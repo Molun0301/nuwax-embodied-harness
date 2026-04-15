@@ -14,8 +14,8 @@ from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.memory import MemoryArrivalVerification, MemoryNavigationCandidate, MemoryRecordKind
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
-from drivers.robots.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
-from drivers.robots.common.manifest import RobotDefaults, RobotManifest
+from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
+from drivers.common.manifest import RobotDefaults, RobotManifest
 from gateways.app import create_gateway_app
 from gateways.relay.server import create_relay_app
 from gateways.runtime import create_default_gateway_runtime
@@ -194,6 +194,27 @@ class FakeProviderBundle(
                 ),
             ],
         )
+
+    def activate_platform_map_version(
+        self,
+        *,
+        map_name: str,
+        version_id: str,
+        geometry_asset,
+        metadata: Dict[str, object],
+    ) -> Dict[str, object]:
+        self.robot.platform_map_version_activation_calls.append(
+            {
+                "map_name": map_name,
+                "version_id": version_id,
+                "geometry_asset": dict(geometry_asset or {}),
+                "metadata": dict(metadata or {}),
+            }
+        )
+        return {
+            "activated": True,
+            "backend": "fake_provider_bundle",
+        }
 
     def set_goal(self, goal: NavigationGoal) -> bool:
         self.robot.navigation_goal_count += 1
@@ -455,6 +476,7 @@ class FakeRobotAssembly(RobotAssemblyBase):
         self.last_exploration_request_id: Optional[str] = None
         self.exploration_poll_count = 0
         self.exploration_cancelled = False
+        self.platform_map_version_activation_calls: List[Dict[str, object]] = []
         self.volume_ratio = 0.5
         self.volume_switch_enabled = True
         self.speech_requests: List[Dict[str, object]] = []
@@ -502,6 +524,7 @@ class FakeRobotAssembly(RobotAssemblyBase):
 
 def _build_test_config(tmp_path: Path):
     config = load_config()
+    config.robot.active_robot = "go2"
     config.gateway.agent_tokens = ("agent-token",)
     config.gateway.admin_tokens = ("admin-token",)
     config.gateway.allow_unknown_client_hosts = True
@@ -652,19 +675,25 @@ def test_gateway_mcp_http_and_auth_behaviour(tmp_path: Path) -> None:
             headers=_agent_headers(),
             json={"jsonrpc": "2.0", "id": "tools", "method": "tools/list"},
         )
+        admin_tools = client.post(
+            "/mcp",
+            headers=_admin_headers(),
+            json={"jsonrpc": "2.0", "id": "admin_tools", "method": "tools/list"},
+        )
         tool_names = {item["name"] for item in tools.json()["result"]["tools"]}
-        assert "capture_image" in tool_names
+        admin_tool_names = {item["name"] for item in admin_tools.json()["result"]["tools"]}
+        assert "capture_image" not in tool_names
         assert "get_latest_observation" in tool_names
         assert "perceive_current_scene" in tool_names
         assert "describe_current_scene" in tool_names
         assert "get_latest_perception" in tool_names
         assert "start_perception_runtime" in tool_names
         assert "stop_perception_runtime" in tool_names
-        assert "get_joint_state" in tool_names
-        assert "get_imu_state" in tool_names
-        assert "get_localization_snapshot" in tool_names
-        assert "get_map_snapshot" in tool_names
-        assert "get_navigation_snapshot" in tool_names
+        assert "get_joint_state" not in tool_names
+        assert "get_imu_state" not in tool_names
+        assert "get_localization_snapshot" not in tool_names
+        assert "get_map_snapshot" not in tool_names
+        assert "get_navigation_snapshot" not in tool_names
         assert "navigate_to_pose" in tool_names
         assert "navigate_to_named_location" in tool_names
         assert "find_target" in tool_names
@@ -673,6 +702,13 @@ def test_gateway_mcp_http_and_auth_behaviour(tmp_path: Path) -> None:
         assert "relative_move" in tool_names
         assert "get_task_status" in tool_names
         assert "switch_control_mode" not in tool_names
+        assert "capture_image" in admin_tool_names
+        assert "get_joint_state" in admin_tool_names
+        assert "get_imu_state" in admin_tool_names
+        assert "get_localization_snapshot" in admin_tool_names
+        assert "get_map_snapshot" in admin_tool_names
+        assert "get_navigation_snapshot" in admin_tool_names
+        assert "switch_control_mode" in admin_tool_names
 
         forbidden = client.post(
             "/api/capabilities/switch_control_mode/invoke",
@@ -752,15 +788,15 @@ def test_gateway_artifact_fetch(tmp_path: Path) -> None:
     with TestClient(app) as client:
         capture = client.post(
             "/api/capabilities/capture_image/invoke",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={"arguments": {}},
         )
         assert capture.status_code == 200
         artifact = capture.json()["result"]["artifact"]
         artifact_id = artifact["artifact_id"]
 
-        meta = client.get(f"/artifacts/{artifact_id}/meta", headers=_agent_headers())
-        raw = client.get(f"/artifacts/{artifact_id}", headers=_agent_headers())
+        meta = client.get(f"/artifacts/{artifact_id}/meta", headers=_admin_headers())
+        raw = client.get(f"/artifacts/{artifact_id}", headers=_admin_headers())
 
         assert meta.status_code == 200
         assert meta.json()["artifact_id"] == artifact_id
@@ -779,7 +815,7 @@ def test_gateway_state_and_observation_endpoints(tmp_path: Path) -> None:
 
         capture = client.post(
             "/api/capabilities/capture_image/invoke",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={"arguments": {"camera_id": "front_camera"}},
         )
         assert capture.status_code == 200
@@ -1070,7 +1106,7 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
 
         get_map_snapshot = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "map_snapshot",
@@ -1084,7 +1120,7 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
 
         get_navigation_snapshot = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "navigation_snapshot",
@@ -1150,7 +1186,7 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
 
         latest_navigation = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "navigation_snapshot_after",
@@ -1427,6 +1463,15 @@ def test_gateway_platform_map_versions_can_save_and_reload_latest_snapshot(tmp_p
         save_payload = save_version.json()["result"]
         version_id = save_payload["map_version"]["version_id"]
         assert save_payload["active_workspace"]["map_asset"]["latest_version_id"] == version_id
+        assert save_payload["map_version"]["geometry_asset"]["map_name"] == "平台版本地图"
+        assert save_payload["map_version"]["geometry_asset"]["version_id"] == version_id
+        assert save_payload["map_version"]["geometry_asset"]["geometry_stack"] == "rtabmap_nav2"
+        assert save_payload["map_version"]["geometry_asset"]["rtabmap_db_path"].endswith(
+            f"/versions/{version_id}/geometry/rtabmap_nav2/rtabmap/rtabmap.db"
+        )
+        assert save_payload["map_version"]["geometry_asset"]["metadata"]["catalog_root"] == str(
+            tmp_path / "runtime_data" / "maps"
+        )
 
         list_versions = client.post(
             "/api/capabilities/list_map_versions/invoke",
@@ -1487,13 +1532,22 @@ def test_gateway_platform_map_versions_can_save_and_reload_latest_snapshot(tmp_p
             assert reactivated_workspace["latest_map_snapshot"]["version_id"] == version_id
             assert reactivated_workspace["latest_map_snapshot"]["occupancy_grid"]["width"] == 2
             assert reactivated_workspace["latest_map_snapshot"]["semantic_map"]["regions"][0]["region_id"] == "charging_station"
+            assert reactivated_workspace["latest_map_snapshot"]["metadata"]["geometry_stack"] == "rtabmap_nav2"
+            assert reactivated_workspace["latest_map_snapshot"]["metadata"]["rtabmap_db_path"].endswith(
+                f"/versions/{version_id}/geometry/rtabmap_nav2/rtabmap/rtabmap.db"
+            )
             assert reactivated_workspace["localization_ready"] is False
             assert reactivated_workspace["active_localization_session"]["status"] == "localizing"
             assert reactivated_workspace["active_localization_session"]["map_version_id"] == version_id
+            assert robot.platform_map_version_activation_calls[-1]["map_name"] == "平台版本地图"
+            assert robot.platform_map_version_activation_calls[-1]["version_id"] == version_id
 
             latest_map = client.get("/api/maps/latest", headers=_agent_headers())
             assert latest_map.status_code == 200
             assert latest_map.json()["map_snapshot"]["version_id"] == version_id
+            refreshed_snapshot = runtime.mapping_service.refresh()
+            assert refreshed_snapshot.version_id == version_id
+            assert refreshed_snapshot.metadata["source_kind"] == "platform_map_version"
 
             semantic_context = client.get("/api/navigation/semantic_context", headers=_agent_headers())
             assert semantic_context.status_code == 200
@@ -1725,16 +1779,34 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
             headers=_agent_headers(),
             json={"jsonrpc": "2.0", "id": "tools", "method": "tools/list"},
         )
+        admin_tools = client.post(
+            "/mcp",
+            headers=_admin_headers(),
+            json={"jsonrpc": "2.0", "id": "admin_tools", "method": "tools/list"},
+        )
         assert tools.status_code == 200
+        assert admin_tools.status_code == 200
         tool_items = tools.json()["result"]["tools"]
+        admin_tool_items = admin_tools.json()["result"]["tools"]
         tool_names = {item["name"] for item in tool_items}
+        admin_tool_names = {item["name"] for item in admin_tool_items}
         assert "speak_text" in tool_names
-        assert "execute_sport_command" in tool_names
         assert "follow_target" in tool_names
         assert "inspect_target" in tool_names
-        assert "set_obstacle_avoidance" in tool_names
+        assert "execute_sport_command" not in tool_names
+        assert "set_obstacle_avoidance" not in tool_names
+        assert "get_joint_state" not in tool_names
+        assert "get_imu_state" not in tool_names
+        assert "get_volume" not in tool_names
+        assert "set_volume" not in tool_names
+        assert "execute_sport_command" in admin_tool_names
+        assert "set_obstacle_avoidance" in admin_tool_names
+        assert "get_joint_state" in admin_tool_names
+        assert "get_imu_state" in admin_tool_names
+        assert "get_volume" in admin_tool_names
+        assert "set_volume" in admin_tool_names
 
-        execute_sport_tool = next(item for item in tool_items if item["name"] == "execute_sport_command")
+        execute_sport_tool = next(item for item in admin_tool_items if item["name"] == "execute_sport_command")
         action_schema = execute_sport_tool["inputSchema"]["properties"]["action"]
         action_catalog = execute_sport_tool["inputSchema"]["x-nuwax-action-catalog"]
         assert "sit" in action_schema["enum"]
@@ -1760,7 +1832,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
         joint_state = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "joints",
@@ -1773,7 +1845,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
         imu_state = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "imu",
@@ -1789,7 +1861,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
         set_volume = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "set_volume",
@@ -1799,7 +1871,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         )
         get_volume = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "get_volume",
@@ -1830,7 +1902,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
         set_obstacle_avoidance = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "obstacle",
@@ -1846,7 +1918,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
         execute_action = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "sport",
@@ -1856,7 +1928,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         )
         set_body_pose = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "pose",
@@ -1866,7 +1938,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         )
         set_speed = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "speed",
@@ -1882,7 +1954,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
         list_capabilities = client.post(
             "/mcp",
-            headers=_agent_headers(),
+            headers=_admin_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "list_capabilities",
@@ -2085,6 +2157,7 @@ def test_relay_forwards_mcp_and_artifacts(tmp_path: Path) -> None:
     """边车转发器应能把 MCP 和制品请求转发到宿主机网关。"""
 
     host_app, runtime, _, config = _build_host_app(tmp_path, start_runtime_on_lifespan=False)
+    config.relay.upstream_token = "admin-token"
     runtime.start()
     try:
         relay_app = create_relay_app(

@@ -51,16 +51,19 @@
 5. `docs/`
    项目文档目录。
    `公开介绍文档/` 面向 GitHub 读者；
-   `内部开发文档/` 面向本地研发，默认不上传到 GitHub。
+   `开发文档/` 面向本地研发与架构演进记录。
 6. `drivers/`
-   机器人入口与装配层，按 `robots/<robot>` 组织具体机器人实现。
-   其中 Go2 的底层控制实现已固定放在 `drivers/robots/go2/control/`。
-   Go2 的端侧定位、地图、Nav2、探索启动入口与专属配置也固定放在 `drivers/robots/go2/`，
-   例如 `drivers/robots/go2/data_plane.py`、`drivers/robots/go2/data_plane_entry.py`、
-   `drivers/robots/go2/settings.py`、`drivers/robots/go2/data_plane.env.example`。
-   同时仓库内已经内置 `drivers/robots/go2/ros2_ws/`，其中包含 Go2 端侧 ROS2（机器人操作系统 2）工作空间、
-   激光雷达建图 vendor 包、`Nav2`（导航栈）示例配置，以及 `build_ros2_workspace.sh`、
-   `launch_ros2_stack.sh` 这两个 Go2 示例脚本。
+   机器人入口与装配层，按 `drivers/<robot_name>/ + drivers/common/ + drivers/sensor/` 组织。
+   根目录 `.env` / `.env.example` 中的 `NUWAX_ACTIVE_ROBOT` 决定统一入口加载哪个机器人目录。
+   其中 Go2 的底层控制实现固定放在 `drivers/go2/control/`。
+   Go2 的端侧输入流、官方运动执行、设备服务与兼容数据面实现固定放在 `drivers/go2/`，
+   例如 `drivers/go2/data_plane.py`、`drivers/go2/data_plane_entry.py`、
+   `drivers/go2/settings.py`、`drivers/go2/data_plane.env.example`。
+   其中项目根目录 `.env` 负责平台主配置与几何栈配置，
+   包括 `NUWAX_GEOMETRY_*`、`NUWAX_RTABMAP_*`、`NUWAX_NAV2_*`；
+   `drivers/go2/data_plane.env` 只负责 Go2 端侧数据面配置，二者不会互相回退读取。
+   仓库内保留 `drivers/go2/ros2_ws/` 作为按需启用的 Go2 ROS2 侧车工作空间，
+   当前只保留官方话题桥接与平台几何侧车所需依赖；旧的本地 `Nav2` 与 `Point-LIO` 启动链已经移除。
 7. `gateways/`
    对外通信入口，包括 MCP、HTTP、事件流、relay 和兼容策略说明。
 8. `providers/`
@@ -84,6 +87,7 @@
     从零部署到实际可用的详细操作手册。
 17. `.env.example`
     宿主机运行时配置示例。
+    当前必须显式设置 `NUWAX_ACTIVE_ROBOT=<robot_name>`，值需与 `drivers/<robot_name>` 同名；
     记忆向量配置当前统一使用 `NUWAX_MEMORY_TEXT_EMBEDDING_*` 与 `NUWAX_MEMORY_IMAGE_EMBEDDING_*`；
     当前默认文本向量模型目录为 `runtime_data/models/BAAI__bge-m3`，默认图像向量模型目录为
     `runtime_data/models/openai__clip-vit-base-patch32`；
@@ -93,16 +97,17 @@
 18. `requirements-memory-models.txt`
     语义空间记忆的模型依赖清单。
     Jetson 场景应先确认 `torch` 可用，再安装本文件。
-19. `drivers/robots/go2/data_plane.env.example`
-    Go2 官方定位、地图与探索能力的专属配置示例。
-20. `drivers/robots/go2/data_plane_entry.py`
+19. `drivers/go2/data_plane.env.example`
+    Go2 官方定位、地图、导航执行与探索能力的专属配置示例。
+    它和项目根目录 `.env` 分属不同配置域，不互相覆盖。
+20. `drivers/go2/data_plane_entry.py`
     Go2 官方数据面的独立启动入口，可单独拉起官方定位、地图、探索相关数据面，再由平台装配接入。
-21. `drivers/robots/go2/ros2_ws/`
-    Go2 配套 ROS2 工作空间，当前仅保留官方数据面接入所需的最小启动包与环境。
-22. `drivers/robots/go2/build_ros2_workspace.sh`
+21. `drivers/go2/ros2_ws/`
+    Go2 配套 ROS2 工作空间，当前仅保留官方话题侧车与 `elevation_mapping` 相关依赖。
+22. `drivers/go2/build_ros2_workspace.sh`
     构建 Go2 端侧 ROS2 工作空间的示例脚本。
-23. `drivers/robots/go2/launch_ros2_stack.sh`
-    准备 Go2 官方数据面运行环境并启动 `data_plane_entry` 的便捷脚本。
+23. `drivers/go2/launch_ros2_stack.sh`
+    为 Go2 ROS2 侧车命令准备运行环境的便捷脚本，不再默认启动任何旧导航 launch。
 24. `requirements.txt`
     Python 运行时依赖。
 

@@ -6,7 +6,7 @@ from dataclasses import asdict, is_dataclass
 from contracts.runtime_views import DiagnosticItem, DiagnosticLevel, DiagnosticSnapshot, RobotStatusSnapshot
 from contracts.events import RuntimeEventCategory
 from core import EventBus, StateNamespace, StateStore
-from drivers.robots.common.assembly import RobotAssemblyBase
+from drivers.common.assembly import RobotAssemblyBase
 from gateways.errors import GatewayError
 from providers import SafetyProvider, StateProvider
 from typing import Deque, List, Optional, Tuple

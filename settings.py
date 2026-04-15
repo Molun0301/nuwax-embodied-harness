@@ -14,14 +14,29 @@ nuwax_robot_bridge 统一配置解析层。
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import logging
 import os
 from pathlib import Path
 import threading
-from typing import Deque, Dict, Tuple
+from typing import Deque, Dict, Iterator, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows 环境不提供 fcntl
+    fcntl = None
 
 from logging_utils import build_default_formatter
+from contracts.geometry_runtime import (
+    GeometryFrameConfig,
+    GeometryTopicsConfig,
+    Nav2Config,
+    PlatformGeometryConfig,
+    RtabmapConfig,
+    build_default_geometry_setup_script,
+    build_default_rtabmap_database_root,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -376,6 +391,8 @@ class NuwaxRobotBridgeConfig:
     gateway: "GatewayServerConfig"
     relay: "RelayServerConfig"
     runtime_data: RuntimeDataConfig
+    geometry: PlatformGeometryConfig
+    robot: "RobotDriverConfig"
     dds: DDSConfig
     low_level: LowLevelControlConfig
     tts: TTSPlayerConfig
@@ -383,6 +400,13 @@ class NuwaxRobotBridgeConfig:
     log_tts: TTSLogBridgeConfig
     volume: VolumeControlConfig
     perception: PerceptionConfig
+
+
+@dataclass
+class RobotDriverConfig:
+    """当前激活机器人入口配置。"""
+
+    active_robot: str = ""
 
 
 @dataclass
@@ -582,6 +606,51 @@ def load_config() -> NuwaxRobotBridgeConfig:
         ),
     )
 
+    geometry = PlatformGeometryConfig(
+        enabled=_cfg_bool("NUWAX_GEOMETRY_ENABLED", False),
+        stack=_cfg_str("NUWAX_GEOMETRY_STACK", "rtabmap_nav2"),
+        require_ros2=_cfg_bool("NUWAX_GEOMETRY_REQUIRE_ROS2", False),
+        setup_script=_cfg_str("NUWAX_GEOMETRY_SETUP_SCRIPT", build_default_geometry_setup_script()),
+        cyclonedds_lib_dir=_cfg_str("NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR", ""),
+        dds_iface=_cfg_str("NUWAX_GEOMETRY_DDS_IFACE", ""),
+        topics=GeometryTopicsConfig(
+            odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/utlidar/robot_odom"),
+            secondary_odom_topics=_cfg_csv(
+                "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS",
+                (
+                    "/uslam/localization/odom",
+                    "/lio_sam_ros2/mapping/odometry",
+                    "/odom_lio",
+                ),
+            ),
+            imu_topic=_cfg_str("NUWAX_GEOMETRY_IMU_TOPIC", "/utlidar/imu"),
+            point_cloud_topic=_cfg_str("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud"),
+            tf_topic=_cfg_str("NUWAX_GEOMETRY_TF_TOPIC", "/tf"),
+            tf_static_topic=_cfg_str("NUWAX_GEOMETRY_TF_STATIC_TOPIC", "/tf_static"),
+            occupancy_topic=_cfg_str("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
+            cost_map_topic=_cfg_str("NUWAX_GEOMETRY_COST_MAP_TOPIC", "/global_costmap/costmap"),
+        ),
+        frames=GeometryFrameConfig(
+            map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "odom"),
+            base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "body"),
+            lidar_frame=_cfg_str("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),
+        ),
+        rtabmap=RtabmapConfig(
+            database_root=_cfg_str("NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
+            launch_package=_cfg_str("NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_ros"),
+            launch_file=_cfg_str("NUWAX_RTABMAP_LAUNCH_FILE", "rtabmap.launch.py"),
+            occupancy_projection=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
+        ),
+        nav2=Nav2Config(
+            action_name=_cfg_str("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
+            launch_package=_cfg_str("NUWAX_NAV2_LAUNCH_PACKAGE", "nav2_bringup"),
+            launch_file=_cfg_str("NUWAX_NAV2_LAUNCH_FILE", "navigation_launch.py"),
+            global_costmap_topic=_cfg_str("NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC", "/global_costmap/costmap"),
+            local_costmap_topic=_cfg_str("NUWAX_NAV2_LOCAL_COSTMAP_TOPIC", "/local_costmap/costmap"),
+            costmap_source=_cfg_str("NUWAX_NAV2_COSTMAP_SOURCE", "nav2_global"),
+        ),
+    )
+
     dds = DDSConfig(
         cyclone_dds_uri=_cfg_str(
             "CYCLONEDDS_URI",
@@ -684,6 +753,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
         artifact_max_total_bytes=max(1, _cfg_int("NUWAX_ARTIFACT_MAX_TOTAL_BYTES", 1073741824)),
         artifact_cleanup_batch_size=max(1, _cfg_int("NUWAX_ARTIFACT_CLEANUP_BATCH_SIZE", 200)),
     )
+    robot = RobotDriverConfig(
+        active_robot=_cfg_str("NUWAX_ACTIVE_ROBOT", "").strip().lower(),
+    )
 
     return NuwaxRobotBridgeConfig(
         base_dir=str(BASE_DIR),
@@ -707,6 +779,8 @@ def load_config() -> NuwaxRobotBridgeConfig:
         gateway=gateway,
         relay=relay,
         runtime_data=runtime_data,
+        geometry=geometry,
+        robot=robot,
         dds=dds,
         low_level=low_level,
         tts=tts_player,
@@ -765,51 +839,100 @@ class _LineLimitedFileHandler(logging.FileHandler):
         self.trim_check_interval = max(1, int(trim_check_interval))
         self._emit_count = 0
         self._trim_lock = threading.Lock()
+        self._lock_file_path = Path(f"{self.baseFilename}.lock")
+        self._lock_file_stream = self._open_lock_file_stream()
+        self._repair_file_if_needed()
+
+    def close(self) -> None:
+        try:
+            if self._lock_file_stream is not None:
+                self._lock_file_stream.close()
+        finally:
+            super().close()
+
+    def _open_lock_file_stream(self):
+        if fcntl is None:
+            return None
+
+        self._lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+        return self._lock_file_path.open("a+b")
+
+    @contextmanager
+    def _interprocess_lock(self) -> Iterator[None]:
+        if self._lock_file_stream is None or fcntl is None:
+            yield
+            return
+
+        fcntl.flock(self._lock_file_stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(self._lock_file_stream.fileno(), fcntl.LOCK_UN)
 
     def emit(self, record: logging.LogRecord) -> None:
-        super().emit(record)
-        if self.max_lines <= 0:
-            return
+        with self._interprocess_lock():
+            super().emit(record)
+            if self.max_lines <= 0:
+                return
 
-        self._emit_count += 1
-        if self._emit_count % self.trim_check_interval != 0:
-            return
+            self._emit_count += 1
+            if self._emit_count % self.trim_check_interval != 0:
+                return
 
-        self._trim_file_if_needed()
+            self._trim_file_if_needed()
+
+    def _repair_file_if_needed(self) -> None:
+        with self._interprocess_lock():
+            self._rewrite_file_if_needed()
 
     def _trim_file_if_needed(self) -> None:
         if not self._trim_lock.acquire(blocking=False):
             return
 
         try:
-            self.flush()
-            path = Path(self.baseFilename)
-            if not path.exists():
-                return
-
-            tail_lines: Deque[str] = deque(maxlen=self.max_lines)
-            total_lines = 0
-            with path.open("r", encoding=self.encoding or "utf-8", errors="ignore") as stream:
-                for raw_line in stream:
-                    total_lines += 1
-                    tail_lines.append(raw_line)
-
-            if total_lines <= self.max_lines:
-                return
-
-            if self.stream is not None:
-                try:
-                    self.stream.close()
-                finally:
-                    self.stream = None
-
-            tmp_path = path.with_suffix(path.suffix + ".tmp")
-            with tmp_path.open("w", encoding=self.encoding or "utf-8") as stream:
-                stream.writelines(tail_lines)
-            tmp_path.replace(path)
-            self.stream = self._open()
+            self._rewrite_file_if_needed()
         finally:
             self._trim_lock.release()
+
+    def _rewrite_file_if_needed(self) -> bool:
+        self.flush()
+        path = Path(self.baseFilename)
+        if not path.exists():
+            return False
+
+        encoding = self.encoding or "utf-8"
+        tail_lines: Deque[str] = deque(maxlen=self.max_lines) if self.max_lines > 0 else deque()
+        cleaned_lines = [] if self.max_lines <= 0 else None
+        total_lines = 0
+        has_nul_bytes = False
+        with path.open("r+", encoding=encoding, errors="ignore") as stream:
+            for raw_line in stream:
+                total_lines += 1
+                if "\x00" in raw_line:
+                    has_nul_bytes = True
+                    raw_line = raw_line.replace("\x00", "")
+                if self.max_lines > 0:
+                    tail_lines.append(raw_line)
+                else:
+                    cleaned_lines.append(raw_line)
+
+            should_trim = self.max_lines > 0 and total_lines > self.max_lines
+            if not should_trim and not has_nul_bytes:
+                return False
+
+            if self.max_lines > 0:
+                stream.seek(0)
+                stream.writelines(tail_lines)
+            else:
+                stream.seek(0)
+                stream.writelines(cleaned_lines)
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        if self.stream is not None:
+            self.stream.seek(0, os.SEEK_END)
+        return True
 
 
 def _configure_third_party_logger_levels() -> None:

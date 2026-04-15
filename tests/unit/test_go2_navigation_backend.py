@@ -5,15 +5,15 @@ import math
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import CostMap, OccupancyGrid
 from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
-from drivers.robots.go2.data_plane import Go2DataPlaneRuntime
-from drivers.robots.go2.frontier_exploration import Go2FrontierExplorer
-from drivers.robots.go2.navigation_backend import Go2GridNavigationPlanner, Go2NavigationSession
-from drivers.robots.go2.settings import (
+from drivers.go2.data_plane import Go2DataPlaneRuntime
+from drivers.go2.settings import (
     Go2DataPlaneConfig,
     Go2ExplorationConfig,
     Go2NavigationBackendConfig,
     Go2OfficialBackendConfig,
 )
+from services.navigation.frontier import Go2FrontierExplorer
+from services.navigation.runtime import Go2GridNavigationPlanner, Go2NavigationSession
 from typing import Optional, Set, Tuple
 
 

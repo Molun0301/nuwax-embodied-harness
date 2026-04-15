@@ -25,6 +25,7 @@ class PerceptionService:
         self,
         *,
         provider_owner,
+        localization_provider_owner=None,
         artifact_service: ArtifactService,
         state_store: StateStore,
         detector_pipeline: DetectorPipeline,
@@ -36,6 +37,7 @@ class PerceptionService:
         pipeline_name: str = "default_perception_pipeline",
     ) -> None:
         self._provider_owner = provider_owner
+        self._localization_provider_owner = localization_provider_owner or provider_owner
         self._artifact_service = artifact_service
         self._state_store = state_store
         self._detector_pipeline = detector_pipeline
@@ -290,7 +292,7 @@ class PerceptionService:
         return providers
 
     def _get_localization_provider_optional(self) -> Optional[LocalizationProvider]:
-        providers = getattr(self._provider_owner, "providers", None)
+        providers = getattr(self._localization_provider_owner, "providers", None)
         if providers is None or not isinstance(providers, LocalizationProvider):
             return None
         if not providers.is_available():

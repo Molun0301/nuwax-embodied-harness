@@ -259,7 +259,7 @@ class LocalizationService:
     def _get_localization_provider(self) -> LocalizationProvider:
         provider = self._find_localization_provider()
         if provider is None:
-            raise GatewayError("当前机器人入口未提供定位提供器。")
+            raise GatewayError("当前平台几何运行时未提供定位提供器。")
         if not provider.is_available():
             raise GatewayError("当前定位提供器暂不可用。")
         return provider

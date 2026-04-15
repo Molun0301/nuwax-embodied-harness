@@ -80,6 +80,45 @@ def test_configure_logging_writes_file_and_request_log(tmp_path: Path) -> None:
     assert "path=/relay/health" in content
 
 
+def test_configure_logging_repairs_nul_bytes_and_keeps_latest_lines(tmp_path: Path) -> None:
+    """初始化日志时应修复空洞字节，并保留尾部日志。"""
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "runtime.log"
+    log_file.write_bytes(
+        b"line-1\n"
+        b"\x00\x00\x00\x00line-2\n"
+        b"line-3\n"
+    )
+
+    configure_logging(
+        LoggingConfig(
+            log_dir=str(log_dir),
+            log_file=str(log_file),
+            level="INFO",
+            max_lines=2,
+            trim_check_interval=100,
+        )
+    )
+
+    logger = logging.getLogger("nuwax_robot_bridge.test.repair")
+    logger.info("line-4")
+
+    for handler in logging.getLogger().handlers:
+        flush = getattr(handler, "flush", None)
+        if callable(flush):
+            flush()
+
+    data = log_file.read_bytes()
+    content = data.decode("utf-8")
+    assert b"\x00" not in data
+    assert "line-1" not in content
+    assert "line-2" in content
+    assert "line-3" in content
+    assert "line-4" in content
+
+
 def test_context_aware_formatter_appends_extra_fields() -> None:
     """统一 formatter 应把扩展字段稳定追加到日志末尾。"""
 

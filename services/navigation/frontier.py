@@ -12,8 +12,8 @@ from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import CostMap, OccupancyGrid
 
 if TYPE_CHECKING:
+    from services.navigation.config import ExplorationConfig
     from services.navigation.runtime import GridNavigationPlanner
-    from drivers.robots.go2.settings import Go2ExplorationConfig
 
 
 Cell2D = Tuple[int, int]
@@ -26,7 +26,7 @@ class ExplorationSafetyStatus(IntEnum):
 
 
 @dataclass
-class Go2ExplorationSafetyResult:
+class ExplorationSafetyResult:
     """探索安全性检查结果。"""
 
     status: ExplorationSafetyStatus
@@ -36,8 +36,8 @@ class Go2ExplorationSafetyResult:
 
 
 @dataclass
-class Go2FrontierCandidate:
-    """Go2 前沿探索候选。"""
+class FrontierCandidate:
+    """前沿探索候选。"""
 
     pose: Pose
     score: float
@@ -47,8 +47,8 @@ class Go2FrontierCandidate:
     average_cost: float
 
 
-class Go2FrontierExplorer:
-    """Go2 显式前沿检测与收益排序器。"""
+class FrontierExplorer:
+    """平台显式前沿检测与收益排序器。"""
 
     _NEIGHBORS: Tuple[Tuple[int, int], ...] = (
         (-1, -1),
@@ -61,7 +61,7 @@ class Go2FrontierExplorer:
         (1, 1),
     )
 
-    def __init__(self, config: "Go2ExplorationConfig") -> None:
+    def __init__(self, config: "ExplorationConfig") -> None:
         self.config = config
         self._last_scan_ranges: Optional[np.ndarray] = None
         self._exploration_active: bool = False
@@ -70,11 +70,11 @@ class Go2FrontierExplorer:
         self,
         current_pose: Pose,
         scan_ranges: Optional[np.ndarray] = None,
-    ) -> Go2ExplorationSafetyResult:
+    ) -> ExplorationSafetyResult:
         """检测探索期间的安全性，返回是否需要停止或减速。"""
         if scan_ranges is None:
             if self._last_scan_ranges is None:
-                return Go2ExplorationSafetyResult(
+                return ExplorationSafetyResult(
                     status=ExplorationSafetyStatus.SAFE,
                     min_obstacle_distance_m=999.0,
                     recommended_speed_mps=0.35,
@@ -86,7 +86,7 @@ class Go2FrontierExplorer:
 
         valid_mask = (scan_ranges >= 0.05) & (scan_ranges <= 25.0)
         if not np.any(valid_mask):
-            return Go2ExplorationSafetyResult(
+            return ExplorationSafetyResult(
                 status=ExplorationSafetyStatus.SAFE,
                 min_obstacle_distance_m=999.0,
                 recommended_speed_mps=0.35,
@@ -100,21 +100,21 @@ class Go2FrontierExplorer:
         front_min = float(np.min(front_arc)) if len(front_arc) > 0 else min_distance
 
         if front_min <= 0.3 or min_distance <= 0.25:
-            return Go2ExplorationSafetyResult(
+            return ExplorationSafetyResult(
                 status=ExplorationSafetyStatus.DANGER,
                 min_obstacle_distance_m=min(front_min, min_distance),
                 recommended_speed_mps=0.0,
                 stop_required=True,
             )
         elif front_min <= 0.6 or min_distance <= 0.4:
-            return Go2ExplorationSafetyResult(
+            return ExplorationSafetyResult(
                 status=ExplorationSafetyStatus.WARNING,
                 min_obstacle_distance_m=min(front_min, min_distance),
                 recommended_speed_mps=0.15,
                 stop_required=False,
             )
 
-        return Go2ExplorationSafetyResult(
+        return ExplorationSafetyResult(
             status=ExplorationSafetyStatus.SAFE,
             min_obstacle_distance_m=min(front_min, min_distance),
             recommended_speed_mps=0.25,
@@ -144,7 +144,7 @@ class Go2FrontierExplorer:
         center_pose: Pose,
         radius_m: Optional[float],
         attempted_poses: Sequence[Pose],
-    ) -> List[Go2FrontierCandidate]:
+    ) -> List[FrontierCandidate]:
         """按收益排序返回可达前沿候选。"""
 
         if not bool(self.config.frontier_enabled):
@@ -175,7 +175,7 @@ class Go2FrontierExplorer:
         if not clusters:
             return []
 
-        candidates: List[Go2FrontierCandidate] = []
+        candidates: List[FrontierCandidate] = []
         revisit_separation_m = float(self.config.frontier_revisit_separation_m)
         current_yaw = _yaw_from_pose(current_pose)
         max_radius_m = None if radius_m is None else max(0.1, float(radius_m))
@@ -250,7 +250,7 @@ class Go2FrontierExplorer:
                 + float(self.config.frontier_heading_weight) * heading_bonus
             )
             candidates.append(
-                Go2FrontierCandidate(
+                FrontierCandidate(
                     pose=goal_pose,
                     score=score,
                     cluster_size=len(cluster),
@@ -402,9 +402,9 @@ def _normalize_angle(angle_rad: float) -> float:
     return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
 
 
-ExplorationSafetyResult = Go2ExplorationSafetyResult
-FrontierCandidate = Go2FrontierCandidate
-FrontierExplorer = Go2FrontierExplorer
+Go2ExplorationSafetyResult = ExplorationSafetyResult
+Go2FrontierCandidate = FrontierCandidate
+Go2FrontierExplorer = FrontierExplorer
 
 
 __all__ = [

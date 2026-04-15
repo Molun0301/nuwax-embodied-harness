@@ -1,20 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+import pytest
 from adapters.base import AdapterCategory, AdapterConfig
 from adapters.streams import RosImageAdapter
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Vector3
 from contracts.image import ImageFrame
+from contracts.map_workspace import MapVersion
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, RobotControlMode
-from drivers.robots.common import ManagedRobotDataPlane, MotionCommandDataPlane
-from drivers.robots.g1 import G1_MANIFEST, create_g1_assembly
-from drivers.robots.go2 import GO2_CAPABILITY_DESCRIPTORS, GO2_CAPABILITY_MATRIX, create_go2_assembly
-from drivers.robots.go2.assembly import Go2ClientFactories
-from settings import APP_CONFIG
+from contracts.runtime_views import MapSnapshot
+from drivers.common import ManagedRobotDataPlane, MotionCommandDataPlane
+from drivers.entry import create_active_robot_assembly, get_active_robot_registration, load_active_robot_private_capability_specs
+from drivers.g1 import G1_MANIFEST, create_g1_assembly
+from drivers.go2 import GO2_CAPABILITY_DESCRIPTORS, GO2_CAPABILITY_MATRIX, create_go2_assembly
+from drivers.go2.assembly import Go2ClientFactories
+from gateways.runtime import GatewayRuntime
+from services.geometry import PlatformGeometryRuntime
+from settings import APP_CONFIG, RobotDriverConfig
 from typing import Dict, List, Optional, Tuple
 
 
@@ -470,7 +476,7 @@ def test_g1_skeleton_keeps_entry_format_stable() -> None:
 
 
 def test_go2_data_plane_is_managed_under_robot_entry() -> None:
-    """Go2 端侧定位、地图、导航与探索能力应由机器人入口统一管理。"""
+    """Go2 端侧数据面应通过平台几何运行时统一暴露几何能力。"""
 
     data_plane = FakeGo2DataPlane()
     assembly = create_go2_assembly(
@@ -480,30 +486,141 @@ def test_go2_data_plane_is_managed_under_robot_entry() -> None:
     )
 
     assembly.start()
+    geometry_runtime = PlatformGeometryRuntime(
+        config=APP_CONFIG.geometry,
+        catalog_root=str(APP_CONFIG.runtime_data.map_catalog_root),
+        robot=assembly,
+    )
 
     assert data_plane.started is True
-    assert assembly.providers.is_localization_available() is True
-    assert assembly.providers.get_current_pose() is not None
-    assert assembly.providers.get_occupancy_grid() is not None
-    assert assembly.providers.get_semantic_map() is not None
+    assert geometry_runtime.providers.is_localization_available() is True
+    assert geometry_runtime.providers.get_current_pose() is not None
+    assert geometry_runtime.providers.get_occupancy_grid() is not None
+    assert geometry_runtime.providers.get_semantic_map() is not None
 
-    accepted = assembly.providers.set_goal(
+    accepted = geometry_runtime.providers.set_goal(
         NavigationGoal(
             goal_id="nav_to_dock",
             target_pose=Pose(frame_id="odom", position=Vector3(x=1.2, y=2.3, z=0.0)),
         )
     )
-    exploring = assembly.providers.start_exploration(
+    exploring = geometry_runtime.providers.start_exploration(
         ExploreAreaRequest(request_id="explore_dock", target_name="充电桩", strategy="frontier")
     )
 
     assert accepted is True
     assert exploring is True
-    assert assembly.providers.get_navigation_state().current_goal_id == "nav_to_dock"
-    assert assembly.providers.get_exploration_state().current_request_id == "explore_dock"
+    assert geometry_runtime.providers.get_navigation_state().current_goal_id == "nav_to_dock"
+    assert geometry_runtime.providers.get_exploration_state().current_request_id == "explore_dock"
 
     assembly.stop()
     assert data_plane.started is False
+
+
+def test_platform_geometry_runtime_can_activate_platform_map_version(tmp_path) -> None:
+    """平台几何运行时应能把平台地图版本整理成正式地图快照。"""
+
+    data_plane = FakeGo2DataPlane()
+    assembly = create_go2_assembly(
+        APP_CONFIG,
+        factories=_build_go2_factories(FakeChannelInitializer()),
+        data_plane=data_plane,
+    )
+    geometry_runtime = PlatformGeometryRuntime(
+        config=APP_CONFIG.geometry,
+        catalog_root=str(tmp_path / "maps"),
+        robot=assembly,
+    )
+    version = MapVersion(
+        map_name="测试地图",
+        version_id="mapver_000001",
+        revision=1,
+        source_name="platform_geometry_runtime",
+        source_version_id="mapv_platform_geometry_runtime_000001",
+        frame_id="odom",
+        snapshot=MapSnapshot(
+            source_name="platform_geometry_runtime",
+            version_id="mapv_platform_geometry_runtime_000001",
+            revision=1,
+            occupancy_grid=OccupancyGrid(
+                map_id="saved_grid",
+                frame_id="odom",
+                width=2,
+                height=2,
+                resolution_m=0.2,
+                origin=Pose(frame_id="odom", position=Vector3(x=0.0, y=0.0, z=0.0)),
+                data=[0, 0, 0, 100],
+            ),
+            cost_map=CostMap(
+                map_id="saved_cost",
+                frame_id="odom",
+                width=2,
+                height=2,
+                resolution_m=0.2,
+                origin=Pose(frame_id="odom", position=Vector3(x=0.0, y=0.0, z=0.0)),
+                data=[1.0, 1.0, 2.0, 100.0],
+            ),
+            semantic_map=SemanticMap(
+                map_id="saved_semantic",
+                frame_id="odom",
+                regions=[
+                    SemanticRegion(
+                        region_id="charging_station",
+                        label="charging_station",
+                        centroid=Pose(frame_id="odom", position=Vector3(x=1.0, y=1.0, z=0.0)),
+                        attributes={"alias": "充电桩"},
+                    )
+                ],
+            ),
+            metadata={"saved_by": "unit_test"},
+        ),
+    )
+
+    snapshot = geometry_runtime.activate_map_version(version)
+
+    assert snapshot.version_id == "mapver_000001"
+    assert snapshot.metadata["source_kind"] == "platform_map_version"
+    assert snapshot.metadata["geometry_stack"] == APP_CONFIG.geometry.stack
+    assert snapshot.metadata["platform_map_version_id"] == "mapver_000001"
+    assert snapshot.metadata["rtabmap_db_path"].endswith("/geometry/rtabmap_nav2/rtabmap/rtabmap.db")
+    assert snapshot.metadata["database_present"] is False
+    assert snapshot.semantic_map is not None
+    assert snapshot.semantic_map.regions[0].region_id == "charging_station"
+    assert (tmp_path / "maps" / "%E6%B5%8B%E8%AF%95%E5%9C%B0%E5%9B%BE" / "versions" / "mapver_000001" / "geometry" / "rtabmap_nav2" / "geometry_asset.json").exists()
+
+
+def test_gateway_runtime_routes_geometry_services_to_platform_owner(tmp_path) -> None:
+    """网关应把定位、地图、导航 provider owner 收回平台几何运行时。"""
+
+    assembly = create_go2_assembly(
+        APP_CONFIG,
+        factories=_build_go2_factories(FakeChannelInitializer()),
+        data_plane=FakeGo2DataPlane(),
+    )
+    runtime_config = replace(
+        APP_CONFIG,
+        gateway=replace(
+            APP_CONFIG.gateway,
+            artifact_dir=str(tmp_path / "artifacts"),
+            public_base_url="http://localhost:8766",
+        ),
+        runtime_data=replace(
+            APP_CONFIG.runtime_data,
+            map_catalog_root=str(tmp_path / "maps"),
+            memory_db_path=str(tmp_path / "memory" / "vector_memory.db"),
+        ),
+    )
+
+    runtime = GatewayRuntime(
+        config=runtime_config,
+        robot=assembly,
+        register_default_capabilities=False,
+    )
+
+    assert runtime.localization_service._provider_owner is runtime.platform_geometry_runtime
+    assert runtime.mapping_service._provider_owner is runtime.platform_geometry_runtime
+    assert runtime.navigation_service._provider_owner is runtime.platform_geometry_runtime
+    assert runtime.perception_service._localization_provider_owner is runtime.platform_geometry_runtime
 
 
 def test_go2_provider_motion_prefers_data_plane_command_path() -> None:
@@ -529,3 +646,36 @@ def test_go2_provider_motion_prefers_data_plane_command_path() -> None:
     assert data_plane.motion_commands[-1] == (0.4, 0.0, 0.1)
     assert data_plane.motion_stop_count == 1
     assert ("Move", (0.4, 0.0, 0.1)) not in assembly.sport_client.calls
+
+
+def test_unified_entry_rejects_missing_active_robot() -> None:
+    """统一入口在缺少 NUWAX_ACTIVE_ROBOT 时不应伪装成默认 Go2。"""
+
+    config = replace(APP_CONFIG, robot=RobotDriverConfig(active_robot=""))
+
+    with pytest.raises(ValueError, match="NUWAX_ACTIVE_ROBOT"):
+        get_active_robot_registration(config)
+
+    assert load_active_robot_private_capability_specs(config) == ()
+
+
+def test_unified_entry_can_create_customrobot_skeleton() -> None:
+    """统一入口应能按 active_robot 装配对应机器人目录。"""
+
+    config = replace(APP_CONFIG, robot=RobotDriverConfig(active_robot="customrobot"))
+
+    assembly = create_active_robot_assembly(config)
+
+    assert assembly.manifest.robot_name == "customrobot"
+
+
+def test_unified_entry_loads_go2_private_capabilities() -> None:
+    """Go2 私有能力应由统一入口按激活机器人动态导入。"""
+
+    config = replace(APP_CONFIG, robot=RobotDriverConfig(active_robot="go2"))
+
+    spec_names = {spec.name for spec in load_active_robot_private_capability_specs(config)}
+
+    assert "execute_sport_command" in spec_names
+    assert "set_obstacle_avoidance" in spec_names
+    assert "switch_control_mode" in spec_names

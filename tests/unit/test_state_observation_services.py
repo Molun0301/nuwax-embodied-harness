@@ -6,8 +6,8 @@ from contracts.geometry import Quaternion, Twist
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.robot_state import IMUState, RobotControlMode, RobotState, SafetyState
 from core import EventBus, StateNamespace, StateStore
-from drivers.robots.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
-from drivers.robots.common.manifest import RobotDefaults, RobotManifest
+from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
+from drivers.common.manifest import RobotDefaults, RobotManifest
 from gateways.artifacts import LocalArtifactStore
 from providers.image import ImageProvider
 from providers.motion import MotionControl

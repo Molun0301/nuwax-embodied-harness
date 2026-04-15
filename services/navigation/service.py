@@ -442,7 +442,7 @@ class NavigationService:
     def _get_navigation_provider(self) -> NavigationProvider:
         provider = self._find_navigation_provider()
         if provider is None:
-            raise GatewayError("当前机器人入口未提供导航后端。")
+            raise GatewayError("当前平台几何运行时未提供导航后端。")
         if not provider.is_available():
             raise GatewayError("当前导航后端暂不可用。")
         return provider
@@ -456,7 +456,7 @@ class NavigationService:
     def _get_exploration_provider(self) -> ExplorationProvider:
         provider = self._find_exploration_provider()
         if provider is None:
-            raise GatewayError("当前机器人入口未提供探索后端。")
+            raise GatewayError("当前平台几何运行时未提供探索后端。")
         if not provider.is_available():
             raise GatewayError("当前探索后端暂不可用。")
         return provider

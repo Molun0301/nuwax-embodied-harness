@@ -42,6 +42,16 @@ class MapVersionRepository:
         versions = self.list_map_versions(map_name, limit=1)
         return versions[0] if versions else None
 
+    def save_existing_map_version(self, version: MapVersion) -> MapVersion:
+        """覆盖写回已存在的平台地图版本。"""
+
+        self._version_path(version.map_name, version.version_id).parent.mkdir(parents=True, exist_ok=True)
+        self._version_path(version.map_name, version.version_id).write_text(
+            version.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        return version
+
     def save_map_version(
         self,
         *,

@@ -48,11 +48,23 @@ class NavigationState(TimestampedContract):
     status: NavigationStatus = Field(default=NavigationStatus.IDLE, description="导航状态。")
     current_pose: Optional[Pose] = Field(default=None, description="当前位姿。")
     remaining_distance_m: Optional[float] = Field(default=None, ge=0.0, description="剩余距离。")
-    remaining_yaw_rad: Optional[float] = Field(default=None, ge=0.0, description="剩余朝向差。")
+    remaining_yaw_rad: Optional[float] = Field(default=None, ge=0.0, description="剩余朝向差幅值。")
     goal_reached: bool = Field(default=False, description="当前目标是否已经到达。")
     message: Optional[str] = Field(default=None, description="状态说明。")
     updated_at: datetime = Field(default_factory=utc_now, description="状态更新时间。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_remaining_yaw_rad(cls, data):
+        if not isinstance(data, dict):
+            return data
+        remaining_yaw_rad = data.get("remaining_yaw_rad")
+        if remaining_yaw_rad is None:
+            return data
+        normalized = dict(data)
+        normalized["remaining_yaw_rad"] = abs(float(remaining_yaw_rad))
+        return normalized
 
 
 class ExplorationStatus(StrEnum):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 import struct
@@ -8,19 +9,22 @@ import sys
 import time
 from types import SimpleNamespace
 
+import numpy as np
+
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
-from contracts.navigation import ExplorationStatus, ExploreAreaRequest
-from drivers.robots.go2 import data_plane as go2_data_plane
-from drivers.robots.go2.data_plane import Go2DataPlaneRuntime, RclpyGo2RosBridge
-from drivers.robots.go2 import settings as go2_settings
-from drivers.robots.go2.settings import (
+from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationState, NavigationStatus
+from drivers.go2 import data_plane as go2_data_plane
+from drivers.go2.data_plane import Go2DataPlaneRuntime, RclpyGo2RosBridge
+from drivers.go2 import settings as go2_settings
+from drivers.go2.settings import (
     Go2DataPlaneConfig,
     Go2DirectDdsConfig,
     Go2ExplorationConfig,
     Go2MapSynthesisConfig,
     Go2OfficialBackendConfig,
 )
+from services.geometry import GeometryFrameConfig, GeometryTopicsConfig, PlatformGeometryConfig
 
 
 class _FakeBridge:
@@ -223,6 +227,8 @@ class _FakeObstaclesAvoidClient:
         self.initialized = False
         self.switch_enabled = False
         self.remote_enabled = False
+        self.switch_set_code = 0
+        self.remote_command_code = 0
         self.switch_calls: list[bool] = []
         self.remote_calls: list[bool] = []
         self.move_calls: list[tuple[float, float, float]] = []
@@ -239,7 +245,7 @@ class _FakeObstaclesAvoidClient:
     def SwitchSet(self, enabled: bool) -> int:
         self.switch_enabled = bool(enabled)
         self.switch_calls.append(self.switch_enabled)
-        return 0
+        return int(self.switch_set_code)
 
     def SwitchGet(self):
         return 0, self.switch_enabled
@@ -247,7 +253,7 @@ class _FakeObstaclesAvoidClient:
     def UseRemoteCommandFromApi(self, enabled: bool) -> int:
         self.remote_enabled = bool(enabled)
         self.remote_calls.append(self.remote_enabled)
-        return 0
+        return int(self.remote_command_code)
 
     def Move(self, vx: float, vy: float, vyaw: float) -> int:
         self.move_calls.append((vx, vy, vyaw))
@@ -289,9 +295,15 @@ def _build_pose_odom_message(*, x: float, y: float, z: float = 0.0, frame_id: st
 
 
 def _build_sport_mode_state_message(*, x: float, y: float, z: float = 0.0) -> SimpleNamespace:
+    half_yaw = 0.0
     return SimpleNamespace(
         position=[x, y, z],
-        imu_state=SimpleNamespace(quaternion=[0.0, 0.0, 0.0, 1.0]),
+        imu_state=SimpleNamespace(
+            quaternion=[math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)],
+            gyroscope=[0.0, 0.0, 0.0],
+            accelerometer=[0.0, 0.0, 0.0],
+            rpy=[0.0, 0.0, 0.0],
+        ),
     )
 
 
@@ -323,22 +335,27 @@ def _grid_cell_index(*, width: int, resolution: float, origin_x: float, origin_y
 
 
 def test_go2_ros2_workspace_defaults_point_to_repo() -> None:
-    assert go2_settings._DEFAULT_GO2_SETUP_SCRIPT.endswith("drivers/robots/go2/ros2_ws/install/setup.bash")
+    assert go2_settings._DEFAULT_GO2_SETUP_SCRIPT.endswith("drivers/go2/ros2_ws/install/setup.bash")
+
+
+def test_go2_map_synthesis_default_self_filter_radius_matches_platform_calibration() -> None:
+    assert Go2MapSynthesisConfig().point_cloud_self_filter_radius_m == 0.65
 
 
 def test_go2_ros2_workspace_assets_exist() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    workspace_root = repo_root / "drivers" / "robots" / "go2" / "ros2_ws"
-    assert (workspace_root / "src" / "nuwax_go2_bringup" / "package.xml").exists()
-    assert (repo_root / "drivers" / "robots" / "go2" / "build_ros2_workspace.sh").exists()
-    assert (repo_root / "drivers" / "robots" / "go2" / "source_runtime_env.sh").exists()
+    workspace_root = repo_root / "drivers" / "go2" / "ros2_ws"
+    assert (workspace_root / "src" / "vendor" / "elevation_mapping_cupy" / "elevation_mapping_cupy" / "package.xml").exists()
+    assert (workspace_root / "src" / "vendor" / "unilidar_sdk" / "unitree_lidar_ros2" / "package.xml").exists()
+    assert (repo_root / "drivers" / "go2" / "build_ros2_workspace.sh").exists()
+    assert (repo_root / "drivers" / "go2" / "source_runtime_env.sh").exists()
 
 
 def test_go2_setup_script_path_falls_back_to_repo_default_when_legacy_path_missing(tmp_path: Path) -> None:
     fallback_setup = tmp_path / "ros2_ws" / "install" / "setup.bash"
     fallback_setup.parent.mkdir(parents=True)
     fallback_setup.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-    legacy_missing = "/home/unitree/nuwax_robot_bridge/drivers/robots/go2/ros2_ws/install/setup.bash"
+    legacy_missing = "/home/unitree/nuwax_robot_bridge/drivers/go2/ros2_ws/install/setup.bash"
 
     resolved = go2_settings._resolve_setup_script_path(legacy_missing, str(fallback_setup))
 
@@ -457,12 +474,201 @@ def test_go2_bridge_can_synthesize_local_maps_from_direct_dds_point_cloud() -> N
         resolution=occupancy.resolution_m,
         origin_x=occupancy.origin.position.x,
         origin_y=occupancy.origin.position.y,
-        x=1.0,
+        x=1.5,
         y=0.0,
     )
     assert occupancy.data[obstacle_index] == 100
     assert cost_map.data[obstacle_index] == 100.0
     assert any(region.label == "hazard" for region in semantic_map.regions)
+
+
+def test_go2_bridge_decodes_unitree_wxyz_pose_quaternion_before_mapping() -> None:
+    bridge = RclpyGo2RosBridge(Go2DataPlaneConfig(enabled=True))
+    yaw_rad = math.pi / 2.0
+    message = SimpleNamespace(
+        position=[1.0, 2.0, 0.0],
+        imu_state=SimpleNamespace(
+            quaternion=[math.cos(yaw_rad / 2.0), 0.0, 0.0, math.sin(yaw_rad / 2.0)],
+            gyroscope=[0.0, 0.0, 0.0],
+            accelerometer=[0.0, 0.0, 0.0],
+            rpy=[0.0, 0.0, yaw_rad],
+        ),
+    )
+
+    pose = bridge._build_pose_from_sport_mode_state(message)
+    world_points, sensor_x, sensor_y = bridge._transform_point_cloud_to_map(
+        np.asarray([[1.0, 0.0, 0.10]], dtype=np.float32),
+        current_pose=pose,
+    )
+
+    assert math.isclose(sensor_x, 1.0, abs_tol=1e-6)
+    assert math.isclose(sensor_y, 2.0, abs_tol=1e-6)
+    assert world_points.shape == (1, 3)
+    assert np.allclose(world_points[0], np.asarray([1.0, 3.0, 0.10], dtype=np.float32), atol=1e-6)
+
+
+def test_go2_bridge_filters_self_points_before_mapping_transform() -> None:
+    bridge = RclpyGo2RosBridge(
+        Go2DataPlaneConfig(
+            enabled=True,
+            map_synthesis=Go2MapSynthesisConfig(
+                point_cloud_self_filter_radius_m=0.55,
+            ),
+        )
+    )
+    current_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=0.0, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    world_points, sensor_x, sensor_y = bridge._transform_point_cloud_to_map(
+        np.asarray(
+            [
+                [0.20, 0.00, 0.10],
+                [0.50, 0.00, 0.10],
+                [0.60, 0.00, 0.10],
+                [1.00, 0.00, 0.10],
+            ],
+            dtype=np.float32,
+        ),
+        current_pose=current_pose,
+    )
+
+    assert sensor_x == 0.0
+    assert sensor_y == 0.0
+    assert world_points.shape == (2, 3)
+    assert np.allclose(
+        world_points,
+        np.asarray(
+            [
+                [0.60, 0.00, 0.10],
+                [1.00, 0.00, 0.10],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+def test_go2_bridge_detects_live_like_self_ring_radius_from_sensor_points() -> None:
+    bridge = RclpyGo2RosBridge(
+        Go2DataPlaneConfig(
+            enabled=True,
+            map_synthesis=Go2MapSynthesisConfig(
+                point_cloud_self_filter_radius_m=0.55,
+            ),
+        )
+    )
+    current_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=0.0, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    angles = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False, dtype=np.float32)
+    radii = np.where((np.arange(angles.size) % 2) == 0, 0.68, 0.74).astype(np.float32)
+    ring_points = np.stack(
+        (
+            radii * np.cos(angles),
+            radii * np.sin(angles),
+            np.full_like(radii, 0.30),
+        ),
+        axis=1,
+    )
+
+    bridge._transform_point_cloud_to_map(ring_points, current_pose=current_pose)
+
+    assert bridge._latest_detected_self_ring_radius_m >= 0.68
+    assert bridge._latest_detected_self_ring_radius_m <= 0.80
+
+
+def test_go2_origin_clearance_breaks_self_obstacle_ring_for_frontier_gap() -> None:
+    current_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=0.0, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    resolution_m = 0.05
+    width = 100
+    height = 100
+    origin_x = -2.5
+    origin_y = -2.5
+    center_row = int((0.0 - origin_y) / resolution_m)
+    center_col = int((0.0 - origin_x) / resolution_m)
+
+    occupancy_data = np.full((height, width), -1, dtype=np.int32)
+    cost_data = np.zeros((height, width), dtype=np.float32)
+    occupied_mask = np.zeros((height, width), dtype=bool)
+    for row in range(height):
+        for col in range(width):
+            distance_m = np.hypot((row - center_row) * resolution_m, (col - center_col) * resolution_m)
+            if distance_m <= 1.50:
+                occupancy_data[row, col] = 0
+            if 0.67 <= distance_m <= 0.75:
+                occupancy_data[row, col] = 100
+                cost_data[row, col] = 100.0
+                occupied_mask[row, col] = True
+
+    build_result = go2_data_plane.Go2GlobalMapBuildResult(
+        width=width,
+        height=height,
+        resolution_m=resolution_m,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        occupancy_data=occupancy_data,
+        cost_data=cost_data,
+        occupied_mask=occupied_mask,
+        source_label="synthetic_self_ring",
+        known_cell_count=int(np.count_nonzero(occupancy_data >= 0)),
+    )
+
+    ring_angles = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False, dtype=np.float32)
+    ring_radii = np.where((np.arange(ring_angles.size) % 2) == 0, 0.68, 0.74).astype(np.float32)
+    ring_points = np.stack(
+        (
+            ring_radii * np.cos(ring_angles),
+            ring_radii * np.sin(ring_angles),
+            np.full_like(ring_radii, 0.30),
+        ),
+        axis=1,
+    )
+
+    def _evaluate_gap(detect_self_ring: bool):
+        config = Go2DataPlaneConfig(
+            enabled=True,
+            exploration=Go2ExplorationConfig(enabled=True),
+            map_synthesis=Go2MapSynthesisConfig(
+                global_map_enabled=True,
+                local_map_enabled=False,
+                global_map_resolution_m=resolution_m,
+                point_cloud_self_filter_radius_m=0.55,
+                semantic_min_cells=1,
+            ),
+        )
+        bridge = RclpyGo2RosBridge(config)
+        if detect_self_ring:
+            bridge._transform_point_cloud_to_map(ring_points, current_pose=current_pose)
+        occupancy_grid, cost_map, _semantic_map = bridge._build_contract_maps_from_global_result(
+            build_result,
+            current_pose=current_pose,
+        )
+        runtime = Go2DataPlaneRuntime(
+            config,
+            bridge=_FakeBridge(localization_available=True, map_available=True, navigation_available=False),
+        )
+        runtime.get_cost_map = lambda: cost_map
+        return runtime._describe_exploration_frontier_gap(
+            request=ExploreAreaRequest(request_id=f"ring_gap_{int(detect_self_ring)}", strategy="frontier"),
+            current_pose=current_pose,
+            occupancy_grid=occupancy_grid,
+        )
+
+    disconnected_message, disconnected_metadata = _evaluate_gap(False)
+    recovered_message, recovered_metadata = _evaluate_gap(True)
+
+    assert disconnected_message is not None
+    assert "前沿已生成，但与机器人可达区域仍断开" in disconnected_message
+    assert disconnected_metadata["reachable_frontier_clusters"] == 0
+
+    assert recovered_message is None
+    assert recovered_metadata["reachable_frontier_clusters"] > 0
 
 
 def test_go2_bridge_restores_persisted_global_map_and_voxel_cache_after_restart(tmp_path: Path) -> None:
@@ -814,10 +1020,86 @@ def test_go2_cyclonedds_lib_dir_uses_configured_path(monkeypatch, tmp_path: Path
     assert config.topics.point_cloud_topic == "/utlidar/cloud"
 
 
+def test_go2_data_plane_prefers_platform_geometry_config_over_go2_geometry_env(monkeypatch) -> None:
+    monkeypatch.setenv("GO2_DATA_PLANE_ODOM_TOPIC", "/legacy/odom")
+    monkeypatch.setenv("GO2_DATA_PLANE_MAP_FRAME", "legacy_map")
+
+    platform_geometry = PlatformGeometryConfig(
+        enabled=True,
+        topics=GeometryTopicsConfig(
+            odom_topic="/platform/odom",
+            imu_topic="/platform/imu",
+            point_cloud_topic="/platform/cloud",
+            tf_topic="/platform/tf",
+            tf_static_topic="/platform/tf_static",
+            occupancy_topic="/platform/map",
+            cost_map_topic="/platform/costmap",
+        ),
+        frames=GeometryFrameConfig(
+            map_frame="platform_map",
+            base_frame="platform_base",
+            lidar_frame="platform_lidar",
+        ),
+    )
+
+    config = go2_settings.load_go2_data_plane_config(platform_geometry=platform_geometry)
+
+    assert config.topics.odom_topic == "/platform/odom"
+    assert config.topics.imu_topic == "/platform/imu"
+    assert config.topics.point_cloud_topic == "/platform/cloud"
+    assert config.topics.occupancy_topic == "/platform/map"
+    assert config.topics.cost_map_topic == "/platform/costmap"
+    assert config.map_synthesis.map_frame == "platform_map"
+    assert config.map_synthesis.base_frame == "platform_base"
+    assert config.map_synthesis.lidar_frame == "platform_lidar"
+
+
+def test_go2_file_value_loader_only_reads_data_plane_env(tmp_path: Path, monkeypatch) -> None:
+    root_env = tmp_path / ".env"
+    root_env.write_text(
+        "\n".join(
+            (
+                "GO2_DATA_PLANE_STARTUP_MAP_TIMEOUT_SEC=77.0",
+                "GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED=false",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    legacy_config = tmp_path / ".config"
+    legacy_config.write_text(
+        "GO2_DATA_PLANE_STARTUP_LOCALIZATION_TIMEOUT_SEC=88.0\n",
+        encoding="utf-8",
+    )
+    go2_env = tmp_path / "drivers" / "go2" / "data_plane.env"
+    go2_env.parent.mkdir(parents=True, exist_ok=True)
+    go2_env.write_text(
+        "\n".join(
+            (
+                "GO2_DATA_PLANE_ENABLED=true",
+                "GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED=true",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(go2_settings, "_ENV_FILE", root_env)
+    monkeypatch.setattr(go2_settings, "_LEGACY_CONFIG_FILE", legacy_config)
+    monkeypatch.setattr(go2_settings, "_GO2_ENV_FILE", go2_env)
+
+    values = go2_settings._load_file_values()
+
+    assert values["GO2_DATA_PLANE_ENABLED"] == "true"
+    assert values["GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED"] == "true"
+    assert "GO2_DATA_PLANE_STARTUP_MAP_TIMEOUT_SEC" not in values
+    assert "GO2_DATA_PLANE_STARTUP_LOCALIZATION_TIMEOUT_SEC" not in values
+
+
 def test_go2_shell_scripts_pass_bash_syntax_check() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     scripts = (
-        repo_root / "drivers" / "robots" / "go2" / "source_runtime_env.sh",
+        repo_root / "drivers" / "go2" / "source_runtime_env.sh",
     )
     for script in scripts:
         subprocess.run(["bash", "-n", str(script)], check=True)
@@ -1193,6 +1475,43 @@ def test_go2_data_plane_routes_motion_through_official_obstacles_avoid_when_enab
     assert sport_client.move_calls == []
 
 
+def test_go2_data_plane_exports_non_negative_remaining_yaw_in_navigation_state() -> None:
+    runtime = Go2DataPlaneRuntime(
+        Go2DataPlaneConfig(enabled=True),
+        bridge=_FakeBridge(localization_available=True, map_available=True, navigation_available=False),
+    )
+    current_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=0.0, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    target_yaw_rad = -2.1169299264066628
+    target_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=1.0, y=0.0, z=0.0),
+        orientation=Quaternion(
+            z=math.sin(target_yaw_rad * 0.5),
+            w=math.cos(target_yaw_rad * 0.5),
+        ),
+    )
+
+    goal_yaw_error_rad = runtime._compute_direct_goal_yaw_error(
+        current_pose=current_pose,
+        target_pose=target_pose,
+    )
+    exported_remaining_yaw = runtime._sanitize_navigation_state_remaining_yaw(goal_yaw_error_rad)
+    state = NavigationState(
+        status=NavigationStatus.RUNNING,
+        remaining_yaw_rad=exported_remaining_yaw,
+        metadata={"goal_yaw_error_rad": goal_yaw_error_rad},
+    )
+
+    assert math.isclose(goal_yaw_error_rad, target_yaw_rad, rel_tol=1e-6, abs_tol=1e-6)
+    assert state.remaining_yaw_rad is not None
+    assert math.isclose(state.remaining_yaw_rad, abs(target_yaw_rad), rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(float(state.metadata["goal_yaw_error_rad"]), target_yaw_rad, rel_tol=1e-6, abs_tol=1e-6)
+
+
 def test_go2_data_plane_falls_back_to_sport_client_when_obstacle_avoidance_disabled() -> None:
     config = Go2DataPlaneConfig(enabled=True)
     runtime = Go2DataPlaneRuntime(
@@ -1216,6 +1535,30 @@ def test_go2_data_plane_falls_back_to_sport_client_when_obstacle_avoidance_disab
     assert result["control_path"] == "sport"
     assert obstacles_client.remote_calls[-1] is False
     assert sport_client.move_calls[-1] == (0.1, 0.0, -0.1)
+
+
+def test_go2_data_plane_falls_back_to_sport_client_when_obstacles_avoid_is_temporarily_unready() -> None:
+    config = Go2DataPlaneConfig(enabled=True)
+    runtime = Go2DataPlaneRuntime(
+        config,
+        bridge=_FakeBridge(localization_available=True, map_available=True, navigation_available=False),
+    )
+    sport_client = _FakeSportClient()
+    obstacles_client = _FakeObstaclesAvoidClient()
+    obstacles_client.switch_set_code = 3104
+    runtime._official_sport_client = sport_client
+    runtime._official_sport_ready = True
+    runtime._official_obstacles_avoid_client = obstacles_client
+    runtime._official_obstacles_avoid_ready = True
+    runtime._obstacle_avoidance_enabled = True
+
+    code = runtime._send_official_motion_command(0.15, 0.0, 0.05)
+
+    assert code == 0
+    assert runtime._official_obstacles_avoid_switch_state is False
+    assert runtime._official_obstacles_avoid_remote_control is False
+    assert obstacles_client.move_calls == []
+    assert sport_client.move_calls[-1] == (0.15, 0.0, 0.05)
 
 
 def test_go2_data_plane_respects_obstacle_avoidance_default_config(monkeypatch) -> None:

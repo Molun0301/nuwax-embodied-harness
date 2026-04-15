@@ -15,11 +15,12 @@ from contracts.navigation import NavigationGoal, NavigationStatus
 from services.navigation.path_tools import evaluate_path_safety, resample_waypoints
 
 if TYPE_CHECKING:
-    from drivers.robots.go2.settings import Go2NavigationBackendConfig, Go2OfficialBackendConfig
+    from services.navigation.config import NavigationBackendConfig, NavigationControlConfig
 
 
 Point2D = Tuple[float, float]
 Cell2D = Tuple[int, int]
+_PLATFORM_NAVIGATION_BACKEND_NAME = "platform_grid_navigation"
 
 
 class NavigationExecutionState(StrEnum):
@@ -34,8 +35,8 @@ class NavigationExecutionState(StrEnum):
 
 
 @dataclass
-class Go2GridPlan:
-    """Go2 端侧一次路径规划结果。"""
+class GridPlan:
+    """平台网格导航一次路径规划结果。"""
 
     frame_id: str
     waypoints: List[Point2D]
@@ -48,8 +49,8 @@ class Go2GridPlan:
 
 
 @dataclass
-class Go2NavigationTickResult:
-    """Go2 导航单次控制更新结果。"""
+class NavigationTickResult:
+    """导航执行单次控制更新结果。"""
 
     status: NavigationStatus
     message: str
@@ -75,7 +76,7 @@ class _PolylineProjection:
 class _PlanningOutcome:
     """路径规划内部结果。"""
 
-    plan: Optional[Go2GridPlan]
+    plan: Optional[GridPlan]
     message: str
     reason: str
     can_retry: bool = False
@@ -151,8 +152,8 @@ class _PlanningMap:
         return self.line_is_clear(start_cell, end_cell)
 
 
-class Go2GridNavigationPlanner:
-    """Go2 内部二维路径规划器。"""
+class GridNavigationPlanner:
+    """平台二维网格路径规划器。"""
 
     _NEIGHBORS: Tuple[Tuple[int, int, float], ...] = (
         (-1, 0, 1.0),
@@ -165,7 +166,7 @@ class Go2GridNavigationPlanner:
         (1, 1, math.sqrt(2.0)),
     )
 
-    def __init__(self, config: "Go2NavigationBackendConfig") -> None:
+    def __init__(self, config: "NavigationBackendConfig") -> None:
         self.config = config
 
     def plan(
@@ -289,7 +290,7 @@ class Go2GridNavigationPlanner:
             waypoints = self._deduplicate_waypoints(waypoints)
         total_distance_m = _polyline_length(waypoints)
         return _PlanningOutcome(
-            plan=Go2GridPlan(
+            plan=GridPlan(
                 frame_id=planning_map.frame_id,
                 waypoints=waypoints,
                 planning_target=final_target_point,
@@ -310,7 +311,7 @@ class Go2GridNavigationPlanner:
         target_pose: Pose,
         occupancy_grid: Optional[OccupancyGrid],
         cost_map: Optional[CostMap],
-    ) -> Optional[Go2GridPlan]:
+    ) -> Optional[GridPlan]:
         outcome = self.plan(
             current_pose=current_pose,
             target_pose=target_pose,
@@ -567,22 +568,22 @@ class Go2GridNavigationPlanner:
         return deduplicated
 
 
-class Go2NavigationSession:
-    """Go2 单个导航目标的规划与控制会话。"""
+class NavigationSession:
+    """单个导航目标的规划与控制会话。"""
 
     def __init__(
         self,
         *,
         goal: NavigationGoal,
-        planner: Go2GridNavigationPlanner,
-        planner_config: "Go2NavigationBackendConfig",
-        control_config: "Go2OfficialBackendConfig",
+        planner: GridNavigationPlanner,
+        planner_config: "NavigationBackendConfig",
+        control_config: "NavigationControlConfig",
     ) -> None:
         self.goal = goal
         self._planner = planner
         self._planner_config = planner_config
         self._control_config = control_config
-        self._current_plan: Optional[Go2GridPlan] = None
+        self._current_plan: Optional[GridPlan] = None
         self._plan_version = 0
         self._last_plan_time_monotonic = 0.0
         self._last_progress_time_monotonic = 0.0
@@ -598,10 +599,10 @@ class Go2NavigationSession:
         occupancy_grid: Optional[OccupancyGrid],
         cost_map: Optional[CostMap],
         now_monotonic: float,
-    ) -> Go2NavigationTickResult:
+    ) -> NavigationTickResult:
         target_pose = self.goal.target_pose
         if target_pose is None:
-            return Go2NavigationTickResult(
+            return NavigationTickResult(
                 status=NavigationStatus.FAILED,
                 message="导航目标缺少目标位姿。",
             )
@@ -610,7 +611,7 @@ class Go2NavigationSession:
             and target_pose.frame_id
             and not frame_ids_semantically_equal(current_pose.frame_id, target_pose.frame_id)
         ):
-            return Go2NavigationTickResult(
+            return NavigationTickResult(
                 status=NavigationStatus.FAILED,
                 message=f"目标坐标系 {target_pose.frame_id} 与当前位姿坐标系 {current_pose.frame_id} 不一致。",
             )
@@ -627,21 +628,21 @@ class Go2NavigationSession:
         if goal_distance_m <= float(self._control_config.goal_tolerance_m):
             if abs(goal_yaw_error_rad) <= float(self._control_config.goal_yaw_tolerance_rad):
                 self._execution_state = NavigationExecutionState.IDLE
-                return Go2NavigationTickResult(
+                return NavigationTickResult(
                     status=NavigationStatus.SUCCEEDED,
-                    message="Go2 工程导航目标已到达。",
+                    message="平台网格导航目标已到达。",
                     remaining_distance_m=0.0,
                     remaining_yaw_rad=0.0,
                     goal_reached=True,
                     metadata={
-                        "backend": "official_grid_navigation",
+                        "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                         "controller_mode": "goal_reached",
                         "execution_state": NavigationExecutionState.IDLE,
                         "plan_version": self._plan_version,
                     },
                 )
             self._execution_state = NavigationExecutionState.FINAL_YAW_ALIGNMENT
-            return Go2NavigationTickResult(
+            return NavigationTickResult(
                 status=NavigationStatus.RUNNING,
                 message="已到达目标位置，正在进行最终朝向对齐。",
                 remaining_distance_m=goal_distance_m,
@@ -653,7 +654,7 @@ class Go2NavigationSession:
                     float(self._control_config.max_yaw_rate_rps),
                 ),
                 metadata={
-                    "backend": "official_grid_navigation",
+                    "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                     "controller_mode": "final_yaw_alignment",
                     "execution_state": NavigationExecutionState.FINAL_YAW_ALIGNMENT,
                     "plan_version": self._plan_version,
@@ -733,15 +734,15 @@ class Go2NavigationSession:
             float(self._control_config.max_yaw_rate_rps),
         )
         self._execution_state = NavigationExecutionState.FOLLOWING_PATH
-        return Go2NavigationTickResult(
+        return NavigationTickResult(
             status=NavigationStatus.RUNNING,
-            message="Go2 工程导航执行中。",
+            message="平台网格导航执行中。",
             remaining_distance_m=estimated_remaining_m,
             remaining_yaw_rad=goal_yaw_error_rad,
             linear_x_mps=linear_x_mps,
             angular_z_rps=angular_z_rps,
             metadata={
-                "backend": "official_grid_navigation",
+                "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                 "controller_mode": "planned_path_follow",
                 "execution_state": NavigationExecutionState.FOLLOWING_PATH,
                 "heading_error_rad": heading_error_rad,
@@ -765,7 +766,7 @@ class Go2NavigationSession:
         target_pose: Pose,
         occupancy_grid: Optional[OccupancyGrid],
         cost_map: Optional[CostMap],
-    ) -> Optional[Go2GridPlan]:
+    ) -> Optional[GridPlan]:
         return self._planner.plan_preview(
             current_pose=current_pose,
             target_pose=target_pose,
@@ -857,7 +858,7 @@ class Go2NavigationSession:
         cost_map: Optional[CostMap],
         reason: str,
         now_monotonic: float,
-    ) -> Optional[Go2NavigationTickResult]:
+    ) -> Optional[NavigationTickResult]:
         cooldown_sec = max(0.0, float(self._planner_config.replan_cooldown_sec))
         if self._current_plan is not None and (now_monotonic - self._last_plan_time_monotonic) < cooldown_sec:
             return None
@@ -881,21 +882,21 @@ class Go2NavigationSession:
             )
             self._execution_state = execution_state
             if self._plan_failure_count >= int(self._planner_config.max_replan_failures):
-                return Go2NavigationTickResult(
+                return NavigationTickResult(
                     status=NavigationStatus.FAILED,
                     message=planning_outcome.message,
                     metadata={
-                        "backend": "official_grid_navigation",
+                        "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                         "execution_state": execution_state,
                         "replan_reason": reason,
                         "plan_failures": self._plan_failure_count,
                     },
                 )
-            return Go2NavigationTickResult(
+            return NavigationTickResult(
                 status=NavigationStatus.PLANNING,
                 message=planning_outcome.message,
                 metadata={
-                    "backend": "official_grid_navigation",
+                    "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                     "execution_state": execution_state,
                     "replan_reason": reason,
                     "plan_failures": self._plan_failure_count,
@@ -913,22 +914,22 @@ class Go2NavigationSession:
                 "规划路径与障碍物掩码重叠比例过高，已拒绝执行并等待重规划。"
             )
             if self._plan_failure_count >= int(self._planner_config.max_replan_failures):
-                return Go2NavigationTickResult(
+                return NavigationTickResult(
                     status=NavigationStatus.FAILED,
                     message=message,
                     metadata={
-                        "backend": "official_grid_navigation",
+                        "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                         "execution_state": NavigationExecutionState.RECOVERY,
                         "replan_reason": "path_mask_blocked",
                         "path_occupied_ratio": path_safety.occupied_ratio,
                         "plan_failures": self._plan_failure_count,
                     },
                 )
-            return Go2NavigationTickResult(
+            return NavigationTickResult(
                 status=NavigationStatus.PLANNING,
                 message=message,
                 metadata={
-                    "backend": "official_grid_navigation",
+                    "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                     "execution_state": NavigationExecutionState.RECOVERY,
                     "replan_reason": "path_mask_blocked",
                     "path_occupied_ratio": path_safety.occupied_ratio,
@@ -952,7 +953,7 @@ class Go2NavigationSession:
         current_pose: Pose,
         goal_distance_m: float,
         goal_yaw_error_rad: float,
-    ) -> Go2NavigationTickResult:
+    ) -> NavigationTickResult:
         target_pose = self.goal.target_pose
         current_yaw = _yaw_from_pose(current_pose)
         desired_heading_rad = math.atan2(
@@ -975,7 +976,7 @@ class Go2NavigationSession:
             float(self._control_config.max_yaw_rate_rps),
         )
         self._execution_state = NavigationExecutionState.DIRECT_FALLBACK
-        return Go2NavigationTickResult(
+        return NavigationTickResult(
             status=NavigationStatus.RUNNING,
             message="地图未就绪，当前按降级直驱模式执行导航。",
             remaining_distance_m=goal_distance_m,
@@ -983,7 +984,7 @@ class Go2NavigationSession:
             linear_x_mps=linear_x_mps,
             angular_z_rps=angular_z_rps,
             metadata={
-                "backend": "official_grid_navigation",
+                "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                 "controller_mode": "direct_fallback",
                 "execution_state": NavigationExecutionState.DIRECT_FALLBACK,
                 "heading_error_rad": heading_error_rad,
@@ -995,7 +996,7 @@ class Go2NavigationSession:
     def _evaluate_path_safety(
         self,
         *,
-        plan: Go2GridPlan,
+        plan: GridPlan,
         occupancy_grid: Optional[OccupancyGrid],
     ):
         if occupancy_grid is None:
@@ -1144,10 +1145,10 @@ def _point_on_polyline(*, polyline: Sequence[Point2D], target_distance_m: float)
     return polyline[-1]
 
 
-GridPlan = Go2GridPlan
-GridNavigationPlanner = Go2GridNavigationPlanner
-NavigationTickResult = Go2NavigationTickResult
-NavigationSession = Go2NavigationSession
+Go2GridPlan = GridPlan
+Go2GridNavigationPlanner = GridNavigationPlanner
+Go2NavigationTickResult = NavigationTickResult
+Go2NavigationSession = NavigationSession
 
 
 __all__ = [

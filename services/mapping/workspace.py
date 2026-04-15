@@ -7,6 +7,7 @@ from contracts.map_workspace import MapAsset, MapAssetStatus, MapVersion, MapWor
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus
 from core import EventBus, StateNamespace, StateStore
 from gateways.errors import GatewayError
+from services.geometry import PlatformGeometryRuntime
 from services.localization import LocalizationService
 from services.mapping.catalog import MapCatalogRepository
 from services.mapping.service import MappingService
@@ -23,6 +24,7 @@ class MapWorkspaceService:
         self,
         *,
         catalog_root: str,
+        geometry_runtime: PlatformGeometryRuntime,
         mapping_service: MappingService,
         localization_service: LocalizationService,
         memory_service: MemoryService,
@@ -33,6 +35,7 @@ class MapWorkspaceService:
     ) -> None:
         self._repository = MapCatalogRepository(catalog_root)
         self._version_repository = MapVersionRepository(catalog_root)
+        self._geometry_runtime = geometry_runtime
         self._mapping_service = mapping_service
         self._localization_service = localization_service
         self._memory_service = memory_service
@@ -109,6 +112,7 @@ class MapWorkspaceService:
         resolved_name = self._require_map_name(map_name)
         previous_active_map_name = self._repository.get_active_map_name()
         if previous_active_map_name != resolved_name:
+            self._geometry_runtime.clear_active_map_version(reason="switch_active_map")
             self._mapping_service.clear_latest_snapshot()
             self._localization_service.clear_latest_snapshot()
             self._localization_service.clear_active_session(reason="switch_active_map")
@@ -278,6 +282,9 @@ class MapWorkspaceService:
                 **dict(metadata or {}),
             },
         )
+        version = self._version_repository.save_existing_map_version(
+            self._geometry_runtime.prepare_map_version_assets(version)
+        )
         asset = self._repository.get_map_asset(resolved_name)
         if asset is None:
             raise GatewayError(
@@ -420,6 +427,7 @@ class MapWorkspaceService:
         self._repository.clear_active_map_name()
         if disable_memory_library and self._memory_service.get_active_library_name() == active_map_name:
             self._memory_service.disable_memory_library()
+        self._geometry_runtime.clear_active_map_version(reason="clear_active_map")
         self._mapping_service.clear_latest_snapshot()
         self._localization_service.clear_latest_snapshot()
         self._localization_service.clear_active_session(reason="clear_active_map")
@@ -475,6 +483,7 @@ class MapWorkspaceService:
             self._repository.clear_active_map_name()
             if self._memory_service.get_active_library_name() == resolved_name:
                 self._memory_service.disable_memory_library()
+            self._geometry_runtime.clear_active_map_version(reason="delete_active_map")
             self._mapping_service.clear_latest_snapshot()
             self._localization_service.clear_latest_snapshot()
             self._localization_service.clear_active_session(reason="delete_active_map")
@@ -618,21 +627,20 @@ class MapWorkspaceService:
         return None
 
     def _load_map_version_into_runtime(self, version: MapVersion) -> None:
+        prepared_version = version
+        if prepared_version.geometry_asset is None:
+            prepared_version = self._version_repository.save_existing_map_version(
+                self._geometry_runtime.prepare_map_version_assets(prepared_version)
+            )
+        runtime_snapshot = self._geometry_runtime.activate_map_version(prepared_version)
         self._mapping_service.ingest_external_snapshot(
-            source_name="platform_map_version:%s" % version.map_name,
-            occupancy_grid=version.snapshot.occupancy_grid.model_copy(deep=True) if version.snapshot.occupancy_grid is not None else None,
-            cost_map=version.snapshot.cost_map.model_copy(deep=True) if version.snapshot.cost_map is not None else None,
-            semantic_map=version.snapshot.semantic_map.model_copy(deep=True) if version.snapshot.semantic_map is not None else None,
-            metadata={
-                **dict(version.snapshot.metadata),
-                "source_kind": "platform_map_version",
-                "map_name": version.map_name,
-                "platform_map_version_id": version.version_id,
-                "platform_map_version_revision": version.revision,
-                "source_snapshot_version_id": version.source_version_id,
-            },
-            version_id_override=version.version_id,
-            revision_override=version.revision,
+            source_name=runtime_snapshot.source_name,
+            occupancy_grid=runtime_snapshot.occupancy_grid,
+            cost_map=runtime_snapshot.cost_map,
+            semantic_map=runtime_snapshot.semantic_map,
+            metadata=runtime_snapshot.metadata,
+            version_id_override=prepared_version.version_id,
+            revision_override=prepared_version.revision,
         )
         self._localization_service.clear_latest_snapshot()
 

@@ -21,17 +21,13 @@ from contracts.memory import MemoryPayloadFilter
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, TaskManager
-from drivers.robots.common import (
+from drivers.entry import load_active_robot_private_capability_specs
+from drivers.common import (
     LoadedMapNameDataPlane,
     MappingRuntimeControlDataPlane,
     NamedMapRuntimeStatusDataPlane,
     ObstacleAvoidanceControlDataPlane,
     RobotAssemblyBase,
-)
-from drivers.robots.go2.capabilities import (
-    GO2_SPORT_COMMAND_NAMES,
-    build_go2_sport_command_description,
-    build_go2_sport_command_input_schema,
 )
 from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
@@ -39,6 +35,7 @@ from gateways.serialization import to_jsonable
 from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
+from services.geometry import PlatformGeometryRuntime
 from services.localization import LocalizationService
 from services.mapping import MappingService, MapWorkspaceService
 from services.memory import MemoryService
@@ -60,6 +57,16 @@ from settings import NuwaxRobotBridgeConfig
 
 RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.runtime")
 _RUNTIME_EVENT_LOG_RATE_LIMIT_SEC = 10.0
+_OPS_DEBUG_CAPABILITY_NAMES = frozenset(
+    {
+        "capture_image",
+        "get_joint_state",
+        "get_imu_state",
+        "get_localization_snapshot",
+        "get_map_snapshot",
+        "get_navigation_snapshot",
+    }
+)
 
 
 def _schema_object(
@@ -185,6 +192,11 @@ class GatewayRuntime:
             history_limit=config.runtime_data.state_history_limit,
             diagnostic_history_limit=config.runtime_data.diagnostic_history_limit,
         )
+        self.platform_geometry_runtime = PlatformGeometryRuntime(
+            config=config.geometry,
+            catalog_root=config.runtime_data.map_catalog_root,
+            robot=robot,
+        )
         self.observation_service = ObservationService(
             provider_owner=robot,
             artifact_service=self.artifact_service,
@@ -193,13 +205,13 @@ class GatewayRuntime:
             history_limit=config.runtime_data.observation_history_limit,
         )
         self.localization_service = LocalizationService(
-            provider_owner=robot,
+            provider_owner=self.platform_geometry_runtime,
             state_store=self.state_store,
             event_bus=self.event_bus,
             history_limit=config.runtime_data.localization_history_limit,
         )
         self.mapping_service = MappingService(
-            provider_owner=robot,
+            provider_owner=self.platform_geometry_runtime,
             state_store=self.state_store,
             event_bus=self.event_bus,
             history_limit=config.runtime_data.map_history_limit,
@@ -207,6 +219,7 @@ class GatewayRuntime:
         perception_components = _build_perception_components(robot)
         self.perception_service = PerceptionService(
             provider_owner=robot,
+            localization_provider_owner=self.platform_geometry_runtime,
             artifact_service=self.artifact_service,
             state_store=self.state_store,
             detector_pipeline=perception_components["detector_pipeline"],
@@ -264,7 +277,7 @@ class GatewayRuntime:
         )
         self.perception_video_runtime._memory_service = self.memory_service
         self.navigation_service = NavigationService(
-            provider_owner=robot,
+            provider_owner=self.platform_geometry_runtime,
             localization_service=self.localization_service,
             mapping_service=self.mapping_service,
             state_store=self.state_store,
@@ -273,6 +286,7 @@ class GatewayRuntime:
         )
         self.map_workspace_service = MapWorkspaceService(
             catalog_root=config.runtime_data.map_catalog_root,
+            geometry_runtime=self.platform_geometry_runtime,
             mapping_service=self.mapping_service,
             localization_service=self.localization_service,
             memory_service=self.memory_service,
@@ -308,6 +322,7 @@ class GatewayRuntime:
                 self.robot.manifest.robot_model,
             )
             self.robot.start()
+            self.platform_geometry_runtime.start()
             self._started = True
         try:
             self.robot_state_service.refresh()
@@ -355,6 +370,7 @@ class GatewayRuntime:
             self.task_manager.shutdown(wait=False)
             self.audio_service.stop()
             self.perception_video_runtime.stop()
+            self.platform_geometry_runtime.stop()
             self.robot.stop()
             self._started = False
 
@@ -432,6 +448,9 @@ class GatewayRuntime:
     def register_default_capabilities(self) -> None:
         """注册首版网关能力。"""
 
+        private_specs = load_active_robot_private_capability_specs(self.config)
+        active_private_names = frozenset(spec.name for spec in private_specs)
+        active_robot_name = self._resolve_active_robot_namespace()
         capabilities = (
             _descriptor(
                 "get_robot_status",
@@ -1187,66 +1206,6 @@ class GatewayRuntime:
                 cancel_supported=True,
             ),
             _descriptor(
-                "execute_sport_command",
-                "执行机身动作",
-                build_go2_sport_command_description(),
-                execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.MEDIUM,
-                input_schema=build_go2_sport_command_input_schema(),
-                output_schema=_schema_object({"code": {"type": "integer"}, "result": {"type": "object"}}),
-            ),
-            _descriptor(
-                "set_body_pose",
-                "设置机身姿态",
-                "通过机身欧拉角控制机器人姿态。",
-                execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.MEDIUM,
-                input_schema=_schema_object(
-                    {
-                        "roll": {"type": "number", "default": 0.0},
-                        "pitch": {"type": "number", "default": 0.0},
-                        "yaw": {"type": "number", "default": 0.0},
-                    }
-                ),
-                output_schema=_schema_object({"code": {"type": "integer"}, "result": {"type": "object"}}),
-            ),
-            _descriptor(
-                "set_speed_level",
-                "设置速度档位",
-                "设置机器人运动速度档位。",
-                execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.MEDIUM,
-                input_schema=_schema_object(
-                    {
-                        "level": {"type": "integer", "minimum": 1, "maximum": 3},
-                    },
-                    required=("level",),
-                ),
-                output_schema=_schema_object({"code": {"type": "integer"}, "result": {"type": "object"}}),
-            ),
-            _descriptor(
-                "get_volume",
-                "获取音量",
-                "读取当前机器人音量与软件播报音量状态。",
-                execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.LOW,
-                output_schema=_schema_object({"volume_state": {"type": "object"}}),
-            ),
-            _descriptor(
-                "set_volume",
-                "设置音量",
-                "设置机器人音量与软件播报音量。",
-                execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.MEDIUM,
-                input_schema=_schema_object(
-                    {
-                        "volume": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                    },
-                    required=("volume",),
-                ),
-                output_schema=_schema_object({"volume_state": {"type": "object"}}),
-            ),
-            _descriptor(
                 "speak_text",
                 "播报文本",
                 "提交一段中文文本到宿主机播报服务；未配置实时语音时退化为记录模式。",
@@ -1260,33 +1219,30 @@ class GatewayRuntime:
                 ),
                 output_schema=_schema_object({"speech": {"type": "object"}}),
             ),
+        )
+        capabilities = tuple(
+            self._decorate_gateway_descriptor(descriptor, active_private_names=active_private_names)
+            for descriptor in capabilities
+        ) + tuple(
             _descriptor(
-                "switch_control_mode",
-                "切换控制模式",
-                "切换机器人高层/低层控制模式，默认仅管理员可见。",
+                spec.name,
+                spec.display_name,
+                spec.description,
                 execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.ADMIN,
-                input_schema=_schema_object({"mode": {"type": "string", "enum": ["high", "low"]}}, required=("mode",)),
-                output_schema=_schema_object({"code": {"type": "integer"}, "result": {"type": "object"}}),
-                exposed_to_agent=False,
-            ),
-            _descriptor(
-                "set_obstacle_avoidance",
-                "设置实时避障",
-                "开启或关闭 Go2 官方实时避障服务。开启后，Go2 官方导航执行环会改走 obstacles_avoid 服务链路。",
-                execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.LOW,
-                input_schema=_schema_object({"enabled": {"type": "boolean"}}, required=("enabled",)),
-                output_schema=_schema_object(
-                    {
-                        "obstacle_avoidance_enabled": {"type": "boolean"},
-                        "backend_ready": {"type": "boolean"},
-                        "switch_enabled": {"type": "boolean"},
-                        "remote_command_enabled": {"type": "boolean"},
-                        "control_path": {"type": "string"},
-                    }
-                ),
-            ),
+                risk_level=spec.risk_level,
+                input_schema=spec.input_schema,
+                output_schema=spec.output_schema,
+                required_resources=spec.required_resources,
+                exposed_to_agent=spec.exposed_to_agent,
+                timeout_sec=spec.timeout_sec,
+                cancel_supported=spec.cancel_supported,
+            ).model_copy(
+                update={
+                    "tags": list(("robot_private", active_robot_name, *spec.tags)),
+                },
+                deep=True,
+            )
+            for spec in private_specs
         )
 
         handlers = {
@@ -1351,7 +1307,11 @@ class GatewayRuntime:
             self.capability_registry.register(
                 descriptor,
                 handlers[descriptor.name],
-                owner="gateway_runtime",
+                owner=self._resolve_gateway_capability_owner(
+                    descriptor.name,
+                    active_private_names=active_private_names,
+                ),
+                metadata={"capability_layer": self._resolve_gateway_capability_layer(descriptor.name, active_private_names)},
                 overwrite=True,
             )
         self._gateway_capability_names = tuple(descriptor.name for descriptor in capabilities)
@@ -1360,6 +1320,8 @@ class GatewayRuntime:
     def register_default_skills(self) -> None:
         """注册首版技能工具面。"""
 
+        active_private_names = frozenset(spec.name for spec in load_active_robot_private_capability_specs(self.config))
+        active_robot_name = self._resolve_active_robot_namespace()
         skills = (
             SkillDescriptor(
                 name="list_capabilities",
@@ -1521,41 +1483,6 @@ class GatewayRuntime:
                 description="按给定速度和时长执行短时底盘移动。",
                 category=SkillCategory.MOTION,
                 capability_name="relative_move",
-            ),
-            SkillDescriptor(
-                name="execute_sport_command",
-                display_name="执行机身动作",
-                description="执行机器人入口支持的高层动作命令。",
-                category=SkillCategory.MOTION,
-                capability_name="execute_sport_command",
-            ),
-            SkillDescriptor(
-                name="set_body_pose",
-                display_name="设置机身姿态",
-                description="通过欧拉角控制机身姿态。",
-                category=SkillCategory.MOTION,
-                capability_name="set_body_pose",
-            ),
-            SkillDescriptor(
-                name="set_speed_level",
-                display_name="设置速度档位",
-                description="设置机器人运动速度档位。",
-                category=SkillCategory.MOTION,
-                capability_name="set_speed_level",
-            ),
-            SkillDescriptor(
-                name="get_volume",
-                display_name="获取音量",
-                description="读取机器人音量和软件播报音量。",
-                category=SkillCategory.AUDIO,
-                capability_name="get_volume",
-            ),
-            SkillDescriptor(
-                name="set_volume",
-                display_name="设置音量",
-                description="设置机器人音量和软件播报音量。",
-                category=SkillCategory.AUDIO,
-                capability_name="set_volume",
             ),
             SkillDescriptor(
                 name="speak_text",
@@ -1732,25 +1659,116 @@ class GatewayRuntime:
                 category=SkillCategory.TASK,
                 capability_name="follow_target",
             ),
-            SkillDescriptor(
-                name="switch_control_mode",
-                display_name="切换控制模式",
-                description="管理员技能，切换高层与低层控制模式。",
-                category=SkillCategory.ADMIN,
-                capability_name="switch_control_mode",
-                exposed_to_agent=False,
-            ),
-            SkillDescriptor(
-                name="set_obstacle_avoidance",
-                display_name="设置实时避障",
-                description="开启或关闭 Go2 官方实时避障服务；仅在 obstacles_avoid 服务就绪时才会暴露给 AI。",
-                category=SkillCategory.SYSTEM,
-                capability_name="set_obstacle_avoidance",
-            ),
         )
+        private_skills = tuple(
+            SkillDescriptor(
+                name=spec.name,
+                display_name=spec.display_name,
+                description=spec.description,
+                category=self._resolve_private_skill_category(spec.name, spec.risk_level),
+                capability_name=spec.name,
+                exposed_to_agent=False,
+                tags=["robot_private", active_robot_name],
+                metadata={"capability_layer": "robot_private"},
+            )
+            for spec in load_active_robot_private_capability_specs(self.config)
+        )
+        skills = tuple(
+            self._decorate_gateway_skill(descriptor, active_private_names=active_private_names)
+            for descriptor in skills
+        ) + private_skills
 
         for descriptor in skills:
             self.skill_registry.register(descriptor, overwrite=True)
+
+    def _decorate_gateway_descriptor(
+        self,
+        descriptor: CapabilityDescriptor,
+        *,
+        active_private_names: frozenset[str],
+    ) -> CapabilityDescriptor:
+        layer = self._resolve_gateway_capability_layer(descriptor.name, active_private_names)
+        tags = list(descriptor.tags)
+        if layer not in tags:
+            tags.append(layer)
+        exposed_to_agent = descriptor.exposed_to_agent
+        if layer in {"ops_debug", "robot_private"}:
+            exposed_to_agent = False
+        return descriptor.model_copy(
+            update={
+                "exposed_to_agent": exposed_to_agent,
+                "tags": tags,
+            },
+            deep=True,
+        )
+
+    def _decorate_gateway_skill(
+        self,
+        descriptor: SkillDescriptor,
+        *,
+        active_private_names: frozenset[str],
+    ) -> SkillDescriptor:
+        layer = self._resolve_gateway_capability_layer(descriptor.capability_name, active_private_names)
+        tags = list(descriptor.tags)
+        if layer not in tags:
+            tags.append(layer)
+        exposed_to_agent = descriptor.exposed_to_agent
+        if layer in {"ops_debug", "robot_private"}:
+            exposed_to_agent = False
+        return descriptor.model_copy(
+            update={
+                "exposed_to_agent": exposed_to_agent,
+                "tags": tags,
+                "metadata": {
+                    **dict(descriptor.metadata),
+                    "capability_layer": layer,
+                },
+            },
+            deep=True,
+        )
+
+    def _resolve_gateway_capability_owner(
+        self,
+        capability_name: str,
+        *,
+        active_private_names: frozenset[str],
+    ) -> str:
+        layer = self._resolve_gateway_capability_layer(capability_name, active_private_names)
+        if layer == "robot_private":
+            return "robot_private_runtime"
+        if layer == "ops_debug":
+            return "ops_debug_runtime"
+        return "gateway_runtime"
+
+    def _resolve_gateway_capability_layer(
+        self,
+        capability_name: str,
+        active_private_names: frozenset[str],
+    ) -> str:
+        if capability_name in active_private_names:
+            return "robot_private"
+        if capability_name in _OPS_DEBUG_CAPABILITY_NAMES:
+            return "ops_debug"
+        return "platform"
+
+    def _resolve_active_robot_namespace(self) -> str:
+        configured_robot_name = str(getattr(getattr(self.config, "robot", None), "active_robot", "") or "").strip().lower()
+        if configured_robot_name:
+            return configured_robot_name
+        return str(getattr(self.robot.manifest, "robot_name", "") or "").strip().lower()
+
+    def _resolve_private_skill_category(
+        self,
+        capability_name: str,
+        risk_level: CapabilityRiskLevel,
+    ) -> SkillCategory:
+        if risk_level == CapabilityRiskLevel.ADMIN:
+            return SkillCategory.ADMIN
+        if capability_name in {"get_volume", "set_volume"}:
+            return SkillCategory.AUDIO
+        if capability_name == "set_obstacle_avoidance":
+            return SkillCategory.SYSTEM
+        return SkillCategory.MOTION
 
     def list_capabilities(self, *, exposed_only: Optional[bool] = None) -> Tuple[CapabilityDescriptor, ...]:
         """列出运行时能力描述。"""
@@ -3377,7 +3395,12 @@ class GatewayRuntime:
         if not hasattr(self.robot, "execute_action"):
             raise GatewayError("当前机器人入口未实现 execute_action。")
         action = self._require_str(arguments, "action")
-        if action not in GO2_SPORT_COMMAND_NAMES:
+        supported_actions: Tuple[str, ...] = ()
+        if self._resolve_active_robot_namespace() == "go2":
+            from drivers.go2.capabilities import GO2_SPORT_COMMAND_NAMES
+
+            supported_actions = tuple(GO2_SPORT_COMMAND_NAMES)
+        if action not in supported_actions:
             raise GatewayError(
                 "execute_sport_command 当前只支持已公开的 Go2 高层机身动作命令。",
                 error_code="invalid_action",
@@ -3385,7 +3408,7 @@ class GatewayRuntime:
                 jsonrpc_code=-32602,
                 details={
                     "action": action,
-                    "supported_actions": list(GO2_SPORT_COMMAND_NAMES),
+                    "supported_actions": list(supported_actions),
                     "hint": "姿态、速度档位、控制模式和低层关节控制请使用专用工具。",
                 },
             )

@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
-from drivers.robots.go2 import create_go2_assembly
+from drivers.entry import create_active_robot_assembly
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
 from gateways.http.api import build_http_router
@@ -158,7 +158,7 @@ def create_gateway_app_from_env() -> FastAPI:
         config.logging.log_file,
         config.logging.level,
     )
-    robot = create_go2_assembly(config, iface=config.dds.iface or None)
+    robot = create_active_robot_assembly(config)
     runtime = create_default_gateway_runtime(config, robot)
     APP_LOGGER.info(
         "宿主机网关应用已创建 robot=%s model=%s artifact_dir=%s memory_db=%s",

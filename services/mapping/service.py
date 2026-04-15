@@ -32,6 +32,22 @@ class MappingService:
     def refresh(self) -> MapSnapshot:
         """从本地图提供器刷新地图快照。"""
 
+        runtime_snapshot_reader = getattr(self._provider_owner, "get_map_snapshot", None)
+        if callable(runtime_snapshot_reader):
+            runtime_snapshot = runtime_snapshot_reader()
+            if runtime_snapshot is not None:
+                if self._is_snapshot_contract_equivalent(runtime_snapshot):
+                    return self._latest_snapshot  # type: ignore[return-value]
+                return self.ingest_external_snapshot(
+                    source_name=runtime_snapshot.source_name,
+                    occupancy_grid=runtime_snapshot.occupancy_grid,
+                    cost_map=runtime_snapshot.cost_map,
+                    semantic_map=runtime_snapshot.semantic_map,
+                    metadata=runtime_snapshot.metadata,
+                    version_id_override=runtime_snapshot.version_id,
+                    revision_override=runtime_snapshot.revision,
+                )
+
         provider = self._get_map_provider()
         return self.ingest_external_snapshot(
             source_name=provider.provider_name,
@@ -204,10 +220,28 @@ class MappingService:
             return [self._normalize_snapshot_value(item) for item in value]
         return value
 
+    def _is_snapshot_contract_equivalent(self, snapshot: MapSnapshot) -> bool:
+        latest = self._latest_snapshot
+        if latest is None:
+            return False
+        return (
+            latest.source_name == snapshot.source_name
+            and latest.version_id == snapshot.version_id
+            and latest.revision == snapshot.revision
+            and self._normalize_snapshot_value(latest.occupancy_grid)
+            == self._normalize_snapshot_value(snapshot.occupancy_grid)
+            and self._normalize_snapshot_value(latest.cost_map)
+            == self._normalize_snapshot_value(snapshot.cost_map)
+            and self._normalize_snapshot_value(latest.semantic_map)
+            == self._normalize_snapshot_value(snapshot.semantic_map)
+            and self._normalize_snapshot_value(latest.metadata)
+            == self._normalize_snapshot_value(snapshot.metadata)
+        )
+
     def _get_map_provider(self) -> MapProvider:
         provider = self._find_map_provider()
         if provider is None:
-            raise GatewayError("当前机器人入口未提供地图提供器。")
+            raise GatewayError("当前平台几何运行时未提供地图提供器。")
         if not provider.is_available():
             raise GatewayError("当前地图提供器暂不可用。")
         return provider

@@ -6,7 +6,7 @@ from compat import StrEnum
 
 from pydantic import Field, field_validator
 
-from contracts.base import MetadataDict, TimestampedContract, utc_now
+from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
 from contracts.memory import MemoryStoreSummary
 from contracts.naming import validate_frame_id
 from contracts.runtime_views import ExplorationContext, LocalizationSession, LocalizationSnapshot, MapSnapshot, NavigationContext
@@ -82,6 +82,39 @@ class MapWorkspace(TimestampedContract):
     metadata: MetadataDict = Field(default_factory=dict, description="附加工作区元数据。")
 
 
+class MapGeometryAssetBinding(ContractModel):
+    """平台地图版本绑定的几何资产描述。"""
+
+    map_name: str = Field(description="所属地图名称。")
+    version_id: str = Field(description="关联的平台地图版本标识。")
+    geometry_stack: str = Field(default="rtabmap_nav2", description="当前绑定的几何栈标识。")
+    frame_id: Optional[str] = Field(default=None, description="该版本几何主图层坐标系。")
+    rtabmap_db_path: str = Field(description="RTAB-Map 数据库文件路径。")
+    occupancy_projection: str = Field(description="占据栅格投影来源说明。")
+    costmap_source: str = Field(description="代价地图来源说明。")
+    parameter_summary: MetadataDict = Field(default_factory=dict, description="几何栈参数摘要。")
+    built_at: datetime = Field(default_factory=utc_now, description="该几何资产构建时间。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("map_name", "version_id", "geometry_stack", "rtabmap_db_path", "occupancy_projection", "costmap_source")
+    @classmethod
+    def _validate_required_geometry_text(cls, value: str) -> str:
+        resolved = str(value or "").strip()
+        if not resolved:
+            raise ValueError("地图几何资产字段不能为空。")
+        return resolved
+
+    @field_validator("frame_id")
+    @classmethod
+    def _validate_geometry_frame_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        resolved = str(value or "").strip()
+        if not resolved:
+            return None
+        return validate_frame_id(resolved)
+
+
 class MapVersion(TimestampedContract):
     """平台侧持久化地图版本。"""
 
@@ -92,6 +125,10 @@ class MapVersion(TimestampedContract):
     source_version_id: str = Field(description="生成该版本时的来源快照版本号。")
     frame_id: Optional[str] = Field(default=None, description="该版本对应的地图坐标系。")
     snapshot: MapSnapshot = Field(description="持久化的地图快照。")
+    geometry_asset: Optional[MapGeometryAssetBinding] = Field(
+        default=None,
+        description="该版本绑定的几何资产信息。",
+    )
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
     @field_validator("map_name", "version_id", "source_name", "source_version_id")

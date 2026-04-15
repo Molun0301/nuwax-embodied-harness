@@ -173,6 +173,22 @@ def test_navigation_state_adapter_normalizes_external_status_alias() -> None:
     assert state.remaining_distance_m == 1.5
 
 
+def test_navigation_state_adapter_normalizes_signed_remaining_yaw_to_magnitude() -> None:
+    """统一导航契约应把外部有符号 yaw 误差收口为剩余朝向幅值。"""
+
+    adapter = NavigationStateAdapter(NavigationStateAdapter.build_default_config())
+    state = adapter.adapt(
+        {
+            "current_goal_id": "goal-002",
+            "status": "running",
+            "remaining_yaw_rad": -2.1,
+        }
+    )
+
+    assert state.status == NavigationStatus.RUNNING
+    assert state.remaining_yaw_rad == pytest.approx(2.1)
+
+
 def test_external_perception_service_adapter_maps_detection_and_tracks() -> None:
     """外部感知适配器应输出统一观察契约。"""
 

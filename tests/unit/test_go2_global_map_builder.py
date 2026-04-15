@@ -1,34 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-import sys
-
 import numpy as np
 
-
-def _load_module(name: str, file_path: Path):
-    spec = importlib.util.spec_from_file_location(name, file_path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_GLOBAL_MAP_MODULE = _load_module(
-    "go2_global_map_test_module",
-    _REPO_ROOT / "drivers" / "robots" / "go2" / "global_map.py",
-)
-_SETTINGS_MODULE = _load_module(
-    "go2_settings_test_module",
-    _REPO_ROOT / "drivers" / "robots" / "go2" / "settings.py",
-)
-
-Go2SparseGlobalMapBuilder = _GLOBAL_MAP_MODULE.Go2SparseGlobalMapBuilder
-Go2MapSynthesisConfig = _SETTINGS_MODULE.Go2MapSynthesisConfig
+from drivers.go2.settings import Go2MapSynthesisConfig
+from services.mapping.occupancy_mapping import SparseOccupancyMapBuilder as Go2SparseGlobalMapBuilder
 
 
 def _grid_index(*, width: int, resolution_m: float, origin_x: float, origin_y: float, x: float, y: float) -> int:

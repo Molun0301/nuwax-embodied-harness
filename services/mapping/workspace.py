@@ -210,9 +210,13 @@ class MapWorkspaceService:
         self,
         *,
         refresh: bool = False,
+        force_relocalize: bool = False,
         metadata: Optional[Dict[str, object]] = None,
     ) -> Optional[LocalizationSession]:
-        """同步当前激活地图的平台定位会话。"""
+        """同步当前激活地图的平台定位会话。
+
+        平台侧决定定位是否就绪，不依赖 Go2 数据面自报状态。
+        """
 
         active_map_name = self._repository.get_active_map_name()
         latest_map_snapshot = self._mapping_service.get_latest_snapshot()
@@ -227,6 +231,7 @@ class MapWorkspaceService:
                 map_version_id=latest_map_snapshot.version_id,
                 frame_id=frame_id,
                 metadata=metadata,
+                force_relocalize=force_relocalize,
             )
         return self._localization_service.ensure_active_session(
             map_name=active_map_name,
@@ -384,7 +389,11 @@ class MapWorkspaceService:
         map_name: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
     ) -> Tuple[LocalizationSession, MapWorkspace]:
-        """对当前激活地图执行一次平台重定位刷新。"""
+        """对当前激活地图执行一次平台重定位刷新。
+
+        正式主链：activate_map -> ensure_active_session -> relocalize -> READY -> navigation available
+        平台决定定位是否就绪，不依赖 Go2 数据面自报状态。
+        """
 
         active_workspace = self.get_active_workspace()
         active_map_name = active_workspace.active_map_name if active_workspace is not None else None
@@ -396,17 +405,26 @@ class MapWorkspaceService:
                 http_status=409,
                 jsonrpc_code=-32000,
             )
-        session = self.sync_active_localization_session(
-            refresh=True,
-            metadata=metadata,
-        )
-        if session is None:
+        latest_map_snapshot = self._mapping_service.get_latest_snapshot()
+        if latest_map_snapshot is None:
             raise GatewayError(
                 "地图 %s 当前没有可用于重定位的平台地图快照。" % resolved_name,
                 error_code="map_snapshot_unavailable",
                 http_status=409,
                 jsonrpc_code=-32000,
             )
+        frame_id = self._resolve_map_frame_id(latest_map_snapshot)
+
+        # 使用平台定位服务的新重定位方法
+        session = self._localization_service.relocalize_active_session(
+            map_name=resolved_name,
+            map_version_id=latest_map_snapshot.version_id,
+            frame_id=frame_id,
+            metadata={
+                **dict(metadata or {}),
+                "source": "relocalize_active_map",
+            },
+        )
         workspace = self.get_active_workspace()
         if workspace is None:
             raise GatewayError(

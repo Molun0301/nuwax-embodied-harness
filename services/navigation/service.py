@@ -13,11 +13,24 @@ from gateways.errors import GatewayError
 from providers import ExplorationProvider, NavigationProvider
 from services.localization import LocalizationService
 from services.mapping.service import MappingService
-from typing import Deque, Optional, Tuple
+from typing import Deque, Dict, Optional, Tuple
+
+from .state_machine import (
+    NavigationStateMachine,
+    NavigationDiagnostics,
+    create_navigation_state_machine,
+    map_nav2_status_to_platform,
+)
 
 
 class NavigationService:
-    """统一导航与探索服务。"""
+    """统一导航与探索服务。
+
+    平台导航运行时核心：
+    - 维护平台导航状态机，管理 NavigationGoal -> Nav2 action -> NavigationContext 的完整链路
+    - Nav2 只是执行器，目标生成、状态推进、失败语义、取消语义都沉淀在平台
+    - 导航完成与否由平台状态机和到点验证共同决定
+    """
 
     def __init__(
         self,
@@ -28,6 +41,7 @@ class NavigationService:
         state_store: StateStore,
         event_bus: Optional[EventBus] = None,
         history_limit: int = 100,
+        navigation_state_machine: Optional[NavigationStateMachine] = None,
     ) -> None:
         self._provider_owner = provider_owner
         self._localization_service = localization_service
@@ -40,6 +54,9 @@ class NavigationService:
         self._latest_exploration_context: Optional[ExplorationContext] = None
         self._current_goal: Optional[NavigationGoal] = None
         self._current_explore_request: Optional[ExploreAreaRequest] = None
+        # 平台导航状态机
+        self._state_machine: NavigationStateMachine = navigation_state_machine or create_navigation_state_machine()
+        self._last_navigation_diagnostics: Optional[NavigationDiagnostics] = None
 
     def is_navigation_available(self) -> bool:
         """判断导航后端是否可用。"""
@@ -64,29 +81,70 @@ class NavigationService:
         return True
 
     def refresh_navigation(self) -> NavigationContext:
-        """刷新导航上下文。"""
+        """刷新导航上下文，使用平台导航状态机管理状态转移。
+
+        主链：NavigationGoal -> 平台 NavigationSession -> Nav2 action -> 平台 NavigationContext
+        Nav2 只负责执行反馈，不负责平台任务定义。
+        """
 
         provider = self._get_navigation_provider()
         navigation_state = provider.get_navigation_state()
+        previous_context = self._latest_navigation_context
+        current_goal = self._current_goal
+        reuse_terminal_state = (
+            previous_context is not None
+            and previous_context.navigation_state.status
+            in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}
+            and navigation_state.status == NavigationStatus.IDLE
+            and previous_context.navigation_state.current_goal_id is not None
+        )
+
+        diagnostics = self._build_navigation_diagnostics(provider, navigation_state)
+        self._last_navigation_diagnostics = diagnostics
+
         goal_reached = bool(provider.is_goal_reached() or navigation_state.goal_reached)
-        if self._current_goal is not None and navigation_state.current_goal_id is None:
-            navigation_state = navigation_state.model_copy(
-                update={"current_goal_id": self._current_goal.goal_id},
-                deep=True,
+        if reuse_terminal_state:
+            navigation_state = previous_context.navigation_state.model_copy(deep=True)
+            current_goal = current_goal or previous_context.current_goal
+            goal_reached = previous_context.goal_reached
+        else:
+            self._state_machine.update_from_backend_state(
+                backend_name=provider.provider_name,
+                backend_status=navigation_state.status.value,
+                message=navigation_state.message,
+                goal_reached=goal_reached,
             )
-        if goal_reached and navigation_state.status not in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
-            navigation_state = navigation_state.model_copy(
-                update={
-                    "status": NavigationStatus.SUCCEEDED,
-                    "goal_reached": True,
-                    "message": navigation_state.message or "目标已到达。",
-                },
-                deep=True,
-            )
+            current_machine_state = self._state_machine.current_status
+            if current_machine_state != navigation_state.status:
+                navigation_state = navigation_state.model_copy(
+                    update={"status": current_machine_state, "message": self._state_machine._status_message},
+                    deep=True,
+                )
+            if current_goal is not None and navigation_state.current_goal_id is None:
+                navigation_state = navigation_state.model_copy(
+                    update={"current_goal_id": current_goal.goal_id},
+                    deep=True,
+                )
+            if goal_reached and current_machine_state not in {
+                NavigationStatus.SUCCEEDED,
+                NavigationStatus.FAILED,
+                NavigationStatus.CANCELLED,
+            }:
+                navigation_state = navigation_state.model_copy(
+                    update={
+                        "status": NavigationStatus.SUCCEEDED,
+                        "goal_reached": True,
+                        "message": navigation_state.message or "目标已到达。",
+                    },
+                    deep=True,
+                )
+
         runtime_metadata = self._build_map_runtime_metadata(
-            map_name=self._current_goal.map_name if self._current_goal is not None else None,
+            map_name=current_goal.map_name if current_goal is not None else None,
             existing_waiting_for=navigation_state.metadata.get("waiting_for"),
         )
+        runtime_metadata["navigation_state_machine"] = self._state_machine.get_state_summary()
+
         navigation_state = navigation_state.model_copy(
             update={
                 "metadata": {
@@ -97,12 +155,13 @@ class NavigationService:
             deep=True,
         )
         context = NavigationContext(
-            current_goal=self._current_goal,
+            current_goal=current_goal,
             navigation_state=navigation_state,
             backend_name=provider.provider_name,
             goal_reached=goal_reached,
             metadata={
                 "provider_version": provider.provider_version,
+                "diagnostics": diagnostics.model_dump(mode="json"),
                 **runtime_metadata,
             },
         )
@@ -115,16 +174,28 @@ class NavigationService:
             source=provider.provider_name,
             metadata={"kind": "latest_navigation"},
         )
+        if context.navigation_state.status in {
+            NavigationStatus.SUCCEEDED,
+            NavigationStatus.FAILED,
+            NavigationStatus.CANCELLED,
+        }:
+            self._current_goal = None
         return context
 
     def set_goal(self, goal: NavigationGoal) -> NavigationContext:
-        """提交导航目标。"""
+        """提交导航目标，使用平台状态机管理目标接受流程。
+
+        主链：NavigationGoal -> 平台状态机 ACCEPTED -> Nav2 执行 -> 平台 NavigationContext
+        """
 
         provider = self._get_navigation_provider()
         accepted = provider.set_goal(goal)
         if not accepted:
+            self._state_machine.fail("导航后端拒绝目标 %s。" % goal.goal_id)
             raise GatewayError(f"导航后端拒绝目标 {goal.goal_id}。")
         self._current_goal = goal
+        # 使用状态机管理目标接受
+        self._state_machine.set_goal(goal.goal_id, message="平台导航目标已接受。")
         context = self.refresh_navigation()
         if context.navigation_state.status == NavigationStatus.IDLE:
             context = context.model_copy(
@@ -145,10 +216,11 @@ class NavigationService:
         return context
 
     def cancel_goal(self) -> NavigationContext:
-        """取消当前导航目标。"""
+        """取消当前导航目标，使用平台状态机管理取消流程。"""
 
         provider = self._get_navigation_provider()
         provider.cancel_goal()
+        self._state_machine.cancel("平台导航目标已取消。")
         context = self.refresh_navigation()
         if context.navigation_state.status == NavigationStatus.IDLE and self._current_goal is not None:
             context = context.model_copy(
@@ -167,6 +239,11 @@ class NavigationService:
             self._latest_navigation_context = context
         self._publish_navigation_event("navigation.goal_cancelled", "导航目标已取消。")
         return context
+
+    def get_navigation_diagnostics(self) -> Optional[NavigationDiagnostics]:
+        """返回当前平台导航诊断信息。"""
+
+        return self._last_navigation_diagnostics
 
     def is_goal_reached(self) -> bool:
         """判断当前目标是否已到达。"""
@@ -191,8 +268,10 @@ class NavigationService:
             if callable(on_progress):
                 on_progress(context)
             state = context.navigation_state.status
-            if context.goal_reached or state == NavigationStatus.SUCCEEDED:
+            if context.goal_reached:
                 return context
+            if state == NavigationStatus.SUCCEEDED:
+                raise GatewayError(context.navigation_state.message or "导航后端报告完成，但平台未确认已到达目标。")
             if state == NavigationStatus.FAILED:
                 raise GatewayError(context.navigation_state.message or "导航执行失败。")
             if state == NavigationStatus.CANCELLED:
@@ -229,6 +308,7 @@ class NavigationService:
         provider = self._get_exploration_provider()
         exploration_state = provider.get_exploration_state()
         previous_context = self._latest_exploration_context
+        current_request = self._current_explore_request
         if (
             previous_context is not None
             and previous_context.exploration_state.status
@@ -237,9 +317,10 @@ class NavigationService:
             and previous_context.exploration_state.current_request_id is not None
         ):
             exploration_state = previous_context.exploration_state.model_copy(deep=True)
+            current_request = current_request or previous_context.current_request
         runtime_metadata = self._build_map_runtime_metadata(
-            map_name=self._current_explore_request.map_name if self._current_explore_request is not None else None,
-            memory_library_name=self._current_explore_request.map_name if self._current_explore_request is not None else None,
+            map_name=current_request.map_name if current_request is not None else None,
+            memory_library_name=current_request.map_name if current_request is not None else None,
             existing_waiting_for=exploration_state.metadata.get("waiting_for"),
         )
         exploration_state = exploration_state.model_copy(
@@ -252,7 +333,7 @@ class NavigationService:
             deep=True,
         )
         context = ExplorationContext(
-            current_request=self._current_explore_request,
+            current_request=current_request,
             exploration_state=exploration_state,
             backend_name=provider.provider_name,
             metadata={
@@ -269,6 +350,12 @@ class NavigationService:
             source=provider.provider_name,
             metadata={"kind": "latest_exploration"},
         )
+        if context.exploration_state.status in {
+            ExplorationStatus.SUCCEEDED,
+            ExplorationStatus.FAILED,
+            ExplorationStatus.CANCELLED,
+        }:
+            self._current_explore_request = None
         return context
 
     def start_exploration(self, request: ExploreAreaRequest) -> ExplorationContext:
@@ -309,23 +396,28 @@ class NavigationService:
         """停止当前探索任务。"""
 
         provider = self._get_exploration_provider()
+        previous_request = self._current_explore_request
+        if previous_request is None and self._latest_exploration_context is not None:
+            previous_request = self._latest_exploration_context.current_request
         provider.stop_exploration()
         context = self.refresh_exploration()
-        if context.exploration_state.status == ExplorationStatus.IDLE and self._current_explore_request is not None:
+        if previous_request is not None and context.exploration_state.status != ExplorationStatus.FAILED:
             context = context.model_copy(
                 update={
+                    "current_request": previous_request,
                     "exploration_state": context.exploration_state.model_copy(
                         update={
-                            "current_request_id": self._current_explore_request.request_id,
+                            "current_request_id": previous_request.request_id,
                             "status": ExplorationStatus.CANCELLED,
                             "message": "探索任务已取消。",
                         },
                         deep=True,
-                    )
+                    ),
                 },
                 deep=True,
             )
             self._latest_exploration_context = context
+            self._current_explore_request = None
         return context
 
     def explore_until_complete(
@@ -445,6 +537,9 @@ class NavigationService:
             raise GatewayError("当前平台几何运行时未提供导航后端。")
         if not provider.is_available():
             raise GatewayError("当前导航后端暂不可用。")
+        availability_checker = getattr(provider, "is_navigation_available", None)
+        if callable(availability_checker) and not availability_checker():
+            raise GatewayError("当前导航后端暂不可用。")
         return provider
 
     def _find_navigation_provider(self) -> Optional[NavigationProvider]:
@@ -459,6 +554,9 @@ class NavigationService:
             raise GatewayError("当前平台几何运行时未提供探索后端。")
         if not provider.is_available():
             raise GatewayError("当前探索后端暂不可用。")
+        availability_checker = getattr(provider, "is_exploration_available", None)
+        if callable(availability_checker) and not availability_checker():
+            raise GatewayError("当前探索后端暂不可用。")
         return provider
 
     def _find_exploration_provider(self) -> Optional[ExplorationProvider]:
@@ -466,6 +564,30 @@ class NavigationService:
         if providers is None or not isinstance(providers, ExplorationProvider):
             return None
         return providers
+
+    def _build_navigation_diagnostics(
+        self,
+        provider: NavigationProvider,
+        navigation_state,
+    ) -> NavigationDiagnostics:
+        """构建平台导航诊断信息。"""
+
+        return NavigationDiagnostics(
+            backend_name=provider.provider_name,
+            backend_status=navigation_state.status.value,
+            platform_status=self._state_machine.current_status,
+            goal_id=self._state_machine.current_goal_id,
+            remaining_distance_m=navigation_state.remaining_distance_m,
+            remaining_yaw_rad=navigation_state.remaining_yaw_rad,
+            recovery_in_progress=self._state_machine._recovery_attempts > 0,
+            last_error=self._state_machine._last_error,
+            metadata={
+                "is_running": self._state_machine.is_running,
+                "is_terminal": self._state_machine.is_terminal,
+                "elapsed_time_sec": self._state_machine.elapsed_time_sec,
+                "recovery_attempts": self._state_machine._recovery_attempts,
+            },
+        )
 
     def _normalize_name(self, value: str) -> str:
         normalized = []

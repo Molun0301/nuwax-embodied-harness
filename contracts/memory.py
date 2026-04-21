@@ -136,6 +136,7 @@ class MemoryPayloadFilter(ContractModel):
 
     record_kinds: List[MemoryRecordKind] = Field(default_factory=list, description="限制检索的记录类型。")
     map_version_id: Optional[str] = Field(default=None, description="限定地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="限定定位会话。")
     linked_location_id: Optional[str] = Field(default=None, description="限定关联地点标识。")
     camera_ids: List[str] = Field(default_factory=list, description="限定相机标识列表。")
     semantic_labels_any: List[str] = Field(default_factory=list, description="要求命中任一语义标签。")

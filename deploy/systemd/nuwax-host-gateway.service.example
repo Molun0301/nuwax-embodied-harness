@@ -11,10 +11,10 @@ WorkingDirectory=/home/unitree/nuwax-robot-bridge
 # 默认会读取 WorkingDirectory 下的 .env。
 # 如果你想把配置独立放到 /etc，再取消下一行注释并准备对应文件。
 # EnvironmentFile=/etc/nuwax_robot_bridge/gateway.env
-# 当前统一入口会读取 .env 里的 NUWAX_ACTIVE_ROBOT，并尝试按该机器人目录加载专属运行环境脚本。
+# 统一启动入口会按 .env 中的 NUWAX_ACTIVE_ROBOT 与 NUWAX_GEOMETRY_ENABLED 加载运行环境。
 # 平台文件日志路径由 .env 中的 NUWAX_LOG_* 控制。
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/bin/bash -lc 'ACTIVE_ROBOT="$(grep -E "^NUWAX_ACTIVE_ROBOT=" /home/unitree/nuwax-robot-bridge/.env 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d "[:space:]")"; if [ -n "$ACTIVE_ROBOT" ] && [ -f "/home/unitree/nuwax-robot-bridge/drivers/${ACTIVE_ROBOT}/source_runtime_env.sh" ]; then source "/home/unitree/nuwax-robot-bridge/drivers/${ACTIVE_ROBOT}/source_runtime_env.sh"; fi; exec /usr/bin/python3 -m uvicorn gateways.app:create_gateway_app_from_env --factory --host 0.0.0.0 --port 8766'
+ExecStart=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/start_gateway.sh
 Restart=always
 RestartSec=3
 TimeoutStopSec=20

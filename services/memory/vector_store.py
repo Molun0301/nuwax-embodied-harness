@@ -127,6 +127,7 @@ class SQLiteNamedVectorStore:
                     collection_name,
                     record_kind,
                     map_version_id,
+                    localization_session_id,
                     linked_location_id,
                     camera_id,
                     topo_node_id,
@@ -139,11 +140,12 @@ class SQLiteNamedVectorStore:
                     payload_json,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(point_id) DO UPDATE SET
                     collection_name = excluded.collection_name,
                     record_kind = excluded.record_kind,
                     map_version_id = excluded.map_version_id,
+                    localization_session_id = excluded.localization_session_id,
                     linked_location_id = excluded.linked_location_id,
                     camera_id = excluded.camera_id,
                     topo_node_id = excluded.topo_node_id,
@@ -161,6 +163,7 @@ class SQLiteNamedVectorStore:
                     collection_name,
                     record_kind,
                     self._string_or_none(payload.get("map_version_id")),
+                    self._string_or_none(payload.get("localization_session_id")),
                     self._string_or_none(payload.get("linked_location_id")),
                     self._string_or_none(payload.get("camera_id")),
                     self._string_or_none(payload.get("topo_node_id")),
@@ -408,6 +411,9 @@ class SQLiteNamedVectorStore:
         if payload_filter.map_version_id:
             query.append("AND map_version_id = ?")
             params.append(payload_filter.map_version_id)
+        if payload_filter.localization_session_id:
+            query.append("AND localization_session_id = ?")
+            params.append(payload_filter.localization_session_id)
         if payload_filter.linked_location_id:
             query.append("AND linked_location_id = ?")
             params.append(payload_filter.linked_location_id)
@@ -471,6 +477,10 @@ class SQLiteNamedVectorStore:
     ) -> bool:
         if payload_filter is None:
             return True
+        if payload_filter.localization_session_id:
+            localization_session_id = str(payload.get("localization_session_id") or "").strip()
+            if localization_session_id != str(payload_filter.localization_session_id).strip():
+                return False
         if payload_filter.semantic_labels_any:
             labels = {str(item).strip().lower() for item in (payload.get("semantic_labels") or []) if str(item).strip()}
             expected = {str(item).strip().lower() for item in payload_filter.semantic_labels_any if str(item).strip()}
@@ -531,6 +541,7 @@ class SQLiteNamedVectorStore:
                     collection_name TEXT NOT NULL DEFAULT 'legacy',
                     record_kind TEXT NOT NULL,
                     map_version_id TEXT,
+                    localization_session_id TEXT,
                     linked_location_id TEXT,
                     camera_id TEXT,
                     topo_node_id TEXT,
@@ -569,6 +580,9 @@ class SQLiteNamedVectorStore:
                 "CREATE INDEX IF NOT EXISTS idx_memory_vector_points_map_version ON memory_vector_points(map_version_id)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_vector_points_localization_session ON memory_vector_points(localization_session_id)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_vector_points_topo_node ON memory_vector_points(topo_node_id)"
             )
             self._conn.execute(
@@ -597,6 +611,7 @@ class SQLiteNamedVectorStore:
         required_columns = {
             "collection_name": "TEXT NOT NULL DEFAULT 'legacy'",
             "map_version_id": "TEXT",
+            "localization_session_id": "TEXT",
             "linked_location_id": "TEXT",
             "camera_id": "TEXT",
             "topo_node_id": "TEXT",

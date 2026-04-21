@@ -154,25 +154,29 @@ class FakeProviderBundle(
         )
 
     def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
+        data = []
+        for _row in range(40):
+            data.extend([0 for _ in range(20)])
+            data.extend([-1 for _ in range(20)])
         return OccupancyGrid(
             map_id="fake_slam_map",
             frame_id="map",
-            width=2,
-            height=2,
+            width=40,
+            height=40,
             resolution_m=0.1,
             origin=Pose(frame_id="map", position=Vector3(x=0.0, y=0.0, z=0.0)),
-            data=[0, 0, 20, 100],
+            data=data,
         )
 
     def get_cost_map(self) -> Optional[CostMap]:
         return CostMap(
             map_id="fake_cost_map",
             frame_id="map",
-            width=2,
-            height=2,
+            width=40,
+            height=40,
             resolution_m=0.1,
             origin=Pose(frame_id="map", position=Vector3(x=0.0, y=0.0, z=0.0)),
-            data=[1.0, 2.0, 10.0, 100.0],
+            data=[0.0 for _ in range(1600)],
         )
 
     def get_semantic_map(self) -> Optional[SemanticMap]:
@@ -1046,7 +1050,7 @@ def test_gateway_navigation_returns_specific_workspace_errors(tmp_path: Path) ->
             robot.providers.get_frame_tree = original_get_frame_tree
         assert missing_localization.status_code == 409
         assert missing_localization.json()["error"]["code"] == "localization_unavailable"
-        assert missing_localization.json()["error"]["details"]["localization_session_status"] == "localizing"
+        assert missing_localization.json()["error"]["details"]["localization_session_status"] == "stale"
 
 
 def test_gateway_navigation_task_reports_arrival_verification_failure(tmp_path: Path) -> None:
@@ -1462,6 +1466,7 @@ def test_gateway_platform_map_versions_can_save_and_reload_latest_snapshot(tmp_p
         assert save_version.status_code == 200
         save_payload = save_version.json()["result"]
         version_id = save_payload["map_version"]["version_id"]
+        saved_snapshot = save_payload["map_version"]["snapshot"]
         assert save_payload["active_workspace"]["map_asset"]["latest_version_id"] == version_id
         assert save_payload["map_version"]["geometry_asset"]["map_name"] == "平台版本地图"
         assert save_payload["map_version"]["geometry_asset"]["version_id"] == version_id
@@ -1530,8 +1535,14 @@ def test_gateway_platform_map_versions_can_save_and_reload_latest_snapshot(tmp_p
             reactivated_workspace = reactivated["result"]["active_workspace"]
             assert reactivated_workspace["map_asset"]["latest_version_id"] == version_id
             assert reactivated_workspace["latest_map_snapshot"]["version_id"] == version_id
-            assert reactivated_workspace["latest_map_snapshot"]["occupancy_grid"]["width"] == 2
-            assert reactivated_workspace["latest_map_snapshot"]["semantic_map"]["regions"][0]["region_id"] == "charging_station"
+            assert (
+                reactivated_workspace["latest_map_snapshot"]["occupancy_grid"]["width"]
+                == saved_snapshot["occupancy_grid"]["width"]
+            )
+            assert (
+                reactivated_workspace["latest_map_snapshot"]["semantic_map"]["regions"][0]["region_id"]
+                == saved_snapshot["semantic_map"]["regions"][0]["region_id"]
+            )
             assert reactivated_workspace["latest_map_snapshot"]["metadata"]["geometry_stack"] == "rtabmap_nav2"
             assert reactivated_workspace["latest_map_snapshot"]["metadata"]["rtabmap_db_path"].endswith(
                 f"/versions/{version_id}/geometry/rtabmap_nav2/rtabmap/rtabmap.db"

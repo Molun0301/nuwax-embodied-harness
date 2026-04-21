@@ -196,3 +196,21 @@ class ObstacleAvoidanceControlDataPlane(Protocol):
 
     def set_obstacle_avoidance_enabled(self, enabled: bool) -> Dict[str, Any]:
         """切换实时避障状态。"""
+
+
+@runtime_checkable
+class ManagedRobotDeviceDataPlane(
+    DataPlaneLifecycle,
+    RobotStateSensorDataPlane,
+    DataPlaneStatusReporter,
+    MotionCommandDataPlane,
+    MappingRuntimeControlDataPlane,
+    NamedMapCompatibilityDataPlane,
+    ObstacleAvoidanceControlDataPlane,
+    Protocol,
+):
+    """机器人入口默认保留的窄数据面协议。
+
+    仅包含设备服务、输入流辅助状态与兼容/调试开关，
+    不再要求机器人数据面承载平台 map/nav/exploration 主链。
+    """

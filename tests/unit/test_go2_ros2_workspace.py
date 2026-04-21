@@ -24,7 +24,7 @@ from drivers.go2.settings import (
     Go2MapSynthesisConfig,
     Go2OfficialBackendConfig,
 )
-from services.geometry import GeometryFrameConfig, GeometryTopicsConfig, PlatformGeometryConfig
+from services.geometry import GeometryFrameConfig, GeometryTopicsConfig, PlatformGeometryConfig, build_default_geometry_setup_script
 
 
 class _FakeBridge:
@@ -338,17 +338,36 @@ def test_go2_ros2_workspace_defaults_point_to_repo() -> None:
     assert go2_settings._DEFAULT_GO2_SETUP_SCRIPT.endswith("drivers/go2/ros2_ws/install/setup.bash")
 
 
+def test_platform_geometry_workspace_defaults_point_to_repo() -> None:
+    assert build_default_geometry_setup_script().endswith("services/geometry/ros2_ws/install/setup.bash")
+
+
 def test_go2_map_synthesis_default_self_filter_radius_matches_platform_calibration() -> None:
     assert Go2MapSynthesisConfig().point_cloud_self_filter_radius_m == 0.65
 
 
 def test_go2_ros2_workspace_assets_exist() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    workspace_root = repo_root / "drivers" / "go2" / "ros2_ws"
-    assert (workspace_root / "src" / "vendor" / "elevation_mapping_cupy" / "elevation_mapping_cupy" / "package.xml").exists()
-    assert (workspace_root / "src" / "vendor" / "unilidar_sdk" / "unitree_lidar_ros2" / "package.xml").exists()
+    go2_workspace_root = repo_root / "drivers" / "go2" / "ros2_ws"
+    geometry_workspace_root = repo_root / "services" / "geometry" / "ros2_ws"
+    assert (go2_workspace_root / "src" / "vendor" / "unilidar_sdk" / "unitree_lidar_ros2" / "package.xml").exists()
+    assert not (go2_workspace_root / "src" / "vendor" / "elevation_mapping_cupy").exists()
+    assert not (go2_workspace_root / "src" / "vendor" / "grid_map").exists()
+    assert (geometry_workspace_root / "src" / "vendor" / "elevation_mapping_cupy" / "elevation_mapping_cupy" / "package.xml").exists()
+    assert (geometry_workspace_root / "src" / "vendor" / "grid_map" / "grid_map" / "package.xml").exists()
     assert (repo_root / "drivers" / "go2" / "build_ros2_workspace.sh").exists()
     assert (repo_root / "drivers" / "go2" / "source_runtime_env.sh").exists()
+    assert (repo_root / "services" / "geometry" / "build_ros2_workspace.sh").exists()
+    assert (repo_root / "services" / "geometry" / "source_runtime_env.sh").exists()
+    assert (repo_root / "services" / "geometry" / "launch_ros2_stack.sh").exists()
+
+
+def test_go2_legacy_runtime_modules_only_remain_under_compat() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    compat_root = repo_root / "drivers" / "go2" / "compat"
+    for module_name in ("collision_detector", "cost_mapper", "local_planner", "voxel_mapper"):
+        assert not (repo_root / "drivers" / "go2" / f"{module_name}.py").exists()
+        assert (compat_root / f"{module_name}.py").exists()
 
 
 def test_go2_setup_script_path_falls_back_to_repo_default_when_legacy_path_missing(tmp_path: Path) -> None:

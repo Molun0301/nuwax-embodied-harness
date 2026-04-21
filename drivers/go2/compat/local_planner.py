@@ -1,3 +1,8 @@
+"""Go2 端侧兼容局部规划器。
+
+仅用于旧数据面兼容路径与调试观测，不再承担平台正式导航执行。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

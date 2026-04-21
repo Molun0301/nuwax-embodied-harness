@@ -8,7 +8,7 @@ from typing import Dict, Tuple
 def build_default_geometry_setup_script() -> str:
     """返回当前仓库内默认几何侧车 setup 脚本路径。"""
 
-    return str(Path(__file__).resolve().parents[1] / "drivers" / "go2" / "ros2_ws" / "install" / "setup.bash")
+    return str(Path(__file__).resolve().parents[1] / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash")
 
 
 def build_default_rtabmap_database_root() -> str:
@@ -120,4 +120,3 @@ class PlatformGeometryConfig:
                 "costmap_source": self.nav2.costmap_source,
             },
         }
-

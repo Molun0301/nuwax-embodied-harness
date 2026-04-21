@@ -1,3 +1,8 @@
+"""Go2 端侧兼容代价图补算器。
+
+仅用于命名地图 / 调试观测 / 兼容回退，不属于平台正式地图与导航主链。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

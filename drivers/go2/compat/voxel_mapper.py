@@ -1,3 +1,8 @@
+"""Go2 端侧兼容体素建图器。
+
+仅用于 Go2 数据面内部补图与调试观测，不属于平台正式地图真值链。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

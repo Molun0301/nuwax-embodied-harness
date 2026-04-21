@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 WS_DIR="${REPO_ROOT}/drivers/go2/ros2_ws"
 
 source_without_nounset() {
@@ -47,7 +47,6 @@ cd "${WS_DIR}"
 
 DEFAULT_BUILD_PACKAGES=(
   unitree_lidar_ros2
-  elevation_mapping_cupy
 )
 
 BUILD_PACKAGES=("${DEFAULT_BUILD_PACKAGES[@]}")
@@ -57,7 +56,7 @@ if [[ -n "${GO2_ROS2_BUILD_PACKAGES:-}" ]]; then
 fi
 
 echo "使用 ROS2 环境: ${ROS_SETUP}"
-echo "开始构建 Go2 端侧工作空间: ${WS_DIR}"
+echo "开始构建 Go2 端侧桥接工作空间: ${WS_DIR}"
 echo "构建包集合: ${BUILD_PACKAGES[*]}"
 
 colcon build \

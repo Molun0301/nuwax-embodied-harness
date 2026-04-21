@@ -3,7 +3,7 @@ from __future__ import annotations
 from compat import StrEnum
 from datetime import datetime
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from contracts.artifacts import ArtifactRef
 from contracts.base import MetadataDict, TimestampedContract
@@ -187,10 +187,24 @@ class MapSnapshot(TimestampedContract):
     source_name: str = Field(description="地图来源名称。")
     version_id: str = Field(description="地图版本标识。")
     revision: int = Field(default=1, ge=1, description="来源内递增版本号。")
+    frame_id: Optional[str] = Field(default=None, description="地图快照统一消费坐标系。")
     occupancy_grid: Optional[OccupancyGrid] = Field(default=None, description="占据栅格地图。")
     cost_map: Optional[CostMap] = Field(default=None, description="代价地图。")
     semantic_map: Optional[SemanticMap] = Field(default=None, description="语义地图。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @model_validator(mode="after")
+    def _derive_frame_id(self) -> "MapSnapshot":
+        """在未显式提供时，从地图层中推导统一坐标系。"""
+
+        if self.frame_id:
+            return self
+        for layer in (self.occupancy_grid, self.cost_map, self.semantic_map):
+            candidate = str(getattr(layer, "frame_id", "") or "").strip() if layer is not None else ""
+            if candidate:
+                self.frame_id = candidate
+                break
+        return self
 
 
 class NavigationContext(TimestampedContract):

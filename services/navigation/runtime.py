@@ -440,8 +440,11 @@ class GridNavigationPlanner:
         start_point: Point2D,
         goal_point: Point2D,
     ) -> Tuple[Optional[Point2D], str, bool]:
-        if planning_map.contains_world(*goal_point, padding_m=float(self.config.planning_horizon_margin_m)):
+        goal_padding_m = float(self.config.planning_horizon_margin_m)
+        if planning_map.contains_world(*goal_point, padding_m=goal_padding_m):
             return goal_point, "goal", True
+        if planning_map.contains_world(*goal_point, padding_m=0.0):
+            return goal_point, "goal_edge", True
 
         goal_distance_m = _point_distance(start_point, goal_point)
         if goal_distance_m <= 1e-6:
@@ -456,7 +459,7 @@ class GridNavigationPlanner:
         dy = goal_point[1] - start_point[1]
         direction_x = dx / goal_distance_m
         direction_y = dy / goal_distance_m
-        horizon_padding_m = float(self.config.planning_horizon_margin_m)
+        fallback_candidate: Optional[Point2D] = None
 
         sampled_distance = max_distance_m
         while sampled_distance > step_m:
@@ -464,9 +467,13 @@ class GridNavigationPlanner:
                 start_point[0] + direction_x * sampled_distance,
                 start_point[1] + direction_y * sampled_distance,
             )
-            if planning_map.contains_world(*candidate, padding_m=horizon_padding_m):
+            if planning_map.contains_world(*candidate, padding_m=goal_padding_m):
                 return candidate, "local_horizon", False
+            if fallback_candidate is None and planning_map.contains_world(*candidate, padding_m=0.0):
+                fallback_candidate = candidate
             sampled_distance -= step_m
+        if fallback_candidate is not None:
+            return fallback_candidate, "local_horizon_edge", False
         return None, "local_horizon", False
 
     def _a_star(
@@ -874,6 +881,11 @@ class NavigationSession:
             self._current_plan = None
             return None
         if planning_outcome.plan is None:
+            retryable_wait_reasons = {
+                "start_out_of_bounds",
+                "no_horizon_target",
+                "target_out_of_bounds",
+            }
             self._plan_failure_count += 1
             execution_state = (
                 NavigationExecutionState.PLANNING
@@ -881,6 +893,19 @@ class NavigationSession:
                 else NavigationExecutionState.RECOVERY
             )
             self._execution_state = execution_state
+            if planning_outcome.can_retry and planning_outcome.reason in retryable_wait_reasons:
+                return NavigationTickResult(
+                    status=NavigationStatus.PLANNING,
+                    message=planning_outcome.message,
+                    metadata={
+                        "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
+                        "execution_state": execution_state,
+                        "replan_reason": reason,
+                        "planning_reason": planning_outcome.reason,
+                        "plan_failures": self._plan_failure_count,
+                        "retryable_wait": True,
+                    },
+                )
             if self._plan_failure_count >= int(self._planner_config.max_replan_failures):
                 return NavigationTickResult(
                     status=NavigationStatus.FAILED,
@@ -889,6 +914,7 @@ class NavigationSession:
                         "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                         "execution_state": execution_state,
                         "replan_reason": reason,
+                        "planning_reason": planning_outcome.reason,
                         "plan_failures": self._plan_failure_count,
                     },
                 )
@@ -899,6 +925,7 @@ class NavigationSession:
                     "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
                     "execution_state": execution_state,
                     "replan_reason": reason,
+                    "planning_reason": planning_outcome.reason,
                     "plan_failures": self._plan_failure_count,
                 },
             )

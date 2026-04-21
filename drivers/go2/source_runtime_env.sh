@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 GO2_RUNTIME_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GO2_RUNTIME_REPO_ROOT="$(cd "${GO2_RUNTIME_SCRIPT_DIR}/../../.." && pwd)"
+GO2_RUNTIME_REPO_ROOT="$(cd "${GO2_RUNTIME_SCRIPT_DIR}/../.." && pwd)"
 GO2_RUNTIME_WS_DIR="${GO2_RUNTIME_REPO_ROOT}/drivers/go2/ros2_ws"
 GO2_RUNTIME_SOURCE_ROS_ENV="${GO2_RUNTIME_SOURCE_ROS_ENV:-false}"
 

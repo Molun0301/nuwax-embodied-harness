@@ -755,13 +755,23 @@ def test_memory_service_persists_vector_memories_across_restart(tmp_path: Path) 
 
 
 def test_memory_service_supports_payload_filters_navigation_and_arrival_verification(tmp_path: Path) -> None:
-    """记忆服务应支持空间过滤、对象 inspection pose 导航和到点复核。"""
+    """记忆服务应支持空间过滤、定位会话过滤、对象 inspection pose 导航和到点复核。"""
 
     stack = _build_memory_stack(tmp_path)
     providers = stack["providers"]
     observation_service = stack["observation_service"]
     perception_service = stack["perception_service"]
     memory_service = stack["memory_service"]
+    localization_service = stack["localization_service"]
+    mapping_service = stack["mapping_service"]
+
+    map_snapshot = mapping_service.get_latest_snapshot()
+    assert map_snapshot is not None
+    localization_session = localization_service.ensure_active_session(
+        map_name="单元测试记忆库",
+        map_version_id=map_snapshot.version_id,
+        frame_id=map_snapshot.frame_id,
+    )
 
     observation_service.capture_observation(camera_id="front_camera")
     perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
@@ -773,7 +783,9 @@ def test_memory_service_supports_payload_filters_navigation_and_arrival_verifica
     )
     assert tagged_location.location_id
     assert tagged_location.metadata["map_version_id"] == tagged_location.map_version_id
+    assert tagged_location.metadata["localization_session_id"] == localization_session.session_id
     assert scene_memory is not None
+    assert scene_memory.metadata["localization_session_id"] == localization_session.session_id
 
     far_filter = MemoryPayloadFilter(
         near_pose=Pose(frame_id="map", position=Vector3(x=9.0, y=9.0, z=0.0)),
@@ -786,15 +798,35 @@ def test_memory_service_supports_payload_filters_navigation_and_arrival_verifica
     )
     assert filtered_result.matches == []
 
+    wrong_session_result = memory_service.query_semantic_memory(
+        "charging dock",
+        similarity_threshold=0.05,
+        payload_filter=MemoryPayloadFilter(localization_session_id="wrong_session"),
+    )
+    assert wrong_session_result.matches == []
+
     providers.current_pose = Pose(frame_id="map", position=Vector3(x=1.1, y=0.45, z=0.0), orientation=Quaternion(w=1.0))
-    navigation_candidate = memory_service.resolve_navigation_candidate("charging dock")
-    navigation_candidates = memory_service.resolve_navigation_candidates("charging dock", limit=3)
+    navigation_candidate = memory_service.resolve_navigation_candidate(
+        "charging dock",
+        localization_session_id=localization_session.session_id,
+    )
+    navigation_candidates = memory_service.resolve_navigation_candidates(
+        "charging dock",
+        localization_session_id=localization_session.session_id,
+        limit=3,
+    )
+    wrong_session_candidate = memory_service.resolve_navigation_candidate(
+        "charging dock",
+        localization_session_id="wrong_session",
+    )
     assert navigation_candidate is not None
     assert navigation_candidates
+    assert wrong_session_candidate is None
     assert navigation_candidates[0].record_id == navigation_candidate.record_id
     assert navigation_candidate.record_id != tagged_location.location_id
     assert navigation_candidate.target_pose.frame_id == "map"
     assert navigation_candidate.metadata["map_name"] == "单元测试记忆库"
+    assert navigation_candidate.metadata["localization_session_id"] == localization_session.session_id
     assert navigation_candidate.map_version_id is not None
 
     verification = memory_service.verify_arrival(
@@ -802,10 +834,12 @@ def test_memory_service_supports_payload_filters_navigation_and_arrival_verifica
         navigation_candidate=navigation_candidate,
         camera_id="front_camera",
         similarity_threshold=0.1,
+        localization_session_id=localization_session.session_id,
     )
     assert verification.verified is True
     assert verification.score >= 0.1
     assert verification.metadata["map_version_id"] == navigation_candidate.map_version_id
+    assert verification.metadata["localization_session_id"] == localization_session.session_id
 
 
 def test_memory_service_deeply_integrates_visual_semantics_into_vector_memory(tmp_path: Path) -> None:

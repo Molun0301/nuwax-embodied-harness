@@ -49,9 +49,11 @@ class GroundingQueryPlanner:
         plan: GroundingQueryPlan,
         *,
         map_version_id: Optional[str],
+        localization_session_id: Optional[str],
     ) -> MemoryPayloadFilter:
         filter_kwargs = {
             "map_version_id": map_version_id,
+            "localization_session_id": localization_session_id,
             "record_kinds": [
                 MemoryRecordKind.SCENE,
                 MemoryRecordKind.NOTE,

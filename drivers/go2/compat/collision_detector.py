@@ -1,3 +1,8 @@
+"""Go2 端侧兼容碰撞检测器。
+
+仅用于 Go2 设备侧本地安全观测与兼容路径，不属于平台正式导航主链。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -2521,7 +2521,6 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=False,
         )
-        self._ensure_robot_mapping_runtime_enabled(trigger="navigate_to_named_location")
         self._refresh_workspace_snapshots()
         self._ensure_localization_ready(
             capability_name="navigate_to_named_location",
@@ -2548,6 +2547,7 @@ class GatewayRuntime:
         tagged_location = self.memory_service.resolve_tagged_location(
             target_name,
             map_version_id=current_map_version_id,
+            localization_session_id=current_localization_session_id,
         )
         if tagged_location is not None:
             navigation_candidate = self.memory_service.resolve_navigation_candidate(
@@ -2922,7 +2922,6 @@ class GatewayRuntime:
 
                 active_request = request
                 context.update(progress=0.08, stage="exploration_accepted", message="开始探索并持续查找目标。")
-                self._ensure_robot_mapping_runtime_enabled(trigger="explore_and_find_target")
                 exploration_context = self.navigation_service.start_exploration(active_request)
                 while True:
                     context.ensure_active()
@@ -2961,6 +2960,7 @@ class GatewayRuntime:
                         rejected_record_ids=rejected_record_ids,
                     )
                     if search_state["current_scene_verification"].verified:
+                        self._report_platform_exploration_hit_stop("current_scene_target_found")
                         exploration_stop_context = self.navigation_service.stop_exploration()
                         context.update(progress=1.0, stage="completed", message="探索中已找到目标。")
                         result = {
@@ -3039,6 +3039,7 @@ class GatewayRuntime:
                             rejected_record_ids=rejected_record_ids,
                         )
                         if final_search_state["current_scene_verification"].verified:
+                            self._report_platform_exploration_hit_stop("current_scene_target_found")
                             context.update(progress=1.0, stage="completed", message="探索结束时已找到目标。")
                             result = {
                                 "query": query,
@@ -3712,6 +3713,12 @@ class GatewayRuntime:
             "camera_id": camera_id,
         }
 
+    def _report_platform_exploration_hit_stop(self, reason: str) -> None:
+        geometry_runtime = getattr(self, "platform_geometry_runtime", None)
+        reporter = getattr(geometry_runtime, "report_platform_exploration_hit_stop", None)
+        if callable(reporter):
+            reporter(reason)
+
     def _build_target_search_state(
         self,
         *,
@@ -4074,7 +4081,7 @@ class GatewayRuntime:
                             "goal_reached": last_context.goal_reached,
                         },
                     )
-                    if last_context.goal_reached or status == NavigationStatus.SUCCEEDED:
+                    if last_context.goal_reached:
                         context.update(progress=1.0, stage="completed", message="导航任务已完成。")
                         result = {
                             "goal_id": goal.goal_id,
@@ -4090,6 +4097,18 @@ class GatewayRuntime:
                         )
                         finalized = True
                         return result
+                    if status == NavigationStatus.SUCCEEDED:
+                        raise GatewayError(
+                            last_context.navigation_state.message or "导航后端报告完成，但平台未确认已到达目标。",
+                            error_code="arrival_not_confirmed",
+                            http_status=409,
+                            jsonrpc_code=-32000,
+                            details={
+                                "goal_id": goal.goal_id,
+                                "map_name": goal.map_name,
+                                "target_name": goal.target_name,
+                            },
+                        )
                     if status == NavigationStatus.FAILED:
                         raise GatewayError(
                             last_context.navigation_state.message or "导航执行失败。",
@@ -4163,7 +4182,6 @@ class GatewayRuntime:
 
         def runner(context) -> Dict[str, Any]:
             context.update(progress=0.02, stage="prepare_exploration_runtime", message="按需准备探索建图运行时。")
-            self._ensure_robot_mapping_runtime_enabled(trigger="explore_area")
             last_context = self.navigation_service.start_exploration(request)
             finalized = False
             context.update(

@@ -1,3 +1,9 @@
+"""Go2 端侧数据面与兼容调试入口。
+
+平台正式的 map / localization / navigation / exploration 主链已经收回平台运行时。
+本模块保留 Go2 设备侧输入流、执行器接入，以及命名地图 / 本地补图 / 调试观测等兼容路径。
+"""
+
 from __future__ import annotations
 
 from collections import deque
@@ -25,10 +31,10 @@ from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.pointcloud import PointCloudFrame, PointField, PointFieldDataType
 from contracts.robot_state import IMUState
-from drivers.go2.collision_detector import Go2CollisionDetector, Go2CollisionDetectorConfig, CollisionStatus
-from drivers.go2.cost_mapper import Go2CostMapper, Go2CostMapperConfig, Go2CostMapperResult
-from drivers.go2.voxel_mapper import Go2VoxelMapper, Go2VoxelMapperConfig, Go2VoxelMapperResult
-from drivers.go2.local_planner import Go2DWALocalPlanner, Go2LocalPlannerConfig, Go2VelocityCommand, LocalPlannerState
+from drivers.go2.compat.collision_detector import Go2CollisionDetector, Go2CollisionDetectorConfig, CollisionStatus
+from drivers.go2.compat.cost_mapper import Go2CostMapper, Go2CostMapperConfig, Go2CostMapperResult
+from drivers.go2.compat.voxel_mapper import Go2VoxelMapper, Go2VoxelMapperConfig, Go2VoxelMapperResult
+from drivers.go2.compat.local_planner import Go2DWALocalPlanner, Go2LocalPlannerConfig, Go2VelocityCommand, LocalPlannerState
 from services.mapping.occupancy_mapping import (
     OccupancyMapBuildResult as Go2GlobalMapBuildResult,
     PointCloudScanObservation as LocalMapScan,
@@ -529,14 +535,22 @@ class RclpyGo2RosBridge:
             return self._latest_imu_state.model_copy(deep=True) if self._latest_imu_state is not None else None
 
     def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
-        """读取占据栅格地图。"""
+        """[兼容/调试路径] 读取占据栅格地图。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式地图应通过 PlatformGeometryRuntime.get_map_snapshot() 获取。
+        """
 
         with self._lock:
             grid = self._select_effective_map_layers_unlocked().occupancy_grid
             return grid.model_copy(deep=True) if grid is not None else None
 
     def get_cost_map(self) -> Optional[CostMap]:
-        """读取代价地图。"""
+        """[兼容/调试路径] 读取代价地图。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式代价地图应通过 PlatformGeometryRuntime.get_map_snapshot() 获取。
+        """
 
         with self._lock:
             cost_map = self._select_effective_map_layers_unlocked().cost_map
@@ -679,31 +693,51 @@ class RclpyGo2RosBridge:
         self._local_planner.reset()
 
     def get_semantic_map(self) -> Optional[SemanticMap]:
-        """读取语义地图。"""
+        """[兼容/调试路径] 读取语义地图。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式语义地图应通过 PlatformGeometryRuntime.get_map_snapshot() 获取。
+        """
 
         with self._lock:
             semantic_map = self._select_effective_map_layers_unlocked().semantic_map
             return semantic_map.model_copy(deep=True) if semantic_map is not None else None
 
     def set_goal(self, goal: NavigationGoal) -> bool:
-        """桥本身不再处理导航目标。"""
+        """[已废弃] 桥本身不再处理导航目标。
+
+        注意：此方法已废弃，导航目标应由平台通过 Nav2 执行。
+        保留此方法仅为兼容旧代码，不应在正式流程中调用。
+        """
 
         del goal
         return False
 
     def cancel_goal(self) -> bool:
-        """桥本身不再处理导航取消。"""
+        """[已废弃] 桥本身不再处理导航取消。
+
+        注意：此方法已废弃，导航取消应由平台通过 Nav2 执行。
+        保留此方法仅为兼容旧代码，不应在正式流程中调用。
+        """
 
         return False
 
     def get_navigation_state(self) -> NavigationState:
-        """读取导航状态。"""
+        """[兼容/调试路径] 读取导航状态。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式导航状态应通过 PlatformGeometryProviderBundle.get_navigation_state() 获取。
+        """
 
         with self._lock:
             return self._latest_navigation_state.model_copy(deep=True)
 
     def is_goal_reached(self) -> bool:
-        """判断导航目标是否已到达。"""
+        """[兼容/调试路径] 判断导航目标是否已到达。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式目标到达判断应通过 NavigationService.is_goal_reached() 获取。
+        """
 
         with self._lock:
             return self._goal_reached
@@ -3130,42 +3164,66 @@ class Go2DataPlaneRuntime:
         return self.bridge.get_imu_state()
 
     def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
-        """读取占据栅格地图。"""
+        """[兼容/调试路径] 读取占据栅格地图。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式地图应通过 PlatformGeometryRuntime.get_map_snapshot() 获取。
+        """
 
         if self._uses_archived_named_map_snapshot():
             return self._archived_occupancy_grid.model_copy(deep=True) if self._archived_occupancy_grid is not None else None
         return self.bridge.get_occupancy_grid()
 
     def get_cost_map(self) -> Optional[CostMap]:
-        """读取代价地图。"""
+        """[兼容/调试路径] 读取代价地图。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式代价地图应通过 PlatformGeometryRuntime.get_map_snapshot() 获取。
+        """
 
         if self._uses_archived_named_map_snapshot():
             return self._archived_cost_map.model_copy(deep=True) if self._archived_cost_map is not None else None
         return self.bridge.get_cost_map()
 
     def get_semantic_map(self) -> Optional[SemanticMap]:
-        """读取语义地图。"""
+        """[兼容/调试路径] 读取语义地图。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式语义地图应通过 PlatformGeometryRuntime.get_map_snapshot() 获取。
+        """
 
         if self._uses_archived_named_map_snapshot():
             return self._archived_semantic_map.model_copy(deep=True) if self._archived_semantic_map is not None else None
         return self.bridge.get_semantic_map()
 
     def set_goal(self, goal: NavigationGoal) -> bool:
-        """提交导航目标。"""
+        """[兼容/调试路径] 提交导航目标。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式导航应通过 NavigationService.set_goal() -> PlatformGeometryProviderBundle -> Nav2 执行。
+        """
 
         if self._uses_official_backend():
             return self._set_official_goal(goal)
         return self.bridge.set_goal(goal)
 
     def cancel_goal(self) -> bool:
-        """取消导航目标。"""
+        """[兼容/调试路径] 取消导航目标。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式导航取消应通过 NavigationService.cancel_goal() -> PlatformGeometryProviderBundle -> Nav2 执行。
+        """
 
         if self._uses_official_backend():
             return self._stop_official_navigation(update_state=True)
         return self.bridge.cancel_goal()
 
     def get_navigation_state(self) -> NavigationState:
-        """读取导航状态。"""
+        """[兼容/调试路径] 读取导航状态。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式导航状态应通过 NavigationService.refresh_navigation() -> PlatformGeometryProviderBundle 获取。
+        """
 
         if self._uses_official_backend():
             with self._navigation_lock:
@@ -3173,7 +3231,11 @@ class Go2DataPlaneRuntime:
         return self.bridge.get_navigation_state()
 
     def is_goal_reached(self) -> bool:
-        """判断当前导航目标是否已完成。"""
+        """[兼容/调试路径] 判断当前导航目标是否已完成。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式目标到达判断应通过 NavigationService.is_goal_reached() 获取。
+        """
 
         if self._uses_official_backend():
             with self._navigation_lock:
@@ -3181,7 +3243,11 @@ class Go2DataPlaneRuntime:
         return self.bridge.is_goal_reached()
 
     def start_exploration(self, request: ExploreAreaRequest) -> bool:
-        """启动探索任务。"""
+        """[兼容/调试路径] 启动探索任务。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式探索应通过 NavigationService.start_exploration() -> PlatformExplorationRuntime 执行。
+        """
 
         self.ensure_mapping_runtime_enabled(reason="exploration")
         if not self.is_exploration_available():
@@ -3213,7 +3279,11 @@ class Go2DataPlaneRuntime:
         return True
 
     def stop_exploration(self) -> bool:
-        """停止探索任务。"""
+        """[兼容/调试路径] 停止探索任务。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式探索取消应通过 NavigationService.stop_exploration() -> PlatformExplorationRuntime 执行。
+        """
 
         with self._exploration_lock:
             self._exploration_stop_event.set()
@@ -3233,7 +3303,11 @@ class Go2DataPlaneRuntime:
         return True
 
     def get_exploration_state(self) -> ExplorationState:
-        """读取探索状态。"""
+        """[兼容/调试路径] 读取探索状态。
+
+        注意：此方法属于 Go2 数据面的兼容/调试路径，不是平台正式主链。
+        平台正式探索状态应通过 NavigationService.refresh_exploration() -> PlatformExplorationRuntime 获取。
+        """
 
         with self._exploration_lock:
             return self._exploration_state.model_copy(deep=True)
@@ -4259,3 +4333,65 @@ class Go2DataPlaneRuntime:
             time.sleep(max(0.05, self.config.exploration.status_poll_interval_sec))
         self.cancel_goal()
         return False
+
+
+class Go2DeviceDataPlane:
+    """Go2 窄数据面 facade。
+
+    仅对机器人入口暴露设备服务、兼容/调试状态与执行器控制，
+    平台正式 map/nav/exploration 主链统一通过 provider/runtime 获取。
+    """
+
+    def __init__(self, runtime: Go2DataPlaneRuntime) -> None:
+        self.runtime = runtime
+
+    def start(self) -> None:
+        self.runtime.start()
+
+    def stop(self) -> None:
+        self.runtime.stop()
+
+    def get_status(self) -> Dict[str, object]:
+        return self.runtime.get_status()
+
+    def get_imu_state(self) -> Optional[IMUState]:
+        return self.runtime.get_imu_state()
+
+    def can_accept_motion_command(self) -> bool:
+        return self.runtime.can_accept_motion_command()
+
+    def send_motion_command(self, vx: float, vy: float, vyaw: float) -> int:
+        return self.runtime.send_motion_command(vx, vy, vyaw)
+
+    def stop_motion_command(self) -> None:
+        self.runtime.stop_motion_command()
+
+    def ensure_mapping_runtime_enabled(self, *, reason: str = "") -> Dict[str, Any]:
+        return self.runtime.ensure_mapping_runtime_enabled(reason=reason)
+
+    def disable_mapping_runtime(self, *, reason: str = "") -> Dict[str, Any]:
+        return self.runtime.disable_mapping_runtime(reason=reason)
+
+    def get_loaded_map_name(self) -> Optional[str]:
+        return self.runtime.get_loaded_map_name()
+
+    def load_named_map(
+        self,
+        map_name: str,
+        *,
+        reason: str = "",
+        allow_missing: bool = False,
+    ) -> Dict[str, Any]:
+        return self.runtime.load_named_map(map_name, reason=reason, allow_missing=allow_missing)
+
+    def save_named_map(self, map_name: str, *, reason: str = "") -> Dict[str, Any]:
+        return self.runtime.save_named_map(map_name, reason=reason)
+
+    def get_named_map_runtime_status(self) -> Dict[str, Any]:
+        return self.runtime.get_named_map_runtime_status()
+
+    def is_obstacle_avoidance_control_available(self) -> bool:
+        return self.runtime.is_obstacle_avoidance_control_available()
+
+    def set_obstacle_avoidance_enabled(self, enabled: bool) -> Dict[str, Any]:
+        return self.runtime.set_obstacle_avoidance_enabled(enabled)

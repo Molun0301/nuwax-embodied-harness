@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from adapters.localization.geometry_state_adapter import BackendLocalizationState
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.runtime_views import LocalizationSessionStatus
 from core import EventBus, StateNamespace, StateStore
 from providers import ExplorationProvider, LocalizationProvider, MapProvider, NavigationProvider
-from services import LocalizationService, MappingService, NavigationService
+from providers.motion import MotionControl
+from services.localization import LocalizationService
+from services.mapping import MappingService
+from services.navigation.config import ExplorationConfig, NavigationBackendConfig
+from services.navigation.exploration_runtime import PlatformExplorationRuntime
+from services.navigation.frontier import FrontierCandidate
+from services.navigation.runtime import GridNavigationPlanner
+from services.navigation.service import NavigationService
+from services.navigation.state_machine import create_navigation_state_machine
 from typing import Optional
 
 
@@ -17,7 +26,7 @@ class _ProviderOwner:
         self.providers = providers
 
 
-class FakeNavigationBundle(LocalizationProvider, MapProvider, NavigationProvider, ExplorationProvider):
+class FakeNavigationBundle(LocalizationProvider, MapProvider, NavigationProvider, ExplorationProvider, MotionControl):
     """导航服务测试用组合后端。"""
 
     provider_name = "fake_navigation_bundle"
@@ -58,50 +67,59 @@ class FakeNavigationBundle(LocalizationProvider, MapProvider, NavigationProvider
         return self.current_pose
 
     def get_frame_tree(self) -> Optional[FrameTree]:
-        return FrameTree(
-            root_frame_id="world",
-            transforms=[
-                Transform(
-                    parent_frame_id="world",
-                    child_frame_id="map",
-                    translation=Vector3(),
-                    rotation=Quaternion(w=1.0),
-                    authority="test_localization",
-                ),
+        transforms = [
+            Transform(
+                parent_frame_id="world",
+                child_frame_id="map",
+                translation=Vector3(),
+                rotation=Quaternion(w=1.0),
+                authority="test_localization",
+            )
+        ]
+        if self.current_pose is not None:
+            transforms.append(
                 Transform(
                     parent_frame_id="map",
                     child_frame_id="base_link",
                     translation=self.current_pose.position,
                     rotation=self.current_pose.orientation,
                     authority="test_localization",
-                ),
-            ],
-        )
+                )
+            )
+        return FrameTree(root_frame_id="world", transforms=transforms)
 
     def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
         return OccupancyGrid(
             map_id="test_map",
             frame_id="map",
-            width=2,
-            height=2,
+            width=40,
+            height=40,
             resolution_m=0.1,
             origin=Pose(frame_id="map", position=Vector3()),
-            data=[0, 0, 10, 100],
+            data=[0 for _ in range(1600)],
         )
 
     def get_cost_map(self) -> Optional[CostMap]:
         return CostMap(
             map_id="test_cost_map",
             frame_id="map",
-            width=2,
-            height=2,
+            width=40,
+            height=40,
             resolution_m=0.1,
             origin=Pose(frame_id="map", position=Vector3()),
-            data=[1.0, 5.0, 15.0, 100.0],
+            data=[0.0 for _ in range(1600)],
         )
 
     def get_semantic_map(self) -> Optional[SemanticMap]:
         return self.semantic_map
+
+    def send_twist(self, twist) -> None:
+        target = self.active_goal.target_pose if self.active_goal is not None else self.current_pose
+        if target is not None:
+            self.current_pose = target.model_copy(deep=True)
+
+    def stop_motion(self) -> None:
+        return None
 
     def set_goal(self, goal: NavigationGoal) -> bool:
         self.active_goal = goal
@@ -354,16 +372,194 @@ def test_navigation_service_exploration_flow_reuses_same_runtime_boundary() -> N
     assert len(navigation_service.list_exploration_history()) >= 1
 
 
-def test_services_consult_provider_specific_availability_flags() -> None:
-    """服务可用性应优先反映提供器的真实运行状态。"""
+def test_backend_localization_state_metadata_defaults_are_isolated() -> None:
+    """后端定位状态模型的默认 metadata 不应在实例间共享。"""
 
-    providers, _, localization_service, mapping_service, navigation_service = _build_navigation_services()
-    providers.localization_available = False
-    providers.map_available = False
-    providers.navigation_available = False
-    providers.exploration_available = False
+    first = BackendLocalizationState()
+    second = BackendLocalizationState()
 
-    assert localization_service.is_available() is False
-    assert mapping_service.is_available() is False
-    assert navigation_service.is_navigation_available() is False
-    assert navigation_service.is_exploration_available() is False
+    first.metadata["source"] = "first"
+
+    assert second.metadata == {}
+
+
+def test_localization_service_clear_active_session_resets_platform_state_machine() -> None:
+    """切图清空会话后，旧的 READY 状态不应污染下一次定位会话。"""
+
+    providers, _, localization_service, _, _ = _build_navigation_services()
+    providers.current_pose = Pose(
+        frame_id="map",
+        position=Vector3(x=1.0, y=2.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+
+    ready_session = localization_service.refresh_active_session(
+        map_name="map_a",
+        map_version_id="mapver_a",
+        frame_id="map",
+    )
+    assert ready_session.status == LocalizationSessionStatus.READY
+
+    localization_service.clear_active_session(reason="switch_active_map")
+    providers.current_pose = None
+
+    new_session = localization_service.refresh_active_session(
+        map_name="map_b",
+        map_version_id="mapver_b",
+        frame_id="map",
+    )
+
+    assert new_session.status == LocalizationSessionStatus.LOCALIZING
+    assert new_session.last_error == "定位中..."
+
+
+def test_navigation_state_machine_maps_generic_platform_statuses() -> None:
+    """非 Nav2 后端返回平台标准状态值时，平台状态机也应正确推进。"""
+
+    state_machine = create_navigation_state_machine()
+
+    assert state_machine.update_from_backend_state("platform_backend", "accepted") == NavigationStatus.ACCEPTED
+    assert state_machine.current_goal_id == "unknown"
+    assert state_machine.update_from_backend_state("platform_backend", "planning") == NavigationStatus.PLANNING
+    assert state_machine.update_from_backend_state("platform_backend", "running") == NavigationStatus.RUNNING
+    assert (
+        state_machine.update_from_backend_state("platform_backend", "succeeded", goal_reached=True)
+        == NavigationStatus.SUCCEEDED
+    )
+
+
+class _StubFrontierExplorer:
+    """平台探索运行时测试桩。"""
+
+    def __init__(self, frontier: FrontierCandidate) -> None:
+        self.frontier = frontier
+        self.started = False
+        self.stopped = False
+
+    def start_exploration(self) -> None:
+        self.started = True
+
+    def stop_exploration(self) -> None:
+        self.stopped = True
+
+    def select_candidates(self, **kwargs):
+        return [self.frontier]
+
+
+def test_platform_exploration_runtime_exposes_contract_state() -> None:
+    """平台探索运行时应输出当前仓库约定的 ExplorationState 契约。"""
+
+    current_pose = Pose(
+        frame_id="map",
+        position=Vector3(x=0.0, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    frontier_pose = Pose(
+        frame_id="map",
+        position=Vector3(x=1.0, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    frontier = FrontierCandidate(
+        pose=frontier_pose,
+        score=0.8,
+        cluster_size=10,
+        info_gain_cells=20,
+        path_distance_m=1.0,
+        average_cost=3.0,
+    )
+    runtime = PlatformExplorationRuntime(
+        frontier_explorer=_StubFrontierExplorer(frontier),
+        navigation_planner=GridNavigationPlanner(NavigationBackendConfig()),
+        config=ExplorationConfig(enabled=True),
+    )
+    occupancy_grid = OccupancyGrid(
+        map_id="test_occ",
+        frame_id="map",
+        width=3,
+        height=3,
+        resolution_m=0.5,
+        origin=Pose(frame_id="map", position=Vector3()),
+        data=[0, 0, 0, 0, 0, 0, 0, 0, -1],
+    )
+
+    request = ExploreAreaRequest(
+        request_id="explore_runtime_001",
+        map_name="test_map",
+        center_pose=current_pose,
+        radius_m=2.0,
+        target_name="dock",
+        strategy="frontier",
+    )
+
+    assert runtime.start_exploration(request) is True
+    assert runtime.get_exploration_state().status == ExplorationStatus.ACCEPTED
+
+    runtime.tick(current_pose=current_pose, occupancy_grid=occupancy_grid, cost_map=None)
+    assert runtime.get_exploration_state().status == ExplorationStatus.RUNNING
+
+    runtime.report_hit_stop("找到目标")
+    final_state = runtime.get_exploration_state()
+
+    assert final_state.current_request_id == request.request_id
+    assert final_state.status == ExplorationStatus.SUCCEEDED
+    assert final_state.metadata["runtime_phase"] == "hit_stop"
+
+
+
+
+def test_platform_geometry_runtime_navigation_no_longer_uses_backend_navigation_dataplane() -> None:
+    """平台正式导航入口应由平台运行时接管，而不是直连后端导航数据面。"""
+
+    from contracts.geometry_runtime import PlatformGeometryConfig
+    from services.geometry.runtime import PlatformGeometryRuntime
+
+    providers = FakeNavigationBundle()
+    provider_owner = _ProviderOwner(providers)
+    state_store = StateStore()
+    event_bus = EventBus()
+    localization_service = LocalizationService(
+        provider_owner=provider_owner,
+        state_store=state_store,
+        event_bus=event_bus,
+        history_limit=10,
+    )
+    mapping_service = MappingService(
+        provider_owner=provider_owner,
+        state_store=state_store,
+        event_bus=event_bus,
+        history_limit=10,
+    )
+    localization_service.refresh()
+    mapping_service.refresh()
+
+    class _Robot:
+        def __init__(self, bundle) -> None:
+            self.providers = bundle
+            self.data_plane = None
+            self.current_pose = bundle.current_pose.model_copy(deep=True)
+
+    robot = _Robot(providers)
+    geometry_runtime = PlatformGeometryRuntime(
+        config=PlatformGeometryConfig(enabled=True),
+        catalog_root="/tmp/nrb_test_geometry_runtime",
+        robot=robot,
+    )
+
+    goal = NavigationGoal(
+        goal_id="platform_nav_001",
+        map_name="test_map",
+        target_pose=Pose(frame_id="map", position=Vector3(x=1.0, y=0.5, z=0.0), orientation=Quaternion(w=1.0)),
+    )
+    assert geometry_runtime.providers.set_goal(goal) is True
+
+    navigation_state = geometry_runtime.providers.get_navigation_state()
+
+    assert providers.active_goal is None
+    assert providers.nav_poll_count == 0
+    assert navigation_state.status in {
+        NavigationStatus.ACCEPTED,
+        NavigationStatus.PLANNING,
+        NavigationStatus.RUNNING,
+        NavigationStatus.SUCCEEDED,
+    }
+    assert navigation_state.metadata["backend"] == "platform_grid_navigation"

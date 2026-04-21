@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -34,6 +37,25 @@ DEFAULT_PROXY_MCP_OUTPUT = PROJECT_ROOT / "deploy" / "nuwaclaw" / "mcp_proxy_con
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8766/api/health"
 DEFAULT_AGENT_TOKEN = "agent-robot-bridge-token"
 DEFAULT_ADMIN_TOKEN = "admin-robot-bridge-token"
+DEFAULT_NUWACLAW_CLIENT_CONTAINER_NAME = "nuwax-client"
+DEFAULT_NUWACLAW_CLIENT_VOLUME_NAME = "nuwax_home"
+DEFAULT_NUWACLAW_CLIENT_IMAGE = "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/nuwax-agent-client:latest"
+DEFAULT_NUWACLAW_SERVER_HOST = "https://agent.nuwax.com"
+DEFAULT_NUWACLAW_AGENT_PORT = 60006
+DEFAULT_NUWACLAW_FILE_SERVER_PORT = 60005
+DEFAULT_NUWACLAW_WEB_PORT = 6080
+DEFAULT_NUWACLAW_WORKSPACE_DIR = "/home/user/nuwaxbot/workspace"
+DEFAULT_NUWACLAW_HOST_MOUNT = "none"
+DEFAULT_NUWACLAW_PROXY_SCRIPT = (
+    Path("/var/lib/docker/volumes")
+    / DEFAULT_NUWACLAW_CLIENT_VOLUME_NAME
+    / "_data"
+    / ".nuwaxbot"
+    / "node_modules"
+    / "nuwax-mcp-stdio-proxy"
+    / "dist"
+    / "index.js"
+)
 DEFAULT_MEMORY_ONLINE_MODEL = "tongyi-embedding-vision-flash-2026-03-06"
 DEFAULT_MEMORY_LOCAL_TEXT_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "BAAI__bge-m3")
 DEFAULT_MEMORY_LOCAL_IMAGE_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "openai__clip-vit-base-patch32")
@@ -98,8 +120,9 @@ def _run(
     env: Optional[Mapping[str, str]] = None,
     check: bool = True,
     capture_output: bool = False,
+    display_command: Optional[str] = None,
 ) -> subprocess.CompletedProcess[str]:
-    printable = " ".join(command)
+    printable = display_command or shlex.join(list(command))
     print(f"$ {printable}")
     completed = subprocess.run(
         list(command),
@@ -145,6 +168,15 @@ def _read_text(path: Path) -> str:
 def _write_text(path: Path, content: str) -> None:
     _ensure_parent(path)
     path.write_text(content, encoding="utf-8")
+
+
+def _mask_secret(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return "<empty>"
+    if len(normalized) <= 8:
+        return "*" * len(normalized)
+    return f"{normalized[:4]}...{normalized[-4:]}"
 
 
 def _parse_env_template(content: str) -> List[Tuple[str, Optional[str]]]:
@@ -252,6 +284,13 @@ class BootstrapPlanner:
         self.health_url = str(args.health_url or DEFAULT_HEALTH_URL).strip() or DEFAULT_HEALTH_URL
         self.agent_token = str(args.agent_token or self.root_existing.get("NUWAX_GATEWAY_AGENT_TOKENS", DEFAULT_AGENT_TOKEN)).strip() or DEFAULT_AGENT_TOKEN
         self.admin_token = str(args.admin_token or self.root_existing.get("NUWAX_GATEWAY_ADMIN_TOKENS", DEFAULT_ADMIN_TOKEN)).strip() or DEFAULT_ADMIN_TOKEN
+        self.install_nuwaclaw_docker = self._resolve_bool("install_nuwaclaw_docker", default=False)
+        self.nuwaclaw_saved_key = str(args.nuwaclaw_saved_key or os.environ.get("NUWAX_SAVED_KEY", "")).strip()
+        self.nuwaclaw_host_mount = self._resolve_choice(
+            "nuwaclaw_host_mount",
+            ("none", "ro", "rw"),
+            default=DEFAULT_NUWACLAW_HOST_MOUNT,
+        )
         self.systemd_output = Path(args.systemd_output).expanduser().resolve() if args.systemd_output else DEFAULT_SYSTEMD_OUTPUT
         self.systemd_user = str(args.systemd_user or DEFAULT_SYSTEMD_USER).strip() or DEFAULT_SYSTEMD_USER
         self.systemd_group = str(args.systemd_group or self.systemd_user).strip() or self.systemd_user
@@ -413,6 +452,14 @@ class BootstrapPlanner:
             f"relay: {_bool_text(self.relay_enabled)}",
             f"mcp_mode: {self.mcp_mode}",
         ]
+        if self.install_nuwaclaw_docker:
+            lines.extend(
+                (
+                    f"install_nuwaclaw_docker: {_bool_text(self.install_nuwaclaw_docker)}",
+                    f"nuwaclaw_host_mount: {self.nuwaclaw_host_mount}",
+                    f"nuwaclaw_saved_key: {_mask_secret(self.nuwaclaw_saved_key)}",
+                )
+            )
         return "\n".join(lines)
 
 
@@ -451,6 +498,21 @@ def run_checks(planner: BootstrapPlanner) -> int:
     if planner.run_healthcheck:
         token_ok = bool(planner.agent_token.strip())
         results.append((token_ok, _check_result("健康检查 token", token_ok, "将使用 Authorization: Bearer <agent token> 调用 /api/health")))
+
+    if planner.install_nuwaclaw_docker:
+        docker_ok = _which("docker") is not None
+        results.append((docker_ok, _check_result("Docker CLI", docker_ok, _which("docker") or "未找到 docker 可执行文件")))
+        saved_key_ok = bool(planner.nuwaclaw_saved_key)
+        results.append(
+            (
+                saved_key_ok,
+                _check_result(
+                    "NuwaxClaw 个人密钥",
+                    saved_key_ok,
+                    "需提供 --nuwaclaw-saved-key 或环境变量 NUWAX_SAVED_KEY",
+                ),
+            )
+        )
 
     for _, line in results:
         print(line)
@@ -511,6 +573,116 @@ def prepare_assets(planner: BootstrapPlanner) -> None:
         )
     if planner.prepare_memory:
         _run((planner.python_bin, "scripts/prepare_memory_models.py"), cwd=PROJECT_ROOT)
+
+
+def _build_nuwaclaw_host_mount(mode: str) -> Optional[str]:
+    if mode == "ro":
+        return "/:/host:ro"
+    if mode == "rw":
+        return "/:/host:rw"
+    return None
+
+
+def build_nuwaclaw_docker_run_command(planner: BootstrapPlanner) -> List[str]:
+    if not planner.nuwaclaw_saved_key:
+        raise BootstrapError("已选择安装 NuwaxClaw Docker 客户端，但未提供个人密钥。")
+
+    command = [
+        "docker",
+        "run",
+        "-d",
+        "--name",
+        DEFAULT_NUWACLAW_CLIENT_CONTAINER_NAME,
+        "--restart",
+        "always",
+        "--add-host",
+        "host.docker.internal:host-gateway",
+        "-p",
+        f"{DEFAULT_NUWACLAW_WEB_PORT}:{DEFAULT_NUWACLAW_WEB_PORT}",
+        "-p",
+        f"{DEFAULT_NUWACLAW_FILE_SERVER_PORT}:{DEFAULT_NUWACLAW_FILE_SERVER_PORT}",
+        "-p",
+        f"{DEFAULT_NUWACLAW_AGENT_PORT}:{DEFAULT_NUWACLAW_AGENT_PORT}",
+        "-v",
+        f"{DEFAULT_NUWACLAW_CLIENT_VOLUME_NAME}:/home/user",
+    ]
+    host_mount = _build_nuwaclaw_host_mount(planner.nuwaclaw_host_mount)
+    if host_mount is not None:
+        command.extend(("-v", host_mount))
+    command.extend(
+        (
+            "-e",
+            "TZ=Asia/Shanghai",
+            "-e",
+            f"NUWAX_SERVER_HOST={DEFAULT_NUWACLAW_SERVER_HOST}",
+            "-e",
+            f"NUWAX_AGENT_PORT={DEFAULT_NUWACLAW_AGENT_PORT}",
+            "-e",
+            f"NUWAX_FILE_SERVER_PORT={DEFAULT_NUWACLAW_FILE_SERVER_PORT}",
+            "-e",
+            f"NUWAX_WORKSPACE_DIR={DEFAULT_NUWACLAW_WORKSPACE_DIR}",
+            "-e",
+            f"NUWAX_SAVED_KEY={planner.nuwaclaw_saved_key}",
+            DEFAULT_NUWACLAW_CLIENT_IMAGE,
+        )
+    )
+    return command
+
+
+def _build_redacted_nuwaclaw_docker_command(command: Sequence[str]) -> str:
+    redacted: List[str] = []
+    for part in command:
+        if part.startswith("NUWAX_SAVED_KEY="):
+            redacted.append(f"NUWAX_SAVED_KEY={_mask_secret(part.split('=', 1)[1])}")
+        else:
+            redacted.append(part)
+    return shlex.join(redacted)
+
+
+def _wait_for_nuwaclaw_client_files(timeout_seconds: float = 60.0) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if DEFAULT_NUWACLAW_PROXY_SCRIPT.exists():
+            return True
+        time.sleep(2.0)
+    return DEFAULT_NUWACLAW_PROXY_SCRIPT.exists()
+
+
+def install_nuwaclaw_client(planner: BootstrapPlanner) -> None:
+    if not planner.install_nuwaclaw_docker:
+        print("跳过 NuwaxClaw Docker 客户端安装。")
+        return
+
+    if _which("docker") is None:
+        raise BootstrapError("未找到 docker，无法执行 NuwaxClaw Docker 客户端安装。")
+
+    if planner.nuwaclaw_host_mount == "rw":
+        print("警告: 当前选择把宿主机根目录以读写模式挂载到容器 /host，这会带来宿主机文件被修改的风险。")
+
+    inspect_result = _run(
+        ("docker", "container", "inspect", DEFAULT_NUWACLAW_CLIENT_CONTAINER_NAME),
+        check=False,
+        capture_output=True,
+        display_command=f"docker container inspect {DEFAULT_NUWACLAW_CLIENT_CONTAINER_NAME}",
+    )
+    if inspect_result.returncode == 0:
+        print("检测到已有 nuwax-client 容器，将删除后按当前参数重建。")
+        _run(("docker", "rm", "-f", DEFAULT_NUWACLAW_CLIENT_CONTAINER_NAME))
+
+    command = build_nuwaclaw_docker_run_command(planner)
+    _run(command, display_command=_build_redacted_nuwaclaw_docker_command(command))
+    print(
+        "已启动 NuwaxClaw Docker 客户端: "
+        f"{DEFAULT_NUWACLAW_CLIENT_CONTAINER_NAME}，"
+        f"端口映射 {DEFAULT_NUWACLAW_WEB_PORT}/{DEFAULT_NUWACLAW_FILE_SERVER_PORT}/{DEFAULT_NUWACLAW_AGENT_PORT}，"
+        f"宿主机挂载模式 {planner.nuwaclaw_host_mount}。"
+    )
+
+    if planner.mcp_mode == "auto" and not _wait_for_nuwaclaw_client_files(timeout_seconds=30.0):
+        print(
+            "NuwaxClaw 容器已启动，但持久卷中的 MCP proxy 文件尚未就绪；"
+            "如果后续自动安装外部 MCP hook 失败，可稍后重跑 bootstrap 或单独执行 hook 安装。"
+        )
 
 
 def render_mcp_payload(token: str) -> Dict[str, object]:
@@ -587,6 +759,30 @@ def write_systemd_example(planner: BootstrapPlanner) -> Path:
     return planner.systemd_output
 
 
+def validate_requested_actions(planner: BootstrapPlanner) -> None:
+    if not planner.install_nuwaclaw_docker:
+        return
+    if _which("docker") is None:
+        raise BootstrapError("已选择安装 NuwaxClaw Docker 客户端，但当前环境未找到 docker。")
+    if not planner.nuwaclaw_saved_key:
+        raise BootstrapError("已选择安装 NuwaxClaw Docker 客户端，但未提供个人密钥。")
+
+
+def run_bootstrap_actions(planner: BootstrapPlanner) -> None:
+    validate_requested_actions(planner)
+    write_root_env(planner)
+    write_robot_env(planner)
+    install_python_dependencies(planner)
+    build_workspaces(planner)
+    prepare_assets(planner)
+    install_nuwaclaw_client(planner)
+    configure_mcp(planner)
+    if planner.systemd_enabled:
+        write_systemd_example(planner)
+    start_gateway(planner)
+    run_healthcheck(planner)
+
+
 def start_gateway(planner: BootstrapPlanner) -> None:
     if not planner.start_gateway:
         print("跳过自动启动 gateway。")
@@ -625,6 +821,14 @@ def prompt_bool(title: str, default: bool) -> bool:
     return answer in {"y", "yes", "1", "true", "on"}
 
 
+def prompt_non_empty(title: str, *, secret: bool = False) -> str:
+    while True:
+        answer = (getpass.getpass(f"{title}: ") if secret else input(f"{title}: ")).strip()
+        if answer:
+            return answer
+        print("该项不能为空。")
+
+
 def run_wizard(args: argparse.Namespace) -> int:
     args.robot = prompt_choice("选择机器人", _build_robot_choices(), "go2")
     recommended_tier = ROBOT_BOOTSTRAP_METADATA[args.robot].recommended_tier
@@ -641,14 +845,23 @@ def run_wizard(args: argparse.Namespace) -> int:
     args.prepare_yolo = prompt_bool("准备 YOLO 权重", args.perception_mode != "disabled")
     args.prepare_memory = prompt_bool("准备本地 memory 模型", args.memory_mode == "local")
     args.mcp_mode = prompt_choice("选择 MCP 注入模式", ("auto", "config-only", "skip"), "auto")
+    args.install_nuwaclaw_docker = prompt_bool("安装 NuwaxClaw Docker 客户端", False)
+    if args.install_nuwaclaw_docker:
+        args.nuwaclaw_host_mount = prompt_choice(
+            "选择宿主机根目录挂载模式（rw 有风险）",
+            ("none", "ro", "rw"),
+            DEFAULT_NUWACLAW_HOST_MOUNT,
+        )
+        if args.nuwaclaw_host_mount == "rw":
+            print("警告: 读写挂载会让容器可以直接修改宿主机根目录，请确认你明确接受该风险。")
+        args.nuwaclaw_saved_key = prompt_non_empty(
+            "请输入个人密钥（将写入 NUWAX_SAVED_KEY）",
+            secret=True,
+        )
     planner = BootstrapPlanner(args)
     print("\n当前部署选择：")
     print(planner.summary())
-    write_root_env(planner)
-    write_robot_env(planner)
-    if planner.systemd_enabled:
-        write_systemd_example(planner)
-    configure_mcp(planner)
+    run_bootstrap_actions(planner)
     return 0
 
 
@@ -656,16 +869,7 @@ def run_apply(args: argparse.Namespace) -> int:
     planner = BootstrapPlanner(args)
     print("部署参数：")
     print(planner.summary())
-    write_root_env(planner)
-    write_robot_env(planner)
-    install_python_dependencies(planner)
-    build_workspaces(planner)
-    prepare_assets(planner)
-    configure_mcp(planner)
-    if planner.systemd_enabled:
-        write_systemd_example(planner)
-    start_gateway(planner)
-    run_healthcheck(planner)
+    run_bootstrap_actions(planner)
     return 0
 
 
@@ -682,7 +886,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     check_parser = subparsers.add_parser("check", help="按当前选择执行前置检查。")
-    wizard_parser = subparsers.add_parser("wizard", help="交互式生成部署配置。")
+    wizard_parser = subparsers.add_parser("wizard", help="交互式收集参数并执行部署动作。")
     apply_parser = subparsers.add_parser("apply", help="执行配置生成与部署动作。")
 
     for subparser in (check_parser, wizard_parser, apply_parser):
@@ -693,6 +897,13 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--mcp-mode", choices=("auto", "config-only", "skip"), help="MCP 注入模式。")
         subparser.add_argument("--agent-token", default="", help="健康检查与 MCP 默认使用的 agent token。")
         subparser.add_argument("--admin-token", default="", help="写入 .env 的 admin token。")
+        subparser.add_argument("--nuwaclaw-saved-key", default="", help="安装 NuwaxClaw Docker 客户端时写入的个人密钥。")
+        subparser.add_argument(
+            "--nuwaclaw-host-mount",
+            choices=("none", "ro", "rw"),
+            default="",
+            help="把宿主机根目录挂载到容器 /host 的模式：none / ro / rw。",
+        )
         subparser.add_argument("--health-url", default=DEFAULT_HEALTH_URL, help="健康检查 URL。")
         subparser.add_argument("--systemd-output", default="", help="systemd 示例输出路径。")
         subparser.add_argument("--systemd-user", default="", help="systemd 运行用户。")
@@ -705,6 +916,7 @@ def build_parser() -> argparse.ArgumentParser:
         add_boolean_flag(subparser, "data_plane", "Go2 数据面")
         add_boolean_flag(subparser, "systemd", "生成 systemd 示例")
         add_boolean_flag(subparser, "relay", "relay 配置")
+        add_boolean_flag(subparser, "install_nuwaclaw_docker", "安装 NuwaxClaw Docker 客户端")
         add_boolean_flag(subparser, "install_python", "安装 Python 依赖")
         add_boolean_flag(subparser, "prepare_memory", "准备本地记忆模型")
         add_boolean_flag(subparser, "prepare_yolo", "准备 YOLO 权重")

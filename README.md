@@ -38,6 +38,8 @@ python3 scripts/bootstrap.py check \
 python3 scripts/bootstrap.py wizard
 ```
 
+向导会按选择直接执行部署动作；如果选择安装 `NuwaxClaw` Docker 客户端，还会继续询问宿主机根目录挂载模式和个人密钥。
+
 无交互执行：
 
 ```bash
@@ -52,12 +54,23 @@ python3 scripts/bootstrap.py apply --non-interactive \
   --mcp-mode auto
 ```
 
+如果同时要安装 `NuwaxClaw` Docker 客户端，可追加：
+
+```bash
+  --install-nuwaclaw-docker \
+  --nuwaclaw-host-mount ro \
+  --nuwaclaw-saved-key <你的个人密钥>
+```
+
+脚本会自动附加 `--add-host=host.docker.internal:host-gateway`，并暴露 `6080`、`60005`、`60006` 端口。
+
 执行完成后会按当前选择生成：
 
 - 根配置 `.env`
 - Go2 专属配置 `drivers/go2/data_plane.env`
 - 可选 `systemd` 示例
 - 可选 MCP 配置文件
+- 可选 `NuwaxClaw` Docker 客户端容器
 
 ### 4. 手工启动网关
 

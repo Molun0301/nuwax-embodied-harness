@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import scripts.bootstrap as bootstrap_module
 import pytest
 
 from scripts.bootstrap import (
@@ -119,3 +120,66 @@ def test_redacted_docker_command_masks_saved_key() -> None:
 
     assert "12345678-1234-1234-1234-1234567890ab" not in redacted
     assert "1234...90ab" in redacted
+
+
+def test_go2_robot_env_overrides_enable_direct_dds_and_official_backend() -> None:
+    planner = _build_planner(
+        "apply",
+        "--robot",
+        "go2",
+        "--tier",
+        "full",
+        "--geometry",
+        "--data-plane",
+        "--memory-mode",
+        "cloud",
+        "--perception-mode",
+        "hybrid",
+        "--mcp-mode",
+        "skip",
+    )
+
+    overrides = planner.robot_env_overrides()
+
+    assert overrides["GO2_DATA_PLANE_ENABLED"] == "true"
+    assert overrides["GO2_DIRECT_DDS_ENABLED"] == "true"
+    assert overrides["GO2_OFFICIAL_BACKEND_ENABLED"] == "true"
+    assert overrides["GO2_NAMED_MAP_ARCHIVE_ROOT"].endswith("runtime_data/go2_named_maps")
+
+
+def test_build_workspaces_only_runs_geometry_workspace_script(monkeypatch) -> None:
+    calls: list[tuple[tuple[str, ...], object]] = []
+
+    def _fake_run(command, *, cwd=None, **kwargs):
+        del kwargs
+        calls.append((tuple(command), cwd))
+        return None
+
+    monkeypatch.setattr(bootstrap_module, "_run", _fake_run)
+    planner = _build_planner(
+        "apply",
+        "--robot",
+        "go2",
+        "--tier",
+        "full",
+        "--geometry",
+        "--data-plane",
+        "--memory-mode",
+        "cloud",
+        "--perception-mode",
+        "hybrid",
+        "--mcp-mode",
+        "skip",
+    )
+
+    bootstrap_module.build_workspaces(planner)
+
+    assert calls == [
+        (
+            (
+                "bash",
+                str(bootstrap_module.PROJECT_ROOT / "services" / "geometry" / "build_ros2_workspace.sh"),
+            ),
+            bootstrap_module.PROJECT_ROOT,
+        )
+    ]

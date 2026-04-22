@@ -57,11 +57,6 @@ if [[ -f "${ENV_FILE}" ]]; then
   load_env_file "${ENV_FILE}"
 fi
 
-ACTIVE_ROBOT="$(trim_whitespace "${NUWAX_ACTIVE_ROBOT:-}")"
-if [[ -n "${ACTIVE_ROBOT}" ]]; then
-  source_runtime_script "${REPO_ROOT}/drivers/${ACTIVE_ROBOT}/source_runtime_env.sh"
-fi
-
 if is_truthy "${NUWAX_GEOMETRY_ENABLED:-false}"; then
   source_runtime_script "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
 fi

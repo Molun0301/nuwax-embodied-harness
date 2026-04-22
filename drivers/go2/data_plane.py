@@ -10,14 +10,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import importlib
-import importlib.util
 import json
 import logging
 import math
 import os
 from pathlib import Path
-import shlex
-import subprocess
 import sys
 import threading
 import time
@@ -58,21 +55,6 @@ _GO2_SELF_RING_MIN_COVERAGE_RATIO = 0.75
 _GO2_SELF_RING_MAX_RADIAL_SPREAD_M = 0.18
 _GO2_SELF_RING_MAX_RADIUS_M = 1.10
 
-_KNOWN_GRID_MAP_LAYERS = {
-    "elevation",
-    "variance",
-    "traversability",
-    "normal_x",
-    "normal_y",
-    "normal_z",
-    "upper_bound",
-    "time",
-    "min_filter",
-    "smooth",
-    "inpaint",
-    "erosion",
-    "rgb",
-}
 
 _POINT_FIELD_DTYPE_MAP = {
     1: np.int8,
@@ -160,31 +142,6 @@ def _prepare_go2_official_sdk_environment(config: "Go2DataPlaneConfig") -> None:
     importlib.invalidate_caches()
 
 
-def _is_ros_environment_active() -> bool:
-    """判断当前进程是否已经进入 ROS2 环境。"""
-
-    return any(
-        str(os.environ.get(name, "") or "").strip()
-        for name in ("ROS_VERSION", "AMENT_PREFIX_PATH", "COLCON_PREFIX_PATH", "ROS_DISTRO")
-    )
-
-
-def _uses_sdk2_in_process(config: "Go2DataPlaneConfig") -> bool:
-    """判断当前进程是否计划启用 Unitree SDK2。"""
-
-    direct_dds_enabled = bool(getattr(getattr(config, "direct_dds", None), "enabled", False))
-    official_backend_enabled = bool(getattr(getattr(config, "official", None), "enabled", False))
-    return direct_dds_enabled or official_backend_enabled
-
-
-def _sdk2_ros_conflict_message() -> str:
-    """返回 SDK2 与 ROS2 进程冲突说明。"""
-
-    return (
-        "根据宇树官方约束，Unitree SDK2 与 ROS2 环境不能在同一进程中同时初始化；"
-        "请在未进入 ROS2 环境的终端中启动宿主机网关，ROS2 能力需要独立进程侧车。"
-    )
-
 
 def _load_go2_official_sdk_modules(
     config: "Go2DataPlaneConfig",
@@ -230,52 +187,6 @@ def _load_go2_official_sdk_modules(
         return None
 
 
-@dataclass
-class ManagedRos2Process:
-    """受控的 ROS2 子进程。"""
-
-    name: str
-    command: str
-    setup_script: str = ""
-    cyclonedds_lib_dir: str = ""
-    process: Optional[subprocess.Popen] = field(default=None, init=False, repr=False)
-
-    def start(self) -> None:
-        """启动子进程。"""
-
-        if self.process is not None and self.process.poll() is None:
-            return
-        shell_parts: List[str] = []
-        if self.setup_script.strip():
-            shell_parts.append(f"source {self.setup_script}")
-        if self.cyclonedds_lib_dir.strip():
-            quoted_lib_dir = shlex.quote(self.cyclonedds_lib_dir)
-            shell_parts.append(f"export LD_LIBRARY_PATH={quoted_lib_dir}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}")
-        shell_parts.append(self.command)
-        shell_command = " && ".join(shell_parts)
-        LOGGER.info("启动 ROS2 子进程 name=%s command=%s", self.name, shell_command)
-        self.process = subprocess.Popen(
-            ["bash", "-lc", shell_command],
-            start_new_session=True,
-            stdout=None,
-            stderr=None,
-        )
-
-    def stop(self, timeout_sec: float = 5.0) -> None:
-        """停止子进程。"""
-
-        if self.process is None or self.process.poll() is not None:
-            return
-        LOGGER.info("停止 ROS2 子进程 name=%s pid=%s", self.name, self.process.pid)
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=max(0.1, timeout_sec))
-        except subprocess.TimeoutExpired:
-            LOGGER.warning("ROS2 子进程超时未退出，强制杀死 name=%s pid=%s", self.name, self.process.pid)
-            self.process.kill()
-            self.process.wait(timeout=2.0)
-
-
 @dataclass(frozen=True)
 class _SelectedMapLayers:
     """桥层当前对外暴露的统一地图图层集合。"""
@@ -288,29 +199,17 @@ class _SelectedMapLayers:
     def has_any_layer(self) -> bool:
         return self.occupancy_grid is not None or self.cost_map is not None or self.semantic_map is not None
 
-    def is_running(self) -> bool:
-        """返回子进程是否仍在运行。"""
-
-        return self.process is not None and self.process.poll() is None
-
 
 class RclpyGo2RosBridge:
     """Go2 端侧数据桥。
 
-    优先直接消费宇树官方 DDS 位姿与点云，再用 ROS2 话题补齐 TF、地图层和兼容输入。
+    直接消费宇树官方 DDS 位姿与点云，并在进程内维护兼容 getter 所需的运行态。
     """
 
     def __init__(self, config: "Go2DataPlaneConfig") -> None:
         self.config = config
         self._lock = threading.RLock()
         self._started = False
-        self._owns_rclpy_context = False
-        self._rclpy = None
-        self._node = None
-        self._executor = None
-        self._executor_thread: Optional[threading.Thread] = None
-        self._ros_started = False
-        self._ros_in_process_disabled_reason = ""
         self._direct_dds_started = False
         self._direct_dds_stop_event = threading.Event()
         self._direct_dds_threads: List[threading.Thread] = []
@@ -320,43 +219,28 @@ class RclpyGo2RosBridge:
         self._goal_handle = None
         self._current_goal: Optional[NavigationGoal] = None
         self._latest_pose: Optional[Pose] = None
-        self._latest_pose_from_ros: Optional[Pose] = None
         self._latest_pose_from_dds: Optional[Pose] = None
         self._latest_pose_source = ""
         self._latest_imu_state: Optional[IMUState] = None
-        self._latest_imu_state_from_ros: Optional[IMUState] = None
         self._latest_imu_state_from_dds: Optional[IMUState] = None
         self._tf_transforms: Dict[Tuple[str, str], Transform] = {}
-        self._latest_occupancy_direct: Optional[OccupancyGrid] = None
-        self._latest_occupancy_from_grid: Optional[OccupancyGrid] = None
         self._latest_occupancy_from_global_cloud: Optional[OccupancyGrid] = None
         self._latest_occupancy_from_local_cloud: Optional[OccupancyGrid] = None
-        self._latest_cost_direct: Optional[CostMap] = None
-        self._latest_cost_from_grid: Optional[CostMap] = None
         self._latest_cost_from_global_cloud: Optional[CostMap] = None
         self._latest_cost_from_local_cloud: Optional[CostMap] = None
-        self._latest_semantic_map: Optional[SemanticMap] = None
         self._latest_semantic_map_from_global_cloud: Optional[SemanticMap] = None
         self._latest_semantic_map_from_local_cloud: Optional[SemanticMap] = None
         self._latest_navigation_state = NavigationState(status=NavigationStatus.IDLE)
         self._goal_reached = False
         self._last_error: Optional[str] = None
-        self._ros_setup_loaded = False
-        self._latest_odom_source_topic = ""
         self._latest_imu_source_topic = ""
         self._latest_point_cloud_source_topic = ""
         self._latest_global_map_source = ""
         self._latest_local_map_source = ""
         self._point_cloud_available = False
         self._direct_pose_ready = False
-        self._ros_pose_ready = False
         self._direct_imu_ready = False
-        self._ros_imu_ready = False
         self._direct_point_cloud_ready = False
-        self._ros_point_cloud_ready = False
-        self._ros_occupancy_ready = False
-        self._ros_grid_map_ready = False
-        self._ros_cost_map_ready = False
         self._global_map_ready = False
         self._local_map_ready = False
         self._global_map_builder = Go2SparseGlobalMapBuilder(self.config.map_synthesis)
@@ -386,61 +270,16 @@ class RclpyGo2RosBridge:
         with self._lock:
             if self._started:
                 return
-            if _uses_sdk2_in_process(self.config) and _is_ros_environment_active():
-                message = _sdk2_ros_conflict_message()
-                self._last_error = message
-                raise RuntimeError(message)
             self._start_direct_dds_backend()
-
-            modules = None
-            if _uses_sdk2_in_process(self.config):
-                self._ros_in_process_disabled_reason = (
-                    "当前进程已启用 Unitree SDK2，已按官方约束禁用进程内 ROS2 订阅。"
-                )
-                if self.config.require_ros2:
-                    self._last_error = self._ros_in_process_disabled_reason
-                    raise RuntimeError(self._ros_in_process_disabled_reason)
-                LOGGER.info(self._ros_in_process_disabled_reason)
-            else:
-                self._ros_in_process_disabled_reason = ""
-                modules = self._load_ros_modules()
-
-            if modules is not None:
-                self._rclpy = modules["rclpy"]
-                if not self._rclpy.ok():
-                    self._rclpy.init(args=None)
-                    self._owns_rclpy_context = True
-                node_class = modules["Node"]
-                executor_class = modules["MultiThreadedExecutor"]
-                self._node = node_class("nuwax_go2_data_plane")
-                self._executor = executor_class(num_threads=2)
-                self._executor.add_node(self._node)
-
-                self._create_subscriptions(modules)
-                self._executor_thread = threading.Thread(
-                    target=self._executor.spin,
-                    name="nuwax_go2_ros2_executor",
-                    daemon=True,
-                )
-                self._executor_thread.start()
-                self._ros_started = True
-            elif self.config.require_ros2 and not self._direct_dds_started:
-                message = "当前环境不可导入 rclpy 或 ROS2 消息包，且 Go2 官方 DDS 直连未就绪。"
-                self._last_error = message
-                raise RuntimeError(message)
-            elif not self._direct_dds_started:
-                message = "当前环境不可导入 rclpy 或 ROS2 消息包，Go2 数据桥保持未启用。"
+            if not self._direct_dds_started:
+                message = "Go2 官方 DDS 直连未就绪，Go2 数据桥保持未启用。"
                 self._last_error = message
                 LOGGER.warning(message)
                 return
 
             self._started = True
             self._last_error = None
-            LOGGER.info(
-                "Go2 数据桥已启动 direct_dds=%s ros2=%s",
-                self._direct_dds_started,
-                self._ros_started,
-            )
+            LOGGER.info("Go2 数据桥已启动 direct_dds=%s", self._direct_dds_started)
 
     def stop(self) -> None:
         """停止 Go2 数据桥。"""
@@ -449,29 +288,8 @@ class RclpyGo2RosBridge:
             if not self._started:
                 return
             self._stop_direct_dds_backend()
-            try:
-                if self._executor is not None:
-                    self._executor.shutdown(timeout_sec=1.0)
-            except Exception:
-                LOGGER.exception("关闭 ROS2 executor 失败。")
-            try:
-                if self._node is not None:
-                    self._node.destroy_node()
-            except Exception:
-                LOGGER.exception("销毁 ROS2 节点失败。")
-            if self._executor_thread is not None:
-                self._executor_thread.join(timeout=2.0)
-            if self._owns_rclpy_context and self._rclpy is not None:
-                try:
-                    self._rclpy.shutdown()
-                except Exception:
-                    LOGGER.exception("关闭 rclpy 上下文失败。")
-            self._executor = None
-            self._node = None
-            self._executor_thread = None
             self._action_client = None
             self._goal_handle = None
-            self._ros_started = False
             self._started = False
             LOGGER.info("Go2 数据桥已停止。")
 
@@ -749,22 +567,16 @@ class RclpyGo2RosBridge:
             effective_map_layers = self._select_effective_map_layers_unlocked()
             return {
                 "started": self._started,
-                "ros_started": self._ros_started,
-                "ros_in_process_disabled_reason": self._ros_in_process_disabled_reason,
                 "direct_dds_started": self._direct_dds_started,
                 "localization_available": self.is_localization_available(),
                 "map_available": effective_map_layers.has_any_layer(),
                 "navigation_available": self.is_navigation_available(),
                 "pose_source": self._latest_pose_source,
                 "dds_pose_ready": self._direct_pose_ready,
-                "ros_pose_ready": self._ros_pose_ready,
-                "odom_source_topic": self._latest_odom_source_topic,
                 "imu_available": self._latest_imu_state is not None,
                 "dds_imu_ready": self._direct_imu_ready,
-                "ros_imu_ready": self._ros_imu_ready,
                 "imu_source_topic": self._latest_imu_source_topic,
                 "dds_cloud_ready": self._direct_point_cloud_ready,
-                "ros_point_cloud_ready": self._ros_point_cloud_ready,
                 "point_cloud_source_topic": self._latest_point_cloud_source_topic,
                 "point_cloud_available": self._point_cloud_available,
                 "point_cloud_mapping_runtime_enabled": self._point_cloud_mapping_runtime_enabled,
@@ -781,7 +593,6 @@ class RclpyGo2RosBridge:
                     )
                     if layer_value is not None
                 ],
-                "ros_map_ready": self._ros_occupancy_ready or self._ros_grid_map_ready or self._ros_cost_map_ready,
                 "global_map_ready": self._global_map_ready,
                 "global_map_source": self._latest_global_map_source,
                 "global_map_cache_restored": self._global_map_cache_restored,
@@ -846,17 +657,6 @@ class RclpyGo2RosBridge:
         )
 
     def _select_effective_map_layers_unlocked(self) -> _SelectedMapLayers:
-        prefer_platform_point_cloud = bool(
-            self._point_cloud_mapping_runtime_enabled
-            and (
-                self._latest_occupancy_from_global_cloud is not None
-                or self._latest_cost_from_global_cloud is not None
-                or self._latest_semantic_map_from_global_cloud is not None
-                or self._latest_occupancy_from_local_cloud is not None
-                or self._latest_cost_from_local_cloud is not None
-                or self._latest_semantic_map_from_local_cloud is not None
-            )
-        )
         ordered_sources = (
             (
                 "platform_global_cloud",
@@ -870,26 +670,7 @@ class RclpyGo2RosBridge:
                 self._latest_cost_from_local_cloud,
                 self._latest_semantic_map_from_local_cloud,
             ),
-            (
-                "ros_grid_map",
-                self._latest_occupancy_from_grid,
-                self._latest_cost_from_grid,
-                self._latest_semantic_map,
-            ),
-            (
-                "ros_direct_map",
-                self._latest_occupancy_direct,
-                self._latest_cost_direct,
-                None,
-            ),
         )
-        if not prefer_platform_point_cloud:
-            ordered_sources = (
-                ordered_sources[2],
-                ordered_sources[3],
-                ordered_sources[0],
-                ordered_sources[1],
-            )
 
         normalized_sources = [
             self._normalize_selected_map_layers_unlocked(
@@ -911,114 +692,9 @@ class RclpyGo2RosBridge:
                 return layers
         return _SelectedMapLayers()
 
-    def _load_ros_modules(self) -> Optional[Dict[str, object]]:
-        self._ensure_ros_python_environment()
-        try:
-            modules = {
-                "rclpy": importlib.import_module("rclpy"),
-                "Node": getattr(importlib.import_module("rclpy.node"), "Node"),
-                "MultiThreadedExecutor": getattr(importlib.import_module("rclpy.executors"), "MultiThreadedExecutor"),
-                "Odometry": getattr(importlib.import_module("nav_msgs.msg"), "Odometry"),
-                "RosOccupancyGrid": getattr(importlib.import_module("nav_msgs.msg"), "OccupancyGrid"),
-                "TFMessage": getattr(importlib.import_module("tf2_msgs.msg"), "TFMessage"),
-                "Imu": getattr(importlib.import_module("sensor_msgs.msg"), "Imu"),
-                "PointCloud2": getattr(importlib.import_module("sensor_msgs.msg"), "PointCloud2"),
-            }
-            try:
-                modules["GridMap"] = getattr(importlib.import_module("grid_map_msgs.msg"), "GridMap")
-            except Exception:
-                modules["GridMap"] = None
-            try:
-                modules["Nav2Costmap"] = getattr(importlib.import_module("nav2_msgs.msg"), "Costmap")
-            except Exception:
-                modules["Nav2Costmap"] = None
-            return modules
-        except Exception as exc:
-            if self.config.require_ros2 or not self._direct_dds_started:
-                LOGGER.exception("导入 ROS2 Python 模块失败。")
-            else:
-                LOGGER.warning("Go2 端侧 ROS2 Python 环境当前不可用，继续使用官方 DDS 直连：%s", exc)
-                LOGGER.debug("导入 ROS2 Python 模块失败详情。", exc_info=True)
-            return None
 
-    def _ensure_ros_python_environment(self) -> None:
-        """把 setup.bash 导出的环境同步到当前 Python 进程。"""
 
-        if self._ros_setup_loaded:
-            return
-        if importlib.util.find_spec("rclpy") is not None:
-            self._ros_setup_loaded = True
-            return
 
-        setup_script = str(self.config.setup_script or "").strip()
-        if not setup_script:
-            LOGGER.warning("Go2 ROS2 setup 脚本未配置，无法自动导入 ROS2 Python 环境。")
-            return
-
-        setup_path = Path(setup_script).expanduser()
-        if not setup_path.exists():
-            LOGGER.warning("Go2 ROS2 setup 脚本不存在，无法自动导入 ROS2 Python 环境：%s", setup_path)
-            return
-
-        try:
-            completed = subprocess.run(
-                [
-                    "bash",
-                    "-lc",
-                    f"source {shlex.quote(str(setup_path))} >/dev/null 2>&1 && env -0",
-                ],
-                check=True,
-                capture_output=True,
-                env=dict(os.environ),
-            )
-        except Exception:
-            LOGGER.exception("执行 Go2 ROS2 setup 脚本失败：%s", setup_path)
-            return
-
-        loaded_env = self._parse_null_delimited_environment(completed.stdout)
-        if not loaded_env:
-            LOGGER.warning("Go2 ROS2 setup 脚本未导出可用环境：%s", setup_path)
-            return
-
-        self._merge_ros_environment(loaded_env)
-        importlib.invalidate_caches()
-        self._ros_setup_loaded = True
-        LOGGER.info("已自动加载 Go2 ROS2 Python 环境 setup=%s", setup_path)
-
-    def _parse_null_delimited_environment(self, payload: bytes) -> Dict[str, str]:
-        """把 env -0 输出解析成环境变量字典。"""
-
-        result: Dict[str, str] = {}
-        for raw_item in payload.split(b"\x00"):
-            if not raw_item or b"=" not in raw_item:
-                continue
-            key_bytes, value_bytes = raw_item.split(b"=", 1)
-            key = key_bytes.decode("utf-8", errors="ignore").strip()
-            if not key:
-                continue
-            result[key] = value_bytes.decode("utf-8", errors="ignore")
-        return result
-
-    def _merge_ros_environment(self, loaded_env: Dict[str, str]) -> None:
-        """把 ROS2 相关环境注入当前进程，并同步 PYTHONPATH 到 sys.path。"""
-
-        for key, value in loaded_env.items():
-            os.environ[key] = value
-
-        python_path = str(loaded_env.get("PYTHONPATH", "") or "").strip()
-        if not python_path:
-            return
-
-        inserted_paths: List[str] = []
-        for raw_item in python_path.split(":"):
-            item = raw_item.strip()
-            if not item or item in inserted_paths:
-                continue
-            inserted_paths.append(item)
-
-        for item in reversed(inserted_paths):
-            if item not in sys.path:
-                sys.path.insert(0, item)
 
     def _start_direct_dds_backend(self) -> None:
         """启动 Go2 官方 DDS 原始数据订阅。"""
@@ -1133,12 +809,8 @@ class RclpyGo2RosBridge:
     def _update_preferred_pose_unlocked(self) -> None:
         """按照优先级更新当前位姿。"""
 
-        if self._latest_pose_from_dds is not None:
-            self._latest_pose = self._latest_pose_from_dds
-            self._latest_pose_source = f"dds:{self.config.direct_dds.pose_topic}"
-        else:
-            self._latest_pose = self._latest_pose_from_ros
-            self._latest_pose_source = self._latest_odom_source_topic
+        self._latest_pose = self._latest_pose_from_dds
+        self._latest_pose_source = f"dds:{self.config.direct_dds.pose_topic}" if self._latest_pose is not None else ""
         self._maybe_refresh_global_map_outputs_unlocked()
 
     def _update_preferred_imu_unlocked(self) -> None:
@@ -1147,10 +819,6 @@ class RclpyGo2RosBridge:
         if self._latest_imu_state_from_dds is not None:
             self._latest_imu_state = self._latest_imu_state_from_dds
             self._latest_imu_source_topic = f"dds:{self.config.direct_dds.pose_topic}#imu_state"
-            return
-        if self._latest_imu_state_from_ros is not None:
-            self._latest_imu_state = self._latest_imu_state_from_ros
-            self._latest_imu_source_topic = str(self.config.topics.imu_topic or "")
             return
         self._latest_imu_state = None
         self._latest_imu_source_topic = ""
@@ -1162,69 +830,11 @@ class RclpyGo2RosBridge:
             self._latest_point_cloud_source_topic = f"dds:{self.config.direct_dds.point_cloud_topic}"
             self._point_cloud_available = True
             return
-        if self._ros_point_cloud_ready:
-            self._latest_point_cloud_source_topic = str(self.config.topics.point_cloud_topic or "")
-            self._point_cloud_available = True
-            return
         self._latest_point_cloud_source_topic = ""
         self._point_cloud_available = False
 
-    def _create_subscriptions(self, modules: Dict[str, object]) -> None:
-        assert self._node is not None
-        topics = self.config.topics
-        subscribed_topics = set()
-        odom_topics = [topics.odom_topic, *list(getattr(topics, "secondary_odom_topics", ()) or ())]
-        for topic_name in odom_topics:
-            normalized = str(topic_name or "").strip()
-            if not normalized or normalized in subscribed_topics:
-                continue
-            subscribed_topics.add(normalized)
-            self._node.create_subscription(
-                modules["Odometry"],
-                normalized,
-                lambda message, source_topic=normalized: self._on_odom(message, source_topic=source_topic),
-                20,
-            )
-        self._node.create_subscription(modules["TFMessage"], topics.tf_topic, self._on_tf_message, 50)
-        self._node.create_subscription(modules["TFMessage"], topics.tf_static_topic, self._on_tf_message, 10)
-        if str(getattr(topics, "imu_topic", "") or "").strip():
-            self._node.create_subscription(
-                modules["Imu"],
-                topics.imu_topic,
-                lambda message, source_topic=topics.imu_topic: self._on_imu(message, source_topic=source_topic),
-                20,
-            )
-        if str(getattr(topics, "point_cloud_topic", "") or "").strip():
-            self._node.create_subscription(
-                modules["PointCloud2"],
-                topics.point_cloud_topic,
-                lambda message, source_topic=topics.point_cloud_topic: self._on_point_cloud(
-                    message, source_topic=source_topic
-                ),
-                5,
-            )
-        self._node.create_subscription(modules["RosOccupancyGrid"], topics.occupancy_topic, self._on_occupancy_grid, 10)
-        if modules.get("GridMap") is not None and topics.grid_map_topic.strip():
-            self._node.create_subscription(modules["GridMap"], topics.grid_map_topic, self._on_grid_map, 10)
-        if modules.get("Nav2Costmap") is not None and topics.cost_map_topic.strip():
-            self._node.create_subscription(modules["Nav2Costmap"], topics.cost_map_topic, self._on_cost_map, 10)
 
-    def _on_odom(self, message: object, *, source_topic: str = "") -> None:
-        pose = self._build_pose_from_odom(message)
-        with self._lock:
-            self._latest_pose_from_ros = pose
-            self._ros_pose_ready = True
-            self._latest_odom_source_topic = str(source_topic or "")
-            self._update_preferred_pose_unlocked()
 
-    def _on_imu(self, message: object, *, source_topic: str = "") -> None:
-        imu_state = self._build_imu_from_ros(message)
-        with self._lock:
-            self._latest_imu_state_from_ros = imu_state
-            self._ros_imu_ready = imu_state is not None
-            if not str(self.config.topics.imu_topic or "").strip():
-                self._latest_imu_source_topic = str(source_topic or "")
-            self._update_preferred_imu_unlocked()
 
     def _is_point_cloud_mapping_enabled(self) -> bool:
         """判断当前是否启用了任意点云地图合成链。"""
@@ -1511,19 +1121,6 @@ class RclpyGo2RosBridge:
             LOGGER.info("Go2 点云地图合成链已回收 reason=%s", reason or "mapping_runtime")
         return status
 
-    def _on_point_cloud(self, message: object, *, source_topic: str = "") -> None:
-        with self._lock:
-            current_pose = self._latest_pose.model_copy(deep=True) if self._latest_pose is not None else None
-            self._ros_point_cloud_ready = True
-            self._update_preferred_point_cloud_status_unlocked()
-            should_ingest = not self._direct_dds_started or not self._direct_point_cloud_ready
-        if current_pose is None or not should_ingest or not self._is_point_cloud_mapping_enabled():
-            return
-        self._ingest_point_cloud_sample(
-            message,
-            current_pose=current_pose,
-            source_label="ros_point_cloud",
-        )
 
     def _on_sport_mode_state(self, message: object, *, source_topic: str = "") -> None:
         pose = self._build_pose_from_sport_mode_state(message)
@@ -1550,81 +1147,11 @@ class RclpyGo2RosBridge:
             source_label="direct_dds_point_cloud",
         )
 
-    def _on_tf_message(self, message: object) -> None:
-        transforms = getattr(message, "transforms", [])
-        with self._lock:
-            for transform in transforms:
-                parent_frame = str(getattr(getattr(transform, "header", None), "frame_id", "") or "").strip()
-                child_frame = str(getattr(transform, "child_frame_id", "") or "").strip()
-                if not parent_frame or not child_frame:
-                    continue
-                self._tf_transforms[(parent_frame, child_frame)] = self._build_transform_from_ros(transform)
 
-    def _on_occupancy_grid(self, message: object) -> None:
-        with self._lock:
-            self._latest_occupancy_direct = self._build_contract_occupancy_grid(message)
-            self._ros_occupancy_ready = True
 
-    def _on_cost_map(self, message: object) -> None:
-        with self._lock:
-            self._latest_cost_direct = self._build_contract_cost_map(message)
-            self._ros_cost_map_ready = True
 
-    def _on_grid_map(self, message: object) -> None:
-        occupancy = self._build_occupancy_from_grid_map(message)
-        cost_map = self._build_cost_map_from_grid_map(message)
-        semantic_map = self._build_semantic_map_from_grid_map(message)
-        with self._lock:
-            self._latest_occupancy_from_grid = occupancy
-            self._latest_cost_from_grid = cost_map
-            self._latest_semantic_map = semantic_map
-            self._ros_grid_map_ready = bool(occupancy is not None or cost_map is not None or semantic_map is not None)
 
-    def _build_pose_from_odom(self, message: object) -> Pose:
-        header = getattr(message, "header", None)
-        pose_with_cov = getattr(message, "pose", None)
-        pose_obj = getattr(pose_with_cov, "pose", None)
-        frame_id = str(getattr(header, "frame_id", "") or self.config.map_synthesis.map_frame)
-        return Pose(
-            frame_id=frame_id,
-            position=Vector3(
-                x=float(getattr(getattr(pose_obj, "position", None), "x", 0.0)),
-                y=float(getattr(getattr(pose_obj, "position", None), "y", 0.0)),
-                z=float(getattr(getattr(pose_obj, "position", None), "z", 0.0)),
-            ),
-            orientation=Quaternion(
-                x=float(getattr(getattr(pose_obj, "orientation", None), "x", 0.0)),
-                y=float(getattr(getattr(pose_obj, "orientation", None), "y", 0.0)),
-                z=float(getattr(getattr(pose_obj, "orientation", None), "z", 0.0)),
-                w=float(getattr(getattr(pose_obj, "orientation", None), "w", 1.0)),
-            ),
-        )
 
-    def _build_imu_from_ros(self, message: object) -> IMUState:
-        header = getattr(message, "header", None)
-        frame_id = str(getattr(header, "frame_id", "") or "imu")
-        orientation = getattr(message, "orientation", None)
-        angular_velocity = getattr(message, "angular_velocity", None)
-        linear_acceleration = getattr(message, "linear_acceleration", None)
-        return IMUState(
-            frame_id=frame_id,
-            orientation=Quaternion(
-                x=float(getattr(orientation, "x", 0.0)),
-                y=float(getattr(orientation, "y", 0.0)),
-                z=float(getattr(orientation, "z", 0.0)),
-                w=float(getattr(orientation, "w", 1.0)),
-            ),
-            angular_velocity_rad_s=Vector3(
-                x=float(getattr(angular_velocity, "x", 0.0)),
-                y=float(getattr(angular_velocity, "y", 0.0)),
-                z=float(getattr(angular_velocity, "z", 0.0)),
-            ),
-            linear_acceleration_m_s2=Vector3(
-                x=float(getattr(linear_acceleration, "x", 0.0)),
-                y=float(getattr(linear_acceleration, "y", 0.0)),
-                z=float(getattr(linear_acceleration, "z", 0.0)),
-            ),
-        )
 
     def _build_pose_from_sport_mode_state(self, message: object) -> Pose:
         imu_state = getattr(message, "imu_state", None)
@@ -2223,240 +1750,15 @@ class RclpyGo2RosBridge:
         cosy_cosp = 1.0 - 2.0 * (rotation.y * rotation.y + rotation.z * rotation.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
-    def _build_transform_from_ros(self, message: object) -> Transform:
-        transform = getattr(message, "transform", None)
-        header = getattr(message, "header", None)
-        return Transform(
-            parent_frame_id=str(getattr(header, "frame_id", "") or self.config.map_synthesis.map_frame),
-            child_frame_id=str(getattr(message, "child_frame_id", "") or self.config.map_synthesis.base_frame),
-            translation=Vector3(
-                x=float(getattr(getattr(transform, "translation", None), "x", 0.0)),
-                y=float(getattr(getattr(transform, "translation", None), "y", 0.0)),
-                z=float(getattr(getattr(transform, "translation", None), "z", 0.0)),
-            ),
-            rotation=Quaternion(
-                x=float(getattr(getattr(transform, "rotation", None), "x", 0.0)),
-                y=float(getattr(getattr(transform, "rotation", None), "y", 0.0)),
-                z=float(getattr(getattr(transform, "rotation", None), "z", 0.0)),
-                w=float(getattr(getattr(transform, "rotation", None), "w", 1.0)),
-            ),
-            authority="ros2_tf",
-        )
 
-    def _build_contract_occupancy_grid(self, message: object) -> OccupancyGrid:
-        info = getattr(message, "info", None)
-        header = getattr(message, "header", None)
-        frame_id = str(getattr(header, "frame_id", "") or self.config.map_synthesis.map_frame)
-        return OccupancyGrid(
-            map_id="go2_occupancy_map",
-            frame_id=frame_id,
-            width=int(getattr(info, "width", 1)),
-            height=int(getattr(info, "height", 1)),
-            resolution_m=float(getattr(info, "resolution", 0.1) or 0.1),
-            origin=self._build_pose_from_ros_pose(getattr(info, "origin", None), frame_id=frame_id),
-            data=[int(value) for value in getattr(message, "data", [])],
-        )
 
-    def _build_contract_cost_map(self, message: object) -> CostMap:
-        metadata = getattr(message, "metadata", None)
-        frame_id = str(getattr(metadata, "layer", "") or self.config.map_synthesis.map_frame)
-        if metadata is not None and getattr(metadata, "map_load_time", None) is not None:
-            frame_id = str(getattr(getattr(message, "header", None), "frame_id", "") or self.config.map_synthesis.map_frame)
-        width = int(getattr(metadata, "size_x", getattr(message, "width", 1)))
-        height = int(getattr(metadata, "size_y", getattr(message, "height", 1)))
-        resolution = float(getattr(metadata, "resolution", getattr(message, "resolution", 0.1)) or 0.1)
-        origin_pose = getattr(metadata, "origin", getattr(message, "origin", None))
-        raw_data = getattr(message, "data", [])
-        return CostMap(
-            map_id="go2_official_cost_map",
-            frame_id=frame_id,
-            width=width,
-            height=height,
-            resolution_m=resolution,
-            origin=self._build_pose_from_ros_pose(origin_pose, frame_id=frame_id),
-            data=[float(value) for value in raw_data],
-        )
 
-    def _build_pose_from_ros_pose(self, pose_obj: object, *, frame_id: str) -> Pose:
-        return Pose(
-            frame_id=frame_id,
-            position=Vector3(
-                x=float(getattr(getattr(pose_obj, "position", None), "x", 0.0)),
-                y=float(getattr(getattr(pose_obj, "position", None), "y", 0.0)),
-                z=float(getattr(getattr(pose_obj, "position", None), "z", 0.0)),
-            ),
-            orientation=Quaternion(
-                x=float(getattr(getattr(pose_obj, "orientation", None), "x", 0.0)),
-                y=float(getattr(getattr(pose_obj, "orientation", None), "y", 0.0)),
-                z=float(getattr(getattr(pose_obj, "orientation", None), "z", 0.0)),
-                w=float(getattr(getattr(pose_obj, "orientation", None), "w", 1.0)),
-            ),
-        )
 
-    def _grid_map_dimensions(self, message: object) -> Tuple[int, int]:
-        info = getattr(message, "info", None)
-        resolution = float(getattr(info, "resolution", 0.1) or 0.1)
-        length_x = float(getattr(info, "length_x", resolution))
-        length_y = float(getattr(info, "length_y", resolution))
-        width = max(1, int(round(length_x / resolution)))
-        height = max(1, int(round(length_y / resolution)))
-        return width, height
 
-    def _grid_map_origin_pose(self, message: object, *, frame_id: str) -> Pose:
-        info = getattr(message, "info", None)
-        pose_obj = getattr(info, "pose", None)
-        length_x = float(getattr(info, "length_x", 0.0))
-        length_y = float(getattr(info, "length_y", 0.0))
-        center_x = float(getattr(getattr(pose_obj, "position", None), "x", 0.0))
-        center_y = float(getattr(getattr(pose_obj, "position", None), "y", 0.0))
-        center_z = float(getattr(getattr(pose_obj, "position", None), "z", 0.0))
-        return Pose(
-            frame_id=frame_id,
-            position=Vector3(
-                x=center_x - length_x / 2.0,
-                y=center_y - length_y / 2.0,
-                z=center_z,
-            ),
-            orientation=Quaternion(
-                x=float(getattr(getattr(pose_obj, "orientation", None), "x", 0.0)),
-                y=float(getattr(getattr(pose_obj, "orientation", None), "y", 0.0)),
-                z=float(getattr(getattr(pose_obj, "orientation", None), "z", 0.0)),
-                w=float(getattr(getattr(pose_obj, "orientation", None), "w", 1.0)),
-            ),
-        )
 
-    def _extract_grid_layer(self, message: object, layer_name: str) -> Optional[np.ndarray]:
-        layers = list(getattr(message, "layers", []))
-        if layer_name not in layers:
-            return None
-        layer_index = layers.index(layer_name)
-        data_entries = list(getattr(message, "data", []))
-        if layer_index >= len(data_entries):
-            return None
-        raw_data = np.asarray(list(getattr(data_entries[layer_index], "data", [])), dtype=np.float32)
-        width, height = self._grid_map_dimensions(message)
-        if raw_data.size != width * height:
-            return None
-        matrix = raw_data.reshape(height, width)
-        outer_start_index = int(getattr(message, "outer_start_index", 0))
-        inner_start_index = int(getattr(message, "inner_start_index", 0))
-        if outer_start_index:
-            matrix = np.roll(matrix, -outer_start_index, axis=0)
-        if inner_start_index:
-            matrix = np.roll(matrix, -inner_start_index, axis=1)
-        return matrix
 
-    def _build_occupancy_from_grid_map(self, message: object) -> Optional[OccupancyGrid]:
-        traversability = self._extract_grid_layer(message, self.config.map_synthesis.traversability_layer)
-        if traversability is None:
-            return None
-        validity = None
-        if self.config.map_synthesis.validity_layer.strip():
-            validity = self._extract_grid_layer(message, self.config.map_synthesis.validity_layer)
-        occupancy = np.clip(np.rint((1.0 - traversability) * 100.0), 0, 100).astype(np.int32)
-        occupancy = np.where(traversability >= self.config.map_synthesis.free_threshold, 0, occupancy)
-        occupancy = np.where(traversability <= self.config.map_synthesis.lethal_threshold, 100, occupancy)
-        if validity is not None:
-            occupancy = np.where(validity <= 0.0, -1, occupancy)
-        width, height = self._grid_map_dimensions(message)
-        frame_id = str(getattr(getattr(message, "header", None), "frame_id", "") or self.config.map_synthesis.map_frame)
-        return OccupancyGrid(
-            map_id="go2_gridmap_occupancy",
-            frame_id=frame_id,
-            width=width,
-            height=height,
-            resolution_m=float(getattr(getattr(message, "info", None), "resolution", 0.1) or 0.1),
-            origin=self._grid_map_origin_pose(message, frame_id=frame_id),
-            data=[int(value) for value in occupancy.flatten().tolist()],
-        )
 
-    def _build_cost_map_from_grid_map(self, message: object) -> Optional[CostMap]:
-        traversability = self._extract_grid_layer(message, self.config.map_synthesis.traversability_layer)
-        if traversability is None:
-            return None
-        validity = None
-        if self.config.map_synthesis.validity_layer.strip():
-            validity = self._extract_grid_layer(message, self.config.map_synthesis.validity_layer)
-        cost = np.clip((1.0 - traversability) * 100.0, 0.0, 100.0)
-        if validity is not None:
-            cost = np.where(validity <= 0.0, 100.0, cost)
-        width, height = self._grid_map_dimensions(message)
-        frame_id = str(getattr(getattr(message, "header", None), "frame_id", "") or self.config.map_synthesis.map_frame)
-        return CostMap(
-            map_id="go2_gridmap_cost",
-            frame_id=frame_id,
-            width=width,
-            height=height,
-            resolution_m=float(getattr(getattr(message, "info", None), "resolution", 0.1) or 0.1),
-            origin=self._grid_map_origin_pose(message, frame_id=frame_id),
-            data=[float(value) for value in cost.flatten().tolist()],
-        )
 
-    def _build_semantic_map_from_grid_map(self, message: object) -> Optional[SemanticMap]:
-        frame_id = str(getattr(getattr(message, "header", None), "frame_id", "") or self.config.map_synthesis.map_frame)
-        width, height = self._grid_map_dimensions(message)
-        origin = self._grid_map_origin_pose(message, frame_id=frame_id)
-        resolution = float(getattr(getattr(message, "info", None), "resolution", 0.1) or 0.1)
-        semantic_layers = list(self.config.map_synthesis.semantic_layers)
-        if not semantic_layers:
-            semantic_layers = [
-                layer
-                for layer in list(getattr(message, "layers", []))
-                if layer not in _KNOWN_GRID_MAP_LAYERS
-            ]
-        regions: List[SemanticRegion] = []
-        for layer_name in semantic_layers:
-            mask_source = self._extract_grid_layer(message, layer_name)
-            if mask_source is None:
-                continue
-            mask = np.asarray(mask_source >= self.config.map_synthesis.semantic_threshold, dtype=np.uint8)
-            regions.extend(
-                self._regions_from_mask(
-                    mask=mask,
-                    score_source=mask_source,
-                    label=layer_name,
-                    frame_id=frame_id,
-                    width=width,
-                    height=height,
-                    origin=origin,
-                    resolution=resolution,
-                )
-            )
-        if not regions:
-            traversability = self._extract_grid_layer(message, self.config.map_synthesis.traversability_layer)
-            if traversability is not None:
-                regions.extend(
-                    self._regions_from_mask(
-                        mask=np.asarray(traversability >= self.config.map_synthesis.free_threshold, dtype=np.uint8),
-                        score_source=traversability,
-                        label="traversable",
-                        frame_id=frame_id,
-                        width=width,
-                        height=height,
-                        origin=origin,
-                        resolution=resolution,
-                    )
-                )
-                regions.extend(
-                    self._regions_from_mask(
-                        mask=np.asarray(traversability <= self.config.map_synthesis.lethal_threshold, dtype=np.uint8),
-                        score_source=1.0 - traversability,
-                        label="hazard",
-                        frame_id=frame_id,
-                        width=width,
-                        height=height,
-                        origin=origin,
-                        resolution=resolution,
-                    )
-                )
-        if not regions:
-            return None
-        return SemanticMap(
-            map_id="go2_semantic_map",
-            frame_id=frame_id,
-            regions=regions,
-            metadata={"source": "grid_map"},
-        )
 
     def _regions_from_mask(
         self,
@@ -2561,7 +1863,6 @@ class Go2DataPlaneRuntime:
     ) -> None:
         self.config = config
         self.bridge = bridge or RclpyGo2RosBridge(config)
-        self._processes: List[ManagedRos2Process] = []
         self._startup_diagnostics: List[str] = []
         self._navigation_lock = threading.RLock()
         self._exploration_lock = threading.RLock()
@@ -3091,13 +2392,8 @@ class Go2DataPlaneRuntime:
             return
         if self._started:
             return
-        if _uses_sdk2_in_process(self.config) and _is_ros_environment_active():
-            message = _sdk2_ros_conflict_message()
-            self._startup_diagnostics = [message]
-            raise RuntimeError(message)
         self._startup_diagnostics = []
         self._start_official_backend()
-        self._processes = []
         self.bridge.start()
         self._wait_for_initial_readiness()
         self._refresh_official_navigation_idle_state()
@@ -3109,8 +2405,6 @@ class Go2DataPlaneRuntime:
         self.stop_exploration()
         self._stop_official_navigation(update_state=False)
         self.bridge.stop()
-        for process in reversed(self._processes):
-            process.stop()
         self._started = False
 
     def is_started(self) -> bool:
@@ -3344,14 +2638,6 @@ class Go2DataPlaneRuntime:
                 "last_error": self._official_last_error,
                 "service_states": dict(self._official_service_states),
             },
-            "managed_processes": [
-                {
-                    "name": process.name,
-                    "command": process.command,
-                    "running": process.is_running(),
-                }
-                for process in self._processes
-            ],
         }
 
     def _uses_official_backend(self) -> bool:
@@ -3389,15 +2675,10 @@ class Go2DataPlaneRuntime:
 
         if self._uses_official_backend() and not self.config.official.auto_start_services:
             return False
-        if self.config.map_synthesis.local_map_enabled:
-            return True
-        if str(self.config.topics.occupancy_topic or "").strip():
-            return True
-        if str(self.config.topics.grid_map_topic or "").strip():
-            return True
-        if str(self.config.topics.cost_map_topic or "").strip():
-            return True
-        return False
+        return bool(
+            self.config.map_synthesis.local_map_enabled
+            or self.config.map_synthesis.global_map_enabled
+        )
 
     def _wait_for_condition(self, *, condition: Any, timeout_sec: float) -> bool:
         """轮询等待指定条件成立。"""

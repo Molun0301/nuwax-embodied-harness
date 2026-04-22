@@ -9,25 +9,7 @@ from typing import Dict, Tuple
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-_ENV_FILE = _PROJECT_ROOT / ".env"
-_LEGACY_CONFIG_FILE = _PROJECT_ROOT / ".config"
 _GO2_ENV_FILE = Path(__file__).resolve().with_name("data_plane.env")
-_GO2_ROS2_WS_DIR = Path(__file__).resolve().parent / "ros2_ws"
-_DEFAULT_GO2_SETUP_SCRIPT = str(_GO2_ROS2_WS_DIR / "install" / "setup.bash")
-
-
-def _resolve_setup_script_path(configured_value: str, default_path: str) -> str:
-    """优先使用存在的 setup 脚本路径，不存在时回退到仓库内默认路径。"""
-
-    normalized = str(configured_value or "").strip()
-    if normalized:
-        candidate = Path(normalized).expanduser()
-        if candidate.exists():
-            return str(candidate)
-    fallback = Path(default_path).expanduser()
-    if fallback.exists():
-        return str(fallback)
-    return normalized or str(fallback)
 
 
 def _looks_like_cyclonedds_lib_dir(candidate: Path) -> bool:
@@ -139,37 +121,6 @@ def _prefer_platform_str(platform_value: str, legacy_name: str, default: str) ->
     if value:
         return value
     return _cfg_str(legacy_name, default)
-
-
-def _prefer_platform_bool(platform_value: bool, legacy_name: str, default: bool) -> bool:
-    if platform_value != default:
-        return bool(platform_value)
-    return _cfg_bool(legacy_name, default)
-
-
-def _prefer_platform_csv(platform_value: Tuple[str, ...], legacy_name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
-    if tuple(platform_value or ()) != tuple(default):
-        return tuple(platform_value or ())
-    return _cfg_csv(legacy_name, default)
-
-
-@dataclass
-class Go2Ros2TopicsConfig:
-    """Go2 ROS2 数据面话题配置。"""
-
-    odom_topic: str = "/utlidar/robot_odom"
-    secondary_odom_topics: Tuple[str, ...] = (
-        "/uslam/localization/odom",
-        "/lio_sam_ros2/mapping/odometry",
-        "/odom_lio",
-    )
-    imu_topic: str = "/utlidar/imu"
-    point_cloud_topic: str = "/utlidar/cloud"
-    tf_topic: str = "/tf"
-    tf_static_topic: str = "/tf_static"
-    occupancy_topic: str = "/map"
-    grid_map_topic: str = "/elevation_mapping_cupy/elevation_map_raw"
-    cost_map_topic: str = "/global_costmap/costmap"
 
 
 @dataclass
@@ -308,8 +259,6 @@ class Go2DataPlaneConfig:
     """Go2 定位、地图、导航、探索数据面配置。"""
 
     enabled: bool = False
-    setup_script: str = ""
-    require_ros2: bool = False
     cyclonedds_lib_dir: str = ""
     sdk_path: str = ""
     dds_iface: str = ""
@@ -318,7 +267,6 @@ class Go2DataPlaneConfig:
     startup_localization_timeout_sec: float = 6.0
     startup_map_timeout_sec: float = 6.0
     startup_poll_interval_sec: float = 0.1
-    topics: Go2Ros2TopicsConfig = field(default_factory=Go2Ros2TopicsConfig)
     direct_dds: Go2DirectDdsConfig = field(default_factory=Go2DirectDdsConfig)
     official: NavigationControlConfig = field(default_factory=NavigationControlConfig)
     navigation: NavigationBackendConfig = field(default_factory=NavigationBackendConfig)
@@ -340,25 +288,10 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
     项目根目录 `.env` 与 `.config` 不参与 Go2 数据面配置解析。
     """
 
-    data_plane_setup_script = _resolve_setup_script_path(
-        _prefer_platform_str(
-            platform_geometry.setup_script if platform_geometry is not None else "",
-            "GO2_DATA_PLANE_SETUP_SCRIPT",
-            _DEFAULT_GO2_SETUP_SCRIPT,
-        ),
-        _DEFAULT_GO2_SETUP_SCRIPT,
-    )
-    geometry_topics = platform_geometry.topics if platform_geometry is not None else None
     geometry_frames = platform_geometry.frames if platform_geometry is not None else None
 
     return Go2DataPlaneConfig(
         enabled=_cfg_bool("GO2_DATA_PLANE_ENABLED", False),
-        setup_script=data_plane_setup_script,
-        require_ros2=_prefer_platform_bool(
-            platform_geometry.require_ros2 if platform_geometry is not None else False,
-            "GO2_DATA_PLANE_REQUIRE_ROS2",
-            False,
-        ),
         cyclonedds_lib_dir=_resolve_cyclonedds_lib_dir(
             _prefer_platform_str(
                 platform_geometry.cyclonedds_lib_dir if platform_geometry is not None else "",
@@ -388,53 +321,6 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
         startup_poll_interval_sec=max(
             0.02,
             _cfg_float("GO2_DATA_PLANE_STARTUP_POLL_INTERVAL_SEC", 0.1),
-        ),
-        topics=Go2Ros2TopicsConfig(
-            odom_topic=_prefer_platform_str(
-                geometry_topics.odom_topic if geometry_topics is not None else "",
-                "GO2_DATA_PLANE_ODOM_TOPIC",
-                "/utlidar/robot_odom",
-            ),
-            secondary_odom_topics=_prefer_platform_csv(
-                geometry_topics.secondary_odom_topics if geometry_topics is not None else (),
-                "GO2_DATA_PLANE_SECONDARY_ODOM_TOPICS",
-                (
-                    "/uslam/localization/odom",
-                    "/lio_sam_ros2/mapping/odometry",
-                    "/odom_lio",
-                ),
-            ),
-            imu_topic=_prefer_platform_str(
-                geometry_topics.imu_topic if geometry_topics is not None else "",
-                "GO2_DATA_PLANE_IMU_TOPIC",
-                "/utlidar/imu",
-            ),
-            point_cloud_topic=_prefer_platform_str(
-                geometry_topics.point_cloud_topic if geometry_topics is not None else "",
-                "GO2_DATA_PLANE_POINT_CLOUD_TOPIC",
-                "/utlidar/cloud",
-            ),
-            tf_topic=_prefer_platform_str(
-                geometry_topics.tf_topic if geometry_topics is not None else "",
-                "GO2_DATA_PLANE_TF_TOPIC",
-                "/tf",
-            ),
-            tf_static_topic=_prefer_platform_str(
-                geometry_topics.tf_static_topic if geometry_topics is not None else "",
-                "GO2_DATA_PLANE_TF_STATIC_TOPIC",
-                "/tf_static",
-            ),
-            occupancy_topic=_prefer_platform_str(
-                geometry_topics.occupancy_topic if geometry_topics is not None else "",
-                "GO2_DATA_PLANE_OCCUPANCY_TOPIC",
-                "/map",
-            ),
-            grid_map_topic=_cfg_str("GO2_DATA_PLANE_GRID_MAP_TOPIC", "/elevation_mapping_cupy/elevation_map_raw"),
-            cost_map_topic=_prefer_platform_str(
-                geometry_topics.cost_map_topic if geometry_topics is not None else "",
-                "GO2_DATA_PLANE_COST_MAP_TOPIC",
-                "/global_costmap/costmap",
-            ),
         ),
         direct_dds=Go2DirectDdsConfig(
             enabled=_cfg_bool("GO2_DIRECT_DDS_ENABLED", True),

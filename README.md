@@ -28,7 +28,7 @@ python3 scripts/bootstrap.py check \
   --mcp-mode auto
 ```
 
-`check` 会按当前机器人和能力组合检查 Python、pip、ROS2、CycloneDDS、MCP 模板等前置条件；未启用 Go2 data plane 或 geometry 时，不会强行要求 ROS2。
+`check` 会按当前机器人和能力组合检查 Python、pip、MCP 模板等前置条件；启用 geometry 或构建 geometry 工作区时才会额外检查 ROS2 与 CycloneDDS，启用 Go2 data plane 时则会检查 Go2 数据面模板。
 
 ### 3. 选择部署方式
 

@@ -72,8 +72,6 @@ class RobotBootstrapMetadata:
     robot_name: str
     env_template: Optional[Path]
     env_target: Optional[Path]
-    runtime_env_script: Optional[Path]
-    ros2_build_script: Optional[Path]
     supports_data_plane: bool
     recommended_tier: str
 
@@ -83,8 +81,6 @@ ROBOT_BOOTSTRAP_METADATA: Dict[str, RobotBootstrapMetadata] = {
         robot_name="go2",
         env_template=PROJECT_ROOT / "drivers" / "go2" / "data_plane.env.example",
         env_target=PROJECT_ROOT / "drivers" / "go2" / "data_plane.env",
-        runtime_env_script=PROJECT_ROOT / "drivers" / "go2" / "source_runtime_env.sh",
-        ros2_build_script=PROJECT_ROOT / "drivers" / "go2" / "build_ros2_workspace.sh",
         supports_data_plane=True,
         recommended_tier="full",
     ),
@@ -92,8 +88,6 @@ ROBOT_BOOTSTRAP_METADATA: Dict[str, RobotBootstrapMetadata] = {
         robot_name="g1",
         env_template=None,
         env_target=None,
-        runtime_env_script=None,
-        ros2_build_script=None,
         supports_data_plane=False,
         recommended_tier="lite",
     ),
@@ -101,8 +95,6 @@ ROBOT_BOOTSTRAP_METADATA: Dict[str, RobotBootstrapMetadata] = {
         robot_name="customrobot",
         env_template=None,
         env_target=None,
-        runtime_env_script=None,
-        ros2_build_script=None,
         supports_data_plane=False,
         recommended_tier="lite",
     ),
@@ -277,7 +269,6 @@ class BootstrapPlanner:
         self.prepare_yolo = self._resolve_bool("prepare_yolo", default=self.perception_mode != "disabled")
         self.export_yolo_engine = self._resolve_bool("export_yolo_engine", default=False)
         self.build_geometry = self._resolve_bool("build_geometry", default=self.geometry_enabled)
-        self.build_robot_ros2 = self._resolve_bool("build_robot_ros2", default=self.selected_robot == "go2" and (self.data_plane_enabled or self.geometry_enabled))
         self.start_gateway = self._resolve_bool("start_gateway", default=False)
         self.run_healthcheck = self._resolve_bool("healthcheck", default=False)
         self.mcp_mode = self._resolve_choice("mcp_mode", ("auto", "config-only", "skip"), default="auto")
@@ -432,8 +423,6 @@ class BootstrapPlanner:
             return {}
         values = {
             "GO2_DATA_PLANE_ENABLED": _bool_text(self.data_plane_enabled),
-            "GO2_DATA_PLANE_REQUIRE_ROS2": _bool_text(self.data_plane_enabled),
-            "GO2_DATA_PLANE_SETUP_SCRIPT": str(PROJECT_ROOT / "drivers" / "go2" / "ros2_ws" / "install" / "setup.bash"),
             "GO2_NAMED_MAP_ARCHIVE_ROOT": str(PROJECT_ROOT / "runtime_data" / "go2_named_maps"),
             "GO2_DIRECT_DDS_ENABLED": _bool_text(self.data_plane_enabled),
             "GO2_OFFICIAL_BACKEND_ENABLED": _bool_text(self.data_plane_enabled),
@@ -478,7 +467,7 @@ def run_checks(planner: BootstrapPlanner) -> int:
     results.append((pip_ok, _check_result("pip", pip_ok, "pip3 或 pip")))
     results.append((_file_exists(PROJECT_ROOT / "requirements.txt"), _check_result("requirements.txt", _file_exists(PROJECT_ROOT / "requirements.txt"), str(PROJECT_ROOT / "requirements.txt"))))
 
-    if planner.geometry_enabled or planner.build_geometry or planner.build_robot_ros2 or planner.data_plane_enabled:
+    if planner.geometry_enabled or planner.build_geometry:
         ros_setup = _detect_ros_setup()
         results.append((ros_setup is not None, _check_result("ROS2", ros_setup is not None, str(ros_setup) if ros_setup else "未找到 /opt/ros/*/setup.bash")))
         cyclone_ok = bool(os.environ.get("CYCLONEDDS_URI", "").strip()) or bool(planner.root_existing.get("CYCLONEDDS_URI", "").strip())
@@ -546,11 +535,6 @@ def install_python_dependencies(planner: BootstrapPlanner) -> None:
 
 
 def build_workspaces(planner: BootstrapPlanner) -> None:
-    if planner.build_robot_ros2 and planner.robot_meta.ros2_build_script is not None and planner.robot_meta.ros2_build_script.exists():
-        _run(("bash", str(planner.robot_meta.ros2_build_script)), cwd=PROJECT_ROOT)
-    elif planner.build_robot_ros2:
-        print(f"机器人 {planner.selected_robot} 当前没有 ROS2 workspace 构建脚本，跳过。")
-
     geometry_script = PROJECT_ROOT / "services" / "geometry" / "build_ros2_workspace.sh"
     if planner.build_geometry and geometry_script.exists():
         _run(("bash", str(geometry_script)), cwd=PROJECT_ROOT)
@@ -840,7 +824,6 @@ def run_wizard(args: argparse.Namespace) -> int:
     args.relay = prompt_bool("启用 relay", False)
     args.systemd = prompt_bool("生成 systemd 示例", True)
     args.install_python = prompt_bool("安装 Python 依赖", True)
-    args.build_robot_ros2 = prompt_bool("构建机器人 ROS2 工作空间", args.robot == "go2" and (args.data_plane or args.geometry))
     args.build_geometry = prompt_bool("构建 geometry ROS2 工作空间", bool(args.geometry))
     args.prepare_yolo = prompt_bool("准备 YOLO 权重", args.perception_mode != "disabled")
     args.prepare_memory = prompt_bool("准备本地 memory 模型", args.memory_mode == "local")
@@ -922,7 +905,6 @@ def build_parser() -> argparse.ArgumentParser:
         add_boolean_flag(subparser, "prepare_yolo", "准备 YOLO 权重")
         add_boolean_flag(subparser, "export_yolo_engine", "导出 TensorRT 引擎")
         add_boolean_flag(subparser, "build_geometry", "构建 geometry ROS2 工作空间")
-        add_boolean_flag(subparser, "build_robot_ros2", "构建机器人 ROS2 工作空间")
         add_boolean_flag(subparser, "start_gateway", "启动 gateway")
         add_boolean_flag(subparser, "healthcheck", "执行健康检查")
 

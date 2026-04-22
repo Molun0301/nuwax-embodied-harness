@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 import struct
 import subprocess
-import sys
 import time
 from types import SimpleNamespace
 
@@ -19,16 +17,15 @@ from drivers.go2.data_plane import Go2DataPlaneRuntime, RclpyGo2RosBridge
 from drivers.go2 import settings as go2_settings
 from drivers.go2.settings import (
     Go2DataPlaneConfig,
-    Go2DirectDdsConfig,
     Go2ExplorationConfig,
     Go2MapSynthesisConfig,
     Go2OfficialBackendConfig,
 )
-from services.geometry import GeometryFrameConfig, GeometryTopicsConfig, PlatformGeometryConfig, build_default_geometry_setup_script
+from services.geometry import GeometryFrameConfig, PlatformGeometryConfig, build_default_geometry_setup_script
 
 
 class _FakeBridge:
-    """测试用 Go2 ROS2 桥。"""
+    """测试用 Go2 数据面桥。"""
 
     def __init__(self, *, localization_available: bool, map_available: bool, navigation_available: bool) -> None:
         self.localization_available = localization_available
@@ -282,18 +279,6 @@ class _FakeRobotStateClient:
         return 0
 
 
-def _build_pose_odom_message(*, x: float, y: float, z: float = 0.0, frame_id: str = "odom") -> SimpleNamespace:
-    return SimpleNamespace(
-        header=SimpleNamespace(frame_id=frame_id),
-        pose=SimpleNamespace(
-            pose=SimpleNamespace(
-                position=SimpleNamespace(x=x, y=y, z=z),
-                orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
-            )
-        ),
-    )
-
-
 def _build_sport_mode_state_message(*, x: float, y: float, z: float = 0.0) -> SimpleNamespace:
     half_yaw = 0.0
     return SimpleNamespace(
@@ -334,10 +319,6 @@ def _grid_cell_index(*, width: int, resolution: float, origin_x: float, origin_y
     return row * width + col
 
 
-def test_go2_ros2_workspace_defaults_point_to_repo() -> None:
-    assert go2_settings._DEFAULT_GO2_SETUP_SCRIPT.endswith("drivers/go2/ros2_ws/install/setup.bash")
-
-
 def test_platform_geometry_workspace_defaults_point_to_repo() -> None:
     assert build_default_geometry_setup_script().endswith("services/geometry/ros2_ws/install/setup.bash")
 
@@ -346,89 +327,48 @@ def test_go2_map_synthesis_default_self_filter_radius_matches_platform_calibrati
     assert Go2MapSynthesisConfig().point_cloud_self_filter_radius_m == 0.65
 
 
-def test_go2_ros2_workspace_assets_exist() -> None:
+def test_go2_robot_side_ros2_assets_must_be_fully_removed_while_geometry_workspace_assets_remain() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    go2_workspace_root = repo_root / "drivers" / "go2" / "ros2_ws"
+    go2_root = repo_root / "drivers" / "go2"
     geometry_workspace_root = repo_root / "services" / "geometry" / "ros2_ws"
-    assert (go2_workspace_root / "src" / "vendor" / "unilidar_sdk" / "unitree_lidar_ros2" / "package.xml").exists()
-    assert not (go2_workspace_root / "src" / "vendor" / "elevation_mapping_cupy").exists()
-    assert not (go2_workspace_root / "src" / "vendor" / "grid_map").exists()
+
+    assert not (go2_root / "ros2_ws").exists(), "发现 drivers/go2/ros2_ws 残留，说明 Go2 DDS-only 收口未完成"
+    assert not (go2_root / "build_ros2_workspace.sh").exists()
+    assert not (go2_root / "source_runtime_env.sh").exists()
+    assert not (go2_root / "launch_ros2_stack.sh").exists()
+    assert (go2_root / "data_plane.env.example").exists()
     assert (geometry_workspace_root / "src" / "vendor" / "elevation_mapping_cupy" / "elevation_mapping_cupy" / "package.xml").exists()
     assert (geometry_workspace_root / "src" / "vendor" / "grid_map" / "grid_map" / "package.xml").exists()
-    assert (repo_root / "drivers" / "go2" / "build_ros2_workspace.sh").exists()
-    assert (repo_root / "drivers" / "go2" / "source_runtime_env.sh").exists()
     assert (repo_root / "services" / "geometry" / "build_ros2_workspace.sh").exists()
     assert (repo_root / "services" / "geometry" / "source_runtime_env.sh").exists()
     assert (repo_root / "services" / "geometry" / "launch_ros2_stack.sh").exists()
 
 
-def test_go2_legacy_runtime_modules_only_remain_under_compat() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    compat_root = repo_root / "drivers" / "go2" / "compat"
-    for module_name in ("collision_detector", "cost_mapper", "local_planner", "voxel_mapper"):
-        assert not (repo_root / "drivers" / "go2" / f"{module_name}.py").exists()
-        assert (compat_root / f"{module_name}.py").exists()
+def test_go2_data_plane_config_defaults_to_direct_dds_topics(monkeypatch) -> None:
+    monkeypatch.setattr(go2_settings, "_load_file_values", lambda: {})
+    for key in (
+        "GO2_DIRECT_DDS_ENABLED",
+        "GO2_DIRECT_DDS_POSE_TOPIC",
+        "GO2_DIRECT_DDS_POINT_CLOUD_TOPIC",
+        "GO2_OFFICIAL_BACKEND_ENABLED",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    config = go2_settings.load_go2_data_plane_config()
+
+    assert config.direct_dds.enabled is True
+    assert config.direct_dds.pose_topic == "rt/sportmodestate"
+    assert config.direct_dds.point_cloud_topic == "rt/utlidar/cloud"
+    assert config.official.enabled is True
 
 
-def test_go2_setup_script_path_falls_back_to_repo_default_when_legacy_path_missing(tmp_path: Path) -> None:
-    fallback_setup = tmp_path / "ros2_ws" / "install" / "setup.bash"
-    fallback_setup.parent.mkdir(parents=True)
-    fallback_setup.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-    legacy_missing = "/home/unitree/nuwax_robot_bridge/drivers/go2/ros2_ws/install/setup.bash"
-
-    resolved = go2_settings._resolve_setup_script_path(legacy_missing, str(fallback_setup))
-
-    assert resolved == str(fallback_setup)
-
-
-def test_go2_bridge_can_apply_ros_setup_environment(monkeypatch, tmp_path: Path) -> None:
-    setup_script = tmp_path / "setup.bash"
-    setup_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-
-    bridge = RclpyGo2RosBridge(
-        Go2DataPlaneConfig(
-            enabled=True,
-            setup_script=str(setup_script),
-        )
-    )
-
-    python_path_a = str(tmp_path / "ros_py_a")
-    python_path_b = str(tmp_path / "ros_py_b")
-    completed = subprocess.CompletedProcess(
-        args=["bash", "-lc", "source setup && env -0"],
-        returncode=0,
-        stdout=(
-            f"PYTHONPATH={python_path_a}:{python_path_b}\x00"
-            "ROS_DISTRO=humble\x00"
-        ).encode("utf-8"),
-    )
-
-    monkeypatch.setattr("importlib.util.find_spec", lambda name: None if name == "rclpy" else object())
-    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: completed)
-    monkeypatch.delenv("ROS_DISTRO", raising=False)
-
-    original_sys_path = list(sys.path)
-    try:
-        bridge._ensure_ros_python_environment()
-        assert os.environ["ROS_DISTRO"] == "humble"
-        assert sys.path[0] == python_path_a
-        assert sys.path[1] == python_path_b
-    finally:
-        sys.path[:] = original_sys_path
-
-
-def test_go2_bridge_prefers_direct_dds_pose_when_available() -> None:
+def test_go2_bridge_exposes_direct_dds_pose_as_current_pose() -> None:
     bridge = RclpyGo2RosBridge(Go2DataPlaneConfig(enabled=True))
 
-    bridge._on_odom(_build_pose_odom_message(x=1.0, y=0.0), source_topic="/utlidar/robot_odom")
-    ros_pose = bridge.get_current_pose()
-    ros_status = bridge.get_status()
+    initial_status = bridge.get_status()
 
-    assert ros_pose is not None
-    assert ros_pose.position.x == 1.0
-    assert ros_status["pose_source"] == "/utlidar/robot_odom"
-    assert ros_status["ros_pose_ready"] is True
-    assert ros_status["dds_pose_ready"] is False
+    assert bridge.get_current_pose() is None
+    assert initial_status["dds_pose_ready"] is False
 
     bridge._on_sport_mode_state(
         _build_sport_mode_state_message(x=2.0, y=3.0),
@@ -872,40 +812,6 @@ def test_go2_data_plane_runtime_can_bind_new_named_map_without_archive(tmp_path:
     assert runtime.get_current_pose() is not None
 
 
-def test_go2_bridge_can_use_ros_point_cloud_as_local_map_fallback() -> None:
-    bridge = RclpyGo2RosBridge(
-        Go2DataPlaneConfig(
-            enabled=True,
-            direct_dds=Go2DirectDdsConfig(enabled=False),
-            official=Go2OfficialBackendConfig(enabled=False),
-            map_synthesis=Go2MapSynthesisConfig(
-                global_map_enabled=False,
-                local_map_enabled=True,
-                local_map_resolution_m=0.5,
-                local_map_width=20,
-                local_map_height=20,
-                local_map_update_interval_sec=0.0,
-                semantic_min_cells=1,
-            ),
-        )
-    )
-    bridge._on_odom(_build_pose_odom_message(x=0.0, y=0.0), source_topic="/utlidar/robot_odom")
-    bridge._on_point_cloud(
-        _build_point_cloud_message([(0.5, 0.0, 0.10), (1.0, 0.0, 0.10)]),
-        source_topic="/utlidar/cloud",
-    )
-
-    occupancy = bridge.get_occupancy_grid()
-    status = bridge.get_status()
-
-    assert occupancy is not None
-    assert status["ros_point_cloud_ready"] is True
-    assert status["dds_cloud_ready"] is False
-    assert status["local_map_ready"] is True
-    assert status["local_map_source"] == "ros_point_cloud"
-    assert status["point_cloud_source_topic"] == "/utlidar/cloud"
-
-
 def test_go2_bridge_prefers_coherent_platform_cloud_map_layers_for_exploration() -> None:
     config = Go2DataPlaneConfig(
         enabled=True,
@@ -1034,26 +940,19 @@ def test_go2_cyclonedds_lib_dir_uses_configured_path(monkeypatch, tmp_path: Path
     config = go2_settings.load_go2_data_plane_config()
 
     assert config.cyclonedds_lib_dir == str(lib_dir)
-    assert config.topics.odom_topic == "/utlidar/robot_odom"
-    assert config.topics.imu_topic == "/utlidar/imu"
-    assert config.topics.point_cloud_topic == "/utlidar/cloud"
+    assert config.direct_dds.pose_topic == "rt/sportmodestate"
+    assert config.direct_dds.point_cloud_topic == "rt/utlidar/cloud"
 
 
-def test_go2_data_plane_prefers_platform_geometry_config_over_go2_geometry_env(monkeypatch) -> None:
-    monkeypatch.setenv("GO2_DATA_PLANE_ODOM_TOPIC", "/legacy/odom")
+def test_go2_data_plane_prefers_platform_geometry_frames_over_go2_geometry_env(monkeypatch) -> None:
+    monkeypatch.setenv("GO2_DATA_PLANE_DDS_IFACE", "legacy0")
     monkeypatch.setenv("GO2_DATA_PLANE_MAP_FRAME", "legacy_map")
+    monkeypatch.setenv("GO2_DATA_PLANE_BASE_FRAME", "legacy_base")
+    monkeypatch.setenv("GO2_DATA_PLANE_LIDAR_FRAME", "legacy_lidar")
 
     platform_geometry = PlatformGeometryConfig(
         enabled=True,
-        topics=GeometryTopicsConfig(
-            odom_topic="/platform/odom",
-            imu_topic="/platform/imu",
-            point_cloud_topic="/platform/cloud",
-            tf_topic="/platform/tf",
-            tf_static_topic="/platform/tf_static",
-            occupancy_topic="/platform/map",
-            cost_map_topic="/platform/costmap",
-        ),
+        dds_iface="platform0",
         frames=GeometryFrameConfig(
             map_frame="platform_map",
             base_frame="platform_base",
@@ -1063,33 +962,13 @@ def test_go2_data_plane_prefers_platform_geometry_config_over_go2_geometry_env(m
 
     config = go2_settings.load_go2_data_plane_config(platform_geometry=platform_geometry)
 
-    assert config.topics.odom_topic == "/platform/odom"
-    assert config.topics.imu_topic == "/platform/imu"
-    assert config.topics.point_cloud_topic == "/platform/cloud"
-    assert config.topics.occupancy_topic == "/platform/map"
-    assert config.topics.cost_map_topic == "/platform/costmap"
+    assert config.dds_iface == "platform0"
     assert config.map_synthesis.map_frame == "platform_map"
     assert config.map_synthesis.base_frame == "platform_base"
     assert config.map_synthesis.lidar_frame == "platform_lidar"
 
 
-def test_go2_file_value_loader_only_reads_data_plane_env(tmp_path: Path, monkeypatch) -> None:
-    root_env = tmp_path / ".env"
-    root_env.write_text(
-        "\n".join(
-            (
-                "GO2_DATA_PLANE_STARTUP_MAP_TIMEOUT_SEC=77.0",
-                "GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED=false",
-            )
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    legacy_config = tmp_path / ".config"
-    legacy_config.write_text(
-        "GO2_DATA_PLANE_STARTUP_LOCALIZATION_TIMEOUT_SEC=88.0\n",
-        encoding="utf-8",
-    )
+def test_go2_file_value_loader_only_reads_go2_data_plane_env(tmp_path: Path, monkeypatch) -> None:
     go2_env = tmp_path / "drivers" / "go2" / "data_plane.env"
     go2_env.parent.mkdir(parents=True, exist_ok=True)
     go2_env.write_text(
@@ -1103,8 +982,6 @@ def test_go2_file_value_loader_only_reads_data_plane_env(tmp_path: Path, monkeyp
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(go2_settings, "_ENV_FILE", root_env)
-    monkeypatch.setattr(go2_settings, "_LEGACY_CONFIG_FILE", legacy_config)
     monkeypatch.setattr(go2_settings, "_GO2_ENV_FILE", go2_env)
 
     values = go2_settings._load_file_values()
@@ -1115,10 +992,10 @@ def test_go2_file_value_loader_only_reads_data_plane_env(tmp_path: Path, monkeyp
     assert "GO2_DATA_PLANE_STARTUP_LOCALIZATION_TIMEOUT_SEC" not in values
 
 
-def test_go2_shell_scripts_pass_bash_syntax_check() -> None:
+def test_geometry_runtime_shell_scripts_pass_bash_syntax_check() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     scripts = (
-        repo_root / "drivers" / "go2" / "source_runtime_env.sh",
+        repo_root / "services" / "geometry" / "source_runtime_env.sh",
     )
     for script in scripts:
         subprocess.run(["bash", "-n", str(script)], check=True)

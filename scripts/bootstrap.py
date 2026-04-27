@@ -165,6 +165,33 @@ def _print_completed_output(completed: subprocess.CompletedProcess[str]) -> None
         print(completed.stderr, end="", file=sys.stderr)
 
 
+def _run_streaming_capture(
+    command: Sequence[str],
+    *,
+    cwd: Optional[Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+    display_command: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
+    printable = display_command or shlex.join(list(command))
+    print(f"$ {printable}")
+    process = subprocess.Popen(
+        list(command),
+        cwd=str(cwd) if cwd is not None else None,
+        env=dict(env) if env is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    output_parts: List[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        output_parts.append(line)
+        print(line, end="")
+    returncode = process.wait()
+    return subprocess.CompletedProcess(list(command), returncode, stdout="".join(output_parts), stderr="")
+
+
 def _run_shell(command: str, *, cwd: Optional[Path] = None, check: bool = True) -> None:
     print(f"$ {command}")
     completed = subprocess.run(command, cwd=str(cwd) if cwd is not None else None, shell=True, text=True)
@@ -391,11 +418,10 @@ def run_geometry_apt_update(sudo: Sequence[str], env: Mapping[str, str]) -> None
 
 def install_geometry_apt_packages(planner: "BootstrapPlanner", sudo: Sequence[str], env: Mapping[str, str], packages: Sequence[str]) -> None:
     command = (*sudo, "apt-get", "install", "-y", *packages)
-    result = _run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True)
+    result = _run_streaming_capture(command, cwd=PROJECT_ROOT, env=env)
     if result.returncode == 0:
         return
 
-    _print_completed_output(result)
     combined_output = "\n".join((result.stdout or "", result.stderr or ""))
     if not planner.repair_ros2_apt_source or not apt_output_has_ros2_archive_404(combined_output):
         raise BootstrapError(f"命令执行失败: {shlex.join(list(command))}")
@@ -407,10 +433,9 @@ def install_geometry_apt_packages(planner: "BootstrapPlanner", sudo: Sequence[st
             continue
         _run((*sudo, "apt-get", "clean"), cwd=PROJECT_ROOT, env=env, check=False)
         run_geometry_apt_update(sudo, env)
-        retry = _run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True)
+        retry = _run_streaming_capture(command, cwd=PROJECT_ROOT, env=env)
         if retry.returncode == 0:
             return
-        _print_completed_output(retry)
 
     raise BootstrapError(
         "ROS2 apt 源持续返回 404。请手工修复 /etc/apt/sources.list.d 中的 ros2/ubuntu 源，"

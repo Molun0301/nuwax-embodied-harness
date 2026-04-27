@@ -9,6 +9,7 @@ from scripts.bootstrap import (
     BootstrapError,
     BootstrapPlanner,
     _build_redacted_nuwaclaw_docker_command,
+    _run_streaming_capture,
     apt_output_has_ros2_archive_404,
     build_geometry_apt_packages,
     build_geometry_optional_apt_packages,
@@ -244,6 +245,24 @@ def test_geometry_apt_update_does_not_fail_on_unrelated_repository_error(monkeyp
     run_geometry_apt_update(("sudo",), {"DEBIAN_FRONTEND": "noninteractive"})
 
     assert calls == [(("sudo", "apt-get", "update"), False)]
+
+
+def test_run_streaming_capture_returns_output_and_streams_to_stdout(capsys) -> None:
+    result = _run_streaming_capture(
+        (
+            "python3",
+            "-c",
+            "print('apt line 1'); print('apt line 2')",
+        )
+    )
+
+    captured = capsys.readouterr()
+
+    assert result.returncode == 0
+    assert "apt line 1" in result.stdout
+    assert "apt line 2" in result.stdout
+    assert "apt line 1" in captured.out
+    assert "apt line 2" in captured.out
 
 
 def test_build_workspaces_only_runs_geometry_workspace_script(monkeypatch) -> None:

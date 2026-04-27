@@ -5,7 +5,7 @@ import logging
 import math
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from contracts.artifacts import ArtifactRetentionPolicy
 from contracts.capabilities import (
@@ -4850,216 +4850,221 @@ class GatewayRuntime:
         reason = fallback.reason if fallback is not None else None
         supported = fallback.supported if fallback is not None else True
 
-        dynamic_support: Dict[str, Tuple[bool, Optional[str]]] = {
+        DynamicCheck = Tuple[Callable[[], bool], Optional[str]]
+        dynamic_support: Dict[str, DynamicCheck] = {
             "capture_image": (
-                self._has_provider(ImageProvider),
+                lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "get_latest_observation": (
-                self._has_provider(ImageProvider),
+                lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "perceive_current_scene": (
-                self._has_provider(ImageProvider),
+                lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "describe_current_scene": (
-                self._has_provider(ImageProvider),
+                lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "get_latest_perception": (
-                self._has_provider(ImageProvider),
+                lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "get_perception_runtime_status": (
-                self._has_provider(ImageProvider),
+                lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "start_perception_runtime": (
-                self._has_provider(ImageProvider) and self.perception_video_runtime.is_enabled(),
+                lambda: self._has_provider(ImageProvider) and self.perception_video_runtime.is_enabled(),
                 "当前机器人入口未提供图像采集提供器，或持续感知功能未启用。",
             ),
             "stop_perception_runtime": (
-                self._has_provider(ImageProvider) and self.perception_video_runtime.is_enabled(),
+                lambda: self._has_provider(ImageProvider) and self.perception_video_runtime.is_enabled(),
                 "当前机器人入口未提供图像采集提供器，或持续感知功能未启用。",
             ),
             "get_localization_snapshot": (
-                self.localization_service.is_available(),
+                lambda: self.localization_service.is_available(),
                 "当前机器人入口未提供定位提供器，且还没有外部定位快照。",
             ),
             "get_localization_session": (
-                True,
+                lambda: True,
                 None,
             ),
             "relocalize_active_map": (
-                self.localization_service.is_available(),
+                lambda: self.localization_service.is_available(),
                 "当前机器人入口未提供定位提供器。",
             ),
             "get_map_snapshot": (
-                self.mapping_service.is_available(),
+                lambda: self.mapping_service.is_available(),
                 "当前机器人入口未提供地图提供器，且还没有外部地图快照。",
             ),
             "get_navigation_snapshot": (
-                self.navigation_service.is_navigation_available() or self.navigation_service.is_exploration_available(),
+                lambda: self.navigation_service.is_navigation_available() or self.navigation_service.is_exploration_available(),
                 "当前机器人入口未提供导航或探索后端。",
             ),
             "get_navigation_semantic_context": (
-                self.mapping_service.is_available(),
+                lambda: self.mapping_service.is_available(),
                 "当前机器人入口未提供地图提供器，且还没有平台地图快照。",
             ),
             "list_maps": (
-                True,
+                lambda: True,
                 None,
             ),
             "create_map": (
-                True,
+                lambda: True,
                 None,
             ),
             "activate_map": (
-                True,
+                lambda: True,
                 None,
             ),
             "delete_map": (
-                True,
+                lambda: True,
                 None,
             ),
             "get_active_map": (
-                True,
+                lambda: True,
                 None,
             ),
             "list_map_versions": (
-                True,
+                lambda: True,
                 None,
             ),
             "save_active_map_version": (
-                True,
+                lambda: True,
                 None,
             ),
             "load_map_version": (
-                True,
+                lambda: True,
                 None,
             ),
             "list_memory_libraries": (
-                True,
+                lambda: True,
                 None,
             ),
             "create_memory_library": (
-                True,
+                lambda: True,
                 None,
             ),
             "enable_memory_library": (
-                True,
+                lambda: True,
                 None,
             ),
             "disable_memory_library": (
-                True,
+                lambda: True,
                 None,
             ),
             "delete_memory_library": (
-                True,
+                lambda: True,
                 None,
             ),
             "tag_location": (
-                self.localization_service.is_available(),
+                lambda: self.localization_service.is_available(),
                 "当前机器人入口未提供定位结果，无法标记地点。",
             ),
             "query_location": (
-                True,
+                lambda: True,
                 None,
             ),
             "query_semantic_memory": (
-                True,
+                lambda: True,
                 None,
             ),
             "remember_current_scene": (
-                self._has_provider(ImageProvider),
+                lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "navigate_to_pose": (
-                self.navigation_service.is_navigation_available(),
+                lambda: self.navigation_service.is_navigation_available(),
                 "当前机器人入口未提供导航后端。",
             ),
             "navigate_to_named_location": (
-                self.navigation_service.is_navigation_available()
+                lambda: self.navigation_service.is_navigation_available()
                 and (self.mapping_service.is_available() or bool(self.memory_service.list_tagged_locations(limit=1))),
                 "当前机器人入口未提供导航后端，且也没有可用地点记忆或语义地图。",
             ),
             "find_target": (
-                self.navigation_service.is_navigation_available() and self._has_provider(ImageProvider),
+                lambda: self.navigation_service.is_navigation_available() and self._has_provider(ImageProvider),
                 "当前机器人入口未同时提供导航后端和图像采集提供器。",
             ),
             "explore_area": (
-                self.navigation_service.is_exploration_available(),
+                lambda: self.navigation_service.is_exploration_available(),
                 "当前机器人入口未提供探索后端。",
             ),
             "explore_and_find_target": (
-                self.navigation_service.is_exploration_available() and self._has_provider(ImageProvider),
+                lambda: self.navigation_service.is_exploration_available() and self._has_provider(ImageProvider),
                 "当前机器人入口未同时提供探索后端和图像采集提供器。",
             ),
             "inspect_target": (
-                self._has_provider(ImageProvider),
+                lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "follow_target": (
-                self._has_provider(ImageProvider) and self._has_provider(MotionControl),
+                lambda: self._has_provider(ImageProvider) and self._has_provider(MotionControl),
                 "当前机器人入口未同时提供图像采集与运动控制提供器。",
             ),
             "relative_move": (
-                self._has_provider(MotionControl),
+                lambda: self._has_provider(MotionControl),
                 "当前机器人入口未提供运动控制提供器。",
             ),
             "execute_sport_command": (
-                hasattr(self.robot, "execute_action"),
+                lambda: hasattr(self.robot, "execute_action"),
                 "当前机器人入口未实现 execute_action。",
             ),
             "set_body_pose": (
-                hasattr(self.robot, "execute_action"),
+                lambda: hasattr(self.robot, "execute_action"),
                 "当前机器人入口未实现 execute_action。",
             ),
             "set_speed_level": (
-                hasattr(self.robot, "execute_action"),
+                lambda: hasattr(self.robot, "execute_action"),
                 "当前机器人入口未实现 execute_action。",
             ),
             "get_joint_state": (
-                self._has_provider(StateProvider),
+                lambda: self._has_provider(StateProvider),
                 "当前机器人入口未提供状态提供器。",
             ),
             "get_imu_state": (
-                self._has_provider(StateProvider),
+                lambda: self._has_provider(StateProvider),
                 "当前机器人入口未提供状态提供器。",
             ),
             "get_volume": (
-                self.audio_service.is_volume_available(),
+                lambda: self.audio_service.is_volume_available(),
                 "当前机器人入口未提供机器人音量控制，仅保留软件音量。",
             ),
             "set_volume": (
-                self.audio_service.is_speech_available(),
+                lambda: self.audio_service.is_speech_available(),
                 "当前播报与音量服务不可用。",
             ),
             "speak_text": (
-                self.audio_service.is_speech_available(),
+                lambda: self.audio_service.is_speech_available(),
                 "当前播报服务不可用。",
             ),
             "stop_all_motion": (
-                self._has_provider(SafetyProvider) or self._has_provider(MotionControl),
+                lambda: self._has_provider(SafetyProvider) or self._has_provider(MotionControl),
                 "当前机器人入口未提供安全停止或运动控制提供器。",
             ),
             "switch_control_mode": (
-                hasattr(self.robot, "switch_mode"),
+                lambda: hasattr(self.robot, "switch_mode"),
                 "当前机器人入口未实现 switch_mode。",
             ),
             "set_obstacle_avoidance": (
-                self._is_obstacle_avoidance_control_available(),
+                lambda: self._is_obstacle_avoidance_control_available(),
                 "当前 Go2 官方 obstacles_avoid 服务未就绪，暂不能切换实时避障。",
             ),
             "get_robot_status": (
-                self._has_provider(StateProvider),
+                lambda: self._has_provider(StateProvider),
                 "当前机器人入口未提供状态提供器。",
             ),
         }
 
         if capability_name in dynamic_support:
-            supported, reason = dynamic_support[capability_name]
+            checker, reason = dynamic_support[capability_name]
+            try:
+                supported = bool(checker())
+            except Exception:
+                supported = False
         metadata["runtime_gateway"] = "enabled"
         metadata["dynamic_availability"] = capability_name in dynamic_support
         return CapabilityAvailability(

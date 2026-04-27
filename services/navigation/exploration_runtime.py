@@ -49,6 +49,7 @@ class ExplorationRuntimeState:
     visited_frontiers: List[Pose] = field(default_factory=list)
     rejected_frontiers: List[Pose] = field(default_factory=list)
     frontier_history: List[FrontierCandidate] = field(default_factory=list)
+    latest_frontiers: List[FrontierCandidate] = field(default_factory=list)
     last_frontier_count: Optional[int] = None
     completed_frontiers: int = 0
     no_gain_rounds: int = 0
@@ -202,6 +203,12 @@ class PlatformExplorationRuntime:
                 "frontiers_visited": len(state.visited_frontiers),
                 "frontiers_rejected": len(state.rejected_frontiers),
                 "completed_frontiers": state.completed_frontiers,
+                "latest_frontiers": [self._frontier_candidate_to_metadata(item) for item in state.latest_frontiers],
+                "current_frontier": (
+                    self._frontier_candidate_to_metadata(state.current_target.frontier)
+                    if state.current_target is not None
+                    else None
+                ),
                 "known_cells": state.known_cells,
                 "no_gain_rounds": state.no_gain_rounds,
                 "waiting_for": state.waiting_for,
@@ -291,6 +298,7 @@ class PlatformExplorationRuntime:
             radius_m=state.request.radius_m,
             attempted_poses=attempted_poses,
         )
+        state.latest_frontiers = list(frontiers)
         state.last_frontier_count = len(frontiers)
         state.last_error = None
         state.known_cells = self._count_known_cells(occupancy_grid)
@@ -412,6 +420,29 @@ class PlatformExplorationRuntime:
             except Exception:
                 pass
         return sum(1 for cell in list(getattr(occupancy_grid, "data", []) or []) if int(cell) >= 0)
+
+    @staticmethod
+    def _frontier_candidate_to_metadata(frontier: FrontierCandidate) -> Dict[str, Any]:
+        return {
+            "id": (
+                "frontier_"
+                f"{frontier.pose.position.x:.3f}_{frontier.pose.position.y:.3f}"
+            ),
+            "pose": frontier.pose.model_dump(mode="json"),
+            "geometry": {
+                "type": "point",
+                "coordinates": [
+                    frontier.pose.position.x,
+                    frontier.pose.position.y,
+                    frontier.pose.position.z,
+                ],
+            },
+            "score": frontier.score,
+            "cluster_size": frontier.cluster_size,
+            "info_gain_cells": frontier.info_gain_cells,
+            "path_distance_m": frontier.path_distance_m,
+            "average_cost": frontier.average_cost,
+        }
 
     def _build_explore_request(self, state: Optional[ExplorationRuntimeState]) -> Optional[ExploreAreaRequest]:
         if state is None:

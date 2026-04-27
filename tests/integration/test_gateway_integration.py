@@ -15,6 +15,7 @@ from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.memory import MemoryArrivalVerification, MemoryNavigationCandidate, MemoryRecordKind
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
+from contracts.pointcloud import PointCloudFrame, PointField, PointFieldDataType
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
 from drivers.common.manifest import RobotDefaults, RobotManifest
@@ -22,7 +23,7 @@ from drivers.go2.assembly import Go2RobotAssembly
 from gateways.app import create_gateway_app
 from gateways.relay.server import create_relay_app
 from gateways.runtime import create_default_gateway_runtime
-from providers import ExplorationProvider, ImageProvider, LocalizationProvider, MapProvider, NavigationProvider
+from providers import ExplorationProvider, ImageProvider, LocalizationProvider, MapProvider, NavigationProvider, PointCloudProvider
 from providers.motion import MotionControl
 from providers.safety import SafetyProvider
 from providers.state import StateProvider
@@ -84,6 +85,7 @@ class FakeProviderBundle(
     MapProvider,
     NavigationProvider,
     ExplorationProvider,
+    PointCloudProvider,
 ):
     """用于集成测试的假提供器集合。"""
 
@@ -157,6 +159,23 @@ class FakeProviderBundle(
             fy=320.0,
             cx=320.0,
             cy=240.0,
+        )
+
+    def get_latest_point_cloud(self) -> PointCloudFrame:
+        return PointCloudFrame(
+            frame_id="world/fake_go2/lidar",
+            point_count=3,
+            fields=[
+                PointField(name="x", offset=0, datatype=PointFieldDataType.FLOAT32, count=1),
+                PointField(name="y", offset=4, datatype=PointFieldDataType.FLOAT32, count=1),
+                PointField(name="z", offset=8, datatype=PointFieldDataType.FLOAT32, count=1),
+            ],
+            points=[
+                Vector3(x=0.0, y=0.0, z=0.0),
+                Vector3(x=1.0, y=0.2, z=0.1),
+                Vector3(x=0.4, y=1.0, z=0.3),
+            ],
+            metadata={"source_topic": "fake_pointcloud", "sequence": 7},
         )
 
     def send_twist(self, twist: Twist) -> None:
@@ -488,6 +507,8 @@ def _build_test_config(tmp_path: Path):
     config.gateway.allowed_source_cidrs = ("127.0.0.1/32",)
     config.gateway.public_base_url = "http://testserver"
     config.gateway.artifact_dir = str(tmp_path / "artifacts")
+    config.logging.log_dir = str(tmp_path / "logs")
+    config.logging.log_file = str(tmp_path / "logs" / "nuwax_robot_bridge.log")
     config.gateway.sse_keepalive_sec = 0.05
     config.gateway.ws_ping_interval_sec = 0.05
     config.runtime_data.memory_db_path = str(tmp_path / "runtime_data" / "memory" / "vector_memory.db")
@@ -815,6 +836,57 @@ def _delete_memory_library(
     )
     assert response.status_code == 200
     return response.json()
+
+
+
+def test_gateway_debug_panel_realtime_readonly_routes(tmp_path: Path) -> None:
+    """sp12 debug 面板应只读展示真实日志、点云 points 和视频帧。"""
+
+    app, runtime, robot, config = _build_host_app(tmp_path)
+    Path(config.logging.log_dir).mkdir(parents=True, exist_ok=True)
+    Path(config.logging.log_file).write_text(
+        "2026-04-27 12:00:00 [INFO] [nuwax.test] 第一行日志\n"
+        "2026-04-27 12:00:01 [ERROR] [nuwax.test] 第二行错误\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        robot.start()
+        page = client.get("/debug", headers=_agent_headers())
+        assert page.status_code == 200
+        assert "实时视频" in page.text
+        assert "真实日志 tail" in page.text
+        assert "<button" not in page.text
+        assert "<form" not in page.text
+        assert "method: \"POST\"" not in page.text
+        assert "method: \"PATCH\"" not in page.text
+        assert "method: \"DELETE\"" not in page.text
+
+        overview = client.get("/api/debug/overview", headers=_agent_headers()).json()
+        assert overview["data"]["video"]["status"] in {"available", "stale"}
+        assert overview["data"]["logs"]["metadata"]["path"] == config.logging.log_file
+
+        pointcloud = client.get("/api/debug/pointcloud/latest", headers=_agent_headers()).json()
+        assert pointcloud["status"] in {"available", "stale"}
+        assert pointcloud["data"]["point_count"] == 3
+        assert len(pointcloud["data"]["points"]) == 3
+
+        video = client.get("/api/debug/video/latest", headers=_agent_headers()).json()
+        assert video["status"] in {"available", "stale"}
+        assert video["data"]["data_uri"].startswith("data:image/jpeg;base64,")
+        assert video["data"]["payload_bytes"] == len(b"fake-jpeg-data")
+
+        logs = client.get("/api/debug/logs/tail?limit=10", headers=_agent_headers()).json()
+        messages = [entry["message"] for entry in logs["data"]["entries"]]
+        assert "第一行日志" in messages
+        assert "第二行错误" in messages
+        assert logs["source"] == "configured_log_file"
+
+        filtered = client.get("/api/debug/logs/tail?limit=10&level=error", headers=_agent_headers()).json()
+        assert [entry["message"] for entry in filtered["data"]["entries"]] == ["第二行错误"]
+
+        assert client.post("/api/debug/pointcloud/latest", headers=_agent_headers()).status_code == 405
+        assert client.delete("/api/debug/video/latest", headers=_agent_headers()).status_code == 405
 
 
 def test_gateway_request_id_contract_and_error_payload(tmp_path: Path, caplog) -> None:

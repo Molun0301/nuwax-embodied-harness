@@ -73,6 +73,7 @@ class DebugOverviewView(ContractModel):
     navigation: DebugSourceSummary
     exploration: DebugSourceSummary
     pointcloud: DebugSourceSummary
+    video: DebugSourceSummary
     logs: DebugSourceSummary
 
 
@@ -114,11 +115,28 @@ class DebugPointCloudView(ContractModel):
     metadata: MetadataDict = Field(default_factory=dict)
     point_count: int = 0
     fields: List[MetadataDict] = Field(default_factory=list)
+    points: List[MetadataDict] = Field(default_factory=list)
     format: str = "xyz"
     payload_bytes: Optional[int] = None
     artifact_ref: Optional[str] = None
     data_uri: Optional[str] = None
     protection: MetadataDict = Field(default_factory=dict)
+    metrics: MetadataDict = Field(default_factory=dict)
+
+
+class DebugVideoView(ContractModel):
+    """视频调试视图。"""
+
+    camera_id: Optional[str] = None
+    frame_id: Optional[str] = None
+    width_px: Optional[int] = None
+    height_px: Optional[int] = None
+    encoding: Optional[str] = None
+    data_uri: Optional[str] = None
+    uri: Optional[str] = None
+    artifact_ref: Optional[str] = None
+    payload_bytes: Optional[int] = None
+    metadata: MetadataDict = Field(default_factory=dict)
     metrics: MetadataDict = Field(default_factory=dict)
 
 

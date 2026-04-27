@@ -14,6 +14,7 @@ from drivers.go2.defaults import GO2_TIMEOUTS, build_go2_defaults
 from drivers.go2.manifest import build_go2_manifest
 from drivers.go2.providers import Go2ProviderBundle
 from drivers.go2.settings import load_go2_data_plane_config
+from services.model_providers import resolve_scene_semantic_provider_spec, resolve_segmentation_provider_spec
 
 if TYPE_CHECKING:
     from settings import NuwaxRobotBridgeConfig
@@ -192,8 +193,11 @@ class Go2RobotAssembly(RobotAssemblyBase):
         """
 
         from services.perception import (
+            BBoxOnlySegmentationBackend,
             Basic2DTrackerBackend,
+            DetectionAttributesSegmentationBackend,
             DetectorPipeline,
+            DisabledSegmentationBackend,
             HybridSceneDescriptionBackend,
             MetadataDrivenDetectorBackend,
             OpenAICompatibleVisionSceneDescriptionBackend,
@@ -242,16 +246,72 @@ class Go2RobotAssembly(RobotAssemblyBase):
                 temperature=self.config.perception.openai_vision.temperature,
             )
 
-        scene_backend_name = self.config.perception.default_scene_backend
-        if scene_backend_name == "simple_scene":
+        scene_provider_spec = resolve_scene_semantic_provider_spec(
+            self.config.perception.default_scene_backend,
+            cloud_enabled=cloud_scene_backend is not None and cloud_scene_backend.is_enabled(),
+            cloud_model_name=self.config.perception.openai_vision.model_name,
+            local_backend_name=local_scene_backend.spec.name,
+            cloud_backend_name=(cloud_scene_backend.spec.name if cloud_scene_backend is not None else "openai_vision"),
+        )
+        if scene_provider_spec.provider_kind == "local":
             scene_backend = local_scene_backend
-        elif scene_backend_name == "openai_scene" and cloud_scene_backend is not None and cloud_scene_backend.is_enabled():
+        elif scene_provider_spec.provider_kind == "cloud" and cloud_scene_backend is not None:
             scene_backend = cloud_scene_backend
         else:
             scene_backend = HybridSceneDescriptionBackend(
                 local_backend=local_scene_backend,
                 cloud_backend=cloud_scene_backend,
                 name="go2_hybrid_scene_describer",
+            )
+
+        segmentation_config = self.config.perception.segmentation
+        configured_segmentation_name = (
+            (segmentation_config.backend_name or "").strip()
+            or self.config.perception.default_segmentation_backend
+        )
+        segmentation_provider_spec = resolve_segmentation_provider_spec(
+            enabled=segmentation_config.enabled,
+            backend_name=configured_segmentation_name,
+            backend_kind=segmentation_config.backend_kind,
+            route=segmentation_config.route,
+            default_backend_name=self.config.perception.default_segmentation_backend,
+            primary_backend_name=segmentation_config.primary_backend_name,
+            low_latency_backend_name=segmentation_config.low_latency_backend_name,
+            allow_bbox_only_fallback=segmentation_config.allow_bbox_only_fallback,
+            quality_thresholds=segmentation_config.quality_thresholds(),
+            output_policy=segmentation_config.output_policy(),
+        )
+        segmentation_metadata = segmentation_provider_spec.to_metadata()
+        if segmentation_provider_spec.provider_kind == "passthrough":
+            segmentation_backend = DetectionAttributesSegmentationBackend(
+                name=segmentation_provider_spec.backend_name,
+                configured_backend_name=segmentation_provider_spec.backend_name,
+                configured_backend_kind=segmentation_config.backend_kind,
+                metadata=segmentation_metadata,
+            )
+        elif segmentation_provider_spec.provider_kind == "bbox_only_fallback" and segmentation_config.allow_bbox_only_fallback:
+            segmentation_backend = BBoxOnlySegmentationBackend(
+                name=segmentation_provider_spec.backend_name,
+                configured_backend_name=segmentation_provider_spec.backend_name,
+                configured_backend_kind="bbox_only_fallback",
+                metadata=segmentation_metadata,
+            )
+        else:
+            reason = str(
+                segmentation_provider_spec.metadata.get("fallback_reason")
+                or segmentation_provider_spec.metadata.get("reason")
+                or "provider_not_available"
+            )
+            disabled_metadata = {
+                **segmentation_metadata,
+                "reason": reason,
+            }
+            segmentation_backend = DisabledSegmentationBackend(
+                configured_enabled=segmentation_config.enabled,
+                configured_backend_name=segmentation_provider_spec.backend_name,
+                configured_backend_kind=segmentation_config.backend_kind,
+                reason=reason,
+                metadata=disabled_metadata,
             )
 
         return {
@@ -262,6 +322,7 @@ class Go2RobotAssembly(RobotAssemblyBase):
             ),
             "tracker_backend": Basic2DTrackerBackend(name="go2_basic_2d_tracker"),
             "scene_description_backend": scene_backend,
+            "segmentation_backend": segmentation_backend,
         }
 
     def _require_high_level(self) -> None:

@@ -319,6 +319,49 @@ class PerceptionOpenAIVisionConfig:
 
 
 @dataclass
+class PerceptionSegmentationConfig:
+    """语义分割后端配置。"""
+
+    enabled: bool = False
+    backend_name: str = ""
+    backend_kind: str = "disabled_segmentation"
+    route: str = "primary"
+    primary_backend_name: str = "groundingdino_sam2"
+    low_latency_backend_name: str = "yolo_world_sam2"
+    allow_bbox_only_fallback: bool = True
+    score_threshold: float = 0.5
+    predicted_iou_threshold: float = 0.5
+    stability_score_threshold: float = 0.5
+    depth_coverage_threshold: float = 0.2
+    map_projection_coverage_threshold: float = 0.2
+    reprojection_error_threshold_px: float = 8.0
+    emit_raw_mask: bool = False
+    emit_polygon: bool = True
+    emit_quality_details: bool = True
+    emit_runtime_summary: bool = True
+    polygon_simplification_epsilon_px: float = 2.0
+
+    def quality_thresholds(self) -> Dict[str, float]:
+        return {
+            "score": self.score_threshold,
+            "predicted_iou": self.predicted_iou_threshold,
+            "stability_score": self.stability_score_threshold,
+            "depth_coverage": self.depth_coverage_threshold,
+            "map_projection_coverage": self.map_projection_coverage_threshold,
+            "reprojection_error_px": self.reprojection_error_threshold_px,
+        }
+
+    def output_policy(self) -> Dict[str, object]:
+        return {
+            "emit_raw_mask": self.emit_raw_mask,
+            "emit_polygon": self.emit_polygon,
+            "emit_quality_details": self.emit_quality_details,
+            "emit_runtime_summary": self.emit_runtime_summary,
+            "polygon_simplification_epsilon_px": self.polygon_simplification_epsilon_px,
+        }
+
+
+@dataclass
 class PerceptionStreamRuntimeConfig:
     """持续视频感知运行时配置。"""
 
@@ -345,8 +388,10 @@ class PerceptionConfig:
 
     default_detector_backend: str = "yolo_local"
     default_scene_backend: str = "hybrid_scene"
+    default_segmentation_backend: str = "segmentation_disabled"
     yolo: PerceptionYoloConfig = field(default_factory=PerceptionYoloConfig)
     openai_vision: PerceptionOpenAIVisionConfig = field(default_factory=PerceptionOpenAIVisionConfig)
+    segmentation: PerceptionSegmentationConfig = field(default_factory=PerceptionSegmentationConfig)
     stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
 
 
@@ -547,6 +592,10 @@ def load_config() -> NuwaxRobotBridgeConfig:
     perception = PerceptionConfig(
         default_detector_backend=_cfg_str("NUWAX_PERCEPTION_DEFAULT_DETECTOR_BACKEND", "yolo_local"),
         default_scene_backend=_cfg_str("NUWAX_PERCEPTION_DEFAULT_SCENE_BACKEND", "hybrid_scene"),
+        default_segmentation_backend=_cfg_str(
+            "NUWAX_PERCEPTION_DEFAULT_SEGMENTATION_BACKEND",
+            "segmentation_disabled",
+        ),
         yolo=PerceptionYoloConfig(
             enabled=_cfg_bool("NUWAX_PERCEPTION_YOLO_ENABLED", True),
             backend_name=_cfg_str("NUWAX_PERCEPTION_YOLO_BACKEND_NAME", "yolo_local"),
@@ -586,6 +635,50 @@ def load_config() -> NuwaxRobotBridgeConfig:
             timeout_sec=max(1.0, _cfg_float("NUWAX_PERCEPTION_OPENAI_TIMEOUT_SEC", 20.0)),
             max_tokens=max(128, _cfg_int("NUWAX_PERCEPTION_OPENAI_MAX_TOKENS", 1400)),
             temperature=max(0.0, _cfg_float("NUWAX_PERCEPTION_OPENAI_TEMPERATURE", 0.0)),
+        ),
+        segmentation=PerceptionSegmentationConfig(
+            enabled=_cfg_bool("NUWAX_PERCEPTION_SEGMENTATION_ENABLED", False),
+            backend_name=_cfg_str("NUWAX_PERCEPTION_SEGMENTATION_BACKEND_NAME", ""),
+            backend_kind=_cfg_str("NUWAX_PERCEPTION_SEGMENTATION_BACKEND_KIND", "disabled_segmentation"),
+            route=_cfg_str("NUWAX_PERCEPTION_SEGMENTATION_ROUTE", "primary"),
+            primary_backend_name=_cfg_str(
+                "NUWAX_PERCEPTION_SEGMENTATION_PRIMARY_BACKEND_NAME",
+                "groundingdino_sam2",
+            ),
+            low_latency_backend_name=_cfg_str(
+                "NUWAX_PERCEPTION_SEGMENTATION_LOW_LATENCY_BACKEND_NAME",
+                "yolo_world_sam2",
+            ),
+            allow_bbox_only_fallback=_cfg_bool("NUWAX_PERCEPTION_SEGMENTATION_ALLOW_BBOX_ONLY_FALLBACK", True),
+            score_threshold=max(0.0, min(1.0, _cfg_float("NUWAX_PERCEPTION_SEGMENTATION_SCORE_THRESHOLD", 0.5))),
+            predicted_iou_threshold=max(
+                0.0,
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_SEGMENTATION_PREDICTED_IOU_THRESHOLD", 0.5)),
+            ),
+            stability_score_threshold=max(
+                0.0,
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_SEGMENTATION_STABILITY_SCORE_THRESHOLD", 0.5)),
+            ),
+            depth_coverage_threshold=max(
+                0.0,
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_SEGMENTATION_DEPTH_COVERAGE_THRESHOLD", 0.2)),
+            ),
+            map_projection_coverage_threshold=max(
+                0.0,
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_SEGMENTATION_MAP_PROJECTION_COVERAGE_THRESHOLD", 0.2)),
+            ),
+            reprojection_error_threshold_px=max(
+                0.0,
+                _cfg_float("NUWAX_PERCEPTION_SEGMENTATION_REPROJECTION_ERROR_THRESHOLD_PX", 8.0),
+            ),
+            emit_raw_mask=_cfg_bool("NUWAX_PERCEPTION_SEGMENTATION_EMIT_RAW_MASK", False),
+            emit_polygon=_cfg_bool("NUWAX_PERCEPTION_SEGMENTATION_EMIT_POLYGON", True),
+            emit_quality_details=_cfg_bool("NUWAX_PERCEPTION_SEGMENTATION_EMIT_QUALITY_DETAILS", True),
+            emit_runtime_summary=_cfg_bool("NUWAX_PERCEPTION_SEGMENTATION_EMIT_RUNTIME_SUMMARY", True),
+            polygon_simplification_epsilon_px=max(
+                0.0,
+                _cfg_float("NUWAX_PERCEPTION_SEGMENTATION_POLYGON_SIMPLIFICATION_EPSILON_PX", 2.0),
+            ),
         ),
         stream_runtime=PerceptionStreamRuntimeConfig(
             enabled=_cfg_bool("NUWAX_PERCEPTION_STREAM_ENABLED", True),

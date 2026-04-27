@@ -8,6 +8,7 @@ import httpx
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import Detection2D, Detection3D, Track, TrackState
 from contracts.runtime_views import SceneObjectSummary, SceneSummary
+from services.model_providers import resolve_scene_semantic_provider_spec
 from services.perception.base import SceneDescriptionBackend, SceneDescriptionBackendSpec
 from services.perception.image_utils import image_frame_to_data_url
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -72,10 +73,17 @@ class SimpleSceneDescriptionBackend(SceneDescriptionBackend):
         name: str = "simple_scene_describer",
         max_labels: int = 5,
     ) -> None:
+        provider = resolve_scene_semantic_provider_spec(
+            "simple_scene",
+            cloud_enabled=False,
+            cloud_model_name="",
+            local_backend_name=name,
+            cloud_backend_name="openai_vision",
+        )
         self.spec = SceneDescriptionBackendSpec(
             name=name,
             backend_kind="rule_based_summary",
-            metadata={"max_labels": max_labels},
+            metadata={"max_labels": max_labels, "provider": provider.to_metadata()},
         )
         self._max_labels = max(1, max_labels)
 
@@ -165,6 +173,7 @@ class SimpleSceneDescriptionBackend(SceneDescriptionBackend):
                 "image_height_px": image_frame.height_px,
                 "visual_labels": [item.label for item in objects],
                 "semantic_tags": [item.label for item in objects],
+                "scene_provider": dict(self.spec.metadata.get("provider") or {}),
             },
         )
 
@@ -192,6 +201,13 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
         self._max_tokens = max(128, int(max_tokens))
         self._temperature = max(0.0, float(temperature))
         self._client = None
+        provider = resolve_scene_semantic_provider_spec(
+            "openai_scene",
+            cloud_enabled=bool(self._model_name),
+            cloud_model_name=self._model_name,
+            local_backend_name="simple_scene",
+            cloud_backend_name=name,
+        )
         self.spec = SceneDescriptionBackendSpec(
             name=name,
             backend_kind="openai_compatible_multimodal",
@@ -199,6 +215,7 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
                 "model_name": self._model_name,
                 "base_url": self._base_url,
                 "api_style": self._api_style,
+                "provider": provider.to_metadata(),
             },
         )
 
@@ -256,6 +273,7 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
                 "semantic_tags": tags,
                 "semantic_relations": relations,
                 "visual_labels": [item.label for item in objects],
+                "scene_provider": dict(self.spec.metadata.get("provider") or {}),
             },
         )
 
@@ -634,12 +652,23 @@ class HybridSceneDescriptionBackend(SceneDescriptionBackend):
     ) -> None:
         self._local_backend = local_backend
         self._cloud_backend = cloud_backend
+        cloud_enabled = cloud_backend is not None and (
+            not hasattr(cloud_backend, "is_enabled") or bool(cloud_backend.is_enabled())
+        )
+        provider = resolve_scene_semantic_provider_spec(
+            "hybrid_scene",
+            cloud_enabled=cloud_enabled,
+            cloud_model_name=str(getattr(cloud_backend, "_model_name", "") or ""),
+            local_backend_name=local_backend.spec.name,
+            cloud_backend_name=cloud_backend.spec.name if cloud_backend is not None else "openai_vision",
+        )
         self.spec = SceneDescriptionBackendSpec(
             name=name,
             backend_kind="hybrid_local_cloud_scene",
             metadata={
                 "local_backend": local_backend.spec.name,
                 "cloud_backend": cloud_backend.spec.name if cloud_backend is not None else "",
+                "provider": provider.to_metadata(),
             },
         )
 
@@ -665,11 +694,29 @@ class HybridSceneDescriptionBackend(SceneDescriptionBackend):
             not hasattr(self._cloud_backend, "is_enabled") or bool(self._cloud_backend.is_enabled())
         )
         if not cloud_enabled:
+            provider_metadata = dict(self.spec.metadata.get("provider") or {})
+            provider_metadata.update(
+                {
+                    "provider_kind": "local",
+                    "provider_name": "rule_based_scene",
+                    "backend_name": self._local_backend.spec.name,
+                    "availability": "available",
+                    "fallback_used": True,
+                    "fallback_reason": "cloud_disabled",
+                    "requested_provider_name": str(provider_metadata.get("requested_provider_name") or "hybrid_scene"),
+                    "resolved_provider_name": "rule_based_scene",
+                    "requested_backend": str(provider_metadata.get("requested_backend") or self.spec.name),
+                    "resolved_backend": self._local_backend.spec.name,
+                    "error_category": "perception_provider",
+                }
+            )
             return local_summary.model_copy(
                 update={
                     "metadata": {
                         **dict(local_summary.metadata),
+                        "scene_provider": provider_metadata,
                         "scene_backend_chain": [self._local_backend.spec.name],
+                        "error_category": "perception_provider",
                     }
                 },
                 deep=True,
@@ -685,12 +732,30 @@ class HybridSceneDescriptionBackend(SceneDescriptionBackend):
                 camera_info=camera_info,
             )
         except Exception as exc:
+            provider_metadata = dict(self.spec.metadata.get("provider") or {})
+            provider_metadata.update(
+                {
+                    "provider_kind": "local",
+                    "provider_name": "rule_based_scene",
+                    "backend_name": self._local_backend.spec.name,
+                    "availability": "unavailable",
+                    "fallback_used": True,
+                    "fallback_reason": "provider_not_available",
+                    "requested_provider_name": str(provider_metadata.get("requested_provider_name") or "hybrid_scene"),
+                    "resolved_provider_name": "rule_based_scene",
+                    "requested_backend": str(provider_metadata.get("requested_backend") or self.spec.name),
+                    "resolved_backend": self._local_backend.spec.name,
+                    "error_category": "perception_provider",
+                }
+            )
             return local_summary.model_copy(
                 update={
                     "metadata": {
                         **dict(local_summary.metadata),
+                        "scene_provider": provider_metadata,
                         "scene_backend_chain": [self._local_backend.spec.name, self._cloud_backend.spec.name],
                         "cloud_vision_error": str(exc),
+                        "error_category": "perception_provider",
                     }
                 },
                 deep=True,
@@ -717,6 +782,7 @@ class HybridSceneDescriptionBackend(SceneDescriptionBackend):
             metadata={
                 **dict(local_summary.metadata),
                 **dict(cloud_summary.metadata),
+                "scene_provider": dict(self.spec.metadata.get("provider") or {}),
                 "visual_labels": [item.label for item in merged_objects],
                 "semantic_tags": merged_tags,
                 "semantic_relations": merged_relations,

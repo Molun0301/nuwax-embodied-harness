@@ -16,7 +16,7 @@ from contracts.events import RuntimeEventCategory
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import OccupancyGrid, SemanticMap, SemanticRegion
-from contracts.memory import MemoryPayloadFilter, MemoryRecordKind
+from contracts.memory import MemoryPayloadFilter, MemoryQueryMatch, MemoryQueryResult, MemoryRecordKind
 from contracts.runtime_views import SceneObjectSummary, SceneSummary
 from contracts.spatial_memory import SpatialAnchorKind
 from contracts.skills import SkillCategory, SkillDescriptor
@@ -72,6 +72,7 @@ class _ProviderBundle(ImageProvider, LocalizationProvider, MapProvider):
                         "label": "charger",
                         "score": 0.84,
                         "bbox": {"x_px": 210, "y_px": 90, "width_px": 60, "height_px": 120},
+                        "map_pose": {"frame_id": "map", "x": 1.25, "y": 0.42, "z": 0.0},
                     },
                 ]
             },
@@ -635,16 +636,42 @@ def test_memory_service_can_query_locations_and_semantic_entries(tmp_path: Path)
         metadata={"source": "unit_test"},
     )
 
+    weak_person_instance = next(item for item in memory_service._semantic_instances_by_id.values() if item.label == "person")
+    weak_person_instance = weak_person_instance.model_copy(
+        update={
+            "metadata": {
+                **dict(weak_person_instance.metadata),
+                "projection_method": "current_pose_fallback",
+                "projection_confidence": 0.9,
+                "support_point_count": 1,
+            }
+        },
+        deep=True,
+    )
+    memory_service._semantic_instances_by_id[weak_person_instance.instance_id] = weak_person_instance
+    memory_service._upsert_vector_point_for_instance(weak_person_instance)
+
     location_result = memory_service.query_location("充电位", similarity_threshold=0.2)
     semantic_result = memory_service.query_semantic_memory("person", similarity_threshold=0.1)
     resolved = memory_service.resolve_tagged_location("补给点")
+
+    weak_matches = [
+        match
+        for match in semantic_result.matches
+        if match.semantic_instance is not None and match.semantic_instance.instance_id == weak_person_instance.instance_id
+    ]
 
     assert location_result.matches
     assert location_result.matches[0].tagged_location is not None
     assert location_result.matches[0].tagged_location.location_id == tagged_location.location_id
     assert semantic_result.matches
-    assert any(match.navigation_candidate is not None for match in semantic_result.matches)
     assert any(match.semantic_instance is not None for match in semantic_result.matches)
+    assert weak_matches
+    assert all(match.navigation_candidate is None for match in weak_matches)
+    assert all(match.metadata["navigable"] is False for match in weak_matches)
+    assert all(match.metadata["non_navigable_reason"] == "current_pose_fallback" for match in weak_matches)
+    assert all(match.metadata["navigation_quality"]["level"] == "not_navigable" for match in weak_matches)
+    assert all(match.metadata["navigation_quality"]["recommended_action"] == "reject" for match in weak_matches)
     assert any(
         match.semantic_memory is not None and match.semantic_memory.memory_id in {
             scene_entry.memory_id,
@@ -654,6 +681,7 @@ def test_memory_service_can_query_locations_and_semantic_entries(tmp_path: Path)
     )
     assert semantic_result.metadata["retrieval_mode"] == "text_recall_then_filter_then_multimodal_rerank"
     assert semantic_result.matches[0].metadata["text_recall_score"] >= 0.0
+    assert semantic_result.matches[0].metadata["backend_type"] == semantic_result.matches[0].metadata["backend"]
     assert semantic_result.matches[0].metadata["image_score"] >= 0.0
     assert resolved is not None
     assert resolved.name == "补给点"
@@ -787,6 +815,34 @@ def test_memory_service_supports_payload_filters_navigation_and_arrival_verifica
     assert scene_memory is not None
     assert scene_memory.metadata["localization_session_id"] == localization_session.session_id
 
+    charger_instance = next(item for item in memory_service._semantic_instances_by_id.values() if item.label == "charger")
+    charger_instance = charger_instance.model_copy(
+        update={
+            "metadata": {
+                **dict(charger_instance.metadata),
+                "projection_method": "explicit_map_pose",
+                "projection_confidence": 0.99,
+                "support_point_count": 4,
+                "has_structured_segmentation": True,
+                "segmentation_score": 0.91,
+                "predicted_iou": 0.84,
+                "segmentation_quality_score": 0.84,
+                "stability_score": 0.89,
+                "coverage": 0.92,
+                "map_projection_coverage": 0.88,
+                "depth_coverage": 0.9,
+                "reprojection_error": 0.3,
+                "segmentation_support_point_count": 4,
+                "projection_degradation_reason": "",
+                "geometry_projection_status": "mask_depth_support",
+                "segmentation_projection_status": "mask_depth_support",
+            }
+        },
+        deep=True,
+    )
+    memory_service._semantic_instances_by_id[charger_instance.instance_id] = charger_instance
+    memory_service._upsert_vector_point_for_instance(charger_instance)
+
     far_filter = MemoryPayloadFilter(
         near_pose=Pose(frame_id="map", position=Vector3(x=9.0, y=9.0, z=0.0)),
         max_distance_m=0.5,
@@ -806,40 +862,588 @@ def test_memory_service_supports_payload_filters_navigation_and_arrival_verifica
     assert wrong_session_result.matches == []
 
     providers.current_pose = Pose(frame_id="map", position=Vector3(x=1.1, y=0.45, z=0.0), orientation=Quaternion(w=1.0))
+    object_query = "red charger"
+    inherited_session_candidate = memory_service.resolve_navigation_candidate(object_query)
     navigation_candidate = memory_service.resolve_navigation_candidate(
-        "charging dock",
+        object_query,
         localization_session_id=localization_session.session_id,
     )
     navigation_candidates = memory_service.resolve_navigation_candidates(
+        object_query,
+        localization_session_id=localization_session.session_id,
+        limit=10,
+    )
+    ambiguous_navigation_candidates = memory_service.resolve_navigation_candidates(
         "charging dock",
         localization_session_id=localization_session.session_id,
-        limit=3,
+        limit=10,
     )
     wrong_session_candidate = memory_service.resolve_navigation_candidate(
-        "charging dock",
+        object_query,
         localization_session_id="wrong_session",
     )
+    assert inherited_session_candidate is not None
     assert navigation_candidate is not None
     assert navigation_candidates
     assert wrong_session_candidate is None
+    assert inherited_session_candidate.metadata["localization_session_id"] == localization_session.session_id
+    assert navigation_candidate.metadata["backend_type"] == navigation_candidate.metadata["backend"]
+    assert 0.0 <= float(navigation_candidate.metadata["candidate_score"]) <= 1.0
+    assert (isinstance(navigation_candidate.metadata["navigable"], bool) or navigation_candidate.metadata["navigable"] is None)
+    assert isinstance(navigation_candidate.metadata["non_navigable_reason"], str)
+    assert isinstance(navigation_candidate.metadata["support_point_count"], int)
+    assert navigation_candidate.metadata["source_collection"] in {
+        "object_instances",
+        "episodic_observations",
+        "place_nodes",
+    }
+    assert navigation_candidate.metadata["projection_method"] in {
+        "track_pose",
+        "depth_camera_projection",
+        "depth_pose_fallback",
+        "map_point_samples",
+        "camera_point_samples",
+        "explicit_map_pose",
+        "current_pose_fallback",
+        "",
+    }
     assert navigation_candidates[0].record_id == navigation_candidate.record_id
     assert navigation_candidate.record_id != tagged_location.location_id
+    assert navigation_candidate.metadata["navigation_quality"]["level"] == "direct_navigation"
+    assert navigation_candidate.metadata["navigation_quality"]["recommended_action"] == "navigate"
+    assert any(candidate.record_id == tagged_location.location_id for candidate in ambiguous_navigation_candidates)
     assert navigation_candidate.target_pose.frame_id == "map"
     assert navigation_candidate.metadata["map_name"] == "单元测试记忆库"
     assert navigation_candidate.metadata["localization_session_id"] == localization_session.session_id
     assert navigation_candidate.map_version_id is not None
 
     verification = memory_service.verify_arrival(
-        "charging dock",
+        object_query,
         navigation_candidate=navigation_candidate,
         camera_id="front_camera",
         similarity_threshold=0.1,
         localization_session_id=localization_session.session_id,
     )
+    mismatched_map_verification = memory_service.verify_arrival(
+        object_query,
+        navigation_candidate=navigation_candidate,
+        camera_id="front_camera",
+        similarity_threshold=0.1,
+        expected_map_version_id="wrong_map_version",
+        localization_session_id=localization_session.session_id,
+    )
+    mismatched_session_verification = memory_service.verify_arrival(
+        object_query,
+        navigation_candidate=navigation_candidate,
+        camera_id="front_camera",
+        similarity_threshold=0.1,
+        localization_session_id="wrong_session",
+    )
     assert verification.verified is True
     assert verification.score >= 0.1
     assert verification.metadata["map_version_id"] == navigation_candidate.map_version_id
     assert verification.metadata["localization_session_id"] == localization_session.session_id
+    assert mismatched_map_verification.verified is False
+    assert mismatched_map_verification.reason == "当前平台地图版本与导航候选版本不一致，已拒绝到点复核。"
+    assert mismatched_map_verification.metadata["expected_map_version_id"] == "wrong_map_version"
+    assert mismatched_map_verification.metadata["active_map_version_id"] == navigation_candidate.map_version_id
+    assert mismatched_session_verification.verified is False
+    assert mismatched_session_verification.reason == "当前平台定位会话已变化，已拒绝在旧定位上下文中执行到点复核。"
+    assert mismatched_session_verification.metadata["expected_localization_session_id"] == "wrong_session"
+    assert mismatched_session_verification.metadata["active_localization_session_id"] == localization_session.session_id
+
+
+def test_memory_service_expands_navigation_candidate_window_until_deep_match_found(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单候选解析在浅窗口全不可导航时应继续扩窗。"""
+
+    stack = _build_memory_stack(tmp_path)
+    providers = stack["providers"]
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    tagged_location, _ = memory_service.tag_location(
+        "深窗口补给点",
+        aliases=["深窗口充电位"],
+        description="用于测试深窗口导航候选。",
+        camera_id="front_camera",
+    )
+    providers.current_pose = Pose(frame_id="map", position=Vector3(x=1.0, y=0.4, z=0.0), orientation=Quaternion(w=1.0))
+
+    deep_navigation_candidate = memory_service._build_navigation_candidate(
+        "charging dock",
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=tagged_location.location_id,
+        anchor_id=memory_service._resolve_location_anchor_id(tagged_location),
+        inspection_pose=tagged_location.pose,
+        anchor_pose=tagged_location.pose,
+        target_name=tagged_location.name,
+        linked_location_id=tagged_location.location_id,
+        map_version_id=tagged_location.map_version_id,
+        topo_node_id=tagged_location.topo_node_id,
+        semantic_region_id=tagged_location.semantic_region_id,
+        artifact_ids=[],
+        current_pose=providers.current_pose,
+        verification_memory_id=tagged_location.memory_id,
+        verification_text="charging dock",
+        camera_id="front_camera",
+        localization_session_id=str(tagged_location.metadata.get("localization_session_id") or "").strip() or None,
+        source_metadata={
+            **dict(tagged_location.metadata),
+            "projection_method": "explicit_map_pose",
+            "projection_confidence": 0.99,
+            "support_point_count": 1,
+        },
+        backend_name="memory_service.tagged_location",
+        candidate_score=0.92,
+    )
+    shallow_match = MemoryQueryMatch(
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=tagged_location.location_id,
+        score=0.91,
+        reason="shallow_non_navigable_match",
+        tagged_location=tagged_location,
+        navigation_candidate=None,
+        metadata={"navigable": False, "non_navigable_reason": "window_filler"},
+    )
+    deep_match = MemoryQueryMatch(
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=tagged_location.location_id,
+        score=0.92,
+        reason="deep_navigable_match",
+        tagged_location=tagged_location,
+        navigation_candidate=deep_navigation_candidate,
+        metadata={"navigable": True},
+    )
+    query_limits = []
+
+    def _fake_query_records(query: str, *, similarity_threshold: float, limit: int, **kwargs) -> MemoryQueryResult:
+        query_limits.append(limit)
+        matches = ([shallow_match] * 12) if limit <= 12 else ([shallow_match] * 12) + [deep_match]
+        returned_count = min(limit, len(matches))
+        return MemoryQueryResult(
+            query=query,
+            similarity_threshold=similarity_threshold,
+            matches=matches[:returned_count],
+            metadata={
+                "candidate_count": 13,
+                "returned_candidate_count": returned_count,
+            },
+        )
+
+    monkeypatch.setattr(memory_service, "_query_records", _fake_query_records)
+    monkeypatch.setattr(memory_service, "resolve_tagged_location", lambda *args, **kwargs: None)
+
+    candidate = memory_service.resolve_navigation_candidate("charging dock")
+
+    assert candidate is not None
+    assert candidate.record_id == tagged_location.location_id
+    assert candidate.metadata["projection_method"] == "explicit_map_pose"
+    assert query_limits[0] == 12
+    assert len(query_limits) >= 2
+    assert query_limits[-1] > query_limits[0]
+
+
+def test_memory_service_recalls_reordered_prefix_candidate_after_window_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """扩窗重排把新候选插到前缀时，仍应召回新的深层候选。"""
+
+    stack = _build_memory_stack(tmp_path)
+    providers = stack["providers"]
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    shallow_location, _ = memory_service.tag_location(
+        "浅窗口补给点",
+        aliases=["浅窗口充电位"],
+        description="用于测试扩窗重排。",
+        camera_id="front_camera",
+    )
+    deep_location, _ = memory_service.tag_location(
+        "前缀深窗口补给点",
+        aliases=["前缀深窗口充电位"],
+        description="用于测试扩窗后前缀插入。",
+        camera_id="front_camera",
+    )
+    providers.current_pose = Pose(frame_id="map", position=Vector3(x=1.0, y=0.4, z=0.0), orientation=Quaternion(w=1.0))
+
+    deep_navigation_candidate = memory_service._build_navigation_candidate(
+        "charging dock",
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=deep_location.location_id,
+        anchor_id=memory_service._resolve_location_anchor_id(deep_location),
+        inspection_pose=deep_location.pose,
+        anchor_pose=deep_location.pose,
+        target_name=deep_location.name,
+        linked_location_id=deep_location.location_id,
+        map_version_id=deep_location.map_version_id,
+        topo_node_id=deep_location.topo_node_id,
+        semantic_region_id=deep_location.semantic_region_id,
+        artifact_ids=[],
+        current_pose=providers.current_pose,
+        verification_memory_id=deep_location.memory_id,
+        verification_text="charging dock",
+        camera_id="front_camera",
+        localization_session_id=str(deep_location.metadata.get("localization_session_id") or "").strip() or None,
+        source_metadata={
+            **dict(deep_location.metadata),
+            "projection_method": "explicit_map_pose",
+            "projection_confidence": 0.99,
+            "support_point_count": 1,
+        },
+        backend_name="memory_service.tagged_location",
+        candidate_score=0.91,
+    )
+    shallow_match = MemoryQueryMatch(
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=shallow_location.location_id,
+        score=0.9,
+        reason="shallow_window_filler",
+        tagged_location=shallow_location,
+        navigation_candidate=None,
+        metadata={"navigable": False, "non_navigable_reason": "window_filler"},
+    )
+    deep_match = MemoryQueryMatch(
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=deep_location.location_id,
+        score=0.91,
+        reason="reordered_prefix_candidate",
+        tagged_location=deep_location,
+        navigation_candidate=deep_navigation_candidate,
+        metadata={"navigable": True, "candidate_score": 0.91},
+    )
+    query_limits = []
+
+    def _fake_query_records(query: str, *, similarity_threshold: float, limit: int, **kwargs) -> MemoryQueryResult:
+        query_limits.append(limit)
+        matches = ([shallow_match] * 12) if limit <= 12 else [deep_match, *([shallow_match] * 12)]
+        returned_count = min(limit, len(matches))
+        return MemoryQueryResult(
+            query=query,
+            similarity_threshold=similarity_threshold,
+            matches=matches[:returned_count],
+            metadata={
+                "candidate_count": 13,
+                "returned_candidate_count": returned_count,
+            },
+        )
+
+    def _fake_query_location(query: str, *, similarity_threshold: float = 0.55, limit: int = 5, **kwargs) -> MemoryQueryResult:
+        return MemoryQueryResult(
+            query=query,
+            similarity_threshold=similarity_threshold,
+            matches=[],
+            metadata={"candidate_count": 0, "returned_candidate_count": 0},
+        )
+
+    monkeypatch.setattr(memory_service, "_query_records", _fake_query_records)
+    monkeypatch.setattr(memory_service, "query_location", _fake_query_location)
+
+    candidate = memory_service.resolve_navigation_candidate("charging dock")
+
+    assert candidate is not None
+    assert candidate.record_id == deep_location.location_id
+    assert candidate.metadata["candidate_score"] == pytest.approx(0.91)
+    assert candidate.metadata["projection_method"] == "explicit_map_pose"
+    assert query_limits[:2] == [12, 13]
+
+
+def test_memory_service_navigation_fallback_reuses_query_location_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fallback 应复用地点查询结果，不能把不可导航地点重新包装成候选。"""
+
+    stack = _build_memory_stack(tmp_path)
+    providers = stack["providers"]
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    blocked_location, _ = memory_service.tag_location(
+        "不可导航补给点",
+        aliases=["不可导航充电位"],
+        description="用于测试 fallback 门控。",
+        camera_id="front_camera",
+    )
+    allowed_location, _ = memory_service.tag_location(
+        "可导航补给点",
+        aliases=["可导航充电位"],
+        description="用于测试 fallback 复用正式候选。",
+        camera_id="front_camera",
+    )
+    blocked_location = blocked_location.model_copy(
+        update={
+            "metadata": {
+                **dict(blocked_location.metadata),
+                "projection_method": "current_pose_fallback",
+                "projection_confidence": 0.91,
+                "support_point_count": 1,
+                "candidate_score": 0.12,
+                "navigable": False,
+                "non_navigable_reason": "candidate_score_below_threshold",
+            }
+        },
+        deep=True,
+    )
+    providers.current_pose = Pose(frame_id="map", position=Vector3(x=1.0, y=0.4, z=0.0), orientation=Quaternion(w=1.0))
+
+    allowed_navigation_candidate = memory_service._build_navigation_candidate(
+        "charging dock",
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=allowed_location.location_id,
+        anchor_id=memory_service._resolve_location_anchor_id(allowed_location),
+        inspection_pose=allowed_location.pose,
+        anchor_pose=allowed_location.pose,
+        target_name=allowed_location.name,
+        linked_location_id=allowed_location.location_id,
+        map_version_id=allowed_location.map_version_id,
+        topo_node_id=allowed_location.topo_node_id,
+        semantic_region_id=allowed_location.semantic_region_id,
+        artifact_ids=[],
+        current_pose=providers.current_pose,
+        verification_memory_id=allowed_location.memory_id,
+        verification_text="charging dock",
+        camera_id="front_camera",
+        localization_session_id=str(allowed_location.metadata.get("localization_session_id") or "").strip() or None,
+        source_metadata={
+            **dict(allowed_location.metadata),
+            "projection_method": "explicit_map_pose",
+            "projection_confidence": 0.74,
+            "support_point_count": 1,
+        },
+        backend_name="memory_service.tagged_location",
+        candidate_score=0.62,
+    )
+    blocked_match = MemoryQueryMatch(
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=blocked_location.location_id,
+        score=0.95,
+        reason="blocked_fallback_match",
+        tagged_location=blocked_location,
+        navigation_candidate=None,
+        metadata={
+            "navigable": False,
+            "candidate_score": 0.12,
+            "non_navigable_reason": "candidate_score_below_threshold",
+        },
+    )
+    allowed_match = MemoryQueryMatch(
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=allowed_location.location_id,
+        score=0.41,
+        reason="allowed_fallback_match",
+        tagged_location=allowed_location,
+        navigation_candidate=allowed_navigation_candidate,
+        metadata={
+            "navigable": True,
+            "candidate_score": 0.62,
+            "projection_method": "explicit_map_pose",
+        },
+    )
+    query_location_calls = []
+
+    def _fake_query_records(query: str, *, similarity_threshold: float, limit: int, **kwargs) -> MemoryQueryResult:
+        return MemoryQueryResult(
+            query=query,
+            similarity_threshold=similarity_threshold,
+            matches=[],
+            metadata={"candidate_count": 0, "returned_candidate_count": 0},
+        )
+
+    def _fake_query_location(
+        query: str,
+        *,
+        similarity_threshold: float = 0.55,
+        limit: int = 5,
+        payload_filter: Optional[MemoryPayloadFilter] = None,
+        **kwargs,
+    ) -> MemoryQueryResult:
+        query_location_calls.append(
+            {
+                "limit": limit,
+                "record_kinds": list(payload_filter.record_kinds) if payload_filter is not None else None,
+            }
+        )
+        return MemoryQueryResult(
+            query=query,
+            similarity_threshold=similarity_threshold,
+            matches=[blocked_match, allowed_match],
+            metadata={"candidate_count": 2, "returned_candidate_count": 2},
+        )
+
+    monkeypatch.setattr(memory_service, "_query_records", _fake_query_records)
+    monkeypatch.setattr(memory_service, "query_location", _fake_query_location)
+
+    candidates = memory_service.resolve_navigation_candidates("charging dock", limit=2)
+
+    assert query_location_calls
+    assert query_location_calls[0]["limit"] == 12
+    assert query_location_calls[0]["record_kinds"] == [MemoryRecordKind.TAGGED_LOCATION]
+    assert [candidate.record_id for candidate in candidates] == [allowed_location.location_id]
+    assert candidates[0].metadata["candidate_score"] == pytest.approx(0.62)
+    assert candidates[0].metadata["navigable"] is True
+    assert candidates[0].metadata["navigation_quality"]["level"] == "direct_navigation"
+    assert candidates[0].metadata["navigation_quality"]["recommended_action"] == "navigate"
+
+
+def test_memory_service_navigation_planner_metadata_stays_on_formal_fallback_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复杂 query 应保留 planner metadata，并继续走正式 query_location fallback。"""
+
+    stack = _build_memory_stack(tmp_path)
+    providers = stack["providers"]
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+    localization_service = stack["localization_service"]
+    mapping_service = stack["mapping_service"]
+
+    map_snapshot = mapping_service.get_latest_snapshot()
+    assert map_snapshot is not None
+    localization_session = localization_service.ensure_active_session(
+        map_name="单元测试记忆库",
+        map_version_id=map_snapshot.version_id,
+        frame_id=map_snapshot.frame_id,
+    )
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    tagged_location, _ = memory_service.tag_location(
+        "门口充电位",
+        aliases=["charging dock", "dock"],
+        description="门口右侧的补给点。",
+        camera_id="front_camera",
+    )
+    providers.current_pose = Pose(frame_id="map", position=Vector3(x=1.0, y=0.4, z=0.0), orientation=Quaternion(w=1.0))
+
+    fallback_candidate = memory_service._build_navigation_candidate(
+        "go to charging_dock near station but not the red box",
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=tagged_location.location_id,
+        anchor_id=memory_service._resolve_location_anchor_id(tagged_location),
+        inspection_pose=tagged_location.pose,
+        anchor_pose=tagged_location.pose,
+        target_name=tagged_location.name,
+        linked_location_id=tagged_location.location_id,
+        map_version_id=tagged_location.map_version_id,
+        topo_node_id=tagged_location.topo_node_id,
+        semantic_region_id=tagged_location.semantic_region_id,
+        artifact_ids=[],
+        current_pose=providers.current_pose,
+        verification_memory_id=tagged_location.memory_id,
+        verification_text="go to charging_dock near station but not the red box",
+        camera_id="front_camera",
+        localization_session_id=localization_session.session_id,
+        source_metadata={
+            **dict(tagged_location.metadata),
+            "projection_method": "explicit_map_pose",
+            "projection_confidence": 0.83,
+            "support_point_count": 1,
+        },
+        backend_name="memory_service.tagged_location",
+        candidate_score=0.62,
+    )
+    fallback_match = MemoryQueryMatch(
+        record_kind=MemoryRecordKind.TAGGED_LOCATION,
+        record_id=tagged_location.location_id,
+        score=0.62,
+        reason="planner_metadata_fallback_match",
+        tagged_location=tagged_location,
+        navigation_candidate=fallback_candidate,
+        metadata={"navigable": True, "candidate_score": 0.62},
+    )
+    query_record_calls = []
+    query_location_calls = []
+
+    def _fake_query_records(query: str, *, similarity_threshold: float, limit: int, **kwargs) -> MemoryQueryResult:
+        payload_filter = kwargs["payload_filter"]
+        grounding_plan = kwargs["grounding_plan"]
+        query_record_calls.append(
+            {
+                "record_kinds": list(payload_filter.record_kinds),
+                "map_version_id": payload_filter.map_version_id,
+                "localization_session_id": payload_filter.localization_session_id,
+                "near_pose": payload_filter.near_pose,
+                "label_filters": (
+                    list(payload_filter.semantic_labels_any),
+                    list(payload_filter.visual_labels_any),
+                    list(payload_filter.vision_tags_any),
+                ),
+                "planner_version": grounding_plan.metadata["planner_version"],
+                "query_scope": grounding_plan.metadata["query_scope"],
+                "negative_constraints": grounding_plan.metadata["negative_constraints"],
+                "spatial_constraints": grounding_plan.metadata["spatial_constraints"],
+            }
+        )
+        return MemoryQueryResult(
+            query=query,
+            similarity_threshold=similarity_threshold,
+            matches=[],
+            metadata={"candidate_count": 0, "returned_candidate_count": 0},
+        )
+
+    def _fake_query_location(
+        query: str,
+        *,
+        similarity_threshold: float = 0.55,
+        limit: int = 5,
+        payload_filter: Optional[MemoryPayloadFilter] = None,
+        **kwargs,
+    ) -> MemoryQueryResult:
+        query_location_calls.append(
+            {
+                "record_kinds": list(payload_filter.record_kinds) if payload_filter is not None else None,
+                "map_version_id": payload_filter.map_version_id if payload_filter is not None else None,
+                "localization_session_id": payload_filter.localization_session_id if payload_filter is not None else None,
+            }
+        )
+        return MemoryQueryResult(
+            query=query,
+            similarity_threshold=similarity_threshold,
+            matches=[fallback_match],
+            metadata={"candidate_count": 1, "returned_candidate_count": 1},
+        )
+
+    monkeypatch.setattr(memory_service, "_query_records", _fake_query_records)
+    monkeypatch.setattr(memory_service, "query_location", _fake_query_location)
+
+    candidates = memory_service.resolve_navigation_candidates(
+        "go to charging_dock near station but not the red box",
+        localization_session_id=localization_session.session_id,
+        limit=1,
+    )
+
+    assert query_record_calls
+    assert query_record_calls[0]["planner_version"] == "4.3-rule-based-v1"
+    assert query_record_calls[0]["query_scope"] == "mixed"
+    assert query_record_calls[0]["map_version_id"] == map_snapshot.version_id
+    assert query_record_calls[0]["localization_session_id"] == localization_session.session_id
+    assert query_record_calls[0]["near_pose"] == providers.current_pose
+    assert query_record_calls[0]["record_kinds"][0] == MemoryRecordKind.OBJECT_INSTANCE
+    assert query_record_calls[0]["label_filters"] == ([], [], [])
+    assert query_record_calls[0]["negative_constraints"]
+    assert all(item["hard_filter"] is False for item in query_record_calls[0]["negative_constraints"])
+    assert any(item["relation"] == "near" for item in query_record_calls[0]["spatial_constraints"])
+    assert query_location_calls
+    assert query_location_calls[0]["record_kinds"] == [MemoryRecordKind.TAGGED_LOCATION]
+    assert query_location_calls[0]["map_version_id"] == map_snapshot.version_id
+    assert query_location_calls[0]["localization_session_id"] == localization_session.session_id
+    assert [candidate.record_id for candidate in candidates] == [tagged_location.location_id]
+    assert candidates[0].metadata["candidate_score"] == pytest.approx(0.62)
 
 
 def test_memory_service_deeply_integrates_visual_semantics_into_vector_memory(tmp_path: Path) -> None:
@@ -889,6 +1493,7 @@ def test_memory_service_writes_object_level_observation_events_and_dynamic_ancho
     observation_service = stack["observation_service"]
     perception_service = stack["perception_service"]
     memory_service = stack["memory_service"]
+    state_store = stack["state_store"]
 
     observation_service.capture_observation(camera_id="front_camera")
     perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
@@ -906,13 +1511,52 @@ def test_memory_service_writes_object_level_observation_events_and_dynamic_ancho
         for item in memory_service._observation_events_by_id.values()
         if person_instance.instance_id in item.linked_instance_ids
     )
+    stored_instance_entry = state_store.read(StateNamespace.MEMORY, f"instance:{person_instance.instance_id}")
+    latest_history_instance = next(
+        item
+        for item in reversed(memory_service._semantic_instance_history)
+        if item.instance_id == person_instance.instance_id
+    )
+    persisted_instance = next(
+        item
+        for item in memory_service._repository.load_semantic_instances()
+        if item.instance_id == person_instance.instance_id
+    )
+    vector_point = memory_service._vector_store.get_point(person_instance.instance_id)
+
+    assert stored_instance_entry is not None
+    assert stored_instance_entry.value.last_observation_event_id == linked_event.event_id
+    assert linked_event.event_id in stored_instance_entry.value.supporting_observation_event_ids
+    assert latest_history_instance.last_observation_event_id == linked_event.event_id
+    assert linked_event.event_id in latest_history_instance.supporting_observation_event_ids
+    assert persisted_instance.last_observation_event_id == linked_event.event_id
+    assert linked_event.event_id in persisted_instance.supporting_observation_event_ids
+    assert vector_point is not None
+
+    person_instance = person_instance.model_copy(
+        update={
+            "metadata": {
+                **dict(person_instance.metadata),
+                "projection_method": "current_pose_fallback",
+                "projection_confidence": 0.9,
+                "support_point_count": 1,
+                "navigable": False,
+                "non_navigable_reason": "current_pose_fallback",
+            }
+        },
+        deep=True,
+    )
+    memory_service._semantic_instances_by_id[person_instance.instance_id] = person_instance
+    memory_service._upsert_vector_point_for_instance(person_instance)
     navigation_context = memory_service.get_navigation_semantic_context()
     dynamic_anchor = next(item for item in navigation_context.anchors if item.anchor_id == person_instance.anchor_id)
-    navigation_candidate = memory_service.resolve_navigation_candidate("person")
+    navigation_candidates = memory_service.resolve_navigation_candidates("person", limit=10)
 
     assert linked_event.source_memory_id == memory_entry.memory_id
     assert linked_event.anchor_id == person_instance.anchor_id
     assert linked_event.pose is not None
+    assert 0.0 <= linked_event.metadata["projection_confidence"] <= 1.0
+    assert linked_event.metadata["support_point_count"] >= 0
     assert linked_event.metadata["projection_method"] in {
         "current_pose_fallback",
         "track_pose",
@@ -922,11 +1566,18 @@ def test_memory_service_writes_object_level_observation_events_and_dynamic_ancho
         "camera_point_samples",
         "explicit_map_pose",
     }
+    assert dynamic_anchor.inspection_poses
     assert dynamic_anchor.anchor_kind == SpatialAnchorKind.OBJECT_INSTANCE
     assert dynamic_anchor.metadata["instance_id"] == person_instance.instance_id
     assert navigation_context.metadata["anchor_count"] == len(navigation_context.anchors)
-    assert navigation_candidate is not None
-    assert navigation_candidate.metadata["anchor_id"] == person_instance.anchor_id
+    assert person_instance.metadata["projection_method"] == "current_pose_fallback"
+    assert isinstance(person_instance.metadata["support_point_count"], int)
+    assert person_instance.metadata["non_navigable_reason"] == "current_pose_fallback"
+    assert person_instance.metadata["navigable"] is False
+    current_pose_candidate = next(candidate for candidate in navigation_candidates if candidate.record_id == person_instance.instance_id)
+    assert current_pose_candidate.metadata["navigation_quality"]["level"] == "not_navigable"
+    assert current_pose_candidate.metadata["navigation_quality"]["recommended_action"] == "reject"
+    assert current_pose_candidate.metadata["non_navigable_reason"] == "current_pose_fallback"
 
 
 def test_memory_service_remember_current_scene_allows_missing_map_snapshot(tmp_path: Path) -> None:

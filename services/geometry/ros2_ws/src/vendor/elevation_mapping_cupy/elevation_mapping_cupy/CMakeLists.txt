@@ -50,19 +50,29 @@ if(BUILD_TESTING)
   find_package(ament_cmake_ros REQUIRED)
   find_package(launch_testing_ament_cmake REQUIRED)
 
+  function(add_optional_pytest_test test_name test_path)
+    if(EXISTS "${test_path}")
+      ament_add_pytest_test(${test_name}
+        "${test_path}"
+        TIMEOUT 120
+        ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+      )
+    else()
+      message(WARNING "跳过 ${test_name}：测试文件不存在: ${test_path}")
+    endif()
+  endfunction()
+
   # Unit tests (run via pytest, no ROS dependencies)
   # These are the PRIMARY regression tests for the axis-swap bug
   # Note: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 disables the launch_testing pytest plugin
   # which would otherwise try to import the package (triggering cupy import errors)
-  ament_add_pytest_test(test_map_shifting
+  add_optional_pytest_test(
+    test_map_shifting
     ${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}/tests/test_map_shifting.py
-    TIMEOUT 120
-    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
   )
-  ament_add_pytest_test(test_map_services
+  add_optional_pytest_test(
+    test_map_services
     ${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}/tests/test_map_services.py
-    TIMEOUT 120
-    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
   )
 
   # Define isolated launch test function for unique ROS_DOMAIN_ID per test

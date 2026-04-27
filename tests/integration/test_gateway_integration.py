@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import json
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import httpx
@@ -16,6 +18,7 @@ from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAre
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
 from drivers.common.manifest import RobotDefaults, RobotManifest
+from drivers.go2.assembly import Go2RobotAssembly
 from gateways.app import create_gateway_app
 from gateways.relay.server import create_relay_app
 from gateways.runtime import create_default_gateway_runtime
@@ -37,6 +40,39 @@ def _admin_headers() -> Dict[str, str]:
 
 def _relay_headers() -> Dict[str, str]:
     return {"Authorization": "Bearer relay-token"}
+
+
+def _mcp_tool_call(collection: str, function: str, parameters: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    return {"name": collection, "arguments": {"function": function, "parameters": dict(parameters or {})}}
+
+
+def _navigation_quality_contract(
+    *,
+    level: str,
+    recommended_action: str,
+    primary_reason_code: str = "",
+    reason_codes: Optional[List[str]] = None,
+    confidence: float = 0.8,
+) -> Dict[str, object]:
+    return {
+        "schema_version": "4.4-v1",
+        "level": level,
+        "confidence": confidence,
+        "recommended_action": recommended_action,
+        "primary_reason_code": primary_reason_code,
+        "reason_codes": list(reason_codes or []),
+        "explanation": "integration test navigation quality",
+        "inputs": {},
+        "thresholds": {
+            "direct_candidate_score_min": 0.55,
+            "continue_exploration_candidate_score_max_exclusive": 0.35,
+            "projection_confidence_hard_min": 0.2,
+            "projection_confidence_direct_min": 0.65,
+            "segmentation_low_signal_min": 0.25,
+            "segmentation_reprojection_error_max": 2.0,
+            "direct_segmentation_signal_min": 0.65,
+        },
+    }
 
 
 class FakeProviderBundle(
@@ -559,6 +595,202 @@ def _build_host_app(tmp_path: Path, *, start_runtime_on_lifespan: bool = True):
     return app, runtime, robot, config
 
 
+def test_load_config_reads_segmentation_settings_from_env(monkeypatch) -> None:
+    """配置解析应读取语义分割相关环境变量。"""
+
+    monkeypatch.setenv("NUWAX_PERCEPTION_DEFAULT_SEGMENTATION_BACKEND", "sam2")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_ENABLED", "true")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_BACKEND_NAME", "")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_BACKEND_KIND", "sam2")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_ROUTE", "low_latency")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_PRIMARY_BACKEND_NAME", "groundingdino_sam2_custom")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_LOW_LATENCY_BACKEND_NAME", "yolo_world_sam2_custom")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_ALLOW_BBOX_ONLY_FALLBACK", "false")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_SCORE_THRESHOLD", "0.66")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_PREDICTED_IOU_THRESHOLD", "0.77")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_STABILITY_SCORE_THRESHOLD", "0.88")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_DEPTH_COVERAGE_THRESHOLD", "0.33")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_MAP_PROJECTION_COVERAGE_THRESHOLD", "0.44")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_REPROJECTION_ERROR_THRESHOLD_PX", "4.5")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_EMIT_RAW_MASK", "true")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_EMIT_POLYGON", "false")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_EMIT_QUALITY_DETAILS", "false")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_EMIT_RUNTIME_SUMMARY", "false")
+    monkeypatch.setenv("NUWAX_PERCEPTION_SEGMENTATION_POLYGON_SIMPLIFICATION_EPSILON_PX", "1.25")
+
+    config = load_config()
+    thresholds = config.perception.segmentation.quality_thresholds()
+    output_policy = config.perception.segmentation.output_policy()
+
+    assert config.perception.default_segmentation_backend == "sam2"
+    assert config.perception.segmentation.enabled is True
+    assert config.perception.segmentation.backend_name == ""
+    assert config.perception.segmentation.backend_kind == "sam2"
+    assert config.perception.segmentation.route == "low_latency"
+    assert config.perception.segmentation.primary_backend_name == "groundingdino_sam2_custom"
+    assert config.perception.segmentation.low_latency_backend_name == "yolo_world_sam2_custom"
+    assert config.perception.segmentation.allow_bbox_only_fallback is False
+    assert thresholds["score"] == 0.66
+    assert thresholds["predicted_iou"] == 0.77
+    assert thresholds["stability_score"] == 0.88
+    assert thresholds["depth_coverage"] == 0.33
+    assert thresholds["map_projection_coverage"] == 0.44
+    assert thresholds["reprojection_error_px"] == 4.5
+    assert output_policy["emit_raw_mask"] is True
+    assert output_policy["emit_polygon"] is False
+    assert output_policy["emit_quality_details"] is False
+    assert output_policy["emit_runtime_summary"] is False
+    assert output_policy["polygon_simplification_epsilon_px"] == 1.25
+
+
+def test_gateway_runtime_wires_default_disabled_segmentation_backend(tmp_path: Path) -> None:
+    """运行时应注入默认禁用的分割后端。"""
+
+    config = _build_test_config(tmp_path)
+    robot = FakeRobotAssembly()
+    runtime = create_default_gateway_runtime(config, robot)
+    backend = runtime.perception_service.segmentation_backend
+
+    assert backend.spec.name == "segmentation_disabled"
+    assert backend.spec.backend_kind == "disabled_segmentation"
+    assert backend.spec.metadata["reason"] == "runtime_default"
+
+
+def test_go2_perception_pipeline_uses_default_segmentation_backend_when_backend_name_empty(tmp_path: Path) -> None:
+    """Go2 感知装配在未显式命名时应回退到默认分割后端名。"""
+
+    config = _build_test_config(tmp_path)
+    config.perception.yolo.enabled = False
+    config.perception.openai_vision.enabled = False
+    config.perception.default_segmentation_backend = "sam2"
+    config.perception.segmentation.enabled = True
+    config.perception.segmentation.backend_name = ""
+    config.perception.segmentation.backend_kind = "sam2"
+    config.perception.segmentation.route = "primary"
+    config.perception.segmentation.score_threshold = 0.66
+    config.perception.segmentation.emit_polygon = True
+
+    components = Go2RobotAssembly.build_default_perception_pipeline(SimpleNamespace(config=config))
+    backend = components["segmentation_backend"]
+
+    assert backend.spec.name == "segmentation_disabled"
+    assert backend.spec.backend_kind == "disabled_segmentation"
+    assert backend.spec.metadata["configured_enabled"] is True
+    assert backend.spec.metadata["configured_backend_name"] == "sam2"
+    assert backend.spec.metadata["configured_backend_kind"] == "sam2"
+    assert backend.spec.metadata["reason"] == "provider_not_available"
+    assert backend.spec.metadata["provider_kind"] == "primary"
+    assert backend.spec.metadata["provider_name"] == "groundingdino_sam2"
+    assert backend.spec.metadata["availability"] == "not_implemented"
+    assert backend.spec.metadata["grounding_provider"] == "groundingdino"
+    assert backend.spec.metadata["segmentation_provider"] == "sam2"
+    assert backend.spec.metadata["capabilities"]["ground"] is True
+    assert backend.spec.metadata["capabilities"]["segment"] is True
+    assert backend.spec.metadata["quality_thresholds"]["score"] == 0.66
+    assert backend.spec.metadata["output_policy"]["emit_polygon"] is True
+
+
+def test_go2_perception_pipeline_wires_low_latency_segmentation_route(tmp_path: Path) -> None:
+    """Go2 感知装配应声明低时延路线并在 provider 未实现时禁用降级。"""
+
+    config = _build_test_config(tmp_path)
+    config.perception.yolo.enabled = False
+    config.perception.openai_vision.enabled = False
+    config.perception.default_segmentation_backend = "fast_segmenter"
+    config.perception.segmentation.enabled = True
+    config.perception.segmentation.backend_name = ""
+    config.perception.segmentation.backend_kind = "yolo_world_sam2"
+    config.perception.segmentation.route = "low_latency"
+    config.perception.segmentation.low_latency_backend_name = "yolo_world_sam2"
+
+    components = Go2RobotAssembly.build_default_perception_pipeline(SimpleNamespace(config=config))
+    backend = components["segmentation_backend"]
+
+    assert backend.spec.name == "segmentation_disabled"
+    assert backend.spec.backend_kind == "disabled_segmentation"
+    assert backend.spec.metadata["configured_backend_name"] == "fast_segmenter"
+    assert backend.spec.metadata["provider_kind"] == "low_latency"
+    assert backend.spec.metadata["provider_name"] == "yolo_world_sam2"
+    assert backend.spec.metadata["route"] == "low_latency"
+    assert backend.spec.metadata["grounding_provider"] == "yolo_world"
+    assert backend.spec.metadata["segmentation_provider"] == "sam2"
+    assert backend.spec.metadata["availability"] == "not_implemented"
+    assert backend.spec.metadata["fallback_reason"] == "provider_not_available"
+
+
+def test_go2_perception_pipeline_wires_bbox_only_segmentation_fallback(tmp_path: Path) -> None:
+    """Go2 感知装配应支持显式 bbox-only 分割回退。"""
+
+    config = _build_test_config(tmp_path)
+    config.perception.yolo.enabled = False
+    config.perception.openai_vision.enabled = False
+    config.perception.default_segmentation_backend = "bbox_only_segmentation"
+    config.perception.segmentation.enabled = True
+    config.perception.segmentation.backend_name = ""
+    config.perception.segmentation.backend_kind = "bbox_only_fallback"
+    config.perception.segmentation.route = "bbox_only"
+    config.perception.segmentation.allow_bbox_only_fallback = True
+
+    components = Go2RobotAssembly.build_default_perception_pipeline(SimpleNamespace(config=config))
+    backend = components["segmentation_backend"]
+
+    assert backend.spec.name == "bbox_only_segmentation"
+    assert backend.spec.backend_kind == "bbox_only_fallback"
+    assert backend.spec.metadata["configured_enabled"] is True
+    assert backend.spec.metadata["configured_backend_name"] == "bbox_only_segmentation"
+    assert backend.spec.metadata["configured_backend_kind"] == "bbox_only_fallback"
+    assert backend.spec.metadata["source"] == "bbox_only_fallback"
+    assert backend.spec.metadata["provider_kind"] == "bbox_only_fallback"
+    assert backend.spec.metadata["segment_capability_available"] is False
+
+def test_go2_perception_pipeline_wires_detection_attributes_segmentation(tmp_path: Path) -> None:
+    """Go2 感知装配应支持检测属性分割后端。"""
+
+    config = _build_test_config(tmp_path)
+    config.perception.yolo.enabled = False
+    config.perception.openai_vision.enabled = False
+    config.perception.default_segmentation_backend = "detection_attributes_segmentation"
+    config.perception.segmentation.enabled = True
+    config.perception.segmentation.backend_name = ""
+    config.perception.segmentation.backend_kind = "detection_attributes"
+
+    components = Go2RobotAssembly.build_default_perception_pipeline(SimpleNamespace(config=config))
+    backend = components["segmentation_backend"]
+
+    assert backend.spec.name == "detection_attributes_segmentation"
+    assert backend.spec.backend_kind == "detection_attributes"
+    assert backend.spec.metadata["configured_enabled"] is True
+    assert backend.spec.metadata["configured_backend_name"] == "detection_attributes_segmentation"
+    assert backend.spec.metadata["configured_backend_kind"] == "detection_attributes"
+    assert backend.spec.metadata["source"] == "detection_attributes"
+    assert backend.spec.metadata["provider_kind"] == "passthrough"
+    assert backend.spec.metadata["provider_name"] == "detection_attributes"
+    assert backend.spec.metadata["fallback_reason"] == "reuse_detector_segmentation_attributes"
+    assert backend.spec.metadata["capabilities"]["segment"] is True
+
+
+def test_go2_perception_pipeline_disables_unsupported_segmentation_route(tmp_path: Path) -> None:
+    """Go2 感知装配遇到未知路线时应显式 disabled 并暴露 unsupported 原因。"""
+
+    config = _build_test_config(tmp_path)
+    config.perception.yolo.enabled = False
+    config.perception.openai_vision.enabled = False
+    config.perception.default_segmentation_backend = "unknown_segmenter"
+    config.perception.segmentation.enabled = True
+    config.perception.segmentation.backend_name = ""
+    config.perception.segmentation.backend_kind = "unknown_kind"
+    config.perception.segmentation.route = "experimental_route"
+
+    components = Go2RobotAssembly.build_default_perception_pipeline(SimpleNamespace(config=config))
+    backend = components["segmentation_backend"]
+
+    assert backend.spec.name == "segmentation_disabled"
+    assert backend.spec.backend_kind == "disabled_segmentation"
+    assert backend.spec.metadata["configured_enabled"] is True
+    assert backend.spec.metadata["configured_backend_name"] == "unknown_segmenter"
+    assert backend.spec.metadata["configured_backend_kind"] == "unknown_kind"
+    assert backend.spec.metadata["provider_kind"] == "unsupported"
+    assert backend.spec.metadata["reason"] == "unsupported_segmentation_route"
 def _wait_for_task(client: TestClient, task_id: str) -> dict:
     deadline = time.time() + 2.0
     while time.time() < deadline:
@@ -568,6 +800,17 @@ def _wait_for_task(client: TestClient, task_id: str) -> dict:
             return payload
         time.sleep(0.02)
     raise AssertionError(f"任务 {task_id} 未在超时时间内结束。")
+
+
+def _runtime_events(runtime, event_type: str) -> list:
+    return [event for event in runtime.event_bus.replay(after_cursor=0) if event.event_type == event_type]
+
+
+def _event_by_task(runtime, event_type: str, task_id: str):
+    for event in runtime.event_bus.replay(after_cursor=0):
+        if event.event_type == event_type and event.task_id == task_id:
+            return event
+    raise AssertionError(f"未找到任务事件 {event_type} task_id={task_id}。")
 
 
 def _wait_for_condition(predicate, *, timeout_sec: float = 1.0) -> None:
@@ -657,6 +900,197 @@ def _delete_memory_library(
     return response.json()
 
 
+def test_gateway_request_id_contract_and_error_payload(tmp_path: Path, caplog) -> None:
+    """HTTP 网关应稳定返回 request_id 并在错误 payload 中暴露错误分类。"""
+
+    app, _, _, _ = _build_host_app(tmp_path)
+
+    @app.get("/_test_unhandled_error")
+    async def _test_unhandled_error():
+        raise RuntimeError("boom")
+
+    with TestClient(app) as client:
+        generated = client.get("/api/health", headers=_agent_headers())
+        assert generated.status_code == 200
+        generated_request_id = generated.headers["X-Request-ID"]
+        assert len(generated_request_id) == 32
+        assert generated_request_id == generated_request_id.lower()
+
+        reusable_headers = {**_agent_headers(), "X-Request-ID": "req-4.5_valid:001"}
+        reused = client.get("/api/health", headers=reusable_headers)
+        assert reused.status_code == 200
+        assert reused.headers["X-Request-ID"] == "req-4.5_valid:001"
+
+        caplog.clear()
+        invalid_headers = {**_agent_headers(), "X-Request-ID": "bad request id"}
+        with caplog.at_level(logging.INFO, logger="nuwax_robot_bridge.http"):
+            replaced = client.get("/api/security/policy", headers=invalid_headers)
+        assert replaced.status_code == 200
+        assert replaced.headers["X-Request-ID"] != "bad request id"
+        replaced_records = [record for record in caplog.records if getattr(record, "event", "") == "http.request.completed"]
+        assert any(getattr(record, "request_id_replaced", False) is True for record in replaced_records)
+        assert any(getattr(record, "request_id_invalid_reason", "") == "invalid_char" for record in replaced_records)
+
+        forbidden = client.post(
+            "/api/capabilities/switch_control_mode/invoke",
+            headers=reusable_headers,
+            json={"arguments": {"mode": "low"}},
+        )
+        assert forbidden.status_code == 403
+        assert forbidden.headers["X-Request-ID"] == "req-4.5_valid:001"
+        assert forbidden.json()["error"]["request_id"] == "req-4.5_valid:001"
+        assert forbidden.json()["error"]["error_category"] == "authorization"
+
+        unhandled_headers = {**_agent_headers(), "X-Request-ID": "req-unhandled-4.5"}
+        unhandled = client.get("/_test_unhandled_error", headers=unhandled_headers)
+        assert unhandled.status_code == 500
+        assert unhandled.headers["X-Request-ID"] == "req-unhandled-4.5"
+        assert unhandled.json()["error"]["request_id"] == "req-unhandled-4.5"
+        assert unhandled.json()["error"]["error_category"] == "internal"
+
+
+def test_gateway_capability_invocation_and_async_task_observability(tmp_path: Path) -> None:
+    """能力调用和异步任务应通过 request_id、task_id 与 capability_name 串联。"""
+
+    app, runtime, _, _ = _build_host_app(tmp_path)
+    request_id = "req-capability-4.5"
+    headers = {**_agent_headers(), "X-Request-ID": request_id, "X-Forwarded-For": "10.4.5.6, 127.0.0.1"}
+    with TestClient(app) as client:
+        status_response = client.post(
+            "/api/capabilities/get_robot_status/invoke",
+            headers=headers,
+            json={"arguments": {}},
+        )
+        assert status_response.status_code == 200
+        status_payload = status_response.json()
+        assert status_payload["request_id"] == request_id
+        assert status_payload["capability_name"] == "get_robot_status"
+        assert status_payload["mode"] == "sync"
+
+        completed_events = [
+            event
+            for event in _runtime_events(runtime, "capability.invocation.completed")
+            if event.subject_id == "get_robot_status" and event.metadata.get("request_id") == request_id
+        ]
+        assert completed_events
+        completed_metadata = completed_events[-1].metadata
+        assert completed_metadata["capability_name"] == "get_robot_status"
+        assert completed_metadata["requested_by"] == "agent"
+        assert completed_metadata["method"] == "POST"
+        assert completed_metadata["path"] == "/api/capabilities/get_robot_status/invoke"
+        assert completed_metadata["client_ip"] == "10.4.5.6"
+        assert completed_metadata["duration_ms"] >= 0.0
+
+        _create_map(client, map_name="观测任务地图")
+        _activate_map(client, map_name="观测任务地图")
+        task_response = client.post(
+            "/api/capabilities/navigate_to_pose/invoke",
+            headers=headers,
+            json={"arguments": {"frame_id": "map", "x": 0.4, "y": 0.2, "timeout_sec": 1.0}},
+        )
+        assert task_response.status_code == 200
+        task_payload = task_response.json()
+        task_id = task_payload["task_id"]
+        assert task_payload["request_id"] == request_id
+        assert task_payload["capability_name"] == "navigate_to_pose"
+        assert task_payload["mode"] == "async_task"
+        assert task_payload["task"]["metadata"]["request_id"] == request_id
+        assert task_payload["task"]["metadata"]["task_id"] == task_id
+        assert task_payload["task"]["metadata"]["capability_name"] == "navigate_to_pose"
+        assert task_payload["task"]["metadata"]["request_context"]["request_id"] == request_id
+        assert task_payload["task"]["metadata"]["request_context"]["path"] == "/api/capabilities/navigate_to_pose/invoke"
+
+        final_task = _wait_for_task(client, task_id)
+        accepted_event = next(event for event in final_task["events"] if event["event_type"] == "task.accepted")
+        assert accepted_event["payload"]["request_id"] == request_id
+        assert accepted_event["payload"]["task_id"] == task_id
+        assert accepted_event["payload"]["capability_name"] == "navigate_to_pose"
+        assert accepted_event["payload"]["request_context"]["client_ip"] == "10.4.5.6"
+        succeeded_runtime_event = _event_by_task(runtime, "task.succeeded", task_id)
+        assert succeeded_runtime_event.metadata["request_id"] == request_id
+        assert succeeded_runtime_event.metadata["task_id"] == task_id
+        assert succeeded_runtime_event.metadata["capability_name"] == "navigate_to_pose"
+
+
+def test_relay_request_id_propagates_and_records_upstream_observation(tmp_path: Path, caplog) -> None:
+    """Relay 应向 upstream 透传规范 request_id 并记录 upstream 观测字段。"""
+
+    relay_config = _build_test_config(tmp_path).relay
+    upstream_requests: List[httpx.Request] = []
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
+        return httpx.Response(
+            201,
+            json={"request_id": request.headers.get("X-Request-ID")},
+            headers={"X-Request-ID": "upstream-should-not-leak", "X-Upstream-Trace": "trace-4.5"},
+        )
+
+    app = create_relay_app(relay_config, transport=httpx.MockTransport(upstream_handler))
+    headers = {**_relay_headers(), "X-Request-ID": "relay-req-4.5", "X-Forwarded-For": "10.45.0.9, 127.0.0.1"}
+
+    with TestClient(app) as client:
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="nuwax_robot_bridge.relay"):
+            response = client.post(
+                "/api/capabilities/get_robot_status/invoke",
+                headers=headers,
+                json={"arguments": {}},
+            )
+
+    assert response.status_code == 201
+    assert response.headers["X-Request-ID"] == "relay-req-4.5"
+    assert response.headers["X-Upstream-Trace"] == "trace-4.5"
+    assert response.json()["request_id"] == "relay-req-4.5"
+    assert upstream_requests
+    upstream_request = upstream_requests[-1]
+    assert str(upstream_request.url) == "http://upstream.test/api/capabilities/get_robot_status/invoke"
+    assert upstream_request.headers["X-Request-ID"] == "relay-req-4.5"
+    assert upstream_request.headers["Authorization"] == "Bearer agent-token"
+
+    completed_records = [record for record in caplog.records if getattr(record, "event", "") == "relay.request.completed"]
+    assert completed_records
+    completed_record = completed_records[-1]
+    assert completed_record.request_id == "relay-req-4.5"
+    assert completed_record.client_ip == "10.45.0.9"
+    assert completed_record.status_code == 201
+    assert completed_record.error_category == "-"
+    assert completed_record.upstream_status_code == 201
+    assert completed_record.upstream_duration_ms >= 0.0
+
+
+def test_relay_marks_upstream_5xx_observation(tmp_path: Path, caplog) -> None:
+    """Relay 应把 upstream 5xx 归类为 upstream 错误并保留本地 request_id。"""
+
+    relay_config = _build_test_config(tmp_path).relay
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={"error": "upstream unavailable"},
+            headers={"X-Request-ID": "upstream-error-id"},
+        )
+
+    app = create_relay_app(relay_config, transport=httpx.MockTransport(upstream_handler))
+    headers = {**_relay_headers(), "X-Request-ID": "relay-upstream-5xx"}
+
+    with TestClient(app) as client:
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="nuwax_robot_bridge.relay"):
+            response = client.get("/api/state/latest", headers=headers)
+
+    assert response.status_code == 503
+    assert response.headers["X-Request-ID"] == "relay-upstream-5xx"
+    completed_records = [record for record in caplog.records if getattr(record, "event", "") == "relay.request.completed"]
+    assert completed_records
+    completed_record = completed_records[-1]
+    assert completed_record.request_id == "relay-upstream-5xx"
+    assert completed_record.status_code == 503
+    assert completed_record.error_category == "upstream"
+    assert completed_record.upstream_status_code == 503
+    assert completed_record.upstream_duration_ms >= 0.0
+
+
 def test_gateway_mcp_http_and_auth_behaviour(tmp_path: Path) -> None:
     """宿主机网关应同时支持 MCP、HTTP 和角色鉴权。"""
 
@@ -684,35 +1118,43 @@ def test_gateway_mcp_http_and_auth_behaviour(tmp_path: Path) -> None:
             headers=_admin_headers(),
             json={"jsonrpc": "2.0", "id": "admin_tools", "method": "tools/list"},
         )
-        tool_names = {item["name"] for item in tools.json()["result"]["tools"]}
-        admin_tool_names = {item["name"] for item in admin_tools.json()["result"]["tools"]}
-        assert "capture_image" not in tool_names
-        assert "get_latest_observation" in tool_names
-        assert "perceive_current_scene" in tool_names
-        assert "describe_current_scene" in tool_names
-        assert "get_latest_perception" in tool_names
-        assert "start_perception_runtime" in tool_names
-        assert "stop_perception_runtime" in tool_names
-        assert "get_joint_state" not in tool_names
-        assert "get_imu_state" not in tool_names
-        assert "get_localization_snapshot" not in tool_names
-        assert "get_map_snapshot" not in tool_names
-        assert "get_navigation_snapshot" not in tool_names
-        assert "navigate_to_pose" in tool_names
-        assert "navigate_to_named_location" in tool_names
-        assert "find_target" in tool_names
-        assert "explore_area" in tool_names
-        assert "explore_and_find_target" in tool_names
-        assert "relative_move" in tool_names
-        assert "get_task_status" in tool_names
+        tool_items = tools.json()["result"]["tools"]
+        admin_tool_items = admin_tools.json()["result"]["tools"]
+        tool_names = {item["name"] for item in tool_items}
+        admin_tool_names = {item["name"] for item in admin_tool_items}
+        assert tool_names == {"platform", "device"}
+        assert admin_tool_names == {"platform", "device"}
+        platform_tool = next(item for item in tool_items if item["name"] == "platform")
+        device_tool = next(item for item in tool_items if item["name"] == "device")
+        platform_functions = set(platform_tool["inputSchema"]["properties"]["function"]["enum"])
+        device_functions = set(device_tool["inputSchema"]["properties"]["function"]["enum"])
+        assert "get_latest_observation" in platform_functions
+        assert "perceive_current_scene" in platform_functions
+        assert "navigate_to_pose" in platform_functions
+        assert "explore_area" in platform_functions
+        assert "relative_move" in platform_functions
+        assert "get_task_status" in platform_functions
+        assert "capture_image" not in platform_functions
+        assert "get_joint_state" in device_functions
+        assert "get_imu_state" in device_functions
+        assert "get_map_snapshot" in device_functions
+        assert "switch_control_mode" in device_functions
+        assert "get_robot_status" not in tool_names
         assert "switch_control_mode" not in tool_names
-        assert "capture_image" in admin_tool_names
-        assert "get_joint_state" in admin_tool_names
-        assert "get_imu_state" in admin_tool_names
-        assert "get_localization_snapshot" in admin_tool_names
-        assert "get_map_snapshot" in admin_tool_names
-        assert "get_navigation_snapshot" in admin_tool_names
-        assert "switch_control_mode" in admin_tool_names
+        assert platform_tool["inputSchema"]["x-nuwax-function-catalog"]["get_robot_status"]["input_schema"]["type"] == "object"
+        assert device_tool["inputSchema"]["x-nuwax-function-catalog"]["switch_control_mode"]["input_schema"]["type"] == "object"
+        legacy_direct_call = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "legacy_direct_call",
+                "method": "tools/call",
+                "params": {"name": "get_robot_status", "arguments": {}},
+            },
+        )
+        assert legacy_direct_call.status_code == 200
+        assert legacy_direct_call.json()["error"]["code"] == -32602
 
         forbidden = client.post(
             "/api/capabilities/switch_control_mode/invoke",
@@ -720,6 +1162,20 @@ def test_gateway_mcp_http_and_auth_behaviour(tmp_path: Path) -> None:
             json={"arguments": {"mode": "low"}},
         )
         assert forbidden.status_code == 403
+
+        agent_device_ok = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "agent_device_switch",
+                "method": "tools/call",
+                "params": _mcp_tool_call("device", "switch_control_mode", {"mode": "low"}),
+            },
+        )
+        assert agent_device_ok.status_code == 200
+        assert agent_device_ok.json()["result"]["structuredContent"]["result"]["mode"] == "low"
+        assert robot.current_mode == "low"
 
         admin_ok = client.post(
             "/api/capabilities/switch_control_mode/invoke",
@@ -1098,6 +1554,12 @@ def test_gateway_navigation_task_reports_arrival_verification_failure(tmp_path: 
 
         assert task_payload["status"]["state"] == "failed"
         assert task_payload["error_payload"]["code"] == "arrival_verification_failed"
+        details = task_payload["error_payload"]["details"]
+        assert details["target_name"] == "严格复核点"
+        arrival = details["arrival_verification"]
+        assert arrival["verified"] is False
+        assert arrival["reason"] == "测试强制到点复核失败。"
+        assert arrival["metadata"]["source"] == "integration_test"
 
 
 def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(tmp_path: Path) -> None:
@@ -1115,7 +1577,7 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
                 "jsonrpc": "2.0",
                 "id": "map_snapshot",
                 "method": "tools/call",
-                "params": {"name": "get_map_snapshot", "arguments": {}},
+                "params": _mcp_tool_call("device", "get_map_snapshot"),
             },
         )
         assert get_map_snapshot.status_code == 200
@@ -1129,7 +1591,7 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
                 "jsonrpc": "2.0",
                 "id": "navigation_snapshot",
                 "method": "tools/call",
-                "params": {"name": "get_navigation_snapshot", "arguments": {}},
+                "params": _mcp_tool_call("device", "get_navigation_snapshot"),
             },
         )
         assert get_navigation_snapshot.status_code == 200
@@ -1144,16 +1606,17 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
                 "jsonrpc": "2.0",
                 "id": "navigate_pose",
                 "method": "tools/call",
-                "params": {
-                    "name": "navigate_to_pose",
-                    "arguments": {
+                "params": _mcp_tool_call(
+                    "platform",
+                    "navigate_to_pose",
+                    {
                         "frame_id": "map",
                         "x": 1.0,
                         "y": 1.0,
                         "yaw_rad": 0.0,
                         "timeout_sec": 1.0,
                     },
-                },
+                ),
             },
         )
         assert navigate_to_pose.status_code == 200
@@ -1170,16 +1633,17 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
                 "jsonrpc": "2.0",
                 "id": "explore_area",
                 "method": "tools/call",
-                "params": {
-                    "name": "explore_area",
-                    "arguments": {
+                "params": _mcp_tool_call(
+                    "platform",
+                    "explore_area",
+                    {
                         "map_name": "MCP测试地图",
                         "target_name": "meeting_point",
                         "strategy": "frontier",
                         "radius_m": 1.5,
                         "timeout_sec": 1.0,
                     },
-                },
+                ),
             },
         )
         assert explore_area.status_code == 200
@@ -1195,7 +1659,7 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
                 "jsonrpc": "2.0",
                 "id": "navigation_snapshot_after",
                 "method": "tools/call",
-                "params": {"name": "get_navigation_snapshot", "arguments": {}},
+                "params": _mcp_tool_call("device", "get_navigation_snapshot"),
             },
         )
         assert latest_navigation.status_code == 200
@@ -1217,15 +1681,16 @@ def test_gateway_explore_area_can_start_without_target_or_coordinates(tmp_path: 
                 "jsonrpc": "2.0",
                 "id": "explore_area_without_target",
                 "method": "tools/call",
-                "params": {
-                    "name": "explore_area",
-                    "arguments": {
+                "params": _mcp_tool_call(
+                    "platform",
+                    "explore_area",
+                    {
                         "map_name": "未知环境测试地图",
                         "strategy": "frontier",
                         "radius_m": 1.5,
                         "timeout_sec": 1.0,
                     },
-                },
+                ),
             },
         )
         assert explore_area.status_code == 200
@@ -1259,8 +1724,342 @@ def test_gateway_find_target_can_complete_from_current_scene(tmp_path: Path) -> 
         assert robot.data_plane.mapping_runtime_calls[-1] == "find_target"
 
 
+
+
+def test_gateway_find_target_navigates_to_memory_candidate_and_verifies_arrival(tmp_path: Path) -> None:
+    """正式找目标入口应支持候选导航并在到点后完成复核。"""
+
+    app, runtime, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="候选导航测试地图")
+        _activate_map(client, map_name="候选导航测试地图")
+
+        candidate = MemoryNavigationCandidate(
+            record_kind=MemoryRecordKind.OBJECT_INSTANCE,
+            record_id="mem_person_20260410T000002Z_deadbeef",
+            target_pose=Pose(frame_id="map", position=Vector3(x=1.6, y=0.2, z=0.0)),
+            target_name="疑似人员目标",
+            verification_query="person",
+            metadata={
+                "source": "integration_test_candidate_navigation",
+                "candidate_score": 0.86,
+                "projection_method": "pointcloud_mask_projection",
+                "projection_confidence": 0.86,
+                "support_point_count": 4,
+                "has_structured_segmentation": True,
+                "segmentation_score": 0.91,
+                "predicted_iou": 0.84,
+                "segmentation_quality_score": 0.84,
+                "stability_score": 0.89,
+                "coverage": 0.92,
+                "map_projection_coverage": 0.88,
+                "depth_coverage": 0.9,
+                "reprojection_error": 0.3,
+                "segmentation_support_point_count": 4,
+                "segmentation_quality": "high",
+                "segmentation_review_required": False,
+                "segmentation_risk_factors": [],
+                "segmentation_quality_reason": "",
+                "segmentation_occlusion_flags": [],
+                "segmentation_truncation_flags": [],
+                "projection_degradation_reason": "",
+                "geometry_projection_status": "mask_depth_support",
+                "segmentation_projection_status": "mask_depth_support",
+                "navigable": True,
+                "non_navigable_reason": "",
+                "navigation_quality": _navigation_quality_contract(
+                    level="direct_navigation",
+                    recommended_action="navigate",
+                    confidence=0.86,
+                ),
+            },
+        )
+        original_verify_arrival = runtime.memory_service.verify_arrival
+        original_resolve_navigation_candidates = runtime.memory_service.resolve_navigation_candidates
+        verify_state = {"scene_checks": 0, "candidate_checks": 0}
+
+        def fake_verify_arrival(query: str, *args, navigation_candidate=None, **kwargs):
+            del args, kwargs
+            if navigation_candidate is None:
+                verify_state["scene_checks"] += 1
+                return MemoryArrivalVerification(
+                    query=query,
+                    verified=False,
+                    score=0.08,
+                    matched_labels=[],
+                    matched_memory_id=None,
+                    reason="当前场景尚未命中目标。",
+                    metadata={
+                        "source": "integration_test_candidate_navigation",
+                        "scene_checks": verify_state["scene_checks"],
+                    },
+                )
+            verify_state["candidate_checks"] += 1
+            return MemoryArrivalVerification(
+                query=query,
+                verified=True,
+                score=0.97,
+                matched_labels=["person"],
+                matched_memory_id=navigation_candidate.record_id,
+                reason="候选位置复核通过。",
+                metadata={
+                    "source": "integration_test_candidate_navigation",
+                    "candidate_checks": verify_state["candidate_checks"],
+                    "candidate_record_id": navigation_candidate.record_id,
+                },
+            )
+
+        runtime.memory_service.verify_arrival = fake_verify_arrival
+        runtime.memory_service.resolve_navigation_candidates = lambda *args, **kwargs: (candidate,)
+        try:
+            find_target = client.post(
+                "/api/capabilities/find_target/invoke",
+                headers=_agent_headers(),
+                json={"arguments": {"query": "person", "timeout_sec": 1.0}},
+            )
+            assert find_target.status_code == 200
+            task_payload = _wait_for_task(client, find_target.json()["task"]["task_id"])
+        finally:
+            runtime.memory_service.verify_arrival = original_verify_arrival
+            runtime.memory_service.resolve_navigation_candidates = original_resolve_navigation_candidates
+
+        assert task_payload["status"]["state"] == "succeeded"
+        assert task_payload["result"]["found_mode"] == "memory_candidate_navigation"
+        arrival = task_payload["result"]["arrival_verification"]
+        assert arrival["verified"] is True
+        assert arrival["matched_memory_id"] == candidate.record_id
+        assert arrival["metadata"]["candidate_record_id"] == candidate.record_id
+        assert arrival["metadata"]["candidate_checks"] == 1
+        assert task_payload["result"]["navigation_candidate"]["record_id"] == candidate.record_id
+        assert task_payload["result"]["attempted_candidate_ids"] == [candidate.record_id]
+        diagnostic = task_payload["result"]["candidate_diagnostics"][0]
+        assert diagnostic["record_id"] == candidate.record_id
+        assert diagnostic["allowed_for_navigation"] is True
+        assert diagnostic["navigation_attempted"] is True
+        assert diagnostic["navigation_quality"]["schema_version"] == "4.4-v1"
+        assert diagnostic["navigation_quality_level"] == "direct_navigation"
+        assert diagnostic["recommended_action"] == "navigate"
+        assert diagnostic["candidate_score"] == 0.86
+        assert diagnostic["projection_confidence"] == 0.86
+        assert diagnostic["support_point_count"] == 4
+        assert diagnostic["has_structured_segmentation"] is True
+        assert diagnostic["segmentation_score"] == 0.91
+        assert diagnostic["predicted_iou"] == 0.84
+        assert diagnostic["segmentation_quality"] == "high"
+        assert diagnostic["segmentation_review_required"] is False
+        assert diagnostic["segmentation_risk_factors"] == []
+        assert diagnostic["geometry_projection_status"] == "mask_depth_support"
+        assert diagnostic["segmentation_projection_status"] == "mask_depth_support"
+        assert task_payload["result"]["navigation_context"]["goal_reached"] is True
+        assert robot.navigation_goal_count == 1
+        assert robot.data_plane.mapping_runtime_calls[-1] == "find_target"
+
+
+def test_gateway_find_target_rejects_segmentation_review_candidate(tmp_path: Path) -> None:
+    """正式找目标入口应拒绝需要人工复核的分割候选。"""
+
+    app, runtime, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="候选分割拒绝测试地图")
+        _activate_map(client, map_name="候选分割拒绝测试地图")
+
+        candidate = MemoryNavigationCandidate(
+            record_kind=MemoryRecordKind.OBJECT_INSTANCE,
+            record_id="mem_person_20260410T000003Z_aabbccdd",
+            target_pose=Pose(frame_id="map", position=Vector3(x=1.4, y=0.4, z=0.0)),
+            target_name="低质量人员目标",
+            verification_query="person",
+            metadata={
+                "source": "integration_test_low_segmentation_candidate",
+                "candidate_score": 0.72,
+                "projection_method": "pointcloud_mask_projection",
+                "support_point_count": 2,
+                "has_structured_segmentation": "false",
+                "segmentation_score": 0.83,
+                "predicted_iou": 0.2,
+                "segmentation_quality_score": 0.2,
+                "stability_score": 0.85,
+                "coverage": 0.18,
+                "map_projection_coverage": 0.19,
+                "depth_coverage": 0.2,
+                "reprojection_error": 3.1,
+                "segmentation_support_point_count": 2,
+                "segmentation_quality": "low",
+                "segmentation_review_required": True,
+                "segmentation_risk_factors": "predicted_iou_below_threshold",
+                "segmentation_quality_reason": "predicted_iou_below_threshold",
+                "segmentation_occlusion_flags": "partial",
+                "segmentation_truncation_flags": ["right_edge"],
+                "projection_degradation_reason": "mask_no_depth_support_bbox_fallback",
+                "geometry_projection_status": "mask_no_depth_support_bbox_fallback",
+                "segmentation_projection_status": "mask_no_depth_support_bbox_fallback",
+                "navigable": False,
+                "non_navigable_reason": "segmentation_review_required",
+                "navigation_quality": _navigation_quality_contract(
+                    level="needs_review",
+                    recommended_action="verify_then_navigate",
+                    primary_reason_code="segmentation_review_required",
+                    reason_codes=["segmentation_review_required"],
+                    confidence=0.72,
+                ),
+            },
+        )
+        original_verify_arrival = runtime.memory_service.verify_arrival
+        original_resolve_navigation_candidates = runtime.memory_service.resolve_navigation_candidates
+
+        def fake_verify_arrival(query: str, *args, **kwargs):
+            del args, kwargs
+            return MemoryArrivalVerification(
+                query=query,
+                verified=False,
+                score=0.05,
+                matched_labels=[],
+                matched_memory_id=None,
+                reason="当前场景尚未命中目标。",
+                metadata={"source": "integration_test_low_segmentation_candidate"},
+            )
+
+        runtime.memory_service.verify_arrival = fake_verify_arrival
+        runtime.memory_service.resolve_navigation_candidates = lambda *args, **kwargs: (candidate,)
+        try:
+            find_target = client.post(
+                "/api/capabilities/find_target/invoke",
+                headers=_agent_headers(),
+                json={"arguments": {"query": "person", "timeout_sec": 1.0}},
+            )
+            assert find_target.status_code == 200
+            task_payload = _wait_for_task(client, find_target.json()["task"]["task_id"])
+        finally:
+            runtime.memory_service.verify_arrival = original_verify_arrival
+            runtime.memory_service.resolve_navigation_candidates = original_resolve_navigation_candidates
+
+        assert task_payload["status"]["state"] == "failed"
+        assert task_payload["error_payload"]["code"] == "target_not_found_in_memory"
+        details = task_payload["error_payload"]["details"]
+        assert details["rejected_candidate_ids"] == [candidate.record_id]
+        diagnostic = details["candidate_diagnostics"][0]
+        assert diagnostic["record_id"] == candidate.record_id
+        assert diagnostic["allowed_for_navigation"] is False
+        assert diagnostic["rejection_reason"] == "segmentation_review_required"
+        assert diagnostic["navigation_quality"]["primary_reason_code"] == "segmentation_review_required"
+        assert diagnostic["navigation_quality"]["reason_codes"] == ["segmentation_review_required"]
+        assert diagnostic["navigation_quality_level"] == "needs_review"
+        assert diagnostic["recommended_action"] == "verify_then_navigate"
+        assert diagnostic["navigation_attempted"] is False
+        assert diagnostic["has_structured_segmentation"] is False
+        assert diagnostic["segmentation_review_required"] is True
+        assert diagnostic["segmentation_risk_factors"] == ["predicted_iou_below_threshold"]
+        assert diagnostic["segmentation_occlusion_flags"] == ["partial"]
+        assert diagnostic["segmentation_truncation_flags"] == ["right_edge"]
+        assert diagnostic["coverage"] == 0.18
+        assert diagnostic["map_projection_coverage"] == 0.19
+        assert diagnostic["depth_coverage"] == 0.2
+        assert diagnostic["reprojection_error"] == 3.1
+        assert diagnostic["projection_degradation_reason"] == "mask_no_depth_support_bbox_fallback"
+        assert robot.navigation_goal_count == 0
+
+
+def test_gateway_find_target_routes_explore_more_and_reject_candidates(tmp_path: Path) -> None:
+    """正式找目标入口应透出继续探索和拒绝候选的质量路由。"""
+
+    app, runtime, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="候选质量路由测试地图")
+        _activate_map(client, map_name="候选质量路由测试地图")
+
+        explore_candidate = MemoryNavigationCandidate(
+            record_kind=MemoryRecordKind.OBJECT_INSTANCE,
+            record_id="mem_person_20260410T000004Z_a1b2c3d4",
+            target_pose=Pose(frame_id="map", position=Vector3(x=1.4, y=0.4, z=0.0)),
+            target_name="证据不足人员目标",
+            verification_query="person",
+            metadata={
+                "source": "integration_test_explore_more_candidate",
+                "candidate_score": 0.2,
+                "navigable": False,
+                "non_navigable_reason": "candidate_score_low",
+                "navigation_quality": _navigation_quality_contract(
+                    level="continue_exploration",
+                    recommended_action="explore_more",
+                    primary_reason_code="candidate_score_low",
+                    reason_codes=["candidate_score_low", "evidence_insufficient"],
+                    confidence=0.35,
+                ),
+            },
+        )
+        reject_candidate = MemoryNavigationCandidate(
+            record_kind=MemoryRecordKind.OBJECT_INSTANCE,
+            record_id="mem_person_20260410T000005Z_d4c3b2a1",
+            target_pose=Pose(frame_id="map", position=Vector3(x=1.6, y=0.6, z=0.0)),
+            target_name="不可导航人员目标",
+            verification_query="person",
+            metadata={
+                "source": "integration_test_reject_candidate",
+                "candidate_score": 0.82,
+                "projection_method": "pointcloud_mask_projection",
+                "support_point_count": 0,
+                "navigable": False,
+                "non_navigable_reason": "projection_geometry_missing",
+                "navigation_quality": _navigation_quality_contract(
+                    level="not_navigable",
+                    recommended_action="reject",
+                    primary_reason_code="projection_geometry_missing",
+                    reason_codes=["projection_geometry_missing"],
+                    confidence=0.82,
+                ),
+            },
+        )
+        original_verify_arrival = runtime.memory_service.verify_arrival
+        original_resolve_navigation_candidates = runtime.memory_service.resolve_navigation_candidates
+
+        def fake_verify_arrival(query: str, *args, **kwargs):
+            del args, kwargs
+            return MemoryArrivalVerification(
+                query=query,
+                verified=False,
+                score=0.04,
+                matched_labels=[],
+                matched_memory_id=None,
+                reason="当前场景尚未命中目标。",
+                metadata={"source": "integration_test_navigation_quality_routing"},
+            )
+
+        runtime.memory_service.verify_arrival = fake_verify_arrival
+        runtime.memory_service.resolve_navigation_candidates = lambda *args, **kwargs: (explore_candidate, reject_candidate)
+        try:
+            find_target = client.post(
+                "/api/capabilities/find_target/invoke",
+                headers=_agent_headers(),
+                json={"arguments": {"query": "person", "timeout_sec": 1.0}},
+            )
+            assert find_target.status_code == 200
+            task_payload = _wait_for_task(client, find_target.json()["task"]["task_id"])
+        finally:
+            runtime.memory_service.verify_arrival = original_verify_arrival
+            runtime.memory_service.resolve_navigation_candidates = original_resolve_navigation_candidates
+
+        assert task_payload["status"]["state"] == "failed"
+        assert task_payload["error_payload"]["code"] == "target_not_found_in_memory"
+        details = task_payload["error_payload"]["details"]
+        assert details["rejected_candidate_ids"] == [explore_candidate.record_id, reject_candidate.record_id]
+        diagnostics = {item["record_id"]: item for item in details["candidate_diagnostics"]}
+        explore_diagnostic = diagnostics[explore_candidate.record_id]
+        assert explore_diagnostic["allowed_for_navigation"] is False
+        assert explore_diagnostic["rejection_reason"] == "candidate_score_low"
+        assert explore_diagnostic["navigation_quality_level"] == "continue_exploration"
+        assert explore_diagnostic["recommended_action"] == "explore_more"
+        assert explore_diagnostic["navigation_attempted"] is False
+        reject_diagnostic = diagnostics[reject_candidate.record_id]
+        assert reject_diagnostic["allowed_for_navigation"] is False
+        assert reject_diagnostic["rejection_reason"] == "projection_geometry_missing"
+        assert reject_diagnostic["navigation_quality_level"] == "not_navigable"
+        assert reject_diagnostic["recommended_action"] == "reject"
+        assert reject_diagnostic["navigation_attempted"] is False
+        assert robot.navigation_goal_count == 0
+
+
 def test_gateway_explore_and_find_target_stops_exploration_and_saves_map_version(tmp_path: Path) -> None:
-    """探索并找目标在命中后应停止探索，并自动收口平台地图版本。"""
+    """探索并找目标应在当前场景命中后停止探索并保存地图版本。"""
 
     app, runtime, robot, _ = _build_host_app(tmp_path)
     with TestClient(app) as client:
@@ -1321,7 +2120,27 @@ def test_gateway_explore_and_find_target_rejects_false_candidate_and_resumes_exp
             target_pose=Pose(frame_id="map", position=Vector3(x=1.2, y=0.3, z=0.0)),
             target_name="疑似人员目标",
             verification_query="person",
-            metadata={"source": "integration_test_false_candidate"},
+            metadata={
+                "source": "integration_test_false_candidate",
+                "projection_method": "pointcloud_mask_projection",
+                "support_point_count": 3,
+                "has_structured_segmentation": True,
+                "segmentation_score": 0.88,
+                "predicted_iou": 0.82,
+                "segmentation_quality_score": 0.82,
+                "stability_score": 0.86,
+                "coverage": 0.9,
+                "map_projection_coverage": 0.9,
+                "depth_coverage": 0.9,
+                "reprojection_error": 0.2,
+                "segmentation_support_point_count": 3,
+                "segmentation_review_required": False,
+                "segmentation_risk_factors": [],
+                "segmentation_occlusion_flags": [],
+                "segmentation_truncation_flags": [],
+                "geometry_projection_status": "mask_depth_support",
+                "segmentation_projection_status": "mask_depth_support",
+            },
         )
         original_verify_arrival = runtime.memory_service.verify_arrival
         original_resolve_navigation_candidates = runtime.memory_service.resolve_navigation_candidates
@@ -1384,6 +2203,8 @@ def test_gateway_explore_and_find_target_rejects_false_candidate_and_resumes_exp
         assert task_payload["status"]["state"] == "succeeded"
         assert task_payload["result"]["found_mode"] == "current_scene"
         assert candidate.record_id in task_payload["result"]["rejected_candidate_ids"]
+        assert task_payload["result"]["arrival_verification"]["metadata"]["scene_checks"] >= 3
+        assert verify_state["candidate_checks"] == 1
         assert task_payload["result"]["exploration_context"]["exploration_state"]["current_request_id"].endswith("_resume_1")
         assert task_payload["result"]["exploration_stop_context"]["exploration_state"]["status"] == "cancelled"
         assert task_payload["result"]["saved_map_version"]["version_id"]
@@ -1752,7 +2573,7 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "list_capabilities",
                 "method": "tools/call",
-                "params": {"name": "list_capabilities", "arguments": {}},
+                "params": _mcp_tool_call("platform", "list_capabilities"),
             },
         )
         assert list_capabilities.status_code == 200
@@ -1801,25 +2622,28 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         admin_tool_items = admin_tools.json()["result"]["tools"]
         tool_names = {item["name"] for item in tool_items}
         admin_tool_names = {item["name"] for item in admin_tool_items}
-        assert "speak_text" in tool_names
-        assert "follow_target" in tool_names
-        assert "inspect_target" in tool_names
+        assert tool_names == {"platform", "device"}
+        assert admin_tool_names == {"platform", "device"}
+        platform_tool = next(item for item in tool_items if item["name"] == "platform")
+        device_tool = next(item for item in tool_items if item["name"] == "device")
+        platform_functions = set(platform_tool["inputSchema"]["properties"]["function"]["enum"])
+        device_functions = set(device_tool["inputSchema"]["properties"]["function"]["enum"])
+        assert "speak_text" in platform_functions
+        assert "follow_target" in platform_functions
+        assert "inspect_target" in platform_functions
+        assert "execute_sport_command" not in platform_functions
+        assert "execute_sport_command" in device_functions
+        assert "set_obstacle_avoidance" in device_functions
+        assert "get_joint_state" in device_functions
+        assert "get_imu_state" in device_functions
+        assert "get_volume" in device_functions
+        assert "set_volume" in device_functions
+        assert "speak_text" not in tool_names
         assert "execute_sport_command" not in tool_names
-        assert "set_obstacle_avoidance" not in tool_names
-        assert "get_joint_state" not in tool_names
-        assert "get_imu_state" not in tool_names
-        assert "get_volume" not in tool_names
-        assert "set_volume" not in tool_names
-        assert "execute_sport_command" in admin_tool_names
-        assert "set_obstacle_avoidance" in admin_tool_names
-        assert "get_joint_state" in admin_tool_names
-        assert "get_imu_state" in admin_tool_names
-        assert "get_volume" in admin_tool_names
-        assert "set_volume" in admin_tool_names
 
-        execute_sport_tool = next(item for item in admin_tool_items if item["name"] == "execute_sport_command")
-        action_schema = execute_sport_tool["inputSchema"]["properties"]["action"]
-        action_catalog = execute_sport_tool["inputSchema"]["x-nuwax-action-catalog"]
+        execute_sport_tool = device_tool["inputSchema"]["x-nuwax-function-catalog"]["execute_sport_command"]
+        action_schema = execute_sport_tool["input_schema"]["properties"]["action"]
+        action_catalog = execute_sport_tool["input_schema"]["x-nuwax-action-catalog"]
         assert "sit" in action_schema["enum"]
         assert "damp" in action_schema["enum"]
         assert "stand_up" in action_schema["enum"]
@@ -1835,7 +2659,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "status",
                 "method": "tools/call",
-                "params": {"name": "get_robot_status", "arguments": {}},
+                "params": _mcp_tool_call("platform", "get_robot_status"),
             },
         )
         assert robot_status.status_code == 200
@@ -1848,7 +2672,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "joints",
                 "method": "tools/call",
-                "params": {"name": "get_joint_state", "arguments": {"joint_name": "front_left_hip"}},
+                "params": _mcp_tool_call("device", "get_joint_state", {"joint_name": "front_left_hip"}),
             },
         )
         assert joint_state.status_code == 200
@@ -1861,7 +2685,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "imu",
                 "method": "tools/call",
-                "params": {"name": "get_imu_state", "arguments": {}},
+                "params": _mcp_tool_call("device", "get_imu_state"),
             },
         )
         assert imu_state.status_code == 200
@@ -1877,7 +2701,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "set_volume",
                 "method": "tools/call",
-                "params": {"name": "set_volume", "arguments": {"volume": 0.8}},
+                "params": _mcp_tool_call("device", "set_volume", {"volume": 0.8}),
             },
         )
         get_volume = client.post(
@@ -1887,7 +2711,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "get_volume",
                 "method": "tools/call",
-                "params": {"name": "get_volume", "arguments": {}},
+                "params": _mcp_tool_call("device", "get_volume"),
             },
         )
         speak_text = client.post(
@@ -1897,7 +2721,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "speak",
                 "method": "tools/call",
-                "params": {"name": "speak_text", "arguments": {"text": "你好，开始巡检。"}},
+                "params": _mcp_tool_call("platform", "speak_text", {"text": "你好，开始巡检。"}),
             },
         )
 
@@ -1918,7 +2742,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "obstacle",
                 "method": "tools/call",
-                "params": {"name": "set_obstacle_avoidance", "arguments": {"enabled": False}},
+                "params": _mcp_tool_call("device", "set_obstacle_avoidance", {"enabled": False}),
             },
         )
         assert set_obstacle_avoidance.status_code == 200
@@ -1934,7 +2758,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "sport",
                 "method": "tools/call",
-                "params": {"name": "execute_sport_command", "arguments": {"action": "stand_up", "params": {"speed": 1}}},
+                "params": _mcp_tool_call("device", "execute_sport_command", {"action": "stand_up", "params": {"speed": 1}}),
             },
         )
         set_body_pose = client.post(
@@ -1944,7 +2768,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "pose",
                 "method": "tools/call",
-                "params": {"name": "set_body_pose", "arguments": {"roll": 0.1, "pitch": 0.0, "yaw": 0.2}},
+                "params": _mcp_tool_call("device", "set_body_pose", {"roll": 0.1, "pitch": 0.0, "yaw": 0.2}),
             },
         )
         set_speed = client.post(
@@ -1954,7 +2778,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "speed",
                 "method": "tools/call",
-                "params": {"name": "set_speed_level", "arguments": {"level": 2}},
+                "params": _mcp_tool_call("device", "set_speed_level", {"level": 2}),
             },
         )
 
@@ -1970,7 +2794,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "list_capabilities",
                 "method": "tools/call",
-                "params": {"name": "list_capabilities", "arguments": {}},
+                "params": _mcp_tool_call("platform", "list_capabilities"),
             },
         )
         assert list_capabilities.status_code == 200
@@ -2005,7 +2829,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "active",
                 "method": "tools/call",
-                "params": {"name": "get_active_tasks", "arguments": {}},
+                "params": _mcp_tool_call("platform", "get_active_tasks"),
             },
         )
         cancel_task = client.post(
@@ -2015,7 +2839,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "cancel",
                 "method": "tools/call",
-                "params": {"name": "cancel_task", "arguments": {"task_id": navigation_task_id}},
+                "params": _mcp_tool_call("platform", "cancel_task", {"task_id": navigation_task_id}),
             },
         )
         assert active_tasks.status_code == 200
@@ -2035,7 +2859,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": "stop",
                 "method": "tools/call",
-                "params": {"name": "stop_all_motion", "arguments": {"reason": "单元测试触发停止。"}},
+                "params": _mcp_tool_call("platform", "stop_all_motion", {"reason": "单元测试触发停止。"}),
             },
         )
         assert stop_all.status_code == 200
@@ -2190,7 +3014,7 @@ def test_relay_forwards_mcp_and_artifacts(tmp_path: Path) -> None:
                     "jsonrpc": "2.0",
                     "id": "capture",
                     "method": "tools/call",
-                    "params": {"name": "capture_image", "arguments": {}},
+                    "params": _mcp_tool_call("device", "capture_image"),
                 },
             )
             structured = capture.json()["result"]["structuredContent"]

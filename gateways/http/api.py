@@ -154,6 +154,36 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access_manager.authenticate_http(request)
         return HTMLResponse(_render_ops_page())
 
+    def _resolve_client_host(request: Request) -> str:
+        forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+        if forwarded_for:
+            return forwarded_for.split(",", 1)[0].strip()
+        if request.client is not None and request.client.host:
+            return request.client.host
+        return "-"
+
+    def _build_capability_request_context(
+        request: Request,
+        *,
+        capability_name: str,
+        requested_by: str,
+    ) -> Dict[str, Any]:
+        state_context = getattr(request.state, "request_context", None)
+        context = dict(state_context) if isinstance(state_context, dict) else {}
+        request_id = context.get("request_id") or getattr(request.state, "request_id", None) or request.headers.get("x-request-id")
+        if request_id:
+            context["request_id"] = str(request_id).strip()
+        context.update(
+            {
+                "capability_name": capability_name,
+                "requested_by": requested_by or "unknown",
+                "method": request.method,
+                "path": request.url.path,
+                "client_ip": context.get("client_ip") or _resolve_client_host(request),
+            }
+        )
+        return context
+
     @router.post("/api/capabilities/{capability_name}/invoke")
     async def api_invoke_capability(
         capability_name: str,
@@ -163,17 +193,27 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access = access_manager.authenticate_http(request)
         descriptor = runtime.capability_registry.get_descriptor(capability_name)
         access_manager.authorize_capability(access, descriptor)
+        request_context = _build_capability_request_context(
+            request,
+            capability_name=capability_name,
+            requested_by=access.principal,
+        )
         try:
             result = await run_in_threadpool(
                 lambda: runtime.invoke_capability(
                     capability_name,
                     body.arguments,
                     requested_by=access.principal,
+                    request_context=request_context,
                 )
             )
         except Exception as exc:
             raise as_gateway_error(exc) from exc
-        return to_jsonable(result)
+        response = to_jsonable(result)
+        request_id = getattr(request.state, "request_id", None)
+        if isinstance(response, dict) and request_id:
+            response["request_id"] = request_id
+        return response
 
     @router.get("/api/tasks")
     async def api_tasks(

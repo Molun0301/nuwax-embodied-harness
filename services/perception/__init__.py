@@ -1,11 +1,18 @@
 """感知与跟踪服务导出。"""
 
 from services.perception.base import (
+    BBoxOnlySegmentationBackend,
+    DetectionAttributesSegmentationBackend,
     DetectionBundle,
     DetectorBackend,
     DetectorBackendSpec,
+    DisabledSegmentationBackend,
     SceneDescriptionBackend,
     SceneDescriptionBackendSpec,
+    SegmentationBackend,
+    SegmentationBackendSpec,
+    SegmentationBundle,
+    SegmentationCandidate,
     TrackerBackend,
     TrackerBackendSpec,
 )
@@ -21,11 +28,14 @@ from services.perception.trackers import Basic2DTrackerBackend, TrackLifecyclePo
 from services.perception.video_runtime import PerceptionVideoRuntime
 
 __all__ = [
+    "BBoxOnlySegmentationBackend",
     "Basic2DTrackerBackend",
+    "DetectionAttributesSegmentationBackend",
     "DetectionBundle",
     "DetectorBackend",
     "DetectorBackendSpec",
     "DetectorPipeline",
+    "DisabledSegmentationBackend",
     "HybridSceneDescriptionBackend",
     "KeyframeDecision",
     "MetadataDrivenDetectorBackend",
@@ -35,6 +45,10 @@ __all__ = [
     "PerceptionVideoRuntime",
     "SceneDescriptionBackend",
     "SceneDescriptionBackendSpec",
+    "SegmentationBackend",
+    "SegmentationBackendSpec",
+    "SegmentationBundle",
+    "SegmentationCandidate",
     "SimpleSceneDescriptionBackend",
     "TrackLifecyclePolicy",
     "TrackerBackend",

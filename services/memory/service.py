@@ -27,9 +27,11 @@ from contracts.memory import (
 )
 from contracts.navigation import NavigationGoal
 from contracts.naming import build_location_id, build_memory_id, build_observation_event_id
+from contracts.perception import Detection2D
 from contracts.runtime_views import LocalizationSnapshot, NavigationSemanticContext, TopologyNodeSummary
 from contracts.spatial_memory import (
     GroundingQueryPlan,
+    InstanceLifecycleState,
     NavigationCandidate,
     ObservationEvent,
     SemanticInstance,
@@ -57,6 +59,11 @@ from services.memory.vector_store import (
     SQLiteNamedVectorStore,
     VectorPoint,
     VectorSearchHit,
+)
+from services.model_providers import (
+    resolve_grounding_provider_spec,
+    resolve_text_embedding_provider_spec,
+    resolve_vision_language_provider_spec,
 )
 from services.memory.vectorizer import (
     HashingTextEmbedder,
@@ -94,6 +101,7 @@ class _ScoredCandidate:
     recency_score: float
     distance_m: Optional[float]
     final_score: float
+    query_scope: str
 
 
 @dataclass(frozen=True)
@@ -110,6 +118,15 @@ class _MemoryLibraryStats:
 
 class MemoryService:
     """统一地点记忆、语义记忆与多模态向量检索服务。"""
+
+    _SEGMENTATION_LOW_SIGNAL_THRESHOLD = 0.25
+    _SEGMENTATION_REPROJECTION_ERROR_GATE = 2.0
+    _NAVIGATION_QUALITY_SCHEMA_VERSION = "4.4-v1"
+    _NAVIGATION_DIRECT_CANDIDATE_SCORE_MIN = 0.55
+    _NAVIGATION_CONTINUE_EXPLORATION_SCORE_MAX_EXCLUSIVE = 0.35
+    _NAVIGATION_PROJECTION_CONFIDENCE_HARD_MIN = 0.20
+    _NAVIGATION_PROJECTION_CONFIDENCE_DIRECT_MIN = 0.65
+    _NAVIGATION_DIRECT_SEGMENTATION_SIGNAL_MIN = 0.65
 
     def __init__(
         self,
@@ -159,6 +176,12 @@ class MemoryService:
         self._configured_image_dimension = int(image_embedding_dimension or 512)
         self._text_embedder = text_embedder
         self._image_embedder = vision_language_embedder
+        self._text_embedding_provider_metadata = resolve_text_embedding_provider_spec(
+            text_embedder.model_name if text_embedder is not None else self._configured_text_model
+        ).to_metadata()
+        self._image_embedding_provider_metadata = resolve_vision_language_provider_spec(
+            vision_language_embedder.model_name if vision_language_embedder is not None else self._configured_image_model
+        ).to_metadata()
         self._text_embedder_ready = text_embedder is not None
         self._image_embedder_ready = (
             vision_language_embedder is not None or self._configured_image_model.lower() == "disabled"
@@ -530,6 +553,82 @@ class MemoryService:
             "artifact_count": len(artifact_ids),
         }
 
+    def _build_text_provider_metadata(
+        self,
+        *,
+        requested_model_name: str,
+        resolved_model_name: str,
+        fallback_used: bool = False,
+        fallback_reason: str = "",
+        availability: str = "available",
+    ) -> Dict[str, object]:
+        requested_provider = resolve_text_embedding_provider_spec(requested_model_name).to_metadata()
+        resolved_provider = resolve_text_embedding_provider_spec(resolved_model_name).to_metadata()
+        return {
+            **resolved_provider,
+            "availability": availability,
+            "fallback_used": bool(fallback_used),
+            "fallback_reason": str(fallback_reason or ""),
+            "requested_provider_name": str(
+                requested_provider.get("requested_provider_name")
+                or requested_provider.get("provider_name")
+                or requested_model_name
+            ),
+            "resolved_provider_name": str(
+                resolved_provider.get("resolved_provider_name")
+                or resolved_provider.get("provider_name")
+                or resolved_model_name
+            ),
+            "requested_backend": str(
+                requested_provider.get("requested_backend")
+                or requested_provider.get("backend_name")
+                or requested_model_name
+            ),
+            "resolved_backend": str(
+                resolved_provider.get("resolved_backend")
+                or resolved_provider.get("backend_name")
+                or resolved_model_name
+            ),
+        }
+
+    def _build_image_provider_metadata(
+        self,
+        *,
+        requested_model_name: str,
+        resolved_model_name: str,
+        fallback_used: bool = False,
+        fallback_reason: str = "",
+        availability: str = "available",
+    ) -> Dict[str, object]:
+        requested_provider = resolve_vision_language_provider_spec(requested_model_name).to_metadata()
+        resolved_provider = resolve_vision_language_provider_spec(resolved_model_name).to_metadata()
+        return {
+            **resolved_provider,
+            "availability": availability,
+            "fallback_used": bool(fallback_used),
+            "fallback_reason": str(fallback_reason or ""),
+            "requested_provider_name": str(
+                requested_provider.get("requested_provider_name")
+                or requested_provider.get("provider_name")
+                or requested_model_name
+            ),
+            "resolved_provider_name": str(
+                resolved_provider.get("resolved_provider_name")
+                or resolved_provider.get("provider_name")
+                or resolved_model_name
+            ),
+            "requested_backend": str(
+                requested_provider.get("requested_backend")
+                or requested_provider.get("backend_name")
+                or requested_model_name
+            ),
+            "resolved_backend": str(
+                resolved_provider.get("resolved_backend")
+                or resolved_provider.get("backend_name")
+                or resolved_model_name
+            ),
+        }
+
     def _build_text_embedder_with_fallback(
         self,
         model_name: str,
@@ -538,13 +637,18 @@ class MemoryService:
         """优先构造配置指定的文本向量器，失败时回退到 hashing。"""
 
         try:
-            return build_text_embedder(
+            embedder = build_text_embedder(
                 model_name,
                 dimension,
                 api_key=self._embedding_api_key,
                 base_url=self._embedding_base_url,
                 timeout_sec=self._embedding_timeout_sec,
             )
+            self._text_embedding_provider_metadata = self._build_text_provider_metadata(
+                requested_model_name=model_name,
+                resolved_model_name=embedder.model_name,
+            )
+            return embedder
         except Exception as exc:
             LOGGER.warning(
                 "文本向量模型初始化失败，已回退到 hashing-v1。requested=%s error=%s",
@@ -552,10 +656,19 @@ class MemoryService:
                 exc,
             )
             fallback_dimension = dimension if dimension > 0 else 256
-            return HashingTextEmbedder(
+            embedder = HashingTextEmbedder(
                 model_name="hashing-v1",
                 dimension=fallback_dimension,
             )
+            self._text_embedding_provider_metadata = self._build_text_provider_metadata(
+                requested_model_name=model_name,
+                resolved_model_name=embedder.model_name,
+                fallback_used=True,
+                fallback_reason="provider_initialization_failed",
+                availability="available",
+            )
+            self._text_embedding_provider_metadata["error_category"] = "model_provider"
+            return embedder
 
     def _build_image_embedder_with_fallback(
         self,
@@ -565,19 +678,39 @@ class MemoryService:
         """优先构造图文共享向量器，失败时关闭图像向量链路。"""
 
         try:
-            return build_vision_language_embedder(
+            embedder = build_vision_language_embedder(
                 model_name,
                 dimension,
                 api_key=self._embedding_api_key,
                 base_url=self._embedding_base_url,
                 timeout_sec=self._embedding_timeout_sec,
             )
+            if embedder is None:
+                self._image_embedding_provider_metadata = self._build_image_provider_metadata(
+                    requested_model_name=model_name,
+                    resolved_model_name="disabled",
+                    availability="disabled",
+                )
+                return None
+            self._image_embedding_provider_metadata = self._build_image_provider_metadata(
+                requested_model_name=model_name,
+                resolved_model_name=embedder.model_name,
+            )
+            return embedder
         except Exception as exc:
             LOGGER.warning(
                 "图像向量模型初始化失败，已关闭图像向量链路。requested=%s error=%s",
                 model_name,
                 exc,
             )
+            self._image_embedding_provider_metadata = self._build_image_provider_metadata(
+                requested_model_name=model_name,
+                resolved_model_name="disabled",
+                fallback_used=True,
+                fallback_reason="provider_initialization_failed",
+                availability="unavailable",
+            )
+            self._image_embedding_provider_metadata["error_category"] = "model_provider"
             return None
 
     def tag_location(
@@ -784,6 +917,8 @@ class MemoryService:
         max_age_sec: Optional[float] = None,
         near_pose: Optional[Pose] = None,
         max_distance_m: Optional[float] = None,
+        grounding_plan: Optional[GroundingQueryPlan] = None,
+        include_non_direct_navigation_candidates: bool = False,
     ) -> MemoryQueryResult:
         """查询命名地点。"""
 
@@ -801,6 +936,8 @@ class MemoryService:
             similarity_threshold=similarity_threshold,
             limit=limit,
             payload_filter=resolved_filter,
+            grounding_plan=grounding_plan,
+            include_non_direct_navigation_candidates=include_non_direct_navigation_candidates,
         )
         self._state_store.write(
             StateNamespace.MEMORY,
@@ -911,9 +1048,11 @@ class MemoryService:
             localization_session_id=localization_session_id,
             limit=1,
         )
-        if not candidates:
-            return None
-        return candidates[0]
+        for candidate in candidates:
+            quality = dict(candidate.metadata.get("navigation_quality") or {})
+            if quality.get("level") == "direct_navigation" or (not quality and candidate.metadata.get("navigable") is True):
+                return candidate
+        return None
 
     def resolve_navigation_candidates(
         self,
@@ -930,15 +1069,26 @@ class MemoryService:
 
         if not self.is_enabled():
             return ()
+        requested_limit = max(1, int(limit))
+        match_limit = max(requested_limit, 12)
         current_pose = self._get_current_pose()
         map_snapshot = self._get_map_snapshot()
         self._refresh_semantic_map_context(map_snapshot)
+        semantic_context = self.get_navigation_semantic_context()
         effective_map_version_id = str(
             map_version_id or (map_snapshot.version_id if map_snapshot is not None else "")
         ).strip() or None
-        effective_localization_session_id = str(localization_session_id or "").strip() or None
+        active_localization_session_id = str(semantic_context.localization_session_id or "").strip() or None
+        effective_localization_session_id = str(
+            localization_session_id or active_localization_session_id or ""
+        ).strip() or None
         known_labels = self._collect_known_grounding_labels()
-        grounding_plan = self._grounding_query_planner.plan(query, known_labels=known_labels)
+        known_object_labels = self._collect_known_grounding_object_labels()
+        grounding_plan = self._grounding_query_planner.plan(
+            query,
+            known_labels=known_labels,
+            known_object_labels=known_object_labels,
+        )
         payload_filter = self._grounding_query_planner.build_payload_filter(
             grounding_plan,
             map_version_id=effective_map_version_id,
@@ -948,58 +1098,111 @@ class MemoryService:
             payload_filter.max_age_sec = max_age_sec
         if current_pose is not None:
             payload_filter.near_pose = current_pose
-        result = self._query_records(
-            query,
-            allowed_record_kinds=(
-                MemoryRecordKind.OBJECT_INSTANCE,
-                MemoryRecordKind.OBSERVATION_EVENT,
-                MemoryRecordKind.SCENE,
-                MemoryRecordKind.NOTE,
-            ),
-            similarity_threshold=similarity_threshold,
-            limit=max(1, int(limit)),
-            payload_filter=payload_filter,
-        )
         candidates: List[MemoryNavigationCandidate] = []
         seen_record_ids = set()
-        for match in result.matches:
-            if match.navigation_candidate is not None:
+        query_scope = str(((grounding_plan.metadata if grounding_plan is not None else {}) or {}).get("query_scope") or "mixed").strip() or "mixed"
+        observed_candidate_count = 0
+        fallback_used = False
+        fallback_reason = ""
+        while True:
+            result = self._query_records(
+                query,
+                allowed_record_kinds=(
+                    MemoryRecordKind.TAGGED_LOCATION,
+                    MemoryRecordKind.OBJECT_INSTANCE,
+                    MemoryRecordKind.OBSERVATION_EVENT,
+                    MemoryRecordKind.SCENE,
+                    MemoryRecordKind.NOTE,
+                ),
+                similarity_threshold=similarity_threshold,
+                limit=match_limit,
+                payload_filter=payload_filter,
+                grounding_plan=grounding_plan,
+                include_non_direct_navigation_candidates=True,
+            )
+            for match in result.matches:
+                if match.navigation_candidate is None:
+                    continue
                 candidate = self._to_legacy_navigation_candidate(match.navigation_candidate)
                 if candidate.record_id in seen_record_ids:
                     continue
                 seen_record_ids.add(candidate.record_id)
                 candidates.append(candidate)
-                if len(candidates) >= max(1, int(limit)):
-                    return tuple(candidates)
-        tagged_location = self.resolve_tagged_location(
-            query,
-            map_version_id=effective_map_version_id,
-            localization_session_id=effective_localization_session_id,
-        )
-        if tagged_location is not None:
-            spatial_candidate = self._build_navigation_candidate(
-                query,
-                record_kind=MemoryRecordKind.TAGGED_LOCATION,
-                record_id=tagged_location.location_id,
-                anchor_id=self._resolve_location_anchor_id(tagged_location),
-                inspection_pose=tagged_location.pose,
-                anchor_pose=tagged_location.pose,
-                target_name=tagged_location.name,
-                linked_location_id=tagged_location.location_id,
-                map_version_id=tagged_location.map_version_id,
-                topo_node_id=tagged_location.topo_node_id,
-                semantic_region_id=tagged_location.semantic_region_id,
-                artifact_ids=[],
-                current_pose=current_pose,
-                verification_memory_id=tagged_location.memory_id,
-                verification_text=tagged_location.perception_headline or query,
-                camera_id=camera_id,
-                localization_session_id=effective_localization_session_id,
+                if len(candidates) >= requested_limit:
+                    break
+            returned_candidate_count = self._coerce_optional_int(result.metadata.get("returned_candidate_count"))
+            if returned_candidate_count is None:
+                returned_candidate_count = len(result.matches)
+            candidate_count = self._coerce_optional_int(result.metadata.get("candidate_count"))
+            if candidate_count is None:
+                candidate_count = returned_candidate_count
+            observed_candidate_count = max(observed_candidate_count, candidate_count)
+            if len(candidates) >= requested_limit:
+                break
+            if returned_candidate_count < match_limit:
+                break
+            if candidate_count <= returned_candidate_count:
+                break
+            next_match_limit = min(
+                candidate_count,
+                max(match_limit * 2, match_limit + requested_limit),
             )
-            candidate = self._to_legacy_navigation_candidate(spatial_candidate)
-            if candidate.record_id not in seen_record_ids:
+            if next_match_limit <= match_limit:
+                break
+            match_limit = next_match_limit
+        if len(candidates) < requested_limit:
+            fallback_used = True
+            fallback_reason = "tagged_location_fallback"
+            location_result = self.query_location(
+                query,
+                similarity_threshold=0.55,
+                limit=max(requested_limit, match_limit),
+                payload_filter=MemoryPayloadFilter(
+                    record_kinds=[MemoryRecordKind.TAGGED_LOCATION],
+                    map_version_id=effective_map_version_id,
+                    localization_session_id=effective_localization_session_id,
+                ),
+                grounding_plan=grounding_plan,
+                include_non_direct_navigation_candidates=True,
+            )
+            observed_candidate_count = max(
+                observed_candidate_count,
+                self._coerce_optional_int(location_result.metadata.get("candidate_count")) or 0,
+            )
+            for match in location_result.matches:
+                if match.navigation_candidate is None:
+                    continue
+                candidate = self._to_legacy_navigation_candidate(match.navigation_candidate)
+                if candidate.record_id in seen_record_ids:
+                    continue
+                seen_record_ids.add(candidate.record_id)
                 candidates.append(candidate)
-        return tuple(candidates[: max(1, int(limit))])
+                if len(candidates) >= requested_limit:
+                    break
+        returned_candidates = tuple(candidates[:requested_limit])
+        observability_metadata = {
+            "query_text_preview": self._preview_text(query),
+            "query_scope": query_scope,
+            "match_limit": match_limit,
+            "candidate_count": observed_candidate_count,
+            "returned_candidate_count": len(returned_candidates),
+            "fallback_used": fallback_used,
+            "fallback_reason": fallback_reason,
+            "map_version_id": effective_map_version_id or "",
+            "localization_session_id": effective_localization_session_id or "",
+            "map_name": semantic_context.map_name or "",
+            "camera_id": camera_id or "",
+        }
+        decorated_candidates = tuple(
+            candidate.model_copy(update={"metadata": {**dict(candidate.metadata), **observability_metadata}}, deep=True)
+            for candidate in returned_candidates
+        )
+        self._publish_memory_event(
+            "memory.navigation_candidates_resolved",
+            "记忆导航候选已解析。",
+            payload=observability_metadata,
+        )
+        return decorated_candidates
 
     def resolve_semantic_region_goal(
         self,
@@ -1049,14 +1252,24 @@ class MemoryService:
         """到点后用当前场景与目标记忆做一次复核。"""
 
         if not self.is_enabled():
-            return MemoryArrivalVerification(
-                query=query,
-                verified=False,
-                score=0.0,
-                matched_labels=[],
-                matched_memory_id=None,
-                reason="当前记忆库未启用，已跳过记忆复核。",
-                metadata={"memory_enabled": False},
+            return self._record_arrival_verification(
+                MemoryArrivalVerification(
+                    query=query,
+                    verified=False,
+                    score=0.0,
+                    matched_labels=[],
+                    matched_memory_id=None,
+                    reason="当前记忆库未启用，已跳过记忆复核。",
+                    metadata={
+                        "memory_enabled": False,
+                        "arrival_verified": False,
+                        "arrival_score": 0.0,
+                        "arrival_reason_code": "memory_disabled",
+                        "camera_id": camera_id or "",
+                        "map_version_id": expected_map_version_id or "",
+                        "localization_session_id": localization_session_id or "",
+                    },
+                )
             )
         legacy_candidate = self._coerce_legacy_navigation_candidate(navigation_candidate)
         effective_map_version_id = str(
@@ -1066,35 +1279,50 @@ class MemoryService:
         semantic_context = self.get_navigation_semantic_context()
         active_localization_session_id = str(semantic_context.localization_session_id or "").strip() or None
         if effective_map_version_id and semantic_context.map_version_id not in {None, effective_map_version_id}:
-            return MemoryArrivalVerification(
-                query=query,
-                verified=False,
-                score=0.0,
-                matched_labels=[],
-                matched_memory_id=None,
-                reason="当前平台地图版本与导航候选版本不一致，已拒绝到点复核。",
-                metadata={
-                    "expected_map_version_id": effective_map_version_id,
-                    "active_map_version_id": semantic_context.map_version_id,
-                    "localization_session_id": localization_session_id or active_localization_session_id,
-                    "map_name": semantic_context.map_name,
-                },
+            return self._record_arrival_verification(
+                MemoryArrivalVerification(
+                    query=query,
+                    verified=False,
+                    score=0.0,
+                    matched_labels=[],
+                    matched_memory_id=None,
+                    reason="当前平台地图版本与导航候选版本不一致，已拒绝到点复核。",
+                    metadata={
+                        "expected_map_version_id": effective_map_version_id,
+                        "active_map_version_id": semantic_context.map_version_id,
+                        "map_version_id": semantic_context.map_version_id or "",
+                        "localization_session_id": localization_session_id or active_localization_session_id or "",
+                        "map_name": semantic_context.map_name,
+                        "camera_id": camera_id or "",
+                        "arrival_verified": False,
+                        "arrival_score": 0.0,
+                        "arrival_reason_code": "map_mismatch",
+                    },
+                )
             )
         if localization_session_id and active_localization_session_id and localization_session_id != active_localization_session_id:
-            return MemoryArrivalVerification(
-                query=query,
-                verified=False,
-                score=0.0,
-                matched_labels=[],
-                matched_memory_id=None,
-                reason="当前平台定位会话已变化，已拒绝在旧定位上下文中执行到点复核。",
-                metadata={
-                    "expected_map_version_id": effective_map_version_id,
-                    "active_map_version_id": semantic_context.map_version_id,
-                    "expected_localization_session_id": localization_session_id,
-                    "active_localization_session_id": active_localization_session_id,
-                    "map_name": semantic_context.map_name,
-                },
+            return self._record_arrival_verification(
+                MemoryArrivalVerification(
+                    query=query,
+                    verified=False,
+                    score=0.0,
+                    matched_labels=[],
+                    matched_memory_id=None,
+                    reason="当前平台定位会话已变化，已拒绝在旧定位上下文中执行到点复核。",
+                    metadata={
+                        "expected_map_version_id": effective_map_version_id,
+                        "active_map_version_id": semantic_context.map_version_id,
+                        "map_version_id": semantic_context.map_version_id or "",
+                        "expected_localization_session_id": localization_session_id,
+                        "active_localization_session_id": active_localization_session_id,
+                        "localization_session_id": active_localization_session_id or "",
+                        "map_name": semantic_context.map_name,
+                        "camera_id": camera_id or "",
+                        "arrival_verified": False,
+                        "arrival_score": 0.0,
+                        "arrival_reason_code": "localization_session_mismatch",
+                    },
+                )
             )
         effective_query = (
             legacy_candidate.verification_query
@@ -1127,6 +1355,19 @@ class MemoryService:
             [item.label for item in perception_context.scene_summary.objects]
             + self._collect_scene_vision_tags(perception_context.scene_summary)
         )
+        target_labels = [effective_query]
+        if legacy_candidate is not None:
+            target_labels.extend(
+                [
+                    legacy_candidate.target_name,
+                    legacy_candidate.verification_query or "",
+                ]
+            )
+        segmentation_evidence = self._collect_arrival_segmentation_evidence(
+            perception_context.observation.detections_2d,
+            query=effective_query,
+            target_labels=target_labels,
+        )
         image_score = 0.0
         target_point = None
         if legacy_candidate is not None:
@@ -1149,13 +1390,31 @@ class MemoryService:
                         ),
                     )
         score = self._clamp_score((0.45 * lexical_score) + (0.55 * image_score if image_score > 0.0 else 0.0) + (0.35 * lexical_score if image_score <= 0.0 else 0.0))
+        segmentation_match_score = self._coerce_optional_float(segmentation_evidence.get("segmentation_match_score")) or 0.0
+        segmentation_quality = str(segmentation_evidence.get("segmentation_quality") or "unknown")
+        if segmentation_evidence.get("has_structured_segmentation") and segmentation_match_score >= 0.55:
+            if segmentation_quality == "high":
+                score = self._clamp_score(score + (0.12 * segmentation_match_score))
+            elif segmentation_quality == "medium":
+                score = self._clamp_score(score + (0.06 * segmentation_match_score))
+            elif segmentation_quality == "low":
+                score = self._clamp_score(score * 0.85)
         verified = score >= similarity_threshold or self._normalize_text(effective_query) in {self._normalize_text(item) for item in matched_labels}
-        if verified and image_score >= lexical_score + 0.05:
+        if verified and segmentation_quality == "high" and segmentation_match_score >= 0.55:
+            reason = "到点后目标标签与当前结构化分割证据一致。"
+            arrival_reason_code = "segmentation_match"
+        elif verified and segmentation_quality == "low" and segmentation_match_score >= 0.55:
+            reason = "到点后目标标签匹配，但当前分割质量偏低，建议复核。"
+            arrival_reason_code = "segmentation_low_quality"
+        elif verified and image_score >= lexical_score + 0.05:
             reason = "到点后图像语义与目标记忆高度一致。"
+            arrival_reason_code = "image_semantic_match"
         elif verified:
             reason = lexical_reason or "到点后目标标签与场景摘要匹配。"
+            arrival_reason_code = "lexical_match"
         else:
             reason = "到点后尚未观察到足够强的目标证据。"
+            arrival_reason_code = "insufficient_evidence"
         result = MemoryArrivalVerification(
             query=effective_query,
             verified=verified,
@@ -1174,16 +1433,13 @@ class MemoryService:
                 "map_name": semantic_context.map_name,
                 "map_version_id": effective_map_version_id or semantic_context.map_version_id,
                 "localization_session_id": localization_session_id or active_localization_session_id,
+                "arrival_verified": verified,
+                "arrival_score": round(score, 6),
+                "arrival_reason_code": arrival_reason_code,
+                **segmentation_evidence,
             },
         )
-        self._state_store.write(
-            StateNamespace.MEMORY,
-            "last_arrival_verification",
-            result,
-            source="memory_service",
-            metadata={"kind": "arrival_verification"},
-        )
-        return result
+        return self._record_arrival_verification(result)
 
     def get_summary(self) -> MemoryStoreSummary:
         """返回记忆摘要。"""
@@ -1193,6 +1449,7 @@ class MemoryService:
         vector_counts = self._vector_store.count_vectors_by_name()
         text_model = self._text_embedder.model_name if self._text_embedder is not None else "disabled"
         text_dimension = self._text_embedder.dimension if self._text_embedder is not None else 0
+        grounding_provider = resolve_grounding_provider_spec()
         return MemoryStoreSummary(
             tagged_location_count=len(self._tagged_locations_by_id),
             semantic_memory_count=len(self._semantic_entries_by_id),
@@ -1207,8 +1464,11 @@ class MemoryService:
                 "vector_store_backend": self._vector_store.backend_name,
                 "text_embedding_model": text_model,
                 "text_embedding_dimension": text_dimension,
+                "text_embedding_provider": dict(self._text_embedding_provider_metadata),
                 "image_embedding_model": self._image_embedder.model_name if self._image_embedder is not None else "disabled",
                 "image_embedding_dimension": self._image_embedder.dimension if self._image_embedder is not None else 0,
+                "image_embedding_provider": dict(self._image_embedding_provider_metadata),
+                "grounding_provider": grounding_provider.to_metadata(),
                 "vector_point_count": self._vector_store.count_points(),
                 "collection_counts": self._vector_store.count_points_by_collection(),
                 "named_vector_counts": vector_counts,
@@ -1466,8 +1726,11 @@ class MemoryService:
         similarity_threshold: float,
         limit: int,
         payload_filter: Optional[MemoryPayloadFilter],
+        grounding_plan: Optional[GroundingQueryPlan] = None,
+        include_non_direct_navigation_candidates: bool = False,
     ) -> MemoryQueryResult:
         normalized_query = self._normalize_text(query)
+        query_scope = str(((grounding_plan.metadata if grounding_plan is not None else {}) or {}).get("query_scope") or "mixed").strip() or "mixed"
         if not normalized_query:
             raise GatewayError(
                 "查询文本不能为空。",
@@ -1516,6 +1779,7 @@ class MemoryService:
                 current_pose=current_pose,
                 text_recall_score=recall_by_id.get(candidate_id, 0.0),
                 query_image_vector=query_image_vector,
+                query_scope=query_scope,
             )
             if candidate is None:
                 continue
@@ -1525,20 +1789,41 @@ class MemoryService:
 
         scored_candidates.sort(key=lambda item: item.final_score, reverse=True)
         selected_candidates = self._select_ranked_candidates(scored_candidates, limit=max(1, limit))
-        matches = [self._build_query_match(query, item, current_pose) for item in selected_candidates]
+        matches = [
+            self._build_query_match(
+                query,
+                item,
+                current_pose,
+                grounding_plan=grounding_plan,
+                expected_map_version_id=payload_filter.map_version_id if payload_filter is not None else None,
+                expected_localization_session_id=(
+                    payload_filter.localization_session_id if payload_filter is not None else None
+                ),
+                include_non_direct_navigation_candidate=include_non_direct_navigation_candidates,
+            )
+            for item in selected_candidates
+        ]
         return MemoryQueryResult(
             query=query,
             similarity_threshold=similarity_threshold,
             matches=matches,
             metadata={
+                "query_text_preview": self._preview_text(query),
+                "query_scope": query_scope,
+                "match_limit": max(1, int(limit)),
                 "candidate_count": len(scored_candidates),
                 "returned_candidate_count": len(selected_candidates),
+                "fallback_used": False,
+                "fallback_reason": "",
                 "retrieval_mode": "text_recall_then_filter_then_multimodal_rerank",
                 "vector_store_backend": self._vector_store.backend_name,
                 "text_embedding_model": self._text_embedder.model_name,
                 "text_embedding_dimension": self._text_embedder.dimension,
+                "text_embedding_provider": dict(self._text_embedding_provider_metadata),
                 "image_embedding_model": self._image_embedder.model_name if self._image_embedder is not None else "disabled",
                 "image_embedding_dimension": self._image_embedder.dimension if self._image_embedder is not None else 0,
+                "image_embedding_provider": dict(self._image_embedding_provider_metadata),
+                "grounding_provider": resolve_grounding_provider_spec().to_metadata(),
                 "filters": payload_filter.model_dump(mode="json") if payload_filter is not None else {},
             },
         )
@@ -1553,6 +1838,7 @@ class MemoryService:
         current_pose: Optional[Pose],
         text_recall_score: float,
         query_image_vector: Optional[np.ndarray],
+        query_scope: str,
     ) -> Optional[_ScoredCandidate]:
         if point.record_kind not in {item.value for item in allowed_record_kinds}:
             return None
@@ -1606,6 +1892,7 @@ class MemoryService:
             image_score=image_score,
             spatial_score=spatial_score,
             recency_score=recency_score,
+            query_scope=query_scope,
         )
         return _ScoredCandidate(
             point=point,
@@ -1622,6 +1909,7 @@ class MemoryService:
             recency_score=recency_score,
             distance_m=distance_m,
             final_score=final_score,
+            query_scope=query_scope,
         )
 
     def _select_ranked_candidates(
@@ -1669,119 +1957,719 @@ class MemoryService:
             )
         return (candidate.record_kind.value, candidate.point.point_id)
 
+    def _coerce_optional_float(self, value: object, fallback_value: object = None) -> Optional[float]:
+        for candidate in (value, fallback_value):
+            if candidate is None or candidate == "" or isinstance(candidate, bool):
+                continue
+            try:
+                return float(candidate)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _coerce_optional_int(self, value: object) -> Optional[int]:
+        if value is None or value == "" or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _coerce_optional_bool(self, value: object) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        normalized = str(value or "").strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+        return None
+
+    def _evaluate_navigation_metadata(
+        self,
+        metadata: Optional[Dict[str, object]],
+        *,
+        backend_name: str,
+        candidate_score: Optional[float] = None,
+        grounding_plan: Optional[GroundingQueryPlan] = None,
+        map_version_id: Optional[str] = None,
+        expected_map_version_id: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
+        expected_localization_session_id: Optional[str] = None,
+    ) -> Dict[str, object]:
+        resolved_metadata = dict(metadata or {})
+        projection_method = str(resolved_metadata.get("projection_method") or "").strip()
+        projection_confidence = self._coerce_optional_float(resolved_metadata.get("projection_confidence"))
+        support_point_count = self._coerce_optional_int(resolved_metadata.get("support_point_count"))
+        projection_degradation_reason = str(resolved_metadata.get("projection_degradation_reason") or "").strip()
+        geometry_projection_method = str(resolved_metadata.get("geometry_projection_method") or "").strip()
+        geometry_projection_status = str(resolved_metadata.get("geometry_projection_status") or "").strip()
+        segmentation_projection_status = str(resolved_metadata.get("segmentation_projection_status") or "").strip()
+        resolved_candidate_score = self._coerce_optional_float(
+            candidate_score if candidate_score is not None else resolved_metadata.get("candidate_score")
+        )
+        resolved_map_version_id = str(map_version_id or resolved_metadata.get("map_version_id") or "").strip() or None
+        resolved_expected_map_version_id = str(expected_map_version_id or "").strip() or None
+        resolved_localization_session_id = str(
+            localization_session_id or resolved_metadata.get("localization_session_id") or ""
+        ).strip() or None
+        resolved_expected_localization_session_id = str(expected_localization_session_id or "").strip() or None
+        segmentation_summary = self._summarize_segmentation_metadata(resolved_metadata)
+        navigation_quality = self._build_navigation_quality(
+            metadata=resolved_metadata,
+            candidate_score=resolved_candidate_score,
+            projection_method=projection_method,
+            projection_confidence=projection_confidence,
+            support_point_count=support_point_count,
+            projection_degradation_reason=projection_degradation_reason,
+            geometry_projection_status=geometry_projection_status,
+            segmentation_projection_status=segmentation_projection_status,
+            segmentation_summary=segmentation_summary,
+            grounding_plan=grounding_plan,
+            map_version_id=resolved_map_version_id,
+            expected_map_version_id=resolved_expected_map_version_id,
+            localization_session_id=resolved_localization_session_id,
+            expected_localization_session_id=resolved_expected_localization_session_id,
+        )
+        backend = str(resolved_metadata.get("backend") or resolved_metadata.get("backend_type") or backend_name)
+        backend_type = str(resolved_metadata.get("backend_type") or resolved_metadata.get("backend") or backend_name)
+        return {
+            "backend": backend,
+            "backend_type": backend_type,
+            "candidate_score": resolved_candidate_score,
+            "projection_method": projection_method,
+            "projection_confidence": projection_confidence,
+            "support_point_count": int(support_point_count or 0),
+            "projection_degradation_reason": projection_degradation_reason,
+            "geometry_projection_method": geometry_projection_method,
+            "geometry_projection_status": geometry_projection_status,
+            "segmentation_projection_status": segmentation_projection_status,
+            "navigable": navigation_quality["level"] == "direct_navigation",
+            "non_navigable_reason": navigation_quality["primary_reason_code"],
+            "navigation_quality": navigation_quality,
+            **segmentation_summary,
+        }
+
+    def _navigation_quality_thresholds(self) -> Dict[str, float]:
+        return {
+            "direct_candidate_score_min": self._NAVIGATION_DIRECT_CANDIDATE_SCORE_MIN,
+            "continue_exploration_candidate_score_max_exclusive": self._NAVIGATION_CONTINUE_EXPLORATION_SCORE_MAX_EXCLUSIVE,
+            "projection_confidence_hard_min": self._NAVIGATION_PROJECTION_CONFIDENCE_HARD_MIN,
+            "projection_confidence_direct_min": self._NAVIGATION_PROJECTION_CONFIDENCE_DIRECT_MIN,
+            "segmentation_low_signal_min": self._SEGMENTATION_LOW_SIGNAL_THRESHOLD,
+            "segmentation_reprojection_error_max": self._SEGMENTATION_REPROJECTION_ERROR_GATE,
+            "direct_segmentation_signal_min": self._NAVIGATION_DIRECT_SEGMENTATION_SIGNAL_MIN,
+        }
+
+    def _build_navigation_quality(
+        self,
+        *,
+        metadata: Dict[str, object],
+        candidate_score: Optional[float],
+        projection_method: str,
+        projection_confidence: Optional[float],
+        support_point_count: Optional[int],
+        projection_degradation_reason: str,
+        geometry_projection_status: str,
+        segmentation_projection_status: str,
+        segmentation_summary: Dict[str, object],
+        grounding_plan: Optional[GroundingQueryPlan],
+        map_version_id: Optional[str],
+        expected_map_version_id: Optional[str],
+        localization_session_id: Optional[str],
+        expected_localization_session_id: Optional[str],
+    ) -> Dict[str, object]:
+        planner_metadata = dict((grounding_plan.metadata if grounding_plan is not None else {}) or {})
+        ambiguities = planner_metadata.get("ambiguities")
+        negative_constraints = planner_metadata.get("negative_constraints")
+        ambiguity_count = len(ambiguities) if isinstance(ambiguities, (list, tuple, set)) else 0
+        negative_constraint_count = len(negative_constraints) if isinstance(negative_constraints, (list, tuple, set)) else 0
+        candidate_ranking_hints = planner_metadata.get("candidate_ranking_hints")
+        candidate_ranking_hints_present = bool(candidate_ranking_hints)
+        reason_codes: List[str] = []
+
+        def add_reason(code: str) -> None:
+            if code not in reason_codes:
+                reason_codes.append(code)
+
+        if expected_map_version_id and map_version_id and map_version_id != expected_map_version_id:
+            add_reason("map_version_mismatch")
+        if (
+            expected_localization_session_id
+            and localization_session_id
+            and localization_session_id != expected_localization_session_id
+        ):
+            add_reason("localization_session_mismatch")
+        if projection_method == "current_pose_fallback":
+            add_reason("current_pose_fallback")
+        if (
+            projection_confidence is not None
+            and projection_confidence < self._NAVIGATION_PROJECTION_CONFIDENCE_HARD_MIN
+        ):
+            add_reason("projection_confidence_low")
+        if projection_method and support_point_count is not None and support_point_count <= 0:
+            add_reason("projection_geometry_missing")
+
+        segmentation_reason_codes = self._navigation_quality_reason_codes_from_segmentation(segmentation_summary)
+        for code in segmentation_reason_codes:
+            if code in {
+                "segmentation_support_missing",
+                "segmentation_quality_low",
+                "segmentation_coverage_low",
+                "segmentation_depth_coverage_low",
+                "segmentation_map_coverage_low",
+                "segmentation_reprojection_error_high",
+                "projection_degraded",
+            }:
+                add_reason(code)
+
+        hard_reason_codes = set(reason_codes)
+        if hard_reason_codes:
+            level = "not_navigable"
+        else:
+            review_codes: List[str] = []
+            if projection_confidence is not None and projection_confidence < self._NAVIGATION_PROJECTION_CONFIDENCE_DIRECT_MIN:
+                review_codes.append("projection_confidence_low")
+            if bool(segmentation_summary.get("segmentation_review_required")):
+                review_codes.append("segmentation_review_required")
+            for code in segmentation_reason_codes:
+                if code in {"segmentation_occluded", "segmentation_truncated"}:
+                    review_codes.append(code)
+            if ambiguity_count > 0:
+                review_codes.append("planner_target_ambiguous")
+            if negative_constraint_count > 0:
+                review_codes.append("planner_negative_constraint")
+            for code in review_codes:
+                add_reason(code)
+            if review_codes:
+                level = "needs_review"
+            else:
+                exploration_codes: List[str] = []
+                if (
+                    candidate_score is not None
+                    and candidate_score < self._NAVIGATION_CONTINUE_EXPLORATION_SCORE_MAX_EXCLUSIVE
+                ):
+                    exploration_codes.append("candidate_score_low")
+                if candidate_score is None:
+                    exploration_codes.append("evidence_insufficient")
+                if projection_method and projection_confidence is None:
+                    exploration_codes.append("evidence_insufficient")
+                if bool(segmentation_summary.get("has_structured_segmentation")):
+                    direct_signals = self._navigation_quality_direct_segmentation_signals(segmentation_summary)
+                    if direct_signals and min(direct_signals) < self._NAVIGATION_DIRECT_SEGMENTATION_SIGNAL_MIN:
+                        exploration_codes.append("evidence_insufficient")
+                if candidate_score is not None and candidate_score < self._NAVIGATION_DIRECT_CANDIDATE_SCORE_MIN:
+                    exploration_codes.append("evidence_insufficient")
+                for code in exploration_codes:
+                    add_reason(code)
+                level = "continue_exploration" if exploration_codes else "direct_navigation"
+
+        recommended_action = {
+            "direct_navigation": "navigate",
+            "needs_review": "verify_then_navigate",
+            "continue_exploration": "explore_more",
+            "not_navigable": "reject",
+        }[level]
+        confidence = self._navigation_quality_confidence(level, candidate_score, projection_confidence, segmentation_summary)
+        primary_reason_code = reason_codes[0] if reason_codes else ""
+        return {
+            "schema_version": self._NAVIGATION_QUALITY_SCHEMA_VERSION,
+            "level": level,
+            "confidence": confidence,
+            "recommended_action": recommended_action,
+            "primary_reason_code": primary_reason_code,
+            "reason_codes": reason_codes,
+            "explanation": self._navigation_quality_explanation(level, primary_reason_code),
+            "inputs": {
+                "candidate_score": candidate_score,
+                "projection_confidence": projection_confidence,
+                "projection_method": projection_method or None,
+                "support_point_count": support_point_count,
+                "segmentation_quality": str(segmentation_summary.get("segmentation_quality") or "") or None,
+                "segmentation_review_required": bool(segmentation_summary.get("segmentation_review_required")),
+                "segmentation_risk_factors": list(segmentation_summary.get("segmentation_risk_factors") or []),
+                "planner_query_scope": str(planner_metadata.get("query_scope") or "").strip() or None,
+                "planner_ambiguity_count": ambiguity_count,
+                "planner_negative_constraint_count": negative_constraint_count,
+                "candidate_ranking_hints_present": candidate_ranking_hints_present,
+                "map_version_id": map_version_id,
+                "expected_map_version_id": expected_map_version_id,
+                "localization_session_id": localization_session_id,
+                "expected_localization_session_id": expected_localization_session_id,
+            },
+            "thresholds": self._navigation_quality_thresholds(),
+        }
+
+    def _navigation_quality_reason_codes_from_segmentation(
+        self,
+        segmentation_summary: Dict[str, object],
+    ) -> List[str]:
+        mapping = {
+            "segmentation_support_points_missing": "segmentation_support_missing",
+            "segmentation_score_below_threshold": "segmentation_quality_low",
+            "predicted_iou_below_threshold": "segmentation_quality_low",
+            "stability_score_below_threshold": "segmentation_quality_low",
+            "coverage_below_threshold": "segmentation_coverage_low",
+            "depth_coverage_below_threshold": "segmentation_depth_coverage_low",
+            "map_projection_coverage_below_threshold": "segmentation_map_coverage_low",
+            "reprojection_error_above_threshold": "segmentation_reprojection_error_high",
+            "segmentation_projection_degraded": "projection_degraded",
+            "segmentation_occluded": "segmentation_occluded",
+            "segmentation_truncated": "segmentation_truncated",
+        }
+        reason_codes: List[str] = []
+        for item in segmentation_summary.get("segmentation_risk_factors") or []:
+            code = mapping.get(str(item))
+            if code and code not in reason_codes:
+                reason_codes.append(code)
+        return reason_codes
+
+    def _navigation_quality_direct_segmentation_signals(
+        self,
+        segmentation_summary: Dict[str, object],
+    ) -> List[float]:
+        signals = []
+        for key in (
+            "segmentation_score",
+            "segmentation_quality_score",
+            "stability_score",
+            "coverage",
+            "map_projection_coverage",
+            "depth_coverage",
+        ):
+            value = self._coerce_optional_float(segmentation_summary.get(key))
+            if value is not None:
+                signals.append(value)
+        return signals
+
+    def _navigation_quality_confidence(
+        self,
+        level: str,
+        candidate_score: Optional[float],
+        projection_confidence: Optional[float],
+        segmentation_summary: Dict[str, object],
+    ) -> float:
+        signals = [value for value in (candidate_score, projection_confidence) if value is not None]
+        segmentation_signals = self._navigation_quality_direct_segmentation_signals(segmentation_summary)
+        if segmentation_signals:
+            signals.append(min(segmentation_signals))
+        if not signals:
+            return 0.35 if level == "continue_exploration" else 0.5
+        if level == "not_navigable":
+            return round(max(0.2, 1.0 - min(signals)), 6)
+        return round(self._clamp_score(sum(signals) / len(signals)), 6)
+
+    def _navigation_quality_explanation(self, level: str, primary_reason_code: str) -> str:
+        explanations = {
+            "direct_navigation": "候选证据满足直接导航要求。",
+            "needs_review": "候选可能正确，但存在需要复核的质量风险。",
+            "continue_exploration": "当前候选证据不足，建议继续探索以收集更多观察。",
+            "not_navigable": "候选存在明确不可导航风险，已拒绝直接导航。",
+        }
+        reason_explanations = {
+            "map_version_mismatch": "地图版本不一致。",
+            "localization_session_mismatch": "定位会话不一致。",
+            "current_pose_fallback": "候选使用当前位置回退投影。",
+            "candidate_score_low": "候选召回分偏低。",
+            "projection_confidence_low": "投影置信度不足。",
+            "projection_geometry_missing": "候选缺少可用几何支撑点。",
+            "projection_degraded": "投影质量已降级。",
+            "segmentation_review_required": "分割证据需要复核。",
+            "segmentation_quality_low": "分割质量信号偏低。",
+            "segmentation_support_missing": "分割支撑点缺失。",
+            "segmentation_coverage_low": "分割覆盖率偏低。",
+            "segmentation_depth_coverage_low": "深度覆盖率偏低。",
+            "segmentation_map_coverage_low": "地图投影覆盖率偏低。",
+            "segmentation_reprojection_error_high": "重投影误差过高。",
+            "segmentation_occluded": "目标存在遮挡风险。",
+            "segmentation_truncated": "目标存在截断风险。",
+            "planner_target_ambiguous": "查询目标存在歧义。",
+            "planner_negative_constraint": "查询包含否定约束，需复核候选。",
+            "evidence_insufficient": "关键证据不足。",
+        }
+        explanation = explanations[level]
+        if primary_reason_code:
+            explanation = "%s%s" % (explanation, reason_explanations.get(primary_reason_code, ""))
+        return explanation
+
+    def _summarize_segmentation_metadata(self, metadata: Dict[str, object]) -> Dict[str, object]:
+        segmentation_score = self._coerce_optional_float(metadata.get("segmentation_score"))
+        predicted_iou = self._coerce_optional_float(metadata.get("predicted_iou"))
+        segmentation_quality_score = self._coerce_optional_float(metadata.get("segmentation_quality_score"), predicted_iou)
+        stability_score = self._coerce_optional_float(metadata.get("stability_score"))
+        coverage = self._coerce_optional_float(metadata.get("coverage"))
+        map_projection_coverage = self._coerce_optional_float(metadata.get("map_projection_coverage"))
+        depth_coverage = self._coerce_optional_float(metadata.get("depth_coverage"))
+        reprojection_error = self._coerce_optional_float(metadata.get("reprojection_error"))
+        segmentation_support_point_count = self._coerce_optional_int(metadata.get("segmentation_support_point_count"))
+        occlusion_flags = self._coerce_segmentation_flags(
+            metadata.get("segmentation_occlusion_flags")
+            if metadata.get("segmentation_occlusion_flags") is not None
+            else metadata.get("occlusion_flags")
+        )
+        truncation_flags = self._coerce_segmentation_flags(
+            metadata.get("segmentation_truncation_flags")
+            if metadata.get("segmentation_truncation_flags") is not None
+            else metadata.get("truncation_flags")
+        )
+        projection_degradation_reason = str(metadata.get("projection_degradation_reason") or "").strip()
+        geometry_projection_status = str(metadata.get("geometry_projection_status") or "").strip()
+        segmentation_projection_status = str(metadata.get("segmentation_projection_status") or "").strip()
+        has_structured_segmentation = bool(self._coerce_optional_bool(metadata.get("has_structured_segmentation"))) or any(
+            value is not None
+            for value in (
+                segmentation_score,
+                segmentation_quality_score,
+                stability_score,
+                coverage,
+                map_projection_coverage,
+                depth_coverage,
+                reprojection_error,
+                segmentation_support_point_count,
+            )
+        ) or bool(occlusion_flags or truncation_flags)
+        risk_factors: List[str] = []
+        if segmentation_support_point_count is not None and segmentation_support_point_count <= 0:
+            risk_factors.append("segmentation_support_points_missing")
+        for key, value in (
+            ("segmentation_score_below_threshold", segmentation_score),
+            ("predicted_iou_below_threshold", segmentation_quality_score),
+            ("stability_score_below_threshold", stability_score),
+            ("coverage_below_threshold", coverage),
+            ("depth_coverage_below_threshold", depth_coverage),
+            ("map_projection_coverage_below_threshold", map_projection_coverage),
+        ):
+            if value is not None and value < self._SEGMENTATION_LOW_SIGNAL_THRESHOLD:
+                risk_factors.append(key)
+        if reprojection_error is not None and reprojection_error > self._SEGMENTATION_REPROJECTION_ERROR_GATE:
+            risk_factors.append("reprojection_error_above_threshold")
+        if occlusion_flags:
+            risk_factors.append("segmentation_occluded")
+        if truncation_flags:
+            risk_factors.append("segmentation_truncated")
+        degraded_text = " ".join([projection_degradation_reason, geometry_projection_status, segmentation_projection_status]).lower()
+        if any(token in degraded_text for token in ("fallback", "failed", "no_depth", "degraded")):
+            risk_factors.append("segmentation_projection_degraded")
+        unique_risks: List[str] = []
+        for item in risk_factors:
+            if item not in unique_risks:
+                unique_risks.append(item)
+        quality_signals = [
+            value
+            for value in (
+                segmentation_score,
+                segmentation_quality_score,
+                stability_score,
+                coverage,
+                map_projection_coverage,
+                depth_coverage,
+            )
+            if value is not None
+        ]
+        if unique_risks:
+            segmentation_quality = "low"
+        elif quality_signals and min(quality_signals) >= 0.65:
+            segmentation_quality = "high"
+        elif has_structured_segmentation:
+            segmentation_quality = "medium"
+        else:
+            segmentation_quality = "unknown"
+        return {
+            "has_structured_segmentation": has_structured_segmentation,
+            "segmentation_score": segmentation_score,
+            "predicted_iou": predicted_iou,
+            "segmentation_quality_score": segmentation_quality_score,
+            "stability_score": stability_score,
+            "coverage": coverage,
+            "map_projection_coverage": map_projection_coverage,
+            "depth_coverage": depth_coverage,
+            "reprojection_error": reprojection_error,
+            "segmentation_support_point_count": int(segmentation_support_point_count or 0),
+            "segmentation_occlusion_flags": occlusion_flags,
+            "segmentation_truncation_flags": truncation_flags,
+            "segmentation_risk_factors": unique_risks,
+            "segmentation_quality_reason": unique_risks[0] if unique_risks else "",
+            "segmentation_quality": segmentation_quality,
+            "segmentation_review_required": segmentation_quality == "low",
+        }
+
+    def _coerce_segmentation_flags(self, value: object) -> List[str]:
+        if value is None or isinstance(value, bool):
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item or "").strip()]
+        normalized = str(value).strip()
+        if not normalized:
+            return []
+        return [item.strip() for item in normalized.split(",") if item.strip()]
+
+    def _collect_arrival_segmentation_evidence(
+        self,
+        detections: Iterable[Detection2D],
+        *,
+        query: str,
+        target_labels: List[str],
+    ) -> Dict[str, object]:
+        best_detection = None
+        best_score = 0.0
+        normalized_targets = [self._normalize_text(item) for item in target_labels if self._normalize_text(item)]
+        for detection in detections:
+            texts = [
+                detection.label,
+                *self._flatten_metadata_strings(detection.attributes),
+            ]
+            score, _ = self._score_text_candidates(
+                self._normalize_text(query),
+                texts,
+                fallback_reason="当前检测与到点目标存在一定相似度。",
+            )
+            normalized_label = self._normalize_text(detection.label)
+            if normalized_label in normalized_targets:
+                score = max(score, 0.99)
+            if score > best_score:
+                best_score = score
+                best_detection = detection
+        if best_detection is None:
+            return {
+                "has_structured_segmentation": False,
+                "matched_segmentation_label": "",
+                "segmentation_match_score": 0.0,
+                **self._summarize_segmentation_metadata({}),
+            }
+        metadata = self._segmentation_metadata_from_detection(best_detection)
+        summary = self._summarize_segmentation_metadata(metadata)
+        return {
+            **summary,
+            "matched_segmentation_label": best_detection.label,
+            "segmentation_match_score": round(best_score, 6),
+        }
+
+    def _segmentation_metadata_from_detection(self, detection: Detection2D) -> Dict[str, object]:
+        metadata = dict(detection.attributes or {})
+        segmentation = detection.segmentation
+        if segmentation is None:
+            return metadata
+        metadata["has_structured_segmentation"] = True
+        if segmentation.quality.score is not None:
+            metadata.setdefault("segmentation_score", float(segmentation.quality.score))
+        if segmentation.quality.predicted_iou is not None:
+            metadata.setdefault("predicted_iou", float(segmentation.quality.predicted_iou))
+        if segmentation.quality.stability_score is not None:
+            metadata.setdefault("stability_score", float(segmentation.quality.stability_score))
+        if segmentation.quality.depth_coverage is not None:
+            metadata.setdefault("depth_coverage", float(segmentation.quality.depth_coverage))
+        if segmentation.quality.map_projection_coverage is not None:
+            metadata.setdefault("map_projection_coverage", float(segmentation.quality.map_projection_coverage))
+        if segmentation.quality.reprojection_error is not None:
+            metadata.setdefault("reprojection_error", float(segmentation.quality.reprojection_error))
+        if segmentation.bbox_xyxy is not None:
+            metadata.setdefault("segmentation_bbox_xyxy", [float(item) for item in segmentation.bbox_xyxy])
+        if segmentation.centroid_uv is not None:
+            metadata.setdefault("centroid_uv", [float(segmentation.centroid_uv[0]), float(segmentation.centroid_uv[1])])
+        if segmentation.area_ratio is not None:
+            metadata.setdefault("segmentation_area_ratio", float(segmentation.area_ratio))
+        if segmentation.occlusion_flags:
+            metadata.setdefault("segmentation_occlusion_flags", list(segmentation.occlusion_flags))
+        if segmentation.truncation_flags:
+            metadata.setdefault("segmentation_truncation_flags", list(segmentation.truncation_flags))
+        return metadata
+
     def _build_query_match(
         self,
         query: str,
         candidate: _ScoredCandidate,
         current_pose: Optional[Pose],
+        *,
+        grounding_plan: Optional[GroundingQueryPlan] = None,
+        expected_map_version_id: Optional[str] = None,
+        expected_localization_session_id: Optional[str] = None,
+        include_non_direct_navigation_candidate: bool = False,
     ) -> MemoryQueryMatch:
         candidate_localization_session_id = str(candidate.point.payload.get("localization_session_id") or "").strip() or None
         navigation_candidate = None
+        navigation_metadata = self._evaluate_navigation_metadata(
+            dict(candidate.point.payload),
+            backend_name=str(candidate.point.payload.get("backend") or candidate.point.payload.get("backend_type") or "memory_service"),
+            candidate_score=candidate.final_score,
+            grounding_plan=grounding_plan,
+            map_version_id=str(candidate.point.payload.get("map_version_id") or "").strip() or None,
+            expected_map_version_id=expected_map_version_id,
+            localization_session_id=candidate_localization_session_id,
+            expected_localization_session_id=expected_localization_session_id,
+        )
         if candidate.tagged_location is not None:
-            navigation_candidate = self._build_navigation_candidate(
-                query,
-                record_kind=MemoryRecordKind.TAGGED_LOCATION,
-                record_id=candidate.tagged_location.location_id,
-                anchor_id=self._resolve_location_anchor_id(candidate.tagged_location),
-                inspection_pose=candidate.tagged_location.pose,
-                anchor_pose=candidate.tagged_location.pose,
-                target_name=candidate.tagged_location.name,
-                linked_location_id=candidate.tagged_location.location_id,
+            source_metadata = {**dict(candidate.tagged_location.metadata), **dict(candidate.point.payload)}
+            backend_name = "memory_service.tagged_location"
+            navigation_metadata = self._evaluate_navigation_metadata(
+                source_metadata,
+                backend_name=backend_name,
+                candidate_score=candidate.final_score,
+                grounding_plan=grounding_plan,
                 map_version_id=candidate.tagged_location.map_version_id,
-                topo_node_id=candidate.tagged_location.topo_node_id,
-                semantic_region_id=candidate.tagged_location.semantic_region_id,
-                artifact_ids=[],
-                current_pose=current_pose,
-                verification_memory_id=candidate.tagged_location.memory_id,
-                verification_text=candidate.tagged_location.perception_headline or query,
-                camera_id=None,
+                expected_map_version_id=expected_map_version_id,
                 localization_session_id=candidate_localization_session_id,
+                expected_localization_session_id=expected_localization_session_id,
             )
+            if navigation_metadata["navigable"] or include_non_direct_navigation_candidate:
+                navigation_candidate = self._build_navigation_candidate(
+                    query,
+                    record_kind=MemoryRecordKind.TAGGED_LOCATION,
+                    record_id=candidate.tagged_location.location_id,
+                    anchor_id=self._resolve_location_anchor_id(candidate.tagged_location),
+                    inspection_pose=candidate.tagged_location.pose,
+                    anchor_pose=candidate.tagged_location.pose,
+                    target_name=candidate.tagged_location.name,
+                    linked_location_id=candidate.tagged_location.location_id,
+                    map_version_id=candidate.tagged_location.map_version_id,
+                    topo_node_id=candidate.tagged_location.topo_node_id,
+                    semantic_region_id=candidate.tagged_location.semantic_region_id,
+                    artifact_ids=[],
+                    current_pose=current_pose,
+                    verification_memory_id=candidate.tagged_location.memory_id,
+                    verification_text=candidate.tagged_location.perception_headline or query,
+                    camera_id=None,
+                    localization_session_id=candidate_localization_session_id,
+                    source_metadata=source_metadata,
+                    backend_name=backend_name,
+                    candidate_score=candidate.final_score,
+                    navigation_metadata=navigation_metadata,
+                )
         elif candidate.semantic_memory is not None and candidate.semantic_memory.pose is not None:
-            navigation_candidate = self._build_navigation_candidate(
-                query,
-                record_kind=candidate.semantic_memory.kind,
-                record_id=candidate.semantic_memory.memory_id,
-                anchor_id=self._resolve_memory_anchor_id(candidate.semantic_memory),
-                inspection_pose=self._resolve_inspection_pose(
-                    anchor_id=self._resolve_memory_anchor_id(candidate.semantic_memory),
-                    fallback_pose=candidate.semantic_memory.pose,
-                ),
-                anchor_pose=candidate.semantic_memory.pose,
-                target_name=candidate.semantic_memory.title,
-                linked_location_id=candidate.semantic_memory.linked_location_id,
+            source_metadata = {**dict(candidate.semantic_memory.metadata), **dict(candidate.point.payload)}
+            backend_name = str(candidate.semantic_memory.metadata.get("backend") or "memory_service.semantic_memory")
+            navigation_metadata = self._evaluate_navigation_metadata(
+                source_metadata,
+                backend_name=backend_name,
+                candidate_score=candidate.final_score,
+                grounding_plan=grounding_plan,
                 map_version_id=candidate.semantic_memory.map_version_id,
-                topo_node_id=candidate.semantic_memory.topo_node_id,
-                semantic_region_id=candidate.semantic_memory.semantic_region_id,
-                artifact_ids=candidate.semantic_memory.artifact_ids,
-                current_pose=current_pose,
-                verification_memory_id=candidate.semantic_memory.memory_id,
-                verification_text=(
-                    candidate.semantic_memory.perception_headline
-                    or candidate.semantic_memory.summary
-                    or query
-                ),
-                camera_id=str(candidate.point.payload.get("camera_id") or "") or None,
+                expected_map_version_id=expected_map_version_id,
                 localization_session_id=candidate_localization_session_id,
+                expected_localization_session_id=expected_localization_session_id,
             )
+            if navigation_metadata["navigable"] or include_non_direct_navigation_candidate:
+                navigation_candidate = self._build_navigation_candidate(
+                    query,
+                    record_kind=candidate.semantic_memory.kind,
+                    record_id=candidate.semantic_memory.memory_id,
+                    anchor_id=self._resolve_memory_anchor_id(candidate.semantic_memory),
+                    inspection_pose=self._resolve_inspection_pose(
+                        anchor_id=self._resolve_memory_anchor_id(candidate.semantic_memory),
+                        fallback_pose=candidate.semantic_memory.pose,
+                    ),
+                    anchor_pose=candidate.semantic_memory.pose,
+                    target_name=candidate.semantic_memory.title,
+                    linked_location_id=candidate.semantic_memory.linked_location_id,
+                    map_version_id=candidate.semantic_memory.map_version_id,
+                    topo_node_id=candidate.semantic_memory.topo_node_id,
+                    semantic_region_id=candidate.semantic_memory.semantic_region_id,
+                    artifact_ids=candidate.semantic_memory.artifact_ids,
+                    current_pose=current_pose,
+                    verification_memory_id=candidate.semantic_memory.memory_id,
+                    verification_text=(
+                        candidate.semantic_memory.perception_headline
+                        or candidate.semantic_memory.summary
+                        or query
+                    ),
+                    camera_id=str(candidate.point.payload.get("camera_id") or "") or None,
+                    localization_session_id=candidate_localization_session_id,
+                    source_metadata=source_metadata,
+                    backend_name=backend_name,
+                    candidate_score=candidate.final_score,
+                    navigation_metadata=navigation_metadata,
+                )
         elif candidate.semantic_instance is not None:
-            navigation_candidate = self._build_navigation_candidate(
-                query,
-                record_kind=MemoryRecordKind.OBJECT_INSTANCE,
-                record_id=candidate.semantic_instance.instance_id,
-                anchor_id=candidate.semantic_instance.anchor_id,
-                inspection_pose=self._resolve_inspection_pose(
-                    anchor_id=candidate.semantic_instance.anchor_id,
-                    fallback_pose=candidate.semantic_instance.pose,
-                    override_poses=candidate.semantic_instance.inspection_poses,
-                ),
-                anchor_pose=candidate.semantic_instance.pose,
-                target_name=candidate.semantic_instance.display_name or candidate.semantic_instance.label,
-                linked_location_id=None,
+            source_metadata = {**dict(candidate.semantic_instance.metadata), **dict(candidate.point.payload)}
+            backend_name = str(candidate.semantic_instance.metadata.get("backend") or "memory_service.semantic_instance")
+            navigation_metadata = self._evaluate_navigation_metadata(
+                source_metadata,
+                backend_name=backend_name,
+                candidate_score=candidate.final_score,
+                grounding_plan=grounding_plan,
                 map_version_id=candidate.semantic_instance.map_version_id,
-                topo_node_id=candidate.semantic_instance.topo_node_id,
-                semantic_region_id=candidate.semantic_instance.semantic_region_id,
-                artifact_ids=candidate.semantic_instance.artifact_ids,
-                current_pose=current_pose,
-                verification_memory_id=None,
-                verification_text=" ".join(
-                    [
-                        candidate.semantic_instance.label,
-                        " ".join(candidate.semantic_instance.semantic_labels),
-                        " ".join(candidate.semantic_instance.vision_tags),
-                    ]
-                ).strip()
-                or query,
-                camera_id=str(candidate.semantic_instance.metadata.get("last_camera_id", "") or "") or None,
+                expected_map_version_id=expected_map_version_id,
                 localization_session_id=candidate_localization_session_id,
+                expected_localization_session_id=expected_localization_session_id,
             )
+            if navigation_metadata["navigable"] or include_non_direct_navigation_candidate:
+                navigation_candidate = self._build_navigation_candidate(
+                    query,
+                    record_kind=MemoryRecordKind.OBJECT_INSTANCE,
+                    record_id=candidate.semantic_instance.instance_id,
+                    anchor_id=candidate.semantic_instance.anchor_id,
+                    inspection_pose=self._resolve_inspection_pose(
+                        anchor_id=candidate.semantic_instance.anchor_id,
+                        fallback_pose=candidate.semantic_instance.pose,
+                        override_poses=candidate.semantic_instance.inspection_poses,
+                    ),
+                    anchor_pose=candidate.semantic_instance.pose,
+                    target_name=candidate.semantic_instance.display_name or candidate.semantic_instance.label,
+                    linked_location_id=None,
+                    map_version_id=candidate.semantic_instance.map_version_id,
+                    topo_node_id=candidate.semantic_instance.topo_node_id,
+                    semantic_region_id=candidate.semantic_instance.semantic_region_id,
+                    artifact_ids=candidate.semantic_instance.artifact_ids,
+                    current_pose=current_pose,
+                    verification_memory_id=None,
+                    verification_text=" ".join(
+                        [
+                            candidate.semantic_instance.label,
+                            " ".join(candidate.semantic_instance.semantic_labels),
+                            " ".join(candidate.semantic_instance.vision_tags),
+                        ]
+                    ).strip()
+                    or query,
+                    camera_id=str(candidate.semantic_instance.metadata.get("last_camera_id", "") or "") or None,
+                    localization_session_id=candidate_localization_session_id,
+                    source_metadata=source_metadata,
+                    backend_name=backend_name,
+                    candidate_score=candidate.final_score,
+                    navigation_metadata=navigation_metadata,
+                )
         elif candidate.observation_event is not None and candidate.observation_event.pose is not None:
-            navigation_candidate = self._build_navigation_candidate(
-                query,
-                record_kind=MemoryRecordKind.OBSERVATION_EVENT,
-                record_id=candidate.observation_event.event_id,
-                anchor_id=candidate.observation_event.anchor_id or self._resolve_anchor_id_for_pose(
-                    candidate.observation_event.pose,
-                    semantic_region_id=candidate.observation_event.semantic_region_id,
-                    topo_node_id=candidate.observation_event.topo_node_id,
-                ),
-                inspection_pose=self._resolve_inspection_pose(
-                    anchor_id=candidate.observation_event.anchor_id,
-                    fallback_pose=candidate.observation_event.pose,
-                ),
-                anchor_pose=candidate.observation_event.pose,
-                target_name=candidate.observation_event.title,
-                linked_location_id=None,
+            source_metadata = {**dict(candidate.observation_event.metadata), **dict(candidate.point.payload)}
+            backend_name = str(candidate.observation_event.metadata.get("backend") or "memory_service.observation_event")
+            navigation_metadata = self._evaluate_navigation_metadata(
+                source_metadata,
+                backend_name=backend_name,
+                candidate_score=candidate.final_score,
+                grounding_plan=grounding_plan,
                 map_version_id=candidate.observation_event.map_version_id,
-                topo_node_id=candidate.observation_event.topo_node_id,
-                semantic_region_id=candidate.observation_event.semantic_region_id,
-                artifact_ids=candidate.observation_event.artifact_ids,
-                current_pose=current_pose,
-                verification_memory_id=candidate.observation_event.source_memory_id,
-                verification_text=candidate.observation_event.summary or query,
-                camera_id=candidate.observation_event.camera_id,
+                expected_map_version_id=expected_map_version_id,
                 localization_session_id=candidate_localization_session_id,
+                expected_localization_session_id=expected_localization_session_id,
             )
+            if navigation_metadata["navigable"] or include_non_direct_navigation_candidate:
+                navigation_candidate = self._build_navigation_candidate(
+                    query,
+                    record_kind=MemoryRecordKind.OBSERVATION_EVENT,
+                    record_id=candidate.observation_event.event_id,
+                    anchor_id=candidate.observation_event.anchor_id or self._resolve_anchor_id_for_pose(
+                        candidate.observation_event.pose,
+                        semantic_region_id=candidate.observation_event.semantic_region_id,
+                        topo_node_id=candidate.observation_event.topo_node_id,
+                    ),
+                    inspection_pose=self._resolve_inspection_pose(
+                        anchor_id=candidate.observation_event.anchor_id,
+                        fallback_pose=candidate.observation_event.pose,
+                    ),
+                    anchor_pose=candidate.observation_event.pose,
+                    target_name=candidate.observation_event.title,
+                    linked_location_id=None,
+                    map_version_id=candidate.observation_event.map_version_id,
+                    topo_node_id=candidate.observation_event.topo_node_id,
+                    semantic_region_id=candidate.observation_event.semantic_region_id,
+                    artifact_ids=candidate.observation_event.artifact_ids,
+                    current_pose=current_pose,
+                    verification_memory_id=candidate.observation_event.source_memory_id,
+                    verification_text=candidate.observation_event.summary or query,
+                    camera_id=candidate.observation_event.camera_id,
+                    localization_session_id=candidate_localization_session_id,
+                    source_metadata=source_metadata,
+                    backend_name=backend_name,
+                    candidate_score=candidate.final_score,
+                    navigation_metadata=navigation_metadata,
+                )
 
         reason = self._build_match_reason(candidate)
         return MemoryQueryMatch(
@@ -1801,8 +2689,9 @@ class MemoryService:
                 "image_score": round(candidate.image_score, 6),
                 "spatial_score": round(candidate.spatial_score, 6),
                 "recency_score": round(candidate.recency_score, 6),
-                "type_prior": round(self._type_prior(candidate.record_kind), 6),
+                "type_prior": round(self._type_prior(candidate.record_kind, query_scope=candidate.query_scope), 6),
                 "distance_m": round(candidate.distance_m, 4) if candidate.distance_m is not None else None,
+                **navigation_metadata,
                 "vector_names": sorted(candidate.point.vectors.keys()),
             },
         )
@@ -1828,10 +2717,30 @@ class MemoryService:
         verification_text: Optional[str],
         camera_id: Optional[str],
         localization_session_id: Optional[str] = None,
+        source_metadata: Optional[Dict[str, object]] = None,
+        backend_name: str = "memory_service",
+        candidate_score: float = 1.0,
+        navigation_metadata: Optional[Dict[str, object]] = None,
     ) -> NavigationCandidate:
         _, distance_m = self._compute_spatial_score(current_pose, inspection_pose)
         verification_artifact_id = artifact_ids[0] if artifact_ids else None
         platform_binding = self._build_platform_semantic_metadata(map_version_id=map_version_id)
+        clamped_score = self._clamp_score(candidate_score)
+        if navigation_metadata is None:
+            navigation_metadata = self._evaluate_navigation_metadata(
+                source_metadata,
+                backend_name=backend_name,
+                candidate_score=clamped_score,
+                map_version_id=map_version_id,
+                localization_session_id=str(
+                    localization_session_id
+                    or platform_binding.get("localization_session_id")
+                    or ""
+                ) or None,
+            )
+        navigation_quality_summary = self._navigation_quality_observability_fields(
+            navigation_metadata.get("navigation_quality")
+        )
         return NavigationCandidate(
             candidate_id=self._build_navigation_candidate_id(record_id),
             anchor_id=anchor_id or self._fallback_anchor_id(record_id),
@@ -1844,7 +2753,7 @@ class MemoryService:
             topo_node_id=topo_node_id,
             semantic_region_id=semantic_region_id,
             distance_m=distance_m,
-            score=1.0,
+            score=clamped_score,
             verification_query=verification_text or query,
             verification_artifact_id=verification_artifact_id,
             metadata={
@@ -1859,6 +2768,37 @@ class MemoryService:
                     or platform_binding.get("localization_session_id")
                     or ""
                 ) or "",
+                "backend": navigation_metadata["backend"],
+                "backend_type": navigation_metadata["backend_type"],
+                "source_collection": self._collection_for_record_kind(record_kind),
+                "candidate_score": navigation_metadata["candidate_score"],
+                "projection_method": navigation_metadata["projection_method"],
+                "projection_confidence": navigation_metadata["projection_confidence"],
+                "support_point_count": navigation_metadata["support_point_count"],
+                "navigable": navigation_metadata["navigable"],
+                "non_navigable_reason": navigation_metadata["non_navigable_reason"],
+                "navigation_quality": navigation_metadata["navigation_quality"],
+                **navigation_quality_summary,
+                "projection_degradation_reason": navigation_metadata["projection_degradation_reason"],
+                "geometry_projection_method": navigation_metadata["geometry_projection_method"],
+                "geometry_projection_status": navigation_metadata["geometry_projection_status"],
+                "segmentation_projection_status": navigation_metadata["segmentation_projection_status"],
+                "has_structured_segmentation": navigation_metadata["has_structured_segmentation"],
+                "segmentation_score": navigation_metadata["segmentation_score"],
+                "predicted_iou": navigation_metadata["predicted_iou"],
+                "segmentation_quality_score": navigation_metadata["segmentation_quality_score"],
+                "stability_score": navigation_metadata["stability_score"],
+                "coverage": navigation_metadata["coverage"],
+                "map_projection_coverage": navigation_metadata["map_projection_coverage"],
+                "depth_coverage": navigation_metadata["depth_coverage"],
+                "reprojection_error": navigation_metadata["reprojection_error"],
+                "segmentation_support_point_count": navigation_metadata["segmentation_support_point_count"],
+                "segmentation_quality": navigation_metadata["segmentation_quality"],
+                "segmentation_review_required": navigation_metadata["segmentation_review_required"],
+                "segmentation_risk_factors": navigation_metadata["segmentation_risk_factors"],
+                "segmentation_quality_reason": navigation_metadata["segmentation_quality_reason"],
+                "segmentation_occlusion_flags": navigation_metadata["segmentation_occlusion_flags"],
+                "segmentation_truncation_flags": navigation_metadata["segmentation_truncation_flags"],
             },
         )
 
@@ -2111,6 +3051,17 @@ class MemoryService:
             "pose_z": pose_z,
             "visual_labels": visual_labels,
             "vision_tags": vision_tags,
+            "projection_method": str(entry.metadata.get("projection_method") or ""),
+            "projection_confidence": entry.metadata.get("projection_confidence"),
+            "support_point_count": entry.metadata.get("support_point_count"),
+            "navigable": entry.metadata.get("navigable"),
+            "non_navigable_reason": str(entry.metadata.get("non_navigable_reason") or ""),
+            "backend": str(entry.metadata.get("backend") or "memory_service.semantic_memory"),
+            "backend_type": str(
+                entry.metadata.get("backend_type")
+                or entry.metadata.get("backend")
+                or "memory_service.semantic_memory"
+            ),
             "verification_text": entry.perception_headline or entry.summary or entry.title,
             "retrieval_text": retrieval_text,
         }
@@ -2132,6 +3083,17 @@ class MemoryService:
             "semantic_labels": list(instance.semantic_labels),
             "visual_labels": list(instance.visual_labels),
             "vision_tags": list(instance.vision_tags),
+            "projection_method": str(instance.metadata.get("projection_method") or ""),
+            "projection_confidence": instance.metadata.get("projection_confidence"),
+            "support_point_count": instance.metadata.get("support_point_count"),
+            "navigable": instance.metadata.get("navigable"),
+            "non_navigable_reason": str(instance.metadata.get("non_navigable_reason") or ""),
+            "backend": str(instance.metadata.get("backend") or "memory_service.semantic_instance"),
+            "backend_type": str(
+                instance.metadata.get("backend_type")
+                or instance.metadata.get("backend")
+                or "memory_service.semantic_instance"
+            ),
             "artifact_ids": list(instance.artifact_ids),
             "timestamp": instance.first_seen_ts.isoformat(),
             "last_seen_ts": instance.last_seen_ts.isoformat(),
@@ -2163,6 +3125,17 @@ class MemoryService:
             "vision_tags": list(event.vision_tags),
             "artifact_ids": list(event.artifact_ids),
             "linked_instance_ids": list(event.linked_instance_ids),
+            "projection_method": str(event.metadata.get("projection_method") or ""),
+            "projection_confidence": event.metadata.get("projection_confidence"),
+            "support_point_count": event.metadata.get("support_point_count"),
+            "navigable": event.metadata.get("navigable"),
+            "non_navigable_reason": str(event.metadata.get("non_navigable_reason") or ""),
+            "backend": str(event.metadata.get("backend") or "memory_service.observation_event"),
+            "backend_type": str(
+                event.metadata.get("backend_type")
+                or event.metadata.get("backend")
+                or "memory_service.observation_event"
+            ),
             "timestamp": event.timestamp.isoformat(),
             "pose_x": pose_x,
             "pose_y": pose_y,
@@ -2394,10 +3367,11 @@ class MemoryService:
         image_score: float,
         spatial_score: float,
         recency_score: float,
+        query_scope: str,
     ) -> float:
         if record_kind == MemoryRecordKind.TAGGED_LOCATION:
             if lexical_score >= 0.99:
-                return 1.0
+                return self._apply_type_prior(1.0, record_kind, query_scope=query_scope)
             score = (
                 (0.45 * lexical_score)
                 + (0.35 * text_recall_score)
@@ -2406,7 +3380,7 @@ class MemoryService:
                 + (0.05 * recency_score)
             )
             base_score = self._clamp_score(max(score, lexical_score * 0.95, text_recall_score * 0.9))
-            return self._apply_type_prior(base_score, record_kind)
+            return self._apply_type_prior(base_score, record_kind, query_scope=query_scope)
         if record_kind == MemoryRecordKind.OBJECT_INSTANCE:
             score = (
                 (0.12 * lexical_score)
@@ -2416,7 +3390,7 @@ class MemoryService:
                 + (0.10 * recency_score)
             )
             base_score = self._clamp_score(max(score, (0.92 * text_recall_score) + 0.03))
-            return self._apply_type_prior(base_score, record_kind)
+            return self._apply_type_prior(base_score, record_kind, query_scope=query_scope)
         if record_kind == MemoryRecordKind.OBSERVATION_EVENT:
             score = (
                 (0.18 * lexical_score)
@@ -2426,7 +3400,7 @@ class MemoryService:
                 + (0.08 * recency_score)
             )
             base_score = self._clamp_score(max(score, (0.96 * text_recall_score) + 0.02))
-            return self._apply_type_prior(base_score, record_kind)
+            return self._apply_type_prior(base_score, record_kind, query_scope=query_scope)
         score = (
             (0.20 * lexical_score)
             + (0.45 * text_recall_score)
@@ -2435,13 +3409,34 @@ class MemoryService:
             + (0.05 * recency_score)
         )
         base_score = self._clamp_score(max(score, text_recall_score + 0.03, image_score * 0.9))
-        return self._apply_type_prior(base_score, record_kind)
+        return self._apply_type_prior(base_score, record_kind, query_scope=query_scope)
 
-    def _apply_type_prior(self, base_score: float, record_kind: MemoryRecordKind) -> float:
-        type_prior = self._type_prior(record_kind)
+    def _apply_type_prior(self, base_score: float, record_kind: MemoryRecordKind, *, query_scope: str) -> float:
+        type_prior = self._type_prior(record_kind, query_scope=query_scope)
         return self._clamp_score(base_score * type_prior)
 
-    def _type_prior(self, record_kind: MemoryRecordKind) -> float:
+    def _type_prior(self, record_kind: MemoryRecordKind, *, query_scope: str) -> float:
+        normalized_scope = str(query_scope or "mixed").strip() or "mixed"
+        if normalized_scope == "place":
+            if record_kind == MemoryRecordKind.TAGGED_LOCATION:
+                return 1.08
+            if record_kind == MemoryRecordKind.OBJECT_INSTANCE:
+                return 0.82
+            if record_kind == MemoryRecordKind.OBSERVATION_EVENT:
+                return 0.88
+            if record_kind in {MemoryRecordKind.SCENE, MemoryRecordKind.NOTE}:
+                return 0.8
+            return 1.0
+        if normalized_scope == "object":
+            if record_kind == MemoryRecordKind.OBJECT_INSTANCE:
+                return 1.08
+            if record_kind == MemoryRecordKind.OBSERVATION_EVENT:
+                return 0.93
+            if record_kind == MemoryRecordKind.TAGGED_LOCATION:
+                return 0.72
+            if record_kind in {MemoryRecordKind.SCENE, MemoryRecordKind.NOTE}:
+                return 0.76
+            return 1.0
         if record_kind == MemoryRecordKind.OBJECT_INSTANCE:
             return 1.0
         if record_kind == MemoryRecordKind.OBSERVATION_EVENT:
@@ -2565,17 +3560,44 @@ class MemoryService:
         )
         self._semantic_instances_by_id = dict(updated_instances)
         linked_instance_ids: List[str] = []
-        for outcome in outcomes:
+        for projected_item, outcome in zip(projected, outcomes):
+            projection_metadata = dict(outcome.instance.metadata)
+            projection_metadata.update(
+                {
+                    "projection_method": str(projected_item.attributes.get("projection_method") or ""),
+                    "projection_confidence": self._coerce_optional_float(
+                        projected_item.attributes.get("projection_confidence")
+                    ),
+                    "support_point_count": self._coerce_optional_int(
+                        projected_item.attributes.get("support_point_count")
+                    )
+                    or 0,
+                }
+            )
+            platform_metadata = self._build_platform_semantic_metadata(
+                map_snapshot=map_snapshot,
+                localization_snapshot=localization_snapshot,
+                map_version_id=outcome.instance.map_version_id,
+            )
+            projection_metadata.update(platform_metadata)
+            projection_metadata.update(
+                self._evaluate_navigation_metadata(
+                    projection_metadata,
+                    backend_name=str(
+                        projection_metadata.get("backend")
+                        or projection_metadata.get("backend_type")
+                        or "memory_service.semantic_instance"
+                    ),
+                    map_version_id=str(platform_metadata.get("map_version_id") or "").strip() or None,
+                    localization_session_id=str(platform_metadata.get("localization_session_id") or "").strip() or None,
+                )
+            )
             instance = outcome.instance.model_copy(
                 update={
                     "metadata": self._attach_library_metadata(
                         {
-                            **dict(outcome.instance.metadata),
-                            **self._build_platform_semantic_metadata(
-                                map_snapshot=map_snapshot,
-                                localization_snapshot=localization_snapshot,
-                                map_version_id=outcome.instance.map_version_id,
-                            ),
+                            **projection_metadata,
+                            **platform_metadata,
                         }
                     )
                 },
@@ -2627,6 +3649,8 @@ class MemoryService:
                 deep=True,
             )
             self._semantic_instances_by_id[instance_id] = updated_instance
+            self._semantic_instance_history.append(updated_instance)
+            self._write_semantic_instance_state(updated_instance)
             self._repository.upsert_semantic_instance(updated_instance)
             self._upsert_vector_point_for_instance(updated_instance)
 
@@ -2644,6 +3668,15 @@ class MemoryService:
             labels.extend(instance.semantic_labels)
             labels.extend(instance.visual_labels)
             labels.extend(instance.vision_tags)
+        return self._normalize_tags(labels)
+
+    def _collect_known_grounding_object_labels(self) -> List[str]:
+        labels: List[str] = []
+        for instance in self._semantic_instances_by_id.values():
+            labels.append(instance.label)
+            if instance.display_name:
+                labels.append(instance.display_name)
+            labels.extend(instance.visual_labels)
         return self._normalize_tags(labels)
 
     def _collection_for_record_kind(self, record_kind: MemoryRecordKind) -> str:
@@ -2901,6 +3934,9 @@ class MemoryService:
 
     def _to_legacy_navigation_candidate(self, candidate: NavigationCandidate) -> MemoryNavigationCandidate:
         record_kind = MemoryRecordKind(str(candidate.metadata.get("record_kind") or MemoryRecordKind.NOTE.value))
+        navigation_quality_summary = self._navigation_quality_observability_fields(
+            candidate.metadata.get("navigation_quality")
+        )
         return MemoryNavigationCandidate(
             record_kind=record_kind,
             record_id=candidate.record_id,
@@ -2920,6 +3956,41 @@ class MemoryService:
                 "candidate_id": candidate.candidate_id,
                 "map_name": str(candidate.metadata.get("map_name") or ""),
                 "localization_session_id": str(candidate.metadata.get("localization_session_id") or ""),
+                "backend": str(candidate.metadata.get("backend") or "memory_service"),
+                "backend_type": str(
+                    candidate.metadata.get("backend_type")
+                    or candidate.metadata.get("backend")
+                    or "memory_service"
+                ),
+                "source_collection": str(candidate.metadata.get("source_collection") or candidate.source_collection),
+                "candidate_score": candidate.score,
+                "projection_method": str(candidate.metadata.get("projection_method") or ""),
+                "projection_confidence": candidate.metadata.get("projection_confidence"),
+                "support_point_count": candidate.metadata.get("support_point_count"),
+                "navigable": candidate.metadata.get("navigable"),
+                "non_navigable_reason": str(candidate.metadata.get("non_navigable_reason") or ""),
+                "navigation_quality": candidate.metadata.get("navigation_quality"),
+                **navigation_quality_summary,
+                "projection_degradation_reason": candidate.metadata.get("projection_degradation_reason"),
+                "geometry_projection_method": candidate.metadata.get("geometry_projection_method"),
+                "geometry_projection_status": candidate.metadata.get("geometry_projection_status"),
+                "segmentation_projection_status": candidate.metadata.get("segmentation_projection_status"),
+                "has_structured_segmentation": candidate.metadata.get("has_structured_segmentation"),
+                "segmentation_score": candidate.metadata.get("segmentation_score"),
+                "predicted_iou": candidate.metadata.get("predicted_iou"),
+                "segmentation_quality_score": candidate.metadata.get("segmentation_quality_score"),
+                "stability_score": candidate.metadata.get("stability_score"),
+                "coverage": candidate.metadata.get("coverage"),
+                "map_projection_coverage": candidate.metadata.get("map_projection_coverage"),
+                "depth_coverage": candidate.metadata.get("depth_coverage"),
+                "reprojection_error": candidate.metadata.get("reprojection_error"),
+                "segmentation_support_point_count": candidate.metadata.get("segmentation_support_point_count"),
+                "segmentation_quality": candidate.metadata.get("segmentation_quality"),
+                "segmentation_review_required": candidate.metadata.get("segmentation_review_required"),
+                "segmentation_risk_factors": candidate.metadata.get("segmentation_risk_factors"),
+                "segmentation_quality_reason": candidate.metadata.get("segmentation_quality_reason"),
+                "segmentation_occlusion_flags": candidate.metadata.get("segmentation_occlusion_flags"),
+                "segmentation_truncation_flags": candidate.metadata.get("segmentation_truncation_flags"),
             },
         )
 
@@ -3115,6 +4186,29 @@ class MemoryService:
             metadata={"kind": "semantic_memory"},
         )
 
+    def _record_arrival_verification(self, result: MemoryArrivalVerification) -> MemoryArrivalVerification:
+        self._state_store.write(
+            StateNamespace.MEMORY,
+            "last_arrival_verification",
+            result,
+            source="memory_service",
+            metadata={"kind": "arrival_verification"},
+        )
+        metadata = dict(result.metadata or {})
+        self._publish_memory_event(
+            "memory.arrival_verification_completed",
+            "记忆到点复核已完成。",
+            payload={
+                "arrival_verified": result.verified,
+                "arrival_score": round(result.score, 6),
+                "arrival_reason_code": metadata.get("arrival_reason_code") or "unknown",
+                "camera_id": metadata.get("camera_id") or "",
+                "map_version_id": metadata.get("map_version_id") or metadata.get("active_map_version_id") or "",
+                "localization_session_id": metadata.get("localization_session_id") or metadata.get("active_localization_session_id") or "",
+            },
+        )
+        return result
+
     def _publish_memory_event(self, event_type: str, message: str, *, payload: Dict[str, object]) -> None:
         if self._event_bus is None:
             return
@@ -3147,6 +4241,21 @@ class MemoryService:
             if normalized and normalized not in result:
                 result.append(normalized)
         return result
+
+    def _preview_text(self, text: Optional[str], *, max_length: int = 160) -> str:
+        preview = re.sub(r"\s+", " ", str(text or "").strip())
+        if len(preview) <= max_length:
+            return preview
+        return preview[: max(0, max_length - 3)] + "..."
+
+    def _navigation_quality_observability_fields(self, navigation_quality: object) -> Dict[str, object]:
+        quality = dict(navigation_quality or {}) if isinstance(navigation_quality, dict) else {}
+        return {
+            "navigation_quality_level": str(quality.get("level") or ""),
+            "recommended_action": str(quality.get("recommended_action") or ""),
+            "primary_reason_code": str(quality.get("primary_reason_code") or ""),
+            "reason_codes": list(quality.get("reason_codes") or []),
+        }
 
     def _normalize_text(self, text: Optional[str]) -> str:
         raw = str(text or "").strip().lower()

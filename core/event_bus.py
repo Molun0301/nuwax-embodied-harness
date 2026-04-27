@@ -10,6 +10,29 @@ from contracts.naming import build_event_id
 from contracts.tasks import TaskEvent
 
 
+_REQUEST_CONTEXT_METADATA_KEYS = (
+    "request_id",
+    "task_id",
+    "capability_name",
+    "requested_by",
+    "method",
+    "path",
+    "client_ip",
+    "status_code",
+    "duration_ms",
+    "error_category",
+    "map_version_id",
+    "localization_session_id",
+    "map_name",
+    "camera_id",
+    "pose_source",
+)
+
+
+def _has_metadata_value(value: Any) -> bool:
+    return value is not None and value != ""
+
+
 @dataclass(frozen=True)
 class EventSubscription:
     """事件订阅条目。"""
@@ -88,6 +111,17 @@ class EventBus:
         payload = dict(task_event.payload)
         if task_event.state is not None:
             payload["state"] = task_event.state.value
+        metadata: MetadataDict = {"task_event_id": task_event.event_id}
+        request_context = payload.get("request_context")
+        if isinstance(request_context, dict):
+            for key in _REQUEST_CONTEXT_METADATA_KEYS:
+                value = request_context.get(key)
+                if _has_metadata_value(value):
+                    metadata[key] = value
+        for key in _REQUEST_CONTEXT_METADATA_KEYS:
+            value = payload.get(key)
+            if _has_metadata_value(value):
+                metadata[key] = value
         return self.publish(
             self.build_event(
                 task_event.event_type,
@@ -96,7 +130,7 @@ class EventBus:
                 task_id=task_event.task_id,
                 message=task_event.message,
                 payload=payload,
-                metadata={"task_event_id": task_event.event_id},
+                metadata=metadata,
             )
         )
 

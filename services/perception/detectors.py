@@ -5,8 +5,9 @@ from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple
 
 from contracts.image import CameraInfo, ImageFrame
-from contracts.perception import BoundingBox2D, Detection2D, Detection3D
+from contracts.perception import BoundingBox2D, Detection2D, Detection3D, SegmentationMask2D, SegmentationQuality
 from gateways.errors import GatewayError
+from services.model_providers import resolve_detection_provider_spec
 from services.perception.base import DetectionBundle, DetectorBackend, DetectorBackendSpec
 from services.perception.image_utils import decode_image_frame_to_bgr
 
@@ -180,6 +181,7 @@ def normalize_detection_2d(raw_detection: object, image_frame: ImageFrame) -> De
         "height_px",
         "camera_id",
         "track_id",
+        "segmentation",
         "attributes",
     }
     merged_attributes = dict(raw_detection.get("attributes") or {})
@@ -193,6 +195,7 @@ def normalize_detection_2d(raw_detection: object, image_frame: ImageFrame) -> De
         bbox=bbox,
         camera_id=str(raw_detection.get("camera_id") or image_frame.camera_id),
         track_id=str(raw_detection.get("track_id")).strip() or None if raw_detection.get("track_id") else None,
+        segmentation=raw_detection.get("segmentation"),
         attributes=merged_attributes,
     )
 
@@ -250,10 +253,19 @@ class MetadataDrivenDetectorBackend(DetectorBackend):
         name: str = "metadata_detector",
         backend_kind: str = "metadata",
     ) -> None:
+        provider_metadata = resolve_detection_provider_spec(
+            backend_name=name,
+            backend_kind=backend_kind,
+        ).to_metadata()
         self.spec = DetectorBackendSpec(
             name=name,
             backend_kind=backend_kind,
-            metadata={"input_contract": "ImageFrame/CameraInfo", "supports_runtime_switch": True},
+            metadata={
+                "input_contract": "ImageFrame/CameraInfo",
+                "supports_runtime_switch": True,
+                "provider": provider_metadata,
+                **provider_metadata,
+            },
         )
 
     def detect(
@@ -272,6 +284,7 @@ class MetadataDrivenDetectorBackend(DetectorBackend):
             metadata={
                 "backend_name": self.spec.name,
                 "backend_kind": self.spec.backend_kind,
+                "detector_provider": dict(self.spec.metadata.get("provider") or {}),
                 "raw_detection_count": len(detections_2d) + len(detections_3d),
             },
         )
@@ -325,10 +338,17 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
         self._model = None
         self._resolved_model_source = ""
         self._resolved_backend_kind = "ultralytics_yolo"
+        provider_metadata = resolve_detection_provider_spec(
+            backend_name=name,
+            backend_kind="ultralytics_yolo",
+            model_name=self._weights,
+        ).to_metadata()
         self.spec = DetectorBackendSpec(
             name=name,
             backend_kind="ultralytics_yolo",
             metadata={
+                "provider": provider_metadata,
+                **provider_metadata,
                 "weights": self._weights,
                 "runtime_preference": self._runtime_preference,
                 "engine_path": self._engine_path,
@@ -356,6 +376,7 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
             metadata={
                 "backend_name": self.spec.name,
                 "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
+                "detector_provider": dict(self.spec.metadata.get("provider") or {}),
                 "raw_detection_count": len(detections_2d),
                 "weights": self._weights,
                 "model_source": self._resolved_model_source,
@@ -442,6 +463,8 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
         xyxy_items = self._to_nested_list(getattr(boxes, "xyxy", ()))
         conf_items = self._to_list(getattr(boxes, "conf", ()))
         class_items = self._to_list(getattr(boxes, "cls", ()))
+        mask_polygon_items = self._extract_mask_polygons(getattr(result, "masks", None))
+        mask_quality_items = self._extract_mask_quality(getattr(result, "masks", None))
 
         detections = []
         for index, xyxy in enumerate(xyxy_items):
@@ -458,28 +481,210 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
                 "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
                 "model_name": self._resolved_model_source or self._weights,
                 "class_id": class_id,
+                "grounding_score": _clamp_score(score),
                 "relative_area": round((width * height) / float(image_frame.width_px * image_frame.height_px), 6),
                 "center_x_ratio": round(((x1 + x2) * 0.5) / float(image_frame.width_px), 6),
                 "center_y_ratio": round(((y1 + y2) * 0.5) / float(image_frame.height_px), 6),
+                "segmentation_available": False,
+                "segmentation_status": "bbox_only",
+                "segmentation_priority": "bbox_only",
             }
-            detections.append(
-                normalize_detection_2d(
-                    {
-                        "label": label,
-                        "score": score,
-                        "bbox": {
-                            "x_px": x1,
-                            "y_px": y1,
-                            "width_px": width,
-                            "height_px": height,
-                        },
-                        "camera_id": image_frame.camera_id,
-                        "attributes": attributes,
-                    },
+            segmentation = None
+            if index < len(mask_polygon_items):
+                quality_metadata = mask_quality_items[index] if index < len(mask_quality_items) else {}
+                mask_attributes, segmentation = self._build_mask_segmentation(
+                    mask_polygon_items[index],
+                    score,
                     image_frame,
+                    quality_metadata=quality_metadata,
                 )
+                attributes.update(mask_attributes)
+            detection = normalize_detection_2d(
+                {
+                    "label": label,
+                    "score": score,
+                    "bbox": {
+                        "x_px": x1,
+                        "y_px": y1,
+                        "width_px": width,
+                        "height_px": height,
+                    },
+                    "camera_id": image_frame.camera_id,
+                    "attributes": attributes,
+                },
+                image_frame,
             )
+            if segmentation is not None:
+                detection = detection.model_copy(update={"segmentation": segmentation}, deep=True)
+            detections.append(detection)
         return tuple(detections)
+
+    def _extract_mask_polygons(self, masks: Any) -> List[List[List[float]]]:
+        if masks is None:
+            return []
+        xy_payload = getattr(masks, "xy", None)
+        if xy_payload is None:
+            return []
+        if hasattr(xy_payload, "tolist"):
+            xy_payload = xy_payload.tolist()
+        polygons = []
+        for polygon in xy_payload:
+            if hasattr(polygon, "tolist"):
+                polygon = polygon.tolist()
+            points = []
+            for point in polygon or []:
+                if hasattr(point, "tolist"):
+                    point = point.tolist()
+                if not isinstance(point, (list, tuple)) or len(point) < 2:
+                    continue
+                try:
+                    points.append([float(point[0]), float(point[1])])
+                except (TypeError, ValueError):
+                    continue
+            polygons.append(points)
+        return polygons
+
+    def _extract_mask_quality(self, masks: Any) -> List[dict]:
+        if masks is None:
+            return []
+        quality_count = max(len(self._to_list_or_empty(getattr(masks, key, ()))) for key in ("predicted_iou", "stability_score", "scores"))
+        quality_items = []
+        for index in range(quality_count):
+            metadata = {}
+            predicted_iou = self._item_at(getattr(masks, "predicted_iou", ()), index)
+            stability_score = self._item_at(getattr(masks, "stability_score", ()), index)
+            segmentation_score = self._item_at(getattr(masks, "scores", ()), index)
+            if predicted_iou is not None:
+                metadata["predicted_iou"] = _clamp_score(predicted_iou)
+            if stability_score is not None:
+                metadata["stability_score"] = _clamp_score(stability_score)
+            if segmentation_score is not None:
+                metadata["segmentation_score"] = _clamp_score(segmentation_score)
+            quality_items.append(metadata)
+        return quality_items
+
+    def _build_mask_segmentation(
+        self,
+        polygon: List[List[float]],
+        score: float,
+        image_frame: ImageFrame,
+        *,
+        quality_metadata: Optional[dict] = None,
+    ) -> Tuple[dict, Optional[SegmentationMask2D]]:
+        quality_metadata = dict(quality_metadata or {})
+        if len(polygon) < 3:
+            return {
+                "segmentation_available": False,
+                "segmentation_status": "invalid_polygon",
+                "segmentation_priority": "bbox_only",
+            }, None
+        area_px = abs(self._polygon_signed_area(polygon))
+        if area_px <= 0.0:
+            return {
+                "segmentation_available": False,
+                "segmentation_status": "empty_polygon",
+                "segmentation_priority": "bbox_only",
+            }, None
+        area_ratio = round(area_px / float(max(1, image_frame.width_px * image_frame.height_px)), 6)
+        centroid = self._polygon_centroid(polygon)
+        normalized_polygon = tuple((float(point[0]), float(point[1])) for point in polygon)
+        centroid_uv = None
+        if centroid is not None:
+            centroid_uv = (round(centroid[0], 3), round(centroid[1], 3))
+        bbox_xyxy = self._polygon_bbox(normalized_polygon)
+        segmentation_score = _clamp_score(quality_metadata.get("segmentation_score", score))
+        predicted_iou = self._optional_score(quality_metadata.get("predicted_iou"))
+        stability_score = self._optional_score(quality_metadata.get("stability_score"))
+        quality = SegmentationQuality(
+            score=segmentation_score,
+            predicted_iou=predicted_iou,
+            stability_score=stability_score,
+        )
+        segmentation = SegmentationMask2D(
+            polygon_px=normalized_polygon,
+            centroid_uv=centroid_uv,
+            bbox_xyxy=bbox_xyxy,
+            area_px=round(area_px, 3),
+            area_ratio=area_ratio,
+            contour={"point_count": len(normalized_polygon)},
+            crop_box=bbox_xyxy,
+            quality=quality,
+            frame_id=image_frame.frame_id,
+            camera_id=image_frame.camera_id,
+            source="ultralytics_yolo_masks",
+            attributes={"grounding_score": _clamp_score(score)},
+        )
+        attributes = {
+            "mask_polygon_px": [[float(x), float(y)] for x, y in normalized_polygon],
+            "segmentation_polygon_px": [[float(x), float(y)] for x, y in normalized_polygon],
+            "bbox_xyxy": [float(value) for value in bbox_xyxy],
+            "crop_box": [float(value) for value in bbox_xyxy],
+            "area_px": round(area_px, 3),
+            "area_ratio": area_ratio,
+            "contour": {"point_count": len(normalized_polygon)},
+            "grounding_score": _clamp_score(score),
+            "segmentation_score": segmentation_score,
+            "segmentation_available": True,
+            "segmentation_status": "segmentation_preferred",
+            "segmentation_priority": "segmentation_over_bbox",
+            "segmentation_source": "ultralytics_yolo_masks",
+            "frame_id": image_frame.frame_id,
+            "camera_id": image_frame.camera_id,
+        }
+        if predicted_iou is not None:
+            attributes["predicted_iou"] = predicted_iou
+        if stability_score is not None:
+            attributes["stability_score"] = stability_score
+        if centroid_uv is not None:
+            attributes["mask_center_px"] = [float(centroid_uv[0]), float(centroid_uv[1])]
+            attributes["centroid_uv"] = attributes["mask_center_px"]
+        return attributes, segmentation
+
+    def _polygon_signed_area(self, polygon: List[List[float]]) -> float:
+        area = 0.0
+        for index, point in enumerate(polygon):
+            next_point = polygon[(index + 1) % len(polygon)]
+            area += (point[0] * next_point[1]) - (next_point[0] * point[1])
+        return area * 0.5
+
+    def _polygon_centroid(self, polygon: List[List[float]]) -> Optional[Tuple[float, float]]:
+        signed_area = self._polygon_signed_area(polygon)
+        if abs(signed_area) < 1e-6:
+            return None
+        cx = 0.0
+        cy = 0.0
+        for index, point in enumerate(polygon):
+            next_point = polygon[(index + 1) % len(polygon)]
+            cross = (point[0] * next_point[1]) - (next_point[0] * point[1])
+            cx += (point[0] + next_point[0]) * cross
+            cy += (point[1] + next_point[1]) * cross
+        scale = 1.0 / (6.0 * signed_area)
+        return cx * scale, cy * scale
+
+    def _polygon_bbox(self, polygon: Tuple[Tuple[float, float], ...]) -> Tuple[float, float, float, float]:
+        xs = [point[0] for point in polygon]
+        ys = [point[1] for point in polygon]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def _optional_score(self, value: object) -> Optional[float]:
+        if value is None:
+            return None
+        return _clamp_score(value)
+
+    def _to_list_or_empty(self, payload: Any) -> List[float]:
+        if payload is None:
+            return []
+        if hasattr(payload, "tolist"):
+            payload = payload.tolist()
+        if isinstance(payload, (list, tuple)):
+            return list(payload)
+        return []
+
+    def _item_at(self, payload: Any, index: int) -> Optional[object]:
+        items = self._to_list_or_empty(payload)
+        if index >= len(items):
+            return None
+        return items[index]
 
     def _resolve_label(self, names: Any, class_id: int) -> str:
         if isinstance(names, dict) and class_id in names:

@@ -44,6 +44,9 @@ class InstanceAssociationService:
         InstanceMovability.MOVABLE: 0.22,
         InstanceMovability.TRANSIENT: 0.10,
     }
+    _SEGMENTATION_LOW_SIGNAL_THRESHOLD = 0.25
+    _SEGMENTATION_REPROJECTION_ERROR_GATE = 2.0
+    _SEGMENTATION_CENTER_DISTANCE_PX_GATE = 80.0
     _UNCERTAIN_AFTER_SEC = {
         InstanceMovability.STATIC: 3 * 24 * 3600.0,
         InstanceMovability.MOVABLE: 2 * 3600.0,
@@ -140,6 +143,16 @@ class InstanceAssociationService:
         max_distance_m = self._MERGE_DISTANCE_M.get(candidate.movability, 1.0)
         if distance_m > max_distance_m:
             return 0.0
+        observation_segmentation = self._summarize_segmentation_metadata(observation.attributes)
+        candidate_segmentation = self._summarize_segmentation_metadata(candidate.metadata)
+        same_track = bool(observation.track_id and observation.track_id == str(candidate.metadata.get("last_track_id") or ""))
+        if not same_track and self._segmentation_blocks_merge(
+            observation.attributes,
+            candidate.metadata,
+            observation_segmentation=observation_segmentation,
+            candidate_segmentation=candidate_segmentation,
+        ):
+            return 0.0
         distance_score = 1.0 / (1.0 + distance_m)
         attribute_score = self._attribute_similarity(observation, candidate)
         age_sec = max(0.0, (now - candidate.last_seen_ts).total_seconds())
@@ -150,13 +163,253 @@ class InstanceAssociationService:
         similarity_gate = self._ATTRIBUTE_SIMILARITY_GATE.get(candidate.movability, 0.0)
         if attribute_score < similarity_gate:
             return 0.0
-        track_bonus = 0.0
-        if observation.track_id and observation.track_id == str(candidate.metadata.get("last_track_id") or ""):
-            track_bonus = 0.15
-        return min(
-            1.0,
-            (0.42 * label_score) + (0.26 * distance_score) + (0.17 * attribute_score) + (0.15 * temporal_score) + track_bonus,
+        base_score = (0.42 * label_score) + (0.26 * distance_score) + (0.17 * attribute_score) + (0.15 * temporal_score)
+        segmentation_score = self._segmentation_association_score(
+            observation.attributes,
+            candidate.metadata,
+            observation_segmentation=observation_segmentation,
+            candidate_segmentation=candidate_segmentation,
         )
+        if segmentation_score is not None:
+            base_score = (0.82 * base_score) + (0.18 * segmentation_score)
+        track_bonus = 0.15 if same_track else 0.0
+        return min(1.0, base_score + track_bonus)
+
+    def _segmentation_blocks_merge(
+        self,
+        observation_metadata: Dict[str, object],
+        candidate_metadata: Dict[str, object],
+        *,
+        observation_segmentation: Dict[str, object],
+        candidate_segmentation: Dict[str, object],
+    ) -> bool:
+        if not (
+            observation_segmentation["has_structured_segmentation"]
+            and candidate_segmentation["has_structured_segmentation"]
+        ):
+            return False
+        hard_risks = {
+            "segmentation_support_points_missing",
+            "segmentation_score_below_threshold",
+            "predicted_iou_below_threshold",
+            "coverage_below_threshold",
+            "depth_coverage_below_threshold",
+            "map_projection_coverage_below_threshold",
+            "reprojection_error_above_threshold",
+            "segmentation_occluded",
+            "segmentation_truncated",
+        }
+        observation_risks = set(observation_segmentation.get("segmentation_risk_factors") or ())
+        candidate_risks = set(candidate_segmentation.get("segmentation_risk_factors") or ())
+        if observation_risks & hard_risks or candidate_risks & hard_risks:
+            return True
+        left_center = self._segmentation_center_px(observation_metadata)
+        right_center = self._segmentation_center_px(candidate_metadata)
+        if left_center is not None and right_center is not None:
+            center_distance = ((left_center[0] - right_center[0]) ** 2 + (left_center[1] - right_center[1]) ** 2) ** 0.5
+            if center_distance > self._segmentation_center_gate_px(observation_metadata, candidate_metadata):
+                return True
+        return False
+
+    def _segmentation_association_score(
+        self,
+        observation_metadata: Dict[str, object],
+        candidate_metadata: Dict[str, object],
+        *,
+        observation_segmentation: Dict[str, object],
+        candidate_segmentation: Dict[str, object],
+    ) -> Optional[float]:
+        if not (
+            observation_segmentation["has_structured_segmentation"]
+            or candidate_segmentation["has_structured_segmentation"]
+        ):
+            return None
+        quality_values = [
+            value
+            for value in (
+                observation_segmentation.get("segmentation_quality_score"),
+                candidate_segmentation.get("segmentation_quality_score"),
+                observation_segmentation.get("segmentation_score"),
+                candidate_segmentation.get("segmentation_score"),
+                observation_segmentation.get("depth_coverage"),
+                candidate_segmentation.get("depth_coverage"),
+                observation_segmentation.get("map_projection_coverage"),
+                candidate_segmentation.get("map_projection_coverage"),
+            )
+            if isinstance(value, (int, float))
+        ]
+        quality_score = sum(quality_values) / len(quality_values) if quality_values else 0.5
+        risk_count = len(observation_segmentation.get("segmentation_risk_factors") or ()) + len(
+            candidate_segmentation.get("segmentation_risk_factors") or ()
+        )
+        risk_score = max(0.0, 1.0 - (0.18 * risk_count))
+        geometry_score = 1.0
+        left_center = self._segmentation_center_px(observation_metadata)
+        right_center = self._segmentation_center_px(candidate_metadata)
+        if left_center is not None and right_center is not None:
+            center_distance = ((left_center[0] - right_center[0]) ** 2 + (left_center[1] - right_center[1]) ** 2) ** 0.5
+            geometry_score = min(geometry_score, 1.0 / (1.0 + (center_distance / 50.0)))
+        left_area = self._coerce_optional_float(
+            observation_metadata.get("segmentation_area_ratio"),
+            observation_metadata.get("area_ratio"),
+        )
+        right_area = self._coerce_optional_float(
+            candidate_metadata.get("segmentation_area_ratio"),
+            candidate_metadata.get("area_ratio"),
+        )
+        if left_area is not None and right_area is not None:
+            geometry_score = min(geometry_score, max(0.0, 1.0 - abs(left_area - right_area)))
+        return max(0.0, min(1.0, (0.45 * quality_score) + (0.35 * geometry_score) + (0.20 * risk_score)))
+
+    def _summarize_segmentation_metadata(self, metadata: Dict[str, object]) -> Dict[str, object]:
+        segmentation_score = self._coerce_optional_float(metadata.get("segmentation_score"))
+        predicted_iou = self._coerce_optional_float(metadata.get("predicted_iou"))
+        segmentation_quality_score = self._coerce_optional_float(metadata.get("segmentation_quality_score"), predicted_iou)
+        stability_score = self._coerce_optional_float(metadata.get("stability_score"))
+        coverage = self._coerce_optional_float(metadata.get("coverage"))
+        depth_coverage = self._coerce_optional_float(metadata.get("depth_coverage"))
+        map_projection_coverage = self._coerce_optional_float(metadata.get("map_projection_coverage"))
+        reprojection_error = self._coerce_optional_float(metadata.get("reprojection_error"))
+        segmentation_support_point_count = self._parse_support_point_count(metadata.get("segmentation_support_point_count"))
+        occlusion_flags = self._coerce_flags(
+            metadata.get("segmentation_occlusion_flags") if metadata.get("segmentation_occlusion_flags") is not None else metadata.get("occlusion_flags")
+        )
+        truncation_flags = self._coerce_flags(
+            metadata.get("segmentation_truncation_flags") if metadata.get("segmentation_truncation_flags") is not None else metadata.get("truncation_flags")
+        )
+        projection_degradation_reason = str(metadata.get("projection_degradation_reason") or "").strip()
+        geometry_projection_status = str(metadata.get("geometry_projection_status") or "").strip()
+        segmentation_projection_status = str(metadata.get("segmentation_projection_status") or "").strip()
+        has_structured_segmentation = self._coerce_bool(metadata.get("has_structured_segmentation")) or any(
+            value is not None
+            for value in (
+                segmentation_score,
+                segmentation_quality_score,
+                stability_score,
+                coverage,
+                depth_coverage,
+                map_projection_coverage,
+                reprojection_error,
+                segmentation_support_point_count,
+            )
+        ) or bool(occlusion_flags or truncation_flags)
+        risk_factors: List[str] = []
+        if segmentation_support_point_count is not None and segmentation_support_point_count <= 0:
+            risk_factors.append("segmentation_support_points_missing")
+        for key, value in (
+            ("segmentation_score_below_threshold", segmentation_score),
+            ("predicted_iou_below_threshold", segmentation_quality_score),
+            ("stability_score_below_threshold", stability_score),
+            ("coverage_below_threshold", self._coerce_optional_float(metadata.get("coverage"))),
+            ("depth_coverage_below_threshold", depth_coverage),
+            ("map_projection_coverage_below_threshold", map_projection_coverage),
+        ):
+            if value is not None and value < self._SEGMENTATION_LOW_SIGNAL_THRESHOLD:
+                risk_factors.append(key)
+        if reprojection_error is not None and reprojection_error > self._SEGMENTATION_REPROJECTION_ERROR_GATE:
+            risk_factors.append("reprojection_error_above_threshold")
+        if occlusion_flags:
+            risk_factors.append("segmentation_occluded")
+        if truncation_flags:
+            risk_factors.append("segmentation_truncated")
+        degraded_text = " ".join([projection_degradation_reason, geometry_projection_status, segmentation_projection_status]).lower()
+        if any(token in degraded_text for token in ("fallback", "failed", "no_depth", "degraded")):
+            risk_factors.append("segmentation_projection_degraded")
+        unique_risks: List[str] = []
+        for item in risk_factors:
+            if item not in unique_risks:
+                unique_risks.append(item)
+        quality_values = [
+            value
+            for value in (
+                segmentation_score,
+                segmentation_quality_score,
+                stability_score,
+                depth_coverage,
+                map_projection_coverage,
+            )
+            if value is not None
+        ]
+        if unique_risks:
+            segmentation_quality = "low"
+        elif quality_values and min(quality_values) >= 0.65:
+            segmentation_quality = "high"
+        elif has_structured_segmentation:
+            segmentation_quality = "medium"
+        else:
+            segmentation_quality = "unknown"
+        return {
+            "has_structured_segmentation": has_structured_segmentation,
+            "segmentation_score": segmentation_score,
+            "predicted_iou": predicted_iou,
+            "segmentation_quality_score": segmentation_quality_score,
+            "stability_score": stability_score,
+            "depth_coverage": depth_coverage,
+            "map_projection_coverage": map_projection_coverage,
+            "reprojection_error": reprojection_error,
+            "segmentation_support_point_count": int(segmentation_support_point_count or 0),
+            "segmentation_occlusion_flags": occlusion_flags,
+            "segmentation_truncation_flags": truncation_flags,
+            "segmentation_risk_factors": unique_risks,
+            "segmentation_quality_reason": unique_risks[0] if unique_risks else "",
+            "segmentation_quality": segmentation_quality,
+            "segmentation_review_required": segmentation_quality == "low",
+        }
+
+    def _coerce_flags(self, value: object) -> List[str]:
+        if value is None or isinstance(value, bool):
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item or "").strip()]
+        normalized = str(value).strip()
+        if not normalized:
+            return []
+        return [item.strip() for item in normalized.split(",") if item.strip()]
+
+    def _coerce_bool(self, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        normalized = str(value or "").strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+        return False
+
+    def _segmentation_center_px(self, metadata: Dict[str, object]) -> Optional[Tuple[float, float]]:
+        for key in ("centroid_uv", "mask_center_px"):
+            value = metadata.get(key)
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                try:
+                    return float(value[0]), float(value[1])
+                except (TypeError, ValueError):
+                    pass
+        bbox = metadata.get("segmentation_bbox_xyxy") or metadata.get("bbox_xyxy")
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            try:
+                left, top, right, bottom = [float(item) for item in bbox[:4]]
+            except (TypeError, ValueError):
+                return None
+            return (left + right) / 2.0, (top + bottom) / 2.0
+        return None
+
+    def _segmentation_center_gate_px(
+        self,
+        observation_metadata: Dict[str, object],
+        candidate_metadata: Dict[str, object],
+    ) -> float:
+        sizes: List[float] = []
+        for metadata in (observation_metadata, candidate_metadata):
+            bbox = metadata.get("segmentation_bbox_xyxy") or metadata.get("bbox_xyxy")
+            if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                try:
+                    left, top, right, bottom = [float(item) for item in bbox[:4]]
+                except (TypeError, ValueError):
+                    continue
+                sizes.extend([abs(right - left), abs(bottom - top)])
+        if not sizes:
+            return self._SEGMENTATION_CENTER_DISTANCE_PX_GATE
+        return max(self._SEGMENTATION_CENTER_DISTANCE_PX_GATE, 0.75 * max(sizes))
 
     def _merge_instance(
         self,
@@ -198,15 +451,11 @@ class InstanceAssociationService:
                 "vision_tags": self._merge_strings(current.vision_tags, observation.semantic_labels),
                 "inspection_poses": inspection_poses,
                 "lifecycle_state": InstanceLifecycleState.ACTIVE,
-                "metadata": {
-                    **dict(current.metadata),
-                    "last_track_id": observation.track_id or dict(current.metadata).get("last_track_id", ""),
-                    "last_camera_id": observation.camera_id or dict(current.metadata).get("last_camera_id", ""),
-                    "association_policy": current.movability.value,
-                    "uncertain_after_sec": self._UNCERTAIN_AFTER_SEC[current.movability],
-                    "stale_after_sec": self._STALE_AFTER_SEC[current.movability],
-                    "removed_after_sec": self._REMOVED_AFTER_SEC[current.movability],
-                },
+                "metadata": self._build_instance_metadata(
+                    observation,
+                    movability=current.movability,
+                    current_metadata=current.metadata,
+                ),
                 "supporting_observation_event_ids": supporting_event_ids,
             },
             deep=True,
@@ -251,15 +500,216 @@ class InstanceAssociationService:
             vision_tags=list(observation.semantic_labels),
             inspection_poses=inspection_poses,
             attributes=dict(observation.attributes),
-            metadata={
-                "last_track_id": observation.track_id or "",
-                "last_camera_id": observation.camera_id or "",
-                "association_policy": movability.value,
-                "uncertain_after_sec": self._UNCERTAIN_AFTER_SEC[movability],
-                "stale_after_sec": self._STALE_AFTER_SEC[movability],
-                "removed_after_sec": self._REMOVED_AFTER_SEC[movability],
-            },
+            metadata=self._build_instance_metadata(
+                observation,
+                movability=movability,
+            ),
         )
+
+    def _build_instance_metadata(
+        self,
+        observation: ProjectedObservation,
+        *,
+        movability: InstanceMovability,
+        current_metadata: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        previous_metadata = dict(current_metadata or {})
+        backend = str(
+            observation.attributes.get("backend")
+            or observation.attributes.get("backend_type")
+            or previous_metadata.get("backend")
+            or previous_metadata.get("backend_type")
+            or "memory_service.semantic_instance"
+        )
+        backend_type = str(
+            observation.attributes.get("backend_type")
+            or observation.attributes.get("backend")
+            or previous_metadata.get("backend_type")
+            or previous_metadata.get("backend")
+            or "memory_service.semantic_instance"
+        )
+        projection_method = str(
+            observation.attributes.get("projection_method")
+            or previous_metadata.get("projection_method")
+            or ""
+        )
+        projection_confidence = observation.attributes.get("projection_confidence")
+        if projection_confidence is None:
+            projection_confidence = previous_metadata.get("projection_confidence")
+        support_point_count = self._coerce_support_point_count(
+            observation.attributes.get("support_point_count"),
+            previous_metadata.get("support_point_count"),
+        )
+        segmentation_score = self._coerce_optional_float(
+            observation.attributes.get("segmentation_score"),
+            previous_metadata.get("segmentation_score"),
+        )
+        predicted_iou = self._coerce_optional_float(
+            observation.attributes.get("predicted_iou"),
+            previous_metadata.get("predicted_iou"),
+        )
+        stability_score = self._coerce_optional_float(
+            observation.attributes.get("stability_score"),
+            previous_metadata.get("stability_score"),
+        )
+        segmentation_quality_score = self._coerce_optional_float(
+            observation.attributes.get("segmentation_quality_score"),
+            previous_metadata.get("segmentation_quality_score"),
+        )
+        if segmentation_quality_score is None:
+            segmentation_quality_score = predicted_iou
+        if segmentation_quality_score is None:
+            segmentation_quality_score = stability_score
+        segmentation_support_point_count = self._coerce_support_point_count(
+            observation.attributes.get("segmentation_support_point_count"),
+            previous_metadata.get("segmentation_support_point_count"),
+        )
+        coverage = self._coerce_optional_float(
+            observation.attributes.get("coverage"),
+            previous_metadata.get("coverage"),
+        )
+        depth_coverage = self._coerce_optional_float(
+            observation.attributes.get("depth_coverage"),
+            previous_metadata.get("depth_coverage"),
+        )
+        map_projection_coverage = self._coerce_optional_float(
+            observation.attributes.get("map_projection_coverage"),
+            previous_metadata.get("map_projection_coverage"),
+        )
+        reprojection_error = self._coerce_optional_float(
+            observation.attributes.get("reprojection_error"),
+            previous_metadata.get("reprojection_error"),
+        )
+
+        def raw_metadata_value(key: str) -> object:
+            value = observation.attributes.get(key)
+            if value is not None:
+                return value
+            return previous_metadata.get(key)
+
+        def string_metadata_value(key: str) -> str:
+            value = observation.attributes.get(key)
+            if value is None or str(value).strip() == "":
+                value = previous_metadata.get(key)
+            return str(value or "")
+
+        projection_degradation_reason = string_metadata_value("projection_degradation_reason")
+        geometry_projection_method = string_metadata_value("geometry_projection_method")
+        geometry_projection_status = string_metadata_value("geometry_projection_status")
+        segmentation_projection_status = string_metadata_value("segmentation_projection_status")
+        support_points_2d = raw_metadata_value("support_points_2d")
+        support_points_3d = raw_metadata_value("support_points_3d")
+        support_points_map = raw_metadata_value("support_points_map")
+        segmentation_bbox_xyxy = raw_metadata_value("segmentation_bbox_xyxy")
+        centroid_uv = raw_metadata_value("centroid_uv") or raw_metadata_value("mask_center_px")
+        mask_center_px = raw_metadata_value("mask_center_px") or raw_metadata_value("centroid_uv")
+        segmentation_area_ratio = self._coerce_optional_float(
+            observation.attributes.get("segmentation_area_ratio"),
+            observation.attributes.get("area_ratio"),
+        )
+        if segmentation_area_ratio is None:
+            segmentation_area_ratio = self._coerce_optional_float(
+                previous_metadata.get("segmentation_area_ratio"),
+                previous_metadata.get("area_ratio"),
+            )
+        segmentation_occlusion_flags = raw_metadata_value("segmentation_occlusion_flags") or raw_metadata_value("occlusion_flags")
+        segmentation_truncation_flags = raw_metadata_value("segmentation_truncation_flags") or raw_metadata_value("truncation_flags")
+        has_structured_segmentation = bool(
+            self._coerce_bool(observation.attributes.get("has_structured_segmentation"))
+            or self._coerce_bool(previous_metadata.get("has_structured_segmentation"))
+            or segmentation_bbox_xyxy
+            or centroid_uv
+            or segmentation_occlusion_flags
+            or segmentation_truncation_flags
+        )
+        navigable = observation.attributes.get("navigable")
+        if navigable is None:
+            navigable = previous_metadata.get("navigable")
+        non_navigable_reason = str(
+            observation.attributes.get("non_navigable_reason")
+            or previous_metadata.get("non_navigable_reason")
+            or ""
+        )
+        metadata = {
+            **previous_metadata,
+            "last_track_id": observation.track_id or previous_metadata.get("last_track_id", ""),
+            "last_camera_id": observation.camera_id or previous_metadata.get("last_camera_id", ""),
+            "association_policy": movability.value,
+            "uncertain_after_sec": self._UNCERTAIN_AFTER_SEC[movability],
+            "stale_after_sec": self._STALE_AFTER_SEC[movability],
+            "removed_after_sec": self._REMOVED_AFTER_SEC[movability],
+            "projection_method": projection_method,
+            "projection_confidence": projection_confidence,
+            "support_point_count": support_point_count,
+            "coverage": coverage,
+            "depth_coverage": depth_coverage,
+            "map_projection_coverage": map_projection_coverage,
+            "reprojection_error": reprojection_error,
+            "projection_degradation_reason": projection_degradation_reason,
+            "geometry_projection_method": geometry_projection_method,
+            "geometry_projection_status": geometry_projection_status,
+            "segmentation_projection_status": segmentation_projection_status,
+            "support_points_2d": support_points_2d,
+            "support_points_3d": support_points_3d,
+            "support_points_map": support_points_map,
+            "segmentation_bbox_xyxy": segmentation_bbox_xyxy,
+            "centroid_uv": centroid_uv,
+            "mask_center_px": mask_center_px,
+            "segmentation_area_ratio": segmentation_area_ratio,
+            "segmentation_occlusion_flags": self._coerce_flags(segmentation_occlusion_flags),
+            "segmentation_truncation_flags": self._coerce_flags(segmentation_truncation_flags),
+            "has_structured_segmentation": has_structured_segmentation,
+            "segmentation_score": segmentation_score,
+            "predicted_iou": predicted_iou,
+            "segmentation_quality_score": segmentation_quality_score,
+            "stability_score": stability_score,
+            "segmentation_support_point_count": segmentation_support_point_count,
+            "navigable": navigable,
+            "non_navigable_reason": non_navigable_reason,
+            "backend": backend,
+            "backend_type": backend_type,
+        }
+        metadata.update(self._summarize_segmentation_metadata(metadata))
+        return metadata
+
+    def _coerce_optional_float(self, raw_value: object, fallback_value: object = None) -> Optional[float]:
+        for value in (raw_value, fallback_value):
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _coerce_support_point_count(self, raw_value: object, fallback_value: object) -> int:
+        parsed_raw = self._parse_support_point_count(raw_value)
+        if parsed_raw is not None:
+            return parsed_raw
+        parsed_fallback = self._parse_support_point_count(fallback_value)
+        if parsed_fallback is not None:
+            return parsed_fallback
+        return 0
+
+    def _parse_support_point_count(self, value: object) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            if value < 0 or not value.is_integer():
+                return None
+            return int(value)
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        try:
+            parsed = float(normalized)
+        except ValueError:
+            return None
+        if parsed < 0 or not parsed.is_integer():
+            return None
+        return int(parsed)
 
     def _mark_stale(self, instance: SemanticInstance, *, now: datetime) -> SemanticInstance:
         age_sec = max(0.0, (now - instance.last_seen_ts).total_seconds())

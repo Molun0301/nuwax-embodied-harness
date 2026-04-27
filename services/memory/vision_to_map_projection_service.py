@@ -36,8 +36,8 @@ class VisionToMapProjectionService:
 
     _PIXEL_CENTER_KEYS = ("pixel_center_px", "mask_center_px", "center_px")
     _PIXEL_POLYGON_KEYS = ("mask_polygon_px", "segmentation_polygon_px")
-    _MAP_POINT_KEYS = ("map_points", "point_samples_map", "map_point", "point_sample_map")
-    _CAMERA_POINT_KEYS = ("camera_points", "point_samples_camera", "camera_point", "point_sample_camera")
+    _MAP_POINT_KEYS = ("map_points", "support_points_map", "point_samples_map", "map_point", "point_sample_map")
+    _CAMERA_POINT_KEYS = ("camera_points", "support_points_3d", "point_samples_camera", "camera_point", "point_sample_camera")
 
     def project(
         self,
@@ -131,7 +131,7 @@ class VisionToMapProjectionService:
         map_frame: str,
         frame_tree,
     ) -> Tuple[Optional[Pose], Dict[str, object]]:
-        base_attributes = dict(detection.attributes)
+        base_attributes = self._detection_attributes_with_segmentation(detection)
         explicit_pose = self._pose_from_attributes(base_attributes, map_frame=map_frame)
         if explicit_pose is not None:
             projected_pose = self._resolve_pose_to_map(
@@ -146,6 +146,8 @@ class VisionToMapProjectionService:
                     projection_method="explicit_map_pose",
                     projection_confidence=0.99,
                     support_point_count=1,
+                    map_projection_coverage=1.0,
+                    projection_degradation_reason="",
                 )
 
         point_pose, point_attributes = self._pose_from_point_samples(
@@ -175,6 +177,8 @@ class VisionToMapProjectionService:
                     projection_method="track_pose",
                     projection_confidence=0.88,
                     support_point_count=1,
+                    map_projection_coverage=1.0,
+                    projection_degradation_reason="track_pose_fallback",
                 )
 
         depth_pose, depth_attributes = self._pose_from_depth_projection(
@@ -202,6 +206,10 @@ class VisionToMapProjectionService:
                 projection_method="current_pose_fallback",
                 projection_confidence=0.2,
                 support_point_count=0,
+                coverage=0.0,
+                depth_coverage=0.0,
+                map_projection_coverage=0.0,
+                projection_degradation_reason="current_pose_fallback_no_geometry",
             ),
         )
 
@@ -238,11 +246,12 @@ class VisionToMapProjectionService:
         map_points = self._extract_points(attributes, keys=self._MAP_POINT_KEYS, default_frame_id=map_frame)
         if map_points is not None:
             return self._pose_from_resolved_points(
-                map_points,
+                map_points[0],
                 current_pose=current_pose,
                 map_frame=map_frame,
                 projection_method="map_point_samples",
                 projection_confidence=0.97,
+                map_projection_coverage=1.0,
             )
 
         camera_points = self._extract_points(
@@ -260,18 +269,22 @@ class VisionToMapProjectionService:
             source_frame_id=camera_points[1],
             target_frame_id=map_frame,
         )
+        map_projection_coverage = 1.0
         if transformed_points is None:
             transformed_points = self._relative_points_to_map(
                 camera_points[0],
                 current_pose=current_pose,
                 map_frame=map_frame,
             )
+            map_projection_coverage = 0.0
         return self._pose_from_resolved_points(
             transformed_points,
             current_pose=current_pose,
             map_frame=map_frame,
             projection_method="camera_point_samples",
             projection_confidence=0.93,
+            map_projection_coverage=map_projection_coverage,
+            projection_degradation_reason="" if map_projection_coverage else "camera_points_relative_pose_fallback",
         )
 
     def _pose_from_depth_projection(
@@ -325,6 +338,11 @@ class VisionToMapProjectionService:
                             "sample_pixel_v_px": round(float(pixel_v), 4),
                             "sample_pixel_source": pixel_source,
                             "camera_frame_id": perception_context.camera_info.frame_id,
+                            "coverage": 1.0,
+                            "depth_coverage": 1.0,
+                            "map_projection_coverage": 1.0,
+                            "reprojection_error": 0.0,
+                            "projection_degradation_reason": "",
                         }
                     )
                     return point_pose, point_attributes
@@ -347,6 +365,11 @@ class VisionToMapProjectionService:
             "projection_method": "depth_pose_fallback",
             "projection_confidence": 0.58,
             "support_point_count": 1,
+            "coverage": 0.5,
+            "depth_coverage": 1.0,
+            "map_projection_coverage": 0.0,
+            "reprojection_error": 0.0,
+            "projection_degradation_reason": "depth_pose_relative_fallback",
             "depth_m": float(depth_m),
             "sample_pixel_u_px": round(float(pixel_u), 4),
             "sample_pixel_v_px": round(float(pixel_v), 4),
@@ -361,7 +384,7 @@ class VisionToMapProjectionService:
         image_width_px: Optional[object],
         image_height_px: Optional[object],
     ) -> Tuple[float, float, str]:
-        attributes = dict(detection.attributes)
+        attributes = self._detection_attributes_with_segmentation(detection)
         for key in self._PIXEL_CENTER_KEYS:
             candidate = self._extract_pixel_pair(attributes.get(key))
             if candidate is not None:
@@ -420,17 +443,17 @@ class VisionToMapProjectionService:
             return None
         frame_id = default_frame_id
         points_payload = payload
-        if isinstance(payload, dict) and isinstance(payload.get("points"), list):
+        if isinstance(payload, dict) and isinstance(payload.get("points"), (list, tuple)):
             points_payload = payload.get("points")
             frame_id = str(payload.get("frame_id") or default_frame_id or "").strip() or None
         elif isinstance(payload, dict) and {"x", "y", "z"} <= set(payload.keys()):
             points_payload = [payload]
             frame_id = str(payload.get("frame_id") or default_frame_id or "").strip() or None
-        elif isinstance(payload, list) and payload and not isinstance(payload[0], (dict, list, tuple)):
+        elif isinstance(payload, (list, tuple)) and payload and not isinstance(payload[0], (dict, list, tuple)):
             return None
 
         resolved_points: List[Vector3] = []
-        if not isinstance(points_payload, list):
+        if not isinstance(points_payload, (list, tuple)):
             return None
         for item in points_payload:
             point = self._normalize_point(item)
@@ -466,6 +489,8 @@ class VisionToMapProjectionService:
         map_frame: str,
         projection_method: str,
         projection_confidence: float,
+        map_projection_coverage: float = 1.0,
+        projection_degradation_reason: str = "",
     ) -> Tuple[Optional[Pose], Dict[str, object]]:
         point_list = list(points)
         if not point_list:
@@ -486,6 +511,12 @@ class VisionToMapProjectionService:
             "projection_method": projection_method,
             "projection_confidence": float(projection_confidence),
             "support_point_count": int(array.shape[0]),
+            "support_points_map": {
+                "frame_id": map_frame,
+                "points": self._serialize_points(point_list),
+            },
+            "map_projection_coverage": round(max(0.0, min(1.0, float(map_projection_coverage))), 6),
+            "projection_degradation_reason": projection_degradation_reason,
             "centroid_map_x": round(float(centroid[0]), 6),
             "centroid_map_y": round(float(centroid[1]), 6),
             "centroid_map_z": round(float(centroid[2]), 6),
@@ -574,7 +605,7 @@ class VisionToMapProjectionService:
         return None
 
     def _polygon_centroid_px(self, payload: object) -> Optional[Tuple[float, float]]:
-        if not isinstance(payload, list):
+        if not isinstance(payload, (list, tuple)):
             return None
         points: List[Tuple[float, float]] = []
         for item in payload:
@@ -711,6 +742,58 @@ class VisionToMapProjectionService:
                 normalized.append(item)
         return semantic_region_id, best_topology_node_id, tuple(normalized)
 
+    def _detection_attributes_with_segmentation(self, detection: Detection2D) -> Dict[str, object]:
+        attributes = dict(detection.attributes or {})
+        segmentation = detection.segmentation
+        if segmentation is None:
+            return attributes
+        if segmentation.polygon_px:
+            polygon = [[float(x), float(y)] for x, y in segmentation.polygon_px]
+            attributes.setdefault("mask_polygon_px", polygon)
+            attributes.setdefault("segmentation_polygon_px", polygon)
+        if segmentation.centroid_uv is not None:
+            centroid = [float(segmentation.centroid_uv[0]), float(segmentation.centroid_uv[1])]
+            attributes.setdefault("mask_center_px", centroid)
+            attributes.setdefault("centroid_uv", centroid)
+        if segmentation.bbox_xyxy is not None:
+            attributes.setdefault("segmentation_bbox_xyxy", [float(item) for item in segmentation.bbox_xyxy])
+        if segmentation.contour:
+            attributes.setdefault("segmentation_contour", dict(segmentation.contour))
+            attributes.setdefault("contour", dict(segmentation.contour))
+        if segmentation.crop_box is not None:
+            attributes.setdefault("segmentation_crop_box", [float(item) for item in segmentation.crop_box])
+        if segmentation.frame_id is not None:
+            attributes.setdefault("segmentation_frame_id", segmentation.frame_id)
+        if segmentation.camera_id is not None:
+            attributes.setdefault("segmentation_camera_id", segmentation.camera_id)
+        if segmentation.source is not None:
+            attributes.setdefault("segmentation_source", segmentation.source)
+        if segmentation.truncation_flags:
+            attributes.setdefault("segmentation_truncation_flags", list(segmentation.truncation_flags))
+        if segmentation.occlusion_flags:
+            attributes.setdefault("segmentation_occlusion_flags", list(segmentation.occlusion_flags))
+        if segmentation.area_px is not None:
+            attributes.setdefault("segmentation_area_px", float(segmentation.area_px))
+            attributes.setdefault("area_px", float(segmentation.area_px))
+        if segmentation.area_ratio is not None:
+            attributes.setdefault("segmentation_area_ratio", float(segmentation.area_ratio))
+            attributes.setdefault("area_ratio", float(segmentation.area_ratio))
+        quality = segmentation.quality
+        if quality.score is not None:
+            attributes.setdefault("segmentation_score", float(quality.score))
+        if quality.predicted_iou is not None:
+            attributes.setdefault("predicted_iou", float(quality.predicted_iou))
+        if quality.stability_score is not None:
+            attributes.setdefault("stability_score", float(quality.stability_score))
+        if quality.depth_coverage is not None:
+            attributes.setdefault("depth_coverage", float(quality.depth_coverage))
+        if quality.map_projection_coverage is not None:
+            attributes.setdefault("map_projection_coverage", float(quality.map_projection_coverage))
+        if quality.reprojection_error is not None:
+            attributes.setdefault("reprojection_error", float(quality.reprojection_error))
+        attributes.setdefault("has_structured_segmentation", True)
+        return attributes
+
     def _merge_projection_attributes(
         self,
         base_attributes: Dict[str, object],
@@ -720,8 +803,39 @@ class VisionToMapProjectionService:
         for key, value in projection_attributes.items():
             if value is None:
                 continue
-            merged[str(key)] = value
+            normalized_key = str(key)
+            if (
+                normalized_key == "projection_degradation_reason"
+                and not str(value).strip()
+                and str(merged.get("projection_degradation_reason") or "").strip()
+            ):
+                continue
+            merged[normalized_key] = value
+        support_count = self._float_or_none(merged.get("support_point_count")) or 0.0
+        if "coverage" not in merged:
+            if self._float_or_none(merged.get("depth_coverage")) is not None:
+                merged["coverage"] = self._float_or_none(merged.get("depth_coverage"))
+            elif support_count > 0:
+                merged["coverage"] = 1.0
+            else:
+                merged["coverage"] = 0.0
+        if "depth_coverage" not in merged and support_count <= 0:
+            merged["depth_coverage"] = 0.0
+        if "map_projection_coverage" not in merged and support_count <= 0:
+            merged["map_projection_coverage"] = 0.0
+        if "projection_degradation_reason" not in merged:
+            merged["projection_degradation_reason"] = ""
         return merged
+
+    def _serialize_points(self, points: Iterable[Vector3]) -> Tuple[Dict[str, float], ...]:
+        return tuple(
+            {
+                "x": round(float(item.x), 6),
+                "y": round(float(item.y), 6),
+                "z": round(float(item.z), 6),
+            }
+            for item in points
+        )
 
     def _distance(self, left: Pose, right: Pose) -> float:
         delta_x = float(left.position.x) - float(right.position.x)

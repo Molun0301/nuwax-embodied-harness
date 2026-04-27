@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 from collections import deque
+from time import perf_counter
 
 from contracts.events import RuntimeEventCategory
 from contracts.naming import build_observation_id
-from contracts.perception import Detection2D, Observation, Track, TrackState
+from contracts.perception import Detection2D, Observation, SegmentationMask2D, Track, TrackState
 from contracts.runtime_views import PerceptionContext
 from core import EventBus, StateNamespace, StateStore
 from gateways.errors import GatewayError
 from providers import ImageProvider, LocalizationProvider, PointCloudProvider
 from services.artifact_service import ArtifactService
-from services.perception.base import SceneDescriptionBackend, TrackerBackend
+from services.perception.base import (
+    DetectionBundle,
+    DisabledSegmentationBackend,
+    SceneDescriptionBackend,
+    SegmentationBackend,
+    SegmentationBundle,
+    TrackerBackend,
+)
 from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
@@ -31,6 +39,7 @@ class PerceptionService:
         detector_pipeline: DetectorPipeline,
         tracker_backend: Optional[TrackerBackend] = None,
         scene_description_backend: Optional[SceneDescriptionBackend] = None,
+        segmentation_backend: Optional[SegmentationBackend] = None,
         geometry_augmentor: Optional[DetectionGeometryAugmentor] = None,
         event_bus: Optional[EventBus] = None,
         history_limit: int = 100,
@@ -43,6 +52,7 @@ class PerceptionService:
         self._detector_pipeline = detector_pipeline
         self._tracker_backend = tracker_backend or Basic2DTrackerBackend()
         self._scene_description_backend = scene_description_backend or SimpleSceneDescriptionBackend()
+        self._segmentation_backend = segmentation_backend or DisabledSegmentationBackend()
         self._geometry_augmentor = geometry_augmentor or DetectionGeometryAugmentor()
         self._event_bus = event_bus
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
@@ -60,6 +70,12 @@ class PerceptionService:
         """返回跟踪后端。"""
 
         return self._tracker_backend
+
+    @property
+    def segmentation_backend(self) -> SegmentationBackend:
+        """返回分割后端。"""
+
+        return self._segmentation_backend
 
     def process_image(
         self,
@@ -83,23 +99,59 @@ class PerceptionService:
         if image_artifact is not None and not isinstance(image_artifact, ArtifactRef):
             raise TypeError("PerceptionService.process_image 的 image_artifact 必须是 ArtifactRef。")
 
+        pipeline_started_at = perf_counter()
+        stage_duration_ms: Dict[str, float] = {}
+        stage_status: Dict[str, str] = {}
+
+        stage_started_at = perf_counter()
         detection_bundle, detector_spec = self._detector_pipeline.detect(
             image_frame,
             camera_info,
             backend_name=detector_backend_name,
         )
+        stage_duration_ms["detector"] = self._elapsed_ms(stage_started_at)
+        stage_status["detector"] = "completed"
+
+        stage_started_at = perf_counter()
+        segmentation_bundle = self._segmentation_backend.segment(
+            image_frame,
+            detections_2d=detection_bundle.detections_2d,
+            camera_info=camera_info,
+        )
+        stage_duration_ms["segmentation"] = self._elapsed_ms(stage_started_at)
+        segmentation_stage_status = self._provider_stage_status(
+            self._segmentation_backend.spec.backend_kind,
+            segmentation_bundle.metadata,
+        )
+        stage_status["segmentation"] = segmentation_stage_status
+
+        detection_bundle = self._attach_segmentation_results(
+            detection_bundle,
+            segmentation_bundle,
+        )
+
+        stage_started_at = perf_counter()
         detection_bundle = self._augment_detection_geometry(
             detection_bundle,
             image_frame=image_frame,
             camera_info=camera_info,
         )
+        stage_duration_ms["geometry"] = self._elapsed_ms(stage_started_at)
+        stage_status["geometry"] = "completed"
+
+        stage_started_at = perf_counter()
         tracks = self._tracker_backend.update(
             image_frame,
             detections_2d=detection_bundle.detections_2d,
             detections_3d=detection_bundle.detections_3d,
             camera_info=camera_info,
         )
+        stage_duration_ms["tracker"] = self._elapsed_ms(stage_started_at)
+        stage_status["tracker"] = "completed"
+
         detections_2d = self._attach_track_ids(detection_bundle.detections_2d, tracks)
+
+        stage_started_at = perf_counter()
         scene_summary = self._scene_description_backend.describe(
             camera_id=image_frame.camera_id,
             detections_2d=detections_2d,
@@ -107,6 +159,18 @@ class PerceptionService:
             tracks=tracks,
             image_frame=image_frame,
             camera_info=camera_info,
+        )
+        stage_duration_ms["scene_description"] = self._elapsed_ms(stage_started_at)
+        stage_status["scene_description"] = "completed"
+        stage_duration_ms["total"] = self._elapsed_ms(pipeline_started_at)
+        provider_fallback_used = segmentation_stage_status == "fallback"
+        provider_fallback_reason = self._provider_fallback_reason(
+            segmentation_bundle.metadata,
+            self._segmentation_backend.spec.metadata,
+        )
+        detector_backend_metadata = dict(detector_spec.metadata)
+        detector_provider = dict(
+            detector_backend_metadata.get("provider") or detection_bundle.metadata.get("detector_provider") or {}
         )
         observation = Observation(
             observation_id=build_observation_id(self._normalize_camera_id(image_frame.camera_id)),
@@ -119,8 +183,20 @@ class PerceptionService:
             metadata={
                 "camera_id": image_frame.camera_id,
                 "detector_backend": detector_spec.name,
+                "detector_provider": dict(detector_provider),
+                "detector_backend_metadata": dict(detector_backend_metadata),
+                "detection_metadata": dict(detection_bundle.metadata),
                 "tracker_backend": self._tracker_backend.spec.name,
+                "segmentation_backend": self._segmentation_backend.spec.name,
+                "segmentation_backend_kind": self._segmentation_backend.spec.backend_kind,
+                "segmentation_backend_metadata": dict(self._segmentation_backend.spec.metadata),
+                "segmentation_metadata": dict(segmentation_bundle.metadata),
+                "segmentation_count": len(segmentation_bundle.segments),
                 "scene_description_backend": self._scene_description_backend.spec.name,
+                "stage_duration_ms": dict(stage_duration_ms),
+                "stage_status": dict(stage_status),
+                "provider_fallback_used": provider_fallback_used,
+                "provider_fallback_reason": provider_fallback_reason,
                 "pipeline_name": self._pipeline_name,
                 "requested_by": requested_by or "unknown",
                 "source_name": source_name or "unknown",
@@ -145,8 +221,22 @@ class PerceptionService:
                 "source_name": source_name or "unknown",
                 "requested_by": requested_by or "unknown",
                 "scene_description_backend": self._scene_description_backend.spec.name,
+                "segmentation_backend": self._segmentation_backend.spec.name,
+                "detector_provider": dict(detector_provider),
+                "detector_backend_metadata": dict(detector_backend_metadata),
+                "detection_metadata": dict(detection_bundle.metadata),
                 "detector_backend_kind": detector_spec.backend_kind,
                 "tracker_backend_kind": self._tracker_backend.spec.backend_kind,
+                "segmentation_backend_kind": self._segmentation_backend.spec.backend_kind,
+                "segmentation_backend_metadata": dict(self._segmentation_backend.spec.metadata),
+                "segmentation_metadata": dict(segmentation_bundle.metadata),
+                "segmentation_count": len(segmentation_bundle.segments),
+                "detection_count": len(detections_2d),
+                "track_count": len(tracks),
+                "stage_duration_ms": dict(stage_duration_ms),
+                "stage_status": dict(stage_status),
+                "provider_fallback_used": provider_fallback_used,
+                "provider_fallback_reason": provider_fallback_reason,
             },
         )
         self._latest_by_camera[context.camera_id] = context
@@ -169,8 +259,26 @@ class PerceptionService:
                     message=scene_summary.headline,
                     payload={
                         "camera_id": context.camera_id,
+                        "detector_backend": detector_spec.name,
+                        "detector_provider": dict(detector_provider),
+                        "segmentation_backend": self._segmentation_backend.spec.name,
+                        "segmentation_backend_kind": self._segmentation_backend.spec.backend_kind,
+                        "scene_description_backend": self._scene_description_backend.spec.name,
                         "detection_count": len(detections_2d),
+                        "segmentation_count": len(segmentation_bundle.segments),
                         "track_count": len(tracks),
+                        "stage_duration_ms": dict(stage_duration_ms),
+                        "stage_status": dict(stage_status),
+                        "provider_fallback_used": provider_fallback_used,
+                        "provider_fallback_reason": provider_fallback_reason,
+                    },
+                    metadata={
+                        "camera_id": context.camera_id,
+                        "detector_backend": detector_spec.name,
+                        "detector_provider": dict(detector_provider),
+                        "segmentation_backend": self._segmentation_backend.spec.name,
+                        "scene_description_backend": self._scene_description_backend.spec.name,
+                        "duration_ms": stage_duration_ms.get("total"),
                     },
                 )
             )
@@ -255,6 +363,125 @@ class PerceptionService:
 
         items = sorted(self._latest_by_camera.values(), key=lambda item: (item.camera_id, item.timestamp))
         return tuple(items)
+
+    def _attach_segmentation_results(
+        self,
+        detection_bundle: DetectionBundle,
+        segmentation_bundle: SegmentationBundle,
+    ) -> DetectionBundle:
+        if not segmentation_bundle.segments:
+            return detection_bundle
+        segment_by_index = {
+            int(segment.metadata["detection_index"]): segment
+            for segment in segmentation_bundle.segments
+            if isinstance(segment.metadata, dict) and "detection_index" in segment.metadata
+        }
+        detections = []
+        changed = False
+        for index, detection in enumerate(detection_bundle.detections_2d):
+            segment = segment_by_index.get(index)
+            if segment is None:
+                detections.append(detection)
+                continue
+            segmentation = segment.segmentation or detection.segmentation
+            segment_metadata = dict(segment.metadata or {})
+            merged_attributes = dict(detection.attributes or {})
+            if segmentation is not None:
+                for key, value in self._segmentation_to_attributes(segmentation).items():
+                    if value is not None and key not in merged_attributes:
+                        merged_attributes[key] = value
+            for key, value in segment_metadata.items():
+                if value is not None and key not in merged_attributes:
+                    merged_attributes[key] = value
+            merged_attributes.setdefault("segmentation_backend", self._segmentation_backend.spec.name)
+            merged_attributes.setdefault("segmentation_backend_kind", self._segmentation_backend.spec.backend_kind)
+            if "segmentation_score" not in merged_attributes:
+                merged_attributes["segmentation_score"] = float(segment.score)
+            update = {"attributes": merged_attributes}
+            if segmentation is not None:
+                update["segmentation"] = segmentation
+            detections.append(detection.model_copy(update=update, deep=True))
+            changed = True
+        if not changed:
+            return detection_bundle
+        return DetectionBundle(
+            detections_2d=tuple(detections),
+            detections_3d=detection_bundle.detections_3d,
+            metadata={
+                **dict(detection_bundle.metadata),
+                "segmentation_backend": self._segmentation_backend.spec.name,
+                "segmentation_count": len(segmentation_bundle.segments),
+                "segmentation_source": segmentation_bundle.metadata.get("source", self._segmentation_backend.spec.backend_kind),
+            },
+        )
+
+    def _elapsed_ms(self, started_at: float) -> float:
+        return round((perf_counter() - started_at) * 1000.0, 3)
+
+    def _provider_stage_status(self, backend_kind: str, metadata: Dict[str, object]) -> str:
+        normalized_kind = str(backend_kind or "").lower()
+        reason = str((metadata or {}).get("reason") or "").lower()
+        source = str((metadata or {}).get("source") or "").lower()
+        if "disabled" in normalized_kind or reason == "disabled_by_config":
+            return "disabled"
+        if "fallback" in normalized_kind or "fallback" in reason or "fallback" in source:
+            return "fallback"
+        if str((metadata or {}).get("stage_status") or "").strip():
+            return str(metadata.get("stage_status"))
+        return "completed"
+
+    def _provider_fallback_reason(self, *metadata_items: Dict[str, object]) -> str:
+        for metadata in metadata_items:
+            for key in ("fallback_reason", "reason", "source"):
+                value = str((metadata or {}).get(key) or "").strip()
+                if value:
+                    return value
+        return ""
+
+    def _segmentation_to_attributes(self, segmentation: SegmentationMask2D) -> Dict[str, object]:
+        attributes: Dict[str, object] = dict(segmentation.attributes or {})
+        if segmentation.polygon_px:
+            polygon = [[float(x), float(y)] for x, y in segmentation.polygon_px]
+            attributes.setdefault("mask_polygon_px", polygon)
+            attributes.setdefault("segmentation_polygon_px", polygon)
+        if segmentation.centroid_uv is not None:
+            centroid = [float(segmentation.centroid_uv[0]), float(segmentation.centroid_uv[1])]
+            attributes.setdefault("mask_center_px", centroid)
+            attributes.setdefault("centroid_uv", centroid)
+        if segmentation.bbox_xyxy is not None:
+            attributes.setdefault("bbox_xyxy", [float(value) for value in segmentation.bbox_xyxy])
+        if segmentation.area_px is not None:
+            attributes.setdefault("area_px", float(segmentation.area_px))
+        if segmentation.area_ratio is not None:
+            attributes.setdefault("area_ratio", float(segmentation.area_ratio))
+        if segmentation.crop_box is not None:
+            attributes.setdefault("crop_box", [float(value) for value in segmentation.crop_box])
+        if segmentation.contour:
+            attributes.setdefault("contour", dict(segmentation.contour))
+        if segmentation.frame_id:
+            attributes.setdefault("frame_id", segmentation.frame_id)
+        if segmentation.camera_id:
+            attributes.setdefault("camera_id", segmentation.camera_id)
+        if segmentation.source:
+            attributes.setdefault("segmentation_source", segmentation.source)
+        if segmentation.truncation_flags:
+            attributes.setdefault("truncation_flags", list(segmentation.truncation_flags))
+        if segmentation.occlusion_flags:
+            attributes.setdefault("occlusion_flags", list(segmentation.occlusion_flags))
+        quality = segmentation.quality
+        if quality.score is not None:
+            attributes.setdefault("segmentation_score", float(quality.score))
+        if quality.predicted_iou is not None:
+            attributes.setdefault("predicted_iou", float(quality.predicted_iou))
+        if quality.stability_score is not None:
+            attributes.setdefault("stability_score", float(quality.stability_score))
+        if quality.depth_coverage is not None:
+            attributes.setdefault("depth_coverage", float(quality.depth_coverage))
+        if quality.map_projection_coverage is not None:
+            attributes.setdefault("map_projection_coverage", float(quality.map_projection_coverage))
+        if quality.reprojection_error is not None:
+            attributes.setdefault("reprojection_error", float(quality.reprojection_error))
+        return attributes
 
     def _attach_track_ids(
         self,

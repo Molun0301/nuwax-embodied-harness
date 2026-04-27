@@ -20,8 +20,11 @@ from gateways.errors import GatewayError
 from providers.image import ImageProvider
 from services import ArtifactService
 from services.perception import (
+    BBoxOnlySegmentationBackend,
     Basic2DTrackerBackend,
+    DetectionAttributesSegmentationBackend,
     DetectorPipeline,
+    DisabledSegmentationBackend,
     HybridSceneDescriptionBackend,
     MetadataDrivenDetectorBackend,
     OpenAICompatibleVisionSceneDescriptionBackend,
@@ -29,6 +32,10 @@ from services.perception import (
     PerceptionVideoRuntime,
     SceneDescriptionBackend,
     SceneDescriptionBackendSpec,
+    SegmentationBackend,
+    SegmentationBackendSpec,
+    SegmentationBundle,
+    SegmentationCandidate,
     SimpleSceneDescriptionBackend,
     TrackLifecyclePolicy,
     UltralyticsYoloDetectorBackend,
@@ -211,6 +218,7 @@ def _build_perception_service(
     tracker_backend: Optional[Basic2DTrackerBackend] = None,
     detector_pipeline: Optional[DetectorPipeline] = None,
     scene_description_backend: Optional[SceneDescriptionBackend] = None,
+    segmentation_backend: Optional[SegmentationBackend] = None,
 ) -> Tuple[PerceptionService, StateStore]:
     artifact_service = ArtifactService(
         LocalArtifactStore(str(tmp_path / "artifacts"), "http://testserver"),
@@ -229,11 +237,25 @@ def _build_perception_service(
         detector_pipeline=detector_pipeline or DetectorPipeline((MetadataDrivenDetectorBackend(),)),
         tracker_backend=tracker_backend,
         scene_description_backend=scene_description_backend,
+        segmentation_backend=segmentation_backend,
         event_bus=EventBus(),
         history_limit=10,
         pipeline_name="test_perception_pipeline",
     )
     return service, state_store
+
+
+def _assert_pipeline_observability(metadata: dict, *, segmentation_status: str) -> None:
+    stage_duration_ms = metadata["stage_duration_ms"]
+    stage_status = metadata["stage_status"]
+    for stage_name in ("detector", "segmentation", "geometry", "tracker", "scene_description", "total"):
+        assert stage_name in stage_duration_ms
+        assert stage_duration_ms[stage_name] >= 0
+    assert stage_status["detector"] == "completed"
+    assert stage_status["segmentation"] == segmentation_status
+    assert stage_status["geometry"] == "completed"
+    assert stage_status["tracker"] == "completed"
+    assert stage_status["scene_description"] == "completed"
 
 
 class _FakeYoloDetectorBackend(UltralyticsYoloDetectorBackend):
@@ -247,11 +269,113 @@ class _FakeYoloDetectorBackend(UltralyticsYoloDetectorBackend):
             conf = [0.93]
             cls = [0]
 
+        class _Masks:
+            xy = [
+                [
+                    [20.0, 30.0],
+                    [80.0, 30.0],
+                    [80.0, 150.0],
+                    [20.0, 150.0],
+                ]
+            ]
+            predicted_iou = [0.71]
+            stability_score = [0.82]
+            scores = [0.89]
+
         class _Result:
             boxes = _Boxes()
+            masks = _Masks()
             names = {0: "Person"}
 
         return [_Result()]
+
+
+class _FakeYoloNoMaskDetectorBackend(UltralyticsYoloDetectorBackend):
+    def _predict(self, image_bgr):
+        del image_bgr
+
+        class _Boxes:
+            xyxy = [[10.0, 12.0, 60.0, 72.0]]
+            conf = [0.81]
+            cls = [0]
+
+        class _Result:
+            boxes = _Boxes()
+            masks = None
+            names = {0: "Bottle"}
+
+        return [_Result()]
+
+
+class _FakeYoloLowQualityMaskDetectorBackend(UltralyticsYoloDetectorBackend):
+    def _predict(self, image_bgr):
+        del image_bgr
+
+        class _Boxes:
+            xyxy = [[12.0, 16.0, 92.0, 116.0]]
+            conf = [0.76]
+            cls = [1]
+
+        class _Masks:
+            xy = [[[12.0, 16.0], [92.0, 16.0], [92.0, 116.0], [12.0, 116.0]]]
+            predicted_iou = [0.19]
+            stability_score = [0.24]
+            scores = [0.22]
+
+        class _Result:
+            boxes = _Boxes()
+            masks = _Masks()
+            names = {1: "Chair"}
+
+        return [_Result()]
+
+
+class _FakeYoloInvalidMaskDetectorBackend(UltralyticsYoloDetectorBackend):
+    def _predict(self, image_bgr):
+        del image_bgr
+
+        class _Boxes:
+            xyxy = [[14.0, 18.0, 44.0, 58.0]]
+            conf = [0.67]
+            cls = [2]
+
+        class _Masks:
+            xy = [[[14.0, 18.0], [44.0, 58.0]]]
+            predicted_iou = [0.91]
+            stability_score = [0.92]
+            scores = [0.93]
+
+        class _Result:
+            boxes = _Boxes()
+            masks = _Masks()
+            names = {2: "Box"}
+
+        return [_Result()]
+
+
+
+class _RecordingSegmentationBackend(SegmentationBackend):
+    def __init__(self) -> None:
+        self.spec = SegmentationBackendSpec(name="recording_segmentation", backend_kind="recording")
+        self.calls = []
+
+    def segment(self, image_frame, *, detections_2d=(), camera_info=None) -> SegmentationBundle:
+        self.calls.append((image_frame, detections_2d, camera_info))
+        return SegmentationBundle(
+            segments=(
+                SegmentationCandidate(
+                    label=detections_2d[0].label,
+                    score=0.88,
+                    metadata={
+                        "detection_index": 0,
+                        "mask_center_px": [60.0, 70.0],
+                        "mask_polygon_px": [[40.0, 50.0], [80.0, 50.0], [80.0, 90.0], [40.0, 90.0]],
+                        "segmentation_score": 0.88,
+                    },
+                ),
+            ),
+            metadata={"backend": "recording_segmentation", "segment_count": 1, "source": "test"},
+        )
 
 
 class _StubCloudSceneBackend(SceneDescriptionBackend):
@@ -432,6 +556,222 @@ def test_perception_service_requires_standard_imageframe_and_camerainfo(tmp_path
         service.process_image("not-an-image-frame", camera_info)
 
 
+def test_perception_service_exposes_segmentation_backend_metadata(tmp_path: Path) -> None:
+    """感知结果元数据应暴露已装配的分割后端信息。"""
+
+    provider_owner = _ProviderOwner(UsbCameraBundle())
+    segmentation_backend = DisabledSegmentationBackend(
+        configured_enabled=True,
+        configured_backend_name="sam2",
+        configured_backend_kind="sam2",
+        reason="not_implemented",
+    )
+    service, _ = _build_perception_service(
+        tmp_path,
+        provider_owner,
+        segmentation_backend=segmentation_backend,
+    )
+
+    context = service.perceive_current_scene(camera_id="front_camera", requested_by="tester", store_artifact=False)
+
+    assert service.segmentation_backend is segmentation_backend
+    _assert_pipeline_observability(context.observation.metadata, segmentation_status="disabled")
+    _assert_pipeline_observability(context.metadata, segmentation_status="disabled")
+    assert context.pipeline_name == "test_perception_pipeline"
+    assert context.observation.metadata["pipeline_name"] == "test_perception_pipeline"
+    assert context.observation.metadata["provider_fallback_used"] is False
+    assert context.observation.metadata["provider_fallback_reason"] == "not_implemented"
+    assert context.observation.metadata["detector_provider"]["capability"] == "detection"
+    assert context.observation.metadata["detector_provider"]["provider_name"] == "metadata_detector"
+    assert context.observation.metadata["detector_provider"]["capabilities"]["detect"] is True
+    assert context.observation.metadata["detector_backend_metadata"]["provider"] == context.observation.metadata["detector_provider"]
+    assert context.metadata["detector_provider"]["capability"] == "detection"
+    assert context.metadata["detector_provider"]["provider_name"] == "metadata_detector"
+    assert context.metadata["detector_provider"]["capabilities"]["detect"] is True
+    assert context.metadata["detector_backend_metadata"]["provider"] == context.metadata["detector_provider"]
+    scene_event = service._event_bus.replay(after_cursor=0)[-1]
+    assert scene_event.event_type == "perception.scene_ready"
+    assert scene_event.payload["stage_status"]["segmentation"] == "disabled"
+    assert scene_event.payload["stage_duration_ms"]["total"] >= 0
+    assert scene_event.payload["detector_provider"]["provider_name"] == "metadata_detector"
+    assert scene_event.payload["detector_provider"]["capabilities"]["detect"] is True
+    assert scene_event.metadata["duration_ms"] == scene_event.payload["stage_duration_ms"]["total"]
+    assert scene_event.metadata["detector_provider"]["capability"] == "detection"
+    assert scene_event.metadata["detector_provider"]["provider_name"] == "metadata_detector"
+    assert context.observation.metadata["segmentation_backend"] == "segmentation_disabled"
+    assert context.observation.metadata["segmentation_backend_kind"] == "disabled_segmentation"
+    assert context.observation.metadata["segmentation_count"] == 0
+    assert context.observation.metadata["segmentation_metadata"]["reason"] == "not_implemented"
+    assert context.observation.metadata["segmentation_backend_metadata"]["configured_enabled"] is True
+    assert context.observation.metadata["segmentation_backend_metadata"]["configured_backend_name"] == "sam2"
+    assert context.observation.metadata["segmentation_backend_metadata"]["configured_backend_kind"] == "sam2"
+    assert context.observation.metadata["segmentation_backend_metadata"]["reason"] == "not_implemented"
+    assert context.metadata["segmentation_backend"] == "segmentation_disabled"
+    assert context.metadata["segmentation_backend_kind"] == "disabled_segmentation"
+    assert context.metadata["segmentation_count"] == 0
+    assert context.metadata["segmentation_metadata"]["reason"] == "not_implemented"
+    assert context.metadata["segmentation_backend_metadata"]["configured_enabled"] is True
+    assert context.metadata["segmentation_backend_metadata"]["configured_backend_name"] == "sam2"
+    assert context.metadata["segmentation_backend_metadata"]["configured_backend_kind"] == "sam2"
+    assert context.metadata["segmentation_backend_metadata"]["reason"] == "not_implemented"
+
+
+def test_perception_service_calls_segmentation_backend_and_merges_attributes(tmp_path: Path) -> None:
+    """感知主链应调用分割后端并把分割属性合入检测结果。"""
+
+    provider_owner = _ProviderOwner(UsbCameraBundle())
+    segmentation_backend = _RecordingSegmentationBackend()
+    service, _ = _build_perception_service(
+        tmp_path,
+        provider_owner,
+        segmentation_backend=segmentation_backend,
+    )
+
+    context = service.perceive_current_scene(camera_id="front_camera", requested_by="tester", store_artifact=False)
+    detection = context.observation.detections_2d[0]
+
+    assert segmentation_backend.calls
+    _assert_pipeline_observability(context.observation.metadata, segmentation_status="completed")
+    _assert_pipeline_observability(context.metadata, segmentation_status="completed")
+    assert context.observation.metadata["pipeline_name"] == "test_perception_pipeline"
+    assert context.observation.metadata["provider_fallback_used"] is False
+    scene_event = service._event_bus.replay(after_cursor=0)[-1]
+    assert scene_event.event_type == "perception.scene_ready"
+    assert scene_event.payload["stage_status"]["segmentation"] == "completed"
+    assert scene_event.payload["provider_fallback_used"] is False
+    _, detections_2d, camera_info = segmentation_backend.calls[0]
+    assert detections_2d[0].label == "person"
+    assert camera_info is not None
+    assert camera_info.camera_id == "front_camera"
+    assert context.observation.metadata["segmentation_count"] == 1
+    assert context.observation.metadata["segmentation_metadata"]["source"] == "test"
+    assert context.metadata["segmentation_count"] == 1
+    assert detection.attributes["mask_center_px"] == [60.0, 70.0]
+    assert detection.attributes["mask_polygon_px"] == [[40.0, 50.0], [80.0, 50.0], [80.0, 90.0], [40.0, 90.0]]
+    assert detection.attributes["segmentation_score"] == pytest.approx(0.88)
+    assert detection.attributes["segmentation_backend"] == "recording_segmentation"
+    assert detection.attributes["segmentation_backend_kind"] == "recording"
+
+
+def test_perception_service_merges_bbox_only_segmentation(tmp_path: Path) -> None:
+    """bbox-only 分割应合入 detection.segmentation 与检测属性。"""
+
+    provider_owner = _ProviderOwner(UsbCameraBundle())
+    segmentation_backend = BBoxOnlySegmentationBackend(
+        metadata={"provider_kind": "bbox_only_fallback", "provider_name": "bbox_only_fallback"},
+    )
+    service, _ = _build_perception_service(
+        tmp_path,
+        provider_owner,
+        segmentation_backend=segmentation_backend,
+    )
+
+    context = service.perceive_current_scene(camera_id="front_camera", requested_by="tester", store_artifact=False)
+    detection = context.observation.detections_2d[0]
+
+    _assert_pipeline_observability(context.observation.metadata, segmentation_status="fallback")
+    _assert_pipeline_observability(context.metadata, segmentation_status="fallback")
+    assert context.observation.metadata["provider_fallback_used"] is True
+    assert context.observation.metadata["provider_fallback_reason"] == "bbox_only_fallback"
+    assert context.observation.metadata["segmentation_backend"] == "bbox_only_segmentation"
+    assert context.observation.metadata["segmentation_backend_kind"] == "bbox_only_fallback"
+    assert context.observation.metadata["segmentation_count"] == 1
+    assert context.observation.metadata["segmentation_metadata"]["source"] == "bbox_only_fallback"
+    assert context.observation.metadata["segmentation_backend_metadata"]["provider_kind"] == "bbox_only_fallback"
+    assert detection.segmentation is not None
+    assert detection.segmentation.source == "bbox_only_fallback"
+    assert detection.segmentation.polygon_px == ((20.0, 30.0), (100.0, 30.0), (100.0, 150.0), (20.0, 150.0))
+    assert detection.segmentation.centroid_uv == (60.0, 90.0)
+    assert detection.segmentation.area_ratio == pytest.approx(0.125)
+    assert detection.attributes["mask_polygon_px"] == [[20.0, 30.0], [100.0, 30.0], [100.0, 150.0], [20.0, 150.0]]
+    assert detection.attributes["segmentation_polygon_px"] == [[20.0, 30.0], [100.0, 30.0], [100.0, 150.0], [20.0, 150.0]]
+    assert detection.attributes["mask_center_px"] == [60.0, 90.0]
+    assert detection.attributes["segmentation_available"] is False
+    assert detection.attributes["segmentation_status"] == "bbox_only_fallback"
+    assert detection.attributes["segmentation_source"] == "bbox_only_fallback"
+    assert detection.attributes["segmentation_backend"] == "bbox_only_segmentation"
+    assert detection.attributes["segmentation_backend_kind"] == "bbox_only_fallback"
+
+
+def test_detection_attributes_segmentation_backend_collects_segments() -> None:
+    """属性分割后端应从检测属性中生成分割候选。"""
+
+    image_frame = ImageFrame(
+        camera_id="front_camera",
+        frame_id="world/test/front_camera",
+        width_px=160,
+        height_px=120,
+        encoding=ImageEncoding.JPEG,
+        data=b"image",
+        metadata={
+            "detections_2d": [
+                {
+                    "label": "person",
+                    "score": 0.95,
+                    "bbox": {"x_px": 20, "y_px": 30, "width_px": 80, "height_px": 120},
+                    "attributes": {
+                        "mask_center_px": [60.0, 70.0],
+                        "mask_polygon_px": [[40.0, 50.0], [80.0, 50.0], [80.0, 90.0], [40.0, 90.0]],
+                    },
+                }
+            ],
+        },
+    )
+    detection = MetadataDrivenDetectorBackend().detect(image_frame).detections_2d[0]
+
+    bundle = DetectionAttributesSegmentationBackend().segment(image_frame, detections_2d=(detection,))
+    segment = bundle.segments[0]
+
+    assert bundle.metadata["segment_count"] == 1
+    assert bundle.metadata["detection_count"] == 1
+    assert segment.label == "person"
+    assert segment.metadata["detection_index"] == 0
+    assert segment.metadata["frame_id"] == "world/test/front_camera"
+    assert segment.metadata["camera_id"] == "front_camera"
+    assert segment.metadata["bbox_xyxy"] == (20.0, 30.0, 100.0, 120.0)
+    assert segment.metadata["mask_center_px"] == [60.0, 70.0]
+    assert segment.metadata["mask_polygon_px"] == [[40.0, 50.0], [80.0, 50.0], [80.0, 90.0], [40.0, 90.0]]
+
+
+def test_bbox_only_segmentation_backend_builds_structured_segments() -> None:
+    """bbox-only 分割后端应从检测框生成结构化最低可用分割。"""
+
+    image_frame = ImageFrame(
+        camera_id="front_camera",
+        frame_id="world/test/front_camera",
+        width_px=200,
+        height_px=100,
+        encoding=ImageEncoding.JPEG,
+        data=b"image",
+        metadata={
+            "detections_2d": [
+                {
+                    "label": "box",
+                    "score": 0.9,
+                    "bbox": {"x_px": 20, "y_px": 10, "width_px": 80, "height_px": 40},
+                }
+            ],
+        },
+    )
+    detection = MetadataDrivenDetectorBackend().detect(image_frame).detections_2d[0]
+
+    bundle = BBoxOnlySegmentationBackend().segment(image_frame, detections_2d=(detection,))
+    segment = bundle.segments[0]
+
+    assert bundle.metadata["source"] == "bbox_only_fallback"
+    assert bundle.metadata["segment_count"] == 1
+    assert segment.label == "box"
+    assert segment.segmentation is not None
+    assert segment.segmentation.polygon_px == ((20.0, 10.0), (100.0, 10.0), (100.0, 50.0), (20.0, 50.0))
+    assert segment.segmentation.centroid_uv == (60.0, 30.0)
+    assert segment.segmentation.bbox_xyxy == (20.0, 10.0, 100.0, 50.0)
+    assert segment.segmentation.area_px == pytest.approx(3200.0)
+    assert segment.segmentation.area_ratio == pytest.approx(0.16)
+    assert segment.segmentation.source == "bbox_only_fallback"
+    assert segment.metadata["segmentation_available"] is False
+    assert segment.metadata["segmentation_status"] == "bbox_only_fallback"
+
+
 def test_metadata_detector_normalizes_detection_results() -> None:
     """检测标准化应修正标签、分数与越界框。"""
 
@@ -485,6 +825,113 @@ def test_yolo_detector_backend_normalizes_ultralytics_results() -> None:
     assert detection.score == pytest.approx(0.93)
     assert detection.attributes["model_name"] == "yolo26n.pt"
     assert detection.attributes["class_id"] == 0
+    assert detection.attributes["grounding_score"] == pytest.approx(0.93)
+    assert detection.attributes["mask_polygon_px"] == [[20.0, 30.0], [80.0, 30.0], [80.0, 150.0], [20.0, 150.0]]
+    assert detection.attributes["segmentation_polygon_px"] == [[20.0, 30.0], [80.0, 30.0], [80.0, 150.0], [20.0, 150.0]]
+    assert detection.attributes["mask_center_px"] == [50.0, 90.0]
+    assert detection.attributes["centroid_uv"] == [50.0, 90.0]
+    assert detection.attributes["bbox_xyxy"] == [20.0, 30.0, 80.0, 150.0]
+    assert detection.attributes["crop_box"] == [20.0, 30.0, 80.0, 150.0]
+    assert detection.attributes["area_px"] == pytest.approx(7200.0)
+    assert detection.attributes["area_ratio"] == pytest.approx(0.375)
+    assert detection.attributes["contour"] == {"point_count": 4}
+    assert detection.attributes["segmentation_score"] == pytest.approx(0.89)
+    assert detection.attributes["predicted_iou"] == pytest.approx(0.71)
+    assert detection.attributes["stability_score"] == pytest.approx(0.82)
+    assert detection.attributes["segmentation_available"] is True
+    assert detection.attributes["segmentation_status"] == "segmentation_preferred"
+    assert detection.attributes["segmentation_priority"] == "segmentation_over_bbox"
+    assert detection.attributes["segmentation_source"] == "ultralytics_yolo_masks"
+    assert detection.segmentation is not None
+    assert detection.segmentation.polygon_px == ((20.0, 30.0), (80.0, 30.0), (80.0, 150.0), (20.0, 150.0))
+    assert detection.segmentation.centroid_uv == (50.0, 90.0)
+    assert detection.segmentation.bbox_xyxy == (20.0, 30.0, 80.0, 150.0)
+    assert detection.segmentation.crop_box == (20.0, 30.0, 80.0, 150.0)
+    assert detection.segmentation.area_px == pytest.approx(7200.0)
+    assert detection.segmentation.area_ratio == pytest.approx(0.375)
+    assert detection.segmentation.contour == {"point_count": 4}
+    assert detection.segmentation.quality.score == pytest.approx(0.89)
+    assert detection.segmentation.quality.predicted_iou == pytest.approx(0.71)
+    assert detection.segmentation.quality.stability_score == pytest.approx(0.82)
+    assert detection.segmentation.attributes["grounding_score"] == pytest.approx(0.93)
+
+
+def test_yolo_detector_backend_preserves_bbox_only_when_masks_missing() -> None:
+    """YOLO 无 masks 时应保持 bbox-only 降级语义。"""
+
+    image_frame = ImageFrame(
+        camera_id="front_camera",
+        frame_id="world/test/front_camera",
+        width_px=160,
+        height_px=120,
+        encoding=ImageEncoding.BGR8,
+        data=bytes([0, 0, 0] * 160 * 120),
+    )
+
+    backend = _FakeYoloNoMaskDetectorBackend(weights="yolo26n.pt")
+    detection = backend.detect(image_frame).detections_2d[0]
+
+    assert detection.label == "bottle"
+    assert detection.segmentation is None
+    assert detection.attributes["grounding_score"] == pytest.approx(0.81)
+    assert detection.attributes["segmentation_available"] is False
+    assert detection.attributes["segmentation_status"] == "bbox_only"
+    assert detection.attributes["segmentation_priority"] == "bbox_only"
+    assert "mask_polygon_px" not in detection.attributes
+    assert "segmentation_score" not in detection.attributes
+
+
+def test_yolo_detector_backend_keeps_low_quality_mask_scores() -> None:
+    """YOLO masks 质量较低时仍应保留结构化质量字段供下游决策。"""
+
+    image_frame = ImageFrame(
+        camera_id="front_camera",
+        frame_id="world/test/front_camera",
+        width_px=160,
+        height_px=120,
+        encoding=ImageEncoding.BGR8,
+        data=bytes([0, 0, 0] * 160 * 120),
+    )
+
+    backend = _FakeYoloLowQualityMaskDetectorBackend(weights="yolo26n.pt")
+    detection = backend.detect(image_frame).detections_2d[0]
+
+    assert detection.label == "chair"
+    assert detection.segmentation is not None
+    assert detection.attributes["segmentation_available"] is True
+    assert detection.attributes["segmentation_status"] == "segmentation_preferred"
+    assert detection.attributes["segmentation_priority"] == "segmentation_over_bbox"
+    assert detection.attributes["segmentation_score"] == pytest.approx(0.22)
+    assert detection.attributes["predicted_iou"] == pytest.approx(0.19)
+    assert detection.attributes["stability_score"] == pytest.approx(0.24)
+    assert detection.segmentation.quality.score == pytest.approx(0.22)
+    assert detection.segmentation.quality.predicted_iou == pytest.approx(0.19)
+    assert detection.segmentation.quality.stability_score == pytest.approx(0.24)
+
+
+def test_yolo_detector_backend_falls_back_for_invalid_mask_polygon() -> None:
+    """YOLO mask polygon 无效时不应生成结构化 segmentation。"""
+
+    image_frame = ImageFrame(
+        camera_id="front_camera",
+        frame_id="world/test/front_camera",
+        width_px=160,
+        height_px=120,
+        encoding=ImageEncoding.BGR8,
+        data=bytes([0, 0, 0] * 160 * 120),
+    )
+
+    backend = _FakeYoloInvalidMaskDetectorBackend(weights="yolo26n.pt")
+    detection = backend.detect(image_frame).detections_2d[0]
+
+    assert detection.label == "box"
+    assert detection.segmentation is None
+    assert detection.attributes["grounding_score"] == pytest.approx(0.67)
+    assert detection.attributes["segmentation_available"] is False
+    assert detection.attributes["segmentation_status"] == "invalid_polygon"
+    assert detection.attributes["segmentation_priority"] == "bbox_only"
+    assert "predicted_iou" not in detection.attributes
+    assert "stability_score" not in detection.attributes
 
 
 def test_yolo_detector_backend_prefers_engine_when_available(tmp_path: Path) -> None:
@@ -1084,13 +1531,14 @@ def test_hybrid_scene_backend_merges_local_and_cloud_semantics(tmp_path: Path) -
     """本地检测与云端语义识别应合并为统一场景摘要。"""
 
     provider_owner = _ProviderOwner(UsbCameraBundle())
+    hybrid_backend = HybridSceneDescriptionBackend(
+        local_backend=SimpleSceneDescriptionBackend(),
+        cloud_backend=_StubCloudSceneBackend(),
+    )
     service, _ = _build_perception_service(
         tmp_path,
         provider_owner,
-        scene_description_backend=HybridSceneDescriptionBackend(
-            local_backend=SimpleSceneDescriptionBackend(),
-            cloud_backend=_StubCloudSceneBackend(),
-        ),
+        scene_description_backend=hybrid_backend,
     )
 
     context = service.perceive_current_scene(camera_id="front_camera", requested_by="tester")
@@ -1098,4 +1546,11 @@ def test_hybrid_scene_backend_merges_local_and_cloud_semantics(tmp_path: Path) -
     assert context.scene_summary.headline == "画面里有一名人员，靠近红色补给架。"
     assert "红色补给架" in context.scene_summary.metadata["semantic_tags"]
     assert "person_beside_charger" in context.scene_summary.metadata["semantic_relations"]
+    assert context.scene_summary.metadata["scene_provider"]["provider_name"] == "hybrid_scene"
+    assert context.scene_summary.metadata["scene_provider"]["provider_kind"] == "hybrid"
+    assert context.scene_summary.metadata["scene_backend_chain"] == [
+        hybrid_backend.spec.metadata["local_backend"],
+        hybrid_backend.spec.metadata["cloud_backend"],
+    ]
+    assert hybrid_backend.spec.metadata["provider"]["provider_name"] == "hybrid_scene"
     assert context.scene_summary.objects[0].label == "person"

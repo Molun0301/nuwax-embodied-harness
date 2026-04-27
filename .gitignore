@@ -14,3 +14,4 @@ artifacts/
 memory_models_20260402.tar.zst
 runtime_data/models/
 tests/
+.vscode/

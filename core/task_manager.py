@@ -15,6 +15,43 @@ from core.resource_lock import ResourceLockManager
 
 TaskRunner = Callable[["TaskExecutionContext"], Any]
 
+_REQUEST_CONTEXT_KEYS = (
+    "request_id",
+    "task_id",
+    "capability_name",
+    "requested_by",
+    "method",
+    "path",
+    "client_ip",
+    "status_code",
+    "duration_ms",
+    "error_category",
+    "map_version_id",
+    "localization_session_id",
+    "map_name",
+    "camera_id",
+    "pose_source",
+)
+
+_ERROR_CATEGORY_BY_CODE = {
+    "authentication_required": "auth",
+    "invalid_token": "auth",
+    "unauthorized": "auth",
+    "access_denied": "authorization",
+    "forbidden": "authorization",
+    "capability_not_allowed": "authorization",
+    "invalid_params": "validation",
+    "validation_error": "validation",
+    "not_found": "validation",
+    "capability_not_registered": "capability",
+    "resource_conflict": "capability",
+    "execution_failed": "capability",
+}
+
+
+def _has_context_value(value: Any) -> bool:
+    return value is not None and value != ""
+
 
 class TaskCancelledError(RuntimeError):
     """任务取消异常。"""
@@ -116,12 +153,18 @@ class TaskManager:
         """提交一个异步任务。"""
 
         task_id = build_task_id(capability_name)
+        metadata_payload = self._build_task_metadata(
+            task_id=task_id,
+            capability_name=capability_name,
+            requested_by=requested_by,
+            metadata=metadata,
+        )
         resources = list(required_resources or [])
         if self._resource_lock_manager is not None and resources:
             self._resource_lock_manager.acquire(
                 task_id,
                 resources,
-                metadata={"capability_name": capability_name, **dict(metadata or {})},
+                metadata={"capability_name": capability_name, **metadata_payload},
             )
 
         spec = TaskSpec(
@@ -130,7 +173,7 @@ class TaskManager:
             requested_by=requested_by,
             input_payload=dict(input_payload or {}),
             required_resources=resources,
-            metadata=dict(metadata or {}),
+            metadata=metadata_payload,
         )
         status = TaskStatus(
             task_id=task_id,
@@ -306,6 +349,67 @@ class TaskManager:
             timer.cancel()
         self._executor.shutdown(wait=wait)
 
+    def _build_task_metadata(
+        self,
+        *,
+        task_id: str,
+        capability_name: str,
+        requested_by: Optional[str],
+        metadata: Optional[MetadataDict],
+    ) -> MetadataDict:
+        metadata_payload = dict(metadata or {})
+        request_context_source = metadata_payload.get("request_context")
+        request_context = dict(request_context_source) if isinstance(request_context_source, dict) else {}
+        request_context["task_id"] = task_id
+        request_context["capability_name"] = request_context.get("capability_name") or capability_name
+        request_context["requested_by"] = (
+            request_context.get("requested_by")
+            or requested_by
+            or metadata_payload.get("requested_by")
+            or "unknown"
+        )
+        metadata_payload["request_context"] = dict(request_context)
+        for key in _REQUEST_CONTEXT_KEYS:
+            value = request_context.get(key)
+            if _has_context_value(value):
+                metadata_payload[key] = value
+        return metadata_payload
+
+    def _build_task_event_payload(self, spec: TaskSpec, payload: Optional[MetadataDict]) -> MetadataDict:
+        event_payload = dict(payload or {})
+        request_context_source = spec.metadata.get("request_context")
+        request_context = dict(request_context_source) if isinstance(request_context_source, dict) else {}
+        request_context["task_id"] = spec.task_id
+        request_context["capability_name"] = request_context.get("capability_name") or spec.capability_name
+        request_context["requested_by"] = request_context.get("requested_by") or spec.requested_by or "unknown"
+        event_payload.setdefault("request_context", dict(request_context))
+        for key in _REQUEST_CONTEXT_KEYS:
+            value = request_context.get(key)
+            if _has_context_value(value):
+                event_payload.setdefault(key, value)
+        return event_payload
+
+    def _classify_terminal_error_category(self, state: TaskState, error_code: Optional[str]) -> str:
+        if state == TaskState.TIMEOUT:
+            return "timeout"
+        if state == TaskState.CANCELLED:
+            return "cancelled"
+        if error_code:
+            return _ERROR_CATEGORY_BY_CODE.get(error_code, "capability")
+        return "capability"
+
+    def _terminal_error_code(self, state: TaskState, error_payload: MetadataDict) -> Optional[str]:
+        error_code = str(error_payload.get("code") or "").strip()
+        if error_code:
+            return error_code
+        if state == TaskState.FAILED:
+            return "task_failed"
+        if state == TaskState.TIMEOUT:
+            return "task_timeout"
+        if state == TaskState.CANCELLED:
+            return "task_cancelled"
+        return None
+
     def _run_task(self, task_id: str, runner: TaskRunner) -> Any:
         self._set_running(task_id)
         context = TaskExecutionContext(manager=self, task_id=task_id)
@@ -374,6 +478,13 @@ class TaskManager:
         error: Optional[str] = None,
         error_payload: Optional[MetadataDict] = None,
     ) -> None:
+        terminal_error_payload = dict(error_payload or {})
+        error_code = self._terminal_error_code(state, terminal_error_payload)
+        if error_code is not None:
+            terminal_error_payload.setdefault("code", error_code)
+        error_category = None if state == TaskState.SUCCEEDED else self._classify_terminal_error_category(state, error_code)
+        if error_category is not None:
+            terminal_error_payload.setdefault("error_category", error_category)
         with self._lock:
             record = self._records[task_id]
             if record.status.state in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.TIMEOUT}:
@@ -392,7 +503,7 @@ class TaskManager:
             )
             record.result = result
             record.error = error
-            record.error_payload = dict(error_payload or {}) or None
+            record.error_payload = terminal_error_payload or None
             if task_id not in self._history_order:
                 self._history_order.append(task_id)
             status = record.status
@@ -406,8 +517,12 @@ class TaskManager:
         payload: MetadataDict = {}
         if error is not None:
             payload["error"] = error
-        if error_payload is not None:
-            payload["error_payload"] = dict(error_payload)
+        if terminal_error_payload:
+            payload["error_payload"] = dict(terminal_error_payload)
+        if error_code is not None:
+            payload["error_code"] = error_code
+        if error_category is not None:
+            payload["error_category"] = error_category
         self._append_task_event(task_id, event_type, state=status.state, message=message, payload=payload)
 
     def _extract_error_payload(self, exc: Exception) -> Optional[MetadataDict]:
@@ -433,16 +548,16 @@ class TaskManager:
         message: Optional[str] = None,
         payload: Optional[MetadataDict] = None,
     ) -> TaskEvent:
-        event = TaskEvent(
-            event_id=build_event_id(event_type),
-            event_type=event_type,
-            task_id=task_id,
-            state=state,
-            message=message,
-            payload=dict(payload or {}),
-        )
         with self._lock:
             record = self._records[task_id]
+            event = TaskEvent(
+                event_id=build_event_id(event_type),
+                event_type=event_type,
+                task_id=task_id,
+                state=state,
+                message=message,
+                payload=self._build_task_event_payload(record.spec, payload),
+            )
             record.events.append(event)
         if self._event_bus is not None:
             self._event_bus.publish_task_event(event)

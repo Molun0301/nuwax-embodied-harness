@@ -15,7 +15,8 @@ from contracts.capabilities import (
     CapabilityMatrix,
     CapabilityRiskLevel,
 )
-from contracts.events import RuntimeEventCategory
+from contracts.base import MetadataDict
+from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from contracts.geometry import Pose, Quaternion, Twist, Vector3
 from contracts.memory import MemoryPayloadFilter
 from contracts.skills import SkillCategory, SkillDescriptor
@@ -31,6 +32,7 @@ from drivers.common import (
 )
 from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
+from gateways.request_context import categorize_gateway_error
 from gateways.serialization import to_jsonable
 from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider
 from services.artifact_service import ArtifactService
@@ -45,6 +47,7 @@ from services.perception import PerceptionService
 from services.perception import (
     Basic2DTrackerBackend,
     DetectorPipeline,
+    DisabledSegmentationBackend,
     MetadataDrivenDetectorBackend,
     PerceptionVideoRuntime,
     SimpleSceneDescriptionBackend,
@@ -57,6 +60,38 @@ from settings import NuwaxRobotBridgeConfig
 
 RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.runtime")
 _RUNTIME_EVENT_LOG_RATE_LIMIT_SEC = 10.0
+_REQUEST_CONTEXT_KEYS = (
+    "request_id",
+    "task_id",
+    "capability_name",
+    "requested_by",
+    "method",
+    "path",
+    "client_ip",
+    "status_code",
+    "duration_ms",
+    "error_category",
+    "map_version_id",
+    "localization_session_id",
+    "map_name",
+    "camera_id",
+    "pose_source",
+)
+
+_RUNTIME_METADATA_LOG_KEYS = (
+    "request_id",
+    "capability_name",
+    "error_category",
+    "duration_ms",
+    "map_version_id",
+    "localization_session_id",
+)
+
+
+def _has_observability_value(value: Any) -> bool:
+    return value is not None and value != ""
+
+
 _OPS_DEBUG_CAPABILITY_NAMES = frozenset(
     {
         "capture_image",
@@ -123,6 +158,7 @@ def _build_perception_components(robot: RobotAssemblyBase) -> Dict[str, Any]:
         ),
         "tracker_backend": Basic2DTrackerBackend(),
         "scene_description_backend": SimpleSceneDescriptionBackend(),
+        "segmentation_backend": DisabledSegmentationBackend(reason="runtime_default"),
     }
     factory = getattr(robot, "build_default_perception_pipeline", None)
     if not callable(factory):
@@ -137,6 +173,7 @@ def _build_perception_components(robot: RobotAssemblyBase) -> Dict[str, Any]:
         "tracker_backend": custom_components.get("tracker_backend") or default_components["tracker_backend"],
         "scene_description_backend": custom_components.get("scene_description_backend")
         or default_components["scene_description_backend"],
+        "segmentation_backend": custom_components.get("segmentation_backend") or default_components["segmentation_backend"],
     }
 
 
@@ -225,6 +262,7 @@ class GatewayRuntime:
             detector_pipeline=perception_components["detector_pipeline"],
             tracker_backend=perception_components["tracker_backend"],
             scene_description_backend=perception_components["scene_description_backend"],
+            segmentation_backend=perception_components["segmentation_backend"],
             event_bus=self.event_bus,
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),
@@ -404,6 +442,11 @@ class GatewayRuntime:
                 "subject_id": event.subject_id or "-",
                 "severity": str(event.severity),
             }
+            metadata = event.metadata or {}
+            for key in _RUNTIME_METADATA_LOG_KEYS:
+                value = metadata.get(key)
+                if _has_observability_value(value):
+                    extra[key] = value
             if event.message:
                 extra["runtime_message"] = event.message
             if payload_preview != "-":
@@ -1823,6 +1866,7 @@ class GatewayRuntime:
         arguments: Optional[Dict[str, Any]] = None,
         *,
         requested_by: Optional[str] = None,
+        request_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """调用一个网关能力。"""
 
@@ -1833,33 +1877,154 @@ class GatewayRuntime:
             raise GatewayError(f"能力 {capability_name} 尚未绑定处理器。")
 
         descriptor = registration.descriptor
+        started_at = time.perf_counter()
+        context = self._build_capability_request_context(
+            request_context,
+            capability_name=descriptor.name,
+            requested_by=requested_by,
+        )
         payload = dict(arguments or {})
-        result = registration.handler(payload, requested_by=requested_by)
+        self._publish_capability_invocation_event(
+            "capability.invocation.started",
+            descriptor.name,
+            context,
+            payload={"mode": descriptor.execution_mode.value},
+            message=f"能力 {descriptor.name} 调用开始。",
+        )
+        try:
+            if descriptor.execution_mode == CapabilityExecutionMode.ASYNC_TASK:
+                result = registration.handler(payload, requested_by=requested_by, request_context=context)
+            else:
+                result = registration.handler(payload, requested_by=requested_by)
+            duration_ms = (time.perf_counter() - started_at) * 1000.0
+            completed_context = dict(context)
+            completed_context["duration_ms"] = duration_ms
+            if descriptor.execution_mode == CapabilityExecutionMode.ASYNC_TASK:
+                completed_context["task_id"] = result.task_id
+                self._publish_capability_invocation_event(
+                    "capability.invocation.completed",
+                    descriptor.name,
+                    completed_context,
+                    task_id=result.task_id,
+                    payload={"mode": descriptor.execution_mode.value, "task_id": result.task_id},
+                    message=f"异步能力 {descriptor.name} 任务已接受。",
+                )
+                status = self.task_manager.get_task_status(result.task_id)
+                return {
+                    "request_id": completed_context.get("request_id"),
+                    "task_id": result.task_id,
+                    "capability_name": descriptor.name,
+                    "mode": descriptor.execution_mode.value,
+                    "task": result,
+                    "status": status,
+                }
 
-        if descriptor.execution_mode == CapabilityExecutionMode.ASYNC_TASK:
-            status = self.task_manager.get_task_status(result.task_id)
+            self._publish_capability_invocation_event(
+                "capability.invocation.completed",
+                descriptor.name,
+                completed_context,
+                payload={"mode": descriptor.execution_mode.value},
+                message=f"同步能力 {descriptor.name} 调用完成。",
+            )
             return {
+                "request_id": completed_context.get("request_id"),
                 "capability_name": descriptor.name,
                 "mode": descriptor.execution_mode.value,
-                "task": result,
-                "status": status,
+                "result": result,
             }
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - started_at) * 1000.0
+            failed_context = dict(context)
+            failed_context["duration_ms"] = duration_ms
+            failed_context["error_category"] = self._classify_capability_error(exc)
+            error_code = self._extract_error_code(exc)
+            self._publish_capability_invocation_event(
+                "capability.invocation.failed",
+                descriptor.name,
+                failed_context,
+                severity=RuntimeEventSeverity.ERROR,
+                payload={
+                    "mode": descriptor.execution_mode.value,
+                    "error_code": error_code,
+                    "error_category": failed_context["error_category"],
+                },
+                message=f"能力 {descriptor.name} 调用失败。",
+            )
+            raise
 
+    @staticmethod
+    def _build_capability_request_context(
+        request_context: Optional[Dict[str, Any]],
+        *,
+        capability_name: str,
+        requested_by: Optional[str],
+    ) -> MetadataDict:
+        context = dict(request_context or {})
+        context["capability_name"] = capability_name
+        context["requested_by"] = context.get("requested_by") or requested_by or "unknown"
+        return {key: value for key, value in context.items() if _has_observability_value(value)}
+
+    def _publish_capability_invocation_event(
+        self,
+        event_type: str,
+        capability_name: str,
+        request_context: MetadataDict,
+        *,
+        task_id: Optional[str] = None,
+        severity: RuntimeEventSeverity = RuntimeEventSeverity.INFO,
+        payload: Optional[MetadataDict] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        metadata = {
+            key: request_context[key]
+            for key in _REQUEST_CONTEXT_KEYS
+            if key in request_context and _has_observability_value(request_context[key])
+        }
         self.event_bus.publish(
             self.event_bus.build_event(
-                "capability.invoked",
+                event_type,
                 category=RuntimeEventCategory.SYSTEM,
                 source="gateway_runtime",
-                subject_id=descriptor.name,
-                message=f"同步能力 {descriptor.name} 调用完成。",
-                payload={"requested_by": requested_by or "unknown"},
+                subject_id=capability_name,
+                task_id=task_id,
+                severity=severity,
+                message=message,
+                payload=dict(payload or {}),
+                metadata=metadata,
             )
         )
-        return {
-            "capability_name": descriptor.name,
-            "mode": descriptor.execution_mode.value,
-            "result": result,
+
+    @staticmethod
+    def _extract_error_code(exc: Exception) -> str:
+        return str(getattr(exc, "error_code", "") or exc.__class__.__name__)
+
+    def _classify_capability_error(self, exc: Exception) -> str:
+        if isinstance(exc, GatewayError):
+            return categorize_gateway_error(exc.error_code, exc.http_status)
+        return "capability"
+
+    def _build_task_request_metadata(
+        self,
+        *,
+        capability_name: str,
+        requested_by: Optional[str],
+        request_context: Optional[MetadataDict] = None,
+        metadata: Optional[MetadataDict] = None,
+    ) -> MetadataDict:
+        metadata_payload = dict(metadata or {})
+        request_context_source = request_context or metadata_payload.get("request_context")
+        context = dict(request_context_source) if isinstance(request_context_source, dict) else {}
+        context["capability_name"] = context.get("capability_name") or capability_name
+        context["requested_by"] = context.get("requested_by") or requested_by or metadata_payload.get("requested_by") or "unknown"
+        metadata_payload["request_context"] = {
+            key: value for key, value in context.items() if _has_observability_value(value)
         }
+        metadata_payload.setdefault("requested_by", context["requested_by"])
+        for key in _REQUEST_CONTEXT_KEYS:
+            value = metadata_payload["request_context"].get(key)
+            if _has_observability_value(value):
+                metadata_payload[key] = value
+        return metadata_payload
 
     def get_health_summary(self) -> Dict[str, Any]:
         """导出健康摘要。"""
@@ -2481,7 +2646,13 @@ class GatewayRuntime:
         )
         return {"semantic_memory": entry}
 
-    def _handle_navigate_to_pose(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+    def _handle_navigate_to_pose(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="navigate_to_pose",
@@ -2512,9 +2683,16 @@ class GatewayRuntime:
             poll_interval_sec=poll_interval_sec,
             timeout_sec=timeout_sec,
             requested_by=requested_by,
+            request_context=request_context,
         )
 
-    def _handle_navigate_to_named_location(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+    def _handle_navigate_to_named_location(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="navigate_to_named_location",
@@ -2635,6 +2813,7 @@ class GatewayRuntime:
             poll_interval_sec=poll_interval_sec,
             timeout_sec=timeout_sec,
             requested_by=requested_by,
+            request_context=request_context,
             completion_callback=(
                 (
                     lambda _navigation_context: self._build_navigation_arrival_result(
@@ -2653,7 +2832,13 @@ class GatewayRuntime:
             ),
         )
 
-    def _handle_find_target(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+    def _handle_find_target(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="find_target",
@@ -2673,6 +2858,7 @@ class GatewayRuntime:
         def runner(context) -> Dict[str, Any]:
             context.update(progress=0.05, stage="search_prepare", message="准备查找目标。")
             finalized = False
+            rejected_record_ids: Set[str] = set()
             try:
                 perception_refresh = self._refresh_target_search_observation(
                     query=query,
@@ -2687,7 +2873,7 @@ class GatewayRuntime:
                     map_name=map_name,
                     camera_id=camera_id,
                     verify_similarity_threshold=verify_similarity_threshold,
-                    rejected_record_ids=set(),
+                    rejected_record_ids=rejected_record_ids,
                 )
                 if search_state["current_scene_verification"].verified:
                     context.update(progress=1.0, stage="completed", message="目标已在当前场景中找到。")
@@ -2698,6 +2884,9 @@ class GatewayRuntime:
                         "arrival_verification": search_state["current_scene_verification"],
                         "navigation_candidate": None,
                         "navigation_context": None,
+                        "attempted_candidate_ids": [],
+                        "candidate_diagnostics": list(search_state.get("candidate_diagnostics", ())),
+                        "rejected_candidate_ids": sorted(rejected_record_ids),
                     }
                     result.update(
                         self._finalize_workspace_assets_after_task(
@@ -2718,7 +2907,7 @@ class GatewayRuntime:
                     poll_interval_sec=poll_interval_sec,
                     verify_similarity_threshold=verify_similarity_threshold,
                     search_state=search_state,
-                    rejected_record_ids=set(),
+                    rejected_record_ids=rejected_record_ids,
                     allow_not_found=False,
                 )
                 result = {
@@ -2762,10 +2951,20 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
-            metadata={"requested_by": requested_by or "unknown"},
+            metadata=self._build_task_request_metadata(
+                capability_name="find_target",
+                requested_by=requested_by,
+                request_context=request_context,
+            ),
         )
 
-    def _handle_explore_area(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+    def _handle_explore_area(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="explore_area",
@@ -2801,9 +3000,16 @@ class GatewayRuntime:
             poll_interval_sec=poll_interval_sec,
             timeout_sec=timeout_sec,
             requested_by=requested_by,
+            request_context=request_context,
         )
 
-    def _handle_explore_and_find_target(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+    def _handle_explore_and_find_target(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="explore_and_find_target",
@@ -2875,6 +3081,8 @@ class GatewayRuntime:
                         "arrival_verification": search_state["current_scene_verification"],
                         "navigation_candidate": None,
                         "navigation_context": None,
+                        "attempted_candidate_ids": [],
+                        "candidate_diagnostics": list(search_state.get("candidate_diagnostics", ())),
                         "exploration_context": None,
                         "exploration_stop_context": None,
                         "rejected_candidate_ids": sorted(rejected_record_ids),
@@ -2969,6 +3177,8 @@ class GatewayRuntime:
                             "arrival_verification": search_state["current_scene_verification"],
                             "navigation_candidate": None,
                             "navigation_context": None,
+                            "attempted_candidate_ids": [],
+                            "candidate_diagnostics": list(search_state.get("candidate_diagnostics", ())),
                             "exploration_context": exploration_context,
                             "exploration_stop_context": exploration_stop_context,
                             "rejected_candidate_ids": sorted(rejected_record_ids),
@@ -3047,6 +3257,8 @@ class GatewayRuntime:
                                 "arrival_verification": final_search_state["current_scene_verification"],
                                 "navigation_candidate": None,
                                 "navigation_context": None,
+                                "attempted_candidate_ids": [],
+                                "candidate_diagnostics": list(final_search_state.get("candidate_diagnostics", ())),
                                 "exploration_context": exploration_context,
                                 "exploration_stop_context": exploration_stop_context,
                                 "rejected_candidate_ids": sorted(rejected_record_ids),
@@ -3097,6 +3309,7 @@ class GatewayRuntime:
                             details={
                                 "map_name": map_name,
                                 "query": query,
+                                "candidate_diagnostics": list(final_search_state.get("candidate_diagnostics", ())),
                                 "rejected_candidate_ids": sorted(rejected_record_ids),
                             },
                         )
@@ -3142,10 +3355,20 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
-            metadata={"requested_by": requested_by or "unknown"},
+            metadata=self._build_task_request_metadata(
+                capability_name="explore_and_find_target",
+                requested_by=requested_by,
+                request_context=request_context,
+            ),
         )
 
-    def _handle_inspect_target(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+    def _handle_inspect_target(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         detector_backend = str(arguments.get("detector_backend", "")).strip() or None
@@ -3231,10 +3454,20 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
-            metadata={"requested_by": requested_by or "unknown"},
+            metadata=self._build_task_request_metadata(
+                capability_name="inspect_target",
+                requested_by=requested_by,
+                request_context=request_context,
+            ),
         )
 
-    def _handle_follow_target(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+    def _handle_follow_target(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         detector_backend = str(arguments.get("detector_backend", "")).strip() or None
@@ -3318,10 +3551,20 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
-            metadata={"requested_by": requested_by or "unknown"},
+            metadata=self._build_task_request_metadata(
+                capability_name="follow_target",
+                requested_by=requested_by,
+                request_context=request_context,
+            ),
         )
 
-    def _handle_relative_move(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+    def _handle_relative_move(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
         motion_control = self._get_provider(MotionControl, "运动控制提供器")
         descriptor = self.capability_registry.get_descriptor("relative_move")
         vx = self._require_float(arguments, "vx")
@@ -3388,7 +3631,11 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=[RuntimeResource.BASE_MOTION.value],
             timeout_sec=timeout_sec,
-            metadata={"requested_by": requested_by or "unknown"},
+            metadata=self._build_task_request_metadata(
+                capability_name="relative_move",
+                requested_by=requested_by,
+                request_context=request_context,
+            ),
         )
 
     def _handle_execute_sport_command(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
@@ -3747,7 +3994,7 @@ class GatewayRuntime:
             expected_map_version_id=current_map_version_id,
             localization_session_id=current_localization_session_id,
         )
-        memory_candidates = [
+        resolved_memory_candidates = [
             candidate
             for candidate in self.memory_service.resolve_navigation_candidates(
                 query,
@@ -3758,6 +4005,13 @@ class GatewayRuntime:
             )
             if candidate.record_id not in rejected_record_ids
         ]
+        candidate_diagnostics: List[Dict[str, Any]] = []
+        memory_candidates: List[Any] = []
+        for candidate in resolved_memory_candidates:
+            diagnostic = self._assess_target_navigation_candidate(candidate)
+            candidate_diagnostics.append(diagnostic)
+            if diagnostic["allowed_for_navigation"]:
+                memory_candidates.append(candidate)
         semantic_goal = None
         if not memory_candidates:
             try:
@@ -3773,8 +4027,159 @@ class GatewayRuntime:
             "current_localization_session_id": current_localization_session_id,
             "current_scene_verification": current_scene_verification,
             "memory_candidates": tuple(memory_candidates),
+            "candidate_diagnostics": tuple(candidate_diagnostics),
             "semantic_goal": semantic_goal,
         }
+
+    def _coerce_optional_float(self, value: Any) -> Optional[float]:
+        if value is None or value == "" or isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _coerce_optional_int(self, value: Any) -> Optional[int]:
+        if value is None or value == "" or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _coerce_optional_bool(self, value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        normalized = str(value or "").strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+        return None
+
+    def _coerce_optional_str_list(self, value: Any) -> List[str]:
+        if value is None or isinstance(value, bool):
+            return []
+        if isinstance(value, str):
+            normalized = value.strip()
+            return [normalized] if normalized else []
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [str(item).strip() for item in value if str(item or "").strip()]
+        return [str(value).strip()] if str(value).strip() else []
+
+    def _build_target_candidate_diagnostic(
+        self,
+        candidate,
+        *,
+        allowed_for_navigation: Optional[bool] = None,
+        rejection_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        metadata = dict(getattr(candidate, "metadata", {}) or {})
+        candidate_score = self._coerce_optional_float(metadata.get("candidate_score"))
+        projection_confidence = self._coerce_optional_float(metadata.get("projection_confidence"))
+        support_point_count = self._coerce_optional_int(metadata.get("support_point_count"))
+        segmentation_score = self._coerce_optional_float(metadata.get("segmentation_score"))
+        predicted_iou = self._coerce_optional_float(metadata.get("predicted_iou"))
+        segmentation_quality_score = self._coerce_optional_float(metadata.get("segmentation_quality_score"))
+        stability_score = self._coerce_optional_float(metadata.get("stability_score"))
+        coverage = self._coerce_optional_float(metadata.get("coverage"))
+        map_projection_coverage = self._coerce_optional_float(metadata.get("map_projection_coverage"))
+        depth_coverage = self._coerce_optional_float(metadata.get("depth_coverage"))
+        reprojection_error = self._coerce_optional_float(metadata.get("reprojection_error"))
+        segmentation_support_point_count = self._coerce_optional_int(metadata.get("segmentation_support_point_count"))
+        has_structured_segmentation = bool(self._coerce_optional_bool(metadata.get("has_structured_segmentation")))
+        segmentation_review_required = bool(self._coerce_optional_bool(metadata.get("segmentation_review_required")))
+        segmentation_risk_factors = self._coerce_optional_str_list(metadata.get("segmentation_risk_factors"))
+        segmentation_occlusion_flags = self._coerce_optional_str_list(metadata.get("segmentation_occlusion_flags"))
+        segmentation_truncation_flags = self._coerce_optional_str_list(metadata.get("segmentation_truncation_flags"))
+        navigable = self._coerce_optional_bool(metadata.get("navigable"))
+        navigation_quality = metadata.get("navigation_quality")
+        if not isinstance(navigation_quality, dict):
+            navigation_quality = {}
+        else:
+            navigation_quality = dict(navigation_quality)
+        diagnostic = {
+            "record_id": str(getattr(candidate, "record_id", "") or ""),
+            "record_kind": str(getattr(getattr(candidate, "record_kind", None), "value", "") or ""),
+            "target_name": str(getattr(candidate, "target_name", "") or ""),
+            "map_version_id": getattr(candidate, "map_version_id", None),
+            "topo_node_id": getattr(candidate, "topo_node_id", None),
+            "semantic_region_id": getattr(candidate, "semantic_region_id", None),
+            "distance_m": getattr(candidate, "distance_m", None),
+            "verification_query": getattr(candidate, "verification_query", None),
+            "camera_id": str(metadata.get("camera_id") or ""),
+            "backend_type": str(metadata.get("backend_type") or metadata.get("backend") or "memory_service"),
+            "backend": str(metadata.get("backend") or metadata.get("backend_type") or "memory_service"),
+            "source_collection": str(metadata.get("source_collection") or ""),
+            "candidate_id": str(metadata.get("candidate_id") or ""),
+            "anchor_id": str(metadata.get("anchor_id") or ""),
+            "candidate_score": candidate_score,
+            "projection_method": str(metadata.get("projection_method") or ""),
+            "projection_confidence": projection_confidence,
+            "support_point_count": support_point_count,
+            "projection_degradation_reason": str(metadata.get("projection_degradation_reason") or ""),
+            "geometry_projection_status": str(metadata.get("geometry_projection_status") or ""),
+            "segmentation_projection_status": str(metadata.get("segmentation_projection_status") or ""),
+            "has_structured_segmentation": has_structured_segmentation,
+            "segmentation_score": segmentation_score,
+            "predicted_iou": predicted_iou,
+            "segmentation_quality_score": segmentation_quality_score,
+            "stability_score": stability_score,
+            "coverage": coverage,
+            "map_projection_coverage": map_projection_coverage,
+            "depth_coverage": depth_coverage,
+            "reprojection_error": reprojection_error,
+            "segmentation_support_point_count": segmentation_support_point_count,
+            "segmentation_quality": str(metadata.get("segmentation_quality") or ""),
+            "segmentation_review_required": segmentation_review_required,
+            "segmentation_risk_factors": segmentation_risk_factors,
+            "segmentation_quality_reason": str(metadata.get("segmentation_quality_reason") or "").strip() or None,
+            "segmentation_occlusion_flags": segmentation_occlusion_flags,
+            "segmentation_truncation_flags": segmentation_truncation_flags,
+            "navigable": navigable,
+            "non_navigable_reason": str(metadata.get("non_navigable_reason") or "").strip() or None,
+            "navigation_quality": navigation_quality,
+            "navigation_quality_level": str(navigation_quality.get("level") or "").strip() or None,
+            "recommended_action": str(navigation_quality.get("recommended_action") or "").strip() or None,
+            "allowed_for_navigation": allowed_for_navigation,
+            "rejection_reason": rejection_reason,
+            "navigation_attempted": False,
+        }
+        return diagnostic
+
+    def _assess_target_navigation_candidate(self, candidate) -> Dict[str, Any]:
+        diagnostic = self._build_target_candidate_diagnostic(candidate)
+        rejection_reason = None
+        recommended_action = diagnostic.get("recommended_action")
+        navigation_quality = diagnostic.get("navigation_quality")
+        if isinstance(navigation_quality, dict) and recommended_action:
+            if recommended_action == "navigate":
+                rejection_reason = None
+            elif recommended_action == "verify_then_navigate":
+                rejection_reason = str(navigation_quality.get("primary_reason_code") or "needs_review").strip()
+            elif recommended_action == "explore_more":
+                rejection_reason = str(navigation_quality.get("primary_reason_code") or "evidence_insufficient").strip()
+            elif recommended_action == "reject":
+                rejection_reason = str(navigation_quality.get("primary_reason_code") or "candidate_marked_non_navigable").strip()
+        elif diagnostic["navigable"] is False:
+            rejection_reason = diagnostic["non_navigable_reason"] or "candidate_marked_non_navigable"
+        elif diagnostic["navigable"] is None and diagnostic["non_navigable_reason"]:
+            rejection_reason = diagnostic["non_navigable_reason"]
+        elif diagnostic["segmentation_review_required"]:
+            rejection_reason = diagnostic["segmentation_quality_reason"] or "segmentation_review_required"
+        elif diagnostic["candidate_score"] is not None and diagnostic["candidate_score"] < 0.35:
+            rejection_reason = "candidate_score_below_threshold"
+        elif diagnostic["projection_confidence"] is not None and diagnostic["projection_confidence"] < 0.2:
+            rejection_reason = "projection_confidence_below_threshold"
+        elif (
+            diagnostic["projection_method"]
+            and diagnostic["support_point_count"] is not None
+            and diagnostic["support_point_count"] <= 0
+        ):
+            rejection_reason = "support_point_count_below_threshold"
+        diagnostic["allowed_for_navigation"] = rejection_reason is None
+        diagnostic["rejection_reason"] = rejection_reason
+        return diagnostic
 
     def _build_goal_from_navigation_candidate(
         self,
@@ -3857,6 +4262,16 @@ class GatewayRuntime:
         current_map_version_id = search_state["current_map_version_id"]
         current_localization_session_id = search_state["current_localization_session_id"]
         workspace = search_state["workspace"]
+        candidate_diagnostics = [dict(item) for item in search_state.get("candidate_diagnostics", ())]
+        rejected_candidates = [
+            dict(item)
+            for item in candidate_diagnostics
+            if item.get("allowed_for_navigation") is False and item.get("record_id") not in rejected_record_ids
+        ]
+        for item in rejected_candidates:
+            record_id = str(item.get("record_id") or "").strip()
+            if record_id:
+                rejected_record_ids.add(record_id)
         if not memory_candidates and semantic_goal is None:
             if allow_not_found:
                 return None
@@ -3865,7 +4280,12 @@ class GatewayRuntime:
                 error_code="target_not_found_in_memory",
                 http_status=404,
                 jsonrpc_code=-32004,
-                details={"map_name": map_name, "query": query},
+                details={
+                    "map_name": map_name,
+                    "query": query,
+                    "candidate_diagnostics": candidate_diagnostics,
+                    "rejected_candidate_ids": sorted(rejected_record_ids),
+                },
             )
         try:
             self._ensure_localization_ready(
@@ -3882,7 +4302,12 @@ class GatewayRuntime:
         last_verification = None
         attempted_candidate_ids: List[str] = []
         for candidate in memory_candidates:
-            attempted_candidate_ids.append(candidate.record_id)
+            candidate_record_id = str(candidate.record_id)
+            attempted_candidate_ids.append(candidate_record_id)
+            for item in candidate_diagnostics:
+                if str(item.get("record_id") or "") == candidate_record_id:
+                    item["navigation_attempted"] = True
+                    break
             task_context.update(
                 progress=0.55,
                 stage="target_candidate_navigation",
@@ -3920,7 +4345,12 @@ class GatewayRuntime:
                     ),
                 )
             except GatewayError as exc:
-                rejected_record_ids.add(candidate.record_id)
+                rejected_record_ids.add(candidate_record_id)
+                for item in candidate_diagnostics:
+                    if str(item.get("record_id") or "") == candidate_record_id:
+                        item["allowed_for_navigation"] = False
+                        item["rejection_reason"] = exc.error_code or "navigation_failed"
+                        break
                 last_error = exc
                 continue
             verification_payload = self._build_target_navigation_verification(
@@ -3939,9 +4369,18 @@ class GatewayRuntime:
                     "navigation_candidate": candidate,
                     "navigation_context": navigation_context,
                     "attempted_candidate_ids": attempted_candidate_ids,
+                    "candidate_diagnostics": candidate_diagnostics,
+                    "rejected_candidate_ids": sorted(rejected_record_ids),
                     **verification_payload,
                 }
-            rejected_record_ids.add(candidate.record_id)
+            rejected_record_ids.add(candidate_record_id)
+            for item in candidate_diagnostics:
+                if str(item.get("record_id") or "") == candidate_record_id:
+                    item["allowed_for_navigation"] = False
+                    item["rejection_reason"] = (
+                        verification_payload["arrival_verification"].reason or "arrival_verification_failed"
+                    )
+                    break
             last_verification = verification_payload["arrival_verification"]
 
         if semantic_goal is not None:
@@ -3988,6 +4427,8 @@ class GatewayRuntime:
                         "navigation_candidate": None,
                         "navigation_context": navigation_context,
                         "attempted_candidate_ids": attempted_candidate_ids,
+                        "candidate_diagnostics": candidate_diagnostics,
+                        "rejected_candidate_ids": sorted(rejected_record_ids),
                         **verification_payload,
                     }
                 last_verification = verification_payload["arrival_verification"]
@@ -4005,6 +4446,8 @@ class GatewayRuntime:
                     "query": query,
                     "arrival_verification": last_verification.model_dump(mode="json"),
                     "attempted_candidate_ids": attempted_candidate_ids,
+                    "candidate_diagnostics": candidate_diagnostics,
+                    "rejected_candidate_ids": sorted(rejected_record_ids),
                 },
             )
         if last_error is not None:
@@ -4017,6 +4460,8 @@ class GatewayRuntime:
                     "map_name": map_name,
                     "query": query,
                     "attempted_candidate_ids": attempted_candidate_ids,
+                    "candidate_diagnostics": candidate_diagnostics,
+                    "rejected_candidate_ids": sorted(rejected_record_ids),
                     "last_error": last_error.to_payload(),
                 },
             )
@@ -4025,7 +4470,12 @@ class GatewayRuntime:
             error_code="target_not_found_in_memory",
             http_status=404,
             jsonrpc_code=-32004,
-            details={"map_name": map_name, "query": query},
+            details={
+                "map_name": map_name,
+                "query": query,
+                "candidate_diagnostics": candidate_diagnostics,
+                "rejected_candidate_ids": sorted(rejected_record_ids),
+            },
         )
 
     def _safe_stop_robot(self, reason: Optional[str]) -> None:
@@ -4052,6 +4502,7 @@ class GatewayRuntime:
         poll_interval_sec: float,
         timeout_sec: float,
         requested_by: Optional[str],
+        request_context: Optional[MetadataDict] = None,
         completion_callback=None,
     ):
         descriptor = self.capability_registry.get_descriptor(capability_name)
@@ -4166,7 +4617,11 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
-            metadata={"requested_by": requested_by or "unknown"},
+            metadata=self._build_task_request_metadata(
+                capability_name=capability_name,
+                requested_by=requested_by,
+                request_context=request_context,
+            ),
         )
 
     def _submit_exploration_task(
@@ -4176,6 +4631,7 @@ class GatewayRuntime:
         poll_interval_sec: float,
         timeout_sec: float,
         requested_by: Optional[str],
+        request_context: Optional[MetadataDict] = None,
     ):
         descriptor = self.capability_registry.get_descriptor("explore_area")
         poll_interval_sec = max(0.05, poll_interval_sec)
@@ -4258,7 +4714,11 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
-            metadata={"requested_by": requested_by or "unknown"},
+            metadata=self._build_task_request_metadata(
+                capability_name="explore_area",
+                requested_by=requested_by,
+                request_context=request_context,
+            ),
         )
 
     def _find_scene_object(self, query: str, perception_context):

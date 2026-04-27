@@ -12,6 +12,12 @@ from starlette.requests import Request
 from drivers.entry import create_active_robot_assembly
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
+from gateways.request_context import (
+    REQUEST_ID_HEADER,
+    categorize_gateway_error,
+    error_category_from_status,
+    normalize_request_id,
+)
 from gateways.http.api import build_http_router
 from gateways.mcp.protocol import build_mcp_router
 from gateways.relay.server import create_relay_app
@@ -72,26 +78,54 @@ def create_gateway_app(
 
     @app.middleware("http")
     async def _request_logging_middleware(request: Request, call_next):
+        request_id_context = normalize_request_id(request.headers.get(REQUEST_ID_HEADER))
+        request.state.request_id = request_id_context.request_id
+        request.state.request_id_generated = request_id_context.request_id_generated
+        request.state.request_id_replaced = request_id_context.request_id_replaced
+        request.state.request_id_invalid_reason = request_id_context.request_id_invalid_reason
+
         start_at = time.perf_counter()
         method = request.method
         path = request.url.path
         client_host = _resolve_client_host(request)
+        base_extra = {
+            "method": method,
+            "path": path,
+            "client_ip": client_host,
+            "request_id": request_id_context.request_id,
+            "request_id_generated": request_id_context.request_id_generated,
+            "request_id_replaced": request_id_context.request_id_replaced,
+        }
+        if request_id_context.request_id_invalid_reason:
+            base_extra["request_id_invalid_reason"] = request_id_context.request_id_invalid_reason
+
         try:
             response = await call_next(request)
         except Exception:
             duration_ms = (time.perf_counter() - start_at) * 1000.0
-            HTTP_LOGGER.exception(
-                "HTTP 请求异常",
-                extra={
-                    "event": "http.request.failed",
-                    "method": method,
-                    "path": path,
-                    "client_ip": client_host,
-                    "duration_ms": duration_ms,
+            error_category = getattr(request.state, "error_category", None) or "internal"
+            failed_extra = {
+                **base_extra,
+                "event": "http.request.failed",
+                "status_code": 500,
+                "duration_ms": duration_ms,
+                "error_category": error_category,
+            }
+            HTTP_LOGGER.exception("HTTP 请求异常", extra=failed_extra)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "internal_error",
+                        "message": "网关内部错误。",
+                        "request_id": request_id_context.request_id,
+                        "error_category": error_category,
+                    }
                 },
+                headers={REQUEST_ID_HEADER: request_id_context.request_id},
             )
-            raise
 
+        response.headers[REQUEST_ID_HEADER] = request_id_context.request_id
         duration_ms = (time.perf_counter() - start_at) * 1000.0
         level = logging.INFO
         if response.status_code >= 500:
@@ -99,12 +133,12 @@ def create_gateway_app(
         elif response.status_code >= 400:
             level = logging.WARNING
         extra = {
+            **base_extra,
             "event": "http.request.completed",
-            "method": method,
-            "path": path,
             "status_code": response.status_code,
-            "client_ip": client_host,
             "duration_ms": duration_ms,
+            "error_category": getattr(request.state, "error_category", None)
+            or error_category_from_status(response.status_code),
         }
         if _should_rate_limit_http_request(path, response.status_code):
             request_log_limiter.log(
@@ -120,14 +154,31 @@ def create_gateway_app(
         return response
 
     @app.exception_handler(GatewayError)
-    async def _gateway_error_handler(_: Request, exc: GatewayError) -> JSONResponse:
+    async def _gateway_error_handler(request: Request, exc: GatewayError) -> JSONResponse:
+        request_id = getattr(request.state, "request_id", None) or normalize_request_id(None).request_id
+        error_category = categorize_gateway_error(exc.error_code, exc.http_status)
+        request.state.error_category = error_category
+        payload = exc.to_payload()
+        payload["request_id"] = request_id
+        payload["error_category"] = error_category
         APP_LOGGER.warning(
             "网关返回业务错误 code=%s status=%s message=%s",
             exc.error_code,
             exc.http_status,
             exc.message,
+            extra={
+                "event": "gateway.error",
+                "request_id": request_id,
+                "error_code": exc.error_code,
+                "error_category": error_category,
+                "status_code": exc.http_status,
+            },
         )
-        return JSONResponse(status_code=exc.http_status, content={"error": exc.to_payload()})
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": payload},
+            headers={REQUEST_ID_HEADER: request_id},
+        )
 
     @app.get("/")
     async def root() -> Dict[str, Any]:

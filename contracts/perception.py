@@ -7,7 +7,7 @@ from pydantic import Field, field_validator
 from contracts.base import MetadataDict, TimestampedContract
 from contracts.geometry import Pose
 from contracts.naming import validate_frame_id, validate_observation_id
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 class BoundingBox2D(TimestampedContract):
@@ -19,6 +19,36 @@ class BoundingBox2D(TimestampedContract):
     height_px: float = Field(gt=0.0, description="高度。")
 
 
+class SegmentationQuality(TimestampedContract):
+    """分割质量指标。"""
+
+    score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="分割置信度。")
+    predicted_iou: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="预测 IoU。")
+    stability_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="稳定性分数。")
+    depth_coverage: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="深度覆盖率。")
+    map_projection_coverage: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="地图投影覆盖率。")
+    reprojection_error: Optional[float] = Field(default=None, ge=0.0, description="重投影误差。")
+
+
+class SegmentationMask2D(TimestampedContract):
+    """二维分割结果。"""
+
+    polygon_px: Tuple[Tuple[float, float], ...] = Field(default_factory=tuple, description="像素坐标多边形。")
+    centroid_uv: Optional[Tuple[float, float]] = Field(default=None, description="像素中心点。")
+    bbox_xyxy: Optional[Tuple[float, float, float, float]] = Field(default=None, description="分割外接框。")
+    area_px: Optional[float] = Field(default=None, ge=0.0, description="分割面积。")
+    area_ratio: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="分割面积占比。")
+    contour: MetadataDict = Field(default_factory=dict, description="轮廓附加数据。")
+    crop_box: Optional[Tuple[float, float, float, float]] = Field(default=None, description="裁剪框。")
+    quality: SegmentationQuality = Field(default_factory=SegmentationQuality, description="分割质量。")
+    frame_id: Optional[str] = Field(default=None, description="来源坐标系。")
+    camera_id: Optional[str] = Field(default=None, description="来源相机。")
+    source: Optional[str] = Field(default=None, description="分割来源。")
+    truncation_flags: Tuple[str, ...] = Field(default_factory=tuple, description="截断标记。")
+    occlusion_flags: Tuple[str, ...] = Field(default_factory=tuple, description="遮挡标记。")
+    attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
+
+
 class Detection2D(TimestampedContract):
     """二维检测结果。"""
 
@@ -27,6 +57,7 @@ class Detection2D(TimestampedContract):
     bbox: BoundingBox2D = Field(description="二维检测框。")
     camera_id: Optional[str] = Field(default=None, description="来源相机。")
     track_id: Optional[str] = Field(default=None, description="关联轨迹。")
+    segmentation: Optional[SegmentationMask2D] = Field(default=None, description="结构化分割结果。")
     attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
 
 

@@ -8,6 +8,10 @@ import numpy as np
 import pytest
 import httpx
 
+from services.model_providers import (
+    resolve_detection_provider_spec,
+    resolve_segmentation_provider_spec,
+)
 from services.memory.vectorizer import (
     build_text_embedder,
     build_vision_language_embedder,
@@ -237,3 +241,174 @@ def test_build_dashscope_text_embedder_surfaces_response_body_message(monkeypatc
 
     with pytest.raises(RuntimeError, match="dimension must be one of \\[64, 128, 256, 512, 768\\], got 1024"):
         embedder.embed_text("测试记忆查询")
+
+
+
+
+def test_resolve_segmentation_provider_spec_declares_primary_route() -> None:
+    """主路线应声明 GroundingDINO + SAM2 能力并暴露质量与输出策略。"""
+
+    spec = resolve_segmentation_provider_spec(
+        enabled=True,
+        backend_name="",
+        backend_kind="groundingdino_sam2",
+        route="primary",
+        default_backend_name="segmentation_disabled",
+        primary_backend_name="groundingdino_sam2",
+        low_latency_backend_name="yolo_world_sam2",
+        allow_bbox_only_fallback=True,
+        quality_thresholds={"score": 0.66, "predicted_iou": 0.7},
+        output_policy={"emit_polygon": True, "emit_raw_mask": False},
+    )
+
+    metadata = spec.to_metadata()
+
+    assert spec.capability == "segmentation"
+    assert spec.provider_kind == "primary"
+    assert spec.provider_name == "groundingdino_sam2"
+    assert metadata["route"] == "primary"
+    assert metadata["grounding_provider"] == "groundingdino"
+    assert metadata["segmentation_provider"] == "sam2"
+    assert metadata["capabilities"]["ground"] is True
+    assert metadata["capabilities"]["segment"] is True
+    assert metadata["availability"] == "not_implemented"
+    assert metadata["fallback_reason"] == "provider_not_available"
+    assert metadata["quality_thresholds"]["score"] == 0.66
+    assert metadata["output_policy"]["emit_polygon"] is True
+
+
+def test_resolve_segmentation_provider_spec_declares_low_latency_route() -> None:
+    """低时延路线应声明 YOLO-World + SAM2，且 contract 与主路线一致。"""
+
+    spec = resolve_segmentation_provider_spec(
+        enabled=True,
+        backend_name="fast_segmenter",
+        backend_kind="yolo_world_sam2",
+        route="low_latency",
+        low_latency_backend_name="yolo_world_sam2",
+    )
+
+    metadata = spec.to_metadata()
+
+    assert spec.provider_kind == "low_latency"
+    assert spec.provider_name == "yolo_world_sam2"
+    assert spec.backend_name == "fast_segmenter"
+    assert metadata["route"] == "low_latency"
+    assert metadata["grounding_provider"] == "yolo_world"
+    assert metadata["segmentation_provider"] == "sam2"
+    assert metadata["capabilities"]["ground"] is True
+    assert metadata["capabilities"]["segment"] is True
+
+
+def test_resolve_segmentation_provider_spec_supports_passthrough_and_disabled() -> None:
+    """禁用与检测属性透传应通过同一 provider spec 表达。"""
+
+    disabled = resolve_segmentation_provider_spec(enabled=False, backend_name="sam2")
+    passthrough = resolve_segmentation_provider_spec(
+        enabled=True,
+        backend_name="detection_attributes_segmentation",
+        backend_kind="detection_attributes",
+        route="passthrough",
+    )
+
+    disabled_metadata = disabled.to_metadata()
+    passthrough_metadata = passthrough.to_metadata()
+
+    assert disabled.provider_kind == "disabled"
+    assert disabled_metadata["availability"] == "disabled"
+    assert disabled_metadata["fallback_reason"] == "disabled_by_config"
+    assert disabled_metadata["capabilities"]["segment"] is False
+    assert passthrough.provider_kind == "passthrough"
+    assert passthrough.provider_name == "detection_attributes"
+    assert passthrough_metadata["source"] == "detection_attributes"
+    assert passthrough_metadata["fallback_reason"] == "reuse_detector_segmentation_attributes"
+    assert passthrough_metadata["capabilities"]["segment"] is True
+
+
+def test_resolve_segmentation_provider_spec_supports_bbox_only_and_unsupported() -> None:
+    """bbox-only 与未知路线应保留可判定的降级原因。"""
+
+    bbox_only = resolve_segmentation_provider_spec(
+        enabled=True,
+        backend_name="bbox_only_segmentation",
+        backend_kind="bbox_only_fallback",
+        route="bbox_only",
+        allow_bbox_only_fallback=True,
+    )
+    unsupported = resolve_segmentation_provider_spec(
+        enabled=True,
+        backend_name="experimental_segmenter",
+        backend_kind="experimental",
+        route="experimental",
+    )
+
+    bbox_only_metadata = bbox_only.to_metadata()
+    unsupported_metadata = unsupported.to_metadata()
+
+    assert bbox_only.provider_kind == "bbox_only_fallback"
+    assert bbox_only.provider_name == "bbox_only_fallback"
+    assert bbox_only_metadata["source"] == "bbox_only_fallback"
+    assert bbox_only_metadata["fallback_reason"] == "bbox_only_fallback_requested"
+    assert bbox_only_metadata["segment_capability_available"] is False
+    assert bbox_only_metadata["capabilities"]["segment"] is False
+    assert unsupported.provider_kind == "unsupported"
+    assert unsupported.provider_name == "experimental"
+    assert unsupported_metadata["availability"] == "unsupported"
+    assert unsupported_metadata["fallback_reason"] == "unsupported_segmentation_route"
+    assert unsupported_metadata["capabilities"]["segment"] is False
+
+def test_resolve_detection_provider_spec_declares_metadata_detector() -> None:
+    spec = resolve_detection_provider_spec(backend_name="metadata_detector", backend_kind="metadata")
+
+    metadata = spec.to_metadata()
+
+    assert spec.capability == "detection"
+    assert spec.provider_kind == "local"
+    assert spec.provider_name == "metadata_detector"
+    assert metadata["availability"] == "available"
+    assert metadata["fallback_used"] is False
+    assert metadata["fallback_reason"] == ""
+    assert metadata["requested_provider_name"] == "metadata"
+    assert metadata["resolved_provider_name"] == "metadata_detector"
+    assert metadata["requested_backend"] == "metadata_detector"
+    assert metadata["resolved_backend"] == "metadata_detector"
+    assert metadata["capabilities"]["detect"] is True
+
+
+def test_resolve_detection_provider_spec_declares_yolo_detector() -> None:
+    spec = resolve_detection_provider_spec(
+        backend_name="ultralytics_yolo_tensorrt",
+        backend_kind="ultralytics_yolo_tensorrt",
+        model_name="yolov8n.pt",
+    )
+
+    metadata = spec.to_metadata()
+
+    assert spec.provider_kind == "local"
+    assert spec.provider_name == "ultralytics_yolo"
+    assert spec.model_name == "yolov8n.pt"
+    assert metadata["availability"] == "available"
+    assert metadata["requested_provider_name"] == "ultralytics_yolo_tensorrt"
+    assert metadata["resolved_provider_name"] == "ultralytics_yolo"
+    assert metadata["capabilities"]["detect"] is True
+
+
+def test_resolve_detection_provider_spec_declares_disabled_and_unsupported() -> None:
+    disabled = resolve_detection_provider_spec(enabled=False, backend_name="disabled_detector", backend_kind="none")
+    unsupported = resolve_detection_provider_spec(backend_name="experimental_detector", backend_kind="experimental")
+
+    disabled_metadata = disabled.to_metadata()
+    unsupported_metadata = unsupported.to_metadata()
+
+    assert disabled.provider_kind == "disabled"
+    assert disabled.provider_name == "disabled"
+    assert disabled_metadata["availability"] == "disabled"
+    assert disabled_metadata["fallback_reason"] == "disabled_by_config"
+    assert disabled_metadata["capabilities"]["detect"] is False
+    assert unsupported.provider_kind == "unsupported"
+    assert unsupported.provider_name == "experimental"
+    assert unsupported_metadata["availability"] == "unsupported"
+    assert unsupported_metadata["fallback_reason"] == "unsupported_provider"
+    assert unsupported_metadata["requested_provider_name"] == "experimental"
+    assert unsupported_metadata["resolved_provider_name"] == "experimental"
+    assert unsupported_metadata["capabilities"]["detect"] is False

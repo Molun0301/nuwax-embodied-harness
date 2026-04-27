@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 import httpx
 
 from gateways.relay.server import create_relay_app
-from tests.integration.test_gateway_integration import _build_host_app, _relay_headers
+from tests.integration.test_gateway_integration import _build_host_app, _mcp_tool_call, _relay_headers
 
 
 def test_host_container_relay_e2e_path(tmp_path: Path) -> None:
@@ -37,14 +37,21 @@ def test_host_container_relay_e2e_path(tmp_path: Path) -> None:
                 json={"jsonrpc": "2.0", "id": "tools", "method": "tools/list"},
             )
             assert tools.status_code == 200
-            tool_names = {item["name"] for item in tools.json()["result"]["tools"]}
-            assert "capture_image" in tool_names
-            assert "list_capabilities" in tool_names
-            assert "list_memory_libraries" in tool_names
-            assert "create_memory_library" in tool_names
-            assert "enable_memory_library" in tool_names
-            assert "disable_memory_library" in tool_names
-            assert "delete_memory_library" in tool_names
+            tool_items = tools.json()["result"]["tools"]
+            tool_names = {item["name"] for item in tool_items}
+            assert tool_names == {"platform", "device"}
+            platform_tool = next(item for item in tool_items if item["name"] == "platform")
+            device_tool = next(item for item in tool_items if item["name"] == "device")
+            platform_functions = set(platform_tool["inputSchema"]["properties"]["function"]["enum"])
+            device_functions = set(device_tool["inputSchema"]["properties"]["function"]["enum"])
+            assert "list_capabilities" in platform_functions
+            assert "list_memory_libraries" in platform_functions
+            assert "create_memory_library" in platform_functions
+            assert "enable_memory_library" in platform_functions
+            assert "disable_memory_library" in platform_functions
+            assert "delete_memory_library" in platform_functions
+            assert "capture_image" in device_functions
+            assert platform_tool["inputSchema"]["x-nuwax-function-catalog"]["create_memory_library"]["input_schema"]["type"] == "object"
 
             create_memory = client.post(
                 "/mcp",
@@ -53,12 +60,13 @@ def test_host_container_relay_e2e_path(tmp_path: Path) -> None:
                     "jsonrpc": "2.0",
                     "id": "create_memory",
                     "method": "tools/call",
-                    "params": {
-                        "name": "create_memory_library",
-                        "arguments": {
+                    "params": _mcp_tool_call(
+                        "platform",
+                        "create_memory_library",
+                        {
                             "library_name": "容器预创建记忆库",
                         },
-                    },
+                    ),
                 },
             )
             assert create_memory.status_code == 200
@@ -73,14 +81,15 @@ def test_host_container_relay_e2e_path(tmp_path: Path) -> None:
                     "jsonrpc": "2.0",
                     "id": "enable_memory",
                     "method": "tools/call",
-                    "params": {
-                        "name": "enable_memory_library",
-                        "arguments": {
+                    "params": _mcp_tool_call(
+                        "platform",
+                        "enable_memory_library",
+                        {
                             "library_name": "容器联调记忆库",
                             "load_history": False,
                             "reset_library": False,
                         },
-                    },
+                    ),
                 },
             )
             assert enable_memory.status_code == 200
@@ -96,12 +105,13 @@ def test_host_container_relay_e2e_path(tmp_path: Path) -> None:
                     "jsonrpc": "2.0",
                     "id": "delete_memory",
                     "method": "tools/call",
-                    "params": {
-                        "name": "delete_memory_library",
-                        "arguments": {
+                    "params": _mcp_tool_call(
+                        "platform",
+                        "delete_memory_library",
+                        {
                             "library_name": "容器联调记忆库",
                         },
-                    },
+                    ),
                 },
             )
             assert delete_memory.status_code == 200
@@ -116,7 +126,7 @@ def test_host_container_relay_e2e_path(tmp_path: Path) -> None:
                     "jsonrpc": "2.0",
                     "id": "capture",
                     "method": "tools/call",
-                    "params": {"name": "capture_image", "arguments": {}},
+                    "params": _mcp_tool_call("device", "capture_image"),
                 },
             )
             assert capture.status_code == 200

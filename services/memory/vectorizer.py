@@ -13,6 +13,8 @@ from typing import Iterable, List, Optional
 import httpx
 import numpy as np
 
+from services.model_providers import resolve_text_embedding_provider_spec, resolve_vision_language_provider_spec
+
 
 VECTORIZER_LOGGER = logging.getLogger("nuwax_robot_bridge.memory.vectorizer")
 
@@ -557,19 +559,19 @@ def build_text_embedder(
     """按配置构造文本向量化器。"""
 
     normalized = str(model_name or "").strip()
-    lowered = normalized.lower()
-    if not normalized or lowered.startswith("hashing"):
-        return HashingTextEmbedder(model_name=normalized or "hashing-v1", dimension=dimension)
-    if _is_dashscope_multimodal_model(normalized):
+    spec = resolve_text_embedding_provider_spec(normalized)
+    if spec.provider_name == "hashing":
+        return HashingTextEmbedder(model_name=spec.model_name or "hashing-v1", dimension=dimension)
+    if spec.provider_name == "dashscope":
         return DashScopeTextEmbedder(
-            model_name=normalized,
+            model_name=spec.model_name,
             dimension=dimension,
             api_key=api_key,
             base_url=base_url,
             timeout_sec=timeout_sec,
         )
-    if lowered.startswith("sentence-transformers:") or "bge" in lowered or _is_local_model_reference(normalized):
-        return SentenceTransformerTextEmbedder(model_name=normalized, dimension=dimension)
+    if spec.provider_name == "sentence_transformers":
+        return SentenceTransformerTextEmbedder(model_name=spec.model_name, dimension=dimension)
     raise ValueError(f"不支持的文本向量化模型：{model_name}")
 
 
@@ -584,17 +586,17 @@ def build_vision_language_embedder(
     """按配置构造图文共享空间向量化器。"""
 
     normalized = str(model_name or "").strip()
-    lowered = normalized.lower()
-    if not normalized or lowered in {"disabled", "none", "off"}:
+    spec = resolve_vision_language_provider_spec(normalized)
+    if not spec.is_enabled():
         return None
-    if _is_dashscope_multimodal_model(normalized):
+    if spec.provider_name == "dashscope":
         return DashScopeVisionLanguageEmbedder(
-            model_name=normalized,
+            model_name=spec.model_name,
             dimension=dimension,
             api_key=api_key,
             base_url=base_url,
             timeout_sec=timeout_sec,
         )
-    if lowered.startswith("transformers-clip:") or "clip" in lowered or _is_local_model_reference(normalized):
-        return CLIPVisionLanguageEmbedder(model_name=normalized, dimension=dimension)
+    if spec.provider_name == "clip":
+        return CLIPVisionLanguageEmbedder(model_name=spec.model_name, dimension=dimension)
     raise ValueError(f"不支持的图文向量化模型：{model_name}")

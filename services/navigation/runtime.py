@@ -1172,11 +1172,6 @@ def _point_on_polyline(*, polyline: Sequence[Point2D], target_distance_m: float)
     return polyline[-1]
 
 
-Go2GridPlan = GridPlan
-Go2GridNavigationPlanner = GridNavigationPlanner
-Go2NavigationTickResult = NavigationTickResult
-Go2NavigationSession = NavigationSession
-
 
 __all__ = [
     "GridNavigationPlanner",
@@ -1184,8 +1179,4 @@ __all__ = [
     "NavigationExecutionState",
     "NavigationSession",
     "NavigationTickResult",
-    "Go2GridNavigationPlanner",
-    "Go2GridPlan",
-    "Go2NavigationSession",
-    "Go2NavigationTickResult",
 ]

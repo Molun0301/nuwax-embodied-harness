@@ -402,17 +402,10 @@ def _normalize_angle(angle_rad: float) -> float:
     return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
 
 
-Go2ExplorationSafetyResult = ExplorationSafetyResult
-Go2FrontierCandidate = FrontierCandidate
-Go2FrontierExplorer = FrontierExplorer
-
 
 __all__ = [
     "ExplorationSafetyResult",
     "ExplorationSafetyStatus",
     "FrontierCandidate",
     "FrontierExplorer",
-    "Go2ExplorationSafetyResult",
-    "Go2FrontierCandidate",
-    "Go2FrontierExplorer",
 ]

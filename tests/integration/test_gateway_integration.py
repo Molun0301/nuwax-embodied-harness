@@ -390,92 +390,9 @@ class FakeObstacleAvoidanceDataPlane:
     def __init__(self) -> None:
         self.enabled = True
         self.calls: List[bool] = []
-        self.mapping_runtime_calls: List[str] = []
-        self.mapping_runtime_disable_calls: List[str] = []
-        self.loaded_map_name: Optional[str] = None
-        self.saved_maps: set[str] = set()
-        self.load_named_map_calls: List[Dict[str, object]] = []
-        self.save_named_map_calls: List[Dict[str, object]] = []
 
     def is_obstacle_avoidance_control_available(self) -> bool:
         return True
-
-    def ensure_mapping_runtime_enabled(self, *, reason: str = "") -> Dict[str, object]:
-        self.mapping_runtime_calls.append(str(reason or ""))
-        return {
-            "service_names": ["unitree_lidar", "unitree_lidar_slam", "voxel_height_mapping"],
-            "service_states": {},
-            "localization_available": True,
-            "map_available": True,
-            "navigation_available": True,
-        }
-
-    def disable_mapping_runtime(self, *, reason: str = "") -> Dict[str, object]:
-        self.mapping_runtime_disable_calls.append(str(reason or ""))
-        return {
-            "service_names": ["unitree_lidar", "unitree_lidar_slam", "voxel_height_mapping"],
-            "service_states": {},
-            "localization_available": True,
-            "map_available": False,
-            "navigation_available": True,
-        }
-
-    def get_loaded_map_name(self) -> Optional[str]:
-        return self.loaded_map_name
-
-    def get_named_map_runtime_status(self) -> Dict[str, object]:
-        return {
-            "loaded_map_name": self.loaded_map_name,
-            "runtime_mode": "live_runtime" if self.loaded_map_name else "none",
-            "saved_maps": sorted(self.saved_maps),
-            "runtime_scope": "compatibility_only",
-            "used_by_platform": False,
-        }
-
-    def load_named_map(
-        self,
-        map_name: str,
-        *,
-        reason: str = "",
-        allow_missing: bool = False,
-    ) -> Dict[str, object]:
-        resolved_name = str(map_name or "").strip()
-        archive_found = resolved_name in self.saved_maps
-        loaded = archive_found or bool(allow_missing)
-        if loaded:
-            self.loaded_map_name = resolved_name
-        self.load_named_map_calls.append(
-            {
-                "map_name": resolved_name,
-                "reason": str(reason or ""),
-                "allow_missing": bool(allow_missing),
-                "loaded": loaded,
-            }
-        )
-        return {
-            "requested_map_name": resolved_name,
-            "loaded_map_name": self.loaded_map_name,
-            "loaded": loaded,
-            "archive_found": archive_found,
-            "runtime_mode": "archive_snapshot" if archive_found else "live_runtime",
-            "requires_localization": False,
-        }
-
-    def save_named_map(self, map_name: str, *, reason: str = "") -> Dict[str, object]:
-        resolved_name = str(map_name or "").strip()
-        self.loaded_map_name = resolved_name
-        self.saved_maps.add(resolved_name)
-        self.save_named_map_calls.append(
-            {
-                "map_name": resolved_name,
-                "reason": str(reason or ""),
-            }
-        )
-        return {
-            "map_name": resolved_name,
-            "saved": True,
-            "runtime_mode": "live_runtime",
-        }
 
     def set_obstacle_avoidance_enabled(self, enabled: bool) -> Dict[str, object]:
         self.enabled = bool(enabled)
@@ -1437,7 +1354,6 @@ def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path)
         navigate_pose_task = _wait_for_task(client, navigate_pose.json()["task"]["task_id"])
         assert navigate_pose_task["status"]["state"] == "succeeded"
         assert robot.current_pose.position.x == 1.0
-        assert robot.data_plane.save_named_map_calls == []
 
         navigate_named = client.post(
             "/api/capabilities/navigate_to_named_location/invoke",
@@ -1447,7 +1363,6 @@ def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path)
         assert navigate_named.status_code == 200
         navigate_named_task = _wait_for_task(client, navigate_named.json()["task"]["task_id"])
         assert navigate_named_task["status"]["state"] == "succeeded"
-        assert robot.data_plane.load_named_map_calls == []
 
         explore = client.post(
             "/api/capabilities/explore_area/invoke",
@@ -1457,7 +1372,6 @@ def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path)
         assert explore.status_code == 200
         explore_task = _wait_for_task(client, explore.json()["task"]["task_id"])
         assert explore_task["status"]["state"] == "succeeded"
-        assert robot.data_plane.save_named_map_calls == []
 
         navigation_latest = client.get("/api/navigation/latest", headers=_agent_headers())
         navigation_history = client.get("/api/navigation/history?limit=10", headers=_agent_headers())
@@ -2240,10 +2154,6 @@ def test_gateway_map_catalog_tools_and_memory_compatibility(tmp_path: Path) -> N
         activate_payload = activate_map.json()["result"]
         assert activate_payload["active_workspace"]["active_map_name"] == "一楼大厅"
         assert activate_payload["memory_summary"]["metadata"]["active_library_name"] == "一楼大厅"
-        assert robot.data_plane.mapping_runtime_calls[-1] == "activate_map"
-        assert activate_payload["map_runtime"]["runtime_scope"] == "compatibility_only"
-        assert activate_payload["map_runtime"]["used_by_platform"] is False
-        assert robot.data_plane.load_named_map_calls == []
 
         enable_memory = client.post(
             "/api/capabilities/enable_memory_library/invoke",
@@ -2564,7 +2474,6 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
             nav_named_payload["result"]["arrival_verification"]["metadata"]["localization_session_id"]
             == semantic_payload["localization_session_id"]
         )
-        assert robot.data_plane.save_named_map_calls == []
 
         list_capabilities = client.post(
             "/mcp",
@@ -3025,3 +2934,41 @@ def test_relay_forwards_mcp_and_artifacts(tmp_path: Path) -> None:
             assert raw.content == b"fake-jpeg-data"
     finally:
         runtime.stop()
+
+
+def test_gateway_debug_panel_readonly_routes(tmp_path: Path) -> None:
+    """sp12 调试面板应只暴露只读 Web 和聚合接口。"""
+
+    app, _, _, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        root = client.get("/", headers=_agent_headers())
+        assert root.status_code == 200
+        assert root.json()["debug_panel_path"] == "/debug"
+
+        page = client.get("/debug", headers=_agent_headers())
+        assert page.status_code == 200
+        assert "只读" in page.text
+        assert "<button" not in page.text.lower()
+
+        for path in (
+            "/api/debug/overview",
+            "/api/debug/map",
+            "/api/debug/localization",
+            "/api/debug/navigation",
+            "/api/debug/pointcloud/latest",
+            "/api/debug/logs/tail",
+        ):
+            response = client.get(path, headers=_agent_headers())
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["type"]
+            assert payload["source"]
+            assert payload["gateway_timestamp"]
+            assert payload["status"] in {"available", "missing", "stale", "error", "unsupported"}
+
+        pointcloud = client.get("/api/debug/pointcloud/latest", headers=_agent_headers()).json()
+        assert pointcloud["data"]["protection"]["default_max_points_applied_by_debug_api"] is False
+
+        assert client.post("/api/debug/navigation", headers=_agent_headers()).status_code == 405
+        assert client.patch("/api/debug/navigation", headers=_agent_headers()).status_code == 405
+        assert client.delete("/api/debug/navigation", headers=_agent_headers()).status_code == 405

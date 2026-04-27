@@ -14,7 +14,7 @@ LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane_entry")
 
 
 def main() -> int:
-    """以独立进程启动 Go2 端侧数据面。"""
+    """以独立进程启动 Go2 设备侧数据面。"""
 
     handler = logging.StreamHandler()
     handler.setFormatter(build_default_formatter())
@@ -34,13 +34,13 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     runtime.start()
-    LOGGER.info("Go2 端侧数据面已启动。")
+    LOGGER.info("Go2 设备侧数据面已启动。")
     try:
         while not stop_event.is_set():
             time.sleep(0.5)
     finally:
         runtime.stop()
-        LOGGER.info("Go2 端侧数据面已停止。")
+        LOGGER.info("Go2 设备侧数据面已停止。")
     return 0
 
 

@@ -47,13 +47,13 @@ def build_go2_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Rob
             ComponentBinding(
                 name="go2_data_plane_runtime",
                 path="drivers.go2.data_plane.Go2DataPlaneRuntime",
-                description="Go2 端侧定位、地图合成、官方导航执行与探索数据面运行时。",
+                description="Go2 设备侧 DDS 输入、运动命令与避障控制运行时。",
                 required=False,
             ),
             ComponentBinding(
                 name="go2_data_plane_settings",
                 path="drivers.go2.settings.load_go2_data_plane_config",
-                description="Go2 端侧定位、地图、导航执行与探索配置加载入口。",
+                description="Go2 设备侧输入流、运动命令与避障配置加载入口。",
                 required=False,
             ),
         ),

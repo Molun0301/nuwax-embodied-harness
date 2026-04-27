@@ -139,53 +139,6 @@ class MotionCommandDataPlane(Protocol):
         """停止底层运动命令。"""
 
 
-@runtime_checkable
-class MappingRuntimeControlDataPlane(Protocol):
-    """建图运行态开关协议。"""
-
-    def ensure_mapping_runtime_enabled(self, *, reason: str = "") -> Dict[str, Any]:
-        """按需启用建图运行态。"""
-
-    def disable_mapping_runtime(self, *, reason: str = "") -> Dict[str, Any]:
-        """回收建图运行态。"""
-
-
-@runtime_checkable
-class NamedMapRuntimeStatusDataPlane(Protocol):
-    """命名地图运行态状态协议。"""
-
-    def get_named_map_runtime_status(self) -> Dict[str, Any]:
-        """返回命名地图兼容运行态状态。"""
-
-
-@runtime_checkable
-class LoadedMapNameDataPlane(Protocol):
-    """当前加载地图名称协议。"""
-
-    def get_loaded_map_name(self) -> Optional[str]:
-        """返回当前加载的地图名称。"""
-
-
-@runtime_checkable
-class NamedMapCompatibilityDataPlane(
-    NamedMapRuntimeStatusDataPlane,
-    LoadedMapNameDataPlane,
-    Protocol,
-):
-    """命名地图兼容入口协议。"""
-
-    def load_named_map(
-        self,
-        map_name: str,
-        *,
-        reason: str = "",
-        allow_missing: bool = False,
-    ) -> Dict[str, Any]:
-        """加载命名地图兼容运行态。"""
-
-    def save_named_map(self, map_name: str, *, reason: str = "") -> Dict[str, Any]:
-        """保存命名地图兼容归档。"""
-
 
 @runtime_checkable
 class ObstacleAvoidanceControlDataPlane(Protocol):
@@ -204,13 +157,11 @@ class ManagedRobotDeviceDataPlane(
     RobotStateSensorDataPlane,
     DataPlaneStatusReporter,
     MotionCommandDataPlane,
-    MappingRuntimeControlDataPlane,
-    NamedMapCompatibilityDataPlane,
     ObstacleAvoidanceControlDataPlane,
     Protocol,
 ):
     """机器人入口默认保留的窄数据面协议。
 
-    仅包含设备服务、输入流辅助状态与兼容/调试开关，
+    仅包含设备服务、输入流辅助状态与运动安全开关，
     不再要求机器人数据面承载平台 map/nav/exploration 主链。
     """

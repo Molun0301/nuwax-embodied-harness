@@ -24,9 +24,6 @@ from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationS
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, TaskManager
 from drivers.entry import load_active_robot_private_capability_specs
 from drivers.common import (
-    LoadedMapNameDataPlane,
-    MappingRuntimeControlDataPlane,
-    NamedMapRuntimeStatusDataPlane,
     ObstacleAvoidanceControlDataPlane,
     RobotAssemblyBase,
 )
@@ -2371,7 +2368,6 @@ class GatewayRuntime:
             reset_memory_library=bool(arguments.get("reset_memory_library", False)),
             metadata={"requested_by": requested_by or "unknown"},
         )
-        self._ensure_robot_mapping_runtime_enabled(trigger="activate_map")
         has_platform_map_version = bool(
             active_workspace is not None
             and active_workspace.map_asset is not None
@@ -2385,7 +2381,6 @@ class GatewayRuntime:
             "active_workspace": active_workspace,
             "maps": self.map_workspace_service.list_maps(),
             "memory_summary": self.memory_service.get_summary(),
-            "map_runtime": self._get_robot_named_map_runtime_status(),
         }
 
     def _handle_delete_map(
@@ -2407,7 +2402,6 @@ class GatewayRuntime:
         )
         if bool(delete_result.get("was_active")):
             self._sync_perception_runtime_for_memory_state(enabled=False)
-            self._disable_robot_mapping_runtime(trigger="delete_map")
         return {
             "delete_result": delete_result,
             "maps": self.map_workspace_service.list_maps(),
@@ -2516,7 +2510,6 @@ class GatewayRuntime:
                 load_history=bool(arguments.get("load_history", True)),
                 reset_library=bool(arguments.get("reset_library", False)),
         )
-        self._ensure_robot_mapping_runtime_enabled(trigger="enable_memory_library")
         if compatibility_mode == "map_workspace" and active_workspace is not None:
             self._refresh_workspace_snapshots()
         self._sync_perception_runtime_for_memory_state(enabled=True)
@@ -2526,7 +2519,6 @@ class GatewayRuntime:
             "maps": self.map_workspace_service.list_maps(),
             "libraries": self.memory_service.list_memory_libraries(),
             "memory_summary": self.memory_service.get_summary(),
-            "map_runtime": self._get_robot_named_map_runtime_status(),
         }
 
     def _handle_disable_memory_library(
@@ -2541,7 +2533,6 @@ class GatewayRuntime:
         if active_workspace is not None and active_workspace.active_map_name == active_workspace.active_memory_library_name:
             self.map_workspace_service.clear_active_map(disable_memory_library=False)
         self._sync_perception_runtime_for_memory_state(enabled=False)
-        self._disable_robot_mapping_runtime(trigger="disable_memory_library")
         return {
             "active_workspace": self.map_workspace_service.get_active_workspace(),
             "maps": self.map_workspace_service.list_maps(),
@@ -2563,7 +2554,6 @@ class GatewayRuntime:
             self.map_workspace_service.clear_active_map(disable_memory_library=False)
         if bool(delete_result.get("was_active")):
             self._sync_perception_runtime_for_memory_state(enabled=False)
-            self._disable_robot_mapping_runtime(trigger="delete_memory_library")
         return {
             "delete_result": delete_result,
             "active_workspace": self.map_workspace_service.get_active_workspace(),
@@ -2659,7 +2649,6 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=False,
         )
-        self._ensure_robot_mapping_runtime_enabled(trigger="navigate_to_pose")
         self._refresh_workspace_snapshots()
         self._ensure_localization_ready(
             capability_name="navigate_to_pose",
@@ -2845,7 +2834,6 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=False,
         )
-        self._ensure_robot_mapping_runtime_enabled(trigger="find_target")
         self._refresh_workspace_snapshots()
         self._ensure_workspace_memory_library_ready(map_name=map_name)
         query = self._require_str(arguments, "query")
@@ -2971,7 +2959,6 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=True,
         )
-        self._ensure_robot_mapping_runtime_enabled(trigger="explore_area")
         self._refresh_workspace_snapshots()
         if self._workspace_requires_localization_before_explore(workspace):
             self._ensure_localization_ready(
@@ -3016,7 +3003,6 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=True,
         )
-        self._ensure_robot_mapping_runtime_enabled(trigger="explore_and_find_target")
         self._refresh_workspace_snapshots()
         if self._workspace_requires_localization_before_explore(workspace):
             self._ensure_localization_ready(
@@ -4811,29 +4797,6 @@ class GatewayRuntime:
         if status.running:
             self.perception_video_runtime.stop()
 
-    def _get_robot_named_map_runtime_status(self) -> Optional[Dict[str, Any]]:
-        data_plane = getattr(self.robot, "data_plane", None)
-        if data_plane is None:
-            return None
-        payload: Optional[Dict[str, Any]] = None
-        try:
-            if isinstance(data_plane, NamedMapRuntimeStatusDataPlane):
-                raw_payload = data_plane.get_named_map_runtime_status()
-                if isinstance(raw_payload, dict):
-                    payload = dict(raw_payload)
-            elif isinstance(data_plane, LoadedMapNameDataPlane):
-                payload = {
-                    "loaded_map_name": data_plane.get_loaded_map_name(),
-                }
-        except Exception:
-            RUNTIME_LOGGER.exception("读取机器人命名地图兼容状态失败。")
-            return None
-        if payload is None:
-            return None
-        payload.setdefault("runtime_scope", "compatibility_only")
-        payload.setdefault("used_by_platform", False)
-        return payload
-
     def _finalize_workspace_assets_after_task(
         self,
         *,
@@ -4851,7 +4814,6 @@ class GatewayRuntime:
             )
         active_workspace = self.map_workspace_service.get_active_workspace()
         return {
-            "map_runtime": self._get_robot_named_map_runtime_status(),
             "active_workspace": active_workspace,
             "saved_map_version": saved_map_version,
         }
@@ -4877,30 +4839,6 @@ class GatewayRuntime:
             RUNTIME_LOGGER.exception("探索任务结束后自动保存平台地图版本失败 map_name=%s trigger=%s", map_name, trigger)
             return None
 
-    def _ensure_robot_mapping_runtime_enabled(self, *, trigger: str) -> None:
-        data_plane = getattr(self.robot, "data_plane", None)
-        if data_plane is None or not isinstance(data_plane, MappingRuntimeControlDataPlane):
-            return
-        try:
-            data_plane.ensure_mapping_runtime_enabled(reason=trigger)
-        except TypeError:
-            data_plane.ensure_mapping_runtime_enabled()
-        except Exception:
-            RUNTIME_LOGGER.exception("按需启用机器人建图运行时失败 trigger=%s", trigger)
-
-    def _disable_robot_mapping_runtime(self, *, trigger: str) -> None:
-        data_plane = getattr(self.robot, "data_plane", None)
-        if data_plane is None or not isinstance(data_plane, MappingRuntimeControlDataPlane):
-            return
-        try:
-            result = data_plane.disable_mapping_runtime(reason=trigger)
-        except TypeError:
-            result = data_plane.disable_mapping_runtime()
-        except Exception:
-            RUNTIME_LOGGER.exception("回收机器人建图运行时失败 trigger=%s", trigger)
-            return
-        if isinstance(result, dict) and not bool(result.get("map_available", True)):
-            self.mapping_service.clear_latest_snapshot()
 
     def _build_gateway_capability_availability(
         self,

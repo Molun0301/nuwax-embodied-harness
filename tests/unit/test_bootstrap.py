@@ -151,7 +151,6 @@ def test_go2_robot_env_overrides_enable_direct_dds_and_official_backend() -> Non
     assert overrides["GO2_DATA_PLANE_ENABLED"] == "true"
     assert overrides["GO2_DIRECT_DDS_ENABLED"] == "true"
     assert overrides["GO2_OFFICIAL_BACKEND_ENABLED"] == "true"
-    assert overrides["GO2_NAMED_MAP_ARCHIVE_ROOT"].endswith("runtime_data/go2_named_maps")
 
 
 def test_geometry_defaults_install_rtabmap_nav2_dependencies() -> None:

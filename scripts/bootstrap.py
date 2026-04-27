@@ -640,7 +640,6 @@ class BootstrapPlanner:
             return {}
         values = {
             "GO2_DATA_PLANE_ENABLED": _bool_text(self.data_plane_enabled),
-            "GO2_NAMED_MAP_ARCHIVE_ROOT": str(PROJECT_ROOT / "runtime_data" / "go2_named_maps"),
             "GO2_DIRECT_DDS_ENABLED": _bool_text(self.data_plane_enabled),
             "GO2_OFFICIAL_BACKEND_ENABLED": _bool_text(self.data_plane_enabled),
         }

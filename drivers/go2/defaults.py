@@ -24,7 +24,6 @@ class Go2ClientTimeouts:
 GO2_TIMEOUTS = Go2ClientTimeouts()
 
 GO2_DEFAULT_FRAME_IDS = {
-    "map": "world/go2/map",
     "base": "world/go2/base",
     "imu": "world/go2/imu",
     "camera_front": "world/go2/camera_front",
@@ -41,9 +40,6 @@ GO2_DEFAULT_TOPICS = {
     "utlidar_cloud": "/utlidar/cloud",
     "tf": "/tf",
     "tf_static": "/tf_static",
-    "occupancy_map": "/map",
-    "grid_map": "/elevation_mapping_cupy/elevation_map_raw",
-    "global_costmap": "/global_costmap/costmap",
 }
 
 GO2_DEFAULT_SENSOR_BINDINGS = (

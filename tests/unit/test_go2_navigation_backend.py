@@ -4,21 +4,16 @@ import math
 
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import CostMap, OccupancyGrid
-from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
-from drivers.go2.data_plane import Go2DataPlaneRuntime
-from drivers.go2.settings import (
-    Go2DataPlaneConfig,
-    Go2ExplorationConfig,
-    Go2NavigationBackendConfig,
-    Go2OfficialBackendConfig,
-)
-from services.navigation.frontier import Go2FrontierExplorer
-from services.navigation.runtime import Go2GridNavigationPlanner, Go2NavigationSession
+from contracts.navigation import NavigationGoal, NavigationStatus
+from services.navigation.config import ExplorationConfig, NavigationBackendConfig, NavigationControlConfig
+from services.navigation.frontier import FrontierExplorer
 from typing import Optional, Set, Tuple
+
+from services.navigation.runtime import GridNavigationPlanner, NavigationSession
 
 
 class _StaticBridge:
-    """测试用静态 Go2 数据桥。"""
+    """测试用静态平台数据桥。"""
 
     def __init__(self) -> None:
         self.localization_available = True
@@ -173,23 +168,23 @@ def _build_partial_maps(
 def _build_session(
     *,
     goal_pose: Pose,
-    planner_config: Optional[Go2NavigationBackendConfig] = None,
-    control_config: Optional[Go2OfficialBackendConfig] = None,
-) -> Go2NavigationSession:
-    planner_cfg = planner_config or Go2NavigationBackendConfig(
+    planner_config: Optional[NavigationBackendConfig] = None,
+    control_config: Optional[NavigationControlConfig] = None,
+) -> NavigationSession:
+    planner_cfg = planner_config or NavigationBackendConfig(
         planner_inflation_radius_m=0.0,
         replan_interval_sec=60.0,
         replan_cooldown_sec=0.0,
         max_replan_failures=4,
     )
-    control_cfg = control_config or Go2OfficialBackendConfig(
+    control_cfg = control_config or NavigationControlConfig(
         goal_tolerance_m=0.25,
         goal_yaw_tolerance_rad=0.25,
         max_linear_velocity_mps=0.35,
         max_yaw_rate_rps=0.8,
     )
-    planner = Go2GridNavigationPlanner(planner_cfg)
-    return Go2NavigationSession(
+    planner = GridNavigationPlanner(planner_cfg)
+    return NavigationSession(
         goal=NavigationGoal(goal_id="test_goal", target_pose=goal_pose),
         planner=planner,
         planner_config=planner_cfg,
@@ -207,8 +202,8 @@ def test_grid_planner_can_route_around_blocking_wall() -> None:
         origin_y=0.0,
         blocked_cells=blocked_cells,
     )
-    planner = Go2GridNavigationPlanner(
-        Go2NavigationBackendConfig(
+    planner = GridNavigationPlanner(
+        NavigationBackendConfig(
             planner_inflation_radius_m=0.0,
             planning_horizon_margin_m=0.2,
         )
@@ -238,8 +233,8 @@ def test_grid_planner_accepts_scoped_odom_alias() -> None:
         origin_y=0.0,
         blocked_cells=set(),
     )
-    planner = Go2GridNavigationPlanner(
-        Go2NavigationBackendConfig(
+    planner = GridNavigationPlanner(
+        NavigationBackendConfig(
             planner_inflation_radius_m=0.0,
             planning_horizon_margin_m=0.2,
         )
@@ -339,61 +334,16 @@ def test_navigation_session_uses_local_horizon_when_goal_is_outside_map() -> Non
     assert tick.metadata["planning_mode"] == "local_horizon"
 
 
-def test_go2_runtime_exploration_candidates_return_empty_without_frontier_candidates() -> None:
-    runtime = Go2DataPlaneRuntime(
-        Go2DataPlaneConfig(
-            enabled=True,
-            exploration=Go2ExplorationConfig(
-                enabled=True,
-                sample_radius_m=2.0,
-                sample_count=4,
-                max_goal_cost=75.0,
-            ),
-            navigation=Go2NavigationBackendConfig(
-                planner_inflation_radius_m=0.0,
-                planning_horizon_margin_m=0.2,
-            ),
-        ),
-        bridge=_StaticBridge(),
-    )
-    runtime._official_sport_ready = True
-
-    current_pose = _build_pose(x=0.0, y=0.0)
-    blocked_cells = {(row, 9) for row in range(20)}
-    occupancy, cost_map = _build_maps(
-        width=20,
-        height=20,
-        resolution_m=0.5,
-        origin_x=-5.0,
-        origin_y=-5.0,
-        blocked_cells=blocked_cells,
-    )
-
-    runtime.get_current_pose = lambda: current_pose
-    runtime.get_occupancy_grid = lambda: occupancy
-    runtime.get_cost_map = lambda: cost_map
-
-    candidates = runtime._build_exploration_candidates(
-        ExploreAreaRequest(
-            request_id="explore_test",
-            center_pose=current_pose,
-            radius_m=2.0,
-            strategy="frontier",
-        )
-    )
-
-    assert candidates == []
-
 
 def test_frontier_explorer_prefers_reachable_frontier_cluster() -> None:
-    planner = Go2GridNavigationPlanner(
-        Go2NavigationBackendConfig(
+    planner = GridNavigationPlanner(
+        NavigationBackendConfig(
             planner_inflation_radius_m=0.0,
             planning_horizon_margin_m=0.2,
         )
     )
-    explorer = Go2FrontierExplorer(
-        Go2ExplorationConfig(
+    explorer = FrontierExplorer(
+        ExplorationConfig(
             enabled=True,
             frontier_enabled=True,
             frontier_min_cluster_cells=3,
@@ -427,16 +377,15 @@ def test_frontier_explorer_prefers_reachable_frontier_cluster() -> None:
     assert candidates
     assert all(candidate.pose.position.x <= 1.0 for candidate in candidates)
 
-
 def test_frontier_explorer_uses_global_search_when_radius_is_not_explicit() -> None:
-    planner = Go2GridNavigationPlanner(
-        Go2NavigationBackendConfig(
+    planner = GridNavigationPlanner(
+        NavigationBackendConfig(
             planner_inflation_radius_m=0.0,
             planning_horizon_margin_m=0.2,
         )
     )
-    explorer = Go2FrontierExplorer(
-        Go2ExplorationConfig(
+    explorer = FrontierExplorer(
+        ExplorationConfig(
             enabled=True,
             frontier_enabled=True,
             frontier_min_cluster_cells=3,
@@ -489,60 +438,4 @@ def test_frontier_explorer_uses_global_search_when_radius_is_not_explicit() -> N
     assert math.hypot(
         global_candidates[0].pose.position.x - current_pose.position.x,
         global_candidates[0].pose.position.y - current_pose.position.y,
-    ) > 1.5
-
-
-def test_go2_data_plane_frontier_exploration_without_radius_uses_global_search() -> None:
-    runtime = Go2DataPlaneRuntime(
-        Go2DataPlaneConfig(
-            enabled=True,
-            exploration=Go2ExplorationConfig(
-                enabled=True,
-                sample_radius_m=1.5,
-                sample_count=8,
-                frontier_min_cluster_cells=3,
-                max_goal_cost=75.0,
-            ),
-            navigation=Go2NavigationBackendConfig(
-                planner_inflation_radius_m=0.0,
-                planning_horizon_margin_m=0.2,
-            ),
-        ),
-        bridge=_StaticBridge(),
-    )
-    runtime._official_sport_ready = True
-
-    free_cells = {(row, col) for row in range(8, 15) for col in range(8, 15)}
-    free_cells.update({(row, col) for row in range(10, 13) for col in range(15, 23)})
-    blocked_cells = {(7, col) for col in range(7, 16)}
-    blocked_cells.update({(15, col) for col in range(7, 16)})
-    blocked_cells.update({(row, 7) for row in range(7, 16)})
-    blocked_cells.update({(row, 15) for row in range(7, 16) if row not in {10, 11, 12}})
-    blocked_cells.update({(9, col) for col in range(15, 23)})
-    blocked_cells.update({(13, col) for col in range(15, 23)})
-    occupancy, cost_map = _build_partial_maps(
-        width=32,
-        height=24,
-        resolution_m=0.5,
-        origin_x=-8.0,
-        origin_y=-6.0,
-        free_cells=free_cells,
-        blocked_cells=blocked_cells,
-    )
-    current_pose = _build_pose(x=-2.25, y=-0.25)
-    runtime.get_current_pose = lambda: current_pose
-    runtime.get_occupancy_grid = lambda: occupancy
-    runtime.get_cost_map = lambda: cost_map
-
-    candidates = runtime._build_exploration_candidates(
-        ExploreAreaRequest(
-            request_id="explore_global_frontier",
-            strategy="frontier",
-        )
-    )
-
-    assert candidates
-    assert math.hypot(
-        candidates[0].position.x - current_pose.position.x,
-        candidates[0].position.y - current_pose.position.y,
     ) > 1.5

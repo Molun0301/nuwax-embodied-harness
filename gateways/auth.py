@@ -48,6 +48,21 @@ class GatewayAccessManager:
         token = self._extract_token(request.headers, request.query_params)
         return self._resolve_access_context(token, source_host)
 
+    def authenticate_local_debug_page(self, request: Request) -> AccessContext:
+        """校验本机调试页，并允许回环来源自动使用 agent 令牌。"""
+
+        source_host = request.client.host if request.client is not None else None
+        self._assert_source_allowed(source_host)
+        try:
+            token = self._extract_token(request.headers, request.query_params)
+        except AuthenticationRequiredError:
+            if not self._is_loopback_source(source_host):
+                raise
+            token = self.default_agent_token()
+            if not token:
+                raise
+        return self._resolve_access_context(token, source_host)
+
     def authenticate_websocket(self, websocket: WebSocket) -> AccessContext:
         """校验 WebSocket 请求。"""
 
@@ -129,12 +144,23 @@ class GatewayAccessManager:
             return query_token
         raise AuthenticationRequiredError()
 
+    def default_agent_token(self) -> str:
+        return next((item for item in self._config.agent_tokens if item), "")
+
     def _resolve_access_context(self, token: str, source_host: Optional[str]) -> AccessContext:
         if token in self._admin_tokens:
             return AccessContext(role=AccessRole.ADMIN, token=token, principal="admin", source_host=source_host)
         if token in self._agent_tokens:
             return AccessContext(role=AccessRole.AGENT, token=token, principal="agent", source_host=source_host)
         raise AuthenticationRequiredError("认证令牌无效。")
+
+    def _is_loopback_source(self, source_host: Optional[str]) -> bool:
+        if not source_host:
+            return self._config.allow_unknown_client_hosts
+        try:
+            return ipaddress.ip_address(source_host).is_loopback
+        except ValueError:
+            return False
 
     def _assert_source_allowed(self, source_host: Optional[str]) -> None:
         if not self._allowed_networks:

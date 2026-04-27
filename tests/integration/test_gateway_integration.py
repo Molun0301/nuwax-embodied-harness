@@ -2948,6 +2948,7 @@ def test_gateway_debug_panel_readonly_routes(tmp_path: Path) -> None:
         page = client.get("/debug", headers=_agent_headers())
         assert page.status_code == 200
         assert "只读" in page.text
+        assert "agent-token" in page.text
         assert "<button" not in page.text.lower()
 
         for path in (

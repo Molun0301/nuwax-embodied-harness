@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import math
 from typing import Any, Dict, List, Optional
 
@@ -48,8 +49,8 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     @router.get("/debug", response_class=HTMLResponse)
     @router.get("/debug/", response_class=HTMLResponse)
     async def debug_page(request: Request) -> HTMLResponse:
-        access_manager.authenticate_http(request)
-        return HTMLResponse(_render_debug_page())
+        access = access_manager.authenticate_local_debug_page(request)
+        return HTMLResponse(_render_debug_page(access.token))
 
     @router.get("/api/debug/overview")
     @router.get("/api/debug/snapshot")
@@ -382,8 +383,9 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     return router
 
 
-def _render_debug_page() -> str:
-    return """<!doctype html>
+def _render_debug_page(access_token: str) -> str:
+    debug_access_token = json.dumps(access_token)
+    html = """<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -506,6 +508,9 @@ def _render_debug_page() -> str:
   <script>
     (() => {
       const POLL_MS = 1000;
+      const DEBUG_ACCESS_TOKEN = __DEBUG_ACCESS_TOKEN__;
+      const urlAccessToken = new URLSearchParams(window.location.search).get("access_token") || "";
+      const apiAccessToken = urlAccessToken || DEBUG_ACCESS_TOKEN;
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "pointcloud", "logs"];
       const overviewLabels = { health: "health", state: "state", localization: "localization", map: "map", navigation: "navigation", exploration: "exploration", pointcloud: "pointcloud", logs: "logs" };
       const state = { mapGrid: null, mapViewport: null, pose: null, trajectory: [], frontiers: [], logs: [], logCursor: 0, polling: false };
@@ -560,9 +565,16 @@ def _render_debug_page() -> str:
         const err = envelope && envelope.error;
         return (err && (err.message || err.code)) || fallback || "数据不可用。";
       }
+      function withAccessToken(path) {
+        if (!apiAccessToken) return path;
+        const url = new URL(path, window.location.origin);
+        url.searchParams.set("access_token", apiAccessToken);
+        return `${url.pathname}${url.search}`;
+      }
       async function getJson(path) {
         const started = performance.now();
-        const res = await fetch(path, { cache: "no-store" });
+        const requestPath = withAccessToken(path);
+        const res = await fetch(requestPath, { cache: "no-store" });
         const receivedAt = new Date();
         if (!res.ok) throw new Error(`${path} HTTP ${res.status}`);
         const json = await res.json();
@@ -937,6 +949,7 @@ def _render_debug_page() -> str:
   </script>
 </body>
 </html>"""
+    return html.replace("__DEBUG_ACCESS_TOKEN__", debug_access_token)
 
 
 def _envelope(

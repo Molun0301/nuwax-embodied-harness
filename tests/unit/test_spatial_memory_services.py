@@ -723,6 +723,42 @@ def test_instance_association_records_s3_projection_metadata() -> None:
     assert metadata["segmentation_support_point_count"] == 0
 
 
+def test_instance_association_accepts_multi_word_visual_labels() -> None:
+    projected_observation = ProjectedObservation(
+        label="potted plant",
+        score=0.86,
+        pose=Pose(frame_id="map", position=Vector3(x=1.2, y=0.8, z=0.0), orientation=Quaternion(w=1.0)),
+        camera_id="front_camera",
+        track_id="trk_plant",
+        instance_type="object",
+        source_observation_id="obs_camera_front_20260427T085219Z_deadbeef",
+        source_artifact_ids=("art_image_plant",),
+        semantic_region_id="dock_zone",
+        topo_node_id="dock_node",
+        semantic_labels=("办公室",),
+        visual_labels=("potted plant",),
+        attributes={"projection_method": "track_pose", "projection_confidence": 0.86},
+    )
+    association_service = InstanceAssociationService(text_embedder=None, inspection_pose_planner=InspectionPosePlanner())
+
+    instances, outcomes = association_service.associate(
+        [projected_observation],
+        existing_instances={},
+        map_version_id="mapv_test_000001",
+        occupancy_grid=_build_map_snapshot().occupancy_grid,
+        cost_map=None,
+        now=utc_now(),
+    )
+
+    assert outcomes[0].created is True
+    instance = next(iter(instances.values()))
+    assert instance.anchor_id.startswith("anc_potted_plant_")
+    assert instance.instance_id.startswith("ins_potted_plant_")
+    assert instance.label == "potted plant"
+    assert instance.display_name == "potted plant"
+    assert instance.visual_labels == ["potted plant"]
+
+
 def test_instance_association_merges_static_instances_and_marks_stale() -> None:
     map_snapshot = _build_map_snapshot()
     map_context = SemanticMapBuilder().build(map_snapshot)

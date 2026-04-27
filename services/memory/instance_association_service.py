@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import re
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from contracts.base import utc_now
@@ -62,6 +63,7 @@ class InstanceAssociationService:
         InstanceMovability.MOVABLE: 7 * 24 * 3600.0,
         InstanceMovability.TRANSIENT: 24 * 3600.0,
     }
+    _ID_KIND_MAX_LENGTH = 24
 
     def __init__(
         self,
@@ -470,8 +472,9 @@ class InstanceAssociationService:
         cost_map,
         now: datetime,
     ) -> SemanticInstance:
-        anchor_id = build_anchor_id(observation.label[:24] or "object", timestamp=now)
-        instance_id = build_instance_id(observation.label[:24] or "object", timestamp=now)
+        id_kind = self._id_kind_from_label(observation.label)
+        anchor_id = build_anchor_id(id_kind, timestamp=now)
+        instance_id = build_instance_id(id_kind, timestamp=now)
         inspection_poses = self._inspection_pose_planner.plan_for_target(
             target_pose=observation.pose,
             occupancy_grid=occupancy_grid,
@@ -505,6 +508,19 @@ class InstanceAssociationService:
                 movability=movability,
             ),
         )
+
+    @classmethod
+    def _id_kind_from_label(cls, label: str) -> str:
+        """把外部视觉标签转换成内部 ID 可用的 kind 片段。"""
+
+        normalized = re.sub(r"[^0-9a-z]+", "_", str(label or "").strip().lower())
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+        if not normalized:
+            return "object"
+        if not normalized[0].isalpha():
+            normalized = "object_%s" % normalized
+        normalized = normalized[:cls._ID_KIND_MAX_LENGTH].rstrip("_")
+        return normalized or "object"
 
     def _build_instance_metadata(
         self,

@@ -7,6 +7,7 @@ from scripts.bootstrap import (
     BootstrapError,
     BootstrapPlanner,
     _build_redacted_nuwaclaw_docker_command,
+    build_geometry_apt_packages,
     build_nuwaclaw_docker_run_command,
     build_parser,
 )
@@ -145,6 +146,62 @@ def test_go2_robot_env_overrides_enable_direct_dds_and_official_backend() -> Non
     assert overrides["GO2_DIRECT_DDS_ENABLED"] == "true"
     assert overrides["GO2_OFFICIAL_BACKEND_ENABLED"] == "true"
     assert overrides["GO2_NAMED_MAP_ARCHIVE_ROOT"].endswith("runtime_data/go2_named_maps")
+
+
+def test_geometry_defaults_install_rtabmap_nav2_dependencies() -> None:
+    planner = _build_planner(
+        "apply",
+        "--robot",
+        "go2",
+        "--tier",
+        "full",
+        "--geometry",
+        "--data-plane",
+        "--memory-mode",
+        "cloud",
+        "--perception-mode",
+        "hybrid",
+        "--mcp-mode",
+        "skip",
+    )
+
+    assert planner.geometry_enabled is True
+    assert planner.build_geometry is True
+    assert planner.install_geometry_deps is True
+    assert "install_geometry_deps: true" in planner.summary()
+
+
+def test_build_geometry_apt_packages_uses_ros_distro_prefix() -> None:
+    packages = build_geometry_apt_packages("humble")
+
+    assert "python3-colcon-common-extensions" in packages
+    assert "python3-rosdep" in packages
+    assert "ros-humble-rtabmap-ros" in packages
+    assert "ros-humble-navigation2" in packages
+    assert "ros-humble-nav2-bringup" in packages
+    assert "ros-humble-rmw-cyclonedds-cpp" in packages
+
+
+def test_build_geometry_enables_dependency_install_by_default() -> None:
+    planner = _build_planner(
+        "apply",
+        "--robot",
+        "customrobot",
+        "--tier",
+        "lite",
+        "--no-geometry",
+        "--build-geometry",
+        "--memory-mode",
+        "disabled",
+        "--perception-mode",
+        "disabled",
+        "--mcp-mode",
+        "skip",
+    )
+
+    assert planner.geometry_enabled is False
+    assert planner.build_geometry is True
+    assert planner.install_geometry_deps is True
 
 
 def test_build_workspaces_only_runs_geometry_workspace_script(monkeypatch) -> None:

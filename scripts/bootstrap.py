@@ -61,6 +61,24 @@ DEFAULT_MEMORY_LOCAL_TEXT_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" /
 DEFAULT_MEMORY_LOCAL_IMAGE_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "openai__clip-vit-base-patch32")
 DEFAULT_YOLO_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "yolo26n.pt")
 DEFAULT_YOLO_ENGINE = str(PROJECT_ROOT / "runtime_data" / "models" / "yolo26n.engine")
+GEOMETRY_APT_BASE_PACKAGES = (
+    "build-essential",
+    "cmake",
+    "python3-colcon-common-extensions",
+    "python3-pip",
+    "python3-rosdep",
+    "python3-vcstool",
+)
+GEOMETRY_ROS_PACKAGE_SUFFIXES = (
+    "navigation2",
+    "nav2-bringup",
+    "nav2-simple-commander",
+    "pointcloud-to-laserscan",
+    "rmw-cyclonedds-cpp",
+    "robot-localization",
+    "rtabmap-ros",
+    "tf-transformations",
+)
 
 
 class BootstrapError(RuntimeError):
@@ -228,6 +246,37 @@ def _detect_ros_setup() -> Optional[Path]:
     return None
 
 
+def _detect_ros_distro(ros_setup: Optional[Path] = None) -> str:
+    env_distro = str(os.environ.get("ROS_DISTRO", "")).strip()
+    if env_distro:
+        return env_distro
+    setup_path = ros_setup or _detect_ros_setup()
+    if setup_path is None:
+        return ""
+    try:
+        parts = setup_path.parts
+        ros_index = parts.index("ros")
+        return parts[ros_index + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
+def _sudo_prefix() -> Tuple[str, ...]:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return ()
+    if _which("sudo") is None:
+        raise BootstrapError("需要 sudo 执行系统依赖安装，但当前环境未找到 sudo。")
+    return ("sudo",)
+
+
+def build_geometry_apt_packages(ros_distro: str) -> Tuple[str, ...]:
+    normalized = str(ros_distro or "").strip()
+    if not normalized:
+        raise BootstrapError("无法识别 ROS2 发行版，不能推导 RTAB-Map/Nav2 apt 包名。")
+    ros_packages = tuple(f"ros-{normalized}-{suffix}" for suffix in GEOMETRY_ROS_PACKAGE_SUFFIXES)
+    return (*GEOMETRY_APT_BASE_PACKAGES, *ros_packages)
+
+
 def _build_robot_choices() -> Tuple[str, ...]:
     return tuple(sorted(ROBOT_DRIVER_REGISTRY.keys()))
 
@@ -269,6 +318,7 @@ class BootstrapPlanner:
         self.prepare_yolo = self._resolve_bool("prepare_yolo", default=self.perception_mode != "disabled")
         self.export_yolo_engine = self._resolve_bool("export_yolo_engine", default=False)
         self.build_geometry = self._resolve_bool("build_geometry", default=self.geometry_enabled)
+        self.install_geometry_deps = self._resolve_bool("install_geometry_deps", default=self.geometry_enabled or self.build_geometry)
         self.start_gateway = self._resolve_bool("start_gateway", default=False)
         self.run_healthcheck = self._resolve_bool("healthcheck", default=False)
         self.mcp_mode = self._resolve_choice("mcp_mode", ("auto", "config-only", "skip"), default="auto")
@@ -437,6 +487,7 @@ class BootstrapPlanner:
             f"memory_mode: {self.memory_mode}",
             f"perception_mode: {self.perception_mode}",
             f"data_plane: {_bool_text(self.data_plane_enabled)}",
+            f"install_geometry_deps: {_bool_text(self.install_geometry_deps)}",
             f"systemd: {_bool_text(self.systemd_enabled)}",
             f"relay: {_bool_text(self.relay_enabled)}",
             f"mcp_mode: {self.mcp_mode}",
@@ -470,8 +521,21 @@ def run_checks(planner: BootstrapPlanner) -> int:
     if planner.geometry_enabled or planner.build_geometry:
         ros_setup = _detect_ros_setup()
         results.append((ros_setup is not None, _check_result("ROS2", ros_setup is not None, str(ros_setup) if ros_setup else "未找到 /opt/ros/*/setup.bash")))
+        ros_distro = _detect_ros_distro(ros_setup)
+        results.append((bool(ros_distro), _check_result("ROS2 发行版", bool(ros_distro), ros_distro or "无法从 ROS_DISTRO 或 /opt/ros/*/setup.bash 推导")))
+        colcon_ok = _which("colcon") is not None
+        colcon_ready = colcon_ok or planner.install_geometry_deps
+        results.append((colcon_ready, _check_result("colcon", colcon_ready, _which("colcon") or "将由 --install-geometry-deps 安装")))
+        rosdep_ok = _which("rosdep") is not None
+        rosdep_ready = rosdep_ok or planner.install_geometry_deps
+        results.append((rosdep_ready, _check_result("rosdep", rosdep_ready, _which("rosdep") or "将由 --install-geometry-deps 安装")))
         cyclone_ok = bool(os.environ.get("CYCLONEDDS_URI", "").strip()) or bool(planner.root_existing.get("CYCLONEDDS_URI", "").strip())
         results.append((cyclone_ok, _check_result("CycloneDDS 配置", cyclone_ok, "环境变量或 .env 中需存在 CYCLONEDDS_URI")))
+        if planner.install_geometry_deps:
+            apt_ok = _which("apt-get") is not None
+            results.append((apt_ok, _check_result("apt-get", apt_ok, _which("apt-get") or "未找到 apt-get，无法自动安装 RTAB-Map/Nav2")))
+            sudo_ok = hasattr(os, "geteuid") and os.geteuid() == 0 or _which("sudo") is not None
+            results.append((sudo_ok, _check_result("sudo/root", sudo_ok, "root 或 sudo 用于安装系统包")))
 
     if planner.selected_robot == "go2" and planner.data_plane_enabled:
         go2_template_ok = planner.robot_meta.env_template is not None and planner.robot_meta.env_template.exists()
@@ -532,6 +596,55 @@ def install_python_dependencies(planner: BootstrapPlanner) -> None:
     _run((planner.python_bin, "-m", "pip", "install", "-r", "requirements.txt"), cwd=PROJECT_ROOT)
     if planner.memory_mode == "local":
         _run((planner.python_bin, "-m", "pip", "install", "-r", "requirements-memory-models.txt"), cwd=PROJECT_ROOT)
+
+
+def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
+    if not planner.install_geometry_deps:
+        print("跳过 geometry 系统依赖安装。")
+        return
+    if not (planner.geometry_enabled or planner.build_geometry):
+        print("未启用 geometry，跳过 RTAB-Map/Nav2 系统依赖安装。")
+        return
+
+    ros_setup = _detect_ros_setup()
+    if ros_setup is None:
+        raise BootstrapError("未找到 ROS2 安装。请先安装 ROS2 Humble/Jazzy，再安装 RTAB-Map/Nav2。")
+    ros_distro = _detect_ros_distro(ros_setup)
+    packages = build_geometry_apt_packages(ros_distro)
+    sudo = _sudo_prefix()
+    env = dict(os.environ)
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+
+    print(f"准备安装 geometry 系统依赖，ROS2 发行版: {ros_distro}")
+    print("将安装: " + " ".join(packages))
+    _run((*sudo, "apt-get", "update"), cwd=PROJECT_ROOT, env=env)
+    _run((*sudo, "apt-get", "install", "-y", *packages), cwd=PROJECT_ROOT, env=env)
+
+    if _which("rosdep") is None:
+        print("未找到 rosdep，跳过工作区 rosdep 依赖解析。")
+        return
+
+    rosdep_sources = Path("/etc/ros/rosdep/sources.list.d/20-default.list")
+    if not rosdep_sources.exists():
+        init_result = _run((*sudo, "rosdep", "init"), cwd=PROJECT_ROOT, check=False)
+        if init_result.returncode != 0:
+            print("rosdep init 未成功；如果已经初始化过可忽略，否则请手工执行 sudo rosdep init。")
+    _run(("rosdep", "update"), cwd=PROJECT_ROOT)
+    geometry_ws = PROJECT_ROOT / "services" / "geometry" / "ros2_ws"
+    _run(
+        (
+            "rosdep",
+            "install",
+            "--from-paths",
+            "src",
+            "--ignore-src",
+            "-r",
+            "-y",
+            "--rosdistro",
+            ros_distro,
+        ),
+        cwd=geometry_ws,
+    )
 
 
 def build_workspaces(planner: BootstrapPlanner) -> None:
@@ -757,6 +870,7 @@ def run_bootstrap_actions(planner: BootstrapPlanner) -> None:
     write_root_env(planner)
     write_robot_env(planner)
     install_python_dependencies(planner)
+    install_geometry_system_dependencies(planner)
     build_workspaces(planner)
     prepare_assets(planner)
     install_nuwaclaw_client(planner)
@@ -825,6 +939,7 @@ def run_wizard(args: argparse.Namespace) -> int:
     args.systemd = prompt_bool("生成 systemd 示例", True)
     args.install_python = prompt_bool("安装 Python 依赖", True)
     args.build_geometry = prompt_bool("构建 geometry ROS2 工作空间", bool(args.geometry))
+    args.install_geometry_deps = prompt_bool("安装 RTAB-Map/Nav2 系统依赖", bool(args.geometry))
     args.prepare_yolo = prompt_bool("准备 YOLO 权重", args.perception_mode != "disabled")
     args.prepare_memory = prompt_bool("准备本地 memory 模型", args.memory_mode == "local")
     args.mcp_mode = prompt_choice("选择 MCP 注入模式", ("auto", "config-only", "skip"), "auto")
@@ -905,6 +1020,7 @@ def build_parser() -> argparse.ArgumentParser:
         add_boolean_flag(subparser, "prepare_yolo", "准备 YOLO 权重")
         add_boolean_flag(subparser, "export_yolo_engine", "导出 TensorRT 引擎")
         add_boolean_flag(subparser, "build_geometry", "构建 geometry ROS2 工作空间")
+        add_boolean_flag(subparser, "install_geometry_deps", "安装 RTAB-Map/Nav2 系统依赖")
         add_boolean_flag(subparser, "start_gateway", "启动 gateway")
         add_boolean_flag(subparser, "healthcheck", "执行健康检查")
 

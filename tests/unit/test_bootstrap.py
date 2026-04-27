@@ -8,6 +8,7 @@ from scripts.bootstrap import (
     BootstrapPlanner,
     _build_redacted_nuwaclaw_docker_command,
     build_geometry_apt_packages,
+    build_geometry_optional_apt_packages,
     build_nuwaclaw_docker_run_command,
     build_parser,
 )
@@ -180,6 +181,16 @@ def test_build_geometry_apt_packages_uses_ros_distro_prefix() -> None:
     assert "ros-humble-navigation2" in packages
     assert "ros-humble-nav2-bringup" in packages
     assert "ros-humble-rmw-cyclonedds-cpp" in packages
+    assert "ros-humble-nav2-simple-commander" not in packages
+
+
+def test_nav2_simple_commander_is_optional_for_foxy_package_sets() -> None:
+    packages = build_geometry_apt_packages("foxy")
+    optional_packages = build_geometry_optional_apt_packages("foxy")
+
+    assert "ros-foxy-nav2-bringup" in packages
+    assert "ros-foxy-nav2-simple-commander" not in packages
+    assert optional_packages == ("ros-foxy-nav2-simple-commander",)
 
 
 def test_build_geometry_enables_dependency_install_by_default() -> None:

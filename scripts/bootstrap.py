@@ -69,15 +69,17 @@ GEOMETRY_APT_BASE_PACKAGES = (
     "python3-rosdep",
     "python3-vcstool",
 )
-GEOMETRY_ROS_PACKAGE_SUFFIXES = (
+GEOMETRY_ROS_REQUIRED_PACKAGE_SUFFIXES = (
     "navigation2",
     "nav2-bringup",
-    "nav2-simple-commander",
     "pointcloud-to-laserscan",
     "rmw-cyclonedds-cpp",
     "robot-localization",
     "rtabmap-ros",
     "tf-transformations",
+)
+GEOMETRY_ROS_OPTIONAL_PACKAGE_SUFFIXES = (
+    "nav2-simple-commander",
 )
 
 
@@ -273,8 +275,42 @@ def build_geometry_apt_packages(ros_distro: str) -> Tuple[str, ...]:
     normalized = str(ros_distro or "").strip()
     if not normalized:
         raise BootstrapError("无法识别 ROS2 发行版，不能推导 RTAB-Map/Nav2 apt 包名。")
-    ros_packages = tuple(f"ros-{normalized}-{suffix}" for suffix in GEOMETRY_ROS_PACKAGE_SUFFIXES)
+    ros_packages = tuple(f"ros-{normalized}-{suffix}" for suffix in GEOMETRY_ROS_REQUIRED_PACKAGE_SUFFIXES)
     return (*GEOMETRY_APT_BASE_PACKAGES, *ros_packages)
+
+
+def build_geometry_optional_apt_packages(ros_distro: str) -> Tuple[str, ...]:
+    normalized = str(ros_distro or "").strip()
+    if not normalized:
+        raise BootstrapError("无法识别 ROS2 发行版，不能推导 RTAB-Map/Nav2 apt 包名。")
+    return tuple(f"ros-{normalized}-{suffix}" for suffix in GEOMETRY_ROS_OPTIONAL_PACKAGE_SUFFIXES)
+
+
+def filter_available_apt_packages(packages: Sequence[str]) -> Tuple[str, ...]:
+    if not packages:
+        return ()
+    if _which("apt-cache") is None:
+        print("未找到 apt-cache，跳过可选 geometry apt 包: " + " ".join(packages))
+        return ()
+
+    available: List[str] = []
+    skipped: List[str] = []
+    for package in packages:
+        result = _run(
+            ("apt-cache", "show", package),
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+            display_command=f"apt-cache show {package} >/dev/null",
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            available.append(package)
+        else:
+            skipped.append(package)
+
+    if skipped:
+        print("跳过当前 apt 源不存在的可选 geometry 包: " + " ".join(skipped))
+    return tuple(available)
 
 
 def _build_robot_choices() -> Tuple[str, ...]:
@@ -608,16 +644,19 @@ def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
 
     ros_setup = _detect_ros_setup()
     if ros_setup is None:
-        raise BootstrapError("未找到 ROS2 安装。请先安装 ROS2 Humble/Jazzy，再安装 RTAB-Map/Nav2。")
+        raise BootstrapError("未找到 ROS2 安装。请先安装 ROS2 Foxy/Humble/Jazzy，再安装 RTAB-Map/Nav2。")
     ros_distro = _detect_ros_distro(ros_setup)
-    packages = build_geometry_apt_packages(ros_distro)
+    required_packages = build_geometry_apt_packages(ros_distro)
+    optional_candidates = build_geometry_optional_apt_packages(ros_distro)
     sudo = _sudo_prefix()
     env = dict(os.environ)
     env["DEBIAN_FRONTEND"] = "noninteractive"
 
     print(f"准备安装 geometry 系统依赖，ROS2 发行版: {ros_distro}")
-    print("将安装: " + " ".join(packages))
     _run((*sudo, "apt-get", "update"), cwd=PROJECT_ROOT, env=env)
+    optional_packages = filter_available_apt_packages(optional_candidates)
+    packages = (*required_packages, *optional_packages)
+    print("将安装: " + " ".join(packages))
     _run((*sudo, "apt-get", "install", "-y", *packages), cwd=PROJECT_ROOT, env=env)
 
     if _which("rosdep") is None:

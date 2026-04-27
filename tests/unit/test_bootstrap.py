@@ -9,6 +9,7 @@ from scripts.bootstrap import (
     BootstrapError,
     BootstrapPlanner,
     _build_redacted_nuwaclaw_docker_command,
+    apt_output_has_ros2_archive_404,
     build_geometry_apt_packages,
     build_geometry_optional_apt_packages,
     build_nuwaclaw_docker_run_command,
@@ -172,7 +173,9 @@ def test_geometry_defaults_install_rtabmap_nav2_dependencies() -> None:
     assert planner.geometry_enabled is True
     assert planner.build_geometry is True
     assert planner.install_geometry_deps is True
+    assert planner.repair_ros2_apt_source is True
     assert "install_geometry_deps: true" in planner.summary()
+    assert "repair_ros2_apt_source: true" in planner.summary()
 
 
 def test_build_geometry_apt_packages_uses_ros_distro_prefix() -> None:
@@ -194,6 +197,16 @@ def test_nav2_simple_commander_is_optional_for_foxy_package_sets() -> None:
     assert "ros-foxy-nav2-bringup" in packages
     assert "ros-foxy-nav2-simple-commander" not in packages
     assert optional_packages == ("ros-foxy-nav2-simple-commander",)
+
+
+def test_apt_output_detects_stale_ros2_archive_404() -> None:
+    output = (
+        "E: Failed to fetch http://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu/pool/main/r/"
+        "ros-foxy-rtabmap-ros.deb  404  Not Found"
+    )
+
+    assert apt_output_has_ros2_archive_404(output) is True
+    assert apt_output_has_ros2_archive_404("404 Not Found https://download.docker.com/linux/ubuntu") is False
 
 
 def test_build_geometry_enables_dependency_install_by_default() -> None:

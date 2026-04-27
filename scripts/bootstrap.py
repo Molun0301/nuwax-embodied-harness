@@ -81,6 +81,10 @@ GEOMETRY_ROS_REQUIRED_PACKAGE_SUFFIXES = (
 GEOMETRY_ROS_OPTIONAL_PACKAGE_SUFFIXES = (
     "nav2-simple-commander",
 )
+DEFAULT_ROS2_APT_FALLBACK_URLS = (
+    "https://mirrors.ustc.edu.cn/ros2/ubuntu",
+    "http://packages.ros.org/ros2/ubuntu",
+)
 
 
 class BootstrapError(RuntimeError):
@@ -152,6 +156,13 @@ def _run(
                 print(completed.stderr, end="", file=sys.stderr)
         raise BootstrapError(f"命令执行失败: {printable}")
     return completed
+
+
+def _print_completed_output(completed: subprocess.CompletedProcess[str]) -> None:
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
 
 
 def _run_shell(command: str, *, cwd: Optional[Path] = None, check: bool = True) -> None:
@@ -286,6 +297,62 @@ def build_geometry_optional_apt_packages(ros_distro: str) -> Tuple[str, ...]:
     return tuple(f"ros-{normalized}-{suffix}" for suffix in GEOMETRY_ROS_OPTIONAL_PACKAGE_SUFFIXES)
 
 
+def apt_output_has_ros2_archive_404(output: str) -> bool:
+    normalized = str(output or "").lower()
+    return "404" in normalized and "not found" in normalized and "ros2/ubuntu" in normalized and "failed to fetch" in normalized
+
+
+def build_ros2_apt_fallback_urls() -> Tuple[str, ...]:
+    configured = _parse_csv(os.environ.get("NUWAX_ROS2_APT_FALLBACK_URLS", ""))
+    if configured:
+        return configured
+    return DEFAULT_ROS2_APT_FALLBACK_URLS
+
+
+def replace_ros2_apt_source_url(sudo: Sequence[str], replacement_url: str) -> bool:
+    script = r"""
+import re
+import sys
+from pathlib import Path
+
+replacement = sys.argv[1].rstrip("/")
+paths = [Path("/etc/apt/sources.list")]
+source_dir = Path("/etc/apt/sources.list.d")
+if source_dir.exists():
+    paths.extend(sorted(source_dir.glob("*.list")))
+
+changed = []
+for path in paths:
+    if not path.exists():
+        continue
+    text = path.read_text(encoding="utf-8", errors="replace")
+    updated = re.sub(r"https?://[^\s]+/ros2/ubuntu/?", replacement, text)
+    if updated == text:
+        continue
+    backup = Path(str(path) + ".nuwaxbak")
+    if not backup.exists():
+        backup.write_text(text, encoding="utf-8")
+    path.write_text(updated, encoding="utf-8")
+    changed.append(str(path))
+
+if changed:
+    print("已更新 ROS2 apt 源: " + ", ".join(changed))
+    sys.exit(0)
+
+print("没有找到可更新的 ROS2 apt 源文件。")
+sys.exit(3)
+"""
+    result = _run(
+        (*sudo, "python3", "-c", script, replacement_url),
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        display_command=f"{shlex.join((*sudo, 'python3'))} -c '<replace ROS2 apt source>' {replacement_url}",
+    )
+    _print_completed_output(result)
+    return result.returncode == 0
+
+
 def filter_available_apt_packages(packages: Sequence[str]) -> Tuple[str, ...]:
     if not packages:
         return ()
@@ -320,6 +387,35 @@ def run_geometry_apt_update(sudo: Sequence[str], env: Mapping[str, str]) -> None
             "apt-get update 未完全成功，通常是某个无关第三方 apt 源不可用。"
             "将继续尝试安装 geometry 依赖；如果后续 apt-get install 仍失败，请先修复或临时禁用异常 apt 源。"
         )
+
+
+def install_geometry_apt_packages(planner: "BootstrapPlanner", sudo: Sequence[str], env: Mapping[str, str], packages: Sequence[str]) -> None:
+    command = (*sudo, "apt-get", "install", "-y", *packages)
+    result = _run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True)
+    if result.returncode == 0:
+        return
+
+    _print_completed_output(result)
+    combined_output = "\n".join((result.stdout or "", result.stderr or ""))
+    if not planner.repair_ros2_apt_source or not apt_output_has_ros2_archive_404(combined_output):
+        raise BootstrapError(f"命令执行失败: {shlex.join(list(command))}")
+
+    print("检测到 ROS2 apt 源包索引与实际归档不同步，准备切换 ROS2 apt 源并重试 geometry 依赖安装。")
+    for fallback_url in build_ros2_apt_fallback_urls():
+        print(f"尝试将 ROS2 apt 源切换到: {fallback_url}")
+        if not replace_ros2_apt_source_url(sudo, fallback_url):
+            continue
+        _run((*sudo, "apt-get", "clean"), cwd=PROJECT_ROOT, env=env, check=False)
+        run_geometry_apt_update(sudo, env)
+        retry = _run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True)
+        if retry.returncode == 0:
+            return
+        _print_completed_output(retry)
+
+    raise BootstrapError(
+        "ROS2 apt 源持续返回 404。请手工修复 /etc/apt/sources.list.d 中的 ros2/ubuntu 源，"
+        "或通过 NUWAX_ROS2_APT_FALLBACK_URLS 指定可用源后重试。"
+    )
 
 
 def _build_robot_choices() -> Tuple[str, ...]:
@@ -364,6 +460,7 @@ class BootstrapPlanner:
         self.export_yolo_engine = self._resolve_bool("export_yolo_engine", default=False)
         self.build_geometry = self._resolve_bool("build_geometry", default=self.geometry_enabled)
         self.install_geometry_deps = self._resolve_bool("install_geometry_deps", default=self.geometry_enabled or self.build_geometry)
+        self.repair_ros2_apt_source = self._resolve_bool("repair_ros2_apt_source", default=True)
         self.start_gateway = self._resolve_bool("start_gateway", default=False)
         self.run_healthcheck = self._resolve_bool("healthcheck", default=False)
         self.mcp_mode = self._resolve_choice("mcp_mode", ("auto", "config-only", "skip"), default="auto")
@@ -533,6 +630,7 @@ class BootstrapPlanner:
             f"perception_mode: {self.perception_mode}",
             f"data_plane: {_bool_text(self.data_plane_enabled)}",
             f"install_geometry_deps: {_bool_text(self.install_geometry_deps)}",
+            f"repair_ros2_apt_source: {_bool_text(self.repair_ros2_apt_source)}",
             f"systemd: {_bool_text(self.systemd_enabled)}",
             f"relay: {_bool_text(self.relay_enabled)}",
             f"mcp_mode: {self.mcp_mode}",
@@ -666,7 +764,7 @@ def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
     optional_packages = filter_available_apt_packages(optional_candidates)
     packages = (*required_packages, *optional_packages)
     print("将安装: " + " ".join(packages))
-    _run((*sudo, "apt-get", "install", "-y", *packages), cwd=PROJECT_ROOT, env=env)
+    install_geometry_apt_packages(planner, sudo, env, packages)
 
     if _which("rosdep") is None:
         print("未找到 rosdep，跳过工作区 rosdep 依赖解析。")
@@ -1069,6 +1167,7 @@ def build_parser() -> argparse.ArgumentParser:
         add_boolean_flag(subparser, "export_yolo_engine", "导出 TensorRT 引擎")
         add_boolean_flag(subparser, "build_geometry", "构建 geometry ROS2 工作空间")
         add_boolean_flag(subparser, "install_geometry_deps", "安装 RTAB-Map/Nav2 系统依赖")
+        add_boolean_flag(subparser, "repair_ros2_apt_source", "自动修复异常 ROS2 apt 源")
         add_boolean_flag(subparser, "start_gateway", "启动 gateway")
         add_boolean_flag(subparser, "healthcheck", "执行健康检查")
 

@@ -15,3 +15,6 @@ memory_models_20260402.tar.zst
 runtime_data/models/
 tests/
 .vscode/
+drivers/go2/ros2_ws/
+nuwax_robot_bridge.log.lock
+runtime_data/

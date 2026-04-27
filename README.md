@@ -90,6 +90,46 @@ curl http://127.0.0.1:8766/api/tools \
   -H 'Authorization: Bearer agent-robot-bridge-token'
 ```
 
+### 6. 打开本机只读 Web 调试面板
+
+启动宿主机网关后，可以在浏览器打开：
+
+```text
+http://127.0.0.1:8766/debug
+```
+
+如果网关运行在 Go2 真机上，并从同一局域网电脑访问，请把 `127.0.0.1` 换成 Go2 的 IP（网络地址）：
+
+```text
+http://<Go2_IP>:8766/debug
+```
+
+该页面是只读调试面板，不包含运动控制、导航目标下发、探索启停、地图保存/删除等控制功能。面板会展示服务状态、运行事件/日志、2D SLAM（同步定位与建图）栅格、机器人位姿与轨迹、navigation/frontier（导航/探索前沿）摘要、点云元数据，以及数据时间戳、延迟和 stale（过期）状态。
+
+常用只读调试 API（应用程序接口）：
+
+```text
+http://127.0.0.1:8766/api/debug/overview
+http://127.0.0.1:8766/api/debug/map
+http://127.0.0.1:8766/api/debug/localization
+http://127.0.0.1:8766/api/debug/navigation
+http://127.0.0.1:8766/api/debug/pointcloud/latest
+http://127.0.0.1:8766/api/debug/logs/tail
+```
+
+兼容别名：
+
+```text
+http://127.0.0.1:8766/api/debug/snapshot
+http://127.0.0.1:8766/api/debug/map/frame/latest
+http://127.0.0.1:8766/api/debug/localization/pose/latest
+http://127.0.0.1:8766/api/debug/localization/trajectory
+http://127.0.0.1:8766/api/debug/exploration/frontier/latest
+http://127.0.0.1:8766/api/debug/pointcloud/frame/latest/meta
+```
+
+真机上的地图/frontier P95（第 95 百分位延迟）、真实点云性能和 frontier 几何高亮仍需要在 Go2 环境中验收。
+
 ## 常见部署组合
 
 ### Go2 全量能力

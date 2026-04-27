@@ -1710,7 +1710,7 @@ class GatewayRuntime:
                 description=spec.description,
                 category=self._resolve_private_skill_category(spec.name, spec.risk_level),
                 capability_name=spec.name,
-                exposed_to_agent=False,
+                exposed_to_agent=spec.exposed_to_agent,
                 tags=["robot_private", active_robot_name],
                 metadata={"capability_layer": "robot_private"},
             )
@@ -1735,7 +1735,7 @@ class GatewayRuntime:
         if layer not in tags:
             tags.append(layer)
         exposed_to_agent = descriptor.exposed_to_agent
-        if layer in {"ops_debug", "robot_private"}:
+        if layer == "ops_debug":
             exposed_to_agent = False
         return descriptor.model_copy(
             update={
@@ -1756,7 +1756,7 @@ class GatewayRuntime:
         if layer not in tags:
             tags.append(layer)
         exposed_to_agent = descriptor.exposed_to_agent
-        if layer in {"ops_debug", "robot_private"}:
+        if layer == "ops_debug":
             exposed_to_agent = False
         return descriptor.model_copy(
             update={

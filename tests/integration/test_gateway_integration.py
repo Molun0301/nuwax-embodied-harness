@@ -2455,7 +2455,7 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
         assert "disable_memory_library" in tool_names
         assert "delete_memory_library" in tool_names
         assert "remember_current_scene" in tool_names
-        assert "switch_control_mode" not in tool_names
+        assert "switch_control_mode" in tool_names
         assert "switch_control_mode" in admin_tool_names
 
         create_result = _create_memory_library(client, library_name="预创建记忆库")
@@ -2696,7 +2696,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
         set_volume = client.post(
             "/mcp",
-            headers=_admin_headers(),
+            headers=_agent_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "set_volume",
@@ -2706,7 +2706,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         )
         get_volume = client.post(
             "/mcp",
-            headers=_admin_headers(),
+            headers=_agent_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "get_volume",
@@ -2737,7 +2737,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
         set_obstacle_avoidance = client.post(
             "/mcp",
-            headers=_admin_headers(),
+            headers=_agent_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "obstacle",
@@ -2753,7 +2753,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
         execute_action = client.post(
             "/mcp",
-            headers=_admin_headers(),
+            headers=_agent_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "sport",
@@ -2763,7 +2763,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         )
         set_body_pose = client.post(
             "/mcp",
-            headers=_admin_headers(),
+            headers=_agent_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "pose",
@@ -2773,7 +2773,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         )
         set_speed = client.post(
             "/mcp",
-            headers=_admin_headers(),
+            headers=_agent_headers(),
             json={
                 "jsonrpc": "2.0",
                 "id": "speed",

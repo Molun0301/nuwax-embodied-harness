@@ -674,8 +674,10 @@ def test_unified_entry_loads_go2_private_capabilities() -> None:
 
     config = replace(APP_CONFIG, robot=RobotDriverConfig(active_robot="go2"))
 
-    spec_names = {spec.name for spec in load_active_robot_private_capability_specs(config)}
+    specs = load_active_robot_private_capability_specs(config)
+    spec_names = {spec.name for spec in specs}
 
     assert "execute_sport_command" in spec_names
     assert "set_obstacle_avoidance" in spec_names
     assert "switch_control_mode" in spec_names
+    assert all(spec.exposed_to_agent is True for spec in specs)

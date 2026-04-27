@@ -17,7 +17,7 @@ class PrivateCapabilitySpec:
     input_schema: Dict[str, object] = field(default_factory=dict)
     output_schema: Dict[str, object] = field(default_factory=dict)
     required_resources: Tuple[str, ...] = ()
-    exposed_to_agent: bool = False
+    exposed_to_agent: bool = True
     timeout_sec: Optional[int] = None
     cancel_supported: bool = False
     tags: Tuple[str, ...] = ()

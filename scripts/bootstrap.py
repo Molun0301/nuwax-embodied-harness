@@ -313,6 +313,15 @@ def filter_available_apt_packages(packages: Sequence[str]) -> Tuple[str, ...]:
     return tuple(available)
 
 
+def run_geometry_apt_update(sudo: Sequence[str], env: Mapping[str, str]) -> None:
+    result = _run((*sudo, "apt-get", "update"), cwd=PROJECT_ROOT, env=env, check=False)
+    if result.returncode != 0:
+        print(
+            "apt-get update 未完全成功，通常是某个无关第三方 apt 源不可用。"
+            "将继续尝试安装 geometry 依赖；如果后续 apt-get install 仍失败，请先修复或临时禁用异常 apt 源。"
+        )
+
+
 def _build_robot_choices() -> Tuple[str, ...]:
     return tuple(sorted(ROBOT_DRIVER_REGISTRY.keys()))
 
@@ -653,7 +662,7 @@ def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
     env["DEBIAN_FRONTEND"] = "noninteractive"
 
     print(f"准备安装 geometry 系统依赖，ROS2 发行版: {ros_distro}")
-    _run((*sudo, "apt-get", "update"), cwd=PROJECT_ROOT, env=env)
+    run_geometry_apt_update(sudo, env)
     optional_packages = filter_available_apt_packages(optional_candidates)
     packages = (*required_packages, *optional_packages)
     print("将安装: " + " ".join(packages))

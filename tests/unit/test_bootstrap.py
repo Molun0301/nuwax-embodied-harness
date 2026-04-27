@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+
 import scripts.bootstrap as bootstrap_module
 import pytest
 
@@ -11,6 +13,7 @@ from scripts.bootstrap import (
     build_geometry_optional_apt_packages,
     build_nuwaclaw_docker_run_command,
     build_parser,
+    run_geometry_apt_update,
 )
 
 
@@ -213,6 +216,21 @@ def test_build_geometry_enables_dependency_install_by_default() -> None:
     assert planner.geometry_enabled is False
     assert planner.build_geometry is True
     assert planner.install_geometry_deps is True
+
+
+def test_geometry_apt_update_does_not_fail_on_unrelated_repository_error(monkeypatch) -> None:
+    calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def _fake_run(command, *, check=True, **kwargs):
+        del kwargs
+        calls.append((tuple(command), check))
+        return subprocess.CompletedProcess(command, 100)
+
+    monkeypatch.setattr(bootstrap_module, "_run", _fake_run)
+
+    run_geometry_apt_update(("sudo",), {"DEBIAN_FRONTEND": "noninteractive"})
+
+    assert calls == [(("sudo", "apt-get", "update"), False)]
 
 
 def test_build_workspaces_only_runs_geometry_workspace_script(monkeypatch) -> None:

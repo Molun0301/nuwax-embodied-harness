@@ -8,6 +8,7 @@ __pycache__/
 .claude/
 docs/内部开发文档/
 docs/开发文档/
+GO2_inner_slam/
 runtime_data/**/*.db
 artifacts/
 .venv_model_download/

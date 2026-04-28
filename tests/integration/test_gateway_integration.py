@@ -17,6 +17,14 @@ from contracts.memory import MemoryArrivalVerification, MemoryNavigationCandidat
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.pointcloud import PointCloudFrame, PointField, PointFieldDataType
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
+from contracts.spatial_memory import (
+    SceneCandidateLabel,
+    SceneModelSummary,
+    SceneObservationSample,
+    SceneSpace,
+    SceneSpaceBoundary,
+    SceneSpaceReviewStatus,
+)
 from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
 from drivers.common.manifest import RobotDefaults, RobotManifest
 from drivers.go2.assembly import Go2RobotAssembly
@@ -836,6 +844,106 @@ def _delete_memory_library(
     )
     assert response.status_code == 200
     return response.json()
+
+
+def _build_gateway_scene_space() -> SceneSpace:
+    sample = SceneObservationSample(
+        sample_id="sample_gateway_scene_space_001",
+        source_observation_id="obs_front_camera_20260401T120000Z_deadbeef",
+        observation_event_id="oev_perception_20260401T120000Z_deadbeef",
+        camera_id="front_camera",
+        pose=Pose(frame_id="map", position=Vector3(x=1.2, y=0.4, z=0.0), orientation=Quaternion(w=1.0)),
+        artifact_ids=["art_image_20260401T120000Z_deadbeef"],
+        visual_labels=["charging dock"],
+        vision_tags=["补给区"],
+        confidence=0.86,
+    )
+    return SceneSpace(
+        scene_space_id="ssp_gateway_zone_20260401T120000Z_deadbeef",
+        map_version_id="mapv_gateway_000001",
+        localization_session_id="loc_gateway_session",
+        frame_id="map",
+        boundary=SceneSpaceBoundary(
+            frame_id="map",
+            centroid=Pose(frame_id="map", position=Vector3(x=1.2, y=0.4, z=0.0), orientation=Quaternion(w=1.0)),
+            confidence=0.86,
+        ),
+        inspection_poses=[Pose(frame_id="map", position=Vector3(x=0.8, y=0.4, z=0.0), orientation=Quaternion(w=1.0))],
+        observation_sample_ids=[sample.sample_id],
+        observation_samples=[sample],
+        model_summary=SceneModelSummary(
+            summary="模型判断这里是补给区。",
+            provider_name="rule_based_scene_space",
+            model_name="rule-based-scene-space-v1",
+            confidence=0.7,
+            evidence_observation_sample_ids=[sample.sample_id],
+        ),
+        candidate_labels=[
+            SceneCandidateLabel(
+                label="补给区",
+                normalized_label="补给区",
+                confidence=0.72,
+                source_model="rule-based-scene-space-v1",
+                evidence_observation_sample_ids=[sample.sample_id],
+                evidence_observation_event_ids=["oev_perception_20260401T120000Z_deadbeef"],
+            )
+        ],
+        primary_label="补给区",
+        human_aliases=["dock"],
+        review_status=SceneSpaceReviewStatus.AUTO_LABELED,
+        linked_anchor_ids=["anc_region_20260401T120000Z_deadbeef"],
+        linked_object_instance_ids=["ins_charger_20260401T120000Z_deadbeef"],
+        linked_topology_node_ids=["dock_node"],
+        linked_semantic_region_ids=["dock_zone"],
+        linked_observation_event_ids=["oev_perception_20260401T120000Z_deadbeef"],
+        metadata={"backend": "memory_service.scene_space"},
+    )
+
+
+def test_gateway_scene_space_readonly_interfaces_and_capability_names(tmp_path: Path) -> None:
+    app, runtime, _, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _enable_memory_library(client, library_name="场景空间接口测试记忆库", reset_library=True)
+        scene_space = runtime.memory_service.upsert_scene_space(_build_gateway_scene_space())
+
+        capabilities = client.get("/api/capabilities?exposed_only=false", headers=_admin_headers())
+        assert capabilities.status_code == 200
+        capability_names = {item["name"] for item in capabilities.json()["capabilities"]}
+        assert {"list_scene_spaces", "get_scene_space", "query_scene_spaces", "review_scene_space"} <= capability_names
+
+        exposed = client.get("/api/capabilities?exposed_only=true", headers=_agent_headers())
+        assert exposed.status_code == 200
+        exposed_names = {item["name"] for item in exposed.json()["capabilities"]}
+        assert {"list_scene_spaces", "get_scene_space", "query_scene_spaces"} <= exposed_names
+        assert "review_scene_space" not in exposed_names
+
+        listed = client.get(
+            "/api/memory/scene_spaces",
+            headers=_agent_headers(),
+            params={"map_version_id": "mapv_gateway_000001", "review_status": "auto_labeled"},
+        )
+        assert listed.status_code == 200
+        listed_payload = listed.json()
+        assert [item["scene_space_id"] for item in listed_payload["scene_spaces"]] == [scene_space.scene_space_id]
+        assert listed_payload["scene_spaces"][0]["candidate_labels"][0]["label"] == "补给区"
+        assert listed_payload["scene_spaces"][0]["human_aliases"] == ["dock"]
+
+        queried = client.get(
+            "/api/memory/scene_spaces/query",
+            headers=_agent_headers(),
+            params={"query": "补给区", "limit": 1, "similarity_threshold": 0.1},
+        )
+        assert queried.status_code == 200
+        match = queried.json()["query_result"]["matches"][0]
+        assert match["record_kind"] == "scene_space"
+        assert match["record_id"] == scene_space.scene_space_id
+        assert match["navigation_candidate"]["source_collection"] == "scene_spaces"
+        assert match["navigation_candidate"]["metadata"]["navigation_quality_level"] == "direct_navigation"
+
+        fetched = client.get(f"/api/memory/scene_spaces/{scene_space.scene_space_id}", headers=_agent_headers())
+        assert fetched.status_code == 200
+        assert fetched.json()["scene_space"]["scene_space_id"] == scene_space.scene_space_id
+        assert client.post("/api/memory/scene_spaces", headers=_agent_headers()).status_code == 405
 
 
 

@@ -11,7 +11,7 @@ from contracts.frame_semantics import frame_ids_semantically_equal, infer_frame_
 from contracts.geometry import Pose, Quaternion, Transform, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import OccupancyGrid
-from contracts.memory import MemoryQueryMatch, MemoryQueryResult, MemoryRecordKind, SemanticMemoryEntry, TaggedLocation
+from contracts.memory import MemoryPayloadFilter, MemoryQueryMatch, MemoryQueryResult, MemoryRecordKind, SemanticMemoryEntry, TaggedLocation
 from contracts.navigation import NavigationGoal
 from contracts.naming import (
     build_anchor_id,
@@ -23,6 +23,7 @@ from contracts.naming import (
     build_navigation_candidate_id,
     build_observation_id,
     build_observation_event_id,
+    build_scene_space_id,
     build_task_id,
     validate_capability_name,
     validate_event_type,
@@ -35,6 +36,12 @@ from contracts.spatial_memory import (
     GroundingQueryPlan,
     NavigationCandidate,
     ObservationEvent,
+    SceneCandidateLabel,
+    SceneModelSummary,
+    SceneObservationSample,
+    SceneSpace,
+    SceneSpaceBoundary,
+    SceneSpaceReviewStatus,
     SemanticInstance,
     SpatialAnchor,
     SpatialAnchorKind,
@@ -316,3 +323,83 @@ def test_spatial_memory_contracts_can_be_constructed() -> None:
     assert candidate.source_collection == "object_instances"
     assert verification.verified is True
     assert plan.intent == "navigate"
+
+
+def test_scene_space_contract_roundtrips_with_evidence_and_filters() -> None:
+    timestamp = datetime(2026, 3, 30, 12, 0, 0, tzinfo=timezone.utc)
+    scene_space_id = build_scene_space_id("dock_zone", timestamp, "deadbeef")
+    observation_event_id = build_observation_event_id("perception", timestamp, "deadbeef")
+    sample = SceneObservationSample(
+        sample_id="sample_dock_zone_001",
+        source_observation_id=build_observation_id("front_camera", timestamp, "deadbeef"),
+        observation_event_id=observation_event_id,
+        camera_id="front_camera",
+        pose=Pose(frame_id="map", position=Vector3(x=1.0, y=2.0, z=0.0)),
+        artifact_ids=[build_artifact_id("image", timestamp, "deadbeef")],
+        visual_labels=["charging dock", "shelf"],
+        vision_tags=["补给区", "机器人停靠"],
+        confidence=0.82,
+    )
+    scene_space = SceneSpace(
+        scene_space_id=scene_space_id,
+        map_version_id="mapv_test_000001",
+        localization_session_id="loc_session_test",
+        frame_id="map",
+        boundary=SceneSpaceBoundary(
+            frame_id="map",
+            centroid=Pose(frame_id="map", position=Vector3(x=1.2, y=2.1, z=0.0)),
+            polygon_points=[
+                Vector3(x=0.8, y=1.7, z=0.0),
+                Vector3(x=1.6, y=1.7, z=0.0),
+                Vector3(x=1.6, y=2.5, z=0.0),
+            ],
+            area_m2=0.64,
+            confidence=0.78,
+        ),
+        entry_poses=[Pose(frame_id="map", position=Vector3(x=0.8, y=2.1, z=0.0))],
+        inspection_poses=[Pose(frame_id="map", position=Vector3(x=0.6, y=2.1, z=0.0))],
+        observation_sample_ids=[sample.sample_id],
+        observation_samples=[sample],
+        model_summary=SceneModelSummary(
+            summary="模型判断该空间像补给和充电区域。",
+            provider_name="rule_based_scene_space",
+            model_name="rule-based-scene-space-v1",
+            confidence=0.66,
+            evidence_observation_sample_ids=[sample.sample_id],
+            generated_at=timestamp,
+            metadata={"fallback_used": True, "fallback_reason": "provider_not_available"},
+        ),
+        candidate_labels=[
+            SceneCandidateLabel(
+                label="补给区",
+                normalized_label="补给区",
+                confidence=0.7,
+                source_model="rule-based-scene-space-v1",
+                evidence_observation_sample_ids=[sample.sample_id],
+                evidence_observation_event_ids=[observation_event_id],
+            )
+        ],
+        primary_label="补给区",
+        human_aliases=["dock"],
+        review_status=SceneSpaceReviewStatus.AUTO_LABELED,
+        linked_anchor_ids=[build_anchor_id("region", timestamp, "deadbeef")],
+        linked_object_instance_ids=[build_instance_id("charger", timestamp, "deadbeef")],
+        linked_topology_node_ids=["dock_node"],
+        linked_semantic_region_ids=["dock_zone"],
+        linked_observation_event_ids=[observation_event_id],
+    )
+
+    restored = SceneSpace.model_validate_json(scene_space.model_dump_json())
+    payload_filter = MemoryPayloadFilter(
+        record_kinds=[MemoryRecordKind.SCENE_SPACE],
+        scene_space_ids=[scene_space_id],
+        review_statuses=[SceneSpaceReviewStatus.AUTO_LABELED],
+    )
+
+    assert restored.scene_space_id == scene_space_id
+    assert restored.model_summary is not None
+    assert restored.model_summary.metadata["fallback_reason"] == "provider_not_available"
+    assert restored.candidate_labels[0].evidence_observation_sample_ids == [sample.sample_id]
+    assert restored.human_aliases == ["dock"]
+    assert payload_filter.record_kinds == [MemoryRecordKind.SCENE_SPACE]
+    assert payload_filter.review_statuses == [SceneSpaceReviewStatus.AUTO_LABELED]

@@ -34,6 +34,9 @@ from contracts.spatial_memory import (
     InstanceLifecycleState,
     NavigationCandidate,
     ObservationEvent,
+    SceneObservationSample,
+    SceneSpace,
+    SceneSpaceReviewStatus,
     SemanticInstance,
     SpatialAnchor,
     SpatialAnchorKind,
@@ -48,6 +51,8 @@ from services.memory.grounding_query_planner import GroundingQueryPlanner
 from services.memory.instance_association_service import AssociationOutcome, InstanceAssociationService
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.repository import MemoryRepository
+from services.memory.scene_space_sampler import SceneSpaceSampler
+from services.memory.scene_space_understanding import SceneSpaceUnderstandingAdapter
 from services.memory.semantic_map_builder import SemanticMapBuildResult, SemanticMapBuilder
 from services.memory.vector_store import (
     EPISODIC_OBSERVATIONS_COLLECTION,
@@ -81,6 +86,7 @@ LOGGER = logging.getLogger(__name__)
 MEMORY_LIBRARY_METADATA_KEY = "memory_library_name"
 LEGACY_MEMORY_LIBRARY_NAME = "legacy_default"
 MEMORY_DISABLED_MESSAGE = "记忆库功能尚未启用，请先调用 `enable_memory_library`。"
+SCENE_SPACES_COLLECTION = "scene_spaces"
 
 
 @dataclass
@@ -93,6 +99,7 @@ class _ScoredCandidate:
     semantic_memory: Optional[SemanticMemoryEntry]
     semantic_instance: Optional[SemanticInstance]
     observation_event: Optional[ObservationEvent]
+    scene_space: Optional[SceneSpace]
     text_recall_score: float
     lexical_score: float
     lexical_reason: str
@@ -113,6 +120,7 @@ class _MemoryLibraryStats:
     semantic_memory_count: int = 0
     semantic_instance_count: int = 0
     observation_event_count: int = 0
+    scene_space_count: int = 0
     last_updated_at: Optional[datetime] = None
 
 
@@ -192,6 +200,8 @@ class MemoryService:
         self._semantic_map_builder = SemanticMapBuilder(
             inspection_pose_planner=self._inspection_pose_planner,
         )
+        self._scene_space_sampler = SceneSpaceSampler()
+        self._scene_space_understanding_adapter = SceneSpaceUnderstandingAdapter()
         self._vision_projection_service = VisionToMapProjectionService()
         self._instance_association_service = InstanceAssociationService(
             text_embedder=self._text_embedder,
@@ -203,6 +213,7 @@ class MemoryService:
         self._semantic_entries_by_id: Dict[str, SemanticMemoryEntry] = {}
         self._semantic_instances_by_id: Dict[str, SemanticInstance] = {}
         self._observation_events_by_id: Dict[str, ObservationEvent] = {}
+        self._scene_spaces_by_id: Dict[str, SceneSpace] = {}
         self._latest_semantic_map_context = SemanticMapBuildResult(
             map_version_id=None,
             frame_id="map",
@@ -210,10 +221,12 @@ class MemoryService:
             anchors_by_id={},
             topology_nodes_by_id={},
         )
+        self._latest_semantic_map_context_localization_session_id: Optional[str] = None
         self._tagged_location_history: Deque[TaggedLocation] = deque(maxlen=max(1, history_limit))
         self._semantic_history: Deque[SemanticMemoryEntry] = deque(maxlen=max(1, history_limit))
         self._semantic_instance_history: Deque[SemanticInstance] = deque(maxlen=max(1, history_limit))
         self._observation_event_history: Deque[ObservationEvent] = deque(maxlen=max(1, history_limit))
+        self._scene_space_history: Deque[SceneSpace] = deque(maxlen=max(1, history_limit))
 
     def is_enabled(self) -> bool:
         """返回记忆库当前是否已启用。"""
@@ -412,6 +425,7 @@ class MemoryService:
                 semantic_memory_count=current.semantic_memory_count + (1 if record_kind == "semantic_memory" else 0),
                 semantic_instance_count=current.semantic_instance_count + (1 if record_kind == "semantic_instance" else 0),
                 observation_event_count=current.observation_event_count + (1 if record_kind == "observation_event" else 0),
+                scene_space_count=current.scene_space_count + (1 if record_kind == "scene_space" else 0),
                 last_updated_at=updated_at,
             )
 
@@ -439,6 +453,12 @@ class MemoryService:
                 record_kind="observation_event",
                 timestamp=event.timestamp,
             )
+        for scene_space in self._repository.load_scene_spaces():
+            _touch(
+                self._record_library_name(scene_space),
+                record_kind="scene_space",
+                timestamp=scene_space.semantic_updated_at or scene_space.timestamp,
+            )
 
         libraries: List[Dict[str, object]] = []
         for stats in sorted(stats_by_name.values(), key=lambda item: (item.library_name.lower(), item.library_name)):
@@ -450,6 +470,7 @@ class MemoryService:
                     "semantic_memory_count": stats.semantic_memory_count,
                     "semantic_instance_count": stats.semantic_instance_count,
                     "observation_event_count": stats.observation_event_count,
+                    "scene_space_count": stats.scene_space_count,
                     "last_updated_at": stats.last_updated_at.isoformat() if stats.last_updated_at is not None else None,
                 }
             )
@@ -488,10 +509,12 @@ class MemoryService:
         self._semantic_entries_by_id.clear()
         self._semantic_instances_by_id.clear()
         self._observation_events_by_id.clear()
+        self._scene_spaces_by_id.clear()
         self._tagged_location_history.clear()
         self._semantic_history.clear()
         self._semantic_instance_history.clear()
         self._observation_event_history.clear()
+        self._scene_space_history.clear()
         self._latest_semantic_map_context = SemanticMapBuildResult(
             map_version_id=None,
             frame_id="map",
@@ -499,6 +522,7 @@ class MemoryService:
             anchors_by_id={},
             topology_nodes_by_id={},
         )
+        self._latest_semantic_map_context_localization_session_id = None
         self._vector_store.clear_all()
 
     def _attach_library_metadata(self, metadata: Optional[Dict[str, object]]) -> Dict[str, object]:
@@ -520,6 +544,7 @@ class MemoryService:
         semantic_memories = [item for item in self._repository.load_semantic_memories() if self._record_library_name(item) == library_name]
         semantic_instances = [item for item in self._repository.load_semantic_instances() if self._record_library_name(item) == library_name]
         observation_events = [item for item in self._repository.load_observation_events() if self._record_library_name(item) == library_name]
+        scene_spaces = [item for item in self._repository.load_scene_spaces() if self._record_library_name(item) == library_name]
 
         artifact_ids = set()
         for item in semantic_memories:
@@ -533,11 +558,13 @@ class MemoryService:
         self._repository.delete_semantic_memories([item.memory_id for item in semantic_memories])
         self._repository.delete_semantic_instances([item.instance_id for item in semantic_instances])
         self._repository.delete_observation_events([item.event_id for item in observation_events])
+        self._repository.delete_scene_spaces([item.scene_space_id for item in scene_spaces])
         self._vector_store.delete_points(
             [item.location_id for item in tagged_locations]
             + [item.memory_id for item in semantic_memories]
             + [item.instance_id for item in semantic_instances]
             + [item.event_id for item in observation_events]
+            + [item.scene_space_id for item in scene_spaces]
         )
         if self._artifact_store is not None:
             for artifact_id in sorted(artifact_ids):
@@ -550,6 +577,7 @@ class MemoryService:
             "semantic_memory_count": len(semantic_memories),
             "semantic_instance_count": len(semantic_instances),
             "observation_event_count": len(observation_events),
+            "scene_space_count": len(scene_spaces),
             "artifact_count": len(artifact_ids),
         }
 
@@ -1094,6 +1122,8 @@ class MemoryService:
             map_version_id=effective_map_version_id,
             localization_session_id=effective_localization_session_id,
         )
+        if MemoryRecordKind.SCENE_SPACE not in payload_filter.record_kinds:
+            payload_filter.record_kinds.append(MemoryRecordKind.SCENE_SPACE)
         if max_age_sec is not None:
             payload_filter.max_age_sec = max_age_sec
         if current_pose is not None:
@@ -1111,6 +1141,7 @@ class MemoryService:
                     MemoryRecordKind.TAGGED_LOCATION,
                     MemoryRecordKind.OBJECT_INSTANCE,
                     MemoryRecordKind.OBSERVATION_EVENT,
+                    MemoryRecordKind.SCENE_SPACE,
                     MemoryRecordKind.SCENE,
                     MemoryRecordKind.NOTE,
                 ),
@@ -1214,6 +1245,25 @@ class MemoryService:
 
         semantic_context = self.get_navigation_semantic_context(map_name=map_name)
         normalized_target = self._normalize_text(target_name)
+        for scene_space in semantic_context.scene_spaces:
+            candidate_labels = self._scene_space_label_texts(scene_space)
+            candidates = {self._normalize_text(item) for item in candidate_labels if self._normalize_text(item)}
+            if normalized_target not in candidates:
+                continue
+            target_pose = self._scene_space_navigation_pose(scene_space)
+            if target_pose is None:
+                raise GatewayError("场景空间 %s 没有可导航的巡检或入口位姿。" % target_name)
+            return NavigationGoal(
+                goal_id="nav_scene_space_%s" % self._normalize_text(target_name),
+                target_pose=target_pose,
+                target_name=target_name,
+                metadata={
+                    "resolved_scene_space_id": scene_space.scene_space_id,
+                    "map_version_id": semantic_context.map_version_id,
+                    "localization_session_id": semantic_context.localization_session_id,
+                    "source": "platform_navigation_scene_space",
+                },
+            )
         for region in semantic_context.semantic_regions:
             aliases = [*region.aliases, str(region.attributes.get("alias", "") or "")]
             candidates = {
@@ -1223,9 +1273,14 @@ class MemoryService:
             }
             if normalized_target not in candidates:
                 continue
-            target_pose = region.inspection_poses[0] if region.inspection_poses else region.centroid
+            target_pose = region.inspection_poses[0] if region.inspection_poses else None
             if target_pose is None:
-                raise GatewayError("语义区域 %s 没有可导航的中心位姿。" % target_name)
+                for scene_space in semantic_context.scene_spaces:
+                    if region.region_id in scene_space.linked_semantic_region_ids:
+                        target_pose = self._scene_space_navigation_pose(scene_space)
+                        break
+            if target_pose is None:
+                raise GatewayError("语义区域 %s 没有可导航的巡检或入口位姿。" % target_name)
             return NavigationGoal(
                 goal_id="nav_semantic_%s" % self._normalize_text(target_name),
                 target_pose=target_pose,
@@ -1474,6 +1529,7 @@ class MemoryService:
                 "named_vector_counts": vector_counts,
                 "semantic_instance_count": len(self._semantic_instances_by_id),
                 "observation_event_count": len(self._observation_events_by_id),
+                "scene_space_count": len(self._scene_spaces_by_id),
             },
         )
 
@@ -1507,6 +1563,7 @@ class MemoryService:
             localization_session_id=localization_session_id,
             localization_ready=localization_ready,
             semantic_regions=[item.model_copy(deep=True) for item in map_context.semantic_regions],
+            scene_spaces=[item.model_copy(deep=True) for item in map_context.scene_spaces],
             topology_nodes=self._build_topology_node_summaries(map_context),
             anchors=[
                 *[item.model_copy(deep=True) for item in map_context.anchors_by_id.values()],
@@ -1516,6 +1573,9 @@ class MemoryService:
                 "active_library_name": self._active_library_name,
                 "frame_id": map_context.frame_id,
                 "semantic_region_count": len(map_context.semantic_regions),
+                "scene_space_count": len(map_context.scene_spaces),
+                "scene_space_candidates": [self._scene_space_context_summary(item) for item in map_context.scene_spaces[:12]],
+                "scene_space_evidence_summary": self._summarize_scene_space_evidence(map_context.scene_spaces),
                 "topology_node_count": len(map_context.topology_nodes_by_id),
                 "anchor_count": len(map_context.anchors_by_id) + len(dynamic_anchors),
                 "localization_session_status": active_session.status.value if active_session is not None else None,
@@ -1614,6 +1674,188 @@ class MemoryService:
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
+
+    def list_scene_spaces(
+        self,
+        *,
+        limit: Optional[int] = None,
+        payload_filter: Optional[MemoryPayloadFilter] = None,
+        scene_space_ids: Optional[List[str]] = None,
+        map_version_id: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
+        review_statuses: Optional[List[Union[SceneSpaceReviewStatus, str]]] = None,
+    ) -> Tuple[SceneSpace, ...]:
+        """列出当前记忆库内的场景空间。"""
+
+        active_library = self._require_memory_enabled()
+        if payload_filter is None:
+            spaces = self._repository.list_scene_spaces(
+                scene_space_ids=scene_space_ids,
+                map_version_id=map_version_id,
+                localization_session_id=localization_session_id,
+                review_statuses=review_statuses,
+                limit=limit,
+            )
+        else:
+            resolved_filter = payload_filter.model_copy(deep=True)
+            if scene_space_ids is not None:
+                resolved_filter.scene_space_ids = list(scene_space_ids)
+            if map_version_id is not None:
+                resolved_filter.map_version_id = map_version_id
+            if localization_session_id is not None:
+                resolved_filter.localization_session_id = localization_session_id
+            if review_statuses is not None:
+                resolved_filter.review_statuses = [
+                    item if isinstance(item, SceneSpaceReviewStatus) else SceneSpaceReviewStatus(str(item))
+                    for item in review_statuses
+                ]
+            resolved_filter.record_kinds = [MemoryRecordKind.SCENE_SPACE]
+            spaces = self._repository.query_scene_spaces(resolved_filter, limit=limit)
+        visible_spaces = [space for space in spaces if self._record_library_name(space) == active_library]
+        for space in visible_spaces:
+            self._cache_scene_space(space)
+        return tuple(visible_spaces)
+
+    def query_scene_spaces(
+        self,
+        query: str = "",
+        *,
+        similarity_threshold: float = 0.25,
+        limit: int = 5,
+        payload_filter: Optional[MemoryPayloadFilter] = None,
+        max_age_sec: Optional[float] = None,
+        near_pose: Optional[Pose] = None,
+        max_distance_m: Optional[float] = None,
+        grounding_plan: Optional[GroundingQueryPlan] = None,
+        include_non_direct_navigation_candidates: bool = False,
+    ) -> MemoryQueryResult:
+        """查询场景空间。"""
+
+        self._require_memory_enabled()
+        resolved_filter = self._merge_payload_filter(
+            payload_filter,
+            record_kinds=[MemoryRecordKind.SCENE_SPACE],
+            max_age_sec=max_age_sec,
+            near_pose=near_pose,
+            max_distance_m=max_distance_m,
+        )
+        if str(query or "").strip():
+            return self._query_records(
+                query,
+                allowed_record_kinds=(MemoryRecordKind.SCENE_SPACE,),
+                similarity_threshold=similarity_threshold,
+                limit=limit,
+                payload_filter=resolved_filter,
+                grounding_plan=grounding_plan,
+                include_non_direct_navigation_candidates=include_non_direct_navigation_candidates,
+            )
+        spaces = [
+            space
+            for space in self._repository.query_scene_spaces(resolved_filter, limit=limit)
+            if self._record_library_name(space) == self._active_library_name
+        ]
+        current_pose = self._get_current_pose()
+        matches = [
+            self._build_scene_space_filter_match(space, current_pose=current_pose)
+            for space in spaces[: max(1, int(limit))]
+        ]
+        return MemoryQueryResult(
+            query=query,
+            similarity_threshold=similarity_threshold,
+            matches=matches,
+            metadata={
+                "query_text_preview": self._preview_text(query),
+                "query_scope": "scene_space",
+                "match_limit": max(1, int(limit)),
+                "candidate_count": len(spaces),
+                "returned_candidate_count": len(matches),
+                "fallback_used": False,
+                "fallback_reason": "",
+                "retrieval_mode": "scene_space_filter",
+                "filters": resolved_filter.model_dump(mode="json"),
+            },
+        )
+
+    def upsert_scene_space(self, scene_space: Union[SceneSpace, Dict[str, object]]) -> SceneSpace:
+        """写入或更新场景空间。"""
+
+        self._require_memory_enabled()
+        space = scene_space if isinstance(scene_space, SceneSpace) else SceneSpace.model_validate(scene_space)
+        return self._upsert_scene_space(space)
+
+    def review_scene_space(
+        self,
+        scene_space_id: str,
+        *,
+        primary_label: Optional[str] = None,
+        human_aliases: Optional[List[str]] = None,
+        review_status: Optional[Union[SceneSpaceReviewStatus, str]] = None,
+        attributes: Optional[Dict[str, object]] = None,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> SceneSpace:
+        """审核或纠偏场景空间。"""
+
+        active_library = self._require_memory_enabled()
+        resolved_id = str(scene_space_id or "").strip()
+        if not resolved_id:
+            raise GatewayError(
+                "场景空间标识不能为空。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        current = self._scene_spaces_by_id.get(resolved_id) or self._repository.load_scene_space(resolved_id)
+        if current is None or self._record_library_name(current) != active_library:
+            raise GatewayError("未找到场景空间：%s" % resolved_id, error_code="scene_space_not_found", http_status=404)
+        updates: Dict[str, object] = {
+            "semantic_updated_at": utc_now(),
+            "metadata": self._attach_library_metadata({**dict(current.metadata), **dict(metadata or {})}),
+        }
+        if primary_label is not None:
+            updates["primary_label"] = str(primary_label or "").strip() or None
+        if human_aliases is not None:
+            updates["human_aliases"] = self._normalize_aliases(human_aliases)
+        if review_status is not None:
+            try:
+                updates["review_status"] = (
+                    review_status
+                    if isinstance(review_status, SceneSpaceReviewStatus)
+                    else SceneSpaceReviewStatus(str(review_status))
+                )
+            except ValueError as exc:
+                raise GatewayError(
+                    "未知场景空间审核状态：%s" % review_status,
+                    error_code="invalid_scene_space_review_status",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                ) from exc
+        if attributes is not None:
+            updates["attributes"] = {**dict(current.attributes), **dict(attributes)}
+        return self._upsert_scene_space(current.model_copy(update=updates, deep=True))
+
+    def delete_scene_spaces(self, scene_space_ids: List[str]) -> int:
+        """删除当前记忆库内的场景空间。"""
+
+        active_library = self._require_memory_enabled()
+        normalized_ids = [str(item).strip() for item in scene_space_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        allowed_ids: List[str] = []
+        for scene_space_id in normalized_ids:
+            space = self._scene_spaces_by_id.get(scene_space_id) or self._repository.load_scene_space(scene_space_id)
+            if space is not None and self._record_library_name(space) == active_library:
+                allowed_ids.append(scene_space_id)
+        if not allowed_ids:
+            return 0
+        deleted = self._repository.delete_scene_spaces(allowed_ids)
+        self._vector_store.delete_points(allowed_ids)
+        for scene_space_id in allowed_ids:
+            self._scene_spaces_by_id.pop(scene_space_id, None)
+        self._scene_space_history = deque(
+            [space for space in self._scene_space_history if space.scene_space_id not in set(allowed_ids)],
+            maxlen=self._scene_space_history.maxlen,
+        )
+        return deleted
 
     def _create_scene_memory_entry(
         self,
@@ -1846,7 +2088,14 @@ class MemoryService:
         semantic_memory = self._semantic_entries_by_id.get(point.point_id)
         semantic_instance = self._semantic_instances_by_id.get(point.point_id)
         observation_event = self._observation_events_by_id.get(point.point_id)
-        if tagged_location is None and semantic_memory is None and semantic_instance is None and observation_event is None:
+        scene_space = self._scene_spaces_by_id.get(point.point_id)
+        if (
+            tagged_location is None
+            and semantic_memory is None
+            and semantic_instance is None
+            and observation_event is None
+            and scene_space is None
+        ):
             return None
         if tagged_location is not None:
             record_kind = MemoryRecordKind.TAGGED_LOCATION
@@ -1863,6 +2112,11 @@ class MemoryService:
             lexical_score, lexical_reason = self._score_observation_event(normalized_query, observation_event)
             location_or_memory_pose = observation_event.pose
             timestamp = observation_event.timestamp
+        elif scene_space is not None:
+            record_kind = MemoryRecordKind.SCENE_SPACE
+            lexical_score, lexical_reason = self._score_scene_space(normalized_query, scene_space)
+            location_or_memory_pose = self._scene_space_navigation_pose(scene_space)
+            timestamp = scene_space.semantic_updated_at or scene_space.timestamp
         else:
             assert semantic_memory is not None
             record_kind = semantic_memory.kind
@@ -1901,6 +2155,7 @@ class MemoryService:
             semantic_memory=semantic_memory,
             semantic_instance=semantic_instance,
             observation_event=observation_event,
+            scene_space=scene_space,
             text_recall_score=text_recall_score,
             lexical_score=lexical_score,
             lexical_reason=lexical_reason,
@@ -1955,6 +2210,8 @@ class MemoryService:
                 candidate.observation_event.topo_node_id or "",
                 *candidate.observation_event.visual_labels,
             )
+        if candidate.scene_space is not None:
+            return (MemoryRecordKind.SCENE_SPACE.value, candidate.scene_space.scene_space_id)
         return (candidate.record_kind.value, candidate.point.point_id)
 
     def _coerce_optional_float(self, value: object, fallback_value: object = None) -> Optional[float]:
@@ -2109,6 +2366,8 @@ class MemoryService:
             add_reason("projection_confidence_low")
         if projection_method and support_point_count is not None and support_point_count <= 0:
             add_reason("projection_geometry_missing")
+        if self._coerce_optional_bool(metadata.get("navigable")) is False:
+            add_reason(str(metadata.get("non_navigable_reason") or "not_navigable"))
 
         segmentation_reason_codes = self._navigation_quality_reason_codes_from_segmentation(segmentation_summary)
         for code in segmentation_reason_codes:
@@ -2276,6 +2535,8 @@ class MemoryService:
             "projection_degraded": "投影质量已降级。",
             "segmentation_review_required": "分割证据需要复核。",
             "segmentation_quality_low": "分割质量信号偏低。",
+            "missing_inspection_or_entry_pose": "场景空间缺少可达巡检或入口位姿。",
+            "not_navigable": "候选不可直接导航。",
             "segmentation_support_missing": "分割支撑点缺失。",
             "segmentation_coverage_low": "分割覆盖率偏低。",
             "segmentation_depth_coverage_low": "深度覆盖率偏低。",
@@ -2474,6 +2735,61 @@ class MemoryService:
             metadata.setdefault("segmentation_truncation_flags", list(segmentation.truncation_flags))
         return metadata
 
+    def _build_scene_space_filter_match(self, scene_space: SceneSpace, *, current_pose: Optional[Pose]) -> MemoryQueryMatch:
+        navigation_pose = self._scene_space_navigation_pose(scene_space)
+        navigation_candidate = None
+        navigation_metadata = self._evaluate_navigation_metadata(
+            {**dict(scene_space.metadata), **self._build_scene_space_payload(scene_space)},
+            backend_name=str(scene_space.metadata.get("backend") or "memory_service.scene_space"),
+            candidate_score=1.0,
+            map_version_id=scene_space.map_version_id,
+            localization_session_id=scene_space.localization_session_id
+            or str(scene_space.metadata.get("localization_session_id") or "")
+            or None,
+        )
+        if navigation_pose is not None and navigation_metadata["navigable"]:
+            navigation_candidate = self._build_navigation_candidate(
+                self._build_scene_space_search_text(scene_space),
+                record_kind=MemoryRecordKind.SCENE_SPACE,
+                record_id=scene_space.scene_space_id,
+                anchor_id=scene_space.linked_anchor_ids[0] if scene_space.linked_anchor_ids else None,
+                inspection_pose=navigation_pose,
+                anchor_pose=scene_space.boundary.centroid if scene_space.boundary is not None else navigation_pose,
+                target_name=scene_space.primary_label or scene_space.scene_space_id,
+                linked_location_id=None,
+                map_version_id=scene_space.map_version_id,
+                topo_node_id=scene_space.linked_topology_node_ids[0] if scene_space.linked_topology_node_ids else None,
+                semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None,
+                artifact_ids=self._scene_space_artifact_ids(scene_space),
+                current_pose=current_pose,
+                verification_memory_id=None,
+                verification_text=self._build_scene_space_search_text(scene_space),
+                camera_id=self._scene_space_camera_ids(scene_space)[0] if self._scene_space_camera_ids(scene_space) else None,
+                localization_session_id=scene_space.localization_session_id
+                or str(scene_space.metadata.get("localization_session_id") or "")
+                or None,
+                source_metadata={**dict(scene_space.metadata), **self._build_scene_space_payload(scene_space)},
+                backend_name=str(scene_space.metadata.get("backend") or "memory_service.scene_space"),
+                candidate_score=1.0,
+                navigation_metadata=navigation_metadata,
+            )
+        _, distance_m = self._compute_spatial_score(current_pose, navigation_pose)
+        return MemoryQueryMatch(
+            record_kind=MemoryRecordKind.SCENE_SPACE,
+            record_id=scene_space.scene_space_id,
+            score=1.0,
+            reason="按场景空间过滤条件命中。",
+            scene_space=scene_space,
+            navigation_candidate=navigation_candidate,
+            metadata={
+                "retrieval_mode": "scene_space_filter",
+                "distance_m": round(distance_m, 4) if distance_m is not None else None,
+                "review_status": scene_space.review_status.value,
+                "scene_space_evidence": self._scene_space_evidence_summary(scene_space),
+                **navigation_metadata,
+            },
+        )
+
     def _build_query_match(
         self,
         query: str,
@@ -2670,6 +2986,45 @@ class MemoryService:
                     candidate_score=candidate.final_score,
                     navigation_metadata=navigation_metadata,
                 )
+        elif candidate.scene_space is not None:
+            navigation_pose = self._scene_space_navigation_pose(candidate.scene_space)
+            if navigation_pose is not None:
+                source_metadata = {**dict(candidate.scene_space.metadata), **dict(candidate.point.payload)}
+                backend_name = str(candidate.scene_space.metadata.get("backend") or "memory_service.scene_space")
+                navigation_metadata = self._evaluate_navigation_metadata(
+                    source_metadata,
+                    backend_name=backend_name,
+                    candidate_score=candidate.final_score,
+                    grounding_plan=grounding_plan,
+                    map_version_id=candidate.scene_space.map_version_id,
+                    expected_map_version_id=expected_map_version_id,
+                    localization_session_id=candidate_localization_session_id,
+                    expected_localization_session_id=expected_localization_session_id,
+                )
+                if navigation_metadata["navigable"] or include_non_direct_navigation_candidate:
+                    navigation_candidate = self._build_navigation_candidate(
+                        query,
+                        record_kind=MemoryRecordKind.SCENE_SPACE,
+                        record_id=candidate.scene_space.scene_space_id,
+                        anchor_id=candidate.scene_space.linked_anchor_ids[0] if candidate.scene_space.linked_anchor_ids else None,
+                        inspection_pose=navigation_pose,
+                        anchor_pose=candidate.scene_space.boundary.centroid if candidate.scene_space.boundary is not None else navigation_pose,
+                        target_name=candidate.scene_space.primary_label or candidate.scene_space.scene_space_id,
+                        linked_location_id=None,
+                        map_version_id=candidate.scene_space.map_version_id,
+                        topo_node_id=candidate.scene_space.linked_topology_node_ids[0] if candidate.scene_space.linked_topology_node_ids else None,
+                        semantic_region_id=candidate.scene_space.linked_semantic_region_ids[0] if candidate.scene_space.linked_semantic_region_ids else None,
+                        artifact_ids=self._scene_space_artifact_ids(candidate.scene_space),
+                        current_pose=current_pose,
+                        verification_memory_id=None,
+                        verification_text=self._build_scene_space_search_text(candidate.scene_space) or query,
+                        camera_id=self._scene_space_camera_ids(candidate.scene_space)[0] if self._scene_space_camera_ids(candidate.scene_space) else None,
+                        localization_session_id=candidate_localization_session_id,
+                        source_metadata=source_metadata,
+                        backend_name=backend_name,
+                        candidate_score=candidate.final_score,
+                        navigation_metadata=navigation_metadata,
+                    )
 
         reason = self._build_match_reason(candidate)
         return MemoryQueryMatch(
@@ -2681,6 +3036,7 @@ class MemoryService:
             semantic_memory=candidate.semantic_memory,
             semantic_instance=candidate.semantic_instance,
             observation_event=candidate.observation_event,
+            scene_space=candidate.scene_space,
             navigation_candidate=navigation_candidate,
             metadata={
                 "retrieval_mode": "text_recall_then_filter_then_multimodal_rerank",
@@ -2760,6 +3116,8 @@ class MemoryService:
                 "camera_id": camera_id or "",
                 "record_kind": record_kind.value,
                 "linked_location_id": linked_location_id or "",
+                "scene_space_id": str((source_metadata or {}).get("scene_space_id") or ""),
+                "linked_object_instance_ids": list((source_metadata or {}).get("linked_instance_ids") or []),
                 "verification_memory_id": verification_memory_id or "",
                 "map_name": str(platform_binding.get("map_name") or "") or "",
                 "map_version_id": str(map_version_id or "") or "",
@@ -2819,6 +3177,9 @@ class MemoryService:
         persisted_events = [
             item for item in self._repository.load_observation_events() if self._record_library_name(item) == target_library
         ]
+        persisted_scene_spaces = [
+            item for item in self._repository.load_scene_spaces() if self._record_library_name(item) == target_library
+        ]
 
         for location in persisted_locations:
             self._tagged_locations_by_id[location.location_id] = location
@@ -2840,6 +3201,9 @@ class MemoryService:
             self._observation_event_history.append(event)
             self._write_observation_event_state(event)
 
+        for scene_space in persisted_scene_spaces:
+            self._cache_scene_space(scene_space)
+
         for location in persisted_locations:
             self._safe_upsert_persisted_vector(
                 record_id=location.location_id,
@@ -2859,6 +3223,11 @@ class MemoryService:
             self._safe_upsert_persisted_vector(
                 record_id=event.event_id,
                 action=lambda current=event: self._upsert_vector_point_for_observation_event(current),
+            )
+        for scene_space in persisted_scene_spaces:
+            self._safe_upsert_persisted_vector(
+                record_id=scene_space.scene_space_id,
+                action=lambda current=scene_space: self._upsert_vector_point_for_scene_space(current),
             )
 
     def _safe_upsert_persisted_vector(self, *, record_id: str, action) -> None:
@@ -2933,6 +3302,22 @@ class MemoryService:
             payload=payload,
             vectors=vectors,
             updated_at=event.timestamp.isoformat(),
+        )
+
+    def _upsert_vector_point_for_scene_space(self, scene_space: SceneSpace) -> None:
+        payload = self._build_scene_space_payload(scene_space)
+        image_bytes = self._load_primary_image_bytes(self._scene_space_artifact_ids(scene_space))
+        vectors = self._build_named_vectors(
+            retrieval_text=str(payload["retrieval_text"]),
+            image_bytes=image_bytes,
+        )
+        self._vector_store.upsert_point(
+            point_id=scene_space.scene_space_id,
+            collection_name=SCENE_SPACES_COLLECTION,
+            record_kind=MemoryRecordKind.SCENE_SPACE.value,
+            payload=payload,
+            vectors=vectors,
+            updated_at=(scene_space.semantic_updated_at or scene_space.timestamp).isoformat(),
         )
 
     def _build_named_vectors(
@@ -3144,6 +3529,198 @@ class MemoryService:
             "verification_text": event.summary or event.title,
         }
 
+    def _build_scene_space_payload(self, scene_space: SceneSpace) -> Dict[str, object]:
+        navigation_pose = self._scene_space_navigation_pose(scene_space)
+        anchor_id = scene_space.linked_anchor_ids[0] if scene_space.linked_anchor_ids else None
+        topo_node_id = scene_space.linked_topology_node_ids[0] if scene_space.linked_topology_node_ids else None
+        semantic_region_id = scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None
+        evidence = self._scene_space_evidence_summary(scene_space)
+        retrieval_text = self._build_scene_space_search_text(scene_space)
+        is_navigable = navigation_pose is not None
+        return {
+            "record_id": scene_space.scene_space_id,
+            "record_kind": MemoryRecordKind.SCENE_SPACE.value,
+            "name": scene_space.primary_label or scene_space.scene_space_id,
+            "primary_label": scene_space.primary_label or "",
+            "aliases": list(scene_space.human_aliases),
+            "map_version_id": scene_space.map_version_id,
+            "localization_session_id": scene_space.localization_session_id or str(scene_space.metadata.get("localization_session_id", "") or "") or None,
+            "topo_node_id": topo_node_id,
+            "semantic_region_id": semantic_region_id,
+            "anchor_id": anchor_id,
+            "scene_space_id": scene_space.scene_space_id,
+            "scene_space_ids": [scene_space.scene_space_id],
+            "review_status": scene_space.review_status.value,
+            "semantic_labels": self._scene_space_semantic_labels(scene_space),
+            "visual_labels": self._scene_space_visual_labels(scene_space),
+            "vision_tags": self._scene_space_vision_tags(scene_space),
+            "camera_id": self._scene_space_camera_ids(scene_space)[0] if self._scene_space_camera_ids(scene_space) else "",
+            "camera_ids": self._scene_space_camera_ids(scene_space),
+            "linked_instance_ids": list(scene_space.linked_object_instance_ids),
+            "linked_observation_event_ids": list(scene_space.linked_observation_event_ids),
+            "timestamp": scene_space.timestamp.isoformat(),
+            "last_seen_ts": (scene_space.semantic_updated_at or scene_space.timestamp).isoformat(),
+            "pose_x": float(navigation_pose.position.x) if navigation_pose is not None else None,
+            "pose_y": float(navigation_pose.position.y) if navigation_pose is not None else None,
+            "pose_z": float(navigation_pose.position.z) if navigation_pose is not None else None,
+            "projection_method": str(scene_space.metadata.get("projection_method") or "scene_space_boundary"),
+            "projection_confidence": scene_space.boundary.confidence if scene_space.boundary is not None else None,
+            "support_point_count": int(evidence.get("observation_sample_count") or 0),
+            "navigable": is_navigable,
+            "non_navigable_reason": "missing_inspection_or_entry_pose" if not is_navigable else "",
+            "navigation_quality": {
+                "level": "direct_navigation" if is_navigable else "not_navigable",
+                "primary_reason_code": "" if is_navigable else "missing_inspection_or_entry_pose",
+                "reason_codes": [] if is_navigable else ["missing_inspection_or_entry_pose"],
+                "recommended_action": "navigate" if is_navigable else "reject",
+            },
+            "backend": str(scene_space.metadata.get("backend") or "memory_service.scene_space"),
+            "backend_type": str(scene_space.metadata.get("backend_type") or "memory_service.scene_space"),
+            "retrieval_text": retrieval_text,
+            "verification_text": retrieval_text,
+            "scene_space_evidence": evidence,
+        }
+
+    def _scene_space_navigation_pose(self, scene_space: SceneSpace) -> Optional[Pose]:
+        if scene_space.inspection_poses:
+            return scene_space.inspection_poses[0]
+        if scene_space.entry_poses:
+            return scene_space.entry_poses[0]
+        return None
+
+    def _scene_space_label_texts(self, scene_space: SceneSpace) -> List[str]:
+        texts: List[str] = [
+            scene_space.scene_space_id,
+            scene_space.primary_label or "",
+            *scene_space.human_aliases,
+            *scene_space.linked_topology_node_ids,
+            *scene_space.linked_semantic_region_ids,
+        ]
+        for candidate_label in scene_space.candidate_labels:
+            texts.extend([candidate_label.label, candidate_label.normalized_label or ""])
+            texts.extend(self._flatten_metadata_strings(candidate_label.attributes))
+            texts.extend(self._flatten_metadata_strings(candidate_label.metadata))
+        if scene_space.model_summary is not None:
+            texts.append(scene_space.model_summary.summary)
+        texts.extend(self._flatten_metadata_strings(scene_space.attributes.get("candidate_labels")))
+        texts.extend(self._flatten_metadata_strings(scene_space.attributes))
+        texts.extend(self._scene_space_visual_labels(scene_space))
+        texts.extend(self._scene_space_vision_tags(scene_space))
+        return self._normalize_aliases(texts)
+
+    def _scene_space_semantic_labels(self, scene_space: SceneSpace) -> List[str]:
+        return self._normalize_tags(self._scene_space_label_texts(scene_space))
+
+    def _scene_space_visual_labels(self, scene_space: SceneSpace) -> List[str]:
+        labels: List[str] = []
+        for sample in scene_space.observation_samples:
+            labels.extend(sample.visual_labels)
+        return self._normalize_tags(labels)
+
+    def _scene_space_vision_tags(self, scene_space: SceneSpace) -> List[str]:
+        tags: List[str] = []
+        for sample in scene_space.observation_samples:
+            tags.extend(sample.vision_tags)
+        if scene_space.model_summary is not None:
+            tags.append(scene_space.model_summary.summary)
+        return self._normalize_tags(tags)
+
+    def _scene_space_camera_ids(self, scene_space: SceneSpace) -> List[str]:
+        return self._normalize_aliases([sample.camera_id or "" for sample in scene_space.observation_samples])
+
+    def _scene_space_artifact_ids(self, scene_space: SceneSpace) -> List[str]:
+        artifact_ids: List[str] = []
+        for sample in scene_space.observation_samples:
+            artifact_ids.extend(sample.artifact_ids)
+        return self._normalize_aliases(artifact_ids)
+
+    def _scene_space_evidence_summary(self, scene_space: SceneSpace) -> Dict[str, object]:
+        candidate_labels = [
+            {
+                "label": item.label,
+                "normalized_label": item.normalized_label or self._normalize_text(item.label),
+                "confidence": round(float(item.confidence), 6),
+                "source_model": item.source_model or "",
+                "evidence_observation_sample_ids": list(item.evidence_observation_sample_ids),
+                "evidence_observation_event_ids": list(item.evidence_observation_event_ids),
+            }
+            for item in scene_space.candidate_labels
+        ]
+        return {
+            "review_status": scene_space.review_status.value,
+            "primary_label": scene_space.primary_label or "",
+            "candidate_labels": candidate_labels,
+            "observation_sample_count": len(scene_space.observation_samples) or len(scene_space.observation_sample_ids),
+            "linked_object_instance_ids": list(scene_space.linked_object_instance_ids),
+            "linked_observation_event_ids": list(scene_space.linked_observation_event_ids),
+            "linked_topology_node_ids": list(scene_space.linked_topology_node_ids),
+            "linked_semantic_region_ids": list(scene_space.linked_semantic_region_ids),
+            "model_summary": scene_space.model_summary.summary if scene_space.model_summary is not None else "",
+            "model_confidence": round(float(scene_space.model_summary.confidence), 6) if scene_space.model_summary is not None else 0.0,
+            "availability": self._scene_space_model_availability(scene_space),
+            "fallback_reason": self._scene_space_model_fallback_reason(scene_space),
+            "model_evidence_observation_sample_ids": (
+                list(scene_space.model_summary.evidence_observation_sample_ids)
+                if scene_space.model_summary is not None
+                else []
+            ),
+            "boundary_confidence": scene_space.boundary.confidence if scene_space.boundary is not None else None,
+        }
+
+    def _scene_space_model_availability(self, scene_space: SceneSpace) -> str:
+        if scene_space.model_summary is not None:
+            metadata = dict(scene_space.model_summary.metadata)
+            provider = metadata.get("provider")
+            if isinstance(provider, dict):
+                return str(metadata.get("availability") or provider.get("availability") or scene_space.metadata.get("availability") or "")
+            return str(metadata.get("availability") or scene_space.metadata.get("availability") or "")
+        return str(scene_space.metadata.get("availability") or "")
+
+    def _scene_space_model_fallback_reason(self, scene_space: SceneSpace) -> str:
+        if scene_space.model_summary is not None:
+            metadata = dict(scene_space.model_summary.metadata)
+            provider = metadata.get("provider")
+            if isinstance(provider, dict):
+                return str(metadata.get("fallback_reason") or provider.get("fallback_reason") or scene_space.metadata.get("fallback_reason") or "")
+            return str(metadata.get("fallback_reason") or scene_space.metadata.get("fallback_reason") or "")
+        return str(scene_space.metadata.get("fallback_reason") or "")
+
+    def _build_scene_space_search_text(self, scene_space: SceneSpace) -> str:
+        evidence = self._scene_space_evidence_summary(scene_space)
+        segments = [
+            " ".join(self._scene_space_label_texts(scene_space)),
+            str(evidence.get("model_summary") or ""),
+            " ".join(self._scene_space_visual_labels(scene_space)),
+            " ".join(self._scene_space_vision_tags(scene_space)),
+            " ".join(scene_space.linked_object_instance_ids),
+            " ".join(scene_space.linked_topology_node_ids),
+            " ".join(scene_space.linked_semantic_region_ids),
+        ]
+        return " ".join(segment for segment in segments if segment).strip()
+
+    def _scene_space_context_summary(self, scene_space: SceneSpace) -> Dict[str, object]:
+        return {
+            "scene_space_id": scene_space.scene_space_id,
+            "primary_label": scene_space.primary_label or "",
+            "candidate_labels": [item.label for item in scene_space.candidate_labels[:5]],
+            "review_status": scene_space.review_status.value,
+            "map_version_id": scene_space.map_version_id,
+            "localization_session_id": scene_space.localization_session_id,
+            "linked_object_instance_ids": list(scene_space.linked_object_instance_ids),
+            "linked_topology_node_ids": list(scene_space.linked_topology_node_ids),
+            "linked_semantic_region_ids": list(scene_space.linked_semantic_region_ids),
+            "evidence_summary": self._scene_space_evidence_summary(scene_space),
+        }
+
+    def _summarize_scene_space_evidence(self, scene_spaces: Iterable[SceneSpace]) -> Dict[str, object]:
+        spaces = list(scene_spaces)
+        return {
+            "scene_space_count": len(spaces),
+            "candidate_label_count": sum(len(item.candidate_labels) for item in spaces),
+            "observation_sample_count": sum(len(item.observation_samples) or len(item.observation_sample_ids) for item in spaces),
+            "linked_object_instance_count": sum(len(item.linked_object_instance_ids) for item in spaces),
+        }
+
     def _build_location_search_text(self, location: TaggedLocation) -> str:
         segments = [
             location.name,
@@ -3224,6 +3801,11 @@ class MemoryService:
                 lexical_score, _ = self._score_observation_event(normalized_query, event)
                 yield event.event_id, lexical_score
             return
+        if record_kind == MemoryRecordKind.SCENE_SPACE:
+            for scene_space in self._scene_spaces_by_id.values():
+                lexical_score, _ = self._score_scene_space(normalized_query, scene_space)
+                yield scene_space.scene_space_id, lexical_score
+            return
         for entry in self._semantic_entries_by_id.values():
             if entry.kind != record_kind:
                 continue
@@ -3291,6 +3873,13 @@ class MemoryService:
             event.topo_node_id or "",
         ]
         return self._score_text_candidates(normalized_query, texts, fallback_reason="与观察事件内容相似。")
+
+    def _score_scene_space(self, normalized_query: str, scene_space: SceneSpace) -> Tuple[float, str]:
+        return self._score_text_candidates(
+            normalized_query,
+            self._scene_space_label_texts(scene_space),
+            fallback_reason="与场景空间标签、摘要或证据相似。",
+        )
 
     def _collect_scene_visual_labels(self, scene_summary) -> List[str]:
         return self._normalize_tags([item.label for item in scene_summary.objects])
@@ -3401,6 +3990,16 @@ class MemoryService:
             )
             base_score = self._clamp_score(max(score, (0.96 * text_recall_score) + 0.02))
             return self._apply_type_prior(base_score, record_kind, query_scope=query_scope)
+        if record_kind == MemoryRecordKind.SCENE_SPACE:
+            score = (
+                (0.35 * lexical_score)
+                + (0.35 * text_recall_score)
+                + (0.05 * image_score)
+                + (0.15 * spatial_score)
+                + (0.10 * recency_score)
+            )
+            base_score = self._clamp_score(max(score, lexical_score * 0.95, text_recall_score * 0.92))
+            return self._apply_type_prior(base_score, record_kind, query_scope=query_scope)
         score = (
             (0.20 * lexical_score)
             + (0.45 * text_recall_score)
@@ -3418,6 +4017,8 @@ class MemoryService:
     def _type_prior(self, record_kind: MemoryRecordKind, *, query_scope: str) -> float:
         normalized_scope = str(query_scope or "mixed").strip() or "mixed"
         if normalized_scope == "place":
+            if record_kind == MemoryRecordKind.SCENE_SPACE:
+                return 1.1
             if record_kind == MemoryRecordKind.TAGGED_LOCATION:
                 return 1.08
             if record_kind == MemoryRecordKind.OBJECT_INSTANCE:
@@ -3434,9 +4035,13 @@ class MemoryService:
                 return 0.93
             if record_kind == MemoryRecordKind.TAGGED_LOCATION:
                 return 0.72
+            if record_kind == MemoryRecordKind.SCENE_SPACE:
+                return 0.72
             if record_kind in {MemoryRecordKind.SCENE, MemoryRecordKind.NOTE}:
                 return 0.76
             return 1.0
+        if record_kind == MemoryRecordKind.SCENE_SPACE:
+            return 0.95
         if record_kind == MemoryRecordKind.OBJECT_INSTANCE:
             return 1.0
         if record_kind == MemoryRecordKind.OBSERVATION_EVENT:
@@ -3483,6 +4088,47 @@ class MemoryService:
         return 0.25
 
     def _point_matches_filter(self, point: VectorPoint, payload_filter: MemoryPayloadFilter) -> bool:
+        record_kinds = {item.value if hasattr(item, "value") else str(item) for item in payload_filter.record_kinds}
+        if record_kinds and point.record_kind not in record_kinds:
+            return False
+        if payload_filter.map_version_id:
+            if str(point.payload.get("map_version_id") or "").strip() != str(payload_filter.map_version_id).strip():
+                return False
+        if payload_filter.localization_session_id:
+            if str(point.payload.get("localization_session_id") or "").strip() != str(payload_filter.localization_session_id).strip():
+                return False
+        if payload_filter.linked_location_id:
+            if str(point.payload.get("linked_location_id") or "").strip() != str(payload_filter.linked_location_id).strip():
+                return False
+        if payload_filter.camera_ids:
+            actual_camera_ids = {str(point.payload.get("camera_id") or "").strip()}
+            actual_camera_ids.update(str(item).strip() for item in (point.payload.get("camera_ids") or []) if str(item).strip())
+            expected_camera_ids = {str(item).strip() for item in payload_filter.camera_ids if str(item).strip()}
+            if expected_camera_ids and not actual_camera_ids.intersection(expected_camera_ids):
+                return False
+        if payload_filter.topo_node_ids:
+            if str(point.payload.get("topo_node_id") or "").strip() not in {str(item).strip() for item in payload_filter.topo_node_ids}:
+                return False
+        if payload_filter.anchor_ids:
+            if str(point.payload.get("anchor_id") or "").strip() not in {str(item).strip() for item in payload_filter.anchor_ids}:
+                return False
+        if payload_filter.scene_space_ids:
+            actual_scene_space_ids = {str(point.payload.get("scene_space_id") or "").strip()}
+            actual_scene_space_ids.update(str(item).strip() for item in (point.payload.get("scene_space_ids") or []) if str(item).strip())
+            expected_scene_space_ids = {str(item).strip() for item in payload_filter.scene_space_ids if str(item).strip()}
+            if expected_scene_space_ids and not actual_scene_space_ids.intersection(expected_scene_space_ids):
+                return False
+        if payload_filter.review_statuses:
+            actual_status = str(point.payload.get("review_status") or "").strip()
+            expected_statuses = {item.value if hasattr(item, "value") else str(item) for item in payload_filter.review_statuses}
+            if actual_status not in expected_statuses:
+                return False
+        if payload_filter.instance_types:
+            if str(point.payload.get("instance_type") or "").strip() not in {str(item).strip() for item in payload_filter.instance_types}:
+                return False
+        if payload_filter.movabilities:
+            if str(point.payload.get("movability") or "").strip() not in {str(item).strip() for item in payload_filter.movabilities}:
+                return False
         shadow_store = self._vector_store
         return shadow_store._payload_matches(point.payload, payload_filter)  # type: ignore[attr-defined]
 
@@ -3513,12 +4159,36 @@ class MemoryService:
         return merged
 
     def _refresh_semantic_map_context(self, map_snapshot) -> SemanticMapBuildResult:
+        active_session = self._localization_service.get_active_session()
+        active_session_id = active_session.session_id if active_session is not None else None
         if map_snapshot is None:
             self._latest_semantic_map_context = self._semantic_map_builder.build(None)
+            self._latest_semantic_map_context_localization_session_id = active_session_id
             return self._latest_semantic_map_context
-        if self._latest_semantic_map_context.map_version_id == map_snapshot.version_id:
+        if (
+            self._latest_semantic_map_context.map_version_id == map_snapshot.version_id
+            and self._latest_semantic_map_context_localization_session_id == active_session_id
+        ):
             return self._latest_semantic_map_context
-        self._latest_semantic_map_context = self._semantic_map_builder.build(map_snapshot)
+        built_context = self._semantic_map_builder.build(map_snapshot)
+        scene_spaces = tuple(self._prepare_built_scene_space(item, active_session_id) for item in built_context.scene_spaces)
+        self._latest_semantic_map_context = SemanticMapBuildResult(
+            map_version_id=built_context.map_version_id,
+            frame_id=built_context.frame_id,
+            semantic_regions=built_context.semantic_regions,
+            anchors_by_id=built_context.anchors_by_id,
+            topology_nodes_by_id=built_context.topology_nodes_by_id,
+            scene_spaces=scene_spaces,
+        )
+        self._latest_semantic_map_context_localization_session_id = active_session_id
+        if self.is_enabled():
+            self._ensure_embedders_initialized()
+            for scene_space in scene_spaces:
+                self._upsert_scene_space(scene_space, publish_event=False)
+        else:
+            for scene_space in scene_spaces:
+                self._cache_scene_space(scene_space)
+                self._write_scene_space_state(scene_space)
         self._state_store.write(
             StateNamespace.MEMORY,
             "semantic_map_context",
@@ -3527,6 +4197,230 @@ class MemoryService:
             metadata={"kind": "semantic_map_context", "map_version_id": map_snapshot.version_id},
         )
         return self._latest_semantic_map_context
+
+    def _prepare_built_scene_space(self, scene_space: SceneSpace, localization_session_id: Optional[str]) -> SceneSpace:
+        existing = self._scene_spaces_by_id.get(scene_space.scene_space_id)
+        same_binding = (
+            existing is not None
+            and existing.map_version_id == scene_space.map_version_id
+            and (existing.localization_session_id or str(existing.metadata.get("localization_session_id") or "") or None)
+            == (localization_session_id or None)
+        )
+        human_aliases = self._normalize_aliases(scene_space.human_aliases)
+        attributes = dict(scene_space.attributes)
+        source_candidate_labels = self._normalize_aliases(attributes.pop("candidate_labels", []) or [])
+        if source_candidate_labels:
+            attributes["boundary_source_labels"] = source_candidate_labels
+        metadata = self._attach_library_metadata(
+            {
+                **dict(scene_space.metadata),
+                "localization_session_id": localization_session_id or "",
+                "source": str(scene_space.metadata.get("source") or scene_space.attributes.get("source") or "semantic_map_builder"),
+            }
+        )
+        prepared = scene_space.model_copy(
+            update={
+                "localization_session_id": localization_session_id,
+                "primary_label": None,
+                "human_aliases": human_aliases,
+                "candidate_labels": [],
+                "attributes": attributes,
+                "metadata": metadata,
+            },
+            deep=True,
+        )
+        if same_binding and existing is not None:
+            prepared = prepared.model_copy(
+                update={
+                    "observation_sample_ids": list(existing.observation_sample_ids),
+                    "observation_samples": list(existing.observation_samples),
+                    "model_summary": existing.model_summary,
+                    "candidate_labels": list(existing.candidate_labels),
+                    "primary_label": existing.primary_label,
+                    "human_aliases": self._normalize_aliases([*prepared.human_aliases, *existing.human_aliases]),
+                    "review_status": existing.review_status,
+                    "semantic_updated_at": existing.semantic_updated_at,
+                    "linked_object_instance_ids": list(existing.linked_object_instance_ids),
+                    "linked_observation_event_ids": list(existing.linked_observation_event_ids),
+                },
+                deep=True,
+            )
+        if prepared.model_summary is not None or prepared.candidate_labels:
+            return prepared
+        return self._apply_scene_space_understanding(
+            prepared,
+            model_output=None,
+            observation_samples=prepared.observation_samples,
+            scene_summaries=(),
+            provider_metadata={"requested_backend": "semantic_map_builder"},
+            availability="unavailable",
+            fallback_reason="no_observation_samples",
+        )
+
+    def _apply_scene_space_understanding(
+        self,
+        scene_space: SceneSpace,
+        *,
+        model_output: Optional[object],
+        observation_samples: Tuple[SceneObservationSample, ...],
+        scene_summaries: Tuple[object, ...],
+        provider_metadata: Optional[Dict[str, object]],
+        availability: str = "available",
+        fallback_reason: str = "",
+    ) -> SceneSpace:
+        if model_output is None:
+            understanding = self._scene_space_understanding_adapter.build_rule_fallback(
+                observation_samples=observation_samples,
+                scene_summaries=scene_summaries,
+                fallback_reason=fallback_reason or "provider_not_available",
+                availability=availability if availability != "available" else "unavailable",
+                provider_metadata=provider_metadata,
+            )
+        else:
+            understanding = self._scene_space_understanding_adapter.normalize(
+                model_output,
+                observation_samples=observation_samples,
+                scene_summaries=scene_summaries,
+                provider_metadata=provider_metadata,
+                availability=availability,
+                fallback_reason=fallback_reason,
+            )
+        locked_statuses = {
+            SceneSpaceReviewStatus.REVIEWED,
+            SceneSpaceReviewStatus.CORRECTED,
+            SceneSpaceReviewStatus.REJECTED,
+        }
+        candidate_labels = list(understanding.candidate_labels)
+        primary_label = scene_space.primary_label
+        review_status = scene_space.review_status
+        if scene_space.review_status not in locked_statuses:
+            primary_label = candidate_labels[0].label if candidate_labels else None
+            review_status = SceneSpaceReviewStatus.AUTO_LABELED if candidate_labels else SceneSpaceReviewStatus.CANDIDATE
+        attributes = dict(scene_space.attributes)
+        attributes["scene_space_understanding"] = {
+            "adapter_version": str(understanding.model_scene_summary.metadata.get("adapter_version") or ""),
+            "evidence_sample_ids": list(understanding.evidence_sample_ids),
+            "candidate_label_count": len(candidate_labels),
+        }
+        metadata = self._attach_library_metadata(
+            {
+                **dict(scene_space.metadata),
+                "availability": understanding.availability,
+                "fallback_reason": understanding.fallback_reason,
+                "scene_space_understanding": {
+                    "availability": understanding.availability,
+                    "fallback_reason": understanding.fallback_reason,
+                    "provider": dict(understanding.provider_metadata),
+                    "evidence_sample_ids": list(understanding.evidence_sample_ids),
+                    "confidence": round(float(understanding.confidence), 6),
+                },
+            }
+        )
+        return scene_space.model_copy(
+            update={
+                "observation_sample_ids": list(understanding.evidence_sample_ids),
+                "observation_samples": list(observation_samples),
+                "model_summary": understanding.model_scene_summary,
+                "candidate_labels": candidate_labels,
+                "primary_label": primary_label,
+                "review_status": review_status,
+                "semantic_updated_at": utc_now(),
+                "attributes": attributes,
+                "metadata": metadata,
+            },
+            deep=True,
+        )
+
+    def _scene_space_understanding_provider_metadata(self, perception_context) -> Dict[str, object]:
+        scene_summary = getattr(perception_context, "scene_summary", None)
+        metadata = dict(getattr(scene_summary, "metadata", {}) or {})
+        provider = metadata.get("scene_provider") or metadata.get("provider")
+        if isinstance(provider, dict):
+            metadata = {**dict(provider), **metadata}
+        metadata.setdefault("backend_name", str(metadata.get("scene_backend") or metadata.get("resolved_backend") or "perception_scene_summary"))
+        metadata.setdefault("provider_name", str(metadata.get("provider_name") or metadata.get("resolved_provider_name") or "perception_scene_summary"))
+        model_name = str(metadata.get("model_name") or metadata.get("cloud_vision_model") or "").strip()
+        if model_name:
+            metadata["model_name"] = model_name
+        return metadata
+
+    def _refresh_scene_spaces_from_observations(
+        self,
+        *,
+        perception_context,
+        observation_events: Tuple[ObservationEvent, ...],
+    ) -> None:
+        scene_summary = getattr(perception_context, "scene_summary", None)
+        if scene_summary is None or not observation_events:
+            return
+        new_event_ids = {event.event_id for event in observation_events}
+        updated_spaces: Dict[str, SceneSpace] = {}
+        provider_metadata = self._scene_space_understanding_provider_metadata(perception_context)
+        availability = str(provider_metadata.get("availability") or "available")
+        fallback_reason = str(provider_metadata.get("fallback_reason") or provider_metadata.get("reason") or "")
+        for scene_space in self._latest_semantic_map_context.scene_spaces:
+            current_space = self._scene_spaces_by_id.get(scene_space.scene_space_id, scene_space)
+            sampling = self._scene_space_sampler.sample(
+                current_space,
+                observation_events=self._observation_events_by_id.values(),
+                semantic_instances=self._semantic_instances_by_id.values(),
+            )
+            if not sampling.samples:
+                continue
+            if not any(sample.observation_event_id in new_event_ids for sample in sampling.samples if sample.observation_event_id):
+                continue
+            updated_space = self._apply_scene_space_understanding(
+                sampling.scene_space,
+                model_output=scene_summary,
+                observation_samples=sampling.samples,
+                scene_summaries=(scene_summary,),
+                provider_metadata=provider_metadata,
+                availability=availability,
+                fallback_reason=fallback_reason,
+            )
+            self._upsert_scene_space(updated_space, publish_event=False)
+            updated_spaces[updated_space.scene_space_id] = updated_space
+        if not updated_spaces:
+            return
+        self._latest_semantic_map_context = SemanticMapBuildResult(
+            map_version_id=self._latest_semantic_map_context.map_version_id,
+            frame_id=self._latest_semantic_map_context.frame_id,
+            semantic_regions=self._latest_semantic_map_context.semantic_regions,
+            anchors_by_id=self._latest_semantic_map_context.anchors_by_id,
+            topology_nodes_by_id=self._latest_semantic_map_context.topology_nodes_by_id,
+            scene_spaces=tuple(
+                updated_spaces.get(space.scene_space_id, space)
+                for space in self._latest_semantic_map_context.scene_spaces
+            ),
+        )
+        self._state_store.write(
+            StateNamespace.MEMORY,
+            "semantic_map_context",
+            self._latest_semantic_map_context,
+            source="memory_service",
+            metadata={"kind": "semantic_map_context", "map_version_id": self._latest_semantic_map_context.map_version_id},
+        )
+
+    def _upsert_scene_space(self, scene_space: SceneSpace, *, publish_event: bool = True) -> SceneSpace:
+        metadata = self._attach_library_metadata(dict(scene_space.metadata))
+        if scene_space.localization_session_id and not metadata.get("localization_session_id"):
+            metadata["localization_session_id"] = scene_space.localization_session_id
+        updated = scene_space.model_copy(update={"metadata": metadata}, deep=True)
+        self._cache_scene_space(updated)
+        self._repository.upsert_scene_space(updated)
+        self._upsert_vector_point_for_scene_space(updated)
+        self._write_scene_space_state(updated)
+        if publish_event:
+            self._publish_memory_event(
+                "memory.scene_space_upserted",
+                "场景空间 %s 已写入。" % (updated.primary_label or updated.scene_space_id),
+                payload={"scene_space_id": updated.scene_space_id, "primary_label": updated.primary_label or ""},
+            )
+        return updated
+
+    def _cache_scene_space(self, scene_space: SceneSpace) -> None:
+        self._scene_spaces_by_id[scene_space.scene_space_id] = scene_space
+        self._scene_space_history.append(scene_space)
 
     def _ingest_spatial_semantic_observation(
         self,
@@ -3654,6 +4548,11 @@ class MemoryService:
             self._repository.upsert_semantic_instance(updated_instance)
             self._upsert_vector_point_for_instance(updated_instance)
 
+        self._refresh_scene_spaces_from_observations(
+            perception_context=perception_context,
+            observation_events=observation_events,
+        )
+
     def _collect_known_grounding_labels(self) -> List[str]:
         labels: List[str] = []
         for location in self._tagged_locations_by_id.values():
@@ -3668,6 +4567,8 @@ class MemoryService:
             labels.extend(instance.semantic_labels)
             labels.extend(instance.visual_labels)
             labels.extend(instance.vision_tags)
+        for scene_space in self._scene_spaces_by_id.values():
+            labels.extend(self._scene_space_label_texts(scene_space))
         return self._normalize_tags(labels)
 
     def _collect_known_grounding_object_labels(self) -> List[str]:
@@ -3684,6 +4585,8 @@ class MemoryService:
             return PLACE_NODES_COLLECTION
         if record_kind == MemoryRecordKind.OBJECT_INSTANCE:
             return OBJECT_INSTANCES_COLLECTION
+        if record_kind == MemoryRecordKind.SCENE_SPACE:
+            return SCENE_SPACES_COLLECTION
         return EPISODIC_OBSERVATIONS_COLLECTION
 
     def _collections_for_record_kinds(
@@ -3946,6 +4849,7 @@ class MemoryService:
             map_version_id=candidate.map_version_id,
             topo_node_id=candidate.topo_node_id,
             semantic_region_id=candidate.semantic_region_id,
+            scene_space_id=str(candidate.metadata.get("scene_space_id") or "") or None,
             distance_m=candidate.distance_m,
             verification_query=candidate.verification_query,
             verification_artifact_id=candidate.verification_artifact_id,
@@ -3963,6 +4867,8 @@ class MemoryService:
                     or "memory_service"
                 ),
                 "source_collection": str(candidate.metadata.get("source_collection") or candidate.source_collection),
+                "scene_space_id": str(candidate.metadata.get("scene_space_id") or ""),
+                "linked_object_instance_ids": list(candidate.metadata.get("linked_object_instance_ids") or []),
                 "candidate_score": candidate.score,
                 "projection_method": str(candidate.metadata.get("projection_method") or ""),
                 "projection_confidence": candidate.metadata.get("projection_confidence"),
@@ -4020,6 +4926,15 @@ class MemoryService:
             event,
             source="memory_service",
             metadata={"kind": "observation_event"},
+        )
+
+    def _write_scene_space_state(self, scene_space: SceneSpace) -> None:
+        self._state_store.write(
+            StateNamespace.MEMORY,
+            "scene_space:%s" % scene_space.scene_space_id,
+            scene_space,
+            source="memory_service",
+            metadata={"kind": "scene_space"},
         )
 
     def _distance_between_poses(self, left: Pose, right: Pose) -> float:

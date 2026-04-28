@@ -7,12 +7,13 @@ import threading
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from contracts.base import utc_now
-from contracts.memory import SemanticMemoryEntry, TaggedLocation
-from contracts.spatial_memory import ObservationEvent, SemanticInstance
+from contracts.memory import MemoryPayloadFilter, SemanticMemoryEntry, TaggedLocation
+from contracts.spatial_memory import ObservationEvent, SceneSpace, SemanticInstance
 
 
 TAGGED_LOCATION_VECTOR_NAMESPACE = "tagged_location"
 SEMANTIC_MEMORY_VECTOR_NAMESPACE = "semantic_memory"
+SCENE_SPACE_VECTOR_NAMESPACE = "scene_space"
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,95 @@ class MemoryRepository:
                 """
             ).fetchall()
         return [ObservationEvent.model_validate_json(str(row["payload_json"])) for row in rows]
+
+    def load_scene_spaces(self) -> List[SceneSpace]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT payload_json
+                FROM scene_spaces
+                ORDER BY updated_at ASC, scene_space_id ASC
+                """
+            ).fetchall()
+        return [SceneSpace.model_validate_json(str(row["payload_json"])) for row in rows]
+
+    def load_scene_space(self, scene_space_id: str) -> Optional[SceneSpace]:
+        resolved_id = str(scene_space_id or "").strip()
+        if not resolved_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT payload_json
+                FROM scene_spaces
+                WHERE scene_space_id = ?
+                """,
+                (resolved_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SceneSpace.model_validate_json(str(row["payload_json"]))
+
+    def list_scene_spaces(
+        self,
+        *,
+        scene_space_ids: Optional[Sequence[str]] = None,
+        map_version_id: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
+        review_statuses: Optional[Sequence[object]] = None,
+        limit: Optional[int] = None,
+    ) -> List[SceneSpace]:
+        where_clauses: List[str] = []
+        params: List[object] = []
+        resolved_ids = [str(item).strip() for item in scene_space_ids or [] if str(item).strip()]
+        if resolved_ids:
+            placeholders = ", ".join("?" for _ in resolved_ids)
+            where_clauses.append(f"scene_space_id IN ({placeholders})")
+            params.extend(resolved_ids)
+        if map_version_id:
+            where_clauses.append("map_version_id = ?")
+            params.append(map_version_id)
+        if localization_session_id:
+            where_clauses.append("localization_session_id = ?")
+            params.append(localization_session_id)
+        resolved_statuses = self._enum_values(review_statuses or [])
+        if resolved_statuses:
+            placeholders = ", ".join("?" for _ in resolved_statuses)
+            where_clauses.append(f"review_status IN ({placeholders})")
+            params.extend(resolved_statuses)
+        query = "SELECT payload_json FROM scene_spaces"
+        if where_clauses:
+            query = f"{query} WHERE {' AND '.join(where_clauses)}"
+        query = f"{query} ORDER BY updated_at DESC, scene_space_id ASC"
+        if limit is not None and limit > 0:
+            query = f"{query} LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [SceneSpace.model_validate_json(str(row["payload_json"])) for row in rows]
+
+    def query_scene_spaces(
+        self,
+        payload_filter: Optional[MemoryPayloadFilter] = None,
+        *,
+        limit: Optional[int] = None,
+    ) -> List[SceneSpace]:
+        if payload_filter is None:
+            return self.list_scene_spaces(limit=limit)
+        if payload_filter.record_kinds:
+            record_kinds = self._enum_values(payload_filter.record_kinds)
+            if SCENE_SPACE_VECTOR_NAMESPACE not in record_kinds:
+                return []
+        spaces = self.list_scene_spaces(
+            scene_space_ids=payload_filter.scene_space_ids,
+            map_version_id=payload_filter.map_version_id,
+            localization_session_id=payload_filter.localization_session_id,
+            review_statuses=payload_filter.review_statuses,
+        )
+        matched = [space for space in spaces if self._scene_space_matches_filter(space, payload_filter)]
+        if limit is not None and limit > 0:
+            return matched[: int(limit)]
+        return matched
 
     def load_vector_records(self, namespace: Optional[str] = None) -> Dict[str, VectorRecord]:
         if namespace is None:
@@ -316,6 +406,52 @@ class MemoryRepository:
             )
             self._conn.commit()
 
+    def upsert_scene_space(self, entry: SceneSpace) -> None:
+        payload_json = entry.model_dump_json()
+        created_at = entry.timestamp.isoformat()
+        semantic_updated_at = entry.semantic_updated_at.isoformat() if entry.semantic_updated_at else None
+        updated_at = semantic_updated_at or created_at
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO scene_spaces (
+                    scene_space_id,
+                    map_version_id,
+                    localization_session_id,
+                    frame_id,
+                    primary_label,
+                    review_status,
+                    payload_json,
+                    created_at,
+                    updated_at,
+                    semantic_updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scene_space_id) DO UPDATE SET
+                    map_version_id = excluded.map_version_id,
+                    localization_session_id = excluded.localization_session_id,
+                    frame_id = excluded.frame_id,
+                    primary_label = excluded.primary_label,
+                    review_status = excluded.review_status,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at,
+                    semantic_updated_at = excluded.semantic_updated_at
+                """,
+                (
+                    entry.scene_space_id,
+                    entry.map_version_id,
+                    entry.localization_session_id,
+                    entry.frame_id,
+                    entry.primary_label,
+                    entry.review_status.value,
+                    payload_json,
+                    created_at,
+                    updated_at,
+                    semantic_updated_at,
+                ),
+            )
+            self._conn.commit()
+
     def delete_tagged_locations(self, location_ids: Sequence[str]) -> int:
         normalized_ids = [str(item).strip() for item in location_ids if str(item).strip()]
         if not normalized_ids:
@@ -380,12 +516,29 @@ class MemoryRepository:
             self._conn.commit()
         return len(normalized_ids)
 
+    def delete_scene_spaces(self, scene_space_ids: Sequence[str]) -> int:
+        normalized_ids = [str(item).strip() for item in scene_space_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM scene_spaces WHERE scene_space_id = ?",
+                [(scene_space_id,) for scene_space_id in normalized_ids],
+            )
+            self._conn.executemany(
+                "DELETE FROM memory_vectors WHERE record_id = ?",
+                [(scene_space_id,) for scene_space_id in normalized_ids],
+            )
+            self._conn.commit()
+        return len(normalized_ids)
+
     def clear_all(self) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM tagged_locations")
             self._conn.execute("DELETE FROM semantic_memories")
             self._conn.execute("DELETE FROM semantic_instances")
             self._conn.execute("DELETE FROM observation_events")
+            self._conn.execute("DELETE FROM scene_spaces")
             self._conn.execute("DELETE FROM memory_vectors")
             self._conn.commit()
 
@@ -431,6 +584,138 @@ class MemoryRepository:
                 ),
             )
             self._conn.commit()
+
+    @staticmethod
+    def _enum_values(values: Sequence[object]) -> List[str]:
+        resolved: List[str] = []
+        for item in values:
+            value = getattr(item, "value", item)
+            normalized = str(value or "").strip()
+            if normalized:
+                resolved.append(normalized)
+        return resolved
+
+    @staticmethod
+    def _matches_any(values: Sequence[str], expected_values: Sequence[str]) -> bool:
+        if not expected_values:
+            return True
+        normalized_values = {str(value).strip().lower() for value in values if str(value).strip()}
+        for item in expected_values:
+            if str(item).strip().lower() in normalized_values:
+                return True
+        return False
+
+    @staticmethod
+    def _scene_space_labels(space: SceneSpace) -> List[str]:
+        labels: List[str] = []
+        if space.primary_label:
+            labels.append(space.primary_label)
+        labels.extend(space.human_aliases)
+        for candidate in space.candidate_labels:
+            labels.append(candidate.label)
+            if candidate.normalized_label:
+                labels.append(candidate.normalized_label)
+        return labels
+
+    @staticmethod
+    def _scene_space_visual_labels(space: SceneSpace) -> List[str]:
+        labels: List[str] = []
+        for sample in space.observation_samples:
+            labels.extend(sample.visual_labels)
+        return labels
+
+    @staticmethod
+    def _scene_space_vision_tags(space: SceneSpace) -> List[str]:
+        tags: List[str] = []
+        for sample in space.observation_samples:
+            tags.extend(sample.vision_tags)
+        return tags
+
+    @staticmethod
+    def _scene_space_camera_ids(space: SceneSpace) -> List[str]:
+        camera_ids: List[str] = []
+        for sample in space.observation_samples:
+            if sample.camera_id:
+                camera_ids.append(sample.camera_id)
+        return camera_ids
+
+    @staticmethod
+    def _scene_space_reference_poses(space: SceneSpace) -> List[object]:
+        poses: List[object] = []
+        if space.boundary and space.boundary.centroid:
+            poses.append(space.boundary.centroid)
+        poses.extend(space.entry_poses)
+        poses.extend(space.inspection_poses)
+        for sample in space.observation_samples:
+            if sample.pose:
+                poses.append(sample.pose)
+        return poses
+
+    @staticmethod
+    def _pose_distance_m(first: object, second: object) -> float:
+        first_position = getattr(first, "position")
+        second_position = getattr(second, "position")
+        dx = float(first_position.x) - float(second_position.x)
+        dy = float(first_position.y) - float(second_position.y)
+        dz = float(first_position.z) - float(second_position.z)
+        return (dx * dx + dy * dy + dz * dz) ** 0.5
+
+    def _scene_space_matches_filter(self, space: SceneSpace, payload_filter: MemoryPayloadFilter) -> bool:
+        if payload_filter.scene_space_ids and space.scene_space_id not in payload_filter.scene_space_ids:
+            return False
+        if payload_filter.map_version_id and space.map_version_id != payload_filter.map_version_id:
+            return False
+        if payload_filter.localization_session_id and space.localization_session_id != payload_filter.localization_session_id:
+            return False
+        if payload_filter.review_statuses:
+            review_statuses = self._enum_values(payload_filter.review_statuses)
+            if space.review_status.value not in review_statuses:
+                return False
+        if payload_filter.anchor_ids and not self._matches_any(space.linked_anchor_ids, payload_filter.anchor_ids):
+            return False
+        if payload_filter.topo_node_ids and not self._matches_any(space.linked_topology_node_ids, payload_filter.topo_node_ids):
+            return False
+        if payload_filter.semantic_labels_any and not self._matches_any(
+            self._scene_space_labels(space),
+            payload_filter.semantic_labels_any,
+        ):
+            return False
+        if payload_filter.visual_labels_any and not self._matches_any(
+            self._scene_space_visual_labels(space),
+            payload_filter.visual_labels_any,
+        ):
+            return False
+        if payload_filter.vision_tags_any and not self._matches_any(
+            self._scene_space_vision_tags(space),
+            payload_filter.vision_tags_any,
+        ):
+            return False
+        if payload_filter.camera_ids and not self._matches_any(
+            self._scene_space_camera_ids(space),
+            payload_filter.camera_ids,
+        ):
+            return False
+        if payload_filter.created_after and space.timestamp < payload_filter.created_after:
+            return False
+        if payload_filter.created_before and space.timestamp > payload_filter.created_before:
+            return False
+        reference_ts = space.semantic_updated_at or space.timestamp
+        if payload_filter.last_seen_after and reference_ts < payload_filter.last_seen_after:
+            return False
+        if payload_filter.last_seen_before and reference_ts > payload_filter.last_seen_before:
+            return False
+        if payload_filter.max_age_sec is not None:
+            age_sec = (utc_now() - reference_ts).total_seconds()
+            if age_sec > payload_filter.max_age_sec:
+                return False
+        if payload_filter.near_pose and payload_filter.max_distance_m is not None:
+            reference_poses = self._scene_space_reference_poses(space)
+            if not reference_poses:
+                return False
+            min_distance = min(self._pose_distance_m(payload_filter.near_pose, pose) for pose in reference_poses)
+            if min_distance > payload_filter.max_distance_m:
+                return False
+        return True
 
     def _init_schema(self) -> None:
         with self._lock:
@@ -492,6 +777,40 @@ class MemoryRepository:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_vectors_namespace ON memory_vectors(namespace)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scene_spaces (
+                    scene_space_id TEXT PRIMARY KEY,
+                    map_version_id TEXT,
+                    localization_session_id TEXT,
+                    frame_id TEXT NOT NULL,
+                    primary_label TEXT,
+                    review_status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    semantic_updated_at TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scene_spaces_map_version_id ON scene_spaces(map_version_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scene_spaces_localization_session_id ON scene_spaces(localization_session_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scene_spaces_frame_id ON scene_spaces(frame_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scene_spaces_primary_label ON scene_spaces(primary_label)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scene_spaces_review_status ON scene_spaces(review_status)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scene_spaces_updated_at ON scene_spaces(updated_at)"
             )
             self._conn.execute(
                 """

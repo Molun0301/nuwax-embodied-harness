@@ -19,6 +19,7 @@ from contracts.base import MetadataDict
 from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from contracts.geometry import Pose, Quaternion, Twist, Vector3
 from contracts.memory import MemoryPayloadFilter
+from contracts.spatial_memory import SceneSpaceReviewStatus
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, TaskManager
@@ -747,10 +748,30 @@ class GatewayRuntime:
             _descriptor(
                 "get_navigation_semantic_context",
                 "获取导航语义上下文",
-                "读取当前平台地图版本绑定的语义区域、拓扑节点和空间锚点上下文。",
+                "读取当前平台地图版本绑定的语义区域、拓扑节点、场景空间候选和证据摘要。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 output_schema=_schema_object({"navigation_semantic_context": {"type": "object"}}),
+            ),
+            _descriptor(
+                "resolve_navigation_candidates",
+                "解析导航候选",
+                "按自然语言查询只返回记忆和语义空间导航候选及证据，不提交导航任务。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "query": {"type": "string"},
+                        "camera_id": {"type": "string"},
+                        "similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.25},
+                        "limit": {"type": "integer", "minimum": 1, "default": 5},
+                        "map_version_id": {"type": "string"},
+                        "localization_session_id": {"type": "string"},
+                        "max_age_sec": {"type": "number", "minimum": 0.0},
+                    },
+                    required=("query",),
+                ),
+                output_schema=_schema_object({"navigation_candidates": {"type": "array"}}),
             ),
             _descriptor(
                 "list_maps",
@@ -1027,6 +1048,89 @@ class GatewayRuntime:
                     required=("query",),
                 ),
                 output_schema=_schema_object({"query_result": {"type": "object"}}),
+            ),
+            _descriptor(
+                "list_scene_spaces",
+                "列出场景空间",
+                "列出当前记忆库内的场景空间，可按地图版本、定位会话、审核状态或空间标识筛选。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "limit": {"type": "integer", "minimum": 1, "default": 20},
+                        "scene_space_id": {"type": "string"},
+                        "scene_space_ids": {"type": "array", "items": {"type": "string"}},
+                        "map_version_id": {"type": "string"},
+                        "localization_session_id": {"type": "string"},
+                        "review_status": {"type": "string"},
+                        "review_statuses": {"type": "array", "items": {"type": "string"}},
+                    }
+                ),
+                output_schema=_schema_object({"scene_spaces": {"type": "array"}, "memory_summary": {"type": "object"}}),
+            ),
+            _descriptor(
+                "get_scene_space",
+                "获取场景空间",
+                "按场景空间标识读取单个场景空间及其证据。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({"scene_space_id": {"type": "string"}}, required=("scene_space_id",)),
+                output_schema=_schema_object({"scene_space": {"type": "object"}}),
+            ),
+            _descriptor(
+                "query_scene_spaces",
+                "查询场景空间",
+                "按自然语言和过滤条件检索场景空间，只返回候选、分数和证据。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "query": {"type": "string"},
+                        "similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.25},
+                        "limit": {"type": "integer", "minimum": 1, "default": 5},
+                        "map_version_id": {"type": "string"},
+                        "localization_session_id": {"type": "string"},
+                        "camera_id": {"type": "string"},
+                        "semantic_labels": {"type": "array"},
+                        "visual_labels": {"type": "array"},
+                        "vision_tags": {"type": "array"},
+                        "topo_node_id": {"type": "string"},
+                        "anchor_id": {"type": "string"},
+                        "scene_space_id": {"type": "string"},
+                        "scene_space_ids": {"type": "array", "items": {"type": "string"}},
+                        "review_status": {"type": "string"},
+                        "review_statuses": {"type": "array", "items": {"type": "string"}},
+                        "max_age_sec": {"type": "number", "minimum": 0.0},
+                        "near_frame_id": {"type": "string"},
+                        "near_x": {"type": "number"},
+                        "near_y": {"type": "number"},
+                        "near_z": {"type": "number", "default": 0.0},
+                        "max_distance_m": {"type": "number", "minimum": 0.0},
+                        "include_non_direct_navigation_candidates": {"type": "boolean", "default": False},
+                    },
+                    required=("query",),
+                ),
+                output_schema=_schema_object({"query_result": {"type": "object"}}),
+            ),
+            _descriptor(
+                "review_scene_space",
+                "审核场景空间",
+                "人工审核或纠偏场景空间标签、别名、状态和属性，不创建导航决策。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object(
+                    {
+                        "scene_space_id": {"type": "string"},
+                        "primary_label": {"type": "string"},
+                        "human_aliases": {"type": "array", "items": {"type": "string"}},
+                        "review_status": {"type": "string"},
+                        "attributes": {"type": "object"},
+                        "metadata": {"type": "object"},
+                    },
+                    required=("scene_space_id",),
+                ),
+                output_schema=_schema_object({"scene_space": {"type": "object"}}),
+                exposed_to_agent=False,
             ),
             _descriptor(
                 "remember_current_scene",
@@ -1308,6 +1412,7 @@ class GatewayRuntime:
             "get_map_snapshot": self._handle_get_map_snapshot,
             "get_navigation_snapshot": self._handle_get_navigation_snapshot,
             "get_navigation_semantic_context": self._handle_get_navigation_semantic_context,
+            "resolve_navigation_candidates": self._handle_resolve_navigation_candidates,
             "list_maps": self._handle_list_maps,
             "create_map": self._handle_create_map,
             "activate_map": self._handle_activate_map,
@@ -1324,6 +1429,10 @@ class GatewayRuntime:
             "tag_location": self._handle_tag_location,
             "query_location": self._handle_query_location,
             "query_semantic_memory": self._handle_query_semantic_memory,
+            "list_scene_spaces": self._handle_list_scene_spaces,
+            "get_scene_space": self._handle_get_scene_space,
+            "query_scene_spaces": self._handle_query_scene_spaces,
+            "review_scene_space": self._handle_review_scene_space,
             "remember_current_scene": self._handle_remember_current_scene,
             "navigate_to_pose": self._handle_navigate_to_pose,
             "navigate_to_named_location": self._handle_navigate_to_named_location,
@@ -1443,9 +1552,16 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="get_navigation_semantic_context",
                 display_name="获取导航语义上下文",
-                description="读取当前平台地图版本绑定的语义区域、拓扑节点和空间锚点上下文。",
+                description="读取当前平台地图版本绑定的语义区域、拓扑节点、场景空间候选和证据摘要。",
                 category=SkillCategory.SYSTEM,
                 capability_name="get_navigation_semantic_context",
+            ),
+            SkillDescriptor(
+                name="resolve_navigation_candidates",
+                display_name="解析导航候选",
+                description="只返回记忆和语义空间导航候选及证据，不提交导航任务。",
+                category=SkillCategory.MEMORY,
+                capability_name="resolve_navigation_candidates",
             ),
             SkillDescriptor(
                 name="capture_image",
@@ -1642,6 +1758,27 @@ class GatewayRuntime:
                 description="按自然语言检索语义记忆。",
                 category=SkillCategory.MEMORY,
                 capability_name="query_semantic_memory",
+            ),
+            SkillDescriptor(
+                name="list_scene_spaces",
+                display_name="列出场景空间",
+                description="列出当前记忆库内的场景空间及其审核状态和证据摘要。",
+                category=SkillCategory.MEMORY,
+                capability_name="list_scene_spaces",
+            ),
+            SkillDescriptor(
+                name="get_scene_space",
+                display_name="获取场景空间",
+                description="按标识读取单个场景空间及其证据。",
+                category=SkillCategory.MEMORY,
+                capability_name="get_scene_space",
+            ),
+            SkillDescriptor(
+                name="query_scene_spaces",
+                display_name="查询场景空间",
+                description="按自然语言检索场景空间候选、分数和证据。",
+                category=SkillCategory.MEMORY,
+                capability_name="query_scene_spaces",
             ),
             SkillDescriptor(
                 name="remember_current_scene",
@@ -2313,6 +2450,26 @@ class GatewayRuntime:
             )
         }
 
+    def _handle_resolve_navigation_candidates(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        query = self._require_str(arguments, "query")
+        return {
+            "navigation_candidates": self.memory_service.resolve_navigation_candidates(
+                query,
+                camera_id=self._optional_str(arguments, "camera_id"),
+                similarity_threshold=self._float(arguments, "similarity_threshold", 0.25),
+                max_age_sec=self._float(arguments, "max_age_sec", 0.0) or None,
+                map_version_id=self._optional_str(arguments, "map_version_id"),
+                localization_session_id=self._optional_str(arguments, "localization_session_id"),
+                limit=max(1, self._int(arguments, "limit", 5)),
+            )
+        }
+
     def _handle_list_memory_libraries(
         self,
         _: Dict[str, Any],
@@ -2619,6 +2776,113 @@ class GatewayRuntime:
                 max_age_sec=payload_filter.max_age_sec if payload_filter is not None else None,
                 near_pose=payload_filter.near_pose if payload_filter is not None else None,
                 max_distance_m=payload_filter.max_distance_m if payload_filter is not None else None,
+            )
+        }
+
+    def _handle_list_scene_spaces(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        payload_filter = self._build_memory_payload_filter(arguments)
+        return {
+            "scene_spaces": self.memory_service.list_scene_spaces(
+                limit=max(1, self._int(arguments, "limit", 20)),
+                payload_filter=payload_filter,
+                scene_space_ids=self._scene_space_ids_from_arguments(arguments) or None,
+                map_version_id=self._optional_str(arguments, "map_version_id"),
+                localization_session_id=self._optional_str(arguments, "localization_session_id"),
+                review_statuses=self._review_statuses_from_arguments(arguments) or None,
+            ),
+            "memory_summary": self.memory_service.get_summary(),
+        }
+
+    def _handle_get_scene_space(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        scene_space_id = self._require_str(arguments, "scene_space_id")
+        spaces = self.memory_service.list_scene_spaces(
+            limit=1,
+            scene_space_ids=[scene_space_id],
+        )
+        if not spaces:
+            raise GatewayError(
+                "未找到场景空间：%s" % scene_space_id,
+                error_code="scene_space_not_found",
+                http_status=404,
+                jsonrpc_code=-32004,
+            )
+        return {"scene_space": spaces[0]}
+
+    def _handle_query_scene_spaces(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        query = self._require_str(arguments, "query")
+        payload_filter = self._build_memory_payload_filter(arguments)
+        return {
+            "query_result": self.memory_service.query_scene_spaces(
+                query,
+                similarity_threshold=self._float(arguments, "similarity_threshold", 0.25),
+                limit=max(1, self._int(arguments, "limit", 5)),
+                payload_filter=payload_filter,
+                max_age_sec=payload_filter.max_age_sec if payload_filter is not None else None,
+                near_pose=payload_filter.near_pose if payload_filter is not None else None,
+                max_distance_m=payload_filter.max_distance_m if payload_filter is not None else None,
+                include_non_direct_navigation_candidates=bool(
+                    arguments.get("include_non_direct_navigation_candidates", False)
+                ),
+            )
+        }
+
+    def _handle_review_scene_space(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        scene_space_id = self._require_str(arguments, "scene_space_id")
+        human_aliases = arguments.get("human_aliases")
+        if human_aliases is not None and not isinstance(human_aliases, list):
+            raise GatewayError(
+                "human_aliases 必须为数组。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        attributes = arguments.get("attributes")
+        if attributes is not None and not isinstance(attributes, dict):
+            raise GatewayError(
+                "attributes 必须为对象。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        metadata = arguments.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise GatewayError(
+                "metadata 必须为对象。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        return {
+            "scene_space": self.memory_service.review_scene_space(
+                scene_space_id,
+                primary_label=self._optional_str(arguments, "primary_label") if "primary_label" in arguments else None,
+                human_aliases=human_aliases,
+                review_status=self._optional_str(arguments, "review_status"),
+                attributes=attributes,
+                metadata={**dict(metadata or {}), "requested_by": requested_by or "unknown"},
             )
         }
 
@@ -4908,6 +5172,10 @@ class GatewayRuntime:
                 lambda: self.mapping_service.is_available(),
                 "当前机器人入口未提供地图提供器，且还没有平台地图快照。",
             ),
+            "resolve_navigation_candidates": (
+                lambda: True,
+                None,
+            ),
             "list_maps": (
                 lambda: True,
                 None,
@@ -4969,6 +5237,22 @@ class GatewayRuntime:
                 None,
             ),
             "query_semantic_memory": (
+                lambda: True,
+                None,
+            ),
+            "list_scene_spaces": (
+                lambda: True,
+                None,
+            ),
+            "get_scene_space": (
+                lambda: True,
+                None,
+            ),
+            "query_scene_spaces": (
+                lambda: True,
+                None,
+            ),
+            "review_scene_space": (
                 lambda: True,
                 None,
             ),
@@ -5124,6 +5408,13 @@ class GatewayRuntime:
     def _normalize_query(self, value: Optional[str]) -> str:
         return "".join(char.lower() if char.isalnum() or "\u4e00" <= char <= "\u9fff" else " " for char in str(value or "")).strip()
 
+    def _optional_str(self, payload: Dict[str, Any], key: str) -> Optional[str]:
+        value = payload.get(key)
+        if value is None or isinstance(value, bool):
+            return None
+        normalized = str(value).strip()
+        return normalized or None
+
     def _serialize(self, value: Any) -> Any:
         if is_dataclass(value):
             return asdict(value)
@@ -5176,23 +5467,47 @@ class GatewayRuntime:
                 jsonrpc_code=-32602,
             ) from exc
 
+    def _scene_space_ids_from_arguments(self, payload: Dict[str, Any]) -> List[str]:
+        values = self._coerce_optional_str_list(payload.get("scene_space_ids"))
+        scene_space_id = self._optional_str(payload, "scene_space_id") or ""
+        if scene_space_id:
+            values.insert(0, scene_space_id)
+        return list(dict.fromkeys(values))
+
+    def _review_statuses_from_arguments(self, payload: Dict[str, Any]) -> List[SceneSpaceReviewStatus]:
+        values = self._coerce_optional_str_list(payload.get("review_statuses"))
+        review_status = self._optional_str(payload, "review_status") or ""
+        if review_status:
+            values.insert(0, review_status)
+        statuses: List[SceneSpaceReviewStatus] = []
+        for value in dict.fromkeys(values):
+            try:
+                statuses.append(SceneSpaceReviewStatus(value))
+            except ValueError as exc:
+                raise GatewayError(
+                    "未知场景空间审核状态：%s" % value,
+                    error_code="invalid_scene_space_review_status",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                ) from exc
+        return statuses
+
     def _build_memory_payload_filter(self, payload: Dict[str, Any]) -> Optional[MemoryPayloadFilter]:
-        semantic_labels = payload.get("semantic_labels")
-        if isinstance(semantic_labels, list):
-            normalized_semantic_labels = [str(item).strip() for item in semantic_labels if str(item).strip()]
-        else:
-            normalized_semantic_labels = []
-        visual_labels = payload.get("visual_labels")
-        if isinstance(visual_labels, list):
-            normalized_visual_labels = [str(item).strip() for item in visual_labels if str(item).strip()]
-        else:
-            normalized_visual_labels = []
-        vision_tags = payload.get("vision_tags")
-        if isinstance(vision_tags, list):
-            normalized_vision_tags = [str(item).strip() for item in vision_tags if str(item).strip()]
-        else:
-            normalized_vision_tags = []
-        topo_node_id = str(payload.get("topo_node_id", "")).strip()
+        normalized_semantic_labels = self._coerce_optional_str_list(payload.get("semantic_labels"))
+        normalized_visual_labels = self._coerce_optional_str_list(payload.get("visual_labels"))
+        normalized_vision_tags = self._coerce_optional_str_list(payload.get("vision_tags"))
+        topo_node_ids = self._coerce_optional_str_list(payload.get("topo_node_ids"))
+        topo_node_id = self._optional_str(payload, "topo_node_id") or ""
+        if topo_node_id:
+            topo_node_ids.insert(0, topo_node_id)
+        topo_node_ids = list(dict.fromkeys(topo_node_ids))
+        anchor_ids = self._coerce_optional_str_list(payload.get("anchor_ids"))
+        anchor_id = self._optional_str(payload, "anchor_id") or ""
+        if anchor_id:
+            anchor_ids.insert(0, anchor_id)
+        anchor_ids = list(dict.fromkeys(anchor_ids))
+        scene_space_ids = self._scene_space_ids_from_arguments(payload)
+        review_statuses = self._review_statuses_from_arguments(payload)
         near_pose = None
         if "near_frame_id" in payload or "near_x" in payload or "near_y" in payload:
             near_pose = Pose(
@@ -5205,13 +5520,17 @@ class GatewayRuntime:
                 orientation=Quaternion(w=1.0),
             )
         filter_payload = MemoryPayloadFilter(
-            map_version_id=str(payload.get("map_version_id", "")).strip() or None,
-            linked_location_id=str(payload.get("linked_location_id", "")).strip() or None,
-            camera_ids=[str(payload.get("camera_id")).strip()] if str(payload.get("camera_id", "")).strip() else [],
+            map_version_id=self._optional_str(payload, "map_version_id"),
+            localization_session_id=self._optional_str(payload, "localization_session_id"),
+            linked_location_id=self._optional_str(payload, "linked_location_id"),
+            camera_ids=[self._optional_str(payload, "camera_id")] if self._optional_str(payload, "camera_id") else [],
             semantic_labels_any=normalized_semantic_labels,
             visual_labels_any=normalized_visual_labels,
             vision_tags_any=normalized_vision_tags,
-            topo_node_ids=[topo_node_id] if topo_node_id else [],
+            topo_node_ids=topo_node_ids,
+            anchor_ids=anchor_ids,
+            scene_space_ids=scene_space_ids,
+            review_statuses=review_statuses,
             max_age_sec=self._float(payload, "max_age_sec", 0.0) or None,
             near_pose=near_pose,
             max_distance_m=self._float(payload, "max_distance_m", 0.0) or None,
@@ -5219,12 +5538,16 @@ class GatewayRuntime:
         has_filter = any(
             [
                 filter_payload.map_version_id,
+                filter_payload.localization_session_id,
                 filter_payload.linked_location_id,
                 filter_payload.camera_ids,
                 filter_payload.semantic_labels_any,
                 filter_payload.visual_labels_any,
                 filter_payload.vision_tags_any,
                 filter_payload.topo_node_ids,
+                filter_payload.anchor_ids,
+                filter_payload.scene_space_ids,
+                filter_payload.review_statuses,
                 filter_payload.max_age_sec is not None,
                 filter_payload.near_pose is not None,
                 filter_payload.max_distance_m is not None,

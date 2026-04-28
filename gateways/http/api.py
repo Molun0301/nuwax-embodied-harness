@@ -614,6 +614,64 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
         }
 
+    @router.get("/api/memory/scene_spaces")
+    async def api_memory_scene_spaces(
+        request: Request,
+        limit: int = 20,
+        scene_space_id: Optional[str] = None,
+        map_version_id: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
+        review_status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        arguments: Dict[str, Any] = {"limit": limit}
+        for key, value in {
+            "scene_space_id": scene_space_id,
+            "map_version_id": map_version_id,
+            "localization_session_id": localization_session_id,
+            "review_status": review_status,
+        }.items():
+            if value is not None:
+                arguments[key] = value
+        return to_jsonable(runtime._handle_list_scene_spaces(arguments, requested_by="http_api"))
+
+    @router.get("/api/memory/scene_spaces/query")
+    async def api_memory_scene_spaces_query(
+        request: Request,
+        query: str,
+        limit: int = 5,
+        similarity_threshold: float = 0.25,
+        map_version_id: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
+        review_status: Optional[str] = None,
+        max_distance_m: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        arguments: Dict[str, Any] = {
+            "query": query,
+            "limit": limit,
+            "similarity_threshold": similarity_threshold,
+        }
+        for key, value in {
+            "map_version_id": map_version_id,
+            "localization_session_id": localization_session_id,
+            "review_status": review_status,
+            "max_distance_m": max_distance_m,
+        }.items():
+            if value is not None:
+                arguments[key] = value
+        return to_jsonable(runtime._handle_query_scene_spaces(arguments, requested_by="http_api"))
+
+    @router.get("/api/memory/scene_spaces/{scene_space_id}")
+    async def api_memory_scene_space(scene_space_id: str, request: Request) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        return to_jsonable(
+            runtime._handle_get_scene_space(
+                {"scene_space_id": scene_space_id},
+                requested_by="http_api",
+            )
+        )
+
     @router.get("/artifacts/{artifact_id}/meta")
     async def api_artifact_meta(artifact_id: str, request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)

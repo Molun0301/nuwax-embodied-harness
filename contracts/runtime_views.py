@@ -13,7 +13,11 @@ from contracts.maps import CostMap, OccupancyGrid, SemanticMap
 from contracts.navigation import ExplorationState, ExploreAreaRequest, NavigationGoal, NavigationState
 from contracts.perception import Observation
 from contracts.robot_state import RobotState, SafetyState
-from contracts.spatial_memory import SemanticRegion as SpatialSemanticRegion, SpatialAnchor
+from contracts.spatial_memory import (
+    SceneSpace as SpatialSceneSpace,
+    SemanticRegion as SpatialSemanticRegion,
+    SpatialAnchor,
+)
 from typing import List, Optional
 
 
@@ -167,6 +171,7 @@ class NavigationSemanticContext(TimestampedContract):
     localization_session_id: Optional[str] = Field(default=None, description="当前绑定的定位会话。")
     localization_ready: bool = Field(default=False, description="当前平台定位是否已就绪。")
     semantic_regions: List[SpatialSemanticRegion] = Field(default_factory=list, description="当前语义区域集合。")
+    scene_spaces: List[SpatialSceneSpace] = Field(default_factory=list, description="当前场景空间集合。")
     topology_nodes: List[TopologyNodeSummary] = Field(default_factory=list, description="当前拓扑节点集合。")
     anchors: List[SpatialAnchor] = Field(default_factory=list, description="当前空间锚点集合。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")

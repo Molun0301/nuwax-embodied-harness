@@ -492,6 +492,104 @@ def resolve_segmentation_provider_spec(
         },
     )
 
+
+def normalize_scene_space_vlm_metadata(
+    metadata: Optional[Dict[str, object]] = None,
+    *,
+    availability: str = "available",
+    fallback_reason: str = "",
+) -> Dict[str, object]:
+    payload = dict(metadata or {})
+    nested_provider = payload.get("provider") or payload.get("scene_provider")
+    if isinstance(nested_provider, dict):
+        payload = {**dict(nested_provider), **payload}
+        payload.pop("provider", None)
+        payload.pop("scene_provider", None)
+
+    requested_provider = str(
+        payload.get("requested_provider_name")
+        or payload.get("provider_name")
+        or payload.get("provider")
+        or "scene_space_vlm"
+    ).strip()
+    resolved_provider = str(
+        payload.get("resolved_provider_name")
+        or payload.get("provider_name")
+        or requested_provider
+        or "scene_space_vlm"
+    ).strip()
+    requested_backend = str(payload.get("requested_backend") or payload.get("backend_name") or "scene_space_vlm").strip()
+    resolved_backend = str(payload.get("resolved_backend") or payload.get("backend_name") or requested_backend).strip()
+    model_name = str(payload.get("model_name") or payload.get("model") or "").strip()
+    provider_kind = str(payload.get("provider_kind") or "cloud").strip().lower()
+    resolved_availability = _safe_availability(payload.get("availability") or availability, provider_kind)
+    resolved_fallback_reason = str(
+        fallback_reason
+        or payload.get("fallback_reason")
+        or payload.get("reason")
+        or ""
+    ).strip()
+    fallback_used = bool(payload.get("fallback_used", bool(resolved_fallback_reason) or resolved_availability != "available"))
+    capabilities = _normalized_capabilities(payload.get("capabilities"))
+    capabilities["understand"] = True
+
+    return {
+        **payload,
+        "capability": "vlm",
+        "scene_space_capability": "scene_space_understanding",
+        "provider_kind": provider_kind,
+        "provider_name": resolved_provider,
+        "model_name": model_name,
+        "backend_name": resolved_backend,
+        "requested_provider_name": requested_provider or resolved_provider,
+        "resolved_provider_name": resolved_provider,
+        "requested_backend": requested_backend or resolved_backend,
+        "resolved_backend": resolved_backend,
+        "availability": resolved_availability,
+        "fallback_used": fallback_used,
+        "fallback_reason": resolved_fallback_reason,
+        "capabilities": capabilities,
+    }
+
+
+def resolve_scene_space_rule_fallback_provider_metadata(
+    *,
+    fallback_reason: str = "provider_not_available",
+    availability: str = "unavailable",
+    requested_metadata: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    requested = dict(requested_metadata or {})
+    requested_provider = str(
+        requested.get("requested_provider_name")
+        or requested.get("provider_name")
+        or requested.get("resolved_provider_name")
+        or "scene_space_vlm"
+    ).strip()
+    requested_backend = str(
+        requested.get("requested_backend")
+        or requested.get("backend_name")
+        or requested.get("resolved_backend")
+        or "scene_space_vlm"
+    ).strip()
+    metadata = {
+        **requested,
+        "capability": "vlm",
+        "scene_space_capability": "scene_space_understanding",
+        "provider_kind": "local",
+        "provider_name": "rule_based_scene_space",
+        "model_name": "rule-based-scene-space-v1",
+        "backend_name": "rule_based_scene_space",
+        "requested_provider_name": requested_provider,
+        "resolved_provider_name": "rule_based_scene_space",
+        "requested_backend": requested_backend,
+        "resolved_backend": "rule_based_scene_space",
+        "availability": _safe_availability(availability, "local"),
+        "fallback_used": True,
+        "fallback_reason": str(fallback_reason or "provider_not_available"),
+        "capabilities": _capabilities(understand=True),
+    }
+    return metadata
+
 def _looks_like_local_model_reference(model_name: str) -> bool:
     normalized = str(model_name or "").strip()
     if not normalized:

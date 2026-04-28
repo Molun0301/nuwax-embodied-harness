@@ -15,9 +15,21 @@ from contracts.memory import MemoryQueryMatch, MemoryQueryResult, MemoryRecordKi
 from contracts.perception import BoundingBox2D, Detection2D, Detection3D, Observation, SegmentationMask2D, SegmentationQuality, Track, TrackState
 from contracts.pointcloud import PointCloudFrame
 from contracts.runtime_views import LocalizationSnapshot, MapSnapshot, PerceptionContext, SceneObjectSummary, SceneSummary
-from contracts.spatial_memory import GroundingQueryPlan, InstanceLifecycleState, InstanceMovability
+from gateways.errors import GatewayError
+from contracts.spatial_memory import (
+    GroundingQueryPlan,
+    InstanceLifecycleState,
+    InstanceMovability,
+    SceneCandidateLabel,
+    SceneModelSummary,
+    SceneObservationSample,
+    SceneSpace,
+    SceneSpaceBoundary,
+    SceneSpaceReviewStatus,
+)
 from services.memory.grounding_query_planner import GroundingQueryPlanner
 from services.memory.inspection_pose_planner import InspectionPosePlanner
+from services.memory.repository import MemoryRepository
 from services.memory.instance_association_service import InstanceAssociationService
 from services.memory.semantic_map_builder import SemanticMapBuilder
 from services.memory.service import MemoryService, _ScoredCandidate
@@ -160,6 +172,78 @@ def _build_test_memory_service(*, perception_context: PerceptionContext | None =
     service._active_library_name = "unit_test_library"
     return service
 
+
+
+
+def _build_scene_space(
+    *,
+    scene_space_id: str = "ssp_dock_zone_20260401T120000Z_deadbeef",
+    primary_label: str = "补给区",
+    map_version_id: str = "mapv_test_000001",
+    localization_session_id: str = "loc_session_test",
+    review_status: SceneSpaceReviewStatus = SceneSpaceReviewStatus.AUTO_LABELED,
+    camera_id: str = "front_camera",
+    x: float = 1.2,
+    y: float = 0.4,
+    visual_labels: tuple[str, ...] = ("charging dock", "shelf"),
+    vision_tags: tuple[str, ...] = ("补给区", "机器人停靠"),
+    human_aliases: tuple[str, ...] = ("dock",),
+) -> SceneSpace:
+    sample = SceneObservationSample(
+        sample_id=f"sample_{scene_space_id}",
+        source_observation_id="obs_front_camera_20260401T120000Z_deadbeef",
+        observation_event_id="oev_perception_20260401T120000Z_deadbeef",
+        camera_id=camera_id,
+        pose=Pose(frame_id="map", position=Vector3(x=x, y=y, z=0.0), orientation=Quaternion(w=1.0)),
+        artifact_ids=["art_image_20260401T120000Z_deadbeef"],
+        visual_labels=list(visual_labels),
+        vision_tags=list(vision_tags),
+        confidence=0.86,
+    )
+    return SceneSpace(
+        scene_space_id=scene_space_id,
+        map_version_id=map_version_id,
+        localization_session_id=localization_session_id,
+        frame_id="map",
+        boundary=SceneSpaceBoundary(
+            frame_id="map",
+            centroid=Pose(frame_id="map", position=Vector3(x=x, y=y, z=0.0), orientation=Quaternion(w=1.0)),
+            min_corner=Vector3(x=x - 0.3, y=y - 0.3, z=0.0),
+            max_corner=Vector3(x=x + 0.3, y=y + 0.3, z=0.0),
+            area_m2=0.36,
+            confidence=0.86,
+        ),
+        entry_poses=[Pose(frame_id="map", position=Vector3(x=x - 0.2, y=y, z=0.0), orientation=Quaternion(w=1.0))],
+        inspection_poses=[Pose(frame_id="map", position=Vector3(x=x - 0.4, y=y, z=0.0), orientation=Quaternion(w=1.0))],
+        observation_sample_ids=[sample.sample_id],
+        observation_samples=[sample],
+        model_summary=SceneModelSummary(
+            summary=f"模型判断这里是{primary_label}。",
+            provider_name="rule_based_scene_space",
+            model_name="rule-based-scene-space-v1",
+            confidence=0.7,
+            evidence_observation_sample_ids=[sample.sample_id],
+        ),
+        candidate_labels=[
+            SceneCandidateLabel(
+                label=primary_label,
+                normalized_label=primary_label,
+                confidence=0.72,
+                source_model="rule-based-scene-space-v1",
+                evidence_observation_sample_ids=[sample.sample_id],
+                evidence_observation_event_ids=["oev_perception_20260401T120000Z_deadbeef"],
+            )
+        ],
+        primary_label=primary_label,
+        human_aliases=list(human_aliases),
+        review_status=review_status,
+        linked_anchor_ids=["anc_region_20260401T120000Z_deadbeef"],
+        linked_object_instance_ids=["ins_charger_20260401T120000Z_deadbeef"],
+        linked_topology_node_ids=["dock_node"],
+        linked_semantic_region_ids=["dock_zone"],
+        linked_observation_event_ids=["oev_perception_20260401T120000Z_deadbeef"],
+        metadata={"memory_library_name": "unit_test_library", "backend": "memory_service.scene_space"},
+    )
 
 def _build_tagged_location(*, location_id: str, name: str, map_version_id: str | None = "mapv_test_000001", localization_session_id: str | None = "loc_session_test", metadata: dict | None = None) -> TaggedLocation:
     return TaggedLocation(
@@ -1505,3 +1589,170 @@ def test_verify_arrival_records_structured_segmentation_evidence() -> None:
     assert result.metadata["segmentation_score"] == pytest.approx(0.91)
     assert result.metadata["segmentation_quality_score"] == pytest.approx(0.82)
     assert result.metadata["segmentation_support_point_count"] == 8
+
+
+def test_repository_filters_scene_spaces_by_semantics_and_pose() -> None:
+    repository = MemoryRepository(":memory:")
+    dock_space = _build_scene_space()
+    lab_space = _build_scene_space(
+        scene_space_id="ssp_lab_zone_20260401T120000Z_cafebabe",
+        primary_label="实验区",
+        map_version_id="mapv_other",
+        localization_session_id="loc_session_other",
+        review_status=SceneSpaceReviewStatus.REVIEWED,
+        camera_id="rear_camera",
+        x=4.0,
+        y=4.0,
+        visual_labels=("bench",),
+        vision_tags=("实验台",),
+        human_aliases=("lab",),
+    )
+    repository.upsert_scene_space(dock_space)
+    repository.upsert_scene_space(lab_space)
+
+    by_label = repository.query_scene_spaces(
+        MemoryPayloadFilter(
+            record_kinds=[MemoryRecordKind.SCENE_SPACE],
+            map_version_id="mapv_test_000001",
+            localization_session_id="loc_session_test",
+            review_statuses=[SceneSpaceReviewStatus.AUTO_LABELED],
+            semantic_labels_any=["dock"],
+            visual_labels_any=["charging dock"],
+            vision_tags_any=["补给区"],
+            camera_ids=["front_camera"],
+            topo_node_ids=["dock_node"],
+            anchor_ids=["anc_region_20260401T120000Z_deadbeef"],
+        )
+    )
+    nearby = repository.query_scene_spaces(
+        MemoryPayloadFilter(
+            record_kinds=[MemoryRecordKind.SCENE_SPACE],
+            near_pose=Pose(frame_id="map", position=Vector3(x=1.0, y=0.4, z=0.0), orientation=Quaternion(w=1.0)),
+            max_distance_m=0.5,
+        )
+    )
+    wrong_kind = repository.query_scene_spaces(MemoryPayloadFilter(record_kinds=[MemoryRecordKind.TAGGED_LOCATION]))
+
+    assert [item.scene_space_id for item in by_label] == [dock_space.scene_space_id]
+    assert [item.scene_space_id for item in nearby] == [dock_space.scene_space_id]
+    assert wrong_kind == []
+
+
+def test_memory_service_queries_scene_spaces_and_builds_navigation_candidate() -> None:
+    service = _build_test_memory_service()
+    scene_space = service.upsert_scene_space(_build_scene_space())
+
+    listed = service.list_scene_spaces(
+        payload_filter=MemoryPayloadFilter(
+            semantic_labels_any=["补给区"],
+            camera_ids=["front_camera"],
+            review_statuses=[SceneSpaceReviewStatus.AUTO_LABELED],
+        )
+    )
+    result = service.query_scene_spaces(
+        "补给区",
+        similarity_threshold=0.1,
+        payload_filter=MemoryPayloadFilter(map_version_id="mapv_test_000001", localization_session_id="loc_session_test"),
+        include_non_direct_navigation_candidates=True,
+    )
+
+    assert listed == (scene_space,)
+    assert result.metadata["query_scope"] == "scene_space"
+    assert result.matches
+    match = result.matches[0]
+    assert match.record_kind == MemoryRecordKind.SCENE_SPACE
+    assert match.scene_space is not None
+    assert match.scene_space.scene_space_id == scene_space.scene_space_id
+    assert match.navigation_candidate is not None
+    assert match.navigation_candidate.source_collection == "scene_spaces"
+    assert match.navigation_candidate.record_id == scene_space.scene_space_id
+    assert match.navigation_candidate.inspection_pose.position.x == pytest.approx(0.8)
+    assert match.navigation_candidate.metadata["scene_space_id"] == scene_space.scene_space_id
+    assert match.navigation_candidate.metadata["navigation_quality_level"] == "direct_navigation"
+    assert match.navigation_candidate.metadata["navigable"] is True
+
+
+def test_memory_service_scene_space_filter_respects_map_localization_and_review_status() -> None:
+    service = _build_test_memory_service()
+    accepted = service.upsert_scene_space(_build_scene_space())
+    service.upsert_scene_space(
+        _build_scene_space(
+            scene_space_id="ssp_rejected_zone_20260401T120000Z_abcd1234",
+            primary_label="误检区",
+            review_status=SceneSpaceReviewStatus.REJECTED,
+            x=2.4,
+            y=2.4,
+            human_aliases=("wrong",),
+        )
+    )
+
+    result = service.query_scene_spaces(
+        "",
+        payload_filter=MemoryPayloadFilter(
+            map_version_id="mapv_test_000001",
+            localization_session_id="loc_session_test",
+            review_statuses=[SceneSpaceReviewStatus.AUTO_LABELED],
+            near_pose=Pose(frame_id="map", position=Vector3(x=1.1, y=0.4, z=0.0), orientation=Quaternion(w=1.0)),
+            max_distance_m=0.6,
+        ),
+    )
+
+    assert [match.record_id for match in result.matches] == [accepted.scene_space_id]
+    assert result.matches[0].metadata["retrieval_mode"] == "scene_space_filter"
+    assert result.matches[0].navigation_candidate is not None
+    assert result.matches[0].navigation_candidate.metadata["navigation_quality_level"] == "direct_navigation"
+
+def test_scene_space_without_inspection_or_entry_pose_is_not_navigable() -> None:
+    service = _build_test_memory_service()
+    scene_space = service.upsert_scene_space(
+        _build_scene_space().model_copy(
+            update={"inspection_poses": [], "entry_poses": []},
+            deep=True,
+        )
+    )
+
+    assert service._scene_space_navigation_pose(scene_space) is None
+
+    result = service.query_scene_spaces(
+        "补给区",
+        similarity_threshold=0.1,
+        include_non_direct_navigation_candidates=True,
+    )
+
+    assert result.matches
+    match = result.matches[0]
+    assert match.scene_space is not None
+    assert match.record_id == scene_space.scene_space_id
+    assert match.navigation_candidate is None
+    assert match.metadata["navigation_quality"]["level"] == "not_navigable"
+    assert match.metadata["navigation_quality"]["primary_reason_code"] == "missing_inspection_or_entry_pose"
+    assert match.metadata["navigable"] is False
+
+
+def test_semantic_region_goal_without_inspection_or_scene_entry_pose_rejects_centroid_fallback() -> None:
+    service = _build_test_memory_service()
+    map_context = SemanticMapBuilder().build(_build_map_snapshot())
+    region = map_context.semantic_regions[0].model_copy(update={"inspection_poses": []}, deep=True)
+    scene_space = map_context.scene_spaces[0].model_copy(
+        update={
+            "inspection_poses": [],
+            "entry_poses": [],
+            "primary_label": "补给区",
+            "candidate_labels": [
+                SceneCandidateLabel(label="补给区", normalized_label="补给区", confidence=0.8)
+            ],
+        },
+        deep=True,
+    )
+    patched_context = replace(
+        map_context,
+        semantic_regions=(region,),
+        scene_spaces=(scene_space,),
+    )
+    service._latest_semantic_map_context = patched_context
+    service._scene_spaces_by_id[scene_space.scene_space_id] = scene_space
+    service._get_map_snapshot = lambda: None
+    service._refresh_semantic_map_context = lambda map_snapshot: patched_context
+
+    with pytest.raises(GatewayError, match="没有可导航的巡检或入口位姿"):
+        service.resolve_semantic_region_goal(region.label)

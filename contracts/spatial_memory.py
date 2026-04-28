@@ -10,9 +10,12 @@ from contracts.base import ContractModel, MetadataDict, TimestampedContract
 from contracts.geometry import Pose, Vector3
 from contracts.naming import (
     validate_anchor_id,
+    validate_frame_id,
     validate_instance_id,
     validate_navigation_candidate_id,
     validate_observation_event_id,
+    validate_observation_id,
+    validate_scene_space_id,
 )
 from typing import List, Optional
 
@@ -82,6 +85,149 @@ class SemanticRegion(TimestampedContract):
     @classmethod
     def _validate_region_anchor_id(cls, value: str) -> str:
         return validate_anchor_id(value)
+
+
+class SceneSpaceReviewStatus(StrEnum):
+    """场景空间审核状态。"""
+
+    CANDIDATE = "candidate"
+    AUTO_LABELED = "auto_labeled"
+    REVIEWED = "reviewed"
+    CORRECTED = "corrected"
+    REJECTED = "rejected"
+    STALE = "stale"
+
+
+class SceneSpaceBoundary(TimestampedContract):
+    """由感知样本聚合出的场景空间边界。"""
+
+    frame_id: str = Field(description="边界所属坐标系。")
+    centroid: Optional[Pose] = Field(default=None, description="边界中心位姿。")
+    polygon_points: List[Vector3] = Field(default_factory=list, description="二维或三维边界轮廓点。")
+    min_corner: Optional[Vector3] = Field(default=None, description="边界包围盒最小角点。")
+    max_corner: Optional[Vector3] = Field(default=None, description="边界包围盒最大角点。")
+    area_m2: Optional[float] = Field(default=None, ge=0.0, description="估计平面面积，单位平方米。")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="边界聚合置信度。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("frame_id")
+    @classmethod
+    def _validate_boundary_frame_id(cls, value: str) -> str:
+        return validate_frame_id(value)
+
+
+class SceneObservationSample(TimestampedContract):
+    """支撑场景空间识别的一次观察样本摘要。"""
+
+    sample_id: str = Field(description="场景空间内部样本标识。")
+    source_observation_id: Optional[str] = Field(default=None, description="来源观察标识。")
+    observation_event_id: Optional[str] = Field(default=None, description="关联观察事件标识。")
+    camera_id: Optional[str] = Field(default=None, description="来源相机。")
+    pose: Optional[Pose] = Field(default=None, description="采样时机器人或相机位姿。")
+    artifact_ids: List[str] = Field(default_factory=list, description="关联图像或模型制品。")
+    visual_labels: List[str] = Field(default_factory=list, description="样本中的视觉目标标签。")
+    vision_tags: List[str] = Field(default_factory=list, description="样本中的多模态语义标签。")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="样本对场景空间的支持置信度。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("source_observation_id")
+    @classmethod
+    def _validate_source_observation_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_observation_id(value)
+
+    @field_validator("observation_event_id")
+    @classmethod
+    def _validate_sample_event_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_observation_event_id(value)
+
+
+class SceneCandidateLabel(TimestampedContract):
+    """模型自动产出的场景空间候选标签。"""
+
+    label: str = Field(description="候选标签。")
+    normalized_label: Optional[str] = Field(default=None, description="归一化候选标签。")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="候选标签置信度。")
+    source_model: Optional[str] = Field(default=None, description="产出该标签的模型名称。")
+    evidence_observation_sample_ids: List[str] = Field(default_factory=list, description="支持该标签的样本标识。")
+    evidence_observation_event_ids: List[str] = Field(default_factory=list, description="支持该标签的观察事件。")
+    attributes: MetadataDict = Field(default_factory=dict, description="标签属性。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("evidence_observation_event_ids")
+    @classmethod
+    def _validate_label_event_ids(cls, value: List[str]) -> List[str]:
+        return [validate_observation_event_id(item) for item in value]
+
+
+class SceneModelSummary(TimestampedContract):
+    """图文或多模态模型对场景空间的摘要。"""
+
+    summary: str = Field(description="模型自动生成的场景空间摘要。")
+    provider_name: Optional[str] = Field(default=None, description="模型服务提供方。")
+    model_name: Optional[str] = Field(default=None, description="模型名称。")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="摘要置信度。")
+    evidence_observation_sample_ids: List[str] = Field(default_factory=list, description="支撑摘要的样本标识。")
+    generated_at: Optional[datetime] = Field(default=None, description="模型摘要生成时间。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class SceneSpace(TimestampedContract):
+    """面向语义导航和记忆检索的场景空间。"""
+
+    scene_space_id: str = Field(description="场景空间标识。")
+    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
+    frame_id: str = Field(description="场景空间统一坐标系。")
+    boundary: Optional[SceneSpaceBoundary] = Field(default=None, description="场景空间边界。")
+    entry_poses: List[Pose] = Field(default_factory=list, description="建议进入该空间的位姿列表。")
+    inspection_poses: List[Pose] = Field(default_factory=list, description="建议巡检该空间的位姿列表。")
+    observation_sample_ids: List[str] = Field(default_factory=list, description="支持该空间的观察样本标识。")
+    observation_samples: List[SceneObservationSample] = Field(default_factory=list, description="支持该空间的观察样本摘要。")
+    model_summary: Optional[SceneModelSummary] = Field(default=None, description="模型自动生成的空间摘要。")
+    candidate_labels: List[SceneCandidateLabel] = Field(default_factory=list, description="模型自动生成的候选标签。")
+    primary_label: Optional[str] = Field(default=None, description="当前采用的空间主标签。")
+    human_aliases: List[str] = Field(default_factory=list, description="人工维护的别名集合。")
+    review_status: SceneSpaceReviewStatus = Field(
+        default=SceneSpaceReviewStatus.CANDIDATE,
+        description="场景空间人工审核状态。",
+    )
+    semantic_updated_at: Optional[datetime] = Field(default=None, description="语义信息最近更新时间。")
+    linked_anchor_ids: List[str] = Field(default_factory=list, description="关联空间锚点集合。")
+    linked_object_instance_ids: List[str] = Field(default_factory=list, description="关联语义对象实例集合。")
+    linked_topology_node_ids: List[str] = Field(default_factory=list, description="关联拓扑节点集合。")
+    linked_semantic_region_ids: List[str] = Field(default_factory=list, description="关联语义区域集合。")
+    linked_observation_event_ids: List[str] = Field(default_factory=list, description="关联观察事件集合。")
+    attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("scene_space_id")
+    @classmethod
+    def _validate_scene_space_id(cls, value: str) -> str:
+        return validate_scene_space_id(value)
+
+    @field_validator("frame_id")
+    @classmethod
+    def _validate_scene_frame_id(cls, value: str) -> str:
+        return validate_frame_id(value)
+
+    @field_validator("linked_anchor_ids")
+    @classmethod
+    def _validate_linked_anchor_ids(cls, value: List[str]) -> List[str]:
+        return [validate_anchor_id(item) for item in value]
+
+    @field_validator("linked_object_instance_ids")
+    @classmethod
+    def _validate_linked_object_instance_ids(cls, value: List[str]) -> List[str]:
+        return [validate_instance_id(item) for item in value]
+
+    @field_validator("linked_observation_event_ids")
+    @classmethod
+    def _validate_linked_observation_event_ids(cls, value: List[str]) -> List[str]:
+        return [validate_observation_event_id(item) for item in value]
 
 
 class SemanticInstance(TimestampedContract):

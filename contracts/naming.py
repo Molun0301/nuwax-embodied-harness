@@ -18,6 +18,7 @@ ANCHOR_ID_PATTERN = re.compile(r"^anc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$
 INSTANCE_ID_PATTERN = re.compile(r"^ins_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 OBSERVATION_EVENT_ID_PATTERN = re.compile(r"^oev_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 NAVIGATION_CANDIDATE_ID_PATTERN = re.compile(r"^navc_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
+SCENE_SPACE_ID_PATTERN = re.compile(r"^ssp_[a-z0-9_]+_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$")
 
 
 def _ensure_match(value: str, pattern: re.Pattern[str], field_name: str) -> str:
@@ -105,6 +106,12 @@ def validate_navigation_candidate_id(value: str) -> str:
     """校验导航候选标识。"""
 
     return _ensure_match(value, NAVIGATION_CANDIDATE_ID_PATTERN, "navigation_candidate_id")
+
+
+def validate_scene_space_id(value: str) -> str:
+    """校验场景空间标识。"""
+
+    return _ensure_match(value, SCENE_SPACE_ID_PATTERN, "scene_space_id")
 
 
 def build_task_id(capability_name: str, timestamp: Optional[datetime] = None, suffix: Optional[str] = None) -> str:
@@ -228,4 +235,21 @@ def build_navigation_candidate_id(
     suffix = suffix.lower()
     return validate_navigation_candidate_id(
         f"navc_{source}_{current_time.strftime('%Y%m%dT%H%M%SZ')}_{suffix}"
+    )
+
+
+def build_scene_space_id(
+    source: str,
+    timestamp: Optional[datetime] = None,
+    suffix: Optional[str] = None,
+) -> str:
+    """按平台约定生成场景空间标识。"""
+
+    source = validate_capability_name(source)
+    current_time = (timestamp or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if suffix is None:
+        suffix = secrets.token_hex(4)
+    suffix = suffix.lower()
+    return validate_scene_space_id(
+        f"ssp_{source}_{current_time.strftime('%Y%m%dT%H%M%SZ')}_{suffix}"
     )

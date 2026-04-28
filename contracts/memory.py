@@ -6,8 +6,14 @@ from pydantic import Field, field_validator, model_validator
 
 from contracts.base import ContractModel, MetadataDict, TimestampedContract
 from contracts.geometry import Pose
-from contracts.naming import validate_location_id, validate_memory_id
-from contracts.spatial_memory import NavigationCandidate, ObservationEvent, SemanticInstance
+from contracts.naming import validate_location_id, validate_memory_id, validate_scene_space_id
+from contracts.spatial_memory import (
+    NavigationCandidate,
+    ObservationEvent,
+    SceneSpace,
+    SceneSpaceReviewStatus,
+    SemanticInstance,
+)
 from datetime import datetime
 from typing import List, Optional
 
@@ -20,6 +26,7 @@ class MemoryRecordKind(StrEnum):
     NOTE = "note"
     OBJECT_INSTANCE = "object_instance"
     OBSERVATION_EVENT = "observation_event"
+    SCENE_SPACE = "scene_space"
 
 
 class TaggedLocation(TimestampedContract):
@@ -34,6 +41,7 @@ class TaggedLocation(TimestampedContract):
     localization_source_name: Optional[str] = Field(default=None, description="定位来源名称。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点标识。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域标识。")
+    scene_space_id: Optional[str] = Field(default=None, description="关联场景空间标识。")
     semantic_labels: List[str] = Field(default_factory=list, description="关联语义标签。")
     observation_id: Optional[str] = Field(default=None, description="关联观察标识。")
     perception_headline: Optional[str] = Field(default=None, description="关联感知摘要标题。")
@@ -52,6 +60,13 @@ class TaggedLocation(TimestampedContract):
             return value
         return validate_memory_id(value)
 
+    @field_validator("scene_space_id")
+    @classmethod
+    def _validate_scene_space_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_scene_space_id(value)
+
 
 class SemanticMemoryEntry(TimestampedContract):
     """面向检索与上层消费的摘要记忆条目。"""
@@ -66,6 +81,7 @@ class SemanticMemoryEntry(TimestampedContract):
     map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点标识。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域标识。")
+    scene_space_id: Optional[str] = Field(default=None, description="关联场景空间标识。")
     semantic_labels: List[str] = Field(default_factory=list, description="关联语义标签。")
     observation_id: Optional[str] = Field(default=None, description="关联观察标识。")
     perception_headline: Optional[str] = Field(default=None, description="关联感知摘要标题。")
@@ -84,6 +100,13 @@ class SemanticMemoryEntry(TimestampedContract):
             return value
         return validate_location_id(value)
 
+    @field_validator("scene_space_id")
+    @classmethod
+    def _validate_entry_scene_space_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_scene_space_id(value)
+
 
 class MemoryQueryMatch(TimestampedContract):
     """记忆查询匹配结果。"""
@@ -96,6 +119,7 @@ class MemoryQueryMatch(TimestampedContract):
     semantic_memory: Optional[SemanticMemoryEntry] = Field(default=None, description="语义记忆记录。")
     semantic_instance: Optional[SemanticInstance] = Field(default=None, description="语义实例记录。")
     observation_event: Optional[ObservationEvent] = Field(default=None, description="观察事件记录。")
+    scene_space: Optional[SceneSpace] = Field(default=None, description="场景空间记录。")
     navigation_candidate: Optional[NavigationCandidate] = Field(
         default=None,
         description="可直接交给导航层的候选目标。",
@@ -108,17 +132,27 @@ class MemoryQueryMatch(TimestampedContract):
         has_memory = self.semantic_memory is not None
         has_instance = self.semantic_instance is not None
         has_event = self.observation_event is not None
-        payload_count = sum(1 for item in (has_location, has_memory, has_instance, has_event) if item)
+        has_scene_space = self.scene_space is not None
+        payload_count = sum(
+            1 for item in (has_location, has_memory, has_instance, has_event, has_scene_space) if item
+        )
         if payload_count != 1:
             raise ValueError("MemoryQueryMatch 必须且只能包含一种记录载荷。")
         if has_location and self.record_kind != MemoryRecordKind.TAGGED_LOCATION:
             raise ValueError("TaggedLocation 结果的 record_kind 必须为 tagged_location。")
-        if has_memory and self.record_kind in {MemoryRecordKind.TAGGED_LOCATION, MemoryRecordKind.OBJECT_INSTANCE, MemoryRecordKind.OBSERVATION_EVENT}:
+        if has_memory and self.record_kind in {
+            MemoryRecordKind.TAGGED_LOCATION,
+            MemoryRecordKind.OBJECT_INSTANCE,
+            MemoryRecordKind.OBSERVATION_EVENT,
+            MemoryRecordKind.SCENE_SPACE,
+        }:
             raise ValueError("语义记忆结果不能使用当前 record_kind。")
         if has_instance and self.record_kind != MemoryRecordKind.OBJECT_INSTANCE:
             raise ValueError("语义实例结果的 record_kind 必须为 object_instance。")
         if has_event and self.record_kind != MemoryRecordKind.OBSERVATION_EVENT:
             raise ValueError("观察事件结果的 record_kind 必须为 observation_event。")
+        if has_scene_space and self.record_kind != MemoryRecordKind.SCENE_SPACE:
+            raise ValueError("场景空间结果的 record_kind 必须为 scene_space。")
         return self
 
 
@@ -144,6 +178,8 @@ class MemoryPayloadFilter(ContractModel):
     vision_tags_any: List[str] = Field(default_factory=list, description="要求命中任一视觉语义标签。")
     topo_node_ids: List[str] = Field(default_factory=list, description="限定拓扑节点列表。")
     anchor_ids: List[str] = Field(default_factory=list, description="限定空间锚点列表。")
+    scene_space_ids: List[str] = Field(default_factory=list, description="限定场景空间列表。")
+    review_statuses: List[SceneSpaceReviewStatus] = Field(default_factory=list, description="限定场景空间审核状态。")
     instance_types: List[str] = Field(default_factory=list, description="限定实例类型列表。")
     movabilities: List[str] = Field(default_factory=list, description="限定实例可移动性列表。")
     created_after: Optional[datetime] = Field(default=None, description="仅保留指定时间之后的记录。")
@@ -153,6 +189,11 @@ class MemoryPayloadFilter(ContractModel):
     last_seen_before: Optional[datetime] = Field(default=None, description="仅保留指定时间之前最后见到的记录。")
     near_pose: Optional[Pose] = Field(default=None, description="限定靠近指定位姿。")
     max_distance_m: Optional[float] = Field(default=None, ge=0.0, description="与 near_pose 的最大距离。")
+
+    @field_validator("scene_space_ids")
+    @classmethod
+    def _validate_filter_scene_space_ids(cls, value: List[str]) -> List[str]:
+        return [validate_scene_space_id(item) for item in value]
 
 
 class MemoryNavigationCandidate(TimestampedContract):
@@ -166,6 +207,7 @@ class MemoryNavigationCandidate(TimestampedContract):
     map_version_id: Optional[str] = Field(default=None, description="候选所在地图版本。")
     topo_node_id: Optional[str] = Field(default=None, description="候选拓扑节点标识。")
     semantic_region_id: Optional[str] = Field(default=None, description="候选语义区域标识。")
+    scene_space_id: Optional[str] = Field(default=None, description="候选场景空间标识。")
     distance_m: Optional[float] = Field(default=None, ge=0.0, description="相对当前位姿的距离。")
     verification_query: Optional[str] = Field(default=None, description="到点后建议复核的文本查询。")
     verification_artifact_id: Optional[str] = Field(default=None, description="到点复核参考制品。")
@@ -179,7 +221,17 @@ class MemoryNavigationCandidate(TimestampedContract):
             return validate_location_id(value)
         if value.startswith("mem_"):
             return validate_memory_id(value)
+        if value.startswith("ssp_"):
+            return validate_scene_space_id(value)
         return value
+
+
+    @field_validator("scene_space_id")
+    @classmethod
+    def _validate_navigation_scene_space_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_scene_space_id(value)
 
 
 class MemoryArrivalVerification(TimestampedContract):

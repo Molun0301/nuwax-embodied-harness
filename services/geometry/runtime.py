@@ -19,7 +19,10 @@ from providers.localization import LocalizationProvider
 from providers.maps import MapProvider
 from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
+from providers.pointcloud import PointCloudProvider
 from services.geometry.config import PlatformGeometryConfig
+from services.geometry.live_map_provider import Ros2LiveMapProvider
+from services.geometry.pointcloud_publisher import Ros2PointCloudPublisher
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig, NavigationControlConfig
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
 from services.navigation.frontier import FrontierExplorer
@@ -59,6 +62,8 @@ class PlatformGeometryRuntime:
         self._catalog_root.mkdir(parents=True, exist_ok=True)
         self._active_map_version: Optional[MapVersion] = None
         self._last_activation_result: Dict[str, object] = {}
+        self._live_map_provider = Ros2LiveMapProvider(config)
+        self._point_cloud_publisher = Ros2PointCloudPublisher(config, self._resolve_point_cloud_provider)
         self._platform_navigation_runtime = PlatformNavigationRuntime(self)
         self._platform_exploration_runtime = PlatformExplorationRuntime(
             frontier_explorer=FrontierExplorer(ExplorationConfig(enabled=True)),
@@ -70,8 +75,20 @@ class PlatformGeometryRuntime:
     def start(self) -> None:
         """启动平台几何运行时。"""
 
+        if not self._is_geometry_profile_enabled():
+            return
+        self._point_cloud_publisher.start()
+        try:
+            self._live_map_provider.start()
+        except Exception:
+            self._point_cloud_publisher.stop()
+            raise
+
     def stop(self) -> None:
         """停止平台几何运行时。"""
+
+        self._live_map_provider.stop()
+        self._point_cloud_publisher.stop()
 
     def is_available(self) -> bool:
         """返回是否存在可供平台消费的几何后端。"""
@@ -129,12 +146,16 @@ class PlatformGeometryRuntime:
                 source_kind = "platform_device_bridge"
             elif backend is getattr(self.robot, "providers", None):
                 source_kind = "platform_compat_provider"
+            elif backend is self._live_map_provider:
+                source_kind = "platform_live_map_provider"
             else:
                 source_kind = "platform_backend"
             backend_name = getattr(backend, "provider_name", None)
         return {
             "source_kind": source_kind,
             "backend_name": backend_name,
+            "live_map_provider": self._live_map_provider.get_status(),
+            "point_cloud_publisher": self._point_cloud_publisher.get_status(),
             "active_map_name": self._active_map_version.map_name if self._active_map_version is not None else None,
             "active_map_version_id": self._active_map_version.version_id if self._active_map_version is not None else None,
             **self.config.build_metadata(),
@@ -356,7 +377,15 @@ class PlatformGeometryRuntime:
         return self._resolve_backend(LocalizationDataPlane, LocalizationProvider)
 
     def _resolve_mapping_backend(self):
+        if self._live_map_provider.is_available():
+            return self._live_map_provider
         return self._resolve_backend(MappingDataPlane, MapProvider)
+
+    def _resolve_point_cloud_provider(self):
+        providers = getattr(self.robot, "providers", None)
+        if providers is not None and isinstance(providers, PointCloudProvider):
+            return providers
+        return None
 
     def _resolve_navigation_backend(self):
         if not self._is_geometry_profile_enabled():
@@ -1103,8 +1132,9 @@ class PlatformGeometryProviderBundle(
         backend = self.runtime._resolve_mapping_backend()
         if backend is None:
             return False
-        if isinstance(backend, MappingDataPlane):
-            return bool(backend.is_map_available())
+        availability_checker = getattr(backend, "is_map_available", None)
+        if callable(availability_checker):
+            return bool(availability_checker())
         return bool(backend.is_available())
 
     def is_navigation_available(self) -> bool:

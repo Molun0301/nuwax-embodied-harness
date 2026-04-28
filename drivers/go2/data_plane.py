@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 
-from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
 from contracts.pointcloud import PointCloudFrame, PointField, PointFieldDataType
 from contracts.robot_state import IMUState
 from logging_utils import LogRateLimiter
@@ -474,6 +474,30 @@ class Go2DataPlaneRuntime:
     def is_started(self) -> bool:
         return self._started
 
+    def is_localization_available(self) -> bool:
+        return self.get_current_pose() is not None
+
+    def get_current_pose(self) -> Optional[Pose]:
+        return None if self.bridge is None else self.bridge.get_current_pose()
+
+    def get_frame_tree(self) -> Optional[FrameTree]:
+        pose = self.get_current_pose()
+        if pose is None:
+            return None
+        return FrameTree(root_frame_id=pose.frame_id)
+
+    def get_localization_state(self) -> Dict[str, Any]:
+        pose = self.get_current_pose()
+        bridge_status = self.bridge.get_status() if self.bridge is not None else {}
+        return {
+            "tracking_state": "odom_available" if pose is not None else "odom_lost",
+            "map_loaded": False,
+            "quality_score": 1.0 if pose is not None else 0.0,
+            "last_error": None if pose is not None else "Go2 DDS 位姿尚未收到。",
+            "pose_source": bridge_status.get("pose_source"),
+            "dds_pose_ready": bridge_status.get("dds_pose_ready"),
+        }
+
     def get_imu_state(self) -> Optional[IMUState]:
         return None if self.bridge is None else self.bridge.get_imu_state()
 
@@ -839,6 +863,18 @@ class Go2DeviceDataPlane:
 
     def get_status(self) -> Dict[str, Any]:
         return self.runtime.get_status()
+
+    def is_localization_available(self) -> bool:
+        return self.runtime.is_localization_available()
+
+    def get_current_pose(self) -> Optional[Pose]:
+        return self.runtime.get_current_pose()
+
+    def get_frame_tree(self) -> Optional[FrameTree]:
+        return self.runtime.get_frame_tree()
+
+    def get_localization_state(self) -> Dict[str, Any]:
+        return self.runtime.get_localization_state()
 
     def get_imu_state(self) -> Optional[IMUState]:
         return self.runtime.get_imu_state()

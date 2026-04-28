@@ -58,6 +58,9 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 if is_truthy "${NUWAX_GEOMETRY_ENABLED:-false}"; then
+  if is_truthy "${NUWAX_GEOMETRY_REQUIRE_ROS2:-false}"; then
+    export NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV="${NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV:-true}"
+  fi
   source_runtime_script "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
 fi
 

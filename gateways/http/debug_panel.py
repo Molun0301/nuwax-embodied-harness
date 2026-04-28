@@ -642,132 +642,267 @@ def _render_debug_page(access_token: str) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>nuwax_robot_bridge 本机只读调试面板</title>
+  <title>nuwax_robot_bridge 只读机器人监控驾驶舱</title>
   <style>
-    :root { color-scheme: dark; --bg: #0d0f0e; --surface: #121614; --panel: #171c1a; --panel-soft: #1d2421; --panel-strong: #222b27; --border: #34413b; --border-soft: #26302c; --text: #eef3ed; --muted: #9aa79f; --good: #6fda8c; --warn: #e7b44a; --bad: #ef6b72; --info: #62c8c4; --accent: #8ab4f8; --map-line: #8ab4f8; --unknown: #4d5650; --free: #dfe6dc; --occupied: #141716; --frontier: #d783ff; }
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --bg-radial-a: rgba(34, 211, 238, 0.18);
+      --bg-radial-b: rgba(124, 58, 237, 0.14);
+      --surface: rgba(11, 18, 32, 0.92);
+      --surface-strong: rgba(15, 23, 42, 0.96);
+      --panel: rgba(15, 23, 42, 0.92);
+      --panel-soft: rgba(30, 41, 59, 0.74);
+      --panel-strong: rgba(30, 41, 59, 0.96);
+      --border: rgba(148, 163, 184, 0.22);
+      --border-soft: rgba(148, 163, 184, 0.14);
+      --border-strong: rgba(34, 211, 238, 0.42);
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --muted-strong: #cbd5e1;
+      --good: #86efac;
+      --warn: #fde68a;
+      --bad: #fca5a5;
+      --info: #93c5fd;
+      --accent: #22d3ee;
+      --accent-strong: #67e8f9;
+      --map-line: #22d3ee;
+      --map-robot: #fbbf24;
+      --unknown: #334155;
+      --free: #dbeafe;
+      --occupied: #020617;
+      --frontier: #f472b6;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
+      --shadow-soft: 0 14px 38px rgba(0, 0, 0, 0.24);
+    }
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; }
-    body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 0; }
-    .app-shell { max-width: 1760px; margin: 0 auto; }
-    .topbar { display: grid; grid-template-columns: minmax(260px, 0.55fr) minmax(520px, 1.45fr); gap: 14px; align-items: stretch; margin-bottom: 14px; }
-    .brand-block, .global-status { background: rgba(18, 22, 20, 0.92); border: 1px solid var(--border); border-radius: 8px; padding: 14px; box-shadow: 0 14px 34px rgba(0, 0, 0, 0.26); }
-    .brand-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    body {
+      margin: 0;
+      padding: 20px;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 8% 8%, var(--bg-radial-a), transparent 32rem),
+        radial-gradient(circle at 92% 6%, var(--bg-radial-b), transparent 36rem),
+        linear-gradient(135deg, #020617 0%, var(--bg) 46%, #0f172a 100%);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+      letter-spacing: 0;
+    }
+    .app-shell { max-width: 1780px; margin: 0 auto; }
+    .topbar { display: grid; grid-template-columns: minmax(300px, 0.62fr) minmax(560px, 1.38fr); gap: 16px; align-items: stretch; margin-bottom: 16px; }
+    .brand-block, .global-status {
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(145deg, rgba(15, 23, 42, 0.94), rgba(15, 23, 42, 0.72));
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 18px;
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(18px);
+    }
+    .brand-block::before, .global-status::before, .panel::before, .card::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(103, 232, 249, 0.7), transparent);
+      pointer-events: none;
+    }
+    .brand-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
     h1, h2, h3 { margin: 0; }
-    h1 { font-size: 24px; font-weight: 720; }
-    h2 { font-size: 16px; font-weight: 650; }
-    h3 { font-size: 13px; color: #d7d2c8; font-weight: 620; }
-    code { color: #9bd7d3; word-break: break-all; }
-    canvas { display: block; width: 100%; border-radius: 6px; background: #0b0b0a; border: 1px solid #2d2e29; }
+    h1 { font-size: clamp(26px, 2.1vw, 38px); line-height: 1.08; font-weight: 780; letter-spacing: -0.04em; }
+    h2 { font-size: 17px; line-height: 1.3; font-weight: 720; letter-spacing: -0.01em; }
+    h3 { font-size: 14px; line-height: 1.35; color: var(--muted-strong); font-weight: 680; }
+    code { color: #a5f3fc; word-break: break-all; }
+    canvas { display: block; width: 100%; border-radius: 18px; background: #020617; border: 1px solid rgba(148, 163, 184, 0.18); box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.92); }
     .muted { color: var(--muted); }
-    .small { font-size: 12px; }
-    .eyebrow { color: var(--info); font-size: 12px; font-weight: 650; text-transform: uppercase; }
-    .readonly { color: #b6ede8; }
-    .grid { display: grid; gap: 12px; }
-    .mission-layout { display: grid; grid-template-columns: 176px minmax(0, 1fr); gap: 14px; align-items: start; }
-    .side-nav { position: sticky; top: 16px; display: grid; gap: 6px; padding: 10px; background: rgba(18, 22, 20, 0.88); border: 1px solid var(--border); border-radius: 8px; }
-    .side-nav a { color: #cbd8d1; text-decoration: none; border: 1px solid transparent; border-radius: 6px; padding: 8px 9px; font-size: 13px; }
-    .side-nav a:hover { border-color: var(--border); background: var(--panel-soft); color: var(--text); }
-    .mission-content { display: grid; gap: 12px; min-width: 0; }
-    .section-band { scroll-margin-top: 16px; display: grid; gap: 12px; }
-    .section-title { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 0 2px; }
-    .overview-grid { grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); }
+    .small { font-size: 12px; line-height: 1.55; }
+    .eyebrow { color: var(--accent-strong); font-size: 12px; font-weight: 780; letter-spacing: 0.12em; text-transform: uppercase; }
+    .readonly { color: #bae6fd; }
+    .grid { display: grid; gap: 14px; }
+    .mission-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 16px; align-items: start; }
+    .side-nav {
+      position: sticky;
+      top: 18px;
+      display: grid;
+      gap: 7px;
+      padding: 10px;
+      background: rgba(15, 23, 42, 0.78);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(14px);
+    }
+    .side-nav a {
+      color: var(--muted-strong);
+      text-decoration: none;
+      border: 1px solid transparent;
+      border-radius: 13px;
+      padding: 10px 11px;
+      font-size: 13px;
+      font-weight: 650;
+      transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease, transform 0.16s ease;
+    }
+    .side-nav a:hover { border-color: var(--border-strong); background: rgba(34, 211, 238, 0.1); color: var(--text); transform: translateX(2px); }
+    .mission-content { display: grid; gap: 14px; min-width: 0; }
+    .section-band { scroll-margin-top: 18px; display: grid; gap: 14px; }
+    .section-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 0 3px; }
+    .overview-grid { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); align-items: stretch; }
     .mission-grid { grid-template-columns: minmax(260px, 0.8fr) minmax(260px, 0.8fr) minmax(320px, 1fr); }
-    .workspace { grid-template-columns: minmax(660px, 1.25fr) minmax(430px, 0.75fr); align-items: start; }
+    .workspace { grid-template-columns: minmax(680px, 1.28fr) minmax(440px, 0.72fr); align-items: start; }
     .right-rail { grid-template-columns: 1fr; }
-    .card, .panel { background: rgba(23, 28, 26, 0.94); border: 1px solid var(--border); border-radius: 8px; padding: 12px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22); }
-    .panel.compact { padding: 10px; }
-    .status-card { display: grid; gap: 7px; min-height: 112px; }
-    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-    .global-status { display: grid; grid-template-columns: repeat(6, minmax(108px, 1fr)); gap: 8px; align-items: stretch; }
+    .card, .panel {
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(180deg, var(--panel), rgba(15, 23, 42, 0.82));
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 15px;
+      box-shadow: var(--shadow-soft);
+    }
+    .panel.compact { padding: 13px; }
+    .status-card { display: grid; gap: 10px; min-height: 176px; align-content: start; }
+    .status-card .card-head { align-items: flex-start; }
+    .status-card .kv { grid-template-columns: minmax(98px, 0.38fr) minmax(0, 1fr); }
+    .status-card .kv div { min-width: 0; }
+    .status-card .mono { white-space: normal; word-break: normal; overflow-wrap: break-word; }
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .global-status { display: grid; grid-template-columns: repeat(4, minmax(126px, 1fr)); gap: 10px; align-items: stretch; }
     .metric-strip { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
-    .metric { border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; background: var(--panel-soft); color: #d9d3c8; min-width: 112px; }
-    .metric b { display: block; font-size: 14px; color: var(--text); }
-    .metric span { display: block; color: var(--muted); font-size: 11px; }
-    .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 8px; font-size: 12px; border: 1px solid var(--border); background: #101412; color: #d8d3ca; white-space: nowrap; }
-    .pill::before { content: ""; width: 7px; height: 7px; border-radius: 999px; background: var(--muted); }
-    .pill.available::before { background: var(--good); }
-    .pill.stale::before { background: var(--warn); }
+    .metric {
+      border: 1px solid var(--border-soft);
+      border-radius: 16px;
+      padding: 10px 11px;
+      background: rgba(15, 23, 42, 0.72);
+      color: var(--muted-strong);
+      min-width: 126px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+    }
+    .metric b { display: block; font-size: 15px; color: var(--text); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+    .metric span { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 1px solid var(--border);
+      background: rgba(15, 23, 42, 0.78);
+      color: var(--muted-strong);
+      white-space: nowrap;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+    }
+    .pill::before { content: ""; width: 8px; height: 8px; border-radius: 999px; background: var(--muted); box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.12); }
+    .pill.available { border-color: rgba(134, 239, 172, 0.44); background: rgba(22, 101, 52, 0.24); color: #dcfce7; }
+    .pill.available::before { background: var(--good); box-shadow: 0 0 16px rgba(134, 239, 172, 0.62); }
+    .pill.stale { border-color: rgba(253, 230, 138, 0.46); background: rgba(113, 63, 18, 0.26); color: #fef3c7; }
+    .pill.stale::before { background: var(--warn); box-shadow: 0 0 16px rgba(253, 230, 138, 0.55); }
+    .pill.missing, .pill.unsupported { border-color: rgba(148, 163, 184, 0.28); background: rgba(51, 65, 85, 0.32); color: #cbd5e1; }
     .pill.missing::before, .pill.unsupported::before { background: var(--unknown); }
-    .pill.error::before { background: var(--bad); }
-    .estop { border-color: rgba(239, 107, 114, 0.55); color: #ffd5d7; background: rgba(95, 20, 25, 0.3); }
-    .kv { display: grid; grid-template-columns: minmax(104px, 0.42fr) minmax(0, 1fr); gap: 5px 8px; font-size: 12px; }
+    .pill.error { border-color: rgba(252, 165, 165, 0.5); background: rgba(127, 29, 29, 0.3); color: #fee2e2; }
+    .pill.error::before { background: var(--bad); box-shadow: 0 0 16px rgba(252, 165, 165, 0.6); }
+    .estop { border-color: rgba(252, 165, 165, 0.58); color: #fee2e2; background: rgba(127, 29, 29, 0.22); }
+    .kv { display: grid; grid-template-columns: minmax(112px, 0.42fr) minmax(0, 1fr); gap: 6px 10px; font-size: 12px; line-height: 1.45; }
     .kv div:nth-child(odd) { color: var(--muted); }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; }
-    .empty, .error-text { color: #ffd0d0; background: rgba(116, 28, 33, 0.22); border: 1px solid rgba(244, 109, 117, 0.35); border-radius: 8px; padding: 9px; }
-    .notice { color: #ffe1a8; background: rgba(115, 78, 21, 0.22); border: 1px solid rgba(244, 185, 66, 0.35); border-radius: 8px; padding: 9px; }
-    .panel-meta { margin-top: 8px; }
-    .canvas-wrap { position: relative; background: #0b0b0a; border-radius: 6px; }
-    #mapCanvas { height: min(62vh, 680px); min-height: 430px; image-rendering: pixelated; }
-    #pointCloudMapCanvas { height: 410px; }
-    #pointCloudCanvas { height: 190px; }
-    .video-stage { position: relative; border-radius: 6px; overflow: hidden; border: 1px solid #2d2e29; background: #080a09; }
-    .video-frame { display: block; width: 100%; min-height: 220px; max-height: 340px; object-fit: contain; background: #0b0b0a; }
-    .video-overlay { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; justify-content: space-between; gap: 8px; pointer-events: none; }
-    .overlay-chip { border: 1px solid rgba(98, 200, 196, 0.35); background: rgba(8, 12, 11, 0.72); border-radius: 6px; padding: 5px 7px; font-size: 12px; color: #d7eee9; }
-    .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+    .kv div:nth-child(even) { color: var(--muted-strong); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; overflow-wrap: break-word; word-break: normal; font-variant-numeric: tabular-nums; }
+    .empty, .error-text { color: #fee2e2; background: rgba(127, 29, 29, 0.2); border: 1px solid rgba(252, 165, 165, 0.28); border-radius: 14px; padding: 10px 11px; }
+    .notice { color: #fef3c7; background: rgba(113, 63, 18, 0.22); border: 1px solid rgba(253, 230, 138, 0.28); border-radius: 14px; padding: 10px 11px; }
+    .panel-meta { margin-top: 10px; }
+    .canvas-wrap { position: relative; background: #020617; border-radius: 18px; padding: 1px; border: 1px solid rgba(148, 163, 184, 0.16); }
+    #mapCanvas { height: min(64vh, 700px); min-height: 450px; image-rendering: pixelated; }
+    #pointCloudMapCanvas { height: 420px; }
+    #pointCloudCanvas { height: 200px; }
+    .video-stage { position: relative; border-radius: 18px; overflow: hidden; border: 1px solid rgba(148, 163, 184, 0.18); background: #020617; box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.9); }
+    .video-frame { display: block; width: 100%; min-height: 230px; max-height: 360px; object-fit: contain; background: #020617; }
+    .video-overlay { position: absolute; left: 12px; right: 12px; bottom: 12px; display: flex; justify-content: space-between; gap: 8px; pointer-events: none; }
+    .overlay-chip { border: 1px solid rgba(34, 211, 238, 0.36); background: rgba(2, 6, 23, 0.78); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: #cffafe; backdrop-filter: blur(10px); }
+    .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
     .legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
-    .swatch { width: 12px; height: 12px; border: 1px solid #777268; border-radius: 3px; }
-    .logs { display: grid; gap: 7px; max-height: 340px; overflow: auto; }
-    .log-line { border: 1px solid #2d2e29; border-radius: 8px; padding: 8px; background: #121210; }
-    .log-line .meta { color: #8fd8d3; font-size: 12px; margin-bottom: 4px; }
-    .log-line.warn .meta, .log-line.warning .meta { color: #ffe1a8; }
-    .log-line.error .meta, .log-line.critical .meta { color: #ffd0d0; }
+    .swatch { width: 13px; height: 13px; border: 1px solid rgba(226, 232, 240, 0.42); border-radius: 4px; }
+    .logs { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 2px; }
+    .log-line { border: 1px solid var(--border-soft); border-left: 3px solid rgba(147, 197, 253, 0.64); border-radius: 13px; padding: 9px 10px; background: rgba(2, 6, 23, 0.46); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.45; }
+    .log-line .meta { color: #93c5fd; font-size: 12px; margin-bottom: 4px; }
+    .log-line.warn, .log-line.warning { border-left-color: rgba(253, 230, 138, 0.82); }
+    .log-line.warn .meta, .log-line.warning .meta { color: #fef3c7; }
+    .log-line.error, .log-line.critical { border-left-color: rgba(252, 165, 165, 0.88); }
+    .log-line.error .meta, .log-line.critical .meta { color: #fecaca; }
     .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .field { min-height: 30px; border: 1px solid var(--border); border-radius: 6px; background: #101412; color: var(--text); padding: 5px 8px; font: inherit; font-size: 12px; }
-    .service-list, .event-list, .task-list { display: grid; gap: 7px; }
-    .service-row, .task-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 8px; align-items: center; border: 1px solid var(--border-soft); border-radius: 7px; padding: 8px; background: #121715; }
+    .field { min-height: 34px; border: 1px solid var(--border); border-radius: 12px; background: rgba(2, 6, 23, 0.5); color: var(--text); padding: 7px 10px; font: inherit; font-size: 12px; outline: none; }
+    .field:focus { border-color: var(--border-strong); box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.12); }
+    .service-list, .event-list, .task-list { display: grid; gap: 8px; }
+    .service-row, .task-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 8px; align-items: center; border: 1px solid var(--border-soft); border-radius: 13px; padding: 9px 10px; background: rgba(15, 23, 42, 0.62); }
     .service-row .meta, .task-row .meta { color: var(--muted); font-size: 12px; }
-    .health-line { height: 6px; border-radius: 999px; background: linear-gradient(90deg, var(--good), var(--info)); opacity: 0.9; }
-    .health-line.warn { background: linear-gradient(90deg, var(--warn), #f97316); }
-    .health-line.bad { background: linear-gradient(90deg, var(--bad), #a61f2b); }
+    .health-line { height: 6px; border-radius: 999px; background: linear-gradient(90deg, var(--good), var(--accent)); opacity: 0.95; }
+    .health-line.warn { background: linear-gradient(90deg, var(--warn), #fb923c); }
+    .health-line.bad { background: linear-gradient(90deg, var(--bad), #ef4444); }
     .split-two { grid-template-columns: 1fr 1fr; }
-    @media (max-width: 1280px) { .topbar, .mission-layout, .workspace, .mission-grid { grid-template-columns: 1fr; } .side-nav { position: static; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); } .global-status { grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); } }
-    @media (max-width: 720px) { body { padding: 10px; } .split-two { grid-template-columns: 1fr; } .metric-strip { justify-content: flex-start; } #mapCanvas, #pointCloudMapCanvas { min-height: 320px; } }
+    @media (max-width: 1280px) {
+      .topbar, .mission-layout, .workspace, .mission-grid { grid-template-columns: 1fr; }
+      .side-nav { position: static; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
+      .side-nav a:hover { transform: none; }
+      .global-status { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+      .overview-grid { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+    }
+    @media (max-width: 720px) {
+      body { padding: 10px; }
+      .brand-block, .global-status, .panel, .card { border-radius: 16px; padding: 12px; }
+      .split-two { grid-template-columns: 1fr; }
+      .metric-strip { justify-content: flex-start; }
+      .global-status { grid-template-columns: 1fr 1fr; }
+      .kv { grid-template-columns: 1fr; }
+      .overview-grid { grid-template-columns: 1fr; }
+      #mapCanvas, #pointCloudMapCanvas { min-height: 320px; }
+      #pointCloudCanvas { height: 180px; }
+    }
   </style>
 </head>
 <body>
   <div class="app-shell">
   <header class="topbar">
     <div class="brand-block">
-      <div class="eyebrow">只读局域网监控</div>
+      <div class="eyebrow">只读机器人观测</div>
       <div class="brand-row">
         <h1 id="robotName">nuwax_robot_bridge</h1>
-        <span id="robotModel" class="pill missing">model: --</span>
+        <span id="robotModel" class="pill missing">型号：--</span>
       </div>
-      <div class="muted small panel-meta">Robotics mission control dashboard · 只读观察面</div>
+      <div class="muted small panel-meta">机器人监控驾驶舱 · 只读观察、诊断和空间态势汇总</div>
     </div>
     <div class="global-status">
-      <div class="metric"><b id="connectionText">connecting</b><span>连接状态</span></div>
+      <div class="metric"><b id="connectionText">connecting</b><span>网关连接</span></div>
       <div class="metric"><b id="runtimeMode">--</b><span>运行模式</span></div>
-      <div class="metric"><b id="batteryMetric">--</b><span>电池</span></div>
-      <div class="metric"><b id="networkLatency" class="mono">--</b><span>HTTP 往返</span></div>
-      <div class="metric"><b id="resourceMetric">--</b><span>CPU/GPU/RAM</span></div>
+      <div class="metric"><b id="batteryMetric">--</b><span>电池状态</span></div>
+      <div class="metric"><b id="networkLatency" class="mono">--</b><span>HTTP（超文本传输协议）往返</span></div>
+      <div class="metric"><b id="resourceMetric">--</b><span>资源/任务</span></div>
       <div class="metric"><b id="clockNow" class="mono">--</b><span>当前时间</span></div>
-      <div class="metric"><b id="lastReceive" class="mono">--</b><span>前端接收</span></div>
-      <div class="metric"><b>&lt;500 ms</b><span>轻量链路目标 P95</span></div>
-      <span id="estopStatus" class="pill estop">Emergency Stop: read-only</span>
+      <div class="metric"><b id="lastReceive" class="mono">--</b><span>数据接收</span></div>
+      <div class="metric"><b>&lt;500 ms</b><span>P95（第 95 百分位）目标</span></div>
+      <span id="estopStatus" class="pill estop">急停状态：只读展示</span>
     </div>
   </header>
 
   <div class="mission-layout">
     <aside class="side-nav" aria-label="页面导航">
-      <a href="#overview">Overview</a>
-      <a href="#live-map">Live Map</a>
-      <a href="#pointcloud-map">3D Map</a>
-      <a href="#video-perception">Video</a>
-      <a href="#navigation">Navigation</a>
-      <a href="#services">Services</a>
-      <a href="#logs-section">Logs</a>
-      <a href="#runtime-settings">Settings</a>
+      <a href="#overview">运行总览</a>
+      <a href="#live-map">2D 地图</a>
+      <a href="#pointcloud-map">3D 点云</a>
+      <a href="#video-perception">视频感知</a>
+      <a href="#navigation">导航态势</a>
+      <a href="#services">服务矩阵</a>
+      <a href="#logs-section">日志</a>
+      <a href="#runtime-settings">运行治理</a>
     </aside>
 
     <div class="mission-content">
   <section id="overview" class="section-band">
     <div class="section-title">
-      <h2>Overview</h2>
+      <h2>运行态总览</h2>
       <span id="missionStatus" class="pill missing">mission: warming</span>
     </div>
-    <section id="overviewGrid" class="grid overview-grid" aria-label="顶部总览"></section>
+    <section id="overviewGrid" class="grid overview-grid" aria-label="运行态总览"></section>
     <div class="grid mission-grid">
       <section class="panel compact">
         <div class="card-head"><h3>当前任务</h3><span id="taskStatus" class="pill missing">missing</span></div>
@@ -787,17 +922,17 @@ def _render_debug_page(access_token: str) -> str:
   <main class="grid workspace">
     <section id="live-map" class="panel">
       <div class="card-head">
-        <h2>2D 地图、定位与轨迹</h2>
+        <h2>空间态势 · 2D 地图 / 定位 / 轨迹</h2>
         <span id="mapStatus" class="pill missing">missing</span>
       </div>
       <div class="canvas-wrap"><canvas id="mapCanvas" width="960" height="620"></canvas></div>
       <div class="legend">
-        <span class="legend-item"><span class="swatch" style="background: var(--unknown)"></span>unknown</span>
-        <span class="legend-item"><span class="swatch" style="background: var(--free)"></span>free</span>
-        <span class="legend-item"><span class="swatch" style="background: var(--occupied)"></span>occupied</span>
+        <span class="legend-item"><span class="swatch" style="background: var(--unknown)"></span>未知</span>
+        <span class="legend-item"><span class="swatch" style="background: var(--free)"></span>可通行</span>
+        <span class="legend-item"><span class="swatch" style="background: var(--occupied)"></span>占据</span>
         <span class="legend-item"><span class="swatch" style="background: var(--map-line)"></span>轨迹</span>
-        <span class="legend-item"><span class="swatch" style="background: #f2a65a"></span>机器人</span>
-        <span class="legend-item"><span class="swatch" style="background: var(--frontier)"></span>frontier</span>
+        <span class="legend-item"><span class="swatch" style="background: var(--map-robot)"></span>机器人</span>
+        <span class="legend-item"><span class="swatch" style="background: var(--frontier)"></span>探索前沿</span>
       </div>
       <div id="mapEmpty" class="empty panel-meta">等待地图数据。</div>
       <div id="mapMeta" class="kv panel-meta"></div>
@@ -821,7 +956,7 @@ def _render_debug_page(access_token: str) -> str:
 
       <section id="scan-diagnostics" class="panel">
         <div class="card-head">
-          <h2>实时扫描帧诊断</h2>
+          <h2>实时扫描诊断</h2>
           <span id="pointcloudStatus" class="pill missing">missing</span>
         </div>
         <div class="canvas-wrap"><canvas id="pointCloudCanvas" width="620" height="190"></canvas></div>
@@ -831,11 +966,11 @@ def _render_debug_page(access_token: str) -> str:
 
       <section id="navigation" class="panel">
         <div class="card-head">
-          <h2>navigation / frontier</h2>
+          <h2>导航态势 / frontier（探索前沿）</h2>
           <span id="navigationStatus" class="pill missing">missing</span>
         </div>
         <div id="navigationMeta" class="kv"></div>
-        <div id="frontierNotice" class="notice panel-meta">等待 frontier 候选几何。</div>
+        <div id="frontierNotice" class="notice panel-meta">等待探索前沿候选几何。</div>
       </section>
 
       <section id="runtime-settings" class="panel">
@@ -849,14 +984,14 @@ def _render_debug_page(access_token: str) -> str:
 
       <section id="video-perception" class="panel">
         <div class="card-head">
-          <h2>视频与感知</h2>
+          <h2>视频感知</h2>
           <span id="videoStatus" class="pill missing">missing</span>
         </div>
         <div class="video-stage">
           <img id="videoFrame" class="video-frame" alt="实时视频帧" hidden>
           <div class="video-overlay">
-            <span id="visionModelStatus" class="overlay-chip">local model: --</span>
-            <span id="videoFpsStatus" class="overlay-chip">fps: --</span>
+            <span id="visionModelStatus" class="overlay-chip">本地模型：--</span>
+            <span id="videoFpsStatus" class="overlay-chip">帧率：--</span>
           </div>
         </div>
         <div id="videoEmpty" class="empty panel-meta">等待视频帧。</div>
@@ -865,7 +1000,7 @@ def _render_debug_page(access_token: str) -> str:
 
       <section id="services" class="panel">
         <div class="card-head">
-          <h2>服务状态</h2>
+          <h2>服务矩阵</h2>
           <span id="servicesStatus" class="pill missing">missing</span>
         </div>
         <div id="serviceMatrix" class="service-list"></div>
@@ -873,7 +1008,7 @@ def _render_debug_page(access_token: str) -> str:
 
       <section id="logs-section" class="panel">
         <div class="card-head">
-          <h2>真实日志 tail</h2>
+          <h2>运行日志尾部</h2>
           <span id="logsStatus" class="pill missing">missing</span>
         </div>
         <div class="toolbar">
@@ -886,7 +1021,7 @@ def _render_debug_page(access_token: str) -> str:
             <option value="error">ERROR</option>
             <option value="critical">CRITICAL</option>
           </select>
-          <input id="logSearch" class="field" type="search" placeholder="搜索日志" aria-label="搜索日志">
+          <input id="logSearch" class="field" type="search" placeholder="搜索日志、节点或关键词" aria-label="搜索日志">
         </div>
         <div id="logsMeta" class="kv"></div>
         <div id="logs" class="logs panel-meta"></div>
@@ -905,8 +1040,27 @@ def _render_debug_page(access_token: str) -> str:
       const DEBUG_ACCESS_TOKEN = __DEBUG_ACCESS_TOKEN__;
       const urlAccessToken = new URLSearchParams(window.location.search).get("access_token") || "";
       const apiAccessToken = urlAccessToken || DEBUG_ACCESS_TOKEN;
+      const CANVAS_THEME = {
+        mapBackground: "#020617",
+        mapUnknown: [51, 65, 85],
+        mapFree: [219, 234, 254],
+        mapOccupied: [2, 6, 23],
+        trajectory: "#22d3ee",
+        frontier: "#f472b6",
+        frontierStroke: "#fbcfe8",
+        robot: "#fbbf24",
+        robotStroke: "#fef3c7",
+        cloudBackground: "#020617",
+        cloudGrid: "rgba(34, 211, 238, 0.14)",
+        cloudText: "#cbd5e1",
+        axisX: "#fb923c",
+        axisY: "#22d3ee",
+        axisZ: "#c084fc",
+        scanAxis: "#475569",
+        scanText: "#cbd5e1",
+      };
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
-      const overviewLabels = { health: "health", state: "state", localization: "localization", map: "map", navigation: "navigation", exploration: "exploration", runtime_governance: "RTAB-Map治理", pointcloud_map: "点云地图", pointcloud: "扫描帧", video: "video", logs: "logs" };
+      const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "点云地图", pointcloud: "扫描帧", video: "视频", logs: "日志" };
       const state = {
         mapGrid: null,
         mapViewport: null,
@@ -1076,6 +1230,12 @@ def _render_debug_page(access_token: str) -> str:
           els.overviewGrid.appendChild(section);
         }
       }
+      function summarizeSource(source) {
+        const value = String(source || "");
+        if (!value) return "--";
+        const parts = value.split(/[/.]/).filter(Boolean);
+        return parts.length ? parts[parts.length - 1].slice(0, 28) : value.slice(0, 28);
+      }
       function updateOverview(envelope) {
         const data = envelope && envelope.data ? envelope.data : {};
         state.latestOverview = data;
@@ -1087,10 +1247,10 @@ def _render_debug_page(access_token: str) -> str:
           if (!section) continue;
           setPill(section.querySelector(".pill"), summary.status || "missing");
           setKv(section.querySelector(".kv"), [
-            ["source_timestamp", shortTime(summary.source_timestamp)],
-            ["latency", fmt(summary.latency_ms, " ms")],
-            ["stale", summary.stale === true ? "true" : "false"],
-            ["source", summary.metadata && summary.metadata.source],
+            ["时间", shortTime(summary.source_timestamp)],
+            ["延迟", fmt(summary.latency_ms, " ms")],
+            ["过期", summary.stale === true ? "是" : "否"],
+            ["来源", summarizeSource(summary.metadata && summary.metadata.source)],
           ]);
           section.querySelector(".small").textContent = `前端接收 ${shortTime(envelope.__receivedAt)}`;
         }
@@ -1157,7 +1317,7 @@ def _render_debug_page(access_token: str) -> str:
         const health = payload || {};
         state.latestHealth = health;
         setText(els.robotName, health.robot_name || "nuwax_robot_bridge");
-        setPill(els.robotModel, health.runtime_started ? "available" : "missing", `model: ${safeText(health.robot_model)}`);
+        setPill(els.robotModel, health.runtime_started ? "available" : "missing", `型号：${safeText(health.robot_model)}`);
         const robot = health.latest_robot_snapshot || {};
         const status = health.assembly_status || {};
         const safety = robot.safety || {};
@@ -1170,7 +1330,7 @@ def _render_debug_page(access_token: str) -> str:
         setText(els.batteryMetric, batteryValue);
         setText(els.resourceMetric, `tasks ${health.active_task_count ?? 0} · events ${health.latest_event_cursor ?? 0}`);
         const estopped = safety.is_estopped === true || safety.estopped === true;
-        setPill(els.estopStatus, estopped ? "error" : "available", estopped ? "Emergency Stop: active" : "Emergency Stop: clear");
+        setPill(els.estopStatus, estopped ? "error" : "available", estopped ? "急停状态：触发" : "急停状态：清除");
         els.estopStatus.classList.add("estop");
       }
       function updateTasks(payload) {
@@ -1272,7 +1432,7 @@ def _render_debug_page(access_token: str) -> str:
         const canvas = els.mapCanvas;
         const ctx = canvas.getContext("2d");
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = "#020617";
+        ctx.fillStyle = CANVAS_THEME.mapBackground;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         const grid = state.mapGrid;
         if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) {
@@ -1293,9 +1453,9 @@ def _render_debug_page(access_token: str) -> str:
             const sourceIndex = row * width + col;
             const targetIndex = ((height - 1 - row) * width + col) * 4;
             const value = Number(grid.data[sourceIndex]);
-            let color = [71, 85, 105];
-            if (value >= 65) color = [17, 24, 39];
-            else if (value >= 0) color = [226, 232, 240];
+            let color = CANVAS_THEME.mapUnknown;
+            if (value >= 65) color = CANVAS_THEME.mapOccupied;
+            else if (value >= 0) color = CANVAS_THEME.mapFree;
             image.data[targetIndex] = color[0];
             image.data[targetIndex + 1] = color[1];
             image.data[targetIndex + 2] = color[2];
@@ -1325,8 +1485,8 @@ def _render_debug_page(access_token: str) -> str:
       function drawFrontiers(ctx) {
         if (!state.frontiers || !state.frontiers.length) return;
         ctx.save();
-        ctx.fillStyle = "#d946ef";
-        ctx.strokeStyle = "#f5d0fe";
+        ctx.fillStyle = CANVAS_THEME.frontier;
+        ctx.strokeStyle = CANVAS_THEME.frontierStroke;
         ctx.lineWidth = 1;
         for (const frontier of state.frontiers) {
           const point = mapToCanvas(pointFromFrontier(frontier));
@@ -1341,7 +1501,7 @@ def _render_debug_page(access_token: str) -> str:
       function drawTrajectory(ctx) {
         if (!state.trajectory || state.trajectory.length < 2) return;
         ctx.save();
-        ctx.strokeStyle = "#38bdf8";
+        ctx.strokeStyle = CANVAS_THEME.trajectory;
         ctx.lineWidth = 2;
         ctx.beginPath();
         let started = false;
@@ -1361,8 +1521,8 @@ def _render_debug_page(access_token: str) -> str:
         ctx.save();
         ctx.translate(point.x, point.y);
         ctx.rotate(-yaw);
-        ctx.fillStyle = "#f97316";
-        ctx.strokeStyle = "#fed7aa";
+        ctx.fillStyle = CANVAS_THEME.robot;
+        ctx.strokeStyle = CANVAS_THEME.robotStroke;
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(10, 0);
@@ -1510,9 +1670,9 @@ def _render_debug_page(access_token: str) -> str:
         const canvas = els.pointcloudMapCanvas;
         const ctx = canvas.getContext("2d");
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = "#080807";
+        ctx.fillStyle = CANVAS_THEME.cloudBackground;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.strokeStyle = "#2d2e29";
+        ctx.strokeStyle = CANVAS_THEME.cloudGrid;
         ctx.lineWidth = 1;
         for (let x = 24; x < canvas.width; x += 44) {
           ctx.beginPath();
@@ -1526,7 +1686,7 @@ def _render_debug_page(access_token: str) -> str:
           ctx.lineTo(canvas.width, y);
           ctx.stroke();
         }
-        ctx.fillStyle = "#a7a29a";
+        ctx.fillStyle = CANVAS_THEME.cloudText;
         ctx.font = "14px system-ui";
         ctx.fillText(message || "等待累计点云地图。", 16, 32);
       }
@@ -1558,11 +1718,11 @@ def _render_debug_page(access_token: str) -> str:
         const scale = Math.min(canvas.width, canvas.height) * 0.78 / projectedSpan;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         const gradient = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
-        gradient.addColorStop(0, "#0b1113");
-        gradient.addColorStop(1, "#0a0a09");
+        gradient.addColorStop(0, "#07111f");
+        gradient.addColorStop(1, CANVAS_THEME.cloudBackground);
         ctx.fillStyle = gradient;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.strokeStyle = "rgba(93, 199, 194, 0.12)";
+        ctx.strokeStyle = CANVAS_THEME.cloudGrid;
         ctx.lineWidth = 1;
         for (let i = -5; i <= 5; i += 1) {
           const a = projectPoint([min[0], center[1] + i * span[1] / 10, min[2]], center, cos, sin, scale, canvas);
@@ -1598,9 +1758,9 @@ def _render_debug_page(access_token: str) -> str:
       function drawPointCloudMapAxes(ctx, center, cos, sin, scale, canvas, span) {
         const origin = projectPoint(center, center, cos, sin, scale, canvas);
         const axes = [
-          { label: "X", color: "#f97316", end: [center[0] + span[0] * 0.18, center[1], center[2]] },
-          { label: "Y", color: "#5dc7c2", end: [center[0], center[1] + span[1] * 0.18, center[2]] },
-          { label: "Z", color: "#d783ff", end: [center[0], center[1], center[2] + span[2] * 0.28] },
+          { label: "X", color: CANVAS_THEME.axisX, end: [center[0] + span[0] * 0.18, center[1], center[2]] },
+          { label: "Y", color: CANVAS_THEME.axisY, end: [center[0], center[1] + span[1] * 0.18, center[2]] },
+          { label: "Z", color: CANVAS_THEME.axisZ, end: [center[0], center[1], center[2] + span[2] * 0.28] },
         ];
         ctx.save();
         ctx.font = "12px system-ui";
@@ -1686,10 +1846,10 @@ def _render_debug_page(access_token: str) -> str:
         const ctx = canvas.getContext("2d");
         const started = performance.now();
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = "#020617";
+        ctx.fillStyle = CANVAS_THEME.cloudBackground;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         if (!points.length) {
-          ctx.fillStyle = "#94a3b8";
+          ctx.fillStyle = CANVAS_THEME.cloudText;
           ctx.font = "14px system-ui";
           ctx.fillText("等待真实点云 points。", 16, 36);
           return performance.now() - started;
@@ -1710,7 +1870,7 @@ def _render_debug_page(access_token: str) -> str:
         const scale = Math.min((canvas.width - 28) / rangeX, (canvas.height - 28) / rangeY);
         const offsetX = (canvas.width - rangeX * scale) / 2;
         const offsetY = (canvas.height - rangeY * scale) / 2;
-        ctx.fillStyle = "#38bdf8";
+        ctx.fillStyle = CANVAS_THEME.axisY;
         for (const p of parsed) {
           const x = offsetX + (p.x - minX) * scale;
           const y = canvas.height - (offsetY + (p.y - minY) * scale);
@@ -1718,12 +1878,12 @@ def _render_debug_page(access_token: str) -> str:
           ctx.fillStyle = `hsl(${190 + zRatio * 90}, 90%, ${55 + zRatio * 20}%)`;
           ctx.fillRect(x, y, 2, 2);
         }
-        ctx.strokeStyle = "#334155";
+        ctx.strokeStyle = CANVAS_THEME.scanAxis;
         ctx.beginPath();
         ctx.moveTo(14, canvas.height - 18); ctx.lineTo(58, canvas.height - 18);
         ctx.moveTo(14, canvas.height - 18); ctx.lineTo(14, canvas.height - 62);
         ctx.stroke();
-        ctx.fillStyle = "#cbd5e1";
+        ctx.fillStyle = CANVAS_THEME.scanText;
         ctx.font = "12px system-ui";
         ctx.fillText("X/Y 俯视投影 · 颜色表示 Z", 68, canvas.height - 16);
         return performance.now() - started;
@@ -1786,8 +1946,8 @@ def _render_debug_page(access_token: str) -> str:
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
-        setText(els.visionModelStatus, `local model: ${status}`);
-        setText(els.videoFpsStatus, `frames ${state.videoFrames} · latency ${fmt(envelope.latency_ms, " ms")}`);
+        setText(els.visionModelStatus, `本地模型：${status}`);
+        setText(els.videoFpsStatus, `帧 ${state.videoFrames} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
       }
       function updateLogs(envelope) {
         const status = statusOf(envelope);

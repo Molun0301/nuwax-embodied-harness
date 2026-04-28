@@ -31,6 +31,7 @@ from settings import NuwaxRobotBridgeConfig, configure_logging, load_config
 APP_LOGGER = logging.getLogger("nuwax_robot_bridge.gateway")
 HTTP_LOGGER = logging.getLogger("nuwax_robot_bridge.http")
 _LOW_VALUE_HTTP_PATHS = frozenset(("/api/health", "/events/stream", "/ops"))
+_LOW_VALUE_HTTP_PREFIXES = ("/api/debug/",)
 _REQUEST_LOG_RATE_LIMIT_SEC = 30.0
 
 
@@ -46,7 +47,7 @@ def _resolve_client_host(request: Request) -> str:
 def _should_rate_limit_http_request(path: str, status_code: int) -> bool:
     if status_code >= 400:
         return False
-    return path in _LOW_VALUE_HTTP_PATHS
+    return path in _LOW_VALUE_HTTP_PATHS or any(path.startswith(prefix) for prefix in _LOW_VALUE_HTTP_PREFIXES)
 
 
 def create_gateway_app(

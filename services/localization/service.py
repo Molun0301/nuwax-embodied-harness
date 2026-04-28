@@ -6,7 +6,8 @@ import time
 from contracts.base import utc_now
 from contracts.events import RuntimeEventCategory
 from contracts.frame_semantics import frame_ids_semantically_equal
-from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus, LocalizationSnapshot
+from contracts.geometry import Pose
+from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus, LocalizationSnapshot, RelocalizationCandidate
 from core import EventBus, StateNamespace, StateStore
 from gateways.errors import GatewayError
 from providers import LocalizationProvider
@@ -67,9 +68,12 @@ class LocalizationService:
         map_version_id: str,
         frame_id: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
+        geometry_asset: Optional[Dict[str, object]] = None,
     ) -> LocalizationSession:
         """确保当前存在绑定到指定地图版本的平台定位会话。"""
 
+        resolved_geometry_asset = self._clone_metadata(geometry_asset) if geometry_asset is not None else None
+        asset_failure = self._resolve_geometry_asset_failure(resolved_geometry_asset)
         existing = self._active_session
         if (
             existing is not None
@@ -84,16 +88,37 @@ class LocalizationService:
                 )
             )
         ):
-            return existing
+            if resolved_geometry_asset is None or existing.geometry_asset == resolved_geometry_asset:
+                return existing
+            updated = existing.model_copy(
+                update={
+                    "geometry_asset": resolved_geometry_asset,
+                    "status": LocalizationSessionStatus.FAILED if asset_failure else existing.status,
+                    "last_error": asset_failure or existing.last_error,
+                    "metadata": {
+                        **dict(existing.metadata),
+                        "geometry_asset_summary": resolved_geometry_asset,
+                        **dict(metadata or {}),
+                    },
+                },
+                deep=True,
+            )
+            self._set_active_session(updated)
+            return updated
         session = LocalizationSession(
             session_id=self._build_session_id(map_name=map_name, map_version_id=map_version_id),
             map_name=str(map_name or "").strip(),
             map_version_id=str(map_version_id or "").strip(),
             frame_id=str(frame_id or "").strip() or None,
-            status=LocalizationSessionStatus.LOCALIZING,
+            status=LocalizationSessionStatus.FAILED if asset_failure else LocalizationSessionStatus.LOCALIZING,
             source_name="platform_localization_runtime",
             pose_available=False,
-            metadata=dict(metadata or {}),
+            geometry_asset=resolved_geometry_asset,
+            last_error=asset_failure,
+            metadata={
+                **dict(metadata or {}),
+                "geometry_asset_summary": resolved_geometry_asset,
+            },
         )
         self._latest_snapshot = None
         self._set_active_session(session)
@@ -107,6 +132,7 @@ class LocalizationService:
         frame_id: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
         force_relocalize: bool = False,
+        geometry_asset: Optional[Dict[str, object]] = None,
     ) -> LocalizationSession:
         """刷新当前平台定位会话，使用平台状态机管理定位生命周期。
 
@@ -129,6 +155,7 @@ class LocalizationService:
             map_version_id=map_version_id,
             frame_id=frame_id,
             metadata=metadata,
+            geometry_asset=geometry_asset,
         )
 
         provider = self._get_localization_provider()
@@ -185,9 +212,20 @@ class LocalizationService:
 
         # 映射到 LocalizationSessionStatus
         session_status = self._map_machine_state_to_session_status(machine_state)
+        asset_failure = self._resolve_geometry_asset_failure(session.geometry_asset)
+        if asset_failure:
+            session_status = LocalizationSessionStatus.FAILED
+
+        relocalization_candidates = self._build_relocalization_candidates(
+            diagnostics=diagnostics,
+            current_pose=current_pose,
+            geometry_asset=session.geometry_asset,
+            session_status=session_status,
+        )
+        last_relocalization = relocalization_candidates[-1] if relocalization_candidates else None
 
         # 构建 last_error
-        last_error = self._build_session_last_error(
+        last_error = asset_failure or self._build_session_last_error(
             diagnostics=diagnostics,
             session_status=session_status,
         )
@@ -206,6 +244,9 @@ class LocalizationService:
                 "provider_name": provider_name,
                 "machine_state": machine_state,
                 "diagnostics": diagnostics.model_dump(mode="json"),
+                "relocalization_candidates": [item.model_dump(mode="json") for item in relocalization_candidates],
+                "last_relocalization": last_relocalization.model_dump(mode="json") if last_relocalization is not None else None,
+                "geometry_asset_summary": session.geometry_asset,
                 "force_relocalize": force_relocalize,
                 **dict(metadata or {}),
             },
@@ -217,11 +258,14 @@ class LocalizationService:
                 "status": session_status,
                 "source_name": provider_name,
                 "pose_available": session_status == LocalizationSessionStatus.READY,
+                "relocalization_candidates": relocalization_candidates,
+                "last_relocalization": last_relocalization,
                 "last_localized_at": utc_now() if session_status == LocalizationSessionStatus.READY else session.last_localized_at,
                 "last_error": last_error,
                 "metadata": {
                     **dict(session.metadata),
                     "machine_state": machine_state,
+                    "asset_failure": asset_failure,
                     **dict(snapshot.metadata),
                 },
             },
@@ -237,6 +281,7 @@ class LocalizationService:
         map_version_id: str,
         frame_id: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
+        geometry_asset: Optional[Dict[str, object]] = None,
     ) -> LocalizationSession:
         """对当前激活会话执行平台级重定位。
 
@@ -261,12 +306,136 @@ class LocalizationService:
                 **dict(metadata or {}),
             },
             force_relocalize=False,  # 状态机已处理重定位
+            geometry_asset=geometry_asset,
         )
 
     def get_localization_diagnostics(self) -> Optional[LocalizationDiagnostics]:
         """返回当前平台定位诊断信息。"""
 
         return self._last_diagnostics
+
+    def _build_relocalization_candidates(
+        self,
+        *,
+        diagnostics: LocalizationDiagnostics,
+        current_pose: Optional[object],
+        geometry_asset: Optional[Dict[str, object]],
+        session_status: LocalizationSessionStatus,
+    ) -> Tuple[RelocalizationCandidate, ...]:
+        metadata = dict(diagnostics.metadata or {})
+        backend_metadata = metadata.get("backend_state") if isinstance(metadata.get("backend_state"), dict) else {}
+        raw_candidates = (
+            backend_metadata.get("relocalization_candidates")
+            or metadata.get("relocalization_candidates")
+            or backend_metadata.get("icp_candidates")
+            or metadata.get("icp_candidates")
+            or []
+        )
+        candidates = []
+        if isinstance(raw_candidates, list):
+            for item in raw_candidates:
+                if isinstance(item, dict):
+                    candidates.append(self._candidate_from_metadata(item, geometry_asset=geometry_asset))
+        if candidates:
+            return tuple(candidates)
+        backend = str(metadata.get("backend_type") or diagnostics.backend_name or "unknown")
+        quality_metadata = backend_metadata.get("quality") if isinstance(backend_metadata.get("quality"), dict) else {}
+        failure_reason = diagnostics.last_error if session_status != LocalizationSessionStatus.READY else None
+        return (
+            RelocalizationCandidate(
+                backend=backend,
+                pose=current_pose if isinstance(current_pose, Pose) and session_status == LocalizationSessionStatus.READY else None,
+                fitness=self._optional_float(
+                    backend_metadata.get("fitness")
+                    or backend_metadata.get("icp_fitness")
+                    or quality_metadata.get("fitness")
+                ),
+                inlier_ratio=self._optional_float(
+                    backend_metadata.get("inlier_ratio")
+                    or backend_metadata.get("inlier")
+                    or backend_metadata.get("icp_inlier_ratio")
+                    or quality_metadata.get("inlier_ratio")
+                ),
+                covariance=self._resolve_candidate_covariance(backend_metadata),
+                asset_refs=self._resolve_candidate_asset_refs(geometry_asset),
+                failure_reason=failure_reason,
+                metadata={
+                    "status": session_status.value,
+                    "backend_state": diagnostics.backend_state,
+                    "quality_unknown": True,
+                    "diagnostics": diagnostics.model_dump(mode="json"),
+                },
+            ),
+        )
+
+    def _candidate_from_metadata(
+        self,
+        item: Dict[str, object],
+        *,
+        geometry_asset: Optional[Dict[str, object]],
+    ) -> RelocalizationCandidate:
+        return RelocalizationCandidate(
+            backend=str(item.get("backend") or item.get("backend_type") or item.get("source") or "unknown"),
+            pose=item.get("pose") if isinstance(item.get("pose"), Pose) else None,
+            fitness=self._optional_float(item.get("fitness") or item.get("icp_fitness")),
+            inlier_ratio=self._optional_float(item.get("inlier_ratio") or item.get("inlier")),
+            covariance=self._resolve_candidate_covariance(item),
+            asset_refs=self._resolve_candidate_asset_refs(geometry_asset, item.get("asset_refs")),
+            failure_reason=str(item.get("failure_reason") or item.get("last_error") or "").strip() or None,
+            metadata=self._clone_metadata(item),
+        )
+
+    def _resolve_geometry_asset_failure(self, geometry_asset: Optional[Dict[str, object]]) -> Optional[str]:
+        if not geometry_asset:
+            return None
+        quality_metrics = geometry_asset.get("quality_metrics")
+        if not isinstance(quality_metrics, dict):
+            return None
+        if quality_metrics.get("status") == "failed":
+            for item in quality_metrics.get("diagnostics") or []:
+                if isinstance(item, dict) and item.get("level") == "error":
+                    return str(item.get("message") or item.get("code") or "几何资产不可用。")
+            return "几何资产不可用。"
+        database = quality_metrics.get("database")
+        if isinstance(database, dict) and database.get("present") is False:
+            return "地图版本缺少 RTAB-Map database 资产。"
+        return None
+
+    def _resolve_candidate_asset_refs(
+        self,
+        geometry_asset: Optional[Dict[str, object]],
+        explicit_refs: Optional[object] = None,
+    ) -> list[Dict[str, object]]:
+        if isinstance(explicit_refs, list):
+            return [self._clone_metadata(item) for item in explicit_refs if isinstance(item, dict)]
+        if not geometry_asset:
+            return []
+        assets = geometry_asset.get("assets")
+        if isinstance(assets, list):
+            return [self._clone_metadata(item) for item in assets if isinstance(item, dict)]
+        refs = []
+        for asset_type, path_key in (("rtabmap_database", "rtabmap_db_path"), ("pcd", "pcd_path")):
+            path = str(geometry_asset.get(path_key) or "").strip()
+            if path:
+                refs.append({"asset_type": asset_type, "path": path, "frame_id": geometry_asset.get("frame_id")})
+        return refs
+
+    def _resolve_candidate_covariance(self, metadata: Dict[str, object]) -> Optional[Dict[str, object]]:
+        covariance = metadata.get("covariance") or metadata.get("pose_covariance")
+        if isinstance(covariance, dict):
+            return self._clone_metadata(covariance)
+        if covariance is not None:
+            return {"value": self._clone_metadata(covariance)}
+        return {"status": "unknown"}
+
+    @staticmethod
+    def _optional_float(value: object) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _build_localization_diagnostics(
         self,
@@ -322,6 +491,7 @@ class LocalizationService:
                 "backend_type": state.backend_type,
                 "loop_closure": state.loop_closure_detected,
                 "relocalizing": state.relocalization_in_progress,
+                "backend_state": self._clone_metadata(backend_state),
             },
         )
 
@@ -429,6 +599,7 @@ class LocalizationService:
             map_version_id=session.map_version_id,
             frame_id=session.frame_id,
             metadata=metadata,
+            geometry_asset=session.geometry_asset,
         )
 
     def get_active_session(self) -> Optional[LocalizationSession]:
@@ -537,6 +708,18 @@ class LocalizationService:
 
     def _capture_provider_data(self, provider: LocalizationProvider):
         return provider.get_current_pose(), provider.get_frame_tree()
+
+    @classmethod
+    def _clone_metadata(cls, value):
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        if isinstance(value, dict):
+            return {key: cls._clone_metadata(inner) for key, inner in value.items()}
+        if isinstance(value, list):
+            return [cls._clone_metadata(item) for item in value]
+        if isinstance(value, tuple):
+            return [cls._clone_metadata(item) for item in value]
+        return value
 
     def _set_active_session(self, session: LocalizationSession) -> LocalizationSession:
         self._active_session = session

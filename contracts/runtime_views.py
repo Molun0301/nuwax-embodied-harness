@@ -132,6 +132,19 @@ class LocalizationSessionStatus(StrEnum):
     FAILED = "failed"
 
 
+class RelocalizationCandidate(TimestampedContract):
+    """RTAB-Map/ICP 重定位候选结果。"""
+
+    backend: str = Field(default="unknown", description="产生候选的重定位后端。")
+    pose: Optional[Pose] = Field(default=None, description="候选位姿。")
+    fitness: Optional[float] = Field(default=None, description="匹配 fitness，未知时为空。")
+    inlier_ratio: Optional[float] = Field(default=None, description="ICP 内点比例，未知时为空。")
+    covariance: Optional[MetadataDict] = Field(default=None, description="协方差摘要，未知时为空。")
+    asset_refs: List[MetadataDict] = Field(default_factory=list, description="候选所引用的地图几何资产。")
+    failure_reason: Optional[str] = Field(default=None, description="候选失败原因。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加诊断元数据。")
+
+
 class LocalizationSession(TimestampedContract):
     """平台侧定位会话。"""
 
@@ -145,6 +158,9 @@ class LocalizationSession(TimestampedContract):
     )
     source_name: str = Field(default="platform_localization_runtime", description="定位会话来源名称。")
     pose_available: bool = Field(default=False, description="当前是否已有可用于平台定位的位姿。")
+    geometry_asset: Optional[MetadataDict] = Field(default=None, description="当前定位会话绑定的几何资产摘要。")
+    relocalization_candidates: List[RelocalizationCandidate] = Field(default_factory=list, description="最近 RTAB-Map/ICP 重定位候选。")
+    last_relocalization: Optional[RelocalizationCandidate] = Field(default=None, description="最近一次重定位结果。")
     last_localized_at: Optional[datetime] = Field(default=None, description="最近一次定位就绪时间。")
     last_error: Optional[str] = Field(default=None, description="最近一次定位失败或未就绪说明。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
@@ -220,6 +236,17 @@ class NavigationContext(TimestampedContract):
     backend_name: Optional[str] = Field(default=None, description="导航后端名称。")
     goal_reached: bool = Field(default=False, description="当前目标是否到达。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class RuntimeGovernanceSummary(TimestampedContract):
+    """运行时观察与治理摘要。"""
+
+    rtabmap_profile: MetadataDict = Field(default_factory=dict, description="RTAB-Map profile 摘要。")
+    geometry_asset: MetadataDict = Field(default_factory=dict, description="当前地图几何资产摘要。")
+    localization_session: MetadataDict = Field(default_factory=dict, description="当前定位会话摘要。")
+    last_relocalization: MetadataDict = Field(default_factory=dict, description="最近一次 RTAB-Map/ICP 重定位摘要。")
+    navigation_control_policy: MetadataDict = Field(default_factory=dict, description="导航控制策略摘要。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加治理元数据。")
 
 
 class ExplorationContext(TimestampedContract):

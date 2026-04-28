@@ -6,11 +6,12 @@ import json
 import math
 from pathlib import Path
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from contracts.base import utc_now
 from contracts.debug_views import (
@@ -23,6 +24,7 @@ from contracts.debug_views import (
     DebugMapView,
     DebugNavigationView,
     DebugOverviewView,
+    DebugPointCloudMapView,
     DebugPointCloudView,
     DebugSourceSummary,
     DebugVideoView,
@@ -31,6 +33,12 @@ from gateways.auth import GatewayAccessManager
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable
 from providers import ImageProvider
+from services.geometry.pointcloud_map import (
+    PointCloudMap,
+    PointCloudMapCache,
+    PointCloudMapError,
+    UnsupportedPointCloudMapError,
+)
 
 
 _LOG_LINE_RE = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d{1,6})?) \[(?P<level>[A-Z]+)\] \[(?P<source>[^\]]+)\] (?P<message>.*)$")
@@ -43,10 +51,14 @@ _STALE_THRESHOLDS_SEC = {
     "trajectory": 2.0,
     "navigation": 3.0,
     "exploration": 3.0,
+    "runtime_governance": 3.0,
+    "pointcloud_map": 3.0,
     "pointcloud": 1.0,
     "video": 1.0,
     "logs": 10.0,
 }
+
+_POINTCLOUD_MAP_CACHE = PointCloudMapCache()
 
 
 def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
@@ -65,11 +77,13 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     async def debug_overview(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         health_summary = runtime.get_health_summary()
+        runtime_governance = runtime.get_runtime_governance_summary()
         state_snapshot = runtime.robot_state_service.get_latest_snapshot()
         localization_snapshot = runtime.localization_service.get_latest_snapshot()
         map_snapshot = runtime.mapping_service.get_latest_snapshot()
         navigation_context = runtime.navigation_service.get_latest_navigation_context()
         exploration_context = runtime.navigation_service.get_latest_exploration_context()
+        pointcloud_map_info = await run_in_threadpool(lambda: _get_pointcloud_map_summary(runtime))
         pointcloud = await run_in_threadpool(lambda: _get_latest_pointcloud(runtime))
         video_info = await run_in_threadpool(lambda: _get_video_summary(runtime))
         log_info = await run_in_threadpool(lambda: _get_log_file_summary(runtime))
@@ -118,6 +132,24 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 message=_exploration_message(exploration_context),
                 metadata=_exploration_metadata(exploration_context),
             ),
+            runtime_governance=_summary_from_payload(
+                name="runtime_governance",
+                source="gateway_runtime",
+                timestamp=_timestamp_from_value(runtime_governance),
+                available=True,
+                message=_runtime_governance_message(runtime_governance),
+                metadata=_runtime_governance_metadata(runtime_governance),
+            ),
+            pointcloud_map=_summary_from_payload(
+                name="pointcloud_map",
+                source=str(pointcloud_map_info.get("source", "pointcloud_map")),
+                timestamp=pointcloud_map_info.get("timestamp"),
+                frame_id=pointcloud_map_info.get("frame_id"),
+                revision=pointcloud_map_info.get("revision"),
+                available=bool(pointcloud_map_info.get("available")),
+                message=str(pointcloud_map_info.get("message") or ""),
+                metadata=dict(pointcloud_map_info.get("metadata") or {}),
+            ),
             pointcloud=_summary_from_payload(
                 name="pointcloud",
                 source=_pointcloud_source(pointcloud),
@@ -125,7 +157,12 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 frame_id=getattr(pointcloud, "frame_id", None),
                 sequence=_sequence_from_metadata(pointcloud),
                 available=pointcloud is not None,
-                metadata=_pointcloud_metrics(pointcloud),
+                metadata={
+                    **_pointcloud_metrics(pointcloud),
+                    "diagnostic_role": "side_channel",
+                    "not_pointcloud_map": True,
+                    "map_source": "pointcloud_map",
+                },
             ),
             video=_summary_from_payload(
                 name="video",
@@ -156,6 +193,8 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 _timestamp_from_value(map_snapshot),
                 _navigation_timestamp(navigation_context),
                 _exploration_timestamp(exploration_context),
+                _timestamp_from_value(runtime_governance),
+                pointcloud_map_info.get("timestamp"),
                 _timestamp_from_value(pointcloud),
                 video_info.get("timestamp"),
                 log_info.get("timestamp"),
@@ -296,6 +335,127 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             error=error,
         )
 
+    @router.get("/api/debug/pointcloud-map/latest/meta")
+    async def debug_pointcloud_map_meta(request: Request) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        started_at = time.perf_counter()
+        descriptor = _resolve_pointcloud_map_descriptor(runtime)
+        pcd_path = str(descriptor.get("pcd_path") or "").strip()
+        if not pcd_path:
+            return _missing_envelope(
+                payload_type="pointcloud_map.meta",
+                source="pointcloud_map",
+                status=DebugDataStatus.MISSING,
+                code="source_unavailable",
+                message="未找到当前激活地图版本的 PCD 点云地图资产；不会回退到最新扫描帧。",
+                data=_missing_pointcloud_map_view(descriptor, started_at),
+            )
+        try:
+            pointcloud_map = await run_in_threadpool(
+                lambda: _POINTCLOUD_MAP_CACHE.load_pcd(
+                    Path(pcd_path),
+                    frame_id=str(descriptor.get("frame_id") or "map"),
+                    source_kind=str(descriptor.get("source_kind") or "map_version_pcd"),
+                )
+            )
+        except UnsupportedPointCloudMapError as exc:
+            return _pointcloud_map_error_envelope(descriptor, str(exc), started_at, code="unsupported_pcd_format")
+        except PointCloudMapError as exc:
+            return _pointcloud_map_error_envelope(descriptor, str(exc), started_at, code="pcd_parse_failed")
+        view = _pointcloud_map_view(pointcloud_map, descriptor, started_at)
+        return _envelope(
+            payload_type="pointcloud_map.meta",
+            source=str(descriptor.get("source") or "pointcloud_map"),
+            data=view,
+            source_timestamp=utc_now(),
+            frame_id=pointcloud_map.frame_id,
+            revision=pointcloud_map.revision,
+            status=DebugDataStatus.AVAILABLE,
+        )
+
+    @router.get("/api/debug/pointcloud-map/latest.bin")
+    async def debug_pointcloud_map_binary(
+        request: Request,
+        lod: str = "preview",
+        revision: Optional[str] = None,
+    ) -> Response:
+        started_at = time.perf_counter()
+        access_manager.authenticate_http(request)
+        descriptor = _resolve_pointcloud_map_descriptor(runtime)
+        pcd_path = str(descriptor.get("pcd_path") or "").strip()
+        if not pcd_path:
+            return JSONResponse(
+                status_code=404,
+                content=_missing_envelope(
+                    payload_type="pointcloud_map.bin",
+                    source="pointcloud_map",
+                    status=DebugDataStatus.MISSING,
+                    code="source_unavailable",
+                    message="未找到 PCD 点云地图资产；不会回退到最新扫描帧。",
+                    data=_missing_pointcloud_map_view(descriptor, started_at),
+                ),
+            )
+        try:
+            pointcloud_map = await run_in_threadpool(
+                lambda: _POINTCLOUD_MAP_CACHE.load_pcd(
+                    Path(pcd_path),
+                    frame_id=str(descriptor.get("frame_id") or "map"),
+                    source_kind=str(descriptor.get("source_kind") or "map_version_pcd"),
+                )
+            )
+        except UnsupportedPointCloudMapError as exc:
+            return JSONResponse(
+                status_code=422,
+                content=_pointcloud_map_error_envelope(
+                    descriptor,
+                    str(exc),
+                    started_at,
+                    code="unsupported_pcd_format",
+                ),
+            )
+        except PointCloudMapError as exc:
+            return JSONResponse(
+                status_code=422,
+                content=_pointcloud_map_error_envelope(
+                    descriptor,
+                    str(exc),
+                    started_at,
+                    code="pcd_parse_failed",
+                ),
+            )
+        if revision and revision != pointcloud_map.revision:
+            return JSONResponse(
+                status_code=409,
+                content=_envelope(
+                    payload_type="pointcloud_map.bin",
+                    source=str(descriptor.get("source") or "pointcloud_map"),
+                    status=DebugDataStatus.STALE,
+                    frame_id=pointcloud_map.frame_id,
+                    revision=pointcloud_map.revision,
+                    error=DebugError(
+                        code="revision_changed",
+                        message="点云地图 revision 已变化，请先重新读取 meta。",
+                        details={"requested_revision": revision, "current_revision": pointcloud_map.revision},
+                    ),
+                    data=_pointcloud_map_view(pointcloud_map, descriptor, started_at),
+                ),
+            )
+        normalized_lod = str(lod or "preview").strip().lower() or "preview"
+        points = pointcloud_map.lod_points(normalized_lod)
+        payload = pointcloud_map.binary_xyz(normalized_lod)
+        headers = {
+            "X-PointCloud-Revision": pointcloud_map.revision,
+            "X-PointCloud-Frame-Id": pointcloud_map.frame_id,
+            "X-PointCloud-Point-Count": str(int(points.shape[0])),
+            "X-PointCloud-Lod": normalized_lod,
+            "X-PointCloud-Format": "float32-xyz",
+            "X-PointCloud-Source-Kind": pointcloud_map.source_kind,
+            "X-PointCloud-Payload-Bytes": str(len(payload)),
+            "X-Server-Compute-Ms": "%.3f" % ((time.perf_counter() - started_at) * 1000.0),
+            "Cache-Control": "no-store",
+        }
+        return Response(content=payload, media_type="application/octet-stream", headers=headers)
+
     @router.get("/api/debug/pointcloud/latest")
     @router.get("/api/debug/pointcloud/frame/latest")
     @router.get("/api/debug/pointcloud/frame/latest/meta")
@@ -310,8 +470,9 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 code="source_unavailable",
                 message="未取得 provider 或 Go2 data_plane 的最新点云帧。",
                 data=DebugPointCloudView(
-                    source="pointcloud_provider",
+                    source="go2_dds_scan_diagnostic",
                     status=DebugDataStatus.MISSING,
+                    metadata={"diagnostic_role": "side_channel", "not_pointcloud_map": True},
                     protection=_pointcloud_protection(runtime),
                 ),
             )
@@ -323,7 +484,12 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             frame_id=getattr(pointcloud, "frame_id", None),
             source=source,
             status=status,
-            metadata=_pointcloud_metadata(pointcloud),
+            metadata={
+                **_pointcloud_metadata(pointcloud),
+                "diagnostic_role": "side_channel",
+                "not_pointcloud_map": True,
+                "map_source_endpoint": "/api/debug/pointcloud-map/latest/meta",
+            },
             point_count=int(getattr(pointcloud, "point_count", 0) or len(points)),
             fields=to_jsonable(getattr(pointcloud, "fields", []) or []),
             points=points,
@@ -332,7 +498,12 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             artifact_ref=getattr(pointcloud, "artifact_id", None),
             data_uri=getattr(pointcloud, "data_uri", None),
             protection=_pointcloud_protection(runtime),
-            metrics={**_pointcloud_metrics(pointcloud), "inline_points": len(points)},
+            metrics={
+                **_pointcloud_metrics(pointcloud),
+                "inline_points": len(points),
+                "diagnostic_role": "side_channel",
+                "not_pointcloud_map": True,
+            },
         )
         return _envelope(
             payload_type="pointcloud.frame",
@@ -398,11 +569,21 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         level: Optional[str] = None,
         source: Optional[str] = None,
     ) -> Dict[str, Any]:
+        started_at = time.perf_counter()
         access_manager.authenticate_http(request)
+        auth_ms = (time.perf_counter() - started_at) * 1000.0
         safe_limit = _clamp_int(limit, default=200, minimum=1, maximum=1000)
         normalized_level = str(level or "").strip().lower()
         normalized_source = str(source or "").strip()
+        resolve_started = time.perf_counter()
         log_path = _resolve_debug_log_path(runtime)
+        path_resolve_ms = (time.perf_counter() - resolve_started) * 1000.0
+        base_metrics = {
+            "auth_ms": auth_ms,
+            "path_resolve_ms": path_resolve_ms,
+            "requested_cursor": max(0, int(cursor or 0)),
+            "requested_limit": safe_limit,
+        }
         if log_path is None:
             return _missing_envelope(
                 payload_type="logs.tail",
@@ -410,9 +591,13 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 status=DebugDataStatus.MISSING,
                 code="source_unavailable",
                 message="未找到配置日志文件。",
-                data=DebugLogsTailView(source_status=DebugDataStatus.MISSING, source_message="未找到配置日志文件。"),
+                data=DebugLogsTailView(
+                    source_status=DebugDataStatus.MISSING,
+                    source_message="未找到配置日志文件。",
+                    metrics={**base_metrics, "server_compute_ms": (time.perf_counter() - started_at) * 1000.0},
+                ),
             )
-        entries, next_cursor, _file_size = await run_in_threadpool(
+        entries, next_cursor, _file_size, tail_metrics = await run_in_threadpool(
             lambda: _tail_log_file(
                 log_path,
                 cursor=max(0, int(cursor or 0)),
@@ -428,6 +613,12 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             entries=entries,
             source_status=status,
             source_message=message,
+            metrics={
+                **base_metrics,
+                **tail_metrics,
+                "returned_entries": len(entries),
+                "server_compute_ms": (time.perf_counter() - started_at) * 1000.0,
+            },
         )
         source_timestamp = _log_file_timestamp(log_path)
         return _envelope(
@@ -453,78 +644,90 @@ def _render_debug_page(access_token: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>nuwax_robot_bridge 本机只读调试面板</title>
   <style>
-    :root { color-scheme: dark; --bg: #0f172a; --panel: #111827; --panel-soft: #172033; --border: #334155; --text: #e5e7eb; --muted: #94a3b8; --good: #22c55e; --warn: #f59e0b; --bad: #ef4444; --info: #38bdf8; --unknown: #475569; --free: #e2e8f0; --occupied: #111827; --frontier: #d946ef; }
+    :root { color-scheme: dark; --bg: #11110f; --panel: #191917; --panel-soft: #22221f; --panel-strong: #262622; --border: #373832; --text: #f3f0e8; --muted: #a7a29a; --good: #7ddf98; --warn: #f4b942; --bad: #f46d75; --info: #5dc7c2; --map-line: #7cc7f2; --unknown: #56554f; --free: #ebe7dc; --occupied: #171715; --frontier: #d783ff; }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 20px; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    header { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; justify-content: space-between; margin-bottom: 16px; }
+    body { margin: 0; padding: 18px; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 0; }
+    .app-shell { max-width: 1720px; margin: 0 auto; }
+    .topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; justify-content: space-between; margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
     h1, h2, h3 { margin: 0; }
-    h1 { font-size: 26px; }
-    h2 { font-size: 18px; }
-    h3 { font-size: 15px; color: #cbd5e1; }
-    code { color: #93c5fd; word-break: break-all; }
-    canvas { display: block; width: 100%; border-radius: 10px; background: #020617; border: 1px solid #1f2937; }
+    h1 { font-size: 24px; font-weight: 680; }
+    h2 { font-size: 16px; font-weight: 650; }
+    h3 { font-size: 13px; color: #d7d2c8; font-weight: 620; }
+    code { color: #9bd7d3; word-break: break-all; }
+    canvas { display: block; width: 100%; border-radius: 6px; background: #0b0b0a; border: 1px solid #2d2e29; }
     .muted { color: var(--muted); }
     .small { font-size: 12px; }
-    .readonly { color: #bfdbfe; }
+    .eyebrow { color: var(--info); font-size: 12px; font-weight: 650; text-transform: uppercase; }
+    .readonly { color: #b6ede8; }
     .grid { display: grid; gap: 12px; }
-    .overview-grid { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); margin-bottom: 12px; }
-    .main-grid { grid-template-columns: minmax(0, 1.4fr) minmax(320px, 0.8fr); align-items: start; }
-    .side-grid { grid-template-columns: 1fr; }
-    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px; box-shadow: 0 14px 30px rgba(2, 6, 23, 0.18); }
-    .status-card { display: grid; gap: 8px; min-height: 146px; }
+    .overview-grid { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); margin-bottom: 12px; }
+    .workspace { grid-template-columns: minmax(620px, 1.25fr) minmax(390px, 0.75fr); align-items: start; }
+    .right-rail { grid-template-columns: 1fr; }
+    .card, .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22); }
+    .status-card { display: grid; gap: 7px; min-height: 126px; }
     .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-    .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 8px; font-size: 12px; border: 1px solid var(--border); background: #0b1220; color: #cbd5e1; white-space: nowrap; }
+    .metric-strip { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
+    .metric { border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; background: var(--panel-soft); color: #d9d3c8; min-width: 118px; }
+    .metric b { display: block; font-size: 14px; color: var(--text); }
+    .metric span { display: block; color: var(--muted); font-size: 11px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 8px; font-size: 12px; border: 1px solid var(--border); background: #10100f; color: #d8d3ca; white-space: nowrap; }
     .pill::before { content: ""; width: 7px; height: 7px; border-radius: 999px; background: var(--muted); }
     .pill.available::before { background: var(--good); }
     .pill.stale::before { background: var(--warn); }
     .pill.missing::before, .pill.unsupported::before { background: var(--unknown); }
     .pill.error::before { background: var(--bad); }
-    .kv { display: grid; grid-template-columns: minmax(92px, 0.45fr) minmax(0, 1fr); gap: 5px 8px; font-size: 12px; }
+    .kv { display: grid; grid-template-columns: minmax(104px, 0.42fr) minmax(0, 1fr); gap: 5px 8px; font-size: 12px; }
     .kv div:nth-child(odd) { color: var(--muted); }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
-    .empty, .error-text { color: #fecaca; background: rgba(127, 29, 29, 0.22); border: 1px solid rgba(248, 113, 113, 0.35); border-radius: 10px; padding: 10px; }
-    .notice { color: #fde68a; background: rgba(120, 53, 15, 0.22); border: 1px solid rgba(251, 191, 36, 0.35); border-radius: 10px; padding: 10px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; }
+    .empty, .error-text { color: #ffd0d0; background: rgba(116, 28, 33, 0.22); border: 1px solid rgba(244, 109, 117, 0.35); border-radius: 8px; padding: 9px; }
+    .notice { color: #ffe1a8; background: rgba(115, 78, 21, 0.22); border: 1px solid rgba(244, 185, 66, 0.35); border-radius: 8px; padding: 9px; }
     .panel-meta { margin-top: 8px; }
-    .map-wrap, .pointcloud-wrap { position: relative; }
-    #mapCanvas { height: min(62vh, 620px); min-height: 360px; image-rendering: pixelated; }
-    #pointCloudCanvas { height: 300px; }
-    .video-frame { display: block; width: 100%; min-height: 220px; max-height: 360px; object-fit: contain; border-radius: 10px; background: #020617; border: 1px solid #1f2937; }
+    .canvas-wrap { position: relative; background: #0b0b0a; border-radius: 6px; }
+    #mapCanvas { height: min(58vh, 620px); min-height: 380px; image-rendering: pixelated; }
+    #pointCloudMapCanvas { height: 360px; }
+    #pointCloudCanvas { height: 190px; }
+    .video-frame { display: block; width: 100%; min-height: 190px; max-height: 300px; object-fit: contain; border-radius: 6px; background: #0b0b0a; border: 1px solid #2d2e29; }
     .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
     .legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
-    .swatch { width: 12px; height: 12px; border: 1px solid #64748b; border-radius: 3px; }
-    .pre { white-space: pre-wrap; overflow: auto; max-height: 210px; padding: 10px; background: #020617; border: 1px solid #1f2937; border-radius: 10px; font-size: 12px; }
-    .logs { display: grid; gap: 8px; max-height: 420px; overflow: auto; }
-    .log-line { border: 1px solid #1f2937; border-radius: 10px; padding: 8px; background: #0b1220; }
-    .log-line .meta { color: #93c5fd; font-size: 12px; margin-bottom: 4px; }
-    .log-line.warn .meta, .log-line.warning .meta { color: #fde68a; }
-    .log-line.error .meta, .log-line.critical .meta { color: #fecaca; }
-    @media (max-width: 980px) { .main-grid { grid-template-columns: 1fr; } body { padding: 12px; } }
+    .swatch { width: 12px; height: 12px; border: 1px solid #777268; border-radius: 3px; }
+    .logs { display: grid; gap: 7px; max-height: 340px; overflow: auto; }
+    .log-line { border: 1px solid #2d2e29; border-radius: 8px; padding: 8px; background: #121210; }
+    .log-line .meta { color: #8fd8d3; font-size: 12px; margin-bottom: 4px; }
+    .log-line.warn .meta, .log-line.warning .meta { color: #ffe1a8; }
+    .log-line.error .meta, .log-line.critical .meta { color: #ffd0d0; }
+    .split-two { grid-template-columns: 1fr 1fr; }
+    @media (max-width: 1180px) { .workspace { grid-template-columns: 1fr; } }
+    @media (max-width: 720px) { body { padding: 10px; } .split-two { grid-template-columns: 1fr; } .metric-strip { justify-content: flex-start; } #mapCanvas, #pointCloudMapCanvas { min-height: 320px; } }
   </style>
 </head>
 <body>
-  <header>
+  <div class="app-shell">
+  <header class="topbar">
     <div>
-      <h1>nuwax_robot_bridge 本机只读调试面板</h1>
-      <p class="muted">该页面仅发起 GET 只读轮询请求，不包含运动、导航、探索或地图修改入口。</p>
+      <div class="eyebrow">只读局域网监控</div>
+      <h1>nuwax_robot_bridge</h1>
     </div>
-    <div class="muted small">轮询周期约 500 ms · 前端接收：<span id="lastReceive" class="mono">--</span></div>
+    <div class="metric-strip">
+      <div class="metric"><b>&lt;500 ms</b><span>轻量链路目标 P95</span></div>
+      <div class="metric"><b id="lastReceive" class="mono">--</b><span>前端接收</span></div>
+    </div>
   </header>
 
   <section id="overviewGrid" class="grid overview-grid" aria-label="顶部总览"></section>
 
-  <main class="grid main-grid">
-    <section class="card">
+  <main class="grid workspace">
+    <section class="panel">
       <div class="card-head">
         <h2>2D 地图、定位与轨迹</h2>
         <span id="mapStatus" class="pill missing">missing</span>
       </div>
-      <div class="map-wrap"><canvas id="mapCanvas" width="960" height="620"></canvas></div>
+      <div class="canvas-wrap"><canvas id="mapCanvas" width="960" height="620"></canvas></div>
       <div class="legend">
         <span class="legend-item"><span class="swatch" style="background: var(--unknown)"></span>unknown</span>
         <span class="legend-item"><span class="swatch" style="background: var(--free)"></span>free</span>
         <span class="legend-item"><span class="swatch" style="background: var(--occupied)"></span>occupied</span>
-        <span class="legend-item"><span class="swatch" style="background: #38bdf8"></span>轨迹</span>
-        <span class="legend-item"><span class="swatch" style="background: #f97316"></span>机器人</span>
+        <span class="legend-item"><span class="swatch" style="background: var(--map-line)"></span>轨迹</span>
+        <span class="legend-item"><span class="swatch" style="background: #f2a65a"></span>机器人</span>
         <span class="legend-item"><span class="swatch" style="background: var(--frontier)"></span>frontier</span>
       </div>
       <div id="mapEmpty" class="empty panel-meta">等待地图数据。</div>
@@ -536,8 +739,28 @@ def _render_debug_page(access_token: str) -> str:
       <div id="localizationMeta" class="kv"></div>
     </section>
 
-    <div class="grid side-grid">
-      <section class="card">
+    <div class="grid right-rail">
+      <section class="panel">
+        <div class="card-head">
+          <h2>3D 点云地图</h2>
+          <span id="pointcloudMapStatus" class="pill missing">missing</span>
+        </div>
+        <div class="canvas-wrap"><canvas id="pointCloudMapCanvas" width="760" height="360"></canvas></div>
+        <div id="pointcloudMapEmpty" class="empty panel-meta">等待 RTAB-Map/PCD 累计点云地图。</div>
+        <div id="pointcloudMapMeta" class="kv panel-meta"></div>
+      </section>
+
+      <section class="panel">
+        <div class="card-head">
+          <h2>实时扫描帧诊断</h2>
+          <span id="pointcloudStatus" class="pill missing">missing</span>
+        </div>
+        <div class="canvas-wrap"><canvas id="pointCloudCanvas" width="620" height="190"></canvas></div>
+        <div id="pointcloudEmpty" class="empty panel-meta">等待最新扫描帧。</div>
+        <div id="pointcloudMeta" class="kv panel-meta"></div>
+      </section>
+
+      <section class="panel">
         <div class="card-head">
           <h2>navigation / frontier</h2>
           <span id="navigationStatus" class="pill missing">missing</span>
@@ -546,17 +769,16 @@ def _render_debug_page(access_token: str) -> str:
         <div id="frontierNotice" class="notice panel-meta">等待 frontier 候选几何。</div>
       </section>
 
-      <section class="card">
+      <section class="panel">
         <div class="card-head">
-          <h2>3D 点云</h2>
-          <span id="pointcloudStatus" class="pill missing">missing</span>
+          <h2>RTAB-Map 运行治理</h2>
+          <span id="governanceStatus" class="pill missing">missing</span>
         </div>
-        <div class="pointcloud-wrap"><canvas id="pointCloudCanvas" width="620" height="300"></canvas></div>
-        <div id="pointcloudEmpty" class="empty panel-meta">等待点云数据。</div>
-        <div id="pointcloudMeta" class="kv panel-meta"></div>
+        <div id="governanceMeta" class="kv"></div>
+        <div class="muted small panel-meta">只读展示 profile、几何资产、重定位质量和导航门控摘要。</div>
       </section>
 
-      <section class="card">
+      <section class="panel">
         <div class="card-head">
           <h2>实时视频</h2>
           <span id="videoStatus" class="pill missing">missing</span>
@@ -566,7 +788,7 @@ def _render_debug_page(access_token: str) -> str:
         <div id="videoMeta" class="kv panel-meta"></div>
       </section>
 
-      <section class="card">
+      <section class="panel">
         <div class="card-head">
           <h2>真实日志 tail</h2>
           <span id="logsStatus" class="pill missing">missing</span>
@@ -576,16 +798,41 @@ def _render_debug_page(access_token: str) -> str:
       </section>
     </div>
   </main>
+  </div>
 
   <script>
     (() => {
-      const POLL_MS = 500;
+      const FAST_POLL_MS = 500;
+      const SENSOR_POLL_MS = 1000;
+      const SLOW_POLL_MS = 1500;
       const DEBUG_ACCESS_TOKEN = __DEBUG_ACCESS_TOKEN__;
       const urlAccessToken = new URLSearchParams(window.location.search).get("access_token") || "";
       const apiAccessToken = urlAccessToken || DEBUG_ACCESS_TOKEN;
-      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "pointcloud", "video", "logs"];
-      const overviewLabels = { health: "health", state: "state", localization: "localization", map: "map", navigation: "navigation", exploration: "exploration", pointcloud: "pointcloud", video: "video", logs: "logs" };
-      const state = { mapGrid: null, mapViewport: null, pose: null, trajectory: [], frontiers: [], logs: [], logCursor: 0, polling: false, videoFrames: 0, pointCloudFrames: 0 };
+      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
+      const overviewLabels = { health: "health", state: "state", localization: "localization", map: "map", navigation: "navigation", exploration: "exploration", runtime_governance: "RTAB-Map治理", pointcloud_map: "点云地图", pointcloud: "扫描帧", video: "video", logs: "logs" };
+      const state = {
+        mapGrid: null,
+        mapViewport: null,
+        pose: null,
+        trajectory: [],
+        frontiers: [],
+        logs: [],
+        logCursor: 0,
+        fastPolling: false,
+        sensorPolling: false,
+        slowPolling: false,
+        videoFrames: 0,
+        pointCloudFrames: 0,
+        pointCloudMapRevision: "",
+        pointCloudMapFrames: 0,
+        pointCloudMapPointCount: 0,
+        pointCloudMapFetchMs: null,
+        pointCloudMapParseMs: null,
+        pointCloudMapRenderMs: null,
+        pointCloudMapBounds: null,
+        pointCloudMapLod: "",
+        pointCloudMapPoints: null,
+      };
       const els = {
         lastReceive: document.getElementById("lastReceive"),
         overviewGrid: document.getElementById("overviewGrid"),
@@ -598,6 +845,12 @@ def _render_debug_page(access_token: str) -> str:
         navigationStatus: document.getElementById("navigationStatus"),
         navigationMeta: document.getElementById("navigationMeta"),
         frontierNotice: document.getElementById("frontierNotice"),
+        governanceStatus: document.getElementById("governanceStatus"),
+        governanceMeta: document.getElementById("governanceMeta"),
+        pointcloudMapCanvas: document.getElementById("pointCloudMapCanvas"),
+        pointcloudMapStatus: document.getElementById("pointcloudMapStatus"),
+        pointcloudMapEmpty: document.getElementById("pointcloudMapEmpty"),
+        pointcloudMapMeta: document.getElementById("pointcloudMapMeta"),
         pointcloudCanvas: document.getElementById("pointCloudCanvas"),
         pointcloudStatus: document.getElementById("pointcloudStatus"),
         pointcloudEmpty: document.getElementById("pointcloudEmpty"),
@@ -658,6 +911,15 @@ def _render_debug_page(access_token: str) -> str:
         json.__frontendLatencyMs = performance.now() - started;
         return json;
       }
+      async function getArrayBuffer(path) {
+        const started = performance.now();
+        const requestPath = withAccessToken(path);
+        const res = await fetch(requestPath, { cache: "no-store" });
+        const receivedAt = new Date();
+        if (!res.ok) throw new Error(`${path} HTTP ${res.status}`);
+        const buffer = await res.arrayBuffer();
+        return { buffer, receivedAt: receivedAt.toISOString(), frontendLatencyMs: performance.now() - started, headers: res.headers };
+      }
       function buildOverview() {
         els.overviewGrid.replaceChildren();
         for (const name of overviewNames) {
@@ -685,7 +947,10 @@ def _render_debug_page(access_token: str) -> str:
         }
       }
       function showPanelError(kind, message) {
-        if (kind === "map") {
+        if (kind === "governance") {
+          setPill(els.governanceStatus, "error");
+          setKv(els.governanceMeta, [["error", message], ["前端接收", nowText()]]);
+        } else if (kind === "map") {
           setPill(els.mapStatus, "error");
           els.mapEmpty.hidden = false;
           els.mapEmpty.textContent = message;
@@ -695,6 +960,10 @@ def _render_debug_page(access_token: str) -> str:
         } else if (kind === "navigation") {
           setPill(els.navigationStatus, "error");
           setKv(els.navigationMeta, [["error", message], ["前端接收", nowText()]]);
+        } else if (kind === "pointcloud_map") {
+          setPill(els.pointcloudMapStatus, "error");
+          els.pointcloudMapEmpty.hidden = false;
+          els.pointcloudMapEmpty.textContent = message;
         } else if (kind === "pointcloud") {
           setPill(els.pointcloudStatus, "error");
           els.pointcloudEmpty.hidden = false;
@@ -896,6 +1165,30 @@ def _render_debug_page(access_token: str) -> str:
         if (!stateObj) return "--";
         return stateObj.status || stateObj.phase || stateObj.message || stateObj.state || "available";
       }
+      function updateGovernance(envelope) {
+        const data = envelope.runtime_governance || (envelope.data && envelope.data.runtime_governance) || envelope.data || {};
+        const status = envelope.status ? statusOf(envelope) : (data && data.rtabmap_profile ? "available" : "missing");
+        const profile = data.rtabmap_profile || {};
+        const asset = data.geometry_asset || {};
+        const session = data.localization_session || {};
+        const relocalization = data.last_relocalization || {};
+        const policy = data.navigation_control_policy || {};
+        const frontAlign = policy.front_align || {};
+        const rotate = policy.rotate_relocalization || {};
+        setPill(els.governanceStatus, status);
+        setKv(els.governanceMeta, [
+          ["profile", `${safeText(profile.name)} / ${safeText(profile.status)} / route=${safeText(profile.route)}`],
+          ["geometry_asset", asset.available ? `${safeText(asset.geometry_stack)} db=${safeText(asset.database_present)} pcd=${safeText(asset.pcd_present)}` : "missing"],
+          ["asset_frame", asset.frame_id],
+          ["localization", session.available ? `${safeText(session.status)} pose=${safeText(session.pose_available)}` : "missing"],
+          ["last_relocalization", relocalization.available ? `fitness=${safeText(relocalization.fitness)} inlier=${safeText(relocalization.inlier_ratio)}` : safeText(relocalization.status)],
+          ["relocalization_failure", relocalization.failure_reason || session.last_error],
+          ["front_align", `${safeText(frontAlign.enabled)} triggered=${safeText(frontAlign.triggered)} reason=${safeText(frontAlign.reason)}`],
+          ["rotate_reloc", `${safeText(rotate.enabled)} triggered=${safeText(rotate.triggered)} reason=${safeText(rotate.reason)}`],
+          ["source", (data.metadata && data.metadata.source) || "platform_service_contracts"],
+          ["前端接收", shortTime(envelope.__receivedAt)],
+        ]);
+      }
       function updateNavigation(envelope) {
         const status = statusOf(envelope);
         const data = envelope.data || {};
@@ -924,6 +1217,201 @@ def _render_debug_page(access_token: str) -> str:
         if (point && point.position) return pointFromCloud(point.position);
         if (point && point.x !== undefined && point.y !== undefined) return { x: Number(point.x), y: Number(point.y), z: Number(point.z || 0) };
         return null;
+      }
+      function normalizeBounds(bounds, points) {
+        const rawMin = bounds && Array.isArray(bounds.min) ? bounds.min : null;
+        const rawMax = bounds && Array.isArray(bounds.max) ? bounds.max : null;
+        if (rawMin && rawMax && rawMin.length >= 3 && rawMax.length >= 3) {
+          return {
+            min: [Number(rawMin[0]), Number(rawMin[1]), Number(rawMin[2])],
+            max: [Number(rawMax[0]), Number(rawMax[1]), Number(rawMax[2])],
+          };
+        }
+        if (!points || points.length < 3) return null;
+        const min = [Infinity, Infinity, Infinity];
+        const max = [-Infinity, -Infinity, -Infinity];
+        for (let index = 0; index + 2 < points.length; index += 3) {
+          const x = points[index], y = points[index + 1], z = points[index + 2];
+          if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+          min[0] = Math.min(min[0], x); min[1] = Math.min(min[1], y); min[2] = Math.min(min[2], z);
+          max[0] = Math.max(max[0], x); max[1] = Math.max(max[1], y); max[2] = Math.max(max[2], z);
+        }
+        return Number.isFinite(min[0]) ? { min, max } : null;
+      }
+      function clearPointCloudMapCanvas(message) {
+        const canvas = els.pointcloudMapCanvas;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#080807";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = "#2d2e29";
+        ctx.lineWidth = 1;
+        for (let x = 24; x < canvas.width; x += 44) {
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, canvas.height);
+          ctx.stroke();
+        }
+        for (let y = 24; y < canvas.height; y += 44) {
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(canvas.width, y);
+          ctx.stroke();
+        }
+        ctx.fillStyle = "#a7a29a";
+        ctx.font = "14px system-ui";
+        ctx.fillText(message || "等待累计点云地图。", 16, 32);
+      }
+      function drawPointCloudMap(points, bounds) {
+        const canvas = els.pointcloudMapCanvas;
+        const ctx = canvas.getContext("2d");
+        const started = performance.now();
+        if (!points || points.length < 3) {
+          clearPointCloudMapCanvas("累计点云地图暂无可绘制点。");
+          return performance.now() - started;
+        }
+        const normalizedBounds = normalizeBounds(bounds, points);
+        if (!normalizedBounds) {
+          clearPointCloudMapCanvas("累计点云地图 bounds 不可用。");
+          return performance.now() - started;
+        }
+        const min = normalizedBounds.min;
+        const max = normalizedBounds.max;
+        const center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+        const span = [
+          Math.max(0.01, max[0] - min[0]),
+          Math.max(0.01, max[1] - min[1]),
+          Math.max(0.01, max[2] - min[2]),
+        ];
+        const yaw = -Math.PI / 5;
+        const cos = Math.cos(yaw);
+        const sin = Math.sin(yaw);
+        const projectedSpan = Math.max(span[0], span[1], span[2] * 1.8, 0.01);
+        const scale = Math.min(canvas.width, canvas.height) * 0.78 / projectedSpan;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const gradient = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+        gradient.addColorStop(0, "#0b1113");
+        gradient.addColorStop(1, "#0a0a09");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = "rgba(93, 199, 194, 0.12)";
+        ctx.lineWidth = 1;
+        for (let i = -5; i <= 5; i += 1) {
+          const a = projectPoint([min[0], center[1] + i * span[1] / 10, min[2]], center, cos, sin, scale, canvas);
+          const b = projectPoint([max[0], center[1] + i * span[1] / 10, min[2]], center, cos, sin, scale, canvas);
+          const c = projectPoint([center[0] + i * span[0] / 10, min[1], min[2]], center, cos, sin, scale, canvas);
+          const d = projectPoint([center[0] + i * span[0] / 10, max[1], min[2]], center, cos, sin, scale, canvas);
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.moveTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.stroke();
+        }
+        const pointCount = Math.floor(points.length / 3);
+        const stride = pointCount > 70000 ? Math.ceil(pointCount / 70000) : 1;
+        for (let index = 0; index + 2 < points.length; index += 3 * stride) {
+          const x = points[index], y = points[index + 1], z = points[index + 2];
+          if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+          const p = projectPoint([x, y, z], center, cos, sin, scale, canvas);
+          const zRatio = Math.max(0, Math.min(1, (z - min[2]) / span[2]));
+          ctx.fillStyle = `hsl(${176 + zRatio * 88}, 72%, ${52 + zRatio * 18}%)`;
+          ctx.fillRect(p.x, p.y, 1.45, 1.45);
+        }
+        drawPointCloudMapAxes(ctx, center, cos, sin, scale, canvas, span);
+        return performance.now() - started;
+      }
+      function projectPoint(point, center, cos, sin, scale, canvas) {
+        const x = point[0] - center[0];
+        const y = point[1] - center[1];
+        const z = point[2] - center[2];
+        const rx = x * cos - y * sin;
+        const ry = x * sin + y * cos;
+        return {
+          x: canvas.width / 2 + rx * scale,
+          y: canvas.height / 2 + (ry * 0.45 - z * 0.85) * scale,
+        };
+      }
+      function drawPointCloudMapAxes(ctx, center, cos, sin, scale, canvas, span) {
+        const origin = projectPoint(center, center, cos, sin, scale, canvas);
+        const axes = [
+          { label: "X", color: "#f97316", end: [center[0] + span[0] * 0.18, center[1], center[2]] },
+          { label: "Y", color: "#5dc7c2", end: [center[0], center[1] + span[1] * 0.18, center[2]] },
+          { label: "Z", color: "#d783ff", end: [center[0], center[1], center[2] + span[2] * 0.28] },
+        ];
+        ctx.save();
+        ctx.font = "12px system-ui";
+        for (const axis of axes) {
+          const end = projectPoint(axis.end, center, cos, sin, scale, canvas);
+          ctx.strokeStyle = axis.color;
+          ctx.fillStyle = axis.color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(origin.x, origin.y);
+          ctx.lineTo(end.x, end.y);
+          ctx.stroke();
+          ctx.fillText(axis.label, end.x + 5, end.y + 4);
+        }
+        ctx.restore();
+      }
+      function selectPointCloudMapLod(data) {
+        const lods = Array.isArray(data.lods) ? data.lods : [];
+        return lods.find((item) => item.level === "preview") || lods[0] || null;
+      }
+      async function loadPointCloudMapBinary(data) {
+        const lod = selectPointCloudMapLod(data);
+        if (!lod || !lod.bin_url) return;
+        const fetched = await getArrayBuffer(lod.bin_url);
+        const parseStarted = performance.now();
+        const points = new Float32Array(fetched.buffer);
+        state.pointCloudMapParseMs = performance.now() - parseStarted;
+        state.pointCloudMapFetchMs = fetched.frontendLatencyMs;
+        state.pointCloudMapLod = lod.level || fetched.headers.get("X-PointCloud-Lod") || "preview";
+        state.pointCloudMapPoints = points;
+        state.pointCloudMapPointCount = Number(fetched.headers.get("X-PointCloud-Point-Count")) || Math.floor(points.length / 3);
+        state.pointCloudMapBounds = normalizeBounds(data.bounds, points);
+        state.pointCloudMapRenderMs = drawPointCloudMap(points, state.pointCloudMapBounds);
+        state.pointCloudMapFrames += 1;
+      }
+      async function updatePointCloudMap(envelope) {
+        const status = statusOf(envelope);
+        const data = envelope.data || {};
+        setPill(els.pointcloudMapStatus, status);
+        if (status !== "available" || !data.revision) {
+          state.pointCloudMapRevision = "";
+          state.pointCloudMapPoints = null;
+          clearPointCloudMapCanvas(errorReason(envelope, "累计点云地图不可用。"));
+          els.pointcloudMapEmpty.hidden = false;
+          els.pointcloudMapEmpty.textContent = errorReason(envelope, "累计点云地图不可用；不会回退到实时扫描帧。");
+        } else {
+          els.pointcloudMapEmpty.hidden = true;
+          if (state.pointCloudMapRevision !== data.revision) {
+            try {
+              await loadPointCloudMapBinary(data);
+              state.pointCloudMapRevision = data.revision;
+            } catch (error) {
+              showPanelError("pointcloud_map", error.message);
+            }
+          } else if (state.pointCloudMapPoints) {
+            state.pointCloudMapRenderMs = drawPointCloudMap(state.pointCloudMapPoints, state.pointCloudMapBounds || data.bounds);
+          }
+        }
+        const metrics = data.metrics || {};
+        const metadata = data.metadata || {};
+        setKv(els.pointcloudMapMeta, [
+          ["map", data.map_name || "--"],
+          ["version", data.map_version_id || "--"],
+          ["revision", data.revision || envelope.revision],
+          ["frame", envelope.frame_id || data.frame_id],
+          ["source_kind", data.source_kind],
+          ["point_count", data.point_count || state.pointCloudMapPointCount],
+          ["lod", state.pointCloudMapLod || "--"],
+          ["payload_bytes", data.payload_bytes],
+          ["pcd_data", metadata.pcd_data],
+          ["pcd_path", data.pcd_path],
+          ["server_compute_ms", fmt(metrics.server_compute_ms, " ms")],
+          ["frontend_fetch_ms", fmt(state.pointCloudMapFetchMs, " ms")],
+          ["browser_parse_ms", fmt(state.pointCloudMapParseMs, " ms")],
+          ["browser_render_ms", fmt(state.pointCloudMapRenderMs, " ms")],
+          ["rendered_frames", state.pointCloudMapFrames],
+          ["source_timestamp", shortTime(envelope.source_timestamp)],
+          ["前端接收", shortTime(envelope.__receivedAt)],
+        ]);
       }
       function drawPointCloud(points) {
         const canvas = els.pointcloudCanvas;
@@ -984,6 +1472,7 @@ def _render_debug_page(access_token: str) -> str:
           ? ""
           : errorReason(envelope, "点云帧可读，但没有内联 points 可绘制。");
         const metrics = data.metrics || {};
+        const metadata = data.metadata || {};
         const protection = data.protection || {};
         setKv(els.pointcloudMeta, [
           ["frame", envelope.frame_id],
@@ -992,6 +1481,9 @@ def _render_debug_page(access_token: str) -> str:
           ["rendered_frames", state.pointCloudFrames],
           ["format", data.format],
           ["payload_bytes", data.payload_bytes || metrics.payload_bytes],
+          ["scan_role", metrics.diagnostic_role || (metadata.diagnostic_role || "side_channel")],
+          ["not_pointcloud_map", String(metrics.not_pointcloud_map === true || metadata.not_pointcloud_map === true)],
+          ["map_source_endpoint", metadata.map_source_endpoint || "/api/debug/pointcloud-map/latest/meta"],
           ["source_topic", metrics.source_topic],
           ["downsampled", String(metrics.downsampled === true)],
           ["browser_render_ms", fmt(renderMs, " ms")],
@@ -1039,11 +1531,15 @@ def _render_debug_page(access_token: str) -> str:
           state.logs = state.logs.slice(-200);
         }
         if (typeof data.next_cursor === "number") state.logCursor = data.next_cursor;
+        const metrics = data.metrics || {};
         setKv(els.logsMeta, [
           ["entries", state.logs.length],
           ["next_cursor", state.logCursor],
           ["source_status", data.source_status || status],
           ["source_message", data.source_message || (envelope.error && envelope.error.message)],
+          ["server_compute_ms", fmt(metrics.server_compute_ms, " ms")],
+          ["file_read_ms", fmt(metrics.file_read_ms, " ms")],
+          ["bytes_read", metrics.bytes_read],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         renderLogs();
@@ -1069,19 +1565,18 @@ def _render_debug_page(access_token: str) -> str:
           els.logs.appendChild(line);
         }
       }
-      async function tick() {
-        if (state.polling) return;
-        state.polling = true;
+      async function tickFast() {
+        if (state.fastPolling) return;
+        state.fastPolling = true;
         try {
-          const [overview, map, localization, navigation, frontier, pointcloud, video, logs] = await Promise.allSettled([
+          const [overview, map, localization, navigation, frontier, governance, pointcloudMap] = await Promise.allSettled([
             getJson("/api/debug/overview"),
             getJson("/api/debug/map"),
             getJson("/api/debug/localization"),
             getJson("/api/debug/navigation"),
             getJson("/api/debug/exploration/frontier/latest"),
-            getJson("/api/debug/pointcloud/latest"),
-            getJson("/api/debug/video/latest"),
-            getJson(`/api/debug/logs/tail?cursor=${encodeURIComponent(state.logCursor)}&limit=200`),
+            getJson("/api/runtime/governance"),
+            getJson("/api/debug/pointcloud-map/latest/meta"),
           ]);
           els.lastReceive.textContent = nowText();
           if (overview.status === "fulfilled") updateOverview(overview.value);
@@ -1089,17 +1584,47 @@ def _render_debug_page(access_token: str) -> str:
           if (localization.status === "fulfilled") updateLocalization(localization.value); else showPanelError("localization", localization.reason.message);
           if (navigation.status === "fulfilled") updateNavigation(navigation.value); else showPanelError("navigation", navigation.reason.message);
           if (frontier.status === "fulfilled" && statusOf(frontier.value) === "available") updateNavigation(frontier.value);
+          if (governance.status === "fulfilled") updateGovernance(governance.value); else showPanelError("governance", governance.reason.message);
+          if (pointcloudMap.status === "fulfilled") await updatePointCloudMap(pointcloudMap.value); else showPanelError("pointcloud_map", pointcloudMap.reason.message);
+        } finally {
+          state.fastPolling = false;
+        }
+      }
+      async function tickSensor() {
+        if (state.sensorPolling) return;
+        state.sensorPolling = true;
+        try {
+          const [pointcloud, video] = await Promise.allSettled([
+            getJson("/api/debug/pointcloud/latest"),
+            getJson("/api/debug/video/latest"),
+          ]);
           if (pointcloud.status === "fulfilled") updatePointCloud(pointcloud.value); else showPanelError("pointcloud", pointcloud.reason.message);
           if (video.status === "fulfilled") updateVideo(video.value); else showPanelError("video", video.reason.message);
-          if (logs.status === "fulfilled") updateLogs(logs.value); else showPanelError("logs", logs.reason.message);
         } finally {
-          state.polling = false;
+          state.sensorPolling = false;
+        }
+      }
+      async function tickSlow() {
+        if (state.slowPolling) return;
+        state.slowPolling = true;
+        try {
+          const logs = await getJson(`/api/debug/logs/tail?cursor=${encodeURIComponent(state.logCursor)}&limit=200`);
+          updateLogs(logs);
+        } catch (error) {
+          showPanelError("logs", error.message);
+        } finally {
+          state.slowPolling = false;
         }
       }
       buildOverview();
       renderLogs();
-      tick();
-      window.setInterval(tick, POLL_MS);
+      clearPointCloudMapCanvas("等待 RTAB-Map/PCD 累计点云地图。");
+      tickFast();
+      tickSensor();
+      tickSlow();
+      window.setInterval(tickFast, FAST_POLL_MS);
+      window.setInterval(tickSensor, SENSOR_POLL_MS);
+      window.setInterval(tickSlow, SLOW_POLL_MS);
     })();
   </script>
 </body>
@@ -1193,6 +1718,274 @@ def _summary_from_payload(
         message=message,
         metadata={"source": source, **dict(metadata or {})},
     )
+
+
+def _get_pointcloud_map_summary(runtime: GatewayRuntime) -> Dict[str, Any]:
+    descriptor = _resolve_pointcloud_map_descriptor(runtime)
+    pcd_path = str(descriptor.get("pcd_path") or "").strip()
+    if not pcd_path:
+        return {
+            "available": False,
+            "source": "pointcloud_map",
+            "frame_id": descriptor.get("frame_id"),
+            "message": "未找到 PCD 点云地图资产。",
+            "metadata": descriptor,
+        }
+    path = Path(pcd_path).expanduser()
+    if not path.exists() or not path.is_file():
+        return {
+            "available": False,
+            "source": str(descriptor.get("source") or "pointcloud_map"),
+            "frame_id": descriptor.get("frame_id"),
+            "message": "PCD 点云地图资产不存在：%s" % pcd_path,
+            "metadata": descriptor,
+        }
+    stat = path.stat()
+    return {
+        "available": True,
+        "source": str(descriptor.get("source") or "pointcloud_map"),
+        "timestamp": utc_now(),
+        "frame_id": descriptor.get("frame_id"),
+        "revision": "pcd:%d:%d" % (int(stat.st_mtime_ns), int(stat.st_size)),
+        "message": "pointcloud_map=%s" % path,
+        "metadata": {
+            **descriptor,
+            "asset_mtime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+            "asset_size_bytes": stat.st_size,
+        },
+    }
+
+
+def _resolve_pointcloud_map_descriptor(runtime: GatewayRuntime) -> Dict[str, Any]:
+    runtime_governance = runtime.get_runtime_governance_summary()
+    governance_asset = dict(getattr(runtime_governance, "geometry_asset", {}) or {})
+    governance_profile = dict(getattr(runtime_governance, "rtabmap_profile", {}) or {})
+    snapshot = runtime.mapping_service.get_latest_snapshot()
+    snapshot_metadata = dict(getattr(snapshot, "metadata", {}) or {}) if snapshot is not None else {}
+    geometry_summary = snapshot_metadata.get("geometry_asset_summary")
+    if not isinstance(geometry_summary, dict):
+        geometry_summary = {}
+    pcd_path = _first_non_empty(
+        governance_asset.get("pcd_path"),
+        snapshot_metadata.get("pcd_path"),
+        geometry_summary.get("pcd_path"),
+        _pcd_path_from_asset_refs(snapshot_metadata.get("geometry_assets")),
+        _pcd_path_from_asset_refs(geometry_summary.get("assets")),
+    )
+    source_kind = "runtime_governance_pcd" if governance_asset.get("pcd_path") else "map_version_pcd" if pcd_path else "unavailable"
+    geometry_runtime = getattr(runtime, "platform_geometry_runtime", None)
+    geometry_config = getattr(geometry_runtime, "config", None)
+    frames = getattr(geometry_config, "frames", None)
+    rtabmap = getattr(geometry_config, "rtabmap", None)
+    outputs = getattr(rtabmap, "outputs", None)
+    return {
+        "source": "rtabmap_pointcloud_map",
+        "source_kind": source_kind if pcd_path else "unavailable",
+        "map_name": _first_non_empty(snapshot_metadata.get("map_name"), geometry_summary.get("map_name")),
+        "map_version_id": _first_non_empty(
+            getattr(snapshot, "version_id", None),
+            snapshot_metadata.get("platform_map_version_id"),
+            geometry_summary.get("version_id"),
+        ),
+        "revision": _revision_from_map(snapshot),
+        "frame_id": _first_non_empty(
+            governance_asset.get("frame_id"),
+            getattr(snapshot, "frame_id", None),
+            snapshot_metadata.get("frame_id"),
+            geometry_summary.get("frame_id"),
+            getattr(frames, "map_frame", None),
+            "map",
+        ),
+        "geometry_stack": _first_non_empty(
+            governance_asset.get("geometry_stack"),
+            snapshot_metadata.get("geometry_stack"),
+            geometry_summary.get("geometry_stack"),
+            getattr(geometry_config, "stack", None),
+            "rtabmap_nav2",
+        ),
+        "rtabmap_db_path": _first_non_empty(
+            governance_asset.get("rtabmap_db_path"),
+            snapshot_metadata.get("rtabmap_db_path"),
+            geometry_summary.get("rtabmap_db_path"),
+        ),
+        "pcd_path": str(pcd_path or ""),
+        "quality_status": governance_asset.get("quality_status"),
+        "asset_summary": governance_asset,
+        "expected_pcd_candidates": [str(path) for path in _configured_pcd_candidates(runtime)],
+        "rtabmap_profile": {
+            "name": _first_non_empty(governance_profile.get("name"), getattr(rtabmap, "profile_name", None)),
+            "enabled": governance_profile.get("enabled", getattr(rtabmap, "profile_enabled", None)),
+            "pcd_root": getattr(rtabmap, "pcd_root", None),
+            "pcd_asset_name": getattr(outputs, "pcd_asset_name", None),
+        },
+    }
+
+
+def _pointcloud_map_view(
+    pointcloud_map: PointCloudMap,
+    descriptor: Dict[str, Any],
+    started_at: float,
+) -> DebugPointCloudMapView:
+    payload_bytes = int(pointcloud_map.lod_points("preview").shape[0]) * 3 * 4
+    lods = []
+    for item in pointcloud_map.lods():
+        level = str(item["level"])
+        lods.append(
+            {
+                **item,
+                "format": "float32-xyz",
+                "payload_bytes": int(item["point_count"]) * 3 * 4,
+                "bin_url": "/api/debug/pointcloud-map/latest.bin?lod=%s&revision=%s" % (level, pointcloud_map.revision),
+            }
+        )
+    return DebugPointCloudMapView(
+        map_name=descriptor.get("map_name"),
+        map_version_id=descriptor.get("map_version_id"),
+        revision=pointcloud_map.revision,
+        frame_id=pointcloud_map.frame_id,
+        source=str(descriptor.get("source") or "rtabmap_pointcloud_map"),
+        source_kind=pointcloud_map.source_kind,
+        geometry_stack=descriptor.get("geometry_stack"),
+        rtabmap_db_path=descriptor.get("rtabmap_db_path"),
+        pcd_path=pointcloud_map.path,
+        point_count=pointcloud_map.point_count,
+        fields=[{"name": "x", "datatype": "float32"}, {"name": "y", "datatype": "float32"}, {"name": "z", "datatype": "float32"}],
+        bounds={"min": list(pointcloud_map.bounds_min), "max": list(pointcloud_map.bounds_max)},
+        lods=lods,
+        payload_bytes=payload_bytes,
+        metadata={
+            "asset_mtime": pointcloud_map.source_timestamp.isoformat(),
+            "loaded_at": pointcloud_map.loaded_at.isoformat(),
+            "pcd_data": pointcloud_map.header.data,
+            "pcd_width": pointcloud_map.header.width,
+            "pcd_height": pointcloud_map.header.height,
+            "pcd_header_fields": list(pointcloud_map.header.fields),
+            "not_sensor_scan": True,
+        },
+        metrics={
+            "server_compute_ms": (time.perf_counter() - started_at) * 1000.0,
+            "pcd_load_ms": pointcloud_map.load_ms,
+            "preview_payload_bytes": payload_bytes,
+        },
+    )
+
+
+def _missing_pointcloud_map_view(descriptor: Dict[str, Any], started_at: float) -> DebugPointCloudMapView:
+    return DebugPointCloudMapView(
+        map_name=descriptor.get("map_name"),
+        map_version_id=descriptor.get("map_version_id"),
+        revision=descriptor.get("revision"),
+        frame_id=descriptor.get("frame_id"),
+        source=str(descriptor.get("source") or "pointcloud_map"),
+        source_kind=str(descriptor.get("source_kind") or "unavailable"),
+        geometry_stack=descriptor.get("geometry_stack"),
+        rtabmap_db_path=descriptor.get("rtabmap_db_path"),
+        pcd_path=descriptor.get("pcd_path"),
+        metadata={
+            "expected_pcd_candidates": descriptor.get("expected_pcd_candidates", []),
+            "rtabmap_profile": descriptor.get("rtabmap_profile", {}),
+            "asset_summary": descriptor.get("asset_summary", {}),
+            "quality_status": descriptor.get("quality_status"),
+            "not_fallback_to_sensor_scan": True,
+        },
+        metrics={"server_compute_ms": (time.perf_counter() - started_at) * 1000.0},
+    )
+
+
+def _pointcloud_map_error_envelope(
+    descriptor: Dict[str, Any],
+    message: str,
+    started_at: float,
+    *,
+    code: str,
+) -> Dict[str, Any]:
+    return _envelope(
+        payload_type="pointcloud_map.meta",
+        source=str(descriptor.get("source") or "pointcloud_map"),
+        data=_missing_pointcloud_map_view(descriptor, started_at),
+        status=DebugDataStatus.ERROR,
+        frame_id=descriptor.get("frame_id"),
+        error=DebugError(
+            code=code,
+            message=message,
+            details={
+                "pcd_path": descriptor.get("pcd_path"),
+                "expected_pcd_candidates": descriptor.get("expected_pcd_candidates", []),
+            },
+        ),
+    )
+
+
+def _configured_pcd_candidates(runtime: GatewayRuntime) -> List[Path]:
+    geometry_runtime = getattr(runtime, "platform_geometry_runtime", None)
+    config = getattr(geometry_runtime, "config", None)
+    rtabmap = getattr(config, "rtabmap", None)
+    outputs = getattr(rtabmap, "outputs", None)
+    root_text = str(getattr(rtabmap, "pcd_root", "") or "").strip()
+    if not root_text:
+        return []
+    root = Path(root_text).expanduser()
+    if root.suffix == ".pcd":
+        return [root]
+    asset_name = str(getattr(outputs, "pcd_asset_name", "") or "cloud_map.pcd")
+    return [root / asset_name, root / "cloud_map.pcd", root / "map.pcd", root / "current.pcd"]
+
+
+def _pcd_path_from_asset_refs(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        asset_type = str(item.get("asset_type") or "").lower()
+        if asset_type == "pcd":
+            return str(item.get("path") or "")
+    return ""
+
+
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _runtime_governance_message(summary: Any) -> str:
+    profile = dict(getattr(summary, "rtabmap_profile", {}) or {})
+    asset = dict(getattr(summary, "geometry_asset", {}) or {})
+    session = dict(getattr(summary, "localization_session", {}) or {})
+    return "route=%s profile=%s asset=%s localization=%s" % (
+        profile.get("route") or "rtabmap",
+        profile.get("status") or "unknown",
+        "available" if asset.get("available") else "missing",
+        session.get("status") or "missing",
+    )
+
+
+def _runtime_governance_metadata(summary: Any) -> Dict[str, Any]:
+    profile = dict(getattr(summary, "rtabmap_profile", {}) or {})
+    asset = dict(getattr(summary, "geometry_asset", {}) or {})
+    session = dict(getattr(summary, "localization_session", {}) or {})
+    relocalization = dict(getattr(summary, "last_relocalization", {}) or {})
+    policy = dict(getattr(summary, "navigation_control_policy", {}) or {})
+    front_align = policy.get("front_align") if isinstance(policy.get("front_align"), dict) else {}
+    rotate = policy.get("rotate_relocalization") if isinstance(policy.get("rotate_relocalization"), dict) else {}
+    return {
+        "profile_name": profile.get("name"),
+        "profile_status": profile.get("status"),
+        "route": profile.get("route") or "rtabmap",
+        "geometry_asset_available": bool(asset.get("available")),
+        "database_present": asset.get("database_present"),
+        "pcd_present": asset.get("pcd_present"),
+        "localization_status": session.get("status"),
+        "last_relocalization_available": bool(relocalization.get("available")),
+        "last_relocalization_failure": relocalization.get("failure_reason"),
+        "front_align_triggered": bool(front_align.get("triggered", False)),
+        "rotate_relocalization_triggered": bool(rotate.get("triggered", False)),
+    }
 
 
 def _frontiers_from_exploration_context(context: Any) -> List[Dict[str, Any]]:
@@ -1362,23 +2155,38 @@ def _parse_log_timestamp(value: str) -> datetime:
     return utc_now()
 
 
-def _tail_log_file(path: Path, *, cursor: int, limit: int, level: str, source: str) -> Tuple[List[DebugLogEntry], int, int]:
+def _tail_log_file(path: Path, *, cursor: int, limit: int, level: str, source: str) -> Tuple[List[DebugLogEntry], int, int, Dict[str, Any]]:
+    started_at = time.perf_counter()
+    stat_started = time.perf_counter()
     if not path.exists() or not path.is_file():
-        return [], 0, 0
+        return [], 0, 0, {
+            "file_stat_ms": (time.perf_counter() - stat_started) * 1000.0,
+            "file_read_ms": 0.0,
+            "bytes_read": 0,
+            "raw_lines": 0,
+            "tail_compute_ms": (time.perf_counter() - started_at) * 1000.0,
+        }
     file_size = path.stat().st_size
+    stat_ms = (time.perf_counter() - stat_started) * 1000.0
     if cursor <= 0 and file_size > 262144:
         start = max(0, file_size - 262144)
     else:
         start = cursor if 0 <= cursor <= file_size else 0
     entries: List[DebugLogEntry] = []
+    raw_lines = 0
+    bytes_read = 0
+    read_started = time.perf_counter()
     with path.open("rb") as stream:
         stream.seek(start)
         if start > 0:
-            stream.readline()
+            skipped = stream.readline()
+            bytes_read += len(skipped)
         while True:
             raw = stream.readline()
             if not raw:
                 break
+            raw_lines += 1
+            bytes_read += len(raw)
             line_end = stream.tell()
             text = raw.decode("utf-8", errors="replace")
             entry = _parse_log_line(text, sequence=line_end)
@@ -1389,7 +2197,16 @@ def _tail_log_file(path: Path, *, cursor: int, limit: int, level: str, source: s
             entries.append(entry)
             if len(entries) > limit:
                 entries = entries[-limit:]
-    return entries, file_size, file_size
+    read_ms = (time.perf_counter() - read_started) * 1000.0
+    return entries, file_size, file_size, {
+        "file_stat_ms": stat_ms,
+        "file_read_ms": read_ms,
+        "bytes_read": bytes_read,
+        "raw_lines": raw_lines,
+        "tail_start_cursor": start,
+        "tail_end_cursor": file_size,
+        "tail_compute_ms": (time.perf_counter() - started_at) * 1000.0,
+    }
 
 
 def _status_for_timestamp(timestamp: Optional[datetime], name: str) -> DebugDataStatus:
@@ -1574,6 +2391,7 @@ def _pointcloud_protection(runtime: GatewayRuntime) -> Dict[str, Any]:
     return {
         "default_max_points_applied_by_debug_api": False,
         "data_plane_max_points_per_scan": max_points_per_scan,
+        "not_a_pointcloud_map": True,
     }
 
 

@@ -29,6 +29,7 @@ class NavigationExecutionState(StrEnum):
     IDLE = "idle"
     PLANNING = "planning"
     FOLLOWING_PATH = "following_path"
+    FRONT_ALIGN = "front_align"
     FINAL_YAW_ALIGNMENT = "final_yaw_alignment"
     DIRECT_FALLBACK = "direct_fallback"
     RECOVERY = "recovery"
@@ -598,6 +599,12 @@ class NavigationSession:
         self._plan_failure_count = 0
         self._last_replan_reason = "initial_plan"
         self._execution_state = NavigationExecutionState.IDLE
+        self._front_align_active = False
+        self._front_align_started_monotonic = 0.0
+        self._last_front_align_time_monotonic = -float("inf")
+        self._last_front_align_result: Dict[str, object] = {"status": "idle", "reason": "not_started"}
+        self._last_rotate_relocalization_time_monotonic = -float("inf")
+        self._last_rotate_relocalization_result: Dict[str, object] = {"status": "idle", "reason": "not_started"}
 
     def tick(
         self,
@@ -606,6 +613,8 @@ class NavigationSession:
         occupancy_grid: Optional[OccupancyGrid],
         cost_map: Optional[CostMap],
         now_monotonic: float,
+        localization_status: Optional[str] = None,
+        motion_safety_allowed: Optional[bool] = None,
     ) -> NavigationTickResult:
         target_pose = self.goal.target_pose
         if target_pose is None:
@@ -646,6 +655,13 @@ class NavigationSession:
                         "controller_mode": "goal_reached",
                         "execution_state": NavigationExecutionState.IDLE,
                         "plan_version": self._plan_version,
+                        **self._navigation_control_policy_metadata(
+                            front_align_reason="goal_reached",
+                            rotate_relocalization_reason="goal_reached",
+                            now_monotonic=now_monotonic,
+                            localization_status=localization_status,
+                            motion_safety_allowed=motion_safety_allowed,
+                        ),
                     },
                 )
             self._execution_state = NavigationExecutionState.FINAL_YAW_ALIGNMENT
@@ -665,6 +681,13 @@ class NavigationSession:
                     "controller_mode": "final_yaw_alignment",
                     "execution_state": NavigationExecutionState.FINAL_YAW_ALIGNMENT,
                     "plan_version": self._plan_version,
+                    **self._navigation_control_policy_metadata(
+                        front_align_reason="inside_goal_tolerance",
+                        rotate_relocalization_reason="inside_goal_tolerance",
+                        now_monotonic=now_monotonic,
+                        localization_status=localization_status,
+                        motion_safety_allowed=motion_safety_allowed,
+                    ),
                 },
             )
 
@@ -691,6 +714,9 @@ class NavigationSession:
                 current_pose=current_pose,
                 goal_distance_m=goal_distance_m,
                 goal_yaw_error_rad=goal_yaw_error_rad,
+                now_monotonic=now_monotonic,
+                localization_status=localization_status,
+                motion_safety_allowed=motion_safety_allowed,
             )
 
         projection = _project_to_polyline(
@@ -718,6 +744,30 @@ class NavigationSession:
             math.atan2(lookahead_point[1] - current_pose.position.y, lookahead_point[0] - current_pose.position.x) - current_yaw
         )
 
+        front_align_result = self._front_align_tick(
+            heading_error_rad=heading_error_rad,
+            remaining_distance_m=estimated_remaining_m,
+            goal_yaw_error_rad=goal_yaw_error_rad,
+            now_monotonic=now_monotonic,
+            controller_mode="front_align",
+            trigger_reason="planned_path_heading_error",
+            localization_status=localization_status,
+            motion_safety_allowed=motion_safety_allowed,
+            extra_metadata={
+                "path_deviation_m": projection.lateral_distance_m,
+                "plan_version": self._plan_version,
+                "plan_source_map": self._current_plan.source_map,
+                "planning_mode": self._current_plan.planning_mode,
+                "replan_reason": self._last_replan_reason,
+                "lookahead_point": {
+                    "x": float(lookahead_point[0]),
+                    "y": float(lookahead_point[1]),
+                },
+            },
+        )
+        if front_align_result is not None:
+            return front_align_result
+
         if abs(heading_error_rad) >= float(self._planner_config.rotate_in_place_heading_rad):
             linear_x_mps = 0.0
         else:
@@ -731,7 +781,7 @@ class NavigationSession:
             )
             linear_x_mps = self._clamp(
                 float(self._control_config.max_linear_velocity_mps) * heading_scale * remaining_scale,
-                0.08,
+                float(self._control_config.min_linear_velocity_mps),
                 float(self._control_config.max_linear_velocity_mps),
             )
 
@@ -763,6 +813,14 @@ class NavigationSession:
                     "x": float(lookahead_point[0]),
                     "y": float(lookahead_point[1]),
                 },
+                **self._navigation_control_policy_metadata(
+                    front_align_reason="heading_within_threshold",
+                    heading_error_rad=heading_error_rad,
+                    rotate_relocalization_reason="localization_status",
+                    now_monotonic=now_monotonic,
+                    localization_status=localization_status,
+                    motion_safety_allowed=motion_safety_allowed,
+                ),
             },
         )
 
@@ -980,6 +1038,9 @@ class NavigationSession:
         current_pose: Pose,
         goal_distance_m: float,
         goal_yaw_error_rad: float,
+        now_monotonic: float,
+        localization_status: Optional[str],
+        motion_safety_allowed: Optional[bool],
     ) -> NavigationTickResult:
         target_pose = self.goal.target_pose
         current_yaw = _yaw_from_pose(current_pose)
@@ -994,7 +1055,7 @@ class NavigationSession:
         else:
             linear_x_mps = self._clamp(
                 goal_distance_m * 0.45,
-                0.08,
+                float(self._control_config.min_linear_velocity_mps),
                 float(self._control_config.max_linear_velocity_mps),
             )
         angular_z_rps = self._clamp(
@@ -1017,8 +1078,206 @@ class NavigationSession:
                 "heading_error_rad": heading_error_rad,
                 "goal_yaw_error_rad": goal_yaw_error_rad,
                 "plan_version": self._plan_version,
+                **self._navigation_control_policy_metadata(
+                    front_align_reason="direct_fallback",
+                    heading_error_rad=heading_error_rad,
+                    rotate_relocalization_reason="direct_fallback",
+                    now_monotonic=now_monotonic,
+                    localization_status=localization_status,
+                    motion_safety_allowed=motion_safety_allowed,
+                ),
             },
         )
+
+    def _front_align_tick(
+        self,
+        *,
+        heading_error_rad: float,
+        remaining_distance_m: float,
+        goal_yaw_error_rad: float,
+        now_monotonic: float,
+        controller_mode: str,
+        trigger_reason: str,
+        localization_status: Optional[str],
+        motion_safety_allowed: Optional[bool],
+        extra_metadata: Dict[str, object],
+    ) -> Optional[NavigationTickResult]:
+        if not bool(self._control_config.front_align_enabled):
+            self._front_align_active = False
+            self._last_front_align_result = {"status": "skipped", "reason": "disabled"}
+            return None
+
+        abs_error_rad = abs(float(heading_error_rad))
+        complete_threshold_rad = max(0.0, float(self._control_config.front_align_complete_threshold_rad))
+        trigger_threshold_rad = max(complete_threshold_rad, float(self._control_config.front_align_heading_threshold_rad))
+        cooldown_sec = max(0.0, float(self._control_config.front_align_cooldown_sec))
+        if self._front_align_active and abs_error_rad <= complete_threshold_rad:
+            self._front_align_active = False
+            self._last_front_align_time_monotonic = now_monotonic
+            self._last_front_align_result = {
+                "status": "completed",
+                "reason": "heading_aligned",
+                "heading_error_rad": float(heading_error_rad),
+            }
+            return None
+        if self._front_align_active and (now_monotonic - self._front_align_started_monotonic) >= max(0.0, float(self._control_config.front_align_timeout_sec)):
+            self._front_align_active = False
+            self._last_front_align_time_monotonic = now_monotonic
+            self._last_front_align_result = {
+                "status": "timeout",
+                "reason": "front_align_timeout",
+                "heading_error_rad": float(heading_error_rad),
+            }
+            return None
+        if not self._front_align_active:
+            if abs_error_rad < trigger_threshold_rad:
+                self._last_front_align_result = {
+                    "status": "skipped",
+                    "reason": "heading_within_threshold",
+                    "heading_error_rad": float(heading_error_rad),
+                }
+                return None
+            if now_monotonic - self._last_front_align_time_monotonic < cooldown_sec:
+                self._last_front_align_result = {
+                    "status": "skipped",
+                    "reason": "cooldown",
+                    "heading_error_rad": float(heading_error_rad),
+                }
+                return None
+            self._front_align_active = True
+            self._front_align_started_monotonic = now_monotonic
+
+        angular_speed = min(
+            abs(float(self._control_config.front_align_angular_velocity_rps)),
+            abs(float(self._control_config.max_yaw_rate_rps)),
+        )
+        angular_z_rps = math.copysign(angular_speed, float(heading_error_rad)) if abs_error_rad > 1e-9 else 0.0
+        self._execution_state = NavigationExecutionState.FRONT_ALIGN
+        self._last_front_align_result = {
+            "status": "running",
+            "reason": trigger_reason,
+            "heading_error_rad": float(heading_error_rad),
+        }
+        return NavigationTickResult(
+            status=NavigationStatus.RUNNING,
+            message="前向对齐策略触发，正在先旋转机身朝向局部路径。",
+            remaining_distance_m=remaining_distance_m,
+            remaining_yaw_rad=goal_yaw_error_rad,
+            linear_x_mps=0.0,
+            angular_z_rps=angular_z_rps,
+            metadata={
+                "backend": _PLATFORM_NAVIGATION_BACKEND_NAME,
+                "controller_mode": controller_mode,
+                "execution_state": NavigationExecutionState.FRONT_ALIGN,
+                "heading_error_rad": heading_error_rad,
+                "goal_yaw_error_rad": goal_yaw_error_rad,
+                **extra_metadata,
+                **self._navigation_control_policy_metadata(
+                    front_align_reason=trigger_reason,
+                    heading_error_rad=heading_error_rad,
+                    rotate_relocalization_reason="not_requested",
+                    now_monotonic=now_monotonic,
+                    localization_status=localization_status,
+                    motion_safety_allowed=motion_safety_allowed,
+                ),
+            },
+        )
+
+    def _navigation_control_policy_metadata(
+        self,
+        *,
+        front_align_reason: str,
+        rotate_relocalization_reason: str,
+        now_monotonic: float,
+        heading_error_rad: Optional[float] = None,
+        localization_status: Optional[str] = None,
+        motion_safety_allowed: Optional[bool] = None,
+    ) -> Dict[str, object]:
+        rotate_policy = self._rotate_relocalization_policy_metadata(
+            reason=rotate_relocalization_reason,
+            now_monotonic=now_monotonic,
+            localization_status=localization_status,
+            motion_safety_allowed=motion_safety_allowed,
+        )
+        return {
+            "navigation_control_policy": {
+                "front_align": {
+                    "enabled": bool(self._control_config.front_align_enabled),
+                    "triggered": bool(self._front_align_active),
+                    "reason": str(front_align_reason),
+                    "heading_error_rad": None if heading_error_rad is None else float(heading_error_rad),
+                    "heading_threshold_rad": float(self._control_config.front_align_heading_threshold_rad),
+                    "complete_threshold_rad": float(self._control_config.front_align_complete_threshold_rad),
+                    "cooldown_sec": float(self._control_config.front_align_cooldown_sec),
+                    "last_result": dict(self._last_front_align_result),
+                },
+                "rotate_relocalization": rotate_policy,
+            }
+        }
+
+    def _rotate_relocalization_policy_metadata(
+        self,
+        *,
+        reason: str,
+        now_monotonic: float,
+        localization_status: Optional[str],
+        motion_safety_allowed: Optional[bool],
+    ) -> Dict[str, object]:
+        configured_statuses = tuple(str(item) for item in self._control_config.rotate_relocalization_trigger_statuses)
+        result = {
+            "enabled": bool(self._control_config.rotate_relocalization_enabled),
+            "triggered": False,
+            "reason": str(reason),
+            "localization_status": localization_status,
+            "trigger_statuses": configured_statuses,
+            "angle_rad": float(self._control_config.rotate_relocalization_angle_rad),
+            "max_cycles": int(self._control_config.rotate_relocalization_max_cycles),
+            "angular_velocity_rps": float(self._control_config.rotate_relocalization_angular_velocity_rps),
+            "timeout_sec": float(self._control_config.rotate_relocalization_timeout_sec),
+            "cooldown_sec": float(self._control_config.rotate_relocalization_cooldown_sec),
+            "motion_safety_required": bool(self._control_config.rotate_relocalization_require_motion_safety),
+            "motion_safety_allowed": motion_safety_allowed,
+            "last_result": dict(self._last_rotate_relocalization_result),
+        }
+        if not bool(self._control_config.rotate_relocalization_enabled):
+            self._last_rotate_relocalization_result = {"status": "skipped", "reason": "disabled"}
+            result["last_result"] = dict(self._last_rotate_relocalization_result)
+            return result
+        if reason not in {"localization_status", "direct_fallback", "recovery"}:
+            self._last_rotate_relocalization_result = {"status": "skipped", "reason": "trigger_reason_not_allowed"}
+            result["reason"] = "trigger_reason_not_allowed"
+            result["last_result"] = dict(self._last_rotate_relocalization_result)
+            return result
+        if localization_status is None:
+            self._last_rotate_relocalization_result = {"status": "skipped", "reason": "localization_status_unavailable"}
+            result["reason"] = "localization_status_unavailable"
+            result["last_result"] = dict(self._last_rotate_relocalization_result)
+            return result
+        if str(localization_status) not in configured_statuses:
+            self._last_rotate_relocalization_result = {"status": "skipped", "reason": "status_not_triggered"}
+            result["reason"] = "status_not_triggered"
+            result["last_result"] = dict(self._last_rotate_relocalization_result)
+            return result
+        if bool(self._control_config.rotate_relocalization_require_motion_safety) and motion_safety_allowed is not True:
+            self._last_rotate_relocalization_result = {"status": "blocked", "reason": "motion_safety_unavailable"}
+            result["reason"] = "motion_safety_unavailable"
+            result["last_result"] = dict(self._last_rotate_relocalization_result)
+            return result
+        if now_monotonic - self._last_rotate_relocalization_time_monotonic < max(0.0, float(self._control_config.rotate_relocalization_cooldown_sec)):
+            self._last_rotate_relocalization_result = {"status": "skipped", "reason": "cooldown"}
+            result["reason"] = "cooldown"
+            result["last_result"] = dict(self._last_rotate_relocalization_result)
+            return result
+        self._last_rotate_relocalization_time_monotonic = now_monotonic
+        self._last_rotate_relocalization_result = {
+            "status": "not_executed",
+            "reason": "decision_only_no_localization_action_runner",
+        }
+        result["triggered"] = True
+        result["reason"] = "decision_only_no_localization_action_runner"
+        result["last_result"] = dict(self._last_rotate_relocalization_result)
+        result["motion_command_issued"] = False
+        return result
 
     def _evaluate_path_safety(
         self,

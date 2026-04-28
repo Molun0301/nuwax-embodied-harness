@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Protocol, runtime_checkable
 from urllib.parse import quote
 
 from contracts.geometry import Pose, Twist, Vector3
-from contracts.map_workspace import MapGeometryAssetBinding, MapVersion
+from contracts.map_workspace import MapGeometryAssetBinding, MapGeometryAssetRef, MapGeometryAssetType, MapVersion
 from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus
 from contracts.runtime_views import MapSnapshot
 from drivers.common import ExplorationDataPlane, LocalizationDataPlane, MappingDataPlane, NavigationDataPlane, RobotAssemblyBase
@@ -76,6 +76,8 @@ class PlatformGeometryRuntime:
     def is_available(self) -> bool:
         """返回是否存在可供平台消费的几何后端。"""
 
+        if not self._is_geometry_profile_enabled():
+            return False
         navigation_backend = self._resolve_navigation_backend()
         exploration_backend = self._resolve_exploration_backend()
         navigation_available = False
@@ -99,6 +101,14 @@ class PlatformGeometryRuntime:
     def describe_backend(self) -> dict:
         """返回当前几何后端来源说明。"""
 
+        if not self._is_geometry_profile_enabled():
+            return {
+                "source_kind": "disabled",
+                "backend_name": None,
+                "active_map_name": self._active_map_version.map_name if self._active_map_version is not None else None,
+                "active_map_version_id": self._active_map_version.version_id if self._active_map_version is not None else None,
+                **self.config.build_metadata(),
+            }
         backend = (
             self._resolve_navigation_backend()
             or self._resolve_mapping_backend()
@@ -140,37 +150,84 @@ class PlatformGeometryRuntime:
         """为平台地图版本补齐并落盘几何资产描述。"""
 
         previous_asset = version.geometry_asset
+        parameter_summary = self._build_parameter_summary()
+        profile_summary = self._clone_metadata(parameter_summary.get("profile") or {})
+        rtabmap_db_path = self._version_rtabmap_database_path(version.map_name, version.version_id)
+        pcd_path = self._version_pcd_asset_path(version.map_name, version.version_id)
+        built_at = previous_asset.built_at if previous_asset is not None else version.timestamp
+        database_metadata = self._materialize_rtabmap_database(rtabmap_db_path)
+        pcd_metadata = self._materialize_pcd_asset(pcd_path)
+        quality_metrics = self._build_geometry_quality_metrics(
+            database_metadata=database_metadata,
+            pcd_metadata=pcd_metadata,
+        )
+        asset_refs = (
+            MapGeometryAssetRef(
+                asset_type=MapGeometryAssetType.RTABMAP_DATABASE,
+                path=str(rtabmap_db_path),
+                frame_id=version.frame_id,
+                profile_summary=profile_summary,
+                built_at=built_at,
+                quality_metrics=dict(quality_metrics.get("database") or {}),
+                metadata={"required": True},
+            ),
+            MapGeometryAssetRef(
+                asset_type=MapGeometryAssetType.PCD,
+                path=str(pcd_path),
+                frame_id=version.frame_id,
+                profile_summary=profile_summary,
+                built_at=built_at,
+                quality_metrics=dict(quality_metrics.get("pcd") or {}),
+                metadata={"required": False},
+            ),
+        )
         geometry_asset = MapGeometryAssetBinding(
             map_name=version.map_name,
             version_id=version.version_id,
             geometry_stack=self.config.stack,
             frame_id=version.frame_id,
-            rtabmap_db_path=str(self._version_geometry_root(version.map_name, version.version_id) / "rtabmap" / "rtabmap.db"),
+            rtabmap_db_path=str(rtabmap_db_path),
+            pcd_path=str(pcd_path),
             occupancy_projection=self.config.rtabmap.occupancy_projection,
             costmap_source=self.config.nav2.costmap_source,
-            parameter_summary=self._build_parameter_summary(),
-            built_at=previous_asset.built_at if previous_asset is not None else version.timestamp,
-            metadata=dict(previous_asset.metadata) if previous_asset is not None else {},
-        )
-
-        database_metadata = self._materialize_rtabmap_database(Path(geometry_asset.rtabmap_db_path))
-        geometry_asset = geometry_asset.model_copy(
-            update={
-                "metadata": {
-                    **dict(geometry_asset.metadata),
-                    "geometry_asset_path": str(self._geometry_asset_path(version.map_name, version.version_id)),
-                    "catalog_root": str(self._catalog_root),
-                    **database_metadata,
-                }
+            parameter_summary=parameter_summary,
+            profile_summary=profile_summary,
+            quality_metrics=quality_metrics,
+            assets=list(asset_refs),
+            built_at=built_at,
+            metadata={
+                **(dict(previous_asset.metadata) if previous_asset is not None else {}),
+                "geometry_asset_path": str(self._geometry_asset_path(version.map_name, version.version_id)),
+                "geometry_asset_root": str(self._version_geometry_root(version.map_name, version.version_id)),
+                "catalog_root": str(self._catalog_root),
+                "profile": profile_summary,
+                "input_contract": parameter_summary.get("input_contract"),
+                "output_contract": parameter_summary.get("output_contract"),
+                "preprocessing": parameter_summary.get("preprocessing"),
+                "navigable_layer": self.config.rtabmap.occupancy_projection,
+                "traversability_layer": self.config.rtabmap.outputs.traversability_layer,
+                "localization_status_contract": self.config.rtabmap.outputs.localization_status,
+                "relocalization_diagnostics_contract": self.config.rtabmap.outputs.relocalization_diagnostics,
+                "database": database_metadata,
+                "pcd": pcd_metadata,
+                "diagnostics": quality_metrics.get("diagnostics", []),
             },
-            deep=True,
         )
         self._geometry_asset_path(version.map_name, version.version_id).parent.mkdir(parents=True, exist_ok=True)
         self._geometry_asset_path(version.map_name, version.version_id).write_text(
             geometry_asset.model_dump_json(indent=2),
             encoding="utf-8",
         )
-        return version.model_copy(update={"geometry_asset": geometry_asset}, deep=True)
+        return version.model_copy(
+            update={
+                "geometry_asset": geometry_asset,
+                "metadata": {
+                    **dict(version.metadata),
+                    "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset),
+                },
+            },
+            deep=True,
+        )
 
     def activate_map_version(self, version: MapVersion) -> MapSnapshot:
         """激活平台地图版本对应的几何资产。"""
@@ -215,14 +272,38 @@ class PlatformGeometryRuntime:
             "source_snapshot_version_id": version.source_version_id,
             "geometry_stack": geometry_asset.geometry_stack if geometry_asset is not None else self.config.stack,
             "rtabmap_db_path": geometry_asset.rtabmap_db_path if geometry_asset is not None else None,
+            "pcd_path": geometry_asset.pcd_path if geometry_asset is not None else None,
             "occupancy_projection": geometry_asset.occupancy_projection if geometry_asset is not None else self.config.rtabmap.occupancy_projection,
             "costmap_source": geometry_asset.costmap_source if geometry_asset is not None else self.config.nav2.costmap_source,
             "parameter_summary": self._clone_metadata(
                 geometry_asset.parameter_summary if geometry_asset is not None else self._build_parameter_summary()
             ),
+            "profile_summary": self._clone_metadata(geometry_asset.profile_summary if geometry_asset is not None else {}),
+            "quality_metrics": self._clone_metadata(geometry_asset.quality_metrics if geometry_asset is not None else {}),
+            "geometry_assets": self._clone_metadata(geometry_asset.assets if geometry_asset is not None else []),
+            "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset) if geometry_asset is not None else None,
             "built_at": geometry_asset.built_at.isoformat() if geometry_asset is not None else None,
-            "geometry_ready": bool(live_geometry_active and (live_occupancy is not None or live_cost_map is not None)),
+            "geometry_ready": bool(
+                geometry_asset is not None
+                and geometry_asset.quality_metrics.get("status") == "ready"
+                and (live_geometry_active or geometry_asset.quality_metrics.get("database", {}).get("present", False))
+            ),
+            "geometry_diagnostics": self._clone_metadata(
+                geometry_asset.quality_metrics.get("diagnostics", []) if geometry_asset is not None else []
+            ),
             "geometry_activation": self._clone_metadata(self._last_activation_result),
+            "profile": self._clone_metadata(
+                geometry_asset.parameter_summary.get("profile") if geometry_asset is not None else self.config.build_metadata().get("profile")
+            ),
+            "input_contract": self._clone_metadata(
+                geometry_asset.parameter_summary.get("input_contract") if geometry_asset is not None else self.config.build_metadata().get("input_contract")
+            ),
+            "output_contract": self._clone_metadata(
+                geometry_asset.parameter_summary.get("output_contract") if geometry_asset is not None else self.config.build_metadata().get("output_contract")
+            ),
+            "preprocessing": self._clone_metadata(
+                geometry_asset.parameter_summary.get("preprocessing") if geometry_asset is not None else self.config.build_metadata().get("preprocessing")
+            ),
             "geometry_backend": self.describe_backend(),
         }
         if geometry_asset is not None:
@@ -240,7 +321,12 @@ class PlatformGeometryRuntime:
             },
         )
 
+    def _is_geometry_profile_enabled(self) -> bool:
+        return bool(self.config.enabled and self.config.rtabmap.profile_enabled)
+
     def _resolve_backend(self, data_plane_protocol, provider_protocol):
+        if not self._is_geometry_profile_enabled():
+            return None
         data_plane_runtime = getattr(self.robot, "data_plane_runtime", None)
         if data_plane_runtime is not None and isinstance(data_plane_runtime, data_plane_protocol):
             return data_plane_runtime
@@ -273,9 +359,13 @@ class PlatformGeometryRuntime:
         return self._resolve_backend(MappingDataPlane, MapProvider)
 
     def _resolve_navigation_backend(self):
+        if not self._is_geometry_profile_enabled():
+            return None
         return self._platform_navigation_runtime
 
     def _resolve_exploration_backend(self):
+        if not self._is_geometry_profile_enabled():
+            return None
         backend = getattr(self, "_platform_exploration_runtime", None)
         if backend is not None:
             return backend
@@ -292,6 +382,12 @@ class PlatformGeometryRuntime:
 
     def _geometry_asset_path(self, map_name: str, version_id: str) -> Path:
         return self._version_geometry_root(map_name, version_id) / "geometry_asset.json"
+
+    def _version_rtabmap_database_path(self, map_name: str, version_id: str) -> Path:
+        return self._version_geometry_root(map_name, version_id) / "rtabmap" / self.config.rtabmap.outputs.database_asset_name
+
+    def _version_pcd_asset_path(self, map_name: str, version_id: str) -> Path:
+        return self._version_geometry_root(map_name, version_id) / "pcd" / self.config.rtabmap.outputs.pcd_asset_name
 
     def _build_parameter_summary(self) -> Dict[str, object]:
         return self._clone_metadata(self.config.build_metadata())
@@ -320,6 +416,120 @@ class PlatformGeometryRuntime:
             "database_source_kind": "live_runtime",
             "database_source_path": str(resolved_source),
         }
+
+    def _materialize_pcd_asset(self, target_path: Path) -> Dict[str, object]:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path = self._locate_live_pcd_asset()
+        if source_path is None:
+            if target_path.exists() and target_path.is_file():
+                return {
+                    "pcd_present": True,
+                    "pcd_source_kind": "persisted_asset",
+                    "pcd_source_path": str(target_path.resolve()),
+                }
+            return {
+                "pcd_present": False,
+                "pcd_source_kind": "unavailable",
+                "pcd_source_path": None,
+            }
+        resolved_source = source_path.resolve()
+        resolved_target = target_path.resolve()
+        if resolved_source != resolved_target:
+            shutil.copy2(resolved_source, resolved_target)
+        return {
+            "pcd_present": target_path.exists(),
+            "pcd_source_kind": "live_runtime",
+            "pcd_source_path": str(resolved_source),
+        }
+
+    def _build_geometry_quality_metrics(
+        self,
+        *,
+        database_metadata: Dict[str, object],
+        pcd_metadata: Dict[str, object],
+    ) -> Dict[str, object]:
+        diagnostics = []
+        database_present = bool(database_metadata.get("database_present", False))
+        pcd_present = bool(pcd_metadata.get("pcd_present", False))
+        if not database_present:
+            diagnostics.append(
+                {
+                    "level": "error",
+                    "code": "rtabmap_database_missing",
+                    "message": "地图版本缺少 RTAB-Map database 资产。",
+                }
+            )
+        if not pcd_present:
+            diagnostics.append(
+                {
+                    "level": "warning",
+                    "code": "pcd_asset_missing",
+                    "message": "地图版本缺少 PCD 点云资产，ICP 质量指标为 unknown。",
+                }
+            )
+        return {
+            "status": "ready" if database_present else "failed",
+            "database": {
+                "present": database_present,
+                "source_kind": database_metadata.get("database_source_kind"),
+                "quality": "unknown",
+            },
+            "pcd": {
+                "present": pcd_present,
+                "source_kind": pcd_metadata.get("pcd_source_kind"),
+                "quality": "unknown",
+            },
+            "diagnostics": diagnostics,
+        }
+
+    def _summarize_geometry_asset(self, geometry_asset: MapGeometryAssetBinding) -> Dict[str, object]:
+        return {
+            "geometry_stack": geometry_asset.geometry_stack,
+            "frame_id": geometry_asset.frame_id,
+            "rtabmap_db_path": geometry_asset.rtabmap_db_path,
+            "pcd_path": geometry_asset.pcd_path,
+            "asset_types": [item.asset_type.value for item in geometry_asset.assets],
+            "assets": self._clone_metadata(geometry_asset.assets),
+            "built_at": geometry_asset.built_at.isoformat(),
+            "quality_metrics": self._clone_metadata(geometry_asset.quality_metrics),
+            "profile_summary": self._clone_metadata(geometry_asset.profile_summary),
+        }
+
+    def _locate_live_pcd_asset(self) -> Optional[Path]:
+        if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
+            current_path = self._active_map_version.geometry_asset.pcd_path
+            if current_path:
+                current_pcd = Path(current_path).expanduser()
+                if current_pcd.exists() and current_pcd.is_file():
+                    return current_pcd
+
+        mapping_backend = self._resolve_mapping_backend()
+        if mapping_backend is not None:
+            getter = getattr(mapping_backend, "get_pcd_map_path", None)
+            if callable(getter):
+                candidate = str(getter() or "").strip()
+                if candidate:
+                    candidate_path = Path(candidate).expanduser()
+                    if candidate_path.exists() and candidate_path.is_file():
+                        return candidate_path
+
+        configured_root = Path(str(self.config.rtabmap.pcd_root or "").strip()).expanduser()
+        candidates = []
+        if configured_root.suffix == ".pcd":
+            candidates.append(configured_root)
+        else:
+            candidates.extend(
+                (
+                    configured_root / self.config.rtabmap.outputs.pcd_asset_name,
+                    configured_root / "cloud_map.pcd",
+                    configured_root / "map.pcd",
+                    configured_root / "current.pcd",
+                )
+            )
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
 
     def _locate_live_rtabmap_database(self) -> Optional[Path]:
         if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
@@ -361,7 +571,9 @@ class PlatformGeometryRuntime:
             "version_id": version.version_id,
             "geometry_stack": self.config.stack,
             "rtabmap_db_path": geometry_asset.rtabmap_db_path if geometry_asset is not None else None,
+            "pcd_path": geometry_asset.pcd_path if geometry_asset is not None else None,
             "frame_id": version.frame_id,
+            "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset) if geometry_asset is not None else None,
         }
         mapping_backend = self._resolve_mapping_backend()
         if mapping_backend is None:
@@ -416,10 +628,14 @@ class PlatformGeometryRuntime:
         return getter()
 
     def start_platform_exploration(self, request) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         self._cancel_platform_exploration_navigation()
         return self._platform_exploration_runtime.start_exploration(request)
 
     def stop_platform_exploration(self) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         current_goal = self._platform_exploration_runtime.get_current_navigation_goal()
         stopped = self._platform_exploration_runtime.stop_exploration()
         self._cancel_platform_exploration_navigation(current_goal=current_goal)
@@ -427,12 +643,16 @@ class PlatformGeometryRuntime:
         return stopped
 
     def report_platform_exploration_hit_stop(self, reason: str) -> None:
+        if not self._is_geometry_profile_enabled():
+            return
         current_goal = self._platform_exploration_runtime.get_current_navigation_goal()
         self._platform_exploration_runtime.report_hit_stop(reason)
         self._cancel_platform_exploration_navigation(current_goal=current_goal)
         self._notify_compat_exploration_stopped()
 
     def sync_platform_exploration(self) -> None:
+        if not self._is_geometry_profile_enabled():
+            return
         if not self._platform_exploration_runtime.is_running:
             return
         current_pose = self._platform_navigation_runtime._read_current_pose()
@@ -473,6 +693,8 @@ class PlatformGeometryRuntime:
             self._platform_exploration_runtime.mark_navigation_arrived()
 
     def get_platform_exploration_state(self) -> ExplorationState:
+        if not self._is_geometry_profile_enabled():
+            return self._platform_exploration_runtime.get_exploration_state()
         self.sync_platform_exploration()
         return self._platform_exploration_runtime.get_exploration_state()
 
@@ -567,10 +789,14 @@ class PlatformNavigationRuntime:
         )
 
     def is_available(self) -> bool:
-        return True
+        return self.runtime._is_geometry_profile_enabled()
 
     def is_navigation_available(self) -> bool:
-        return self._resolve_motion_control() is not None and self.runtime._resolve_localization_backend() is not None
+        return (
+            self.runtime._is_geometry_profile_enabled()
+            and self._resolve_motion_control() is not None
+            and self.runtime._resolve_localization_backend() is not None
+        )
 
     def set_goal(self, goal: NavigationGoal) -> bool:
         if not self.is_navigation_available():
@@ -668,11 +894,15 @@ class PlatformNavigationRuntime:
             if cost_map is None:
                 cost_map = self.runtime._read_live_map_layer("cost_map")
 
+            localization_status = self._read_localization_status()
+            motion_safety_allowed = self._read_motion_safety_allowed()
             tick_result = self._session.tick(
                 current_pose=current_pose,
                 occupancy_grid=occupancy_grid,
                 cost_map=cost_map,
                 now_monotonic=time.monotonic(),
+                localization_status=localization_status,
+                motion_safety_allowed=motion_safety_allowed,
             )
             metadata = {
                 "backend": "platform_grid_navigation",
@@ -698,13 +928,11 @@ class PlatformNavigationRuntime:
                         },
                     )
                     return self._state.model_copy(deep=True)
-                self._simulate_pose_progress_locked(current_pose=current_pose, tick_result=tick_result)
                 current_pose = self._read_current_pose() or current_pose
             else:
                 self._stop_motion_locked()
                 if tick_result.status == NavigationStatus.SUCCEEDED:
                     self._goal_reached = True
-                    self._sync_goal_pose_locked()
                     current_pose = self._read_current_pose() or current_pose
                     self._session = None
                 elif tick_result.status in {NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
@@ -719,7 +947,11 @@ class PlatformNavigationRuntime:
                 remaining_yaw_rad=tick_result.remaining_yaw_rad,
                 goal_reached=bool(self._goal_reached or tick_result.goal_reached),
                 message=tick_result.message,
-                metadata=metadata,
+                metadata={
+                    **metadata,
+                    "pose_source": "localization_backend",
+                    "pose_writeback": False,
+                },
             )
             return self._state.model_copy(deep=True)
 
@@ -743,6 +975,39 @@ class PlatformNavigationRuntime:
         pose = backend.get_current_pose()
         return self._clone_pose(pose)
 
+    def _read_localization_status(self) -> Optional[str]:
+        backend = self.runtime._resolve_localization_backend()
+        if backend is None:
+            return None
+        get_state = getattr(backend, "get_localization_state", None)
+        if callable(get_state):
+            try:
+                state = get_state()
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                for key in ("status", "tracking_state", "state"):
+                    value = str(state.get(key) or "").strip()
+                    if value:
+                        return value
+        return "tracking" if backend.get_current_pose() is not None else "lost"
+
+    def _read_motion_safety_allowed(self) -> Optional[bool]:
+        providers = getattr(self.runtime.robot, "providers", None)
+        safety_state = None
+        get_safety_state = getattr(providers, "get_safety_state", None)
+        if callable(get_safety_state):
+            try:
+                safety_state = get_safety_state()
+            except Exception:
+                safety_state = None
+        if safety_state is None:
+            robot_state = getattr(self.runtime.robot, "state", None)
+            safety_state = getattr(robot_state, "safety", None)
+        if safety_state is None:
+            return None
+        return bool(getattr(safety_state, "can_move", False)) and not bool(getattr(safety_state, "is_estopped", False))
+
     def _dispatch_motion_locked(self, *, current_pose: Pose, tick_result) -> None:
         motion_control = self._resolve_motion_control()
         if motion_control is None:
@@ -763,52 +1028,6 @@ class PlatformNavigationRuntime:
             motion_control.stop_motion()
         except Exception:
             pass
-
-    def _simulate_pose_progress_locked(self, *, current_pose: Pose, tick_result) -> None:
-        del current_pose, tick_result
-        goal = self._current_goal
-        target_pose = goal.target_pose if goal is not None else None
-        session = self._session
-        if session is not None:
-            current_plan = getattr(session, "_current_plan", None)
-            planning_target = getattr(current_plan, "planning_target", None)
-            planning_mode = str(getattr(current_plan, "planning_mode", "") or "")
-            if planning_target is not None and target_pose is not None and planning_mode != "goal":
-                target_pose = target_pose.model_copy(
-                    update={
-                        "position": Vector3(
-                            x=float(planning_target[0]),
-                            y=float(planning_target[1]),
-                            z=float(target_pose.position.z),
-                        )
-                    },
-                    deep=True,
-                )
-        if target_pose is None:
-            return
-        self._write_mutable_pose(self._clone_pose(target_pose))
-
-    def _sync_goal_pose_locked(self) -> None:
-        goal = self._current_goal
-        if goal is None or goal.target_pose is None:
-            return
-        self._write_mutable_pose(self._clone_pose(goal.target_pose))
-
-    def _write_mutable_pose(self, pose: Optional[Pose]) -> None:
-        if pose is None:
-            return
-        robot_pose = getattr(self.runtime.robot, "current_pose", None)
-        if robot_pose is not None:
-            try:
-                setattr(self.runtime.robot, "current_pose", pose.model_copy(deep=True))
-            except Exception:
-                pass
-        localization_backend = self.runtime._resolve_localization_backend()
-        if localization_backend is not None and hasattr(localization_backend, "current_pose"):
-            try:
-                setattr(localization_backend, "current_pose", pose.model_copy(deep=True))
-            except Exception:
-                pass
 
     @staticmethod
     def _clone_pose(pose: Optional[Pose]) -> Optional[Pose]:
@@ -862,7 +1081,12 @@ class PlatformGeometryProviderBundle(
     def is_available(self) -> bool:
         return self.runtime.is_available()
 
+    def _is_geometry_profile_enabled(self) -> bool:
+        return self.runtime._is_geometry_profile_enabled()
+
     def is_localization_available(self) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         backend = self.runtime._resolve_localization_backend()
         if backend is None:
             return False
@@ -871,6 +1095,8 @@ class PlatformGeometryProviderBundle(
         return bool(backend.is_available())
 
     def is_map_available(self) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return True
@@ -882,6 +1108,8 @@ class PlatformGeometryProviderBundle(
         return bool(backend.is_available())
 
     def is_navigation_available(self) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         backend = self.runtime._resolve_navigation_backend()
         if backend is None:
             return False
@@ -890,6 +1118,8 @@ class PlatformGeometryProviderBundle(
         return bool(backend.is_available())
 
     def is_exploration_available(self) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         backend = self.runtime._resolve_exploration_backend()
         if backend is None:
             return False
@@ -898,16 +1128,27 @@ class PlatformGeometryProviderBundle(
         return bool(backend.is_available())
 
     def get_current_pose(self):
+        if not self._is_geometry_profile_enabled():
+            return None
         backend = self.runtime._resolve_localization_backend()
         return None if backend is None else backend.get_current_pose()
 
     def get_frame_tree(self):
+        if not self._is_geometry_profile_enabled():
+            return None
         backend = self.runtime._resolve_localization_backend()
         return None if backend is None else backend.get_frame_tree()
 
     def get_localization_state(self) -> dict:
         """返回后端原始定位状态，供平台定位状态机消费。"""
 
+        if not self._is_geometry_profile_enabled():
+            return {
+                "tracking_state": "unavailable",
+                "map_loaded": False,
+                "quality_score": 0.0,
+                "last_error": "平台几何运行时或 RTAB-Map profile 已禁用。",
+            }
         backend = self.runtime._resolve_localization_backend()
         if backend is None:
             return {
@@ -934,6 +1175,8 @@ class PlatformGeometryProviderBundle(
         }
 
     def get_occupancy_grid(self):
+        if not self._is_geometry_profile_enabled():
+            return None
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.occupancy_grid
@@ -941,6 +1184,8 @@ class PlatformGeometryProviderBundle(
         return None if backend is None else backend.get_occupancy_grid()
 
     def get_cost_map(self):
+        if not self._is_geometry_profile_enabled():
+            return None
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.cost_map
@@ -948,6 +1193,8 @@ class PlatformGeometryProviderBundle(
         return None if backend is None else backend.get_cost_map()
 
     def get_semantic_map(self):
+        if not self._is_geometry_profile_enabled():
+            return None
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.semantic_map
@@ -955,10 +1202,14 @@ class PlatformGeometryProviderBundle(
         return None if backend is None else backend.get_semantic_map()
 
     def set_goal(self, goal):
+        if not self._is_geometry_profile_enabled():
+            return False
         backend = self.runtime._resolve_navigation_backend()
         return False if backend is None else backend.set_goal(goal)
 
     def cancel_goal(self) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         backend = self.runtime._resolve_navigation_backend()
         return False if backend is None else backend.cancel_goal()
 
@@ -971,13 +1222,19 @@ class PlatformGeometryProviderBundle(
         return backend.get_navigation_state()
 
     def is_goal_reached(self) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         backend = self.runtime._resolve_navigation_backend()
         return False if backend is None else backend.is_goal_reached()
 
     def start_exploration(self, request) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         return self.runtime.start_platform_exploration(request)
 
     def stop_exploration(self) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
         return self.runtime.stop_platform_exploration()
 
     def get_exploration_state(self):

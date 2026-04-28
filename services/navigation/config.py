@@ -21,8 +21,23 @@ class NavigationControlConfig:
     goal_yaw_tolerance_rad: float = 0.45
     control_loop_interval_sec: float = 0.1
     max_linear_velocity_mps: float = 0.35
+    min_linear_velocity_mps: float = 0.08
     max_yaw_rate_rps: float = 0.8
     obstacle_avoidance_default_enabled: bool = True
+    front_align_enabled: bool = True
+    front_align_heading_threshold_rad: float = 0.85
+    front_align_complete_threshold_rad: float = 0.25
+    front_align_angular_velocity_rps: float = 0.35
+    front_align_timeout_sec: float = 3.0
+    front_align_cooldown_sec: float = 1.0
+    rotate_relocalization_enabled: bool = False
+    rotate_relocalization_trigger_statuses: Tuple[str, ...] = ("localizing", "stale")
+    rotate_relocalization_angle_rad: float = 6.283185307179586
+    rotate_relocalization_max_cycles: int = 1
+    rotate_relocalization_angular_velocity_rps: float = 0.25
+    rotate_relocalization_timeout_sec: float = 20.0
+    rotate_relocalization_cooldown_sec: float = 30.0
+    rotate_relocalization_require_motion_safety: bool = True
 
 
 @dataclass

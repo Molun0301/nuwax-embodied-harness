@@ -22,6 +22,7 @@ from contracts.memory import MemoryPayloadFilter
 from contracts.spatial_memory import SceneSpaceReviewStatus
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
+from contracts.runtime_views import RuntimeGovernanceSummary
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, TaskManager
 from drivers.entry import load_active_robot_private_capability_specs
 from drivers.common import (
@@ -2160,6 +2161,32 @@ class GatewayRuntime:
                 metadata_payload[key] = value
         return metadata_payload
 
+    def get_runtime_governance_summary(self) -> RuntimeGovernanceSummary:
+        """导出运行时观察与治理摘要。"""
+
+        map_snapshot = self.mapping_service.get_latest_snapshot()
+        localization_snapshot = self.localization_service.get_latest_snapshot()
+        localization_session = self.localization_service.get_active_session()
+        navigation_context = self.navigation_service.get_latest_navigation_context()
+        profile = self._runtime_rtabmap_profile_summary(map_snapshot)
+        geometry_asset = self._runtime_geometry_asset_summary(map_snapshot, localization_session)
+        last_relocalization = self._runtime_last_relocalization_summary(localization_session, localization_snapshot)
+        navigation_policy = self._runtime_navigation_control_policy_summary(navigation_context)
+        return RuntimeGovernanceSummary(
+            rtabmap_profile=profile,
+            geometry_asset=geometry_asset,
+            localization_session=self._runtime_localization_session_summary(localization_session, localization_snapshot),
+            last_relocalization=last_relocalization,
+            navigation_control_policy=navigation_policy,
+            metadata={
+                "route": "rtabmap",
+                "go2_boundary": "dds_only",
+                "source": "platform_service_contracts",
+                "map_version_id": getattr(map_snapshot, "version_id", None),
+                "localization_session_id": getattr(localization_session, "session_id", None),
+            },
+        )
+
     def get_health_summary(self) -> Dict[str, Any]:
         """导出健康摘要。"""
 
@@ -2176,6 +2203,7 @@ class GatewayRuntime:
             "perception_runtime": self._serialize(self.perception_video_runtime.get_status()),
             "latest_navigation": self._serialize(self.navigation_service.get_latest_navigation_context()),
             "latest_exploration": self._serialize(self.navigation_service.get_latest_exploration_context()),
+            "runtime_governance": self._serialize(self.get_runtime_governance_summary()),
             "memory_summary": self.memory_service.get_summary().model_dump(mode="json"),
             "active_map_workspace": self._serialize(self.map_workspace_service.get_active_workspace()),
             "audio_state": self.audio_service.get_volume_state(),
@@ -2186,6 +2214,148 @@ class GatewayRuntime:
             "artifact_summary": self.artifact_service.get_summary().model_dump(mode="json"),
             "resource_leases": [lease.model_dump(mode="json") for lease in self.resource_lock_manager.snapshot()],
         }
+
+    def _runtime_rtabmap_profile_summary(self, map_snapshot: Any) -> MetadataDict:
+        metadata = dict(getattr(map_snapshot, "metadata", {}) or {}) if map_snapshot is not None else {}
+        profile = metadata.get("profile_summary") or metadata.get("profile")
+        if not isinstance(profile, dict):
+            backend = self.platform_geometry_runtime.describe_backend()
+            profile = backend.get("profile") if isinstance(backend.get("profile"), dict) else {}
+        return {
+            "name": profile.get("name") or profile.get("profile_name"),
+            "enabled": bool(profile.get("enabled", profile.get("profile_enabled", False))),
+            "default": bool(profile.get("default", profile.get("default_profile", False))),
+            "route": profile.get("route") or "rtabmap",
+            "stack": profile.get("stack") or metadata.get("geometry_stack") or self.platform_geometry_runtime.config.stack,
+            "status": "configured" if profile else "missing",
+            "geometry_enabled": bool(self.platform_geometry_runtime.config.enabled),
+            "require_ros2": bool(self.platform_geometry_runtime.config.require_ros2),
+            "source": "map_snapshot.metadata" if metadata else "geometry_runtime.config",
+        }
+
+    def _runtime_geometry_asset_summary(self, map_snapshot: Any, localization_session: Any) -> MetadataDict:
+        metadata = dict(getattr(map_snapshot, "metadata", {}) or {}) if map_snapshot is not None else {}
+        summary = metadata.get("geometry_asset_summary")
+        if not isinstance(summary, dict) and localization_session is not None:
+            summary = getattr(localization_session, "geometry_asset", None)
+        if not isinstance(summary, dict):
+            summary = {}
+        quality_metrics = summary.get("quality_metrics") if isinstance(summary.get("quality_metrics"), dict) else {}
+        diagnostics = summary.get("diagnostics") or quality_metrics.get("diagnostics") or metadata.get("geometry_diagnostics") or []
+        raw_quality_status = quality_metrics.get("status")
+        quality_status = str(raw_quality_status or "").strip()
+        if isinstance(raw_quality_status, bool):
+            quality_status = "ready" if raw_quality_status else "failed"
+        if not quality_status:
+            geometry_ready = metadata.get("geometry_ready")
+            if geometry_ready is True:
+                quality_status = "ready"
+            elif geometry_ready is False:
+                quality_status = "failed"
+            elif summary:
+                quality_status = "unknown"
+            else:
+                quality_status = "missing"
+        return {
+            "available": bool(summary),
+            "geometry_stack": summary.get("geometry_stack") or metadata.get("geometry_stack") or self.platform_geometry_runtime.config.stack,
+            "frame_id": summary.get("frame_id") or getattr(map_snapshot, "frame_id", None),
+            "rtabmap_db_path": summary.get("rtabmap_db_path") or metadata.get("rtabmap_db_path"),
+            "pcd_path": summary.get("pcd_path") or metadata.get("pcd_path"),
+            "asset_types": summary.get("asset_types") or [],
+            "quality_status": quality_status,
+            "database_present": self._runtime_nested_bool(quality_metrics, "database", "present"),
+            "pcd_present": self._runtime_nested_bool(quality_metrics, "pcd", "present"),
+            "diagnostics": self._runtime_jsonable(diagnostics),
+            "source": "geometry_asset_summary" if summary else "missing",
+        }
+
+    def _runtime_localization_session_summary(self, localization_session: Any, localization_snapshot: Any) -> MetadataDict:
+        if localization_session is None:
+            return {
+                "available": False,
+                "status": "missing",
+                "pose_available": bool(getattr(localization_snapshot, "current_pose", None) is not None),
+                "source": "localization_service",
+            }
+        status = getattr(getattr(localization_session, "status", None), "value", getattr(localization_session, "status", None))
+        return {
+            "available": True,
+            "session_id": getattr(localization_session, "session_id", None),
+            "map_name": getattr(localization_session, "map_name", None),
+            "map_version_id": getattr(localization_session, "map_version_id", None),
+            "frame_id": getattr(localization_session, "frame_id", None),
+            "status": status,
+            "pose_available": bool(getattr(localization_session, "pose_available", False)),
+            "source_name": getattr(localization_session, "source_name", None),
+            "last_localized_at": getattr(localization_session, "last_localized_at", None),
+            "last_error": getattr(localization_session, "last_error", None),
+            "candidate_count": len(getattr(localization_session, "relocalization_candidates", []) or []),
+            "source": "localization_service.active_session",
+        }
+
+    def _runtime_last_relocalization_summary(self, localization_session: Any, localization_snapshot: Any) -> MetadataDict:
+        candidate = getattr(localization_session, "last_relocalization", None) if localization_session is not None else None
+        if candidate is None and localization_snapshot is not None:
+            metadata = getattr(localization_snapshot, "metadata", {}) or {}
+            candidate = metadata.get("last_relocalization") if isinstance(metadata, dict) else None
+        payload = self._runtime_jsonable(candidate) if candidate is not None else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        if not payload:
+            return {"available": False, "status": "missing", "source": "localization_service"}
+        return {
+            "available": True,
+            "backend": payload.get("backend"),
+            "fitness": payload.get("fitness"),
+            "inlier_ratio": payload.get("inlier_ratio"),
+            "failure_reason": payload.get("failure_reason"),
+            "pose_available": payload.get("pose") is not None,
+            "asset_ref_count": len(payload.get("asset_refs") or []),
+            "metadata": payload.get("metadata") or {},
+            "source": "localization_service.last_relocalization",
+        }
+
+    def _runtime_navigation_control_policy_summary(self, navigation_context: Any) -> MetadataDict:
+        navigation_state = getattr(navigation_context, "navigation_state", None) if navigation_context is not None else None
+        state_metadata = dict(getattr(navigation_state, "metadata", {}) or {}) if navigation_state is not None else {}
+        context_metadata = dict(getattr(navigation_context, "metadata", {}) or {}) if navigation_context is not None else {}
+        policy = state_metadata.get("navigation_control_policy") or context_metadata.get("navigation_control_policy")
+        if not isinstance(policy, dict):
+            policy = {}
+        front_align = policy.get("front_align") if isinstance(policy.get("front_align"), dict) else {}
+        rotate = policy.get("rotate_relocalization") if isinstance(policy.get("rotate_relocalization"), dict) else {}
+        return {
+            "available": bool(policy),
+            "backend": state_metadata.get("backend") or getattr(navigation_context, "backend_name", None),
+            "execution_state": state_metadata.get("execution_state"),
+            "controller_mode": state_metadata.get("controller_mode"),
+            "front_align": {
+                "enabled": bool(front_align.get("enabled", False)),
+                "triggered": bool(front_align.get("triggered", False)),
+                "reason": front_align.get("reason"),
+                "heading_error_rad": front_align.get("heading_error_rad"),
+                "last_result": front_align.get("last_result") or {},
+            },
+            "rotate_relocalization": {
+                "enabled": bool(rotate.get("enabled", False)),
+                "triggered": bool(rotate.get("triggered", False)),
+                "reason": rotate.get("reason"),
+                "localization_status": rotate.get("localization_status"),
+                "motion_safety_allowed": rotate.get("motion_safety_allowed"),
+                "last_result": rotate.get("last_result") or {},
+            },
+            "source": "navigation_state.metadata" if policy else "missing",
+        }
+
+    def _runtime_nested_bool(self, payload: MetadataDict, outer_key: str, inner_key: str) -> Optional[bool]:
+        outer = payload.get(outer_key)
+        if not isinstance(outer, dict) or inner_key not in outer:
+            return None
+        return bool(outer.get(inner_key))
+
+    def _runtime_jsonable(self, value: Any) -> Any:
+        return self._serialize(value)
 
     def get_task_snapshot(self, task_id: str) -> Dict[str, Any]:
         """读取任务状态快照。"""

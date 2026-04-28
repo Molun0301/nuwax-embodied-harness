@@ -149,6 +149,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access_manager.authenticate_http(request)
         return _build_layout_snapshot()
 
+    @router.get("/api/runtime/governance")
+    async def api_runtime_governance(request: Request) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        return {"runtime_governance": to_jsonable(runtime.get_runtime_governance_summary())}
+
     @router.get("/ops", response_class=HTMLResponse)
     async def ops_page(request: Request) -> HTMLResponse:
         access_manager.authenticate_http(request)

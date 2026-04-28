@@ -230,14 +230,22 @@ class MapWorkspaceService:
                 map_name=active_map_name,
                 map_version_id=latest_map_snapshot.version_id,
                 frame_id=frame_id,
-                metadata=metadata,
+                metadata={
+                    **dict(metadata or {}),
+                    "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
+                },
                 force_relocalize=force_relocalize,
+                geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
             )
         return self._localization_service.ensure_active_session(
             map_name=active_map_name,
             map_version_id=latest_map_snapshot.version_id,
             frame_id=frame_id,
-            metadata=metadata,
+            metadata={
+                **dict(metadata or {}),
+                "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
+            },
+            geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
         )
 
     def list_map_versions(self, *, map_name: str, limit: Optional[int] = None) -> Tuple[MapVersion, ...]:
@@ -423,7 +431,9 @@ class MapWorkspaceService:
             metadata={
                 **dict(metadata or {}),
                 "source": "relocalize_active_map",
+                "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
             },
+            geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
         )
         workspace = self.get_active_workspace()
         if workspace is None:
@@ -644,6 +654,24 @@ class MapWorkspaceService:
                 return frame_id
         return None
 
+    def _resolve_geometry_asset_summary(self, latest_map_snapshot) -> Optional[Dict[str, object]]:
+        summary = latest_map_snapshot.metadata.get("geometry_asset_summary")
+        if isinstance(summary, dict):
+            return dict(summary)
+        asset_refs = latest_map_snapshot.metadata.get("geometry_assets")
+        quality_metrics = latest_map_snapshot.metadata.get("quality_metrics")
+        if asset_refs is None and quality_metrics is None:
+            return None
+        return {
+            "geometry_stack": latest_map_snapshot.metadata.get("geometry_stack"),
+            "frame_id": self._resolve_map_frame_id(latest_map_snapshot),
+            "rtabmap_db_path": latest_map_snapshot.metadata.get("rtabmap_db_path"),
+            "pcd_path": latest_map_snapshot.metadata.get("pcd_path"),
+            "assets": asset_refs,
+            "quality_metrics": quality_metrics,
+            "diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
+        }
+
     def _load_map_version_into_runtime(self, version: MapVersion) -> None:
         prepared_version = version
         if prepared_version.geometry_asset is None:
@@ -697,7 +725,11 @@ class MapWorkspaceService:
             map_name=active_map_name,
             map_version_id=latest_map_snapshot.version_id,
             frame_id=self._resolve_map_frame_id(latest_map_snapshot),
-            metadata=metadata,
+            metadata={
+                **dict(metadata or {}),
+                "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
+            },
+            geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
         )
 
     def _require_map_name(self, map_name: str) -> str:

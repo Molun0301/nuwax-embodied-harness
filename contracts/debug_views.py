@@ -72,6 +72,8 @@ class DebugOverviewView(ContractModel):
     map: DebugSourceSummary
     navigation: DebugSourceSummary
     exploration: DebugSourceSummary
+    runtime_governance: DebugSourceSummary
+    pointcloud_map: DebugSourceSummary
     pointcloud: DebugSourceSummary
     video: DebugSourceSummary
     logs: DebugSourceSummary
@@ -124,6 +126,28 @@ class DebugPointCloudView(ContractModel):
     metrics: MetadataDict = Field(default_factory=dict)
 
 
+class DebugPointCloudMapView(ContractModel):
+    """累计点云地图调试视图。"""
+
+    map_name: Optional[str] = None
+    map_version_id: Optional[str] = None
+    revision: Optional[str] = None
+    frame_id: Optional[str] = None
+    source: Optional[str] = None
+    source_kind: Optional[str] = None
+    geometry_stack: Optional[str] = None
+    rtabmap_db_path: Optional[str] = None
+    pcd_path: Optional[str] = None
+    point_count: int = 0
+    fields: List[MetadataDict] = Field(default_factory=list)
+    bounds: Optional[MetadataDict] = None
+    lods: List[MetadataDict] = Field(default_factory=list)
+    format: str = "float32-xyz"
+    payload_bytes: Optional[int] = None
+    metadata: MetadataDict = Field(default_factory=dict)
+    metrics: MetadataDict = Field(default_factory=dict)
+
+
 class DebugVideoView(ContractModel):
     """视频调试视图。"""
 
@@ -159,3 +183,4 @@ class DebugLogsTailView(ContractModel):
     entries: List[DebugLogEntry] = Field(default_factory=list)
     source_status: DebugDataStatus = DebugDataStatus.MISSING
     source_message: Optional[str] = None
+    metrics: MetadataDict = Field(default_factory=dict, description="日志读取分段耗时与载荷观测。")

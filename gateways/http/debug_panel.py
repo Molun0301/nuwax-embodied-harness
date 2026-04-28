@@ -644,13 +644,16 @@ def _render_debug_page(access_token: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>nuwax_robot_bridge 本机只读调试面板</title>
   <style>
-    :root { color-scheme: dark; --bg: #11110f; --panel: #191917; --panel-soft: #22221f; --panel-strong: #262622; --border: #373832; --text: #f3f0e8; --muted: #a7a29a; --good: #7ddf98; --warn: #f4b942; --bad: #f46d75; --info: #5dc7c2; --map-line: #7cc7f2; --unknown: #56554f; --free: #ebe7dc; --occupied: #171715; --frontier: #d783ff; }
+    :root { color-scheme: dark; --bg: #0d0f0e; --surface: #121614; --panel: #171c1a; --panel-soft: #1d2421; --panel-strong: #222b27; --border: #34413b; --border-soft: #26302c; --text: #eef3ed; --muted: #9aa79f; --good: #6fda8c; --warn: #e7b44a; --bad: #ef6b72; --info: #62c8c4; --accent: #8ab4f8; --map-line: #8ab4f8; --unknown: #4d5650; --free: #dfe6dc; --occupied: #141716; --frontier: #d783ff; }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 18px; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 0; }
-    .app-shell { max-width: 1720px; margin: 0 auto; }
-    .topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; justify-content: space-between; margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 0; }
+    .app-shell { max-width: 1760px; margin: 0 auto; }
+    .topbar { display: grid; grid-template-columns: minmax(260px, 0.55fr) minmax(520px, 1.45fr); gap: 14px; align-items: stretch; margin-bottom: 14px; }
+    .brand-block, .global-status { background: rgba(18, 22, 20, 0.92); border: 1px solid var(--border); border-radius: 8px; padding: 14px; box-shadow: 0 14px 34px rgba(0, 0, 0, 0.26); }
+    .brand-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
     h1, h2, h3 { margin: 0; }
-    h1 { font-size: 24px; font-weight: 680; }
+    h1 { font-size: 24px; font-weight: 720; }
     h2 { font-size: 16px; font-weight: 650; }
     h3 { font-size: 13px; color: #d7d2c8; font-weight: 620; }
     code { color: #9bd7d3; word-break: break-all; }
@@ -660,22 +663,33 @@ def _render_debug_page(access_token: str) -> str:
     .eyebrow { color: var(--info); font-size: 12px; font-weight: 650; text-transform: uppercase; }
     .readonly { color: #b6ede8; }
     .grid { display: grid; gap: 12px; }
-    .overview-grid { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); margin-bottom: 12px; }
-    .workspace { grid-template-columns: minmax(620px, 1.25fr) minmax(390px, 0.75fr); align-items: start; }
+    .mission-layout { display: grid; grid-template-columns: 176px minmax(0, 1fr); gap: 14px; align-items: start; }
+    .side-nav { position: sticky; top: 16px; display: grid; gap: 6px; padding: 10px; background: rgba(18, 22, 20, 0.88); border: 1px solid var(--border); border-radius: 8px; }
+    .side-nav a { color: #cbd8d1; text-decoration: none; border: 1px solid transparent; border-radius: 6px; padding: 8px 9px; font-size: 13px; }
+    .side-nav a:hover { border-color: var(--border); background: var(--panel-soft); color: var(--text); }
+    .mission-content { display: grid; gap: 12px; min-width: 0; }
+    .section-band { scroll-margin-top: 16px; display: grid; gap: 12px; }
+    .section-title { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 0 2px; }
+    .overview-grid { grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); }
+    .mission-grid { grid-template-columns: minmax(260px, 0.8fr) minmax(260px, 0.8fr) minmax(320px, 1fr); }
+    .workspace { grid-template-columns: minmax(660px, 1.25fr) minmax(430px, 0.75fr); align-items: start; }
     .right-rail { grid-template-columns: 1fr; }
-    .card, .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22); }
-    .status-card { display: grid; gap: 7px; min-height: 126px; }
+    .card, .panel { background: rgba(23, 28, 26, 0.94); border: 1px solid var(--border); border-radius: 8px; padding: 12px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22); }
+    .panel.compact { padding: 10px; }
+    .status-card { display: grid; gap: 7px; min-height: 112px; }
     .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    .global-status { display: grid; grid-template-columns: repeat(6, minmax(108px, 1fr)); gap: 8px; align-items: stretch; }
     .metric-strip { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
-    .metric { border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; background: var(--panel-soft); color: #d9d3c8; min-width: 118px; }
+    .metric { border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; background: var(--panel-soft); color: #d9d3c8; min-width: 112px; }
     .metric b { display: block; font-size: 14px; color: var(--text); }
     .metric span { display: block; color: var(--muted); font-size: 11px; }
-    .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 8px; font-size: 12px; border: 1px solid var(--border); background: #10100f; color: #d8d3ca; white-space: nowrap; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 8px; font-size: 12px; border: 1px solid var(--border); background: #101412; color: #d8d3ca; white-space: nowrap; }
     .pill::before { content: ""; width: 7px; height: 7px; border-radius: 999px; background: var(--muted); }
     .pill.available::before { background: var(--good); }
     .pill.stale::before { background: var(--warn); }
     .pill.missing::before, .pill.unsupported::before { background: var(--unknown); }
     .pill.error::before { background: var(--bad); }
+    .estop { border-color: rgba(239, 107, 114, 0.55); color: #ffd5d7; background: rgba(95, 20, 25, 0.3); }
     .kv { display: grid; grid-template-columns: minmax(104px, 0.42fr) minmax(0, 1fr); gap: 5px 8px; font-size: 12px; }
     .kv div:nth-child(odd) { color: var(--muted); }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; }
@@ -683,10 +697,13 @@ def _render_debug_page(access_token: str) -> str:
     .notice { color: #ffe1a8; background: rgba(115, 78, 21, 0.22); border: 1px solid rgba(244, 185, 66, 0.35); border-radius: 8px; padding: 9px; }
     .panel-meta { margin-top: 8px; }
     .canvas-wrap { position: relative; background: #0b0b0a; border-radius: 6px; }
-    #mapCanvas { height: min(58vh, 620px); min-height: 380px; image-rendering: pixelated; }
-    #pointCloudMapCanvas { height: 360px; }
+    #mapCanvas { height: min(62vh, 680px); min-height: 430px; image-rendering: pixelated; }
+    #pointCloudMapCanvas { height: 410px; }
     #pointCloudCanvas { height: 190px; }
-    .video-frame { display: block; width: 100%; min-height: 190px; max-height: 300px; object-fit: contain; border-radius: 6px; background: #0b0b0a; border: 1px solid #2d2e29; }
+    .video-stage { position: relative; border-radius: 6px; overflow: hidden; border: 1px solid #2d2e29; background: #080a09; }
+    .video-frame { display: block; width: 100%; min-height: 220px; max-height: 340px; object-fit: contain; background: #0b0b0a; }
+    .video-overlay { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; justify-content: space-between; gap: 8px; pointer-events: none; }
+    .overlay-chip { border: 1px solid rgba(98, 200, 196, 0.35); background: rgba(8, 12, 11, 0.72); border-radius: 6px; padding: 5px 7px; font-size: 12px; color: #d7eee9; }
     .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
     .legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
     .swatch { width: 12px; height: 12px; border: 1px solid #777268; border-radius: 3px; }
@@ -695,28 +712,80 @@ def _render_debug_page(access_token: str) -> str:
     .log-line .meta { color: #8fd8d3; font-size: 12px; margin-bottom: 4px; }
     .log-line.warn .meta, .log-line.warning .meta { color: #ffe1a8; }
     .log-line.error .meta, .log-line.critical .meta { color: #ffd0d0; }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .field { min-height: 30px; border: 1px solid var(--border); border-radius: 6px; background: #101412; color: var(--text); padding: 5px 8px; font: inherit; font-size: 12px; }
+    .service-list, .event-list, .task-list { display: grid; gap: 7px; }
+    .service-row, .task-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 8px; align-items: center; border: 1px solid var(--border-soft); border-radius: 7px; padding: 8px; background: #121715; }
+    .service-row .meta, .task-row .meta { color: var(--muted); font-size: 12px; }
+    .health-line { height: 6px; border-radius: 999px; background: linear-gradient(90deg, var(--good), var(--info)); opacity: 0.9; }
+    .health-line.warn { background: linear-gradient(90deg, var(--warn), #f97316); }
+    .health-line.bad { background: linear-gradient(90deg, var(--bad), #a61f2b); }
     .split-two { grid-template-columns: 1fr 1fr; }
-    @media (max-width: 1180px) { .workspace { grid-template-columns: 1fr; } }
+    @media (max-width: 1280px) { .topbar, .mission-layout, .workspace, .mission-grid { grid-template-columns: 1fr; } .side-nav { position: static; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); } .global-status { grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); } }
     @media (max-width: 720px) { body { padding: 10px; } .split-two { grid-template-columns: 1fr; } .metric-strip { justify-content: flex-start; } #mapCanvas, #pointCloudMapCanvas { min-height: 320px; } }
   </style>
 </head>
 <body>
   <div class="app-shell">
   <header class="topbar">
-    <div>
+    <div class="brand-block">
       <div class="eyebrow">只读局域网监控</div>
-      <h1>nuwax_robot_bridge</h1>
+      <div class="brand-row">
+        <h1 id="robotName">nuwax_robot_bridge</h1>
+        <span id="robotModel" class="pill missing">model: --</span>
+      </div>
+      <div class="muted small panel-meta">Robotics mission control dashboard · 只读观察面</div>
     </div>
-    <div class="metric-strip">
-      <div class="metric"><b>&lt;500 ms</b><span>轻量链路目标 P95</span></div>
+    <div class="global-status">
+      <div class="metric"><b id="connectionText">connecting</b><span>连接状态</span></div>
+      <div class="metric"><b id="runtimeMode">--</b><span>运行模式</span></div>
+      <div class="metric"><b id="batteryMetric">--</b><span>电池</span></div>
+      <div class="metric"><b id="networkLatency" class="mono">--</b><span>HTTP 往返</span></div>
+      <div class="metric"><b id="resourceMetric">--</b><span>CPU/GPU/RAM</span></div>
+      <div class="metric"><b id="clockNow" class="mono">--</b><span>当前时间</span></div>
       <div class="metric"><b id="lastReceive" class="mono">--</b><span>前端接收</span></div>
+      <div class="metric"><b>&lt;500 ms</b><span>轻量链路目标 P95</span></div>
+      <span id="estopStatus" class="pill estop">Emergency Stop: read-only</span>
     </div>
   </header>
 
-  <section id="overviewGrid" class="grid overview-grid" aria-label="顶部总览"></section>
+  <div class="mission-layout">
+    <aside class="side-nav" aria-label="页面导航">
+      <a href="#overview">Overview</a>
+      <a href="#live-map">Live Map</a>
+      <a href="#pointcloud-map">3D Map</a>
+      <a href="#video-perception">Video</a>
+      <a href="#navigation">Navigation</a>
+      <a href="#services">Services</a>
+      <a href="#logs-section">Logs</a>
+      <a href="#runtime-settings">Settings</a>
+    </aside>
+
+    <div class="mission-content">
+  <section id="overview" class="section-band">
+    <div class="section-title">
+      <h2>Overview</h2>
+      <span id="missionStatus" class="pill missing">mission: warming</span>
+    </div>
+    <section id="overviewGrid" class="grid overview-grid" aria-label="顶部总览"></section>
+    <div class="grid mission-grid">
+      <section class="panel compact">
+        <div class="card-head"><h3>当前任务</h3><span id="taskStatus" class="pill missing">missing</span></div>
+        <div id="taskSummary" class="task-list"></div>
+      </section>
+      <section class="panel compact">
+        <div class="card-head"><h3>位姿与运动</h3><span id="poseStatus" class="pill missing">missing</span></div>
+        <div id="missionPoseMeta" class="kv"></div>
+      </section>
+      <section class="panel compact">
+        <div class="card-head"><h3>传感器链路</h3><span id="sensorStatus" class="pill missing">missing</span></div>
+        <div id="sensorSummary" class="kv"></div>
+      </section>
+    </div>
+  </section>
 
   <main class="grid workspace">
-    <section class="panel">
+    <section id="live-map" class="panel">
       <div class="card-head">
         <h2>2D 地图、定位与轨迹</h2>
         <span id="mapStatus" class="pill missing">missing</span>
@@ -740,7 +809,7 @@ def _render_debug_page(access_token: str) -> str:
     </section>
 
     <div class="grid right-rail">
-      <section class="panel">
+      <section id="pointcloud-map" class="panel">
         <div class="card-head">
           <h2>3D 点云地图</h2>
           <span id="pointcloudMapStatus" class="pill missing">missing</span>
@@ -750,7 +819,7 @@ def _render_debug_page(access_token: str) -> str:
         <div id="pointcloudMapMeta" class="kv panel-meta"></div>
       </section>
 
-      <section class="panel">
+      <section id="scan-diagnostics" class="panel">
         <div class="card-head">
           <h2>实时扫描帧诊断</h2>
           <span id="pointcloudStatus" class="pill missing">missing</span>
@@ -760,7 +829,7 @@ def _render_debug_page(access_token: str) -> str:
         <div id="pointcloudMeta" class="kv panel-meta"></div>
       </section>
 
-      <section class="panel">
+      <section id="navigation" class="panel">
         <div class="card-head">
           <h2>navigation / frontier</h2>
           <span id="navigationStatus" class="pill missing">missing</span>
@@ -769,7 +838,7 @@ def _render_debug_page(access_token: str) -> str:
         <div id="frontierNotice" class="notice panel-meta">等待 frontier 候选几何。</div>
       </section>
 
-      <section class="panel">
+      <section id="runtime-settings" class="panel">
         <div class="card-head">
           <h2>RTAB-Map 运行治理</h2>
           <span id="governanceStatus" class="pill missing">missing</span>
@@ -778,26 +847,54 @@ def _render_debug_page(access_token: str) -> str:
         <div class="muted small panel-meta">只读展示 profile、几何资产、重定位质量和导航门控摘要。</div>
       </section>
 
-      <section class="panel">
+      <section id="video-perception" class="panel">
         <div class="card-head">
-          <h2>实时视频</h2>
+          <h2>视频与感知</h2>
           <span id="videoStatus" class="pill missing">missing</span>
         </div>
-        <img id="videoFrame" class="video-frame" alt="实时视频帧" hidden>
+        <div class="video-stage">
+          <img id="videoFrame" class="video-frame" alt="实时视频帧" hidden>
+          <div class="video-overlay">
+            <span id="visionModelStatus" class="overlay-chip">local model: --</span>
+            <span id="videoFpsStatus" class="overlay-chip">fps: --</span>
+          </div>
+        </div>
         <div id="videoEmpty" class="empty panel-meta">等待视频帧。</div>
         <div id="videoMeta" class="kv panel-meta"></div>
       </section>
 
-      <section class="panel">
+      <section id="services" class="panel">
+        <div class="card-head">
+          <h2>服务状态</h2>
+          <span id="servicesStatus" class="pill missing">missing</span>
+        </div>
+        <div id="serviceMatrix" class="service-list"></div>
+      </section>
+
+      <section id="logs-section" class="panel">
         <div class="card-head">
           <h2>真实日志 tail</h2>
           <span id="logsStatus" class="pill missing">missing</span>
+        </div>
+        <div class="toolbar">
+          <select id="logLevelFilter" class="field" aria-label="日志等级过滤">
+            <option value="">ALL</option>
+            <option value="debug">DEBUG</option>
+            <option value="info">INFO</option>
+            <option value="warn">WARN</option>
+            <option value="warning">WARNING</option>
+            <option value="error">ERROR</option>
+            <option value="critical">CRITICAL</option>
+          </select>
+          <input id="logSearch" class="field" type="search" placeholder="搜索日志" aria-label="搜索日志">
         </div>
         <div id="logsMeta" class="kv"></div>
         <div id="logs" class="logs panel-meta"></div>
       </section>
     </div>
   </main>
+    </div>
+  </div>
   </div>
 
   <script>
@@ -832,8 +929,29 @@ def _render_debug_page(access_token: str) -> str:
         pointCloudMapBounds: null,
         pointCloudMapLod: "",
         pointCloudMapPoints: null,
+        latestOverview: null,
+        latestHealth: null,
+        latestTasks: null,
+        logFilter: "",
+        logSearch: "",
       };
       const els = {
+        robotName: document.getElementById("robotName"),
+        robotModel: document.getElementById("robotModel"),
+        connectionText: document.getElementById("connectionText"),
+        runtimeMode: document.getElementById("runtimeMode"),
+        batteryMetric: document.getElementById("batteryMetric"),
+        networkLatency: document.getElementById("networkLatency"),
+        resourceMetric: document.getElementById("resourceMetric"),
+        clockNow: document.getElementById("clockNow"),
+        estopStatus: document.getElementById("estopStatus"),
+        missionStatus: document.getElementById("missionStatus"),
+        taskStatus: document.getElementById("taskStatus"),
+        taskSummary: document.getElementById("taskSummary"),
+        poseStatus: document.getElementById("poseStatus"),
+        missionPoseMeta: document.getElementById("missionPoseMeta"),
+        sensorStatus: document.getElementById("sensorStatus"),
+        sensorSummary: document.getElementById("sensorSummary"),
         lastReceive: document.getElementById("lastReceive"),
         overviewGrid: document.getElementById("overviewGrid"),
         mapCanvas: document.getElementById("mapCanvas"),
@@ -859,9 +977,15 @@ def _render_debug_page(access_token: str) -> str:
         videoFrame: document.getElementById("videoFrame"),
         videoEmpty: document.getElementById("videoEmpty"),
         videoMeta: document.getElementById("videoMeta"),
+        visionModelStatus: document.getElementById("visionModelStatus"),
+        videoFpsStatus: document.getElementById("videoFpsStatus"),
+        servicesStatus: document.getElementById("servicesStatus"),
+        serviceMatrix: document.getElementById("serviceMatrix"),
         logsStatus: document.getElementById("logsStatus"),
         logsMeta: document.getElementById("logsMeta"),
         logs: document.getElementById("logs"),
+        logLevelFilter: document.getElementById("logLevelFilter"),
+        logSearch: document.getElementById("logSearch"),
       };
 
       function nowText() { return new Date().toLocaleTimeString(); }
@@ -889,6 +1013,28 @@ def _render_debug_page(access_token: str) -> str:
           v.textContent = safeText(value);
           el.append(k, v);
         }
+      }
+      function setText(el, value) {
+        if (!el) return;
+        el.textContent = safeText(value);
+      }
+      function statusSeverity(status) {
+        const value = statusClass(status || "missing");
+        if (value === "available") return 0;
+        if (value === "stale") return 1;
+        if (value === "missing" || value === "unsupported") return 2;
+        return 3;
+      }
+      function worstStatus(items) {
+        let result = "available";
+        for (const item of items) {
+          const status = item && item.status ? item.status : "missing";
+          if (statusSeverity(status) > statusSeverity(result)) result = status;
+        }
+        return result;
+      }
+      function updateClock() {
+        setText(els.clockNow, nowText());
       }
       function errorReason(envelope, fallback) {
         const err = envelope && envelope.error;
@@ -932,6 +1078,9 @@ def _render_debug_page(access_token: str) -> str:
       }
       function updateOverview(envelope) {
         const data = envelope && envelope.data ? envelope.data : {};
+        state.latestOverview = data;
+        setText(els.connectionText, "online");
+        setText(els.networkLatency, fmt(envelope.__frontendLatencyMs, " ms"));
         for (const name of overviewNames) {
           const summary = data[name] || {};
           const section = document.getElementById(`overview-${name}`);
@@ -944,6 +1093,117 @@ def _render_debug_page(access_token: str) -> str:
             ["source", summary.metadata && summary.metadata.source],
           ]);
           section.querySelector(".small").textContent = `前端接收 ${shortTime(envelope.__receivedAt)}`;
+        }
+        const mission = worstStatus([data.health, data.state, data.localization, data.map, data.navigation, data.pointcloud_map, data.video, data.logs]);
+        setPill(els.missionStatus, mission, "mission");
+        updateSensorSummary(data);
+        renderServiceMatrix(data);
+      }
+      function updateSensorSummary(data) {
+        const map = data.map || {};
+        const localization = data.localization || {};
+        const cloudMap = data.pointcloud_map || {};
+        const scan = data.pointcloud || {};
+        const video = data.video || {};
+        const sensorStatus = worstStatus([map, localization, cloudMap, scan, video]);
+        setPill(els.sensorStatus, sensorStatus);
+        setKv(els.sensorSummary, [
+          ["2D_map", `${safeText(map.status)} latency=${fmt(map.latency_ms, " ms")}`],
+          ["localization", `${safeText(localization.status)} frame=${safeText(localization.frame_id)}`],
+          ["pointcloud_map", `${safeText(cloudMap.status)} rev=${safeText(cloudMap.revision)}`],
+          ["scan_frame", `${safeText(scan.status)} frame=${safeText(scan.frame_id)}`],
+          ["video", `${safeText(video.status)} source=${safeText(video.metadata && video.metadata.source)}`],
+        ]);
+      }
+      function renderServiceMatrix(data) {
+        const rows = [
+          ["gateway", data.health],
+          ["robot_state", data.state],
+          ["mapping", data.map],
+          ["localization", data.localization],
+          ["navigation", data.navigation],
+          ["exploration", data.exploration],
+          ["rtabmap_governance", data.runtime_governance],
+          ["pointcloud_map", data.pointcloud_map],
+          ["sensor_scan", data.pointcloud],
+          ["video", data.video],
+          ["logs", data.logs],
+        ];
+        els.serviceMatrix.replaceChildren();
+        const serviceStatus = worstStatus(rows.map((item) => item[1]));
+        setPill(els.servicesStatus, serviceStatus);
+        for (const [name, summary] of rows) {
+          const status = summary && summary.status ? summary.status : "missing";
+          const row = document.createElement("article");
+          row.className = "service-row";
+          const left = document.createElement("div");
+          const title = document.createElement("div");
+          title.textContent = name;
+          title.className = "mono";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.textContent = `${safeText(summary && summary.metadata && summary.metadata.source)} · latency ${fmt(summary && summary.latency_ms, " ms")} · ${shortTime(summary && summary.source_timestamp)}`;
+          const line = document.createElement("div");
+          line.className = `health-line ${statusSeverity(status) >= 3 ? "bad" : statusSeverity(status) >= 1 ? "warn" : ""}`;
+          left.append(title, meta, line);
+          const pill = document.createElement("span");
+          pill.className = `pill ${statusClass(status)}`;
+          pill.textContent = status;
+          row.append(left, pill);
+          els.serviceMatrix.appendChild(row);
+        }
+      }
+      function updateHealth(payload) {
+        const health = payload || {};
+        state.latestHealth = health;
+        setText(els.robotName, health.robot_name || "nuwax_robot_bridge");
+        setPill(els.robotModel, health.runtime_started ? "available" : "missing", `model: ${safeText(health.robot_model)}`);
+        const robot = health.latest_robot_snapshot || {};
+        const status = health.assembly_status || {};
+        const safety = robot.safety || {};
+        const battery = robot.battery || {};
+        setText(els.runtimeMode, status.control_mode || robot.mode || "--");
+        const rawBattery = Number(battery.percentage);
+        const batteryValue = battery.percentage !== undefined
+          ? `${Math.round(rawBattery <= 1 ? rawBattery * 100 : rawBattery)}%`
+          : (battery.level !== undefined ? `${battery.level}%` : "--");
+        setText(els.batteryMetric, batteryValue);
+        setText(els.resourceMetric, `tasks ${health.active_task_count ?? 0} · events ${health.latest_event_cursor ?? 0}`);
+        const estopped = safety.is_estopped === true || safety.estopped === true;
+        setPill(els.estopStatus, estopped ? "error" : "available", estopped ? "Emergency Stop: active" : "Emergency Stop: clear");
+        els.estopStatus.classList.add("estop");
+      }
+      function updateTasks(payload) {
+        const active = Array.isArray(payload && payload.active_tasks) ? payload.active_tasks : [];
+        const history = Array.isArray(payload && payload.history_tasks) ? payload.history_tasks : [];
+        state.latestTasks = payload || {};
+        els.taskSummary.replaceChildren();
+        setPill(els.taskStatus, "available", active.length ? `${active.length} active` : "idle");
+        const items = active.length ? active.slice(0, 4) : history.slice(0, 3);
+        if (!items.length) {
+          const row = document.createElement("article");
+          row.className = "task-row";
+          row.innerHTML = '<div><div class="mono">idle</div><div class="meta">当前没有活动任务</div></div><span class="pill missing">idle</span>';
+          els.taskSummary.appendChild(row);
+          return;
+        }
+        for (const task of items) {
+          const row = document.createElement("article");
+          row.className = "task-row";
+          const left = document.createElement("div");
+          const title = document.createElement("div");
+          title.className = "mono";
+          title.textContent = task.task_id || task.capability_name || "task";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.textContent = `${safeText(task.capability_name)} · progress ${fmt(task.progress, "")} · ${safeText(task.stage || task.state)}`;
+          left.append(title, meta);
+          const pill = document.createElement("span");
+          const taskState = String(task.state || task.status || "missing").toLowerCase();
+          pill.className = `pill ${taskState === "failed" || taskState === "timeout" ? "error" : taskState === "running" ? "available" : "stale"}`;
+          pill.textContent = taskState;
+          row.append(left, pill);
+          els.taskSummary.appendChild(row);
         }
       }
       function showPanelError(kind, message) {
@@ -1157,6 +1417,14 @@ def _render_debug_page(access_token: str) -> str:
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["stale", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
+        ]);
+        setPill(els.poseStatus, status);
+        setKv(els.missionPoseMeta, [
+          ["frame", envelope.frame_id || (state.pose && state.pose.frame_id)],
+          ["position", p ? `x=${fmt(p.x)} y=${fmt(p.y)} z=${fmt(p.z)}` : "--"],
+          ["yaw", yaw === null ? "--" : fmt(yaw, " rad")],
+          ["trajectory", state.trajectory.length],
+          ["latency", fmt(envelope.latency_ms, " ms")],
         ]);
         drawMap();
       }
@@ -1518,6 +1786,8 @@ def _render_debug_page(access_token: str) -> str:
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
+        setText(els.visionModelStatus, `local model: ${status}`);
+        setText(els.videoFpsStatus, `frames ${state.videoFrames} · latency ${fmt(envelope.latency_ms, " ms")}`);
       }
       function updateLogs(envelope) {
         const status = statusOf(envelope);
@@ -1546,14 +1816,23 @@ def _render_debug_page(access_token: str) -> str:
       }
       function renderLogs() {
         els.logs.replaceChildren();
-        if (!state.logs.length) {
+        const normalizedLevel = String(state.logFilter || "").toLowerCase();
+        const query = String(state.logSearch || "").trim().toLowerCase();
+        const filtered = state.logs.filter((entry) => {
+          const level = String(entry.level || "").toLowerCase();
+          const haystack = `${entry.timestamp || ""} ${entry.level || ""} ${entry.source || ""} ${entry.message || ""} ${entry.event_type || ""}`.toLowerCase();
+          if (normalizedLevel && level !== normalizedLevel) return false;
+          if (query && !haystack.includes(query)) return false;
+          return true;
+        });
+        if (!filtered.length) {
           const empty = document.createElement("div");
           empty.className = "empty";
           empty.textContent = "暂无匹配日志行。";
           els.logs.appendChild(empty);
           return;
         }
-        for (const entry of state.logs.slice(-120).reverse()) {
+        for (const entry of filtered.slice(-120).reverse()) {
           const line = document.createElement("article");
           line.className = `log-line ${entry.level || "info"}`;
           const meta = document.createElement("div");
@@ -1580,6 +1859,10 @@ def _render_debug_page(access_token: str) -> str:
           ]);
           els.lastReceive.textContent = nowText();
           if (overview.status === "fulfilled") updateOverview(overview.value);
+          else {
+            setText(els.connectionText, "degraded");
+            setText(els.networkLatency, "--");
+          }
           if (map.status === "fulfilled") updateMap(map.value); else showPanelError("map", map.reason.message);
           if (localization.status === "fulfilled") updateLocalization(localization.value); else showPanelError("localization", localization.reason.message);
           if (navigation.status === "fulfilled") updateNavigation(navigation.value); else showPanelError("navigation", navigation.reason.message);
@@ -1608,8 +1891,14 @@ def _render_debug_page(access_token: str) -> str:
         if (state.slowPolling) return;
         state.slowPolling = true;
         try {
-          const logs = await getJson(`/api/debug/logs/tail?cursor=${encodeURIComponent(state.logCursor)}&limit=200`);
-          updateLogs(logs);
+          const [logs, health, tasks] = await Promise.allSettled([
+            getJson(`/api/debug/logs/tail?cursor=${encodeURIComponent(state.logCursor)}&limit=200`),
+            getJson("/api/health"),
+            getJson("/api/tasks?history_limit=20"),
+          ]);
+          if (logs.status === "fulfilled") updateLogs(logs.value); else showPanelError("logs", logs.reason.message);
+          if (health.status === "fulfilled") updateHealth(health.value);
+          if (tasks.status === "fulfilled") updateTasks(tasks.value);
         } catch (error) {
           showPanelError("logs", error.message);
         } finally {
@@ -1618,6 +1907,16 @@ def _render_debug_page(access_token: str) -> str:
       }
       buildOverview();
       renderLogs();
+      updateClock();
+      window.setInterval(updateClock, 1000);
+      els.logLevelFilter.addEventListener("change", () => {
+        state.logFilter = els.logLevelFilter.value;
+        renderLogs();
+      });
+      els.logSearch.addEventListener("input", () => {
+        state.logSearch = els.logSearch.value;
+        renderLogs();
+      });
       clearPointCloudMapCanvas("等待 RTAB-Map/PCD 累计点云地图。");
       tickFast();
       tickSensor();

@@ -541,6 +541,32 @@ def _build_host_app(tmp_path: Path, *, start_runtime_on_lifespan: bool = True):
     return app, runtime, robot, config
 
 
+def _write_debug_pointcloud_map(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "# .PCD v0.7",
+                "VERSION 0.7",
+                "FIELDS x y z",
+                "SIZE 4 4 4",
+                "TYPE F F F",
+                "COUNT 1 1 1",
+                "WIDTH 4",
+                "HEIGHT 1",
+                "POINTS 4",
+                "DATA ascii",
+                "0.0 0.0 0.0",
+                "1.0 0.0 0.1",
+                "1.0 1.0 0.2",
+                "0.0 1.0 0.3",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_load_config_reads_segmentation_settings_from_env(monkeypatch) -> None:
     """配置解析应读取语义分割相关环境变量。"""
 
@@ -957,6 +983,10 @@ def test_gateway_debug_panel_realtime_readonly_routes(tmp_path: Path) -> None:
         "2026-04-27 12:00:01 [ERROR] [nuwax.test] 第二行错误\n",
         encoding="utf-8",
     )
+    pcd_path = tmp_path / "pcd" / "cloud_map.pcd"
+    _write_debug_pointcloud_map(pcd_path)
+    config.geometry.rtabmap.pcd_root = str(pcd_path.parent)
+    config.geometry.frames.map_frame = "map"
 
     with TestClient(app) as client:
         robot.start()
@@ -964,6 +994,8 @@ def test_gateway_debug_panel_realtime_readonly_routes(tmp_path: Path) -> None:
         assert page.status_code == 200
         assert "实时视频" in page.text
         assert "真实日志 tail" in page.text
+        assert "3D 点云地图" in page.text
+        assert "/api/debug/pointcloud-map/latest/meta" in page.text
         assert "<button" not in page.text
         assert "<form" not in page.text
         assert "method: \"POST\"" not in page.text
@@ -972,12 +1004,29 @@ def test_gateway_debug_panel_realtime_readonly_routes(tmp_path: Path) -> None:
 
         overview = client.get("/api/debug/overview", headers=_agent_headers()).json()
         assert overview["data"]["video"]["status"] in {"available", "stale"}
+        assert overview["data"]["pointcloud_map"]["status"] in {"available", "stale"}
         assert overview["data"]["logs"]["metadata"]["path"] == config.logging.log_file
+
+        pointcloud_map = client.get("/api/debug/pointcloud-map/latest/meta", headers=_agent_headers()).json()
+        assert pointcloud_map["status"] == "available"
+        assert pointcloud_map["data"]["source_kind"] == "configured_pcd_root"
+        assert pointcloud_map["data"]["point_count"] == 4
+        assert pointcloud_map["data"]["metadata"]["not_sensor_scan"] is True
+        assert pointcloud_map["data"]["pcd_path"] == str(pcd_path.resolve())
+        pointcloud_map_bin = client.get(
+            f"/api/debug/pointcloud-map/latest.bin?lod=preview&revision={pointcloud_map['revision']}",
+            headers=_agent_headers(),
+        )
+        assert pointcloud_map_bin.status_code == 200
+        assert pointcloud_map_bin.headers["X-PointCloud-Format"] == "float32-xyz"
+        assert pointcloud_map_bin.headers["X-PointCloud-Point-Count"] == "4"
+        assert len(pointcloud_map_bin.content) == 4 * 3 * 4
 
         pointcloud = client.get("/api/debug/pointcloud/latest", headers=_agent_headers()).json()
         assert pointcloud["status"] in {"available", "stale"}
         assert pointcloud["data"]["point_count"] == 3
         assert len(pointcloud["data"]["points"]) == 3
+        assert pointcloud["data"]["protection"]["not_a_pointcloud_map"] is True
 
         video = client.get("/api/debug/video/latest", headers=_agent_headers()).json()
         assert video["status"] in {"available", "stale"}
@@ -989,11 +1038,14 @@ def test_gateway_debug_panel_realtime_readonly_routes(tmp_path: Path) -> None:
         assert "第一行日志" in messages
         assert "第二行错误" in messages
         assert logs["source"] == "configured_log_file"
+        assert logs["data"]["metrics"]["server_compute_ms"] >= 0.0
+        assert logs["data"]["metrics"]["file_read_ms"] >= 0.0
 
         filtered = client.get("/api/debug/logs/tail?limit=10&level=error", headers=_agent_headers()).json()
         assert [entry["message"] for entry in filtered["data"]["entries"]] == ["第二行错误"]
 
         assert client.post("/api/debug/pointcloud/latest", headers=_agent_headers()).status_code == 405
+        assert client.post("/api/debug/pointcloud-map/latest/meta", headers=_agent_headers()).status_code == 405
         assert client.delete("/api/debug/video/latest", headers=_agent_headers()).status_code == 405
 
 
@@ -3136,6 +3188,7 @@ def test_gateway_debug_panel_readonly_routes(tmp_path: Path) -> None:
             "/api/debug/map",
             "/api/debug/localization",
             "/api/debug/navigation",
+            "/api/debug/pointcloud-map/latest/meta",
             "/api/debug/pointcloud/latest",
             "/api/debug/logs/tail",
         ):
@@ -3149,7 +3202,12 @@ def test_gateway_debug_panel_readonly_routes(tmp_path: Path) -> None:
 
         pointcloud = client.get("/api/debug/pointcloud/latest", headers=_agent_headers()).json()
         assert pointcloud["data"]["protection"]["default_max_points_applied_by_debug_api"] is False
+        pointcloud_map = client.get("/api/debug/pointcloud-map/latest/meta", headers=_agent_headers()).json()
+        if pointcloud_map["status"] != "available":
+            assert pointcloud_map["data"]["point_count"] == 0
+            assert pointcloud_map["data"]["metadata"]["not_fallback_to_sensor_scan"] is True
 
         assert client.post("/api/debug/navigation", headers=_agent_headers()).status_code == 405
+        assert client.post("/api/debug/pointcloud-map/latest/meta", headers=_agent_headers()).status_code == 405
         assert client.patch("/api/debug/navigation", headers=_agent_headers()).status_code == 405
         assert client.delete("/api/debug/navigation", headers=_agent_headers()).status_code == 405

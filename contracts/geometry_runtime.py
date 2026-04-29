@@ -49,6 +49,7 @@ class GeometryFrameConfig:
     odom_frame: str = "odom"
     base_frame: str = "body"
     lidar_frame: str = "utlidar_lidar"
+    imu_frame: str = "utlidar_imu"
 
 
 @dataclass
@@ -138,12 +139,17 @@ class RtabmapConfig:
 class Nav2Config:
     """Nav2 侧车配置。"""
 
+    mode: str = "external"
     action_name: str = "/navigate_to_pose"
     launch_package: str = "nav2_bringup"
     launch_file: str = "navigation_launch.py"
     global_costmap_topic: str = "/global_costmap/costmap"
     local_costmap_topic: str = "/local_costmap/costmap"
     costmap_source: str = "nav2_global"
+    map_yaml: str = ""
+    params_file: str = ""
+    use_sim_time: bool = False
+    autostart: bool = True
 
 
 @dataclass
@@ -193,6 +199,7 @@ class PlatformGeometryConfig:
                 "odom_frame": self.frames.odom_frame,
                 "base_frame": self.frames.base_frame,
                 "lidar_frame": self.frames.lidar_frame,
+                "imu_frame": self.frames.imu_frame,
             },
             "input_contract": {
                 "name": self.rtabmap.input_contract,
@@ -287,6 +294,11 @@ class PlatformGeometryConfig:
                 "launch_file": self.nav2.launch_file,
                 "global_costmap_topic": self.nav2.global_costmap_topic,
                 "local_costmap_topic": self.nav2.local_costmap_topic,
+                "mode": self.nav2.mode,
                 "costmap_source": self.nav2.costmap_source,
+                "map_yaml": self.nav2.map_yaml or None,
+                "params_file": self.nav2.params_file or None,
+                "use_sim_time": self.nav2.use_sim_time,
+                "autostart": self.nav2.autostart,
             },
         }

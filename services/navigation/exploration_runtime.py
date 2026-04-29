@@ -36,6 +36,12 @@ class FrontierTarget:
     navigation_goal: NavigationGoal
     arrived: bool = False
     scanned: bool = False
+    map_revision: Optional[str] = None
+    costmap_revision: Optional[str] = None
+    pose_revision: Optional[str] = None
+    created_at: datetime = field(default_factory=utc_now)
+    stale: bool = False
+    stale_reason: Optional[str] = None
 
 
 @dataclass
@@ -55,6 +61,11 @@ class ExplorationRuntimeState:
     no_gain_rounds: int = 0
     known_cells: int = 0
     waiting_for: Optional[str] = None
+    failure_code: Optional[str] = None
+    frontier_freshness: Dict[str, Any] = field(default_factory=dict)
+    map_revision: Optional[str] = None
+    costmap_revision: Optional[str] = None
+    pose_revision: Optional[str] = None
     start_time: datetime = field(default_factory=utc_now)
     end_time: Optional[datetime] = None
     last_error: Optional[str] = None
@@ -154,6 +165,7 @@ class PlatformExplorationRuntime:
         current_pose: Optional[Pose],
         occupancy_grid=None,
         cost_map=None,
+        runtime_metadata: Optional[Dict[str, Any]] = None,
     ) -> ExplorationRuntimeState:
         """推进探索状态机。"""
 
@@ -163,6 +175,7 @@ class PlatformExplorationRuntime:
             return self._current_state
 
         state = self._current_state
+        self._apply_runtime_metadata(state, runtime_metadata)
         state.waiting_for = None
         if state.phase == ExplorationRuntimePhase.PLANNING:
             self._handle_planning_state(state, current_pose, occupancy_grid, cost_map)
@@ -205,13 +218,18 @@ class PlatformExplorationRuntime:
                 "completed_frontiers": state.completed_frontiers,
                 "latest_frontiers": [self._frontier_candidate_to_metadata(item) for item in state.latest_frontiers],
                 "current_frontier": (
-                    self._frontier_candidate_to_metadata(state.current_target.frontier)
+                    self._frontier_candidate_to_metadata(state.current_target.frontier, target=state.current_target)
                     if state.current_target is not None
                     else None
                 ),
                 "known_cells": state.known_cells,
                 "no_gain_rounds": state.no_gain_rounds,
                 "waiting_for": state.waiting_for,
+                "failure_code": state.failure_code,
+                "frontier_freshness": dict(state.frontier_freshness),
+                "map_revision": state.map_revision,
+                "costmap_revision": state.costmap_revision,
+                "pose_revision": state.pose_revision,
                 "hit_stop_trigger": state.hit_stop_trigger,
                 "current_target_goal_id": (
                     state.current_target.navigation_goal.goal_id if state.current_target is not None else None
@@ -242,6 +260,67 @@ class PlatformExplorationRuntime:
             return
         self._current_state.hit_stop_trigger = str(reason or "").strip() or "external_report"
         self._finish(self._current_state, phase=ExplorationRuntimePhase.HIT_STOP)
+
+    def block_on_prerequisite(
+        self,
+        *,
+        waiting_for: str,
+        message: str,
+        failure_code: str = "exploration_prerequisite_unavailable",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """记录探索前置条件阻塞，保持任务在可恢复规划态。"""
+
+        if self._current_state is None:
+            return
+        state = self._current_state
+        if state.current_target is not None:
+            self.mark_current_frontier_stale(
+                reason="prerequisite_changed:%s" % waiting_for,
+                replan=False,
+            )
+        state.phase = ExplorationRuntimePhase.PLANNING
+        state.waiting_for = str(waiting_for or "prerequisite")
+        state.failure_code = str(failure_code or "exploration_prerequisite_unavailable")
+        state.last_error = str(message or "探索前置条件未就绪。")
+        self._apply_runtime_metadata(state, metadata)
+        state.metadata["readiness_phase"] = "blocked"
+
+    def fail_current(
+        self,
+        *,
+        reason: str,
+        failure_code: str,
+        waiting_for: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """将当前探索任务置为失败。"""
+
+        if self._current_state is None:
+            return
+        state = self._current_state
+        state.waiting_for = waiting_for
+        state.failure_code = str(failure_code or "exploration_failed")
+        state.last_error = str(reason or "探索失败。")
+        self._apply_runtime_metadata(state, metadata)
+        self._finish(state, phase=ExplorationRuntimePhase.FAILED)
+
+    def mark_current_frontier_stale(self, *, reason: str, replan: bool = True) -> None:
+        """标记当前 frontier 过期，不再复用旧目标继续导航。"""
+
+        if self._current_state is None or self._current_state.current_target is None:
+            return
+        target = self._current_state.current_target
+        target.stale = True
+        target.stale_reason = str(reason or "frontier_stale")
+        self._current_state.rejected_frontiers.append(target.frontier.pose)
+        self._current_state.metadata["last_stale_frontier"] = self._frontier_candidate_to_metadata(target.frontier, target=target)
+        self._current_state.current_target = None
+        self._current_state.waiting_for = "frontier"
+        self._current_state.failure_code = "frontier_stale"
+        self._current_state.last_error = "frontier 已过期，等待基于最新地图重新规划。"
+        if replan:
+            self._current_state.phase = ExplorationRuntimePhase.PLANNING
 
     def reject_current_target(self, reason: str) -> None:
         """由外部能力拒绝当前前沿目标，要求重新规划。"""
@@ -283,8 +362,14 @@ class PlatformExplorationRuntime:
             state.last_error = "当前位姿不可用，无法选择 frontier。"
             return
         if occupancy_grid is None:
-            state.waiting_for = "occupancy_grid"
-            state.last_error = "当前占据栅格不可用，无法选择 frontier。"
+            state.waiting_for = "map"
+            state.failure_code = "map_unavailable"
+            state.last_error = "当前 /map 占据栅格不可用，无法选择 frontier。"
+            return
+        if cost_map is None:
+            state.waiting_for = "costmap"
+            state.failure_code = "costmap_unavailable"
+            state.last_error = "当前 costmap 不可用，无法安全选择 frontier。"
             return
 
         attempted_poses = [*state.visited_frontiers, *state.rejected_frontiers]
@@ -301,19 +386,38 @@ class PlatformExplorationRuntime:
         state.latest_frontiers = list(frontiers)
         state.last_frontier_count = len(frontiers)
         state.last_error = None
+        state.failure_code = None
         state.known_cells = self._count_known_cells(occupancy_grid)
 
         if not frontiers:
-            self._finish(state, phase=ExplorationRuntimePhase.SUCCEEDED)
+            state.waiting_for = "frontier"
+            state.failure_code = "frontier_unavailable"
+            state.last_error = "最新 live map/costmap/pose 未产生可达 frontier。"
+            self._finish(state, phase=ExplorationRuntimePhase.FAILED)
             return
 
         best_frontier = self._select_best_frontier(frontiers, state)
         if best_frontier is None:
-            self._finish(state, phase=ExplorationRuntimePhase.SUCCEEDED)
+            state.waiting_for = "frontier"
+            state.failure_code = "frontier_exhausted"
+            state.last_error = "最新 frontier 均已访问或被拒绝，无法继续探索。"
+            self._finish(state, phase=ExplorationRuntimePhase.FAILED)
             return
 
+        frontier_revision = self._frontier_revision(state)
+        state.frontier_freshness = {
+            "fresh": True,
+            "frontier_revision": frontier_revision,
+            "computed_at": utc_now().isoformat(),
+            "map_revision": state.map_revision,
+            "costmap_revision": state.costmap_revision,
+            "pose_revision": state.pose_revision,
+        }
         state.current_target = FrontierTarget(
             frontier=best_frontier,
+            map_revision=state.map_revision,
+            costmap_revision=state.costmap_revision,
+            pose_revision=state.pose_revision,
             navigation_goal=NavigationGoal(
                 goal_id=(
                     "explore_frontier_"
@@ -326,6 +430,11 @@ class PlatformExplorationRuntime:
                     "exploration_request_id": state.request_id,
                     "frontier_score": best_frontier.score,
                     "frontier_cluster_size": best_frontier.cluster_size,
+                    "frontier_revision": frontier_revision,
+                    "map_revision": state.map_revision,
+                    "costmap_revision": state.costmap_revision,
+                    "pose_revision": state.pose_revision,
+                    "frontier_computed_at": state.frontier_freshness.get("computed_at"),
                 },
             ),
         )
@@ -344,13 +453,9 @@ class PlatformExplorationRuntime:
             state.last_error = "移动过程中丢失定位。"
             return
 
-        target_pose = state.current_target.navigation_goal.target_pose
-        dx = current_pose.position.x - target_pose.position.x
-        dy = current_pose.position.y - target_pose.position.y
-        distance = (dx * dx + dy * dy) ** 0.5
-        if distance <= max(0.0, float(self._config.reach_distance_m)):
-            state.current_target.arrived = True
-            state.phase = ExplorationRuntimePhase.SCANNING
+        state.last_error = None
+        if state.current_target.stale:
+            self.mark_current_frontier_stale(reason=state.current_target.stale_reason or "frontier_stale")
 
     def _handle_scanning_state(self, state: ExplorationRuntimeState, occupancy_grid) -> None:
         if state.current_target is None:
@@ -422,8 +527,8 @@ class PlatformExplorationRuntime:
         return sum(1 for cell in list(getattr(occupancy_grid, "data", []) or []) if int(cell) >= 0)
 
     @staticmethod
-    def _frontier_candidate_to_metadata(frontier: FrontierCandidate) -> Dict[str, Any]:
-        return {
+    def _frontier_candidate_to_metadata(frontier: FrontierCandidate, *, target: Optional[FrontierTarget] = None) -> Dict[str, Any]:
+        metadata = {
             "id": (
                 "frontier_"
                 f"{frontier.pose.position.x:.3f}_{frontier.pose.position.y:.3f}"
@@ -443,6 +548,36 @@ class PlatformExplorationRuntime:
             "path_distance_m": frontier.path_distance_m,
             "average_cost": frontier.average_cost,
         }
+        if target is not None:
+            metadata.update({
+                "fresh": not target.stale,
+                "stale": target.stale,
+                "stale_reason": target.stale_reason,
+                "map_revision": target.map_revision,
+                "costmap_revision": target.costmap_revision,
+                "pose_revision": target.pose_revision,
+                "computed_at": target.created_at.isoformat(),
+            })
+        return metadata
+
+    def _apply_runtime_metadata(self, state: ExplorationRuntimeState, metadata: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(metadata, dict):
+            return
+        state.metadata.update(dict(metadata))
+        state.map_revision = _string_or_none(metadata.get("map_revision")) or state.map_revision
+        state.costmap_revision = _string_or_none(metadata.get("costmap_revision")) or state.costmap_revision
+        state.pose_revision = _string_or_none(metadata.get("pose_revision")) or state.pose_revision
+        frontier_freshness = metadata.get("frontier_freshness")
+        if isinstance(frontier_freshness, dict):
+            state.frontier_freshness.update(frontier_freshness)
+
+    def _frontier_revision(self, state: ExplorationRuntimeState) -> str:
+        return "map=%s|costmap=%s|pose=%s|round=%d" % (
+            state.map_revision or "unknown",
+            state.costmap_revision or "unknown",
+            state.pose_revision or "unknown",
+            state.completed_frontiers + len(state.rejected_frontiers),
+        )
 
     def _build_explore_request(self, state: Optional[ExplorationRuntimeState]) -> Optional[ExploreAreaRequest]:
         if state is None:
@@ -507,3 +642,10 @@ def create_platform_exploration_runtime(
         navigation_planner=navigation_planner or GridNavigationPlanner(),
         config=resolved_config,
     )
+
+
+def _string_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

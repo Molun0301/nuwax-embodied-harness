@@ -734,6 +734,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             odom_frame=_cfg_str("NUWAX_GEOMETRY_ODOM_FRAME", "odom"),
             base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "body"),
             lidar_frame=_cfg_str("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),
+            imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
         rtabmap=RtabmapConfig(
             profile_name=_cfg_str("NUWAX_RTABMAP_PROFILE_NAME", "rtabmap_nav2"),
@@ -790,12 +791,17 @@ def load_config() -> NuwaxRobotBridgeConfig:
             ),
         ),
         nav2=Nav2Config(
+            mode=_cfg_str("NUWAX_NAV2_MODE", "external"),
             action_name=_cfg_str("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
             launch_package=_cfg_str("NUWAX_NAV2_LAUNCH_PACKAGE", "nav2_bringup"),
             launch_file=_cfg_str("NUWAX_NAV2_LAUNCH_FILE", "navigation_launch.py"),
             global_costmap_topic=_cfg_str("NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC", "/global_costmap/costmap"),
             local_costmap_topic=_cfg_str("NUWAX_NAV2_LOCAL_COSTMAP_TOPIC", "/local_costmap/costmap"),
             costmap_source=_cfg_str("NUWAX_NAV2_COSTMAP_SOURCE", "nav2_global"),
+            map_yaml=_cfg_str("NUWAX_NAV2_MAP_YAML", ""),
+            params_file=_cfg_str("NUWAX_NAV2_PARAMS_FILE", ""),
+            use_sim_time=_cfg_bool("NUWAX_NAV2_USE_SIM_TIME", False),
+            autostart=_cfg_bool("NUWAX_NAV2_AUTOSTART", True),
         ),
     )
 

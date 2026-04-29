@@ -46,7 +46,7 @@ _LOG_LINE_RE = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?
 _STALE_THRESHOLDS_SEC = {
     "health": 3.0,
     "state": 3.0,
-    "map": 2.0,
+    "map": 30.0,
     "localization": 1.0,
     "trajectory": 2.0,
     "navigation": 3.0,
@@ -87,6 +87,16 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         pointcloud = await run_in_threadpool(lambda: _get_latest_pointcloud(runtime))
         video_info = await run_in_threadpool(lambda: _get_video_summary(runtime))
         log_info = await run_in_threadpool(lambda: _get_log_file_summary(runtime))
+        map_diagnostics = (
+            _build_map_diagnostics(map_snapshot)
+            if map_snapshot is not None and getattr(map_snapshot, "occupancy_grid", None) is not None
+            else {}
+        )
+        map_summary_timestamp = (
+            map_diagnostics.get("last_message_at")
+            if isinstance(map_diagnostics.get("last_message_at"), datetime)
+            else _timestamp_from_value(map_snapshot)
+        )
         overview = DebugOverviewView(
             health=_summary_from_payload(
                 name="health",
@@ -111,10 +121,12 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             map=_summary_from_payload(
                 name="map",
                 source="mapping_service",
-                timestamp=_timestamp_from_value(map_snapshot),
+                timestamp=map_summary_timestamp,
                 frame_id=getattr(map_snapshot, "frame_id", None),
-                revision=_revision_from_map(map_snapshot),
+                revision=str(map_diagnostics.get("content_revision") or _revision_from_map(map_snapshot)),
+                sequence=map_diagnostics.get("message_count") if isinstance(map_diagnostics.get("message_count"), int) else None,
                 available=map_snapshot is not None and getattr(map_snapshot, "occupancy_grid", None) is not None,
+                metadata={"diagnostics": to_jsonable(map_diagnostics), "stream_bridge": to_jsonable(runtime.get_live_map_stream_status())} if map_diagnostics else {"stream_bridge": to_jsonable(runtime.get_live_map_stream_status())},
             ),
             navigation=_summary_from_payload(
                 name="navigation",
@@ -206,6 +218,7 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     @router.get("/api/debug/map/frame/latest")
     async def debug_map(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
+        refresh_error = None
         snapshot = runtime.mapping_service.get_latest_snapshot()
         if snapshot is None or getattr(snapshot, "occupancy_grid", None) is None:
             service_available = runtime.mapping_service.is_available()
@@ -216,21 +229,25 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 code="source_unavailable" if service_available else "source_unsupported",
                 message="未取得平台地图缓存或占据栅格。" if service_available else "建图服务不可用或未配置。",
             )
+        diagnostics = _build_map_diagnostics(snapshot, refresh_error=refresh_error)
         view = DebugMapView(
             map_snapshot=to_jsonable(snapshot),
             occupancy_grid=to_jsonable(snapshot.occupancy_grid),
             cost_map=to_jsonable(snapshot.cost_map),
             semantic_map=to_jsonable(snapshot.semantic_map),
+            diagnostics=to_jsonable({**diagnostics, "stream_bridge": runtime.get_live_map_stream_status()}),
         )
-        source_timestamp = _timestamp_from_value(snapshot)
+        source_timestamp = diagnostics.get("source_timestamp") if isinstance(diagnostics.get("source_timestamp"), datetime) else _map_source_timestamp(snapshot)
+        cache_timestamp = diagnostics.get("last_message_at") if isinstance(diagnostics.get("last_message_at"), datetime) else source_timestamp
         return _envelope(
             payload_type="map.frame",
             source="mapping_service",
             data=view,
             source_timestamp=source_timestamp,
             frame_id=getattr(snapshot, "frame_id", None),
-            revision=_revision_from_map(snapshot),
-            status=_status_for_timestamp(source_timestamp, "map"),
+            sequence=diagnostics.get("message_count") if isinstance(diagnostics.get("message_count"), int) else None,
+            revision=str(diagnostics.get("content_revision") or _revision_from_map(snapshot)),
+            status=_status_for_map_diagnostics(diagnostics, cache_timestamp),
         )
 
     @router.get("/api/debug/localization")
@@ -302,12 +319,30 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             )
         exploration_state = getattr(exploration_context, "exploration_state", None)
         waiting_for = None
+        failure_code = None
         frontier_count = None
+        frontier_freshness = {}
+        map_revision = None
+        costmap_revision = None
+        nav2_readiness = {}
         mapping_chain_diagnostics = {}
         if exploration_state is not None:
             exploration_metadata = dict(getattr(exploration_state, "metadata", {}) or {})
             frontier_count = getattr(exploration_state, "frontier_count", None)
             waiting_for = exploration_metadata.get("waiting_for")
+            failure_code = exploration_metadata.get("failure_code")
+            frontier_freshness = (
+                dict(exploration_metadata.get("frontier_freshness"))
+                if isinstance(exploration_metadata.get("frontier_freshness"), dict)
+                else {}
+            )
+            map_revision = exploration_metadata.get("map_revision")
+            costmap_revision = exploration_metadata.get("costmap_revision")
+            nav2_readiness = (
+                dict(exploration_metadata.get("nav2_readiness"))
+                if isinstance(exploration_metadata.get("nav2_readiness"), dict)
+                else {}
+            )
             raw_mapping_chain_diagnostics = exploration_metadata.get("mapping_chain_diagnostics")
             mapping_chain_diagnostics = (
                 dict(raw_mapping_chain_diagnostics) if isinstance(raw_mapping_chain_diagnostics, dict) else {}
@@ -318,6 +353,11 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             exploration_context=to_jsonable(exploration_context),
             frontier_count=frontier_count if frontier_count is not None else len(frontiers),
             waiting_for=waiting_for,
+            failure_code=failure_code,
+            frontier_freshness=frontier_freshness,
+            map_revision=None if map_revision is None else str(map_revision),
+            costmap_revision=None if costmap_revision is None else str(costmap_revision),
+            nav2_readiness=nav2_readiness,
             mapping_chain_diagnostics=mapping_chain_diagnostics,
             frontiers=frontiers,
         )
@@ -333,6 +373,11 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 details={
                     "frontier_count": frontier_count,
                     "waiting_for": waiting_for,
+                    "failure_code": failure_code,
+                    "frontier_freshness": frontier_freshness,
+                    "map_revision": map_revision,
+                    "costmap_revision": costmap_revision,
+                    "nav2_readiness": nav2_readiness,
                     "mapping_chain_diagnostics": mapping_chain_diagnostics,
                 },
             )
@@ -823,10 +868,13 @@ def _render_debug_page(access_token: str) -> str:
     .empty, .error-text { color: #fee2e2; background: rgba(127, 29, 29, 0.2); border: 1px solid rgba(252, 165, 165, 0.28); border-radius: 14px; padding: 10px 11px; }
     .notice { color: #fef3c7; background: rgba(113, 63, 18, 0.22); border: 1px solid rgba(253, 230, 138, 0.28); border-radius: 14px; padding: 10px 11px; }
     .panel-meta { margin-top: 10px; }
-    .canvas-wrap { position: relative; background: #020617; border-radius: 18px; padding: 1px; border: 1px solid rgba(148, 163, 184, 0.16); }
+    .canvas-wrap { position: relative; background: #020617; border-radius: 18px; padding: 1px; border: 1px solid rgba(148, 163, 184, 0.16); overflow: hidden; }
     #mapCanvas { height: min(64vh, 700px); min-height: 450px; image-rendering: pixelated; }
-    #pointCloudMapCanvas { height: 420px; }
-    #pointCloudCanvas { height: 200px; }
+    .map-toolbar { position: absolute; z-index: 2; left: 12px; top: 12px; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+    .map-control { min-height: 30px; border: 1px solid rgba(34, 211, 238, 0.34); border-radius: 11px; background: rgba(2, 6, 23, 0.78); color: #cffafe; padding: 5px 9px; font: inherit; font-size: 12px; font-weight: 720; cursor: pointer; }
+    .map-control:hover { border-color: var(--accent-strong); background: rgba(8, 47, 73, 0.72); }
+    .map-chip { border: 1px solid rgba(34, 211, 238, 0.3); background: rgba(2, 6, 23, 0.74); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: #cffafe; backdrop-filter: blur(10px); }
+    .map-stream-chip { position: absolute; z-index: 2; right: 12px; top: 12px; max-width: min(430px, calc(100% - 24px)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .video-stage { position: relative; border-radius: 18px; overflow: hidden; border: 1px solid rgba(148, 163, 184, 0.18); background: #020617; box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.9); }
     .video-frame { display: block; width: 100%; min-height: 230px; max-height: 360px; object-fit: contain; background: #020617; }
     .video-overlay { position: absolute; left: 12px; right: 12px; bottom: 12px; display: flex; justify-content: space-between; gap: 8px; pointer-events: none; }
@@ -866,8 +914,7 @@ def _render_debug_page(access_token: str) -> str:
       .global-status { grid-template-columns: 1fr 1fr; }
       .kv { grid-template-columns: 1fr; }
       .overview-grid { grid-template-columns: 1fr; }
-      #mapCanvas, #pointCloudMapCanvas { min-height: 320px; }
-      #pointCloudCanvas { height: 180px; }
+      #mapCanvas { min-height: 320px; }
     }
   </style>
 </head>
@@ -899,7 +946,6 @@ def _render_debug_page(access_token: str) -> str:
     <aside class="side-nav" aria-label="页面导航">
       <a href="#overview">运行总览</a>
       <a href="#live-map">2D 地图</a>
-      <a href="#pointcloud-map">3D 点云</a>
       <a href="#video-perception">视频感知</a>
       <a href="#navigation">导航态势</a>
       <a href="#services">服务矩阵</a>
@@ -936,7 +982,16 @@ def _render_debug_page(access_token: str) -> str:
         <h2>空间态势 · 2D 地图 / 定位 / 轨迹</h2>
         <span id="mapStatus" class="pill missing">missing</span>
       </div>
-      <div class="canvas-wrap"><canvas id="mapCanvas" width="960" height="620"></canvas></div>
+      <div class="canvas-wrap">
+        <div class="map-toolbar" aria-label="地图缩放控制">
+          <button id="mapZoomOut" class="map-control" type="button">-</button>
+          <span id="mapZoomValue" class="map-chip">100%</span>
+          <button id="mapZoomIn" class="map-control" type="button">+</button>
+          <button id="mapZoomReset" class="map-control" type="button">reset</button>
+        </div>
+        <span id="mapStreamStatus" class="map-chip map-stream-chip">等待地图首帧</span>
+        <canvas id="mapCanvas" width="960" height="620"></canvas>
+      </div>
       <div class="legend">
         <span class="legend-item"><span class="swatch" style="background: var(--unknown)"></span>未知</span>
         <span class="legend-item"><span class="swatch" style="background: var(--free)"></span>可通行</span>
@@ -955,26 +1010,6 @@ def _render_debug_page(access_token: str) -> str:
     </section>
 
     <div class="grid right-rail">
-      <section id="pointcloud-map" class="panel">
-        <div class="card-head">
-          <h2>3D 点云地图</h2>
-          <span id="pointcloudMapStatus" class="pill missing">missing</span>
-        </div>
-        <div class="canvas-wrap"><canvas id="pointCloudMapCanvas" width="760" height="360"></canvas></div>
-        <div id="pointcloudMapEmpty" class="empty panel-meta">等待 RTAB-Map/PCD 累计点云地图。</div>
-        <div id="pointcloudMapMeta" class="kv panel-meta"></div>
-      </section>
-
-      <section id="scan-diagnostics" class="panel">
-        <div class="card-head">
-          <h2>实时扫描诊断</h2>
-          <span id="pointcloudStatus" class="pill missing">missing</span>
-        </div>
-        <div class="canvas-wrap"><canvas id="pointCloudCanvas" width="620" height="190"></canvas></div>
-        <div id="pointcloudEmpty" class="empty panel-meta">等待最新扫描帧。</div>
-        <div id="pointcloudMeta" class="kv panel-meta"></div>
-      </section>
-
       <section id="navigation" class="panel">
         <div class="card-head">
           <h2>导航态势 / frontier（探索前沿）</h2>
@@ -1061,39 +1096,28 @@ def _render_debug_page(access_token: str) -> str:
         frontierStroke: "#fbcfe8",
         robot: "#fbbf24",
         robotStroke: "#fef3c7",
-        cloudBackground: "#020617",
-        cloudGrid: "rgba(34, 211, 238, 0.14)",
-        cloudText: "#cbd5e1",
-        axisX: "#fb923c",
-        axisY: "#22d3ee",
-        axisZ: "#c084fc",
-        scanAxis: "#475569",
-        scanText: "#cbd5e1",
+        goal: "#a78bfa",
+        goalStroke: "#ddd6fe",
+        navPath: "#38bdf8",
       };
-      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
-      const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "点云地图", pointcloud: "扫描帧", video: "视频", logs: "日志" };
+      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "video", "logs"];
+      const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", video: "视频", logs: "日志" };
       const state = {
         mapGrid: null,
         mapViewport: null,
+        mapZoom: 1,
+        mapStream: null,
         pose: null,
         trajectory: [],
         frontiers: [],
+        goalPose: null,
+        navigationPath: [],
         logs: [],
         logCursor: 0,
         fastPolling: false,
         sensorPolling: false,
         slowPolling: false,
         videoFrames: 0,
-        pointCloudFrames: 0,
-        pointCloudMapRevision: "",
-        pointCloudMapFrames: 0,
-        pointCloudMapPointCount: 0,
-        pointCloudMapFetchMs: null,
-        pointCloudMapParseMs: null,
-        pointCloudMapRenderMs: null,
-        pointCloudMapBounds: null,
-        pointCloudMapLod: "",
-        pointCloudMapPoints: null,
         latestOverview: null,
         latestHealth: null,
         latestTasks: null,
@@ -1120,6 +1144,11 @@ def _render_debug_page(access_token: str) -> str:
         lastReceive: document.getElementById("lastReceive"),
         overviewGrid: document.getElementById("overviewGrid"),
         mapCanvas: document.getElementById("mapCanvas"),
+        mapZoomIn: document.getElementById("mapZoomIn"),
+        mapZoomOut: document.getElementById("mapZoomOut"),
+        mapZoomReset: document.getElementById("mapZoomReset"),
+        mapZoomValue: document.getElementById("mapZoomValue"),
+        mapStreamStatus: document.getElementById("mapStreamStatus"),
         mapStatus: document.getElementById("mapStatus"),
         mapEmpty: document.getElementById("mapEmpty"),
         mapMeta: document.getElementById("mapMeta"),
@@ -1130,14 +1159,6 @@ def _render_debug_page(access_token: str) -> str:
         frontierNotice: document.getElementById("frontierNotice"),
         governanceStatus: document.getElementById("governanceStatus"),
         governanceMeta: document.getElementById("governanceMeta"),
-        pointcloudMapCanvas: document.getElementById("pointCloudMapCanvas"),
-        pointcloudMapStatus: document.getElementById("pointcloudMapStatus"),
-        pointcloudMapEmpty: document.getElementById("pointcloudMapEmpty"),
-        pointcloudMapMeta: document.getElementById("pointcloudMapMeta"),
-        pointcloudCanvas: document.getElementById("pointCloudCanvas"),
-        pointcloudStatus: document.getElementById("pointcloudStatus"),
-        pointcloudEmpty: document.getElementById("pointcloudEmpty"),
-        pointcloudMeta: document.getElementById("pointcloudMeta"),
         videoStatus: document.getElementById("videoStatus"),
         videoFrame: document.getElementById("videoFrame"),
         videoEmpty: document.getElementById("videoEmpty"),
@@ -1265,7 +1286,7 @@ def _render_debug_page(access_token: str) -> str:
           ]);
           section.querySelector(".small").textContent = `前端接收 ${shortTime(envelope.__receivedAt)}`;
         }
-        const mission = worstStatus([data.health, data.state, data.localization, data.map, data.navigation, data.pointcloud_map, data.video, data.logs]);
+        const mission = worstStatus([data.health, data.state, data.localization, data.map, data.navigation, data.video, data.logs]);
         setPill(els.missionStatus, mission, "mission");
         updateSensorSummary(data);
         renderServiceMatrix(data);
@@ -1273,16 +1294,12 @@ def _render_debug_page(access_token: str) -> str:
       function updateSensorSummary(data) {
         const map = data.map || {};
         const localization = data.localization || {};
-        const cloudMap = data.pointcloud_map || {};
-        const scan = data.pointcloud || {};
         const video = data.video || {};
-        const sensorStatus = worstStatus([map, localization, cloudMap, scan, video]);
+        const sensorStatus = worstStatus([map, localization, video]);
         setPill(els.sensorStatus, sensorStatus);
         setKv(els.sensorSummary, [
           ["2D_map", `${safeText(map.status)} latency=${fmt(map.latency_ms, " ms")}`],
           ["localization", `${safeText(localization.status)} frame=${safeText(localization.frame_id)}`],
-          ["pointcloud_map", `${safeText(cloudMap.status)} rev=${safeText(cloudMap.revision)}`],
-          ["scan_frame", `${safeText(scan.status)} frame=${safeText(scan.frame_id)}`],
           ["video", `${safeText(video.status)} source=${safeText(video.metadata && video.metadata.source)}`],
         ]);
       }
@@ -1295,8 +1312,6 @@ def _render_debug_page(access_token: str) -> str:
           ["navigation", data.navigation],
           ["exploration", data.exploration],
           ["rtabmap_governance", data.runtime_governance],
-          ["pointcloud_map", data.pointcloud_map],
-          ["sensor_scan", data.pointcloud],
           ["video", data.video],
           ["logs", data.logs],
         ];
@@ -1391,14 +1406,6 @@ def _render_debug_page(access_token: str) -> str:
         } else if (kind === "navigation") {
           setPill(els.navigationStatus, "error");
           setKv(els.navigationMeta, [["error", message], ["前端接收", nowText()]]);
-        } else if (kind === "pointcloud_map") {
-          setPill(els.pointcloudMapStatus, "error");
-          els.pointcloudMapEmpty.hidden = false;
-          els.pointcloudMapEmpty.textContent = message;
-        } else if (kind === "pointcloud") {
-          setPill(els.pointcloudStatus, "error");
-          els.pointcloudEmpty.hidden = false;
-          els.pointcloudEmpty.textContent = message;
         } else if (kind === "video") {
           setPill(els.videoStatus, "error");
           els.videoEmpty.hidden = false;
@@ -1410,27 +1417,13 @@ def _render_debug_page(access_token: str) -> str:
       }
       function originPosition(grid) { return grid && grid.origin && grid.origin.position ? grid.origin.position : { x: 0, y: 0 }; }
       function originYaw(grid) { return yawFromPose(grid && grid.origin) || 0; }
-      function mapToCanvas(point) {
-        const grid = state.mapGrid;
-        const viewport = state.mapViewport;
-        if (!grid || !viewport || !point) return null;
-        const origin = originPosition(grid);
-        const resolution = Number(grid.resolution_m) || 1;
-        const dx = Number(point.x) - Number(origin.x || 0);
-        const dy = Number(point.y) - Number(origin.y || 0);
-        const yaw = originYaw(grid);
-        const cos = Math.cos(-yaw);
-        const sin = Math.sin(-yaw);
-        const localX = dx * cos - dy * sin;
-        const localY = dx * sin + dy * cos;
-        const col = localX / resolution;
-        const row = localY / resolution;
-        return { x: viewport.x + col * viewport.scale, y: viewport.y + (Number(grid.height) - 1 - row) * viewport.scale };
-      }
       function pointFromPose(pose) {
         const pos = pose && pose.position;
         if (!pos) return null;
-        return { x: Number(pos.x), y: Number(pos.y), z: Number(pos.z || 0) };
+        const x = Number(pos.x);
+        const y = Number(pos.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        return { x, y, z: Number(pos.z || 0) };
       }
       function yawFromPose(pose) {
         const q = pose && pose.orientation;
@@ -1439,25 +1432,97 @@ def _render_debug_page(access_token: str) -> str:
         const cosy = 1 - 2 * ((Number(q.y) || 0) * (Number(q.y) || 0) + (Number(q.z) || 0) * (Number(q.z) || 0));
         return Math.atan2(siny, cosy);
       }
+      function mapCorners(grid) {
+        if (!grid || !grid.width || !grid.height) return [];
+        const origin = originPosition(grid);
+        const yaw = originYaw(grid);
+        const cos = Math.cos(yaw);
+        const sin = Math.sin(yaw);
+        const resolution = Number(grid.resolution_m) || 1;
+        const width = Number(grid.width) * resolution;
+        const height = Number(grid.height) * resolution;
+        return [[0, 0], [width, 0], [width, height], [0, height]].map(([x, y]) => ({
+          x: Number(origin.x || 0) + x * cos - y * sin,
+          y: Number(origin.y || 0) + x * sin + y * cos,
+        }));
+      }
+      function cameraAnchor() {
+        const posePoint = pointFromPose(state.pose);
+        if (posePoint) return { point: posePoint, yaw: yawFromPose(state.pose) || 0, locked: true };
+        const corners = mapCorners(state.mapGrid);
+        if (!corners.length) return { point: { x: 0, y: 0 }, yaw: 0, locked: false };
+        const point = corners.reduce((acc, item) => ({ x: acc.x + item.x / corners.length, y: acc.y + item.y / corners.length }), { x: 0, y: 0 });
+        return { point, yaw: 0, locked: false };
+      }
+      function basePixelsPerMeter(anchor) {
+        const canvas = els.mapCanvas;
+        const corners = mapCorners(state.mapGrid);
+        if (!corners.length) return 60;
+        let maxX = 1;
+        let maxY = 1;
+        const yaw = anchor.yaw || 0;
+        const cos = Math.cos(yaw);
+        const sin = Math.sin(yaw);
+        for (const corner of corners) {
+          const dx = Number(corner.x) - anchor.point.x;
+          const dy = Number(corner.y) - anchor.point.y;
+          const right = sin * dx - cos * dy;
+          const up = cos * dx + sin * dy;
+          maxX = Math.max(maxX, Math.abs(right));
+          maxY = Math.max(maxY, Math.abs(up));
+        }
+        return Math.max(4, Math.min(canvas.width / (maxX * 2.16), canvas.height / (maxY * 2.16)));
+      }
+      function cameraScale(anchor) {
+        return basePixelsPerMeter(anchor) * state.mapZoom;
+      }
+      function applyCameraTransform(ctx, anchor, scale) {
+        const yaw = anchor.yaw || 0;
+        const sin = Math.sin(yaw);
+        const cos = Math.cos(yaw);
+        const centerX = els.mapCanvas.width / 2;
+        const centerY = els.mapCanvas.height / 2;
+        const a = scale * sin;
+        const b = -scale * cos;
+        const c = -scale * cos;
+        const d = -scale * sin;
+        const e = centerX - a * anchor.point.x - c * anchor.point.y;
+        const f = centerY - b * anchor.point.x - d * anchor.point.y;
+        ctx.setTransform(a, b, c, d, e, f);
+      }
+      function mapToCanvas(point) {
+        if (!point) return null;
+        const anchor = cameraAnchor();
+        const scale = cameraScale(anchor);
+        const yaw = anchor.yaw || 0;
+        const dx = Number(point.x) - anchor.point.x;
+        const dy = Number(point.y) - anchor.point.y;
+        return {
+          x: els.mapCanvas.width / 2 + (Math.sin(yaw) * dx - Math.cos(yaw) * dy) * scale,
+          y: els.mapCanvas.height / 2 - (Math.cos(yaw) * dx + Math.sin(yaw) * dy) * scale,
+        };
+      }
+      function setWorldLineStyle(ctx, scale, color, pixels) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = Math.max(1 / scale, pixels / scale);
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+      }
       function drawMap() {
         const canvas = els.mapCanvas;
         const ctx = canvas.getContext("2d");
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.fillStyle = CANVAS_THEME.mapBackground;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         const grid = state.mapGrid;
-        if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) {
-          state.mapViewport = null;
-          return;
-        }
+        const anchor = cameraAnchor();
+        const scale = cameraScale(anchor);
+        state.mapViewport = { centerX: canvas.width / 2, centerY: canvas.height / 2, scale, zoom: state.mapZoom, robotLocked: anchor.locked };
+        if (els.mapZoomValue) els.mapZoomValue.textContent = `${Math.round(state.mapZoom * 100)}%`;
+        if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) return;
         const width = Number(grid.width);
         const height = Number(grid.height);
-        const scale = Math.max(1, Math.floor(Math.min(canvas.width / width, canvas.height / height)));
-        const drawWidth = width * scale;
-        const drawHeight = height * scale;
-        const offsetX = Math.floor((canvas.width - drawWidth) / 2);
-        const offsetY = Math.floor((canvas.height - drawHeight) / 2);
-        state.mapViewport = { x: offsetX, y: offsetY, scale };
         const image = ctx.createImageData(width, height);
         for (let row = 0; row < height; row += 1) {
           for (let col = 0; col < width; col += 1) {
@@ -1477,11 +1542,21 @@ def _render_debug_page(access_token: str) -> str:
         offscreen.width = width;
         offscreen.height = height;
         offscreen.getContext("2d").putImageData(image, 0, 0);
+        ctx.save();
+        applyCameraTransform(ctx, anchor, scale);
+        const origin = originPosition(grid);
+        const resolution = Number(grid.resolution_m) || 1;
+        ctx.translate(Number(origin.x || 0), Number(origin.y || 0));
+        ctx.rotate(originYaw(grid));
+        ctx.scale(resolution, -resolution);
         ctx.imageSmoothingEnabled = false;
-        ctx.drawImage(offscreen, offsetX, offsetY, drawWidth, drawHeight);
-        drawTrajectory(ctx);
-        drawFrontiers(ctx);
-        drawRobot(ctx);
+        ctx.drawImage(offscreen, 0, -height, width, height);
+        ctx.restore();
+        drawTrajectory(ctx, anchor, scale);
+        drawNavigationPath(ctx, anchor, scale);
+        drawGoal(ctx, anchor, scale);
+        drawFrontiers(ctx, anchor, scale);
+        drawRobot(ctx, anchor.locked);
       }
       function pointFromFrontier(frontier) {
         const geometry = frontier && frontier.geometry ? frontier.geometry : frontier;
@@ -1493,31 +1568,14 @@ def _render_debug_page(access_token: str) -> str:
         if (geometry.x !== undefined && geometry.y !== undefined) return { x: Number(geometry.x), y: Number(geometry.y), z: Number(geometry.z || 0) };
         return null;
       }
-      function drawFrontiers(ctx) {
-        if (!state.frontiers || !state.frontiers.length) return;
+      function drawWorldPoints(ctx, anchor, scale, points, color, pixels) {
+        if (!points || points.length < 2) return;
         ctx.save();
-        ctx.fillStyle = CANVAS_THEME.frontier;
-        ctx.strokeStyle = CANVAS_THEME.frontierStroke;
-        ctx.lineWidth = 1;
-        for (const frontier of state.frontiers) {
-          const point = mapToCanvas(pointFromFrontier(frontier));
-          if (!point) continue;
-          ctx.beginPath();
-          ctx.arc(point.x, point.y, 5, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.stroke();
-        }
-        ctx.restore();
-      }
-      function drawTrajectory(ctx) {
-        if (!state.trajectory || state.trajectory.length < 2) return;
-        ctx.save();
-        ctx.strokeStyle = CANVAS_THEME.trajectory;
-        ctx.lineWidth = 2;
+        applyCameraTransform(ctx, anchor, scale);
+        setWorldLineStyle(ctx, scale, color, pixels);
         ctx.beginPath();
         let started = false;
-        for (const pose of state.trajectory) {
-          const point = mapToCanvas(pointFromPose(pose));
+        for (const point of points) {
           if (!point) continue;
           if (!started) { ctx.moveTo(point.x, point.y); started = true; }
           else ctx.lineTo(point.x, point.y);
@@ -1525,21 +1583,64 @@ def _render_debug_page(access_token: str) -> str:
         if (started) ctx.stroke();
         ctx.restore();
       }
-      function drawRobot(ctx) {
-        const point = mapToCanvas(pointFromPose(state.pose));
-        if (!point) return;
-        const yaw = yawFromPose(state.pose) || 0;
+      function drawFrontiers(ctx, anchor, scale) {
+        if (!state.frontiers || !state.frontiers.length) return;
         ctx.save();
-        ctx.translate(point.x, point.y);
-        ctx.rotate(-yaw);
+        applyCameraTransform(ctx, anchor, scale);
+        ctx.fillStyle = CANVAS_THEME.frontier;
+        ctx.strokeStyle = CANVAS_THEME.frontierStroke;
+        ctx.lineWidth = Math.max(1 / scale, 1.4 / scale);
+        for (const frontier of state.frontiers) {
+          const point = pointFromFrontier(frontier);
+          if (!point) continue;
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, Math.max(0.08, 5 / scale), 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+      function drawTrajectory(ctx, anchor, scale) {
+        const points = (state.trajectory || []).map(pointFromPose).filter(Boolean);
+        drawWorldPoints(ctx, anchor, scale, points, CANVAS_THEME.trajectory, 2.5);
+      }
+      function drawNavigationPath(ctx, anchor, scale) {
+        drawWorldPoints(ctx, anchor, scale, state.navigationPath, CANVAS_THEME.navPath, 3);
+      }
+      function drawGoal(ctx, anchor, scale) {
+        const point = pointFromPose(state.goalPose);
+        if (!point) return;
+        ctx.save();
+        applyCameraTransform(ctx, anchor, scale);
+        ctx.strokeStyle = CANVAS_THEME.goalStroke;
+        ctx.fillStyle = CANVAS_THEME.goal;
+        ctx.lineWidth = Math.max(1 / scale, 2 / scale);
+        const radius = Math.max(0.12, 7 / scale);
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(point.x - radius * 1.45, point.y);
+        ctx.lineTo(point.x + radius * 1.45, point.y);
+        ctx.moveTo(point.x, point.y - radius * 1.45);
+        ctx.lineTo(point.x, point.y + radius * 1.45);
+        ctx.stroke();
+        ctx.restore();
+      }
+      function drawRobot(ctx, locked) {
+        if (!locked) return;
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.translate(els.mapCanvas.width / 2, els.mapCanvas.height / 2);
         ctx.fillStyle = CANVAS_THEME.robot;
         ctx.strokeStyle = CANVAS_THEME.robotStroke;
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(10, 0);
-        ctx.lineTo(-7, -6);
-        ctx.lineTo(-4, 0);
-        ctx.lineTo(-7, 6);
+        ctx.moveTo(0, -14);
+        ctx.lineTo(-9, 9);
+        ctx.lineTo(0, 5);
+        ctx.lineTo(9, 9);
         ctx.closePath();
         ctx.fill();
         ctx.stroke();
@@ -1549,6 +1650,9 @@ def _render_debug_page(access_token: str) -> str:
         const status = statusOf(envelope);
         const data = envelope.data || {};
         const grid = data.occupancy_grid;
+        const diagnostics = data.diagnostics || {};
+        const streamBridge = diagnostics.stream_bridge || {};
+        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp };
         setPill(els.mapStatus, status);
         if (grid && Array.isArray(grid.data)) {
           state.mapGrid = grid;
@@ -1566,10 +1670,27 @@ def _render_debug_page(access_token: str) -> str:
           ["size", grid ? `${grid.width} x ${grid.height}` : "--"],
           ["resolution", grid ? `${grid.resolution_m} m` : "--"],
           ["source_timestamp", shortTime(envelope.source_timestamp)],
+          ["revision", envelope.revision || diagnostics.content_revision],
+          ["sequence", envelope.sequence || diagnostics.message_count],
+          ["streaming", mapStreamLabel(status, diagnostics, streamBridge)],
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["stale", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
+        updateMapStreamChip(status, diagnostics, streamBridge, envelope.source_timestamp);
+      }
+      function mapStreamLabel(status, diagnostics, streamBridge) {
+        const messageCount = diagnostics && (diagnostics.message_count || diagnostics.sequence);
+        const revision = diagnostics && (diagnostics.content_revision || diagnostics.revision);
+        const delta = diagnostics && diagnostics.message_count_delta;
+        const bridgeStatus = streamBridge && (streamBridge.status || streamBridge.state || streamBridge.mode);
+        if (!messageCount) return status === "available" ? "首帧已缓存" : "等待首帧";
+        const live = status === "available" && (delta === undefined || delta === null || Number(delta) > 0 || diagnostics.live_mapping_ready === true);
+        return `${live ? "实时流" : "离线资产/缓存"} rev=${safeText(revision)} seq=${safeText(messageCount)} bridge=${safeText(bridgeStatus)}`;
+      }
+      function updateMapStreamChip(status, diagnostics, streamBridge, timestamp) {
+        if (!els.mapStreamStatus) return;
+        els.mapStreamStatus.textContent = `${mapStreamLabel(status, diagnostics, streamBridge)} · ${shortTime(timestamp)}`;
       }
       function updateLocalization(envelope) {
         const status = statusOf(envelope);
@@ -1598,6 +1719,48 @@ def _render_debug_page(access_token: str) -> str:
           ["latency", fmt(envelope.latency_ms, " ms")],
         ]);
         drawMap();
+      }
+      function firstArrayValue(...values) {
+        for (const value of values) {
+          if (Array.isArray(value) && value.length) return value;
+        }
+        return [];
+      }
+      function pathPointFromValue(value) {
+        if (!value) return null;
+        if (Array.isArray(value) && value.length >= 2) return { x: Number(value[0]), y: Number(value[1]), z: Number(value[2] || 0) };
+        if (value.pose) return pointFromPose(value.pose);
+        if (value.position) return pointFromPose(value);
+        if (value.target_pose) return pointFromPose(value.target_pose);
+        if (value.x !== undefined && value.y !== undefined) return { x: Number(value.x), y: Number(value.y), z: Number(value.z || 0) };
+        return null;
+      }
+      function extractNavigationPath(context) {
+        const metadata = context && context.metadata ? context.metadata : {};
+        const stateObj = context && context.navigation_state ? context.navigation_state : {};
+        const stateMetadata = stateObj && stateObj.metadata ? stateObj.metadata : {};
+        const raw = firstArrayValue(
+          context && context.planned_path,
+          context && context.current_path,
+          context && context.remaining_path,
+          context && context.nav_path,
+          context && context.waypoints,
+          metadata.planned_path,
+          metadata.current_path,
+          metadata.remaining_path,
+          metadata.nav_path,
+          metadata.waypoints,
+          stateMetadata.planned_path,
+          stateMetadata.current_path,
+          stateMetadata.remaining_path,
+          stateMetadata.nav_path,
+          stateMetadata.waypoints
+        );
+        return raw.map(pathPointFromValue).filter(Boolean);
+      }
+      function extractNavigationGoal(context) {
+        const goal = context && context.current_goal ? context.current_goal : null;
+        return goal && goal.target_pose ? goal.target_pose : null;
       }
       function summarizeContext(context, key) {
         const stateObj = context && context[key];
@@ -1640,6 +1803,8 @@ def _render_debug_page(access_token: str) -> str:
         const cloudSource = mappingDiag.point_cloud_source || {};
         const frontiers = Array.isArray(data.frontiers) ? data.frontiers : null;
         state.frontiers = frontiers || [];
+        state.goalPose = extractNavigationGoal(data.navigation_context);
+        state.navigationPath = extractNavigationPath(data.navigation_context);
         setKv(els.navigationMeta, [
           ["navigation", summarizeContext(data.navigation_context, "navigation_state")],
           ["exploration", summarizeContext(data.exploration_context, "exploration_state")],
@@ -1649,6 +1814,8 @@ def _render_debug_page(access_token: str) -> str:
           ["occupancy", `${safeText(liveMap.occupancy_topic)} ready=${safeText(liveMap.occupancy_grid_ready)} count=${safeText(liveMap.occupancy_message_count)}`],
           ["pointcloud_bridge", `${safeText(cloudPub.topic || cloudPub.point_cloud_topic)} published=${safeText(cloudPub.published_count)} source=${safeText(cloudPub.source || cloudPub.last_source_topic || cloudSource.source_topic)}`],
           ["frontier_geometry", frontiers && frontiers.length ? `${frontiers.length} 个几何` : "暂无候选"],
+          ["goal", state.goalPose ? "target_pose" : "--"],
+          ["nav_path", state.navigationPath.length ? `${state.navigationPath.length} 点` : "--"],
           ["source_timestamp", shortTime(envelope.source_timestamp)],
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["stale", envelope.stale === true ? "true" : "false"],
@@ -1657,287 +1824,6 @@ def _render_debug_page(access_token: str) -> str:
         els.frontierNotice.hidden = Boolean(frontiers && frontiers.length);
         els.frontierNotice.textContent = frontiers && frontiers.length ? "" : "当前探索上下文还没有 frontier 几何，请确认探索运行态已生成候选。";
         drawMap();
-      }
-      function pointFromCloud(point) {
-        if (Array.isArray(point)) return { x: Number(point[0]), y: Number(point[1]), z: Number(point[2] || 0) };
-        if (point && point.position) return pointFromCloud(point.position);
-        if (point && point.x !== undefined && point.y !== undefined) return { x: Number(point.x), y: Number(point.y), z: Number(point.z || 0) };
-        return null;
-      }
-      function normalizeBounds(bounds, points) {
-        const rawMin = bounds && Array.isArray(bounds.min) ? bounds.min : null;
-        const rawMax = bounds && Array.isArray(bounds.max) ? bounds.max : null;
-        if (rawMin && rawMax && rawMin.length >= 3 && rawMax.length >= 3) {
-          return {
-            min: [Number(rawMin[0]), Number(rawMin[1]), Number(rawMin[2])],
-            max: [Number(rawMax[0]), Number(rawMax[1]), Number(rawMax[2])],
-          };
-        }
-        if (!points || points.length < 3) return null;
-        const min = [Infinity, Infinity, Infinity];
-        const max = [-Infinity, -Infinity, -Infinity];
-        for (let index = 0; index + 2 < points.length; index += 3) {
-          const x = points[index], y = points[index + 1], z = points[index + 2];
-          if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
-          min[0] = Math.min(min[0], x); min[1] = Math.min(min[1], y); min[2] = Math.min(min[2], z);
-          max[0] = Math.max(max[0], x); max[1] = Math.max(max[1], y); max[2] = Math.max(max[2], z);
-        }
-        return Number.isFinite(min[0]) ? { min, max } : null;
-      }
-      function clearPointCloudMapCanvas(message) {
-        const canvas = els.pointcloudMapCanvas;
-        const ctx = canvas.getContext("2d");
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = CANVAS_THEME.cloudBackground;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.strokeStyle = CANVAS_THEME.cloudGrid;
-        ctx.lineWidth = 1;
-        for (let x = 24; x < canvas.width; x += 44) {
-          ctx.beginPath();
-          ctx.moveTo(x, 0);
-          ctx.lineTo(x, canvas.height);
-          ctx.stroke();
-        }
-        for (let y = 24; y < canvas.height; y += 44) {
-          ctx.beginPath();
-          ctx.moveTo(0, y);
-          ctx.lineTo(canvas.width, y);
-          ctx.stroke();
-        }
-        ctx.fillStyle = CANVAS_THEME.cloudText;
-        ctx.font = "14px system-ui";
-        ctx.fillText(message || "等待累计点云地图。", 16, 32);
-      }
-      function drawPointCloudMap(points, bounds) {
-        const canvas = els.pointcloudMapCanvas;
-        const ctx = canvas.getContext("2d");
-        const started = performance.now();
-        if (!points || points.length < 3) {
-          clearPointCloudMapCanvas("累计点云地图暂无可绘制点。");
-          return performance.now() - started;
-        }
-        const normalizedBounds = normalizeBounds(bounds, points);
-        if (!normalizedBounds) {
-          clearPointCloudMapCanvas("累计点云地图 bounds 不可用。");
-          return performance.now() - started;
-        }
-        const min = normalizedBounds.min;
-        const max = normalizedBounds.max;
-        const center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
-        const span = [
-          Math.max(0.01, max[0] - min[0]),
-          Math.max(0.01, max[1] - min[1]),
-          Math.max(0.01, max[2] - min[2]),
-        ];
-        const yaw = -Math.PI / 5;
-        const cos = Math.cos(yaw);
-        const sin = Math.sin(yaw);
-        const projectedSpan = Math.max(span[0], span[1], span[2] * 1.8, 0.01);
-        const scale = Math.min(canvas.width, canvas.height) * 0.78 / projectedSpan;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        const gradient = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
-        gradient.addColorStop(0, "#07111f");
-        gradient.addColorStop(1, CANVAS_THEME.cloudBackground);
-        ctx.fillStyle = gradient;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.strokeStyle = CANVAS_THEME.cloudGrid;
-        ctx.lineWidth = 1;
-        for (let i = -5; i <= 5; i += 1) {
-          const a = projectPoint([min[0], center[1] + i * span[1] / 10, min[2]], center, cos, sin, scale, canvas);
-          const b = projectPoint([max[0], center[1] + i * span[1] / 10, min[2]], center, cos, sin, scale, canvas);
-          const c = projectPoint([center[0] + i * span[0] / 10, min[1], min[2]], center, cos, sin, scale, canvas);
-          const d = projectPoint([center[0] + i * span[0] / 10, max[1], min[2]], center, cos, sin, scale, canvas);
-          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.moveTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.stroke();
-        }
-        const pointCount = Math.floor(points.length / 3);
-        const stride = pointCount > 70000 ? Math.ceil(pointCount / 70000) : 1;
-        for (let index = 0; index + 2 < points.length; index += 3 * stride) {
-          const x = points[index], y = points[index + 1], z = points[index + 2];
-          if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
-          const p = projectPoint([x, y, z], center, cos, sin, scale, canvas);
-          const zRatio = Math.max(0, Math.min(1, (z - min[2]) / span[2]));
-          ctx.fillStyle = `hsl(${176 + zRatio * 88}, 72%, ${52 + zRatio * 18}%)`;
-          ctx.fillRect(p.x, p.y, 1.45, 1.45);
-        }
-        drawPointCloudMapAxes(ctx, center, cos, sin, scale, canvas, span);
-        return performance.now() - started;
-      }
-      function projectPoint(point, center, cos, sin, scale, canvas) {
-        const x = point[0] - center[0];
-        const y = point[1] - center[1];
-        const z = point[2] - center[2];
-        const rx = x * cos - y * sin;
-        const ry = x * sin + y * cos;
-        return {
-          x: canvas.width / 2 + rx * scale,
-          y: canvas.height / 2 + (ry * 0.45 - z * 0.85) * scale,
-        };
-      }
-      function drawPointCloudMapAxes(ctx, center, cos, sin, scale, canvas, span) {
-        const origin = projectPoint(center, center, cos, sin, scale, canvas);
-        const axes = [
-          { label: "X", color: CANVAS_THEME.axisX, end: [center[0] + span[0] * 0.18, center[1], center[2]] },
-          { label: "Y", color: CANVAS_THEME.axisY, end: [center[0], center[1] + span[1] * 0.18, center[2]] },
-          { label: "Z", color: CANVAS_THEME.axisZ, end: [center[0], center[1], center[2] + span[2] * 0.28] },
-        ];
-        ctx.save();
-        ctx.font = "12px system-ui";
-        for (const axis of axes) {
-          const end = projectPoint(axis.end, center, cos, sin, scale, canvas);
-          ctx.strokeStyle = axis.color;
-          ctx.fillStyle = axis.color;
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.moveTo(origin.x, origin.y);
-          ctx.lineTo(end.x, end.y);
-          ctx.stroke();
-          ctx.fillText(axis.label, end.x + 5, end.y + 4);
-        }
-        ctx.restore();
-      }
-      function selectPointCloudMapLod(data) {
-        const lods = Array.isArray(data.lods) ? data.lods : [];
-        return lods.find((item) => item.level === "preview") || lods[0] || null;
-      }
-      async function loadPointCloudMapBinary(data) {
-        const lod = selectPointCloudMapLod(data);
-        if (!lod || !lod.bin_url) return;
-        const fetched = await getArrayBuffer(lod.bin_url);
-        const parseStarted = performance.now();
-        const points = new Float32Array(fetched.buffer);
-        state.pointCloudMapParseMs = performance.now() - parseStarted;
-        state.pointCloudMapFetchMs = fetched.frontendLatencyMs;
-        state.pointCloudMapLod = lod.level || fetched.headers.get("X-PointCloud-Lod") || "preview";
-        state.pointCloudMapPoints = points;
-        state.pointCloudMapPointCount = Number(fetched.headers.get("X-PointCloud-Point-Count")) || Math.floor(points.length / 3);
-        state.pointCloudMapBounds = normalizeBounds(data.bounds, points);
-        state.pointCloudMapRenderMs = drawPointCloudMap(points, state.pointCloudMapBounds);
-        state.pointCloudMapFrames += 1;
-      }
-      async function updatePointCloudMap(envelope) {
-        const status = statusOf(envelope);
-        const data = envelope.data || {};
-        setPill(els.pointcloudMapStatus, status);
-        if (status !== "available" || !data.revision) {
-          state.pointCloudMapRevision = "";
-          state.pointCloudMapPoints = null;
-          clearPointCloudMapCanvas(errorReason(envelope, "累计点云地图不可用。"));
-          els.pointcloudMapEmpty.hidden = false;
-          els.pointcloudMapEmpty.textContent = errorReason(envelope, "累计点云地图不可用；不会回退到实时扫描帧。");
-        } else {
-          els.pointcloudMapEmpty.hidden = true;
-          if (state.pointCloudMapRevision !== data.revision) {
-            try {
-              await loadPointCloudMapBinary(data);
-              state.pointCloudMapRevision = data.revision;
-            } catch (error) {
-              showPanelError("pointcloud_map", error.message);
-            }
-          } else if (state.pointCloudMapPoints) {
-            state.pointCloudMapRenderMs = drawPointCloudMap(state.pointCloudMapPoints, state.pointCloudMapBounds || data.bounds);
-          }
-        }
-        const metrics = data.metrics || {};
-        const metadata = data.metadata || {};
-        setKv(els.pointcloudMapMeta, [
-          ["map", data.map_name || "--"],
-          ["version", data.map_version_id || "--"],
-          ["revision", data.revision || envelope.revision],
-          ["frame", envelope.frame_id || data.frame_id],
-          ["source_kind", data.source_kind],
-          ["point_count", data.point_count || state.pointCloudMapPointCount],
-          ["lod", state.pointCloudMapLod || "--"],
-          ["payload_bytes", data.payload_bytes],
-          ["pcd_data", metadata.pcd_data],
-          ["pcd_path", data.pcd_path],
-          ["server_compute_ms", fmt(metrics.server_compute_ms, " ms")],
-          ["frontend_fetch_ms", fmt(state.pointCloudMapFetchMs, " ms")],
-          ["browser_parse_ms", fmt(state.pointCloudMapParseMs, " ms")],
-          ["browser_render_ms", fmt(state.pointCloudMapRenderMs, " ms")],
-          ["rendered_frames", state.pointCloudMapFrames],
-          ["source_timestamp", shortTime(envelope.source_timestamp)],
-          ["前端接收", shortTime(envelope.__receivedAt)],
-        ]);
-      }
-      function drawPointCloud(points) {
-        const canvas = els.pointcloudCanvas;
-        const ctx = canvas.getContext("2d");
-        const started = performance.now();
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = CANVAS_THEME.cloudBackground;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        if (!points.length) {
-          ctx.fillStyle = CANVAS_THEME.cloudText;
-          ctx.font = "14px system-ui";
-          ctx.fillText("等待真实点云 points。", 16, 36);
-          return performance.now() - started;
-        }
-        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
-        const parsed = [];
-        for (const raw of points) {
-          const p = pointFromCloud(raw);
-          if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) continue;
-          parsed.push(p);
-          minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
-          minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
-          minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
-        }
-        const rangeX = Math.max(0.01, maxX - minX);
-        const rangeY = Math.max(0.01, maxY - minY);
-        const rangeZ = Math.max(0.01, maxZ - minZ);
-        const scale = Math.min((canvas.width - 28) / rangeX, (canvas.height - 28) / rangeY);
-        const offsetX = (canvas.width - rangeX * scale) / 2;
-        const offsetY = (canvas.height - rangeY * scale) / 2;
-        ctx.fillStyle = CANVAS_THEME.axisY;
-        for (const p of parsed) {
-          const x = offsetX + (p.x - minX) * scale;
-          const y = canvas.height - (offsetY + (p.y - minY) * scale);
-          const zRatio = (p.z - minZ) / rangeZ;
-          ctx.fillStyle = `hsl(${190 + zRatio * 90}, 90%, ${55 + zRatio * 20}%)`;
-          ctx.fillRect(x, y, 2, 2);
-        }
-        ctx.strokeStyle = CANVAS_THEME.scanAxis;
-        ctx.beginPath();
-        ctx.moveTo(14, canvas.height - 18); ctx.lineTo(58, canvas.height - 18);
-        ctx.moveTo(14, canvas.height - 18); ctx.lineTo(14, canvas.height - 62);
-        ctx.stroke();
-        ctx.fillStyle = CANVAS_THEME.scanText;
-        ctx.font = "12px system-ui";
-        ctx.fillText("X/Y 俯视投影 · 颜色表示 Z", 68, canvas.height - 16);
-        return performance.now() - started;
-      }
-      function updatePointCloud(envelope) {
-        const status = statusOf(envelope);
-        const data = envelope.data || {};
-        const points = Array.isArray(data.points) ? data.points : [];
-        setPill(els.pointcloudStatus, status);
-        const renderMs = drawPointCloud(points);
-        state.pointCloudFrames += points.length ? 1 : 0;
-        els.pointcloudEmpty.hidden = Boolean(points.length);
-        els.pointcloudEmpty.textContent = points.length
-          ? ""
-          : errorReason(envelope, "点云帧可读，但没有内联 points 可绘制。");
-        const metrics = data.metrics || {};
-        const metadata = data.metadata || {};
-        const protection = data.protection || {};
-        setKv(els.pointcloudMeta, [
-          ["frame", envelope.frame_id],
-          ["point_count", data.point_count ?? points.length],
-          ["inline_points", points.length],
-          ["rendered_frames", state.pointCloudFrames],
-          ["format", data.format],
-          ["payload_bytes", data.payload_bytes || metrics.payload_bytes],
-          ["scan_role", metrics.diagnostic_role || (metadata.diagnostic_role || "side_channel")],
-          ["not_pointcloud_map", String(metrics.not_pointcloud_map === true || metadata.not_pointcloud_map === true)],
-          ["map_source_endpoint", metadata.map_source_endpoint || "/api/debug/pointcloud-map/latest/meta"],
-          ["source_topic", metrics.source_topic],
-          ["downsampled", String(metrics.downsampled === true)],
-          ["browser_render_ms", fmt(renderMs, " ms")],
-          ["default_max_points", String(protection.default_max_points_applied_by_debug_api === true)],
-          ["source_timestamp", shortTime(envelope.source_timestamp)],
-          ["latency", fmt(envelope.latency_ms, " ms")],
-          ["前端接收", shortTime(envelope.__receivedAt)],
-        ]);
       }
       function updateVideo(envelope) {
         const status = statusOf(envelope);
@@ -2026,14 +1912,13 @@ def _render_debug_page(access_token: str) -> str:
         if (state.fastPolling) return;
         state.fastPolling = true;
         try {
-          const [overview, map, localization, navigation, frontier, governance, pointcloudMap] = await Promise.allSettled([
+          const [overview, map, localization, navigation, frontier, governance] = await Promise.allSettled([
             getJson("/api/debug/overview"),
             getJson("/api/debug/map"),
             getJson("/api/debug/localization"),
             getJson("/api/debug/navigation"),
             getJson("/api/debug/exploration/frontier/latest"),
             getJson("/api/runtime/governance"),
-            getJson("/api/debug/pointcloud-map/latest/meta"),
           ]);
           els.lastReceive.textContent = nowText();
           if (overview.status === "fulfilled") updateOverview(overview.value);
@@ -2046,7 +1931,6 @@ def _render_debug_page(access_token: str) -> str:
           if (navigation.status === "fulfilled") updateNavigation(navigation.value); else showPanelError("navigation", navigation.reason.message);
           if (frontier.status === "fulfilled" && statusOf(frontier.value) === "available") updateNavigation(frontier.value);
           if (governance.status === "fulfilled") updateGovernance(governance.value); else showPanelError("governance", governance.reason.message);
-          if (pointcloudMap.status === "fulfilled") await updatePointCloudMap(pointcloudMap.value); else showPanelError("pointcloud_map", pointcloudMap.reason.message);
         } finally {
           state.fastPolling = false;
         }
@@ -2055,11 +1939,9 @@ def _render_debug_page(access_token: str) -> str:
         if (state.sensorPolling) return;
         state.sensorPolling = true;
         try {
-          const [pointcloud, video] = await Promise.allSettled([
-            getJson("/api/debug/pointcloud/latest"),
+          const [video] = await Promise.allSettled([
             getJson("/api/debug/video/latest"),
           ]);
-          if (pointcloud.status === "fulfilled") updatePointCloud(pointcloud.value); else showPanelError("pointcloud", pointcloud.reason.message);
           if (video.status === "fulfilled") updateVideo(video.value); else showPanelError("video", video.reason.message);
         } finally {
           state.sensorPolling = false;
@@ -2087,6 +1969,17 @@ def _render_debug_page(access_token: str) -> str:
       renderLogs();
       updateClock();
       window.setInterval(updateClock, 1000);
+      function setMapZoom(nextZoom) {
+        state.mapZoom = Math.min(8, Math.max(0.25, nextZoom));
+        drawMap();
+      }
+      els.mapZoomIn.addEventListener("click", () => setMapZoom(state.mapZoom * 1.25));
+      els.mapZoomOut.addEventListener("click", () => setMapZoom(state.mapZoom / 1.25));
+      els.mapZoomReset.addEventListener("click", () => setMapZoom(1));
+      els.mapCanvas.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        setMapZoom(state.mapZoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12));
+      }, { passive: false });
       els.logLevelFilter.addEventListener("change", () => {
         state.logFilter = els.logLevelFilter.value;
         renderLogs();
@@ -2095,7 +1988,6 @@ def _render_debug_page(access_token: str) -> str:
         state.logSearch = els.logSearch.value;
         renderLogs();
       });
-      clearPointCloudMapCanvas("等待 RTAB-Map/PCD 累计点云地图。");
       tickFast();
       tickSensor();
       tickSlow();
@@ -2159,6 +2051,127 @@ def _missing_envelope(
         status=status,
         error=DebugError(code=code, message=message),
     )
+
+
+def _build_map_diagnostics(snapshot: Any, *, refresh_error: Optional[str] = None) -> Dict[str, Any]:
+    metadata = dict(getattr(snapshot, "metadata", {}) or {})
+    live_mapping = metadata.get("live_mapping_diagnostics") if isinstance(metadata.get("live_mapping_diagnostics"), dict) else {}
+    provider_status = metadata.get("provider_status") if isinstance(metadata.get("provider_status"), dict) else {}
+    live_provider = live_mapping.get("live_map_provider") if isinstance(live_mapping.get("live_map_provider"), dict) else {}
+    map_stream = live_mapping.get("rtabmap_readiness", {}).get("map_stream") if isinstance(live_mapping.get("rtabmap_readiness"), dict) else {}
+    if not isinstance(map_stream, dict):
+        map_stream = {}
+    status = {**dict(live_provider), **dict(provider_status)}
+    occupancy_grid = getattr(snapshot, "occupancy_grid", None)
+    cost_map = getattr(snapshot, "cost_map", None)
+    source_timestamp = _map_source_timestamp(snapshot)
+    last_message_at = _parse_debug_timestamp(status.get("last_message_at") or status.get("latest_occupancy_received_at"))
+    gateway_timestamp = utc_now()
+    cache_age = max(0.0, (gateway_timestamp - last_message_at).total_seconds()) if last_message_at is not None else None
+    source_age = max(0.0, (gateway_timestamp - source_timestamp).total_seconds()) if source_timestamp is not None else None
+    expected_frame_id = status.get("expected_frame_id") or _map_expected_frame_id(snapshot)
+    frame_id = getattr(snapshot, "frame_id", None)
+    frame_mismatch = bool(status.get("frame_mismatch")) or bool(
+        expected_frame_id and frame_id and str(expected_frame_id) != str(frame_id)
+    )
+    message_count = _int_or_none(status.get("occupancy_message_count") or status.get("message_count"))
+    cost_message_count = _int_or_none(status.get("cost_map_message_count"))
+    content_revision = _int_or_none(
+        map_stream.get("content_revision") or status.get("occupancy_revision") or _metric_value(status, "occupancy_metrics", "content_revision")
+    )
+    costmap_revision = _int_or_none(
+        map_stream.get("costmap_revision") or status.get("cost_map_revision") or _metric_value(status, "cost_map_metrics", "content_revision")
+    )
+    diagnostics = {
+        "source_timestamp": source_timestamp,
+        "gateway_timestamp": gateway_timestamp,
+        "time_skew": status.get("time_skew_sec"),
+        "frame_id": frame_id,
+        "expected_frame_id": expected_frame_id,
+        "sequence": message_count,
+        "revision": getattr(snapshot, "revision", None),
+        "message_count": message_count,
+        "provider_status": status.get("provider_status") or ("available" if status.get("started") and status.get("ros_ready") else "unknown"),
+        "frame_mismatch": frame_mismatch,
+        "cache_age": cache_age,
+        "source_age": source_age,
+        "last_message_at": last_message_at,
+        "message_count_delta": map_stream.get("message_count_delta"),
+        "stream_age_ms": map_stream.get("stream_age_ms") if map_stream.get("stream_age_ms") is not None else (cache_age * 1000.0 if cache_age is not None else None),
+        "content_revision": content_revision,
+        "content_hash": map_stream.get("content_hash") or _metric_value(status, "occupancy_metrics", "content_hash"),
+        "known_cell_delta": map_stream.get("known_cell_delta") if map_stream.get("known_cell_delta") is not None else _metric_value(status, "occupancy_metrics", "known_cell_delta"),
+        "known_cell_count": map_stream.get("known_cell_count") if map_stream.get("known_cell_count") is not None else _metric_value(status, "occupancy_metrics", "known_cell_count"),
+        "costmap_delta": map_stream.get("costmap_delta") if map_stream.get("costmap_delta") is not None else _metric_value(status, "cost_map_metrics", "costmap_delta"),
+        "costmap_revision": costmap_revision,
+        "costmap_hash": map_stream.get("costmap_hash") or _metric_value(status, "cost_map_metrics", "content_hash"),
+        "cost_map_message_count": cost_message_count,
+        "occupancy_grid_ready": occupancy_grid is not None,
+        "cost_map_ready": cost_map is not None,
+        "live_mapping_ready": live_mapping.get("ready"),
+        "waiting_for": live_mapping.get("waiting_for"),
+        "waiting_message": live_mapping.get("message"),
+        "refresh_error": refresh_error,
+        "diagnostic_roles": {
+            "pointcloud_map": "health_check_input",
+            "pointcloud": "side_channel_not_map_source",
+            "map_source": "rtabmap_occupancy_grid",
+        },
+    }
+    if message_count is not None and message_count <= 0:
+        diagnostics["message_count_warning"] = "/map message_count 未增长或尚未收到首帧。"
+    return diagnostics
+
+
+def _map_source_timestamp(snapshot: Any) -> Optional[datetime]:
+    for layer_name in ("occupancy_grid", "cost_map", "semantic_map"):
+        timestamp = _timestamp_from_value(getattr(snapshot, layer_name, None))
+        if timestamp is not None:
+            return timestamp
+    return _timestamp_from_value(snapshot)
+
+
+def _map_expected_frame_id(snapshot: Any) -> Optional[str]:
+    metadata = dict(getattr(snapshot, "metadata", {}) or {})
+    input_contract = metadata.get("input_contract") if isinstance(metadata.get("input_contract"), dict) else {}
+    tf_contract = input_contract.get("tf") if isinstance(input_contract.get("tf"), dict) else {}
+    return tf_contract.get("map_frame") or metadata.get("frame_id")
+
+
+def _status_for_map_diagnostics(diagnostics: Dict[str, Any], cache_timestamp: Optional[datetime]) -> DebugDataStatus:
+    if diagnostics.get("refresh_error") and not diagnostics.get("occupancy_grid_ready"):
+        return DebugDataStatus.ERROR
+    if not diagnostics.get("occupancy_grid_ready"):
+        return DebugDataStatus.MISSING
+    if diagnostics.get("frame_mismatch"):
+        return DebugDataStatus.STALE
+    if cache_timestamp is not None and _is_stale(cache_timestamp, "map", utc_now()):
+        return DebugDataStatus.STALE
+    return DebugDataStatus.AVAILABLE
+
+
+def _parse_debug_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _metric_value(status: Dict[str, Any], key: str, metric: str) -> Any:
+    value = status.get(key)
+    return value.get(metric) if isinstance(value, dict) else None
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _summary_from_payload(
@@ -2774,9 +2787,16 @@ def _exploration_metadata(context: Any) -> Dict[str, Any]:
     state = getattr(context, "exploration_state", None) if context is not None else None
     if state is None:
         return {}
+    metadata = dict(getattr(state, "metadata", {}) or {})
     return {
         "frontier_count": getattr(state, "frontier_count", None),
-        "waiting_for": dict(getattr(state, "metadata", {}) or {}).get("waiting_for"),
+        "waiting_for": metadata.get("waiting_for"),
+        "failure_code": metadata.get("failure_code"),
+        "frontier_freshness": metadata.get("frontier_freshness"),
+        "map_revision": metadata.get("map_revision"),
+        "costmap_revision": metadata.get("costmap_revision"),
+        "nav2_ready": metadata.get("nav2_ready"),
+        "nav2_readiness": metadata.get("nav2_readiness"),
     }
 
 

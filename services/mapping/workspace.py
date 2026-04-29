@@ -292,6 +292,12 @@ class MapWorkspaceService:
             snapshot=snapshot,
             metadata={
                 "reason": str(reason or "").strip(),
+                "snapshot_kind": snapshot.metadata.get("map_snapshot_kind"),
+                "live_streaming_ready": snapshot.metadata.get("live_streaming_ready"),
+                "checkpoint_ready": snapshot.metadata.get("checkpoint_ready"),
+                "rtabmap_session_id": snapshot.metadata.get("rtabmap_session_id") or snapshot.metadata.get("session_id"),
+                "rtabmap_run_id": snapshot.metadata.get("rtabmap_run_id") or snapshot.metadata.get("run_id"),
+                "rtabmap_database_path": snapshot.metadata.get("rtabmap_database_path") or snapshot.metadata.get("rtabmap_db_path"),
                 **dict(metadata or {}),
             },
         )
@@ -670,6 +676,14 @@ class MapWorkspaceService:
             "assets": asset_refs,
             "quality_metrics": quality_metrics,
             "diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
+            "snapshot_kind": latest_map_snapshot.metadata.get("map_snapshot_kind"),
+            "source_mode": latest_map_snapshot.metadata.get("source_mode") or latest_map_snapshot.metadata.get("map_version_source_mode"),
+            "live_streaming_ready": latest_map_snapshot.metadata.get("rtabmap_live_streaming_ready") or latest_map_snapshot.metadata.get("live_streaming_ready"),
+            "checkpoint_ready": latest_map_snapshot.metadata.get("checkpoint_ready"),
+            "session_id": latest_map_snapshot.metadata.get("rtabmap_session_id") or latest_map_snapshot.metadata.get("session_id"),
+            "run_id": latest_map_snapshot.metadata.get("rtabmap_run_id") or latest_map_snapshot.metadata.get("run_id"),
+            "database": latest_map_snapshot.metadata.get("database"),
+            "pcd": latest_map_snapshot.metadata.get("pcd"),
         }
 
     def _load_map_version_into_runtime(self, version: MapVersion) -> None:

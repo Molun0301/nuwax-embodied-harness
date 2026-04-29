@@ -191,8 +191,9 @@ class NavigationService:
         provider = self._get_navigation_provider()
         accepted = provider.set_goal(goal)
         if not accepted:
-            self._state_machine.fail("导航后端拒绝目标 %s。" % goal.goal_id)
-            raise GatewayError(f"导航后端拒绝目标 {goal.goal_id}。")
+            message = self._navigation_provider_error_message(provider, default="导航后端拒绝目标 %s。" % goal.goal_id)
+            self._state_machine.fail(message)
+            raise GatewayError(message)
         self._current_goal = goal
         # 使用状态机管理目标接受
         self._state_machine.set_goal(goal.goal_id, message="平台导航目标已接受。")
@@ -536,10 +537,10 @@ class NavigationService:
         if provider is None:
             raise GatewayError("当前平台几何运行时未提供导航后端。")
         if not provider.is_available():
-            raise GatewayError("当前导航后端暂不可用。")
+            raise GatewayError(self._navigation_provider_error_message(provider, default="当前导航后端暂不可用。"))
         availability_checker = getattr(provider, "is_navigation_available", None)
         if callable(availability_checker) and not availability_checker():
-            raise GatewayError("当前导航后端暂不可用。")
+            raise GatewayError(self._navigation_provider_error_message(provider, default="当前导航后端暂不可用。"))
         return provider
 
     def _find_navigation_provider(self) -> Optional[NavigationProvider]:
@@ -547,6 +548,27 @@ class NavigationService:
         if providers is None or not isinstance(providers, NavigationProvider):
             return None
         return providers
+
+    def _navigation_provider_error_message(self, provider: NavigationProvider, *, default: str) -> str:
+        try:
+            state = provider.get_navigation_state()
+        except Exception:
+            return default
+        message = str(getattr(state, "message", "") or "").strip()
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        readiness = metadata.get("readiness") or metadata.get("nav2_readiness")
+        reasons = []
+        if isinstance(readiness, dict):
+            errors = readiness.get("errors")
+            if isinstance(errors, dict):
+                reasons.extend(str(value) for value in errors.values() if value)
+            waiting_for = str(readiness.get("waiting_for") or "").strip()
+            if waiting_for:
+                reasons.append("waiting_for=%s" % waiting_for)
+        if reasons:
+            suffix = "；".join(dict.fromkeys(reasons))
+            return "%s（%s）" % (message or default, suffix)
+        return message or default
 
     def _get_exploration_provider(self) -> ExplorationProvider:
         provider = self._find_exploration_provider()

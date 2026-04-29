@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import logging
 import threading
 from typing import Any, Dict, List, Optional
@@ -39,6 +40,16 @@ class Ros2LiveMapProvider:
         self._has_ros2_context = False
         self._occupancy_message_count = 0
         self._cost_map_message_count = 0
+        self._latest_occupancy_metrics: Dict[str, object] = {}
+        self._latest_cost_map_metrics: Dict[str, object] = {}
+        self._latest_occupancy_received_at: Optional[datetime] = None
+        self._latest_cost_map_received_at: Optional[datetime] = None
+        self._occupancy_content_revision = 0
+        self._cost_map_content_revision = 0
+        self._last_occupancy_content_hash: Optional[str] = None
+        self._last_cost_map_content_hash: Optional[str] = None
+        self._last_occupancy_known_cell_count = 0
+        self._last_cost_map_known_cell_count = 0
         self._node = None
         self._executor = None
         self._thread: Optional[threading.Thread] = None
@@ -131,8 +142,62 @@ class Ros2LiveMapProvider:
         }
 
     def get_status(self) -> Dict[str, object]:
-        occupancy_grid = self.get_occupancy_grid()
-        cost_map = self.get_cost_map()
+        with self._lock:
+            occupancy_grid = (
+                self._latest_occupancy_grid.model_copy(deep=True)
+                if self._latest_occupancy_grid is not None
+                else None
+            )
+            cost_map = self._latest_cost_map.model_copy(deep=True) if self._latest_cost_map is not None else None
+            occupancy_metrics = dict(self._latest_occupancy_metrics)
+            cost_map_metrics = dict(self._latest_cost_map_metrics)
+            occupancy_count = self._occupancy_message_count
+            cost_map_count = self._cost_map_message_count
+            occupancy_revision = self._occupancy_content_revision
+            cost_map_revision = self._cost_map_content_revision
+            occupancy_received_at = self._latest_occupancy_received_at
+            cost_map_received_at = self._latest_cost_map_received_at
+            last_error = self._last_error
+        now = datetime.now(timezone.utc)
+        occupancy_publisher_count = self._publisher_count(self.occupancy_topic)
+        cost_map_publisher_count = self._publisher_count(self.cost_map_topic) if self.cost_map_topic else None
+        rtabmap_info_publisher_count = self._publisher_count("/rtabmap/info")
+        latest_occupancy_age_sec = (
+            max(0.0, (now - occupancy_grid.timestamp).total_seconds()) if occupancy_grid is not None else None
+        )
+        latest_cost_map_age_sec = (
+            max(0.0, (now - cost_map.timestamp).total_seconds()) if cost_map is not None else None
+        )
+        latest_occupancy_cache_age_sec = (
+            max(0.0, (now - occupancy_received_at).total_seconds()) if occupancy_received_at is not None else None
+        )
+        latest_cost_map_cache_age_sec = (
+            max(0.0, (now - cost_map_received_at).total_seconds()) if cost_map_received_at is not None else None
+        )
+        occupancy_time_skew_sec = (
+            (occupancy_received_at - occupancy_grid.timestamp).total_seconds()
+            if occupancy_grid is not None and occupancy_received_at is not None
+            else None
+        )
+        cost_map_time_skew_sec = (
+            (cost_map_received_at - cost_map.timestamp).total_seconds()
+            if cost_map is not None and cost_map_received_at is not None
+            else None
+        )
+        expected_frame_id = str(self.config.frames.map_frame or "").strip() or None
+        occupancy_frame_mismatch = bool(
+            occupancy_grid is not None
+            and expected_frame_id
+            and str(occupancy_grid.frame_id or "").strip()
+            and str(occupancy_grid.frame_id or "").strip() != expected_frame_id
+        )
+        cost_map_frame_mismatch = bool(
+            cost_map is not None
+            and expected_frame_id
+            and str(cost_map.frame_id or "").strip()
+            and str(cost_map.frame_id or "").strip() != expected_frame_id
+        )
+        provider_status = "available" if self.is_available() else ("error" if last_error else "starting" if self._started else "stopped")
         return {
             "provider_name": self.provider_name,
             "provider_version": self.provider_version,
@@ -140,8 +205,22 @@ class Ros2LiveMapProvider:
             "ros_ready": self._ros_ready,
             "occupancy_topic": self.occupancy_topic,
             "cost_map_topic": self.cost_map_topic or None,
-            "occupancy_message_count": self._occupancy_message_count,
-            "cost_map_message_count": self._cost_map_message_count,
+            "occupancy_publisher_count": occupancy_publisher_count,
+            "cost_map_publisher_count": cost_map_publisher_count,
+            "rtabmap_info_topic": "/rtabmap/info",
+            "rtabmap_info_publisher_count": rtabmap_info_publisher_count,
+            "occupancy_has_publisher": occupancy_publisher_count is not None and occupancy_publisher_count > 0,
+            "cost_map_has_publisher": cost_map_publisher_count is not None and cost_map_publisher_count > 0,
+            "rtabmap_info_has_publisher": rtabmap_info_publisher_count is not None and rtabmap_info_publisher_count > 0,
+            "provider_status": provider_status,
+            "expected_frame_id": expected_frame_id,
+            "occupancy_message_count": occupancy_count,
+            "cost_map_message_count": cost_map_count,
+            "message_count": occupancy_count,
+            "occupancy_sequence": occupancy_count,
+            "cost_map_sequence": cost_map_count,
+            "occupancy_revision": occupancy_revision,
+            "cost_map_revision": cost_map_revision,
             "occupancy_grid_ready": occupancy_grid is not None,
             "cost_map_ready": cost_map is not None,
             "occupancy_grid_size": (
@@ -149,10 +228,40 @@ class Ros2LiveMapProvider:
                 if occupancy_grid is not None
                 else None
             ),
+            "latest_occupancy_frame_id": occupancy_grid.frame_id if occupancy_grid is not None else None,
+            "latest_cost_map_frame_id": cost_map.frame_id if cost_map is not None else None,
             "latest_occupancy_timestamp": occupancy_grid.timestamp.isoformat() if occupancy_grid is not None else None,
             "latest_cost_map_timestamp": cost_map.timestamp.isoformat() if cost_map is not None else None,
-            "last_error": self._last_error,
+            "latest_occupancy_source_timestamp": occupancy_grid.timestamp.isoformat() if occupancy_grid is not None else None,
+            "latest_cost_map_source_timestamp": cost_map.timestamp.isoformat() if cost_map is not None else None,
+            "latest_occupancy_received_at": occupancy_received_at.isoformat() if occupancy_received_at is not None else None,
+            "latest_cost_map_received_at": cost_map_received_at.isoformat() if cost_map_received_at is not None else None,
+            "last_message_at": occupancy_received_at.isoformat() if occupancy_received_at is not None else None,
+            "latest_occupancy_age_sec": latest_occupancy_age_sec,
+            "latest_cost_map_age_sec": latest_cost_map_age_sec,
+            "latest_occupancy_source_age_sec": latest_occupancy_age_sec,
+            "latest_cost_map_source_age_sec": latest_cost_map_age_sec,
+            "latest_occupancy_cache_age_sec": latest_occupancy_cache_age_sec,
+            "latest_cost_map_cache_age_sec": latest_cost_map_cache_age_sec,
+            "occupancy_time_skew_sec": occupancy_time_skew_sec,
+            "cost_map_time_skew_sec": cost_map_time_skew_sec,
+            "time_skew_sec": occupancy_time_skew_sec,
+            "occupancy_frame_mismatch": occupancy_frame_mismatch,
+            "cost_map_frame_mismatch": cost_map_frame_mismatch,
+            "frame_mismatch": occupancy_frame_mismatch or cost_map_frame_mismatch,
+            "occupancy_metrics": occupancy_metrics,
+            "cost_map_metrics": cost_map_metrics,
+            "last_error": last_error,
         }
+
+    def _publisher_count(self, topic: str) -> Optional[int]:
+        if not topic or self._node is None:
+            return None
+        try:
+            return len(self._node.get_publishers_info_by_topic(topic))
+        except Exception:
+            LOGGER.debug("读取 ROS2 topic publisher 失败 topic=%s", topic, exc_info=True)
+            return None
 
     def _start_ros2_subscriptions(self) -> None:
         from nav_msgs.msg import OccupancyGrid as RosOccupancyGrid
@@ -234,9 +343,27 @@ class Ros2LiveMapProvider:
                 self._last_error = str(exc)
             LOGGER.debug("转换 ROS2 占据栅格失败。", exc_info=True)
             return
+        metrics = self._build_grid_metrics(occupancy_grid.data)
         with self._lock:
-            self._latest_occupancy_grid = occupancy_grid
+            previous_hash = self._last_occupancy_content_hash
+            previous_known_count = self._last_occupancy_known_cell_count
+            known_count = int(metrics.get("known_cell_count") or 0)
+            content_hash = str(metrics.get("content_hash") or "")
+            known_delta = known_count - previous_known_count if previous_hash is not None else known_count
+            if previous_hash is None or content_hash != previous_hash or known_delta != 0:
+                self._occupancy_content_revision += 1
             self._occupancy_message_count += 1
+            metrics = {
+                **metrics,
+                "content_revision": self._occupancy_content_revision,
+                "known_cell_delta": known_delta,
+                "message_count": self._occupancy_message_count,
+            }
+            self._latest_occupancy_grid = occupancy_grid
+            self._latest_occupancy_metrics = metrics
+            self._latest_occupancy_received_at = datetime.now(timezone.utc)
+            self._last_occupancy_content_hash = content_hash
+            self._last_occupancy_known_cell_count = known_count
             self._last_error = None
 
     def _on_cost_map(self, message: Any) -> None:
@@ -257,10 +384,53 @@ class Ros2LiveMapProvider:
                 self._last_error = str(exc)
             LOGGER.debug("转换 ROS2 代价地图失败。", exc_info=True)
             return
+        metrics = self._build_grid_metrics([int(value) for value in cost_map.data])
         with self._lock:
-            self._latest_cost_map = cost_map
+            previous_hash = self._last_cost_map_content_hash
+            previous_known_count = self._last_cost_map_known_cell_count
+            known_count = int(metrics.get("known_cell_count") or 0)
+            content_hash = str(metrics.get("content_hash") or "")
+            costmap_delta = known_count - previous_known_count if previous_hash is not None else known_count
+            if previous_hash is None or content_hash != previous_hash or costmap_delta != 0:
+                self._cost_map_content_revision += 1
             self._cost_map_message_count += 1
+            metrics = {
+                **metrics,
+                "content_revision": self._cost_map_content_revision,
+                "known_cell_delta": costmap_delta,
+                "costmap_delta": costmap_delta,
+                "message_count": self._cost_map_message_count,
+            }
+            self._latest_cost_map = cost_map
+            self._latest_cost_map_metrics = metrics
+            self._latest_cost_map_received_at = datetime.now(timezone.utc)
+            self._last_cost_map_content_hash = content_hash
+            self._last_cost_map_known_cell_count = known_count
             self._last_error = None
+
+    def _build_grid_metrics(self, data: List[int]) -> Dict[str, object]:
+        unknown_count = 0
+        free_count = 0
+        occupied_count = 0
+        digest = hashlib.sha256()
+        for value in data:
+            int_value = int(value)
+            digest.update(int_value.to_bytes(2, byteorder="little", signed=True))
+            if int_value < 0:
+                unknown_count += 1
+            elif int_value == 0:
+                free_count += 1
+            elif int_value >= 50:
+                occupied_count += 1
+        known_count = max(0, len(data) - unknown_count)
+        return {
+            "cell_count": len(data),
+            "known_cell_count": known_count,
+            "unknown_cell_count": unknown_count,
+            "free_cell_count": free_count,
+            "occupied_cell_count": occupied_count,
+            "content_hash": digest.hexdigest(),
+        }
 
     def _build_grid_payload(self, message: Any, *, map_id: str) -> Dict[str, Any]:
         header = getattr(message, "header", None)

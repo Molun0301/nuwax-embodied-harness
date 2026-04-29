@@ -59,6 +59,8 @@ from settings import NuwaxRobotBridgeConfig
 
 RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.runtime")
 _RUNTIME_EVENT_LOG_RATE_LIMIT_SEC = 10.0
+_LIVE_MAP_STREAM_REFRESH_INTERVAL_SEC = 0.5
+_LIVE_MAP_STREAM_ERROR_BACKOFF_SEC = 2.0
 _REQUEST_CONTEXT_KEYS = (
     "request_id",
     "task_id",
@@ -336,6 +338,8 @@ class GatewayRuntime:
         self._started = False
         self._runtime_event_log_limiter = LogRateLimiter()
         self._event_log_subscription_id = self.event_bus.subscribe(self._log_runtime_event)
+        self._live_map_stream_stop_event = threading.Event()
+        self._live_map_stream_thread: Optional[threading.Thread] = None
         self._base_capability_matrix = robot.manifest.capability_matrix
         self._gateway_capability_names: Tuple[str, ...] = ()
 
@@ -363,13 +367,13 @@ class GatewayRuntime:
             self._started = True
         try:
             self.robot_state_service.refresh()
-        except Exception:
-            pass
+        except Exception as exc:
+            RUNTIME_LOGGER.warning("启动后刷新机器人状态失败：%s", exc)
         try:
             if self.localization_service.is_available():
                 self.localization_service.refresh()
-        except Exception:
-            pass
+        except Exception as exc:
+            RUNTIME_LOGGER.warning("启动后刷新定位状态失败：%s", exc)
         try:
             if self.perception_video_runtime.should_auto_start():
                 self.perception_video_runtime.start()
@@ -381,6 +385,7 @@ class GatewayRuntime:
             except Exception:
                 RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
         self._refresh_dynamic_capability_matrix()
+        self._start_live_map_stream_bridge()
 
         self.event_bus.publish(
             self.event_bus.build_event(
@@ -405,6 +410,7 @@ class GatewayRuntime:
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
             self.safety_guard.stop_all_motion("宿主机网关关闭。")
             self.task_manager.shutdown(wait=False)
+            self._stop_live_map_stream_bridge()
             self.audio_service.stop()
             self.perception_video_runtime.stop()
             self.platform_geometry_runtime.stop()
@@ -419,6 +425,71 @@ class GatewayRuntime:
                 message="宿主机网关运行时已停止。",
             )
         )
+
+    def _start_live_map_stream_bridge(self) -> None:
+        if self._live_map_stream_thread is not None and self._live_map_stream_thread.is_alive():
+            return
+        self._live_map_stream_stop_event.clear()
+        self._live_map_stream_thread = threading.Thread(
+            target=self._run_live_map_stream_bridge,
+            name="nuwax_live_map_stream_bridge",
+            daemon=True,
+        )
+        self._live_map_stream_thread.start()
+
+    def _stop_live_map_stream_bridge(self) -> None:
+        self._live_map_stream_stop_event.set()
+        thread = self._live_map_stream_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._live_map_stream_thread = None
+
+    def _run_live_map_stream_bridge(self) -> None:
+        while not self._live_map_stream_stop_event.is_set():
+            try:
+                self._refresh_live_map_stream_once()
+                self._live_map_stream_stop_event.wait(_LIVE_MAP_STREAM_REFRESH_INTERVAL_SEC)
+            except Exception as exc:
+                self.platform_geometry_runtime._record_runtime_diagnostic("live_map_stream_bridge", exc)
+                RUNTIME_LOGGER.warning("实时地图流桥接刷新失败：%s", exc)
+                self._live_map_stream_stop_event.wait(_LIVE_MAP_STREAM_ERROR_BACKOFF_SEC)
+
+    def _refresh_live_map_stream_once(self) -> None:
+        refreshers = (
+            ("live_map_stream_map", self.mapping_service.is_available, self.mapping_service.refresh),
+            ("live_map_stream_localization", self.localization_service.is_available, self.localization_service.refresh),
+            ("live_map_stream_navigation", self.navigation_service.is_navigation_available, self.navigation_service.refresh_navigation),
+            ("live_map_stream_exploration", self.navigation_service.is_exploration_available, self.navigation_service.refresh_exploration),
+        )
+        for code, is_available, refresh in refreshers:
+            try:
+                if is_available():
+                    refresh()
+            except Exception as exc:
+                self.platform_geometry_runtime._record_runtime_diagnostic(code, exc)
+
+    def get_live_map_stream_status(self) -> Dict[str, object]:
+        thread = self._live_map_stream_thread
+        latest_map = self.mapping_service.get_latest_snapshot()
+        latest_localization = self.localization_service.get_latest_snapshot()
+        latest_navigation = self.navigation_service.get_latest_navigation_context()
+        latest_exploration = self.navigation_service.get_latest_exploration_context()
+        return {
+            "enabled": True,
+            "running": bool(thread is not None and thread.is_alive()),
+            "interval_sec": _LIVE_MAP_STREAM_REFRESH_INTERVAL_SEC,
+            "map_revision": getattr(latest_map, "revision", None),
+            "map_version_id": getattr(latest_map, "version_id", None),
+            "map_source_name": getattr(latest_map, "source_name", None),
+            "map_timestamp": getattr(getattr(latest_map, "occupancy_grid", None), "timestamp", None),
+            "localization_timestamp": getattr(latest_localization, "timestamp", None),
+            "navigation_timestamp": getattr(getattr(latest_navigation, "navigation_state", None), "timestamp", None),
+            "exploration_timestamp": getattr(getattr(latest_exploration, "exploration_state", None), "timestamp", None),
+            "event_stream_endpoints": {
+                "sse": "/events/stream?event_types=mapping.snapshot_ready",
+                "websocket": "/events/ws?event_types=mapping.snapshot_ready",
+            },
+        }
 
     def _log_runtime_event(self, event) -> None:
         """把运行时事件同步写入标准日志。"""
@@ -2184,6 +2255,8 @@ class GatewayRuntime:
                 "source": "platform_service_contracts",
                 "map_version_id": getattr(map_snapshot, "version_id", None),
                 "localization_session_id": getattr(localization_session, "session_id", None),
+                "geometry_runtime": self.platform_geometry_runtime.get_runtime_status(),
+                "live_mapping_diagnostics": self.platform_geometry_runtime.get_live_mapping_diagnostics(),
             },
         )
 
@@ -4217,8 +4290,9 @@ class GatewayRuntime:
         try:
             if refresh_live_map and self.mapping_service.is_available():
                 self.mapping_service.refresh()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.platform_geometry_runtime._record_runtime_diagnostic("workspace_map_refresh", exc)
+            RUNTIME_LOGGER.warning("刷新地图工作区快照失败：%s", exc)
         try:
             if active_workspace is not None:
                 self.map_workspace_service.sync_active_localization_session(

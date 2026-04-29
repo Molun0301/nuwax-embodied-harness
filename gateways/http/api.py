@@ -381,12 +381,14 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_maps_latest(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         snapshot = runtime.mapping_service.get_latest_snapshot()
+        diagnostics = None
         if snapshot is None and runtime.mapping_service.is_available():
             try:
                 snapshot = await run_in_threadpool(runtime.mapping_service.refresh)
-            except Exception:
-                pass
-        return {"map_snapshot": to_jsonable(snapshot)}
+            except Exception as exc:
+                runtime.platform_geometry_runtime._record_runtime_diagnostic("api_maps_latest_refresh", exc)
+                diagnostics = {"refresh_error": str(exc)}
+        return {"map_snapshot": to_jsonable(snapshot), "diagnostics": diagnostics}
 
     @router.get("/api/maps/history")
     async def api_maps_history(request: Request, limit: int = 20) -> Dict[str, Any]:
@@ -523,19 +525,23 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access_manager.authenticate_http(request)
         navigation_context = runtime.navigation_service.get_latest_navigation_context()
         exploration_context = runtime.navigation_service.get_latest_exploration_context()
+        diagnostics = {}
         if runtime.navigation_service.is_navigation_available():
             try:
                 navigation_context = await run_in_threadpool(runtime.navigation_service.refresh_navigation)
-            except Exception:
-                pass
+            except Exception as exc:
+                runtime.platform_geometry_runtime._record_runtime_diagnostic("api_navigation_refresh", exc)
+                diagnostics["navigation_refresh_error"] = str(exc)
         if runtime.navigation_service.is_exploration_available():
             try:
                 exploration_context = await run_in_threadpool(runtime.navigation_service.refresh_exploration)
-            except Exception:
-                pass
+            except Exception as exc:
+                runtime.platform_geometry_runtime._record_runtime_diagnostic("api_exploration_refresh", exc)
+                diagnostics["exploration_refresh_error"] = str(exc)
         return {
             "navigation_context": to_jsonable(navigation_context),
             "exploration_context": to_jsonable(exploration_context),
+            "diagnostics": diagnostics or None,
         }
 
     @router.get("/api/navigation/semantic_context")

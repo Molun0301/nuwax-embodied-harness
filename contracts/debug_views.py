@@ -86,6 +86,7 @@ class DebugMapView(ContractModel):
     occupancy_grid: Optional[MetadataDict] = None
     cost_map: Optional[MetadataDict] = None
     semantic_map: Optional[MetadataDict] = None
+    diagnostics: MetadataDict = Field(default_factory=dict)
     legend: MetadataDict = Field(default_factory=lambda: {"unknown": -1, "free": 0, "occupied": 100})
 
 
@@ -105,6 +106,11 @@ class DebugNavigationView(ContractModel):
     exploration_context: Optional[MetadataDict] = None
     frontier_count: Optional[int] = None
     waiting_for: Optional[str] = None
+    failure_code: Optional[str] = None
+    frontier_freshness: MetadataDict = Field(default_factory=dict)
+    map_revision: Optional[str] = None
+    costmap_revision: Optional[str] = None
+    nav2_readiness: MetadataDict = Field(default_factory=dict)
     mapping_chain_diagnostics: MetadataDict = Field(default_factory=dict)
     frontiers: Optional[List[MetadataDict]] = None
 

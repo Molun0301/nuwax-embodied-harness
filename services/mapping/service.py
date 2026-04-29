@@ -38,23 +38,43 @@ class MappingService:
             if runtime_snapshot is not None:
                 if self._is_snapshot_contract_equivalent(runtime_snapshot):
                     return self._latest_snapshot  # type: ignore[return-value]
+                metadata = dict(runtime_snapshot.metadata or {})
+                live_streaming = bool(
+                    metadata.get("rtabmap_live_streaming_ready")
+                    or metadata.get("live_streaming_ready")
+                    or metadata.get("map_snapshot_kind") == "live_streaming"
+                    or metadata.get("source_kind") == "platform_live_map_provider"
+                )
                 return self.ingest_external_snapshot(
                     source_name=runtime_snapshot.source_name,
                     occupancy_grid=runtime_snapshot.occupancy_grid,
                     cost_map=runtime_snapshot.cost_map,
                     semantic_map=runtime_snapshot.semantic_map,
-                    metadata=runtime_snapshot.metadata,
-                    version_id_override=runtime_snapshot.version_id,
-                    revision_override=runtime_snapshot.revision,
+                    metadata=metadata,
+                    version_id_override=None if live_streaming else runtime_snapshot.version_id,
+                    revision_override=None if live_streaming else runtime_snapshot.revision,
                 )
 
         provider = self._get_map_provider()
+        provider_metadata: Dict[str, object] = {"source_kind": "provider", "provider_version": provider.provider_version}
+        status_reader = getattr(provider, "get_status", None)
+        if callable(status_reader):
+            try:
+                provider_metadata["provider_status"] = status_reader()
+            except Exception as exc:
+                provider_metadata["provider_status_error"] = str(exc)
+        diagnostics_reader = getattr(self._provider_owner, "get_live_mapping_diagnostics", None)
+        if callable(diagnostics_reader):
+            try:
+                provider_metadata["live_mapping_diagnostics"] = diagnostics_reader()
+            except Exception as exc:
+                provider_metadata["live_mapping_diagnostics_error"] = str(exc)
         return self.ingest_external_snapshot(
             source_name=provider.provider_name,
             occupancy_grid=provider.get_occupancy_grid(),
             cost_map=provider.get_cost_map(),
             semantic_map=provider.get_semantic_map(),
-            metadata={"source_kind": "provider", "provider_version": provider.provider_version},
+            metadata=provider_metadata,
         )
 
     def ingest_external_snapshot(
@@ -73,9 +93,13 @@ class MappingService:
         if occupancy_grid is None and cost_map is None and semantic_map is None:
             raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
 
+        source_metadata = dict(metadata or {})
         snapshot_metadata = {
             "available_layers": self._build_available_layers(occupancy_grid, cost_map, semantic_map),
-            **dict(metadata or {}),
+            "map_snapshot_kind": source_metadata.get("map_snapshot_kind") or self._infer_snapshot_kind(source_metadata),
+            "live_streaming_ready": bool(source_metadata.get("rtabmap_live_streaming_ready") or source_metadata.get("live_streaming_ready")),
+            "checkpoint_ready": bool(source_metadata.get("checkpoint_ready") or source_metadata.get("geometry_ready")),
+            **source_metadata,
         }
         # 对实时 provider 刷新做内容去重，避免同一张地图在无变化时反复生成新版本。
         if (
@@ -162,6 +186,14 @@ class MappingService:
             return bool(availability_checker())
         return True
 
+    def _infer_snapshot_kind(self, metadata: Dict[str, object]) -> str:
+        source_mode = str(metadata.get("source_mode") or metadata.get("map_version_source_mode") or "").strip()
+        if source_mode == "live_streaming_checkpoint" or metadata.get("rtabmap_live_streaming_ready") is True:
+            return "live_streaming"
+        if metadata.get("platform_map_version_id") or metadata.get("geometry_asset_summary"):
+            return "offline_checkpoint"
+        return "provider_snapshot"
+
     def _build_available_layers(self, occupancy_grid, cost_map, semantic_map) -> List[str]:
         layers: List[str] = []
         if occupancy_grid is not None:
@@ -211,10 +243,21 @@ class MappingService:
         if hasattr(value, "model_dump"):
             return self._normalize_snapshot_value(value.model_dump(mode="json"))
         if isinstance(value, dict):
+            volatile_keys = {
+                "timestamp",
+                "gateway_timestamp",
+                "latest_occupancy_cache_age_sec",
+                "latest_cost_map_cache_age_sec",
+                "latest_occupancy_age_sec",
+                "latest_cost_map_age_sec",
+                "latest_occupancy_source_age_sec",
+                "latest_cost_map_source_age_sec",
+                "stream_age_ms",
+            }
             return {
                 key: self._normalize_snapshot_value(inner)
                 for key, inner in sorted(value.items())
-                if key != "timestamp"
+                if key not in volatile_keys and not str(key).endswith("_age_sec")
             }
         if isinstance(value, list):
             return [self._normalize_snapshot_value(item) for item in value]

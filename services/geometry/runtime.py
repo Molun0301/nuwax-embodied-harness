@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 from contracts.geometry import Pose, Twist, Vector3
 from contracts.map_workspace import MapGeometryAssetBinding, MapGeometryAssetRef, MapGeometryAssetType, MapVersion
-from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus
+from contracts.navigation import ExplorationStatus, NavigationGoal, NavigationState, NavigationStatus
 from contracts.runtime_views import MapSnapshot
 from drivers.common import ExplorationDataPlane, LocalizationDataPlane, MappingDataPlane, NavigationDataPlane, RobotAssemblyBase
 from providers.exploration import ExplorationProvider
@@ -64,6 +64,8 @@ class PlatformGeometryRuntime:
         self._last_activation_result: Dict[str, object] = {}
         self._live_map_provider = Ros2LiveMapProvider(config)
         self._point_cloud_publisher = Ros2PointCloudPublisher(config, self._resolve_point_cloud_provider)
+        self._live_geometry_start_lock = threading.RLock()
+        self._live_geometry_start_attempted = False
         self._platform_navigation_runtime = PlatformNavigationRuntime(self)
         self._platform_exploration_runtime = PlatformExplorationRuntime(
             frontier_explorer=FrontierExplorer(ExplorationConfig(enabled=True)),
@@ -75,20 +77,29 @@ class PlatformGeometryRuntime:
     def start(self) -> None:
         """启动平台几何运行时。"""
 
-        if not self._is_geometry_profile_enabled():
-            return
-        self._point_cloud_publisher.start()
-        try:
-            self._live_map_provider.start()
-        except Exception:
-            self._point_cloud_publisher.stop()
-            raise
+        return
 
     def stop(self) -> None:
         """停止平台几何运行时。"""
 
         self._live_map_provider.stop()
         self._point_cloud_publisher.stop()
+        self._live_geometry_start_attempted = False
+
+    def _ensure_live_geometry_started(self) -> None:
+        if not self._is_geometry_profile_enabled():
+            return
+        with self._live_geometry_start_lock:
+            if self._live_map_provider.is_available() and self._point_cloud_publisher.is_available():
+                return
+            self._live_geometry_start_attempted = True
+            try:
+                self._point_cloud_publisher.start()
+                self._live_map_provider.start()
+            except Exception:
+                self._point_cloud_publisher.stop()
+                self._live_geometry_start_attempted = False
+                raise
 
     def is_available(self) -> bool:
         """返回是否存在可供平台消费的几何后端。"""
@@ -160,6 +171,212 @@ class PlatformGeometryRuntime:
             "active_map_version_id": self._active_map_version.version_id if self._active_map_version is not None else None,
             **self.config.build_metadata(),
         }
+
+    def get_live_mapping_diagnostics(self) -> Dict[str, object]:
+        """返回探索建图输入链路的可行动诊断。"""
+
+        live_map_status = self._clone_metadata(self._live_map_provider.get_status())
+        point_cloud_status = self._clone_metadata(self._point_cloud_publisher.get_status())
+        point_cloud_source = self._build_point_cloud_source_status()
+        data_plane_status = self._build_data_plane_status()
+        waiting_for, message = self._classify_live_mapping_wait(
+            live_map_status=live_map_status,
+            point_cloud_status=point_cloud_status,
+            point_cloud_source=point_cloud_source,
+            data_plane_status=data_plane_status,
+        )
+        return {
+            "ready": waiting_for is None,
+            "waiting_for": waiting_for,
+            "message": message,
+            "live_geometry_start_attempted": self._live_geometry_start_attempted,
+            "geometry_enabled": self.config.enabled,
+            "rtabmap_profile_enabled": self.config.rtabmap.profile_enabled,
+            "live_map_provider": live_map_status,
+            "point_cloud_publisher": point_cloud_status,
+            "point_cloud_source": point_cloud_source,
+            "data_plane": data_plane_status,
+            "config": self._build_live_mapping_config_summary(),
+        }
+
+    def _build_live_mapping_config_summary(self) -> Dict[str, object]:
+        direct_dds = getattr(getattr(self.robot, "data_plane_runtime", None), "config", None)
+        direct_dds = getattr(direct_dds, "direct_dds", None)
+        return {
+            "geometry_stack": self.config.stack,
+            "require_ros2": self.config.require_ros2,
+            "point_cloud_topic": self.config.topics.point_cloud_topic,
+            "occupancy_topic": self.config.topics.occupancy_topic,
+            "cost_map_topic": self.config.topics.cost_map_topic,
+            "map_frame": self.config.frames.map_frame,
+            "odom_frame": self.config.frames.odom_frame,
+            "base_frame": self.config.frames.base_frame,
+            "lidar_frame": self.config.frames.lidar_frame,
+            "rtabmap_profile_name": self.config.rtabmap.profile_name,
+            "rtabmap_launch_package": self.config.rtabmap.launch_package,
+            "rtabmap_launch_file": self.config.rtabmap.launch_file,
+            "go2_direct_dds_point_cloud_topic": getattr(direct_dds, "point_cloud_topic", None),
+            "go2_direct_dds_enabled": getattr(direct_dds, "enabled", None),
+        }
+
+    def _build_point_cloud_source_status(self) -> Dict[str, object]:
+        provider = self._resolve_point_cloud_provider()
+        status: Dict[str, object] = {
+            "provider_name": getattr(provider, "provider_name", None),
+            "provider_version": getattr(provider, "provider_version", None),
+            "provider_available": provider is not None,
+            "point_cloud_ready": False,
+            "point_count": 0,
+            "source_topic": None,
+            "frame_id": None,
+            "timestamp": None,
+            "last_error": None,
+        }
+        if provider is None:
+            status["last_error"] = "未找到平台点云 provider。"
+            return status
+        availability_checker = getattr(provider, "is_available", None)
+        if callable(availability_checker):
+            try:
+                status["provider_available"] = bool(availability_checker())
+            except Exception as exc:
+                status["provider_available"] = False
+                status["last_error"] = str(exc)
+        getter = getattr(provider, "get_latest_point_cloud", None)
+        if not callable(getter):
+            status["last_error"] = "点云 provider 未实现 get_latest_point_cloud。"
+            return status
+        try:
+            point_cloud = getter()
+        except Exception as exc:
+            status["last_error"] = str(exc)
+            return status
+        if point_cloud is None:
+            return status
+        metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+        timestamp = getattr(point_cloud, "timestamp", None)
+        status.update(
+            {
+                "point_cloud_ready": bool(getattr(point_cloud, "points", None)),
+                "point_count": int(getattr(point_cloud, "point_count", 0) or 0),
+                "source_topic": metadata.get("source_topic"),
+                "frame_id": getattr(point_cloud, "frame_id", None),
+                "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else None,
+            }
+        )
+        return status
+
+    def _build_data_plane_status(self) -> Dict[str, object]:
+        runtime = getattr(self.robot, "data_plane_runtime", None)
+        data_plane = getattr(self.robot, "data_plane", None)
+        config = getattr(runtime, "config", None)
+        if config is None:
+            config = getattr(getattr(data_plane, "runtime", None), "config", None)
+        status_getter = getattr(runtime, "get_status", None) or getattr(data_plane, "get_status", None)
+        raw_status: Dict[str, object] = {}
+        if callable(status_getter):
+            try:
+                raw_status = self._clone_metadata(status_getter())
+            except Exception as exc:
+                raw_status = {"last_error": str(exc)}
+        direct_dds = getattr(config, "direct_dds", None)
+        bridge_status = raw_status.get("bridge") if isinstance(raw_status.get("bridge"), dict) else {}
+        return {
+            "present": runtime is not None or data_plane is not None,
+            "enabled": getattr(config, "enabled", None),
+            "started": raw_status.get("started"),
+            "direct_dds_started": bridge_status.get("direct_dds_started"),
+            "dds_cloud_ready": bridge_status.get("dds_cloud_ready"),
+            "point_cloud_source_topic": bridge_status.get("point_cloud_source_topic"),
+            "latest_point_cloud_points": bridge_status.get("latest_point_cloud_points"),
+            "direct_dds_enabled": getattr(direct_dds, "enabled", None),
+            "direct_dds_point_cloud_topic": getattr(direct_dds, "point_cloud_topic", None),
+            "dds_iface": getattr(config, "dds_iface", None),
+            "last_error": raw_status.get("last_error"),
+        }
+
+    def _classify_live_mapping_wait(
+        self,
+        *,
+        live_map_status: Dict[str, object],
+        point_cloud_status: Dict[str, object],
+        point_cloud_source: Dict[str, object],
+        data_plane_status: Dict[str, object],
+    ) -> tuple[Optional[str], str]:
+        point_cloud_error = str(point_cloud_status.get("last_error") or "").strip()
+        if point_cloud_error:
+            return "point_cloud_bridge_error", "ROS2 点云桥错误：%s" % point_cloud_error
+        live_map_error = str(live_map_status.get("last_error") or "").strip()
+        if live_map_error:
+            return "live_map_provider_error", "ROS2 实时地图订阅错误：%s" % live_map_error
+        source_error = str(point_cloud_source.get("last_error") or "").strip()
+        occupancy_grid_ready = bool(live_map_status.get("occupancy_grid_ready"))
+        if source_error and not occupancy_grid_ready:
+            return "point_cloud_input", source_error
+        published_count = int(point_cloud_status.get("published_count") or 0)
+        point_cloud_topic = str(point_cloud_status.get("topic") or point_cloud_status.get("point_cloud_topic") or self.config.topics.point_cloud_topic)
+        source_topic = str(
+            point_cloud_source.get("source_topic")
+            or data_plane_status.get("point_cloud_source_topic")
+            or data_plane_status.get("direct_dds_point_cloud_topic")
+            or "rt/utlidar/cloud"
+        )
+        if published_count <= 0:
+            if data_plane_status.get("enabled") is False:
+                return (
+                    "point_cloud_input",
+                    "Go2 data plane 未启用，点云桥尚未向 %s 发布首帧；请启用 GO2_DATA_PLANE_ENABLED 并确认 %s 有输入。"
+                    % (point_cloud_topic, source_topic),
+                )
+            return (
+                "point_cloud_input",
+                "点云桥尚未向 %s 发布首帧，等待 Go2 data plane 从 %s 输入点云。"
+                % (point_cloud_topic, source_topic),
+            )
+        if not bool(live_map_status.get("occupancy_grid_ready")):
+            occupancy_topic = str(live_map_status.get("occupancy_topic") or self.config.topics.occupancy_topic)
+            return (
+                "rtabmap_occupancy_grid",
+                "点云桥已向 %s 发布 %d 帧，等待 RTAB-Map 在 %s 发布首帧占据栅格。"
+                % (point_cloud_topic, published_count, occupancy_topic),
+            )
+        occupancy_topic = str(live_map_status.get("occupancy_topic") or self.config.topics.occupancy_topic)
+        return None, "建图链路已收到 %s 首帧占据栅格。" % occupancy_topic
+
+    def _attach_live_mapping_diagnostics_to_request(self, request):
+        metadata = dict(getattr(request, "metadata", {}) or {})
+        metadata["initial_mapping_chain_diagnostics"] = self.get_live_mapping_diagnostics()
+        copier = getattr(request, "model_copy", None)
+        if callable(copier):
+            return request.model_copy(update={"metadata": metadata}, deep=True)
+        request.metadata = metadata
+        return request
+
+    def _augment_exploration_state_with_mapping_diagnostics(self, state):
+        diagnostics = self.get_live_mapping_diagnostics()
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        current_waiting_for = str(metadata.get("waiting_for") or "").strip() or None
+        diagnostic_waiting_for = diagnostics.get("waiting_for")
+        active = getattr(state.status, "value", state.status) in {
+            ExplorationStatus.ACCEPTED.value,
+            ExplorationStatus.RUNNING.value,
+        }
+        override_waiting = bool(
+            active
+            and diagnostic_waiting_for
+            and (
+                current_waiting_for in {None, "occupancy_grid", "mapping_ready", "point_cloud_input", "rtabmap_occupancy_grid"}
+                or str(diagnostic_waiting_for).endswith("_error")
+            )
+        )
+        if override_waiting:
+            metadata["waiting_for"] = diagnostic_waiting_for
+            metadata["waiting_detail"] = diagnostics.get("message")
+        metadata["mapping_chain_diagnostics"] = diagnostics
+        updates = {"metadata": metadata}
+        if override_waiting and diagnostics.get("message"):
+            updates["message"] = diagnostics.get("message")
+        return state.model_copy(update=updates, deep=True)
 
     def clear_active_map_version(self, *, reason: str = "") -> None:
         """清空当前激活的平台地图版本上下文。"""
@@ -659,6 +876,8 @@ class PlatformGeometryRuntime:
     def start_platform_exploration(self, request) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
+        self._ensure_live_geometry_started()
+        request = self._attach_live_mapping_diagnostics_to_request(request)
         self._cancel_platform_exploration_navigation()
         return self._platform_exploration_runtime.start_exploration(request)
 
@@ -725,7 +944,8 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return self._platform_exploration_runtime.get_exploration_state()
         self.sync_platform_exploration()
-        return self._platform_exploration_runtime.get_exploration_state()
+        state = self._platform_exploration_runtime.get_exploration_state()
+        return self._augment_exploration_state_with_mapping_diagnostics(state)
 
     def _notify_compat_exploration_stopped(self) -> None:
         backend = self._resolve_backend(ExplorationDataPlane, ExplorationProvider)
@@ -828,6 +1048,7 @@ class PlatformNavigationRuntime:
         )
 
     def set_goal(self, goal: NavigationGoal) -> bool:
+        self.runtime._ensure_live_geometry_started()
         if not self.is_navigation_available():
             return False
         goal_copy = goal.model_copy(deep=True)

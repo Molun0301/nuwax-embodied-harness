@@ -104,10 +104,12 @@ class Ros2PointCloudPublisher:
                 "started": self._started,
                 "ros_ready": self._ros_ready,
                 "point_cloud_topic": self.topic,
+                "topic": self.topic,
                 "frame_id": self.frame_id,
                 "published_count": self._published_count,
                 "dropped_count": self._dropped_count,
                 "last_source_topic": self._last_source_topic,
+                "source": self._last_source_topic,
                 "last_published_timestamp": (
                     self._last_published_timestamp.isoformat() if self._last_published_timestamp is not None else None
                 ),

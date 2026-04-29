@@ -5060,17 +5060,23 @@ class GatewayRuntime:
             context.update(progress=0.02, stage="prepare_exploration_runtime", message="按需准备探索建图运行时。")
             last_context = self.navigation_service.start_exploration(request)
             finalized = False
+            exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
             context.update(
                 progress=0.05,
                 stage="accepted",
-                message=f"探索任务 {request.request_id} 已提交。",
-                payload={"request_id": request.request_id},
+                message=last_context.exploration_state.message or f"探索任务 {request.request_id} 已提交。",
+                payload={
+                    "request_id": request.request_id,
+                    "waiting_for": exploration_metadata.get("waiting_for"),
+                    "mapping_chain_diagnostics": exploration_metadata.get("mapping_chain_diagnostics"),
+                },
             )
             try:
                 while True:
                     context.ensure_active()
                     last_context = self.navigation_service.refresh_exploration()
                     status = last_context.exploration_state.status
+                    exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
                     context.update(
                         progress=self._estimate_exploration_progress(last_context),
                         stage=f"exploration_{status.value}",
@@ -5079,6 +5085,8 @@ class GatewayRuntime:
                             "request_id": request.request_id,
                             "covered_ratio": last_context.exploration_state.covered_ratio,
                             "frontier_count": last_context.exploration_state.frontier_count,
+                            "waiting_for": exploration_metadata.get("waiting_for"),
+                            "mapping_chain_diagnostics": exploration_metadata.get("mapping_chain_diagnostics"),
                         },
                     )
                     if status.value == "succeeded":

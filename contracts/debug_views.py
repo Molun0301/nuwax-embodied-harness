@@ -105,6 +105,7 @@ class DebugNavigationView(ContractModel):
     exploration_context: Optional[MetadataDict] = None
     frontier_count: Optional[int] = None
     waiting_for: Optional[str] = None
+    mapping_chain_diagnostics: MetadataDict = Field(default_factory=dict)
     frontiers: Optional[List[MetadataDict]] = None
 
 

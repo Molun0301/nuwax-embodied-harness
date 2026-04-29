@@ -303,15 +303,22 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         exploration_state = getattr(exploration_context, "exploration_state", None)
         waiting_for = None
         frontier_count = None
+        mapping_chain_diagnostics = {}
         if exploration_state is not None:
+            exploration_metadata = dict(getattr(exploration_state, "metadata", {}) or {})
             frontier_count = getattr(exploration_state, "frontier_count", None)
-            waiting_for = dict(getattr(exploration_state, "metadata", {}) or {}).get("waiting_for")
+            waiting_for = exploration_metadata.get("waiting_for")
+            raw_mapping_chain_diagnostics = exploration_metadata.get("mapping_chain_diagnostics")
+            mapping_chain_diagnostics = (
+                dict(raw_mapping_chain_diagnostics) if isinstance(raw_mapping_chain_diagnostics, dict) else {}
+            )
         frontiers = _frontiers_from_exploration_context(exploration_context)
         view = DebugNavigationView(
             navigation_context=to_jsonable(navigation_context),
             exploration_context=to_jsonable(exploration_context),
             frontier_count=frontier_count if frontier_count is not None else len(frontiers),
             waiting_for=waiting_for,
+            mapping_chain_diagnostics=mapping_chain_diagnostics,
             frontiers=frontiers,
         )
         source_timestamp = _latest_timestamp(_navigation_timestamp(navigation_context), _exploration_timestamp(exploration_context))
@@ -323,7 +330,11 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             error = DebugError(
                 code="source_unavailable" if source_available else "source_unsupported",
                 message="探索上下文暂未提供 frontier 几何；请确认探索运行态已生成候选。",
-                details={"frontier_count": frontier_count, "waiting_for": waiting_for},
+                details={
+                    "frontier_count": frontier_count,
+                    "waiting_for": waiting_for,
+                    "mapping_chain_diagnostics": mapping_chain_diagnostics,
+                },
             )
         return _envelope(
             payload_type=payload_type,
@@ -1623,6 +1634,10 @@ def _render_debug_page(access_token: str) -> str:
         setPill(els.navigationStatus, status);
         const frontierCount = data.frontier_count;
         const waitingFor = data.waiting_for;
+        const mappingDiag = data.mapping_chain_diagnostics || {};
+        const liveMap = mappingDiag.live_map_provider || {};
+        const cloudPub = mappingDiag.point_cloud_publisher || {};
+        const cloudSource = mappingDiag.point_cloud_source || {};
         const frontiers = Array.isArray(data.frontiers) ? data.frontiers : null;
         state.frontiers = frontiers || [];
         setKv(els.navigationMeta, [
@@ -1630,6 +1645,9 @@ def _render_debug_page(access_token: str) -> str:
           ["exploration", summarizeContext(data.exploration_context, "exploration_state")],
           ["frontier_count", frontierCount === null || frontierCount === undefined ? "--" : frontierCount],
           ["waiting_for", waitingFor],
+          ["mapping_detail", mappingDiag.message],
+          ["occupancy", `${safeText(liveMap.occupancy_topic)} ready=${safeText(liveMap.occupancy_grid_ready)} count=${safeText(liveMap.occupancy_message_count)}`],
+          ["pointcloud_bridge", `${safeText(cloudPub.topic || cloudPub.point_cloud_topic)} published=${safeText(cloudPub.published_count)} source=${safeText(cloudPub.source || cloudPub.last_source_topic || cloudSource.source_topic)}`],
           ["frontier_geometry", frontiers && frontiers.length ? `${frontiers.length} 个几何` : "暂无候选"],
           ["source_timestamp", shortTime(envelope.source_timestamp)],
           ["latency", fmt(envelope.latency_ms, " ms")],

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 import struct
@@ -72,8 +73,10 @@ class _FakeObstaclesAvoidClient:
         self.switch_enabled = False
         self.remote_enabled = False
         self.switch_set_code = 0
+        self.switch_get_code = 0
         self.remote_command_code = 0
         self.switch_calls: list[bool] = []
+        self.switch_get_calls = 0
         self.remote_calls: list[bool] = []
         self.move_calls: list[tuple[float, float, float]] = []
 
@@ -92,6 +95,9 @@ class _FakeObstaclesAvoidClient:
         return int(self.switch_set_code)
 
     def SwitchGet(self):
+        self.switch_get_calls += 1
+        if self.switch_get_code != 0:
+            return int(self.switch_get_code), None
         return 0, self.switch_enabled
 
     def UseRemoteCommandFromApi(self, enabled: bool) -> int:
@@ -420,6 +426,30 @@ def test_go2_data_plane_falls_back_to_sport_client_when_obstacles_avoid_is_tempo
     assert runtime._official_obstacles_avoid_remote_control is False
     assert obstacles_client.move_calls == []
     assert sport_client.move_calls[-1] == (0.15, 0.0, 0.05)
+
+
+def test_go2_data_plane_status_uses_cached_obstacle_switch_on_timeout(caplog) -> None:
+    runtime = Go2DataPlaneRuntime(Go2DataPlaneConfig(enabled=True), bridge=_FakeBridge())
+    obstacles_client = _FakeObstaclesAvoidClient()
+    obstacles_client.switch_enabled = True
+    runtime._official_obstacles_avoid_client = obstacles_client
+    runtime._official_obstacles_avoid_ready = True
+    runtime._official_obstacles_avoid_switch_state = True
+    runtime._obstacle_avoidance_enabled = True
+
+    obstacles_client.switch_get_code = 3104
+    caplog.set_level(logging.WARNING, logger=go2_data_plane.LOGGER.name)
+
+    status = runtime.get_obstacle_avoidance_status()
+    status_again = runtime.get_obstacle_avoidance_status()
+
+    assert status["switch_enabled"] is True
+    assert status["switch_state_cached"] is True
+    assert status["switch_state_error_code"] == 3104
+    assert status["control_path"] == "obstacles_avoid"
+    assert status_again["switch_state_error_code"] == 3104
+    assert obstacles_client.switch_get_calls == 1
+    assert "读取官方避障开关状态失败" not in caplog.text
 
 
 def test_go2_data_plane_respects_obstacle_avoidance_default_config(monkeypatch) -> None:

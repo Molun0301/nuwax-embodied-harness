@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane")
 _GO2_INFO_LOG_RATE_LIMIT_SEC = 30.0
 _GO2_MOTION_ERROR_LOG_RATE_LIMIT_SEC = 5.0
+_GO2_OBSTACLE_STATUS_REFRESH_INTERVAL_SEC = 5.0
+_GO2_OBSTACLE_BEST_EFFORT_ERROR_CODES = {3102, 3104}
 
 
 _POINT_FIELD_DTYPE_MAP = {
@@ -446,6 +448,10 @@ class Go2DataPlaneRuntime:
         self._official_robot_state_ready = False
         self._official_obstacles_avoid_ready = False
         self._official_obstacles_avoid_switch_state: Optional[bool] = None
+        self._official_obstacles_avoid_switch_state_last_attempt_at: Optional[float] = None
+        self._official_obstacles_avoid_switch_state_observed_at: Optional[float] = None
+        self._official_obstacles_avoid_switch_state_error: Optional[str] = None
+        self._official_obstacles_avoid_switch_state_error_code: Optional[int] = None
         self._official_obstacles_avoid_remote_control = False
         self._obstacle_avoidance_enabled = bool(self.config.official.obstacle_avoidance_default_enabled)
         self._official_service_states: Dict[str, Dict[str, object]] = {}
@@ -542,17 +548,22 @@ class Go2DataPlaneRuntime:
 
     def get_obstacle_avoidance_status(self) -> Dict[str, Any]:
         backend_ready = self.is_obstacle_avoidance_control_available()
-        switch_enabled = bool(self._official_obstacles_avoid_switch_state) if self._official_obstacles_avoid_switch_state is not None else False
         if backend_ready:
-            try:
-                switch_enabled = self._read_obstacle_avoidance_switch_state()
-            except Exception as exc:
-                LOGGER.warning("读取官方避障开关状态失败: %s", exc)
+            self._refresh_obstacle_avoidance_switch_state_for_status()
+        switch_enabled = (
+            bool(self._official_obstacles_avoid_switch_state)
+            if self._official_obstacles_avoid_switch_state is not None
+            else False
+        )
         return {
             "obstacle_avoidance_enabled": self._obstacle_avoidance_enabled,
             "default_enabled": bool(getattr(getattr(self.config, "official", None), "obstacle_avoidance_default_enabled", True)),
             "backend_ready": backend_ready,
             "switch_enabled": switch_enabled,
+            "switch_state_cached": self._official_obstacles_avoid_switch_state is not None,
+            "switch_state_observed": self._official_obstacles_avoid_switch_state_observed_at is not None,
+            "switch_state_error": self._official_obstacles_avoid_switch_state_error,
+            "switch_state_error_code": self._official_obstacles_avoid_switch_state_error_code,
             "remote_command_enabled": self._official_obstacles_avoid_remote_control,
             "control_path": "obstacles_avoid" if backend_ready and self._obstacle_avoidance_enabled else "sport",
         }
@@ -720,16 +731,73 @@ class Go2DataPlaneRuntime:
 
     def _read_obstacle_avoidance_switch_state(self) -> bool:
         client = self._require_obstacle_avoidance_client()
+        now = time.monotonic()
+        self._official_obstacles_avoid_switch_state_last_attempt_at = now
         code, enabled = client.SwitchGet()
         if code != 0:
+            self._remember_obstacle_avoidance_switch_state_error(
+                f"读取 Go2 官方 obstacles_avoid 状态失败 code={code}",
+                code=code,
+            )
             raise RuntimeError(f"读取 Go2 官方 obstacles_avoid 状态失败 code={code}")
         self._official_obstacles_avoid_switch_state = bool(enabled)
+        self._official_obstacles_avoid_switch_state_observed_at = now
+        self._official_obstacles_avoid_switch_state_error = None
+        self._official_obstacles_avoid_switch_state_error_code = None
         return bool(enabled)
+
+    def _refresh_obstacle_avoidance_switch_state_for_status(self) -> None:
+        now = time.monotonic()
+        last_attempt_at = self._official_obstacles_avoid_switch_state_last_attempt_at
+        if (
+            last_attempt_at is not None
+            and now - last_attempt_at < _GO2_OBSTACLE_STATUS_REFRESH_INTERVAL_SEC
+        ):
+            return
+        try:
+            self._read_obstacle_avoidance_switch_state()
+        except Exception as exc:
+            if self._official_obstacles_avoid_switch_state_error != str(exc):
+                self._remember_obstacle_avoidance_switch_state_error(
+                    str(exc),
+                    code=self._extract_obstacle_avoidance_error_code(exc),
+                )
+            if self._is_obstacle_avoidance_best_effort_error(exc):
+                self._info_log_limiter.log(
+                    LOGGER,
+                    logging.INFO,
+                    "读取 Go2 官方避障开关状态暂不可用，沿用缓存状态",
+                    key=("go2_obstacles_avoid_status_read_best_effort", str(exc)),
+                    interval_sec=_GO2_INFO_LOG_RATE_LIMIT_SEC,
+                    extra={
+                        "event": "go2.obstacles_avoid.status_read_best_effort",
+                        "error": str(exc),
+                        "error_code": self._official_obstacles_avoid_switch_state_error_code,
+                    },
+                )
+                return
+            self._info_log_limiter.log(
+                LOGGER,
+                logging.WARNING,
+                "读取官方避障开关状态失败: %s",
+                exc,
+                key=("go2_obstacles_avoid_status_read_error", str(exc)),
+                interval_sec=_GO2_INFO_LOG_RATE_LIMIT_SEC,
+                extra={
+                    "event": "go2.obstacles_avoid.status_read_error",
+                    "error": str(exc),
+                    "error_code": self._official_obstacles_avoid_switch_state_error_code,
+                },
+            )
 
     def _set_obstacle_avoidance_switch(self, enabled: bool) -> bool:
         client = self._require_obstacle_avoidance_client()
         code = client.SwitchSet(bool(enabled))
         if code != 0:
+            self._remember_obstacle_avoidance_switch_state_error(
+                f"切换 Go2 官方 obstacles_avoid 开关失败 code={code}",
+                code=code,
+            )
             raise RuntimeError(f"切换 Go2 官方 obstacles_avoid 开关失败 code={code}")
         try:
             return self._read_obstacle_avoidance_switch_state()
@@ -778,8 +846,34 @@ class Go2DataPlaneRuntime:
             return False
 
     def _is_obstacle_avoidance_best_effort_error(self, error: Exception) -> bool:
+        code = self._extract_obstacle_avoidance_error_code(error)
+        return code in _GO2_OBSTACLE_BEST_EFFORT_ERROR_CODES
+
+    def _extract_obstacle_avoidance_error_code(self, error: Exception) -> Optional[int]:
         message = str(error)
-        return "code=3102" in message or "code=3104" in message
+        marker = "code="
+        if marker not in message:
+            return None
+        tail = message.split(marker, 1)[1].strip()
+        digits = []
+        for char in tail:
+            if char.isdigit() or (char == "-" and not digits):
+                digits.append(char)
+                continue
+            break
+        if not digits:
+            return None
+        try:
+            return int("".join(digits))
+        except ValueError:
+            return None
+
+    def _remember_obstacle_avoidance_switch_state_error(self, message: str, *, code: object = None) -> None:
+        self._official_obstacles_avoid_switch_state_error = str(message)
+        try:
+            self._official_obstacles_avoid_switch_state_error_code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            self._official_obstacles_avoid_switch_state_error_code = None
 
     def _release_obstacle_avoidance_remote_command(self) -> None:
         if not self._official_obstacles_avoid_remote_control:

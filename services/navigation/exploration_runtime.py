@@ -1,6 +1,7 @@
 """平台探索编排运行时。"""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -10,7 +11,7 @@ from contracts.base import utc_now
 from contracts.geometry import Pose
 from contracts.navigation import ExplorationState as ContractExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal
 from contracts.runtime_views import ExplorationContext
-from services.navigation.config import ExplorationConfig
+from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.frontier import FrontierCandidate, FrontierExplorer
 from services.navigation.runtime import GridNavigationPlanner
 
@@ -70,6 +71,9 @@ class ExplorationRuntimeState:
     end_time: Optional[datetime] = None
     last_error: Optional[str] = None
     hit_stop_trigger: Optional[str] = None
+    stop_reason: Optional[str] = None
+    stop_condition: Optional[str] = None
+    stop_condition_detail: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -125,6 +129,7 @@ class PlatformExplorationRuntime:
                 "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
                 "radius_m": request.radius_m,
                 "target_name": request.target_name,
+                "max_duration_sec": request.max_duration_sec,
                 "stop_conditions": dict(request.stop_conditions),
                 **dict(request.metadata),
             },
@@ -142,12 +147,13 @@ class PlatformExplorationRuntime:
 
         if self._current_state is None:
             return False
-        if self._current_state.phase not in {
-            ExplorationRuntimePhase.SUCCEEDED,
-            ExplorationRuntimePhase.FAILED,
-            ExplorationRuntimePhase.CANCELLED,
-            ExplorationRuntimePhase.HIT_STOP,
-        }:
+        if not self._is_terminal_phase(self._current_state.phase):
+            self._record_stop(
+                self._current_state,
+                reason="cancelled",
+                condition="manual_cancel",
+                detail={"cancelled_at": utc_now().isoformat()},
+            )
             self._finish(self._current_state, phase=ExplorationRuntimePhase.CANCELLED)
         else:
             self._stop_frontier_runtime()
@@ -177,6 +183,8 @@ class PlatformExplorationRuntime:
         state = self._current_state
         self._apply_runtime_metadata(state, runtime_metadata)
         state.waiting_for = None
+        if self._check_stop_conditions(state):
+            return state
         if state.phase == ExplorationRuntimePhase.PLANNING:
             self._handle_planning_state(state, current_pose, occupancy_grid, cost_map)
         elif state.phase == ExplorationRuntimePhase.MOVING_TO_FRONTIER:
@@ -191,6 +199,8 @@ class PlatformExplorationRuntime:
         }:
             self._running = False
             self._stop_frontier_runtime()
+        if not self._is_terminal_phase(state.phase):
+            self._check_stop_conditions(state)
         return state
 
     def get_exploration_state(self) -> ContractExplorationState:
@@ -204,6 +214,37 @@ class PlatformExplorationRuntime:
         total_attempts = state.completed_frontiers + len(state.rejected_frontiers)
         if total_attempts > 0:
             covered_ratio = float(state.completed_frontiers) / float(total_attempts)
+        metadata = {
+            **dict(state.metadata),
+            "runtime_phase": state.phase.value,
+            "frontiers_visited": len(state.visited_frontiers),
+            "frontiers_rejected": len(state.rejected_frontiers),
+            "completed_frontiers": state.completed_frontiers,
+            "latest_frontiers": [self._frontier_candidate_to_metadata(item) for item in state.latest_frontiers],
+            "current_frontier": (
+                self._frontier_candidate_to_metadata(state.current_target.frontier, target=state.current_target)
+                if state.current_target is not None
+                else None
+            ),
+            "known_cells": state.known_cells,
+            "no_gain_rounds": state.no_gain_rounds,
+            "waiting_for": state.waiting_for,
+            "failure_code": state.failure_code,
+            "frontier_freshness": dict(state.frontier_freshness),
+            "map_revision": state.map_revision,
+            "costmap_revision": state.costmap_revision,
+            "pose_revision": state.pose_revision,
+            "hit_stop_trigger": state.hit_stop_trigger,
+            "stop_reason": state.stop_reason,
+            "stop_condition": state.stop_condition,
+            "stop_condition_detail": dict(state.stop_condition_detail),
+            "elapsed_time_sec": self._elapsed_time_sec(state),
+            "current_target_goal_id": (
+                state.current_target.navigation_goal.goal_id if state.current_target is not None else None
+            ),
+            "start_time": state.start_time.isoformat(),
+            "end_time": state.end_time.isoformat() if state.end_time is not None else None,
+        }
         return ContractExplorationState(
             current_request_id=state.request_id,
             status=self._map_runtime_phase_to_status(state.phase),
@@ -211,33 +252,7 @@ class PlatformExplorationRuntime:
             covered_ratio=covered_ratio,
             frontier_count=state.last_frontier_count,
             message=self._build_status_message(state),
-            metadata={
-                "runtime_phase": state.phase.value,
-                "frontiers_visited": len(state.visited_frontiers),
-                "frontiers_rejected": len(state.rejected_frontiers),
-                "completed_frontiers": state.completed_frontiers,
-                "latest_frontiers": [self._frontier_candidate_to_metadata(item) for item in state.latest_frontiers],
-                "current_frontier": (
-                    self._frontier_candidate_to_metadata(state.current_target.frontier, target=state.current_target)
-                    if state.current_target is not None
-                    else None
-                ),
-                "known_cells": state.known_cells,
-                "no_gain_rounds": state.no_gain_rounds,
-                "waiting_for": state.waiting_for,
-                "failure_code": state.failure_code,
-                "frontier_freshness": dict(state.frontier_freshness),
-                "map_revision": state.map_revision,
-                "costmap_revision": state.costmap_revision,
-                "pose_revision": state.pose_revision,
-                "hit_stop_trigger": state.hit_stop_trigger,
-                "current_target_goal_id": (
-                    state.current_target.navigation_goal.goal_id if state.current_target is not None else None
-                ),
-                "start_time": state.start_time.isoformat(),
-                "end_time": state.end_time.isoformat() if state.end_time is not None else None,
-                **dict(state.metadata),
-            },
+            metadata=metadata,
         )
 
     def get_exploration_context(self) -> ExplorationContext:
@@ -259,6 +274,12 @@ class PlatformExplorationRuntime:
         if self._current_state is None:
             return
         self._current_state.hit_stop_trigger = str(reason or "").strip() or "external_report"
+        self._record_stop(
+            self._current_state,
+            reason="hit_stop",
+            condition="hit_stop",
+            detail={"trigger": self._current_state.hit_stop_trigger},
+        )
         self._finish(self._current_state, phase=ExplorationRuntimePhase.HIT_STOP)
 
     def block_on_prerequisite(
@@ -388,6 +409,8 @@ class PlatformExplorationRuntime:
         state.last_error = None
         state.failure_code = None
         state.known_cells = self._count_known_cells(occupancy_grid)
+        if self._check_stop_conditions(state):
+            return
 
         if not frontiers:
             state.waiting_for = "frontier"
@@ -478,7 +501,18 @@ class PlatformExplorationRuntime:
 
         if self._check_hit_stop(state):
             return
+        if self._check_stop_conditions(state):
+            return
         if state.no_gain_rounds >= int(self._config.frontier_max_no_gain_rounds):
+            self._record_stop(
+                state,
+                reason="stop_condition",
+                condition="frontier_max_no_gain_rounds",
+                detail={
+                    "no_gain_rounds": state.no_gain_rounds,
+                    "threshold": int(self._config.frontier_max_no_gain_rounds),
+                },
+            )
             self._finish(state, phase=ExplorationRuntimePhase.SUCCEEDED)
             return
 
@@ -490,9 +524,120 @@ class PlatformExplorationRuntime:
 
         return state.phase == ExplorationRuntimePhase.HIT_STOP
 
+    def _check_stop_conditions(self, state: ExplorationRuntimeState) -> bool:
+        """检查请求级停止条件，达成后以成功终态结束探索。"""
+
+        if self._is_terminal_phase(state.phase):
+            return True
+        duration_limit = self._max_duration_limit_sec(state)
+        if duration_limit is not None:
+            elapsed_time_sec = self._elapsed_time_sec(state)
+            if elapsed_time_sec >= duration_limit:
+                return self._finish_stop_condition(
+                    state,
+                    condition="max_duration_sec",
+                    detail={
+                        "elapsed_time_sec": elapsed_time_sec,
+                        "limit_sec": duration_limit,
+                    },
+                )
+
+        stop_conditions = dict(state.request.stop_conditions or {})
+        max_completed_frontiers = self._numeric_stop_condition(stop_conditions, "max_completed_frontiers")
+        if max_completed_frontiers is not None and max_completed_frontiers > 0:
+            if float(state.completed_frontiers) >= max_completed_frontiers:
+                return self._finish_stop_condition(
+                    state,
+                    condition="max_completed_frontiers",
+                    detail={
+                        "completed_frontiers": state.completed_frontiers,
+                        "threshold": max_completed_frontiers,
+                    },
+                )
+
+        min_known_cells = self._numeric_stop_condition(stop_conditions, "min_known_cells")
+        if min_known_cells is not None and min_known_cells > 0:
+            if float(state.known_cells) >= min_known_cells:
+                return self._finish_stop_condition(
+                    state,
+                    condition="min_known_cells",
+                    detail={
+                        "known_cells": state.known_cells,
+                        "threshold": min_known_cells,
+                    },
+                )
+
+        max_no_gain_rounds = self._numeric_stop_condition(stop_conditions, "max_no_gain_rounds")
+        if max_no_gain_rounds is not None and max_no_gain_rounds > 0:
+            if float(state.no_gain_rounds) >= max_no_gain_rounds:
+                return self._finish_stop_condition(
+                    state,
+                    condition="max_no_gain_rounds",
+                    detail={
+                        "no_gain_rounds": state.no_gain_rounds,
+                        "threshold": max_no_gain_rounds,
+                    },
+                )
+
+        min_covered_ratio = self._numeric_stop_condition(stop_conditions, "min_covered_ratio")
+        covered_ratio = self._covered_ratio(state)
+        if min_covered_ratio is not None and 0.0 < min_covered_ratio <= 1.0 and covered_ratio is not None:
+            if covered_ratio >= min_covered_ratio:
+                return self._finish_stop_condition(
+                    state,
+                    condition="min_covered_ratio",
+                    detail={
+                        "covered_ratio": covered_ratio,
+                        "threshold": min_covered_ratio,
+                    },
+                )
+        return False
+
+    def _finish_stop_condition(
+        self,
+        state: ExplorationRuntimeState,
+        *,
+        condition: str,
+        detail: Dict[str, Any],
+    ) -> bool:
+        self._record_stop(
+            state,
+            reason="stop_condition",
+            condition=condition,
+            detail=detail,
+        )
+        self._finish(state, phase=ExplorationRuntimePhase.SUCCEEDED)
+        return True
+
+    def _record_stop(
+        self,
+        state: ExplorationRuntimeState,
+        *,
+        reason: str,
+        condition: str,
+        detail: Dict[str, Any],
+    ) -> None:
+        state.stop_reason = str(reason or "").strip() or None
+        state.stop_condition = str(condition or "").strip() or None
+        state.stop_condition_detail = dict(detail or {})
+        state.metadata.update(
+            {
+                "stop_reason": state.stop_reason,
+                "stop_condition": state.stop_condition,
+                "stop_condition_detail": dict(state.stop_condition_detail),
+            }
+        )
+
     def _finish(self, state: ExplorationRuntimeState, *, phase: ExplorationRuntimePhase) -> None:
         state.phase = phase
         state.end_time = utc_now()
+        if phase == ExplorationRuntimePhase.FAILED and state.stop_reason is None:
+            self._record_stop(
+                state,
+                reason="failed",
+                condition=state.failure_code or "exploration_failed",
+                detail={"message": state.last_error},
+            )
         self._running = False
         self._stop_frontier_runtime()
 
@@ -600,6 +745,8 @@ class PlatformExplorationRuntime:
         if state.phase == ExplorationRuntimePhase.HIT_STOP:
             return "探索命中停机：%s。" % (state.hit_stop_trigger or "已满足停止条件")
         if state.phase == ExplorationRuntimePhase.SUCCEEDED:
+            if state.stop_reason == "stop_condition" and state.stop_condition:
+                return "探索停止条件已达成：%s。" % self._stop_condition_label(state.stop_condition)
             return "探索完成，共访问 %d 个 frontier。" % len(state.visited_frontiers)
         if state.phase == ExplorationRuntimePhase.FAILED:
             return "探索失败：%s。" % (state.last_error or "未知错误")
@@ -621,6 +768,60 @@ class PlatformExplorationRuntime:
         return status_map.get(phase, ExplorationStatus.IDLE)
 
     @staticmethod
+    def _is_terminal_phase(phase: ExplorationRuntimePhase) -> bool:
+        return phase in {
+            ExplorationRuntimePhase.HIT_STOP,
+            ExplorationRuntimePhase.SUCCEEDED,
+            ExplorationRuntimePhase.FAILED,
+            ExplorationRuntimePhase.CANCELLED,
+        }
+
+    def _max_duration_limit_sec(self, state: ExplorationRuntimeState) -> Optional[float]:
+        limits: List[float] = []
+        if state.request.max_duration_sec is not None:
+            limits.append(float(state.request.max_duration_sec))
+        condition_limit = self._numeric_stop_condition(dict(state.request.stop_conditions or {}), "max_duration_sec")
+        if condition_limit is not None and condition_limit > 0.0:
+            limits.append(condition_limit)
+        if not limits:
+            return None
+        return min(limits)
+
+    @staticmethod
+    def _numeric_stop_condition(stop_conditions: Dict[str, Any], key: str) -> Optional[float]:
+        if key not in stop_conditions:
+            return None
+        value = stop_conditions.get(key)
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        return number
+
+    @staticmethod
+    def _covered_ratio(state: ExplorationRuntimeState) -> Optional[float]:
+        total_attempts = state.completed_frontiers + len(state.rejected_frontiers)
+        if total_attempts <= 0:
+            return None
+        return float(state.completed_frontiers) / float(total_attempts)
+
+    @staticmethod
+    def _stop_condition_label(condition: str) -> str:
+        labels = {
+            "max_duration_sec": "最大探索时长",
+            "max_completed_frontiers": "最大 frontier 完成数",
+            "min_covered_ratio": "最小覆盖比例",
+            "max_no_gain_rounds": "最大无增益轮数",
+            "min_known_cells": "最小已知栅格数",
+            "frontier_max_no_gain_rounds": "frontier 无增益上限",
+        }
+        return labels.get(condition, condition)
+
+    @staticmethod
     def _elapsed_time_sec(state: Optional[ExplorationRuntimeState]) -> float:
         if state is None:
             return 0.0
@@ -639,7 +840,7 @@ def create_platform_exploration_runtime(
     resolved_config = config or ExplorationConfig(enabled=True)
     return PlatformExplorationRuntime(
         frontier_explorer=frontier_explorer or FrontierExplorer(resolved_config),
-        navigation_planner=navigation_planner or GridNavigationPlanner(),
+        navigation_planner=navigation_planner or GridNavigationPlanner(NavigationBackendConfig()),
         config=resolved_config,
     )
 

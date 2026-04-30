@@ -50,6 +50,8 @@ class LocalizationService:
         # 平台定位状态机
         self._state_machine: LocalizationStateMachine = state_machine or create_localization_state_machine()
         self._last_diagnostics: Optional[LocalizationDiagnostics] = None
+        self._localization_update_subscription_id: Optional[object] = None
+        self._subscribe_provider_localization_updates()
 
     def refresh(self) -> LocalizationSnapshot:
         """从本地定位提供器刷新定位快照。"""
@@ -62,6 +64,44 @@ class LocalizationService:
             frame_tree=frame_tree,
             metadata={"source_kind": "provider", "provider_version": provider.provider_version},
         )
+
+    def _subscribe_provider_localization_updates(self) -> None:
+        subscription = getattr(self._provider_owner, "subscribe_localization_updates", None)
+        if callable(subscription):
+            self._localization_update_subscription_id = subscription(self._handle_provider_localization_update)
+            if self._localization_update_subscription_id is not None:
+                return
+        providers = getattr(self._provider_owner, "providers", None)
+        subscription = getattr(providers, "subscribe_localization", None)
+        if callable(subscription):
+            self._localization_update_subscription_id = subscription(self._handle_provider_localization_update)
+
+    def has_provider_stream_subscription(self) -> bool:
+        """返回定位服务是否已接入 provider 原生流。"""
+
+        return self._localization_update_subscription_id is not None
+
+    def _handle_provider_localization_update(
+        self,
+        current_pose,
+        frame_tree=None,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> Optional[LocalizationSnapshot]:
+        update_metadata = dict(metadata or {})
+        source_name = str(
+            update_metadata.get("source_name")
+            or update_metadata.get("provider_name")
+            or "platform_localization_provider"
+        )
+        try:
+            return self.ingest_external_snapshot(
+                source_name=source_name,
+                current_pose=current_pose,
+                frame_tree=frame_tree,
+                metadata=update_metadata,
+            )
+        except Exception:
+            return None
 
     def ensure_active_session(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
 
 import scripts.bootstrap as bootstrap_module
@@ -174,8 +175,55 @@ def test_geometry_defaults_install_rtabmap_nav2_dependencies() -> None:
     assert planner.build_geometry is True
     assert planner.install_geometry_deps is True
     assert planner.repair_ros2_apt_source is True
+    assert planner.root_overrides()["NUWAX_NAV2_MODE"] == "sidecar"
     assert "install_geometry_deps: true" in planner.summary()
     assert "repair_ros2_apt_source: true" in planner.summary()
+
+
+def test_default_runtime_config_enables_managed_geometry_chain() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    settings_source = (repo_root / "settings.py").read_text(encoding="utf-8")
+    geometry_contract_source = (repo_root / "contracts" / "geometry_runtime.py").read_text(encoding="utf-8")
+
+    assert 'enabled=_cfg_bool("NUWAX_GEOMETRY_ENABLED", True)' in settings_source
+    assert 'require_ros2=_cfg_bool("NUWAX_GEOMETRY_REQUIRE_ROS2", True)' in settings_source
+    assert 'mode=_cfg_str("NUWAX_NAV2_MODE", "sidecar")' in settings_source
+    assert "enabled: bool = True" in geometry_contract_source
+    assert "require_ros2: bool = True" in geometry_contract_source
+    assert 'mode: str = "sidecar"' in geometry_contract_source
+
+
+def test_deployment_docs_keep_geometry_odom_on_controlled_topic() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deployment_doc = (repo_root / "部署文档.md").read_text(encoding="utf-8")
+
+    assert "NUWAX_GEOMETRY_ODOM_TOPIC=/nuwax/geometry/odom" in deployment_doc
+    assert "odom_topic:=/nuwax/geometry/odom" in deployment_doc
+    assert "NUWAX_GEOMETRY_ODOM_TOPIC=/utlidar/robot_odom" not in deployment_doc
+    assert "odom_topic:=/utlidar/robot_odom" not in deployment_doc
+
+
+def test_no_geometry_bootstrap_disables_nav2_mode() -> None:
+    planner = _build_planner(
+        "apply",
+        "--robot",
+        "customrobot",
+        "--tier",
+        "lite",
+        "--no-geometry",
+        "--memory-mode",
+        "disabled",
+        "--perception-mode",
+        "disabled",
+        "--mcp-mode",
+        "skip",
+    )
+
+    overrides = planner.root_overrides()
+
+    assert overrides["NUWAX_GEOMETRY_ENABLED"] == "false"
+    assert overrides["NUWAX_GEOMETRY_REQUIRE_ROS2"] == "false"
+    assert overrides["NUWAX_NAV2_MODE"] == "disabled"
 
 
 def test_build_geometry_apt_packages_uses_ros_distro_prefix() -> None:

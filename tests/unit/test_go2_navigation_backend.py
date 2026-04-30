@@ -4,12 +4,11 @@ import math
 
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import CostMap, OccupancyGrid
-from contracts.navigation import NavigationGoal, NavigationStatus
-from services.navigation.config import ExplorationConfig, NavigationBackendConfig, NavigationControlConfig
+from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.frontier import FrontierExplorer
-from typing import Optional, Set, Tuple
+from typing import Set, Tuple
 
-from services.navigation.runtime import GridNavigationPlanner, NavigationSession
+from services.navigation.runtime import GridNavigationPlanner
 
 
 class _StaticBridge:
@@ -165,33 +164,6 @@ def _build_partial_maps(
     )
 
 
-def _build_session(
-    *,
-    goal_pose: Pose,
-    planner_config: Optional[NavigationBackendConfig] = None,
-    control_config: Optional[NavigationControlConfig] = None,
-) -> NavigationSession:
-    planner_cfg = planner_config or NavigationBackendConfig(
-        planner_inflation_radius_m=0.0,
-        replan_interval_sec=60.0,
-        replan_cooldown_sec=0.0,
-        max_replan_failures=4,
-    )
-    control_cfg = control_config or NavigationControlConfig(
-        goal_tolerance_m=0.25,
-        goal_yaw_tolerance_rad=0.25,
-        max_linear_velocity_mps=0.35,
-        max_yaw_rate_rps=0.8,
-    )
-    planner = GridNavigationPlanner(planner_cfg)
-    return NavigationSession(
-        goal=NavigationGoal(goal_id="test_goal", target_pose=goal_pose),
-        planner=planner,
-        planner_config=planner_cfg,
-        control_config=control_cfg,
-    )
-
-
 def test_grid_planner_can_route_around_blocking_wall() -> None:
     blocked_cells = {(row, 8) for row in range(20) if row != 10}
     occupancy, cost_map = _build_maps(
@@ -251,89 +223,6 @@ def test_grid_planner_accepts_scoped_odom_alias() -> None:
 
     assert plan is not None
     assert plan.frame_id == "odom"
-
-
-def test_navigation_session_replans_when_path_is_blocked_ahead() -> None:
-    session = _build_session(goal_pose=_build_pose(x=6.0, y=1.0))
-    free_occupancy, free_cost_map = _build_maps(
-        width=20,
-        height=20,
-        resolution_m=0.5,
-        origin_x=0.0,
-        origin_y=0.0,
-        blocked_cells=set(),
-    )
-
-    first_tick = session.tick(
-        current_pose=_build_pose(x=1.0, y=1.0),
-        occupancy_grid=free_occupancy,
-        cost_map=free_cost_map,
-        now_monotonic=0.0,
-    )
-
-    assert first_tick.status == NavigationStatus.RUNNING
-    assert first_tick.metadata["controller_mode"] == "planned_path_follow"
-    assert first_tick.metadata["plan_version"] == 1
-
-    blocked_occupancy, blocked_cost_map = _build_maps(
-        width=20,
-        height=20,
-        resolution_m=0.5,
-        origin_x=0.0,
-        origin_y=0.0,
-        blocked_cells={(2, 5), (2, 6), (2, 7)},
-    )
-    second_tick = session.tick(
-        current_pose=_build_pose(x=1.5, y=1.0),
-        occupancy_grid=blocked_occupancy,
-        cost_map=blocked_cost_map,
-        now_monotonic=2.0,
-    )
-
-    assert second_tick.status == NavigationStatus.RUNNING
-    assert second_tick.metadata["controller_mode"] == "planned_path_follow"
-    assert second_tick.metadata["plan_version"] == 2
-    assert second_tick.metadata["replan_reason"] == "obstacle_ahead"
-
-
-def test_navigation_session_falls_back_to_direct_control_without_map() -> None:
-    session = _build_session(goal_pose=_build_pose(x=2.0, y=0.0))
-
-    tick = session.tick(
-        current_pose=_build_pose(x=0.0, y=0.0),
-        occupancy_grid=None,
-        cost_map=None,
-        now_monotonic=0.0,
-    )
-
-    assert tick.status == NavigationStatus.RUNNING
-    assert tick.metadata["controller_mode"] == "direct_fallback"
-    assert tick.linear_x_mps > 0.0
-
-
-def test_navigation_session_uses_local_horizon_when_goal_is_outside_map() -> None:
-    session = _build_session(goal_pose=_build_pose(x=10.0, y=2.5))
-    occupancy, cost_map = _build_maps(
-        width=10,
-        height=10,
-        resolution_m=0.5,
-        origin_x=0.0,
-        origin_y=0.0,
-        blocked_cells=set(),
-    )
-
-    tick = session.tick(
-        current_pose=_build_pose(x=2.5, y=2.5),
-        occupancy_grid=occupancy,
-        cost_map=cost_map,
-        now_monotonic=0.0,
-    )
-
-    assert tick.status == NavigationStatus.RUNNING
-    assert tick.metadata["controller_mode"] == "planned_path_follow"
-    assert tick.metadata["planning_mode"] == "local_horizon"
-
-
 
 def test_frontier_explorer_prefers_reachable_frontier_cluster() -> None:
     planner = GridNavigationPlanner(

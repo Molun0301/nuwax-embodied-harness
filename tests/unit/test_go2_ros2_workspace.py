@@ -354,6 +354,20 @@ def test_geometry_runtime_shell_scripts_pass_bash_syntax_check() -> None:
         subprocess.run(["bash", "-n", str(script)], check=True)
 
 
+def test_geometry_startup_defaults_form_managed_nav2_chain() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    start_gateway_source = (repo_root / "scripts" / "start_gateway.sh").read_text(encoding="utf-8")
+    sidecar_source = (repo_root / "services" / "geometry" / "start_rtabmap_sidecar.sh").read_text(encoding="utf-8")
+    env_example_source = (repo_root / ".env.example").read_text(encoding="utf-8")
+
+    assert 'NUWAX_GEOMETRY_ENABLED:-true' in start_gateway_source
+    assert 'NUWAX_GEOMETRY_REQUIRE_ROS2:-true' in start_gateway_source
+    assert 'NAV2_MODE="${NUWAX_NAV2_MODE:-sidecar}"' in sidecar_source
+    assert "NUWAX_GEOMETRY_ENABLED=true" in env_example_source
+    assert "NUWAX_GEOMETRY_REQUIRE_ROS2=true" in env_example_source
+    assert "NUWAX_NAV2_MODE=sidecar" in env_example_source
+
+
 def test_odom_tf_bridge_uses_configured_parent_frame() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     bridge_source = (repo_root / "services" / "geometry" / "odom_tf_bridge.py").read_text(encoding="utf-8")
@@ -376,7 +390,8 @@ def test_platform_geometry_publishes_controlled_odom_topic() -> None:
     assert 'self.topic = str(config.topics.odom_topic or "/nuwax/geometry/odom")' in odom_publisher_source
     assert "message.header.frame_id = self.odom_frame" in odom_publisher_source
     assert "message.child_frame_id = self.base_frame" in odom_publisher_source
-    assert "Ros2OdometryPublisher(config, self._resolve_localization_backend)" in runtime_source
+    assert "Ros2OdometryPublisher(config, self._resolve_raw_localization_backend)" in runtime_source
+    assert "self._tf_localization_provider = Ros2TfLocalizationProvider(config)" in runtime_source
 
 
 def test_go2_data_plane_runtime_proxies_device_observations() -> None:

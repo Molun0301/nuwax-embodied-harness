@@ -295,6 +295,9 @@ class MapWorkspaceService:
                 "rtabmap_session_id": snapshot.metadata.get("rtabmap_session_id") or snapshot.metadata.get("session_id"),
                 "rtabmap_run_id": snapshot.metadata.get("rtabmap_run_id") or snapshot.metadata.get("run_id"),
                 "rtabmap_database_path": snapshot.metadata.get("rtabmap_database_path") or snapshot.metadata.get("rtabmap_db_path"),
+                "update_sequence": snapshot.metadata.get("update_sequence"),
+                "content_revision": snapshot.metadata.get("content_revision"),
+                "seed_map_version_id": snapshot.metadata.get("seed_map_version_id"),
                 **dict(metadata or {}),
             },
         )
@@ -690,15 +693,31 @@ class MapWorkspaceService:
                 self._geometry_runtime.prepare_map_version_assets(prepared_version)
             )
         runtime_snapshot = self._geometry_runtime.activate_map_version(prepared_version)
-        self._mapping_service.ingest_external_snapshot(
-            source_name=runtime_snapshot.source_name,
-            occupancy_grid=runtime_snapshot.occupancy_grid,
-            cost_map=runtime_snapshot.cost_map,
-            semantic_map=runtime_snapshot.semantic_map,
-            metadata=runtime_snapshot.metadata,
-            version_id_override=prepared_version.version_id,
-            revision_override=prepared_version.revision,
+        runtime_metadata = dict(runtime_snapshot.metadata or {})
+        live_streaming_snapshot = bool(
+            runtime_metadata.get("map_snapshot_kind") == "live_streaming"
+            or runtime_metadata.get("source_kind") == "platform_live_map_provider"
+            or runtime_metadata.get("live_streaming_ready")
+            or runtime_metadata.get("rtabmap_live_streaming_ready")
         )
+        ingest_kwargs = {
+            "source_name": runtime_snapshot.source_name,
+            "occupancy_grid": runtime_snapshot.occupancy_grid,
+            "cost_map": runtime_snapshot.cost_map,
+            "semantic_map": runtime_snapshot.semantic_map,
+            "metadata": {
+                **runtime_metadata,
+                "seed_map_name": prepared_version.map_name,
+                "seed_map_version_id": prepared_version.version_id,
+                "seed_map_version_revision": prepared_version.revision,
+                "loaded_as_seed": True,
+                "continues_live_updates": True,
+            },
+        }
+        if not live_streaming_snapshot:
+            ingest_kwargs["version_id_override"] = prepared_version.version_id
+            ingest_kwargs["revision_override"] = prepared_version.revision
+        self._mapping_service.ingest_external_snapshot(**ingest_kwargs)
         self._localization_service.clear_latest_snapshot()
 
     def _require_map_version(self, map_name: str, version_id: str) -> MapVersion:

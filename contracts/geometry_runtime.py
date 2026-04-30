@@ -139,7 +139,7 @@ class RtabmapConfig:
 class Nav2Config:
     """Nav2 侧车配置。"""
 
-    mode: str = "external"
+    mode: str = "sidecar"
     action_name: str = "/navigate_to_pose"
     launch_package: str = "nav2_bringup"
     launch_file: str = "navigation_launch.py"
@@ -156,9 +156,9 @@ class Nav2Config:
 class PlatformGeometryConfig:
     """平台几何引擎统一配置。"""
 
-    enabled: bool = False
+    enabled: bool = True
     stack: str = "rtabmap_nav2"
-    require_ros2: bool = False
+    require_ros2: bool = True
     setup_script: str = field(default_factory=build_default_geometry_setup_script)
     cyclonedds_lib_dir: str = ""
     dds_iface: str = ""

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from adapters.helpers import build_pose
 from adapters.mapping.slam_occupancy_adapter import SlamOccupancyAdapter
@@ -46,6 +46,9 @@ class Ros2LiveMapProvider:
         self._latest_cost_map_received_at: Optional[datetime] = None
         self._occupancy_content_revision = 0
         self._cost_map_content_revision = 0
+        self._update_sequence = 0
+        self._map_update_subscribers: Dict[int, Callable[[Dict[str, object]], None]] = {}
+        self._next_map_update_subscription_id = 1
         self._last_occupancy_content_hash: Optional[str] = None
         self._last_cost_map_content_hash: Optional[str] = None
         self._last_occupancy_known_cell_count = 0
@@ -133,6 +136,17 @@ class Ros2LiveMapProvider:
     def get_semantic_map(self) -> Optional[SemanticMap]:
         return None
 
+    def subscribe_map_updates(self, callback: Callable[[Dict[str, object]], None]) -> int:
+        with self._lock:
+            subscription_id = self._next_map_update_subscription_id
+            self._next_map_update_subscription_id += 1
+            self._map_update_subscribers[subscription_id] = callback
+            return subscription_id
+
+    def unsubscribe_map_updates(self, subscription_id: int) -> bool:
+        with self._lock:
+            return self._map_update_subscribers.pop(subscription_id, None) is not None
+
     def activate_platform_map_version(self, **_: Any) -> Dict[str, object]:
         return {
             "backend_switch_applied": False,
@@ -155,6 +169,7 @@ class Ros2LiveMapProvider:
             cost_map_count = self._cost_map_message_count
             occupancy_revision = self._occupancy_content_revision
             cost_map_revision = self._cost_map_content_revision
+            update_sequence = self._update_sequence
             occupancy_received_at = self._latest_occupancy_received_at
             cost_map_received_at = self._latest_cost_map_received_at
             last_error = self._last_error
@@ -219,6 +234,7 @@ class Ros2LiveMapProvider:
             "message_count": occupancy_count,
             "occupancy_sequence": occupancy_count,
             "cost_map_sequence": cost_map_count,
+            "update_sequence": update_sequence,
             "occupancy_revision": occupancy_revision,
             "cost_map_revision": cost_map_revision,
             "occupancy_grid_ready": occupancy_grid is not None,
@@ -365,6 +381,9 @@ class Ros2LiveMapProvider:
             self._last_occupancy_content_hash = content_hash
             self._last_occupancy_known_cell_count = known_count
             self._last_error = None
+            payload = self._build_map_update_payload_locked(source_layer="occupancy")
+            subscribers = list(self._map_update_subscribers.items())
+        self._notify_map_update_subscribers(subscribers, payload)
 
     def _on_cost_map(self, message: Any) -> None:
         try:
@@ -407,6 +426,57 @@ class Ros2LiveMapProvider:
             self._last_cost_map_content_hash = content_hash
             self._last_cost_map_known_cell_count = known_count
             self._last_error = None
+            payload = self._build_map_update_payload_locked(source_layer="cost_map")
+            subscribers = list(self._map_update_subscribers.items())
+        self._notify_map_update_subscribers(subscribers, payload)
+
+    def _build_map_update_payload_locked(self, *, source_layer: str) -> Dict[str, object]:
+        self._update_sequence += 1
+        occupancy_grid = (
+            self._latest_occupancy_grid.model_copy(deep=True)
+            if self._latest_occupancy_grid is not None
+            else None
+        )
+        cost_map = self._latest_cost_map.model_copy(deep=True) if self._latest_cost_map is not None else None
+        occupancy_metrics = dict(self._latest_occupancy_metrics)
+        cost_map_metrics = dict(self._latest_cost_map_metrics)
+        metrics = occupancy_metrics if source_layer == "occupancy" else cost_map_metrics
+        occupancy_revision = self._occupancy_content_revision
+        cost_map_revision = self._cost_map_content_revision
+        return {
+            "source_name": self.provider_name,
+            "occupancy_grid": occupancy_grid,
+            "cost_map": cost_map,
+            "semantic_map": None,
+            "metadata": {
+                "source_kind": "platform_live_map_provider",
+                "map_snapshot_kind": "live_streaming",
+                "live_streaming_ready": True,
+                "rtabmap_live_streaming_ready": True,
+                "update_sequence": self._update_sequence,
+                "source_layer": source_layer,
+                "occupancy_sequence": self._occupancy_message_count,
+                "cost_map_sequence": self._cost_map_message_count,
+                "message_count": self._occupancy_message_count + self._cost_map_message_count,
+                "occupancy_content_revision": occupancy_revision,
+                "cost_map_content_revision": cost_map_revision,
+                "content_revision": max(occupancy_revision, cost_map_revision),
+                "occupancy_metrics": occupancy_metrics,
+                "cost_map_metrics": cost_map_metrics,
+                "metrics": metrics,
+            },
+        }
+
+    def _notify_map_update_subscribers(
+        self,
+        subscribers: List[tuple[int, Callable[[Dict[str, object]], None]]],
+        payload: Dict[str, object],
+    ) -> None:
+        for subscription_id, callback in subscribers:
+            try:
+                callback(payload)
+            except Exception:
+                LOGGER.debug("实时地图更新订阅回调失败 subscription_id=%s", subscription_id, exc_info=True)
 
     def _build_grid_metrics(self, data: List[int]) -> Dict[str, object]:
         unknown_count = 0

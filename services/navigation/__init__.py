@@ -1,6 +1,6 @@
 """导航服务导出。"""
 
-from services.navigation.config import ExplorationConfig, NavigationBackendConfig, NavigationControlConfig
+from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.exploration_runtime import (
     ExplorationRuntimePhase,
     ExplorationRuntimeState,
@@ -10,7 +10,7 @@ from services.navigation.exploration_runtime import (
 )
 from services.navigation.frontier import FrontierCandidate, FrontierExplorer
 from services.navigation.path_tools import PathSafetyResult, build_path_mask, evaluate_path_safety, resample_waypoints
-from services.navigation.runtime import GridNavigationPlanner, NavigationExecutionState, NavigationSession
+from services.navigation.runtime import GridNavigationPlanner
 from services.navigation.service import NavigationService
 from services.navigation.state_machine import (
     NavigationStateMachine,
@@ -28,11 +28,8 @@ __all__ = [
     "FrontierTarget",
     "GridNavigationPlanner",
     "NavigationBackendConfig",
-    "NavigationControlConfig",
     "NavigationDiagnostics",
-    "NavigationExecutionState",
     "NavigationService",
-    "NavigationSession",
     "NavigationStateMachine",
     "PathSafetyResult",
     "PlatformExplorationRuntime",

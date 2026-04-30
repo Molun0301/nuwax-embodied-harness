@@ -15,7 +15,7 @@ from contracts.navigation import NavigationStatus
 class NavigationStateMachine:
     """平台导航状态机。
 
-    管理 NavigationSession 生命周期，支持以下状态转换：
+    管理平台导航目标生命周期，支持以下状态转换：
     - IDLE -> ACCEPTED: 目标被接受
     - ACCEPTED -> PLANNING: 开始规划路径
     - PLANNING -> RUNNING: 开始执行

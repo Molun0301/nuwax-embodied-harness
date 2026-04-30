@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import asdict, is_dataclass
 import logging
 import math
+from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -37,7 +39,12 @@ from gateways.serialization import to_jsonable
 from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
-from services.geometry import PlatformGeometryRuntime
+from services.geometry import (
+    PlatformGeometryRuntime,
+    PointCloudMapCache,
+    PointCloudMapError,
+    UnsupportedPointCloudMapError,
+)
 from services.localization import LocalizationService
 from services.mapping import MappingService, MapWorkspaceService
 from services.memory import MemoryService
@@ -115,6 +122,18 @@ def _schema_object(
         "required": list(required),
         "additionalProperties": False,
     }
+
+
+def _exploration_stop_conditions_schema() -> Dict[str, object]:
+    return _schema_object(
+        {
+            "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
+            "max_completed_frontiers": {"type": "number", "exclusiveMinimum": 0.0},
+            "min_covered_ratio": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 1.0},
+            "max_no_gain_rounds": {"type": "number", "exclusiveMinimum": 0.0},
+            "min_known_cells": {"type": "number", "exclusiveMinimum": 0.0},
+        }
+    )
 
 
 def _descriptor(
@@ -346,7 +365,11 @@ class GatewayRuntime:
         self._event_log_subscription_id = self.event_bus.subscribe(self._log_runtime_event)
         self._robot_state_stream_subscription_id: Optional[int] = None
         self._localization_stream_subscription_id: Optional[int] = None
+        self._localization_stream_unsubscriber = None
         self._point_cloud_stream_subscription_id: Optional[int] = None
+        self._pointcloud_map_stream_subscription_id: Optional[str] = None
+        self._pointcloud_map_cache = PointCloudMapCache()
+        self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
         self._base_capability_matrix = robot.manifest.capability_matrix
         self._gateway_capability_names: Tuple[str, ...] = ()
 
@@ -383,6 +406,7 @@ class GatewayRuntime:
                 self.map_workspace_service.restore_active_workspace(load_memory_history=True)
             except Exception:
                 RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
+        self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
         self._refresh_dynamic_capability_matrix()
 
         self.event_bus.publish(
@@ -431,8 +455,8 @@ class GatewayRuntime:
             "mode": "stream_bus",
             "stream_bus": self.stream_bus.status(),
             "stream_endpoints": {
-                "sse": "/streams/sse?topics=map.frame,localization.pose,navigation.state,exploration.state",
-                "websocket": "/streams/ws?topics=map.frame,localization.pose,navigation.state,exploration.state",
+                "sse": "/streams/sse?topics=map.frame,localization.pose,navigation.state,exploration.state,pointcloud_map.meta",
+                "websocket": "/streams/ws?topics=map.frame,localization.pose,navigation.state,exploration.state,pointcloud_map.meta",
             },
         }
 
@@ -543,21 +567,41 @@ class GatewayRuntime:
     def _start_data_frame_stream_sources(self) -> None:
         self._publish_runtime_governance_stream_frame()
         self._publish_static_stream_capability_frames()
+        self._publish_pointcloud_map_stream_frame(reason="runtime_stream_start")
+        if self._pointcloud_map_stream_subscription_id is None:
+            self._pointcloud_map_stream_subscription_id = self.stream_bus.subscribe(
+                self._handle_map_frame_for_pointcloud_map_stream,
+                topics=("map.frame",),
+            )
         providers = getattr(self.robot, "providers", None)
 
         robot_state_subscriber = getattr(providers, "subscribe_robot_state", None)
         if callable(robot_state_subscriber) and self._robot_state_stream_subscription_id is None:
             self._robot_state_stream_subscription_id = robot_state_subscriber(self._publish_robot_state_stream_frame)
 
-        localization_subscriber = getattr(providers, "subscribe_localization", None)
-        if callable(localization_subscriber) and self._localization_stream_subscription_id is None:
-            self._localization_stream_subscription_id = localization_subscriber(self._publish_localization_stream_frame)
+        localization_stream_owned_by_service = False
+        has_provider_stream = getattr(self.localization_service, "has_provider_stream_subscription", None)
+        if callable(has_provider_stream):
+            localization_stream_owned_by_service = bool(has_provider_stream())
+        if not localization_stream_owned_by_service:
+            platform_providers = getattr(self.platform_geometry_runtime, "providers", None)
+            localization_subscriber = getattr(platform_providers, "subscribe_localization", None)
+            localization_unsubscriber = getattr(platform_providers, "unsubscribe_localization", None)
+            if not callable(localization_subscriber):
+                localization_subscriber = getattr(providers, "subscribe_localization", None)
+                localization_unsubscriber = getattr(providers, "unsubscribe_localization", None)
+            if callable(localization_subscriber) and self._localization_stream_subscription_id is None:
+                self._localization_stream_subscription_id = localization_subscriber(self._publish_localization_stream_frame)
+                self._localization_stream_unsubscriber = localization_unsubscriber if callable(localization_unsubscriber) else None
 
         point_cloud_subscriber = getattr(providers, "subscribe_point_cloud", None)
         if callable(point_cloud_subscriber) and self._point_cloud_stream_subscription_id is None:
             self._point_cloud_stream_subscription_id = point_cloud_subscriber(self._publish_point_cloud_stream_frame)
 
     def _stop_data_frame_stream_sources(self) -> None:
+        if self._pointcloud_map_stream_subscription_id is not None:
+            self.stream_bus.unsubscribe(self._pointcloud_map_stream_subscription_id)
+            self._pointcloud_map_stream_subscription_id = None
         providers = getattr(self.robot, "providers", None)
         if providers is None:
             return
@@ -567,10 +611,11 @@ class GatewayRuntime:
                 unsubscriber(self._robot_state_stream_subscription_id)
             self._robot_state_stream_subscription_id = None
         if self._localization_stream_subscription_id is not None:
-            unsubscriber = getattr(providers, "unsubscribe_localization", None)
+            unsubscriber = getattr(self, "_localization_stream_unsubscriber", None) or getattr(providers, "unsubscribe_localization", None)
             if callable(unsubscriber):
                 unsubscriber(self._localization_stream_subscription_id)
             self._localization_stream_subscription_id = None
+            self._localization_stream_unsubscriber = None
         if self._point_cloud_stream_subscription_id is not None:
             unsubscriber = getattr(providers, "unsubscribe_point_cloud", None)
             if callable(unsubscriber):
@@ -610,6 +655,220 @@ class GatewayRuntime:
             metadata={
                 "point_count": getattr(point_cloud, "point_count", None),
                 "source_topic": metadata.get("source_topic"),
+                "not_a_pointcloud_map": True,
+            },
+        )
+
+    def _handle_map_frame_for_pointcloud_map_stream(self, frame: Any) -> None:
+        del frame
+        self._publish_pointcloud_map_stream_frame(reason="map_frame_update")
+
+    def _publish_pointcloud_map_stream_frame(self, *, reason: str = "manual_refresh") -> None:
+        source_summary = self.platform_geometry_runtime.get_live_pointcloud_map_asset_summary()
+        pcd_path = source_summary.get("pcd_path") or source_summary.get("path")
+        frame_id = str(source_summary.get("frame_id") or self.config.geometry.frames.map_frame or "map")
+        source_kind = str(source_summary.get("source_kind") or "configured_pcd_root")
+        if not pcd_path or not bool(source_summary.get("available")):
+            self._publish_pointcloud_map_diagnostic(
+                source_summary,
+                status="missing",
+                reason=str(source_summary.get("reason") or "pointcloud_map_pcd_missing"),
+                frame_id=frame_id,
+                refresh_reason=reason,
+            )
+            return
+        try:
+            pointcloud_map = self._pointcloud_map_cache.load_pcd(
+                pcd_path if isinstance(pcd_path, Path) else Path(str(pcd_path)),
+                frame_id=frame_id,
+                source_kind=source_kind,
+            )
+        except UnsupportedPointCloudMapError as exc:
+            self._publish_pointcloud_map_diagnostic(
+                source_summary,
+                status="unsupported",
+                reason="unsupported_pcd_format",
+                frame_id=frame_id,
+                refresh_reason=reason,
+                error=str(exc),
+            )
+            return
+        except PointCloudMapError as exc:
+            self._publish_pointcloud_map_diagnostic(
+                source_summary,
+                status="error",
+                reason="pcd_load_failed",
+                frame_id=frame_id,
+                refresh_reason=reason,
+                error=str(exc),
+            )
+            return
+
+        payload = self._build_pointcloud_map_meta_payload(pointcloud_map, source_summary, refresh_reason=reason)
+        self.stream_bus.publish(
+            "pointcloud_map.meta",
+            source="pointcloud_map_cache",
+            payload=payload,
+            frame_id=pointcloud_map.frame_id,
+            revision=pointcloud_map.revision,
+            status="available",
+            metadata={
+                "source_kind": pointcloud_map.source_kind,
+                "pcd_path": pointcloud_map.path,
+                "point_count": pointcloud_map.point_count,
+                "not_sensor_scan": True,
+                "not_fallback_to_sensor_scan": True,
+                "refresh_reason": reason,
+            },
+        )
+        self._publish_pointcloud_map_preview_chunk(pointcloud_map, source_summary, refresh_reason=reason)
+
+    def _build_pointcloud_map_meta_payload(self, pointcloud_map: Any, source_summary: Dict[str, object], *, refresh_reason: str) -> Dict[str, object]:
+        payload_bytes = int(pointcloud_map.point_count) * 3 * 4
+        lods = []
+        for item in pointcloud_map.lods():
+            lods.append(
+                {
+                    **dict(item),
+                    "stream_topic": "pointcloud_map.chunk",
+                    "format": "float32-xyz",
+                    "payload_kind": "binary",
+                }
+            )
+        return {
+            "map_name": source_summary.get("map_name"),
+            "map_version_id": source_summary.get("map_version_id"),
+            "revision": pointcloud_map.revision,
+            "frame_id": pointcloud_map.frame_id,
+            "source": "pointcloud_map_cache",
+            "source_kind": pointcloud_map.source_kind,
+            "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
+            "rtabmap_db_path": source_summary.get("rtabmap_db_path"),
+            "pcd_path": pointcloud_map.path,
+            "point_count": pointcloud_map.point_count,
+            "fields": [
+                {"name": "x", "datatype": "float32", "offset": 0},
+                {"name": "y", "datatype": "float32", "offset": 4},
+                {"name": "z", "datatype": "float32", "offset": 8},
+            ],
+            "bounds": {"min": list(pointcloud_map.bounds_min), "max": list(pointcloud_map.bounds_max)},
+            "lods": lods,
+            "format": "float32-xyz",
+            "payload_bytes": payload_bytes,
+            "stream_topics": ["pointcloud_map.meta", "pointcloud_map.chunk"],
+            "metadata": {
+                "not_sensor_scan": True,
+                "not_fallback_to_sensor_scan": True,
+                "source_timestamp": pointcloud_map.source_timestamp,
+                "loaded_at": pointcloud_map.loaded_at,
+                "header_data": getattr(pointcloud_map.header, "data", None),
+                "refresh_reason": refresh_reason,
+                "expected_candidates": source_summary.get("expected_candidates") or [],
+            },
+            "metrics": {
+                "load_ms": pointcloud_map.load_ms,
+                "payload_bytes": payload_bytes,
+                "preview_point_count": lods[0]["point_count"] if lods else 0,
+            },
+        }
+
+    def _publish_pointcloud_map_preview_chunk(self, pointcloud_map: Any, source_summary: Dict[str, object], *, refresh_reason: str) -> None:
+        chunk_key = (str(pointcloud_map.path), str(pointcloud_map.revision))
+        if self._last_pointcloud_map_chunk_key == chunk_key:
+            return
+        preview_bytes = pointcloud_map.binary_xyz("preview")
+        preview_point_count = len(preview_bytes) // (3 * 4)
+        self.stream_bus.publish(
+            "pointcloud_map.chunk",
+            source="pointcloud_map_cache",
+            payload_kind=StreamPayloadKind.BINARY,
+            payload={
+                "revision": pointcloud_map.revision,
+                "frame_id": pointcloud_map.frame_id,
+                "lod": "preview",
+                "chunk_index": 0,
+                "chunk_count": 1,
+                "format": "float32-xyz",
+                "encoding": "base64",
+                "data": base64.b64encode(preview_bytes).decode("ascii"),
+                "point_count": preview_point_count,
+                "source_kind": pointcloud_map.source_kind,
+                "metadata": {
+                    "not_sensor_scan": True,
+                    "not_fallback_to_sensor_scan": True,
+                    "pcd_path": pointcloud_map.path,
+                    "refresh_reason": refresh_reason,
+                    "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
+                },
+            },
+            frame_id=pointcloud_map.frame_id,
+            revision=pointcloud_map.revision,
+            status="available",
+            metadata={
+                "source_kind": pointcloud_map.source_kind,
+                "lod": "preview",
+                "format": "float32-xyz",
+                "encoding": "base64",
+                "point_count": preview_point_count,
+                "payload_bytes": len(preview_bytes),
+                "not_sensor_scan": True,
+                "not_fallback_to_sensor_scan": True,
+            },
+        )
+        self._last_pointcloud_map_chunk_key = chunk_key
+
+    def _publish_pointcloud_map_diagnostic(
+        self,
+        source_summary: Dict[str, object],
+        *,
+        status: str,
+        reason: str,
+        frame_id: str,
+        refresh_reason: str,
+        error: Optional[str] = None,
+    ) -> None:
+        payload = {
+            "map_name": source_summary.get("map_name"),
+            "map_version_id": source_summary.get("map_version_id"),
+            "revision": None,
+            "frame_id": frame_id,
+            "source": "pointcloud_map_cache",
+            "source_kind": source_summary.get("source_kind") or "configured_pcd_root",
+            "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
+            "rtabmap_db_path": source_summary.get("rtabmap_db_path"),
+            "pcd_path": source_summary.get("pcd_path") or source_summary.get("path"),
+            "point_count": 0,
+            "fields": [],
+            "bounds": None,
+            "lods": [],
+            "format": "float32-xyz",
+            "payload_bytes": 0,
+            "stream_topics": ["pointcloud_map.meta"],
+            "metadata": {
+                "not_sensor_scan": True,
+                "not_fallback_to_sensor_scan": True,
+                "reason": reason,
+                "refresh_reason": refresh_reason,
+                "expected_candidates": source_summary.get("expected_candidates") or [],
+                "source_available": bool(source_summary.get("available")),
+            },
+            "metrics": {"payload_bytes": 0},
+        }
+        if error:
+            payload["metadata"]["error"] = error
+        self.stream_bus.publish(
+            "pointcloud_map.meta",
+            source="pointcloud_map_cache",
+            payload=payload,
+            frame_id=frame_id,
+            status=status,
+            metadata={
+                "source_kind": payload["source_kind"],
+                "pcd_path": payload["pcd_path"],
+                "reason": reason,
+                "not_sensor_scan": True,
+                "not_fallback_to_sensor_scan": True,
+                "refresh_reason": refresh_reason,
             },
         )
 
@@ -629,14 +888,6 @@ class GatewayRuntime:
             payload_kind=StreamPayloadKind.UNSUPPORTED,
             status="unsupported",
             metadata={"reason": "no_native_video_stream_subscription"},
-        )
-        self.stream_bus.publish(
-            "pointcloud_map.meta",
-            source="pointcloud_map",
-            payload={"available": False, "message": "点云地图 HTTP 快照入口已下线，等待地图服务推送原生流式点云地图元数据。"},
-            payload_kind=StreamPayloadKind.UNSUPPORTED,
-            status="unsupported",
-            metadata={"reason": "no_native_pointcloud_map_stream_subscription"},
         )
 
     def register_default_capabilities(self) -> None:
@@ -1392,6 +1643,7 @@ class GatewayRuntime:
                         "radius_m": {"type": "number", "exclusiveMinimum": 0.0},
                         "strategy": {"type": "string", "default": "frontier"},
                         "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
+                        "stop_conditions": _exploration_stop_conditions_schema(),
                         "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.2},
                         "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     }
@@ -1419,6 +1671,7 @@ class GatewayRuntime:
                         "radius_m": {"type": "number", "exclusiveMinimum": 0.0},
                         "strategy": {"type": "string", "default": "frontier"},
                         "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
+                        "stop_conditions": _exploration_stop_conditions_schema(),
                         "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.2},
                         "search_refresh_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.8},
                         "verify_similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.55},
@@ -3657,6 +3910,7 @@ class GatewayRuntime:
             radius_m=self._float(arguments, "radius_m", 0.0) or None,
             strategy=str(arguments.get("strategy") or "frontier"),
             max_duration_sec=self._float(arguments, "max_duration_sec", 0.0) or None,
+            stop_conditions=self._exploration_stop_conditions(arguments),
             metadata={"requested_by": requested_by or "unknown"},
         )
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.2)
@@ -3702,6 +3956,7 @@ class GatewayRuntime:
             radius_m=self._float(arguments, "radius_m", 0.0) or None,
             strategy=str(arguments.get("strategy") or "frontier"),
             max_duration_sec=self._float(arguments, "max_duration_sec", 0.0) or None,
+            stop_conditions=self._exploration_stop_conditions(arguments),
             metadata={
                 "requested_by": requested_by or "unknown",
                 "search_query": query,
@@ -4709,6 +4964,74 @@ class GatewayRuntime:
         if normalized == "false":
             return False
         return None
+
+    def _exploration_stop_conditions(self, arguments: Dict[str, Any]) -> MetadataDict:
+        raw_conditions = arguments.get("stop_conditions")
+        if raw_conditions is None:
+            return {}
+        if not isinstance(raw_conditions, dict):
+            raise GatewayError(
+                "参数 stop_conditions 必须为对象。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+
+        validators = {
+            "max_duration_sec": (0.0, None),
+            "max_completed_frontiers": (0.0, None),
+            "min_covered_ratio": (0.0, 1.0),
+            "max_no_gain_rounds": (0.0, None),
+            "min_known_cells": (0.0, None),
+        }
+        stop_conditions: MetadataDict = {}
+        for key, (minimum, maximum) in validators.items():
+            if key not in raw_conditions:
+                continue
+            value = raw_conditions.get(key)
+            if value is None or value == "":
+                continue
+            if isinstance(value, bool):
+                raise GatewayError(
+                    f"参数 stop_conditions.{key} 必须为数字。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                )
+            try:
+                number = float(value)
+            except (TypeError, ValueError) as exc:
+                raise GatewayError(
+                    f"参数 stop_conditions.{key} 必须为数字。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                ) from exc
+            if not math.isfinite(number) or number <= minimum:
+                raise GatewayError(
+                    f"参数 stop_conditions.{key} 必须大于 {minimum}。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                )
+            if maximum is not None and number > maximum:
+                raise GatewayError(
+                    f"参数 stop_conditions.{key} 必须小于等于 {maximum}。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                )
+            stop_conditions[key] = number
+
+        unsupported = sorted(str(key) for key in raw_conditions if key not in validators)
+        if unsupported:
+            raise GatewayError(
+                "参数 stop_conditions 包含不支持的条件：%s。" % ", ".join(unsupported),
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        return stop_conditions
 
     def _coerce_optional_str_list(self, value: Any) -> List[str]:
         if value is None or isinstance(value, bool):

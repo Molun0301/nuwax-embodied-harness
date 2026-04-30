@@ -63,67 +63,195 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         security_policy = access_manager.export_policy()
         layout = _build_layout_snapshot()
         return f"""<!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>nuwax_robot_bridge 运维页</title>
   <style>
-    body {{ font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; margin: 24px; background: #f4f6f8; color: #1f2937; }}
-    h1, h2 {{ margin: 0 0 12px 0; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }}
-    .card {{ background: white; border-radius: 12px; padding: 16px; box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08); }}
-    .mono {{ font-family: "JetBrains Mono", "Consolas", monospace; word-break: break-all; }}
-    ul {{ margin: 8px 0 0 18px; padding: 0; }}
-    li {{ margin: 4px 0; }}
-    .muted {{ color: #6b7280; }}
+    :root {{
+      --bg: #f6f7f9;
+      --bg-grad-a: rgba(59, 130, 246, 0.08);
+      --bg-grad-b: rgba(139, 92, 246, 0.06);
+      --surface: rgba(255, 255, 255, 0.95);
+      --surface-strong: #ffffff;
+      --panel: rgba(255, 255, 255, 0.92);
+      --panel-soft: rgba(248, 250, 252, 0.85);
+      --border: rgba(148, 163, 184, 0.35);
+      --border-soft: rgba(148, 163, 184, 0.22);
+      --border-strong: rgba(59, 130, 246, 0.55);
+      --text: #0f172a;
+      --muted: #475569;
+      --muted-strong: #334155;
+      --accent: #2563eb;
+      --accent-strong: #1d4ed8;
+      --shadow: 0 10px 40px rgba(0, 0, 0, 0.08);
+      --shadow-soft: 0 4px 18px rgba(0, 0, 0, 0.06);
+      --radius: 16px;
+      --radius-sm: 12px;
+    }}
+    [data-theme="dark"] {{
+      --bg: #0b1120;
+      --bg-grad-a: rgba(34, 211, 238, 0.12);
+      --bg-grad-b: rgba(124, 58, 237, 0.10);
+      --surface: rgba(15, 23, 42, 0.92);
+      --surface-strong: rgba(15, 23, 42, 0.96);
+      --panel: rgba(15, 23, 42, 0.88);
+      --panel-soft: rgba(30, 41, 59, 0.70);
+      --border: rgba(148, 163, 184, 0.18);
+      --border-soft: rgba(148, 163, 184, 0.12);
+      --border-strong: rgba(34, 211, 238, 0.45);
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --muted-strong: #cbd5e1;
+      --accent: #38bdf8;
+      --accent-strong: #22d3ee;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+      --shadow-soft: 0 14px 38px rgba(0, 0, 0, 0.22);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      padding: 24px;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 8% 8%, var(--bg-grad-a), transparent 30rem),
+        radial-gradient(circle at 92% 6%, var(--bg-grad-b), transparent 34rem),
+        linear-gradient(135deg, var(--bg) 0%, var(--panel-soft) 100%);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+      transition: background 0.3s ease, color 0.3s ease;
+    }}
+    .app-shell {{ max-width: 1200px; margin: 0 auto; }}
+    h1 {{ margin: 0 0 6px 0; font-size: clamp(24px, 2vw, 34px); font-weight: 780; letter-spacing: -0.03em; }}
+    h2 {{ margin: 0 0 12px 0; font-size: 16px; font-weight: 720; color: var(--muted-strong); }}
+    .eyebrow {{ color: var(--accent-strong); font-size: 12px; font-weight: 780; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 8px; }}
+    .muted {{ color: var(--muted); }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 20px; }}
+    .card {{
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(180deg, var(--panel), var(--panel-soft));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      box-shadow: var(--shadow-soft);
+      transition: background 0.3s ease, border-color 0.3s ease;
+    }}
+    .card::before {{
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--accent-strong), transparent);
+      pointer-events: none;
+      opacity: 0.7;
+    }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; word-break: break-all; font-size: 13px; color: var(--accent-strong); }}
+    ul {{ margin: 8px 0 0 0; padding: 0; list-style: none; }}
+    li {{ margin: 8px 0; padding: 8px 10px; border-radius: 10px; background: var(--panel-soft); border: 1px solid var(--border-soft); display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; transition: background 0.3s ease; }}
+    li span:first-child {{ color: var(--muted); font-size: 13px; }}
+    .theme-toggle {{
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 100;
+      width: 40px;
+      height: 40px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface-strong);
+      color: var(--text);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      box-shadow: var(--shadow-soft);
+      transition: background 0.3s ease, color 0.3s ease, border-color 0.3s ease, transform 0.2s ease;
+    }}
+    .theme-toggle:hover {{ transform: scale(1.08); border-color: var(--border-strong); }}
+    @media (max-width: 720px) {{
+      body {{ padding: 14px; }}
+      .card {{ border-radius: 14px; padding: 14px; }}
+      .theme-toggle {{ top: 10px; right: 10px; width: 36px; height: 36px; font-size: 16px; }}
+    }}
   </style>
 </head>
 <body>
-  <h1>nuwax_robot_bridge 运维页</h1>
-  <p class="muted">用于快速查看宿主机运行时、目录布局和安全策略的最低可用状态页。</p>
-  <div class="grid">
-    <section class="card">
-      <h2>运行时</h2>
-      <ul>
-        <li>机器人：<span class="mono">{health["robot_name"]}</span></li>
-        <li>型号：<span class="mono">{health["robot_model"]}</span></li>
-        <li>已启动：<span class="mono">{health["runtime_started"]}</span></li>
-        <li>活动任务数：<span class="mono">{health["active_task_count"]}</span></li>
-        <li>最新事件游标：<span class="mono">{health["latest_event_cursor"]}</span></li>
-      </ul>
-    </section>
-    <section class="card">
-      <h2>目录布局</h2>
-      <ul>
-        <li>基础目录：<span class="mono">{layout["base_dir"]}</span></li>
-        <li>日志目录：<span class="mono">{layout["log_dir"]}</span></li>
-        <li>日志文件：<span class="mono">{layout["log_file"]}</span></li>
-        <li>制品目录：<span class="mono">{layout["artifact_dir"]}</span></li>
-        <li>状态缓存：<span class="mono">{layout["state_store_mode"]}</span></li>
-      </ul>
-    </section>
-    <section class="card">
-      <h2>安全策略</h2>
-      <ul>
-        <li>允许网段：<span class="mono">{", ".join(security_policy["allowed_source_cidrs"]) or "未限制"}</span></li>
-        <li>允许未知来源：<span class="mono">{security_policy["allow_unknown_client_hosts"]}</span></li>
-        <li>Agent 令牌数：<span class="mono">{security_policy["agent_token_count"]}</span></li>
-        <li>Admin 令牌数：<span class="mono">{security_policy["admin_token_count"]}</span></li>
-        <li>高风险白名单：<span class="mono">{", ".join(security_policy["agent_high_risk_allowlist"]) or "空"}</span></li>
-      </ul>
-    </section>
-    <section class="card">
-      <h2>调试入口</h2>
-      <ul>
-        <li><span class="mono">/api/health</span></li>
-        <li><span class="mono">/api/tools</span></li>
-        <li><span class="mono">/api/security/policy</span></li>
-        <li><span class="mono">/api/deployment/layout</span></li>
-        <li><span class="mono">/api/tasks</span></li>
-        <li><span class="mono">/events/stream</span></li>
-      </ul>
-    </section>
+  <button id="themeToggle" class="theme-toggle" title="切换主题" aria-label="切换白天/黑夜主题">☀️</button>
+  <div class="app-shell">
+    <div class="eyebrow">运维控制台</div>
+    <h1>nuwax_robot_bridge 运维页</h1>
+    <p class="muted">用于快速查看宿主机运行时、目录布局和安全策略的最低可用状态页。</p>
+    <div class="grid">
+      <section class="card">
+        <h2>运行时</h2>
+        <ul>
+          <li><span>机器人</span><span class="mono">{health["robot_name"]}</span></li>
+          <li><span>型号</span><span class="mono">{health["robot_model"]}</span></li>
+          <li><span>已启动</span><span class="mono">{health["runtime_started"]}</span></li>
+          <li><span>活动任务数</span><span class="mono">{health["active_task_count"]}</span></li>
+          <li><span>最新事件游标</span><span class="mono">{health["latest_event_cursor"]}</span></li>
+        </ul>
+      </section>
+      <section class="card">
+        <h2>目录布局</h2>
+        <ul>
+          <li><span>基础目录</span><span class="mono">{layout["base_dir"]}</span></li>
+          <li><span>日志目录</span><span class="mono">{layout["log_dir"]}</span></li>
+          <li><span>日志文件</span><span class="mono">{layout["log_file"]}</span></li>
+          <li><span>制品目录</span><span class="mono">{layout["artifact_dir"]}</span></li>
+          <li><span>状态缓存</span><span class="mono">{layout["state_store_mode"]}</span></li>
+        </ul>
+      </section>
+      <section class="card">
+        <h2>安全策略</h2>
+        <ul>
+          <li><span>允许网段</span><span class="mono">{", ".join(security_policy["allowed_source_cidrs"]) or "未限制"}</span></li>
+          <li><span>允许未知来源</span><span class="mono">{security_policy["allow_unknown_client_hosts"]}</span></li>
+          <li><span>Agent 令牌数</span><span class="mono">{security_policy["agent_token_count"]}</span></li>
+          <li><span>Admin 令牌数</span><span class="mono">{security_policy["admin_token_count"]}</span></li>
+          <li><span>高风险白名单</span><span class="mono">{", ".join(security_policy["agent_high_risk_allowlist"]) or "空"}</span></li>
+        </ul>
+      </section>
+      <section class="card">
+        <h2>调试入口</h2>
+        <ul>
+          <li><span>健康检查</span><span class="mono">/api/health</span></li>
+          <li><span>工具列表</span><span class="mono">/api/tools</span></li>
+          <li><span>安全策略</span><span class="mono">/api/security/policy</span></li>
+          <li><span>部署布局</span><span class="mono">/api/deployment/layout</span></li>
+          <li><span>任务管理</span><span class="mono">/api/tasks</span></li>
+          <li><span>事件流</span><span class="mono">/events/stream</span></li>
+        </ul>
+      </section>
+    </div>
   </div>
+  <script>
+    (() => {{
+      const btn = document.getElementById("themeToggle");
+      function initTheme() {{
+        const saved = localStorage.getItem("nuwax-theme");
+        const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const theme = saved || (prefersDark ? "dark" : "light");
+        document.documentElement.setAttribute("data-theme", theme);
+        updateIcon(theme);
+      }}
+      function toggleTheme() {{
+        const current = document.documentElement.getAttribute("data-theme") || "dark";
+        const next = current === "dark" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", next);
+        localStorage.setItem("nuwax-theme", next);
+        updateIcon(next);
+      }}
+      function updateIcon(theme) {{
+        if (btn) btn.textContent = theme === "dark" ? "🌙" : "☀️";
+      }}
+      initTheme();
+      if (btn) btn.addEventListener("click", toggleTheme);
+    }})();
+  </script>
 </body>
 </html>"""
 

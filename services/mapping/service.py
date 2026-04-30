@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import threading
 from typing import Any
 
 from contracts.events import RuntimeEventCategory
@@ -27,9 +28,14 @@ class MappingService:
         self._state_store = state_store
         self._event_bus = event_bus
         self._stream_bus = stream_bus
+        self._lock = threading.RLock()
         self._history: Deque[MapSnapshot] = deque(maxlen=max(1, history_limit))
         self._latest_snapshot: Optional[MapSnapshot] = None
         self._revision_by_source: Dict[str, int] = {}
+        self._map_update_subscription_id: Optional[object] = None
+        subscription = getattr(self._provider_owner, "subscribe_map_updates", None)
+        if callable(subscription):
+            self._map_update_subscription_id = subscription(self._handle_provider_map_update)
 
     def refresh(self) -> MapSnapshot:
         """从本地图提供器刷新地图快照。"""
@@ -38,8 +44,11 @@ class MappingService:
         if callable(runtime_snapshot_reader):
             runtime_snapshot = runtime_snapshot_reader()
             if runtime_snapshot is not None:
-                if self._is_snapshot_contract_equivalent(runtime_snapshot):
-                    return self._latest_snapshot  # type: ignore[return-value]
+                with self._lock:
+                    if self._is_snapshot_contract_equivalent(runtime_snapshot):
+                        latest_snapshot = self._latest_snapshot
+                        if latest_snapshot is not None:
+                            return latest_snapshot
                 metadata = dict(runtime_snapshot.metadata or {})
                 live_streaming = bool(
                     metadata.get("rtabmap_live_streaming_ready")
@@ -79,6 +88,17 @@ class MappingService:
             metadata=provider_metadata,
         )
 
+    def _handle_provider_map_update(self, payload: Dict[str, object]) -> MapSnapshot:
+        source_name = str(payload.get("source_name") or "platform_live_map_provider")
+        metadata = payload.get("metadata")
+        return self.ingest_external_snapshot(
+            source_name=source_name,
+            occupancy_grid=payload.get("occupancy_grid"),
+            cost_map=payload.get("cost_map"),
+            semantic_map=payload.get("semantic_map"),
+            metadata=metadata if isinstance(metadata, dict) else None,
+        )
+
     def ingest_external_snapshot(
         self,
         *,
@@ -103,43 +123,49 @@ class MappingService:
             "checkpoint_ready": bool(source_metadata.get("checkpoint_ready") or source_metadata.get("geometry_ready")),
             **source_metadata,
         }
-        # 对实时 provider 刷新做内容去重，避免同一张地图在无变化时反复生成新版本。
-        if (
-            version_id_override is None
-            and revision_override is None
-            and self._is_equivalent_to_latest_snapshot(
+        with self._lock:
+            if (
+                version_id_override is None
+                and revision_override is None
+                and self._is_equivalent_to_latest_snapshot(
+                    source_name=source_name,
+                    occupancy_grid=occupancy_grid,
+                    cost_map=cost_map,
+                    semantic_map=semantic_map,
+                    metadata=snapshot_metadata,
+                )
+            ):
+                return self._latest_snapshot  # type: ignore[return-value]
+
+            if revision_override is not None:
+                revision = max(1, int(revision_override))
+            else:
+                revision = self._revision_by_source.get(source_name, 0) + 1
+            self._revision_by_source[source_name] = max(self._revision_by_source.get(source_name, 0), revision)
+            snapshot = MapSnapshot(
                 source_name=source_name,
+                version_id=str(version_id_override or self._build_version_id(source_name, revision)),
+                revision=revision,
                 occupancy_grid=occupancy_grid,
                 cost_map=cost_map,
                 semantic_map=semantic_map,
                 metadata=snapshot_metadata,
             )
-        ):
-            return self._latest_snapshot  # type: ignore[return-value]
-
-        if revision_override is not None:
-            revision = max(1, int(revision_override))
-        else:
-            revision = self._revision_by_source.get(source_name, 0) + 1
-        self._revision_by_source[source_name] = max(self._revision_by_source.get(source_name, 0), revision)
-        snapshot = MapSnapshot(
-            source_name=source_name,
-            version_id=str(version_id_override or self._build_version_id(source_name, revision)),
-            revision=revision,
-            occupancy_grid=occupancy_grid,
-            cost_map=cost_map,
-            semantic_map=semantic_map,
-            metadata=snapshot_metadata,
-        )
-        self._latest_snapshot = snapshot
-        self._history.append(snapshot)
-        self._state_store.write(
-            StateNamespace.MAP,
-            source_name,
-            snapshot,
-            source=source_name,
-            metadata={"kind": "latest_map", "version_id": snapshot.version_id, "revision": revision},
-        )
+            self._latest_snapshot = snapshot
+            self._history.append(snapshot)
+            self._state_store.write(
+                StateNamespace.MAP,
+                source_name,
+                snapshot,
+                source=source_name,
+                metadata={"kind": "latest_map", "version_id": snapshot.version_id, "revision": revision},
+            )
+            event_payload = {
+                "source_name": source_name,
+                "version_id": snapshot.version_id,
+                "revision": revision,
+            }
+            stream_sequence = self._extract_stream_sequence(snapshot.metadata)
 
         if self._event_bus is not None:
             self._event_bus.publish(
@@ -148,11 +174,7 @@ class MappingService:
                     category=RuntimeEventCategory.ROBOT,
                     source="mapping_service",
                     message="地图快照已更新。",
-                    payload={
-                        "source_name": source_name,
-                        "version_id": snapshot.version_id,
-                        "revision": revision,
-                    },
+                    payload=dict(event_payload),
                 )
             )
         if self._stream_bus is not None:
@@ -161,30 +183,30 @@ class MappingService:
                 source="mapping_service",
                 payload=snapshot,
                 frame_id=snapshot.frame_id,
+                sequence=stream_sequence,
                 revision=str(snapshot.revision),
                 status="available",
-                metadata={
-                    "source_name": source_name,
-                    "version_id": snapshot.version_id,
-                    "revision": revision,
-                },
+                metadata=dict(event_payload),
             )
         return snapshot
 
     def get_latest_snapshot(self) -> Optional[MapSnapshot]:
         """返回最新地图快照。"""
 
-        return self._latest_snapshot
+        with self._lock:
+            return self._latest_snapshot
 
     def clear_latest_snapshot(self) -> None:
         """清空当前最新地图快照，避免在地图已回收时继续暴露旧结果。"""
 
-        self._latest_snapshot = None
+        with self._lock:
+            self._latest_snapshot = None
 
     def list_history(self, *, limit: Optional[int] = None) -> Tuple[MapSnapshot, ...]:
         """返回地图历史。"""
 
-        items = list(self._history)
+        with self._lock:
+            items = list(self._history)
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
@@ -192,8 +214,9 @@ class MappingService:
     def is_available(self) -> bool:
         """判断地图服务当前是否可用。"""
 
-        if self._latest_snapshot is not None:
-            return True
+        with self._lock:
+            if self._latest_snapshot is not None:
+                return True
         provider = self._find_map_provider()
         if provider is None or not provider.is_available():
             return False
@@ -201,6 +224,17 @@ class MappingService:
         if callable(availability_checker):
             return bool(availability_checker())
         return True
+
+    def _extract_stream_sequence(self, metadata: Dict[str, object]) -> Optional[int]:
+        for key in ("update_sequence", "source_sequence", "occupancy_sequence", "message_count"):
+            value = metadata.get(key)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
 
     def _infer_snapshot_kind(self, metadata: Dict[str, object]) -> str:
         source_mode = str(metadata.get("source_mode") or metadata.get("map_version_source_mode") or "").strip()
@@ -280,22 +314,23 @@ class MappingService:
         return value
 
     def _is_snapshot_contract_equivalent(self, snapshot: MapSnapshot) -> bool:
-        latest = self._latest_snapshot
-        if latest is None:
-            return False
-        return (
-            latest.source_name == snapshot.source_name
-            and latest.version_id == snapshot.version_id
-            and latest.revision == snapshot.revision
-            and self._normalize_snapshot_value(latest.occupancy_grid)
-            == self._normalize_snapshot_value(snapshot.occupancy_grid)
-            and self._normalize_snapshot_value(latest.cost_map)
-            == self._normalize_snapshot_value(snapshot.cost_map)
-            and self._normalize_snapshot_value(latest.semantic_map)
-            == self._normalize_snapshot_value(snapshot.semantic_map)
-            and self._normalize_snapshot_value(latest.metadata)
-            == self._normalize_snapshot_value(snapshot.metadata)
-        )
+        with self._lock:
+            latest = self._latest_snapshot
+            if latest is None:
+                return False
+            return (
+                latest.source_name == snapshot.source_name
+                and latest.version_id == snapshot.version_id
+                and latest.revision == snapshot.revision
+                and self._normalize_snapshot_value(latest.occupancy_grid)
+                == self._normalize_snapshot_value(snapshot.occupancy_grid)
+                and self._normalize_snapshot_value(latest.cost_map)
+                == self._normalize_snapshot_value(snapshot.cost_map)
+                and self._normalize_snapshot_value(latest.semantic_map)
+                == self._normalize_snapshot_value(snapshot.semantic_map)
+                and self._normalize_snapshot_value(latest.metadata)
+                == self._normalize_snapshot_value(snapshot.metadata)
+            )
 
     def _get_map_provider(self) -> MapProvider:
         provider = self._find_map_provider()

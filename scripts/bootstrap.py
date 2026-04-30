@@ -547,6 +547,7 @@ class BootstrapPlanner:
             "NUWAX_GEOMETRY_ENABLED": _bool_text(self.geometry_enabled),
             "NUWAX_GEOMETRY_REQUIRE_ROS2": _bool_text(self.geometry_enabled),
             "NUWAX_GEOMETRY_SETUP_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash"),
+            "NUWAX_NAV2_MODE": "sidecar" if self.geometry_enabled else "disabled",
             "NUWAX_LOG_DIR": str(PROJECT_ROOT),
             "NUWAX_LOG_FILE": str(PROJECT_ROOT / "nuwax_robot_bridge.log"),
             "NUWAX_GATEWAY_ARTIFACT_DIR": str(PROJECT_ROOT / "artifacts"),

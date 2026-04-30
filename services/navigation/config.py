@@ -1,48 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
-
-
-@dataclass
-class NavigationControlConfig:
-    """平台统一导航执行控制配置。"""
-
-    enabled: bool = True
-    auto_start_services: bool = False
-    service_names: Tuple[str, ...] = (
-        "unitree_lidar",
-        "unitree_lidar_slam",
-        "voxel_height_mapping",
-        "obstacles_avoid",
-    )
-    client_timeout_sec: float = 3.0
-    goal_tolerance_m: float = 0.45
-    goal_yaw_tolerance_rad: float = 0.45
-    control_loop_interval_sec: float = 0.1
-    max_linear_velocity_mps: float = 0.35
-    min_linear_velocity_mps: float = 0.08
-    max_yaw_rate_rps: float = 0.8
-    obstacle_avoidance_default_enabled: bool = True
-    front_align_enabled: bool = True
-    front_align_heading_threshold_rad: float = 0.85
-    front_align_complete_threshold_rad: float = 0.25
-    front_align_angular_velocity_rps: float = 0.35
-    front_align_timeout_sec: float = 3.0
-    front_align_cooldown_sec: float = 1.0
-    rotate_relocalization_enabled: bool = False
-    rotate_relocalization_trigger_statuses: Tuple[str, ...] = ("localizing", "stale")
-    rotate_relocalization_angle_rad: float = 6.283185307179586
-    rotate_relocalization_max_cycles: int = 1
-    rotate_relocalization_angular_velocity_rps: float = 0.25
-    rotate_relocalization_timeout_sec: float = 20.0
-    rotate_relocalization_cooldown_sec: float = 30.0
-    rotate_relocalization_require_motion_safety: bool = True
 
 
 @dataclass
 class NavigationBackendConfig:
-    """平台统一网格导航后端配置。"""
+    """二维网格路径评估配置。"""
 
     enabled: bool = True
     occupancy_lethal_threshold: int = 65
@@ -50,21 +13,8 @@ class NavigationBackendConfig:
     unknown_cell_cost: float = 55.0
     planner_inflation_radius_m: float = 0.05
     planning_horizon_margin_m: float = 0.60
-    lookahead_distance_m: float = 0.80
-    obstacle_check_distance_m: float = 1.00
-    max_path_deviation_m: float = 0.75
-    replan_cooldown_sec: float = 0.40
-    replan_interval_sec: float = 1.20
-    stuck_timeout_sec: float = 2.50
-    progress_epsilon_m: float = 0.12
-    max_replan_failures: int = 8
-    rotate_in_place_heading_rad: float = 0.95
-    heading_slowdown_rad: float = 1.20
-    yaw_gain: float = 1.35
     path_resample_spacing_m: float = 0.0
     path_smoothing_window: int = 0
-    path_mask_robot_width_m: float = 0.0
-    path_mask_max_occupied_ratio: float = 0.05
 
 
 @dataclass
@@ -95,5 +45,4 @@ class ExplorationConfig:
 __all__ = [
     "ExplorationConfig",
     "NavigationBackendConfig",
-    "NavigationControlConfig",
 ]

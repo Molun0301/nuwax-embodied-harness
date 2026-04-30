@@ -706,9 +706,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
     )
 
     geometry = PlatformGeometryConfig(
-        enabled=_cfg_bool("NUWAX_GEOMETRY_ENABLED", False),
+        enabled=_cfg_bool("NUWAX_GEOMETRY_ENABLED", True),
         stack=_cfg_str("NUWAX_GEOMETRY_STACK", "rtabmap_nav2"),
-        require_ros2=_cfg_bool("NUWAX_GEOMETRY_REQUIRE_ROS2", False),
+        require_ros2=_cfg_bool("NUWAX_GEOMETRY_REQUIRE_ROS2", True),
         setup_script=_cfg_str("NUWAX_GEOMETRY_SETUP_SCRIPT", build_default_geometry_setup_script()),
         cyclonedds_lib_dir=_cfg_str("NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR", ""),
         dds_iface=_cfg_str("NUWAX_GEOMETRY_DDS_IFACE", ""),
@@ -791,7 +791,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             ),
         ),
         nav2=Nav2Config(
-            mode=_cfg_str("NUWAX_NAV2_MODE", "external"),
+            mode=_cfg_str("NUWAX_NAV2_MODE", "sidecar"),
             action_name=_cfg_str("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
             launch_package=_cfg_str("NUWAX_NAV2_LAUNCH_PACKAGE", "nav2_bringup"),
             launch_file=_cfg_str("NUWAX_NAV2_LAUNCH_FILE", "navigation_launch.py"),

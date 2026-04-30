@@ -12,12 +12,12 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 from urllib.parse import quote
 
-from contracts.geometry import Pose, Twist, Vector3
+from contracts.geometry import Pose, Vector3
 from contracts.map_workspace import MapGeometryAssetBinding, MapGeometryAssetRef, MapGeometryAssetType, MapVersion
-from contracts.navigation import ExplorationStatus, NavigationGoal, NavigationState, NavigationStatus
+from contracts.navigation import ExplorationState, ExplorationStatus, NavigationGoal, NavigationState, NavigationStatus
 from contracts.runtime_views import MapSnapshot
 from drivers.common import ExplorationDataPlane, LocalizationDataPlane, MappingDataPlane, NavigationDataPlane, RobotAssemblyBase
 from providers.exploration import ExplorationProvider
@@ -31,10 +31,11 @@ from services.geometry.live_map_provider import Ros2LiveMapProvider
 from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
 from services.geometry.odometry_publisher import Ros2OdometryPublisher
 from services.geometry.pointcloud_publisher import Ros2PointCloudPublisher
-from services.navigation.config import ExplorationConfig, NavigationBackendConfig, NavigationControlConfig
+from services.geometry.tf_localization_provider import Ros2TfLocalizationProvider
+from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
 from services.navigation.frontier import FrontierExplorer
-from services.navigation.runtime import GridNavigationPlanner, NavigationSession
+from services.navigation.runtime import GridNavigationPlanner
 
 
 _GEOMETRY_SIDE_CAR_RESTART_LIMIT = 2
@@ -43,7 +44,7 @@ _GEOMETRY_STREAMING_WINDOW_SEC = 3.0
 _NAV2_SIDECAR_MODES = {"sidecar", "managed", "launch", "internal"}
 _NAV2_EXTERNAL_MODES = {"external", "external_action", "action", "client", "pending"}
 _NAV2_DISABLED_MODES = {"", "disabled", "off", "none"}
-_NAV2_PLATFORM_FALLBACK_MODES = {"platform", "platform_grid", "grid", "fallback", "platform_fallback"}
+_REMOVED_PLATFORM_GRID_MODES = {"platform", "platform_grid", "grid", "fallback", "platform_fallback"}
 
 
 @dataclass
@@ -203,7 +204,8 @@ class PlatformGeometryRuntime:
         self._active_map_version: Optional[MapVersion] = None
         self._last_activation_result: Dict[str, object] = {}
         self._live_map_provider = Ros2LiveMapProvider(config)
-        self._odometry_publisher = Ros2OdometryPublisher(config, self._resolve_localization_backend)
+        self._tf_localization_provider = Ros2TfLocalizationProvider(config)
+        self._odometry_publisher = Ros2OdometryPublisher(config, self._resolve_raw_localization_backend)
         self._point_cloud_publisher = Ros2PointCloudPublisher(config, self._resolve_point_cloud_provider)
         self._live_geometry_start_lock = threading.RLock()
         self._live_geometry_start_attempted = False
@@ -218,13 +220,24 @@ class PlatformGeometryRuntime:
         self._runtime_diagnostics: List[Dict[str, object]] = []
         self._map_stream_tracker: Dict[str, object] = {}
         self._nav2_launch_attempted = False
-        self._platform_navigation_runtime = PlatformNavigationRuntime(self)
         self._nav2_action_provider = Nav2ActionNavigationProvider(self)
+        self._platform_exploration_config = ExplorationConfig(enabled=True)
         self._platform_exploration_runtime = PlatformExplorationRuntime(
-            frontier_explorer=FrontierExplorer(ExplorationConfig(enabled=True)),
+            frontier_explorer=FrontierExplorer(self._platform_exploration_config),
             navigation_planner=GridNavigationPlanner(NavigationBackendConfig()),
-            config=ExplorationConfig(enabled=True),
+            config=self._platform_exploration_config,
         )
+        self._exploration_loop_lock = threading.RLock()
+        self._exploration_loop_stop_event = threading.Event()
+        self._exploration_loop_thread: Optional[threading.Thread] = None
+        self._exploration_loop_generation = 0
+        self._exploration_loop_thread_generation = 0
+        self._exploration_tick_count = 0
+        self._exploration_last_tick_at_iso: Optional[str] = None
+        self._exploration_last_tick_monotonic: Optional[float] = None
+        self._exploration_last_tick_source: Optional[str] = None
+        self._exploration_update_subscribers: Dict[int, Callable[[ExplorationState], None]] = {}
+        self._next_exploration_subscription_id = 1
         self.providers = PlatformGeometryProviderBundle(self)
 
     def start(self) -> None:
@@ -261,6 +274,7 @@ class PlatformGeometryRuntime:
             self._set_runtime_state("failed", "平台几何运行时启动失败：%s" % exc, blocked=True)
             self._stop_managed_processes()
             self._live_map_provider.stop()
+            self._tf_localization_provider.stop()
             self._odometry_publisher.stop()
             self._point_cloud_publisher.stop()
             self._live_geometry_start_attempted = False
@@ -274,11 +288,13 @@ class PlatformGeometryRuntime:
 
         self._set_runtime_state("stopping", "正在停止平台几何侧车进程。")
         self._runtime_stop_event.set()
+        self._stop_platform_exploration_loop(cancel_navigation=True, notify=True)
         thread = self._runtime_monitor_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         self._stop_managed_processes()
         self._live_map_provider.stop()
+        self._tf_localization_provider.stop()
         self._odometry_publisher.stop()
         self._point_cloud_publisher.stop()
         self._live_geometry_start_attempted = False
@@ -566,6 +582,7 @@ class PlatformGeometryRuntime:
             self._set_runtime_state("failed", process_failure, blocked=True)
             return
         live_map_status = self._clone_metadata(self._live_map_provider.get_status())
+        tf_localization_status = self._clone_metadata(self._tf_localization_provider.get_status())
         odometry_status = self._clone_metadata(self._odometry_publisher.get_status())
         point_cloud_status = self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = self._build_point_cloud_source_status()
@@ -573,6 +590,7 @@ class PlatformGeometryRuntime:
         self._update_stream_tracker(live_map_status)
         readiness = self._build_rtabmap_readiness(
             live_map_status=live_map_status,
+            tf_localization_status=tf_localization_status,
             odometry_status=odometry_status,
             point_cloud_status=point_cloud_status,
             point_cloud_source=point_cloud_source,
@@ -627,12 +645,14 @@ class PlatformGeometryRuntime:
         self,
         *,
         live_map_status: Optional[Dict[str, object]] = None,
+        tf_localization_status: Optional[Dict[str, object]] = None,
         odometry_status: Optional[Dict[str, object]] = None,
         point_cloud_status: Optional[Dict[str, object]] = None,
         point_cloud_source: Optional[Dict[str, object]] = None,
         data_plane_status: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         live_map_status = live_map_status or self._clone_metadata(self._live_map_provider.get_status())
+        tf_localization_status = tf_localization_status or self._clone_metadata(self._tf_localization_provider.get_status())
         odometry_status = odometry_status or self._clone_metadata(self._odometry_publisher.get_status())
         point_cloud_status = point_cloud_status or self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
@@ -646,7 +666,7 @@ class PlatformGeometryRuntime:
         odom_bridge = self._managed_processes.get("odom_tf_bridge")
         rtabmap_process = self._managed_processes.get("rtabmap")
         map_stream = dict(self._map_stream_tracker)
-        tf_chain = self._build_tf_chain_status()
+        tf_chain = self._build_tf_chain_status(tf_localization_status=tf_localization_status)
         rtabmap_info_publisher_count = live_map_status.get("rtabmap_info_publisher_count")
         if rtabmap_info_publisher_count is None:
             rtabmap_info_publisher_count = live_map_status.get("rtabmap_info_has_publisher")
@@ -697,6 +717,7 @@ class PlatformGeometryRuntime:
             "message": message,
             "map_stream": map_stream,
             "tf_chain": tf_chain,
+            "tf_localization_provider": self._clone_metadata(tf_localization_status),
             "rtabmap_info": {
                 "topic": "/rtabmap/info",
                 "publisher_count": rtabmap_info_publisher_count,
@@ -707,13 +728,17 @@ class PlatformGeometryRuntime:
             "odom_tf_bridge_process": odom_bridge.status() if odom_bridge is not None else None,
         }
 
-    def _build_tf_chain_status(self) -> Dict[str, object]:
-        required_process_names = (
-            "odom_tf_bridge",
-            "static_tf_base_to_body",
-            "static_tf_base_to_lidar",
-            "static_tf_base_to_imu",
-        )
+    def _build_tf_chain_status(self, *, tf_localization_status: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        tf_localization_status = tf_localization_status or self._clone_metadata(self._tf_localization_provider.get_status())
+        required_processes = ["odom_tf_bridge"]
+        if str(self.config.frames.base_frame or "").strip() != "body":
+            required_processes.append("static_tf_base_to_body")
+        if str(self.config.frames.base_frame or "").strip() != str(self.config.frames.lidar_frame or "").strip():
+            required_processes.append("static_tf_base_to_lidar")
+        imu_frame = str(getattr(self.config.frames, "imu_frame", "") or "").strip()
+        if imu_frame and str(self.config.frames.base_frame or "").strip() != imu_frame:
+            required_processes.append("static_tf_base_to_imu")
+        required_process_names = tuple(required_processes)
         process_status = {
             name: self._managed_processes[name].status()
             for name in required_process_names
@@ -721,8 +746,16 @@ class PlatformGeometryRuntime:
         }
         missing = [name for name in required_process_names if name not in self._managed_processes]
         stopped = [name for name, status in process_status.items() if not bool(status.get("running"))]
+        pose_ready = bool(tf_localization_status.get("pose_ready") or tf_localization_status.get("pose_available"))
+        map_to_base_ready = bool(tf_localization_status.get("map_to_base_ready"))
+        chain_ready = not missing and not stopped and pose_ready and map_to_base_ready
         return {
-            "ready": not missing and not stopped,
+            "ready": chain_ready,
+            "process_ready": not missing and not stopped,
+            "pose_ready": pose_ready,
+            "map_to_base_ready": map_to_base_ready,
+            "map_to_odom_ready": bool(tf_localization_status.get("map_to_odom_ready")),
+            "odom_to_base_ready": bool(tf_localization_status.get("odom_to_base_ready")),
             "map_frame": self.config.frames.map_frame,
             "odom_frame": self.config.frames.odom_frame,
             "base_frame": self.config.frames.base_frame,
@@ -732,7 +765,8 @@ class PlatformGeometryRuntime:
             "missing_processes": missing,
             "stopped_processes": stopped,
             "processes": process_status,
-            "validation": "process_and_config_only_until_ros_tf_buffer_probe_is_available",
+            "tf_localization_provider": self._clone_metadata(tf_localization_status),
+            "validation": "ros2_tf_provider_must_resolve_map_to_base_pose",
         }
 
     def _update_stream_tracker(self, live_map_status: Dict[str, object]) -> None:
@@ -816,19 +850,76 @@ class PlatformGeometryRuntime:
     def _nav2_mode(self) -> str:
         return str(getattr(self.config.nav2, "mode", "external") or "external").strip().lower()
 
+    def _navigation_backend_policy(self) -> Dict[str, object]:
+        mode = self._nav2_mode()
+        nav2_provider = getattr(self, "_nav2_action_provider", None)
+        nav2_provider_name = getattr(nav2_provider, "provider_name", "nav2_action_navigation")
+        policy = {
+            "mode": mode,
+            "execution_chain": "nav2_action_only",
+            "single_execution_chain": True,
+            "platform_grid_removed": True,
+            "removed_backend_kind": "platform_grid",
+            "removed_backend_provider": None,
+            "nav2_action_provider_name": nav2_provider_name,
+            "nav2_action_active": False,
+            "platform_grid_active": False,
+            "selected_provider_name": None,
+            "active_backend_provider": None,
+            "active_backend_kind": None,
+            "message": None,
+        }
+        if mode in _NAV2_DISABLED_MODES:
+            policy.update({
+                "selection": "disabled",
+                "message": "Nav2 已禁用，平台未选择导航执行后端。",
+            })
+        elif mode in _REMOVED_PLATFORM_GRID_MODES:
+            policy.update({
+                "selection": "removed_platform_grid",
+                "message": "platform_grid 自定义导航执行链已删除；请使用 Nav2 action 模式。",
+            })
+        elif mode in _NAV2_EXTERNAL_MODES or mode in _NAV2_SIDECAR_MODES:
+            policy.update({
+                "selection": "nav2_action",
+                "selected_provider_name": nav2_provider_name,
+                "active_backend_provider": nav2_provider_name,
+                "active_backend_kind": "nav2_action",
+                "nav2_action_active": True,
+                "message": "当前正式导航执行链为 Nav2 action。",
+            })
+        else:
+            policy.update({
+                "selection": "unsupported",
+                "message": "Nav2 模式 %s 尚未接入导航后端选择。" % mode,
+            })
+        policy["active_navigation_backend"] = policy["active_backend_provider"]
+        return policy
+
+    def _with_navigation_backend_policy(self, status: Dict[str, object]) -> Dict[str, object]:
+        policy = self._navigation_backend_policy()
+        return {
+            **dict(status or {}),
+            "navigation_backend_policy": policy,
+            "active_navigation_backend": policy.get("active_backend_provider"),
+            "nav2_action_active": bool(policy.get("nav2_action_active")),
+            "platform_grid_active": bool(policy.get("platform_grid_active")),
+            "platform_grid_removed": bool(policy.get("platform_grid_removed")),
+        }
+
     def _build_nav2_status(self) -> Dict[str, object]:
         mode = self._nav2_mode()
         process = self._managed_processes.get("nav2")
         if mode in _NAV2_DISABLED_MODES:
             phase = "disabled"
-            message = "Nav2 已禁用；平台网格导航不是 Nav2。"
-        elif mode in _NAV2_PLATFORM_FALLBACK_MODES:
-            phase = "platform_fallback"
-            message = "当前使用平台 GridNavigationPlanner fallback；该后端不是 Nav2 闭环。"
+            message = "Nav2 已禁用；平台不再提供 platform_grid 自定义导航执行链。"
+        elif mode in _REMOVED_PLATFORM_GRID_MODES:
+            phase = "removed_platform_grid"
+            message = "platform_grid 自定义导航执行链已删除；请把 NUWAX_NAV2_MODE 配置为 sidecar 或 external。"
         elif mode in _NAV2_EXTERNAL_MODES:
             provider = getattr(self, "_nav2_action_provider", None)
             if provider is not None:
-                return provider.get_nav2_status()
+                return self._with_navigation_backend_policy(provider.get_nav2_status())
             phase = "external"
             message = "Nav2 配置为外部模式，但 action provider 尚未初始化。"
         elif mode in _NAV2_SIDECAR_MODES:
@@ -841,7 +932,7 @@ class PlatformGeometryRuntime:
                     status = provider.get_nav2_status()
                     status["process"] = process.status()
                     status["launch_attempted"] = self._nav2_launch_attempted
-                    return status
+                    return self._with_navigation_backend_policy(status)
                 phase = "blocked"
                 message = "Nav2 sidecar 进程已启动，但 action provider 尚未初始化。"
             else:
@@ -860,7 +951,8 @@ class PlatformGeometryRuntime:
             "global_costmap_topic": self.config.nav2.global_costmap_topic,
             "local_costmap_topic": self.config.nav2.local_costmap_topic,
             "costmap_source": self.config.nav2.costmap_source,
-            "grid_navigation_backend": "platform_grid_navigation",
+            "platform_grid_removed": True,
+            "grid_navigation_backend": None,
             "grid_navigation_is_nav2": False,
             "action_client_connected": False,
             "lifecycle_ready": False,
@@ -868,7 +960,7 @@ class PlatformGeometryRuntime:
         }
         if process is not None:
             status["process"] = process.status()
-        return status
+        return self._with_navigation_backend_policy(status)
 
     def get_runtime_status(self) -> Dict[str, object]:
         with self._runtime_state_lock:
@@ -885,9 +977,11 @@ class PlatformGeometryRuntime:
             "started": started,
             "live_geometry_start_attempted": self._live_geometry_start_attempted,
             "processes": {name: process.status() for name, process in self._managed_processes.items()},
+            "navigation_backend_policy": self._navigation_backend_policy(),
             "map_stream": dict(self._map_stream_tracker),
             "rtabmap_readiness": self._build_rtabmap_readiness(),
             "nav2": self._build_nav2_status(),
+            "tf_localization_provider": self._tf_localization_provider.get_status(),
             "diagnostics": diagnostics,
             "launch_ros2_stack": {
                 "script": str(self._geometry_script("launch_ros2_stack.sh")),
@@ -902,6 +996,7 @@ class PlatformGeometryRuntime:
         with self._live_geometry_start_lock:
             if (
                 self._live_map_provider.is_available()
+                and self._tf_localization_provider.is_available()
                 and self._odometry_publisher.is_available()
                 and self._point_cloud_publisher.is_available()
             ):
@@ -911,10 +1006,13 @@ class PlatformGeometryRuntime:
                 self._odometry_publisher.start()
                 self._point_cloud_publisher.start()
                 self._live_map_provider.start()
+                self._tf_localization_provider.start()
             except Exception:
                 self._odometry_publisher.stop()
                 self._point_cloud_publisher.stop()
+                self._live_map_provider.stop()
                 self._live_geometry_start_attempted = False
+                self._tf_localization_provider.stop()
                 raise
 
     def is_available(self) -> bool:
@@ -950,6 +1048,7 @@ class PlatformGeometryRuntime:
                 "source_kind": "disabled",
                 "backend_name": None,
                 "runtime_status": self.get_runtime_status(),
+                "navigation_backend_policy": self._navigation_backend_policy(),
                 "active_map_name": self._active_map_version.map_name if self._active_map_version is not None else None,
                 "active_map_version_id": self._active_map_version.version_id if self._active_map_version is not None else None,
                 **self.config.build_metadata(),
@@ -963,10 +1062,7 @@ class PlatformGeometryRuntime:
         source_kind = "unavailable"
         backend_name = None
         if backend is not None:
-            if backend in {
-                getattr(self, "_platform_navigation_runtime", None),
-                getattr(self, "_platform_exploration_runtime", None),
-            }:
+            if backend is getattr(self, "_platform_exploration_runtime", None):
                 source_kind = "platform_runtime"
             elif backend is getattr(self.robot, "data_plane_runtime", None):
                 source_kind = "platform_compat_runtime"
@@ -976,6 +1072,8 @@ class PlatformGeometryRuntime:
                 source_kind = "platform_compat_provider"
             elif backend is self._live_map_provider:
                 source_kind = "platform_live_map_provider"
+            elif backend is self._tf_localization_provider:
+                source_kind = "platform_tf_localization_provider"
             else:
                 source_kind = "platform_backend"
             backend_name = getattr(backend, "provider_name", None)
@@ -984,8 +1082,10 @@ class PlatformGeometryRuntime:
             "backend_name": backend_name,
             "runtime_status": self.get_runtime_status(),
             "live_map_provider": self._live_map_provider.get_status(),
+            "tf_localization_provider": self._tf_localization_provider.get_status(),
             "odometry_publisher": self._odometry_publisher.get_status(),
             "point_cloud_publisher": self._point_cloud_publisher.get_status(),
+            "navigation_backend_policy": self._navigation_backend_policy(),
             "active_map_name": self._active_map_version.map_name if self._active_map_version is not None else None,
             "active_map_version_id": self._active_map_version.version_id if self._active_map_version is not None else None,
             **self.config.build_metadata(),
@@ -995,13 +1095,13 @@ class PlatformGeometryRuntime:
         """返回探索建图输入链路的可行动诊断。"""
 
         live_map_status = self._clone_metadata(self._live_map_provider.get_status())
+        tf_localization_status = self._clone_metadata(self._tf_localization_provider.get_status())
         odometry_status = self._clone_metadata(self._odometry_publisher.get_status())
         point_cloud_status = self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = self._build_point_cloud_source_status()
         data_plane_status = self._build_data_plane_status()
         waiting_for, message = self._classify_live_mapping_wait(
             live_map_status=live_map_status,
-            odometry_status=odometry_status,
             point_cloud_status=point_cloud_status,
             point_cloud_source=point_cloud_source,
             data_plane_status=data_plane_status,
@@ -1016,12 +1116,14 @@ class PlatformGeometryRuntime:
             "runtime_status": self.get_runtime_status(),
             "rtabmap_readiness": self._build_rtabmap_readiness(
                 live_map_status=live_map_status,
+                tf_localization_status=tf_localization_status,
                 odometry_status=odometry_status,
                 point_cloud_status=point_cloud_status,
                 point_cloud_source=point_cloud_source,
                 data_plane_status=data_plane_status,
             ),
             "live_map_provider": live_map_status,
+            "tf_localization_provider": tf_localization_status,
             "odometry_publisher": odometry_status,
             "point_cloud_publisher": point_cloud_status,
             "point_cloud_source": point_cloud_source,
@@ -1316,32 +1418,156 @@ class PlatformGeometryRuntime:
             )
         return fallback_snapshot
 
+    def subscribe_map_updates(self, callback) -> int:
+        return self._live_map_provider.subscribe_map_updates(callback)
+
+    def unsubscribe_map_updates(self, subscription_id: int) -> bool:
+        return self._live_map_provider.unsubscribe_map_updates(subscription_id)
+
     def get_map_snapshot(self) -> Optional[MapSnapshot]:
         """返回当前平台几何运行时对外暴露的地图快照。"""
 
-        if self._active_map_version is None:
-            return None
         version = self._active_map_version
-        live_geometry_active = bool(
-            self._last_activation_result.get("live_geometry_active", False)
-            or self._live_map_provider.is_map_available()
-        )
-        live_occupancy = self._read_live_map_layer("occupancy_grid") if live_geometry_active else None
-        live_cost_map = self._read_live_map_layer("cost_map") if live_geometry_active else None
-        occupancy_grid = self._clone_contract(live_occupancy) or self._clone_contract(version.snapshot.occupancy_grid)
-        cost_map = self._clone_contract(live_cost_map) or self._clone_contract(version.snapshot.cost_map)
-        semantic_map = self._clone_contract(version.snapshot.semantic_map) or self._read_live_map_layer("semantic_map")
+        live_occupancy = self._read_live_map_layer("occupancy_grid")
+        live_cost_map = self._read_live_map_layer("cost_map")
+        live_available = live_occupancy is not None or live_cost_map is not None
+        if live_available:
+            return self._build_live_map_snapshot(
+                live_occupancy=live_occupancy,
+                live_cost_map=live_cost_map,
+                seed_version=version,
+            )
+        if version is None:
+            return None
+        occupancy_grid = self._clone_contract(version.snapshot.occupancy_grid)
+        cost_map = self._clone_contract(version.snapshot.cost_map)
+        semantic_map = self._clone_contract(version.snapshot.semantic_map)
         if occupancy_grid is None and cost_map is None and semantic_map is None:
             return None
         geometry_asset = version.geometry_asset
-        geometry_metadata = {
-            "source_kind": "platform_live_map_provider" if live_occupancy is not None or live_cost_map is not None else "platform_map_version",
-            "map_snapshot_kind": "live_streaming" if live_occupancy is not None or live_cost_map is not None else "offline_checkpoint",
-            "rtabmap_live_streaming_ready": bool(live_occupancy is not None or live_cost_map is not None),
-            "map_name": version.map_name,
-            "platform_map_version_id": version.version_id,
-            "platform_map_version_revision": version.revision,
-            "source_snapshot_version_id": version.source_version_id,
+        geometry_metadata = self._build_map_snapshot_geometry_metadata(
+            version=version,
+            geometry_asset=geometry_asset,
+            live_available=False,
+            map_snapshot_kind="offline_checkpoint",
+            source_kind="platform_map_version",
+        )
+        return MapSnapshot(
+            source_name=self.providers.provider_name,
+            version_id=version.version_id,
+            revision=version.revision,
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+            semantic_map=semantic_map,
+            metadata={
+                **dict(version.snapshot.metadata),
+                **geometry_metadata,
+            },
+        )
+
+    def _build_live_map_snapshot(self, *, live_occupancy, live_cost_map, seed_version: Optional[MapVersion]) -> MapSnapshot:
+        live_status = self._clone_metadata(self._live_map_provider.get_status())
+        update_sequence = live_status.get("update_sequence")
+        occupancy_sequence = int(live_status.get("occupancy_sequence") or live_status.get("occupancy_message_count") or 0)
+        cost_map_sequence = int(live_status.get("cost_map_sequence") or live_status.get("cost_map_message_count") or 0)
+        message_count = max(int(live_status.get("message_count") or 0), occupancy_sequence + cost_map_sequence)
+        content_revision = max(
+            int(live_status.get("occupancy_revision") or 0),
+            int(live_status.get("cost_map_revision") or 0),
+        )
+        revision_value = update_sequence or message_count or content_revision
+        try:
+            live_revision = max(1, int(revision_value or 1))
+        except (TypeError, ValueError):
+            live_revision = 1
+        seed = "|".join(str(part or "") for part in (
+            live_status.get("provider_name"),
+            live_status.get("occupancy_topic"),
+            live_status.get("cost_map_topic"),
+            live_status.get("started"),
+        ))
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16] if seed.strip("|") else "current"
+        metadata = {
+            "source_kind": "platform_live_map_provider",
+            "map_snapshot_kind": "live_streaming",
+            "live_streaming_ready": True,
+            "rtabmap_live_streaming_ready": True,
+            "source_name": live_status.get("provider_name") or self._live_map_provider.provider_name,
+            "update_sequence": update_sequence,
+            "occupancy_sequence": occupancy_sequence,
+            "cost_map_sequence": cost_map_sequence,
+            "message_count": message_count,
+            "occupancy_content_revision": live_status.get("occupancy_revision"),
+            "cost_map_content_revision": live_status.get("cost_map_revision"),
+            "content_revision": content_revision,
+            "occupancy_metrics": self._clone_metadata(live_status.get("occupancy_metrics") or {}),
+            "cost_map_metrics": self._clone_metadata(live_status.get("cost_map_metrics") or {}),
+            "live_map_provider": live_status,
+            "live_mapping_diagnostics": self.get_live_mapping_diagnostics(),
+        }
+        if seed_version is not None:
+            metadata.update({
+                "map_name": seed_version.map_name,
+                "seed_map_version_id": seed_version.version_id,
+                "seed_map_version_revision": seed_version.revision,
+                "seed_source_snapshot_version_id": seed_version.source_version_id,
+            })
+            metadata.update(self._build_map_snapshot_geometry_metadata(
+                version=seed_version,
+                geometry_asset=seed_version.geometry_asset,
+                live_available=True,
+                map_snapshot_kind="live_streaming",
+                source_kind="platform_live_map_provider",
+            ))
+        else:
+            metadata.update({
+                "geometry_stack": self.config.stack,
+                "occupancy_projection": self.config.rtabmap.occupancy_projection,
+                "costmap_source": self.config.nav2.costmap_source,
+                "parameter_summary": self._build_parameter_summary(),
+                "profile": self._clone_metadata(self.config.build_metadata().get("profile")),
+                "input_contract": self._clone_metadata(self.config.build_metadata().get("input_contract")),
+                "output_contract": self._clone_metadata(self.config.build_metadata().get("output_contract")),
+                "preprocessing": self._clone_metadata(self.config.build_metadata().get("preprocessing")),
+                "geometry_backend": self.describe_backend(),
+            })
+        return MapSnapshot(
+            source_name=str(live_status.get("provider_name") or self._live_map_provider.provider_name),
+            version_id="live_%s_%s" % (digest, live_revision),
+            revision=live_revision,
+            occupancy_grid=self._clone_contract(live_occupancy),
+            cost_map=self._clone_contract(live_cost_map),
+            semantic_map=self._clone_contract(seed_version.snapshot.semantic_map) if seed_version is not None else None,
+            metadata=metadata,
+        )
+
+    def _build_map_snapshot_geometry_metadata(
+        self,
+        *,
+        version: MapVersion,
+        geometry_asset: Optional[MapGeometryAssetBinding],
+        live_available: bool,
+        map_snapshot_kind: str,
+        source_kind: str,
+    ) -> Dict[str, object]:
+        version_metadata = {"map_name": version.map_name}
+        if map_snapshot_kind == "live_streaming":
+            version_metadata.update({
+                "seed_map_version_id": version.version_id,
+                "seed_map_version_revision": version.revision,
+                "seed_source_snapshot_version_id": version.source_version_id,
+            })
+        else:
+            version_metadata.update({
+                "platform_map_version_id": version.version_id,
+                "platform_map_version_revision": version.revision,
+                "source_snapshot_version_id": version.source_version_id,
+            })
+        metadata = {
+            "source_kind": source_kind,
+            "map_snapshot_kind": map_snapshot_kind,
+            "rtabmap_live_streaming_ready": bool(live_available),
+            **version_metadata,
             "geometry_stack": geometry_asset.geometry_stack if geometry_asset is not None else self.config.stack,
             "rtabmap_db_path": geometry_asset.rtabmap_db_path if geometry_asset is not None else None,
             "pcd_path": geometry_asset.pcd_path if geometry_asset is not None else None,
@@ -1356,9 +1582,12 @@ class PlatformGeometryRuntime:
             "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset) if geometry_asset is not None else None,
             "built_at": geometry_asset.built_at.isoformat() if geometry_asset is not None else None,
             "geometry_ready": bool(
-                geometry_asset is not None
-                and geometry_asset.quality_metrics.get("status") == "ready"
-                and (live_geometry_active or geometry_asset.quality_metrics.get("database", {}).get("present", False))
+                live_available
+                or (
+                    geometry_asset is not None
+                    and geometry_asset.quality_metrics.get("status") == "ready"
+                    and geometry_asset.quality_metrics.get("database", {}).get("present", False)
+                )
             ),
             "geometry_diagnostics": self._clone_metadata(
                 geometry_asset.quality_metrics.get("diagnostics", []) if geometry_asset is not None else []
@@ -1380,19 +1609,12 @@ class PlatformGeometryRuntime:
             "live_mapping_diagnostics": self.get_live_mapping_diagnostics(),
         }
         if geometry_asset is not None:
-            geometry_metadata.update(dict(geometry_asset.metadata))
-        return MapSnapshot(
-            source_name=self.providers.provider_name,
-            version_id=version.version_id,
-            revision=version.revision,
-            occupancy_grid=occupancy_grid,
-            cost_map=cost_map,
-            semantic_map=semantic_map,
-            metadata={
-                **dict(version.snapshot.metadata),
-                **geometry_metadata,
-            },
-        )
+            metadata.update(dict(geometry_asset.metadata))
+        metadata["source_kind"] = source_kind
+        metadata["map_snapshot_kind"] = map_snapshot_kind
+        metadata["rtabmap_live_streaming_ready"] = bool(live_available)
+        metadata.update(version_metadata)
+        return metadata
 
     def _is_geometry_profile_enabled(self) -> bool:
         return bool(self.config.enabled and self.config.rtabmap.profile_enabled)
@@ -1425,8 +1647,15 @@ class PlatformGeometryRuntime:
             return backend
         return None
 
-    def _resolve_localization_backend(self):
+    def _resolve_raw_localization_backend(self):
         return self._resolve_backend(LocalizationDataPlane, LocalizationProvider)
+
+    def _resolve_localization_backend(self):
+        if not self._is_geometry_profile_enabled():
+            return None
+        if self._tf_localization_provider.is_available():
+            return self._tf_localization_provider
+        return self._resolve_raw_localization_backend()
 
     def _resolve_mapping_backend(self):
         if self._live_map_provider.is_available():
@@ -1445,8 +1674,8 @@ class PlatformGeometryRuntime:
         mode = self._nav2_mode()
         if mode in _NAV2_DISABLED_MODES:
             return None
-        if mode in _NAV2_PLATFORM_FALLBACK_MODES:
-            return self._platform_navigation_runtime
+        if mode in _REMOVED_PLATFORM_GRID_MODES:
+            return None
         nav2_provider = getattr(self, "_nav2_action_provider", None)
         if mode in _NAV2_EXTERNAL_MODES or mode in _NAV2_SIDECAR_MODES:
             return nav2_provider
@@ -1681,6 +1910,125 @@ class PlatformGeometryRuntime:
             "process_running": process.is_running() if process is not None else False,
         }
 
+    def get_live_pointcloud_map_asset_summary(self) -> Dict[str, object]:
+        """返回当前累计点云地图 PCD 资产候选，不读取扫描帧。"""
+
+        if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
+            geometry_asset = self._active_map_version.geometry_asset
+            current_path = geometry_asset.pcd_path
+            if current_path:
+                return self._pointcloud_map_asset_summary(
+                    Path(current_path).expanduser(),
+                    source_kind="map_version_pcd",
+                    priority=1,
+                    map_name=self._active_map_version.map_name,
+                    map_version_id=self._active_map_version.version_id,
+                    frame_id=geometry_asset.frame_id or self._active_map_version.frame_id,
+                    geometry_stack=geometry_asset.geometry_stack,
+                    rtabmap_db_path=geometry_asset.rtabmap_db_path,
+                )
+
+        mapping_backend = self._resolve_mapping_backend()
+        if mapping_backend is not None:
+            getter = getattr(mapping_backend, "get_pcd_map_path", None)
+            if callable(getter):
+                candidate = str(getter() or "").strip()
+                if candidate:
+                    return self._pointcloud_map_asset_summary(
+                        Path(candidate).expanduser(),
+                        source_kind="mapping_backend_pcd",
+                        priority=2,
+                        frame_id=self.config.frames.map_frame,
+                        geometry_stack=self.config.stack,
+                    )
+
+        candidates = self._configured_pcd_asset_candidates()
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return self._pointcloud_map_asset_summary(
+                    candidate,
+                    source_kind="configured_pcd_root",
+                    priority=3,
+                    frame_id=self.config.frames.map_frame,
+                    geometry_stack=self.config.stack,
+                    expected_candidates=candidates,
+                )
+
+        primary = candidates[0] if candidates else None
+        if primary is not None:
+            return self._pointcloud_map_asset_summary(
+                primary,
+                source_kind="configured_pcd_root",
+                priority=3,
+                frame_id=self.config.frames.map_frame,
+                geometry_stack=self.config.stack,
+                expected_candidates=candidates,
+            )
+        return {
+            "available": False,
+            "status": "missing",
+            "source_kind": "configured_pcd_root",
+            "reason": "configured_pcd_root_empty",
+            "pcd_path": None,
+            "expected_candidates": [],
+            "frame_id": self.config.frames.map_frame,
+            "geometry_stack": self.config.stack,
+            "not_fallback_to_sensor_scan": True,
+        }
+
+    def _configured_pcd_asset_candidates(self) -> List[Path]:
+        configured_value = str(self.config.rtabmap.pcd_root or "").strip()
+        if not configured_value:
+            return []
+        configured_root = Path(configured_value).expanduser()
+        if configured_root.suffix == ".pcd":
+            return [configured_root]
+        return [
+            configured_root / self.config.rtabmap.outputs.pcd_asset_name,
+            configured_root / "cloud_map.pcd",
+            configured_root / "map.pcd",
+            configured_root / "current.pcd",
+        ]
+
+    def _pointcloud_map_asset_summary(
+        self,
+        path: Path,
+        *,
+        source_kind: str,
+        priority: int,
+        frame_id: Optional[str] = None,
+        geometry_stack: Optional[str] = None,
+        map_name: Optional[str] = None,
+        map_version_id: Optional[str] = None,
+        rtabmap_db_path: Optional[str] = None,
+        expected_candidates: Optional[List[Path]] = None,
+    ) -> Dict[str, object]:
+        resolved = path.expanduser().resolve(strict=False)
+        available = resolved.exists() and resolved.is_file()
+        summary: Dict[str, object] = {
+            "available": available,
+            "status": "available" if available else "missing",
+            "source_kind": source_kind,
+            "priority": priority,
+            "pcd_path": str(resolved),
+            "path": str(resolved),
+            "map_name": map_name,
+            "map_version_id": map_version_id,
+            "frame_id": frame_id or self.config.frames.map_frame,
+            "geometry_stack": geometry_stack or self.config.stack,
+            "rtabmap_db_path": rtabmap_db_path,
+            "not_fallback_to_sensor_scan": True,
+            "expected_candidates": [str(item.expanduser().resolve(strict=False)) for item in (expected_candidates or [path])],
+        }
+        if available:
+            try:
+                summary["file"] = self._file_metadata(resolved)
+            except Exception as exc:
+                summary["file"] = {"present": True, "path": str(resolved), "error": str(exc)}
+            return summary
+        summary["reason"] = "%s_missing" % source_kind
+        return summary
+
     def _locate_live_pcd_asset(self) -> Optional[Path]:
         if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
             current_path = self._active_map_version.geometry_asset.pcd_path
@@ -1813,32 +2161,208 @@ class PlatformGeometryRuntime:
             return None
         return getter()
 
+    def _has_live_or_seed_map(self) -> bool:
+        return bool(self._live_map_provider.is_map_available() or self._active_map_version is not None)
+
+    def subscribe_localization_updates(self, callback) -> Optional[int]:
+        """订阅平台 TF 定位输出。"""
+
+        if not self._is_geometry_profile_enabled():
+            return None
+        return self._tf_localization_provider.subscribe_localization(callback)
+
+    def unsubscribe_localization_updates(self, subscription_id: Optional[int]) -> None:
+        self._tf_localization_provider.unsubscribe_localization(subscription_id)
+
+    def subscribe_exploration_updates(self, callback: Callable[[ExplorationState], None]) -> int:
+        """订阅平台探索后台 tick 产生的状态快照。"""
+
+        if not callable(callback):
+            raise ValueError("exploration update callback must be callable")
+        with self._exploration_loop_lock:
+            subscription_id = self._next_exploration_subscription_id
+            self._next_exploration_subscription_id += 1
+            self._exploration_update_subscribers[subscription_id] = callback
+            return subscription_id
+
+    def unsubscribe_exploration_updates(self, subscription_id: int) -> bool:
+        with self._exploration_loop_lock:
+            return self._exploration_update_subscribers.pop(int(subscription_id), None) is not None
+
     def start_platform_exploration(self, request) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
         self._ensure_live_geometry_started()
         request = self._attach_live_mapping_diagnostics_to_request(request)
+        old_thread = None
+        with self._exploration_loop_lock:
+            self._exploration_loop_stop_event.set()
+            self._exploration_loop_generation += 1
+            old_thread = self._exploration_loop_thread
+        if old_thread is not None and old_thread.is_alive() and old_thread is not threading.current_thread():
+            old_thread.join(timeout=max(0.2, self._exploration_loop_interval_sec() * 2.0))
         self._cancel_platform_exploration_navigation()
-        return self._platform_exploration_runtime.start_exploration(request)
+        accepted = self._platform_exploration_runtime.start_exploration(request)
+        if not accepted:
+            return False
+        with self._exploration_loop_lock:
+            self._exploration_loop_stop_event.clear()
+            self._exploration_loop_generation += 1
+            self._exploration_tick_count = 0
+            self._exploration_last_tick_at_iso = None
+            self._exploration_last_tick_monotonic = None
+            self._exploration_last_tick_source = "start_exploration"
+            self._ensure_platform_exploration_loop_locked()
+        self._notify_exploration_update(self.get_platform_exploration_state())
+        return True
 
     def stop_platform_exploration(self) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
-        current_goal = self._platform_exploration_runtime.get_current_navigation_goal()
-        stopped = self._platform_exploration_runtime.stop_exploration()
-        self._cancel_platform_exploration_navigation(current_goal=current_goal)
-        self._notify_compat_exploration_stopped()
-        return stopped
+        return self._stop_platform_exploration_loop(cancel_navigation=True, notify=True)
 
     def report_platform_exploration_hit_stop(self, reason: str) -> None:
         if not self._is_geometry_profile_enabled():
             return
+        thread = None
+        with self._exploration_loop_lock:
+            self._exploration_loop_stop_event.set()
+            self._exploration_loop_generation += 1
+            thread = self._exploration_loop_thread
         current_goal = self._platform_exploration_runtime.get_current_navigation_goal()
         self._platform_exploration_runtime.report_hit_stop(reason)
         self._cancel_platform_exploration_navigation(current_goal=current_goal)
         self._notify_compat_exploration_stopped()
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.2, self._exploration_loop_interval_sec() * 2.0))
+        self._notify_exploration_update(self.get_platform_exploration_state())
 
-    def sync_platform_exploration(self) -> None:
+    def _stop_platform_exploration_loop(self, *, cancel_navigation: bool, notify: bool) -> bool:
+        thread = None
+        with self._exploration_loop_lock:
+            self._exploration_loop_stop_event.set()
+            self._exploration_loop_generation += 1
+            thread = self._exploration_loop_thread
+        current_goal = self._platform_exploration_runtime.get_current_navigation_goal()
+        stopped = self._platform_exploration_runtime.stop_exploration()
+        if cancel_navigation:
+            self._cancel_platform_exploration_navigation(current_goal=current_goal)
+        if stopped:
+            self._notify_compat_exploration_stopped()
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.2, self._exploration_loop_interval_sec() * 2.0))
+        if notify:
+            self._notify_exploration_update(self.get_platform_exploration_state())
+        return stopped
+
+    def _exploration_loop_interval_sec(self) -> float:
+        return max(0.02, float(getattr(self._platform_exploration_config, "status_poll_interval_sec", 0.2) or 0.2))
+
+    def _ensure_platform_exploration_loop_locked(self) -> None:
+        if (
+            self._exploration_loop_thread is not None
+            and self._exploration_loop_thread.is_alive()
+            and self._exploration_loop_thread_generation == self._exploration_loop_generation
+        ):
+            return
+        if not self._platform_exploration_runtime.is_running:
+            return
+        generation = self._exploration_loop_generation
+        self._exploration_loop_thread_generation = generation
+        self._exploration_loop_thread = threading.Thread(
+            target=self._platform_exploration_loop,
+            args=(generation,),
+            name="nuwax_platform_exploration_loop",
+            daemon=True,
+        )
+        self._exploration_loop_thread.start()
+
+    def _platform_exploration_loop(self, generation: int) -> None:
+        while not self._exploration_loop_stop_event.is_set():
+            state_snapshot = None
+            terminal = False
+            try:
+                with self._exploration_loop_lock:
+                    if generation != self._exploration_loop_generation:
+                        break
+                    if not self._platform_exploration_runtime.is_running:
+                        break
+                    self._record_exploration_tick_locked(tick_source="exploration_loop")
+                self.sync_platform_exploration(tick_source="exploration_loop")
+                state_snapshot = self.get_platform_exploration_state()
+                terminal = getattr(state_snapshot.status, "value", state_snapshot.status) in {
+                    ExplorationStatus.SUCCEEDED.value,
+                    ExplorationStatus.FAILED.value,
+                    ExplorationStatus.CANCELLED.value,
+                }
+            except Exception as exc:
+                self._record_runtime_diagnostic("exploration_loop", exc)
+                try:
+                    self._platform_exploration_runtime.fail_current(
+                        reason="平台探索后台循环失败：%s" % exc,
+                        failure_code="exploration_loop_error",
+                        waiting_for="exploration_loop",
+                        metadata=self._exploration_loop_metadata(tick_source="exploration_loop_error"),
+                    )
+                    state_snapshot = self.get_platform_exploration_state()
+                except Exception:
+                    state_snapshot = None
+                terminal = True
+            if state_snapshot is not None:
+                self._notify_exploration_update(state_snapshot)
+            if terminal:
+                self._exploration_loop_stop_event.set()
+                break
+            if self._exploration_loop_stop_event.wait(self._exploration_loop_interval_sec()):
+                break
+        with self._exploration_loop_lock:
+            if (
+                self._exploration_loop_thread is threading.current_thread()
+                and generation == self._exploration_loop_thread_generation
+            ):
+                self._exploration_loop_thread = None
+
+    def _record_exploration_tick_locked(self, *, tick_source: str) -> None:
+        self._exploration_tick_count += 1
+        self._exploration_last_tick_at_iso = _utc_now_iso()
+        self._exploration_last_tick_monotonic = time.monotonic()
+        self._exploration_last_tick_source = tick_source
+
+    def _exploration_loop_metadata(self, *, tick_source: str) -> Dict[str, object]:
+        with self._exploration_loop_lock:
+            thread = self._exploration_loop_thread
+            thread_alive = bool(thread is not None and thread.is_alive())
+            last_tick_source = self._exploration_last_tick_source or tick_source
+            return {
+                "exploration_tick_source": tick_source,
+                "exploration_last_tick_source": last_tick_source,
+                "exploration_tick_count": self._exploration_tick_count,
+                "exploration_last_tick_at": self._exploration_last_tick_at_iso,
+                "exploration_last_tick_monotonic": self._exploration_last_tick_monotonic,
+                "exploration_loop_interval_sec": self._exploration_loop_interval_sec(),
+                "exploration_loop_generation": self._exploration_loop_generation,
+                "exploration_loop": {
+                    "mode": "autonomous",
+                    "thread_alive": thread_alive,
+                    "stop_requested": self._exploration_loop_stop_event.is_set(),
+                    "generation": self._exploration_loop_generation,
+                    "tick_count": self._exploration_tick_count,
+                    "last_tick_at": self._exploration_last_tick_at_iso,
+                    "last_tick_source": last_tick_source,
+                    "interval_sec": self._exploration_loop_interval_sec(),
+                },
+            }
+
+    def _notify_exploration_update(self, state: ExplorationState) -> None:
+        with self._exploration_loop_lock:
+            subscribers = tuple(self._exploration_update_subscribers.values())
+        for callback in subscribers:
+            try:
+                callback(state.model_copy(deep=True))
+            except Exception:
+                pass
+
+    def sync_platform_exploration(self, *, tick_source: str = "manual") -> None:
         if not self._is_geometry_profile_enabled():
             return
         if not self._platform_exploration_runtime.is_running:
@@ -1857,6 +2381,12 @@ class PlatformGeometryRuntime:
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
         )
+        navigation_backend = self._resolve_navigation_backend()
+        navigation_backend_name = getattr(navigation_backend, "provider_name", None) if navigation_backend is not None else None
+        runtime_metadata.update({
+            **self._exploration_loop_metadata(tick_source=tick_source),
+            "navigation_backend_name": navigation_backend_name,
+        })
         waiting_for = runtime_metadata.get("waiting_for")
         if waiting_for:
             self._cancel_platform_exploration_navigation()
@@ -1881,13 +2411,31 @@ class PlatformGeometryRuntime:
         current_goal = self._platform_exploration_runtime.get_current_navigation_goal()
         if current_goal is None:
             return
-        navigation_backend = self._resolve_navigation_backend()
-        if navigation_backend is None or getattr(navigation_backend, "provider_name", "") != "nav2_action_navigation":
+        if navigation_backend is None:
             self._platform_exploration_runtime.block_on_prerequisite(
-                waiting_for="nav2_lifecycle",
-                message="探索 frontier 必须通过 Nav2 action 后端执行，当前未绑定 Nav2。",
-                failure_code="nav2_backend_unavailable",
+                waiting_for="navigation_backend",
+                message="探索 frontier 需要导航后端执行，当前未绑定可用导航后端。",
+                failure_code="navigation_backend_unavailable",
                 metadata=runtime_metadata,
+            )
+            return
+        availability_checker = getattr(navigation_backend, "is_navigation_available", None)
+        try:
+            navigation_available = bool(availability_checker()) if callable(availability_checker) else bool(navigation_backend.is_available())
+        except Exception:
+            navigation_available = False
+        if not navigation_available:
+            state = navigation_backend.get_navigation_state()
+            metadata = dict(getattr(state, "metadata", {}) or {})
+            readiness = metadata.get("nav2_readiness") if isinstance(metadata.get("nav2_readiness"), dict) else {}
+            waiting = self._normalize_exploration_waiting_for(
+                metadata.get("waiting_for") or readiness.get("waiting_for") or "navigation_backend"
+            )
+            self._platform_exploration_runtime.block_on_prerequisite(
+                waiting_for=waiting,
+                message=state.message or "探索 frontier 导航后端暂不可用。",
+                failure_code=str(metadata.get("failure_reason") or "navigation_backend_unavailable"),
+                metadata={**runtime_metadata, "navigation_state": self._clone_contract(state)},
             )
             return
         navigation_state = navigation_backend.get_navigation_state()
@@ -1903,19 +2451,20 @@ class PlatformGeometryRuntime:
             if not accepted:
                 state = navigation_backend.get_navigation_state()
                 metadata = dict(getattr(state, "metadata", {}) or {})
+                readiness = metadata.get("nav2_readiness") if isinstance(metadata.get("nav2_readiness"), dict) else {}
                 waiting = self._normalize_exploration_waiting_for(
-                    metadata.get("waiting_for") or metadata.get("nav2_readiness", {}).get("waiting_for") or "nav2_lifecycle"
+                    metadata.get("waiting_for") or readiness.get("waiting_for") or "navigation_backend"
                 )
                 self._platform_exploration_runtime.block_on_prerequisite(
                     waiting_for=waiting,
-                    message=state.message or "Nav2 action 后端拒绝探索前沿目标。",
-                    failure_code=str(metadata.get("failure_reason") or "nav2_goal_rejected"),
-                    metadata={**runtime_metadata, "nav2_state": self._clone_contract(state)},
+                    message=state.message or "%s 后端拒绝探索前沿目标。" % navigation_backend.provider_name,
+                    failure_code=str(metadata.get("failure_reason") or "navigation_goal_rejected"),
+                    metadata={**runtime_metadata, "navigation_state": self._clone_contract(state)},
                 )
             return
         if navigation_state.status in {NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
             self._platform_exploration_runtime.reject_current_target(
-                navigation_state.message or "探索前沿 Nav2 导航失败。"
+                navigation_state.message or "探索前沿导航失败。"
             )
             return
         if bool(navigation_backend.is_goal_reached() or navigation_state.goal_reached):
@@ -1924,9 +2473,16 @@ class PlatformGeometryRuntime:
     def get_platform_exploration_state(self) -> ExplorationState:
         if not self._is_geometry_profile_enabled():
             return self._platform_exploration_runtime.get_exploration_state()
-        self.sync_platform_exploration()
+        with self._exploration_loop_lock:
+            if self._platform_exploration_runtime.is_running:
+                self._ensure_platform_exploration_loop_locked()
         state = self._platform_exploration_runtime.get_exploration_state()
-        return self._augment_exploration_state_with_mapping_diagnostics(state)
+        state = self._augment_exploration_state_with_mapping_diagnostics(state)
+        metadata = {
+            **dict(getattr(state, "metadata", {}) or {}),
+            **self._exploration_loop_metadata(tick_source="get_exploration_state"),
+        }
+        return state.model_copy(update={"metadata": metadata}, deep=True)
 
     def _read_exploration_pose(self):
         navigation_backend = self._resolve_navigation_backend()
@@ -1947,6 +2503,29 @@ class PlatformGeometryRuntime:
         live_diagnostics = self.get_live_mapping_diagnostics()
         rtabmap_readiness = live_diagnostics.get("rtabmap_readiness") if isinstance(live_diagnostics.get("rtabmap_readiness"), dict) else {}
         nav2_status = self._build_nav2_status()
+        navigation_backend_policy = self._navigation_backend_policy()
+        navigation_backend = self._resolve_navigation_backend()
+        navigation_backend_name = getattr(navigation_backend, "provider_name", None) if navigation_backend is not None else None
+        navigation_backend_ready = False
+        navigation_backend_message = str(
+            navigation_backend_policy.get("message")
+            or "探索 frontier 需要导航后端执行，当前未绑定可用导航后端。"
+        )
+        navigation_backend_waiting_for = "navigation_backend"
+        if navigation_backend is not None:
+            availability_checker = getattr(navigation_backend, "is_navigation_available", None)
+            try:
+                navigation_backend_ready = bool(availability_checker()) if callable(availability_checker) else bool(navigation_backend.is_available())
+            except Exception as exc:
+                navigation_backend_ready = False
+                navigation_backend_message = "导航后端可用性检查失败：%s" % exc
+            else:
+                if navigation_backend_ready:
+                    navigation_backend_message = "%s 导航后端可用于探索 frontier 执行。" % navigation_backend_name
+                    navigation_backend_waiting_for = None
+                elif navigation_backend_name == "nav2_action_navigation":
+                    navigation_backend_waiting_for = self._normalize_exploration_waiting_for(nav2_status.get("waiting_for") or "nav2_lifecycle")
+                    navigation_backend_message = str(nav2_status.get("message") or "等待 Nav2 lifecycle/action/costmap ready。")
         map_stream = rtabmap_readiness.get("map_stream") if isinstance(rtabmap_readiness.get("map_stream"), dict) else {}
         map_revision = self._exploration_map_revision(snapshot, occupancy_grid, map_stream)
         costmap_revision = self._exploration_costmap_revision(snapshot, cost_map, map_stream, nav2_status)
@@ -1958,8 +2537,17 @@ class PlatformGeometryRuntime:
             "map_stream": self._clone_metadata(map_stream),
             "rtabmap_readiness": self._clone_metadata(rtabmap_readiness),
             "nav2_readiness": self._clone_metadata(nav2_status),
+            "navigation_backend": {
+                "provider_name": navigation_backend_name,
+                "ready": navigation_backend_ready,
+                "waiting_for": navigation_backend_waiting_for,
+                "message": navigation_backend_message,
+                "policy": self._clone_metadata(navigation_backend_policy),
+            },
+            "navigation_backend_policy": self._clone_metadata(navigation_backend_policy),
             "live_map_streaming_ready": bool(rtabmap_readiness.get("streaming_ready")),
             "nav2_ready": bool(nav2_status.get("ready")),
+            "navigation_backend_ready": navigation_backend_ready,
             "frontier_freshness": {
                 "fresh": True,
                 "map_revision": map_revision,
@@ -1991,23 +2579,25 @@ class PlatformGeometryRuntime:
             waiting_for = "costmap"
             message = "等待最新 costmap。"
             failure_code = "costmap_unavailable"
-        elif not bool(nav2_status.get("ready")):
-            waiting_for = self._normalize_exploration_waiting_for(nav2_status.get("waiting_for") or "nav2_lifecycle")
-            message = str(nav2_status.get("message") or "等待 Nav2 lifecycle/action/costmap ready。")
-            failure_code = "nav2_not_ready"
+        elif not navigation_backend_ready:
+            waiting_for = self._normalize_exploration_waiting_for(navigation_backend_waiting_for or "navigation_backend")
+            message = navigation_backend_message
+            failure_code = "navigation_backend_not_ready"
         if waiting_for:
             metadata.update({"waiting_for": waiting_for, "waiting_detail": message, "failure_code": failure_code})
             metadata["frontier_freshness"] = {**dict(metadata["frontier_freshness"]), "fresh": False, "stale_reason": waiting_for}
         return metadata
 
     def _normalize_exploration_waiting_for(self, value: object) -> str:
-        normalized = str(value or "").strip() or "nav2_lifecycle"
+        normalized = str(value or "").strip() or "navigation_backend"
         return {
             "lifecycle": "nav2_lifecycle",
             "action": "nav2_action",
             "ros2_action": "nav2_action",
             "tf": "tf",
             "costmap": "costmap",
+            "backend": "navigation_backend",
+            "navigation": "navigation_backend",
         }.get(normalized, normalized)
 
     def _frontier_goal_is_stale(self, goal: NavigationGoal, metadata: Dict[str, object]) -> bool:
@@ -2116,313 +2706,6 @@ class PlatformGeometryRuntime:
         return value
 
 
-class PlatformNavigationRuntime:
-    """平台正式导航运行时。
-
-    负责把 NavigationService 的正式导航链收口到平台侧：
-    - 目标接收、状态快照与取消语义由平台维护；
-    - 底层只暴露定位/地图/运动控制，不再要求机器人数据面实现导航数据面四件套；
-    - 路径规划与控制复用统一的 GridNavigationPlanner/NavigationSession。
-    """
-
-    provider_name = "platform_navigation_runtime"
-    provider_version = "0.1.0"
-
-    def __init__(
-        self,
-        runtime: "PlatformGeometryRuntime",
-        *,
-        planner_config: Optional[NavigationBackendConfig] = None,
-        control_config: Optional[NavigationControlConfig] = None,
-    ) -> None:
-        self.runtime = runtime
-        self._planner_config = planner_config or NavigationBackendConfig()
-        self._control_config = control_config or NavigationControlConfig()
-        self._planner = GridNavigationPlanner(self._planner_config)
-        self._lock = threading.RLock()
-        self._session: Optional[NavigationSession] = None
-        self._current_goal: Optional[NavigationGoal] = None
-        self._goal_reached = False
-        self._state = NavigationState(
-            status=NavigationStatus.IDLE,
-            message="平台网格导航空闲。",
-            metadata={"backend": "platform_grid_navigation"},
-        )
-
-    def is_available(self) -> bool:
-        return self.runtime._is_geometry_profile_enabled()
-
-    def is_navigation_available(self) -> bool:
-        return (
-            self.runtime._is_geometry_profile_enabled()
-            and self._resolve_motion_control() is not None
-            and self.runtime._resolve_localization_backend() is not None
-        )
-
-    def set_goal(self, goal: NavigationGoal) -> bool:
-        self.runtime._ensure_live_geometry_started()
-        if not self.is_navigation_available():
-            return False
-        goal_copy = goal.model_copy(deep=True)
-        current_pose = self._read_current_pose()
-        remaining_distance_m, remaining_yaw_rad = self._compute_goal_errors(current_pose, goal_copy.target_pose)
-        with self._lock:
-            self._stop_motion_locked()
-            self._current_goal = goal_copy
-            is_internal_exploration_goal = bool(goal_copy.metadata.get("exploration_request_id"))
-            if not is_internal_exploration_goal and hasattr(self.runtime.robot, "navigation_goal_count"):
-                try:
-                    self.runtime.robot.navigation_goal_count += 1
-                except Exception:
-                    pass
-            if not is_internal_exploration_goal and hasattr(self.runtime.robot, "last_goal_id"):
-                try:
-                    self.runtime.robot.last_goal_id = goal_copy.goal_id
-                except Exception:
-                    pass
-            self._session = NavigationSession(
-                goal=goal_copy,
-                planner=self._planner,
-                planner_config=self._planner_config,
-                control_config=self._control_config,
-            )
-            self._goal_reached = False
-            self._state = NavigationState(
-                current_goal_id=goal_copy.goal_id,
-                status=NavigationStatus.ACCEPTED,
-                current_pose=self._clone_pose(current_pose),
-                remaining_distance_m=remaining_distance_m,
-                remaining_yaw_rad=remaining_yaw_rad,
-                goal_reached=False,
-                message="平台网格导航目标已接受。",
-                metadata={
-                    "backend": "platform_grid_navigation",
-                    "execution_state": "accepted",
-                },
-            )
-        return True
-
-    def cancel_goal(self) -> bool:
-        with self._lock:
-            if self._current_goal is None and self._session is None and self._state.status == NavigationStatus.IDLE:
-                return False
-            current_pose = self._read_current_pose()
-            current_goal_id = (
-                self._current_goal.goal_id
-                if self._current_goal is not None
-                else self._state.current_goal_id
-            )
-            self._stop_motion_locked()
-            self._session = None
-            self._current_goal = None
-            self._goal_reached = False
-            self._state = NavigationState(
-                current_goal_id=current_goal_id,
-                status=NavigationStatus.CANCELLED,
-                current_pose=self._clone_pose(current_pose),
-                goal_reached=False,
-                message="平台网格导航已取消。",
-                metadata={"backend": "platform_grid_navigation"},
-            )
-            self.runtime._notify_compat_navigation_cancelled()
-            return True
-
-    def get_navigation_state(self) -> NavigationState:
-        with self._lock:
-            if self._session is None or self._current_goal is None:
-                return self._state.model_copy(deep=True)
-
-            current_pose = self._read_current_pose()
-            if current_pose is None:
-                self._state = self._state.model_copy(
-                    update={
-                        "status": NavigationStatus.PLANNING,
-                        "message": "等待定位位姿就绪后开始执行平台导航。",
-                        "metadata": {
-                            **dict(self._state.metadata),
-                            "backend": "platform_grid_navigation",
-                            "waiting_for": "current_pose",
-                        },
-                    },
-                    deep=True,
-                )
-                return self._state.model_copy(deep=True)
-
-            map_snapshot = self.runtime.get_map_snapshot()
-            occupancy_grid = self.runtime._clone_contract(map_snapshot.occupancy_grid) if map_snapshot is not None else None
-            cost_map = self.runtime._clone_contract(map_snapshot.cost_map) if map_snapshot is not None else None
-            if occupancy_grid is None:
-                occupancy_grid = self.runtime._read_live_map_layer("occupancy_grid")
-            if cost_map is None:
-                cost_map = self.runtime._read_live_map_layer("cost_map")
-
-            localization_status = self._read_localization_status()
-            motion_safety_allowed = self._read_motion_safety_allowed()
-            tick_result = self._session.tick(
-                current_pose=current_pose,
-                occupancy_grid=occupancy_grid,
-                cost_map=cost_map,
-                now_monotonic=time.monotonic(),
-                localization_status=localization_status,
-                motion_safety_allowed=motion_safety_allowed,
-            )
-            metadata = {
-                "backend": "platform_grid_navigation",
-                "nav2": self.runtime._build_nav2_status(),
-                **dict(tick_result.metadata),
-            }
-
-            if tick_result.status == NavigationStatus.RUNNING:
-                try:
-                    self._dispatch_motion_locked(current_pose=current_pose, tick_result=tick_result)
-                except Exception as exc:
-                    self._stop_motion_locked()
-                    self._session = None
-                    self._goal_reached = False
-                    self._state = NavigationState(
-                        current_goal_id=self._current_goal.goal_id,
-                        status=NavigationStatus.FAILED,
-                        current_pose=self._clone_pose(current_pose),
-                        goal_reached=False,
-                        message=f"平台导航运动控制失败：{exc}",
-                        metadata={
-                            **metadata,
-                            "motion_error": str(exc),
-                        },
-                    )
-                    return self._state.model_copy(deep=True)
-                current_pose = self._read_current_pose() or current_pose
-            else:
-                self._stop_motion_locked()
-                if tick_result.status == NavigationStatus.SUCCEEDED:
-                    self._goal_reached = True
-                    current_pose = self._read_current_pose() or current_pose
-                    self._session = None
-                elif tick_result.status in {NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
-                    self._goal_reached = False
-                    self._session = None
-
-            self._state = NavigationState(
-                current_goal_id=self._current_goal.goal_id,
-                status=tick_result.status,
-                current_pose=self._clone_pose(current_pose),
-                remaining_distance_m=tick_result.remaining_distance_m,
-                remaining_yaw_rad=tick_result.remaining_yaw_rad,
-                goal_reached=bool(self._goal_reached or tick_result.goal_reached),
-                message=tick_result.message,
-                metadata={
-                    **metadata,
-                    "pose_source": "localization_backend",
-                    "pose_writeback": False,
-                },
-            )
-            return self._state.model_copy(deep=True)
-
-    def is_goal_reached(self) -> bool:
-        with self._lock:
-            return bool(self._goal_reached or self._state.goal_reached)
-
-    def _resolve_motion_control(self) -> Optional[MotionControl]:
-        providers = getattr(self.runtime.robot, "providers", None)
-        if providers is None or not isinstance(providers, MotionControl):
-            return None
-        availability_checker = getattr(providers, "is_available", None)
-        if callable(availability_checker) and not availability_checker():
-            return None
-        return providers
-
-    def _read_current_pose(self) -> Optional[Pose]:
-        backend = self.runtime._resolve_localization_backend()
-        if backend is None:
-            return None
-        pose = backend.get_current_pose()
-        return self._clone_pose(pose)
-
-    def _read_localization_status(self) -> Optional[str]:
-        backend = self.runtime._resolve_localization_backend()
-        if backend is None:
-            return None
-        get_state = getattr(backend, "get_localization_state", None)
-        if callable(get_state):
-            try:
-                state = get_state()
-            except Exception:
-                state = None
-            if isinstance(state, dict):
-                for key in ("status", "tracking_state", "state"):
-                    value = str(state.get(key) or "").strip()
-                    if value:
-                        return value
-        return "tracking" if backend.get_current_pose() is not None else "lost"
-
-    def _read_motion_safety_allowed(self) -> Optional[bool]:
-        providers = getattr(self.runtime.robot, "providers", None)
-        safety_state = None
-        get_safety_state = getattr(providers, "get_safety_state", None)
-        if callable(get_safety_state):
-            try:
-                safety_state = get_safety_state()
-            except Exception:
-                safety_state = None
-        if safety_state is None:
-            robot_state = getattr(self.runtime.robot, "state", None)
-            safety_state = getattr(robot_state, "safety", None)
-        if safety_state is None:
-            return None
-        return bool(getattr(safety_state, "can_move", False)) and not bool(getattr(safety_state, "is_estopped", False))
-
-    def _dispatch_motion_locked(self, *, current_pose: Pose, tick_result) -> None:
-        motion_control = self._resolve_motion_control()
-        if motion_control is None:
-            raise RuntimeError("运动控制后端不可用")
-        motion_control.send_twist(
-            Twist(
-                frame_id=str(self.runtime.config.frames.base_frame or current_pose.frame_id or "base_link"),
-                linear=Vector3(x=float(tick_result.linear_x_mps)),
-                angular=Vector3(z=float(tick_result.angular_z_rps)),
-            )
-        )
-
-    def _stop_motion_locked(self) -> None:
-        motion_control = self._resolve_motion_control()
-        if motion_control is None:
-            return
-        try:
-            motion_control.stop_motion()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _clone_pose(pose: Optional[Pose]) -> Optional[Pose]:
-        return None if pose is None else pose.model_copy(deep=True)
-
-    @staticmethod
-    def _compute_goal_errors(
-        current_pose: Optional[Pose],
-        target_pose: Optional[Pose],
-    ) -> tuple[Optional[float], Optional[float]]:
-        if current_pose is None or target_pose is None:
-            return None, None
-        dx = float(target_pose.position.x - current_pose.position.x)
-        dy = float(target_pose.position.y - current_pose.position.y)
-        distance = math.hypot(dx, dy)
-        current_yaw = PlatformNavigationRuntime._yaw_from_pose(current_pose)
-        target_yaw = PlatformNavigationRuntime._yaw_from_pose(target_pose)
-        yaw_error = abs(PlatformNavigationRuntime._normalize_angle(target_yaw - current_yaw))
-        return distance, yaw_error
-
-    @staticmethod
-    def _yaw_from_pose(pose: Pose) -> float:
-        rotation = pose.orientation
-        siny_cosp = 2.0 * (rotation.w * rotation.z + rotation.x * rotation.y)
-        cosy_cosp = 1.0 - 2.0 * (rotation.y * rotation.y + rotation.z * rotation.z)
-        return math.atan2(siny_cosp, cosy_cosp)
-
-    @staticmethod
-    def _normalize_angle(angle_rad: float) -> float:
-        return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
-
-
 @dataclass
 class PlatformGeometryProviderBundle(
     LocalizationProvider,
@@ -2503,6 +2786,14 @@ class PlatformGeometryProviderBundle(
         backend = self.runtime._resolve_localization_backend()
         return None if backend is None else backend.get_frame_tree()
 
+    def subscribe_localization(self, callback) -> Optional[int]:
+        if not self._is_geometry_profile_enabled():
+            return None
+        return self.runtime.subscribe_localization_updates(callback)
+
+    def unsubscribe_localization(self, subscription_id: Optional[int]) -> None:
+        self.runtime.unsubscribe_localization_updates(subscription_id)
+
     def get_localization_state(self) -> dict:
         """返回后端原始定位状态，供平台定位状态机消费。"""
 
@@ -2526,14 +2817,21 @@ class PlatformGeometryProviderBundle(
             try:
                 state = get_state()
                 if isinstance(state, dict):
-                    return state
+                    return {
+                        **state,
+                        "backend_name": getattr(backend, "provider_name", None),
+                        "raw_odom_input": self.runtime._clone_metadata(self.runtime._odometry_publisher.get_status()),
+                        "tf_localization_provider": self.runtime._clone_metadata(self.runtime._tf_localization_provider.get_status()),
+                        "map_loaded": bool(state.get("map_loaded") or self.runtime._has_live_or_seed_map()),
+                    }
             except Exception:
                 pass
         # 回退到基于位姿可用性的简单判断
         pose = backend.get_current_pose()
         return {
             "tracking_state": "tracking" if pose is not None else "lost",
-            "map_loaded": self.runtime._active_map_version is not None,
+            "backend_name": getattr(backend, "provider_name", None),
+            "map_loaded": self.runtime._has_live_or_seed_map(),
             "quality_score": 1.0 if pose is not None else 0.0,
             "last_error": None,
         }
@@ -2541,7 +2839,16 @@ class PlatformGeometryProviderBundle(
     def get_status(self) -> dict:
         if not self._is_geometry_profile_enabled():
             return {"provider_status": "disabled"}
-        return self.runtime._clone_metadata(self.runtime._live_map_provider.get_status())
+        navigation_backend_policy = self.runtime._navigation_backend_policy()
+        return {
+            "provider_name": self.provider_name,
+            "provider_version": self.provider_version,
+            "localization_backend": getattr(self.runtime._resolve_localization_backend(), "provider_name", None),
+            "navigation_backend_policy": self.runtime._clone_metadata(navigation_backend_policy),
+            "active_navigation_backend": navigation_backend_policy.get("active_backend_provider"),
+            "tf_localization_provider": self.runtime._clone_metadata(self.runtime._tf_localization_provider.get_status()),
+            "live_map_provider": self.runtime._clone_metadata(self.runtime._live_map_provider.get_status()),
+        }
 
     def get_occupancy_grid(self):
         if not self._is_geometry_profile_enabled():
@@ -2582,12 +2889,44 @@ class PlatformGeometryProviderBundle(
         backend = self.runtime._resolve_navigation_backend()
         return False if backend is None else backend.cancel_goal()
 
+    def subscribe_navigation_updates(self, callback) -> Optional[int]:
+        if not self._is_geometry_profile_enabled():
+            return None
+        backend = self.runtime._resolve_navigation_backend()
+        subscriber = getattr(backend, "subscribe_navigation_updates", None)
+        if not callable(subscriber):
+            return None
+        return subscriber(callback)
+
+    def unsubscribe_navigation_updates(self, subscription_id: int) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
+        backend = self.runtime._resolve_navigation_backend()
+        unsubscribe = getattr(backend, "unsubscribe_navigation_updates", None)
+        if not callable(unsubscribe):
+            return False
+        return bool(unsubscribe(subscription_id))
+
     def get_navigation_state(self):
         backend = self.runtime._resolve_navigation_backend()
         if backend is None:
             from contracts.navigation import NavigationState, NavigationStatus
 
-            return NavigationState(status=NavigationStatus.IDLE, message="平台几何运行时未绑定导航后端。")
+            policy = self.runtime._navigation_backend_policy()
+            message = "平台几何运行时未绑定导航后端。"
+            if policy.get("selection") == "removed_platform_grid":
+                message = "platform_grid 自定义导航执行链已删除；请配置并使用 Nav2 action 导航。"
+            return NavigationState(
+                status=NavigationStatus.IDLE,
+                message=message,
+                metadata={
+                    "navigation_backend_policy": self.runtime._clone_metadata(policy),
+                    "active_navigation_backend": policy.get("active_backend_provider"),
+                    "nav2_action_active": bool(policy.get("nav2_action_active")),
+                    "platform_grid_active": bool(policy.get("platform_grid_active")),
+                    "platform_grid_removed": bool(policy.get("platform_grid_removed")),
+                },
+            )
         return backend.get_navigation_state()
 
     def is_goal_reached(self) -> bool:
@@ -2605,6 +2944,16 @@ class PlatformGeometryProviderBundle(
         if not self._is_geometry_profile_enabled():
             return False
         return self.runtime.stop_platform_exploration()
+
+    def subscribe_exploration_updates(self, callback) -> Optional[int]:
+        if not self._is_geometry_profile_enabled():
+            return None
+        return self.runtime.subscribe_exploration_updates(callback)
+
+    def unsubscribe_exploration_updates(self, subscription_id: int) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
+        return self.runtime.unsubscribe_exploration_updates(subscription_id)
 
     def get_exploration_state(self):
         return self.runtime.get_platform_exploration_state()

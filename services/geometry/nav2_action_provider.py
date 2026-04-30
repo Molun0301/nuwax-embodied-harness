@@ -166,12 +166,23 @@ class Nav2ActionNavigationProvider:
         readiness = self._readiness()
         with self._lock:
             state = self._state.model_copy(deep=True)
-        metadata = {**dict(state.metadata), "nav2_readiness": self._status_dict(readiness)}
+        metadata = {
+            **dict(state.metadata),
+            **self._navigation_backend_policy_metadata(),
+            "provider_name": self.provider_name,
+            "nav2_readiness": self._status_dict(readiness),
+        }
         if state.status == NavigationStatus.IDLE and not readiness.ready:
             return NavigationState(
                 status=NavigationStatus.FAILED,
                 message=readiness.message,
-                metadata={"backend": "nav2", "waiting_for": readiness.waiting_for, "nav2_readiness": self._status_dict(readiness)},
+                metadata={
+                    "backend": "nav2",
+                    "waiting_for": readiness.waiting_for,
+                    **self._navigation_backend_policy_metadata(),
+                    "provider_name": self.provider_name,
+                    "nav2_readiness": self._status_dict(readiness),
+                },
             )
         return state.model_copy(update={"metadata": metadata}, deep=True)
 
@@ -191,7 +202,8 @@ class Nav2ActionNavigationProvider:
             "global_costmap_topic": self.runtime.config.nav2.global_costmap_topic,
             "local_costmap_topic": self.runtime.config.nav2.local_costmap_topic,
             "costmap_source": self.runtime.config.nav2.costmap_source,
-            "grid_navigation_backend": "platform_grid_navigation",
+            "platform_grid_removed": True,
+            "grid_navigation_backend": None,
             "grid_navigation_is_nav2": False,
             "action_client_connected": readiness.action_server_ready,
             "lifecycle_ready": self._lifecycle_ready(readiness.lifecycle),
@@ -201,6 +213,19 @@ class Nav2ActionNavigationProvider:
             "costmaps": readiness.costmaps,
             "tf_ready": readiness.tf_ready,
             "errors": readiness.errors,
+        }
+
+    def _navigation_backend_policy_metadata(self) -> Dict[str, object]:
+        policy_builder = getattr(self.runtime, "_navigation_backend_policy", None)
+        if not callable(policy_builder):
+            return {}
+        policy = policy_builder()
+        return {
+            "navigation_backend_policy": self.runtime._clone_metadata(policy),
+            "active_navigation_backend": policy.get("active_backend_provider"),
+            "nav2_action_active": bool(policy.get("nav2_action_active")),
+            "platform_grid_active": bool(policy.get("platform_grid_active")),
+            "platform_grid_removed": bool(policy.get("platform_grid_removed")),
         }
 
     def _readiness(self) -> _Nav2Readiness:

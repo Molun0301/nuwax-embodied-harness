@@ -81,7 +81,18 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     @router.get("/api/debug/snapshot")
     async def debug_overview(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        return _stream_migration_response('robot.state', 'map.frame', 'localization.pose', 'navigation.state', 'exploration.state', 'logs.entry', 'tasks.state')
+        return _stream_migration_response(
+            'robot.state',
+            'map.frame',
+            'localization.pose',
+            'navigation.state',
+            'exploration.state',
+            'runtime.governance',
+            'pointcloud_map.meta',
+            'pointcloud.frame',
+            'logs.entry',
+            'tasks.state',
+        )
 
     @router.get("/api/debug/map")
     @router.get("/api/debug/map/frame/latest")
@@ -137,388 +148,577 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 def _render_debug_page(access_token: str) -> str:
     debug_access_token = json.dumps(access_token)
     html = """<!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>nuwax_robot_bridge 只读机器人监控驾驶舱</title>
   <style>
     :root {
-      color-scheme: dark;
+      --bg: #f4f7fb;
+      --bg-grad-a: rgba(37, 99, 235, 0.10);
+      --bg-grad-b: rgba(14, 165, 233, 0.08);
+      --surface: rgba(255, 255, 255, 0.88);
+      --surface-strong: rgba(255, 255, 255, 0.96);
+      --panel: rgba(255, 255, 255, 0.86);
+      --panel-soft: rgba(248, 250, 252, 0.80);
+      --panel-strong: #f8fafc;
+      --border: rgba(148, 163, 184, 0.32);
+      --border-soft: rgba(148, 163, 184, 0.18);
+      --border-strong: rgba(37, 99, 235, 0.46);
+      --text: #0f172a;
+      --muted: #64748b;
+      --muted-strong: #334155;
+      --good: #16a34a;
+      --warn: #ca8a04;
+      --bad: #dc2626;
+      --info: #2563eb;
+      --accent: #2563eb;
+      --accent-strong: #0ea5e9;
+      --map-line: #0ea5e9;
+      --map-robot: #f59e0b;
+      --unknown: #cbd5e1;
+      --free: #dbeafe;
+      --occupied: #172033;
+      --frontier: #db2777;
+      --shadow: 0 22px 70px rgba(15, 23, 42, 0.12);
+      --shadow-soft: 0 10px 34px rgba(15, 23, 42, 0.08);
+      --radius: 20px;
+      --radius-sm: 14px;
+    }
+    [data-theme="dark"] {
       --bg: #07111f;
-      --bg-radial-a: rgba(34, 211, 238, 0.18);
-      --bg-radial-b: rgba(124, 58, 237, 0.14);
-      --surface: rgba(11, 18, 32, 0.92);
-      --surface-strong: rgba(15, 23, 42, 0.96);
-      --panel: rgba(15, 23, 42, 0.92);
-      --panel-soft: rgba(30, 41, 59, 0.74);
-      --panel-strong: rgba(30, 41, 59, 0.96);
-      --border: rgba(148, 163, 184, 0.22);
-      --border-soft: rgba(148, 163, 184, 0.14);
+      --bg-grad-a: rgba(34, 211, 238, 0.14);
+      --bg-grad-b: rgba(37, 99, 235, 0.12);
+      --surface: rgba(15, 23, 42, 0.72);
+      --surface-strong: rgba(15, 23, 42, 0.90);
+      --panel: rgba(15, 23, 42, 0.74);
+      --panel-soft: rgba(30, 41, 59, 0.58);
+      --panel-strong: rgba(15, 23, 42, 0.92);
+      --border: rgba(148, 163, 184, 0.18);
+      --border-soft: rgba(148, 163, 184, 0.11);
       --border-strong: rgba(34, 211, 238, 0.42);
       --text: #f8fafc;
       --muted: #94a3b8;
       --muted-strong: #cbd5e1;
-      --good: #86efac;
-      --warn: #fde68a;
-      --bad: #fca5a5;
-      --info: #93c5fd;
-      --accent: #22d3ee;
-      --accent-strong: #67e8f9;
-      --map-line: #22d3ee;
+      --good: #4ade80;
+      --warn: #facc15;
+      --bad: #f87171;
+      --info: #60a5fa;
+      --accent: #38bdf8;
+      --accent-strong: #22d3ee;
+      --map-line: #38bdf8;
       --map-robot: #fbbf24;
       --unknown: #334155;
-      --free: #dbeafe;
+      --free: #93c5fd;
       --occupied: #020617;
       --frontier: #f472b6;
-      --shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
-      --shadow-soft: 0 14px 38px rgba(0, 0, 0, 0.24);
+      --shadow: 0 28px 90px rgba(0, 0, 0, 0.36);
+      --shadow-soft: 0 16px 44px rgba(0, 0, 0, 0.24);
     }
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; }
     body {
       margin: 0;
-      padding: 20px;
+      padding: 14px;
       min-height: 100vh;
       background:
-        radial-gradient(circle at 8% 8%, var(--bg-radial-a), transparent 32rem),
-        radial-gradient(circle at 92% 6%, var(--bg-radial-b), transparent 36rem),
-        linear-gradient(135deg, #020617 0%, var(--bg) 46%, #0f172a 100%);
+        radial-gradient(circle at 10% 6%, var(--bg-grad-a), transparent 32rem),
+        radial-gradient(circle at 88% 4%, var(--bg-grad-b), transparent 36rem),
+        linear-gradient(135deg, var(--bg) 0%, var(--panel-strong) 100%);
       color: var(--text);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
-      letter-spacing: 0;
+      transition: background 0.3s ease, color 0.3s ease;
     }
-    .app-shell { max-width: 1780px; margin: 0 auto; }
-    .topbar { display: grid; grid-template-columns: minmax(300px, 0.62fr) minmax(560px, 1.38fr); gap: 16px; align-items: stretch; margin-bottom: 16px; }
-    .brand-block, .global-status {
+    .app-shell { width: min(100%, 2260px); margin: 0 auto; display: grid; gap: 12px; }
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(300px, 0.46fr) minmax(0, 1.54fr);
+      gap: 12px;
+      align-items: stretch;
+    }
+    .brand-block, .global-status, .panel, .card, .side-nav {
       position: relative;
       overflow: hidden;
-      background: linear-gradient(145deg, rgba(15, 23, 42, 0.94), rgba(15, 23, 42, 0.72));
+      background: linear-gradient(180deg, var(--panel), var(--panel-soft));
       border: 1px solid var(--border);
-      border-radius: 20px;
-      padding: 18px;
+      border-radius: var(--radius);
       box-shadow: var(--shadow-soft);
       backdrop-filter: blur(18px);
+      transition: background 0.3s ease, border-color 0.3s ease;
     }
-    .brand-block::before, .global-status::before, .panel::before, .card::before {
+    .brand-block::before, .global-status::before, .panel::before, .card::before, .side-nav::before {
       content: "";
       position: absolute;
       inset: 0 0 auto;
       height: 1px;
-      background: linear-gradient(90deg, transparent, rgba(103, 232, 249, 0.7), transparent);
+      background: linear-gradient(90deg, transparent, var(--accent-strong), transparent);
+      opacity: 0.58;
       pointer-events: none;
     }
-    .brand-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+    .brand-block { padding: 14px 16px; display: grid; align-content: center; gap: 6px; }
+    .brand-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     h1, h2, h3 { margin: 0; }
-    h1 { font-size: clamp(26px, 2.1vw, 38px); line-height: 1.08; font-weight: 780; letter-spacing: -0.04em; }
-    h2 { font-size: 17px; line-height: 1.3; font-weight: 720; letter-spacing: -0.01em; }
-    h3 { font-size: 14px; line-height: 1.35; color: var(--muted-strong); font-weight: 680; }
-    code { color: #a5f3fc; word-break: break-all; }
-    canvas { display: block; width: 100%; border-radius: 18px; background: #020617; border: 1px solid rgba(148, 163, 184, 0.18); box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.92); }
+    h1 { font-size: clamp(22px, 1.55vw, 32px); line-height: 1.05; font-weight: 780; letter-spacing: -0.04em; }
+    h2 { font-size: 15px; line-height: 1.25; font-weight: 720; letter-spacing: -0.01em; }
+    h3 { font-size: 13px; line-height: 1.35; color: var(--muted-strong); font-weight: 700; }
+    code { color: var(--accent-strong); word-break: break-all; }
+    canvas { display: block; width: 100%; border-radius: var(--radius-sm); background: var(--occupied); border: 1px solid var(--border-soft); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04); }
     .muted { color: var(--muted); }
-    .small { font-size: 12px; line-height: 1.55; }
-    .eyebrow { color: var(--accent-strong); font-size: 12px; font-weight: 780; letter-spacing: 0.12em; text-transform: uppercase; }
-    .readonly { color: #bae6fd; }
-    .grid { display: grid; gap: 14px; }
-    .mission-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 16px; align-items: start; }
+    .small { font-size: 12px; line-height: 1.45; }
+    .eyebrow { color: var(--accent-strong); font-size: 11px; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; }
+    .readonly { color: var(--info); }
+    .grid { display: grid; gap: 12px; min-width: 0; }
+    .mission-layout { display: grid; gap: 12px; min-width: 0; }
     .side-nav {
-      position: sticky;
-      top: 18px;
-      display: grid;
-      gap: 7px;
-      padding: 10px;
-      background: rgba(15, 23, 42, 0.78);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      box-shadow: var(--shadow-soft);
-      backdrop-filter: blur(14px);
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      overflow-x: auto;
+      padding: 8px;
+      border-radius: 16px;
+      scrollbar-width: thin;
     }
     .side-nav a {
       color: var(--muted-strong);
       text-decoration: none;
       border: 1px solid transparent;
-      border-radius: 13px;
-      padding: 10px 11px;
-      font-size: 13px;
-      font-weight: 650;
-      transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease, transform 0.16s ease;
+      border-radius: 999px;
+      padding: 8px 11px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+      transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
     }
-    .side-nav a:hover { border-color: var(--border-strong); background: rgba(34, 211, 238, 0.1); color: var(--text); transform: translateX(2px); }
-    .mission-content { display: grid; gap: 14px; min-width: 0; }
-    .section-band { scroll-margin-top: 18px; display: grid; gap: 14px; }
-    .section-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 0 3px; }
-    .overview-grid { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); align-items: stretch; }
-    .mission-grid { grid-template-columns: minmax(260px, 0.8fr) minmax(260px, 0.8fr) minmax(320px, 1fr); }
-    .workspace { grid-template-columns: minmax(680px, 1.28fr) minmax(440px, 0.72fr); align-items: start; }
-    .right-rail { grid-template-columns: 1fr; }
-    .card, .panel {
-      position: relative;
-      overflow: hidden;
-      background: linear-gradient(180deg, var(--panel), rgba(15, 23, 42, 0.82));
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      padding: 15px;
-      box-shadow: var(--shadow-soft);
+    .side-nav a:hover { border-color: var(--border-strong); background: rgba(37, 99, 235, 0.09); color: var(--text); }
+    [data-theme="dark"] .side-nav a:hover { background: rgba(34, 211, 238, 0.10); }
+    .mission-content { display: grid; gap: 12px; min-width: 0; }
+    .section-band { scroll-margin-top: 16px; display: grid; gap: 12px; min-width: 0; }
+    .section-title { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 0 3px; }
+    .overview-grid { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); align-items: stretch; }
+    #overview .overview-grid { max-height: min(32vh, 320px); overflow: auto; padding-right: 2px; }
+    #overview .status-card { min-height: 104px; }
+    .mission-grid { grid-template-columns: minmax(230px, 0.88fr) minmax(260px, 1fr) minmax(260px, 1fr); }
+    .workspace {
+      grid-template-columns: minmax(0, 1.95fr) minmax(330px, 0.72fr);
+      align-items: stretch;
+      gap: 12px;
+      min-height: calc(100vh - 166px);
     }
-    .panel.compact { padding: 13px; }
-    .status-card { display: grid; gap: 10px; min-height: 176px; align-content: start; }
-    .status-card .card-head { align-items: flex-start; }
-    .status-card .kv { grid-template-columns: minmax(98px, 0.38fr) minmax(0, 1fr); }
+    .right-rail { grid-template-columns: 1fr; gap: 12px; max-height: calc(100vh - 154px); overflow: auto; padding-right: 2px; }
+    .diagnostics-grid { grid-template-columns: minmax(340px, 0.8fr) minmax(360px, 0.78fr) minmax(420px, 1.08fr); align-items: start; }
+    .card, .panel { padding: 13px; }
+    .panel.compact { padding: 12px; }
+    .panel.map-panel { padding: 12px; box-shadow: var(--shadow); display: flex; flex-direction: column; min-height: calc(100vh - 166px); }
+    .status-card { display: grid; gap: 8px; min-height: 136px; align-content: start; }
+    .status-card .card-head { align-items: flex-start; margin-bottom: 4px; }
+    .status-card .kv { grid-template-columns: minmax(92px, 0.36fr) minmax(0, 1fr); }
     .status-card .kv div { min-width: 0; }
     .status-card .mono { white-space: normal; word-break: normal; overflow-wrap: break-word; }
-    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .global-status { display: grid; grid-template-columns: repeat(4, minmax(126px, 1fr)); gap: 10px; align-items: stretch; }
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    .global-status { display: grid; grid-template-columns: repeat(8, minmax(108px, 1fr)) auto; gap: 8px; align-items: stretch; padding: 10px; }
     .metric-strip { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
     .metric {
       border: 1px solid var(--border-soft);
-      border-radius: 16px;
-      padding: 10px 11px;
-      background: rgba(15, 23, 42, 0.72);
+      border-radius: 14px;
+      padding: 8px 10px;
+      background: var(--panel-strong);
       color: var(--muted-strong);
-      min-width: 126px;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+      min-width: 0;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      transition: background 0.3s ease, border-color 0.3s ease;
     }
-    .metric b { display: block; font-size: 15px; color: var(--text); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
-    .metric span { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }
+    .metric b { display: block; font-size: 14px; color: var(--text); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .metric span { display: block; color: var(--muted); font-size: 10.5px; margin-top: 3px; }
     .pill {
       display: inline-flex;
       align-items: center;
       gap: 7px;
       border-radius: 999px;
-      padding: 5px 10px;
-      font-size: 12px;
-      font-weight: 700;
+      padding: 5px 9px;
+      font-size: 11.5px;
+      font-weight: 760;
       border: 1px solid var(--border);
-      background: rgba(15, 23, 42, 0.78);
+      background: var(--panel-strong);
       color: var(--muted-strong);
       white-space: nowrap;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease;
     }
-    .pill::before { content: ""; width: 8px; height: 8px; border-radius: 999px; background: var(--muted); box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.12); }
-    .pill.available { border-color: rgba(134, 239, 172, 0.44); background: rgba(22, 101, 52, 0.24); color: #dcfce7; }
-    .pill.available::before { background: var(--good); box-shadow: 0 0 16px rgba(134, 239, 172, 0.62); }
-    .pill.stale { border-color: rgba(253, 230, 138, 0.46); background: rgba(113, 63, 18, 0.26); color: #fef3c7; }
-    .pill.stale::before { background: var(--warn); box-shadow: 0 0 16px rgba(253, 230, 138, 0.55); }
-    .pill.missing, .pill.unsupported { border-color: rgba(148, 163, 184, 0.28); background: rgba(51, 65, 85, 0.32); color: #cbd5e1; }
+    .pill::before { content: ""; width: 7px; height: 7px; border-radius: 999px; background: var(--muted); box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.12); }
+    .pill.available { border-color: rgba(22, 163, 74, 0.45); background: rgba(22, 163, 74, 0.10); color: #15803d; }
+    [data-theme="dark"] .pill.available { border-color: rgba(74, 222, 128, 0.45); background: rgba(22, 101, 52, 0.24); color: #dcfce7; }
+    .pill.available::before { background: var(--good); box-shadow: 0 0 12px rgba(22, 163, 74, 0.45); }
+    [data-theme="dark"] .pill.available::before { box-shadow: 0 0 16px rgba(74, 222, 128, 0.55); }
+    .pill.stale { border-color: rgba(202, 138, 4, 0.45); background: rgba(202, 138, 4, 0.10); color: #a16207; }
+    [data-theme="dark"] .pill.stale { border-color: rgba(250, 204, 21, 0.45); background: rgba(113, 63, 18, 0.26); color: #fef3c7; }
+    .pill.stale::before { background: var(--warn); box-shadow: 0 0 12px rgba(202, 138, 4, 0.45); }
+    [data-theme="dark"] .pill.stale::before { box-shadow: 0 0 16px rgba(250, 204, 21, 0.55); }
+    .pill.missing, .pill.unsupported { border-color: rgba(148, 163, 184, 0.30); background: rgba(148, 163, 184, 0.10); color: #64748b; }
+    [data-theme="dark"] .pill.missing, [data-theme="dark"] .pill.unsupported { border-color: rgba(148, 163, 184, 0.28); background: rgba(51, 65, 85, 0.32); color: #cbd5e1; }
     .pill.missing::before, .pill.unsupported::before { background: var(--unknown); }
-    .pill.error { border-color: rgba(252, 165, 165, 0.5); background: rgba(127, 29, 29, 0.3); color: #fee2e2; }
-    .pill.error::before { background: var(--bad); box-shadow: 0 0 16px rgba(252, 165, 165, 0.6); }
-    .estop { border-color: rgba(252, 165, 165, 0.58); color: #fee2e2; background: rgba(127, 29, 29, 0.22); }
-    .kv { display: grid; grid-template-columns: minmax(112px, 0.42fr) minmax(0, 1fr); gap: 6px 10px; font-size: 12px; line-height: 1.45; }
+    .pill.error { border-color: rgba(220, 38, 38, 0.45); background: rgba(220, 38, 38, 0.10); color: #b91c1c; }
+    [data-theme="dark"] .pill.error { border-color: rgba(248, 113, 113, 0.50); background: rgba(127, 29, 29, 0.30); color: #fee2e2; }
+    .pill.error::before { background: var(--bad); box-shadow: 0 0 12px rgba(220, 38, 38, 0.45); }
+    [data-theme="dark"] .pill.error::before { box-shadow: 0 0 16px rgba(248, 113, 113, 0.55); }
+    .estop { align-self: center; justify-content: center; border-color: rgba(220, 38, 38, 0.55); color: #b91c1c; background: rgba(220, 38, 38, 0.10); }
+    [data-theme="dark"] .estop { border-color: rgba(248, 113, 113, 0.58); color: #fee2e2; background: rgba(127, 29, 29, 0.22); }
+    .kv { display: grid; grid-template-columns: minmax(108px, 0.40fr) minmax(0, 1fr); gap: 5px 9px; font-size: 11.5px; line-height: 1.42; }
     .kv div:nth-child(odd) { color: var(--muted); }
     .kv div:nth-child(even) { color: var(--muted-strong); }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; overflow-wrap: break-word; word-break: normal; font-variant-numeric: tabular-nums; }
-    .empty, .error-text { color: #fee2e2; background: rgba(127, 29, 29, 0.2); border: 1px solid rgba(252, 165, 165, 0.28); border-radius: 14px; padding: 10px 11px; }
-    .notice { color: #fef3c7; background: rgba(113, 63, 18, 0.22); border: 1px solid rgba(253, 230, 138, 0.28); border-radius: 14px; padding: 10px 11px; }
-    .panel-meta { margin-top: 10px; }
-    .canvas-wrap { position: relative; background: #020617; border-radius: 18px; padding: 1px; border: 1px solid rgba(148, 163, 184, 0.16); overflow: hidden; }
-    #mapCanvas { height: min(64vh, 700px); min-height: 450px; image-rendering: pixelated; }
+    .empty, .error-text { color: #b91c1c; background: rgba(220, 38, 38, 0.08); border: 1px solid rgba(220, 38, 38, 0.25); border-radius: 12px; padding: 9px 10px; }
+    [data-theme="dark"] .empty, [data-theme="dark"] .error-text { color: #fee2e2; background: rgba(127, 29, 29, 0.20); border-color: rgba(252, 165, 165, 0.28); }
+    .notice { color: #a16207; background: rgba(202, 138, 4, 0.08); border: 1px solid rgba(202, 138, 4, 0.25); border-radius: 12px; padding: 9px 10px; }
+    [data-theme="dark"] .notice { color: #fef3c7; background: rgba(113, 63, 18, 0.22); border-color: rgba(253, 230, 138, 0.28); }
+    .panel-meta { margin-top: 9px; }
+    .canvas-wrap { position: relative; flex: 1 1 auto; background: var(--occupied); border-radius: var(--radius-sm); padding: 1px; border: 1px solid var(--border-soft); overflow: hidden; min-height: 480px; }
+    #mapCanvas { height: 100%; min-height: 480px; image-rendering: pixelated; }
     .map-toolbar { position: absolute; z-index: 2; left: 12px; top: 12px; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
-    .map-control { min-height: 30px; border: 1px solid rgba(34, 211, 238, 0.34); border-radius: 11px; background: rgba(2, 6, 23, 0.78); color: #cffafe; padding: 5px 9px; font: inherit; font-size: 12px; font-weight: 720; cursor: pointer; }
-    .map-control:hover { border-color: var(--accent-strong); background: rgba(8, 47, 73, 0.72); }
-    .map-chip { border: 1px solid rgba(34, 211, 238, 0.3); background: rgba(2, 6, 23, 0.74); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: #cffafe; backdrop-filter: blur(10px); }
-    .map-stream-chip { position: absolute; z-index: 2; right: 12px; top: 12px; max-width: min(430px, calc(100% - 24px)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .video-stage { position: relative; border-radius: 18px; overflow: hidden; border: 1px solid rgba(148, 163, 184, 0.18); background: #020617; box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.9); }
-    .video-frame { display: block; width: 100%; min-height: 230px; max-height: 360px; object-fit: contain; background: #020617; }
-    .video-overlay { position: absolute; left: 12px; right: 12px; bottom: 12px; display: flex; justify-content: space-between; gap: 8px; pointer-events: none; }
-    .overlay-chip { border: 1px solid rgba(34, 211, 238, 0.36); background: rgba(2, 6, 23, 0.78); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: #cffafe; backdrop-filter: blur(10px); }
-    .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
-    .legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
-    .swatch { width: 13px; height: 13px; border: 1px solid rgba(226, 232, 240, 0.42); border-radius: 4px; }
-    .logs { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 2px; }
-    .log-line { border: 1px solid var(--border-soft); border-left: 3px solid rgba(147, 197, 253, 0.64); border-radius: 13px; padding: 9px 10px; background: rgba(2, 6, 23, 0.46); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.45; }
-    .log-line .meta { color: #93c5fd; font-size: 12px; margin-bottom: 4px; }
-    .log-line.warn, .log-line.warning { border-left-color: rgba(253, 230, 138, 0.82); }
-    .log-line.warn .meta, .log-line.warning .meta { color: #fef3c7; }
-    .log-line.error, .log-line.critical { border-left-color: rgba(252, 165, 165, 0.88); }
-    .log-line.error .meta, .log-line.critical .meta { color: #fecaca; }
+    .map-control { min-height: 30px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface-strong); color: var(--accent-strong); padding: 5px 9px; font: inherit; font-size: 12px; font-weight: 740; cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease; }
+    .map-control:hover { border-color: var(--accent); background: var(--panel-soft); }
+    .map-chip { border: 1px solid var(--border-strong); background: var(--surface-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: var(--accent-strong); backdrop-filter: blur(10px); }
+    .map-stream-chip { position: absolute; z-index: 2; right: 12px; top: 12px; max-width: min(520px, calc(100% - 24px)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .map-info-grid { grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); margin-top: 10px; max-height: 176px; overflow: auto; padding-right: 2px; }
+    .video-stage { position: relative; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border-soft); background: var(--occupied); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04); }
+    .video-frame { display: block; width: 100%; min-height: 210px; max-height: 300px; object-fit: contain; background: var(--occupied); }
+    .video-overlay { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; justify-content: space-between; gap: 8px; pointer-events: none; }
+    .overlay-chip { border: 1px solid var(--border-strong); background: var(--surface-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: var(--accent-strong); backdrop-filter: blur(10px); }
+    .legend { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 9px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px; }
+    .swatch { width: 12px; height: 12px; border: 1px solid var(--border); border-radius: 4px; }
+    .logs { display: grid; gap: 8px; max-height: min(38vh, 430px); overflow: auto; padding-right: 2px; }
+    .log-line { border: 1px solid var(--border-soft); border-left: 3px solid var(--info); border-radius: 12px; padding: 9px 10px; background: var(--panel-strong); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.45; transition: background 0.3s ease; }
+    .log-line .meta { color: var(--info); font-size: 12px; margin-bottom: 4px; }
+    .log-line.warn, .log-line.warning { border-left-color: var(--warn); }
+    .log-line.warn .meta, .log-line.warning .meta { color: var(--warn); }
+    .log-line.error, .log-line.critical { border-left-color: var(--bad); }
+    .log-line.error .meta, .log-line.critical .meta { color: var(--bad); }
     .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .field { min-height: 34px; border: 1px solid var(--border); border-radius: 12px; background: rgba(2, 6, 23, 0.5); color: var(--text); padding: 7px 10px; font: inherit; font-size: 12px; outline: none; }
-    .field:focus { border-color: var(--border-strong); box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.12); }
-    .service-list, .event-list, .task-list { display: grid; gap: 8px; }
-    .service-row, .task-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 8px; align-items: center; border: 1px solid var(--border-soft); border-radius: 13px; padding: 9px 10px; background: rgba(15, 23, 42, 0.62); }
+    .field { min-height: 34px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-strong); color: var(--text); padding: 7px 10px; font: inherit; font-size: 12px; outline: none; transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease; }
+    .field:focus { border-color: var(--border-strong); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12); }
+    [data-theme="dark"] .field:focus { box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.12); }
+    .service-list, .event-list, .task-list { display: grid; gap: 8px; max-height: min(34vh, 380px); overflow: auto; padding-right: 2px; }
+    .service-row, .task-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 8px; align-items: center; border: 1px solid var(--border-soft); border-radius: 12px; padding: 8px 9px; background: var(--panel-soft); transition: background 0.3s ease; }
     .service-row .meta, .task-row .meta { color: var(--muted); font-size: 12px; }
     .health-line { height: 6px; border-radius: 999px; background: linear-gradient(90deg, var(--good), var(--accent)); opacity: 0.95; }
     .health-line.warn { background: linear-gradient(90deg, var(--warn), #fb923c); }
     .health-line.bad { background: linear-gradient(90deg, var(--bad), #ef4444); }
     .split-two { grid-template-columns: 1fr 1fr; }
-    @media (max-width: 1280px) {
-      .topbar, .mission-layout, .workspace, .mission-grid { grid-template-columns: 1fr; }
-      .side-nav { position: static; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
-      .side-nav a:hover { transform: none; }
-      .global-status { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
-      .overview-grid { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+    .theme-toggle {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 100;
+      width: 40px;
+      height: 40px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface-strong);
+      color: var(--text);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      box-shadow: var(--shadow-soft);
+      transition: background 0.3s ease, color 0.3s ease, border-color 0.3s ease, transform 0.2s ease;
+    }
+    .theme-toggle:hover { transform: scale(1.08); border-color: var(--border-strong); }
+    @media (min-width: 1800px) {
+      body { padding: 16px 20px; }
+      .workspace { grid-template-columns: minmax(0, 2.25fr) minmax(360px, 0.70fr); }
+      .workspace, .panel.map-panel { min-height: calc(100vh - 170px); }
+      .canvas-wrap { min-height: 560px; }
+      #mapCanvas { min-height: 560px; }
+    }
+    @media (max-width: 1500px) {
+      .topbar { grid-template-columns: 1fr; }
+      .global-status { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
+      .workspace { grid-template-columns: minmax(0, 1.5fr) minmax(300px, 0.75fr); }
+      .overview-grid { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+      .diagnostics-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 1120px) {
+      .workspace, .mission-grid, .diagnostics-grid { grid-template-columns: 1fr; }
+      .right-rail { grid-template-columns: repeat(2, minmax(260px, 1fr)); max-height: none; overflow: visible; padding-right: 0; }
+      #runtime-settings { grid-column: span 2; }
+      .workspace, .panel.map-panel { min-height: auto; }
+      .canvas-wrap { min-height: 460px; }
+      #mapCanvas { height: min(68vh, 760px); min-height: 460px; }
     }
     @media (max-width: 720px) {
       body { padding: 10px; }
-      .brand-block, .global-status, .panel, .card { border-radius: 16px; padding: 12px; }
-      .split-two { grid-template-columns: 1fr; }
-      .metric-strip { justify-content: flex-start; }
+      .brand-block, .global-status, .panel, .card, .side-nav { border-radius: 14px; padding: 11px; }
+      .side-nav { padding: 7px; }
+      .split-two, .right-rail, .overview-grid, .map-info-grid { grid-template-columns: 1fr; }
+      #runtime-settings { grid-column: auto; }
       .global-status { grid-template-columns: 1fr 1fr; }
       .kv { grid-template-columns: 1fr; }
-      .overview-grid { grid-template-columns: 1fr; }
-      #mapCanvas { min-height: 320px; }
+      .canvas-wrap { min-height: 340px; }
+      #mapCanvas { height: 58vh; min-height: 340px; }
+      .map-stream-chip { left: 12px; top: 50px; right: auto; max-width: calc(100% - 24px); }
+      .theme-toggle { top: 10px; right: 10px; width: 36px; height: 36px; font-size: 16px; }
+    }
+
+    html, body { height: 100%; overflow: hidden; }
+    body { padding: 10px; }
+    .app-shell { height: calc(100vh - 20px); max-height: calc(100vh - 20px); width: min(100%, 2260px); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
+    .topbar { grid-template-columns: minmax(250px, 0.36fr) minmax(0, 1.64fr); gap: 10px; min-height: 78px; }
+    .brand-block { padding: 10px 14px; gap: 4px; }
+    .brand-block .small { display: none; }
+    h1 { font-size: clamp(20px, 1.25vw, 28px); }
+    .global-status { grid-template-columns: repeat(8, minmax(92px, 1fr)) auto; gap: 6px; padding: 8px; }
+    .metric { padding: 7px 9px; }
+    .metric b { font-size: 13px; }
+    .metric span { font-size: 10px; }
+    .mission-layout, .mission-content { height: 100%; min-height: 0; overflow: hidden; }
+    .workspace { height: 100%; min-height: 0; grid-template-columns: minmax(0, 1.55fr) minmax(410px, 0.82fr); align-items: stretch; }
+    .panel.map-panel { min-height: 0; height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto auto; overflow: hidden; }
+    .map-panel .card-head { margin-bottom: 8px; }
+    .canvas-wrap { min-height: 0; }
+    #mapCanvas { height: 100%; min-height: 0; }
+    .legend { margin-top: 6px; gap: 7px; }
+    #mapEmpty { margin-top: 6px; padding: 7px 9px; }
+    .map-info-grid { max-height: 142px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); margin-top: 6px; overflow: hidden; }
+    .map-info-grid .panel { min-height: 0; padding: 9px; }
+    .map-info-grid .card-head { margin-bottom: 6px; }
+    .map-info-grid .kv { max-height: 86px; overflow: auto; }
+    .right-rail { height: 100%; max-height: none; overflow: hidden; padding-right: 0; grid-template-rows: minmax(0, 1.08fr) minmax(0, 0.92fr); }
+    .tab-panel { display: grid; grid-template-rows: auto auto minmax(0, 1fr); min-height: 0; overflow: hidden; }
+    .tab-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+    .tab-menu { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 6px; margin-bottom: 8px; }
+    .tab-button { border: 1px solid var(--border-soft); border-radius: 999px; background: var(--panel-strong); color: var(--muted-strong); min-height: 30px; padding: 6px 8px; font: inherit; font-size: 11.5px; font-weight: 760; cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease; }
+    .tab-button:hover, .tab-button.active { border-color: var(--border-strong); background: rgba(37, 99, 235, 0.11); color: var(--text); }
+    [data-theme="dark"] .tab-button:hover, [data-theme="dark"] .tab-button.active { background: rgba(34, 211, 238, 0.12); }
+    .tab-content { min-height: 0; overflow: auto; padding-right: 2px; }
+    .tab-pane { display: none; min-height: 0; }
+    .tab-pane.active { display: block; }
+    .tab-pane > .panel, .tab-pane > section.panel { box-shadow: none; background: rgba(255, 255, 255, 0.04); }
+    [data-theme="dark"] .tab-pane > .panel, [data-theme="dark"] .tab-pane > section.panel { background: rgba(15, 23, 42, 0.28); }
+    .overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    #overview .overview-grid { max-height: none; overflow: visible; padding-right: 0; }
+    #overview .status-card, .status-card { min-height: 92px; padding: 10px; }
+    .status-card .kv { gap: 4px 7px; }
+    .task-list, .service-list { max-height: none; }
+    .logs { max-height: none; }
+    .video-frame { min-height: 170px; max-height: 230px; }
+    .diagnostics-grid, .side-nav { display: none; }
+    @media (max-width: 1500px) {
+      .topbar { grid-template-columns: 1fr; min-height: 126px; }
+      .global-status { grid-template-columns: repeat(4, minmax(120px, 1fr)); }
+      .workspace { grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.85fr); }
+    }
+    @media (max-width: 1120px) {
+      html, body { overflow: auto; }
+      body { padding: 10px; }
+      .app-shell { height: auto; max-height: none; overflow: visible; }
+      .workspace { height: auto; grid-template-columns: 1fr; }
+      .panel.map-panel { height: auto; min-height: 620px; }
+      .canvas-wrap { min-height: 420px; }
+      #mapCanvas { height: 52vh; min-height: 420px; }
+      .right-rail { height: auto; grid-template-rows: none; }
+      .diagnostics-grid { display: none; }
     }
   </style>
 </head>
 <body>
+  <button id="themeToggle" class="theme-toggle" title="切换主题" aria-label="切换白天/黑夜主题">☀️</button>
   <div class="app-shell">
-  <header class="topbar">
-    <div class="brand-block">
-      <div class="eyebrow">只读机器人观测</div>
-      <div class="brand-row">
-        <h1 id="robotName">nuwax_robot_bridge</h1>
-        <span id="robotModel" class="pill missing">型号：--</span>
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="eyebrow">只读机器人观测</div>
+        <div class="brand-row">
+          <h1 id="robotName">nuwax_robot_bridge</h1>
+          <span id="robotModel" class="pill missing">型号：--</span>
+        </div>
+        <div class="muted small">单屏实时地图驾驶舱 · 关键态势优先</div>
       </div>
-      <div class="muted small panel-meta">机器人监控驾驶舱 · 只读观察、诊断和空间态势汇总</div>
-    </div>
-    <div class="global-status">
-      <div class="metric"><b id="connectionText">connecting</b><span>网关连接</span></div>
-      <div class="metric"><b id="runtimeMode">--</b><span>运行模式</span></div>
-      <div class="metric"><b id="batteryMetric">--</b><span>电池状态</span></div>
-      <div class="metric"><b id="networkLatency" class="mono">--</b><span>HTTP（超文本传输协议）往返</span></div>
-      <div class="metric"><b id="resourceMetric">--</b><span>资源/任务</span></div>
-      <div class="metric"><b id="clockNow" class="mono">--</b><span>当前时间</span></div>
-      <div class="metric"><b id="lastReceive" class="mono">--</b><span>数据接收</span></div>
-      <div class="metric"><b>&lt;500 ms</b><span>P95（第 95 百分位）目标</span></div>
-      <span id="estopStatus" class="pill estop">急停状态：只读展示</span>
-    </div>
-  </header>
-
-  <div class="mission-layout">
-    <aside class="side-nav" aria-label="页面导航">
-      <a href="#overview">运行总览</a>
-      <a href="#live-map">2D 地图</a>
-      <a href="#video-perception">视频感知</a>
-      <a href="#navigation">导航态势</a>
-      <a href="#services">服务矩阵</a>
-      <a href="#logs-section">日志</a>
-      <a href="#runtime-settings">运行治理</a>
-    </aside>
-
-    <div class="mission-content">
-  <section id="overview" class="section-band">
-    <div class="section-title">
-      <h2>运行态总览</h2>
-      <span id="missionStatus" class="pill missing">mission: warming</span>
-    </div>
-    <section id="overviewGrid" class="grid overview-grid" aria-label="运行态总览"></section>
-    <div class="grid mission-grid">
-      <section class="panel compact">
-        <div class="card-head"><h3>当前任务</h3><span id="taskStatus" class="pill missing">missing</span></div>
-        <div id="taskSummary" class="task-list"></div>
-      </section>
-      <section class="panel compact">
-        <div class="card-head"><h3>位姿与运动</h3><span id="poseStatus" class="pill missing">missing</span></div>
-        <div id="missionPoseMeta" class="kv"></div>
-      </section>
-      <section class="panel compact">
-        <div class="card-head"><h3>传感器链路</h3><span id="sensorStatus" class="pill missing">missing</span></div>
-        <div id="sensorSummary" class="kv"></div>
-      </section>
-    </div>
-  </section>
-
-  <main class="grid workspace">
-    <section id="live-map" class="panel">
-      <div class="card-head">
-        <h2>空间态势 · 2D 地图 / 定位 / 轨迹</h2>
-        <span id="mapStatus" class="pill missing">missing</span>
+      <div class="global-status">
+        <div class="metric"><b id="connectionText">connecting</b><span>网关连接</span></div>
+        <div class="metric"><b id="runtimeMode">--</b><span>运行模式</span></div>
+        <div class="metric"><b id="batteryMetric">--</b><span>电池状态</span></div>
+        <div class="metric"><b id="networkLatency" class="mono">--</b><span>HTTP 往返</span></div>
+        <div class="metric"><b id="resourceMetric">--</b><span>资源/任务</span></div>
+        <div class="metric"><b id="clockNow" class="mono">--</b><span>当前时间</span></div>
+        <div class="metric"><b id="lastReceive" class="mono">--</b><span>数据接收</span></div>
+        <div class="metric"><b>&lt;500 ms</b><span>P95 目标</span></div>
+        <span id="estopStatus" class="pill estop">急停状态：只读展示</span>
       </div>
-      <div class="canvas-wrap">
-        <div class="map-toolbar" aria-label="地图缩放控制">
-          <button id="mapZoomOut" class="map-control" type="button">-</button>
-          <span id="mapZoomValue" class="map-chip">100%</span>
-          <button id="mapZoomIn" class="map-control" type="button">+</button>
-          <button id="mapZoomReset" class="map-control" type="button">reset</button>
-        </div>
-        <span id="mapStreamStatus" class="map-chip map-stream-chip">等待地图首帧</span>
-        <canvas id="mapCanvas" width="960" height="620"></canvas>
+    </header>
+
+    <div class="mission-layout">
+      <div class="mission-content">
+        <main class="grid workspace">
+          <section id="live-map" class="panel map-panel">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Live Spatial Canvas</div>
+                <h2>空间态势 · 2D 地图 / 定位 / 轨迹</h2>
+              </div>
+              <span id="mapStatus" class="pill missing">missing</span>
+            </div>
+            <div class="canvas-wrap">
+              <div class="map-toolbar" aria-label="地图缩放控制">
+                <button id="mapZoomOut" class="map-control" type="button">-</button>
+                <span id="mapZoomValue" class="map-chip">100%</span>
+                <button id="mapZoomIn" class="map-control" type="button">+</button>
+                <button id="mapZoomReset" class="map-control" type="button">reset</button>
+              </div>
+              <span id="mapStreamStatus" class="map-chip map-stream-chip">等待地图首帧</span>
+              <canvas id="mapCanvas" width="1180" height="680"></canvas>
+            </div>
+            <div class="legend">
+              <span class="legend-item"><span class="swatch" style="background: var(--unknown)"></span>未知</span>
+              <span class="legend-item"><span class="swatch" style="background: var(--free)"></span>可通行</span>
+              <span class="legend-item"><span class="swatch" style="background: var(--occupied)"></span>占据</span>
+              <span class="legend-item"><span class="swatch" style="background: var(--map-line)"></span>轨迹</span>
+              <span class="legend-item"><span class="swatch" style="background: var(--map-robot)"></span>机器人</span>
+              <span class="legend-item"><span class="swatch" style="background: var(--frontier)"></span>探索前沿</span>
+            </div>
+            <div id="mapEmpty" class="empty panel-meta">等待地图数据。</div>
+            <div class="grid map-info-grid">
+              <section class="panel compact">
+                <div class="card-head"><h3>地图帧</h3><span class="muted small">occupancy grid</span></div>
+                <div id="mapMeta" class="kv"></div>
+              </section>
+              <section class="panel compact">
+                <div class="card-head">
+                  <h3>定位/轨迹</h3>
+                  <span id="localizationStatus" class="pill missing">missing</span>
+                </div>
+                <div id="localizationMeta" class="kv"></div>
+              </section>
+            </div>
+          </section>
+
+          <aside class="grid right-rail" aria-label="态势与诊断面板">
+            <section class="panel tab-panel" data-tab-group="situation">
+              <div class="tab-title">
+                <div>
+                  <div class="eyebrow">Situation</div>
+                  <h2>任务态势</h2>
+                </div>
+                <span id="missionStatus" class="pill missing">mission: warming</span>
+              </div>
+              <div class="tab-menu" role="tablist" aria-label="任务态势二级菜单">
+                <button class="tab-button active" type="button" data-tab-target="navigation-pane">导航</button>
+                <button class="tab-button" type="button" data-tab-target="overview-pane">总览</button>
+                <button class="tab-button" type="button" data-tab-target="task-pane">任务</button>
+                <button class="tab-button" type="button" data-tab-target="sensor-pane">传感器</button>
+              </div>
+              <div class="tab-content">
+                <div id="navigation-pane" class="tab-pane active">
+                  <section id="navigation" class="panel compact">
+                    <div class="card-head">
+                      <h3>导航态势 / frontier（探索前沿）</h3>
+                      <span id="navigationStatus" class="pill missing">missing</span>
+                    </div>
+                    <div id="navigationMeta" class="kv"></div>
+                    <div id="frontierNotice" class="notice panel-meta">等待探索前沿候选几何。</div>
+                  </section>
+                </div>
+                <div id="overview-pane" class="tab-pane">
+                  <section id="overview" class="panel compact">
+                    <div class="card-head"><h3>运行态总览</h3><span class="muted small">核心链路</span></div>
+                    <section id="overviewGrid" class="grid overview-grid" aria-label="运行态总览"></section>
+                  </section>
+                </div>
+                <div id="task-pane" class="tab-pane">
+                  <section class="panel compact">
+                    <div class="card-head"><h3>当前任务</h3><span id="taskStatus" class="pill missing">missing</span></div>
+                    <div id="taskSummary" class="task-list"></div>
+                  </section>
+                </div>
+                <div id="sensor-pane" class="tab-pane">
+                  <section class="panel compact">
+                    <div class="card-head"><h3>位姿与运动</h3><span id="poseStatus" class="pill missing">missing</span></div>
+                    <div id="missionPoseMeta" class="kv"></div>
+                  </section>
+                  <section class="panel compact panel-meta">
+                    <div class="card-head"><h3>传感器链路</h3><span id="sensorStatus" class="pill missing">missing</span></div>
+                    <div id="sensorSummary" class="kv"></div>
+                  </section>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel tab-panel" data-tab-group="diagnostics">
+              <div class="tab-title">
+                <div>
+                  <div class="eyebrow">Diagnostics</div>
+                  <h2>运行诊断</h2>
+                </div>
+                <span id="governanceStatus" class="pill missing">missing</span>
+              </div>
+              <div class="tab-menu" role="tablist" aria-label="运行诊断二级菜单">
+                <button class="tab-button active" type="button" data-tab-target="governance-pane">治理</button>
+                <button class="tab-button" type="button" data-tab-target="video-pane">视频</button>
+                <button class="tab-button" type="button" data-tab-target="service-pane">服务</button>
+                <button class="tab-button" type="button" data-tab-target="logs-pane">日志</button>
+              </div>
+              <div class="tab-content">
+                <div id="governance-pane" class="tab-pane active">
+                  <section id="runtime-settings" class="panel compact">
+                    <div class="card-head"><h3>RTAB-Map 运行治理</h3><span class="muted small">只读</span></div>
+                    <div id="governanceMeta" class="kv"></div>
+                    <div class="muted small panel-meta">展示 profile、几何资产、重定位质量和导航门控摘要。</div>
+                  </section>
+                </div>
+                <div id="video-pane" class="tab-pane">
+                  <section id="video-perception" class="panel compact">
+                    <div class="card-head">
+                      <h3>视频感知</h3>
+                      <span id="videoStatus" class="pill missing">missing</span>
+                    </div>
+                    <div class="video-stage">
+                      <img id="videoFrame" class="video-frame" alt="实时视频帧" hidden>
+                      <div class="video-overlay">
+                        <span id="visionModelStatus" class="overlay-chip">本地模型：--</span>
+                        <span id="videoFpsStatus" class="overlay-chip">帧率：--</span>
+                      </div>
+                    </div>
+                    <div id="videoEmpty" class="empty panel-meta">等待视频帧。</div>
+                    <div id="videoMeta" class="kv panel-meta"></div>
+                  </section>
+                </div>
+                <div id="service-pane" class="tab-pane">
+                  <section id="services" class="panel compact">
+                    <div class="card-head">
+                      <h3>服务矩阵</h3>
+                      <span id="servicesStatus" class="pill missing">missing</span>
+                    </div>
+                    <div id="serviceMatrix" class="service-list"></div>
+                  </section>
+                </div>
+                <div id="logs-pane" class="tab-pane">
+                  <section id="logs-section" class="panel compact">
+                    <div class="card-head">
+                      <h3>运行日志尾部</h3>
+                      <span id="logsStatus" class="pill missing">missing</span>
+                    </div>
+                    <div class="toolbar">
+                      <select id="logLevelFilter" class="field" aria-label="日志等级过滤">
+                        <option value="">ALL</option>
+                        <option value="debug">DEBUG</option>
+                        <option value="info">INFO</option>
+                        <option value="warn">WARN</option>
+                        <option value="warning">WARNING</option>
+                        <option value="error">ERROR</option>
+                        <option value="critical">CRITICAL</option>
+                      </select>
+                      <input id="logSearch" class="field" type="search" placeholder="搜索日志、节点或关键词" aria-label="搜索日志">
+                    </div>
+                    <div id="logsMeta" class="kv"></div>
+                    <div id="logs" class="logs panel-meta"></div>
+                  </section>
+                </div>
+              </div>
+            </section>
+          </aside>
+        </main>
       </div>
-      <div class="legend">
-        <span class="legend-item"><span class="swatch" style="background: var(--unknown)"></span>未知</span>
-        <span class="legend-item"><span class="swatch" style="background: var(--free)"></span>可通行</span>
-        <span class="legend-item"><span class="swatch" style="background: var(--occupied)"></span>占据</span>
-        <span class="legend-item"><span class="swatch" style="background: var(--map-line)"></span>轨迹</span>
-        <span class="legend-item"><span class="swatch" style="background: var(--map-robot)"></span>机器人</span>
-        <span class="legend-item"><span class="swatch" style="background: var(--frontier)"></span>探索前沿</span>
-      </div>
-      <div id="mapEmpty" class="empty panel-meta">等待地图数据。</div>
-      <div id="mapMeta" class="kv panel-meta"></div>
-      <div class="card-head" style="margin-top: 14px;">
-        <h3>定位/轨迹</h3>
-        <span id="localizationStatus" class="pill missing">missing</span>
-      </div>
-      <div id="localizationMeta" class="kv"></div>
-    </section>
-
-    <div class="grid right-rail">
-      <section id="navigation" class="panel">
-        <div class="card-head">
-          <h2>导航态势 / frontier（探索前沿）</h2>
-          <span id="navigationStatus" class="pill missing">missing</span>
-        </div>
-        <div id="navigationMeta" class="kv"></div>
-        <div id="frontierNotice" class="notice panel-meta">等待探索前沿候选几何。</div>
-      </section>
-
-      <section id="runtime-settings" class="panel">
-        <div class="card-head">
-          <h2>RTAB-Map 运行治理</h2>
-          <span id="governanceStatus" class="pill missing">missing</span>
-        </div>
-        <div id="governanceMeta" class="kv"></div>
-        <div class="muted small panel-meta">只读展示 profile、几何资产、重定位质量和导航门控摘要。</div>
-      </section>
-
-      <section id="video-perception" class="panel">
-        <div class="card-head">
-          <h2>视频感知</h2>
-          <span id="videoStatus" class="pill missing">missing</span>
-        </div>
-        <div class="video-stage">
-          <img id="videoFrame" class="video-frame" alt="实时视频帧" hidden>
-          <div class="video-overlay">
-            <span id="visionModelStatus" class="overlay-chip">本地模型：--</span>
-            <span id="videoFpsStatus" class="overlay-chip">帧率：--</span>
-          </div>
-        </div>
-        <div id="videoEmpty" class="empty panel-meta">等待视频帧。</div>
-        <div id="videoMeta" class="kv panel-meta"></div>
-      </section>
-
-      <section id="services" class="panel">
-        <div class="card-head">
-          <h2>服务矩阵</h2>
-          <span id="servicesStatus" class="pill missing">missing</span>
-        </div>
-        <div id="serviceMatrix" class="service-list"></div>
-      </section>
-
-      <section id="logs-section" class="panel">
-        <div class="card-head">
-          <h2>运行日志尾部</h2>
-          <span id="logsStatus" class="pill missing">missing</span>
-        </div>
-        <div class="toolbar">
-          <select id="logLevelFilter" class="field" aria-label="日志等级过滤">
-            <option value="">ALL</option>
-            <option value="debug">DEBUG</option>
-            <option value="info">INFO</option>
-            <option value="warn">WARN</option>
-            <option value="warning">WARNING</option>
-            <option value="error">ERROR</option>
-            <option value="critical">CRITICAL</option>
-          </select>
-          <input id="logSearch" class="field" type="search" placeholder="搜索日志、节点或关键词" aria-label="搜索日志">
-        </div>
-        <div id="logsMeta" class="kv"></div>
-        <div id="logs" class="logs panel-meta"></div>
-      </section>
     </div>
-  </main>
-    </div>
-  </div>
   </div>
 
   <script>
@@ -564,6 +764,7 @@ def _render_debug_page(access_token: str) -> str:
         latestTasks: null,
         logFilter: "",
         logSearch: "",
+        mapResizeFrame: null,
       };
       const els = {
         robotName: document.getElementById("robotName"),
@@ -613,7 +814,43 @@ def _render_debug_page(access_token: str) -> str:
         logs: document.getElementById("logs"),
         logLevelFilter: document.getElementById("logLevelFilter"),
         logSearch: document.getElementById("logSearch"),
+        themeToggle: document.getElementById("themeToggle"),
       };
+
+      function initTheme() {
+        const saved = localStorage.getItem("nuwax-theme");
+        const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const theme = saved || (prefersDark ? "dark" : "light");
+        document.documentElement.setAttribute("data-theme", theme);
+        updateThemeIcon(theme);
+      }
+      function toggleTheme() {
+        const current = document.documentElement.getAttribute("data-theme") || "dark";
+        const next = current === "dark" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", next);
+        localStorage.setItem("nuwax-theme", next);
+        updateThemeIcon(next);
+      }
+      function updateThemeIcon(theme) {
+        if (els.themeToggle) els.themeToggle.textContent = theme === "dark" ? "🌙" : "☀️";
+      }
+      initTheme();
+      if (els.themeToggle) els.themeToggle.addEventListener("click", toggleTheme);
+      function initTabPanels() {
+        for (const panel of document.querySelectorAll(".tab-panel")) {
+          const buttons = Array.from(panel.querySelectorAll(".tab-button"));
+          const panes = Array.from(panel.querySelectorAll(".tab-pane"));
+          for (const button of buttons) {
+            button.addEventListener("click", () => {
+              const targetId = button.dataset.tabTarget;
+              for (const item of buttons) item.classList.toggle("active", item === button);
+              for (const pane of panes) pane.classList.toggle("active", pane.id === targetId);
+              redrawMapAfterResize();
+            });
+          }
+        }
+      }
+      initTabPanels();
 
       function nowText() { return new Date().toLocaleTimeString(); }
       function shortTime(value) { return value ? new Date(value).toLocaleTimeString() : "--"; }
@@ -644,6 +881,24 @@ def _render_debug_page(access_token: str) -> str:
       function setText(el, value) {
         if (!el) return;
         el.textContent = safeText(value);
+      }
+      function syncMapCanvasSize() {
+        const canvas = els.mapCanvas;
+        if (!canvas) return false;
+        const rect = canvas.getBoundingClientRect();
+        const width = Math.max(360, Math.round(rect.width));
+        const height = Math.max(320, Math.round(rect.height));
+        if (canvas.width === width && canvas.height === height) return false;
+        canvas.width = width;
+        canvas.height = height;
+        return true;
+      }
+      function redrawMapAfterResize() {
+        if (state.mapResizeFrame) window.cancelAnimationFrame(state.mapResizeFrame);
+        state.mapResizeFrame = window.requestAnimationFrame(() => {
+          state.mapResizeFrame = null;
+          drawMap();
+        });
       }
       function statusSeverity(status) {
         const value = statusClass(status || "missing");
@@ -723,7 +978,7 @@ def _render_debug_page(access_token: str) -> str:
         setKv(els.sensorSummary, [
           ["2D_map", `${safeText(map.status)} latency=${fmt(map.latency_ms, " ms")}`],
           ["localization", `${safeText(localization.status)} frame=${safeText(localization.frame_id)}`],
-          ["pointcloud_map", `${safeText(pointcloudMap.status)} frame=${safeText(pointcloudMap.frame_id)} rev=${safeText(pointcloudMap.revision)}`],
+          ["pointcloud_map", `${safeText(pointcloudMap.status)} frame=${safeText(pointcloudMap.frame_id)} rev=${safeText(pointcloudMap.revision)} points=${safeText(pointcloudMap.metadata && pointcloudMap.metadata.point_count)} source=${safeText(pointcloudMap.metadata && pointcloudMap.metadata.source_kind)}`],
           ["pointcloud", `${safeText(pointcloud.status)} points=${safeText(pointcloud.metadata && pointcloud.metadata.point_count)} source=${safeText(pointcloud.metadata && pointcloud.metadata.source)}`],
           ["video", `${safeText(video.status)} source=${safeText(video.metadata && video.metadata.source)}`],
         ]);
@@ -936,6 +1191,7 @@ def _render_debug_page(access_token: str) -> str:
         ctx.lineJoin = "round";
       }
       function drawMap() {
+        syncMapCanvasSize();
         const canvas = els.mapCanvas;
         const ctx = canvas.getContext("2d");
         ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1475,7 +1731,7 @@ def _render_debug_page(access_token: str) -> str:
       function updatePointcloudMapFrame(frame) {
         const summary = frame.payload || {};
         const envelope = envelopeFromFrame(frame, summary);
-        const data = { pointcloud_map: { status: envelope.status, frame_id: envelope.frame_id, revision: envelope.revision, latency_ms: envelope.latency_ms, source_timestamp: envelope.source_timestamp, metadata: { source: envelope.source } } };
+        const data = { pointcloud_map: { status: envelope.status, frame_id: envelope.frame_id, revision: envelope.revision, latency_ms: envelope.latency_ms, source_timestamp: envelope.source_timestamp, metadata: { source: envelope.source, source_kind: summary.source_kind || (frame.metadata && frame.metadata.source_kind), point_count: summary.point_count ?? (frame.metadata && frame.metadata.point_count), pcd_path: summary.pcd_path || (frame.metadata && frame.metadata.pcd_path) } } };
         updateSensorSummary({ ...(state.latestOverview || {}), ...data });
       }
       function updatePointcloudFrame(frame) {
@@ -1523,6 +1779,10 @@ def _render_debug_page(access_token: str) -> str:
         };
         const key = keyByTopic[frame.topic];
         if (!key) return;
+        const payload = frame.payload || {};
+        const metadata = frame.topic === "pointcloud_map.meta"
+          ? { source: frame.source, source_kind: payload.source_kind || (frame.metadata && frame.metadata.source_kind), point_count: payload.point_count ?? (frame.metadata && frame.metadata.point_count), pcd_path: payload.pcd_path || (frame.metadata && frame.metadata.pcd_path) }
+          : { source: frame.source };
         const overview = { ...(state.latestOverview || {}) };
         overview[key] = {
           status: frame.status || "available",
@@ -1531,7 +1791,7 @@ def _render_debug_page(access_token: str) -> str:
           stale: frame.status === "stale",
           frame_id: frame.frame_id,
           revision: frame.revision,
-          metadata: { source: frame.source },
+          metadata,
         };
         state.latestOverview = overview;
         updateOverview({ data: overview, __receivedAt: new Date().toISOString(), __frontendLatencyMs: 0 });
@@ -1539,6 +1799,12 @@ def _render_debug_page(access_token: str) -> str:
       buildOverview();
       renderLogs();
       updateClock();
+      syncMapCanvasSize();
+      if (window.ResizeObserver) {
+        new ResizeObserver(redrawMapAfterResize).observe(els.mapCanvas);
+      } else {
+        window.addEventListener("resize", redrawMapAfterResize);
+      }
       window.setInterval(updateClock, 1000);
       function setMapZoom(nextZoom) {
         state.mapZoom = Math.min(8, Math.max(0.25, nextZoom));

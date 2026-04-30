@@ -5,7 +5,7 @@ from typing import Any
 
 from contracts.events import RuntimeEventCategory
 from contracts.runtime_views import MapSnapshot
-from core import EventBus, StateNamespace, StateStore
+from core import EventBus, StateNamespace, StateStore, StreamBus
 from gateways.errors import GatewayError
 from providers import MapProvider
 from typing import Deque, Dict, List, Optional, Tuple
@@ -20,11 +20,13 @@ class MappingService:
         provider_owner,
         state_store: StateStore,
         event_bus: Optional[EventBus] = None,
+        stream_bus: Optional[StreamBus] = None,
         history_limit: int = 100,
     ) -> None:
         self._provider_owner = provider_owner
         self._state_store = state_store
         self._event_bus = event_bus
+        self._stream_bus = stream_bus
         self._history: Deque[MapSnapshot] = deque(maxlen=max(1, history_limit))
         self._latest_snapshot: Optional[MapSnapshot] = None
         self._revision_by_source: Dict[str, int] = {}
@@ -152,6 +154,20 @@ class MappingService:
                         "revision": revision,
                     },
                 )
+            )
+        if self._stream_bus is not None:
+            self._stream_bus.publish(
+                "map.frame",
+                source="mapping_service",
+                payload=snapshot,
+                frame_id=snapshot.frame_id,
+                revision=str(snapshot.revision),
+                status="available",
+                metadata={
+                    "source_name": source_name,
+                    "version_id": snapshot.version_id,
+                    "revision": revision,
+                },
             )
         return snapshot
 

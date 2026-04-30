@@ -82,6 +82,7 @@ from contracts.robot_state import (
     SafetyState,
 )
 from contracts.skills import SkillCategory, SkillDescriptor, SkillRuntimeView
+from contracts.streams import StreamFrame, StreamPayloadKind
 from contracts.runtime_views import (
     DiagnosticItem,
     DiagnosticLevel,
@@ -203,6 +204,8 @@ __all__ = [
     "SkillCategory",
     "SkillDescriptor",
     "SkillRuntimeView",
+    "StreamFrame",
+    "StreamPayloadKind",
     "TaggedLocation",
     "TaskEvent",
     "TaskSpec",

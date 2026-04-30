@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+import threading
+from typing import Callable, DefaultDict, Dict, FrozenSet, Iterable, List, Optional, Tuple
+
+from contracts.streams import StreamFrame, StreamPayloadKind
+
+
+@dataclass(frozen=True)
+class StreamSubscription:
+    """实时流订阅条目。"""
+
+    subscription_id: str
+    callback: Callable[[StreamFrame], None]
+    topics: Optional[FrozenSet[str]] = None
+
+
+class StreamBus:
+    """支持游标续播的线程安全实时数据总线。"""
+
+    def __init__(self, retention_limit: int = 1000) -> None:
+        self._retention_limit = max(1, retention_limit)
+        self._frames: List[StreamFrame] = []
+        self._subscriptions: Dict[str, StreamSubscription] = {}
+        self._latest_by_topic: Dict[str, StreamFrame] = {}
+        self._dropped_by_topic: DefaultDict[str, int] = defaultdict(int)
+        self._next_cursor = 1
+        self._next_subscription_seq = 1
+        self._lock = threading.RLock()
+
+    def latest_cursor(self) -> int:
+        with self._lock:
+            return self._next_cursor - 1
+
+    def latest_frame(self, topic: str) -> Optional[StreamFrame]:
+        with self._lock:
+            return self._latest_by_topic.get(str(topic))
+
+    def publish(
+        self,
+        topic: str,
+        *,
+        source: str,
+        payload=None,
+        payload_kind: StreamPayloadKind = StreamPayloadKind.JSON,
+        frame_id: Optional[str] = None,
+        sequence: Optional[int] = None,
+        revision: Optional[str] = None,
+        status: str = "available",
+        metadata: Optional[dict] = None,
+    ) -> StreamFrame:
+        frame = StreamFrame(
+            topic=str(topic),
+            source=str(source),
+            payload_kind=payload_kind,
+            payload=payload,
+            frame_id=frame_id,
+            sequence=sequence,
+            revision=revision,
+            status=str(status or "available"),
+            metadata=dict(metadata or {}),
+        )
+        return self.publish_frame(frame)
+
+    def publish_frame(self, frame: StreamFrame) -> StreamFrame:
+        with self._lock:
+            stored_frame = frame.model_copy(update={"cursor": self._next_cursor})
+            self._next_cursor += 1
+            self._frames.append(stored_frame)
+            if len(self._frames) > self._retention_limit:
+                self._frames = self._frames[-self._retention_limit :]
+            self._latest_by_topic[stored_frame.topic] = stored_frame
+            subscriptions = tuple(self._subscriptions.values())
+
+        for subscription in subscriptions:
+            if self._matches(subscription, stored_frame):
+                subscription.callback(stored_frame)
+        return stored_frame
+
+    def publish_dropped(self, topic: str, *, source: str, dropped_count: int = 1) -> StreamFrame:
+        with self._lock:
+            self._dropped_by_topic[str(topic)] += max(1, int(dropped_count))
+            total = self._dropped_by_topic[str(topic)]
+        return self.publish(
+            f"{topic}.dropped",
+            source=source,
+            payload_kind=StreamPayloadKind.DIAGNOSTIC,
+            status="dropped",
+            payload={"topic": str(topic), "dropped_count": total},
+        )
+
+    def subscribe(
+        self,
+        callback: Callable[[StreamFrame], None],
+        *,
+        topics: Optional[Iterable[str]] = None,
+    ) -> str:
+        with self._lock:
+            subscription_id = f"stream_sub_{self._next_subscription_seq:04d}"
+            self._next_subscription_seq += 1
+            subscription = StreamSubscription(
+                subscription_id=subscription_id,
+                callback=callback,
+                topics=frozenset(str(topic) for topic in topics) if topics is not None else None,
+            )
+            self._subscriptions[subscription_id] = subscription
+            return subscription_id
+
+    def unsubscribe(self, subscription_id: str) -> None:
+        with self._lock:
+            self._subscriptions.pop(subscription_id, None)
+
+    def replay(
+        self,
+        *,
+        after_cursor: int = 0,
+        limit: Optional[int] = None,
+        topics: Optional[Iterable[str]] = None,
+    ) -> Tuple[StreamFrame, ...]:
+        topic_filter = frozenset(str(topic) for topic in topics) if topics is not None else None
+        with self._lock:
+            frames = [
+                frame
+                for frame in self._frames
+                if frame.cursor is not None
+                and frame.cursor > after_cursor
+                and (topic_filter is None or frame.topic in topic_filter)
+            ]
+        if limit is not None:
+            frames = frames[:limit]
+        return tuple(frames)
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "latest_cursor": self._next_cursor - 1,
+                "subscription_count": len(self._subscriptions),
+                "topic_count": len(self._latest_by_topic),
+                "topics": sorted(self._latest_by_topic),
+                "dropped_by_topic": dict(self._dropped_by_topic),
+            }
+
+    def _matches(self, subscription: StreamSubscription, frame: StreamFrame) -> bool:
+        return subscription.topics is None or frame.topic in subscription.topics

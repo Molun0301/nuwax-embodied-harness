@@ -3,13 +3,13 @@
 from providers.base import BaseProvider
 from providers.exploration import ExplorationProvider
 from providers.image import ImageProvider
-from providers.localization import LocalizationProvider
+from providers.localization import LocalizationProvider, StreamingLocalizationProvider
 from providers.maps import MapProvider
 from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
-from providers.pointcloud import PointCloudProvider
+from providers.pointcloud import PointCloudProvider, StreamingPointCloudProvider
 from providers.safety import SafetyProvider
-from providers.state import StateProvider
+from providers.state import StateProvider, StreamingStateProvider
 
 __all__ = [
     "BaseProvider",
@@ -22,4 +22,7 @@ __all__ = [
     "PointCloudProvider",
     "SafetyProvider",
     "StateProvider",
+    "StreamingStateProvider",
+    "StreamingPointCloudProvider",
+    "StreamingLocalizationProvider",
 ]

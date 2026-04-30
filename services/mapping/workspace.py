@@ -278,15 +278,12 @@ class MapWorkspaceService:
             )
         snapshot = self._mapping_service.get_latest_snapshot()
         if snapshot is None:
-            if self._mapping_service.is_available():
-                snapshot = self._mapping_service.refresh()
-            else:
-                raise GatewayError(
-                    "当前没有可保存的地图快照。",
-                    error_code="map_snapshot_unavailable",
-                    http_status=409,
-                    jsonrpc_code=-32000,
-                )
+            raise GatewayError(
+                "当前没有可保存的地图流帧。",
+                error_code="map_snapshot_unavailable",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
         version = self._version_repository.save_map_version(
             map_name=resolved_name,
             snapshot=snapshot,

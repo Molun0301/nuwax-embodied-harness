@@ -317,36 +317,12 @@ class PerceptionVideoRuntime:
         localization_service = self._localization_service
         if localization_service is not None:
             snapshot = localization_service.get_latest_snapshot()
-            active_session = None
-            get_active_session = getattr(localization_service, "get_active_session", None)
-            if callable(get_active_session):
-                active_session = get_active_session()
-            if active_session is not None:
-                try:
-                    localization_service.refresh_current_session(
-                        metadata={"source": "perception_video_runtime"},
-                    )
-                except Exception:
-                    pass
-                snapshot = localization_service.get_latest_snapshot()
-            elif localization_service.is_available():
-                try:
-                    snapshot = localization_service.refresh()
-                except Exception:
-                    pass
             if snapshot is not None:
                 current_pose = snapshot.current_pose
 
         mapping_service = self._mapping_service
         if mapping_service is not None:
-            snapshot = mapping_service.get_latest_snapshot()
-            # 已有平台地图快照时直接复用，避免 burst 复核把平台地图真值刷新成新的 provider 版本。
-            if mapping_service.is_available():
-                try:
-                    snapshot = mapping_service.refresh()
-                except Exception:
-                    pass
-            map_context = self._semantic_map_builder.build(snapshot)
+            map_context = self._semantic_map_builder.build(mapping_service.get_latest_snapshot())
         return current_pose, map_context
 
     def _remember_from_keyframe(

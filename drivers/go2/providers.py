@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
-from contracts.geometry import Quaternion, Twist, Vector3
+from contracts.geometry import FrameTree, Pose, Quaternion, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.common import MotionCommandDataPlane
 from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO
 from providers.image import ImageProvider
+from providers.localization import StreamingLocalizationProvider
 from providers.motion import MotionControl
-from providers.pointcloud import PointCloudProvider
+from providers.pointcloud import PointCloudProvider, StreamingPointCloudProvider
 from providers.safety import SafetyProvider
-from providers.state import StateProvider
+from providers.state import StateProvider, StreamingStateProvider
 
 if TYPE_CHECKING:
     from drivers.go2.assembly import Go2RobotAssembly
@@ -42,6 +43,9 @@ class Go2ProviderBundle(
     StateProvider,
     ImageProvider,
     PointCloudProvider,
+    StreamingPointCloudProvider,
+    StreamingLocalizationProvider,
+    StreamingStateProvider,
     MotionControl,
     SafetyProvider,
 ):
@@ -163,6 +167,46 @@ class Go2ProviderBundle(
             camera_info.camera_id = camera_id
         return camera_info
 
+    def subscribe_robot_state(self, callback: Callable[[RobotState], None]) -> Optional[int]:
+        return self.subscribe_localization(lambda pose, frame_tree, metadata: callback(self._build_robot_state_from_stream(pose, metadata)))
+
+    def unsubscribe_robot_state(self, subscription_id: Optional[int]) -> None:
+        self.unsubscribe_localization(subscription_id)
+
+    def subscribe_localization(
+        self,
+        callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None],
+    ) -> Optional[int]:
+        if self.assembly.data_plane is None:
+            return None
+        subscriber = getattr(self.assembly.data_plane, "subscribe_localization", None)
+        if not callable(subscriber):
+            return None
+        return subscriber(callback)
+
+    def unsubscribe_localization(self, subscription_id: Optional[int]) -> None:
+        if self.assembly.data_plane is None or subscription_id is None:
+            return
+        unsubscriber = getattr(self.assembly.data_plane, "unsubscribe_localization", None)
+        if callable(unsubscriber):
+            unsubscriber(subscription_id)
+
+    def _build_robot_state_from_stream(self, pose: Optional[Pose], metadata: Dict[str, object]) -> RobotState:
+        return RobotState(
+            robot_id=self.assembly.defaults.parameters["robot_id"],
+            frame_id=self.assembly.defaults.frame_ids["base"],
+            mode=_to_control_mode(self.assembly.current_mode),
+            pose=pose,
+            joints=self.get_joint_states(),
+            imu=self.get_imu_state(),
+            safety=self.get_safety_state(),
+            metadata={
+                "control_mode": self.assembly.current_mode,
+                "source_kind": "go2_dds_stream",
+                **dict(metadata or {}),
+            },
+        )
+
     def _read_current_pose_for_state(self):
         if self.assembly.data_plane is None:
             return None
@@ -179,6 +223,21 @@ class Go2ProviderBundle(
             return None
         point_cloud = getter()
         return point_cloud.model_copy(deep=True) if point_cloud is not None else None
+
+    def subscribe_point_cloud(self, callback: Callable[[PointCloudFrame], None]) -> Optional[int]:
+        if self.assembly.data_plane is None:
+            return None
+        subscriber = getattr(self.assembly.data_plane, "subscribe_local_point_cloud", None)
+        if not callable(subscriber):
+            return None
+        return subscriber(callback)
+
+    def unsubscribe_point_cloud(self, subscription_id: Optional[int]) -> None:
+        if self.assembly.data_plane is None or subscription_id is None:
+            return
+        unsubscriber = getattr(self.assembly.data_plane, "unsubscribe_local_point_cloud", None)
+        if callable(unsubscriber):
+            unsubscriber(subscription_id)
 
     def send_twist(self, twist: Twist) -> None:
         data_plane = _resolve_motion_command_data_plane(self.assembly.data_plane)

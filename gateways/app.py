@@ -23,6 +23,7 @@ from gateways.http.debug_panel import build_debug_panel_router
 from gateways.mcp.protocol import build_mcp_router
 from gateways.relay.server import create_relay_app
 from gateways.runtime import GatewayRuntime, create_default_gateway_runtime
+from gateways.ws.data_streams import build_data_stream_router
 from gateways.ws.events import build_event_router
 from logging_utils import LogRateLimiter
 from settings import NuwaxRobotBridgeConfig, configure_logging, load_config
@@ -193,6 +194,7 @@ def create_gateway_app(
             "ops_path": "/ops",
             "debug_panel_path": "/debug",
             "event_paths": {"ws": "/events/ws", "sse": "/events/stream"},
+            "stream_paths": {"ws": "/streams/ws", "sse": "/streams/sse"},
             "artifacts_base": "/artifacts",
         }
 
@@ -200,6 +202,7 @@ def create_gateway_app(
     app.include_router(build_debug_panel_router(runtime, access_manager))
     app.include_router(build_mcp_router(runtime, access_manager))
     app.include_router(build_event_router(runtime, access_manager))
+    app.include_router(build_data_stream_router(runtime, access_manager))
     return app
 
 

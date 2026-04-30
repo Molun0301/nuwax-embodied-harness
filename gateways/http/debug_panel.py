@@ -24,7 +24,6 @@ from contracts.debug_views import (
     DebugMapView,
     DebugNavigationView,
     DebugOverviewView,
-    DebugPointCloudMapView,
     DebugPointCloudView,
     DebugSourceSummary,
     DebugVideoView,
@@ -32,13 +31,6 @@ from contracts.debug_views import (
 from gateways.auth import GatewayAccessManager
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable
-from providers import ImageProvider
-from services.geometry.pointcloud_map import (
-    PointCloudMap,
-    PointCloudMapCache,
-    PointCloudMapError,
-    UnsupportedPointCloudMapError,
-)
 
 
 _LOG_LINE_RE = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d{1,6})?) \[(?P<level>[A-Z]+)\] \[(?P<source>[^\]]+)\] (?P<message>.*)$")
@@ -58,7 +50,20 @@ _STALE_THRESHOLDS_SEC = {
     "logs": 10.0,
 }
 
-_POINTCLOUD_MAP_CACHE = PointCloudMapCache()
+
+def _stream_migration_response(*topics: str) -> JSONResponse:
+    topic_list = [topic for topic in topics if topic]
+    query = ",".join(topic_list)
+    stream_path = "/streams/ws" + (f"?topics={query}" if query else "")
+    return JSONResponse(
+        status_code=410,
+        content={
+            "code": "stream_required",
+            "message": "实时数据调试 HTTP 快照入口已下线，请订阅实时流。",
+            "stream": stream_path,
+            "topics": topic_list,
+        },
+    )
 
 
 def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
@@ -74,618 +79,56 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
     @router.get("/api/debug/overview")
     @router.get("/api/debug/snapshot")
-    async def debug_overview(request: Request) -> Dict[str, Any]:
+    async def debug_overview(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        health_summary = runtime.get_health_summary()
-        runtime_governance = runtime.get_runtime_governance_summary()
-        state_snapshot = runtime.robot_state_service.get_latest_snapshot()
-        localization_snapshot = runtime.localization_service.get_latest_snapshot()
-        map_snapshot = runtime.mapping_service.get_latest_snapshot()
-        navigation_context = runtime.navigation_service.get_latest_navigation_context()
-        exploration_context = runtime.navigation_service.get_latest_exploration_context()
-        pointcloud_map_info = await run_in_threadpool(lambda: _get_pointcloud_map_summary(runtime))
-        pointcloud = await run_in_threadpool(lambda: _get_latest_pointcloud(runtime))
-        video_info = await run_in_threadpool(lambda: _get_video_summary(runtime))
-        log_info = await run_in_threadpool(lambda: _get_log_file_summary(runtime))
-        map_diagnostics = (
-            _build_map_diagnostics(map_snapshot)
-            if map_snapshot is not None and getattr(map_snapshot, "occupancy_grid", None) is not None
-            else {}
-        )
-        map_summary_timestamp = (
-            map_diagnostics.get("last_message_at")
-            if isinstance(map_diagnostics.get("last_message_at"), datetime)
-            else _timestamp_from_value(map_snapshot)
-        )
-        overview = DebugOverviewView(
-            health=_summary_from_payload(
-                name="health",
-                source="gateway_runtime",
-                timestamp=_timestamp_from_value(health_summary),
-                available=True,
-                message="runtime_started=%s" % bool(health_summary.get("runtime_started")),
-            ),
-            state=_summary_from_payload(
-                name="state",
-                source="robot_state_service",
-                timestamp=_timestamp_from_value(state_snapshot),
-                available=state_snapshot is not None,
-            ),
-            localization=_summary_from_payload(
-                name="localization",
-                source="localization_service",
-                timestamp=_timestamp_from_value(localization_snapshot),
-                frame_id=_frame_id_from_localization(localization_snapshot),
-                available=localization_snapshot is not None and getattr(localization_snapshot, "current_pose", None) is not None,
-            ),
-            map=_summary_from_payload(
-                name="map",
-                source="mapping_service",
-                timestamp=map_summary_timestamp,
-                frame_id=getattr(map_snapshot, "frame_id", None),
-                revision=str(map_diagnostics.get("content_revision") or _revision_from_map(map_snapshot)),
-                sequence=map_diagnostics.get("message_count") if isinstance(map_diagnostics.get("message_count"), int) else None,
-                available=map_snapshot is not None and getattr(map_snapshot, "occupancy_grid", None) is not None,
-                metadata={"diagnostics": to_jsonable(map_diagnostics), "stream_bridge": to_jsonable(runtime.get_live_map_stream_status())} if map_diagnostics else {"stream_bridge": to_jsonable(runtime.get_live_map_stream_status())},
-            ),
-            navigation=_summary_from_payload(
-                name="navigation",
-                source="navigation_service",
-                timestamp=_navigation_timestamp(navigation_context),
-                frame_id=_frame_id_from_navigation(navigation_context),
-                available=navigation_context is not None,
-                message=_navigation_message(navigation_context),
-            ),
-            exploration=_summary_from_payload(
-                name="exploration",
-                source="navigation_service",
-                timestamp=_exploration_timestamp(exploration_context),
-                available=exploration_context is not None,
-                message=_exploration_message(exploration_context),
-                metadata=_exploration_metadata(exploration_context),
-            ),
-            runtime_governance=_summary_from_payload(
-                name="runtime_governance",
-                source="gateway_runtime",
-                timestamp=_timestamp_from_value(runtime_governance),
-                available=True,
-                message=_runtime_governance_message(runtime_governance),
-                metadata=_runtime_governance_metadata(runtime_governance),
-            ),
-            pointcloud_map=_summary_from_payload(
-                name="pointcloud_map",
-                source=str(pointcloud_map_info.get("source", "pointcloud_map")),
-                timestamp=pointcloud_map_info.get("timestamp"),
-                frame_id=pointcloud_map_info.get("frame_id"),
-                revision=pointcloud_map_info.get("revision"),
-                available=bool(pointcloud_map_info.get("available")),
-                message=str(pointcloud_map_info.get("message") or ""),
-                metadata=dict(pointcloud_map_info.get("metadata") or {}),
-            ),
-            pointcloud=_summary_from_payload(
-                name="pointcloud",
-                source=_pointcloud_source(pointcloud),
-                timestamp=_timestamp_from_value(pointcloud),
-                frame_id=getattr(pointcloud, "frame_id", None),
-                sequence=_sequence_from_metadata(pointcloud),
-                available=pointcloud is not None,
-                metadata={
-                    **_pointcloud_metrics(pointcloud),
-                    "diagnostic_role": "side_channel",
-                    "not_pointcloud_map": True,
-                    "map_source": "pointcloud_map",
-                },
-            ),
-            video=_summary_from_payload(
-                name="video",
-                source=str(video_info.get("source", "image_provider")),
-                timestamp=video_info.get("timestamp"),
-                frame_id=video_info.get("frame_id"),
-                available=bool(video_info.get("available")),
-                message=str(video_info.get("message") or ""),
-                metadata=dict(video_info.get("metadata") or {}),
-            ),
-            logs=_summary_from_payload(
-                name="logs",
-                source=str(log_info.get("source", "configured_log_file")),
-                timestamp=log_info.get("timestamp"),
-                sequence=log_info.get("sequence"),
-                available=bool(log_info.get("available")),
-                message=str(log_info.get("message") or ""),
-                metadata=dict(log_info.get("metadata") or {}),
-            ),
-        )
-        return _envelope(
-            payload_type="debug.overview",
-            source="debug_panel",
-            data=overview,
-            source_timestamp=_latest_timestamp(
-                _timestamp_from_value(state_snapshot),
-                _timestamp_from_value(localization_snapshot),
-                _timestamp_from_value(map_snapshot),
-                _navigation_timestamp(navigation_context),
-                _exploration_timestamp(exploration_context),
-                _timestamp_from_value(runtime_governance),
-                pointcloud_map_info.get("timestamp"),
-                _timestamp_from_value(pointcloud),
-                video_info.get("timestamp"),
-                log_info.get("timestamp"),
-            ),
-            status=DebugDataStatus.AVAILABLE,
-        )
+        return _stream_migration_response('robot.state', 'map.frame', 'localization.pose', 'navigation.state', 'exploration.state', 'logs.entry', 'tasks.state')
 
     @router.get("/api/debug/map")
     @router.get("/api/debug/map/frame/latest")
-    async def debug_map(request: Request) -> Dict[str, Any]:
+    async def debug_map(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        refresh_error = None
-        snapshot = runtime.mapping_service.get_latest_snapshot()
-        if snapshot is None or getattr(snapshot, "occupancy_grid", None) is None:
-            service_available = runtime.mapping_service.is_available()
-            return _missing_envelope(
-                payload_type="map.frame",
-                source="mapping_service",
-                status=DebugDataStatus.MISSING if service_available else DebugDataStatus.UNSUPPORTED,
-                code="source_unavailable" if service_available else "source_unsupported",
-                message="未取得平台地图缓存或占据栅格。" if service_available else "建图服务不可用或未配置。",
-            )
-        diagnostics = _build_map_diagnostics(snapshot, refresh_error=refresh_error)
-        view = DebugMapView(
-            map_snapshot=to_jsonable(snapshot),
-            occupancy_grid=to_jsonable(snapshot.occupancy_grid),
-            cost_map=to_jsonable(snapshot.cost_map),
-            semantic_map=to_jsonable(snapshot.semantic_map),
-            diagnostics=to_jsonable({**diagnostics, "stream_bridge": runtime.get_live_map_stream_status()}),
-        )
-        source_timestamp = diagnostics.get("source_timestamp") if isinstance(diagnostics.get("source_timestamp"), datetime) else _map_source_timestamp(snapshot)
-        cache_timestamp = diagnostics.get("last_message_at") if isinstance(diagnostics.get("last_message_at"), datetime) else source_timestamp
-        return _envelope(
-            payload_type="map.frame",
-            source="mapping_service",
-            data=view,
-            source_timestamp=source_timestamp,
-            frame_id=getattr(snapshot, "frame_id", None),
-            sequence=diagnostics.get("message_count") if isinstance(diagnostics.get("message_count"), int) else None,
-            revision=str(diagnostics.get("content_revision") or _revision_from_map(snapshot)),
-            status=_status_for_map_diagnostics(diagnostics, cache_timestamp),
-        )
+        return _stream_migration_response('map.frame')
 
     @router.get("/api/debug/localization")
     @router.get("/api/debug/localization/pose/latest")
     @router.get("/api/debug/localization/trajectory")
-    async def debug_localization(request: Request, limit: int = 2000) -> Dict[str, Any]:
+    async def debug_localization(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        snapshot = runtime.localization_service.get_latest_snapshot()
-        history_limit = _clamp_int(limit, default=2000, minimum=1, maximum=10000)
-        history = runtime.localization_service.list_history(limit=history_limit)
-        trajectory = [
-            to_jsonable(item.current_pose)
-            for item in history
-            if getattr(item, "current_pose", None) is not None
-        ]
-        if snapshot is None or getattr(snapshot, "current_pose", None) is None:
-            service_available = runtime.localization_service.is_available()
-            return _missing_envelope(
-                payload_type="localization.snapshot",
-                source="localization_service",
-                status=DebugDataStatus.MISSING if service_available else DebugDataStatus.UNSUPPORTED,
-                code="source_unavailable" if service_available else "source_unsupported",
-                message="未取得平台定位缓存位姿。" if service_available else "定位服务不可用或未配置。",
-                data=DebugLocalizationView(trajectory=trajectory),
-            )
-        view = DebugLocalizationView(
-            localization_snapshot=to_jsonable(snapshot),
-            pose=to_jsonable(snapshot.current_pose),
-            frame_tree=to_jsonable(snapshot.frame_tree),
-            trajectory=trajectory,
-        )
-        source_timestamp = _timestamp_from_value(snapshot.current_pose) or _timestamp_from_value(snapshot)
-        return _envelope(
-            payload_type="localization.snapshot",
-            source="localization_service",
-            data=view,
-            source_timestamp=source_timestamp,
-            frame_id=getattr(snapshot.current_pose, "frame_id", None),
-            status=_status_for_timestamp(source_timestamp, "localization"),
-        )
+        return _stream_migration_response('localization.pose', 'localization.frame_tree', 'localization.trajectory')
 
     @router.get("/api/debug/navigation")
     @router.get("/api/debug/exploration/frontier/latest")
-    async def debug_navigation(request: Request) -> Dict[str, Any]:
+    async def debug_navigation(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        navigation_context = runtime.navigation_service.get_latest_navigation_context()
-        exploration_context = runtime.navigation_service.get_latest_exploration_context()
-        is_frontier_request = request.url.path.endswith("/exploration/frontier/latest")
-        source_available = (
-            runtime.navigation_service.is_exploration_available()
-            if is_frontier_request
-            else runtime.navigation_service.is_navigation_available() or runtime.navigation_service.is_exploration_available()
-        )
-        if is_frontier_request and exploration_context is None:
-            return _missing_envelope(
-                payload_type="frontier.frame",
-                source="navigation_service",
-                status=DebugDataStatus.MISSING if source_available else DebugDataStatus.UNSUPPORTED,
-                code="source_unavailable" if source_available else "source_unsupported",
-                message="未取得探索缓存上下文。" if source_available else "探索服务不可用或未配置。",
-            )
-        if navigation_context is None and exploration_context is None:
-            return _missing_envelope(
-                payload_type="navigation.snapshot",
-                source="navigation_service",
-                status=DebugDataStatus.MISSING if source_available else DebugDataStatus.UNSUPPORTED,
-                code="source_unavailable" if source_available else "source_unsupported",
-                message="未取得导航或探索缓存上下文。" if source_available else "导航或探索服务不可用或未配置。",
-            )
-        exploration_state = getattr(exploration_context, "exploration_state", None)
-        waiting_for = None
-        failure_code = None
-        frontier_count = None
-        frontier_freshness = {}
-        map_revision = None
-        costmap_revision = None
-        nav2_readiness = {}
-        mapping_chain_diagnostics = {}
-        if exploration_state is not None:
-            exploration_metadata = dict(getattr(exploration_state, "metadata", {}) or {})
-            frontier_count = getattr(exploration_state, "frontier_count", None)
-            waiting_for = exploration_metadata.get("waiting_for")
-            failure_code = exploration_metadata.get("failure_code")
-            frontier_freshness = (
-                dict(exploration_metadata.get("frontier_freshness"))
-                if isinstance(exploration_metadata.get("frontier_freshness"), dict)
-                else {}
-            )
-            map_revision = exploration_metadata.get("map_revision")
-            costmap_revision = exploration_metadata.get("costmap_revision")
-            nav2_readiness = (
-                dict(exploration_metadata.get("nav2_readiness"))
-                if isinstance(exploration_metadata.get("nav2_readiness"), dict)
-                else {}
-            )
-            raw_mapping_chain_diagnostics = exploration_metadata.get("mapping_chain_diagnostics")
-            mapping_chain_diagnostics = (
-                dict(raw_mapping_chain_diagnostics) if isinstance(raw_mapping_chain_diagnostics, dict) else {}
-            )
-        frontiers = _frontiers_from_exploration_context(exploration_context)
-        view = DebugNavigationView(
-            navigation_context=to_jsonable(navigation_context),
-            exploration_context=to_jsonable(exploration_context),
-            frontier_count=frontier_count if frontier_count is not None else len(frontiers),
-            waiting_for=waiting_for,
-            failure_code=failure_code,
-            frontier_freshness=frontier_freshness,
-            map_revision=None if map_revision is None else str(map_revision),
-            costmap_revision=None if costmap_revision is None else str(costmap_revision),
-            nav2_readiness=nav2_readiness,
-            mapping_chain_diagnostics=mapping_chain_diagnostics,
-            frontiers=frontiers,
-        )
-        source_timestamp = _latest_timestamp(_navigation_timestamp(navigation_context), _exploration_timestamp(exploration_context))
-        status = _status_for_timestamp(source_timestamp, "navigation")
-        payload_type = "frontier.frame" if is_frontier_request else "navigation.snapshot"
-        error = None
-        if payload_type == "frontier.frame" and not frontiers:
-            status = DebugDataStatus.MISSING if source_available else DebugDataStatus.UNSUPPORTED
-            error = DebugError(
-                code="source_unavailable" if source_available else "source_unsupported",
-                message="探索上下文暂未提供 frontier 几何；请确认探索运行态已生成候选。",
-                details={
-                    "frontier_count": frontier_count,
-                    "waiting_for": waiting_for,
-                    "failure_code": failure_code,
-                    "frontier_freshness": frontier_freshness,
-                    "map_revision": map_revision,
-                    "costmap_revision": costmap_revision,
-                    "nav2_readiness": nav2_readiness,
-                    "mapping_chain_diagnostics": mapping_chain_diagnostics,
-                },
-            )
-        return _envelope(
-            payload_type=payload_type,
-            source="navigation_service",
-            data=view,
-            source_timestamp=source_timestamp,
-            frame_id=_frame_id_from_navigation(navigation_context),
-            status=status,
-            error=error,
-        )
+        return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
     @router.get("/api/debug/pointcloud-map/latest/meta")
-    async def debug_pointcloud_map_meta(request: Request) -> Dict[str, Any]:
+    async def debug_pointcloud_map_meta(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        started_at = time.perf_counter()
-        descriptor = _resolve_pointcloud_map_descriptor(runtime)
-        pcd_path = str(descriptor.get("pcd_path") or "").strip()
-        if not pcd_path:
-            return _missing_envelope(
-                payload_type="pointcloud_map.meta",
-                source="pointcloud_map",
-                status=DebugDataStatus.MISSING,
-                code="source_unavailable",
-                message="未找到当前激活地图版本的 PCD 点云地图资产；不会回退到最新扫描帧。",
-                data=_missing_pointcloud_map_view(descriptor, started_at),
-            )
-        try:
-            pointcloud_map = await run_in_threadpool(
-                lambda: _POINTCLOUD_MAP_CACHE.load_pcd(
-                    Path(pcd_path),
-                    frame_id=str(descriptor.get("frame_id") or "map"),
-                    source_kind=str(descriptor.get("source_kind") or "map_version_pcd"),
-                )
-            )
-        except UnsupportedPointCloudMapError as exc:
-            return _pointcloud_map_error_envelope(descriptor, str(exc), started_at, code="unsupported_pcd_format")
-        except PointCloudMapError as exc:
-            return _pointcloud_map_error_envelope(descriptor, str(exc), started_at, code="pcd_parse_failed")
-        view = _pointcloud_map_view(pointcloud_map, descriptor, started_at)
-        return _envelope(
-            payload_type="pointcloud_map.meta",
-            source=str(descriptor.get("source") or "pointcloud_map"),
-            data=view,
-            source_timestamp=utc_now(),
-            frame_id=pointcloud_map.frame_id,
-            revision=pointcloud_map.revision,
-            status=DebugDataStatus.AVAILABLE,
-        )
+        return _stream_migration_response('pointcloud_map.meta')
 
     @router.get("/api/debug/pointcloud-map/latest.bin")
-    async def debug_pointcloud_map_binary(
-        request: Request,
-        lod: str = "preview",
-        revision: Optional[str] = None,
-    ) -> Response:
-        started_at = time.perf_counter()
+    async def debug_pointcloud_map_binary(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        descriptor = _resolve_pointcloud_map_descriptor(runtime)
-        pcd_path = str(descriptor.get("pcd_path") or "").strip()
-        if not pcd_path:
-            return JSONResponse(
-                status_code=404,
-                content=_missing_envelope(
-                    payload_type="pointcloud_map.bin",
-                    source="pointcloud_map",
-                    status=DebugDataStatus.MISSING,
-                    code="source_unavailable",
-                    message="未找到 PCD 点云地图资产；不会回退到最新扫描帧。",
-                    data=_missing_pointcloud_map_view(descriptor, started_at),
-                ),
-            )
-        try:
-            pointcloud_map = await run_in_threadpool(
-                lambda: _POINTCLOUD_MAP_CACHE.load_pcd(
-                    Path(pcd_path),
-                    frame_id=str(descriptor.get("frame_id") or "map"),
-                    source_kind=str(descriptor.get("source_kind") or "map_version_pcd"),
-                )
-            )
-        except UnsupportedPointCloudMapError as exc:
-            return JSONResponse(
-                status_code=422,
-                content=_pointcloud_map_error_envelope(
-                    descriptor,
-                    str(exc),
-                    started_at,
-                    code="unsupported_pcd_format",
-                ),
-            )
-        except PointCloudMapError as exc:
-            return JSONResponse(
-                status_code=422,
-                content=_pointcloud_map_error_envelope(
-                    descriptor,
-                    str(exc),
-                    started_at,
-                    code="pcd_parse_failed",
-                ),
-            )
-        if revision and revision != pointcloud_map.revision:
-            return JSONResponse(
-                status_code=409,
-                content=_envelope(
-                    payload_type="pointcloud_map.bin",
-                    source=str(descriptor.get("source") or "pointcloud_map"),
-                    status=DebugDataStatus.STALE,
-                    frame_id=pointcloud_map.frame_id,
-                    revision=pointcloud_map.revision,
-                    error=DebugError(
-                        code="revision_changed",
-                        message="点云地图 revision 已变化，请先重新读取 meta。",
-                        details={"requested_revision": revision, "current_revision": pointcloud_map.revision},
-                    ),
-                    data=_pointcloud_map_view(pointcloud_map, descriptor, started_at),
-                ),
-            )
-        normalized_lod = str(lod or "preview").strip().lower() or "preview"
-        points = pointcloud_map.lod_points(normalized_lod)
-        payload = pointcloud_map.binary_xyz(normalized_lod)
-        headers = {
-            "X-PointCloud-Revision": pointcloud_map.revision,
-            "X-PointCloud-Frame-Id": pointcloud_map.frame_id,
-            "X-PointCloud-Point-Count": str(int(points.shape[0])),
-            "X-PointCloud-Lod": normalized_lod,
-            "X-PointCloud-Format": "float32-xyz",
-            "X-PointCloud-Source-Kind": pointcloud_map.source_kind,
-            "X-PointCloud-Payload-Bytes": str(len(payload)),
-            "X-Server-Compute-Ms": "%.3f" % ((time.perf_counter() - started_at) * 1000.0),
-            "Cache-Control": "no-store",
-        }
-        return Response(content=payload, media_type="application/octet-stream", headers=headers)
+        return _stream_migration_response('pointcloud_map.chunk', 'pointcloud_map.frame')
 
     @router.get("/api/debug/pointcloud/latest")
     @router.get("/api/debug/pointcloud/frame/latest")
     @router.get("/api/debug/pointcloud/frame/latest/meta")
-    async def debug_pointcloud_latest(request: Request) -> Dict[str, Any]:
+    async def debug_pointcloud_latest(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        pointcloud = await run_in_threadpool(lambda: _get_latest_pointcloud(runtime))
-        if pointcloud is None:
-            return _missing_envelope(
-                payload_type="pointcloud.frame",
-                source="pointcloud_provider",
-                status=DebugDataStatus.MISSING,
-                code="source_unavailable",
-                message="未取得 provider 或 Go2 data_plane 的最新点云帧。",
-                data=DebugPointCloudView(
-                    source="go2_dds_scan_diagnostic",
-                    status=DebugDataStatus.MISSING,
-                    metadata={"diagnostic_role": "side_channel", "not_pointcloud_map": True},
-                    protection=_pointcloud_protection(runtime),
-                ),
-            )
-        source = _pointcloud_source(pointcloud)
-        source_timestamp = _timestamp_from_value(pointcloud)
-        status = _status_for_timestamp(source_timestamp, "pointcloud")
-        points = _pointcloud_points(pointcloud)
-        view = DebugPointCloudView(
-            frame_id=getattr(pointcloud, "frame_id", None),
-            source=source,
-            status=status,
-            metadata={
-                **_pointcloud_metadata(pointcloud),
-                "diagnostic_role": "side_channel",
-                "not_pointcloud_map": True,
-                "map_source_endpoint": "/api/debug/pointcloud-map/latest/meta",
-            },
-            point_count=int(getattr(pointcloud, "point_count", 0) or len(points)),
-            fields=to_jsonable(getattr(pointcloud, "fields", []) or []),
-            points=points,
-            format=_pointcloud_format(pointcloud),
-            payload_bytes=_estimate_pointcloud_payload_bytes(pointcloud),
-            artifact_ref=getattr(pointcloud, "artifact_id", None),
-            data_uri=getattr(pointcloud, "data_uri", None),
-            protection=_pointcloud_protection(runtime),
-            metrics={
-                **_pointcloud_metrics(pointcloud),
-                "inline_points": len(points),
-                "diagnostic_role": "side_channel",
-                "not_pointcloud_map": True,
-            },
-        )
-        return _envelope(
-            payload_type="pointcloud.frame",
-            source=source,
-            data=view,
-            source_timestamp=source_timestamp,
-            frame_id=getattr(pointcloud, "frame_id", None),
-            sequence=_sequence_from_metadata(pointcloud),
-            status=status,
-        )
+        return _stream_migration_response('pointcloud.frame')
 
     @router.get("/api/debug/video/latest")
     @router.get("/api/debug/video/frame/latest")
-    async def debug_video_latest(request: Request, camera_id: Optional[str] = None) -> Dict[str, Any]:
+    async def debug_video_latest(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        try:
-            image_frame = await run_in_threadpool(lambda: _capture_debug_video_frame(runtime, camera_id=camera_id))
-        except Exception as exc:
-            return _missing_envelope(
-                payload_type="video.frame",
-                source="image_provider",
-                status=DebugDataStatus.MISSING,
-                code="source_unavailable",
-                message="未取得 ImageProvider 的最新视频帧：%s" % exc,
-            )
-        if image_frame is None:
-            return _missing_envelope(
-                payload_type="video.frame",
-                source="image_provider",
-                status=DebugDataStatus.MISSING,
-                code="source_unavailable",
-                message="当前机器人入口未提供图像/视频 provider。",
-            )
-        source_timestamp = _timestamp_from_value(image_frame)
-        payload_bytes = len(getattr(image_frame, "data", None) or b"")
-        view = DebugVideoView(
-            camera_id=getattr(image_frame, "camera_id", None),
-            frame_id=getattr(image_frame, "frame_id", None),
-            width_px=getattr(image_frame, "width_px", None),
-            height_px=getattr(image_frame, "height_px", None),
-            encoding=str(getattr(getattr(image_frame, "encoding", None), "value", getattr(image_frame, "encoding", "")) or ""),
-            data_uri=_image_data_uri(image_frame),
-            uri=getattr(image_frame, "uri", None),
-            artifact_ref=getattr(image_frame, "artifact_id", None),
-            payload_bytes=payload_bytes,
-            metadata=to_jsonable(getattr(image_frame, "metadata", {}) or {}),
-            metrics={"payload_bytes": payload_bytes},
-        )
-        return _envelope(
-            payload_type="video.frame",
-            source="image_provider",
-            data=view,
-            source_timestamp=source_timestamp,
-            frame_id=getattr(image_frame, "frame_id", None),
-            status=_status_for_timestamp(source_timestamp, "video"),
-        )
+        return _stream_migration_response('video.frame')
 
     @router.get("/api/debug/logs/tail")
-    async def debug_logs_tail(
-        request: Request,
-        cursor: int = 0,
-        limit: int = 200,
-        level: Optional[str] = None,
-        source: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        started_at = time.perf_counter()
+    async def debug_logs_tail(request: Request) -> JSONResponse:
         access_manager.authenticate_http(request)
-        auth_ms = (time.perf_counter() - started_at) * 1000.0
-        safe_limit = _clamp_int(limit, default=200, minimum=1, maximum=1000)
-        normalized_level = str(level or "").strip().lower()
-        normalized_source = str(source or "").strip()
-        resolve_started = time.perf_counter()
-        log_path = _resolve_debug_log_path(runtime)
-        path_resolve_ms = (time.perf_counter() - resolve_started) * 1000.0
-        base_metrics = {
-            "auth_ms": auth_ms,
-            "path_resolve_ms": path_resolve_ms,
-            "requested_cursor": max(0, int(cursor or 0)),
-            "requested_limit": safe_limit,
-        }
-        if log_path is None:
-            return _missing_envelope(
-                payload_type="logs.tail",
-                source="configured_log_file",
-                status=DebugDataStatus.MISSING,
-                code="source_unavailable",
-                message="未找到配置日志文件。",
-                data=DebugLogsTailView(
-                    source_status=DebugDataStatus.MISSING,
-                    source_message="未找到配置日志文件。",
-                    metrics={**base_metrics, "server_compute_ms": (time.perf_counter() - started_at) * 1000.0},
-                ),
-            )
-        entries, next_cursor, _file_size, tail_metrics = await run_in_threadpool(
-            lambda: _tail_log_file(
-                log_path,
-                cursor=max(0, int(cursor or 0)),
-                limit=safe_limit,
-                level=normalized_level,
-                source=normalized_source,
-            )
-        )
-        status = DebugDataStatus.AVAILABLE if log_path.exists() else DebugDataStatus.MISSING
-        message = "读取配置日志文件 %s" % log_path
-        view = DebugLogsTailView(
-            next_cursor=next_cursor,
-            entries=entries,
-            source_status=status,
-            source_message=message,
-            metrics={
-                **base_metrics,
-                **tail_metrics,
-                "returned_entries": len(entries),
-                "server_compute_ms": (time.perf_counter() - started_at) * 1000.0,
-            },
-        )
-        source_timestamp = _log_file_timestamp(log_path)
-        return _envelope(
-            payload_type="logs.tail",
-            source="configured_log_file",
-            data=view,
-            source_timestamp=source_timestamp,
-            sequence=next_cursor,
-            status=status,
-            error=None if status == DebugDataStatus.AVAILABLE else DebugError(code="source_unavailable", message=message),
-        )
+        return _stream_migration_response('logs.entry')
 
 
     return router
@@ -1080,9 +523,6 @@ def _render_debug_page(access_token: str) -> str:
 
   <script>
     (() => {
-      const FAST_POLL_MS = 500;
-      const SENSOR_POLL_MS = 1000;
-      const SLOW_POLL_MS = 1500;
       const DEBUG_ACCESS_TOKEN = __DEBUG_ACCESS_TOKEN__;
       const urlAccessToken = new URLSearchParams(window.location.search).get("access_token") || "";
       const apiAccessToken = urlAccessToken || DEBUG_ACCESS_TOKEN;
@@ -1100,8 +540,8 @@ def _render_debug_page(access_token: str) -> str:
         goalStroke: "#ddd6fe",
         navPath: "#38bdf8",
       };
-      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "video", "logs"];
-      const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", video: "视频", logs: "日志" };
+      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
+      const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", logs: "日志" };
       const state = {
         mapGrid: null,
         mapViewport: null,
@@ -1114,9 +554,10 @@ def _render_debug_page(access_token: str) -> str:
         navigationPath: [],
         logs: [],
         logCursor: 0,
-        fastPolling: false,
-        sensorPolling: false,
-        slowPolling: false,
+        streamSocket: null,
+        streamReconnectTimer: null,
+        latestStreamCursor: 0,
+        latestStreamFrames: {},
         videoFrames: 0,
         latestOverview: null,
         latestHealth: null,
@@ -1232,26 +673,6 @@ def _render_debug_page(access_token: str) -> str:
         url.searchParams.set("access_token", apiAccessToken);
         return `${url.pathname}${url.search}`;
       }
-      async function getJson(path) {
-        const started = performance.now();
-        const requestPath = withAccessToken(path);
-        const res = await fetch(requestPath, { cache: "no-store" });
-        const receivedAt = new Date();
-        if (!res.ok) throw new Error(`${path} HTTP ${res.status}`);
-        const json = await res.json();
-        json.__receivedAt = receivedAt.toISOString();
-        json.__frontendLatencyMs = performance.now() - started;
-        return json;
-      }
-      async function getArrayBuffer(path) {
-        const started = performance.now();
-        const requestPath = withAccessToken(path);
-        const res = await fetch(requestPath, { cache: "no-store" });
-        const receivedAt = new Date();
-        if (!res.ok) throw new Error(`${path} HTTP ${res.status}`);
-        const buffer = await res.arrayBuffer();
-        return { buffer, receivedAt: receivedAt.toISOString(), frontendLatencyMs: performance.now() - started, headers: res.headers };
-      }
       function buildOverview() {
         els.overviewGrid.replaceChildren();
         for (const name of overviewNames) {
@@ -1295,11 +716,15 @@ def _render_debug_page(access_token: str) -> str:
         const map = data.map || {};
         const localization = data.localization || {};
         const video = data.video || {};
-        const sensorStatus = worstStatus([map, localization, video]);
+        const pointcloudMap = data.pointcloud_map || {};
+        const pointcloud = data.pointcloud || {};
+        const sensorStatus = worstStatus([map, localization, pointcloudMap, pointcloud, video]);
         setPill(els.sensorStatus, sensorStatus);
         setKv(els.sensorSummary, [
           ["2D_map", `${safeText(map.status)} latency=${fmt(map.latency_ms, " ms")}`],
           ["localization", `${safeText(localization.status)} frame=${safeText(localization.frame_id)}`],
+          ["pointcloud_map", `${safeText(pointcloudMap.status)} frame=${safeText(pointcloudMap.frame_id)} rev=${safeText(pointcloudMap.revision)}`],
+          ["pointcloud", `${safeText(pointcloud.status)} points=${safeText(pointcloud.metadata && pointcloud.metadata.point_count)} source=${safeText(pointcloud.metadata && pointcloud.metadata.source)}`],
           ["video", `${safeText(video.status)} source=${safeText(video.metadata && video.metadata.source)}`],
         ]);
       }
@@ -1312,6 +737,8 @@ def _render_debug_page(access_token: str) -> str:
           ["navigation", data.navigation],
           ["exploration", data.exploration],
           ["rtabmap_governance", data.runtime_governance],
+          ["pointcloud_map", data.pointcloud_map],
+          ["pointcloud", data.pointcloud],
           ["video", data.video],
           ["logs", data.logs],
         ];
@@ -1908,62 +1335,206 @@ def _render_debug_page(access_token: str) -> str:
           els.logs.appendChild(line);
         }
       }
-      async function tickFast() {
-        if (state.fastPolling) return;
-        state.fastPolling = true;
-        try {
-          const [overview, map, localization, navigation, frontier, governance] = await Promise.allSettled([
-            getJson("/api/debug/overview"),
-            getJson("/api/debug/map"),
-            getJson("/api/debug/localization"),
-            getJson("/api/debug/navigation"),
-            getJson("/api/debug/exploration/frontier/latest"),
-            getJson("/api/runtime/governance"),
-          ]);
-          els.lastReceive.textContent = nowText();
-          if (overview.status === "fulfilled") updateOverview(overview.value);
-          else {
-            setText(els.connectionText, "degraded");
-            setText(els.networkLatency, "--");
+      const STREAM_TOPICS = [
+        "robot.state",
+        "map.frame",
+        "localization.pose",
+        "localization.frame_tree",
+        "localization.trajectory",
+        "navigation.state",
+        "exploration.state",
+        "exploration.frontier",
+        "runtime.governance",
+        "pointcloud_map.meta",
+        "pointcloud.frame",
+        "video.frame",
+        "logs.entry",
+        "tasks.state"
+      ];
+      function envelopeFromFrame(frame, payloadOverride) {
+        const receivedAt = new Date().toISOString();
+        return {
+          ok: frame.status !== "error" && frame.status !== "missing",
+          type: frame.topic,
+          source: frame.source,
+          frame_id: frame.frame_id,
+          source_timestamp: frame.timestamp,
+          gateway_timestamp: frame.timestamp,
+          sequence: frame.sequence ?? frame.cursor,
+          revision: frame.revision,
+          status: frame.status || "available",
+          stale: frame.status === "stale",
+          data: payloadOverride === undefined ? frame.payload : payloadOverride,
+          metadata: frame.metadata || {},
+          __receivedAt: receivedAt,
+          __frontendLatencyMs: 0,
+        };
+      }
+      function buildStreamUrl() {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const url = new URL(`${protocol}//${window.location.host}/streams/ws`);
+        url.searchParams.set("topics", STREAM_TOPICS.join(","));
+        if (state.latestStreamCursor) url.searchParams.set("after_cursor", String(state.latestStreamCursor));
+        if (apiAccessToken) url.searchParams.set("access_token", apiAccessToken);
+        return url.toString();
+      }
+      function connectStreams() {
+        if (state.streamSocket && state.streamSocket.readyState === WebSocket.OPEN) return;
+        const socket = new WebSocket(buildStreamUrl());
+        state.streamSocket = socket;
+        socket.addEventListener("open", () => {
+          setText(els.connectionText, "streaming");
+          setText(els.networkLatency, "stream");
+          if (state.streamReconnectTimer) {
+            window.clearTimeout(state.streamReconnectTimer);
+            state.streamReconnectTimer = null;
           }
-          if (map.status === "fulfilled") updateMap(map.value); else showPanelError("map", map.reason.message);
-          if (localization.status === "fulfilled") updateLocalization(localization.value); else showPanelError("localization", localization.reason.message);
-          if (navigation.status === "fulfilled") updateNavigation(navigation.value); else showPanelError("navigation", navigation.reason.message);
-          if (frontier.status === "fulfilled" && statusOf(frontier.value) === "available") updateNavigation(frontier.value);
-          if (governance.status === "fulfilled") updateGovernance(governance.value); else showPanelError("governance", governance.reason.message);
-        } finally {
-          state.fastPolling = false;
-        }
+        });
+        socket.addEventListener("message", (event) => {
+          const message = JSON.parse(event.data);
+          if (message.type === "keepalive") {
+            setText(els.connectionText, "streaming");
+            if (typeof message.cursor === "number") state.latestStreamCursor = message.cursor;
+            return;
+          }
+          if (message.type !== "stream.frame" || !message.frame) return;
+          handleStreamFrame(message.frame);
+        });
+        socket.addEventListener("close", () => scheduleStreamReconnect());
+        socket.addEventListener("error", () => {
+          setText(els.connectionText, "stream_error");
+          showPanelError("logs", "实时数据流连接异常，正在重连。");
+        });
       }
-      async function tickSensor() {
-        if (state.sensorPolling) return;
-        state.sensorPolling = true;
-        try {
-          const [video] = await Promise.allSettled([
-            getJson("/api/debug/video/latest"),
-          ]);
-          if (video.status === "fulfilled") updateVideo(video.value); else showPanelError("video", video.reason.message);
-        } finally {
-          state.sensorPolling = false;
-        }
+      function scheduleStreamReconnect() {
+        setText(els.connectionText, "reconnecting");
+        if (state.streamReconnectTimer) return;
+        state.streamReconnectTimer = window.setTimeout(() => {
+          state.streamReconnectTimer = null;
+          connectStreams();
+        }, 1000);
       }
-      async function tickSlow() {
-        if (state.slowPolling) return;
-        state.slowPolling = true;
-        try {
-          const [logs, health, tasks] = await Promise.allSettled([
-            getJson(`/api/debug/logs/tail?cursor=${encodeURIComponent(state.logCursor)}&limit=200`),
-            getJson("/api/health"),
-            getJson("/api/tasks?history_limit=20"),
-          ]);
-          if (logs.status === "fulfilled") updateLogs(logs.value); else showPanelError("logs", logs.reason.message);
-          if (health.status === "fulfilled") updateHealth(health.value);
-          if (tasks.status === "fulfilled") updateTasks(tasks.value);
-        } catch (error) {
-          showPanelError("logs", error.message);
-        } finally {
-          state.slowPolling = false;
+      function handleStreamFrame(frame) {
+        state.latestStreamCursor = Math.max(state.latestStreamCursor || 0, Number(frame.cursor || 0));
+        state.latestStreamFrames[frame.topic] = frame;
+        els.lastReceive.textContent = nowText();
+        setText(els.connectionText, "streaming");
+        if (frame.topic === "robot.state") {
+          updateRobotStateFrame(frame);
+        } else if (frame.topic === "map.frame") {
+          updateMap(envelopeFromFrame(frame));
+        } else if (frame.topic === "localization.pose") {
+          updateLocalization(envelopeFromFrame(frame, { pose: frame.payload, trajectory: state.trajectory }));
+        } else if (frame.topic === "localization.trajectory") {
+          const trajectory = frame.payload && Array.isArray(frame.payload.trajectory) ? frame.payload.trajectory : [];
+          updateLocalization(envelopeFromFrame(frame, { pose: state.pose, trajectory }));
+        } else if (frame.topic === "navigation.state") {
+          updateNavigation(envelopeFromFrame(frame, { navigation_context: frame.payload, exploration_context: state.latestStreamFrames["exploration.state"] && state.latestStreamFrames["exploration.state"].payload }));
+        } else if (frame.topic === "exploration.state") {
+          updateNavigation(envelopeFromFrame(frame, { navigation_context: state.latestStreamFrames["navigation.state"] && state.latestStreamFrames["navigation.state"].payload, exploration_context: frame.payload }));
+        } else if (frame.topic === "exploration.frontier") {
+          updateFrontierFrame(frame);
+        } else if (frame.topic === "runtime.governance") {
+          updateGovernance(envelopeFromFrame(frame));
+        } else if (frame.topic === "pointcloud_map.meta") {
+          updatePointcloudMapFrame(frame);
+        } else if (frame.topic === "pointcloud.frame") {
+          updatePointcloudFrame(frame);
+        } else if (frame.topic === "video.frame") {
+          updateVideo(envelopeFromFrame(frame));
+        } else if (frame.topic === "logs.entry") {
+          updateLogFrame(frame);
+        } else if (frame.topic === "tasks.state") {
+          updateTaskFrame(frame);
         }
+        updateStreamOverview(frame);
+      }
+      function updateRobotStateFrame(frame) {
+        const payload = frame.payload || {};
+        updateHealth({
+          runtime_started: true,
+          robot_name: payload.robot_name,
+          robot_model: payload.robot_model,
+          assembly_status: payload.assembly_status || {},
+          latest_robot_snapshot: payload.robot_state || {},
+          active_task_count: state.latestTasks && Array.isArray(state.latestTasks.active_tasks) ? state.latestTasks.active_tasks.length : 0,
+          latest_event_cursor: frame.cursor || 0,
+        });
+      }
+      function updateFrontierFrame(frame) {
+        const payload = frame.payload || {};
+        const frontiers = Array.isArray(payload.latest_frontiers) ? payload.latest_frontiers : [];
+        state.frontiers = frontiers;
+        updateNavigation(envelopeFromFrame(frame, {
+          navigation_context: state.latestStreamFrames["navigation.state"] && state.latestStreamFrames["navigation.state"].payload,
+          exploration_context: state.latestStreamFrames["exploration.state"] && state.latestStreamFrames["exploration.state"].payload,
+          frontiers,
+          frontier_count: frontiers.length,
+        }));
+      }
+      function updatePointcloudMapFrame(frame) {
+        const summary = frame.payload || {};
+        const envelope = envelopeFromFrame(frame, summary);
+        const data = { pointcloud_map: { status: envelope.status, frame_id: envelope.frame_id, revision: envelope.revision, latency_ms: envelope.latency_ms, source_timestamp: envelope.source_timestamp, metadata: { source: envelope.source } } };
+        updateSensorSummary({ ...(state.latestOverview || {}), ...data });
+      }
+      function updatePointcloudFrame(frame) {
+        const payload = frame.payload || {};
+        const envelope = envelopeFromFrame(frame, payload);
+        const data = { pointcloud: { status: envelope.status, frame_id: envelope.frame_id, revision: envelope.revision, latency_ms: envelope.latency_ms, source_timestamp: envelope.source_timestamp, metadata: { source: envelope.source, point_count: payload.point_count || (frame.metadata && frame.metadata.point_count) } } };
+        updateSensorSummary({ ...(state.latestOverview || {}), ...data });
+      }
+      function updateLogFrame(frame) {
+        const payload = frame.payload || {};
+        const entry = {
+          sequence: frame.sequence ?? frame.cursor,
+          timestamp: payload.timestamp || frame.timestamp,
+          level: String(payload.severity || frame.status || "info").toLowerCase(),
+          source: payload.source || frame.source,
+          event_type: payload.event_type,
+          message: payload.message || payload.event_type || "runtime.event",
+        };
+        updateLogs(envelopeFromFrame(frame, { entries: [entry], next_cursor: frame.cursor, source_status: "streaming", metrics: {} }));
+      }
+      function updateTaskFrame(frame) {
+        const event = frame.payload || {};
+        const payload = event.payload || {};
+        const task = {
+          task_id: event.task_id || payload.task_id,
+          capability_name: payload.capability_name || (payload.request_context && payload.request_context.capability_name),
+          state: payload.state || event.state || event.event_type,
+          stage: event.message || event.event_type,
+          progress: payload.progress,
+        };
+        updateTasks({ active_tasks: task.task_id ? [task] : [], history_tasks: [] });
+      }
+      function updateStreamOverview(frame) {
+        const keyByTopic = {
+          "robot.state": "state",
+          "map.frame": "map",
+          "localization.pose": "localization",
+          "navigation.state": "navigation",
+          "exploration.state": "exploration",
+          "runtime.governance": "runtime_governance",
+          "pointcloud_map.meta": "pointcloud_map",
+          "pointcloud.frame": "pointcloud",
+          "video.frame": "video",
+          "logs.entry": "logs",
+        };
+        const key = keyByTopic[frame.topic];
+        if (!key) return;
+        const overview = { ...(state.latestOverview || {}) };
+        overview[key] = {
+          status: frame.status || "available",
+          source_timestamp: frame.timestamp,
+          latency_ms: 0,
+          stale: frame.status === "stale",
+          frame_id: frame.frame_id,
+          revision: frame.revision,
+          metadata: { source: frame.source },
+        };
+        state.latestOverview = overview;
+        updateOverview({ data: overview, __receivedAt: new Date().toISOString(), __frontendLatencyMs: 0 });
       }
       buildOverview();
       renderLogs();
@@ -1988,12 +1559,7 @@ def _render_debug_page(access_token: str) -> str:
         state.logSearch = els.logSearch.value;
         renderLogs();
       });
-      tickFast();
-      tickSensor();
-      tickSlow();
-      window.setInterval(tickFast, FAST_POLL_MS);
-      window.setInterval(tickSensor, SENSOR_POLL_MS);
-      window.setInterval(tickSlow, SLOW_POLL_MS);
+      connectStreams();
     })();
   </script>
 </body>
@@ -2210,238 +1776,6 @@ def _summary_from_payload(
     )
 
 
-def _get_pointcloud_map_summary(runtime: GatewayRuntime) -> Dict[str, Any]:
-    descriptor = _resolve_pointcloud_map_descriptor(runtime)
-    pcd_path = str(descriptor.get("pcd_path") or "").strip()
-    if not pcd_path:
-        return {
-            "available": False,
-            "source": "pointcloud_map",
-            "frame_id": descriptor.get("frame_id"),
-            "message": "未找到 PCD 点云地图资产。",
-            "metadata": descriptor,
-        }
-    path = Path(pcd_path).expanduser()
-    if not path.exists() or not path.is_file():
-        return {
-            "available": False,
-            "source": str(descriptor.get("source") or "pointcloud_map"),
-            "frame_id": descriptor.get("frame_id"),
-            "message": "PCD 点云地图资产不存在：%s" % pcd_path,
-            "metadata": descriptor,
-        }
-    stat = path.stat()
-    return {
-        "available": True,
-        "source": str(descriptor.get("source") or "pointcloud_map"),
-        "timestamp": utc_now(),
-        "frame_id": descriptor.get("frame_id"),
-        "revision": "pcd:%d:%d" % (int(stat.st_mtime_ns), int(stat.st_size)),
-        "message": "pointcloud_map=%s" % path,
-        "metadata": {
-            **descriptor,
-            "asset_mtime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
-            "asset_size_bytes": stat.st_size,
-        },
-    }
-
-
-def _resolve_pointcloud_map_descriptor(runtime: GatewayRuntime) -> Dict[str, Any]:
-    runtime_governance = runtime.get_runtime_governance_summary()
-    governance_asset = dict(getattr(runtime_governance, "geometry_asset", {}) or {})
-    governance_profile = dict(getattr(runtime_governance, "rtabmap_profile", {}) or {})
-    snapshot = runtime.mapping_service.get_latest_snapshot()
-    snapshot_metadata = dict(getattr(snapshot, "metadata", {}) or {}) if snapshot is not None else {}
-    geometry_summary = snapshot_metadata.get("geometry_asset_summary")
-    if not isinstance(geometry_summary, dict):
-        geometry_summary = {}
-    pcd_path = _first_non_empty(
-        governance_asset.get("pcd_path"),
-        snapshot_metadata.get("pcd_path"),
-        geometry_summary.get("pcd_path"),
-        _pcd_path_from_asset_refs(snapshot_metadata.get("geometry_assets")),
-        _pcd_path_from_asset_refs(geometry_summary.get("assets")),
-    )
-    source_kind = "runtime_governance_pcd" if governance_asset.get("pcd_path") else "map_version_pcd" if pcd_path else "unavailable"
-    geometry_runtime = getattr(runtime, "platform_geometry_runtime", None)
-    geometry_config = getattr(geometry_runtime, "config", None)
-    frames = getattr(geometry_config, "frames", None)
-    rtabmap = getattr(geometry_config, "rtabmap", None)
-    outputs = getattr(rtabmap, "outputs", None)
-    return {
-        "source": "rtabmap_pointcloud_map",
-        "source_kind": source_kind if pcd_path else "unavailable",
-        "map_name": _first_non_empty(snapshot_metadata.get("map_name"), geometry_summary.get("map_name")),
-        "map_version_id": _first_non_empty(
-            getattr(snapshot, "version_id", None),
-            snapshot_metadata.get("platform_map_version_id"),
-            geometry_summary.get("version_id"),
-        ),
-        "revision": _revision_from_map(snapshot),
-        "frame_id": _first_non_empty(
-            governance_asset.get("frame_id"),
-            getattr(snapshot, "frame_id", None),
-            snapshot_metadata.get("frame_id"),
-            geometry_summary.get("frame_id"),
-            getattr(frames, "map_frame", None),
-            "map",
-        ),
-        "geometry_stack": _first_non_empty(
-            governance_asset.get("geometry_stack"),
-            snapshot_metadata.get("geometry_stack"),
-            geometry_summary.get("geometry_stack"),
-            getattr(geometry_config, "stack", None),
-            "rtabmap_nav2",
-        ),
-        "rtabmap_db_path": _first_non_empty(
-            governance_asset.get("rtabmap_db_path"),
-            snapshot_metadata.get("rtabmap_db_path"),
-            geometry_summary.get("rtabmap_db_path"),
-        ),
-        "pcd_path": str(pcd_path or ""),
-        "quality_status": governance_asset.get("quality_status"),
-        "asset_summary": governance_asset,
-        "expected_pcd_candidates": [str(path) for path in _configured_pcd_candidates(runtime)],
-        "rtabmap_profile": {
-            "name": _first_non_empty(governance_profile.get("name"), getattr(rtabmap, "profile_name", None)),
-            "enabled": governance_profile.get("enabled", getattr(rtabmap, "profile_enabled", None)),
-            "pcd_root": getattr(rtabmap, "pcd_root", None),
-            "pcd_asset_name": getattr(outputs, "pcd_asset_name", None),
-        },
-    }
-
-
-def _pointcloud_map_view(
-    pointcloud_map: PointCloudMap,
-    descriptor: Dict[str, Any],
-    started_at: float,
-) -> DebugPointCloudMapView:
-    payload_bytes = int(pointcloud_map.lod_points("preview").shape[0]) * 3 * 4
-    lods = []
-    for item in pointcloud_map.lods():
-        level = str(item["level"])
-        lods.append(
-            {
-                **item,
-                "format": "float32-xyz",
-                "payload_bytes": int(item["point_count"]) * 3 * 4,
-                "bin_url": "/api/debug/pointcloud-map/latest.bin?lod=%s&revision=%s" % (level, pointcloud_map.revision),
-            }
-        )
-    return DebugPointCloudMapView(
-        map_name=descriptor.get("map_name"),
-        map_version_id=descriptor.get("map_version_id"),
-        revision=pointcloud_map.revision,
-        frame_id=pointcloud_map.frame_id,
-        source=str(descriptor.get("source") or "rtabmap_pointcloud_map"),
-        source_kind=pointcloud_map.source_kind,
-        geometry_stack=descriptor.get("geometry_stack"),
-        rtabmap_db_path=descriptor.get("rtabmap_db_path"),
-        pcd_path=pointcloud_map.path,
-        point_count=pointcloud_map.point_count,
-        fields=[{"name": "x", "datatype": "float32"}, {"name": "y", "datatype": "float32"}, {"name": "z", "datatype": "float32"}],
-        bounds={"min": list(pointcloud_map.bounds_min), "max": list(pointcloud_map.bounds_max)},
-        lods=lods,
-        payload_bytes=payload_bytes,
-        metadata={
-            "asset_mtime": pointcloud_map.source_timestamp.isoformat(),
-            "loaded_at": pointcloud_map.loaded_at.isoformat(),
-            "pcd_data": pointcloud_map.header.data,
-            "pcd_width": pointcloud_map.header.width,
-            "pcd_height": pointcloud_map.header.height,
-            "pcd_header_fields": list(pointcloud_map.header.fields),
-            "not_sensor_scan": True,
-        },
-        metrics={
-            "server_compute_ms": (time.perf_counter() - started_at) * 1000.0,
-            "pcd_load_ms": pointcloud_map.load_ms,
-            "preview_payload_bytes": payload_bytes,
-        },
-    )
-
-
-def _missing_pointcloud_map_view(descriptor: Dict[str, Any], started_at: float) -> DebugPointCloudMapView:
-    return DebugPointCloudMapView(
-        map_name=descriptor.get("map_name"),
-        map_version_id=descriptor.get("map_version_id"),
-        revision=descriptor.get("revision"),
-        frame_id=descriptor.get("frame_id"),
-        source=str(descriptor.get("source") or "pointcloud_map"),
-        source_kind=str(descriptor.get("source_kind") or "unavailable"),
-        geometry_stack=descriptor.get("geometry_stack"),
-        rtabmap_db_path=descriptor.get("rtabmap_db_path"),
-        pcd_path=descriptor.get("pcd_path"),
-        metadata={
-            "expected_pcd_candidates": descriptor.get("expected_pcd_candidates", []),
-            "rtabmap_profile": descriptor.get("rtabmap_profile", {}),
-            "asset_summary": descriptor.get("asset_summary", {}),
-            "quality_status": descriptor.get("quality_status"),
-            "not_fallback_to_sensor_scan": True,
-        },
-        metrics={"server_compute_ms": (time.perf_counter() - started_at) * 1000.0},
-    )
-
-
-def _pointcloud_map_error_envelope(
-    descriptor: Dict[str, Any],
-    message: str,
-    started_at: float,
-    *,
-    code: str,
-) -> Dict[str, Any]:
-    return _envelope(
-        payload_type="pointcloud_map.meta",
-        source=str(descriptor.get("source") or "pointcloud_map"),
-        data=_missing_pointcloud_map_view(descriptor, started_at),
-        status=DebugDataStatus.ERROR,
-        frame_id=descriptor.get("frame_id"),
-        error=DebugError(
-            code=code,
-            message=message,
-            details={
-                "pcd_path": descriptor.get("pcd_path"),
-                "expected_pcd_candidates": descriptor.get("expected_pcd_candidates", []),
-            },
-        ),
-    )
-
-
-def _configured_pcd_candidates(runtime: GatewayRuntime) -> List[Path]:
-    geometry_runtime = getattr(runtime, "platform_geometry_runtime", None)
-    config = getattr(geometry_runtime, "config", None)
-    rtabmap = getattr(config, "rtabmap", None)
-    outputs = getattr(rtabmap, "outputs", None)
-    root_text = str(getattr(rtabmap, "pcd_root", "") or "").strip()
-    if not root_text:
-        return []
-    root = Path(root_text).expanduser()
-    if root.suffix == ".pcd":
-        return [root]
-    asset_name = str(getattr(outputs, "pcd_asset_name", "") or "cloud_map.pcd")
-    return [root / asset_name, root / "cloud_map.pcd", root / "map.pcd", root / "current.pcd"]
-
-
-def _pcd_path_from_asset_refs(value: Any) -> str:
-    if not isinstance(value, list):
-        return ""
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        asset_type = str(item.get("asset_type") or "").lower()
-        if asset_type == "pcd":
-            return str(item.get("path") or "")
-    return ""
-
-
-def _first_non_empty(*values: Any) -> str:
-    for value in values:
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            return text
-    return ""
-
 
 def _runtime_governance_message(summary: Any) -> str:
     profile = dict(getattr(summary, "rtabmap_profile", {}) or {})
@@ -2509,44 +1843,6 @@ def _frontiers_from_exploration_context(context: Any) -> List[Dict[str, Any]]:
         normalized.append({**item, "geometry": geometry})
     return to_jsonable(normalized)
 
-
-def _get_image_provider(runtime: GatewayRuntime) -> Optional[ImageProvider]:
-    robot = getattr(runtime, "robot", None)
-    providers = getattr(robot, "providers", None) if robot is not None else None
-    if providers is not None and isinstance(providers, ImageProvider):
-        availability = getattr(providers, "is_available", None)
-        if not callable(availability) or bool(availability()):
-            return providers
-    return None
-
-
-def _capture_debug_video_frame(runtime: GatewayRuntime, *, camera_id: Optional[str] = None) -> Any:
-    provider = _get_image_provider(runtime)
-    if provider is None:
-        return None
-    return provider.capture_image(camera_id)
-
-
-def _get_video_summary(runtime: GatewayRuntime) -> Dict[str, Any]:
-    provider = _get_image_provider(runtime)
-    if provider is None:
-        return {"available": False, "source": "image_provider", "message": "当前机器人入口未提供图像/视频 provider。"}
-    try:
-        camera_info = provider.get_camera_info(None)
-    except Exception as exc:
-        return {"available": False, "source": "image_provider", "message": str(exc)}
-    return {
-        "available": camera_info is not None,
-        "source": "image_provider",
-        "timestamp": _timestamp_from_value(camera_info),
-        "frame_id": getattr(camera_info, "frame_id", None),
-        "message": "camera_info available" if camera_info is not None else "camera_info unavailable",
-        "metadata": {
-            "camera_id": getattr(camera_info, "camera_id", None),
-            "width_px": getattr(camera_info, "width_px", None),
-            "height_px": getattr(camera_info, "height_px", None),
-        },
-    }
 
 
 def _image_data_uri(image_frame: Any) -> Optional[str]:
@@ -2799,30 +2095,6 @@ def _exploration_metadata(context: Any) -> Dict[str, Any]:
         "nav2_readiness": metadata.get("nav2_readiness"),
     }
 
-
-def _get_latest_pointcloud(runtime: GatewayRuntime) -> Any:
-    candidates = []
-    robot = getattr(runtime, "robot", None)
-    if robot is not None:
-        candidates.append(robot)
-        provider_bundle = getattr(robot, "providers", None)
-        if provider_bundle is not None:
-            candidates.append(provider_bundle)
-        data_plane = getattr(robot, "data_plane", None)
-        if data_plane is not None:
-            candidates.append(data_plane)
-    for candidate in candidates:
-        getter = getattr(candidate, "get_latest_point_cloud", None)
-        if callable(getter):
-            pointcloud = getter()
-            if pointcloud is not None:
-                return pointcloud
-        local_getter = getattr(candidate, "get_latest_local_point_cloud", None)
-        if callable(local_getter):
-            pointcloud = local_getter()
-            if pointcloud is not None:
-                return pointcloud
-    return None
 
 
 def _pointcloud_source(pointcloud: Any) -> str:

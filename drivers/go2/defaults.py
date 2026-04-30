@@ -35,7 +35,7 @@ GO2_DEFAULT_TOPICS = {
     "joint_state": "robot.go2.joint_state",
     "imu_state": "robot.go2.imu_state",
     "robot_volume": "robot.go2.audio.volume",
-    "robot_odom": "/utlidar/robot_odom",
+    "robot_odom": "/nuwax/geometry/odom",
     "utlidar_imu": "/utlidar/imu",
     "utlidar_cloud": "/utlidar/cloud",
     "tf": "/tf",

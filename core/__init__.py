@@ -5,6 +5,7 @@ from core.event_bus import EventBus, EventSubscription
 from core.resource_lock import ResourceConflict, ResourceConflictError, ResourceLease, ResourceLockManager, RuntimeResource
 from core.safety_guard import SafetyGuard, WatchdogRegistration
 from core.state_store import StateEntry, StateNamespace, StateStore
+from core.stream_bus import StreamBus, StreamSubscription
 from core.task_manager import (
     TaskCancelledError,
     TaskExecutionContext,
@@ -28,6 +29,8 @@ __all__ = [
     "StateEntry",
     "StateNamespace",
     "StateStore",
+    "StreamBus",
+    "StreamSubscription",
     "TaskCancelledError",
     "TaskExecutionContext",
     "TaskManager",

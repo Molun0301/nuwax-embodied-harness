@@ -713,7 +713,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         cyclonedds_lib_dir=_cfg_str("NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR", ""),
         dds_iface=_cfg_str("NUWAX_GEOMETRY_DDS_IFACE", ""),
         topics=GeometryTopicsConfig(
-            odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/utlidar/robot_odom"),
+            odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/nuwax/geometry/odom"),
             secondary_odom_topics=_cfg_csv(
                 "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS",
                 (
@@ -730,7 +730,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             cost_map_topic=_cfg_str("NUWAX_GEOMETRY_COST_MAP_TOPIC", "/global_costmap/costmap"),
         ),
         frames=GeometryFrameConfig(
-            map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "odom"),
+            map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "map"),
             odom_frame=_cfg_str("NUWAX_GEOMETRY_ODOM_FRAME", "odom"),
             base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "body"),
             lidar_frame=_cfg_str("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),

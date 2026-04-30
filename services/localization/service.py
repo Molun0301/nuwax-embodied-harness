@@ -8,7 +8,7 @@ from contracts.events import RuntimeEventCategory
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus, LocalizationSnapshot, RelocalizationCandidate
-from core import EventBus, StateNamespace, StateStore
+from core import EventBus, StateNamespace, StateStore, StreamBus
 from gateways.errors import GatewayError
 from providers import LocalizationProvider
 from typing import Deque, Dict, Optional, Tuple
@@ -35,12 +35,14 @@ class LocalizationService:
         provider_owner,
         state_store: StateStore,
         event_bus: Optional[EventBus] = None,
+        stream_bus: Optional[StreamBus] = None,
         history_limit: int = 100,
         state_machine: Optional[LocalizationStateMachine] = None,
     ) -> None:
         self._provider_owner = provider_owner
         self._state_store = state_store
         self._event_bus = event_bus
+        self._stream_bus = stream_bus
         self._history: Deque[LocalizationSnapshot] = deque(maxlen=max(1, history_limit))
         self._session_history: Deque[LocalizationSession] = deque(maxlen=max(1, history_limit))
         self._latest_snapshot: Optional[LocalizationSnapshot] = None
@@ -656,6 +658,32 @@ class LocalizationService:
                     message="定位快照已更新。",
                     payload={"source_name": source_name},
                 )
+            )
+        if self._stream_bus is not None:
+            if current_pose is not None:
+                self._stream_bus.publish(
+                    "localization.pose",
+                    source="localization_service",
+                    payload=current_pose,
+                    frame_id=getattr(current_pose, "frame_id", None),
+                    status="available",
+                    metadata={"source_name": source_name},
+                )
+            if frame_tree is not None:
+                self._stream_bus.publish(
+                    "localization.frame_tree",
+                    source="localization_service",
+                    payload=frame_tree,
+                    status="available",
+                    metadata={"source_name": source_name},
+                )
+            self._stream_bus.publish(
+                "localization.trajectory",
+                source="localization_service",
+                payload={"trajectory": [item.current_pose for item in self._history if item.current_pose is not None]},
+                frame_id=getattr(current_pose, "frame_id", None),
+                status="available" if current_pose is not None else "missing",
+                metadata={"source_name": source_name, "history_size": len(self._history)},
             )
         return snapshot
 

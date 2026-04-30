@@ -8,7 +8,7 @@ from contracts.map_workspace import MapAssetStatus
 from contracts.runtime_views import LocalizationSessionStatus
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationStatus
 from contracts.runtime_views import ExplorationContext, NavigationContext
-from core import EventBus, StateNamespace, StateStore
+from core import EventBus, StateNamespace, StateStore, StreamBus
 from gateways.errors import GatewayError
 from providers import ExplorationProvider, NavigationProvider
 from services.localization import LocalizationService
@@ -40,6 +40,7 @@ class NavigationService:
         mapping_service: MappingService,
         state_store: StateStore,
         event_bus: Optional[EventBus] = None,
+        stream_bus: Optional[StreamBus] = None,
         history_limit: int = 100,
         navigation_state_machine: Optional[NavigationStateMachine] = None,
     ) -> None:
@@ -48,6 +49,7 @@ class NavigationService:
         self._mapping_service = mapping_service
         self._state_store = state_store
         self._event_bus = event_bus
+        self._stream_bus = stream_bus
         self._navigation_history: Deque[NavigationContext] = deque(maxlen=max(1, history_limit))
         self._exploration_history: Deque[ExplorationContext] = deque(maxlen=max(1, history_limit))
         self._latest_navigation_context: Optional[NavigationContext] = None
@@ -174,6 +176,15 @@ class NavigationService:
             source=provider.provider_name,
             metadata={"kind": "latest_navigation"},
         )
+        if self._stream_bus is not None:
+            self._stream_bus.publish(
+                "navigation.state",
+                source="navigation_service",
+                payload=context,
+                frame_id=getattr(getattr(context.navigation_state, "current_pose", None), "frame_id", None),
+                status=str(getattr(context.navigation_state.status, "value", context.navigation_state.status)),
+                metadata={"backend_name": provider.provider_name},
+            )
         if context.navigation_state.status in {
             NavigationStatus.SUCCEEDED,
             NavigationStatus.FAILED,
@@ -351,6 +362,24 @@ class NavigationService:
             source=provider.provider_name,
             metadata={"kind": "latest_exploration"},
         )
+        if self._stream_bus is not None:
+            self._stream_bus.publish(
+                "exploration.state",
+                source="navigation_service",
+                payload=context,
+                status=str(getattr(context.exploration_state.status, "value", context.exploration_state.status)),
+                metadata={"backend_name": provider.provider_name},
+            )
+            frontiers = dict(getattr(context.exploration_state, "metadata", {}) or {}).get("latest_frontiers")
+            current_frontier = dict(getattr(context.exploration_state, "metadata", {}) or {}).get("current_frontier")
+            if frontiers is not None or current_frontier is not None:
+                self._stream_bus.publish(
+                    "exploration.frontier",
+                    source="navigation_service",
+                    payload={"latest_frontiers": frontiers, "current_frontier": current_frontier},
+                    status="available",
+                    metadata={"backend_name": provider.provider_name},
+                )
         if context.exploration_state.status in {
             ExplorationStatus.SUCCEEDED,
             ExplorationStatus.FAILED,

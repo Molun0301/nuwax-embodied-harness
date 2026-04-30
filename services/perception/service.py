@@ -7,7 +7,7 @@ from contracts.events import RuntimeEventCategory
 from contracts.naming import build_observation_id
 from contracts.perception import Detection2D, Observation, SegmentationMask2D, Track, TrackState
 from contracts.runtime_views import PerceptionContext
-from core import EventBus, StateNamespace, StateStore
+from core import EventBus, StateNamespace, StateStore, StreamBus
 from gateways.errors import GatewayError
 from providers import ImageProvider, LocalizationProvider, PointCloudProvider
 from services.artifact_service import ArtifactService
@@ -42,6 +42,7 @@ class PerceptionService:
         segmentation_backend: Optional[SegmentationBackend] = None,
         geometry_augmentor: Optional[DetectionGeometryAugmentor] = None,
         event_bus: Optional[EventBus] = None,
+        stream_bus: Optional[StreamBus] = None,
         history_limit: int = 100,
         pipeline_name: str = "default_perception_pipeline",
     ) -> None:
@@ -55,6 +56,7 @@ class PerceptionService:
         self._segmentation_backend = segmentation_backend or DisabledSegmentationBackend()
         self._geometry_augmentor = geometry_augmentor or DetectionGeometryAugmentor()
         self._event_bus = event_bus
+        self._stream_bus = stream_bus
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
         self._latest_by_camera: Dict[str, PerceptionContext] = {}
         self._pipeline_name = pipeline_name
@@ -543,21 +545,17 @@ class PerceptionService:
     ):
         if camera_info is None or not detection_bundle.detections_2d:
             return detection_bundle
-        point_cloud_provider = self._get_point_cloud_provider_optional()
-        if point_cloud_provider is None:
-            return detection_bundle
-        point_cloud = point_cloud_provider.get_latest_point_cloud()
-        if point_cloud is None or not point_cloud.points:
+        point_cloud_frame = self._latest_stream_payload("pointcloud.frame")
+        if point_cloud_frame is None or not getattr(point_cloud_frame, "points", None):
             return detection_bundle
 
-        localization_provider = self._get_localization_provider_optional()
-        frame_tree = localization_provider.get_frame_tree() if localization_provider is not None else None
-        current_pose = localization_provider.get_current_pose() if localization_provider is not None else None
+        frame_tree = self._latest_stream_payload("localization.frame_tree")
+        current_pose = self._latest_stream_payload("localization.pose")
         detections_2d, geometry_metadata = self._geometry_augmentor.augment_detections(
             detection_bundle.detections_2d,
             image_frame=image_frame,
             camera_info=camera_info,
-            point_cloud=point_cloud,
+            point_cloud=point_cloud_frame,
             frame_tree=frame_tree,
             current_pose=current_pose,
         )
@@ -571,6 +569,14 @@ class PerceptionService:
                 **geometry_metadata,
             },
         )
+
+    def _latest_stream_payload(self, topic: str):
+        if self._stream_bus is None:
+            return None
+        frame = self._stream_bus.latest_frame(topic)
+        if frame is None or frame.status != "available":
+            return None
+        return frame.payload
 
     def _normalize_camera_id(self, camera_id: str) -> str:
         normalized = []

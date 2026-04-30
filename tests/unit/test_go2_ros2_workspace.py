@@ -345,9 +345,38 @@ def test_go2_file_value_loader_only_reads_go2_data_plane_env(tmp_path: Path, mon
 
 def test_geometry_runtime_shell_scripts_pass_bash_syntax_check() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    scripts = (repo_root / "services" / "geometry" / "source_runtime_env.sh",)
+    scripts = (
+        repo_root / "services" / "geometry" / "source_runtime_env.sh",
+        repo_root / "services" / "geometry" / "launch_ros2_stack.sh",
+        repo_root / "services" / "geometry" / "start_rtabmap_sidecar.sh",
+    )
     for script in scripts:
         subprocess.run(["bash", "-n", str(script)], check=True)
+
+
+def test_odom_tf_bridge_uses_configured_parent_frame() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    bridge_source = (repo_root / "services" / "geometry" / "odom_tf_bridge.py").read_text(encoding="utf-8")
+    sidecar_source = (repo_root / "services" / "geometry" / "start_rtabmap_sidecar.sh").read_text(encoding="utf-8")
+    geometry_contract_source = (repo_root / "contracts" / "geometry_runtime.py").read_text(encoding="utf-8")
+
+    assert 'parser.add_argument("--odom-topic", default="/nuwax/geometry/odom")' in bridge_source
+    assert 'odom_topic: str = "/nuwax/geometry/odom"' in geometry_contract_source
+    assert "transform.header.frame_id = parent_frame" in bridge_source
+    assert "transform.header = message.header" not in bridge_source
+    assert '--odom-frame "${ODOM_FRAME}"' in sidecar_source
+
+
+def test_platform_geometry_publishes_controlled_odom_topic() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    odom_publisher_source = (repo_root / "services" / "geometry" / "odometry_publisher.py").read_text(encoding="utf-8")
+    runtime_source = (repo_root / "services" / "geometry" / "runtime.py").read_text(encoding="utf-8")
+
+    assert "class Ros2OdometryPublisher" in odom_publisher_source
+    assert 'self.topic = str(config.topics.odom_topic or "/nuwax/geometry/odom")' in odom_publisher_source
+    assert "message.header.frame_id = self.odom_frame" in odom_publisher_source
+    assert "message.child_frame_id = self.base_frame" in odom_publisher_source
+    assert "Ros2OdometryPublisher(config, self._resolve_localization_backend)" in runtime_source
 
 
 def test_go2_data_plane_runtime_proxies_device_observations() -> None:

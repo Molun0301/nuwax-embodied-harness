@@ -6,7 +6,6 @@ import logging
 import math
 import struct
 import threading
-import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from contracts.pointcloud import PointCloudFrame
@@ -43,7 +42,7 @@ class Ros2PointCloudPublisher:
         self._rclpy = None
         self._pointcloud2_type = None
         self._point_field_type = None
-        self._thread: Optional[threading.Thread] = None
+        self._subscription_id: Optional[int] = None
 
     def start(self) -> None:
         if self._started:
@@ -62,8 +61,7 @@ class Ros2PointCloudPublisher:
         self._started = True
         self._ros_ready = True
         self._last_error = None
-        self._thread = threading.Thread(target=self._publish_loop, name="nuwax_ros2_pointcloud_publisher", daemon=True)
-        self._thread.start()
+        self._subscribe_point_cloud_source()
         LOGGER.info("ROS2 点云发布桥已启动 point_cloud_topic=%s frame_id=%s", self.topic, self.frame_id)
 
     def stop(self) -> None:
@@ -73,8 +71,7 @@ class Ros2PointCloudPublisher:
         self._started = False
         self._ros_ready = False
         self._stop_event.set()
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+        self._unsubscribe_point_cloud_source()
         if node is not None:
             try:
                 node.destroy_node()
@@ -90,7 +87,7 @@ class Ros2PointCloudPublisher:
         self._rclpy = None
         self._pointcloud2_type = None
         self._point_field_type = None
-        self._thread = None
+        self._subscription_id = None
         self._has_ros2_context = False
 
     def is_available(self) -> bool:
@@ -152,29 +149,28 @@ class Ros2PointCloudPublisher:
             self._has_ros2_context = False
             raise
 
-    def _publish_loop(self) -> None:
-        period_sec = 0.2
-        while not self._stop_event.is_set():
-            started_at = time.monotonic()
-            try:
-                self._publish_latest_point_cloud()
-            except Exception as exc:
-                with self._lock:
-                    self._last_error = str(exc)
-                LOGGER.debug("发布 ROS2 点云失败。", exc_info=True)
-            elapsed = time.monotonic() - started_at
-            self._stop_event.wait(max(0.01, period_sec - elapsed))
-
-    def _publish_latest_point_cloud(self) -> None:
-        if self._publisher is None or self._pointcloud2_type is None or self._point_field_type is None:
-            return
+    def _subscribe_point_cloud_source(self) -> None:
         provider = self._provider_resolver()
         if provider is None:
             return
-        getter = getattr(provider, "get_latest_point_cloud", None)
-        if not callable(getter):
+        subscriber = getattr(provider, "subscribe_point_cloud", None)
+        if callable(subscriber):
+            self._subscription_id = subscriber(self._publish_point_cloud)
             return
-        point_cloud = getter()
+        self._last_error = "点云 provider 未实现 subscribe_point_cloud，未启用定时轮询伪流式。"
+
+    def _unsubscribe_point_cloud_source(self) -> None:
+        provider = self._provider_resolver()
+        if provider is None or self._subscription_id is None:
+            return
+        unsubscriber = getattr(provider, "unsubscribe_point_cloud", None)
+        if callable(unsubscriber):
+            unsubscriber(self._subscription_id)
+        self._subscription_id = None
+
+    def _publish_point_cloud(self, point_cloud: PointCloudFrame) -> None:
+        if self._publisher is None or self._pointcloud2_type is None or self._point_field_type is None:
+            return
         if point_cloud is None or not point_cloud.points:
             return
         point_cloud = self._downsample(point_cloud)

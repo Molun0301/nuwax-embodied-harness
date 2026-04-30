@@ -27,7 +27,7 @@ def build_default_rtabmap_pcd_root() -> str:
 class GeometryTopicsConfig:
     """平台几何侧车统一话题配置。"""
 
-    odom_topic: str = "/utlidar/robot_odom"
+    odom_topic: str = "/nuwax/geometry/odom"
     secondary_odom_topics: Tuple[str, ...] = (
         "/uslam/localization/odom",
         "/lio_sam_ros2/mapping/odometry",
@@ -45,7 +45,7 @@ class GeometryTopicsConfig:
 class GeometryFrameConfig:
     """平台几何侧车统一坐标系配置。"""
 
-    map_frame: str = "odom"
+    map_frame: str = "map"
     odom_frame: str = "odom"
     base_frame: str = "body"
     lidar_frame: str = "utlidar_lidar"

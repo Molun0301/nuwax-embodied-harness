@@ -7,6 +7,7 @@ from fastapi import Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from gateways.auth import GatewayAccessManager
@@ -20,6 +21,21 @@ class CapabilityInvokeRequest(BaseModel):
     """能力调用请求体。"""
 
     arguments: Dict[str, Any] = Field(default_factory=dict, description="调用参数。")
+
+
+def _stream_migration_response(*topics: str) -> JSONResponse:
+    topic_list = [topic for topic in topics if topic]
+    query = ",".join(topic_list)
+    stream_path = "/streams/ws" + (f"?topics={query}" if query else "")
+    return JSONResponse(
+        status_code=410,
+        content={
+            "code": "stream_required",
+            "message": "实时数据 HTTP 快照入口已下线，请订阅实时流。",
+            "stream": stream_path,
+            "topics": topic_list,
+        },
+    )
 
 
 def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
@@ -257,26 +273,22 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/state/latest")
     async def api_state_latest(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        snapshot = runtime.robot_state_service.get_latest_snapshot()
-        if snapshot is None:
-            snapshot = await run_in_threadpool(runtime.robot_state_service.refresh)
-        return to_jsonable(snapshot)
+        return _stream_migration_response('robot.state')
 
     @router.get("/api/state/history")
     async def api_state_history(request: Request, limit: int = 20) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        return {"history": to_jsonable(runtime.robot_state_service.list_history(limit=limit))}
+        return _stream_migration_response('robot.state')
 
     @router.get("/api/state/diagnostics")
     async def api_state_diagnostics(request: Request, limit: int = 20) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        return {"diagnostics": to_jsonable(runtime.robot_state_service.list_diagnostics(limit=limit))}
+        return _stream_migration_response('robot.state')
 
     @router.get("/api/observations/latest")
     async def api_observations_latest(request: Request, camera_id: Optional[str] = None) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        context = runtime.observation_service.get_latest_observation(camera_id)
-        return {"observation_context": to_jsonable(context)}
+        return _stream_migration_response('video.frame', 'pointcloud.frame')
 
     @router.get("/api/observations/history")
     async def api_observations_history(
@@ -285,10 +297,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         limit: int = 20,
     ) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        return {
-            "history": to_jsonable(runtime.observation_service.list_history(camera_id=camera_id, limit=limit)),
-            "latest_contexts": to_jsonable(runtime.observation_service.list_latest_contexts()),
-        }
+        return _stream_migration_response('video.frame', 'pointcloud.frame')
 
     @router.get("/api/artifacts/summary")
     async def api_artifacts_summary(request: Request) -> Dict[str, Any]:
@@ -298,8 +307,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/perception/latest")
     async def api_perception_latest(request: Request, camera_id: Optional[str] = None) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        context = runtime.perception_service.get_latest_perception(camera_id)
-        return {"perception_context": to_jsonable(context)}
+        return _stream_migration_response('video.frame')
 
     @router.get("/api/perception/history")
     async def api_perception_history(
@@ -308,10 +316,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         limit: int = 20,
     ) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        return {
-            "history": to_jsonable(runtime.perception_service.list_history(camera_id=camera_id, limit=limit)),
-            "latest_contexts": to_jsonable(runtime.perception_service.list_latest_contexts()),
-        }
+        return _stream_migration_response('video.frame')
 
     @router.get("/api/perception/runtime")
     async def api_perception_runtime(request: Request) -> Dict[str, Any]:
@@ -331,17 +336,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/localization/latest")
     async def api_localization_latest(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        try:
-            return to_jsonable(
-                await run_in_threadpool(
-                    lambda: runtime._handle_get_localization_snapshot(
-                        {},
-                        requested_by="http_api",
-                    )
-                )
-            )
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
+        return _stream_migration_response('localization.pose', 'localization.frame_tree', 'localization.trajectory')
 
     @router.get("/api/localization/session")
     async def api_localization_session(request: Request) -> Dict[str, Any]:
@@ -375,25 +370,17 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/localization/history")
     async def api_localization_history(request: Request, limit: int = 20) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        return {"history": to_jsonable(runtime.localization_service.list_history(limit=limit))}
+        return _stream_migration_response('localization.pose', 'localization.trajectory')
 
     @router.get("/api/maps/latest")
     async def api_maps_latest(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        snapshot = runtime.mapping_service.get_latest_snapshot()
-        diagnostics = None
-        if snapshot is None and runtime.mapping_service.is_available():
-            try:
-                snapshot = await run_in_threadpool(runtime.mapping_service.refresh)
-            except Exception as exc:
-                runtime.platform_geometry_runtime._record_runtime_diagnostic("api_maps_latest_refresh", exc)
-                diagnostics = {"refresh_error": str(exc)}
-        return {"map_snapshot": to_jsonable(snapshot), "diagnostics": diagnostics}
+        return _stream_migration_response('map.frame')
 
     @router.get("/api/maps/history")
     async def api_maps_history(request: Request, limit: int = 20) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        return {"history": to_jsonable(runtime.mapping_service.list_history(limit=limit))}
+        return _stream_migration_response('map.frame')
 
     @router.get("/api/maps/catalog")
     async def api_maps_catalog(request: Request) -> Dict[str, Any]:
@@ -523,26 +510,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/navigation/latest")
     async def api_navigation_latest(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        navigation_context = runtime.navigation_service.get_latest_navigation_context()
-        exploration_context = runtime.navigation_service.get_latest_exploration_context()
-        diagnostics = {}
-        if runtime.navigation_service.is_navigation_available():
-            try:
-                navigation_context = await run_in_threadpool(runtime.navigation_service.refresh_navigation)
-            except Exception as exc:
-                runtime.platform_geometry_runtime._record_runtime_diagnostic("api_navigation_refresh", exc)
-                diagnostics["navigation_refresh_error"] = str(exc)
-        if runtime.navigation_service.is_exploration_available():
-            try:
-                exploration_context = await run_in_threadpool(runtime.navigation_service.refresh_exploration)
-            except Exception as exc:
-                runtime.platform_geometry_runtime._record_runtime_diagnostic("api_exploration_refresh", exc)
-                diagnostics["exploration_refresh_error"] = str(exc)
-        return {
-            "navigation_context": to_jsonable(navigation_context),
-            "exploration_context": to_jsonable(exploration_context),
-            "diagnostics": diagnostics or None,
-        }
+        return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
     @router.get("/api/navigation/semantic_context")
     async def api_navigation_semantic_context(request: Request) -> Dict[str, Any]:
@@ -561,10 +529,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/navigation/history")
     async def api_navigation_history(request: Request, limit: int = 20) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        return {
-            "navigation_history": to_jsonable(runtime.navigation_service.list_navigation_history(limit=limit)),
-            "exploration_history": to_jsonable(runtime.navigation_service.list_exploration_history(limit=limit)),
-        }
+        return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
     @router.get("/api/memory/summary")
     async def api_memory_summary(request: Request) -> Dict[str, Any]:

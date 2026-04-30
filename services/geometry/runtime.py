@@ -29,6 +29,7 @@ from providers.pointcloud import PointCloudProvider
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.live_map_provider import Ros2LiveMapProvider
 from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
+from services.geometry.odometry_publisher import Ros2OdometryPublisher
 from services.geometry.pointcloud_publisher import Ros2PointCloudPublisher
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig, NavigationControlConfig
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
@@ -202,6 +203,7 @@ class PlatformGeometryRuntime:
         self._active_map_version: Optional[MapVersion] = None
         self._last_activation_result: Dict[str, object] = {}
         self._live_map_provider = Ros2LiveMapProvider(config)
+        self._odometry_publisher = Ros2OdometryPublisher(config, self._resolve_localization_backend)
         self._point_cloud_publisher = Ros2PointCloudPublisher(config, self._resolve_point_cloud_provider)
         self._live_geometry_start_lock = threading.RLock()
         self._live_geometry_start_attempted = False
@@ -259,6 +261,7 @@ class PlatformGeometryRuntime:
             self._set_runtime_state("failed", "平台几何运行时启动失败：%s" % exc, blocked=True)
             self._stop_managed_processes()
             self._live_map_provider.stop()
+            self._odometry_publisher.stop()
             self._point_cloud_publisher.stop()
             self._live_geometry_start_attempted = False
             with self._runtime_state_lock:
@@ -276,6 +279,7 @@ class PlatformGeometryRuntime:
             thread.join(timeout=2.0)
         self._stop_managed_processes()
         self._live_map_provider.stop()
+        self._odometry_publisher.stop()
         self._point_cloud_publisher.stop()
         self._live_geometry_start_attempted = False
         with self._runtime_state_lock:
@@ -407,6 +411,8 @@ class PlatformGeometryRuntime:
             str(self._geometry_script("odom_tf_bridge.py")),
             "--odom-topic",
             str(self.config.topics.odom_topic),
+            "--odom-frame",
+            str(self.config.frames.odom_frame),
             "--default-child-frame",
             str(self.config.frames.base_frame),
             "--child-frame",
@@ -560,12 +566,14 @@ class PlatformGeometryRuntime:
             self._set_runtime_state("failed", process_failure, blocked=True)
             return
         live_map_status = self._clone_metadata(self._live_map_provider.get_status())
+        odometry_status = self._clone_metadata(self._odometry_publisher.get_status())
         point_cloud_status = self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = self._build_point_cloud_source_status()
         data_plane_status = self._build_data_plane_status()
         self._update_stream_tracker(live_map_status)
         readiness = self._build_rtabmap_readiness(
             live_map_status=live_map_status,
+            odometry_status=odometry_status,
             point_cloud_status=point_cloud_status,
             point_cloud_source=point_cloud_source,
             data_plane_status=data_plane_status,
@@ -619,11 +627,13 @@ class PlatformGeometryRuntime:
         self,
         *,
         live_map_status: Optional[Dict[str, object]] = None,
+        odometry_status: Optional[Dict[str, object]] = None,
         point_cloud_status: Optional[Dict[str, object]] = None,
         point_cloud_source: Optional[Dict[str, object]] = None,
         data_plane_status: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         live_map_status = live_map_status or self._clone_metadata(self._live_map_provider.get_status())
+        odometry_status = odometry_status or self._clone_metadata(self._odometry_publisher.get_status())
         point_cloud_status = point_cloud_status or self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
         data_plane_status = data_plane_status or self._build_data_plane_status()
@@ -643,6 +653,7 @@ class PlatformGeometryRuntime:
         go2_odom_ready = bool(
             odom_bridge is not None
             and odom_bridge.is_running()
+            and int(odometry_status.get("published_count") or 0) > 0
             and int(point_cloud_status.get("published_count") or 0) > 0
             and (point_cloud_source.get("timestamp") or data_plane_status.get("started") is not False)
         )
@@ -662,7 +673,7 @@ class PlatformGeometryRuntime:
         )
         relocalization_ready = bool(localization_ready and int(map_stream.get("content_revision") or 0) > 0)
         if not go2_odom_ready:
-            message = "Go2 odom/TF 输入未就绪；需要 odom_tf_bridge 运行、点云已发布且源时间戳可用。"
+            message = "Go2 odom/TF 输入未就绪；需要平台 odom 发布桥、odom_tf_bridge 运行，且点云已发布。"
             waiting_for = waiting_for or "go2_odom"
         elif not first_frame_ready:
             message = wait_message
@@ -692,6 +703,7 @@ class PlatformGeometryRuntime:
                 "has_publisher": rtabmap_info_publisher_count is True or int(rtabmap_info_publisher_count or 0) > 0,
             },
             "rtabmap_process": rtabmap_process.status() if rtabmap_process is not None else None,
+            "odometry_publisher": odometry_status,
             "odom_tf_bridge_process": odom_bridge.status() if odom_bridge is not None else None,
         }
 
@@ -888,13 +900,19 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return
         with self._live_geometry_start_lock:
-            if self._live_map_provider.is_available() and self._point_cloud_publisher.is_available():
+            if (
+                self._live_map_provider.is_available()
+                and self._odometry_publisher.is_available()
+                and self._point_cloud_publisher.is_available()
+            ):
                 return
             self._live_geometry_start_attempted = True
             try:
+                self._odometry_publisher.start()
                 self._point_cloud_publisher.start()
                 self._live_map_provider.start()
             except Exception:
+                self._odometry_publisher.stop()
                 self._point_cloud_publisher.stop()
                 self._live_geometry_start_attempted = False
                 raise
@@ -966,6 +984,7 @@ class PlatformGeometryRuntime:
             "backend_name": backend_name,
             "runtime_status": self.get_runtime_status(),
             "live_map_provider": self._live_map_provider.get_status(),
+            "odometry_publisher": self._odometry_publisher.get_status(),
             "point_cloud_publisher": self._point_cloud_publisher.get_status(),
             "active_map_name": self._active_map_version.map_name if self._active_map_version is not None else None,
             "active_map_version_id": self._active_map_version.version_id if self._active_map_version is not None else None,
@@ -976,11 +995,13 @@ class PlatformGeometryRuntime:
         """返回探索建图输入链路的可行动诊断。"""
 
         live_map_status = self._clone_metadata(self._live_map_provider.get_status())
+        odometry_status = self._clone_metadata(self._odometry_publisher.get_status())
         point_cloud_status = self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = self._build_point_cloud_source_status()
         data_plane_status = self._build_data_plane_status()
         waiting_for, message = self._classify_live_mapping_wait(
             live_map_status=live_map_status,
+            odometry_status=odometry_status,
             point_cloud_status=point_cloud_status,
             point_cloud_source=point_cloud_source,
             data_plane_status=data_plane_status,
@@ -995,11 +1016,13 @@ class PlatformGeometryRuntime:
             "runtime_status": self.get_runtime_status(),
             "rtabmap_readiness": self._build_rtabmap_readiness(
                 live_map_status=live_map_status,
+                odometry_status=odometry_status,
                 point_cloud_status=point_cloud_status,
                 point_cloud_source=point_cloud_source,
                 data_plane_status=data_plane_status,
             ),
             "live_map_provider": live_map_status,
+            "odometry_publisher": odometry_status,
             "point_cloud_publisher": point_cloud_status,
             "point_cloud_source": point_cloud_source,
             "data_plane": data_plane_status,
@@ -1012,6 +1035,7 @@ class PlatformGeometryRuntime:
         return {
             "geometry_stack": self.config.stack,
             "require_ros2": self.config.require_ros2,
+            "odom_topic": self.config.topics.odom_topic,
             "point_cloud_topic": self.config.topics.point_cloud_topic,
             "occupancy_topic": self.config.topics.occupancy_topic,
             "cost_map_topic": self.config.topics.cost_map_topic,
@@ -1028,13 +1052,14 @@ class PlatformGeometryRuntime:
 
     def _build_point_cloud_source_status(self) -> Dict[str, object]:
         provider = self._resolve_point_cloud_provider()
+        data_plane_status = self._build_data_plane_status()
         status: Dict[str, object] = {
             "provider_name": getattr(provider, "provider_name", None),
             "provider_version": getattr(provider, "provider_version", None),
             "provider_available": provider is not None,
-            "point_cloud_ready": False,
-            "point_count": 0,
-            "source_topic": None,
+            "point_cloud_ready": bool(data_plane_status.get("dds_cloud_ready")),
+            "point_count": int(data_plane_status.get("latest_point_cloud_points") or 0),
+            "source_topic": data_plane_status.get("point_cloud_source_topic"),
             "frame_id": None,
             "timestamp": None,
             "last_error": None,
@@ -1049,28 +1074,9 @@ class PlatformGeometryRuntime:
             except Exception as exc:
                 status["provider_available"] = False
                 status["last_error"] = str(exc)
-        getter = getattr(provider, "get_latest_point_cloud", None)
-        if not callable(getter):
-            status["last_error"] = "点云 provider 未实现 get_latest_point_cloud。"
-            return status
-        try:
-            point_cloud = getter()
-        except Exception as exc:
-            status["last_error"] = str(exc)
-            return status
-        if point_cloud is None:
-            return status
-        metadata = dict(getattr(point_cloud, "metadata", {}) or {})
-        timestamp = getattr(point_cloud, "timestamp", None)
-        status.update(
-            {
-                "point_cloud_ready": bool(getattr(point_cloud, "points", None)),
-                "point_count": int(getattr(point_cloud, "point_count", 0) or 0),
-                "source_topic": metadata.get("source_topic"),
-                "frame_id": getattr(point_cloud, "frame_id", None),
-                "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else None,
-            }
-        )
+        subscriber = getattr(provider, "subscribe_point_cloud", None)
+        if not callable(subscriber):
+            status["last_error"] = "点云 provider 未实现 subscribe_point_cloud。"
         return status
 
     def _build_data_plane_status(self) -> Dict[str, object]:
@@ -1093,10 +1099,13 @@ class PlatformGeometryRuntime:
             "enabled": getattr(config, "enabled", None),
             "started": raw_status.get("started"),
             "direct_dds_started": bridge_status.get("direct_dds_started"),
+            "dds_pose_ready": bridge_status.get("dds_pose_ready"),
             "dds_cloud_ready": bridge_status.get("dds_cloud_ready"),
+            "pose_source": bridge_status.get("pose_source"),
             "point_cloud_source_topic": bridge_status.get("point_cloud_source_topic"),
             "latest_point_cloud_points": bridge_status.get("latest_point_cloud_points"),
             "direct_dds_enabled": getattr(direct_dds, "enabled", None),
+            "direct_dds_pose_topic": getattr(direct_dds, "pose_topic", None),
             "direct_dds_point_cloud_topic": getattr(direct_dds, "point_cloud_topic", None),
             "dds_iface": getattr(config, "dds_iface", None),
             "last_error": raw_status.get("last_error"),

@@ -23,7 +23,8 @@ from contracts.spatial_memory import SceneSpaceReviewStatus
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
 from contracts.runtime_views import RuntimeGovernanceSummary
-from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, TaskManager
+from contracts.streams import StreamPayloadKind
+from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, StreamBus, TaskManager
 from drivers.entry import load_active_robot_private_capability_specs
 from drivers.common import (
     ObstacleAvoidanceControlDataPlane,
@@ -59,8 +60,6 @@ from settings import NuwaxRobotBridgeConfig
 
 RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.runtime")
 _RUNTIME_EVENT_LOG_RATE_LIMIT_SEC = 10.0
-_LIVE_MAP_STREAM_REFRESH_INTERVAL_SEC = 0.5
-_LIVE_MAP_STREAM_ERROR_BACKOFF_SEC = 2.0
 _REQUEST_CONTEXT_KEYS = (
     "request_id",
     "task_id",
@@ -188,6 +187,7 @@ class GatewayRuntime:
         robot: RobotAssemblyBase,
         capability_registry: Optional[CapabilityRegistry] = None,
         event_bus: Optional[EventBus] = None,
+        stream_bus: Optional[StreamBus] = None,
         resource_lock_manager: Optional[ResourceLockManager] = None,
         safety_guard: Optional[SafetyGuard] = None,
         state_store: Optional[StateStore] = None,
@@ -200,6 +200,7 @@ class GatewayRuntime:
         self.capability_registry = capability_registry or CapabilityRegistry()
         self.skill_registry = SkillRegistry()
         self.event_bus = event_bus or EventBus()
+        self.stream_bus = stream_bus or StreamBus()
         self.resource_lock_manager = resource_lock_manager or ResourceLockManager()
         self.state_store = state_store or StateStore()
         self.safety_guard = safety_guard or SafetyGuard(
@@ -227,6 +228,7 @@ class GatewayRuntime:
             robot,
             state_store=self.state_store,
             event_bus=self.event_bus,
+            stream_bus=self.stream_bus,
             history_limit=config.runtime_data.state_history_limit,
             diagnostic_history_limit=config.runtime_data.diagnostic_history_limit,
         )
@@ -246,12 +248,14 @@ class GatewayRuntime:
             provider_owner=self.platform_geometry_runtime,
             state_store=self.state_store,
             event_bus=self.event_bus,
+            stream_bus=self.stream_bus,
             history_limit=config.runtime_data.localization_history_limit,
         )
         self.mapping_service = MappingService(
             provider_owner=self.platform_geometry_runtime,
             state_store=self.state_store,
             event_bus=self.event_bus,
+            stream_bus=self.stream_bus,
             history_limit=config.runtime_data.map_history_limit,
         )
         perception_components = _build_perception_components(robot)
@@ -265,6 +269,7 @@ class GatewayRuntime:
             scene_description_backend=perception_components["scene_description_backend"],
             segmentation_backend=perception_components["segmentation_backend"],
             event_bus=self.event_bus,
+            stream_bus=self.stream_bus,
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),
         )
@@ -321,6 +326,7 @@ class GatewayRuntime:
             mapping_service=self.mapping_service,
             state_store=self.state_store,
             event_bus=self.event_bus,
+            stream_bus=self.stream_bus,
             history_limit=config.runtime_data.navigation_history_limit,
         )
         self.map_workspace_service = MapWorkspaceService(
@@ -338,8 +344,9 @@ class GatewayRuntime:
         self._started = False
         self._runtime_event_log_limiter = LogRateLimiter()
         self._event_log_subscription_id = self.event_bus.subscribe(self._log_runtime_event)
-        self._live_map_stream_stop_event = threading.Event()
-        self._live_map_stream_thread: Optional[threading.Thread] = None
+        self._robot_state_stream_subscription_id: Optional[int] = None
+        self._localization_stream_subscription_id: Optional[int] = None
+        self._point_cloud_stream_subscription_id: Optional[int] = None
         self._base_capability_matrix = robot.manifest.capability_matrix
         self._gateway_capability_names: Tuple[str, ...] = ()
 
@@ -366,26 +373,17 @@ class GatewayRuntime:
             self.platform_geometry_runtime.start()
             self._started = True
         try:
-            self.robot_state_service.refresh()
-        except Exception as exc:
-            RUNTIME_LOGGER.warning("启动后刷新机器人状态失败：%s", exc)
-        try:
-            if self.localization_service.is_available():
-                self.localization_service.refresh()
-        except Exception as exc:
-            RUNTIME_LOGGER.warning("启动后刷新定位状态失败：%s", exc)
-        try:
             if self.perception_video_runtime.should_auto_start():
                 self.perception_video_runtime.start()
         except Exception:
             RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
+        self._start_data_frame_stream_sources()
         if self.config.runtime_data.map_active_restore_on_start:
             try:
                 self.map_workspace_service.restore_active_workspace(load_memory_history=True)
             except Exception:
                 RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
         self._refresh_dynamic_capability_matrix()
-        self._start_live_map_stream_bridge()
 
         self.event_bus.publish(
             self.event_bus.build_event(
@@ -410,8 +408,8 @@ class GatewayRuntime:
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
             self.safety_guard.stop_all_motion("宿主机网关关闭。")
             self.task_manager.shutdown(wait=False)
-            self._stop_live_map_stream_bridge()
             self.audio_service.stop()
+            self._stop_data_frame_stream_sources()
             self.perception_video_runtime.stop()
             self.platform_geometry_runtime.stop()
             self.robot.stop()
@@ -426,68 +424,15 @@ class GatewayRuntime:
             )
         )
 
-    def _start_live_map_stream_bridge(self) -> None:
-        if self._live_map_stream_thread is not None and self._live_map_stream_thread.is_alive():
-            return
-        self._live_map_stream_stop_event.clear()
-        self._live_map_stream_thread = threading.Thread(
-            target=self._run_live_map_stream_bridge,
-            name="nuwax_live_map_stream_bridge",
-            daemon=True,
-        )
-        self._live_map_stream_thread.start()
-
-    def _stop_live_map_stream_bridge(self) -> None:
-        self._live_map_stream_stop_event.set()
-        thread = self._live_map_stream_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
-        self._live_map_stream_thread = None
-
-    def _run_live_map_stream_bridge(self) -> None:
-        while not self._live_map_stream_stop_event.is_set():
-            try:
-                self._refresh_live_map_stream_once()
-                self._live_map_stream_stop_event.wait(_LIVE_MAP_STREAM_REFRESH_INTERVAL_SEC)
-            except Exception as exc:
-                self.platform_geometry_runtime._record_runtime_diagnostic("live_map_stream_bridge", exc)
-                RUNTIME_LOGGER.warning("实时地图流桥接刷新失败：%s", exc)
-                self._live_map_stream_stop_event.wait(_LIVE_MAP_STREAM_ERROR_BACKOFF_SEC)
-
-    def _refresh_live_map_stream_once(self) -> None:
-        refreshers = (
-            ("live_map_stream_map", self.mapping_service.is_available, self.mapping_service.refresh),
-            ("live_map_stream_localization", self.localization_service.is_available, self.localization_service.refresh),
-            ("live_map_stream_navigation", self.navigation_service.is_navigation_available, self.navigation_service.refresh_navigation),
-            ("live_map_stream_exploration", self.navigation_service.is_exploration_available, self.navigation_service.refresh_exploration),
-        )
-        for code, is_available, refresh in refreshers:
-            try:
-                if is_available():
-                    refresh()
-            except Exception as exc:
-                self.platform_geometry_runtime._record_runtime_diagnostic(code, exc)
-
     def get_live_map_stream_status(self) -> Dict[str, object]:
-        thread = self._live_map_stream_thread
-        latest_map = self.mapping_service.get_latest_snapshot()
-        latest_localization = self.localization_service.get_latest_snapshot()
-        latest_navigation = self.navigation_service.get_latest_navigation_context()
-        latest_exploration = self.navigation_service.get_latest_exploration_context()
         return {
             "enabled": True,
-            "running": bool(thread is not None and thread.is_alive()),
-            "interval_sec": _LIVE_MAP_STREAM_REFRESH_INTERVAL_SEC,
-            "map_revision": getattr(latest_map, "revision", None),
-            "map_version_id": getattr(latest_map, "version_id", None),
-            "map_source_name": getattr(latest_map, "source_name", None),
-            "map_timestamp": getattr(getattr(latest_map, "occupancy_grid", None), "timestamp", None),
-            "localization_timestamp": getattr(latest_localization, "timestamp", None),
-            "navigation_timestamp": getattr(getattr(latest_navigation, "navigation_state", None), "timestamp", None),
-            "exploration_timestamp": getattr(getattr(latest_exploration, "exploration_state", None), "timestamp", None),
-            "event_stream_endpoints": {
-                "sse": "/events/stream?event_types=mapping.snapshot_ready",
-                "websocket": "/events/ws?event_types=mapping.snapshot_ready",
+            "running": True,
+            "mode": "stream_bus",
+            "stream_bus": self.stream_bus.status(),
+            "stream_endpoints": {
+                "sse": "/streams/sse?topics=map.frame,localization.pose,navigation.state,exploration.state",
+                "websocket": "/streams/ws?topics=map.frame,localization.pose,navigation.state,exploration.state",
             },
         }
 
@@ -495,6 +440,7 @@ class GatewayRuntime:
         """把运行时事件同步写入标准日志。"""
 
         try:
+            self._publish_runtime_event_stream_frames(event)
             level = {
                 "info": logging.INFO,
                 "warning": logging.WARNING,
@@ -545,6 +491,42 @@ class GatewayRuntime:
             RUNTIME_LOGGER.exception("写入运行时事件日志失败。")
 
     @staticmethod
+    def _stream_enum_value(value: Any) -> str:
+        return str(getattr(value, "value", value))
+
+    def _publish_runtime_event_stream_frames(self, event) -> None:
+        category = self._stream_enum_value(getattr(event, "category", ""))
+        severity = self._stream_enum_value(getattr(event, "severity", "info"))
+        self.stream_bus.publish(
+            "logs.entry",
+            source=str(getattr(event, "source", "event_bus") or "event_bus"),
+            payload={
+                "cursor": getattr(event, "cursor", None),
+                "event_type": getattr(event, "event_type", None),
+                "category": category,
+                "severity": severity,
+                "source": getattr(event, "source", None),
+                "task_id": getattr(event, "task_id", None),
+                "subject_id": getattr(event, "subject_id", None),
+                "message": getattr(event, "message", None),
+                "payload": getattr(event, "payload", {}) or {},
+                "metadata": getattr(event, "metadata", {}) or {},
+                "timestamp": getattr(event, "timestamp", None),
+            },
+            sequence=getattr(event, "cursor", None),
+            status=severity,
+        )
+        if category == "task" or getattr(event, "task_id", None):
+            self.stream_bus.publish(
+                "tasks.state",
+                source="task_manager",
+                payload=event,
+                sequence=getattr(event, "cursor", None),
+                status="available",
+                metadata={"task_id": getattr(event, "task_id", None), "event_type": getattr(event, "event_type", None)},
+            )
+
+    @staticmethod
     def _build_log_preview(value: Any) -> str:
         """把结构化载荷压缩成适合日志的一行文本。"""
 
@@ -557,6 +539,105 @@ class GatewayRuntime:
         if len(rendered) > 600:
             return f"{rendered[:600]}...(truncated)"
         return rendered
+
+    def _start_data_frame_stream_sources(self) -> None:
+        self._publish_runtime_governance_stream_frame()
+        self._publish_static_stream_capability_frames()
+        providers = getattr(self.robot, "providers", None)
+
+        robot_state_subscriber = getattr(providers, "subscribe_robot_state", None)
+        if callable(robot_state_subscriber) and self._robot_state_stream_subscription_id is None:
+            self._robot_state_stream_subscription_id = robot_state_subscriber(self._publish_robot_state_stream_frame)
+
+        localization_subscriber = getattr(providers, "subscribe_localization", None)
+        if callable(localization_subscriber) and self._localization_stream_subscription_id is None:
+            self._localization_stream_subscription_id = localization_subscriber(self._publish_localization_stream_frame)
+
+        point_cloud_subscriber = getattr(providers, "subscribe_point_cloud", None)
+        if callable(point_cloud_subscriber) and self._point_cloud_stream_subscription_id is None:
+            self._point_cloud_stream_subscription_id = point_cloud_subscriber(self._publish_point_cloud_stream_frame)
+
+    def _stop_data_frame_stream_sources(self) -> None:
+        providers = getattr(self.robot, "providers", None)
+        if providers is None:
+            return
+        if self._robot_state_stream_subscription_id is not None:
+            unsubscriber = getattr(providers, "unsubscribe_robot_state", None)
+            if callable(unsubscriber):
+                unsubscriber(self._robot_state_stream_subscription_id)
+            self._robot_state_stream_subscription_id = None
+        if self._localization_stream_subscription_id is not None:
+            unsubscriber = getattr(providers, "unsubscribe_localization", None)
+            if callable(unsubscriber):
+                unsubscriber(self._localization_stream_subscription_id)
+            self._localization_stream_subscription_id = None
+        if self._point_cloud_stream_subscription_id is not None:
+            unsubscriber = getattr(providers, "unsubscribe_point_cloud", None)
+            if callable(unsubscriber):
+                unsubscriber(self._point_cloud_stream_subscription_id)
+            self._point_cloud_stream_subscription_id = None
+
+    def _publish_robot_state_stream_frame(self, robot_state: Any) -> None:
+        try:
+            self.robot_state_service.ingest_robot_state(
+                robot_state,
+                source_name="robot_state_stream",
+                metadata={"source_kind": "robot_stream_callback"},
+            )
+        except Exception:
+            RUNTIME_LOGGER.debug("写入机器人状态流帧失败。", exc_info=True)
+
+    def _publish_localization_stream_frame(self, pose: Any, frame_tree: Any = None, metadata: Optional[Dict[str, object]] = None) -> None:
+        try:
+            self.localization_service.ingest_external_snapshot(
+                source_name="robot_localization_stream",
+                current_pose=pose,
+                frame_tree=frame_tree,
+                metadata={"source_kind": "robot_stream_callback", **dict(metadata or {})},
+            )
+        except Exception:
+            RUNTIME_LOGGER.debug("写入定位流帧失败。", exc_info=True)
+
+    def _publish_point_cloud_stream_frame(self, point_cloud: Any) -> None:
+        metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+        self.stream_bus.publish(
+            "pointcloud.frame",
+            source=str(metadata.get("source_topic") or "pointcloud_provider"),
+            payload=point_cloud,
+            frame_id=getattr(point_cloud, "frame_id", None),
+            sequence=metadata.get("sequence") if isinstance(metadata.get("sequence"), int) else None,
+            status="available",
+            metadata={
+                "point_count": getattr(point_cloud, "point_count", None),
+                "source_topic": metadata.get("source_topic"),
+            },
+        )
+
+    def _publish_runtime_governance_stream_frame(self) -> None:
+        self.stream_bus.publish(
+            "runtime.governance",
+            source="gateway_runtime",
+            payload=self.get_runtime_governance_summary(),
+            status="available",
+        )
+
+    def _publish_static_stream_capability_frames(self) -> None:
+        self.stream_bus.publish(
+            "video.frame",
+            source="image_provider",
+            payload={"available": False, "message": "当前图像接口没有原生视频流订阅，未启用定时抓帧伪流式。"},
+            payload_kind=StreamPayloadKind.UNSUPPORTED,
+            status="unsupported",
+            metadata={"reason": "no_native_video_stream_subscription"},
+        )
+        self.stream_bus.publish(
+            "pointcloud_map.meta",
+            source="pointcloud_map",
+            payload={"available": False, "message": "点云地图 HTTP 快照入口已下线，等待地图服务推送原生流式点云地图元数据。"},
+            payload_kind=StreamPayloadKind.UNSUPPORTED,
+            status="unsupported",
+            metadata={"reason": "no_native_pointcloud_map_stream_subscription"},
+        )
 
     def register_default_capabilities(self) -> None:
         """注册首版网关能力。"""
@@ -2261,31 +2342,130 @@ class GatewayRuntime:
         )
 
     def get_health_summary(self) -> Dict[str, Any]:
-        """导出健康摘要。"""
+        """导出轻量健康摘要。
 
+        `/api/health` 是 Web 面板和现场排障的高频入口，不能携带完整地图、
+        工作区、感知和导航上下文等大对象；详细数据应走对应 debug/API 接口。
+        """
+
+        robot_snapshot = self.robot_state_service.get_latest_snapshot()
+        localization_snapshot = self.localization_service.get_latest_snapshot()
+        map_snapshot = self.mapping_service.get_latest_snapshot()
+        navigation_context = self.navigation_service.get_latest_navigation_context()
+        exploration_context = self.navigation_service.get_latest_exploration_context()
+        perception_runtime = self.perception_video_runtime.get_status()
+        active_workspace = self.map_workspace_service.get_active_workspace()
+        artifact_summary = self.artifact_service.get_summary()
+        robot_state = getattr(robot_snapshot, "robot_state", robot_snapshot)
         return {
             "runtime_started": self._started,
             "robot_name": self.robot.manifest.robot_name,
             "robot_model": self.robot.manifest.robot_model,
             "assembly_status": self._serialize(self.robot.get_status()),
-            "latest_robot_snapshot": self._serialize(self.robot_state_service.get_latest_snapshot()),
-            "latest_localization": self._serialize(self.localization_service.get_latest_snapshot()),
-            "latest_map": self._serialize(self.mapping_service.get_latest_snapshot()),
-            "latest_observation": self._serialize(self.observation_service.get_latest_observation()),
-            "latest_perception": self._serialize(self.perception_service.get_latest_perception()),
-            "perception_runtime": self._serialize(self.perception_video_runtime.get_status()),
-            "latest_navigation": self._serialize(self.navigation_service.get_latest_navigation_context()),
-            "latest_exploration": self._serialize(self.navigation_service.get_latest_exploration_context()),
-            "runtime_governance": self._serialize(self.get_runtime_governance_summary()),
-            "memory_summary": self.memory_service.get_summary().model_dump(mode="json"),
-            "active_map_workspace": self._serialize(self.map_workspace_service.get_active_workspace()),
+            "latest_robot_snapshot": self._health_robot_state_summary(robot_state),
+            "latest_localization": self._health_localization_summary(localization_snapshot),
+            "latest_map": self._health_map_summary(map_snapshot),
+            "latest_navigation": self._health_navigation_summary(navigation_context),
+            "latest_exploration": self._health_exploration_summary(exploration_context),
+            "perception_runtime": self._health_perception_summary(perception_runtime),
+            "active_map_workspace": self._health_workspace_summary(active_workspace),
             "audio_state": self.audio_service.get_volume_state(),
             "active_task_count": len(self.task_manager.list_active_tasks()),
             "latest_event_cursor": self.event_bus.latest_cursor(),
+            "latest_stream_cursor": self.stream_bus.latest_cursor(),
             "artifact_dir": str(self.artifact_store.base_dir),
             "public_base_url": self.config.gateway.public_base_url,
-            "artifact_summary": self.artifact_service.get_summary().model_dump(mode="json"),
-            "resource_leases": [lease.model_dump(mode="json") for lease in self.resource_lock_manager.snapshot()],
+            "artifact_summary": {
+                "artifact_count": getattr(artifact_summary, "artifact_count", None),
+                "total_size_bytes": getattr(artifact_summary, "total_size_bytes", None),
+            },
+            "resource_leases": [
+                {
+                    "resource": getattr(lease, "resource", None),
+                    "task_id": getattr(lease, "task_id", None),
+                    "acquired_at": getattr(lease, "acquired_at", None),
+                }
+                for lease in self.resource_lock_manager.snapshot()
+            ],
+            "payload_contract": "lightweight_health_summary",
+            "stream_bus": self.stream_bus.status(),
+        }
+
+    def _health_robot_state_summary(self, robot_state: Any) -> Dict[str, Any]:
+        if robot_state is None:
+            return {}
+        return {
+            "timestamp": getattr(robot_state, "timestamp", None),
+            "robot_id": getattr(robot_state, "robot_id", None),
+            "frame_id": getattr(robot_state, "frame_id", None),
+            "mode": getattr(robot_state, "mode", None),
+            "battery": self._serialize(getattr(robot_state, "battery", None)),
+            "safety": self._serialize(getattr(robot_state, "safety", None)),
+            "metadata": dict(getattr(robot_state, "metadata", {}) or {}),
+        }
+
+    def _health_localization_summary(self, snapshot: Any) -> Dict[str, Any]:
+        pose = getattr(snapshot, "current_pose", None) if snapshot is not None else None
+        return {
+            "available": bool(pose is not None),
+            "timestamp": getattr(snapshot, "timestamp", None),
+            "pose_timestamp": getattr(pose, "timestamp", None),
+            "frame_id": getattr(pose, "frame_id", None),
+        }
+
+    def _health_map_summary(self, snapshot: Any) -> Dict[str, Any]:
+        occupancy_grid = getattr(snapshot, "occupancy_grid", None) if snapshot is not None else None
+        return {
+            "available": bool(occupancy_grid is not None),
+            "timestamp": getattr(snapshot, "timestamp", None),
+            "version_id": getattr(snapshot, "version_id", None),
+            "revision": getattr(snapshot, "revision", None),
+            "source_name": getattr(snapshot, "source_name", None),
+            "frame_id": getattr(snapshot, "frame_id", None),
+            "occupancy_grid": {
+                "timestamp": getattr(occupancy_grid, "timestamp", None),
+                "width": getattr(occupancy_grid, "width", None),
+                "height": getattr(occupancy_grid, "height", None),
+                "resolution_m": getattr(occupancy_grid, "resolution_m", None),
+            }
+            if occupancy_grid is not None
+            else None,
+        }
+
+    def _health_navigation_summary(self, context: Any) -> Dict[str, Any]:
+        state = getattr(context, "navigation_state", None) if context is not None else None
+        return {
+            "available": bool(context is not None),
+            "timestamp": getattr(state, "timestamp", None) or getattr(context, "timestamp", None),
+            "status": getattr(state, "status", None),
+            "message": getattr(state, "message", None),
+        }
+
+    def _health_exploration_summary(self, context: Any) -> Dict[str, Any]:
+        state = getattr(context, "exploration_state", None) if context is not None else None
+        return {
+            "available": bool(context is not None),
+            "timestamp": getattr(state, "timestamp", None) or getattr(context, "timestamp", None),
+            "status": getattr(state, "status", None),
+            "frontier_count": getattr(state, "frontier_count", None),
+            "message": getattr(state, "message", None),
+        }
+
+    def _health_perception_summary(self, status: Any) -> Dict[str, Any]:
+        return {
+            "enabled": getattr(status, "enabled", None),
+            "running": getattr(status, "running", None),
+            "camera_id": getattr(status, "camera_id", None),
+            "processed_frames": getattr(status, "processed_frames", None),
+            "last_error": getattr(status, "last_error", None),
+        }
+
+    def _health_workspace_summary(self, workspace: Any) -> Dict[str, Any]:
+        return {
+            "available": bool(workspace is not None),
+            "map_name": getattr(workspace, "map_name", None),
+            "map_version_id": getattr(workspace, "map_version_id", None),
+            "frame_id": getattr(workspace, "frame_id", None),
         }
 
     def _runtime_rtabmap_profile_summary(self, map_snapshot: Any) -> MetadataDict:
@@ -2444,7 +2624,9 @@ class GatewayRuntime:
 
     def _handle_get_robot_status(self, _: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         del requested_by
-        snapshot = self.robot_state_service.refresh()
+        snapshot = self.robot_state_service.get_latest_snapshot()
+        if snapshot is None:
+            raise GatewayError("当前还没有可用的机器人状态流帧。")
         payload = snapshot.model_dump(mode="json")
         payload["perception_runtime"] = self._serialize(self.perception_video_runtime.get_status())
         return payload
@@ -2608,19 +2790,13 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        active_workspace = self.map_workspace_service.get_active_workspace()
-        localization_session = None
-        if active_workspace is not None and active_workspace.map_loaded:
-            localization_session = self.map_workspace_service.sync_active_localization_session(
-                refresh=True,
-                metadata={"requested_by": requested_by or "unknown", "source": "get_localization_snapshot"},
-            )
+        del requested_by
         snapshot = self.localization_service.get_latest_snapshot()
-        if snapshot is None and self.localization_service.is_available():
-            snapshot = self.localization_service.refresh()
+        if snapshot is None:
+            raise GatewayError("当前还没有可用的定位流帧。")
         return {
             "localization_snapshot": snapshot,
-            "localization_session": localization_session or self.map_workspace_service.get_active_localization_session(),
+            "localization_session": self.map_workspace_service.get_active_localization_session(),
         }
 
     def _handle_get_localization_session(
@@ -2655,7 +2831,7 @@ class GatewayRuntime:
         del requested_by
         snapshot = self.mapping_service.get_latest_snapshot()
         if snapshot is None:
-            snapshot = self.mapping_service.refresh()
+            raise GatewayError("当前还没有可用的地图流帧。")
         return {"map_snapshot": snapshot}
 
     def _handle_get_navigation_snapshot(
@@ -2668,12 +2844,8 @@ class GatewayRuntime:
         navigation_context = self.navigation_service.get_latest_navigation_context()
         exploration_context = self.navigation_service.get_latest_exploration_context()
 
-        if navigation_context is None and self.navigation_service.is_navigation_available():
-            navigation_context = self.navigation_service.refresh_navigation()
-        if exploration_context is None and self.navigation_service.is_exploration_available():
-            exploration_context = self.navigation_service.refresh_exploration()
         if navigation_context is None and exploration_context is None:
-            raise GatewayError("当前机器人入口未提供导航或探索后端。")
+            raise GatewayError("当前还没有可用的导航或探索流帧。")
         return {
             "navigation_context": navigation_context,
             "exploration_context": exploration_context,
@@ -4282,25 +4454,12 @@ class GatewayRuntime:
 
     def _refresh_workspace_snapshots(self) -> None:
         active_workspace = self.map_workspace_service.get_active_workspace()
-        refresh_live_map = True
-        if active_workspace is not None and active_workspace.latest_map_snapshot is not None:
-            refresh_live_map = (
-                active_workspace.latest_map_snapshot.metadata.get("source_kind") != "platform_map_version"
-            )
-        try:
-            if refresh_live_map and self.mapping_service.is_available():
-                self.mapping_service.refresh()
-        except Exception as exc:
-            self.platform_geometry_runtime._record_runtime_diagnostic("workspace_map_refresh", exc)
-            RUNTIME_LOGGER.warning("刷新地图工作区快照失败：%s", exc)
         try:
             if active_workspace is not None:
                 self.map_workspace_service.sync_active_localization_session(
-                    refresh=True,
+                    refresh=False,
                     metadata={"source": "refresh_workspace_snapshots"},
                 )
-            elif self.localization_service.is_available():
-                self.localization_service.refresh()
         except Exception:
             pass
 

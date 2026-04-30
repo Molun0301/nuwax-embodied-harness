@@ -11,10 +11,10 @@ cd "${REPO_ROOT}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 export CYCLONEDDS_URI="${CYCLONEDDS_URI:-<CycloneDDS><Domain><Compatibility><StandardsConformance>lax</StandardsConformance></Compatibility></Domain></CycloneDDS>}"
 
-ODOM_TOPIC="${NUWAX_GEOMETRY_ODOM_TOPIC:-/utlidar/robot_odom}"
+ODOM_TOPIC="${NUWAX_GEOMETRY_ODOM_TOPIC:-/nuwax/geometry/odom}"
 IMU_TOPIC="${NUWAX_GEOMETRY_IMU_TOPIC:-/utlidar/imu}"
 POINT_CLOUD_TOPIC="${NUWAX_GEOMETRY_POINT_CLOUD_TOPIC:-/utlidar/cloud}"
-MAP_FRAME="${NUWAX_GEOMETRY_MAP_FRAME:-odom}"
+MAP_FRAME="${NUWAX_GEOMETRY_MAP_FRAME:-map}"
 ODOM_FRAME="${NUWAX_GEOMETRY_ODOM_FRAME:-odom}"
 BASE_FRAME="${NUWAX_GEOMETRY_BASE_FRAME:-body}"
 LIDAR_FRAME="${NUWAX_GEOMETRY_LIDAR_FRAME:-utlidar_lidar}"
@@ -49,6 +49,17 @@ start_background() {
   PIDS+=("$!")
 }
 
+if [[ -z "${MAP_FRAME}" ]]; then
+  MAP_FRAME="map"
+fi
+if [[ -z "${ODOM_FRAME}" ]]; then
+  ODOM_FRAME="odom"
+fi
+if [[ "${MAP_FRAME}" == "${ODOM_FRAME}" ]]; then
+  printf 'RTAB-Map map_frame_id 与 odom_frame_id 不能相同：%s；请把 NUWAX_GEOMETRY_MAP_FRAME 设为 map，避免 TF_SELF_TRANSFORM。\n' "${MAP_FRAME}" >&2
+  exit 2
+fi
+
 start_static_tf() {
   local log_name="$1"
   local parent_frame="$2"
@@ -65,6 +76,7 @@ start_background "odom_tf_bridge.log" \
   bash "${REPO_ROOT}/services/geometry/launch_ros2_stack.sh" \
   python3 "${REPO_ROOT}/services/geometry/odom_tf_bridge.py" \
   --odom-topic "${ODOM_TOPIC}" \
+  --odom-frame "${ODOM_FRAME}" \
   --default-child-frame "${BASE_FRAME}" \
   --child-frame "${BASE_FRAME}"
 

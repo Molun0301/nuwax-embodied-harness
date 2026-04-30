@@ -5,7 +5,7 @@ from dataclasses import asdict, is_dataclass
 
 from contracts.runtime_views import DiagnosticItem, DiagnosticLevel, DiagnosticSnapshot, RobotStatusSnapshot
 from contracts.events import RuntimeEventCategory
-from core import EventBus, StateNamespace, StateStore
+from core import EventBus, StateNamespace, StateStore, StreamBus
 from drivers.common.assembly import RobotAssemblyBase
 from gateways.errors import GatewayError
 from providers import SafetyProvider, StateProvider
@@ -21,12 +21,14 @@ class RobotStateService:
         *,
         state_store: StateStore,
         event_bus: Optional[EventBus] = None,
+        stream_bus: Optional[StreamBus] = None,
         history_limit: int = 200,
         diagnostic_history_limit: int = 200,
     ) -> None:
         self._robot = robot
         self._state_store = state_store
         self._event_bus = event_bus
+        self._stream_bus = stream_bus
         self._history: Deque[RobotStatusSnapshot] = deque(maxlen=max(1, history_limit))
         self._diagnostic_history: Deque[DiagnosticSnapshot] = deque(maxlen=max(1, diagnostic_history_limit))
         self._latest_snapshot: Optional[RobotStatusSnapshot] = None
@@ -36,7 +38,23 @@ class RobotStateService:
 
         state_provider = self._get_state_provider()
         robot_state = state_provider.get_robot_state()
-        safety_state = self._get_safety_state(robot_state)
+        return self.ingest_robot_state(
+            robot_state,
+            source_name=state_provider.provider_name,
+            metadata={"source_kind": "provider_refresh"},
+        )
+
+    def ingest_robot_state(
+        self,
+        robot_state,
+        *,
+        source_name: str,
+        safety_state=None,
+        metadata: Optional[dict] = None,
+    ) -> RobotStatusSnapshot:
+        """写入源头推送的机器人状态。"""
+
+        safety_state = safety_state or self._get_safety_state(robot_state)
         diagnostics = self._build_diagnostics(robot_state, safety_state)
         snapshot = RobotStatusSnapshot(
             robot_name=self._robot.manifest.robot_name,
@@ -46,8 +64,9 @@ class RobotStateService:
             safety_state=safety_state,
             diagnostics=diagnostics,
             metadata={
-                "provider_name": state_provider.provider_name,
+                "provider_name": source_name,
                 "adapter_count": len(self._robot.get_adapter_health_statuses()),
+                **dict(metadata or {}),
             },
         )
         diagnostic_snapshot = DiagnosticSnapshot(
@@ -61,7 +80,7 @@ class RobotStateService:
         self._diagnostic_history.append(diagnostic_snapshot)
 
         self._state_store.write_from_provider(
-            state_provider.provider_name,
+            source_name,
             StateNamespace.ROBOT_STATE,
             self._robot.manifest.robot_name,
             robot_state,
@@ -71,7 +90,7 @@ class RobotStateService:
             StateNamespace.SAFETY,
             self._robot.manifest.robot_name,
             safety_state,
-            source=state_provider.provider_name,
+            source=source_name,
         )
         self._state_store.write(
             StateNamespace.SYSTEM,
@@ -99,6 +118,19 @@ class RobotStateService:
                         "diagnostic_count": len(diagnostics),
                     },
                 )
+            )
+        if self._stream_bus is not None:
+            self._stream_bus.publish(
+                "robot.state",
+                source="robot_state_service",
+                payload=snapshot,
+                frame_id=getattr(robot_state, "frame_id", None),
+                status="available",
+                metadata={
+                    "robot_name": self._robot.manifest.robot_name,
+                    "mode": getattr(getattr(robot_state, "mode", None), "value", None),
+                    "diagnostic_count": len(diagnostics),
+                },
             )
         return snapshot
 

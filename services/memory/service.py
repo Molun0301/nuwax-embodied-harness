@@ -5030,40 +5030,18 @@ class MemoryService:
         prefer_live: bool = False,
     ):
         snapshot = self._localization_service.get_latest_snapshot()
-        active_session = self._localization_service.get_active_session()
-        if active_session is not None:
-            try:
-                self._localization_service.refresh_current_session(
-                    metadata={"source": "memory_service"},
-                )
-            except GatewayError:
-                pass
-            snapshot = self._localization_service.get_latest_snapshot()
-        elif self._localization_service.is_available() and (snapshot is None or prefer_live):
-            try:
-                snapshot = self._localization_service.refresh()
-            except GatewayError:
-                pass
         if snapshot is not None:
             return snapshot
         if allow_missing:
             return None
-        raise GatewayError("当前没有可用定位结果。")
+        raise GatewayError("当前没有可用定位流帧。")
 
     def _get_map_snapshot(self):
         snapshot = self._mapping_service.get_latest_snapshot()
-        if snapshot is None and self._mapping_service.is_available():
-            try:
-                snapshot = self._mapping_service.refresh()
-            except GatewayError as exc:
-                if snapshot is None and "地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。" not in str(exc):
-                    raise
-                if snapshot is None:
-                    self._refresh_semantic_map_context(None)
-                    return None
         if snapshot is not None:
             self._refresh_semantic_map_context(snapshot)
             return snapshot
+        self._refresh_semantic_map_context(None)
         return None
 
     def _load_primary_image_bytes(self, artifact_ids: List[str]) -> Optional[bytes]:

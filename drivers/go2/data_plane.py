@@ -16,7 +16,7 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 
@@ -153,6 +153,9 @@ class RclpyGo2RosBridge:
         self._latest_pose_source = ""
         self._latest_imu_source_topic = ""
         self._latest_point_cloud_source_topic = ""
+        self._localization_callbacks: Dict[int, Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]] = {}
+        self._point_cloud_callbacks: Dict[int, Callable[[PointCloudFrame], None]] = {}
+        self._next_callback_id = 1
         self._direct_pose_ready = False
         self._direct_imu_ready = False
         self._direct_point_cloud_ready = False
@@ -195,6 +198,31 @@ class RclpyGo2RosBridge:
             },
             deep=True,
         )
+
+    def _next_subscription_id(self) -> int:
+        callback_id = self._next_callback_id
+        self._next_callback_id += 1
+        return callback_id
+
+    def subscribe_localization(self, callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]) -> int:
+        with self._lock:
+            callback_id = self._next_subscription_id()
+            self._localization_callbacks[callback_id] = callback
+            return callback_id
+
+    def unsubscribe_localization(self, callback_id: int) -> None:
+        with self._lock:
+            self._localization_callbacks.pop(int(callback_id), None)
+
+    def subscribe_local_point_cloud(self, callback: Callable[[PointCloudFrame], None]) -> int:
+        with self._lock:
+            callback_id = self._next_subscription_id()
+            self._point_cloud_callbacks[callback_id] = callback
+            return callback_id
+
+    def unsubscribe_local_point_cloud(self, callback_id: int) -> None:
+        with self._lock:
+            self._point_cloud_callbacks.pop(int(callback_id), None)
 
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
@@ -311,6 +339,13 @@ class RclpyGo2RosBridge:
     def _on_sport_mode_state(self, message: object, *, source_topic: str = "") -> None:
         pose = self._build_pose_from_sport_mode_state(message)
         imu_state = self._build_imu_from_sport_mode_state(message)
+        frame_tree = FrameTree(root_frame_id=pose.frame_id)
+        metadata = {
+            "source_topic": str(source_topic or ""),
+            "imu_source_topic": f"{source_topic}#imu_state" if source_topic else "",
+            "dds_pose_ready": True,
+            "dds_imu_ready": imu_state is not None,
+        }
         with self._lock:
             self._latest_pose_from_dds = pose
             self._latest_imu_state_from_dds = imu_state
@@ -318,6 +353,12 @@ class RclpyGo2RosBridge:
             self._direct_imu_ready = imu_state is not None
             self._latest_pose_source = str(source_topic or "")
             self._latest_imu_source_topic = f"{source_topic}#imu_state" if source_topic else ""
+            callbacks = tuple(self._localization_callbacks.values())
+        for callback in callbacks:
+            try:
+                callback(pose.model_copy(deep=True), frame_tree.model_copy(deep=True), dict(metadata))
+            except Exception:
+                LOGGER.debug("分发 Go2 DDS 定位帧失败。", exc_info=True)
 
     def _on_direct_point_cloud(self, message: object, *, source_topic: str = "") -> None:
         points_xyz = self._extract_xyz_from_point_cloud(message)
@@ -346,6 +387,12 @@ class RclpyGo2RosBridge:
             self._latest_local_point_cloud = point_cloud
             self._direct_point_cloud_ready = True
             self._latest_point_cloud_source_topic = str(source_topic or "")
+            callbacks = tuple(self._point_cloud_callbacks.values())
+        for callback in callbacks:
+            try:
+                callback(point_cloud.model_copy(deep=True))
+            except Exception:
+                LOGGER.debug("分发 Go2 DDS 点云帧失败。", exc_info=True)
 
     def _build_pose_from_sport_mode_state(self, message: object) -> Pose:
         imu_state = getattr(message, "imu_state", None)
@@ -511,6 +558,26 @@ class Go2DataPlaneRuntime:
         if self.bridge is None:
             return None
         return self.bridge.get_latest_local_point_cloud(max_points=max_points)
+
+    def subscribe_localization(self, callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]) -> Optional[int]:
+        if self.bridge is None:
+            return None
+        return self.bridge.subscribe_localization(callback)
+
+    def unsubscribe_localization(self, callback_id: Optional[int]) -> None:
+        if self.bridge is None or callback_id is None:
+            return
+        self.bridge.unsubscribe_localization(callback_id)
+
+    def subscribe_local_point_cloud(self, callback: Callable[[PointCloudFrame], None]) -> Optional[int]:
+        if self.bridge is None:
+            return None
+        return self.bridge.subscribe_local_point_cloud(callback)
+
+    def unsubscribe_local_point_cloud(self, callback_id: Optional[int]) -> None:
+        if self.bridge is None or callback_id is None:
+            return
+        self.bridge.unsubscribe_local_point_cloud(callback_id)
 
     def can_accept_motion_command(self) -> bool:
         return self._uses_official_backend() and self._official_sport_ready
@@ -975,6 +1042,18 @@ class Go2DeviceDataPlane:
 
     def get_latest_local_point_cloud(self, *, max_points: Optional[int] = None) -> Optional[PointCloudFrame]:
         return self.runtime.get_latest_local_point_cloud(max_points=max_points)
+
+    def subscribe_localization(self, callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]) -> Optional[int]:
+        return self.runtime.subscribe_localization(callback)
+
+    def unsubscribe_localization(self, callback_id: Optional[int]) -> None:
+        self.runtime.unsubscribe_localization(callback_id)
+
+    def subscribe_local_point_cloud(self, callback: Callable[[PointCloudFrame], None]) -> Optional[int]:
+        return self.runtime.subscribe_local_point_cloud(callback)
+
+    def unsubscribe_local_point_cloud(self, callback_id: Optional[int]) -> None:
+        self.runtime.unsubscribe_local_point_cloud(callback_id)
 
     def can_accept_motion_command(self) -> bool:
         return self.runtime.can_accept_motion_command()

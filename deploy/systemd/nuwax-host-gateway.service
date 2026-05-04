@@ -1,0 +1,19 @@
+[Unit]
+Description=nuwax_robot_bridge 宿主机网关
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=huang
+Group=huang
+WorkingDirectory=/home/huang/nuwax-robot-bridge
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash /home/huang/nuwax-robot-bridge/scripts/start_gateway.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+ReadWritePaths=/var/log/nuwax_robot_bridge /var/lib/nuwax_robot_bridge
+
+[Install]
+WantedBy=multi-user.target

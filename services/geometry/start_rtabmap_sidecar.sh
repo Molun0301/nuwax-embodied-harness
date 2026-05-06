@@ -26,7 +26,7 @@ NAV2_MODE="${NUWAX_NAV2_MODE:-sidecar}"
 NAV2_LAUNCH_PACKAGE="${NUWAX_NAV2_LAUNCH_PACKAGE:-nav2_bringup}"
 NAV2_LAUNCH_FILE="${NUWAX_NAV2_LAUNCH_FILE:-navigation_launch.py}"
 NAV2_MAP_YAML="${NUWAX_NAV2_MAP_YAML:-}"
-NAV2_PARAMS_FILE="${NUWAX_NAV2_PARAMS_FILE:-}"
+NAV2_PARAMS_FILE="${NUWAX_NAV2_PARAMS_FILE:-${REPO_ROOT}/services/geometry/nav2_params.yaml}"
 NAV2_USE_SIM_TIME="${NUWAX_NAV2_USE_SIM_TIME:-false}"
 NAV2_AUTOSTART="${NUWAX_NAV2_AUTOSTART:-true}"
 
@@ -94,7 +94,7 @@ start_background "rtabmap_live.log" \
   subscribe_scan_cloud:=true scan_cloud_topic:="${POINT_CLOUD_TOPIC}" \
   odom_topic:="${ODOM_TOPIC}" imu_topic:="${IMU_TOPIC}" \
   qos:=2 qos_scan:=2 qos_odom:=1 qos_imu:=2 \
-  approx_sync:=false queue_size:=30 wait_for_transform:=0.5 \
+  approx_sync:=false queue_size:=30 wait_for_transform:=1.5 \
   database_path:="${RTABMAP_DB_PATH}" \
   args:='--delete_db_on_start --RGBD/CreateOccupancyGrid true --Grid/FromDepth false --Grid/RangeMax 8.0 --Grid/CellSize 0.05 --Grid/3D true --Grid/RayTracing true --Grid/FlatObstacleDetected true --Grid/MaxGroundHeight 0.35 --Grid/MaxObstacleHeight 1.8 --Grid/NormalsSegmentation false --Grid/MinClusterSize 5'
 

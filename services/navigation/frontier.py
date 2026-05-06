@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 import math
-from typing import List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 
@@ -65,6 +65,7 @@ class FrontierExplorer:
         self.config = config
         self._last_scan_ranges: Optional[np.ndarray] = None
         self._exploration_active: bool = False
+        self._last_filter_diagnostics: Dict[str, object] = {}
 
     def check_exploration_safety(
         self,
@@ -134,6 +135,9 @@ class FrontierExplorer:
     def is_exploration_active(self) -> bool:
         return self._exploration_active
 
+    def get_last_filter_diagnostics(self) -> Dict[str, object]:
+        return dict(self._last_filter_diagnostics)
+
     def select_candidates(
         self,
         *,
@@ -147,40 +151,81 @@ class FrontierExplorer:
     ) -> List[FrontierCandidate]:
         """按收益排序返回可达前沿候选。"""
 
+        diagnostics: Dict[str, object] = {
+            "frontier_enabled": bool(self.config.frontier_enabled),
+            "frame_mismatch": 0,
+            "free_cells": 0,
+            "unknown_cells": 0,
+            "frontier_cells_before_cost_filter": 0,
+            "frontier_cells": 0,
+            "high_cost": 0,
+            "cluster_total": 0,
+            "cluster_too_small": 0,
+            "cluster_out_of_radius": 0,
+            "cluster_revisit": 0,
+            "plan_preview_failed": 0,
+            "plan_preview_failed_by_reason": {},
+            "selected_candidates": 0,
+            "cost_map_used": False,
+            "cost_map_layout_mismatch": False,
+        }
+
+        def finish(candidates: List[FrontierCandidate]) -> List[FrontierCandidate]:
+            diagnostics["selected_candidates"] = len(candidates)
+            self._last_filter_diagnostics = dict(diagnostics)
+            return candidates
+
         if not bool(self.config.frontier_enabled):
-            return []
+            return finish([])
         if (
             occupancy_grid.frame_id
             and current_pose.frame_id
             and not frame_ids_semantically_equal(occupancy_grid.frame_id, current_pose.frame_id)
         ):
-            return []
+            diagnostics["frame_mismatch"] = 1
+            diagnostics["occupancy_frame_id"] = occupancy_grid.frame_id
+            diagnostics["pose_frame_id"] = current_pose.frame_id
+            return finish([])
 
         occupancy = np.asarray(occupancy_grid.data, dtype=np.int32).reshape(occupancy_grid.height, occupancy_grid.width)
         free_mask = occupancy == 0
         unknown_mask = occupancy < 0
+        diagnostics["free_cells"] = int(np.count_nonzero(free_mask))
+        diagnostics["unknown_cells"] = int(np.count_nonzero(unknown_mask))
         if not np.any(free_mask) or not np.any(unknown_mask):
-            return []
+            return finish([])
         effective_cost_map = cost_map if self._same_grid_layout(occupancy_grid, cost_map) else None
+        diagnostics["cost_map_used"] = effective_cost_map is not None
+        diagnostics["cost_map_layout_mismatch"] = cost_map is not None and effective_cost_map is None
 
         frontier_mask = self._build_frontier_mask(
             free_mask=free_mask,
             unknown_mask=unknown_mask,
-            cost_map=effective_cost_map,
+            cost_map=None,
         )
+        diagnostics["frontier_cells_before_cost_filter"] = int(np.count_nonzero(frontier_mask))
+        if effective_cost_map is not None and int(effective_cost_map.width) == occupancy_grid.width and int(effective_cost_map.height) == occupancy_grid.height:
+            costs = np.asarray(effective_cost_map.data, dtype=np.float32).reshape(occupancy_grid.height, occupancy_grid.width)
+            high_cost_mask = frontier_mask & (costs > float(self.config.max_goal_cost))
+            diagnostics["high_cost"] = int(np.count_nonzero(high_cost_mask))
+            frontier_mask &= costs <= float(self.config.max_goal_cost)
+        diagnostics["frontier_cells"] = int(np.count_nonzero(frontier_mask))
         if not np.any(frontier_mask):
-            return []
+            return finish([])
 
         clusters = self._cluster_frontiers(frontier_mask)
+        diagnostics["cluster_total"] = len(clusters)
         if not clusters:
-            return []
+            return finish([])
 
         candidates: List[FrontierCandidate] = []
         revisit_separation_m = float(self.config.frontier_revisit_separation_m)
         current_yaw = _yaw_from_pose(current_pose)
         max_radius_m = None if radius_m is None else max(0.1, float(radius_m))
+        plan_failures: Dict[str, int] = {}
         for cluster in clusters:
             if len(cluster) < int(self.config.frontier_min_cluster_cells):
+                diagnostics["cluster_too_small"] = int(diagnostics["cluster_too_small"]) + 1
                 continue
             cluster_points_world = [
                 _cell_to_world(
@@ -199,6 +244,7 @@ class FrontierExplorer:
                 centroid_y - center_pose.position.y,
             )
             if max_radius_m is not None and center_distance_m > max_radius_m:
+                diagnostics["cluster_out_of_radius"] = int(diagnostics["cluster_out_of_radius"]) + 1
                 continue
 
             best_cell = min(
@@ -222,6 +268,7 @@ class FrontierExplorer:
                 math.hypot(goal_x - attempted.position.x, goal_y - attempted.position.y) < revisit_separation_m
                 for attempted in attempted_poses
             ):
+                diagnostics["cluster_revisit"] = int(diagnostics["cluster_revisit"]) + 1
                 continue
 
             yaw_rad = math.atan2(goal_y - current_pose.position.y, goal_x - current_pose.position.x)
@@ -230,13 +277,29 @@ class FrontierExplorer:
                 position=Vector3(x=goal_x, y=goal_y, z=center_pose.position.z),
                 orientation=_quaternion_from_yaw(yaw_rad),
             )
-            plan = planner.plan_preview(
-                current_pose=current_pose,
-                target_pose=goal_pose,
-                occupancy_grid=occupancy_grid,
-                cost_map=effective_cost_map,
-            )
+            planner_fn = getattr(planner, "plan", None)
+            if callable(planner_fn):
+                outcome = planner_fn(
+                    current_pose=current_pose,
+                    target_pose=goal_pose,
+                    occupancy_grid=occupancy_grid,
+                    cost_map=effective_cost_map,
+                )
+                plan = getattr(outcome, "plan", None)
+                failure_reason = str(getattr(outcome, "reason", "plan_unavailable") or "plan_unavailable")
+            else:
+                plan = planner.plan_preview(
+                    current_pose=current_pose,
+                    target_pose=goal_pose,
+                    occupancy_grid=occupancy_grid,
+                    cost_map=effective_cost_map,
+                )
+                failure_reason = "plan_preview_unavailable"
             if plan is None or plan.planning_mode != "goal":
+                if plan is not None and plan.planning_mode != "goal":
+                    failure_reason = "planning_mode_%s" % plan.planning_mode
+                diagnostics["plan_preview_failed"] = int(diagnostics["plan_preview_failed"]) + 1
+                plan_failures[failure_reason] = plan_failures.get(failure_reason, 0) + 1
                 continue
 
             average_cost = self._cluster_average_cost(cluster=cluster, cost_map=effective_cost_map)
@@ -267,7 +330,8 @@ class FrontierExplorer:
                 float(item.path_distance_m),
             )
         )
-        return candidates
+        diagnostics["plan_preview_failed_by_reason"] = dict(plan_failures)
+        return finish(candidates)
 
     def _same_grid_layout(self, occupancy_grid: OccupancyGrid, cost_map: Optional[CostMap]) -> bool:
         if cost_map is None:

@@ -405,6 +405,9 @@ class PlatformExplorationRuntime:
             attempted_poses=attempted_poses,
         )
         state.latest_frontiers = list(frontiers)
+        diagnostics_getter = getattr(self._frontier_explorer, "get_last_filter_diagnostics", None)
+        if callable(diagnostics_getter):
+            state.metadata["frontier_filter_diagnostics"] = dict(diagnostics_getter())
         state.last_frontier_count = len(frontiers)
         state.last_error = None
         state.failure_code = None
@@ -415,6 +418,9 @@ class PlatformExplorationRuntime:
         if not frontiers:
             state.waiting_for = "frontier"
             state.failure_code = "frontier_unavailable"
+            state.metadata["frontier_unavailable_diagnostics"] = dict(
+                state.metadata.get("frontier_filter_diagnostics") or {}
+            )
             state.last_error = "最新 live map/costmap/pose 未产生可达 frontier。"
             self._finish(state, phase=ExplorationRuntimePhase.FAILED)
             return
@@ -733,8 +739,12 @@ class PlatformExplorationRuntime:
         if state.phase == ExplorationRuntimePhase.PLANNING:
             if state.waiting_for == "current_pose":
                 return "当前定位尚未就绪，等待探索起步条件。"
-            if state.waiting_for == "occupancy_grid":
+            if state.waiting_for in {"occupancy_grid", "map"}:
                 return "当前探索地图尚未就绪，等待首帧地图。"
+            if state.waiting_for == "costmap":
+                return "当前 costmap 尚未就绪，等待安全代价地图。"
+            if state.waiting_for == "frontier":
+                return "当前地图尚未产生可达 frontier。"
             return "正在规划下一个 frontier。"
         if state.phase == ExplorationRuntimePhase.MOVING_TO_FRONTIER:
             if state.current_target is None:

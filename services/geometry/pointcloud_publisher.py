@@ -8,6 +8,7 @@ import struct
 import threading
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from contracts.geometry import Vector3
 from contracts.pointcloud import PointCloudFrame
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
@@ -173,7 +174,11 @@ class Ros2PointCloudPublisher:
             return
         if point_cloud is None or not point_cloud.points:
             return
-        point_cloud = self._downsample(point_cloud)
+        point_cloud = self._preprocess(point_cloud)
+        if point_cloud is None:
+            with self._lock:
+                self._dropped_count += 1
+            return
         message = self._build_pointcloud2_message(point_cloud)
         if message is None:
             with self._lock:
@@ -190,7 +195,78 @@ class Ros2PointCloudPublisher:
             self._last_source_topic = str(point_cloud.metadata.get("source_topic") or "") or None
             self._last_error = None
 
-    def _downsample(self, point_cloud: PointCloudFrame) -> PointCloudFrame:
+    def _preprocess(self, point_cloud: PointCloudFrame) -> Optional[PointCloudFrame]:
+        preprocess = self.config.rtabmap.point_cloud_preprocess
+        raw_count = int(point_cloud.point_count or len(point_cloud.points))
+        if not bool(preprocess.enabled):
+            return self._downsample(point_cloud, raw_count=raw_count)
+
+        min_range = max(0.0, float(preprocess.min_range_m))
+        max_range = max(0.0, float(preprocess.max_range_m))
+        crop_min_z = float(preprocess.crop_min_z_m)
+        crop_max_z = float(preprocess.crop_max_z_m)
+        crop_forward_min = float(preprocess.crop_forward_min_m)
+        crop_forward_max = float(preprocess.crop_forward_max_m)
+        crop_lateral = max(0.0, float(preprocess.crop_lateral_m))
+        voxel_size = max(0.0, float(preprocess.voxel_size_m))
+        filtered = []
+        for point in point_cloud.points:
+            x = float(getattr(point, "x", 0.0) or 0.0)
+            y = float(getattr(point, "y", 0.0) or 0.0)
+            z = float(getattr(point, "z", 0.0) or 0.0)
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                continue
+            distance = math.sqrt(x * x + y * y + z * z)
+            if distance < min_range or (max_range > 0.0 and distance > max_range):
+                continue
+            if z < crop_min_z or z > crop_max_z:
+                continue
+            if x < crop_forward_min or x > crop_forward_max:
+                continue
+            if crop_lateral > 0.0 and abs(y) > crop_lateral:
+                continue
+            filtered.append((x, y, z))
+        if not filtered:
+            return None
+
+        if voxel_size > 1e-6:
+            voxels: Dict[Tuple[int, int, int], Tuple[float, float, float]] = {}
+            for x, y, z in filtered:
+                key = (
+                    int(math.floor(x / voxel_size)),
+                    int(math.floor(y / voxel_size)),
+                    int(math.floor(z / voxel_size)),
+                )
+                voxels.setdefault(key, (x, y, z))
+            filtered = list(voxels.values())
+
+        max_points = max(1, int(preprocess.max_points_per_scan))
+        downsampled = False
+        if len(filtered) > max_points:
+            stride = max(1, int(math.ceil(len(filtered) / float(max_points))))
+            filtered = filtered[::stride][:max_points]
+            downsampled = True
+        points = [Vector3(x=x, y=y, z=z) for x, y, z in filtered]
+        metadata = {
+            **dict(point_cloud.metadata),
+            "ros2_bridge_preprocessed": True,
+            "ros2_bridge_input_points": raw_count,
+            "ros2_bridge_filtered_points": len(points),
+            "ros2_bridge_removed_points": max(0, raw_count - len(points)),
+            "ros2_bridge_downsampled": downsampled,
+            "ros2_bridge_voxel_size_m": voxel_size,
+            "ros2_bridge_min_range_m": min_range,
+            "ros2_bridge_max_range_m": max_range,
+            "ros2_bridge_crop_z_m": [crop_min_z, crop_max_z],
+            "ros2_bridge_crop_forward_m": [crop_forward_min, crop_forward_max],
+            "ros2_bridge_crop_lateral_m": crop_lateral,
+        }
+        return point_cloud.model_copy(
+            update={"point_count": len(points), "points": points, "metadata": metadata},
+            deep=True,
+        )
+
+    def _downsample(self, point_cloud: PointCloudFrame, *, raw_count: Optional[int] = None) -> PointCloudFrame:
         max_points = max(1, int(self.config.rtabmap.point_cloud_preprocess.max_points_per_scan))
         if point_cloud.point_count <= max_points:
             return point_cloud
@@ -200,7 +276,13 @@ class Ros2PointCloudPublisher:
             update={
                 "point_count": len(points),
                 "points": points,
-                "metadata": {**dict(point_cloud.metadata), "ros2_bridge_downsampled": True},
+                "metadata": {
+                    **dict(point_cloud.metadata),
+                    "ros2_bridge_downsampled": True,
+                    "ros2_bridge_input_points": int(raw_count or point_cloud.point_count),
+                    "ros2_bridge_filtered_points": len(points),
+                    "ros2_bridge_removed_points": max(0, int(raw_count or point_cloud.point_count) - len(points)),
+                },
             },
             deep=True,
         )
@@ -222,7 +304,7 @@ class Ros2PointCloudPublisher:
 
         message = PointCloud2()
         message.header.frame_id = str(point_cloud.frame_id or self.frame_id)
-        stamp_sec, stamp_nanosec = self._timestamp_to_ros_stamp(point_cloud.timestamp)
+        stamp_sec, stamp_nanosec = self._timestamp_to_ros_stamp(self._select_publish_timestamp(point_cloud.timestamp))
         message.header.stamp.sec = stamp_sec
         message.header.stamp.nanosec = stamp_nanosec
         message.height = 1
@@ -247,6 +329,20 @@ class Ros2PointCloudPublisher:
         digest.update(str(point_cloud.timestamp.isoformat()).encode("utf-8"))
         digest.update(str(point_cloud.point_count).encode("utf-8"))
         return digest.hexdigest()
+
+    def _select_publish_timestamp(self, timestamp: datetime) -> datetime:
+        normalized = timestamp
+        if normalized.tzinfo is None:
+            normalized = normalized.replace(tzinfo=timezone.utc)
+        normalized = normalized.astimezone(timezone.utc)
+        now = datetime.now(timezone.utc)
+        age_sec = (now - normalized).total_seconds()
+        quality = self.config.rtabmap.timestamp_quality
+        max_age_sec = max(0.5, float(quality.max_point_cloud_age_sec) * 4.0)
+        max_future_sec = max(0.1, float(quality.max_sensor_skew_sec))
+        if age_sec > max_age_sec or age_sec < -max_future_sec:
+            return now
+        return normalized
 
     def _timestamp_to_ros_stamp(self, timestamp: datetime) -> Tuple[int, int]:
         normalized = timestamp

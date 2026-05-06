@@ -40,7 +40,7 @@ from services.navigation.runtime import GridNavigationPlanner
 
 _GEOMETRY_SIDE_CAR_RESTART_LIMIT = 2
 _GEOMETRY_MONITOR_INTERVAL_SEC = 1.0
-_GEOMETRY_STREAMING_WINDOW_SEC = 3.0
+_GEOMETRY_STREAMING_WINDOW_SEC = 6.0
 _NAV2_SIDECAR_MODES = {"sidecar", "managed", "launch", "internal"}
 _NAV2_EXTERNAL_MODES = {"external", "external_action", "action", "client", "pending"}
 _NAV2_DISABLED_MODES = {"", "disabled", "off", "none"}
@@ -488,7 +488,7 @@ class PlatformGeometryRuntime:
             "qos_imu:=2",
             "approx_sync:=false",
             "queue_size:=30",
-            "wait_for_transform:=0.5",
+            "wait_for_transform:=1.5",
             "database_path:=%s" % db_path,
             "args:=%s" % " ".join(rtabmap_args),
         ]
@@ -525,6 +525,10 @@ class PlatformGeometryRuntime:
         if map_yaml:
             command.append("map:=%s" % map_yaml)
         params_file = str(getattr(self.config.nav2, "params_file", "") or "").strip()
+        if not params_file:
+            default_params = self._geometry_script("nav2_params.yaml")
+            if default_params.exists():
+                params_file = str(default_params)
         if params_file:
             command.append("params_file:=%s" % params_file)
         return command
@@ -714,6 +718,26 @@ class PlatformGeometryRuntime:
         rtabmap_info_publisher_count = live_map_status.get("rtabmap_info_publisher_count")
         if rtabmap_info_publisher_count is None:
             rtabmap_info_publisher_count = live_map_status.get("rtabmap_info_has_publisher")
+        rtabmap_map_data_publisher_count = live_map_status.get("rtabmap_map_data_publisher_count")
+        if rtabmap_map_data_publisher_count is None:
+            rtabmap_map_data_publisher_count = live_map_status.get("rtabmap_map_data_has_publisher")
+        rtabmap_info_message_count = int(live_map_status.get("rtabmap_info_message_count") or 0)
+        rtabmap_map_data_message_count = int(live_map_status.get("rtabmap_map_data_message_count") or 0)
+        rtabmap_activity_ready = bool(
+            rtabmap_info_message_count > 0
+            or rtabmap_map_data_message_count > 0
+            or rtabmap_info_publisher_count is True
+            or rtabmap_map_data_publisher_count is True
+            or int(rtabmap_info_publisher_count or 0) > 0
+            or int(rtabmap_map_data_publisher_count or 0) > 0
+        )
+        stream_timestamp_fresh = bool(
+            map_stream.get("source_timestamp_fresh")
+            or map_stream.get("costmap_source_timestamp_fresh")
+            or map_stream.get("message_count_recent")
+            or map_stream.get("costmap_recent")
+            or map_stream.get("rtabmap_activity_recent")
+        )
         go2_odom_ready = bool(
             odom_bridge is not None
             and odom_bridge.is_running()
@@ -732,8 +756,8 @@ class PlatformGeometryRuntime:
             and rtabmap_process is not None
             and rtabmap_process.is_running()
             and tf_chain.get("ready")
-            and map_stream.get("source_timestamp_fresh")
-            and (rtabmap_info_publisher_count is True or int(rtabmap_info_publisher_count or 0) > 0)
+            and stream_timestamp_fresh
+            and rtabmap_activity_ready
         )
         relocalization_ready = bool(localization_ready and int(map_stream.get("content_revision") or 0) > 0)
         if not go2_odom_ready:
@@ -742,13 +766,13 @@ class PlatformGeometryRuntime:
         elif not first_frame_ready:
             message = wait_message
         elif not streaming_ready:
-            message = "RTAB-Map 已发布 /map 首帧，但 /map message_count、source timestamp 或内容指标尚未证明连续 streaming。"
+            message = "RTAB-Map 已发布 /map 首帧，但 /map、costmap、/rtabmap/info 或 /rtabmap/mapData 尚未形成连续活跃证据。"
             waiting_for = "rtabmap_streaming"
         elif not localization_ready:
-            message = "RTAB-Map /map 已 streaming，但 /rtabmap/info、TF 链或进程状态尚未证明 localization/relocalization ready。"
+            message = "RTAB-Map 实时地图链路活跃，但辅助话题、TF 链或进程状态尚未证明 localization/relocalization ready。"
             waiting_for = "rtabmap_localization"
         else:
-            message = "Go2 odom、RTAB-Map /map streaming、/rtabmap/info 与 TF 链均已就绪。"
+            message = "Go2 odom、RTAB-Map 实时地图链路、辅助话题与 TF 链均已就绪。"
             waiting_for = None
         return {
             "ready": localization_ready,
@@ -762,10 +786,18 @@ class PlatformGeometryRuntime:
             "map_stream": map_stream,
             "tf_chain": tf_chain,
             "tf_localization_provider": self._clone_metadata(tf_localization_status),
+            "rtabmap_activity_ready": rtabmap_activity_ready,
             "rtabmap_info": {
                 "topic": "/rtabmap/info",
                 "publisher_count": rtabmap_info_publisher_count,
+                "message_count": rtabmap_info_message_count,
                 "has_publisher": rtabmap_info_publisher_count is True or int(rtabmap_info_publisher_count or 0) > 0,
+            },
+            "rtabmap_map_data": {
+                "topic": "/rtabmap/mapData",
+                "publisher_count": rtabmap_map_data_publisher_count,
+                "message_count": rtabmap_map_data_message_count,
+                "has_publisher": rtabmap_map_data_publisher_count is True or int(rtabmap_map_data_publisher_count or 0) > 0,
             },
             "rtabmap_process": rtabmap_process.status() if rtabmap_process is not None else None,
             "odometry_publisher": odometry_status,
@@ -814,9 +846,16 @@ class PlatformGeometryRuntime:
         }
 
     def _update_stream_tracker(self, live_map_status: Dict[str, object]) -> None:
-        count = int(live_map_status.get("occupancy_message_count") or 0)
+        occupancy_count = int(live_map_status.get("occupancy_message_count") or 0)
+        costmap_count = int(live_map_status.get("cost_map_message_count") or 0)
+        rtabmap_info_count = int(live_map_status.get("rtabmap_info_message_count") or 0)
+        rtabmap_map_data_count = int(live_map_status.get("rtabmap_map_data_message_count") or 0)
         timestamp = _parse_iso_timestamp(live_map_status.get("latest_occupancy_timestamp"))
+        costmap_timestamp = _parse_iso_timestamp(live_map_status.get("latest_cost_map_timestamp"))
         received_at = _parse_iso_timestamp(live_map_status.get("latest_occupancy_received_at"))
+        costmap_received_at = _parse_iso_timestamp(live_map_status.get("latest_cost_map_received_at"))
+        rtabmap_info_received_at = _parse_iso_timestamp(live_map_status.get("latest_rtabmap_info_received_at"))
+        rtabmap_map_data_received_at = _parse_iso_timestamp(live_map_status.get("latest_rtabmap_map_data_received_at"))
         metrics = live_map_status.get("occupancy_metrics") if isinstance(live_map_status.get("occupancy_metrics"), dict) else {}
         cost_metrics = live_map_status.get("cost_map_metrics") if isinstance(live_map_status.get("cost_map_metrics"), dict) else {}
         content_hash = str(metrics.get("content_hash") or "")
@@ -826,22 +865,33 @@ class PlatformGeometryRuntime:
         now = datetime.now(timezone.utc)
         previous_count = int(self._map_stream_tracker.get("last_count") or 0)
         previous_costmap_count = int(self._map_stream_tracker.get("last_costmap_count") or 0)
+        previous_rtabmap_info_count = int(self._map_stream_tracker.get("last_rtabmap_info_count") or 0)
+        previous_rtabmap_map_data_count = int(self._map_stream_tracker.get("last_rtabmap_map_data_count") or 0)
         previous_hash = str(self._map_stream_tracker.get("last_content_hash") or "")
         previous_costmap_hash = str(self._map_stream_tracker.get("last_costmap_hash") or "")
         previous_known_count = int(self._map_stream_tracker.get("last_known_cell_count") or 0)
         previous_costmap_known_count = int(self._map_stream_tracker.get("last_costmap_known_cell_count") or 0)
-        first_count = int(self._map_stream_tracker.get("first_count") or count)
-        if count > previous_count:
-            self._map_stream_tracker["last_count"] = count
+        first_count = int(self._map_stream_tracker.get("first_count") or occupancy_count)
+        if occupancy_count > previous_count:
+            self._map_stream_tracker["last_count"] = occupancy_count
             self._map_stream_tracker["last_growth_at"] = now.isoformat()
             if "first_growth_at" not in self._map_stream_tracker:
                 self._map_stream_tracker["first_growth_at"] = now.isoformat()
-                self._map_stream_tracker["first_count"] = count
+                self._map_stream_tracker["first_count"] = occupancy_count
+        if costmap_count > previous_costmap_count:
+            self._map_stream_tracker["last_costmap_count"] = costmap_count
+            self._map_stream_tracker["last_costmap_growth_at"] = now.isoformat()
+        if rtabmap_info_count > previous_rtabmap_info_count:
+            self._map_stream_tracker["last_rtabmap_info_count"] = rtabmap_info_count
+            self._map_stream_tracker["last_rtabmap_info_at"] = now.isoformat()
+        if rtabmap_map_data_count > previous_rtabmap_map_data_count:
+            self._map_stream_tracker["last_rtabmap_map_data_count"] = rtabmap_map_data_count
+            self._map_stream_tracker["last_rtabmap_map_data_at"] = now.isoformat()
         content_changed = bool(content_hash and content_hash != previous_hash)
         known_changed = known_count != previous_known_count
         known_cell_delta = known_count - previous_known_count if previous_hash else known_count
         costmap_delta = costmap_known_count - previous_costmap_known_count if previous_costmap_hash else costmap_known_count
-        if count > previous_count and (content_changed or known_changed):
+        if occupancy_count > previous_count and (content_changed or known_changed):
             self._map_stream_tracker["last_content_change_at"] = now.isoformat()
             self._map_stream_tracker["content_revision"] = int(self._map_stream_tracker.get("content_revision") or 0) + 1
         if costmap_hash and (costmap_hash != previous_costmap_hash or costmap_delta != 0):
@@ -853,41 +903,77 @@ class PlatformGeometryRuntime:
             self._map_stream_tracker["last_costmap_hash"] = costmap_hash
         self._map_stream_tracker["last_known_cell_count"] = known_count
         self._map_stream_tracker["last_costmap_known_cell_count"] = costmap_known_count
-        self._map_stream_tracker["last_costmap_count"] = int(live_map_status.get("cost_map_message_count") or 0)
-        latest_age_sec = None
-        if timestamp is not None:
-            latest_age_sec = max(0.0, (now - timestamp).total_seconds())
-        received_age_sec = None
-        if received_at is not None:
-            received_age_sec = max(0.0, (now - received_at).total_seconds())
+        latest_age_sec = max(0.0, (now - timestamp).total_seconds()) if timestamp is not None else None
+        costmap_age_sec = max(0.0, (now - costmap_timestamp).total_seconds()) if costmap_timestamp is not None else None
+        received_age_sec = max(0.0, (now - received_at).total_seconds()) if received_at is not None else None
+        costmap_received_age_sec = max(0.0, (now - costmap_received_at).total_seconds()) if costmap_received_at is not None else None
+        rtabmap_info_age_sec = max(0.0, (now - rtabmap_info_received_at).total_seconds()) if rtabmap_info_received_at is not None else None
+        rtabmap_map_data_age_sec = max(0.0, (now - rtabmap_map_data_received_at).total_seconds()) if rtabmap_map_data_received_at is not None else None
         first_growth_at = _parse_iso_timestamp(self._map_stream_tracker.get("first_growth_at"))
         last_growth_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_growth_at"))
+        last_costmap_growth_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_costmap_growth_at"))
+        last_rtabmap_info_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_rtabmap_info_at"))
+        last_rtabmap_map_data_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_rtabmap_map_data_at"))
         last_content_change_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_content_change_at"))
-        source_fresh = latest_age_sec is not None and latest_age_sec <= max(1.0, float(self.config.rtabmap.timestamp_quality.max_tf_age_sec) * 4.0)
+        last_costmap_change_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_costmap_change_at"))
+        max_source_age = max(1.0, float(self.config.rtabmap.timestamp_quality.max_tf_age_sec) * 4.0)
+        source_fresh = latest_age_sec is not None and latest_age_sec <= max_source_age
+        costmap_source_fresh = costmap_age_sec is not None and costmap_age_sec <= max_source_age
         count_recent = last_growth_at is not None and (now - last_growth_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC
+        costmap_recent = last_costmap_growth_at is not None and (now - last_costmap_growth_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC
+        rtabmap_info_recent = last_rtabmap_info_at is not None and (now - last_rtabmap_info_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC
+        rtabmap_map_data_recent = last_rtabmap_map_data_at is not None and (now - last_rtabmap_map_data_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC
         content_recent = last_content_change_at is not None and (now - last_content_change_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC * 2.0
+        costmap_content_recent = last_costmap_change_at is not None and (now - last_costmap_change_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC * 2.0
+        rtabmap_activity_recent = rtabmap_info_recent or rtabmap_map_data_recent
+        any_stream_recent = count_recent or costmap_recent or rtabmap_activity_recent
+        source_fresh_evidence = source_fresh or costmap_source_fresh or count_recent or costmap_recent or rtabmap_activity_recent
+        total_observed_messages = occupancy_count + costmap_count + rtabmap_info_count + rtabmap_map_data_count
+        content_evidence = content_recent or costmap_content_recent or known_count > 0 or costmap_known_count > 0
         growth_window = (now - first_growth_at).total_seconds() if first_growth_at is not None else 0.0
-        streaming = bool(
-            count >= max(first_count + 1, 2)
-            and source_fresh
+        occupancy_growth_ok = bool(
+            occupancy_count >= max(first_count + 1, 2)
             and count_recent
-            and (content_recent or known_count > 0)
-            and growth_window <= _GEOMETRY_STREAMING_WINDOW_SEC * max(1, count - first_count + 1)
+            and growth_window <= _GEOMETRY_STREAMING_WINDOW_SEC * max(1, occupancy_count - first_count + 1)
+        )
+        streaming = bool(
+            occupancy_count > 0
+            and total_observed_messages >= 2
+            and source_fresh_evidence
+            and any_stream_recent
+            and content_evidence
+            and (occupancy_growth_ok or costmap_recent or rtabmap_activity_recent)
         )
         self._map_stream_tracker["latest_age_sec"] = latest_age_sec
+        self._map_stream_tracker["costmap_age_sec"] = costmap_age_sec
         self._map_stream_tracker["received_age_sec"] = received_age_sec
+        self._map_stream_tracker["costmap_received_age_sec"] = costmap_received_age_sec
+        self._map_stream_tracker["rtabmap_info_age_sec"] = rtabmap_info_age_sec
+        self._map_stream_tracker["rtabmap_map_data_age_sec"] = rtabmap_map_data_age_sec
         self._map_stream_tracker["source_timestamp_fresh"] = source_fresh
+        self._map_stream_tracker["costmap_source_timestamp_fresh"] = costmap_source_fresh
+        self._map_stream_tracker["rtabmap_activity_recent"] = rtabmap_activity_recent
+        self._map_stream_tracker["source_fresh_evidence"] = source_fresh_evidence
         self._map_stream_tracker["message_count_recent"] = count_recent
+        self._map_stream_tracker["costmap_recent"] = costmap_recent
+        self._map_stream_tracker["rtabmap_info_recent"] = rtabmap_info_recent
+        self._map_stream_tracker["rtabmap_map_data_recent"] = rtabmap_map_data_recent
         self._map_stream_tracker["content_recent"] = content_recent
-        self._map_stream_tracker["message_count_delta"] = count - previous_count
+        self._map_stream_tracker["costmap_content_recent"] = costmap_content_recent
+        self._map_stream_tracker["message_count_delta"] = occupancy_count - previous_count
         self._map_stream_tracker["content_hash"] = content_hash or None
         self._map_stream_tracker["known_cell_count"] = known_count
         self._map_stream_tracker["known_cell_delta"] = known_cell_delta
-        self._map_stream_tracker["costmap_message_count_delta"] = int(live_map_status.get("cost_map_message_count") or 0) - previous_costmap_count
+        self._map_stream_tracker["costmap_message_count_delta"] = costmap_count - previous_costmap_count
         self._map_stream_tracker["costmap_hash"] = costmap_hash or None
         self._map_stream_tracker["costmap_known_cell_count"] = costmap_known_count
         self._map_stream_tracker["costmap_delta"] = costmap_delta
-        self._map_stream_tracker["last_message_at"] = received_at.isoformat() if received_at is not None else None
+        self._map_stream_tracker["rtabmap_info_message_count"] = rtabmap_info_count
+        self._map_stream_tracker["rtabmap_map_data_message_count"] = rtabmap_map_data_count
+        self._map_stream_tracker["rtabmap_info_delta"] = rtabmap_info_count - previous_rtabmap_info_count
+        self._map_stream_tracker["rtabmap_map_data_delta"] = rtabmap_map_data_count - previous_rtabmap_map_data_count
+        self._map_stream_tracker["total_observed_message_count"] = total_observed_messages
+        self._map_stream_tracker["last_message_at"] = str(live_map_status.get("last_message_at") or "") or None
         self._map_stream_tracker["stream_age_ms"] = received_age_sec * 1000.0 if received_age_sec is not None else None
         self._map_stream_tracker["streaming"] = streaming
 

@@ -25,6 +25,8 @@ class Ros2LiveMapProvider:
         self.config = config
         self.occupancy_topic = str(config.topics.occupancy_topic or "/map")
         self.cost_map_topic = str(config.topics.cost_map_topic or "")
+        self.rtabmap_info_topic = "/rtabmap/info"
+        self.rtabmap_map_data_topic = "/rtabmap/mapData"
         self._lock = threading.RLock()
         self._adapter = SlamOccupancyAdapter(
             SlamOccupancyAdapter.build_default_config(
@@ -44,6 +46,11 @@ class Ros2LiveMapProvider:
         self._latest_cost_map_metrics: Dict[str, object] = {}
         self._latest_occupancy_received_at: Optional[datetime] = None
         self._latest_cost_map_received_at: Optional[datetime] = None
+        self._rtabmap_info_message_count = 0
+        self._rtabmap_map_data_message_count = 0
+        self._latest_rtabmap_info_received_at: Optional[datetime] = None
+        self._latest_rtabmap_map_data_received_at: Optional[datetime] = None
+        self._rtabmap_auxiliary_subscription_errors: List[str] = []
         self._occupancy_content_revision = 0
         self._cost_map_content_revision = 0
         self._update_sequence = 0
@@ -172,11 +179,17 @@ class Ros2LiveMapProvider:
             update_sequence = self._update_sequence
             occupancy_received_at = self._latest_occupancy_received_at
             cost_map_received_at = self._latest_cost_map_received_at
+            rtabmap_info_count = self._rtabmap_info_message_count
+            rtabmap_map_data_count = self._rtabmap_map_data_message_count
+            rtabmap_info_received_at = self._latest_rtabmap_info_received_at
+            rtabmap_map_data_received_at = self._latest_rtabmap_map_data_received_at
+            rtabmap_auxiliary_subscription_errors = list(self._rtabmap_auxiliary_subscription_errors)
             last_error = self._last_error
         now = datetime.now(timezone.utc)
         occupancy_publisher_count = self._publisher_count(self.occupancy_topic)
         cost_map_publisher_count = self._publisher_count(self.cost_map_topic) if self.cost_map_topic else None
-        rtabmap_info_publisher_count = self._publisher_count("/rtabmap/info")
+        rtabmap_info_publisher_count = self._publisher_count(self.rtabmap_info_topic)
+        rtabmap_map_data_publisher_count = self._publisher_count(self.rtabmap_map_data_topic)
         latest_occupancy_age_sec = (
             max(0.0, (now - occupancy_grid.timestamp).total_seconds()) if occupancy_grid is not None else None
         )
@@ -189,6 +202,23 @@ class Ros2LiveMapProvider:
         latest_cost_map_cache_age_sec = (
             max(0.0, (now - cost_map_received_at).total_seconds()) if cost_map_received_at is not None else None
         )
+        latest_rtabmap_info_cache_age_sec = (
+            max(0.0, (now - rtabmap_info_received_at).total_seconds()) if rtabmap_info_received_at is not None else None
+        )
+        latest_rtabmap_map_data_cache_age_sec = (
+            max(0.0, (now - rtabmap_map_data_received_at).total_seconds()) if rtabmap_map_data_received_at is not None else None
+        )
+        message_times = [
+            item
+            for item in (
+                occupancy_received_at,
+                cost_map_received_at,
+                rtabmap_info_received_at,
+                rtabmap_map_data_received_at,
+            )
+            if item is not None
+        ]
+        latest_message_at = max(message_times) if message_times else None
         occupancy_time_skew_sec = (
             (occupancy_received_at - occupancy_grid.timestamp).total_seconds()
             if occupancy_grid is not None and occupancy_received_at is not None
@@ -222,18 +252,26 @@ class Ros2LiveMapProvider:
             "cost_map_topic": self.cost_map_topic or None,
             "occupancy_publisher_count": occupancy_publisher_count,
             "cost_map_publisher_count": cost_map_publisher_count,
-            "rtabmap_info_topic": "/rtabmap/info",
+            "rtabmap_info_topic": self.rtabmap_info_topic,
+            "rtabmap_map_data_topic": self.rtabmap_map_data_topic,
             "rtabmap_info_publisher_count": rtabmap_info_publisher_count,
+            "rtabmap_map_data_publisher_count": rtabmap_map_data_publisher_count,
             "occupancy_has_publisher": occupancy_publisher_count is not None and occupancy_publisher_count > 0,
             "cost_map_has_publisher": cost_map_publisher_count is not None and cost_map_publisher_count > 0,
             "rtabmap_info_has_publisher": rtabmap_info_publisher_count is not None and rtabmap_info_publisher_count > 0,
+            "rtabmap_map_data_has_publisher": rtabmap_map_data_publisher_count is not None and rtabmap_map_data_publisher_count > 0,
             "provider_status": provider_status,
             "expected_frame_id": expected_frame_id,
             "occupancy_message_count": occupancy_count,
             "cost_map_message_count": cost_map_count,
+            "rtabmap_info_message_count": rtabmap_info_count,
+            "rtabmap_map_data_message_count": rtabmap_map_data_count,
             "message_count": occupancy_count,
+            "total_observed_message_count": occupancy_count + cost_map_count + rtabmap_info_count + rtabmap_map_data_count,
             "occupancy_sequence": occupancy_count,
             "cost_map_sequence": cost_map_count,
+            "rtabmap_info_sequence": rtabmap_info_count,
+            "rtabmap_map_data_sequence": rtabmap_map_data_count,
             "update_sequence": update_sequence,
             "occupancy_revision": occupancy_revision,
             "cost_map_revision": cost_map_revision,
@@ -252,13 +290,18 @@ class Ros2LiveMapProvider:
             "latest_cost_map_source_timestamp": cost_map.timestamp.isoformat() if cost_map is not None else None,
             "latest_occupancy_received_at": occupancy_received_at.isoformat() if occupancy_received_at is not None else None,
             "latest_cost_map_received_at": cost_map_received_at.isoformat() if cost_map_received_at is not None else None,
-            "last_message_at": occupancy_received_at.isoformat() if occupancy_received_at is not None else None,
+            "latest_rtabmap_info_received_at": rtabmap_info_received_at.isoformat() if rtabmap_info_received_at is not None else None,
+            "latest_rtabmap_map_data_received_at": rtabmap_map_data_received_at.isoformat() if rtabmap_map_data_received_at is not None else None,
+            "last_message_at": latest_message_at.isoformat() if latest_message_at is not None else None,
             "latest_occupancy_age_sec": latest_occupancy_age_sec,
             "latest_cost_map_age_sec": latest_cost_map_age_sec,
             "latest_occupancy_source_age_sec": latest_occupancy_age_sec,
             "latest_cost_map_source_age_sec": latest_cost_map_age_sec,
             "latest_occupancy_cache_age_sec": latest_occupancy_cache_age_sec,
             "latest_cost_map_cache_age_sec": latest_cost_map_cache_age_sec,
+            "latest_rtabmap_info_cache_age_sec": latest_rtabmap_info_cache_age_sec,
+            "latest_rtabmap_map_data_cache_age_sec": latest_rtabmap_map_data_cache_age_sec,
+            "rtabmap_auxiliary_subscription_errors": rtabmap_auxiliary_subscription_errors,
             "occupancy_time_skew_sec": occupancy_time_skew_sec,
             "cost_map_time_skew_sec": cost_map_time_skew_sec,
             "time_skew_sec": occupancy_time_skew_sec,
@@ -314,6 +357,7 @@ class Ros2LiveMapProvider:
                     self._subscriptions.append(
                         node.create_subscription(RosOccupancyGrid, self.cost_map_topic, self._on_cost_map, qos_profile)
                     )
+            self._try_start_rtabmap_auxiliary_subscriptions(node)
             self._rclpy = rclpy
             self._node = node
             self._executor = executor
@@ -338,6 +382,33 @@ class Ros2LiveMapProvider:
             self._rclpy = None
             self._has_ros2_context = False
             raise
+
+    def _try_start_rtabmap_auxiliary_subscriptions(self, node: Any) -> None:
+        from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+        qos_profile = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        errors: List[str] = []
+        try:
+            from rtabmap_msgs.msg import Info as RtabmapInfo
+            self._subscriptions.append(
+                node.create_subscription(RtabmapInfo, self.rtabmap_info_topic, self._on_rtabmap_info, qos_profile)
+            )
+        except Exception as exc:
+            errors.append("订阅 /rtabmap/info 失败：%s" % exc)
+        try:
+            from rtabmap_msgs.msg import MapData
+            self._subscriptions.append(
+                node.create_subscription(MapData, self.rtabmap_map_data_topic, self._on_rtabmap_map_data, qos_profile)
+            )
+        except Exception as exc:
+            errors.append("订阅 /rtabmap/mapData 失败：%s" % exc)
+        with self._lock:
+            self._rtabmap_auxiliary_subscription_errors = errors
 
     def _spin(self) -> None:
         executor = self._executor
@@ -429,6 +500,16 @@ class Ros2LiveMapProvider:
             payload = self._build_map_update_payload_locked(source_layer="cost_map")
             subscribers = list(self._map_update_subscribers.items())
         self._notify_map_update_subscribers(subscribers, payload)
+
+    def _on_rtabmap_info(self, _: Any) -> None:
+        with self._lock:
+            self._rtabmap_info_message_count += 1
+            self._latest_rtabmap_info_received_at = datetime.now(timezone.utc)
+
+    def _on_rtabmap_map_data(self, _: Any) -> None:
+        with self._lock:
+            self._rtabmap_map_data_message_count += 1
+            self._latest_rtabmap_map_data_received_at = datetime.now(timezone.utc)
 
     def _build_map_update_payload_locked(self, *, source_layer: str) -> Dict[str, object]:
         self._update_sequence += 1

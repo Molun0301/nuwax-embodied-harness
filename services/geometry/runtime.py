@@ -27,6 +27,7 @@ from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
 from providers.pointcloud import PointCloudProvider
 from services.geometry.config import PlatformGeometryConfig
+from services.geometry.frontier_marker_provider import Ros2FrontierMarkerProvider
 from services.geometry.live_map_provider import Ros2LiveMapProvider
 from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
 from services.geometry.odometry_publisher import Ros2OdometryPublisher
@@ -205,6 +206,7 @@ class PlatformGeometryRuntime:
         self._active_map_version: Optional[MapVersion] = None
         self._last_activation_result: Dict[str, object] = {}
         self._live_map_provider = Ros2LiveMapProvider(config)
+        self._frontier_marker_provider = Ros2FrontierMarkerProvider(config)
         self._tf_localization_provider = Ros2TfLocalizationProvider(config)
         self._odometry_publisher = Ros2OdometryPublisher(config, self._resolve_raw_localization_backend)
         self._point_cloud_publisher = Ros2PointCloudPublisher(config, self._resolve_point_cloud_provider)
@@ -282,6 +284,7 @@ class PlatformGeometryRuntime:
             self._set_runtime_state("failed", "平台几何运行时启动失败：%s" % exc, blocked=True)
             self._stop_managed_processes()
             self._live_map_provider.stop()
+            self._frontier_marker_provider.stop()
             self._tf_localization_provider.stop()
             self._odometry_publisher.stop()
             self._point_cloud_publisher.stop()
@@ -302,6 +305,7 @@ class PlatformGeometryRuntime:
             thread.join(timeout=2.0)
         self._stop_managed_processes()
         self._live_map_provider.stop()
+        self._frontier_marker_provider.stop()
         self._tf_localization_provider.stop()
         self._odometry_publisher.stop()
         self._point_cloud_publisher.stop()
@@ -369,7 +373,10 @@ class PlatformGeometryRuntime:
         return [str(item) for item in raw_args if str(item or "").strip()]
 
     def _build_external_geometry_command(self) -> List[str]:
-        return [str(self._external_script_path()), *self._external_args()]
+        args = self._external_args()
+        if self._uses_external_geometry_stack() and "--explore" not in args:
+            args.append("--explore")
+        return [str(self._external_script_path()), *args]
 
     def _external_input_bridge_enabled(self) -> bool:
         return bool(getattr(self.config.external, "input_bridge_enabled", False))
@@ -378,6 +385,12 @@ class PlatformGeometryRuntime:
         return self._external_input_bridge_enabled() or bool(
             getattr(self.config.external, "point_cloud_bridge_enabled", False)
         )
+
+    def _external_frontiers_readonly_enabled(self) -> bool:
+        return bool(getattr(self.config.external, "exploration_frontiers_readonly", True))
+
+    def _uses_external_frontier_observation_mode(self) -> bool:
+        return self._uses_external_geometry_stack() and self._external_frontiers_readonly_enabled()
 
     def _run_preflight_checks(self) -> List[str]:
         errors: List[str] = []
@@ -1236,6 +1249,7 @@ class PlatformGeometryRuntime:
                 and self._tf_localization_provider.is_available()
                 and self._odometry_publisher.is_available()
                 and self._point_cloud_publisher.is_available()
+                and self._frontier_marker_provider.is_available()
             ):
                 return
             self._live_geometry_start_attempted = True
@@ -1243,11 +1257,13 @@ class PlatformGeometryRuntime:
                 self._odometry_publisher.start()
                 self._point_cloud_publisher.start()
                 self._live_map_provider.start()
+                self._frontier_marker_provider.start()
                 self._tf_localization_provider.start()
             except Exception:
                 self._odometry_publisher.stop()
                 self._point_cloud_publisher.stop()
                 self._live_map_provider.stop()
+                self._frontier_marker_provider.stop()
                 self._live_geometry_start_attempted = False
                 self._tf_localization_provider.stop()
                 raise
@@ -1263,7 +1279,12 @@ class PlatformGeometryRuntime:
                 input_bridge_ready = self._odometry_publisher.is_available() and self._point_cloud_publisher.is_available()
             elif point_cloud_bridge_enabled:
                 input_bridge_ready = self._point_cloud_publisher.is_available()
-            if self._live_map_provider.is_available() and self._tf_localization_provider.is_available() and input_bridge_ready:
+            if (
+                self._live_map_provider.is_available()
+                and self._tf_localization_provider.is_available()
+                and self._frontier_marker_provider.is_available()
+                and input_bridge_ready
+            ):
                 return
             self._live_geometry_start_attempted = True
             try:
@@ -1272,6 +1293,7 @@ class PlatformGeometryRuntime:
                 if point_cloud_bridge_enabled:
                     self._point_cloud_publisher.start()
                 self._live_map_provider.start()
+                self._frontier_marker_provider.start()
                 self._tf_localization_provider.start()
             except Exception:
                 if input_bridge_enabled:
@@ -1279,6 +1301,7 @@ class PlatformGeometryRuntime:
                 if point_cloud_bridge_enabled:
                     self._point_cloud_publisher.stop()
                 self._live_map_provider.stop()
+                self._frontier_marker_provider.stop()
                 self._tf_localization_provider.stop()
                 self._live_geometry_start_attempted = False
                 raise
@@ -2635,6 +2658,20 @@ class PlatformGeometryRuntime:
             return
         if not self._platform_exploration_runtime.is_running:
             return
+        if self._uses_external_frontier_observation_mode():
+            self._cancel_platform_exploration_navigation()
+            self._platform_exploration_runtime.block_on_prerequisite(
+                waiting_for="external_frontier_selection",
+                message="当前为外部 frontier 观测模式，仅展示候选前沿，不自动下发导航目标。",
+                failure_code="external_frontier_selection_required",
+                metadata={
+                    **self._exploration_loop_metadata(tick_source=tick_source),
+                    "frontier_observation_mode": True,
+                    "frontier_goal_dispatch_enabled": False,
+                    "frontier_selection_owner": "external_llm",
+                },
+            )
+            return
         current_pose = self._read_exploration_pose()
         snapshot = self.get_map_snapshot()
         occupancy_grid = self._clone_contract(snapshot.occupancy_grid) if snapshot is not None else None
@@ -2746,11 +2783,31 @@ class PlatformGeometryRuntime:
                 self._ensure_platform_exploration_loop_locked()
         state = self._platform_exploration_runtime.get_exploration_state()
         state = self._augment_exploration_state_with_mapping_diagnostics(state)
+        frontier_metadata: Dict[str, object] = {}
+        latest_frontiers = self._frontier_marker_provider.get_latest_frontiers()
+        frontier_provider_status = self._clone_metadata(self._frontier_marker_provider.get_status())
+        if latest_frontiers:
+            current_frontier = latest_frontiers[0]
+            frontier_source = (
+                current_frontier.get("metadata", {}).get("source")
+                if isinstance(current_frontier.get("metadata"), dict)
+                else None
+            )
+            frontier_metadata = {
+                "latest_frontiers": latest_frontiers,
+                "current_frontier": current_frontier,
+                "frontier_marker_provider": frontier_provider_status,
+                "frontier_source": frontier_source or "go2slam_explore_lite",
+            }
         metadata = {
             **dict(getattr(state, "metadata", {}) or {}),
+            **frontier_metadata,
             **self._exploration_loop_metadata(tick_source="get_exploration_state"),
         }
-        return state.model_copy(update={"metadata": metadata}, deep=True)
+        update: Dict[str, object] = {"metadata": metadata}
+        if latest_frontiers:
+            update["frontier_count"] = len(latest_frontiers)
+        return state.model_copy(update=update, deep=True)
 
     def _read_exploration_pose(self):
         navigation_backend = self._resolve_navigation_backend()

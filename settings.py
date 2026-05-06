@@ -732,6 +732,10 @@ def load_config() -> NuwaxRobotBridgeConfig:
             tf_static_topic=_cfg_str("NUWAX_GEOMETRY_TF_STATIC_TOPIC", "/tf_static"),
             occupancy_topic=_cfg_str("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
             cost_map_topic=_cfg_str("NUWAX_GEOMETRY_COST_MAP_TOPIC", "/global_costmap/costmap"),
+            exploration_frontiers_topic=_cfg_str(
+                "NUWAX_GEOMETRY_EXPLORATION_FRONTIERS_TOPIC",
+                "/explore/frontiers",
+            ),
         ),
         frames=GeometryFrameConfig(
             map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "map"),
@@ -820,6 +824,10 @@ def load_config() -> NuwaxRobotBridgeConfig:
             point_cloud_bridge_enabled=_cfg_bool(
                 "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED",
                 external_input_bridge_enabled,
+            ),
+            exploration_frontiers_readonly=_cfg_bool(
+                "NUWAX_GEOMETRY_EXTERNAL_EXPLORATION_FRONTIERS_READONLY",
+                True,
             ),
         ),
     )

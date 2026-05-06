@@ -12,7 +12,14 @@ from fastapi.testclient import TestClient
 import httpx
 
 from contracts.capabilities import CapabilityMatrix
+from contracts.events import RuntimeEventCategory
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Vector3
+from contracts.geometry_runtime import (
+    ExternalGeometryStackConfig,
+    GeometryFrameConfig,
+    Nav2Config,
+    PlatformGeometryConfig,
+)
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.memory import MemoryArrivalVerification, MemoryNavigationCandidate, MemoryRecordKind
@@ -41,8 +48,9 @@ from providers import ExplorationProvider, ImageProvider, LocalizationProvider, 
 from providers.motion import MotionControl
 from providers.safety import SafetyProvider
 from providers.state import StateProvider
+from services.geometry.runtime import PlatformGeometryRuntime
 from settings import GatewayServerConfig, load_config
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _agent_headers() -> Dict[str, str]:
@@ -514,6 +522,8 @@ class FakeRobotAssembly(RobotAssemblyBase):
 
 def _build_test_config(tmp_path: Path):
     config = load_config()
+    config.geometry.enabled = False
+    config.geometry.require_ros2 = False
     config.robot.active_robot = "go2"
     config.gateway.agent_tokens = ("agent-token",)
     config.gateway.admin_tokens = ("admin-token",)
@@ -3306,3 +3316,265 @@ def test_gateway_debug_panel_overview_does_not_overwrite_stream_connection_statu
     assert match is not None
 
     assert "connectionText" not in match.group("body")
+
+
+def _go2slam_external_geometry_config(
+    script: Path,
+    *,
+    args: Tuple[str, ...] = ("--no-rviz",),
+    exploration_frontiers_readonly: bool = True,
+) -> PlatformGeometryConfig:
+    return PlatformGeometryConfig(
+        enabled=True,
+        stack="go2slam_external",
+        require_ros2=False,
+        frames=GeometryFrameConfig(base_frame="base_footprint"),
+        nav2=Nav2Config(mode="external"),
+        external=ExternalGeometryStackConfig(
+            script_path=str(script),
+            args=args,
+            exploration_frontiers_readonly=exploration_frontiers_readonly,
+        ),
+    )
+
+
+def _go2slam_runtime(config: PlatformGeometryConfig, tmp_path: Path) -> PlatformGeometryRuntime:
+    robot = type("_Robot", (), {"providers": object(), "data_plane": None, "data_plane_runtime": None})()
+    return PlatformGeometryRuntime(config=config, catalog_root=str(tmp_path / "maps"), robot=robot)
+
+
+def test_go2slam_external_command_enables_explore_without_duplicate(tmp_path: Path) -> None:
+    script = tmp_path / "start_go2_slam_nav2.sh"
+    script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    runtime = _go2slam_runtime(_go2slam_external_geometry_config(script), tmp_path)
+    assert runtime._build_external_geometry_command() == [str(script), "--no-rviz", "--explore"]
+
+    configured_runtime = _go2slam_runtime(
+        _go2slam_external_geometry_config(script, args=("--no-rviz", "--explore")),
+        tmp_path,
+    )
+    assert configured_runtime._build_external_geometry_command() == [str(script), "--no-rviz", "--explore"]
+
+
+def test_ros2_frontier_marker_provider_converts_explore_marker_array_to_frontier_metadata() -> None:
+    from services.geometry.frontier_marker_provider import Ros2FrontierMarkerProvider
+
+    def point(x: float, y: float, z: float = 0.0) -> SimpleNamespace:
+        return SimpleNamespace(x=x, y=y, z=z)
+
+    def marker(
+        marker_id: int,
+        marker_type: int,
+        *,
+        points: Optional[List[SimpleNamespace]] = None,
+        pose_point: Optional[SimpleNamespace] = None,
+        action: int = 0,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=marker_id,
+            ns="frontiers",
+            type=marker_type,
+            action=action,
+            header=SimpleNamespace(frame_id="map", stamp=SimpleNamespace(sec=12, nanosec=250_000_000)),
+            pose=SimpleNamespace(position=pose_point or point(0.0, 0.0, 0.0)),
+            points=list(points or []),
+            scale=SimpleNamespace(x=0.2, y=0.2, z=0.2),
+        )
+
+    message = SimpleNamespace(
+        markers=[
+            marker(0, 8, points=[point(1.0, 2.0), point(1.2, 2.2)]),
+            marker(1, 2, pose_point=point(1.1, 2.1)),
+            marker(2, 8, points=[point(9.0, 9.0)], action=2),
+        ]
+    )
+
+    frontiers = Ros2FrontierMarkerProvider.frontiers_from_marker_array(
+        message,
+        source_topic="/explore/frontiers",
+    )
+
+    assert len(frontiers) == 1
+    frontier = frontiers[0]
+    assert frontier["geometry"] == {"type": "point", "coordinates": [1.1, 2.1, 0.0]}
+    assert frontier["pose"]["frame_id"] == "map"
+    assert frontier["cluster_size"] == 2
+    assert frontier["metadata"]["source"] == "go2slam_explore_lite"
+    assert frontier["metadata"]["source_topic"] == "/explore/frontiers"
+    assert frontier["metadata"]["marker_ids"] == [0, 1]
+    assert frontier["metadata"]["points"][1] == {"x": 1.2, "y": 2.2, "z": 0.0}
+
+
+def test_platform_geometry_runtime_exposes_external_frontiers_in_exploration_state(tmp_path: Path) -> None:
+    script = tmp_path / "start_go2_slam_nav2.sh"
+    script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    runtime = _go2slam_runtime(_go2slam_external_geometry_config(script), tmp_path)
+    frontier = {
+        "id": "frontier-0",
+        "geometry": {"type": "point", "coordinates": [1.1, 2.1, 0.0]},
+        "pose": Pose(frame_id="map", position=Vector3(x=1.1, y=2.1)).model_dump(mode="json"),
+        "cluster_size": 2,
+        "metadata": {"source": "go2slam_explore_lite", "source_topic": "/explore/frontiers"},
+    }
+    provider_status = {
+        "provider_status": "available",
+        "topic": "/explore/frontiers",
+        "frontier_count": 1,
+        "message_count": 3,
+    }
+    runtime._frontier_marker_provider = SimpleNamespace(
+        get_latest_frontiers=lambda: [frontier],
+        get_status=lambda: provider_status,
+        is_available=lambda: True,
+    )
+    runtime._augment_exploration_state_with_mapping_diagnostics = lambda state: state
+    runtime._exploration_loop_metadata = lambda *, tick_source: {"tick_source": tick_source}
+
+    state = runtime.get_platform_exploration_state()
+
+    assert state.frontier_count == 1
+    assert state.metadata["latest_frontiers"] == [frontier]
+    assert state.metadata["frontier_marker_provider"] == provider_status
+    assert state.metadata["frontier_source"] == "go2slam_explore_lite"
+
+
+def test_go2slam_explore_config_runs_frontier_only_without_nav2_goal_dispatch_by_default() -> None:
+    go2slam_root = Path("services/geometry/ros2_ws/src/go2slam")
+    explore_cpp = (go2slam_root / "m-explore-ros2/explore/src/explore.cpp").read_text(encoding="utf-8")
+    explore_header = (go2slam_root / "m-explore-ros2/explore/include/explore/explore.h").read_text(encoding="utf-8")
+    explore_params = (go2slam_root / "src/go2_navigation2/config/explore_params.yaml").read_text(encoding="utf-8")
+
+    assert "send_goals: false" in explore_params
+    assert 'declare_parameter<bool>("send_goals", true)' in explore_cpp
+    assert 'get_parameter("send_goals", send_goals_)' in explore_cpp
+    assert "bool send_goals_" in explore_header
+
+    wait_index = explore_cpp.index("wait_for_action_server")
+    assert explore_cpp.rfind("if (send_goals_)", 0, wait_index) != -1
+
+    frontier_only_index = explore_cpp.index("if (!send_goals_)")
+    send_goal_index = explore_cpp.index("move_base_client_->async_send_goal(goal, send_goal_options);")
+    assert frontier_only_index < send_goal_index
+
+
+def test_go2slam_start_script_uses_source_explore_params_when_explore_enabled() -> None:
+    script = Path("services/geometry/ros2_ws/src/go2slam/start_go2_slam_nav2.sh").read_text(encoding="utf-8")
+
+    assert 'EXPLORE_PARAMS_FILE="$ROOT_DIR/src/go2_navigation2/config/explore_params.yaml"' in script
+    assert 'NAV2_ARGS+=(use_explore:=true "explore_params_file:=${EXPLORE_PARAMS_FILE}")' in script
+
+
+def test_go2slam_external_frontier_observation_mode_never_dispatches_navigation_goal(tmp_path: Path) -> None:
+    script = tmp_path / "start_go2_slam_nav2.sh"
+    script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    runtime = _go2slam_runtime(_go2slam_external_geometry_config(script), tmp_path)
+
+    calls: list[str] = []
+    runtime._platform_exploration_runtime.start_exploration(
+        ExploreAreaRequest(request_id="explore_readonly", strategy="frontier")
+    )
+    runtime._cancel_platform_exploration_navigation = lambda current_goal=None: calls.append("cancel")
+    runtime._exploration_loop_metadata = lambda *, tick_source: {"tick_source": tick_source}
+    runtime._platform_exploration_runtime.block_on_prerequisite = (
+        lambda **kwargs: calls.append("blocked:%s" % kwargs["waiting_for"])
+    )
+
+    class _NavigationBackend:
+        provider_name = "fake_nav"
+
+        def set_goal(self, goal):
+            calls.append("set_goal")
+            return True
+
+        def cancel_goal(self):
+            calls.append("cancel_goal")
+
+        def get_navigation_state(self):
+            return NavigationState(status=NavigationStatus.IDLE)
+
+        def is_available(self):
+            return True
+
+        def is_navigation_available(self):
+            return True
+
+        def is_goal_reached(self):
+            return False
+
+    runtime._resolve_navigation_backend = lambda: _NavigationBackend()
+
+    runtime.sync_platform_exploration(tick_source="test")
+
+    assert "cancel" in calls
+    assert "blocked:external_frontier_selection" in calls
+    assert "set_goal" not in calls
+
+
+def test_gateway_runtime_publishes_video_frame_from_image_provider() -> None:
+    app, runtime, robot, _ = _build_host_app(Path("/tmp"))
+    del app
+    robot.start()
+    robot.providers.capture_image = lambda camera_id=None: ImageFrame(
+        camera_id="front_camera",
+        frame_id="world/fake_go2/front_camera",
+        width_px=640,
+        height_px=480,
+        encoding=ImageEncoding.JPEG,
+        data=b"\xff\xd8\xff\xdbdemo-jpeg",
+        metadata={"size_bytes": len(b"\xff\xd8\xff\xdbdemo-jpeg")},
+    )
+
+    runtime._publish_video_stream_frame(reason="test")
+
+    frame = runtime.stream_bus.latest_frame("video.frame")
+    assert frame is not None
+    assert frame.status == "available"
+    assert frame.source == "image_provider"
+    assert frame.payload["camera_id"] == "front_camera"
+    assert frame.payload["data_uri"].startswith("data:image/jpeg;base64,")
+    assert frame.payload["payload_bytes"] == len(b"\xff\xd8\xff\xdbdemo-jpeg")
+    assert "data" not in frame.payload
+
+
+def test_gateway_runtime_publishes_missing_video_frame_when_capture_fails() -> None:
+    app, runtime, robot, _ = _build_host_app(Path("/tmp"))
+    del app
+    robot.start()
+    robot.providers.capture_image = lambda camera_id=None: (_ for _ in ()).throw(RuntimeError("camera offline"))
+
+    runtime._publish_video_stream_frame(reason="test_failure")
+
+    frame = runtime.stream_bus.latest_frame("video.frame")
+    assert frame is not None
+    assert frame.status == "missing"
+    assert frame.source == "image_provider"
+    assert frame.payload["available"] is False
+    assert "camera offline" in frame.payload["message"]
+
+
+def test_gateway_debug_panel_log_stream_updates_overview_status() -> None:
+    html = _render_debug_page("agent-token")
+
+    assert '"logs.entry": "logs"' in html
+    assert 'overview[key] = {' in html
+    assert 'status: frame.status || "available"' in html
+
+
+def test_gateway_runtime_publishes_logs_entry_stream_frame_as_available() -> None:
+    app, runtime, _robot, _config = _build_host_app(Path("/tmp"))
+    del app
+    event = runtime.event_bus.build_event(
+        "system.test_log",
+        category=RuntimeEventCategory.SYSTEM,
+        source="test_source",
+        message="hello log",
+        payload={},
+    )
+
+    runtime._publish_runtime_event_stream_frames(event)
+
+    frame = runtime.stream_bus.latest_frame("logs.entry")
+    assert frame is not None
+    assert frame.status == "available"
+    assert frame.payload["severity"] == "info"

@@ -95,6 +95,7 @@ _RUNTIME_METADATA_LOG_KEYS = (
 )
 
 _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 2.0
+_VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
 
 
 def _has_observability_value(value: Any) -> bool:
@@ -372,6 +373,8 @@ class GatewayRuntime:
         self._pointcloud_map_stream_subscription_id: Optional[str] = None
         self._navigation_status_refresh_stop = threading.Event()
         self._navigation_status_refresh_thread: Optional[threading.Thread] = None
+        self._video_stream_refresh_stop = threading.Event()
+        self._video_stream_refresh_thread: Optional[threading.Thread] = None
         self._pointcloud_map_cache = PointCloudMapCache()
         self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
         self._base_capability_matrix = robot.manifest.capability_matrix
@@ -542,7 +545,8 @@ class GatewayRuntime:
                 "timestamp": getattr(event, "timestamp", None),
             },
             sequence=getattr(event, "cursor", None),
-            status=severity,
+            status="available",
+            metadata={"severity": severity, "category": category},
         )
         if category == "task" or getattr(event, "task_id", None):
             self.stream_bus.publish(
@@ -574,6 +578,7 @@ class GatewayRuntime:
         self._publish_pointcloud_map_stream_frame(reason="runtime_stream_start")
         self._publish_navigation_bootstrap_stream_frames()
         self._start_navigation_status_refresh_stream()
+        self._start_video_stream_refresh()
         if self._pointcloud_map_stream_subscription_id is None:
             self._pointcloud_map_stream_subscription_id = self.stream_bus.subscribe(
                 self._handle_map_frame_for_pointcloud_map_stream,
@@ -653,8 +658,37 @@ class GatewayRuntime:
         while not self._navigation_status_refresh_stop.wait(_NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC):
             self._publish_navigation_bootstrap_stream_frames()
 
+    def _start_video_stream_refresh(self) -> None:
+        if self._video_stream_refresh_thread is not None:
+            return
+        self._video_stream_refresh_stop.clear()
+        thread = threading.Thread(
+            target=self._run_video_stream_refresh,
+            name="nuwax-video-stream-refresh",
+            daemon=True,
+        )
+        self._video_stream_refresh_thread = thread
+        thread.start()
+
+    def _stop_video_stream_refresh(self) -> None:
+        thread = self._video_stream_refresh_thread
+        if thread is None:
+            return
+        self._video_stream_refresh_stop.set()
+        if thread.is_alive():
+            thread.join(timeout=_VIDEO_STREAM_REFRESH_INTERVAL_SEC + 1.0)
+        self._video_stream_refresh_thread = None
+
+    def _run_video_stream_refresh(self) -> None:
+        while not self._video_stream_refresh_stop.wait(_VIDEO_STREAM_REFRESH_INTERVAL_SEC):
+            try:
+                self._publish_video_stream_frame(reason="video_stream_refresh")
+            except Exception:
+                RUNTIME_LOGGER.debug("刷新视频流帧失败。", exc_info=True)
+
     def _stop_data_frame_stream_sources(self) -> None:
         self._stop_navigation_status_refresh_stream()
+        self._stop_video_stream_refresh()
         if self._pointcloud_map_stream_subscription_id is not None:
             self.stream_bus.unsubscribe(self._pointcloud_map_stream_subscription_id)
             self._pointcloud_map_stream_subscription_id = None
@@ -712,6 +746,84 @@ class GatewayRuntime:
                 "point_count": getattr(point_cloud, "point_count", None),
                 "source_topic": metadata.get("source_topic"),
                 "not_a_pointcloud_map": True,
+            },
+        )
+
+    def _publish_video_stream_frame(self, *, reason: str) -> None:
+        providers = getattr(self.robot, "providers", None)
+        image_provider = providers if providers is not None and isinstance(providers, ImageProvider) else None
+        if image_provider is None:
+            self.stream_bus.publish(
+                "video.frame",
+                source="image_provider",
+                payload={"available": False, "message": "当前机器人未提供图像 provider。"},
+                status="missing",
+                metadata={"reason": "image_provider_missing", "refresh_reason": reason},
+            )
+            return
+        availability_checker = getattr(image_provider, "is_image_available", None)
+        try:
+            image_available = bool(availability_checker()) if callable(availability_checker) else bool(image_provider.is_available())
+        except Exception:
+            image_available = False
+        if not image_available:
+            self.stream_bus.publish(
+                "video.frame",
+                source="image_provider",
+                payload={"available": False, "message": "当前图像 provider 暂不可用。"},
+                status="missing",
+                metadata={"reason": "image_provider_unavailable", "refresh_reason": reason},
+            )
+            return
+        try:
+            image_frame = image_provider.capture_image(None)
+        except Exception as exc:
+            self.stream_bus.publish(
+                "video.frame",
+                source="image_provider",
+                payload={"available": False, "message": str(exc)},
+                status="missing",
+                metadata={"reason": "image_capture_failed", "refresh_reason": reason},
+            )
+            return
+        data = getattr(image_frame, "data", None)
+        data_uri = None
+        encoding = str(
+            getattr(getattr(image_frame, "encoding", None), "value", getattr(image_frame, "encoding", "jpeg")) or "jpeg"
+        ).lower()
+        if data:
+            mime_type = {
+                "jpeg": "image/jpeg",
+                "jpg": "image/jpeg",
+                "png": "image/png",
+            }.get(encoding, "application/octet-stream")
+            data_uri = "data:%s;base64,%s" % (mime_type, base64.b64encode(bytes(data)).decode("ascii"))
+        payload = {
+            "available": True,
+            "camera_id": getattr(image_frame, "camera_id", None),
+            "frame_id": getattr(image_frame, "frame_id", None),
+            "width_px": getattr(image_frame, "width_px", None),
+            "height_px": getattr(image_frame, "height_px", None),
+            "encoding": encoding,
+            "data_uri": data_uri,
+            "payload_bytes": len(data or b""),
+            "source": "image_provider",
+            "refresh_reason": reason,
+            "timestamp": getattr(image_frame, "timestamp", None),
+            "metadata": self._serialize(getattr(image_frame, "metadata", {}) or {}),
+        }
+        self.stream_bus.publish(
+            "video.frame",
+            source="image_provider",
+            payload=payload,
+            frame_id=getattr(image_frame, "frame_id", None),
+            status="available",
+            metadata={
+                "camera_id": getattr(image_frame, "camera_id", None),
+                "encoding": str(
+                    getattr(getattr(image_frame, "encoding", None), "value", getattr(image_frame, "encoding", "")) or ""
+                ),
+                "refresh_reason": reason,
             },
         )
 
@@ -937,14 +1049,7 @@ class GatewayRuntime:
         )
 
     def _publish_static_stream_capability_frames(self) -> None:
-        self.stream_bus.publish(
-            "video.frame",
-            source="image_provider",
-            payload={"available": False, "message": "当前图像接口没有原生视频流订阅，未启用定时抓帧伪流式。"},
-            payload_kind=StreamPayloadKind.UNSUPPORTED,
-            status="unsupported",
-            metadata={"reason": "no_native_video_stream_subscription"},
-        )
+        self._publish_video_stream_frame(reason="runtime_stream_start")
 
     def register_default_capabilities(self) -> None:
         """注册首版网关能力。"""

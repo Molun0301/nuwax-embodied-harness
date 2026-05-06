@@ -302,10 +302,18 @@ GO2_CAPABILITY_DESCRIPTORS_BY_NAME = {
     descriptor.name: descriptor for descriptor in GO2_CAPABILITY_DESCRIPTORS
 }
 
+GO2_UNSUPPORTED_CAPABILITIES: Dict[str, str] = {
+    "pose_preset": "当前未绑定 Go2 实机关节标定，不能安全应用预设姿态。",
+}
+
 GO2_CAPABILITY_MATRIX = CapabilityMatrix(
     robot_model="unitree_go2",
     capabilities=[
-        CapabilityAvailability(name=descriptor.name, supported=True)
+        CapabilityAvailability(
+            name=descriptor.name,
+            supported=descriptor.name not in GO2_UNSUPPORTED_CAPABILITIES,
+            reason=GO2_UNSUPPORTED_CAPABILITIES.get(descriptor.name),
+        )
         for descriptor in GO2_CAPABILITY_DESCRIPTORS
     ],
     metadata={

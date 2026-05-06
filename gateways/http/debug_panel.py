@@ -54,13 +54,15 @@ _STALE_THRESHOLDS_SEC = {
 def _stream_migration_response(*topics: str) -> JSONResponse:
     topic_list = [topic for topic in topics if topic]
     query = ",".join(topic_list)
-    stream_path = "/streams/ws" + (f"?topics={query}" if query else "")
+    ws_stream_path = "/streams/ws" + (f"?topics={query}" if query else "")
+    sse_stream_path = "/streams/sse" + (f"?topics={query}" if query else "")
     return JSONResponse(
         status_code=410,
         content={
             "code": "stream_required",
             "message": "实时数据调试 HTTP 快照入口已下线，请订阅实时流。",
-            "stream": stream_path,
+            "stream": ws_stream_path,
+            "streams": {"websocket": ws_stream_path, "sse": sse_stream_path},
             "topics": topic_list,
         },
     )

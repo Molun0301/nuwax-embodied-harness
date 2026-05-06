@@ -74,10 +74,49 @@ class StreamBus:
             self._latest_by_topic[stored_frame.topic] = stored_frame
             subscriptions = tuple(self._subscriptions.values())
 
+        failures: List[Tuple[StreamSubscription, Exception]] = []
         for subscription in subscriptions:
-            if self._matches(subscription, stored_frame):
+            if not self._matches(subscription, stored_frame):
+                continue
+            try:
                 subscription.callback(stored_frame)
+            except Exception as exc:
+                failures.append((subscription, exc))
+        if failures:
+            self._record_subscription_failures(stored_frame, failures)
         return stored_frame
+
+    def _record_subscription_failures(
+        self,
+        frame: StreamFrame,
+        failures: Iterable[Tuple[StreamSubscription, Exception]],
+    ) -> None:
+        for subscription, exc in failures:
+            diagnostic = StreamFrame(
+                topic="diagnostics.stream_bus.subscription_failed",
+                source="stream_bus",
+                payload_kind=StreamPayloadKind.DIAGNOSTIC,
+                payload={
+                    "subscription_id": subscription.subscription_id,
+                    "failed_topic": frame.topic,
+                    "failed_frame_cursor": frame.cursor,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+                status="error",
+                metadata={
+                    "subscription_id": subscription.subscription_id,
+                    "failed_topic": frame.topic,
+                    "failed_frame_cursor": frame.cursor,
+                },
+            )
+            with self._lock:
+                stored_diagnostic = diagnostic.model_copy(update={"cursor": self._next_cursor})
+                self._next_cursor += 1
+                self._frames.append(stored_diagnostic)
+                if len(self._frames) > self._retention_limit:
+                    self._frames = self._frames[-self._retention_limit :]
+                self._latest_by_topic[stored_diagnostic.topic] = stored_diagnostic
 
     def publish_dropped(self, topic: str, *, source: str, dropped_count: int = 1) -> StreamFrame:
         with self._lock:

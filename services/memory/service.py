@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
@@ -360,6 +362,115 @@ class MemoryService:
                 payload={"library_name": previous_name},
             )
         return summary.model_dump(mode="json")
+
+    def build_artifact_reference_index(self, *, library_name: Optional[str] = None) -> Dict[str, List[Dict[str, object]]]:
+        """构建记忆库内制品反向引用索引。"""
+
+        target_library = str(library_name or "").strip() or None
+        index: Dict[str, List[Dict[str, object]]] = {}
+
+        def _accept(record: object) -> bool:
+            return target_library is None or self._record_library_name(record) == target_library
+
+        def _add(artifact_id: str, *, record_kind: str, record_id: str, source: str, library_name: str) -> None:
+            resolved_id = str(artifact_id or "").strip()
+            if not resolved_id:
+                return
+            index.setdefault(resolved_id, []).append(
+                {
+                    "source": source,
+                    "record_kind": record_kind,
+                    "record_id": record_id,
+                    "library_name": library_name,
+                }
+            )
+
+        for entry in self._repository.load_semantic_memories():
+            if not _accept(entry):
+                continue
+            library = self._record_library_name(entry)
+            for artifact_id in entry.artifact_ids:
+                _add(artifact_id, record_kind="semantic_memory", record_id=entry.memory_id, source="memory.semantic_memory", library_name=library)
+        for instance in self._repository.load_semantic_instances():
+            if not _accept(instance):
+                continue
+            library = self._record_library_name(instance)
+            for artifact_id in instance.artifact_ids:
+                _add(artifact_id, record_kind="semantic_instance", record_id=instance.instance_id, source="memory.semantic_instance", library_name=library)
+        for event in self._repository.load_observation_events():
+            if not _accept(event):
+                continue
+            library = self._record_library_name(event)
+            for artifact_id in event.artifact_ids:
+                _add(artifact_id, record_kind="observation_event", record_id=event.event_id, source="memory.observation_event", library_name=library)
+        for scene_space in self._repository.load_scene_spaces():
+            if not _accept(scene_space):
+                continue
+            library = self._record_library_name(scene_space)
+            for artifact_id in self._scene_space_artifact_ids(scene_space):
+                _add(artifact_id, record_kind="scene_space", record_id=scene_space.scene_space_id, source="memory.scene_space", library_name=library)
+        return index
+
+    def build_memory_checkpoint(self, *, library_name: Optional[str] = None) -> Dict[str, object]:
+        """构建可写入地图版本 manifest 的记忆检查点。"""
+
+        target_library = str(library_name or "").strip() or self._active_library_name
+
+        def _matches(record: object) -> bool:
+            return not target_library or self._record_library_name(record) == target_library
+
+        tagged_locations = [item for item in self._repository.load_tagged_locations() if _matches(item)]
+        semantic_memories = [item for item in self._repository.load_semantic_memories() if _matches(item)]
+        semantic_instances = [item for item in self._repository.load_semantic_instances() if _matches(item)]
+        observation_events = [item for item in self._repository.load_observation_events() if _matches(item)]
+        scene_spaces = [item for item in self._repository.load_scene_spaces() if _matches(item)]
+        artifact_index = self.build_artifact_reference_index(library_name=target_library)
+        payload = {
+            "library_name": target_library,
+            "active": bool(target_library and target_library == self._active_library_name),
+            "tagged_location_ids": sorted(item.location_id for item in tagged_locations),
+            "semantic_memory_ids": sorted(item.memory_id for item in semantic_memories),
+            "semantic_instance_ids": sorted(item.instance_id for item in semantic_instances),
+            "observation_event_ids": sorted(item.event_id for item in observation_events),
+            "scene_space_ids": sorted(item.scene_space_id for item in scene_spaces),
+            "artifact_ids": sorted(artifact_index),
+        }
+        checkpoint_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        return {
+            "library_name": target_library,
+            "active": payload["active"],
+            "tagged_location_count": len(tagged_locations),
+            "semantic_memory_count": len(semantic_memories),
+            "semantic_instance_count": len(semantic_instances),
+            "observation_event_count": len(observation_events),
+            "scene_space_count": len(scene_spaces),
+            "artifact_count": len(payload["artifact_ids"]),
+            "artifact_ids": payload["artifact_ids"],
+            "checkpoint_hash": checkpoint_hash,
+        }
+
+    def diagnose_artifact_links(self, artifact_store: Optional[LocalArtifactStore] = None, *, library_name: Optional[str] = None) -> Dict[str, object]:
+        """诊断记忆记录引用的制品是否仍可解析。"""
+
+        index = self.build_artifact_reference_index(library_name=library_name)
+        missing: List[Dict[str, object]] = []
+        checked = 0
+        store = artifact_store or self._artifact_store
+        if store is not None:
+            for artifact_id, references in sorted(index.items()):
+                checked += 1
+                try:
+                    store.get_ref(artifact_id)
+                    store.get_file_path(artifact_id)
+                except Exception as exc:
+                    missing.append({"artifact_id": artifact_id, "error": str(exc), "references": references})
+        return {
+            "library_name": str(library_name or "").strip() or self._active_library_name,
+            "checked_artifact_count": checked,
+            "referenced_artifact_count": len(index),
+            "missing_artifact_count": len(missing),
+            "missing_artifacts": missing,
+        }
 
     def delete_memory_library(self, *, library_name: str) -> Dict[str, object]:
         """删除指定命名记忆库及其关联记录。"""

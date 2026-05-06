@@ -588,7 +588,7 @@ class Go2DataPlaneRuntime:
         return self._send_official_motion_command(vx, vy, vyaw)
 
     def stop_motion_command(self) -> None:
-        if not self.can_accept_motion_command():
+        if not self._uses_official_backend():
             return
         self._stop_official_motion()
 

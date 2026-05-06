@@ -435,10 +435,33 @@ class PlatformGeometryRuntime:
             str(self.config.frames.base_frame),
         ]
 
-    def _build_rtabmap_command(self) -> List[str]:
-        db_path = self._rtabmap_database_path()
+    def _build_rtabmap_command(
+        self,
+        *,
+        database_path: Optional[Path] = None,
+        delete_db_on_start: bool = True,
+        localization_mode: bool = False,
+    ) -> List[str]:
+        db_path = (database_path or self._rtabmap_database_path()).expanduser()
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        return self._build_launch_prefix() + [
+        rtabmap_args = [
+            "--RGBD/CreateOccupancyGrid true",
+            "--Grid/FromDepth false",
+            "--Grid/RangeMax 8.0",
+            "--Grid/CellSize 0.05",
+            "--Grid/3D true",
+            "--Grid/RayTracing true",
+            "--Grid/FlatObstacleDetected true",
+            "--Grid/MaxGroundHeight 0.35",
+            "--Grid/MaxObstacleHeight 1.8",
+            "--Grid/NormalsSegmentation false",
+            "--Grid/MinClusterSize 5",
+        ]
+        if delete_db_on_start:
+            rtabmap_args.insert(0, "--delete_db_on_start")
+        if localization_mode:
+            rtabmap_args.extend(("--Mem/IncrementalMemory false", "--Mem/InitWMWithAllNodes true"))
+        command = self._build_launch_prefix() + [
             "ros2",
             "launch",
             str(self.config.rtabmap.launch_package),
@@ -467,8 +490,11 @@ class PlatformGeometryRuntime:
             "queue_size:=30",
             "wait_for_transform:=0.5",
             "database_path:=%s" % db_path,
-            "args:=--delete_db_on_start --RGBD/CreateOccupancyGrid true --Grid/FromDepth false --Grid/RangeMax 8.0 --Grid/CellSize 0.05 --Grid/3D true --Grid/RayTracing true --Grid/FlatObstacleDetected true --Grid/MaxGroundHeight 0.35 --Grid/MaxObstacleHeight 1.8 --Grid/NormalsSegmentation false --Grid/MinClusterSize 5",
+            "args:=%s" % " ".join(rtabmap_args),
         ]
+        if localization_mode:
+            command.append("localization:=true")
+        return command
 
     def _build_static_tf_command(self, parent_frame: str, child_frame: str) -> List[str]:
         return self._build_launch_prefix() + [
@@ -486,7 +512,7 @@ class PlatformGeometryRuntime:
             str(child_frame),
         ]
 
-    def _build_nav2_command(self) -> List[str]:
+    def _build_nav2_command(self, *, map_yaml_override: Optional[Path] = None) -> List[str]:
         command = self._build_launch_prefix() + [
             "ros2",
             "launch",
@@ -495,7 +521,7 @@ class PlatformGeometryRuntime:
             "use_sim_time:=%s" % str(bool(getattr(self.config.nav2, "use_sim_time", False))).lower(),
             "autostart:=%s" % str(bool(getattr(self.config.nav2, "autostart", True))).lower(),
         ]
-        map_yaml = str(getattr(self.config.nav2, "map_yaml", "") or "").strip()
+        map_yaml = str(map_yaml_override or getattr(self.config.nav2, "map_yaml", "") or "").strip()
         if map_yaml:
             command.append("map:=%s" % map_yaml)
         params_file = str(getattr(self.config.nav2, "params_file", "") or "").strip()
@@ -539,6 +565,24 @@ class PlatformGeometryRuntime:
         process.command = list(command)
         process.start(restart=restart)
         self._managed_processes[name] = process
+
+    def _restart_managed_process(self, name: str, command: List[str], log_name: str) -> _ManagedProcess:
+        current = self._managed_processes.get(name)
+        if current is not None:
+            current.stop()
+            process = current
+            process.log_path = self._geometry_log_dir() / log_name
+        else:
+            process = _ManagedProcess(
+                name=name,
+                command=list(command),
+                log_path=self._geometry_log_dir() / log_name,
+                cwd=self._repo_root(),
+            )
+        process.command = list(command)
+        process.start(restart=current is not None)
+        self._managed_processes[name] = process
+        return process
 
     def _stop_managed_processes(self) -> None:
         for process in list(self._managed_processes.values()):
@@ -1308,17 +1352,35 @@ class PlatformGeometryRuntime:
         previous_asset = version.geometry_asset
         parameter_summary = self._build_parameter_summary()
         profile_summary = self._clone_metadata(parameter_summary.get("profile") or {})
-        rtabmap_db_path = self._version_rtabmap_database_path(version.map_name, version.version_id)
-        pcd_path = self._version_pcd_asset_path(version.map_name, version.version_id)
+        rtabmap_db_path = (
+            Path(previous_asset.rtabmap_db_path).expanduser()
+            if previous_asset is not None
+            else self._version_rtabmap_database_path(version.map_name, version.version_id)
+        )
+        pcd_path = (
+            Path(previous_asset.pcd_path).expanduser()
+            if previous_asset is not None and previous_asset.pcd_path
+            else self._version_pcd_asset_path(version.map_name, version.version_id)
+        )
         built_at = previous_asset.built_at if previous_asset is not None else version.timestamp
         rtabmap_run = self._build_rtabmap_run_metadata()
-        database_metadata = self._materialize_rtabmap_database(rtabmap_db_path)
-        pcd_metadata = self._materialize_pcd_asset(pcd_path)
+        database_metadata = (
+            self._describe_existing_rtabmap_database(rtabmap_db_path)
+            if previous_asset is not None
+            else self._materialize_rtabmap_database(rtabmap_db_path)
+        )
+        pcd_metadata = (
+            self._describe_existing_pcd_asset(pcd_path)
+            if previous_asset is not None
+            else self._materialize_pcd_asset(pcd_path)
+        )
+        nav2_map_metadata = self._materialize_nav2_map_assets(version)
         quality_metrics = self._build_geometry_quality_metrics(
             database_metadata=database_metadata,
             pcd_metadata=pcd_metadata,
             rtabmap_run=rtabmap_run,
         )
+        quality_metrics["nav2_map"] = self._clone_metadata(nav2_map_metadata)
         asset_refs = (
             MapGeometryAssetRef(
                 asset_type=MapGeometryAssetType.RTABMAP_DATABASE,
@@ -1373,6 +1435,7 @@ class PlatformGeometryRuntime:
                 "run_id": rtabmap_run.get("run_id"),
                 "database": database_metadata,
                 "pcd": pcd_metadata,
+                "nav2_map": nav2_map_metadata,
                 "diagnostics": quality_metrics.get("diagnostics", []),
             },
         )
@@ -1393,6 +1456,8 @@ class PlatformGeometryRuntime:
                     "rtabmap_live_streaming_ready": quality_metrics.get("live_streaming_ready"),
                     "map_version_source_mode": quality_metrics.get("source_mode"),
                     "checkpoint_ready": quality_metrics.get("checkpoint_ready"),
+                    "nav2_map_yaml_path": nav2_map_metadata.get("yaml_path"),
+                    "nav2_map_ready": nav2_map_metadata.get("present"),
                 },
             },
             deep=True,
@@ -1404,9 +1469,16 @@ class PlatformGeometryRuntime:
         prepared_version = self.prepare_map_version_assets(version)
         geometry_asset = prepared_version.geometry_asset
         assert geometry_asset is not None
+        previous_active_version = self._active_map_version.model_copy(deep=True) if self._active_map_version is not None else None
         activation_result = self._activate_backend_map_version(prepared_version)
-        self._active_map_version = prepared_version.model_copy(deep=True)
         self._last_activation_result = activation_result
+        if not activation_result.get("backend_switch_applied"):
+            self._active_map_version = previous_active_version
+            raise RuntimeError(
+                "地图版本 %s 后端切换未确认：%s"
+                % (prepared_version.version_id, activation_result.get("reason") or "backend_switch_applied_false")
+            )
+        self._active_map_version = prepared_version.model_copy(deep=True)
 
         ready_snapshot = self._wait_for_geometry_snapshot(timeout_sec=0.2)
         if ready_snapshot is not None:
@@ -1707,29 +1779,97 @@ class PlatformGeometryRuntime:
     def _version_pcd_asset_path(self, map_name: str, version_id: str) -> Path:
         return self._version_geometry_root(map_name, version_id) / "pcd" / self.config.rtabmap.outputs.pcd_asset_name
 
+    def _version_nav2_map_yaml_path(self, map_name: str, version_id: str) -> Path:
+        return self._version_geometry_root(map_name, version_id) / "nav2" / "map.yaml"
+
+    def _version_nav2_map_pgm_path(self, map_name: str, version_id: str) -> Path:
+        return self._version_geometry_root(map_name, version_id) / "nav2" / "map.pgm"
+
+    def _materialize_nav2_map_assets(self, version: MapVersion) -> Dict[str, object]:
+        occupancy_grid = version.snapshot.occupancy_grid
+        yaml_path = self._version_nav2_map_yaml_path(version.map_name, version.version_id)
+        pgm_path = self._version_nav2_map_pgm_path(version.map_name, version.version_id)
+        if occupancy_grid is None:
+            return {
+                "present": False,
+                "source_kind": "unavailable",
+                "yaml_path": str(yaml_path.resolve(strict=False)),
+                "pgm_path": str(pgm_path.resolve(strict=False)),
+                "reason": "occupancy_grid_missing",
+            }
+        yaml_path.parent.mkdir(parents=True, exist_ok=True)
+        width = int(occupancy_grid.width)
+        height = int(occupancy_grid.height)
+        data = list(occupancy_grid.data)
+        if len(data) != width * height:
+            return {
+                "present": False,
+                "source_kind": "platform_snapshot",
+                "yaml_path": str(yaml_path.resolve(strict=False)),
+                "pgm_path": str(pgm_path.resolve(strict=False)),
+                "reason": "occupancy_grid_size_mismatch",
+                "width": width,
+                "height": height,
+                "data_length": len(data),
+            }
+        with pgm_path.open("wb") as handle:
+            handle.write(("P5\n%d %d\n255\n" % (width, height)).encode("ascii"))
+            for row in range(height - 1, -1, -1):
+                start = row * width
+                for value in data[start:start + width]:
+                    if value < 0:
+                        pixel = 205
+                    elif value >= 65:
+                        pixel = 0
+                    else:
+                        pixel = 254
+                    handle.write(bytes((pixel,)))
+        origin = occupancy_grid.origin
+        yaw = self._yaw_from_pose(origin)
+        yaml_path.write_text(
+            "image: %s\nmode: trinary\nresolution: %.12g\norigin: [%.12g, %.12g, %.12g]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n"
+            % (pgm_path.name, float(occupancy_grid.resolution_m), float(origin.position.x), float(origin.position.y), yaw),
+            encoding="utf-8",
+        )
+        yaml_metadata = self._file_metadata(yaml_path)
+        pgm_metadata = self._file_metadata(pgm_path)
+        return {
+            "present": True,
+            "source_kind": "platform_snapshot",
+            "yaml_path": str(yaml_path.resolve(strict=False)),
+            "pgm_path": str(pgm_path.resolve(strict=False)),
+            "yaml": yaml_metadata,
+            "pgm": pgm_metadata,
+            "checksum_sha256": {"yaml": yaml_metadata.get("sha256"), "pgm": pgm_metadata.get("sha256")},
+            "frame_id": occupancy_grid.frame_id,
+            "width": width,
+            "height": height,
+            "resolution_m": float(occupancy_grid.resolution_m),
+        }
+
+    def _yaw_from_pose(self, pose: Pose) -> float:
+        orientation = pose.orientation
+        siny_cosp = 2.0 * (float(orientation.w) * float(orientation.z) + float(orientation.x) * float(orientation.y))
+        cosy_cosp = 1.0 - 2.0 * (float(orientation.y) * float(orientation.y) + float(orientation.z) * float(orientation.z))
+        return math.atan2(siny_cosp, cosy_cosp)
+
     def _build_parameter_summary(self) -> Dict[str, object]:
         return self._clone_metadata(self.config.build_metadata())
 
     def _materialize_rtabmap_database(self, target_path: Path) -> Dict[str, object]:
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        source_path = self._locate_live_rtabmap_database()
+        if target_path.exists() and target_path.is_file():
+            return self._describe_existing_rtabmap_database(target_path)
+        source_path = self._locate_live_rtabmap_database(include_active_version=False)
         if source_path is None:
-            if target_path.exists() and target_path.is_file():
-                return {
-                    "database_present": True,
-                    "database_source_kind": "persisted_asset",
-                    "database_source_path": str(target_path.resolve()),
-                    "database_target_path": str(target_path.resolve()),
-                    "database_target": self._file_metadata(target_path),
-                }
             return {
                 "database_present": False,
                 "database_source_kind": "unavailable",
                 "database_source_path": None,
-                "database_target_path": str(target_path.resolve()),
+                "database_target_path": str(target_path.resolve(strict=False)),
             }
         resolved_source = source_path.resolve()
-        resolved_target = target_path.resolve()
+        resolved_target = target_path.resolve(strict=False)
         source_before = self._file_metadata(resolved_source)
         if resolved_source != resolved_target:
             shutil.copy2(resolved_source, resolved_target)
@@ -1742,41 +1882,66 @@ class PlatformGeometryRuntime:
             "database_source_before": source_before,
             "database_source_after": source_after,
             "database_target": self._file_metadata(resolved_target),
+            "checksum_sha256": self._file_metadata(resolved_target).get("sha256") if resolved_target.exists() else None,
             "live_db_size_changed_during_copy": (
                 source_before.get("size_bytes") != source_after.get("size_bytes")
                 or source_before.get("mtime_ns") != source_after.get("mtime_ns")
             ),
         }
 
+    def _describe_existing_rtabmap_database(self, path: Path) -> Dict[str, object]:
+        resolved = path.expanduser().resolve(strict=False)
+        present = resolved.exists() and resolved.is_file()
+        metadata = self._file_metadata(resolved) if present else {"present": False, "path": str(resolved)}
+        return {
+            "database_present": present,
+            "database_source_kind": "persisted_asset",
+            "database_source_path": str(resolved) if present else None,
+            "database_target_path": str(resolved),
+            "database_target": metadata,
+            "checksum_sha256": metadata.get("sha256") if isinstance(metadata, dict) else None,
+        }
+
     def _materialize_pcd_asset(self, target_path: Path) -> Dict[str, object]:
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        source_path = self._locate_live_pcd_asset()
+        if target_path.exists() and target_path.is_file():
+            return self._describe_existing_pcd_asset(target_path)
+        source_path = self._locate_live_pcd_asset(include_active_version=False)
         if source_path is None:
-            if target_path.exists() and target_path.is_file():
-                return {
-                    "pcd_present": True,
-                    "pcd_source_kind": "persisted_asset",
-                    "pcd_source_path": str(target_path.resolve()),
-                    "pcd_target_path": str(target_path.resolve()),
-                    "pcd_target": self._file_metadata(target_path),
-                }
             return {
                 "pcd_present": False,
                 "pcd_source_kind": "unavailable",
                 "pcd_source_path": None,
-                "pcd_target_path": str(target_path.resolve()),
+                "pcd_target_path": str(target_path.resolve(strict=False)),
             }
         resolved_source = source_path.resolve()
-        resolved_target = target_path.resolve()
+        resolved_target = target_path.resolve(strict=False)
         if resolved_source != resolved_target:
             shutil.copy2(resolved_source, resolved_target)
+        target_metadata = self._file_metadata(resolved_target)
         return {
             "pcd_present": target_path.exists(),
             "pcd_source_kind": "live_runtime",
             "pcd_source_path": str(resolved_source),
             "pcd_target_path": str(resolved_target),
             "pcd_source": self._file_metadata(resolved_source),
-            "pcd_target": self._file_metadata(resolved_target),
+            "pcd_target": target_metadata,
+            "checksum_sha256": target_metadata.get("sha256"),
+        }
+
+    def _describe_existing_pcd_asset(self, path: Optional[Path]) -> Dict[str, object]:
+        if path is None:
+            return {"pcd_present": False, "pcd_source_kind": "unavailable", "pcd_source_path": None, "pcd_target_path": None}
+        resolved = path.expanduser().resolve(strict=False)
+        present = resolved.exists() and resolved.is_file()
+        metadata = self._file_metadata(resolved) if present else {"present": False, "path": str(resolved)}
+        return {
+            "pcd_present": present,
+            "pcd_source_kind": "persisted_asset",
+            "pcd_source_path": str(resolved) if present else None,
+            "pcd_target_path": str(resolved),
+            "pcd_target": metadata,
+            "checksum_sha256": metadata.get("sha256") if isinstance(metadata, dict) else None,
         }
 
     def _build_geometry_quality_metrics(
@@ -1846,6 +2011,7 @@ class PlatformGeometryRuntime:
                 "source_kind": database_metadata.get("database_source_kind"),
                 "source_path": database_metadata.get("database_source_path"),
                 "target_path": database_metadata.get("database_target_path"),
+                "checksum_sha256": database_metadata.get("checksum_sha256"),
                 "mtime_age_sec": live_db_mtime_age_sec,
                 "live_updating": live_db_updating,
                 "quality": "live_updating" if live_db_updating else "checkpoint_or_unknown",
@@ -1855,6 +2021,7 @@ class PlatformGeometryRuntime:
                 "source_kind": pcd_metadata.get("pcd_source_kind"),
                 "source_path": pcd_metadata.get("pcd_source_path"),
                 "target_path": pcd_metadata.get("pcd_target_path"),
+                "checksum_sha256": pcd_metadata.get("checksum_sha256"),
                 "quality": "present" if pcd_present else "unknown",
             },
             "diagnostics": diagnostics,
@@ -1862,6 +2029,8 @@ class PlatformGeometryRuntime:
 
     def _summarize_geometry_asset(self, geometry_asset: MapGeometryAssetBinding) -> Dict[str, object]:
         return {
+            "map_name": geometry_asset.map_name,
+            "version_id": geometry_asset.version_id,
             "geometry_stack": geometry_asset.geometry_stack,
             "frame_id": geometry_asset.frame_id,
             "rtabmap_db_path": geometry_asset.rtabmap_db_path,
@@ -1881,7 +2050,7 @@ class PlatformGeometryRuntime:
             stat = path.stat()
         except OSError as exc:
             return {"present": False, "error": str(exc), "path": str(path)}
-        return {
+        metadata = {
             "present": True,
             "path": str(path),
             "size_bytes": int(stat.st_size),
@@ -1889,10 +2058,19 @@ class PlatformGeometryRuntime:
             "mtime_ns": int(stat.st_mtime_ns),
             "mtime_iso": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
         }
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            metadata["sha256"] = digest.hexdigest()
+        except OSError as exc:
+            metadata["sha256_error"] = str(exc)
+        return metadata
 
     def _build_rtabmap_run_metadata(self) -> Dict[str, object]:
         process = self._managed_processes.get("rtabmap")
-        db_path = self._locate_live_rtabmap_database()
+        db_path = self._locate_live_rtabmap_database(include_active_version=False)
         started_at = process.started_at_iso if process is not None else None
         pid = process.process.pid if process is not None and process.process is not None and process.is_running() else None
         source = str(db_path.resolve()) if db_path is not None else None
@@ -2029,8 +2207,8 @@ class PlatformGeometryRuntime:
         summary["reason"] = "%s_missing" % source_kind
         return summary
 
-    def _locate_live_pcd_asset(self) -> Optional[Path]:
-        if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
+    def _locate_live_pcd_asset(self, *, include_active_version: bool = True) -> Optional[Path]:
+        if include_active_version and self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
             current_path = self._active_map_version.geometry_asset.pcd_path
             if current_path:
                 current_pcd = Path(current_path).expanduser()
@@ -2065,8 +2243,8 @@ class PlatformGeometryRuntime:
                 return candidate
         return None
 
-    def _locate_live_rtabmap_database(self) -> Optional[Path]:
-        if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
+    def _locate_live_rtabmap_database(self, *, include_active_version: bool = True) -> Optional[Path]:
+        if include_active_version and self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
             current_db = Path(self._active_map_version.geometry_asset.rtabmap_db_path).expanduser()
             if current_db.exists() and current_db.is_file():
                 return current_db
@@ -2088,6 +2266,8 @@ class PlatformGeometryRuntime:
         else:
             candidates.extend(
                 (
+                    self._rtabmap_database_path(),
+                    configured_root / "live_rtabmap.db",
                     configured_root / "rtabmap.db",
                     configured_root / "current.db",
                     configured_root / "active.db",
@@ -2109,39 +2289,131 @@ class PlatformGeometryRuntime:
             "frame_id": version.frame_id,
             "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset) if geometry_asset is not None else None,
         }
-        mapping_backend = self._resolve_mapping_backend()
-        if mapping_backend is None:
+        if geometry_asset is None:
+            return {**activation_payload, "backend_switch_applied": False, "reason": "geometry_asset_missing"}
+        db_path = Path(geometry_asset.rtabmap_db_path).expanduser()
+        if not db_path.exists() or not db_path.is_file():
+            return {**activation_payload, "backend_switch_applied": False, "reason": "rtabmap_database_missing"}
+        nav2_map = geometry_asset.metadata.get("nav2_map") if isinstance(geometry_asset.metadata.get("nav2_map"), dict) else {}
+        nav2_yaml_path = Path(str(nav2_map.get("yaml_path") or self._version_nav2_map_yaml_path(version.map_name, version.version_id))).expanduser()
+        if not nav2_yaml_path.exists() or not nav2_yaml_path.is_file():
+            nav2_map = self._materialize_nav2_map_assets(version)
+            nav2_yaml_path = Path(str(nav2_map.get("yaml_path") or nav2_yaml_path)).expanduser()
+        if not nav2_yaml_path.exists() or not nav2_yaml_path.is_file():
             return {
                 **activation_payload,
                 "backend_switch_applied": False,
-                "reason": "mapping_backend_unavailable",
+                "backend_map_loaded": False,
+                "active_backend_version_id": None,
+                "reason": "nav2_map_yaml_missing",
+                "nav2": {
+                    "backend_map_loaded": False,
+                    "map_yaml_path": str(nav2_yaml_path.resolve(strict=False)),
+                    "map_yaml_present": False,
+                    "nav2_map": self._clone_metadata(nav2_map),
+                },
             }
-        activator = getattr(mapping_backend, "activate_platform_map_version", None)
-        if not callable(activator):
+        mode = self._nav2_mode()
+        if mode in _NAV2_EXTERNAL_MODES:
             return {
                 **activation_payload,
                 "backend_switch_applied": False,
-                "reason": "backend_missing_activate_platform_map_version",
+                "backend_map_loaded": False,
+                "active_backend_version_id": None,
+                "reason": "external_nav2_requires_operator_reload_ack",
+                "nav2": {
+                    "mode": mode,
+                    "backend_map_loaded": False,
+                    "map_yaml_path": str(nav2_yaml_path.resolve(strict=False)),
+                    "map_yaml_present": nav2_yaml_path.exists() and nav2_yaml_path.is_file(),
+                    "switch_method": "external_nav2_not_mutated",
+                },
             }
-        result = activator(
-            map_name=version.map_name,
-            version_id=version.version_id,
-            geometry_asset=geometry_asset.model_dump(mode="json") if geometry_asset is not None else None,
-            metadata={
-                "source_name": version.source_name,
-                "source_version_id": version.source_version_id,
-            },
+        rtabmap_command = self._build_rtabmap_command(
+            database_path=db_path,
+            delete_db_on_start=False,
+            localization_mode=True,
         )
-        if isinstance(result, dict):
-            return {
-                **activation_payload,
-                "backend_switch_applied": True,
-                **self._clone_metadata(result),
-            }
+        rtabmap_process = self._restart_managed_process("rtabmap", rtabmap_command, "rtabmap_map_version.log")
+        nav2_result = self._activate_nav2_map_version(version=version, nav2_yaml_path=nav2_yaml_path)
+        rtabmap_ack = self._build_rtabmap_backend_ack(
+            version=version,
+            geometry_asset=geometry_asset,
+            process=rtabmap_process,
+        )
+        nav2_ack = {
+            **nav2_result,
+            "backend_map_loaded": bool(nav2_result.get("backend_map_loaded")),
+            "active_backend_version_id": version.version_id if nav2_result.get("backend_map_loaded") else None,
+        }
+        backend_switch_applied = bool(rtabmap_ack.get("backend_map_loaded") and nav2_ack.get("backend_map_loaded"))
+        reason = None if backend_switch_applied else "backend_switch_ack_incomplete"
         return {
             **activation_payload,
-            "backend_switch_applied": True,
-            "backend_result": result,
+            "backend_switch_applied": backend_switch_applied,
+            "backend_map_loaded": backend_switch_applied,
+            "active_backend_version_id": version.version_id if backend_switch_applied else None,
+            "rtabmap": rtabmap_ack,
+            "nav2": nav2_ack,
+            "nav2_map_yaml_path": str(nav2_yaml_path.resolve(strict=False)),
+            "reason": reason,
+        }
+
+    def _activate_nav2_map_version(self, *, version: MapVersion, nav2_yaml_path: Path) -> Dict[str, object]:
+        mode = self._nav2_mode()
+        payload = {
+            "mode": mode,
+            "map_yaml_path": str(nav2_yaml_path.resolve(strict=False)),
+            "map_yaml_present": nav2_yaml_path.exists() and nav2_yaml_path.is_file(),
+        }
+        if mode in _NAV2_DISABLED_MODES:
+            return {**payload, "backend_map_loaded": False, "reason": "nav2_disabled"}
+        if not bool(payload["map_yaml_present"]):
+            return {**payload, "backend_map_loaded": False, "reason": "nav2_map_yaml_missing"}
+        if mode in _NAV2_SIDECAR_MODES:
+            process = self._restart_managed_process(
+                "nav2",
+                self._build_nav2_command(map_yaml_override=nav2_yaml_path),
+                "nav2_map_version.log",
+            )
+            return {
+                **payload,
+                "backend_map_loaded": process.is_running(),
+                "active_backend_version_id": version.version_id if process.is_running() else None,
+                "process": process.status(),
+                "switch_method": "restart_nav2_sidecar_with_map_yaml",
+            }
+        if mode in _NAV2_EXTERNAL_MODES:
+            return {
+                **payload,
+                "backend_map_loaded": False,
+                "reason": "external_nav2_requires_operator_reload_ack",
+                "switch_method": "external_nav2_not_mutated",
+            }
+        return {**payload, "backend_map_loaded": False, "reason": "nav2_mode_unsupported"}
+
+    def _build_rtabmap_backend_ack(
+        self,
+        *,
+        version: MapVersion,
+        geometry_asset: MapGeometryAssetBinding,
+        process: _ManagedProcess,
+    ) -> Dict[str, object]:
+        db_path = Path(geometry_asset.rtabmap_db_path).expanduser().resolve(strict=False)
+        process_status = process.status()
+        command = [str(item) for item in process.command]
+        database_arg = "database_path:=%s" % db_path
+        delete_on_start = any("--delete_db_on_start" in item for item in command)
+        loaded = bool(process.is_running() and database_arg in command and not delete_on_start)
+        return {
+            "backend_map_loaded": loaded,
+            "active_backend_version_id": version.version_id if loaded else None,
+            "rtabmap_db_path": str(db_path),
+            "database_arg": database_arg,
+            "delete_db_on_start": delete_on_start,
+            "localization_mode": any("localization:=true" == item for item in command),
+            "process": process_status,
+            "switch_method": "restart_rtabmap_localization_with_version_database",
         }
 
     def _wait_for_geometry_snapshot(self, *, timeout_sec: float) -> Optional[MapSnapshot]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 import time
 from typing import Dict, Optional, Tuple, Any, Callable, TYPE_CHECKING
 
@@ -29,6 +30,15 @@ class Go2ClientFactories:
     video_client_factory: Callable[[], Any]
     vui_client_factory: Callable[[], Any]
     low_level_controller_factory: Callable[[Optional[str]], Any]
+
+
+def _prepare_go2_sdk_path(config: "NuwaxRobotBridgeConfig") -> None:
+    sdk_path = str(getattr(getattr(config, "dds", None), "sdk_path", "") or "").strip()
+    if not sdk_path:
+        return
+    normalized = str(Path(sdk_path).expanduser())
+    if normalized not in sys.path:
+        sys.path.insert(0, normalized)
 
 
 def _load_default_factories() -> Go2ClientFactories:
@@ -69,6 +79,7 @@ class Go2RobotAssembly(RobotAssemblyBase):
     data_plane_runtime: Optional[Go2DataPlaneRuntime] = None
 
     def __post_init__(self) -> None:
+        _prepare_go2_sdk_path(self.config)
         self.factories = self.factories or _load_default_factories()
         self.defaults = build_go2_defaults(self.config, self.iface)
         self.manifest = build_go2_manifest(self.config)
@@ -95,6 +106,8 @@ class Go2RobotAssembly(RobotAssemblyBase):
         self.low_level_controller = None
         self.high_level_initialized = False
         self.current_mode = "high"
+        self._last_motion_stop_routes: List[str] = []
+        self._last_motion_stop_errors: List[str] = []
         for adapter in self.prebound_adapters:
             self.bind_adapter(adapter)
 
@@ -180,7 +193,44 @@ class Go2RobotAssembly(RobotAssemblyBase):
         """执行统一停止。"""
 
         del reason
-        self.stop_move()
+        stopped_routes: List[str] = []
+        errors: List[str] = []
+
+        data_plane_stop = getattr(self.data_plane, "stop_motion_command", None)
+        if callable(data_plane_stop):
+            try:
+                data_plane_stop()
+                stopped_routes.append("data_plane_motion")
+            except Exception as exc:
+                errors.append(f"data_plane_motion: {exc}")
+
+        if self.low_level_controller is not None:
+            try:
+                stop_motion = getattr(self.low_level_controller, "stop_motion", None)
+                if callable(stop_motion):
+                    stop_motion()
+                else:
+                    self.low_level_controller.stop()
+                self.low_level_controller = None
+                self.current_mode = "high"
+                stopped_routes.append("lowcmd")
+            except Exception as exc:
+                errors.append(f"lowcmd: {exc}")
+
+        if self.sport_client is not None:
+            try:
+                code = self.sport_client.StopMove()
+                if code not in (0, None):
+                    errors.append(f"sport: code={code}")
+                else:
+                    stopped_routes.append("sport")
+            except Exception as exc:
+                errors.append(f"sport: {exc}")
+
+        self._last_motion_stop_routes = stopped_routes
+        self._last_motion_stop_errors = errors
+        if errors:
+            raise RuntimeError("Go2 统一停止部分通道失败: " + "; ".join(errors))
 
     def build_default_perception_pipeline(self) -> Dict[str, Any]:
         """构造 Go2 默认感知处理管线。
@@ -330,6 +380,11 @@ class Go2RobotAssembly(RobotAssemblyBase):
         if self.sport_client is None or self.video_client is None or self.vui_client is None:
             raise RuntimeError("Go2 高层客户端未初始化")
 
+    def _require_high_level_motion(self) -> None:
+        if self.current_mode == "low":
+            raise RuntimeError("Go2 当前处于低层控制模式，不能下发高层速度命令。")
+        self._require_high_level()
+
     def _require_low_level(self) -> None:
         if self.current_mode != "low" or self.low_level_controller is None:
             raise RuntimeError("请先切换到低级别模式: switch_mode")
@@ -358,11 +413,11 @@ class Go2RobotAssembly(RobotAssemblyBase):
         return 0, {"filename": str(output_path), "size": len(image_bytes)}
 
     def move(self, vx: float, vy: float, vyaw: float) -> int:
-        self._require_high_level()
+        self._require_high_level_motion()
         return self.sport_client.Move(vx, vy, vyaw)
 
     def move_for(self, vx: float, vy: float, vyaw: float, duration: float) -> int:
-        self._require_high_level()
+        self._require_high_level_motion()
         start_time = time.time()
         while time.time() - start_time < duration:
             code = self.sport_client.Move(vx, vy, vyaw)
@@ -563,9 +618,7 @@ class Go2RobotAssembly(RobotAssemblyBase):
             return 0, self.low_level_controller.get_imu_state()
 
         if action == "pose_preset":
-            self._require_low_level()
-            success = self.low_level_controller.apply_pose_preset(params.get("name", "stand"))
-            return (0 if success else -1), None
+            return None, "pose_preset 当前未绑定 Go2 实机关节标定，已在能力矩阵中标记为不可用。"
 
         if action in GO2_CAPABILITY_DESCRIPTORS_BY_NAME:
             return None, f"动作 {action} 已声明，但当前装配入口尚未实现。"

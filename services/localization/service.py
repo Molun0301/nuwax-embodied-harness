@@ -115,7 +115,7 @@ class LocalizationService:
         """确保当前存在绑定到指定地图版本的平台定位会话。"""
 
         resolved_geometry_asset = self._clone_metadata(geometry_asset) if geometry_asset is not None else None
-        asset_failure = self._resolve_geometry_asset_failure(resolved_geometry_asset)
+        asset_failure = self._resolve_geometry_asset_failure(resolved_geometry_asset, map_version_id=map_version_id)
         existing = self._active_session
         if (
             existing is not None
@@ -254,7 +254,7 @@ class LocalizationService:
 
         # 映射到 LocalizationSessionStatus
         session_status = self._map_machine_state_to_session_status(machine_state)
-        asset_failure = self._resolve_geometry_asset_failure(session.geometry_asset)
+        asset_failure = self._resolve_geometry_asset_failure(session.geometry_asset, map_version_id=session.map_version_id)
         if asset_failure:
             session_status = LocalizationSessionStatus.FAILED
 
@@ -427,20 +427,38 @@ class LocalizationService:
             metadata=self._clone_metadata(item),
         )
 
-    def _resolve_geometry_asset_failure(self, geometry_asset: Optional[Dict[str, object]]) -> Optional[str]:
+    def _resolve_geometry_asset_failure(
+        self,
+        geometry_asset: Optional[Dict[str, object]],
+        *,
+        map_version_id: Optional[str] = None,
+    ) -> Optional[str]:
         if not geometry_asset:
             return None
         quality_metrics = geometry_asset.get("quality_metrics")
-        if not isinstance(quality_metrics, dict):
-            return None
-        if quality_metrics.get("status") == "failed":
-            for item in quality_metrics.get("diagnostics") or []:
-                if isinstance(item, dict) and item.get("level") == "error":
-                    return str(item.get("message") or item.get("code") or "几何资产不可用。")
-            return "几何资产不可用。"
-        database = quality_metrics.get("database")
-        if isinstance(database, dict) and database.get("present") is False:
-            return "地图版本缺少 RTAB-Map database 资产。"
+        if isinstance(quality_metrics, dict):
+            if quality_metrics.get("status") == "failed":
+                for item in quality_metrics.get("diagnostics") or []:
+                    if isinstance(item, dict) and item.get("level") == "error":
+                        return str(item.get("message") or item.get("code") or "几何资产不可用。")
+                return "几何资产不可用。"
+            database = quality_metrics.get("database")
+            if isinstance(database, dict) and database.get("present") is False:
+                return "地图版本缺少 RTAB-Map database 资产。"
+        expected_version_id = str(map_version_id or geometry_asset.get("version_id") or geometry_asset.get("platform_map_version_id") or "").strip()
+        backend_map_loaded = geometry_asset.get("backend_map_loaded")
+        backend_map_version_id = str(geometry_asset.get("backend_map_version_id") or "").strip()
+        if expected_version_id and backend_map_loaded is not True:
+            return "RTAB-Map/Nav2 后端尚未确认加载该地图版本。"
+        if expected_version_id and backend_map_version_id and backend_map_version_id != expected_version_id:
+            return "后端地图版本不一致：%s != %s。" % (backend_map_version_id, expected_version_id)
+        activation = geometry_asset.get("geometry_activation")
+        if isinstance(activation, dict):
+            if activation.get("backend_switch_applied") is False or activation.get("backend_map_loaded") is False:
+                return "RTAB-Map/Nav2 后端切换未确认：%s。" % (activation.get("reason") or "backend_switch_applied_false")
+            active_backend_version_id = str(activation.get("active_backend_version_id") or "").strip()
+            if expected_version_id and active_backend_version_id and active_backend_version_id != expected_version_id:
+                return "后端激活版本不一致：%s != %s。" % (active_backend_version_id, expected_version_id)
         return None
 
     def _resolve_candidate_asset_refs(

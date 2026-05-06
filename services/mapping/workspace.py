@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from datetime import datetime
 
 from contracts.events import RuntimeEventCategory
@@ -92,6 +95,11 @@ class MapWorkspaceService:
                 deep=True,
             )
         self._save_asset(asset)
+        self._append_operation_journal(
+            "map.catalog_created",
+            map_name=resolved_name,
+            payload={"created": True, "memory_library": resolved_name},
+        )
         self._publish_event(
             "map.catalog_created",
             "地图 %s 已创建。" % resolved_name,
@@ -157,6 +165,15 @@ class MapWorkspaceService:
                 "requested_by": (metadata or {}).get("requested_by", "unknown"),
                 "source": "activate_map",
             }
+        )
+        self._append_operation_journal(
+            "map.workspace_activated",
+            map_name=resolved_name,
+            payload={
+                "previous_active_map_name": previous_active_map_name,
+                "load_latest_version": bool(load_latest_version),
+                "reset_memory_library": bool(reset_memory_library),
+            },
         )
         self._publish_event(
             "map.workspace_activated",
@@ -302,7 +319,10 @@ class MapWorkspaceService:
             },
         )
         version = self._version_repository.save_existing_map_version(
-            self._geometry_runtime.prepare_map_version_assets(version)
+            self._attach_memory_checkpoint_to_version(
+                self._geometry_runtime.prepare_map_version_assets(version),
+                map_name=resolved_name,
+            )
         )
         asset = self._repository.get_map_asset(resolved_name)
         if asset is None:
@@ -322,6 +342,16 @@ class MapWorkspaceService:
                 deep=True,
             ),
             is_active=(self._repository.get_active_map_name() == resolved_name),
+        )
+        self._append_operation_journal(
+            "map.version_saved",
+            map_name=resolved_name,
+            version_id=version.version_id,
+            payload={
+                "revision": version.revision,
+                "memory_checkpoint": version.metadata.get("memory_checkpoint"),
+                "bundle_manifest_path": version.metadata.get("bundle_manifest_path"),
+            },
         )
         self._publish_event(
             "map.version_saved",
@@ -390,6 +420,16 @@ class MapWorkspaceService:
             is_active=(self._repository.get_active_map_name() == resolved_name),
         )
         workspace = self.get_active_workspace() or self._build_workspace(synced_asset)
+        self._append_operation_journal(
+            "map.version_loaded",
+            map_name=resolved_name,
+            version_id=version.version_id,
+            payload={
+                "revision": version.revision,
+                "memory_checkpoint": version.metadata.get("memory_checkpoint"),
+                "bundle_manifest_path": version.metadata.get("bundle_manifest_path"),
+            },
+        )
         self._publish_event(
             "map.version_loaded",
             "地图 %s 已加载平台版本 %s。" % (resolved_name, version.version_id),
@@ -537,6 +577,15 @@ class MapWorkspaceService:
             source="map_workspace_service",
             metadata={"kind": "map_delete_result"},
         )
+        self._append_operation_journal(
+            "map.catalog_deleted",
+            map_name=resolved_name,
+            payload={
+                "deleted": deleted,
+                "deleted_memory_library": deleted_memory_library,
+                "was_active": was_active,
+            },
+        )
         self._publish_event(
             "map.catalog_deleted",
             "地图 %s 已删除。" % resolved_name if deleted else "地图 %s 不存在。" % resolved_name,
@@ -590,6 +639,7 @@ class MapWorkspaceService:
             source="map_workspace_service",
             metadata={"kind": "active_workspace", "map_name": asset.map_name},
         )
+        self._write_workspace_manifest(workspace)
         return workspace
 
     def _sync_asset(self, asset: MapAsset, *, is_active: bool) -> MapAsset:
@@ -662,8 +712,23 @@ class MapWorkspaceService:
 
     def _resolve_geometry_asset_summary(self, latest_map_snapshot) -> Optional[Dict[str, object]]:
         summary = latest_map_snapshot.metadata.get("geometry_asset_summary")
+        activation = latest_map_snapshot.metadata.get("geometry_activation")
+        backend_map_version_id = None
+        backend_map_loaded = None
+        if isinstance(activation, dict):
+            backend_map_version_id = activation.get("active_backend_version_id")
+            backend_map_loaded = activation.get("backend_map_loaded") or activation.get("backend_switch_applied")
+        common = {
+            "geometry_activation": activation,
+            "backend_map_loaded": backend_map_loaded,
+            "backend_map_version_id": backend_map_version_id,
+            "snapshot_version_id": latest_map_snapshot.version_id,
+            "platform_map_version_id": latest_map_snapshot.metadata.get("platform_map_version_id") or latest_map_snapshot.metadata.get("seed_map_version_id"),
+            "nav2_map_yaml_path": latest_map_snapshot.metadata.get("nav2_map_yaml_path"),
+            "nav2_map_ready": latest_map_snapshot.metadata.get("nav2_map_ready"),
+        }
         if isinstance(summary, dict):
-            return dict(summary)
+            return {**dict(summary), **common}
         asset_refs = latest_map_snapshot.metadata.get("geometry_assets")
         quality_metrics = latest_map_snapshot.metadata.get("quality_metrics")
         if asset_refs is None and quality_metrics is None:
@@ -684,16 +749,26 @@ class MapWorkspaceService:
             "run_id": latest_map_snapshot.metadata.get("rtabmap_run_id") or latest_map_snapshot.metadata.get("run_id"),
             "database": latest_map_snapshot.metadata.get("database"),
             "pcd": latest_map_snapshot.metadata.get("pcd"),
+            **common,
         }
 
     def _load_map_version_into_runtime(self, version: MapVersion) -> None:
         prepared_version = version
         if prepared_version.geometry_asset is None:
             prepared_version = self._version_repository.save_existing_map_version(
-                self._geometry_runtime.prepare_map_version_assets(prepared_version)
+                self._attach_memory_checkpoint_to_version(
+                    self._geometry_runtime.prepare_map_version_assets(prepared_version),
+                    map_name=prepared_version.map_name,
+                )
+            )
+        elif not isinstance(prepared_version.metadata.get("bundle_manifest"), dict):
+            prepared_version = self._version_repository.save_existing_map_version(
+                self._attach_memory_checkpoint_to_version(prepared_version, map_name=prepared_version.map_name)
             )
         runtime_snapshot = self._geometry_runtime.activate_map_version(prepared_version)
         runtime_metadata = dict(runtime_snapshot.metadata or {})
+        activation = runtime_metadata.get("geometry_activation") if isinstance(runtime_metadata.get("geometry_activation"), dict) else {}
+        backend_switched = bool(activation.get("backend_switch_applied") and activation.get("active_backend_version_id") == prepared_version.version_id)
         live_streaming_snapshot = bool(
             runtime_metadata.get("map_snapshot_kind") == "live_streaming"
             or runtime_metadata.get("source_kind") == "platform_live_map_provider"
@@ -707,18 +782,81 @@ class MapWorkspaceService:
             "semantic_map": runtime_snapshot.semantic_map,
             "metadata": {
                 **runtime_metadata,
+                "platform_map_version_id": prepared_version.version_id,
+                "platform_map_version_revision": prepared_version.revision,
                 "seed_map_name": prepared_version.map_name,
                 "seed_map_version_id": prepared_version.version_id,
                 "seed_map_version_revision": prepared_version.revision,
-                "loaded_as_seed": True,
-                "continues_live_updates": True,
+                "loaded_as_seed": bool(live_streaming_snapshot and not backend_switched),
+                "continues_live_updates": bool(live_streaming_snapshot),
+                "backend_version_bound": backend_switched,
             },
         }
-        if not live_streaming_snapshot:
+        if backend_switched or not live_streaming_snapshot:
             ingest_kwargs["version_id_override"] = prepared_version.version_id
             ingest_kwargs["revision_override"] = prepared_version.revision
         self._mapping_service.ingest_external_snapshot(**ingest_kwargs)
         self._localization_service.clear_latest_snapshot()
+
+    def _attach_memory_checkpoint_to_version(self, version: MapVersion, *, map_name: str) -> MapVersion:
+        checkpoint = self._memory_service.build_memory_checkpoint(library_name=map_name)
+        return version.model_copy(
+            update={
+                "metadata": {
+                    **dict(version.metadata),
+                    "memory_checkpoint": checkpoint,
+                    "bundle_manifest_path": self._version_repository.bundle_manifest_path(version.map_name, version.version_id),
+                    "bundle_manifest_schema": "map_version_bundle_manifest.v1",
+                }
+            },
+            deep=True,
+        )
+
+    def _write_workspace_manifest(self, workspace: MapWorkspace) -> None:
+        manifest = {
+            "schema_version": "map_workspace_manifest.v1",
+            "active_map_name": workspace.active_map_name,
+            "active_memory_library_name": workspace.active_memory_library_name,
+            "map_loaded": workspace.map_loaded,
+            "localization_ready": workspace.localization_ready,
+            "latest_version_id": workspace.map_asset.latest_version_id if workspace.map_asset is not None else None,
+            "latest_revision": workspace.map_asset.latest_revision if workspace.map_asset is not None else None,
+            "frame_id": workspace.map_asset.frame_id if workspace.map_asset is not None else None,
+            "memory_checkpoint": self._memory_service.build_memory_checkpoint(library_name=workspace.active_memory_library_name),
+            "artifact_link_diagnostics": self._memory_service.diagnose_artifact_links(library_name=workspace.active_memory_library_name),
+            "catalog_root": self.catalog_root,
+        }
+        manifest["workspace_hash"] = hashlib.sha256(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        path = self._repository.root_dir / "workspace_manifest.json"
+        self._write_json_atomic(path, manifest)
+
+    def _append_operation_journal(
+        self,
+        event_type: str,
+        *,
+        map_name: Optional[str] = None,
+        version_id: Optional[str] = None,
+        payload: Optional[Dict[str, object]] = None,
+    ) -> None:
+        item = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "event_type": event_type,
+            "map_name": map_name,
+            "version_id": version_id,
+            "payload": dict(payload or {}),
+        }
+        journal_path = self._repository.root_dir / "operation_journal.jsonl"
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with journal_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _write_json_atomic(self, path, payload: Dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(".%s.tmp" % path.name)
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp_path, path)
 
     def _require_map_version(self, map_name: str, version_id: str) -> MapVersion:
         version = self._version_repository.get_map_version(map_name, version_id)

@@ -52,6 +52,11 @@ class ArtifactService:
 
         return self._store.build_summary()
 
+    def diagnose_links(self) -> Dict[str, object]:
+        """诊断制品引用索引中的断链。"""
+
+        return self._store.diagnose_reference_links()
+
     def cleanup_if_needed(self) -> ArtifactCleanupResult:
         """按策略执行制品清理。"""
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import math
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -93,6 +94,7 @@ class Nav2ActionNavigationProvider:
         self._last_lifecycle_status: Dict[str, object] = {}
         self._global_costmap = _CostmapTopicState(str(runtime.config.nav2.global_costmap_topic or "/global_costmap/costmap"))
         self._local_costmap = _CostmapTopicState(str(runtime.config.nav2.local_costmap_topic or "/local_costmap/costmap"))
+        self._active_goal: Optional[NavigationGoal] = None
         self._state = NavigationState(
             status=NavigationStatus.IDLE,
             message="Nav2 action 导航空闲。",
@@ -108,9 +110,13 @@ class Nav2ActionNavigationProvider:
     def set_goal(self, goal: NavigationGoal) -> bool:
         readiness = self._readiness()
         if not readiness.ready:
+            with self._lock:
+                self._active_goal = None
             self._set_blocked_state(goal.goal_id, readiness)
             return False
         if goal.target_pose is None:
+            with self._lock:
+                self._active_goal = None
             self._state = NavigationState(
                 current_goal_id=goal.goal_id,
                 status=NavigationStatus.FAILED,
@@ -123,6 +129,8 @@ class Nav2ActionNavigationProvider:
             future = self._action_client.send_goal_async(goal_msg, feedback_callback=self._on_feedback)
             future.add_done_callback(lambda completed: self._on_goal_response(completed, goal.goal_id))
         except Exception as exc:
+            with self._lock:
+                self._active_goal = None
             self._state = NavigationState(
                 current_goal_id=goal.goal_id,
                 status=NavigationStatus.FAILED,
@@ -130,14 +138,16 @@ class Nav2ActionNavigationProvider:
                 metadata={"backend": "nav2", "failure_reason": "action_send_failed", "error": str(exc)},
             )
             return False
-        self._state = NavigationState(
-            current_goal_id=goal.goal_id,
-            status=NavigationStatus.ACCEPTED,
-            current_pose=self._read_current_pose(),
-            goal_reached=False,
-            message="Nav2 /navigate_to_pose 目标已发送，等待 action server 接受。",
-            metadata={"backend": "nav2", "action_name": self.runtime.config.nav2.action_name, "readiness": self._status_dict(readiness)},
-        )
+        with self._lock:
+            self._active_goal = goal.model_copy(deep=True)
+            self._state = NavigationState(
+                current_goal_id=goal.goal_id,
+                status=NavigationStatus.ACCEPTED,
+                current_pose=self._read_current_pose(),
+                goal_reached=False,
+                message="Nav2 /navigate_to_pose 目标已发送，等待 action server 接受。",
+                metadata={"backend": "nav2", "action_name": self.runtime.config.nav2.action_name, "readiness": self._status_dict(readiness)},
+            )
         return True
 
     def cancel_goal(self) -> bool:
@@ -152,6 +162,7 @@ class Nav2ActionNavigationProvider:
         with self._lock:
             self._goal_handle = None
             self._result_future = None
+            self._active_goal = None
             self._state = NavigationState(
                 current_goal_id=current_goal_id,
                 status=NavigationStatus.CANCELLED,
@@ -401,6 +412,7 @@ class Nav2ActionNavigationProvider:
             return
         with self._lock:
             if not getattr(goal_handle, "accepted", False):
+                self._active_goal = None
                 self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action server 拒绝导航目标。", metadata={"backend": "nav2", "failure_reason": "goal_rejected"})
                 return
             self._goal_handle = goal_handle
@@ -433,10 +445,18 @@ class Nav2ActionNavigationProvider:
             with self._lock:
                 self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action result 读取失败：%s" % exc, metadata={"backend": "nav2", "failure_reason": "result_error", "error": str(exc)})
             return
-        if status_code == 4:
+        with self._lock:
+            active_goal = self._active_goal.model_copy(deep=True) if self._active_goal is not None else None
+        current_pose = self._read_current_pose()
+        tolerance_check = self._check_goal_tolerance(active_goal, current_pose) if status_code == 4 else {"checked": False}
+        if status_code == 4 and tolerance_check.get("within_tolerance"):
             status = NavigationStatus.SUCCEEDED
-            message = "Nav2 导航目标已到达。"
+            message = "Nav2 导航目标已到达，平台位姿容差复核通过。"
             goal_reached = True
+        elif status_code == 4:
+            status = NavigationStatus.FAILED
+            message = "Nav2 返回成功，但平台最终位姿容差复核失败。"
+            goal_reached = False
         elif status_code in {5, 6}:
             status = NavigationStatus.CANCELLED if status_code == 5 else NavigationStatus.FAILED
             message = "Nav2 导航已取消。" if status_code == 5 else "Nav2 导航失败或被中止。"
@@ -448,14 +468,65 @@ class Nav2ActionNavigationProvider:
         with self._lock:
             self._goal_handle = None
             self._result_future = None
+            self._active_goal = None
             self._state = NavigationState(
                 current_goal_id=goal_id,
                 status=status,
-                current_pose=self._read_current_pose(),
+                current_pose=current_pose,
                 goal_reached=goal_reached,
+                remaining_distance_m=tolerance_check.get("position_error_m") if status_code == 4 else None,
+                remaining_yaw_rad=tolerance_check.get("yaw_error_rad") if status_code == 4 else None,
                 message=message,
-                metadata={"backend": "nav2", "action_status_code": status_code, "action_name": self.runtime.config.nav2.action_name},
+                metadata={
+                    "backend": "nav2",
+                    "action_status_code": status_code,
+                    "action_name": self.runtime.config.nav2.action_name,
+                    "arrival_tolerance_check": tolerance_check,
+                },
             )
+
+    def _check_goal_tolerance(self, goal: Optional[NavigationGoal], current_pose: Optional[Pose]) -> Dict[str, object]:
+        if goal is None or goal.target_pose is None:
+            return {"checked": False, "within_tolerance": False, "reason": "active_goal_missing"}
+        if current_pose is None:
+            return {"checked": False, "within_tolerance": False, "reason": "current_pose_missing"}
+        target_pose = goal.target_pose
+        position_error = math.sqrt(
+            (float(current_pose.position.x) - float(target_pose.position.x)) ** 2
+            + (float(current_pose.position.y) - float(target_pose.position.y)) ** 2
+            + (float(current_pose.position.z) - float(target_pose.position.z)) ** 2
+        )
+        yaw_error = abs(self._normalize_angle(self._pose_yaw(current_pose) - self._pose_yaw(target_pose)))
+        position_tolerance = float(goal.tolerance_position_m)
+        yaw_tolerance = float(goal.tolerance_yaw_rad)
+        frame_match = str(current_pose.frame_id or "").strip() == str(target_pose.frame_id or "").strip()
+        within_tolerance = bool(frame_match and position_error <= position_tolerance and yaw_error <= yaw_tolerance)
+        return {
+            "checked": True,
+            "within_tolerance": within_tolerance,
+            "frame_match": frame_match,
+            "current_frame_id": current_pose.frame_id,
+            "target_frame_id": target_pose.frame_id,
+            "position_error_m": position_error,
+            "yaw_error_rad": yaw_error,
+            "tolerance_position_m": position_tolerance,
+            "tolerance_yaw_rad": yaw_tolerance,
+        }
+
+    @staticmethod
+    def _pose_yaw(pose: Pose) -> float:
+        orientation = pose.orientation
+        siny_cosp = 2.0 * (float(orientation.w) * float(orientation.z) + float(orientation.x) * float(orientation.y))
+        cosy_cosp = 1.0 - 2.0 * (float(orientation.y) * float(orientation.y) + float(orientation.z) * float(orientation.z))
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    @staticmethod
+    def _normalize_angle(value: float) -> float:
+        while value > math.pi:
+            value -= 2.0 * math.pi
+        while value < -math.pi:
+            value += 2.0 * math.pi
+        return value
 
     def _on_global_costmap(self, message: Any) -> None:
         with self._lock:

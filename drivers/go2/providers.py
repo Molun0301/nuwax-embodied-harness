@@ -54,6 +54,10 @@ class Go2ProviderBundle(
     assembly: "Go2RobotAssembly"
     provider_name: str = "go2_default_bundle"
     provider_version: str = "0.1.0"
+    safety_guard: Optional[object] = None
+
+    def bind_safety_guard(self, safety_guard: object) -> None:
+        self.safety_guard = safety_guard
 
     def is_available(self) -> bool:
         return self.assembly.high_level_initialized
@@ -65,14 +69,23 @@ class Go2ProviderBundle(
         return self.assembly.high_level_initialized
 
     def get_robot_state(self) -> RobotState:
+        low_level_running = bool(
+            self.assembly.low_level_controller is not None
+            and getattr(self.assembly.low_level_controller, "is_running", False)
+        )
         metadata = {
             "control_mode": self.assembly.current_mode,
             "mode_state": {
                 "control_mode": self.assembly.current_mode,
                 "low_level_ready": self.assembly.low_level_controller is not None,
+                "low_level_running": low_level_running,
                 "high_level_initialized": self.assembly.high_level_initialized,
             },
             "low_level_ready": self.assembly.low_level_controller is not None,
+            "low_level_running": low_level_running,
+            "motion_stop_routes": list(getattr(self.assembly, "_last_motion_stop_routes", [])),
+            "motion_stop_errors": list(getattr(self.assembly, "_last_motion_stop_errors", [])),
+            "safe_stop": self._get_safe_stop_state(),
             "default_sensors": list(self.assembly.manifest.default_sensors),
             "default_audio_backends": list(self.assembly.manifest.default_audio_backends),
         }
@@ -82,7 +95,12 @@ class Go2ProviderBundle(
             metadata["robot_volume"] = None
         metadata["volume_state"] = metadata["robot_volume"]
         if self.assembly.data_plane is not None:
-            metadata["data_plane"] = self.assembly.data_plane.get_status()
+            data_plane_status = self.assembly.data_plane.get_status()
+            metadata["data_plane"] = data_plane_status
+            obstacle_status = data_plane_status.get("obstacle_avoidance") if isinstance(data_plane_status, dict) else None
+            if isinstance(obstacle_status, dict):
+                metadata["remote_command_enabled"] = bool(obstacle_status.get("remote_command_enabled", False))
+                metadata["motion_command_route"] = obstacle_status.get("control_path")
 
         return RobotState(
             robot_id=self.assembly.defaults.parameters["robot_id"],
@@ -240,6 +258,8 @@ class Go2ProviderBundle(
             unsubscriber(subscription_id)
 
     def send_twist(self, twist: Twist) -> None:
+        if self.assembly.current_mode == "low":
+            raise RuntimeError("Go2 当前处于低层控制模式，不能通过高层速度链下发运动命令。")
         data_plane = _resolve_motion_command_data_plane(self.assembly.data_plane)
         if data_plane is not None:
             code = data_plane.send_motion_command(
@@ -257,19 +277,31 @@ class Go2ProviderBundle(
         )
 
     def stop_motion(self) -> None:
-        data_plane = _resolve_motion_command_data_plane(self.assembly.data_plane)
-        if data_plane is not None:
-            data_plane.stop_motion_command()
-            return
-        self.assembly.stop_move()
+        self.assembly.stop_all_motion(None)
 
     def get_safety_state(self) -> SafetyState:
+        safe_stop_state = self._get_safe_stop_state()
+        is_estopped = bool(safe_stop_state.get("is_estopped", False))
         return SafetyState(
-            is_estopped=False,
+            is_estopped=is_estopped,
             motors_enabled=self.assembly.high_level_initialized,
-            can_move=self.assembly.high_level_initialized,
-            warning_message=None,
+            can_move=self.assembly.high_level_initialized and not is_estopped,
+            warning_message=str(safe_stop_state.get("last_stop_reason") or "安全停止门禁处于激活状态。") if is_estopped else None,
         )
 
+    def _get_safe_stop_state(self) -> Dict[str, object]:
+        if self.safety_guard is None:
+            return {}
+        state_getter = getattr(self.safety_guard, "get_safe_stop_state", None)
+        if not callable(state_getter):
+            return {}
+        state = state_getter()
+        return dict(state) if isinstance(state, dict) else {}
+
     def request_safe_stop(self, reason: Optional[str] = None) -> None:
+        safe_stop_active = bool(getattr(self.safety_guard, "safe_stop_active", False))
+        stop_all_motion = getattr(self.safety_guard, "stop_all_motion", None)
+        if callable(stop_all_motion) and not safe_stop_active:
+            stop_all_motion(reason)
+            return
         self.assembly.stop_all_motion(reason)

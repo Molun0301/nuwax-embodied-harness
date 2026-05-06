@@ -110,6 +110,30 @@ _OPS_DEBUG_CAPABILITY_NAMES = frozenset(
     }
 )
 
+_SAFE_STOP_GATED_RESOURCE_NAMES = frozenset(
+    {
+        RuntimeResource.BASE_MOTION.value,
+        RuntimeResource.NAVIGATION.value,
+    }
+)
+_SAFE_STOP_GATED_CAPABILITY_NAMES = frozenset(
+    {
+        "relative_move",
+        "follow_target",
+        "navigate_to_pose",
+        "navigate_to_named_location",
+        "find_target",
+        "explore_area",
+        "explore_and_find_target",
+        "inspect_target",
+        "execute_sport_command",
+        "set_body_pose",
+        "set_speed_level",
+        "switch_control_mode",
+        "set_obstacle_avoidance",
+    }
+)
+
 
 def _schema_object(
     properties: Optional[Dict[str, Dict[str, object]]] = None,
@@ -338,6 +362,7 @@ class GatewayRuntime:
             embedding_base_url=config.runtime_data.memory_embedding_base_url,
             embedding_timeout_sec=config.runtime_data.memory_embedding_timeout_sec,
         )
+        self.artifact_store.set_reference_provider(self.memory_service.build_artifact_reference_index)
         self.perception_video_runtime._memory_service = self.memory_service
         self.navigation_service = NavigationService(
             provider_owner=self.platform_geometry_runtime,
@@ -374,6 +399,10 @@ class GatewayRuntime:
         self._gateway_capability_names: Tuple[str, ...] = ()
 
         self.capability_registry.bind_robot_capability_matrix(robot.manifest.capability_matrix)
+        providers = getattr(self.robot, "providers", None)
+        bind_safety_guard = getattr(providers, "bind_safety_guard", None)
+        if callable(bind_safety_guard):
+            bind_safety_guard(self.safety_guard)
         self.safety_guard.register_stop_handler("robot_entry", self._safe_stop_robot)
 
         if register_default_capabilities:
@@ -431,6 +460,13 @@ class GatewayRuntime:
                 return
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
             self.safety_guard.stop_all_motion("宿主机网关关闭。")
+            cancelled_task_ids = self.task_manager.cancel_all_active_tasks("宿主机网关关闭。")
+            if cancelled_task_ids:
+                RUNTIME_LOGGER.info(
+                    "宿主机网关关闭时已收口活动任务 count=%s task_ids=%s",
+                    len(cancelled_task_ids),
+                    ",".join(cancelled_task_ids),
+                )
             self.task_manager.shutdown(wait=False)
             self.audio_service.stop()
             self._stop_data_frame_stream_sources()
@@ -973,11 +1009,20 @@ class GatewayRuntime:
             _descriptor(
                 "stop_all_motion",
                 "安全停止",
-                "触发全局安全停止，立即停止底盘运动。",
+                "触发全局安全停止，立即停止底盘运动并保持急停门禁。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object({"reason": {"type": "string"}}),
-                output_schema=_schema_object({"stopped": {"type": "boolean"}}),
+                output_schema=_schema_object({"stopped": {"type": "boolean"}, "safety_state": {"type": "object"}}),
+            ),
+            _descriptor(
+                "recover_safe_stop",
+                "恢复安全停止",
+                "显式解除全局安全停止门禁，允许后续运动和导航能力重新提交。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.ADMIN,
+                input_schema=_schema_object({"reason": {"type": "string"}}),
+                output_schema=_schema_object({"recovered": {"type": "boolean"}, "safety_state": {"type": "object"}}),
             ),
             _descriptor(
                 "capture_image",
@@ -1802,6 +1847,7 @@ class GatewayRuntime:
             "get_task_status": self._handle_get_task_status,
             "cancel_task": self._handle_cancel_task,
             "stop_all_motion": self._handle_stop_all_motion,
+            "recover_safe_stop": self._handle_recover_safe_stop,
             "capture_image": self._handle_capture_image,
             "get_joint_state": self._handle_get_joint_state,
             "get_imu_state": self._handle_get_imu_state,
@@ -1916,9 +1962,16 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="stop_all_motion",
                 display_name="安全停止",
-                description="立即触发全局安全停止。",
+                description="立即触发全局安全停止并保持急停门禁。",
                 category=SkillCategory.SYSTEM,
                 capability_name="stop_all_motion",
+            ),
+            SkillDescriptor(
+                name="recover_safe_stop",
+                display_name="恢复安全停止",
+                description="显式解除全局安全停止门禁。",
+                category=SkillCategory.ADMIN,
+                capability_name="recover_safe_stop",
             ),
             SkillDescriptor(
                 name="get_localization_snapshot",
@@ -2432,6 +2485,7 @@ class GatewayRuntime:
             message=f"能力 {descriptor.name} 调用开始。",
         )
         try:
+            self._ensure_safe_stop_allows_capability(descriptor)
             if descriptor.execution_mode == CapabilityExecutionMode.ASYNC_TASK:
                 result = registration.handler(payload, requested_by=requested_by, request_context=context)
             else:
@@ -2591,6 +2645,7 @@ class GatewayRuntime:
                 "localization_session_id": getattr(localization_session, "session_id", None),
                 "geometry_runtime": self.platform_geometry_runtime.get_runtime_status(),
                 "live_mapping_diagnostics": self.platform_geometry_runtime.get_live_mapping_diagnostics(),
+                "safe_stop": self.safety_guard.get_safe_stop_state(),
             },
         )
 
@@ -2924,7 +2979,12 @@ class GatewayRuntime:
     def _handle_stop_all_motion(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         reason = arguments.get("reason") or f"{requested_by or 'unknown'} 请求安全停止。"
         self.safety_guard.stop_all_motion(reason)
-        return {"stopped": True, "reason": reason}
+        return {"stopped": True, "reason": reason, "safety_state": self.safety_guard.get_safe_stop_state()}
+
+    def _handle_recover_safe_stop(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
+        reason = arguments.get("reason") or f"{requested_by or 'unknown'} 请求恢复安全停止。"
+        state = self.safety_guard.clear_safe_stop(reason)
+        return {"recovered": True, "reason": reason, "safety_state": state}
 
     def _handle_capture_image(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         camera_id = arguments.get("camera_id")
@@ -4737,8 +4797,6 @@ class GatewayRuntime:
     def _workspace_requires_localization_before_explore(self, workspace) -> bool:
         if workspace is None or workspace.map_asset is None:
             return False
-        if workspace.map_loaded:
-            return True
         return bool(workspace.map_asset.latest_version_id)
 
     def _ensure_localization_ready(
@@ -4748,7 +4806,10 @@ class GatewayRuntime:
         map_name: str,
         workspace,
     ):
-        localization_session = self.map_workspace_service.get_active_localization_session()
+        localization_session = self.map_workspace_service.sync_active_localization_session(
+            refresh=True,
+            metadata={"source": capability_name},
+        )
         localization_snapshot = self.localization_service.get_latest_snapshot()
         if (
             localization_session is not None
@@ -5462,6 +5523,29 @@ class GatewayRuntime:
         if isinstance(providers, MotionControl):
             providers.stop_motion()
 
+    def _is_safe_stop_gated_capability(self, descriptor: CapabilityDescriptor) -> bool:
+        if descriptor.name in _SAFE_STOP_GATED_CAPABILITY_NAMES:
+            return True
+        return any(resource in _SAFE_STOP_GATED_RESOURCE_NAMES for resource in descriptor.required_resources)
+
+    def _ensure_safe_stop_allows_capability(self, descriptor: CapabilityDescriptor) -> None:
+        if not self._is_safe_stop_gated_capability(descriptor):
+            return
+        if not self.safety_guard.safe_stop_active:
+            return
+        state = self.safety_guard.get_safe_stop_state()
+        raise GatewayError(
+            f"安全停止门禁处于激活状态，能力 {descriptor.name} 在显式恢复前禁止执行。",
+            error_code="safe_stop_active",
+            http_status=423,
+            jsonrpc_code=-32011,
+            details={
+                "capability_name": descriptor.name,
+                "required_resources": list(descriptor.required_resources),
+                "safety_state": state,
+            },
+        )
+
     def _get_provider(self, provider_type: type, provider_label: str):
         providers = getattr(self.robot, "providers", None)
         if providers is None or not isinstance(providers, provider_type):
@@ -6062,6 +6146,10 @@ class GatewayRuntime:
             "stop_all_motion": (
                 lambda: self._has_provider(SafetyProvider) or self._has_provider(MotionControl),
                 "当前机器人入口未提供安全停止或运动控制提供器。",
+            ),
+            "recover_safe_stop": (
+                lambda: True,
+                "安全停止恢复入口不可用。",
             ),
             "switch_control_mode": (
                 lambda: hasattr(self.robot, "switch_mode"),

@@ -136,7 +136,7 @@ class Go2OfficialControlConfig:
     client_timeout_sec: float = 3.0
     max_linear_velocity_mps: float = 0.35
     max_yaw_rate_rps: float = 0.8
-    obstacle_avoidance_default_enabled: bool = True
+    obstacle_avoidance_default_enabled: bool = False
 
 
 @dataclass
@@ -185,7 +185,7 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
             max_yaw_rate_rps=max(0.1, _cfg_float("GO2_OFFICIAL_MAX_YAW_RATE_RPS", 0.8)),
             obstacle_avoidance_default_enabled=_cfg_bool(
                 "GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED",
-                True,
+                False,
             ),
         ),
     )

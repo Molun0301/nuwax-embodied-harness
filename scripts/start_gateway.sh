@@ -96,6 +96,107 @@ is_pid_alive() {
   [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1
 }
 
+pid_pgid() {
+  local pid="$1"
+  ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+send_signal_to_process_scope() {
+  local signal="$1"
+  local pid="$2"
+  local pgid=""
+  local self_pgid=""
+
+  if ! is_pid_alive "${pid}"; then
+    return 0
+  fi
+
+  pgid="$(pid_pgid "${pid}")"
+  self_pgid="$(pid_pgid "$$")"
+  if [[ -n "${pgid}" && "${pgid}" != "${self_pgid}" ]]; then
+    kill "-${signal}" -- "-${pgid}" >/dev/null 2>&1 || true
+  fi
+  kill "-${signal}" -- "${pid}" >/dev/null 2>&1 || true
+}
+
+wait_for_pid_exit() {
+  local pid="$1"
+  local timeout_sec="$2"
+  local waited=0
+
+  while is_pid_alive "${pid}"; do
+    if [[ "${waited}" -ge "${timeout_sec}" ]]; then
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
+terminate_process_scope() {
+  local pid="$1"
+  local label="${2:-process}"
+  local stop_timeout="${NUWAX_GATEWAY_STOP_TIMEOUT_SEC:-20}"
+  local kill_timeout="${NUWAX_GATEWAY_KILL_TIMEOUT_SEC:-5}"
+
+  if ! is_pid_alive "${pid}"; then
+    return 0
+  fi
+
+  echo "stopping ${label} pid ${pid}..."
+  send_signal_to_process_scope TERM "${pid}"
+  send_signal_to_process_scope CONT "${pid}"
+  if wait_for_pid_exit "${pid}" "${stop_timeout}"; then
+    return 0
+  fi
+
+  echo "${label} pid ${pid} did not stop after ${stop_timeout}s; sending SIGKILL." >&2
+  send_signal_to_process_scope KILL "${pid}"
+  wait_for_pid_exit "${pid}" "${kill_timeout}" || true
+}
+
+cleanup_stale_gateway_processes() {
+  local pid=""
+  local args=""
+
+  while read -r pid args; do
+    if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
+      continue
+    fi
+    if [[ "${args}" == *"uvicorn gateways.app:create_gateway_app_from_env"* && "${args}" == *"--port ${PORT}"* ]]; then
+      terminate_process_scope "${pid}" "stale gateway worker"
+    fi
+  done < <(ps -eo pid=,args=)
+}
+
+cleanup_external_geometry_processes() {
+  local geometry_root="${REPO_ROOT}/services/geometry/ros2_ws/src/go2slam"
+  local pid=""
+  local args=""
+  local pgid=""
+  declare -A seen_pgids=()
+
+  if ! is_truthy "${NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY:-true}"; then
+    return 0
+  fi
+
+  while read -r pid args; do
+    if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
+      continue
+    fi
+    if [[ "${args}" != *"${geometry_root}"* ]]; then
+      continue
+    fi
+    pgid="$(pid_pgid "${pid}")"
+    if [[ -z "${pgid}" || -n "${seen_pgids[${pgid}]:-}" ]]; then
+      continue
+    fi
+    seen_pgids["${pgid}"]=1
+    terminate_process_scope "${pid}" "external geometry process group ${pgid}"
+  done < <(ps -eo pid=,args=)
+}
+
 remove_pid_file() {
   local pid=""
   pid="$(read_pid_file || true)"
@@ -111,32 +212,27 @@ write_pid_file() {
 
 stop_existing_gateway() {
   local pid=""
-  local waited=0
 
   pid="$(read_pid_file || true)"
   if [[ -z "${pid}" ]]; then
     echo "gateway pid file not found: ${PID_FILE}"
+    cleanup_stale_gateway_processes
+    cleanup_external_geometry_processes
     return 0
   fi
 
   if ! is_pid_alive "${pid}"; then
     echo "gateway pid ${pid} is not running; removing stale pid file."
     rm -f "${PID_FILE}"
+    cleanup_stale_gateway_processes
+    cleanup_external_geometry_processes
     return 0
   fi
 
-  echo "stopping gateway pid ${pid}..."
-  kill "${pid}" >/dev/null 2>&1 || true
-  while is_pid_alive "${pid}"; do
-    waited=$((waited + 1))
-    if [[ "${waited}" -ge 20 ]]; then
-      echo "gateway pid ${pid} did not stop after ${waited}s; sending SIGKILL." >&2
-      kill -9 "${pid}" >/dev/null 2>&1 || true
-      break
-    fi
-    sleep 1
-  done
+  terminate_process_scope "${pid}" "gateway supervisor"
   rm -f "${PID_FILE}"
+  cleanup_stale_gateway_processes
+  cleanup_external_geometry_processes
 }
 
 status_gateway() {
@@ -153,9 +249,10 @@ status_gateway() {
 stop_gateway() {
   STOP_REQUESTED=1
   if [[ -n "${GATEWAY_PID}" ]] && kill -0 "${GATEWAY_PID}" >/dev/null 2>&1; then
-    kill "${GATEWAY_PID}" >/dev/null 2>&1 || true
+    terminate_process_scope "${GATEWAY_PID}" "gateway worker"
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
   fi
+  cleanup_external_geometry_processes
   exit 0
 }
 
@@ -164,6 +261,8 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 PID_FILE="${NUWAX_GATEWAY_PID_FILE:-${REPO_ROOT}/runtime_data/gateway/gateway.pid}"
+HOST="${NUWAX_GATEWAY_HOST:-0.0.0.0}"
+PORT="${NUWAX_GATEWAY_PORT:-8766}"
 
 case "${ACTION}" in
   start)
@@ -172,6 +271,8 @@ case "${ACTION}" in
       exit 1
     fi
     rm -f "${PID_FILE}"
+    cleanup_stale_gateway_processes
+    cleanup_external_geometry_processes
     ;;
   stop)
     stop_existing_gateway
@@ -197,8 +298,6 @@ if is_truthy "${NUWAX_GEOMETRY_ENABLED:-true}"; then
   source_runtime_script "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
 fi
 
-HOST="${NUWAX_GATEWAY_HOST:-0.0.0.0}"
-PORT="${NUWAX_GATEWAY_PORT:-8766}"
 export PYTHONUNBUFFERED=1
 
 cd "${REPO_ROOT}"

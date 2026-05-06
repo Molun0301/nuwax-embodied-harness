@@ -6,6 +6,8 @@ import logging
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from pydantic import ValidationError
+
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
@@ -62,6 +64,7 @@ class Ros2TfLocalizationProvider:
         self._thread: Optional[threading.Thread] = None
         self._rclpy = None
         self._subscriptions: List[Any] = []
+        self._invalid_transform_keys: set = set()
 
     def start(self) -> None:
         if self._started:
@@ -524,23 +527,36 @@ class Ros2TfLocalizationProvider:
         transform = getattr(message, "transform", None)
         translation = getattr(transform, "translation", None)
         rotation = getattr(transform, "rotation", None)
-        return Transform(
-            timestamp=self._timestamp_from_header(header),
-            parent_frame_id=parent_frame_id,
-            child_frame_id=child_frame_id,
-            translation=Vector3(
-                x=float(getattr(translation, "x", 0.0) or 0.0),
-                y=float(getattr(translation, "y", 0.0) or 0.0),
-                z=float(getattr(translation, "z", 0.0) or 0.0),
-            ),
-            rotation=Quaternion(
-                x=float(getattr(rotation, "x", 0.0) or 0.0),
-                y=float(getattr(rotation, "y", 0.0) or 0.0),
-                z=float(getattr(rotation, "z", 0.0) or 0.0),
-                w=float(getattr(rotation, "w", 1.0) if rotation is not None else 1.0),
-            ),
-            authority=authority,
-        )
+        try:
+            return Transform(
+                timestamp=self._timestamp_from_header(header),
+                parent_frame_id=parent_frame_id,
+                child_frame_id=child_frame_id,
+                translation=Vector3(
+                    x=float(getattr(translation, "x", 0.0) or 0.0),
+                    y=float(getattr(translation, "y", 0.0) or 0.0),
+                    z=float(getattr(translation, "z", 0.0) or 0.0),
+                ),
+                rotation=Quaternion(
+                    x=float(getattr(rotation, "x", 0.0) or 0.0),
+                    y=float(getattr(rotation, "y", 0.0) or 0.0),
+                    z=float(getattr(rotation, "z", 0.0) or 0.0),
+                    w=float(getattr(rotation, "w", 1.0) if rotation is not None else 1.0),
+                ),
+                authority=authority,
+            )
+        except ValidationError as exc:
+            key = (parent_frame_id, child_frame_id)
+            if key not in self._invalid_transform_keys:
+                self._invalid_transform_keys.add(key)
+                LOGGER.warning(
+                    "跳过不合规 TF 变换 parent=%s child=%s authority=%s reason=%s",
+                    parent_frame_id,
+                    child_frame_id,
+                    authority,
+                    exc.errors()[0].get("msg") if exc.errors() else str(exc),
+                )
+            return None
 
     def _normalize_contract_transform(self, transform: Transform) -> Optional[Transform]:
         parent_frame_id = self._normalize_frame_id(transform.parent_frame_id)

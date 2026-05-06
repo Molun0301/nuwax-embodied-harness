@@ -1,0 +1,186 @@
+- generic [active] [ref=e1]:
+  - button "切换白天/黑夜主题" [ref=e2] [cursor=pointer]: ☀️
+  - generic [ref=e3]:
+    - banner [ref=e4]:
+      - generic [ref=e5]:
+        - generic [ref=e6]: 只读机器人观测
+        - generic [ref=e7]:
+          - heading "go2" [level=1] [ref=e183]
+          - generic [ref=e9]: "型号：unitree_go2: available"
+      - generic [ref=e10]:
+        - generic [ref=e11]:
+          - generic [ref=e12]: streaming
+          - generic [ref=e13]: 网关连接
+        - generic [ref=e14]:
+          - generic [ref=e15]: high
+          - generic [ref=e16]: 运行模式
+        - generic [ref=e17]:
+          - generic [ref=e18]: "--"
+          - generic [ref=e19]: 电池状态
+        - generic [ref=e20]:
+          - generic [ref=e21]: 0 ms
+          - generic [ref=e22]: HTTP 往返
+        - generic [ref=e23]:
+          - generic [ref=e24]: tasks 0 · events 199286
+          - generic [ref=e25]: 资源/任务
+        - generic [ref=e26]:
+          - generic [ref=e27]: 12:38:24
+          - generic [ref=e28]: 当前时间
+        - generic [ref=e29]:
+          - generic [ref=e30]: 12:38:24
+          - generic [ref=e31]: 数据接收
+        - generic [ref=e32]:
+          - generic [ref=e33]: <500 ms
+          - generic [ref=e34]: P95 目标
+        - generic [ref=e35]: "急停状态：清除: available"
+    - main [ref=e38]:
+      - generic [ref=e39]:
+        - generic [ref=e40]:
+          - generic [ref=e41]:
+            - generic [ref=e42]: Live Spatial Canvas
+            - heading "空间态势 · 2D 地图 / 定位 / 轨迹" [level=2] [ref=e43]
+          - generic [ref=e44]: available
+        - generic [ref=e45]:
+          - generic "地图缩放控制" [ref=e46]:
+            - button "-" [ref=e47] [cursor=pointer]
+            - generic [ref=e48]: 100%
+            - button "+" [ref=e49] [cursor=pointer]
+            - button "reset" [ref=e50] [cursor=pointer]
+          - generic [ref=e51]: 首帧已缓存 · 12:38:23
+        - generic [ref=e53]:
+          - generic [ref=e54]: 未知
+          - generic [ref=e56]: 可通行
+          - generic [ref=e58]: 占据
+          - generic [ref=e60]: 轨迹
+          - generic [ref=e62]: 机器人
+          - generic [ref=e64]: 探索前沿
+        - generic [ref=e66]:
+          - generic [ref=e67]:
+            - generic [ref=e68]:
+              - heading "地图帧" [level=3] [ref=e69]
+              - generic [ref=e70]: occupancy grid
+            - generic [ref=e71]:
+              - generic [ref=e184]: frame
+              - generic [ref=e185]: map
+              - generic [ref=e186]: size
+              - generic [ref=e187]: 111 x 90
+              - generic [ref=e188]: resolution
+              - generic [ref=e189]: 0.05000000074505806 m
+              - generic [ref=e190]: source_timestamp
+              - generic [ref=e191]: 12:38:23
+              - generic [ref=e192]: revision
+              - generic [ref=e193]: "2082"
+              - generic [ref=e194]: sequence
+              - generic [ref=e195]: "2082"
+              - generic [ref=e196]: streaming
+              - generic [ref=e197]: 首帧已缓存
+              - generic [ref=e198]: latency
+              - generic [ref=e199]: "--"
+              - generic [ref=e200]: stale
+              - generic [ref=e201]: "false"
+              - generic [ref=e202]: 前端接收
+              - generic [ref=e203]: 12:38:24
+          - generic [ref=e92]:
+            - generic [ref=e93]:
+              - heading "定位/轨迹" [level=3] [ref=e94]
+              - generic [ref=e95]: available
+            - generic [ref=e204]:
+              - generic [ref=e205]: frame
+              - generic [ref=e206]: map
+              - generic [ref=e207]: pose
+              - generic [ref=e208]: x=-0.9 y=0.2 z=0
+              - generic [ref=e209]: yaw
+              - generic [ref=e210]: 1.5 rad
+              - generic [ref=e211]: trajectory_count
+              - generic [ref=e212]: "100"
+              - generic [ref=e213]: source_timestamp
+              - generic [ref=e214]: 12:38:23
+              - generic [ref=e215]: latency
+              - generic [ref=e216]: "--"
+              - generic [ref=e217]: stale
+              - generic [ref=e218]: "false"
+              - generic [ref=e219]: 前端接收
+              - generic [ref=e220]: 12:38:24
+      - complementary "态势与诊断面板" [ref=e96]:
+        - generic [ref=e97]:
+          - generic [ref=e98]:
+            - generic [ref=e99]:
+              - generic [ref=e100]: Situation
+              - heading "任务态势" [level=2] [ref=e101]
+            - generic [ref=e102]: "mission: missing"
+          - tablist "任务态势二级菜单" [ref=e103]:
+            - button "导航" [ref=e104] [cursor=pointer]
+            - button "总览" [ref=e105] [cursor=pointer]
+            - button "任务" [ref=e106] [cursor=pointer]
+            - button "传感器" [ref=e107] [cursor=pointer]
+          - generic [ref=e110]:
+            - generic [ref=e111]:
+              - heading "导航态势 / frontier（探索前沿）" [level=3] [ref=e112]
+              - generic [ref=e113]: available
+            - generic [ref=e114]:
+              - generic [ref=e115]: navigation
+              - generic [ref=e116]: failed
+              - generic [ref=e117]: exploration
+              - generic [ref=e118]: idle
+              - generic [ref=e119]: frontier_count
+              - generic [ref=e120]: "--"
+              - generic [ref=e121]: waiting_for
+              - generic [ref=e122]: "--"
+              - generic [ref=e123]: mapping_detail
+              - generic [ref=e124]: "--"
+              - generic [ref=e125]: occupancy
+              - generic [ref=e126]: "-- ready=-- count=--"
+              - generic [ref=e127]: pointcloud_bridge
+              - generic [ref=e128]: "-- published=-- source=--"
+              - generic [ref=e129]: frontier_geometry
+              - generic [ref=e130]: 暂无候选
+              - generic [ref=e131]: goal
+              - generic [ref=e132]: "--"
+              - generic [ref=e133]: nav_path
+              - generic [ref=e134]: "--"
+              - generic [ref=e135]: source_timestamp
+              - generic [ref=e136]: 12:38:13
+              - generic [ref=e137]: latency
+              - generic [ref=e138]: "--"
+              - generic [ref=e139]: stale
+              - generic [ref=e140]: "false"
+              - generic [ref=e141]: 前端接收
+              - generic [ref=e142]: 12:38:19
+            - generic [ref=e143]: 当前探索上下文还没有 frontier 几何，请确认探索运行态已生成候选。
+        - generic [ref=e144]:
+          - generic [ref=e145]:
+            - generic [ref=e146]:
+              - generic [ref=e147]: Diagnostics
+              - heading "运行诊断" [level=2] [ref=e148]
+            - generic [ref=e149]: available
+          - tablist "运行诊断二级菜单" [ref=e150]:
+            - button "治理" [ref=e151] [cursor=pointer]
+            - button "视频" [ref=e152] [cursor=pointer]
+            - button "服务" [ref=e153] [cursor=pointer]
+            - button "日志" [ref=e154] [cursor=pointer]
+          - generic [ref=e157]:
+            - generic [ref=e158]:
+              - heading "RTAB-Map 运行治理" [level=3] [ref=e159]
+              - generic [ref=e160]: 只读
+            - generic [ref=e161]:
+              - generic [ref=e162]: profile
+              - generic [ref=e163]: rtabmap_nav2 / configured / route=rtabmap
+              - generic [ref=e164]: geometry_asset
+              - generic [ref=e165]: missing
+              - generic [ref=e166]: asset_frame
+              - generic [ref=e167]: "--"
+              - generic [ref=e168]: localization
+              - generic [ref=e169]: missing
+              - generic [ref=e170]: last_relocalization
+              - generic [ref=e171]: missing
+              - generic [ref=e172]: relocalization_failure
+              - generic [ref=e173]: "--"
+              - generic [ref=e174]: front_align
+              - generic [ref=e175]: false triggered=false reason=--
+              - generic [ref=e176]: rotate_reloc
+              - generic [ref=e177]: false triggered=false reason=--
+              - generic [ref=e178]: source
+              - generic [ref=e179]: platform_service_contracts
+              - generic [ref=e180]: 前端接收
+              - generic [ref=e181]: 12:38:19
+            - generic [ref=e182]: 展示 profile、几何资产、重定位质量和导航门控摘要。

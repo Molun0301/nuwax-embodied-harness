@@ -94,6 +94,8 @@ _RUNTIME_METADATA_LOG_KEYS = (
     "localization_session_id",
 )
 
+_NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 2.0
+
 
 def _has_observability_value(value: Any) -> bool:
     return value is not None and value != ""
@@ -368,6 +370,8 @@ class GatewayRuntime:
         self._localization_stream_unsubscriber = None
         self._point_cloud_stream_subscription_id: Optional[int] = None
         self._pointcloud_map_stream_subscription_id: Optional[str] = None
+        self._navigation_status_refresh_stop = threading.Event()
+        self._navigation_status_refresh_thread: Optional[threading.Thread] = None
         self._pointcloud_map_cache = PointCloudMapCache()
         self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
         self._base_capability_matrix = robot.manifest.capability_matrix
@@ -568,6 +572,8 @@ class GatewayRuntime:
         self._publish_runtime_governance_stream_frame()
         self._publish_static_stream_capability_frames()
         self._publish_pointcloud_map_stream_frame(reason="runtime_stream_start")
+        self._publish_navigation_bootstrap_stream_frames()
+        self._start_navigation_status_refresh_stream()
         if self._pointcloud_map_stream_subscription_id is None:
             self._pointcloud_map_stream_subscription_id = self.stream_bus.subscribe(
                 self._handle_map_frame_for_pointcloud_map_stream,
@@ -598,7 +604,57 @@ class GatewayRuntime:
         if callable(point_cloud_subscriber) and self._point_cloud_stream_subscription_id is None:
             self._point_cloud_stream_subscription_id = point_cloud_subscriber(self._publish_point_cloud_stream_frame)
 
+    def _publish_navigation_bootstrap_stream_frames(self) -> None:
+        try:
+            self.navigation_service.refresh_navigation()
+        except Exception as exc:
+            self.stream_bus.publish(
+                "navigation.state",
+                source="navigation_service",
+                payload={"available": False, "message": str(exc)},
+                status="missing",
+                metadata={"reason": "navigation_bootstrap_failed"},
+            )
+            RUNTIME_LOGGER.debug("启动流源时刷新导航状态失败。", exc_info=True)
+        try:
+            self.navigation_service.refresh_exploration()
+        except Exception as exc:
+            self.stream_bus.publish(
+                "exploration.state",
+                source="navigation_service",
+                payload={"available": False, "message": str(exc)},
+                status="missing",
+                metadata={"reason": "exploration_bootstrap_failed"},
+            )
+            RUNTIME_LOGGER.debug("启动流源时刷新探索状态失败。", exc_info=True)
+
+    def _start_navigation_status_refresh_stream(self) -> None:
+        if self._navigation_status_refresh_thread is not None:
+            return
+        self._navigation_status_refresh_stop.clear()
+        thread = threading.Thread(
+            target=self._run_navigation_status_refresh_stream,
+            name="nuwax-navigation-status-refresh",
+            daemon=True,
+        )
+        self._navigation_status_refresh_thread = thread
+        thread.start()
+
+    def _stop_navigation_status_refresh_stream(self) -> None:
+        thread = self._navigation_status_refresh_thread
+        if thread is None:
+            return
+        self._navigation_status_refresh_stop.set()
+        if thread.is_alive():
+            thread.join(timeout=_NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC + 1.0)
+        self._navigation_status_refresh_thread = None
+
+    def _run_navigation_status_refresh_stream(self) -> None:
+        while not self._navigation_status_refresh_stop.wait(_NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC):
+            self._publish_navigation_bootstrap_stream_frames()
+
     def _stop_data_frame_stream_sources(self) -> None:
+        self._stop_navigation_status_refresh_stream()
         if self._pointcloud_map_stream_subscription_id is not None:
             self.stream_bus.unsubscribe(self._pointcloud_map_stream_subscription_id)
             self._pointcloud_map_stream_subscription_id = None

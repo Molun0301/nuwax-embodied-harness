@@ -20,6 +20,7 @@ _NAV2_LIFECYCLE_NODES = (
 )
 _COSTMAP_FRESH_SEC = 5.0
 _LIFECYCLE_CACHE_SEC = 1.0
+_LIFECYCLE_GET_STATE_TIMEOUT_SEC = 0.75
 
 
 @dataclass
@@ -328,7 +329,7 @@ class Nav2ActionNavigationProvider:
                     continue
                 item["available"] = True
                 future = client.call_async(request_type.Request())
-                deadline = time.monotonic() + 0.2
+                deadline = time.monotonic() + _LIFECYCLE_GET_STATE_TIMEOUT_SEC
                 while not future.done() and time.monotonic() < deadline:
                     time.sleep(0.01)
                 if future.done() and future.result() is not None:

@@ -26,6 +26,7 @@ from core import (
     SafetyGuard,
     StateNamespace,
     StateStore,
+    StreamBus,
     TaskManager,
 )
 from typing import Dict, List, Optional, Tuple
@@ -127,6 +128,28 @@ def test_event_bus_supports_publish_subscribe_and_cursor_replay() -> None:
     assert received == [(1, "task.accepted"), (2, "task.progress")]
     assert [event.event_type for event in replayed] == ["task.progress", "safety.stop_triggered"]
     assert event_bus.latest_cursor() == 4
+
+
+def test_stream_bus_latest_frames_survive_retention_window() -> None:
+    """流总线应能按 topic 取最新帧，即使该帧已被历史窗口淘汰。"""
+
+    stream_bus = StreamBus(retention_limit=2)
+    navigation_frame = stream_bus.publish("navigation.state", source="unit_test", payload={"status": "idle"})
+    stream_bus.publish("map.frame", source="unit_test", payload={"revision": 1}, revision="1")
+    stream_bus.publish("localization.pose", source="unit_test", payload={"x": 0.0})
+    latest_map_frame = stream_bus.publish("map.frame", source="unit_test", payload={"revision": 2}, revision="2")
+
+    retained_topics = [frame.topic for frame in stream_bus.replay(after_cursor=0)]
+    latest_topics = [
+        frame.topic
+        for frame in stream_bus.latest_frames(topics=("navigation.state", "map.frame"))
+    ]
+
+    assert retained_topics == ["localization.pose", "map.frame"]
+    assert latest_topics == ["navigation.state", "map.frame"]
+    assert stream_bus.latest_frame("navigation.state") == navigation_frame
+    assert stream_bus.latest_frame("map.frame") == latest_map_frame
+    assert stream_bus.oldest_cursor() == 3
 
 
 def test_task_manager_runs_successful_task_and_emits_events() -> None:

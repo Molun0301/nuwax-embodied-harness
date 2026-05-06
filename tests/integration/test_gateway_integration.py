@@ -1430,6 +1430,47 @@ def test_data_stream_websocket_replays_latest_frame_when_cursor_is_from_old_proc
     assert message["frame"]["cursor"] == 1
 
 
+def test_data_stream_websocket_initial_connect_replays_latest_topic_snapshot() -> None:
+    """新数据流连接应补每个 topic 最新帧，而不是回放整段高频 retained backlog。"""
+
+    stream_bus = StreamBus(retention_limit=3)
+    navigation_frame = stream_bus.publish(
+        "navigation.state",
+        source="unit_test",
+        payload={"status": "idle"},
+    )
+    for index in range(5):
+        stream_bus.publish(
+            "map.frame",
+            source="unit_test",
+            payload={"revision": index},
+            revision=str(index),
+        )
+    runtime = SimpleNamespace(
+        stream_bus=stream_bus,
+        config=SimpleNamespace(gateway=SimpleNamespace(sse_keepalive_sec=0.01, ws_ping_interval_sec=0.01)),
+    )
+    access_manager = GatewayAccessManager(
+        GatewayServerConfig(
+            agent_tokens=("agent-token",),
+            allowed_source_cidrs=(),
+        )
+    )
+    app = FastAPI()
+    app.include_router(build_data_stream_router(runtime, access_manager))
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/streams/ws?topics=navigation.state,map.frame&access_token=agent-token"
+        ) as websocket:
+            messages = [websocket.receive_json(), websocket.receive_json()]
+
+    frames = [message["frame"] for message in messages if message.get("type") == "stream.frame"]
+    assert [frame["topic"] for frame in frames] == ["navigation.state", "map.frame"]
+    assert frames[0]["cursor"] == navigation_frame.cursor
+    assert frames[1]["revision"] == "4"
+
+
 def test_gateway_artifact_fetch(tmp_path: Path) -> None:
     """图像能力应落制品并允许元数据与原始内容拉取。"""
 
@@ -3221,6 +3262,8 @@ def test_gateway_debug_panel_readonly_routes(tmp_path: Path) -> None:
         assert page.status_code == 200
         assert "只读" in page.text
         assert "agent-token" in page.text
+        assert "healthOverviewFromRobotFrame" in page.text
+        assert 'overview.health = healthOverviewFromRobotFrame(frame)' in page.text
         assert "<button" not in page.text.lower()
 
         for path in (

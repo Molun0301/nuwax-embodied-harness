@@ -346,6 +346,7 @@ def test_go2_file_value_loader_only_reads_go2_data_plane_env(tmp_path: Path, mon
 def test_geometry_runtime_shell_scripts_pass_bash_syntax_check() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     scripts = (
+        repo_root / "scripts" / "start_gateway.sh",
         repo_root / "services" / "geometry" / "source_runtime_env.sh",
         repo_root / "services" / "geometry" / "launch_ros2_stack.sh",
         repo_root / "services" / "geometry" / "start_rtabmap_sidecar.sh",

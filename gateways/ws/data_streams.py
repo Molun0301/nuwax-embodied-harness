@@ -30,6 +30,18 @@ def _normalize_after_cursor(after_cursor: int, latest_cursor: int) -> int:
     return after_cursor
 
 
+def _replay_stream_frames(
+    runtime: GatewayRuntime,
+    *,
+    after_cursor: int,
+    topics: Optional[Iterable[str]],
+) -> Tuple[StreamFrame, ...]:
+    oldest_cursor = runtime.stream_bus.oldest_cursor()
+    if after_cursor <= 0 or (oldest_cursor > 0 and after_cursor < oldest_cursor):
+        return runtime.stream_bus.latest_frames(topics=topics)
+    return runtime.stream_bus.replay(after_cursor=after_cursor, topics=topics)
+
+
 def _safe_enqueue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, frame: StreamFrame, runtime: GatewayRuntime) -> None:
     def _push() -> None:
         if queue.full():
@@ -65,7 +77,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             queue: asyncio.Queue[StreamFrame] = asyncio.Queue(maxsize=200)
             emitted = 0
 
-            for frame in runtime.stream_bus.replay(after_cursor=after_cursor, topics=topic_filter):
+            for frame in _replay_stream_frames(runtime, after_cursor=after_cursor, topics=topic_filter):
                 yield _format_sse_payload(frame)
                 emitted += 1
                 if max_frames is not None and emitted >= max_frames:
@@ -108,8 +120,11 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[StreamFrame] = asyncio.Queue(maxsize=200)
 
-        for frame in runtime.stream_bus.replay(after_cursor=after_cursor, topics=topic_filter):
-            await websocket.send_json({"type": "stream.frame", "frame": to_jsonable(frame)})
+        try:
+            for frame in _replay_stream_frames(runtime, after_cursor=after_cursor, topics=topic_filter):
+                await websocket.send_json({"type": "stream.frame", "frame": to_jsonable(frame)})
+        except WebSocketDisconnect:
+            return
 
         subscription_id = runtime.stream_bus.subscribe(
             lambda frame: _safe_enqueue(loop, queue, frame, runtime),

@@ -38,6 +38,30 @@ class StreamBus:
         with self._lock:
             return self._latest_by_topic.get(str(topic))
 
+    def oldest_cursor(self) -> int:
+        with self._lock:
+            if not self._frames:
+                return 0
+            return int(self._frames[0].cursor or 0)
+
+    def latest_frames(
+        self,
+        *,
+        topics: Optional[Iterable[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Tuple[StreamFrame, ...]:
+        topic_filter = frozenset(str(topic) for topic in topics) if topics is not None else None
+        with self._lock:
+            frames = [
+                frame
+                for frame in self._latest_by_topic.values()
+                if topic_filter is None or frame.topic in topic_filter
+            ]
+        frames.sort(key=lambda frame: int(frame.cursor or 0))
+        if limit is not None:
+            frames = frames[:limit]
+        return tuple(frames)
+
     def publish(
         self,
         topic: str,

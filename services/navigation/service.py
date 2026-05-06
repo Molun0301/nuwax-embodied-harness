@@ -96,7 +96,9 @@ class NavigationService:
         Nav2 action 只负责执行反馈，不负责平台任务定义。
         """
 
-        provider = self._get_navigation_provider()
+        provider = self._find_navigation_provider()
+        if provider is None:
+            raise GatewayError("当前平台几何运行时未提供导航后端。")
         navigation_state = provider.get_navigation_state()
         return self._ingest_navigation_state(provider, navigation_state)
 
@@ -197,13 +199,14 @@ class NavigationService:
                 metadata={"kind": "latest_navigation"},
             )
             if self._stream_bus is not None:
+                navigation_status = str(getattr(context.navigation_state.status, "value", context.navigation_state.status))
                 self._stream_bus.publish(
                     "navigation.state",
                     source="navigation_service",
                     payload=context,
                     frame_id=getattr(getattr(context.navigation_state, "current_pose", None), "frame_id", None),
-                    status=str(getattr(context.navigation_state.status, "value", context.navigation_state.status)),
-                    metadata={"backend_name": provider.provider_name},
+                    status="available",
+                    metadata={"backend_name": provider.provider_name, "navigation_status": navigation_status},
                 )
             if context.navigation_state.status in {
                 NavigationStatus.SUCCEEDED,
@@ -399,12 +402,13 @@ class NavigationService:
                 metadata={"kind": "latest_exploration"},
             )
             if self._stream_bus is not None:
+                exploration_status = str(getattr(context.exploration_state.status, "value", context.exploration_state.status))
                 self._stream_bus.publish(
                     "exploration.state",
                     source="navigation_service",
                     payload=context,
-                    status=str(getattr(context.exploration_state.status, "value", context.exploration_state.status)),
-                    metadata={"backend_name": provider.provider_name},
+                    status="available",
+                    metadata={"backend_name": provider.provider_name, "exploration_status": exploration_status},
                 )
                 frontiers = dict(getattr(context.exploration_state, "metadata", {}) or {}).get("latest_frontiers")
                 current_frontier = dict(getattr(context.exploration_state, "metadata", {}) or {}).get("current_frontier")

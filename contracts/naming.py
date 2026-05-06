@@ -5,7 +5,7 @@ import re
 import secrets
 from typing import Optional
 
-FRAME_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(/[a-z][a-z0-9_]*)*$")
+FRAME_ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(/[A-Za-z][A-Za-z0-9_]*)*$")
 TOPIC_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
 CAPABILITY_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 TASK_ID_PATTERN = re.compile(r"^task_[a-z0-9][a-z0-9_:-]{2,127}$")

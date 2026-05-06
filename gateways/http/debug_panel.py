@@ -1764,6 +1764,17 @@ def _render_debug_page(access_token: str) -> str:
         };
         updateTasks({ active_tasks: task.task_id ? [task] : [], history_tasks: [] });
       }
+      function healthOverviewFromRobotFrame(frame) {
+        return {
+          status: frame.status || "available",
+          source_timestamp: frame.timestamp,
+          latency_ms: 0,
+          stale: frame.status === "stale",
+          frame_id: frame.frame_id,
+          revision: frame.revision,
+          metadata: { source: "gateway_runtime", derived_from: frame.source || "robot.state", runtime_started: true },
+        };
+      }
       function updateStreamOverview(frame) {
         const keyByTopic = {
           "robot.state": "state",
@@ -1784,6 +1795,7 @@ def _render_debug_page(access_token: str) -> str:
           ? { source: frame.source, source_kind: payload.source_kind || (frame.metadata && frame.metadata.source_kind), point_count: payload.point_count ?? (frame.metadata && frame.metadata.point_count), pcd_path: payload.pcd_path || (frame.metadata && frame.metadata.pcd_path) }
           : { source: frame.source };
         const overview = { ...(state.latestOverview || {}) };
+        if (frame.topic === "robot.state") overview.health = healthOverviewFromRobotFrame(frame);
         overview[key] = {
           status: frame.status || "available",
           source_timestamp: frame.timestamp,

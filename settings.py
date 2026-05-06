@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - Windows 环境不提供 fcntl
 
 from logging_utils import build_default_formatter
 from contracts.geometry_runtime import (
+    ExternalGeometryStackConfig,
     GeometryFrameConfig,
     GeometryOdometryQualityConfig,
     GeometryPointCloudPreprocessConfig,
@@ -39,6 +40,7 @@ from contracts.geometry_runtime import (
     PlatformGeometryConfig,
     RtabmapConfig,
     RtabmapOutputConfig,
+    build_default_go2slam_external_script,
     build_default_geometry_setup_script,
     build_default_rtabmap_database_root,
     build_default_rtabmap_pcd_root,
@@ -705,6 +707,8 @@ def load_config() -> NuwaxRobotBridgeConfig:
         ),
     )
 
+    external_input_bridge_enabled = _cfg_bool("NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED", False)
+
     geometry = PlatformGeometryConfig(
         enabled=_cfg_bool("NUWAX_GEOMETRY_ENABLED", True),
         stack=_cfg_str("NUWAX_GEOMETRY_STACK", "rtabmap_nav2"),
@@ -802,6 +806,21 @@ def load_config() -> NuwaxRobotBridgeConfig:
             params_file=_cfg_str("NUWAX_NAV2_PARAMS_FILE", ""),
             use_sim_time=_cfg_bool("NUWAX_NAV2_USE_SIM_TIME", False),
             autostart=_cfg_bool("NUWAX_NAV2_AUTOSTART", True),
+        ),
+        external=ExternalGeometryStackConfig(
+            enabled=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_ENABLED", True),
+            script_path=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_SCRIPT", build_default_go2slam_external_script()),
+            args=_cfg_csv("NUWAX_GEOMETRY_EXTERNAL_ARGS", ("--no-rviz",)),
+            process_name=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME", "go2slam_external"),
+            log_name=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_LOG_NAME", "go2slam_external.log"),
+            provides_map=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_MAP", True),
+            provides_nav2=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAV2", True),
+            provides_tf=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_TF", True),
+            input_bridge_enabled=external_input_bridge_enabled,
+            point_cloud_bridge_enabled=_cfg_bool(
+                "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED",
+                external_input_bridge_enabled,
+            ),
         ),
     )
 

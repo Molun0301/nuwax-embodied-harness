@@ -23,6 +23,20 @@ def build_default_rtabmap_pcd_root() -> str:
     return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "pcd")
 
 
+def build_default_go2slam_external_script() -> str:
+    """返回仓库内默认 Go2 SLAM/Nav2 外部脚本路径。"""
+
+    return str(
+        Path(__file__).resolve().parents[1]
+        / "services"
+        / "geometry"
+        / "ros2_ws"
+        / "src"
+        / "go2slam"
+        / "start_go2_slam_nav2.sh"
+    )
+
+
 @dataclass
 class GeometryTopicsConfig:
     """平台几何侧车统一话题配置。"""
@@ -153,6 +167,22 @@ class Nav2Config:
 
 
 @dataclass
+class ExternalGeometryStackConfig:
+    """外部几何栈托管配置。"""
+
+    enabled: bool = True
+    script_path: str = field(default_factory=build_default_go2slam_external_script)
+    args: Tuple[str, ...] = ("--no-rviz",)
+    process_name: str = "go2slam_external"
+    log_name: str = "go2slam_external.log"
+    provides_map: bool = True
+    provides_nav2: bool = True
+    provides_tf: bool = True
+    input_bridge_enabled: bool = False
+    point_cloud_bridge_enabled: bool = False
+
+
+@dataclass
 class PlatformGeometryConfig:
     """平台几何引擎统一配置。"""
 
@@ -166,6 +196,7 @@ class PlatformGeometryConfig:
     frames: GeometryFrameConfig = field(default_factory=GeometryFrameConfig)
     rtabmap: RtabmapConfig = field(default_factory=RtabmapConfig)
     nav2: Nav2Config = field(default_factory=Nav2Config)
+    external: ExternalGeometryStackConfig = field(default_factory=ExternalGeometryStackConfig)
 
     def build_metadata(self) -> Dict[str, object]:
         """返回便于状态面记录的几何配置摘要。"""
@@ -276,6 +307,18 @@ class PlatformGeometryConfig:
                 "launch_package": self.rtabmap.launch_package,
                 "launch_file": self.rtabmap.launch_file,
                 "occupancy_projection": self.rtabmap.occupancy_projection,
+            },
+            "external_geometry": {
+                "enabled": self.external.enabled,
+                "script_path": self.external.script_path,
+                "args": self.external.args,
+                "process_name": self.external.process_name,
+                "log_name": self.external.log_name,
+                "provides_map": self.external.provides_map,
+                "provides_nav2": self.external.provides_nav2,
+                "provides_tf": self.external.provides_tf,
+                "input_bridge_enabled": self.external.input_bridge_enabled,
+                "point_cloud_bridge_enabled": self.external.point_cloud_bridge_enabled,
             },
             "output_contract": {
                 "name": self.rtabmap.output_contract,

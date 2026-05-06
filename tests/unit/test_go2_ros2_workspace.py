@@ -368,6 +368,53 @@ def test_geometry_startup_defaults_form_managed_nav2_chain() -> None:
     assert "NUWAX_NAV2_MODE=sidecar" in env_example_source
 
 
+def test_env_example_documents_go2slam_external_geometry_stack() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    env_example_source = (repo_root / ".env.example").read_text(encoding="utf-8")
+
+    assert "NUWAX_GEOMETRY_STACK=go2slam_external" in env_example_source
+    assert "NUWAX_GEOMETRY_EXTERNAL_SCRIPT=" in env_example_source
+    assert "NUWAX_GEOMETRY_EXTERNAL_ARGS=--no-rviz" in env_example_source
+    assert "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED=false" in env_example_source
+    assert "NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED=true" in env_example_source
+    assert "NUWAX_GEOMETRY_POINT_CLOUD_TOPIC=/utlidar/cloud_deskewed" in env_example_source
+    assert "NUWAX_NAV2_MODE=external" in env_example_source
+    assert "不要在网关 .env 全局设置 RMW_IMPLEMENTATION" in env_example_source
+    assert "不要让网关点云桥和 go2_driver 同时发布同名点云话题" in env_example_source
+
+
+def test_go2slam_nav2_start_script_defaults_to_cyclonedds_rmw() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    script_source = (
+        repo_root / "services/geometry/ros2_ws/src/go2slam/start_go2_slam_nav2.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"' in script_source
+
+
+def test_go2_driver_uses_sensor_qos_for_utlidar_robot_pose() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    driver_source = (
+        repo_root / "services/geometry/ros2_ws/src/go2slam/src/base/go2_driver/src/driver.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert 'create_subscription<geometry_msgs::msg::PoseStamped>' in driver_source
+    assert '"/utlidar/robot_pose"' in driver_source
+    assert "rclcpp::SensorDataQoS()" in driver_source
+
+
+def test_go2slam_cloud_accumulation_uses_named_z_field_with_bounds_checks() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    source = (
+        repo_root / "services/geometry/ros2_ws/src/go2slam/src/go2_perception/src/cloud_accumulation.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "cloud.fields[2]" not in source
+    assert 'find_float32_field_offset(cloud, "z", z_offset)' in source
+    assert "cloud.data.size()" in source
+    assert "fields_are_compatible" in source
+
+
 def test_odom_tf_bridge_uses_configured_parent_frame() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     bridge_source = (repo_root / "services" / "geometry" / "odom_tf_bridge.py").read_text(encoding="utf-8")

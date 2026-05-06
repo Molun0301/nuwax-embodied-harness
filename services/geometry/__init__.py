@@ -1,6 +1,7 @@
 """平台几何运行时导出。"""
 
 from services.geometry.config import (
+    ExternalGeometryStackConfig,
     GeometryFrameConfig,
     GeometryOdometryQualityConfig,
     GeometryPointCloudPreprocessConfig,
@@ -11,6 +12,7 @@ from services.geometry.config import (
     PlatformGeometryConfig,
     RtabmapConfig,
     RtabmapOutputConfig,
+    build_default_go2slam_external_script,
     build_default_geometry_setup_script,
     build_default_rtabmap_database_root,
     build_default_rtabmap_pcd_root,
@@ -28,6 +30,7 @@ from services.geometry.pointcloud_map import (
 )
 
 __all__ = [
+    "ExternalGeometryStackConfig",
     "GeometryFrameConfig",
     "GeometryOdometryQualityConfig",
     "GeometryPointCloudPreprocessConfig",
@@ -46,6 +49,7 @@ __all__ = [
     "RtabmapConfig",
     "RtabmapOutputConfig",
     "UnsupportedPointCloudMapError",
+    "build_default_go2slam_external_script",
     "build_default_geometry_setup_script",
     "build_default_rtabmap_database_root",
     "build_default_rtabmap_pcd_root",

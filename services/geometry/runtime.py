@@ -45,6 +45,7 @@ _NAV2_SIDECAR_MODES = {"sidecar", "managed", "launch", "internal"}
 _NAV2_EXTERNAL_MODES = {"external", "external_action", "action", "client", "pending"}
 _NAV2_DISABLED_MODES = {"", "disabled", "off", "none"}
 _REMOVED_PLATFORM_GRID_MODES = {"platform", "platform_grid", "grid", "fallback", "platform_fallback"}
+_EXTERNAL_GEOMETRY_STACKS = {"external", "go2slam_external", "external_go2slam"}
 
 
 @dataclass
@@ -264,10 +265,17 @@ class PlatformGeometryRuntime:
                 if self.config.require_ros2:
                     raise RuntimeError(message)
                 return
-            self._set_runtime_state("starting_inputs", "正在启动点云桥、里程计 TF 与静态 TF 输入链路。")
-            self._ensure_live_geometry_started()
+            if self._uses_external_geometry_stack():
+                self._set_runtime_state("starting_external", "正在启动外部 Go2 SLAM/Nav2 几何脚本。")
+                self._ensure_external_geometry_observers_started()
+            else:
+                self._set_runtime_state("starting_inputs", "正在启动点云桥、里程计 TF 与静态 TF 输入链路。")
+                self._ensure_live_geometry_started()
             self._start_required_processes()
-            self._set_runtime_state("starting_rtabmap", "RTAB-Map 侧车已启动，等待 /map 首帧。")
+            if self._uses_external_geometry_stack():
+                self._set_runtime_state("starting_external", "外部 Go2 SLAM/Nav2 几何脚本已启动，等待 /map 与 TF。")
+            else:
+                self._set_runtime_state("starting_rtabmap", "RTAB-Map 侧车已启动，等待 /map 首帧。")
             self._start_monitor_thread()
         except Exception as exc:
             self._record_runtime_diagnostic("geometry_start", exc)
@@ -337,8 +345,44 @@ class PlatformGeometryRuntime:
             return root
         return root / "live_rtabmap.db"
 
+    def _geometry_stack(self) -> str:
+        return str(getattr(self.config, "stack", "") or "").strip().lower()
+
+    def _uses_external_geometry_stack(self) -> bool:
+        return self._geometry_stack() in _EXTERNAL_GEOMETRY_STACKS
+
+    def _external_process_name(self) -> str:
+        name = str(getattr(self.config.external, "process_name", "") or "").strip()
+        return name or "go2slam_external"
+
+    def _external_log_name(self) -> str:
+        log_name = str(getattr(self.config.external, "log_name", "") or "").strip()
+        return log_name or "go2slam_external.log"
+
+    def _external_script_path(self) -> Path:
+        return Path(str(getattr(self.config.external, "script_path", "") or "")).expanduser()
+
+    def _external_args(self) -> List[str]:
+        raw_args = getattr(self.config.external, "args", ())
+        if isinstance(raw_args, str):
+            return shlex.split(raw_args)
+        return [str(item) for item in raw_args if str(item or "").strip()]
+
+    def _build_external_geometry_command(self) -> List[str]:
+        return [str(self._external_script_path()), *self._external_args()]
+
+    def _external_input_bridge_enabled(self) -> bool:
+        return bool(getattr(self.config.external, "input_bridge_enabled", False))
+
+    def _external_point_cloud_bridge_enabled(self) -> bool:
+        return self._external_input_bridge_enabled() or bool(
+            getattr(self.config.external, "point_cloud_bridge_enabled", False)
+        )
+
     def _run_preflight_checks(self) -> List[str]:
         errors: List[str] = []
+        if self._uses_external_geometry_stack():
+            return self._run_external_geometry_preflight_checks()
         launch_script = self._geometry_script("launch_ros2_stack.sh")
         if not launch_script.exists():
             errors.append("缺少 ROS2 环境启动脚本 %s" % launch_script)
@@ -392,6 +436,41 @@ class PlatformGeometryRuntime:
                 errors.append("Nav2 params file 不存在 %s" % params_file)
         return errors
 
+    def _run_external_geometry_preflight_checks(self) -> List[str]:
+        errors: List[str] = []
+        if not bool(getattr(self.config.external, "enabled", True)):
+            errors.append("外部 geometry 栈已禁用，但 NUWAX_GEOMETRY_STACK=%s 需要外部脚本。" % self.config.stack)
+        raw_script_path = str(getattr(self.config.external, "script_path", "") or "").strip()
+        script_path = self._external_script_path()
+        if not raw_script_path:
+            errors.append("缺少外部 geometry script 配置 NUWAX_GEOMETRY_EXTERNAL_SCRIPT")
+        elif not script_path.exists():
+            errors.append("外部 geometry script 不存在 %s" % script_path)
+        elif not script_path.is_file():
+            errors.append("外部 geometry script 不是文件 %s" % script_path)
+        elif not os.access(script_path, os.X_OK):
+            errors.append("外部 geometry script 不可执行 %s" % script_path)
+        required_topics = {
+            "occupancy_topic": self.config.topics.occupancy_topic,
+            "cost_map_topic": self.config.topics.cost_map_topic,
+            "tf_topic": self.config.topics.tf_topic,
+            "tf_static_topic": self.config.topics.tf_static_topic,
+        }
+        for name, value in required_topics.items():
+            if not str(value or "").strip():
+                errors.append("缺少 external geometry topic 配置 %s" % name)
+        required_frames = {
+            "map_frame": self.config.frames.map_frame,
+            "odom_frame": self.config.frames.odom_frame,
+            "base_frame": self.config.frames.base_frame,
+        }
+        for name, value in required_frames.items():
+            if not str(value or "").strip():
+                errors.append("缺少 external geometry TF frame 配置 %s" % name)
+        if self._nav2_mode() in _NAV2_SIDECAR_MODES:
+            errors.append("外部 Go2 SLAM/Nav2 栈已提供 Nav2；请把 NUWAX_NAV2_MODE 配置为 external。")
+        return errors
+
     def _ros_setup_candidates(self) -> List[Path]:
         return [
             Path("/opt/ros/humble/setup.bash"),
@@ -401,6 +480,29 @@ class PlatformGeometryRuntime:
         ]
 
     def _start_required_processes(self) -> None:
+        if self._uses_external_geometry_stack():
+            if self._external_input_bridge_enabled():
+                self._start_managed_process(
+                    "external_odom_tf_bridge",
+                    self._build_odom_tf_bridge_command(),
+                    "external_odom_tf_bridge.log",
+                )
+            self._start_managed_process(
+                self._external_process_name(),
+                self._build_external_geometry_command(),
+                self._external_log_name(),
+            )
+            if self._external_input_bridge_enabled():
+                bridge_message = "外部 Go2 SLAM/Nav2 脚本托管启动；平台启动 ROS2 odom/点云输入桥与 odom TF bridge，不启动内置 RTAB-Map/Nav2。"
+            elif self._external_point_cloud_bridge_enabled():
+                bridge_message = "外部 Go2 SLAM/Nav2 脚本托管启动；平台只启动 ROS2 点云输入桥，跳过 odom/odom_tf_bridge。"
+            else:
+                bridge_message = "外部 Go2 SLAM/Nav2 脚本托管启动；平台跳过内置 RTAB-Map/Nav2/odom_tf_bridge。"
+            self._record_runtime_diagnostic(
+                "go2slam_external",
+                bridge_message,
+            )
+            return
         self._start_managed_process("odom_tf_bridge", self._build_odom_tf_bridge_command(), "odom_tf_bridge.log")
         self._start_static_tf_process("static_tf_base_to_body", self.config.frames.base_frame, "body")
         self._start_static_tf_process("static_tf_base_to_lidar", self.config.frames.base_frame, self.config.frames.lidar_frame)
@@ -621,12 +723,25 @@ class PlatformGeometryRuntime:
             ExplorationStatus.ACCEPTED.value,
             ExplorationStatus.RUNNING.value,
         }:
-            self._set_runtime_state("exploring", "RTAB-Map localization 与地图 streaming 已就绪，平台探索任务运行中。")
+            message = (
+                "外部 go2slam 地图 streaming 已就绪，平台探索任务运行中。"
+                if self._uses_external_geometry_stack()
+                else "RTAB-Map localization 与地图 streaming 已就绪，平台探索任务运行中。"
+            )
+            self._set_runtime_state("exploring", message)
             return
         if nav2_phase != "ready":
-            self._set_runtime_state("streaming", "RTAB-Map localization 与地图 streaming 已就绪；Nav2 状态：%s。" % nav2_status.get("phase"))
+            message = (
+                "外部 go2slam 地图 streaming 已就绪；Nav2 状态：%s。"
+                if self._uses_external_geometry_stack()
+                else "RTAB-Map localization 与地图 streaming 已就绪；Nav2 状态：%s。"
+            )
+            self._set_runtime_state("streaming", message % nav2_status.get("phase"))
             return
-        self._set_runtime_state("ready", "RTAB-Map localization、地图 streaming 与 Nav2 均已就绪。")
+        if self._uses_external_geometry_stack():
+            self._set_runtime_state("ready", "外部 Go2 SLAM/Nav2 地图 streaming、TF 与 Nav2 均已就绪。")
+        else:
+            self._set_runtime_state("ready", "RTAB-Map localization、地图 streaming 与 Nav2 均已就绪。")
 
     def _blocking_process_failure(self) -> Optional[str]:
         for name, process in self._managed_processes.items():
@@ -657,6 +772,15 @@ class PlatformGeometryRuntime:
         point_cloud_status = point_cloud_status or self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
         data_plane_status = data_plane_status or self._build_data_plane_status()
+        if self._uses_external_geometry_stack():
+            return self._build_external_geometry_readiness(
+                live_map_status=live_map_status,
+                tf_localization_status=tf_localization_status,
+                odometry_status=odometry_status,
+                point_cloud_status=point_cloud_status,
+                point_cloud_source=point_cloud_source,
+                data_plane_status=data_plane_status,
+            )
         waiting_for, wait_message = self._classify_live_mapping_wait(
             live_map_status=live_map_status,
             point_cloud_status=point_cloud_status,
@@ -728,16 +852,124 @@ class PlatformGeometryRuntime:
             "odom_tf_bridge_process": odom_bridge.status() if odom_bridge is not None else None,
         }
 
+    def _build_external_geometry_readiness(
+        self,
+        *,
+        live_map_status: Dict[str, object],
+        tf_localization_status: Dict[str, object],
+        odometry_status: Optional[Dict[str, object]] = None,
+        point_cloud_status: Optional[Dict[str, object]] = None,
+        point_cloud_source: Optional[Dict[str, object]] = None,
+        data_plane_status: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        odometry_status = odometry_status or self._clone_metadata(self._odometry_publisher.get_status())
+        point_cloud_status = point_cloud_status or self._clone_metadata(self._point_cloud_publisher.get_status())
+        point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
+        data_plane_status = data_plane_status or self._build_data_plane_status()
+        process_name = self._external_process_name()
+        external_process = self._managed_processes.get(process_name)
+        odom_tf_bridge = self._managed_processes.get("external_odom_tf_bridge")
+        map_stream = dict(self._map_stream_tracker)
+        tf_chain = self._build_tf_chain_status(tf_localization_status=tf_localization_status)
+        process_running = bool(external_process is not None and external_process.is_running())
+        input_bridge_enabled = self._external_input_bridge_enabled()
+        point_cloud_bridge_enabled = self._external_point_cloud_bridge_enabled()
+        input_bridge_ready = True
+        if input_bridge_enabled:
+            input_bridge_ready = bool(
+                odom_tf_bridge is not None
+                and odom_tf_bridge.is_running()
+                and int(odometry_status.get("published_count") or 0) > 0
+                and int(point_cloud_status.get("published_count") or 0) > 0
+                and (point_cloud_source.get("timestamp") or data_plane_status.get("started") is not False)
+            )
+        elif point_cloud_bridge_enabled:
+            input_bridge_ready = bool(
+                int(point_cloud_status.get("published_count") or 0) > 0
+                and (point_cloud_source.get("timestamp") or data_plane_status.get("started") is not False)
+            )
+        first_frame_ready = bool(
+            live_map_status.get("occupancy_grid_ready")
+            and int(live_map_status.get("occupancy_message_count") or 0) > 0
+            and live_map_status.get("occupancy_has_publisher") is not False
+        )
+        streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
+        localization_ready = bool(process_running and input_bridge_ready and streaming_ready and tf_chain.get("ready"))
+        if not process_running:
+            message = "外部 Go2 SLAM/Nav2 脚本尚未运行。"
+            waiting_for = "external_process"
+        elif not input_bridge_ready:
+            message = (
+                "外部 go2slam 点云输入桥未就绪；需要平台发布点云输入。"
+                if point_cloud_bridge_enabled and not input_bridge_enabled
+                else "外部 go2slam 输入桥未就绪；需要平台发布 /odom、点云输入，并运行 odom -> base TF bridge。"
+            )
+            waiting_for = "external_input_bridge"
+        elif not first_frame_ready:
+            message = "等待外部 go2slam 发布 /map 首帧。"
+            waiting_for = "external_map"
+        elif not streaming_ready:
+            message = "外部 go2slam 已发布 /map 首帧，正在确认连续 streaming。"
+            waiting_for = "external_map_streaming"
+        elif not tf_chain.get("ready"):
+            message = "外部 go2slam /map 已 streaming，等待 map -> odom -> base TF 链就绪。"
+            waiting_for = "external_tf"
+        else:
+            message = "外部 Go2 SLAM/Nav2 /map streaming 与 TF 链均已就绪。"
+            waiting_for = None
+        return {
+            "ready": localization_ready,
+            "go2_odom_ready": bool(process_running and input_bridge_ready),
+            "first_frame_ready": first_frame_ready,
+            "streaming_ready": streaming_ready,
+            "localization_ready": localization_ready,
+            "relocalization_ready": localization_ready,
+            "waiting_for": waiting_for,
+            "message": message,
+            "map_stream": map_stream,
+            "tf_chain": tf_chain,
+            "tf_localization_provider": self._clone_metadata(tf_localization_status),
+            "rtabmap_info": {
+                "topic": "/rtabmap/info",
+                "publisher_count": None,
+                "has_publisher": None,
+                "not_required": True,
+            },
+            "rtabmap_process": None,
+            "odometry_publisher": odometry_status,
+            "point_cloud_publisher": point_cloud_status,
+            "point_cloud_source": point_cloud_source,
+            "data_plane": data_plane_status,
+            "odom_tf_bridge_process": odom_tf_bridge.status() if odom_tf_bridge is not None else None,
+            "external_geometry": {
+                "stack": self.config.stack,
+                "process_name": process_name,
+                "script_path": str(self._external_script_path()),
+                "args": tuple(self._external_args()),
+                "provides_map": bool(getattr(self.config.external, "provides_map", True)),
+                "provides_nav2": bool(getattr(self.config.external, "provides_nav2", True)),
+                "provides_tf": bool(getattr(self.config.external, "provides_tf", True)),
+                "input_bridge_enabled": input_bridge_enabled,
+                "point_cloud_bridge_enabled": point_cloud_bridge_enabled,
+            },
+            "external_process": external_process.status() if external_process is not None else None,
+        }
+
     def _build_tf_chain_status(self, *, tf_localization_status: Optional[Dict[str, object]] = None) -> Dict[str, object]:
         tf_localization_status = tf_localization_status or self._clone_metadata(self._tf_localization_provider.get_status())
-        required_processes = ["odom_tf_bridge"]
-        if str(self.config.frames.base_frame or "").strip() != "body":
-            required_processes.append("static_tf_base_to_body")
-        if str(self.config.frames.base_frame or "").strip() != str(self.config.frames.lidar_frame or "").strip():
-            required_processes.append("static_tf_base_to_lidar")
-        imu_frame = str(getattr(self.config.frames, "imu_frame", "") or "").strip()
-        if imu_frame and str(self.config.frames.base_frame or "").strip() != imu_frame:
-            required_processes.append("static_tf_base_to_imu")
+        if self._uses_external_geometry_stack():
+            required_processes = [self._external_process_name()]
+            if self._external_input_bridge_enabled():
+                required_processes.append("external_odom_tf_bridge")
+        else:
+            required_processes = ["odom_tf_bridge"]
+            if str(self.config.frames.base_frame or "").strip() != "body":
+                required_processes.append("static_tf_base_to_body")
+            if str(self.config.frames.base_frame or "").strip() != str(self.config.frames.lidar_frame or "").strip():
+                required_processes.append("static_tf_base_to_lidar")
+            imu_frame = str(getattr(self.config.frames, "imu_frame", "") or "").strip()
+            if imu_frame and str(self.config.frames.base_frame or "").strip() != imu_frame:
+                required_processes.append("static_tf_base_to_imu")
         required_process_names = tuple(required_processes)
         process_status = {
             name: self._managed_processes[name].status()
@@ -766,7 +998,11 @@ class PlatformGeometryRuntime:
             "stopped_processes": stopped,
             "processes": process_status,
             "tf_localization_provider": self._clone_metadata(tf_localization_status),
-            "validation": "ros2_tf_provider_must_resolve_map_to_base_pose",
+            "validation": (
+                "external_go2slam_tf_provider_must_resolve_map_to_base_pose"
+                if self._uses_external_geometry_stack()
+                else "ros2_tf_provider_must_resolve_map_to_base_pose"
+            ),
         }
 
     def _update_stream_tracker(self, live_map_status: Dict[str, object]) -> None:
@@ -981,6 +1217,7 @@ class PlatformGeometryRuntime:
             "map_stream": dict(self._map_stream_tracker),
             "rtabmap_readiness": self._build_rtabmap_readiness(),
             "nav2": self._build_nav2_status(),
+            "external_geometry": self.config.build_metadata().get("external_geometry"),
             "tf_localization_provider": self._tf_localization_provider.get_status(),
             "diagnostics": diagnostics,
             "launch_ros2_stack": {
@@ -1013,6 +1250,37 @@ class PlatformGeometryRuntime:
                 self._live_map_provider.stop()
                 self._live_geometry_start_attempted = False
                 self._tf_localization_provider.stop()
+                raise
+
+    def _ensure_external_geometry_observers_started(self) -> None:
+        if not self._is_geometry_profile_enabled():
+            return
+        with self._live_geometry_start_lock:
+            input_bridge_enabled = self._external_input_bridge_enabled()
+            point_cloud_bridge_enabled = self._external_point_cloud_bridge_enabled()
+            input_bridge_ready = True
+            if input_bridge_enabled:
+                input_bridge_ready = self._odometry_publisher.is_available() and self._point_cloud_publisher.is_available()
+            elif point_cloud_bridge_enabled:
+                input_bridge_ready = self._point_cloud_publisher.is_available()
+            if self._live_map_provider.is_available() and self._tf_localization_provider.is_available() and input_bridge_ready:
+                return
+            self._live_geometry_start_attempted = True
+            try:
+                if input_bridge_enabled:
+                    self._odometry_publisher.start()
+                if point_cloud_bridge_enabled:
+                    self._point_cloud_publisher.start()
+                self._live_map_provider.start()
+                self._tf_localization_provider.start()
+            except Exception:
+                if input_bridge_enabled:
+                    self._odometry_publisher.stop()
+                if point_cloud_bridge_enabled:
+                    self._point_cloud_publisher.stop()
+                self._live_map_provider.stop()
+                self._tf_localization_provider.stop()
+                self._live_geometry_start_attempted = False
                 raise
 
     def is_available(self) -> bool:

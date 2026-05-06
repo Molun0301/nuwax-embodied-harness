@@ -22,6 +22,14 @@ def _parse_topics(values: Optional[str]) -> Optional[Tuple[str, ...]]:
     return topics if topics else None
 
 
+def _normalize_after_cursor(after_cursor: int, latest_cursor: int) -> int:
+    if after_cursor <= 0:
+        return 0
+    if latest_cursor > 0 and after_cursor > latest_cursor:
+        return 0
+    return after_cursor
+
+
 def _safe_enqueue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, frame: StreamFrame, runtime: GatewayRuntime) -> None:
     def _push() -> None:
         if queue.full():
@@ -50,6 +58,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     ) -> StreamingResponse:
         access_manager.authenticate_http(request)
         topic_filter = _parse_topics(topics)
+        after_cursor = _normalize_after_cursor(after_cursor, runtime.stream_bus.latest_cursor())
 
         async def frame_generator():
             loop = asyncio.get_running_loop()
@@ -89,6 +98,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             access_manager.authenticate_websocket(websocket)
             topic_filter = _parse_topics(websocket.query_params.get("topics"))
             after_cursor = int(websocket.query_params.get("after_cursor", "0"))
+            after_cursor = _normalize_after_cursor(after_cursor, runtime.stream_bus.latest_cursor())
         except Exception as exc:
             error = exc if isinstance(exc, GatewayError) else GatewayError(f"数据流订阅初始化失败: {exc}")
             await websocket.close(code=4403, reason=error.message)

@@ -1,4 +1,3 @@
-.env
 drivers/go2/data_plane.env
 go2_proxy.log
 nuwax_robot_bridge.log
@@ -19,3 +18,4 @@ tests/
 drivers/go2/ros2_ws/
 nuwax_robot_bridge.log.lock
 runtime_data/
+.gitnexus

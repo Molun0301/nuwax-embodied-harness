@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 from types import SimpleNamespace
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import httpx
 
@@ -25,17 +26,20 @@ from contracts.spatial_memory import (
     SceneSpaceBoundary,
     SceneSpaceReviewStatus,
 )
+from core.stream_bus import StreamBus
 from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
 from drivers.common.manifest import RobotDefaults, RobotManifest
 from drivers.go2.assembly import Go2RobotAssembly
 from gateways.app import create_gateway_app
+from gateways.auth import GatewayAccessManager
 from gateways.relay.server import create_relay_app
 from gateways.runtime import create_default_gateway_runtime
+from gateways.ws.data_streams import build_data_stream_router
 from providers import ExplorationProvider, ImageProvider, LocalizationProvider, MapProvider, NavigationProvider, PointCloudProvider
 from providers.motion import MotionControl
 from providers.safety import SafetyProvider
 from providers.state import StateProvider
-from settings import load_config
+from settings import GatewayServerConfig, load_config
 from typing import Dict, List, Optional, Tuple
 
 
@@ -1388,6 +1392,42 @@ def test_gateway_websocket_and_sse_event_stream(tmp_path: Path) -> None:
                     found_ws = event
                     break
             assert found_ws is not None
+
+
+def test_data_stream_websocket_replays_latest_frame_when_cursor_is_from_old_process() -> None:
+    """数据流客户端带旧进程游标时，应重放当前进程 retained frame。"""
+
+    stream_bus = StreamBus()
+    stream_bus.publish(
+        "map.frame",
+        source="unit_test",
+        payload={"revision": 1},
+        frame_id="map",
+        sequence=1,
+        revision="1",
+    )
+    runtime = SimpleNamespace(
+        stream_bus=stream_bus,
+        config=SimpleNamespace(gateway=SimpleNamespace(sse_keepalive_sec=0.01, ws_ping_interval_sec=0.01)),
+    )
+    access_manager = GatewayAccessManager(
+        GatewayServerConfig(
+            agent_tokens=("agent-token",),
+            allowed_source_cidrs=(),
+        )
+    )
+    app = FastAPI()
+    app.include_router(build_data_stream_router(runtime, access_manager))
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/streams/ws?topics=map.frame&after_cursor=999&access_token=agent-token"
+        ) as websocket:
+            message = websocket.receive_json()
+
+    assert message["type"] == "stream.frame"
+    assert message["frame"]["topic"] == "map.frame"
+    assert message["frame"]["cursor"] == 1
 
 
 def test_gateway_artifact_fetch(tmp_path: Path) -> None:

@@ -947,7 +947,6 @@ def _render_debug_page(access_token: str) -> str:
       function updateOverview(envelope) {
         const data = envelope && envelope.data ? envelope.data : {};
         state.latestOverview = data;
-        setText(els.connectionText, "online");
         setText(els.networkLatency, fmt(envelope.__frontendLatencyMs, " ms"));
         for (const name of overviewNames) {
           const summary = data[name] || {};

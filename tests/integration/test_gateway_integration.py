@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import json
 from pathlib import Path
+import re
 import time
 from types import SimpleNamespace
 
@@ -32,6 +33,7 @@ from drivers.common.manifest import RobotDefaults, RobotManifest
 from drivers.go2.assembly import Go2RobotAssembly
 from gateways.app import create_gateway_app
 from gateways.auth import GatewayAccessManager
+from gateways.http.debug_panel import _render_debug_page
 from gateways.relay.server import create_relay_app
 from gateways.runtime import create_default_gateway_runtime
 from gateways.ws.data_streams import build_data_stream_router
@@ -3294,3 +3296,13 @@ def test_gateway_debug_panel_readonly_routes(tmp_path: Path) -> None:
         assert client.post("/api/debug/pointcloud-map/latest/meta", headers=_agent_headers()).status_code == 405
         assert client.patch("/api/debug/navigation", headers=_agent_headers()).status_code == 405
         assert client.delete("/api/debug/navigation", headers=_agent_headers()).status_code == 405
+
+
+def test_gateway_debug_panel_overview_does_not_overwrite_stream_connection_status() -> None:
+    """overview 聚合刷新不应把已连接的实时流状态刷回 online。"""
+
+    html = _render_debug_page("agent-token")
+    match = re.search(r"function updateOverview\([^)]*\) \{(?P<body>.*?)\n      \}", html, re.S)
+    assert match is not None
+
+    assert "connectionText" not in match.group("body")

@@ -11,7 +11,7 @@ from contracts.map_workspace import MapVersion
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.pointcloud import PointCloudFrame
-from contracts.robot_state import IMUState, RobotControlMode
+from contracts.robot_state import BatteryState, IMUState, RobotControlMode
 from contracts.runtime_views import MapSnapshot
 from drivers.common import ManagedRobotDataPlane, MotionCommandDataPlane
 from drivers.entry import create_active_robot_assembly, get_active_robot_registration, load_active_robot_private_capability_specs
@@ -225,6 +225,7 @@ class FakeGo2DataPlane:
         )
         self.navigation_state = NavigationState(status=NavigationStatus.IDLE, current_pose=self.pose)
         self.exploration_state = ExplorationState(status=ExplorationStatus.IDLE)
+        self.battery_state = BatteryState(percentage=88.0, voltage_v=28.2, current_a=-1.1, temperature_c=31.0)
         self.motion_commands: List[Tuple[float, float, float]] = []
         self.motion_stop_count = 0
 
@@ -323,6 +324,9 @@ class FakeGo2DataPlane:
     def get_imu_state(self) -> Optional[IMUState]:
         return IMUState(frame_id="odom/imu")
 
+    def get_battery_state(self) -> Optional[BatteryState]:
+        return self.battery_state
+
     def can_accept_motion_command(self) -> bool:
         return self.started
 
@@ -397,10 +401,13 @@ def test_go2_provider_exposes_local_point_cloud_when_data_plane_supports_it() ->
     assembly.start()
 
     point_cloud = assembly.providers.get_latest_point_cloud()
+    robot_state = assembly.providers.get_robot_state()
 
     assert point_cloud is not None
     assert point_cloud.frame_id == "odom"
     assert point_cloud.point_count == 1
+    assert robot_state.battery is not None
+    assert robot_state.battery.percentage == 88.0
 
 
 def test_go2_low_level_mode_and_capability_matrix_are_consistent() -> None:

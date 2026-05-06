@@ -145,6 +145,25 @@ def _build_sport_mode_state_message(*, x: float, y: float, z: float = 0.0) -> Si
     )
 
 
+def _build_low_state_message(
+    *,
+    soc: int = 87,
+    power_v: float = 28.4,
+    power_a: float = -1.2,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        bms_state=SimpleNamespace(
+            soc=soc,
+            bq_ntc=[30, 31],
+            mcu_ntc=[32, 33],
+            status=8,
+            current=-1200,
+        ),
+        power_v=power_v,
+        power_a=power_a,
+    )
+
+
 def _build_point_cloud_message(points_xyz: list[tuple[float, float, float]]) -> SimpleNamespace:
     data = bytearray()
     for x, y, z in points_xyz:
@@ -201,26 +220,34 @@ def test_go2_data_plane_config_defaults_to_direct_dds_topics(monkeypatch) -> Non
 
     assert config.direct_dds.enabled is True
     assert config.direct_dds.pose_topic == "rt/sportmodestate"
+    assert config.direct_dds.low_state_topic == "rt/lowstate"
     assert config.direct_dds.point_cloud_topic == "rt/utlidar/cloud"
     assert config.official.enabled is True
 
 
-def test_go2_bridge_exposes_direct_dds_pose_and_imu_state() -> None:
+def test_go2_bridge_exposes_direct_dds_pose_imu_and_battery_state() -> None:
     bridge = RclpyGo2RosBridge(Go2DataPlaneConfig(enabled=True))
 
     initial_status = bridge.get_status()
 
     assert bridge.get_current_pose() is None
     assert bridge.get_imu_state() is None
+    assert bridge.get_battery_state() is None
     assert initial_status["dds_pose_ready"] is False
     assert initial_status["dds_imu_ready"] is False
+    assert initial_status["dds_battery_ready"] is False
 
     bridge._on_sport_mode_state(
         _build_sport_mode_state_message(x=2.0, y=3.0),
         source_topic="dds:rt/sportmodestate",
     )
+    bridge._on_low_state(
+        _build_low_state_message(),
+        source_topic="dds:rt/lowstate",
+    )
     dds_pose = bridge.get_current_pose()
     imu_state = bridge.get_imu_state()
+    battery_state = bridge.get_battery_state()
     dds_status = bridge.get_status()
 
     assert dds_pose is not None
@@ -229,10 +256,17 @@ def test_go2_bridge_exposes_direct_dds_pose_and_imu_state() -> None:
     assert imu_state is not None
     assert imu_state.angular_velocity_rad_s.z == 0.3
     assert imu_state.linear_acceleration_m_s2.z == 3.0
+    assert battery_state is not None
+    assert battery_state.percentage == 87
+    assert battery_state.voltage_v == 28.4
+    assert battery_state.current_a == -1.2
+    assert battery_state.temperature_c == 31.5
     assert dds_status["pose_source"] == "dds:rt/sportmodestate"
     assert dds_status["imu_source_topic"] == "dds:rt/sportmodestate#imu_state"
+    assert dds_status["battery_source_topic"] == "dds:rt/lowstate"
     assert dds_status["dds_pose_ready"] is True
     assert dds_status["dds_imu_ready"] is True
+    assert dds_status["dds_battery_ready"] is True
 
 
 def test_go2_bridge_exposes_direct_dds_point_cloud_without_building_maps() -> None:

@@ -6,7 +6,7 @@ from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 from contracts.geometry import FrameTree, Pose, Quaternion, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.pointcloud import PointCloudFrame
-from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
+from contracts.robot_state import BatteryState, IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.common import MotionCommandDataPlane
 from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO
 from providers.image import ImageProvider
@@ -91,6 +91,7 @@ class Go2ProviderBundle(
             pose=self._read_current_pose_for_state(),
             joints=self.get_joint_states(),
             imu=self.get_imu_state(),
+            battery=self.get_battery_state(),
             safety=self.get_safety_state(),
             metadata=metadata,
         )
@@ -147,6 +148,14 @@ class Go2ProviderBundle(
             ),
         )
 
+    def get_battery_state(self) -> Optional[BatteryState]:
+        if self.assembly.data_plane is None:
+            return None
+        getter = getattr(self.assembly.data_plane, "get_battery_state", None)
+        if not callable(getter):
+            return None
+        return getter()
+
     def capture_image(self, camera_id: Optional[str] = None) -> ImageFrame:
         image_bytes = self.assembly.capture_image_bytes()
         camera_info = self.get_camera_info(camera_id)
@@ -199,6 +208,7 @@ class Go2ProviderBundle(
             pose=pose,
             joints=self.get_joint_states(),
             imu=self.get_imu_state(),
+            battery=self.get_battery_state(),
             safety=self.get_safety_state(),
             metadata={
                 "control_mode": self.assembly.current_mode,

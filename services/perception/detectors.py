@@ -301,21 +301,15 @@ class MetadataDrivenDetectorBackend(DetectorBackend):
         raise GatewayError("检测元数据必须是列表或可迭代对象。")
 
 
-class UltralyticsYoloDetectorBackend(DetectorBackend):
-    """基于 Ultralytics YOLO 的生产级本地检测后端。
-
-    默认优先使用 TensorRT 引擎文件：
-    1. 若明确给出 `.engine`，直接按 TensorRT 方式加载；
-    2. 若给出 `.pt` 且存在同名或显式指定的 `.engine`，优先加载 `.engine`；
-    3. 若 TensorRT 引擎不存在，则自动回退到 `.pt`，避免宿主机启动失败。
-    """
+class _YoloWorldRuntimeBackend(DetectorBackend):
+    """YOLO-World 的 Ultralytics 运行时封装。"""
 
     def __init__(
         self,
         *,
-        name: str = "yolo_local",
-        weights: str = "yolo26n.pt",
-        runtime_preference: str = "tensorrt",
+        name: str = "yolo_world",
+        weights: str = "yolov8s-world.pt",
+        runtime_preference: str = "pytorch",
         engine_path: str = "",
         device: str = "",
         half: bool = True,
@@ -325,8 +319,8 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
         image_size: int = 640,
         max_detections: int = 100,
     ) -> None:
-        self._weights = str(weights).strip() or "yolo26n.pt"
-        self._runtime_preference = str(runtime_preference or "tensorrt").strip().lower()
+        self._weights = str(weights).strip() or "yolov8s-world.pt"
+        self._runtime_preference = str(runtime_preference or "pytorch").strip().lower()
         self._engine_path = str(engine_path).strip()
         self._device = str(device).strip()
         self._half = bool(half)
@@ -337,15 +331,15 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
         self._max_detections = max(1, int(max_detections))
         self._model = None
         self._resolved_model_source = ""
-        self._resolved_backend_kind = "ultralytics_yolo"
+        self._resolved_backend_kind = "yolo_world"
         provider_metadata = resolve_detection_provider_spec(
             backend_name=name,
-            backend_kind="ultralytics_yolo",
+            backend_kind="yolo_world",
             model_name=self._weights,
         ).to_metadata()
         self.spec = DetectorBackendSpec(
             name=name,
-            backend_kind="ultralytics_yolo",
+            backend_kind="yolo_world",
             metadata={
                 "provider": provider_metadata,
                 **provider_metadata,
@@ -406,14 +400,14 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
             from ultralytics import YOLO
         except ImportError as exc:
             raise RuntimeError(
-                "当前环境未安装 ultralytics，无法启用本地 YOLO 检测。"
+                "当前环境未安装 ultralytics，无法启用 YOLO-World 检测。"
             ) from exc
         model_source, backend_kind = self._resolve_model_source()
         self._model = YOLO(model_source)
         self._resolved_model_source = model_source
         self._resolved_backend_kind = backend_kind
         DETECTOR_LOGGER.info(
-            "YOLO 本地检测后端已加载 source=%s backend=%s preference=%s",
+            "YOLO-World 检测后端已加载 source=%s backend=%s preference=%s",
             model_source,
             backend_kind,
             self._runtime_preference,
@@ -425,7 +419,7 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
         explicit_engine_path = Path(self._engine_path) if self._engine_path else None
 
         if weights_path.suffix.lower() == ".engine":
-            return str(weights_path), "ultralytics_yolo_tensorrt"
+            return str(weights_path), "yolo_world_tensorrt"
 
         engine_candidates = []
         if explicit_engine_path is not None:
@@ -436,7 +430,7 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
         if self._runtime_preference in ("tensorrt", "auto"):
             for candidate in engine_candidates:
                 if candidate.exists():
-                    return str(candidate), "ultralytics_yolo_tensorrt"
+                    return str(candidate), "yolo_world_tensorrt"
             if self._runtime_preference == "tensorrt":
                 DETECTOR_LOGGER.warning(
                     "未找到 TensorRT 引擎，已回退到原始权重 source=%s candidates=%s",
@@ -444,7 +438,7 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
                     [str(item) for item in engine_candidates],
                 )
 
-        return self._weights, "ultralytics_yolo_pytorch"
+        return self._weights, "yolo_world_pytorch"
 
     def _normalize_yolo_result(
         self,
@@ -611,7 +605,7 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
             quality=quality,
             frame_id=image_frame.frame_id,
             camera_id=image_frame.camera_id,
-            source="ultralytics_yolo_masks",
+            source="yolo_world_masks",
             attributes={"grounding_score": _clamp_score(score)},
         )
         attributes = {
@@ -627,7 +621,7 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
             "segmentation_available": True,
             "segmentation_status": "segmentation_preferred",
             "segmentation_priority": "segmentation_over_bbox",
-            "segmentation_source": "ultralytics_yolo_masks",
+            "segmentation_source": "yolo_world_masks",
             "frame_id": image_frame.frame_id,
             "camera_id": image_frame.camera_id,
         }
@@ -714,7 +708,7 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
         return [[float(item) for item in row] for row in payload]
 
 
-class YoloWorldDetectorBackend(UltralyticsYoloDetectorBackend):
+class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
     """基于 Ultralytics YOLO-World 的开放词汇检测后端。"""
 
     def __init__(

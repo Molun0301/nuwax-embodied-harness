@@ -51,15 +51,7 @@ from services.mapping import MappingService, MapWorkspaceService
 from services.memory import MemoryService
 from services.navigation import NavigationService
 from services.observation_service import ObservationService
-from services.perception import PerceptionService
-from services.perception import (
-    Basic2DTrackerBackend,
-    DetectorPipeline,
-    DisabledSegmentationBackend,
-    MetadataDrivenDetectorBackend,
-    PerceptionVideoRuntime,
-    SimpleSceneDescriptionBackend,
-)
+from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
 from services.robot_state_service import RobotStateService
 from skills import SkillRegistry
 from logging_utils import LogRateLimiter
@@ -191,34 +183,10 @@ def _descriptor(
     )
 
 
-def _build_perception_components(robot: RobotAssemblyBase) -> Dict[str, Any]:
-    """解析机器人入口提供的默认感知处理管线。"""
+def _build_perception_components(config: NuwaxRobotBridgeConfig) -> Dict[str, Any]:
+    """构造平台侧默认感知处理管线。"""
 
-    default_components = {
-        "pipeline_name": "default_perception_pipeline",
-        "detector_pipeline": DetectorPipeline(
-            (MetadataDrivenDetectorBackend(),),
-            default_backend_name="metadata_detector",
-        ),
-        "tracker_backend": Basic2DTrackerBackend(),
-        "scene_description_backend": SimpleSceneDescriptionBackend(),
-        "segmentation_backend": DisabledSegmentationBackend(reason="runtime_default"),
-    }
-    factory = getattr(robot, "build_default_perception_pipeline", None)
-    if not callable(factory):
-        return default_components
-
-    custom_components = factory()
-    if not isinstance(custom_components, dict):
-        return default_components
-    return {
-        "pipeline_name": custom_components.get("pipeline_name") or default_components["pipeline_name"],
-        "detector_pipeline": custom_components.get("detector_pipeline") or default_components["detector_pipeline"],
-        "tracker_backend": custom_components.get("tracker_backend") or default_components["tracker_backend"],
-        "scene_description_backend": custom_components.get("scene_description_backend")
-        or default_components["scene_description_backend"],
-        "segmentation_backend": custom_components.get("segmentation_backend") or default_components["segmentation_backend"],
-    }
+    return build_platform_perception_components(config)
 
 
 class GatewayRuntime:
@@ -302,7 +270,7 @@ class GatewayRuntime:
             stream_bus=self.stream_bus,
             history_limit=config.runtime_data.map_history_limit,
         )
-        perception_components = _build_perception_components(robot)
+        perception_components = _build_perception_components(config)
         self.perception_service = PerceptionService(
             provider_owner=robot,
             localization_provider_owner=self.platform_geometry_runtime,

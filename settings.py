@@ -292,24 +292,6 @@ class VolumeControlConfig:
 
 
 @dataclass
-class PerceptionYoloConfig:
-    """本地 YOLO 感知配置。"""
-
-    enabled: bool = True
-    backend_name: str = "yolo_local"
-    model_name: str = str(BASE_DIR / "runtime_data" / "models" / "yolo26n.pt")
-    runtime_preference: str = "tensorrt"
-    engine_path: str = ""
-    device: str = ""
-    half: bool = True
-    int8: bool = False
-    image_size: int = 640
-    confidence_threshold: float = 0.25
-    iou_threshold: float = 0.45
-    max_detections: int = 100
-
-
-@dataclass
 class PerceptionYoloWorldConfig:
     """YOLO-World 开放词汇检测配置。"""
 
@@ -447,7 +429,6 @@ class PerceptionConfig:
     default_detector_backend: str = "yolo_world"
     default_scene_backend: str = "hybrid_scene"
     default_segmentation_backend: str = "segmentation_disabled"
-    yolo: PerceptionYoloConfig = field(default_factory=PerceptionYoloConfig)
     yolo_world: PerceptionYoloWorldConfig = field(default_factory=PerceptionYoloWorldConfig)
     tracker: PerceptionTrackerConfig = field(default_factory=PerceptionTrackerConfig)
     openai_vision: PerceptionOpenAIVisionConfig = field(default_factory=PerceptionOpenAIVisionConfig)
@@ -655,32 +636,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
         default_segmentation_backend=_cfg_str(
             "NUWAX_PERCEPTION_DEFAULT_SEGMENTATION_BACKEND",
             "segmentation_disabled",
-        ),
-        yolo=PerceptionYoloConfig(
-            enabled=_cfg_bool("NUWAX_PERCEPTION_YOLO_ENABLED", True),
-            backend_name=_cfg_str("NUWAX_PERCEPTION_YOLO_BACKEND_NAME", "yolo_local"),
-            model_name=_cfg_str(
-                "NUWAX_PERCEPTION_YOLO_MODEL",
-                str(BASE_DIR / "runtime_data" / "models" / "yolo26n.pt"),
-            ),
-            runtime_preference=_cfg_str("NUWAX_PERCEPTION_YOLO_RUNTIME", "tensorrt"),
-            engine_path=_cfg_str(
-                "NUWAX_PERCEPTION_YOLO_ENGINE_PATH",
-                str(BASE_DIR / "runtime_data" / "models" / "yolo26n.engine"),
-            ),
-            device=_cfg_str("NUWAX_PERCEPTION_YOLO_DEVICE", ""),
-            half=_cfg_bool("NUWAX_PERCEPTION_YOLO_HALF", True),
-            int8=_cfg_bool("NUWAX_PERCEPTION_YOLO_INT8", False),
-            image_size=max(32, _cfg_int("NUWAX_PERCEPTION_YOLO_IMAGE_SIZE", 640)),
-            confidence_threshold=max(
-                0.0,
-                min(1.0, _cfg_float("NUWAX_PERCEPTION_YOLO_CONFIDENCE", 0.25)),
-            ),
-            iou_threshold=max(
-                0.0,
-                min(1.0, _cfg_float("NUWAX_PERCEPTION_YOLO_IOU", 0.45)),
-            ),
-            max_detections=max(1, _cfg_int("NUWAX_PERCEPTION_YOLO_MAX_DETECTIONS", 100)),
         ),
         yolo_world=PerceptionYoloWorldConfig(
             enabled=_cfg_bool("NUWAX_PERCEPTION_YOLO_WORLD_ENABLED", True),

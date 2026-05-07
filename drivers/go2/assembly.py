@@ -15,7 +15,6 @@ from drivers.go2.defaults import GO2_TIMEOUTS, build_go2_defaults
 from drivers.go2.manifest import build_go2_manifest
 from drivers.go2.providers import Go2ProviderBundle
 from drivers.go2.settings import load_go2_data_plane_config
-from services.model_providers import resolve_scene_semantic_provider_spec, resolve_segmentation_provider_spec
 
 if TYPE_CHECKING:
     from settings import NuwaxRobotBridgeConfig
@@ -99,7 +98,6 @@ class Go2RobotAssembly(RobotAssemblyBase):
         elif isinstance(self.data_plane, Go2DataPlaneRuntime):
             self.data_plane = Go2DeviceDataPlane(self.data_plane)
         self.providers = Go2ProviderBundle(self)
-        self.perception_pipeline = self.build_default_perception_pipeline()
         self.sport_client = None
         self.video_client = None
         self.vui_client = None
@@ -231,182 +229,6 @@ class Go2RobotAssembly(RobotAssemblyBase):
         self._last_motion_stop_errors = errors
         if errors:
             raise RuntimeError("Go2 统一停止部分通道失败: " + "; ".join(errors))
-
-    def build_default_perception_pipeline(self) -> Dict[str, Any]:
-        """构造 Go2 默认感知处理管线。
-
-        当前默认实现采用“本地稳定检测 + 云端可选语义增强”的双层结构：
-        1. 输入统一为 Go2 图像提供器返回的 `ImageFrame/CameraInfo`。
-        2. 本地检测默认使用可替换的 YOLO 后端，并保留元数据回退后端。
-        3. 跟踪和场景摘要在宿主机运行时层完成。
-        4. 云端语义识别统一通过 OpenAI SDK 兼容接口接入。
-        """
-
-        from services.perception import (
-            BBoxOnlySegmentationBackend,
-            Basic2DTrackerBackend,
-            ByteTrackTrackerBackend,
-            DetectionAttributesSegmentationBackend,
-            DetectorPipeline,
-            DisabledSegmentationBackend,
-            HybridSceneDescriptionBackend,
-            MetadataDrivenDetectorBackend,
-            OpenAICompatibleVisionSceneDescriptionBackend,
-            SimpleSceneDescriptionBackend,
-            UltralyticsYoloDetectorBackend,
-            YoloWorldDetectorBackend,
-        )
-
-        metadata_detector_name = "go2_metadata_detector"
-        detector_backends = [
-            MetadataDrivenDetectorBackend(name=metadata_detector_name),
-        ]
-        if self.config.perception.yolo.enabled:
-            detector_backends.insert(
-                0,
-                UltralyticsYoloDetectorBackend(
-                    name=self.config.perception.yolo.backend_name,
-                    weights=self.config.perception.yolo.model_name,
-                    runtime_preference=self.config.perception.yolo.runtime_preference,
-                    engine_path=self.config.perception.yolo.engine_path,
-                    device=self.config.perception.yolo.device,
-                    half=self.config.perception.yolo.half,
-                    int8=self.config.perception.yolo.int8,
-                    confidence_threshold=self.config.perception.yolo.confidence_threshold,
-                    iou_threshold=self.config.perception.yolo.iou_threshold,
-                    image_size=self.config.perception.yolo.image_size,
-                    max_detections=self.config.perception.yolo.max_detections,
-                ),
-            )
-        if self.config.perception.yolo_world.enabled:
-            detector_backends.insert(
-                0,
-                YoloWorldDetectorBackend(
-                    name=self.config.perception.yolo_world.backend_name,
-                    weights=self.config.perception.yolo_world.model_name,
-                    runtime_preference=self.config.perception.yolo_world.runtime_preference,
-                    engine_path=self.config.perception.yolo_world.engine_path,
-                    device=self.config.perception.yolo_world.device,
-                    half=self.config.perception.yolo_world.half,
-                    int8=self.config.perception.yolo_world.int8,
-                    confidence_threshold=self.config.perception.yolo_world.confidence_threshold,
-                    iou_threshold=self.config.perception.yolo_world.iou_threshold,
-                    image_size=self.config.perception.yolo_world.image_size,
-                    max_detections=self.config.perception.yolo_world.max_detections,
-                    class_names=self.config.perception.yolo_world.class_names,
-                    class_aliases=self.config.perception.yolo_world.class_aliases,
-                    dynamic_class_metadata_keys=self.config.perception.yolo_world.dynamic_class_metadata_keys,
-                ),
-            )
-
-        registered_detector_names = {backend.spec.name for backend in detector_backends}
-        default_detector_name = self.config.perception.default_detector_backend
-        if default_detector_name not in registered_detector_names:
-            default_detector_name = detector_backends[0].spec.name
-
-        local_scene_backend = SimpleSceneDescriptionBackend(name="go2_rule_scene_describer")
-        cloud_scene_backend = None
-        if self.config.perception.openai_vision.enabled:
-            cloud_scene_backend = OpenAICompatibleVisionSceneDescriptionBackend(
-                name=self.config.perception.openai_vision.backend_name,
-                model=self.config.perception.openai_vision.model_name,
-                api_key=self.config.perception.openai_vision.api_key,
-                base_url=self.config.perception.openai_vision.base_url,
-                api_style=self.config.perception.openai_vision.api_style,
-                timeout_sec=self.config.perception.openai_vision.timeout_sec,
-                max_tokens=self.config.perception.openai_vision.max_tokens,
-                temperature=self.config.perception.openai_vision.temperature,
-            )
-
-        scene_provider_spec = resolve_scene_semantic_provider_spec(
-            self.config.perception.default_scene_backend,
-            cloud_enabled=cloud_scene_backend is not None and cloud_scene_backend.is_enabled(),
-            cloud_model_name=self.config.perception.openai_vision.model_name,
-            local_backend_name=local_scene_backend.spec.name,
-            cloud_backend_name=(cloud_scene_backend.spec.name if cloud_scene_backend is not None else "openai_vision"),
-        )
-        if scene_provider_spec.provider_kind == "local":
-            scene_backend = local_scene_backend
-        elif scene_provider_spec.provider_kind == "cloud" and cloud_scene_backend is not None:
-            scene_backend = cloud_scene_backend
-        else:
-            scene_backend = HybridSceneDescriptionBackend(
-                local_backend=local_scene_backend,
-                cloud_backend=cloud_scene_backend,
-                name="go2_hybrid_scene_describer",
-            )
-
-        segmentation_config = self.config.perception.segmentation
-        configured_segmentation_name = (
-            (segmentation_config.backend_name or "").strip()
-            or self.config.perception.default_segmentation_backend
-        )
-        segmentation_provider_spec = resolve_segmentation_provider_spec(
-            enabled=segmentation_config.enabled,
-            backend_name=configured_segmentation_name,
-            backend_kind=segmentation_config.backend_kind,
-            route=segmentation_config.route,
-            default_backend_name=self.config.perception.default_segmentation_backend,
-            primary_backend_name=segmentation_config.primary_backend_name,
-            low_latency_backend_name=segmentation_config.low_latency_backend_name,
-            allow_bbox_only_fallback=segmentation_config.allow_bbox_only_fallback,
-            quality_thresholds=segmentation_config.quality_thresholds(),
-            output_policy=segmentation_config.output_policy(),
-        )
-        segmentation_metadata = segmentation_provider_spec.to_metadata()
-        if segmentation_provider_spec.provider_kind == "passthrough":
-            segmentation_backend = DetectionAttributesSegmentationBackend(
-                name=segmentation_provider_spec.backend_name,
-                configured_backend_name=segmentation_provider_spec.backend_name,
-                configured_backend_kind=segmentation_config.backend_kind,
-                metadata=segmentation_metadata,
-            )
-        elif segmentation_provider_spec.provider_kind == "bbox_only_fallback" and segmentation_config.allow_bbox_only_fallback:
-            segmentation_backend = BBoxOnlySegmentationBackend(
-                name=segmentation_provider_spec.backend_name,
-                configured_backend_name=segmentation_provider_spec.backend_name,
-                configured_backend_kind="bbox_only_fallback",
-                metadata=segmentation_metadata,
-            )
-        else:
-            reason = str(
-                segmentation_provider_spec.metadata.get("fallback_reason")
-                or segmentation_provider_spec.metadata.get("reason")
-                or "provider_not_available"
-            )
-            disabled_metadata = {
-                **segmentation_metadata,
-                "reason": reason,
-            }
-            segmentation_backend = DisabledSegmentationBackend(
-                configured_enabled=segmentation_config.enabled,
-                configured_backend_name=segmentation_provider_spec.backend_name,
-                configured_backend_kind=segmentation_config.backend_kind,
-                reason=reason,
-                metadata=disabled_metadata,
-            )
-
-        tracker_backend = ByteTrackTrackerBackend(
-            name=self.config.perception.tracker.bytetrack_name,
-            high_threshold=self.config.perception.tracker.high_threshold,
-            low_threshold=self.config.perception.tracker.low_threshold,
-            iou_match_threshold=self.config.perception.tracker.iou_match_threshold,
-            lost_ttl_frames=self.config.perception.tracker.lost_ttl_frames,
-            trajectory_limit=self.config.perception.tracker.trajectory_limit,
-        )
-        if self.config.perception.tracker.default_backend.strip().lower() not in {"bytetrack", "byte_track"}:
-            tracker_backend = Basic2DTrackerBackend(name="go2_basic_2d_tracker")
-
-        return {
-            "pipeline_name": "go2_default_perception_pipeline",
-            "detector_pipeline": DetectorPipeline(
-                tuple(detector_backends),
-                default_backend_name=default_detector_name,
-            ),
-            "tracker_backend": tracker_backend,
-            "scene_description_backend": scene_backend,
-            "segmentation_backend": segmentation_backend,
-        }
 
     def _require_high_level(self) -> None:
         self.ensure_high_level_clients()

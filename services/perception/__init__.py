@@ -16,7 +16,8 @@ from services.perception.base import (
     TrackerBackend,
     TrackerBackendSpec,
 )
-from services.perception.detectors import DetectorPipeline, MetadataDrivenDetectorBackend, UltralyticsYoloDetectorBackend, YoloWorldDetectorBackend
+from services.perception.detectors import DetectorPipeline, MetadataDrivenDetectorBackend, YoloWorldDetectorBackend
+from services.perception.factory import build_platform_perception_components
 from services.perception.keyframe import KeyframeDecision, PerceptionKeyframeSelector
 from services.perception.scene import (
     HybridSceneDescriptionBackend,
@@ -28,6 +29,7 @@ from services.perception.trackers import Basic2DTrackerBackend, ByteTrackTracker
 from services.perception.video_runtime import PerceptionVideoRuntime
 
 __all__ = [
+    "build_platform_perception_components",
     "BBoxOnlySegmentationBackend",
     "Basic2DTrackerBackend",
     "ByteTrackTrackerBackend",
@@ -54,6 +56,5 @@ __all__ = [
     "TrackLifecyclePolicy",
     "TrackerBackend",
     "TrackerBackendSpec",
-    "UltralyticsYoloDetectorBackend",
     "YoloWorldDetectorBackend",
 ]

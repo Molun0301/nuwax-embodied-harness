@@ -129,7 +129,7 @@ class Go2MapBuilder : public rclcpp::Node {
     pcl::PointCloud<PointType>::Ptr transformed_cloud;
     Eigen::Matrix4f output_transform;
     if (latest_odom_received_ && lookupOutputTransform(&output_transform)) {
-      transformed_cloud = std::make_shared<pcl::PointCloud<PointType>>();
+      transformed_cloud = boost::make_shared<pcl::PointCloud<PointType>>();
       pcl::transformPointCloud(*map_cloud_, *transformed_cloud, output_transform);
       save_cloud = transformed_cloud;
     } else {
@@ -224,7 +224,7 @@ class Go2MapBuilder : public rclcpp::Node {
 
   pcl::PointCloud<PointType>::Ptr downsampleForIcp(
       const pcl::PointCloud<PointType> &input_cloud) const {
-    auto downsampled = std::make_shared<pcl::PointCloud<PointType>>(input_cloud);
+    auto downsampled = boost::make_shared<pcl::PointCloud<PointType>>(input_cloud);
     if (downsampled->empty() || icp_scan_voxel_leaf_size_ <= 0.0) {
       return downsampled;
     }
@@ -234,7 +234,7 @@ class Go2MapBuilder : public rclcpp::Node {
         static_cast<float>(icp_scan_voxel_leaf_size_),
         static_cast<float>(icp_scan_voxel_leaf_size_));
     voxel.setInputCloud(downsampled);
-    auto filtered = std::make_shared<pcl::PointCloud<PointType>>();
+    auto filtered = boost::make_shared<pcl::PointCloud<PointType>>();
     voxel.filter(*filtered);
     return filtered;
   }

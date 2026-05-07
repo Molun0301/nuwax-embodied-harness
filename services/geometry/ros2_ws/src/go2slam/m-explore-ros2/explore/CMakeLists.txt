@@ -87,18 +87,20 @@ target_include_directories(explore PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 
-target_link_libraries(explore PUBLIC
-  ${explore_lite_msgs_TARGETS}
-  ${geometry_msgs_TARGETS}
-  ${map_msgs_TARGETS}
-  ${nav2_msgs_TARGETS}
-  ${nav_msgs_TARGETS}
-  ${std_msgs_TARGETS}
-  ${visualization_msgs_TARGETS}
-  nav2_costmap_2d::filters
-  rclcpp::rclcpp
-  tf2::tf2
-  tf2_ros::tf2_ros
+ament_target_dependencies(explore
+  rclcpp
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  tf2_ros
+  tf2
+  tf2_geometry_msgs
+  nav2_msgs
+  nav_msgs
+  map_msgs
+  nav2_costmap_2d
+  visualization_msgs
+  explore_lite_msgs
 )
 
 install(TARGETS explore

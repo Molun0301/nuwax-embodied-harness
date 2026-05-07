@@ -50,7 +50,7 @@
 #include <utility>
 
 #include "sensor_msgs/point_cloud2_iterator.hpp"
-#include "tf2_sensor_msgs/tf2_sensor_msgs.hpp"
+#include "tf2_sensor_msgs/tf2_sensor_msgs.h"
 #include "tf2_ros/create_timer_ros.h"
 #include "tf2/LinearMath/Transform.h"
 #include "geometry_msgs/msg/transform_stamped.hpp"

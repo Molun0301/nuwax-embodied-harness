@@ -8,7 +8,7 @@
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <rclcpp/time.hpp>
 #include <tf2/LinearMath/Quaternion.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 
 namespace go2_navigation2 {
 

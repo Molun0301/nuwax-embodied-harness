@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.8)
 project(go2_navigation2)
 
+include(CheckIncludeFileCXX)
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -80,27 +82,33 @@ ament_target_dependencies(
   "geometry_msgs"
 )
 
-# ClimbStairsTask plugin
-add_library(climb_stairs_task SHARED
-  src/climb_stairs_task.cpp
-)
-target_include_directories(climb_stairs_task PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-target_compile_features(climb_stairs_task PUBLIC cxx_std_17)
-ament_target_dependencies(
-  climb_stairs_task
-  "rclcpp"
-  "rclcpp_lifecycle"
-  "geometry_msgs"
-  "nav2_core"
-  "nav2_util"
-  "pluginlib"
-)
+check_include_file_cxx("nav2_core/waypoint_task_executor.hpp" HAVE_NAV2_WAYPOINT_TASK_EXECUTOR)
+if(HAVE_NAV2_WAYPOINT_TASK_EXECUTOR)
+  add_library(climb_stairs_task SHARED
+    src/climb_stairs_task.cpp
+  )
+  target_include_directories(climb_stairs_task PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+  target_compile_features(climb_stairs_task PUBLIC cxx_std_17)
+  ament_target_dependencies(
+    climb_stairs_task
+    "rclcpp"
+    "rclcpp_lifecycle"
+    "geometry_msgs"
+    "nav2_core"
+    "nav2_util"
+    "pluginlib"
+  )
 
-pluginlib_export_plugin_description_file(nav2_core climb_stairs_plugin.xml)
+  pluginlib_export_plugin_description_file(nav2_core climb_stairs_plugin.xml)
+  install(TARGETS climb_stairs_task
+    DESTINATION lib/${PROJECT_NAME})
+else()
+  message(STATUS "nav2_core/waypoint_task_executor.hpp not found; skipping climb_stairs_task plugin")
+endif()
 
-install(TARGETS navigation front_align_cmd_vel_gate pcd_initial_pose_publisher initial_pose_spin_relocalizer climb_stairs_task
+install(TARGETS navigation front_align_cmd_vel_gate pcd_initial_pose_publisher initial_pose_spin_relocalizer
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config rviz

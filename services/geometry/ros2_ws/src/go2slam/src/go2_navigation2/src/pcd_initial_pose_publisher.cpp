@@ -50,7 +50,7 @@ Eigen::Matrix4f transformToEigen(
 pcl::PointCloud<PointType>::Ptr downsampleCloud(
     const pcl::PointCloud<PointType>::Ptr &input,
     const double voxel_leaf_size) {
-  auto cleaned = std::make_shared<pcl::PointCloud<PointType>>();
+  pcl::PointCloud<PointType>::Ptr cleaned(new pcl::PointCloud<PointType>());
   std::vector<int> indices;
   pcl::removeNaNFromPointCloud(*input, *cleaned, indices);
 
@@ -65,7 +65,7 @@ pcl::PointCloud<PointType>::Ptr downsampleCloud(
       static_cast<float>(voxel_leaf_size));
   voxel.setInputCloud(cleaned);
 
-  auto filtered = std::make_shared<pcl::PointCloud<PointType>>();
+  pcl::PointCloud<PointType>::Ptr filtered(new pcl::PointCloud<PointType>());
   voxel.filter(*filtered);
   return filtered;
 }
@@ -120,7 +120,7 @@ class PcdInitialPosePublisher : public rclcpp::Node {
       return false;
     }
 
-    auto raw_map = std::make_shared<pcl::PointCloud<PointType>>();
+    pcl::PointCloud<PointType>::Ptr raw_map(new pcl::PointCloud<PointType>());
     if (pcl::io::loadPCDFile<PointType>(pcd_path_, *raw_map) != 0) {
       RCLCPP_ERROR(get_logger(), "Failed to load PCD map: %s", pcd_path_.c_str());
       return false;
@@ -184,9 +184,8 @@ class PcdInitialPosePublisher : public rclcpp::Node {
       return;
     }
 
-    auto source_cloud = downsampleCloud(
-        std::make_shared<pcl::PointCloud<PointType>>(cloud_in_base),
-        source_voxel_leaf_size_);
+    pcl::PointCloud<PointType>::Ptr raw_source(new pcl::PointCloud<PointType>(cloud_in_base));
+    auto source_cloud = downsampleCloud(raw_source, source_voxel_leaf_size_);
     if (static_cast<int>(source_cloud->size()) < min_source_points_) {
       RCLCPP_WARN_THROTTLE(
           get_logger(),

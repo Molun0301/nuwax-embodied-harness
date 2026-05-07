@@ -628,6 +628,40 @@ class BootstrapPlanner:
             "NUWAX_GATEWAY_ADMIN_TOKENS": self.admin_token,
             "NUWAX_RELAY_ENABLED": _bool_text(self.relay_enabled),
         }
+        if self.selected_robot == "go2" and self.geometry_enabled:
+            values.update(
+                {
+                    "NUWAX_GEOMETRY_STACK": "go2slam_external",
+                    "NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR": "/usr/local/lib",
+                    "NUWAX_GEOMETRY_ODOM_TOPIC": "/odom",
+                    "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS": "/uslam/localization/odom,/lio_sam_ros2/mapping/odometry,/odom_lio",
+                    "NUWAX_GEOMETRY_IMU_TOPIC": "/utlidar/imu",
+                    "NUWAX_GEOMETRY_POINT_CLOUD_TOPIC": "/utlidar/cloud_deskewed",
+                    "NUWAX_GEOMETRY_TF_TOPIC": "/tf",
+                    "NUWAX_GEOMETRY_TF_STATIC_TOPIC": "/tf_static",
+                    "NUWAX_GEOMETRY_OCCUPANCY_TOPIC": "/map",
+                    "NUWAX_GEOMETRY_COST_MAP_TOPIC": "/global_costmap/costmap",
+                    "NUWAX_GEOMETRY_MAP_FRAME": "map",
+                    "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
+                    "NUWAX_GEOMETRY_BASE_FRAME": "base_footprint",
+                    "NUWAX_GEOMETRY_LIDAR_FRAME": "utlidar_lidar",
+                    "NUWAX_RTABMAP_LAUNCH_PACKAGE": "rtabmap_ros",
+                    "NUWAX_RTABMAP_LAUNCH_FILE": "rtabmap.launch.py",
+                    "NUWAX_RTABMAP_OCCUPANCY_PROJECTION": "projected_occupancy",
+                    "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(GO2SLAM_WS_DIR / "start_go2_slam_nav2.sh"),
+                    "NUWAX_GEOMETRY_EXTERNAL_ARGS": "--no-rviz",
+                    "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "/dev/null",
+                    "NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED": "false",
+                    "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED": "false",
+                    "NUWAX_NAV2_MODE": "external",
+                    "NUWAX_NAV2_ACTION_NAME": "/navigate_to_pose",
+                    "NUWAX_NAV2_LAUNCH_PACKAGE": "nav2_bringup",
+                    "NUWAX_NAV2_LAUNCH_FILE": "navigation_launch.py",
+                    "NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC": "/global_costmap/costmap",
+                    "NUWAX_NAV2_LOCAL_COSTMAP_TOPIC": "/local_costmap/costmap",
+                    "NUWAX_NAV2_COSTMAP_SOURCE": "nav2_global",
+                }
+            )
 
         if self.memory_mode == "cloud":
             values.update(

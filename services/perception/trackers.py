@@ -195,3 +195,233 @@ class Basic2DTrackerBackend(TrackerBackend):
                 result.append("_")
         normalized = "".join(result).strip("_")
         return normalized or "item"
+
+
+class ByteTrackTrackerBackend(TrackerBackend):
+    """ByteTrack 风格二维多目标跟踪后端。"""
+
+    def __init__(
+        self,
+        *,
+        name: str = "bytetrack_tracker",
+        high_threshold: float = 0.5,
+        low_threshold: float = 0.1,
+        iou_match_threshold: float = 0.3,
+        lost_ttl_frames: int = 30,
+        trajectory_limit: int = 12,
+    ) -> None:
+        self.spec = TrackerBackendSpec(
+            name=name,
+            backend_kind="bytetrack",
+            metadata={
+                "algorithm": "ByteTrack",
+                "high_threshold": max(0.0, min(1.0, float(high_threshold))),
+                "low_threshold": max(0.0, min(1.0, float(low_threshold))),
+                "iou_match_threshold": max(0.0, min(1.0, float(iou_match_threshold))),
+                "lost_ttl_frames": max(1, int(lost_ttl_frames)),
+                "trajectory_limit": max(2, int(trajectory_limit)),
+            },
+        )
+        self._high_threshold = float(self.spec.metadata["high_threshold"])
+        self._low_threshold = float(self.spec.metadata["low_threshold"])
+        self._iou_match_threshold = float(self.spec.metadata["iou_match_threshold"])
+        self._lost_ttl_frames = int(self.spec.metadata["lost_ttl_frames"])
+        self._trajectory_limit = int(self.spec.metadata["trajectory_limit"])
+        self._records_by_camera: Dict[str, Dict[str, _TrackRecord]] = {}
+        self._track_counter = itertools.count(1)
+
+    def update(
+        self,
+        image_frame: ImageFrame,
+        *,
+        detections_2d: Tuple[Detection2D, ...] = (),
+        detections_3d: Tuple[Detection3D, ...] = (),
+        camera_info: Optional[CameraInfo] = None,
+    ) -> Tuple[Track, ...]:
+        del detections_3d, camera_info
+        camera_id = image_frame.camera_id
+        records = self._records_by_camera.setdefault(camera_id, {})
+        matched_track_ids: Set[str] = set()
+        emitted: List[Track] = []
+        candidate_detections = [item for item in detections_2d if float(item.score) >= self._low_threshold]
+        high_detections = [item for item in candidate_detections if float(item.score) >= self._high_threshold]
+        low_detections = [item for item in candidate_detections if float(item.score) < self._high_threshold]
+
+        for detection in sorted(high_detections, key=lambda item: item.score, reverse=True):
+            record = self._match_record(records, detection, matched_track_ids)
+            if record is None:
+                record = self._create_record(camera_id, detection, image_frame.timestamp)
+                records[record.track_id] = record
+            else:
+                self._update_record(record, detection, image_frame.timestamp)
+            matched_track_ids.add(record.track_id)
+            emitted.append(record.to_contract())
+
+        for detection in sorted(low_detections, key=lambda item: item.score, reverse=True):
+            record = self._match_record(records, detection, matched_track_ids)
+            if record is None:
+                continue
+            self._update_record(record, detection, image_frame.timestamp)
+            matched_track_ids.add(record.track_id)
+            emitted.append(record.to_contract())
+
+        removed_track_ids: List[str] = []
+        for track_id, record in records.items():
+            if track_id in matched_track_ids:
+                continue
+            record.misses += 1
+            record.state = TrackState.LOST
+            self._refresh_record_metadata(record, last_seen_only=True)
+            if record.misses > self._lost_ttl_frames:
+                record.state = TrackState.REMOVED
+                emitted.append(record.to_contract())
+                removed_track_ids.append(track_id)
+                continue
+            emitted.append(record.to_contract())
+
+        for track_id in removed_track_ids:
+            records.pop(track_id, None)
+
+        return tuple(emitted)
+
+    def reset(self, camera_id: Optional[str] = None) -> None:
+        if camera_id is None:
+            self._records_by_camera.clear()
+            return
+        self._records_by_camera.pop(camera_id, None)
+
+    def _match_record(
+        self,
+        records: Dict[str, _TrackRecord],
+        detection: Detection2D,
+        matched_track_ids: Set[str],
+    ) -> Optional[_TrackRecord]:
+        best_record: Optional[_TrackRecord] = None
+        best_iou = 0.0
+        for record in records.values():
+            if record.track_id in matched_track_ids:
+                continue
+            if record.label != detection.label:
+                continue
+            if record.state == TrackState.REMOVED:
+                continue
+            iou = _bbox_iou(record.bbox, detection.bbox)
+            if iou < self._iou_match_threshold:
+                continue
+            if iou > best_iou:
+                best_iou = iou
+                best_record = record
+        return best_record
+
+    def _create_record(self, camera_id: str, detection: Detection2D, timestamp) -> _TrackRecord:
+        suffix = next(self._track_counter)
+        track_id = "bt_%s_%s_%04d" % (
+            self._normalize_fragment(camera_id),
+            self._normalize_fragment(detection.label),
+            suffix,
+        )
+        record = _TrackRecord(
+            track_id=track_id,
+            camera_id=camera_id,
+            label=detection.label,
+            bbox=detection.bbox,
+            score=detection.score,
+            hits=1,
+            misses=0,
+            state=TrackState.TRACKED,
+            attributes=dict(detection.attributes),
+        )
+        record.attributes = {
+            **dict(record.attributes or {}),
+            "tracker": "bytetrack",
+            "first_seen": timestamp.isoformat(),
+            "last_seen": timestamp.isoformat(),
+            "velocity_hint": {"du_px_per_sec": 0.0, "dv_px_per_sec": 0.0},
+            "short_trajectory": [self._trajectory_sample(detection, timestamp)],
+            "track_age_frames": 1,
+            "track_miss_frames": 0,
+        }
+        return record
+
+    def _update_record(self, record: _TrackRecord, detection: Detection2D, timestamp) -> None:
+        previous_center = self._bbox_center(record.bbox)
+        previous_timestamp = str((record.attributes or {}).get("last_seen") or "")
+        record.hits += 1
+        record.misses = 0
+        record.bbox = detection.bbox
+        record.score = detection.score
+        record.state = TrackState.TRACKED
+        attributes = {**dict(record.attributes or {}), **dict(detection.attributes)}
+        velocity_hint = {"du_px_per_sec": 0.0, "dv_px_per_sec": 0.0}
+        current_center = self._bbox_center(detection.bbox)
+        elapsed_sec = self._elapsed_seconds(previous_timestamp, timestamp)
+        if previous_center is not None and current_center is not None and elapsed_sec > 0.0:
+            velocity_hint = {
+                "du_px_per_sec": round((current_center[0] - previous_center[0]) / elapsed_sec, 6),
+                "dv_px_per_sec": round((current_center[1] - previous_center[1]) / elapsed_sec, 6),
+            }
+        trajectory = list(attributes.get("short_trajectory") or [])
+        trajectory.append(self._trajectory_sample(detection, timestamp))
+        attributes.update(
+            {
+                "tracker": "bytetrack",
+                "last_seen": timestamp.isoformat(),
+                "velocity_hint": velocity_hint,
+                "short_trajectory": trajectory[-self._trajectory_limit :],
+                "track_age_frames": record.hits,
+                "track_miss_frames": record.misses,
+            }
+        )
+        record.attributes = attributes
+
+    def _refresh_record_metadata(self, record: _TrackRecord, *, last_seen_only: bool = False) -> None:
+        attributes = dict(record.attributes or {})
+        attributes.update(
+            {
+                "tracker": "bytetrack",
+                "track_age_frames": record.hits,
+                "track_miss_frames": record.misses,
+            }
+        )
+        if not last_seen_only:
+            attributes.setdefault("last_seen", "")
+        record.attributes = attributes
+
+    def _trajectory_sample(self, detection: Detection2D, timestamp) -> Dict[str, object]:
+        center = self._bbox_center(detection.bbox) or (0.0, 0.0)
+        return {
+            "timestamp": timestamp.isoformat(),
+            "center_u_px": round(float(center[0]), 4),
+            "center_v_px": round(float(center[1]), 4),
+            "bbox": {
+                "x_px": round(float(detection.bbox.x_px), 4),
+                "y_px": round(float(detection.bbox.y_px), 4),
+                "width_px": round(float(detection.bbox.width_px), 4),
+                "height_px": round(float(detection.bbox.height_px), 4),
+            },
+            "score": round(float(detection.score), 6),
+        }
+
+    def _bbox_center(self, bbox: Optional[BoundingBox2D]) -> Optional[Tuple[float, float]]:
+        if bbox is None:
+            return None
+        return float(bbox.x_px) + (float(bbox.width_px) * 0.5), float(bbox.y_px) + (float(bbox.height_px) * 0.5)
+
+    def _elapsed_seconds(self, previous_timestamp: str, current_timestamp) -> float:
+        if not previous_timestamp:
+            return 0.0
+        try:
+            previous = current_timestamp.__class__.fromisoformat(previous_timestamp)
+        except ValueError:
+            return 0.0
+        return max(0.0, (current_timestamp - previous).total_seconds())
+
+    def _normalize_fragment(self, value: str) -> str:
+        result = []
+        for char in value.lower():
+            if char.isalnum():
+                result.append(char)
+            else:
+                result.append("_")
+        normalized = "".join(result).strip("_")
+        return normalized or "item"

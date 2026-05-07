@@ -112,7 +112,10 @@ class PerceptionService:
             backend_name=detector_backend_name,
         )
         stage_duration_ms["detector"] = self._elapsed_ms(stage_started_at)
-        stage_status["detector"] = "completed"
+        stage_status["detector"] = self._provider_stage_status(
+            detector_spec.backend_kind,
+            detection_bundle.metadata,
+        )
 
         stage_started_at = perf_counter()
         segmentation_bundle = self._segmentation_backend.segment(
@@ -139,7 +142,11 @@ class PerceptionService:
             camera_info=camera_info,
         )
         stage_duration_ms["geometry"] = self._elapsed_ms(stage_started_at)
-        stage_status["geometry"] = "completed"
+        stage_status["geometry"] = str(
+            detection_bundle.metadata.get("geometry_stage_status")
+            or detection_bundle.metadata.get("geometry_status")
+            or "completed"
+        )
 
         stage_started_at = perf_counter()
         tracks = self._tracker_backend.update(
@@ -504,9 +511,22 @@ class PerceptionService:
                 if track.bbox == detection.bbox:
                     matched_track_id = track.track_id
                     break
+            track_metadata = {}
+            if matched_track_id:
+                for track in tracks:
+                    if track.track_id == matched_track_id:
+                        track_metadata = dict(track.attributes or {})
+                        break
+            attributes = dict(detection.attributes or {})
+            resolved_track_id = matched_track_id or detection.track_id
+            if resolved_track_id:
+                attributes["track_id"] = resolved_track_id
+            for key in ("last_seen", "velocity_hint", "short_trajectory", "track_age_frames", "track_miss_frames", "tracker"):
+                if key in track_metadata:
+                    attributes[key] = track_metadata[key]
             assigned.append(
                 detection.model_copy(
-                    update={"track_id": matched_track_id or detection.track_id},
+                    update={"track_id": resolved_track_id, "attributes": attributes},
                     deep=True,
                 )
             )
@@ -544,10 +564,27 @@ class PerceptionService:
         camera_info,
     ):
         if camera_info is None or not detection_bundle.detections_2d:
-            return detection_bundle
+            return detection_bundle.__class__(
+                detections_2d=detection_bundle.detections_2d,
+                detections_3d=detection_bundle.detections_3d,
+                metadata={
+                    **dict(detection_bundle.metadata),
+                    "geometry_stage_status": "disabled" if not detection_bundle.detections_2d else "not_ready",
+                    "geometry_degraded_reason": "camera_info_missing" if detection_bundle.detections_2d else "no_detections",
+                },
+            )
         point_cloud_frame = self._latest_stream_payload("pointcloud.frame")
         if point_cloud_frame is None or not getattr(point_cloud_frame, "points", None):
-            return detection_bundle
+            return detection_bundle.__class__(
+                detections_2d=detection_bundle.detections_2d,
+                detections_3d=detection_bundle.detections_3d,
+                metadata={
+                    **dict(detection_bundle.metadata),
+                    "geometry_stage_status": "degraded",
+                    "geometry_degraded_reason": "pointcloud_unavailable",
+                    "geometry_projection_status": "pointcloud_unavailable",
+                },
+            )
 
         frame_tree = self._latest_stream_payload("localization.frame_tree")
         current_pose = self._latest_stream_payload("localization.pose")
@@ -559,14 +596,26 @@ class PerceptionService:
             frame_tree=frame_tree,
             current_pose=current_pose,
         )
+        support_count = int(geometry_metadata.get("geometry_support_point_total") or 0)
+        geometry_stage_status = "completed" if support_count > 0 else "degraded"
         if detections_2d == detection_bundle.detections_2d and not geometry_metadata:
-            return detection_bundle
+            return detection_bundle.__class__(
+                detections_2d=detection_bundle.detections_2d,
+                detections_3d=detection_bundle.detections_3d,
+                metadata={
+                    **dict(detection_bundle.metadata),
+                    "geometry_stage_status": "degraded",
+                    "geometry_degraded_reason": "pointcloud_projection_failed",
+                },
+            )
         return detection_bundle.__class__(
             detections_2d=detections_2d,
             detections_3d=detection_bundle.detections_3d,
             metadata={
                 **dict(detection_bundle.metadata),
                 **geometry_metadata,
+                "geometry_stage_status": geometry_stage_status,
+                "geometry_degraded_reason": "" if support_count > 0 else "pointcloud_projection_failed",
             },
         )
 

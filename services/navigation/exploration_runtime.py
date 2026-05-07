@@ -60,6 +60,7 @@ class ExplorationRuntimeState:
     last_frontier_count: Optional[int] = None
     completed_frontiers: int = 0
     no_gain_rounds: int = 0
+    semantic_failure_rounds: int = 0
     known_cells: int = 0
     waiting_for: Optional[str] = None
     failure_code: Optional[str] = None
@@ -74,6 +75,8 @@ class ExplorationRuntimeState:
     stop_reason: Optional[str] = None
     stop_condition: Optional[str] = None
     stop_condition_detail: Dict[str, Any] = field(default_factory=dict)
+    semantic_context: Dict[str, Any] = field(default_factory=dict)
+    constraint_diagnostics: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -124,6 +127,7 @@ class PlatformExplorationRuntime:
             request_id=request.request_id,
             request=request.model_copy(deep=True),
             phase=ExplorationRuntimePhase.PLANNING,
+            semantic_context=self._semantic_context_from_request(request),
             metadata={
                 "map_name": request.map_name,
                 "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
@@ -141,6 +145,91 @@ class PlatformExplorationRuntime:
         """兼容 `ExplorationProvider` 的启动接口。"""
 
         return self.start(request)
+
+
+    def update_semantic_context(self, context: Dict[str, Any]) -> None:
+        if self._current_state is None or not isinstance(context, dict):
+            return
+        self._current_state.semantic_context.update(dict(context))
+        self._current_state.metadata["semantic_exploration_context"] = dict(self._current_state.semantic_context)
+
+    def _semantic_context_from_request(self, request: ExploreAreaRequest) -> Dict[str, Any]:
+        metadata = dict(request.metadata or {})
+        raw_context = metadata.get("semantic_exploration_context")
+        context = dict(raw_context) if isinstance(raw_context, dict) else {}
+        if request.target_name:
+            context.setdefault("target_name", request.target_name)
+        search_query = metadata.get("search_query")
+        if search_query:
+            context.setdefault("query", str(search_query))
+            context.setdefault("search_query", str(search_query))
+        if request.radius_m is not None:
+            context.setdefault("request_radius_m", request.radius_m)
+        if request.max_duration_sec is not None:
+            context.setdefault("timeout_sec", request.max_duration_sec)
+        return context
+
+    def _check_runtime_constraints(self, state: ExplorationRuntimeState) -> bool:
+        context = dict(state.semantic_context or {})
+        diagnostics: Dict[str, Any] = {
+            "checked": True,
+            "battery": context.get("battery") if isinstance(context.get("battery"), dict) else {},
+            "communication": context.get("communication") if isinstance(context.get("communication"), dict) else {},
+            "safety": context.get("safety") if isinstance(context.get("safety"), dict) else {},
+            "max_distance_m": context.get("max_distance_m"),
+            "forbidden_zone_count": len(context.get("forbidden_zones") or []) if isinstance(context.get("forbidden_zones"), list) else 0,
+        }
+        state.constraint_diagnostics = diagnostics
+        safety = diagnostics["safety"] if isinstance(diagnostics["safety"], dict) else {}
+        if bool(safety.get("safe_stop_active") or safety.get("is_estopped") or safety.get("estopped")):
+            return self._finish_constraint_stop(
+                state,
+                condition="safety_state_blocked",
+                message="安全状态阻止继续探索。",
+                detail=diagnostics,
+            )
+        battery = diagnostics["battery"] if isinstance(diagnostics["battery"], dict) else {}
+        battery_percent = self._optional_float(battery.get("percentage"))
+        min_battery_percent = self._optional_float(context.get("min_battery_percent"))
+        if battery_percent is not None and min_battery_percent is not None and battery_percent < min_battery_percent:
+            return self._finish_constraint_stop(
+                state,
+                condition="battery_below_minimum",
+                message="当前电量低于探索阈值。",
+                detail=diagnostics,
+            )
+        communication = diagnostics["communication"] if isinstance(diagnostics["communication"], dict) else {}
+        if communication.get("available") is False or communication.get("connected") is False:
+            return self._finish_constraint_stop(
+                state,
+                condition="communication_unavailable",
+                message="通信状态不可用，已停止探索。",
+                detail=diagnostics,
+            )
+        return False
+
+    def _finish_constraint_stop(
+        self,
+        state: ExplorationRuntimeState,
+        *,
+        condition: str,
+        message: str,
+        detail: Dict[str, Any],
+    ) -> bool:
+        state.failure_code = condition
+        state.last_error = message
+        self._record_stop(state, reason="constraint", condition=condition, detail=detail)
+        self._finish(state, phase=ExplorationRuntimePhase.FAILED)
+        return True
+
+    def _optional_float(self, value: Any) -> Optional[float]:
+        if value is None or value == "" or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
 
     def stop(self) -> bool:
         """停止探索任务。"""
@@ -183,6 +272,8 @@ class PlatformExplorationRuntime:
         state = self._current_state
         self._apply_runtime_metadata(state, runtime_metadata)
         state.waiting_for = None
+        if self._check_runtime_constraints(state):
+            return state
         if self._check_stop_conditions(state):
             return state
         if state.phase == ExplorationRuntimePhase.PLANNING:
@@ -228,6 +319,9 @@ class PlatformExplorationRuntime:
             ),
             "known_cells": state.known_cells,
             "no_gain_rounds": state.no_gain_rounds,
+            "semantic_failure_rounds": state.semantic_failure_rounds,
+            "semantic_exploration_context": dict(state.semantic_context),
+            "constraint_diagnostics": dict(state.constraint_diagnostics),
             "waiting_for": state.waiting_for,
             "failure_code": state.failure_code,
             "frontier_freshness": dict(state.frontier_freshness),
@@ -403,11 +497,13 @@ class PlatformExplorationRuntime:
             center_pose=center_pose,
             radius_m=state.request.radius_m,
             attempted_poses=attempted_poses,
+            semantic_context=state.semantic_context,
         )
         state.latest_frontiers = list(frontiers)
         diagnostics_getter = getattr(self._frontier_explorer, "get_last_filter_diagnostics", None)
         if callable(diagnostics_getter):
             state.metadata["frontier_filter_diagnostics"] = dict(diagnostics_getter())
+        state.metadata["semantic_exploration_context"] = dict(state.semantic_context)
         state.last_frontier_count = len(frontiers)
         state.last_error = None
         state.failure_code = None
@@ -418,6 +514,7 @@ class PlatformExplorationRuntime:
         if not frontiers:
             state.waiting_for = "frontier"
             state.failure_code = "frontier_unavailable"
+            state.semantic_failure_rounds += 1
             state.metadata["frontier_unavailable_diagnostics"] = dict(
                 state.metadata.get("frontier_filter_diagnostics") or {}
             )
@@ -497,8 +594,10 @@ class PlatformExplorationRuntime:
         state.known_cells = max(previous_known_cells, current_known_cells)
         if info_gain_cells <= int(self._config.frontier_min_information_gain_cells):
             state.no_gain_rounds += 1
+            state.semantic_failure_rounds += 1
         else:
             state.no_gain_rounds = 0
+            state.semantic_failure_rounds = 0
 
         state.current_target.scanned = True
         state.visited_frontiers.append(state.current_target.frontier.pose)
@@ -698,6 +797,8 @@ class PlatformExplorationRuntime:
             "info_gain_cells": frontier.info_gain_cells,
             "path_distance_m": frontier.path_distance_m,
             "average_cost": frontier.average_cost,
+            "semantic_gain": frontier.semantic_gain,
+            "semantic_gain_breakdown": dict(frontier.semantic_gain_breakdown),
         }
         if target is not None:
             metadata.update({
@@ -721,6 +822,10 @@ class PlatformExplorationRuntime:
         frontier_freshness = metadata.get("frontier_freshness")
         if isinstance(frontier_freshness, dict):
             state.frontier_freshness.update(frontier_freshness)
+        semantic_context = metadata.get("semantic_exploration_context")
+        if isinstance(semantic_context, dict):
+            state.semantic_context.update(semantic_context)
+            state.metadata["semantic_exploration_context"] = dict(state.semantic_context)
 
     def _frontier_revision(self, state: ExplorationRuntimeState) -> str:
         return "map=%s|costmap=%s|pose=%s|round=%d" % (

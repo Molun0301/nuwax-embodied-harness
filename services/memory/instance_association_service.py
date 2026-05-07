@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -9,8 +10,10 @@ from contracts.base import utc_now
 from contracts.geometry import Pose
 from contracts.naming import build_anchor_id, build_instance_id
 from contracts.spatial_memory import (
+    InstanceDynamicState,
     InstanceLifecycleState,
     InstanceMovability,
+    InstanceObservationWindowSample,
     SemanticInstance,
 )
 from services.memory.inspection_pose_planner import InspectionPosePlanner
@@ -63,6 +66,15 @@ class InstanceAssociationService:
         InstanceMovability.MOVABLE: 7 * 24 * 3600.0,
         InstanceMovability.TRANSIENT: 24 * 3600.0,
     }
+    _OBSERVATION_WINDOW_LIMIT = 8
+    _STATIC_CLASS_KEYWORDS = ("wall", "door", "dock", "station", "shelf", "charger", "table", "cabinet")
+    _DYNAMIC_CLASS_KEYWORDS = ("person", "human", "pedestrian", "dog", "cat", "visitor", "worker", "vehicle", "car", "truck", "bus", "bicycle", "motorcycle")
+    _QUASI_STATIC_CLASS_KEYWORDS = ("chair", "cart", "box", "bag", "cone", "barrier", "barricade", "trash")
+    _DYNAMIC_DISPLACEMENT_M = 0.8
+    _DYNAMIC_SPEED_MPS = 0.2
+    _QUASI_STATIC_DISPLACEMENT_M = 0.25
+    _QUASI_STATIC_SPEED_MPS = 0.05
+    _STATIC_CONSISTENCY_M = 0.18
     _ID_KIND_MAX_LENGTH = 24
 
     def __init__(
@@ -85,6 +97,7 @@ class InstanceAssociationService:
         *,
         existing_instances: Dict[str, SemanticInstance],
         map_version_id: Optional[str],
+        localization_session_id: Optional[str] = None,
         occupancy_grid=None,
         cost_map=None,
         now: Optional[datetime] = None,
@@ -109,6 +122,7 @@ class InstanceAssociationService:
                     best_instance,
                     item,
                     map_version_id=map_version_id,
+                    localization_session_id=localization_session_id,
                     occupancy_grid=occupancy_grid,
                     cost_map=cost_map,
                     now=resolved_now,
@@ -120,6 +134,7 @@ class InstanceAssociationService:
             created = self._create_instance(
                 item,
                 map_version_id=map_version_id,
+                localization_session_id=localization_session_id,
                 occupancy_grid=occupancy_grid,
                 cost_map=cost_map,
                 now=resolved_now,
@@ -419,6 +434,7 @@ class InstanceAssociationService:
         observation: ProjectedObservation,
         *,
         map_version_id: Optional[str],
+        localization_session_id: Optional[str],
         occupancy_grid,
         cost_map,
         now: datetime,
@@ -438,10 +454,29 @@ class InstanceAssociationService:
             current.supporting_observation_event_ids,
             (),
         )
+        observation_window = self._build_observation_window(
+            current.observation_window,
+            observation,
+            now=now,
+        )
+        dynamic_state, dynamic_metadata = self._classify_dynamic_state(
+            label=observation.label,
+            movability=current.movability,
+            observation_window=observation_window,
+            attributes=observation.attributes,
+        )
+        metadata = self._build_instance_metadata(
+            observation,
+            movability=current.movability,
+            current_metadata=current.metadata,
+        )
+        metadata.update(dynamic_metadata)
+        metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
         return current.model_copy(
             update={
                 "pose": blended_pose,
                 "map_version_id": map_version_id or current.map_version_id,
+                "localization_session_id": localization_session_id or current.localization_session_id,
                 "topo_node_id": observation.topo_node_id or current.topo_node_id,
                 "semantic_region_id": observation.semantic_region_id or current.semantic_region_id,
                 "confidence": max(float(current.confidence), float(observation.score)),
@@ -452,12 +487,10 @@ class InstanceAssociationService:
                 "visual_labels": visual_labels,
                 "vision_tags": self._merge_strings(current.vision_tags, observation.semantic_labels),
                 "inspection_poses": inspection_poses,
+                "dynamic_state": dynamic_state,
+                "observation_window": observation_window,
                 "lifecycle_state": InstanceLifecycleState.ACTIVE,
-                "metadata": self._build_instance_metadata(
-                    observation,
-                    movability=current.movability,
-                    current_metadata=current.metadata,
-                ),
+                "metadata": metadata,
                 "supporting_observation_event_ids": supporting_event_ids,
             },
             deep=True,
@@ -468,6 +501,7 @@ class InstanceAssociationService:
         observation: ProjectedObservation,
         *,
         map_version_id: Optional[str],
+        localization_session_id: Optional[str],
         occupancy_grid,
         cost_map,
         now: datetime,
@@ -481,6 +515,19 @@ class InstanceAssociationService:
             cost_map=cost_map,
         )
         movability = self._infer_movability(observation.label, observation.attributes)
+        observation_window = self._build_observation_window((), observation, now=now)
+        dynamic_state, dynamic_metadata = self._classify_dynamic_state(
+            label=observation.label,
+            movability=movability,
+            observation_window=observation_window,
+            attributes=observation.attributes,
+        )
+        metadata = self._build_instance_metadata(
+            observation,
+            movability=movability,
+        )
+        metadata.update(dynamic_metadata)
+        metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
         return SemanticInstance(
             instance_id=instance_id,
             anchor_id=anchor_id,
@@ -488,10 +535,13 @@ class InstanceAssociationService:
             display_name=str(observation.attributes.get("display_name_zh") or observation.label),
             pose=observation.pose,
             map_version_id=map_version_id,
+            localization_session_id=localization_session_id,
             topo_node_id=observation.topo_node_id,
             semantic_region_id=observation.semantic_region_id,
             instance_type=observation.instance_type,
             movability=movability,
+            dynamic_state=dynamic_state,
+            observation_window=observation_window,
             lifecycle_state=InstanceLifecycleState.ACTIVE,
             confidence=float(observation.score),
             observation_count=1,
@@ -503,10 +553,7 @@ class InstanceAssociationService:
             vision_tags=list(observation.semantic_labels),
             inspection_poses=inspection_poses,
             attributes=dict(observation.attributes),
-            metadata=self._build_instance_metadata(
-                observation,
-                movability=movability,
-            ),
+            metadata=metadata,
         )
 
     @classmethod
@@ -616,6 +663,9 @@ class InstanceAssociationService:
         support_points_2d = raw_metadata_value("support_points_2d")
         support_points_3d = raw_metadata_value("support_points_3d")
         support_points_map = raw_metadata_value("support_points_map")
+        centroid_map = raw_metadata_value("centroid_map")
+        bbox_3d_map = raw_metadata_value("bbox_3d_map")
+        object_3d_bbox = raw_metadata_value("object_3d_bbox")
         segmentation_bbox_xyxy = raw_metadata_value("segmentation_bbox_xyxy")
         centroid_uv = raw_metadata_value("centroid_uv") or raw_metadata_value("mask_center_px")
         mask_center_px = raw_metadata_value("mask_center_px") or raw_metadata_value("centroid_uv")
@@ -638,14 +688,23 @@ class InstanceAssociationService:
             or segmentation_occlusion_flags
             or segmentation_truncation_flags
         )
+        previous_navigable = previous_metadata.get("navigable")
+        previous_non_navigable_reason = str(previous_metadata.get("non_navigable_reason") or "")
         navigable = observation.attributes.get("navigable")
-        if navigable is None:
-            navigable = previous_metadata.get("navigable")
-        non_navigable_reason = str(
-            observation.attributes.get("non_navigable_reason")
-            or previous_metadata.get("non_navigable_reason")
-            or ""
+        non_navigable_reason = str(observation.attributes.get("non_navigable_reason") or "")
+        fallback_recovered = (
+            previous_navigable is False
+            and previous_non_navigable_reason == "current_pose_fallback_no_geometry"
+            and projection_method != "current_pose_fallback"
+            and support_point_count > 0
         )
+        if navigable is None and not fallback_recovered:
+            navigable = previous_navigable
+        if not non_navigable_reason and not fallback_recovered:
+            non_navigable_reason = previous_non_navigable_reason
+        if projection_method == "current_pose_fallback" or projection_degradation_reason == "current_pose_fallback_no_geometry":
+            navigable = False
+            non_navigable_reason = "current_pose_fallback_no_geometry"
         metadata = {
             **previous_metadata,
             "last_track_id": observation.track_id or previous_metadata.get("last_track_id", ""),
@@ -668,6 +727,9 @@ class InstanceAssociationService:
             "support_points_2d": support_points_2d,
             "support_points_3d": support_points_3d,
             "support_points_map": support_points_map,
+            "centroid_map": centroid_map,
+            "bbox_3d_map": bbox_3d_map,
+            "object_3d_bbox": object_3d_bbox,
             "segmentation_bbox_xyxy": segmentation_bbox_xyxy,
             "centroid_uv": centroid_uv,
             "mask_center_px": mask_center_px,
@@ -687,6 +749,160 @@ class InstanceAssociationService:
         }
         metadata.update(self._summarize_segmentation_metadata(metadata))
         return metadata
+
+    def _build_observation_window(
+        self,
+        current_window: Iterable[InstanceObservationWindowSample],
+        observation: ProjectedObservation,
+        *,
+        now: datetime,
+    ) -> List[InstanceObservationWindowSample]:
+        window = [item for item in current_window if isinstance(item, InstanceObservationWindowSample)]
+        window.append(
+            InstanceObservationWindowSample(
+                timestamp=now,
+                pose=observation.pose,
+                bbox_xyxy=self._observation_bbox_xyxy(observation.attributes),
+                confidence=float(observation.score),
+                track_id=observation.track_id,
+                metadata={
+                    "camera_id": observation.camera_id or "",
+                    "source_observation_id": observation.source_observation_id,
+                    "projection_method": str(observation.attributes.get("projection_method") or ""),
+                },
+            )
+        )
+        return window[-self._OBSERVATION_WINDOW_LIMIT :]
+
+    def _observation_bbox_xyxy(self, attributes: Dict[str, object]) -> List[float]:
+        for key in ("bbox_xyxy", "segmentation_bbox_xyxy", "bbox", "2d_bbox"):
+            value = attributes.get(key)
+            if isinstance(value, (list, tuple)) and len(value) >= 4:
+                try:
+                    return [float(item) for item in value[:4]]
+                except (TypeError, ValueError):
+                    return []
+            if isinstance(value, dict):
+                keys = ("left", "top", "right", "bottom")
+                if all(item in value for item in keys):
+                    try:
+                        return [float(value[item]) for item in keys]
+                    except (TypeError, ValueError):
+                        return []
+        return []
+
+    def _classify_dynamic_state(
+        self,
+        *,
+        label: str,
+        movability: InstanceMovability,
+        observation_window: List[InstanceObservationWindowSample],
+        attributes: Dict[str, object],
+    ) -> Tuple[InstanceDynamicState, Dict[str, object]]:
+        explicit_state = self._explicit_dynamic_state(attributes)
+        metrics = self._dynamic_window_metrics(observation_window)
+        lowered = " ".join(
+            str(item or "").strip().lower()
+            for item in (label, attributes.get("category"), attributes.get("state"), attributes.get("movability"))
+            if str(item or "").strip()
+        )
+        dynamic_prior = movability == InstanceMovability.TRANSIENT or any(item in lowered for item in self._DYNAMIC_CLASS_KEYWORDS)
+        quasi_static_prior = any(item in lowered for item in self._QUASI_STATIC_CLASS_KEYWORDS)
+        static_prior = movability == InstanceMovability.STATIC or any(item in lowered for item in self._STATIC_CLASS_KEYWORDS)
+        if explicit_state is not None:
+            state = explicit_state
+            reason = "explicit_dynamic_state"
+        elif dynamic_prior:
+            state = InstanceDynamicState.DYNAMIC
+            reason = "dynamic_class_prior"
+        elif metrics["observation_count"] >= 2 and (
+            metrics["max_displacement_m"] >= self._DYNAMIC_DISPLACEMENT_M
+            or metrics["estimated_speed_mps"] >= self._DYNAMIC_SPEED_MPS
+        ):
+            state = InstanceDynamicState.DYNAMIC
+            reason = "short_window_motion"
+        elif metrics["observation_count"] >= 2 and (
+            metrics["max_displacement_m"] >= self._QUASI_STATIC_DISPLACEMENT_M
+            or metrics["estimated_speed_mps"] >= self._QUASI_STATIC_SPEED_MPS
+        ):
+            state = InstanceDynamicState.QUASI_STATIC
+            reason = "short_window_quasi_static_motion"
+        elif quasi_static_prior:
+            state = InstanceDynamicState.QUASI_STATIC
+            reason = "quasi_static_class_prior"
+        elif static_prior and metrics["max_displacement_m"] <= self._STATIC_CONSISTENCY_M:
+            state = InstanceDynamicState.STATIC
+            reason = "static_class_prior"
+        elif metrics["observation_count"] >= 3 and metrics["max_displacement_m"] <= self._STATIC_CONSISTENCY_M:
+            state = InstanceDynamicState.STATIC
+            reason = "multi_observation_consistency"
+        else:
+            state = InstanceDynamicState.UNKNOWN
+            reason = "insufficient_motion_evidence"
+        return state, {
+            "dynamic_state": state.value,
+            "dynamic_state_reason": reason,
+            "dynamic_observation_count": metrics["observation_count"],
+            "dynamic_window_duration_sec": metrics["duration_sec"],
+            "dynamic_window_displacement_m": metrics["max_displacement_m"],
+            "dynamic_window_speed_mps": metrics["estimated_speed_mps"],
+            "dynamic_track_ids": metrics["track_ids"],
+            "dynamic_short_term_obstacle_context": state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC},
+            "long_term_static_target_eligible": state == InstanceDynamicState.STATIC,
+            "observation_window": [item.model_dump(mode="json") for item in observation_window],
+        }
+
+    def _explicit_dynamic_state(self, attributes: Dict[str, object]) -> Optional[InstanceDynamicState]:
+        value = str(
+            attributes.get("dynamic_state")
+            or attributes.get("motion_state")
+            or attributes.get("object_motion_state")
+            or ""
+        ).strip().lower()
+        mapping = {
+            "static": InstanceDynamicState.STATIC,
+            "dynamic": InstanceDynamicState.DYNAMIC,
+            "moving": InstanceDynamicState.DYNAMIC,
+            "quasi_static": InstanceDynamicState.QUASI_STATIC,
+            "quasi-static": InstanceDynamicState.QUASI_STATIC,
+            "unknown": InstanceDynamicState.UNKNOWN,
+        }
+        return mapping.get(value)
+
+    def _dynamic_window_metrics(self, observation_window: List[InstanceObservationWindowSample]) -> Dict[str, object]:
+        if not observation_window:
+            return {"observation_count": 0, "duration_sec": 0.0, "max_displacement_m": 0.0, "estimated_speed_mps": 0.0, "track_ids": []}
+        first = observation_window[0]
+        last = observation_window[-1]
+        duration_sec = max(0.0, (last.timestamp - first.timestamp).total_seconds())
+        max_displacement = 0.0
+        for item in observation_window:
+            max_displacement = max(max_displacement, self._distance(first.pose, item.pose), self._distance(last.pose, item.pose))
+        speed = max_displacement / duration_sec if duration_sec > 0.0 else 0.0
+        track_ids: List[str] = []
+        for item in observation_window:
+            if item.track_id and item.track_id not in track_ids:
+                track_ids.append(item.track_id)
+        return {
+            "observation_count": len(observation_window),
+            "duration_sec": round(duration_sec, 6),
+            "max_displacement_m": round(float(max_displacement), 6),
+            "estimated_speed_mps": round(float(speed), 6),
+            "track_ids": track_ids,
+        }
+
+    def _apply_dynamic_navigation_policy(
+        self,
+        metadata: Dict[str, object],
+        dynamic_state: InstanceDynamicState,
+    ) -> Dict[str, object]:
+        updated = dict(metadata)
+        if dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}:
+            updated["navigable"] = False
+            updated["non_navigable_reason"] = "dynamic_entity" if dynamic_state == InstanceDynamicState.DYNAMIC else "quasi_static_entity"
+            updated["navigation_exclusion_scope"] = "long_term_static_target"
+            updated["local_retry_policy"] = "retry_after_dynamic_obstacle_clears"
+        return updated
 
     def _coerce_optional_float(self, raw_value: object, fallback_value: object = None) -> Optional[float]:
         for value in (raw_value, fallback_value):

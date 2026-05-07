@@ -310,6 +310,58 @@ class PerceptionYoloConfig:
 
 
 @dataclass
+class PerceptionYoloWorldConfig:
+    """YOLO-World 开放词汇检测配置。"""
+
+    enabled: bool = True
+    backend_name: str = "yolo_world"
+    model_name: str = str(BASE_DIR / "runtime_data" / "models" / "yolov8s-world.pt")
+    runtime_preference: str = "pytorch"
+    engine_path: str = ""
+    device: str = ""
+    half: bool = True
+    int8: bool = False
+    image_size: int = 640
+    confidence_threshold: float = 0.25
+    iou_threshold: float = 0.45
+    max_detections: int = 100
+    class_names: Tuple[str, ...] = (
+        "person",
+        "door",
+        "chair",
+        "table",
+        "shelf",
+        "cabinet",
+        "box",
+        "bag",
+        "backpack",
+        "bottle",
+        "cup",
+        "bench",
+        "stairs",
+        "charger",
+        "dock",
+        "traffic cone",
+        "fire hydrant",
+    )
+    class_aliases: Tuple[str, ...] = ()
+    dynamic_class_metadata_keys: Tuple[str, ...] = ()
+
+
+@dataclass
+class PerceptionTrackerConfig:
+    """感知跟踪后端配置。"""
+
+    default_backend: str = "bytetrack"
+    bytetrack_name: str = "go2_bytetrack_tracker"
+    high_threshold: float = 0.5
+    low_threshold: float = 0.1
+    iou_match_threshold: float = 0.3
+    lost_ttl_frames: int = 30
+    trajectory_limit: int = 12
+
+
+@dataclass
 class PerceptionOpenAIVisionConfig:
     """云端视觉语义配置。"""
 
@@ -392,10 +444,12 @@ class PerceptionStreamRuntimeConfig:
 class PerceptionConfig:
     """统一视觉感知配置。"""
 
-    default_detector_backend: str = "yolo_local"
+    default_detector_backend: str = "yolo_world"
     default_scene_backend: str = "hybrid_scene"
     default_segmentation_backend: str = "segmentation_disabled"
     yolo: PerceptionYoloConfig = field(default_factory=PerceptionYoloConfig)
+    yolo_world: PerceptionYoloWorldConfig = field(default_factory=PerceptionYoloWorldConfig)
+    tracker: PerceptionTrackerConfig = field(default_factory=PerceptionTrackerConfig)
     openai_vision: PerceptionOpenAIVisionConfig = field(default_factory=PerceptionOpenAIVisionConfig)
     segmentation: PerceptionSegmentationConfig = field(default_factory=PerceptionSegmentationConfig)
     stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
@@ -596,7 +650,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
     )
 
     perception = PerceptionConfig(
-        default_detector_backend=_cfg_str("NUWAX_PERCEPTION_DEFAULT_DETECTOR_BACKEND", "yolo_local"),
+        default_detector_backend=_cfg_str("NUWAX_PERCEPTION_DEFAULT_DETECTOR_BACKEND", "yolo_world"),
         default_scene_backend=_cfg_str("NUWAX_PERCEPTION_DEFAULT_SCENE_BACKEND", "hybrid_scene"),
         default_segmentation_backend=_cfg_str(
             "NUWAX_PERCEPTION_DEFAULT_SEGMENTATION_BACKEND",
@@ -627,6 +681,44 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 min(1.0, _cfg_float("NUWAX_PERCEPTION_YOLO_IOU", 0.45)),
             ),
             max_detections=max(1, _cfg_int("NUWAX_PERCEPTION_YOLO_MAX_DETECTIONS", 100)),
+        ),
+        yolo_world=PerceptionYoloWorldConfig(
+            enabled=_cfg_bool("NUWAX_PERCEPTION_YOLO_WORLD_ENABLED", True),
+            backend_name=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_BACKEND_NAME", "yolo_world"),
+            model_name=_cfg_str(
+                "NUWAX_PERCEPTION_YOLO_WORLD_MODEL",
+                str(BASE_DIR / "runtime_data" / "models" / "yolov8s-world.pt"),
+            ),
+            runtime_preference=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME", "pytorch"),
+            engine_path=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH", ""),
+            device=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_DEVICE", ""),
+            half=_cfg_bool("NUWAX_PERCEPTION_YOLO_WORLD_HALF", True),
+            int8=_cfg_bool("NUWAX_PERCEPTION_YOLO_WORLD_INT8", False),
+            image_size=max(32, _cfg_int("NUWAX_PERCEPTION_YOLO_WORLD_IMAGE_SIZE", 640)),
+            confidence_threshold=max(
+                0.0,
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_YOLO_WORLD_CONFIDENCE", 0.25)),
+            ),
+            iou_threshold=max(
+                0.0,
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_YOLO_WORLD_IOU", 0.45)),
+            ),
+            max_detections=max(1, _cfg_int("NUWAX_PERCEPTION_YOLO_WORLD_MAX_DETECTIONS", 100)),
+            class_names=_cfg_csv(
+                "NUWAX_PERCEPTION_YOLO_WORLD_CLASSES",
+                PerceptionYoloWorldConfig.class_names,
+            ),
+            class_aliases=_cfg_csv("NUWAX_PERCEPTION_YOLO_WORLD_ALIASES", ()),
+            dynamic_class_metadata_keys=_cfg_csv("NUWAX_PERCEPTION_YOLO_WORLD_DYNAMIC_CLASS_KEYS", ()),
+        ),
+        tracker=PerceptionTrackerConfig(
+            default_backend=_cfg_str("NUWAX_PERCEPTION_TRACKER_BACKEND", "bytetrack"),
+            bytetrack_name=_cfg_str("NUWAX_PERCEPTION_BYTETRACK_NAME", "go2_bytetrack_tracker"),
+            high_threshold=max(0.0, min(1.0, _cfg_float("NUWAX_PERCEPTION_BYTETRACK_HIGH_THRESHOLD", 0.5))),
+            low_threshold=max(0.0, min(1.0, _cfg_float("NUWAX_PERCEPTION_BYTETRACK_LOW_THRESHOLD", 0.1))),
+            iou_match_threshold=max(0.0, min(1.0, _cfg_float("NUWAX_PERCEPTION_BYTETRACK_IOU", 0.3))),
+            lost_ttl_frames=max(1, _cfg_int("NUWAX_PERCEPTION_BYTETRACK_LOST_TTL_FRAMES", 30)),
+            trajectory_limit=max(2, _cfg_int("NUWAX_PERCEPTION_BYTETRACK_TRAJECTORY_LIMIT", 12)),
         ),
         openai_vision=PerceptionOpenAIVisionConfig(
             enabled=_cfg_bool("NUWAX_PERCEPTION_OPENAI_ENABLED", False),

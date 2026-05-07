@@ -121,7 +121,7 @@ class Nav2ActionNavigationProvider:
                 current_goal_id=goal.goal_id,
                 status=NavigationStatus.FAILED,
                 message="Nav2 /navigate_to_pose 需要显式 target_pose，命名目标必须先解析。",
-                metadata={"backend": "nav2", "failure_reason": "target_pose_missing", "readiness": self._status_dict(readiness)},
+                metadata={"backend": "nav2", "failure_reason": "target_pose_missing", "failure_category": "target_error", "readiness": self._status_dict(readiness), **self._navigation_execution_metadata()},
             )
             return False
         try:
@@ -135,7 +135,7 @@ class Nav2ActionNavigationProvider:
                 current_goal_id=goal.goal_id,
                 status=NavigationStatus.FAILED,
                 message="Nav2 action 发送目标失败：%s" % exc,
-                metadata={"backend": "nav2", "failure_reason": "action_send_failed", "error": str(exc)},
+                metadata={"backend": "nav2", "failure_reason": "action_send_failed", "failure_category": "execution_layer_rejected", "error": str(exc), **self._navigation_execution_metadata()},
             )
             return False
         with self._lock:
@@ -146,7 +146,7 @@ class Nav2ActionNavigationProvider:
                 current_pose=self._read_current_pose(),
                 goal_reached=False,
                 message="Nav2 /navigate_to_pose 目标已发送，等待 action server 接受。",
-                metadata={"backend": "nav2", "action_name": self.runtime.config.nav2.action_name, "readiness": self._status_dict(readiness)},
+                metadata={"backend": "nav2", "action_name": self.runtime.config.nav2.action_name, "readiness": self._status_dict(readiness), **self._navigation_execution_metadata()},
             )
         return True
 
@@ -169,7 +169,7 @@ class Nav2ActionNavigationProvider:
                 current_pose=self._read_current_pose(),
                 goal_reached=False,
                 message="Nav2 导航目标已取消。",
-                metadata={"backend": "nav2", "action_name": self.runtime.config.nav2.action_name},
+                metadata={"backend": "nav2", "action_name": self.runtime.config.nav2.action_name, "failure_reason": "cancelled", "failure_category": "cancel", **self._navigation_execution_metadata()},
             )
         return True
 
@@ -237,6 +237,14 @@ class Nav2ActionNavigationProvider:
             "nav2_action_active": bool(policy.get("nav2_action_active")),
             "platform_grid_active": bool(policy.get("platform_grid_active")),
             "platform_grid_removed": bool(policy.get("platform_grid_removed")),
+        }
+
+    def _navigation_execution_metadata(self) -> Dict[str, object]:
+        return {
+            **self._navigation_backend_policy_metadata(),
+            "execution_chain": "platform_navigation_service_to_nav2_action",
+            "nav2_action_name": self.runtime.config.nav2.action_name,
+            "go2_private_control_chain_used": False,
         }
 
     def _readiness(self) -> _Nav2Readiness:
@@ -408,15 +416,15 @@ class Nav2ActionNavigationProvider:
             goal_handle = future.result()
         except Exception as exc:
             with self._lock:
-                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action 接受目标失败：%s" % exc, metadata={"backend": "nav2", "failure_reason": "goal_response_error", "error": str(exc)})
+                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action 接受目标失败：%s" % exc, metadata={"backend": "nav2", "failure_reason": "goal_response_error", "failure_category": "execution_layer_rejected", "error": str(exc), "terminal_feedback_recorded": True, **self._navigation_execution_metadata()})
             return
         with self._lock:
             if not getattr(goal_handle, "accepted", False):
                 self._active_goal = None
-                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action server 拒绝导航目标。", metadata={"backend": "nav2", "failure_reason": "goal_rejected"})
+                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action server 拒绝导航目标。", metadata={"backend": "nav2", "failure_reason": "goal_rejected", "failure_category": "target_error", "terminal_feedback_recorded": True, **self._navigation_execution_metadata()})
                 return
             self._goal_handle = goal_handle
-            self._state = self._state.model_copy(update={"status": NavigationStatus.RUNNING, "message": "Nav2 action 已接受目标并开始执行。"}, deep=True)
+            self._state = self._state.model_copy(update={"status": NavigationStatus.RUNNING, "message": "Nav2 action 已接受目标并开始执行。", "metadata": {**dict(self._state.metadata), **self._navigation_execution_metadata()}}, deep=True)
             self._result_future = goal_handle.get_result_async()
             self._result_future.add_done_callback(lambda completed: self._on_result(completed, goal_id))
 
@@ -443,7 +451,7 @@ class Nav2ActionNavigationProvider:
             status_code = int(getattr(result, "status", 0) or 0)
         except Exception as exc:
             with self._lock:
-                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action result 读取失败：%s" % exc, metadata={"backend": "nav2", "failure_reason": "result_error", "error": str(exc)})
+                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action result 读取失败：%s" % exc, metadata={"backend": "nav2", "failure_reason": "result_error", "failure_category": "execution_layer_rejected", "error": str(exc), "terminal_feedback_recorded": True, **self._navigation_execution_metadata()})
             return
         with self._lock:
             active_goal = self._active_goal.model_copy(deep=True) if self._active_goal is not None else None
@@ -482,8 +490,37 @@ class Nav2ActionNavigationProvider:
                     "action_status_code": status_code,
                     "action_name": self.runtime.config.nav2.action_name,
                     "arrival_tolerance_check": tolerance_check,
+                    "failure_reason": self._result_failure_reason(status_code, tolerance_check),
+                    "failure_category": self._result_failure_category(status_code, tolerance_check),
+                    "nav2_costmaps": self._costmap_status(),
+                    "terminal_feedback_recorded": True,
+                    **self._navigation_execution_metadata(),
                 },
             )
+
+    @staticmethod
+    def _result_failure_reason(status_code: int, tolerance_check: Dict[str, object]) -> str:
+        if status_code == 4 and tolerance_check.get("within_tolerance"):
+            return ""
+        if status_code == 4:
+            return "arrival_tolerance_failed"
+        if status_code == 5:
+            return "cancelled"
+        if status_code == 6:
+            return "local_planner_failed"
+        return "unknown_nav2_terminal_status"
+
+    @staticmethod
+    def _result_failure_category(status_code: int, tolerance_check: Dict[str, object]) -> str:
+        if status_code == 4 and tolerance_check.get("within_tolerance"):
+            return "success"
+        if status_code == 4:
+            return "localization_drift"
+        if status_code == 5:
+            return "cancel"
+        if status_code == 6:
+            return "candidate_unreachable"
+        return "execution_layer_rejected"
 
     def _check_goal_tolerance(self, goal: Optional[NavigationGoal], current_pose: Optional[Pose]) -> Dict[str, object]:
         if goal is None or goal.target_pose is None:
@@ -544,7 +581,7 @@ class Nav2ActionNavigationProvider:
                 current_pose=self._read_current_pose(),
                 goal_reached=False,
                 message=readiness.message,
-                metadata={"backend": "nav2", "waiting_for": readiness.waiting_for, "failure_reason": "nav2_not_ready", "readiness": self._status_dict(readiness)},
+                metadata={"backend": "nav2", "waiting_for": readiness.waiting_for, "failure_reason": "nav2_not_ready", "failure_category": "execution_layer_rejected", "readiness": self._status_dict(readiness), **self._navigation_execution_metadata()},
             )
 
     @staticmethod

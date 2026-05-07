@@ -243,6 +243,70 @@ class Ros2LiveMapProvider:
             and str(cost_map.frame_id or "").strip() != expected_frame_id
         )
         provider_status = "available" if self.is_available() else ("error" if last_error else "starting" if self._started else "stopped")
+        cost_map_required = bool(self.cost_map_topic)
+        occupancy_acceptance_ready = bool(
+            occupancy_grid is not None
+            and occupancy_count > 0
+            and not occupancy_frame_mismatch
+            and (occupancy_publisher_count is None or occupancy_publisher_count > 0)
+        )
+        cost_map_acceptance_ready = bool(
+            not cost_map_required
+            or (
+                cost_map is not None
+                and cost_map_count > 0
+                and not cost_map_frame_mismatch
+                and (cost_map_publisher_count is None or cost_map_publisher_count > 0)
+            )
+        )
+        rtabmap_auxiliary_ready = bool(
+            rtabmap_info_count > 0
+            or rtabmap_map_data_count > 0
+            or int(rtabmap_info_publisher_count or 0) > 0
+            or int(rtabmap_map_data_publisher_count or 0) > 0
+        )
+        continuous_update_ready = bool(
+            occupancy_count + cost_map_count + rtabmap_info_count + rtabmap_map_data_count >= 2
+            and (occupancy_count >= 2 or cost_map_count > 0 or rtabmap_auxiliary_ready)
+        )
+        occupancy_costmap_acceptance = {
+            "ready": bool(occupancy_acceptance_ready and cost_map_acceptance_ready and continuous_update_ready),
+            "occupancy": {
+                "ready": occupancy_acceptance_ready,
+                "topic": self.occupancy_topic,
+                "publisher_count": occupancy_publisher_count,
+                "message_count": occupancy_count,
+                "content_revision": occupancy_revision,
+                "frame_id": occupancy_grid.frame_id if occupancy_grid is not None else None,
+                "frame_match": not occupancy_frame_mismatch if occupancy_grid is not None else False,
+                "latest_cache_age_sec": latest_occupancy_cache_age_sec,
+                "latest_source_age_sec": latest_occupancy_age_sec,
+                "metrics": occupancy_metrics,
+            },
+            "cost_map": {
+                "required": cost_map_required,
+                "ready": cost_map_acceptance_ready,
+                "topic": self.cost_map_topic or None,
+                "publisher_count": cost_map_publisher_count,
+                "message_count": cost_map_count,
+                "content_revision": cost_map_revision,
+                "frame_id": cost_map.frame_id if cost_map is not None else None,
+                "frame_match": not cost_map_frame_mismatch if cost_map is not None else not cost_map_required,
+                "latest_cache_age_sec": latest_cost_map_cache_age_sec,
+                "latest_source_age_sec": latest_cost_map_age_sec,
+                "metrics": cost_map_metrics,
+            },
+            "continuous_update": {
+                "ready": continuous_update_ready,
+                "update_sequence": update_sequence,
+                "total_observed_message_count": occupancy_count + cost_map_count + rtabmap_info_count + rtabmap_map_data_count,
+                "last_message_at": latest_message_at.isoformat() if latest_message_at is not None else None,
+                "rtabmap_auxiliary_ready": rtabmap_auxiliary_ready,
+                "rtabmap_info_message_count": rtabmap_info_count,
+                "rtabmap_map_data_message_count": rtabmap_map_data_count,
+            },
+            "expected_frame_id": expected_frame_id,
+        }
         return {
             "provider_name": self.provider_name,
             "provider_version": self.provider_version,
@@ -277,6 +341,7 @@ class Ros2LiveMapProvider:
             "cost_map_revision": cost_map_revision,
             "occupancy_grid_ready": occupancy_grid is not None,
             "cost_map_ready": cost_map is not None,
+            "occupancy_costmap_acceptance": occupancy_costmap_acceptance,
             "occupancy_grid_size": (
                 {"width": occupancy_grid.width, "height": occupancy_grid.height}
                 if occupancy_grid is not None

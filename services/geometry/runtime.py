@@ -635,6 +635,11 @@ class PlatformGeometryRuntime:
         point_cloud_status = self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = self._build_point_cloud_source_status()
         data_plane_status = self._build_data_plane_status()
+        ros2_topic_inputs = self._build_ros2_topic_input_status(
+            tf_localization_status=tf_localization_status,
+            odometry_status=odometry_status,
+            point_cloud_status=point_cloud_status,
+        )
         self._update_stream_tracker(live_map_status)
         readiness = self._build_rtabmap_readiness(
             live_map_status=live_map_status,
@@ -643,9 +648,10 @@ class PlatformGeometryRuntime:
             point_cloud_status=point_cloud_status,
             point_cloud_source=point_cloud_source,
             data_plane_status=data_plane_status,
+            ros2_topic_inputs=ros2_topic_inputs,
         )
-        if not bool(readiness.get("go2_odom_ready")):
-            self._set_runtime_state("waiting_odom", str(readiness.get("message") or "等待 Go2 odom 输入。"))
+        if not bool(readiness.get("platform_sensor_inputs_ready") or readiness.get("go2_odom_ready")):
+            self._set_runtime_state("waiting_geometry_inputs", str(readiness.get("message") or "等待平台 ROS2 几何输入。"))
             return
         if not bool(readiness.get("first_frame_ready")):
             self._set_runtime_state("waiting_map", str(readiness.get("message") or "等待 RTAB-Map /map 首帧。"))
@@ -698,6 +704,7 @@ class PlatformGeometryRuntime:
         point_cloud_status: Optional[Dict[str, object]] = None,
         point_cloud_source: Optional[Dict[str, object]] = None,
         data_plane_status: Optional[Dict[str, object]] = None,
+        ros2_topic_inputs: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         live_map_status = live_map_status or self._clone_metadata(self._live_map_provider.get_status())
         tf_localization_status = tf_localization_status or self._clone_metadata(self._tf_localization_provider.get_status())
@@ -705,6 +712,11 @@ class PlatformGeometryRuntime:
         point_cloud_status = point_cloud_status or self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
         data_plane_status = data_plane_status or self._build_data_plane_status()
+        ros2_topic_inputs = ros2_topic_inputs or self._build_ros2_topic_input_status(
+            tf_localization_status=tf_localization_status,
+            odometry_status=odometry_status,
+            point_cloud_status=point_cloud_status,
+        )
         waiting_for, wait_message = self._classify_live_mapping_wait(
             live_map_status=live_map_status,
             point_cloud_status=point_cloud_status,
@@ -714,6 +726,10 @@ class PlatformGeometryRuntime:
         odom_bridge = self._managed_processes.get("odom_tf_bridge")
         rtabmap_process = self._managed_processes.get("rtabmap")
         map_stream = dict(self._map_stream_tracker)
+        occupancy_costmap_acceptance = live_map_status.get("occupancy_costmap_acceptance")
+        if not isinstance(occupancy_costmap_acceptance, dict):
+            occupancy_costmap_acceptance = {}
+        occupancy_costmap_ready = bool(occupancy_costmap_acceptance.get("ready"))
         tf_chain = self._build_tf_chain_status(tf_localization_status=tf_localization_status)
         rtabmap_info_publisher_count = live_map_status.get("rtabmap_info_publisher_count")
         if rtabmap_info_publisher_count is None:
@@ -738,19 +754,20 @@ class PlatformGeometryRuntime:
             or map_stream.get("costmap_recent")
             or map_stream.get("rtabmap_activity_recent")
         )
-        go2_odom_ready = bool(
-            odom_bridge is not None
+        platform_sensor_inputs_ready = bool(
+            ros2_topic_inputs.get("ready")
+            and odom_bridge is not None
             and odom_bridge.is_running()
             and int(odometry_status.get("published_count") or 0) > 0
             and int(point_cloud_status.get("published_count") or 0) > 0
-            and (point_cloud_source.get("timestamp") or data_plane_status.get("started") is not False)
         )
+        go2_odom_ready = platform_sensor_inputs_ready
         first_frame_ready = bool(
             live_map_status.get("occupancy_grid_ready")
             and int(live_map_status.get("occupancy_message_count") or 0) > 0
             and live_map_status.get("occupancy_has_publisher") is not False
         )
-        streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
+        streaming_ready = bool(first_frame_ready and map_stream.get("streaming") and occupancy_costmap_ready)
         localization_ready = bool(
             streaming_ready
             and rtabmap_process is not None
@@ -760,25 +777,31 @@ class PlatformGeometryRuntime:
             and rtabmap_activity_ready
         )
         relocalization_ready = bool(localization_ready and int(map_stream.get("content_revision") or 0) > 0)
-        if not go2_odom_ready:
-            message = "Go2 odom/TF 输入未就绪；需要平台 odom 发布桥、odom_tf_bridge 运行，且点云已发布。"
-            waiting_for = waiting_for or "go2_odom"
+        if not platform_sensor_inputs_ready:
+            missing_inputs = list(ros2_topic_inputs.get("missing_required") or [])
+            missing_label = ", ".join(str(item) for item in missing_inputs) if missing_inputs else "odom/pointcloud/TF/IMU"
+            message = "平台 ROS2 几何输入未就绪：%s；需要 odom 发布桥、odom_tf_bridge、点云桥和 TF/static TF 均形成可观测链路。" % missing_label
+            waiting_for = waiting_for or (missing_inputs[0] if missing_inputs else "ros2_topic_inputs")
         elif not first_frame_ready:
             message = wait_message
         elif not streaming_ready:
             message = "RTAB-Map 已发布 /map 首帧，但 /map、costmap、/rtabmap/info 或 /rtabmap/mapData 尚未形成连续活跃证据。"
-            waiting_for = "rtabmap_streaming"
+            waiting_for = "occupancy_costmap_acceptance" if not occupancy_costmap_ready else "rtabmap_streaming"
         elif not localization_ready:
             message = "RTAB-Map 实时地图链路活跃，但辅助话题、TF 链或进程状态尚未证明 localization/relocalization ready。"
             waiting_for = "rtabmap_localization"
         else:
-            message = "Go2 odom、RTAB-Map 实时地图链路、辅助话题与 TF 链均已就绪。"
+            message = "平台 ROS2 几何输入、RTAB-Map 实时地图链路、辅助话题与 TF 链均已就绪。"
             waiting_for = None
         return {
             "ready": localization_ready,
+            "platform_sensor_inputs_ready": platform_sensor_inputs_ready,
             "go2_odom_ready": go2_odom_ready,
+            "ros2_topic_inputs": self._clone_metadata(ros2_topic_inputs),
             "first_frame_ready": first_frame_ready,
             "streaming_ready": streaming_ready,
+            "occupancy_costmap_ready": occupancy_costmap_ready,
+            "occupancy_costmap_acceptance": self._clone_metadata(occupancy_costmap_acceptance),
             "localization_ready": localization_ready,
             "relocalization_ready": relocalization_ready,
             "waiting_for": waiting_for,
@@ -1099,6 +1122,29 @@ class PlatformGeometryRuntime:
             blocked = self._runtime_blocked
             diagnostics = list(self._runtime_diagnostics)
             started = self._runtime_started
+        tf_status = self._tf_localization_provider.get_status()
+        odometry_status = self._odometry_publisher.get_status()
+        point_cloud_status = self._point_cloud_publisher.get_status()
+        ros2_topic_inputs = self._build_ros2_topic_input_status(
+            tf_localization_status=tf_status,
+            odometry_status=odometry_status,
+            point_cloud_status=point_cloud_status,
+        )
+        rtabmap_readiness = self._build_rtabmap_readiness(
+            tf_localization_status=tf_status,
+            odometry_status=odometry_status,
+            point_cloud_status=point_cloud_status,
+            ros2_topic_inputs=ros2_topic_inputs,
+        )
+        nav2_status = self._build_nav2_status()
+        map_version_assets = self._build_map_version_asset_status()
+        geometry_acceptance = self._build_geometry_acceptance_status(
+            ros2_topic_inputs=ros2_topic_inputs,
+            rtabmap_readiness=rtabmap_readiness,
+            nav2_status=nav2_status,
+            tf_localization_status=tf_status,
+            map_version_assets=map_version_assets,
+        )
         return {
             "phase": phase,
             "state": phase,
@@ -1108,10 +1154,13 @@ class PlatformGeometryRuntime:
             "live_geometry_start_attempted": self._live_geometry_start_attempted,
             "processes": {name: process.status() for name, process in self._managed_processes.items()},
             "navigation_backend_policy": self._navigation_backend_policy(),
+            "ros2_topic_inputs": ros2_topic_inputs,
             "map_stream": dict(self._map_stream_tracker),
-            "rtabmap_readiness": self._build_rtabmap_readiness(),
-            "nav2": self._build_nav2_status(),
-            "tf_localization_provider": self._tf_localization_provider.get_status(),
+            "rtabmap_readiness": rtabmap_readiness,
+            "map_version_assets": map_version_assets,
+            "nav2": nav2_status,
+            "tf_localization_provider": tf_status,
+            "geometry_acceptance": geometry_acceptance,
             "diagnostics": diagnostics,
             "launch_ros2_stack": {
                 "script": str(self._geometry_script("launch_ros2_stack.sh")),
@@ -1230,6 +1279,11 @@ class PlatformGeometryRuntime:
         point_cloud_status = self._clone_metadata(self._point_cloud_publisher.get_status())
         point_cloud_source = self._build_point_cloud_source_status()
         data_plane_status = self._build_data_plane_status()
+        ros2_topic_inputs = self._build_ros2_topic_input_status(
+            tf_localization_status=tf_localization_status,
+            odometry_status=odometry_status,
+            point_cloud_status=point_cloud_status,
+        )
         waiting_for, message = self._classify_live_mapping_wait(
             live_map_status=live_map_status,
             point_cloud_status=point_cloud_status,
@@ -1251,7 +1305,10 @@ class PlatformGeometryRuntime:
                 point_cloud_status=point_cloud_status,
                 point_cloud_source=point_cloud_source,
                 data_plane_status=data_plane_status,
+                ros2_topic_inputs=ros2_topic_inputs,
             ),
+            "ros2_topic_inputs": ros2_topic_inputs,
+            "map_version_assets": self._build_map_version_asset_status(),
             "live_map_provider": live_map_status,
             "tf_localization_provider": tf_localization_status,
             "odometry_publisher": odometry_status,
@@ -1309,6 +1366,123 @@ class PlatformGeometryRuntime:
         subscriber = getattr(provider, "subscribe_point_cloud", None)
         if not callable(subscriber):
             status["last_error"] = "点云 provider 未实现 subscribe_point_cloud。"
+        return status
+
+    def _build_ros2_topic_input_status(
+        self,
+        *,
+        tf_localization_status: Optional[Dict[str, object]] = None,
+        odometry_status: Optional[Dict[str, object]] = None,
+        point_cloud_status: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        tf_localization_status = tf_localization_status or self._clone_metadata(self._tf_localization_provider.get_status())
+        odometry_status = odometry_status or self._clone_metadata(self._odometry_publisher.get_status())
+        point_cloud_status = point_cloud_status or self._clone_metadata(self._point_cloud_publisher.get_status())
+        topic_specs = {
+            "odom": {
+                "topic": self.config.topics.odom_topic,
+                "required": True,
+                "message_count": int(odometry_status.get("published_count") or 0),
+                "source": "platform_odometry_publisher",
+                "status": self._clone_metadata(odometry_status),
+            },
+            "imu": {
+                "topic": self.config.topics.imu_topic,
+                "required": True,
+                "message_count": None,
+                "source": "robot_sensor_ros2_topic",
+                "status": {},
+            },
+            "pointcloud": {
+                "topic": self.config.topics.point_cloud_topic,
+                "required": True,
+                "message_count": int(point_cloud_status.get("published_count") or 0),
+                "source": "platform_pointcloud_publisher",
+                "status": self._clone_metadata(point_cloud_status),
+            },
+            "tf": {
+                "topic": self.config.topics.tf_topic,
+                "required": True,
+                "message_count": int(tf_localization_status.get("tf_message_count") or 0),
+                "source": "ros2_tf",
+                "status": self._clone_metadata(tf_localization_status),
+            },
+            "tf_static": {
+                "topic": self.config.topics.tf_static_topic,
+                "required": True,
+                "message_count": int(tf_localization_status.get("tf_static_message_count") or 0),
+                "source": "ros2_tf_static",
+                "status": self._clone_metadata(tf_localization_status),
+            },
+        }
+        topics: Dict[str, object] = {}
+        missing_required: List[str] = []
+        for name, spec in topic_specs.items():
+            topic = str(spec.get("topic") or "").strip()
+            graph = self._topic_graph_status(topic)
+            message_count = spec.get("message_count")
+            publisher_count = graph.get("publisher_count")
+            configured = bool(topic)
+            publisher_ready = publisher_count is not None and int(publisher_count or 0) > 0
+            first_frame_ready = isinstance(message_count, int) and message_count > 0
+            ready = bool(configured and (first_frame_ready or publisher_ready))
+            item = {
+                "topic": topic or None,
+                "required": bool(spec.get("required")),
+                "configured": configured,
+                "ready": ready,
+                "first_frame_ready": first_frame_ready,
+                "message_count": message_count,
+                "publisher_ready": publisher_ready,
+                "source": spec.get("source"),
+                "graph": graph,
+                "status": spec.get("status") or {},
+            }
+            if item["required"] and not ready:
+                missing_required.append(name)
+            topics[name] = item
+        return {
+            "ready": not missing_required,
+            "missing_required": missing_required,
+            "topics": topics,
+            "required_topic_names": tuple(topic_specs.keys()),
+            "input_contract": "platform_geometry_ros2_topics",
+            "message": "平台 ROS2 几何输入已可观测。" if not missing_required else "平台 ROS2 几何输入缺失：%s。" % ", ".join(missing_required),
+        }
+
+    def _topic_graph_status(self, topic: str) -> Dict[str, object]:
+        status: Dict[str, object] = {
+            "topic": topic or None,
+            "graph_node_available": False,
+            "publisher_count": None,
+            "subscription_count": None,
+            "last_error": None,
+        }
+        if not str(topic or "").strip():
+            status["last_error"] = "topic_empty"
+            return status
+        nodes = (
+            getattr(self._live_map_provider, "_node", None),
+            getattr(self._tf_localization_provider, "_node", None),
+            getattr(self._odometry_publisher, "_node", None),
+            getattr(self._point_cloud_publisher, "_node", None),
+            getattr(self._nav2_action_provider, "_node", None),
+        )
+        errors = []
+        for node in nodes:
+            if node is None:
+                continue
+            status["graph_node_available"] = True
+            try:
+                publishers = node.get_publishers_info_by_topic(topic)
+                subscriptions = node.get_subscriptions_info_by_topic(topic)
+                status["publisher_count"] = len(publishers)
+                status["subscription_count"] = len(subscriptions)
+                return status
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            status["last_error"] = "; ".join(errors[-3:])
         return status
 
     def _build_data_plane_status(self) -> Dict[str, object]:
@@ -1373,12 +1547,12 @@ class PlatformGeometryRuntime:
             if data_plane_status.get("enabled") is False:
                 return (
                     "point_cloud_input",
-                    "Go2 data plane 未启用，点云桥尚未向 %s 发布首帧；请启用 GO2_DATA_PLANE_ENABLED 并确认 %s 有输入。"
+                    "平台点云桥尚未向 %s 发布首帧；请确认机器人传感器 provider 或 ROS2 点云输入 %s 可用。"
                     % (point_cloud_topic, source_topic),
                 )
             return (
                 "point_cloud_input",
-                "点云桥尚未向 %s 发布首帧，等待 Go2 data plane 从 %s 输入点云。"
+                "点云桥尚未向 %s 发布首帧，等待平台传感器 provider 从 %s 输入点云。"
                 % (point_cloud_topic, source_topic),
             )
         if not bool(live_map_status.get("occupancy_grid_ready")):
@@ -2522,6 +2696,94 @@ class PlatformGeometryRuntime:
     def _has_live_or_seed_map(self) -> bool:
         return bool(self._live_map_provider.is_map_available() or self._active_map_version is not None)
 
+    def _build_map_version_asset_status(self) -> Dict[str, object]:
+        active_version = self._active_map_version
+        geometry_asset = active_version.geometry_asset if active_version is not None else None
+        live_db = self._locate_live_rtabmap_database(include_active_version=False)
+        live_pcd = self._locate_live_pcd_asset(include_active_version=False)
+        nav2_map = geometry_asset.metadata.get("nav2_map") if geometry_asset is not None and isinstance(geometry_asset.metadata.get("nav2_map"), dict) else {}
+        active_asset_ready = bool(
+            geometry_asset is not None
+            and geometry_asset.quality_metrics.get("status") == "ready"
+            and geometry_asset.quality_metrics.get("database", {}).get("present", False)
+        )
+        live_database_ready = live_db is not None and live_db.exists() and live_db.is_file()
+        live_pcd_ready = live_pcd is not None and live_pcd.exists() and live_pcd.is_file()
+        return {
+            "ready": active_asset_ready,
+            "active_map_name": active_version.map_name if active_version is not None else None,
+            "active_map_version_id": active_version.version_id if active_version is not None else None,
+            "active_geometry_asset_ready": active_asset_ready,
+            "active_geometry_asset_summary": self._summarize_geometry_asset(geometry_asset) if geometry_asset is not None else None,
+            "live_rtabmap_database_ready": live_database_ready,
+            "live_rtabmap_database": self._file_metadata(live_db) if live_db is not None else {"present": False, "path": str(self._rtabmap_database_path().resolve(strict=False))},
+            "live_pcd_asset_ready": live_pcd_ready,
+            "live_pcd_asset": self._file_metadata(live_pcd) if live_pcd is not None else {"present": False, "path": str((Path(str(self.config.rtabmap.pcd_root or "")).expanduser() / self.config.rtabmap.outputs.pcd_asset_name).resolve(strict=False))},
+            "nav2_map_asset": self._clone_metadata(nav2_map),
+            "acceptance": {
+                "map_version_geometry_asset_ready": active_asset_ready,
+                "live_checkpoint_available": live_database_ready,
+                "pcd_asset_available": live_pcd_ready,
+                "nav2_map_yaml_ready": bool(nav2_map.get("present") or nav2_map.get("map_yaml_present") or nav2_map.get("yaml", {}).get("present")),
+            },
+            "message": "地图版本几何资产已就绪。" if active_asset_ready else "尚未确认当前地图版本几何资产；可继续使用实时流，但需在地图版本固化时生成资产。",
+        }
+
+    def _build_geometry_acceptance_status(
+        self,
+        *,
+        ros2_topic_inputs: Dict[str, object],
+        rtabmap_readiness: Dict[str, object],
+        nav2_status: Dict[str, object],
+        tf_localization_status: Dict[str, object],
+        map_version_assets: Dict[str, object],
+    ) -> Dict[str, object]:
+        navigation_policy = self._navigation_backend_policy()
+        checks = {
+            "ros2_topic_inputs": {
+                "ready": bool(ros2_topic_inputs.get("ready")),
+                "waiting_for": ros2_topic_inputs.get("missing_required"),
+                "message": ros2_topic_inputs.get("message"),
+            },
+            "rtabmap_live_map": {
+                "ready": bool(rtabmap_readiness.get("streaming_ready") and rtabmap_readiness.get("occupancy_costmap_ready")),
+                "waiting_for": rtabmap_readiness.get("waiting_for"),
+                "message": rtabmap_readiness.get("message"),
+                "occupancy_costmap_acceptance": self._clone_metadata(rtabmap_readiness.get("occupancy_costmap_acceptance") or {}),
+            },
+            "map_version_assets": {
+                "ready": bool(map_version_assets.get("ready")),
+                "waiting_for": None if map_version_assets.get("ready") else "map_version_geometry_asset",
+                "message": map_version_assets.get("message"),
+            },
+            "tf_localization": {
+                "ready": bool(tf_localization_status.get("pose_ready") or tf_localization_status.get("pose_available"))
+                and bool(tf_localization_status.get("map_to_base_ready")),
+                "waiting_for": tf_localization_status.get("waiting_for"),
+                "message": tf_localization_status.get("last_error"),
+            },
+            "nav2_action": {
+                "ready": bool(nav2_status.get("ready") and nav2_status.get("action_client_connected")),
+                "waiting_for": nav2_status.get("waiting_for"),
+                "message": nav2_status.get("message"),
+            },
+            "platform_goal_route": {
+                "ready": bool(navigation_policy.get("nav2_action_active") and navigation_policy.get("platform_grid_removed")),
+                "waiting_for": None if navigation_policy.get("nav2_action_active") else "nav2_action_backend",
+                "message": navigation_policy.get("message"),
+            },
+        }
+        required_for_navigation = ("ros2_topic_inputs", "rtabmap_live_map", "tf_localization", "nav2_action", "platform_goal_route")
+        failed = [name for name in required_for_navigation if not bool(checks[name].get("ready"))]
+        return {
+            "ready": not failed,
+            "failed_required_checks": failed,
+            "checks": checks,
+            "navigation_backend_policy": self._clone_metadata(navigation_policy),
+            "data_plane_not_required_for_semantic_navigation": True,
+            "message": "平台侧几何主链已满足可导航验收。" if not failed else "平台侧几何主链仍有未就绪项：%s。" % ", ".join(failed),
+        }
+
     def subscribe_localization_updates(self, callback) -> Optional[int]:
         """订阅平台 TF 定位输出。"""
 
@@ -2578,6 +2840,15 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return False
         return self._stop_platform_exploration_loop(cancel_navigation=True, notify=True)
+
+
+    def update_platform_exploration_semantic_context(self, context: Dict[str, object]) -> None:
+        if not self._is_geometry_profile_enabled():
+            return
+        updater = getattr(self._platform_exploration_runtime, "update_semantic_context", None)
+        if callable(updater):
+            updater(dict(context or {}))
+            self._notify_exploration_update(self.get_platform_exploration_state())
 
     def report_platform_exploration_hit_stop(self, reason: str) -> None:
         if not self._is_geometry_profile_enabled():
@@ -3297,6 +3568,12 @@ class PlatformGeometryProviderBundle(
         if not self._is_geometry_profile_enabled():
             return False
         return self.runtime.start_platform_exploration(request)
+
+
+    def update_semantic_context(self, context) -> None:
+        if not self._is_geometry_profile_enabled():
+            return
+        self.runtime.update_platform_exploration_semantic_context(dict(context or {}))
 
     def stop_exploration(self) -> bool:
         if not self._is_geometry_profile_enabled():

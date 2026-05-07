@@ -245,6 +245,7 @@ class Go2RobotAssembly(RobotAssemblyBase):
         from services.perception import (
             BBoxOnlySegmentationBackend,
             Basic2DTrackerBackend,
+            ByteTrackTrackerBackend,
             DetectionAttributesSegmentationBackend,
             DetectorPipeline,
             DisabledSegmentationBackend,
@@ -253,6 +254,7 @@ class Go2RobotAssembly(RobotAssemblyBase):
             OpenAICompatibleVisionSceneDescriptionBackend,
             SimpleSceneDescriptionBackend,
             UltralyticsYoloDetectorBackend,
+            YoloWorldDetectorBackend,
         )
 
         metadata_detector_name = "go2_metadata_detector"
@@ -274,6 +276,26 @@ class Go2RobotAssembly(RobotAssemblyBase):
                     iou_threshold=self.config.perception.yolo.iou_threshold,
                     image_size=self.config.perception.yolo.image_size,
                     max_detections=self.config.perception.yolo.max_detections,
+                ),
+            )
+        if self.config.perception.yolo_world.enabled:
+            detector_backends.insert(
+                0,
+                YoloWorldDetectorBackend(
+                    name=self.config.perception.yolo_world.backend_name,
+                    weights=self.config.perception.yolo_world.model_name,
+                    runtime_preference=self.config.perception.yolo_world.runtime_preference,
+                    engine_path=self.config.perception.yolo_world.engine_path,
+                    device=self.config.perception.yolo_world.device,
+                    half=self.config.perception.yolo_world.half,
+                    int8=self.config.perception.yolo_world.int8,
+                    confidence_threshold=self.config.perception.yolo_world.confidence_threshold,
+                    iou_threshold=self.config.perception.yolo_world.iou_threshold,
+                    image_size=self.config.perception.yolo_world.image_size,
+                    max_detections=self.config.perception.yolo_world.max_detections,
+                    class_names=self.config.perception.yolo_world.class_names,
+                    class_aliases=self.config.perception.yolo_world.class_aliases,
+                    dynamic_class_metadata_keys=self.config.perception.yolo_world.dynamic_class_metadata_keys,
                 ),
             )
 
@@ -364,13 +386,24 @@ class Go2RobotAssembly(RobotAssemblyBase):
                 metadata=disabled_metadata,
             )
 
+        tracker_backend = ByteTrackTrackerBackend(
+            name=self.config.perception.tracker.bytetrack_name,
+            high_threshold=self.config.perception.tracker.high_threshold,
+            low_threshold=self.config.perception.tracker.low_threshold,
+            iou_match_threshold=self.config.perception.tracker.iou_match_threshold,
+            lost_ttl_frames=self.config.perception.tracker.lost_ttl_frames,
+            trajectory_limit=self.config.perception.tracker.trajectory_limit,
+        )
+        if self.config.perception.tracker.default_backend.strip().lower() not in {"bytetrack", "byte_track"}:
+            tracker_backend = Basic2DTrackerBackend(name="go2_basic_2d_tracker")
+
         return {
             "pipeline_name": "go2_default_perception_pipeline",
             "detector_pipeline": DetectorPipeline(
                 tuple(detector_backends),
                 default_backend_name=default_detector_name,
             ),
-            "tracker_backend": Basic2DTrackerBackend(name="go2_basic_2d_tracker"),
+            "tracker_backend": tracker_backend,
             "scene_description_backend": scene_backend,
             "segmentation_backend": segmentation_backend,
         }

@@ -39,6 +39,7 @@ from gateways.serialization import to_jsonable
 from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
+from services.evaluation import EvaluationService
 from services.geometry import (
     PlatformGeometryRuntime,
     PointCloudMapCache,
@@ -344,6 +345,11 @@ class GatewayRuntime:
             robot=robot,
             event_bus=self.event_bus,
         )
+        self.evaluation_service = EvaluationService(
+            state_store=self.state_store,
+            event_bus=self.event_bus,
+            history_limit=config.runtime_data.navigation_history_limit,
+        )
         self.memory_service = MemoryService(
             localization_service=self.localization_service,
             mapping_service=self.mapping_service,
@@ -361,6 +367,7 @@ class GatewayRuntime:
             embedding_api_key=config.runtime_data.memory_embedding_api_key,
             embedding_base_url=config.runtime_data.memory_embedding_base_url,
             embedding_timeout_sec=config.runtime_data.memory_embedding_timeout_sec,
+            evaluation_service=self.evaluation_service,
         )
         self.artifact_store.set_reference_provider(self.memory_service.build_artifact_reference_index)
         self.perception_video_runtime._memory_service = self.memory_service
@@ -372,6 +379,8 @@ class GatewayRuntime:
             event_bus=self.event_bus,
             stream_bus=self.stream_bus,
             history_limit=config.runtime_data.navigation_history_limit,
+            safety_state_provider=self._build_navigation_safety_snapshot,
+            evaluation_service=self.evaluation_service,
         )
         self.map_workspace_service = MapWorkspaceService(
             catalog_root=config.runtime_data.map_catalog_root,
@@ -1203,6 +1212,20 @@ class GatewayRuntime:
                 output_schema=_schema_object({"navigation_semantic_context": {"type": "object"}}),
             ),
             _descriptor(
+                "get_semantic_navigation_evaluation_summary",
+                "获取语义导航评估摘要",
+                "读取平台侧任务级评估 trace、切片聚合和质量门禁结果。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({"limit": {"type": "integer", "minimum": 1, "default": 20}}),
+                output_schema=_schema_object(
+                    {
+                        "evaluation_summary": {"type": "object"},
+                        "evaluation_traces": {"type": "array"},
+                    }
+                ),
+            ),
+            _descriptor(
                 "resolve_navigation_candidates",
                 "解析导航候选",
                 "按自然语言查询只返回记忆和语义空间导航候选及证据，不提交导航任务。",
@@ -1864,6 +1887,7 @@ class GatewayRuntime:
             "get_map_snapshot": self._handle_get_map_snapshot,
             "get_navigation_snapshot": self._handle_get_navigation_snapshot,
             "get_navigation_semantic_context": self._handle_get_navigation_semantic_context,
+            "get_semantic_navigation_evaluation_summary": self._handle_get_semantic_navigation_evaluation_summary,
             "resolve_navigation_candidates": self._handle_resolve_navigation_candidates,
             "list_maps": self._handle_list_maps,
             "create_map": self._handle_create_map,
@@ -2014,6 +2038,13 @@ class GatewayRuntime:
                 description="读取当前平台地图版本绑定的语义区域、拓扑节点、场景空间候选和证据摘要。",
                 category=SkillCategory.SYSTEM,
                 capability_name="get_navigation_semantic_context",
+            ),
+            SkillDescriptor(
+                name="get_semantic_navigation_evaluation_summary",
+                display_name="获取语义导航评估摘要",
+                description="读取平台侧任务级评估 trace、切片聚合和质量门禁结果。",
+                category=SkillCategory.SYSTEM,
+                capability_name="get_semantic_navigation_evaluation_summary",
             ),
             SkillDescriptor(
                 name="resolve_navigation_candidates",
@@ -2620,6 +2651,22 @@ class GatewayRuntime:
                 metadata_payload[key] = value
         return metadata_payload
 
+    def _build_navigation_safety_snapshot(self) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {
+            "safe_stop": self.safety_guard.get_safe_stop_state(),
+            "official_obstacle_avoidance": {},
+        }
+        data_plane = getattr(self.robot, "data_plane", None)
+        getter = getattr(data_plane, "get_obstacle_avoidance_status", None)
+        if callable(getter):
+            try:
+                status = getter()
+                if isinstance(status, dict):
+                    snapshot["official_obstacle_avoidance"] = status
+            except Exception as exc:
+                snapshot["official_obstacle_avoidance"] = {"status_error": str(exc)}
+        return snapshot
+
     def get_runtime_governance_summary(self) -> RuntimeGovernanceSummary:
         """导出运行时观察与治理摘要。"""
 
@@ -3178,6 +3225,19 @@ class GatewayRuntime:
             )
         }
 
+    def _handle_get_semantic_navigation_evaluation_summary(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        limit = max(1, self._int(arguments, "limit", 20))
+        return {
+            "evaluation_summary": self.evaluation_service.get_summary(),
+            "evaluation_traces": list(self.evaluation_service.list_traces(limit=limit)),
+        }
+
     def _handle_resolve_navigation_candidates(
         self,
         arguments: Dict[str, Any],
@@ -3186,16 +3246,22 @@ class GatewayRuntime:
     ) -> Dict[str, Any]:
         del requested_by
         query = self._require_str(arguments, "query")
+        candidates = self.memory_service.resolve_navigation_candidates(
+            query,
+            camera_id=self._optional_str(arguments, "camera_id"),
+            similarity_threshold=self._float(arguments, "similarity_threshold", 0.25),
+            max_age_sec=self._float(arguments, "max_age_sec", 0.0) or None,
+            map_version_id=self._optional_str(arguments, "map_version_id"),
+            localization_session_id=self._optional_str(arguments, "localization_session_id"),
+            limit=max(1, self._int(arguments, "limit", 5)),
+        )
+        first_metadata = dict(candidates[0].metadata) if candidates else {}
+        resolution_summary = first_metadata.get("resolution_summary") if isinstance(first_metadata.get("resolution_summary"), dict) else None
         return {
-            "navigation_candidates": self.memory_service.resolve_navigation_candidates(
-                query,
-                camera_id=self._optional_str(arguments, "camera_id"),
-                similarity_threshold=self._float(arguments, "similarity_threshold", 0.25),
-                max_age_sec=self._float(arguments, "max_age_sec", 0.0) or None,
-                map_version_id=self._optional_str(arguments, "map_version_id"),
-                localization_session_id=self._optional_str(arguments, "localization_session_id"),
-                limit=max(1, self._int(arguments, "limit", 5)),
-            )
+            "navigation_candidates": candidates,
+            "goal_spec": resolution_summary.get("goal_spec") if isinstance(resolution_summary, dict) else None,
+            "resolution_summary": resolution_summary,
+            "llm_boundary": first_metadata.get("llm_boundary") if first_metadata else None,
         }
 
     def _handle_list_memory_libraries(
@@ -3785,6 +3851,11 @@ class GatewayRuntime:
             },
             deep=True,
         )
+        goal = self._ensure_evaluation_trace_for_goal(
+            goal,
+            query=target_name,
+            navigation_candidate=navigation_candidate,
+        )
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
         timeout_sec = self._resolve_async_timeout("navigate_to_named_location", arguments, minimum_sec=0.1)
         should_fail_on_arrival_verification = navigation_candidate is not None
@@ -3806,6 +3877,8 @@ class GatewayRuntime:
                         strict=should_fail_on_arrival_verification,
                         expected_map_version_id=current_map_version_id,
                         localization_session_id=current_localization_session_id,
+                        navigation_context=_navigation_context,
+                        goal=goal,
                     )
                 )
                 if verify_on_arrival
@@ -3922,12 +3995,6 @@ class GatewayRuntime:
         return self.task_manager.submit(
             "find_target",
             runner,
-            input_payload={
-                "map_name": map_name,
-                "query": query,
-                "camera_id": camera_id,
-                "poll_interval_sec": poll_interval_sec,
-            },
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
@@ -4020,6 +4087,15 @@ class GatewayRuntime:
             metadata={
                 "requested_by": requested_by or "unknown",
                 "search_query": query,
+                "semantic_exploration_context": {
+                    "query": query,
+                    "search_query": query,
+                    "target_name": query,
+                    "camera_id": camera_id or "",
+                    "max_distance_m": self._float(arguments, "max_distance_m", 0.0) or None,
+                    "min_battery_percent": self._float(arguments, "min_battery_percent", 0.0) or None,
+                    "forbidden_zones": arguments.get("forbidden_zones") if isinstance(arguments.get("forbidden_zones"), list) else [],
+                },
             },
         )
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.2)
@@ -4108,7 +4184,24 @@ class GatewayRuntime:
                     finalized = True
                     return result
 
-                active_request = request
+                initial_semantic_context = self._build_semantic_exploration_context(
+                    query=query,
+                    camera_id=camera_id,
+                    search_state=search_state,
+                    exploration_context=None,
+                    perception_refresh=precheck_refresh,
+                    memory_ingest={},
+                    extra_context=dict(request.metadata.get("semantic_exploration_context") or {}),
+                )
+                active_request = request.model_copy(
+                    update={
+                        "metadata": {
+                            **dict(request.metadata),
+                            "semantic_exploration_context": initial_semantic_context,
+                        }
+                    },
+                    deep=True,
+                )
                 context.update(progress=0.08, stage="exploration_accepted", message="开始探索并持续查找目标。")
                 exploration_context = self.navigation_service.start_exploration(active_request)
                 while True:
@@ -4129,14 +4222,23 @@ class GatewayRuntime:
                     )
 
                     now = time.monotonic()
+                    cycle_refresh: Dict[str, Any] = {}
+                    cycle_memory_ingest: Dict[str, Any] = {}
                     if now - last_search_refresh_at >= max(0.1, search_refresh_interval_sec):
-                        self._refresh_target_search_observation(
+                        cycle_refresh = self._refresh_target_search_observation(
                             query=query,
                             camera_id=camera_id,
                             requested_by=requested_by,
                             reason="explore_find_cycle",
                             remember_result=True,
                             frame_count=1,
+                        )
+                        cycle_memory_ingest = self._ingest_semantic_exploration_cycle_memory(
+                            query=query,
+                            camera_id=camera_id,
+                            requested_by=requested_by,
+                            reason="explore_find_cycle",
+                            exploration_context=exploration_context,
                         )
                         last_search_refresh_at = now
 
@@ -4146,6 +4248,15 @@ class GatewayRuntime:
                         camera_id=camera_id,
                         verify_similarity_threshold=verify_similarity_threshold,
                         rejected_record_ids=rejected_record_ids,
+                    )
+                    self._update_semantic_exploration_context(
+                        query=query,
+                        camera_id=camera_id,
+                        search_state=search_state,
+                        exploration_context=exploration_context,
+                        perception_refresh=cycle_refresh,
+                        memory_ingest=cycle_memory_ingest,
+                        extra_context=dict(request.metadata.get("semantic_exploration_context") or {}),
                     )
                     if search_state["current_scene_verification"].verified:
                         self._report_platform_exploration_hit_stop("current_scene_target_found")
@@ -4173,6 +4284,7 @@ class GatewayRuntime:
                         return result
 
                     if search_state["memory_candidates"] or search_state["semantic_goal"] is not None:
+                        self._report_platform_exploration_hit_stop("semantic_candidate_target_found")
                         exploration_stop_context = self.navigation_service.stop_exploration()
                         navigation_result = self._run_target_navigation_candidates(
                             task_context=context,
@@ -4213,7 +4325,7 @@ class GatewayRuntime:
                         continue
 
                     if status.value == "succeeded":
-                        self._refresh_target_search_observation(
+                        final_refresh = self._refresh_target_search_observation(
                             query=query,
                             camera_id=camera_id,
                             requested_by=requested_by,
@@ -4221,12 +4333,28 @@ class GatewayRuntime:
                             remember_result=True,
                             frame_count=1,
                         )
+                        final_memory_ingest = self._ingest_semantic_exploration_cycle_memory(
+                            query=query,
+                            camera_id=camera_id,
+                            requested_by=requested_by,
+                            reason="explore_find_final",
+                            exploration_context=exploration_context,
+                        )
                         final_search_state = self._build_target_search_state(
                             query=query,
                             map_name=map_name,
                             camera_id=camera_id,
                             verify_similarity_threshold=verify_similarity_threshold,
                             rejected_record_ids=rejected_record_ids,
+                        )
+                        self._update_semantic_exploration_context(
+                            query=query,
+                            camera_id=camera_id,
+                            search_state=final_search_state,
+                            exploration_context=exploration_context,
+                            perception_refresh=final_refresh,
+                            memory_ingest=final_memory_ingest,
+                            extra_context=dict(request.metadata.get("semantic_exploration_context") or {}),
                         )
                         if final_search_state["current_scene_verification"].verified:
                             self._report_platform_exploration_hit_stop("current_scene_target_found")
@@ -4281,6 +4409,15 @@ class GatewayRuntime:
                             )
                             finalized = True
                             return result
+                        negative_memory = self._record_semantic_exploration_negative_observation(
+                            query=query,
+                            camera_id=camera_id,
+                            map_name=map_name,
+                            reason="target_not_found_after_exploration",
+                            exploration_context=exploration_context,
+                            search_state=final_search_state,
+                            rejected_record_ids=rejected_record_ids,
+                        )
                         raise GatewayError(
                             "探索已完成，但仍未找到目标：%s" % query,
                             error_code="target_not_found_after_exploration",
@@ -4291,11 +4428,24 @@ class GatewayRuntime:
                                 "query": query,
                                 "candidate_diagnostics": list(final_search_state.get("candidate_diagnostics", ())),
                                 "rejected_candidate_ids": sorted(rejected_record_ids),
+                                "negative_memory": negative_memory,
                             },
                         )
 
                     if status.value == "failed":
-                        raise GatewayError(exploration_context.exploration_state.message or "探索执行失败。")
+                        negative_memory = self._record_semantic_exploration_negative_observation(
+                            query=query,
+                            camera_id=camera_id,
+                            map_name=map_name,
+                            reason="exploration_failed",
+                            exploration_context=exploration_context,
+                            search_state=search_state,
+                            rejected_record_ids=rejected_record_ids,
+                        )
+                        raise GatewayError(
+                            exploration_context.exploration_state.message or "探索执行失败。",
+                            details={"negative_memory": negative_memory},
+                        )
                     if status.value == "cancelled":
                         raise GatewayError(exploration_context.exploration_state.message or "探索已取消。")
                     time.sleep(max(0.05, poll_interval_sec))
@@ -4837,6 +4987,257 @@ class GatewayRuntime:
             },
         )
 
+    def _navigation_pose_summary(self, pose) -> Optional[Dict[str, object]]:
+        if pose is None:
+            return None
+        return {
+            "frame_id": pose.frame_id,
+            "x": round(float(pose.position.x), 4),
+            "y": round(float(pose.position.y), 4),
+            "z": round(float(pose.position.z), 4),
+        }
+
+    def _build_navigation_verification_policy(
+        self,
+        *,
+        query: str,
+        navigation_candidate=None,
+        goal: Optional[NavigationGoal] = None,
+        verify_similarity_threshold: float,
+        expected_map_version_id: Optional[str],
+        localization_session_id: Optional[str],
+    ) -> Dict[str, object]:
+        candidate_metadata = dict(getattr(navigation_candidate, "metadata", {}) or {})
+        goal_metadata = dict(getattr(goal, "metadata", {}) or {})
+        target_pose = getattr(navigation_candidate, "target_pose", None) or getattr(goal, "target_pose", None)
+        return {
+            "policy_version": "stage6-v1",
+            "required": True,
+            "target_query": query,
+            "arrival_distance": {
+                "tolerance_position_m": float(getattr(goal, "tolerance_position_m", 0.3) if goal is not None else 0.3),
+                "target_pose": self._navigation_pose_summary(target_pose),
+                "backend_goal_reached_required": True,
+            },
+            "viewpoint": {
+                "target_name": str(getattr(navigation_candidate, "target_name", "") or getattr(goal, "target_name", "") or query),
+                "inspection_pose_required": target_pose is not None,
+                "camera_id_required": False,
+            },
+            "target_reidentification": {
+                "similarity_threshold": round(float(verify_similarity_threshold), 6),
+                "verification_query": str(getattr(navigation_candidate, "verification_query", "") or query),
+                "record_id": str(getattr(navigation_candidate, "record_id", "") or goal_metadata.get("record_id") or ""),
+                "record_kind": str(getattr(getattr(navigation_candidate, "record_kind", None), "value", "") or goal_metadata.get("record_kind") or ""),
+            },
+            "scene_consistency": {
+                "map_version_id": expected_map_version_id or "",
+                "localization_session_id": localization_session_id or "",
+                "scene_space_id": str(getattr(navigation_candidate, "scene_space_id", "") or candidate_metadata.get("scene_space_id") or ""),
+                "semantic_region_id": str(getattr(navigation_candidate, "semantic_region_id", "") or candidate_metadata.get("semantic_region_id") or ""),
+            },
+            "upper_confirmation": {
+                "required": False,
+                "source": "platform_verification_policy",
+                "accepted_by": "memory_arrival_verification",
+            },
+        }
+
+    def _ingest_navigation_verification_memory(
+        self,
+        *,
+        query: str,
+        camera_id: Optional[str],
+        requested_by: Optional[str],
+        source: str,
+        verification_policy: Dict[str, object],
+        arrival_verification=None,
+    ) -> Dict[str, object]:
+        if not self.memory_service.is_enabled():
+            return {"memory_enabled": False, "memory_written": False, "semantic_memory_id": "", "observation_event_ids": []}
+        try:
+            entry = self.memory_service.remember_current_scene(
+                title="导航复核观察：%s" % query[:48],
+                camera_id=camera_id,
+                tags=[query, "navigation_verification"],
+                metadata={
+                    "requested_by": requested_by or "unknown",
+                    "source": source,
+                    "verification_policy": verification_policy,
+                    "arrival_verified": bool(getattr(arrival_verification, "verified", False)) if arrival_verification is not None else None,
+                    "arrival_score": getattr(arrival_verification, "score", None),
+                    "arrival_reason": getattr(arrival_verification, "reason", "") if arrival_verification is not None else "",
+                },
+            )
+        except Exception as exc:
+            RUNTIME_LOGGER.exception("语义导航复核记忆写入失败 query=%s", query)
+            return {
+                "memory_enabled": True,
+                "memory_written": False,
+                "semantic_memory_id": "",
+                "observation_event_ids": [],
+                "error": str(exc),
+            }
+        event_ids = list(self.memory_service.observation_event_ids_for_memory(entry.memory_id))
+        return {
+            "memory_enabled": True,
+            "memory_written": True,
+            "semantic_memory_id": entry.memory_id,
+            "observation_event_ids": event_ids,
+            "scene_space_id": entry.scene_space_id or "",
+            "semantic_labels": list(entry.semantic_labels),
+        }
+
+    def _navigation_failure_reason_code(self, error_code: Optional[str], message: Optional[str] = None) -> str:
+        normalized = str(error_code or "").strip()
+        if normalized in {"localization_unavailable", "arrival_not_confirmed"}:
+            return "localization_untrusted"
+        if normalized in {"target_not_reachable", "navigation_goal_failed", "navigation_failed"}:
+            return "candidate_unreachable"
+        if normalized in {"path_blocked", "safe_stop_active", "safety_precheck_failed"}:
+            return "path_blocked"
+        if normalized == "arrival_verification_failed":
+            return "target_not_found"
+        if normalized:
+            return normalized
+        text = str(message or "")
+        if "阻塞" in text or "blocked" in text.lower():
+            return "path_blocked"
+        return "navigation_failed"
+
+    def _navigation_next_action(
+        self,
+        *,
+        reason_code: str,
+        remaining_candidate_count: int,
+        allow_not_found: bool,
+        score: Optional[float] = None,
+    ) -> Dict[str, object]:
+        low_score = score is not None and score < 0.35
+        if remaining_candidate_count > 0 and reason_code in {"target_not_found", "candidate_unreachable", "path_blocked", "insufficient_evidence"}:
+            return {"action": "try_next_candidate", "recoverable": True, "reason_code": reason_code}
+        if reason_code in {"candidate_unreachable", "path_blocked", "localization_untrusted"}:
+            return {"action": "replan", "recoverable": True, "reason_code": reason_code}
+        if reason_code in {"target_not_found", "insufficient_evidence", "perception_low_confidence"} or low_score:
+            return {"action": "semantic_exploration", "recoverable": True, "reason_code": reason_code}
+        if reason_code in {"candidate_confidence_low", "segmentation_review_required"}:
+            return {"action": "request_clarification", "recoverable": True, "reason_code": reason_code}
+        return {"action": "stop_and_report", "recoverable": bool(allow_not_found), "reason_code": reason_code}
+
+    def _build_navigation_task_trace(
+        self,
+        *,
+        query: str,
+        goal: Optional[NavigationGoal],
+        navigation_candidate,
+        navigation_context,
+        verification_policy: Dict[str, object],
+        arrival_verification,
+        perception_refresh: Dict[str, object],
+        memory_update: Dict[str, object],
+        next_action: Dict[str, object],
+    ) -> Dict[str, object]:
+        nav_state = getattr(navigation_context, "navigation_state", None)
+        route = dict(getattr(nav_state, "metadata", {}) or {}).get("navigation_submission_route") if nav_state is not None else None
+        return {
+            "trace_version": "stage6-v1",
+            "goal": {
+                "query": query,
+                "goal_id": getattr(goal, "goal_id", None),
+                "target_name": getattr(goal, "target_name", None),
+                "target_pose": self._navigation_pose_summary(getattr(goal, "target_pose", None)),
+            },
+            "candidate": self._build_target_candidate_diagnostic(navigation_candidate) if navigation_candidate is not None else None,
+            "route": route or {},
+            "execution": {
+                "status": str(getattr(getattr(nav_state, "status", None), "value", getattr(nav_state, "status", "unknown"))),
+                "goal_reached": bool(getattr(navigation_context, "goal_reached", False)),
+                "remaining_distance_m": getattr(nav_state, "remaining_distance_m", None),
+            },
+            "verification": {
+                "policy": verification_policy,
+                "verified": bool(getattr(arrival_verification, "verified", False)) if arrival_verification is not None else False,
+                "score": getattr(arrival_verification, "score", None),
+                "reason": getattr(arrival_verification, "reason", "") if arrival_verification is not None else "",
+                "metadata": dict(getattr(arrival_verification, "metadata", {}) or {}) if arrival_verification is not None else {},
+            },
+            "memory_update": memory_update,
+            "next_action": next_action,
+            "metadata": {
+                "evaluation_trace_id": str(dict(getattr(goal, "metadata", {}) or {}).get("evaluation_trace_id") or dict(getattr(navigation_candidate, "metadata", {}) or {}).get("evaluation_trace_id") or ""),
+            },
+        }
+
+    def _record_evaluation_task_outcome(
+        self,
+        *,
+        task_trace: Dict[str, object],
+        execution_status: str,
+        navigation_candidate=None,
+        navigation_goal: Optional[NavigationGoal] = None,
+        navigation_context=None,
+        verification_result=None,
+        memory_update: Optional[Dict[str, object]] = None,
+        failure_reason_code: Optional[str] = None,
+    ) -> None:
+        evaluator = getattr(self, "evaluation_service", None)
+        if evaluator is None:
+            return
+        try:
+            evaluator.record_task_outcome(
+                task_trace=task_trace,
+                execution_status=execution_status,
+                verification_result=verification_result,
+                memory_update=memory_update,
+                navigation_context=navigation_context,
+                navigation_goal=navigation_goal,
+                navigation_candidate=navigation_candidate,
+                failure_reason_code=failure_reason_code,
+            )
+        except Exception:
+            RUNTIME_LOGGER.exception("记录语义导航任务级评估失败 execution_status=%s", execution_status)
+
+    def _ensure_evaluation_trace_for_goal(
+        self,
+        goal: NavigationGoal,
+        *,
+        query: str,
+        navigation_candidate=None,
+    ) -> NavigationGoal:
+        metadata = dict(goal.metadata or {})
+        if metadata.get("evaluation_trace_id"):
+            return goal
+        evaluator = getattr(self, "evaluation_service", None)
+        if evaluator is None:
+            return goal
+        candidate_payload = self._build_target_candidate_diagnostic(navigation_candidate) if navigation_candidate is not None else None
+        trace = evaluator.start_trace(
+            goal={
+                "query": query,
+                "goal_id": goal.goal_id,
+                "target_name": goal.target_name or query,
+                "map_name": goal.map_name or "",
+                "selected_candidate": candidate_payload,
+                "map_version_id": metadata.get("map_version_id") or "",
+                "localization_session_id": metadata.get("localization_session_id") or "",
+            },
+            metadata={
+                **metadata,
+                "target_category": query,
+                "selected_candidate": candidate_payload or {},
+            },
+        )
+        return goal.model_copy(
+            update={
+                "metadata": {
+                    **metadata,
+                    "evaluation_trace_id": trace.trace_id,
+                    "selected_candidate": candidate_payload or metadata.get("selected_candidate") or {},
+                }
+            },
+            deep=True,
+        )
+
     def _build_navigation_arrival_result(
         self,
         *,
@@ -4848,13 +5249,30 @@ class GatewayRuntime:
         strict: bool,
         expected_map_version_id: Optional[str],
         localization_session_id: Optional[str],
+        navigation_context=None,
+        goal: Optional[NavigationGoal] = None,
     ) -> Dict[str, Any]:
+        verification_policy = self._build_navigation_verification_policy(
+            query=target_name,
+            navigation_candidate=navigation_candidate,
+            goal=goal,
+            verify_similarity_threshold=verify_similarity_threshold,
+            expected_map_version_id=expected_map_version_id,
+            localization_session_id=localization_session_id,
+        )
         burst_messages = self.perception_video_runtime.run_burst(
             frame_count=3,
             interval_sec=0.05,
             requested_reason="arrival_verify",
             store_artifact=False,
+            remember_result=True,
         )
+        refresh_payload = {
+            "burst_messages": burst_messages,
+            "camera_id": camera_id,
+            "refresh_reason": "arrival_verify",
+            "memory_write_requested": True,
+        }
         arrival_verification = self.memory_service.verify_arrival(
             target_name,
             navigation_candidate=navigation_candidate,
@@ -4862,6 +5280,55 @@ class GatewayRuntime:
             similarity_threshold=verify_similarity_threshold,
             expected_map_version_id=expected_map_version_id,
             localization_session_id=localization_session_id,
+        )
+        memory_ingest = self._ingest_navigation_verification_memory(
+            query=target_name,
+            camera_id=camera_id,
+            requested_by="navigation_arrival_result",
+            source="navigate_to_named_location_arrival",
+            verification_policy=verification_policy,
+            arrival_verification=arrival_verification,
+        )
+        next_action = self._navigation_next_action(
+            reason_code=str(dict(arrival_verification.metadata).get("arrival_reason_code") or "target_not_found"),
+            remaining_candidate_count=0,
+            allow_not_found=False,
+            score=arrival_verification.score,
+        )
+        task_trace = self._build_navigation_task_trace(
+            query=target_name,
+            goal=goal,
+            navigation_candidate=navigation_candidate,
+            navigation_context=navigation_context,
+            verification_policy=verification_policy,
+            arrival_verification=arrival_verification,
+            perception_refresh=refresh_payload,
+            memory_update=memory_ingest,
+            next_action=next_action,
+        )
+        memory_update = self.memory_service.record_navigation_task_outcome(
+            query=target_name,
+            navigation_candidate=navigation_candidate,
+            navigation_goal=goal,
+            navigation_context=navigation_context,
+            arrival_verification=arrival_verification,
+            verification_policy=verification_policy,
+            perception_refresh=refresh_payload,
+            memory_ingest=memory_ingest,
+            execution_status="arrival_verified" if arrival_verification.verified else "arrival_verification_failed",
+            next_action=next_action,
+            task_trace=task_trace,
+        )
+        task_trace["memory_update"] = {**dict(task_trace.get("memory_update") or {}), "outcome": memory_update}
+        self._record_evaluation_task_outcome(
+            task_trace=task_trace,
+            execution_status="arrival_verified" if arrival_verification.verified else "arrival_verification_failed",
+            navigation_candidate=navigation_candidate,
+            navigation_goal=goal,
+            navigation_context=navigation_context,
+            verification_result=arrival_verification,
+            memory_update=memory_update,
+            failure_reason_code=None if arrival_verification.verified else str(dict(arrival_verification.metadata).get("arrival_reason_code") or "target_not_found"),
         )
         if strict and not arrival_verification.verified:
             raise GatewayError(
@@ -4872,13 +5339,276 @@ class GatewayRuntime:
                 details={
                     "map_name": map_name,
                     "target_name": target_name,
+                    "verification_policy": verification_policy,
                     "arrival_verification": arrival_verification.model_dump(mode="json"),
+                    "memory_update": memory_update,
+                    "next_action": next_action,
                 },
             )
         return {
             "burst_messages": burst_messages,
+            "verification_policy": verification_policy,
             "arrival_verification": arrival_verification,
+            "memory_ingest": memory_ingest,
+            "memory_update": memory_update,
+            "next_action": next_action,
+            "task_trace": task_trace,
         }
+
+
+    def _ingest_semantic_exploration_cycle_memory(
+        self,
+        *,
+        query: str,
+        camera_id: Optional[str],
+        requested_by: Optional[str],
+        reason: str,
+        exploration_context,
+    ) -> Dict[str, Any]:
+        if not self.memory_service.is_enabled():
+            return {"memory_enabled": False, "memory_written": False, "semantic_memory_id": "", "observation_event_ids": []}
+        try:
+            entry = self.memory_service.remember_current_scene(
+                title="语义探索观察：%s" % query[:48],
+                camera_id=camera_id,
+                tags=[query, "semantic_exploration", "frontier_refresh"],
+                metadata={
+                    "requested_by": requested_by or "unknown",
+                    "source": reason,
+                    "exploration_state": self._exploration_state_metadata(exploration_context),
+                },
+            )
+        except Exception as exc:
+            RUNTIME_LOGGER.exception("语义探索观察记忆写入失败 query=%s", query)
+            return {"memory_enabled": True, "memory_written": False, "semantic_memory_id": "", "observation_event_ids": [], "error": str(exc)}
+        return {
+            "memory_enabled": True,
+            "memory_written": True,
+            "semantic_memory_id": entry.memory_id,
+            "observation_event_ids": list(self.memory_service.observation_event_ids_for_memory(entry.memory_id)),
+            "scene_space_id": entry.scene_space_id or "",
+        }
+
+    def _update_semantic_exploration_context(
+        self,
+        *,
+        query: str,
+        camera_id: Optional[str],
+        search_state: Dict[str, Any],
+        exploration_context,
+        perception_refresh: Dict[str, Any],
+        memory_ingest: Dict[str, Any],
+        extra_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        context = self._build_semantic_exploration_context(
+            query=query,
+            camera_id=camera_id,
+            search_state=search_state,
+            exploration_context=exploration_context,
+            perception_refresh=perception_refresh,
+            memory_ingest=memory_ingest,
+            extra_context=extra_context,
+        )
+        updater = getattr(self.navigation_service, "update_exploration_semantic_context", None)
+        if callable(updater):
+            updater(context)
+        return context
+
+    def _build_semantic_exploration_context(
+        self,
+        *,
+        query: str,
+        camera_id: Optional[str],
+        search_state: Dict[str, Any],
+        exploration_context,
+        perception_refresh: Dict[str, Any],
+        memory_ingest: Dict[str, Any],
+        extra_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        diagnostics = [dict(item) for item in search_state.get("candidate_diagnostics", ())]
+        failed_poses = []
+        for item in diagnostics:
+            if item.get("allowed_for_navigation") is False or item.get("rejection_reason"):
+                pose = item.get("target_pose") or item.get("pose")
+                if pose is not None:
+                    failed_poses.append(pose)
+        current_scene = search_state.get("current_scene_verification")
+        semantic_context = {
+            **dict(extra_context or {}),
+            "query": query,
+            "search_query": query,
+            "target_name": query,
+            "camera_id": camera_id or "",
+            "target_category": self._semantic_target_category(query, search_state),
+            "target_aliases": self._semantic_target_aliases(query, diagnostics),
+            "candidate_diagnostics": diagnostics,
+            "failed_poses": failed_poses,
+            "negative_observations": self._semantic_negative_observations(diagnostics),
+            "scene_spaces": self._semantic_scene_space_priors(search_state),
+            "semantic_regions": self._semantic_region_priors(search_state),
+            "current_scene_verified": bool(getattr(current_scene, "verified", False)),
+            "current_scene_score": getattr(current_scene, "score", None),
+            "perception_refresh": dict(perception_refresh or {}),
+            "memory_ingest": dict(memory_ingest or {}),
+            "candidate_rerank": {
+                "reranked_at": time.time(),
+                "memory_candidate_count": len(search_state.get("memory_candidates") or ()),
+                "diagnostic_count": len(diagnostics),
+                "semantic_goal_available": search_state.get("semantic_goal") is not None,
+            },
+            "exploration_state": self._exploration_state_metadata(exploration_context),
+            "safety": self._semantic_exploration_safety_context(),
+            "battery": self._semantic_exploration_battery_context(),
+            "communication": self._semantic_exploration_communication_context(),
+        }
+        return semantic_context
+
+    def _semantic_target_category(self, query: str, search_state: Dict[str, Any]) -> str:
+        for candidate in search_state.get("memory_candidates") or ():
+            metadata = dict(getattr(candidate, "metadata", {}) or {})
+            for key in ("target_category", "label", "semantic_label"):
+                value = str(metadata.get(key) or "").strip()
+                if value:
+                    return value
+        return str(query or "").strip()
+
+    def _semantic_target_aliases(self, query: str, diagnostics: List[Dict[str, Any]]) -> List[str]:
+        aliases = [query]
+        for item in diagnostics:
+            aliases.extend(self._coerce_optional_str_list(item.get("semantic_labels")))
+            target_name = str(item.get("target_name") or "").strip()
+            if target_name:
+                aliases.append(target_name)
+        normalized: List[str] = []
+        for item in aliases:
+            value = str(item or "").strip()
+            if value and value not in normalized:
+                normalized.append(value)
+        return normalized
+
+    def _semantic_negative_observations(self, diagnostics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        observations: List[Dict[str, Any]] = []
+        for item in diagnostics:
+            if not item.get("rejection_reason"):
+                continue
+            observations.append(
+                {
+                    "record_id": item.get("record_id"),
+                    "reason": item.get("rejection_reason"),
+                    "pose": item.get("target_pose") or item.get("pose"),
+                    "score": item.get("candidate_score") or item.get("ranking_total_score"),
+                }
+            )
+        return observations
+
+    def _semantic_scene_space_priors(self, search_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        priors: List[Dict[str, Any]] = []
+        for candidate in search_state.get("memory_candidates") or ():
+            metadata = dict(getattr(candidate, "metadata", {}) or {})
+            scene_space_id = str(getattr(candidate, "scene_space_id", None) or metadata.get("scene_space_id") or "").strip()
+            if not scene_space_id:
+                continue
+            priors.append(
+                {
+                    "scene_space_id": scene_space_id,
+                    "primary_label": getattr(candidate, "target_name", "") or metadata.get("primary_label") or "",
+                    "pose": getattr(candidate, "target_pose", None).model_dump(mode="json") if getattr(candidate, "target_pose", None) is not None else None,
+                    "semantic_labels": self._coerce_optional_str_list(metadata.get("semantic_labels")),
+                    "radius_m": 6.0,
+                }
+            )
+        return priors
+
+    def _semantic_region_priors(self, search_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        semantic_goal = search_state.get("semantic_goal")
+        if semantic_goal is None:
+            return []
+        metadata = dict(getattr(semantic_goal, "metadata", {}) or {})
+        target_pose = getattr(semantic_goal, "target_pose", None)
+        return [
+            {
+                "region_id": metadata.get("resolved_region_id") or metadata.get("semantic_region_id") or getattr(semantic_goal, "goal_id", ""),
+                "label": getattr(semantic_goal, "target_name", "") or metadata.get("label") or "",
+                "pose": target_pose.model_dump(mode="json") if target_pose is not None else None,
+                "semantic_labels": self._coerce_optional_str_list(metadata.get("semantic_labels")),
+                "radius_m": 8.0,
+            }
+        ]
+
+    def _exploration_state_metadata(self, exploration_context) -> Dict[str, Any]:
+        state = getattr(exploration_context, "exploration_state", None) if exploration_context is not None else None
+        if state is None:
+            return {}
+        return {
+            "status": str(getattr(getattr(state, "status", None), "value", getattr(state, "status", ""))),
+            "frontier_count": getattr(state, "frontier_count", None),
+            "covered_ratio": getattr(state, "covered_ratio", None),
+            "metadata": dict(getattr(state, "metadata", {}) or {}),
+        }
+
+    def _semantic_exploration_battery_context(self) -> Dict[str, Any]:
+        snapshot = self.robot_state_service.get_latest_snapshot()
+        robot_state = getattr(snapshot, "robot_state", None) if snapshot is not None else None
+        battery = getattr(robot_state, "battery", None) if robot_state is not None else None
+        if battery is None:
+            return {"available": False}
+        return {"available": True, **self._serialize(battery)}
+
+    def _semantic_exploration_safety_context(self) -> Dict[str, Any]:
+        snapshot = self.robot_state_service.get_latest_snapshot()
+        robot_state = getattr(snapshot, "robot_state", None) if snapshot is not None else None
+        safety = getattr(robot_state, "safety", None) if robot_state is not None else None
+        payload = self.safety_guard.get_safe_stop_state()
+        if safety is not None:
+            payload = {**self._serialize(safety), **payload}
+        return payload
+
+    def _semantic_exploration_communication_context(self) -> Dict[str, Any]:
+        status = self.robot.get_status()
+        metadata = status if isinstance(status, dict) else self._serialize(status)
+        connected = metadata.get("connected") if isinstance(metadata, dict) else None
+        available = metadata.get("available") if isinstance(metadata, dict) else None
+        return {
+            "available": bool(available) if available is not None else True,
+            "connected": bool(connected) if connected is not None else True,
+            "metadata": metadata if isinstance(metadata, dict) else {},
+        }
+
+    def _record_semantic_exploration_negative_observation(
+        self,
+        *,
+        query: str,
+        camera_id: Optional[str],
+        map_name: str,
+        reason: str,
+        exploration_context,
+        search_state: Dict[str, Any],
+        rejected_record_ids: Set[str],
+    ) -> Dict[str, Any]:
+        recorder = getattr(self.memory_service, "record_semantic_exploration_negative_observation", None)
+        if not callable(recorder):
+            return {"memory_enabled": self.memory_service.is_enabled(), "memory_written": False, "reason": "recorder_unavailable"}
+        exploration_metadata = self._exploration_state_metadata(exploration_context)
+        frontier_metadata = []
+        state_metadata = exploration_metadata.get("metadata") if isinstance(exploration_metadata.get("metadata"), dict) else {}
+        if isinstance(state_metadata, dict):
+            frontier_metadata = list(state_metadata.get("latest_frontiers") or [])
+        try:
+            return recorder(
+                query=query,
+                camera_id=camera_id,
+                map_name=map_name,
+                reason=reason,
+                frontier_metadata=frontier_metadata,
+                candidate_diagnostics=[dict(item) for item in search_state.get("candidate_diagnostics", ())],
+                metadata={
+                    "exploration_state": exploration_metadata,
+                    "rejected_record_ids": sorted(rejected_record_ids),
+                },
+            )
+        except Exception as exc:
+            RUNTIME_LOGGER.exception("语义探索负观测写入失败 query=%s", query)
+            return {"memory_enabled": self.memory_service.is_enabled(), "memory_written": False, "error": str(exc)}
 
     def _refresh_target_search_observation(
         self,
@@ -5151,6 +5881,21 @@ class GatewayRuntime:
             "candidate_id": str(metadata.get("candidate_id") or ""),
             "anchor_id": str(metadata.get("anchor_id") or ""),
             "candidate_score": candidate_score,
+            "score_breakdown": metadata.get("score_breakdown") if isinstance(metadata.get("score_breakdown"), dict) else None,
+            "ranking_total_score": self._coerce_optional_float(metadata.get("ranking_total_score")),
+            "semantic_score": self._coerce_optional_float(metadata.get("semantic_score")),
+            "spatial_score": self._coerce_optional_float(metadata.get("spatial_score")),
+            "reachability_score": self._coerce_optional_float(metadata.get("reachability_score")),
+            "freshness_score": self._coerce_optional_float(metadata.get("freshness_score")),
+            "verification_score": self._coerce_optional_float(metadata.get("verification_score")),
+            "failure_penalty": self._coerce_optional_float(metadata.get("failure_penalty")),
+            "safety_score": self._coerce_optional_float(metadata.get("safety_score")),
+            "goal_spec": metadata.get("goal_spec") if isinstance(metadata.get("goal_spec"), dict) else None,
+            "resolution_decision": str(metadata.get("resolution_decision") or "") or None,
+            "excluded_reason": str(metadata.get("excluded_reason") or "") or None,
+            "exclusion_reasons": self._coerce_optional_str_list(metadata.get("exclusion_reasons")),
+            "llm_boundary": metadata.get("llm_boundary") if isinstance(metadata.get("llm_boundary"), dict) else None,
+            "coordinate_source": str(metadata.get("coordinate_source") or "") or None,
             "projection_method": str(metadata.get("projection_method") or ""),
             "projection_confidence": projection_confidence,
             "support_point_count": support_point_count,
@@ -5178,7 +5923,7 @@ class GatewayRuntime:
             "navigation_quality": navigation_quality,
             "navigation_quality_level": str(navigation_quality.get("level") or "").strip() or None,
             "recommended_action": str(navigation_quality.get("recommended_action") or "").strip() or None,
-            "allowed_for_navigation": allowed_for_navigation,
+            "allowed_for_navigation": allowed_for_navigation if allowed_for_navigation is not None else self._coerce_optional_bool(metadata.get("allowed_for_navigation")),
             "rejection_reason": rejection_reason,
             "navigation_attempted": False,
         }
@@ -5189,7 +5934,11 @@ class GatewayRuntime:
         rejection_reason = None
         recommended_action = diagnostic.get("recommended_action")
         navigation_quality = diagnostic.get("navigation_quality")
-        if isinstance(navigation_quality, dict) and recommended_action:
+        if diagnostic.get("allowed_for_navigation") is False and diagnostic.get("excluded_reason"):
+            rejection_reason = str(diagnostic.get("excluded_reason") or "candidate_excluded_by_resolution")
+        elif diagnostic.get("resolution_decision") in {"clarify", "explore", "reject"}:
+            rejection_reason = str(diagnostic.get("excluded_reason") or diagnostic.get("resolution_decision") or "candidate_excluded_by_resolution")
+        elif isinstance(navigation_quality, dict) and recommended_action:
             if recommended_action == "navigate":
                 rejection_reason = None
             elif recommended_action == "verify_then_navigate":
@@ -5241,6 +5990,8 @@ class GatewayRuntime:
                 "map_version_id": map_version_id,
                 "localization_session_id": localization_session_id,
                 "requested_by": requested_by or "unknown",
+                "evaluation_trace_id": str(dict(candidate.metadata or {}).get("evaluation_trace_id") or ""),
+                "selected_candidate": self._build_target_candidate_diagnostic(candidate),
             },
         )
 
@@ -5255,7 +6006,16 @@ class GatewayRuntime:
         requested_by: Optional[str],
         expected_map_version_id: Optional[str],
         localization_session_id: Optional[str],
+        goal: Optional[NavigationGoal] = None,
     ) -> Dict[str, Any]:
+        verification_policy = self._build_navigation_verification_policy(
+            query=query,
+            navigation_candidate=navigation_candidate,
+            goal=goal,
+            verify_similarity_threshold=verify_similarity_threshold,
+            expected_map_version_id=expected_map_version_id,
+            localization_session_id=localization_session_id,
+        )
         refresh_payload = self._refresh_target_search_observation(
             query=query,
             camera_id=camera_id,
@@ -5272,9 +6032,20 @@ class GatewayRuntime:
             expected_map_version_id=expected_map_version_id,
             localization_session_id=localization_session_id,
         )
+        memory_ingest = self._ingest_navigation_verification_memory(
+            query=query,
+            camera_id=camera_id,
+            requested_by=requested_by,
+            source="target_arrival_verify",
+            verification_policy=verification_policy,
+            arrival_verification=arrival_verification,
+        )
         return {
             "burst_messages": refresh_payload["burst_messages"],
             "scene_headline": refresh_payload["scene_headline"],
+            "perception_refresh": refresh_payload,
+            "verification_policy": verification_policy,
+            "memory_ingest": memory_ingest,
             "arrival_verification": arrival_verification,
             "map_name": map_name,
         }
@@ -5383,10 +6154,57 @@ class GatewayRuntime:
                 )
             except GatewayError as exc:
                 rejected_record_ids.add(candidate_record_id)
+                reason_code = self._navigation_failure_reason_code(exc.error_code, exc.message)
+                next_action = self._navigation_next_action(
+                    reason_code=reason_code,
+                    remaining_candidate_count=max(0, len(memory_candidates) - len(attempted_candidate_ids)),
+                    allow_not_found=allow_not_found,
+                )
+                verification_policy = self._build_navigation_verification_policy(
+                    query=query,
+                    navigation_candidate=candidate,
+                    goal=goal,
+                    verify_similarity_threshold=verify_similarity_threshold,
+                    expected_map_version_id=current_map_version_id,
+                    localization_session_id=current_localization_session_id,
+                )
+                failure_task_trace = {
+                    "goal": {"goal_id": goal.goal_id, "query": query},
+                    "candidate": self._build_target_candidate_diagnostic(candidate),
+                    "execution": {"status": "navigation_failed", "error": exc.to_payload()},
+                    "verification": {"policy": verification_policy, "verified": False},
+                    "memory_update": {},
+                    "next_action": next_action,
+                    "metadata": {"evaluation_trace_id": str(dict(candidate.metadata or {}).get("evaluation_trace_id") or "")},
+                }
+                memory_update = self.memory_service.record_navigation_task_outcome(
+                    query=query,
+                    navigation_candidate=candidate,
+                    navigation_goal=goal,
+                    navigation_context=None,
+                    verification_policy=verification_policy,
+                    perception_refresh={},
+                    memory_ingest={},
+                    execution_status="navigation_failed",
+                    failure_reason_code=reason_code,
+                    next_action=next_action,
+                    task_trace=failure_task_trace,
+                )
+                self._record_evaluation_task_outcome(
+                    task_trace=failure_task_trace,
+                    execution_status="navigation_failed",
+                    navigation_candidate=candidate,
+                    navigation_goal=goal,
+                    verification_result=None,
+                    memory_update=memory_update,
+                    failure_reason_code=reason_code,
+                )
                 for item in candidate_diagnostics:
                     if str(item.get("record_id") or "") == candidate_record_id:
                         item["allowed_for_navigation"] = False
-                        item["rejection_reason"] = exc.error_code or "navigation_failed"
+                        item["rejection_reason"] = reason_code
+                        item["memory_update"] = memory_update
+                        item["next_action"] = next_action
                         break
                 last_error = exc
                 continue
@@ -5399,8 +6217,56 @@ class GatewayRuntime:
                 requested_by=requested_by,
                 expected_map_version_id=current_map_version_id,
                 localization_session_id=current_localization_session_id,
+                goal=goal,
             )
-            if verification_payload["arrival_verification"].verified:
+            arrival_verification = verification_payload["arrival_verification"]
+            reason_code = str(dict(arrival_verification.metadata).get("arrival_reason_code") or "arrival_verification")
+            next_action = self._navigation_next_action(
+                reason_code=reason_code,
+                remaining_candidate_count=max(0, len(memory_candidates) - len(attempted_candidate_ids)),
+                allow_not_found=allow_not_found,
+                score=arrival_verification.score,
+            )
+            task_trace = self._build_navigation_task_trace(
+                query=query,
+                goal=goal,
+                navigation_candidate=candidate,
+                navigation_context=navigation_context,
+                verification_policy=verification_payload["verification_policy"],
+                arrival_verification=arrival_verification,
+                perception_refresh=verification_payload["perception_refresh"],
+                memory_update=verification_payload["memory_ingest"],
+                next_action=next_action,
+            )
+            memory_update = self.memory_service.record_navigation_task_outcome(
+                query=query,
+                navigation_candidate=candidate,
+                navigation_goal=goal,
+                navigation_context=navigation_context,
+                arrival_verification=arrival_verification,
+                verification_policy=verification_payload["verification_policy"],
+                perception_refresh=verification_payload["perception_refresh"],
+                memory_ingest=verification_payload["memory_ingest"],
+                execution_status="arrival_verified" if arrival_verification.verified else "arrival_verification_failed",
+                failure_reason_code=None if arrival_verification.verified else reason_code,
+                next_action=next_action,
+                task_trace=task_trace,
+            )
+            task_trace["memory_update"] = {**dict(task_trace.get("memory_update") or {}), "outcome": memory_update}
+            self._record_evaluation_task_outcome(
+                task_trace=task_trace,
+                execution_status="arrival_verified" if arrival_verification.verified else "arrival_verification_failed",
+                navigation_candidate=candidate,
+                navigation_goal=goal,
+                navigation_context=navigation_context,
+                verification_result=arrival_verification,
+                memory_update=memory_update,
+                failure_reason_code=None if arrival_verification.verified else reason_code,
+            )
+            verification_payload["memory_update"] = memory_update
+            verification_payload["next_action"] = next_action
+            verification_payload["task_trace"] = task_trace
+            if arrival_verification.verified:
                 return {
                     "found_mode": "memory_candidate_navigation",
                     "navigation_candidate": candidate,
@@ -5415,10 +6281,12 @@ class GatewayRuntime:
                 if str(item.get("record_id") or "") == candidate_record_id:
                     item["allowed_for_navigation"] = False
                     item["rejection_reason"] = (
-                        verification_payload["arrival_verification"].reason or "arrival_verification_failed"
+                        arrival_verification.reason or "arrival_verification_failed"
                     )
+                    item["memory_update"] = memory_update
+                    item["next_action"] = next_action
                     break
-            last_verification = verification_payload["arrival_verification"]
+            last_verification = arrival_verification
 
         if semantic_goal is not None:
             task_context.update(
@@ -5426,6 +6294,11 @@ class GatewayRuntime:
                 stage="semantic_goal_navigation",
                 message="正在前往语义区域目标。",
                 payload={"query": query, "goal_id": semantic_goal.goal_id},
+            )
+            semantic_goal = self._ensure_evaluation_trace_for_goal(
+                semantic_goal,
+                query=query,
+                navigation_candidate=None,
             )
             try:
                 navigation_context = self.navigation_service.navigate_until_complete(
@@ -5446,6 +6319,61 @@ class GatewayRuntime:
                     ),
                 )
             except GatewayError as exc:
+                reason_code = self._navigation_failure_reason_code(exc.error_code, exc.message)
+                next_action = self._navigation_next_action(
+                    reason_code=reason_code,
+                    remaining_candidate_count=0,
+                    allow_not_found=allow_not_found,
+                )
+                verification_policy = self._build_navigation_verification_policy(
+                    query=query,
+                    navigation_candidate=None,
+                    goal=semantic_goal,
+                    verify_similarity_threshold=verify_similarity_threshold,
+                    expected_map_version_id=current_map_version_id,
+                    localization_session_id=current_localization_session_id,
+                )
+                semantic_failure_trace = {
+                    "goal": {"goal_id": semantic_goal.goal_id, "query": query},
+                    "candidate": None,
+                    "execution": {"status": "navigation_failed", "error": exc.to_payload()},
+                    "verification": {"policy": verification_policy, "verified": False},
+                    "memory_update": {},
+                    "next_action": next_action,
+                    "metadata": {"evaluation_trace_id": str(dict(semantic_goal.metadata or {}).get("evaluation_trace_id") or "")},
+                }
+                memory_update = self.memory_service.record_navigation_task_outcome(
+                    query=query,
+                    navigation_candidate=None,
+                    navigation_goal=semantic_goal,
+                    verification_policy=verification_policy,
+                    perception_refresh={},
+                    memory_ingest={},
+                    execution_status="semantic_navigation_failed",
+                    failure_reason_code=reason_code,
+                    next_action=next_action,
+                    task_trace=semantic_failure_trace,
+                )
+                self._record_evaluation_task_outcome(
+                    task_trace=semantic_failure_trace,
+                    execution_status="semantic_navigation_failed",
+                    navigation_candidate=None,
+                    navigation_goal=semantic_goal,
+                    verification_result=None,
+                    memory_update=memory_update,
+                    failure_reason_code=reason_code,
+                )
+                candidate_diagnostics.append(
+                    {
+                        "record_id": semantic_goal.goal_id,
+                        "record_kind": "semantic_goal",
+                        "allowed_for_navigation": False,
+                        "navigation_attempted": True,
+                        "rejection_reason": reason_code,
+                        "memory_update": memory_update,
+                        "next_action": next_action,
+                    }
+                )
                 last_error = exc
             else:
                 verification_payload = self._build_target_navigation_verification(
@@ -5457,8 +6385,56 @@ class GatewayRuntime:
                     requested_by=requested_by,
                     expected_map_version_id=current_map_version_id,
                     localization_session_id=current_localization_session_id,
+                    goal=semantic_goal,
                 )
-                if verification_payload["arrival_verification"].verified:
+                arrival_verification = verification_payload["arrival_verification"]
+                reason_code = str(dict(arrival_verification.metadata).get("arrival_reason_code") or "arrival_verification")
+                next_action = self._navigation_next_action(
+                    reason_code=reason_code,
+                    remaining_candidate_count=0,
+                    allow_not_found=allow_not_found,
+                    score=arrival_verification.score,
+                )
+                task_trace = self._build_navigation_task_trace(
+                    query=query,
+                    goal=semantic_goal,
+                    navigation_candidate=None,
+                    navigation_context=navigation_context,
+                    verification_policy=verification_payload["verification_policy"],
+                    arrival_verification=arrival_verification,
+                    perception_refresh=verification_payload["perception_refresh"],
+                    memory_update=verification_payload["memory_ingest"],
+                    next_action=next_action,
+                )
+                memory_update = self.memory_service.record_navigation_task_outcome(
+                    query=query,
+                    navigation_candidate=None,
+                    navigation_goal=semantic_goal,
+                    navigation_context=navigation_context,
+                    arrival_verification=arrival_verification,
+                    verification_policy=verification_payload["verification_policy"],
+                    perception_refresh=verification_payload["perception_refresh"],
+                    memory_ingest=verification_payload["memory_ingest"],
+                    execution_status="arrival_verified" if arrival_verification.verified else "arrival_verification_failed",
+                    failure_reason_code=None if arrival_verification.verified else reason_code,
+                    next_action=next_action,
+                    task_trace=task_trace,
+                )
+                task_trace["memory_update"] = {**dict(task_trace.get("memory_update") or {}), "outcome": memory_update}
+                self._record_evaluation_task_outcome(
+                    task_trace=task_trace,
+                    execution_status="arrival_verified" if arrival_verification.verified else "arrival_verification_failed",
+                    navigation_candidate=None,
+                    navigation_goal=semantic_goal,
+                    navigation_context=navigation_context,
+                    verification_result=arrival_verification,
+                    memory_update=memory_update,
+                    failure_reason_code=None if arrival_verification.verified else reason_code,
+                )
+                verification_payload["memory_update"] = memory_update
+                verification_payload["next_action"] = next_action
+                verification_payload["task_trace"] = task_trace
+                if arrival_verification.verified:
                     return {
                         "found_mode": "semantic_region_navigation",
                         "navigation_candidate": None,
@@ -5468,7 +6444,18 @@ class GatewayRuntime:
                         "rejected_candidate_ids": sorted(rejected_record_ids),
                         **verification_payload,
                     }
-                last_verification = verification_payload["arrival_verification"]
+                candidate_diagnostics.append(
+                    {
+                        "record_id": semantic_goal.goal_id,
+                        "record_kind": "semantic_goal",
+                        "allowed_for_navigation": False,
+                        "navigation_attempted": True,
+                        "rejection_reason": arrival_verification.reason or "arrival_verification_failed",
+                        "memory_update": memory_update,
+                        "next_action": next_action,
+                    }
+                )
+                last_verification = arrival_verification
 
         if allow_not_found:
             return None
@@ -5567,6 +6554,7 @@ class GatewayRuntime:
     ):
         descriptor = self.capability_registry.get_descriptor(capability_name)
         poll_interval_sec = max(0.02, poll_interval_sec)
+        route_policy = self.platform_geometry_runtime.get_runtime_status().get("navigation_backend_policy", {})
 
         def runner(context) -> Dict[str, Any]:
             last_context = self.navigation_service.set_goal(goal)
@@ -5575,7 +6563,16 @@ class GatewayRuntime:
                 progress=0.05,
                 stage="accepted",
                 message=f"导航目标 {goal.goal_id} 已提交。",
-                payload={"goal_id": goal.goal_id},
+                payload={
+                    "goal_id": goal.goal_id,
+                    "navigation_route": {
+                        "gateway_capability": capability_name,
+                        "service": "NavigationService.set_goal",
+                        "target_backend": route_policy.get("active_backend_provider"),
+                        "execution_chain": route_policy.get("execution_chain"),
+                        "go2_private_control_chain_used": False,
+                    },
+                },
             )
             try:
                 while True:
@@ -5590,6 +6587,7 @@ class GatewayRuntime:
                             "goal_id": goal.goal_id,
                             "remaining_distance_m": last_context.navigation_state.remaining_distance_m,
                             "goal_reached": last_context.goal_reached,
+                            "navigation_route": last_context.navigation_state.metadata.get("navigation_submission_route"),
                         },
                     )
                     if last_context.goal_reached:
@@ -5673,6 +6671,13 @@ class GatewayRuntime:
                 "target_name": goal.target_name,
                 "target_pose": goal.target_pose.model_dump(mode="json") if goal.target_pose is not None else None,
                 "poll_interval_sec": poll_interval_sec,
+                "navigation_route": {
+                    "gateway_capability": capability_name,
+                    "service": "NavigationService.set_goal",
+                    "target_backend": route_policy.get("active_backend_provider"),
+                    "execution_chain": route_policy.get("execution_chain"),
+                    "go2_private_control_chain_used": False,
+                },
             },
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
@@ -5681,6 +6686,15 @@ class GatewayRuntime:
                 capability_name=capability_name,
                 requested_by=requested_by,
                 request_context=request_context,
+                metadata={
+                    "navigation_route": {
+                        "gateway_capability": capability_name,
+                        "service": "NavigationService.set_goal",
+                        "target_backend": route_policy.get("active_backend_provider"),
+                        "execution_chain": route_policy.get("execution_chain"),
+                        "go2_private_control_chain_used": False,
+                    }
+                },
             ),
         )
 
@@ -5769,16 +6783,6 @@ class GatewayRuntime:
         return self.task_manager.submit(
             "explore_area",
             runner,
-            input_payload={
-                "request_id": request.request_id,
-                "map_name": request.map_name,
-                "target_name": request.target_name,
-                "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
-                "radius_m": request.radius_m,
-                "strategy": request.strategy,
-                "max_duration_sec": request.max_duration_sec,
-                "poll_interval_sec": poll_interval_sec,
-            },
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,

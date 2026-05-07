@@ -29,6 +29,7 @@ class ExplorationConfig:
     frontier_distance_weight: float = 1.0
     frontier_cost_weight: float = 0.35
     frontier_heading_weight: float = 0.20
+    frontier_semantic_gain_weight: float = 8.0
     frontier_revisit_separation_m: float = 0.75
     frontier_max_no_gain_rounds: int = 2
     frontier_min_information_gain_cells: int = 12

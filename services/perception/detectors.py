@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import BoundingBox2D, Detection2D, Detection3D, SegmentationMask2D, SegmentationQuality
@@ -712,6 +712,318 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
         if payload and not isinstance(payload[0], list):
             return [[float(item) for item in payload]]
         return [[float(item) for item in row] for row in payload]
+
+
+class YoloWorldDetectorBackend(UltralyticsYoloDetectorBackend):
+    """基于 Ultralytics YOLO-World 的开放词汇检测后端。"""
+
+    def __init__(
+        self,
+        *,
+        name: str = "yolo_world",
+        weights: str = "yolov8s-world.pt",
+        runtime_preference: str = "pytorch",
+        engine_path: str = "",
+        device: str = "",
+        half: bool = True,
+        int8: bool = False,
+        confidence_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+        image_size: int = 640,
+        max_detections: int = 100,
+        class_names: Tuple[str, ...] = (),
+        class_aliases: Tuple[str, ...] = (),
+        dynamic_class_metadata_keys: Tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(
+            name=name,
+            weights=weights,
+            runtime_preference=runtime_preference,
+            engine_path=engine_path,
+            device=device,
+            half=half,
+            int8=int8,
+            confidence_threshold=confidence_threshold,
+            iou_threshold=iou_threshold,
+            image_size=image_size,
+            max_detections=max_detections,
+        )
+        self._configured_class_names = self._normalize_class_names(class_names)
+        self._dynamic_class_metadata_keys = tuple(
+            str(item).strip()
+            for item in dynamic_class_metadata_keys
+            if str(item or "").strip()
+        ) or (
+            "detection_classes",
+            "target_classes",
+            "class_prompts",
+            "open_vocabulary_classes",
+            "perception_detection_classes",
+            "task_goal_labels",
+            "task_target_labels",
+            "requested_labels",
+            "target_label",
+            "task_goal",
+            "goal",
+            "query",
+        )
+        self._configured_aliases = self._parse_alias_entries(class_aliases)
+        self._last_class_names: Tuple[str, ...] = ()
+        provider_metadata = resolve_detection_provider_spec(
+            backend_name=name,
+            backend_kind="yolo_world",
+            model_name=self._weights,
+        ).to_metadata()
+        self.spec = DetectorBackendSpec(
+            name=name,
+            backend_kind="yolo_world",
+            metadata={
+                "provider": provider_metadata,
+                **provider_metadata,
+                "weights": self._weights,
+                "runtime_preference": self._runtime_preference,
+                "engine_path": self._engine_path,
+                "device": self._device or "auto",
+                "half": self._half,
+                "int8": self._int8,
+                "supports_runtime_switch": True,
+                "input_contract": "ImageFrame/CameraInfo",
+                "open_vocabulary": True,
+                "configured_class_count": len(self._configured_class_names),
+                "dynamic_class_metadata_keys": list(self._dynamic_class_metadata_keys),
+            },
+        )
+
+    def detect(
+        self,
+        image_frame: ImageFrame,
+        camera_info: Optional[CameraInfo] = None,
+    ) -> DetectionBundle:
+        class_names, class_source = self._resolve_class_names(image_frame)
+        provider_metadata = dict(self.spec.metadata.get("provider") or {})
+        base_metadata = {
+            "backend_name": self.spec.name,
+            "backend_kind": self.spec.backend_kind,
+            "detector_provider": provider_metadata,
+            "provider": provider_metadata,
+            "open_vocabulary": True,
+            "open_vocabulary_classes": list(class_names),
+            "open_vocabulary_class_count": len(class_names),
+            "open_vocabulary_class_source": class_source,
+            "weights": self._weights,
+            "model_source": self._resolved_model_source,
+            "runtime_preference": self._runtime_preference,
+            "device": self._device or "auto",
+        }
+        if not class_names:
+            return DetectionBundle(
+                metadata={
+                    **base_metadata,
+                    "raw_detection_count": 0,
+                    "stage_status": "not_ready",
+                    "availability": "unavailable",
+                    "reason": "open_vocabulary_classes_empty",
+                    "fallback_reason": "open_vocabulary_classes_empty",
+                    "model_loaded": self._model is not None,
+                }
+            )
+        try:
+            image_bgr = decode_image_frame_to_bgr(image_frame)
+            results = self._predict_with_classes(image_bgr, class_names)
+        except Exception as exc:
+            return DetectionBundle(
+                metadata={
+                    **base_metadata,
+                    "raw_detection_count": 0,
+                    "stage_status": "not_ready",
+                    "availability": "unavailable",
+                    "reason": "model_not_loaded_or_prediction_failed",
+                    "fallback_reason": "model_not_loaded_or_prediction_failed",
+                    "error": str(exc),
+                    "model_loaded": self._model is not None,
+                }
+            )
+        first_result = results[0] if results else None
+        detections_2d = self._enrich_open_vocabulary_detections(
+            self._normalize_yolo_result(first_result, image_frame),
+            image_frame=image_frame,
+            camera_info=camera_info,
+            class_names=class_names,
+        )
+        return DetectionBundle(
+            detections_2d=detections_2d,
+            detections_3d=(),
+            metadata={
+                **base_metadata,
+                "raw_detection_count": len(detections_2d),
+                "stage_status": "completed",
+                "availability": "available",
+                "model_loaded": self._model is not None,
+                "model_source": self._resolved_model_source or self._weights,
+                "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
+            },
+        )
+
+    def _get_model(self):
+        if self._model is not None:
+            return self._model
+        self._ensure_local_model_source_available()
+        _ensure_torchvision_nms_fallback()
+        try:
+            from ultralytics import YOLOWorld as model_class
+        except ImportError:
+            try:
+                from ultralytics import YOLO as model_class
+            except ImportError as exc:
+                raise RuntimeError("当前环境未安装 ultralytics，无法启用 YOLO-World 检测。") from exc
+        model_source, backend_kind = self._resolve_model_source()
+        self._model = model_class(model_source)
+        self._resolved_model_source = model_source
+        self._resolved_backend_kind = "yolo_world_tensorrt" if "tensorrt" in backend_kind else "yolo_world_pytorch"
+        DETECTOR_LOGGER.info(
+            "YOLO-World 开放词汇检测后端已加载 source=%s backend=%s preference=%s",
+            model_source,
+            self._resolved_backend_kind,
+            self._runtime_preference,
+        )
+        return self._model
+
+    def _predict_with_classes(self, image_bgr, class_names: Tuple[str, ...]) -> List[Any]:
+        model = self._get_model()
+        if class_names != self._last_class_names and hasattr(model, "set_classes"):
+            model.set_classes(list(class_names))
+            self._last_class_names = class_names
+        kwargs = {
+            "conf": self._confidence_threshold,
+            "iou": self._iou_threshold,
+            "imgsz": self._image_size,
+            "max_det": self._max_detections,
+            "verbose": False,
+        }
+        if self._device:
+            kwargs["device"] = self._device
+        return list(model.predict(image_bgr, **kwargs))
+
+    def _ensure_local_model_source_available(self) -> None:
+        candidate = Path(self._engine_path) if self._engine_path and self._runtime_preference == "tensorrt" else Path(self._weights)
+        if candidate.is_absolute() or str(candidate.parent) not in {"", "."}:
+            if not candidate.exists():
+                raise RuntimeError("YOLO-World 模型文件不存在：%s" % candidate)
+
+    def _resolve_class_names(self, image_frame: ImageFrame) -> Tuple[Tuple[str, ...], str]:
+        metadata = dict(image_frame.metadata or {})
+        for key in self._dynamic_class_metadata_keys:
+            class_names = self._normalize_class_names(metadata.get(key))
+            if class_names:
+                return class_names, key
+        return self._configured_class_names, "configured_class_table"
+
+    def _enrich_open_vocabulary_detections(
+        self,
+        detections: Tuple[Detection2D, ...],
+        *,
+        image_frame: ImageFrame,
+        camera_info: Optional[CameraInfo],
+        class_names: Tuple[str, ...],
+    ) -> Tuple[Detection2D, ...]:
+        enriched = []
+        camera_frame_id = camera_info.frame_id if camera_info is not None else image_frame.frame_id
+        for detection in detections:
+            bbox = detection.bbox
+            bbox_xyxy = [
+                float(bbox.x_px),
+                float(bbox.y_px),
+                float(bbox.x_px + bbox.width_px),
+                float(bbox.y_px + bbox.height_px),
+            ]
+            provider_metadata = dict(self.spec.metadata.get("provider") or {})
+            aliases = self._aliases_for_label(detection.label, image_frame.metadata)
+            attributes = {
+                **dict(detection.attributes or {}),
+                "aliases": list(aliases),
+                "confidence": float(detection.score),
+                "bbox_xyxy": bbox_xyxy,
+                "bbox": {
+                    "x_px": float(bbox.x_px),
+                    "y_px": float(bbox.y_px),
+                    "width_px": float(bbox.width_px),
+                    "height_px": float(bbox.height_px),
+                },
+                "provider": "yolo_world",
+                "provider_metadata": provider_metadata,
+                "model_version": self._resolved_model_source or self._weights,
+                "timestamp": detection.timestamp.isoformat(),
+                "camera_frame_id": camera_frame_id,
+                "open_vocabulary_classes": list(class_names),
+                "open_vocabulary_class_count": len(class_names),
+            }
+            enriched.append(detection.model_copy(update={"attributes": attributes}, deep=True))
+        return tuple(enriched)
+
+    def _normalize_class_names(self, payload: object) -> Tuple[str, ...]:
+        items: List[object] = []
+        if payload is None:
+            return ()
+        if isinstance(payload, dict):
+            for key in ("classes", "labels", "targets", "target_labels", "object_labels", "prompts"):
+                value = payload.get(key)
+                if value is not None:
+                    items.extend(self._normalize_class_names(value))
+            if not items:
+                items.extend(str(key) for key in payload.keys())
+        elif isinstance(payload, str):
+            normalized = payload.replace("，", ",").replace("；", ";").replace("\n", ",")
+            separators = [",", ";", "|"]
+            parts = [normalized]
+            for separator in separators:
+                if separator in normalized:
+                    parts = normalized.split(separator)
+                    break
+            items.extend(parts)
+        elif isinstance(payload, Iterable) and not isinstance(payload, (bytes, bytearray)):
+            items.extend(payload)
+        else:
+            items.append(payload)
+
+        result: List[str] = []
+        for item in items:
+            label = str(item or "").strip().lower()
+            if not label:
+                continue
+            if label not in result:
+                result.append(label)
+        return tuple(result)
+
+    def _parse_alias_entries(self, entries: Tuple[str, ...]) -> Dict[str, Tuple[str, ...]]:
+        aliases: Dict[str, Tuple[str, ...]] = {}
+        for entry in entries:
+            raw = str(entry or "").strip()
+            if not raw:
+                continue
+            separator = "=" if "=" in raw else ":" if ":" in raw else ""
+            if not separator:
+                continue
+            label, alias_payload = raw.split(separator, 1)
+            label = label.strip().lower()
+            alias_items = self._normalize_class_names(alias_payload)
+            if label and alias_items:
+                aliases[label] = alias_items
+        return aliases
+
+    def _aliases_for_label(self, label: str, metadata: Dict[str, object]) -> Tuple[str, ...]:
+        normalized_label = str(label or "").strip().lower()
+        result: List[str] = []
+        if normalized_label:
+            result.append(normalized_label)
+        for item in self._configured_aliases.get(normalized_label, ()):
+            if item not in result:
+                result.append(item)
+        metadata_aliases = metadata.get("detection_class_aliases") or metadata.get("class_aliases")
+        if isinstance(metadata_aliases, dict):
+            for item in self._normalize_class_names(metadata_aliases.get(normalized_label)):
+                if item not in result:
+                    result.append(item)
+        return tuple(result)
 
 
 class DetectorPipeline:

@@ -14,7 +14,7 @@ from gateways.errors import GatewayError
 from providers import ExplorationProvider, NavigationProvider
 from services.localization import LocalizationService
 from services.mapping.service import MappingService
-from typing import Deque, Dict, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
 from .state_machine import (
     NavigationStateMachine,
@@ -45,6 +45,8 @@ class NavigationService:
         stream_bus: Optional[StreamBus] = None,
         history_limit: int = 100,
         navigation_state_machine: Optional[NavigationStateMachine] = None,
+        safety_state_provider: Optional[Callable[[], Dict[str, object]]] = None,
+        evaluation_service: Optional[Any] = None,
     ) -> None:
         self._provider_owner = provider_owner
         self._localization_service = localization_service
@@ -61,6 +63,9 @@ class NavigationService:
         # 平台导航状态机
         self._state_machine: NavigationStateMachine = navigation_state_machine or create_navigation_state_machine()
         self._last_navigation_diagnostics: Optional[NavigationDiagnostics] = None
+        self._last_terminal_navigation_event_key: Optional[Tuple[str, str]] = None
+        self._safety_state_provider = safety_state_provider
+        self._evaluation_service = evaluation_service
         self._lock = threading.RLock()
         self._navigation_update_subscription_id: Optional[int] = None
         self._exploration_update_subscription_id: Optional[int] = None
@@ -166,6 +171,14 @@ class NavigationService:
                 existing_waiting_for=navigation_state.metadata.get("waiting_for"),
             )
             runtime_metadata["navigation_state_machine"] = self._state_machine.get_state_summary()
+            runtime_metadata["navigation_submission_route"] = {
+                "entrypoint": "NavigationService.set_goal",
+                "provider_name": provider.provider_name,
+                "provider_version": provider.provider_version,
+                "target_backend": navigation_state.metadata.get("backend") or provider.provider_name,
+                "platform_goal_downlink": "platform_navigation_service_to_nav2_action",
+                "go2_private_control_chain_used": False,
+            }
 
             navigation_state = navigation_state.model_copy(
                 update={
@@ -210,6 +223,8 @@ class NavigationService:
                 NavigationStatus.FAILED,
                 NavigationStatus.CANCELLED,
             }:
+                self._publish_terminal_navigation_event(context)
+                self._record_navigation_evaluation(context)
                 self._current_goal = None
             return context
 
@@ -274,6 +289,96 @@ class NavigationService:
             self._latest_navigation_context = context
         self._publish_navigation_event("navigation.goal_cancelled", "导航目标已取消。")
         return context
+
+    def _record_navigation_evaluation(self, context: NavigationContext) -> None:
+        evaluator = getattr(self, "_evaluation_service", None)
+        if evaluator is None:
+            return
+        try:
+            evaluator.record_navigation_context(
+                context=context,
+                safety_snapshot=self._navigation_safety_snapshot(context),
+            )
+        except Exception:
+            return
+
+    def _publish_terminal_navigation_event(self, context: NavigationContext) -> None:
+        status = context.navigation_state.status
+        if status not in {NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
+            return
+        goal_id = context.navigation_state.current_goal_id or (context.current_goal.goal_id if context.current_goal is not None else None)
+        event_key = (str(goal_id or ""), status.value)
+        if self._last_terminal_navigation_event_key == event_key:
+            return
+        self._last_terminal_navigation_event_key = event_key
+        failure_classification = self._classify_navigation_outcome(context)
+        self._publish_navigation_event(
+            "navigation.goal_terminal",
+            context.navigation_state.message or "导航目标进入终态。",
+            goal_id=goal_id,
+            status=status.value,
+            goal_reached=context.goal_reached,
+            backend_name=context.backend_name,
+            navigation_route=context.navigation_state.metadata.get("navigation_submission_route"),
+            failure_classification=failure_classification,
+            safety_snapshot=self._navigation_safety_snapshot(context),
+            local_retry_policy=failure_classification.get("local_retry_policy"),
+        )
+
+    def _classify_navigation_outcome(self, context: NavigationContext) -> Dict[str, object]:
+        state = context.navigation_state
+        metadata = dict(state.metadata or {})
+        status = state.status
+        if status == NavigationStatus.SUCCEEDED:
+            return {"reason_code": "goal_reached", "category": "success", "local_retry_policy": "none"}
+        if status == NavigationStatus.CANCELLED:
+            return {"reason_code": "cancelled", "category": "cancel", "local_retry_policy": "none"}
+        failure_reason = str(metadata.get("failure_reason") or metadata.get("waiting_for") or "").strip()
+        readiness = metadata.get("nav2_readiness") or metadata.get("readiness")
+        errors = readiness.get("errors") if isinstance(readiness, dict) else {}
+        waiting_for = str(metadata.get("waiting_for") or (readiness.get("waiting_for") if isinstance(readiness, dict) else "") or "").strip()
+        action_status_code = metadata.get("action_status_code")
+        feedback = metadata.get("feedback") if isinstance(metadata.get("feedback"), dict) else {}
+        safety = self._read_external_safety_state()
+        if bool(safety.get("safe_stop", {}).get("safe_stop_active")) or bool(safety.get("safe_stop", {}).get("is_estopped")):
+            return {"reason_code": "emergency_stop", "category": "execution_rejected", "local_retry_policy": "manual_recover_safe_stop", "raw_reason": failure_reason}
+        if failure_reason in {"target_pose_missing", "goal_rejected"}:
+            return {"reason_code": "target_error", "category": "target_error", "local_retry_policy": "reject_goal", "raw_reason": failure_reason}
+        if failure_reason in {"nav2_not_ready"} and waiting_for in {"costmap", "action", "lifecycle"}:
+            return {"reason_code": "execution_layer_rejected", "category": "execution_layer_rejected", "local_retry_policy": "wait_backend_ready", "raw_reason": failure_reason}
+        if waiting_for in {"tf", "localization_ready", "localization"} or (isinstance(errors, dict) and "tf" in errors):
+            return {"reason_code": "localization_drift", "category": "localization_drift", "local_retry_policy": "relocalize_before_retry", "raw_reason": failure_reason}
+        if isinstance(feedback.get("number_of_recoveries"), int) and int(feedback.get("number_of_recoveries") or 0) > 0:
+            return {"reason_code": "dynamic_obstacle", "category": "dynamic_obstacle", "local_retry_policy": "retry_after_dynamic_obstacle_clears", "raw_reason": failure_reason}
+        if action_status_code == 6:
+            return {"reason_code": "local_planner_failed", "category": "candidate_unreachable", "local_retry_policy": "retry_with_local_replan", "raw_reason": failure_reason}
+        if failure_reason in {"action_send_failed", "goal_response_error", "result_error"}:
+            return {"reason_code": "execution_layer_rejected", "category": "execution_layer_rejected", "local_retry_policy": "wait_backend_ready", "raw_reason": failure_reason}
+        if failure_reason in {"perception_uncertain", "projection_confidence_low", "current_pose_fallback"}:
+            return {"reason_code": "perception_uncertain", "category": "perception_uncertain", "local_retry_policy": "collect_more_observations", "raw_reason": failure_reason}
+        return {"reason_code": "candidate_unreachable", "category": "candidate_unreachable", "local_retry_policy": "retry_with_alternate_candidate", "raw_reason": failure_reason}
+
+    def _navigation_safety_snapshot(self, context: NavigationContext) -> Dict[str, object]:
+        metadata = dict(context.navigation_state.metadata or {})
+        readiness = metadata.get("nav2_readiness") or metadata.get("readiness")
+        snapshot = {
+            "nav2_costmaps": metadata.get("nav2_costmaps") or (readiness.get("costmaps") if isinstance(readiness, dict) else metadata.get("costmaps")) or {},
+            "nav2_readiness": readiness or {},
+            "safe_stop": {},
+            "official_obstacle_avoidance": {},
+            "terminal_feedback": metadata.get("feedback") if isinstance(metadata.get("feedback"), dict) else {},
+        }
+        snapshot.update(self._read_external_safety_state())
+        return snapshot
+
+    def _read_external_safety_state(self) -> Dict[str, object]:
+        if self._safety_state_provider is None:
+            return {}
+        try:
+            value = self._safety_state_provider()
+        except Exception:
+            return {}
+        return dict(value or {}) if isinstance(value, dict) else {}
 
     def get_navigation_diagnostics(self) -> Optional[NavigationDiagnostics]:
         """返回当前平台导航诊断信息。"""
@@ -460,6 +565,13 @@ class NavigationService:
             )
             self._latest_exploration_context = context
         return context
+
+
+    def update_exploration_semantic_context(self, context: Dict[str, object]) -> None:
+        provider = self._find_exploration_provider()
+        updater = getattr(provider, "update_semantic_context", None) if provider is not None else None
+        if callable(updater):
+            updater(dict(context or {}))
 
     def stop_exploration(self) -> ExplorationContext:
         """停止当前探索任务。"""

@@ -61,9 +61,12 @@ DEFAULT_MEMORY_LOCAL_TEXT_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" /
 DEFAULT_MEMORY_LOCAL_IMAGE_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "openai__clip-vit-base-patch32")
 DEFAULT_YOLO_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "yolo26n.pt")
 DEFAULT_YOLO_ENGINE = str(PROJECT_ROOT / "runtime_data" / "models" / "yolo26n.engine")
+GEOMETRY_WS_DIR = PROJECT_ROOT / "services" / "geometry" / "ros2_ws"
+GO2SLAM_WS_DIR = GEOMETRY_WS_DIR / "src" / "go2slam"
 GEOMETRY_APT_BASE_PACKAGES = (
     "build-essential",
     "cmake",
+    "git",
     "python3-colcon-common-extensions",
     "python3-pip",
     "python3-rosdep",
@@ -80,6 +83,64 @@ GEOMETRY_ROS_REQUIRED_PACKAGE_SUFFIXES = (
 )
 GEOMETRY_ROS_OPTIONAL_PACKAGE_SUFFIXES = (
     "nav2-simple-commander",
+)
+GO2SLAM_APT_BASE_PACKAGES = (
+    "libboost-thread-dev",
+    "libopencv-dev",
+    "libpcl-dev",
+)
+GO2SLAM_ROS_REQUIRED_PACKAGE_SUFFIXES = (
+    "ament-cmake",
+    "ament-cmake-gtest",
+    "ament-index-python",
+    "ament-lint-auto",
+    "ament-lint-common",
+    "geometry-msgs",
+    "image-geometry",
+    "joint-state-publisher",
+    "laser-geometry",
+    "launch",
+    "launch-ros",
+    "map-msgs",
+    "message-filters",
+    "nav-msgs",
+    "nav2-amcl",
+    "nav2-behaviors",
+    "nav2-bringup",
+    "nav2-bt-navigator",
+    "nav2-controller",
+    "nav2-core",
+    "nav2-costmap-2d",
+    "nav2-lifecycle-manager",
+    "nav2-map-server",
+    "nav2-msgs",
+    "nav2-planner",
+    "nav2-smoother",
+    "nav2-util",
+    "nav2-waypoint-follower",
+    "pcl-conversions",
+    "pcl-ros",
+    "pluginlib",
+    "rclcpp",
+    "rclcpp-components",
+    "rclcpp-lifecycle",
+    "rclpy",
+    "robot-localization",
+    "robot-state-publisher",
+    "ros2launch",
+    "rosidl-default-generators",
+    "rosidl-default-runtime",
+    "rviz2",
+    "sensor-msgs",
+    "sensor-msgs-py",
+    "slam-toolbox",
+    "std-msgs",
+    "tf2",
+    "tf2-geometry-msgs",
+    "tf2-ros",
+    "tf2-sensor-msgs",
+    "visualization-msgs",
+    "xacro",
 )
 DEFAULT_ROS2_APT_FALLBACK_URLS = (
     "https://mirrors.ustc.edu.cn/ros2/ubuntu",
@@ -317,6 +378,14 @@ def build_geometry_apt_packages(ros_distro: str) -> Tuple[str, ...]:
     return (*GEOMETRY_APT_BASE_PACKAGES, *ros_packages)
 
 
+def build_go2slam_apt_packages(ros_distro: str) -> Tuple[str, ...]:
+    normalized = str(ros_distro or "").strip()
+    if not normalized:
+        raise BootstrapError("无法识别 ROS2 发行版，不能推导 Go2SLAM apt 包名。")
+    ros_packages = tuple(f"ros-{normalized}-{suffix}" for suffix in GO2SLAM_ROS_REQUIRED_PACKAGE_SUFFIXES)
+    return (*GO2SLAM_APT_BASE_PACKAGES, *ros_packages)
+
+
 def build_geometry_optional_apt_packages(ros_distro: str) -> Tuple[str, ...]:
     normalized = str(ros_distro or "").strip()
     if not normalized:
@@ -484,7 +553,8 @@ class BootstrapPlanner:
         self.prepare_yolo = self._resolve_bool("prepare_yolo", default=self.perception_mode != "disabled")
         self.export_yolo_engine = self._resolve_bool("export_yolo_engine", default=False)
         self.build_geometry = self._resolve_bool("build_geometry", default=self.geometry_enabled)
-        self.install_geometry_deps = self._resolve_bool("install_geometry_deps", default=self.geometry_enabled or self.build_geometry)
+        self.build_go2slam = self._resolve_bool("build_go2slam", default=self.selected_robot == "go2" and self.build_geometry)
+        self.install_geometry_deps = self._resolve_bool("install_geometry_deps", default=self.geometry_enabled or self.build_geometry or self.build_go2slam)
         self.repair_ros2_apt_source = self._resolve_bool("repair_ros2_apt_source", default=True)
         self.start_gateway = self._resolve_bool("start_gateway", default=False)
         self.run_healthcheck = self._resolve_bool("healthcheck", default=False)
@@ -654,6 +724,8 @@ class BootstrapPlanner:
             f"memory_mode: {self.memory_mode}",
             f"perception_mode: {self.perception_mode}",
             f"data_plane: {_bool_text(self.data_plane_enabled)}",
+            f"build_geometry: {_bool_text(self.build_geometry)}",
+            f"build_go2slam: {_bool_text(self.build_go2slam)}",
             f"install_geometry_deps: {_bool_text(self.install_geometry_deps)}",
             f"repair_ros2_apt_source: {_bool_text(self.repair_ros2_apt_source)}",
             f"systemd: {_bool_text(self.systemd_enabled)}",
@@ -686,7 +758,7 @@ def run_checks(planner: BootstrapPlanner) -> int:
     results.append((pip_ok, _check_result("pip", pip_ok, "pip3 或 pip")))
     results.append((_file_exists(PROJECT_ROOT / "requirements.txt"), _check_result("requirements.txt", _file_exists(PROJECT_ROOT / "requirements.txt"), str(PROJECT_ROOT / "requirements.txt"))))
 
-    if planner.geometry_enabled or planner.build_geometry:
+    if planner.geometry_enabled or planner.build_geometry or planner.build_go2slam:
         ros_setup = _detect_ros_setup()
         results.append((ros_setup is not None, _check_result("ROS2", ros_setup is not None, str(ros_setup) if ros_setup else "未找到 /opt/ros/*/setup.bash")))
         ros_distro = _detect_ros_distro(ros_setup)
@@ -704,6 +776,9 @@ def run_checks(planner: BootstrapPlanner) -> int:
             results.append((apt_ok, _check_result("apt-get", apt_ok, _which("apt-get") or "未找到 apt-get，无法自动安装 RTAB-Map/Nav2")))
             sudo_ok = hasattr(os, "geteuid") and os.geteuid() == 0 or _which("sudo") is not None
             results.append((sudo_ok, _check_result("sudo/root", sudo_ok, "root 或 sudo 用于安装系统包")))
+        if planner.build_go2slam:
+            go2slam_ok = GO2SLAM_WS_DIR.exists()
+            results.append((go2slam_ok, _check_result("Go2SLAM 工作区", go2slam_ok, str(GO2SLAM_WS_DIR) if go2slam_ok else "未找到 services/geometry/ros2_ws/src/go2slam")))
 
     if planner.selected_robot == "go2" and planner.data_plane_enabled:
         go2_template_ok = planner.robot_meta.env_template is not None and planner.robot_meta.env_template.exists()
@@ -770,7 +845,7 @@ def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
     if not planner.install_geometry_deps:
         print("跳过 geometry 系统依赖安装。")
         return
-    if not (planner.geometry_enabled or planner.build_geometry):
+    if not (planner.geometry_enabled or planner.build_geometry or planner.build_go2slam):
         print("未启用 geometry，跳过 RTAB-Map/Nav2 系统依赖安装。")
         return
 
@@ -778,7 +853,10 @@ def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
     if ros_setup is None:
         raise BootstrapError("未找到 ROS2 安装。请先安装 ROS2 Foxy/Humble/Jazzy，再安装 RTAB-Map/Nav2。")
     ros_distro = _detect_ros_distro(ros_setup)
-    required_packages = build_geometry_apt_packages(ros_distro)
+    package_set = set(build_geometry_apt_packages(ros_distro))
+    if planner.build_go2slam:
+        package_set.update(build_go2slam_apt_packages(ros_distro))
+    required_packages = tuple(sorted(package_set))
     optional_candidates = build_geometry_optional_apt_packages(ros_distro)
     sudo = _sudo_prefix()
     env = dict(os.environ)
@@ -801,27 +879,75 @@ def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
         if init_result.returncode != 0:
             print("rosdep init 未成功；如果已经初始化过可忽略，否则请手工执行 sudo rosdep init。")
     _run(("rosdep", "update"), cwd=PROJECT_ROOT)
-    geometry_ws = PROJECT_ROOT / "services" / "geometry" / "ros2_ws"
     _run(
         (
             "rosdep",
             "install",
             "--from-paths",
-            "src",
+            "src/vendor",
             "--ignore-src",
             "-r",
             "-y",
             "--rosdistro",
             ros_distro,
         ),
-        cwd=geometry_ws,
+        cwd=GEOMETRY_WS_DIR,
     )
+    if planner.build_go2slam:
+        assert_go2slam_workspace_ready(ros_setup)
+        _run(
+            (
+                "rosdep",
+                "install",
+                "--from-paths",
+                "src",
+                "m-explore-ros2",
+                "--ignore-src",
+                "-r",
+                "-y",
+                "--rosdistro",
+                ros_distro,
+            ),
+            cwd=GO2SLAM_WS_DIR,
+        )
+
+
+def assert_go2slam_workspace_ready(ros_setup: Path) -> None:
+    if not GO2SLAM_WS_DIR.exists():
+        raise BootstrapError(f"未找到 Go2SLAM 工作区: {GO2SLAM_WS_DIR}")
+    missing: List[str] = []
+    for package_name in ("unitree_go", "unitree_api"):
+        command = f"source {shlex.quote(str(ros_setup))} && ros2 pkg prefix {shlex.quote(package_name)} >/dev/null"
+        result = _run(("bash", "-lc", command), cwd=GO2SLAM_WS_DIR, check=False, capture_output=True)
+        if result.returncode != 0:
+            missing.append(package_name)
+    if missing:
+        raise BootstrapError(
+            "Go2SLAM 构建前缺少 Unitree ROS2 接口包: "
+            + ", ".join(missing)
+            + "。请先按 Unitree 官方说明安装或编译 unitree_go/unitree_api，并确认 `ros2 pkg prefix unitree_go` 与 `ros2 pkg prefix unitree_api` 可用。"
+        )
 
 
 def build_workspaces(planner: BootstrapPlanner) -> None:
     geometry_script = PROJECT_ROOT / "services" / "geometry" / "build_ros2_workspace.sh"
     if planner.build_geometry and geometry_script.exists():
         _run(("bash", str(geometry_script)), cwd=PROJECT_ROOT)
+    if planner.build_go2slam:
+        ros_setup = _detect_ros_setup()
+        if ros_setup is None:
+            raise BootstrapError("未找到 ROS2 安装，不能构建 Go2SLAM 工作区。")
+        assert_go2slam_workspace_ready(ros_setup)
+        _run(
+            (
+                "bash",
+                "-lc",
+                "source "
+                + shlex.quote(str(ros_setup))
+                + " && colcon build --symlink-install --parallel-workers 1 --build-base build --install-base install --log-base log",
+            ),
+            cwd=GO2SLAM_WS_DIR,
+        )
 
 
 def prepare_assets(planner: BootstrapPlanner) -> None:
@@ -1110,6 +1236,7 @@ def run_wizard(args: argparse.Namespace) -> int:
     args.systemd = prompt_bool("生成 systemd 示例", True)
     args.install_python = prompt_bool("安装 Python 依赖", True)
     args.build_geometry = prompt_bool("构建 geometry ROS2 工作空间", bool(args.geometry))
+    args.build_go2slam = prompt_bool("单独构建 Go2SLAM 工作区", args.robot == "go2" and bool(args.build_geometry))
     args.install_geometry_deps = prompt_bool("安装 RTAB-Map/Nav2 系统依赖", bool(args.geometry))
     args.prepare_yolo = prompt_bool("准备 YOLO 权重", args.perception_mode != "disabled")
     args.prepare_memory = prompt_bool("准备本地 memory 模型", args.memory_mode == "local")
@@ -1191,6 +1318,7 @@ def build_parser() -> argparse.ArgumentParser:
         add_boolean_flag(subparser, "prepare_yolo", "准备 YOLO 权重")
         add_boolean_flag(subparser, "export_yolo_engine", "导出 TensorRT 引擎")
         add_boolean_flag(subparser, "build_geometry", "构建 geometry ROS2 工作空间")
+        add_boolean_flag(subparser, "build_go2slam", "Go2 默认额外构建 services/geometry/ros2_ws/src/go2slam")
         add_boolean_flag(subparser, "install_geometry_deps", "安装 RTAB-Map/Nav2 系统依赖")
         add_boolean_flag(subparser, "repair_ros2_apt_source", "自动修复异常 ROS2 apt 源")
         add_boolean_flag(subparser, "start_gateway", "启动 gateway")

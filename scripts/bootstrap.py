@@ -944,7 +944,7 @@ def build_workspaces(planner: BootstrapPlanner) -> None:
                 "-lc",
                 "source "
                 + shlex.quote(str(ros_setup))
-                + " && colcon build --symlink-install --parallel-workers 1 --build-base build --install-base install --log-base log",
+                + " && colcon --log-base log build --symlink-install --parallel-workers 1 --build-base build --install-base install",
             ),
             cwd=GO2SLAM_WS_DIR,
         )

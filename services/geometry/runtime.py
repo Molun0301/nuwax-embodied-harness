@@ -408,6 +408,43 @@ class PlatformGeometryRuntime:
         self._start_managed_process("rtabmap", self._build_rtabmap_command(), "rtabmap_live.log")
         self._start_nav2_process_if_configured()
 
+    def _ensure_rtabmap_live_slam_for_exploration(self) -> None:
+        live_db_path = self._rtabmap_database_path().expanduser().resolve(strict=False)
+        current = self._managed_processes.get("rtabmap")
+        current_command = [str(part) for part in current.command] if current is not None else []
+        current_db_path: Optional[Path] = None
+        for part in current_command:
+            if part.startswith("database_path:="):
+                current_db_path = Path(part.split(":=", 1)[1]).expanduser().resolve(strict=False)
+                break
+        uses_live_db = current_db_path == live_db_path
+        localization_mode = "localization:=true" in current_command
+        nav2_current = self._managed_processes.get("nav2")
+        nav2_command = [str(part) for part in nav2_current.command] if nav2_current is not None else []
+        nav2_uses_static_map = any(part.startswith("map:=") for part in nav2_command)
+        nav2_live_ready = self._nav2_mode() not in _NAV2_SIDECAR_MODES or (
+            nav2_current is not None and nav2_current.is_running() and not nav2_uses_static_map
+        )
+        if current is not None and current.is_running() and uses_live_db and not localization_mode and nav2_live_ready:
+            return
+        previous_active_version = self._active_map_version
+        self._active_map_version = None
+        self._last_activation_result = {
+            "cleared": True,
+            "reason": "explore_live_slam",
+            "previous_active_map_name": previous_active_version.map_name if previous_active_version is not None else None,
+            "previous_active_map_version_id": previous_active_version.version_id if previous_active_version is not None else None,
+        }
+        self._map_stream_tracker = {}
+        self._restart_managed_process("rtabmap", self._build_rtabmap_command(), "rtabmap_live.log")
+        if self._nav2_mode() in _NAV2_SIDECAR_MODES:
+            self._restart_managed_process("nav2", self._build_nav2_command(), "nav2.log")
+            self._nav2_launch_attempted = True
+            reset_costmaps = getattr(self._nav2_action_provider, "reset_observed_costmaps", None)
+            if callable(reset_costmaps):
+                reset_costmaps()
+        self._set_runtime_state("waiting_map", "探索任务已切回 RTAB-Map/Nav2 live 模式，等待 /map 首帧。")
+
     def _start_monitor_thread(self) -> None:
         if self._runtime_monitor_thread is not None and self._runtime_monitor_thread.is_alive():
             return
@@ -486,8 +523,8 @@ class PlatformGeometryRuntime:
             "qos_scan:=2",
             "qos_odom:=1",
             "qos_imu:=2",
-            "approx_sync:=false",
-            "queue_size:=30",
+            "approx_sync:=true",
+            "queue_size:=60",
             "wait_for_transform:=1.5",
             "database_path:=%s" % db_path,
             "args:=%s" % " ".join(rtabmap_args),
@@ -730,6 +767,15 @@ class PlatformGeometryRuntime:
         if not isinstance(occupancy_costmap_acceptance, dict):
             occupancy_costmap_acceptance = {}
         occupancy_costmap_ready = bool(occupancy_costmap_acceptance.get("ready"))
+        if not occupancy_costmap_ready:
+            occupancy_acceptance = occupancy_costmap_acceptance.get("occupancy")
+            cost_map_acceptance = occupancy_costmap_acceptance.get("cost_map")
+            occupancy_costmap_ready = bool(
+                isinstance(occupancy_acceptance, dict)
+                and isinstance(cost_map_acceptance, dict)
+                and occupancy_acceptance.get("ready")
+                and cost_map_acceptance.get("ready")
+            )
         tf_chain = self._build_tf_chain_status(tf_localization_status=tf_localization_status)
         rtabmap_info_publisher_count = live_map_status.get("rtabmap_info_publisher_count")
         if rtabmap_info_publisher_count is None:
@@ -746,6 +792,14 @@ class PlatformGeometryRuntime:
             or rtabmap_map_data_publisher_count is True
             or int(rtabmap_info_publisher_count or 0) > 0
             or int(rtabmap_map_data_publisher_count or 0) > 0
+        )
+        continuous_update = occupancy_costmap_acceptance.get("continuous_update")
+        if not isinstance(continuous_update, dict):
+            continuous_update = {}
+        occupancy_costmap_activity_ready = bool(
+            continuous_update.get("ready")
+            or int(live_map_status.get("cost_map_message_count") or 0) > 0
+            or int(live_map_status.get("occupancy_message_count") or 0) > 1
         )
         stream_timestamp_fresh = bool(
             map_stream.get("source_timestamp_fresh")
@@ -767,14 +821,19 @@ class PlatformGeometryRuntime:
             and int(live_map_status.get("occupancy_message_count") or 0) > 0
             and live_map_status.get("occupancy_has_publisher") is not False
         )
-        streaming_ready = bool(first_frame_ready and map_stream.get("streaming") and occupancy_costmap_ready)
+        live_stream_activity_ready = bool(
+            map_stream.get("streaming")
+            or rtabmap_activity_ready
+            or (rtabmap_process is not None and rtabmap_process.is_running())
+        )
+        streaming_ready = bool(first_frame_ready and occupancy_costmap_ready and live_stream_activity_ready)
         localization_ready = bool(
             streaming_ready
             and rtabmap_process is not None
             and rtabmap_process.is_running()
             and tf_chain.get("ready")
             and stream_timestamp_fresh
-            and rtabmap_activity_ready
+            and (rtabmap_activity_ready or occupancy_costmap_activity_ready)
         )
         relocalization_ready = bool(localization_ready and int(map_stream.get("content_revision") or 0) > 0)
         if not platform_sensor_inputs_ready:
@@ -800,6 +859,7 @@ class PlatformGeometryRuntime:
             "ros2_topic_inputs": self._clone_metadata(ros2_topic_inputs),
             "first_frame_ready": first_frame_ready,
             "streaming_ready": streaming_ready,
+            "live_stream_activity_ready": live_stream_activity_ready,
             "occupancy_costmap_ready": occupancy_costmap_ready,
             "occupancy_costmap_acceptance": self._clone_metadata(occupancy_costmap_acceptance),
             "localization_ready": localization_ready,
@@ -810,6 +870,8 @@ class PlatformGeometryRuntime:
             "tf_chain": tf_chain,
             "tf_localization_provider": self._clone_metadata(tf_localization_status),
             "rtabmap_activity_ready": rtabmap_activity_ready,
+            "occupancy_costmap_activity_ready": occupancy_costmap_activity_ready,
+            "continuous_update": self._clone_metadata(continuous_update),
             "rtabmap_info": {
                 "topic": "/rtabmap/info",
                 "publisher_count": rtabmap_info_publisher_count,
@@ -1270,7 +1332,7 @@ class PlatformGeometryRuntime:
             **self.config.build_metadata(),
         }
 
-    def get_live_mapping_diagnostics(self) -> Dict[str, object]:
+    def get_live_mapping_diagnostics(self, *, include_runtime_status: bool = True) -> Dict[str, object]:
         """返回探索建图输入链路的可行动诊断。"""
 
         live_map_status = self._clone_metadata(self._live_map_provider.get_status())
@@ -1290,25 +1352,24 @@ class PlatformGeometryRuntime:
             point_cloud_source=point_cloud_source,
             data_plane_status=data_plane_status,
         )
-        return {
+        rtabmap_readiness = self._build_rtabmap_readiness(
+            live_map_status=live_map_status,
+            tf_localization_status=tf_localization_status,
+            odometry_status=odometry_status,
+            point_cloud_status=point_cloud_status,
+            point_cloud_source=point_cloud_source,
+            data_plane_status=data_plane_status,
+            ros2_topic_inputs=ros2_topic_inputs,
+        )
+        diagnostics = {
             "ready": waiting_for is None,
             "waiting_for": waiting_for,
             "message": message,
             "live_geometry_start_attempted": self._live_geometry_start_attempted,
             "geometry_enabled": self.config.enabled,
             "rtabmap_profile_enabled": self.config.rtabmap.profile_enabled,
-            "runtime_status": self.get_runtime_status(),
-            "rtabmap_readiness": self._build_rtabmap_readiness(
-                live_map_status=live_map_status,
-                tf_localization_status=tf_localization_status,
-                odometry_status=odometry_status,
-                point_cloud_status=point_cloud_status,
-                point_cloud_source=point_cloud_source,
-                data_plane_status=data_plane_status,
-                ros2_topic_inputs=ros2_topic_inputs,
-            ),
+            "rtabmap_readiness": rtabmap_readiness,
             "ros2_topic_inputs": ros2_topic_inputs,
-            "map_version_assets": self._build_map_version_asset_status(),
             "live_map_provider": live_map_status,
             "tf_localization_provider": tf_localization_status,
             "odometry_publisher": odometry_status,
@@ -1317,6 +1378,10 @@ class PlatformGeometryRuntime:
             "data_plane": data_plane_status,
             "config": self._build_live_mapping_config_summary(),
         }
+        if include_runtime_status:
+            diagnostics["runtime_status"] = self.get_runtime_status()
+            diagnostics["map_version_assets"] = self._build_map_version_asset_status()
+        return diagnostics
 
     def _build_live_mapping_config_summary(self) -> Dict[str, object]:
         direct_dds = getattr(getattr(self.robot, "data_plane_runtime", None), "config", None)
@@ -1567,7 +1632,7 @@ class PlatformGeometryRuntime:
 
     def _attach_live_mapping_diagnostics_to_request(self, request):
         metadata = dict(getattr(request, "metadata", {}) or {})
-        metadata["initial_mapping_chain_diagnostics"] = self.get_live_mapping_diagnostics()
+        metadata["initial_mapping_chain_diagnostics"] = self.get_live_mapping_diagnostics(include_runtime_status=False)
         copier = getattr(request, "model_copy", None)
         if callable(copier):
             return request.model_copy(update={"metadata": metadata}, deep=True)
@@ -1575,7 +1640,7 @@ class PlatformGeometryRuntime:
         return request
 
     def _augment_exploration_state_with_mapping_diagnostics(self, state):
-        diagnostics = self.get_live_mapping_diagnostics()
+        diagnostics = self.get_live_mapping_diagnostics(include_runtime_status=False)
         metadata = dict(getattr(state, "metadata", {}) or {})
         current_waiting_for = str(metadata.get("waiting_for") or "").strip() or None
         diagnostic_waiting_for = diagnostics.get("waiting_for")
@@ -2813,6 +2878,7 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return False
         self._ensure_live_geometry_started()
+        self._ensure_rtabmap_live_slam_for_exploration()
         request = self._attach_live_mapping_diagnostics_to_request(request)
         old_thread = None
         with self._exploration_loop_lock:
@@ -3129,7 +3195,7 @@ class PlatformGeometryRuntime:
             return None
 
     def _build_exploration_runtime_metadata(self, *, snapshot, current_pose, occupancy_grid, cost_map) -> Dict[str, object]:
-        live_diagnostics = self.get_live_mapping_diagnostics()
+        live_diagnostics = self.get_live_mapping_diagnostics(include_runtime_status=False)
         rtabmap_readiness = live_diagnostics.get("rtabmap_readiness") if isinstance(live_diagnostics.get("rtabmap_readiness"), dict) else {}
         nav2_status = self._build_nav2_status()
         navigation_backend_policy = self._navigation_backend_policy()
@@ -3156,6 +3222,19 @@ class PlatformGeometryRuntime:
                     navigation_backend_waiting_for = self._normalize_exploration_waiting_for(nav2_status.get("waiting_for") or "nav2_lifecycle")
                     navigation_backend_message = str(nav2_status.get("message") or "等待 Nav2 lifecycle/action/costmap ready。")
         map_stream = rtabmap_readiness.get("map_stream") if isinstance(rtabmap_readiness.get("map_stream"), dict) else {}
+        live_map_provider_status = live_diagnostics.get("live_map_provider") if isinstance(live_diagnostics.get("live_map_provider"), dict) else {}
+        live_layer_status = {
+            "snapshot_present": snapshot is not None,
+            "occupancy_grid_present": occupancy_grid is not None,
+            "cost_map_present": cost_map is not None,
+            "live_provider_occupancy_ready": bool(live_map_provider_status.get("occupancy_grid_ready")),
+            "live_provider_cost_map_ready": bool(live_map_provider_status.get("cost_map_ready")),
+            "live_provider_occupancy_message_count": int(live_map_provider_status.get("occupancy_message_count") or 0),
+            "live_provider_cost_map_message_count": int(live_map_provider_status.get("cost_map_message_count") or 0),
+            "latest_occupancy_received_at": live_map_provider_status.get("latest_occupancy_received_at"),
+            "latest_cost_map_received_at": live_map_provider_status.get("latest_cost_map_received_at"),
+            "last_error": live_map_provider_status.get("last_error"),
+        }
         map_revision = self._exploration_map_revision(snapshot, occupancy_grid, map_stream)
         costmap_revision = self._exploration_costmap_revision(snapshot, cost_map, map_stream, nav2_status)
         pose_revision = self._exploration_pose_revision(current_pose)
@@ -3177,6 +3256,7 @@ class PlatformGeometryRuntime:
             "live_map_streaming_ready": bool(rtabmap_readiness.get("streaming_ready")),
             "nav2_ready": bool(nav2_status.get("ready")),
             "navigation_backend_ready": navigation_backend_ready,
+            "live_layer_status": self._clone_metadata(live_layer_status),
             "frontier_freshness": {
                 "fresh": True,
                 "map_revision": map_revision,
@@ -3190,8 +3270,12 @@ class PlatformGeometryRuntime:
         failure_code = None
         if occupancy_grid is None:
             waiting_for = "map"
-            message = "等待 RTAB-Map /map 首帧。"
-            failure_code = "map_unavailable"
+            if live_layer_status["live_provider_occupancy_message_count"] > 0:
+                message = "实时地图 provider 已收到 /map 消息计数，但探索状态机未取得 occupancy_grid 对象。"
+                failure_code = "map_object_unavailable"
+            else:
+                message = "等待 RTAB-Map /map 首帧。"
+                failure_code = "map_unavailable"
         elif not bool(rtabmap_readiness.get("streaming_ready")):
             waiting_for = "live_map_streaming"
             message = str(rtabmap_readiness.get("message") or live_diagnostics.get("message") or "等待 live map streaming。")
@@ -3206,8 +3290,12 @@ class PlatformGeometryRuntime:
             failure_code = "pose_unavailable"
         elif cost_map is None:
             waiting_for = "costmap"
-            message = "等待最新 costmap。"
-            failure_code = "costmap_unavailable"
+            if live_layer_status["live_provider_cost_map_message_count"] > 0:
+                message = "实时地图 provider 已收到 costmap 消息计数，但探索状态机未取得 cost_map 对象。"
+                failure_code = "costmap_object_unavailable"
+            else:
+                message = "等待最新 costmap。"
+                failure_code = "costmap_unavailable"
         elif not navigation_backend_ready:
             waiting_for = self._normalize_exploration_waiting_for(navigation_backend_waiting_for or "navigation_backend")
             message = navigation_backend_message

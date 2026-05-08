@@ -15,9 +15,9 @@ from services.geometry.ros2_context import acquire_ros2_context, release_ros2_co
 _NAV2_LIFECYCLE_NODES = (
     "planner_server",
     "controller_server",
+    "recoveries_server",
     "bt_navigator",
-    "global_costmap/global_costmap",
-    "local_costmap/local_costmap",
+    "waypoint_follower",
 )
 _COSTMAP_FRESH_SEC = 5.0
 _LIFECYCLE_CACHE_SEC = 1.0
@@ -26,11 +26,23 @@ _LIFECYCLE_CACHE_SEC = 1.0
 @dataclass
 class _CostmapTopicState:
     topic: str
+    update_topic: str
     message_count: int = 0
+    update_count: int = 0
     last_received_at: Optional[datetime] = None
+    last_update_received_at: Optional[datetime] = None
     frame_id: Optional[str] = None
     width: Optional[int] = None
     height: Optional[int] = None
+
+    def reset(self) -> None:
+        self.message_count = 0
+        self.update_count = 0
+        self.last_received_at = None
+        self.last_update_received_at = None
+        self.frame_id = None
+        self.width = None
+        self.height = None
 
     def update(self, message: Any) -> None:
         self.message_count += 1
@@ -41,21 +53,47 @@ class _CostmapTopicState:
             self.width = int(getattr(info, "width", 0) or 0)
             self.height = int(getattr(info, "height", 0) or 0)
 
+    def update_delta(self, message: Any) -> None:
+        self.update_count += 1
+        self.last_update_received_at = datetime.now(timezone.utc)
+        self.frame_id = str(getattr(getattr(message, "header", None), "frame_id", "") or "") or self.frame_id
+        width = int(getattr(message, "width", 0) or 0)
+        height = int(getattr(message, "height", 0) or 0)
+        if width > 0:
+            self.width = max(int(self.width or 0), width)
+        if height > 0:
+            self.height = max(int(self.height or 0), height)
+
     def snapshot(self) -> Dict[str, object]:
         now = datetime.now(timezone.utc)
         age_sec = None
         if self.last_received_at is not None:
             age_sec = max(0.0, (now - self.last_received_at).total_seconds())
+        update_age_sec = None
+        if self.last_update_received_at is not None:
+            update_age_sec = max(0.0, (now - self.last_update_received_at).total_seconds())
+        activity_at = max(
+            [item for item in (self.last_received_at, self.last_update_received_at) if item is not None],
+            default=None,
+        )
+        activity_age_sec = None
+        if activity_at is not None:
+            activity_age_sec = max(0.0, (now - activity_at).total_seconds())
         return {
             "topic": self.topic,
+            "update_topic": self.update_topic,
             "message_count": self.message_count,
+            "update_count": self.update_count,
             "last_received_at": self.last_received_at.isoformat() if self.last_received_at else None,
+            "last_update_received_at": self.last_update_received_at.isoformat() if self.last_update_received_at else None,
             "age_sec": age_sec,
+            "update_age_sec": update_age_sec,
+            "activity_age_sec": activity_age_sec,
             "frame_id": self.frame_id,
             "width": self.width,
             "height": self.height,
             "first_frame_ready": self.message_count >= 1,
-            "streaming": self.message_count >= 2 and age_sec is not None and age_sec <= _COSTMAP_FRESH_SEC,
+            "streaming": self.message_count >= 1 and (self.message_count + self.update_count) >= 2 and activity_age_sec is not None and activity_age_sec <= _COSTMAP_FRESH_SEC,
         }
 
 
@@ -92,8 +130,10 @@ class Nav2ActionNavigationProvider:
         self._lifecycle_clients: Dict[str, Any] = {}
         self._last_lifecycle_check_at = 0.0
         self._last_lifecycle_status: Dict[str, object] = {}
-        self._global_costmap = _CostmapTopicState(str(runtime.config.nav2.global_costmap_topic or "/global_costmap/costmap"))
-        self._local_costmap = _CostmapTopicState(str(runtime.config.nav2.local_costmap_topic or "/local_costmap/costmap"))
+        global_costmap_topic = str(runtime.config.nav2.global_costmap_topic or "/global_costmap/costmap")
+        local_costmap_topic = str(runtime.config.nav2.local_costmap_topic or "/local_costmap/costmap")
+        self._global_costmap = _CostmapTopicState(global_costmap_topic, self._costmap_update_topic(global_costmap_topic))
+        self._local_costmap = _CostmapTopicState(local_costmap_topic, self._costmap_update_topic(local_costmap_topic))
         self._active_goal: Optional[NavigationGoal] = None
         self._state = NavigationState(
             status=NavigationStatus.IDLE,
@@ -149,6 +189,11 @@ class Nav2ActionNavigationProvider:
                 metadata={"backend": "nav2", "action_name": self.runtime.config.nav2.action_name, "readiness": self._status_dict(readiness), **self._navigation_execution_metadata()},
             )
         return True
+
+    def reset_observed_costmaps(self) -> None:
+        with self._lock:
+            self._global_costmap.reset()
+            self._local_costmap.reset()
 
     def cancel_goal(self) -> bool:
         with self._lock:
@@ -277,6 +322,7 @@ class Nav2ActionNavigationProvider:
             try:
                 from nav2_msgs.action import NavigateToPose
                 from nav_msgs.msg import OccupancyGrid
+                from map_msgs.msg import OccupancyGridUpdate
                 from lifecycle_msgs.srv import GetState
                 from rclpy.action import ActionClient
                 from rclpy.executors import MultiThreadedExecutor
@@ -291,6 +337,8 @@ class Nav2ActionNavigationProvider:
                 self._action_client = ActionClient(self._node, NavigateToPose, str(self.runtime.config.nav2.action_name or "/navigate_to_pose"))
                 self._node.create_subscription(OccupancyGrid, self._global_costmap.topic, self._on_global_costmap, 10)
                 self._node.create_subscription(OccupancyGrid, self._local_costmap.topic, self._on_local_costmap, 10)
+                self._node.create_subscription(OccupancyGridUpdate, self._global_costmap.update_topic, self._on_global_costmap_update, 10)
+                self._node.create_subscription(OccupancyGridUpdate, self._local_costmap.update_topic, self._on_local_costmap_update, 10)
                 for node_name in _NAV2_LIFECYCLE_NODES:
                     self._lifecycle_clients[node_name] = self._node.create_client(GetState, "/%s/get_state" % node_name)
                 self._thread = threading.Thread(target=self._executor.spin, name="nuwax_nav2_action_provider", daemon=True)
@@ -565,6 +613,10 @@ class Nav2ActionNavigationProvider:
             value += 2.0 * math.pi
         return value
 
+    @staticmethod
+    def _costmap_update_topic(costmap_topic: str) -> str:
+        return "%s_updates" % str(costmap_topic or "").rstrip("/")
+
     def _on_global_costmap(self, message: Any) -> None:
         with self._lock:
             self._global_costmap.update(message)
@@ -572,6 +624,14 @@ class Nav2ActionNavigationProvider:
     def _on_local_costmap(self, message: Any) -> None:
         with self._lock:
             self._local_costmap.update(message)
+
+    def _on_global_costmap_update(self, message: Any) -> None:
+        with self._lock:
+            self._global_costmap.update_delta(message)
+
+    def _on_local_costmap_update(self, message: Any) -> None:
+        with self._lock:
+            self._local_costmap.update_delta(message)
 
     def _set_blocked_state(self, goal_id: str, readiness: _Nav2Readiness) -> None:
         with self._lock:

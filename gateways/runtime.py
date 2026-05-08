@@ -3987,12 +3987,6 @@ class GatewayRuntime:
             create_if_missing=True,
         )
         self._refresh_workspace_snapshots()
-        if self._workspace_requires_localization_before_explore(workspace):
-            self._ensure_localization_ready(
-                capability_name="explore_area",
-                map_name=map_name,
-                workspace=workspace,
-            )
         target_name = str(arguments.get("target_name", "")).strip() or None
         center_pose = None
         if "frame_id" in arguments or "x" in arguments or "y" in arguments:
@@ -4032,12 +4026,6 @@ class GatewayRuntime:
             create_if_missing=True,
         )
         self._refresh_workspace_snapshots()
-        if self._workspace_requires_localization_before_explore(workspace):
-            self._ensure_localization_ready(
-                capability_name="explore_and_find_target",
-                map_name=map_name,
-                workspace=workspace,
-            )
         self._ensure_workspace_memory_library_ready(map_name=map_name)
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None

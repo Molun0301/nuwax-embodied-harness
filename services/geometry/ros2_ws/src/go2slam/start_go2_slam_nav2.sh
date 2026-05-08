@@ -3,9 +3,9 @@
 set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROS_SETUP="/opt/ros/jazzy/setup.bash"
+ROS_SETUP="/opt/ros/foxy/setup.bash"
 WS_SETUP="$ROOT_DIR/install/setup.bash"
-RVIZ_CONFIG="/opt/ros/jazzy/share/nav2_bringup/rviz/nav2_default_view.rviz"
+RVIZ_CONFIG="/opt/ros/foxy/share/nav2_bringup/rviz/nav2_default_view.rviz"
 EXPLORE_PARAMS_FILE="$ROOT_DIR/src/go2_navigation2/config/explore_params.yaml"
 NAV2_PID=""
 MAPPING_PID=""

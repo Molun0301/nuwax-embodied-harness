@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import logging
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from adapters.helpers import build_pose
@@ -13,6 +14,7 @@ from services.geometry.config import PlatformGeometryConfig
 from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.live_map_provider")
+_PUBLISHER_COUNT_CACHE_TTL_SEC = 10.0
 
 
 class Ros2LiveMapProvider:
@@ -60,6 +62,7 @@ class Ros2LiveMapProvider:
         self._last_cost_map_content_hash: Optional[str] = None
         self._last_occupancy_known_cell_count = 0
         self._last_cost_map_known_cell_count = 0
+        self._publisher_count_cache: Dict[str, Dict[str, object]] = {}
         self._node = None
         self._executor = None
         self._thread: Optional[threading.Thread] = None
@@ -120,6 +123,7 @@ class Ros2LiveMapProvider:
         self._thread = None
         self._rclpy = None
         self._subscriptions = []
+        self._publisher_count_cache = {}
         self._has_ros2_context = False
 
     def is_available(self) -> bool:
@@ -164,12 +168,8 @@ class Ros2LiveMapProvider:
 
     def get_status(self) -> Dict[str, object]:
         with self._lock:
-            occupancy_grid = (
-                self._latest_occupancy_grid.model_copy(deep=True)
-                if self._latest_occupancy_grid is not None
-                else None
-            )
-            cost_map = self._latest_cost_map.model_copy(deep=True) if self._latest_cost_map is not None else None
+            occupancy_grid = self._latest_occupancy_grid
+            cost_map = self._latest_cost_map
             occupancy_metrics = dict(self._latest_occupancy_metrics)
             cost_map_metrics = dict(self._latest_cost_map_metrics)
             occupancy_count = self._occupancy_message_count
@@ -379,12 +379,27 @@ class Ros2LiveMapProvider:
         }
 
     def _publisher_count(self, topic: str) -> Optional[int]:
-        if not topic or self._node is None:
+        normalized_topic = str(topic or "").strip()
+        if not normalized_topic or self._node is None:
             return None
+        now = time.monotonic()
+        cached = self._publisher_count_cache.get(normalized_topic)
+        if cached is not None and now - float(cached.get("observed_at_monotonic") or 0.0) < _PUBLISHER_COUNT_CACHE_TTL_SEC:
+            value = cached.get("publisher_count")
+            return int(value) if value is not None else None
         try:
-            return len(self._node.get_publishers_info_by_topic(topic))
+            publisher_count = len(self._node.get_publishers_info_by_topic(normalized_topic))
+            self._publisher_count_cache[normalized_topic] = {
+                "observed_at_monotonic": now,
+                "publisher_count": publisher_count,
+            }
+            return publisher_count
         except Exception:
-            LOGGER.debug("读取 ROS2 topic publisher 失败 topic=%s", topic, exc_info=True)
+            LOGGER.debug("读取 ROS2 topic publisher 失败 topic=%s", normalized_topic, exc_info=True)
+            self._publisher_count_cache[normalized_topic] = {
+                "observed_at_monotonic": now,
+                "publisher_count": None,
+            }
             return None
 
     def _start_ros2_subscriptions(self) -> None:
@@ -578,12 +593,8 @@ class Ros2LiveMapProvider:
 
     def _build_map_update_payload_locked(self, *, source_layer: str) -> Dict[str, object]:
         self._update_sequence += 1
-        occupancy_grid = (
-            self._latest_occupancy_grid.model_copy(deep=True)
-            if self._latest_occupancy_grid is not None
-            else None
-        )
-        cost_map = self._latest_cost_map.model_copy(deep=True) if self._latest_cost_map is not None else None
+        occupancy_grid = self._latest_occupancy_grid
+        cost_map = self._latest_cost_map
         occupancy_metrics = dict(self._latest_occupancy_metrics)
         cost_map_metrics = dict(self._latest_cost_map_metrics)
         metrics = occupancy_metrics if source_layer == "occupancy" else cost_map_metrics

@@ -399,7 +399,6 @@ class GatewayRuntime:
                 self.robot.manifest.robot_model,
             )
             self.robot.start()
-            self.platform_geometry_runtime.start()
             self._started = True
         try:
             if self.perception_video_runtime.should_auto_start():
@@ -894,6 +893,17 @@ class GatewayRuntime:
         )
 
     def _publish_static_stream_capability_frames(self) -> None:
+        if self.config.perception.stream_runtime.enabled:
+            if self.stream_bus.latest_frame("video.frame") is None:
+                self.stream_bus.publish(
+                    "video.frame",
+                    source="image_provider",
+                    payload={"available": False, "message": "等待视频感知运行时发布首帧。"},
+                    payload_kind=StreamPayloadKind.DIAGNOSTIC,
+                    status="missing",
+                    metadata={"reason": "waiting_for_perception_stream_runtime"},
+                )
+            return
         self.stream_bus.publish(
             "video.frame",
             source="image_provider",
@@ -3139,14 +3149,63 @@ class GatewayRuntime:
             "active_workspace": self.map_workspace_service.get_active_workspace(),
         }
 
+    def _ensure_geometry_runtime_started(self, *, reason: str, capability_name: Optional[str] = None) -> None:
+        if self.platform_geometry_runtime.is_started():
+            return
+        RUNTIME_LOGGER.info(
+            "按需启动平台几何运行时 reason=%s capability=%s",
+            reason,
+            capability_name or "-",
+        )
+        self.platform_geometry_runtime.ensure_started(reason=reason)
+        self.event_bus.publish(
+            self.event_bus.build_event(
+                "geometry.runtime_started_on_demand",
+                category=RuntimeEventCategory.SYSTEM,
+                source="gateway_runtime",
+                subject_id=capability_name or "platform_geometry_runtime",
+                message="平台几何运行时已按需启动。",
+                payload={"reason": reason, "capability_name": capability_name},
+            )
+        )
+
+    def _ensure_active_map_version_loaded(self, *, map_name: str, requested_by: Optional[str], capability_name: str):
+        workspace = self.map_workspace_service.get_active_workspace()
+        if workspace is None or workspace.active_map_name != map_name:
+            return workspace
+        if workspace.latest_map_snapshot is not None:
+            return workspace
+        latest_version_id = getattr(workspace.map_asset, "latest_version_id", None) if workspace.map_asset is not None else None
+        if not latest_version_id:
+            return workspace
+        _, loaded_workspace = self.map_workspace_service.load_map_version(
+            map_name=map_name,
+            version_id=str(latest_version_id),
+            activate_if_needed=False,
+            load_memory_history=True,
+            reset_memory_library=False,
+            metadata={"requested_by": requested_by or "unknown", "source": capability_name},
+        )
+        return loaded_workspace
+
     def _handle_relocalize_active_map(
         self,
         arguments: Dict[str, Any],
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
+        map_name = str(arguments.get("map_name", "")).strip() or None
+        active_workspace = self.map_workspace_service.get_active_workspace()
+        target_map_name = map_name or (active_workspace.active_map_name if active_workspace is not None else None)
+        self._ensure_geometry_runtime_started(reason="relocalize_active_map", capability_name="relocalize_active_map")
+        if target_map_name:
+            self._ensure_active_map_version_loaded(
+                map_name=target_map_name,
+                requested_by=requested_by,
+                capability_name="relocalize_active_map",
+            )
         localization_session, active_workspace = self.map_workspace_service.relocalize_active_map(
-            map_name=str(arguments.get("map_name", "")).strip() or None,
+            map_name=map_name,
             metadata={"requested_by": requested_by or "unknown", "source": "relocalize_active_map"},
         )
         return {
@@ -3286,14 +3345,8 @@ class GatewayRuntime:
             load_memory_history=bool(arguments.get("load_memory_history", True)),
             reset_memory_library=bool(arguments.get("reset_memory_library", False)),
             metadata={"requested_by": requested_by or "unknown"},
+            load_latest_version=False,
         )
-        has_platform_map_version = bool(
-            active_workspace is not None
-            and active_workspace.map_asset is not None
-            and active_workspace.map_asset.latest_version_id
-        )
-        if not has_platform_map_version:
-            self._refresh_workspace_snapshots()
         self._sync_perception_runtime_for_memory_state(enabled=True)
         active_workspace = self.map_workspace_service.get_active_workspace() or active_workspace
         return {
@@ -3359,6 +3412,7 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
+        self._ensure_geometry_runtime_started(reason="save_active_map_version", capability_name="save_active_map_version")
         map_version = self.map_workspace_service.save_map_version(
             map_name=str(arguments.get("map_name", "")).strip() or None,
             reason=str(arguments.get("reason", "")).strip(),
@@ -3376,6 +3430,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         map_name = self._require_str(arguments, "map_name")
+        self._ensure_geometry_runtime_started(reason="load_map_version", capability_name="load_map_version")
         map_version, workspace = self.map_workspace_service.load_map_version(
             map_name=map_name,
             version_id=str(arguments.get("version_id", "")).strip() or None,
@@ -3675,6 +3730,12 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=False,
         )
+        self._ensure_geometry_runtime_started(reason="navigate_to_pose", capability_name="navigate_to_pose")
+        workspace = self._ensure_active_map_version_loaded(
+            map_name=map_name,
+            requested_by=requested_by,
+            capability_name="navigate_to_pose",
+        ) or workspace
         self._refresh_workspace_snapshots()
         self._ensure_localization_ready(
             capability_name="navigate_to_pose",
@@ -3714,6 +3775,12 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=False,
         )
+        self._ensure_geometry_runtime_started(reason="navigate_to_named_location", capability_name="navigate_to_named_location")
+        workspace = self._ensure_active_map_version_loaded(
+            map_name=map_name,
+            requested_by=requested_by,
+            capability_name="navigate_to_named_location",
+        ) or workspace
         self._refresh_workspace_snapshots()
         self._ensure_localization_ready(
             capability_name="navigate_to_named_location",
@@ -3867,6 +3934,12 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=False,
         )
+        self._ensure_geometry_runtime_started(reason="find_target", capability_name="find_target")
+        workspace = self._ensure_active_map_version_loaded(
+            map_name=map_name,
+            requested_by=requested_by,
+            capability_name="find_target",
+        ) or workspace
         self._refresh_workspace_snapshots()
         self._ensure_workspace_memory_library_ready(map_name=map_name)
         query = self._require_str(arguments, "query")
@@ -3986,6 +4059,12 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=True,
         )
+        self._ensure_geometry_runtime_started(reason="explore_area", capability_name="explore_area")
+        workspace = self._ensure_active_map_version_loaded(
+            map_name=map_name,
+            requested_by=requested_by,
+            capability_name="explore_area",
+        ) or workspace
         self._refresh_workspace_snapshots()
         target_name = str(arguments.get("target_name", "")).strip() or None
         center_pose = None
@@ -4025,6 +4104,12 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=True,
         )
+        self._ensure_geometry_runtime_started(reason="explore_and_find_target", capability_name="explore_and_find_target")
+        workspace = self._ensure_active_map_version_loaded(
+            map_name=map_name,
+            requested_by=requested_by,
+            capability_name="explore_and_find_target",
+        ) or workspace
         self._refresh_workspace_snapshots()
         self._ensure_workspace_memory_library_ready(map_name=map_name)
         query = self._require_str(arguments, "query")
@@ -4474,6 +4559,16 @@ class GatewayRuntime:
             matched_object = self._find_scene_object(query, perception_context)
             if matched_object is None and auto_navigate:
                 context.update(progress=0.3, stage="inspect_navigate", message="当前画面未找到目标，尝试导航到命名位置。")
+                active_workspace = self.map_workspace_service.get_active_workspace()
+                active_map_name = active_workspace.active_map_name if active_workspace is not None else None
+                self._ensure_geometry_runtime_started(reason="inspect_target_auto_navigate", capability_name="inspect_target")
+                if active_map_name:
+                    self._ensure_active_map_version_loaded(
+                        map_name=active_map_name,
+                        requested_by=requested_by,
+                        capability_name="inspect_target",
+                    )
+                    self._refresh_workspace_snapshots()
                 tagged_location = self.memory_service.resolve_tagged_location(query)
                 if tagged_location is not None:
                     goal = NavigationGoal(
@@ -6508,6 +6603,7 @@ class GatewayRuntime:
         request_context: Optional[MetadataDict] = None,
         completion_callback=None,
     ):
+        self._ensure_geometry_runtime_started(reason=f"{capability_name}_navigation_task", capability_name=capability_name)
         descriptor = self.capability_registry.get_descriptor(capability_name)
         poll_interval_sec = max(0.02, poll_interval_sec)
         route_policy = self.platform_geometry_runtime.get_runtime_status().get("navigation_backend_policy", {})
@@ -6663,6 +6759,7 @@ class GatewayRuntime:
         requested_by: Optional[str],
         request_context: Optional[MetadataDict] = None,
     ):
+        self._ensure_geometry_runtime_started(reason="explore_area_task", capability_name="explore_area")
         descriptor = self.capability_registry.get_descriptor("explore_area")
         poll_interval_sec = max(0.05, poll_interval_sec)
 
@@ -6829,15 +6926,10 @@ class GatewayRuntime:
         )
 
     def _sync_perception_runtime_for_memory_state(self, *, enabled: bool) -> None:
+        del enabled
         status = self.perception_video_runtime.get_status()
-        if not status.enabled or not status.auto_start:
-            return
-        if enabled:
-            if self.perception_video_runtime.should_auto_start():
-                self.perception_video_runtime.start()
-            return
-        if status.running:
-            self.perception_video_runtime.stop()
+        if status.enabled and status.auto_start and not status.running:
+            self.perception_video_runtime.start()
 
     def _finalize_workspace_assets_after_task(
         self,

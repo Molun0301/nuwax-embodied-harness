@@ -93,8 +93,8 @@ start_background "rtabmap_live.log" \
   visual_odometry:=false icp_odometry:=false \
   subscribe_scan_cloud:=true scan_cloud_topic:="${POINT_CLOUD_TOPIC}" \
   odom_topic:="${ODOM_TOPIC}" imu_topic:="${IMU_TOPIC}" \
-  qos:=2 qos_scan:=2 qos_odom:=1 qos_imu:=2 \
-  approx_sync:=false queue_size:=30 wait_for_transform:=1.5 \
+  qos:=2 qos_scan:=2 qos_odom:=2 qos_imu:=2 \
+  approx_sync:=false queue_size:=3 topic_queue_size:=2 sync_queue_size:=2 wait_for_transform:=0.1 \
   database_path:="${RTABMAP_DB_PATH}" \
   args:='--delete_db_on_start --RGBD/CreateOccupancyGrid true --Grid/FromDepth false --Grid/RangeMax 8.0 --Grid/CellSize 0.05 --Grid/3D true --Grid/RayTracing true --Grid/FlatObstacleDetected true --Grid/MaxGroundHeight 0.35 --Grid/MaxObstacleHeight 1.8 --Grid/NormalsSegmentation false --Grid/MinClusterSize 5'
 

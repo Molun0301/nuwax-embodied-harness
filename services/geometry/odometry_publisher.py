@@ -126,8 +126,8 @@ class Ros2OdometryPublisher:
             node = rclpy.create_node("nuwax_odometry_publisher")
             qos_profile = QoSProfile(
                 history=HistoryPolicy.KEEP_LAST,
-                depth=20,
-                reliability=ReliabilityPolicy.RELIABLE,
+                depth=5,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
                 durability=DurabilityPolicy.VOLATILE,
             )
             self._publisher = node.create_publisher(Odometry, self.topic, qos_profile)

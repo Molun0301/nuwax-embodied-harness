@@ -33,8 +33,8 @@ def main() -> None:
     broadcaster = TransformBroadcaster(node)
     qos = QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
-        depth=20,
-        reliability=ReliabilityPolicy.RELIABLE,
+        depth=5,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
         durability=DurabilityPolicy.VOLATILE,
     )
 

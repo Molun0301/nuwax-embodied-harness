@@ -41,6 +41,7 @@ from services.navigation.runtime import GridNavigationPlanner
 _GEOMETRY_SIDE_CAR_RESTART_LIMIT = 2
 _GEOMETRY_MONITOR_INTERVAL_SEC = 1.0
 _GEOMETRY_STREAMING_WINDOW_SEC = 6.0
+_GEOMETRY_TOPIC_GRAPH_CACHE_TTL_SEC = 10.0
 _NAV2_SIDECAR_MODES = {"sidecar", "managed", "launch", "internal"}
 _NAV2_EXTERNAL_MODES = {"external", "external_action", "action", "client", "pending"}
 _NAV2_DISABLED_MODES = {"", "disabled", "off", "none"}
@@ -219,6 +220,7 @@ class PlatformGeometryRuntime:
         self._managed_processes: Dict[str, _ManagedProcess] = {}
         self._runtime_diagnostics: List[Dict[str, object]] = []
         self._map_stream_tracker: Dict[str, object] = {}
+        self._topic_graph_cache: Dict[str, Dict[str, object]] = {}
         self._nav2_launch_attempted = False
         self._nav2_action_provider = Nav2ActionNavigationProvider(self)
         self._platform_exploration_config = ExplorationConfig(enabled=True)
@@ -250,6 +252,7 @@ class PlatformGeometryRuntime:
             self._runtime_stop_event.clear()
             self._runtime_diagnostics = []
             self._managed_processes = {}
+            self._topic_graph_cache = {}
             self._nav2_launch_attempted = False
             self._map_stream_tracker = {}
         if not self._is_geometry_profile_enabled():
@@ -282,6 +285,20 @@ class PlatformGeometryRuntime:
                 self._runtime_started = False
             if self.config.require_ros2:
                 raise
+
+    def is_started(self) -> bool:
+        """返回平台几何运行时是否已启动。"""
+
+        with self._runtime_state_lock:
+            return bool(self._runtime_started)
+
+    def ensure_started(self, *, reason: str = "") -> None:
+        """按需启动平台几何运行时。"""
+
+        del reason
+        if self.is_started():
+            return
+        self.start()
 
     def stop(self) -> None:
         """停止平台几何运行时。"""
@@ -521,11 +538,13 @@ class PlatformGeometryRuntime:
             "imu_topic:=%s" % self.config.topics.imu_topic,
             "qos:=2",
             "qos_scan:=2",
-            "qos_odom:=1",
+            "qos_odom:=2",
             "qos_imu:=2",
-            "approx_sync:=true",
-            "queue_size:=60",
-            "wait_for_transform:=1.5",
+            "approx_sync:=false",
+            "queue_size:=3",
+            "topic_queue_size:=2",
+            "sync_queue_size:=2",
+            "wait_for_transform:=0.1",
             "database_path:=%s" % db_path,
             "args:=%s" % " ".join(rtabmap_args),
         ]
@@ -1523,9 +1542,14 @@ class PlatformGeometryRuntime:
             "subscription_count": None,
             "last_error": None,
         }
-        if not str(topic or "").strip():
+        normalized_topic = str(topic or "").strip()
+        if not normalized_topic:
             status["last_error"] = "topic_empty"
             return status
+        now = time.monotonic()
+        cached = self._topic_graph_cache.get(normalized_topic)
+        if cached is not None and now - float(cached.get("observed_at_monotonic") or 0.0) < _GEOMETRY_TOPIC_GRAPH_CACHE_TTL_SEC:
+            return dict(cached.get("status") or status)
         nodes = (
             getattr(self._live_map_provider, "_node", None),
             getattr(self._tf_localization_provider, "_node", None),
@@ -1539,15 +1563,17 @@ class PlatformGeometryRuntime:
                 continue
             status["graph_node_available"] = True
             try:
-                publishers = node.get_publishers_info_by_topic(topic)
-                subscriptions = node.get_subscriptions_info_by_topic(topic)
+                publishers = node.get_publishers_info_by_topic(normalized_topic)
+                subscriptions = node.get_subscriptions_info_by_topic(normalized_topic)
                 status["publisher_count"] = len(publishers)
                 status["subscription_count"] = len(subscriptions)
+                self._topic_graph_cache[normalized_topic] = {"observed_at_monotonic": now, "status": dict(status)}
                 return status
             except Exception as exc:
                 errors.append(str(exc))
         if errors:
             status["last_error"] = "; ".join(errors[-3:])
+        self._topic_graph_cache[normalized_topic] = {"observed_at_monotonic": now, "status": dict(status)}
         return status
 
     def _build_data_plane_status(self) -> Dict[str, object]:

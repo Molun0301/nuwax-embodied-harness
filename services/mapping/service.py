@@ -124,18 +124,17 @@ class MappingService:
             **source_metadata,
         }
         with self._lock:
-            if (
-                version_id_override is None
-                and revision_override is None
-                and self._is_equivalent_to_latest_snapshot(
+            if version_id_override is None and revision_override is None:
+                if self._is_live_revision_equivalent(source_name=source_name, metadata=snapshot_metadata):
+                    return self._latest_snapshot  # type: ignore[return-value]
+                if self._is_equivalent_to_latest_snapshot(
                     source_name=source_name,
                     occupancy_grid=occupancy_grid,
                     cost_map=cost_map,
                     semantic_map=semantic_map,
                     metadata=snapshot_metadata,
-                )
-            ):
-                return self._latest_snapshot  # type: ignore[return-value]
+                ):
+                    return self._latest_snapshot  # type: ignore[return-value]
 
             if revision_override is not None:
                 revision = max(1, int(revision_override))
@@ -286,6 +285,39 @@ class MappingService:
             and self._normalize_snapshot_value(latest.metadata)
             == self._normalize_snapshot_value(metadata)
         )
+
+    def _is_live_revision_equivalent(self, *, source_name: str, metadata: Dict[str, object]) -> bool:
+        latest = self._latest_snapshot
+        if latest is None or latest.source_name != source_name:
+            return False
+        if not bool(metadata.get("live_streaming_ready") or metadata.get("rtabmap_live_streaming_ready")):
+            return False
+        latest_metadata = latest.metadata or {}
+        revision_keys = ("content_revision", "occupancy_content_revision", "cost_map_content_revision")
+        if not all(key in latest_metadata and key in metadata for key in revision_keys):
+            return False
+        if any(latest_metadata.get(key) != metadata.get(key) for key in revision_keys):
+            return False
+        return self._live_content_hashes_match(latest_metadata=latest_metadata, metadata=metadata)
+
+    def _live_content_hashes_match(self, *, latest_metadata: Dict[str, object], metadata: Dict[str, object]) -> bool:
+        hash_pairs = (
+            ("occupancy_metrics", "content_hash"),
+            ("cost_map_metrics", "content_hash"),
+            ("metrics", "content_hash"),
+        )
+        comparable_count = 0
+        for container_key, hash_key in hash_pairs:
+            latest_container = latest_metadata.get(container_key)
+            current_container = metadata.get(container_key)
+            if not isinstance(latest_container, dict) or not isinstance(current_container, dict):
+                continue
+            if hash_key not in latest_container or hash_key not in current_container:
+                continue
+            comparable_count += 1
+            if latest_container.get(hash_key) != current_container.get(hash_key):
+                return False
+        return comparable_count > 0
 
     def _normalize_snapshot_value(self, value: Any) -> Any:
         if value is None:

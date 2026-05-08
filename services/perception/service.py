@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections import deque
 from time import perf_counter
 
@@ -257,7 +258,6 @@ class PerceptionService:
             source=source_name or detector_spec.name,
             metadata={"kind": "latest_perception", "pipeline_name": self._pipeline_name},
         )
-
         if self._event_bus is not None:
             self._event_bus.publish(
                 self._event_bus.build_event(
@@ -307,6 +307,10 @@ class PerceptionService:
         image_frame = image_provider.capture_image(camera_id)
         resolved_camera_id = image_frame.camera_id
         camera_info = image_provider.get_camera_info(resolved_camera_id)
+        self._publish_video_frame(
+            image_frame,
+            source_name=image_provider.provider_name,
+        )
         image_artifact = None
         if store_artifact:
             image_artifact = self._artifact_service.save_image_frame(
@@ -342,6 +346,19 @@ class PerceptionService:
         if context is None:
             raise GatewayError("当前还没有可用的感知缓存。")
         return context
+
+    def publish_current_video_frame(
+        self,
+        *,
+        camera_id: Optional[str] = None,
+        requested_by: Optional[str] = None,
+    ) -> None:
+        image_provider = self._get_image_provider()
+        image_frame = image_provider.capture_image(camera_id)
+        self._publish_video_frame(
+            image_frame,
+            source_name=image_provider.provider_name,
+        )
 
     def get_latest_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
         """返回最新感知结果。"""
@@ -531,6 +548,66 @@ class PerceptionService:
                 )
             )
         return tuple(assigned)
+
+    def _publish_video_frame(self, image_frame, *, source_name: str) -> None:
+        if self._stream_bus is None:
+            return
+        metadata = dict(image_frame.metadata or {})
+        payload_bytes = len(image_frame.data or b"")
+        data_uri = self._build_video_data_uri(image_frame)
+        payload = {
+            "available": bool(data_uri or image_frame.uri),
+            "camera_id": image_frame.camera_id,
+            "frame_id": image_frame.frame_id,
+            "width_px": image_frame.width_px,
+            "height_px": image_frame.height_px,
+            "encoding": image_frame.encoding.value,
+            "payload_bytes": payload_bytes,
+            "metadata": dict(metadata),
+        }
+        if data_uri:
+            payload["data_uri"] = data_uri
+        elif image_frame.uri:
+            payload["uri"] = image_frame.uri
+        elif image_frame.artifact_id:
+            payload["artifact_id"] = image_frame.artifact_id
+        status = "available" if payload.get("data_uri") or payload.get("uri") else "unsupported"
+        if status != "available":
+            payload["message"] = f"浏览器暂不支持直接显示 {image_frame.encoding.value} 图像帧。"
+        self._stream_bus.publish(
+            "video.frame",
+            source=source_name or "image_provider",
+            payload=payload,
+            frame_id=image_frame.frame_id,
+            sequence=metadata.get("sequence") if isinstance(metadata.get("sequence"), int) else None,
+            status=status,
+            metadata={
+                "camera_id": image_frame.camera_id,
+                "encoding": image_frame.encoding.value,
+                "payload_bytes": payload_bytes,
+                "source_name": source_name or "image_provider",
+                **metadata,
+            },
+        )
+
+    def _build_video_data_uri(self, image_frame) -> Optional[str]:
+        if not image_frame.data:
+            return None
+        mime_type = self._video_mime_type(image_frame.encoding)
+        if mime_type is None:
+            return None
+        return "data:%s;base64,%s" % (
+            mime_type,
+            base64.b64encode(image_frame.data).decode("ascii"),
+        )
+
+    def _video_mime_type(self, encoding) -> Optional[str]:
+        value = str(getattr(encoding, "value", encoding)).lower()
+        if value == "jpeg":
+            return "image/jpeg"
+        if value == "png":
+            return "image/png"
+        return None
 
     def _get_image_provider(self) -> ImageProvider:
         providers = getattr(self._provider_owner, "providers", None)

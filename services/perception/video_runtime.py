@@ -95,16 +95,7 @@ class PerceptionVideoRuntime:
     def should_auto_start(self) -> bool:
         """返回是否应在宿主机运行时启动时自动拉起。"""
 
-        if not (self._enabled and self._auto_start):
-            return False
-        if self._memory_service is None:
-            return True
-        if hasattr(self._memory_service, "is_enabled"):
-            try:
-                return bool(self._memory_service.is_enabled())
-            except Exception:
-                return False
-        return True
+        return self._enabled and self._auto_start
 
     def is_running(self) -> bool:
         """返回后台线程是否处于运行状态。"""
@@ -197,11 +188,16 @@ class PerceptionVideoRuntime:
         effective_reason = reason
         if not force_keyframe:
             if not decision.should_process:
+                self._perception_service.publish_current_video_frame(
+                    camera_id=self._camera_id,
+                    requested_by="perception_video_runtime",
+                )
                 with self._lock:
+                    self._last_error = None
                     self._last_status_metadata = {
                         **dict(self._last_status_metadata),
                         "camera_id": self._camera_id,
-                        "capture_mode": "keyframe",
+                        "capture_mode": "video_stream",
                         "last_skip_reason": decision.reason,
                         **dict(decision.metadata),
                     }

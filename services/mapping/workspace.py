@@ -115,7 +115,7 @@ class MapWorkspaceService:
         load_memory_history: bool = True,
         reset_memory_library: bool = False,
         metadata: Optional[Dict[str, object]] = None,
-        load_latest_version: bool = True,
+        load_latest_version: bool = False,
     ) -> MapWorkspace:
         resolved_name = self._require_map_name(map_name)
         previous_active_map_name = self._repository.get_active_map_name()
@@ -200,6 +200,7 @@ class MapWorkspaceService:
             load_memory_history=load_memory_history,
             reset_memory_library=reset_memory_library,
             metadata=metadata,
+            load_latest_version=False,
         )
 
     def get_active_workspace(self) -> Optional[MapWorkspace]:
@@ -541,6 +542,7 @@ class MapWorkspaceService:
             create_if_missing=False,
             load_memory_history=load_memory_history,
             reset_memory_library=False,
+            load_latest_version=False,
         )
 
     def delete_map(

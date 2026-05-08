@@ -16,13 +16,13 @@
 ./start_go2_slam_nav2.sh --mapping
 ```
 
-启动 SLAM + Nav2 + frontier 自动探索：
+启动 SLAM + Nav2 + frontier 只读观测：
 
 ```bash
 ./start_go2_slam_nav2.sh --explore
 ```
 
-同时保存点云图并自动探索：
+同时保存点云图并观测 frontier：
 
 ```bash
 ./start_go2_slam_nav2.sh --mapping --explore
@@ -71,7 +71,7 @@ frontier 搜索参数在：
 src/go2_navigation2/config/explore_params.yaml
 ```
 
-默认使用 slam_toolbox 的 `/map` 和 `/map_updates` 做 frontier 搜索，向 Nav2 的 `navigate_to_pose` action 发送目标点。RViz 中可添加 `explore/frontiers` MarkerArray 查看 frontier。
+默认使用 slam_toolbox 的 `/map` 和 `/map_updates` 做 frontier 搜索，只发布 `explore/frontiers` MarkerArray 供 debug/RViz 显示，不向 Nav2 的 `navigate_to_pose` action 发送目标点。
 
 用于生成 `/go2_built_map` 点云地图，之后可用 `save_pointcloud.sh` 保存。
 

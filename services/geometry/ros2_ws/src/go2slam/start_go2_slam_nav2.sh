@@ -12,14 +12,14 @@ MAPPING_PID=""
 
 # --- 新增参数处理 ---
 START_MAPPING=false  # 默认不启动点云建图
-START_EXPLORE=false  # 默认不启动 frontier 探索
+START_EXPLORE=false  # 默认不启动 frontier 观测
 START_RVIZ=true      # 默认启动 RViz
 
 usage() {
   local status="${1:-1}"
   echo "Usage: $0 [--mapping] [--explore] [--no-rviz]"
   echo "  --mapping    启动 Go2 点云建图 (mapping_only.launch.py)"
-  echo "  --explore    启动 m-explore-ros2 frontier 自动探索"
+  echo "  --explore    启动 m-explore-ros2 frontier 只读观测"
   echo "  --no-rviz    不启动 RViz，适用于无显示环境或远程终端"
   exit "${status}"
 }

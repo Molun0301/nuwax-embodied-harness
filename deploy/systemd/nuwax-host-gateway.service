@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=huang
-Group=huang
-WorkingDirectory=/home/huang/nuwax-robot-bridge
+User=unitree
+Group=unitree
+WorkingDirectory=/home/unitree/nuwax-robot-bridge
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/bin/bash /home/huang/nuwax-robot-bridge/scripts/start_gateway.sh
+ExecStart=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/start_gateway.sh
 Restart=always
 RestartSec=3
 TimeoutStopSec=20

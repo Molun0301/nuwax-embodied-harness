@@ -47,6 +47,7 @@ _NAV2_EXTERNAL_MODES = {"external", "external_action", "action", "client", "pend
 _NAV2_DISABLED_MODES = {"", "disabled", "off", "none"}
 _REMOVED_PLATFORM_GRID_MODES = {"platform", "platform_grid", "grid", "fallback", "platform_fallback"}
 _EXTERNAL_GEOMETRY_STACKS = {"external_slam_nav2"}
+_EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME = "external_slam_nav2_state.db"
 
 
 @dataclass
@@ -1400,16 +1401,28 @@ class PlatformGeometryRuntime:
             pcd_metadata=pcd_metadata,
             rtabmap_run=rtabmap_run,
         )
-        asset_refs = (
-            MapGeometryAssetRef(
-                asset_type=MapGeometryAssetType.RTABMAP_DATABASE,
-                path=str(rtabmap_db_path),
-                frame_id=version.frame_id,
-                profile_summary=profile_summary,
-                built_at=built_at,
-                quality_metrics=dict(quality_metrics.get("database") or {}),
-                metadata={"required": True},
-            ),
+        database_quality = dict(quality_metrics.get("database") or {})
+        database_required = bool(database_quality.get("required", True))
+        database_present = bool(database_quality.get("present", False))
+        database_asset_type = (
+            MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE
+            if self._uses_external_geometry_stack()
+            else MapGeometryAssetType.RTABMAP_DATABASE
+        )
+        asset_refs = []
+        if database_required or database_present:
+            asset_refs.append(
+                MapGeometryAssetRef(
+                    asset_type=database_asset_type,
+                    path=str(rtabmap_db_path),
+                    frame_id=version.frame_id,
+                    profile_summary=profile_summary,
+                    built_at=built_at,
+                    quality_metrics=database_quality,
+                    metadata={"required": database_required},
+                )
+            )
+        asset_refs.append(
             MapGeometryAssetRef(
                 asset_type=MapGeometryAssetType.PCD,
                 path=str(pcd_path),
@@ -1418,7 +1431,7 @@ class PlatformGeometryRuntime:
                 built_at=built_at,
                 quality_metrics=dict(quality_metrics.get("pcd") or {}),
                 metadata={"required": False},
-            ),
+            )
         )
         geometry_asset = MapGeometryAssetBinding(
             map_name=version.map_name,
@@ -1667,7 +1680,10 @@ class PlatformGeometryRuntime:
                 or (
                     geometry_asset is not None
                     and geometry_asset.quality_metrics.get("status") == "ready"
-                    and geometry_asset.quality_metrics.get("database", {}).get("present", False)
+                    and (
+                        geometry_asset.quality_metrics.get("database", {}).get("present", False)
+                        or not geometry_asset.quality_metrics.get("database", {}).get("required", True)
+                    )
                 )
             ),
             "geometry_diagnostics": self._clone_metadata(
@@ -1783,7 +1799,15 @@ class PlatformGeometryRuntime:
         return self._version_geometry_root(map_name, version_id) / "geometry_asset.json"
 
     def _version_rtabmap_database_path(self, map_name: str, version_id: str) -> Path:
+        if self._uses_external_geometry_stack():
+            return self._version_geometry_root(map_name, version_id) / "external_slam_nav2" / self._external_slam_nav2_state_asset_name()
         return self._version_geometry_root(map_name, version_id) / "rtabmap" / self.config.rtabmap.outputs.database_asset_name
+
+    def _external_slam_nav2_state_asset_name(self) -> str:
+        configured_name = str(getattr(self.config.rtabmap.outputs, "database_asset_name", "") or "").strip()
+        if not configured_name or configured_name == "rtabmap.db":
+            return _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME
+        return configured_name
 
     def _version_pcd_asset_path(self, map_name: str, version_id: str) -> Path:
         return self._version_geometry_root(map_name, version_id) / "pcd" / self.config.rtabmap.outputs.pcd_asset_name
@@ -1869,6 +1893,7 @@ class PlatformGeometryRuntime:
     ) -> Dict[str, object]:
         diagnostics = []
         database_present = bool(database_metadata.get("database_present", False))
+        database_required = not self._uses_external_geometry_stack()
         pcd_present = bool(pcd_metadata.get("pcd_present", False))
         readiness = self._build_rtabmap_readiness()
         live_source = database_metadata.get("database_source_kind") == "live_runtime"
@@ -1883,7 +1908,7 @@ class PlatformGeometryRuntime:
             and int(live_db_stat.get("size_bytes") or 0) > 0
         ) if isinstance(live_db_stat, dict) else False
         live_streaming_ready = bool(readiness.get("streaming_ready") and live_db_updating)
-        if not database_present:
+        if not database_present and database_required:
             diagnostics.append(
                 {
                     "level": "error",
@@ -1891,12 +1916,20 @@ class PlatformGeometryRuntime:
                     "message": "地图版本缺少 RTAB-Map database 资产。",
                 }
             )
+        if not database_present and not database_required:
+            diagnostics.append(
+                {
+                    "level": "info",
+                    "code": "external_geometry_state_not_materialized",
+                    "message": "未找到 external_slam_nav2 状态数据库；该诊断资产为可选资产，不阻断地图版本保存或定位会话。",
+                }
+            )
         if database_present and not live_streaming_ready:
             diagnostics.append(
                 {
                     "level": "warning",
-                    "code": "rtabmap_database_checkpoint_only",
-                    "message": "RTAB-Map database 已落盘为离线 checkpoint，但未证明 live rtabmap.db 正在随 /map streaming 更新。",
+                    "code": "external_geometry_state_checkpoint_only",
+                    "message": "external_slam_nav2 状态数据库已落盘为离线 checkpoint，但未证明外部几何状态正在随 /map streaming 更新。",
                 }
             )
         if not pcd_present:
@@ -1916,7 +1949,7 @@ class PlatformGeometryRuntime:
                 }
             )
         return {
-            "status": "ready" if database_present else "failed",
+            "status": "ready" if database_present or not database_required else "failed",
             "live_streaming_ready": live_streaming_ready,
             "checkpoint_ready": database_present,
             "source_mode": "live_streaming_checkpoint" if live_streaming_ready else "offline_checkpoint",
@@ -1924,6 +1957,7 @@ class PlatformGeometryRuntime:
             "rtabmap_run": rtabmap_run,
             "database": {
                 "present": database_present,
+                "required": database_required,
                 "source_kind": database_metadata.get("database_source_kind"),
                 "source_path": database_metadata.get("database_source_path"),
                 "target_path": database_metadata.get("database_target_path"),
@@ -2169,6 +2203,11 @@ class PlatformGeometryRuntime:
         candidates = []
         if configured_root.suffix == ".db":
             candidates.append(configured_root)
+        elif self._uses_external_geometry_stack():
+            state_asset_name = self._external_slam_nav2_state_asset_name()
+            candidates.append(configured_root / state_asset_name)
+            if state_asset_name != _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME:
+                candidates.append(configured_root / _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME)
         else:
             candidates.extend(
                 (

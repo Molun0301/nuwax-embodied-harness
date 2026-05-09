@@ -308,8 +308,25 @@ def _render_env_from_template(template_path: Path, overrides: Mapping[str, str])
     template = _read_text(template_path)
     lines: List[str] = []
     seen: set[str] = set()
+    strip_go2_geometry_notes = (
+        overrides.get("NUWAX_GEOMETRY_STACK") == "disabled"
+        and overrides.get("NUWAX_GEOMETRY_EXTERNAL_SCRIPT") == ""
+    )
+    skipping_go2_geometry_note = False
     for raw_line in template.splitlines():
         stripped = raw_line.strip()
+        if strip_go2_geometry_notes:
+            lowered = raw_line.lower()
+            if stripped.startswith("# external_slam_nav2 默认外部 SLAM/Nav2 栈说明"):
+                skipping_go2_geometry_note = True
+                continue
+            if skipping_go2_geometry_note:
+                if not stripped:
+                    skipping_go2_geometry_note = False
+                    lines.append(raw_line)
+                continue
+            if "go2slam" in lowered or "start_go2_slam_nav2.sh" in lowered:
+                continue
         if not stripped or stripped.startswith("#") or "=" not in raw_line:
             lines.append(raw_line)
             continue
@@ -612,12 +629,39 @@ class BootstrapPlanner:
         return value
 
     def root_overrides(self) -> Dict[str, str]:
+        go2_geometry_enabled = self.selected_robot == "go2" and self.geometry_enabled
         values: Dict[str, str] = {
             "NUWAX_ACTIVE_ROBOT": self.selected_robot,
-            "NUWAX_GEOMETRY_ENABLED": _bool_text(self.geometry_enabled),
-            "NUWAX_GEOMETRY_REQUIRE_ROS2": _bool_text(self.geometry_enabled),
+            "NUWAX_GEOMETRY_ENABLED": _bool_text(go2_geometry_enabled),
+            "NUWAX_GEOMETRY_REQUIRE_ROS2": _bool_text(go2_geometry_enabled),
+            "NUWAX_GEOMETRY_STACK": "disabled",
             "NUWAX_GEOMETRY_SETUP_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash"),
-            "NUWAX_NAV2_MODE": "sidecar" if self.geometry_enabled else "disabled",
+            "NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR": "",
+            "NUWAX_GEOMETRY_ODOM_TOPIC": "",
+            "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS": "",
+            "NUWAX_GEOMETRY_IMU_TOPIC": "",
+            "NUWAX_GEOMETRY_POINT_CLOUD_TOPIC": "",
+            "NUWAX_GEOMETRY_TF_TOPIC": "",
+            "NUWAX_GEOMETRY_TF_STATIC_TOPIC": "",
+            "NUWAX_GEOMETRY_OCCUPANCY_TOPIC": "",
+            "NUWAX_GEOMETRY_COST_MAP_TOPIC": "",
+            "NUWAX_GEOMETRY_MAP_FRAME": "",
+            "NUWAX_GEOMETRY_ODOM_FRAME": "",
+            "NUWAX_GEOMETRY_BASE_FRAME": "",
+            "NUWAX_GEOMETRY_LIDAR_FRAME": "",
+            "NUWAX_NAV2_MODE": "disabled",
+            "NUWAX_NAV2_ACTION_NAME": "",
+            "NUWAX_NAV2_LAUNCH_PACKAGE": "",
+            "NUWAX_NAV2_LAUNCH_FILE": "",
+            "NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC": "",
+            "NUWAX_NAV2_LOCAL_COSTMAP_TOPIC": "",
+            "NUWAX_NAV2_COSTMAP_SOURCE": "",
+            "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": "",
+            "NUWAX_GEOMETRY_EXTERNAL_ARGS": "",
+            "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "",
+            "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "",
+            "NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED": "false",
+            "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED": "false",
             "NUWAX_LOG_DIR": str(PROJECT_ROOT),
             "NUWAX_LOG_FILE": str(PROJECT_ROOT / "nuwax_robot_bridge.log"),
             "NUWAX_GATEWAY_ARTIFACT_DIR": str(PROJECT_ROOT / "artifacts"),

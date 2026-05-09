@@ -24,3 +24,4 @@ runtime_data/
 .venv/
 .pytest_cache
 .playwright-mcp
+功能列表.md

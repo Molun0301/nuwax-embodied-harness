@@ -13,7 +13,7 @@ class SlamOccupancyAdapter(AdapterBase[Dict[str, Any], OccupancyGrid]):
     @classmethod
     def build_default_config(
         cls,
-        name: str = "slam_occupancy",
+        name: str = "external_slam_nav2_occupancy",
         *,
         source_ref: Optional[str] = "/map",
     ) -> AdapterConfig:
@@ -22,10 +22,11 @@ class SlamOccupancyAdapter(AdapterBase[Dict[str, Any], OccupancyGrid]):
         return AdapterConfig(
             name=name,
             category=AdapterCategory.MAPPING,
-            source_kind="slam",
+            source_kind="external_slam_nav2",
             contract_type="OccupancyGrid",
             source_ref=source_ref,
             settings={"default_frame_id": "map", "unknown_value": -1, "clamp_values": True},
+            metadata={"geometry_stack": "external_slam_nav2", "topic": source_ref},
         )
 
     def convert_payload(self, payload: Dict[str, Any]) -> OccupancyGrid:

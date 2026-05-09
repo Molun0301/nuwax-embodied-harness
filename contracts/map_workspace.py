@@ -86,6 +86,7 @@ class MapGeometryAssetType(StrEnum):
     """平台地图版本几何资产类型。"""
 
     RTABMAP_DATABASE = "rtabmap_database"
+    EXTERNAL_SLAM_NAV2_STATE = "external_slam_nav2_state"
     PCD = "pcd"
 
 
@@ -124,14 +125,14 @@ class MapGeometryAssetBinding(ContractModel):
 
     map_name: str = Field(description="所属地图名称。")
     version_id: str = Field(description="关联的平台地图版本标识。")
-    geometry_stack: str = Field(default="rtabmap_nav2", description="当前绑定的几何栈标识。")
+    geometry_stack: str = Field(default="external_slam_nav2", description="当前绑定的几何栈标识。")
     frame_id: Optional[str] = Field(default=None, description="该版本几何主图层坐标系。")
-    rtabmap_db_path: str = Field(description="RTAB-Map 数据库文件路径。")
+    rtabmap_db_path: str = Field(description="外部 SLAM/Nav2 状态数据库文件路径。")
     pcd_path: Optional[str] = Field(default=None, description="PCD 点云地图资产路径。")
     occupancy_projection: str = Field(description="占据栅格投影来源说明。")
     costmap_source: str = Field(description="代价地图来源说明。")
     parameter_summary: MetadataDict = Field(default_factory=dict, description="几何栈参数摘要。")
-    profile_summary: MetadataDict = Field(default_factory=dict, description="RTAB-Map profile 摘要。")
+    profile_summary: MetadataDict = Field(default_factory=dict, description="几何 profile 摘要。")
     quality_metrics: MetadataDict = Field(default_factory=dict, description="几何资产质量指标。")
     assets: List[MapGeometryAssetRef] = Field(default_factory=list, description="该地图版本绑定的几何资产列表。")
     built_at: datetime = Field(default_factory=utc_now, description="该几何资产构建时间。")
@@ -168,16 +169,28 @@ class MapGeometryAssetBinding(ContractModel):
         if self.assets:
             return self
         profile_summary = dict(self.profile_summary or self.parameter_summary.get("profile") or {})
-        refs = [
-            MapGeometryAssetRef(
-                asset_type=MapGeometryAssetType.RTABMAP_DATABASE,
-                path=self.rtabmap_db_path,
-                frame_id=self.frame_id,
-                profile_summary=profile_summary,
-                built_at=self.built_at,
-                quality_metrics=dict(self.quality_metrics.get("database") or {}),
+        is_external_stack = str(self.geometry_stack or "").strip().lower() == "external_slam_nav2"
+        state_asset_type = (
+            MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE
+            if is_external_stack
+            else MapGeometryAssetType.RTABMAP_DATABASE
+        )
+        database_quality = dict(self.quality_metrics.get("database") or {})
+        database_required = bool(database_quality.get("required", not is_external_stack))
+        database_present = bool(database_quality.get("present", False))
+        refs = []
+        if database_required or database_present:
+            refs.append(
+                MapGeometryAssetRef(
+                    asset_type=state_asset_type,
+                    path=self.rtabmap_db_path,
+                    frame_id=self.frame_id,
+                    profile_summary=profile_summary,
+                    built_at=self.built_at,
+                    quality_metrics=database_quality,
+                    metadata={"required": database_required},
+                )
             )
-        ]
         if self.pcd_path:
             refs.append(
                 MapGeometryAssetRef(

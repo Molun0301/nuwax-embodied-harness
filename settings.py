@@ -758,23 +758,16 @@ def load_config() -> NuwaxRobotBridgeConfig:
 
     geometry = PlatformGeometryConfig(
         enabled=_cfg_bool("NUWAX_GEOMETRY_ENABLED", True),
-        stack=_cfg_str("NUWAX_GEOMETRY_STACK", "rtabmap_nav2"),
+        stack=_cfg_str("NUWAX_GEOMETRY_STACK", "external_slam_nav2"),
         require_ros2=_cfg_bool("NUWAX_GEOMETRY_REQUIRE_ROS2", True),
         setup_script=_cfg_str("NUWAX_GEOMETRY_SETUP_SCRIPT", build_default_geometry_setup_script()),
         cyclonedds_lib_dir=_cfg_str("NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR", ""),
         dds_iface=_cfg_str("NUWAX_GEOMETRY_DDS_IFACE", ""),
         topics=GeometryTopicsConfig(
-            odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/nuwax/geometry/odom"),
-            secondary_odom_topics=_cfg_csv(
-                "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS",
-                (
-                    "/uslam/localization/odom",
-                    "/lio_sam_ros2/mapping/odometry",
-                    "/odom_lio",
-                ),
-            ),
+            odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/odom"),
+            secondary_odom_topics=_cfg_csv("NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS", ()),
             imu_topic=_cfg_str("NUWAX_GEOMETRY_IMU_TOPIC", "/utlidar/imu"),
-            point_cloud_topic=_cfg_str("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud"),
+            point_cloud_topic=_cfg_str("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud_deskewed"),
             tf_topic=_cfg_str("NUWAX_GEOMETRY_TF_TOPIC", "/tf"),
             tf_static_topic=_cfg_str("NUWAX_GEOMETRY_TF_STATIC_TOPIC", "/tf_static"),
             occupancy_topic=_cfg_str("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
@@ -787,12 +780,12 @@ def load_config() -> NuwaxRobotBridgeConfig:
         frames=GeometryFrameConfig(
             map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "map"),
             odom_frame=_cfg_str("NUWAX_GEOMETRY_ODOM_FRAME", "odom"),
-            base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "body"),
+            base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "base_footprint"),
             lidar_frame=_cfg_str("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),
             imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
         rtabmap=RtabmapConfig(
-            profile_name=_cfg_str("NUWAX_RTABMAP_PROFILE_NAME", "rtabmap_nav2"),
+            profile_name=_cfg_str("NUWAX_RTABMAP_PROFILE_NAME", "external_slam_nav2"),
             profile_enabled=_cfg_bool("NUWAX_RTABMAP_PROFILE_ENABLED", True),
             default_profile=_cfg_bool("NUWAX_RTABMAP_DEFAULT_PROFILE", True),
             database_root=_cfg_str("NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
@@ -836,7 +829,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 output_layer=_cfg_str("NUWAX_GEOMETRY_TRAVERSABILITY_OUTPUT_LAYER", "traversability"),
             ),
             outputs=RtabmapOutputConfig(
-                database_asset_name=_cfg_str("NUWAX_RTABMAP_DATABASE_ASSET_NAME", "rtabmap.db"),
+                database_asset_name=_cfg_str("NUWAX_RTABMAP_DATABASE_ASSET_NAME", "external_slam_nav2_state.db"),
                 pcd_asset_name=_cfg_str("NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"),
                 occupancy_layer=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"),
                 costmap_layer=_cfg_str("NUWAX_RTABMAP_COSTMAP_LAYER", "nav2_global_costmap"),
@@ -846,7 +839,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             ),
         ),
         nav2=Nav2Config(
-            mode=_cfg_str("NUWAX_NAV2_MODE", "sidecar"),
+            mode=_cfg_str("NUWAX_NAV2_MODE", "external"),
             action_name=_cfg_str("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
             launch_package=_cfg_str("NUWAX_NAV2_LAUNCH_PACKAGE", "nav2_bringup"),
             launch_file=_cfg_str("NUWAX_NAV2_LAUNCH_FILE", "navigation_launch.py"),

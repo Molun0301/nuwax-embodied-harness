@@ -13,7 +13,7 @@ class Nav2CostMapAdapter(AdapterBase[Dict[str, Any], CostMap]):
     @classmethod
     def build_default_config(
         cls,
-        name: str = "nav2_costmap",
+        name: str = "external_slam_nav2_costmap",
         *,
         source_ref: Optional[str] = "/global_costmap/costmap",
     ) -> AdapterConfig:
@@ -22,10 +22,11 @@ class Nav2CostMapAdapter(AdapterBase[Dict[str, Any], CostMap]):
         return AdapterConfig(
             name=name,
             category=AdapterCategory.MAPPING,
-            source_kind="nav2",
+            source_kind="external_slam_nav2",
             contract_type="CostMap",
             source_ref=source_ref,
             settings={"default_frame_id": "map", "cost_scale": 1.0},
+            metadata={"geometry_stack": "external_slam_nav2", "topic": source_ref},
         )
 
     def convert_payload(self, payload: Dict[str, Any]) -> CostMap:

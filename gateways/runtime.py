@@ -2717,7 +2717,7 @@ class GatewayRuntime:
             last_relocalization=last_relocalization,
             navigation_control_policy=navigation_policy,
             metadata={
-                "route": "rtabmap",
+                "route": profile.get("route") or "unknown",
                 "go2_boundary": "dds_only",
                 "source": "platform_service_contracts",
                 "map_version_id": getattr(map_snapshot, "version_id", None),
@@ -2864,7 +2864,15 @@ class GatewayRuntime:
             "name": profile.get("name") or profile.get("profile_name"),
             "enabled": bool(profile.get("enabled", profile.get("profile_enabled", False))),
             "default": bool(profile.get("default", profile.get("default_profile", False))),
-            "route": profile.get("route") or "rtabmap",
+            "route": (
+                profile.get("route")
+                or metadata.get("route")
+                or getattr(self.platform_geometry_runtime.config.nav2, "mode", None)
+                or profile.get("stack")
+                or metadata.get("geometry_stack")
+                or self.platform_geometry_runtime.config.stack
+                or "unknown"
+            ),
             "stack": profile.get("stack") or metadata.get("geometry_stack") or self.platform_geometry_runtime.config.stack,
             "status": "configured" if profile else "missing",
             "geometry_enabled": bool(self.platform_geometry_runtime.config.enabled),

@@ -433,13 +433,22 @@ class LocalizationService:
         quality_metrics = geometry_asset.get("quality_metrics")
         if not isinstance(quality_metrics, dict):
             return None
+        is_external_stack = str(geometry_asset.get("geometry_stack") or "").strip().lower() == "external_slam_nav2"
+        database = quality_metrics.get("database")
+        database_missing = isinstance(database, dict) and database.get("present") is False
+        database_required = bool(database.get("required", not is_external_stack)) if isinstance(database, dict) else True
+        optional_database_missing = bool(database_missing and not database_required)
         if quality_metrics.get("status") == "failed":
             for item in quality_metrics.get("diagnostics") or []:
                 if isinstance(item, dict) and item.get("level") == "error":
+                    code = str(item.get("code") or "").strip()
+                    if optional_database_missing and code in {"external_geometry_state_missing", "external_geometry_state_not_materialized"}:
+                        continue
                     return str(item.get("message") or item.get("code") or "几何资产不可用。")
+            if optional_database_missing:
+                return None
             return "几何资产不可用。"
-        database = quality_metrics.get("database")
-        if isinstance(database, dict) and database.get("present") is False:
+        if database_missing and database_required:
             return "地图版本缺少 RTAB-Map database 资产。"
         return None
 
@@ -455,8 +464,10 @@ class LocalizationService:
         assets = geometry_asset.get("assets")
         if isinstance(assets, list):
             return [self._clone_metadata(item) for item in assets if isinstance(item, dict)]
+        is_external_stack = str(geometry_asset.get("geometry_stack") or "").strip().lower() == "external_slam_nav2"
+        state_asset_type = "external_slam_nav2_state" if is_external_stack else "rtabmap_database"
         refs = []
-        for asset_type, path_key in (("rtabmap_database", "rtabmap_db_path"), ("pcd", "pcd_path")):
+        for asset_type, path_key in ((state_asset_type, "rtabmap_db_path"), ("pcd", "pcd_path")):
             path = str(geometry_asset.get(path_key) or "").strip()
             if path:
                 refs.append({"asset_type": asset_type, "path": path, "frame_id": geometry_asset.get("frame_id")})

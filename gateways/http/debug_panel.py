@@ -2124,7 +2124,7 @@ def _runtime_governance_message(summary: Any) -> str:
     asset = dict(getattr(summary, "geometry_asset", {}) or {})
     session = dict(getattr(summary, "localization_session", {}) or {})
     return "route=%s profile=%s asset=%s localization=%s" % (
-        profile.get("route") or "rtabmap",
+        profile.get("route") or "unknown",
         profile.get("status") or "unknown",
         "available" if asset.get("available") else "missing",
         session.get("status") or "missing",
@@ -2142,7 +2142,7 @@ def _runtime_governance_metadata(summary: Any) -> Dict[str, Any]:
     return {
         "profile_name": profile.get("name"),
         "profile_status": profile.get("status"),
-        "route": profile.get("route") or "rtabmap",
+        "route": profile.get("route") or "unknown",
         "geometry_asset_available": bool(asset.get("available")),
         "database_present": asset.get("database_present"),
         "pcd_present": asset.get("pcd_present"),

@@ -41,14 +41,10 @@ def build_default_external_slam_nav2_script() -> str:
 class GeometryTopicsConfig:
     """平台几何侧车统一话题配置。"""
 
-    odom_topic: str = "/nuwax/geometry/odom"
-    secondary_odom_topics: Tuple[str, ...] = (
-        "/uslam/localization/odom",
-        "/lio_sam_ros2/mapping/odometry",
-        "/odom_lio",
-    )
+    odom_topic: str = "/odom"
+    secondary_odom_topics: Tuple[str, ...] = ()
     imu_topic: str = "/utlidar/imu"
-    point_cloud_topic: str = "/utlidar/cloud"
+    point_cloud_topic: str = "/utlidar/cloud_deskewed"
     tf_topic: str = "/tf"
     tf_static_topic: str = "/tf_static"
     occupancy_topic: str = "/map"
@@ -62,7 +58,7 @@ class GeometryFrameConfig:
 
     map_frame: str = "map"
     odom_frame: str = "odom"
-    base_frame: str = "body"
+    base_frame: str = "base_footprint"
     lidar_frame: str = "utlidar_lidar"
     imu_frame: str = "utlidar_imu"
 
@@ -120,7 +116,7 @@ class GeometryTraversabilityFilterConfig:
 class RtabmapOutputConfig:
     """RTAB-Map 输出资产与诊断摘要配置。"""
 
-    database_asset_name: str = "rtabmap.db"
+    database_asset_name: str = "external_slam_nav2_state.db"
     pcd_asset_name: str = "cloud_map.pcd"
     occupancy_layer: str = "occupancy_grid"
     costmap_layer: str = "nav2_global_costmap"
@@ -133,7 +129,7 @@ class RtabmapOutputConfig:
 class RtabmapConfig:
     """RTAB-Map 侧车配置。"""
 
-    profile_name: str = "rtabmap_nav2"
+    profile_name: str = "external_slam_nav2"
     profile_enabled: bool = True
     default_profile: bool = True
     database_root: str = field(default_factory=build_default_rtabmap_database_root)
@@ -154,7 +150,7 @@ class RtabmapConfig:
 class Nav2Config:
     """Nav2 侧车配置。"""
 
-    mode: str = "sidecar"
+    mode: str = "external"
     action_name: str = "/navigate_to_pose"
     launch_package: str = "nav2_bringup"
     launch_file: str = "navigation_launch.py"
@@ -189,7 +185,7 @@ class PlatformGeometryConfig:
     """平台几何引擎统一配置。"""
 
     enabled: bool = True
-    stack: str = "rtabmap_nav2"
+    stack: str = "external_slam_nav2"
     require_ros2: bool = True
     setup_script: str = field(default_factory=build_default_geometry_setup_script)
     cyclonedds_lib_dir: str = ""
@@ -214,7 +210,7 @@ class PlatformGeometryConfig:
                 "name": self.rtabmap.profile_name,
                 "enabled": self.rtabmap.profile_enabled,
                 "default": self.rtabmap.default_profile,
-                "route": "rtabmap",
+                "route": self.nav2.mode or "external",
                 "stack": self.stack,
             },
             "topics": {

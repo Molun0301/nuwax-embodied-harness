@@ -133,6 +133,20 @@ class LowLevelController:
             self.cmd_thread.Stop()
         logger.info("低级别控制循环已停止")
 
+    def stop_motion(self):
+        """清零低层命令并停止发布循环。"""
+
+        if self.low_cmd is not None:
+            for index in range(20):
+                self.low_cmd.motor_cmd[index].q = 0
+                self.low_cmd.motor_cmd[index].kp = 0
+                self.low_cmd.motor_cmd[index].dq = 0
+                self.low_cmd.motor_cmd[index].kd = 0
+                self.low_cmd.motor_cmd[index].tau = 0
+            if self.is_initialized:
+                self._control_loop()
+        self.stop()
+
     def _control_loop(self):
         """控制循环。"""
 
@@ -246,3 +260,26 @@ class LowLevelController:
                 }
             )
         return {"joints": states}
+
+    def get_imu_state(self) -> dict:
+        """获取低层 IMU 状态。"""
+
+        if self.low_state is None:
+            return {}
+
+        imu_state = getattr(self.low_state, "imu_state", None)
+        if imu_state is None:
+            return {}
+
+        quaternion = getattr(imu_state, "quaternion", None)
+        gyroscope = getattr(imu_state, "gyroscope", None)
+        accelerometer = getattr(imu_state, "accelerometer", None)
+        raw_quaternion = list(quaternion) if quaternion is not None else [1.0, 0.0, 0.0, 0.0]
+        while len(raw_quaternion) < 4:
+            raw_quaternion.append(0.0)
+        w, x, y, z = raw_quaternion[:4]
+        return {
+            "quaternion": [x, y, z, w],
+            "gyroscope": list(gyroscope) if gyroscope is not None else [0.0, 0.0, 0.0],
+            "accelerometer": list(accelerometer) if accelerometer is not None else [0.0, 0.0, 0.0],
+        }

@@ -318,7 +318,7 @@ def resolve_detection_provider_spec(
                 "capabilities": _capabilities(detect=True),
             },
         )
-    if "yolo" in requested_kind or requested_kind in {"ultralytics", "ultralytics_yolo_tensorrt", "ultralytics_yolo_pytorch"}:
+    if requested_kind.startswith("ultralytics_yolo") and "world" not in requested_kind:
         return ModelProviderSpec(
             capability="detection",
             provider_kind="local",
@@ -330,6 +330,21 @@ def resolve_detection_provider_spec(
                 "resolved_provider_name": "ultralytics_yolo",
                 "resolved_backend": requested_backend,
                 "capabilities": _capabilities(detect=True),
+            },
+        )
+    if "yolo_world" in requested_kind or requested_kind in {"yoloworld", "ultralytics_yolo_world"}:
+        return ModelProviderSpec(
+            capability="detection",
+            provider_kind="local",
+            provider_name="yolo_world",
+            model_name=normalized_model,
+            backend_name=requested_backend,
+            metadata={
+                **base_metadata,
+                "resolved_provider_name": "yolo_world",
+                "resolved_backend": requested_backend,
+                "open_vocabulary": True,
+                "capabilities": _capabilities(ground=True, detect=True),
             },
         )
     return ModelProviderSpec(

@@ -210,6 +210,9 @@ class VisionToMapProjectionService:
                 depth_coverage=0.0,
                 map_projection_coverage=0.0,
                 projection_degradation_reason="current_pose_fallback_no_geometry",
+                navigable=False,
+                non_navigable_reason="current_pose_fallback_no_geometry",
+                observation_only=True,
             ),
         )
 
@@ -503,10 +506,35 @@ class VisionToMapProjectionService:
             position=Vector3(
                 x=float(centroid[0]),
                 y=float(centroid[1]),
-                z=float(current_pose.position.z),
+                z=float(centroid[2]),
             ),
             orientation=current_pose.orientation,
         )
+        min_values = array.min(axis=0)
+        max_values = array.max(axis=0)
+        bbox_3d_map = {
+            "frame_id": map_frame,
+            "center": {
+                "x": round(float(centroid[0]), 6),
+                "y": round(float(centroid[1]), 6),
+                "z": round(float(centroid[2]), 6),
+            },
+            "extent_m": {
+                "x": round(float(extent[0]), 6),
+                "y": round(float(extent[1]), 6),
+                "z": round(float(extent[2]), 6),
+            },
+            "min": {
+                "x": round(float(min_values[0]), 6),
+                "y": round(float(min_values[1]), 6),
+                "z": round(float(min_values[2]), 6),
+            },
+            "max": {
+                "x": round(float(max_values[0]), 6),
+                "y": round(float(max_values[1]), 6),
+                "z": round(float(max_values[2]), 6),
+            },
+        }
         return projected_pose, {
             "projection_method": projection_method,
             "projection_confidence": float(projection_confidence),
@@ -517,14 +545,21 @@ class VisionToMapProjectionService:
             },
             "map_projection_coverage": round(max(0.0, min(1.0, float(map_projection_coverage))), 6),
             "projection_degradation_reason": projection_degradation_reason,
+            "centroid_map": bbox_3d_map["center"],
+            "bbox_3d_map": bbox_3d_map,
+            "object_3d_bbox": bbox_3d_map,
             "centroid_map_x": round(float(centroid[0]), 6),
             "centroid_map_y": round(float(centroid[1]), 6),
             "centroid_map_z": round(float(centroid[2]), 6),
             "extent_x_m": round(float(extent[0]), 6),
             "extent_y_m": round(float(extent[1]), 6),
             "extent_z_m": round(float(extent[2]), 6),
-            "min_map_z": round(float(array[:, 2].min()), 6),
-            "max_map_z": round(float(array[:, 2].max()), 6),
+            "min_map_x": round(float(min_values[0]), 6),
+            "min_map_y": round(float(min_values[1]), 6),
+            "min_map_z": round(float(min_values[2]), 6),
+            "max_map_x": round(float(max_values[0]), 6),
+            "max_map_y": round(float(max_values[1]), 6),
+            "max_map_z": round(float(max_values[2]), 6),
         }
 
     def _relative_pose_to_map(self, pose: Pose, *, current_pose: Pose, map_frame: str) -> Pose:

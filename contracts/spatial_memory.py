@@ -46,6 +46,25 @@ class InstanceLifecycleState(StrEnum):
     REMOVED = "removed"
 
 
+class InstanceDynamicState(StrEnum):
+    """实例短时动态状态。"""
+
+    STATIC = "static"
+    DYNAMIC = "dynamic"
+    QUASI_STATIC = "quasi_static"
+    UNKNOWN = "unknown"
+
+
+class InstanceObservationWindowSample(TimestampedContract):
+    """实例短时观测窗口样本。"""
+
+    pose: Pose = Field(description="观察到的对象位姿，统一使用 map frame。")
+    bbox_xyxy: List[float] = Field(default_factory=list, description="观察时二维包围盒。")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="观察置信度。")
+    track_id: Optional[str] = Field(default=None, description="观察关联的跟踪标识。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
 class SpatialAnchor(TimestampedContract):
     """可长期引用的空间锚点。"""
 
@@ -54,6 +73,7 @@ class SpatialAnchor(TimestampedContract):
     name: str = Field(description="锚点名称。")
     pose: Pose = Field(description="锚点位姿，统一使用 map frame。")
     map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
     semantic_labels: List[str] = Field(default_factory=list, description="关联语义标签。")
@@ -72,6 +92,7 @@ class SemanticRegion(TimestampedContract):
     region_id: str = Field(description="区域标识。")
     anchor_id: str = Field(description="区域锚点标识。")
     map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     frame_id: str = Field(description="区域坐标系，统一应为 map。")
     label: str = Field(description="区域主标签。")
     aliases: List[str] = Field(default_factory=list, description="区域别名。")
@@ -79,6 +100,8 @@ class SemanticRegion(TimestampedContract):
     polygon_points: List[Vector3] = Field(default_factory=list, description="区域轮廓点集合。")
     topo_node_ids: List[str] = Field(default_factory=list, description="关联拓扑节点集合。")
     inspection_poses: List[Pose] = Field(default_factory=list, description="建议巡检位姿列表。")
+    graph_relation_ids: List[str] = Field(default_factory=list, description="关联语义图关系集合。")
+    summary_node_ids: List[str] = Field(default_factory=list, description="关联层级摘要节点集合。")
     attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
 
     @field_validator("anchor_id")
@@ -96,6 +119,34 @@ class SceneSpaceReviewStatus(StrEnum):
     CORRECTED = "corrected"
     REJECTED = "rejected"
     STALE = "stale"
+
+
+class SemanticGraphRelationKind(StrEnum):
+    """长期语义图关系类型。"""
+
+    CONTAINS = "contains"
+    NEARBY = "nearby"
+    OBSERVED_FROM = "observed_from"
+    REACHABLE_FROM = "reachable_from"
+    SAME_INSTANCE = "same_instance"
+    BLOCKED_BY = "blocked_by"
+    FAILED_AT = "failed_at"
+
+
+class NavigationTrajectoryEventKind(StrEnum):
+    """导航历史轨迹事件类型。"""
+
+    VISITED_POSE = "visited_pose"
+    REACHABLE_POSE = "reachable_pose"
+    FAILED_POSE = "failed_pose"
+
+
+class SemanticSummaryKind(StrEnum):
+    """长期语义图层级摘要类型。"""
+
+    REGION = "region"
+    OBJECT_CLUSTER = "object_cluster"
+    TARGET_CATEGORY_CLUSTER = "target_category_cluster"
 
 
 class SceneSpaceBoundary(TimestampedContract):
@@ -201,6 +252,8 @@ class SceneSpace(TimestampedContract):
     linked_topology_node_ids: List[str] = Field(default_factory=list, description="关联拓扑节点集合。")
     linked_semantic_region_ids: List[str] = Field(default_factory=list, description="关联语义区域集合。")
     linked_observation_event_ids: List[str] = Field(default_factory=list, description="关联观察事件集合。")
+    graph_relation_ids: List[str] = Field(default_factory=list, description="关联语义图关系集合。")
+    summary_node_ids: List[str] = Field(default_factory=list, description="关联层级摘要节点集合。")
     attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
@@ -239,10 +292,20 @@ class SemanticInstance(TimestampedContract):
     display_name: Optional[str] = Field(default=None, description="展示名称。")
     pose: Pose = Field(description="实例位姿，统一使用 map frame。")
     map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
+    scene_space_id: Optional[str] = Field(default=None, description="关联场景空间。")
     instance_type: str = Field(default="object", description="实例类型。")
     movability: InstanceMovability = Field(default=InstanceMovability.MOVABLE, description="可移动性分类。")
+    dynamic_state: InstanceDynamicState = Field(
+        default=InstanceDynamicState.UNKNOWN,
+        description="短时观测窗口推断出的动态状态。",
+    )
+    observation_window: List[InstanceObservationWindowSample] = Field(
+        default_factory=list,
+        description="用于动态实体隔离的短时观测窗口。",
+    )
     lifecycle_state: InstanceLifecycleState = Field(
         default=InstanceLifecycleState.ACTIVE,
         description="生命周期状态。",
@@ -258,6 +321,8 @@ class SemanticInstance(TimestampedContract):
     visual_labels: List[str] = Field(default_factory=list, description="视觉目标标签。")
     vision_tags: List[str] = Field(default_factory=list, description="视觉语义标签。")
     inspection_poses: List[Pose] = Field(default_factory=list, description="建议巡检位姿列表。")
+    graph_relation_ids: List[str] = Field(default_factory=list, description="关联语义图关系集合。")
+    summary_node_ids: List[str] = Field(default_factory=list, description="关联层级摘要节点集合。")
     attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
@@ -287,14 +352,18 @@ class ObservationEvent(TimestampedContract):
     summary: str = Field(description="事件摘要。")
     camera_id: Optional[str] = Field(default=None, description="来源相机。")
     pose: Optional[Pose] = Field(default=None, description="事件发生位姿。")
+    frame_id: Optional[str] = Field(default=None, description="事件证据坐标系。")
     map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
+    scene_space_id: Optional[str] = Field(default=None, description="关联场景空间。")
     anchor_id: Optional[str] = Field(default=None, description="关联锚点。")
     source_observation_id: Optional[str] = Field(default=None, description="来源观察标识。")
     source_memory_id: Optional[str] = Field(default=None, description="来源记忆标识。")
     linked_instance_ids: List[str] = Field(default_factory=list, description="关联实例集合。")
     artifact_ids: List[str] = Field(default_factory=list, description="关联制品。")
+    graph_relation_ids: List[str] = Field(default_factory=list, description="关联语义图关系集合。")
     semantic_labels: List[str] = Field(default_factory=list, description="语义标签。")
     visual_labels: List[str] = Field(default_factory=list, description="视觉目标标签。")
     vision_tags: List[str] = Field(default_factory=list, description="视觉语义标签。")
@@ -312,6 +381,13 @@ class ObservationEvent(TimestampedContract):
             return value
         return validate_anchor_id(value)
 
+    @field_validator("frame_id")
+    @classmethod
+    def _validate_event_frame_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_frame_id(value)
+
 
 class NavigationCandidate(TimestampedContract):
     """面向导航层输出的空间候选。"""
@@ -324,8 +400,10 @@ class NavigationCandidate(TimestampedContract):
     inspection_pose: Pose = Field(description="建议用于导航的巡检位姿。")
     anchor_pose: Optional[Pose] = Field(default=None, description="锚点中心位姿。")
     map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
+    scene_space_id: Optional[str] = Field(default=None, description="关联场景空间。")
     distance_m: Optional[float] = Field(default=None, ge=0.0, description="相对当前位姿的距离。")
     score: float = Field(default=0.0, ge=0.0, le=1.0, description="综合候选分数。")
     verification_query: Optional[str] = Field(default=None, description="建议到点后复核的文本。")
@@ -349,6 +427,77 @@ class NavigationCandidate(TimestampedContract):
         if not value:
             return value
         return validate_observation_event_id(value)
+
+
+class NavigationTrajectoryEvent(TimestampedContract):
+    """平台侧 ego trajectory（自我轨迹）节点。"""
+
+    trajectory_event_id: str = Field(description="轨迹事件标识。")
+    event_kind: NavigationTrajectoryEventKind = Field(description="轨迹事件类型。")
+    pose: Optional[Pose] = Field(default=None, description="机器人历史位姿。")
+    target_pose: Optional[Pose] = Field(default=None, description="关联候选目标位姿。")
+    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
+    navigation_candidate_id: Optional[str] = Field(default=None, description="关联导航候选标识。")
+    source_record_kind: Optional[str] = Field(default=None, description="关联候选来源记录类型。")
+    source_record_id: Optional[str] = Field(default=None, description="关联候选来源记录标识。")
+    target_name: Optional[str] = Field(default=None, description="候选目标名称。")
+    success: Optional[bool] = Field(default=None, description="执行或复核是否成功。")
+    reason_code: Optional[str] = Field(default=None, description="成功或失败原因码。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class SemanticGraphRelation(TimestampedContract):
+    """长期语义图关系边。"""
+
+    relation_id: str = Field(description="关系标识。")
+    relation_kind: SemanticGraphRelationKind = Field(description="关系类型。")
+    source_node_kind: str = Field(description="源节点类型。")
+    source_node_id: str = Field(description="源节点标识。")
+    target_node_kind: str = Field(description="目标节点类型。")
+    target_node_id: str = Field(description="目标节点标识。")
+    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="关系置信度。")
+    evidence_observation_event_ids: List[str] = Field(default_factory=list, description="支撑观察事件集合。")
+    evidence_trajectory_event_ids: List[str] = Field(default_factory=list, description="支撑轨迹事件集合。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("evidence_observation_event_ids")
+    @classmethod
+    def _validate_relation_event_ids(cls, value: List[str]) -> List[str]:
+        return [validate_observation_event_id(item) for item in value]
+
+
+class SemanticSummaryNode(TimestampedContract):
+    """长期语义图层级摘要节点。"""
+
+    summary_id: str = Field(description="摘要节点标识。")
+    summary_kind: SemanticSummaryKind = Field(description="摘要类型。")
+    title: str = Field(description="摘要标题。")
+    summary: str = Field(description="结构化摘要文本。")
+    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
+    scene_space_id: Optional[str] = Field(default=None, description="关联场景空间。")
+    semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
+    label: Optional[str] = Field(default=None, description="聚合目标类别或区域标签。")
+    member_node_ids: List[str] = Field(default_factory=list, description="被摘要成员节点集合。")
+    relation_ids: List[str] = Field(default_factory=list, description="关联关系集合。")
+    evidence_observation_event_ids: List[str] = Field(default_factory=list, description="支撑观察事件集合。")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="摘要置信度。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("scene_space_id")
+    @classmethod
+    def _validate_summary_scene_space_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_scene_space_id(value)
+
+    @field_validator("evidence_observation_event_ids")
+    @classmethod
+    def _validate_summary_event_ids(cls, value: List[str]) -> List[str]:
+        return [validate_observation_event_id(item) for item in value]
 
 
 class VerificationResult(TimestampedContract):

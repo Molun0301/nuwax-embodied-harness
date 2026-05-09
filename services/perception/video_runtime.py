@@ -197,11 +197,16 @@ class PerceptionVideoRuntime:
         effective_reason = reason
         if not force_keyframe:
             if not decision.should_process:
+                self._perception_service.publish_current_video_frame(
+                    camera_id=self._camera_id,
+                    requested_by="perception_video_runtime",
+                )
                 with self._lock:
+                    self._last_error = None
                     self._last_status_metadata = {
                         **dict(self._last_status_metadata),
                         "camera_id": self._camera_id,
-                        "capture_mode": "keyframe",
+                        "capture_mode": "video_stream",
                         "last_skip_reason": decision.reason,
                         **dict(decision.metadata),
                     }
@@ -316,14 +321,27 @@ class PerceptionVideoRuntime:
         map_context = None
         localization_service = self._localization_service
         if localization_service is not None:
-            snapshot = localization_service.get_latest_snapshot()
+            snapshot = self._refresh_service_snapshot(localization_service)
             if snapshot is not None:
                 current_pose = snapshot.current_pose
 
         mapping_service = self._mapping_service
         if mapping_service is not None:
-            map_context = self._semantic_map_builder.build(mapping_service.get_latest_snapshot())
+            map_snapshot = self._refresh_service_snapshot(mapping_service)
+            map_context = self._semantic_map_builder.build(map_snapshot)
         return current_pose, map_context
+
+    def _refresh_service_snapshot(self, service):
+        refresher = getattr(service, "refresh", None)
+        if callable(refresher):
+            try:
+                return refresher()
+            except Exception:
+                PERCEPTION_RUNTIME_LOGGER.debug("刷新持续感知上下文失败。", exc_info=True)
+        getter = getattr(service, "get_latest_snapshot", None)
+        if callable(getter):
+            return getter()
+        return None
 
     def _remember_from_keyframe(
         self,

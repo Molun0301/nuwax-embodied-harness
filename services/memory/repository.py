@@ -8,7 +8,14 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 from contracts.base import utc_now
 from contracts.memory import MemoryPayloadFilter, SemanticMemoryEntry, TaggedLocation
-from contracts.spatial_memory import ObservationEvent, SceneSpace, SemanticInstance
+from contracts.spatial_memory import (
+    NavigationTrajectoryEvent,
+    ObservationEvent,
+    SceneSpace,
+    SemanticGraphRelation,
+    SemanticInstance,
+    SemanticSummaryNode,
+)
 
 
 TAGGED_LOCATION_VECTOR_NAMESPACE = "tagged_location"
@@ -117,6 +124,39 @@ class MemoryRepository:
                 """
             ).fetchall()
         return [SceneSpace.model_validate_json(str(row["payload_json"])) for row in rows]
+
+    def load_navigation_trajectory_events(self) -> List[NavigationTrajectoryEvent]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT payload_json
+                FROM navigation_trajectory_events
+                ORDER BY created_at ASC, trajectory_event_id ASC
+                """
+            ).fetchall()
+        return [NavigationTrajectoryEvent.model_validate_json(str(row["payload_json"])) for row in rows]
+
+    def load_semantic_graph_relations(self) -> List[SemanticGraphRelation]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT payload_json
+                FROM semantic_graph_relations
+                ORDER BY updated_at ASC, relation_id ASC
+                """
+            ).fetchall()
+        return [SemanticGraphRelation.model_validate_json(str(row["payload_json"])) for row in rows]
+
+    def load_semantic_summary_nodes(self) -> List[SemanticSummaryNode]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT payload_json
+                FROM semantic_summary_nodes
+                ORDER BY updated_at ASC, summary_id ASC
+                """
+            ).fetchall()
+        return [SemanticSummaryNode.model_validate_json(str(row["payload_json"])) for row in rows]
 
     def load_scene_space(self, scene_space_id: str) -> Optional[SceneSpace]:
         resolved_id = str(scene_space_id or "").strip()
@@ -355,14 +395,18 @@ class MemoryRepository:
                     instance_id,
                     label,
                     lifecycle_state,
+                    map_version_id,
+                    localization_session_id,
                     payload_json,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(instance_id) DO UPDATE SET
                     label = excluded.label,
                     lifecycle_state = excluded.lifecycle_state,
+                    map_version_id = excluded.map_version_id,
+                    localization_session_id = excluded.localization_session_id,
                     payload_json = excluded.payload_json,
                     updated_at = excluded.updated_at
                 """,
@@ -370,6 +414,8 @@ class MemoryRepository:
                     entry.instance_id,
                     entry.label,
                     entry.lifecycle_state.value,
+                    entry.map_version_id,
+                    entry.localization_session_id,
                     payload_json,
                     created_at,
                     updated_at,
@@ -386,19 +432,25 @@ class MemoryRepository:
                 INSERT INTO observation_events (
                     event_id,
                     anchor_id,
+                    map_version_id,
+                    localization_session_id,
                     payload_json,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_id) DO UPDATE SET
                     anchor_id = excluded.anchor_id,
+                    map_version_id = excluded.map_version_id,
+                    localization_session_id = excluded.localization_session_id,
                     payload_json = excluded.payload_json,
                     updated_at = excluded.updated_at
                 """,
                 (
                     entry.event_id,
                     entry.anchor_id,
+                    entry.map_version_id,
+                    entry.localization_session_id,
                     payload_json,
                     created_at,
                     created_at,
@@ -448,6 +500,135 @@ class MemoryRepository:
                     created_at,
                     updated_at,
                     semantic_updated_at,
+                ),
+            )
+            self._conn.commit()
+
+    def upsert_navigation_trajectory_event(self, entry: NavigationTrajectoryEvent) -> None:
+        payload_json = entry.model_dump_json()
+        created_at = entry.timestamp.isoformat()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO navigation_trajectory_events (
+                    trajectory_event_id,
+                    event_kind,
+                    map_version_id,
+                    localization_session_id,
+                    source_record_id,
+                    payload_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trajectory_event_id) DO UPDATE SET
+                    event_kind = excluded.event_kind,
+                    map_version_id = excluded.map_version_id,
+                    localization_session_id = excluded.localization_session_id,
+                    source_record_id = excluded.source_record_id,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    entry.trajectory_event_id,
+                    entry.event_kind.value,
+                    entry.map_version_id,
+                    entry.localization_session_id,
+                    entry.source_record_id,
+                    payload_json,
+                    created_at,
+                    created_at,
+                ),
+            )
+            self._conn.commit()
+
+    def upsert_semantic_graph_relation(self, entry: SemanticGraphRelation) -> None:
+        payload_json = entry.model_dump_json()
+        created_at = entry.timestamp.isoformat()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO semantic_graph_relations (
+                    relation_id,
+                    relation_kind,
+                    source_node_kind,
+                    source_node_id,
+                    target_node_kind,
+                    target_node_id,
+                    map_version_id,
+                    localization_session_id,
+                    payload_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(relation_id) DO UPDATE SET
+                    relation_kind = excluded.relation_kind,
+                    source_node_kind = excluded.source_node_kind,
+                    source_node_id = excluded.source_node_id,
+                    target_node_kind = excluded.target_node_kind,
+                    target_node_id = excluded.target_node_id,
+                    map_version_id = excluded.map_version_id,
+                    localization_session_id = excluded.localization_session_id,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    entry.relation_id,
+                    entry.relation_kind.value,
+                    entry.source_node_kind,
+                    entry.source_node_id,
+                    entry.target_node_kind,
+                    entry.target_node_id,
+                    entry.map_version_id,
+                    entry.localization_session_id,
+                    payload_json,
+                    created_at,
+                    created_at,
+                ),
+            )
+            self._conn.commit()
+
+    def upsert_semantic_summary_node(self, entry: SemanticSummaryNode) -> None:
+        payload_json = entry.model_dump_json()
+        created_at = entry.timestamp.isoformat()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO semantic_summary_nodes (
+                    summary_id,
+                    summary_kind,
+                    map_version_id,
+                    localization_session_id,
+                    scene_space_id,
+                    semantic_region_id,
+                    label,
+                    payload_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(summary_id) DO UPDATE SET
+                    summary_kind = excluded.summary_kind,
+                    map_version_id = excluded.map_version_id,
+                    localization_session_id = excluded.localization_session_id,
+                    scene_space_id = excluded.scene_space_id,
+                    semantic_region_id = excluded.semantic_region_id,
+                    label = excluded.label,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    entry.summary_id,
+                    entry.summary_kind.value,
+                    entry.map_version_id,
+                    entry.localization_session_id,
+                    entry.scene_space_id,
+                    entry.semantic_region_id,
+                    entry.label,
+                    payload_json,
+                    created_at,
+                    created_at,
                 ),
             )
             self._conn.commit()
@@ -532,6 +713,42 @@ class MemoryRepository:
             self._conn.commit()
         return len(normalized_ids)
 
+    def delete_navigation_trajectory_events(self, trajectory_event_ids: Sequence[str]) -> int:
+        normalized_ids = [str(item).strip() for item in trajectory_event_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM navigation_trajectory_events WHERE trajectory_event_id = ?",
+                [(trajectory_event_id,) for trajectory_event_id in normalized_ids],
+            )
+            self._conn.commit()
+        return len(normalized_ids)
+
+    def delete_semantic_graph_relations(self, relation_ids: Sequence[str]) -> int:
+        normalized_ids = [str(item).strip() for item in relation_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM semantic_graph_relations WHERE relation_id = ?",
+                [(relation_id,) for relation_id in normalized_ids],
+            )
+            self._conn.commit()
+        return len(normalized_ids)
+
+    def delete_semantic_summary_nodes(self, summary_ids: Sequence[str]) -> int:
+        normalized_ids = [str(item).strip() for item in summary_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM semantic_summary_nodes WHERE summary_id = ?",
+                [(summary_id,) for summary_id in normalized_ids],
+            )
+            self._conn.commit()
+        return len(normalized_ids)
+
     def clear_all(self) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM tagged_locations")
@@ -539,6 +756,9 @@ class MemoryRepository:
             self._conn.execute("DELETE FROM semantic_instances")
             self._conn.execute("DELETE FROM observation_events")
             self._conn.execute("DELETE FROM scene_spaces")
+            self._conn.execute("DELETE FROM navigation_trajectory_events")
+            self._conn.execute("DELETE FROM semantic_graph_relations")
+            self._conn.execute("DELETE FROM semantic_summary_nodes")
             self._conn.execute("DELETE FROM memory_vectors")
             self._conn.commit()
 
@@ -717,6 +937,12 @@ class MemoryRepository:
                 return False
         return True
 
+    def _ensure_columns(self, table_name: str, columns: Dict[str, str]) -> None:
+        existing = {str(row["name"]) for row in self._conn.execute("PRAGMA table_info(%s)" % table_name).fetchall()}
+        for column_name, column_type in columns.items():
+            if column_name not in existing:
+                self._conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table_name, column_name, column_type))
+
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.execute(
@@ -794,6 +1020,13 @@ class MemoryRepository:
                 )
                 """
             )
+            self._ensure_columns(
+                "scene_spaces",
+                {
+                    "map_version_id": "TEXT",
+                    "localization_session_id": "TEXT",
+                },
+            )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_scene_spaces_map_version_id ON scene_spaces(map_version_id)"
             )
@@ -818,11 +1051,20 @@ class MemoryRepository:
                     instance_id TEXT PRIMARY KEY,
                     label TEXT NOT NULL,
                     lifecycle_state TEXT NOT NULL,
+                    map_version_id TEXT,
+                    localization_session_id TEXT,
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
+            )
+            self._ensure_columns(
+                "semantic_instances",
+                {
+                    "map_version_id": "TEXT",
+                    "localization_session_id": "TEXT",
+                },
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_instances_label ON semantic_instances(label)"
@@ -831,10 +1073,51 @@ class MemoryRepository:
                 "CREATE INDEX IF NOT EXISTS idx_semantic_instances_lifecycle_state ON semantic_instances(lifecycle_state)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_instances_map_version_id ON semantic_instances(map_version_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_instances_localization_session_id ON semantic_instances(localization_session_id)"
+            )
+            self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS observation_events (
                     event_id TEXT PRIMARY KEY,
                     anchor_id TEXT,
+                    map_version_id TEXT,
+                    localization_session_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._ensure_columns(
+                "observation_events",
+                {
+                    "map_version_id": "TEXT",
+                    "localization_session_id": "TEXT",
+                },
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_observation_events_anchor_id ON observation_events(anchor_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_observation_events_created_at ON observation_events(created_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_observation_events_map_version_id ON observation_events(map_version_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_observation_events_localization_session_id ON observation_events(localization_session_id)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS navigation_trajectory_events (
+                    trajectory_event_id TEXT PRIMARY KEY,
+                    event_kind TEXT NOT NULL,
+                    map_version_id TEXT,
+                    localization_session_id TEXT,
+                    source_record_id TEXT,
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -842,10 +1125,79 @@ class MemoryRepository:
                 """
             )
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_observation_events_anchor_id ON observation_events(anchor_id)"
+                "CREATE INDEX IF NOT EXISTS idx_navigation_trajectory_events_kind ON navigation_trajectory_events(event_kind)"
             )
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_observation_events_created_at ON observation_events(created_at)"
+                "CREATE INDEX IF NOT EXISTS idx_navigation_trajectory_events_map_version_id ON navigation_trajectory_events(map_version_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_navigation_trajectory_events_localization_session_id ON navigation_trajectory_events(localization_session_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_navigation_trajectory_events_source_record_id ON navigation_trajectory_events(source_record_id)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS semantic_graph_relations (
+                    relation_id TEXT PRIMARY KEY,
+                    relation_kind TEXT NOT NULL,
+                    source_node_kind TEXT NOT NULL,
+                    source_node_id TEXT NOT NULL,
+                    target_node_kind TEXT NOT NULL,
+                    target_node_id TEXT NOT NULL,
+                    map_version_id TEXT,
+                    localization_session_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_kind ON semantic_graph_relations(relation_kind)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_source ON semantic_graph_relations(source_node_kind, source_node_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_target ON semantic_graph_relations(target_node_kind, target_node_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_map_version_id ON semantic_graph_relations(map_version_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_localization_session_id ON semantic_graph_relations(localization_session_id)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS semantic_summary_nodes (
+                    summary_id TEXT PRIMARY KEY,
+                    summary_kind TEXT NOT NULL,
+                    map_version_id TEXT,
+                    localization_session_id TEXT,
+                    scene_space_id TEXT,
+                    semantic_region_id TEXT,
+                    label TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_kind ON semantic_summary_nodes(summary_kind)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_map_version_id ON semantic_summary_nodes(map_version_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_localization_session_id ON semantic_summary_nodes(localization_session_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_scene_space_id ON semantic_summary_nodes(scene_space_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_label ON semantic_summary_nodes(label)"
             )
             self._conn.commit()
 

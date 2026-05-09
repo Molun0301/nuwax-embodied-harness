@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections import deque
 from time import perf_counter
 
@@ -112,7 +113,10 @@ class PerceptionService:
             backend_name=detector_backend_name,
         )
         stage_duration_ms["detector"] = self._elapsed_ms(stage_started_at)
-        stage_status["detector"] = "completed"
+        stage_status["detector"] = self._provider_stage_status(
+            detector_spec.backend_kind,
+            detection_bundle.metadata,
+        )
 
         stage_started_at = perf_counter()
         segmentation_bundle = self._segmentation_backend.segment(
@@ -139,7 +143,11 @@ class PerceptionService:
             camera_info=camera_info,
         )
         stage_duration_ms["geometry"] = self._elapsed_ms(stage_started_at)
-        stage_status["geometry"] = "completed"
+        stage_status["geometry"] = str(
+            detection_bundle.metadata.get("geometry_stage_status")
+            or detection_bundle.metadata.get("geometry_status")
+            or "completed"
+        )
 
         stage_started_at = perf_counter()
         tracks = self._tracker_backend.update(
@@ -250,7 +258,6 @@ class PerceptionService:
             source=source_name or detector_spec.name,
             metadata={"kind": "latest_perception", "pipeline_name": self._pipeline_name},
         )
-
         if self._event_bus is not None:
             self._event_bus.publish(
                 self._event_bus.build_event(
@@ -300,6 +307,10 @@ class PerceptionService:
         image_frame = image_provider.capture_image(camera_id)
         resolved_camera_id = image_frame.camera_id
         camera_info = image_provider.get_camera_info(resolved_camera_id)
+        self._publish_video_frame(
+            image_frame,
+            source_name=image_provider.provider_name,
+        )
         image_artifact = None
         if store_artifact:
             image_artifact = self._artifact_service.save_image_frame(
@@ -335,6 +346,19 @@ class PerceptionService:
         if context is None:
             raise GatewayError("当前还没有可用的感知缓存。")
         return context
+
+    def publish_current_video_frame(
+        self,
+        *,
+        camera_id: Optional[str] = None,
+        requested_by: Optional[str] = None,
+    ) -> None:
+        image_provider = self._get_image_provider()
+        image_frame = image_provider.capture_image(camera_id)
+        self._publish_video_frame(
+            image_frame,
+            source_name=image_provider.provider_name,
+        )
 
     def get_latest_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
         """返回最新感知结果。"""
@@ -504,13 +528,86 @@ class PerceptionService:
                 if track.bbox == detection.bbox:
                     matched_track_id = track.track_id
                     break
+            track_metadata = {}
+            if matched_track_id:
+                for track in tracks:
+                    if track.track_id == matched_track_id:
+                        track_metadata = dict(track.attributes or {})
+                        break
+            attributes = dict(detection.attributes or {})
+            resolved_track_id = matched_track_id or detection.track_id
+            if resolved_track_id:
+                attributes["track_id"] = resolved_track_id
+            for key in ("last_seen", "velocity_hint", "short_trajectory", "track_age_frames", "track_miss_frames", "tracker"):
+                if key in track_metadata:
+                    attributes[key] = track_metadata[key]
             assigned.append(
                 detection.model_copy(
-                    update={"track_id": matched_track_id or detection.track_id},
+                    update={"track_id": resolved_track_id, "attributes": attributes},
                     deep=True,
                 )
             )
         return tuple(assigned)
+
+    def _publish_video_frame(self, image_frame, *, source_name: str) -> None:
+        if self._stream_bus is None:
+            return
+        metadata = dict(image_frame.metadata or {})
+        payload_bytes = len(image_frame.data or b"")
+        data_uri = self._build_video_data_uri(image_frame)
+        payload = {
+            "available": bool(data_uri or image_frame.uri),
+            "camera_id": image_frame.camera_id,
+            "frame_id": image_frame.frame_id,
+            "width_px": image_frame.width_px,
+            "height_px": image_frame.height_px,
+            "encoding": image_frame.encoding.value,
+            "payload_bytes": payload_bytes,
+            "metadata": dict(metadata),
+        }
+        if data_uri:
+            payload["data_uri"] = data_uri
+        elif image_frame.uri:
+            payload["uri"] = image_frame.uri
+        elif image_frame.artifact_id:
+            payload["artifact_id"] = image_frame.artifact_id
+        status = "available" if payload.get("data_uri") or payload.get("uri") else "unsupported"
+        if status != "available":
+            payload["message"] = f"浏览器暂不支持直接显示 {image_frame.encoding.value} 图像帧。"
+        self._stream_bus.publish(
+            "video.frame",
+            source=source_name or "image_provider",
+            payload=payload,
+            frame_id=image_frame.frame_id,
+            sequence=metadata.get("sequence") if isinstance(metadata.get("sequence"), int) else None,
+            status=status,
+            metadata={
+                "camera_id": image_frame.camera_id,
+                "encoding": image_frame.encoding.value,
+                "payload_bytes": payload_bytes,
+                "source_name": source_name or "image_provider",
+                **metadata,
+            },
+        )
+
+    def _build_video_data_uri(self, image_frame) -> Optional[str]:
+        if not image_frame.data:
+            return None
+        mime_type = self._video_mime_type(image_frame.encoding)
+        if mime_type is None:
+            return None
+        return "data:%s;base64,%s" % (
+            mime_type,
+            base64.b64encode(image_frame.data).decode("ascii"),
+        )
+
+    def _video_mime_type(self, encoding) -> Optional[str]:
+        value = str(getattr(encoding, "value", encoding)).lower()
+        if value == "jpeg":
+            return "image/jpeg"
+        if value == "png":
+            return "image/png"
+        return None
 
     def _get_image_provider(self) -> ImageProvider:
         providers = getattr(self._provider_owner, "providers", None)
@@ -544,13 +641,34 @@ class PerceptionService:
         camera_info,
     ):
         if camera_info is None or not detection_bundle.detections_2d:
-            return detection_bundle
+            return detection_bundle.__class__(
+                detections_2d=detection_bundle.detections_2d,
+                detections_3d=detection_bundle.detections_3d,
+                metadata={
+                    **dict(detection_bundle.metadata),
+                    "geometry_stage_status": "completed",
+                    "geometry_degraded_reason": "camera_info_missing" if detection_bundle.detections_2d else "no_detections",
+                },
+            )
+
         point_cloud_frame = self._latest_stream_payload("pointcloud.frame")
         if point_cloud_frame is None or not getattr(point_cloud_frame, "points", None):
-            return detection_bundle
+            point_cloud_frame = self._get_latest_point_cloud_optional()
 
         frame_tree = self._latest_stream_payload("localization.frame_tree")
         current_pose = self._latest_stream_payload("localization.pose")
+        if frame_tree is None or current_pose is None:
+            localization_provider = self._get_localization_provider_optional()
+            if localization_provider is not None:
+                if frame_tree is None:
+                    frame_tree_getter = getattr(localization_provider, "get_frame_tree", None)
+                    if callable(frame_tree_getter):
+                        frame_tree = frame_tree_getter()
+                if current_pose is None:
+                    pose_getter = getattr(localization_provider, "get_current_pose", None)
+                    if callable(pose_getter):
+                        current_pose = pose_getter()
+
         detections_2d, geometry_metadata = self._geometry_augmentor.augment_detections(
             detection_bundle.detections_2d,
             image_frame=image_frame,
@@ -559,16 +677,44 @@ class PerceptionService:
             frame_tree=frame_tree,
             current_pose=current_pose,
         )
+        if point_cloud_frame is None or not getattr(point_cloud_frame, "points", None):
+            geometry_metadata = {
+                **dict(geometry_metadata),
+                "geometry_projection_status": "pointcloud_unavailable",
+                "geometry_degraded_reason": "pointcloud_unavailable",
+            }
         if detections_2d == detection_bundle.detections_2d and not geometry_metadata:
-            return detection_bundle
+            return detection_bundle.__class__(
+                detections_2d=detection_bundle.detections_2d,
+                detections_3d=detection_bundle.detections_3d,
+                metadata={
+                    **dict(detection_bundle.metadata),
+                    "geometry_stage_status": "completed",
+                },
+            )
+        support_count = int(geometry_metadata.get("geometry_support_point_total") or 0)
+        degraded_reason = str(geometry_metadata.get("geometry_degraded_reason") or "")
+        if support_count <= 0 and point_cloud_frame is not None and getattr(point_cloud_frame, "points", None):
+            degraded_reason = degraded_reason or "pointcloud_projection_failed"
         return detection_bundle.__class__(
             detections_2d=detections_2d,
             detections_3d=detection_bundle.detections_3d,
             metadata={
                 **dict(detection_bundle.metadata),
                 **geometry_metadata,
+                "geometry_stage_status": "completed",
+                "geometry_degraded_reason": degraded_reason,
             },
         )
+
+    def _get_latest_point_cloud_optional(self):
+        provider = self._get_point_cloud_provider_optional()
+        if provider is None:
+            return None
+        try:
+            return provider.get_latest_point_cloud()
+        except Exception:
+            return None
 
     def _latest_stream_payload(self, topic: str):
         if self._stream_bus is None:

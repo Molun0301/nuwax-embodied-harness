@@ -54,13 +54,15 @@ _STALE_THRESHOLDS_SEC = {
 def _stream_migration_response(*topics: str) -> JSONResponse:
     topic_list = [topic for topic in topics if topic]
     query = ",".join(topic_list)
-    stream_path = "/streams/ws" + (f"?topics={query}" if query else "")
+    ws_stream_path = "/streams/ws" + (f"?topics={query}" if query else "")
+    sse_stream_path = "/streams/sse" + (f"?topics={query}" if query else "")
     return JSONResponse(
         status_code=410,
         content={
             "code": "stream_required",
             "message": "实时数据调试 HTTP 快照入口已下线，请订阅实时流。",
-            "stream": stream_path,
+            "stream": ws_stream_path,
+            "streams": {"websocket": ws_stream_path, "sse": sse_stream_path},
             "topics": topic_list,
         },
     )
@@ -761,7 +763,11 @@ def _render_debug_page(access_token: str) -> str:
         videoFrames: 0,
         latestOverview: null,
         latestHealth: null,
-        latestTasks: null,
+        latestTasks: { active_tasks: [], history_tasks: [] },
+        taskActiveById: new Map(),
+        taskHistoryById: new Map(),
+        lastRobotStateRevision: null,
+        lastRobotStateHash: null,
         logFilter: "",
         logSearch: "",
         mapResizeFrame: null,
@@ -947,6 +953,7 @@ def _render_debug_page(access_token: str) -> str:
       function updateOverview(envelope) {
         const data = envelope && envelope.data ? envelope.data : {};
         state.latestOverview = data;
+        setText(els.connectionText, "online");
         setText(els.networkLatency, fmt(envelope.__frontendLatencyMs, " ms"));
         for (const name of overviewNames) {
           const summary = data[name] || {};
@@ -1040,6 +1047,42 @@ def _render_debug_page(access_token: str) -> str:
         setPill(els.estopStatus, estopped ? "error" : "available", estopped ? "急停状态：触发" : "急停状态：清除");
         els.estopStatus.classList.add("estop");
       }
+      function normalizeTaskState(value) {
+        const raw = value && typeof value === "object" && "value" in value ? value.value : value;
+        const stateValue = String(raw || "missing").toLowerCase();
+        if (stateValue.startsWith("task.")) return stateValue.slice(5);
+        return stateValue;
+      }
+      function isTerminalTaskState(value) {
+        return ["succeeded", "failed", "cancelled", "timeout"].includes(normalizeTaskState(value));
+      }
+      function taskUpdatedMs(task) {
+        const value = task && (task.updated_at || task.completed_at || task.started_at || task.timestamp || task.created_at);
+        const parsed = value ? Date.parse(value) : 0;
+        return Number.isFinite(parsed) ? parsed : 0;
+      }
+      function taskListFromMap(map, limit) {
+        const items = Array.from(map.values()).sort((a, b) => taskUpdatedMs(b) - taskUpdatedMs(a));
+        return typeof limit === "number" ? items.slice(0, limit) : items;
+      }
+      function refreshTaskStore() {
+        const active = taskListFromMap(state.taskActiveById);
+        const history = taskListFromMap(state.taskHistoryById, 20);
+        state.latestTasks = { active_tasks: active, history_tasks: history };
+        updateTasks(state.latestTasks);
+        updateHealth({ ...(state.latestHealth || {}), active_task_count: active.length });
+      }
+      function replaceTaskStore(payload) {
+        state.taskActiveById.clear();
+        state.taskHistoryById.clear();
+        for (const task of Array.isArray(payload && payload.active_tasks) ? payload.active_tasks : []) {
+          if (task && task.task_id) state.taskActiveById.set(String(task.task_id), task);
+        }
+        for (const task of Array.isArray(payload && payload.history_tasks) ? payload.history_tasks : []) {
+          if (task && task.task_id) state.taskHistoryById.set(String(task.task_id), task);
+        }
+        refreshTaskStore();
+      }
       function updateTasks(payload) {
         const active = Array.isArray(payload && payload.active_tasks) ? payload.active_tasks : [];
         const history = Array.isArray(payload && payload.history_tasks) ? payload.history_tasks : [];
@@ -1066,11 +1109,20 @@ def _render_debug_page(access_token: str) -> str:
           meta.textContent = `${safeText(task.capability_name)} · progress ${fmt(task.progress, "")} · ${safeText(task.stage || task.state)}`;
           left.append(title, meta);
           const pill = document.createElement("span");
-          const taskState = String(task.state || task.status || "missing").toLowerCase();
-          pill.className = `pill ${taskState === "failed" || taskState === "timeout" ? "error" : taskState === "running" ? "available" : "stale"}`;
+          const taskState = normalizeTaskState(task.state || task.status);
+          pill.className = `pill ${taskState === "failed" || taskState === "timeout" ? "error" : taskState === "running" || taskState === "accepted" ? "available" : taskState === "succeeded" ? "available" : "stale"}`;
           pill.textContent = taskState;
           row.append(left, pill);
           els.taskSummary.appendChild(row);
+        }
+      }
+      async function loadInitialTasks() {
+        try {
+          const response = await fetch(withAccessToken("/api/tasks?history_limit=20"));
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          replaceTaskStore(await response.json());
+        } catch (err) {
+          showPanelError("logs", `任务列表初始化失败：${err.message || err}`);
         }
       }
       function showPanelError(kind, message) {
@@ -1331,8 +1383,8 @@ def _render_debug_page(access_token: str) -> str:
       function updateMap(envelope) {
         const status = statusOf(envelope);
         const data = envelope.data || {};
-        const grid = data.occupancy_grid;
-        const diagnostics = data.diagnostics || {};
+        const grid = data.occupancy_grid || (data.map_snapshot && data.map_snapshot.occupancy_grid) || null;
+        const diagnostics = data.diagnostics || data.metadata || (data.map_snapshot && data.map_snapshot.metadata) || {};
         const streamBridge = diagnostics.stream_bridge || {};
         state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp };
         setPill(els.mapStatus, status);
@@ -1612,8 +1664,8 @@ def _render_debug_page(access_token: str) -> str:
           ok: frame.status !== "error" && frame.status !== "missing",
           type: frame.topic,
           source: frame.source,
-          frame_id: frame.frame_id,
-          source_timestamp: frame.timestamp,
+          frame_id: frame.frame_id || (frame.payload && frame.payload.frame_id),
+          source_timestamp: frame.timestamp || (frame.payload && frame.payload.timestamp),
           gateway_timestamp: frame.timestamp,
           sequence: frame.sequence ?? frame.cursor,
           revision: frame.revision,
@@ -1675,7 +1727,7 @@ def _render_debug_page(access_token: str) -> str:
         els.lastReceive.textContent = nowText();
         setText(els.connectionText, "streaming");
         if (frame.topic === "robot.state") {
-          updateRobotStateFrame(frame);
+          if (!updateRobotStateFrame(frame)) return;
         } else if (frame.topic === "map.frame") {
           updateMap(envelopeFromFrame(frame));
         } else if (frame.topic === "localization.pose") {
@@ -1704,7 +1756,15 @@ def _render_debug_page(access_token: str) -> str:
         }
         updateStreamOverview(frame);
       }
+      function robotStateChangeKey(frame) {
+        const metadata = frame.metadata || {};
+        return metadata.content_hash || metadata.signature || frame.revision || null;
+      }
       function updateRobotStateFrame(frame) {
+        const changeKey = robotStateChangeKey(frame);
+        if (changeKey && changeKey === state.lastRobotStateHash) return false;
+        state.lastRobotStateHash = changeKey;
+        state.lastRobotStateRevision = frame.revision || (frame.metadata && frame.metadata.revision) || state.lastRobotStateRevision;
         const payload = frame.payload || {};
         updateHealth({
           runtime_started: true,
@@ -1715,6 +1775,7 @@ def _render_debug_page(access_token: str) -> str:
           active_task_count: state.latestTasks && Array.isArray(state.latestTasks.active_tasks) ? state.latestTasks.active_tasks.length : 0,
           latest_event_cursor: frame.cursor || 0,
         });
+        return true;
       }
       function updateFrontierFrame(frame) {
         const payload = frame.payload || {};
@@ -1754,25 +1815,29 @@ def _render_debug_page(access_token: str) -> str:
       function updateTaskFrame(frame) {
         const event = frame.payload || {};
         const payload = event.payload || {};
+        const requestContext = payload.request_context || {};
+        const taskId = event.task_id || payload.task_id || requestContext.task_id;
+        if (!taskId) return;
+        const existing = state.taskActiveById.get(String(taskId)) || state.taskHistoryById.get(String(taskId)) || {};
         const task = {
-          task_id: event.task_id || payload.task_id,
-          capability_name: payload.capability_name || (payload.request_context && payload.request_context.capability_name),
-          state: payload.state || event.state || event.event_type,
-          stage: event.message || event.event_type,
-          progress: payload.progress,
+          ...existing,
+          task_id: taskId,
+          capability_name: payload.capability_name || requestContext.capability_name || existing.capability_name,
+          state: payload.state || event.state || existing.state || event.event_type,
+          stage: payload.stage || event.message || existing.stage || event.event_type,
+          message: payload.message || event.message || existing.message,
+          progress: payload.progress !== undefined ? payload.progress : existing.progress,
+          updated_at: event.timestamp || payload.updated_at || frame.timestamp || existing.updated_at,
+          completed_at: payload.completed_at || existing.completed_at,
         };
-        updateTasks({ active_tasks: task.task_id ? [task] : [], history_tasks: [] });
-      }
-      function healthOverviewFromRobotFrame(frame) {
-        return {
-          status: frame.status || "available",
-          source_timestamp: frame.timestamp,
-          latency_ms: 0,
-          stale: frame.status === "stale",
-          frame_id: frame.frame_id,
-          revision: frame.revision,
-          metadata: { source: "gateway_runtime", derived_from: frame.source || "robot.state", runtime_started: true },
-        };
+        if (isTerminalTaskState(task.state)) {
+          state.taskActiveById.delete(String(taskId));
+          state.taskHistoryById.set(String(taskId), task);
+        } else {
+          state.taskHistoryById.delete(String(taskId));
+          state.taskActiveById.set(String(taskId), task);
+        }
+        refreshTaskStore();
       }
       function updateStreamOverview(frame) {
         const keyByTopic = {
@@ -1794,7 +1859,6 @@ def _render_debug_page(access_token: str) -> str:
           ? { source: frame.source, source_kind: payload.source_kind || (frame.metadata && frame.metadata.source_kind), point_count: payload.point_count ?? (frame.metadata && frame.metadata.point_count), pcd_path: payload.pcd_path || (frame.metadata && frame.metadata.pcd_path) }
           : { source: frame.source };
         const overview = { ...(state.latestOverview || {}) };
-        if (frame.topic === "robot.state") overview.health = healthOverviewFromRobotFrame(frame);
         overview[key] = {
           status: frame.status || "available",
           source_timestamp: frame.timestamp,
@@ -1810,6 +1874,7 @@ def _render_debug_page(access_token: str) -> str:
       buildOverview();
       renderLogs();
       updateClock();
+      loadInitialTasks();
       syncMapCanvasSize();
       if (window.ResizeObserver) {
         new ResizeObserver(redrawMapAfterResize).observe(els.mapCanvas);

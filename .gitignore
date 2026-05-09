@@ -1,9 +1,11 @@
+.env
 drivers/go2/data_plane.env
 go2_proxy.log
 nuwax_robot_bridge.log
 __pycache__/
 *.pyc
 .omc/
+.omx/
 .claude/
 docs/内部开发文档/
 docs/开发文档/

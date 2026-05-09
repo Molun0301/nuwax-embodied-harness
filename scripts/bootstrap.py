@@ -59,8 +59,8 @@ DEFAULT_NUWACLAW_PROXY_SCRIPT = (
 DEFAULT_MEMORY_ONLINE_MODEL = "tongyi-embedding-vision-flash-2026-03-06"
 DEFAULT_MEMORY_LOCAL_TEXT_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "BAAI__bge-m3")
 DEFAULT_MEMORY_LOCAL_IMAGE_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "openai__clip-vit-base-patch32")
-DEFAULT_YOLO_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "yolo26n.pt")
-DEFAULT_YOLO_ENGINE = str(PROJECT_ROOT / "runtime_data" / "models" / "yolo26n.engine")
+DEFAULT_YOLO_WORLD_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-world.pt")
+DEFAULT_YOLO_WORLD_ENGINE = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-world-int8.engine")
 GEOMETRY_WS_DIR = PROJECT_ROOT / "services" / "geometry" / "ros2_ws"
 GO2SLAM_WS_DIR = GEOMETRY_WS_DIR / "src" / "go2slam"
 GEOMETRY_APT_BASE_PACKAGES = (
@@ -691,50 +691,65 @@ class BootstrapPlanner:
                 }
             )
 
+        yolo_world_runtime = "tensorrt" if self.export_yolo_engine else "pytorch"
+        yolo_world_int8 = _bool_text(self.export_yolo_engine)
         if self.perception_mode == "local":
             values.update(
                 {
+                    "NUWAX_PERCEPTION_DEFAULT_DETECTOR_BACKEND": "yolo_world",
                     "NUWAX_PERCEPTION_DEFAULT_SCENE_BACKEND": "simple_scene",
-                    "NUWAX_PERCEPTION_YOLO_ENABLED": "true",
+                    "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "true",
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "false",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_AUTO_START": "true",
-                    "NUWAX_PERCEPTION_YOLO_MODEL": DEFAULT_YOLO_MODEL,
-                    "NUWAX_PERCEPTION_YOLO_ENGINE_PATH": DEFAULT_YOLO_ENGINE,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": DEFAULT_YOLO_WORLD_MODEL,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH": DEFAULT_YOLO_WORLD_ENGINE,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME": yolo_world_runtime,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_INT8": yolo_world_int8,
+                    "NUWAX_PERCEPTION_TRACKER_BACKEND": "bytetrack",
                 }
             )
         elif self.perception_mode == "hybrid":
             values.update(
                 {
+                    "NUWAX_PERCEPTION_DEFAULT_DETECTOR_BACKEND": "yolo_world",
                     "NUWAX_PERCEPTION_DEFAULT_SCENE_BACKEND": "hybrid_scene",
-                    "NUWAX_PERCEPTION_YOLO_ENABLED": "true",
+                    "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "true",
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_AUTO_START": "true",
-                    "NUWAX_PERCEPTION_YOLO_MODEL": DEFAULT_YOLO_MODEL,
-                    "NUWAX_PERCEPTION_YOLO_ENGINE_PATH": DEFAULT_YOLO_ENGINE,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": DEFAULT_YOLO_WORLD_MODEL,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH": DEFAULT_YOLO_WORLD_ENGINE,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME": yolo_world_runtime,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_INT8": yolo_world_int8,
+                    "NUWAX_PERCEPTION_TRACKER_BACKEND": "bytetrack",
                 }
             )
         elif self.perception_mode == "cloud-scene":
             values.update(
                 {
+                    "NUWAX_PERCEPTION_DEFAULT_DETECTOR_BACKEND": "yolo_world",
                     "NUWAX_PERCEPTION_DEFAULT_SCENE_BACKEND": "openai_scene",
-                    "NUWAX_PERCEPTION_YOLO_ENABLED": "true",
+                    "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "true",
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_AUTO_START": "true",
-                    "NUWAX_PERCEPTION_YOLO_MODEL": DEFAULT_YOLO_MODEL,
-                    "NUWAX_PERCEPTION_YOLO_ENGINE_PATH": DEFAULT_YOLO_ENGINE,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": DEFAULT_YOLO_WORLD_MODEL,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH": DEFAULT_YOLO_WORLD_ENGINE,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME": yolo_world_runtime,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_INT8": yolo_world_int8,
+                    "NUWAX_PERCEPTION_TRACKER_BACKEND": "bytetrack",
                 }
             )
         else:
             values.update(
                 {
+                    "NUWAX_PERCEPTION_DEFAULT_DETECTOR_BACKEND": "metadata_detector",
                     "NUWAX_PERCEPTION_DEFAULT_SCENE_BACKEND": "simple_scene",
-                    "NUWAX_PERCEPTION_YOLO_ENABLED": "false",
+                    "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "false",
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "false",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "false",
-                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "false",
+                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "true",
                 }
             )
 
@@ -986,16 +1001,27 @@ def build_workspaces(planner: BootstrapPlanner) -> None:
 
 def prepare_assets(planner: BootstrapPlanner) -> None:
     if planner.prepare_yolo:
-        _run((planner.python_bin, "scripts/prepare_yolo_weights.py", "--output", DEFAULT_YOLO_MODEL), cwd=PROJECT_ROOT)
+        _run(
+            (
+                planner.python_bin,
+                "scripts/prepare_yolo_world_tensorrt.py",
+                "--weights-output",
+                DEFAULT_YOLO_WORLD_MODEL,
+                "--engine-output",
+                DEFAULT_YOLO_WORLD_ENGINE,
+                "--download-only",
+            ),
+            cwd=PROJECT_ROOT,
+        )
     if planner.export_yolo_engine:
         _run(
             (
                 planner.python_bin,
-                "scripts/export_yolo_tensorrt_engine.py",
-                "--weights",
-                DEFAULT_YOLO_MODEL,
-                "--output",
-                DEFAULT_YOLO_ENGINE,
+                "scripts/prepare_yolo_world_tensorrt.py",
+                "--weights-output",
+                DEFAULT_YOLO_WORLD_MODEL,
+                "--engine-output",
+                DEFAULT_YOLO_WORLD_ENGINE,
             ),
             cwd=PROJECT_ROOT,
         )
@@ -1272,7 +1298,7 @@ def run_wizard(args: argparse.Namespace) -> int:
     args.build_geometry = prompt_bool("构建 geometry ROS2 工作空间", bool(args.geometry))
     args.build_go2slam = prompt_bool("单独构建 Go2SLAM 工作区", args.robot == "go2" and bool(args.build_geometry))
     args.install_geometry_deps = prompt_bool("安装 RTAB-Map/Nav2 系统依赖", bool(args.geometry))
-    args.prepare_yolo = prompt_bool("准备 YOLO 权重", args.perception_mode != "disabled")
+    args.prepare_yolo = prompt_bool("准备 YOLO-World 权重", args.perception_mode != "disabled")
     args.prepare_memory = prompt_bool("准备本地 memory 模型", args.memory_mode == "local")
     args.mcp_mode = prompt_choice("选择 MCP 注入模式", ("auto", "config-only", "skip"), "auto")
     args.install_nuwaclaw_docker = prompt_bool("安装 NuwaxClaw Docker 客户端", False)
@@ -1349,8 +1375,8 @@ def build_parser() -> argparse.ArgumentParser:
         add_boolean_flag(subparser, "install_nuwaclaw_docker", "安装 NuwaxClaw Docker 客户端")
         add_boolean_flag(subparser, "install_python", "安装 Python 依赖")
         add_boolean_flag(subparser, "prepare_memory", "准备本地记忆模型")
-        add_boolean_flag(subparser, "prepare_yolo", "准备 YOLO 权重")
-        add_boolean_flag(subparser, "export_yolo_engine", "导出 TensorRT 引擎")
+        add_boolean_flag(subparser, "prepare_yolo", "准备 YOLO-World 权重")
+        add_boolean_flag(subparser, "export_yolo_engine", "导出 YOLO-World TensorRT 引擎")
         add_boolean_flag(subparser, "build_geometry", "构建 geometry ROS2 工作空间")
         add_boolean_flag(subparser, "build_go2slam", "Go2 默认额外构建 services/geometry/ros2_ws/src/go2slam")
         add_boolean_flag(subparser, "install_geometry_deps", "安装 RTAB-Map/Nav2 系统依赖")

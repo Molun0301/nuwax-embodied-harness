@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, is_dataclass
+import hashlib
+import json
 
 from contracts.runtime_views import DiagnosticItem, DiagnosticLevel, DiagnosticSnapshot, RobotStatusSnapshot
 from contracts.events import RuntimeEventCategory
@@ -32,6 +34,8 @@ class RobotStateService:
         self._history: Deque[RobotStatusSnapshot] = deque(maxlen=max(1, history_limit))
         self._diagnostic_history: Deque[DiagnosticSnapshot] = deque(maxlen=max(1, diagnostic_history_limit))
         self._latest_snapshot: Optional[RobotStatusSnapshot] = None
+        self._last_web_state_signature: Optional[str] = None
+        self._web_state_revision = 0
 
     def refresh(self) -> RobotStatusSnapshot:
         """采样并写入最新机器人状态。"""
@@ -105,6 +109,22 @@ class RobotStateService:
             source="robot_state_service",
         )
 
+        web_state_signature = self._build_web_state_signature(snapshot)
+        if web_state_signature == self._last_web_state_signature:
+            return snapshot
+        self._last_web_state_signature = web_state_signature
+        self._web_state_revision += 1
+        content_hash = hashlib.sha256(web_state_signature.encode("utf-8")).hexdigest()
+        web_state_metadata = {
+            "robot_name": self._robot.manifest.robot_name,
+            "mode": getattr(getattr(robot_state, "mode", None), "value", None),
+            "diagnostic_count": len(diagnostics),
+            "revision": self._web_state_revision,
+            "content_hash": content_hash,
+            "signature": content_hash,
+            "change_policy": "web_semantic_fields",
+        }
+
         if self._event_bus is not None:
             self._event_bus.publish(
                 self._event_bus.build_event(
@@ -116,6 +136,8 @@ class RobotStateService:
                     payload={
                         "mode": robot_state.mode.value,
                         "diagnostic_count": len(diagnostics),
+                        "revision": self._web_state_revision,
+                        "content_hash": content_hash,
                     },
                 )
             )
@@ -125,12 +147,9 @@ class RobotStateService:
                 source="robot_state_service",
                 payload=snapshot,
                 frame_id=getattr(robot_state, "frame_id", None),
+                revision=str(self._web_state_revision),
                 status="available",
-                metadata={
-                    "robot_name": self._robot.manifest.robot_name,
-                    "mode": getattr(getattr(robot_state, "mode", None), "value", None),
-                    "diagnostic_count": len(diagnostics),
-                },
+                metadata=web_state_metadata,
             )
         return snapshot
 
@@ -154,6 +173,80 @@ class RobotStateService:
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
+
+    def _build_web_state_signature(self, snapshot: RobotStatusSnapshot) -> str:
+        payload = {
+            "robot_name": snapshot.robot_name,
+            "robot_model": snapshot.robot_model,
+            "assembly_status": self._stable_value(snapshot.assembly_status),
+            "robot_state": self._web_robot_state(snapshot.robot_state),
+            "safety_state": self._stable_value(snapshot.safety_state),
+            "diagnostics": [self._web_diagnostic(item) for item in snapshot.diagnostics],
+            "provider_name": snapshot.metadata.get("provider_name"),
+            "adapter_count": snapshot.metadata.get("adapter_count"),
+            "source_kind": snapshot.metadata.get("source_kind"),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _web_robot_state(self, robot_state) -> dict:
+        return {
+            "robot_id": getattr(robot_state, "robot_id", None),
+            "frame_id": getattr(robot_state, "frame_id", None),
+            "mode": getattr(getattr(robot_state, "mode", None), "value", getattr(robot_state, "mode", None)),
+            "battery": self._stable_value(getattr(robot_state, "battery", None)),
+            "safety": self._stable_value(getattr(robot_state, "safety", None)),
+            "metadata": self._stable_value(self._filter_web_metadata(getattr(robot_state, "metadata", {}) or {})),
+        }
+
+    def _web_diagnostic(self, item: DiagnosticItem) -> dict:
+        return {
+            "component": item.component,
+            "level": getattr(item.level, "value", item.level),
+            "message": item.message,
+            "metadata": self._stable_value(item.metadata),
+        }
+
+    def _filter_web_metadata(self, metadata: dict) -> dict:
+        volatile_keys = {
+            "pose",
+            "twist",
+            "joints",
+            "imu",
+            "timestamp",
+            "updated_at",
+            "source_timestamp",
+            "sequence",
+            "seq",
+            "cursor",
+            "frame_count",
+            "latest_point_cloud_points",
+            "dds_point_cloud_reader_drop_count",
+            "dds_point_cloud_dispatch_drop_count",
+        }
+        return self._drop_volatile_keys(dict(metadata), volatile_keys)
+
+    def _drop_volatile_keys(self, value, volatile_keys: set):
+        if isinstance(value, dict):
+            return {
+                key: self._drop_volatile_keys(item, volatile_keys)
+                for key, item in value.items()
+                if key not in volatile_keys
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._drop_volatile_keys(item, volatile_keys) for item in value]
+        return value
+
+    def _stable_value(self, value):
+        if is_dataclass(value):
+            return self._stable_value(asdict(value))
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            return self._stable_value(model_dump(mode="json"))
+        if isinstance(value, dict):
+            return {str(key): self._stable_value(value[key]) for key in sorted(value)}
+        if isinstance(value, (list, tuple)):
+            return [self._stable_value(item) for item in value]
+        return value
 
     def _get_state_provider(self) -> StateProvider:
         providers = getattr(self._robot, "providers", None)

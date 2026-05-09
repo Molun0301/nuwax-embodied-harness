@@ -26,13 +26,15 @@ class CapabilityInvokeRequest(BaseModel):
 def _stream_migration_response(*topics: str) -> JSONResponse:
     topic_list = [topic for topic in topics if topic]
     query = ",".join(topic_list)
-    stream_path = "/streams/ws" + (f"?topics={query}" if query else "")
+    ws_stream_path = "/streams/ws" + (f"?topics={query}" if query else "")
+    sse_stream_path = "/streams/sse" + (f"?topics={query}" if query else "")
     return JSONResponse(
         status_code=410,
         content={
             "code": "stream_required",
             "message": "实时数据 HTTP 快照入口已下线，请订阅实时流。",
-            "stream": stream_path,
+            "stream": ws_stream_path,
+            "streams": {"websocket": ws_stream_path, "sse": sse_stream_path},
             "topics": topic_list,
         },
     )
@@ -258,7 +260,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/health")
     async def api_health(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
-        return to_jsonable(runtime.get_health_summary())
+        return await run_in_threadpool(lambda: to_jsonable(runtime.get_health_summary()))
 
     @router.get("/api/capabilities")
     async def api_capabilities(
@@ -266,7 +268,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         exposed_only: Optional[bool] = None,
     ) -> Dict[str, Any]:
         access = access_manager.authenticate_http(request)
-        descriptors = runtime.list_capabilities(exposed_only=exposed_only)
+        descriptors = await run_in_threadpool(lambda: runtime.list_capabilities(exposed_only=exposed_only))
         allowed = access_manager.filter_capabilities(access, descriptors)
         return {"capabilities": [descriptor.model_dump(mode="json") for descriptor in allowed]}
 
@@ -277,9 +279,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     ) -> Dict[str, Any]:
         access = access_manager.authenticate_http(request)
         exposed_only = None if access.role.value == "admin" else True
-        views = runtime.list_tools(
-            exposed_only=exposed_only,
-            include_unsupported=include_unsupported,
+        views = await run_in_threadpool(
+            lambda: runtime.list_tools(
+                exposed_only=exposed_only,
+                include_unsupported=include_unsupported,
+            )
         )
         return {"tools": to_jsonable(views)}
 

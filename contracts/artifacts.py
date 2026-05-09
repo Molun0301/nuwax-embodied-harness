@@ -63,4 +63,6 @@ class ArtifactCleanupResult(TimestampedContract):
     removed_count: int = Field(default=0, ge=0, description="清理掉的制品数量。")
     freed_bytes: int = Field(default=0, ge=0, description="释放的字节数。")
     removed_artifact_ids: List[str] = Field(default_factory=list, description="被清理掉的制品标识。")
+    protected_count: int = Field(default=0, ge=0, description="因仍被引用而保留的制品数量。")
+    protected_artifact_ids: List[str] = Field(default_factory=list, description="因引用保护保留的制品标识。")
     summary: ArtifactStorageSummary = Field(description="清理后的存储摘要。")

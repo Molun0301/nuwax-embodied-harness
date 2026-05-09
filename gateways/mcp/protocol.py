@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Dict, Optional, Any, List, Tuple
 import json
 
+from contracts.skills import SkillDescriptor
 from fastapi import APIRouter
 from fastapi import Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
@@ -17,6 +20,10 @@ from gateways.serialization import to_json_text, to_jsonable
 
 def _jsonrpc_result(request_id: Any, result: Dict[str, Any]) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+_SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18")
+_DEFAULT_PROTOCOL_VERSION = _SUPPORTED_PROTOCOL_VERSIONS[0]
 
 
 def _jsonrpc_error(request_id: Any, *, code: int, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -32,16 +39,16 @@ _MCP_COLLECTIONS = {
 }
 
 
-def _tool_layer(view: Any) -> str:
-    return str(getattr(view.descriptor, "metadata", {}).get("capability_layer") or "platform")
+def _tool_layer(descriptor: SkillDescriptor) -> str:
+    return str(getattr(descriptor, "metadata", {}).get("capability_layer") or "platform")
 
 
-def _tool_catalog_item(runtime: GatewayRuntime, view: Any, layer: str) -> Dict[str, Any]:
-    capability_descriptor = runtime.capability_registry.get_descriptor(view.capability_name)
+def _tool_catalog_item(runtime: GatewayRuntime, descriptor: SkillDescriptor, layer: str) -> Dict[str, Any]:
+    capability_descriptor = runtime.capability_registry.get_descriptor(descriptor.capability_name)
     return {
-        "name": view.descriptor.name,
-        "display_name": view.descriptor.display_name,
-        "description": view.descriptor.description,
+        "name": descriptor.name,
+        "display_name": descriptor.display_name,
+        "description": descriptor.description,
         "input_schema": capability_descriptor.input_schema or {"type": "object", "properties": {}, "additionalProperties": False},
         "output_schema": capability_descriptor.output_schema or {"type": "object", "properties": {}, "additionalProperties": False},
         "execution_mode": capability_descriptor.execution_mode.value,
@@ -52,12 +59,18 @@ def _tool_catalog_item(runtime: GatewayRuntime, view: Any, layer: str) -> Dict[s
 
 def _build_collection_catalogs(runtime: GatewayRuntime) -> Dict[str, Dict[str, Dict[str, Any]]]:
     catalogs: Dict[str, Dict[str, Dict[str, Any]]] = {name: {} for name in _MCP_COLLECTIONS}
-    views = runtime.list_tools(exposed_only=None, include_unsupported=False)
-    for view in views:
-        layer = _tool_layer(view)
+    descriptors = runtime.skill_registry.list_descriptors()
+    for descriptor in descriptors:
+        try:
+            registration = runtime.capability_registry.get_registration(descriptor.capability_name)
+        except Exception:
+            continue
+        if not registration.runnable:
+            continue
+        layer = _tool_layer(descriptor)
         for collection_name, config in _MCP_COLLECTIONS.items():
             if layer in config["layers"]:
-                catalogs[collection_name][view.descriptor.name] = _tool_catalog_item(runtime, view, layer)
+                catalogs[collection_name][descriptor.name] = _tool_catalog_item(runtime, descriptor, layer)
                 break
     return catalogs
 
@@ -106,6 +119,53 @@ def _build_collection_tools(runtime: GatewayRuntime) -> List[Dict[str, Any]]:
         }
         for collection_name in ("platform", "device")
     ]
+
+
+def _negotiate_protocol_version(params: Dict[str, Any]) -> str:
+    requested_version = str(params.get("protocolVersion") or "").strip()
+    if not requested_version:
+        return _DEFAULT_PROTOCOL_VERSION
+    if requested_version in _SUPPORTED_PROTOCOL_VERSIONS:
+        return requested_version
+    raise GatewayError(
+        f"不支持的 MCP 协议版本: {requested_version}。",
+        error_code="unsupported_mcp_protocol_version",
+        http_status=400,
+        jsonrpc_code=-32602,
+        details={
+            "requested_protocol_version": requested_version,
+            "supported_protocol_versions": list(_SUPPORTED_PROTOCOL_VERSIONS),
+        },
+    )
+
+
+def _build_initialize_result(runtime: GatewayRuntime, protocol_version: str) -> Dict[str, Any]:
+    base_url = runtime.config.gateway.public_base_url.rstrip("/")
+    return {
+        "protocolVersion": protocol_version,
+        "capabilities": {"tools": {"listChanged": False}},
+        "serverInfo": {"name": "nuwax_robot_bridge", "version": "0.9.0"},
+        "metadata": {
+            "transport": {
+                "type": "streamable_http",
+                "endpoint": f"{base_url}/mcp",
+                "sse_get_supported": True,
+            },
+            "events": {
+                "websocket_url": f"{base_url}/events/ws",
+                "sse_url": f"{base_url}/events/stream",
+            },
+            "streams": {
+                "websocket_url": f"{base_url}/streams/ws",
+                "sse_url": f"{base_url}/streams/sse",
+            },
+            "artifacts": {"base_url": f"{base_url}/artifacts"},
+        },
+    }
+
+
+def _format_sse(event_name: str, payload: Dict[str, Any]) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, arguments: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -162,6 +222,21 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
 
     router = APIRouter()
 
+    @router.get("/mcp")
+    async def mcp_stream(request: Request) -> Response:
+        try:
+            access_manager.authenticate_http(request)
+        except GatewayError as exc:
+            return JSONResponse(_jsonrpc_error(None, code=exc.jsonrpc_code, message=exc.message, data=exc.to_payload()), status_code=exc.http_status)
+
+        async def event_generator():
+            yield _format_sse("endpoint", {"endpoint": "/mcp", "protocol_versions": list(_SUPPORTED_PROTOCOL_VERSIONS)})
+            while not await request.is_disconnected():
+                await asyncio.sleep(runtime.config.gateway.sse_keepalive_sec)
+                yield _format_sse("keepalive", {"endpoint": "/mcp"})
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
     @router.post("/mcp")
     async def mcp_endpoint(request: Request) -> Response:
         try:
@@ -178,13 +253,17 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
         if not isinstance(body, dict):
             return JSONResponse(_jsonrpc_error(None, code=-32600, message="Invalid Request"), status_code=400)
 
+        has_request_id = "id" in body
         request_id = body.get("id")
-        method = body.get("method", "")
+        method = str(body.get("method", ""))
         params = body.get("params", {})
         if params is None:
             params = {}
 
         try:
+            if not has_request_id:
+                return Response(status_code=202)
+
             if not isinstance(params, dict):
                 raise GatewayError(
                     "JSON-RPC params 必须是对象。",
@@ -194,26 +273,12 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                 )
 
             if method == "initialize":
-                return JSONResponse(
-                    _jsonrpc_result(
-                        request_id,
-                        {
-                            "protocolVersion": "2025-11-25",
-                            "capabilities": {"tools": {"listChanged": False}},
-                            "serverInfo": {"name": "nuwax_robot_bridge", "version": "0.9.0"},
-                            "metadata": {
-                                "events": {
-                                    "websocket_url": f"{runtime.config.gateway.public_base_url}/events/ws",
-                                    "sse_url": f"{runtime.config.gateway.public_base_url}/events/stream",
-                                },
-                                "artifacts": {"base_url": f"{runtime.config.gateway.public_base_url}/artifacts"},
-                            },
-                        },
-                    )
-                )
+                protocol_version = _negotiate_protocol_version(params)
+                return JSONResponse(_jsonrpc_result(request_id, _build_initialize_result(runtime, protocol_version)))
 
             if method == "tools/list":
-                return JSONResponse(_jsonrpc_result(request_id, {"tools": _build_collection_tools(runtime)}))
+                tools = await run_in_threadpool(lambda: _build_collection_tools(runtime))
+                return JSONResponse(_jsonrpc_result(request_id, {"tools": tools}))
 
             if method == "tools/call":
                 name = str(params.get("name", "")).strip()

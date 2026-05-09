@@ -48,6 +48,8 @@ _ERROR_CATEGORY_BY_CODE = {
     "execution_failed": "capability",
 }
 
+_TERMINAL_STATES = {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.TIMEOUT}
+
 
 def _has_context_value(value: Any) -> bool:
     return value is not None and value != ""
@@ -160,13 +162,6 @@ class TaskManager:
             metadata=metadata,
         )
         resources = list(required_resources or [])
-        if self._resource_lock_manager is not None and resources:
-            self._resource_lock_manager.acquire(
-                task_id,
-                resources,
-                metadata={"capability_name": capability_name, **metadata_payload},
-            )
-
         spec = TaskSpec(
             task_id=task_id,
             capability_name=capability_name,
@@ -183,22 +178,59 @@ class TaskManager:
             message="任务已接受。",
         )
         record = TaskRecord(spec=spec, status=status)
+        acquired_resources = False
+        future: Optional[Future[Any]] = None
+        timer: Optional[Timer] = None
+        start_gate = threading.Event()
+        start_aborted = threading.Event()
 
-        with self._lock:
-            self._records[task_id] = record
+        def gated_runner() -> Any:
+            start_gate.wait()
+            if start_aborted.is_set():
+                return None
+            return self._run_task(task_id, runner)
 
-        self._append_task_event(task_id, "task.accepted", state=TaskState.ACCEPTED, message="任务已接受。")
+        try:
+            if self._resource_lock_manager is not None and resources:
+                self._resource_lock_manager.acquire(
+                    task_id,
+                    resources,
+                    metadata={"capability_name": capability_name, **metadata_payload},
+                )
+                acquired_resources = True
 
-        if timeout_sec is not None:
-            timer = Timer(timeout_sec, self._handle_timeout, args=(task_id,))
-            timer.daemon = True
-            record.timeout_timer = timer
-            timer.start()
+            with self._lock:
+                self._records[task_id] = record
 
-        future = self._executor.submit(self._run_task, task_id, runner)
-        with self._lock:
-            record.future = future
-        return spec
+            future = self._executor.submit(gated_runner)
+            with self._lock:
+                record.future = future
+
+            self._append_task_event(task_id, "task.accepted", state=TaskState.ACCEPTED, message="任务已接受。")
+
+            if timeout_sec is not None:
+                timer = Timer(timeout_sec, self._handle_timeout, args=(task_id,))
+                timer.daemon = True
+                with self._lock:
+                    record.timeout_timer = timer
+                timer.start()
+
+            start_gate.set()
+            return spec
+        except Exception:
+            start_aborted.set()
+            start_gate.set()
+            if future is not None:
+                future.cancel()
+            if timer is not None:
+                timer.cancel()
+            with self._lock:
+                self._records.pop(task_id, None)
+                if task_id in self._history_order:
+                    self._history_order.remove(task_id)
+            if acquired_resources and self._resource_lock_manager is not None:
+                self._resource_lock_manager.release(task_id)
+            raise
 
     def get_task_status(self, task_id: str) -> TaskStatus:
         """获取任务状态。"""
@@ -238,7 +270,7 @@ class TaskManager:
             return tuple(
                 record.status
                 for record in self._records.values()
-                if record.status.state not in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.TIMEOUT}
+                if record.status.state not in _TERMINAL_STATES
             )
 
     def list_history(self, limit: Optional[int] = None) -> Tuple[TaskStatus, ...]:
@@ -275,7 +307,7 @@ class TaskManager:
 
         with self._lock:
             record = self._records[task_id]
-            if record.status.state in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.TIMEOUT}:
+            if record.status.state in _TERMINAL_STATES:
                 return record.status
             record.status = record.status.model_copy(
                 update={
@@ -308,12 +340,35 @@ class TaskManager:
 
         with self._lock:
             record = self._records[task_id]
-            if record.status.state in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.TIMEOUT}:
+            if record.status.state in _TERMINAL_STATES:
                 return False
             record.cancel_requested = True
+            future = record.future
 
+        if future is not None:
+            future.cancel()
         self._set_terminal_state(task_id, TaskState.CANCELLED, message or "任务已取消。")
         return True
+
+    def cancel_all_active_tasks(self, message: Optional[str] = None) -> Tuple[str, ...]:
+        """取消全部活动任务。"""
+
+        with self._lock:
+            task_ids = tuple(
+                task_id
+                for task_id, record in self._records.items()
+                if record.status.state not in _TERMINAL_STATES
+            )
+            futures = {task_id: self._records[task_id].future for task_id in task_ids}
+            for task_id in task_ids:
+                self._records[task_id].cancel_requested = True
+
+        for task_id in task_ids:
+            future = futures.get(task_id)
+            if future is not None:
+                future.cancel()
+            self._set_terminal_state(task_id, TaskState.CANCELLED, message or "任务已取消。")
+        return task_ids
 
     def wait_for_task(self, task_id: str, timeout: Optional[float] = None) -> Any:
         """等待任务结束。"""
@@ -454,7 +509,7 @@ class TaskManager:
     def _set_running(self, task_id: str) -> None:
         with self._lock:
             record = self._records[task_id]
-            if record.status.state in {TaskState.CANCELLED, TaskState.TIMEOUT}:
+            if record.status.state in _TERMINAL_STATES:
                 return
             now = utc_now()
             record.status = record.status.model_copy(
@@ -487,7 +542,7 @@ class TaskManager:
             terminal_error_payload.setdefault("error_category", error_category)
         with self._lock:
             record = self._records[task_id]
-            if record.status.state in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.TIMEOUT}:
+            if record.status.state in _TERMINAL_STATES:
                 return
             now = utc_now()
             record.status = record.status.model_copy(
@@ -523,7 +578,11 @@ class TaskManager:
             payload["error_code"] = error_code
         if error_category is not None:
             payload["error_category"] = error_category
-        self._append_task_event(task_id, event_type, state=status.state, message=message, payload=payload)
+        try:
+            self._append_task_event(task_id, event_type, state=status.state, message=message, payload=payload)
+        finally:
+            self._release_resources(task_id)
+            self._cancel_timer(task_id)
 
     def _extract_error_payload(self, exc: Exception) -> Optional[MetadataDict]:
         exporter = getattr(exc, "to_payload", None)
@@ -568,7 +627,7 @@ class TaskManager:
             record = self._records.get(task_id)
             if record is None:
                 return
-            if record.status.state in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.TIMEOUT}:
+            if record.status.state in _TERMINAL_STATES:
                 return
             record.timeout_triggered = True
         self._set_terminal_state(task_id, TaskState.TIMEOUT, "任务执行超时。")

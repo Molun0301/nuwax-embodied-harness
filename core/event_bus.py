@@ -99,11 +99,52 @@ class EventBus:
                 self._events = self._events[-self._retention_limit :]
             subscriptions = tuple(self._subscriptions.values())
 
+        failures: List[Tuple[EventSubscription, Exception]] = []
         for subscription in subscriptions:
-            if self._matches(subscription, stored_event):
+            if not self._matches(subscription, stored_event):
+                continue
+            try:
                 subscription.callback(stored_event)
+            except Exception as exc:
+                failures.append((subscription, exc))
+        if failures:
+            self._record_subscription_failures(stored_event, failures)
 
         return stored_event
+
+    def _record_subscription_failures(
+        self,
+        event: RuntimeEvent,
+        failures: Iterable[Tuple[EventSubscription, Exception]],
+    ) -> None:
+        for subscription, exc in failures:
+            diagnostic = self.build_event(
+                "event_bus.subscription_failed",
+                category=RuntimeEventCategory.SYSTEM,
+                source="event_bus",
+                subject_id=subscription.subscription_id,
+                severity=RuntimeEventSeverity.ERROR,
+                message="事件订阅者执行失败，已隔离。",
+                payload={
+                    "subscription_id": subscription.subscription_id,
+                    "failed_event_id": event.event_id,
+                    "failed_event_type": event.event_type,
+                    "failed_event_cursor": event.cursor,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+                metadata={
+                    "subscription_id": subscription.subscription_id,
+                    "failed_event_type": event.event_type,
+                    "failed_event_cursor": event.cursor,
+                },
+            )
+            with self._lock:
+                stored_diagnostic = diagnostic.model_copy(update={"cursor": self._next_cursor})
+                self._next_cursor += 1
+                self._events.append(stored_diagnostic)
+                if len(self._events) > self._retention_limit:
+                    self._events = self._events[-self._retention_limit :]
 
     def publish_task_event(self, task_event: TaskEvent, *, source: str = "task_manager") -> RuntimeEvent:
         """把任务事件转换为统一运行时事件并发布。"""

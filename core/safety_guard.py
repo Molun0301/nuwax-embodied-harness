@@ -38,13 +38,42 @@ class SafetyGuard:
         self._stop_handlers: Dict[str, StopHandler] = {}
         self._watchdogs: Dict[str, WatchdogRegistration] = {}
         self._last_stop_reason: Optional[str] = None
+        self._safe_stop_active = False
+        self._safe_stop_triggered_at: Optional[datetime] = None
+        self._safe_stop_recovered_at: Optional[datetime] = None
         self._lock = threading.RLock()
 
     @property
     def last_stop_reason(self) -> Optional[str]:
         """最近一次停机原因。"""
 
-        return self._last_stop_reason
+        with self._lock:
+            return self._last_stop_reason
+
+    @property
+    def safe_stop_active(self) -> bool:
+        """安全停止门禁是否处于激活状态。"""
+
+        with self._lock:
+            return self._safe_stop_active
+
+    @property
+    def is_estopped(self) -> bool:
+        """是否处于急停禁行状态。"""
+
+        return self.safe_stop_active
+
+    def get_safe_stop_state(self) -> MetadataDict:
+        """导出安全停止状态快照。"""
+
+        with self._lock:
+            return {
+                "safe_stop_active": self._safe_stop_active,
+                "is_estopped": self._safe_stop_active,
+                "last_stop_reason": self._last_stop_reason,
+                "triggered_at": self._safe_stop_triggered_at.isoformat() if self._safe_stop_triggered_at else None,
+                "recovered_at": self._safe_stop_recovered_at.isoformat() if self._safe_stop_recovered_at else None,
+            }
 
     def register_stop_handler(self, name: str, handler: StopHandler) -> None:
         """注册安全停机处理器。"""
@@ -103,11 +132,15 @@ class SafetyGuard:
         return tuple(stale)
 
     def stop_all_motion(self, reason: Optional[str] = None) -> None:
-        """执行全局安全停机。"""
+        """执行全局安全停机并保持急停门禁。"""
 
         with self._lock:
             handlers = tuple(self._stop_handlers.items())
             self._last_stop_reason = reason
+            self._safe_stop_active = True
+            self._safe_stop_triggered_at = utc_now()
+            self._safe_stop_recovered_at = None
+            state = self.get_safe_stop_state()
 
         for _, handler in handlers:
             handler(reason)
@@ -125,5 +158,32 @@ class SafetyGuard:
                     source="safety_guard",
                     severity=RuntimeEventSeverity.WARNING,
                     message=reason or "触发全局安全停机。",
+                    payload=state,
                 )
             )
+
+    def clear_safe_stop(self, reason: Optional[str] = None) -> MetadataDict:
+        """显式恢复安全停止门禁。"""
+
+        with self._lock:
+            self._safe_stop_active = False
+            self._safe_stop_recovered_at = utc_now()
+            state = self.get_safe_stop_state()
+
+        if self._event_bus is not None:
+            self._event_bus.publish(
+                self._event_bus.build_event(
+                    "safety.stop_recovered",
+                    category=RuntimeEventCategory.SAFETY,
+                    source="safety_guard",
+                    severity=RuntimeEventSeverity.INFO,
+                    message=reason or "安全停止门禁已显式恢复。",
+                    payload=state,
+                )
+            )
+        return state
+
+    def restore_safe_stop(self, reason: Optional[str] = None) -> MetadataDict:
+        """恢复安全停止门禁的兼容入口。"""
+
+        return self.clear_safe_stop(reason)

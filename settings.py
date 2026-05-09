@@ -406,7 +406,7 @@ class PerceptionStreamRuntimeConfig:
     """持续视频感知运行时配置。"""
 
     enabled: bool = True
-    auto_start: bool = True
+    auto_start: bool = False
     camera_id: str = "front_camera"
     interval_sec: float = 0.5
     detector_backend_name: str = ""
@@ -450,7 +450,7 @@ class RuntimeDataConfig:
     memory_history_limit: int = 200
     map_catalog_root: str = ""
     map_auto_create_library: bool = True
-    map_active_restore_on_start: bool = True
+    map_active_restore_on_start: bool = False
     map_delete_also_delete_library: bool = False
     memory_db_path: str = ""
     memory_embedding_model: str = DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL
@@ -735,7 +735,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         ),
         stream_runtime=PerceptionStreamRuntimeConfig(
             enabled=_cfg_bool("NUWAX_PERCEPTION_STREAM_ENABLED", True),
-            auto_start=_cfg_bool("NUWAX_PERCEPTION_STREAM_AUTO_START", True),
+            auto_start=_cfg_bool("NUWAX_PERCEPTION_STREAM_AUTO_START", False),
             camera_id=_cfg_str("NUWAX_PERCEPTION_STREAM_CAMERA_ID", "front_camera"),
             interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_STREAM_INTERVAL_SEC", 0.5)),
             detector_backend_name=_cfg_str("NUWAX_PERCEPTION_STREAM_DETECTOR_BACKEND", ""),
@@ -845,6 +845,8 @@ def load_config() -> NuwaxRobotBridgeConfig:
             global_costmap_topic=_cfg_str("NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC", "/global_costmap/costmap"),
             local_costmap_topic=_cfg_str("NUWAX_NAV2_LOCAL_COSTMAP_TOPIC", "/local_costmap/costmap"),
             costmap_source=_cfg_str("NUWAX_NAV2_COSTMAP_SOURCE", "nav2_global"),
+            cmd_vel_topic=_cfg_str("NUWAX_NAV2_CMD_VEL_TOPIC", "/cmd_vel"),
+            cmd_vel_timeout_sec=max(0.1, _cfg_float("NUWAX_NAV2_CMD_VEL_TIMEOUT_SEC", 0.6)),
             map_yaml=_cfg_str("NUWAX_NAV2_MAP_YAML", ""),
             params_file=_cfg_str("NUWAX_NAV2_PARAMS_FILE", ""),
             use_sim_time=_cfg_bool("NUWAX_NAV2_USE_SIM_TIME", False),
@@ -912,7 +914,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             str(BASE_DIR / "runtime_data" / "maps"),
         ),
         map_auto_create_library=_cfg_bool("NUWAX_MAP_AUTO_CREATE_LIBRARY", True),
-        map_active_restore_on_start=_cfg_bool("NUWAX_ACTIVE_MAP_RESTORE_ON_START", True),
+        map_active_restore_on_start=_cfg_bool("NUWAX_ACTIVE_MAP_RESTORE_ON_START", False),
         map_delete_also_delete_library=_cfg_bool("NUWAX_MAP_DELETE_ALSO_DELETE_LIBRARY", False),
         memory_db_path=_cfg_str(
             "NUWAX_MEMORY_DB_PATH",

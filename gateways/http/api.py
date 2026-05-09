@@ -551,8 +551,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             map_name=map_name,
             delete_memory_library=delete_memory_library,
         )
-        if bool(delete_result.get("was_active")):
-            runtime._sync_perception_runtime_for_memory_state(enabled=False)
         return {
             "delete_result": to_jsonable(delete_result),
             "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
@@ -573,7 +571,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             reset_memory_library=bool(payload.get("reset_memory_library", False)),
             metadata={"requested_by": "http_api"},
         )
-        runtime._sync_perception_runtime_for_memory_state(enabled=True)
         return {
             "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace() or active_workspace),
             "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
@@ -692,8 +689,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         delete_result = runtime.memory_service.delete_memory_library(library_name=library_name)
         if active_workspace is not None and active_workspace.active_map_name == library_name:
             runtime.map_workspace_service.clear_active_map(disable_memory_library=False)
-        if bool(delete_result.get("was_active")):
-            runtime._sync_perception_runtime_for_memory_state(enabled=False)
         return {
             "delete_result": to_jsonable(delete_result),
             "maps": to_jsonable(runtime.map_workspace_service.list_maps()),

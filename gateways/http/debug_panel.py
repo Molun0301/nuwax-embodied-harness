@@ -1383,8 +1383,8 @@ def _render_debug_page(access_token: str) -> str:
       function updateMap(envelope) {
         const status = statusOf(envelope);
         const data = envelope.data || {};
-        const grid = data.occupancy_grid;
-        const diagnostics = data.diagnostics || {};
+        const grid = data.occupancy_grid || (data.map_snapshot && data.map_snapshot.occupancy_grid) || null;
+        const diagnostics = data.diagnostics || data.metadata || (data.map_snapshot && data.map_snapshot.metadata) || {};
         const streamBridge = diagnostics.stream_bridge || {};
         state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp };
         setPill(els.mapStatus, status);
@@ -1664,8 +1664,8 @@ def _render_debug_page(access_token: str) -> str:
           ok: frame.status !== "error" && frame.status !== "missing",
           type: frame.topic,
           source: frame.source,
-          frame_id: frame.frame_id,
-          source_timestamp: frame.timestamp,
+          frame_id: frame.frame_id || (frame.payload && frame.payload.frame_id),
+          source_timestamp: frame.timestamp || (frame.payload && frame.payload.timestamp),
           gateway_timestamp: frame.timestamp,
           sequence: frame.sequence ?? frame.cursor,
           revision: frame.revision,

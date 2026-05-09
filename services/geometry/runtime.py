@@ -27,6 +27,7 @@ from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
 from providers.pointcloud import PointCloudProvider
 from services.geometry.config import PlatformGeometryConfig
+from services.geometry.cmd_vel_bridge import Ros2CmdVelMotionBridge
 from services.geometry.live_map_provider import Ros2LiveMapProvider
 from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
 from services.geometry.odometry_publisher import Ros2OdometryPublisher
@@ -208,6 +209,7 @@ class PlatformGeometryRuntime:
         self._tf_localization_provider = Ros2TfLocalizationProvider(config)
         self._odometry_publisher = Ros2OdometryPublisher(config, self._resolve_raw_localization_backend)
         self._point_cloud_publisher = Ros2PointCloudPublisher(config, self._resolve_point_cloud_provider)
+        self._cmd_vel_motion_bridge = Ros2CmdVelMotionBridge(config, self._resolve_motion_provider)
         self._live_geometry_start_lock = threading.RLock()
         self._live_geometry_start_attempted = False
         self._runtime_state_lock = threading.RLock()
@@ -280,6 +282,7 @@ class PlatformGeometryRuntime:
             self._tf_localization_provider.stop()
             self._odometry_publisher.stop()
             self._point_cloud_publisher.stop()
+            self._cmd_vel_motion_bridge.stop()
             self._live_geometry_start_attempted = False
             with self._runtime_state_lock:
                 self._runtime_started = False
@@ -314,6 +317,7 @@ class PlatformGeometryRuntime:
         self._tf_localization_provider.stop()
         self._odometry_publisher.stop()
         self._point_cloud_publisher.stop()
+        self._cmd_vel_motion_bridge.stop()
         self._live_geometry_start_attempted = False
         with self._runtime_state_lock:
             self._runtime_started = False
@@ -1240,6 +1244,7 @@ class PlatformGeometryRuntime:
             "rtabmap_readiness": rtabmap_readiness,
             "map_version_assets": map_version_assets,
             "nav2": nav2_status,
+            "cmd_vel_motion_bridge": self._cmd_vel_motion_bridge.get_status(),
             "tf_localization_provider": tf_status,
             "geometry_acceptance": geometry_acceptance,
             "diagnostics": diagnostics,
@@ -1259,6 +1264,7 @@ class PlatformGeometryRuntime:
                 and self._tf_localization_provider.is_available()
                 and self._odometry_publisher.is_available()
                 and self._point_cloud_publisher.is_available()
+                and self._cmd_vel_motion_bridge.is_available()
             ):
                 return
             self._live_geometry_start_attempted = True
@@ -1267,12 +1273,14 @@ class PlatformGeometryRuntime:
                 self._point_cloud_publisher.start()
                 self._live_map_provider.start()
                 self._tf_localization_provider.start()
+                self._cmd_vel_motion_bridge.start()
             except Exception:
                 self._odometry_publisher.stop()
                 self._point_cloud_publisher.stop()
                 self._live_map_provider.stop()
-                self._live_geometry_start_attempted = False
                 self._tf_localization_provider.stop()
+                self._cmd_vel_motion_bridge.stop()
+                self._live_geometry_start_attempted = False
                 raise
 
     def is_available(self) -> bool:
@@ -1345,6 +1353,7 @@ class PlatformGeometryRuntime:
             "tf_localization_provider": self._tf_localization_provider.get_status(),
             "odometry_publisher": self._odometry_publisher.get_status(),
             "point_cloud_publisher": self._point_cloud_publisher.get_status(),
+            "cmd_vel_motion_bridge": self._cmd_vel_motion_bridge.get_status(),
             "navigation_backend_policy": self._navigation_backend_policy(),
             "active_map_name": self._active_map_version.map_name if self._active_map_version is not None else None,
             "active_map_version_id": self._active_map_version.version_id if self._active_map_version is not None else None,
@@ -1393,6 +1402,7 @@ class PlatformGeometryRuntime:
             "tf_localization_provider": tf_localization_status,
             "odometry_publisher": odometry_status,
             "point_cloud_publisher": point_cloud_status,
+            "cmd_vel_motion_bridge": self._clone_metadata(self._cmd_vel_motion_bridge.get_status()),
             "point_cloud_source": point_cloud_source,
             "data_plane": data_plane_status,
             "config": self._build_live_mapping_config_summary(),
@@ -1555,6 +1565,7 @@ class PlatformGeometryRuntime:
             getattr(self._tf_localization_provider, "_node", None),
             getattr(self._odometry_publisher, "_node", None),
             getattr(self._point_cloud_publisher, "_node", None),
+            getattr(self._cmd_vel_motion_bridge, "_node", None),
             getattr(self._nav2_action_provider, "_node", None),
         )
         errors = []
@@ -2088,6 +2099,12 @@ class PlatformGeometryRuntime:
     def _resolve_point_cloud_provider(self):
         providers = getattr(self.robot, "providers", None)
         if providers is not None and isinstance(providers, PointCloudProvider):
+            return providers
+        return None
+
+    def _resolve_motion_provider(self):
+        providers = getattr(self.robot, "providers", None)
+        if providers is not None and isinstance(providers, MotionControl):
             return providers
         return None
 

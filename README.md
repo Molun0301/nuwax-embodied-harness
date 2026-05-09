@@ -80,6 +80,8 @@ bash scripts/start_gateway.sh
 
 `scripts/start_gateway.sh` 会读取根 `.env`，按 `NUWAX_ACTIVE_ROBOT` 加载机器人运行环境，并在启用 geometry 时加载平台 geometry 运行环境。
 
+启用 geometry 时，平台会启动 RTAB-Map / Nav2，并通过 `NUWAX_NAV2_CMD_VEL_TOPIC` 接收 Nav2 速度输出，桥接到机器人 `MotionControl`（运动控制）提供器；默认不在网关启动时自动恢复上次激活地图，也不自动拉起持续视频感知，需由上层显式启用对应运行态。
+
 ### 5. 验证接口
 
 ```bash

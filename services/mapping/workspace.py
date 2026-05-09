@@ -46,13 +46,14 @@ class MapWorkspaceService:
         self._state_store = state_store
         self._event_bus = event_bus
         self._auto_create_library = bool(auto_create_library)
+        self._active_map_name: Optional[str] = None
 
     @property
     def catalog_root(self) -> str:
         return str(self._repository.root_dir)
 
     def list_maps(self) -> Tuple[MapAsset, ...]:
-        active_map_name = self._repository.get_active_map_name()
+        active_map_name = self._active_map_name
         assets = [self._sync_asset(item, is_active=(item.map_name == active_map_name)) for item in self._repository.list_map_assets()]
         assets.sort(key=lambda item: (not item.active, item.display_name.lower(), item.display_name))
         return tuple(assets)
@@ -61,7 +62,7 @@ class MapWorkspaceService:
         asset = self._repository.get_map_asset(self._require_map_name(map_name))
         if asset is None:
             return None
-        active_map_name = self._repository.get_active_map_name()
+        active_map_name = self._active_map_name
         return self._sync_asset(asset, is_active=(asset.map_name == active_map_name))
 
     def create_map(
@@ -74,7 +75,7 @@ class MapWorkspaceService:
         resolved_name = self._require_map_name(map_name)
         existing = self._repository.get_map_asset(resolved_name)
         if existing is not None:
-            return self._sync_asset(existing, is_active=(existing.map_name == self._repository.get_active_map_name()))
+            return self._sync_asset(existing, is_active=(existing.map_name == self._active_map_name))
         asset = MapAsset(
             map_name=resolved_name,
             display_name=str(display_name or resolved_name).strip() or resolved_name,
@@ -118,7 +119,7 @@ class MapWorkspaceService:
         load_latest_version: bool = False,
     ) -> MapWorkspace:
         resolved_name = self._require_map_name(map_name)
-        previous_active_map_name = self._repository.get_active_map_name()
+        previous_active_map_name = self._active_map_name
         if previous_active_map_name != resolved_name:
             self._geometry_runtime.clear_active_map_version(reason="switch_active_map")
             self._mapping_service.clear_latest_snapshot()
@@ -154,6 +155,7 @@ class MapWorkspaceService:
             ),
             is_active=True,
         )
+        self._active_map_name = resolved_name
         self._repository.set_active_map_name(resolved_name)
         self._save_asset(synced_asset)
         if load_latest_version and synced_asset.latest_version_id:
@@ -204,11 +206,12 @@ class MapWorkspaceService:
         )
 
     def get_active_workspace(self) -> Optional[MapWorkspace]:
-        active_map_name = self._repository.get_active_map_name()
+        active_map_name = self._active_map_name
         if not active_map_name:
             return None
         asset = self._repository.get_map_asset(active_map_name)
         if asset is None:
+            self._active_map_name = None
             self._repository.clear_active_map_name()
             return None
         synced_asset = self._sync_asset(asset, is_active=True)
@@ -217,7 +220,7 @@ class MapWorkspaceService:
     def get_active_map_name(self) -> Optional[str]:
         """返回当前激活地图名称。"""
 
-        return self._repository.get_active_map_name()
+        return self._active_map_name
 
     def get_active_localization_session(self) -> Optional[LocalizationSession]:
         """返回当前激活地图绑定的平台定位会话。"""
@@ -236,7 +239,7 @@ class MapWorkspaceService:
         平台侧决定定位是否就绪，不依赖 Go2 数据面自报状态。
         """
 
-        active_map_name = self._repository.get_active_map_name()
+        active_map_name = self._active_map_name
         latest_map_snapshot = self._mapping_service.get_latest_snapshot()
         if not active_map_name or latest_map_snapshot is None:
             self._localization_service.clear_latest_snapshot()
@@ -342,7 +345,7 @@ class MapWorkspaceService:
                 },
                 deep=True,
             ),
-            is_active=(self._repository.get_active_map_name() == resolved_name),
+            is_active=(self._active_map_name == resolved_name),
         )
         self._append_operation_journal(
             "map.version_saved",
@@ -372,7 +375,7 @@ class MapWorkspaceService:
         metadata: Optional[Dict[str, object]] = None,
     ) -> Tuple[MapVersion, MapWorkspace]:
         resolved_name = self._require_map_name(map_name)
-        if activate_if_needed and self._repository.get_active_map_name() != resolved_name:
+        if activate_if_needed and self._active_map_name != resolved_name:
             self.activate_map(
                 map_name=resolved_name,
                 create_if_missing=False,
@@ -418,7 +421,7 @@ class MapWorkspaceService:
                 },
                 deep=True,
             ),
-            is_active=(self._repository.get_active_map_name() == resolved_name),
+            is_active=(self._active_map_name == resolved_name),
         )
         workspace = self.get_active_workspace() or self._build_workspace(synced_asset)
         self._append_operation_journal(
@@ -495,10 +498,11 @@ class MapWorkspaceService:
     def clear_active_map(self, *, disable_memory_library: bool = False) -> Optional[MapAsset]:
         """清空当前激活地图。"""
 
-        active_map_name = self._repository.get_active_map_name()
+        active_map_name = self._active_map_name
         if not active_map_name:
             return None
         asset = self._repository.get_map_asset(active_map_name)
+        self._active_map_name = None
         self._repository.clear_active_map_name()
         if disable_memory_library and self._memory_service.get_active_library_name() == active_map_name:
             self._memory_service.disable_memory_library()
@@ -553,9 +557,10 @@ class MapWorkspaceService:
     ) -> Dict[str, object]:
         resolved_name = self._require_map_name(map_name)
         asset = self._repository.get_map_asset(resolved_name)
-        was_active = bool(asset is not None and self._repository.get_active_map_name() == resolved_name)
+        was_active = bool(asset is not None and self._active_map_name == resolved_name)
         deleted_memory_library = False
         if was_active:
+            self._active_map_name = None
             self._repository.clear_active_map_name()
             if self._memory_service.get_active_library_name() == resolved_name:
                 self._memory_service.disable_memory_library()
@@ -648,7 +653,7 @@ class MapWorkspaceService:
         latest_map_snapshot = self._mapping_service.get_latest_snapshot() if is_active else None
         active_localization_session = (
             self._ensure_active_localization_session_binding()
-            if is_active and self._repository.get_active_map_name() == asset.map_name
+            if is_active and self._active_map_name == asset.map_name
             else None
         )
         memory_summary = self._memory_service.get_summary()
@@ -887,7 +892,7 @@ class MapWorkspaceService:
         *,
         metadata: Optional[Dict[str, object]] = None,
     ) -> Optional[LocalizationSession]:
-        active_map_name = self._repository.get_active_map_name()
+        active_map_name = self._active_map_name
         latest_map_snapshot = self._mapping_service.get_latest_snapshot()
         if not active_map_name or latest_map_snapshot is None:
             return None

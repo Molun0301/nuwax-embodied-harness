@@ -400,18 +400,8 @@ class GatewayRuntime:
             )
             self.robot.start()
             self._started = True
-        try:
-            if self.perception_video_runtime.should_auto_start():
-                self.perception_video_runtime.start()
-        except Exception:
-            RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
         self._start_data_frame_stream_sources()
-        if self.config.runtime_data.map_active_restore_on_start:
-            try:
-                self.map_workspace_service.restore_active_workspace(load_memory_history=True)
-            except Exception:
-                RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
-        self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
+        self._publish_pointcloud_map_stream_frame(reason="runtime_start")
         self._refresh_dynamic_capability_matrix()
 
         self.event_bus.publish(
@@ -3347,7 +3337,6 @@ class GatewayRuntime:
             metadata={"requested_by": requested_by or "unknown"},
             load_latest_version=False,
         )
-        self._sync_perception_runtime_for_memory_state(enabled=True)
         active_workspace = self.map_workspace_service.get_active_workspace() or active_workspace
         return {
             "active_workspace": active_workspace,
@@ -3372,8 +3361,6 @@ class GatewayRuntime:
                 )
             ),
         )
-        if bool(delete_result.get("was_active")):
-            self._sync_perception_runtime_for_memory_state(enabled=False)
         return {
             "delete_result": delete_result,
             "maps": self.map_workspace_service.list_maps(),
@@ -3486,7 +3473,6 @@ class GatewayRuntime:
         )
         if compatibility_mode == "map_workspace" and active_workspace is not None:
             self._refresh_workspace_snapshots()
-        self._sync_perception_runtime_for_memory_state(enabled=True)
         return {
             "compatibility_mode": compatibility_mode,
             "active_workspace": active_workspace or self.map_workspace_service.get_active_workspace(),
@@ -3506,7 +3492,6 @@ class GatewayRuntime:
         self.memory_service.disable_memory_library()
         if active_workspace is not None and active_workspace.active_map_name == active_workspace.active_memory_library_name:
             self.map_workspace_service.clear_active_map(disable_memory_library=False)
-        self._sync_perception_runtime_for_memory_state(enabled=False)
         return {
             "active_workspace": self.map_workspace_service.get_active_workspace(),
             "maps": self.map_workspace_service.list_maps(),
@@ -3526,8 +3511,6 @@ class GatewayRuntime:
         delete_result = self.memory_service.delete_memory_library(library_name=library_name)
         if active_workspace is not None and active_workspace.active_map_name == library_name:
             self.map_workspace_service.clear_active_map(disable_memory_library=False)
-        if bool(delete_result.get("was_active")):
-            self._sync_perception_runtime_for_memory_state(enabled=False)
         return {
             "delete_result": delete_result,
             "active_workspace": self.map_workspace_service.get_active_workspace(),
@@ -6925,11 +6908,6 @@ class GatewayRuntime:
             )
         )
 
-    def _sync_perception_runtime_for_memory_state(self, *, enabled: bool) -> None:
-        del enabled
-        status = self.perception_video_runtime.get_status()
-        if status.enabled and status.auto_start and not status.running:
-            self.perception_video_runtime.start()
 
     def _finalize_workspace_assets_after_task(
         self,

@@ -146,6 +146,8 @@ class Nav2Config:
     global_costmap_topic: str = "/global_costmap/costmap"
     local_costmap_topic: str = "/local_costmap/costmap"
     costmap_source: str = "nav2_global"
+    cmd_vel_topic: str = "/cmd_vel"
+    cmd_vel_timeout_sec: float = 0.6
     map_yaml: str = ""
     params_file: str = ""
     use_sim_time: bool = False
@@ -296,6 +298,8 @@ class PlatformGeometryConfig:
                 "local_costmap_topic": self.nav2.local_costmap_topic,
                 "mode": self.nav2.mode,
                 "costmap_source": self.nav2.costmap_source,
+                "cmd_vel_topic": self.nav2.cmd_vel_topic,
+                "cmd_vel_timeout_sec": self.nav2.cmd_vel_timeout_sec,
                 "map_yaml": self.nav2.map_yaml or None,
                 "params_file": self.nav2.params_file or None,
                 "use_sim_time": self.nav2.use_sim_time,

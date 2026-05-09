@@ -23,8 +23,8 @@ def build_default_rtabmap_pcd_root() -> str:
     return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "pcd")
 
 
-def build_default_go2slam_external_script() -> str:
-    """返回仓库内默认 Go2 SLAM/Nav2 外部脚本路径。"""
+def build_default_external_slam_nav2_script() -> str:
+    """返回仓库内默认外部 SLAM/Nav2 启动脚本路径。"""
 
     return str(
         Path(__file__).resolve().parents[1]
@@ -172,10 +172,10 @@ class ExternalGeometryStackConfig:
     """外部几何栈托管配置。"""
 
     enabled: bool = True
-    script_path: str = field(default_factory=build_default_go2slam_external_script)
+    script_path: str = field(default_factory=build_default_external_slam_nav2_script)
     args: Tuple[str, ...] = ("--no-rviz",)
-    process_name: str = "go2slam_external"
-    log_name: str = "go2slam_external.log"
+    process_name: str = "external_slam_nav2"
+    log_name: str = "external_slam_nav2.log"
     provides_map: bool = True
     provides_nav2: bool = True
     provides_tf: bool = True

@@ -631,7 +631,7 @@ class BootstrapPlanner:
         if self.selected_robot == "go2" and self.geometry_enabled:
             values.update(
                 {
-                    "NUWAX_GEOMETRY_STACK": "go2slam_external",
+                    "NUWAX_GEOMETRY_STACK": "external_slam_nav2",
                     "NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR": "/usr/local/lib",
                     "NUWAX_GEOMETRY_ODOM_TOPIC": "/odom",
                     "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS": "/uslam/localization/odom,/lio_sam_ros2/mapping/odometry,/odom_lio",
@@ -650,7 +650,8 @@ class BootstrapPlanner:
                     "NUWAX_RTABMAP_OCCUPANCY_PROJECTION": "projected_occupancy",
                     "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(GO2SLAM_WS_DIR / "start_go2_slam_nav2.sh"),
                     "NUWAX_GEOMETRY_EXTERNAL_ARGS": "--no-rviz",
-                    "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "/dev/null",
+                    "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "external_slam_nav2",
+                    "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "external_slam_nav2.log",
                     "NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED": "false",
                     "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED": "false",
                     "NUWAX_NAV2_MODE": "external",

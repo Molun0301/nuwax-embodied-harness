@@ -1,19 +1,19 @@
-# go2slam 外部几何栈流程文档
+# external_slam_nav2 外部 SLAM/Nav2 几何栈流程文档
 
-本文档说明如何让网关托管 `go2slam` 脚本，并使用该脚本提供的 `/map`、TF 和 Nav2。
+本文档说明如何让网关托管外部 SLAM/Nav2 脚本，并使用该脚本提供的 `/map`、TF（坐标变换树）和 Nav2（导航栈）。当前默认脚本仍位于 `services/geometry/ros2_ws/src/go2slam/`，平台配置栈名统一为 `external_slam_nav2`。
 
 ## 适用场景
 
-当 `services/geometry/ros2_ws/src/go2slam/start_go2_slam_nav2.sh` 已经负责启动 Go2 driver、robot_localization、点云转 `/scan`、slam_toolbox 和 Nav2 时，平台必须使用外部几何栈模式。
+当 `services/geometry/ros2_ws/src/go2slam/start_go2_slam_nav2.sh` 已经负责启动外部驱动、robot_localization、点云转 `/scan`、slam_toolbox 和 Nav2 时，平台必须使用 `external_slam_nav2` 外部几何栈模式。
 
 这个模式下：
 
-- 网关只托管启动 `go2slam` 脚本。
+- 网关只托管启动外部 SLAM/Nav2 脚本。
 - 网关不再启动平台内置 RTAB-Map。
 - 网关不再启动平台内置 Nav2。
-- `start_go2_slam_nav2.sh` 会启动 go2slam 自己的 Go2 driver，由它提供 `/utlidar/cloud_deskewed`、`/utlidar/robot_pose`、`/odom`、点云转 `/scan`、slam_toolbox 和 Nav2。
-- 默认不要开启网关平台输入桥，也不要开启网关点云桥。避免网关点云桥和 go2slam 的 `go2_driver` 同时发布同名 `/utlidar/cloud_deskewed`。
-- 只有当外部脚本没有独立 Unitree ROS2 driver、确实缺少 go2slam 输入话题时，才开启平台输入桥。
+- `start_go2_slam_nav2.sh` 会启动外部脚本自己的 Go2 driver，由它提供 `/utlidar/cloud_deskewed`、`/utlidar/robot_pose`、`/odom`、点云转 `/scan`、slam_toolbox 和 Nav2。
+- 默认不要开启网关平台输入桥，也不要开启网关点云桥。避免网关点云桥和外部脚本的 `go2_driver` 同时发布同名 `/utlidar/cloud_deskewed`。
+- 只有当外部脚本没有独立 Unitree ROS2 driver、确实缺少外部栈输入话题时，才开启平台输入桥。
 - 网关仍会观察 `/map`、`/tf`、`/tf_static`，并通过 `/navigate_to_pose` 对接外部 Nav2。
 - 不使用 `ROS_DOMAIN_ID=1`。
 
@@ -23,13 +23,15 @@
 
 ```dotenv
 NUWAX_GEOMETRY_ENABLED=true
-NUWAX_GEOMETRY_STACK=go2slam_external
+NUWAX_GEOMETRY_STACK=external_slam_nav2
 NUWAX_GEOMETRY_REQUIRE_ROS2=true
 NUWAX_GEOMETRY_SETUP_SCRIPT=/home/huang/nuwax-robot-bridge/services/geometry/ros2_ws/install/setup.bash
 NUWAX_GEOMETRY_ODOM_TOPIC=/odom
 NUWAX_GEOMETRY_POINT_CLOUD_TOPIC=/utlidar/cloud_deskewed
 NUWAX_GEOMETRY_EXTERNAL_SCRIPT=/home/huang/nuwax-robot-bridge/services/geometry/ros2_ws/src/go2slam/start_go2_slam_nav2.sh
 NUWAX_GEOMETRY_EXTERNAL_ARGS=--no-rviz
+NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME=external_slam_nav2
+NUWAX_GEOMETRY_EXTERNAL_LOG_NAME=external_slam_nav2.log
 NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED=false
 NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED=false
 NUWAX_NAV2_MODE=external
@@ -41,13 +43,13 @@ NUWAX_GEOMETRY_ODOM_FRAME=odom
 NUWAX_GEOMETRY_BASE_FRAME=base_footprint
 ```
 
-`base_frame` 必须用 `base_footprint`，因为 `go2slam` 的主 TF 链是：
+`base_frame` 必须用 `base_footprint`，因为当前默认外部脚本的主 TF 链是：
 
 ```text
 map -> odom -> base_footprint
 ```
 
-不要在根 `.env` 全局设置 `RMW_IMPLEMENTATION`。`RMW_IMPLEMENTATION` 应由外部 go2slam 启动脚本在 ROS2 子进程内设置，否则会影响网关主进程里的 Unitree SDK 初始化。
+不要在根 `.env` 全局设置 `RMW_IMPLEMENTATION`。`RMW_IMPLEMENTATION` 应由外部 SLAM/Nav2 启动脚本在 ROS2 子进程内设置，否则会影响网关主进程里的 Unitree SDK 初始化。
 
 ## DDS / RMW 边界
 
@@ -65,14 +67,14 @@ RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 原因：
 
-- go2slam 的 ROS2 侧需要 `rmw_cyclonedds_cpp` 才能稳定接通 Unitree/Go2 的 `/utlidar/robot_pose`、`/utlidar/cloud_deskewed` 等链路。
+- 外部 SLAM/Nav2 的 ROS2 侧需要 `rmw_cyclonedds_cpp` 才能稳定接通 Unitree/Go2 的 `/utlidar/robot_pose`、`/utlidar/cloud_deskewed` 等链路。
 - 网关主进程不应继承这个 RMW 设置；全局设置后可能导致 Unitree SDK `ChannelFactoryInitialize` 或官方服务访问异常。
 - `CYCLONEDDS_URI` 和 `NUWAX_GEOMETRY_DDS_IFACE` 可以继续用于指定网卡，但 RMW 实现边界必须留在外部脚本内。
 
 ## 启动流程
 
 1. 启动网关。
-2. `PlatformGeometryRuntime` 识别 `NUWAX_GEOMETRY_STACK=go2slam_external`。
+2. `PlatformGeometryRuntime` 识别 `NUWAX_GEOMETRY_STACK=external_slam_nav2`。
 3. 网关启动 `/map` 和 TF 观察器。
 4. 默认不启动平台 ROS2 odom 发布桥、点云发布桥和 `external_odom_tf_bridge`。
 5. 网关托管启动：
@@ -81,7 +83,7 @@ RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 /home/huang/nuwax-robot-bridge/services/geometry/ros2_ws/src/go2slam/start_go2_slam_nav2.sh --no-rviz
 ```
 
-6. `go2slam` 脚本在子进程内使用 `rmw_cyclonedds_cpp` 启动 Go2 driver、cloud_accumulation、pointcloud_to_laserscan、slam_toolbox、Nav2。
+6. 外部 SLAM/Nav2 脚本在子进程内使用 `rmw_cyclonedds_cpp` 启动 Go2 driver、cloud_accumulation、pointcloud_to_laserscan、slam_toolbox、Nav2。
 7. 点云链路应为：
 
 ```text
@@ -94,7 +96,7 @@ RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 ## 重新编译 go2_perception
 
-如果修改了 `cloud_accumulation.cpp` 或点云转换节点，需要重编外部 go2slam 工作空间里的 `go2_perception`：
+如果修改了 `cloud_accumulation.cpp` 或点云转换节点，需要重编外部 SLAM/Nav2 工作空间里的 `go2_perception`：
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -109,7 +111,7 @@ colcon build --symlink-install --packages-select go2_perception --cmake-clean-ca
 查看托管脚本日志：
 
 ```bash
-tail -f runtime_data/geometry/logs/go2slam_external.log
+tail -f runtime_data/geometry/logs/external_slam_nav2.log
 ```
 
 确认 `/map` 有数据：
@@ -121,7 +123,7 @@ export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ros2 topic echo /map --once
 ```
 
-确认 go2slam 输入链路有数据：
+确认外部 SLAM/Nav2 输入链路有数据：
 
 ```bash
 ros2 topic hz /utlidar/cloud_deskewed
@@ -155,10 +157,10 @@ ros2 action list | grep navigate_to_pose
 确认网关没有启动内置 RTAB-Map/Nav2：
 
 ```bash
-grep -E "rtabmap|nav2|go2slam_external" runtime_data/geometry/logs/*.log
+grep -E "rtabmap|nav2|external_slam_nav2" runtime_data/geometry/logs/*.log
 ```
 
-正常情况下，外部模式只应看到 `go2slam_external.log` 和可选的 `external_odom_tf_bridge.log` 由网关托管启动；不应出现新的平台 `rtabmap_live.log` 或平台 `nav2.log` 启动记录。
+正常情况下，外部模式只应看到 `external_slam_nav2.log` 和可选的 `external_odom_tf_bridge.log` 由网关托管启动；不应出现新的平台 `rtabmap_live.log` 或平台 `nav2.log` 启动记录。
 
 确认网关没有启动平台点云桥：
 
@@ -203,7 +205,7 @@ NUWAX_GEOMETRY_BASE_FRAME=base_footprint
 ros2 run tf2_ros tf2_echo map base_footprint
 ```
 
-如果 `odom -> base_footprint` 和 `/utlidar/cloud_deskewed` 已由 go2slam 原脚本提供，保持：
+如果 `odom -> base_footprint` 和 `/utlidar/cloud_deskewed` 已由外部 SLAM/Nav2 原脚本提供，保持：
 
 ```dotenv
 NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED=false
@@ -217,7 +219,7 @@ NUWAX_GEOMETRY_POINT_CLOUD_TOPIC=/utlidar/cloud_deskewed
 ros2 topic info /utlidar/cloud_deskewed -v
 ```
 
-如果同时出现 go2slam 的 `driver` publisher 和网关的 `nuwax_pointcloud_publisher` publisher，说明同名点云话题被双发布，需要关闭网关点云桥。
+如果同时出现外部脚本的 `driver` publisher 和网关的 `nuwax_pointcloud_publisher` publisher，说明同名点云话题被双发布，需要关闭网关点云桥。
 
 如果 `odom -> base_footprint` 不存在，同时机器上没有独立 Unitree ROS2 驱动发布 `/utlidar/robot_pose` 和 `/utlidar/cloud_deskewed`，再开启完整平台输入桥：
 
@@ -231,14 +233,14 @@ NUWAX_GEOMETRY_BASE_FRAME=base_footprint
 
 ### 网关一直等待地图
 
-确认 `go2slam_external.log` 中 slam_toolbox 已启动，再检查：
+确认 `external_slam_nav2.log` 中 slam_toolbox 已启动，再检查：
 
 ```bash
 ros2 topic list | grep '^/map$'
 ros2 topic echo /map --once
 ```
 
-如果 `/map` 有 publisher 但 `echo --once` 没有任何输出，继续检查 go2slam 输入源：
+如果 `/map` 有 publisher 但 `echo --once` 没有任何输出，继续检查外部 SLAM/Nav2 输入源：
 
 ```bash
 ros2 topic info /utlidar/robot_pose -v
@@ -290,7 +292,7 @@ ros2 topic hz /map
 
 ```bash
 ps -ef | grep cloud_accumulation
-grep -n "cloud_accumulation.*process has died" runtime_data/geometry/logs/go2slam_external.log | tail
+grep -n "cloud_accumulation.*process has died" runtime_data/geometry/logs/external_slam_nav2.log | tail
 ```
 
 已确认过的故障形态：
@@ -302,7 +304,7 @@ grep -n "cloud_accumulation.*process has died" runtime_data/geometry/logs/go2sla
 含义：
 
 - `exit code -11` 是段错误。
-- 常见原因是网关点云桥和 go2slam `go2_driver` 同时发布 `/utlidar/cloud_deskewed`，`cloud_accumulation` 收到混合 PointCloud2 格式后按错误字段布局解析。
+- 常见原因是网关点云桥和外部脚本 `go2_driver` 同时发布 `/utlidar/cloud_deskewed`，`cloud_accumulation` 收到混合 PointCloud2 格式后按错误字段布局解析。
 - 修复方式是关闭网关点云桥，并使用带字段名和边界检查的 `cloud_accumulation.cpp`，然后重编 `go2_perception`。
 
 修复后应看到：

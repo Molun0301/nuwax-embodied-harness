@@ -46,7 +46,7 @@ _NAV2_SIDECAR_MODES = {"sidecar", "managed", "launch", "internal"}
 _NAV2_EXTERNAL_MODES = {"external", "external_action", "action", "client", "pending"}
 _NAV2_DISABLED_MODES = {"", "disabled", "off", "none"}
 _REMOVED_PLATFORM_GRID_MODES = {"platform", "platform_grid", "grid", "fallback", "platform_fallback"}
-_EXTERNAL_GEOMETRY_STACKS = {"external", "go2slam_external", "external_go2slam"}
+_EXTERNAL_GEOMETRY_STACKS = {"external_slam_nav2"}
 
 
 @dataclass
@@ -187,7 +187,7 @@ class PlatformGeometryRuntime:
     """平台几何引擎入口。
 
     当前阶段的平台几何运行时除了承接 provider owner 语义，还负责：
-    1. 约束平台地图版本对应的 RTAB-Map / Nav2 资产目录；
+    1. 约束平台地图版本对应的外部 SLAM/Nav2 资产目录；
     2. 管理当前激活的平台地图版本几何上下文；
     3. 在历史地图激活时，把平台版本快照重新组织为平台几何输出。
     """
@@ -256,10 +256,10 @@ class PlatformGeometryRuntime:
             self._nav2_launch_attempted = False
             self._map_stream_tracker = {}
         if not self._is_geometry_profile_enabled():
-            self._set_runtime_state("disabled", "平台几何运行时或 RTAB-Map profile 已禁用。")
+            self._set_runtime_state("disabled", "平台几何运行时或几何 profile 已禁用。")
             return
         try:
-            self._set_runtime_state("preflight", "正在检查 ROS2、脚本、话题与 TF 配置。")
+            self._set_runtime_state("preflight", "正在检查外部 SLAM/Nav2 脚本、话题与 TF 配置。")
             preflight_errors = self._run_preflight_checks()
             if preflight_errors:
                 message = "平台几何运行时预检失败：" + "；".join(preflight_errors)
@@ -267,17 +267,12 @@ class PlatformGeometryRuntime:
                 if self.config.require_ros2:
                     raise RuntimeError(message)
                 return
-            if self._uses_external_geometry_stack():
-                self._set_runtime_state("starting_external", "正在启动外部 Go2 SLAM/Nav2 几何脚本。")
-                self._ensure_external_geometry_observers_started()
-            else:
-                self._set_runtime_state("starting_inputs", "正在启动点云桥、里程计 TF 与静态 TF 输入链路。")
-                self._ensure_live_geometry_started()
+            if not self._uses_external_geometry_stack():
+                raise RuntimeError(self._removed_internal_stack_message())
+            self._set_runtime_state("starting_external", "正在启动外部 SLAM/Nav2 几何脚本。")
+            self._ensure_external_geometry_observers_started()
             self._start_required_processes()
-            if self._uses_external_geometry_stack():
-                self._set_runtime_state("starting_external", "外部 Go2 SLAM/Nav2 几何脚本已启动，等待 /map 与 TF。")
-            else:
-                self._set_runtime_state("starting_rtabmap", "RTAB-Map 侧车已启动，等待 /map 首帧。")
+            self._set_runtime_state("starting_external", "外部 SLAM/Nav2 几何脚本已启动，等待 /map、TF 与 Nav2 action。")
             self._start_monitor_thread()
         except Exception as exc:
             self._record_runtime_diagnostic("geometry_start", exc)
@@ -316,7 +311,7 @@ class PlatformGeometryRuntime:
         if self._is_geometry_profile_enabled():
             self._set_runtime_state("disabled", "平台几何运行时已停止。")
         else:
-            self._set_runtime_state("disabled", "平台几何运行时或 RTAB-Map profile 已禁用。")
+            self._set_runtime_state("disabled", "平台几何运行时或几何 profile 已禁用。")
 
     def _set_runtime_state(self, phase: str, message: str, *, blocked: bool = False) -> None:
         with self._runtime_state_lock:
@@ -343,25 +338,26 @@ class PlatformGeometryRuntime:
     def _geometry_log_dir(self) -> Path:
         return self._repo_root() / "runtime_data" / "geometry" / "logs"
 
-    def _rtabmap_database_path(self) -> Path:
-        root = Path(str(self.config.rtabmap.database_root or "")).expanduser()
-        if root.suffix == ".db":
-            return root
-        return root / "live_rtabmap.db"
-
     def _geometry_stack(self) -> str:
         return str(getattr(self.config, "stack", "") or "").strip().lower()
 
     def _uses_external_geometry_stack(self) -> bool:
         return self._geometry_stack() in _EXTERNAL_GEOMETRY_STACKS
 
+    def _removed_internal_stack_message(self) -> str:
+        stack = self._geometry_stack() or "<未配置>"
+        return (
+            "几何 stack=%s 不再受支持；旧 RTAB-Map 内置启动链路已删除，"
+            "当前运行时只允许使用 external_slam_nav2 外部 SLAM/Nav2 侧车栈。"
+        ) % stack
+
     def _external_process_name(self) -> str:
         name = str(getattr(self.config.external, "process_name", "") or "").strip()
-        return name or "go2slam_external"
+        return name or "external_slam_nav2"
 
     def _external_log_name(self) -> str:
         log_name = str(getattr(self.config.external, "log_name", "") or "").strip()
-        return log_name or "go2slam_external.log"
+        return log_name or "external_slam_nav2.log"
 
     def _external_script_path(self) -> Path:
         return Path(str(getattr(self.config.external, "script_path", "") or "")).expanduser()
@@ -393,85 +389,50 @@ class PlatformGeometryRuntime:
         return self._uses_external_geometry_stack() and self._external_frontiers_readonly_enabled()
 
     def _run_preflight_checks(self) -> List[str]:
-        errors: List[str] = []
         if self._uses_external_geometry_stack():
             return self._run_external_geometry_preflight_checks()
-        launch_script = self._geometry_script("launch_ros2_stack.sh")
-        if not launch_script.exists():
-            errors.append("缺少 ROS2 环境启动脚本 %s" % launch_script)
-        sidecar_script = self._geometry_script("start_rtabmap_sidecar.sh")
-        if not sidecar_script.exists():
-            errors.append("缺少 RTAB-Map sidecar 脚本 %s" % sidecar_script)
-        odom_bridge_script = self._geometry_script("odom_tf_bridge.py")
-        if not odom_bridge_script.exists():
-            errors.append("缺少 odom TF bridge 脚本 %s" % odom_bridge_script)
-        setup_script = Path(str(self.config.setup_script or "")).expanduser()
-        ros_setup_available = setup_script.exists() or any(path.exists() for path in self._ros_setup_candidates())
-        if self.config.require_ros2 and not setup_script.exists():
-            errors.append("缺少 geometry setup script %s" % setup_script)
-        if shutil.which("ros2") is None and not ros_setup_available:
-            errors.append("未找到 ros2 命令、geometry setup script 或系统 ROS setup，无法启动 ROS2 sidecar")
-        required_topics = {
-            "odom_topic": self.config.topics.odom_topic,
-            "point_cloud_topic": self.config.topics.point_cloud_topic,
-            "occupancy_topic": self.config.topics.occupancy_topic,
-            "tf_topic": self.config.topics.tf_topic,
-            "tf_static_topic": self.config.topics.tf_static_topic,
-        }
-        for name, value in required_topics.items():
-            if not str(value or "").strip():
-                errors.append("缺少 geometry topic 配置 %s" % name)
-        required_frames = {
-            "map_frame": self.config.frames.map_frame,
-            "odom_frame": self.config.frames.odom_frame,
-            "base_frame": self.config.frames.base_frame,
-            "lidar_frame": self.config.frames.lidar_frame,
-            "imu_frame": getattr(self.config.frames, "imu_frame", ""),
-        }
-        for name, value in required_frames.items():
-            if not str(value or "").strip():
-                errors.append("缺少 geometry TF frame 配置 %s" % name)
-        if not str(self.config.rtabmap.launch_package or "").strip():
-            errors.append("缺少 RTAB-Map launch package 配置")
-        if not str(self.config.rtabmap.launch_file or "").strip():
-            errors.append("缺少 RTAB-Map launch file 配置")
-        nav2_mode = self._nav2_mode()
-        if nav2_mode in _NAV2_SIDECAR_MODES:
-            if not str(self.config.nav2.launch_package or "").strip():
-                errors.append("Nav2 sidecar 模式缺少 launch package 配置")
-            if not str(self.config.nav2.launch_file or "").strip():
-                errors.append("Nav2 sidecar 模式缺少 launch file 配置")
-            map_yaml = str(getattr(self.config.nav2, "map_yaml", "") or "").strip()
-            if map_yaml and not Path(map_yaml).expanduser().exists():
-                errors.append("Nav2 map yaml 不存在 %s" % map_yaml)
-            params_file = str(getattr(self.config.nav2, "params_file", "") or "").strip()
-            if params_file and not Path(params_file).expanduser().exists():
-                errors.append("Nav2 params file 不存在 %s" % params_file)
-        return errors
+        return [self._removed_internal_stack_message()]
 
     def _run_external_geometry_preflight_checks(self) -> List[str]:
         errors: List[str] = []
         if not bool(getattr(self.config.external, "enabled", True)):
-            errors.append("外部 geometry 栈已禁用，但 NUWAX_GEOMETRY_STACK=%s 需要外部脚本。" % self.config.stack)
+            errors.append("外部 SLAM/Nav2 几何栈已禁用，但 NUWAX_GEOMETRY_STACK=%s 需要外部脚本。" % self.config.stack)
         raw_script_path = str(getattr(self.config.external, "script_path", "") or "").strip()
         script_path = self._external_script_path()
         if not raw_script_path:
-            errors.append("缺少外部 geometry script 配置 NUWAX_GEOMETRY_EXTERNAL_SCRIPT")
+            errors.append("缺少外部 SLAM/Nav2 script 配置 NUWAX_GEOMETRY_EXTERNAL_SCRIPT")
         elif not script_path.exists():
-            errors.append("外部 geometry script 不存在 %s" % script_path)
+            errors.append("外部 SLAM/Nav2 script 不存在 %s" % script_path)
         elif not script_path.is_file():
-            errors.append("外部 geometry script 不是文件 %s" % script_path)
+            errors.append("外部 SLAM/Nav2 script 不是文件 %s" % script_path)
         elif not os.access(script_path, os.X_OK):
-            errors.append("外部 geometry script 不可执行 %s" % script_path)
+            errors.append("外部 SLAM/Nav2 script 不可执行 %s" % script_path)
+        if self._external_input_bridge_enabled():
+            launch_script = self._geometry_script("launch_ros2_stack.sh")
+            if not launch_script.exists():
+                errors.append("缺少 ROS2 环境启动脚本 %s，无法启动可选 odom/TF 桥。" % launch_script)
+            odom_bridge_script = self._geometry_script("odom_tf_bridge.py")
+            if not odom_bridge_script.exists():
+                errors.append("缺少 odom TF bridge 脚本 %s，无法启动可选 odom/TF 桥。" % odom_bridge_script)
+            setup_script = Path(str(self.config.setup_script or "")).expanduser()
+            ros_setup_available = setup_script.exists() or any(path.exists() for path in self._ros_setup_candidates())
+            if self.config.require_ros2 and not setup_script.exists():
+                errors.append("缺少 geometry setup script %s" % setup_script)
+            if shutil.which("ros2") is None and not ros_setup_available:
+                errors.append("未找到 ros2 命令、geometry setup script 或系统 ROS setup，无法启动可选 odom/TF 桥。")
         required_topics = {
             "occupancy_topic": self.config.topics.occupancy_topic,
             "cost_map_topic": self.config.topics.cost_map_topic,
             "tf_topic": self.config.topics.tf_topic,
             "tf_static_topic": self.config.topics.tf_static_topic,
         }
+        if self._external_point_cloud_bridge_enabled():
+            required_topics["point_cloud_topic"] = self.config.topics.point_cloud_topic
+        if self._external_input_bridge_enabled():
+            required_topics["odom_topic"] = self.config.topics.odom_topic
         for name, value in required_topics.items():
             if not str(value or "").strip():
-                errors.append("缺少 external geometry topic 配置 %s" % name)
+                errors.append("缺少外部 SLAM/Nav2 topic 配置 %s" % name)
         required_frames = {
             "map_frame": self.config.frames.map_frame,
             "odom_frame": self.config.frames.odom_frame,
@@ -479,9 +440,9 @@ class PlatformGeometryRuntime:
         }
         for name, value in required_frames.items():
             if not str(value or "").strip():
-                errors.append("缺少 external geometry TF frame 配置 %s" % name)
+                errors.append("缺少外部 SLAM/Nav2 TF frame 配置 %s" % name)
         if self._nav2_mode() in _NAV2_SIDECAR_MODES:
-            errors.append("外部 Go2 SLAM/Nav2 栈已提供 Nav2；请把 NUWAX_NAV2_MODE 配置为 external。")
+            errors.append("旧 Nav2 sidecar/internal 启动链路已删除；请把 NUWAX_NAV2_MODE 配置为 external、action 或 client。")
         return errors
 
     def _ros_setup_candidates(self) -> List[Path]:
@@ -493,35 +454,31 @@ class PlatformGeometryRuntime:
         ]
 
     def _start_required_processes(self) -> None:
-        if self._uses_external_geometry_stack():
-            if self._external_input_bridge_enabled():
-                self._start_managed_process(
-                    "external_odom_tf_bridge",
-                    self._build_odom_tf_bridge_command(),
-                    "external_odom_tf_bridge.log",
-                )
+        if not self._uses_external_geometry_stack():
+            message = self._removed_internal_stack_message()
+            self._record_runtime_diagnostic("removed_internal_rtabmap_stack", message)
+            raise RuntimeError(message)
+        if self._external_input_bridge_enabled():
             self._start_managed_process(
-                self._external_process_name(),
-                self._build_external_geometry_command(),
-                self._external_log_name(),
+                "external_odom_tf_bridge",
+                self._build_odom_tf_bridge_command(),
+                "external_odom_tf_bridge.log",
             )
-            if self._external_input_bridge_enabled():
-                bridge_message = "外部 Go2 SLAM/Nav2 脚本托管启动；平台启动 ROS2 odom/点云输入桥与 odom TF bridge，不启动内置 RTAB-Map/Nav2。"
-            elif self._external_point_cloud_bridge_enabled():
-                bridge_message = "外部 Go2 SLAM/Nav2 脚本托管启动；平台只启动 ROS2 点云输入桥，跳过 odom/odom_tf_bridge。"
-            else:
-                bridge_message = "外部 Go2 SLAM/Nav2 脚本托管启动；平台跳过内置 RTAB-Map/Nav2/odom_tf_bridge。"
-            self._record_runtime_diagnostic(
-                "go2slam_external",
-                bridge_message,
-            )
-            return
-        self._start_managed_process("odom_tf_bridge", self._build_odom_tf_bridge_command(), "odom_tf_bridge.log")
-        self._start_static_tf_process("static_tf_base_to_body", self.config.frames.base_frame, "body")
-        self._start_static_tf_process("static_tf_base_to_lidar", self.config.frames.base_frame, self.config.frames.lidar_frame)
-        self._start_static_tf_process("static_tf_base_to_imu", self.config.frames.base_frame, getattr(self.config.frames, "imu_frame", "utlidar_imu"))
-        self._start_managed_process("rtabmap", self._build_rtabmap_command(), "rtabmap_live.log")
-        self._start_nav2_process_if_configured()
+        self._start_managed_process(
+            self._external_process_name(),
+            self._build_external_geometry_command(),
+            self._external_log_name(),
+        )
+        if self._external_input_bridge_enabled():
+            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台启动 ROS2 odom/点云输入桥与 odom TF bridge，不启动内置 RTAB-Map/Nav2。"
+        elif self._external_point_cloud_bridge_enabled():
+            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台只启动 ROS2 点云输入桥，跳过 odom/odom_tf_bridge。"
+        else:
+            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台跳过内置 RTAB-Map/Nav2/odom_tf_bridge。"
+        self._record_runtime_diagnostic(
+            "external_slam_nav2",
+            bridge_message,
+        )
 
     def _start_monitor_thread(self) -> None:
         if self._runtime_monitor_thread is not None and self._runtime_monitor_thread.is_alive():
@@ -549,97 +506,6 @@ class PlatformGeometryRuntime:
             "--child-frame",
             str(self.config.frames.base_frame),
         ]
-
-    def _build_rtabmap_command(self) -> List[str]:
-        db_path = self._rtabmap_database_path()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        return self._build_launch_prefix() + [
-            "ros2",
-            "launch",
-            str(self.config.rtabmap.launch_package),
-            str(self.config.rtabmap.launch_file),
-            "namespace:=/",
-            "rtabmapviz:=false",
-            "rviz:=false",
-            "depth:=false",
-            "subscribe_rgb:=false",
-            "subscribe_rgbd:=false",
-            "frame_id:=%s" % self.config.frames.base_frame,
-            "map_frame_id:=%s" % self.config.frames.map_frame,
-            "odom_frame_id:=%s" % self.config.frames.odom_frame,
-            "publish_tf_map:=true",
-            "visual_odometry:=false",
-            "icp_odometry:=false",
-            "subscribe_scan_cloud:=true",
-            "scan_cloud_topic:=%s" % self.config.topics.point_cloud_topic,
-            "odom_topic:=%s" % self.config.topics.odom_topic,
-            "imu_topic:=%s" % self.config.topics.imu_topic,
-            "qos:=2",
-            "qos_scan:=2",
-            "qos_odom:=1",
-            "qos_imu:=2",
-            "approx_sync:=false",
-            "queue_size:=30",
-            "wait_for_transform:=0.5",
-            "database_path:=%s" % db_path,
-            "args:=--delete_db_on_start --RGBD/CreateOccupancyGrid true --Grid/FromDepth false --Grid/RangeMax 8.0 --Grid/CellSize 0.05 --Grid/3D true --Grid/RayTracing true --Grid/FlatObstacleDetected true --Grid/MaxGroundHeight 0.35 --Grid/MaxObstacleHeight 1.8 --Grid/NormalsSegmentation false --Grid/MinClusterSize 5",
-        ]
-
-    def _build_static_tf_command(self, parent_frame: str, child_frame: str) -> List[str]:
-        return self._build_launch_prefix() + [
-            "ros2",
-            "run",
-            "tf2_ros",
-            "static_transform_publisher",
-            "0",
-            "0",
-            "0",
-            "0",
-            "0",
-            "0",
-            str(parent_frame),
-            str(child_frame),
-        ]
-
-    def _build_nav2_command(self) -> List[str]:
-        command = self._build_launch_prefix() + [
-            "ros2",
-            "launch",
-            str(self.config.nav2.launch_package),
-            str(self.config.nav2.launch_file),
-            "use_sim_time:=%s" % str(bool(getattr(self.config.nav2, "use_sim_time", False))).lower(),
-            "autostart:=%s" % str(bool(getattr(self.config.nav2, "autostart", True))).lower(),
-        ]
-        map_yaml = str(getattr(self.config.nav2, "map_yaml", "") or "").strip()
-        if map_yaml:
-            command.append("map:=%s" % map_yaml)
-        params_file = str(getattr(self.config.nav2, "params_file", "") or "").strip()
-        if params_file:
-            command.append("params_file:=%s" % params_file)
-        return command
-
-    def _start_static_tf_process(self, name: str, parent_frame: str, child_frame: str) -> None:
-        if not str(parent_frame or "").strip() or not str(child_frame or "").strip():
-            self._record_runtime_diagnostic(name, "静态 TF 缺少 parent 或 child frame。")
-            return
-        if parent_frame == child_frame:
-            self._record_runtime_diagnostic(name, "静态 TF parent 与 child 相同，跳过启动。")
-            return
-        self._start_managed_process(name, self._build_static_tf_command(parent_frame, child_frame), "%s.log" % name)
-
-    def _start_nav2_process_if_configured(self) -> None:
-        nav2_mode = self._nav2_mode()
-        if nav2_mode in _NAV2_DISABLED_MODES:
-            return
-        self._nav2_launch_attempted = True
-        if nav2_mode in _NAV2_EXTERNAL_MODES:
-            self._record_runtime_diagnostic("nav2_external", "Nav2 配置为外部模式，平台只暴露状态，不把 GridNavigationPlanner 伪装成 Nav2。")
-            return
-        if nav2_mode in _NAV2_SIDECAR_MODES:
-            self._set_runtime_state("starting_nav2", "正在启动 Nav2 sidecar。")
-            self._start_managed_process("nav2", self._build_nav2_command(), "nav2.log")
-            return
-        self._record_runtime_diagnostic("nav2_mode", "未知 Nav2 模式 %s，按待接入状态暴露。" % nav2_mode)
 
     def _start_managed_process(self, name: str, command: List[str], log_name: str, *, restart: bool = False) -> None:
         current = self._managed_processes.get(name)
@@ -675,8 +541,6 @@ class PlatformGeometryRuntime:
             exit_code = process.poll()
             if exit_code is None or process.is_running():
                 continue
-            if name == "nav2" and self._nav2_mode() not in _NAV2_SIDECAR_MODES:
-                continue
             if process.restart_count < _GEOMETRY_SIDE_CAR_RESTART_LIMIT:
                 self._set_runtime_state("recovering", "%s 进程异常退出，正在尝试恢复。" % name)
                 self._record_runtime_diagnostic("process_exit", "%s exit_code=%s\n%s" % (name, exit_code, process.last_error or ""))
@@ -691,6 +555,9 @@ class PlatformGeometryRuntime:
 
     def _advance_runtime_state_from_inputs(self) -> None:
         if not self._runtime_started or not self._is_geometry_profile_enabled():
+            return
+        if not self._uses_external_geometry_stack():
+            self._set_runtime_state("failed", self._removed_internal_stack_message(), blocked=True)
             return
         process_failure = self._blocking_process_failure()
         if process_failure:
@@ -712,49 +579,36 @@ class PlatformGeometryRuntime:
             data_plane_status=data_plane_status,
         )
         if not bool(readiness.get("go2_odom_ready")):
-            self._set_runtime_state("waiting_odom", str(readiness.get("message") or "等待 Go2 odom 输入。"))
+            self._set_runtime_state("waiting_input_bridge", str(readiness.get("message") or "等待外部 SLAM/Nav2 输入桥。"))
             return
         if not bool(readiness.get("first_frame_ready")):
-            self._set_runtime_state("waiting_map", str(readiness.get("message") or "等待 RTAB-Map /map 首帧。"))
+            self._set_runtime_state("waiting_map", str(readiness.get("message") or "等待外部 SLAM/Nav2 /map 首帧。"))
             return
         if not bool(readiness.get("streaming_ready")):
-            self._set_runtime_state("first_frame", str(readiness.get("message") or "RTAB-Map 已发布 /map 首帧，正在确认连续流式更新。"))
+            self._set_runtime_state("first_frame", str(readiness.get("message") or "外部 SLAM/Nav2 已发布 /map 首帧，正在确认连续流式更新。"))
             return
         if not bool(readiness.get("localization_ready")):
-            self._set_runtime_state("streaming", str(readiness.get("message") or "地图 streaming 已就绪，等待 RTAB-Map localization/relocalization。"))
+            self._set_runtime_state("streaming", str(readiness.get("message") or "地图 streaming 已就绪，等待外部 SLAM/Nav2 定位与 TF。"))
             return
         nav2_status = self._build_nav2_status()
         nav2_phase = str(nav2_status.get("phase") or "")
         if nav2_phase == "starting":
-            self._set_runtime_state("starting_nav2", "Nav2 sidecar 正在启动。")
+            self._set_runtime_state("starting_nav2", "正在等待外部 Nav2 action 可用。")
             return
         if nav2_phase == "failed":
-            self._set_runtime_state("failed", str(nav2_status.get("message") or "Nav2 sidecar 失败。"), blocked=True)
+            self._set_runtime_state("failed", str(nav2_status.get("message") or "外部 Nav2 action 失败。"), blocked=True)
             return
         exploration_state = self._platform_exploration_runtime.get_exploration_state()
         if getattr(exploration_state.status, "value", exploration_state.status) in {
             ExplorationStatus.ACCEPTED.value,
             ExplorationStatus.RUNNING.value,
         }:
-            message = (
-                "外部 go2slam 地图 streaming 已就绪，平台探索任务运行中。"
-                if self._uses_external_geometry_stack()
-                else "RTAB-Map localization 与地图 streaming 已就绪，平台探索任务运行中。"
-            )
-            self._set_runtime_state("exploring", message)
+            self._set_runtime_state("exploring", "外部 SLAM/Nav2 地图 streaming、TF 与 Nav2 action 已就绪，平台探索任务运行中。")
             return
         if nav2_phase != "ready":
-            message = (
-                "外部 go2slam 地图 streaming 已就绪；Nav2 状态：%s。"
-                if self._uses_external_geometry_stack()
-                else "RTAB-Map localization 与地图 streaming 已就绪；Nav2 状态：%s。"
-            )
-            self._set_runtime_state("streaming", message % nav2_status.get("phase"))
+            self._set_runtime_state("streaming", "外部 SLAM/Nav2 地图 streaming 与 TF 已就绪；Nav2 状态：%s。" % nav2_status.get("phase"))
             return
-        if self._uses_external_geometry_stack():
-            self._set_runtime_state("ready", "外部 Go2 SLAM/Nav2 地图 streaming、TF 与 Nav2 均已就绪。")
-        else:
-            self._set_runtime_state("ready", "RTAB-Map localization、地图 streaming 与 Nav2 均已就绪。")
+        self._set_runtime_state("ready", "外部 SLAM/Nav2 地图 streaming、TF 与 Nav2 action 均已就绪。")
 
     def _blocking_process_failure(self) -> Optional[str]:
         for name, process in self._managed_processes.items():
@@ -763,10 +617,8 @@ class PlatformGeometryRuntime:
             exit_code = process.poll()
             if exit_code is None:
                 continue
-            if process.restart_count >= _GEOMETRY_SIDE_CAR_RESTART_LIMIT and name != "nav2":
+            if process.restart_count >= _GEOMETRY_SIDE_CAR_RESTART_LIMIT:
                 return "%s 进程已退出，exit_code=%s。" % (name, exit_code)
-            if name == "nav2" and self._nav2_mode() in _NAV2_SIDECAR_MODES and process.restart_count >= _GEOMETRY_SIDE_CAR_RESTART_LIMIT:
-                return "Nav2 sidecar 已退出，exit_code=%s。" % exit_code
         return None
 
     def _build_rtabmap_readiness(
@@ -794,75 +646,34 @@ class PlatformGeometryRuntime:
                 point_cloud_source=point_cloud_source,
                 data_plane_status=data_plane_status,
             )
-        waiting_for, wait_message = self._classify_live_mapping_wait(
-            live_map_status=live_map_status,
-            point_cloud_status=point_cloud_status,
-            point_cloud_source=point_cloud_source,
-            data_plane_status=data_plane_status,
-        )
-        odom_bridge = self._managed_processes.get("odom_tf_bridge")
-        rtabmap_process = self._managed_processes.get("rtabmap")
+        message = self._removed_internal_stack_message()
         map_stream = dict(self._map_stream_tracker)
         tf_chain = self._build_tf_chain_status(tf_localization_status=tf_localization_status)
-        rtabmap_info_publisher_count = live_map_status.get("rtabmap_info_publisher_count")
-        if rtabmap_info_publisher_count is None:
-            rtabmap_info_publisher_count = live_map_status.get("rtabmap_info_has_publisher")
-        go2_odom_ready = bool(
-            odom_bridge is not None
-            and odom_bridge.is_running()
-            and int(odometry_status.get("published_count") or 0) > 0
-            and int(point_cloud_status.get("published_count") or 0) > 0
-            and (point_cloud_source.get("timestamp") or data_plane_status.get("started") is not False)
-        )
-        first_frame_ready = bool(
-            live_map_status.get("occupancy_grid_ready")
-            and int(live_map_status.get("occupancy_message_count") or 0) > 0
-            and live_map_status.get("occupancy_has_publisher") is not False
-        )
-        streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
-        localization_ready = bool(
-            streaming_ready
-            and rtabmap_process is not None
-            and rtabmap_process.is_running()
-            and tf_chain.get("ready")
-            and map_stream.get("source_timestamp_fresh")
-            and (rtabmap_info_publisher_count is True or int(rtabmap_info_publisher_count or 0) > 0)
-        )
-        relocalization_ready = bool(localization_ready and int(map_stream.get("content_revision") or 0) > 0)
-        if not go2_odom_ready:
-            message = "Go2 odom/TF 输入未就绪；需要平台 odom 发布桥、odom_tf_bridge 运行，且点云已发布。"
-            waiting_for = waiting_for or "go2_odom"
-        elif not first_frame_ready:
-            message = wait_message
-        elif not streaming_ready:
-            message = "RTAB-Map 已发布 /map 首帧，但 /map message_count、source timestamp 或内容指标尚未证明连续 streaming。"
-            waiting_for = "rtabmap_streaming"
-        elif not localization_ready:
-            message = "RTAB-Map /map 已 streaming，但 /rtabmap/info、TF 链或进程状态尚未证明 localization/relocalization ready。"
-            waiting_for = "rtabmap_localization"
-        else:
-            message = "Go2 odom、RTAB-Map /map streaming、/rtabmap/info 与 TF 链均已就绪。"
-            waiting_for = None
         return {
-            "ready": localization_ready,
-            "go2_odom_ready": go2_odom_ready,
-            "first_frame_ready": first_frame_ready,
-            "streaming_ready": streaming_ready,
-            "localization_ready": localization_ready,
-            "relocalization_ready": relocalization_ready,
-            "waiting_for": waiting_for,
+            "ready": False,
+            "go2_odom_ready": False,
+            "input_bridge_ready": False,
+            "first_frame_ready": False,
+            "streaming_ready": False,
+            "localization_ready": False,
+            "relocalization_ready": False,
+            "waiting_for": "external_slam_nav2_stack",
             "message": message,
+            "removed_internal_stack": True,
             "map_stream": map_stream,
             "tf_chain": tf_chain,
             "tf_localization_provider": self._clone_metadata(tf_localization_status),
-            "rtabmap_info": {
-                "topic": "/rtabmap/info",
-                "publisher_count": rtabmap_info_publisher_count,
-                "has_publisher": rtabmap_info_publisher_count is True or int(rtabmap_info_publisher_count or 0) > 0,
+            "legacy_rtabmap": {
+                "info_topic": "/rtabmap/info",
+                "info_not_required": True,
+                "process": None,
+                "removed": True,
             },
-            "rtabmap_process": rtabmap_process.status() if rtabmap_process is not None else None,
             "odometry_publisher": odometry_status,
-            "odom_tf_bridge_process": odom_bridge.status() if odom_bridge is not None else None,
+            "point_cloud_publisher": point_cloud_status,
+            "point_cloud_source": point_cloud_source,
+            "data_plane": data_plane_status,
+            "odom_tf_bridge_process": None,
         }
 
     def _build_external_geometry_readiness(
@@ -909,30 +720,31 @@ class PlatformGeometryRuntime:
         streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
         localization_ready = bool(process_running and input_bridge_ready and streaming_ready and tf_chain.get("ready"))
         if not process_running:
-            message = "外部 Go2 SLAM/Nav2 脚本尚未运行。"
+            message = "外部 SLAM/Nav2 脚本尚未运行。"
             waiting_for = "external_process"
         elif not input_bridge_ready:
             message = (
-                "外部 go2slam 点云输入桥未就绪；需要平台发布点云输入。"
+                "外部 SLAM/Nav2 点云输入桥未就绪；需要平台发布点云输入。"
                 if point_cloud_bridge_enabled and not input_bridge_enabled
-                else "外部 go2slam 输入桥未就绪；需要平台发布 /odom、点云输入，并运行 odom -> base TF bridge。"
+                else "外部 SLAM/Nav2 输入桥未就绪；需要平台发布 /odom、点云输入，并运行 odom -> base TF bridge。"
             )
             waiting_for = "external_input_bridge"
         elif not first_frame_ready:
-            message = "等待外部 go2slam 发布 /map 首帧。"
+            message = "等待外部 SLAM/Nav2 发布 /map 首帧。"
             waiting_for = "external_map"
         elif not streaming_ready:
-            message = "外部 go2slam 已发布 /map 首帧，正在确认连续 streaming。"
+            message = "外部 SLAM/Nav2 已发布 /map 首帧，正在确认连续 streaming。"
             waiting_for = "external_map_streaming"
         elif not tf_chain.get("ready"):
-            message = "外部 go2slam /map 已 streaming，等待 map -> odom -> base TF 链就绪。"
+            message = "外部 SLAM/Nav2 /map 已 streaming，等待 map -> odom -> base TF 链就绪。"
             waiting_for = "external_tf"
         else:
-            message = "外部 Go2 SLAM/Nav2 /map streaming 与 TF 链均已就绪。"
+            message = "外部 SLAM/Nav2 /map streaming 与 TF 链均已就绪。"
             waiting_for = None
         return {
             "ready": localization_ready,
             "go2_odom_ready": bool(process_running and input_bridge_ready),
+            "input_bridge_ready": bool(input_bridge_ready),
             "first_frame_ready": first_frame_ready,
             "streaming_ready": streaming_ready,
             "localization_ready": localization_ready,
@@ -942,13 +754,12 @@ class PlatformGeometryRuntime:
             "map_stream": map_stream,
             "tf_chain": tf_chain,
             "tf_localization_provider": self._clone_metadata(tf_localization_status),
-            "rtabmap_info": {
-                "topic": "/rtabmap/info",
-                "publisher_count": None,
-                "has_publisher": None,
-                "not_required": True,
+            "legacy_rtabmap": {
+                "info_topic": "/rtabmap/info",
+                "info_not_required": True,
+                "process": None,
+                "removed": True,
             },
-            "rtabmap_process": None,
             "odometry_publisher": odometry_status,
             "point_cloud_publisher": point_cloud_status,
             "point_cloud_source": point_cloud_source,
@@ -970,19 +781,13 @@ class PlatformGeometryRuntime:
 
     def _build_tf_chain_status(self, *, tf_localization_status: Optional[Dict[str, object]] = None) -> Dict[str, object]:
         tf_localization_status = tf_localization_status or self._clone_metadata(self._tf_localization_provider.get_status())
+        removed_internal_stack = not self._uses_external_geometry_stack()
         if self._uses_external_geometry_stack():
             required_processes = [self._external_process_name()]
             if self._external_input_bridge_enabled():
                 required_processes.append("external_odom_tf_bridge")
         else:
-            required_processes = ["odom_tf_bridge"]
-            if str(self.config.frames.base_frame or "").strip() != "body":
-                required_processes.append("static_tf_base_to_body")
-            if str(self.config.frames.base_frame or "").strip() != str(self.config.frames.lidar_frame or "").strip():
-                required_processes.append("static_tf_base_to_lidar")
-            imu_frame = str(getattr(self.config.frames, "imu_frame", "") or "").strip()
-            if imu_frame and str(self.config.frames.base_frame or "").strip() != imu_frame:
-                required_processes.append("static_tf_base_to_imu")
+            required_processes = []
         required_process_names = tuple(required_processes)
         process_status = {
             name: self._managed_processes[name].status()
@@ -993,10 +798,10 @@ class PlatformGeometryRuntime:
         stopped = [name for name, status in process_status.items() if not bool(status.get("running"))]
         pose_ready = bool(tf_localization_status.get("pose_ready") or tf_localization_status.get("pose_available"))
         map_to_base_ready = bool(tf_localization_status.get("map_to_base_ready"))
-        chain_ready = not missing and not stopped and pose_ready and map_to_base_ready
+        chain_ready = bool(not removed_internal_stack and not missing and not stopped and pose_ready and map_to_base_ready)
         return {
             "ready": chain_ready,
-            "process_ready": not missing and not stopped,
+            "process_ready": bool(not removed_internal_stack and not missing and not stopped),
             "pose_ready": pose_ready,
             "map_to_base_ready": map_to_base_ready,
             "map_to_odom_ready": bool(tf_localization_status.get("map_to_odom_ready")),
@@ -1011,10 +816,11 @@ class PlatformGeometryRuntime:
             "stopped_processes": stopped,
             "processes": process_status,
             "tf_localization_provider": self._clone_metadata(tf_localization_status),
+            "removed_internal_stack": removed_internal_stack,
             "validation": (
-                "external_go2slam_tf_provider_must_resolve_map_to_base_pose"
+                "external_slam_nav2_tf_provider_must_resolve_map_to_base_pose"
                 if self._uses_external_geometry_stack()
-                else "ros2_tf_provider_must_resolve_map_to_base_pose"
+                else "removed_internal_rtabmap_stack"
             ),
         }
 
@@ -1128,7 +934,7 @@ class PlatformGeometryRuntime:
                 "selection": "removed_platform_grid",
                 "message": "platform_grid 自定义导航执行链已删除；请使用 Nav2 action 模式。",
             })
-        elif mode in _NAV2_EXTERNAL_MODES or mode in _NAV2_SIDECAR_MODES:
+        elif mode in _NAV2_EXTERNAL_MODES:
             policy.update({
                 "selection": "nav2_action",
                 "selected_provider_name": nav2_provider_name,
@@ -1136,6 +942,11 @@ class PlatformGeometryRuntime:
                 "active_backend_kind": "nav2_action",
                 "nav2_action_active": True,
                 "message": "当前正式导航执行链为 Nav2 action。",
+            })
+        elif mode in _NAV2_SIDECAR_MODES:
+            policy.update({
+                "selection": "removed_nav2_sidecar",
+                "message": "旧 Nav2 sidecar/internal 启动链路已删除；请使用外部 Nav2 action 模式。",
             })
         else:
             policy.update({
@@ -1164,29 +975,20 @@ class PlatformGeometryRuntime:
             message = "Nav2 已禁用；平台不再提供 platform_grid 自定义导航执行链。"
         elif mode in _REMOVED_PLATFORM_GRID_MODES:
             phase = "removed_platform_grid"
-            message = "platform_grid 自定义导航执行链已删除；请把 NUWAX_NAV2_MODE 配置为 sidecar 或 external。"
+            message = "platform_grid 自定义导航执行链已删除；请把 NUWAX_NAV2_MODE 配置为 external、action 或 client。"
         elif mode in _NAV2_EXTERNAL_MODES:
             provider = getattr(self, "_nav2_action_provider", None)
             if provider is not None:
-                return self._with_navigation_backend_policy(provider.get_nav2_status())
+                status = dict(provider.get_nav2_status())
+                status.pop("launch_package", None)
+                status.pop("launch_file", None)
+                status["sidecar_launch_removed"] = True
+                return self._with_navigation_backend_policy(status)
             phase = "external"
             message = "Nav2 配置为外部模式，但 action provider 尚未初始化。"
         elif mode in _NAV2_SIDECAR_MODES:
-            if process is None:
-                phase = "not_started"
-                message = "Nav2 sidecar 尚未启动。"
-            elif process.is_running():
-                provider = getattr(self, "_nav2_action_provider", None)
-                if provider is not None:
-                    status = provider.get_nav2_status()
-                    status["process"] = process.status()
-                    status["launch_attempted"] = self._nav2_launch_attempted
-                    return self._with_navigation_backend_policy(status)
-                phase = "blocked"
-                message = "Nav2 sidecar 进程已启动，但 action provider 尚未初始化。"
-            else:
-                phase = "failed"
-                message = "Nav2 sidecar 进程已退出，exit_code=%s。" % process.exit_code
+            phase = "removed_nav2_sidecar"
+            message = "旧 Nav2 sidecar/internal 启动链路已删除；运行时只连接外部 Nav2 action。"
         else:
             phase = "pending_integration"
             message = "Nav2 模式 %s 尚未接入。" % mode
@@ -1195,11 +997,10 @@ class PlatformGeometryRuntime:
             "phase": phase,
             "message": message,
             "action_name": self.config.nav2.action_name,
-            "launch_package": self.config.nav2.launch_package,
-            "launch_file": self.config.nav2.launch_file,
             "global_costmap_topic": self.config.nav2.global_costmap_topic,
             "local_costmap_topic": self.config.nav2.local_costmap_topic,
             "costmap_source": self.config.nav2.costmap_source,
+            "sidecar_launch_removed": True,
             "platform_grid_removed": True,
             "grid_navigation_backend": None,
             "grid_navigation_is_nav2": False,
@@ -1236,37 +1037,16 @@ class PlatformGeometryRuntime:
             "launch_ros2_stack": {
                 "script": str(self._geometry_script("launch_ros2_stack.sh")),
                 "starts_rtabmap_or_nav2_by_default": False,
-                "message": "launch_ros2_stack.sh 只准备 ROS2 环境；RTAB-Map/Nav2 由 PlatformGeometryRuntime 显式启动。",
+                "message": "launch_ros2_stack.sh 只用于可选 ROS2 桥环境；旧 RTAB-Map/Nav2 内置启动链路已删除。",
             },
         }
 
     def _ensure_live_geometry_started(self) -> None:
         if not self._is_geometry_profile_enabled():
             return
-        with self._live_geometry_start_lock:
-            if (
-                self._live_map_provider.is_available()
-                and self._tf_localization_provider.is_available()
-                and self._odometry_publisher.is_available()
-                and self._point_cloud_publisher.is_available()
-                and self._frontier_marker_provider.is_available()
-            ):
-                return
-            self._live_geometry_start_attempted = True
-            try:
-                self._odometry_publisher.start()
-                self._point_cloud_publisher.start()
-                self._live_map_provider.start()
-                self._frontier_marker_provider.start()
-                self._tf_localization_provider.start()
-            except Exception:
-                self._odometry_publisher.stop()
-                self._point_cloud_publisher.stop()
-                self._live_map_provider.stop()
-                self._frontier_marker_provider.stop()
-                self._live_geometry_start_attempted = False
-                self._tf_localization_provider.stop()
-                raise
+        if not self._uses_external_geometry_stack():
+            raise RuntimeError(self._removed_internal_stack_message())
+        self._ensure_external_geometry_observers_started()
 
     def _ensure_external_geometry_observers_started(self) -> None:
         if not self._is_geometry_profile_enabled():
@@ -1310,6 +1090,8 @@ class PlatformGeometryRuntime:
         """返回是否存在可供平台消费的几何后端。"""
 
         if not self._is_geometry_profile_enabled():
+            return False
+        if not self._uses_external_geometry_stack():
             return False
         navigation_backend = self._resolve_navigation_backend()
         exploration_backend = self._resolve_exploration_backend()
@@ -1436,9 +1218,8 @@ class PlatformGeometryRuntime:
             "odom_frame": self.config.frames.odom_frame,
             "base_frame": self.config.frames.base_frame,
             "lidar_frame": self.config.frames.lidar_frame,
-            "rtabmap_profile_name": self.config.rtabmap.profile_name,
-            "rtabmap_launch_package": self.config.rtabmap.launch_package,
-            "rtabmap_launch_file": self.config.rtabmap.launch_file,
+            "geometry_profile_name": self.config.rtabmap.profile_name,
+            "rtabmap_launch_removed": True,
             "go2_direct_dds_point_cloud_topic": getattr(direct_dds, "point_cloud_topic", None),
             "go2_direct_dds_enabled": getattr(direct_dds, "enabled", None),
         }
@@ -1512,14 +1293,23 @@ class PlatformGeometryRuntime:
         point_cloud_source: Dict[str, object],
         data_plane_status: Dict[str, object],
     ) -> tuple[Optional[str], str]:
-        point_cloud_error = str(point_cloud_status.get("last_error") or "").strip()
-        if point_cloud_error:
-            return "point_cloud_bridge_error", "ROS2 点云桥错误：%s" % point_cloud_error
         live_map_error = str(live_map_status.get("last_error") or "").strip()
         if live_map_error:
             return "live_map_provider_error", "ROS2 实时地图订阅错误：%s" % live_map_error
-        source_error = str(point_cloud_source.get("last_error") or "").strip()
         occupancy_grid_ready = bool(live_map_status.get("occupancy_grid_ready"))
+        if self._uses_external_geometry_stack() and not self._external_point_cloud_bridge_enabled():
+            occupancy_topic = str(live_map_status.get("occupancy_topic") or self.config.topics.occupancy_topic)
+            if not occupancy_grid_ready:
+                return (
+                    "external_occupancy_grid",
+                    "等待外部 SLAM/Nav2 在 %s 发布首帧占据栅格。"
+                    % occupancy_topic,
+                )
+            return None, "外部 SLAM/Nav2 建图链路已收到 %s 首帧占据栅格。" % occupancy_topic
+        point_cloud_error = str(point_cloud_status.get("last_error") or "").strip()
+        if point_cloud_error:
+            return "point_cloud_bridge_error", "ROS2 点云桥错误：%s" % point_cloud_error
+        source_error = str(point_cloud_source.get("last_error") or "").strip()
         if source_error and not occupancy_grid_ready:
             return "point_cloud_input", source_error
         published_count = int(point_cloud_status.get("published_count") or 0)
@@ -1545,12 +1335,12 @@ class PlatformGeometryRuntime:
         if not bool(live_map_status.get("occupancy_grid_ready")):
             occupancy_topic = str(live_map_status.get("occupancy_topic") or self.config.topics.occupancy_topic)
             return (
-                "rtabmap_occupancy_grid",
-                "点云桥已向 %s 发布 %d 帧，等待 RTAB-Map 在 %s 发布首帧占据栅格。"
+                "external_occupancy_grid",
+                "点云桥已向 %s 发布 %d 帧，等待外部 SLAM/Nav2 在 %s 发布首帧占据栅格。"
                 % (point_cloud_topic, published_count, occupancy_topic),
             )
         occupancy_topic = str(live_map_status.get("occupancy_topic") or self.config.topics.occupancy_topic)
-        return None, "建图链路已收到 %s 首帧占据栅格。" % occupancy_topic
+        return None, "外部 SLAM/Nav2 建图链路已收到 %s 首帧占据栅格。" % occupancy_topic
 
     def _attach_live_mapping_diagnostics_to_request(self, request):
         metadata = dict(getattr(request, "metadata", {}) or {})
@@ -1574,7 +1364,7 @@ class PlatformGeometryRuntime:
             active
             and diagnostic_waiting_for
             and (
-                current_waiting_for in {None, "occupancy_grid", "mapping_ready", "point_cloud_input", "rtabmap_occupancy_grid"}
+                current_waiting_for in {None, "occupancy_grid", "mapping_ready", "point_cloud_input", "external_occupancy_grid"}
                 or str(diagnostic_waiting_for).endswith("_error")
             )
         )
@@ -1968,7 +1758,7 @@ class PlatformGeometryRuntime:
         if mode in _REMOVED_PLATFORM_GRID_MODES:
             return None
         nav2_provider = getattr(self, "_nav2_action_provider", None)
-        if mode in _NAV2_EXTERNAL_MODES or mode in _NAV2_SIDECAR_MODES:
+        if mode in _NAV2_EXTERNAL_MODES:
             return nav2_provider
         return None
 
@@ -2182,21 +1972,24 @@ class PlatformGeometryRuntime:
         }
 
     def _build_rtabmap_run_metadata(self) -> Dict[str, object]:
-        process = self._managed_processes.get("rtabmap")
+        process_name = self._external_process_name()
+        process = self._managed_processes.get(process_name)
         db_path = self._locate_live_rtabmap_database()
         started_at = process.started_at_iso if process is not None else None
         pid = process.process.pid if process is not None and process.process is not None and process.is_running() else None
         source = str(db_path.resolve()) if db_path is not None else None
         seed = "|".join(str(part or "") for part in (source, started_at, pid))
         digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16] if seed.strip("|") else ""
-        run_id = "rtabmap_%s" % digest if digest else None
+        run_id = "external_slam_nav2_%s" % digest if digest else None
         return {
             "session_id": run_id,
             "run_id": run_id,
             "database_path": source,
             "started_at": started_at,
             "pid": pid,
-            "node_name": "rtabmap",
+            "node_name": process_name,
+            "source_stack": self.config.stack,
+            "rtabmap_launch_removed": True,
             "log_path": str(process.log_path) if process is not None else None,
             "process_running": process.is_running() if process is not None else False,
         }
@@ -2483,7 +2276,10 @@ class PlatformGeometryRuntime:
     def start_platform_exploration(self, request) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
-        self._ensure_live_geometry_started()
+        if not self._uses_external_geometry_stack():
+            self._record_runtime_diagnostic("removed_internal_exploration_stack", self._removed_internal_stack_message())
+            return False
+        self._ensure_external_geometry_observers_started()
         request = self._attach_live_mapping_diagnostics_to_request(request)
         old_thread = None
         with self._exploration_loop_lock:
@@ -2797,7 +2593,7 @@ class PlatformGeometryRuntime:
                 "latest_frontiers": latest_frontiers,
                 "current_frontier": current_frontier,
                 "frontier_marker_provider": frontier_provider_status,
-                "frontier_source": frontier_source or "go2slam_explore_lite",
+                "frontier_source": frontier_source or "external_slam_nav2_frontier_markers",
             }
         metadata = {
             **dict(getattr(state, "metadata", {}) or {}),
@@ -2886,7 +2682,7 @@ class PlatformGeometryRuntime:
         failure_code = None
         if occupancy_grid is None:
             waiting_for = "map"
-            message = "等待 RTAB-Map /map 首帧。"
+            message = "等待外部 SLAM/Nav2 /map 首帧。"
             failure_code = "map_unavailable"
         elif not bool(rtabmap_readiness.get("streaming_ready")):
             waiting_for = "live_map_streaming"
@@ -2894,7 +2690,7 @@ class PlatformGeometryRuntime:
             failure_code = "live_map_streaming_unavailable"
         elif not bool(rtabmap_readiness.get("tf_chain", {}).get("ready")):
             waiting_for = "tf"
-            message = "等待 RTAB-Map/Nav2 所需 TF 链 ready。"
+            message = "等待外部 SLAM/Nav2 所需 TF 链 ready。"
             failure_code = "tf_unavailable"
         elif current_pose is None:
             waiting_for = "tf"
@@ -3041,7 +2837,7 @@ class PlatformGeometryProviderBundle(
     """平台几何 provider bundle。
 
     所有 provider 接口的平台级代理。数据源来自平台几何运行时管理的后端
-    （RTAB-Map/Nav2 侧车或 Go2 SDK），但定位状态由平台状态机管理，
+    （外部 SLAM/Nav2 侧车和平台数据面），但定位状态由平台状态机管理，
     不直接暴露后端原始状态给上层。
     """
 
@@ -3127,7 +2923,7 @@ class PlatformGeometryProviderBundle(
                 "tracking_state": "unavailable",
                 "map_loaded": False,
                 "quality_score": 0.0,
-                "last_error": "平台几何运行时或 RTAB-Map profile 已禁用。",
+                "last_error": "平台几何运行时或几何 profile 已禁用。",
             }
         backend = self.runtime._resolve_localization_backend()
         if backend is None:

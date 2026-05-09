@@ -24,7 +24,7 @@ from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
 
 class PerceptionService:
@@ -89,6 +89,8 @@ class PerceptionService:
         requested_by: Optional[str] = None,
         detector_backend_name: Optional[str] = None,
         source_name: Optional[str] = None,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> PerceptionContext:
         """消费标准图像并产出检测、跟踪和场景摘要。"""
 
@@ -101,6 +103,18 @@ class PerceptionService:
             raise TypeError("PerceptionService.process_image 的 camera_info 必须是 CameraInfo。")
         if image_artifact is not None and not isinstance(image_artifact, ArtifactRef):
             raise TypeError("PerceptionService.process_image 的 image_artifact 必须是 ArtifactRef。")
+
+        metadata_update = dict(detection_metadata or {})
+        if open_vocabulary_classes is not None:
+            class_names = [str(item).strip() for item in open_vocabulary_classes if str(item or "").strip()]
+            if class_names:
+                metadata_update["open_vocabulary_classes"] = class_names
+                metadata_update.setdefault("target_classes", class_names)
+        if metadata_update:
+            image_frame = image_frame.model_copy(
+                update={"metadata": {**dict(image_frame.metadata or {}), **metadata_update}},
+                deep=True,
+            )
 
         pipeline_started_at = perf_counter()
         stage_duration_ms: Dict[str, float] = {}
@@ -300,6 +314,8 @@ class PerceptionService:
         requested_by: Optional[str] = None,
         detector_backend_name: Optional[str] = None,
         store_artifact: bool = True,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> PerceptionContext:
         """从当前图像提供器抓取一帧并完成完整感知。"""
 
@@ -324,6 +340,8 @@ class PerceptionService:
             requested_by=requested_by,
             detector_backend_name=detector_backend_name,
             source_name=image_provider.provider_name,
+            detection_metadata=detection_metadata,
+            open_vocabulary_classes=open_vocabulary_classes,
         )
 
     def describe_current_scene(
@@ -333,6 +351,8 @@ class PerceptionService:
         refresh: bool = True,
         requested_by: Optional[str] = None,
         detector_backend_name: Optional[str] = None,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> PerceptionContext:
         """返回当前场景的结构化中文摘要。"""
 
@@ -341,6 +361,8 @@ class PerceptionService:
                 camera_id=camera_id,
                 requested_by=requested_by,
                 detector_backend_name=detector_backend_name,
+                detection_metadata=detection_metadata,
+                open_vocabulary_classes=open_vocabulary_classes,
             )
         context = self.get_latest_perception(camera_id)
         if context is None:

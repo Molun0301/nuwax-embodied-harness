@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 from datetime import datetime
 
 from contracts.base import utc_now
@@ -179,6 +179,8 @@ class PerceptionVideoRuntime:
         force_keyframe: bool = False,
         reason: str = "manual",
         allow_memory_write: bool = True,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> Optional[str]:
         """手动执行一次抓帧与感知，返回摘要标题。"""
 
@@ -219,6 +221,8 @@ class PerceptionVideoRuntime:
             requested_by="perception_video_runtime",
             detector_backend_name=self._detector_backend_name or None,
             store_artifact=self._store_artifact,
+            detection_metadata=detection_metadata,
+            open_vocabulary_classes=open_vocabulary_classes,
         )
         self._keyframe_selector.mark_processed(
             timestamp=now,
@@ -254,6 +258,7 @@ class PerceptionVideoRuntime:
                 "keyframe_reason": effective_reason,
                 "memory_written": memory_written,
                 "remember_keyframes": self._remember_keyframes,
+                "detection_metadata": dict(detection_metadata or {}),
                 **dict(decision.metadata),
             }
         self._write_status(running=self.is_running())
@@ -267,6 +272,8 @@ class PerceptionVideoRuntime:
         requested_reason: str = "burst_verify",
         store_artifact: Optional[bool] = None,
         remember_result: bool = False,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> Tuple[str, ...]:
         """执行短时 burst 复核，返回成功处理的摘要列表。"""
 
@@ -284,6 +291,8 @@ class PerceptionVideoRuntime:
                     force_keyframe=True,
                     reason=requested_reason,
                     allow_memory_write=remember_result,
+                    detection_metadata=detection_metadata,
+                    open_vocabulary_classes=open_vocabulary_classes,
                 )
                 if message:
                     messages.append(message)
@@ -357,7 +366,9 @@ class PerceptionVideoRuntime:
         del current_pose, map_context
         if not allow_memory_write:
             return False
-        if self._memory_service is None or not self._remember_keyframes:
+        if self._memory_service is None:
+            return False
+        if not self._remember_keyframes and not force:
             return False
         if hasattr(self._memory_service, "is_enabled") and not self._memory_service.is_enabled():
             return False

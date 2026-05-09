@@ -19,6 +19,7 @@ from contracts.capabilities import (
 )
 from contracts.base import MetadataDict
 from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose, Quaternion, Twist, Vector3
 from contracts.memory import MemoryPayloadFilter
 from contracts.spatial_memory import SceneSpaceReviewStatus
@@ -1713,7 +1714,7 @@ class GatewayRuntime:
             _descriptor(
                 "navigate_to_named_location",
                 "导航到命名位置",
-                "优先使用已标记地点，其次使用语义记忆候选，把自然语言目标解析成导航目标并可在到点后复核。",
+                "只查询已标记地点和已入库语义记忆目标，把自然语言目标解析成已知导航目标；不触发现场开放词汇识别。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -1736,7 +1737,7 @@ class GatewayRuntime:
             _descriptor(
                 "find_target",
                 "查找目标",
-                "优先检查当前场景，其次回忆同图记忆候选并导航复核，用于查找人、物或地点。",
+                "按开放词汇 query 调用当前/探索感知识别目标，投影成地图位姿并写入语义记忆；低歧义自动导航，高歧义返回澄清候选。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -1782,7 +1783,11 @@ class GatewayRuntime:
                     }
                 ),
                 output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
-                required_resources=(RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value),
+                required_resources=(
+                    RuntimeResource.BASE_MOTION.value,
+                    RuntimeResource.NAVIGATION.value,
+                    RuntimeResource.CAMERA_OBSERVATION.value,
+                ),
                 timeout_sec=300,
                 cancel_supported=True,
             ),
@@ -2336,14 +2341,14 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="navigate_to_named_location",
                 display_name="导航到命名位置",
-                description="优先使用地点记忆，其次使用语义地图，导航到命名位置。",
+                description="查询已入库地点或目标记忆并导航，不做现场开放词汇识别。",
                 category=SkillCategory.TASK,
                 capability_name="navigate_to_named_location",
             ),
             SkillDescriptor(
                 name="find_target",
                 display_name="查找目标",
-                description="优先检查当前场景，再基于向量记忆回忆目标位置并导航复核。",
+                description="用开放词汇视觉识别查找物品，写入语义记忆后低歧义导航，高歧义澄清。",
                 category=SkillCategory.TASK,
                 capability_name="find_target",
             ),
@@ -3908,6 +3913,12 @@ class GatewayRuntime:
             create_if_missing=False,
         )
         self._refresh_workspace_snapshots()
+        self._ensure_localization_ready(
+            capability_name="find_target",
+            map_name=map_name,
+            workspace=workspace,
+        )
+        workspace = self.map_workspace_service.get_active_workspace() or workspace
         self._ensure_workspace_memory_library_ready(map_name=map_name)
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
@@ -4970,6 +4981,15 @@ class GatewayRuntime:
         remember_result: bool,
         frame_count: int,
     ) -> Dict[str, Any]:
+        target_classes = [query]
+        detection_metadata = {
+            "query": query,
+            "open_vocabulary_classes": target_classes,
+            "target_classes": target_classes,
+            "requested_by": requested_by or "unknown",
+            "source": reason,
+            "camera_id": camera_id or "",
+        }
         burst_messages: Tuple[str, ...] = ()
         perception_context = None
         if self.perception_video_runtime.is_enabled():
@@ -4978,7 +4998,9 @@ class GatewayRuntime:
                 interval_sec=0.05,
                 requested_reason=reason,
                 store_artifact=False,
-                remember_result=remember_result,
+                remember_result=False,
+                detection_metadata=detection_metadata,
+                open_vocabulary_classes=target_classes,
             )
             perception_context = self.perception_service.get_latest_perception(camera_id)
         else:
@@ -4986,28 +5008,179 @@ class GatewayRuntime:
                 camera_id=camera_id,
                 refresh=True,
                 requested_by=requested_by or "target_search",
+                detection_metadata=detection_metadata,
+                open_vocabulary_classes=target_classes,
             )
-            if remember_result and self.memory_service.is_enabled():
-                try:
-                    self.memory_service.remember_current_scene(
-                        title="自动目标搜索：%s" % query[:48],
-                        camera_id=camera_id,
-                        summary_override=perception_context.scene_summary.headline,
-                        tags=[query],
-                        metadata={
-                            "requested_by": requested_by or "unknown",
-                            "source": reason,
-                        },
-                    )
-                except Exception:
-                    RUNTIME_LOGGER.exception("目标搜索时写入当前场景记忆失败 query=%s", query)
+
+        detection_evidence = self._build_target_detection_evidence(query, perception_context)
+        memory_written = False
+        if (
+            remember_result
+            and self.memory_service.is_enabled()
+            and perception_context is not None
+            and detection_evidence["has_detection_evidence"]
+        ):
+            try:
+                self.memory_service.remember_current_scene(
+                    title="目标识别：%s" % query[:48],
+                    camera_id=perception_context.camera_id,
+                    summary_override=perception_context.scene_summary.headline,
+                    tags=[query, *detection_evidence["matched_labels"]],
+                    metadata={
+                        "requested_by": requested_by or "unknown",
+                        "source": reason,
+                        "capture_mode": "target_search_burst" if burst_messages else "target_search_single",
+                        "target_search_query": query,
+                        "target_detection_evidence": True,
+                        "detection_metadata": detection_metadata,
+                        **detection_evidence,
+                    },
+                )
+                memory_written = True
+            except Exception:
+                RUNTIME_LOGGER.exception("目标搜索时写入目标检测记忆失败 query=%s", query)
         return {
             "burst_messages": burst_messages,
             "scene_headline": (
                 perception_context.scene_summary.headline if perception_context is not None else None
             ),
-            "camera_id": camera_id,
+            "camera_id": perception_context.camera_id if perception_context is not None else camera_id,
+            "detection_metadata": detection_metadata,
+            "detection_evidence": detection_evidence,
+            "memory_written": memory_written,
         }
+
+    def _target_label_matches_query(self, query: str, label: str) -> bool:
+        normalized_query = self._normalize_query(query)
+        normalized_label = self._normalize_query(label)
+        if not normalized_query or not normalized_label:
+            return False
+        return (
+            normalized_query == normalized_label
+            or normalized_query in normalized_label
+            or normalized_label in normalized_query
+        )
+
+    def _target_query_matches_any(self, query: str, values: Any) -> bool:
+        normalized_query = self._normalize_query(query)
+        if not normalized_query:
+            return False
+        if isinstance(values, dict):
+            iterable = values.values()
+        elif isinstance(values, (list, tuple, set, frozenset)):
+            iterable = values
+        else:
+            iterable = (values,)
+        for value in iterable:
+            if isinstance(value, dict):
+                if self._target_query_matches_any(normalized_query, value):
+                    return True
+                continue
+            if isinstance(value, (list, tuple, set, frozenset)):
+                if self._target_query_matches_any(normalized_query, value):
+                    return True
+                continue
+            if self._target_label_matches_query(normalized_query, str(value or "")):
+                return True
+        return False
+
+    def _frame_ids_match(self, left: str, right: str) -> bool:
+        normalized_left = str(left or "").strip()
+        normalized_right = str(right or "").strip()
+        if not normalized_left or not normalized_right:
+            return False
+        if normalized_left == normalized_right:
+            return True
+        try:
+            return frame_ids_semantically_equal(normalized_left, normalized_right)
+        except ValueError:
+            return False
+
+    def _target_navigation_frame_is_disallowed(self, frame_id: str) -> bool:
+        normalized = str(frame_id or "").strip().lower().replace("/", "_")
+        if not normalized:
+            return True
+        if any(token in normalized for token in ("camera", "cam", "lidar", "imu", "base", "footprint")):
+            return True
+        for disallowed in ("odom", "odom_combined", "base", "base_link", "base_footprint"):
+            if self._frame_ids_match(frame_id, disallowed):
+                return True
+        return False
+
+    def _target_navigation_map_frame_ids(self, workspace: Any = None) -> Set[str]:
+        configured_map_frame = str(getattr(getattr(self.config.geometry, "frames", None), "map_frame", "") or "").strip()
+        accepted_frames = {"map"}
+        if configured_map_frame and not self._target_navigation_frame_is_disallowed(configured_map_frame):
+            accepted_frames.add(configured_map_frame)
+        if workspace is None:
+            workspace = self.map_workspace_service.get_active_workspace()
+        for value in (
+            getattr(getattr(workspace, "latest_map_snapshot", None), "frame_id", None),
+            getattr(getattr(workspace, "active_localization_session", None), "frame_id", None),
+            getattr(getattr(workspace, "map_asset", None), "frame_id", None),
+        ):
+            frame_id = str(value or "").strip()
+            if frame_id and not self._target_navigation_frame_is_disallowed(frame_id):
+                accepted_frames.add(frame_id)
+        return accepted_frames
+
+    def _target_pose_is_map_frame(self, frame_id: str, workspace: Any = None) -> bool:
+        target_frame_id = str(frame_id or "").strip()
+        if not target_frame_id:
+            return False
+        return any(
+            self._frame_ids_match(target_frame_id, map_frame_id)
+            for map_frame_id in self._target_navigation_map_frame_ids(workspace)
+        )
+
+    def _build_target_detection_evidence(self, query: str, perception_context) -> Dict[str, Any]:
+        evidence: Dict[str, Any] = {
+            "has_detection_evidence": False,
+            "matched_labels": [],
+            "matched_detection_count": 0,
+            "best_detection_score": None,
+            "best_detection_label": "",
+            "projection_method": "",
+            "geometry_projection_method": "",
+            "projection_confidence": None,
+            "support_point_count": None,
+            "projection_degradation_reason": "",
+        }
+        if perception_context is None:
+            return evidence
+        matched_detections = []
+        for detection in perception_context.observation.detections_2d:
+            labels = [detection.label]
+            attributes = dict(detection.attributes or {})
+            labels.extend(self._coerce_optional_str_list(attributes.get("aliases")))
+            if any(self._target_label_matches_query(query, label) for label in labels):
+                matched_detections.append(detection)
+        if not matched_detections:
+            return evidence
+        matched_detections.sort(key=lambda item: item.score, reverse=True)
+        best_detection = matched_detections[0]
+        attributes = dict(best_detection.attributes or {})
+        evidence.update(
+            {
+                "has_detection_evidence": True,
+                "matched_labels": sorted(
+                    {
+                        str(detection.label).strip()
+                        for detection in matched_detections
+                        if str(detection.label or "").strip()
+                    }
+                ),
+                "matched_detection_count": len(matched_detections),
+                "best_detection_score": float(best_detection.score),
+                "best_detection_label": str(best_detection.label),
+                "projection_method": str(attributes.get("projection_method") or ""),
+                "geometry_projection_method": str(attributes.get("geometry_projection_method") or ""),
+                "projection_confidence": self._coerce_optional_float(attributes.get("projection_confidence")),
+                "support_point_count": self._coerce_optional_int(attributes.get("support_point_count")),
+                "projection_degradation_reason": str(attributes.get("projection_degradation_reason") or ""),
+            }
+        )
+        return evidence
 
     def _report_platform_exploration_hit_stop(self, reason: str) -> None:
         geometry_runtime = getattr(self, "platform_geometry_runtime", None)
@@ -5043,6 +5216,23 @@ class GatewayRuntime:
             expected_map_version_id=current_map_version_id,
             localization_session_id=current_localization_session_id,
         )
+        current_scene_detection_evidence = self._build_target_detection_evidence(
+            query,
+            self.perception_service.get_latest_perception(camera_id),
+        )
+        if current_scene_verification.verified and not current_scene_detection_evidence["has_detection_evidence"]:
+            current_scene_verification = current_scene_verification.model_copy(
+                update={
+                    "verified": False,
+                    "reason": "当前场景缺少目标检测证据，已拒绝开放词汇找物命中。",
+                    "metadata": {
+                        **dict(current_scene_verification.metadata or {}),
+                        "target_detection_required": True,
+                        "target_detection_evidence": current_scene_detection_evidence,
+                    },
+                },
+                deep=True,
+            )
         resolved_memory_candidates = [
             candidate
             for candidate in self.memory_service.resolve_navigation_candidates(
@@ -5057,27 +5247,26 @@ class GatewayRuntime:
         candidate_diagnostics: List[Dict[str, Any]] = []
         memory_candidates: List[Any] = []
         for candidate in resolved_memory_candidates:
-            diagnostic = self._assess_target_navigation_candidate(candidate)
+            diagnostic = self._assess_target_navigation_candidate(candidate, query=query, workspace=workspace)
             candidate_diagnostics.append(diagnostic)
             if diagnostic["allowed_for_navigation"]:
                 memory_candidates.append(candidate)
+        memory_candidates, clarification = self._select_low_ambiguity_target_candidates(
+            query=query,
+            candidates=memory_candidates,
+            candidate_diagnostics=candidate_diagnostics,
+        )
         semantic_goal = None
-        if not memory_candidates:
-            try:
-                semantic_goal = self.memory_service.resolve_semantic_region_goal(
-                    query,
-                    map_name=map_name,
-                )
-            except GatewayError:
-                semantic_goal = None
         return {
             "workspace": workspace,
             "current_map_version_id": current_map_version_id,
             "current_localization_session_id": current_localization_session_id,
             "current_scene_verification": current_scene_verification,
+            "current_scene_detection_evidence": current_scene_detection_evidence,
             "memory_candidates": tuple(memory_candidates),
             "candidate_diagnostics": tuple(candidate_diagnostics),
             "semantic_goal": semantic_goal,
+            "clarification": clarification,
         }
 
     def _coerce_optional_float(self, value: Any) -> Optional[float]:
@@ -5188,12 +5377,21 @@ class GatewayRuntime:
         self,
         candidate,
         *,
+        query: str = "",
+        workspace: Any = None,
         allowed_for_navigation: Optional[bool] = None,
         rejection_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         metadata = dict(getattr(candidate, "metadata", {}) or {})
+        normalized_query = self._normalize_query(query)
         candidate_score = self._coerce_optional_float(metadata.get("candidate_score"))
-        projection_confidence = self._coerce_optional_float(metadata.get("projection_confidence"))
+        projection_confidence_raw = metadata.get("projection_confidence")
+        projection_confidence_present = "projection_confidence" in metadata
+        projection_confidence = self._coerce_optional_float(projection_confidence_raw)
+        projection_confidence_valid = (
+            not projection_confidence_present
+            or (projection_confidence is not None and math.isfinite(projection_confidence))
+        )
         support_point_count = self._coerce_optional_int(metadata.get("support_point_count"))
         segmentation_score = self._coerce_optional_float(metadata.get("segmentation_score"))
         predicted_iou = self._coerce_optional_float(metadata.get("predicted_iou"))
@@ -5215,15 +5413,106 @@ class GatewayRuntime:
             navigation_quality = {}
         else:
             navigation_quality = dict(navigation_quality)
+        target_pose = getattr(candidate, "target_pose", None)
+        record_kind_value = str(getattr(getattr(candidate, "record_kind", None), "value", "") or "")
+        linked_object_instance_ids = self._coerce_optional_str_list(metadata.get("linked_object_instance_ids"))
+        evidence_event_id = str(
+            metadata.get("observation_event_id")
+            or metadata.get("last_observation_event_id")
+            or metadata.get("linked_observation_event_id")
+            or metadata.get("verification_event_id")
+            or ""
+        ).strip()
+        target_detection_evidence = self._coerce_optional_bool(metadata.get("target_detection_evidence")) is True
+        has_detection_evidence_flag = self._coerce_optional_bool(metadata.get("has_detection_evidence")) is True
+        matched_detection_count = self._coerce_optional_int(metadata.get("matched_detection_count"))
+        detection_metadata = metadata.get("detection_metadata")
+        if not isinstance(detection_metadata, dict):
+            detection_metadata = {}
+        detection_query_values = [
+            metadata.get("target_search_query"),
+            metadata.get("search_query"),
+            metadata.get("query"),
+            detection_metadata.get("query"),
+            detection_metadata.get("target_query"),
+            detection_metadata.get("target_search_query"),
+            detection_metadata.get("open_vocabulary_query"),
+        ]
+        detection_query = next((str(value).strip() for value in detection_query_values if str(value or "").strip()), "")
+        matched_labels = self._coerce_optional_str_list(metadata.get("matched_labels"))
+        best_detection_label = str(metadata.get("best_detection_label") or "").strip()
+        detection_label_values = [
+            matched_labels,
+            best_detection_label,
+            metadata.get("detection_label"),
+            metadata.get("target_label"),
+            detection_metadata.get("matched_labels"),
+            detection_metadata.get("best_detection_label"),
+            detection_metadata.get("open_vocabulary_classes"),
+        ]
+        query_matched_fields = []
+        if self._target_query_matches_any(normalized_query, detection_query_values):
+            query_matched_fields.append("detection_query")
+        if self._target_query_matches_any(normalized_query, detection_label_values):
+            query_matched_fields.append("detection_label")
+        explicit_query_match_keys = (
+            "query_matched_detection_evidence",
+            "detection_query_matched",
+            "target_query_matched",
+            "target_search_query_matched",
+            "open_vocabulary_query_matched",
+            "query_matched",
+        )
+        explicit_query_match_evidence = any(
+            self._coerce_optional_bool(source.get(key)) is True
+            for source in (metadata, detection_metadata)
+            for key in explicit_query_match_keys
+        )
+        has_query_match_evidence = bool(normalized_query and (query_matched_fields or explicit_query_match_evidence))
+        has_detection_signal = bool(
+            target_detection_evidence
+            or has_detection_evidence_flag
+            or (matched_detection_count is not None and matched_detection_count > 0)
+            or matched_labels
+            or best_detection_label
+            or detection_query
+            or explicit_query_match_evidence
+        )
+        query_matched_detection_evidence = bool(has_query_match_evidence and has_detection_signal)
+        query_matched_event_evidence = bool(evidence_event_id and has_query_match_evidence)
+        projection_method = str(metadata.get("projection_method") or "")
+        geometry_projection_method = str(metadata.get("geometry_projection_method") or "")
+        geometry_projection_status = str(metadata.get("geometry_projection_status") or "")
+        segmentation_projection_status = str(metadata.get("segmentation_projection_status") or "")
+        has_projection_geometry_state = bool(
+            projection_method
+            or geometry_projection_method
+            or geometry_projection_status
+            or segmentation_projection_status
+        )
+        has_projection_evidence = bool(has_projection_geometry_state)
+        target_frame_id = str(getattr(target_pose, "frame_id", "") or "") if target_pose is not None else ""
+        accepted_map_frame_ids = sorted(self._target_navigation_map_frame_ids(workspace))
+        target_pose_in_map_frame = self._target_pose_is_map_frame(target_frame_id, workspace)
+        target_evidence_source = ""
+        if query_matched_detection_evidence:
+            target_evidence_source = "detection"
+        elif query_matched_event_evidence:
+            target_evidence_source = "observation_event"
+        has_detection_evidence = bool(target_evidence_source)
         diagnostic = {
             "record_id": str(getattr(candidate, "record_id", "") or ""),
-            "record_kind": str(getattr(getattr(candidate, "record_kind", None), "value", "") or ""),
+            "record_kind": record_kind_value,
             "target_name": str(getattr(candidate, "target_name", "") or ""),
             "map_version_id": getattr(candidate, "map_version_id", None),
             "topo_node_id": getattr(candidate, "topo_node_id", None),
             "semantic_region_id": getattr(candidate, "semantic_region_id", None),
             "distance_m": getattr(candidate, "distance_m", None),
             "verification_query": getattr(candidate, "verification_query", None),
+            "has_goal_pose": target_pose is not None,
+            "target_frame_id": target_frame_id,
+            "target_pose_in_map_frame": target_pose_in_map_frame,
+            "accepted_map_frame_ids": accepted_map_frame_ids,
             "camera_id": str(metadata.get("camera_id") or ""),
             "backend_type": str(metadata.get("backend_type") or metadata.get("backend") or "memory_service"),
             "backend": str(metadata.get("backend") or metadata.get("backend_type") or "memory_service"),
@@ -5231,12 +5520,30 @@ class GatewayRuntime:
             "candidate_id": str(metadata.get("candidate_id") or ""),
             "anchor_id": str(metadata.get("anchor_id") or ""),
             "candidate_score": candidate_score,
-            "projection_method": str(metadata.get("projection_method") or ""),
+            "has_target_evidence": has_detection_evidence,
+            "target_evidence_source": target_evidence_source,
+            "evidence_record_kind": record_kind_value if record_kind_value in {"object_instance", "observation_event"} else "",
+            "linked_object_instance_ids": linked_object_instance_ids,
+            "evidence_event_id": evidence_event_id,
+            "target_detection_evidence": target_detection_evidence,
+            "has_detection_evidence_flag": has_detection_evidence_flag,
+            "matched_detection_count": matched_detection_count,
+            "detection_query": detection_query,
+            "query_match_evidence_fields": query_matched_fields,
+            "explicit_query_match_evidence": explicit_query_match_evidence,
+            "query_matched_detection_evidence": query_matched_detection_evidence,
+            "query_matched_event_evidence": query_matched_event_evidence,
+            "projection_method": projection_method,
+            "geometry_projection_method": geometry_projection_method,
             "projection_confidence": projection_confidence,
+            "projection_confidence_present": projection_confidence_present,
+            "projection_confidence_valid": projection_confidence_valid,
             "support_point_count": support_point_count,
+            "has_projection_evidence": has_projection_evidence,
+            "has_projection_geometry_state": has_projection_geometry_state,
             "projection_degradation_reason": str(metadata.get("projection_degradation_reason") or ""),
-            "geometry_projection_status": str(metadata.get("geometry_projection_status") or ""),
-            "segmentation_projection_status": str(metadata.get("segmentation_projection_status") or ""),
+            "geometry_projection_status": geometry_projection_status,
+            "segmentation_projection_status": segmentation_projection_status,
             "has_structured_segmentation": has_structured_segmentation,
             "segmentation_score": segmentation_score,
             "predicted_iou": predicted_iou,
@@ -5264,12 +5571,35 @@ class GatewayRuntime:
         }
         return diagnostic
 
-    def _assess_target_navigation_candidate(self, candidate) -> Dict[str, Any]:
-        diagnostic = self._build_target_candidate_diagnostic(candidate)
+    def _assess_target_navigation_candidate(self, candidate, *, query: str = "", workspace: Any = None) -> Dict[str, Any]:
+        diagnostic = self._build_target_candidate_diagnostic(candidate, query=query, workspace=workspace)
         rejection_reason = None
         recommended_action = diagnostic.get("recommended_action")
         navigation_quality = diagnostic.get("navigation_quality")
-        if isinstance(navigation_quality, dict) and recommended_action:
+        if diagnostic["record_kind"] not in {"object_instance", "observation_event"}:
+            rejection_reason = "target_navigation_source_not_object_evidence"
+        elif not diagnostic["has_target_evidence"]:
+            rejection_reason = "target_evidence_missing"
+        elif not diagnostic["has_goal_pose"] or not diagnostic["target_frame_id"]:
+            rejection_reason = "target_pose_missing"
+        elif not diagnostic["target_pose_in_map_frame"]:
+            rejection_reason = "target_pose_not_map_frame"
+        elif (
+            diagnostic["projection_method"] == "current_pose_fallback"
+            or diagnostic["geometry_projection_method"] == "current_pose_fallback"
+        ):
+            rejection_reason = "projection_method_current_pose_fallback"
+        elif diagnostic["support_point_count"] is None or diagnostic["support_point_count"] <= 0:
+            rejection_reason = "support_point_count_below_threshold"
+        elif not diagnostic["has_projection_evidence"]:
+            rejection_reason = "projection_evidence_missing"
+        elif not diagnostic["projection_confidence_valid"]:
+            rejection_reason = "projection_confidence_invalid"
+        elif diagnostic["projection_confidence"] is not None and diagnostic["projection_confidence"] < 0.2:
+            rejection_reason = "projection_confidence_below_threshold"
+        elif diagnostic["segmentation_review_required"]:
+            rejection_reason = diagnostic["segmentation_quality_reason"] or "segmentation_review_required"
+        elif isinstance(navigation_quality, dict) and recommended_action:
             if recommended_action == "navigate":
                 rejection_reason = None
             elif recommended_action == "verify_then_navigate":
@@ -5286,10 +5616,8 @@ class GatewayRuntime:
             rejection_reason = diagnostic["segmentation_quality_reason"] or "segmentation_review_required"
         elif diagnostic["candidate_score"] is not None and diagnostic["candidate_score"] < 0.35:
             rejection_reason = "candidate_score_below_threshold"
-        elif diagnostic["projection_confidence"] is not None and diagnostic["projection_confidence"] < 0.2:
-            rejection_reason = "projection_confidence_below_threshold"
         elif (
-            diagnostic["projection_method"]
+            (diagnostic["projection_method"] or diagnostic["geometry_projection_method"])
             and diagnostic["support_point_count"] is not None
             and diagnostic["support_point_count"] <= 0
         ):
@@ -5297,6 +5625,79 @@ class GatewayRuntime:
         diagnostic["allowed_for_navigation"] = rejection_reason is None
         diagnostic["rejection_reason"] = rejection_reason
         return diagnostic
+
+    def _target_candidate_score_from_diagnostic(self, diagnostic: Dict[str, Any]) -> Optional[float]:
+        score = self._coerce_optional_float(diagnostic.get("candidate_score"))
+        if score is not None:
+            return score
+        navigation_quality = diagnostic.get("navigation_quality")
+        if isinstance(navigation_quality, dict):
+            return self._coerce_optional_float(navigation_quality.get("confidence"))
+        return None
+
+    def _build_target_clarification(
+        self,
+        *,
+        query: str,
+        reason: str,
+        candidate_diagnostics: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        candidates = [
+            dict(item)
+            for item in candidate_diagnostics
+            if item.get("allowed_for_navigation") is True
+        ]
+        return {
+            "action": "clarify",
+            "reason": reason,
+            "query": query,
+            "message": "找到多个可导航候选，请补充更明确的目标描述或选择候选 record_id。",
+            "candidates": candidates[:5],
+        }
+
+    def _select_low_ambiguity_target_candidates(
+        self,
+        *,
+        query: str,
+        candidates: List[Any],
+        candidate_diagnostics: List[Dict[str, Any]],
+    ) -> Tuple[List[Any], Optional[Dict[str, Any]]]:
+        if not candidates:
+            return candidates, None
+        diagnostics_by_record_id = {str(item.get("record_id") or ""): item for item in candidate_diagnostics}
+        eligible_candidates = []
+        for candidate in candidates:
+            diagnostic = diagnostics_by_record_id.get(str(getattr(candidate, "record_id", "") or ""), {})
+            if diagnostic.get("allowed_for_navigation") is not True:
+                continue
+            if not diagnostic.get("has_goal_pose"):
+                continue
+            if diagnostic.get("segmentation_review_required"):
+                continue
+            eligible_candidates.append(candidate)
+        if not eligible_candidates:
+            return [], None
+        if len(eligible_candidates) == 1:
+            return [eligible_candidates[0]], None
+
+        top_candidate = eligible_candidates[0]
+        second_candidate = eligible_candidates[1]
+        top_diagnostic = diagnostics_by_record_id.get(str(getattr(top_candidate, "record_id", "") or ""), {})
+        second_diagnostic = diagnostics_by_record_id.get(str(getattr(second_candidate, "record_id", "") or ""), {})
+        top_score = self._target_candidate_score_from_diagnostic(top_diagnostic)
+        second_score = self._target_candidate_score_from_diagnostic(second_diagnostic)
+        if top_score is None or second_score is None or (top_score - second_score) < 0.08:
+            clarification = self._build_target_clarification(
+                query=query,
+                reason="ambiguous_navigation_candidates",
+                candidate_diagnostics=candidate_diagnostics,
+            )
+            for item in candidate_diagnostics:
+                if item.get("allowed_for_navigation") is True:
+                    item["ambiguity_state"] = "needs_clarification"
+                    item["clarification_reason"] = "ambiguous_navigation_candidates"
+            return [], clarification
+        return [top_candidate], None
 
     def _build_goal_from_navigation_candidate(
         self,
@@ -5352,6 +5753,20 @@ class GatewayRuntime:
             expected_map_version_id=expected_map_version_id,
             localization_session_id=localization_session_id,
         )
+        detection_evidence = refresh_payload.get("detection_evidence") or {}
+        if arrival_verification.verified and not detection_evidence.get("has_detection_evidence"):
+            arrival_verification = arrival_verification.model_copy(
+                update={
+                    "verified": False,
+                    "reason": "到点后缺少目标检测证据，已拒绝开放词汇找物复核。",
+                    "metadata": {
+                        **dict(arrival_verification.metadata or {}),
+                        "target_detection_required": True,
+                        "target_detection_evidence": detection_evidence,
+                    },
+                },
+                deep=True,
+            )
         return {
             "burst_messages": refresh_payload["burst_messages"],
             "scene_headline": refresh_payload["scene_headline"],
@@ -5376,10 +5791,28 @@ class GatewayRuntime:
     ) -> Optional[Dict[str, Any]]:
         memory_candidates = list(search_state["memory_candidates"])
         semantic_goal = search_state["semantic_goal"]
+        clarification = search_state.get("clarification")
         current_map_version_id = search_state["current_map_version_id"]
         current_localization_session_id = search_state["current_localization_session_id"]
         workspace = search_state["workspace"]
         candidate_diagnostics = [dict(item) for item in search_state.get("candidate_diagnostics", ())]
+        if clarification is not None and capability_name == "find_target":
+            task_context.update(
+                progress=1.0,
+                stage="clarification_required",
+                message="找到多个可能目标，需要澄清后再导航。",
+                payload={"query": query, "action": "clarify"},
+            )
+            return {
+                "found_mode": "clarification_required",
+                "action": "clarify",
+                "clarification": clarification,
+                "navigation_candidate": None,
+                "navigation_context": None,
+                "attempted_candidate_ids": [],
+                "candidate_diagnostics": candidate_diagnostics,
+                "rejected_candidate_ids": sorted(rejected_record_ids),
+            }
         rejected_candidates = [
             dict(item)
             for item in candidate_diagnostics
@@ -5389,12 +5822,12 @@ class GatewayRuntime:
             record_id = str(item.get("record_id") or "").strip()
             if record_id:
                 rejected_record_ids.add(record_id)
-        if not memory_candidates and semantic_goal is None:
+        if not memory_candidates and (semantic_goal is None or capability_name == "find_target"):
             if allow_not_found:
                 return None
             raise GatewayError(
-                "未在地图 %s 的记忆库或语义区域中找到目标：%s" % (map_name, query),
-                error_code="target_not_found_in_memory",
+                "未在地图 %s 中找到具备目标检测和地图投影证据的目标：%s" % (map_name, query),
+                error_code="target_not_found_with_evidence",
                 http_status=404,
                 jsonrpc_code=-32004,
                 details={
@@ -6281,7 +6714,11 @@ class GatewayRuntime:
         return max(minimum_sec, selected_timeout)
 
     def _normalize_query(self, value: Optional[str]) -> str:
-        return "".join(char.lower() if char.isalnum() or "\u4e00" <= char <= "\u9fff" else " " for char in str(value or "")).strip()
+        normalized = "".join(
+            char.lower() if char.isalnum() or "\u4e00" <= char <= "\u9fff" else " "
+            for char in str(value or "")
+        )
+        return " ".join(normalized.split())
 
     def _optional_str(self, payload: Dict[str, Any], key: str) -> Optional[str]:
         value = payload.get(key)

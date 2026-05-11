@@ -237,13 +237,16 @@ class Nav2ActionNavigationProvider:
         lifecycle = self._read_lifecycle_status()
         action_ready = self._is_action_server_ready()
         costmaps = self._costmap_status()
+        costmaps_ready = self._costmaps_ready(costmaps)
         tf_ready, tf_error = self._tf_ready()
+        lifecycle_ready = self._lifecycle_ready(lifecycle)
+        lifecycle_observation_uncertain = self._lifecycle_observation_uncertain(lifecycle)
         errors: Dict[str, str] = {}
-        if not self._lifecycle_ready(lifecycle):
+        if not lifecycle_ready and not (lifecycle_observation_uncertain and action_ready and costmaps_ready and tf_ready):
             errors["lifecycle"] = "Nav2 lifecycle 未全部 active。"
         if not action_ready:
             errors["action"] = "Nav2 /navigate_to_pose action server 不可用。"
-        if not self._costmaps_ready(costmaps):
+        if not costmaps_ready:
             errors["costmap"] = "Nav2 global/local costmap 尚未首帧并连续更新。"
         if not tf_ready:
             errors["tf"] = tf_error or "TF/localization 不可用。"
@@ -480,6 +483,15 @@ class Nav2ActionNavigationProvider:
     @staticmethod
     def _lifecycle_ready(lifecycle: Dict[str, object]) -> bool:
         return bool(lifecycle) and all(bool(item.get("active")) for item in lifecycle.values() if isinstance(item, dict))
+
+    @staticmethod
+    def _lifecycle_observation_uncertain(lifecycle: Dict[str, object]) -> bool:
+        if not lifecycle:
+            return False
+        for item in lifecycle.values():
+            if not isinstance(item, dict) or not item.get("available") or item.get("state") is not None or item.get("error"):
+                return False
+        return True
 
     @staticmethod
     def _costmaps_ready(costmaps: Dict[str, object]) -> bool:

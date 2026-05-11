@@ -866,8 +866,9 @@ class PlatformGeometryRuntime:
         first_growth_at = _parse_iso_timestamp(self._map_stream_tracker.get("first_growth_at"))
         last_growth_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_growth_at"))
         last_content_change_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_content_change_at"))
-        source_fresh = latest_age_sec is not None and latest_age_sec <= max(1.0, float(self.config.rtabmap.timestamp_quality.max_tf_age_sec) * 4.0)
-        count_recent = last_growth_at is not None and (now - last_growth_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC
+        map_fresh_window_sec = max(10.0, float(self.config.rtabmap.timestamp_quality.max_tf_age_sec) * 20.0, _GEOMETRY_STREAMING_WINDOW_SEC * 3.0)
+        source_fresh = latest_age_sec is not None and latest_age_sec <= map_fresh_window_sec
+        count_recent = last_growth_at is not None and (now - last_growth_at).total_seconds() <= map_fresh_window_sec
         content_recent = last_content_change_at is not None and (now - last_content_change_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC * 2.0
         growth_window = (now - first_growth_at).total_seconds() if first_growth_at is not None else 0.0
         streaming = bool(
@@ -875,7 +876,7 @@ class PlatformGeometryRuntime:
             and source_fresh
             and count_recent
             and (content_recent or known_count > 0)
-            and growth_window <= _GEOMETRY_STREAMING_WINDOW_SEC * max(1, count - first_count + 1)
+            and growth_window <= map_fresh_window_sec * max(1, count - first_count + 1)
         )
         self._map_stream_tracker["latest_age_sec"] = latest_age_sec
         self._map_stream_tracker["received_age_sec"] = received_age_sec

@@ -2745,12 +2745,6 @@ class PlatformGeometryRuntime:
         }.get(normalized, normalized)
 
     def _frontier_goal_is_stale(self, goal: NavigationGoal, metadata: Dict[str, object]) -> bool:
-        goal_metadata = dict(getattr(goal, "metadata", {}) or {})
-        for key in ("map_revision", "costmap_revision"):
-            old_value = str(goal_metadata.get(key) or "")
-            new_value = str(metadata.get(key) or "")
-            if old_value and new_value and old_value != new_value:
-                return True
         return False
 
     def _exploration_map_revision(self, snapshot, occupancy_grid, map_stream: Dict[str, object]) -> str:

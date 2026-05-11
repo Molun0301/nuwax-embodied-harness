@@ -87,6 +87,7 @@ class Nav2ActionNavigationProvider:
         self._action_client = None
         self._goal_handle = None
         self._result_future = None
+        self._goal_sequence = 0
         self._rclpy = None
         self._get_state_type = None
         self._lifecycle_clients: Dict[str, Any] = {}
@@ -119,32 +120,50 @@ class Nav2ActionNavigationProvider:
                 metadata={"backend": "nav2", "failure_reason": "target_pose_missing", "readiness": self._status_dict(readiness)},
             )
             return False
+        goal_sequence = None
         try:
             goal_msg = self._build_nav2_goal(goal.target_pose)
-            future = self._action_client.send_goal_async(goal_msg, feedback_callback=self._on_feedback)
-            future.add_done_callback(lambda completed: self._on_goal_response(completed, goal.goal_id))
+            with self._lock:
+                self._goal_sequence += 1
+                goal_sequence = self._goal_sequence
+                self._goal_handle = None
+                self._result_future = None
+                self._state = NavigationState(
+                    current_goal_id=goal.goal_id,
+                    status=NavigationStatus.PLANNING,
+                    current_pose=self._read_current_pose(),
+                    goal_reached=False,
+                    message="Nav2 /navigate_to_pose 目标已发送，等待 action server 接受。",
+                    metadata={
+                        "backend": "nav2",
+                        "action_name": self.runtime.config.nav2.action_name,
+                        "readiness": self._status_dict(readiness),
+                        "target_pose": goal.target_pose.model_dump(mode="json"),
+                        "goal_sequence": goal_sequence,
+                    },
+                )
+            future = self._action_client.send_goal_async(goal_msg, feedback_callback=lambda feedback: self._on_feedback(feedback, goal.goal_id, goal_sequence))
+            future.add_done_callback(lambda completed: self._on_goal_response(completed, goal.goal_id, goal_sequence))
         except Exception as exc:
-            self._state = NavigationState(
-                current_goal_id=goal.goal_id,
-                status=NavigationStatus.FAILED,
-                message="Nav2 action 发送目标失败：%s" % exc,
-                metadata={"backend": "nav2", "failure_reason": "action_send_failed", "error": str(exc)},
-            )
+            metadata = {"backend": "nav2", "failure_reason": "action_send_failed", "error": str(exc)}
+            if goal_sequence is not None:
+                metadata["goal_sequence"] = goal_sequence
+            with self._lock:
+                self._state = NavigationState(
+                    current_goal_id=goal.goal_id,
+                    status=NavigationStatus.FAILED,
+                    current_pose=self._read_current_pose(),
+                    message="Nav2 action 发送目标失败：%s" % exc,
+                    metadata=metadata,
+                )
             return False
-        self._state = NavigationState(
-            current_goal_id=goal.goal_id,
-            status=NavigationStatus.ACCEPTED,
-            current_pose=self._read_current_pose(),
-            goal_reached=False,
-            message="Nav2 /navigate_to_pose 目标已发送，等待 action server 接受。",
-            metadata={"backend": "nav2", "action_name": self.runtime.config.nav2.action_name, "readiness": self._status_dict(readiness)},
-        )
         return True
 
     def cancel_goal(self) -> bool:
         with self._lock:
             goal_handle = self._goal_handle
             current_goal_id = self._state.current_goal_id
+            self._goal_sequence += 1
         if goal_handle is not None:
             try:
                 goal_handle.cancel_goal_async()
@@ -396,28 +415,41 @@ class Nav2ActionNavigationProvider:
         goal_msg.pose.pose.orientation.w = float(target_pose.orientation.w)
         return goal_msg
 
-    def _on_goal_response(self, future: Any, goal_id: str) -> None:
+    def _on_goal_response(self, future: Any, goal_id: str, goal_sequence: int) -> None:
         try:
             goal_handle = future.result()
         except Exception as exc:
             with self._lock:
-                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action 接受目标失败：%s" % exc, metadata={"backend": "nav2", "failure_reason": "goal_response_error", "error": str(exc)})
+                if goal_sequence != self._goal_sequence or self._state.current_goal_id != goal_id:
+                    return
+                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action 接受目标失败：%s" % exc, metadata={"backend": "nav2", "failure_reason": "goal_response_error", "error": str(exc), "goal_sequence": goal_sequence})
+            return
+        with self._lock:
+            stale_response = goal_sequence != self._goal_sequence or self._state.current_goal_id != goal_id
+        if stale_response:
+            if getattr(goal_handle, "accepted", False):
+                try:
+                    goal_handle.cancel_goal_async()
+                except Exception:
+                    pass
             return
         with self._lock:
             if not getattr(goal_handle, "accepted", False):
-                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action server 拒绝导航目标。", metadata={"backend": "nav2", "failure_reason": "goal_rejected"})
+                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action server 拒绝导航目标。", metadata={"backend": "nav2", "failure_reason": "goal_rejected", "goal_sequence": goal_sequence})
                 return
             self._goal_handle = goal_handle
-            self._state = self._state.model_copy(update={"status": NavigationStatus.RUNNING, "message": "Nav2 action 已接受目标并开始执行。"}, deep=True)
+            self._state = self._state.model_copy(update={"status": NavigationStatus.RUNNING, "message": "Nav2 action 已接受目标并开始执行。", "metadata": {**dict(self._state.metadata), "goal_sequence": goal_sequence}}, deep=True)
             self._result_future = goal_handle.get_result_async()
-            self._result_future.add_done_callback(lambda completed: self._on_result(completed, goal_id))
+            self._result_future.add_done_callback(lambda completed: self._on_result(completed, goal_id, goal_sequence))
 
-    def _on_feedback(self, feedback_msg: Any) -> None:
+    def _on_feedback(self, feedback_msg: Any, goal_id: str, goal_sequence: int) -> None:
         feedback = getattr(feedback_msg, "feedback", None)
         if feedback is None:
             return
         distance_remaining = getattr(feedback, "distance_remaining", None)
         with self._lock:
+            if goal_sequence != self._goal_sequence or self._state.current_goal_id != goal_id:
+                return
             self._state = self._state.model_copy(
                 update={
                     "status": NavigationStatus.RUNNING,
@@ -429,13 +461,15 @@ class Nav2ActionNavigationProvider:
                 deep=True,
             )
 
-    def _on_result(self, future: Any, goal_id: str) -> None:
+    def _on_result(self, future: Any, goal_id: str, goal_sequence: int) -> None:
         try:
             result = future.result()
             status_code = int(getattr(result, "status", 0) or 0)
         except Exception as exc:
             with self._lock:
-                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action result 读取失败：%s" % exc, metadata={"backend": "nav2", "failure_reason": "result_error", "error": str(exc)})
+                if goal_sequence != self._goal_sequence or self._state.current_goal_id != goal_id:
+                    return
+                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action result 读取失败：%s" % exc, metadata={"backend": "nav2", "failure_reason": "result_error", "error": str(exc), "goal_sequence": goal_sequence})
             return
         if status_code == 4:
             status = NavigationStatus.SUCCEEDED
@@ -450,6 +484,8 @@ class Nav2ActionNavigationProvider:
             message = "Nav2 返回未知终态 status=%s。" % status_code
             goal_reached = False
         with self._lock:
+            if goal_sequence != self._goal_sequence or self._state.current_goal_id != goal_id:
+                return
             self._goal_handle = None
             self._result_future = None
             self._state = NavigationState(
@@ -458,7 +494,7 @@ class Nav2ActionNavigationProvider:
                 current_pose=self._read_current_pose(),
                 goal_reached=goal_reached,
                 message=message,
-                metadata={"backend": "nav2", "action_status_code": status_code, "action_name": self.runtime.config.nav2.action_name},
+                metadata={"backend": "nav2", "action_status_code": status_code, "action_name": self.runtime.config.nav2.action_name, "goal_sequence": goal_sequence},
             )
 
     def _on_global_costmap(self, message: Any) -> None:

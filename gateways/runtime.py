@@ -91,6 +91,17 @@ _RUNTIME_METADATA_LOG_KEYS = (
 
 _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 2.0
 _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
+_ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
+    {
+        "navigate_to_pose",
+        "navigate_to_named_location",
+        "find_target",
+        "explore_area",
+        "explore_and_find_target",
+        "relocalize_active_map",
+        "save_active_map_version",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -280,6 +291,7 @@ class GatewayRuntime:
             segmentation_backend=perception_components["segmentation_backend"],
             event_bus=self.event_bus,
             stream_bus=self.stream_bus,
+            video_frame_sink=self._store_latest_video_frame,
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),
         )
@@ -395,7 +407,6 @@ class GatewayRuntime:
                 self.robot.manifest.robot_model,
             )
             self.robot.start()
-            self.platform_geometry_runtime.start()
             self._started = True
         try:
             if self.perception_video_runtime.should_auto_start():
@@ -571,7 +582,6 @@ class GatewayRuntime:
         self._publish_runtime_governance_stream_frame()
         self._publish_static_stream_capability_frames()
         self._publish_pointcloud_map_stream_frame(reason="runtime_stream_start")
-        self._publish_navigation_bootstrap_stream_frames()
         self._start_navigation_status_refresh_stream()
         self._start_video_stream_refresh()
         if self._pointcloud_map_stream_subscription_id is None:
@@ -590,12 +600,8 @@ class GatewayRuntime:
         if callable(has_provider_stream):
             localization_stream_owned_by_service = bool(has_provider_stream())
         if not localization_stream_owned_by_service:
-            platform_providers = getattr(self.platform_geometry_runtime, "providers", None)
-            localization_subscriber = getattr(platform_providers, "subscribe_localization", None)
-            localization_unsubscriber = getattr(platform_providers, "unsubscribe_localization", None)
-            if not callable(localization_subscriber):
-                localization_subscriber = getattr(providers, "subscribe_localization", None)
-                localization_unsubscriber = getattr(providers, "unsubscribe_localization", None)
+            localization_subscriber = getattr(providers, "subscribe_localization", None)
+            localization_unsubscriber = getattr(providers, "unsubscribe_localization", None)
             if callable(localization_subscriber) and self._localization_stream_subscription_id is None:
                 self._localization_stream_subscription_id = localization_subscriber(self._publish_localization_stream_frame)
                 self._localization_stream_unsubscriber = localization_unsubscriber if callable(localization_unsubscriber) else None
@@ -651,6 +657,9 @@ class GatewayRuntime:
 
     def _run_navigation_status_refresh_stream(self) -> None:
         while not self._navigation_status_refresh_stop.wait(_NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC):
+            runtime_status = self.platform_geometry_runtime.get_runtime_status()
+            if not runtime_status.get("started"):
+                continue
             self._publish_navigation_bootstrap_stream_frames()
 
     def _start_video_stream_refresh(self) -> None:
@@ -2611,6 +2620,7 @@ class GatewayRuntime:
     ) -> Dict[str, Any]:
         """调用一个网关能力。"""
 
+        self._ensure_geometry_runtime_for_capability(capability_name)
         self._refresh_dynamic_capability_matrix()
         registration = self.capability_registry.get_registration(capability_name)
         self.capability_registry.assert_supported(capability_name, robot_model=self.robot.manifest.robot_model)
@@ -6122,6 +6132,7 @@ class GatewayRuntime:
         poll_interval_sec = max(0.02, poll_interval_sec)
 
         def runner(context) -> Dict[str, Any]:
+            self._ensure_geometry_runtime_for_capability(capability_name)
             last_context = self.navigation_service.set_goal(goal)
             finalized = False
             context.update(
@@ -6251,6 +6262,7 @@ class GatewayRuntime:
 
         def runner(context) -> Dict[str, Any]:
             context.update(progress=0.02, stage="prepare_exploration_runtime", message="按需准备探索建图运行时。")
+            self._ensure_geometry_runtime_for_capability("explore_area")
             last_context = self.navigation_service.start_exploration(request)
             finalized = False
             exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
@@ -6432,6 +6444,42 @@ class GatewayRuntime:
         if status.running:
             self.perception_video_runtime.stop()
 
+    def _ensure_geometry_runtime_for_capability(self, capability_name: str) -> None:
+        if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
+            return
+        geometry_config = self.config.geometry
+        if not bool(getattr(geometry_config, "enabled", False)) or not bool(
+            getattr(getattr(geometry_config, "rtabmap", None), "profile_enabled", False)
+        ):
+            raise GatewayError(
+                "平台几何运行时已禁用，无法执行 %s。" % capability_name,
+                error_code="geometry_runtime_disabled",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={"capability_name": capability_name},
+            )
+        try:
+            self.platform_geometry_runtime.start()
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(
+                "按需启动平台几何运行时失败：%s" % exc,
+                error_code="geometry_runtime_start_failed",
+                http_status=503,
+                jsonrpc_code=-32010,
+                details={"capability_name": capability_name},
+            ) from exc
+        runtime_status = self.platform_geometry_runtime.get_runtime_status()
+        if runtime_status.get("blocked") or str(runtime_status.get("phase") or "").lower() in {"failed", "disabled"}:
+            raise GatewayError(
+                str(runtime_status.get("message") or "平台几何运行时未就绪。"),
+                error_code="geometry_runtime_unavailable",
+                http_status=503,
+                jsonrpc_code=-32010,
+                details={"capability_name": capability_name, "runtime_status": runtime_status},
+            )
+
     def _finalize_workspace_assets_after_task(
         self,
         *,
@@ -6485,6 +6533,11 @@ class GatewayRuntime:
         reason = fallback.reason if fallback is not None else None
         supported = fallback.supported if fallback is not None else True
 
+        geometry_config = self.config.geometry
+        geometry_config_enabled = bool(getattr(geometry_config, "enabled", False)) and bool(
+            getattr(getattr(geometry_config, "rtabmap", None), "profile_enabled", False)
+        )
+
         DynamicCheck = Tuple[Callable[[], bool], Optional[str]]
         dynamic_support: Dict[str, DynamicCheck] = {
             "capture_image": (
@@ -6520,28 +6573,28 @@ class GatewayRuntime:
                 "当前机器人入口未提供图像采集提供器，或持续感知功能未启用。",
             ),
             "get_localization_snapshot": (
-                lambda: self.localization_service.is_available(),
-                "当前机器人入口未提供定位提供器，且还没有外部定位快照。",
+                lambda: True,
+                None,
             ),
             "get_localization_session": (
                 lambda: True,
                 None,
             ),
             "relocalize_active_map": (
-                lambda: self.localization_service.is_available(),
-                "当前机器人入口未提供定位提供器。",
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
             ),
             "get_map_snapshot": (
-                lambda: self.mapping_service.is_available(),
-                "当前机器人入口未提供地图提供器，且还没有外部地图快照。",
+                lambda: True,
+                None,
             ),
             "get_navigation_snapshot": (
-                lambda: self.navigation_service.is_navigation_available() or self.navigation_service.is_exploration_available(),
-                "当前机器人入口未提供导航或探索后端。",
+                lambda: True,
+                None,
             ),
             "get_navigation_semantic_context": (
-                lambda: self.mapping_service.is_available(),
-                "当前机器人入口未提供地图提供器，且还没有平台地图快照。",
+                lambda: True,
+                None,
             ),
             "resolve_navigation_candidates": (
                 lambda: True,
@@ -6572,8 +6625,8 @@ class GatewayRuntime:
                 None,
             ),
             "save_active_map_version": (
-                lambda: True,
-                None,
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
             ),
             "load_map_version": (
                 lambda: True,
@@ -6600,8 +6653,8 @@ class GatewayRuntime:
                 None,
             ),
             "tag_location": (
-                lambda: self.localization_service.is_available(),
-                "当前机器人入口未提供定位结果，无法标记地点。",
+                lambda: self.localization_service.get_latest_snapshot() is not None,
+                "当前还没有可用定位快照，无法标记地点。",
             ),
             "query_location": (
                 lambda: True,
@@ -6632,25 +6685,25 @@ class GatewayRuntime:
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "navigate_to_pose": (
-                lambda: self.navigation_service.is_navigation_available(),
-                "当前机器人入口未提供导航后端。",
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
             ),
             "navigate_to_named_location": (
-                lambda: self.navigation_service.is_navigation_available()
-                and (self.mapping_service.is_available() or bool(self.memory_service.list_tagged_locations(limit=1))),
-                "当前机器人入口未提供导航后端，且也没有可用地点记忆或语义地图。",
+                lambda: geometry_config_enabled
+                and (self.mapping_service.get_latest_snapshot() is not None or bool(self.memory_service.list_tagged_locations(limit=1))),
+                "平台几何运行时已禁用，或没有可用地点记忆或语义地图。",
             ),
             "find_target": (
-                lambda: self.navigation_service.is_navigation_available() and self._has_provider(ImageProvider),
-                "当前机器人入口未同时提供导航后端和图像采集提供器。",
+                lambda: geometry_config_enabled and self._has_provider(ImageProvider),
+                "平台几何运行时已禁用，或当前机器人入口未提供图像采集提供器。",
             ),
             "explore_area": (
-                lambda: self.navigation_service.is_exploration_available(),
-                "当前机器人入口未提供探索后端。",
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
             ),
             "explore_and_find_target": (
-                lambda: self.navigation_service.is_exploration_available() and self._has_provider(ImageProvider),
-                "当前机器人入口未同时提供探索后端和图像采集提供器。",
+                lambda: geometry_config_enabled and self._has_provider(ImageProvider),
+                "平台几何运行时已禁用，或当前机器人入口未提供图像采集提供器。",
             ),
             "inspect_target": (
                 lambda: self._has_provider(ImageProvider),

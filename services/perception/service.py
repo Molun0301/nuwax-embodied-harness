@@ -24,7 +24,9 @@ from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
+
+VideoFrameSink = Callable[[object], Optional[object]]
 
 
 class PerceptionService:
@@ -44,6 +46,7 @@ class PerceptionService:
         geometry_augmentor: Optional[DetectionGeometryAugmentor] = None,
         event_bus: Optional[EventBus] = None,
         stream_bus: Optional[StreamBus] = None,
+        video_frame_sink: Optional[VideoFrameSink] = None,
         history_limit: int = 100,
         pipeline_name: str = "default_perception_pipeline",
     ) -> None:
@@ -58,9 +61,13 @@ class PerceptionService:
         self._geometry_augmentor = geometry_augmentor or DetectionGeometryAugmentor()
         self._event_bus = event_bus
         self._stream_bus = stream_bus
+        self._video_frame_sink = video_frame_sink
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
         self._latest_by_camera: Dict[str, PerceptionContext] = {}
         self._pipeline_name = pipeline_name
+
+    def set_video_frame_sink(self, video_frame_sink: Optional[VideoFrameSink]) -> None:
+        self._video_frame_sink = video_frame_sink
 
     @property
     def detector_pipeline(self) -> DetectorPipeline:
@@ -576,16 +583,24 @@ class PerceptionService:
             return
         metadata = dict(image_frame.metadata or {})
         payload_bytes = len(image_frame.data or b"")
+        latest_frame = None
+        if image_frame.data and image_frame.encoding.value == "jpeg" and self._video_frame_sink is not None:
+            try:
+                latest_frame = self._video_frame_sink(image_frame)
+            except Exception:
+                latest_frame = None
+        sequence = getattr(latest_frame, "sequence", None)
+        mjpeg_available = latest_frame is not None and isinstance(sequence, int)
         payload = {
-            "available": bool(image_frame.data or image_frame.uri or image_frame.artifact_id),
+            "available": bool(mjpeg_available or image_frame.uri or image_frame.artifact_id),
             "camera_id": image_frame.camera_id,
             "frame_id": image_frame.frame_id,
             "width_px": image_frame.width_px,
             "height_px": image_frame.height_px,
             "encoding": image_frame.encoding.value,
             "payload_bytes": payload_bytes,
-            "transport": "mjpeg" if image_frame.data and image_frame.encoding.value == "jpeg" else "metadata",
-            "stream_url": "/streams/video.mjpeg?" + urlencode({"camera_id": image_frame.camera_id}) if image_frame.data and image_frame.encoding.value == "jpeg" else None,
+            "transport": "mjpeg" if mjpeg_available else "metadata",
+            "stream_url": "/streams/video.mjpeg?" + urlencode({"camera_id": image_frame.camera_id}) if mjpeg_available else None,
             "metadata": dict(metadata),
         }
         if image_frame.uri:
@@ -600,7 +615,7 @@ class PerceptionService:
             source=source_name or "image_provider",
             payload=payload,
             frame_id=image_frame.frame_id,
-            sequence=metadata.get("sequence") if isinstance(metadata.get("sequence"), int) else None,
+            sequence=sequence,
             status=status,
             metadata={
                 "camera_id": image_frame.camera_id,

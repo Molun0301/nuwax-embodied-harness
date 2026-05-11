@@ -370,10 +370,7 @@ class PlatformGeometryRuntime:
         return [str(item) for item in raw_args if str(item or "").strip()]
 
     def _build_external_geometry_command(self) -> List[str]:
-        args = self._external_args()
-        if self._uses_external_geometry_stack() and "--explore" not in args:
-            args.append("--explore")
-        return [str(self._external_script_path()), *args]
+        return [str(self._external_script_path()), *self._external_args()]
 
     def _external_input_bridge_enabled(self) -> bool:
         return bool(getattr(self.config.external, "input_bridge_enabled", False))

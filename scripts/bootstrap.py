@@ -820,7 +820,7 @@ class BootstrapPlanner:
                     "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "true",
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "false",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "true",
-                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "true",
+                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "false",
                     "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": DEFAULT_YOLO_WORLD_MODEL,
                     "NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH": DEFAULT_YOLO_WORLD_ENGINE,
                     "NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME": yolo_world_runtime,
@@ -836,7 +836,7 @@ class BootstrapPlanner:
                     "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "true",
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "true",
-                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "true",
+                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "false",
                     "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": DEFAULT_YOLO_WORLD_MODEL,
                     "NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH": DEFAULT_YOLO_WORLD_ENGINE,
                     "NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME": yolo_world_runtime,
@@ -852,7 +852,7 @@ class BootstrapPlanner:
                     "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "true",
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "true",
-                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "true",
+                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "false",
                     "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": DEFAULT_YOLO_WORLD_MODEL,
                     "NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH": DEFAULT_YOLO_WORLD_ENGINE,
                     "NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME": yolo_world_runtime,
@@ -868,7 +868,7 @@ class BootstrapPlanner:
                     "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "false",
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "false",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "false",
-                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "true",
+                    "NUWAX_PERCEPTION_STREAM_AUTO_START": "false",
                 }
             )
 

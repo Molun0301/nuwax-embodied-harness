@@ -44,6 +44,11 @@ def _replay_stream_frames(
     return runtime.stream_bus.replay(after_cursor=after_cursor, topics=topics)
 
 
+async def _run_blocking(callable_obj, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: callable_obj(*args, **kwargs))
+
+
 def _safe_enqueue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, frame: StreamFrame, runtime: GatewayRuntime) -> None:
     def _push() -> None:
         if queue.full():
@@ -122,7 +127,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         async def frame_generator():
             last_sequence = 0
             while not await request.is_disconnected():
-                latest_frame = await asyncio.to_thread(
+                latest_frame = await _run_blocking(
                     runtime.wait_for_video_frame,
                     last_sequence,
                     timeout_sec=runtime.config.gateway.sse_keepalive_sec,

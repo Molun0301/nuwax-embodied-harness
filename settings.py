@@ -408,7 +408,7 @@ class PerceptionStreamRuntimeConfig:
     """持续视频感知运行时配置。"""
 
     enabled: bool = True
-    auto_start: bool = True
+    auto_start: bool = False
     camera_id: str = "front_camera"
     interval_sec: float = 0.5
     detector_backend_name: str = ""
@@ -737,7 +737,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         ),
         stream_runtime=PerceptionStreamRuntimeConfig(
             enabled=_cfg_bool("NUWAX_PERCEPTION_STREAM_ENABLED", True),
-            auto_start=_cfg_bool("NUWAX_PERCEPTION_STREAM_AUTO_START", True),
+            auto_start=_cfg_bool("NUWAX_PERCEPTION_STREAM_AUTO_START", False),
             camera_id=_cfg_str("NUWAX_PERCEPTION_STREAM_CAMERA_ID", "front_camera"),
             interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_STREAM_INTERVAL_SEC", 0.5)),
             detector_backend_name=_cfg_str("NUWAX_PERCEPTION_STREAM_DETECTOR_BACKEND", ""),

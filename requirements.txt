@@ -27,4 +27,6 @@ openai==1.60.2
 # Jetson + Python 3.8 场景建议固定到已验证的 wheel 版本，
 # 避免解析到源码包后触发上游 `puccinialin` 构建依赖问题。
 polars==1.8.2
+# YOLO-World 的 set_classes() 需要 ultralytics CLIP 模块。
+git+https://github.com/ultralytics/CLIP.git
 ultralytics==8.4.33

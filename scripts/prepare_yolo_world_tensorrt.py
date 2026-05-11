@@ -9,6 +9,8 @@ from typing import Iterable, List, Optional, Tuple
 import urllib.request
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 DEFAULT_RELEASE = "v8.4.0"
 DEFAULT_REPO = "ultralytics/assets"
 DEFAULT_CLASSES = (
@@ -72,10 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _normalize_path(value: str) -> Path:
+def _normalize_path(value: str, *, base_dir: Path = PROJECT_ROOT) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
+        path = (base_dir / path).resolve()
     return path
 
 
@@ -193,9 +195,10 @@ def _prepare_weights(args: argparse.Namespace) -> Path:
 
 
 def _write_calibration_yaml(image_dir: str, output_dir: Path, classes: Tuple[str, ...]) -> Path:
-    image_path = _normalize_path(image_dir)
+    image_path = _normalize_path(image_dir, base_dir=Path.cwd())
     if not image_path.exists() or not image_path.is_dir():
         raise SystemExit("INT8 校准图片目录不存在：%s" % image_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
     yaml_path = output_dir / "yolo_world_int8_calibration.yaml"
     names = "\n".join("  %d: %s" % (index, label) for index, label in enumerate(classes or DEFAULT_CLASSES))
     yaml_path.write_text(

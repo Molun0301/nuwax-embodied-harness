@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import time
 from typing import Dict, Iterable, Optional, Tuple
 
 from fastapi import APIRouter, Request
@@ -104,6 +106,42 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         return StreamingResponse(frame_generator(), media_type="text/event-stream")
 
+    @router.get("/streams/video.mjpeg")
+    async def video_mjpeg_stream(
+        request: Request,
+        camera_id: Optional[str] = None,
+        fps: float = 3.0,
+    ) -> StreamingResponse:
+        access_manager.authenticate_http(request)
+        del camera_id
+        requested_fps = float(fps or 3.0)
+        if not math.isfinite(requested_fps):
+            requested_fps = 3.0
+        frame_interval_sec = 1.0 / min(max(requested_fps, 0.2), 10.0)
+
+        async def frame_generator():
+            last_sequence = 0
+            while not await request.is_disconnected():
+                latest_frame = await asyncio.to_thread(
+                    runtime.wait_for_video_frame,
+                    last_sequence,
+                    timeout_sec=runtime.config.gateway.sse_keepalive_sec,
+                )
+                if latest_frame is None:
+                    continue
+                last_sequence = latest_frame.sequence
+                started_at = time.monotonic()
+                yield _format_mjpeg_frame(latest_frame.data)
+                elapsed = time.monotonic() - started_at
+                if elapsed < frame_interval_sec:
+                    await asyncio.sleep(frame_interval_sec - elapsed)
+
+        return StreamingResponse(
+            frame_generator(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store"},
+        )
+
     @router.websocket("/streams/ws")
     async def websocket_streams(websocket: WebSocket) -> None:
         try:
@@ -143,6 +181,16 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             runtime.stream_bus.unsubscribe(subscription_id)
 
     return router
+
+
+def _format_mjpeg_frame(data: bytes) -> bytes:
+    headers = (
+        b"--frame\r\n"
+        b"Content-Type: image/jpeg\r\n"
+        + f"Content-Length: {len(data)}".encode("ascii")
+        + b"\r\n\r\n"
+    )
+    return headers + data + b"\r\n"
 
 
 def _format_sse_payload(frame: StreamFrame) -> str:

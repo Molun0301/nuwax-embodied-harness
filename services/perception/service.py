@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import base64
 from collections import deque
+from urllib.parse import urlencode
 from time import perf_counter
 
 from contracts.events import RuntimeEventCategory
@@ -576,24 +576,23 @@ class PerceptionService:
             return
         metadata = dict(image_frame.metadata or {})
         payload_bytes = len(image_frame.data or b"")
-        data_uri = self._build_video_data_uri(image_frame)
         payload = {
-            "available": bool(data_uri or image_frame.uri),
+            "available": bool(image_frame.data or image_frame.uri or image_frame.artifact_id),
             "camera_id": image_frame.camera_id,
             "frame_id": image_frame.frame_id,
             "width_px": image_frame.width_px,
             "height_px": image_frame.height_px,
             "encoding": image_frame.encoding.value,
             "payload_bytes": payload_bytes,
+            "transport": "mjpeg" if image_frame.data and image_frame.encoding.value == "jpeg" else "metadata",
+            "stream_url": "/streams/video.mjpeg?" + urlencode({"camera_id": image_frame.camera_id}) if image_frame.data and image_frame.encoding.value == "jpeg" else None,
             "metadata": dict(metadata),
         }
-        if data_uri:
-            payload["data_uri"] = data_uri
-        elif image_frame.uri:
+        if image_frame.uri:
             payload["uri"] = image_frame.uri
         elif image_frame.artifact_id:
             payload["artifact_id"] = image_frame.artifact_id
-        status = "available" if payload.get("data_uri") or payload.get("uri") else "unsupported"
+        status = "available" if payload.get("stream_url") or payload.get("uri") or payload.get("artifact_id") else "unsupported"
         if status != "available":
             payload["message"] = f"浏览器暂不支持直接显示 {image_frame.encoding.value} 图像帧。"
         self._stream_bus.publish(
@@ -611,25 +610,6 @@ class PerceptionService:
                 **metadata,
             },
         )
-
-    def _build_video_data_uri(self, image_frame) -> Optional[str]:
-        if not image_frame.data:
-            return None
-        mime_type = self._video_mime_type(image_frame.encoding)
-        if mime_type is None:
-            return None
-        return "data:%s;base64,%s" % (
-            mime_type,
-            base64.b64encode(image_frame.data).decode("ascii"),
-        )
-
-    def _video_mime_type(self, encoding) -> Optional[str]:
-        value = str(getattr(encoding, "value", encoding)).lower()
-        if value == "jpeg":
-            return "image/jpeg"
-        if value == "png":
-            return "image/png"
-        return None
 
     def _get_image_provider(self) -> ImageProvider:
         providers = getattr(self._provider_owner, "providers", None)

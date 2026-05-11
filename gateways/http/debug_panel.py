@@ -86,6 +86,7 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         return _stream_migration_response(
             'robot.state',
             'map.frame',
+            'map.heartbeat',
             'localization.pose',
             'navigation.state',
             'exploration.state',
@@ -744,6 +745,8 @@ def _render_debug_page(access_token: str) -> str:
       };
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", logs: "日志" };
+      const OVERVIEW_RENDER_INTERVAL_MS = 500;
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.state", "exploration.frontier", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "tasks.state"];
       const state = {
         mapGrid: null,
         mapViewport: null,
@@ -760,8 +763,17 @@ def _render_debug_page(access_token: str) -> str:
         streamReconnectTimer: null,
         latestStreamCursor: 0,
         latestStreamFrames: {},
+        pendingStreamFrames: {},
+        pendingLogFrames: [],
+        streamFlushFrame: null,
         videoFrames: 0,
+        pendingVideoEnvelope: null,
+        videoRenderFrame: null,
+        lastVideoFrameKey: null,
         latestOverview: null,
+        overviewRenderTimer: null,
+        overviewLastRenderAt: 0,
+        overviewReceivedAt: null,
         latestHealth: null,
         latestTasks: { active_tasks: [], history_tasks: [] },
         taskActiveById: new Map(),
@@ -770,7 +782,9 @@ def _render_debug_page(access_token: str) -> str:
         lastRobotStateHash: null,
         logFilter: "",
         logSearch: "",
-        mapResizeFrame: null,
+        mapDrawFrame: null,
+        mapBaseCache: null,
+        mapGridContentKey: "",
       };
       const els = {
         robotName: document.getElementById("robotName"),
@@ -900,11 +914,7 @@ def _render_debug_page(access_token: str) -> str:
         return true;
       }
       function redrawMapAfterResize() {
-        if (state.mapResizeFrame) window.cancelAnimationFrame(state.mapResizeFrame);
-        state.mapResizeFrame = window.requestAnimationFrame(() => {
-          state.mapResizeFrame = null;
-          drawMap();
-        });
+        requestMapDraw(false);
       }
       function statusSeverity(status) {
         const value = statusClass(status || "missing");
@@ -953,7 +963,7 @@ def _render_debug_page(access_token: str) -> str:
       function updateOverview(envelope) {
         const data = envelope && envelope.data ? envelope.data : {};
         state.latestOverview = data;
-        setText(els.connectionText, "online");
+        if (!state.streamSocket || state.streamSocket.readyState !== WebSocket.OPEN) setText(els.connectionText, "online");
         setText(els.networkLatency, fmt(envelope.__frontendLatencyMs, " ms"));
         for (const name of overviewNames) {
           const summary = data[name] || {};
@@ -1241,22 +1251,34 @@ def _render_debug_page(access_token: str) -> str:
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
       }
-      function drawMap() {
-        syncMapCanvasSize();
-        const canvas = els.mapCanvas;
-        const ctx = canvas.getContext("2d");
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = CANVAS_THEME.mapBackground;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        const grid = state.mapGrid;
-        const anchor = cameraAnchor();
-        const scale = cameraScale(anchor);
-        state.mapViewport = { centerX: canvas.width / 2, centerY: canvas.height / 2, scale, zoom: state.mapZoom, robotLocked: anchor.locked };
-        if (els.mapZoomValue) els.mapZoomValue.textContent = `${Math.round(state.mapZoom * 100)}%`;
-        if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) return;
+      function requestMapDraw(baseDirty) {
+        if (baseDirty) state.mapBaseCache = null;
+        if (state.mapDrawFrame) return;
+        state.mapDrawFrame = window.requestAnimationFrame(() => {
+          state.mapDrawFrame = null;
+          drawMap();
+        });
+      }
+      function mapGridDataSignature(grid) {
+        const data = grid && Array.isArray(grid.data) ? grid.data : [];
+        if (!data.length) return "empty";
+        let hash = 2166136261;
+        for (let index = 0; index < data.length; index += 1) {
+          hash ^= (Number(data[index]) + 129) & 255;
+          hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return `${data.length}:${hash.toString(16)}`;
+      }
+      function mapGridContentKey(grid, envelope, diagnostics) {
+        if (!grid) return "missing";
+        const origin = originPosition(grid);
+        const revision = (diagnostics && (diagnostics.occupancy_content_hash || diagnostics.content_hash || diagnostics.grid_hash || diagnostics.occupancy_content_revision || diagnostics.content_revision || diagnostics.revision)) || (grid.metadata && (grid.metadata.occupancy_content_hash || grid.metadata.content_hash || grid.metadata.grid_hash || grid.metadata.occupancy_content_revision || grid.metadata.content_revision || grid.metadata.revision)) || envelope.revision || grid.revision || mapGridDataSignature(grid);
+        return [grid.frame_id || envelope.frame_id || "", grid.width, grid.height, grid.resolution_m, Number(origin.x || 0), Number(origin.y || 0), originYaw(grid), revision].join("|");
+      }
+      function ensureMapBaseCanvas(ctx, grid) {
         const width = Number(grid.width);
         const height = Number(grid.height);
+        if (state.mapBaseCache && state.mapBaseCache.key === state.mapGridContentKey && state.mapBaseCache.width === width && state.mapBaseCache.height === height) return state.mapBaseCache.canvas;
         const image = ctx.createImageData(width, height);
         for (let row = 0; row < height; row += 1) {
           for (let col = 0; col < width; col += 1) {
@@ -1276,6 +1298,26 @@ def _render_debug_page(access_token: str) -> str:
         offscreen.width = width;
         offscreen.height = height;
         offscreen.getContext("2d").putImageData(image, 0, 0);
+        state.mapBaseCache = { key: state.mapGridContentKey, width, height, canvas: offscreen };
+        return offscreen;
+      }
+      function drawMap() {
+        syncMapCanvasSize();
+        const canvas = els.mapCanvas;
+        const ctx = canvas.getContext("2d");
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = CANVAS_THEME.mapBackground;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const grid = state.mapGrid;
+        const anchor = cameraAnchor();
+        const scale = cameraScale(anchor);
+        state.mapViewport = { centerX: canvas.width / 2, centerY: canvas.height / 2, scale, zoom: state.mapZoom, robotLocked: anchor.locked };
+        if (els.mapZoomValue) els.mapZoomValue.textContent = `${Math.round(state.mapZoom * 100)}%`;
+        if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) return;
+        const width = Number(grid.width);
+        const height = Number(grid.height);
+        const offscreen = ensureMapBaseCanvas(ctx, grid);
         ctx.save();
         applyCameraTransform(ctx, anchor, scale);
         const origin = originPosition(grid);
@@ -1389,13 +1431,18 @@ def _render_debug_page(access_token: str) -> str:
         state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp };
         setPill(els.mapStatus, status);
         if (grid && Array.isArray(grid.data)) {
+          const nextContentKey = mapGridContentKey(grid, envelope, diagnostics);
+          const baseDirty = state.mapGridContentKey !== nextContentKey;
           state.mapGrid = grid;
+          state.mapGridContentKey = nextContentKey;
           els.mapEmpty.hidden = status === "available";
           els.mapEmpty.textContent = status === "stale" ? "地图数据已过期，保留最后一帧。" : "";
-          drawMap();
+          requestMapDraw(baseDirty);
         } else {
           state.mapGrid = null;
-          drawMap();
+          state.mapGridContentKey = "";
+          state.mapBaseCache = null;
+          requestMapDraw(true);
           els.mapEmpty.hidden = false;
           els.mapEmpty.textContent = errorReason(envelope, "无 occupancy_grid，占据栅格不可用。");
         }
@@ -1414,17 +1461,46 @@ def _render_debug_page(access_token: str) -> str:
         updateMapStreamChip(status, diagnostics, streamBridge, envelope.source_timestamp);
       }
       function mapStreamLabel(status, diagnostics, streamBridge) {
-        const messageCount = diagnostics && (diagnostics.message_count || diagnostics.sequence);
-        const revision = diagnostics && (diagnostics.content_revision || diagnostics.revision);
+        const messageCount = diagnostics && (diagnostics.message_count || diagnostics.update_sequence || diagnostics.sequence);
+        const revision = diagnostics && (diagnostics.content_revision || diagnostics.occupancy_content_revision || diagnostics.revision);
         const delta = diagnostics && diagnostics.message_count_delta;
         const bridgeStatus = streamBridge && (streamBridge.status || streamBridge.state || streamBridge.mode);
         if (!messageCount) return status === "available" ? "首帧已缓存" : "等待首帧";
-        const live = status === "available" && (delta === undefined || delta === null || Number(delta) > 0 || diagnostics.live_mapping_ready === true);
+        const live = status === "available" && (delta === undefined || delta === null || Number(delta) > 0 || diagnostics.live_mapping_ready === true || diagnostics.source_alive === true);
         return `${live ? "实时流" : "离线资产/缓存"} rev=${safeText(revision)} seq=${safeText(messageCount)} bridge=${safeText(bridgeStatus)}`;
       }
       function updateMapStreamChip(status, diagnostics, streamBridge, timestamp) {
         if (!els.mapStreamStatus) return;
         els.mapStreamStatus.textContent = `${mapStreamLabel(status, diagnostics, streamBridge)} · ${shortTime(timestamp)}`;
+      }
+      function updateMapHeartbeat(envelope) {
+        const status = statusOf(envelope);
+        const heartbeat = envelope.data || {};
+        const diagnostics = { ...((state.mapStream && state.mapStream.diagnostics) || {}), ...(envelope.metadata || {}), ...heartbeat };
+        const streamBridge = diagnostics.stream_bridge || {};
+        const grid = state.mapGrid;
+        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision || diagnostics.content_revision, sequence: envelope.sequence || diagnostics.update_sequence, timestamp: envelope.source_timestamp };
+        setPill(els.mapStatus, status);
+        if (grid && Array.isArray(grid.data)) {
+          els.mapEmpty.hidden = true;
+          els.mapEmpty.textContent = "";
+        } else {
+          els.mapEmpty.hidden = false;
+          els.mapEmpty.textContent = "地图源在线，等待内容更新帧。";
+        }
+        setKv(els.mapMeta, [
+          ["frame", envelope.frame_id || diagnostics.frame_id || (grid && grid.frame_id)],
+          ["size", grid ? `${grid.width} x ${grid.height}` : "--"],
+          ["resolution", grid ? `${grid.resolution_m} m` : "--"],
+          ["source_timestamp", shortTime(envelope.source_timestamp)],
+          ["revision", envelope.revision || diagnostics.content_revision],
+          ["sequence", envelope.sequence || diagnostics.update_sequence || diagnostics.message_count],
+          ["streaming", mapStreamLabel(status, diagnostics, streamBridge)],
+          ["latency", fmt(envelope.latency_ms, " ms")],
+          ["stale", envelope.stale === true ? "true" : "false"],
+          ["前端接收", shortTime(envelope.__receivedAt)],
+        ]);
+        updateMapStreamChip(status, diagnostics, streamBridge, envelope.source_timestamp);
       }
       function updateLocalization(envelope) {
         const status = statusOf(envelope);
@@ -1452,7 +1528,7 @@ def _render_debug_page(access_token: str) -> str:
           ["trajectory", state.trajectory.length],
           ["latency", fmt(envelope.latency_ms, " ms")],
         ]);
-        drawMap();
+        requestMapDraw(false);
       }
       function firstArrayValue(...values) {
         for (const value of values) {
@@ -1557,17 +1633,41 @@ def _render_debug_page(access_token: str) -> str:
         ]);
         els.frontierNotice.hidden = Boolean(frontiers && frontiers.length);
         els.frontierNotice.textContent = frontiers && frontiers.length ? "" : "当前探索上下文还没有 frontier 几何，请确认探索运行态已生成候选。";
-        drawMap();
+        requestMapDraw(false);
+      }
+      function scheduleVideoUpdate(envelope) {
+        state.pendingVideoEnvelope = envelope;
+        if (state.videoRenderFrame) return;
+        state.videoRenderFrame = window.requestAnimationFrame(() => {
+          state.videoRenderFrame = null;
+          const next = state.pendingVideoEnvelope;
+          state.pendingVideoEnvelope = null;
+          if (next) updateVideo(next);
+        });
+      }
+      function buildVideoFrameSrc(data) {
+        if (data.stream_url) {
+          const url = new URL(data.stream_url, window.location.origin);
+          if (apiAccessToken && !url.searchParams.get("access_token")) url.searchParams.set("access_token", apiAccessToken);
+          return url.toString();
+        }
+        return data.data_uri || data.uri || "";
       }
       function updateVideo(envelope) {
         const status = statusOf(envelope);
         const data = envelope.data || {};
         setPill(els.videoStatus, status);
-        if (data.data_uri || data.uri) {
-          els.videoFrame.src = data.data_uri || data.uri;
+        const videoSrc = buildVideoFrameSrc(data);
+        if (videoSrc) {
+          const frameKeyParts = data.stream_url ? [videoSrc] : [videoSrc, envelope.frame_id || data.frame_id || "", envelope.sequence || "", envelope.source_timestamp || ""];
+          const frameKey = frameKeyParts.some(Boolean) ? frameKeyParts.join("|") : null;
+          if (!frameKey || frameKey !== state.lastVideoFrameKey) {
+            els.videoFrame.src = videoSrc;
+            state.videoFrames += 1;
+            if (frameKey) state.lastVideoFrameKey = frameKey;
+          }
           els.videoFrame.hidden = false;
           els.videoEmpty.hidden = true;
-          state.videoFrames += 1;
         } else {
           els.videoFrame.hidden = true;
           els.videoEmpty.hidden = false;
@@ -1578,6 +1678,8 @@ def _render_debug_page(access_token: str) -> str:
           ["frame", envelope.frame_id || data.frame_id],
           ["size", data.width_px && data.height_px ? `${data.width_px} x ${data.height_px}` : "--"],
           ["encoding", data.encoding],
+          ["transport", data.transport],
+          ["stream_url", data.stream_url],
           ["payload_bytes", data.payload_bytes],
           ["rendered_frames", state.videoFrames],
           ["source_timestamp", shortTime(envelope.source_timestamp)],
@@ -1645,6 +1747,7 @@ def _render_debug_page(access_token: str) -> str:
       const STREAM_TOPICS = [
         "robot.state",
         "map.frame",
+        "map.heartbeat",
         "localization.pose",
         "localization.frame_tree",
         "localization.trajectory",
@@ -1724,12 +1827,43 @@ def _render_debug_page(access_token: str) -> str:
       function handleStreamFrame(frame) {
         state.latestStreamCursor = Math.max(state.latestStreamCursor || 0, Number(frame.cursor || 0));
         state.latestStreamFrames[frame.topic] = frame;
+        if (frame.topic === "logs.entry") {
+          state.pendingLogFrames.push(frame);
+          if (state.pendingLogFrames.length > 200) state.pendingLogFrames.splice(0, state.pendingLogFrames.length - 200);
+        } else {
+          state.pendingStreamFrames[frame.topic] = frame;
+        }
         els.lastReceive.textContent = nowText();
         setText(els.connectionText, "streaming");
+        scheduleStreamFlush();
+      }
+      function scheduleStreamFlush() {
+        if (state.streamFlushFrame) return;
+        state.streamFlushFrame = window.requestAnimationFrame(flushStreamFrames);
+      }
+      function flushStreamFrames() {
+        state.streamFlushFrame = null;
+        const pending = state.pendingStreamFrames;
+        const logFrames = state.pendingLogFrames;
+        state.pendingStreamFrames = {};
+        state.pendingLogFrames = [];
+        for (const topic of STREAM_FLUSH_ORDER) {
+          const frame = pending[topic];
+          if (!frame) continue;
+          delete pending[topic];
+          processStreamFrame(frame);
+        }
+        for (const topic of Object.keys(pending)) processStreamFrame(pending[topic]);
+        if (logFrames.length) updateLogFrames(logFrames);
+      }
+      function processStreamFrame(frame) {
+        let updateOverviewForFrame = true;
         if (frame.topic === "robot.state") {
-          if (!updateRobotStateFrame(frame)) return;
+          updateOverviewForFrame = updateRobotStateFrame(frame);
         } else if (frame.topic === "map.frame") {
           updateMap(envelopeFromFrame(frame));
+        } else if (frame.topic === "map.heartbeat") {
+          updateMapHeartbeat(envelopeFromFrame(frame));
         } else if (frame.topic === "localization.pose") {
           updateLocalization(envelopeFromFrame(frame, { pose: frame.payload, trajectory: state.trajectory }));
         } else if (frame.topic === "localization.trajectory") {
@@ -1748,13 +1882,15 @@ def _render_debug_page(access_token: str) -> str:
         } else if (frame.topic === "pointcloud.frame") {
           updatePointcloudFrame(frame);
         } else if (frame.topic === "video.frame") {
-          updateVideo(envelopeFromFrame(frame));
+          scheduleVideoUpdate(envelopeFromFrame(frame));
         } else if (frame.topic === "logs.entry") {
           updateLogFrame(frame);
         } else if (frame.topic === "tasks.state") {
           updateTaskFrame(frame);
+        } else {
+          updateOverviewForFrame = false;
         }
-        updateStreamOverview(frame);
+        if (updateOverviewForFrame) updateStreamOverview(frame);
       }
       function robotStateChangeKey(frame) {
         const metadata = frame.metadata || {};
@@ -1800,9 +1936,9 @@ def _render_debug_page(access_token: str) -> str:
         const data = { pointcloud: { status: envelope.status, frame_id: envelope.frame_id, revision: envelope.revision, latency_ms: envelope.latency_ms, source_timestamp: envelope.source_timestamp, metadata: { source: envelope.source, point_count: payload.point_count || (frame.metadata && frame.metadata.point_count) } } };
         updateSensorSummary({ ...(state.latestOverview || {}), ...data });
       }
-      function updateLogFrame(frame) {
+      function logEntryFromFrame(frame) {
         const payload = frame.payload || {};
-        const entry = {
+        return {
           sequence: frame.sequence ?? frame.cursor,
           timestamp: payload.timestamp || frame.timestamp,
           level: String(payload.severity || frame.status || "info").toLowerCase(),
@@ -1810,7 +1946,15 @@ def _render_debug_page(access_token: str) -> str:
           event_type: payload.event_type,
           message: payload.message || payload.event_type || "runtime.event",
         };
-        updateLogs(envelopeFromFrame(frame, { entries: [entry], next_cursor: frame.cursor, source_status: "streaming", metrics: {} }));
+      }
+      function updateLogFrame(frame) {
+        updateLogFrames([frame]);
+      }
+      function updateLogFrames(frames) {
+        const latest = frames[frames.length - 1];
+        const entries = frames.map(logEntryFromFrame);
+        updateLogs(envelopeFromFrame(latest, { entries, next_cursor: latest.cursor, source_status: "streaming", metrics: {} }));
+        updateStreamOverview(latest);
       }
       function updateTaskFrame(frame) {
         const event = frame.payload || {};
@@ -1843,6 +1987,7 @@ def _render_debug_page(access_token: str) -> str:
         const keyByTopic = {
           "robot.state": "state",
           "map.frame": "map",
+          "map.heartbeat": "map",
           "localization.pose": "localization",
           "navigation.state": "navigation",
           "exploration.state": "exploration",
@@ -1855,8 +2000,11 @@ def _render_debug_page(access_token: str) -> str:
         const key = keyByTopic[frame.topic];
         if (!key) return;
         const payload = frame.payload || {};
+        const pointcloudMeta = { source: frame.source, point_count: payload.point_count ?? (frame.metadata && frame.metadata.point_count) };
         const metadata = frame.topic === "pointcloud_map.meta"
-          ? { source: frame.source, source_kind: payload.source_kind || (frame.metadata && frame.metadata.source_kind), point_count: payload.point_count ?? (frame.metadata && frame.metadata.point_count), pcd_path: payload.pcd_path || (frame.metadata && frame.metadata.pcd_path) }
+          ? { ...pointcloudMeta, source_kind: payload.source_kind || (frame.metadata && frame.metadata.source_kind), pcd_path: payload.pcd_path || (frame.metadata && frame.metadata.pcd_path) }
+          : frame.topic === "pointcloud.frame" ? pointcloudMeta
+          : frame.topic === "map.heartbeat" ? { source: frame.source, event_type: payload.event_type || (frame.metadata && frame.metadata.event_type), message_count: payload.message_count, update_sequence: payload.update_sequence }
           : { source: frame.source };
         const overview = { ...(state.latestOverview || {}) };
         overview[key] = {
@@ -1869,7 +2017,24 @@ def _render_debug_page(access_token: str) -> str:
           metadata,
         };
         state.latestOverview = overview;
-        updateOverview({ data: overview, __receivedAt: new Date().toISOString(), __frontendLatencyMs: 0 });
+        state.overviewReceivedAt = new Date().toISOString();
+        scheduleOverviewRender(false);
+      }
+      function scheduleOverviewRender(immediate) {
+        if (!state.latestOverview) return;
+        const render = () => {
+          state.overviewRenderTimer = null;
+          state.overviewLastRenderAt = Date.now();
+          updateOverview({ data: state.latestOverview, __receivedAt: state.overviewReceivedAt || new Date().toISOString(), __frontendLatencyMs: 0 });
+        };
+        if (immediate) {
+          if (state.overviewRenderTimer) window.clearTimeout(state.overviewRenderTimer);
+          render();
+          return;
+        }
+        if (state.overviewRenderTimer) return;
+        const elapsed = Date.now() - state.overviewLastRenderAt;
+        state.overviewRenderTimer = window.setTimeout(render, Math.max(0, OVERVIEW_RENDER_INTERVAL_MS - elapsed));
       }
       buildOverview();
       renderLogs();
@@ -1884,7 +2049,7 @@ def _render_debug_page(access_token: str) -> str:
       window.setInterval(updateClock, 1000);
       function setMapZoom(nextZoom) {
         state.mapZoom = Math.min(8, Math.max(0.25, nextZoom));
-        drawMap();
+        requestMapDraw(false);
       }
       els.mapZoomIn.addEventListener("click", () => setMapZoom(state.mapZoom * 1.25));
       els.mapZoomOut.addEventListener("click", () => setMapZoom(state.mapZoom / 1.25));
@@ -1990,6 +2155,8 @@ def _build_map_diagnostics(snapshot: Any, *, refresh_error: Optional[str] = None
     costmap_revision = _int_or_none(
         map_stream.get("costmap_revision") or status.get("cost_map_revision") or _metric_value(status, "cost_map_metrics", "content_revision")
     )
+    occupancy_content_hash = metadata.get("occupancy_content_hash") or map_stream.get("content_hash") or _metric_value(status, "occupancy_metrics", "content_hash")
+    cost_map_content_hash = metadata.get("cost_map_content_hash") or map_stream.get("costmap_hash") or _metric_value(status, "cost_map_metrics", "content_hash")
     diagnostics = {
         "source_timestamp": source_timestamp,
         "gateway_timestamp": gateway_timestamp,
@@ -2007,12 +2174,14 @@ def _build_map_diagnostics(snapshot: Any, *, refresh_error: Optional[str] = None
         "message_count_delta": map_stream.get("message_count_delta"),
         "stream_age_ms": map_stream.get("stream_age_ms") if map_stream.get("stream_age_ms") is not None else (cache_age * 1000.0 if cache_age is not None else None),
         "content_revision": content_revision,
-        "content_hash": map_stream.get("content_hash") or _metric_value(status, "occupancy_metrics", "content_hash"),
+        "occupancy_content_hash": occupancy_content_hash,
+        "content_hash": occupancy_content_hash,
         "known_cell_delta": map_stream.get("known_cell_delta") if map_stream.get("known_cell_delta") is not None else _metric_value(status, "occupancy_metrics", "known_cell_delta"),
         "known_cell_count": map_stream.get("known_cell_count") if map_stream.get("known_cell_count") is not None else _metric_value(status, "occupancy_metrics", "known_cell_count"),
         "costmap_delta": map_stream.get("costmap_delta") if map_stream.get("costmap_delta") is not None else _metric_value(status, "cost_map_metrics", "costmap_delta"),
         "costmap_revision": costmap_revision,
-        "costmap_hash": map_stream.get("costmap_hash") or _metric_value(status, "cost_map_metrics", "content_hash"),
+        "cost_map_content_hash": cost_map_content_hash,
+        "costmap_hash": cost_map_content_hash,
         "cost_map_message_count": cost_message_count,
         "occupancy_grid_ready": occupancy_grid is not None,
         "cost_map_ready": cost_map is not None,

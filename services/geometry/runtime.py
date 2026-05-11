@@ -1565,15 +1565,17 @@ class PlatformGeometryRuntime:
         occupancy_sequence = int(live_status.get("occupancy_sequence") or live_status.get("occupancy_message_count") or 0)
         cost_map_sequence = int(live_status.get("cost_map_sequence") or live_status.get("cost_map_message_count") or 0)
         message_count = max(int(live_status.get("message_count") or 0), occupancy_sequence + cost_map_sequence)
-        content_revision = max(
-            int(live_status.get("occupancy_revision") or 0),
-            int(live_status.get("cost_map_revision") or 0),
-        )
-        revision_value = update_sequence or message_count or content_revision
+        occupancy_content_revision = int(live_status.get("occupancy_revision") or 0)
+        cost_map_content_revision = int(live_status.get("cost_map_revision") or 0)
+        content_revision = occupancy_content_revision + cost_map_content_revision
         try:
-            live_revision = max(1, int(revision_value or 1))
+            live_revision = max(1, int(content_revision or 1))
         except (TypeError, ValueError):
             live_revision = 1
+        occupancy_metrics = self._clone_metadata(live_status.get("occupancy_metrics") or {})
+        cost_map_metrics = self._clone_metadata(live_status.get("cost_map_metrics") or {})
+        occupancy_content_hash = occupancy_metrics.get("content_hash")
+        cost_map_content_hash = cost_map_metrics.get("content_hash")
         seed = "|".join(str(part or "") for part in (
             live_status.get("provider_name"),
             live_status.get("occupancy_topic"),
@@ -1582,6 +1584,7 @@ class PlatformGeometryRuntime:
         ))
         digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16] if seed.strip("|") else "current"
         metadata = {
+            "event_type": "content_update",
             "source_kind": "platform_live_map_provider",
             "map_snapshot_kind": "live_streaming",
             "live_streaming_ready": True,
@@ -1591,11 +1594,14 @@ class PlatformGeometryRuntime:
             "occupancy_sequence": occupancy_sequence,
             "cost_map_sequence": cost_map_sequence,
             "message_count": message_count,
-            "occupancy_content_revision": live_status.get("occupancy_revision"),
-            "cost_map_content_revision": live_status.get("cost_map_revision"),
+            "occupancy_content_hash": occupancy_content_hash,
+            "cost_map_content_hash": cost_map_content_hash,
+            "content_hash": occupancy_content_hash,
+            "occupancy_content_revision": occupancy_content_revision,
+            "cost_map_content_revision": cost_map_content_revision,
             "content_revision": content_revision,
-            "occupancy_metrics": self._clone_metadata(live_status.get("occupancy_metrics") or {}),
-            "cost_map_metrics": self._clone_metadata(live_status.get("cost_map_metrics") or {}),
+            "occupancy_metrics": occupancy_metrics,
+            "cost_map_metrics": cost_map_metrics,
             "live_map_provider": live_status,
             "live_mapping_diagnostics": self.get_live_mapping_diagnostics(),
         }

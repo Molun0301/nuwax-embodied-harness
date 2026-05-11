@@ -88,15 +88,20 @@ class MappingService:
             metadata=provider_metadata,
         )
 
-    def _handle_provider_map_update(self, payload: Dict[str, object]) -> MapSnapshot:
+    def _handle_provider_map_update(self, payload: Dict[str, object]) -> Optional[MapSnapshot]:
         source_name = str(payload.get("source_name") or "platform_live_map_provider")
         metadata = payload.get("metadata")
+        source_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        self._publish_map_heartbeat(source_name=source_name, metadata=source_metadata)
+        if str(source_metadata.get("event_type") or "content_update") != "content_update":
+            with self._lock:
+                return self._latest_snapshot
         return self.ingest_external_snapshot(
             source_name=source_name,
             occupancy_grid=payload.get("occupancy_grid"),
             cost_map=payload.get("cost_map"),
             semantic_map=payload.get("semantic_map"),
-            metadata=metadata if isinstance(metadata, dict) else None,
+            metadata=source_metadata,
         )
 
     def ingest_external_snapshot(
@@ -160,11 +165,14 @@ class MappingService:
                 source=source_name,
                 metadata={"kind": "latest_map", "version_id": snapshot.version_id, "revision": revision},
             )
+            frame_metadata = self._build_map_frame_metadata(snapshot)
             event_payload = {
                 "source_name": source_name,
                 "version_id": snapshot.version_id,
                 "revision": revision,
+                **frame_metadata,
             }
+            snapshot.metadata.update(frame_metadata)
             stream_sequence = self._extract_stream_sequence(snapshot.metadata)
 
         if self._event_bus is not None:
@@ -236,6 +244,63 @@ class MappingService:
                 continue
         return None
 
+    def _publish_map_heartbeat(self, *, source_name: str, metadata: Dict[str, object]) -> None:
+        if self._stream_bus is None:
+            return
+        heartbeat = {
+            "event_type": "heartbeat",
+            "source_event_type": metadata.get("event_type"),
+            "source_name": source_name,
+            "source_alive": True,
+            "source_layer": metadata.get("source_layer"),
+            "frame_id": metadata.get("frame_id"),
+            "update_sequence": metadata.get("update_sequence"),
+            "message_count": metadata.get("message_count"),
+            "occupancy_sequence": metadata.get("occupancy_sequence"),
+            "cost_map_sequence": metadata.get("cost_map_sequence"),
+            "live_streaming_ready": metadata.get("live_streaming_ready"),
+            "rtabmap_live_streaming_ready": metadata.get("rtabmap_live_streaming_ready"),
+        }
+        sequence = self._extract_stream_sequence(heartbeat)
+        revision = None
+        self._stream_bus.publish(
+            "map.heartbeat",
+            source="mapping_service",
+            payload=heartbeat,
+            frame_id=str(heartbeat.get("frame_id") or "") or None,
+            sequence=sequence,
+            revision=str(revision) if revision is not None else None,
+            status="available",
+            metadata=dict(heartbeat),
+        )
+
+    def _build_map_frame_metadata(self, snapshot: MapSnapshot) -> Dict[str, object]:
+        metadata = dict(snapshot.metadata or {})
+        occupancy_metrics = metadata.get("occupancy_metrics") if isinstance(metadata.get("occupancy_metrics"), dict) else {}
+        cost_map_metrics = metadata.get("cost_map_metrics") if isinstance(metadata.get("cost_map_metrics"), dict) else {}
+        occupancy_revision = metadata.get("occupancy_content_revision")
+        cost_map_revision = metadata.get("cost_map_content_revision")
+        content_revision = metadata.get("content_revision")
+        if content_revision is None:
+            revisions = []
+            for value in (occupancy_revision, cost_map_revision):
+                try:
+                    revisions.append(int(value))
+                except (TypeError, ValueError):
+                    pass
+            content_revision = sum(revisions) if revisions else snapshot.revision
+        occupancy_hash = metadata.get("occupancy_content_hash") or occupancy_metrics.get("content_hash")
+        cost_map_hash = metadata.get("cost_map_content_hash") or cost_map_metrics.get("content_hash")
+        return {
+            "event_type": "content_update",
+            "occupancy_content_hash": occupancy_hash,
+            "cost_map_content_hash": cost_map_hash,
+            "content_hash": metadata.get("content_hash") or occupancy_hash,
+            "occupancy_content_revision": occupancy_revision,
+            "cost_map_content_revision": cost_map_revision,
+            "content_revision": content_revision,
+        }
+
     def _infer_snapshot_kind(self, metadata: Dict[str, object]) -> str:
         source_mode = str(metadata.get("source_mode") or metadata.get("map_version_source_mode") or "").strip()
         if source_mode == "live_streaming_checkpoint" or metadata.get("rtabmap_live_streaming_ready") is True:
@@ -296,6 +361,35 @@ class MappingService:
             volatile_keys = {
                 "timestamp",
                 "gateway_timestamp",
+                "source_timestamp",
+                "update_sequence",
+                "source_sequence",
+                "occupancy_sequence",
+                "cost_map_sequence",
+                "message_count",
+                "occupancy_message_count",
+                "cost_map_message_count",
+                "message_count_delta",
+                "costmap_message_count_delta",
+                "known_cell_delta",
+                "costmap_delta",
+                "last_message_at",
+                "last_count",
+                "last_costmap_count",
+                "first_count",
+                "last_growth_at",
+                "first_growth_at",
+                "last_content_change_at",
+                "last_costmap_change_at",
+                "source_timestamp_fresh",
+                "message_count_recent",
+                "content_recent",
+                "latest_occupancy_timestamp",
+                "latest_cost_map_timestamp",
+                "latest_occupancy_source_timestamp",
+                "latest_cost_map_source_timestamp",
+                "latest_occupancy_received_at",
+                "latest_cost_map_received_at",
                 "latest_occupancy_cache_age_sec",
                 "latest_cost_map_cache_age_sec",
                 "latest_occupancy_age_sec",
@@ -307,7 +401,9 @@ class MappingService:
             return {
                 key: self._normalize_snapshot_value(inner)
                 for key, inner in sorted(value.items())
-                if key not in volatile_keys and not str(key).endswith("_age_sec")
+                if key not in volatile_keys
+                and not str(key).endswith("_age_sec")
+                and not str(key).endswith("_received_at")
             }
         if isinstance(value, list):
             return [self._normalize_snapshot_value(item) for item in value]

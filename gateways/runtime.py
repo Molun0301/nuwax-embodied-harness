@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 import logging
 import math
 from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlencode
 
 from contracts.artifacts import ArtifactRetentionPolicy
 from contracts.capabilities import (
@@ -26,6 +27,7 @@ from contracts.spatial_memory import SceneSpaceReviewStatus
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
 from contracts.runtime_views import RuntimeGovernanceSummary
+from contracts.image import ImageFrame
 from contracts.streams import StreamPayloadKind
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, StreamBus, TaskManager
 from drivers.entry import load_active_robot_private_capability_specs
@@ -89,6 +91,23 @@ _RUNTIME_METADATA_LOG_KEYS = (
 
 _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 2.0
 _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
+
+
+@dataclass(frozen=True)
+class LatestVideoFrame:
+    camera_id: Optional[str]
+    frame_id: Optional[str]
+    width_px: Optional[int]
+    height_px: Optional[int]
+    encoding: str
+    data: bytes
+    sequence: int
+    timestamp: Any
+    metadata: Dict[str, Any]
+
+    @property
+    def payload_bytes(self) -> int:
+        return len(self.data)
 
 
 def _has_observability_value(value: Any) -> bool:
@@ -344,6 +363,9 @@ class GatewayRuntime:
         self._navigation_status_refresh_thread: Optional[threading.Thread] = None
         self._video_stream_refresh_stop = threading.Event()
         self._video_stream_refresh_thread: Optional[threading.Thread] = None
+        self._latest_video_frame: Optional[LatestVideoFrame] = None
+        self._latest_video_frame_condition = threading.Condition()
+        self._latest_video_frame_sequence = 0
         self._pointcloud_map_cache = PointCloudMapCache()
         self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
         self._base_capability_matrix = robot.manifest.capability_matrix
@@ -759,46 +781,87 @@ class GatewayRuntime:
                 metadata={"reason": "image_capture_failed", "refresh_reason": reason},
             )
             return
-        data = getattr(image_frame, "data", None)
-        data_uri = None
-        encoding = str(
-            getattr(getattr(image_frame, "encoding", None), "value", getattr(image_frame, "encoding", "jpeg")) or "jpeg"
-        ).lower()
-        if data:
-            mime_type = {
-                "jpeg": "image/jpeg",
-                "jpg": "image/jpeg",
-                "png": "image/png",
-            }.get(encoding, "application/octet-stream")
-            data_uri = "data:%s;base64,%s" % (mime_type, base64.b64encode(bytes(data)).decode("ascii"))
+        latest_frame = self._store_latest_video_frame(image_frame)
+        if latest_frame is None:
+            self.stream_bus.publish(
+                "video.frame",
+                source="image_provider",
+                payload={"available": False, "message": "当前图像 provider 未返回 JPEG 图像数据。"},
+                status="unsupported",
+                metadata={"reason": "image_payload_missing", "refresh_reason": reason},
+            )
+            return
+        stream_path = "/streams/video.mjpeg?" + urlencode({"camera_id": latest_frame.camera_id or ""})
         payload = {
             "available": True,
-            "camera_id": getattr(image_frame, "camera_id", None),
-            "frame_id": getattr(image_frame, "frame_id", None),
-            "width_px": getattr(image_frame, "width_px", None),
-            "height_px": getattr(image_frame, "height_px", None),
-            "encoding": encoding,
-            "data_uri": data_uri,
-            "payload_bytes": len(data or b""),
+            "camera_id": latest_frame.camera_id,
+            "frame_id": latest_frame.frame_id,
+            "width_px": latest_frame.width_px,
+            "height_px": latest_frame.height_px,
+            "encoding": latest_frame.encoding,
+            "payload_bytes": latest_frame.payload_bytes,
+            "transport": "mjpeg",
+            "stream_url": stream_path,
             "source": "image_provider",
             "refresh_reason": reason,
-            "timestamp": getattr(image_frame, "timestamp", None),
-            "metadata": self._serialize(getattr(image_frame, "metadata", {}) or {}),
+            "timestamp": latest_frame.timestamp,
+            "metadata": self._serialize(latest_frame.metadata),
         }
         self.stream_bus.publish(
             "video.frame",
             source="image_provider",
             payload=payload,
-            frame_id=getattr(image_frame, "frame_id", None),
+            frame_id=latest_frame.frame_id,
+            sequence=latest_frame.sequence,
             status="available",
             metadata={
-                "camera_id": getattr(image_frame, "camera_id", None),
-                "encoding": str(
-                    getattr(getattr(image_frame, "encoding", None), "value", getattr(image_frame, "encoding", "")) or ""
-                ),
+                "camera_id": latest_frame.camera_id,
+                "encoding": latest_frame.encoding,
+                "payload_bytes": latest_frame.payload_bytes,
+                "transport": "mjpeg",
                 "refresh_reason": reason,
             },
         )
+
+    def _store_latest_video_frame(self, image_frame: ImageFrame) -> Optional[LatestVideoFrame]:
+        data = getattr(image_frame, "data", None)
+        encoding = str(
+            getattr(getattr(image_frame, "encoding", None), "value", getattr(image_frame, "encoding", "jpeg")) or "jpeg"
+        ).lower()
+        if not data or encoding not in {"jpeg", "jpg"}:
+            return None
+        with self._latest_video_frame_condition:
+            self._latest_video_frame_sequence += 1
+            latest_frame = LatestVideoFrame(
+                camera_id=getattr(image_frame, "camera_id", None),
+                frame_id=getattr(image_frame, "frame_id", None),
+                width_px=getattr(image_frame, "width_px", None),
+                height_px=getattr(image_frame, "height_px", None),
+                encoding="jpeg",
+                data=bytes(data),
+                sequence=self._latest_video_frame_sequence,
+                timestamp=getattr(image_frame, "timestamp", None),
+                metadata=dict(getattr(image_frame, "metadata", {}) or {}),
+            )
+            self._latest_video_frame = latest_frame
+            self._latest_video_frame_condition.notify_all()
+            return latest_frame
+
+    def latest_video_frame(self) -> Optional[LatestVideoFrame]:
+        with self._latest_video_frame_condition:
+            return self._latest_video_frame
+
+    def wait_for_video_frame(self, after_sequence: int, *, timeout_sec: float) -> Optional[LatestVideoFrame]:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        with self._latest_video_frame_condition:
+            while True:
+                latest_frame = self._latest_video_frame
+                if latest_frame is not None and latest_frame.sequence > after_sequence:
+                    return latest_frame
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                self._latest_video_frame_condition.wait(timeout=remaining)
 
     def _handle_map_frame_for_pointcloud_map_stream(self, frame: Any) -> None:
         del frame

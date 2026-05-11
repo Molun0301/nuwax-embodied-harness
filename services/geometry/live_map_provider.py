@@ -366,7 +366,8 @@ class Ros2LiveMapProvider:
             known_count = int(metrics.get("known_cell_count") or 0)
             content_hash = str(metrics.get("content_hash") or "")
             known_delta = known_count - previous_known_count if previous_hash is not None else known_count
-            if previous_hash is None or content_hash != previous_hash or known_delta != 0:
+            content_changed = previous_hash is None or content_hash != previous_hash or known_delta != 0
+            if content_changed:
                 self._occupancy_content_revision += 1
             self._occupancy_message_count += 1
             metrics = {
@@ -381,7 +382,10 @@ class Ros2LiveMapProvider:
             self._last_occupancy_content_hash = content_hash
             self._last_occupancy_known_cell_count = known_count
             self._last_error = None
-            payload = self._build_map_update_payload_locked(source_layer="occupancy")
+            payload = self._build_map_update_payload_locked(
+                source_layer="occupancy",
+                event_type="content_update" if content_changed else "heartbeat",
+            )
             subscribers = list(self._map_update_subscribers.items())
         self._notify_map_update_subscribers(subscribers, payload)
 
@@ -410,7 +414,8 @@ class Ros2LiveMapProvider:
             known_count = int(metrics.get("known_cell_count") or 0)
             content_hash = str(metrics.get("content_hash") or "")
             costmap_delta = known_count - previous_known_count if previous_hash is not None else known_count
-            if previous_hash is None or content_hash != previous_hash or costmap_delta != 0:
+            content_changed = previous_hash is None or content_hash != previous_hash or costmap_delta != 0
+            if content_changed:
                 self._cost_map_content_revision += 1
             self._cost_map_message_count += 1
             metrics = {
@@ -426,45 +431,69 @@ class Ros2LiveMapProvider:
             self._last_cost_map_content_hash = content_hash
             self._last_cost_map_known_cell_count = known_count
             self._last_error = None
-            payload = self._build_map_update_payload_locked(source_layer="cost_map")
+            payload = self._build_map_update_payload_locked(
+                source_layer="cost_map",
+                event_type="content_update" if content_changed else "heartbeat",
+            )
             subscribers = list(self._map_update_subscribers.items())
         self._notify_map_update_subscribers(subscribers, payload)
 
-    def _build_map_update_payload_locked(self, *, source_layer: str) -> Dict[str, object]:
+    def _build_map_update_payload_locked(self, *, source_layer: str, event_type: str) -> Dict[str, object]:
         self._update_sequence += 1
+        include_layers = event_type == "content_update"
         occupancy_grid = (
             self._latest_occupancy_grid.model_copy(deep=True)
-            if self._latest_occupancy_grid is not None
+            if include_layers and self._latest_occupancy_grid is not None
             else None
         )
-        cost_map = self._latest_cost_map.model_copy(deep=True) if self._latest_cost_map is not None else None
+        cost_map = (
+            self._latest_cost_map.model_copy(deep=True)
+            if include_layers and self._latest_cost_map is not None
+            else None
+        )
+        latest_occupancy = self._latest_occupancy_grid
+        latest_cost_map = self._latest_cost_map
         occupancy_metrics = dict(self._latest_occupancy_metrics)
         cost_map_metrics = dict(self._latest_cost_map_metrics)
         metrics = occupancy_metrics if source_layer == "occupancy" else cost_map_metrics
         occupancy_revision = self._occupancy_content_revision
         cost_map_revision = self._cost_map_content_revision
+        occupancy_hash = occupancy_metrics.get("content_hash")
+        cost_map_hash = cost_map_metrics.get("content_hash")
+        frame_id = None
+        if latest_occupancy is not None:
+            frame_id = latest_occupancy.frame_id
+        elif latest_cost_map is not None:
+            frame_id = latest_cost_map.frame_id
+        metadata = {
+            "event_type": event_type,
+            "source_kind": "platform_live_map_provider",
+            "map_snapshot_kind": "live_streaming",
+            "live_streaming_ready": True,
+            "rtabmap_live_streaming_ready": True,
+            "source_alive": True,
+            "frame_id": frame_id,
+            "update_sequence": self._update_sequence,
+            "source_layer": source_layer,
+            "occupancy_sequence": self._occupancy_message_count,
+            "cost_map_sequence": self._cost_map_message_count,
+            "message_count": self._occupancy_message_count + self._cost_map_message_count,
+            "occupancy_content_hash": occupancy_hash,
+            "cost_map_content_hash": cost_map_hash,
+            "content_hash": occupancy_hash,
+            "occupancy_content_revision": occupancy_revision,
+            "cost_map_content_revision": cost_map_revision,
+            "content_revision": occupancy_revision + cost_map_revision,
+            "occupancy_metrics": occupancy_metrics,
+            "cost_map_metrics": cost_map_metrics,
+            "metrics": metrics,
+        }
         return {
             "source_name": self.provider_name,
             "occupancy_grid": occupancy_grid,
             "cost_map": cost_map,
             "semantic_map": None,
-            "metadata": {
-                "source_kind": "platform_live_map_provider",
-                "map_snapshot_kind": "live_streaming",
-                "live_streaming_ready": True,
-                "rtabmap_live_streaming_ready": True,
-                "update_sequence": self._update_sequence,
-                "source_layer": source_layer,
-                "occupancy_sequence": self._occupancy_message_count,
-                "cost_map_sequence": self._cost_map_message_count,
-                "message_count": self._occupancy_message_count + self._cost_map_message_count,
-                "occupancy_content_revision": occupancy_revision,
-                "cost_map_content_revision": cost_map_revision,
-                "content_revision": max(occupancy_revision, cost_map_revision),
-                "occupancy_metrics": occupancy_metrics,
-                "cost_map_metrics": cost_map_metrics,
-                "metrics": metrics,
-            },
+            "metadata": metadata,
         }
 
     def _notify_map_update_subscribers(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from contracts.events import RuntimeEventCategory
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.map_workspace import MapAsset, MapAssetStatus, MapVersion, MapWorkspace
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus
 from core import EventBus, StateNamespace, StateStore
@@ -237,15 +238,11 @@ class MapWorkspaceService:
                 force_relocalize=force_relocalize,
                 geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
             )
-        return self._localization_service.ensure_active_session(
-            map_name=active_map_name,
-            map_version_id=latest_map_snapshot.version_id,
+        return self._ensure_localization_session_for_snapshot(
+            active_map_name=active_map_name,
+            latest_map_snapshot=latest_map_snapshot,
             frame_id=frame_id,
-            metadata={
-                **dict(metadata or {}),
-                "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
-            },
-            geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
+            metadata=metadata,
         )
 
     def list_map_versions(self, *, map_name: str, limit: Optional[int] = None) -> Tuple[MapVersion, ...]:
@@ -751,16 +748,76 @@ class MapWorkspaceService:
         latest_map_snapshot = self._mapping_service.get_latest_snapshot()
         if not active_map_name or latest_map_snapshot is None:
             return None
+        frame_id = self._resolve_map_frame_id(latest_map_snapshot)
+        return self._ensure_localization_session_for_snapshot(
+            active_map_name=active_map_name,
+            latest_map_snapshot=latest_map_snapshot,
+            frame_id=frame_id,
+            metadata=metadata,
+        )
+
+    def _ensure_localization_session_for_snapshot(
+        self,
+        *,
+        active_map_name: str,
+        latest_map_snapshot,
+        frame_id: Optional[str],
+        metadata: Optional[Dict[str, object]],
+    ) -> LocalizationSession:
+        reusable_session = self._get_reusable_live_localization_session(
+            active_map_name=active_map_name,
+            latest_map_snapshot=latest_map_snapshot,
+            frame_id=frame_id,
+        )
+        if reusable_session is not None:
+            return reusable_session
         return self._localization_service.ensure_active_session(
             map_name=active_map_name,
             map_version_id=latest_map_snapshot.version_id,
-            frame_id=self._resolve_map_frame_id(latest_map_snapshot),
+            frame_id=frame_id,
             metadata={
                 **dict(metadata or {}),
                 "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
             },
             geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
         )
+
+    def _get_reusable_live_localization_session(
+        self,
+        *,
+        active_map_name: str,
+        latest_map_snapshot,
+        frame_id: Optional[str],
+    ) -> Optional[LocalizationSession]:
+        if not self._is_live_streaming_snapshot(latest_map_snapshot):
+            return None
+        session = self._localization_service.get_active_session()
+        if session is None or session.map_name != active_map_name:
+            return None
+        if session.status == LocalizationSessionStatus.FAILED:
+            return None
+        if not self._localization_session_frame_matches(session.frame_id, frame_id):
+            return None
+        return session
+
+    def _is_live_streaming_snapshot(self, latest_map_snapshot) -> bool:
+        metadata = dict(getattr(latest_map_snapshot, "metadata", {}) or {})
+        return bool(
+            getattr(latest_map_snapshot, "source_name", None) == "platform_ros2_live_map"
+            or metadata.get("map_snapshot_kind") == "live_streaming"
+            or metadata.get("source_kind") == "platform_live_map_provider"
+            or metadata.get("live_streaming_ready")
+            or metadata.get("rtabmap_live_streaming_ready")
+        )
+
+    def _localization_session_frame_matches(self, session_frame_id: Optional[str], frame_id: Optional[str]) -> bool:
+        existing_frame_id = str(session_frame_id or "").strip() or None
+        latest_frame_id = str(frame_id or "").strip() or None
+        if existing_frame_id == latest_frame_id:
+            return True
+        if existing_frame_id and latest_frame_id:
+            return frame_ids_semantically_equal(existing_frame_id, latest_frame_id)
+        return False
 
     def _require_map_name(self, map_name: str) -> str:
         resolved_name = str(map_name or "").strip()

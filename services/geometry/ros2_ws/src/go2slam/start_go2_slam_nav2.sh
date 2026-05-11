@@ -3,12 +3,44 @@
 set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROS_SETUP="/opt/ros/foxy/setup.bash"
 WS_SETUP="$ROOT_DIR/install/setup.bash"
-RVIZ_CONFIG="/opt/ros/foxy/share/nav2_bringup/rviz/nav2_default_view.rviz"
 EXPLORE_PARAMS_FILE="$ROOT_DIR/src/go2_navigation2/config/explore_params.yaml"
 NAV2_PID=""
 MAPPING_PID=""
+STOP_REQUESTED=false
+
+detect_ros_setup() {
+  local candidates=()
+  if [[ -n "${NUWAX_ROS_SETUP_SCRIPT:-}" ]]; then
+    candidates+=("${NUWAX_ROS_SETUP_SCRIPT}")
+  fi
+  if [[ -n "${ROS_DISTRO:-}" ]]; then
+    candidates+=("/opt/ros/${ROS_DISTRO}/setup.bash")
+  fi
+  candidates+=(
+    "/opt/ros/jazzy/setup.bash"
+    "/opt/ros/humble/setup.bash"
+    "/opt/ros/iron/setup.bash"
+    "/opt/ros/foxy/setup.bash"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_nav2_rviz_config() {
+  local ros_setup="$1"
+  local ros_prefix="${ros_setup%/setup.bash}"
+  echo "${ros_prefix}/share/nav2_bringup/rviz/nav2_default_view.rviz"
+}
+
+ROS_SETUP="$(detect_ros_setup || true)"
+RVIZ_CONFIG=""
 
 # --- 新增参数处理 ---
 START_MAPPING=false  # 默认不启动点云建图
@@ -37,6 +69,7 @@ done
 # ------------------
 
 cleanup() {
+  STOP_REQUESTED=true
   # 只有在 PID 不为空时才尝试清理
   for pid in "${MAPPING_PID}" "${NAV2_PID}"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
@@ -52,6 +85,37 @@ cleanup() {
 }
 
 trap cleanup EXIT INT TERM
+
+workspace_stale_source() {
+  local setup_file="$1"
+  local source_file=""
+  local search_roots=()
+  [[ -d "${ROOT_DIR}/src" ]] && search_roots+=("${ROOT_DIR}/src")
+  [[ -d "${ROOT_DIR}/m-explore-ros2" ]] && search_roots+=("${ROOT_DIR}/m-explore-ros2")
+  if [[ "${#search_roots[@]}" -eq 0 ]]; then
+    return 1
+  fi
+  while IFS= read -r -d '' source_file; do
+    if [[ "${source_file}" -nt "${setup_file}" ]]; then
+      echo "${source_file}"
+      return 0
+    fi
+  done < <(find "${search_roots[@]}" -type f \
+    \( -name 'package.xml' -o -name 'CMakeLists.txt' -o -name '*.launch.py' -o -name '*.py' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.yaml' -o -name '*.xml' \) \
+    -print0 2>/dev/null)
+  return 1
+}
+
+assert_workspace_current() {
+  local setup_file="$1"
+  local stale_source=""
+  stale_source="$(workspace_stale_source "${setup_file}" || true)"
+  if [[ -n "${stale_source}" ]]; then
+    echo "Workspace install is older than source: ${stale_source}" >&2
+    echo "Rebuild first: cd ${ROOT_DIR} && source ${ROS_SETUP} && colcon build --symlink-install" >&2
+    exit 1
+  fi
+}
 
 configure_cyclonedds_participant_limit() {
   local max_auto_participant_index=100
@@ -81,16 +145,19 @@ configure_cyclonedds_participant_limit() {
 }
 
 # 环境检查
-if [[ ! -f "${ROS_SETUP}" ]]; then
-  echo "Missing ROS setup: ${ROS_SETUP}" >&2
+if [[ -z "${ROS_SETUP}" || ! -f "${ROS_SETUP}" ]]; then
+  echo "Missing ROS setup. Set NUWAX_ROS_SETUP_SCRIPT or install ROS2 Jazzy/Humble/Iron/Foxy." >&2
   exit 1
 fi
+RVIZ_CONFIG="$(resolve_nav2_rviz_config "${ROS_SETUP}")"
 
 if [[ ! -f "${WS_SETUP}" ]]; then
   echo "Missing workspace setup: ${WS_SETUP}" >&2
   echo "Build the workspace first: colcon build" >&2
   exit 1
 fi
+
+assert_workspace_current "${WS_SETUP}"
 
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 
@@ -155,12 +222,19 @@ fi
 
 if [[ "${START_RVIZ}" != true ]]; then
   echo "RViz disabled. Press Ctrl-C to stop Go2 Nav2."
+  set +e
   if [[ "${START_MAPPING}" = true ]]; then
     wait -n "${NAV2_PID}" "${MAPPING_PID}"
   else
     wait "${NAV2_PID}"
   fi
-  exit $?
+  exit_code="$?"
+  set -e
+  if [[ "${STOP_REQUESTED}" == true ]]; then
+    exit 0
+  fi
+  echo "Go2 SLAM/Nav2 launch exited unexpectedly with code ${exit_code}. Check runtime_data/geometry/logs/external_slam_nav2.log." >&2
+  exit 1
 fi
 
 echo "Starting RViz..."

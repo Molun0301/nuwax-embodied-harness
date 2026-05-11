@@ -7,10 +7,41 @@
 set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROS_SETUP="/opt/ros/jazzy/setup.bash"
 WS_SETUP="$ROOT_DIR/install/setup.bash"
-RVIZ_CONFIG="/opt/ros/jazzy/share/nav2_bringup/rviz/nav2_default_view.rviz"
 LAUNCH_PID=""
+
+detect_ros_setup() {
+  local candidates=()
+  if [[ -n "${NUWAX_ROS_SETUP_SCRIPT:-}" ]]; then
+    candidates+=("${NUWAX_ROS_SETUP_SCRIPT}")
+  fi
+  if [[ -n "${ROS_DISTRO:-}" ]]; then
+    candidates+=("/opt/ros/${ROS_DISTRO}/setup.bash")
+  fi
+  candidates+=(
+    "/opt/ros/jazzy/setup.bash"
+    "/opt/ros/humble/setup.bash"
+    "/opt/ros/iron/setup.bash"
+    "/opt/ros/foxy/setup.bash"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_nav2_rviz_config() {
+  local ros_setup="$1"
+  local ros_prefix="${ros_setup%/setup.bash}"
+  echo "${ros_prefix}/share/nav2_bringup/rviz/nav2_default_view.rviz"
+}
+
+ROS_SETUP="$(detect_ros_setup || true)"
+RVIZ_CONFIG=""
 
 cleanup() {
   if [[ -n "${LAUNCH_PID}" ]] && kill -0 "${LAUNCH_PID}" 2>/dev/null; then
@@ -20,6 +51,37 @@ cleanup() {
 }
 
 trap cleanup EXIT INT TERM
+
+workspace_stale_source() {
+  local setup_file="$1"
+  local source_file=""
+  local search_roots=()
+  [[ -d "${ROOT_DIR}/src" ]] && search_roots+=("${ROOT_DIR}/src")
+  [[ -d "${ROOT_DIR}/m-explore-ros2" ]] && search_roots+=("${ROOT_DIR}/m-explore-ros2")
+  if [[ "${#search_roots[@]}" -eq 0 ]]; then
+    return 1
+  fi
+  while IFS= read -r -d '' source_file; do
+    if [[ "${source_file}" -nt "${setup_file}" ]]; then
+      echo "${source_file}"
+      return 0
+    fi
+  done < <(find "${search_roots[@]}" -type f \
+    \( -name 'package.xml' -o -name 'CMakeLists.txt' -o -name '*.launch.py' -o -name '*.py' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.yaml' -o -name '*.xml' \) \
+    -print0 2>/dev/null)
+  return 1
+}
+
+assert_workspace_current() {
+  local setup_file="$1"
+  local stale_source=""
+  stale_source="$(workspace_stale_source "${setup_file}" || true)"
+  if [[ -n "${stale_source}" ]]; then
+    echo "Workspace install is older than source: ${stale_source}" >&2
+    echo "Rebuild first: cd ${ROOT_DIR} && source ${ROS_SETUP} && colcon build --symlink-install" >&2
+    exit 1
+  fi
+}
 
 configure_cyclonedds_participant_limit() {
   local max_auto_participant_index=100
@@ -48,16 +110,19 @@ configure_cyclonedds_participant_limit() {
   echo "Warning: CYCLONEDDS_URI is set but could not be patched automatically. If nodes fail with participant index errors, add MaxAutoParticipantIndex=${max_auto_participant_index} to the CycloneDDS config." >&2
 }
 
-if [[ ! -f "${ROS_SETUP}" ]]; then
-  echo "Missing ROS setup: ${ROS_SETUP}" >&2
+if [[ -z "${ROS_SETUP}" || ! -f "${ROS_SETUP}" ]]; then
+  echo "Missing ROS setup. Set NUWAX_ROS_SETUP_SCRIPT or install ROS2 Jazzy/Humble/Iron/Foxy." >&2
   exit 1
 fi
+RVIZ_CONFIG="$(resolve_nav2_rviz_config "${ROS_SETUP}")"
 
 if [[ ! -f "${WS_SETUP}" ]]; then
   echo "Missing workspace setup: ${WS_SETUP}" >&2
   echo "Build the workspace first: colcon build" >&2
   exit 1
 fi
+
+assert_workspace_current "${WS_SETUP}"
 
 if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
   echo "No GUI session detected. RViz needs DISPLAY or WAYLAND_DISPLAY." >&2

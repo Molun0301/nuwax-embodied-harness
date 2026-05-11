@@ -89,6 +89,23 @@ GO2SLAM_APT_BASE_PACKAGES = (
     "libopencv-dev",
     "libpcl-dev",
 )
+GO2SLAM_RUNTIME_REQUIRED_PACKAGES = (
+    "go2_navigation2",
+    "go2_slam",
+    "go2_driver",
+    "go2_perception",
+    "explore_lite",
+)
+GO2SLAM_SOURCE_STALE_SUFFIXES = (
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".py",
+    ".cpp",
+    ".hpp",
+    ".h",
+    ".launch.py",
+)
 GO2SLAM_ROS_REQUIRED_PACKAGE_SUFFIXES = (
     "ament-cmake",
     "ament-cmake-gtest",
@@ -105,7 +122,6 @@ GO2SLAM_ROS_REQUIRED_PACKAGE_SUFFIXES = (
     "message-filters",
     "nav-msgs",
     "nav2-amcl",
-    "nav2-behaviors",
     "nav2-bringup",
     "nav2-bt-navigator",
     "nav2-controller",
@@ -353,12 +369,19 @@ def _parse_csv(value: str) -> Tuple[str, ...]:
 
 
 def _detect_ros_setup() -> Optional[Path]:
-    for candidate in (
-        Path("/opt/ros/humble/setup.bash"),
-        Path("/opt/ros/jazzy/setup.bash"),
-        Path("/opt/ros/iron/setup.bash"),
-        Path("/opt/ros/foxy/setup.bash"),
-    ):
+    configured = str(os.environ.get("NUWAX_ROS_SETUP_SCRIPT", "")).strip()
+    candidates: List[Path] = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend(
+        (
+            Path("/opt/ros/jazzy/setup.bash"),
+            Path("/opt/ros/humble/setup.bash"),
+            Path("/opt/ros/iron/setup.bash"),
+            Path("/opt/ros/foxy/setup.bash"),
+        )
+    )
+    for candidate in candidates:
         if candidate.exists():
             return candidate
     return None
@@ -377,6 +400,48 @@ def _detect_ros_distro(ros_setup: Optional[Path] = None) -> str:
         return parts[ros_index + 1]
     except (ValueError, IndexError):
         return ""
+
+
+def go2slam_setup_path() -> Path:
+    return GO2SLAM_WS_DIR / "install" / "setup.bash"
+
+
+def find_go2slam_stale_source(setup_path: Path) -> Optional[Path]:
+    if not setup_path.exists():
+        return None
+    roots = [GO2SLAM_WS_DIR / "src", GO2SLAM_WS_DIR / "m-explore-ros2"]
+    for root in roots:
+        if not root.exists():
+            continue
+        for candidate in root.rglob("*"):
+            if not candidate.is_file():
+                continue
+            name = candidate.name
+            if not (name == "CMakeLists.txt" or name.endswith(GO2SLAM_SOURCE_STALE_SUFFIXES)):
+                continue
+            try:
+                if candidate.stat().st_mtime > setup_path.stat().st_mtime:
+                    return candidate
+            except OSError:
+                continue
+    return None
+
+
+def missing_go2slam_runtime_packages(ros_setup: Optional[Path], packages: Sequence[str] = GO2SLAM_RUNTIME_REQUIRED_PACKAGES) -> Tuple[str, ...]:
+    setup_path = go2slam_setup_path()
+    if ros_setup is None or not setup_path.exists():
+        return tuple(packages)
+    missing: List[str] = []
+    for package_name in packages:
+        command = (
+            f"source {shlex.quote(str(ros_setup))} "
+            f"&& source {shlex.quote(str(setup_path))} "
+            f"&& ros2 pkg prefix {shlex.quote(package_name)} >/dev/null"
+        )
+        result = _run(("bash", "-lc", command), cwd=GO2SLAM_WS_DIR, check=False, capture_output=True)
+        if result.returncode != 0:
+            missing.append(package_name)
+    return tuple(missing)
 
 
 def _sudo_prefix() -> Tuple[str, ...]:
@@ -399,7 +464,8 @@ def build_go2slam_apt_packages(ros_distro: str) -> Tuple[str, ...]:
     normalized = str(ros_distro or "").strip()
     if not normalized:
         raise BootstrapError("无法识别 ROS2 发行版，不能推导 Go2SLAM apt 包名。")
-    ros_packages = tuple(f"ros-{normalized}-{suffix}" for suffix in GO2SLAM_ROS_REQUIRED_PACKAGE_SUFFIXES)
+    nav2_recovery_suffix = "nav2-recoveries" if normalized == "foxy" else "nav2-behaviors"
+    ros_packages = tuple(f"ros-{normalized}-{suffix}" for suffix in (*GO2SLAM_ROS_REQUIRED_PACKAGE_SUFFIXES, nav2_recovery_suffix))
     return (*GO2SLAM_APT_BASE_PACKAGES, *ros_packages)
 
 
@@ -551,7 +617,13 @@ def _read_existing_env(path: Path) -> Dict[str, str]:
 class BootstrapPlanner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.python_bin = args.python_bin or sys.executable or "python3"
+        self.install_python = self._resolve_bool("install_python", default=True)
+        requested_python_bin = str(args.python_bin or "").strip()
+        self.seed_python_bin = sys.executable or "python3"
+        self.use_project_venv = not requested_python_bin and self.install_python
+        self.python_bin = requested_python_bin or (
+            str(PROJECT_ROOT / ".venv" / "bin" / "python") if self.use_project_venv else self.seed_python_bin
+        )
         self.repo_root = PROJECT_ROOT
         self.root_template = ROOT_ENV_TEMPLATE
         self.root_target = Path(args.root_env_output).expanduser().resolve() if args.root_env_output else ROOT_ENV_TARGET
@@ -565,7 +637,6 @@ class BootstrapPlanner:
         self.systemd_enabled = self._resolve_bool("systemd", default=False)
         self.relay_enabled = self._resolve_bool("relay", default=False)
         self.data_plane_enabled = self._resolve_bool("data_plane", default=self.selected_robot == "go2" and self.tier == "full")
-        self.install_python = self._resolve_bool("install_python", default=True)
         self.prepare_memory = self._resolve_bool("prepare_memory", default=self.memory_mode == "local")
         self.prepare_yolo = self._resolve_bool("prepare_yolo", default=self.perception_mode != "disabled")
         self.export_yolo_engine = self._resolve_bool("export_yolo_engine", default=False)
@@ -630,10 +701,13 @@ class BootstrapPlanner:
 
     def root_overrides(self) -> Dict[str, str]:
         go2_geometry_enabled = self.selected_robot == "go2" and self.geometry_enabled
+        ros_setup = _detect_ros_setup() if go2_geometry_enabled else None
         values: Dict[str, str] = {
             "NUWAX_ACTIVE_ROBOT": self.selected_robot,
+            "NUWAX_PYTHON_BIN": self.python_bin,
             "NUWAX_GEOMETRY_ENABLED": _bool_text(go2_geometry_enabled),
             "NUWAX_GEOMETRY_REQUIRE_ROS2": _bool_text(go2_geometry_enabled),
+            "NUWAX_ROS_SETUP_SCRIPT": str(ros_setup) if ros_setup is not None else "",
             "NUWAX_GEOMETRY_STACK": "disabled",
             "NUWAX_GEOMETRY_SETUP_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash"),
             "NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR": "",
@@ -846,10 +920,26 @@ def run_checks(planner: BootstrapPlanner) -> int:
     results: List[Tuple[bool, str]] = []
     results.append((_file_exists(ROOT_ENV_TEMPLATE), _check_result("根模板", _file_exists(ROOT_ENV_TEMPLATE), str(ROOT_ENV_TEMPLATE))))
     results.append((_file_exists(START_SCRIPT), _check_result("统一启动入口", _file_exists(START_SCRIPT), str(START_SCRIPT))))
-    python_ok = _which(Path(planner.python_bin).name) is not None or Path(planner.python_bin).exists()
-    results.append((python_ok, _check_result("Python", python_ok, planner.python_bin)))
-    pip_ok = _which("pip3") is not None or _which("pip") is not None
-    results.append((pip_ok, _check_result("pip", pip_ok, "pip3 或 pip")))
+    if planner.use_project_venv:
+        seed_name = Path(planner.seed_python_bin).name
+        python_ok = _which(seed_name) is not None or Path(planner.seed_python_bin).exists()
+        results.append((python_ok, _check_result("Python", python_ok, planner.seed_python_bin)))
+        venv_ok = False
+        if python_ok:
+            venv_result = _run(
+                (planner.seed_python_bin, "-c", "import venv, ensurepip"),
+                cwd=PROJECT_ROOT,
+                check=False,
+                capture_output=True,
+                display_command=f"{planner.seed_python_bin} -c 'import venv, ensurepip'",
+            )
+            venv_ok = venv_result.returncode == 0
+        results.append((venv_ok, _check_result("python venv", venv_ok, f"将创建 {PROJECT_ROOT / '.venv'}")))
+    else:
+        python_ok = _which(Path(planner.python_bin).name) is not None or Path(planner.python_bin).exists()
+        results.append((python_ok, _check_result("Python", python_ok, planner.python_bin)))
+        pip_ok = _which("pip3") is not None or _which("pip") is not None
+        results.append((pip_ok, _check_result("pip", pip_ok, "pip3 或 pip")))
     results.append((_file_exists(PROJECT_ROOT / "requirements.txt"), _check_result("requirements.txt", _file_exists(PROJECT_ROOT / "requirements.txt"), str(PROJECT_ROOT / "requirements.txt"))))
 
     if planner.geometry_enabled or planner.build_geometry or planner.build_go2slam:
@@ -863,16 +953,35 @@ def run_checks(planner: BootstrapPlanner) -> int:
         rosdep_ok = _which("rosdep") is not None
         rosdep_ready = rosdep_ok or planner.install_geometry_deps
         results.append((rosdep_ready, _check_result("rosdep", rosdep_ready, _which("rosdep") or "将由 --install-geometry-deps 安装")))
-        cyclone_ok = bool(os.environ.get("CYCLONEDDS_URI", "").strip()) or bool(planner.root_existing.get("CYCLONEDDS_URI", "").strip())
-        results.append((cyclone_ok, _check_result("CycloneDDS 配置", cyclone_ok, "环境变量或 .env 中需存在 CYCLONEDDS_URI")))
+        root_template_values = _read_existing_env(ROOT_ENV_TEMPLATE)
+        cyclone_value = (
+            os.environ.get("CYCLONEDDS_URI", "").strip()
+            or planner.root_existing.get("CYCLONEDDS_URI", "").strip()
+            or root_template_values.get("CYCLONEDDS_URI", "").strip()
+        )
+        cyclone_ok = bool(cyclone_value)
+        results.append((cyclone_ok, _check_result("CycloneDDS 配置", cyclone_ok, "环境变量、.env 或 .env.example 中需存在 CYCLONEDDS_URI")))
         if planner.install_geometry_deps:
             apt_ok = _which("apt-get") is not None
             results.append((apt_ok, _check_result("apt-get", apt_ok, _which("apt-get") or "未找到 apt-get，无法自动安装 RTAB-Map/Nav2")))
             sudo_ok = hasattr(os, "geteuid") and os.geteuid() == 0 or _which("sudo") is not None
             results.append((sudo_ok, _check_result("sudo/root", sudo_ok, "root 或 sudo 用于安装系统包")))
-        if planner.build_go2slam:
+        if planner.build_go2slam or (planner.selected_robot == "go2" and planner.geometry_enabled):
             go2slam_ok = GO2SLAM_WS_DIR.exists()
             results.append((go2slam_ok, _check_result("Go2SLAM 工作区", go2slam_ok, str(GO2SLAM_WS_DIR) if go2slam_ok else "未找到 services/geometry/ros2_ws/src/go2slam")))
+            setup_path = go2slam_setup_path()
+            setup_ready = setup_path.exists() or planner.build_go2slam
+            setup_detail = str(setup_path) if setup_path.exists() else "将由 --build-go2slam 构建生成"
+            results.append((setup_ready, _check_result("Go2SLAM install/setup.bash", setup_ready, setup_detail)))
+            if setup_path.exists():
+                stale_source = find_go2slam_stale_source(setup_path)
+                stale_ok = stale_source is None or planner.build_go2slam
+                stale_detail = "源码未新于 install" if stale_source is None else f"{stale_source} 新于 install，将重新构建" if planner.build_go2slam else f"{stale_source} 新于 install，请重新构建"
+                results.append((stale_ok, _check_result("Go2SLAM 构建新鲜度", stale_ok, stale_detail)))
+                missing_runtime = missing_go2slam_runtime_packages(ros_setup) if ros_setup is not None else GO2SLAM_RUNTIME_REQUIRED_PACKAGES
+                packages_ok = not missing_runtime or planner.build_go2slam
+                packages_detail = "运行包可被当前 ROS2 环境解析" if not missing_runtime else "缺少: " + ", ".join(missing_runtime) + ("；将重新构建" if planner.build_go2slam else "")
+                results.append((packages_ok, _check_result("Go2SLAM 运行包", packages_ok, packages_detail)))
 
     if planner.selected_robot == "go2" and planner.data_plane_enabled:
         go2_template_ok = planner.robot_meta.env_template is not None and planner.robot_meta.env_template.exists()
@@ -930,9 +1039,20 @@ def install_python_dependencies(planner: BootstrapPlanner) -> None:
     if not planner.install_python:
         print("跳过 Python 依赖安装。")
         return
-    _run((planner.python_bin, "-m", "pip", "install", "-r", "requirements.txt"), cwd=PROJECT_ROOT)
+    if planner.use_project_venv:
+        venv_dir = PROJECT_ROOT / ".venv"
+        venv_python = venv_dir / "bin" / "python"
+        if not venv_python.exists():
+            try:
+                _run((planner.seed_python_bin, "-m", "venv", "--system-site-packages", str(venv_dir)), cwd=PROJECT_ROOT)
+            except BootstrapError as exc:
+                raise BootstrapError("创建项目虚拟环境失败，请先安装 python3-venv 后重试。") from exc
+        planner_python = str(venv_python)
+    else:
+        planner_python = planner.python_bin
+    _run((planner_python, "-m", "pip", "install", "-r", "requirements.txt"), cwd=PROJECT_ROOT)
     if planner.memory_mode == "local":
-        _run((planner.python_bin, "-m", "pip", "install", "-r", "requirements-memory-models.txt"), cwd=PROJECT_ROOT)
+        _run((planner_python, "-m", "pip", "install", "-r", "requirements-memory-models.txt"), cwd=PROJECT_ROOT)
 
 
 def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
@@ -1023,6 +1143,28 @@ def assert_go2slam_workspace_ready(ros_setup: Path) -> None:
         )
 
 
+def assert_go2slam_runtime_ready(ros_setup: Path) -> None:
+    setup_path = go2slam_setup_path()
+    if not setup_path.exists():
+        raise BootstrapError(
+            f"缺少 Go2SLAM install/setup.bash: {setup_path}。"
+            f"请执行 `cd {GO2SLAM_WS_DIR} && source {ros_setup} && colcon build --symlink-install`。"
+        )
+    stale_source = find_go2slam_stale_source(setup_path)
+    if stale_source is not None:
+        raise BootstrapError(
+            f"Go2SLAM 工作区需要重新编译，源码文件新于 install: {stale_source}。"
+            f"请执行 `cd {GO2SLAM_WS_DIR} && source {ros_setup} && colcon build --symlink-install`。"
+        )
+    missing_runtime = missing_go2slam_runtime_packages(ros_setup)
+    if missing_runtime:
+        raise BootstrapError(
+            "Go2SLAM install 中缺少运行包: "
+            + ", ".join(missing_runtime)
+            + f"。请执行 `cd {GO2SLAM_WS_DIR} && source {ros_setup} && colcon build --symlink-install`。"
+        )
+
+
 def build_workspaces(planner: BootstrapPlanner) -> None:
     geometry_script = PROJECT_ROOT / "services" / "geometry" / "build_ros2_workspace.sh"
     if planner.build_geometry and geometry_script.exists():
@@ -1042,6 +1184,7 @@ def build_workspaces(planner: BootstrapPlanner) -> None:
             ),
             cwd=GO2SLAM_WS_DIR,
         )
+        assert_go2slam_runtime_ready(ros_setup)
 
 
 def prepare_assets(planner: BootstrapPlanner) -> None:
@@ -1287,6 +1430,11 @@ def start_gateway(planner: BootstrapPlanner) -> None:
     if not planner.start_gateway:
         print("跳过自动启动 gateway。")
         return
+    if planner.selected_robot == "go2" and planner.geometry_enabled:
+        ros_setup = _detect_ros_setup()
+        if ros_setup is None:
+            raise BootstrapError("未找到 ROS2 安装，不能启动 Go2 geometry 主链。")
+        assert_go2slam_runtime_ready(ros_setup)
     command = f"nohup bash {START_SCRIPT} > /tmp/nuwax_bootstrap_gateway.log 2>&1 &"
     _run_shell(command, cwd=PROJECT_ROOT)
     print("已在后台启动 gateway，日志位于 /tmp/nuwax_bootstrap_gateway.log")
@@ -1382,7 +1530,7 @@ def add_boolean_flag(parser: argparse.ArgumentParser, name: str, help_text: str)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="nuwax_robot_bridge 一键部署入口。")
-    parser.add_argument("--python-bin", default=sys.executable or "python3", help="Python 解释器路径。")
+    parser.add_argument("--python-bin", default="", help="Python 解释器路径；默认创建并使用项目 .venv。")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 

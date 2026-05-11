@@ -20,9 +20,13 @@ geometry_source_without_nounset() {
 }
 
 geometry_detect_ros_setup() {
-  local candidates=(
-    "/opt/ros/humble/setup.bash"
+  local candidates=()
+  if [[ -n "${NUWAX_ROS_SETUP_SCRIPT:-}" ]]; then
+    candidates+=("${NUWAX_ROS_SETUP_SCRIPT}")
+  fi
+  candidates+=(
     "/opt/ros/jazzy/setup.bash"
+    "/opt/ros/humble/setup.bash"
     "/opt/ros/iron/setup.bash"
     "/opt/ros/foxy/setup.bash"
   )

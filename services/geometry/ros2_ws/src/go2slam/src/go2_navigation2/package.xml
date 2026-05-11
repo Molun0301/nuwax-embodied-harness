@@ -36,7 +36,8 @@
   <exec_depend>nav2_lifecycle_manager</exec_depend>
   <exec_depend>nav2_map_server</exec_depend>
   <exec_depend>nav2_planner</exec_depend>
-  <exec_depend>nav2_recoveries</exec_depend>
+  <exec_depend condition="$ROS_DISTRO == foxy">nav2_recoveries</exec_depend>
+  <exec_depend condition="$ROS_DISTRO != foxy">nav2_behaviors</exec_depend>
   <exec_depend>nav2_waypoint_follower</exec_depend>
   <exec_depend>rviz2</exec_depend>
 

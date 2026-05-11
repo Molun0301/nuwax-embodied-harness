@@ -260,6 +260,7 @@ if [[ -f "${ENV_FILE}" ]]; then
   load_env_file "${ENV_FILE}"
 fi
 
+PYTHON_BIN="${NUWAX_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
 PID_FILE="${NUWAX_GATEWAY_PID_FILE:-${REPO_ROOT}/runtime_data/gateway/gateway.pid}"
 HOST="${NUWAX_GATEWAY_HOST:-0.0.0.0}"
 PORT="${NUWAX_GATEWAY_PORT:-8766}"

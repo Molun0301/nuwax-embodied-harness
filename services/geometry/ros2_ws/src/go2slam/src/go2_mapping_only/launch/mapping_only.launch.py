@@ -39,7 +39,7 @@ def generate_launch_description():
     )
     save_path_arg = DeclareLaunchArgument(
         'save_path',
-        default_value='/home/huang/xxx/output/go2_built_map.pcd',
+        default_value='/tmp/go2_built_map.pcd',
         description='PCD output file path.',
     )
     voxel_leaf_size_arg = DeclareLaunchArgument(

@@ -87,7 +87,7 @@ class Go2MapBuilder : public rclcpp::Node {
     icp_max_correspondence_distance_ = declare_parameter<double>("icp_max_correspondence_distance", 0.45);
     icp_max_iterations_ = declare_parameter<int>("icp_max_iterations", 30);
     icp_max_z_step_ = declare_parameter<double>("icp_max_z_step", 0.20);
-    save_path_ = declare_parameter<std::string>("save_path", "/home/huang/xxx/output/go2_built_map.pcd");
+    save_path_ = declare_parameter<std::string>("save_path", "/tmp/go2_built_map.pcd");
 
     auto cloud_qos = rclcpp::SensorDataQoS();
     auto odom_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();

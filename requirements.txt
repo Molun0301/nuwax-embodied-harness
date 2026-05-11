@@ -29,4 +29,7 @@ openai==1.60.2
 polars==1.8.2
 # YOLO-World 的 set_classes() 需要 ultralytics CLIP 模块。
 git+https://github.com/ultralytics/CLIP.git
+# TensorRT 导出会先经过 ONNX；Jetson aarch64 不安装 PyPI 上缺失的 onnxruntime-gpu。
+onnx==1.17.0
+onnxslim==0.1.93
 ultralytics==8.4.33

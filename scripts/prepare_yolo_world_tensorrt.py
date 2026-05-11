@@ -37,16 +37,16 @@ DEFAULT_CLASSES = (
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数。"""
 
-    parser = argparse.ArgumentParser(description="一键准备 YOLO-World 权重并导出 TensorRT INT8 引擎。")
-    parser.add_argument("--model", default="yolov8s-world.pt", help="模型名或本地权重路径。")
+    parser = argparse.ArgumentParser(description="一键准备 YOLO-Worldv2 权重并导出 TensorRT engine。")
+    parser.add_argument("--model", default="yolov8s-worldv2.pt", help="模型名或本地权重路径。")
     parser.add_argument(
         "--weights-output",
-        default="runtime_data/models/yolov8s-world.pt",
+        default="runtime_data/models/yolov8s-worldv2.pt",
         help="权重输出路径。",
     )
     parser.add_argument(
         "--engine-output",
-        default="runtime_data/models/yolov8s-world-int8.engine",
+        default="runtime_data/models/yolov8s-worldv2.engine",
         help="TensorRT engine 输出路径。",
     )
     parser.add_argument("--release", default=DEFAULT_RELEASE, help="Ultralytics assets release 版本。")
@@ -59,9 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch", type=int, default=1, help="导出 batch 大小。")
     parser.add_argument("--workspace", type=float, default=None, help="TensorRT workspace，单位 GiB。")
     parser.add_argument("--dynamic", action="store_true", help="导出 dynamic shape engine。")
+    parser.add_argument("--simplify", action="store_true", default=False, help="启用 ONNX simplification。Jetson 默认关闭，避免触发 onnxruntime-gpu 自动安装。")
     parser.add_argument("--half", action="store_true", default=True, help="启用 FP16。")
     parser.add_argument("--no-half", action="store_false", dest="half", help="关闭 FP16。")
-    parser.add_argument("--int8", action="store_true", default=True, help="启用 INT8 量化。")
+    parser.add_argument("--int8", action="store_true", default=False, help="启用 INT8 量化。")
     parser.add_argument("--no-int8", action="store_false", dest="int8", help="关闭 INT8，只导出 FP16/FP32 engine。")
     parser.add_argument(
         "--calib-data",
@@ -165,6 +166,11 @@ def _ensure_min_bytes(path: Path, min_bytes: int = 100_000) -> None:
         raise SystemExit("文件大小异常，可能未下载完成：%s (%d bytes)" % (path, size))
 
 
+def _is_original_yolo_world_weight(path: Path) -> bool:
+    name = path.name.lower()
+    return name.startswith("yolov8") and name.endswith("-world.pt") and "worldv2" not in name
+
+
 def _prepare_weights(args: argparse.Namespace) -> Path:
     output_path = _normalize_path(args.weights_output)
     if output_path.exists() and not args.overwrite:
@@ -220,6 +226,10 @@ def _load_yolo_world_model(weights_path: Path):
 
 
 def _export_engine(args: argparse.Namespace, weights_path: Path) -> Path:
+    if _is_original_yolo_world_weight(weights_path):
+        raise SystemExit(
+            "原版 YOLO-World 权重不支持导出 TensorRT engine，请改用 yolov8s-worldv2.pt。"
+        )
     engine_path = _normalize_path(args.engine_output)
     if engine_path.exists() and not args.overwrite:
         _ensure_min_bytes(engine_path)
@@ -241,6 +251,7 @@ def _export_engine(args: argparse.Namespace, weights_path: Path) -> Path:
         "half": bool(args.half),
         "int8": bool(args.int8),
         "dynamic": bool(args.dynamic),
+        "simplify": bool(args.simplify),
     }
     if args.device:
         export_kwargs["device"] = args.device
@@ -263,7 +274,7 @@ def _export_engine(args: argparse.Namespace, weights_path: Path) -> Path:
 
     metadata_path = engine_path.with_suffix(engine_path.suffix + ".metadata.txt")
     metadata_path.write_text(
-        "weights=%s\nengine=%s\nclasses=%s\nimgsz=%s\nbatch=%s\nint8=%s\ncalib_data=%s\ncalib_fraction=%s\n"
+        "weights=%s\nengine=%s\nclasses=%s\nimgsz=%s\nbatch=%s\nint8=%s\nsimplify=%s\ncalib_data=%s\ncalib_fraction=%s\n"
         % (
             weights_path,
             engine_path,
@@ -271,6 +282,7 @@ def _export_engine(args: argparse.Namespace, weights_path: Path) -> Path:
             max(32, int(args.imgsz)),
             max(1, int(args.batch)),
             bool(args.int8),
+            bool(args.simplify),
             export_kwargs.get("data", ""),
             export_kwargs.get("fraction", ""),
         ),

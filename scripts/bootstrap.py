@@ -59,8 +59,8 @@ DEFAULT_NUWACLAW_PROXY_SCRIPT = (
 DEFAULT_MEMORY_ONLINE_MODEL = "tongyi-embedding-vision-flash-2026-03-06"
 DEFAULT_MEMORY_LOCAL_TEXT_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "BAAI__bge-m3")
 DEFAULT_MEMORY_LOCAL_IMAGE_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "openai__clip-vit-base-patch32")
-DEFAULT_YOLO_WORLD_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-world.pt")
-DEFAULT_YOLO_WORLD_ENGINE = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-world-int8.engine")
+DEFAULT_YOLO_WORLD_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-worldv2.pt")
+DEFAULT_YOLO_WORLD_ENGINE = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-worldv2.engine")
 GEOMETRY_WS_DIR = PROJECT_ROOT / "services" / "geometry" / "ros2_ws"
 GO2SLAM_WS_DIR = GEOMETRY_WS_DIR / "src" / "go2slam"
 GEOMETRY_APT_BASE_PACKAGES = (
@@ -811,7 +811,7 @@ class BootstrapPlanner:
             )
 
         yolo_world_runtime = "tensorrt" if self.export_yolo_engine else "pytorch"
-        yolo_world_int8 = _bool_text(self.export_yolo_engine)
+        yolo_world_int8 = "false"
         if self.perception_mode == "local":
             values.update(
                 {
@@ -1210,6 +1210,7 @@ def prepare_assets(planner: BootstrapPlanner) -> None:
                 DEFAULT_YOLO_WORLD_MODEL,
                 "--engine-output",
                 DEFAULT_YOLO_WORLD_ENGINE,
+                "--no-int8",
             ),
             cwd=PROJECT_ROOT,
         )

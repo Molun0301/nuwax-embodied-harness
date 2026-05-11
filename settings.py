@@ -299,7 +299,7 @@ class PerceptionYoloWorldConfig:
 
     enabled: bool = True
     backend_name: str = "yolo_world"
-    model_name: str = str(BASE_DIR / "runtime_data" / "models" / "yolov8s-world.pt")
+    model_name: str = str(BASE_DIR / "runtime_data" / "models" / "yolov8s-worldv2.pt")
     runtime_preference: str = "pytorch"
     engine_path: str = ""
     device: str = ""
@@ -644,7 +644,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             backend_name=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_BACKEND_NAME", "yolo_world"),
             model_name=_cfg_str(
                 "NUWAX_PERCEPTION_YOLO_WORLD_MODEL",
-                str(BASE_DIR / "runtime_data" / "models" / "yolov8s-world.pt"),
+                str(BASE_DIR / "runtime_data" / "models" / "yolov8s-worldv2.pt"),
             ),
             runtime_preference=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME", "pytorch"),
             engine_path=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH", ""),

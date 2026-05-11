@@ -308,7 +308,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         self,
         *,
         name: str = "yolo_world",
-        weights: str = "yolov8s-world.pt",
+        weights: str = "yolov8s-worldv2.pt",
         runtime_preference: str = "pytorch",
         engine_path: str = "",
         device: str = "",
@@ -319,7 +319,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         image_size: int = 640,
         max_detections: int = 100,
     ) -> None:
-        self._weights = str(weights).strip() or "yolov8s-world.pt"
+        self._weights = str(weights).strip() or "yolov8s-worldv2.pt"
         self._runtime_preference = str(runtime_preference or "pytorch").strip().lower()
         self._engine_path = str(engine_path).strip()
         self._device = str(device).strip()
@@ -715,7 +715,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         self,
         *,
         name: str = "yolo_world",
-        weights: str = "yolov8s-world.pt",
+        weights: str = "yolov8s-worldv2.pt",
         runtime_preference: str = "pytorch",
         engine_path: str = "",
         device: str = "",

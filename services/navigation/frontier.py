@@ -223,6 +223,10 @@ class FrontierExplorer:
                 for attempted in attempted_poses
             ):
                 continue
+            goal_distance_m = math.hypot(goal_x - current_pose.position.x, goal_y - current_pose.position.y)
+            min_goal_distance_m = max(float(self.config.reach_distance_m), float(occupancy_grid.resolution_m) * 2.0)
+            if goal_distance_m <= min_goal_distance_m:
+                continue
 
             yaw_rad = math.atan2(goal_y - current_pose.position.y, goal_x - current_pose.position.x)
             goal_pose = Pose(

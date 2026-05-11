@@ -177,7 +177,6 @@ class ExternalGeometryStackConfig:
     provides_tf: bool = True
     input_bridge_enabled: bool = False
     point_cloud_bridge_enabled: bool = False
-    exploration_frontiers_readonly: bool = True
 
 
 @dataclass
@@ -317,7 +316,6 @@ class PlatformGeometryConfig:
                 "provides_tf": self.external.provides_tf,
                 "input_bridge_enabled": self.external.input_bridge_enabled,
                 "point_cloud_bridge_enabled": self.external.point_cloud_bridge_enabled,
-                "exploration_frontiers_readonly": self.external.exploration_frontiers_readonly,
             },
             "output_contract": {
                 "name": self.rtabmap.output_contract,

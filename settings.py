@@ -865,10 +865,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED",
                 external_input_bridge_enabled,
             ),
-            exploration_frontiers_readonly=_cfg_bool(
-                "NUWAX_GEOMETRY_EXTERNAL_EXPLORATION_FRONTIERS_READONLY",
-                True,
-            ),
         ),
     )
 

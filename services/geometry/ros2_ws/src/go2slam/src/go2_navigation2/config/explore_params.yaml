@@ -5,7 +5,6 @@ explore_node:
     costmap_topic: /map
     costmap_updates_topic: /map_updates
     visualize: true
-    send_goals: false
     planner_frequency: 0.15
     progress_timeout: 30.0
     potential_scale: 3.0

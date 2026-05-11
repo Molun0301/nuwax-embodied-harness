@@ -69,7 +69,6 @@ Explore::Explore()
   this->declare_parameter<float>("orientation_scale", 0.0);
   this->declare_parameter<float>("gain_scale", 1.0);
   this->declare_parameter<float>("min_frontier_size", 0.5);
-  this->declare_parameter<bool>("send_goals", true);
   this->declare_parameter<bool>("return_to_init", false);
 
   this->get_parameter("planner_frequency", planner_frequency_);
@@ -79,7 +78,6 @@ Explore::Explore()
   this->get_parameter("orientation_scale", orientation_scale_);
   this->get_parameter("gain_scale", gain_scale_);
   this->get_parameter("min_frontier_size", min_frontier_size);
-  this->get_parameter("send_goals", send_goals_);
   this->get_parameter("return_to_init", return_to_init_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
 
@@ -110,13 +108,9 @@ Explore::Explore()
       "explore/resume", 10,
       std::bind(&Explore::resumeCallback, this, std::placeholders::_1));
 
-  if (send_goals_) {
-    RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
-    move_base_client_->wait_for_action_server();
-    RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
-  } else {
-    RCLCPP_INFO(logger_, "Frontier-only mode enabled; move_base goals will not be sent.");
-  }
+  RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
+  move_base_client_->wait_for_action_server();
+  RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
 
   if (return_to_init_) {
     RCLCPP_INFO(logger_, "Getting initial pose of the robot");
@@ -248,22 +242,13 @@ void Explore::makePlan()
     auto status_msg = explore_lite_msgs::msg::ExploreStatus();
     status_msg.status = explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE;
     status_pub_->publish(status_msg);
-    if (send_goals_) {
-      stop(true);
-    }
+    stop(true);
     return;
   }
 
   // publish frontiers as visualization markers
   if (visualize_) {
     visualizeFrontiers(frontiers);
-  }
-
-  if (!send_goals_) {
-    if (resuming_) {
-      resuming_ = false;
-    }
-    return;
   }
 
   // find non blacklisted frontier
@@ -430,12 +415,10 @@ void Explore::stop(bool finished_exploring)
     status_pub_->publish(status_msg);
   }
 
-  if (send_goals_) {
-    move_base_client_->async_cancel_all_goals();
-  }
+  move_base_client_->async_cancel_all_goals();
   exploring_timer_->cancel();
 
-  if (send_goals_ && return_to_init_ && finished_exploring) {
+  if (return_to_init_ && finished_exploring) {
     returnToInitialPose();
   }
 }

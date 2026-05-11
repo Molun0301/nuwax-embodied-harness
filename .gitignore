@@ -26,3 +26,5 @@ runtime_data/
 .playwright-mcp
 功能列表.md
 .env
+AGENTS.md
+CLAUDE.md

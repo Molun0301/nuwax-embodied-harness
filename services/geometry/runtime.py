@@ -380,12 +380,6 @@ class PlatformGeometryRuntime:
             getattr(self.config.external, "point_cloud_bridge_enabled", False)
         )
 
-    def _external_frontiers_readonly_enabled(self) -> bool:
-        return bool(getattr(self.config.external, "exploration_frontiers_readonly", True))
-
-    def _uses_external_frontier_observation_mode(self) -> bool:
-        return self._uses_external_geometry_stack() and self._external_frontiers_readonly_enabled()
-
     def _run_preflight_checks(self) -> List[str]:
         if self._uses_external_geometry_stack():
             return self._run_external_geometry_preflight_checks()
@@ -2495,20 +2489,6 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return
         if not self._platform_exploration_runtime.is_running:
-            return
-        if self._uses_external_frontier_observation_mode():
-            self._cancel_platform_exploration_navigation()
-            self._platform_exploration_runtime.block_on_prerequisite(
-                waiting_for="external_frontier_selection",
-                message="当前为外部 frontier 观测模式，仅展示候选前沿，不自动下发导航目标。",
-                failure_code="external_frontier_selection_required",
-                metadata={
-                    **self._exploration_loop_metadata(tick_source=tick_source),
-                    "frontier_observation_mode": True,
-                    "frontier_goal_dispatch_enabled": False,
-                    "frontier_selection_owner": "external_llm",
-                },
-            )
             return
         current_pose = self._read_exploration_pose()
         snapshot = self.get_map_snapshot()

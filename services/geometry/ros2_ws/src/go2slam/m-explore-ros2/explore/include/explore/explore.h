@@ -141,7 +141,6 @@ private:
   double potential_scale_, orientation_scale_, gain_scale_;
   double progress_timeout_;
   bool visualize_;
-  bool send_goals_;
   bool return_to_init_;
   std::string robot_base_frame_;
   bool resuming_ = false;

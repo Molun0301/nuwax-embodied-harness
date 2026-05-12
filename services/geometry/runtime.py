@@ -1505,10 +1505,72 @@ class PlatformGeometryRuntime:
         return fallback_snapshot
 
     def subscribe_map_updates(self, callback) -> int:
-        return self._live_map_provider.subscribe_map_updates(callback)
+        def wrapped_callback(payload):
+            return callback(self._attach_active_map_version_to_live_map_payload(payload))
+
+        return self._live_map_provider.subscribe_map_updates(wrapped_callback)
 
     def unsubscribe_map_updates(self, subscription_id: int) -> bool:
         return self._live_map_provider.unsubscribe_map_updates(subscription_id)
+
+    def _attach_active_map_version_to_live_map_payload(self, payload):
+        if not isinstance(payload, dict):
+            return payload
+        version = self._active_map_version
+        if version is None:
+            return payload
+        metadata = self._clone_metadata(payload.get("metadata") or {})
+        metadata.update(self._build_map_snapshot_geometry_metadata(
+            version=version,
+            geometry_asset=version.geometry_asset,
+            live_available=True,
+            map_snapshot_kind="live_streaming",
+            source_kind="platform_live_map_provider",
+        ))
+        if self._live_map_payload_under_covers_seed(payload, metadata, version):
+            metadata.update({
+                "event_type": "heartbeat",
+                "suppressed_live_map_update": True,
+                "suppressed_live_map_reason": "live_occupancy_known_cells_below_seed_map",
+            })
+            return {
+                **payload,
+                "occupancy_grid": None,
+                "cost_map": None,
+                "semantic_map": None,
+                "metadata": metadata,
+            }
+        return {
+            **payload,
+            "semantic_map": payload.get("semantic_map") or self._clone_contract(version.snapshot.semantic_map),
+            "metadata": metadata,
+        }
+
+    def _live_map_payload_under_covers_seed(self, payload, metadata: Dict[str, object], version: MapVersion) -> bool:
+        if str(metadata.get("event_type") or "content_update") != "content_update":
+            return False
+        if version.snapshot.occupancy_grid is None:
+            return False
+        live_known_cells = self._metadata_known_cell_count(metadata)
+        if live_known_cells is None:
+            live_known_cells = self._occupancy_known_cell_count(payload.get("occupancy_grid"))
+        seed_known_cells = self._occupancy_known_cell_count(version.snapshot.occupancy_grid)
+        return seed_known_cells is not None and (live_known_cells is None or live_known_cells < seed_known_cells)
+
+    def _metadata_known_cell_count(self, metadata: Dict[str, object]) -> Optional[int]:
+        occupancy_metrics = metadata.get("occupancy_metrics")
+        if not isinstance(occupancy_metrics, dict) or "known_cell_count" not in occupancy_metrics:
+            return None
+        try:
+            return int(occupancy_metrics.get("known_cell_count") or 0)
+        except (TypeError, ValueError):
+            return None
+
+    def _occupancy_known_cell_count(self, occupancy_grid) -> Optional[int]:
+        data = getattr(occupancy_grid, "data", None)
+        if data is None:
+            return None
+        return sum(1 for value in data if int(value) >= 0)
 
     def get_map_snapshot(self) -> Optional[MapSnapshot]:
         """返回当前平台几何运行时对外暴露的地图快照。"""
@@ -2512,18 +2574,78 @@ class PlatformGeometryRuntime:
             "navigation_backend_name": navigation_backend_name,
         })
         waiting_for = runtime_metadata.get("waiting_for")
-        if waiting_for:
-            self._cancel_platform_exploration_navigation()
-            self._platform_exploration_runtime.block_on_prerequisite(
-                waiting_for=str(waiting_for),
-                message=str(runtime_metadata.get("waiting_detail") or "探索前置条件未就绪。"),
-                failure_code=str(runtime_metadata.get("failure_code") or "exploration_prerequisite_unavailable"),
-                metadata=runtime_metadata,
-            )
-            return
         current_goal_before_tick = self._platform_exploration_runtime.get_current_navigation_goal()
+        if waiting_for:
+            preserve_current_goal = False
+            navigation_state = None
+            navigation_state_unavailable = False
+            if current_goal_before_tick is not None and navigation_backend is not None:
+                try:
+                    navigation_state = navigation_backend.get_navigation_state()
+                except Exception:
+                    navigation_state_unavailable = True
+            if navigation_state_unavailable:
+                preserve_current_goal = True
+            if (
+                navigation_state is not None
+                and current_goal_before_tick is not None
+                and navigation_state.current_goal_id == current_goal_before_tick.goal_id
+            ):
+                if bool(navigation_state.goal_reached) or navigation_state.status == NavigationStatus.SUCCEEDED:
+                    self._platform_exploration_runtime.mark_navigation_arrived()
+                    return
+                if navigation_state.status in {NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
+                    self._platform_exploration_runtime.reject_current_target(
+                        navigation_state.message or "探索前沿导航失败。"
+                    )
+                    return
+                preserve_current_goal = navigation_state.status in {
+                    NavigationStatus.ACCEPTED,
+                    NavigationStatus.PLANNING,
+                    NavigationStatus.RUNNING,
+                }
+            if preserve_current_goal:
+                transient_waiting_detail = runtime_metadata.get("waiting_detail")
+                transient_failure_code = runtime_metadata.get("failure_code")
+                runtime_metadata = {
+                    key: value
+                    for key, value in runtime_metadata.items()
+                    if key not in {"waiting_for", "waiting_detail", "failure_code"}
+                }
+                runtime_metadata["transient_waiting_for"] = str(waiting_for)
+                if transient_waiting_detail:
+                    runtime_metadata["transient_waiting_detail"] = str(transient_waiting_detail)
+                if transient_failure_code:
+                    runtime_metadata["transient_failure_code"] = str(transient_failure_code)
+                frontier_freshness = runtime_metadata.get("frontier_freshness")
+                if isinstance(frontier_freshness, dict):
+                    sanitized_freshness = {
+                        key: value
+                        for key, value in dict(frontier_freshness).items()
+                        if key != "stale_reason"
+                    }
+                    runtime_metadata["frontier_freshness"] = {
+                        **sanitized_freshness,
+                        "fresh": True,
+                        "transient_waiting_for": str(waiting_for),
+                    }
+            else:
+                try:
+                    self._cancel_platform_exploration_navigation(current_goal=current_goal_before_tick)
+                except Exception:
+                    return
+                self._platform_exploration_runtime.block_on_prerequisite(
+                    waiting_for=str(waiting_for),
+                    message=str(runtime_metadata.get("waiting_detail") or "探索前置条件未就绪。"),
+                    failure_code=str(runtime_metadata.get("failure_code") or "exploration_prerequisite_unavailable"),
+                    metadata=runtime_metadata,
+                )
+                return
         if current_goal_before_tick is not None and self._frontier_goal_is_stale(current_goal_before_tick, runtime_metadata):
-            self._cancel_platform_exploration_navigation(current_goal=current_goal_before_tick)
+            try:
+                self._cancel_platform_exploration_navigation(current_goal=current_goal_before_tick)
+            except Exception:
+                return
             self._platform_exploration_runtime.mark_current_frontier_stale(reason="live_map_costmap_or_pose_revision_changed")
             return
         self._platform_exploration_runtime.tick(
@@ -2549,7 +2671,25 @@ class PlatformGeometryRuntime:
         except Exception:
             navigation_available = False
         if not navigation_available:
-            state = navigation_backend.get_navigation_state()
+            try:
+                state = navigation_backend.get_navigation_state()
+            except Exception:
+                return
+            if state.current_goal_id == current_goal.goal_id:
+                if bool(state.goal_reached) or state.status == NavigationStatus.SUCCEEDED:
+                    self._platform_exploration_runtime.mark_navigation_arrived()
+                    return
+                if state.status in {NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
+                    self._platform_exploration_runtime.reject_current_target(
+                        state.message or "探索前沿导航失败。"
+                    )
+                    return
+                if state.status in {
+                    NavigationStatus.ACCEPTED,
+                    NavigationStatus.PLANNING,
+                    NavigationStatus.RUNNING,
+                }:
+                    return
             metadata = dict(getattr(state, "metadata", {}) or {})
             readiness = metadata.get("nav2_readiness") if isinstance(metadata.get("nav2_readiness"), dict) else {}
             waiting = self._normalize_exploration_waiting_for(
@@ -2562,7 +2702,10 @@ class PlatformGeometryRuntime:
                 metadata={**runtime_metadata, "navigation_state": self._clone_contract(state)},
             )
             return
-        navigation_state = navigation_backend.get_navigation_state()
+        try:
+            navigation_state = navigation_backend.get_navigation_state()
+        except Exception:
+            return
         if navigation_state.current_goal_id != current_goal.goal_id:
             if navigation_state.current_goal_id and navigation_state.status not in {
                 NavigationStatus.IDLE,
@@ -2570,10 +2713,16 @@ class PlatformGeometryRuntime:
                 NavigationStatus.FAILED,
                 NavigationStatus.CANCELLED,
             }:
-                navigation_backend.cancel_goal()
+                try:
+                    navigation_backend.cancel_goal()
+                except Exception:
+                    return
             accepted = navigation_backend.set_goal(current_goal)
             if not accepted:
-                state = navigation_backend.get_navigation_state()
+                try:
+                    state = navigation_backend.get_navigation_state()
+                except Exception:
+                    return
                 metadata = dict(getattr(state, "metadata", {}) or {})
                 readiness = metadata.get("nav2_readiness") if isinstance(metadata.get("nav2_readiness"), dict) else {}
                 waiting = self._normalize_exploration_waiting_for(

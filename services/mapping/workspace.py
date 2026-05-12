@@ -416,6 +416,13 @@ class MapWorkspaceService:
                 http_status=409,
                 jsonrpc_code=-32000,
             )
+        expected_version_id = (
+            active_workspace.map_asset.latest_version_id
+            if active_workspace is not None and active_workspace.map_asset is not None
+            else None
+        )
+        if expected_version_id:
+            self._load_map_version_into_runtime(self._require_map_version(resolved_name, expected_version_id))
         latest_map_snapshot = self._mapping_service.get_latest_snapshot()
         if latest_map_snapshot is None:
             raise GatewayError(
@@ -424,17 +431,32 @@ class MapWorkspaceService:
                 http_status=409,
                 jsonrpc_code=-32000,
             )
+        if not self._snapshot_matches_map_version(latest_map_snapshot, expected_version_id):
+            raise GatewayError(
+                "地图 %s 当前地图快照不属于已激活的最新版本 %s，拒绝重定位。" % (resolved_name, expected_version_id),
+                error_code="map_snapshot_version_mismatch",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    "map_name": resolved_name,
+                    "expected_version_id": expected_version_id,
+                    "snapshot_version_id": latest_map_snapshot.version_id,
+                    "seed_map_version_id": latest_map_snapshot.metadata.get("seed_map_version_id"),
+                    "platform_map_version_id": latest_map_snapshot.metadata.get("platform_map_version_id"),
+                },
+            )
         frame_id = self._resolve_map_frame_id(latest_map_snapshot)
+        localization_map_version_id = expected_version_id or latest_map_snapshot.version_id
 
-        # 使用平台定位服务的新重定位方法
         session = self._localization_service.relocalize_active_session(
             map_name=resolved_name,
-            map_version_id=latest_map_snapshot.version_id,
+            map_version_id=localization_map_version_id,
             frame_id=frame_id,
             metadata={
                 **dict(metadata or {}),
                 "source": "relocalize_active_map",
                 "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
+                "snapshot_version_id": latest_map_snapshot.version_id,
             },
             geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
         )
@@ -714,8 +736,71 @@ class MapWorkspaceService:
         if not live_streaming_snapshot:
             ingest_kwargs["version_id_override"] = prepared_version.version_id
             ingest_kwargs["revision_override"] = prepared_version.revision
-        self._mapping_service.ingest_external_snapshot(**ingest_kwargs)
+        if live_streaming_snapshot and (
+            not self._snapshot_matches_map_version(runtime_snapshot, prepared_version.version_id)
+            or self._live_snapshot_under_covers_seed(runtime_snapshot, prepared_version)
+        ):
+            seed_metadata = {
+                **dict(prepared_version.snapshot.metadata),
+                "seed_map_name": prepared_version.map_name,
+                "seed_map_version_id": prepared_version.version_id,
+                "seed_map_version_revision": prepared_version.revision,
+                "loaded_as_seed": True,
+                "continues_live_updates": True,
+            }
+            self._mapping_service.ingest_external_snapshot(
+                source_name=prepared_version.snapshot.source_name,
+                occupancy_grid=prepared_version.snapshot.occupancy_grid,
+                cost_map=prepared_version.snapshot.cost_map,
+                semantic_map=prepared_version.snapshot.semantic_map,
+                metadata=seed_metadata,
+                version_id_override=prepared_version.version_id,
+                revision_override=prepared_version.revision,
+            )
+        else:
+            self._mapping_service.ingest_external_snapshot(**ingest_kwargs)
         self._localization_service.clear_latest_snapshot()
+
+    def _snapshot_matches_map_version(self, snapshot, expected_version_id: Optional[str]) -> bool:
+        if not expected_version_id:
+            return True
+        metadata = dict(getattr(snapshot, "metadata", {}) or {})
+        return expected_version_id in {
+            str(getattr(snapshot, "version_id", "") or ""),
+            str(metadata.get("seed_map_version_id") or ""),
+            str(metadata.get("platform_map_version_id") or ""),
+        }
+
+    def _live_snapshot_under_covers_seed(self, snapshot, version: MapVersion) -> bool:
+        metadata = dict(getattr(snapshot, "metadata", {}) or {})
+        live_snapshot = bool(
+            metadata.get("map_snapshot_kind") == "live_streaming"
+            or metadata.get("source_kind") == "platform_live_map_provider"
+            or metadata.get("live_streaming_ready")
+            or metadata.get("rtabmap_live_streaming_ready")
+        )
+        if not live_snapshot or version.snapshot.occupancy_grid is None:
+            return False
+        live_known_cells = self._metadata_known_cell_count(metadata)
+        if live_known_cells is None:
+            live_known_cells = self._occupancy_known_cell_count(getattr(snapshot, "occupancy_grid", None))
+        seed_known_cells = self._occupancy_known_cell_count(version.snapshot.occupancy_grid)
+        return seed_known_cells is not None and (live_known_cells is None or live_known_cells < seed_known_cells)
+
+    def _metadata_known_cell_count(self, metadata: Dict[str, object]) -> Optional[int]:
+        occupancy_metrics = metadata.get("occupancy_metrics")
+        if not isinstance(occupancy_metrics, dict) or "known_cell_count" not in occupancy_metrics:
+            return None
+        try:
+            return int(occupancy_metrics.get("known_cell_count") or 0)
+        except (TypeError, ValueError):
+            return None
+
+    def _occupancy_known_cell_count(self, occupancy_grid) -> Optional[int]:
+        data = getattr(occupancy_grid, "data", None)
+        if data is None:
+            return None
+        return sum(1 for value in data if int(value) >= 0)
 
     def _require_map_version(self, map_name: str, version_id: str) -> MapVersion:
         version = self._version_repository.get_map_version(map_name, version_id)

@@ -3289,6 +3289,7 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
+        self._ensure_geometry_runtime_for_capability("relocalize_active_map")
         localization_session, active_workspace = self.map_workspace_service.relocalize_active_map(
             map_name=str(arguments.get("map_name", "")).strip() or None,
             metadata={"requested_by": requested_by or "unknown", "source": "relocalize_active_map"},
@@ -4118,10 +4119,11 @@ class GatewayRuntime:
         )
         self._refresh_workspace_snapshots()
         if self._workspace_requires_localization_before_explore(workspace):
-            self._ensure_localization_ready(
+            self._ensure_localization_ready_or_relocalize(
                 capability_name="explore_area",
                 map_name=map_name,
                 workspace=workspace,
+                requested_by=requested_by,
             )
         target_name = str(arguments.get("target_name", "")).strip() or None
         center_pose = None
@@ -5000,6 +5002,55 @@ class GatewayRuntime:
                 ),
             },
         )
+
+    def _ensure_localization_ready_or_relocalize(
+        self,
+        *,
+        capability_name: str,
+        map_name: str,
+        workspace,
+        requested_by: Optional[str],
+    ):
+        try:
+            return self._ensure_localization_ready(
+                capability_name=capability_name,
+                map_name=map_name,
+                workspace=workspace,
+            )
+        except GatewayError as exc:
+            if exc.error_code != "localization_unavailable":
+                raise
+        self._ensure_geometry_runtime_for_capability("relocalize_active_map")
+        try:
+            session, workspace = self.map_workspace_service.relocalize_active_map(
+                map_name=map_name,
+                metadata={"requested_by": requested_by or "unknown", "source": capability_name},
+            )
+        except GatewayError:
+            raise
+        workspace = self.map_workspace_service.get_active_workspace() or workspace
+        try:
+            return self._ensure_localization_ready(
+                capability_name=capability_name,
+                map_name=map_name,
+                workspace=workspace,
+            )
+        except GatewayError as exc:
+            details = {
+                **dict(exc.details),
+                "auto_relocalize_attempted": True,
+                "relocalization_session_status": session.status.value,
+                "relocalization_session_id": session.session_id,
+                "relocalization_last_error": session.last_error,
+                "relocalization_map_version_id": session.map_version_id,
+            }
+            raise GatewayError(
+                "地图 %s 自动重定位后仍未完成定位，无法执行 %s。" % (map_name, capability_name),
+                error_code=exc.error_code,
+                http_status=exc.http_status,
+                jsonrpc_code=exc.jsonrpc_code,
+                details=details,
+            ) from exc
 
     def _build_navigation_arrival_result(
         self,
@@ -6261,7 +6312,7 @@ class GatewayRuntime:
         poll_interval_sec = max(0.05, poll_interval_sec)
 
         def runner(context) -> Dict[str, Any]:
-            context.update(progress=0.02, stage="prepare_exploration_runtime", message="按需准备探索建图运行时。")
+            context.update(progress=0.02, stage="prepare_exploration_runtime", message="检查并复用探索建图运行时。")
             self._ensure_geometry_runtime_for_capability("explore_area")
             last_context = self.navigation_service.start_exploration(request)
             finalized = False
@@ -6512,6 +6563,13 @@ class GatewayRuntime:
             return None
         if active_workspace.latest_map_snapshot is None:
             return None
+        if not self._exploration_snapshot_matches_active_map_version(active_workspace):
+            RUNTIME_LOGGER.warning(
+                "跳过探索后自动保存地图版本：live 地图快照未绑定当前激活版本 map_name=%s trigger=%s",
+                map_name,
+                trigger,
+            )
+            return None
         try:
             return self.map_workspace_service.save_map_version(
                 map_name=map_name,
@@ -6522,6 +6580,58 @@ class GatewayRuntime:
             RUNTIME_LOGGER.exception("探索任务结束后自动保存平台地图版本失败 map_name=%s trigger=%s", map_name, trigger)
             return None
 
+    def _exploration_snapshot_matches_active_map_version(self, active_workspace) -> bool:
+        map_asset = getattr(active_workspace, "map_asset", None)
+        expected_version_id = str(getattr(map_asset, "latest_version_id", "") or "").strip()
+        if not expected_version_id:
+            return True
+        snapshot = getattr(active_workspace, "latest_map_snapshot", None)
+        if snapshot is None:
+            return False
+        metadata = dict(getattr(snapshot, "metadata", {}) or {})
+        live_snapshot = bool(
+            metadata.get("map_snapshot_kind") == "live_streaming"
+            or metadata.get("source_kind") == "platform_live_map_provider"
+            or metadata.get("live_streaming_ready")
+            or metadata.get("rtabmap_live_streaming_ready")
+        )
+        if not live_snapshot:
+            return True
+        if expected_version_id not in {
+            str(getattr(snapshot, "version_id", "") or ""),
+            str(metadata.get("seed_map_version_id") or ""),
+            str(metadata.get("platform_map_version_id") or ""),
+        }:
+            return False
+        versions = self.map_workspace_service.list_map_versions(map_name=active_workspace.active_map_name, limit=1)
+        if not versions:
+            return True
+        return not self._live_snapshot_under_covers_saved_version(snapshot, versions[0])
+
+    def _live_snapshot_under_covers_saved_version(self, snapshot, version) -> bool:
+        if getattr(version.snapshot, "occupancy_grid", None) is None:
+            return False
+        metadata = dict(getattr(snapshot, "metadata", {}) or {})
+        live_known_cells = self._metadata_known_cell_count(metadata)
+        if live_known_cells is None:
+            live_known_cells = self._occupancy_known_cell_count(getattr(snapshot, "occupancy_grid", None))
+        seed_known_cells = self._occupancy_known_cell_count(version.snapshot.occupancy_grid)
+        return seed_known_cells is not None and (live_known_cells is None or live_known_cells < seed_known_cells)
+
+    def _metadata_known_cell_count(self, metadata: Dict[str, object]) -> Optional[int]:
+        occupancy_metrics = metadata.get("occupancy_metrics")
+        if not isinstance(occupancy_metrics, dict) or "known_cell_count" not in occupancy_metrics:
+            return None
+        try:
+            return int(occupancy_metrics.get("known_cell_count") or 0)
+        except (TypeError, ValueError):
+            return None
+
+    def _occupancy_known_cell_count(self, occupancy_grid) -> Optional[int]:
+        data = getattr(occupancy_grid, "data", None)
+        if data is None:
+            return None
+        return sum(1 for value in data if int(value) >= 0)
 
     def _build_gateway_capability_availability(
         self,

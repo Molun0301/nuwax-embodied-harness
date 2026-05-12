@@ -56,7 +56,7 @@ from services.observation_service import ObservationService
 from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
 from services.robot_state_service import RobotStateService
 from skills import SkillRegistry
-from logging_utils import LogRateLimiter
+from logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event
 from settings import NuwaxRobotBridgeConfig
 
 
@@ -478,18 +478,23 @@ class GatewayRuntime:
 
         try:
             self._publish_runtime_event_stream_frames(event)
+            event_type = str(event.event_type)
             level = {
                 "info": logging.INFO,
                 "warning": logging.WARNING,
                 "error": logging.ERROR,
             }.get(str(event.severity), logging.INFO)
+            if level <= logging.INFO and is_low_value_runtime_event(event_type):
+                level = logging.DEBUG
+            if not RUNTIME_LOGGER.isEnabledFor(level):
+                return
             payload_preview = self._build_log_preview(event.payload)
             metadata_preview = self._build_log_preview(event.metadata)
             extra = {
                 "event": "runtime.event",
                 "cursor": event.cursor or "-",
                 "category": str(event.category),
-                "runtime_event_type": event.event_type,
+                "runtime_event_type": event_type,
                 "source": event.source,
                 "task_id": event.task_id or "-",
                 "subject_id": event.subject_id or "-",
@@ -515,11 +520,9 @@ class GatewayRuntime:
                 "运行时事件",
                 key=(
                     "runtime_event",
+                    logging.getLevelName(level),
                     str(event.category),
-                    event.event_type,
-                    event.source,
-                    event.task_id or "-",
-                    event.subject_id or "-",
+                    event_type,
                 ),
                 interval_sec=_RUNTIME_EVENT_LOG_RATE_LIMIT_SEC,
                 extra=extra,
@@ -568,15 +571,10 @@ class GatewayRuntime:
     def _build_log_preview(value: Any) -> str:
         """把结构化载荷压缩成适合日志的一行文本。"""
 
-        if not value:
-            return "-"
         try:
-            rendered = str(to_jsonable(value))
+            return format_log_preview(to_jsonable(value))
         except Exception:
-            rendered = str(value)
-        if len(rendered) > 600:
-            return f"{rendered[:600]}...(truncated)"
-        return rendered
+            return format_log_preview(value)
 
     def _start_data_frame_stream_sources(self) -> None:
         self._publish_runtime_governance_stream_frame()

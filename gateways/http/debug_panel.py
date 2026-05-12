@@ -93,6 +93,8 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             'runtime.governance',
             'pointcloud_map.meta',
             'pointcloud.frame',
+            'video.frame',
+            'video.detections',
             'logs.entry',
             'tasks.state',
         )
@@ -385,8 +387,11 @@ def _render_debug_page(access_token: str) -> str:
     .map-info-grid { grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); margin-top: 10px; max-height: 176px; overflow: auto; padding-right: 2px; }
     .video-stage { position: relative; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border-soft); background: var(--occupied); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04); }
     .video-frame { display: block; width: 100%; min-height: 210px; max-height: 300px; object-fit: contain; background: var(--occupied); }
-    .video-overlay { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; justify-content: space-between; gap: 8px; pointer-events: none; }
+    .video-detection-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .video-overlay { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; pointer-events: none; }
     .overlay-chip { border: 1px solid var(--border-strong); background: var(--surface-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: var(--accent-strong); backdrop-filter: blur(10px); }
+    .overlay-toggle { display: inline-flex; align-items: center; gap: 6px; pointer-events: auto; cursor: pointer; }
+    .overlay-toggle input { accent-color: var(--accent); }
     .legend { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 9px; }
     .legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px; }
     .swatch { width: 12px; height: 12px; border: 1px solid var(--border); border-radius: 4px; }
@@ -676,9 +681,11 @@ def _render_debug_page(access_token: str) -> str:
                     </div>
                     <div class="video-stage">
                       <img id="videoFrame" class="video-frame" alt="实时视频帧" hidden>
+                      <canvas id="videoDetections" class="video-detection-canvas" hidden></canvas>
                       <div class="video-overlay">
                         <span id="visionModelStatus" class="overlay-chip">本地模型：--</span>
                         <span id="videoFpsStatus" class="overlay-chip">帧率：--</span>
+                        <label class="overlay-chip overlay-toggle"><input id="showDetections" type="checkbox">显示检测框</label>
                       </div>
                     </div>
                     <div id="videoEmpty" class="empty panel-meta">等待视频帧。</div>
@@ -746,7 +753,7 @@ def _render_debug_page(access_token: str) -> str:
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 500;
-      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.state", "exploration.frontier", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "tasks.state"];
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.state", "exploration.frontier", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state"];
       const state = {
         mapGrid: null,
         mapViewport: null,
@@ -770,6 +777,10 @@ def _render_debug_page(access_token: str) -> str:
         pendingVideoEnvelope: null,
         videoRenderFrame: null,
         lastVideoFrameKey: null,
+        showDetections: false,
+        videoDetections: [],
+        videoSourceSize: null,
+        videoDetectionDrawFrame: null,
         latestOverview: null,
         overviewRenderTimer: null,
         overviewLastRenderAt: 0,
@@ -823,6 +834,8 @@ def _render_debug_page(access_token: str) -> str:
         governanceMeta: document.getElementById("governanceMeta"),
         videoStatus: document.getElementById("videoStatus"),
         videoFrame: document.getElementById("videoFrame"),
+        videoDetections: document.getElementById("videoDetections"),
+        showDetections: document.getElementById("showDetections"),
         videoEmpty: document.getElementById("videoEmpty"),
         videoMeta: document.getElementById("videoMeta"),
         visionModelStatus: document.getElementById("visionModelStatus"),
@@ -1648,6 +1661,7 @@ def _render_debug_page(access_token: str) -> str:
       function buildVideoFrameSrc(data) {
         if (data.stream_url) {
           const url = new URL(data.stream_url, window.location.origin);
+          if (!url.searchParams.get("fps")) url.searchParams.set("fps", "15");
           if (apiAccessToken && !url.searchParams.get("access_token")) url.searchParams.set("access_token", apiAccessToken);
           return url.toString();
         }
@@ -1656,6 +1670,11 @@ def _render_debug_page(access_token: str) -> str:
       function updateVideo(envelope) {
         const status = statusOf(envelope);
         const data = envelope.data || {};
+        const detections = Array.isArray(data.detections_2d) ? data.detections_2d : null;
+        if (detections) {
+          updateVideoDetections(data, envelope);
+          return;
+        }
         setPill(els.videoStatus, status);
         const videoSrc = buildVideoFrameSrc(data);
         if (videoSrc) {
@@ -1666,9 +1685,11 @@ def _render_debug_page(access_token: str) -> str:
             state.videoFrames += 1;
             if (frameKey) state.lastVideoFrameKey = frameKey;
           }
+          if (data.width_px && data.height_px) state.videoSourceSize = { width: Number(data.width_px), height: Number(data.height_px) };
           els.videoFrame.hidden = false;
           els.videoEmpty.hidden = true;
-        } else {
+          scheduleVideoDetectionDraw();
+        } else if (!state.lastVideoFrameKey) {
           els.videoFrame.hidden = true;
           els.videoEmpty.hidden = false;
           els.videoEmpty.textContent = errorReason(envelope, "视频 provider 未返回图像帧。");
@@ -1681,13 +1702,86 @@ def _render_debug_page(access_token: str) -> str:
           ["transport", data.transport],
           ["stream_url", data.stream_url],
           ["payload_bytes", data.payload_bytes],
+          ["detections", state.videoDetections.length],
           ["rendered_frames", state.videoFrames],
           ["source_timestamp", shortTime(envelope.source_timestamp)],
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         setText(els.visionModelStatus, `本地模型：${status}`);
-        setText(els.videoFpsStatus, `帧 ${state.videoFrames} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
+        setText(els.videoFpsStatus, `帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
+      }
+      function updateVideoDetections(data, envelope) {
+        state.videoDetections = Array.isArray(data.detections_2d) ? data.detections_2d : [];
+        if (data.width_px && data.height_px) state.videoSourceSize = { width: Number(data.width_px), height: Number(data.height_px) };
+        setPill(els.videoStatus, statusOf(envelope), `${state.videoDetections.length} detections`);
+        setText(els.visionModelStatus, `本地模型：${data.detector_backend || envelope.source || "perception"}`);
+        setText(els.videoFpsStatus, `帧 ${state.videoFrames} · 检测 ${state.videoDetections.length}`);
+        scheduleVideoDetectionDraw();
+      }
+      function scheduleVideoDetectionDraw() {
+        if (state.videoDetectionDrawFrame) return;
+        state.videoDetectionDrawFrame = window.requestAnimationFrame(() => {
+          state.videoDetectionDrawFrame = null;
+          drawVideoDetections();
+        });
+      }
+      function drawVideoDetections() {
+        const canvas = els.videoDetections;
+        const image = els.videoFrame;
+        if (!canvas || !image || !state.showDetections || image.hidden || !state.videoDetections.length) {
+          if (canvas) {
+            canvas.hidden = true;
+            const context = canvas.getContext("2d");
+            if (context) context.clearRect(0, 0, canvas.width, canvas.height);
+          }
+          return;
+        }
+        const stageRect = canvas.parentElement.getBoundingClientRect();
+        const imageRect = image.getBoundingClientRect();
+        const width = Math.max(1, Math.round(stageRect.width));
+        const height = Math.max(1, Math.round(stageRect.height));
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+        const sourceWidth = Number((state.videoSourceSize && state.videoSourceSize.width) || image.naturalWidth || 0);
+        const sourceHeight = Number((state.videoSourceSize && state.videoSourceSize.height) || image.naturalHeight || 0);
+        if (!(sourceWidth > 0 && sourceHeight > 0)) {
+          canvas.hidden = true;
+          return;
+        }
+        const fitScale = Math.min(imageRect.width / sourceWidth, imageRect.height / sourceHeight);
+        const drawnWidth = sourceWidth * fitScale;
+        const drawnHeight = sourceHeight * fitScale;
+        const scaleX = fitScale;
+        const scaleY = fitScale;
+        const offsetX = imageRect.left - stageRect.left + (imageRect.width - drawnWidth) / 2;
+        const offsetY = imageRect.top - stageRect.top + (imageRect.height - drawnHeight) / 2;
+        const context = canvas.getContext("2d");
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.lineWidth = 2;
+        context.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
+        for (const detection of state.videoDetections) {
+          const bbox = detection && detection.bbox;
+          if (!bbox) continue;
+          const x = offsetX + Number(bbox.x_px || 0) * scaleX;
+          const y = offsetY + Number(bbox.y_px || 0) * scaleY;
+          const boxWidth = Number(bbox.width_px || 0) * scaleX;
+          const boxHeight = Number(bbox.height_px || 0) * scaleY;
+          if (!(boxWidth > 0 && boxHeight > 0)) continue;
+          const label = `${detection.label || "object"} ${detection.score !== undefined ? Math.round(Number(detection.score) * 100) + "%" : ""}`.trim();
+          context.strokeStyle = "#22d3ee";
+          context.fillStyle = "rgba(34, 211, 238, 0.16)";
+          context.strokeRect(x, y, boxWidth, boxHeight);
+          context.fillRect(x, y, boxWidth, boxHeight);
+          const labelWidth = Math.min(context.measureText(label).width + 10, Math.max(50, boxWidth));
+          context.fillStyle = "rgba(2, 6, 23, 0.82)";
+          context.fillRect(x, Math.max(0, y - 20), labelWidth, 18);
+          context.fillStyle = "#e0f2fe";
+          context.fillText(label, x + 5, Math.max(12, y - 7));
+        }
+        canvas.hidden = false;
       }
       function updateLogs(envelope) {
         const status = statusOf(envelope);
@@ -1758,6 +1852,7 @@ def _render_debug_page(access_token: str) -> str:
         "pointcloud_map.meta",
         "pointcloud.frame",
         "video.frame",
+        "video.detections",
         "logs.entry",
         "tasks.state"
       ];
@@ -1883,6 +1978,8 @@ def _render_debug_page(access_token: str) -> str:
           updatePointcloudFrame(frame);
         } else if (frame.topic === "video.frame") {
           scheduleVideoUpdate(envelopeFromFrame(frame));
+        } else if (frame.topic === "video.detections") {
+          updateVideoDetections(frame.payload || {}, envelopeFromFrame(frame));
         } else if (frame.topic === "logs.entry") {
           updateLogFrame(frame);
         } else if (frame.topic === "tasks.state") {
@@ -1957,7 +2054,12 @@ def _render_debug_page(access_token: str) -> str:
         updateStreamOverview(latest);
       }
       function updateTaskFrame(frame) {
-        const event = frame.payload || {};
+        const framePayload = frame.payload || {};
+        if (Array.isArray(framePayload.active_tasks) || Array.isArray(framePayload.history_tasks)) {
+          replaceTaskStore(framePayload);
+          return;
+        }
+        const event = framePayload.event || framePayload;
         const payload = event.payload || {};
         const requestContext = payload.request_context || {};
         const taskId = event.task_id || payload.task_id || requestContext.task_id;
@@ -2047,6 +2149,12 @@ def _render_debug_page(access_token: str) -> str:
         window.addEventListener("resize", redrawMapAfterResize);
       }
       window.setInterval(updateClock, 1000);
+      els.showDetections.addEventListener("change", () => {
+        state.showDetections = Boolean(els.showDetections.checked);
+        scheduleVideoDetectionDraw();
+      });
+      els.videoFrame.addEventListener("load", scheduleVideoDetectionDraw);
+      window.addEventListener("resize", scheduleVideoDetectionDraw);
       function setMapZoom(nextZoom) {
         state.mapZoom = Math.min(8, Math.max(0.25, nextZoom));
         requestMapDraw(false);

@@ -111,32 +111,41 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         return StreamingResponse(frame_generator(), media_type="text/event-stream")
 
+    video_capture_lock = asyncio.Lock()
+
     @router.get("/streams/video.mjpeg")
     async def video_mjpeg_stream(
         request: Request,
         camera_id: Optional[str] = None,
-        fps: float = 3.0,
+        fps: float = 15.0,
     ) -> StreamingResponse:
         access_manager.authenticate_http(request)
-        del camera_id
-        requested_fps = float(fps or 3.0)
+        requested_fps = float(fps or 15.0)
         if not math.isfinite(requested_fps):
-            requested_fps = 3.0
-        frame_interval_sec = 1.0 / min(max(requested_fps, 0.2), 10.0)
+            requested_fps = 15.0
+        frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 24.0)
 
         async def frame_generator():
             last_sequence = 0
             while not await request.is_disconnected():
+                started_at = time.monotonic()
+                try:
+                    async with video_capture_lock:
+                        await _run_blocking(
+                            runtime.perception_service.publish_current_video_frame,
+                            camera_id=camera_id,
+                            requested_by="streams.video_mjpeg",
+                        )
+                except Exception:
+                    pass
                 latest_frame = await _run_blocking(
                     runtime.wait_for_video_frame,
                     last_sequence,
-                    timeout_sec=runtime.config.gateway.sse_keepalive_sec,
+                    timeout_sec=frame_interval_sec,
                 )
-                if latest_frame is None:
-                    continue
-                last_sequence = latest_frame.sequence
-                started_at = time.monotonic()
-                yield _format_mjpeg_frame(latest_frame.data)
+                if latest_frame is not None:
+                    last_sequence = latest_frame.sequence
+                    yield _format_mjpeg_frame(latest_frame.data)
                 elapsed = time.monotonic() - started_at
                 if elapsed < frame_interval_sec:
                     await asyncio.sleep(frame_interval_sec - elapsed)

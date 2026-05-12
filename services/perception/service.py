@@ -24,7 +24,7 @@ from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
-from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 VideoFrameSink = Callable[[object], Optional[object]]
 
@@ -312,6 +312,7 @@ class PerceptionService:
                     },
                 )
             )
+        self._publish_detection_overlay_frame(context)
         return context
 
     def perceive_current_scene(
@@ -577,6 +578,53 @@ class PerceptionService:
                 )
             )
         return tuple(assigned)
+
+    def _publish_detection_overlay_frame(self, context: PerceptionContext) -> None:
+        if self._stream_bus is None:
+            return
+        observation = context.observation
+        detections = tuple(self._serialize_detection_overlay(detection) for detection in observation.detections_2d)
+        payload = {
+            "available": True,
+            "camera_id": context.camera_id,
+            "frame_id": observation.frame_id,
+            "width_px": observation.metadata.get("width_px"),
+            "height_px": observation.metadata.get("height_px"),
+            "detector_backend": context.detector_backend,
+            "tracker_backend": context.tracker_backend,
+            "detection_count": len(detections),
+            "detections_2d": detections,
+            "stage_status": dict(context.metadata.get("stage_status") or {}),
+            "stage_duration_ms": dict(context.metadata.get("stage_duration_ms") or {}),
+        }
+        self._stream_bus.publish(
+            "video.detections",
+            source="perception_service",
+            payload=payload,
+            frame_id=observation.frame_id,
+            status="available",
+            metadata={
+                "camera_id": context.camera_id,
+                "detector_backend": context.detector_backend,
+                "detection_count": len(detections),
+            },
+        )
+
+    @staticmethod
+    def _serialize_detection_overlay(detection: Detection2D) -> Dict[str, Any]:
+        bbox = detection.bbox
+        return {
+            "label": detection.label,
+            "score": detection.score,
+            "track_id": detection.track_id,
+            "bbox": {
+                "x_px": bbox.x_px,
+                "y_px": bbox.y_px,
+                "width_px": bbox.width_px,
+                "height_px": bbox.height_px,
+            },
+            "attributes": dict(detection.attributes or {}),
+        }
 
     def _publish_video_frame(self, image_frame, *, source_name: str) -> None:
         if self._stream_bus is None:

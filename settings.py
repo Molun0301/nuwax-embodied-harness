@@ -27,7 +27,7 @@ try:
 except ImportError:  # pragma: no cover - Windows 环境不提供 fcntl
     fcntl = None
 
-from logging_utils import build_default_formatter
+from logging_utils import DropPatternLogFilter, build_default_formatter
 from contracts.geometry_runtime import (
     ExternalGeometryStackConfig,
     GeometryFrameConfig,
@@ -1008,38 +1008,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
     )
 
 
-class _NoisyLogFilter(logging.Filter):
-    """过滤第三方库的高频低价值日志，避免运行日志爆量。"""
-
-    _DROP_PATTERNS = (
-        "Received message on data channel:",
-        "> message sent:",
-        "Heartbeat response received.",
-        "Creating offer...",
-        "Trying to send SDP using the old method...",
-        "An error occurred with the old method:",
-        "Data channel closed",
-    )
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            message = record.getMessage()
-        except Exception:
-            return True
-
-        for pattern in self._DROP_PATTERNS:
-            if pattern in message:
-                return False
-
-        if "HTTPConnectionPool(" in message and "/offer" in message and "Connection refused" in message:
-            return False
-
-        if "MediaStreamError" in message and "AsyncIOEventEmitter" in message:
-            return False
-
-        return True
-
-
 class _LineLimitedFileHandler(logging.FileHandler):
     """按最大行数保留日志文件，超出后自动裁剪前面的旧内容。"""
 
@@ -1168,12 +1136,15 @@ def _configure_third_party_logger_levels() -> None:
     ):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
-    # Uvicorn（ASGI 服务器）默认会挂自己的 handler。
-    # 这里统一改成向根日志传播，确保文件日志和控制台日志口径一致。
-    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for logger_name in ("uvicorn", "uvicorn.error"):
         logger = logging.getLogger(logger_name)
         logger.handlers = []
         logger.propagate = True
+
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.handlers = []
+    access_logger.propagate = False
+    access_logger.disabled = True
 
 
 def configure_logging(config: LoggingConfig) -> None:
@@ -1182,7 +1153,7 @@ def configure_logging(config: LoggingConfig) -> None:
     Path(config.log_dir).mkdir(parents=True, exist_ok=True)
     level_name = (config.level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    noisy_filter = _NoisyLogFilter()
+    noisy_filter = DropPatternLogFilter()
     formatter = build_default_formatter()
 
     file_handler = _LineLimitedFileHandler(

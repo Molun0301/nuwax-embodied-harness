@@ -39,7 +39,7 @@ from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
 from gateways.request_context import categorize_gateway_error
 from gateways.serialization import to_jsonable
-from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider
+from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider, StreamingImageProvider
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
 from services.geometry import (
@@ -370,6 +370,7 @@ class GatewayRuntime:
         self._localization_stream_subscription_id: Optional[int] = None
         self._localization_stream_unsubscriber = None
         self._point_cloud_stream_subscription_id: Optional[int] = None
+        self._image_stream_subscription_id: Optional[int] = None
         self._pointcloud_map_stream_subscription_id: Optional[str] = None
         self._navigation_status_refresh_stop = threading.Event()
         self._navigation_status_refresh_thread: Optional[threading.Thread] = None
@@ -577,6 +578,10 @@ class GatewayRuntime:
             return format_log_preview(value)
 
     def _start_data_frame_stream_sources(self) -> None:
+        providers = getattr(self.robot, "providers", None)
+        if isinstance(providers, StreamingImageProvider) and self._image_stream_subscription_id is None:
+            self._image_stream_subscription_id = providers.subscribe_image(self._publish_image_stream_frame)
+
         self._publish_runtime_governance_stream_frame()
         self._publish_static_stream_capability_frames()
         self._publish_pointcloud_map_stream_frame(reason="runtime_stream_start")
@@ -587,7 +592,6 @@ class GatewayRuntime:
                 self._handle_map_frame_for_pointcloud_map_stream,
                 topics=("map.frame",),
             )
-        providers = getattr(self.robot, "providers", None)
 
         robot_state_subscriber = getattr(providers, "subscribe_robot_state", None)
         if callable(robot_state_subscriber) and self._robot_state_stream_subscription_id is None:
@@ -713,6 +717,11 @@ class GatewayRuntime:
             if callable(unsubscriber):
                 unsubscriber(self._point_cloud_stream_subscription_id)
             self._point_cloud_stream_subscription_id = None
+        if self._image_stream_subscription_id is not None:
+            unsubscriber = getattr(providers, "unsubscribe_image", None)
+            if callable(unsubscriber):
+                unsubscriber(self._image_stream_subscription_id)
+            self._image_stream_subscription_id = None
 
     def _publish_robot_state_stream_frame(self, robot_state: Any) -> None:
         try:
@@ -751,8 +760,35 @@ class GatewayRuntime:
             },
         )
 
+    def _publish_image_stream_frame(self, image_frame: ImageFrame) -> None:
+        latest_frame = self._store_latest_video_frame(image_frame)
+        if latest_frame is None:
+            self.stream_bus.publish(
+                "video.frame",
+                source="image_stream_provider",
+                payload={"available": False, "message": "源头推送图像不是 JPEG 图像数据。"},
+                status="unsupported",
+                metadata={"reason": "stream_image_payload_missing"},
+            )
+            return
+        self._publish_latest_video_stream_metadata(latest_frame, reason="image_stream_push", source="image_stream_provider")
+
     def _publish_video_stream_frame(self, *, reason: str) -> None:
         providers = getattr(self.robot, "providers", None)
+        if self._image_stream_subscription_id is not None:
+            latest_frame = self.latest_video_frame()
+            if latest_frame is None:
+                self.stream_bus.publish(
+                    "video.frame",
+                    source="image_stream_provider",
+                    payload={"available": False, "message": "源头推送图像流尚未收到首帧。"},
+                    status="missing",
+                    metadata={"reason": "image_stream_waiting_first_frame", "refresh_reason": reason},
+                )
+                return
+            self._publish_latest_video_stream_metadata(latest_frame, reason=reason, source="image_stream_provider")
+            return
+
         image_provider = providers if providers is not None and isinstance(providers, ImageProvider) else None
         if image_provider is None:
             self.stream_bus.publish(
@@ -798,6 +834,9 @@ class GatewayRuntime:
                 metadata={"reason": "image_payload_missing", "refresh_reason": reason},
             )
             return
+        self._publish_latest_video_stream_metadata(latest_frame, reason=reason, source="image_provider")
+
+    def _publish_latest_video_stream_metadata(self, latest_frame: LatestVideoFrame, *, reason: str, source: str) -> None:
         stream_path = "/streams/video.mjpeg?" + urlencode({"camera_id": latest_frame.camera_id or ""})
         payload = {
             "available": True,
@@ -809,14 +848,14 @@ class GatewayRuntime:
             "payload_bytes": latest_frame.payload_bytes,
             "transport": "mjpeg",
             "stream_url": stream_path,
-            "source": "image_provider",
+            "source": source,
             "refresh_reason": reason,
             "timestamp": latest_frame.timestamp,
             "metadata": self._serialize(latest_frame.metadata),
         }
         self.stream_bus.publish(
             "video.frame",
-            source="image_provider",
+            source=source,
             payload=payload,
             frame_id=latest_frame.frame_id,
             sequence=latest_frame.sequence,
@@ -4115,18 +4154,25 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=True,
         )
-        self._refresh_workspace_snapshots()
-        if self._workspace_requires_localization_before_explore(workspace):
-            self._ensure_localization_ready_or_relocalize(
-                capability_name="explore_area",
-                map_name=map_name,
-                workspace=workspace,
-                requested_by=requested_by,
-            )
         target_name = str(arguments.get("target_name", "")).strip() or None
         center_pose = None
         if "frame_id" in arguments or "x" in arguments or "y" in arguments:
             center_pose = self._build_pose_from_arguments(arguments)
+        poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.2)
+        timeout_sec = self._resolve_async_timeout("explore_area", arguments, minimum_sec=0.1)
+        stop_conditions = self._exploration_stop_conditions(arguments)
+        max_duration_sec = self._resolve_exploration_max_duration_sec(
+            max_duration_sec=self._float(arguments, "max_duration_sec", 0.0) or None,
+            stop_conditions=stop_conditions,
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+        )
+        timeout_sec = self._resolve_exploration_timeout_sec(
+            timeout_sec=timeout_sec,
+            max_duration_sec=max_duration_sec,
+            stop_conditions=stop_conditions,
+            poll_interval_sec=poll_interval_sec,
+        )
         request = ExploreAreaRequest(
             request_id=self._build_runtime_request_id("explore"),
             map_name=map_name,
@@ -4134,12 +4180,10 @@ class GatewayRuntime:
             target_name=target_name,
             radius_m=self._float(arguments, "radius_m", 0.0) or None,
             strategy=str(arguments.get("strategy") or "frontier"),
-            max_duration_sec=self._float(arguments, "max_duration_sec", 0.0) or None,
-            stop_conditions=self._exploration_stop_conditions(arguments),
+            max_duration_sec=max_duration_sec,
+            stop_conditions=stop_conditions,
             metadata={"requested_by": requested_by or "unknown"},
         )
-        poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.2)
-        timeout_sec = self._resolve_async_timeout("explore_area", arguments, minimum_sec=0.1)
         return self._submit_exploration_task(
             request=request,
             poll_interval_sec=poll_interval_sec,
@@ -4174,23 +4218,37 @@ class GatewayRuntime:
         center_pose = None
         if "frame_id" in arguments or "x" in arguments or "y" in arguments:
             center_pose = self._build_pose_from_arguments(arguments)
+        poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.2)
+        search_refresh_interval_sec = self._float(arguments, "search_refresh_interval_sec", 0.8)
+        verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
+        timeout_sec = self._resolve_async_timeout("explore_and_find_target", arguments, minimum_sec=0.1)
+        stop_conditions = self._exploration_stop_conditions(arguments)
+        timeout_guard_interval_sec = max(poll_interval_sec, search_refresh_interval_sec)
+        max_duration_sec = self._resolve_exploration_max_duration_sec(
+            max_duration_sec=self._float(arguments, "max_duration_sec", 0.0) or None,
+            stop_conditions=stop_conditions,
+            timeout_sec=timeout_sec,
+            poll_interval_sec=timeout_guard_interval_sec,
+        )
+        timeout_sec = self._resolve_exploration_timeout_sec(
+            timeout_sec=timeout_sec,
+            max_duration_sec=max_duration_sec,
+            stop_conditions=stop_conditions,
+            poll_interval_sec=timeout_guard_interval_sec,
+        )
         request = ExploreAreaRequest(
             request_id=self._build_runtime_request_id("explore_find"),
             map_name=map_name,
             center_pose=center_pose,
             radius_m=self._float(arguments, "radius_m", 0.0) or None,
             strategy=str(arguments.get("strategy") or "frontier"),
-            max_duration_sec=self._float(arguments, "max_duration_sec", 0.0) or None,
-            stop_conditions=self._exploration_stop_conditions(arguments),
+            max_duration_sec=max_duration_sec,
+            stop_conditions=stop_conditions,
             metadata={
                 "requested_by": requested_by or "unknown",
                 "search_query": query,
             },
         )
-        poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.2)
-        search_refresh_interval_sec = self._float(arguments, "search_refresh_interval_sec", 0.8)
-        verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
-        timeout_sec = self._resolve_async_timeout("explore_and_find_target", arguments, minimum_sec=0.1)
         descriptor = self.capability_registry.get_descriptor("explore_and_find_target")
 
         def runner(context) -> Dict[str, Any]:
@@ -5485,6 +5543,35 @@ class GatewayRuntime:
             )
         return stop_conditions
 
+    def _resolve_exploration_max_duration_sec(
+        self,
+        *,
+        max_duration_sec: Optional[float],
+        stop_conditions: MetadataDict,
+        timeout_sec: float,
+        poll_interval_sec: float,
+    ) -> Optional[float]:
+        if max_duration_sec is not None:
+            return max_duration_sec
+        if stop_conditions.get("max_duration_sec") is not None:
+            return None
+        guard_sec = max(1.0, float(poll_interval_sec or 0.0) * 2.0)
+        return max(0.1, float(timeout_sec) - guard_sec)
+
+    def _resolve_exploration_timeout_sec(
+        self,
+        *,
+        timeout_sec: float,
+        max_duration_sec: Optional[float],
+        stop_conditions: MetadataDict,
+        poll_interval_sec: float,
+    ) -> float:
+        duration_candidates = [value for value in (max_duration_sec, stop_conditions.get("max_duration_sec")) if value]
+        if not duration_candidates:
+            return timeout_sec
+        guard_sec = max(1.0, float(poll_interval_sec or 0.0) * 2.0)
+        return max(float(timeout_sec), max(float(value) for value in duration_candidates) + guard_sec)
+
     def _coerce_optional_str_list(self, value: Any) -> List[str]:
         if value is None or isinstance(value, bool):
             return []
@@ -6311,6 +6398,17 @@ class GatewayRuntime:
 
         def runner(context) -> Dict[str, Any]:
             context.update(progress=0.02, stage="prepare_exploration_runtime", message="检查并复用探索建图运行时。")
+            context.ensure_active()
+            self._refresh_workspace_snapshots()
+            workspace = self.map_workspace_service.get_active_workspace()
+            if self._workspace_requires_localization_before_explore(workspace):
+                self._ensure_localization_ready_or_relocalize(
+                    capability_name="explore_area",
+                    map_name=request.map_name,
+                    workspace=workspace,
+                    requested_by=requested_by,
+                )
+            context.ensure_active()
             self._ensure_geometry_runtime_for_capability("explore_area")
             last_context = self.navigation_service.start_exploration(request)
             finalized = False

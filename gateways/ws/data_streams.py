@@ -132,12 +132,17 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 try:
                     async with video_capture_lock:
                         await _run_blocking(
-                            runtime.perception_service.publish_current_video_frame,
-                            camera_id=camera_id,
-                            requested_by="streams.video_mjpeg",
+                            runtime._publish_video_stream_frame,
+                            reason="streams.video_mjpeg",
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    runtime.stream_bus.publish(
+                        "video.frame",
+                        source="streams.video_mjpeg",
+                        payload={"available": False, "message": str(exc)},
+                        status="missing",
+                        metadata={"reason": "mjpeg_capture_failed"},
+                    )
                 latest_frame = await _run_blocking(
                     runtime.wait_for_video_frame,
                     last_sequence,

@@ -42,6 +42,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -50,7 +51,11 @@
 #include <utility>
 
 #include "sensor_msgs/point_cloud2_iterator.hpp"
+#if __has_include("tf2_sensor_msgs/tf2_sensor_msgs.h")
 #include "tf2_sensor_msgs/tf2_sensor_msgs.h"
+#else
+#include "tf2_sensor_msgs/tf2_sensor_msgs.hpp"
+#endif
 #include "tf2_ros/create_timer_ros.h"
 #include "tf2/LinearMath/Transform.h"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -107,6 +112,8 @@ PointCloudToLaserScanNode::PointCloudToLaserScanNode(const rclcpp::NodeOptions &
       sub_, *tf2_, target_frame_, input_queue_size_,
       this->get_node_logging_interface(),
       this->get_node_clock_interface());
+    const int64_t tolerance_ns = static_cast<int64_t>((tolerance_ > 0.0 ? tolerance_ : 0.0) * 1e9);
+    message_filter_->setTolerance(rclcpp::Duration(std::chrono::nanoseconds(tolerance_ns)));
     message_filter_->registerCallback(
       std::bind(&PointCloudToLaserScanNode::cloudCallback, this, _1));
   } else {  // otherwise setup direct subscription

@@ -9,7 +9,7 @@ from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.common import MotionCommandDataPlane
 from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO
-from providers.image import ImageProvider
+from providers.image import ImageProvider, StreamingImageProvider
 from providers.localization import StreamingLocalizationProvider
 from providers.motion import MotionControl
 from providers.pointcloud import PointCloudProvider, StreamingPointCloudProvider
@@ -42,6 +42,7 @@ def _resolve_motion_command_data_plane(data_plane) -> Optional[MotionCommandData
 class Go2ProviderBundle(
     StateProvider,
     ImageProvider,
+    StreamingImageProvider,
     PointCloudProvider,
     StreamingPointCloudProvider,
     StreamingLocalizationProvider,
@@ -66,7 +67,13 @@ class Go2ProviderBundle(
         return self.assembly.high_level_initialized
 
     def is_image_available(self) -> bool:
-        return self.assembly.high_level_initialized
+        if self.assembly.high_level_initialized:
+            return True
+        data_plane = getattr(self.assembly, "data_plane", None)
+        getter = getattr(data_plane, "get_latest_image", None)
+        if not callable(getter):
+            return False
+        return getter() is not None
 
     def get_robot_state(self) -> RobotState:
         low_level_running = bool(
@@ -184,6 +191,32 @@ class Go2ProviderBundle(
         if camera_id:
             camera_info.camera_id = camera_id
         return camera_info
+
+    def subscribe_image(self, callback: Callable[[ImageFrame], None]) -> Optional[int]:
+        if self.assembly.data_plane is None:
+            return None
+        status_getter = getattr(self.assembly.data_plane, "get_status", None)
+        status = status_getter() if callable(status_getter) else {}
+        bridge_status = status.get("bridge") if isinstance(status, dict) else {}
+        if not bool(
+            status.get("enabled")
+            and status.get("started")
+            and isinstance(bridge_status, dict)
+            and bridge_status.get("direct_dds_started")
+            and bridge_status.get("dds_video_subscribed")
+        ):
+            return None
+        subscriber = getattr(self.assembly.data_plane, "subscribe_image", None)
+        if not callable(subscriber):
+            return None
+        return subscriber(callback)
+
+    def unsubscribe_image(self, subscription_id: Optional[int]) -> None:
+        if self.assembly.data_plane is None or subscription_id is None:
+            return
+        unsubscriber = getattr(self.assembly.data_plane, "unsubscribe_image", None)
+        if callable(unsubscriber):
+            unsubscriber(subscription_id)
 
     def subscribe_robot_state(self, callback: Callable[[RobotState], None]) -> Optional[int]:
         return self.subscribe_localization(lambda pose, frame_tree, metadata: callback(self._build_robot_state_from_stream(pose, metadata)))

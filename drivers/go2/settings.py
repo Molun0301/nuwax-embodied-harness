@@ -123,6 +123,8 @@ class Go2DirectDdsConfig:
     pose_topic: str = "rt/sportmodestate"
     low_state_topic: str = "rt/lowstate"
     point_cloud_topic: str = "rt/utlidar/cloud"
+    front_video_topic: str = "rt/frontvideostream"
+    front_video_resolution: str = "720p"
     read_timeout_sec: float = 0.5
     max_points_per_scan: int = 1200
 
@@ -175,6 +177,8 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
             pose_topic=_cfg_str("GO2_DIRECT_DDS_POSE_TOPIC", "rt/sportmodestate"),
             low_state_topic=_cfg_str("GO2_DIRECT_DDS_LOW_STATE_TOPIC", "rt/lowstate"),
             point_cloud_topic=_cfg_str("GO2_DIRECT_DDS_POINT_CLOUD_TOPIC", "rt/utlidar/cloud"),
+            front_video_topic=_cfg_str("GO2_DIRECT_DDS_FRONT_VIDEO_TOPIC", "rt/frontvideostream"),
+            front_video_resolution=_cfg_str("GO2_DIRECT_DDS_FRONT_VIDEO_RESOLUTION", "720p"),
             read_timeout_sec=max(0.05, _cfg_float("GO2_DIRECT_DDS_READ_TIMEOUT_SEC", 0.5)),
             max_points_per_scan=max(50, _cfg_int("GO2_DIRECT_DDS_MAX_POINTS_PER_SCAN", 1200)),
         ),

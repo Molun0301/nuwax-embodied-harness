@@ -6,6 +6,7 @@ import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose
 from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus
 from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
@@ -31,6 +32,9 @@ class _CostmapTopicState:
     frame_id: Optional[str] = None
     width: Optional[int] = None
     height: Optional[int] = None
+    resolution_m: Optional[float] = None
+    origin_x: Optional[float] = None
+    origin_y: Optional[float] = None
 
     def update(self, message: Any) -> None:
         self.message_count += 1
@@ -40,6 +44,12 @@ class _CostmapTopicState:
         if info is not None:
             self.width = int(getattr(info, "width", 0) or 0)
             self.height = int(getattr(info, "height", 0) or 0)
+            self.resolution_m = float(getattr(info, "resolution", 0.0) or 0.0)
+            origin = getattr(info, "origin", None)
+            position = getattr(origin, "position", None)
+            if position is not None:
+                self.origin_x = float(getattr(position, "x", 0.0) or 0.0)
+                self.origin_y = float(getattr(position, "y", 0.0) or 0.0)
 
     def snapshot(self) -> Dict[str, object]:
         now = datetime.now(timezone.utc)
@@ -54,6 +64,9 @@ class _CostmapTopicState:
             "frame_id": self.frame_id,
             "width": self.width,
             "height": self.height,
+            "resolution_m": self.resolution_m,
+            "origin_x": self.origin_x,
+            "origin_y": self.origin_y,
             "first_frame_ready": self.message_count >= 1,
             "streaming": self.message_count >= 2 and age_sec is not None and age_sec <= _COSTMAP_FRESH_SEC,
         }
@@ -256,8 +269,9 @@ class Nav2ActionNavigationProvider:
         lifecycle = self._read_lifecycle_status()
         action_ready = self._is_action_server_ready()
         costmaps = self._costmap_status()
-        costmaps_ready = self._costmaps_ready(costmaps)
-        tf_ready, tf_error = self._tf_ready()
+        current_pose = self._read_current_pose()
+        costmaps_ready = self._costmaps_ready(costmaps, current_pose=current_pose)
+        tf_ready, tf_error = self._tf_ready(current_pose=current_pose)
         lifecycle_ready = self._lifecycle_ready(lifecycle)
         lifecycle_observation_uncertain = self._lifecycle_observation_uncertain(lifecycle)
         errors: Dict[str, str] = {}
@@ -266,7 +280,13 @@ class Nav2ActionNavigationProvider:
         if not action_ready:
             errors["action"] = "Nav2 /navigate_to_pose action server 不可用。"
         if not costmaps_ready:
-            errors["costmap"] = "Nav2 global/local costmap 尚未首帧并连续更新。"
+            global_status = costmaps.get("global") if isinstance(costmaps.get("global"), dict) else {}
+            if global_status.get("bounds_error") == "current_pose_out_of_bounds":
+                errors["costmap"] = "当前位姿不在 Nav2 global costmap 范围内。"
+            elif global_status.get("bounds_error") == "current_pose_unavailable":
+                errors["costmap"] = "当前位姿不可用，无法验证 Nav2 global costmap 范围。"
+            else:
+                errors["costmap"] = "Nav2 global/local costmap 尚未首帧并连续更新。"
         if not tf_ready:
             errors["tf"] = tf_error or "TF/localization 不可用。"
         if errors:
@@ -375,8 +395,8 @@ class Nav2ActionNavigationProvider:
     def _costmap_status(self) -> Dict[str, object]:
         return {"global": self._global_costmap.snapshot(), "local": self._local_costmap.snapshot()}
 
-    def _tf_ready(self) -> Tuple[bool, Optional[str]]:
-        pose = self._read_current_pose()
+    def _tf_ready(self, *, current_pose: Optional[Pose] = None) -> Tuple[bool, Optional[str]]:
+        pose = current_pose or self._read_current_pose()
         if pose is None:
             return False, "TF/localization 缺失：当前位姿不可用。"
         backend = self.runtime._resolve_localization_backend()
@@ -530,10 +550,16 @@ class Nav2ActionNavigationProvider:
         return True
 
     @staticmethod
-    def _costmaps_ready(costmaps: Dict[str, object]) -> bool:
+    def _costmaps_ready(costmaps: Dict[str, object], *, current_pose: Optional[Pose] = None) -> bool:
         global_status = costmaps.get("global") if isinstance(costmaps.get("global"), dict) else {}
         local_status = costmaps.get("local") if isinstance(costmaps.get("local"), dict) else {}
-        return bool(global_status.get("streaming") and local_status.get("streaming"))
+        if not bool(global_status.get("streaming") and local_status.get("streaming")):
+            return False
+        if current_pose is None:
+            global_status["current_pose_in_bounds"] = False
+            global_status["bounds_error"] = "current_pose_unavailable"
+            return False
+        return _annotate_pose_in_costmap(current_pose, global_status)
 
     @staticmethod
     def _status_dict(readiness: _Nav2Readiness) -> Dict[str, object]:
@@ -559,3 +585,37 @@ class Nav2ActionNavigationProvider:
         if navigation_time is not None:
             metadata["navigation_time"] = str(navigation_time)
         return metadata
+
+
+def _annotate_pose_in_costmap(pose: Pose, costmap_status: Dict[str, object]) -> bool:
+    frame_id = str(costmap_status.get("frame_id") or "")
+    pose_frame_id = str(pose.frame_id or "")
+    if frame_id and pose_frame_id and not frame_ids_semantically_equal(frame_id, pose_frame_id):
+        costmap_status.update({"current_pose_in_bounds": False, "bounds_error": "frame_mismatch"})
+        return False
+    try:
+        width = int(costmap_status.get("width") or 0)
+        height = int(costmap_status.get("height") or 0)
+        resolution_m = float(costmap_status.get("resolution_m") or 0.0)
+        origin_x = float(costmap_status.get("origin_x") or 0.0)
+        origin_y = float(costmap_status.get("origin_y") or 0.0)
+    except (TypeError, ValueError):
+        costmap_status.update({"current_pose_in_bounds": False, "bounds_error": "invalid_bounds"})
+        return False
+    if width <= 0 or height <= 0 or resolution_m <= 0.0:
+        costmap_status.update({"current_pose_in_bounds": False, "bounds_error": "invalid_bounds"})
+        return False
+    max_x = origin_x + float(width) * resolution_m
+    max_y = origin_y + float(height) * resolution_m
+    x = float(pose.position.x)
+    y = float(pose.position.y)
+    in_bounds = origin_x <= x < max_x and origin_y <= y < max_y
+    costmap_status.update(
+        {
+            "current_pose": {"frame_id": pose_frame_id, "x": x, "y": y},
+            "bounds": {"min_x": origin_x, "min_y": origin_y, "max_x": max_x, "max_y": max_y},
+            "current_pose_in_bounds": in_bounds,
+            "bounds_error": None if in_bounds else "current_pose_out_of_bounds",
+        }
+    )
+    return in_bounds

@@ -777,6 +777,7 @@ def _render_debug_page(access_token: str) -> str:
         pendingVideoEnvelope: null,
         videoRenderFrame: null,
         lastVideoFrameKey: null,
+        videoStreamSrc: null,
         showDetections: false,
         videoDetections: [],
         videoSourceSize: null,
@@ -1667,6 +1668,15 @@ def _render_debug_page(access_token: str) -> str:
         }
         return data.data_uri || data.uri || "";
       }
+      function startVideoStream() {
+        const videoSrc = buildVideoFrameSrc({ stream_url: DEFAULT_VIDEO_STREAM_URL });
+        if (!videoSrc || state.videoStreamSrc === videoSrc) return;
+        els.videoFrame.src = videoSrc;
+        state.videoStreamSrc = videoSrc;
+        els.videoFrame.hidden = false;
+        els.videoEmpty.hidden = false;
+        els.videoEmpty.textContent = "正在连接视频流。";
+      }
       function updateVideo(envelope) {
         const status = statusOf(envelope);
         const data = envelope.data || {};
@@ -1681,7 +1691,10 @@ def _render_debug_page(access_token: str) -> str:
           const frameKeyParts = data.stream_url ? [videoSrc] : [videoSrc, envelope.frame_id || data.frame_id || "", envelope.sequence || "", envelope.source_timestamp || ""];
           const frameKey = frameKeyParts.some(Boolean) ? frameKeyParts.join("|") : null;
           if (!frameKey || frameKey !== state.lastVideoFrameKey) {
-            els.videoFrame.src = videoSrc;
+            if (state.videoStreamSrc !== videoSrc) {
+              els.videoFrame.src = videoSrc;
+              state.videoStreamSrc = videoSrc;
+            }
             state.videoFrames += 1;
             if (frameKey) state.lastVideoFrameKey = frameKey;
           }
@@ -1838,6 +1851,7 @@ def _render_debug_page(access_token: str) -> str:
           els.logs.appendChild(line);
         }
       }
+      const DEFAULT_VIDEO_STREAM_URL = "/streams/video.mjpeg";
       const STREAM_TOPICS = [
         "robot.state",
         "map.frame",
@@ -2153,8 +2167,18 @@ def _render_debug_page(access_token: str) -> str:
         state.showDetections = Boolean(els.showDetections.checked);
         scheduleVideoDetectionDraw();
       });
-      els.videoFrame.addEventListener("load", scheduleVideoDetectionDraw);
+      els.videoFrame.addEventListener("load", () => {
+        els.videoFrame.hidden = false;
+        els.videoEmpty.hidden = true;
+        scheduleVideoDetectionDraw();
+      });
+      els.videoFrame.addEventListener("error", () => {
+        els.videoFrame.hidden = true;
+        els.videoEmpty.hidden = false;
+        els.videoEmpty.textContent = "视频流连接失败，请检查 /streams/video.mjpeg 或机器人图像 provider。";
+      });
       window.addEventListener("resize", scheduleVideoDetectionDraw);
+      startVideoStream();
       function setMapZoom(nextZoom) {
         state.mapZoom = Math.min(8, Math.max(0.25, nextZoom));
         requestMapDraw(false);

@@ -81,6 +81,39 @@ geometry_prepend_ld_library_path() {
   export LD_LIBRARY_PATH="${target}"
 }
 
+geometry_configure_cyclonedds_participant_limit() {
+  local max_auto_participant_index="${NUWAX_GEOMETRY_CYCLONEDDS_MAX_AUTO_PARTICIPANT_INDEX:-100}"
+
+  if [[ "${RMW_IMPLEMENTATION:-}" != "rmw_cyclonedds_cpp" && -z "${CYCLONEDDS_URI:-}" ]]; then
+    return 0
+  fi
+
+  if [[ -z "${CYCLONEDDS_URI:-}" ]]; then
+    export CYCLONEDDS_URI="<CycloneDDS><Domain><Discovery><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>${max_auto_participant_index}</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>"
+    return 0
+  fi
+
+  if [[ "${CYCLONEDDS_URI}" == *"MaxAutoParticipantIndex"* ]]; then
+    return 0
+  fi
+
+  if [[ "${CYCLONEDDS_URI}" == "<CycloneDDS"* && "${CYCLONEDDS_URI}" == *"</Discovery>"* ]]; then
+    local discovery_close="</Discovery>"
+    local discovery_with_limit="<ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>${max_auto_participant_index}</MaxAutoParticipantIndex></Discovery>"
+    export CYCLONEDDS_URI="${CYCLONEDDS_URI/$discovery_close/$discovery_with_limit}"
+    return 0
+  fi
+
+  if [[ "${CYCLONEDDS_URI}" == "<CycloneDDS"* && "${CYCLONEDDS_URI}" == *"</Domain>"* ]]; then
+    local domain_close="</Domain>"
+    local discovery_block="<Discovery><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>${max_auto_participant_index}</MaxAutoParticipantIndex></Discovery></Domain>"
+    export CYCLONEDDS_URI="${CYCLONEDDS_URI/$domain_close/$discovery_block}"
+    return 0
+  fi
+
+  printf 'Warning: CYCLONEDDS_URI is set but could not be patched automatically. Add MaxAutoParticipantIndex=%s to the CycloneDDS config if ROS2 nodes fail with participant index errors.\n' "${max_auto_participant_index}" >&2
+}
+
 if [[ "${NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV,,}" == "1" || "${NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV,,}" == "true" || "${NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV,,}" == "yes" || "${NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV,,}" == "on" ]]; then
   GEOMETRY_RUNTIME_ROS_SETUP="$(geometry_detect_ros_setup || true)"
   if [[ -n "${GEOMETRY_RUNTIME_ROS_SETUP}" ]]; then
@@ -96,6 +129,8 @@ GEOMETRY_RUNTIME_CYCLONEDDS_LIB_DIR="$(geometry_resolve_cyclonedds_lib_dir || tr
 if [[ -n "${GEOMETRY_RUNTIME_CYCLONEDDS_LIB_DIR}" ]]; then
   geometry_prepend_ld_library_path "${GEOMETRY_RUNTIME_CYCLONEDDS_LIB_DIR}"
 fi
+
+geometry_configure_cyclonedds_participant_limit
 
 unset GEOMETRY_RUNTIME_ROS_SETUP
 unset GEOMETRY_RUNTIME_CYCLONEDDS_LIB_DIR

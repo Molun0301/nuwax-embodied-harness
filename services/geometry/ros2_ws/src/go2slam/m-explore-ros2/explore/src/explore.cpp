@@ -70,6 +70,7 @@ Explore::Explore()
   this->declare_parameter<float>("gain_scale", 1.0);
   this->declare_parameter<float>("min_frontier_size", 0.5);
   this->declare_parameter<bool>("return_to_init", false);
+  this->declare_parameter<bool>("send_navigation_goals", true);
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -79,6 +80,7 @@ Explore::Explore()
   this->get_parameter("gain_scale", gain_scale_);
   this->get_parameter("min_frontier_size", min_frontier_size);
   this->get_parameter("return_to_init", return_to_init_);
+  this->get_parameter("send_navigation_goals", send_navigation_goals_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
 
   progress_timeout_ = timeout;
@@ -108,11 +110,13 @@ Explore::Explore()
       "explore/resume", 10,
       std::bind(&Explore::resumeCallback, this, std::placeholders::_1));
 
-  RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
-  move_base_client_->wait_for_action_server();
-  RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
+  if (send_navigation_goals_) {
+    RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
+    move_base_client_->wait_for_action_server();
+    RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
+  }
 
-  if (return_to_init_) {
+  if (return_to_init_ && send_navigation_goals_) {
     RCLCPP_INFO(logger_, "Getting initial pose of the robot");
     geometry_msgs::msg::TransformStamped transformStamped;
     std::string map_frame = costmap_client_.getGlobalFrameID();
@@ -251,6 +255,10 @@ void Explore::makePlan()
     visualizeFrontiers(frontiers);
   }
 
+  if (!send_navigation_goals_) {
+    return;
+  }
+
   // find non blacklisted frontier
   auto frontier =
       std::find_if_not(frontiers.begin(), frontiers.end(),
@@ -342,6 +350,9 @@ void Explore::returnToInitialPose()
           RCLCPP_INFO(logger_, "Successfully returned to initial pose.");
         }
       };
+  if (!send_navigation_goals_) {
+    return;
+  }
   move_base_client_->async_send_goal(goal, send_goal_options);
 }
 bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
@@ -415,10 +426,12 @@ void Explore::stop(bool finished_exploring)
     status_pub_->publish(status_msg);
   }
 
-  move_base_client_->async_cancel_all_goals();
+  if (send_navigation_goals_) {
+    move_base_client_->async_cancel_all_goals();
+  }
   exploring_timer_->cancel();
 
-  if (return_to_init_ && finished_exploring) {
+  if (return_to_init_ && send_navigation_goals_ && finished_exploring) {
     returnToInitialPose();
   }
 }

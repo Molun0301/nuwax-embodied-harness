@@ -142,6 +142,7 @@ private:
   double progress_timeout_;
   bool visualize_;
   bool return_to_init_;
+  bool send_navigation_goals_;
   std::string robot_base_frame_;
   bool resuming_ = false;
 };

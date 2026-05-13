@@ -2,6 +2,7 @@ explore_node:
   ros__parameters:
     robot_base_frame: base_footprint
     return_to_init: false
+    send_navigation_goals: false
     costmap_topic: /map
     costmap_updates_topic: /map_updates
     visualize: true

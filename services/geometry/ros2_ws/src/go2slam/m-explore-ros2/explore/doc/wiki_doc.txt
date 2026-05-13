@@ -77,6 +77,11 @@ param {
   4.type = bool
   4.desc = Specifies whether or not publish visualized frontiers.
 
+  5.name = ~send_navigation_goals
+  5.default = `true`
+  5.type = bool
+  5.desc = Specifies whether frontier targets are sent to Nav2. Set false for read-only frontier visualization.
+
   6.name = ~planner_frequency
   6.default = `1.0`
   6.type = double

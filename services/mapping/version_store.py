@@ -5,6 +5,7 @@ from urllib.parse import quote
 
 from contracts.map_workspace import MapVersion
 from contracts.runtime_views import MapSnapshot
+from services.mapping.catalog import _to_safe_dir_segment
 from typing import Dict, Optional, Tuple
 
 
@@ -92,8 +93,23 @@ class MapVersionRepository:
         return None
 
     def _version_path(self, map_name: str, version_id: str) -> Path:
-        return self._versions_root(map_name) / quote(str(version_id or "").strip(), safe="") / "version.json"
+        versions_root = self._versions_root(map_name)
+        safe_version = _to_safe_dir_segment(version_id)
+        primary = versions_root / safe_version / "version.json"
+        if not primary.exists():
+            # 兼容旧版本写出的 URL 编码 version_id 目录（含特殊字符时才有差异）。
+            legacy = versions_root / quote(str(version_id or "").strip(), safe="") / "version.json"
+            if legacy.exists():
+                return legacy
+        return primary
 
     def _versions_root(self, map_name: str) -> Path:
-        safe_map_name = quote(str(map_name or "").strip(), safe="")
-        return self._root_dir / safe_map_name / "versions"
+        safe_map_name = _to_safe_dir_segment(map_name)
+        primary = self._root_dir / safe_map_name / "versions"
+        # 同 catalog.py 中 _map_dir 的兼容策略：旧目录走 URL 编码名时不破坏读取。
+        if not primary.exists():
+            legacy_root = self._root_dir / quote(str(map_name or "").strip(), safe="")
+            legacy_versions = legacy_root / "versions"
+            if legacy_versions.exists():
+                return legacy_versions
+        return primary

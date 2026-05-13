@@ -150,8 +150,12 @@ class MapWorkspaceService:
         self._repository.set_active_map_name(resolved_name)
         self._save_asset(synced_asset)
         if load_latest_version and synced_asset.latest_version_id:
+            # activate_map / restore_active_workspace 路径：仅恢复活跃地图工作区，
+            # 不强制底层后端做"历史 DB 切换"。实时栈下 /map 由 RTAB-Map 实时推送，
+            # 平台只把上次的快照作为种子重新 ingest。
             self._load_map_version_into_runtime(
-                self._require_map_version(resolved_name, synced_asset.latest_version_id)
+                self._require_map_version(resolved_name, synced_asset.latest_version_id),
+                require_backend_switch=False,
             )
         self._ensure_active_localization_session_binding(
             metadata={
@@ -360,7 +364,9 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             )
         self._localization_service.clear_latest_snapshot()
-        self._load_map_version_into_runtime(version)
+        # load_map_version 是 MCP 用户显式选择切到一个历史版本，
+        # 要求后端真正切换可定位状态；external_slam_nav2 暂未支持时应拒绝伪装成功。
+        self._load_map_version_into_runtime(version, require_backend_switch=True)
         self._ensure_active_localization_session_binding(
             metadata={
                 **dict(metadata or {}),
@@ -422,7 +428,11 @@ class MapWorkspaceService:
             else None
         )
         if expected_version_id:
-            self._load_map_version_into_runtime(self._require_map_version(resolved_name, expected_version_id))
+            # relocalize 必须确认后端真正可定位到该版本，否则不能伪装成功。
+            self._load_map_version_into_runtime(
+                self._require_map_version(resolved_name, expected_version_id),
+                require_backend_switch=True,
+            )
         latest_map_snapshot = self._mapping_service.get_latest_snapshot()
         if latest_map_snapshot is None:
             raise GatewayError(
@@ -705,7 +715,12 @@ class MapWorkspaceService:
             "pcd": latest_map_snapshot.metadata.get("pcd"),
         }
 
-    def _load_map_version_into_runtime(self, version: MapVersion) -> None:
+    def _load_map_version_into_runtime(
+        self,
+        version: MapVersion,
+        *,
+        require_backend_switch: bool,
+    ) -> None:
         prepared_version = version
         if prepared_version.geometry_asset is None:
             prepared_version = self._version_repository.save_existing_map_version(
@@ -713,9 +728,12 @@ class MapWorkspaceService:
             )
         runtime_snapshot = self._geometry_runtime.activate_map_version(prepared_version)
         runtime_metadata = dict(runtime_snapshot.metadata or {})
+        # require_backend_switch=True 表示调用方显式要求切换底层 SLAM/Nav2 后端状态；
+        # 否则只是恢复/激活活跃工作区，允许种子图 ingest 但不要求后端"真正切换可定位"。
         self._ensure_backend_version_switch_applied(
             prepared_version=prepared_version,
             runtime_metadata=runtime_metadata,
+            require_backend_switch=require_backend_switch,
         )
         live_streaming_snapshot = bool(
             runtime_metadata.get("map_snapshot_kind") == "live_streaming"
@@ -770,10 +788,17 @@ class MapWorkspaceService:
         *,
         prepared_version: MapVersion,
         runtime_metadata: Dict[str, object],
+        require_backend_switch: bool,
     ) -> None:
         activation = runtime_metadata.get("geometry_activation")
         activation_result = activation if isinstance(activation, dict) else {}
         if activation_result.get("backend_switch_applied") is True:
+            return
+        # require_backend_switch=False 时（恢复活跃工作区 / activate_map 默认路径），
+        # external_slam_nav2 实时栈不需要"切换底层 DB"——实时 /map 由 RTAB-Map 持续推送，
+        # 平台只需要把上次的种子图重新 ingest 给实时栈。这里允许放行，但不污染状态：
+        # 不清 active_map_version，让后续 ingest 与 frontier/costmap 链路正常继续。
+        if not require_backend_switch:
             return
         quality_metrics = runtime_metadata.get("quality_metrics")
         metrics = quality_metrics if isinstance(quality_metrics, dict) else {}

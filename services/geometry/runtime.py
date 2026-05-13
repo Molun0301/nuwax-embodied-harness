@@ -486,12 +486,16 @@ class PlatformGeometryRuntime:
         return ["bash", str(self._geometry_script("launch_ros2_stack.sh"))]
 
     def _build_odom_tf_bridge_command(self) -> List[str]:
+        # 平台内部 odom 源由 odometry_publisher 写入固定 frame，使用「锁定值」语义；
+        # 外部 SLAM/Nav2 切换命名时由配置驱动，不靠 bridge 静默兜底。
         return self._build_launch_prefix() + [
             "python3",
             str(self._geometry_script("odom_tf_bridge.py")),
             "--odom-topic",
             str(self.config.topics.odom_topic),
             "--odom-frame",
+            str(self.config.frames.odom_frame),
+            "--default-odom-frame",
             str(self.config.frames.odom_frame),
             "--default-child-frame",
             str(self.config.frames.base_frame),

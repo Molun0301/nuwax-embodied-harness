@@ -216,7 +216,12 @@ global_costmap:
       height: 12
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      # 外部 SLAM（RTAB-Map）路线下，global_costmap 走 rolling_window 12×12 滚动窗口。
+      # 一旦同时挂 static_layer，nav2_costmap_2d 收到 OccupancyGrid 会 matchSize()
+      # 重 resize 整张 costmap 到地图原始尺寸，rolling_window 的 width/height 失效，
+      # 表现为机器人/雷达 origin 一离开 SLAM 初始小窗口就持续 out-of-bounds 并阻塞 frontier
+      # 搜索。这里仅保留 obstacle_layer + inflation_layer，避障与膨胀完全足够。
+      plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -231,9 +236,6 @@ global_costmap:
           raytrace_min_range: 0.2
           obstacle_max_range: 2.5
           obstacle_min_range: 0.2
-      static_layer:
-        plugin: "nav2_costmap_2d::StaticLayer"
-        map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0

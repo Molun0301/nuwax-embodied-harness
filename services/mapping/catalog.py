@@ -1,12 +1,46 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from pathlib import Path
 import shutil
 from urllib.parse import quote
 
 from contracts.map_workspace import MapAsset
 from typing import List, Optional
+
+
+# 文件系统中不允许出现的字符（POSIX/常见 FS 取交集，再补常规危险符号），
+# 用单字符 `_` 替换；保留中文/Unicode 字母数字，避免 URL 编码导致的 sqlite 路径
+# 不可达问题（参见 docs/开发文档/ROS全链路修复-2026-05-13/worker2-rtabmap/feadback.md）。
+_FORBIDDEN_DIR_CHARS = set('/\\\x00:*?"<>|')
+
+
+def _to_safe_dir_segment(raw_name: str) -> str:
+    """把任意 map_name / version_id 规整成单层目录名。
+
+    规则：
+    - strip + NFC 归一化，避免 macOS NFD 与 Linux NFC 不一致；
+    - 控制字符与文件系统保留符号 → `_`；
+    - 不做 URL/percent 编码，保留中文等 Unicode 字母数字，让 rtabmap、SQLite
+      在该路径上直接 open 而不会因为 `%XX` 解释歧义打不开数据库。
+    - 整段去重连续 `_`，避免污染显示。
+    """
+
+    candidate = unicodedata.normalize("NFC", str(raw_name or "").strip())
+    if not candidate:
+        # 空字符串永远不允许落到文件系统：返回单字符占位避免 mkdir/sqlite 异常。
+        return "_"
+    chars: List[str] = []
+    for ch in candidate:
+        if ch in _FORBIDDEN_DIR_CHARS or unicodedata.category(ch).startswith("C"):
+            chars.append("_")
+        else:
+            chars.append(ch)
+    normalized = "".join(chars)
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized.strip("_") or "_"
 
 
 class MapCatalogRepository:
@@ -87,5 +121,14 @@ class MapCatalogRepository:
         return self._map_dir(map_name) / "metadata.json"
 
     def _map_dir(self, map_name: str) -> Path:
-        safe_name = quote(str(map_name or "").strip(), safe="")
-        return self._root_dir / safe_name
+        safe_name = _to_safe_dir_segment(map_name)
+        primary = self._root_dir / safe_name
+        # 向后兼容：旧版本曾用 urllib.parse.quote(map_name, safe="") 写出 URL
+        # 编码目录（如 `%E5%8A%9E%E5%85%AC%E5%AE%A4`），sqlite 在带百分号路径上
+        # 反复 FATAL `unable to open database file`。这里：当原名目录不存在但
+        # 编码目录存在时，沿用旧目录路径以读老资产；新写入永远走原名分支。
+        if not primary.exists():
+            legacy = self._root_dir / quote(str(map_name or "").strip(), safe="")
+            if legacy.exists():
+                return legacy
+        return primary

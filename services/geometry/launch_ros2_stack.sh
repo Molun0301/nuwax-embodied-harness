@@ -57,6 +57,7 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
 fi
 
 export NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV=true
+export NUWAX_GEOMETRY_RUNTIME_FORCE_CYCLONEDDS=true
 source_without_nounset "${SCRIPT_DIR}/source_runtime_env.sh"
 
 cd "${REPO_ROOT}"

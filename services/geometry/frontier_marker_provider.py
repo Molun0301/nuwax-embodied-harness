@@ -314,24 +314,15 @@ class Ros2FrontierMarkerProvider:
             node = rclpy.create_node("nuwax_frontier_marker_provider")
             executor = SingleThreadedExecutor()
             executor.add_node(node)
-            qos_profiles = (
-                QoSProfile(
-                    history=HistoryPolicy.KEEP_LAST,
-                    depth=1,
-                    reliability=ReliabilityPolicy.RELIABLE,
-                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                ),
-                QoSProfile(
-                    history=HistoryPolicy.KEEP_LAST,
-                    depth=5,
-                    reliability=ReliabilityPolicy.BEST_EFFORT,
-                    durability=DurabilityPolicy.VOLATILE,
-                ),
+            qos_profile = QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
             )
-            for qos_profile in qos_profiles:
-                self._subscriptions.append(
-                    node.create_subscription(MarkerArray, self.topic, self._on_marker_array, qos_profile)
-                )
+            self._subscriptions.append(
+                node.create_subscription(MarkerArray, self.topic, self._on_marker_array, qos_profile)
+            )
             self._rclpy = rclpy
             self._node = node
             self._executor = executor

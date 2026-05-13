@@ -1,7 +1,7 @@
 explore_node:
   ros__parameters:
-    robot_base_frame: base_link
-    send_navigation_goals: true
+    robot_base_frame: base_footprint
+    send_navigation_goals: false
     costmap_topic: /global_costmap/costmap
     costmap_updates_topic: /global_costmap/costmap_updates
     visualize: true

@@ -4,6 +4,7 @@ set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAP_DIR="${ROOT_DIR}/maps"
+GEOMETRY_RUNTIME_ENV_SCRIPT="$ROOT_DIR/../../../source_runtime_env.sh"
 
 detect_ros_setup() {
   local candidates=()
@@ -41,6 +42,9 @@ if [[ ! -f "${ROOT_DIR}/install/setup.bash" ]]; then
 fi
 source "${ROS_SETUP}"
 source "${ROOT_DIR}/install/setup.bash"
+export NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV=false
+export NUWAX_GEOMETRY_RUNTIME_FORCE_CYCLONEDDS=true
+source "${GEOMETRY_RUNTIME_ENV_SCRIPT}"
 
 mkdir -p "${MAP_DIR}"
 

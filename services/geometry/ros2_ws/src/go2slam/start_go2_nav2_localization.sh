@@ -8,6 +8,7 @@ set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS_SETUP="$ROOT_DIR/install/setup.bash"
+GEOMETRY_RUNTIME_ENV_SCRIPT="$ROOT_DIR/../../../source_runtime_env.sh"
 LAUNCH_PID=""
 
 detect_ros_setup() {
@@ -83,33 +84,6 @@ assert_workspace_current() {
   fi
 }
 
-configure_cyclonedds_participant_limit() {
-  local max_auto_participant_index=100
-
-  if [[ "${RMW_IMPLEMENTATION:-}" != "rmw_cyclonedds_cpp" && -z "${CYCLONEDDS_URI:-}" ]]; then
-    return
-  fi
-
-  if [[ -z "${CYCLONEDDS_URI:-}" ]]; then
-    export CYCLONEDDS_URI="<CycloneDDS><Domain><Discovery><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>${max_auto_participant_index}</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>"
-    return
-  fi
-
-  if [[ "${CYCLONEDDS_URI}" == *"MaxAutoParticipantIndex"* ]]; then
-    return
-  fi
-
-  if [[ "${CYCLONEDDS_URI}" == "<CycloneDDS"* && "${CYCLONEDDS_URI}" == *"</Discovery>"* ]]; then
-    local discovery_close="</Discovery>"
-    local discovery_with_limit="<ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>${max_auto_participant_index}</MaxAutoParticipantIndex></Discovery>"
-    export CYCLONEDDS_URI="${CYCLONEDDS_URI/$discovery_close/$discovery_with_limit}"
-    echo "Configured CycloneDDS MaxAutoParticipantIndex=${max_auto_participant_index}"
-    return
-  fi
-
-  echo "Warning: CYCLONEDDS_URI is set but could not be patched automatically. If nodes fail with participant index errors, add MaxAutoParticipantIndex=${max_auto_participant_index} to the CycloneDDS config." >&2
-}
-
 if [[ -z "${ROS_SETUP}" || ! -f "${ROS_SETUP}" ]]; then
   echo "Missing ROS setup. Set NUWAX_ROS_SETUP_SCRIPT or install ROS2 Jazzy/Humble/Iron/Foxy." >&2
   exit 1
@@ -158,7 +132,9 @@ fi
 
 source "${ROS_SETUP}"
 source "${WS_SETUP}"
-configure_cyclonedds_participant_limit
+export NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV=false
+export NUWAX_GEOMETRY_RUNTIME_FORCE_CYCLONEDDS=true
+source "${GEOMETRY_RUNTIME_ENV_SCRIPT}"
 
 set -u
 

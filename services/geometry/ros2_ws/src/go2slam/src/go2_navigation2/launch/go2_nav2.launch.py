@@ -85,13 +85,17 @@ def generate_launch_description():
     use_waypoint_follower = LaunchConfiguration("use_waypoint_follower")
     use_explore = LaunchConfiguration("use_explore")
     explore_params_file = LaunchConfiguration("explore_params_file")
+    slam_params_file = LaunchConfiguration("slam_params_file")
 
     slam_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(go2_slam_pkg, "launch", "go2_slamtoolbox.launch.py")
         ),
         condition=IfCondition(PythonExpression(["'", localization_mode, "' == 'slam'"])),
-        launch_arguments={"use_sim_time": use_sim_time}.items(),
+        launch_arguments={
+            "use_sim_time": use_sim_time,
+            "slam_params_file": slam_params_file,
+        }.items(),
     )
 
     localization_nodes = GroupAction(
@@ -313,6 +317,10 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("use_sim_time", default_value="false"),
             DeclareLaunchArgument("params_file", default_value=os.path.join(nav2_pkg, "config", "nav2_params.yaml")),
+            DeclareLaunchArgument(
+                "slam_params_file",
+                default_value=os.path.join(go2_slam_pkg, "config", "mapper_params_online_async.yaml"),
+            ),
             DeclareLaunchArgument("map", default_value=default_map_yaml),
             DeclareLaunchArgument("localization", default_value="amcl"),
             DeclareLaunchArgument("autostart", default_value="true"),

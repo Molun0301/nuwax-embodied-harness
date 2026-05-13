@@ -1452,7 +1452,7 @@ class PlatformGeometryRuntime:
                 "traversability_layer": self.config.rtabmap.outputs.traversability_layer,
                 "localization_status_contract": self.config.rtabmap.outputs.localization_status,
                 "relocalization_diagnostics_contract": self.config.rtabmap.outputs.relocalization_diagnostics,
-                "source_mode": "live_streaming_checkpoint" if quality_metrics.get("live_streaming_ready") else "offline_checkpoint",
+                "source_mode": quality_metrics.get("source_mode"),
                 "streaming_readiness": self._clone_metadata(quality_metrics.get("streaming_readiness")),
                 "rtabmap_run": rtabmap_run,
                 "session_id": rtabmap_run.get("session_id"),
@@ -1953,7 +1953,8 @@ class PlatformGeometryRuntime:
     ) -> Dict[str, object]:
         diagnostics = []
         database_present = bool(database_metadata.get("database_present", False))
-        database_required = not self._uses_external_geometry_stack()
+        external_stack = self._uses_external_geometry_stack()
+        database_required = not external_stack
         pcd_present = bool(pcd_metadata.get("pcd_present", False))
         readiness = self._build_rtabmap_readiness()
         live_source = database_metadata.get("database_source_kind") == "live_runtime"
@@ -1979,9 +1980,9 @@ class PlatformGeometryRuntime:
         if not database_present and not database_required:
             diagnostics.append(
                 {
-                    "level": "info",
+                    "level": "warning",
                     "code": "external_geometry_state_not_materialized",
-                    "message": "未找到 external_slam_nav2 状态数据库；该诊断资产为可选资产，不阻断地图版本保存或定位会话。",
+                    "message": "未找到 external_slam_nav2 状态数据库；该版本只包含平台快照，不能宣称底层后端 checkpoint ready，也不能用于复现定位/导航。",
                 }
             )
         if database_present and not live_streaming_ready:
@@ -2008,11 +2009,15 @@ class PlatformGeometryRuntime:
                     "message": "未能从 RTAB-Map 进程状态解析真实 run_id。",
                 }
             )
+        backend_checkpoint_ready = database_present
         return {
-            "status": "ready" if database_present or not database_required else "failed",
+            "status": "ready" if backend_checkpoint_ready else "snapshot_only" if external_stack else "failed",
             "live_streaming_ready": live_streaming_ready,
-            "checkpoint_ready": database_present,
-            "source_mode": "live_streaming_checkpoint" if live_streaming_ready else "offline_checkpoint",
+            "checkpoint_ready": backend_checkpoint_ready,
+            "backend_checkpoint_ready": backend_checkpoint_ready,
+            "platform_snapshot_only": bool(external_stack and not backend_checkpoint_ready),
+            "backend_switch_supported": False if external_stack else True,
+            "source_mode": "live_streaming_checkpoint" if live_streaming_ready else "platform_snapshot_only" if external_stack and not backend_checkpoint_ready else "offline_checkpoint",
             "streaming_readiness": readiness,
             "rtabmap_run": rtabmap_run,
             "database": {

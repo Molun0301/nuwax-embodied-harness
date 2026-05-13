@@ -91,6 +91,7 @@ _RUNTIME_METADATA_LOG_KEYS = (
 
 _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 2.0
 _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
+_DEFAULT_ASYNC_TASK_TIMEOUT_SEC = 15 * 60
 _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
     {
         "navigate_to_pose",
@@ -1817,7 +1818,7 @@ class GatewayRuntime:
                 ),
                 output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
                 required_resources=(RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value),
-                timeout_sec=180,
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
             ),
             _descriptor(
@@ -1840,7 +1841,7 @@ class GatewayRuntime:
                 ),
                 output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
                 required_resources=(RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value),
-                timeout_sec=240,
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
             ),
             _descriptor(
@@ -1866,7 +1867,7 @@ class GatewayRuntime:
                     RuntimeResource.NAVIGATION.value,
                     RuntimeResource.CAMERA_OBSERVATION.value,
                 ),
-                timeout_sec=300,
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
             ),
             _descriptor(
@@ -1897,7 +1898,7 @@ class GatewayRuntime:
                     RuntimeResource.NAVIGATION.value,
                     RuntimeResource.CAMERA_OBSERVATION.value,
                 ),
-                timeout_sec=300,
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
             ),
             _descriptor(
@@ -1932,7 +1933,7 @@ class GatewayRuntime:
                     RuntimeResource.NAVIGATION.value,
                     RuntimeResource.CAMERA_OBSERVATION.value,
                 ),
-                timeout_sec=600,
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
             ),
             _descriptor(
@@ -1954,7 +1955,7 @@ class GatewayRuntime:
                 ),
                 output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
                 required_resources=(RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value),
-                timeout_sec=120,
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
             ),
             _descriptor(
@@ -1977,7 +1978,7 @@ class GatewayRuntime:
                 ),
                 output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
                 required_resources=(RuntimeResource.BASE_MOTION.value, RuntimeResource.CAMERA_OBSERVATION.value),
-                timeout_sec=60,
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
             ),
             _descriptor(
@@ -1999,7 +2000,7 @@ class GatewayRuntime:
                 ),
                 output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
                 required_resources=(RuntimeResource.BASE_MOTION.value,),
-                timeout_sec=30,
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
             ),
             _descriptor(

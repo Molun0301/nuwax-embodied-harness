@@ -713,6 +713,10 @@ class MapWorkspaceService:
             )
         runtime_snapshot = self._geometry_runtime.activate_map_version(prepared_version)
         runtime_metadata = dict(runtime_snapshot.metadata or {})
+        self._ensure_backend_version_switch_applied(
+            prepared_version=prepared_version,
+            runtime_metadata=runtime_metadata,
+        )
         live_streaming_snapshot = bool(
             runtime_metadata.get("map_snapshot_kind") == "live_streaming"
             or runtime_metadata.get("source_kind") == "platform_live_map_provider"
@@ -760,6 +764,43 @@ class MapWorkspaceService:
         else:
             self._mapping_service.ingest_external_snapshot(**ingest_kwargs)
         self._localization_service.clear_latest_snapshot()
+
+    def _ensure_backend_version_switch_applied(
+        self,
+        *,
+        prepared_version: MapVersion,
+        runtime_metadata: Dict[str, object],
+    ) -> None:
+        activation = runtime_metadata.get("geometry_activation")
+        activation_result = activation if isinstance(activation, dict) else {}
+        if activation_result.get("backend_switch_applied") is True:
+            return
+        quality_metrics = runtime_metadata.get("quality_metrics")
+        metrics = quality_metrics if isinstance(quality_metrics, dict) else {}
+        database = metrics.get("database")
+        database_metrics = database if isinstance(database, dict) else {}
+        self._geometry_runtime.clear_active_map_version(reason="backend_switch_not_applied")
+        raise GatewayError(
+            "平台地图版本 %s 只恢复了平台快照，当前 external_slam_nav2 后端不支持把该版本加载到底层 SLAM/Nav2 状态，拒绝伪装成已切换可定位。" % prepared_version.version_id,
+            error_code="map_version_backend_switch_unavailable",
+            http_status=409,
+            jsonrpc_code=-32000,
+            details={
+                "map_name": prepared_version.map_name,
+                "version_id": prepared_version.version_id,
+                "backend_switch_applied": False,
+                "reason": activation_result.get("reason") or "backend_switch_not_applied",
+                "geometry_stack": runtime_metadata.get("geometry_stack"),
+                "map_snapshot_kind": runtime_metadata.get("map_snapshot_kind"),
+                "source_kind": runtime_metadata.get("source_kind"),
+                "checkpoint_ready": metrics.get("checkpoint_ready") or runtime_metadata.get("checkpoint_ready"),
+                "backend_checkpoint_ready": metrics.get("backend_checkpoint_ready"),
+                "platform_snapshot_only": metrics.get("platform_snapshot_only"),
+                "database_present": database_metrics.get("present"),
+                "rtabmap_db_path": runtime_metadata.get("rtabmap_db_path"),
+                "geometry_activation": activation_result,
+            },
+        )
 
     def _snapshot_matches_map_version(self, snapshot, expected_version_id: Optional[str]) -> bool:
         if not expected_version_id:

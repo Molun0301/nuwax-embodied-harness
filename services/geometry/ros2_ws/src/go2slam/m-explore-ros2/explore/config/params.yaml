@@ -1,10 +1,10 @@
 /**:
   ros__parameters:
-    robot_base_frame: base_link
-    return_to_init: true
-    send_navigation_goals: true
-    costmap_topic: map
-    costmap_updates_topic: map_updates
+    robot_base_frame: base_footprint
+    return_to_init: false
+    send_navigation_goals: false
+    costmap_topic: /global_costmap/costmap
+    costmap_updates_topic: /global_costmap/costmap_updates
     visualize: true
     planner_frequency: 0.15
     progress_timeout: 30.0

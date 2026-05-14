@@ -453,6 +453,7 @@ class LocalizationService:
             return
         try:
             from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+            from rclpy.duration import Duration
             from geometry_msgs.msg import PoseWithCovarianceStamped
             from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
 
@@ -468,6 +469,13 @@ class LocalizationService:
                 msg = PoseWithCovarianceStamped()
                 # AMCL 期望 frame=map
                 msg.header.frame_id = "map"
+                # 关键：必须显式设 header.stamp，否则默认 (sec=0, nanosec=0) 会让 AMCL Foxy
+                # 在 lookupTransform(base_footprint, odom) 时报 "Failed to transform initial pose
+                # in time"，并触发 setPose 在 TF 异常后强写 PF 状态的已知 SIGSEGV bug
+                # （exit code -11），导致 amcl 死亡、map→odom TF 不再发布、整条 nav2 链路废掉。
+                # 用 now() - 0.5s 避开 extrapolation_into_future（确保 stamp 落在 TF buffer
+                # 的已知区间内）。
+                msg.header.stamp = (node.get_clock().now() - Duration(seconds=0.5)).to_msg()
                 msg.pose.pose.position.x = float(hint_pose.position.x)
                 msg.pose.pose.position.y = float(hint_pose.position.y)
                 msg.pose.pose.position.z = float(hint_pose.position.z)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+import logging
 import math
 from typing import List, Optional, Sequence, Tuple, TYPE_CHECKING
 
@@ -15,6 +16,8 @@ if TYPE_CHECKING:
     from services.navigation.config import ExplorationConfig
     from services.navigation.runtime import GridNavigationPlanner
 
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.navigation.frontier")
 
 Cell2D = Tuple[int, int]
 
@@ -179,6 +182,23 @@ class FrontierExplorer:
         revisit_separation_m = float(self.config.frontier_revisit_separation_m)
         current_yaw = _yaw_from_pose(current_pose)
         max_radius_m = None if radius_m is None else max(0.1, float(radius_m))
+        LOGGER.info(
+            "frontier 候选生成开始 current=(%.3f, %.3f, %.3f) frame=%s map_frame=%s grid=%sx%s resolution=%.3f origin=(%.3f, %.3f) costmap_frame=%s clusters=%d radius_m=%s attempted=%d",
+            float(current_pose.position.x),
+            float(current_pose.position.y),
+            float(current_pose.position.z),
+            current_pose.frame_id,
+            occupancy_grid.frame_id,
+            int(occupancy_grid.width),
+            int(occupancy_grid.height),
+            float(occupancy_grid.resolution_m),
+            float(occupancy_grid.origin.position.x),
+            float(occupancy_grid.origin.position.y),
+            getattr(cost_map, "frame_id", None) if cost_map is not None else None,
+            len(clusters),
+            None if radius_m is None else float(radius_m),
+            len(attempted_poses),
+        )
         for cluster in clusters:
             if len(cluster) < int(self.config.frontier_min_cluster_cells):
                 continue
@@ -217,6 +237,18 @@ class FrontierExplorer:
                 origin_x=float(occupancy_grid.origin.position.x),
                 origin_y=float(occupancy_grid.origin.position.y),
                 resolution=float(occupancy_grid.resolution_m),
+            )
+            LOGGER.debug(
+                "frontier 候选坐标生成 cell=(%d,%d) world=(%.3f, %.3f, %.3f) centroid=(%.3f, %.3f) frame=%s cluster_size=%d",
+                int(best_cell[0]),
+                int(best_cell[1]),
+                float(goal_x),
+                float(goal_y),
+                float(center_pose.position.z),
+                float(centroid_x),
+                float(centroid_y),
+                current_pose.frame_id,
+                len(cluster),
             )
             if any(
                 math.hypot(goal_x - attempted.position.x, goal_y - attempted.position.y) < revisit_separation_m
@@ -263,6 +295,18 @@ class FrontierExplorer:
                     average_cost=average_cost,
                 )
             )
+            LOGGER.debug(
+                "frontier 候选坐标可达 goal=(%.3f, %.3f, %.3f) yaw=%.3f frame=%s score=%.3f distance_m=%.3f average_cost=%.3f info_gain=%d",
+                float(goal_pose.position.x),
+                float(goal_pose.position.y),
+                float(goal_pose.position.z),
+                float(yaw_rad),
+                goal_pose.frame_id,
+                float(score),
+                float(plan.total_distance_m),
+                float(average_cost),
+                int(info_gain_cells),
+            )
 
         candidates.sort(
             key=lambda item: (
@@ -271,6 +315,21 @@ class FrontierExplorer:
                 float(item.path_distance_m),
             )
         )
+        if candidates:
+            best = candidates[0]
+            LOGGER.info(
+                "frontier 候选生成完成 count=%d best=(%.3f, %.3f, %.3f) frame=%s score=%.3f distance_m=%.3f info_gain=%d",
+                len(candidates),
+                float(best.pose.position.x),
+                float(best.pose.position.y),
+                float(best.pose.position.z),
+                best.pose.frame_id,
+                float(best.score),
+                float(best.path_distance_m),
+                int(best.info_gain_cells),
+            )
+        else:
+            LOGGER.info("frontier 候选生成完成 count=0")
         return candidates
 
     def _same_grid_layout(self, occupancy_grid: OccupancyGrid, cost_map: Optional[CostMap]) -> bool:

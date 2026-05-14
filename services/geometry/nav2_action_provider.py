@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -22,6 +23,8 @@ _NAV2_LIFECYCLE_NODES = (
 _COSTMAP_FRESH_SEC = 5.0
 _LIFECYCLE_CACHE_SEC = 1.0
 _LIFECYCLE_GET_STATE_TIMEOUT_SEC = 0.75
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.nav2_action_provider")
 
 
 @dataclass
@@ -121,16 +124,45 @@ class Nav2ActionNavigationProvider:
         return self._readiness().ready
 
     def set_goal(self, goal: NavigationGoal) -> bool:
+        if goal.target_pose is not None:
+            LOGGER.info(
+                "Nav2 provider 接收导航目标 goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s map_name=%s target_name=%s metadata=%s",
+                goal.goal_id,
+                float(goal.target_pose.position.x),
+                float(goal.target_pose.position.y),
+                float(goal.target_pose.position.z),
+                goal.target_pose.frame_id,
+                goal.map_name,
+                goal.target_name,
+                dict(goal.metadata),
+            )
+        else:
+            LOGGER.info(
+                "Nav2 provider 接收导航目标 goal_id=%s target_pose=None map_name=%s target_name=%s metadata=%s",
+                goal.goal_id,
+                goal.map_name,
+                goal.target_name,
+                dict(goal.metadata),
+            )
+        target_pose_metadata = goal.target_pose.model_dump(mode="json") if goal.target_pose is not None else None
         readiness = self._readiness()
         if not readiness.ready:
+            LOGGER.info(
+                "Nav2 provider 拒绝目标：not_ready goal_id=%s waiting_for=%s message=%s target=%s",
+                goal.goal_id,
+                readiness.waiting_for,
+                readiness.message,
+                target_pose_metadata,
+            )
             self._set_blocked_state(goal.goal_id, readiness)
             return False
         if goal.target_pose is None:
+            LOGGER.info("Nav2 provider 拒绝目标：target_pose_missing goal_id=%s", goal.goal_id)
             self._state = NavigationState(
                 current_goal_id=goal.goal_id,
                 status=NavigationStatus.FAILED,
                 message="Nav2 /navigate_to_pose 需要显式 target_pose，命名目标必须先解析。",
-                metadata={"backend": "nav2", "failure_reason": "target_pose_missing", "readiness": self._status_dict(readiness)},
+                metadata={"backend": "nav2", "failure_reason": "target_pose_missing", "readiness": self._status_dict(readiness), "target_pose": target_pose_metadata},
             )
             return False
         goal_sequence = None
@@ -155,10 +187,21 @@ class Nav2ActionNavigationProvider:
                         "goal_sequence": goal_sequence,
                     },
                 )
+            LOGGER.info(
+                "Nav2 action 发送 NavigateToPose goal_id=%s goal_sequence=%s target=(%.3f, %.3f, %.3f) frame=%s action=%s",
+                goal.goal_id,
+                goal_sequence,
+                float(goal_msg.pose.pose.position.x),
+                float(goal_msg.pose.pose.position.y),
+                float(goal_msg.pose.pose.position.z),
+                goal_msg.pose.header.frame_id,
+                self.runtime.config.nav2.action_name,
+            )
             future = self._action_client.send_goal_async(goal_msg, feedback_callback=lambda feedback: self._on_feedback(feedback, goal.goal_id, goal_sequence))
             future.add_done_callback(lambda completed: self._on_goal_response(completed, goal.goal_id, goal_sequence))
         except Exception as exc:
-            metadata = {"backend": "nav2", "failure_reason": "action_send_failed", "error": str(exc)}
+            LOGGER.info("Nav2 action 发送目标异常 goal_id=%s target=%s error=%s", goal.goal_id, target_pose_metadata, exc)
+            metadata = {"backend": "nav2", "failure_reason": "action_send_failed", "error": str(exc), "target_pose": target_pose_metadata}
             if goal_sequence is not None:
                 metadata["goal_sequence"] = goal_sequence
             with self._lock:
@@ -433,6 +476,17 @@ class Nav2ActionNavigationProvider:
         goal_msg.pose.pose.orientation.y = float(target_pose.orientation.y)
         goal_msg.pose.pose.orientation.z = float(target_pose.orientation.z)
         goal_msg.pose.pose.orientation.w = float(target_pose.orientation.w)
+        LOGGER.info(
+            "Nav2 NavigateToPose goal 构造 target=(%.3f, %.3f, %.3f) frame=%s orientation=(%.4f, %.4f, %.4f, %.4f)",
+            float(goal_msg.pose.pose.position.x),
+            float(goal_msg.pose.pose.position.y),
+            float(goal_msg.pose.pose.position.z),
+            goal_msg.pose.header.frame_id,
+            float(goal_msg.pose.pose.orientation.x),
+            float(goal_msg.pose.pose.orientation.y),
+            float(goal_msg.pose.pose.orientation.z),
+            float(goal_msg.pose.pose.orientation.w),
+        )
         return goal_msg
 
     def _on_goal_response(self, future: Any, goal_id: str, goal_sequence: int) -> None:
@@ -454,11 +508,25 @@ class Nav2ActionNavigationProvider:
                     pass
             return
         with self._lock:
+            state_metadata = dict(self._state.metadata)
+            target_pose = state_metadata.get("target_pose") if isinstance(state_metadata.get("target_pose"), dict) else {}
             if not getattr(goal_handle, "accepted", False):
-                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action server 拒绝导航目标。", metadata={"backend": "nav2", "failure_reason": "goal_rejected", "goal_sequence": goal_sequence})
+                LOGGER.info(
+                    "Nav2 action server 拒绝目标 goal_id=%s goal_sequence=%s target=%s",
+                    goal_id,
+                    goal_sequence,
+                    target_pose,
+                )
+                self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action server 拒绝导航目标。", metadata={"backend": "nav2", "failure_reason": "goal_rejected", "goal_sequence": goal_sequence, "target_pose": target_pose})
                 return
+            LOGGER.info(
+                "Nav2 action server 接受目标 goal_id=%s goal_sequence=%s target=%s",
+                goal_id,
+                goal_sequence,
+                target_pose,
+            )
             self._goal_handle = goal_handle
-            self._state = self._state.model_copy(update={"status": NavigationStatus.RUNNING, "message": "Nav2 action 已接受目标并开始执行。", "metadata": {**dict(self._state.metadata), "goal_sequence": goal_sequence}}, deep=True)
+            self._state = self._state.model_copy(update={"status": NavigationStatus.RUNNING, "message": "Nav2 action 已接受目标并开始执行。", "metadata": {**state_metadata, "goal_sequence": goal_sequence}}, deep=True)
             self._result_future = goal_handle.get_result_async()
             self._result_future.add_done_callback(lambda completed: self._on_result(completed, goal_id, goal_sequence))
 
@@ -506,6 +574,16 @@ class Nav2ActionNavigationProvider:
         with self._lock:
             if goal_sequence != self._goal_sequence or self._state.current_goal_id != goal_id:
                 return
+            state_metadata = dict(self._state.metadata)
+            target_pose = state_metadata.get("target_pose") if isinstance(state_metadata.get("target_pose"), dict) else {}
+            LOGGER.info(
+                "Nav2 action 结果 goal_id=%s goal_sequence=%s status=%s goal_reached=%s target=%s",
+                goal_id,
+                goal_sequence,
+                status_code,
+                goal_reached,
+                target_pose,
+            )
             self._goal_handle = None
             self._result_future = None
             self._state = NavigationState(
@@ -514,7 +592,7 @@ class Nav2ActionNavigationProvider:
                 current_pose=self._read_current_pose(),
                 goal_reached=goal_reached,
                 message=message,
-                metadata={"backend": "nav2", "action_status_code": status_code, "action_name": self.runtime.config.nav2.action_name, "goal_sequence": goal_sequence},
+                metadata={"backend": "nav2", "action_status_code": status_code, "action_name": self.runtime.config.nav2.action_name, "goal_sequence": goal_sequence, "target_pose": target_pose},
             )
 
     def _on_global_costmap(self, message: Any) -> None:

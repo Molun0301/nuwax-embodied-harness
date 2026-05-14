@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import logging
 import threading
 import time
 
@@ -22,6 +23,8 @@ from .state_machine import (
     create_navigation_state_machine,
     map_nav2_status_to_platform,
 )
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.navigation.service")
 
 
 class NavigationService:
@@ -223,9 +226,32 @@ class NavigationService:
         """
 
         provider = self._get_navigation_provider()
+        if goal.target_pose is not None:
+            LOGGER.info(
+                "导航服务接收目标 goal_id=%s provider=%s target=(%.3f, %.3f, %.3f) frame=%s map_name=%s target_name=%s metadata=%s",
+                goal.goal_id,
+                provider.provider_name,
+                float(goal.target_pose.position.x),
+                float(goal.target_pose.position.y),
+                float(goal.target_pose.position.z),
+                goal.target_pose.frame_id,
+                goal.map_name,
+                goal.target_name,
+                dict(goal.metadata),
+            )
+        else:
+            LOGGER.info(
+                "导航服务接收目标 goal_id=%s provider=%s target_pose=None map_name=%s target_name=%s metadata=%s",
+                goal.goal_id,
+                provider.provider_name,
+                goal.map_name,
+                goal.target_name,
+                dict(goal.metadata),
+            )
         with self._lock:
             self._current_goal = goal
             self._state_machine.set_goal(goal.goal_id, message="平台导航目标已接受。")
+        LOGGER.info("导航服务转发目标 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
         accepted = provider.set_goal(goal)
         if not accepted:
             message = self._navigation_provider_error_message(provider, default="导航后端拒绝目标 %s。" % goal.goal_id)
@@ -233,6 +259,7 @@ class NavigationService:
                 self._current_goal = None
                 self._state_machine.fail(message)
             raise GatewayError(message)
+        LOGGER.info("导航服务目标已被后端接收 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
         context = self.refresh_navigation()
         if context.navigation_state.status == NavigationStatus.IDLE:
             context = context.model_copy(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import logging
 import math
 import os
 from pathlib import Path
@@ -37,6 +38,8 @@ from services.navigation.config import ExplorationConfig, NavigationBackendConfi
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
 from services.navigation.frontier import FrontierExplorer
 from services.navigation.runtime import GridNavigationPlanner
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.runtime")
 
 
 _GEOMETRY_SIDE_CAR_RESTART_LIMIT = 2
@@ -1392,10 +1395,12 @@ class PlatformGeometryRuntime:
         rtabmap_run = self._build_rtabmap_run_metadata()
         database_metadata = self._materialize_rtabmap_database(rtabmap_db_path)
         pcd_metadata = self._materialize_pcd_asset(pcd_path)
+        nav2_map_metadata = self._materialize_nav2_map_assets(version)
         quality_metrics = self._build_geometry_quality_metrics(
             database_metadata=database_metadata,
             pcd_metadata=pcd_metadata,
             rtabmap_run=rtabmap_run,
+            nav2_map_metadata=nav2_map_metadata,
         )
         database_quality = dict(quality_metrics.get("database") or {})
         database_required = bool(database_quality.get("required", True))
@@ -1416,6 +1421,19 @@ class PlatformGeometryRuntime:
                     built_at=built_at,
                     quality_metrics=database_quality,
                     metadata={"required": database_required},
+                )
+            )
+        nav2_map_quality = dict(quality_metrics.get("nav2_map") or {})
+        if self._uses_external_geometry_stack() and bool(nav2_map_quality.get("present")):
+            asset_refs.append(
+                MapGeometryAssetRef(
+                    asset_type=MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE,
+                    path=str(nav2_map_quality.get("yaml_path") or nav2_map_metadata.get("yaml_path")),
+                    frame_id=version.frame_id,
+                    profile_summary=profile_summary,
+                    built_at=built_at,
+                    quality_metrics=nav2_map_quality,
+                    metadata={"required": True, "state_kind": "nav2_map_yaml"},
                 )
             )
         asset_refs.append(
@@ -1463,6 +1481,7 @@ class PlatformGeometryRuntime:
                 "run_id": rtabmap_run.get("run_id"),
                 "database": database_metadata,
                 "pcd": pcd_metadata,
+                "nav2_map": nav2_map_metadata,
                 "diagnostics": quality_metrics.get("diagnostics", []),
             },
         )
@@ -1483,6 +1502,8 @@ class PlatformGeometryRuntime:
                     "rtabmap_live_streaming_ready": quality_metrics.get("live_streaming_ready"),
                     "map_version_source_mode": quality_metrics.get("source_mode"),
                     "checkpoint_ready": quality_metrics.get("checkpoint_ready"),
+                    "nav2_map_yaml_path": nav2_map_metadata.get("yaml_path"),
+                    "nav2_map_ready": nav2_map_metadata.get("present"),
                 },
             },
             deep=True,
@@ -1876,6 +1897,77 @@ class PlatformGeometryRuntime:
     def _version_pcd_asset_path(self, map_name: str, version_id: str) -> Path:
         return self._version_geometry_root(map_name, version_id) / "pcd" / self.config.rtabmap.outputs.pcd_asset_name
 
+    def _version_nav2_map_yaml_path(self, map_name: str, version_id: str) -> Path:
+        return self._version_geometry_root(map_name, version_id) / "nav2" / "map.yaml"
+
+    def _version_nav2_map_pgm_path(self, map_name: str, version_id: str) -> Path:
+        return self._version_geometry_root(map_name, version_id) / "nav2" / "map.pgm"
+
+    def _materialize_nav2_map_assets(self, version: MapVersion) -> Dict[str, object]:
+        occupancy_grid = version.snapshot.occupancy_grid
+        yaml_path = self._version_nav2_map_yaml_path(version.map_name, version.version_id)
+        pgm_path = self._version_nav2_map_pgm_path(version.map_name, version.version_id)
+        if occupancy_grid is None:
+            return {
+                "present": False,
+                "source_kind": "unavailable",
+                "yaml_path": str(yaml_path.resolve(strict=False)),
+                "pgm_path": str(pgm_path.resolve(strict=False)),
+                "reason": "occupancy_grid_missing",
+            }
+        width = int(occupancy_grid.width)
+        height = int(occupancy_grid.height)
+        data = list(occupancy_grid.data)
+        if len(data) != width * height:
+            return {
+                "present": False,
+                "source_kind": "platform_snapshot",
+                "yaml_path": str(yaml_path.resolve(strict=False)),
+                "pgm_path": str(pgm_path.resolve(strict=False)),
+                "reason": "occupancy_grid_size_mismatch",
+                "width": width,
+                "height": height,
+                "data_length": len(data),
+            }
+        yaml_path.parent.mkdir(parents=True, exist_ok=True)
+        with pgm_path.open("wb") as handle:
+            handle.write(("P5\n%d %d\n255\n" % (width, height)).encode("ascii"))
+            for row in range(height - 1, -1, -1):
+                start = row * width
+                for value in data[start:start + width]:
+                    if value < 0:
+                        pixel = 205
+                    elif value >= 65:
+                        pixel = 0
+                    else:
+                        pixel = 254
+                    handle.write(bytes((pixel,)))
+        origin = occupancy_grid.origin
+        yaw = self._yaw_from_pose(origin)
+        yaml_path.write_text(
+            "image: %s\nmode: trinary\nresolution: %.12g\norigin: [%.12g, %.12g, %.12g]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n"
+            % (pgm_path.name, float(occupancy_grid.resolution_m), float(origin.position.x), float(origin.position.y), yaw),
+            encoding="utf-8",
+        )
+        return {
+            "present": True,
+            "source_kind": "platform_snapshot",
+            "yaml_path": str(yaml_path.resolve(strict=False)),
+            "pgm_path": str(pgm_path.resolve(strict=False)),
+            "yaml": self._file_metadata(yaml_path),
+            "pgm": self._file_metadata(pgm_path),
+            "frame_id": occupancy_grid.frame_id,
+            "width": width,
+            "height": height,
+            "resolution_m": float(occupancy_grid.resolution_m),
+        }
+
+    def _yaw_from_pose(self, pose: Pose) -> float:
+        orientation = pose.orientation
+        siny_cosp = 2.0 * (float(orientation.w) * float(orientation.z) + float(orientation.x) * float(orientation.y))
+        cosy_cosp = 1.0 - 2.0 * (float(orientation.y) * float(orientation.y) + float(orientation.z) * float(orientation.z))
+        return math.atan2(siny_cosp, cosy_cosp)
+
     def _build_parameter_summary(self) -> Dict[str, object]:
         return self._clone_metadata(self.config.build_metadata())
 
@@ -1954,10 +2046,13 @@ class PlatformGeometryRuntime:
         database_metadata: Dict[str, object],
         pcd_metadata: Dict[str, object],
         rtabmap_run: Dict[str, object],
+        nav2_map_metadata: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         diagnostics = []
+        nav2_map_metadata = dict(nav2_map_metadata or {})
         database_present = bool(database_metadata.get("database_present", False))
         external_stack = self._uses_external_geometry_stack()
+        nav2_map_present = bool(nav2_map_metadata.get("present", False))
         database_required = not external_stack
         pcd_present = bool(pcd_metadata.get("pcd_present", False))
         readiness = self._build_rtabmap_readiness()
@@ -1981,12 +2076,20 @@ class PlatformGeometryRuntime:
                     "message": "地图版本缺少 RTAB-Map database 资产。",
                 }
             )
+        if external_stack and not nav2_map_present:
+            diagnostics.append(
+                {
+                    "level": "error",
+                    "code": "nav2_map_asset_missing",
+                    "message": "地图版本缺少 Nav2 map.yaml/PGM 资产，无法加载到底层 SLAM/Nav2 定位状态。",
+                }
+            )
         if not database_present and not database_required:
             diagnostics.append(
                 {
-                    "level": "warning",
+                    "level": "info" if nav2_map_present else "warning",
                     "code": "external_geometry_state_not_materialized",
-                    "message": "未找到 external_slam_nav2 状态数据库；该版本只包含平台快照，不能宣称底层后端 checkpoint ready，也不能用于复现定位/导航。",
+                    "message": "未找到 external_slam_nav2 状态数据库；当前 external_slam_nav2 版本恢复以 Nav2 map.yaml/PGM + AMCL 为后端检查点。",
                 }
             )
         if database_present and not live_streaming_ready:
@@ -2010,18 +2113,18 @@ class PlatformGeometryRuntime:
                 {
                     "level": "warning",
                     "code": "rtabmap_run_id_missing",
-                    "message": "未能从 RTAB-Map 进程状态解析真实 run_id。",
+                    "message": "未能从外部 SLAM/Nav2 进程状态解析真实 run_id。",
                 }
             )
-        backend_checkpoint_ready = database_present
+        backend_checkpoint_ready = nav2_map_present if external_stack else database_present
         return {
             "status": "ready" if backend_checkpoint_ready else "snapshot_only" if external_stack else "failed",
             "live_streaming_ready": live_streaming_ready,
             "checkpoint_ready": backend_checkpoint_ready,
             "backend_checkpoint_ready": backend_checkpoint_ready,
             "platform_snapshot_only": bool(external_stack and not backend_checkpoint_ready),
-            "backend_switch_supported": False if external_stack else True,
-            "source_mode": "live_streaming_checkpoint" if live_streaming_ready else "platform_snapshot_only" if external_stack and not backend_checkpoint_ready else "offline_checkpoint",
+            "backend_switch_supported": True if external_stack else True,
+            "source_mode": "live_streaming_checkpoint" if live_streaming_ready else "nav2_map_checkpoint" if external_stack and backend_checkpoint_ready else "platform_snapshot_only" if external_stack else "offline_checkpoint",
             "streaming_readiness": readiness,
             "rtabmap_run": rtabmap_run,
             "database": {
@@ -2040,6 +2143,11 @@ class PlatformGeometryRuntime:
                 "source_path": pcd_metadata.get("pcd_source_path"),
                 "target_path": pcd_metadata.get("pcd_target_path"),
                 "quality": "present" if pcd_present else "unknown",
+            },
+            "nav2_map": {
+                **self._clone_metadata(nav2_map_metadata),
+                "required": bool(external_stack),
+                "quality": "loadable" if nav2_map_present else "missing",
             },
             "diagnostics": diagnostics,
         }
@@ -2302,39 +2410,192 @@ class PlatformGeometryRuntime:
             "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset) if geometry_asset is not None else None,
         }
         mapping_backend = self._resolve_mapping_backend()
+        if mapping_backend is not None and mapping_backend is not self._live_map_provider:
+            activator = getattr(mapping_backend, "activate_platform_map_version", None)
+            if callable(activator):
+                result = activator(
+                    map_name=version.map_name,
+                    version_id=version.version_id,
+                    geometry_asset=geometry_asset.model_dump(mode="json") if geometry_asset is not None else None,
+                    metadata={
+                        "source_name": version.source_name,
+                        "source_version_id": version.source_version_id,
+                    },
+                )
+                if isinstance(result, dict):
+                    cloned_result = self._clone_metadata(result)
+                    backend_switch_applied = bool(cloned_result.get("backend_switch_applied", True))
+                    return {
+                        **activation_payload,
+                        **cloned_result,
+                        "backend_switch_applied": backend_switch_applied,
+                    }
+                return {
+                    **activation_payload,
+                    "backend_switch_applied": True,
+                    "backend_result": result,
+                }
+            return {
+                **activation_payload,
+                "backend_switch_applied": False,
+                "reason": "backend_missing_activate_platform_map_version",
+                "backend": type(mapping_backend).__name__,
+            }
+        if self._uses_external_geometry_stack():
+            return self._activate_external_nav2_map_version(version, activation_payload)
         if mapping_backend is None:
             return {
                 **activation_payload,
                 "backend_switch_applied": False,
                 "reason": "mapping_backend_unavailable",
             }
-        activator = getattr(mapping_backend, "activate_platform_map_version", None)
-        if not callable(activator):
+        return {
+            **activation_payload,
+            "backend_switch_applied": False,
+            "reason": "backend_missing_activate_platform_map_version",
+        }
+
+    def _activate_external_nav2_map_version(
+        self,
+        version: MapVersion,
+        activation_payload: Dict[str, object],
+    ) -> Dict[str, object]:
+        nav2_map_metadata = self._resolve_nav2_map_metadata(version)
+        nav2_yaml_path = self._resolve_existing_nav2_map_yaml_path(version, nav2_map_metadata)
+        if nav2_yaml_path is None:
+            materialized_metadata = self._materialize_nav2_map_assets(version)
+            nav2_map_metadata = {**nav2_map_metadata, **self._clone_metadata(materialized_metadata)}
+            nav2_yaml_path = self._resolve_existing_nav2_map_yaml_path(version, nav2_map_metadata)
+        if nav2_yaml_path is None:
             return {
                 **activation_payload,
                 "backend_switch_applied": False,
-                "reason": "backend_missing_activate_platform_map_version",
+                "reason": "nav2_map_yaml_missing",
+                "nav2_map": nav2_map_metadata,
             }
-        result = activator(
-            map_name=version.map_name,
-            version_id=version.version_id,
-            geometry_asset=geometry_asset.model_dump(mode="json") if geometry_asset is not None else None,
-            metadata={
-                "source_name": version.source_name,
-                "source_version_id": version.source_version_id,
-            },
+        nav2_yaml_path = nav2_yaml_path.expanduser().resolve(strict=False)
+        pcd_path = self._resolve_existing_version_pcd_path(version)
+        command = self._build_nav2_map_activation_command(
+            map_yaml_path=nav2_yaml_path,
+            pcd_path=pcd_path,
         )
-        if isinstance(result, dict):
+        self._ensure_external_geometry_observers_started()
+        process_name = self._external_process_name()
+        current_process = self._managed_processes.get(process_name)
+        restart = current_process is not None
+        if current_process is not None:
+            current_process.stop()
+        self._live_map_provider.reset_cached_map()
+        self._map_stream_tracker = {}
+        self._start_managed_process(process_name, command, self._external_log_name(), restart=restart)
+        process = self._managed_processes.get(process_name)
+        process_status = process.status() if process is not None else None
+        process_running = bool(process is not None and process.is_running())
+        if not process_running:
             return {
                 **activation_payload,
-                "backend_switch_applied": True,
-                **self._clone_metadata(result),
+                "backend_switch_applied": False,
+                "reason": "external_nav2_amcl_start_failed",
+                "nav2_map": nav2_map_metadata,
+                "nav2": {
+                    "switch_method": "managed_ros2_launch_amcl",
+                    "map_yaml_path": str(nav2_yaml_path),
+                    "pcd_path": str(pcd_path) if pcd_path is not None else None,
+                    "pcd_present": bool(pcd_path is not None),
+                    "command": command,
+                    "process": process_status,
+                },
             }
         return {
             **activation_payload,
             "backend_switch_applied": True,
-            "backend_result": result,
+            "backend_map_loaded": True,
+            "active_backend_version_id": version.version_id,
+            "reason": "external_nav2_amcl_started",
+            "nav2_map": nav2_map_metadata,
+            "nav2": {
+                "switch_method": "managed_ros2_launch_amcl",
+                "map_yaml_path": str(nav2_yaml_path),
+                "pcd_path": str(pcd_path) if pcd_path is not None else None,
+                "pcd_present": bool(pcd_path is not None),
+                "command": command,
+                "process": process_status,
+            },
         }
+
+    def _resolve_nav2_map_metadata(self, version: MapVersion) -> Dict[str, object]:
+        geometry_asset = version.geometry_asset
+        metadata: Dict[str, object] = {}
+        if geometry_asset is not None:
+            metadata.update(self._clone_metadata(geometry_asset.quality_metrics.get("nav2_map") or {}))
+            metadata.update(self._clone_metadata(geometry_asset.metadata.get("nav2_map") or {}))
+        version_metadata = getattr(version, "metadata", None)
+        if isinstance(version_metadata, dict):
+            yaml_path = version_metadata.get("nav2_map_yaml_path")
+            if yaml_path and not metadata.get("yaml_path"):
+                metadata["yaml_path"] = yaml_path
+            ready = version_metadata.get("nav2_map_ready")
+            if ready is not None and "present" not in metadata:
+                metadata["present"] = bool(ready)
+        return metadata
+
+    def _resolve_existing_nav2_map_yaml_path(
+        self,
+        version: MapVersion,
+        nav2_map_metadata: Dict[str, object],
+    ) -> Optional[Path]:
+        candidates: List[object] = []
+        geometry_asset = version.geometry_asset
+        if geometry_asset is not None:
+            for asset_ref in geometry_asset.assets:
+                if asset_ref.asset_type != MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE:
+                    continue
+                asset_metadata = dict(asset_ref.metadata or {})
+                if asset_metadata.get("state_kind") == "nav2_map_yaml":
+                    candidates.append(asset_ref.path)
+                candidates.append(asset_ref.quality_metrics.get("yaml_path"))
+        candidates.append(nav2_map_metadata.get("yaml_path"))
+        candidates.append(self._version_nav2_map_yaml_path(version.map_name, version.version_id))
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = Path(str(candidate)).expanduser()
+            if path.exists() and path.is_file():
+                return path
+        return None
+
+    def _resolve_existing_version_pcd_path(self, version: MapVersion) -> Optional[Path]:
+        geometry_asset = version.geometry_asset
+        candidates: List[object] = []
+        if geometry_asset is not None:
+            candidates.append(geometry_asset.pcd_path)
+            for asset_ref in geometry_asset.assets:
+                if asset_ref.asset_type == MapGeometryAssetType.PCD:
+                    candidates.append(asset_ref.path)
+        candidates.append(self._version_pcd_asset_path(version.map_name, version.version_id))
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = Path(str(candidate)).expanduser()
+            if path.exists() and path.is_file():
+                return path.resolve(strict=False)
+        return None
+
+    def _build_nav2_map_activation_command(self, *, map_yaml_path: Path, pcd_path: Optional[Path]) -> List[str]:
+        command = self._build_launch_prefix() + [
+            "ros2",
+            "launch",
+            "go2_navigation2",
+            "go2_nav2.launch.py",
+            "localization:=amcl",
+            "map:=%s" % str(map_yaml_path),
+            "use_rviz:=false",
+            "use_pcd_initial_pose:=%s" % ("true" if pcd_path is not None else "false"),
+            "auto_spin_after_initial_pose:=%s" % ("true" if pcd_path is not None else "false"),
+        ]
+        if pcd_path is not None:
+            command.append("pcd_map:=%s" % str(pcd_path))
+        return command
 
     def _wait_for_geometry_snapshot(self, *, timeout_sec: float) -> Optional[MapSnapshot]:
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
@@ -2726,6 +2987,20 @@ class PlatformGeometryRuntime:
                     navigation_backend.cancel_goal()
                 except Exception:
                     return
+            target_pose = current_goal.target_pose
+            if target_pose is not None:
+                LOGGER.info(
+                    "平台探索下发 frontier 导航目标 backend=%s previous_goal_id=%s previous_status=%s goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s metadata=%s",
+                    navigation_backend_name,
+                    navigation_state.current_goal_id,
+                    getattr(navigation_state.status, "value", navigation_state.status),
+                    current_goal.goal_id,
+                    float(target_pose.position.x),
+                    float(target_pose.position.y),
+                    float(target_pose.position.z),
+                    target_pose.frame_id,
+                    dict(current_goal.metadata),
+                )
             accepted = navigation_backend.set_goal(current_goal)
             if not accepted:
                 try:
@@ -3183,7 +3458,20 @@ class PlatformGeometryProviderBundle(
         if not self._is_geometry_profile_enabled():
             return False
         backend = self.runtime._resolve_navigation_backend()
-        return False if backend is None else backend.set_goal(goal)
+        if backend is None:
+            return False
+        target_pose = getattr(goal, "target_pose", None)
+        if target_pose is not None:
+            LOGGER.info(
+                "几何 ProviderBundle 转发导航目标 backend=%s goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s",
+                getattr(backend, "provider_name", None),
+                getattr(goal, "goal_id", None),
+                float(target_pose.position.x),
+                float(target_pose.position.y),
+                float(target_pose.position.z),
+                target_pose.frame_id,
+            )
+        return backend.set_goal(goal)
 
     def cancel_goal(self) -> bool:
         if not self._is_geometry_profile_enabled():

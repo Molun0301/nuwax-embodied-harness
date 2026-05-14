@@ -1,6 +1,7 @@
 """平台探索编排运行时。"""
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -14,6 +15,8 @@ from contracts.runtime_views import ExplorationContext
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.frontier import FrontierCandidate, FrontierExplorer
 from services.navigation.runtime import GridNavigationPlanner
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.navigation.exploration_runtime")
 
 
 class ExplorationRuntimePhase(Enum):
@@ -361,7 +364,17 @@ class PlatformExplorationRuntime:
             return None
         if self._current_state.phase != ExplorationRuntimePhase.MOVING_TO_FRONTIER:
             return None
-        return self._current_state.current_target.navigation_goal.model_copy(deep=True)
+        goal = self._current_state.current_target.navigation_goal.model_copy(deep=True)
+        if goal.target_pose is not None:
+            LOGGER.debug(
+                "frontier 导航目标读取 goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s",
+                goal.goal_id,
+                float(goal.target_pose.position.x),
+                float(goal.target_pose.position.y),
+                float(goal.target_pose.position.z),
+                goal.target_pose.frame_id,
+            )
+        return goal
 
     def mark_navigation_arrived(self) -> None:
         """由平台导航链路标记当前前沿已到达。"""
@@ -395,6 +408,22 @@ class PlatformExplorationRuntime:
 
         attempted_poses = [*state.visited_frontiers, *state.rejected_frontiers]
         center_pose = state.request.center_pose or current_pose
+        LOGGER.info(
+            "frontier 规划请求 request_id=%s current=(%.3f, %.3f, %.3f) frame=%s center=(%.3f, %.3f, %.3f) radius_m=%s map_revision=%s costmap_revision=%s pose_revision=%s attempted=%d",
+            state.request_id,
+            float(current_pose.position.x),
+            float(current_pose.position.y),
+            float(current_pose.position.z),
+            current_pose.frame_id,
+            float(center_pose.position.x),
+            float(center_pose.position.y),
+            float(center_pose.position.z),
+            None if state.request.radius_m is None else float(state.request.radius_m),
+            state.map_revision,
+            state.costmap_revision,
+            state.pose_revision,
+            len(attempted_poses),
+        )
         frontiers = self._frontier_explorer.select_candidates(
             current_pose=current_pose,
             occupancy_grid=occupancy_grid,
@@ -406,6 +435,7 @@ class PlatformExplorationRuntime:
         )
         state.latest_frontiers = list(frontiers)
         state.last_frontier_count = len(frontiers)
+        LOGGER.info("frontier 规划接收候选 request_id=%s count=%d", state.request_id, len(frontiers))
         state.last_error = None
         state.failure_code = None
         state.known_cells = self._count_known_cells(occupancy_grid)
@@ -427,6 +457,18 @@ class PlatformExplorationRuntime:
             self._finish(state, phase=ExplorationRuntimePhase.FAILED)
             return
 
+        LOGGER.info(
+            "frontier 目标选中 request_id=%s pose=(%.3f, %.3f, %.3f) frame=%s score=%.3f distance_m=%.3f cluster_size=%d info_gain=%d",
+            state.request_id,
+            float(best_frontier.pose.position.x),
+            float(best_frontier.pose.position.y),
+            float(best_frontier.pose.position.z),
+            best_frontier.pose.frame_id,
+            float(best_frontier.score),
+            float(best_frontier.path_distance_m),
+            int(best_frontier.cluster_size),
+            int(best_frontier.info_gain_cells),
+        )
         frontier_revision = self._frontier_revision(state)
         state.frontier_freshness = {
             "fresh": True,
@@ -460,6 +502,19 @@ class PlatformExplorationRuntime:
                     "frontier_computed_at": state.frontier_freshness.get("computed_at"),
                 },
             ),
+        )
+        target_pose = state.current_target.navigation_goal.target_pose
+        LOGGER.info(
+            "frontier 导航目标组装 goal_id=%s request_id=%s target=(%.3f, %.3f, %.3f) frame=%s map_name=%s target_name=%s revision=%s",
+            state.current_target.navigation_goal.goal_id,
+            state.request_id,
+            float(target_pose.position.x),
+            float(target_pose.position.y),
+            float(target_pose.position.z),
+            target_pose.frame_id,
+            state.request.map_name,
+            state.request.target_name,
+            frontier_revision,
         )
         state.phase = ExplorationRuntimePhase.MOVING_TO_FRONTIER
 
@@ -653,11 +708,38 @@ class PlatformExplorationRuntime:
     ) -> Optional[FrontierCandidate]:
         visited_positions = {(pose.position.x, pose.position.y) for pose in state.visited_frontiers}
         rejected_positions = {(pose.position.x, pose.position.y) for pose in state.rejected_frontiers}
+        LOGGER.debug(
+            "frontier 选择器接收候选 request_id=%s count=%d visited=%d rejected=%d",
+            state.request_id,
+            len(frontiers),
+            len(visited_positions),
+            len(rejected_positions),
+        )
         for frontier in frontiers:
             position = (frontier.pose.position.x, frontier.pose.position.y)
             if position in visited_positions or position in rejected_positions:
+                LOGGER.debug(
+                    "frontier 选择器跳过已尝试坐标 request_id=%s pose=(%.3f, %.3f, %.3f) frame=%s score=%.3f",
+                    state.request_id,
+                    float(frontier.pose.position.x),
+                    float(frontier.pose.position.y),
+                    float(frontier.pose.position.z),
+                    frontier.pose.frame_id,
+                    float(frontier.score),
+                )
                 continue
+            LOGGER.info(
+                "frontier 选择器返回目标 request_id=%s pose=(%.3f, %.3f, %.3f) frame=%s score=%.3f distance_m=%.3f",
+                state.request_id,
+                float(frontier.pose.position.x),
+                float(frontier.pose.position.y),
+                float(frontier.pose.position.z),
+                frontier.pose.frame_id,
+                float(frontier.score),
+                float(frontier.path_distance_m),
+            )
             return frontier
+        LOGGER.info("frontier 选择器没有可返回目标 request_id=%s", state.request_id)
         return None
 
     def _count_known_cells(self, occupancy_grid) -> int:

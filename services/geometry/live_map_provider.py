@@ -136,6 +136,23 @@ class Ros2LiveMapProvider:
     def get_semantic_map(self) -> Optional[SemanticMap]:
         return None
 
+    def reset_cached_map(self) -> None:
+        with self._lock:
+            self._latest_occupancy_grid = None
+            self._latest_cost_map = None
+            self._occupancy_message_count = 0
+            self._cost_map_message_count = 0
+            self._latest_occupancy_metrics = {}
+            self._latest_cost_map_metrics = {}
+            self._latest_occupancy_received_at = None
+            self._latest_cost_map_received_at = None
+            self._occupancy_content_revision = 0
+            self._cost_map_content_revision = 0
+            self._last_occupancy_content_hash = None
+            self._last_cost_map_content_hash = None
+            self._last_occupancy_known_cell_count = 0
+            self._last_cost_map_known_cell_count = 0
+
     def subscribe_map_updates(self, callback: Callable[[Dict[str, object]], None]) -> int:
         with self._lock:
             subscription_id = self._next_map_update_subscription_id

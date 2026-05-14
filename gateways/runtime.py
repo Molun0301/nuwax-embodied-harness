@@ -100,6 +100,7 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
         "explore_area",
         "explore_and_find_target",
         "relocalize_active_map",
+        "load_map_version",
         "save_active_map_version",
     }
 )

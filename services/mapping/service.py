@@ -204,11 +204,73 @@ class MappingService:
         with self._lock:
             return self._latest_snapshot
 
-    def clear_latest_snapshot(self) -> None:
-        """清空当前最新地图快照，避免在地图已回收时继续暴露旧结果。"""
+    def clear_latest_snapshot(
+        self,
+        *,
+        cleared_map_name: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """清空当前最新地图快照，避免在地图已回收时继续暴露旧结果。
+
+        除清服务端 `_latest_snapshot` 外，还会：
+        1. 在 stream_bus 上 publish 一帧 `map.frame`（payload 为空 + `event_type=catalog_cleared`），
+           让前端 SSE/WS 收到一帧 occupancy_grid 缺失的 envelope，立即清掉画布；
+        2. 同步发 `map.heartbeat`，让监控面板的 streaming chip 也走刷新；
+        3. 调 `stream_bus.clear_topic("map.frame")` 与 `clear_topic("map.heartbeat")`，
+           避免新接入的 SSE/WS 客户端首帧仍拉到旧地图。
+        4. 在 event_bus 上 publish `mapping.snapshot_cleared`，与 catalog_deleted 事件呼应。
+        """
 
         with self._lock:
+            previous = self._latest_snapshot
             self._latest_snapshot = None
+        # 即使之前没有 snapshot 也要发 clear 信号——前端可能在重连首帧拉到旧 cache。
+        previous_source_name = (
+            previous.source_name if previous is not None else "platform_live_map_provider"
+        )
+        cleared_payload = {
+            "event_type": "catalog_cleared",
+            "cleared_map_name": str(cleared_map_name or "").strip() or None,
+            "reason": str(reason or "").strip() or None,
+            "previous_version_id": previous.version_id if previous is not None else None,
+            "previous_revision": previous.revision if previous is not None else None,
+            "source_alive": False,
+            "live_streaming_ready": False,
+            "rtabmap_live_streaming_ready": False,
+        }
+        if self._stream_bus is not None:
+            # 用 status="cleared" + payload=None 的 map.frame 让前端 updateMap 走 grid 缺失分支。
+            self._stream_bus.publish(
+                "map.frame",
+                source="mapping_service",
+                payload=None,
+                status="cleared",
+                metadata=cleared_payload,
+            )
+            self._stream_bus.publish(
+                "map.heartbeat",
+                source="mapping_service",
+                payload=cleared_payload,
+                status="cleared",
+                metadata=cleared_payload,
+            )
+            # 清 latest cache，下一个新 SSE/WS 客户端的首帧就拉不到旧 map.frame。
+            self._stream_bus.clear_topic("map.frame")
+            self._stream_bus.clear_topic("map.heartbeat")
+        if self._event_bus is not None:
+            self._event_bus.publish(
+                self._event_bus.build_event(
+                    "mapping.snapshot_cleared",
+                    category=RuntimeEventCategory.ROBOT,
+                    source="mapping_service",
+                    message="地图快照已清空。",
+                    payload={
+                        "cleared_map_name": cleared_payload["cleared_map_name"],
+                        "reason": cleared_payload["reason"],
+                        "previous_source_name": previous_source_name,
+                    },
+                )
+            )
 
     def list_history(self, *, limit: Optional[int] = None) -> Tuple[MapSnapshot, ...]:
         """返回地图历史。"""

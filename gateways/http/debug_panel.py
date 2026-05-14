@@ -1442,9 +1442,10 @@ def _render_debug_page(access_token: str) -> str:
         const grid = data.occupancy_grid || (data.map_snapshot && data.map_snapshot.occupancy_grid) || null;
         const diagnostics = data.diagnostics || data.metadata || (data.map_snapshot && data.map_snapshot.metadata) || {};
         const streamBridge = diagnostics.stream_bridge || {};
-        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp };
-        setPill(els.mapStatus, status);
-        if (grid && Array.isArray(grid.data)) {
+        const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
+        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp, cleared };
+        setPill(els.mapStatus, cleared ? "cleared" : status);
+        if (!cleared && grid && Array.isArray(grid.data)) {
           const nextContentKey = mapGridContentKey(grid, envelope, diagnostics);
           const baseDirty = state.mapGridContentKey !== nextContentKey;
           state.mapGrid = grid;
@@ -1458,7 +1459,9 @@ def _render_debug_page(access_token: str) -> str:
           state.mapBaseCache = null;
           requestMapDraw(true);
           els.mapEmpty.hidden = false;
-          els.mapEmpty.textContent = errorReason(envelope, "无 occupancy_grid，占据栅格不可用。");
+          els.mapEmpty.textContent = cleared
+            ? mapClearedMessage(diagnostics)
+            : errorReason(envelope, "无 occupancy_grid，占据栅格不可用。");
         }
         setKv(els.mapMeta, [
           ["frame", envelope.frame_id || (grid && grid.frame_id)],
@@ -1467,12 +1470,26 @@ def _render_debug_page(access_token: str) -> str:
           ["source_timestamp", shortTime(envelope.source_timestamp)],
           ["revision", envelope.revision || diagnostics.content_revision],
           ["sequence", envelope.sequence || diagnostics.message_count],
-          ["streaming", mapStreamLabel(status, diagnostics, streamBridge)],
+          ["streaming", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["stale", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
-        updateMapStreamChip(status, diagnostics, streamBridge, envelope.source_timestamp);
+        updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
+      }
+      function isMapClearedEnvelope(envelope, diagnostics, status) {
+        if (status === "cleared") return true;
+        const eventType = diagnostics && (diagnostics.event_type || diagnostics.suppressed_live_map_reason);
+        if (typeof eventType === "string" && (eventType === "catalog_cleared" || eventType === "workspace_cleared")) return true;
+        return false;
+      }
+      function mapClearedMessage(diagnostics) {
+        const cleared = diagnostics && (diagnostics.cleared_map_name || diagnostics.previous_active_map_name);
+        const reason = diagnostics && diagnostics.reason;
+        if (cleared && reason) return `地图 ${cleared} 已清空（${reason}）。`;
+        if (cleared) return `地图 ${cleared} 已清空。`;
+        if (reason) return `地图已清空（${reason}）。`;
+        return "地图已清空，等待新工作区激活。";
       }
       function mapStreamLabel(status, diagnostics, streamBridge) {
         const messageCount = diagnostics && (diagnostics.message_count || diagnostics.update_sequence || diagnostics.sequence);
@@ -1492,15 +1509,22 @@ def _render_debug_page(access_token: str) -> str:
         const heartbeat = envelope.data || {};
         const diagnostics = { ...((state.mapStream && state.mapStream.diagnostics) || {}), ...(envelope.metadata || {}), ...heartbeat };
         const streamBridge = diagnostics.stream_bridge || {};
-        const grid = state.mapGrid;
-        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision || diagnostics.content_revision, sequence: envelope.sequence || diagnostics.update_sequence, timestamp: envelope.source_timestamp };
-        setPill(els.mapStatus, status);
-        if (grid && Array.isArray(grid.data)) {
+        const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
+        if (cleared) {
+          state.mapGrid = null;
+          state.mapGridContentKey = "";
+          state.mapBaseCache = null;
+          requestMapDraw(true);
+        }
+        const grid = cleared ? null : state.mapGrid;
+        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision || diagnostics.content_revision, sequence: envelope.sequence || diagnostics.update_sequence, timestamp: envelope.source_timestamp, cleared };
+        setPill(els.mapStatus, cleared ? "cleared" : status);
+        if (!cleared && grid && Array.isArray(grid.data)) {
           els.mapEmpty.hidden = true;
           els.mapEmpty.textContent = "";
         } else {
           els.mapEmpty.hidden = false;
-          els.mapEmpty.textContent = "地图源在线，等待内容更新帧。";
+          els.mapEmpty.textContent = cleared ? mapClearedMessage(diagnostics) : "地图源在线，等待内容更新帧。";
         }
         setKv(els.mapMeta, [
           ["frame", envelope.frame_id || diagnostics.frame_id || (grid && grid.frame_id)],
@@ -1509,12 +1533,12 @@ def _render_debug_page(access_token: str) -> str:
           ["source_timestamp", shortTime(envelope.source_timestamp)],
           ["revision", envelope.revision || diagnostics.content_revision],
           ["sequence", envelope.sequence || diagnostics.update_sequence || diagnostics.message_count],
-          ["streaming", mapStreamLabel(status, diagnostics, streamBridge)],
+          ["streaming", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["stale", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
-        updateMapStreamChip(status, diagnostics, streamBridge, envelope.source_timestamp);
+        updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
       }
       function updateLocalization(envelope) {
         const status = statusOf(envelope);

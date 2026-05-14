@@ -555,15 +555,21 @@ class GatewayRuntime:
 
     def _publish_runtime_event_stream_frames(self, event) -> None:
         category = self._stream_enum_value(getattr(event, "category", ""))
+        event_type = str(getattr(event, "event_type", "") or "")
         severity = self._stream_enum_value(getattr(event, "severity", "info"))
+        log_stream_severity = (
+            "debug"
+            if severity == "info" and is_low_value_runtime_event(event_type)
+            else severity
+        )
         self.stream_bus.publish(
             "logs.entry",
             source=str(getattr(event, "source", "event_bus") or "event_bus"),
             payload={
                 "cursor": getattr(event, "cursor", None),
-                "event_type": getattr(event, "event_type", None),
+                "event_type": event_type or None,
                 "category": category,
-                "severity": severity,
+                "severity": log_stream_severity,
                 "source": getattr(event, "source", None),
                 "task_id": getattr(event, "task_id", None),
                 "subject_id": getattr(event, "subject_id", None),
@@ -574,7 +580,7 @@ class GatewayRuntime:
             },
             sequence=getattr(event, "cursor", None),
             status="available",
-            metadata={"severity": severity, "category": category},
+            metadata={"severity": log_stream_severity, "category": category},
         )
         if category == "task" or getattr(event, "task_id", None):
             self.stream_bus.publish(

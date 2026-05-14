@@ -78,7 +78,7 @@ class Go2ProviderBundle(
                 and status.get("started")
                 and isinstance(bridge_status, dict)
                 and bridge_status.get("direct_dds_started")
-                and bridge_status.get("dds_video_subscribed")
+                and bridge_status.get("video_source_subscribed")
             ):
                 return True
         return self.assembly.high_level_initialized
@@ -211,7 +211,7 @@ class Go2ProviderBundle(
             and status.get("started")
             and isinstance(bridge_status, dict)
             and bridge_status.get("direct_dds_started")
-            and bridge_status.get("dds_video_subscribed")
+            and bridge_status.get("video_source_subscribed")
         ):
             return None
         subscriber = getattr(self.assembly.data_plane, "subscribe_image", None)
@@ -239,7 +239,7 @@ class Go2ProviderBundle(
             and status.get("started")
             and isinstance(bridge_status, dict)
             and bridge_status.get("direct_dds_started")
-            and bridge_status.get("dds_video_subscribed")
+            and bridge_status.get("video_source_subscribed")
         ):
             return None
         getter = getattr(self.assembly.data_plane, "get_latest_image", None)

@@ -49,31 +49,6 @@ _POINT_FIELD_DTYPE_MAP = {
     8: np.float64,
 }
 
-_GO2_FRONT_VIDEO_RESOLUTIONS = {
-    "720p": ("video720p", 1280, 720),
-    "360p": ("video360p", 640, 360),
-    "180p": ("video180p", 320, 180),
-}
-
-
-def _normalize_front_video_resolution(value: str) -> str:
-    normalized = str(value or "").strip().lower()
-    return normalized if normalized in _GO2_FRONT_VIDEO_RESOLUTIONS else "720p"
-
-
-def _extract_front_video_jpeg(message: object, *, resolution: str) -> Optional[Tuple[bytes, str, int, int]]:
-    selected_resolution = _normalize_front_video_resolution(resolution)
-    field_name, width_px, height_px = _GO2_FRONT_VIDEO_RESOLUTIONS[selected_resolution]
-    raw_data = getattr(message, field_name, None)
-    if raw_data is None:
-        return None
-    data = bytes(raw_data)
-    start = data.find(b"\xff\xd8")
-    end = data.rfind(b"\xff\xd9")
-    if start < 0 or end < start:
-        return None
-    return data[start : end + 2], selected_resolution, width_px, height_px
-
 
 def _unitree_wxyz_quaternion_to_contract(values: Sequence[float]) -> Quaternion:
     raw_values = [float(item) for item in list(values or [])[:4]]
@@ -150,7 +125,11 @@ def _load_go2_official_sdk_modules(
             unitree_go_dds_module = importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_")
             modules["ChannelSubscriber"] = getattr(channel_module, "ChannelSubscriber")
             modules["SportModeState"] = getattr(unitree_go_dds_module, "SportModeState_")
-            modules["Go2FrontVideoData"] = getattr(unitree_go_dds_module, "Go2FrontVideoData_", None)
+            modules["VideoClient"] = getattr(
+                importlib.import_module("unitree_sdk2py.go2.video.video_client"),
+                "VideoClient",
+                None,
+            )
             modules["DirectPointCloud2"] = getattr(
                 importlib.import_module("unitree_sdk2py.idl.sensor_msgs.msg.dds_"),
                 "PointCloud2_",
@@ -173,7 +152,6 @@ class RclpyGo2RosBridge:
         self._direct_dds_threads: List[threading.Thread] = []
         self._direct_pose_subscriber = None
         self._direct_point_cloud_subscriber = None
-        self._direct_front_video_subscriber = None
         self._direct_point_cloud_worker_condition = threading.Condition()
         self._direct_point_cloud_pending_sample: Optional[object] = None
         self._direct_point_cloud_pending_source_topic = ""
@@ -183,14 +161,10 @@ class RclpyGo2RosBridge:
         self._direct_point_cloud_pending_dispatch_frame: Optional[PointCloudFrame] = None
         self._direct_point_cloud_pending_dispatch_sequence = 0
         self._direct_point_cloud_dispatched_sequence = 0
-        self._direct_front_video_dispatch_condition = threading.Condition()
-        self._direct_front_video_pending_dispatch_frame: Optional[ImageFrame] = None
-        self._direct_front_video_pending_dispatch_sequence = 0
-        self._direct_front_video_dispatched_sequence = 0
         self._direct_point_cloud_reader_drop_count = 0
         self._direct_point_cloud_dispatch_drop_count = 0
-        self._direct_front_video_dispatch_drop_count = 0
-        self._direct_front_video_unsupported_count = 0
+        self._video_client = None
+        self._video_pull_failure_count = 0
         self._latest_pose_from_dds: Optional[Pose] = None
         self._latest_imu_state_from_dds: Optional[IMUState] = None
         self._latest_local_point_cloud: Optional[PointCloudFrame] = None
@@ -198,7 +172,7 @@ class RclpyGo2RosBridge:
         self._latest_pose_source = ""
         self._latest_imu_source_topic = ""
         self._latest_point_cloud_source_topic = ""
-        self._latest_front_video_source_topic = ""
+        self._latest_front_video_source = ""
         self._localization_callbacks: Dict[int, Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]] = {}
         self._point_cloud_callbacks: Dict[int, Callable[[PointCloudFrame], None]] = {}
         self._image_callbacks: Dict[int, Callable[[ImageFrame], None]] = {}
@@ -206,7 +180,8 @@ class RclpyGo2RosBridge:
         self._direct_pose_ready = False
         self._direct_imu_ready = False
         self._direct_point_cloud_ready = False
-        self._direct_front_video_ready = False
+        self._video_source_subscribed = False
+        self._video_source_ready = False
 
     def start(self) -> None:
         if self._started:
@@ -294,18 +269,18 @@ class RclpyGo2RosBridge:
                 "dds_pose_ready": self._direct_pose_ready,
                 "dds_imu_ready": self._direct_imu_ready,
                 "dds_cloud_ready": self._direct_point_cloud_ready,
-                "dds_video_subscribed": self._direct_front_video_subscriber is not None,
-                "dds_video_ready": self._direct_front_video_ready,
+                "video_source_subscribed": self._video_source_subscribed,
+                "video_source_ready": self._video_source_ready,
+                "video_source_kind": "go2_video_client_push",
                 "pose_source": self._latest_pose_source,
                 "imu_source_topic": self._latest_imu_source_topic,
                 "point_cloud_source_topic": self._latest_point_cloud_source_topic,
-                "front_video_source_topic": self._latest_front_video_source_topic,
+                "front_video_source": self._latest_front_video_source,
                 "latest_point_cloud_points": self._latest_local_point_cloud.point_count if self._latest_local_point_cloud is not None else 0,
                 "latest_front_video_bytes": len(self._latest_front_video_frame.data or b"") if self._latest_front_video_frame is not None else 0,
                 "dds_point_cloud_reader_drop_count": self._direct_point_cloud_reader_drop_count,
                 "dds_point_cloud_dispatch_drop_count": self._direct_point_cloud_dispatch_drop_count,
-                "dds_front_video_dispatch_drop_count": self._direct_front_video_dispatch_drop_count,
-                "dds_front_video_unsupported_count": self._direct_front_video_unsupported_count,
+                "video_pull_failure_count": self._video_pull_failure_count,
             }
 
     def _start_direct_dds_backend(self) -> None:
@@ -344,30 +319,28 @@ class RclpyGo2RosBridge:
             LOGGER.warning("初始化 Go2 官方 DDS 订阅器失败：%s", exc)
             self._direct_pose_subscriber = None
             self._direct_point_cloud_subscriber = None
-            self._direct_front_video_subscriber = None
             return
 
-        front_video_type = modules.get("Go2FrontVideoData")
-        if front_video_type is not None:
-            try:
-                self._direct_front_video_subscriber = subscriber_class(
-                    self.config.direct_dds.front_video_topic,
-                    front_video_type,
-                )
-                self._direct_front_video_subscriber.Init()
-            except Exception:
-                self._direct_front_video_subscriber = None
-                LOGGER.warning("初始化 Go2 官方 DDS 前置视频订阅器失败。", exc_info=True)
+        self._video_client = self._create_video_client()
+        if self._video_client is not None:
+            self._video_source_subscribed = True
 
         self._direct_dds_stop_event.clear()
-        self._direct_dds_threads = [
+        threads: List[threading.Thread] = [
             threading.Thread(target=self._direct_pose_reader_loop, name="go2_direct_pose_reader", daemon=True),
             threading.Thread(target=self._direct_point_cloud_reader_loop, name="go2_direct_point_cloud_reader", daemon=True),
             threading.Thread(target=self._direct_point_cloud_worker_loop, name="go2_direct_point_cloud_worker", daemon=True),
             threading.Thread(target=self._direct_point_cloud_dispatch_loop, name="go2_direct_point_cloud_dispatch", daemon=True),
-            threading.Thread(target=self._direct_front_video_reader_loop, name="go2_direct_front_video_reader", daemon=True),
-            threading.Thread(target=self._direct_front_video_dispatch_loop, name="go2_direct_front_video_dispatch", daemon=True),
         ]
+        if self._video_client is not None:
+            threads.append(
+                threading.Thread(
+                    target=self._front_video_pull_loop,
+                    name="go2_front_video_pull",
+                    daemon=True,
+                )
+            )
+        self._direct_dds_threads = threads
         for thread in self._direct_dds_threads:
             thread.start()
         self._direct_dds_started = True
@@ -378,13 +351,11 @@ class RclpyGo2RosBridge:
             self._direct_point_cloud_worker_condition.notify_all()
         with self._direct_point_cloud_dispatch_condition:
             self._direct_point_cloud_dispatch_condition.notify_all()
-        with self._direct_front_video_dispatch_condition:
-            self._direct_front_video_dispatch_condition.notify_all()
         for thread in self._direct_dds_threads:
             if thread.is_alive():
                 thread.join(timeout=1.0)
         self._direct_dds_threads = []
-        for subscriber in (self._direct_pose_subscriber, self._direct_point_cloud_subscriber, self._direct_front_video_subscriber):
+        for subscriber in (self._direct_pose_subscriber, self._direct_point_cloud_subscriber):
             if subscriber is None:
                 continue
             try:
@@ -393,14 +364,14 @@ class RclpyGo2RosBridge:
                 LOGGER.debug("关闭 Go2 官方 DDS 订阅器失败。", exc_info=True)
         self._direct_pose_subscriber = None
         self._direct_point_cloud_subscriber = None
-        self._direct_front_video_subscriber = None
+        self._video_client = None
+        self._video_source_subscribed = False
+        self._video_source_ready = False
         with self._direct_point_cloud_worker_condition:
             self._direct_point_cloud_pending_sample = None
             self._direct_point_cloud_pending_source_topic = ""
         with self._direct_point_cloud_dispatch_condition:
             self._direct_point_cloud_pending_dispatch_frame = None
-        with self._direct_front_video_dispatch_condition:
-            self._direct_front_video_pending_dispatch_frame = None
         self._direct_dds_started = False
 
     def _direct_pose_reader_loop(self) -> None:
@@ -437,22 +408,91 @@ class RclpyGo2RosBridge:
                 continue
             self._queue_direct_point_cloud_sample(sample, source_topic=source_topic)
 
-    def _direct_front_video_reader_loop(self) -> None:
-        timeout_sec = float(getattr(self.config.direct_dds, "read_timeout_sec", 0.5))
-        source_topic = f"dds:{self.config.direct_dds.front_video_topic}"
-        while not self._direct_dds_stop_event.is_set():
-            subscriber = self._direct_front_video_subscriber
-            if subscriber is None:
-                return
+    def _create_video_client(self):
+        modules = _load_go2_official_sdk_modules(self.config, include_dds_topics=True)
+        if modules is None:
+            return None
+        video_client_factory = modules.get("VideoClient")
+        if video_client_factory is None:
+            LOGGER.warning("Go2 官方 VideoClient 模块缺失，无法启动前置视频推流。")
+            return None
+        try:
+            client = video_client_factory()
+            client.SetTimeout(float(getattr(self.config.official, "client_timeout_sec", 3.0)))
+            client.Init()
+            return client
+        except Exception:
+            LOGGER.warning("初始化 Go2 官方 VideoClient 失败。", exc_info=True)
+            return None
+
+    def _front_video_pull_loop(self) -> None:
+        """以源头帧率持续从 VideoClient 拉最新 JPEG 并推送给所有 image_callbacks。
+
+        Go2 没有原生 DDS push 视频接口，端侧 driver 在此把 RPC 抽样包装成
+        持续推流，使平台层的 StreamingImageProvider 接口语义不变（订阅即得帧）。
+        """
+
+        client = self._video_client
+        if client is None:
+            return
+        interval_sec = max(0.005, float(getattr(self.config.direct_dds, "video_pull_interval_sec", 0.033)))
+        camera_template = GO2_DEFAULT_CAMERA_INFO.model_copy(deep=True)
+        source_label = "go2_video_client"
+        while not self._direct_dds_stop_event.wait(0):
+            loop_started_at = time.monotonic()
             try:
-                sample = subscriber.Read(timeout_sec)
+                code, data = client.GetImageSample()
             except Exception:
-                LOGGER.debug("读取 Go2 官方 DDS 前置视频失败。", exc_info=True)
-                time.sleep(0.1)
+                LOGGER.debug("Go2 VideoClient 拉帧异常。", exc_info=True)
+                with self._lock:
+                    self._video_pull_failure_count += 1
+                if self._direct_dds_stop_event.wait(min(0.5, interval_sec * 4)):
+                    return
                 continue
-            if sample is None:
+            if code != 0 or not data:
+                with self._lock:
+                    self._video_pull_failure_count += 1
+                if self._direct_dds_stop_event.wait(min(0.5, interval_sec * 4)):
+                    return
                 continue
-            self._on_direct_front_video(sample, source_topic=source_topic)
+            jpeg_bytes = bytes(data)
+            soi = jpeg_bytes.find(b"\xff\xd8")
+            eoi = jpeg_bytes.rfind(b"\xff\xd9")
+            if soi < 0 or eoi <= soi:
+                with self._lock:
+                    self._video_pull_failure_count += 1
+                if self._direct_dds_stop_event.wait(interval_sec):
+                    return
+                continue
+            jpeg_payload = jpeg_bytes[soi : eoi + 2]
+            image_frame = ImageFrame(
+                camera_id=camera_template.camera_id,
+                frame_id=camera_template.frame_id,
+                width_px=camera_template.width_px,
+                height_px=camera_template.height_px,
+                encoding=ImageEncoding.JPEG,
+                data=jpeg_payload,
+                timestamp=datetime.now(timezone.utc),
+                metadata={
+                    "source_kind": "go2_video_client_push",
+                    "source_label": source_label,
+                    "size_bytes": len(jpeg_payload),
+                },
+            )
+            with self._lock:
+                self._latest_front_video_frame = image_frame
+                self._video_source_ready = True
+                self._latest_front_video_source = source_label
+                callbacks = tuple(self._image_callbacks.values())
+            for callback in callbacks:
+                try:
+                    callback(image_frame.model_copy(deep=True))
+                except Exception:
+                    LOGGER.debug("分发 Go2 前置视频推流帧失败。", exc_info=True)
+            elapsed = time.monotonic() - loop_started_at
+            remaining = interval_sec - elapsed
+            if remaining > 0 and self._direct_dds_stop_event.wait(remaining):
+                return
 
     def _queue_direct_point_cloud_sample(self, sample: object, *, source_topic: str) -> None:
         with self._direct_point_cloud_worker_condition:
@@ -514,38 +554,6 @@ class RclpyGo2RosBridge:
                 except Exception:
                     LOGGER.debug("分发 Go2 DDS 点云帧失败。", exc_info=True)
 
-    def _queue_direct_front_video_dispatch(self, image_frame: ImageFrame) -> None:
-        with self._direct_front_video_dispatch_condition:
-            if self._direct_front_video_pending_dispatch_sequence != self._direct_front_video_dispatched_sequence:
-                with self._lock:
-                    self._direct_front_video_dispatch_drop_count += 1
-            self._direct_front_video_pending_dispatch_sequence += 1
-            self._direct_front_video_pending_dispatch_frame = image_frame
-            self._direct_front_video_dispatch_condition.notify()
-
-    def _direct_front_video_dispatch_loop(self) -> None:
-        while not self._direct_dds_stop_event.is_set():
-            with self._direct_front_video_dispatch_condition:
-                while (
-                    not self._direct_dds_stop_event.is_set()
-                    and self._direct_front_video_pending_dispatch_sequence == self._direct_front_video_dispatched_sequence
-                ):
-                    self._direct_front_video_dispatch_condition.wait(timeout=0.5)
-                if self._direct_dds_stop_event.is_set():
-                    return
-                sequence = self._direct_front_video_pending_dispatch_sequence
-                image_frame = self._direct_front_video_pending_dispatch_frame
-                self._direct_front_video_dispatched_sequence = sequence
-            if image_frame is None:
-                continue
-            with self._lock:
-                callbacks = tuple(self._image_callbacks.values())
-            for callback in callbacks:
-                try:
-                    callback(image_frame.model_copy(deep=True))
-                except Exception:
-                    LOGGER.debug("分发 Go2 DDS 前置视频帧失败。", exc_info=True)
-
     def _on_sport_mode_state(self, message: object, *, source_topic: str = "") -> None:
         pose = self._build_pose_from_sport_mode_state(message)
         imu_state = self._build_imu_from_sport_mode_state(message)
@@ -598,42 +606,6 @@ class RclpyGo2RosBridge:
             self._direct_point_cloud_ready = True
             self._latest_point_cloud_source_topic = str(source_topic or "")
         self._queue_direct_point_cloud_dispatch(point_cloud)
-
-    def _on_direct_front_video(self, message: object, *, source_topic: str = "") -> None:
-        extracted = _extract_front_video_jpeg(
-            message,
-            resolution=str(getattr(self.config.direct_dds, "front_video_resolution", "720p") or "720p"),
-        )
-        if extracted is None:
-            with self._lock:
-                self._direct_front_video_unsupported_count += 1
-                self._latest_front_video_source_topic = str(source_topic or "")
-            return
-        data, resolution, width_px, height_px = extracted
-        camera_info = GO2_DEFAULT_CAMERA_INFO.model_copy(deep=True)
-        camera_info.width_px = width_px
-        camera_info.height_px = height_px
-        image_frame = ImageFrame(
-            camera_id=camera_info.camera_id,
-            frame_id=camera_info.frame_id,
-            width_px=width_px,
-            height_px=height_px,
-            encoding=ImageEncoding.JPEG,
-            data=data,
-            timestamp=datetime.now(timezone.utc),
-            metadata={
-                "source_topic": str(source_topic or ""),
-                "source_kind": "go2_dds_front_video",
-                "time_frame": int(getattr(message, "time_frame", 0) or 0),
-                "resolution": resolution,
-                "size_bytes": len(data),
-            },
-        )
-        with self._lock:
-            self._latest_front_video_frame = image_frame
-            self._direct_front_video_ready = True
-            self._latest_front_video_source_topic = str(source_topic or "")
-        self._queue_direct_front_video_dispatch(image_frame)
 
     def _build_pose_from_sport_mode_state(self, message: object) -> Pose:
         imu_state = getattr(message, "imu_state", None)

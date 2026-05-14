@@ -167,6 +167,17 @@ class StreamBus:
         with self._lock:
             self._subscriptions.pop(subscription_id, None)
 
+    def clear_topic(self, topic: str) -> bool:
+        """清除指定 topic 的 latest 缓存。
+
+        新接入的 SSE / WS 客户端首帧靠 latest_frames() 拿快照；当上游内容失效
+        （例如地图被删除、活跃工作区切走）时调用本方法，避免新连接拿到陈旧数据。
+        retention 历史 frames 不动，replay 仍可回放。
+        """
+
+        with self._lock:
+            return self._latest_by_topic.pop(str(topic), None) is not None
+
     def replay(
         self,
         *,

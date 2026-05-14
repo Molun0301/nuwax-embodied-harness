@@ -114,7 +114,10 @@ class MapWorkspaceService:
         previous_active_map_name = self._repository.get_active_map_name()
         if previous_active_map_name != resolved_name:
             self._geometry_runtime.clear_active_map_version(reason="switch_active_map")
-            self._mapping_service.clear_latest_snapshot()
+            self._mapping_service.clear_latest_snapshot(
+                cleared_map_name=previous_active_map_name,
+                reason="switch_active_map",
+            )
             self._localization_service.clear_latest_snapshot()
             self._localization_service.clear_active_session(reason="switch_active_map")
         asset = self._repository.get_map_asset(resolved_name)
@@ -495,7 +498,10 @@ class MapWorkspaceService:
         if disable_memory_library and self._memory_service.get_active_library_name() == active_map_name:
             self._memory_service.disable_memory_library()
         self._geometry_runtime.clear_active_map_version(reason="clear_active_map")
-        self._mapping_service.clear_latest_snapshot()
+        self._mapping_service.clear_latest_snapshot(
+            cleared_map_name=active_map_name,
+            reason="clear_active_map",
+        )
         self._localization_service.clear_latest_snapshot()
         self._localization_service.clear_active_session(reason="clear_active_map")
         if asset is None:
@@ -551,7 +557,10 @@ class MapWorkspaceService:
             if self._memory_service.get_active_library_name() == resolved_name:
                 self._memory_service.disable_memory_library()
             self._geometry_runtime.clear_active_map_version(reason="delete_active_map")
-            self._mapping_service.clear_latest_snapshot()
+            self._mapping_service.clear_latest_snapshot(
+                cleared_map_name=resolved_name,
+                reason="delete_active_map",
+            )
             self._localization_service.clear_latest_snapshot()
             self._localization_service.clear_active_session(reason="delete_active_map")
         if delete_memory_library and self._memory_service.has_memory_library(resolved_name):

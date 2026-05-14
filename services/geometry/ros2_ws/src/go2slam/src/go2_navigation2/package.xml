@@ -28,7 +28,6 @@
   <exec_depend>go2_driver</exec_depend>
   <exec_depend>go2_perception</exec_depend>
   <exec_depend>go2_slam</exec_depend>
-  <exec_depend>explore_lite</exec_depend>
   <exec_depend>nav2_amcl</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>nav2_bt_navigator</exec_depend>

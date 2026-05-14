@@ -52,7 +52,7 @@ class GeometryLocalizationStateMapping:
             return self.tracking_state_mappings[backend_state.tracking_state]
 
         # 根据后端类型进行具体判断
-        if self.backend_type == "rtabmap":
+        if self.backend_type in ("slam_toolbox", "rtabmap"):
             return self._map_rtabmap_state(backend_state)
         elif self.backend_type == "go2_sdk":
             return self._map_go2_sdk_state(backend_state)
@@ -65,9 +65,9 @@ class GeometryLocalizationStateMapping:
         self,
         backend_state: BackendLocalizationState,
     ) -> LocalizationSessionStatus:
-        """映射 RTAB-Map 定位状态。
+        """映射在线 SLAM 后端定位状态（slam_toolbox / 历史 RTAB-Map 通用）。
 
-        RTAB-Map 状态映射：
+        状态映射：
         - initialization -> LOCALIZING
         - tracking -> READY (如果 pose_available)
         - lost -> STALE
@@ -157,10 +157,10 @@ class GeometryLocalizationStateMapping:
 
 
 def create_rtabmap_state_mapping() -> GeometryLocalizationStateMapping:
-    """创建 RTAB-Map 状态映射规则。"""
+    """创建在线 SLAM 后端状态映射规则（slam_toolbox 主线，保留 RTAB-Map 历史命名兼容）。"""
 
     return GeometryLocalizationStateMapping(
-        backend_type="rtabmap",
+        backend_type="slam_toolbox",
         tracking_state_mappings={
             "initialization": LocalizationSessionStatus.LOCALIZING,
             "relocalizing": LocalizationSessionStatus.LOCALIZING,
@@ -169,6 +169,10 @@ def create_rtabmap_state_mapping() -> GeometryLocalizationStateMapping:
             "map_not_loaded": LocalizationSessionStatus.FAILED,
         },
     )
+
+
+# 别名：项目主线命名为 slam_toolbox。
+create_slam_toolbox_state_mapping = create_rtabmap_state_mapping
 
 
 def create_go2_sdk_state_mapping() -> GeometryLocalizationStateMapping:
@@ -204,7 +208,7 @@ def map_backend_state_to_platform_status(
     """将任意后端定位状态映射到平台状态。"""
 
     # 根据后端类型选择映射规则
-    if backend_state.backend_type == "rtabmap":
+    if backend_state.backend_type in ("slam_toolbox", "rtabmap"):
         mapping = create_rtabmap_state_mapping()
     elif backend_state.backend_type == "go2_sdk":
         mapping = create_go2_sdk_state_mapping()

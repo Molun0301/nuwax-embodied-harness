@@ -27,3 +27,6 @@ class StreamingImageProvider(BaseProvider, Protocol):
     def unsubscribe_image(self, subscription_id: Optional[int]) -> None:
         """取消源头推送图像帧订阅。"""
 
+    def get_latest_image(self, camera_id: Optional[str] = None) -> Optional[ImageFrame]:
+        """返回最近一帧源头推送图像；不可得返回 None。"""
+

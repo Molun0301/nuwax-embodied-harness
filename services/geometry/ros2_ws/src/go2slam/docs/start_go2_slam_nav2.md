@@ -1,6 +1,6 @@
 # start_go2_slam_nav2.sh
 
-启动 Go2 的 SLAM + Nav2，用于边建 2D 地图边导航。
+启动 Go2 的 SLAM + Nav2，用于边建 2D 地图边导航。SLAM 后端为 slam_toolbox。
 
 ## 用法
 
@@ -14,18 +14,6 @@
 
 ```bash
 ./start_go2_slam_nav2.sh --mapping
-```
-
-启动 SLAM + Nav2 + frontier 只读观测：
-
-```bash
-./start_go2_slam_nav2.sh --explore
-```
-
-同时保存点云图并观测 frontier：
-
-```bash
-./start_go2_slam_nav2.sh --mapping --explore
 ```
 
 无图形界面或不需要 RViz：
@@ -59,21 +47,9 @@ RViz
 go2_mapping_only/mapping_only.launch.py
 ```
 
-加 `--explore` 时，还会启动：
-
-```text
-explore_lite/explore
-```
-
-frontier 搜索参数在：
-
-```text
-src/go2_navigation2/config/explore_params.yaml
-```
-
-默认使用 slam_toolbox 的 `/map` 和 `/map_updates` 做 frontier 搜索，只发布 `explore/frontiers` MarkerArray 供 debug/RViz 显示，不向 Nav2 的 `navigate_to_pose` action 发送目标点。
-
 用于生成 `/go2_built_map` 点云地图，之后可用 `save_pointcloud.sh` 保存。
+
+> frontier 探索由平台侧 `services/navigation/PlatformExplorationRuntime` + `Nav2ActionNavigationProvider` 负责（基于 occupancy 计算 frontier 并通过 Nav2 action 派发），go2slam 不再内置 explore_lite/m-explore-ros2。
 
 ## 适用场景
 

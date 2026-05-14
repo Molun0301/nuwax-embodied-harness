@@ -83,8 +83,7 @@ def generate_launch_description():
     pcd_initial_pose_cloud_topic = LaunchConfiguration("pcd_initial_pose_cloud_topic")
     auto_spin_after_initial_pose = LaunchConfiguration("auto_spin_after_initial_pose")
     use_waypoint_follower = LaunchConfiguration("use_waypoint_follower")
-    use_explore = LaunchConfiguration("use_explore")
-    explore_params_file = LaunchConfiguration("explore_params_file")
+    use_front_align_cmd_vel_gate = LaunchConfiguration("use_front_align_cmd_vel_gate")
     slam_params_file = LaunchConfiguration("slam_params_file")
 
     slam_launch = IncludeLaunchDescription(
@@ -165,6 +164,7 @@ def generate_launch_description():
                 executable="front_align_cmd_vel_gate",
                 name="front_align_cmd_vel_gate",
                 output="screen",
+                condition=IfCondition(use_front_align_cmd_vel_gate),
                 parameters=[
                     params_file,
                     {
@@ -289,16 +289,7 @@ def generate_launch_description():
         )
     )
 
-    explore_node = Node(
-        package="explore_lite",
-        executable="explore",
-        name="explore_node",
-        output="screen",
-        condition=IfCondition(use_explore),
-        parameters=[explore_params_file, {"use_sim_time": use_sim_time}],
-        remappings=[("/tf", "tf"), ("/tf_static", "tf_static")],
-        arguments=["--ros-args", "--log-level", log_level],
-    )
+    explore_node = None
 
     rviz_node = Node(
         package="rviz2",
@@ -333,10 +324,10 @@ def generate_launch_description():
             DeclareLaunchArgument("pcd_initial_pose_cloud_topic", default_value="/utlidar/cloud_deskewed"),
             DeclareLaunchArgument("auto_spin_after_initial_pose", default_value="false"),
             DeclareLaunchArgument("use_waypoint_follower", default_value="false"),
-            DeclareLaunchArgument("use_explore", default_value="false"),
             DeclareLaunchArgument(
-                "explore_params_file",
-                default_value=os.path.join(nav2_pkg, "config", "explore_params.yaml"),
+                "use_front_align_cmd_vel_gate",
+                default_value="true",
+                description="Go2 cmd_vel 整形节点开关；其他机器人接入时通过 use_front_align_cmd_vel_gate:=false 关闭",
             ),
             robot_bringup,
             robot_localization,
@@ -344,7 +335,6 @@ def generate_launch_description():
             localization_nodes,
             slam_launch,
             nav2_nodes,
-            explore_node,
             rviz_node,
         ]
     )

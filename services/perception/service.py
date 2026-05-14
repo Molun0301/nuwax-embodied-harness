@@ -11,6 +11,7 @@ from contracts.runtime_views import PerceptionContext
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from gateways.errors import GatewayError
 from providers import ImageProvider, LocalizationProvider, PointCloudProvider
+from providers.image import StreamingImageProvider
 from services.artifact_service import ArtifactService
 from services.perception.base import (
     DetectionBundle,
@@ -328,7 +329,9 @@ class PerceptionService:
         """从当前图像提供器抓取一帧并完成完整感知。"""
 
         image_provider = self._get_image_provider()
-        image_frame = image_provider.capture_image(camera_id)
+        image_frame = self._read_latest_pushed_image(image_provider, camera_id)
+        if image_frame is None:
+            image_frame = image_provider.capture_image(camera_id)
         resolved_camera_id = image_frame.camera_id
         camera_info = image_provider.get_camera_info(resolved_camera_id)
         self._publish_video_frame(
@@ -384,11 +387,33 @@ class PerceptionService:
         requested_by: Optional[str] = None,
     ) -> None:
         image_provider = self._get_image_provider()
-        image_frame = image_provider.capture_image(camera_id)
+        image_frame = self._read_latest_pushed_image(image_provider, camera_id)
+        if image_frame is None:
+            return
         self._publish_video_frame(
             image_frame,
             source_name=image_provider.provider_name,
         )
+
+    def _read_latest_pushed_image(
+        self,
+        image_provider: ImageProvider,
+        camera_id: Optional[str],
+    ) -> Optional["ImageFrame"]:
+        if not isinstance(image_provider, StreamingImageProvider):
+            return None
+        getter = getattr(image_provider, "get_latest_image", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(camera_id)
+        except TypeError:
+            try:
+                return getter()
+            except Exception:
+                return None
+        except Exception:
+            return None
 
     def get_latest_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
         """返回最新感知结果。"""

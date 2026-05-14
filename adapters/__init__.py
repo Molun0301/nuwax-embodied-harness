@@ -8,7 +8,6 @@ from adapters.base import (
     AdapterLifecycleState,
 )
 from adapters.localization.odom_pose_adapter import OdomPoseAdapter
-from adapters.mapping.nav2_costmap_adapter import Nav2CostMapAdapter
 from adapters.mapping.slam_occupancy_adapter import SlamOccupancyAdapter
 from adapters.perception.external_perception_service_adapter import ExternalPerceptionServiceAdapter
 from adapters.streams.ros_image_adapter import RosImageAdapter
@@ -21,7 +20,6 @@ __all__ = [
     "AdapterHealthStatus",
     "AdapterLifecycleState",
     "ExternalPerceptionServiceAdapter",
-    "Nav2CostMapAdapter",
     "OdomPoseAdapter",
     "RosImageAdapter",
     "SlamOccupancyAdapter",

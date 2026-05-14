@@ -1,4 +1,5 @@
 from contracts.geometry_runtime import (
+    BackendStateConfig,
     ExternalGeometryStackConfig,
     GeometryFrameConfig,
     GeometryOdometryQualityConfig,
@@ -17,6 +18,7 @@ from contracts.geometry_runtime import (
 )
 
 __all__ = [
+    "BackendStateConfig",
     "ExternalGeometryStackConfig",
     "GeometryFrameConfig",
     "GeometryOdometryQualityConfig",

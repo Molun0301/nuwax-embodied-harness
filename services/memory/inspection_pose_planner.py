@@ -17,11 +17,15 @@ class InspectionPosePlanner:
         cost_threshold: float = 60.0,
         candidate_radii_m: Sequence[float] = (0.8, 1.2, 1.6),
         candidate_angles_deg: Sequence[float] = (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0),
+        max_view_distance_m: float = 5.0,
+        visibility_step_factor: float = 1.0,
     ) -> None:
         self._occupied_threshold = max(0, min(100, int(occupied_threshold)))
         self._cost_threshold = float(cost_threshold)
         self._candidate_radii_m = tuple(float(item) for item in candidate_radii_m if float(item) > 0.0)
         self._candidate_angles_deg = tuple(float(item) for item in candidate_angles_deg)
+        self._max_view_distance_m = max(0.1, float(max_view_distance_m))
+        self._visibility_step_factor = max(0.1, float(visibility_step_factor))
 
     def plan_for_target(
         self,
@@ -47,6 +51,7 @@ class InspectionPosePlanner:
                     pose,
                     occupancy_grid=occupancy_grid,
                     cost_map=cost_map,
+                    target_pose=target_pose,
                 )
                 if not traversable:
                     continue
@@ -79,6 +84,7 @@ class InspectionPosePlanner:
         *,
         occupancy_grid: Optional[OccupancyGrid],
         cost_map: Optional[CostMap],
+        target_pose: Optional[Pose] = None,
     ) -> Tuple[bool, float]:
         occupancy_penalty = 0.0
         if occupancy_grid is not None:
@@ -94,7 +100,57 @@ class InspectionPosePlanner:
                 return False, 1.0
             cost_penalty = float(cost_value) / max(1.0, self._cost_threshold)
 
-        return True, occupancy_penalty + cost_penalty
+        visibility_penalty = 0.0
+        if target_pose is not None and occupancy_grid is not None:
+            visible, hit_ratio = self._visibility_check(pose, target_pose, occupancy_grid)
+            if not visible:
+                return False, 1.0
+            visibility_penalty = max(0.0, min(0.5, hit_ratio * 0.4))
+
+        return True, occupancy_penalty + cost_penalty + visibility_penalty
+
+    def _visibility_check(
+        self,
+        candidate_pose: Pose,
+        target_pose: Pose,
+        occupancy_grid: OccupancyGrid,
+    ) -> Tuple[bool, float]:
+        """沿 candidate→target 方向做光线投射，遮挡视为不可见。"""
+
+        distance_m = self._distance(candidate_pose, target_pose)
+        if distance_m <= 1e-6:
+            return True, 0.0
+        max_distance_m = min(distance_m, self._max_view_distance_m)
+        resolution = float(getattr(occupancy_grid, "resolution_m", 0.0) or 0.0)
+        if resolution <= 0.0:
+            return True, 0.0
+        step_m = max(resolution * self._visibility_step_factor, resolution)
+        step_count = max(1, int(max_distance_m / step_m))
+        delta_x = float(target_pose.position.x) - float(candidate_pose.position.x)
+        delta_y = float(target_pose.position.y) - float(candidate_pose.position.y)
+        unit_x = delta_x / distance_m
+        unit_y = delta_y / distance_m
+        cumulative_hits = 0
+        for index in range(1, step_count + 1):
+            travel = min(index * step_m, max_distance_m)
+            sample_x = float(candidate_pose.position.x) + (unit_x * travel)
+            sample_y = float(candidate_pose.position.y) + (unit_y * travel)
+            sample_pose = Pose(
+                frame_id=candidate_pose.frame_id,
+                position=Vector3(x=sample_x, y=sample_y, z=float(candidate_pose.position.z)),
+                orientation=candidate_pose.orientation,
+            )
+            value = self._sample_grid_value(occupancy_grid, sample_pose)
+            if value is None:
+                continue
+            if value < 0:
+                continue
+            if value >= self._occupied_threshold and travel < distance_m - resolution * 0.5:
+                return False, 1.0
+            if value >= self._occupied_threshold * 0.7:
+                cumulative_hits += 1
+        hit_ratio = cumulative_hits / max(1, step_count)
+        return True, hit_ratio
 
     def _sample_grid_value(self, grid, pose: Pose):
         resolution = float(grid.resolution_m)

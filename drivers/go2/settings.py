@@ -150,6 +150,7 @@ class Go2DataPlaneConfig:
     cyclonedds_lib_dir: str = ""
     sdk_path: str = ""
     dds_iface: str = ""
+    expected_odom_frame: str = ""
     direct_dds: Go2DirectDdsConfig = field(default_factory=Go2DirectDdsConfig)
     official: Go2OfficialControlConfig = field(default_factory=Go2OfficialControlConfig)
 
@@ -172,6 +173,9 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
             "GO2_DATA_PLANE_DDS_IFACE",
             _cfg_str("GO2_DDS_IFACE", ""),
         ),
+        expected_odom_frame=str(
+            platform_geometry.frames.odom_frame if platform_geometry is not None else ""
+        ).strip(),
         direct_dds=Go2DirectDdsConfig(
             enabled=_cfg_bool("GO2_DIRECT_DDS_ENABLED", True),
             pose_topic=_cfg_str("GO2_DIRECT_DDS_POSE_TOPIC", "rt/sportmodestate"),

@@ -18,6 +18,84 @@ from contracts.naming import validate_capability_name
 CapabilityHandler = Callable[..., Any]
 
 
+PLATFORM_GEOMETRY_OWNER = "platform_geometry_runtime"
+GATEWAY_OWNER = "gateway_runtime"
+ROBOT_PRIVATE_OWNER = "robot_private_runtime"
+OPS_DEBUG_OWNER = "ops_debug_runtime"
+
+
+PLATFORM_GEOMETRY_CAPABILITIES = frozenset(
+    {
+        "get_localization_snapshot",
+        "get_localization_session",
+        "relocalize_active_map",
+        "get_map_snapshot",
+        "list_maps",
+        "create_map",
+        "activate_map",
+        "delete_map",
+        "get_active_map",
+        "list_map_versions",
+        "save_active_map_version",
+        "load_map_version",
+        "delete_map_version",
+        "navigate_to_pose",
+        "navigate_to_named_location",
+        "explore_area",
+        "explore_and_find_target",
+        "find_target",
+        "inspect_target",
+        "follow_target",
+        "relative_move",
+        "get_navigation_snapshot",
+        "get_navigation_semantic_context",
+        "resolve_navigation_candidates",
+    }
+)
+
+ROBOT_DEVICE_CAPABILITIES = frozenset(
+    {
+        "capture_image",
+        "get_robot_state",
+        "get_robot_status",
+        "get_imu_state",
+        "get_joint_state",
+        "get_joint_states",
+        "send_motion_command",
+        "stop_all_motion",
+        "request_safe_stop",
+        "get_safety_state",
+        "get_battery_state",
+        "get_low_state",
+        "execute_sport_command",
+        "set_body_pose",
+        "set_speed_level",
+        "switch_control_mode",
+        "set_obstacle_avoidance",
+        "get_volume",
+        "set_volume",
+        "speak_text",
+    }
+)
+
+
+_PLATFORM_OWNER_ALLOWED = frozenset({PLATFORM_GEOMETRY_OWNER, GATEWAY_OWNER, OPS_DEBUG_OWNER})
+_ROBOT_OWNER_ALLOWED = frozenset({ROBOT_PRIVATE_OWNER, GATEWAY_OWNER, OPS_DEBUG_OWNER})
+
+
+def _enforce_owner_whitelist(capability_name: str, owner: str) -> None:
+    if capability_name in PLATFORM_GEOMETRY_CAPABILITIES and owner not in _PLATFORM_OWNER_ALLOWED:
+        raise ValueError(
+            f"Capability {capability_name} 必须由平台主链 owner 注册，"
+            f"允许 owner={sorted(_PLATFORM_OWNER_ALLOWED)}，收到 owner={owner!r}"
+        )
+    if capability_name in ROBOT_DEVICE_CAPABILITIES and owner not in _ROBOT_OWNER_ALLOWED:
+        raise ValueError(
+            f"Capability {capability_name} 必须由机器人 owner 注册，"
+            f"允许 owner={sorted(_ROBOT_OWNER_ALLOWED)}，收到 owner={owner!r}"
+        )
+
+
 class CapabilityRuntimeView(ContractModel):
     """运行时能力视图。"""
 
@@ -66,8 +144,12 @@ class CapabilityRegistry:
         owner: str = "runtime",
         metadata: Optional[MetadataDict] = None,
         overwrite: bool = False,
+        bypass_owner_check: bool = False,
     ) -> RegisteredCapability:
         """注册一项能力。"""
+
+        if not bypass_owner_check:
+            _enforce_owner_whitelist(descriptor.name, owner)
 
         with self._lock:
             if descriptor.name in self._registrations and not overwrite:

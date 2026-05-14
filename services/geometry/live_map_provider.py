@@ -164,14 +164,6 @@ class Ros2LiveMapProvider:
         with self._lock:
             return self._map_update_subscribers.pop(subscription_id, None) is not None
 
-    def activate_platform_map_version(self, **_: Any) -> Dict[str, object]:
-        return {
-            "backend_switch_applied": False,
-            "live_geometry_active": self.is_map_available(),
-            "reason": "live_ros2_map_provider_observes_current_map_only",
-            "provider_status": self.get_status(),
-        }
-
     def get_status(self) -> Dict[str, object]:
         with self._lock:
             occupancy_grid = (

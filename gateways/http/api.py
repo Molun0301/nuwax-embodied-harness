@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from gateways.auth import GatewayAccessManager
-from gateways.errors import as_gateway_error
+from gateways.errors import AccessDeniedError, as_gateway_error
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable
 from gateways.tcp_legacy.policy import build_tcp_legacy_policy
@@ -399,7 +399,12 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/legacy/tcp_policy")
     async def api_tcp_policy(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
+        access = access_manager.authenticate_http(request)
+        if access.role.value != "admin":
+            raise AccessDeniedError(
+                "tcp_legacy 策略仅 admin 角色可访问。",
+                details={"role": access.role.value, "endpoint": "/api/legacy/tcp_policy"},
+            )
         return to_jsonable(build_tcp_legacy_policy())
 
     @router.get("/api/state/latest")

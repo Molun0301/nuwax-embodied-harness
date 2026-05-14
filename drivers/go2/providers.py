@@ -67,13 +67,21 @@ class Go2ProviderBundle(
         return self.assembly.high_level_initialized
 
     def is_image_available(self) -> bool:
-        if self.assembly.high_level_initialized:
-            return True
         data_plane = getattr(self.assembly, "data_plane", None)
-        getter = getattr(data_plane, "get_latest_image", None)
-        if not callable(getter):
-            return False
-        return getter() is not None
+        if data_plane is not None:
+            status_getter = getattr(data_plane, "get_status", None)
+            status = status_getter() if callable(status_getter) else {}
+            bridge_status = status.get("bridge") if isinstance(status, dict) else {}
+            if bool(
+                isinstance(status, dict)
+                and status.get("enabled")
+                and status.get("started")
+                and isinstance(bridge_status, dict)
+                and bridge_status.get("direct_dds_started")
+                and bridge_status.get("dds_video_subscribed")
+            ):
+                return True
+        return self.assembly.high_level_initialized
 
     def get_robot_state(self) -> RobotState:
         low_level_running = bool(
@@ -217,6 +225,27 @@ class Go2ProviderBundle(
         unsubscriber = getattr(self.assembly.data_plane, "unsubscribe_image", None)
         if callable(unsubscriber):
             unsubscriber(subscription_id)
+
+    def get_latest_image(self, camera_id: Optional[str] = None) -> Optional[ImageFrame]:
+        del camera_id
+        if self.assembly.data_plane is None:
+            return None
+        status_getter = getattr(self.assembly.data_plane, "get_status", None)
+        status = status_getter() if callable(status_getter) else {}
+        bridge_status = status.get("bridge") if isinstance(status, dict) else {}
+        if not bool(
+            isinstance(status, dict)
+            and status.get("enabled")
+            and status.get("started")
+            and isinstance(bridge_status, dict)
+            and bridge_status.get("direct_dds_started")
+            and bridge_status.get("dds_video_subscribed")
+        ):
+            return None
+        getter = getattr(self.assembly.data_plane, "get_latest_image", None)
+        if not callable(getter):
+            return None
+        return getter()
 
     def subscribe_robot_state(self, callback: Callable[[RobotState], None]) -> Optional[int]:
         return self.subscribe_localization(lambda pose, frame_tree, metadata: callback(self._build_robot_state_from_stream(pose, metadata)))

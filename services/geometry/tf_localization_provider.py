@@ -32,11 +32,24 @@ class Ros2TfLocalizationProvider:
 
     def __init__(self, config: PlatformGeometryConfig) -> None:
         self.config = config
-        self.tf_topic = str(config.topics.tf_topic or "/tf")
-        self.tf_static_topic = str(config.topics.tf_static_topic or "/tf_static")
-        self.map_frame = self._normalize_frame_id(config.frames.map_frame) or "map"
-        self.odom_frame = self._normalize_frame_id(config.frames.odom_frame) or "odom"
-        self.base_frame = self._normalize_frame_id(config.frames.base_frame) or "body"
+        tf_topic = str(config.topics.tf_topic or "").strip()
+        tf_static_topic = str(config.topics.tf_static_topic or "").strip()
+        if not tf_topic or not tf_static_topic:
+            raise ValueError(
+                "PlatformGeometryConfig.topics.tf_topic / tf_static_topic 必须显式配置，禁止使用兜底字面值。"
+            )
+        map_frame = self._normalize_frame_id(config.frames.map_frame)
+        odom_frame = self._normalize_frame_id(config.frames.odom_frame)
+        base_frame = self._normalize_frame_id(config.frames.base_frame)
+        if not map_frame or not odom_frame or not base_frame:
+            raise ValueError(
+                "PlatformGeometryConfig.frames.map_frame / odom_frame / base_frame 必须显式配置，禁止使用兜底字面值。"
+            )
+        self.tf_topic = tf_topic
+        self.tf_static_topic = tf_static_topic
+        self.map_frame = map_frame
+        self.odom_frame = odom_frame
+        self.base_frame = base_frame
         self._max_tf_age_sec = max(0.05, float(config.rtabmap.timestamp_quality.max_tf_age_sec or 0.5))
         self._lock = threading.RLock()
         self._started = False

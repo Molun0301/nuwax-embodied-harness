@@ -13,7 +13,7 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, TYPE_CHECKING, runtime_checkable
 from urllib.parse import quote
 
 from contracts.geometry import Pose, Vector3
@@ -28,7 +28,6 @@ from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
 from providers.pointcloud import PointCloudProvider
 from services.geometry.config import PlatformGeometryConfig
-from services.geometry.frontier_marker_provider import Ros2FrontierMarkerProvider
 from services.geometry.live_map_provider import Ros2LiveMapProvider
 from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
 from services.geometry.odometry_publisher import Ros2OdometryPublisher
@@ -38,6 +37,9 @@ from services.navigation.config import ExplorationConfig, NavigationBackendConfi
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
 from services.navigation.frontier import FrontierExplorer
 from services.navigation.runtime import GridNavigationPlanner
+
+if TYPE_CHECKING:
+    from core.event_bus import EventBus
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.runtime")
 
@@ -202,17 +204,22 @@ class PlatformGeometryRuntime:
         config: PlatformGeometryConfig,
         catalog_root: str,
         robot: RobotAssemblyBase,
+        event_bus: Optional["EventBus"] = None,
     ) -> None:
         self.config = config
         self.robot = robot
+        self._event_bus = event_bus
         self._catalog_root = Path(catalog_root).expanduser()
         self._catalog_root.mkdir(parents=True, exist_ok=True)
         self._active_map_version: Optional[MapVersion] = None
         self._last_activation_result: Dict[str, object] = {}
         self._live_map_provider = Ros2LiveMapProvider(config)
-        self._frontier_marker_provider = Ros2FrontierMarkerProvider(config)
         self._tf_localization_provider = Ros2TfLocalizationProvider(config)
-        self._odometry_publisher = Ros2OdometryPublisher(config, self._resolve_raw_localization_backend)
+        self._odometry_publisher = Ros2OdometryPublisher(
+            config,
+            self._resolve_raw_localization_backend,
+            event_bus=event_bus,
+        )
         self._point_cloud_publisher = Ros2PointCloudPublisher(config, self._resolve_point_cloud_provider)
         self._live_geometry_start_lock = threading.RLock()
         self._live_geometry_start_attempted = False
@@ -283,7 +290,6 @@ class PlatformGeometryRuntime:
             self._set_runtime_state("failed", "平台几何运行时启动失败：%s" % exc, blocked=True)
             self._stop_managed_processes()
             self._live_map_provider.stop()
-            self._frontier_marker_provider.stop()
             self._tf_localization_provider.stop()
             self._odometry_publisher.stop()
             self._point_cloud_publisher.stop()
@@ -304,7 +310,6 @@ class PlatformGeometryRuntime:
             thread.join(timeout=2.0)
         self._stop_managed_processes()
         self._live_map_provider.stop()
-        self._frontier_marker_provider.stop()
         self._tf_localization_provider.stop()
         self._odometry_publisher.stop()
         self._point_cloud_publisher.stop()
@@ -1062,7 +1067,6 @@ class PlatformGeometryRuntime:
             if (
                 self._live_map_provider.is_available()
                 and self._tf_localization_provider.is_available()
-                and self._frontier_marker_provider.is_available()
                 and input_bridge_ready
             ):
                 return
@@ -1073,7 +1077,6 @@ class PlatformGeometryRuntime:
                 if point_cloud_bridge_enabled:
                     self._point_cloud_publisher.start()
                 self._live_map_provider.start()
-                self._frontier_marker_provider.start()
                 self._tf_localization_provider.start()
             except Exception:
                 if input_bridge_enabled:
@@ -1081,7 +1084,6 @@ class PlatformGeometryRuntime:
                 if point_cloud_bridge_enabled:
                     self._point_cloud_publisher.stop()
                 self._live_map_provider.stop()
-                self._frontier_marker_provider.stop()
                 self._tf_localization_provider.stop()
                 self._live_geometry_start_attempted = False
                 raise
@@ -1318,7 +1320,8 @@ class PlatformGeometryRuntime:
             point_cloud_source.get("source_topic")
             or data_plane_status.get("point_cloud_source_topic")
             or data_plane_status.get("direct_dds_point_cloud_topic")
-            or "rt/utlidar/cloud"
+            or self.config.topics.point_cloud_topic
+            or ""
         )
         if published_count <= 0:
             if data_plane_status.get("enabled") is False:
@@ -1389,33 +1392,33 @@ class PlatformGeometryRuntime:
         previous_asset = version.geometry_asset
         parameter_summary = self._build_parameter_summary()
         profile_summary = self._clone_metadata(parameter_summary.get("profile") or {})
-        rtabmap_db_path = self._version_rtabmap_database_path(version.map_name, version.version_id)
+        backend_state_path = self._version_backend_state_path(version.map_name, version.version_id)
         pcd_path = self._version_pcd_asset_path(version.map_name, version.version_id)
         built_at = previous_asset.built_at if previous_asset is not None else version.timestamp
-        rtabmap_run = self._build_rtabmap_run_metadata()
-        database_metadata = self._materialize_rtabmap_database(rtabmap_db_path)
+        backend_run = self._build_rtabmap_run_metadata()
+        database_metadata = self._materialize_backend_state(backend_state_path)
         pcd_metadata = self._materialize_pcd_asset(pcd_path)
         nav2_map_metadata = self._materialize_nav2_map_assets(version)
         quality_metrics = self._build_geometry_quality_metrics(
             database_metadata=database_metadata,
             pcd_metadata=pcd_metadata,
-            rtabmap_run=rtabmap_run,
+            rtabmap_run=backend_run,
             nav2_map_metadata=nav2_map_metadata,
         )
         database_quality = dict(quality_metrics.get("database") or {})
         database_required = bool(database_quality.get("required", True))
         database_present = bool(database_quality.get("present", False))
-        database_asset_type = (
-            MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE
-            if self._uses_external_geometry_stack()
-            else MapGeometryAssetType.RTABMAP_DATABASE
-        )
+        # external_slam_nav2 真实后端是 slam_toolbox：state asset type 用新枚举值。
+        if self._uses_external_geometry_stack():
+            database_asset_type = MapGeometryAssetType.SLAM_TOOLBOX_POSEGRAPH
+        else:
+            database_asset_type = MapGeometryAssetType.RTABMAP_DATABASE
         asset_refs = []
         if database_required or database_present:
             asset_refs.append(
                 MapGeometryAssetRef(
                     asset_type=database_asset_type,
-                    path=str(rtabmap_db_path),
+                    path=str(backend_state_path),
                     frame_id=version.frame_id,
                     profile_summary=profile_summary,
                     built_at=built_at,
@@ -1452,7 +1455,9 @@ class PlatformGeometryRuntime:
             version_id=version.version_id,
             geometry_stack=self.config.stack,
             frame_id=version.frame_id,
-            rtabmap_db_path=str(rtabmap_db_path),
+            backend_state_path=str(backend_state_path),
+            # 老 version.json 兼容：rtabmap_db_path 与 backend_state_path 同步写。
+            rtabmap_db_path=str(backend_state_path),
             pcd_path=str(pcd_path),
             occupancy_projection=self.config.rtabmap.occupancy_projection,
             costmap_source=self.config.nav2.costmap_source,
@@ -1476,9 +1481,11 @@ class PlatformGeometryRuntime:
                 "relocalization_diagnostics_contract": self.config.rtabmap.outputs.relocalization_diagnostics,
                 "source_mode": quality_metrics.get("source_mode"),
                 "streaming_readiness": self._clone_metadata(quality_metrics.get("streaming_readiness")),
-                "rtabmap_run": rtabmap_run,
-                "session_id": rtabmap_run.get("session_id"),
-                "run_id": rtabmap_run.get("run_id"),
+                "backend_run": backend_run,
+                # 兼容老消费方继续读 rtabmap_run。
+                "rtabmap_run": backend_run,
+                "session_id": backend_run.get("session_id"),
+                "run_id": backend_run.get("run_id"),
                 "database": database_metadata,
                 "pcd": pcd_metadata,
                 "nav2_map": nav2_map_metadata,
@@ -1496,8 +1503,13 @@ class PlatformGeometryRuntime:
                 "metadata": {
                     **dict(version.metadata),
                     "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset),
-                    "rtabmap_session_id": rtabmap_run.get("session_id"),
-                    "rtabmap_run_id": rtabmap_run.get("run_id"),
+                    "backend_session_id": backend_run.get("session_id"),
+                    "backend_run_id": backend_run.get("run_id"),
+                    "backend_state_path": database_metadata.get("database_source_path") or database_metadata.get("database_target_path"),
+                    "backend_streaming_ready": quality_metrics.get("live_streaming_ready"),
+                    # 老消费方读老 metadata key 时仍能解析（迁移期保留 alias）。
+                    "rtabmap_session_id": backend_run.get("session_id"),
+                    "rtabmap_run_id": backend_run.get("run_id"),
                     "rtabmap_database_path": database_metadata.get("database_source_path") or database_metadata.get("database_target_path"),
                     "rtabmap_live_streaming_ready": quality_metrics.get("live_streaming_ready"),
                     "map_version_source_mode": quality_metrics.get("source_mode"),
@@ -1509,13 +1521,25 @@ class PlatformGeometryRuntime:
             deep=True,
         )
 
-    def activate_map_version(self, version: MapVersion) -> MapSnapshot:
-        """激活平台地图版本对应的几何资产。"""
+    def activate_map_version(
+        self,
+        version: MapVersion,
+        *,
+        require_backend_switch: bool = True,
+    ) -> MapSnapshot:
+        """激活平台地图版本对应的几何资产。
+
+        require_backend_switch=False 时（activate_map / restore_active_workspace 默认路径）：
+        实时栈下不重启 SLAM 进程，仅在平台层标记活跃版本，让上层 ingest 种子图。
+        """
 
         prepared_version = self.prepare_map_version_assets(version)
         geometry_asset = prepared_version.geometry_asset
         assert geometry_asset is not None
-        activation_result = self._activate_backend_map_version(prepared_version)
+        activation_result = self._activate_backend_map_version(
+            prepared_version,
+            require_backend_switch=require_backend_switch,
+        )
         self._active_map_version = prepared_version.model_copy(deep=True)
         self._last_activation_result = activation_result
 
@@ -1553,11 +1577,23 @@ class PlatformGeometryRuntime:
             source_kind="platform_live_map_provider",
         ))
         if self._live_map_payload_under_covers_seed(payload, metadata, version):
+            live_known_cells = self._metadata_known_cell_count(metadata)
+            if live_known_cells is None:
+                live_known_cells = self._occupancy_known_cell_count(payload.get("occupancy_grid"))
+            seed_known_cells = self._occupancy_known_cell_count(version.snapshot.occupancy_grid)
             metadata.update({
                 "event_type": "heartbeat",
                 "suppressed_live_map_update": True,
                 "suppressed_live_map_reason": "live_occupancy_known_cells_below_seed_map",
+                "live_known_cell_count": live_known_cells,
+                "seed_known_cell_count": seed_known_cells,
             })
+            self._publish_snapshot_suppressed_event(
+                version=version,
+                metadata=metadata,
+                live_known_cells=live_known_cells,
+                seed_known_cells=seed_known_cells,
+            )
             return {
                 **payload,
                 "occupancy_grid": None,
@@ -1570,6 +1606,43 @@ class PlatformGeometryRuntime:
             "semantic_map": payload.get("semantic_map") or self._clone_contract(version.snapshot.semantic_map),
             "metadata": metadata,
         }
+
+    def _publish_snapshot_suppressed_event(
+        self,
+        *,
+        version: MapVersion,
+        metadata: Dict[str, object],
+        live_known_cells,
+        seed_known_cells,
+    ) -> None:
+        """把 live<seed 抑制语义通过 EventBus 暴露给消费方，避免静默卡图。"""
+
+        event_bus = getattr(self.robot, "event_bus", None) or getattr(self, "_event_bus", None)
+        if event_bus is None:
+            return
+        try:
+            from contracts.events import RuntimeEventCategory
+            payload = {
+                "map_name": version.map_name,
+                "map_version_id": version.version_id,
+                "suppressed_live_map_reason": metadata.get("suppressed_live_map_reason"),
+                "live_known_cell_count": live_known_cells,
+                "seed_known_cell_count": seed_known_cells,
+                "source_topic": str(getattr(self._live_map_provider, "occupancy_topic", "") or ""),
+                "frame_id": metadata.get("frame_id"),
+                "update_sequence": metadata.get("update_sequence"),
+            }
+            event_bus.publish(
+                event_bus.build_event(
+                    "mapping.snapshot_suppressed",
+                    category=RuntimeEventCategory.ROBOT,
+                    source="platform_geometry_runtime",
+                    message="live_map known_cell_count 低于种子，已抑制本帧。",
+                    payload=payload,
+                )
+            )
+        except Exception:
+            LOGGER.debug("发布 mapping.snapshot_suppressed 失败。", exc_info=True)
 
     def _live_map_payload_under_covers_seed(self, payload, metadata: Dict[str, object], version: MapVersion) -> bool:
         if str(metadata.get("event_type") or "content_update") != "content_update":
@@ -1884,9 +1957,36 @@ class PlatformGeometryRuntime:
         return self._version_geometry_root(map_name, version_id) / "geometry_asset.json"
 
     def _version_rtabmap_database_path(self, map_name: str, version_id: str) -> Path:
+        """Deprecated alias —— 转向通用 _version_backend_state_path。"""
+
+        return self._version_backend_state_path(map_name, version_id)
+
+    def _version_backend_state_path(self, map_name: str, version_id: str) -> Path:
+        """统一返回该地图版本的 SLAM 后端状态文件路径。
+
+        - external_slam_nav2 真实后端是 slam_toolbox：状态文件由
+          slam_toolbox `serialize_map` 服务写出 `<prefix>.posegraph` + `<prefix>.data`，
+          这里返回 prefix（不带后缀）：`slam_toolbox/<safe(map_name)>`。
+        - 兼容内置 RTAB-Map 历史栈：返回 `<root>/rtabmap/<database_asset_name>`。
+        """
+
         if self._uses_external_geometry_stack():
-            return self._version_geometry_root(map_name, version_id) / "external_slam_nav2" / self._external_slam_nav2_state_asset_name()
+            return self._version_geometry_root(map_name, version_id) / "slam_toolbox" / self._slam_toolbox_state_basename(map_name)
         return self._version_geometry_root(map_name, version_id) / "rtabmap" / self.config.rtabmap.outputs.database_asset_name
+
+    def _slam_toolbox_state_basename(self, map_name: str) -> str:
+        """规整 map_name 为 slam_toolbox serialize/deserialize 用的文件名前缀。"""
+
+        normalized = []
+        for ch in str(map_name or "").strip():
+            if ch.isalnum():
+                normalized.append(ch.lower())
+            else:
+                normalized.append("_")
+        joined = "".join(normalized).strip("_") or "map"
+        while "__" in joined:
+            joined = joined.replace("__", "_")
+        return joined
 
     def _external_slam_nav2_state_asset_name(self) -> str:
         configured_name = str(getattr(self.config.rtabmap.outputs, "database_asset_name", "") or "").strip()
@@ -1972,41 +2072,64 @@ class PlatformGeometryRuntime:
         return self._clone_metadata(self.config.build_metadata())
 
     def _materialize_rtabmap_database(self, target_path: Path) -> Dict[str, object]:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        source_path = self._locate_live_rtabmap_database()
-        if source_path is None:
-            if target_path.exists() and target_path.is_file():
-                return {
-                    "database_present": True,
-                    "database_source_kind": "persisted_asset",
-                    "database_source_path": str(target_path.resolve()),
-                    "database_target_path": str(target_path.resolve()),
-                    "database_target": self._file_metadata(target_path),
-                }
+        """Deprecated alias —— 转向 _materialize_backend_state。"""
+
+        return self._materialize_backend_state(target_path)
+
+    def _materialize_backend_state(self, target_path: Path) -> Dict[str, object]:
+        """根据当前几何栈持久化 SLAM 后端状态。
+
+        - external_slam_nav2（slam_toolbox）：调 `/slam_toolbox/serialize_map`
+          把 `<prefix>.posegraph + <prefix>.data` 写到 target_path 同名前缀。
+        - 历史 RTAB-Map 内置栈：保留原 .db 拷贝逻辑。
+        """
+
+        if self._uses_external_geometry_stack():
+            return self._materialize_slam_toolbox_state(target_path)
+        return self._materialize_rtabmap_db_legacy(target_path)
+
+    def _materialize_slam_toolbox_state(self, target_prefix: Path) -> Dict[str, object]:
+        """让 slam_toolbox 把当前 pose-graph 持久化到 versions/<v>/geometry/slam_toolbox/<prefix>。"""
+
+        target_prefix.parent.mkdir(parents=True, exist_ok=True)
+        posegraph_path = target_prefix.with_suffix(".posegraph")
+        data_path = target_prefix.with_suffix(".data")
+        # 调 /slam_toolbox/serialize_map 服务（filename 不带后缀，slam_toolbox 自动加 .posegraph + .data）。
+        service_result = self._call_slam_toolbox_serialize_map(str(target_prefix))
+        present = posegraph_path.exists() and posegraph_path.is_file() and data_path.exists() and data_path.is_file()
+        if present:
             return {
-                "database_present": False,
-                "database_source_kind": "unavailable",
-                "database_source_path": None,
-                "database_target_path": str(target_path.resolve()),
+                "database_present": True,
+                "database_source_kind": "slam_toolbox_serialize",
+                "database_source_path": str(target_prefix.resolve()),
+                "database_target_path": str(target_prefix.resolve()),
+                "database_target": self._file_metadata(posegraph_path),
+                "posegraph_path": str(posegraph_path.resolve()),
+                "posegraph": self._file_metadata(posegraph_path),
+                "data_path": str(data_path.resolve()),
+                "data": self._file_metadata(data_path),
+                "service_call": service_result,
             }
-        resolved_source = source_path.resolve()
-        resolved_target = target_path.resolve()
-        source_before = self._file_metadata(resolved_source)
-        if resolved_source != resolved_target:
-            shutil.copy2(resolved_source, resolved_target)
-        source_after = self._file_metadata(resolved_source)
+        # 服务调用失败或文件没出现：保留磁盘上已有 checkpoint 的兜底（再激活流程能恢复）。
+        if posegraph_path.exists() and data_path.exists():
+            return {
+                "database_present": True,
+                "database_source_kind": "persisted_asset",
+                "database_source_path": str(target_prefix.resolve()),
+                "database_target_path": str(target_prefix.resolve()),
+                "database_target": self._file_metadata(posegraph_path),
+                "posegraph_path": str(posegraph_path.resolve()),
+                "data_path": str(data_path.resolve()),
+                "service_call": service_result,
+            }
         return {
-            "database_present": target_path.exists(),
-            "database_source_kind": "live_runtime",
-            "database_source_path": str(resolved_source),
-            "database_target_path": str(resolved_target),
-            "database_source_before": source_before,
-            "database_source_after": source_after,
-            "database_target": self._file_metadata(resolved_target),
-            "live_db_size_changed_during_copy": (
-                source_before.get("size_bytes") != source_after.get("size_bytes")
-                or source_before.get("mtime_ns") != source_after.get("mtime_ns")
-            ),
+            "database_present": False,
+            "database_source_kind": "slam_toolbox_serialize_unavailable",
+            "database_source_path": None,
+            "database_target_path": str(target_prefix.resolve()),
+            "posegraph_path": str(posegraph_path.resolve()),
+            "data_path": str(data_path.resolve()),
+            "service_call": service_result,
         }
 
     def _materialize_pcd_asset(self, target_path: Path) -> Dict[str, object]:
@@ -2116,15 +2239,36 @@ class PlatformGeometryRuntime:
                     "message": "未能从外部 SLAM/Nav2 进程状态解析真实 run_id。",
                 }
             )
-        backend_checkpoint_ready = nav2_map_present if external_stack else database_present
+        # external_slam_nav2 真实后端是 slam_toolbox：backend_checkpoint_ready 必须证明 posegraph
+        # 已落盘（database_present 来自 _materialize_slam_toolbox_state 的 .posegraph + .data 校验）。
+        # status="ready" 必须 backend checkpoint 与 nav2 map 同时就位，否则只是 snapshot_only。
+        if external_stack:
+            backend_checkpoint_ready = bool(database_present)
+            ready_for_load = backend_checkpoint_ready and nav2_map_present
+            if ready_for_load:
+                status = "ready"
+            elif nav2_map_present:
+                status = "snapshot_only"
+            else:
+                status = "snapshot_only"
+        else:
+            backend_checkpoint_ready = bool(database_present)
+            status = "ready" if backend_checkpoint_ready else "failed"
         return {
-            "status": "ready" if backend_checkpoint_ready else "snapshot_only" if external_stack else "failed",
+            "status": status,
             "live_streaming_ready": live_streaming_ready,
             "checkpoint_ready": backend_checkpoint_ready,
             "backend_checkpoint_ready": backend_checkpoint_ready,
+            "nav2_map_present": nav2_map_present,
             "platform_snapshot_only": bool(external_stack and not backend_checkpoint_ready),
-            "backend_switch_supported": True if external_stack else True,
-            "source_mode": "live_streaming_checkpoint" if live_streaming_ready else "nav2_map_checkpoint" if external_stack and backend_checkpoint_ready else "platform_snapshot_only" if external_stack else "offline_checkpoint",
+            "backend_switch_supported": True,
+            "source_mode": (
+                "live_streaming_checkpoint" if live_streaming_ready
+                else "slam_toolbox_pose_graph" if external_stack and backend_checkpoint_ready
+                else "nav2_map_checkpoint" if external_stack and nav2_map_present
+                else "platform_snapshot_only" if external_stack
+                else "offline_checkpoint"
+            ),
             "streaming_readiness": readiness,
             "rtabmap_run": rtabmap_run,
             "database": {
@@ -2361,54 +2505,242 @@ class PlatformGeometryRuntime:
         return None
 
     def _locate_live_rtabmap_database(self) -> Optional[Path]:
+        """Deprecated alias —— 转向 _locate_live_backend_state。"""
+
+        return self._locate_live_backend_state()
+
+    def _locate_live_backend_state(self) -> Optional[Path]:
+        """定位当前活跃的 SLAM 后端状态文件。
+
+        - external_slam_nav2（slam_toolbox）：同名 .posegraph 路径（与 .data 配对）；
+          活跃地图版本的 backend_state_path 对应 prefix，加 `.posegraph` 后缀检查。
+        - 历史 RTAB-Map 内置栈：保留 .db 扫描路径。
+        """
+
         if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
-            current_db = Path(self._active_map_version.geometry_asset.rtabmap_db_path).expanduser()
-            if current_db.exists() and current_db.is_file():
-                return current_db
+            asset = self._active_map_version.geometry_asset
+            current_prefix = Path(asset.backend_state_path or asset.rtabmap_db_path or "").expanduser()
+            if self._uses_external_geometry_stack():
+                posegraph = current_prefix.with_suffix(".posegraph")
+                data = current_prefix.with_suffix(".data")
+                if posegraph.exists() and data.exists():
+                    return posegraph
+            else:
+                if current_prefix.exists() and current_prefix.is_file():
+                    return current_prefix
 
         mapping_backend = self._resolve_mapping_backend()
         if mapping_backend is not None:
-            getter = getattr(mapping_backend, "get_rtabmap_database_path", None)
+            getter = getattr(mapping_backend, "get_backend_state_path", None) or getattr(mapping_backend, "get_rtabmap_database_path", None)
             if callable(getter):
                 candidate = str(getter() or "").strip()
                 if candidate:
                     candidate_path = Path(candidate).expanduser()
-                    if candidate_path.exists() and candidate_path.is_file():
+                    if self._uses_external_geometry_stack():
+                        posegraph = candidate_path.with_suffix(".posegraph")
+                        data = candidate_path.with_suffix(".data")
+                        if posegraph.exists() and data.exists():
+                            return posegraph
+                    elif candidate_path.exists() and candidate_path.is_file():
                         return candidate_path
 
         configured_root = Path(str(self.config.rtabmap.database_root or "").strip()).expanduser()
-        candidates = []
-        if configured_root.suffix == ".db":
-            candidates.append(configured_root)
-        elif self._uses_external_geometry_stack():
-            state_asset_name = self._external_slam_nav2_state_asset_name()
-            candidates.append(configured_root / state_asset_name)
-            if state_asset_name != _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME:
-                candidates.append(configured_root / _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME)
+        candidates: List[Path] = []
+        if self._uses_external_geometry_stack():
+            # slam_toolbox 默认在 ROS workspace 默认 cwd 或 NUWAX_RTABMAP_DATABASE_ROOT 下写
+            # `<map>.posegraph + <map>.data`；尝试常见前缀。
+            for prefix_name in ("current", "active", "map", "slam_toolbox"):
+                candidates.append(configured_root / (prefix_name + ".posegraph"))
         else:
-            candidates.extend(
-                (
-                    configured_root / "rtabmap.db",
-                    configured_root / "current.db",
-                    configured_root / "active.db",
+            if configured_root.suffix == ".db":
+                candidates.append(configured_root)
+            else:
+                candidates.extend(
+                    (
+                        configured_root / "rtabmap.db",
+                        configured_root / "current.db",
+                        configured_root / "active.db",
+                    )
                 )
-            )
         for candidate in candidates:
             if candidate.exists() and candidate.is_file():
                 return candidate
         return None
 
-    def _activate_backend_map_version(self, version: MapVersion) -> Dict[str, object]:
+    def _materialize_rtabmap_db_legacy(self, target_path: Path) -> Dict[str, object]:
+        """RTAB-Map 历史栈下的 .db 文件拷贝（仅供非 external_slam_nav2 stack 使用）。"""
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path = self._locate_live_backend_state()
+        if source_path is None:
+            if target_path.exists() and target_path.is_file():
+                return {
+                    "database_present": True,
+                    "database_source_kind": "persisted_asset",
+                    "database_source_path": str(target_path.resolve()),
+                    "database_target_path": str(target_path.resolve()),
+                    "database_target": self._file_metadata(target_path),
+                }
+            return {
+                "database_present": False,
+                "database_source_kind": "unavailable",
+                "database_source_path": None,
+                "database_target_path": str(target_path.resolve()),
+            }
+        resolved_source = source_path.resolve()
+        resolved_target = target_path.resolve()
+        source_before = self._file_metadata(resolved_source)
+        if resolved_source != resolved_target:
+            shutil.copy2(resolved_source, resolved_target)
+        source_after = self._file_metadata(resolved_source)
+        return {
+            "database_present": target_path.exists(),
+            "database_source_kind": "live_runtime",
+            "database_source_path": str(resolved_source),
+            "database_target_path": str(resolved_target),
+            "database_source_before": source_before,
+            "database_source_after": source_after,
+            "database_target": self._file_metadata(resolved_target),
+            "live_db_size_changed_during_copy": (
+                source_before.get("size_bytes") != source_after.get("size_bytes")
+                or source_before.get("mtime_ns") != source_after.get("mtime_ns")
+            ),
+        }
+
+    def _call_slam_toolbox_serialize_map(self, filename_prefix: str) -> Dict[str, object]:
+        """调用 /slam_toolbox/serialize_map 把当前 pose-graph 落到指定 prefix。"""
+
+        return self._call_slam_toolbox_filename_service(
+            service_name="/slam_toolbox/serialize_map",
+            service_type="slam_toolbox/srv/SerializePoseGraph",
+            filename_prefix=filename_prefix,
+        )
+
+    def _call_slam_toolbox_deserialize_pose_graph(self, filename_prefix: str) -> Dict[str, object]:
+        """调用 /slam_toolbox/deserialize_pose_graph 把指定 prefix 恢复到 slam_toolbox。
+
+        slam_toolbox 服务定义带 match_type / initial_pose 字段；这里只走最简形态：
+        match_type=START_AT_FIRST_NODE(0) + initial_pose=零。失败由调用方按 fallback 处理。
+        """
+
+        request = (
+            "{filename: '%s', match_type: 0, "
+            "initial_pose: {x: 0.0, y: 0.0, theta: 0.0}}"
+        ) % filename_prefix
+        return self._invoke_ros2_service_call(
+            service_name="/slam_toolbox/deserialize_pose_graph",
+            service_type="slam_toolbox/srv/DeserializePoseGraph",
+            request=request,
+        )
+
+    def _call_slam_toolbox_filename_service(
+        self,
+        *,
+        service_name: str,
+        service_type: str,
+        filename_prefix: str,
+    ) -> Dict[str, object]:
+        request = "{filename: '%s'}" % filename_prefix
+        return self._invoke_ros2_service_call(
+            service_name=service_name,
+            service_type=service_type,
+            request=request,
+        )
+
+    def _invoke_ros2_service_call(
+        self,
+        *,
+        service_name: str,
+        service_type: str,
+        request: str,
+        timeout_sec: float = 8.0,
+    ) -> Dict[str, object]:
+        """对当前 ROS2 环境发一次 `ros2 service call` 同步请求。"""
+
+        command = self._build_launch_prefix() + [
+            "ros2",
+            "service",
+            "call",
+            service_name,
+            service_type,
+            request,
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=max(2.0, float(timeout_sec)),
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "service": service_name,
+                "service_type": service_type,
+                "request": request,
+                "error": "timeout",
+                "timeout_sec": exc.timeout,
+                "command": command,
+            }
+        except FileNotFoundError as exc:
+            return {
+                "ok": False,
+                "service": service_name,
+                "service_type": service_type,
+                "request": request,
+                "error": "ros2_cli_unavailable",
+                "message": str(exc),
+                "command": command,
+            }
+        return {
+            "ok": completed.returncode == 0,
+            "service": service_name,
+            "service_type": service_type,
+            "request": request,
+            "returncode": completed.returncode,
+            "stdout_tail": (completed.stdout or "").strip().splitlines()[-5:],
+            "stderr_tail": (completed.stderr or "").strip().splitlines()[-5:],
+            "command": command,
+        }
+
+    def _activate_backend_map_version(
+        self,
+        version: MapVersion,
+        *,
+        require_backend_switch: bool = True,
+    ) -> Dict[str, object]:
+        """切换后端地图版本。
+
+        require_backend_switch=False 时（activate_map / restore_active_workspace 默认路径）
+        实时栈下不重启 SLAM 进程，仅返回 backend_switch_applied=False 但允许调用方继续 ingest 种子。
+        """
+
         geometry_asset = version.geometry_asset
+        backend_state = (
+            geometry_asset.backend_state_path or geometry_asset.rtabmap_db_path
+            if geometry_asset is not None
+            else None
+        )
         activation_payload = {
             "map_name": version.map_name,
             "version_id": version.version_id,
             "geometry_stack": self.config.stack,
-            "rtabmap_db_path": geometry_asset.rtabmap_db_path if geometry_asset is not None else None,
+            "backend_state_path": backend_state,
+            # 老消费方兼容：保持 rtabmap_db_path 字段读得到。
+            "rtabmap_db_path": backend_state,
             "pcd_path": geometry_asset.pcd_path if geometry_asset is not None else None,
             "frame_id": version.frame_id,
             "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset) if geometry_asset is not None else None,
+            "require_backend_switch": bool(require_backend_switch),
         }
+        if not require_backend_switch:
+            return {
+                **activation_payload,
+                "backend_switch_applied": False,
+                "reason": "require_backend_switch_false",
+                "backend_mode": "live_streaming_only",
+            }
         mapping_backend = self._resolve_mapping_backend()
         if mapping_backend is not None and mapping_backend is not self._live_map_provider:
             activator = getattr(mapping_backend, "activate_platform_map_version", None)
@@ -2455,11 +2787,85 @@ class PlatformGeometryRuntime:
             "reason": "backend_missing_activate_platform_map_version",
         }
 
+    def _try_activate_slam_toolbox_pose_graph(
+        self,
+        version: MapVersion,
+        activation_payload: Dict[str, object],
+    ) -> Optional[Dict[str, object]]:
+        """如果该地图版本带有 slam_toolbox posegraph 资产，调 deserialize_pose_graph 真恢复。
+
+        - 返回 dict 表示 deserialize 路径已成功，调用方直接使用该结果。
+        - 返回 None 表示"调用方应回落到 AMCL"。
+          为了不丢失 deserialize 失败原因，本函数会把 service_result 写到
+          `activation_payload["slam_toolbox_deserialize"]`（caller 共享 dict）；
+          上层 `_activate_external_nav2_map_version` 拼 AMCL 返回值时会一同带回，
+          消费方就能在 metadata 看到 `slam_toolbox_deserialize: {ok: false, reason: ...}`。
+        """
+
+        prefix = self._resolve_existing_slam_toolbox_state_prefix(version)
+        if prefix is None:
+            # 没有 posegraph checkpoint，留给 AMCL 走 map.yaml 路线。
+            activation_payload["slam_toolbox_deserialize"] = {
+                "ok": False,
+                "reason": "posegraph_checkpoint_missing",
+            }
+            return None
+        service_result = self._call_slam_toolbox_deserialize_pose_graph(str(prefix))
+        if not service_result.get("ok"):
+            # deserialize 服务调用失败：把失败原因带回 caller，让 AMCL 兜底返回值能看到。
+            activation_payload["slam_toolbox_deserialize"] = service_result
+            return None
+        return {
+            **activation_payload,
+            "backend_switch_applied": True,
+            "backend_map_loaded": True,
+            "backend_mode": "slam_toolbox_pose_graph",
+            "active_backend_version_id": version.version_id,
+            "reason": "slam_toolbox_deserialize_pose_graph_succeeded",
+            "slam_toolbox": {
+                "switch_method": "slam_toolbox_deserialize_pose_graph",
+                "filename_prefix": str(prefix),
+                "service_call": service_result,
+            },
+        }
+
+    def _resolve_existing_slam_toolbox_state_prefix(self, version: MapVersion) -> Optional[Path]:
+        """返回带 .posegraph + .data 配对的 prefix（不含后缀）路径；都不存在返回 None。"""
+
+        geometry_asset = version.geometry_asset
+        candidates: List[Path] = []
+        if geometry_asset is not None:
+            for raw in (geometry_asset.backend_state_path, geometry_asset.rtabmap_db_path):
+                if raw:
+                    candidates.append(Path(str(raw)).expanduser())
+            for asset_ref in geometry_asset.assets:
+                if asset_ref.asset_type in (
+                    MapGeometryAssetType.SLAM_TOOLBOX_POSEGRAPH,
+                    MapGeometryAssetType.RTABMAP_DATABASE,
+                    MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE,
+                ):
+                    candidates.append(Path(asset_ref.path).expanduser())
+        candidates.append(self._version_backend_state_path(version.map_name, version.version_id))
+        for prefix in candidates:
+            if prefix.suffix in (".posegraph", ".data"):
+                prefix = prefix.with_suffix("")
+            posegraph = prefix.with_suffix(".posegraph")
+            data = prefix.with_suffix(".data")
+            if posegraph.exists() and posegraph.is_file() and data.exists() and data.is_file():
+                return prefix
+        return None
+
     def _activate_external_nav2_map_version(
         self,
         version: MapVersion,
         activation_payload: Dict[str, object],
     ) -> Dict[str, object]:
+        # 优先尝试 slam_toolbox 真恢复（deserialize_pose_graph + start_localization）；
+        # 仅在 deserialize 不可用或文件缺失时回落到"重启进程切 AMCL 离线 map.yaml"。
+        slam_toolbox_result = self._try_activate_slam_toolbox_pose_graph(version, activation_payload)
+        if slam_toolbox_result is not None:
+            return slam_toolbox_result
+
         nav2_map_metadata = self._resolve_nav2_map_metadata(version)
         nav2_yaml_path = self._resolve_existing_nav2_map_yaml_path(version, nav2_map_metadata)
         if nav2_yaml_path is None:
@@ -2471,6 +2877,7 @@ class PlatformGeometryRuntime:
                 **activation_payload,
                 "backend_switch_applied": False,
                 "reason": "nav2_map_yaml_missing",
+                "backend_mode": "unavailable",
                 "nav2_map": nav2_map_metadata,
             }
         nav2_yaml_path = nav2_yaml_path.expanduser().resolve(strict=False)
@@ -2496,6 +2903,7 @@ class PlatformGeometryRuntime:
                 **activation_payload,
                 "backend_switch_applied": False,
                 "reason": "external_nav2_amcl_start_failed",
+                "backend_mode": "amcl_localization_only",
                 "nav2_map": nav2_map_metadata,
                 "nav2": {
                     "switch_method": "managed_ros2_launch_amcl",
@@ -2510,6 +2918,7 @@ class PlatformGeometryRuntime:
             **activation_payload,
             "backend_switch_applied": True,
             "backend_map_loaded": True,
+            "backend_mode": "amcl_localization_only",
             "active_backend_version_id": version.version_id,
             "reason": "external_nav2_amcl_started",
             "nav2_map": nav2_map_metadata,
@@ -3036,9 +3445,10 @@ class PlatformGeometryRuntime:
         state = self._platform_exploration_runtime.get_exploration_state()
         state = self._augment_exploration_state_with_mapping_diagnostics(state)
         frontier_metadata: Dict[str, object] = {}
-        latest_frontiers = self._frontier_marker_provider.get_latest_frontiers()
-        frontier_provider_status = self._clone_metadata(self._frontier_marker_provider.get_status())
-        if latest_frontiers:
+        latest_frontiers: List[Dict[str, object]] = []
+        platform_frontiers = self._platform_exploration_runtime.get_latest_frontiers() if hasattr(self._platform_exploration_runtime, "get_latest_frontiers") else []
+        if platform_frontiers:
+            latest_frontiers = list(platform_frontiers)
             current_frontier = latest_frontiers[0]
             frontier_source = (
                 current_frontier.get("metadata", {}).get("source")
@@ -3048,8 +3458,7 @@ class PlatformGeometryRuntime:
             frontier_metadata = {
                 "latest_frontiers": latest_frontiers,
                 "current_frontier": current_frontier,
-                "frontier_marker_provider": frontier_provider_status,
-                "frontier_source": frontier_source or "external_slam_nav2_frontier_markers",
+                "frontier_source": frontier_source or "platform_frontier_explorer",
             }
         metadata = {
             **dict(getattr(state, "metadata", {}) or {}),

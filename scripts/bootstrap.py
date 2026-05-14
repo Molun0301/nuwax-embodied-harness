@@ -94,7 +94,6 @@ GO2SLAM_RUNTIME_REQUIRED_PACKAGES = (
     "go2_slam",
     "go2_driver",
     "go2_perception",
-    "explore_lite",
 )
 GO2SLAM_SOURCE_STALE_SUFFIXES = (
     ".xml",
@@ -409,7 +408,7 @@ def go2slam_setup_path() -> Path:
 def find_go2slam_stale_source(setup_path: Path) -> Optional[Path]:
     if not setup_path.exists():
         return None
-    roots = [GO2SLAM_WS_DIR / "src", GO2SLAM_WS_DIR / "m-explore-ros2"]
+    roots = [GO2SLAM_WS_DIR / "src"]
     for root in roots:
         if not root.exists():
             continue
@@ -1115,7 +1114,6 @@ def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
                 "install",
                 "--from-paths",
                 "src",
-                "m-explore-ros2",
                 "--ignore-src",
                 "-r",
                 "-y",

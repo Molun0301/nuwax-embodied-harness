@@ -11,12 +11,12 @@ from tf2_ros import TransformBroadcaster
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Nuwax odom 到 TF 桥。")
-    parser.add_argument("--odom-topic", default="/nuwax/geometry/odom")
-    # 显式留空表示「锁不死」：尊重 odom 消息携带的 header.frame_id / child_frame_id；
-    # 仅当消息也未带 frame 时才退到 --default-* 兜底。
+    parser.add_argument("--odom-topic", required=True)
+    # 锁定值（CLI 必填）优先；--default-* 仅作为 odom 消息未带 frame 时的兜底，
+    # 但本身也必须由调用方显式指定（不再硬编码字面值）。
     parser.add_argument("--odom-frame", default="")
-    parser.add_argument("--default-odom-frame", default="odom")
-    parser.add_argument("--default-child-frame", default="base_footprint")
+    parser.add_argument("--default-odom-frame", required=True)
+    parser.add_argument("--default-child-frame", required=True)
     parser.add_argument("--child-frame", default="")
     parser.add_argument("--node-name", default="nuwax_odom_tf_bridge")
     return parser.parse_args()
@@ -28,11 +28,15 @@ def _normalize_frame_id(value: str | None) -> str:
 
 def main() -> None:
     args = parse_args()
-    # 锁定值（显式 CLI 给出）优先；否则尊重 odom 消息携带的 frame；再退到默认。
+    # 锁定值（显式 CLI 给出）优先；否则尊重 odom 消息携带的 frame；再退到 --default-*。
     odom_frame_override = _normalize_frame_id(args.odom_frame)
-    default_odom_frame = _normalize_frame_id(args.default_odom_frame) or "odom"
+    default_odom_frame = _normalize_frame_id(args.default_odom_frame)
     child_frame_override = _normalize_frame_id(args.child_frame)
-    default_child_frame = _normalize_frame_id(args.default_child_frame) or "base_footprint"
+    default_child_frame = _normalize_frame_id(args.default_child_frame)
+    if not default_odom_frame or not default_child_frame:
+        raise SystemExit(
+            "odom_tf_bridge: --default-odom-frame / --default-child-frame 必须显式指定，禁止硬编码兜底。"
+        )
     rclpy.init()
     node = rclpy.create_node(args.node_name)
     broadcaster = TransformBroadcaster(node)

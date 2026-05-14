@@ -291,11 +291,15 @@ class MapWorkspaceService:
             metadata={
                 "reason": str(reason or "").strip(),
                 "snapshot_kind": snapshot.metadata.get("map_snapshot_kind"),
-                "live_streaming_ready": snapshot.metadata.get("live_streaming_ready"),
+                "live_streaming_ready": snapshot.metadata.get("live_streaming_ready") or snapshot.metadata.get("backend_streaming_ready"),
                 "checkpoint_ready": snapshot.metadata.get("checkpoint_ready"),
-                "rtabmap_session_id": snapshot.metadata.get("rtabmap_session_id") or snapshot.metadata.get("session_id"),
-                "rtabmap_run_id": snapshot.metadata.get("rtabmap_run_id") or snapshot.metadata.get("run_id"),
-                "rtabmap_database_path": snapshot.metadata.get("rtabmap_database_path") or snapshot.metadata.get("rtabmap_db_path"),
+                "backend_session_id": snapshot.metadata.get("backend_session_id") or snapshot.metadata.get("rtabmap_session_id") or snapshot.metadata.get("session_id"),
+                "backend_run_id": snapshot.metadata.get("backend_run_id") or snapshot.metadata.get("rtabmap_run_id") or snapshot.metadata.get("run_id"),
+                "backend_state_path": snapshot.metadata.get("backend_state_path") or snapshot.metadata.get("rtabmap_database_path") or snapshot.metadata.get("rtabmap_db_path"),
+                # 老消费方继续兼容：保留 rtabmap_* 别名。
+                "rtabmap_session_id": snapshot.metadata.get("backend_session_id") or snapshot.metadata.get("rtabmap_session_id") or snapshot.metadata.get("session_id"),
+                "rtabmap_run_id": snapshot.metadata.get("backend_run_id") or snapshot.metadata.get("rtabmap_run_id") or snapshot.metadata.get("run_id"),
+                "rtabmap_database_path": snapshot.metadata.get("backend_state_path") or snapshot.metadata.get("rtabmap_database_path") or snapshot.metadata.get("rtabmap_db_path"),
                 "update_sequence": snapshot.metadata.get("update_sequence"),
                 "content_revision": snapshot.metadata.get("content_revision"),
                 "seed_map_version_id": snapshot.metadata.get("seed_map_version_id"),
@@ -726,7 +730,10 @@ class MapWorkspaceService:
             prepared_version = self._version_repository.save_existing_map_version(
                 self._geometry_runtime.prepare_map_version_assets(prepared_version)
             )
-        runtime_snapshot = self._geometry_runtime.activate_map_version(prepared_version)
+        runtime_snapshot = self._geometry_runtime.activate_map_version(
+            prepared_version,
+            require_backend_switch=require_backend_switch,
+        )
         runtime_metadata = dict(runtime_snapshot.metadata or {})
         # require_backend_switch=True 表示调用方显式要求切换底层 SLAM/Nav2 后端状态；
         # 否则只是恢复/激活活跃工作区，允许种子图 ingest 但不要求后端"真正切换可定位"。
@@ -739,6 +746,8 @@ class MapWorkspaceService:
             runtime_metadata.get("map_snapshot_kind") == "live_streaming"
             or runtime_metadata.get("source_kind") == "platform_live_map_provider"
             or runtime_metadata.get("live_streaming_ready")
+            or runtime_metadata.get("backend_streaming_ready")
+            # 兼容老 metadata key（旧 version.json）。
             or runtime_metadata.get("rtabmap_live_streaming_ready")
         )
         ingest_kwargs = {

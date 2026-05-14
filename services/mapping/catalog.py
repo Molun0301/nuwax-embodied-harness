@@ -10,6 +10,24 @@ from contracts.map_workspace import MapAsset
 from typing import List, Optional
 
 
+class MapNameCollisionError(ValueError):
+    """两个不同 map_name 经 _to_safe_dir_segment 规整后落到同一个目录。
+
+    场景：name_a="办公区/A"、name_b="办公区_A" 都会被规整为 "办公区_A"。
+    第二个 name 写入时本类被抛出，避免悄悄覆盖已有地图资产。
+    """
+
+    def __init__(self, *, requested_name: str, existing_name: str, safe_segment: str, path: str) -> None:
+        self.requested_name = requested_name
+        self.existing_name = existing_name
+        self.safe_segment = safe_segment
+        self.path = path
+        super().__init__(
+            "地图名称 %r 与已存在地图 %r 在文件系统目录段 %r 上冲突；"
+            "请改用差异更明显的 map_name。" % (requested_name, existing_name, safe_segment)
+        )
+
+
 # 文件系统中不允许出现的字符（POSIX/常见 FS 取交集，再补常规危险符号），
 # 用单字符 `_` 替换；保留中文/Unicode 字母数字，避免 URL 编码导致的 sqlite 路径
 # 不可达问题（参见 docs/开发文档/ROS全链路修复-2026-05-13/worker2-rtabmap/feadback.md）。
@@ -73,7 +91,23 @@ class MapCatalogRepository:
         return assets
 
     def save_map_asset(self, asset: MapAsset) -> MapAsset:
+        # 写入前先做 safe-segment 碰撞检查：如果目标目录已存在 metadata.json
+        # 且其 map_name 与当前请求不同，说明两个不同 map_name 经 _to_safe_dir_segment
+        # 规整后落到同一目录（例如 "办公区/A" 与 "办公区_A"），拒绝静默覆盖。
         map_dir = self._map_dir(asset.map_name)
+        existing_metadata_path = map_dir / "metadata.json"
+        if existing_metadata_path.exists():
+            try:
+                existing_asset = MapAsset.model_validate_json(existing_metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing_asset = None
+            if existing_asset is not None and existing_asset.map_name != asset.map_name:
+                raise MapNameCollisionError(
+                    requested_name=asset.map_name,
+                    existing_name=existing_asset.map_name,
+                    safe_segment=_to_safe_dir_segment(asset.map_name),
+                    path=str(existing_metadata_path),
+                )
         map_dir.mkdir(parents=True, exist_ok=True)
         (map_dir / "snapshots").mkdir(parents=True, exist_ok=True)
         (map_dir / "versions").mkdir(parents=True, exist_ok=True)

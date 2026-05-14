@@ -643,8 +643,14 @@ class RclpyGo2RosBridge:
         position = list(getattr(message, "position", [0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0])
         while len(position) < 3:
             position.append(0.0)
+        expected_odom_frame = str(getattr(self.config, "expected_odom_frame", "") or "").strip()
+        if not expected_odom_frame:
+            raise ValueError(
+                "Go2DataPlaneConfig.expected_odom_frame 必须由 PlatformGeometryConfig.frames.odom_frame 注入；"
+                "禁止使用硬编码兜底字符串。"
+            )
         return Pose(
-            frame_id="odom",
+            frame_id=expected_odom_frame,
             position=Vector3(x=float(position[0]), y=float(position[1]), z=float(position[2])),
             orientation=quaternion,
         )

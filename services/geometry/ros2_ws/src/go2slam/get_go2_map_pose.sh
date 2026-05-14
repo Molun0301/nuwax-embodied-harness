@@ -45,7 +45,6 @@ workspace_stale_source() {
   local source_file=""
   local search_roots=()
   [[ -d "${ROOT_DIR}/src" ]] && search_roots+=("${ROOT_DIR}/src")
-  [[ -d "${ROOT_DIR}/m-explore-ros2" ]] && search_roots+=("${ROOT_DIR}/m-explore-ros2")
   if [[ "${#search_roots[@]}" -eq 0 ]]; then
     return 1
   fi

@@ -92,6 +92,8 @@ _RUNTIME_METADATA_LOG_KEYS = (
 _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 2.0
 _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
 _DEFAULT_ASYNC_TASK_TIMEOUT_SEC = 15 * 60
+_SPEAK_TEXT_DEFAULT_TIMEOUT_SEC = 60
+_SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC = 1.5
 _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
     {
         "navigate_to_pose",
@@ -99,6 +101,13 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
         "find_target",
         "explore_area",
         "explore_and_find_target",
+        "relocalize_active_map",
+        "load_map_version",
+        "save_active_map_version",
+    }
+)
+_SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
+    {
         "relocalize_active_map",
         "load_map_version",
         "save_active_map_version",
@@ -259,6 +268,7 @@ class GatewayRuntime:
             config=config.geometry,
             catalog_root=config.runtime_data.map_catalog_root,
             robot=robot,
+            event_bus=self.event_bus,
         )
         self.observation_service = ObservationService(
             provider_owner=robot,
@@ -293,7 +303,7 @@ class GatewayRuntime:
             segmentation_backend=perception_components["segmentation_backend"],
             event_bus=self.event_bus,
             stream_bus=self.stream_bus,
-            video_frame_sink=self._store_latest_video_frame,
+            video_frame_sink=None,
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),
         )
@@ -343,7 +353,7 @@ class GatewayRuntime:
             embedding_base_url=config.runtime_data.memory_embedding_base_url,
             embedding_timeout_sec=config.runtime_data.memory_embedding_timeout_sec,
         )
-        self.perception_video_runtime._memory_service = self.memory_service
+        self.perception_video_runtime.bind_memory_service(self.memory_service)
         self.navigation_service = NavigationService(
             provider_owner=self.platform_geometry_runtime,
             localization_service=self.localization_service,
@@ -368,6 +378,10 @@ class GatewayRuntime:
         self._started = False
         self._runtime_event_log_limiter = LogRateLimiter()
         self._event_log_subscription_id = self.event_bus.subscribe(self._log_runtime_event)
+        self._geometry_runtime_lock = threading.RLock()
+        self._geometry_runtime_start_event: Optional[threading.Event] = None
+        self._safety_watchdog_stop = threading.Event()
+        self._safety_watchdog_thread: Optional[threading.Thread] = None
         self._robot_state_stream_subscription_id: Optional[int] = None
         self._localization_stream_subscription_id: Optional[int] = None
         self._localization_stream_unsubscriber = None
@@ -416,6 +430,7 @@ class GatewayRuntime:
                 self.perception_video_runtime.start()
         except Exception:
             RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
+        self._start_safety_watchdog_loop()
         self._start_data_frame_stream_sources()
         if self.config.runtime_data.map_active_restore_on_start:
             try:
@@ -446,6 +461,7 @@ class GatewayRuntime:
                 RUNTIME_LOGGER.info("宿主机运行时未启动，忽略停止请求。")
                 return
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
+            self._stop_safety_watchdog_loop()
             self.safety_guard.stop_all_motion("宿主机网关关闭。")
             self.task_manager.shutdown(wait=False)
             self.audio_service.stop()
@@ -776,67 +792,32 @@ class GatewayRuntime:
         self._publish_latest_video_stream_metadata(latest_frame, reason="image_stream_push", source="image_stream_provider")
 
     def _publish_video_stream_frame(self, *, reason: str) -> None:
-        providers = getattr(self.robot, "providers", None)
-        if self._image_stream_subscription_id is not None:
-            latest_frame = self.latest_video_frame()
-            if latest_frame is None:
-                self.stream_bus.publish(
-                    "video.frame",
-                    source="image_stream_provider",
-                    payload={"available": False, "message": "源头推送图像流尚未收到首帧。"},
-                    status="missing",
-                    metadata={"reason": "image_stream_waiting_first_frame", "refresh_reason": reason},
-                )
-                return
-            self._publish_latest_video_stream_metadata(latest_frame, reason=reason, source="image_stream_provider")
-            return
-
-        image_provider = providers if providers is not None and isinstance(providers, ImageProvider) else None
-        if image_provider is None:
+        if self._image_stream_subscription_id is None:
             self.stream_bus.publish(
                 "video.frame",
-                source="image_provider",
-                payload={"available": False, "message": "当前机器人未提供图像 provider。"},
+                source="image_stream_provider",
+                payload={
+                    "available": False,
+                    "message": "源头视频推流未订阅；不再以高层 SDK 抓单帧伪装实时。",
+                },
                 status="missing",
-                metadata={"reason": "image_provider_missing", "refresh_reason": reason},
+                metadata={
+                    "reason": "streams_source_not_subscribed",
+                    "refresh_reason": reason,
+                },
             )
             return
-        availability_checker = getattr(image_provider, "is_image_available", None)
-        try:
-            image_available = bool(availability_checker()) if callable(availability_checker) else bool(image_provider.is_available())
-        except Exception:
-            image_available = False
-        if not image_available:
-            self.stream_bus.publish(
-                "video.frame",
-                source="image_provider",
-                payload={"available": False, "message": "当前图像 provider 暂不可用。"},
-                status="missing",
-                metadata={"reason": "image_provider_unavailable", "refresh_reason": reason},
-            )
-            return
-        try:
-            image_frame = image_provider.capture_image(None)
-        except Exception as exc:
-            self.stream_bus.publish(
-                "video.frame",
-                source="image_provider",
-                payload={"available": False, "message": str(exc)},
-                status="missing",
-                metadata={"reason": "image_capture_failed", "refresh_reason": reason},
-            )
-            return
-        latest_frame = self._store_latest_video_frame(image_frame)
+        latest_frame = self.latest_video_frame()
         if latest_frame is None:
             self.stream_bus.publish(
                 "video.frame",
-                source="image_provider",
-                payload={"available": False, "message": "当前图像 provider 未返回 JPEG 图像数据。"},
-                status="unsupported",
-                metadata={"reason": "image_payload_missing", "refresh_reason": reason},
+                source="image_stream_provider",
+                payload={"available": False, "message": "源头推送图像流尚未收到首帧。"},
+                status="missing",
+                metadata={"reason": "image_stream_waiting_first_frame", "refresh_reason": reason},
             )
             return
-        self._publish_latest_video_stream_metadata(latest_frame, reason=reason, source="image_provider")
+        self._publish_latest_video_stream_metadata(latest_frame, reason=reason, source="image_stream_provider")
 
     def _publish_latest_video_stream_metadata(self, latest_frame: LatestVideoFrame, *, reason: str, source: str) -> None:
         stream_path = "/streams/video.mjpeg?" + urlencode({"camera_id": latest_frame.camera_id or ""})
@@ -995,7 +976,7 @@ class GatewayRuntime:
             "source": "pointcloud_map_cache",
             "source_kind": pointcloud_map.source_kind,
             "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "rtabmap_db_path": source_summary.get("rtabmap_db_path"),
+            "rtabmap_db_path": source_summary.get("backend_state_path") or source_summary.get("rtabmap_db_path"),
             "pcd_path": pointcloud_map.path,
             "point_count": pointcloud_map.point_count,
             "fields": [
@@ -1087,7 +1068,7 @@ class GatewayRuntime:
             "source": "pointcloud_map_cache",
             "source_kind": source_summary.get("source_kind") or "configured_pcd_root",
             "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "rtabmap_db_path": source_summary.get("rtabmap_db_path"),
+            "rtabmap_db_path": source_summary.get("backend_state_path") or source_summary.get("rtabmap_db_path"),
             "pcd_path": source_summary.get("pcd_path") or source_summary.get("path"),
             "point_count": 0,
             "fields": [],
@@ -2008,15 +1989,19 @@ class GatewayRuntime:
                 "speak_text",
                 "播报文本",
                 "提交一段中文文本到宿主机播报服务；未配置实时语音时退化为记录模式。",
-                execution_mode=CapabilityExecutionMode.SYNC,
+                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
                     {
                         "text": {"type": "string"},
+                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     },
                     required=("text",),
                 ),
-                output_schema=_schema_object({"speech": {"type": "object"}}),
+                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
+                required_resources=(RuntimeResource.AUDIO_OUT.value,),
+                timeout_sec=_SPEAK_TEXT_DEFAULT_TIMEOUT_SEC,
+                cancel_supported=True,
             ),
         )
         capabilities = tuple(
@@ -2659,7 +2644,7 @@ class GatewayRuntime:
     ) -> Dict[str, Any]:
         """调用一个网关能力。"""
 
-        self._ensure_geometry_runtime_for_capability(capability_name)
+        self._ensure_geometry_runtime_for_invoke(capability_name)
         self._refresh_dynamic_capability_matrix()
         registration = self.capability_registry.get_registration(capability_name)
         self.capability_registry.assert_supported(capability_name, robot_model=self.robot.manifest.robot_model)
@@ -3024,7 +3009,12 @@ class GatewayRuntime:
             "available": bool(summary),
             "geometry_stack": summary.get("geometry_stack") or metadata.get("geometry_stack") or self.platform_geometry_runtime.config.stack,
             "frame_id": summary.get("frame_id") or getattr(map_snapshot, "frame_id", None),
-            "rtabmap_db_path": summary.get("rtabmap_db_path") or metadata.get("rtabmap_db_path"),
+            "rtabmap_db_path": (
+                summary.get("backend_state_path")
+                or summary.get("rtabmap_db_path")
+                or metadata.get("backend_state_path")
+                or metadata.get("rtabmap_db_path")
+            ),
             "pcd_path": summary.get("pcd_path") or metadata.get("pcd_path"),
             "asset_types": summary.get("asset_types") or [],
             "quality_status": quality_status,
@@ -3857,6 +3847,20 @@ class GatewayRuntime:
         )
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
         timeout_sec = self._resolve_async_timeout("navigate_to_pose", arguments, minimum_sec=0.1)
+        camera_id = str(arguments.get("camera_id", "")).strip() or None
+        verify_on_arrival = bool(arguments.get("verify_on_arrival", False))
+        verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
+        target_name_hint = str(arguments.get("target_name") or goal.target_name or "navigate_to_pose").strip()
+        current_map_version_id = (
+            workspace.latest_map_snapshot.version_id
+            if workspace is not None and workspace.latest_map_snapshot is not None
+            else None
+        )
+        current_localization_session_id = (
+            workspace.active_localization_session.session_id
+            if workspace is not None and workspace.active_localization_session is not None
+            else None
+        )
         return self._submit_navigation_task(
             capability_name="navigate_to_pose",
             goal=goal,
@@ -3864,6 +3868,24 @@ class GatewayRuntime:
             timeout_sec=timeout_sec,
             requested_by=requested_by,
             request_context=request_context,
+            completion_callback=(
+                (
+                    lambda _navigation_context: self._build_navigation_arrival_result(
+                        map_name=map_name,
+                        target_name=target_name_hint,
+                        camera_id=camera_id,
+                        navigation_candidate=None,
+                        verify_similarity_threshold=verify_similarity_threshold,
+                        strict=False,
+                        expected_map_version_id=current_map_version_id,
+                        localization_session_id=current_localization_session_id,
+                        goal_id=goal.goal_id,
+                        requested_by=requested_by,
+                    )
+                )
+                if verify_on_arrival
+                else None
+            ),
         )
 
     def _handle_navigate_to_named_location(
@@ -4005,6 +4027,8 @@ class GatewayRuntime:
                         strict=should_fail_on_arrival_verification,
                         expected_map_version_id=current_map_version_id,
                         localization_session_id=current_localization_session_id,
+                        goal_id=goal.goal_id,
+                        requested_by=requested_by,
                     )
                 )
                 if verify_on_arrival
@@ -4207,14 +4231,6 @@ class GatewayRuntime:
             requested_by=requested_by,
             create_if_missing=True,
         )
-        self._refresh_workspace_snapshots()
-        if self._workspace_requires_localization_before_explore(workspace):
-            self._ensure_localization_ready(
-                capability_name="explore_and_find_target",
-                map_name=map_name,
-                workspace=workspace,
-            )
-        self._ensure_workspace_memory_library_ready(map_name=map_name)
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         center_pose = None
@@ -4913,14 +4929,37 @@ class GatewayRuntime:
         volume = self._require_float(arguments, "volume")
         return {"volume_state": self.audio_service.set_volume(volume)}
 
-    def _handle_speak_text(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
+    def _handle_speak_text(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
         text = self._require_str(arguments, "text")
-        return {
-            "speech": self.audio_service.speak_text(
-                text,
-                metadata={"requested_by": requested_by or "unknown"},
-            )
-        }
+        timeout_sec = self._resolve_async_timeout("speak_text", arguments, minimum_sec=0.1)
+        descriptor = self.capability_registry.get_descriptor("speak_text")
+        speak_metadata = {"requested_by": requested_by or "unknown"}
+
+        def runner(context) -> Dict[str, Any]:
+            context.update(progress=0.05, stage="accepted", message="开始播报文本。")
+            speech = self.audio_service.speak_text(text, metadata=speak_metadata)
+            context.update(progress=1.0, stage="completed", message="文本播报完成。")
+            return {"speech": speech}
+
+        return self.task_manager.submit(
+            "speak_text",
+            runner,
+            input_payload={"text": text},
+            requested_by=requested_by,
+            required_resources=list(descriptor.required_resources),
+            timeout_sec=timeout_sec,
+            metadata=self._build_task_request_metadata(
+                capability_name="speak_text",
+                requested_by=requested_by,
+                request_context=request_context,
+            ),
+        )
 
     def _handle_switch_control_mode(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         del requested_by
@@ -5121,6 +5160,8 @@ class GatewayRuntime:
         strict: bool,
         expected_map_version_id: Optional[str],
         localization_session_id: Optional[str],
+        goal_id: Optional[str] = None,
+        requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         burst_messages = self.perception_video_runtime.run_burst(
             frame_count=3,
@@ -5135,6 +5176,19 @@ class GatewayRuntime:
             similarity_threshold=verify_similarity_threshold,
             expected_map_version_id=expected_map_version_id,
             localization_session_id=localization_session_id,
+            goal_id=goal_id,
+        )
+        writeback_result = self._force_observation_writeback_after_arrival(
+            query=target_name,
+            camera_id=camera_id,
+            requested_by=requested_by,
+            navigation_candidate=navigation_candidate,
+            arrival_verification=arrival_verification,
+            map_name=map_name,
+            goal_id=goal_id,
+            map_version_id=expected_map_version_id,
+            localization_session_id=localization_session_id,
+            reason_source="navigation_arrival",
         )
         if strict and not arrival_verification.verified:
             raise GatewayError(
@@ -5146,12 +5200,154 @@ class GatewayRuntime:
                     "map_name": map_name,
                     "target_name": target_name,
                     "arrival_verification": arrival_verification.model_dump(mode="json"),
+                    "observation_writeback": writeback_result,
                 },
             )
         return {
             "burst_messages": burst_messages,
             "arrival_verification": arrival_verification,
+            "observation_writeback": writeback_result,
         }
+
+    def _force_observation_writeback_after_arrival(
+        self,
+        *,
+        query: str,
+        camera_id: Optional[str],
+        requested_by: Optional[str],
+        navigation_candidate,
+        arrival_verification,
+        map_name: Optional[str],
+        goal_id: Optional[str],
+        map_version_id: Optional[str],
+        localization_session_id: Optional[str],
+        reason_source: str,
+    ) -> Dict[str, Any]:
+        """到点后无条件强制把现场观察写回记忆链路。
+
+        无论 verify 成功失败，都把当前帧 ingest 一次，作为对应 NavigationCandidate
+        的成功证据或失败反证；失败时同时降低对应记忆候选的可信度。
+        """
+
+        outcome: Dict[str, Any] = {
+            "memory_written": False,
+            "skipped_reason": "",
+            "candidate_confidence_decay": 0.0,
+        }
+        if not self.memory_service.is_enabled():
+            outcome["skipped_reason"] = "memory_disabled"
+            return outcome
+        verified = bool(getattr(arrival_verification, "verified", False))
+        score = float(getattr(arrival_verification, "score", 0.0) or 0.0)
+        reason = str(getattr(arrival_verification, "reason", "") or "")
+        verification_metadata = dict(getattr(arrival_verification, "metadata", {}) or {})
+        candidate_id = ""
+        record_id = ""
+        record_kind = ""
+        target_name = query
+        if navigation_candidate is not None:
+            cand_metadata = dict(getattr(navigation_candidate, "metadata", {}) or {})
+            candidate_id = str(cand_metadata.get("candidate_id") or "")
+            record_id = str(getattr(navigation_candidate, "record_id", "") or "")
+            kind = getattr(navigation_candidate, "record_kind", None)
+            record_kind = kind.value if kind is not None else str(cand_metadata.get("record_kind") or "")
+            target_name = str(getattr(navigation_candidate, "target_name", target_name) or target_name)
+        if not candidate_id:
+            candidate_id = str(verification_metadata.get("candidate_id") or "")
+        if not record_id:
+            record_id = str(verification_metadata.get("record_id") or "")
+        normalized_query = str(query or "").strip() or target_name or "arrival_writeback"
+        title_prefix = "到点观察" if verified else "到点反证"
+        title = "%s：%s" % (title_prefix, normalized_query[:48])
+        tags: List[str] = [normalized_query]
+        if target_name and target_name not in tags:
+            tags.append(target_name)
+        matched_labels = list(getattr(arrival_verification, "matched_labels", ()) or ())
+        for label in matched_labels:
+            if label and label not in tags:
+                tags.append(label)
+        ingest_metadata: Dict[str, Any] = {
+            "requested_by": requested_by or "unknown",
+            "source": reason_source,
+            "capture_mode": "arrival_writeback",
+            "arrival_writeback": True,
+            "arrival_verified": verified,
+            "verification_score": round(score, 6),
+            "verification_reason": reason,
+            "verification_reason_code": str(verification_metadata.get("arrival_reason_code") or ""),
+            "candidate_id": candidate_id,
+            "goal_id": str(goal_id or verification_metadata.get("goal_id") or ""),
+            "record_id": record_id,
+            "record_kind": record_kind,
+            "target_name": target_name,
+            "map_name": map_name or "",
+            "map_version_id": map_version_id or str(verification_metadata.get("map_version_id") or ""),
+            "localization_session_id": localization_session_id
+            or str(verification_metadata.get("localization_session_id") or ""),
+            "matched_memory_id": str(getattr(arrival_verification, "matched_memory_id", "") or ""),
+            "verification_query": str(verification_metadata.get("verification_query") or normalized_query),
+            "evidence_kind": "success_evidence" if verified else "failure_counter_evidence",
+        }
+        try:
+            entry = self.memory_service.remember_current_scene(
+                title=title,
+                camera_id=camera_id,
+                tags=tags,
+                metadata=ingest_metadata,
+            )
+            outcome["memory_written"] = True
+            outcome["memory_id"] = getattr(entry, "memory_id", None)
+        except Exception:
+            RUNTIME_LOGGER.exception(
+                "到点强制写回观察失败 query=%s candidate_id=%s",
+                normalized_query,
+                candidate_id,
+            )
+            outcome["skipped_reason"] = "ingest_exception"
+            return outcome
+        if not verified:
+            decay = self._decay_navigation_candidate_after_failure(
+                candidate_id=candidate_id,
+                record_id=record_id,
+                record_kind=record_kind,
+                reason_code=str(verification_metadata.get("arrival_reason_code") or "insufficient_evidence"),
+                arrival_score=score,
+            )
+            outcome["candidate_confidence_decay"] = decay
+        return outcome
+
+    def _decay_navigation_candidate_after_failure(
+        self,
+        *,
+        candidate_id: str,
+        record_id: str,
+        record_kind: str,
+        reason_code: str,
+        arrival_score: float,
+    ) -> float:
+        """到点失败时降低对应记忆候选的可信度。"""
+
+        if not record_id and not candidate_id:
+            return 0.0
+        decay_amount = max(0.05, min(0.25, 0.1 + max(0.0, 0.55 - float(arrival_score))))
+        try:
+            applied = self.memory_service.apply_candidate_confidence_decay(
+                record_id=record_id,
+                candidate_id=candidate_id,
+                record_kind=record_kind,
+                decay_amount=decay_amount,
+                reason_code=reason_code,
+            )
+        except AttributeError:
+            return 0.0
+        except Exception:
+            RUNTIME_LOGGER.exception(
+                "记忆候选可信度衰减失败 record_id=%s candidate_id=%s",
+                record_id,
+                candidate_id,
+            )
+            return 0.0
+        return float(applied or 0.0)
 
     def _refresh_target_search_observation(
         self,
@@ -5947,6 +6143,7 @@ class GatewayRuntime:
         requested_by: Optional[str],
         expected_map_version_id: Optional[str],
         localization_session_id: Optional[str],
+        goal_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         refresh_payload = self._refresh_target_search_observation(
             query=query,
@@ -5963,6 +6160,7 @@ class GatewayRuntime:
             similarity_threshold=verify_similarity_threshold,
             expected_map_version_id=expected_map_version_id,
             localization_session_id=localization_session_id,
+            goal_id=goal_id,
         )
         detection_evidence = refresh_payload.get("detection_evidence") or {}
         if arrival_verification.verified and not detection_evidence.get("has_detection_evidence"):
@@ -5978,11 +6176,24 @@ class GatewayRuntime:
                 },
                 deep=True,
             )
+        writeback_result = self._force_observation_writeback_after_arrival(
+            query=query,
+            camera_id=camera_id,
+            requested_by=requested_by,
+            navigation_candidate=navigation_candidate,
+            arrival_verification=arrival_verification,
+            map_name=map_name,
+            goal_id=goal_id,
+            map_version_id=expected_map_version_id,
+            localization_session_id=localization_session_id,
+            reason_source="target_arrival_verify",
+        )
         return {
             "burst_messages": refresh_payload["burst_messages"],
             "scene_headline": refresh_payload["scene_headline"],
             "arrival_verification": arrival_verification,
             "map_name": map_name,
+            "observation_writeback": writeback_result,
         }
 
     def _run_target_navigation_candidates(
@@ -6000,6 +6211,7 @@ class GatewayRuntime:
         rejected_record_ids: Set[str],
         allow_not_found: bool,
     ) -> Optional[Dict[str, Any]]:
+        self._ensure_workspace_memory_library_ready(map_name=map_name)
         memory_candidates = list(search_state["memory_candidates"])
         semantic_goal = search_state["semantic_goal"]
         clarification = search_state.get("clarification")
@@ -6123,6 +6335,7 @@ class GatewayRuntime:
                 requested_by=requested_by,
                 expected_map_version_id=current_map_version_id,
                 localization_session_id=current_localization_session_id,
+                goal_id=goal.goal_id,
             )
             if verification_payload["arrival_verification"].verified:
                 return {
@@ -6181,6 +6394,7 @@ class GatewayRuntime:
                     requested_by=requested_by,
                     expected_map_version_id=current_map_version_id,
                     localization_session_id=current_localization_session_id,
+                    goal_id=semantic_goal.goal_id,
                 )
                 if verification_payload["arrival_verification"].verified:
                     return {
@@ -6410,6 +6624,7 @@ class GatewayRuntime:
                     workspace=workspace,
                     requested_by=requested_by,
                 )
+            self._ensure_workspace_memory_library_ready(map_name=request.map_name)
             context.ensure_active()
             self._ensure_geometry_runtime_for_capability("explore_area")
             last_context = self.navigation_service.start_exploration(request)
@@ -6593,7 +6808,42 @@ class GatewayRuntime:
         if status.running:
             self.perception_video_runtime.stop()
 
-    def _ensure_geometry_runtime_for_capability(self, capability_name: str) -> None:
+    def _start_safety_watchdog_loop(self) -> None:
+        if self._safety_watchdog_thread is not None:
+            return
+        self._safety_watchdog_stop.clear()
+        thread = threading.Thread(
+            target=self._run_safety_watchdog_loop,
+            name="nuwax-safety-watchdog",
+            daemon=True,
+        )
+        self._safety_watchdog_thread = thread
+        thread.start()
+
+    def _stop_safety_watchdog_loop(self) -> None:
+        thread = self._safety_watchdog_thread
+        if thread is None:
+            return
+        self._safety_watchdog_stop.set()
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        self._safety_watchdog_thread = None
+
+    def _run_safety_watchdog_loop(self) -> None:
+        while not self._safety_watchdog_stop.wait(_SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC):
+            try:
+                self.safety_guard.check_watchdogs()
+            except Exception:
+                RUNTIME_LOGGER.exception("SafetyGuard watchdog 巡检失败。")
+
+    def _ensure_geometry_runtime_for_invoke(self, capability_name: str) -> None:
+        """invoke 入口的几何运行时门禁：仅做快速检查，不阻塞启动。
+
+        - 不在白名单：直接放行。
+        - SYNC 类几何 capability（白名单子集）：必须等就绪；若已有线程在 start 则等同一事件。
+        - ASYNC 类几何 capability：仅做禁用 / blocked 检查；启动留给 runner 内的 ensure 调用。
+        """
+
         if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
             return
         geometry_config = self.config.geometry
@@ -6607,18 +6857,59 @@ class GatewayRuntime:
                 jsonrpc_code=-32000,
                 details={"capability_name": capability_name},
             )
-        try:
-            self.platform_geometry_runtime.start()
-        except GatewayError:
-            raise
-        except Exception as exc:
+        runtime_status = self.platform_geometry_runtime.get_runtime_status()
+        if runtime_status.get("started") and not runtime_status.get("blocked"):
+            return
+        if capability_name in _SYNC_GEOMETRY_CAPABILITY_NAMES:
+            self._ensure_geometry_runtime_started(capability_name)
+            return
+        # ASYNC 类：runner 内会再次调用 ensure；此处只标记 pending 不阻塞
+        if str(runtime_status.get("phase") or "").lower() in {"failed", "disabled"}:
             raise GatewayError(
-                "按需启动平台几何运行时失败：%s" % exc,
-                error_code="geometry_runtime_start_failed",
+                str(runtime_status.get("message") or "平台几何运行时未就绪。"),
+                error_code="geometry_runtime_unavailable",
                 http_status=503,
                 jsonrpc_code=-32010,
-                details={"capability_name": capability_name},
-            ) from exc
+                details={"capability_name": capability_name, "runtime_status": runtime_status},
+            )
+
+    def _ensure_geometry_runtime_started(self, capability_name: str) -> None:
+        """同步等待平台几何运行时就绪；多个并发调用共享同一个启动事件。"""
+
+        with self._geometry_runtime_lock:
+            event = self._geometry_runtime_start_event
+        if event is not None and not event.is_set():
+            event.wait()
+        runtime_status = self.platform_geometry_runtime.get_runtime_status()
+        if runtime_status.get("started") and not runtime_status.get("blocked"):
+            return
+        with self._geometry_runtime_lock:
+            event = self._geometry_runtime_start_event
+            should_start = event is None
+            if should_start:
+                event = threading.Event()
+                self._geometry_runtime_start_event = event
+        if should_start:
+            try:
+                self.platform_geometry_runtime.start()
+            except Exception as exc:
+                event.set()
+                with self._geometry_runtime_lock:
+                    self._geometry_runtime_start_event = None
+                if isinstance(exc, GatewayError):
+                    raise
+                raise GatewayError(
+                    "按需启动平台几何运行时失败：%s" % exc,
+                    error_code="geometry_runtime_start_failed",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                    details={"capability_name": capability_name},
+                ) from exc
+            event.set()
+            with self._geometry_runtime_lock:
+                self._geometry_runtime_start_event = None
+        else:
+            event.wait()
         runtime_status = self.platform_geometry_runtime.get_runtime_status()
         if runtime_status.get("blocked") or str(runtime_status.get("phase") or "").lower() in {"failed", "disabled"}:
             raise GatewayError(
@@ -6628,6 +6919,24 @@ class GatewayRuntime:
                 jsonrpc_code=-32010,
                 details={"capability_name": capability_name, "runtime_status": runtime_status},
             )
+
+    def _ensure_geometry_runtime_for_capability(self, capability_name: str) -> None:
+        """runner 内部的几何运行时启动入口（保留原语义，被 _submit_*_task 复用）。"""
+
+        if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
+            return
+        geometry_config = self.config.geometry
+        if not bool(getattr(geometry_config, "enabled", False)) or not bool(
+            getattr(getattr(geometry_config, "rtabmap", None), "profile_enabled", False)
+        ):
+            raise GatewayError(
+                "平台几何运行时已禁用，无法执行 %s。" % capability_name,
+                error_code="geometry_runtime_disabled",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={"capability_name": capability_name},
+            )
+        self._ensure_geometry_runtime_started(capability_name)
 
     def _finalize_workspace_assets_after_task(
         self,

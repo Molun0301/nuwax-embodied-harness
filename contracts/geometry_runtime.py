@@ -49,7 +49,6 @@ class GeometryTopicsConfig:
     tf_static_topic: str = "/tf_static"
     occupancy_topic: str = "/map"
     cost_map_topic: str = "/global_costmap/costmap"
-    exploration_frontiers_topic: str = "/explore/frontiers"
 
 
 @dataclass
@@ -127,7 +126,11 @@ class RtabmapOutputConfig:
 
 @dataclass
 class RtabmapConfig:
-    """RTAB-Map 侧车配置。"""
+    """SLAM 后端状态侧车配置（历史名称：RTAB-Map；当前后端默认为 slam_toolbox）。
+
+    类已重命名为 ``BackendStateConfig``；``RtabmapConfig`` 保留作为兼容 alias，
+    旧名仍然可用但应在后续治理任务中切换到新名。
+    """
 
     profile_name: str = "external_slam_nav2"
     profile_enabled: bool = True
@@ -342,3 +345,10 @@ class PlatformGeometryConfig:
                 "autostart": self.nav2.autostart,
             },
         }
+
+
+# 类重命名兼容 alias：
+# - 新名 BackendStateConfig 更准确反映“SLAM 后端状态”职责（当前默认后端是 slam_toolbox）。
+# - 老名 RtabmapConfig 仍然指向同一个类对象，外部 import 不破坏。
+# - 后续治理任务里再彻底切换到新名，这里暂不主动迁移调用方。
+BackendStateConfig = RtabmapConfig

@@ -51,7 +51,9 @@ class LocalizationService:
         self._state_machine: LocalizationStateMachine = state_machine or create_localization_state_machine()
         self._last_diagnostics: Optional[LocalizationDiagnostics] = None
         self._localization_update_subscription_id: Optional[object] = None
+        self._odom_publisher_failure_message: Optional[str] = None
         self._subscribe_provider_localization_updates()
+        self._subscribe_odom_publisher_failures()
 
     def refresh(self) -> LocalizationSnapshot:
         """从本地定位提供器刷新定位快照。"""
@@ -75,6 +77,31 @@ class LocalizationService:
         subscription = getattr(providers, "subscribe_localization", None)
         if callable(subscription):
             self._localization_update_subscription_id = subscription(self._handle_provider_localization_update)
+
+    def _subscribe_odom_publisher_failures(self) -> None:
+        """订阅 odom publisher 故障事件，故障即把状态机置 stale。"""
+
+        if self._event_bus is None:
+            return
+        try:
+            self._event_bus.subscribe(
+                self._on_odom_publisher_event,
+                event_types=("geometry.odom_publisher_failed",),
+            )
+        except Exception:
+            return
+
+    def _on_odom_publisher_event(self, event) -> None:
+        try:
+            event_type = str(getattr(event, "event_type", "") or "")
+            if event_type != "geometry.odom_publisher_failed":
+                return
+            self._odom_publisher_failure_message = str(getattr(event, "message", "") or "odom publisher failed")
+            # 故障即丢弃位姿可用性，让状态机进入 stale
+            self._state_machine.pose_received(pose_available=False, tracking_quality=0.0)
+            self._state_machine.check_timeouts()
+        except Exception:
+            pass
 
     def has_provider_stream_subscription(self) -> bool:
         """返回定位服务是否已接入 provider 原生流。"""
@@ -329,27 +356,160 @@ class LocalizationService:
 
         正式主链：
         1. 重置状态机到 LOCALIZING 状态
-        2. 尝试获取新位姿
-        3. 等待定位就绪或失败
+        2. 根据后端模式真实驱动 SLAM/AMCL 重定位（slam_toolbox/clear_changes、AMCL /initialpose）
+        3. 刷新会话并返回最新状态
 
         Returns:
             更新后的 LocalizationSession
         """
 
-        # 触发状态机重定位
+        # 触发状态机重定位（清 stale_since 计时、attempts++）
         self._state_machine.relocalize()
 
+        # 真接入：根据当前 session/asset 解析后端模式，向 SLAM/AMCL 发出真实重定位指令
+        backend_dispatch = self._dispatch_backend_relocalize(
+            geometry_asset=geometry_asset,
+            metadata=metadata,
+        )
+
+        merged_metadata: Dict[str, object] = {
+            "relocalize": True,
+            "backend_relocalize": backend_dispatch,
+            **dict(metadata or {}),
+        }
         return self.refresh_active_session(
             map_name=map_name,
             map_version_id=map_version_id,
             frame_id=frame_id,
-            metadata={
-                "relocalize": True,
-                **dict(metadata or {}),
-            },
+            metadata=merged_metadata,
             force_relocalize=False,  # 状态机已处理重定位
             geometry_asset=geometry_asset,
         )
+
+    def _dispatch_backend_relocalize(
+        self,
+        *,
+        geometry_asset: Optional[Dict[str, object]],
+        metadata: Optional[Dict[str, object]],
+    ) -> Dict[str, object]:
+        """根据后端模式向真实 SLAM/AMCL 发出重定位指令。"""
+
+        backend_mode = self._resolve_backend_mode(
+            geometry_asset=geometry_asset,
+            metadata=metadata,
+        )
+        # 取最近 provider pose 作为 /initialpose hint；缺失时让后端用上次 known pose
+        hint_pose: Optional[Pose] = None
+        try:
+            provider = self._find_localization_provider()
+            if provider is not None:
+                hint_pose = provider.get_current_pose()
+        except Exception:
+            hint_pose = None
+
+        result: Dict[str, object] = {
+            "backend_mode": backend_mode,
+            "hint_pose_available": hint_pose is not None,
+            "actions": [],
+            "errors": [],
+        }
+        if backend_mode == "amcl_localization_only":
+            self._publish_initialpose(hint_pose, result)
+        elif backend_mode == "slam_toolbox":
+            # slam_toolbox 在线建图模式下，发 clear_changes 让其重新接受新 keyframe；
+            # 同时 /initialpose 让 AMCL（如同时启用）重新撒粒子。
+            self._call_slam_toolbox_clear_changes(result)
+            self._publish_initialpose(hint_pose, result)
+        else:
+            result["errors"].append(
+                "未知后端模式 backend_mode=%s，跳过真接入；建议在 mapping 端写入 backend_mode 元数据。"
+                % backend_mode
+            )
+        return result
+
+    @staticmethod
+    def _resolve_backend_mode(
+        *,
+        geometry_asset: Optional[Dict[str, object]],
+        metadata: Optional[Dict[str, object]],
+    ) -> str:
+        """从 metadata / geometry_asset 解析后端模式。"""
+
+        for source in (metadata or {}, geometry_asset or {}):
+            value = str(source.get("backend_mode") or "").strip().lower()
+            if value:
+                return value
+        # 兜底：external_slam_nav2 默认 slam_toolbox（在线 SLAM）。
+        stack = str((geometry_asset or {}).get("geometry_stack") or "").strip().lower()
+        if stack == "external_slam_nav2":
+            return "slam_toolbox"
+        return "unknown"
+
+    def _publish_initialpose(self, hint_pose: Optional[Pose], result: Dict[str, object]) -> None:
+        """向 AMCL `/initialpose` 发布初始位姿。"""
+
+        if hint_pose is None:
+            result["errors"].append("无可用 hint pose，跳过 /initialpose 发布。")
+            return
+        try:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+            from geometry_msgs.msg import PoseWithCovarianceStamped
+            from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
+
+            rclpy = acquire_ros2_context()
+            node = rclpy.create_node("nuwax_localization_initialpose_publisher")
+            try:
+                qos = QoSProfile(
+                    history=HistoryPolicy.KEEP_LAST,
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                )
+                pub = node.create_publisher(PoseWithCovarianceStamped, "/initialpose", qos)
+                msg = PoseWithCovarianceStamped()
+                # AMCL 期望 frame=map
+                msg.header.frame_id = "map"
+                msg.pose.pose.position.x = float(hint_pose.position.x)
+                msg.pose.pose.position.y = float(hint_pose.position.y)
+                msg.pose.pose.position.z = float(hint_pose.position.z)
+                msg.pose.pose.orientation.x = float(hint_pose.orientation.x)
+                msg.pose.pose.orientation.y = float(hint_pose.orientation.y)
+                msg.pose.pose.orientation.z = float(hint_pose.orientation.z)
+                msg.pose.pose.orientation.w = float(hint_pose.orientation.w)
+                # 单位对角协方差作为 hint（不强约束）
+                msg.pose.covariance = [0.25 if i in (0, 7, 35) else 0.0 for i in range(36)]
+                pub.publish(msg)
+                result["actions"].append({"target": "/initialpose", "status": "published"})
+            finally:
+                node.destroy_node()
+                release_ros2_context()
+        except Exception as exc:
+            result["errors"].append("/initialpose 发布失败：%s" % exc)
+
+    def _call_slam_toolbox_clear_changes(self, result: Dict[str, object]) -> None:
+        """调用 slam_toolbox `/slam_toolbox/clear_changes` service 清除累积修正。"""
+
+        try:
+            from slam_toolbox.srv import Clear  # type: ignore
+            from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
+
+            rclpy = acquire_ros2_context()
+            node = rclpy.create_node("nuwax_localization_slam_toolbox_client")
+            try:
+                client = node.create_client(Clear, "/slam_toolbox/clear_changes")
+                if not client.wait_for_service(timeout_sec=2.0):
+                    result["errors"].append("/slam_toolbox/clear_changes service 未就绪。")
+                    return
+                future = client.call_async(Clear.Request())
+                rclpy.spin_until_future_complete(node, future, timeout_sec=2.0)
+                if future.done() and future.result() is not None:
+                    result["actions"].append({"target": "/slam_toolbox/clear_changes", "status": "called"})
+                else:
+                    result["errors"].append("/slam_toolbox/clear_changes 调用未返回结果。")
+            finally:
+                node.destroy_node()
+                release_ros2_context()
+        except Exception as exc:
+            result["errors"].append("/slam_toolbox/clear_changes 调用失败：%s" % exc)
 
     def get_localization_diagnostics(self) -> Optional[LocalizationDiagnostics]:
         """返回当前平台定位诊断信息。"""
@@ -465,12 +625,19 @@ class LocalizationService:
         if isinstance(assets, list):
             return [self._clone_metadata(item) for item in assets if isinstance(item, dict)]
         is_external_stack = str(geometry_asset.get("geometry_stack") or "").strip().lower() == "external_slam_nav2"
-        state_asset_type = "external_slam_nav2_state" if is_external_stack else "rtabmap_database"
+        # external_slam_nav2 真实后端是 slam_toolbox。
+        state_asset_type = "slam_toolbox_posegraph" if is_external_stack else "rtabmap_database"
         refs = []
-        for asset_type, path_key in ((state_asset_type, "rtabmap_db_path"), ("pcd", "pcd_path")):
-            path = str(geometry_asset.get(path_key) or "").strip()
-            if path:
-                refs.append({"asset_type": asset_type, "path": path, "frame_id": geometry_asset.get("frame_id")})
+        # 优先读 backend_state_path（新命名），缺失时 fallback 到老 rtabmap_db_path（兼容老 version.json）。
+        backend_path = (
+            str(geometry_asset.get("backend_state_path") or "").strip()
+            or str(geometry_asset.get("rtabmap_db_path") or "").strip()
+        )
+        if backend_path:
+            refs.append({"asset_type": state_asset_type, "path": backend_path, "frame_id": geometry_asset.get("frame_id")})
+        pcd_path = str(geometry_asset.get("pcd_path") or "").strip()
+        if pcd_path:
+            refs.append({"asset_type": "pcd", "path": pcd_path, "frame_id": geometry_asset.get("frame_id")})
         return refs
 
     def _resolve_candidate_covariance(self, metadata: Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -585,18 +752,27 @@ class LocalizationService:
         }
 
     def _resolve_backend_type(self, provider: LocalizationProvider) -> str:
-        """解析后端类型。"""
+        """解析后端类型。
+
+        历史命名 `rtabmap` 已退场；当前真实在线 SLAM 后端是 `slam_toolbox`。
+        provider_name 同时匹配 `slam_toolbox` 与历史 `rtabmap` 字面值，统一归一为
+        `slam_toolbox`。
+        """
 
         backend_type = getattr(provider, "backend_type", None)
         if backend_type:
+            normalized = str(backend_type).strip().lower()
+            # 兼容存量 backend_type="rtabmap" 写入，统一对外语义为 slam_toolbox。
+            if normalized == "rtabmap":
+                return "slam_toolbox"
             return str(backend_type)
 
-        provider_name = getattr(provider, "provider_name", "")
-        if "rtabmap" in provider_name.lower():
-            return "rtabmap"
-        if "go2" in provider_name.lower():
+        provider_name = str(getattr(provider, "provider_name", "") or "").lower()
+        if "slam_toolbox" in provider_name or "rtabmap" in provider_name:
+            return "slam_toolbox"
+        if "go2" in provider_name:
             return "go2_sdk"
-        if "nav2" in provider_name.lower():
+        if "nav2" in provider_name:
             return "nav2"
 
         return "unknown"

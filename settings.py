@@ -20,7 +20,7 @@ import logging
 import os
 from pathlib import Path
 import threading
-from typing import Deque, Dict, Iterator, Tuple
+from typing import Deque, Dict, Iterator, Optional, Tuple
 
 try:
     import fcntl
@@ -136,6 +136,52 @@ def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
         if item:
             items.append(item)
     return tuple(items)
+
+
+_DEPRECATION_LOGGER = logging.getLogger("nuwax_robot_bridge.settings.deprecation")
+_DEPRECATED_ENV_NOTIFIED: set[str] = set()
+
+
+def _notify_deprecated_env(legacy_name: str, preferred_name: str) -> None:
+    if legacy_name in _DEPRECATED_ENV_NOTIFIED:
+        return
+    _DEPRECATED_ENV_NOTIFIED.add(legacy_name)
+    _DEPRECATION_LOGGER.warning(
+        "环境变量 %s 已重命名为 %s，旧名仍兼容但下一轮治理会删除，请尽快迁移。",
+        legacy_name,
+        preferred_name,
+    )
+
+
+def _resolve_alias_env_value(preferred_name: str, legacy_name: str) -> Optional[str]:
+    """优先返回新 env 名的原值；新名缺省、老名有值时打 deprecation 提示并返回老名值。"""
+
+    preferred_raw = _raw_value(preferred_name, "")
+    if preferred_raw.strip():
+        return preferred_raw
+    legacy_raw = _raw_value(legacy_name, "")
+    if legacy_raw.strip():
+        _notify_deprecated_env(legacy_name, preferred_name)
+        return legacy_raw
+    return None
+
+
+def _cfg_str_alias(preferred_name: str, legacy_name: str, default: str = "") -> str:
+    raw = _resolve_alias_env_value(preferred_name, legacy_name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return value if value else default
+
+
+def _cfg_bool_alias(preferred_name: str, legacy_name: str, default: bool) -> bool:
+    raw = _resolve_alias_env_value(preferred_name, legacy_name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if not value:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
 
 
 def _clamp_volume(value: float) -> float:
@@ -772,10 +818,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
             tf_static_topic=_cfg_str("NUWAX_GEOMETRY_TF_STATIC_TOPIC", "/tf_static"),
             occupancy_topic=_cfg_str("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
             cost_map_topic=_cfg_str("NUWAX_GEOMETRY_COST_MAP_TOPIC", "/global_costmap/costmap"),
-            exploration_frontiers_topic=_cfg_str(
-                "NUWAX_GEOMETRY_EXPLORATION_FRONTIERS_TOPIC",
-                "/explore/frontiers",
-            ),
         ),
         frames=GeometryFrameConfig(
             map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "map"),
@@ -785,16 +827,16 @@ def load_config() -> NuwaxRobotBridgeConfig:
             imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
         rtabmap=RtabmapConfig(
-            profile_name=_cfg_str("NUWAX_RTABMAP_PROFILE_NAME", "external_slam_nav2"),
-            profile_enabled=_cfg_bool("NUWAX_RTABMAP_PROFILE_ENABLED", True),
-            default_profile=_cfg_bool("NUWAX_RTABMAP_DEFAULT_PROFILE", True),
-            database_root=_cfg_str("NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
-            pcd_root=_cfg_str("NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()),
-            launch_package=_cfg_str("NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_ros"),
-            launch_file=_cfg_str("NUWAX_RTABMAP_LAUNCH_FILE", "rtabmap.launch.py"),
-            occupancy_projection=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
-            input_contract=_cfg_str("NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"),
-            output_contract=_cfg_str("NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
+            profile_name=_cfg_str_alias("NUWAX_BACKEND_PROFILE_NAME", "NUWAX_RTABMAP_PROFILE_NAME", "external_slam_nav2"),
+            profile_enabled=_cfg_bool_alias("NUWAX_BACKEND_PROFILE_ENABLED", "NUWAX_RTABMAP_PROFILE_ENABLED", True),
+            default_profile=_cfg_bool_alias("NUWAX_BACKEND_DEFAULT_PROFILE", "NUWAX_RTABMAP_DEFAULT_PROFILE", True),
+            database_root=_cfg_str_alias("NUWAX_BACKEND_DATABASE_ROOT", "NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
+            pcd_root=_cfg_str_alias("NUWAX_BACKEND_PCD_ROOT", "NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()),
+            launch_package=_cfg_str_alias("NUWAX_BACKEND_LAUNCH_PACKAGE", "NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_ros"),
+            launch_file=_cfg_str_alias("NUWAX_BACKEND_LAUNCH_FILE", "NUWAX_RTABMAP_LAUNCH_FILE", "rtabmap.launch.py"),
+            occupancy_projection=_cfg_str_alias("NUWAX_BACKEND_OCCUPANCY_PROJECTION", "NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
+            input_contract=_cfg_str_alias("NUWAX_BACKEND_INPUT_CONTRACT", "NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"),
+            output_contract=_cfg_str_alias("NUWAX_BACKEND_OUTPUT_CONTRACT", "NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
             timestamp_quality=GeometryTimestampQualityConfig(
                 source=_cfg_str("NUWAX_GEOMETRY_TIMESTAMP_SOURCE", "sensor_header"),
                 max_point_cloud_age_sec=max(0.0, _cfg_float("NUWAX_GEOMETRY_POINT_CLOUD_MAX_AGE_SEC", 0.5)),
@@ -829,13 +871,13 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 output_layer=_cfg_str("NUWAX_GEOMETRY_TRAVERSABILITY_OUTPUT_LAYER", "traversability"),
             ),
             outputs=RtabmapOutputConfig(
-                database_asset_name=_cfg_str("NUWAX_RTABMAP_DATABASE_ASSET_NAME", "external_slam_nav2_state.db"),
-                pcd_asset_name=_cfg_str("NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"),
-                occupancy_layer=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"),
-                costmap_layer=_cfg_str("NUWAX_RTABMAP_COSTMAP_LAYER", "nav2_global_costmap"),
-                traversability_layer=_cfg_str("NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"),
-                localization_status=_cfg_str("NUWAX_RTABMAP_LOCALIZATION_STATUS", "rtabmap_localization"),
-                relocalization_diagnostics=_cfg_str("NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "rtabmap_icp"),
+                database_asset_name=_cfg_str_alias("NUWAX_BACKEND_DATABASE_ASSET_NAME", "NUWAX_RTABMAP_DATABASE_ASSET_NAME", "external_slam_nav2_state.db"),
+                pcd_asset_name=_cfg_str_alias("NUWAX_BACKEND_PCD_ASSET_NAME", "NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"),
+                occupancy_layer=_cfg_str_alias("NUWAX_BACKEND_OCCUPANCY_LAYER", "NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"),
+                costmap_layer=_cfg_str_alias("NUWAX_BACKEND_COSTMAP_LAYER", "NUWAX_RTABMAP_COSTMAP_LAYER", "nav2_global_costmap"),
+                traversability_layer=_cfg_str_alias("NUWAX_BACKEND_TRAVERSABILITY_LAYER", "NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"),
+                localization_status=_cfg_str_alias("NUWAX_BACKEND_LOCALIZATION_STATUS", "NUWAX_RTABMAP_LOCALIZATION_STATUS", "rtabmap_localization"),
+                relocalization_diagnostics=_cfg_str_alias("NUWAX_BACKEND_RELOCALIZATION_DIAGNOSTICS", "NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "rtabmap_icp"),
             ),
         ),
         nav2=Nav2Config(

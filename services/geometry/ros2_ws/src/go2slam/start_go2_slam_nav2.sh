@@ -5,7 +5,6 @@ set -eo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS_SETUP="$ROOT_DIR/install/setup.bash"
 GEOMETRY_RUNTIME_ENV_SCRIPT="$ROOT_DIR/../../../source_runtime_env.sh"
-EXPLORE_PARAMS_FILE="$ROOT_DIR/src/go2_navigation2/config/explore_params.yaml"
 NAV2_PID=""
 MAPPING_PID=""
 STOP_REQUESTED=false
@@ -45,14 +44,12 @@ RVIZ_CONFIG=""
 
 # --- 新增参数处理 ---
 START_MAPPING=false  # 默认不启动点云建图
-START_EXPLORE=false  # 默认不启动 frontier 观测
 START_RVIZ=true      # 默认启动 RViz
 
 usage() {
   local status="${1:-1}"
-  echo "Usage: $0 [--mapping] [--explore] [--no-rviz]"
+  echo "Usage: $0 [--mapping] [--no-rviz]"
   echo "  --mapping    启动 Go2 点云建图 (mapping_only.launch.py)"
-  echo "  --explore    启动 m-explore-ros2 frontier 只读观测"
   echo "  --no-rviz    不启动 RViz，适用于无显示环境或远程终端"
   exit "${status}"
 }
@@ -61,7 +58,6 @@ usage() {
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     --mapping) START_MAPPING=true; shift ;;
-    --explore) START_EXPLORE=true; shift ;;
     --no-rviz) START_RVIZ=false; shift ;;
     -h|--help) usage 0 ;;
     *) echo "Unknown parameter: $1"; usage ;;
@@ -92,7 +88,6 @@ workspace_stale_source() {
   local source_file=""
   local search_roots=()
   [[ -d "${ROOT_DIR}/src" ]] && search_roots+=("${ROOT_DIR}/src")
-  [[ -d "${ROOT_DIR}/m-explore-ros2" ]] && search_roots+=("${ROOT_DIR}/m-explore-ros2")
   if [[ "${#search_roots[@]}" -eq 0 ]]; then
     return 1
   fi
@@ -156,18 +151,6 @@ fi
 # 启动 Nav2
 echo "Starting Go2 Nav2 in SLAM mode..."
 NAV2_ARGS=(localization:=slam use_rviz:=false)
-if [[ "${START_EXPLORE}" = true ]]; then
-  if ! ros2 pkg prefix explore_lite >/dev/null 2>&1; then
-    echo "Error: Missing ROS package 'explore_lite' but --explore was requested." >&2
-    echo "Build the workspace first, including m-explore-ros2: colcon build --symlink-install" >&2
-    exit 1
-  fi
-  if [[ ! -f "${EXPLORE_PARAMS_FILE}" ]]; then
-    echo "Error: Missing explore params file: ${EXPLORE_PARAMS_FILE}" >&2
-    exit 1
-  fi
-  NAV2_ARGS+=(use_explore:=true "explore_params_file:=${EXPLORE_PARAMS_FILE}")
-fi
 ros2 launch go2_navigation2 go2_nav2.launch.py "${NAV2_ARGS[@]}" &
 NAV2_PID=$!
 

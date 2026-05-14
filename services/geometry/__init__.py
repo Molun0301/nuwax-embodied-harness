@@ -1,6 +1,7 @@
 """平台几何运行时导出。"""
 
 from services.geometry.config import (
+    BackendStateConfig,
     ExternalGeometryStackConfig,
     GeometryFrameConfig,
     GeometryOdometryQualityConfig,
@@ -18,7 +19,6 @@ from services.geometry.config import (
     build_default_rtabmap_pcd_root,
 )
 from services.geometry.runtime import PlatformGeometryRuntime
-from services.geometry.frontier_marker_provider import Ros2FrontierMarkerProvider
 from services.geometry.live_map_provider import Ros2LiveMapProvider
 from services.geometry.pointcloud_publisher import Ros2PointCloudPublisher
 from services.geometry.tf_localization_provider import Ros2TfLocalizationProvider
@@ -31,6 +31,7 @@ from services.geometry.pointcloud_map import (
 )
 
 __all__ = [
+    "BackendStateConfig",
     "ExternalGeometryStackConfig",
     "GeometryFrameConfig",
     "GeometryOdometryQualityConfig",
@@ -41,7 +42,6 @@ __all__ = [
     "Nav2Config",
     "PlatformGeometryConfig",
     "PlatformGeometryRuntime",
-    "Ros2FrontierMarkerProvider",
     "Ros2LiveMapProvider",
     "Ros2PointCloudPublisher",
     "Ros2TfLocalizationProvider",

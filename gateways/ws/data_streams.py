@@ -7,7 +7,7 @@ import time
 from typing import Dict, Iterable, Optional, Tuple
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from contracts.streams import StreamFrame
@@ -111,15 +111,22 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         return StreamingResponse(frame_generator(), media_type="text/event-stream")
 
-    video_capture_lock = asyncio.Lock()
-
     @router.get("/streams/video.mjpeg")
     async def video_mjpeg_stream(
         request: Request,
         camera_id: Optional[str] = None,
         fps: float = 15.0,
-    ) -> StreamingResponse:
+    ):
         access_manager.authenticate_http(request)
+        if runtime._image_stream_subscription_id is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "video_stream_not_available",
+                    "reason": "streams_source_not_subscribed",
+                    "message": "源头视频推流未订阅；不再以高层 SDK 抓单帧伪装实时。",
+                },
+            )
         requested_fps = float(fps or 15.0)
         if not math.isfinite(requested_fps):
             requested_fps = 15.0
@@ -129,20 +136,6 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             last_sequence = 0
             while not await request.is_disconnected():
                 started_at = time.monotonic()
-                try:
-                    async with video_capture_lock:
-                        await _run_blocking(
-                            runtime._publish_video_stream_frame,
-                            reason="streams.video_mjpeg",
-                        )
-                except Exception as exc:
-                    runtime.stream_bus.publish(
-                        "video.frame",
-                        source="streams.video_mjpeg",
-                        payload={"available": False, "message": str(exc)},
-                        status="missing",
-                        metadata={"reason": "mjpeg_capture_failed"},
-                    )
                 latest_frame = await _run_blocking(
                     runtime.wait_for_video_frame,
                     last_sequence,

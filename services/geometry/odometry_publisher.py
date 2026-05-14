@@ -6,7 +6,9 @@ import math
 import threading
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from contracts.geometry import Pose
+from core.event_bus import EventBus
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
 
@@ -19,12 +21,30 @@ class Ros2OdometryPublisher:
     provider_name = "platform_ros2_odometry_publisher"
     provider_version = "0.1.0"
 
-    def __init__(self, config: PlatformGeometryConfig, provider_resolver: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        config: PlatformGeometryConfig,
+        provider_resolver: Callable[[], Any],
+        *,
+        event_bus: Optional[EventBus] = None,
+    ) -> None:
         self.config = config
-        self.topic = str(config.topics.odom_topic or "/nuwax/geometry/odom")
-        self.odom_frame = str(config.frames.odom_frame or "odom")
-        self.base_frame = str(config.frames.base_frame or "base_link")
+        topic = str(config.topics.odom_topic or "").strip()
+        if not topic:
+            raise ValueError(
+                "PlatformGeometryConfig.topics.odom_topic 必须显式配置，禁止使用兜底字面值。"
+            )
+        odom_frame = str(config.frames.odom_frame or "").strip()
+        base_frame = str(config.frames.base_frame or "").strip()
+        if not odom_frame or not base_frame:
+            raise ValueError(
+                "PlatformGeometryConfig.frames.odom_frame / base_frame 必须显式配置，禁止使用兜底字面值。"
+            )
+        self.topic = topic
+        self.odom_frame = odom_frame
+        self.base_frame = base_frame
         self._provider_resolver = provider_resolver
+        self._event_bus = event_bus
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._started = False
@@ -52,6 +72,7 @@ class Ros2OdometryPublisher:
             self._started = False
             self._ros_ready = False
             LOGGER.warning("启动 ROS2 odom 发布桥失败：%s", exc)
+            self._emit_failure_event("publisher_start_failed", str(exc))
             if self.config.require_ros2:
                 raise
             return
@@ -153,14 +174,17 @@ class Ros2OdometryPublisher:
         provider = self._provider_resolver()
         if provider is None:
             self._last_error = "定位 provider 不可用，未启用 ROS2 odom 发布。"
+            self._emit_failure_event("provider_unavailable", self._last_error)
             return
         subscriber = getattr(provider, "subscribe_localization", None)
         if not callable(subscriber):
             self._last_error = "定位 provider 未实现 subscribe_localization，未启用定时轮询伪流式。"
+            self._emit_failure_event("provider_subscribe_unavailable", self._last_error)
             return
         self._subscription_id = subscriber(lambda pose, frame_tree, metadata: self._publish_pose(pose))
         if self._subscription_id is None:
             self._last_error = "定位 provider 未返回有效订阅，ROS2 odom 发布未连接源头流。"
+            self._emit_failure_event("provider_subscribe_returned_none", self._last_error)
 
     def _publish_pose(self, pose: Pose) -> None:
         if self._publisher is None or self._odometry_type is None or pose is None:
@@ -182,6 +206,29 @@ class Ros2OdometryPublisher:
             with self._lock:
                 self._last_error = str(exc)
             LOGGER.debug("发布 ROS2 odom 失败。", exc_info=True)
+            self._emit_failure_event("publish_exception", str(exc))
+
+    def _emit_failure_event(self, reason: str, message: str) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            self._event_bus.publish(
+                self._event_bus.build_event(
+                    "geometry.odom_publisher_failed",
+                    category=RuntimeEventCategory.ROBOT,
+                    source="platform_ros2_odometry_publisher",
+                    severity=RuntimeEventSeverity.ERROR,
+                    message=message,
+                    payload={
+                        "reason": reason,
+                        "topic": self.topic,
+                        "odom_frame": self.odom_frame,
+                        "base_frame": self.base_frame,
+                    },
+                )
+            )
+        except Exception:
+            LOGGER.debug("发布 odom_publisher_failed 事件失败。", exc_info=True)
 
     def _build_odometry_message(self, pose: Pose):
         Odometry = self._odometry_type

@@ -106,6 +106,11 @@ class PerceptionVideoRuntime:
                 return False
         return True
 
+    def bind_memory_service(self, memory_service) -> None:
+        """显式注入 memory_service，避免外部直接赋值私有字段。"""
+
+        self._memory_service = memory_service
+
     def is_running(self) -> bool:
         """返回后台线程是否处于运行状态。"""
 

@@ -88,7 +88,7 @@ sudo apt install -y \
   ros-jazzy-rosidl-default-runtime
 ```
 
-点云建图和 `m-explore-ros2/map_merge` 编译还会用到系统库：
+点云建图编译还会用到系统库：
 
 ```bash
 sudo apt install -y libpcl-dev libopencv-dev libboost-thread-dev
@@ -107,7 +107,7 @@ ros2 pkg prefix unitree_api
 ```bash
 sudo rosdep init 2>/dev/null || true
 rosdep update
-rosdep install --from-paths src m-explore-ros2 --ignore-src -r -y --rosdistro jazzy
+rosdep install --from-paths src --ignore-src -r -y --rosdistro jazzy
 ```
 
 如果 `rosdep` 报 `unitree_go` 或 `unitree_api` 无法解析，先完成 Unitree ROS 2 接口包安装，再重新构建。
@@ -134,8 +134,6 @@ source install/setup.bash
 | --- | --- |
 | `start_go2_slam_nav2.sh` | 启动 GO2 驱动、EKF、点云转 LaserScan、slam_toolbox、Nav2 和 RViz，用于边建 2D 地图边导航。 |
 | `start_go2_slam_nav2.sh --mapping` | 在 SLAM/Nav2 基础上启动 `go2_mapping_only` 点云建图，发布 `/go2_built_map`，用于后续保存 PCD 点云地图。 |
-| `start_go2_slam_nav2.sh --explore` | 在 SLAM/Nav2 基础上启动 `explore_lite` frontier 只读观测，只发布前沿点，不向 Nav2 发送目标点。 |
-| `start_go2_slam_nav2.sh --mapping --explore` | 同时进行 SLAM、Nav2、点云建图和 frontier 只读观测。 |
 | `start_go2_slam_nav2.sh --no-rviz` | 启动 SLAM/Nav2 但不启动 RViz，适用于无显示环境或远程终端。 |
 | `start_go2_nav2_localization.sh` | 使用 `maps/` 下最新 2D 地图启动 map_server、AMCL、Nav2 和 RViz；如果 `output/` 下有 PCD，会尝试自动初始定位。 |
 | `start_go2_nav2_localization.sh <map.yaml>` | 使用指定 2D 地图启动 AMCL + Nav2，PCD 仍自动选择 `output/` 下最新文件。 |

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -408,6 +409,12 @@ class PlatformExplorationRuntime:
 
         attempted_poses = [*state.visited_frontiers, *state.rejected_frontiers]
         center_pose = state.request.center_pose or current_pose
+
+        if len(attempted_poses) == 0:
+            self._wait_for_costmap_stable(state)
+            if not self.is_running:
+                return
+
         LOGGER.info(
             "frontier 规划请求 request_id=%s current=(%.3f, %.3f, %.3f) frame=%s center=(%.3f, %.3f, %.3f) radius_m=%s map_revision=%s costmap_revision=%s pose_revision=%s attempted=%d",
             state.request_id,
@@ -433,6 +440,9 @@ class PlatformExplorationRuntime:
             radius_m=state.request.radius_m,
             attempted_poses=attempted_poses,
         )
+        if not self.is_running:
+            LOGGER.info("frontier 计算完成但探索已停止，丢弃结果 request_id=%s", state.request_id)
+            return
         state.latest_frontiers = list(frontiers)
         state.last_frontier_count = len(frontiers)
         LOGGER.info("frontier 规划接收候选 request_id=%s count=%d", state.request_id, len(frontiers))
@@ -517,6 +527,53 @@ class PlatformExplorationRuntime:
             frontier_revision,
         )
         state.phase = ExplorationRuntimePhase.MOVING_TO_FRONTIER
+
+    def _wait_for_costmap_stable(self, state: ExplorationRuntimeState) -> None:
+        """首轮 frontier 计算前等待 costmap revision 达到稳定阈值。"""
+
+        _COSTMAP_MIN_REVISION = 5
+        _WAIT_TIMEOUT_SEC = 15.0
+        _POLL_INTERVAL_SEC = 0.5
+
+        def _parse_costmap_revision(revision: Optional[str]) -> int:
+            if not revision:
+                return 0
+            try:
+                return int(revision.split(":")[-1])
+            except (ValueError, IndexError):
+                return 0
+
+        current_rev = _parse_costmap_revision(state.costmap_revision)
+        if current_rev >= _COSTMAP_MIN_REVISION:
+            return
+
+        LOGGER.info(
+            "首轮 frontier 计算前等待 costmap 稳定 request_id=%s current_revision=%s min_revision=%d timeout_sec=%.1f",
+            state.request_id,
+            state.costmap_revision,
+            _COSTMAP_MIN_REVISION,
+            _WAIT_TIMEOUT_SEC,
+        )
+        deadline = time.monotonic() + _WAIT_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            if not self.is_running:
+                return
+            current_rev = _parse_costmap_revision(state.costmap_revision)
+            if current_rev >= _COSTMAP_MIN_REVISION:
+                LOGGER.info(
+                    "costmap 已稳定 request_id=%s revision=%s",
+                    state.request_id,
+                    state.costmap_revision,
+                )
+                return
+            time.sleep(_POLL_INTERVAL_SEC)
+
+        LOGGER.warning(
+            "等待 costmap 稳定超时，继续执行首轮 frontier 计算 request_id=%s current_revision=%s min_revision=%d",
+            state.request_id,
+            state.costmap_revision,
+            _COSTMAP_MIN_REVISION,
+        )
 
     def _handle_moving_state(
         self,

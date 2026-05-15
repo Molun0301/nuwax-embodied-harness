@@ -6,6 +6,7 @@ import logging
 import math
 from typing import List, Optional, Sequence, Tuple, TYPE_CHECKING
 
+import cv2
 import numpy as np
 
 from contracts.frame_semantics import frame_ids_semantically_equal
@@ -379,29 +380,16 @@ class FrontierExplorer:
         return frontier_mask
 
     def _cluster_frontiers(self, frontier_mask: np.ndarray) -> List[List[Cell2D]]:
-        height, width = frontier_mask.shape
-        visited = np.zeros((height, width), dtype=np.uint8)
+        if not frontier_mask.any():
+            return []
+        num_labels, labels, _stats, _ = cv2.connectedComponentsWithStats(
+            frontier_mask.astype(np.uint8), connectivity=8
+        )
         clusters: List[List[Cell2D]] = []
-        for row in range(height):
-            for col in range(width):
-                if not frontier_mask[row, col] or visited[row, col] == 1:
-                    continue
-                cluster: List[Cell2D] = []
-                queue = [(row, col)]
-                visited[row, col] = 1
-                while queue:
-                    current_row, current_col = queue.pop()
-                    cluster.append((current_row, current_col))
-                    for row_offset, col_offset in self._NEIGHBORS:
-                        next_row = current_row + row_offset
-                        next_col = current_col + col_offset
-                        if next_row < 0 or next_row >= height or next_col < 0 or next_col >= width:
-                            continue
-                        if visited[next_row, next_col] == 1 or not frontier_mask[next_row, next_col]:
-                            continue
-                        visited[next_row, next_col] = 1
-                        queue.append((next_row, next_col))
-                clusters.append(cluster)
+        for label_id in range(1, num_labels):  # 0 是背景
+            ys, xs = np.where(labels == label_id)
+            cluster: List[Cell2D] = [(int(y), int(x)) for y, x in zip(ys, xs)]
+            clusters.append(cluster)
         return clusters
 
     def _candidate_cell_score(

@@ -40,10 +40,12 @@ def main() -> None:
     rclpy.init()
     node = rclpy.create_node(args.node_name)
     broadcaster = TransformBroadcaster(node)
+    # Jetson 内存有限：depth=1 避免大缓冲区分配；BEST_EFFORT 减少 DDS 内部队列开销。
+    # odom/TF 为高频数据，丢帧可接受，不需要 RELIABLE 重传。
     qos = QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
-        depth=20,
-        reliability=ReliabilityPolicy.RELIABLE,
+        depth=1,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
         durability=DurabilityPolicy.VOLATILE,
     )
     # 保留上一次有效 stamp，拦截零时间戳与重复 stamp，避免 tf2 抛 TF_REPEAT_DATA / TF_OLD_DATA。
@@ -90,6 +92,10 @@ def main() -> None:
     node.create_subscription(Odometry, args.odom_topic, on_odom, qos)
     try:
         rclpy.spin(node)
+    except MemoryError:
+        node.get_logger().fatal("odom_tf_bridge: 内存不足（MemoryError），优雅退出。")
+    except Exception as exc:  # noqa: BLE001
+        node.get_logger().fatal(f"odom_tf_bridge: 未预期异常，优雅退出：{exc}")
     finally:
         node.destroy_node()
         rclpy.shutdown()

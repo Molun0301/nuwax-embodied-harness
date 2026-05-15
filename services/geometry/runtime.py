@@ -2914,6 +2914,7 @@ class PlatformGeometryRuntime:
                     "process": process_status,
                 },
             }
+        self._ensure_amcl_initialized()
         return {
             **activation_payload,
             "backend_switch_applied": True,
@@ -3005,6 +3006,66 @@ class PlatformGeometryRuntime:
         if pcd_path is not None:
             command.append("pcd_map:=%s" % str(pcd_path))
         return command
+
+    def _ensure_amcl_initialized(self) -> None:
+        """等待 AMCL 发布 map→odom TF；超时后发布 identity initialpose 作为 fallback。"""
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            try:
+                pose = self._tf_localization_provider.get_current_pose()
+            except Exception:
+                pose = None
+            if pose is not None:
+                LOGGER.info("AMCL 已初始化，map→odom TF 可用。")
+                return
+            time.sleep(0.5)
+        LOGGER.warning("AMCL 15 秒内未发布 TF，发布 identity initialpose 作为 fallback。")
+        self._publish_initialpose_fallback()
+        deadline2 = time.monotonic() + 5.0
+        while time.monotonic() < deadline2:
+            try:
+                pose = self._tf_localization_provider.get_current_pose()
+            except Exception:
+                pose = None
+            if pose is not None:
+                LOGGER.info("AMCL 在 initialpose fallback 后成功初始化。")
+                return
+            time.sleep(0.5)
+        LOGGER.warning("AMCL 在 initialpose fallback 后仍未发布 TF，定位栈可能未就绪。")
+
+    def _publish_initialpose_fallback(self) -> None:
+        """向 /initialpose 发布 identity PoseWithCovarianceStamped，触发 AMCL 初始化。"""
+        from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
+        node = None
+        rclpy = None
+        has_context = False
+        try:
+            from geometry_msgs.msg import PoseWithCovarianceStamped
+            rclpy = acquire_ros2_context()
+            has_context = True
+            node = rclpy.create_node("nuwax_amcl_initialpose_publisher")
+            pub = node.create_publisher(PoseWithCovarianceStamped, "/initialpose", 10)
+            msg = PoseWithCovarianceStamped()
+            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.header.frame_id = "map"
+            msg.pose.pose.orientation.w = 1.0
+            msg.pose.covariance[0] = 0.25
+            msg.pose.covariance[7] = 0.25
+            msg.pose.covariance[35] = 0.06853891945200942
+            # 等待订阅者就绪后发布
+            time.sleep(0.5)
+            pub.publish(msg)
+            LOGGER.info("已发布 identity initialpose 到 /initialpose。")
+        except Exception as exc:
+            LOGGER.warning("发布 initialpose fallback 失败：%s", exc)
+        finally:
+            if node is not None:
+                try:
+                    node.destroy_node()
+                except Exception:
+                    pass
+            if has_context:
+                release_ros2_context()
 
     def _wait_for_geometry_snapshot(self, *, timeout_sec: float) -> Optional[MapSnapshot]:
         deadline = time.monotonic() + max(0.0, float(timeout_sec))

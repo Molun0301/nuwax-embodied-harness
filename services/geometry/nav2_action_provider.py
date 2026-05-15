@@ -451,6 +451,10 @@ class Nav2ActionNavigationProvider:
                 return False, "TF 检查失败：%s" % exc
             if frame_tree is None:
                 return False, "TF 缺失：frame tree 不可用。"
+        # 额外确认 map→base_footprint TF 链健康：get_current_pose() 必须返回非 None
+        live_pose = self._read_current_pose()
+        if live_pose is None:
+            return False, "TF 定位不可用：get_current_pose() 返回 None，map→base_footprint TF 链可能断裂。"
         return True, None
 
     def _read_current_pose(self) -> Optional[Pose]:

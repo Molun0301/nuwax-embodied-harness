@@ -170,12 +170,13 @@ fi
 
 sleep 4
 
-# 启动 odom_tf_bridge（发布 odom→base_footprint TF，slam_toolbox 依赖此 TF）
+# 启动 odom_tf_bridge（go2_driver 的 pose_callback 依赖 utlidar/robot_pose，
+# 如果该 topic 无数据则 driver 不发布 TF，需要 odom_tf_bridge 补充）
 REPO_ROOT="${ROOT_DIR}/../../../../.."
 ODOM_BRIDGE_SCRIPT="${REPO_ROOT}/services/geometry/odom_tf_bridge.py"
 if [[ -f "${ODOM_BRIDGE_SCRIPT}" ]]; then
   echo "Starting odom_tf_bridge..."
-  python3 "${ODOM_BRIDGE_SCRIPT}" --odom-topic /utlidar/robot_odom --odom-frame odom --default-child-frame base_footprint --child-frame base_footprint &
+  python3 "${ODOM_BRIDGE_SCRIPT}" --odom-topic /odom --odom-frame odom --default-child-frame base_footprint --child-frame base_footprint &
   ODOM_BRIDGE_PID=$!
 fi
 

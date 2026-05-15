@@ -7,6 +7,7 @@ WS_SETUP="$ROOT_DIR/install/setup.bash"
 GEOMETRY_RUNTIME_ENV_SCRIPT="$ROOT_DIR/../../../source_runtime_env.sh"
 NAV2_PID=""
 MAPPING_PID=""
+BRIDGE_PID=""
 STOP_REQUESTED=false
 
 detect_ros_setup() {
@@ -68,7 +69,7 @@ done
 cleanup() {
   STOP_REQUESTED=true
   # 只有在 PID 不为空时才尝试清理
-  for pid in "${MAPPING_PID}" "${NAV2_PID}"; do
+  for pid in "${BRIDGE_PID}" "${MAPPING_PID}" "${NAV2_PID}"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
       kill -INT "${pid}" 2>/dev/null || true
       for _ in {1..30}; do
@@ -167,6 +168,14 @@ fi
 # -----------------------
 
 sleep 4
+
+# 启动 Nav2 Goal Bridge（topic-to-action 桥接，解决跨 RMW action 通信 bug）
+BRIDGE_SCRIPT="${ROOT_DIR}/../../../services/geometry/nav2_goal_bridge.py"
+if [[ -f "${BRIDGE_SCRIPT}" ]]; then
+  echo "Starting Nav2 Goal Bridge..."
+  python3 "${BRIDGE_SCRIPT}" &
+  BRIDGE_PID=$!
+fi
 
 # 运行状态检查
 if ! kill -0 "${NAV2_PID}" 2>/dev/null; then

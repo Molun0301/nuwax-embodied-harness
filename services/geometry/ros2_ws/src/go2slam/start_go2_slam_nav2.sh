@@ -176,7 +176,7 @@ REPO_ROOT="${ROOT_DIR}/../../../../.."
 ODOM_BRIDGE_SCRIPT="${REPO_ROOT}/services/geometry/odom_tf_bridge.py"
 if [[ -f "${ODOM_BRIDGE_SCRIPT}" ]]; then
   echo "Starting odom_tf_bridge..."
-  python3 "${ODOM_BRIDGE_SCRIPT}" --odom-topic /odom --default-odom-frame odom --odom-frame odom --default-child-frame base_footprint --child-frame base_footprint &
+  python3 "${ODOM_BRIDGE_SCRIPT}" --odom-topic /utlidar/robot_odom --default-odom-frame odom --odom-frame odom --default-child-frame base_footprint --child-frame base_footprint &
   ODOM_BRIDGE_PID=$!
 fi
 

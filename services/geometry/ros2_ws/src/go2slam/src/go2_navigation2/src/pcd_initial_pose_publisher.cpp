@@ -254,7 +254,7 @@ class PcdInitialPosePublisher : public rclcpp::Node {
       return;
     }
 
-    pending_pose_.header.stamp = now();
+    pending_pose_.header.stamp = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
     initial_pose_pub_->publish(pending_pose_);
     --remaining_publishes_;
   }

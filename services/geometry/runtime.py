@@ -3046,7 +3046,8 @@ class PlatformGeometryRuntime:
             node = rclpy.create_node("nuwax_amcl_initialpose_publisher")
             pub = node.create_publisher(PoseWithCovarianceStamped, "/initialpose", 10)
             msg = PoseWithCovarianceStamped()
-            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.header.stamp.sec = 0
+            msg.header.stamp.nanosec = 0
             msg.header.frame_id = "map"
             msg.pose.pose.orientation.w = 1.0
             msg.pose.covariance[0] = 0.25

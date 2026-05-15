@@ -21,9 +21,9 @@ PERCEPTION_RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.perception.run
 class PerceptionVideoRuntime:
     """持续视频感知运行时。
 
-    该运行时基于统一 `ImageProvider` 周期抓帧，再复用 `PerceptionService`
-    完成检测、跟踪与场景摘要。这样 Go2 当前可以直接通过 `VideoClient`
-    打通连续识别链路，后续切换到别的机器人或视频源时无需改上层。
+    该运行时只从平台已接收的端侧视频推流 latest/keyframe 缓冲抽帧，
+    再复用 `PerceptionService` 完成检测、跟踪与场景摘要；它不触发平台到
+    机器人侧的图像采集。
     """
 
     def __init__(
@@ -201,6 +201,24 @@ class PerceptionVideoRuntime:
             current_pose=current_pose,
             map_context=map_context,
         )
+        video_status = self._perception_service.video_frame_source_status()
+        if not bool(video_status.get("available")):
+            self._perception_service.publish_current_video_frame(
+                camera_id=self._camera_id,
+                requested_by="perception_video_runtime",
+            )
+            with self._lock:
+                self._last_error = "端侧视频推流未就绪或最近帧已过期。"
+                self._last_status_metadata = {
+                    **dict(self._last_status_metadata),
+                    "camera_id": self._camera_id,
+                    "capture_mode": "video_stream",
+                    "last_skip_reason": "video_ingest_not_ready",
+                    "video_ingest_status": dict(video_status),
+                    **dict(decision.metadata),
+                }
+            self._write_status(running=self.is_running())
+            return None
         effective_reason = reason
         if not force_keyframe:
             if not decision.should_process:
@@ -215,6 +233,7 @@ class PerceptionVideoRuntime:
                         "camera_id": self._camera_id,
                         "capture_mode": "video_stream",
                         "last_skip_reason": decision.reason,
+                        "video_ingest_status": dict(video_status),
                         **dict(decision.metadata),
                     }
                 self._write_status(running=self.is_running())
@@ -264,6 +283,7 @@ class PerceptionVideoRuntime:
                 "memory_written": memory_written,
                 "remember_keyframes": self._remember_keyframes,
                 "detection_metadata": dict(detection_metadata or {}),
+                "video_ingest_status": dict(video_status),
                 **dict(decision.metadata),
             }
         self._write_status(running=self.is_running())

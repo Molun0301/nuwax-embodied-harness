@@ -676,11 +676,11 @@ def _render_debug_page(access_token: str) -> str:
                 <div id="video-pane" class="tab-pane">
                   <section id="video-perception" class="panel compact">
                     <div class="card-head">
-                      <h3>视频感知</h3>
+                      <h3>端侧推流视频感知</h3>
                       <span id="videoStatus" class="pill missing">missing</span>
                     </div>
                     <div class="video-stage">
-                      <img id="videoFrame" class="video-frame" alt="实时视频帧" hidden>
+                      <img id="videoFrame" class="video-frame" alt="Go2 端侧推流视频帧" hidden>
                       <canvas id="videoDetections" class="video-detection-canvas" hidden></canvas>
                       <div class="video-overlay">
                         <span id="visionModelStatus" class="overlay-chip">本地模型：--</span>
@@ -688,7 +688,7 @@ def _render_debug_page(access_token: str) -> str:
                         <label class="overlay-chip overlay-toggle"><input id="showDetections" type="checkbox">显示检测框</label>
                       </div>
                     </div>
-                    <div id="videoEmpty" class="empty panel-meta">等待视频帧。</div>
+                    <div id="videoEmpty" class="empty panel-meta">等待 Go2 端侧视频推流。</div>
                     <div id="videoMeta" class="kv panel-meta"></div>
                   </section>
                 </div>
@@ -1699,7 +1699,7 @@ def _render_debug_page(access_token: str) -> str:
         state.videoStreamSrc = videoSrc;
         els.videoFrame.hidden = false;
         els.videoEmpty.hidden = false;
-        els.videoEmpty.textContent = "正在连接视频流。";
+        els.videoEmpty.textContent = "正在连接平台转发的 Go2 端侧视频推流。";
       }
       function updateVideo(envelope) {
         const status = statusOf(envelope);
@@ -1729,7 +1729,7 @@ def _render_debug_page(access_token: str) -> str:
         } else if (!state.lastVideoFrameKey) {
           els.videoFrame.hidden = true;
           els.videoEmpty.hidden = false;
-          els.videoEmpty.textContent = errorReason(envelope, "视频 provider 未返回图像帧。");
+          els.videoEmpty.textContent = errorReason(envelope, "尚未收到 Go2 端侧主动推送的视频帧。");
         }
         setKv(els.videoMeta, [
           ["camera", data.camera_id],
@@ -1737,6 +1737,9 @@ def _render_debug_page(access_token: str) -> str:
           ["size", data.width_px && data.height_px ? `${data.width_px} x ${data.height_px}` : "--"],
           ["encoding", data.encoding],
           ["transport", data.transport],
+          ["ingest_connected", data.ingest_status && data.ingest_status.connected],
+          ["ingest_fps", data.ingest_status && fmt(data.ingest_status.fps_estimate, " fps")],
+          ["ingest_last_client", data.ingest_status && data.ingest_status.last_client_id],
           ["stream_url", data.stream_url],
           ["payload_bytes", data.payload_bytes],
           ["detections", state.videoDetections.length],
@@ -2199,7 +2202,7 @@ def _render_debug_page(access_token: str) -> str:
       els.videoFrame.addEventListener("error", () => {
         els.videoFrame.hidden = true;
         els.videoEmpty.hidden = false;
-        els.videoEmpty.textContent = "视频流连接失败，请检查 /streams/video.mjpeg 或机器人图像 provider。";
+        els.videoEmpty.textContent = "视频流连接失败，请检查 Go2 端侧推流进程与 /streams/video.ingest。";
       });
       window.addEventListener("resize", scheduleVideoDetectionDraw);
       startVideoStream();

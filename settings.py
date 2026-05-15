@@ -471,6 +471,13 @@ class PerceptionStreamRuntimeConfig:
 
 
 @dataclass
+class VideoIngestConfig:
+    """端侧视频推流接收配置。"""
+
+    max_frame_age_sec: float = 2.0
+
+
+@dataclass
 class PerceptionConfig:
     """统一视觉感知配置。"""
 
@@ -482,6 +489,7 @@ class PerceptionConfig:
     openai_vision: PerceptionOpenAIVisionConfig = field(default_factory=PerceptionOpenAIVisionConfig)
     segmentation: PerceptionSegmentationConfig = field(default_factory=PerceptionSegmentationConfig)
     stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
+    video_ingest: VideoIngestConfig = field(default_factory=VideoIngestConfig)
 
 
 @dataclass
@@ -797,6 +805,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
             remember_min_interval_sec=max(0.0, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_REMEMBER_MIN_INTERVAL_SEC", 15.0)),
             burst_frame_count=max(1, _cfg_int("NUWAX_PERCEPTION_BURST_FRAME_COUNT", 4)),
             burst_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_BURST_INTERVAL_SEC", 0.08)),
+        ),
+        video_ingest=VideoIngestConfig(
+            max_frame_age_sec=max(0.1, _cfg_float("NUWAX_VIDEO_INGEST_MAX_FRAME_AGE_SEC", 2.0)),
         ),
     )
 

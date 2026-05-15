@@ -116,6 +116,21 @@ def _prefer_platform_str(platform_value: str, legacy_name: str, default: str) ->
 
 
 @dataclass
+class Go2VideoStreamConfig:
+    """Go2 端侧主动视频推流配置。"""
+
+    enabled: bool = True
+    gateway_url: str = "ws://127.0.0.1:8766/streams/video.ingest"
+    access_token: str = ""
+    fps: float = 15.0
+    camera_id: str = "front_camera"
+    frame_id: str = "go2/front_camera"
+    width_px: int = 1280
+    height_px: int = 720
+    reconnect_sec: float = 1.0
+
+
+@dataclass
 class Go2DirectDdsConfig:
     """Go2 官方 DDS 原始输入配置。"""
 
@@ -125,7 +140,6 @@ class Go2DirectDdsConfig:
     point_cloud_topic: str = "rt/utlidar/cloud"
     read_timeout_sec: float = 0.5
     max_points_per_scan: int = 1200
-    video_pull_interval_sec: float = 0.033
 
 
 @dataclass
@@ -152,6 +166,7 @@ class Go2DataPlaneConfig:
     expected_odom_frame: str = ""
     direct_dds: Go2DirectDdsConfig = field(default_factory=Go2DirectDdsConfig)
     official: Go2OfficialControlConfig = field(default_factory=Go2OfficialControlConfig)
+    video_stream: Go2VideoStreamConfig = field(default_factory=Go2VideoStreamConfig)
 
 
 def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None = None) -> Go2DataPlaneConfig:
@@ -182,7 +197,6 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
             point_cloud_topic=_cfg_str("GO2_DIRECT_DDS_POINT_CLOUD_TOPIC", "rt/utlidar/cloud"),
             read_timeout_sec=max(0.05, _cfg_float("GO2_DIRECT_DDS_READ_TIMEOUT_SEC", 0.5)),
             max_points_per_scan=max(50, _cfg_int("GO2_DIRECT_DDS_MAX_POINTS_PER_SCAN", 1200)),
-            video_pull_interval_sec=max(0.005, _cfg_float("GO2_VIDEO_PULL_INTERVAL_SEC", 0.033)),
         ),
         official=Go2OfficialControlConfig(
             enabled=_cfg_bool("GO2_OFFICIAL_BACKEND_ENABLED", True),
@@ -195,5 +209,16 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
                 "GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED",
                 False,
             ),
+        ),
+        video_stream=Go2VideoStreamConfig(
+            enabled=_cfg_bool("GO2_VIDEO_STREAM_ENABLED", True),
+            gateway_url=_cfg_str("GO2_VIDEO_STREAM_GATEWAY_URL", "ws://127.0.0.1:8766/streams/video.ingest"),
+            access_token=_cfg_str("GO2_VIDEO_STREAM_ACCESS_TOKEN", ""),
+            fps=max(1.0, _cfg_float("GO2_VIDEO_STREAM_FPS", 15.0)),
+            camera_id=_cfg_str("GO2_VIDEO_STREAM_CAMERA_ID", "front_camera"),
+            frame_id=_cfg_str("GO2_VIDEO_STREAM_FRAME_ID", "go2/front_camera"),
+            width_px=max(1, _cfg_int("GO2_VIDEO_STREAM_WIDTH_PX", 1280)),
+            height_px=max(1, _cfg_int("GO2_VIDEO_STREAM_HEIGHT_PX", 720)),
+            reconnect_sec=max(0.1, _cfg_float("GO2_VIDEO_STREAM_RECONNECT_SEC", 1.0)),
         ),
     )

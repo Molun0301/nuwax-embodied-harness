@@ -10,8 +10,7 @@ from contracts.perception import Detection2D, Observation, SegmentationMask2D, T
 from contracts.runtime_views import PerceptionContext
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from gateways.errors import GatewayError
-from providers import ImageProvider, LocalizationProvider, PointCloudProvider
-from providers.image import StreamingImageProvider
+from providers import LocalizationProvider, PointCloudProvider
 from services.artifact_service import ArtifactService
 from services.perception.base import (
     DetectionBundle,
@@ -25,9 +24,19 @@ from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Tuple
 
 VideoFrameSink = Callable[[object], Optional[object]]
+
+
+class VideoFrameSource(Protocol):
+    """平台已接收视频流抽帧源。"""
+
+    def get_latest_image(self, camera_id: Optional[str] = None) -> Optional[object]:
+        """返回端侧推流接收缓冲中的最近图像。"""
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        """返回端侧推流接收状态。"""
 
 
 class PerceptionService:
@@ -48,6 +57,7 @@ class PerceptionService:
         event_bus: Optional[EventBus] = None,
         stream_bus: Optional[StreamBus] = None,
         video_frame_sink: Optional[VideoFrameSink] = None,
+        video_frame_source: Optional[VideoFrameSource] = None,
         history_limit: int = 100,
         pipeline_name: str = "default_perception_pipeline",
     ) -> None:
@@ -63,12 +73,16 @@ class PerceptionService:
         self._event_bus = event_bus
         self._stream_bus = stream_bus
         self._video_frame_sink = video_frame_sink
+        self._video_frame_source = video_frame_source
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
         self._latest_by_camera: Dict[str, PerceptionContext] = {}
         self._pipeline_name = pipeline_name
 
     def set_video_frame_sink(self, video_frame_sink: Optional[VideoFrameSink]) -> None:
         self._video_frame_sink = video_frame_sink
+
+    def set_video_frame_source(self, video_frame_source: Optional[VideoFrameSource]) -> None:
+        self._video_frame_source = video_frame_source
 
     @property
     def detector_pipeline(self) -> DetectorPipeline:
@@ -326,17 +340,28 @@ class PerceptionService:
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> PerceptionContext:
-        """从当前图像提供器抓取一帧并完成完整感知。"""
+        """从平台已接收的端侧推流抽取最新帧并完成完整感知。"""
 
-        image_provider = self._get_image_provider()
-        image_frame = self._read_latest_pushed_image(image_provider, camera_id)
+        image_frame = self._read_latest_pushed_image(camera_id)
         if image_frame is None:
-            image_frame = image_provider.capture_image(camera_id)
+            ingest_status = self._video_frame_source_status()
+            raise GatewayError(
+                "端侧视频推流尚未接入或尚未收到首帧，无法执行实时感知；平台不会主动采集图像帧。",
+                error_code="video_ingest_not_ready",
+                http_status=503,
+                details={
+                    "camera_id": camera_id,
+                    "required_source": "go2_side_stream_push",
+                    "platform_role": "video_ingest_receiver",
+                    "ingest_status": ingest_status,
+                },
+            )
         resolved_camera_id = image_frame.camera_id
-        camera_info = image_provider.get_camera_info(resolved_camera_id)
+        camera_info = self._camera_info_from_video_frame(image_frame)
+        source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
         self._publish_video_frame(
             image_frame,
-            source_name=image_provider.provider_name,
+            source_name=source_name,
         )
         image_artifact = None
         if store_artifact:
@@ -350,7 +375,7 @@ class PerceptionService:
             image_artifact=image_artifact,
             requested_by=requested_by,
             detector_backend_name=detector_backend_name,
-            source_name=image_provider.provider_name,
+            source_name=source_name,
             detection_metadata=detection_metadata,
             open_vocabulary_classes=open_vocabulary_classes,
         )
@@ -386,34 +411,39 @@ class PerceptionService:
         camera_id: Optional[str] = None,
         requested_by: Optional[str] = None,
     ) -> None:
-        image_provider = self._get_image_provider()
-        image_frame = self._read_latest_pushed_image(image_provider, camera_id)
+        del requested_by
+        image_frame = self._read_latest_pushed_image(camera_id)
         if image_frame is None:
             return
         self._publish_video_frame(
             image_frame,
-            source_name=image_provider.provider_name,
+            source_name=str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver"),
         )
 
     def _read_latest_pushed_image(
         self,
-        image_provider: ImageProvider,
         camera_id: Optional[str],
     ) -> Optional["ImageFrame"]:
-        if not isinstance(image_provider, StreamingImageProvider):
+        from contracts.image import ImageFrame
+
+        video_frame_source = self._video_frame_source
+        if video_frame_source is None:
             return None
-        getter = getattr(image_provider, "get_latest_image", None)
+        getter = getattr(video_frame_source, "get_latest_image", None)
         if not callable(getter):
             return None
         try:
-            return getter(camera_id)
+            image_frame = getter(camera_id)
         except TypeError:
             try:
-                return getter()
+                image_frame = getter()
             except Exception:
                 return None
         except Exception:
             return None
+        if image_frame is not None and not isinstance(image_frame, ImageFrame):
+            raise TypeError("视频推流抽帧源必须返回标准 ImageFrame。")
+        return image_frame
 
     def get_latest_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
         """返回最新感知结果。"""
@@ -663,7 +693,19 @@ class PerceptionService:
             except Exception:
                 latest_frame = None
         sequence = getattr(latest_frame, "sequence", None)
-        mjpeg_available = latest_frame is not None and isinstance(sequence, int)
+        if not isinstance(sequence, int) and isinstance(metadata.get("ingest_sequence"), int):
+            sequence = int(metadata["ingest_sequence"])
+        source_kind = str(metadata.get("source_kind") or source_name or "")
+        ingest_stream_frame = source_kind == "platform_video_ingest_stream"
+        mjpeg_available = bool(
+            (latest_frame is not None and isinstance(sequence, int))
+            or (
+                ingest_stream_frame
+                and image_frame.data
+                and image_frame.encoding.value == "jpeg"
+                and isinstance(sequence, int)
+            )
+        )
         payload = {
             "available": bool(mjpeg_available or image_frame.uri or image_frame.artifact_id),
             "camera_id": image_frame.camera_id,
@@ -675,6 +717,7 @@ class PerceptionService:
             "transport": "mjpeg" if mjpeg_available else "metadata",
             "stream_url": "/streams/video.mjpeg?" + urlencode({"camera_id": image_frame.camera_id}) if mjpeg_available else None,
             "metadata": dict(metadata),
+            "ingest_status": self._video_frame_source_status(),
         }
         if image_frame.uri:
             payload["uri"] = image_frame.uri
@@ -699,13 +742,38 @@ class PerceptionService:
             },
         )
 
-    def _get_image_provider(self) -> ImageProvider:
-        providers = getattr(self._provider_owner, "providers", None)
-        if providers is None or not isinstance(providers, ImageProvider):
-            raise GatewayError("当前机器人入口未提供图像提供器。")
-        if not providers.is_available():
-            raise GatewayError("当前图像提供器暂不可用。")
-        return providers
+    def _video_frame_source_status(self) -> Dict[str, Any]:
+        video_frame_source = self._video_frame_source
+        if video_frame_source is None:
+            return {"available": False, "connected": False, "reason": "video_frame_source_missing"}
+        snapshot = getattr(video_frame_source, "status_snapshot", None)
+        if not callable(snapshot):
+            return {"available": True, "connected": None, "reason": "status_snapshot_unavailable"}
+        try:
+            status = snapshot()
+        except Exception as exc:
+            return {"available": False, "connected": False, "reason": "status_snapshot_failed", "error": str(exc)}
+        return dict(status or {})
+
+    def video_frame_source_status(self) -> Dict[str, Any]:
+        """返回平台端侧推流接收状态，供持续感知运行时做实时性门禁。"""
+
+        return self._video_frame_source_status()
+
+    @staticmethod
+    def _camera_info_from_video_frame(image_frame):
+        from contracts.image import CameraInfo
+
+        metadata = dict(getattr(image_frame, "metadata", {}) or {})
+        camera_info_payload = metadata.get("camera_info")
+        if isinstance(camera_info_payload, CameraInfo):
+            return camera_info_payload
+        if isinstance(camera_info_payload, dict):
+            try:
+                return CameraInfo(**camera_info_payload)
+            except Exception:
+                return None
+        return None
 
     def _get_localization_provider_optional(self) -> Optional[LocalizationProvider]:
         providers = getattr(self._localization_provider_owner, "providers", None)

@@ -11,6 +11,7 @@ RESTART_MAX_ATTEMPTS="${NUWAX_GATEWAY_RESTART_MAX_ATTEMPTS:-0}"
 ACTION="${1:-start}"
 PID_FILE=""
 GATEWAY_PID=""
+VIDEO_STREAMER_PID=""
 STOP_REQUESTED=0
 
 trim_whitespace() {
@@ -246,8 +247,35 @@ status_gateway() {
   return 3
 }
 
+should_start_go2_video_streamer() {
+  is_truthy "${GO2_VIDEO_STREAM_ENABLED:-true}" \
+    && is_truthy "${GO2_DATA_PLANE_ENABLED:-false}" \
+    && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "go2" ]]
+}
+
+start_go2_video_streamer() {
+  if [[ -n "${VIDEO_STREAMER_PID}" ]] && is_pid_alive "${VIDEO_STREAMER_PID}"; then
+    return 0
+  fi
+  if ! should_start_go2_video_streamer; then
+    return 0
+  fi
+  echo "starting Go2 side video streamer -> ${GO2_VIDEO_STREAM_GATEWAY_URL:-ws://127.0.0.1:${PORT}/streams/video.ingest}"
+  "${PYTHON_BIN}" -m drivers.go2.video_streamer &
+  VIDEO_STREAMER_PID="$!"
+}
+
+stop_go2_video_streamer() {
+  if [[ -n "${VIDEO_STREAMER_PID}" ]] && is_pid_alive "${VIDEO_STREAMER_PID}"; then
+    terminate_process_scope "${VIDEO_STREAMER_PID}" "go2 video streamer"
+    wait "${VIDEO_STREAMER_PID}" >/dev/null 2>&1 || true
+  fi
+  VIDEO_STREAMER_PID=""
+}
+
 stop_gateway() {
   STOP_REQUESTED=1
+  stop_go2_video_streamer
   if [[ -n "${GATEWAY_PID}" ]] && kill -0 "${GATEWAY_PID}" >/dev/null 2>&1; then
     terminate_process_scope "${GATEWAY_PID}" "gateway worker"
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
@@ -258,6 +286,10 @@ stop_gateway() {
 
 if [[ -f "${ENV_FILE}" ]]; then
   load_env_file "${ENV_FILE}"
+fi
+GO2_DATA_PLANE_ENV_FILE="${GO2_DATA_PLANE_ENV_FILE:-${REPO_ROOT}/drivers/go2/data_plane.env}"
+if [[ -f "${GO2_DATA_PLANE_ENV_FILE}" ]]; then
+  load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
 fi
 
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
@@ -300,6 +332,9 @@ if is_truthy "${NUWAX_GEOMETRY_ENABLED:-true}"; then
 fi
 
 export PYTHONUNBUFFERED=1
+export GO2_VIDEO_STREAM_GATEWAY_URL="${GO2_VIDEO_STREAM_GATEWAY_URL:-ws://127.0.0.1:${PORT}/streams/video.ingest}"
+GATEWAY_AGENT_TOKEN_DEFAULT="${NUWAX_GATEWAY_AGENT_TOKENS:-}"
+export GO2_VIDEO_STREAM_ACCESS_TOKEN="${GO2_VIDEO_STREAM_ACCESS_TOKEN:-${GATEWAY_AGENT_TOKEN_DEFAULT%%,*}}"
 
 cd "${REPO_ROOT}"
 write_pid_file
@@ -307,7 +342,14 @@ trap remove_pid_file EXIT
 trap stop_gateway INT TERM
 
 if ! is_restart_enabled "${RESTART_POLICY}"; then
-  exec "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}"
+  set +e
+  "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}" &
+  GATEWAY_PID="$!"
+  start_go2_video_streamer
+  wait "${GATEWAY_PID}"
+  exit_code="$?"
+  stop_go2_video_streamer
+  exit "${exit_code}"
 fi
 
 attempt=0
@@ -315,8 +357,10 @@ while true; do
   set +e
   "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}" &
   GATEWAY_PID="$!"
+  start_go2_video_streamer
   wait "${GATEWAY_PID}"
   exit_code="$?"
+  stop_go2_video_streamer
   GATEWAY_PID=""
   set -e
 

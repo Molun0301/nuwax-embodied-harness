@@ -21,10 +21,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CH
 import numpy as np
 
 from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
-from contracts.image import ImageEncoding, ImageFrame
 from contracts.pointcloud import PointCloudFrame, PointField, PointFieldDataType
 from contracts.robot_state import IMUState
-from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO
 from logging_utils import LogRateLimiter
 
 if TYPE_CHECKING:
@@ -125,11 +123,6 @@ def _load_go2_official_sdk_modules(
             unitree_go_dds_module = importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_")
             modules["ChannelSubscriber"] = getattr(channel_module, "ChannelSubscriber")
             modules["SportModeState"] = getattr(unitree_go_dds_module, "SportModeState_")
-            modules["VideoClient"] = getattr(
-                importlib.import_module("unitree_sdk2py.go2.video.video_client"),
-                "VideoClient",
-                None,
-            )
             modules["DirectPointCloud2"] = getattr(
                 importlib.import_module("unitree_sdk2py.idl.sensor_msgs.msg.dds_"),
                 "PointCloud2_",
@@ -163,25 +156,18 @@ class RclpyGo2RosBridge:
         self._direct_point_cloud_dispatched_sequence = 0
         self._direct_point_cloud_reader_drop_count = 0
         self._direct_point_cloud_dispatch_drop_count = 0
-        self._video_client = None
-        self._video_pull_failure_count = 0
         self._latest_pose_from_dds: Optional[Pose] = None
         self._latest_imu_state_from_dds: Optional[IMUState] = None
         self._latest_local_point_cloud: Optional[PointCloudFrame] = None
-        self._latest_front_video_frame: Optional[ImageFrame] = None
         self._latest_pose_source = ""
         self._latest_imu_source_topic = ""
         self._latest_point_cloud_source_topic = ""
-        self._latest_front_video_source = ""
         self._localization_callbacks: Dict[int, Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]] = {}
         self._point_cloud_callbacks: Dict[int, Callable[[PointCloudFrame], None]] = {}
-        self._image_callbacks: Dict[int, Callable[[ImageFrame], None]] = {}
         self._next_callback_id = 1
         self._direct_pose_ready = False
         self._direct_imu_ready = False
         self._direct_point_cloud_ready = False
-        self._video_source_subscribed = False
-        self._video_source_ready = False
 
     def start(self) -> None:
         if self._started:
@@ -222,10 +208,6 @@ class RclpyGo2RosBridge:
             deep=True,
         )
 
-    def get_latest_image(self) -> Optional[ImageFrame]:
-        with self._lock:
-            return self._latest_front_video_frame.model_copy(deep=True) if self._latest_front_video_frame is not None else None
-
     def _next_subscription_id(self) -> int:
         callback_id = self._next_callback_id
         self._next_callback_id += 1
@@ -251,16 +233,6 @@ class RclpyGo2RosBridge:
         with self._lock:
             self._point_cloud_callbacks.pop(int(callback_id), None)
 
-    def subscribe_image(self, callback: Callable[[ImageFrame], None]) -> int:
-        with self._lock:
-            callback_id = self._next_subscription_id()
-            self._image_callbacks[callback_id] = callback
-            return callback_id
-
-    def unsubscribe_image(self, callback_id: int) -> None:
-        with self._lock:
-            self._image_callbacks.pop(int(callback_id), None)
-
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -269,18 +241,12 @@ class RclpyGo2RosBridge:
                 "dds_pose_ready": self._direct_pose_ready,
                 "dds_imu_ready": self._direct_imu_ready,
                 "dds_cloud_ready": self._direct_point_cloud_ready,
-                "video_source_subscribed": self._video_source_subscribed,
-                "video_source_ready": self._video_source_ready,
-                "video_source_kind": "go2_video_client_push",
                 "pose_source": self._latest_pose_source,
                 "imu_source_topic": self._latest_imu_source_topic,
                 "point_cloud_source_topic": self._latest_point_cloud_source_topic,
-                "front_video_source": self._latest_front_video_source,
                 "latest_point_cloud_points": self._latest_local_point_cloud.point_count if self._latest_local_point_cloud is not None else 0,
-                "latest_front_video_bytes": len(self._latest_front_video_frame.data or b"") if self._latest_front_video_frame is not None else 0,
                 "dds_point_cloud_reader_drop_count": self._direct_point_cloud_reader_drop_count,
                 "dds_point_cloud_dispatch_drop_count": self._direct_point_cloud_dispatch_drop_count,
-                "video_pull_failure_count": self._video_pull_failure_count,
             }
 
     def _start_direct_dds_backend(self) -> None:
@@ -321,10 +287,6 @@ class RclpyGo2RosBridge:
             self._direct_point_cloud_subscriber = None
             return
 
-        self._video_client = self._create_video_client()
-        if self._video_client is not None:
-            self._video_source_subscribed = True
-
         self._direct_dds_stop_event.clear()
         threads: List[threading.Thread] = [
             threading.Thread(target=self._direct_pose_reader_loop, name="go2_direct_pose_reader", daemon=True),
@@ -332,14 +294,6 @@ class RclpyGo2RosBridge:
             threading.Thread(target=self._direct_point_cloud_worker_loop, name="go2_direct_point_cloud_worker", daemon=True),
             threading.Thread(target=self._direct_point_cloud_dispatch_loop, name="go2_direct_point_cloud_dispatch", daemon=True),
         ]
-        if self._video_client is not None:
-            threads.append(
-                threading.Thread(
-                    target=self._front_video_pull_loop,
-                    name="go2_front_video_pull",
-                    daemon=True,
-                )
-            )
         self._direct_dds_threads = threads
         for thread in self._direct_dds_threads:
             thread.start()
@@ -364,9 +318,6 @@ class RclpyGo2RosBridge:
                 LOGGER.debug("关闭 Go2 官方 DDS 订阅器失败。", exc_info=True)
         self._direct_pose_subscriber = None
         self._direct_point_cloud_subscriber = None
-        self._video_client = None
-        self._video_source_subscribed = False
-        self._video_source_ready = False
         with self._direct_point_cloud_worker_condition:
             self._direct_point_cloud_pending_sample = None
             self._direct_point_cloud_pending_source_topic = ""
@@ -407,92 +358,6 @@ class RclpyGo2RosBridge:
             if sample is None:
                 continue
             self._queue_direct_point_cloud_sample(sample, source_topic=source_topic)
-
-    def _create_video_client(self):
-        modules = _load_go2_official_sdk_modules(self.config, include_dds_topics=True)
-        if modules is None:
-            return None
-        video_client_factory = modules.get("VideoClient")
-        if video_client_factory is None:
-            LOGGER.warning("Go2 官方 VideoClient 模块缺失，无法启动前置视频推流。")
-            return None
-        try:
-            client = video_client_factory()
-            client.SetTimeout(float(getattr(self.config.official, "client_timeout_sec", 3.0)))
-            client.Init()
-            return client
-        except Exception:
-            LOGGER.warning("初始化 Go2 官方 VideoClient 失败。", exc_info=True)
-            return None
-
-    def _front_video_pull_loop(self) -> None:
-        """以源头帧率持续从 VideoClient 拉最新 JPEG 并推送给所有 image_callbacks。
-
-        Go2 没有原生 DDS push 视频接口，端侧 driver 在此把 RPC 抽样包装成
-        持续推流，使平台层的 StreamingImageProvider 接口语义不变（订阅即得帧）。
-        """
-
-        client = self._video_client
-        if client is None:
-            return
-        interval_sec = max(0.005, float(getattr(self.config.direct_dds, "video_pull_interval_sec", 0.033)))
-        camera_template = GO2_DEFAULT_CAMERA_INFO.model_copy(deep=True)
-        source_label = "go2_video_client"
-        while not self._direct_dds_stop_event.wait(0):
-            loop_started_at = time.monotonic()
-            try:
-                code, data = client.GetImageSample()
-            except Exception:
-                LOGGER.debug("Go2 VideoClient 拉帧异常。", exc_info=True)
-                with self._lock:
-                    self._video_pull_failure_count += 1
-                if self._direct_dds_stop_event.wait(min(0.5, interval_sec * 4)):
-                    return
-                continue
-            if code != 0 or not data:
-                with self._lock:
-                    self._video_pull_failure_count += 1
-                if self._direct_dds_stop_event.wait(min(0.5, interval_sec * 4)):
-                    return
-                continue
-            jpeg_bytes = bytes(data)
-            soi = jpeg_bytes.find(b"\xff\xd8")
-            eoi = jpeg_bytes.rfind(b"\xff\xd9")
-            if soi < 0 or eoi <= soi:
-                with self._lock:
-                    self._video_pull_failure_count += 1
-                if self._direct_dds_stop_event.wait(interval_sec):
-                    return
-                continue
-            jpeg_payload = jpeg_bytes[soi : eoi + 2]
-            image_frame = ImageFrame(
-                camera_id=camera_template.camera_id,
-                frame_id=camera_template.frame_id,
-                width_px=camera_template.width_px,
-                height_px=camera_template.height_px,
-                encoding=ImageEncoding.JPEG,
-                data=jpeg_payload,
-                timestamp=datetime.now(timezone.utc),
-                metadata={
-                    "source_kind": "go2_video_client_push",
-                    "source_label": source_label,
-                    "size_bytes": len(jpeg_payload),
-                },
-            )
-            with self._lock:
-                self._latest_front_video_frame = image_frame
-                self._video_source_ready = True
-                self._latest_front_video_source = source_label
-                callbacks = tuple(self._image_callbacks.values())
-            for callback in callbacks:
-                try:
-                    callback(image_frame.model_copy(deep=True))
-                except Exception:
-                    LOGGER.debug("分发 Go2 前置视频推流帧失败。", exc_info=True)
-            elapsed = time.monotonic() - loop_started_at
-            remaining = interval_sec - elapsed
-            if remaining > 0 and self._direct_dds_stop_event.wait(remaining):
-                return
 
     def _queue_direct_point_cloud_sample(self, sample: object, *, source_topic: str) -> None:
         with self._direct_point_cloud_worker_condition:
@@ -779,11 +644,6 @@ class Go2DataPlaneRuntime:
             return None
         return self.bridge.get_latest_local_point_cloud(max_points=max_points)
 
-    def get_latest_image(self) -> Optional[ImageFrame]:
-        if self.bridge is None:
-            return None
-        return self.bridge.get_latest_image()
-
     def subscribe_localization(self, callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]) -> Optional[int]:
         if self.bridge is None:
             return None
@@ -803,16 +663,6 @@ class Go2DataPlaneRuntime:
         if self.bridge is None or callback_id is None:
             return
         self.bridge.unsubscribe_local_point_cloud(callback_id)
-
-    def subscribe_image(self, callback: Callable[[ImageFrame], None]) -> Optional[int]:
-        if self.bridge is None:
-            return None
-        return self.bridge.subscribe_image(callback)
-
-    def unsubscribe_image(self, callback_id: Optional[int]) -> None:
-        if self.bridge is None or callback_id is None:
-            return
-        self.bridge.unsubscribe_image(callback_id)
 
     def can_accept_motion_command(self) -> bool:
         return self._uses_official_backend() and self._official_sport_ready
@@ -1278,9 +1128,6 @@ class Go2DeviceDataPlane:
     def get_latest_local_point_cloud(self, *, max_points: Optional[int] = None) -> Optional[PointCloudFrame]:
         return self.runtime.get_latest_local_point_cloud(max_points=max_points)
 
-    def get_latest_image(self) -> Optional[ImageFrame]:
-        return self.runtime.get_latest_image()
-
     def subscribe_localization(self, callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]) -> Optional[int]:
         return self.runtime.subscribe_localization(callback)
 
@@ -1292,12 +1139,6 @@ class Go2DeviceDataPlane:
 
     def unsubscribe_local_point_cloud(self, callback_id: Optional[int]) -> None:
         self.runtime.unsubscribe_local_point_cloud(callback_id)
-
-    def subscribe_image(self, callback: Callable[[ImageFrame], None]) -> Optional[int]:
-        return self.runtime.subscribe_image(callback)
-
-    def unsubscribe_image(self, callback_id: Optional[int]) -> None:
-        self.runtime.unsubscribe_image(callback_id)
 
     def can_accept_motion_command(self) -> bool:
         return self.runtime.can_accept_motion_command()

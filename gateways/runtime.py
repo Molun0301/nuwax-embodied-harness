@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, is_dataclass
 import logging
 import math
 from pathlib import Path
@@ -39,7 +39,7 @@ from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
 from gateways.request_context import categorize_gateway_error
 from gateways.serialization import to_jsonable
-from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider, StreamingImageProvider
+from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
 from services.geometry import (
@@ -55,6 +55,7 @@ from services.navigation import NavigationService
 from services.observation_service import ObservationService
 from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
 from services.robot_state_service import RobotStateService
+from services.video import ReceivedVideoFrame, VideoStreamReceiver
 from skills import SkillRegistry
 from logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event
 from settings import NuwaxRobotBridgeConfig
@@ -113,23 +114,6 @@ _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
         "save_active_map_version",
     }
 )
-
-
-@dataclass(frozen=True)
-class LatestVideoFrame:
-    camera_id: Optional[str]
-    frame_id: Optional[str]
-    width_px: Optional[int]
-    height_px: Optional[int]
-    encoding: str
-    data: bytes
-    sequence: int
-    timestamp: Any
-    metadata: Dict[str, Any]
-
-    @property
-    def payload_bytes(self) -> int:
-        return len(self.data)
 
 
 def _has_observability_value(value: Any) -> bool:
@@ -291,6 +275,9 @@ class GatewayRuntime:
             stream_bus=self.stream_bus,
             history_limit=config.runtime_data.map_history_limit,
         )
+        self.video_stream_receiver = VideoStreamReceiver(
+            max_frame_age_sec=config.perception.video_ingest.max_frame_age_sec,
+        )
         perception_components = _build_perception_components(config)
         self.perception_service = PerceptionService(
             provider_owner=robot,
@@ -304,6 +291,7 @@ class GatewayRuntime:
             event_bus=self.event_bus,
             stream_bus=self.stream_bus,
             video_frame_sink=None,
+            video_frame_source=self.video_stream_receiver,
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),
         )
@@ -386,15 +374,11 @@ class GatewayRuntime:
         self._localization_stream_subscription_id: Optional[int] = None
         self._localization_stream_unsubscriber = None
         self._point_cloud_stream_subscription_id: Optional[int] = None
-        self._image_stream_subscription_id: Optional[int] = None
         self._pointcloud_map_stream_subscription_id: Optional[str] = None
         self._navigation_status_refresh_stop = threading.Event()
         self._navigation_status_refresh_thread: Optional[threading.Thread] = None
         self._video_stream_refresh_stop = threading.Event()
         self._video_stream_refresh_thread: Optional[threading.Thread] = None
-        self._latest_video_frame: Optional[LatestVideoFrame] = None
-        self._latest_video_frame_condition = threading.Condition()
-        self._latest_video_frame_sequence = 0
         self._pointcloud_map_cache = PointCloudMapCache()
         self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
         self._base_capability_matrix = robot.manifest.capability_matrix
@@ -603,8 +587,6 @@ class GatewayRuntime:
 
     def _start_data_frame_stream_sources(self) -> None:
         providers = getattr(self.robot, "providers", None)
-        if isinstance(providers, StreamingImageProvider) and self._image_stream_subscription_id is None:
-            self._image_stream_subscription_id = providers.subscribe_image(self._publish_image_stream_frame)
 
         self._publish_runtime_governance_stream_frame()
         self._publish_static_stream_capability_frames()
@@ -741,11 +723,6 @@ class GatewayRuntime:
             if callable(unsubscriber):
                 unsubscriber(self._point_cloud_stream_subscription_id)
             self._point_cloud_stream_subscription_id = None
-        if self._image_stream_subscription_id is not None:
-            unsubscriber = getattr(providers, "unsubscribe_image", None)
-            if callable(unsubscriber):
-                unsubscriber(self._image_stream_subscription_id)
-            self._image_stream_subscription_id = None
 
     def _publish_robot_state_stream_frame(self, robot_state: Any) -> None:
         try:
@@ -785,50 +762,60 @@ class GatewayRuntime:
         )
 
     def _publish_image_stream_frame(self, image_frame: ImageFrame) -> None:
-        latest_frame = self._store_latest_video_frame(image_frame)
+        metadata = dict(getattr(image_frame, "metadata", {}) or {})
+        try:
+            latest_frame = self.video_stream_receiver.ingest_jpeg(
+                bytes(getattr(image_frame, "data", b"") or b""),
+                client_id=str(metadata.get("client_id") or "legacy_image_stream_provider"),
+                camera_id=getattr(image_frame, "camera_id", None),
+                frame_id=getattr(image_frame, "frame_id", None),
+                width_px=getattr(image_frame, "width_px", None),
+                height_px=getattr(image_frame, "height_px", None),
+                metadata={**metadata, "source_kind": "legacy_image_stream_provider"},
+            )
+        except Exception:
+            latest_frame = None
         if latest_frame is None:
             self.stream_bus.publish(
                 "video.frame",
-                source="image_stream_provider",
-                payload={"available": False, "message": "源头推送图像不是 JPEG 图像数据。"},
+                source="video_ingest_receiver",
+                payload={"available": False, "message": "端侧推流接收器拒绝了非 JPEG 图像数据。"},
                 status="unsupported",
-                metadata={"reason": "stream_image_payload_missing"},
+                metadata={"reason": "stream_image_payload_missing", "source_kind": "legacy_image_stream_provider"},
             )
             return
-        self._publish_latest_video_stream_metadata(latest_frame, reason="image_stream_push", source="image_stream_provider")
+        self._publish_latest_video_stream_metadata(latest_frame, reason="image_stream_push", source="video_ingest_receiver")
 
     def _publish_video_stream_frame(self, *, reason: str) -> None:
-        if self._image_stream_subscription_id is None:
+        latest_frame = self.video_stream_receiver.latest_frame()
+        if latest_frame is None:
+            status = self.video_stream_receiver.status_snapshot()
             self.stream_bus.publish(
                 "video.frame",
-                source="image_stream_provider",
+                source="video_ingest_receiver",
                 payload={
+                    **self._serialize(status),
                     "available": False,
-                    "message": "源头视频推流未订阅；不再以高层 SDK 抓单帧伪装实时。",
+                    "message": "尚未收到 Go2 端侧主动推送的视频首帧；平台不会主动采集图像帧。",
+                    "stream_url": "/streams/video.mjpeg",
                 },
                 status="missing",
                 metadata={
-                    "reason": "streams_source_not_subscribed",
+                    "reason": "video_ingest_waiting_first_frame",
                     "refresh_reason": reason,
+                    "source_kind": "platform_video_ingest_stream",
+                    "connected": bool(status.get("connected")),
                 },
             )
             return
-        latest_frame = self.latest_video_frame()
-        if latest_frame is None:
-            self.stream_bus.publish(
-                "video.frame",
-                source="image_stream_provider",
-                payload={"available": False, "message": "源头推送图像流尚未收到首帧。"},
-                status="missing",
-                metadata={"reason": "image_stream_waiting_first_frame", "refresh_reason": reason},
-            )
-            return
-        self._publish_latest_video_stream_metadata(latest_frame, reason=reason, source="image_stream_provider")
+        self._publish_latest_video_stream_metadata(latest_frame, reason=reason, source="video_ingest_receiver")
 
-    def _publish_latest_video_stream_metadata(self, latest_frame: LatestVideoFrame, *, reason: str, source: str) -> None:
+    def _publish_latest_video_stream_metadata(self, latest_frame: ReceivedVideoFrame, *, reason: str, source: str) -> None:
         stream_path = "/streams/video.mjpeg?" + urlencode({"camera_id": latest_frame.camera_id or ""})
+        status = self.video_stream_receiver.status_snapshot()
+        is_available = bool(status.get("available"))
         payload = {
-            "available": True,
+            "available": is_available,
             "camera_id": latest_frame.camera_id,
             "frame_id": latest_frame.frame_id,
             "width_px": latest_frame.width_px,
@@ -836,67 +823,53 @@ class GatewayRuntime:
             "encoding": latest_frame.encoding,
             "payload_bytes": latest_frame.payload_bytes,
             "transport": "mjpeg",
-            "stream_url": stream_path,
+            "stream_url": stream_path if is_available else None,
             "source": source,
             "refresh_reason": reason,
             "timestamp": latest_frame.timestamp,
             "metadata": self._serialize(latest_frame.metadata),
+            "ingest_status": self._serialize(status),
         }
+        if not is_available:
+            payload["message"] = "Go2 端侧视频推流已断开或最近帧已过期；平台不会用陈旧缓存帧冒充实时视频。"
         self.stream_bus.publish(
             "video.frame",
             source=source,
             payload=payload,
             frame_id=latest_frame.frame_id,
             sequence=latest_frame.sequence,
-            status="available",
+            status="available" if is_available else "missing",
             metadata={
                 "camera_id": latest_frame.camera_id,
                 "encoding": latest_frame.encoding,
                 "payload_bytes": latest_frame.payload_bytes,
                 "transport": "mjpeg",
                 "refresh_reason": reason,
+                "source_kind": "platform_video_ingest_stream",
+                "connected": bool(status.get("connected")),
             },
         )
 
-    def _store_latest_video_frame(self, image_frame: ImageFrame) -> Optional[LatestVideoFrame]:
-        data = getattr(image_frame, "data", None)
-        encoding = str(
-            getattr(getattr(image_frame, "encoding", None), "value", getattr(image_frame, "encoding", "jpeg")) or "jpeg"
-        ).lower()
-        if not data or encoding not in {"jpeg", "jpg"}:
-            return None
-        with self._latest_video_frame_condition:
-            self._latest_video_frame_sequence += 1
-            latest_frame = LatestVideoFrame(
+    def _store_latest_video_frame(self, image_frame: ImageFrame) -> Optional[ReceivedVideoFrame]:
+        metadata = dict(getattr(image_frame, "metadata", {}) or {})
+        try:
+            return self.video_stream_receiver.ingest_jpeg(
+                bytes(getattr(image_frame, "data", b"") or b""),
+                client_id=str(metadata.get("client_id") or "video_frame_sink"),
                 camera_id=getattr(image_frame, "camera_id", None),
                 frame_id=getattr(image_frame, "frame_id", None),
                 width_px=getattr(image_frame, "width_px", None),
                 height_px=getattr(image_frame, "height_px", None),
-                encoding="jpeg",
-                data=bytes(data),
-                sequence=self._latest_video_frame_sequence,
-                timestamp=getattr(image_frame, "timestamp", None),
-                metadata=dict(getattr(image_frame, "metadata", {}) or {}),
+                metadata=metadata,
             )
-            self._latest_video_frame = latest_frame
-            self._latest_video_frame_condition.notify_all()
-            return latest_frame
+        except Exception:
+            return None
 
-    def latest_video_frame(self) -> Optional[LatestVideoFrame]:
-        with self._latest_video_frame_condition:
-            return self._latest_video_frame
+    def latest_video_frame(self) -> Optional[ReceivedVideoFrame]:
+        return self.video_stream_receiver.latest_frame()
 
-    def wait_for_video_frame(self, after_sequence: int, *, timeout_sec: float) -> Optional[LatestVideoFrame]:
-        deadline = time.monotonic() + max(0.0, timeout_sec)
-        with self._latest_video_frame_condition:
-            while True:
-                latest_frame = self._latest_video_frame
-                if latest_frame is not None and latest_frame.sequence > after_sequence:
-                    return latest_frame
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0:
-                    return None
-                self._latest_video_frame_condition.wait(timeout=remaining)
+    def wait_for_video_frame(self, after_sequence: int, *, timeout_sec: float) -> Optional[ReceivedVideoFrame]:
+        return self.video_stream_receiver.wait_for_frame(after_sequence, timeout_sec=timeout_sec)
 
     def _handle_map_frame_for_pointcloud_map_stream(self, frame: Any) -> None:
         del frame

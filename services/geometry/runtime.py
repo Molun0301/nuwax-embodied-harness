@@ -2914,12 +2914,11 @@ class PlatformGeometryRuntime:
                     "process": process_status,
                 },
             }
-        self._ensure_amcl_initialized()
         return {
             **activation_payload,
             "backend_switch_applied": True,
             "backend_map_loaded": True,
-            "backend_mode": "amcl_localization_only",
+            "backend_mode": "slam_localization",
             "active_backend_version_id": version.version_id,
             "reason": "external_nav2_amcl_started",
             "nav2_map": nav2_map_metadata,
@@ -2997,14 +2996,9 @@ class PlatformGeometryRuntime:
             "launch",
             "go2_navigation2",
             "go2_nav2.launch.py",
-            "localization:=amcl",
-            "map:=%s" % str(map_yaml_path),
+            "localization:=slam",
             "use_rviz:=false",
-            "use_pcd_initial_pose:=%s" % ("true" if pcd_path is not None else "false"),
-            "auto_spin_after_initial_pose:=%s" % ("true" if pcd_path is not None else "false"),
         ]
-        if pcd_path is not None:
-            command.append("pcd_map:=%s" % str(pcd_path))
         return command
 
     def _ensure_amcl_initialized(self) -> None:

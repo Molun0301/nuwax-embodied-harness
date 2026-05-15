@@ -458,12 +458,12 @@ class PlatformGeometryRuntime:
             message = self._removed_internal_stack_message()
             self._record_runtime_diagnostic("removed_internal_rtabmap_stack", message)
             raise RuntimeError(message)
-        if self._external_input_bridge_enabled():
-            self._start_managed_process(
-                "external_odom_tf_bridge",
-                self._build_odom_tf_bridge_command(),
-                "external_odom_tf_bridge.log",
-            )
+        # odom_tf_bridge 始终启动：slam_toolbox 需要 odom→base_footprint TF
+        self._start_managed_process(
+            "external_odom_tf_bridge",
+            self._build_odom_tf_bridge_command(),
+            "external_odom_tf_bridge.log",
+        )
         self._start_managed_process(
             self._external_process_name(),
             self._build_external_geometry_command(),
@@ -474,7 +474,7 @@ class PlatformGeometryRuntime:
         elif self._external_point_cloud_bridge_enabled():
             bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台只启动 ROS2 点云输入桥，跳过 odom/odom_tf_bridge。"
         else:
-            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台跳过内置 RTAB-Map/Nav2/odom_tf_bridge。"
+            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台启动 odom_tf_bridge，跳过内置 RTAB-Map/Nav2。"
         self._record_runtime_diagnostic(
             "external_slam_nav2",
             bridge_message,
@@ -3001,10 +3001,10 @@ class PlatformGeometryRuntime:
             "localization:=slam",
             "use_rviz:=false",
         ]
-        # 尝试找到已保存的 posegraph，让 slam_toolbox 加载已有地图做增量建图
-        posegraph_yaml = self._generate_slam_params_with_posegraph(map_yaml_path)
-        if posegraph_yaml is not None:
-            command.append("slam_params_file:=%s" % str(posegraph_yaml))
+        # 暂时禁用 posegraph 加载（slam_toolbox 加载含中文路径的 posegraph 时 SIGSEGV）
+        # posegraph_yaml = self._generate_slam_params_with_posegraph(map_yaml_path)
+        # if posegraph_yaml is not None:
+        #     command.append("slam_params_file:=%s" % str(posegraph_yaml))
         return command
 
     def _generate_slam_params_with_posegraph(self, map_yaml_path: Path) -> Optional[Path]:

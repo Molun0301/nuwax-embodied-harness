@@ -458,12 +458,7 @@ class PlatformGeometryRuntime:
             message = self._removed_internal_stack_message()
             self._record_runtime_diagnostic("removed_internal_rtabmap_stack", message)
             raise RuntimeError(message)
-        # odom_tf_bridge 始终启动：slam_toolbox 需要 odom→base_footprint TF
-        self._start_managed_process(
-            "external_odom_tf_bridge",
-            self._build_odom_tf_bridge_command(),
-            "external_odom_tf_bridge.log",
-        )
+        # odom_tf_bridge 由 start_go2_slam_nav2.sh 在 CycloneDDS 域内启动（平台进程是 FastRTPS，看不到 driver 的 odom topic）
         self._start_managed_process(
             self._external_process_name(),
             self._build_external_geometry_command(),

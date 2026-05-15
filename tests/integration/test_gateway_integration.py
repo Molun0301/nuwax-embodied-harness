@@ -1129,6 +1129,17 @@ def test_gateway_debug_panel_realtime_readonly_routes(tmp_path: Path) -> None:
         assert "实时视频" in page.text
         assert "真实日志 tail" in page.text
         assert "3D 点云地图" in page.text
+        assert "consumeMjpegStream" in page.text
+        assert "ReadableStream MJPEG 解码" in page.text
+        assert "browser_stream" in page.text
+        assert "rendered_frames" in page.text
+        assert "state.videoFrames += 1" in page.text
+        assert "renderDecodedVideoFrame" in page.text
+        assert "displayVideoBlob" in page.text
+        assert "els.videoFrame.src = nextUrl" in page.text
+        assert "state.videoFrames += 1" in page.text
+        assert ".stream_url) {" in page.text
+        assert "els.videoFrame.src = videoSrc" not in page.text
         assert "/api/debug/pointcloud-map/latest/meta" in page.text
         assert "<button" not in page.text
         assert "<form" not in page.text
@@ -3412,6 +3423,12 @@ def test_gateway_debug_panel_readonly_routes(tmp_path: Path) -> None:
         assert page.status_code == 200
         assert "只读" in page.text
         assert "agent-token" in page.text
+        assert "consumeMjpegStream" in page.text
+        assert "createImageBitmap" in page.text
+        assert "MJPEG 字节流" in page.text
+        assert "displayVideoBlob" in page.text
+        assert "els.videoFrame.src = nextUrl" in page.text
+        assert "els.videoFrame.src = videoSrc" not in page.text
         assert "<button" not in page.text.lower()
 
         for path in (

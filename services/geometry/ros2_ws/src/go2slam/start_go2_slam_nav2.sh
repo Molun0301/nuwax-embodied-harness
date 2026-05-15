@@ -171,7 +171,8 @@ fi
 sleep 4
 
 # 启动 odom_tf_bridge（发布 odom→base_footprint TF，slam_toolbox 依赖此 TF）
-ODOM_BRIDGE_SCRIPT="${ROOT_DIR}/../../../services/geometry/odom_tf_bridge.py"
+REPO_ROOT="${ROOT_DIR}/../../../../.."
+ODOM_BRIDGE_SCRIPT="${REPO_ROOT}/services/geometry/odom_tf_bridge.py"
 if [[ -f "${ODOM_BRIDGE_SCRIPT}" ]]; then
   echo "Starting odom_tf_bridge..."
   python3 "${ODOM_BRIDGE_SCRIPT}" --odom-topic /utlidar/robot_odom --odom-frame odom --default-child-frame base_footprint --child-frame base_footprint &
@@ -179,7 +180,7 @@ if [[ -f "${ODOM_BRIDGE_SCRIPT}" ]]; then
 fi
 
 # 启动 Nav2 Goal Bridge（topic-to-action 桥接，解决跨 RMW action 通信 bug）
-BRIDGE_SCRIPT="${ROOT_DIR}/../../../services/geometry/nav2_goal_bridge.py"
+BRIDGE_SCRIPT="${REPO_ROOT}/services/geometry/nav2_goal_bridge.py"
 if [[ -f "${BRIDGE_SCRIPT}" ]]; then
   echo "Starting Nav2 Goal Bridge..."
   python3 "${BRIDGE_SCRIPT}" &

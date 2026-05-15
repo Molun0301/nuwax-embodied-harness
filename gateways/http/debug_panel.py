@@ -754,6 +754,10 @@ def _render_debug_page(access_token: str) -> str:
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 500;
       const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.state", "exploration.frontier", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state"];
+      const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
+      const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
+      const VIDEO_JPEG_DECODE_TIMEOUT_MS = 3000;
+      const MJPEG_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
       const state = {
         mapGrid: null,
         mapViewport: null,
@@ -778,6 +782,17 @@ def _render_debug_page(access_token: str) -> str:
         videoRenderFrame: null,
         lastVideoFrameKey: null,
         videoStreamSrc: null,
+        videoStreamController: null,
+        videoStreamGeneration: 0,
+        videoStreamReconnectTimer: null,
+        videoStreamReconnectDelayMs: VIDEO_STREAM_INITIAL_RECONNECT_MS,
+        videoStreamStatus: "idle",
+        videoStreamBytes: 0,
+        videoDecodedBytes: 0,
+        videoDecodeErrors: 0,
+        videoLastError: "",
+        videoLastFrameAt: null,
+        videoCurrentObjectUrl: null,
         showDetections: false,
         videoDetections: [],
         videoSourceSize: null,
@@ -1692,14 +1707,333 @@ def _render_debug_page(access_token: str) -> str:
         }
         return data.data_uri || data.uri || "";
       }
-      function startVideoStream() {
-        const videoSrc = buildVideoFrameSrc({ stream_url: DEFAULT_VIDEO_STREAM_URL });
-        if (!videoSrc || state.videoStreamSrc === videoSrc) return;
-        els.videoFrame.src = videoSrc;
+      function revokeVideoObjectUrl() {
+        if (!state.videoCurrentObjectUrl) return;
+        try {
+          URL.revokeObjectURL(state.videoCurrentObjectUrl);
+        } catch (err) {
+          // 忽略浏览器释放失败；下一帧会覆盖显示。
+        }
+        state.videoCurrentObjectUrl = null;
+      }
+      function setVideoStreamStatus(status, message) {
+        state.videoStreamStatus = status;
+        if (message) {
+          els.videoEmpty.hidden = state.videoFrames > 0 && status === "rendering";
+          els.videoEmpty.textContent = message;
+        }
+        setText(
+          els.videoFpsStatus,
+          `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${status}`
+        );
+      }
+      function scheduleVideoStreamReconnect(reason) {
+        if (!state.videoStreamSrc) return;
+        if (state.videoStreamReconnectTimer) return;
+        const delayMs = state.videoStreamReconnectDelayMs;
+        const nextDelayMs = Math.min(VIDEO_STREAM_MAX_RECONNECT_MS, Math.max(VIDEO_STREAM_INITIAL_RECONNECT_MS, delayMs * 1.6));
+        setVideoStreamStatus("reconnecting", `${reason || "MJPEG 视频流中断"}，${Math.round(delayMs)} ms 后重连。`);
+        state.videoStreamReconnectTimer = window.setTimeout(() => {
+          state.videoStreamReconnectTimer = null;
+          state.videoStreamReconnectDelayMs = nextDelayMs;
+          startVideoStream({ force: true, reason: "reconnect" });
+        }, delayMs);
+      }
+      function stopVideoStream(reason) {
+        state.videoStreamGeneration += 1;
+        if (state.videoStreamController) {
+          try {
+            state.videoStreamController.abort();
+          } catch (err) {
+            // AbortController 可能已结束。
+          }
+          state.videoStreamController = null;
+        }
+        if (state.videoStreamReconnectTimer) {
+          window.clearTimeout(state.videoStreamReconnectTimer);
+          state.videoStreamReconnectTimer = null;
+        }
+        setVideoStreamStatus("stopped", reason || "视频流已停止。");
+      }
+      function clearVideoDisplay(reason) {
+        stopVideoStream(reason);
+        revokeVideoObjectUrl();
+        els.videoFrame.removeAttribute("src");
+        els.videoFrame.hidden = true;
+        state.videoStreamSrc = null;
+        state.lastVideoFrameKey = null;
+      }
+      function startVideoStream(options) {
+        const opts = options || {};
+        const videoSrc = opts.streamUrl
+          ? new URL(opts.streamUrl, window.location.origin).toString()
+          : buildVideoFrameSrc({ stream_url: DEFAULT_VIDEO_STREAM_URL });
+        if (!videoSrc) return;
+        if (!opts.force && state.videoStreamSrc === videoSrc && state.videoStreamController) return;
+        const reconnectDelay = opts.reason === "reconnect" ? state.videoStreamReconnectDelayMs : VIDEO_STREAM_INITIAL_RECONNECT_MS;
+        if (state.videoStreamController) {
+          try {
+            state.videoStreamController.abort();
+          } catch (err) {
+            // 旧连接可能已结束。
+          }
+          state.videoStreamController = null;
+        }
+        if (state.videoStreamReconnectTimer) {
+          window.clearTimeout(state.videoStreamReconnectTimer);
+          state.videoStreamReconnectTimer = null;
+        }
+        state.videoStreamReconnectDelayMs = reconnectDelay;
+        state.videoStreamGeneration += 1;
         state.videoStreamSrc = videoSrc;
+        const generation = state.videoStreamGeneration;
+        const controller = new AbortController();
+        state.videoStreamController = controller;
+        state.videoStreamBytes = 0;
+        state.videoDecodedBytes = 0;
+        state.videoLastError = "";
+        setVideoStreamStatus("connecting", "正在连接平台转发的 Go2 端侧 MJPEG 视频流。");
+        consumeMjpegStream(videoSrc, controller.signal, generation).catch((err) => {
+          if (generation !== state.videoStreamGeneration || controller.signal.aborted) return;
+          const message = err && err.message ? err.message : String(err || "未知错误");
+          state.videoLastError = message;
+          state.videoDecodeErrors += 1;
+          state.videoStreamController = null;
+          scheduleVideoStreamReconnect(`MJPEG 解码流失败：${message}`);
+        });
+      }
+      function resetVideoStreamFromMetadata(videoSrc) {
+        if (!videoSrc) return false;
+        const latestRenderedAgeMs = state.videoLastFrameAt ? Date.now() - state.videoLastFrameAt : Infinity;
+        if (
+          state.videoStreamSrc === videoSrc
+          && !state.videoStreamController
+          && !state.videoStreamReconnectTimer
+          && latestRenderedAgeMs > VIDEO_STREAM_MAX_RECONNECT_MS
+        ) {
+          startVideoStream({ streamUrl: videoSrc, force: true, reason: "metadata_watchdog" });
+          return true;
+        }
+        return false;
+      }
+      async function consumeMjpegStream(videoSrc, signal, generation) {
+        const response = await fetch(videoSrc, { method: "GET", cache: "no-store", signal });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        if (!response.body || !response.body.getReader) {
+          throw new Error("当前浏览器不支持 ReadableStream MJPEG 解码。");
+        }
+        state.videoStreamReconnectDelayMs = VIDEO_STREAM_INITIAL_RECONNECT_MS;
+        setVideoStreamStatus("streaming", "已连接 MJPEG 字节流，等待首帧 JPEG 解码。");
+        const reader = response.body.getReader();
+        let buffer = new Uint8Array(0);
+        try {
+          while (generation === state.videoStreamGeneration) {
+            const result = await reader.read();
+            if (result.done) break;
+            if (!result.value || !result.value.byteLength) continue;
+            state.videoStreamBytes += result.value.byteLength;
+            buffer = appendBytes(buffer, result.value);
+            if (buffer.byteLength > MJPEG_MAX_BUFFER_BYTES) {
+              const soi = findMarker(buffer, 0xff, 0xd8, Math.max(0, buffer.byteLength - 1024 * 1024));
+              buffer = soi >= 0 ? buffer.slice(soi) : new Uint8Array(0);
+              if (!buffer.byteLength) throw new Error("MJPEG 缓冲区超过上限且未找到 JPEG 起始标记。");
+            }
+            let parsedAny = false;
+            let latestFrameBytes = null;
+            while (true) {
+              const parsed = extractNextJpeg(buffer);
+              if (!parsed) break;
+              if (!parsed.frame) {
+                buffer = parsed.remaining;
+                break;
+              }
+              parsedAny = true;
+              latestFrameBytes = parsed.frame;
+              buffer = parsed.remaining;
+            }
+            if (latestFrameBytes) {
+              try {
+                await renderDecodedVideoFrame(latestFrameBytes, generation);
+              } catch (err) {
+                const message = err && err.message ? err.message : String(err || "未知错误");
+                state.videoLastError = message;
+                state.videoDecodeErrors += 1;
+                state.videoStreamController = null;
+                scheduleVideoStreamReconnect(`JPEG 帧解码失败：${message}`);
+                return;
+              }
+            }
+            if (!parsedAny && state.videoFrames === 0) {
+              setVideoStreamStatus("streaming", `已接收 ${state.videoStreamBytes} 字节，等待完整 JPEG 帧。`);
+            }
+          }
+        } finally {
+          try {
+            reader.releaseLock();
+          } catch (err) {
+            // 读取器可能已经释放。
+          }
+        }
+        if (generation === state.videoStreamGeneration) {
+          state.videoStreamController = null;
+          scheduleVideoStreamReconnect("MJPEG 字节流已结束");
+        }
+      }
+      function appendBytes(left, right) {
+        if (!left || !left.byteLength) return right;
+        const merged = new Uint8Array(left.byteLength + right.byteLength);
+        merged.set(left, 0);
+        merged.set(right, left.byteLength);
+        return merged;
+      }
+      function findMarker(bytes, a, b, start) {
+        const begin = Math.max(0, Number(start || 0));
+        for (let i = begin; i < bytes.byteLength - 1; i += 1) {
+          if (bytes[i] === a && bytes[i + 1] === b) return i;
+        }
+        return -1;
+      }
+      function extractNextJpeg(buffer) {
+        const soi = findMarker(buffer, 0xff, 0xd8, 0);
+        if (soi < 0) {
+          return {
+            frame: null,
+            remaining: buffer.byteLength > 2 ? buffer.slice(buffer.byteLength - 2) : buffer,
+          };
+        }
+        const eoi = findMarker(buffer, 0xff, 0xd9, soi + 2);
+        if (eoi < 0) {
+          return {
+            frame: null,
+            remaining: soi > 0 ? buffer.slice(soi) : buffer,
+          };
+        }
+        const frame = buffer.slice(soi, eoi + 2);
+        const remaining = buffer.slice(eoi + 2);
+        if (!frame.byteLength) return null;
+        return { frame, remaining };
+      }
+      async function decodeJpegBlob(blob) {
+        let probeUrl = null;
+        if (typeof createImageBitmap === "function") {
+          const timeout = new Promise((_, reject) => {
+            window.setTimeout(() => reject(new Error("JPEG 解码超时")), VIDEO_JPEG_DECODE_TIMEOUT_MS);
+          });
+          const bitmap = await Promise.race([createImageBitmap(blob), timeout]);
+          if (bitmap && typeof bitmap.close === "function") bitmap.close();
+        } else {
+          try {
+            await new Promise((resolve, reject) => {
+              const probe = new Image();
+              let settled = false;
+              const timer = window.setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                reject(new Error("JPEG 解码超时"));
+              }, VIDEO_JPEG_DECODE_TIMEOUT_MS);
+              probe.onload = () => {
+                if (settled) return;
+                settled = true;
+                window.clearTimeout(timer);
+                resolve();
+              };
+              probe.onerror = () => {
+                if (settled) return;
+                settled = true;
+                window.clearTimeout(timer);
+                reject(new Error("JPEG 解码失败"));
+              };
+              probeUrl = URL.createObjectURL(blob);
+              probe.src = probeUrl;
+            });
+          } finally {
+            if (probeUrl) URL.revokeObjectURL(probeUrl);
+          }
+        }
+      }
+      async function renderDecodedVideoFrame(frameBytes, generation) {
+        if (!frameBytes || !frameBytes.byteLength) return;
+        const blob = new Blob([frameBytes], { type: "image/jpeg" });
+        await decodeJpegBlob(blob);
+        if (generation !== state.videoStreamGeneration) return;
+        const nextUrl = await displayVideoBlob(blob, generation);
+        if (generation !== state.videoStreamGeneration) {
+          try {
+            URL.revokeObjectURL(nextUrl);
+          } catch (err) {
+            // 过期帧释放失败不影响下一轮。
+          }
+          return;
+        }
+        state.videoCurrentObjectUrl = nextUrl;
+        state.videoDecodedBytes += frameBytes.byteLength;
+        state.videoFrames += 1;
+        state.videoLastFrameAt = Date.now();
+        state.videoStreamStatus = "rendering";
         els.videoFrame.hidden = false;
-        els.videoEmpty.hidden = false;
-        els.videoEmpty.textContent = "正在连接平台转发的 Go2 端侧视频推流。";
+        els.videoEmpty.hidden = true;
+        scheduleVideoDetectionDraw();
+      }
+      async function displayVideoBlob(blob, generation) {
+        const nextUrl = URL.createObjectURL(blob);
+        const previousUrl = state.videoCurrentObjectUrl;
+        try {
+          await new Promise((resolve, reject) => {
+            let settled = false;
+            const timer = window.setTimeout(() => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(new Error("JPEG 显示超时"));
+            }, VIDEO_JPEG_DECODE_TIMEOUT_MS);
+            function cleanup() {
+              window.clearTimeout(timer);
+              els.videoFrame.removeEventListener("load", onLoad);
+              els.videoFrame.removeEventListener("error", onError);
+            }
+            function onLoad() {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve();
+            }
+            function onError() {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(new Error("JPEG 显示失败"));
+            }
+            els.videoFrame.addEventListener("load", onLoad, { once: true });
+            els.videoFrame.addEventListener("error", onError, { once: true });
+            if (generation !== state.videoStreamGeneration) {
+              settled = true;
+              cleanup();
+              resolve();
+              return;
+            }
+            els.videoFrame.src = nextUrl;
+          });
+        } catch (err) {
+          try {
+            URL.revokeObjectURL(nextUrl);
+          } catch (revokeErr) {
+            // 忽略失败。
+          }
+          throw err;
+        }
+        if (generation !== state.videoStreamGeneration) return nextUrl;
+        if (previousUrl) {
+          window.setTimeout(() => {
+            try {
+              URL.revokeObjectURL(previousUrl);
+            } catch (err) {
+              // 旧帧 URL 释放失败不影响后续实时帧。
+            }
+          }, 250);
+        }
+        return nextUrl;
       }
       function updateVideo(envelope) {
         const status = statusOf(envelope);
@@ -1712,23 +2046,32 @@ def _render_debug_page(access_token: str) -> str:
         setPill(els.videoStatus, status);
         const videoSrc = buildVideoFrameSrc(data);
         if (videoSrc) {
-          const frameKeyParts = data.stream_url ? [videoSrc] : [videoSrc, envelope.frame_id || data.frame_id || "", envelope.sequence || "", envelope.source_timestamp || ""];
-          const frameKey = frameKeyParts.some(Boolean) ? frameKeyParts.join("|") : null;
-          if (!frameKey || frameKey !== state.lastVideoFrameKey) {
-            if (state.videoStreamSrc !== videoSrc) {
-              els.videoFrame.src = videoSrc;
-              state.videoStreamSrc = videoSrc;
+          if (data.stream_url) {
+            if (state.videoStreamSrc !== videoSrc || (!state.videoStreamController && !state.videoStreamReconnectTimer)) {
+              startVideoStream({ streamUrl: videoSrc, force: state.videoStreamSrc !== videoSrc, reason: "metadata" });
+            } else {
+              resetVideoStreamFromMetadata(videoSrc);
             }
+          } else if (state.lastVideoFrameKey !== videoSrc) {
+            stopVideoStream("切换到单帧图像显示。");
+            revokeVideoObjectUrl();
+            els.videoFrame.setAttribute("src", videoSrc);
+            state.videoStreamSrc = videoSrc;
+            state.lastVideoFrameKey = videoSrc;
             state.videoFrames += 1;
-            if (frameKey) state.lastVideoFrameKey = frameKey;
+            state.videoLastFrameAt = Date.now();
           }
           if (data.width_px && data.height_px) state.videoSourceSize = { width: Number(data.width_px), height: Number(data.height_px) };
-          els.videoFrame.hidden = false;
-          els.videoEmpty.hidden = true;
+          if (state.videoFrames > 0 || !data.stream_url) {
+            els.videoFrame.hidden = false;
+            els.videoEmpty.hidden = state.videoFrames > 0;
+          } else {
+            els.videoFrame.hidden = true;
+            els.videoEmpty.hidden = false;
+          }
           scheduleVideoDetectionDraw();
         } else if (!state.lastVideoFrameKey) {
-          els.videoFrame.hidden = true;
-          els.videoEmpty.hidden = false;
+          clearVideoDisplay(errorReason(envelope, "尚未收到 Go2 端侧主动推送的视频帧。"));
           els.videoEmpty.textContent = errorReason(envelope, "尚未收到 Go2 端侧主动推送的视频帧。");
         }
         setKv(els.videoMeta, [
@@ -1742,21 +2085,27 @@ def _render_debug_page(access_token: str) -> str:
           ["ingest_last_client", data.ingest_status && data.ingest_status.last_client_id],
           ["stream_url", data.stream_url],
           ["payload_bytes", data.payload_bytes],
+          ["browser_stream", state.videoStreamStatus],
+          ["browser_bytes", state.videoStreamBytes],
+          ["decoded_bytes", state.videoDecodedBytes],
+          ["decode_errors", state.videoDecodeErrors],
+          ["last_decode_error", state.videoLastError],
           ["detections", state.videoDetections.length],
           ["rendered_frames", state.videoFrames],
+          ["last_rendered_at", state.videoLastFrameAt ? new Date(state.videoLastFrameAt).toLocaleTimeString() : "--"],
           ["source_timestamp", shortTime(envelope.source_timestamp)],
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         setText(els.visionModelStatus, `本地模型：${status}`);
-        setText(els.videoFpsStatus, `帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
+        setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${state.videoStreamStatus} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
       }
       function updateVideoDetections(data, envelope) {
         state.videoDetections = Array.isArray(data.detections_2d) ? data.detections_2d : [];
         if (data.width_px && data.height_px) state.videoSourceSize = { width: Number(data.width_px), height: Number(data.height_px) };
         setPill(els.videoStatus, statusOf(envelope), `${state.videoDetections.length} detections`);
         setText(els.visionModelStatus, `本地模型：${data.detector_backend || envelope.source || "perception"}`);
-        setText(els.videoFpsStatus, `帧 ${state.videoFrames} · 检测 ${state.videoDetections.length}`);
+        setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${state.videoStreamStatus}`);
         scheduleVideoDetectionDraw();
       }
       function scheduleVideoDetectionDraw() {
@@ -2202,7 +2551,9 @@ def _render_debug_page(access_token: str) -> str:
       els.videoFrame.addEventListener("error", () => {
         els.videoFrame.hidden = true;
         els.videoEmpty.hidden = false;
-        els.videoEmpty.textContent = "视频流连接失败，请检查 Go2 端侧推流进程与 /streams/video.ingest。";
+        state.videoLastError = "浏览器无法显示已解码 JPEG 帧。";
+        state.videoDecodeErrors += 1;
+        els.videoEmpty.textContent = "已收到 MJPEG 字节流，但浏览器显示解码后的 JPEG 帧失败。";
       });
       window.addEventListener("resize", scheduleVideoDetectionDraw);
       startVideoStream();

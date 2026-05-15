@@ -3001,7 +3001,37 @@ class PlatformGeometryRuntime:
             "localization:=slam",
             "use_rviz:=false",
         ]
+        # 尝试找到已保存的 posegraph，让 slam_toolbox 加载已有地图做增量建图
+        posegraph_yaml = self._generate_slam_params_with_posegraph(map_yaml_path)
+        if posegraph_yaml is not None:
+            command.append("slam_params_file:=%s" % str(posegraph_yaml))
         return command
+
+    def _generate_slam_params_with_posegraph(self, map_yaml_path: Path) -> Optional[Path]:
+        """基于默认 slam_toolbox yaml 生成包含 map_file_name 的临时配置。"""
+        import shutil
+        slam_dir = map_yaml_path.parent.parent / "slam_toolbox"
+        if not slam_dir.exists():
+            return None
+        posegraph_files = list(slam_dir.glob("*.posegraph"))
+        if not posegraph_files:
+            return None
+        prefix = posegraph_files[0].with_suffix("")  # 去掉 .posegraph 后缀
+        data_file = prefix.with_suffix(".data")
+        if not data_file.exists():
+            return None
+        default_yaml = Path("/home/unitree/nuwax-robot-bridge/services/geometry/ros2_ws/install/go2_slam/share/go2_slam/config/mapper_params_online_async.yaml")
+        if not default_yaml.exists():
+            default_yaml = Path(self.config.geometry_setup_script).parent.parent / "install/go2_slam/share/go2_slam/config/mapper_params_online_async.yaml"
+        if not default_yaml.exists():
+            return None
+        tmp_yaml = Path("/tmp/nuwax_slam_params_with_map.yaml")
+        shutil.copy2(str(default_yaml), str(tmp_yaml))
+        with open(tmp_yaml, "a") as f:
+            f.write("\n    map_file_name: %s\n" % str(prefix))
+            f.write("    map_start_at_dock: true\n")
+        LOGGER.info("生成 slam_toolbox 增量建图配置 posegraph=%s yaml=%s", prefix, tmp_yaml)
+        return tmp_yaml
 
     def _ensure_amcl_initialized(self) -> None:
         """等待 AMCL 发布 map→odom TF；超时后发布 identity initialpose 作为 fallback。"""

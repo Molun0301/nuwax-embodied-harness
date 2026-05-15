@@ -170,15 +170,9 @@ fi
 
 sleep 4
 
-# 启动 odom_tf_bridge（go2_driver 的 pose_callback 依赖 utlidar/robot_pose，
-# 如果该 topic 无数据则 driver 不发布 TF，需要 odom_tf_bridge 补充）
+# odom_tf_bridge 由平台进程（FastRTPS）启动，Unitree SDK 在 FastRTPS 域发布 /odom
+# 此处不启动（CycloneDDS 域看不到 FastRTPS 的 /odom）
 REPO_ROOT="${ROOT_DIR}/../../../../.."
-ODOM_BRIDGE_SCRIPT="${REPO_ROOT}/services/geometry/odom_tf_bridge.py"
-if [[ -f "${ODOM_BRIDGE_SCRIPT}" ]]; then
-  echo "Starting odom_tf_bridge..."
-  python3 "${ODOM_BRIDGE_SCRIPT}" --odom-topic /utlidar/robot_odom --default-odom-frame odom --odom-frame odom --default-child-frame base_footprint --child-frame base_footprint &
-  ODOM_BRIDGE_PID=$!
-fi
 
 # 启动 Nav2 Goal Bridge（topic-to-action 桥接，解决跨 RMW action 通信 bug）
 BRIDGE_SCRIPT="${REPO_ROOT}/services/geometry/nav2_goal_bridge.py"

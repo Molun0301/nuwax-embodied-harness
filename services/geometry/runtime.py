@@ -2993,19 +2993,8 @@ class PlatformGeometryRuntime:
         return None
 
     def _build_nav2_map_activation_command(self, *, map_yaml_path: Path, pcd_path: Optional[Path]) -> List[str]:
-        command = self._build_launch_prefix() + [
-            "ros2",
-            "launch",
-            "go2_navigation2",
-            "go2_nav2.launch.py",
-            "localization:=slam",
-            "use_rviz:=false",
-        ]
-        # 暂时禁用 posegraph 加载（slam_toolbox 加载含中文路径的 posegraph 时 SIGSEGV）
-        # posegraph_yaml = self._generate_slam_params_with_posegraph(map_yaml_path)
-        # if posegraph_yaml is not None:
-        #     command.append("slam_params_file:=%s" % str(posegraph_yaml))
-        return command
+        # 直接复用 start_go2_slam_nav2.sh（它管理 odom_tf_bridge + nav2_goal_bridge）
+        return self._build_external_geometry_command()
 
     def _generate_slam_params_with_posegraph(self, map_yaml_path: Path) -> Optional[Path]:
         """基于默认 slam_toolbox yaml 生成包含 map_file_name 的临时配置。"""

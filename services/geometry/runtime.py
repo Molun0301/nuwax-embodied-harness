@@ -1576,7 +1576,9 @@ class PlatformGeometryRuntime:
             map_snapshot_kind="live_streaming",
             source_kind="platform_live_map_provider",
         ))
-        if self._live_map_payload_under_covers_seed(payload, metadata, version):
+        if self._platform_exploration_runtime.is_running:
+            pass  # 探索模式下不抑制 live map（新建地图从小到大增长是正常的）
+        elif self._live_map_payload_under_covers_seed(payload, metadata, version):
             live_known_cells = self._metadata_known_cell_count(metadata)
             if live_known_cells is None:
                 live_known_cells = self._occupancy_known_cell_count(payload.get("occupancy_grid"))

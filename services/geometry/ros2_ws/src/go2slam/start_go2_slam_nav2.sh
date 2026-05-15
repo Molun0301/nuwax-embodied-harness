@@ -8,6 +8,7 @@ GEOMETRY_RUNTIME_ENV_SCRIPT="$ROOT_DIR/../../../source_runtime_env.sh"
 NAV2_PID=""
 MAPPING_PID=""
 BRIDGE_PID=""
+ODOM_BRIDGE_PID=""
 STOP_REQUESTED=false
 
 detect_ros_setup() {
@@ -69,7 +70,7 @@ done
 cleanup() {
   STOP_REQUESTED=true
   # 只有在 PID 不为空时才尝试清理
-  for pid in "${BRIDGE_PID}" "${MAPPING_PID}" "${NAV2_PID}"; do
+  for pid in "${ODOM_BRIDGE_PID}" "${BRIDGE_PID}" "${MAPPING_PID}" "${NAV2_PID}"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
       kill -INT "${pid}" 2>/dev/null || true
       for _ in {1..30}; do
@@ -168,6 +169,14 @@ fi
 # -----------------------
 
 sleep 4
+
+# 启动 odom_tf_bridge（发布 odom→base_footprint TF，slam_toolbox 依赖此 TF）
+ODOM_BRIDGE_SCRIPT="${ROOT_DIR}/../../../services/geometry/odom_tf_bridge.py"
+if [[ -f "${ODOM_BRIDGE_SCRIPT}" ]]; then
+  echo "Starting odom_tf_bridge..."
+  python3 "${ODOM_BRIDGE_SCRIPT}" --odom-topic /utlidar/robot_odom --odom-frame odom --default-child-frame base_footprint --child-frame base_footprint &
+  ODOM_BRIDGE_PID=$!
+fi
 
 # 启动 Nav2 Goal Bridge（topic-to-action 桥接，解决跨 RMW action 通信 bug）
 BRIDGE_SCRIPT="${ROOT_DIR}/../../../services/geometry/nav2_goal_bridge.py"

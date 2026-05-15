@@ -1,0 +1,19 @@
+[Unit]
+Description=nuwax_robot_bridge Go2 端侧实时视频推流
+After=network-online.target nuwax-host-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+Group=unitree
+WorkingDirectory=/home/unitree/nuwax-robot-bridge
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/unitree/nuwax-robot-bridge/drivers/go2/data_plane.env
+ExecStart=/usr/bin/python3 -m drivers.go2.video_streamer
+Restart=always
+RestartSec=1
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

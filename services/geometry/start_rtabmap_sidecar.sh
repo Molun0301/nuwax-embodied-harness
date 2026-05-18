@@ -3,6 +3,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${NUWAX_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+
+# 从 .env 读取 frame 和后端配置（不读取 topic 变量——sidecar 运行在 CycloneDDS 域，
+# 使用平台桥接后的 topic，与 .env 中 FastRTPS 域的 topic 不同）
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+  while IFS='=' read -r key value; do
+    [[ -z "${key}" || "${key}" == \#* ]] && continue
+    export "${key}=${value}"
+  done < <(grep -E '^NUWAX_GEOMETRY_(MAP_FRAME|ODOM_FRAME|BASE_FRAME|LIDAR_FRAME|IMU_FRAME)=|^NUWAX_RTABMAP_|^NUWAX_NAV2_' "${REPO_ROOT}/.env")
+fi
+
 LOG_DIR="${NUWAX_GEOMETRY_LOG_DIR:-${REPO_ROOT}/runtime_data/geometry/logs}"
 DB_ROOT="${NUWAX_RTABMAP_DATABASE_ROOT:-${REPO_ROOT}/runtime_data/geometry/rtabmap}"
 mkdir -p "${LOG_DIR}" "${DB_ROOT}"
@@ -19,7 +29,7 @@ ODOM_FRAME="${NUWAX_GEOMETRY_ODOM_FRAME:-odom}"
 BASE_FRAME="${NUWAX_GEOMETRY_BASE_FRAME:-body}"
 LIDAR_FRAME="${NUWAX_GEOMETRY_LIDAR_FRAME:-utlidar_lidar}"
 IMU_FRAME="${NUWAX_GEOMETRY_IMU_FRAME:-utlidar_imu}"
-RTABMAP_LAUNCH_PACKAGE="${NUWAX_RTABMAP_LAUNCH_PACKAGE:-rtabmap_ros}"
+RTABMAP_LAUNCH_PACKAGE="${NUWAX_RTABMAP_LAUNCH_PACKAGE:-rtabmap_launch}"
 RTABMAP_LAUNCH_FILE="${NUWAX_RTABMAP_LAUNCH_FILE:-rtabmap.launch.py}"
 RTABMAP_DB_PATH="${NUWAX_RTABMAP_DATABASE_PATH:-${DB_ROOT}/live_rtabmap.db}"
 NAV2_MODE="${NUWAX_NAV2_MODE:-sidecar}"
@@ -77,6 +87,7 @@ start_background "odom_tf_bridge.log" \
   python3 "${REPO_ROOT}/services/geometry/odom_tf_bridge.py" \
   --odom-topic "${ODOM_TOPIC}" \
   --odom-frame "${ODOM_FRAME}" \
+  --default-odom-frame "${ODOM_FRAME}" \
   --default-child-frame "${BASE_FRAME}" \
   --child-frame "${BASE_FRAME}"
 

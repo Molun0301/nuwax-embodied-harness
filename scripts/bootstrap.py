@@ -762,7 +762,7 @@ class BootstrapPlanner:
                     "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
                     "NUWAX_GEOMETRY_BASE_FRAME": "base_footprint",
                     "NUWAX_GEOMETRY_LIDAR_FRAME": "utlidar_lidar",
-                    "NUWAX_RTABMAP_LAUNCH_PACKAGE": "rtabmap_ros",
+                    "NUWAX_RTABMAP_LAUNCH_PACKAGE": "rtabmap_launch",
                     "NUWAX_RTABMAP_LAUNCH_FILE": "rtabmap.launch.py",
                     "NUWAX_RTABMAP_OCCUPANCY_PROJECTION": "projected_occupancy",
                     "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "start_rtabmap_sidecar.sh"),

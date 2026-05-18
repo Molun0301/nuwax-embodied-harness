@@ -843,7 +843,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             default_profile=_cfg_bool_alias("NUWAX_BACKEND_DEFAULT_PROFILE", "NUWAX_RTABMAP_DEFAULT_PROFILE", True),
             database_root=_cfg_str_alias("NUWAX_BACKEND_DATABASE_ROOT", "NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
             pcd_root=_cfg_str_alias("NUWAX_BACKEND_PCD_ROOT", "NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()),
-            launch_package=_cfg_str_alias("NUWAX_BACKEND_LAUNCH_PACKAGE", "NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_ros"),
+            launch_package=_cfg_str_alias("NUWAX_BACKEND_LAUNCH_PACKAGE", "NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_launch"),
             launch_file=_cfg_str_alias("NUWAX_BACKEND_LAUNCH_FILE", "NUWAX_RTABMAP_LAUNCH_FILE", "rtabmap.launch.py"),
             occupancy_projection=_cfg_str_alias("NUWAX_BACKEND_OCCUPANCY_PROJECTION", "NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
             input_contract=_cfg_str_alias("NUWAX_BACKEND_INPUT_CONTRACT", "NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"),

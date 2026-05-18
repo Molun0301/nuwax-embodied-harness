@@ -85,7 +85,7 @@ class MapWorkspace(TimestampedContract):
 class MapGeometryAssetType(StrEnum):
     """平台地图版本几何资产类型。"""
 
-    # 真实后端是 slam_toolbox（serialize 出 .posegraph + .data）。
+    # slam_toolbox 后端资产类型（serialize 出 .posegraph + .data），当前主线使用 RTAB-Map。
     SLAM_TOOLBOX_POSEGRAPH = "slam_toolbox_posegraph"
     EXTERNAL_SLAM_NAV2_STATE = "external_slam_nav2_state"
     PCD = "pcd"
@@ -205,7 +205,7 @@ class MapGeometryAssetBinding(ContractModel):
         profile_summary = dict(self.profile_summary or self.parameter_summary.get("profile") or {})
         stack_lower = str(self.geometry_stack or "").strip().lower()
         is_external_stack = stack_lower == "external_slam_nav2"
-        # external_slam_nav2 真实后端是 slam_toolbox（serialize 出 .posegraph + .data）。
+        # external_slam_nav2 当前默认后端是 RTAB-Map；保留 slam_toolbox posegraph 资产路径兼容。
         if is_external_stack:
             state_asset_type = MapGeometryAssetType.SLAM_TOOLBOX_POSEGRAPH
         else:

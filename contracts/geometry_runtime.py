@@ -123,7 +123,7 @@ class RtabmapOutputConfig:
 
 @dataclass
 class RtabmapConfig:
-    """SLAM 后端状态侧车配置（历史名称：RTAB-Map；当前后端默认为 slam_toolbox）。
+    """SLAM 后端状态侧车配置（当前默认后端为 RTAB-Map，保留 slam_toolbox 兼容路径）。
 
     类已重命名为 ``BackendStateConfig``；``RtabmapConfig`` 保留作为兼容 alias，
     旧名仍然可用但应在后续治理任务中切换到新名。
@@ -345,7 +345,7 @@ class PlatformGeometryConfig:
 
 
 # 类重命名兼容 alias：
-# - 新名 BackendStateConfig 更准确反映“SLAM 后端状态”职责（当前默认后端是 slam_toolbox）。
+# - 新名 BackendStateConfig 更准确反映”SLAM 后端状态”职责（当前默认后端是 RTAB-Map）。
 # - 老名 RtabmapConfig 仍然指向同一个类对象，外部 import 不破坏。
 # - 后续治理任务里再彻底切换到新名，这里暂不主动迁移调用方。
 BackendStateConfig = RtabmapConfig

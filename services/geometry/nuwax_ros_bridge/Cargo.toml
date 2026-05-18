@@ -5,7 +5,7 @@ edition = "2021"
 description = "nuwax 平台几何 ROS2 桥接子进程（独立于 Python 网关）"
 
 [dependencies]
-r2r = "0.9"
+r2r = "0.6"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.12"

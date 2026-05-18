@@ -29,14 +29,11 @@ class RemoteGeometryProvider:
 
     def connect(self) -> bool:
         """连接到 Rust 子进程的 gRPC server。"""
-        socket_path = self._bridge.socket_path
-        if not socket_path:
+        if not self._bridge.is_running:
             LOGGER.error("子进程未启动，无法连接")
             return False
         try:
-            self._channel = grpc.insecure_channel(
-                "unix://" + socket_path
-            )
+            self._channel = grpc.insecure_channel(self._bridge.grpc_target)
             self._stub = pb2_grpc.GeometryRuntimeStub(self._channel)
             resp = self._stub.GetStatus(pb2.Empty())
             LOGGER.info("gRPC 连接成功: phase=%s, rss=%dKB", resp.phase, resp.rss_kb)

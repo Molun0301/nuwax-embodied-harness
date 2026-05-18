@@ -32,6 +32,8 @@ from services.geometry.live_map_provider import Ros2LiveMapProvider
 from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
 from services.geometry.odometry_publisher import Ros2OdometryPublisher
 from services.geometry.pointcloud_publisher import Ros2PointCloudPublisher
+from services.geometry.ros_bridge_client import RosBridgeSubprocess
+from services.geometry.remote_provider import RemoteGeometryProvider
 from services.geometry.tf_localization_provider import Ros2TfLocalizationProvider
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
@@ -235,6 +237,8 @@ class PlatformGeometryRuntime:
         self._map_stream_tracker: Dict[str, object] = {}
         self._nav2_launch_attempted = False
         self._nav2_action_provider = Nav2ActionNavigationProvider(self)
+        self._ros_bridge_subprocess: Optional[RosBridgeSubprocess] = None
+        self._remote_provider: Optional[RemoteGeometryProvider] = None
         self._platform_exploration_config = ExplorationConfig(enabled=True)
         self._platform_exploration_runtime = PlatformExplorationRuntime(
             frontier_explorer=FrontierExplorer(self._platform_exploration_config),
@@ -471,6 +475,7 @@ class PlatformGeometryRuntime:
             self._external_log_name(),
         )
         if self._external_input_bridge_enabled():
+            self._start_ros_bridge_subprocess()
             bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台启动 ROS2 odom/点云输入桥与 odom TF bridge，不启动内置 RTAB-Map/Nav2。"
         elif self._external_point_cloud_bridge_enabled():
             bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台只启动 ROS2 点云输入桥，跳过 odom/odom_tf_bridge。"
@@ -529,6 +534,29 @@ class PlatformGeometryRuntime:
     def _stop_managed_processes(self) -> None:
         for process in list(self._managed_processes.values()):
             process.stop()
+        if self._ros_bridge_subprocess is not None:
+            self._ros_bridge_subprocess.stop()
+            self._ros_bridge_subprocess = None
+        if self._remote_provider is not None:
+            self._remote_provider.disconnect()
+            self._remote_provider = None
+
+    def _start_ros_bridge_subprocess(self) -> None:
+        """启动 Rust nuwax-ros-bridge 子进程并建立 gRPC 连接。"""
+        if self._ros_bridge_subprocess is not None and self._ros_bridge_subprocess.is_running:
+            return
+        bridge = RosBridgeSubprocess()
+        if not bridge.start():
+            LOGGER.warning("Rust ros-bridge 子进程启动失败: %s", bridge.last_error)
+            self._record_runtime_diagnostic("ros_bridge_start", bridge.last_error or "启动失败")
+            return
+        self._ros_bridge_subprocess = bridge
+        provider = RemoteGeometryProvider(bridge)
+        if provider.connect():
+            self._remote_provider = provider
+            LOGGER.info("Rust ros-bridge gRPC 连接已建立")
+        else:
+            LOGGER.warning("Rust ros-bridge gRPC 连接失败，子进程仍在运行")
 
     def _monitor_runtime_loop(self) -> None:
         while not self._runtime_stop_event.wait(_GEOMETRY_MONITOR_INTERVAL_SEC):

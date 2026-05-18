@@ -1,10 +1,9 @@
 use r2r::QosProfile;
 use std::sync::Arc;
-use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio_stream::StreamExt;
 use tracing::{info, warn, error};
 
-// === 共享状态（gRPC 读取用）===
 #[derive(Clone, Default)]
 pub struct PoseState {
     pub x: f64, pub y: f64, pub z: f64,
@@ -62,7 +61,6 @@ impl Default for SharedState {
     }
 }
 
-// === 命令枚举 ===
 pub enum BridgeCommand {
     PublishOdom {
         frame_id: String,
@@ -90,7 +88,6 @@ pub enum BridgeCommand {
     },
 }
 
-// === Handle（gRPC 线程持有）===
 #[derive(Clone)]
 pub struct Ros2BridgeHandle {
     tx: mpsc::Sender<BridgeCommand>,
@@ -143,7 +140,6 @@ impl Ros2BridgeHandle {
     }
 }
 
-// === 启动入口 ===
 pub fn spawn_ros2_bridge(
     odom_topic: &str,
     pointcloud_topic: &str,
@@ -162,19 +158,25 @@ pub fn spawn_ros2_bridge(
     let nav_action = nav_action.to_string();
 
     std::thread::spawn(move || {
-        if let Err(e) = ros2_spin_loop(
-            &odom_topic, &pc_topic, &map_topic, &tf_topic, &nav_action,
-            rx, state_clone,
-        ) {
-            error!("ROS2 桥接线程异常退出: {}", e);
-        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("创建 tokio runtime 失败");
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async move {
+            if let Err(e) = ros2_async_loop(
+                &odom_topic, &pc_topic, &map_topic, &tf_topic, &nav_action,
+                rx, state_clone,
+            ).await {
+                error!("ROS2 桥接线程异常退出: {}", e);
+            }
+        }));
     });
 
     Ok(Ros2BridgeHandle { tx, state })
 }
 
-// === ROS2 主循环 ===
-fn ros2_spin_loop(
+async fn ros2_async_loop(
     odom_topic: &str,
     pc_topic: &str,
     map_topic: &str,
@@ -186,106 +188,217 @@ fn ros2_spin_loop(
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "nuwax_ros_bridge", "")?;
 
-    // Publisher: Odometry
     let odom_pub = node.create_publisher::<r2r::nav_msgs::msg::Odometry>(
         odom_topic, QosProfile::default()
     )?;
-
-    // Publisher: PointCloud2
     let pc_pub = node.create_publisher::<r2r::sensor_msgs::msg::PointCloud2>(
         pc_topic, QosProfile::default()
     )?;
 
-    // Subscriber: OccupancyGrid (/map)
-    let map_state = state.clone();
-    let _map_sub = node.subscribe::<r2r::nav_msgs::msg::OccupancyGrid>(
+    let map_sub = node.subscribe::<r2r::nav_msgs::msg::OccupancyGrid>(
         map_topic, QosProfile::default()
     )?;
-
-    // Subscriber: TFMessage (/tf)
-    let tf_state = state.clone();
-    let _tf_sub = node.subscribe::<r2r::tf2_msgs::msg::TFMessage>(
+    let tf_sub = node.subscribe::<r2r::tf2_msgs::msg::TFMessage>(
         tf_topic, QosProfile::default()
     )?;
 
-    // Action Client: NavigateToPose
-    let _action_client = node.create_action_client::<r2r::nav2_msgs::action::NavigateToPose::Action>(
+    let nav_client = node.create_action_client::<r2r::nav2_msgs::action::NavigateToPose::Action>(
         nav_action
     )?;
 
-    info!("ROS2 桥接线程启动: odom={}, map={}, tf={}, nav={}", odom_topic, map_topic, tf_topic, nav_action);
+    info!("ROS2 桥接启动: odom={}, map={}, tf={}, nav={}", odom_topic, map_topic, tf_topic, nav_action);
 
-    // 主循环
-    loop {
-        node.spin_once(std::time::Duration::from_millis(10));
+    // 订阅 /map → 更新 SharedState.map
+    let map_state = state.clone();
+    tokio::task::spawn_local(async move {
+        let mut stream = map_sub;
+        while let Some(msg) = stream.next().await {
+            let mut s = map_state.write().await;
+            s.map.width = msg.info.width;
+            s.map.height = msg.info.height;
+            s.map.resolution = msg.info.resolution;
+            s.map.origin_x = msg.info.origin.position.x;
+            s.map.origin_y = msg.info.origin.position.y;
+            s.map.frame_id = msg.header.frame_id.clone();
+            s.map.revision += 1;
+            s.map.data = msg.data;
+        }
+    });
 
-        // 处理 map 订阅（通过 try_recv 从 subscriber stream）
-        // 注：r2r subscriber 返回 Stream，需要在 async 上下文中 poll
-        // 这里用同步方式处理命令
-        while let Ok(cmd) = rx.try_recv() {
-            match cmd {
-                BridgeCommand::PublishOdom {
-                    frame_id, child_frame_id,
-                    x, y, z, qx, qy, qz, qw,
-                    lvx, lvy, lvz, avx, avy, avz, reply
-                } => {
-                    let mut msg = r2r::nav_msgs::msg::Odometry::default();
-                    msg.header.frame_id = frame_id;
-                    msg.child_frame_id = child_frame_id;
-                    msg.pose.pose.position.x = x;
-                    msg.pose.pose.position.y = y;
-                    msg.pose.pose.position.z = z;
-                    msg.pose.pose.orientation.x = qx;
-                    msg.pose.pose.orientation.y = qy;
-                    msg.pose.pose.orientation.z = qz;
-                    msg.pose.pose.orientation.w = qw;
-                    msg.twist.twist.linear.x = lvx;
-                    msg.twist.twist.linear.y = lvy;
-                    msg.twist.twist.linear.z = lvz;
-                    msg.twist.twist.angular.x = avx;
-                    msg.twist.twist.angular.y = avy;
-                    msg.twist.twist.angular.z = avz;
-                    let r = odom_pub.publish(&msg).map_err(|e| format!("{}", e));
-                    let _ = reply.send(r);
+    // 订阅 /tf → 更新 SharedState.transforms + pose
+    let tf_state = state.clone();
+    tokio::task::spawn_local(async move {
+        let mut stream = tf_sub;
+        while let Some(msg) = stream.next().await {
+            let mut s = tf_state.write().await;
+            for tf in &msg.transforms {
+                let entry = TransformEntry {
+                    parent: tf.header.frame_id.clone(),
+                    child: tf.child_frame_id.clone(),
+                    tx: tf.transform.translation.x,
+                    ty: tf.transform.translation.y,
+                    tz: tf.transform.translation.z,
+                    rx: tf.transform.rotation.x,
+                    ry: tf.transform.rotation.y,
+                    rz: tf.transform.rotation.z,
+                    rw: tf.transform.rotation.w,
+                };
+                if let Some(existing) = s.transforms.iter_mut().find(|t| t.parent == entry.parent && t.child == entry.child) {
+                    *existing = entry.clone();
+                } else {
+                    s.transforms.push(entry.clone());
                 }
-                BridgeCommand::PublishPointCloud {
-                    frame_id, data, point_count, point_step, reply
-                } => {
-                    let mut msg = r2r::sensor_msgs::msg::PointCloud2::default();
-                    msg.header.frame_id = frame_id;
-                    msg.height = 1;
-                    msg.width = point_count;
-                    msg.point_step = point_step;
-                    msg.row_step = point_step * point_count;
-                    msg.is_dense = true;
-                    msg.data = data;
-                    let r = pc_pub.publish(&msg).map_err(|e| format!("{}", e));
-                    let _ = reply.send(r);
-                }
-                BridgeCommand::SendNavGoal {
-                    x, y, z, qx, qy, qz, qw, reply
-                } => {
-                    // Nav2 goal 发送（简化版：记录状态，实际 action 调用需要 async）
-                    let goal_id = uuid::Uuid::new_v4().to_string();
-                    {
-                        let mut s = state.blocking_write();
-                        s.nav_state.status = "NAVIGATING".into();
-                        s.nav_state.message = format!("导航到 ({:.3}, {:.3})", x, y);
-                        s.nav_state.goal_id = goal_id.clone();
-                    }
-                    info!("发送导航目标: ({:.3}, {:.3}, {:.3}) goal_id={}", x, y, z, goal_id);
-                    let _ = reply.send(Ok(goal_id));
-                }
-                BridgeCommand::CancelNav { reply } => {
-                    {
-                        let mut s = state.blocking_write();
-                        s.nav_state.status = "IDLE".into();
-                        s.nav_state.message = "导航已取消".into();
-                    }
-                    info!("导航已取消");
-                    let _ = reply.send(Ok(()));
+                if tf.child_frame_id == "base_link" || tf.child_frame_id == "base_footprint" {
+                    s.pose.x = tf.transform.translation.x;
+                    s.pose.y = tf.transform.translation.y;
+                    s.pose.z = tf.transform.translation.z;
+                    s.pose.qx = tf.transform.rotation.x;
+                    s.pose.qy = tf.transform.rotation.y;
+                    s.pose.qz = tf.transform.rotation.z;
+                    s.pose.qw = tf.transform.rotation.w;
+                    s.pose.frame_id = tf.header.frame_id.clone();
                 }
             }
+        }
+    });
+
+    // 主循环：spin node + 处理命令 + 周期性检测 Nav2
+    let cmd_state = state.clone();
+    let mut last_nav2_check = std::time::Instant::now();
+    loop {
+        node.spin_once(std::time::Duration::from_millis(5));
+
+        if last_nav2_check.elapsed() >= std::time::Duration::from_secs(2) {
+            last_nav2_check = std::time::Instant::now();
+            let ready = nav_client.server_ready().unwrap_or(false);
+            let mut s = cmd_state.write().await;
+            s.nav2_action_server_ready = ready;
+        }
+
+        match rx.try_recv() {
+            Ok(cmd) => handle_command(cmd, &odom_pub, &pc_pub, &nav_client, &cmd_state).await,
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                info!("命令通道关闭，桥接线程退出");
+                break;
+            }
+        }
+
+        tokio::task::yield_now().await;
+    }
+
+    Ok(())
+}
+
+async fn handle_command(
+    cmd: BridgeCommand,
+    odom_pub: &r2r::Publisher<r2r::nav_msgs::msg::Odometry>,
+    pc_pub: &r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
+    nav_client: &r2r::ActionClient<r2r::nav2_msgs::action::NavigateToPose::Action>,
+    state: &Arc<RwLock<SharedState>>,
+) {
+    match cmd {
+        BridgeCommand::PublishOdom {
+            frame_id, child_frame_id,
+            x, y, z, qx, qy, qz, qw,
+            lvx, lvy, lvz, avx, avy, avz, reply
+        } => {
+            let mut msg = r2r::nav_msgs::msg::Odometry::default();
+            msg.header.frame_id = frame_id;
+            msg.child_frame_id = child_frame_id;
+            msg.pose.pose.position.x = x;
+            msg.pose.pose.position.y = y;
+            msg.pose.pose.position.z = z;
+            msg.pose.pose.orientation.x = qx;
+            msg.pose.pose.orientation.y = qy;
+            msg.pose.pose.orientation.z = qz;
+            msg.pose.pose.orientation.w = qw;
+            msg.twist.twist.linear.x = lvx;
+            msg.twist.twist.linear.y = lvy;
+            msg.twist.twist.linear.z = lvz;
+            msg.twist.twist.angular.x = avx;
+            msg.twist.twist.angular.y = avy;
+            msg.twist.twist.angular.z = avz;
+            let r = odom_pub.publish(&msg).map_err(|e| format!("{}", e));
+            let _ = reply.send(r);
+        }
+        BridgeCommand::PublishPointCloud {
+            frame_id, data, point_count, point_step, reply
+        } => {
+            let mut msg = r2r::sensor_msgs::msg::PointCloud2::default();
+            msg.header.frame_id = frame_id;
+            msg.height = 1;
+            msg.width = point_count;
+            msg.point_step = point_step;
+            msg.row_step = point_step * point_count;
+            msg.is_dense = true;
+            msg.data = data;
+            let r = pc_pub.publish(&msg).map_err(|e| format!("{}", e));
+            let _ = reply.send(r);
+        }
+        BridgeCommand::SendNavGoal {
+            x, y, z, qx, qy, qz, qw, reply
+        } => {
+            let goal_id = uuid::Uuid::new_v4().to_string();
+            let mut goal = r2r::nav2_msgs::action::NavigateToPose::Goal::default();
+            goal.pose.header.frame_id = "map".to_string();
+            goal.pose.pose.position.x = x;
+            goal.pose.pose.position.y = y;
+            goal.pose.pose.position.z = z;
+            goal.pose.pose.orientation.x = qx;
+            goal.pose.pose.orientation.y = qy;
+            goal.pose.pose.orientation.z = qz;
+            goal.pose.pose.orientation.w = qw;
+
+            let state_for_nav = state.clone();
+            let gid = goal_id.clone();
+            match nav_client.send_goal_request(goal) {
+                Ok(fut) => {
+                    {
+                        let mut s = state_for_nav.write().await;
+                        s.nav_state.status = "NAVIGATING".into();
+                        s.nav_state.message = format!("导航到 ({:.3}, {:.3})", x, y);
+                        s.nav_state.goal_id = gid.clone();
+                    }
+                    info!("发送导航目标: ({:.3}, {:.3}, {:.3}) goal_id={}", x, y, z, gid);
+                    let _ = reply.send(Ok(gid.clone()));
+                    tokio::task::spawn_local(async move {
+                        match fut.await {
+                            Ok((_goal_handle, result_fut)) => {
+                                match result_fut.await {
+                                    Ok((_status, _result)) => {
+                                        let mut s = state_for_nav.write().await;
+                                        s.nav_state.status = "SUCCEEDED".into();
+                                        s.nav_state.message = "导航完成".into();
+                                    }
+                                    Err(e) => {
+                                        let mut s = state_for_nav.write().await;
+                                        s.nav_state.status = "FAILED".into();
+                                        s.nav_state.message = format!("导航失败: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let mut s = state_for_nav.write().await;
+                                s.nav_state.status = "REJECTED".into();
+                                s.nav_state.message = format!("目标被拒绝: {}", e);
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(format!("发送目标失败: {}", e)));
+                }
+            }
+        }
+        BridgeCommand::CancelNav { reply } => {
+            {
+                let mut s = state.write().await;
+                s.nav_state.status = "IDLE".into();
+                s.nav_state.message = "导航已取消".into();
+            }
+            info!("导航已取消");
+            let _ = reply.send(Ok(()));
         }
     }
 }

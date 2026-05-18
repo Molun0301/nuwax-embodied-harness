@@ -1,0 +1,137 @@
+syntax = "proto3";
+package nuwax.geometry;
+
+message Empty {}
+message Vec3 { double x = 1; double y = 2; double z = 3; }
+message Quat { double x = 1; double y = 2; double z = 3; double w = 4; }
+message Pose {
+  Vec3 position = 1;
+  Quat orientation = 2;
+  string frame_id = 3;
+  uint64 timestamp_ns = 4;
+}
+message Transform {
+  string parent_frame = 1;
+  string child_frame = 2;
+  Vec3 translation = 3;
+  Quat rotation = 4;
+  uint64 timestamp_ns = 5;
+}
+message FrameTree { repeated Transform transforms = 1; }
+message ShmRef {
+  string key = 1;
+  uint64 size = 2;
+  uint64 revision = 3;
+}
+
+message StartRequest { string config_json = 1; }
+message StartResult { bool success = 1; string message = 2; }
+message StopRequest {}
+message StopResult { bool success = 1; }
+message RuntimeStatus {
+  string phase = 1;
+  string message = 2;
+  uint64 uptime_ms = 3;
+  uint32 rss_kb = 4;
+}
+
+message PoseRequest { string target_frame = 1; string source_frame = 2; }
+message PoseUpdate { Pose pose = 1; uint64 sequence = 2; }
+
+message OccupancyGridMeta {
+  uint32 width = 1;
+  uint32 height = 2;
+  float resolution = 3;
+  double origin_x = 4;
+  double origin_y = 5;
+  string frame_id = 6;
+  uint64 revision = 7;
+  uint64 timestamp_ns = 8;
+}
+message MapUpdateNotification {
+  OccupancyGridMeta meta = 1;
+  ShmRef shm_ref = 2;
+}
+
+// === 导航 ===
+message NavigationGoal {
+  Pose target_pose = 1;
+  string behavior_tree = 2;
+}
+message NavigationAck {
+  bool accepted = 1;
+  string goal_id = 2;
+  string message = 3;
+}
+message CancelResult { bool success = 1; string message = 2; }
+message NavigationStateUpdate {
+  string status = 1;
+  string message = 2;
+  Pose current_pose = 3;
+  float distance_remaining = 4;
+  string goal_id = 5;
+  uint64 timestamp_ns = 6;
+}
+message Nav2Readiness {
+  bool ready = 1;
+  string waiting_for = 2;
+  string message = 3;
+  bool action_server_ready = 4;
+  bool tf_ready = 5;
+  map<string, string> lifecycle_states = 6;
+  map<string, string> errors = 7;
+}
+
+// === 探索 ===
+message Frontier {
+  Vec3 centroid = 1;
+  uint32 size = 2;
+  float cost = 3;
+}
+message FrontierList { repeated Frontier frontiers = 1; uint64 timestamp_ns = 2; }
+message FrontierUpdate { FrontierList frontiers = 1; uint64 sequence = 2; }
+
+// === 输入桥 ===
+message OdomInput {
+  Pose pose = 1;
+  Vec3 linear_velocity = 2;
+  Vec3 angular_velocity = 3;
+}
+message PointCloudShmRef {
+  ShmRef shm_ref = 1;
+  string frame_id = 2;
+  uint32 point_count = 3;
+  uint32 point_step = 4;
+}
+
+// === 服务定义 ===
+service GeometryRuntime {
+  // 控制面
+  rpc Start(StartRequest) returns (StartResult);
+  rpc Stop(StopRequest) returns (StopResult);
+  rpc GetStatus(Empty) returns (RuntimeStatus);
+
+  // 定位
+  rpc GetCurrentPose(PoseRequest) returns (Pose);
+  rpc SubscribePose(PoseRequest) returns (stream PoseUpdate);
+  rpc GetFrameTree(Empty) returns (FrameTree);
+
+  // 地图
+  rpc GetOccupancyGrid(Empty) returns (OccupancyGridMeta);
+  rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
+  rpc GetOccupancyGridShm(Empty) returns (ShmRef);
+
+  // 导航
+  rpc SetNavigationGoal(NavigationGoal) returns (NavigationAck);
+  rpc CancelNavigation(Empty) returns (CancelResult);
+  rpc SubscribeNavigationState(Empty) returns (stream NavigationStateUpdate);
+  rpc GetNavigationReadiness(Empty) returns (Nav2Readiness);
+
+  // 探索
+  rpc GetFrontiers(Empty) returns (FrontierList);
+  rpc SubscribeFrontiers(Empty) returns (stream FrontierUpdate);
+
+  // 输入桥（网关 → ROS）
+  rpc PublishOdom(OdomInput) returns (Empty);
+  rpc PublishPointCloud(PointCloudShmRef) returns (Empty);
+}

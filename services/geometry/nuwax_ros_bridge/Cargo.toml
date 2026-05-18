@@ -1,0 +1,33 @@
+[package]
+name = "nuwax-ros-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "nuwax 平台几何 ROS2 桥接子进程（独立于 Python 网关）"
+
+[dependencies]
+r2r = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+memmap2 = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[[bin]]
+name = "nuwax-ros-bridge"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

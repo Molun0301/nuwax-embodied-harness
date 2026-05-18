@@ -20,15 +20,16 @@ import logging
 import os
 from pathlib import Path
 import threading
-from typing import Deque, Dict, Iterator, Tuple
+from typing import Deque, Dict, Iterator, Optional, Tuple
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows 环境不提供 fcntl
     fcntl = None
 
-from logging_utils import build_default_formatter
+from logging_utils import DropPatternLogFilter, build_default_formatter
 from contracts.geometry_runtime import (
+    ExternalGeometryStackConfig,
     GeometryFrameConfig,
     GeometryOdometryQualityConfig,
     GeometryPointCloudPreprocessConfig,
@@ -39,6 +40,7 @@ from contracts.geometry_runtime import (
     PlatformGeometryConfig,
     RtabmapConfig,
     RtabmapOutputConfig,
+    build_default_external_slam_nav2_script,
     build_default_geometry_setup_script,
     build_default_rtabmap_database_root,
     build_default_rtabmap_pcd_root,
@@ -134,6 +136,52 @@ def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
         if item:
             items.append(item)
     return tuple(items)
+
+
+_DEPRECATION_LOGGER = logging.getLogger("nuwax_robot_bridge.settings.deprecation")
+_DEPRECATED_ENV_NOTIFIED: set[str] = set()
+
+
+def _notify_deprecated_env(legacy_name: str, preferred_name: str) -> None:
+    if legacy_name in _DEPRECATED_ENV_NOTIFIED:
+        return
+    _DEPRECATED_ENV_NOTIFIED.add(legacy_name)
+    _DEPRECATION_LOGGER.warning(
+        "环境变量 %s 已重命名为 %s，旧名仍兼容但下一轮治理会删除，请尽快迁移。",
+        legacy_name,
+        preferred_name,
+    )
+
+
+def _resolve_alias_env_value(preferred_name: str, legacy_name: str) -> Optional[str]:
+    """优先返回新 env 名的原值；新名缺省、老名有值时打 deprecation 提示并返回老名值。"""
+
+    preferred_raw = _raw_value(preferred_name, "")
+    if preferred_raw.strip():
+        return preferred_raw
+    legacy_raw = _raw_value(legacy_name, "")
+    if legacy_raw.strip():
+        _notify_deprecated_env(legacy_name, preferred_name)
+        return legacy_raw
+    return None
+
+
+def _cfg_str_alias(preferred_name: str, legacy_name: str, default: str = "") -> str:
+    raw = _resolve_alias_env_value(preferred_name, legacy_name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return value if value else default
+
+
+def _cfg_bool_alias(preferred_name: str, legacy_name: str, default: bool) -> bool:
+    raw = _resolve_alias_env_value(preferred_name, legacy_name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if not value:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
 
 
 def _clamp_volume(value: float) -> float:
@@ -297,7 +345,7 @@ class PerceptionYoloWorldConfig:
 
     enabled: bool = True
     backend_name: str = "yolo_world"
-    model_name: str = str(BASE_DIR / "runtime_data" / "models" / "yolov8s-world.pt")
+    model_name: str = str(BASE_DIR / "runtime_data" / "models" / "yolov8s-worldv2.pt")
     runtime_preference: str = "pytorch"
     engine_path: str = ""
     device: str = ""
@@ -423,6 +471,13 @@ class PerceptionStreamRuntimeConfig:
 
 
 @dataclass
+class VideoIngestConfig:
+    """端侧视频推流接收配置。"""
+
+    max_frame_age_sec: float = 2.0
+
+
+@dataclass
 class PerceptionConfig:
     """统一视觉感知配置。"""
 
@@ -434,6 +489,7 @@ class PerceptionConfig:
     openai_vision: PerceptionOpenAIVisionConfig = field(default_factory=PerceptionOpenAIVisionConfig)
     segmentation: PerceptionSegmentationConfig = field(default_factory=PerceptionSegmentationConfig)
     stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
+    video_ingest: VideoIngestConfig = field(default_factory=VideoIngestConfig)
 
 
 @dataclass
@@ -450,7 +506,7 @@ class RuntimeDataConfig:
     memory_history_limit: int = 200
     map_catalog_root: str = ""
     map_auto_create_library: bool = True
-    map_active_restore_on_start: bool = False
+    map_active_restore_on_start: bool = True
     map_delete_also_delete_library: bool = False
     memory_db_path: str = ""
     memory_embedding_model: str = DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL
@@ -642,7 +698,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             backend_name=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_BACKEND_NAME", "yolo_world"),
             model_name=_cfg_str(
                 "NUWAX_PERCEPTION_YOLO_WORLD_MODEL",
-                str(BASE_DIR / "runtime_data" / "models" / "yolov8s-world.pt"),
+                str(BASE_DIR / "runtime_data" / "models" / "yolov8s-worldv2.pt"),
             ),
             runtime_preference=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME", "pytorch"),
             engine_path=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH", ""),
@@ -750,27 +806,25 @@ def load_config() -> NuwaxRobotBridgeConfig:
             burst_frame_count=max(1, _cfg_int("NUWAX_PERCEPTION_BURST_FRAME_COUNT", 4)),
             burst_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_BURST_INTERVAL_SEC", 0.08)),
         ),
+        video_ingest=VideoIngestConfig(
+            max_frame_age_sec=max(0.1, _cfg_float("NUWAX_VIDEO_INGEST_MAX_FRAME_AGE_SEC", 2.0)),
+        ),
     )
+
+    external_input_bridge_enabled = _cfg_bool("NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED", False)
 
     geometry = PlatformGeometryConfig(
         enabled=_cfg_bool("NUWAX_GEOMETRY_ENABLED", True),
-        stack=_cfg_str("NUWAX_GEOMETRY_STACK", "rtabmap_nav2"),
+        stack=_cfg_str("NUWAX_GEOMETRY_STACK", "external_slam_nav2"),
         require_ros2=_cfg_bool("NUWAX_GEOMETRY_REQUIRE_ROS2", True),
         setup_script=_cfg_str("NUWAX_GEOMETRY_SETUP_SCRIPT", build_default_geometry_setup_script()),
         cyclonedds_lib_dir=_cfg_str("NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR", ""),
         dds_iface=_cfg_str("NUWAX_GEOMETRY_DDS_IFACE", ""),
         topics=GeometryTopicsConfig(
-            odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/nuwax/geometry/odom"),
-            secondary_odom_topics=_cfg_csv(
-                "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS",
-                (
-                    "/uslam/localization/odom",
-                    "/lio_sam_ros2/mapping/odometry",
-                    "/odom_lio",
-                ),
-            ),
+            odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/odom"),
+            secondary_odom_topics=_cfg_csv("NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS", ()),
             imu_topic=_cfg_str("NUWAX_GEOMETRY_IMU_TOPIC", "/utlidar/imu"),
-            point_cloud_topic=_cfg_str("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud"),
+            point_cloud_topic=_cfg_str("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud_deskewed"),
             tf_topic=_cfg_str("NUWAX_GEOMETRY_TF_TOPIC", "/tf"),
             tf_static_topic=_cfg_str("NUWAX_GEOMETRY_TF_STATIC_TOPIC", "/tf_static"),
             occupancy_topic=_cfg_str("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
@@ -779,21 +833,21 @@ def load_config() -> NuwaxRobotBridgeConfig:
         frames=GeometryFrameConfig(
             map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "map"),
             odom_frame=_cfg_str("NUWAX_GEOMETRY_ODOM_FRAME", "odom"),
-            base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "body"),
+            base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "base_footprint"),
             lidar_frame=_cfg_str("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),
             imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
         rtabmap=RtabmapConfig(
-            profile_name=_cfg_str("NUWAX_RTABMAP_PROFILE_NAME", "rtabmap_nav2"),
-            profile_enabled=_cfg_bool("NUWAX_RTABMAP_PROFILE_ENABLED", True),
-            default_profile=_cfg_bool("NUWAX_RTABMAP_DEFAULT_PROFILE", True),
-            database_root=_cfg_str("NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
-            pcd_root=_cfg_str("NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()),
-            launch_package=_cfg_str("NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_ros"),
-            launch_file=_cfg_str("NUWAX_RTABMAP_LAUNCH_FILE", "rtabmap.launch.py"),
-            occupancy_projection=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
-            input_contract=_cfg_str("NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"),
-            output_contract=_cfg_str("NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
+            profile_name=_cfg_str_alias("NUWAX_BACKEND_PROFILE_NAME", "NUWAX_RTABMAP_PROFILE_NAME", "external_slam_nav2"),
+            profile_enabled=_cfg_bool_alias("NUWAX_BACKEND_PROFILE_ENABLED", "NUWAX_RTABMAP_PROFILE_ENABLED", True),
+            default_profile=_cfg_bool_alias("NUWAX_BACKEND_DEFAULT_PROFILE", "NUWAX_RTABMAP_DEFAULT_PROFILE", True),
+            database_root=_cfg_str_alias("NUWAX_BACKEND_DATABASE_ROOT", "NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
+            pcd_root=_cfg_str_alias("NUWAX_BACKEND_PCD_ROOT", "NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()),
+            launch_package=_cfg_str_alias("NUWAX_BACKEND_LAUNCH_PACKAGE", "NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_ros"),
+            launch_file=_cfg_str_alias("NUWAX_BACKEND_LAUNCH_FILE", "NUWAX_RTABMAP_LAUNCH_FILE", "rtabmap.launch.py"),
+            occupancy_projection=_cfg_str_alias("NUWAX_BACKEND_OCCUPANCY_PROJECTION", "NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
+            input_contract=_cfg_str_alias("NUWAX_BACKEND_INPUT_CONTRACT", "NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"),
+            output_contract=_cfg_str_alias("NUWAX_BACKEND_OUTPUT_CONTRACT", "NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
             timestamp_quality=GeometryTimestampQualityConfig(
                 source=_cfg_str("NUWAX_GEOMETRY_TIMESTAMP_SOURCE", "sensor_header"),
                 max_point_cloud_age_sec=max(0.0, _cfg_float("NUWAX_GEOMETRY_POINT_CLOUD_MAX_AGE_SEC", 0.5)),
@@ -828,29 +882,42 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 output_layer=_cfg_str("NUWAX_GEOMETRY_TRAVERSABILITY_OUTPUT_LAYER", "traversability"),
             ),
             outputs=RtabmapOutputConfig(
-                database_asset_name=_cfg_str("NUWAX_RTABMAP_DATABASE_ASSET_NAME", "rtabmap.db"),
-                pcd_asset_name=_cfg_str("NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"),
-                occupancy_layer=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"),
-                costmap_layer=_cfg_str("NUWAX_RTABMAP_COSTMAP_LAYER", "nav2_global_costmap"),
-                traversability_layer=_cfg_str("NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"),
-                localization_status=_cfg_str("NUWAX_RTABMAP_LOCALIZATION_STATUS", "rtabmap_localization"),
-                relocalization_diagnostics=_cfg_str("NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "rtabmap_icp"),
+                database_asset_name=_cfg_str_alias("NUWAX_BACKEND_DATABASE_ASSET_NAME", "NUWAX_RTABMAP_DATABASE_ASSET_NAME", "external_slam_nav2_state.db"),
+                pcd_asset_name=_cfg_str_alias("NUWAX_BACKEND_PCD_ASSET_NAME", "NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"),
+                occupancy_layer=_cfg_str_alias("NUWAX_BACKEND_OCCUPANCY_LAYER", "NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"),
+                costmap_layer=_cfg_str_alias("NUWAX_BACKEND_COSTMAP_LAYER", "NUWAX_RTABMAP_COSTMAP_LAYER", "nav2_global_costmap"),
+                traversability_layer=_cfg_str_alias("NUWAX_BACKEND_TRAVERSABILITY_LAYER", "NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"),
+                localization_status=_cfg_str_alias("NUWAX_BACKEND_LOCALIZATION_STATUS", "NUWAX_RTABMAP_LOCALIZATION_STATUS", "rtabmap_localization"),
+                relocalization_diagnostics=_cfg_str_alias("NUWAX_BACKEND_RELOCALIZATION_DIAGNOSTICS", "NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "rtabmap_icp"),
             ),
         ),
         nav2=Nav2Config(
-            mode=_cfg_str("NUWAX_NAV2_MODE", "sidecar"),
+            mode=_cfg_str("NUWAX_NAV2_MODE", "external"),
             action_name=_cfg_str("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
             launch_package=_cfg_str("NUWAX_NAV2_LAUNCH_PACKAGE", "nav2_bringup"),
             launch_file=_cfg_str("NUWAX_NAV2_LAUNCH_FILE", "navigation_launch.py"),
             global_costmap_topic=_cfg_str("NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC", "/global_costmap/costmap"),
             local_costmap_topic=_cfg_str("NUWAX_NAV2_LOCAL_COSTMAP_TOPIC", "/local_costmap/costmap"),
             costmap_source=_cfg_str("NUWAX_NAV2_COSTMAP_SOURCE", "nav2_global"),
-            cmd_vel_topic=_cfg_str("NUWAX_NAV2_CMD_VEL_TOPIC", "/cmd_vel"),
-            cmd_vel_timeout_sec=max(0.1, _cfg_float("NUWAX_NAV2_CMD_VEL_TIMEOUT_SEC", 0.6)),
             map_yaml=_cfg_str("NUWAX_NAV2_MAP_YAML", ""),
             params_file=_cfg_str("NUWAX_NAV2_PARAMS_FILE", ""),
             use_sim_time=_cfg_bool("NUWAX_NAV2_USE_SIM_TIME", False),
             autostart=_cfg_bool("NUWAX_NAV2_AUTOSTART", True),
+        ),
+        external=ExternalGeometryStackConfig(
+            enabled=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_ENABLED", True),
+            script_path=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_SCRIPT", build_default_external_slam_nav2_script()),
+            args=_cfg_csv("NUWAX_GEOMETRY_EXTERNAL_ARGS", ("--no-rviz",)),
+            process_name=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME", "external_slam_nav2"),
+            log_name=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_LOG_NAME", "external_slam_nav2.log"),
+            provides_map=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_MAP", True),
+            provides_nav2=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAV2", True),
+            provides_tf=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_TF", True),
+            input_bridge_enabled=external_input_bridge_enabled,
+            point_cloud_bridge_enabled=_cfg_bool(
+                "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED",
+                external_input_bridge_enabled,
+            ),
         ),
     )
 
@@ -914,7 +981,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             str(BASE_DIR / "runtime_data" / "maps"),
         ),
         map_auto_create_library=_cfg_bool("NUWAX_MAP_AUTO_CREATE_LIBRARY", True),
-        map_active_restore_on_start=_cfg_bool("NUWAX_ACTIVE_MAP_RESTORE_ON_START", False),
+        map_active_restore_on_start=_cfg_bool("NUWAX_ACTIVE_MAP_RESTORE_ON_START", True),
         map_delete_also_delete_library=_cfg_bool("NUWAX_MAP_DELETE_ALSO_DELETE_LIBRARY", False),
         memory_db_path=_cfg_str(
             "NUWAX_MEMORY_DB_PATH",
@@ -992,38 +1059,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
         volume=volume,
         perception=perception,
     )
-
-
-class _NoisyLogFilter(logging.Filter):
-    """过滤第三方库的高频低价值日志，避免运行日志爆量。"""
-
-    _DROP_PATTERNS = (
-        "Received message on data channel:",
-        "> message sent:",
-        "Heartbeat response received.",
-        "Creating offer...",
-        "Trying to send SDP using the old method...",
-        "An error occurred with the old method:",
-        "Data channel closed",
-    )
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            message = record.getMessage()
-        except Exception:
-            return True
-
-        for pattern in self._DROP_PATTERNS:
-            if pattern in message:
-                return False
-
-        if "HTTPConnectionPool(" in message and "/offer" in message and "Connection refused" in message:
-            return False
-
-        if "MediaStreamError" in message and "AsyncIOEventEmitter" in message:
-            return False
-
-        return True
 
 
 class _LineLimitedFileHandler(logging.FileHandler):
@@ -1154,12 +1189,15 @@ def _configure_third_party_logger_levels() -> None:
     ):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
-    # Uvicorn（ASGI 服务器）默认会挂自己的 handler。
-    # 这里统一改成向根日志传播，确保文件日志和控制台日志口径一致。
-    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for logger_name in ("uvicorn", "uvicorn.error"):
         logger = logging.getLogger(logger_name)
         logger.handlers = []
         logger.propagate = True
+
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.handlers = []
+    access_logger.propagate = False
+    access_logger.disabled = True
 
 
 def configure_logging(config: LoggingConfig) -> None:
@@ -1168,7 +1206,7 @@ def configure_logging(config: LoggingConfig) -> None:
     Path(config.log_dir).mkdir(parents=True, exist_ok=True)
     level_name = (config.level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    noisy_filter = _NoisyLogFilter()
+    noisy_filter = DropPatternLogFilter()
     formatter = build_default_formatter()
 
     file_handler = _LineLimitedFileHandler(

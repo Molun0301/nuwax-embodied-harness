@@ -318,6 +318,20 @@ def resolve_detection_provider_spec(
                 "capabilities": _capabilities(detect=True),
             },
         )
+    if requested_kind.startswith("ultralytics_yolo") and "world" not in requested_kind:
+        return ModelProviderSpec(
+            capability="detection",
+            provider_kind="local",
+            provider_name="ultralytics_yolo",
+            model_name=normalized_model,
+            backend_name=requested_backend,
+            metadata={
+                **base_metadata,
+                "resolved_provider_name": "ultralytics_yolo",
+                "resolved_backend": requested_backend,
+                "capabilities": _capabilities(detect=True),
+            },
+        )
     if "yolo_world" in requested_kind or requested_kind in {"yoloworld", "ultralytics_yolo_world"}:
         return ModelProviderSpec(
             capability="detection",

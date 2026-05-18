@@ -5,6 +5,7 @@ import heapq
 import math
 from typing import List, Optional, Sequence, Tuple, TYPE_CHECKING
 
+import cv2
 import numpy as np
 
 from contracts.frame_semantics import frame_ids_semantically_equal
@@ -373,22 +374,9 @@ class GridNavigationPlanner:
         if radius_m <= 1e-6 or not np.any(blocked):
             return blocked.copy()
         radius_cells = max(1, int(math.ceil(radius_m / max(1e-6, resolution_m))))
-        offsets: List[Tuple[int, int]] = []
-        for row_offset in range(-radius_cells, radius_cells + 1):
-            for col_offset in range(-radius_cells, radius_cells + 1):
-                if math.hypot(float(row_offset), float(col_offset)) <= float(radius_cells) + 1e-6:
-                    offsets.append((row_offset, col_offset))
-
-        height, width = blocked.shape
-        inflated = blocked.copy()
-        occupied_rows, occupied_cols = np.where(blocked)
-        for row, col in zip(occupied_rows.tolist(), occupied_cols.tolist()):
-            for row_offset, col_offset in offsets:
-                next_row = row + row_offset
-                next_col = col + col_offset
-                if 0 <= next_row < height and 0 <= next_col < width:
-                    inflated[next_row, next_col] = True
-        return inflated
+        kernel_size = 2 * radius_cells + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        return cv2.dilate(blocked.astype(np.uint8), kernel).astype(bool)
 
     def _search_radius_cells(self, planning_map: _PlanningMap) -> int:
         search_radius_m = max(

@@ -23,7 +23,7 @@ from settings import RelayServerConfig
 
 
 RELAY_LOGGER = logging.getLogger("nuwax_robot_bridge.relay")
-_LOW_VALUE_RELAY_PATHS = frozenset(("/relay/health", "/events/stream", "/streams/sse"))
+_LOW_VALUE_RELAY_PATHS = frozenset(("/relay/health", "/events/stream", "/streams/sse", "/streams/video.mjpeg"))
 _RELAY_REQUEST_LOG_RATE_LIMIT_SEC = 30.0
 
 
@@ -170,6 +170,10 @@ def create_relay_app(
     @app.get("/streams/sse")
     async def relay_streams_sse(request: Request) -> Response:
         return await _forward_request(app, request, "/streams/sse", stream=True)
+
+    @app.get("/streams/video.mjpeg")
+    async def relay_streams_video_mjpeg(request: Request) -> Response:
+        return await _forward_request(app, request, "/streams/video.mjpeg", stream=True)
 
     @app.websocket("/streams/ws")
     async def relay_streams_ws(websocket: WebSocket) -> None:

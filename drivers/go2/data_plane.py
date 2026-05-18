@@ -120,11 +120,9 @@ def _load_go2_official_sdk_modules(
         }
         if include_dds_topics:
             channel_module = importlib.import_module("unitree_sdk2py.core.channel")
+            unitree_go_dds_module = importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_")
             modules["ChannelSubscriber"] = getattr(channel_module, "ChannelSubscriber")
-            modules["SportModeState"] = getattr(
-                importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_"),
-                "SportModeState_",
-            )
+            modules["SportModeState"] = getattr(unitree_go_dds_module, "SportModeState_")
             modules["DirectPointCloud2"] = getattr(
                 importlib.import_module("unitree_sdk2py.idl.sensor_msgs.msg.dds_"),
                 "PointCloud2_",
@@ -290,12 +288,13 @@ class RclpyGo2RosBridge:
             return
 
         self._direct_dds_stop_event.clear()
-        self._direct_dds_threads = [
+        threads: List[threading.Thread] = [
             threading.Thread(target=self._direct_pose_reader_loop, name="go2_direct_pose_reader", daemon=True),
             threading.Thread(target=self._direct_point_cloud_reader_loop, name="go2_direct_point_cloud_reader", daemon=True),
             threading.Thread(target=self._direct_point_cloud_worker_loop, name="go2_direct_point_cloud_worker", daemon=True),
             threading.Thread(target=self._direct_point_cloud_dispatch_loop, name="go2_direct_point_cloud_dispatch", daemon=True),
         ]
+        self._direct_dds_threads = threads
         for thread in self._direct_dds_threads:
             thread.start()
         self._direct_dds_started = True
@@ -481,8 +480,14 @@ class RclpyGo2RosBridge:
         position = list(getattr(message, "position", [0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0])
         while len(position) < 3:
             position.append(0.0)
+        expected_odom_frame = str(getattr(self.config, "expected_odom_frame", "") or "").strip()
+        if not expected_odom_frame:
+            raise ValueError(
+                "Go2DataPlaneConfig.expected_odom_frame 必须由 PlatformGeometryConfig.frames.odom_frame 注入；"
+                "禁止使用硬编码兜底字符串。"
+            )
         return Pose(
-            frame_id="odom",
+            frame_id=expected_odom_frame,
             position=Vector3(x=float(position[0]), y=float(position[1]), z=float(position[2])),
             orientation=quaternion,
         )

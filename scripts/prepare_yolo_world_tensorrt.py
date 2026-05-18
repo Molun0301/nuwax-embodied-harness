@@ -7,10 +7,98 @@ import subprocess
 import tempfile
 from typing import Iterable, List, Optional, Tuple
 import urllib.request
+import zipfile
 
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_RELEASE = "v8.4.0"
 DEFAULT_REPO = "ultralytics/assets"
+DEFAULT_CALIBRATION_ROOT = PROJECT_ROOT / "runtime_data" / "calibration" / "yolo_world"
+COCO8_URL = "https://github.com/ultralytics/assets/releases/download/v0.0.0/coco8.zip"
+COCO_VAL2017_URL = "http://images.cocodataset.org/zips/val2017.zip"
+COCO_CLASSES = (
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
+)
 DEFAULT_CLASSES = (
     "person",
     "door",
@@ -35,16 +123,16 @@ DEFAULT_CLASSES = (
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数。"""
 
-    parser = argparse.ArgumentParser(description="一键准备 YOLO-World 权重并导出 TensorRT INT8 引擎。")
-    parser.add_argument("--model", default="yolov8s-world.pt", help="模型名或本地权重路径。")
+    parser = argparse.ArgumentParser(description="一键准备 YOLO-Worldv2 权重并导出 TensorRT engine。")
+    parser.add_argument("--model", default="yolov8s-worldv2.pt", help="模型名或本地权重路径。")
     parser.add_argument(
         "--weights-output",
-        default="runtime_data/models/yolov8s-world.pt",
+        default="runtime_data/models/yolov8s-worldv2.pt",
         help="权重输出路径。",
     )
     parser.add_argument(
         "--engine-output",
-        default="runtime_data/models/yolov8s-world-int8.engine",
+        default="runtime_data/models/yolov8s-worldv2.engine",
         help="TensorRT engine 输出路径。",
     )
     parser.add_argument("--release", default=DEFAULT_RELEASE, help="Ultralytics assets release 版本。")
@@ -57,14 +145,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch", type=int, default=1, help="导出 batch 大小。")
     parser.add_argument("--workspace", type=float, default=None, help="TensorRT workspace，单位 GiB。")
     parser.add_argument("--dynamic", action="store_true", help="导出 dynamic shape engine。")
+    parser.add_argument("--simplify", action="store_true", default=False, help="启用 ONNX simplification。Jetson 默认关闭，避免触发 onnxruntime-gpu 自动安装。")
     parser.add_argument("--half", action="store_true", default=True, help="启用 FP16。")
     parser.add_argument("--no-half", action="store_false", dest="half", help="关闭 FP16。")
-    parser.add_argument("--int8", action="store_true", default=True, help="启用 INT8 量化。")
+    parser.add_argument("--int8", action="store_true", default=False, help="启用 INT8 量化。")
     parser.add_argument("--no-int8", action="store_false", dest="int8", help="关闭 INT8，只导出 FP16/FP32 engine。")
     parser.add_argument(
         "--calib-data",
-        default="coco8.yaml",
-        help="INT8 校准数据集 YAML。生产环境建议换成现场采集数据。",
+        default="",
+        help="INT8 校准数据集 YAML。为空时按 --calib-preset 准备校准数据。",
+    )
+    parser.add_argument(
+        "--calib-preset",
+        choices=("none", "coco8", "coco-val2017"),
+        default="coco8",
+        help="INT8 校准数据预设。coco8 轻量验证，coco-val2017 更适合通用 COCO 校准。",
+    )
+    parser.add_argument(
+        "--calib-root",
+        default=str(DEFAULT_CALIBRATION_ROOT),
+        help="自动下载校准数据的保存目录。",
     )
     parser.add_argument("--calib-images", default="", help="根据图片目录临时生成 INT8 校准 YAML。")
     parser.add_argument("--calib-fraction", type=float, default=1.0, help="INT8 校准数据使用比例。")
@@ -72,10 +172,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _normalize_path(value: str) -> Path:
+def _normalize_path(value: str, *, base_dir: Path = PROJECT_ROOT) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
+        path = (base_dir / path).resolve()
     return path
 
 
@@ -134,24 +234,24 @@ def _download_with_urllib(url: str, target: Path, timeout_sec: float) -> bool:
     return True
 
 
-def _materialize_temp_file(source: Path) -> Path:
-    temp_file = tempfile.NamedTemporaryFile(prefix="nuwax_yolo_world_weights_", suffix=".pt", delete=False)
+def _materialize_temp_file(source: Path, *, prefix: str, suffix: str) -> Path:
+    temp_file = tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False)
     temp_file.close()
     target = Path(temp_file.name)
     shutil.copy2(str(source), str(target))
     return target
 
 
-def _download_to_temp(urls: Iterable[str], timeout_sec: float) -> Optional[Path]:
+def _download_to_temp(urls: Iterable[str], timeout_sec: float, *, suffix: str) -> Optional[Path]:
     with tempfile.TemporaryDirectory(prefix="nuwax_yolo_world_download_") as temp_dir:
-        temp_path = Path(temp_dir) / "weights.pt"
+        temp_path = Path(temp_dir) / ("download" + suffix)
         for url in urls:
             if _download_with_wget(url, temp_path, timeout_sec) and temp_path.exists() and temp_path.stat().st_size > 0:
-                return _materialize_temp_file(temp_path)
+                return _materialize_temp_file(temp_path, prefix="nuwax_yolo_world_download_", suffix=suffix)
             if _download_with_curl(url, temp_path, timeout_sec) and temp_path.exists() and temp_path.stat().st_size > 0:
-                return _materialize_temp_file(temp_path)
+                return _materialize_temp_file(temp_path, prefix="nuwax_yolo_world_download_", suffix=suffix)
             if _download_with_urllib(url, temp_path, timeout_sec) and temp_path.exists() and temp_path.stat().st_size > 0:
-                return _materialize_temp_file(temp_path)
+                return _materialize_temp_file(temp_path, prefix="nuwax_yolo_world_download_", suffix=suffix)
     return None
 
 
@@ -161,6 +261,11 @@ def _ensure_min_bytes(path: Path, min_bytes: int = 100_000) -> None:
     size = path.stat().st_size
     if size < min_bytes:
         raise SystemExit("文件大小异常，可能未下载完成：%s (%d bytes)" % (path, size))
+
+
+def _is_original_yolo_world_weight(path: Path) -> bool:
+    name = path.name.lower()
+    return name.startswith("yolov8") and name.endswith("-world.pt") and "worldv2" not in name
 
 
 def _prepare_weights(args: argparse.Namespace) -> Path:
@@ -178,6 +283,7 @@ def _prepare_weights(args: argparse.Namespace) -> Path:
         temp_download = _download_to_temp(
             _iter_candidate_urls(args.model, args.release, args.download_url),
             timeout_sec=max(1.0, float(args.download_timeout_sec)),
+            suffix=".pt",
         )
         if temp_download is None:
             raise SystemExit("未能自动下载 YOLO-World 权重。请使用 --download-url 或先手工放置权重。")
@@ -192,17 +298,86 @@ def _prepare_weights(args: argparse.Namespace) -> Path:
     return output_path
 
 
-def _write_calibration_yaml(image_dir: str, output_dir: Path, classes: Tuple[str, ...]) -> Path:
-    image_path = _normalize_path(image_dir)
+def _write_calibration_yaml(
+    image_dir: str,
+    output_dir: Path,
+    classes: Tuple[str, ...],
+    *,
+    yaml_name: str = "yolo_world_int8_calibration.yaml",
+) -> Path:
+    image_path = _normalize_path(image_dir, base_dir=Path.cwd())
     if not image_path.exists() or not image_path.is_dir():
         raise SystemExit("INT8 校准图片目录不存在：%s" % image_path)
-    yaml_path = output_dir / "yolo_world_int8_calibration.yaml"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    yaml_path = output_dir / yaml_name
     names = "\n".join("  %d: %s" % (index, label) for index, label in enumerate(classes or DEFAULT_CLASSES))
     yaml_path.write_text(
         "path: %s\ntrain: .\nval: .\nnames:\n%s\n" % (image_path, names),
         encoding="utf-8",
     )
     return yaml_path
+
+
+def _extract_zip(zip_path: Path, target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(target_dir)
+
+
+def _download_and_extract_zip(url: str, target_dir: Path, image_dir: Path, timeout_sec: float) -> None:
+    if image_dir.exists() and any(image_dir.iterdir()):
+        return
+    temp_zip = _download_to_temp((url,), timeout_sec=timeout_sec, suffix=".zip")
+    if temp_zip is None:
+        raise SystemExit("未能自动下载 INT8 校准数据：%s" % url)
+    try:
+        _extract_zip(temp_zip, target_dir)
+    finally:
+        if temp_zip.exists():
+            temp_zip.unlink()
+    if not image_dir.exists() or not any(image_dir.iterdir()):
+        raise SystemExit("INT8 校准数据解压后未找到图片目录：%s" % image_dir)
+
+
+def _prepare_calibration_preset(args: argparse.Namespace, output_dir: Path, classes: Tuple[str, ...]) -> str:
+    preset = str(args.calib_preset or "none").strip().lower()
+    if preset == "none":
+        return ""
+
+    root = _normalize_path(str(args.calib_root), base_dir=PROJECT_ROOT)
+    if preset == "coco8":
+        dataset_dir = root / "coco8"
+        image_dir = dataset_dir / "images" / "val"
+        _download_and_extract_zip(
+            COCO8_URL,
+            root,
+            image_dir,
+            timeout_sec=max(1.0, float(args.download_timeout_sec)),
+        )
+        return str(_write_calibration_yaml(
+            str(image_dir),
+            output_dir,
+            COCO_CLASSES,
+            yaml_name="coco8_calibration.yaml",
+        ))
+
+    if preset == "coco-val2017":
+        dataset_dir = root / "coco"
+        image_dir = dataset_dir / "val2017"
+        _download_and_extract_zip(
+            COCO_VAL2017_URL,
+            dataset_dir,
+            image_dir,
+            timeout_sec=max(1.0, float(args.download_timeout_sec)),
+        )
+        return str(_write_calibration_yaml(
+            str(image_dir),
+            output_dir,
+            COCO_CLASSES,
+            yaml_name="coco_val2017_calibration.yaml",
+        ))
+
+    raise SystemExit("未知 INT8 校准数据预设：%s" % preset)
 
 
 def _load_yolo_world_model(weights_path: Path):
@@ -217,6 +392,10 @@ def _load_yolo_world_model(weights_path: Path):
 
 
 def _export_engine(args: argparse.Namespace, weights_path: Path) -> Path:
+    if _is_original_yolo_world_weight(weights_path):
+        raise SystemExit(
+            "原版 YOLO-World 权重不支持导出 TensorRT engine，请改用 yolov8s-worldv2.pt。"
+        )
     engine_path = _normalize_path(args.engine_output)
     if engine_path.exists() and not args.overwrite:
         _ensure_min_bytes(engine_path)
@@ -238,6 +417,7 @@ def _export_engine(args: argparse.Namespace, weights_path: Path) -> Path:
         "half": bool(args.half),
         "int8": bool(args.int8),
         "dynamic": bool(args.dynamic),
+        "simplify": bool(args.simplify),
     }
     if args.device:
         export_kwargs["device"] = args.device
@@ -248,7 +428,9 @@ def _export_engine(args: argparse.Namespace, weights_path: Path) -> Path:
         if args.calib_images:
             calib_data = str(_write_calibration_yaml(args.calib_images, engine_path.parent, classes))
         if not calib_data:
-            raise SystemExit("INT8 导出需要 --calib-data 或 --calib-images。")
+            calib_data = _prepare_calibration_preset(args, engine_path.parent, classes)
+        if not calib_data:
+            raise SystemExit("INT8 导出需要 --calib-data、--calib-images 或 --calib-preset。")
         export_kwargs["data"] = calib_data
         export_kwargs["fraction"] = max(0.0, min(1.0, float(args.calib_fraction)))
 
@@ -260,7 +442,7 @@ def _export_engine(args: argparse.Namespace, weights_path: Path) -> Path:
 
     metadata_path = engine_path.with_suffix(engine_path.suffix + ".metadata.txt")
     metadata_path.write_text(
-        "weights=%s\nengine=%s\nclasses=%s\nimgsz=%s\nbatch=%s\nint8=%s\ncalib_data=%s\ncalib_fraction=%s\n"
+        "weights=%s\nengine=%s\nclasses=%s\nimgsz=%s\nbatch=%s\nint8=%s\nsimplify=%s\ncalib_data=%s\ncalib_fraction=%s\n"
         % (
             weights_path,
             engine_path,
@@ -268,6 +450,7 @@ def _export_engine(args: argparse.Namespace, weights_path: Path) -> Path:
             max(32, int(args.imgsz)),
             max(1, int(args.batch)),
             bool(args.int8),
+            bool(args.simplify),
             export_kwargs.get("data", ""),
             export_kwargs.get("fraction", ""),
         ),

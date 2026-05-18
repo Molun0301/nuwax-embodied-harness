@@ -13,6 +13,7 @@ from contracts.naming import (
     validate_frame_id,
     validate_instance_id,
     validate_navigation_candidate_id,
+    validate_navigation_trajectory_event_id,
     validate_observation_event_id,
     validate_observation_id,
     validate_scene_space_id,
@@ -445,6 +446,18 @@ class NavigationTrajectoryEvent(TimestampedContract):
     success: Optional[bool] = Field(default=None, description="执行或复核是否成功。")
     reason_code: Optional[str] = Field(default=None, description="成功或失败原因码。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("trajectory_event_id")
+    @classmethod
+    def _validate_trajectory_event_id(cls, value: str) -> str:
+        return validate_navigation_trajectory_event_id(value)
+
+    @field_validator("navigation_candidate_id")
+    @classmethod
+    def _validate_trajectory_candidate_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_navigation_candidate_id(value)
 
 
 class SemanticGraphRelation(TimestampedContract):

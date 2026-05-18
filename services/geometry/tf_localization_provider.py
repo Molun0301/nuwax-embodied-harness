@@ -6,6 +6,8 @@ import logging
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from pydantic import ValidationError
+
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
@@ -30,11 +32,24 @@ class Ros2TfLocalizationProvider:
 
     def __init__(self, config: PlatformGeometryConfig) -> None:
         self.config = config
-        self.tf_topic = str(config.topics.tf_topic or "/tf")
-        self.tf_static_topic = str(config.topics.tf_static_topic or "/tf_static")
-        self.map_frame = self._normalize_frame_id(config.frames.map_frame) or "map"
-        self.odom_frame = self._normalize_frame_id(config.frames.odom_frame) or "odom"
-        self.base_frame = self._normalize_frame_id(config.frames.base_frame) or "body"
+        tf_topic = str(config.topics.tf_topic or "").strip()
+        tf_static_topic = str(config.topics.tf_static_topic or "").strip()
+        if not tf_topic or not tf_static_topic:
+            raise ValueError(
+                "PlatformGeometryConfig.topics.tf_topic / tf_static_topic 必须显式配置，禁止使用兜底字面值。"
+            )
+        map_frame = self._normalize_frame_id(config.frames.map_frame)
+        odom_frame = self._normalize_frame_id(config.frames.odom_frame)
+        base_frame = self._normalize_frame_id(config.frames.base_frame)
+        if not map_frame or not odom_frame or not base_frame:
+            raise ValueError(
+                "PlatformGeometryConfig.frames.map_frame / odom_frame / base_frame 必须显式配置，禁止使用兜底字面值。"
+            )
+        self.tf_topic = tf_topic
+        self.tf_static_topic = tf_static_topic
+        self.map_frame = map_frame
+        self.odom_frame = odom_frame
+        self.base_frame = base_frame
         self._max_tf_age_sec = max(0.05, float(config.rtabmap.timestamp_quality.max_tf_age_sec or 0.5))
         self._lock = threading.RLock()
         self._started = False
@@ -62,6 +77,7 @@ class Ros2TfLocalizationProvider:
         self._thread: Optional[threading.Thread] = None
         self._rclpy = None
         self._subscriptions: List[Any] = []
+        self._invalid_transform_keys: set = set()
 
     def start(self) -> None:
         if self._started:
@@ -524,23 +540,36 @@ class Ros2TfLocalizationProvider:
         transform = getattr(message, "transform", None)
         translation = getattr(transform, "translation", None)
         rotation = getattr(transform, "rotation", None)
-        return Transform(
-            timestamp=self._timestamp_from_header(header),
-            parent_frame_id=parent_frame_id,
-            child_frame_id=child_frame_id,
-            translation=Vector3(
-                x=float(getattr(translation, "x", 0.0) or 0.0),
-                y=float(getattr(translation, "y", 0.0) or 0.0),
-                z=float(getattr(translation, "z", 0.0) or 0.0),
-            ),
-            rotation=Quaternion(
-                x=float(getattr(rotation, "x", 0.0) or 0.0),
-                y=float(getattr(rotation, "y", 0.0) or 0.0),
-                z=float(getattr(rotation, "z", 0.0) or 0.0),
-                w=float(getattr(rotation, "w", 1.0) if rotation is not None else 1.0),
-            ),
-            authority=authority,
-        )
+        try:
+            return Transform(
+                timestamp=self._timestamp_from_header(header),
+                parent_frame_id=parent_frame_id,
+                child_frame_id=child_frame_id,
+                translation=Vector3(
+                    x=float(getattr(translation, "x", 0.0) or 0.0),
+                    y=float(getattr(translation, "y", 0.0) or 0.0),
+                    z=float(getattr(translation, "z", 0.0) or 0.0),
+                ),
+                rotation=Quaternion(
+                    x=float(getattr(rotation, "x", 0.0) or 0.0),
+                    y=float(getattr(rotation, "y", 0.0) or 0.0),
+                    z=float(getattr(rotation, "z", 0.0) or 0.0),
+                    w=float(getattr(rotation, "w", 1.0) if rotation is not None else 1.0),
+                ),
+                authority=authority,
+            )
+        except ValidationError as exc:
+            key = (parent_frame_id, child_frame_id)
+            if key not in self._invalid_transform_keys:
+                self._invalid_transform_keys.add(key)
+                LOGGER.warning(
+                    "跳过不合规 TF 变换 parent=%s child=%s authority=%s reason=%s",
+                    parent_frame_id,
+                    child_frame_id,
+                    authority,
+                    exc.errors()[0].get("msg") if exc.errors() else str(exc),
+                )
+            return None
 
     def _normalize_contract_transform(self, transform: Transform) -> Optional[Transform]:
         parent_frame_id = self._normalize_frame_id(transform.parent_frame_id)

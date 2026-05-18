@@ -1490,16 +1490,72 @@ class MemoryService:
                     reason_codes = self._normalize_aliases([*reason_codes, reason_code])
             elif not verification.verified and str(metadata.get("arrival_reason_code") or "") in {"map_mismatch", "localization_session_mismatch"}:
                 penalty = max(penalty, 0.2)
+        decay_state = getattr(self, "_navigation_candidate_confidence_decay", None)
+        decay_amount = 0.0
+        if isinstance(decay_state, dict):
+            decay_amount = max(
+                float(decay_state.get(candidate_record_id, 0.0) or 0.0),
+                float(decay_state.get(str(candidate.metadata.get("candidate_id") or ""), 0.0) or 0.0),
+            )
+        if decay_amount > 0.0:
+            penalty = min(0.85, penalty + decay_amount)
         return {
             "penalty": round(self._clamp_score(penalty), 6),
             "failure_count": failure_count,
             "reason_codes": reason_codes,
             "trajectory_event_ids": [item.trajectory_event_id for item in failed_events[-5:]],
             "latest_failure_at": failed_events[-1].timestamp.isoformat() if failed_events else "",
+            "confidence_decay": round(decay_amount, 6),
         }
 
     def _navigation_candidate_failure_penalty(self, candidate: MemoryNavigationCandidate) -> float:
         return float(self._navigation_candidate_failure_evidence(candidate).get("penalty") or 0.0)
+
+    def apply_candidate_confidence_decay(
+        self,
+        *,
+        record_id: str,
+        candidate_id: str,
+        record_kind: str,
+        decay_amount: float,
+        reason_code: str,
+    ) -> float:
+        """到点失败时降低对应记忆候选的可信度。
+
+        把衰减系数累计写到 `_navigation_candidate_confidence_decay`，下次
+        `_navigation_candidate_failure_evidence` 取分数时会读取并扣分。
+        同步把衰减写入对应 SemanticInstance.metadata（若存在），供查询/排序消费。
+        """
+
+        record_id_str = str(record_id or "").strip()
+        candidate_id_str = str(candidate_id or "").strip()
+        if not record_id_str and not candidate_id_str:
+            return 0.0
+        amount = max(0.0, min(0.5, float(decay_amount or 0.0)))
+        if amount <= 0.0:
+            return 0.0
+        decay_state = getattr(self, "_navigation_candidate_confidence_decay", None)
+        if decay_state is None:
+            decay_state = {}
+            setattr(self, "_navigation_candidate_confidence_decay", decay_state)
+        key = record_id_str or candidate_id_str
+        previous = float(decay_state.get(key, 0.0))
+        new_value = min(0.6, previous + amount)
+        decay_state[key] = new_value
+        if record_kind in {MemoryRecordKind.OBJECT_INSTANCE.value, "object_instance"} and record_id_str:
+            instance = self._semantic_instances_by_id.get(record_id_str)
+            if instance is not None:
+                merged_metadata = dict(instance.metadata or {})
+                merged_metadata["arrival_failure_decay"] = round(new_value, 6)
+                merged_metadata["arrival_failure_reason_code"] = reason_code
+                merged_metadata["arrival_failure_last_candidate_id"] = candidate_id_str
+                updated = instance.model_copy(update={"metadata": merged_metadata}, deep=True)
+                self._semantic_instances_by_id[record_id_str] = updated
+                try:
+                    self._repository.upsert_semantic_instance(updated)
+                except Exception:
+                    LOGGER.exception("写回实例衰减失败 instance_id=%s", record_id_str)
+        return new_value
 
     def _build_candidate_score_breakdown(
         self,
@@ -1682,6 +1738,7 @@ class MemoryService:
         max_age_sec: Optional[float] = None,
         map_version_id: Optional[str] = None,
         localization_session_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
     ) -> Optional[MemoryNavigationCandidate]:
         """把自由文本查询解析成可导航的记忆候选。"""
 
@@ -1693,6 +1750,7 @@ class MemoryService:
             map_version_id=map_version_id,
             localization_session_id=localization_session_id,
             limit=1,
+            goal_id=goal_id,
         )
         for candidate in candidates:
             metadata = dict(candidate.metadata or {})
@@ -1716,6 +1774,7 @@ class MemoryService:
         map_version_id: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         limit: int = 5,
+        goal_id: Optional[str] = None,
     ) -> Tuple[MemoryNavigationCandidate, ...]:
         """把自由文本查询解析成一组可导航的记忆候选。"""
 
@@ -1895,6 +1954,7 @@ class MemoryService:
             except Exception:
                 LOGGER.exception("记录语义检索评估指标失败 query=%s", query)
         resolution_payload = resolution.model_dump(mode="json")
+        resolved_goal_id = str(goal_id or "").strip() or None
         decorated_candidates = tuple(
             candidate.model_copy(
                 update={
@@ -1902,6 +1962,7 @@ class MemoryService:
                         **dict(candidate.metadata),
                         "resolution_summary": resolution_payload,
                         "evaluation_trace_id": evaluation_trace.trace_id if evaluation_trace is not None else dict(candidate.metadata).get("evaluation_trace_id", ""),
+                        "goal_id": resolved_goal_id or str(dict(candidate.metadata).get("goal_id") or ""),
                     }
                 },
                 deep=True,
@@ -1996,9 +2057,11 @@ class MemoryService:
         similarity_threshold: float = 0.55,
         expected_map_version_id: Optional[str] = None,
         localization_session_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
     ) -> MemoryArrivalVerification:
         """到点后用当前场景与目标记忆做一次复核。"""
 
+        resolved_goal_id = str(goal_id or "").strip() or None
         if not self.is_enabled():
             return self._record_arrival_verification(
                 MemoryArrivalVerification(
@@ -2008,6 +2071,8 @@ class MemoryService:
                     matched_labels=[],
                     matched_memory_id=None,
                     reason="当前记忆库未启用，已跳过记忆复核。",
+                    goal_id=resolved_goal_id,
+                    candidate_id=None,
                     metadata={
                         "memory_enabled": False,
                         "arrival_verified": False,
@@ -2016,10 +2081,19 @@ class MemoryService:
                         "camera_id": camera_id or "",
                         "map_version_id": expected_map_version_id or "",
                         "localization_session_id": localization_session_id or "",
+                        "goal_id": resolved_goal_id or "",
                     },
                 )
             )
         legacy_candidate = self._coerce_legacy_navigation_candidate(navigation_candidate)
+        candidate_id_from_metadata = str(
+            (legacy_candidate.metadata if legacy_candidate is not None else {}).get("candidate_id")
+            or ""
+        ).strip() or None
+        if resolved_goal_id is None and legacy_candidate is not None:
+            metadata_goal_id = str(legacy_candidate.metadata.get("goal_id") or "").strip()
+            if metadata_goal_id:
+                resolved_goal_id = metadata_goal_id
         effective_map_version_id = str(
             expected_map_version_id
             or (legacy_candidate.map_version_id if legacy_candidate is not None else "")
@@ -2035,6 +2109,8 @@ class MemoryService:
                     matched_labels=[],
                     matched_memory_id=None,
                     reason="当前平台地图版本与导航候选版本不一致，已拒绝到点复核。",
+                    goal_id=resolved_goal_id,
+                    candidate_id=candidate_id_from_metadata,
                     metadata={
                         "expected_map_version_id": effective_map_version_id,
                         "active_map_version_id": semantic_context.map_version_id,
@@ -2045,6 +2121,8 @@ class MemoryService:
                         "arrival_verified": False,
                         "arrival_score": 0.0,
                         "arrival_reason_code": "map_mismatch",
+                        "goal_id": resolved_goal_id or "",
+                        "candidate_id": candidate_id_from_metadata or "",
                     },
                 )
             )
@@ -2057,6 +2135,8 @@ class MemoryService:
                     matched_labels=[],
                     matched_memory_id=None,
                     reason="当前平台定位会话已变化，已拒绝在旧定位上下文中执行到点复核。",
+                    goal_id=resolved_goal_id,
+                    candidate_id=candidate_id_from_metadata,
                     metadata={
                         "expected_map_version_id": effective_map_version_id,
                         "active_map_version_id": semantic_context.map_version_id,
@@ -2069,6 +2149,8 @@ class MemoryService:
                         "arrival_verified": False,
                         "arrival_score": 0.0,
                         "arrival_reason_code": "localization_session_mismatch",
+                        "goal_id": resolved_goal_id or "",
+                        "candidate_id": candidate_id_from_metadata or "",
                     },
                 )
             )
@@ -2172,6 +2254,8 @@ class MemoryService:
                 legacy_candidate.verification_memory_id if legacy_candidate is not None else None
             ),
             reason=reason,
+            goal_id=resolved_goal_id,
+            candidate_id=candidate_id_from_metadata,
             metadata={
                 "lexical_score": round(lexical_score, 6),
                 "image_score": round(image_score, 6),
@@ -2180,7 +2264,8 @@ class MemoryService:
                 "verification_query": effective_query,
                 "record_id": legacy_candidate.record_id if legacy_candidate is not None else "",
                 "record_kind": legacy_candidate.record_kind.value if legacy_candidate is not None else "",
-                "candidate_id": str((legacy_candidate.metadata if legacy_candidate is not None else {}).get("candidate_id") or ""),
+                "candidate_id": candidate_id_from_metadata or "",
+                "goal_id": resolved_goal_id or "",
                 "map_name": semantic_context.map_name,
                 "map_version_id": effective_map_version_id or semantic_context.map_version_id,
                 "localization_session_id": localization_session_id or active_localization_session_id,
@@ -5690,6 +5775,7 @@ class MemoryService:
                 "camera_id": str(candidate.metadata.get("camera_id") or ""),
                 "anchor_id": candidate.anchor_id,
                 "candidate_id": candidate.candidate_id,
+                "goal_id": str(candidate.metadata.get("goal_id") or ""),
                 "map_name": str(candidate.metadata.get("map_name") or ""),
                 "localization_session_id": str(candidate.metadata.get("localization_session_id") or ""),
                 "backend": str(candidate.metadata.get("backend") or "memory_service"),

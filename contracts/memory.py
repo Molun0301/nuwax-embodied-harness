@@ -315,6 +315,8 @@ class MemoryArrivalVerification(TimestampedContract):
     matched_labels: List[str] = Field(default_factory=list, description="当前场景命中的标签。")
     matched_memory_id: Optional[str] = Field(default=None, description="所复核的目标记忆标识。")
     reason: Optional[str] = Field(default=None, description="复核原因说明。")
+    goal_id: Optional[str] = Field(default=None, description="关联导航目标标识。")
+    candidate_id: Optional[str] = Field(default=None, description="关联导航候选标识。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加复核信息。")
 
 

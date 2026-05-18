@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import audioop
 import fcntl
-import json
 import logging
 import os
 import queue
@@ -31,6 +30,7 @@ from dataclasses import replace
 from io import BytesIO
 from typing import Dict, List, Optional, Set, Any
 
+from logging_utils import compact_log_value
 from settings import APP_CONFIG, LocalPlaybackConfig, RobotWebRTCPlaybackConfig, TTSPlayerConfig
 from .robot_webrtc_audio import RobotWebRTCAudioHubClient
 
@@ -656,7 +656,14 @@ class LocalAudioBackend:
             if not text:
                 continue
             self.last_stderr = text
-            logger.warning("TTS播放后端输出(%s): %s", backend_name, text)
+            logger.debug(
+                "TTS 播放后端输出",
+                extra={
+                    "event": "tts.backend.stderr",
+                    "backend": backend_name,
+                    "stderr_preview": compact_log_value(text, max_length=240),
+                },
+            )
 
     def _drain_stderr(self, process) -> str:
         if process.stderr is None:
@@ -1174,14 +1181,17 @@ class RealtimeTTSPlayer:
         self._finish_backend_for_session()
         backend_status = self._current_backend.status() if self._current_backend is not None else {}
         logger.info(
-            "TTS会话结束: %s bytes_written=%s backend=%s route=%s device=%s last_error=%s last_stderr=%s",
-            session_id,
-            backend_status.get("bytes_written"),
-            backend_status.get("backend_name"),
-            backend_status.get("route_backend"),
-            backend_status.get("route_device"),
-            backend_status.get("last_error") or "-",
-            backend_status.get("last_stderr") or "-",
+            "TTS 会话结束",
+            extra={
+                "event": "tts.session.finished",
+                "session_id": session_id,
+                "bytes_written": backend_status.get("bytes_written"),
+                "backend": backend_status.get("backend_name") or "-",
+                "route_backend": backend_status.get("route_backend") or "-",
+                "route_device": backend_status.get("route_device") or "-",
+                "last_error_preview": compact_log_value(backend_status.get("last_error") or "-", max_length=240),
+                "last_stderr_preview": compact_log_value(backend_status.get("last_stderr") or "-", max_length=240),
+            },
         )
         with self._lock:
             self._current_session_id = None
@@ -1198,7 +1208,14 @@ class RealtimeTTSPlayer:
         if self._current_session_id != session_id:
             return
         if self.config.print_subtitle:
-            logger.info("TTS字幕: %s", json.dumps(payload, ensure_ascii=False))
+            logger.info(
+                "TTS 字幕",
+                extra={
+                    "event": "tts.subtitle",
+                    "session_id": session_id,
+                    "subtitle_preview": compact_log_value(payload, max_length=240),
+                },
+            )
 
     def handle_sentence_end(self, session_id: str, payload: Dict[str, Any]) -> None:
         del payload

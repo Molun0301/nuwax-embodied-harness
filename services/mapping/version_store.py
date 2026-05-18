@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 from pathlib import Path
 from urllib.parse import quote
 
 from contracts.map_workspace import MapVersion
 from contracts.runtime_views import MapSnapshot
+from services.mapping.catalog import _to_safe_dir_segment
 from typing import Dict, Optional, Tuple
 
 
@@ -48,10 +46,11 @@ class MapVersionRepository:
     def save_existing_map_version(self, version: MapVersion) -> MapVersion:
         """覆盖写回已存在的平台地图版本。"""
 
-        version_path = self._version_path(version.map_name, version.version_id)
-        version_path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_text_atomic(version_path, version.model_dump_json(indent=2))
-        self.write_bundle_manifest(version)
+        self._version_path(version.map_name, version.version_id).parent.mkdir(parents=True, exist_ok=True)
+        self._version_path(version.map_name, version.version_id).write_text(
+            version.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
         return version
 
     def save_map_version(
@@ -75,103 +74,11 @@ class MapVersionRepository:
         )
         version_dir = self._versions_root(map_name) / version.version_id
         version_dir.mkdir(parents=True, exist_ok=True)
-        self._write_text_atomic(
-            self._version_path(map_name, version.version_id),
+        self._version_path(map_name, version.version_id).write_text(
             version.model_dump_json(indent=2),
+            encoding="utf-8",
         )
-        self.write_bundle_manifest(version)
         return version
-
-    def bundle_manifest_path(self, map_name: str, version_id: str) -> str:
-        """返回地图版本 bundle manifest 路径。"""
-
-        return str((self._version_path(map_name, version_id).parent / "bundle_manifest.json").resolve(strict=False))
-
-    def write_bundle_manifest(self, version: MapVersion, *, memory_checkpoint: Optional[Dict[str, object]] = None) -> Dict[str, object]:
-        """写入地图版本 bundle manifest。"""
-
-        version_dir = self._version_path(version.map_name, version.version_id).parent
-        version_dir.mkdir(parents=True, exist_ok=True)
-        manifest = self.build_bundle_manifest(version, memory_checkpoint=memory_checkpoint)
-        self._write_text_atomic(
-            version_dir / "bundle_manifest.json",
-            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
-        )
-        return manifest
-
-    def build_bundle_manifest(self, version: MapVersion, *, memory_checkpoint: Optional[Dict[str, object]] = None) -> Dict[str, object]:
-        """构建地图版本可校验资产清单。"""
-
-        version_path = self._version_path(version.map_name, version.version_id)
-        files = [self._describe_file(version_path, role="version_json", required=True)]
-        geometry_asset = version.geometry_asset
-        if geometry_asset is not None:
-            geometry_asset_path_value = str(geometry_asset.metadata.get("geometry_asset_path") or "").strip()
-            if geometry_asset_path_value:
-                files.append(self._describe_file(Path(geometry_asset_path_value).expanduser(), role="geometry_asset_json", required=True))
-            files.append(self._describe_file(Path(geometry_asset.rtabmap_db_path).expanduser(), role="rtabmap_database", required=True))
-            if geometry_asset.pcd_path:
-                files.append(self._describe_file(Path(geometry_asset.pcd_path).expanduser(), role="pcd", required=False))
-            nav2_map = geometry_asset.metadata.get("nav2_map") if isinstance(geometry_asset.metadata.get("nav2_map"), dict) else {}
-            for key, role, required in (
-                ("yaml_path", "nav2_map_yaml", True),
-                ("image_path", "nav2_map_image", False),
-            ):
-                value = str(nav2_map.get(key) or "").strip()
-                if value:
-                    files.append(self._describe_file(Path(value).expanduser(), role=role, required=required))
-        manifest_payload = {
-            "schema_version": "map_version_bundle_manifest.v1",
-            "map_name": version.map_name,
-            "version_id": version.version_id,
-            "revision": version.revision,
-            "source_name": version.source_name,
-            "source_version_id": version.source_version_id,
-            "frame_id": version.frame_id,
-            "files": files,
-            "memory_checkpoint": dict(memory_checkpoint or version.metadata.get("memory_checkpoint") or {}),
-            "metadata": {
-                "geometry_stack": geometry_asset.geometry_stack if geometry_asset is not None else None,
-                "backend_map_version_id": version.metadata.get("backend_map_version_id"),
-                "rtabmap_session_id": version.metadata.get("rtabmap_session_id"),
-                "rtabmap_run_id": version.metadata.get("rtabmap_run_id"),
-            },
-        }
-        manifest_payload["bundle_hash"] = hashlib.sha256(
-            json.dumps(manifest_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-        missing_required = [item for item in files if item.get("required") and not item.get("present")]
-        manifest_payload["complete"] = not missing_required
-        manifest_payload["missing_required_files"] = missing_required
-        return manifest_payload
-
-    def _describe_file(self, path: Path, *, role: str, required: bool) -> Dict[str, object]:
-        resolved = path.expanduser().resolve(strict=False)
-        payload: Dict[str, object] = {
-            "role": role,
-            "path": str(resolved),
-            "required": bool(required),
-            "present": resolved.exists() and resolved.is_file(),
-        }
-        if not payload["present"]:
-            return payload
-        stat = resolved.stat()
-        payload.update({
-            "size_bytes": int(stat.st_size),
-            "mtime_ns": int(stat.st_mtime_ns),
-        })
-        digest = hashlib.sha256()
-        with resolved.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        payload["sha256"] = digest.hexdigest()
-        return payload
-
-    def _write_text_atomic(self, path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(".%s.tmp" % path.name)
-        tmp_path.write_text(content, encoding="utf-8")
-        os.replace(tmp_path, path)
 
     def _build_version_id(self, revision: int) -> str:
         return f"mapver_{revision:06d}"
@@ -186,8 +93,23 @@ class MapVersionRepository:
         return None
 
     def _version_path(self, map_name: str, version_id: str) -> Path:
-        return self._versions_root(map_name) / quote(str(version_id or "").strip(), safe="") / "version.json"
+        versions_root = self._versions_root(map_name)
+        safe_version = _to_safe_dir_segment(version_id)
+        primary = versions_root / safe_version / "version.json"
+        if not primary.exists():
+            # 兼容旧版本写出的 URL 编码 version_id 目录（含特殊字符时才有差异）。
+            legacy = versions_root / quote(str(version_id or "").strip(), safe="") / "version.json"
+            if legacy.exists():
+                return legacy
+        return primary
 
     def _versions_root(self, map_name: str) -> Path:
-        safe_map_name = quote(str(map_name or "").strip(), safe="")
-        return self._root_dir / safe_map_name / "versions"
+        safe_map_name = _to_safe_dir_segment(map_name)
+        primary = self._root_dir / safe_map_name / "versions"
+        # 同 catalog.py 中 _map_dir 的兼容策略：旧目录走 URL 编码名时不破坏读取。
+        if not primary.exists():
+            legacy_root = self._root_dir / quote(str(map_name or "").strip(), safe="")
+            legacy_versions = legacy_root / "versions"
+            if legacy_versions.exists():
+                return legacy_versions
+        return primary

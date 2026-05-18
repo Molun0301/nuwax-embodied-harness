@@ -1,0 +1,40 @@
+# 楼梯导航航点示例
+# 使用方法：ros2 run nav2_waypoint_follower waypoint_follower --ros-args -p waypoints_file:=stairs_waypoints.yaml
+
+waypoints:
+  - pose:
+      position:
+        x: 1.0
+        y: 0.0
+        z: 0.0
+      orientation:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        w: 1.0
+    frame_id: "map"
+    
+  # 楼梯起点 - 到达此点会触发爬楼梯
+  - pose:
+      position:
+        x: 3.0
+        y: 0.0
+        z: 0.0
+      orientation:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        w: 1.0
+    frame_id: "map"
+    
+  - pose:
+      position:
+        x: 5.0
+        y: 0.0
+        z: 0.0
+      orientation:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        w: 1.0
+    frame_id: "map"

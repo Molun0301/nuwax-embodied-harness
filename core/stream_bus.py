@@ -34,9 +34,25 @@ class StreamBus:
         with self._lock:
             return self._next_cursor - 1
 
+    def oldest_cursor(self) -> int:
+        with self._lock:
+            if not self._frames:
+                return 0
+            return int(self._frames[0].cursor or 0)
+
     def latest_frame(self, topic: str) -> Optional[StreamFrame]:
         with self._lock:
             return self._latest_by_topic.get(str(topic))
+
+    def latest_frames(self, *, topics: Optional[Iterable[str]] = None) -> Tuple[StreamFrame, ...]:
+        topic_filter = frozenset(str(topic) for topic in topics) if topics is not None else None
+        with self._lock:
+            frames = tuple(
+                frame
+                for frame in self._latest_by_topic.values()
+                if topic_filter is None or frame.topic in topic_filter
+            )
+        return tuple(sorted(frames, key=lambda frame: frame.cursor or 0))
 
     def publish(
         self,
@@ -150,6 +166,17 @@ class StreamBus:
     def unsubscribe(self, subscription_id: str) -> None:
         with self._lock:
             self._subscriptions.pop(subscription_id, None)
+
+    def clear_topic(self, topic: str) -> bool:
+        """清除指定 topic 的 latest 缓存。
+
+        新接入的 SSE / WS 客户端首帧靠 latest_frames() 拿快照；当上游内容失效
+        （例如地图被删除、活跃工作区切走）时调用本方法，避免新连接拿到陈旧数据。
+        retention 历史 frames 不动，replay 仍可回放。
+        """
+
+        with self._lock:
+            return self._latest_by_topic.pop(str(topic), None) is not None
 
     def replay(
         self,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 from datetime import datetime
 
 from contracts.base import utc_now
@@ -21,9 +21,9 @@ PERCEPTION_RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.perception.run
 class PerceptionVideoRuntime:
     """持续视频感知运行时。
 
-    该运行时基于统一 `ImageProvider` 周期抓帧，再复用 `PerceptionService`
-    完成检测、跟踪与场景摘要。这样 Go2 当前可以直接通过 `VideoClient`
-    打通连续识别链路，后续切换到别的机器人或视频源时无需改上层。
+    该运行时只从平台已接收的端侧视频推流 latest/keyframe 缓冲抽帧，
+    再复用 `PerceptionService` 完成检测、跟踪与场景摘要；它不触发平台到
+    机器人侧的图像采集。
     """
 
     def __init__(
@@ -95,7 +95,21 @@ class PerceptionVideoRuntime:
     def should_auto_start(self) -> bool:
         """返回是否应在宿主机运行时启动时自动拉起。"""
 
-        return self._enabled and self._auto_start
+        if not (self._enabled and self._auto_start):
+            return False
+        if self._memory_service is None:
+            return True
+        if hasattr(self._memory_service, "is_enabled"):
+            try:
+                return bool(self._memory_service.is_enabled())
+            except Exception:
+                return False
+        return True
+
+    def bind_memory_service(self, memory_service) -> None:
+        """显式注入 memory_service，避免外部直接赋值私有字段。"""
+
+        self._memory_service = memory_service
 
     def is_running(self) -> bool:
         """返回后台线程是否处于运行状态。"""
@@ -170,6 +184,8 @@ class PerceptionVideoRuntime:
         force_keyframe: bool = False,
         reason: str = "manual",
         allow_memory_write: bool = True,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> Optional[str]:
         """手动执行一次抓帧与感知，返回摘要标题。"""
 
@@ -185,6 +201,24 @@ class PerceptionVideoRuntime:
             current_pose=current_pose,
             map_context=map_context,
         )
+        video_status = self._perception_service.video_frame_source_status()
+        if not bool(video_status.get("available")):
+            self._perception_service.publish_current_video_frame(
+                camera_id=self._camera_id,
+                requested_by="perception_video_runtime",
+            )
+            with self._lock:
+                self._last_error = "端侧视频推流未就绪或最近帧已过期。"
+                self._last_status_metadata = {
+                    **dict(self._last_status_metadata),
+                    "camera_id": self._camera_id,
+                    "capture_mode": "video_stream",
+                    "last_skip_reason": "video_ingest_not_ready",
+                    "video_ingest_status": dict(video_status),
+                    **dict(decision.metadata),
+                }
+            self._write_status(running=self.is_running())
+            return None
         effective_reason = reason
         if not force_keyframe:
             if not decision.should_process:
@@ -199,6 +233,7 @@ class PerceptionVideoRuntime:
                         "camera_id": self._camera_id,
                         "capture_mode": "video_stream",
                         "last_skip_reason": decision.reason,
+                        "video_ingest_status": dict(video_status),
                         **dict(decision.metadata),
                     }
                 self._write_status(running=self.is_running())
@@ -210,6 +245,8 @@ class PerceptionVideoRuntime:
             requested_by="perception_video_runtime",
             detector_backend_name=self._detector_backend_name or None,
             store_artifact=self._store_artifact,
+            detection_metadata=detection_metadata,
+            open_vocabulary_classes=open_vocabulary_classes,
         )
         self._keyframe_selector.mark_processed(
             timestamp=now,
@@ -245,6 +282,8 @@ class PerceptionVideoRuntime:
                 "keyframe_reason": effective_reason,
                 "memory_written": memory_written,
                 "remember_keyframes": self._remember_keyframes,
+                "detection_metadata": dict(detection_metadata or {}),
+                "video_ingest_status": dict(video_status),
                 **dict(decision.metadata),
             }
         self._write_status(running=self.is_running())
@@ -258,6 +297,8 @@ class PerceptionVideoRuntime:
         requested_reason: str = "burst_verify",
         store_artifact: Optional[bool] = None,
         remember_result: bool = False,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> Tuple[str, ...]:
         """执行短时 burst 复核，返回成功处理的摘要列表。"""
 
@@ -275,6 +316,8 @@ class PerceptionVideoRuntime:
                     force_keyframe=True,
                     reason=requested_reason,
                     allow_memory_write=remember_result,
+                    detection_metadata=detection_metadata,
+                    open_vocabulary_classes=open_vocabulary_classes,
                 )
                 if message:
                     messages.append(message)
@@ -312,14 +355,27 @@ class PerceptionVideoRuntime:
         map_context = None
         localization_service = self._localization_service
         if localization_service is not None:
-            snapshot = localization_service.get_latest_snapshot()
+            snapshot = self._refresh_service_snapshot(localization_service)
             if snapshot is not None:
                 current_pose = snapshot.current_pose
 
         mapping_service = self._mapping_service
         if mapping_service is not None:
-            map_context = self._semantic_map_builder.build(mapping_service.get_latest_snapshot())
+            map_snapshot = self._refresh_service_snapshot(mapping_service)
+            map_context = self._semantic_map_builder.build(map_snapshot)
         return current_pose, map_context
+
+    def _refresh_service_snapshot(self, service):
+        refresher = getattr(service, "refresh", None)
+        if callable(refresher):
+            try:
+                return refresher()
+            except Exception:
+                PERCEPTION_RUNTIME_LOGGER.debug("刷新持续感知上下文失败。", exc_info=True)
+        getter = getattr(service, "get_latest_snapshot", None)
+        if callable(getter):
+            return getter()
+        return None
 
     def _remember_from_keyframe(
         self,
@@ -335,7 +391,9 @@ class PerceptionVideoRuntime:
         del current_pose, map_context
         if not allow_memory_write:
             return False
-        if self._memory_service is None or not self._remember_keyframes:
+        if self._memory_service is None:
+            return False
+        if not self._remember_keyframes and not force:
             return False
         if hasattr(self._memory_service, "is_enabled") and not self._memory_service.is_enabled():
             return False

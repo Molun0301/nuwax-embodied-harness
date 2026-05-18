@@ -20,3 +20,11 @@ tests/
 drivers/go2/ros2_ws/
 nuwax_robot_bridge.log.lock
 runtime_data/
+.gitnexus
+.venv/
+.pytest_cache
+.playwright-mcp
+功能列表.md
+.env
+AGENTS.md
+CLAUDE.md

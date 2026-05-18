@@ -1,7 +1,9 @@
 """平台探索编排运行时。"""
 from __future__ import annotations
 
+import logging
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -14,6 +16,8 @@ from contracts.runtime_views import ExplorationContext
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.frontier import FrontierCandidate, FrontierExplorer
 from services.navigation.runtime import GridNavigationPlanner
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.navigation.exploration_runtime")
 
 
 class ExplorationRuntimePhase(Enum):
@@ -60,7 +64,6 @@ class ExplorationRuntimeState:
     last_frontier_count: Optional[int] = None
     completed_frontiers: int = 0
     no_gain_rounds: int = 0
-    semantic_failure_rounds: int = 0
     known_cells: int = 0
     waiting_for: Optional[str] = None
     failure_code: Optional[str] = None
@@ -75,8 +78,6 @@ class ExplorationRuntimeState:
     stop_reason: Optional[str] = None
     stop_condition: Optional[str] = None
     stop_condition_detail: Dict[str, Any] = field(default_factory=dict)
-    semantic_context: Dict[str, Any] = field(default_factory=dict)
-    constraint_diagnostics: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -127,7 +128,6 @@ class PlatformExplorationRuntime:
             request_id=request.request_id,
             request=request.model_copy(deep=True),
             phase=ExplorationRuntimePhase.PLANNING,
-            semantic_context=self._semantic_context_from_request(request),
             metadata={
                 "map_name": request.map_name,
                 "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
@@ -145,91 +145,6 @@ class PlatformExplorationRuntime:
         """兼容 `ExplorationProvider` 的启动接口。"""
 
         return self.start(request)
-
-
-    def update_semantic_context(self, context: Dict[str, Any]) -> None:
-        if self._current_state is None or not isinstance(context, dict):
-            return
-        self._current_state.semantic_context.update(dict(context))
-        self._current_state.metadata["semantic_exploration_context"] = dict(self._current_state.semantic_context)
-
-    def _semantic_context_from_request(self, request: ExploreAreaRequest) -> Dict[str, Any]:
-        metadata = dict(request.metadata or {})
-        raw_context = metadata.get("semantic_exploration_context")
-        context = dict(raw_context) if isinstance(raw_context, dict) else {}
-        if request.target_name:
-            context.setdefault("target_name", request.target_name)
-        search_query = metadata.get("search_query")
-        if search_query:
-            context.setdefault("query", str(search_query))
-            context.setdefault("search_query", str(search_query))
-        if request.radius_m is not None:
-            context.setdefault("request_radius_m", request.radius_m)
-        if request.max_duration_sec is not None:
-            context.setdefault("timeout_sec", request.max_duration_sec)
-        return context
-
-    def _check_runtime_constraints(self, state: ExplorationRuntimeState) -> bool:
-        context = dict(state.semantic_context or {})
-        diagnostics: Dict[str, Any] = {
-            "checked": True,
-            "battery": context.get("battery") if isinstance(context.get("battery"), dict) else {},
-            "communication": context.get("communication") if isinstance(context.get("communication"), dict) else {},
-            "safety": context.get("safety") if isinstance(context.get("safety"), dict) else {},
-            "max_distance_m": context.get("max_distance_m"),
-            "forbidden_zone_count": len(context.get("forbidden_zones") or []) if isinstance(context.get("forbidden_zones"), list) else 0,
-        }
-        state.constraint_diagnostics = diagnostics
-        safety = diagnostics["safety"] if isinstance(diagnostics["safety"], dict) else {}
-        if bool(safety.get("safe_stop_active") or safety.get("is_estopped") or safety.get("estopped")):
-            return self._finish_constraint_stop(
-                state,
-                condition="safety_state_blocked",
-                message="安全状态阻止继续探索。",
-                detail=diagnostics,
-            )
-        battery = diagnostics["battery"] if isinstance(diagnostics["battery"], dict) else {}
-        battery_percent = self._optional_float(battery.get("percentage"))
-        min_battery_percent = self._optional_float(context.get("min_battery_percent"))
-        if battery_percent is not None and min_battery_percent is not None and battery_percent < min_battery_percent:
-            return self._finish_constraint_stop(
-                state,
-                condition="battery_below_minimum",
-                message="当前电量低于探索阈值。",
-                detail=diagnostics,
-            )
-        communication = diagnostics["communication"] if isinstance(diagnostics["communication"], dict) else {}
-        if communication.get("available") is False or communication.get("connected") is False:
-            return self._finish_constraint_stop(
-                state,
-                condition="communication_unavailable",
-                message="通信状态不可用，已停止探索。",
-                detail=diagnostics,
-            )
-        return False
-
-    def _finish_constraint_stop(
-        self,
-        state: ExplorationRuntimeState,
-        *,
-        condition: str,
-        message: str,
-        detail: Dict[str, Any],
-    ) -> bool:
-        state.failure_code = condition
-        state.last_error = message
-        self._record_stop(state, reason="constraint", condition=condition, detail=detail)
-        self._finish(state, phase=ExplorationRuntimePhase.FAILED)
-        return True
-
-    def _optional_float(self, value: Any) -> Optional[float]:
-        if value is None or value == "" or isinstance(value, bool):
-            return None
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return None
-        return number if math.isfinite(number) else None
 
     def stop(self) -> bool:
         """停止探索任务。"""
@@ -272,8 +187,6 @@ class PlatformExplorationRuntime:
         state = self._current_state
         self._apply_runtime_metadata(state, runtime_metadata)
         state.waiting_for = None
-        if self._check_runtime_constraints(state):
-            return state
         if self._check_stop_conditions(state):
             return state
         if state.phase == ExplorationRuntimePhase.PLANNING:
@@ -319,9 +232,6 @@ class PlatformExplorationRuntime:
             ),
             "known_cells": state.known_cells,
             "no_gain_rounds": state.no_gain_rounds,
-            "semantic_failure_rounds": state.semantic_failure_rounds,
-            "semantic_exploration_context": dict(state.semantic_context),
-            "constraint_diagnostics": dict(state.constraint_diagnostics),
             "waiting_for": state.waiting_for,
             "failure_code": state.failure_code,
             "frontier_freshness": dict(state.frontier_freshness),
@@ -455,7 +365,17 @@ class PlatformExplorationRuntime:
             return None
         if self._current_state.phase != ExplorationRuntimePhase.MOVING_TO_FRONTIER:
             return None
-        return self._current_state.current_target.navigation_goal.model_copy(deep=True)
+        goal = self._current_state.current_target.navigation_goal.model_copy(deep=True)
+        if goal.target_pose is not None:
+            LOGGER.debug(
+                "frontier 导航目标读取 goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s",
+                goal.goal_id,
+                float(goal.target_pose.position.x),
+                float(goal.target_pose.position.y),
+                float(goal.target_pose.position.z),
+                goal.target_pose.frame_id,
+            )
+        return goal
 
     def mark_navigation_arrived(self) -> None:
         """由平台导航链路标记当前前沿已到达。"""
@@ -489,6 +409,28 @@ class PlatformExplorationRuntime:
 
         attempted_poses = [*state.visited_frontiers, *state.rejected_frontiers]
         center_pose = state.request.center_pose or current_pose
+
+        if len(attempted_poses) == 0:
+            self._wait_for_costmap_stable(state)
+            if not self.is_running:
+                return
+
+        LOGGER.info(
+            "frontier 规划请求 request_id=%s current=(%.3f, %.3f, %.3f) frame=%s center=(%.3f, %.3f, %.3f) radius_m=%s map_revision=%s costmap_revision=%s pose_revision=%s attempted=%d",
+            state.request_id,
+            float(current_pose.position.x),
+            float(current_pose.position.y),
+            float(current_pose.position.z),
+            current_pose.frame_id,
+            float(center_pose.position.x),
+            float(center_pose.position.y),
+            float(center_pose.position.z),
+            None if state.request.radius_m is None else float(state.request.radius_m),
+            state.map_revision,
+            state.costmap_revision,
+            state.pose_revision,
+            len(attempted_poses),
+        )
         frontiers = self._frontier_explorer.select_candidates(
             current_pose=current_pose,
             occupancy_grid=occupancy_grid,
@@ -497,14 +439,13 @@ class PlatformExplorationRuntime:
             center_pose=center_pose,
             radius_m=state.request.radius_m,
             attempted_poses=attempted_poses,
-            semantic_context=state.semantic_context,
         )
+        if not self.is_running:
+            LOGGER.info("frontier 计算完成但探索已停止，丢弃结果 request_id=%s", state.request_id)
+            return
         state.latest_frontiers = list(frontiers)
-        diagnostics_getter = getattr(self._frontier_explorer, "get_last_filter_diagnostics", None)
-        if callable(diagnostics_getter):
-            state.metadata["frontier_filter_diagnostics"] = dict(diagnostics_getter())
-        state.metadata["semantic_exploration_context"] = dict(state.semantic_context)
         state.last_frontier_count = len(frontiers)
+        LOGGER.info("frontier 规划接收候选 request_id=%s count=%d", state.request_id, len(frontiers))
         state.last_error = None
         state.failure_code = None
         state.known_cells = self._count_known_cells(occupancy_grid)
@@ -514,10 +455,6 @@ class PlatformExplorationRuntime:
         if not frontiers:
             state.waiting_for = "frontier"
             state.failure_code = "frontier_unavailable"
-            state.semantic_failure_rounds += 1
-            state.metadata["frontier_unavailable_diagnostics"] = dict(
-                state.metadata.get("frontier_filter_diagnostics") or {}
-            )
             state.last_error = "最新 live map/costmap/pose 未产生可达 frontier。"
             self._finish(state, phase=ExplorationRuntimePhase.FAILED)
             return
@@ -530,6 +467,18 @@ class PlatformExplorationRuntime:
             self._finish(state, phase=ExplorationRuntimePhase.FAILED)
             return
 
+        LOGGER.info(
+            "frontier 目标选中 request_id=%s pose=(%.3f, %.3f, %.3f) frame=%s score=%.3f distance_m=%.3f cluster_size=%d info_gain=%d",
+            state.request_id,
+            float(best_frontier.pose.position.x),
+            float(best_frontier.pose.position.y),
+            float(best_frontier.pose.position.z),
+            best_frontier.pose.frame_id,
+            float(best_frontier.score),
+            float(best_frontier.path_distance_m),
+            int(best_frontier.cluster_size),
+            int(best_frontier.info_gain_cells),
+        )
         frontier_revision = self._frontier_revision(state)
         state.frontier_freshness = {
             "fresh": True,
@@ -564,7 +513,67 @@ class PlatformExplorationRuntime:
                 },
             ),
         )
+        target_pose = state.current_target.navigation_goal.target_pose
+        LOGGER.info(
+            "frontier 导航目标组装 goal_id=%s request_id=%s target=(%.3f, %.3f, %.3f) frame=%s map_name=%s target_name=%s revision=%s",
+            state.current_target.navigation_goal.goal_id,
+            state.request_id,
+            float(target_pose.position.x),
+            float(target_pose.position.y),
+            float(target_pose.position.z),
+            target_pose.frame_id,
+            state.request.map_name,
+            state.request.target_name,
+            frontier_revision,
+        )
         state.phase = ExplorationRuntimePhase.MOVING_TO_FRONTIER
+
+    def _wait_for_costmap_stable(self, state: ExplorationRuntimeState) -> None:
+        """首轮 frontier 计算前等待 costmap revision 达到稳定阈值。"""
+
+        _COSTMAP_MIN_REVISION = 5
+        _WAIT_TIMEOUT_SEC = 15.0
+        _POLL_INTERVAL_SEC = 0.5
+
+        def _parse_costmap_revision(revision: Optional[str]) -> int:
+            if not revision:
+                return 0
+            try:
+                return int(revision.split(":")[-1])
+            except (ValueError, IndexError):
+                return 0
+
+        current_rev = _parse_costmap_revision(state.costmap_revision)
+        if current_rev >= _COSTMAP_MIN_REVISION:
+            return
+
+        LOGGER.info(
+            "首轮 frontier 计算前等待 costmap 稳定 request_id=%s current_revision=%s min_revision=%d timeout_sec=%.1f",
+            state.request_id,
+            state.costmap_revision,
+            _COSTMAP_MIN_REVISION,
+            _WAIT_TIMEOUT_SEC,
+        )
+        deadline = time.monotonic() + _WAIT_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            if not self.is_running:
+                return
+            current_rev = _parse_costmap_revision(state.costmap_revision)
+            if current_rev >= _COSTMAP_MIN_REVISION:
+                LOGGER.info(
+                    "costmap 已稳定 request_id=%s revision=%s",
+                    state.request_id,
+                    state.costmap_revision,
+                )
+                return
+            time.sleep(_POLL_INTERVAL_SEC)
+
+        LOGGER.warning(
+            "等待 costmap 稳定超时，继续执行首轮 frontier 计算 request_id=%s current_revision=%s min_revision=%d",
+            state.request_id,
+            state.costmap_revision,
+            _COSTMAP_MIN_REVISION,
+        )
 
     def _handle_moving_state(
         self,
@@ -594,10 +603,8 @@ class PlatformExplorationRuntime:
         state.known_cells = max(previous_known_cells, current_known_cells)
         if info_gain_cells <= int(self._config.frontier_min_information_gain_cells):
             state.no_gain_rounds += 1
-            state.semantic_failure_rounds += 1
         else:
             state.no_gain_rounds = 0
-            state.semantic_failure_rounds = 0
 
         state.current_target.scanned = True
         state.visited_frontiers.append(state.current_target.frontier.pose)
@@ -758,11 +765,38 @@ class PlatformExplorationRuntime:
     ) -> Optional[FrontierCandidate]:
         visited_positions = {(pose.position.x, pose.position.y) for pose in state.visited_frontiers}
         rejected_positions = {(pose.position.x, pose.position.y) for pose in state.rejected_frontiers}
+        LOGGER.debug(
+            "frontier 选择器接收候选 request_id=%s count=%d visited=%d rejected=%d",
+            state.request_id,
+            len(frontiers),
+            len(visited_positions),
+            len(rejected_positions),
+        )
         for frontier in frontiers:
             position = (frontier.pose.position.x, frontier.pose.position.y)
             if position in visited_positions or position in rejected_positions:
+                LOGGER.debug(
+                    "frontier 选择器跳过已尝试坐标 request_id=%s pose=(%.3f, %.3f, %.3f) frame=%s score=%.3f",
+                    state.request_id,
+                    float(frontier.pose.position.x),
+                    float(frontier.pose.position.y),
+                    float(frontier.pose.position.z),
+                    frontier.pose.frame_id,
+                    float(frontier.score),
+                )
                 continue
+            LOGGER.info(
+                "frontier 选择器返回目标 request_id=%s pose=(%.3f, %.3f, %.3f) frame=%s score=%.3f distance_m=%.3f",
+                state.request_id,
+                float(frontier.pose.position.x),
+                float(frontier.pose.position.y),
+                float(frontier.pose.position.z),
+                frontier.pose.frame_id,
+                float(frontier.score),
+                float(frontier.path_distance_m),
+            )
             return frontier
+        LOGGER.info("frontier 选择器没有可返回目标 request_id=%s", state.request_id)
         return None
 
     def _count_known_cells(self, occupancy_grid) -> int:
@@ -797,8 +831,6 @@ class PlatformExplorationRuntime:
             "info_gain_cells": frontier.info_gain_cells,
             "path_distance_m": frontier.path_distance_m,
             "average_cost": frontier.average_cost,
-            "semantic_gain": frontier.semantic_gain,
-            "semantic_gain_breakdown": dict(frontier.semantic_gain_breakdown),
         }
         if target is not None:
             metadata.update({
@@ -822,10 +854,6 @@ class PlatformExplorationRuntime:
         frontier_freshness = metadata.get("frontier_freshness")
         if isinstance(frontier_freshness, dict):
             state.frontier_freshness.update(frontier_freshness)
-        semantic_context = metadata.get("semantic_exploration_context")
-        if isinstance(semantic_context, dict):
-            state.semantic_context.update(semantic_context)
-            state.metadata["semantic_exploration_context"] = dict(state.semantic_context)
 
     def _frontier_revision(self, state: ExplorationRuntimeState) -> str:
         return "map=%s|costmap=%s|pose=%s|round=%d" % (
@@ -844,12 +872,12 @@ class PlatformExplorationRuntime:
         if state.phase == ExplorationRuntimePhase.PLANNING:
             if state.waiting_for == "current_pose":
                 return "当前定位尚未就绪，等待探索起步条件。"
-            if state.waiting_for in {"occupancy_grid", "map"}:
-                return "当前探索地图尚未就绪，等待首帧地图。"
+            if state.waiting_for in ("occupancy_grid", "map"):
+                return "当前 /map 占据栅格尚未就绪，等待 SLAM 首帧地图。"
             if state.waiting_for == "costmap":
-                return "当前 costmap 尚未就绪，等待安全代价地图。"
+                return "Nav2 global costmap 尚未就绪，请检查 amcl 是否发布 map→odom TF 与 nav2 lifecycle 是否全部 active。"
             if state.waiting_for == "frontier":
-                return "当前地图尚未产生可达 frontier。"
+                return "live map/costmap/pose 暂未产生可达 frontier；若持续如此，请检查 amcl 是否健康（map→odom TF 是否在更新）。"
             return "正在规划下一个 frontier。"
         if state.phase == ExplorationRuntimePhase.MOVING_TO_FRONTIER:
             if state.current_target is None:

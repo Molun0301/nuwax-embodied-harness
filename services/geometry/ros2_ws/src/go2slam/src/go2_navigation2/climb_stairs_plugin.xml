@@ -1,0 +1,7 @@
+<library path="climb_stairs_task">
+  <class type="go2_navigation2::ClimbStairsTask" base_class_type="nav2_core::WaypointTaskExecutor">
+    <description>
+      Waypoint task executor for climbing stairs by sending fixed velocity commands
+    </description>
+  </class>
+</library>

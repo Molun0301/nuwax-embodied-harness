@@ -86,12 +86,15 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         return _stream_migration_response(
             'robot.state',
             'map.frame',
+            'map.heartbeat',
             'localization.pose',
             'navigation.state',
             'exploration.state',
             'runtime.governance',
             'pointcloud_map.meta',
             'pointcloud.frame',
+            'video.frame',
+            'video.detections',
             'logs.entry',
             'tasks.state',
         )
@@ -384,8 +387,11 @@ def _render_debug_page(access_token: str) -> str:
     .map-info-grid { grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); margin-top: 10px; max-height: 176px; overflow: auto; padding-right: 2px; }
     .video-stage { position: relative; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border-soft); background: var(--occupied); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04); }
     .video-frame { display: block; width: 100%; min-height: 210px; max-height: 300px; object-fit: contain; background: var(--occupied); }
-    .video-overlay { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; justify-content: space-between; gap: 8px; pointer-events: none; }
+    .video-detection-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .video-overlay { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; pointer-events: none; }
     .overlay-chip { border: 1px solid var(--border-strong); background: var(--surface-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: var(--accent-strong); backdrop-filter: blur(10px); }
+    .overlay-toggle { display: inline-flex; align-items: center; gap: 6px; pointer-events: auto; cursor: pointer; }
+    .overlay-toggle input { accent-color: var(--accent); }
     .legend { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 9px; }
     .legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px; }
     .swatch { width: 12px; height: 12px; border: 1px solid var(--border); border-radius: 4px; }
@@ -670,17 +676,19 @@ def _render_debug_page(access_token: str) -> str:
                 <div id="video-pane" class="tab-pane">
                   <section id="video-perception" class="panel compact">
                     <div class="card-head">
-                      <h3>视频感知</h3>
+                      <h3>端侧推流视频感知</h3>
                       <span id="videoStatus" class="pill missing">missing</span>
                     </div>
                     <div class="video-stage">
-                      <img id="videoFrame" class="video-frame" alt="实时视频帧" hidden>
+                      <img id="videoFrame" class="video-frame" alt="Go2 端侧推流视频帧" hidden>
+                      <canvas id="videoDetections" class="video-detection-canvas" hidden></canvas>
                       <div class="video-overlay">
                         <span id="visionModelStatus" class="overlay-chip">本地模型：--</span>
                         <span id="videoFpsStatus" class="overlay-chip">帧率：--</span>
+                        <label class="overlay-chip overlay-toggle"><input id="showDetections" type="checkbox">显示检测框</label>
                       </div>
                     </div>
-                    <div id="videoEmpty" class="empty panel-meta">等待视频帧。</div>
+                    <div id="videoEmpty" class="empty panel-meta">等待 Go2 端侧视频推流。</div>
                     <div id="videoMeta" class="kv panel-meta"></div>
                   </section>
                 </div>
@@ -744,6 +752,12 @@ def _render_debug_page(access_token: str) -> str:
       };
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", logs: "日志" };
+      const OVERVIEW_RENDER_INTERVAL_MS = 500;
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.state", "exploration.frontier", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state"];
+      const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
+      const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
+      const VIDEO_JPEG_DECODE_TIMEOUT_MS = 3000;
+      const MJPEG_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
       const state = {
         mapGrid: null,
         mapViewport: null,
@@ -760,8 +774,33 @@ def _render_debug_page(access_token: str) -> str:
         streamReconnectTimer: null,
         latestStreamCursor: 0,
         latestStreamFrames: {},
+        pendingStreamFrames: {},
+        pendingLogFrames: [],
+        streamFlushFrame: null,
         videoFrames: 0,
+        pendingVideoEnvelope: null,
+        videoRenderFrame: null,
+        lastVideoFrameKey: null,
+        videoStreamSrc: null,
+        videoStreamController: null,
+        videoStreamGeneration: 0,
+        videoStreamReconnectTimer: null,
+        videoStreamReconnectDelayMs: VIDEO_STREAM_INITIAL_RECONNECT_MS,
+        videoStreamStatus: "idle",
+        videoStreamBytes: 0,
+        videoDecodedBytes: 0,
+        videoDecodeErrors: 0,
+        videoLastError: "",
+        videoLastFrameAt: null,
+        videoCurrentObjectUrl: null,
+        showDetections: false,
+        videoDetections: [],
+        videoSourceSize: null,
+        videoDetectionDrawFrame: null,
         latestOverview: null,
+        overviewRenderTimer: null,
+        overviewLastRenderAt: 0,
+        overviewReceivedAt: null,
         latestHealth: null,
         latestTasks: { active_tasks: [], history_tasks: [] },
         taskActiveById: new Map(),
@@ -770,7 +809,9 @@ def _render_debug_page(access_token: str) -> str:
         lastRobotStateHash: null,
         logFilter: "",
         logSearch: "",
-        mapResizeFrame: null,
+        mapDrawFrame: null,
+        mapBaseCache: null,
+        mapGridContentKey: "",
       };
       const els = {
         robotName: document.getElementById("robotName"),
@@ -809,6 +850,8 @@ def _render_debug_page(access_token: str) -> str:
         governanceMeta: document.getElementById("governanceMeta"),
         videoStatus: document.getElementById("videoStatus"),
         videoFrame: document.getElementById("videoFrame"),
+        videoDetections: document.getElementById("videoDetections"),
+        showDetections: document.getElementById("showDetections"),
         videoEmpty: document.getElementById("videoEmpty"),
         videoMeta: document.getElementById("videoMeta"),
         visionModelStatus: document.getElementById("visionModelStatus"),
@@ -900,11 +943,7 @@ def _render_debug_page(access_token: str) -> str:
         return true;
       }
       function redrawMapAfterResize() {
-        if (state.mapResizeFrame) window.cancelAnimationFrame(state.mapResizeFrame);
-        state.mapResizeFrame = window.requestAnimationFrame(() => {
-          state.mapResizeFrame = null;
-          drawMap();
-        });
+        requestMapDraw(false);
       }
       function statusSeverity(status) {
         const value = statusClass(status || "missing");
@@ -953,7 +992,7 @@ def _render_debug_page(access_token: str) -> str:
       function updateOverview(envelope) {
         const data = envelope && envelope.data ? envelope.data : {};
         state.latestOverview = data;
-        setText(els.connectionText, "online");
+        if (!state.streamSocket || state.streamSocket.readyState !== WebSocket.OPEN) setText(els.connectionText, "online");
         setText(els.networkLatency, fmt(envelope.__frontendLatencyMs, " ms"));
         for (const name of overviewNames) {
           const summary = data[name] || {};
@@ -1241,22 +1280,34 @@ def _render_debug_page(access_token: str) -> str:
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
       }
-      function drawMap() {
-        syncMapCanvasSize();
-        const canvas = els.mapCanvas;
-        const ctx = canvas.getContext("2d");
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = CANVAS_THEME.mapBackground;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        const grid = state.mapGrid;
-        const anchor = cameraAnchor();
-        const scale = cameraScale(anchor);
-        state.mapViewport = { centerX: canvas.width / 2, centerY: canvas.height / 2, scale, zoom: state.mapZoom, robotLocked: anchor.locked };
-        if (els.mapZoomValue) els.mapZoomValue.textContent = `${Math.round(state.mapZoom * 100)}%`;
-        if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) return;
+      function requestMapDraw(baseDirty) {
+        if (baseDirty) state.mapBaseCache = null;
+        if (state.mapDrawFrame) return;
+        state.mapDrawFrame = window.requestAnimationFrame(() => {
+          state.mapDrawFrame = null;
+          drawMap();
+        });
+      }
+      function mapGridDataSignature(grid) {
+        const data = grid && Array.isArray(grid.data) ? grid.data : [];
+        if (!data.length) return "empty";
+        let hash = 2166136261;
+        for (let index = 0; index < data.length; index += 1) {
+          hash ^= (Number(data[index]) + 129) & 255;
+          hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return `${data.length}:${hash.toString(16)}`;
+      }
+      function mapGridContentKey(grid, envelope, diagnostics) {
+        if (!grid) return "missing";
+        const origin = originPosition(grid);
+        const revision = (diagnostics && (diagnostics.occupancy_content_hash || diagnostics.content_hash || diagnostics.grid_hash || diagnostics.occupancy_content_revision || diagnostics.content_revision || diagnostics.revision)) || (grid.metadata && (grid.metadata.occupancy_content_hash || grid.metadata.content_hash || grid.metadata.grid_hash || grid.metadata.occupancy_content_revision || grid.metadata.content_revision || grid.metadata.revision)) || envelope.revision || grid.revision || mapGridDataSignature(grid);
+        return [grid.frame_id || envelope.frame_id || "", grid.width, grid.height, grid.resolution_m, Number(origin.x || 0), Number(origin.y || 0), originYaw(grid), revision].join("|");
+      }
+      function ensureMapBaseCanvas(ctx, grid) {
         const width = Number(grid.width);
         const height = Number(grid.height);
+        if (state.mapBaseCache && state.mapBaseCache.key === state.mapGridContentKey && state.mapBaseCache.width === width && state.mapBaseCache.height === height) return state.mapBaseCache.canvas;
         const image = ctx.createImageData(width, height);
         for (let row = 0; row < height; row += 1) {
           for (let col = 0; col < width; col += 1) {
@@ -1276,6 +1327,26 @@ def _render_debug_page(access_token: str) -> str:
         offscreen.width = width;
         offscreen.height = height;
         offscreen.getContext("2d").putImageData(image, 0, 0);
+        state.mapBaseCache = { key: state.mapGridContentKey, width, height, canvas: offscreen };
+        return offscreen;
+      }
+      function drawMap() {
+        syncMapCanvasSize();
+        const canvas = els.mapCanvas;
+        const ctx = canvas.getContext("2d");
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = CANVAS_THEME.mapBackground;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const grid = state.mapGrid;
+        const anchor = cameraAnchor();
+        const scale = cameraScale(anchor);
+        state.mapViewport = { centerX: canvas.width / 2, centerY: canvas.height / 2, scale, zoom: state.mapZoom, robotLocked: anchor.locked };
+        if (els.mapZoomValue) els.mapZoomValue.textContent = `${Math.round(state.mapZoom * 100)}%`;
+        if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) return;
+        const width = Number(grid.width);
+        const height = Number(grid.height);
+        const offscreen = ensureMapBaseCanvas(ctx, grid);
         ctx.save();
         applyCameraTransform(ctx, anchor, scale);
         const origin = originPosition(grid);
@@ -1386,18 +1457,26 @@ def _render_debug_page(access_token: str) -> str:
         const grid = data.occupancy_grid || (data.map_snapshot && data.map_snapshot.occupancy_grid) || null;
         const diagnostics = data.diagnostics || data.metadata || (data.map_snapshot && data.map_snapshot.metadata) || {};
         const streamBridge = diagnostics.stream_bridge || {};
-        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp };
-        setPill(els.mapStatus, status);
-        if (grid && Array.isArray(grid.data)) {
+        const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
+        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp, cleared };
+        setPill(els.mapStatus, cleared ? "cleared" : status);
+        if (!cleared && grid && Array.isArray(grid.data)) {
+          const nextContentKey = mapGridContentKey(grid, envelope, diagnostics);
+          const baseDirty = state.mapGridContentKey !== nextContentKey;
           state.mapGrid = grid;
+          state.mapGridContentKey = nextContentKey;
           els.mapEmpty.hidden = status === "available";
           els.mapEmpty.textContent = status === "stale" ? "地图数据已过期，保留最后一帧。" : "";
-          drawMap();
+          requestMapDraw(baseDirty);
         } else {
           state.mapGrid = null;
-          drawMap();
+          state.mapGridContentKey = "";
+          state.mapBaseCache = null;
+          requestMapDraw(true);
           els.mapEmpty.hidden = false;
-          els.mapEmpty.textContent = errorReason(envelope, "无 occupancy_grid，占据栅格不可用。");
+          els.mapEmpty.textContent = cleared
+            ? mapClearedMessage(diagnostics)
+            : errorReason(envelope, "无 occupancy_grid，占据栅格不可用。");
         }
         setKv(els.mapMeta, [
           ["frame", envelope.frame_id || (grid && grid.frame_id)],
@@ -1406,25 +1485,75 @@ def _render_debug_page(access_token: str) -> str:
           ["source_timestamp", shortTime(envelope.source_timestamp)],
           ["revision", envelope.revision || diagnostics.content_revision],
           ["sequence", envelope.sequence || diagnostics.message_count],
-          ["streaming", mapStreamLabel(status, diagnostics, streamBridge)],
+          ["streaming", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["stale", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
-        updateMapStreamChip(status, diagnostics, streamBridge, envelope.source_timestamp);
+        updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
+      }
+      function isMapClearedEnvelope(envelope, diagnostics, status) {
+        if (status === "cleared") return true;
+        const eventType = diagnostics && (diagnostics.event_type || diagnostics.suppressed_live_map_reason);
+        if (typeof eventType === "string" && (eventType === "catalog_cleared" || eventType === "workspace_cleared")) return true;
+        return false;
+      }
+      function mapClearedMessage(diagnostics) {
+        const cleared = diagnostics && (diagnostics.cleared_map_name || diagnostics.previous_active_map_name);
+        const reason = diagnostics && diagnostics.reason;
+        if (cleared && reason) return `地图 ${cleared} 已清空（${reason}）。`;
+        if (cleared) return `地图 ${cleared} 已清空。`;
+        if (reason) return `地图已清空（${reason}）。`;
+        return "地图已清空，等待新工作区激活。";
       }
       function mapStreamLabel(status, diagnostics, streamBridge) {
-        const messageCount = diagnostics && (diagnostics.message_count || diagnostics.sequence);
-        const revision = diagnostics && (diagnostics.content_revision || diagnostics.revision);
+        const messageCount = diagnostics && (diagnostics.message_count || diagnostics.update_sequence || diagnostics.sequence);
+        const revision = diagnostics && (diagnostics.content_revision || diagnostics.occupancy_content_revision || diagnostics.revision);
         const delta = diagnostics && diagnostics.message_count_delta;
         const bridgeStatus = streamBridge && (streamBridge.status || streamBridge.state || streamBridge.mode);
         if (!messageCount) return status === "available" ? "首帧已缓存" : "等待首帧";
-        const live = status === "available" && (delta === undefined || delta === null || Number(delta) > 0 || diagnostics.live_mapping_ready === true);
+        const live = status === "available" && (delta === undefined || delta === null || Number(delta) > 0 || diagnostics.live_mapping_ready === true || diagnostics.source_alive === true);
         return `${live ? "实时流" : "离线资产/缓存"} rev=${safeText(revision)} seq=${safeText(messageCount)} bridge=${safeText(bridgeStatus)}`;
       }
       function updateMapStreamChip(status, diagnostics, streamBridge, timestamp) {
         if (!els.mapStreamStatus) return;
         els.mapStreamStatus.textContent = `${mapStreamLabel(status, diagnostics, streamBridge)} · ${shortTime(timestamp)}`;
+      }
+      function updateMapHeartbeat(envelope) {
+        const status = statusOf(envelope);
+        const heartbeat = envelope.data || {};
+        const diagnostics = { ...((state.mapStream && state.mapStream.diagnostics) || {}), ...(envelope.metadata || {}), ...heartbeat };
+        const streamBridge = diagnostics.stream_bridge || {};
+        const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
+        if (cleared) {
+          state.mapGrid = null;
+          state.mapGridContentKey = "";
+          state.mapBaseCache = null;
+          requestMapDraw(true);
+        }
+        const grid = cleared ? null : state.mapGrid;
+        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision || diagnostics.content_revision, sequence: envelope.sequence || diagnostics.update_sequence, timestamp: envelope.source_timestamp, cleared };
+        setPill(els.mapStatus, cleared ? "cleared" : status);
+        if (!cleared && grid && Array.isArray(grid.data)) {
+          els.mapEmpty.hidden = true;
+          els.mapEmpty.textContent = "";
+        } else {
+          els.mapEmpty.hidden = false;
+          els.mapEmpty.textContent = cleared ? mapClearedMessage(diagnostics) : "地图源在线，等待内容更新帧。";
+        }
+        setKv(els.mapMeta, [
+          ["frame", envelope.frame_id || diagnostics.frame_id || (grid && grid.frame_id)],
+          ["size", grid ? `${grid.width} x ${grid.height}` : "--"],
+          ["resolution", grid ? `${grid.resolution_m} m` : "--"],
+          ["source_timestamp", shortTime(envelope.source_timestamp)],
+          ["revision", envelope.revision || diagnostics.content_revision],
+          ["sequence", envelope.sequence || diagnostics.update_sequence || diagnostics.message_count],
+          ["streaming", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
+          ["latency", fmt(envelope.latency_ms, " ms")],
+          ["stale", envelope.stale === true ? "true" : "false"],
+          ["前端接收", shortTime(envelope.__receivedAt)],
+        ]);
+        updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
       }
       function updateLocalization(envelope) {
         const status = statusOf(envelope);
@@ -1452,7 +1581,7 @@ def _render_debug_page(access_token: str) -> str:
           ["trajectory", state.trajectory.length],
           ["latency", fmt(envelope.latency_ms, " ms")],
         ]);
-        drawMap();
+        requestMapDraw(false);
       }
       function firstArrayValue(...values) {
         for (const value of values) {
@@ -1557,35 +1686,491 @@ def _render_debug_page(access_token: str) -> str:
         ]);
         els.frontierNotice.hidden = Boolean(frontiers && frontiers.length);
         els.frontierNotice.textContent = frontiers && frontiers.length ? "" : "当前探索上下文还没有 frontier 几何，请确认探索运行态已生成候选。";
-        drawMap();
+        requestMapDraw(false);
+      }
+      function scheduleVideoUpdate(envelope) {
+        state.pendingVideoEnvelope = envelope;
+        if (state.videoRenderFrame) return;
+        state.videoRenderFrame = window.requestAnimationFrame(() => {
+          state.videoRenderFrame = null;
+          const next = state.pendingVideoEnvelope;
+          state.pendingVideoEnvelope = null;
+          if (next) updateVideo(next);
+        });
+      }
+      function buildVideoFrameSrc(data) {
+        if (data.stream_url) {
+          const url = new URL(data.stream_url, window.location.origin);
+          if (!url.searchParams.get("fps")) url.searchParams.set("fps", "15");
+          if (apiAccessToken && !url.searchParams.get("access_token")) url.searchParams.set("access_token", apiAccessToken);
+          return url.toString();
+        }
+        return data.data_uri || data.uri || "";
+      }
+      function revokeVideoObjectUrl() {
+        if (!state.videoCurrentObjectUrl) return;
+        try {
+          URL.revokeObjectURL(state.videoCurrentObjectUrl);
+        } catch (err) {
+          // 忽略浏览器释放失败；下一帧会覆盖显示。
+        }
+        state.videoCurrentObjectUrl = null;
+      }
+      function setVideoStreamStatus(status, message) {
+        state.videoStreamStatus = status;
+        if (message) {
+          els.videoEmpty.hidden = state.videoFrames > 0 && status === "rendering";
+          els.videoEmpty.textContent = message;
+        }
+        setText(
+          els.videoFpsStatus,
+          `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${status}`
+        );
+      }
+      function scheduleVideoStreamReconnect(reason) {
+        if (!state.videoStreamSrc) return;
+        if (state.videoStreamReconnectTimer) return;
+        const delayMs = state.videoStreamReconnectDelayMs;
+        const nextDelayMs = Math.min(VIDEO_STREAM_MAX_RECONNECT_MS, Math.max(VIDEO_STREAM_INITIAL_RECONNECT_MS, delayMs * 1.6));
+        setVideoStreamStatus("reconnecting", `${reason || "MJPEG 视频流中断"}，${Math.round(delayMs)} ms 后重连。`);
+        state.videoStreamReconnectTimer = window.setTimeout(() => {
+          state.videoStreamReconnectTimer = null;
+          state.videoStreamReconnectDelayMs = nextDelayMs;
+          startVideoStream({ force: true, reason: "reconnect" });
+        }, delayMs);
+      }
+      function stopVideoStream(reason) {
+        state.videoStreamGeneration += 1;
+        if (state.videoStreamController) {
+          try {
+            state.videoStreamController.abort();
+          } catch (err) {
+            // AbortController 可能已结束。
+          }
+          state.videoStreamController = null;
+        }
+        if (state.videoStreamReconnectTimer) {
+          window.clearTimeout(state.videoStreamReconnectTimer);
+          state.videoStreamReconnectTimer = null;
+        }
+        setVideoStreamStatus("stopped", reason || "视频流已停止。");
+      }
+      function clearVideoDisplay(reason) {
+        stopVideoStream(reason);
+        revokeVideoObjectUrl();
+        els.videoFrame.removeAttribute("src");
+        els.videoFrame.hidden = true;
+        state.videoStreamSrc = null;
+        state.lastVideoFrameKey = null;
+      }
+      function startVideoStream(options) {
+        const opts = options || {};
+        const videoSrc = opts.streamUrl
+          ? new URL(opts.streamUrl, window.location.origin).toString()
+          : buildVideoFrameSrc({ stream_url: DEFAULT_VIDEO_STREAM_URL });
+        if (!videoSrc) return;
+        if (!opts.force && state.videoStreamSrc === videoSrc && state.videoStreamController) return;
+        const reconnectDelay = opts.reason === "reconnect" ? state.videoStreamReconnectDelayMs : VIDEO_STREAM_INITIAL_RECONNECT_MS;
+        if (state.videoStreamController) {
+          try {
+            state.videoStreamController.abort();
+          } catch (err) {
+            // 旧连接可能已结束。
+          }
+          state.videoStreamController = null;
+        }
+        if (state.videoStreamReconnectTimer) {
+          window.clearTimeout(state.videoStreamReconnectTimer);
+          state.videoStreamReconnectTimer = null;
+        }
+        state.videoStreamReconnectDelayMs = reconnectDelay;
+        state.videoStreamGeneration += 1;
+        state.videoStreamSrc = videoSrc;
+        const generation = state.videoStreamGeneration;
+        const controller = new AbortController();
+        state.videoStreamController = controller;
+        state.videoStreamBytes = 0;
+        state.videoDecodedBytes = 0;
+        state.videoLastError = "";
+        setVideoStreamStatus("connecting", "正在连接平台转发的 Go2 端侧 MJPEG 视频流。");
+        consumeMjpegStream(videoSrc, controller.signal, generation).catch((err) => {
+          if (generation !== state.videoStreamGeneration || controller.signal.aborted) return;
+          const message = err && err.message ? err.message : String(err || "未知错误");
+          state.videoLastError = message;
+          state.videoDecodeErrors += 1;
+          state.videoStreamController = null;
+          scheduleVideoStreamReconnect(`MJPEG 解码流失败：${message}`);
+        });
+      }
+      function resetVideoStreamFromMetadata(videoSrc) {
+        if (!videoSrc) return false;
+        const latestRenderedAgeMs = state.videoLastFrameAt ? Date.now() - state.videoLastFrameAt : Infinity;
+        if (
+          state.videoStreamSrc === videoSrc
+          && !state.videoStreamController
+          && !state.videoStreamReconnectTimer
+          && latestRenderedAgeMs > VIDEO_STREAM_MAX_RECONNECT_MS
+        ) {
+          startVideoStream({ streamUrl: videoSrc, force: true, reason: "metadata_watchdog" });
+          return true;
+        }
+        return false;
+      }
+      async function consumeMjpegStream(videoSrc, signal, generation) {
+        const response = await fetch(videoSrc, { method: "GET", cache: "no-store", signal });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        if (!response.body || !response.body.getReader) {
+          throw new Error("当前浏览器不支持 ReadableStream MJPEG 解码。");
+        }
+        state.videoStreamReconnectDelayMs = VIDEO_STREAM_INITIAL_RECONNECT_MS;
+        setVideoStreamStatus("streaming", "已连接 MJPEG 字节流，等待首帧 JPEG 解码。");
+        const reader = response.body.getReader();
+        let buffer = new Uint8Array(0);
+        try {
+          while (generation === state.videoStreamGeneration) {
+            const result = await reader.read();
+            if (result.done) break;
+            if (!result.value || !result.value.byteLength) continue;
+            state.videoStreamBytes += result.value.byteLength;
+            buffer = appendBytes(buffer, result.value);
+            if (buffer.byteLength > MJPEG_MAX_BUFFER_BYTES) {
+              const soi = findMarker(buffer, 0xff, 0xd8, Math.max(0, buffer.byteLength - 1024 * 1024));
+              buffer = soi >= 0 ? buffer.slice(soi) : new Uint8Array(0);
+              if (!buffer.byteLength) throw new Error("MJPEG 缓冲区超过上限且未找到 JPEG 起始标记。");
+            }
+            let parsedAny = false;
+            let latestFrameBytes = null;
+            while (true) {
+              const parsed = extractNextJpeg(buffer);
+              if (!parsed) break;
+              if (!parsed.frame) {
+                buffer = parsed.remaining;
+                break;
+              }
+              parsedAny = true;
+              latestFrameBytes = parsed.frame;
+              buffer = parsed.remaining;
+            }
+            if (latestFrameBytes) {
+              try {
+                await renderDecodedVideoFrame(latestFrameBytes, generation);
+              } catch (err) {
+                const message = err && err.message ? err.message : String(err || "未知错误");
+                state.videoLastError = message;
+                state.videoDecodeErrors += 1;
+                state.videoStreamController = null;
+                scheduleVideoStreamReconnect(`JPEG 帧解码失败：${message}`);
+                return;
+              }
+            }
+            if (!parsedAny && state.videoFrames === 0) {
+              setVideoStreamStatus("streaming", `已接收 ${state.videoStreamBytes} 字节，等待完整 JPEG 帧。`);
+            }
+          }
+        } finally {
+          try {
+            reader.releaseLock();
+          } catch (err) {
+            // 读取器可能已经释放。
+          }
+        }
+        if (generation === state.videoStreamGeneration) {
+          state.videoStreamController = null;
+          scheduleVideoStreamReconnect("MJPEG 字节流已结束");
+        }
+      }
+      function appendBytes(left, right) {
+        if (!left || !left.byteLength) return right;
+        const merged = new Uint8Array(left.byteLength + right.byteLength);
+        merged.set(left, 0);
+        merged.set(right, left.byteLength);
+        return merged;
+      }
+      function findMarker(bytes, a, b, start) {
+        const begin = Math.max(0, Number(start || 0));
+        for (let i = begin; i < bytes.byteLength - 1; i += 1) {
+          if (bytes[i] === a && bytes[i + 1] === b) return i;
+        }
+        return -1;
+      }
+      function extractNextJpeg(buffer) {
+        const soi = findMarker(buffer, 0xff, 0xd8, 0);
+        if (soi < 0) {
+          return {
+            frame: null,
+            remaining: buffer.byteLength > 2 ? buffer.slice(buffer.byteLength - 2) : buffer,
+          };
+        }
+        const eoi = findMarker(buffer, 0xff, 0xd9, soi + 2);
+        if (eoi < 0) {
+          return {
+            frame: null,
+            remaining: soi > 0 ? buffer.slice(soi) : buffer,
+          };
+        }
+        const frame = buffer.slice(soi, eoi + 2);
+        const remaining = buffer.slice(eoi + 2);
+        if (!frame.byteLength) return null;
+        return { frame, remaining };
+      }
+      async function decodeJpegBlob(blob) {
+        let probeUrl = null;
+        if (typeof createImageBitmap === "function") {
+          const timeout = new Promise((_, reject) => {
+            window.setTimeout(() => reject(new Error("JPEG 解码超时")), VIDEO_JPEG_DECODE_TIMEOUT_MS);
+          });
+          const bitmap = await Promise.race([createImageBitmap(blob), timeout]);
+          if (bitmap && typeof bitmap.close === "function") bitmap.close();
+        } else {
+          try {
+            await new Promise((resolve, reject) => {
+              const probe = new Image();
+              let settled = false;
+              const timer = window.setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                reject(new Error("JPEG 解码超时"));
+              }, VIDEO_JPEG_DECODE_TIMEOUT_MS);
+              probe.onload = () => {
+                if (settled) return;
+                settled = true;
+                window.clearTimeout(timer);
+                resolve();
+              };
+              probe.onerror = () => {
+                if (settled) return;
+                settled = true;
+                window.clearTimeout(timer);
+                reject(new Error("JPEG 解码失败"));
+              };
+              probeUrl = URL.createObjectURL(blob);
+              probe.src = probeUrl;
+            });
+          } finally {
+            if (probeUrl) URL.revokeObjectURL(probeUrl);
+          }
+        }
+      }
+      async function renderDecodedVideoFrame(frameBytes, generation) {
+        if (!frameBytes || !frameBytes.byteLength) return;
+        const blob = new Blob([frameBytes], { type: "image/jpeg" });
+        await decodeJpegBlob(blob);
+        if (generation !== state.videoStreamGeneration) return;
+        const nextUrl = await displayVideoBlob(blob, generation);
+        if (generation !== state.videoStreamGeneration) {
+          try {
+            URL.revokeObjectURL(nextUrl);
+          } catch (err) {
+            // 过期帧释放失败不影响下一轮。
+          }
+          return;
+        }
+        state.videoCurrentObjectUrl = nextUrl;
+        state.videoDecodedBytes += frameBytes.byteLength;
+        state.videoFrames += 1;
+        state.videoLastFrameAt = Date.now();
+        state.videoStreamStatus = "rendering";
+        els.videoFrame.hidden = false;
+        els.videoEmpty.hidden = true;
+        scheduleVideoDetectionDraw();
+      }
+      async function displayVideoBlob(blob, generation) {
+        const nextUrl = URL.createObjectURL(blob);
+        const previousUrl = state.videoCurrentObjectUrl;
+        try {
+          await new Promise((resolve, reject) => {
+            let settled = false;
+            const timer = window.setTimeout(() => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(new Error("JPEG 显示超时"));
+            }, VIDEO_JPEG_DECODE_TIMEOUT_MS);
+            function cleanup() {
+              window.clearTimeout(timer);
+              els.videoFrame.removeEventListener("load", onLoad);
+              els.videoFrame.removeEventListener("error", onError);
+            }
+            function onLoad() {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve();
+            }
+            function onError() {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(new Error("JPEG 显示失败"));
+            }
+            els.videoFrame.addEventListener("load", onLoad, { once: true });
+            els.videoFrame.addEventListener("error", onError, { once: true });
+            if (generation !== state.videoStreamGeneration) {
+              settled = true;
+              cleanup();
+              resolve();
+              return;
+            }
+            els.videoFrame.src = nextUrl;
+          });
+        } catch (err) {
+          try {
+            URL.revokeObjectURL(nextUrl);
+          } catch (revokeErr) {
+            // 忽略失败。
+          }
+          throw err;
+        }
+        if (generation !== state.videoStreamGeneration) return nextUrl;
+        if (previousUrl) {
+          window.setTimeout(() => {
+            try {
+              URL.revokeObjectURL(previousUrl);
+            } catch (err) {
+              // 旧帧 URL 释放失败不影响后续实时帧。
+            }
+          }, 250);
+        }
+        return nextUrl;
       }
       function updateVideo(envelope) {
         const status = statusOf(envelope);
         const data = envelope.data || {};
+        const detections = Array.isArray(data.detections_2d) ? data.detections_2d : null;
+        if (detections) {
+          updateVideoDetections(data, envelope);
+          return;
+        }
         setPill(els.videoStatus, status);
-        if (data.data_uri || data.uri) {
-          els.videoFrame.src = data.data_uri || data.uri;
-          els.videoFrame.hidden = false;
-          els.videoEmpty.hidden = true;
-          state.videoFrames += 1;
-        } else {
-          els.videoFrame.hidden = true;
-          els.videoEmpty.hidden = false;
-          els.videoEmpty.textContent = errorReason(envelope, "视频 provider 未返回图像帧。");
+        const videoSrc = buildVideoFrameSrc(data);
+        if (videoSrc) {
+          if (data.stream_url) {
+            if (state.videoStreamSrc !== videoSrc || (!state.videoStreamController && !state.videoStreamReconnectTimer)) {
+              startVideoStream({ streamUrl: videoSrc, force: state.videoStreamSrc !== videoSrc, reason: "metadata" });
+            } else {
+              resetVideoStreamFromMetadata(videoSrc);
+            }
+          } else if (state.lastVideoFrameKey !== videoSrc) {
+            stopVideoStream("切换到单帧图像显示。");
+            revokeVideoObjectUrl();
+            els.videoFrame.setAttribute("src", videoSrc);
+            state.videoStreamSrc = videoSrc;
+            state.lastVideoFrameKey = videoSrc;
+            state.videoFrames += 1;
+            state.videoLastFrameAt = Date.now();
+          }
+          if (data.width_px && data.height_px) state.videoSourceSize = { width: Number(data.width_px), height: Number(data.height_px) };
+          if (state.videoFrames > 0 || !data.stream_url) {
+            els.videoFrame.hidden = false;
+            els.videoEmpty.hidden = state.videoFrames > 0;
+          } else {
+            els.videoFrame.hidden = true;
+            els.videoEmpty.hidden = false;
+          }
+          scheduleVideoDetectionDraw();
+        } else if (!state.lastVideoFrameKey) {
+          clearVideoDisplay(errorReason(envelope, "尚未收到 Go2 端侧主动推送的视频帧。"));
+          els.videoEmpty.textContent = errorReason(envelope, "尚未收到 Go2 端侧主动推送的视频帧。");
         }
         setKv(els.videoMeta, [
           ["camera", data.camera_id],
           ["frame", envelope.frame_id || data.frame_id],
           ["size", data.width_px && data.height_px ? `${data.width_px} x ${data.height_px}` : "--"],
           ["encoding", data.encoding],
+          ["transport", data.transport],
+          ["ingest_connected", data.ingest_status && data.ingest_status.connected],
+          ["ingest_fps", data.ingest_status && fmt(data.ingest_status.fps_estimate, " fps")],
+          ["ingest_last_client", data.ingest_status && data.ingest_status.last_client_id],
+          ["stream_url", data.stream_url],
           ["payload_bytes", data.payload_bytes],
+          ["browser_stream", state.videoStreamStatus],
+          ["browser_bytes", state.videoStreamBytes],
+          ["decoded_bytes", state.videoDecodedBytes],
+          ["decode_errors", state.videoDecodeErrors],
+          ["last_decode_error", state.videoLastError],
+          ["detections", state.videoDetections.length],
           ["rendered_frames", state.videoFrames],
+          ["last_rendered_at", state.videoLastFrameAt ? new Date(state.videoLastFrameAt).toLocaleTimeString() : "--"],
           ["source_timestamp", shortTime(envelope.source_timestamp)],
           ["latency", fmt(envelope.latency_ms, " ms")],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         setText(els.visionModelStatus, `本地模型：${status}`);
-        setText(els.videoFpsStatus, `帧 ${state.videoFrames} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
+        setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${state.videoStreamStatus} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
+      }
+      function updateVideoDetections(data, envelope) {
+        state.videoDetections = Array.isArray(data.detections_2d) ? data.detections_2d : [];
+        if (data.width_px && data.height_px) state.videoSourceSize = { width: Number(data.width_px), height: Number(data.height_px) };
+        setPill(els.videoStatus, statusOf(envelope), `${state.videoDetections.length} detections`);
+        setText(els.visionModelStatus, `本地模型：${data.detector_backend || envelope.source || "perception"}`);
+        setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${state.videoStreamStatus}`);
+        scheduleVideoDetectionDraw();
+      }
+      function scheduleVideoDetectionDraw() {
+        if (state.videoDetectionDrawFrame) return;
+        state.videoDetectionDrawFrame = window.requestAnimationFrame(() => {
+          state.videoDetectionDrawFrame = null;
+          drawVideoDetections();
+        });
+      }
+      function drawVideoDetections() {
+        const canvas = els.videoDetections;
+        const image = els.videoFrame;
+        if (!canvas || !image || !state.showDetections || image.hidden || !state.videoDetections.length) {
+          if (canvas) {
+            canvas.hidden = true;
+            const context = canvas.getContext("2d");
+            if (context) context.clearRect(0, 0, canvas.width, canvas.height);
+          }
+          return;
+        }
+        const stageRect = canvas.parentElement.getBoundingClientRect();
+        const imageRect = image.getBoundingClientRect();
+        const width = Math.max(1, Math.round(stageRect.width));
+        const height = Math.max(1, Math.round(stageRect.height));
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+        const sourceWidth = Number((state.videoSourceSize && state.videoSourceSize.width) || image.naturalWidth || 0);
+        const sourceHeight = Number((state.videoSourceSize && state.videoSourceSize.height) || image.naturalHeight || 0);
+        if (!(sourceWidth > 0 && sourceHeight > 0)) {
+          canvas.hidden = true;
+          return;
+        }
+        const fitScale = Math.min(imageRect.width / sourceWidth, imageRect.height / sourceHeight);
+        const drawnWidth = sourceWidth * fitScale;
+        const drawnHeight = sourceHeight * fitScale;
+        const scaleX = fitScale;
+        const scaleY = fitScale;
+        const offsetX = imageRect.left - stageRect.left + (imageRect.width - drawnWidth) / 2;
+        const offsetY = imageRect.top - stageRect.top + (imageRect.height - drawnHeight) / 2;
+        const context = canvas.getContext("2d");
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.lineWidth = 2;
+        context.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
+        for (const detection of state.videoDetections) {
+          const bbox = detection && detection.bbox;
+          if (!bbox) continue;
+          const x = offsetX + Number(bbox.x_px || 0) * scaleX;
+          const y = offsetY + Number(bbox.y_px || 0) * scaleY;
+          const boxWidth = Number(bbox.width_px || 0) * scaleX;
+          const boxHeight = Number(bbox.height_px || 0) * scaleY;
+          if (!(boxWidth > 0 && boxHeight > 0)) continue;
+          const label = `${detection.label || "object"} ${detection.score !== undefined ? Math.round(Number(detection.score) * 100) + "%" : ""}`.trim();
+          context.strokeStyle = "#22d3ee";
+          context.fillStyle = "rgba(34, 211, 238, 0.16)";
+          context.strokeRect(x, y, boxWidth, boxHeight);
+          context.fillRect(x, y, boxWidth, boxHeight);
+          const labelWidth = Math.min(context.measureText(label).width + 10, Math.max(50, boxWidth));
+          context.fillStyle = "rgba(2, 6, 23, 0.82)";
+          context.fillRect(x, Math.max(0, y - 20), labelWidth, 18);
+          context.fillStyle = "#e0f2fe";
+          context.fillText(label, x + 5, Math.max(12, y - 7));
+        }
+        canvas.hidden = false;
       }
       function updateLogs(envelope) {
         const status = statusOf(envelope);
@@ -1642,9 +2227,11 @@ def _render_debug_page(access_token: str) -> str:
           els.logs.appendChild(line);
         }
       }
+      const DEFAULT_VIDEO_STREAM_URL = "/streams/video.mjpeg";
       const STREAM_TOPICS = [
         "robot.state",
         "map.frame",
+        "map.heartbeat",
         "localization.pose",
         "localization.frame_tree",
         "localization.trajectory",
@@ -1655,6 +2242,7 @@ def _render_debug_page(access_token: str) -> str:
         "pointcloud_map.meta",
         "pointcloud.frame",
         "video.frame",
+        "video.detections",
         "logs.entry",
         "tasks.state"
       ];
@@ -1724,12 +2312,43 @@ def _render_debug_page(access_token: str) -> str:
       function handleStreamFrame(frame) {
         state.latestStreamCursor = Math.max(state.latestStreamCursor || 0, Number(frame.cursor || 0));
         state.latestStreamFrames[frame.topic] = frame;
+        if (frame.topic === "logs.entry") {
+          state.pendingLogFrames.push(frame);
+          if (state.pendingLogFrames.length > 200) state.pendingLogFrames.splice(0, state.pendingLogFrames.length - 200);
+        } else {
+          state.pendingStreamFrames[frame.topic] = frame;
+        }
         els.lastReceive.textContent = nowText();
         setText(els.connectionText, "streaming");
+        scheduleStreamFlush();
+      }
+      function scheduleStreamFlush() {
+        if (state.streamFlushFrame) return;
+        state.streamFlushFrame = window.requestAnimationFrame(flushStreamFrames);
+      }
+      function flushStreamFrames() {
+        state.streamFlushFrame = null;
+        const pending = state.pendingStreamFrames;
+        const logFrames = state.pendingLogFrames;
+        state.pendingStreamFrames = {};
+        state.pendingLogFrames = [];
+        for (const topic of STREAM_FLUSH_ORDER) {
+          const frame = pending[topic];
+          if (!frame) continue;
+          delete pending[topic];
+          processStreamFrame(frame);
+        }
+        for (const topic of Object.keys(pending)) processStreamFrame(pending[topic]);
+        if (logFrames.length) updateLogFrames(logFrames);
+      }
+      function processStreamFrame(frame) {
+        let updateOverviewForFrame = true;
         if (frame.topic === "robot.state") {
-          if (!updateRobotStateFrame(frame)) return;
+          updateOverviewForFrame = updateRobotStateFrame(frame);
         } else if (frame.topic === "map.frame") {
           updateMap(envelopeFromFrame(frame));
+        } else if (frame.topic === "map.heartbeat") {
+          updateMapHeartbeat(envelopeFromFrame(frame));
         } else if (frame.topic === "localization.pose") {
           updateLocalization(envelopeFromFrame(frame, { pose: frame.payload, trajectory: state.trajectory }));
         } else if (frame.topic === "localization.trajectory") {
@@ -1748,13 +2367,17 @@ def _render_debug_page(access_token: str) -> str:
         } else if (frame.topic === "pointcloud.frame") {
           updatePointcloudFrame(frame);
         } else if (frame.topic === "video.frame") {
-          updateVideo(envelopeFromFrame(frame));
+          scheduleVideoUpdate(envelopeFromFrame(frame));
+        } else if (frame.topic === "video.detections") {
+          updateVideoDetections(frame.payload || {}, envelopeFromFrame(frame));
         } else if (frame.topic === "logs.entry") {
           updateLogFrame(frame);
         } else if (frame.topic === "tasks.state") {
           updateTaskFrame(frame);
+        } else {
+          updateOverviewForFrame = false;
         }
-        updateStreamOverview(frame);
+        if (updateOverviewForFrame) updateStreamOverview(frame);
       }
       function robotStateChangeKey(frame) {
         const metadata = frame.metadata || {};
@@ -1800,9 +2423,9 @@ def _render_debug_page(access_token: str) -> str:
         const data = { pointcloud: { status: envelope.status, frame_id: envelope.frame_id, revision: envelope.revision, latency_ms: envelope.latency_ms, source_timestamp: envelope.source_timestamp, metadata: { source: envelope.source, point_count: payload.point_count || (frame.metadata && frame.metadata.point_count) } } };
         updateSensorSummary({ ...(state.latestOverview || {}), ...data });
       }
-      function updateLogFrame(frame) {
+      function logEntryFromFrame(frame) {
         const payload = frame.payload || {};
-        const entry = {
+        return {
           sequence: frame.sequence ?? frame.cursor,
           timestamp: payload.timestamp || frame.timestamp,
           level: String(payload.severity || frame.status || "info").toLowerCase(),
@@ -1810,10 +2433,23 @@ def _render_debug_page(access_token: str) -> str:
           event_type: payload.event_type,
           message: payload.message || payload.event_type || "runtime.event",
         };
-        updateLogs(envelopeFromFrame(frame, { entries: [entry], next_cursor: frame.cursor, source_status: "streaming", metrics: {} }));
+      }
+      function updateLogFrame(frame) {
+        updateLogFrames([frame]);
+      }
+      function updateLogFrames(frames) {
+        const latest = frames[frames.length - 1];
+        const entries = frames.map(logEntryFromFrame);
+        updateLogs(envelopeFromFrame(latest, { entries, next_cursor: latest.cursor, source_status: "streaming", metrics: {} }));
+        updateStreamOverview(latest);
       }
       function updateTaskFrame(frame) {
-        const event = frame.payload || {};
+        const framePayload = frame.payload || {};
+        if (Array.isArray(framePayload.active_tasks) || Array.isArray(framePayload.history_tasks)) {
+          replaceTaskStore(framePayload);
+          return;
+        }
+        const event = framePayload.event || framePayload;
         const payload = event.payload || {};
         const requestContext = payload.request_context || {};
         const taskId = event.task_id || payload.task_id || requestContext.task_id;
@@ -1843,6 +2479,7 @@ def _render_debug_page(access_token: str) -> str:
         const keyByTopic = {
           "robot.state": "state",
           "map.frame": "map",
+          "map.heartbeat": "map",
           "localization.pose": "localization",
           "navigation.state": "navigation",
           "exploration.state": "exploration",
@@ -1855,8 +2492,11 @@ def _render_debug_page(access_token: str) -> str:
         const key = keyByTopic[frame.topic];
         if (!key) return;
         const payload = frame.payload || {};
+        const pointcloudMeta = { source: frame.source, point_count: payload.point_count ?? (frame.metadata && frame.metadata.point_count) };
         const metadata = frame.topic === "pointcloud_map.meta"
-          ? { source: frame.source, source_kind: payload.source_kind || (frame.metadata && frame.metadata.source_kind), point_count: payload.point_count ?? (frame.metadata && frame.metadata.point_count), pcd_path: payload.pcd_path || (frame.metadata && frame.metadata.pcd_path) }
+          ? { ...pointcloudMeta, source_kind: payload.source_kind || (frame.metadata && frame.metadata.source_kind), pcd_path: payload.pcd_path || (frame.metadata && frame.metadata.pcd_path) }
+          : frame.topic === "pointcloud.frame" ? pointcloudMeta
+          : frame.topic === "map.heartbeat" ? { source: frame.source, event_type: payload.event_type || (frame.metadata && frame.metadata.event_type), message_count: payload.message_count, update_sequence: payload.update_sequence }
           : { source: frame.source };
         const overview = { ...(state.latestOverview || {}) };
         overview[key] = {
@@ -1869,7 +2509,24 @@ def _render_debug_page(access_token: str) -> str:
           metadata,
         };
         state.latestOverview = overview;
-        updateOverview({ data: overview, __receivedAt: new Date().toISOString(), __frontendLatencyMs: 0 });
+        state.overviewReceivedAt = new Date().toISOString();
+        scheduleOverviewRender(false);
+      }
+      function scheduleOverviewRender(immediate) {
+        if (!state.latestOverview) return;
+        const render = () => {
+          state.overviewRenderTimer = null;
+          state.overviewLastRenderAt = Date.now();
+          updateOverview({ data: state.latestOverview, __receivedAt: state.overviewReceivedAt || new Date().toISOString(), __frontendLatencyMs: 0 });
+        };
+        if (immediate) {
+          if (state.overviewRenderTimer) window.clearTimeout(state.overviewRenderTimer);
+          render();
+          return;
+        }
+        if (state.overviewRenderTimer) return;
+        const elapsed = Date.now() - state.overviewLastRenderAt;
+        state.overviewRenderTimer = window.setTimeout(render, Math.max(0, OVERVIEW_RENDER_INTERVAL_MS - elapsed));
       }
       buildOverview();
       renderLogs();
@@ -1882,9 +2539,27 @@ def _render_debug_page(access_token: str) -> str:
         window.addEventListener("resize", redrawMapAfterResize);
       }
       window.setInterval(updateClock, 1000);
+      els.showDetections.addEventListener("change", () => {
+        state.showDetections = Boolean(els.showDetections.checked);
+        scheduleVideoDetectionDraw();
+      });
+      els.videoFrame.addEventListener("load", () => {
+        els.videoFrame.hidden = false;
+        els.videoEmpty.hidden = true;
+        scheduleVideoDetectionDraw();
+      });
+      els.videoFrame.addEventListener("error", () => {
+        els.videoFrame.hidden = true;
+        els.videoEmpty.hidden = false;
+        state.videoLastError = "浏览器无法显示已解码 JPEG 帧。";
+        state.videoDecodeErrors += 1;
+        els.videoEmpty.textContent = "已收到 MJPEG 字节流，但浏览器显示解码后的 JPEG 帧失败。";
+      });
+      window.addEventListener("resize", scheduleVideoDetectionDraw);
+      startVideoStream();
       function setMapZoom(nextZoom) {
         state.mapZoom = Math.min(8, Math.max(0.25, nextZoom));
-        drawMap();
+        requestMapDraw(false);
       }
       els.mapZoomIn.addEventListener("click", () => setMapZoom(state.mapZoom * 1.25));
       els.mapZoomOut.addEventListener("click", () => setMapZoom(state.mapZoom / 1.25));
@@ -1990,6 +2665,8 @@ def _build_map_diagnostics(snapshot: Any, *, refresh_error: Optional[str] = None
     costmap_revision = _int_or_none(
         map_stream.get("costmap_revision") or status.get("cost_map_revision") or _metric_value(status, "cost_map_metrics", "content_revision")
     )
+    occupancy_content_hash = metadata.get("occupancy_content_hash") or map_stream.get("content_hash") or _metric_value(status, "occupancy_metrics", "content_hash")
+    cost_map_content_hash = metadata.get("cost_map_content_hash") or map_stream.get("costmap_hash") or _metric_value(status, "cost_map_metrics", "content_hash")
     diagnostics = {
         "source_timestamp": source_timestamp,
         "gateway_timestamp": gateway_timestamp,
@@ -2007,12 +2684,14 @@ def _build_map_diagnostics(snapshot: Any, *, refresh_error: Optional[str] = None
         "message_count_delta": map_stream.get("message_count_delta"),
         "stream_age_ms": map_stream.get("stream_age_ms") if map_stream.get("stream_age_ms") is not None else (cache_age * 1000.0 if cache_age is not None else None),
         "content_revision": content_revision,
-        "content_hash": map_stream.get("content_hash") or _metric_value(status, "occupancy_metrics", "content_hash"),
+        "occupancy_content_hash": occupancy_content_hash,
+        "content_hash": occupancy_content_hash,
         "known_cell_delta": map_stream.get("known_cell_delta") if map_stream.get("known_cell_delta") is not None else _metric_value(status, "occupancy_metrics", "known_cell_delta"),
         "known_cell_count": map_stream.get("known_cell_count") if map_stream.get("known_cell_count") is not None else _metric_value(status, "occupancy_metrics", "known_cell_count"),
         "costmap_delta": map_stream.get("costmap_delta") if map_stream.get("costmap_delta") is not None else _metric_value(status, "cost_map_metrics", "costmap_delta"),
         "costmap_revision": costmap_revision,
-        "costmap_hash": map_stream.get("costmap_hash") or _metric_value(status, "cost_map_metrics", "content_hash"),
+        "cost_map_content_hash": cost_map_content_hash,
+        "costmap_hash": cost_map_content_hash,
         "cost_map_message_count": cost_message_count,
         "occupancy_grid_ready": occupancy_grid is not None,
         "cost_map_ready": cost_map is not None,
@@ -2124,7 +2803,7 @@ def _runtime_governance_message(summary: Any) -> str:
     asset = dict(getattr(summary, "geometry_asset", {}) or {})
     session = dict(getattr(summary, "localization_session", {}) or {})
     return "route=%s profile=%s asset=%s localization=%s" % (
-        profile.get("route") or "rtabmap",
+        profile.get("route") or "unknown",
         profile.get("status") or "unknown",
         "available" if asset.get("available") else "missing",
         session.get("status") or "missing",
@@ -2142,7 +2821,7 @@ def _runtime_governance_metadata(summary: Any) -> Dict[str, Any]:
     return {
         "profile_name": profile.get("name"),
         "profile_status": profile.get("status"),
-        "route": profile.get("route") or "rtabmap",
+        "route": profile.get("route") or "unknown",
         "geometry_asset_available": bool(asset.get("available")),
         "database_present": asset.get("database_present"),
         "pcd_present": asset.get("pcd_present"),

@@ -23,18 +23,25 @@ def build_default_rtabmap_pcd_root() -> str:
     return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "pcd")
 
 
+def build_default_external_slam_nav2_script() -> str:
+    """返回仓库内默认外部 SLAM/Nav2 启动脚本路径。"""
+
+    return str(
+        Path(__file__).resolve().parents[1]
+        / "services"
+        / "geometry"
+        / "start_rtabmap_sidecar.sh"
+    )
+
+
 @dataclass
 class GeometryTopicsConfig:
     """平台几何侧车统一话题配置。"""
 
-    odom_topic: str = "/nuwax/geometry/odom"
-    secondary_odom_topics: Tuple[str, ...] = (
-        "/uslam/localization/odom",
-        "/lio_sam_ros2/mapping/odometry",
-        "/odom_lio",
-    )
+    odom_topic: str = "/odom"
+    secondary_odom_topics: Tuple[str, ...] = ()
     imu_topic: str = "/utlidar/imu"
-    point_cloud_topic: str = "/utlidar/cloud"
+    point_cloud_topic: str = "/utlidar/cloud_deskewed"
     tf_topic: str = "/tf"
     tf_static_topic: str = "/tf_static"
     occupancy_topic: str = "/map"
@@ -47,7 +54,7 @@ class GeometryFrameConfig:
 
     map_frame: str = "map"
     odom_frame: str = "odom"
-    base_frame: str = "body"
+    base_frame: str = "base_footprint"
     lidar_frame: str = "utlidar_lidar"
     imu_frame: str = "utlidar_imu"
 
@@ -105,7 +112,7 @@ class GeometryTraversabilityFilterConfig:
 class RtabmapOutputConfig:
     """RTAB-Map 输出资产与诊断摘要配置。"""
 
-    database_asset_name: str = "rtabmap.db"
+    database_asset_name: str = "external_slam_nav2_state.db"
     pcd_asset_name: str = "cloud_map.pcd"
     occupancy_layer: str = "occupancy_grid"
     costmap_layer: str = "nav2_global_costmap"
@@ -116,9 +123,13 @@ class RtabmapOutputConfig:
 
 @dataclass
 class RtabmapConfig:
-    """RTAB-Map 侧车配置。"""
+    """SLAM 后端状态侧车配置（历史名称：RTAB-Map；当前后端默认为 slam_toolbox）。
 
-    profile_name: str = "rtabmap_nav2"
+    类已重命名为 ``BackendStateConfig``；``RtabmapConfig`` 保留作为兼容 alias，
+    旧名仍然可用但应在后续治理任务中切换到新名。
+    """
+
+    profile_name: str = "external_slam_nav2"
     profile_enabled: bool = True
     default_profile: bool = True
     database_root: str = field(default_factory=build_default_rtabmap_database_root)
@@ -139,15 +150,13 @@ class RtabmapConfig:
 class Nav2Config:
     """Nav2 侧车配置。"""
 
-    mode: str = "sidecar"
+    mode: str = "external"
     action_name: str = "/navigate_to_pose"
     launch_package: str = "nav2_bringup"
     launch_file: str = "navigation_launch.py"
     global_costmap_topic: str = "/global_costmap/costmap"
     local_costmap_topic: str = "/local_costmap/costmap"
     costmap_source: str = "nav2_global"
-    cmd_vel_topic: str = "/cmd_vel"
-    cmd_vel_timeout_sec: float = 0.6
     map_yaml: str = ""
     params_file: str = ""
     use_sim_time: bool = False
@@ -155,11 +164,27 @@ class Nav2Config:
 
 
 @dataclass
+class ExternalGeometryStackConfig:
+    """外部几何栈托管配置。"""
+
+    enabled: bool = True
+    script_path: str = field(default_factory=build_default_external_slam_nav2_script)
+    args: Tuple[str, ...] = ("--no-rviz",)
+    process_name: str = "external_slam_nav2"
+    log_name: str = "external_slam_nav2.log"
+    provides_map: bool = True
+    provides_nav2: bool = True
+    provides_tf: bool = True
+    input_bridge_enabled: bool = False
+    point_cloud_bridge_enabled: bool = False
+
+
+@dataclass
 class PlatformGeometryConfig:
     """平台几何引擎统一配置。"""
 
     enabled: bool = True
-    stack: str = "rtabmap_nav2"
+    stack: str = "external_slam_nav2"
     require_ros2: bool = True
     setup_script: str = field(default_factory=build_default_geometry_setup_script)
     cyclonedds_lib_dir: str = ""
@@ -168,6 +193,7 @@ class PlatformGeometryConfig:
     frames: GeometryFrameConfig = field(default_factory=GeometryFrameConfig)
     rtabmap: RtabmapConfig = field(default_factory=RtabmapConfig)
     nav2: Nav2Config = field(default_factory=Nav2Config)
+    external: ExternalGeometryStackConfig = field(default_factory=ExternalGeometryStackConfig)
 
     def build_metadata(self) -> Dict[str, object]:
         """返回便于状态面记录的几何配置摘要。"""
@@ -183,7 +209,7 @@ class PlatformGeometryConfig:
                 "name": self.rtabmap.profile_name,
                 "enabled": self.rtabmap.profile_enabled,
                 "default": self.rtabmap.default_profile,
-                "route": "rtabmap",
+                "route": self.nav2.mode or "external",
                 "stack": self.stack,
             },
             "topics": {
@@ -279,6 +305,18 @@ class PlatformGeometryConfig:
                 "launch_file": self.rtabmap.launch_file,
                 "occupancy_projection": self.rtabmap.occupancy_projection,
             },
+            "external_geometry": {
+                "enabled": self.external.enabled,
+                "script_path": self.external.script_path,
+                "args": self.external.args,
+                "process_name": self.external.process_name,
+                "log_name": self.external.log_name,
+                "provides_map": self.external.provides_map,
+                "provides_nav2": self.external.provides_nav2,
+                "provides_tf": self.external.provides_tf,
+                "input_bridge_enabled": self.external.input_bridge_enabled,
+                "point_cloud_bridge_enabled": self.external.point_cloud_bridge_enabled,
+            },
             "output_contract": {
                 "name": self.rtabmap.output_contract,
                 "database_asset_name": self.rtabmap.outputs.database_asset_name,
@@ -298,11 +336,16 @@ class PlatformGeometryConfig:
                 "local_costmap_topic": self.nav2.local_costmap_topic,
                 "mode": self.nav2.mode,
                 "costmap_source": self.nav2.costmap_source,
-                "cmd_vel_topic": self.nav2.cmd_vel_topic,
-                "cmd_vel_timeout_sec": self.nav2.cmd_vel_timeout_sec,
                 "map_yaml": self.nav2.map_yaml or None,
                 "params_file": self.nav2.params_file or None,
                 "use_sim_time": self.nav2.use_sim_time,
                 "autostart": self.nav2.autostart,
             },
         }
+
+
+# 类重命名兼容 alias：
+# - 新名 BackendStateConfig 更准确反映“SLAM 后端状态”职责（当前默认后端是 slam_toolbox）。
+# - 老名 RtabmapConfig 仍然指向同一个类对象，外部 import 不破坏。
+# - 后续治理任务里再彻底切换到新名，这里暂不主动迁移调用方。
+BackendStateConfig = RtabmapConfig

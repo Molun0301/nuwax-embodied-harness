@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from gateways.auth import GatewayAccessManager
-from gateways.errors import as_gateway_error
+from gateways.errors import AccessDeniedError, as_gateway_error
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable
 from gateways.tcp_legacy.policy import build_tcp_legacy_policy
@@ -399,7 +399,12 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/legacy/tcp_policy")
     async def api_tcp_policy(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
+        access = access_manager.authenticate_http(request)
+        if access.role.value != "admin":
+            raise AccessDeniedError(
+                "tcp_legacy 策略仅 admin 角色可访问。",
+                details={"role": access.role.value, "endpoint": "/api/legacy/tcp_policy"},
+            )
         return to_jsonable(build_tcp_legacy_policy())
 
     @router.get("/api/state/latest")
@@ -551,6 +556,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             map_name=map_name,
             delete_memory_library=delete_memory_library,
         )
+        if bool(delete_result.get("was_active")):
+            runtime._sync_perception_runtime_for_memory_state(enabled=False)
         return {
             "delete_result": to_jsonable(delete_result),
             "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
@@ -571,6 +578,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             reset_memory_library=bool(payload.get("reset_memory_library", False)),
             metadata={"requested_by": "http_api"},
         )
+        runtime._sync_perception_runtime_for_memory_state(enabled=True)
         return {
             "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace() or active_workspace),
             "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
@@ -606,15 +614,15 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        try:
-            return to_jsonable(
-                runtime._handle_save_active_map_version(
-                    payload,
-                    requested_by="http_api",
-                )
-            )
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
+        map_version = runtime.map_workspace_service.save_map_version(
+            map_name=str(payload.get("map_name", "")).strip() or None,
+            reason=str(payload.get("reason", "")).strip(),
+            metadata={"requested_by": "http_api"},
+        )
+        return {
+            "map_version": to_jsonable(map_version),
+            "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
+        }
 
     @router.post("/api/maps/versions/load")
     async def api_map_versions_load(request: Request) -> Dict[str, Any]:
@@ -622,15 +630,19 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        try:
-            return to_jsonable(
-                runtime._handle_load_map_version(
-                    payload,
-                    requested_by="http_api",
-                )
-            )
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
+        map_name = str(payload.get("map_name", "")).strip()
+        map_version, workspace = runtime.map_workspace_service.load_map_version(
+            map_name=map_name,
+            version_id=str(payload.get("version_id", "")).strip() or None,
+            activate_if_needed=True,
+            load_memory_history=bool(payload.get("load_memory_history", True)),
+            reset_memory_library=bool(payload.get("reset_memory_library", False)),
+            metadata={"requested_by": "http_api", "source": "http_api_load_map_version"},
+        )
+        return {
+            "map_version": to_jsonable(map_version),
+            "active_workspace": to_jsonable(workspace),
+        }
 
     @router.get("/api/navigation/latest")
     async def api_navigation_latest(request: Request) -> Dict[str, Any]:
@@ -689,6 +701,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         delete_result = runtime.memory_service.delete_memory_library(library_name=library_name)
         if active_workspace is not None and active_workspace.active_map_name == library_name:
             runtime.map_workspace_service.clear_active_map(disable_memory_library=False)
+        if bool(delete_result.get("was_active")):
+            runtime._sync_perception_runtime_for_memory_state(enabled=False)
         return {
             "delete_result": to_jsonable(delete_result),
             "maps": to_jsonable(runtime.map_workspace_service.list_maps()),

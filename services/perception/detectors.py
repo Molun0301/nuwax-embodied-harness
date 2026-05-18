@@ -308,7 +308,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         self,
         *,
         name: str = "yolo_world",
-        weights: str = "yolov8s-world.pt",
+        weights: str = "yolov8s-worldv2.pt",
         runtime_preference: str = "pytorch",
         engine_path: str = "",
         device: str = "",
@@ -319,7 +319,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         image_size: int = 640,
         max_detections: int = 100,
     ) -> None:
-        self._weights = str(weights).strip() or "yolov8s-world.pt"
+        self._weights = str(weights).strip() or "yolov8s-worldv2.pt"
         self._runtime_preference = str(runtime_preference or "pytorch").strip().lower()
         self._engine_path = str(engine_path).strip()
         self._device = str(device).strip()
@@ -715,7 +715,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         self,
         *,
         name: str = "yolo_world",
-        weights: str = "yolov8s-world.pt",
+        weights: str = "yolov8s-worldv2.pt",
         runtime_preference: str = "pytorch",
         engine_path: str = "",
         device: str = "",
@@ -742,7 +742,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             image_size=image_size,
             max_detections=max_detections,
         )
-        self._configured_class_names = self._normalize_class_names(class_names)
+        self._configured_class_names = self._normalize_class_names(class_names) or ("object",)
         self._dynamic_class_metadata_keys = tuple(
             str(item).strip()
             for item in dynamic_class_metadata_keys
@@ -809,34 +809,39 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             "runtime_preference": self._runtime_preference,
             "device": self._device or "auto",
         }
+        image_bgr = decode_image_frame_to_bgr(image_frame)
         if not class_names:
-            return DetectionBundle(
-                metadata={
-                    **base_metadata,
-                    "raw_detection_count": 0,
-                    "stage_status": "not_ready",
-                    "availability": "unavailable",
-                    "reason": "open_vocabulary_classes_empty",
-                    "fallback_reason": "open_vocabulary_classes_empty",
-                    "model_loaded": self._model is not None,
-                }
-            )
-        try:
-            image_bgr = decode_image_frame_to_bgr(image_frame)
-            results = self._predict_with_classes(image_bgr, class_names)
-        except Exception as exc:
-            return DetectionBundle(
-                metadata={
-                    **base_metadata,
-                    "raw_detection_count": 0,
-                    "stage_status": "not_ready",
-                    "availability": "unavailable",
-                    "reason": "model_not_loaded_or_prediction_failed",
-                    "fallback_reason": "model_not_loaded_or_prediction_failed",
-                    "error": str(exc),
-                    "model_loaded": self._model is not None,
-                }
-            )
+            try:
+                results = self._predict(image_bgr)
+            except Exception as exc:
+                return DetectionBundle(
+                    metadata={
+                        **base_metadata,
+                        "raw_detection_count": 0,
+                        "stage_status": "not_ready",
+                        "availability": "unavailable",
+                        "reason": "open_vocabulary_classes_empty",
+                        "fallback_reason": "open_vocabulary_classes_empty",
+                        "error": str(exc),
+                        "model_loaded": self._model is not None,
+                    }
+                )
+        else:
+            try:
+                results = self._predict_with_classes(image_bgr, class_names)
+            except Exception as exc:
+                return DetectionBundle(
+                    metadata={
+                        **base_metadata,
+                        "raw_detection_count": 0,
+                        "stage_status": "not_ready",
+                        "availability": "unavailable",
+                        "reason": "model_not_loaded_or_prediction_failed",
+                        "fallback_reason": "model_not_loaded_or_prediction_failed",
+                        "error": str(exc),
+                        "model_loaded": self._model is not None,
+                    }
+                )
         first_result = results[0] if results else None
         detections_2d = self._enrich_open_vocabulary_detections(
             self._normalize_yolo_result(first_result, image_frame),
@@ -932,25 +937,27 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             ]
             provider_metadata = dict(self.spec.metadata.get("provider") or {})
             aliases = self._aliases_for_label(detection.label, image_frame.metadata)
-            attributes = {
-                **dict(detection.attributes or {}),
-                "aliases": list(aliases),
-                "confidence": float(detection.score),
-                "bbox_xyxy": bbox_xyxy,
-                "bbox": {
-                    "x_px": float(bbox.x_px),
-                    "y_px": float(bbox.y_px),
-                    "width_px": float(bbox.width_px),
-                    "height_px": float(bbox.height_px),
-                },
-                "provider": "yolo_world",
-                "provider_metadata": provider_metadata,
-                "model_version": self._resolved_model_source or self._weights,
-                "timestamp": detection.timestamp.isoformat(),
-                "camera_frame_id": camera_frame_id,
-                "open_vocabulary_classes": list(class_names),
-                "open_vocabulary_class_count": len(class_names),
-            }
+            attributes = dict(detection.attributes or {})
+            attributes.update(
+                {
+                    "aliases": list(aliases),
+                    "confidence": float(detection.score),
+                    "bbox": {
+                        "x_px": float(bbox.x_px),
+                        "y_px": float(bbox.y_px),
+                        "width_px": float(bbox.width_px),
+                        "height_px": float(bbox.height_px),
+                    },
+                    "provider": "yolo_world",
+                    "provider_metadata": provider_metadata,
+                    "model_version": self._resolved_model_source or self._weights,
+                    "timestamp": detection.timestamp.isoformat(),
+                    "camera_frame_id": camera_frame_id,
+                    "open_vocabulary_classes": list(class_names),
+                    "open_vocabulary_class_count": len(class_names),
+                }
+            )
+            attributes.setdefault("bbox_xyxy", bbox_xyxy)
             enriched.append(detection.model_copy(update={"attributes": attributes}, deep=True))
         return tuple(enriched)
 

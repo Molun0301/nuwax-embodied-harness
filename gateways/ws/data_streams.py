@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Dict, Iterable, Optional, Tuple
+import math
+from uuid import uuid4
+import time
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from contracts.streams import StreamFrame
@@ -20,6 +23,31 @@ def _parse_topics(values: Optional[str]) -> Optional[Tuple[str, ...]]:
         return None
     topics = tuple(item.strip() for item in values.split(",") if item.strip())
     return topics if topics else None
+
+
+def _normalize_after_cursor(after_cursor: int, latest_cursor: int) -> int:
+    if after_cursor <= 0:
+        return 0
+    if latest_cursor > 0 and after_cursor > latest_cursor:
+        return 0
+    return after_cursor
+
+
+def _replay_stream_frames(
+    runtime: GatewayRuntime,
+    *,
+    after_cursor: int,
+    topics: Optional[Iterable[str]],
+) -> Tuple[StreamFrame, ...]:
+    oldest_cursor = runtime.stream_bus.oldest_cursor()
+    if after_cursor <= 0 or (oldest_cursor > 0 and after_cursor < oldest_cursor):
+        return runtime.stream_bus.latest_frames(topics=topics)
+    return runtime.stream_bus.replay(after_cursor=after_cursor, topics=topics)
+
+
+async def _run_blocking(callable_obj, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: callable_obj(*args, **kwargs))
 
 
 def _safe_enqueue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, frame: StreamFrame, runtime: GatewayRuntime) -> None:
@@ -50,13 +78,14 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     ) -> StreamingResponse:
         access_manager.authenticate_http(request)
         topic_filter = _parse_topics(topics)
+        after_cursor = _normalize_after_cursor(after_cursor, runtime.stream_bus.latest_cursor())
 
         async def frame_generator():
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue[StreamFrame] = asyncio.Queue(maxsize=200)
             emitted = 0
 
-            for frame in runtime.stream_bus.replay(after_cursor=after_cursor, topics=topic_filter):
+            for frame in _replay_stream_frames(runtime, after_cursor=after_cursor, topics=topic_filter):
                 yield _format_sse_payload(frame)
                 emitted += 1
                 if max_frames is not None and emitted >= max_frames:
@@ -83,12 +112,205 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         return StreamingResponse(frame_generator(), media_type="text/event-stream")
 
+    @router.get("/streams/video.mjpeg")
+    async def video_mjpeg_stream(
+        request: Request,
+        camera_id: Optional[str] = None,
+        fps: float = 15.0,
+    ):
+        access_manager.authenticate_http(request)
+        status = await _run_blocking(runtime.video_stream_receiver.status_snapshot)
+        if not bool(status.get("available")):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "video_stream_not_available",
+                    "reason": "video_ingest_waiting_first_frame",
+                    "message": "尚未收到 Go2 端侧主动推送的视频首帧；平台不会主动采集图像帧。",
+                    "status": to_jsonable(status),
+                },
+            )
+        requested_fps = float(fps or 15.0)
+        if not math.isfinite(requested_fps):
+            requested_fps = 15.0
+        frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 24.0)
+
+        async def frame_generator():
+            last_sequence = 0
+            while not await request.is_disconnected():
+                started_at = time.monotonic()
+                latest_frame = await _run_blocking(
+                    runtime.video_stream_receiver.wait_for_frame,
+                    last_sequence,
+                    timeout_sec=frame_interval_sec,
+                    camera_id=camera_id,
+                )
+                if latest_frame is not None:
+                    last_sequence = latest_frame.sequence
+                    yield _format_mjpeg_frame(latest_frame.data)
+                elapsed = time.monotonic() - started_at
+                if elapsed < frame_interval_sec:
+                    await asyncio.sleep(frame_interval_sec - elapsed)
+
+        return StreamingResponse(
+            frame_generator(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @router.websocket("/streams/video.ingest")
+    async def video_ingest_stream(websocket: WebSocket) -> None:
+        client_id = f"go2-video-{uuid4().hex[:12]}"
+        try:
+            access_manager.authenticate_websocket(websocket)
+        except Exception as exc:
+            error = exc if isinstance(exc, GatewayError) else GatewayError(f"视频推流接入鉴权失败: {exc}")
+            await websocket.close(code=4403, reason=error.message)
+            return
+
+        await websocket.accept()
+        camera_id = "front_camera"
+        frame_id = "go2/front_camera"
+        width_px = 1280
+        height_px = 720
+        source_metadata: Dict[str, Any] = {"source_kind": "go2_side_stream_push"}
+
+        try:
+            start_message = await websocket.receive()
+            if start_message.get("text") is not None:
+                try:
+                    payload = json.loads(str(start_message.get("text") or "{}"))
+                except json.JSONDecodeError as exc:
+                    raise GatewayError(f"视频推流启动消息不是合法 JSON: {exc}", error_code="video_ingest_bad_start", http_status=400) from exc
+                if str(payload.get("type") or "") not in {"video.start", "video_start", ""}:
+                    raise GatewayError("视频推流首条消息必须是 video.start。", error_code="video_ingest_bad_start", http_status=400)
+                encoding = str(payload.get("encoding") or "jpeg").strip().lower()
+                if encoding not in {"jpeg", "jpg", "image/jpeg"}:
+                    raise GatewayError("视频推流 ingest 仅接受 JPEG 编码帧。", error_code="video_ingest_unsupported_encoding", http_status=415)
+                camera_id = str(payload.get("camera_id") or camera_id)
+                frame_id = str(payload.get("frame_id") or frame_id)
+                width_px = _positive_int(payload.get("width_px"), width_px)
+                height_px = _positive_int(payload.get("height_px"), height_px)
+                source_metadata = {
+                    "source_kind": str(payload.get("source_kind") or "go2_side_stream_push"),
+                    "streamer_version": payload.get("streamer_version"),
+                    "robot": payload.get("robot"),
+                    "camera_info": payload.get("camera_info"),
+                }
+                await _run_blocking(
+                    runtime.video_stream_receiver.start_stream,
+                    client_id=client_id,
+                    camera_id=camera_id,
+                    frame_id=frame_id,
+                    width_px=width_px,
+                    height_px=height_px,
+                    encoding="jpeg",
+                    metadata=source_metadata,
+                )
+                runtime._publish_video_stream_frame(reason="video_ingest_connected")
+                await websocket.send_json({"type": "video.accepted", "client_id": client_id})
+            elif start_message.get("bytes") is not None:
+                await _run_blocking(
+                    runtime.video_stream_receiver.start_stream,
+                    client_id=client_id,
+                    camera_id=camera_id,
+                    frame_id=frame_id,
+                    width_px=width_px,
+                    height_px=height_px,
+                    encoding="jpeg",
+                    metadata=source_metadata,
+                )
+                await _run_blocking(
+                    runtime.video_stream_receiver.ingest_jpeg,
+                    start_message["bytes"],
+                    client_id=client_id,
+                    camera_id=camera_id,
+                    frame_id=frame_id,
+                    width_px=width_px,
+                    height_px=height_px,
+                    metadata=source_metadata,
+                )
+                runtime._publish_video_stream_frame(reason="video_ingest_frame")
+            else:
+                raise GatewayError("视频推流首条消息为空。", error_code="video_ingest_bad_start", http_status=400)
+
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                if message.get("bytes") is not None:
+                    latest_frame = await _run_blocking(
+                        runtime.video_stream_receiver.ingest_jpeg,
+                        message["bytes"],
+                        client_id=client_id,
+                        camera_id=camera_id,
+                        frame_id=frame_id,
+                        width_px=width_px,
+                        height_px=height_px,
+                        metadata=source_metadata,
+                    )
+                    if latest_frame.sequence == 1 or latest_frame.sequence % 5 == 0:
+                        runtime._publish_video_stream_frame(reason="video_ingest_frame")
+                    continue
+                if message.get("text") is not None:
+                    control = json.loads(str(message.get("text") or "{}"))
+                    if str(control.get("type") or "") == "video.stop":
+                        break
+                    if str(control.get("type") or "") == "video.ping":
+                        await websocket.send_json({"type": "video.pong", "client_id": client_id})
+                        continue
+                    continue
+        except WebSocketDisconnect:
+            pass
+        except json.JSONDecodeError as exc:
+            error_message = f"视频推流控制消息不是合法 JSON: {exc}"
+            try:
+                await websocket.close(code=1003, reason=error_message[:120])
+            except Exception:
+                pass
+            await _run_blocking(
+                runtime.video_stream_receiver.mark_disconnected,
+                client_id=client_id,
+                error=error_message,
+            )
+            runtime._publish_video_stream_frame(reason="video_ingest_control_error")
+            return
+        except GatewayError as exc:
+            try:
+                await websocket.close(code=1003, reason=exc.message[:120])
+            except Exception:
+                pass
+            await _run_blocking(
+                runtime.video_stream_receiver.mark_disconnected,
+                client_id=client_id,
+                error=exc.message,
+            )
+            runtime._publish_video_stream_frame(reason="video_ingest_rejected")
+            return
+        except Exception as exc:
+            error_message = str(getattr(exc, "message", exc))
+            try:
+                await websocket.close(code=1011, reason=error_message[:120])
+            except Exception:
+                pass
+            await _run_blocking(
+                runtime.video_stream_receiver.mark_disconnected,
+                client_id=client_id,
+                error=error_message,
+            )
+            runtime._publish_video_stream_frame(reason="video_ingest_error")
+            return
+        finally:
+            await _run_blocking(runtime.video_stream_receiver.mark_disconnected, client_id=client_id)
+            runtime._publish_video_stream_frame(reason="video_ingest_disconnected")
+
     @router.websocket("/streams/ws")
     async def websocket_streams(websocket: WebSocket) -> None:
         try:
             access_manager.authenticate_websocket(websocket)
             topic_filter = _parse_topics(websocket.query_params.get("topics"))
             after_cursor = int(websocket.query_params.get("after_cursor", "0"))
+            after_cursor = _normalize_after_cursor(after_cursor, runtime.stream_bus.latest_cursor())
         except Exception as exc:
             error = exc if isinstance(exc, GatewayError) else GatewayError(f"数据流订阅初始化失败: {exc}")
             await websocket.close(code=4403, reason=error.message)
@@ -98,8 +320,11 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[StreamFrame] = asyncio.Queue(maxsize=200)
 
-        for frame in runtime.stream_bus.replay(after_cursor=after_cursor, topics=topic_filter):
-            await websocket.send_json({"type": "stream.frame", "frame": to_jsonable(frame)})
+        try:
+            for frame in _replay_stream_frames(runtime, after_cursor=after_cursor, topics=topic_filter):
+                await websocket.send_json({"type": "stream.frame", "frame": to_jsonable(frame)})
+        except WebSocketDisconnect:
+            return
 
         subscription_id = runtime.stream_bus.subscribe(
             lambda frame: _safe_enqueue(loop, queue, frame, runtime),
@@ -118,6 +343,24 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             runtime.stream_bus.unsubscribe(subscription_id)
 
     return router
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return parsed if parsed > 0 else int(default)
+
+
+def _format_mjpeg_frame(data: bytes) -> bytes:
+    headers = (
+        b"--frame\r\n"
+        b"Content-Type: image/jpeg\r\n"
+        + f"Content-Length: {len(data)}".encode("ascii")
+        + b"\r\n\r\n"
+    )
+    return headers + data + b"\r\n"
 
 
 def _format_sse_payload(frame: StreamFrame) -> str:

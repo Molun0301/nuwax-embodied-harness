@@ -684,8 +684,8 @@ class EvaluationService:
                 reasons.append("stage9_missing_goal_spec")
             if candidates and not all(self._candidate_has_navigation_audit(item) for item in candidates):
                 reasons.append("stage9_candidate_audit_incomplete")
-        if trace.navigation_metrics is not None and not self._route_is_platform_geometry_nav2(trace.route):
-            reasons.append("stage9_navigation_route_not_platform_geometry")
+        if trace.navigation_metrics is not None and not self._route_is_configured_navigation_stack(trace.route):
+            reasons.append("stage9_navigation_route_not_configured_stack")
         if trace.execution_status in {"arrival_verified", "arrival_verification_failed"} and trace.verification_result is None:
             reasons.append("stage9_missing_arrival_verification")
         if trace.execution_status not in {"unknown", "current_scene_found"} and trace.memory_update is not None and trace.memory_metrics is None:
@@ -713,7 +713,7 @@ class EvaluationService:
             self._criterion_status("natural_language_goal_to_goal_spec_topk", any(self._candidate_has_goal_spec(item) for item in candidates) or any(self._metadata_has_goal_spec(dict(trace.metadata or {})) for trace in traces), "GoalSpec 与 top-k 候选进入检索 trace。", "等待语义检索样本。"),
             self._criterion_status("long_term_memory_candidates_with_explanations", candidate_evidence_complete, "候选含 anchor/evidence/confidence/reachability 审计字段。", "等待完整候选审计样本。"),
             self._criterion_status("semantic_exploration_when_no_reliable_candidate", any(self._trace_has_decision(trace, {"explore"}) for trace in traces), "无可靠候选可进入 explore 决策。", "未观测到 explore 样本。"),
-            self._criterion_status("platform_geometry_nav2_execution", any(trace.navigation_metrics is not None and self._route_is_platform_geometry_nav2(trace.route) for trace in traces), "导航 trace 走平台侧 geometry/Nav2 路由。", "等待导航执行样本。"),
+            self._criterion_status("configured_navigation_stack_execution", any(trace.navigation_metrics is not None and self._route_is_configured_navigation_stack(trace.route) for trace in traces), "导航 trace 走当前配置的 geometry 路由。", "等待导航执行样本。"),
             self._criterion_status("arrival_verification", any(trace.verification_result is not None for trace in traces), "到点复核结果进入 trace。", "等待到点复核样本。"),
             self._criterion_status("memory_feedback_affects_ranking", bool(memory_metrics), "成功/失败写回与记忆指标进入评估。", "等待记忆写回样本。"),
             self._criterion_status("dynamic_entity_not_polluting_static_memory", bool(dynamic_candidates) and all(not self._candidate_allowed_for_navigation(item) for item in dynamic_candidates), "动态实体候选被长期静态记忆/直导航拦截。", "未观测动态实体候选样本。"),
@@ -781,11 +781,11 @@ class EvaluationService:
         candidates = ([trace.selected_candidate] if trace.selected_candidate else []) + list(trace.candidate_list or [])
         return any(str((item or {}).get("resolution_decision") or ((item or {}).get("metadata") or {}).get("resolution_decision") or "") in decisions for item in candidates if isinstance(item, dict))
 
-    def _route_is_platform_geometry_nav2(self, route: MetadataDict) -> bool:
+    def _route_is_configured_navigation_stack(self, route: MetadataDict) -> bool:
         if not route:
             return False
         text = " ".join(str(value).lower() for value in route.values())
-        return "platform" in text and ("geometry" in text or "nav2" in text)
+        return "geometry" in text or "go2slam" in text or "navigation" in text
 
     def _trace_next_action(self, trace: SemanticNavigationEvaluationTrace) -> MetadataDict:
         metadata = dict(trace.metadata or {})

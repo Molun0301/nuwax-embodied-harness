@@ -1,4 +1,6 @@
 from contracts.geometry_runtime import (
+    BackendStateConfig,
+    ExternalGeometryStackConfig,
     GeometryFrameConfig,
     GeometryOdometryQualityConfig,
     GeometryPointCloudPreprocessConfig,
@@ -9,12 +11,15 @@ from contracts.geometry_runtime import (
     PlatformGeometryConfig,
     RtabmapConfig,
     RtabmapOutputConfig,
+    build_default_external_slam_nav2_script,
     build_default_geometry_setup_script,
     build_default_rtabmap_database_root,
     build_default_rtabmap_pcd_root,
 )
 
 __all__ = [
+    "BackendStateConfig",
+    "ExternalGeometryStackConfig",
     "GeometryFrameConfig",
     "GeometryOdometryQualityConfig",
     "GeometryPointCloudPreprocessConfig",
@@ -25,6 +30,7 @@ __all__ = [
     "PlatformGeometryConfig",
     "RtabmapConfig",
     "RtabmapOutputConfig",
+    "build_default_external_slam_nav2_script",
     "build_default_geometry_setup_script",
     "build_default_rtabmap_database_root",
     "build_default_rtabmap_pcd_root",

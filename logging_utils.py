@@ -5,21 +5,128 @@ import json
 import logging
 import threading
 import time
-from typing import Any, Callable, Dict, Hashable, Mapping, Optional
+from typing import Any, Callable, Dict, Hashable, Iterable, Mapping, Optional
 
 
 _STANDARD_LOG_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__.keys()) | {"message", "asctime"}
 DEFAULT_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
+DEFAULT_EXTRA_VALUE_MAX_LENGTH = 240
+DEFAULT_PREVIEW_MAX_LENGTH = 600
+_EXTRA_FIELD_ORDER = (
+    "event",
+    "request_id",
+    "task_id",
+    "capability_name",
+    "method",
+    "path",
+    "status_code",
+    "duration_ms",
+    "error_category",
+    "category",
+    "runtime_event_type",
+    "source",
+    "subject_id",
+    "severity",
+    "suppressed_count",
+    "rate_limit_window_sec",
+)
+_DEFAULT_DROP_PATTERNS = (
+    "Received message on data channel:",
+    "> message sent:",
+    "Heartbeat response received.",
+    "Creating offer...",
+    "Trying to send SDP using the old method...",
+    "An error occurred with the old method:",
+    "Data channel closed",
+)
+LOW_VALUE_RUNTIME_EVENT_SUFFIXES = (".snapshot_ready", ".state_refreshed")
+LOW_VALUE_RUNTIME_EVENT_TYPES = frozenset(
+    {
+        "localization.snapshot_ready",
+        "mapping.snapshot_ready",
+        "robot.state_refreshed",
+    }
+)
+
+
+def _truncate_text(text: str, max_length: int) -> str:
+    limit = max(0, int(max_length))
+    if limit <= 0 or len(text) <= limit:
+        return text
+    suffix = "...(truncated)"
+    if limit <= len(suffix):
+        return text[:limit]
+    return f"{text[: limit - len(suffix)]}{suffix}"
+
+
+def _compact_log_value(value: Any, *, max_depth: int, max_items: int) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<bytes len={len(value)}>"
+    if max_depth <= 0:
+        return f"<{type(value).__name__}>"
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        compacted = {
+            str(key): _compact_log_value(item, max_depth=max_depth - 1, max_items=max_items)
+            for key, item in items[:max_items]
+        }
+        if len(items) > max_items:
+            compacted["..."] = f"+{len(items) - max_items} keys"
+        return compacted
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        compacted_items = [
+            _compact_log_value(item, max_depth=max_depth - 1, max_items=max_items)
+            for item in items[:max_items]
+        ]
+        if len(items) > max_items:
+            compacted_items.append(f"...(+{len(items) - max_items} items)")
+        return compacted_items
+    return str(value)
+
+
+def compact_log_value(
+    value: Any,
+    *,
+    max_length: int = DEFAULT_EXTRA_VALUE_MAX_LENGTH,
+    max_depth: int = 2,
+    max_items: int = 8,
+) -> str:
+    compacted = _compact_log_value(value, max_depth=max_depth, max_items=max_items)
+    if compacted is None:
+        return "-"
+    if isinstance(compacted, str):
+        return _truncate_text(compacted, max_length)
+    try:
+        rendered = json.dumps(compacted, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        rendered = str(compacted)
+    return _truncate_text(rendered, max_length)
+
+
+def format_log_preview(value: Any, *, max_length: int = DEFAULT_PREVIEW_MAX_LENGTH) -> str:
+    if not value:
+        return "-"
+    return compact_log_value(value, max_length=max_length, max_depth=3, max_items=10)
+
+
+def is_low_value_runtime_event(event_type: str) -> bool:
+    normalized = str(event_type or "")
+    return normalized in LOW_VALUE_RUNTIME_EVENT_TYPES or normalized.endswith(LOW_VALUE_RUNTIME_EVENT_SUFFIXES)
 
 
 def _stringify_log_value(value: Any) -> str:
-    """把日志扩展字段压成单行可读文本。"""
-
     if value is None:
         return "-"
     if isinstance(value, str):
-        text = value.strip()
-        if not text:
+        text = compact_log_value(value)
+        if not text or text == "-":
             return "-"
         if any(char.isspace() for char in text) or "=" in text:
             return json.dumps(text, ensure_ascii=False)
@@ -28,12 +135,20 @@ def _stringify_log_value(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, float):
         return ("%.3f" % value).rstrip("0").rstrip(".")
-    if isinstance(value, (dict, list, tuple, set)):
-        try:
-            return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        except TypeError:
-            return str(value)
-    return str(value)
+    return compact_log_value(value)
+
+
+def _iter_extra_items(record: logging.LogRecord) -> Iterable[tuple[str, Any]]:
+    extras = {
+        key: value
+        for key, value in record.__dict__.items()
+        if key not in _STANDARD_LOG_RECORD_FIELDS and not key.startswith("_")
+    }
+    for key in _EXTRA_FIELD_ORDER:
+        if key in extras:
+            yield key, extras.pop(key)
+    for key in sorted(extras):
+        yield key, extras[key]
 
 
 class ContextAwareFormatter(logging.Formatter):
@@ -41,14 +156,34 @@ class ContextAwareFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         rendered = super().format(record)
-        extras = []
-        for key, value in sorted(record.__dict__.items()):
-            if key in _STANDARD_LOG_RECORD_FIELDS or key.startswith("_"):
-                continue
-            extras.append(f"{key}={_stringify_log_value(value)}")
+        extras = [f"{key}={_stringify_log_value(value)}" for key, value in _iter_extra_items(record)]
         if not extras:
             return rendered
         return "%s %s" % (rendered, " ".join(extras))
+
+
+class DropPatternLogFilter(logging.Filter):
+    """过滤已知低价值刷屏日志。"""
+
+    def __init__(self, drop_patterns: Iterable[str] = _DEFAULT_DROP_PATTERNS) -> None:
+        super().__init__()
+        self._drop_patterns = tuple(pattern for pattern in drop_patterns if pattern)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+
+        if record.levelno >= logging.WARNING:
+            return True
+        if any(pattern in message for pattern in self._drop_patterns):
+            return False
+        if "HTTPConnectionPool(" in message and "/offer" in message and "Connection refused" in message:
+            return False
+        if "MediaStreamError" in message and "AsyncIOEventEmitter" in message:
+            return False
+        return True
 
 
 def build_default_formatter() -> ContextAwareFormatter:

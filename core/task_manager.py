@@ -345,9 +345,13 @@ class TaskManager:
             record.cancel_requested = True
             future = record.future
 
-        if future is not None:
-            future.cancel()
-        self._set_terminal_state(task_id, TaskState.CANCELLED, message or "任务已取消。")
+        can_release_resources = future is None or future.cancel() or future.done()
+        self._set_terminal_state(
+            task_id,
+            TaskState.CANCELLED,
+            message or "任务已取消。",
+            release_resources=can_release_resources,
+        )
         return True
 
     def cancel_all_active_tasks(self, message: Optional[str] = None) -> Tuple[str, ...]:
@@ -365,9 +369,13 @@ class TaskManager:
 
         for task_id in task_ids:
             future = futures.get(task_id)
-            if future is not None:
-                future.cancel()
-            self._set_terminal_state(task_id, TaskState.CANCELLED, message or "任务已取消。")
+            can_release_resources = future is None or future.cancel() or future.done()
+            self._set_terminal_state(
+                task_id,
+                TaskState.CANCELLED,
+                message or "任务已取消。",
+                release_resources=can_release_resources,
+            )
         return task_ids
 
     def wait_for_task(self, task_id: str, timeout: Optional[float] = None) -> Any:
@@ -532,6 +540,7 @@ class TaskManager:
         result: Any = None,
         error: Optional[str] = None,
         error_payload: Optional[MetadataDict] = None,
+        release_resources: bool = True,
     ) -> None:
         terminal_error_payload = dict(error_payload or {})
         error_code = self._terminal_error_code(state, terminal_error_payload)
@@ -581,7 +590,8 @@ class TaskManager:
         try:
             self._append_task_event(task_id, event_type, state=status.state, message=message, payload=payload)
         finally:
-            self._release_resources(task_id)
+            if release_resources:
+                self._release_resources(task_id)
             self._cancel_timer(task_id)
 
     def _extract_error_payload(self, exc: Exception) -> Optional[MetadataDict]:
@@ -630,7 +640,14 @@ class TaskManager:
             if record.status.state in _TERMINAL_STATES:
                 return
             record.timeout_triggered = True
-        self._set_terminal_state(task_id, TaskState.TIMEOUT, "任务执行超时。")
+            future = record.future
+        can_release_resources = future is None or future.cancel() or future.done()
+        self._set_terminal_state(
+            task_id,
+            TaskState.TIMEOUT,
+            "任务执行超时。",
+            release_resources=can_release_resources,
+        )
 
     def _release_resources(self, task_id: str) -> None:
         if self._resource_lock_manager is None:

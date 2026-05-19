@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass
 import json
 import logging
+import random
 import threading
 import time
 from typing import Any, Callable, Dict, Hashable, Iterable, Mapping, Optional
@@ -167,7 +169,17 @@ class DropPatternLogFilter(logging.Filter):
 
     def __init__(self, drop_patterns: Iterable[str] = _DEFAULT_DROP_PATTERNS) -> None:
         super().__init__()
-        self._drop_patterns = tuple(pattern for pattern in drop_patterns if pattern)
+        self._drop_patterns = list(pattern for pattern in drop_patterns if pattern)
+        self._lock = threading.Lock()
+
+    def add_pattern(self, pattern: str) -> None:
+        with self._lock:
+            if pattern and pattern not in self._drop_patterns:
+                self._drop_patterns.append(pattern)
+
+    def remove_pattern(self, pattern: str) -> None:
+        with self._lock:
+            self._drop_patterns = [p for p in self._drop_patterns if p != pattern]
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -177,7 +189,9 @@ class DropPatternLogFilter(logging.Filter):
 
         if record.levelno >= logging.WARNING:
             return True
-        if any(pattern in message for pattern in self._drop_patterns):
+        with self._lock:
+            patterns = list(self._drop_patterns)
+        if any(pattern in message for pattern in patterns):
             return False
         if "HTTPConnectionPool(" in message and "/offer" in message and "Connection refused" in message:
             return False
@@ -251,3 +265,127 @@ class LogRateLimiter:
                 return True, suppressed_count
             state.suppressed_count += 1
             return False, 0
+
+
+# ---------------------------------------------------------------------------
+# Correlation ID 上下文
+# ---------------------------------------------------------------------------
+
+_correlation_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "correlation_id", default=""
+)
+_capability_name_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "capability_name_ctx", default=""
+)
+
+
+def set_correlation_context(*, request_id: str = "", capability_name: str = "") -> None:
+    if request_id:
+        _correlation_id.set(request_id)
+    if capability_name:
+        _capability_name_ctx.set(capability_name)
+
+
+def clear_correlation_context() -> None:
+    _correlation_id.set("")
+    _capability_name_ctx.set("")
+
+
+class CorrelationContextFilter(logging.Filter):
+    """自动将 correlation context 注入每条 LogRecord。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not getattr(record, "correlation_id", ""):
+            cid = _correlation_id.get("")
+            if cid:
+                record.correlation_id = cid
+        if not getattr(record, "capability_name", ""):
+            cap = _capability_name_ctx.get("")
+            if cap:
+                record.capability_name = cap
+        return True
+
+
+# ---------------------------------------------------------------------------
+# SamplingLogFilter
+# ---------------------------------------------------------------------------
+
+
+class SamplingLogFilter(logging.Filter):
+    """对高频 DEBUG 日志按比例采样。WARNING 及以上始终放行。"""
+
+    def __init__(self, sample_rate: float = 0.01) -> None:
+        super().__init__()
+        self._sample_rate = max(0.0, min(1.0, sample_rate))
+        self._counter = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        self._counter += 1
+        if self._sample_rate <= 0.0:
+            return False
+        return (self._counter % max(1, int(1.0 / self._sample_rate))) == 0
+
+
+# ---------------------------------------------------------------------------
+# DeduplicatingLogFilter
+# ---------------------------------------------------------------------------
+
+
+class DeduplicatingLogFilter(logging.Filter):
+    """在时间窗内对相同消息去重。ERROR 及以上始终放行。"""
+
+    def __init__(self, window_sec: float = 30.0, max_tracked: int = 200) -> None:
+        super().__init__()
+        self._window_sec = max(0.1, float(window_sec))
+        self._max_tracked = max(1, int(max_tracked))
+        self._seen: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            return True
+        try:
+            msg_key = record.getMessage()[:120]
+        except Exception:
+            return True
+        now = time.monotonic()
+        with self._lock:
+            self._evict_expired(now)
+            if msg_key in self._seen:
+                return False
+            if len(self._seen) >= self._max_tracked:
+                return True
+            self._seen[msg_key] = now
+            return True
+
+    def _evict_expired(self, now: float) -> None:
+        expired = [k for k, t in self._seen.items() if now - t >= self._window_sec]
+        for k in expired:
+            del self._seen[k]
+
+
+# ---------------------------------------------------------------------------
+# JsonLineFormatter
+# ---------------------------------------------------------------------------
+
+
+class JsonLineFormatter(logging.Formatter):
+    """输出 JSON Lines 格式日志。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: Dict[str, Any] = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        cid = getattr(record, "correlation_id", "")
+        if cid:
+            payload["correlation_id"] = cid
+        for key, value in _iter_extra_items(record):
+            payload[key] = str(value) if not isinstance(value, (str, int, float, bool, type(None))) else value
+        if record.exc_info and record.exc_info[1]:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False, default=str)

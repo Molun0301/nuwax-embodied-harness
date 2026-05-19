@@ -57,7 +57,7 @@ class LowLevelController:
             logger.warning("低级别控制器已初始化")
             return True
 
-        logger.info("初始化DDS通道 (低级别)...")
+        logger.debug("初始化DDS通道 (低级别)...")
         if self.iface:
             ChannelFactoryInitialize(0, self.iface)
         else:
@@ -69,7 +69,7 @@ class LowLevelController:
         self.state_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self.state_subscriber.Init(self._on_low_state, 10)
 
-        logger.info("等待LowState数据...")
+        logger.debug("等待LowState数据...")
         timeout = 5.0
         start = time.time()
         while self.low_state is None and (time.time() - start) < timeout:
@@ -122,7 +122,7 @@ class LowLevelController:
             name="lowcmd_writer",
         )
         self.cmd_thread.Start()
-        logger.info("低级别控制循环已启动")
+        logger.debug("低级别控制循环已启动")
         return True
 
     def stop(self):
@@ -131,7 +131,7 @@ class LowLevelController:
         self.is_running = False
         if self.cmd_thread:
             self.cmd_thread.Stop()
-        logger.info("低级别控制循环已停止")
+        logger.debug("低级别控制循环已停止")
 
     def stop_motion(self):
         """清零低层命令并停止发布循环。"""

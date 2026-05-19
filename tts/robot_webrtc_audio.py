@@ -348,7 +348,7 @@ class RobotWebRTCAudioHubClient:
             resolved = str(path.resolve())
             if resolved not in sys.path:
                 sys.path.insert(0, resolved)
-                logger.info("已追加 robot_webrtc 依赖路径: %s", resolved)
+                logger.debug("已追加 robot_webrtc 依赖路径: %s", resolved)
 
     def _handle_asyncio_exception(self, loop, context) -> None:
         """忽略连接关闭阶段常见的 MediaStreamError 噪声。"""
@@ -406,7 +406,7 @@ class RobotWebRTCAudioHubClient:
             for i in range(0, len(b64_data), self.upload_chunk_size)
         ]
 
-        logger.info("开始上传机器人扬声音频: file=%s chunks=%s", filename, len(chunks))
+        logger.debug("开始上传机器人扬声音频: file=%s chunks=%s", filename, len(chunks))
         for index, chunk in enumerate(chunks, 1):
             parameter = {
                 "file_name": filename,

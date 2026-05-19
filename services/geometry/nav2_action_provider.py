@@ -187,7 +187,7 @@ class Nav2ActionNavigationProvider:
                         "goal_sequence": goal_sequence,
                     },
                 )
-            LOGGER.info(
+            LOGGER.debug(
                 "Nav2 bridge 发送 NavigateToPose goal_id=%s goal_sequence=%s target=(%.3f, %.3f, %.3f) frame=%s action=%s",
                 goal.goal_id,
                 goal_sequence,
@@ -497,7 +497,7 @@ class Nav2ActionNavigationProvider:
         goal_msg.pose.pose.orientation.y = float(target_pose.orientation.y)
         goal_msg.pose.pose.orientation.z = float(target_pose.orientation.z)
         goal_msg.pose.pose.orientation.w = float(target_pose.orientation.w)
-        LOGGER.info(
+        LOGGER.debug(
             "Nav2 NavigateToPose goal 构造 target=(%.3f, %.3f, %.3f) frame=%s orientation=(%.4f, %.4f, %.4f, %.4f)",
             float(goal_msg.pose.pose.position.x),
             float(goal_msg.pose.pose.position.y),
@@ -540,7 +540,7 @@ class Nav2ActionNavigationProvider:
                 )
                 self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action server 拒绝导航目标。", metadata={"backend": "nav2", "failure_reason": "goal_rejected", "goal_sequence": goal_sequence, "target_pose": target_pose})
                 return
-            LOGGER.info(
+            LOGGER.debug(
                 "Nav2 action server 接受目标 goal_id=%s goal_sequence=%s target=%s",
                 goal_id,
                 goal_sequence,

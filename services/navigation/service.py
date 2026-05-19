@@ -251,7 +251,7 @@ class NavigationService:
         with self._lock:
             self._current_goal = goal
             self._state_machine.set_goal(goal.goal_id, message="平台导航目标已接受。")
-        LOGGER.info("导航服务转发目标 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
+        LOGGER.debug("导航服务转发目标 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
         accepted = provider.set_goal(goal)
         if not accepted:
             message = self._navigation_provider_error_message(provider, default="导航后端拒绝目标 %s。" % goal.goal_id)

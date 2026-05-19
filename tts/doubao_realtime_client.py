@@ -291,7 +291,7 @@ class DoubaoRealtimeClient:
         if existing is not None:
             if existing.task is None or not existing.task.done():
                 self.active_session_id = new_session_id
-                self.logger.info("复用已存在的本地 Doubao 会话: session=%s", new_session_id)
+                self.logger.debug("复用已存在的本地 Doubao 会话: session=%s", new_session_id)
                 return new_session_id
             self.sessions.pop(new_session_id, None)
 
@@ -312,7 +312,7 @@ class DoubaoRealtimeClient:
             self._run_session(state),
             name="doubao-session-%s" % new_session_id,
         )
-        self.logger.info(
+        self.logger.debug(
             "已创建本地 Doubao 会话: session=%s speaker=%s resource_id=%s",
             new_session_id,
             settings.speaker,
@@ -374,7 +374,7 @@ class DoubaoRealtimeClient:
 
                 for header_mode, headers in header_candidates:
                     try:
-                        self.logger.info(
+                        self.logger.debug(
                             "连接豆包上游: session=%s auth_mode=%s resource_id=%s",
                             state.session_id,
                             header_mode,
@@ -412,7 +412,7 @@ class DoubaoRealtimeClient:
             TTS_BIDIRECTIONAL_URL,
             **self._doubao_connect_kwargs(headers),
         ) as websocket:
-            self.logger.info("豆包上游连接成功: session=%s", state.session_id)
+            self.logger.debug("豆包上游连接成功: session=%s", state.session_id)
             receiver_task = asyncio.create_task(
                 self._recv_loop(state, websocket),
                 name="doubao-recv-%s" % state.session_id,
@@ -440,7 +440,7 @@ class DoubaoRealtimeClient:
                 command = await state.queue.get()
                 if command.kind == "text":
                     await self._ensure_playback_started(state)
-                    self.logger.info(
+                    self.logger.debug(
                         "发送 TaskRequest: session=%s chars=%s",
                         state.session_id,
                         len(command.text),
@@ -455,7 +455,7 @@ class DoubaoRealtimeClient:
                         ),
                     )
                 elif command.kind == "finish":
-                    self.logger.info("发送 FinishSession: session=%s", state.session_id)
+                    self.logger.debug("发送 FinishSession: session=%s", state.session_id)
                     await self._send_frame(
                         websocket,
                         state.session_id,
@@ -464,7 +464,7 @@ class DoubaoRealtimeClient:
                     )
                     break
                 elif command.kind == "cancel":
-                    self.logger.info("发送 CancelSession: session=%s", state.session_id)
+                    self.logger.debug("发送 CancelSession: session=%s", state.session_id)
                     await self._send_frame(
                         websocket,
                         state.session_id,
@@ -602,12 +602,12 @@ class DoubaoRealtimeClient:
 
             if event == Event.CONNECTION_STARTED:
                 state.connection_started.set()
-                self.logger.info("豆包连接已启动: session=%s", state.session_id)
+                self.logger.debug("豆包连接已启动: session=%s", state.session_id)
                 continue
 
             if event == Event.SESSION_STARTED:
                 state.session_started.set()
-                self.logger.info("豆包会话已启动: session=%s", state.session_id)
+                self.logger.debug("豆包会话已启动: session=%s", state.session_id)
                 continue
 
             if event == Event.TTS_RESPONSE:

@@ -27,7 +27,13 @@ try:
 except ImportError:  # pragma: no cover - Windows 环境不提供 fcntl
     fcntl = None
 
-from logging_utils import DropPatternLogFilter, build_default_formatter
+from logging_utils import (
+    CorrelationContextFilter,
+    DeduplicatingLogFilter,
+    DropPatternLogFilter,
+    JsonLineFormatter,
+    build_default_formatter,
+)
 from contracts.geometry_runtime import (
     ExternalGeometryStackConfig,
     GeometryFrameConfig,
@@ -1199,6 +1205,29 @@ def _configure_third_party_logger_levels() -> None:
     access_logger.propagate = False
     access_logger.disabled = True
 
+    for ros2_logger_name in ("nuwax_robot_bridge.ros2", "ros2"):
+        logging.getLogger(ros2_logger_name).setLevel(logging.WARNING)
+
+
+_SUBSYSTEM_LOGGERS = {
+    "geometry": "nuwax_robot_bridge.geometry",
+    "navigation": "nuwax_robot_bridge.navigation",
+    "perception": "nuwax_robot_bridge.perception",
+    "tts": "nuwax_robot_bridge.tts",
+    "gateway": "nuwax_robot_bridge.gateway",
+    "runtime": "nuwax_robot_bridge.runtime",
+    "ros2": "nuwax_robot_bridge.ros2",
+    "driver": "nuwax_robot_bridge.driver",
+}
+
+
+def _configure_subsystem_levels() -> None:
+    for subsystem, logger_name in _SUBSYSTEM_LOGGERS.items():
+        env_key = f"NUWAX_LOG_LEVEL_{subsystem.upper()}"
+        level_str = os.environ.get(env_key, "").strip().upper()
+        if level_str and hasattr(logging, level_str):
+            logging.getLogger(logger_name).setLevel(getattr(logging, level_str))
+
 
 def configure_logging(config: LoggingConfig) -> None:
     """统一初始化日志。"""
@@ -1207,7 +1236,12 @@ def configure_logging(config: LoggingConfig) -> None:
     level_name = (config.level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     noisy_filter = DropPatternLogFilter()
-    formatter = build_default_formatter()
+
+    log_format = os.environ.get("NUWAX_LOG_FORMAT", "").strip().lower()
+    if log_format == "json":
+        formatter = JsonLineFormatter()
+    else:
+        formatter = build_default_formatter()
 
     file_handler = _LineLimitedFileHandler(
         config.log_file,
@@ -1222,12 +1256,20 @@ def configure_logging(config: LoggingConfig) -> None:
     console_handler.addFilter(noisy_filter)
     console_handler.setFormatter(formatter)
 
+    correlation_filter = CorrelationContextFilter()
+    dedup_filter = DeduplicatingLogFilter(window_sec=15.0)
+
+    file_handler.addFilter(correlation_filter)
+    console_handler.addFilter(correlation_filter)
+    console_handler.addFilter(dedup_filter)
+
     logging.basicConfig(
         level=level,
         handlers=[file_handler, console_handler],
         force=True,
     )
     _configure_third_party_logger_levels()
+    _configure_subsystem_levels()
 
 
 APP_CONFIG = load_config()

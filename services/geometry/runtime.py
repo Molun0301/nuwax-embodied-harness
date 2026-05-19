@@ -34,6 +34,7 @@ from services.geometry.odometry_publisher import Ros2OdometryPublisher
 from services.geometry.pointcloud_publisher import Ros2PointCloudPublisher
 from services.geometry.ros_bridge_client import RosBridgeSubprocess
 from services.geometry.remote_provider import RemoteGeometryProvider
+from services.geometry.rosout_bridge import RosoutBridge
 from services.geometry.tf_localization_provider import Ros2TfLocalizationProvider
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
@@ -239,6 +240,7 @@ class PlatformGeometryRuntime:
         self._nav2_action_provider = Nav2ActionNavigationProvider(self)
         self._ros_bridge_subprocess: Optional[RosBridgeSubprocess] = None
         self._remote_provider: Optional[RemoteGeometryProvider] = None
+        self._rosout_bridge = RosoutBridge()
         self._platform_exploration_config = ExplorationConfig(enabled=True)
         self._platform_exploration_runtime = PlatformExplorationRuntime(
             frontier_explorer=FrontierExplorer(self._platform_exploration_config),
@@ -288,6 +290,7 @@ class PlatformGeometryRuntime:
             self._ensure_external_geometry_observers_started()
             self._start_required_processes()
             self._set_runtime_state("starting_external", "外部 SLAM/Nav2 几何脚本已启动，等待 /map、TF 与 Nav2 action。")
+            self._rosout_bridge.start()
             self._start_monitor_thread()
         except Exception as exc:
             self._record_runtime_diagnostic("geometry_start", exc)
@@ -317,6 +320,7 @@ class PlatformGeometryRuntime:
         self._tf_localization_provider.stop()
         self._odometry_publisher.stop()
         self._point_cloud_publisher.stop()
+        self._rosout_bridge.stop()
         self._live_geometry_start_attempted = False
         with self._runtime_state_lock:
             self._runtime_started = False
@@ -3048,7 +3052,7 @@ class PlatformGeometryRuntime:
         with open(tmp_yaml, "a") as f:
             f.write("\n    map_file_name: %s\n" % str(prefix))
             f.write("    map_start_at_dock: true\n")
-        LOGGER.info("生成 slam_toolbox 增量建图配置 posegraph=%s yaml=%s", prefix, tmp_yaml)
+        LOGGER.debug("生成 slam_toolbox 增量建图配置 posegraph=%s yaml=%s", prefix, tmp_yaml)
         return tmp_yaml
 
     def _ensure_amcl_initialized(self) -> None:
@@ -3100,7 +3104,7 @@ class PlatformGeometryRuntime:
             # 等待订阅者就绪后发布
             time.sleep(0.5)
             pub.publish(msg)
-            LOGGER.info("已发布 identity initialpose 到 /initialpose。")
+            LOGGER.debug("已发布 identity initialpose 到 /initialpose。")
         except Exception as exc:
             LOGGER.warning("发布 initialpose fallback 失败：%s", exc)
         finally:
@@ -3504,7 +3508,7 @@ class PlatformGeometryRuntime:
                     return
             target_pose = current_goal.target_pose
             if target_pose is not None:
-                LOGGER.info(
+                LOGGER.debug(
                     "平台探索下发 frontier 导航目标 backend=%s previous_goal_id=%s previous_status=%s goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s metadata=%s",
                     navigation_backend_name,
                     navigation_state.current_goal_id,
@@ -3977,7 +3981,7 @@ class PlatformGeometryProviderBundle(
             return False
         target_pose = getattr(goal, "target_pose", None)
         if target_pose is not None:
-            LOGGER.info(
+            LOGGER.debug(
                 "几何 ProviderBundle 转发导航目标 backend=%s goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s",
                 getattr(backend, "provider_name", None),
                 getattr(goal, "goal_id", None),

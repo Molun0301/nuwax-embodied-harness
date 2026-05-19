@@ -315,7 +315,7 @@ class LogTTSBridge:
         if not buffer.raw_text:
             return
         if not buffer.finish_requested:
-            LOGGER.info("检测到一轮模型回复结束，准备收口TTS流: session=%s source=%s", session_id, source)
+            LOGGER.debug("检测到一轮模型回复结束，准备收口TTS流: session=%s source=%s", session_id, source)
         buffer.finish_requested = True
 
     def _flush_sessions(self) -> None:
@@ -366,7 +366,7 @@ class LogTTSBridge:
         if text_hash and text_hash != buffer.last_spoken_hash:
             buffer.last_spoken_hash = text_hash
 
-        LOGGER.info(
+        LOGGER.debug(
             "本轮日志TTS已完成: session=%s tts_session=%s chars=%s",
             session_id,
             buffer.tts_session_id or "-",
@@ -489,7 +489,7 @@ class LogTTSBridge:
 
         buffer.start_failures = 0
         buffer.last_start_error = ""
-        LOGGER.info("TTS流已创建: session=%s tts_session=%s", session_id, buffer.tts_session_id)
+        LOGGER.debug("TTS流已创建: session=%s tts_session=%s", session_id, buffer.tts_session_id)
         return True
 
     def _append_stream_text(self, session_id: str, buffer: SessionBuffer, text: str) -> bool:
@@ -521,7 +521,7 @@ class LogTTSBridge:
         if not ok:
             LOGGER.error("结束本地 Doubao 会话失败: session=%s tts_session=%s", session_id, tts_session_id)
             return False
-        LOGGER.info("TTS流已结束: session=%s tts_session=%s", session_id, tts_session_id)
+        LOGGER.debug("TTS流已结束: session=%s tts_session=%s", session_id, tts_session_id)
         return True
 
     def _compute_incremental_delta(self, previous: str, current: str) -> str:

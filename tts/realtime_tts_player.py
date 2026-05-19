@@ -119,7 +119,7 @@ class LocalAudioBackend:
             sample_rate,
             channels,
         ):
-            logger.info("启动TTS播放后端(%s): %s", backend_name, " ".join(cmd))
+            logger.debug("启动TTS播放后端(%s): %s", backend_name, " ".join(cmd))
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -347,7 +347,7 @@ class LocalAudioBackend:
             self.route_backend = "spk-ctl"
             self.route_device = spk_device
             self.speaker_enabled = True
-            logger.info("已启用喇叭功放控制: device=%s", spk_device)
+            logger.debug("已启用喇叭功放控制: device=%s", spk_device)
             return spk_device
 
         default_device = self._preferred_alsa_device()
@@ -356,7 +356,7 @@ class LocalAudioBackend:
             self.route_prepared = True
             self.route_backend = "alsa-default"
             self.route_device = default_device
-            logger.info("已选择系统默认播放设备: device=%s", default_device)
+            logger.debug("已选择系统默认播放设备: device=%s", default_device)
             return default_device
 
         if not self.config.enable_ape_route:
@@ -367,7 +367,7 @@ class LocalAudioBackend:
             self.route_prepared = True
             self.route_backend = "ape"
             self.route_device = ape_device
-            logger.info(
+            logger.debug(
                 "已配置APE播放路由: card=%s speaker=%s admaif=%s device=%s",
                 self.config.ape_card,
                 self.config.ape_speaker,
@@ -387,7 +387,7 @@ class LocalAudioBackend:
             if playback_channels == 1:
                 playback_channels = 2
         if playback_sample_rate != sample_rate or playback_channels != channels:
-            logger.info(
+            logger.debug(
                 "已启用PCM播放格式转换: input=%sHz/%sch output=%sHz/%sch route=%s",
                 sample_rate,
                 channels,
@@ -471,7 +471,7 @@ class LocalAudioBackend:
             logger.warning("取消Pulse sink静音失败: sink=%s error=%s", sink, exc)
         volume_text = self._pactl_read_text(["pactl", "get-sink-volume", sink])
         mute_text = self._pactl_read_text(["pactl", "get-sink-mute", sink])
-        logger.info(
+        logger.debug(
             "Pulse sink已准备: sink=%s volume=%s mute=%s",
             sink,
             volume_text or "-",
@@ -637,7 +637,7 @@ class LocalAudioBackend:
                     text=True,
                     timeout=1.0,
                 )
-                logger.info("已关闭喇叭功放控制: %s", " ".join(command[1:]))
+                logger.debug("已关闭喇叭功放控制: %s", " ".join(command[1:]))
                 self.speaker_enabled = False
                 return
             except Exception:
@@ -782,7 +782,7 @@ class RobotSpeakerBackend:
         self._segment_stop.clear()
         self._segment_index = 0
         self.client.connect()
-        logger.info("机器人扬声器后端已就绪: ip=%s mode=%s", self.config.robot_ip, self.config.connection_mode)
+        logger.debug("机器人扬声器后端已就绪: ip=%s mode=%s", self.config.robot_ip, self.config.connection_mode)
 
         if self.config.use_megaphone and self.config.streaming_enabled and self.audio_format == "pcm":
             logger.warning("robot_webrtc 实时 megaphone 仍属实验路径，当前会优先尝试实时流式，失败后自动回退整段上传")
@@ -794,7 +794,7 @@ class RobotSpeakerBackend:
                 )
                 self._streaming_enabled = True
                 self._streaming_active = True
-                logger.info(
+                logger.debug(
                     "机器人扬声器已进入实时 megaphone 模式: ip=%s sample_rate=%s channels=%s",
                     self.config.robot_ip,
                     self.sample_rate,
@@ -814,7 +814,7 @@ class RobotSpeakerBackend:
                 daemon=True,
             )
             self._segment_thread.start()
-            logger.info("机器人扬声器已启用按句分段上传模式")
+            logger.debug("机器人扬声器已启用按句分段上传模式")
 
     def write(self, payload: bytes) -> None:
         if not payload:
@@ -927,7 +927,7 @@ class RobotSpeakerBackend:
         if self._segment_queue is None:
             return False
         self._segment_queue.put(segment)
-        logger.info(
+        logger.debug(
             "机器人扬声器分段已入队: index=%s bytes=%s duration=%.2fs",
             segment["index"],
             segment["bytes_uploaded"],
@@ -1029,7 +1029,7 @@ class RobotSpeakerBackend:
             try:
                 self._uploaded_result = self._upload_segment_with_retry(segment)
                 self.last_error = ""
-                logger.info(
+                logger.debug(
                     "机器人扬声器分段播放完成: index=%s duration=%.2fs",
                     segment["index"],
                     segment["duration_sec"],
@@ -1114,7 +1114,7 @@ class RealtimeTTSPlayer:
     def start(self) -> bool:
         with self._lock:
             if self._running:
-                logger.info("本地TTS播放管理器已在运行")
+                logger.debug("本地TTS播放管理器已在运行")
                 return False
             self._running = True
         logger.info("本地TTS播放管理器已启动")
@@ -1138,7 +1138,7 @@ class RealtimeTTSPlayer:
         backend = self._current_backend
         if backend is not None:
             volume = backend.set_volume(volume)
-        logger.info("本地TTS播放软件音量设置为: %.2f", volume)
+        logger.debug("本地TTS播放软件音量设置为: %.2f", volume)
         return volume
 
     def begin_session(
@@ -1156,10 +1156,10 @@ class RealtimeTTSPlayer:
             previous_session_id = self._current_session_id
             self._current_session_id = session_id
         if previous_session_id and previous_session_id != session_id:
-            logger.info("检测到新的TTS会话，停止旧会话: old=%s new=%s", previous_session_id, session_id)
+            logger.debug("检测到新的TTS会话，停止旧会话: old=%s new=%s", previous_session_id, session_id)
             self._stop_backend(force=True)
         self._start_backend_for_session(audio_format, sample_rate, channels)
-        logger.info(
+        logger.debug(
             "TTS会话开始: %s backend=%s",
             session_id,
             self._active_backend_mode or self.config.backend_mode,
@@ -1180,7 +1180,7 @@ class RealtimeTTSPlayer:
             return
         self._finish_backend_for_session()
         backend_status = self._current_backend.status() if self._current_backend is not None else {}
-        logger.info(
+        logger.debug(
             "TTS 会话结束",
             extra={
                 "event": "tts.session.finished",
@@ -1208,7 +1208,7 @@ class RealtimeTTSPlayer:
         if self._current_session_id != session_id:
             return
         if self.config.print_subtitle:
-            logger.info(
+            logger.debug(
                 "TTS 字幕",
                 extra={
                     "event": "tts.subtitle",

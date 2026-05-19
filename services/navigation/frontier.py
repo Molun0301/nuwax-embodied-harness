@@ -183,7 +183,7 @@ class FrontierExplorer:
         revisit_separation_m = float(self.config.frontier_revisit_separation_m)
         current_yaw = _yaw_from_pose(current_pose)
         max_radius_m = None if radius_m is None else max(0.1, float(radius_m))
-        LOGGER.info(
+        LOGGER.debug(
             "frontier 候选生成开始 current=(%.3f, %.3f, %.3f) frame=%s map_frame=%s grid=%sx%s resolution=%.3f origin=(%.3f, %.3f) costmap_frame=%s clusters=%d radius_m=%s attempted=%d",
             float(current_pose.position.x),
             float(current_pose.position.y),
@@ -318,7 +318,7 @@ class FrontierExplorer:
         )
         if candidates:
             best = candidates[0]
-            LOGGER.info(
+            LOGGER.debug(
                 "frontier 候选生成完成 count=%d best=(%.3f, %.3f, %.3f) frame=%s score=%.3f distance_m=%.3f info_gain=%d",
                 len(candidates),
                 float(best.pose.position.x),
@@ -330,7 +330,7 @@ class FrontierExplorer:
                 int(best.info_gain_cells),
             )
         else:
-            LOGGER.info("frontier 候选生成完成 count=0")
+            LOGGER.debug("frontier 候选生成完成 count=0")
         return candidates
 
     def _same_grid_layout(self, occupancy_grid: OccupancyGrid, cost_map: Optional[CostMap]) -> bool:

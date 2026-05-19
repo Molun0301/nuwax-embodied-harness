@@ -57,7 +57,7 @@ from services.perception import PerceptionService, PerceptionVideoRuntime, build
 from services.robot_state_service import RobotStateService
 from services.video import ReceivedVideoFrame, VideoStreamReceiver
 from skills import SkillRegistry
-from logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event
+from logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event, set_correlation_context, clear_correlation_context
 from settings import NuwaxRobotBridgeConfig
 
 
@@ -2638,6 +2638,10 @@ class GatewayRuntime:
             requested_by=requested_by,
         )
         payload = dict(arguments or {})
+        set_correlation_context(
+            request_id=context.get("request_id", ""),
+            capability_name=descriptor.name,
+        )
         self._publish_capability_invocation_event(
             "capability.invocation.started",
             descriptor.name,
@@ -2705,6 +2709,8 @@ class GatewayRuntime:
                 message=f"能力 {descriptor.name} 调用失败。",
             )
             raise
+        finally:
+            clear_correlation_context()
 
     @staticmethod
     def _build_capability_request_context(

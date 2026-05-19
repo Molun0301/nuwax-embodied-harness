@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane")
+
+from logging_utils import SamplingLogFilter as _SamplingLogFilter
+LOGGER.addFilter(_SamplingLogFilter(sample_rate=0.01))
 _GO2_INFO_LOG_RATE_LIMIT_SEC = 30.0
 _GO2_MOTION_ERROR_LOG_RATE_LIMIT_SEC = 5.0
 _GO2_OBSTACLE_STATUS_REFRESH_INTERVAL_SEC = 5.0
@@ -692,7 +695,7 @@ class Go2DataPlaneRuntime:
         except Exception:
             self._obstacle_avoidance_enabled = previous_enabled
             raise
-        LOGGER.info("官方避障已%s。", "启用" if switch_enabled else "禁用")
+        LOGGER.debug("官方避障已%s。", "启用" if switch_enabled else "禁用")
         return self.get_obstacle_avoidance_status()
 
     def is_obstacle_avoidance_enabled(self) -> bool:
@@ -965,7 +968,7 @@ class Go2DataPlaneRuntime:
         if code != 0:
             raise RuntimeError(f"切换 Go2 官方 obstacles_avoid 远程命令模式失败 code={code}")
         self._official_obstacles_avoid_remote_control = bool(enabled)
-        LOGGER.info("Go2 官方避障远程命令模式已%s。", "启用" if enabled else "关闭")
+        LOGGER.debug("Go2 官方避障远程命令模式已%s。", "启用" if enabled else "关闭")
 
     def _ensure_obstacle_avoidance_active(self) -> bool:
         if not self._obstacle_avoidance_enabled:
@@ -1074,7 +1077,7 @@ class Go2DataPlaneRuntime:
                 extra=extra,
             )
             return
-        LOGGER.info("Go2 运动命令链路已切换", extra=extra)
+        LOGGER.debug("Go2 运动命令链路已切换", extra=extra)
 
     def _stop_official_motion(self) -> None:
         self._last_motion_command_route = None

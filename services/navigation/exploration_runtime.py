@@ -415,7 +415,7 @@ class PlatformExplorationRuntime:
             if not self.is_running:
                 return
 
-        LOGGER.info(
+        LOGGER.debug(
             "frontier 规划请求 request_id=%s current=(%.3f, %.3f, %.3f) frame=%s center=(%.3f, %.3f, %.3f) radius_m=%s map_revision=%s costmap_revision=%s pose_revision=%s attempted=%d",
             state.request_id,
             float(current_pose.position.x),
@@ -445,7 +445,7 @@ class PlatformExplorationRuntime:
             return
         state.latest_frontiers = list(frontiers)
         state.last_frontier_count = len(frontiers)
-        LOGGER.info("frontier 规划接收候选 request_id=%s count=%d", state.request_id, len(frontiers))
+        LOGGER.debug("frontier 规划接收候选 request_id=%s count=%d", state.request_id, len(frontiers))
         state.last_error = None
         state.failure_code = None
         state.known_cells = self._count_known_cells(occupancy_grid)
@@ -467,7 +467,7 @@ class PlatformExplorationRuntime:
             self._finish(state, phase=ExplorationRuntimePhase.FAILED)
             return
 
-        LOGGER.info(
+        LOGGER.debug(
             "frontier 目标选中 request_id=%s pose=(%.3f, %.3f, %.3f) frame=%s score=%.3f distance_m=%.3f cluster_size=%d info_gain=%d",
             state.request_id,
             float(best_frontier.pose.position.x),
@@ -514,7 +514,7 @@ class PlatformExplorationRuntime:
             ),
         )
         target_pose = state.current_target.navigation_goal.target_pose
-        LOGGER.info(
+        LOGGER.debug(
             "frontier 导航目标组装 goal_id=%s request_id=%s target=(%.3f, %.3f, %.3f) frame=%s map_name=%s target_name=%s revision=%s",
             state.current_target.navigation_goal.goal_id,
             state.request_id,
@@ -785,7 +785,7 @@ class PlatformExplorationRuntime:
                     float(frontier.score),
                 )
                 continue
-            LOGGER.info(
+            LOGGER.debug(
                 "frontier 选择器返回目标 request_id=%s pose=(%.3f, %.3f, %.3f) frame=%s score=%.3f distance_m=%.3f",
                 state.request_id,
                 float(frontier.pose.position.x),

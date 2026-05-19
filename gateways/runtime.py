@@ -57,7 +57,7 @@ from services.perception import PerceptionService, PerceptionVideoRuntime, build
 from services.robot_state_service import RobotStateService
 from services.video import ReceivedVideoFrame, VideoStreamReceiver
 from skills import SkillRegistry
-from logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event, set_correlation_context, clear_correlation_context
+from logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event, set_correlation_context, clear_correlation_context, StreamBusLogHandler, DropPatternLogFilter
 from settings import NuwaxRobotBridgeConfig
 
 
@@ -217,6 +217,10 @@ class GatewayRuntime:
         self.skill_registry = SkillRegistry()
         self.event_bus = event_bus or EventBus()
         self.stream_bus = stream_bus or StreamBus()
+        self._log_stream_handler = StreamBusLogHandler(self.stream_bus, level=logging.DEBUG)
+        self._log_stream_handler.setFormatter(logging.Formatter("%(message)s"))
+        self._log_stream_handler.addFilter(DropPatternLogFilter())
+        logging.getLogger().addHandler(self._log_stream_handler)
         self.resource_lock_manager = resource_lock_manager or ResourceLockManager()
         self.state_store = state_store or StateStore()
         self.safety_guard = safety_guard or SafetyGuard(
@@ -539,33 +543,6 @@ class GatewayRuntime:
 
     def _publish_runtime_event_stream_frames(self, event) -> None:
         category = self._stream_enum_value(getattr(event, "category", ""))
-        event_type = str(getattr(event, "event_type", "") or "")
-        severity = self._stream_enum_value(getattr(event, "severity", "info"))
-        log_stream_severity = (
-            "debug"
-            if severity == "info" and is_low_value_runtime_event(event_type)
-            else severity
-        )
-        self.stream_bus.publish(
-            "logs.entry",
-            source=str(getattr(event, "source", "event_bus") or "event_bus"),
-            payload={
-                "cursor": getattr(event, "cursor", None),
-                "event_type": event_type or None,
-                "category": category,
-                "severity": log_stream_severity,
-                "source": getattr(event, "source", None),
-                "task_id": getattr(event, "task_id", None),
-                "subject_id": getattr(event, "subject_id", None),
-                "message": getattr(event, "message", None),
-                "payload": getattr(event, "payload", {}) or {},
-                "metadata": getattr(event, "metadata", {}) or {},
-                "timestamp": getattr(event, "timestamp", None),
-            },
-            sequence=getattr(event, "cursor", None),
-            status="available",
-            metadata={"severity": log_stream_severity, "category": category},
-        )
         if category == "task" or getattr(event, "task_id", None):
             self.stream_bus.publish(
                 "tasks.state",

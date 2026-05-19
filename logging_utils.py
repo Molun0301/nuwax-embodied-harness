@@ -389,3 +389,43 @@ class JsonLineFormatter(logging.Formatter):
         if record.exc_info and record.exc_info[1]:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+class StreamBusLogHandler(logging.Handler):
+    """将 Python 日志记录发布到 StreamBus 的 logs.entry topic。"""
+
+    def __init__(self, stream_bus, level=logging.NOTSET):
+        super().__init__(level)
+        self._stream_bus = stream_bus
+        self._sequence = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._sequence += 1
+            severity = record.levelname.lower()
+            if severity == "warning":
+                severity = "warn"
+            message = self.format(record) if self.formatter else record.getMessage()
+            extra = {}
+            for key in _EXTRA_FIELD_ORDER:
+                value = getattr(record, key, None)
+                if value is not None:
+                    extra[key] = value
+            self._stream_bus.publish(
+                "logs.entry",
+                source=record.name,
+                payload={
+                    "timestamp": record.created,
+                    "severity": severity,
+                    "level": severity,
+                    "source": record.name,
+                    "message": message,
+                    "event_type": extra.get("event"),
+                    "task_id": extra.get("task_id"),
+                },
+                sequence=self._sequence,
+                status="available",
+                metadata={"severity": severity},
+            )
+        except Exception:
+            self.handleError(record)

@@ -4,6 +4,8 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_stream::StreamExt;
 use tracing::{info, error};
 
+use crate::pointcloud::PointCloudProcessor;
+
 #[derive(Clone, Default)]
 pub struct PoseState {
     pub x: f64, pub y: f64, pub z: f64,

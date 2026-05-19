@@ -1,3 +1,4 @@
+mod pointcloud;
 mod ros2_bridge;
 mod server;
 mod video_relay;

@@ -418,7 +418,7 @@ class RclpyGo2RosBridge:
                 callbacks = tuple(self._point_cloud_callbacks.values())
             for callback in callbacks:
                 try:
-                    callback(point_cloud.model_copy(deep=True))
+                    callback(point_cloud.model_copy(deep=False))
                 except Exception:
                     LOGGER.debug("分发 Go2 DDS 点云帧失败。", exc_info=True)
 
@@ -442,7 +442,7 @@ class RclpyGo2RosBridge:
             callbacks = tuple(self._localization_callbacks.values())
         for callback in callbacks:
             try:
-                callback(pose.model_copy(deep=True), frame_tree.model_copy(deep=True), dict(metadata))
+                callback(pose.model_copy(deep=False), frame_tree.model_copy(deep=False), dict(metadata))
             except Exception:
                 LOGGER.debug("分发 Go2 DDS 定位帧失败。", exc_info=True)
 

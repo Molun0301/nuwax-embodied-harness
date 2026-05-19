@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
 import logging
 import math
 from pathlib import Path
@@ -771,7 +772,7 @@ class GatewayRuntime:
                 "video.frame",
                 source="video_ingest_receiver",
                 payload={
-                    **self._serialize(status),
+                    **self._serialize_lightweight(status),
                     "available": False,
                     "message": "尚未收到 Go2 端侧主动推送的视频首帧；平台不会主动采集图像帧。",
                     "stream_url": "/streams/video.mjpeg",
@@ -804,8 +805,8 @@ class GatewayRuntime:
             "source": source,
             "refresh_reason": reason,
             "timestamp": latest_frame.timestamp,
-            "metadata": self._serialize(latest_frame.metadata),
-            "ingest_status": self._serialize(status),
+            "metadata": self._serialize_lightweight(latest_frame.metadata),
+            "ingest_status": self._serialize_lightweight(status),
         }
         if not is_available:
             payload["message"] = "Go2 端侧视频推流已断开或最近帧已过期；平台不会用陈旧缓存帧冒充实时视频。"
@@ -7326,6 +7327,21 @@ class GatewayRuntime:
         if is_dataclass(value):
             return asdict(value)
         return to_jsonable(value)
+
+    def _serialize_lightweight(self, value: Any) -> Any:
+        """快路径序列化：跳过 jsonable_encoder，直接返回已安全的值。"""
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): self._serialize_lightweight(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._serialize_lightweight(item) for item in value]
+        if isinstance(value, datetime):
+            return value.isoformat()
+        # fallback to full serialization for complex types
+        return self._serialize(value)
 
     def _require_str(self, payload: Dict[str, Any], key: str) -> str:
         value = str(payload.get(key, "")).strip()

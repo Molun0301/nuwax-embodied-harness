@@ -1,20 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import importlib
-import json
 import logging
 import os
 from pathlib import Path
 import sys
 import time
 from typing import Callable, Optional, TypeVar
-from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
-import websockets
-
-from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO
 from drivers.go2.settings import Go2DataPlaneConfig, load_go2_data_plane_config
 
 try:
@@ -96,18 +90,6 @@ def _extract_jpeg_payload(data: object) -> Optional[bytes]:
     return raw[soi : eoi + 2]
 
 
-def _gateway_url_with_token(url: str, token: str) -> str:
-    normalized = str(url or "").strip()
-    if not normalized:
-        normalized = "ws://127.0.0.1:8766/streams/video.ingest"
-    if not token:
-        return normalized
-    parts = urlsplit(normalized)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.setdefault("access_token", token)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
-
 async def _run_blocking(callable_obj: Callable[..., T], *args: object, **kwargs: object) -> T:
     """在兼容 Python 3.8 的线程池中执行阻塞 SDK 调用。"""
 
@@ -120,63 +102,31 @@ async def _run_blocking(callable_obj: Callable[..., T], *args: object, **kwargs:
 
 async def _stream_once(config: Go2DataPlaneConfig) -> None:
     stream_config = config.video_stream
-    gateway_url = _gateway_url_with_token(stream_config.gateway_url, stream_config.access_token)
     client = await _run_blocking(_create_video_client, config)
     frame_interval_sec = 1.0 / max(1.0, float(stream_config.fps))
-    camera_id = str(stream_config.camera_id or GO2_DEFAULT_CAMERA_INFO.camera_id)
-    frame_id = str(stream_config.frame_id or GO2_DEFAULT_CAMERA_INFO.frame_id)
-    width_px = int(stream_config.width_px or GO2_DEFAULT_CAMERA_INFO.width_px)
-    height_px = int(stream_config.height_px or GO2_DEFAULT_CAMERA_INFO.height_px)
-    camera_info = GO2_DEFAULT_CAMERA_INFO.model_copy(
-        update={
-            "camera_id": camera_id,
-            "frame_id": frame_id,
-            "width_px": width_px,
-            "height_px": height_px,
-        },
-        deep=True,
-    ).model_dump(mode="json")
 
     uds_path = os.environ.get("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
-    uds_sender = VideoUdsSender(uds_path, reconnect_interval=1.0) if VideoUdsSender is not None else None
+    if VideoUdsSender is None:
+        raise RuntimeError("VideoUdsSender 不可用，无法启动视频推流。")
+    uds_sender = VideoUdsSender(uds_path, reconnect_interval=1.0)
+    if not uds_sender.connect():
+        raise RuntimeError(f"无法连接 Rust 视频中转 UDS: {uds_path}")
+    LOGGER.info("视频推流已连接 Rust UDS: %s", uds_path)
 
-    async with websockets.connect(gateway_url, max_size=None, ping_interval=15, ping_timeout=15) as websocket:
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "video.start",
-                    "camera_id": camera_id,
-                    "frame_id": frame_id,
-                    "width_px": width_px,
-                    "height_px": height_px,
-                    "encoding": "jpeg",
-                    "source_kind": "go2_side_stream_push",
-                    "robot": "unitree_go2",
-                    "streamer_version": "go2_video_streamer.v1",
-                    "camera_info": camera_info,
-                    "started_at": datetime.now(timezone.utc).isoformat(),
-                },
-                ensure_ascii=False,
-            )
-        )
-        try:
-            await asyncio.wait_for(websocket.recv(), timeout=3.0)
-        except asyncio.TimeoutError:
-            LOGGER.warning("平台视频 ingest 未在 3 秒内确认，继续推流。")
-
-        while True:
-            started_at = time.monotonic()
-            code, data = await _run_blocking(client.GetImageSample)
-            if code != 0 or not data:
-                raise RuntimeError(f"Go2 VideoClient.GetImageSample 失败: code={code}")
-            payload = _extract_jpeg_payload(data)
-            if payload is None:
-                raise RuntimeError("Go2 VideoClient 返回的数据不是完整 JPEG。")
-            await websocket.send(payload)
-            if uds_sender is not None:
-                uds_sender.send_frame(payload)
-            elapsed = time.monotonic() - started_at
-            remaining = frame_interval_sec - elapsed
+    while True:
+        started_at = time.monotonic()
+        code, data = await _run_blocking(client.GetImageSample)
+        if code != 0 or not data:
+            raise RuntimeError(f"Go2 VideoClient.GetImageSample 失败: code={code}")
+        payload = _extract_jpeg_payload(data)
+        if payload is None:
+            raise RuntimeError("Go2 VideoClient 返回的数据不是完整 JPEG。")
+        if not uds_sender.send_frame(payload):
+            raise RuntimeError("UDS 发送失败，连接已断开。")
+        elapsed = time.monotonic() - started_at
+        remaining = frame_interval_sec - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
             if remaining > 0:
                 await asyncio.sleep(remaining)
 

@@ -104,12 +104,33 @@ message PointCloudShmRef {
   uint32 point_step = 4;
 }
 
+// === 视频帧共享内存 ===
+message VideoFrameShmRef {
+  string shm_path = 1;
+  string uds_path = 2;
+  uint64 sequence = 3;
+  uint32 frame_size = 4;
+  uint64 timestamp_ns = 5;
+}
+
+// === 健康检查 ===
+message HealthCheckRequest {}
+message HealthCheckResponse {
+  bool healthy = 1;
+  string phase = 2;
+  uint64 uptime_ms = 3;
+  uint32 rss_kb = 4;
+  uint64 video_frame_sequence = 5;
+  uint32 video_fps_estimate = 6;
+}
+
 // === 服务定义 ===
 service GeometryRuntime {
   // 控制面
   rpc Start(StartRequest) returns (StartResult);
   rpc Stop(StopRequest) returns (StopResult);
   rpc GetStatus(Empty) returns (RuntimeStatus);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
   // 定位
   rpc GetCurrentPose(PoseRequest) returns (Pose);

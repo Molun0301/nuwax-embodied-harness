@@ -319,14 +319,22 @@ async fn handle_command(
         BridgeCommand::PublishPointCloud {
             frame_id, data, point_count, point_step, reply
         } => {
+            let processor = PointCloudProcessor::default_go2();
+            let (processed_data, processed_count) = processor.process(&data, point_step);
+            let out_step = 12u32; // XYZ only after processing
             let mut msg = r2r::sensor_msgs::msg::PointCloud2::default();
             msg.header.frame_id = frame_id;
             msg.height = 1;
-            msg.width = point_count;
-            msg.point_step = point_step;
-            msg.row_step = point_step * point_count;
+            msg.width = processed_count;
+            msg.point_step = out_step;
+            msg.row_step = out_step * processed_count;
             msg.is_dense = true;
-            msg.data = data;
+            msg.data = processed_data;
+            msg.fields = vec![
+                r2r::sensor_msgs::msg::PointField { name: "x".into(), offset: 0, datatype: 7, count: 1 },
+                r2r::sensor_msgs::msg::PointField { name: "y".into(), offset: 4, datatype: 7, count: 1 },
+                r2r::sensor_msgs::msg::PointField { name: "z".into(), offset: 8, datatype: 7, count: 1 },
+            ];
             let r = pc_pub.publish(&msg).map_err(|e| format!("{}", e));
             let _ = reply.send(r);
         }

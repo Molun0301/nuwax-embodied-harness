@@ -50,6 +50,17 @@ impl GeometryRuntime for GeometryRuntimeService {
         }))
     }
 
+    async fn health_check(&self, _req: Request<HealthCheckRequest>) -> Result<Response<HealthCheckResponse>, Status> {
+        Ok(Response::new(HealthCheckResponse {
+            healthy: true,
+            phase: "running".into(),
+            uptime_ms: 0,
+            rss_kb: get_rss_kb(),
+            video_frame_sequence: 0,
+            video_fps_estimate: 0,
+        }))
+    }
+
     async fn get_current_pose(&self, _req: Request<PoseRequest>) -> Result<Response<Pose>, Status> {
         let s = self.bridge.state.read().await;
         Ok(Response::new(Pose {

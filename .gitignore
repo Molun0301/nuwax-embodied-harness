@@ -28,3 +28,5 @@ runtime_data/
 .env
 AGENTS.md
 CLAUDE.md
+services/geometry/nuwax_ros_bridge/Cargo.lock
+services/geometry/nuwax_ros_bridge/target/

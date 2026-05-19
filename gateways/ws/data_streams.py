@@ -124,15 +124,25 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         fps: float = 15.0,
     ):
         access_manager.authenticate_http(request)
-        status = await _run_blocking(runtime.video_stream_receiver.status_snapshot)
-        if not bool(status.get("available")):
+        # 检查视频源可用性：共享内存或 WebSocket 接收器
+        video_available = False
+        if VideoShmReader is not None:
+            import os as _os
+            _shm_path = _os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+            _probe = VideoShmReader(_shm_path)
+            if _probe.has_new_frame():
+                video_available = True
+            _probe.close()
+        if not video_available:
+            status = await _run_blocking(runtime.video_stream_receiver.status_snapshot)
+            video_available = bool(status.get("available"))
+        if not video_available:
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "video_stream_not_available",
                     "reason": "video_ingest_waiting_first_frame",
-                    "message": "尚未收到 Go2 端侧主动推送的视频首帧；平台不会主动采集图像帧。",
-                    "status": to_jsonable(status),
+                    "message": "尚未收到视频首帧（Rust 桥和 WebSocket 均无数据）。",
                 },
             )
         requested_fps = float(fps or 15.0)

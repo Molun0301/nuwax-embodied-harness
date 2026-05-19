@@ -364,7 +364,7 @@ async fn handle_command(
                     let _ = reply.send(Ok(gid.clone()));
                     tokio::task::spawn_local(async move {
                         match fut.await {
-                            Ok((_goal_handle, result_fut)) => {
+                            Ok((_goal_handle, result_fut, _feedback_stream)) => {
                                 match result_fut.await {
                                     Ok((_status, _result)) => {
                                         let mut s = state_for_nav.write().await;

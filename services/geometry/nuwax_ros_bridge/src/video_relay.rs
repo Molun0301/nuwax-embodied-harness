@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
 const SHM_MAGIC: u64 = 0x4E55_5741_5856_4944; // "NUWAXVID"
 const SHM_VERSION: u32 = 1;
@@ -99,7 +99,7 @@ fn video_relay_loop(
                 if let Err(e) = handle_video_connection(
                     &mut conn, &mut mmap, &sequence, &notify,
                 ) {
-                    warn!("视频连接断开: {}", e);
+                    info!("视频连接断开: {}", e);
                 }
             }
             Err(e) => {

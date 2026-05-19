@@ -2,7 +2,7 @@ use r2r::QosProfile;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_stream::StreamExt;
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
 #[derive(Clone, Default)]
 pub struct PoseState {
@@ -262,18 +262,10 @@ async fn ros2_async_loop(
         }
     });
 
-    // 主循环：spin node + 处理命令 + 周期性检测 Nav2
+    // 主循环：spin node + 处理命令
     let cmd_state = state.clone();
-    let mut last_nav2_check = std::time::Instant::now();
     loop {
         node.spin_once(std::time::Duration::from_millis(5));
-
-        if last_nav2_check.elapsed() >= std::time::Duration::from_secs(2) {
-            last_nav2_check = std::time::Instant::now();
-            let ready = nav_client.server_ready().unwrap_or(false);
-            let mut s = cmd_state.write().await;
-            s.nav2_action_server_ready = ready;
-        }
 
         match rx.try_recv() {
             Ok(cmd) => handle_command(cmd, &odom_pub, &pc_pub, &nav_client, &cmd_state).await,

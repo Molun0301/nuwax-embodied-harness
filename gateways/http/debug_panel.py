@@ -386,7 +386,7 @@ def _render_debug_page(access_token: str) -> str:
     .map-stream-chip { position: absolute; z-index: 2; right: 12px; top: 12px; max-width: min(520px, calc(100% - 24px)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .map-info-grid { grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); margin-top: 10px; max-height: 176px; overflow: auto; padding-right: 2px; }
     .video-stage { position: relative; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border-soft); background: var(--occupied); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04); }
-    .video-frame { display: block; width: 100%; min-height: 210px; max-height: 300px; object-fit: contain; background: var(--occupied); }
+    .video-frame { display: block; width: 100%; min-height: 210px; max-height: 300px; object-fit: contain; position: relative; z-index: 1; }
     .video-detection-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
     .video-overlay { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; pointer-events: none; }
     .overlay-chip { border: 1px solid var(--border-strong); background: var(--surface-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: var(--accent-strong); backdrop-filter: blur(10px); }
@@ -550,7 +550,6 @@ def _render_debug_page(access_token: str) -> str:
         <div class="metric"><b id="resourceMetric">--</b><span>资源/任务</span></div>
         <div class="metric"><b id="clockNow" class="mono">--</b><span>当前时间</span></div>
         <div class="metric"><b id="lastReceive" class="mono">--</b><span>数据接收</span></div>
-        <div class="metric"><b>&lt;500 ms</b><span>P95 目标</span></div>
         <span id="estopStatus" class="pill estop">急停状态：只读展示</span>
       </div>
     </header>
@@ -587,7 +586,7 @@ def _render_debug_page(access_token: str) -> str:
             <div id="mapEmpty" class="empty panel-meta">等待地图数据。</div>
             <div class="grid map-info-grid">
               <section class="panel compact">
-                <div class="card-head"><h3>地图帧</h3><span class="muted small">occupancy grid</span></div>
+                <div class="card-head"><h3>地图信息</h3><span class="muted small">occupancy grid</span></div>
                 <div id="mapMeta" class="kv"></div>
               </section>
               <section class="panel compact">
@@ -605,11 +604,11 @@ def _render_debug_page(access_token: str) -> str:
               <div class="tab-title">
                 <div>
                   <div class="eyebrow">Situation</div>
-                  <h2>任务态势</h2>
+                  <h2>状态总览</h2>
                 </div>
                 <span id="missionStatus" class="pill missing">mission: warming</span>
               </div>
-              <div class="tab-menu" role="tablist" aria-label="任务态势二级菜单">
+              <div class="tab-menu" role="tablist" aria-label="状态总览二级菜单">
                 <button class="tab-button active" type="button" data-tab-target="navigation-pane">导航</button>
                 <button class="tab-button" type="button" data-tab-target="overview-pane">总览</button>
                 <button class="tab-button" type="button" data-tab-target="task-pane">任务</button>
@@ -713,7 +712,6 @@ def _render_debug_page(access_token: str) -> str:
                         <option value="debug">DEBUG</option>
                         <option value="info">INFO</option>
                         <option value="warn">WARN</option>
-                        <option value="warning">WARNING</option>
                         <option value="error">ERROR</option>
                         <option value="critical">CRITICAL</option>
                       </select>
@@ -917,6 +915,8 @@ def _render_debug_page(access_token: str) -> str:
         el.textContent = label ? `${label}: ${value}` : value;
       }
       function setKv(el, rows) {
+        const scrollContainer = el.closest(".map-info-grid, .tab-content, .kv");
+        const savedScroll = scrollContainer ? scrollContainer.scrollTop : 0;
         el.replaceChildren();
         for (const [key, value] of rows) {
           const k = document.createElement("div");
@@ -925,6 +925,9 @@ def _render_debug_page(access_token: str) -> str:
           k.textContent = key;
           v.textContent = safeText(value);
           el.append(k, v);
+        }
+        if (scrollContainer && savedScroll > 0) {
+          scrollContainer.scrollTop = savedScroll;
         }
       }
       function setText(el, value) {
@@ -1163,6 +1166,17 @@ def _render_debug_page(access_token: str) -> str:
         } catch (err) {
           showPanelError("logs", `任务列表初始化失败：${err.message || err}`);
         }
+      }
+      function startTaskPolling() {
+        setInterval(async () => {
+          try {
+            const response = await fetch(withAccessToken("/api/tasks?history_limit=20"));
+            if (!response.ok) return;
+            replaceTaskStore(await response.json());
+          } catch (err) {
+            // 静默忽略轮询失败
+          }
+        }, 3000);
       }
       function showPanelError(kind, message) {
         if (kind === "governance") {
@@ -1479,15 +1493,13 @@ def _render_debug_page(access_token: str) -> str:
             : errorReason(envelope, "无 occupancy_grid，占据栅格不可用。");
         }
         setKv(els.mapMeta, [
-          ["frame", envelope.frame_id || (grid && grid.frame_id)],
-          ["size", grid ? `${grid.width} x ${grid.height}` : "--"],
-          ["resolution", grid ? `${grid.resolution_m} m` : "--"],
+          ["地图名称", diagnostics.active_map_name || diagnostics.map_name || envelope.frame_id || (grid && grid.frame_id) || "--"],
+          ["总栅格数", grid ? `${grid.width * grid.height}` : "--"],
           ["source_timestamp", shortTime(envelope.source_timestamp)],
           ["revision", envelope.revision || diagnostics.content_revision],
           ["sequence", envelope.sequence || diagnostics.message_count],
           ["streaming", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
           ["latency", fmt(envelope.latency_ms, " ms")],
-          ["stale", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
@@ -1719,8 +1731,8 @@ def _render_debug_page(access_token: str) -> str:
       function setVideoStreamStatus(status, message) {
         state.videoStreamStatus = status;
         if (message) {
-          els.videoEmpty.hidden = state.videoFrames > 0 && status === "rendering";
-          els.videoEmpty.textContent = message;
+          els.videoEmpty.hidden = state.videoFrames > 0;
+          if (!els.videoEmpty.hidden) els.videoEmpty.textContent = message;
         }
         setText(
           els.videoFpsStatus,
@@ -1974,6 +1986,7 @@ def _render_debug_page(access_token: str) -> str:
         state.videoStreamStatus = "rendering";
         els.videoFrame.hidden = false;
         els.videoEmpty.hidden = true;
+        void els.videoFrame.offsetHeight;
         scheduleVideoDetectionDraw();
       }
       async function displayVideoBlob(blob, generation) {
@@ -2204,7 +2217,7 @@ def _render_debug_page(access_token: str) -> str:
         const filtered = state.logs.filter((entry) => {
           const level = String(entry.level || "").toLowerCase();
           const haystack = `${entry.timestamp || ""} ${entry.level || ""} ${entry.source || ""} ${entry.message || ""} ${entry.event_type || ""}`.toLowerCase();
-          if (normalizedLevel && level !== normalizedLevel) return false;
+          if (normalizedLevel && level !== normalizedLevel && !(normalizedLevel === "warn" && level === "warning") && !(normalizedLevel === "warning" && level === "warn")) return false;
           if (query && !haystack.includes(query)) return false;
           return true;
         });
@@ -2428,7 +2441,7 @@ def _render_debug_page(access_token: str) -> str:
         return {
           sequence: frame.sequence ?? frame.cursor,
           timestamp: payload.timestamp || frame.timestamp,
-          level: String(payload.severity || frame.status || "info").toLowerCase(),
+          level: String(payload.severity || payload.level || frame.status || "info").toLowerCase(),
           source: payload.source || frame.source,
           event_type: payload.event_type,
           message: payload.message || payload.event_type || "runtime.event",
@@ -2532,6 +2545,7 @@ def _render_debug_page(access_token: str) -> str:
       renderLogs();
       updateClock();
       loadInitialTasks();
+      startTaskPolling();
       syncMapCanvasSize();
       if (window.ResizeObserver) {
         new ResizeObserver(redrawMapAfterResize).observe(els.mapCanvas);

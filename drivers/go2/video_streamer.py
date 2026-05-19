@@ -17,6 +17,11 @@ import websockets
 from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO
 from drivers.go2.settings import Go2DataPlaneConfig, load_go2_data_plane_config
 
+try:
+    from services.geometry.video_uds_sender import VideoUdsSender
+except ImportError:
+    VideoUdsSender = None
+
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.video_streamer")
 T = TypeVar("T")
@@ -132,6 +137,9 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
         deep=True,
     ).model_dump(mode="json")
 
+    uds_path = os.environ.get("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
+    uds_sender = VideoUdsSender(uds_path, reconnect_interval=1.0) if VideoUdsSender is not None else None
+
     async with websockets.connect(gateway_url, max_size=None, ping_interval=15, ping_timeout=15) as websocket:
         await websocket.send(
             json.dumps(
@@ -165,6 +173,8 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
             if payload is None:
                 raise RuntimeError("Go2 VideoClient 返回的数据不是完整 JPEG。")
             await websocket.send(payload)
+            if uds_sender is not None:
+                uds_sender.send_frame(payload)
             elapsed = time.monotonic() - started_at
             remaining = frame_interval_sec - elapsed
             if remaining > 0:

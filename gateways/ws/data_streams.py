@@ -17,6 +17,11 @@ from gateways.errors import GatewayError
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable
 
+try:
+    from services.geometry.video_shm_reader import VideoShmReader
+except ImportError:
+    VideoShmReader = None
+
 
 def _parse_topics(values: Optional[str]) -> Optional[Tuple[str, ...]]:
     if not values:
@@ -137,17 +142,38 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         async def frame_generator():
             last_sequence = 0
+            shm_reader = None
+            if VideoShmReader is not None:
+                import os
+                shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+                shm_reader = VideoShmReader(shm_path)
+
             while not await request.is_disconnected():
                 started_at = time.monotonic()
-                latest_frame = await _run_blocking(
-                    runtime.video_stream_receiver.wait_for_frame,
-                    last_sequence,
-                    timeout_sec=frame_interval_sec,
-                    camera_id=camera_id,
-                )
-                if latest_frame is not None:
-                    last_sequence = latest_frame.sequence
-                    yield _format_mjpeg_frame(latest_frame.data)
+
+                # 快速路径：从共享内存读取（Rust 视频中继进程写入）
+                frame_data = None
+                if shm_reader is not None:
+                    result = shm_reader.read_latest()
+                    if result is not None:
+                        frame_data, seq, _ = result
+                        last_sequence = seq
+
+                # 回退路径：从 video_stream_receiver 读取（Python WebSocket 路径）
+                if frame_data is None:
+                    latest_frame = await _run_blocking(
+                        runtime.video_stream_receiver.wait_for_frame,
+                        last_sequence,
+                        timeout_sec=frame_interval_sec,
+                        camera_id=camera_id,
+                    )
+                    if latest_frame is not None:
+                        last_sequence = latest_frame.sequence
+                        frame_data = latest_frame.data
+
+                if frame_data is not None:
+                    yield _format_mjpeg_frame(frame_data)
+
                 elapsed = time.monotonic() - started_at
                 if elapsed < frame_interval_sec:
                     await asyncio.sleep(frame_interval_sec - elapsed)

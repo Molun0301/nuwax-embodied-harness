@@ -1,7 +1,9 @@
 mod ros2_bridge;
 mod server;
+mod video_relay;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tonic::transport::Server;
 use tracing::info;
 
@@ -31,9 +33,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nav_action = std::env::var("NUWAX_NAV_ACTION")
         .unwrap_or_else(|_| "/navigate_to_pose".into());
 
+    let video_shm_path = PathBuf::from(
+        std::env::var("NUWAX_VIDEO_SHM_PATH")
+            .unwrap_or_else(|_| "/tmp/nuwax_video.shm".into())
+    );
+    let video_uds_path = PathBuf::from(
+        std::env::var("NUWAX_VIDEO_UDS_PATH")
+            .unwrap_or_else(|_| "/tmp/nuwax_video.sock".into())
+    );
+
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
 
     info!("启动 nuwax-ros-bridge, addr: {}", addr);
+
+    // 启动视频帧 UDS 中转
+    let _video_handle = video_relay::spawn_video_relay(
+        &video_shm_path, &video_uds_path,
+    )?;
+    info!("视频中转已启动: shm={:?}, uds={:?}", video_shm_path, video_uds_path);
 
     let bridge = ros2_bridge::spawn_ros2_bridge(
         &odom_topic, &pointcloud_topic, &map_topic, &tf_topic, &nav_action

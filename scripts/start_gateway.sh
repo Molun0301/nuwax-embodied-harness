@@ -12,6 +12,7 @@ ACTION="${1:-start}"
 PID_FILE=""
 GATEWAY_PID=""
 VIDEO_STREAMER_PID=""
+ROS_BRIDGE_PID=""
 STOP_REQUESTED=0
 
 trim_whitespace() {
@@ -247,10 +248,39 @@ status_gateway() {
   return 3
 }
 
+should_start_ros_bridge() {
+  local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
+  [[ -x "${binary}" ]] && is_truthy "${NUWAX_ROS_BRIDGE_ENABLED:-true}"
+}
+
 should_start_go2_video_streamer() {
   is_truthy "${GO2_VIDEO_STREAM_ENABLED:-true}" \
     && is_truthy "${GO2_DATA_PLANE_ENABLED:-false}" \
     && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "go2" ]]
+}
+
+start_ros_bridge() {
+  if [[ -n "${ROS_BRIDGE_PID}" ]] && is_pid_alive "${ROS_BRIDGE_PID}"; then
+    return 0
+  fi
+  if ! should_start_ros_bridge; then
+    return 0
+  fi
+  local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
+  echo "starting Rust ros-bridge: ${binary}"
+  (source /opt/ros/foxy/setup.bash && exec "${binary}") &
+  ROS_BRIDGE_PID="$!"
+  # 等待 UDS socket 出现
+  local waited=0
+  while [[ ! -S /tmp/nuwax_video.sock ]] && [[ "${waited}" -lt 5 ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [[ -S /tmp/nuwax_video.sock ]]; then
+    echo "Rust ros-bridge ready (pid ${ROS_BRIDGE_PID})"
+  else
+    echo "WARNING: Rust ros-bridge UDS not ready after 5s" >&2
+  fi
 }
 
 start_go2_video_streamer() {
@@ -260,9 +290,18 @@ start_go2_video_streamer() {
   if ! should_start_go2_video_streamer; then
     return 0
   fi
-  echo "starting Go2 side video streamer -> ${GO2_VIDEO_STREAM_GATEWAY_URL:-ws://127.0.0.1:${PORT}/streams/video.ingest}"
+  echo "starting Go2 side video streamer -> UDS /tmp/nuwax_video.sock"
   "${PYTHON_BIN}" -m drivers.go2.video_streamer &
   VIDEO_STREAMER_PID="$!"
+}
+
+stop_ros_bridge() {
+  if [[ -n "${ROS_BRIDGE_PID}" ]] && is_pid_alive "${ROS_BRIDGE_PID}"; then
+    terminate_process_scope "${ROS_BRIDGE_PID}" "rust ros-bridge"
+    wait "${ROS_BRIDGE_PID}" >/dev/null 2>&1 || true
+  fi
+  ROS_BRIDGE_PID=""
+  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm
 }
 
 stop_go2_video_streamer() {
@@ -276,6 +315,7 @@ stop_go2_video_streamer() {
 stop_gateway() {
   STOP_REQUESTED=1
   stop_go2_video_streamer
+  stop_ros_bridge
   if [[ -n "${GATEWAY_PID}" ]] && kill -0 "${GATEWAY_PID}" >/dev/null 2>&1; then
     terminate_process_scope "${GATEWAY_PID}" "gateway worker"
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
@@ -345,6 +385,7 @@ if ! is_restart_enabled "${RESTART_POLICY}"; then
   set +e
   "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}" &
   GATEWAY_PID="$!"
+  start_ros_bridge
   start_go2_video_streamer
   wait "${GATEWAY_PID}"
   exit_code="$?"
@@ -357,6 +398,7 @@ while true; do
   set +e
   "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}" &
   GATEWAY_PID="$!"
+  start_ros_bridge
   start_go2_video_streamer
   wait "${GATEWAY_PID}"
   exit_code="$?"

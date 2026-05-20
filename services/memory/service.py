@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 import logging
+import queue
 import re
+import threading
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -253,6 +255,13 @@ class MemoryService:
         self._navigation_trajectory_history: Deque[NavigationTrajectoryEvent] = deque(maxlen=max(1, history_limit))
         self._semantic_graph_relation_history: Deque[SemanticGraphRelation] = deque(maxlen=max(1, history_limit))
         self._semantic_summary_history: Deque[SemanticSummaryNode] = deque(maxlen=max(1, history_limit))
+
+        # 后台向量化队列：先写 SQLite 记录，worker 线程异步补充向量
+        self._vectorization_queue: queue.Queue = queue.Queue(maxsize=500)
+        self._vectorization_worker: Optional[threading.Thread] = None
+        self._vectorization_stop_event = threading.Event()
+        # ObservationEvent TTL 清理计数器：每 100 次写入触发一次过期清理
+        self._observation_event_write_count: int = 0
 
     def is_enabled(self) -> bool:
         """返回记忆库当前是否已启用。"""
@@ -2791,6 +2800,22 @@ class MemoryService:
             collection_names=self._collections_for_record_kinds(allowed_record_kinds),
         )
         recall_by_id = {hit.point.point_id: hit.score for hit in vector_hits}
+        # 多模态检索增强：image_dense 双路召回取并集（最高分优先）
+        if query_image_vector is not None and self._image_embedder is not None:
+            try:
+                image_hits = self._vector_store.query(
+                    vector_name=IMAGE_VECTOR_NAME,
+                    query_vector=query_image_vector,
+                    limit=recall_limit,
+                    payload_filter=payload_filter,
+                    collection_names=self._collections_for_record_kinds(allowed_record_kinds),
+                )
+                for hit in image_hits:
+                    existing_score = recall_by_id.get(hit.point.point_id, 0.0)
+                    if hit.score > existing_score:
+                        recall_by_id[hit.point.point_id] = hit.score
+            except Exception:
+                pass  # image 检索失败不影响主链路
         candidate_ids = set(recall_by_id.keys())
         for record_kind in allowed_record_kinds:
             for candidate_id, lexical_score in self._iter_lexical_candidate_ids(normalized_query, record_kind):
@@ -2966,7 +2991,23 @@ class MemoryService:
     ) -> List[_ScoredCandidate]:
         selected: List[_ScoredCandidate] = []
         seen_keys = set()
+        seen_instance_ids: set[str] = set()
         for candidate in candidates:
+            # 跨类型去重：同一 instance_id 只保留分数最高的候选（列表已按 final_score 降序排列）
+            if candidate.semantic_instance is not None:
+                instance_id = (
+                    candidate.semantic_instance.anchor_id
+                    or candidate.semantic_instance.instance_id
+                )
+                if instance_id and instance_id in seen_instance_ids:
+                    continue
+                if instance_id:
+                    seen_instance_ids.add(instance_id)
+            elif candidate.observation_event is not None and candidate.observation_event.linked_instance_ids:
+                linked_ids = candidate.observation_event.linked_instance_ids
+                if seen_instance_ids.intersection(linked_ids):
+                    continue
+                seen_instance_ids.update(linked_ids)
             dedup_key = self._candidate_dedup_key(candidate)
             if dedup_key in seen_keys:
                 continue
@@ -4113,35 +4154,154 @@ class MemoryService:
 
     def _upsert_vector_point_for_instance(self, instance: SemanticInstance) -> None:
         payload = self._build_instance_payload(instance)
-        image_bytes = self._load_primary_image_bytes(instance.artifact_ids)
-        vectors = self._build_named_vectors(
-            retrieval_text=str(payload["retrieval_text"]),
-            image_bytes=image_bytes,
-        )
+        # 先写入不含向量的记录，降低主链路延迟
         self._vector_store.upsert_point(
             point_id=instance.instance_id,
             collection_name=OBJECT_INSTANCES_COLLECTION,
             record_kind=MemoryRecordKind.OBJECT_INSTANCE.value,
             payload=payload,
-            vectors=vectors,
+            vectors={},
             updated_at=instance.last_seen_ts.isoformat(),
+        )
+        # 异步补充向量
+        self._enqueue_vectorization(
+            point_id=instance.instance_id,
+            collection_name=OBJECT_INSTANCES_COLLECTION,
+            record_kind=MemoryRecordKind.OBJECT_INSTANCE.value,
+            retrieval_text=str(payload["retrieval_text"]),
+            artifact_ids=list(instance.artifact_ids),
+            updated_at=instance.last_seen_ts.isoformat(),
+            payload=payload,
         )
 
     def _upsert_vector_point_for_observation_event(self, event: ObservationEvent) -> None:
         payload = self._build_observation_event_payload(event)
-        image_bytes = self._load_primary_image_bytes(event.artifact_ids)
-        vectors = self._build_named_vectors(
-            retrieval_text=str(payload["retrieval_text"]),
-            image_bytes=image_bytes,
-        )
+        # 先写入不含向量的记录，降低主链路延迟
         self._vector_store.upsert_point(
             point_id=event.event_id,
             collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
             record_kind=MemoryRecordKind.OBSERVATION_EVENT.value,
             payload=payload,
-            vectors=vectors,
+            vectors={},
             updated_at=event.timestamp.isoformat(),
         )
+        # 异步补充向量
+        self._enqueue_vectorization(
+            point_id=event.event_id,
+            collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
+            record_kind=MemoryRecordKind.OBSERVATION_EVENT.value,
+            retrieval_text=str(payload["retrieval_text"]),
+            artifact_ids=list(event.artifact_ids),
+            updated_at=event.timestamp.isoformat(),
+            payload=payload,
+        )
+
+    # ------------------------------------------------------------------
+    # 后台向量化 worker
+    # ------------------------------------------------------------------
+
+    def _start_vectorization_worker(self) -> None:
+        """启动后台向量化 worker 线程。"""
+        if self._vectorization_worker is not None and self._vectorization_worker.is_alive():
+            return
+        self._vectorization_stop_event.clear()
+        self._vectorization_worker = threading.Thread(
+            target=self._vectorization_worker_loop,
+            name="memory-vectorization-worker",
+            daemon=True,
+        )
+        self._vectorization_worker.start()
+        logger.info("后台向量化 worker 已启动")
+
+    def _stop_vectorization_worker(self) -> None:
+        """停止后台向量化 worker 线程。"""
+        if self._vectorization_worker is None or not self._vectorization_worker.is_alive():
+            return
+        self._vectorization_stop_event.set()
+        try:
+            self._vectorization_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._vectorization_worker.join(timeout=10.0)
+        self._vectorization_worker = None
+        logger.info("后台向量化 worker 已停止")
+
+    def _vectorization_worker_loop(self) -> None:
+        """worker 主循环：从队列取任务，生成向量后写入 vector_store。"""
+        while not self._vectorization_stop_event.is_set():
+            try:
+                task = self._vectorization_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if task is None:
+                break
+            try:
+                image_bytes = self._load_primary_image_bytes(task["artifact_ids"])  # type: ignore[arg-type]
+                vectors = self._build_named_vectors(
+                    retrieval_text=str(task["retrieval_text"]),
+                    image_bytes=image_bytes,
+                )
+                self._vector_store.upsert_point(
+                    point_id=str(task["point_id"]),
+                    collection_name=str(task["collection_name"]),
+                    record_kind=str(task["record_kind"]),
+                    payload=task["payload"],  # type: ignore[arg-type]
+                    vectors=vectors,
+                    updated_at=str(task["updated_at"]),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("后台向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
+            finally:
+                self._vectorization_queue.task_done()
+
+    def _enqueue_vectorization(
+        self,
+        *,
+        point_id: str,
+        collection_name: str,
+        record_kind: str,
+        retrieval_text: str,
+        artifact_ids: List[str],
+        updated_at: str,
+        payload: Dict[str, object],
+    ) -> None:
+        """将向量化任务入队；队满或 worker 未启动时降级为同步执行。"""
+        task: Dict[str, object] = {
+            "point_id": point_id,
+            "collection_name": collection_name,
+            "record_kind": record_kind,
+            "retrieval_text": retrieval_text,
+            "artifact_ids": artifact_ids,
+            "updated_at": updated_at,
+            "payload": payload,
+        }
+        if self._vectorization_worker is None or not self._vectorization_worker.is_alive():
+            self._run_vectorization_task_sync(task)
+            return
+        try:
+            self._vectorization_queue.put_nowait(task)
+        except queue.Full:
+            logger.warning("向量化队列已满，降级为同步执行 point_id=%s", point_id)
+            self._run_vectorization_task_sync(task)
+
+    def _run_vectorization_task_sync(self, task: Dict[str, object]) -> None:
+        """同步执行单个向量化任务（fallback 路径）。"""
+        try:
+            image_bytes = self._load_primary_image_bytes(task["artifact_ids"])  # type: ignore[arg-type]
+            vectors = self._build_named_vectors(
+                retrieval_text=str(task["retrieval_text"]),
+                image_bytes=image_bytes,
+            )
+            self._vector_store.upsert_point(
+                point_id=str(task["point_id"]),
+                collection_name=str(task["collection_name"]),
+                record_kind=str(task["record_kind"]),
+                payload=task["payload"],  # type: ignore[arg-type]
+                vectors=vectors,
+                updated_at=str(task["updated_at"]),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("同步向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
 
     def _upsert_vector_point_for_scene_space(self, scene_space: SceneSpace) -> None:
         payload = self._build_scene_space_payload(scene_space)
@@ -5422,6 +5582,53 @@ class MemoryService:
             observation_events=observation_events,
         )
 
+        # 每 100 次写入触发一次 ObservationEvent TTL 过期清理
+        self._observation_event_write_count += len(observation_events)
+        if self._observation_event_write_count >= 100:
+            self._observation_event_write_count = 0
+            self._cleanup_expired_observation_events()
+
+    def _cleanup_expired_observation_events(self, max_age_sec: float = 604800.0) -> int:
+        """清理超过 TTL 的 ObservationEvent，默认保留 7 天（604800 秒）。
+
+        遍历内存索引，找出 timestamp 超过 max_age_sec 的事件，从内存、历史队列、
+        持久化仓库和向量库中一并删除。返回清理的事件数量。
+        """
+        import logging
+        from datetime import timezone
+
+        logger = logging.getLogger(__name__)
+        now = __import__("datetime").datetime.now(tz=timezone.utc)
+        expired_ids = [
+            event_id
+            for event_id, event in list(self._observation_events_by_id.items())
+            if (now - event.timestamp.replace(tzinfo=timezone.utc)
+                if event.timestamp.tzinfo is None
+                else now - event.timestamp).total_seconds() > max_age_sec
+        ]
+        if not expired_ids:
+            return 0
+
+        expired_set = set(expired_ids)
+        # 从内存索引中删除
+        for event_id in expired_ids:
+            self._observation_events_by_id.pop(event_id, None)
+        # 从历史队列中删除（重建队列，保留未过期项）
+        surviving = [e for e in self._observation_event_history if e.event_id not in expired_set]
+        self._observation_event_history.clear()
+        for e in surviving:
+            self._observation_event_history.append(e)
+        # 从持久化仓库中删除
+        try:
+            self._repository.delete_observation_events(expired_ids)
+        except AttributeError:
+            pass
+        # 从向量库中删除
+        self._vector_store.delete_points(expired_ids)
+
+        logger.info("ObservationEvent TTL 清理：已删除 %d 条过期事件（max_age_sec=%.0f）", len(expired_ids), max_age_sec)
+        return len(expired_ids)
+
     def _is_long_term_static_instance(self, instance: SemanticInstance) -> bool:
         dynamic_state = self._instance_dynamic_state(instance)
         metadata = dict(instance.metadata or {})
@@ -5431,7 +5638,21 @@ class MemoryService:
             return False
         if metadata.get("long_term_static_target_eligible") is False:
             return False
-        return dynamic_state == InstanceDynamicState.STATIC
+        if dynamic_state == InstanceDynamicState.STATIC:
+            return True
+        # 补充路径：无 class prior 的物品首次观测为 UNKNOWN，需要多次观测才能收敛到 STATIC
+        # 当观测次数 >= 2 且投影质量非 fallback 时也允许持久化
+        observation_count = len(instance.observation_window) if instance.observation_window else 0
+        if observation_count >= 2:
+            pose_quality = str(metadata.get("pose_quality_level") or "").strip()
+            projection_confidence = self._coerce_optional_float(
+                metadata.get("projection_confidence")
+            )
+            if pose_quality != "fallback" and (
+                projection_confidence is None or projection_confidence >= 0.5
+            ):
+                return True
+        return False
 
     def _instance_dynamic_state(self, instance: SemanticInstance) -> InstanceDynamicState:
         value = getattr(instance, "dynamic_state", InstanceDynamicState.UNKNOWN)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 import math
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -90,6 +91,53 @@ class InstanceAssociationService:
         """在运行期注入文本向量器。"""
 
         self._text_embedder = text_embedder
+        # 切换 embedder 后清空缓存，避免使用旧模型的结果
+        self._label_similarity_cache.clear()
+
+    # 实例级标签相似度缓存，key 为 frozenset{label_a, label_b}，顺序无关
+    _label_similarity_cache: Dict[frozenset, float] = {}
+
+    def _label_similarity(self, label_a: str, label_b: str) -> float:
+        """计算两个标签的语义相似度，返回 [0.0, 1.0]。
+
+        若 text_embedder 可用则用余弦相似度；否则用精确匹配 + 包含关系 fallback。
+        结果缓存在实例字典中（顺序无关 key），避免重复推理。
+        """
+        a = label_a.strip().lower()
+        b = label_b.strip().lower()
+        if a == b:
+            return 1.0
+
+        cache_key: frozenset = frozenset({a, b})
+        if cache_key in self._label_similarity_cache:
+            return self._label_similarity_cache[cache_key]
+
+        if self._text_embedder is not None:
+            try:
+                emb_a = self._text_embedder.embed(a)
+                emb_b = self._text_embedder.embed(b)
+                # 计算余弦相似度
+                dot = sum(x * y for x, y in zip(emb_a, emb_b))
+                norm_a = math.sqrt(sum(x * x for x in emb_a))
+                norm_b = math.sqrt(sum(x * x for x in emb_b))
+                if norm_a > 0.0 and norm_b > 0.0:
+                    similarity = dot / (norm_a * norm_b)
+                else:
+                    similarity = 0.0
+                # 相似度低于阈值直接归零，避免弱相关噪声干扰评分
+                result = similarity if similarity >= 0.75 else 0.0
+            except Exception:
+                # embedder 异常时降级为精确匹配
+                result = 1.0 if a == b else 0.0
+        else:
+            # fallback：精确匹配已在函数入口处理；这里额外考虑标签包含关系
+            if a in b or b in a:
+                result = 1.0
+            else:
+                result = 0.0
+
+        self._label_similarity_cache[cache_key] = result
+        return result
 
     def associate(
         self,
@@ -153,7 +201,7 @@ class InstanceAssociationService:
         candidate: SemanticInstance,
         now: datetime,
     ) -> float:
-        label_score = 1.0 if observation.label.strip().lower() == candidate.label.strip().lower() else 0.0
+        label_score = self._label_similarity(observation.label, candidate.label)
         if label_score == 0.0:
             return 0.0
         distance_m = self._distance(observation.pose, candidate.pose)

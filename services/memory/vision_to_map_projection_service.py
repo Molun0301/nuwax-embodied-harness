@@ -29,6 +29,7 @@ class ProjectedObservation:
     semantic_labels: Tuple[str, ...]
     visual_labels: Tuple[str, ...]
     attributes: Dict[str, object]
+    pose_quality_level: str = "low"  # "high", "medium", "low", "fallback"
 
 
 class VisionToMapProjectionService:
@@ -689,6 +690,18 @@ class VisionToMapProjectionService:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _infer_pose_quality_level(projection_method: str) -> str:
+        """根据 projection_method 推导投影坐标质量等级。"""
+        m = str(projection_method or "").lower()
+        if any(k in m for k in ("map_points", "support_points", "detection3d_pose", "map_point_samples", "explicit_map_pose")):
+            return "high"
+        if any(k in m for k in ("track_pose", "depth", "camera_point_samples")):
+            return "medium"
+        if any(k in m for k in ("robot_pose", "fallback", "current_pose")):
+            return "fallback"
+        return "low"
+
     def _build_projected_observation(
         self,
         *,
@@ -708,6 +721,10 @@ class VisionToMapProjectionService:
         merged_attributes.setdefault("semantic_region_id", semantic_region_id or "")
         merged_attributes.setdefault("topo_node_id", topo_node_id or "")
         merged_attributes.setdefault("semantic_labels", list(semantic_labels))
+        pose_quality_level = self._infer_pose_quality_level(
+            str(merged_attributes.get("projection_method") or "")
+        )
+        merged_attributes["pose_quality_level"] = pose_quality_level
         return ProjectedObservation(
             label=label,
             score=float(score),
@@ -722,6 +739,7 @@ class VisionToMapProjectionService:
             semantic_labels=semantic_labels,
             visual_labels=(str(label).strip().lower(),),
             attributes=merged_attributes,
+            pose_quality_level=pose_quality_level,
         )
 
     def _resolve_semantic_anchor(

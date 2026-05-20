@@ -268,7 +268,7 @@ start_ros_bridge() {
   fi
   local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
   echo "starting Rust ros-bridge: ${binary}"
-  (source /opt/ros/foxy/setup.bash && exec "${binary}") &
+  (set +u; source /opt/ros/foxy/setup.bash; set -u; exec "${binary}") &
   ROS_BRIDGE_PID="$!"
   # 等待 UDS socket 出现
   local waited=0

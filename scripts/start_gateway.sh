@@ -304,6 +304,18 @@ stop_ros_bridge() {
   rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm
 }
 
+monitor_ros_bridge() {
+  while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
+    sleep 5
+    if [[ -n "${ROS_BRIDGE_PID}" ]] && ! is_pid_alive "${ROS_BRIDGE_PID}"; then
+      echo "Rust ros-bridge (pid ${ROS_BRIDGE_PID}) crashed, restarting..." >&2
+      rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm
+      ROS_BRIDGE_PID=""
+      start_ros_bridge
+    fi
+  done
+}
+
 stop_go2_video_streamer() {
   if [[ -n "${VIDEO_STREAMER_PID}" ]] && is_pid_alive "${VIDEO_STREAMER_PID}"; then
     terminate_process_scope "${VIDEO_STREAMER_PID}" "go2 video streamer"
@@ -387,9 +399,11 @@ if ! is_restart_enabled "${RESTART_POLICY}"; then
   GATEWAY_PID="$!"
   start_ros_bridge
   start_go2_video_streamer
+  monitor_ros_bridge &
   wait "${GATEWAY_PID}"
   exit_code="$?"
   stop_go2_video_streamer
+  stop_ros_bridge
   exit "${exit_code}"
 fi
 
@@ -400,6 +414,7 @@ while true; do
   GATEWAY_PID="$!"
   start_ros_bridge
   start_go2_video_streamer
+  monitor_ros_bridge &
   wait "${GATEWAY_PID}"
   exit_code="$?"
   stop_go2_video_streamer

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from compat import StrEnum
 
-from pydantic import Field, field_validator
+from pydantic import ConfigDict, Field, field_validator
 
 from contracts.base import ContractModel, MetadataDict, TimestampedContract
 from contracts.geometry import Pose, Quaternion, Twist, Vector3
@@ -33,6 +33,8 @@ class JointState(ContractModel):
 
 class IMUState(TimestampedContract):
     """惯导状态。"""
+
+    model_config = ConfigDict(frozen=True)
 
     frame_id: str = Field(description="IMU 坐标系。")
     orientation: Quaternion = Field(default_factory=Quaternion, description="姿态四元数。")

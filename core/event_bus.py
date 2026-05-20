@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass
+import logging
 import threading
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
@@ -33,6 +35,9 @@ def _has_metadata_value(value: Any) -> bool:
     return value is not None and value != ""
 
 
+_logger = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
 class EventSubscription:
     """事件订阅条目。"""
@@ -41,6 +46,7 @@ class EventSubscription:
     callback: Callable[[RuntimeEvent], None]
     categories: Optional[FrozenSet[RuntimeEventCategory]] = None
     event_types: Optional[FrozenSet[str]] = None
+    async_dispatch: bool = False
 
 
 class EventBus:
@@ -53,6 +59,17 @@ class EventBus:
         self._next_cursor = 1
         self._next_subscription_seq = 1
         self._lock = threading.RLock()
+
+        # 异步分发队列及消费者线程
+        self._async_queue: collections.deque = collections.deque(maxlen=10000)
+        self._async_event = threading.Event()
+        self._shutdown = False
+        self._consumer_thread = threading.Thread(
+            target=self._async_consumer_loop,
+            name="EventBus-async-consumer",
+            daemon=True,
+        )
+        self._consumer_thread.start()
 
     def latest_cursor(self) -> int:
         """返回最新游标。"""
@@ -103,10 +120,14 @@ class EventBus:
         for subscription in subscriptions:
             if not self._matches(subscription, stored_event):
                 continue
-            try:
-                subscription.callback(stored_event)
-            except Exception as exc:
-                failures.append((subscription, exc))
+            if subscription.async_dispatch:
+                self._async_queue.append((subscription.callback, stored_event))
+                self._async_event.set()
+            else:
+                try:
+                    subscription.callback(stored_event)
+                except Exception as exc:
+                    failures.append((subscription, exc))
         if failures:
             self._record_subscription_failures(stored_event, failures)
 
@@ -181,8 +202,14 @@ class EventBus:
         *,
         categories: Optional[Iterable[RuntimeEventCategory]] = None,
         event_types: Optional[Iterable[str]] = None,
+        async_dispatch: bool = False,
     ) -> str:
-        """订阅事件。"""
+        """订阅事件。
+
+        Args:
+            async_dispatch: 若为 True，回调将由后台消费者线程异步执行，
+                           不阻塞发布者线程。适用于重量级回调（如 WebSocket 序列化推送）。
+        """
 
         with self._lock:
             subscription_id = f"sub_{self._next_subscription_seq:04d}"
@@ -192,6 +219,7 @@ class EventBus:
                 callback=callback,
                 categories=frozenset(categories) if categories is not None else None,
                 event_types=frozenset(event_types) if event_types is not None else None,
+                async_dispatch=async_dispatch,
             )
             self._subscriptions[subscription_id] = subscription
             return subscription_id
@@ -233,3 +261,29 @@ class EventBus:
         if subscription.event_types is not None and event.event_type not in subscription.event_types:
             return False
         return True
+
+    def _async_consumer_loop(self) -> None:
+        """后台消费者线程：从 deque 中取出异步回调并执行。"""
+        while not self._shutdown:
+            self._async_event.wait(timeout=0.1)
+            self._async_event.clear()
+            while self._async_queue:
+                try:
+                    callback, event = self._async_queue.popleft()
+                except IndexError:
+                    break
+                try:
+                    callback(event)
+                except Exception as exc:
+                    _logger.warning(
+                        "异步事件回调执行异常: %s — %s",
+                        exc.__class__.__name__,
+                        exc,
+                    )
+
+    def shutdown(self) -> None:
+        """停止后台消费者线程并清空队列。"""
+        self._shutdown = True
+        self._async_event.set()
+        self._consumer_thread.join(timeout=2.0)
+        self._async_queue.clear()

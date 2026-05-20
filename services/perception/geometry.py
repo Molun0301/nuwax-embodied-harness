@@ -46,7 +46,7 @@ class DetectionGeometryAugmentor:
             image_width_px=int(image_frame.width_px),
             image_height_px=int(image_frame.height_px),
         )
-        if point_cloud is None or not point_cloud.points:
+        if point_cloud is None or (not point_cloud.points and point_cloud.points_xyz_array is None):
             metadata = {}
             if segmentation_enriched_count:
                 metadata["geometry_segmentation_enriched_count"] = segmentation_enriched_count
@@ -101,7 +101,14 @@ class DetectionGeometryAugmentor:
         frame_tree: Optional[FrameTree],
         map_frame_id: Optional[str],
     ) -> Optional[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[str]]]:
-        point_samples = tuple(point_cloud.points)
+        point_samples = tuple(point_cloud.points) if point_cloud.points else ()
+        if not point_samples and point_cloud.points_xyz_array is not None:
+            # 从 ndarray 高性能路径构造 Vector3 元组（感知模块需要逐点访问）
+            arr = point_cloud.points_xyz_array
+            point_samples = tuple(
+                Vector3(x=float(arr[i, 0]), y=float(arr[i, 1]), z=float(arr[i, 2]))
+                for i in range(arr.shape[0])
+            )
         if not point_samples:
             return None
 
@@ -273,7 +280,7 @@ class DetectionGeometryAugmentor:
 
         if not updated:
             return detection
-        return detection.model_copy(update={"attributes": attributes}, deep=True)
+        return detection.model_copy(update={"attributes": attributes}, deep=False)
 
     def _augment_single_detection(
         self,
@@ -339,7 +346,7 @@ class DetectionGeometryAugmentor:
             attributes["projection_degradation_reason"] = projection_status
             if polygon:
                 attributes["segmentation_projection_status"] = projection_status
-            return detection.model_copy(update={"attributes": attributes}, deep=True), 0
+            return detection.model_copy(update={"attributes": attributes}, deep=False), 0
 
         ordered_indices = support_indices[np.argsort(camera_points[support_indices, 2])]
         selected_indices = ordered_indices[: self._max_points_per_detection]
@@ -395,7 +402,7 @@ class DetectionGeometryAugmentor:
                 6,
             )
 
-        return detection.model_copy(update={"attributes": attributes}, deep=True), support_count
+        return detection.model_copy(update={"attributes": attributes}, deep=False), support_count
 
     def _resolve_points_to_frame(
         self,

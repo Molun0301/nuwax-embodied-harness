@@ -221,7 +221,7 @@ class Ros2PointCloudPublisher:
     def _publish_point_cloud(self, point_cloud: PointCloudFrame) -> None:
         if self._publisher is None or self._pointcloud2_type is None or self._point_field_type is None:
             return
-        if not point_cloud.points:
+        if not point_cloud.points and point_cloud.points_xyz_array is None:
             return
         if self._should_skip_for_rate_limit():
             with self._lock:
@@ -325,6 +325,11 @@ class Ros2PointCloudPublisher:
         return np.ascontiguousarray(points, dtype=np.float32), metadata
 
     def _points_to_array(self, point_cloud: PointCloudFrame) -> np.ndarray:
+        # 高性能路径：优先使用 ndarray 字段
+        if point_cloud.points_xyz_array is not None:
+            array = np.asarray(point_cloud.points_xyz_array, dtype=np.float32)
+            if array.ndim == 2 and array.shape[1] >= 3:
+                return np.ascontiguousarray(array[:, :3], dtype=np.float32)
         points = point_cloud.points
         if points is None:
             return np.empty((0, 3), dtype=np.float32)

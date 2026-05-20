@@ -16,6 +16,37 @@ DETECTOR_LOGGER = logging.getLogger("nuwax_robot_bridge.perception.detectors")
 _TORCHVISION_NMS_PATCHED = False
 
 
+# ---------------------------------------------------------------------------
+# Worker 结果适配层 — 将 worker 进程返回的原始 numpy 数据包装为
+# 与 _normalize_yolo_result 兼容的对象（鸭子类型）
+# ---------------------------------------------------------------------------
+
+class _WorkerBoxes:
+    """模拟 ultralytics Boxes 对象，持有 numpy 数组。"""
+
+    def __init__(self, xyxy, conf, cls) -> None:
+        self.xyxy = xyxy
+        self.conf = conf
+        self.cls = cls
+
+
+class _WorkerMasks:
+    """模拟 ultralytics Masks 对象，持有多边形列表。"""
+
+    def __init__(self, masks_data) -> None:
+        self.xy = masks_data if masks_data else None
+
+
+class _WorkerResult:
+    """将 worker 进程返回的 (xyxy, conf, cls, names, masks_data) 包装为
+    _normalize_yolo_result 可直接访问的对象。"""
+
+    def __init__(self, xyxy, conf, cls, names, masks_data) -> None:
+        self.boxes = _WorkerBoxes(xyxy, conf, cls) if xyxy is not None else None
+        self.names = names if isinstance(names, dict) else {}
+        self.masks = _WorkerMasks(masks_data) if masks_data else None
+
+
 def _box_iou_for_nms(boxes_left, boxes_right):
     """计算两组框的 IoU（交并比）。"""
 
@@ -309,7 +340,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         *,
         name: str = "yolo_world",
         weights: str = "yolov8s-worldv2.pt",
-        runtime_preference: str = "pytorch",
+        runtime_preference: str = "auto",
         engine_path: str = "",
         device: str = "",
         half: bool = True,
@@ -320,7 +351,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         max_detections: int = 100,
     ) -> None:
         self._weights = str(weights).strip() or "yolov8s-worldv2.pt"
-        self._runtime_preference = str(runtime_preference or "pytorch").strip().lower()
+        self._runtime_preference = str(runtime_preference or "auto").strip().lower()
         self._engine_path = str(engine_path).strip()
         self._device = str(device).strip()
         self._half = bool(half)
@@ -332,6 +363,8 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         self._model = None
         self._resolved_model_source = ""
         self._resolved_backend_kind = "yolo_world"
+        self._inference_worker = None
+        self._use_worker_process = True  # 可通过子类或配置关闭
         provider_metadata = resolve_detection_provider_spec(
             backend_name=name,
             backend_kind="yolo_world",
@@ -380,6 +413,16 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         )
 
     def _predict(self, image_bgr) -> List[Any]:
+        # 优先使用独立进程推理（释放主线程 GIL）
+        if self._use_worker_process:
+            worker = self._get_inference_worker()
+            if worker is not None and worker.is_ready:
+                result = worker.predict(image_bgr)
+                if result is not None:
+                    return [_WorkerResult(*result)]
+                # worker 返回 None 时回退到主线程推理
+
+        # 回退：主线程直接推理
         model = self._get_model()
         kwargs = {
             "conf": self._confidence_threshold,
@@ -391,6 +434,33 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         if self._device:
             kwargs["device"] = self._device
         return list(model.predict(image_bgr, **kwargs))
+
+    def _get_inference_worker(self):
+        """获取（或懒加载启动）YOLO 推理 worker 进程。"""
+        if self._inference_worker is not None:
+            return self._inference_worker
+        try:
+            from services.perception.inference_worker import YoloInferenceWorker
+        except ImportError as exc:
+            DETECTOR_LOGGER.warning("无法导入 YoloInferenceWorker，回退到主线程推理: %s", exc)
+            self._use_worker_process = False
+            return None
+        model_source, _ = self._resolve_model_source()
+        worker = YoloInferenceWorker(
+            model_source,
+            confidence_threshold=self._confidence_threshold,
+            iou_threshold=self._iou_threshold,
+            image_size=self._image_size,
+            max_detections=self._max_detections,
+            device=self._device,
+        )
+        if worker.start():
+            self._inference_worker = worker
+            return worker
+        # 启动失败，永久回退到主线程推理
+        DETECTOR_LOGGER.warning("YOLO 推理 worker 启动失败，永久回退到主线程推理")
+        self._use_worker_process = False
+        return None
 
     def _get_model(self):
         if self._model is not None:

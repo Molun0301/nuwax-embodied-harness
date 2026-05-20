@@ -257,9 +257,12 @@ class MemoryService:
         self._semantic_summary_history: Deque[SemanticSummaryNode] = deque(maxlen=max(1, history_limit))
 
         # 后台向量化队列：先写 SQLite 记录，worker 线程异步补充向量
-        self._vectorization_queue: queue.Queue = queue.Queue(maxsize=500)
+        self._vectorization_queue: queue.Queue = queue.Queue(maxsize=2000)
         self._vectorization_worker: Optional[threading.Thread] = None
         self._vectorization_stop_event = threading.Event()
+        # 队列满时的溢出缓冲区：worker 空闲时自动补充执行
+        self._pending_vectorization: deque = deque(maxlen=2000)
+        self._pending_lock = threading.Lock()
         # ObservationEvent TTL 清理计数器：每 100 次写入触发一次过期清理
         self._observation_event_write_count: int = 0
 
@@ -4232,6 +4235,8 @@ class MemoryService:
             try:
                 task = self._vectorization_queue.get(timeout=1.0)
             except queue.Empty:
+                # 队列空闲时，从 pending 缓冲区补充任务
+                self._drain_pending_vectorization()
                 continue
             if task is None:
                 break
@@ -4253,6 +4258,23 @@ class MemoryService:
                 logger.warning("后台向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
             finally:
                 self._vectorization_queue.task_done()
+
+    def _drain_pending_vectorization(self) -> None:
+        """从 pending 缓冲区取出任务重新入队，每次最多补充 50 个避免阻塞。"""
+        drained = 0
+        while drained < 50:
+            with self._pending_lock:
+                if not self._pending_vectorization:
+                    break
+                task = self._pending_vectorization.popleft()
+            try:
+                self._vectorization_queue.put_nowait(task)
+                drained += 1
+            except queue.Full:
+                # 队列又满了，放回 pending
+                with self._pending_lock:
+                    self._pending_vectorization.appendleft(task)
+                break
 
     def _enqueue_vectorization(
         self,
@@ -4281,8 +4303,15 @@ class MemoryService:
         try:
             self._vectorization_queue.put_nowait(task)
         except queue.Full:
-            logger.warning("向量化队列已满，降级为同步执行 point_id=%s", point_id)
-            self._run_vectorization_task_sync(task)
+            logger.warning("向量化队列已满，标记待处理 point_id=%s", point_id)
+            # 标记为 pending，后续 worker 空闲时补充
+            self._mark_pending_vectorization(point_id, task)
+            return  # 不阻塞调用方
+
+    def _mark_pending_vectorization(self, point_id: str, task: Dict[str, object]) -> None:
+        """将溢出任务存入 pending 缓冲区，worker 空闲时自动补充执行。"""
+        with self._pending_lock:
+            self._pending_vectorization.append(task)
 
     def _run_vectorization_task_sync(self, task: Dict[str, object]) -> None:
         """同步执行单个向量化任务（fallback 路径）。"""

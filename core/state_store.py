@@ -40,7 +40,10 @@ class StateStore:
 
     def __init__(self) -> None:
         self._store: Dict[StateNamespace, Dict[str, StateEntry]] = {namespace: {} for namespace in StateNamespace}
-        self._lock = threading.RLock()
+        # per-namespace 锁，__init__ 时预创建，避免运行时竞态
+        self._locks: Dict[StateNamespace, threading.RLock] = {ns: threading.RLock() for ns in StateNamespace}
+        # 每个 namespace 最新条目缓存，write 时更新，read_latest 直接返回
+        self._latest_by_namespace: Dict[StateNamespace, Optional[StateEntry]] = {ns: None for ns in StateNamespace}
 
     def write(
         self,
@@ -62,8 +65,13 @@ class StateStore:
             value=value,
             metadata=dict(metadata or {}),
         )
-        with self._lock:
-            self._store[namespace][key] = entry
+        with self._locks[namespace]:
+            # copy-on-write：替换整个 namespace dict 引用，snapshot 可无锁读取
+            self._store[namespace] = {**self._store[namespace], key: entry}
+            # 更新最新条目缓存
+            latest = self._latest_by_namespace[namespace]
+            if latest is None or entry.updated_at >= latest.updated_at:
+                self._latest_by_namespace[namespace] = entry
         return entry
 
     def write_from_provider(
@@ -82,22 +90,18 @@ class StateStore:
     def read(self, namespace: StateNamespace, key: str) -> Optional[StateEntry]:
         """读取单条状态。"""
 
-        with self._lock:
+        with self._locks[namespace]:
             return self._store[namespace].get(key)
 
     def read_latest(self, namespace: StateNamespace) -> Optional[StateEntry]:
-        """读取某命名空间最新条目。"""
+        """读取某命名空间最新条目，直接返回缓存值。"""
 
-        with self._lock:
-            entries = list(self._store[namespace].values())
-        if not entries:
-            return None
-        return max(entries, key=lambda item: item.updated_at)
+        return self._latest_by_namespace[namespace]
 
     def snapshot(self, namespace: StateNamespace) -> Tuple[StateEntry, ...]:
-        """读取某命名空间完整快照。"""
+        """读取某命名空间完整快照（copy-on-write，读取引用即可）。"""
 
-        with self._lock:
-            entries = list(self._store[namespace].values())
-        entries.sort(key=lambda item: item.updated_at)
+        # write 时已替换整个 dict 引用，此处拿到的是不可变快照
+        ns_dict = self._store[namespace]
+        entries = sorted(ns_dict.values(), key=lambda item: item.updated_at)
         return tuple(entries)

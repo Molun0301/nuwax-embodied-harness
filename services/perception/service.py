@@ -135,7 +135,7 @@ class PerceptionService:
         if metadata_update:
             image_frame = image_frame.model_copy(
                 update={"metadata": {**dict(image_frame.metadata or {}), **metadata_update}},
-                deep=True,
+                deep=False,
             )
 
         pipeline_started_at = perf_counter()
@@ -511,7 +511,7 @@ class PerceptionService:
             update = {"attributes": merged_attributes}
             if segmentation is not None:
                 update["segmentation"] = segmentation
-            detections.append(detection.model_copy(update=update, deep=True))
+            detections.append(detection.model_copy(update=update, deep=False))
             changed = True
         if not changed:
             return detection_bundle
@@ -629,7 +629,7 @@ class PerceptionService:
             assigned.append(
                 detection.model_copy(
                     update={"track_id": resolved_track_id, "attributes": attributes},
-                    deep=True,
+                    deep=False,
                 )
             )
         return tuple(assigned)

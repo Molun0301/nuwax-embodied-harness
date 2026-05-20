@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from compat import StrEnum
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from contracts.base import MetadataDict, TimestampedContract
 from contracts.geometry import Vector3
 from contracts.naming import validate_frame_id
-from typing import List, Optional
+from typing import Any, List, Optional
 
 
 class PointFieldDataType(StrEnum):
@@ -34,10 +34,19 @@ class PointField(TimestampedContract):
 class PointCloudFrame(TimestampedContract):
     """点云帧。"""
 
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        populate_by_name=True,
+        use_enum_values=False,
+        arbitrary_types_allowed=True,
+    )
+
     frame_id: str = Field(description="点云坐标系。")
     point_count: int = Field(ge=0, description="点数量。")
     fields: List[PointField] = Field(default_factory=list, description="字段定义。")
     points: List[Vector3] = Field(default_factory=list, description="内联点集合。")
+    points_xyz_array: Optional[Any] = Field(default=None, description="高性能 ndarray(N,3) float32 点云，跳过 Pydantic 校验。")
     data_uri: Optional[str] = Field(default=None, description="外部点云地址。")
     artifact_id: Optional[str] = Field(default=None, description="点云制品标识。")
     is_dense: bool = Field(default=True, description="是否为稠密点云。")
@@ -50,8 +59,8 @@ class PointCloudFrame(TimestampedContract):
 
     @model_validator(mode="after")
     def _ensure_payload(self) -> "PointCloudFrame":
-        if not self.points and self.data_uri is None and self.artifact_id is None:
-            raise ValueError("PointCloudFrame 至少需要提供 points、data_uri 或 artifact_id 之一。")
+        if not self.points and self.points_xyz_array is None and self.data_uri is None and self.artifact_id is None:
+            raise ValueError("PointCloudFrame 至少需要提供 points、points_xyz_array、data_uri 或 artifact_id 之一。")
         return self
 
 

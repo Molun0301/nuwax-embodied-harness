@@ -107,11 +107,10 @@ class SQLiteNamedVectorStore:
         if self._db_path != ":memory:":
             self._read_conn.execute("PRAGMA journal_mode=WAL")
             self._read_conn.execute("PRAGMA query_only=ON")
-        # ANN（近似最近邻）批量计算缓存
-        self._vector_cache: Dict[str, np.ndarray] = {}  # {point_id: vector}
-        self._cache_dirty: bool = True
-        self._cache_matrix: Optional[np.ndarray] = None  # (N, dim) 矩阵
-        self._cache_point_ids: List[str] = []
+        # ANN（近似最近邻）批量计算缓存 —— 按 vector_name 分组增量维护
+        self._cache_dirty: bool = False
+        self._cache_matrices: Dict[str, np.ndarray] = {}  # {vector_name: (N, dim)}
+        self._cache_point_ids: Dict[str, List[str]] = {}  # {vector_name: [point_id...]}
         self._cache_threshold: int = 50  # 超过此数量启用批量矩阵计算
         self._init_schema()
 
@@ -237,7 +236,32 @@ class SQLiteNamedVectorStore:
                     ),
                 )
             self._conn.commit()
-            self._cache_dirty = True
+            # 增量更新缓存矩阵：追加或替换向量，避免全量重建
+            self._incremental_cache_update(point_id, vectors)
+
+    def _incremental_cache_update(
+        self, point_id: str, vectors: Dict[str, "NamedVector"]
+    ) -> None:
+        """增量更新缓存矩阵：新 point 追加，已有 point 原地替换向量。"""
+        for vector_name, named_vec in vectors.items():
+            vec = named_vec.vector.astype(np.float32)
+            ids_list = self._cache_point_ids.setdefault(vector_name, [])
+            matrix = self._cache_matrices.get(vector_name)
+            if point_id in ids_list:
+                # 已有 point，原地替换
+                idx = ids_list.index(point_id)
+                if matrix is not None and idx < matrix.shape[0]:
+                    matrix[idx] = vec
+            else:
+                # 新 point，追加
+                ids_list.append(point_id)
+                row = vec.reshape(1, -1)
+                if matrix is None or matrix.shape[0] == 0:
+                    self._cache_matrices[vector_name] = row
+                else:
+                    self._cache_matrices[vector_name] = np.vstack(
+                        [matrix, row]
+                    )
 
     def get_point(self, point_id: str) -> Optional[VectorPoint]:
         with self._read_lock:
@@ -342,9 +366,24 @@ class SQLiteNamedVectorStore:
         if use_batch:
             try:
                 ordered_ids = [pid for pid in point_ids if pid in vector_map]
-                matrix = np.stack(
-                    [_decode_vector(vector_map[pid]["vector_payload"]) for pid in ordered_ids]
-                )
+                # 优先使用增量缓存矩阵（避免每次从 DB 解码重建）
+                cached_matrix = self._cache_matrices.get(vector_name)
+                cached_ids = self._cache_point_ids.get(vector_name, [])
+                if (
+                    not self._cache_dirty
+                    and cached_matrix is not None
+                    and cached_ids
+                    and set(ordered_ids).issubset(set(cached_ids))
+                ):
+                    # 从缓存矩阵中按候选 id 提取子矩阵
+                    id_to_idx = {pid: i for i, pid in enumerate(cached_ids)}
+                    indices = [id_to_idx[pid] for pid in ordered_ids]
+                    matrix = cached_matrix[indices]
+                else:
+                    # fallback：从 DB 行解码构建矩阵
+                    matrix = np.stack(
+                        [_decode_vector(vector_map[pid]["vector_payload"]) for pid in ordered_ids]
+                    )
                 scores_arr = self._batch_cosine_similarity(query_vector, matrix)
                 score_by_id = {pid: float(scores_arr[i]) for i, pid in enumerate(ordered_ids)}
             except Exception:
@@ -411,7 +450,10 @@ class SQLiteNamedVectorStore:
                 [(point_id,) for point_id in normalized_ids],
             )
             self._conn.commit()
+            # delete 较少发生，标记 dirty 全量重建
             self._cache_dirty = True
+            self._cache_matrices.clear()
+            self._cache_point_ids.clear()
         return len(normalized_ids)
 
     def clear_all(self) -> None:

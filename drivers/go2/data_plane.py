@@ -189,17 +189,30 @@ class RclpyGo2RosBridge:
 
     def get_current_pose(self) -> Optional[Pose]:
         with self._lock:
-            return self._latest_pose_from_dds.model_copy(deep=True) if self._latest_pose_from_dds is not None else None
+            return self._latest_pose_from_dds.model_copy(deep=False) if self._latest_pose_from_dds is not None else None
 
     def get_imu_state(self) -> Optional[IMUState]:
         with self._lock:
-            return self._latest_imu_state_from_dds.model_copy(deep=True) if self._latest_imu_state_from_dds is not None else None
+            return self._latest_imu_state_from_dds.model_copy(deep=False) if self._latest_imu_state_from_dds is not None else None
 
     def get_latest_local_point_cloud(self, *, max_points: Optional[int] = None) -> Optional[PointCloudFrame]:
         with self._lock:
-            point_cloud = self._latest_local_point_cloud.model_copy(deep=True) if self._latest_local_point_cloud is not None else None
+            point_cloud = self._latest_local_point_cloud.model_copy(deep=False) if self._latest_local_point_cloud is not None else None
         if point_cloud is None or max_points is None or point_cloud.point_count <= max_points:
             return point_cloud
+        # 高性能路径：优先使用 ndarray 降采样
+        if point_cloud.points_xyz_array is not None:
+            arr = point_cloud.points_xyz_array
+            stride = max(1, int(np.ceil(arr.shape[0] / float(max_points))))
+            downsampled = arr[::stride][:max_points]
+            return point_cloud.model_copy(
+                update={
+                    "point_count": int(downsampled.shape[0]),
+                    "points_xyz_array": downsampled,
+                    "metadata": {**dict(point_cloud.metadata), "downsampled": True},
+                },
+                deep=False,
+            )
         stride = max(1, int(np.ceil(point_cloud.point_count / float(max_points))))
         points = point_cloud.points[::stride][:max_points]
         return point_cloud.model_copy(
@@ -208,7 +221,7 @@ class RclpyGo2RosBridge:
                 "points": points,
                 "metadata": {**dict(point_cloud.metadata), "downsampled": True},
             },
-            deep=True,
+            deep=False,
         )
 
     def _next_subscription_id(self) -> int:
@@ -457,6 +470,8 @@ class RclpyGo2RosBridge:
         if points_xyz.shape[0] > max_points:
             stride = max(1, int(np.ceil(points_xyz.shape[0] / float(max_points))))
             points_xyz = points_xyz[::stride][:max_points]
+
+        # 高性能路径：使用 ndarray 直接构造，跳过逐点 Vector3 实例化
         point_cloud = PointCloudFrame(
             frame_id=str(getattr(message, "header", None) and getattr(message.header, "frame_id", "") or "utlidar_lidar"),
             point_count=int(points_xyz.shape[0]),
@@ -465,7 +480,7 @@ class RclpyGo2RosBridge:
                 PointField(name="y", offset=4, datatype=PointFieldDataType.FLOAT32, count=1),
                 PointField(name="z", offset=8, datatype=PointFieldDataType.FLOAT32, count=1),
             ],
-            points=[Vector3(x=float(x), y=float(y), z=float(z)) for x, y, z in points_xyz],
+            points_xyz_array=points_xyz.astype(np.float32, copy=False),
             timestamp=datetime.now(timezone.utc),
             metadata={"source_topic": str(source_topic or "")},
         )

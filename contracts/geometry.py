@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+from pydantic import ConfigDict, Field, field_validator
 
 from contracts.base import ContractModel, TimestampedContract
 from contracts.naming import validate_frame_id
@@ -26,6 +26,8 @@ class Quaternion(ContractModel):
 
 class Pose(TimestampedContract):
     """带坐标系的位姿。"""
+
+    model_config = ConfigDict(frozen=True)
 
     frame_id: str = Field(description="位姿所属坐标系。")
     position: Vector3 = Field(default_factory=Vector3, description="位置，单位米。")

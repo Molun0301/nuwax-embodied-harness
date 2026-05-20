@@ -4,7 +4,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_stream::StreamExt;
 use tracing::{info, error};
 
-use crate::pointcloud::PointCloudProcessor;
+use crate::pointcloud::{PointCloudProcessor, PointCloudShmWriter};
 
 #[derive(Clone, Default)]
 pub struct PoseState {
@@ -159,6 +159,11 @@ pub fn spawn_ros2_bridge(
     let tf_topic = tf_topic.to_string();
     let nav_action = nav_action.to_string();
 
+    let pc_shm_path = std::path::PathBuf::from(
+        std::env::var("NUWAX_POINTCLOUD_SHM_PATH")
+            .unwrap_or_else(|_| "/tmp/nuwax_pointcloud.shm".into())
+    );
+
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -168,7 +173,7 @@ pub fn spawn_ros2_bridge(
         rt.block_on(local.run_until(async move {
             if let Err(e) = ros2_async_loop(
                 &odom_topic, &pc_topic, &map_topic, &tf_topic, &nav_action,
-                rx, state_clone,
+                rx, state_clone, &pc_shm_path,
             ).await {
                 error!("ROS2 桥接线程异常退出: {}", e);
             }
@@ -186,7 +191,17 @@ async fn ros2_async_loop(
     nav_action: &str,
     mut rx: mpsc::Receiver<BridgeCommand>,
     state: Arc<RwLock<SharedState>>,
+    pc_shm_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 初始化点云共享内存写入器
+    let mut pc_shm_writer = match PointCloudShmWriter::new(pc_shm_path) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            error!("点云共享内存初始化失败（降级为无 SHM 模式）: {}", e);
+            None
+        }
+    };
+
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "nuwax_ros_bridge", "")?;
 
@@ -270,7 +285,7 @@ async fn ros2_async_loop(
         node.spin_once(std::time::Duration::from_millis(5));
 
         match rx.try_recv() {
-            Ok(cmd) => handle_command(cmd, &odom_pub, &pc_pub, &nav_client, &cmd_state).await,
+            Ok(cmd) => handle_command(cmd, &odom_pub, &pc_pub, &nav_client, &cmd_state, &mut pc_shm_writer).await,
             Err(mpsc::error::TryRecvError::Empty) => {}
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 info!("命令通道关闭，桥接线程退出");
@@ -290,6 +305,7 @@ async fn handle_command(
     pc_pub: &r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
     nav_client: &r2r::ActionClient<r2r::nav2_msgs::action::NavigateToPose::Action>,
     state: &Arc<RwLock<SharedState>>,
+    pc_shm_writer: &mut Option<PointCloudShmWriter>,
 ) {
     match cmd {
         BridgeCommand::PublishOdom {
@@ -322,6 +338,12 @@ async fn handle_command(
             let processor = PointCloudProcessor::default_go2();
             let (processed_data, processed_count) = processor.process(&data, point_step);
             let out_step = 12u32; // XYZ only after processing
+
+            // 写入共享内存供 Python 侧零拷贝读取
+            if let Some(ref mut writer) = pc_shm_writer {
+                writer.write_frame(&processed_data, processed_count);
+            }
+
             let mut msg = r2r::sensor_msgs::msg::PointCloud2::default();
             msg.header.frame_id = frame_id;
             msg.height = 1;

@@ -1,6 +1,25 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use memmap2::MmapMut;
+use tracing::{info, error};
 
 const VOXEL_SIZE: f32 = 0.05;
+
+// ─── 点云共享内存常量 ───
+const PC_SHM_MAGIC: u64 = 0x4E55_5741_5850_434C; // "NUWAXPCL"
+const PC_SHM_VERSION: u32 = 1;
+/// 头部布局 (32 bytes):
+///   0-7:   magic (u64 LE)
+///   8-11:  version (u32 LE)
+///   12-15: point_count (u32 LE)
+///   16-23: timestamp_ns (u64 LE)
+///   24-31: frame_id / sequence (u64 LE)
+const PC_HEADER_SIZE: usize = 32;
+/// 最大支持点数（1200 点 × 12 字节/点 = 14400 字节）
+const PC_MAX_POINTS: usize = 4096;
+const PC_MAX_DATA_SIZE: usize = PC_MAX_POINTS * 12; // float32 × 3
+const PC_SHM_BUFFER_SIZE: usize = PC_HEADER_SIZE + PC_MAX_DATA_SIZE;
 
 pub struct PointCloudProcessor {
     max_distance: f32,
@@ -60,6 +79,64 @@ impl PointCloudProcessor {
         }
 
         (output, downsampled.len() as u32)
+    }
+}
+
+// ─── 点云共享内存写入器 ───
+
+pub struct PointCloudShmWriter {
+    mmap: MmapMut,
+    sequence: AtomicU64,
+}
+
+impl PointCloudShmWriter {
+    /// 创建点云共享内存写入器，路径默认 /tmp/nuwax_pointcloud.shm
+    pub fn new(shm_path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(shm_path)?;
+        file.set_len(PC_SHM_BUFFER_SIZE as u64)?;
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        // 写入 magic 和 version
+        mmap[0..8].copy_from_slice(&PC_SHM_MAGIC.to_le_bytes());
+        mmap[8..12].copy_from_slice(&PC_SHM_VERSION.to_le_bytes());
+        info!("点云共享内存已创建: {:?} ({} bytes)", shm_path, PC_SHM_BUFFER_SIZE);
+        Ok(Self { mmap, sequence: AtomicU64::new(0) })
+    }
+
+    /// 将处理后的点云写入共享内存。
+    /// data: 连续 float32 XYZ 布局 (point_step=12)
+    /// point_count: 有效点数
+    pub fn write_frame(&mut self, data: &[u8], point_count: u32) {
+        let n = point_count as usize;
+        if n == 0 || n > PC_MAX_POINTS {
+            return;
+        }
+        let data_size = n * 12;
+        if data.len() < data_size {
+            return;
+        }
+
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        // 先写数据区
+        self.mmap[PC_HEADER_SIZE..PC_HEADER_SIZE + data_size]
+            .copy_from_slice(&data[..data_size]);
+
+        // 再写头部（sequence 最后写，作为 release fence）
+        self.mmap[8..12].copy_from_slice(&PC_SHM_VERSION.to_le_bytes());
+        self.mmap[12..16].copy_from_slice(&point_count.to_le_bytes());
+        self.mmap[16..24].copy_from_slice(&now_ns.to_le_bytes());
+        // sequence 最后写入，读端以此判断数据完整性
+        self.mmap[24..32].copy_from_slice(&seq.to_le_bytes());
+
+        if let Err(e) = self.mmap.flush_range(0, PC_HEADER_SIZE + data_size) {
+            error!("点云共享内存 flush 失败: {}", e);
+        }
     }
 }
 

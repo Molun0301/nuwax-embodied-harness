@@ -352,7 +352,7 @@ class PerceptionYoloWorldConfig:
     enabled: bool = True
     backend_name: str = "yolo_world"
     model_name: str = str(BASE_DIR / "runtime_data" / "models" / "yolov8s-worldv2.pt")
-    runtime_preference: str = "pytorch"
+    runtime_preference: str = "auto"
     engine_path: str = ""
     device: str = ""
     half: bool = True
@@ -706,7 +706,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "NUWAX_PERCEPTION_YOLO_WORLD_MODEL",
                 str(BASE_DIR / "runtime_data" / "models" / "yolov8s-worldv2.pt"),
             ),
-            runtime_preference=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME", "pytorch"),
+            runtime_preference=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME", "auto"),
             engine_path=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH", ""),
             device=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_DEVICE", ""),
             half=_cfg_bool("NUWAX_PERCEPTION_YOLO_WORLD_HALF", True),
@@ -1114,16 +1114,16 @@ class _LineLimitedFileHandler(logging.FileHandler):
             fcntl.flock(self._lock_file_stream.fileno(), fcntl.LOCK_UN)
 
     def emit(self, record: logging.LogRecord) -> None:
-        with self._interprocess_lock():
-            super().emit(record)
-            if self.max_lines <= 0:
-                return
+        super().emit(record)
+        if self.max_lines <= 0:
+            return
 
-            self._emit_count += 1
-            if self._emit_count % self.trim_check_interval != 0:
-                return
+        self._emit_count += 1
+        if self._emit_count % self.trim_check_interval != 0:
+            return
 
-            self._trim_file_if_needed()
+        # 后台线程执行 trim，避免阻塞日志写入
+        threading.Thread(target=self._trim_file_if_needed, daemon=True).start()
 
     def _repair_file_if_needed(self) -> None:
         with self._interprocess_lock():
@@ -1134,7 +1134,8 @@ class _LineLimitedFileHandler(logging.FileHandler):
             return
 
         try:
-            self._rewrite_file_if_needed()
+            with self._interprocess_lock():
+                self._rewrite_file_if_needed()
         finally:
             self._trim_lock.release()
 

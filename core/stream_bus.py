@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import collections
 from collections import defaultdict
 from dataclasses import dataclass
+import logging
 import threading
 from typing import Callable, DefaultDict, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from contracts.streams import StreamFrame, StreamPayloadKind
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -15,6 +19,7 @@ class StreamSubscription:
     subscription_id: str
     callback: Callable[[StreamFrame], None]
     topics: Optional[FrozenSet[str]] = None
+    async_dispatch: bool = False
 
 
 class StreamBus:
@@ -29,6 +34,17 @@ class StreamBus:
         self._next_cursor = 1
         self._next_subscription_seq = 1
         self._lock = threading.RLock()
+
+        # 异步分发队列及消费者线程
+        self._async_queue: collections.deque = collections.deque(maxlen=10000)
+        self._async_event = threading.Event()
+        self._shutdown = False
+        self._consumer_thread = threading.Thread(
+            target=self._async_consumer_loop,
+            name="StreamBus-async-consumer",
+            daemon=True,
+        )
+        self._consumer_thread.start()
 
     def latest_cursor(self) -> int:
         with self._lock:
@@ -94,10 +110,14 @@ class StreamBus:
         for subscription in subscriptions:
             if not self._matches(subscription, stored_frame):
                 continue
-            try:
-                subscription.callback(stored_frame)
-            except Exception as exc:
-                failures.append((subscription, exc))
+            if subscription.async_dispatch:
+                self._async_queue.append((subscription.callback, stored_frame))
+                self._async_event.set()
+            else:
+                try:
+                    subscription.callback(stored_frame)
+                except Exception as exc:
+                    failures.append((subscription, exc))
         if failures:
             self._record_subscription_failures(stored_frame, failures)
         return stored_frame
@@ -151,7 +171,14 @@ class StreamBus:
         callback: Callable[[StreamFrame], None],
         *,
         topics: Optional[Iterable[str]] = None,
+        async_dispatch: bool = False,
     ) -> str:
+        """订阅流帧。
+
+        Args:
+            async_dispatch: 若为 True，回调将由后台消费者线程异步执行，
+                           不阻塞发布者线程。适用于重量级回调（如 WebSocket 序列化推送）。
+        """
         with self._lock:
             subscription_id = f"stream_sub_{self._next_subscription_seq:04d}"
             self._next_subscription_seq += 1
@@ -159,6 +186,7 @@ class StreamBus:
                 subscription_id=subscription_id,
                 callback=callback,
                 topics=frozenset(str(topic) for topic in topics) if topics is not None else None,
+                async_dispatch=async_dispatch,
             )
             self._subscriptions[subscription_id] = subscription
             return subscription_id
@@ -210,3 +238,29 @@ class StreamBus:
 
     def _matches(self, subscription: StreamSubscription, frame: StreamFrame) -> bool:
         return subscription.topics is None or frame.topic in subscription.topics
+
+    def _async_consumer_loop(self) -> None:
+        """后台消费者线程：从 deque 中取出异步回调并执行。"""
+        while not self._shutdown:
+            self._async_event.wait(timeout=0.1)
+            self._async_event.clear()
+            while self._async_queue:
+                try:
+                    callback, frame = self._async_queue.popleft()
+                except IndexError:
+                    break
+                try:
+                    callback(frame)
+                except Exception as exc:
+                    _logger.warning(
+                        "异步流回调执行异常: %s — %s",
+                        exc.__class__.__name__,
+                        exc,
+                    )
+
+    def shutdown(self) -> None:
+        """停止后台消费者线程并清空队列。"""
+        self._shutdown = True
+        self._async_event.set()
+        self._consumer_thread.join(timeout=2.0)
+        self._async_queue.clear()

@@ -46,7 +46,7 @@ class PointCloudFrame(TimestampedContract):
     point_count: int = Field(ge=0, description="点数量。")
     fields: List[PointField] = Field(default_factory=list, description="字段定义。")
     points: List[Vector3] = Field(default_factory=list, description="内联点集合。")
-    points_xyz_array: Optional[Any] = Field(default=None, description="高性能 ndarray(N,3) float32 点云，跳过 Pydantic 校验。")
+    points_xyz_array: Optional[Any] = Field(default=None, exclude=True, description="高性能 ndarray(N,3) float32 点云，跳过 Pydantic 校验。")
     data_uri: Optional[str] = Field(default=None, description="外部点云地址。")
     artifact_id: Optional[str] = Field(default=None, description="点云制品标识。")
     is_dense: bool = Field(default=True, description="是否为稠密点云。")

@@ -45,7 +45,9 @@ load_env_file() {
         value="${value:1:${#value}-2}"
       fi
     fi
-    export "${key}=${value}"
+    if [[ -z "${!key+x}" ]]; then
+      export "${key}=${value}"
+    fi
   done < "${target}"
 }
 
@@ -335,6 +337,8 @@ stop_gateway() {
   cleanup_external_geometry_processes
   exit 0
 }
+
+export NUWAX_GEOMETRY_REQUIRE_ROS2="${NUWAX_GEOMETRY_REQUIRE_ROS2:-false}"
 
 if [[ -f "${ENV_FILE}" ]]; then
   load_env_file "${ENV_FILE}"

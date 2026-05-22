@@ -52,6 +52,10 @@ message MapUpdateNotification {
   OccupancyGridMeta meta = 1;
   ShmRef shm_ref = 2;
 }
+message OccupancyGridData {
+  OccupancyGridMeta meta = 1;
+  bytes data = 2;  // 栅格数据（每字节一个cell，-1=unknown, 0=free, 100=occupied）
+}
 
 // === 导航 ===
 message NavigationGoal {
@@ -139,6 +143,7 @@ service GeometryRuntime {
 
   // 地图
   rpc GetOccupancyGrid(Empty) returns (OccupancyGridMeta);
+  rpc GetOccupancyGridData(Empty) returns (OccupancyGridData);
   rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
   rpc GetOccupancyGridShm(Empty) returns (ShmRef);
 

@@ -122,6 +122,23 @@ impl GeometryRuntime for GeometryRuntimeService {
         }))
     }
 
+    async fn get_occupancy_grid_data(&self, _req: Request<Empty>) -> Result<Response<OccupancyGridData>, Status> {
+        let s = self.bridge.state.read().await;
+        Ok(Response::new(OccupancyGridData {
+            meta: Some(OccupancyGridMeta {
+                width: s.map.width,
+                height: s.map.height,
+                resolution: s.map.resolution,
+                origin_x: s.map.origin_x,
+                origin_y: s.map.origin_y,
+                frame_id: s.map.frame_id.clone(),
+                revision: s.map.revision,
+                timestamp_ns: s.map.timestamp_ns,
+            }),
+            data: s.map.data.iter().map(|&v| v as u8).collect(),
+        }))
+    }
+
     type SubscribeMapUpdatesStream = tokio_stream::wrappers::ReceiverStream<Result<MapUpdateNotification, Status>>;
     async fn subscribe_map_updates(&self, _req: Request<Empty>) -> Result<Response<Self::SubscribeMapUpdatesStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(8);

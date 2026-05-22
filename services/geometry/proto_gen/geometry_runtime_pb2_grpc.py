@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-from services.geometry.proto_gen import geometry_runtime_pb2 as geometry__runtime__pb2
+import geometry_runtime_pb2 as geometry__runtime__pb2
 
-GRPC_GENERATED_VERSION = '1.70.0'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in geometry_runtime_pb2_grpc.py depends on'
+        + ' but the generated code in geometry_runtime_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -50,6 +50,11 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.RuntimeStatus.FromString,
                 _registered_method=True)
+        self.HealthCheck = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/HealthCheck',
+                request_serializer=geometry__runtime__pb2.HealthCheckRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.HealthCheckResponse.FromString,
+                _registered_method=True)
         self.GetCurrentPose = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/GetCurrentPose',
                 request_serializer=geometry__runtime__pb2.PoseRequest.SerializeToString,
@@ -69,6 +74,11 @@ class GeometryRuntimeStub(object):
                 '/nuwax.geometry.GeometryRuntime/GetOccupancyGrid',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.OccupancyGridMeta.FromString,
+                _registered_method=True)
+        self.GetOccupancyGridData = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetOccupancyGridData',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.OccupancyGridData.FromString,
                 _registered_method=True)
         self.SubscribeMapUpdates = channel.unary_stream(
                 '/nuwax.geometry.GeometryRuntime/SubscribeMapUpdates',
@@ -145,6 +155,12 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def HealthCheck(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetCurrentPose(self, request, context):
         """定位
         """
@@ -167,6 +183,12 @@ class GeometryRuntimeServicer(object):
     def GetOccupancyGrid(self, request, context):
         """地图
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetOccupancyGridData(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -252,6 +274,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.RuntimeStatus.SerializeToString,
             ),
+            'HealthCheck': grpc.unary_unary_rpc_method_handler(
+                    servicer.HealthCheck,
+                    request_deserializer=geometry__runtime__pb2.HealthCheckRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.HealthCheckResponse.SerializeToString,
+            ),
             'GetCurrentPose': grpc.unary_unary_rpc_method_handler(
                     servicer.GetCurrentPose,
                     request_deserializer=geometry__runtime__pb2.PoseRequest.FromString,
@@ -271,6 +298,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.GetOccupancyGrid,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.OccupancyGridMeta.SerializeToString,
+            ),
+            'GetOccupancyGridData': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetOccupancyGridData,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.OccupancyGridData.SerializeToString,
             ),
             'SubscribeMapUpdates': grpc.unary_stream_rpc_method_handler(
                     servicer.SubscribeMapUpdates,
@@ -416,6 +448,33 @@ class GeometryRuntime(object):
             _registered_method=True)
 
     @staticmethod
+    def HealthCheck(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/HealthCheck',
+            geometry__runtime__pb2.HealthCheckRequest.SerializeToString,
+            geometry__runtime__pb2.HealthCheckResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def GetCurrentPose(request,
             target,
             options=(),
@@ -513,6 +572,33 @@ class GeometryRuntime(object):
             '/nuwax.geometry.GeometryRuntime/GetOccupancyGrid',
             geometry__runtime__pb2.Empty.SerializeToString,
             geometry__runtime__pb2.OccupancyGridMeta.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetOccupancyGridData(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetOccupancyGridData',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.OccupancyGridData.FromString,
             options,
             channel_credentials,
             insecure,

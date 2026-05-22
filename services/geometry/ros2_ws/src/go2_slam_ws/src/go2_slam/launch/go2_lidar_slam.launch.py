@@ -27,6 +27,7 @@ GO2 机器狗 LiDAR SLAM Launch 文件
 import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -46,6 +47,12 @@ def generate_launch_description():
     init_wm_with_all_nodes = LaunchConfiguration('init_wm_with_all_nodes')
     rtabmap_args = LaunchConfiguration('rtabmap_args')
     planar_odom = LaunchConfiguration('planar_odom')
+    initial_pose = LaunchConfiguration('initial_pose')
+    auto_switch_to_mapping = LaunchConfiguration('auto_switch_to_mapping')
+    start_at_origin = LaunchConfiguration('start_at_origin')
+    optimize_max_error = LaunchConfiguration('optimize_max_error')
+    max_odom_cache_size = LaunchConfiguration('max_odom_cache_size')
+    localization_odom_topic = LaunchConfiguration('localization_odom_topic')
 
     # =========================================================================
     # 节点1: odom_to_tf — 里程计转 TF 广播器
@@ -98,6 +105,7 @@ def generate_launch_description():
         'frame_id': base_frame,
         'odom_frame_id': odom_frame,
         'map_frame_id': map_frame,
+        'initial_pose': initial_pose,
         'subscribe_scan_cloud': True,
         'subscribe_rgb': False,
         'subscribe_depth': False,
@@ -121,7 +129,9 @@ def generate_launch_description():
         'RGBD/AngularUpdate': '0.05',
         'RGBD/LinearUpdate': '0.05',
         'RGBD/OptimizeFromGraphEnd': 'false',
-        'RGBD/StartAtOrigin': 'false',
+        'RGBD/OptimizeMaxError': ParameterValue(optimize_max_error, value_type=str),
+        'RGBD/StartAtOrigin': ParameterValue(start_at_origin, value_type=str),
+        'RGBD/MaxOdomCacheSize': ParameterValue(max_odom_cache_size, value_type=str),
         'RGBD/LocalImmunizationRatio': '0.25',
         'Mem/IncrementalMemory': ParameterValue(incremental_memory, value_type=str),
         'Mem/NotLinkedNodesKept': 'false',
@@ -178,6 +188,22 @@ def generate_launch_description():
     ],
 )
 
+    auto_switch_node = ExecuteProcess(
+        cmd=['python3', os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'auto_switch_to_mapping.py')],
+        output='screen',
+        condition=IfCondition(auto_switch_to_mapping),
+    )
+
+    map_odom_publisher = ExecuteProcess(
+        cmd=['python3', os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'map_odom_publisher.py'),
+            '--map-frame', map_frame,
+            '--base-frame', base_frame,
+            '--topic', localization_odom_topic],
+        output='screen',
+    )
+
 
 
 
@@ -212,7 +238,15 @@ def generate_launch_description():
         DeclareLaunchArgument('init_wm_with_all_nodes', default_value='false'),
         DeclareLaunchArgument('rtabmap_args', default_value=''),
         DeclareLaunchArgument('planar_odom', default_value='true'),
+        DeclareLaunchArgument('initial_pose', default_value=''),
+        DeclareLaunchArgument('auto_switch_to_mapping', default_value='false'),
+        DeclareLaunchArgument('start_at_origin', default_value='false'),
+        DeclareLaunchArgument('optimize_max_error', default_value='20.0'),
+        DeclareLaunchArgument('max_odom_cache_size', default_value='0'),
+        DeclareLaunchArgument('localization_odom_topic', default_value='/rtabmap/localization_odom'),
         odom_to_tf,         # 1. 先启动里程计转TF，确保TF树完整
         static_tf_lidar,    # 2. 发布静态TF
         rtabmap_node,       # 3. 最后启动SLAM
+        auto_switch_node,
+        map_odom_publisher,
     ])

@@ -78,6 +78,28 @@ is_truthy() {
   [[ "${value}" == "1" || "${value}" == "true" || "${value}" == "yes" || "${value}" == "on" ]]
 }
 
+normalize_initial_pose() {
+  local raw="$1"
+  [[ -n "${raw}" ]] || return 0
+
+  local parts=()
+  # shellcheck disable=SC2206
+  parts=(${raw})
+  case "${#parts[@]}" in
+    3)
+      printf '%s %s 0 0 0 %s' "${parts[0]}" "${parts[1]}" "${parts[2]}"
+      ;;
+    6|7)
+      printf '%s' "${raw}"
+      ;;
+    *)
+      echo "initial pose 格式错误: ${raw}" >&2
+      echo "可用格式: \"x y yaw\"、\"x y z roll pitch yaw\" 或 \"x y z qx qy qz qw\"。" >&2
+      return 1
+      ;;
+  esac
+}
+
 cleanup_stale_slam_processes() {
   local pid args
   if ! is_truthy "${NUWAX_GO2_SLAM_CLEAN_STALE_PROCESSES:-true}"; then
@@ -229,11 +251,17 @@ MAP_FRAME="${NUWAX_GEOMETRY_MAP_FRAME:-map}"
 ODOM_FRAME="${NUWAX_GEOMETRY_ODOM_FRAME:-odom}"
 BASE_FRAME="${NUWAX_GEOMETRY_BASE_FRAME:-base_link}"
 LIDAR_FRAME="${NUWAX_GEOMETRY_LIDAR_FRAME:-utlidar_lidar}"
+LOCALIZATION_ODOM_TOPIC="${NUWAX_GO2_SLAM_LOCALIZATION_ODOM_TOPIC:-/rtabmap/localization_odom}"
 WAIT_FOR_INPUTS="false"
 INPUT_TIMEOUT_SEC="${NUWAX_GO2_SLAM_INPUT_TIMEOUT_SEC:-30}"
 SLAM_MODE="${NUWAX_GO2_SLAM_MODE:-auto}"
 RTABMAP_ARGS="${NUWAX_GO2_SLAM_RTABMAP_ARGS:-}"
 PLANAR_ODOM="${NUWAX_GO2_SLAM_PLANAR_ODOM:-true}"
+INITIAL_POSE="${NUWAX_GO2_SLAM_INITIAL_POSE:-}"
+AUTO_SWITCH_TO_MAPPING="false"
+START_AT_ORIGIN="${NUWAX_GO2_SLAM_START_AT_ORIGIN:-false}"
+OPTIMIZE_MAX_ERROR="${NUWAX_GO2_SLAM_OPTIMIZE_MAX_ERROR:-20.0}"
+MAX_ODOM_CACHE_SIZE="${NUWAX_GO2_SLAM_MAX_ODOM_CACHE_SIZE:-0}"
 
 LAUNCH_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -241,9 +269,9 @@ while [[ $# -gt 0 ]]; do
     --no-rviz|--no-rviz=true|--no-rviz=false|--rviz|--rviz=true|--rviz=false)
       shift
       ;;
-    --database-path)
+    --database-path|--dataset-path)
       if [[ $# -lt 2 ]]; then
-        echo "--database-path 需要一个路径参数。" >&2
+        echo "$1 需要一个路径参数。" >&2
         exit 2
       fi
       DATABASE_PATH="$2"
@@ -261,12 +289,48 @@ while [[ $# -gt 0 ]]; do
       PLANAR_ODOM="false"
       shift
       ;;
+    --initial-pose)
+      if [[ $# -lt 2 ]]; then
+        echo "--initial-pose 需要一个位姿字符串，例如 \"1.2 0.5 1.57\"。" >&2
+        exit 2
+      fi
+      INITIAL_POSE="$2"
+      shift 2
+      ;;
+    --start-at-origin)
+      START_AT_ORIGIN="true"
+      shift
+      ;;
+    --resume-last-localization)
+      START_AT_ORIGIN="false"
+      shift
+      ;;
+    --optimize-max-error)
+      if [[ $# -lt 2 ]]; then
+        echo "--optimize-max-error 需要一个数值参数。" >&2
+        exit 2
+      fi
+      OPTIMIZE_MAX_ERROR="$2"
+      shift 2
+      ;;
+    --max-odom-cache-size)
+      if [[ $# -lt 2 ]]; then
+        echo "--max-odom-cache-size 需要一个整数参数。" >&2
+        exit 2
+      fi
+      MAX_ODOM_CACHE_SIZE="$2"
+      shift 2
+      ;;
     --localization|--localization-mode)
       SLAM_MODE="localization"
       shift
       ;;
     --mapping|--mapping-mode)
       SLAM_MODE="mapping"
+      shift
+      ;;
+    --direct-mapping)
+      SLAM_MODE="direct-mapping"
       shift
       ;;
     --new-map)
@@ -300,6 +364,8 @@ cd "${REPO_ROOT}"
 
 mkdir -p "$(dirname "${DATABASE_PATH}")"
 
+INITIAL_POSE="$(normalize_initial_pose "${INITIAL_POSE}")"
+
 DATABASE_EXISTS="false"
 if [[ -s "${DATABASE_PATH}" ]]; then
   DATABASE_EXISTS="true"
@@ -313,10 +379,10 @@ case "${SLAM_MODE}" in
       SLAM_MODE="mapping"
     fi
     ;;
-  localization|mapping|new-map)
+  localization|mapping|direct-mapping|new-map)
     ;;
   *)
-    echo "未知 NUWAX_GO2_SLAM_MODE/启动模式: ${SLAM_MODE}，可选 auto/localization/mapping/new-map。" >&2
+    echo "未知 NUWAX_GO2_SLAM_MODE/启动模式: ${SLAM_MODE}，可选 auto/localization/mapping/direct-mapping/new-map。" >&2
     exit 2
     ;;
 esac
@@ -332,10 +398,21 @@ case "${SLAM_MODE}" in
     INIT_WM_WITH_ALL_NODES="true"
     ;;
   mapping)
+    if is_truthy "${DATABASE_EXISTS}"; then
+      # First relocalize against the existing map, then switch to mapping
+      # through /rtabmap/set_mode_mapping. In mapping mode alone, RTAB-Map's
+      # global scan map relocalization is not active.
+      INCREMENTAL_MEMORY="false"
+      INIT_WM_WITH_ALL_NODES="true"
+      AUTO_SWITCH_TO_MAPPING="true"
+    else
+      INCREMENTAL_MEMORY="true"
+      INIT_WM_WITH_ALL_NODES="false"
+    fi
+    ;;
+  direct-mapping)
     INCREMENTAL_MEMORY="true"
     if is_truthy "${DATABASE_EXISTS}"; then
-      # Continue extending an existing database while keeping old nodes
-      # available for relocalization / loop-closure candidates.
       INIT_WM_WITH_ALL_NODES="true"
     else
       INIT_WM_WITH_ALL_NODES="false"
@@ -364,7 +441,11 @@ if is_truthy "${WAIT_FOR_INPUTS}"; then
 fi
 
 echo "启动 Go2 LiDAR SLAM: mode=${SLAM_MODE} database_path=${DATABASE_PATH} database_exists=${DATABASE_EXISTS} incremental_memory=${INCREMENTAL_MEMORY} init_wm_with_all_nodes=${INIT_WM_WITH_ALL_NODES}" >&2
-echo "ROS: RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION} CYCLONEDDS_URI=${CYCLONEDDS_URI:-} point_cloud_topic=${POINT_CLOUD_TOPIC} odom_topic=${ODOM_TOPIC} planar_odom=${PLANAR_ODOM}" >&2
+echo "ROS: RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION} CYCLONEDDS_URI=${CYCLONEDDS_URI:-} point_cloud_topic=${POINT_CLOUD_TOPIC} odom_topic=${ODOM_TOPIC} planar_odom=${PLANAR_ODOM} auto_switch_to_mapping=${AUTO_SWITCH_TO_MAPPING}" >&2
+echo "RTAB-Map localization params: start_at_origin=${START_AT_ORIGIN} optimize_max_error=${OPTIMIZE_MAX_ERROR} max_odom_cache_size=${MAX_ODOM_CACHE_SIZE}" >&2
+if [[ -n "${INITIAL_POSE}" ]]; then
+  echo "RTAB-Map initial_pose=${INITIAL_POSE}" >&2
+fi
 
 ROS_LAUNCH_ARGS=(
   "database_path:=${DATABASE_PATH}" \
@@ -375,13 +456,22 @@ ROS_LAUNCH_ARGS=(
   "odom_frame:=${ODOM_FRAME}" \
   "base_frame:=${BASE_FRAME}" \
   "lidar_frame:=${LIDAR_FRAME}" \
+  "localization_odom_topic:=${LOCALIZATION_ODOM_TOPIC}" \
   "incremental_memory:=${INCREMENTAL_MEMORY}" \
   "init_wm_with_all_nodes:=${INIT_WM_WITH_ALL_NODES}" \
-  "planar_odom:=${PLANAR_ODOM}"
+  "planar_odom:=${PLANAR_ODOM}" \
+  "auto_switch_to_mapping:=${AUTO_SWITCH_TO_MAPPING}" \
+  "start_at_origin:=${START_AT_ORIGIN}" \
+  "optimize_max_error:=${OPTIMIZE_MAX_ERROR}" \
+  "max_odom_cache_size:=${MAX_ODOM_CACHE_SIZE}"
 )
 
 if [[ -n "${RTABMAP_ARGS}" ]]; then
   ROS_LAUNCH_ARGS+=("rtabmap_args:=${RTABMAP_ARGS}")
+fi
+
+if [[ -n "${INITIAL_POSE}" ]]; then
+  ROS_LAUNCH_ARGS+=("initial_pose:=${INITIAL_POSE}")
 fi
 
 exec ros2 launch go2_slam go2_lidar_slam.launch.py \

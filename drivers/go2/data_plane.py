@@ -39,17 +39,6 @@ _GO2_OBSTACLE_STATUS_REFRESH_INTERVAL_SEC = 5.0
 _GO2_OBSTACLE_BEST_EFFORT_ERROR_CODES = {3102, 3104}
 
 
-_POINT_FIELD_DTYPE_MAP = {
-    1: np.int8,
-    2: np.uint8,
-    3: np.int16,
-    4: np.uint16,
-    5: np.int32,
-    6: np.uint32,
-    7: np.float32,
-    8: np.float64,
-}
-
 
 def _unitree_wxyz_quaternion_to_contract(values: Sequence[float]) -> Quaternion:
     raw_values = [float(item) for item in list(values or [])[:4]]
@@ -126,10 +115,6 @@ def _load_go2_official_sdk_modules(
             unitree_go_dds_module = importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_")
             modules["ChannelSubscriber"] = getattr(channel_module, "ChannelSubscriber")
             modules["SportModeState"] = getattr(unitree_go_dds_module, "SportModeState_")
-            modules["DirectPointCloud2"] = getattr(
-                importlib.import_module("unitree_sdk2py.idl.sensor_msgs.msg.dds_"),
-                "PointCloud2_",
-            )
         return modules
     except Exception as exc:
         LOGGER.warning("导入 Go2 官方 SDK 模块失败：%s", exc)
@@ -147,18 +132,6 @@ class RclpyGo2RosBridge:
         self._direct_dds_stop_event = threading.Event()
         self._direct_dds_threads: List[threading.Thread] = []
         self._direct_pose_subscriber = None
-        self._direct_point_cloud_subscriber = None
-        self._direct_point_cloud_worker_condition = threading.Condition()
-        self._direct_point_cloud_pending_sample: Optional[object] = None
-        self._direct_point_cloud_pending_source_topic = ""
-        self._direct_point_cloud_pending_sequence = 0
-        self._direct_point_cloud_processed_sequence = 0
-        self._direct_point_cloud_dispatch_condition = threading.Condition()
-        self._direct_point_cloud_pending_dispatch_frame: Optional[PointCloudFrame] = None
-        self._direct_point_cloud_pending_dispatch_sequence = 0
-        self._direct_point_cloud_dispatched_sequence = 0
-        self._direct_point_cloud_reader_drop_count = 0
-        self._direct_point_cloud_dispatch_drop_count = 0
         self._latest_pose_from_dds: Optional[Pose] = None
         self._latest_imu_state_from_dds: Optional[IMUState] = None
         self._latest_local_point_cloud: Optional[PointCloudFrame] = None
@@ -261,8 +234,6 @@ class RclpyGo2RosBridge:
                 "imu_source_topic": self._latest_imu_source_topic,
                 "point_cloud_source_topic": self._latest_point_cloud_source_topic,
                 "latest_point_cloud_points": self._latest_local_point_cloud.point_count if self._latest_local_point_cloud is not None else 0,
-                "dds_point_cloud_reader_drop_count": self._direct_point_cloud_reader_drop_count,
-                "dds_point_cloud_dispatch_drop_count": self._direct_point_cloud_dispatch_drop_count,
             }
 
     def _start_direct_dds_backend(self) -> None:
@@ -292,59 +263,32 @@ class RclpyGo2RosBridge:
                 modules["SportModeState"],
             )
             self._direct_pose_subscriber.Init()
-            if self.config.direct_dds.point_cloud_enabled:
-                self._direct_point_cloud_subscriber = subscriber_class(
-                    self.config.direct_dds.point_cloud_topic,
-                    modules["DirectPointCloud2"],
-                )
-                self._direct_point_cloud_subscriber.Init()
-            else:
-                LOGGER.info("SDK 点云订阅已禁用，由 Rust bridge 直接订阅 Go2 原生 ROS2 话题")
+            LOGGER.info("SDK 点云订阅已禁用，由 Rust bridge 直接订阅 Go2 原生 ROS2 话题")
         except Exception as exc:
             LOGGER.warning("初始化 Go2 官方 DDS 订阅器失败：%s", exc)
             self._direct_pose_subscriber = None
-            self._direct_point_cloud_subscriber = None
             return
 
         self._direct_dds_stop_event.clear()
-        threads: List[threading.Thread] = [
+        self._direct_dds_threads = [
             threading.Thread(target=self._direct_pose_reader_loop, name="go2_direct_pose_reader", daemon=True),
         ]
-        if self.config.direct_dds.point_cloud_enabled:
-            threads.extend([
-                threading.Thread(target=self._direct_point_cloud_reader_loop, name="go2_direct_point_cloud_reader", daemon=True),
-                threading.Thread(target=self._direct_point_cloud_worker_loop, name="go2_direct_point_cloud_worker", daemon=True),
-                threading.Thread(target=self._direct_point_cloud_dispatch_loop, name="go2_direct_point_cloud_dispatch", daemon=True),
-            ])
-        self._direct_dds_threads = threads
         for thread in self._direct_dds_threads:
             thread.start()
         self._direct_dds_started = True
 
     def _stop_direct_dds_backend(self) -> None:
         self._direct_dds_stop_event.set()
-        with self._direct_point_cloud_worker_condition:
-            self._direct_point_cloud_worker_condition.notify_all()
-        with self._direct_point_cloud_dispatch_condition:
-            self._direct_point_cloud_dispatch_condition.notify_all()
         for thread in self._direct_dds_threads:
             if thread.is_alive():
                 thread.join(timeout=1.0)
         self._direct_dds_threads = []
-        for subscriber in (self._direct_pose_subscriber, self._direct_point_cloud_subscriber):
-            if subscriber is None:
-                continue
+        if self._direct_pose_subscriber is not None:
             try:
-                subscriber.Close()
+                self._direct_pose_subscriber.Close()
             except Exception:
                 LOGGER.debug("关闭 Go2 官方 DDS 订阅器失败。", exc_info=True)
         self._direct_pose_subscriber = None
-        self._direct_point_cloud_subscriber = None
-        with self._direct_point_cloud_worker_condition:
-            self._direct_point_cloud_pending_sample = None
-            self._direct_point_cloud_pending_source_topic = ""
-        with self._direct_point_cloud_dispatch_condition:
-            self._direct_point_cloud_pending_dispatch_frame = None
         self._direct_dds_started = False
 
     def _direct_pose_reader_loop(self) -> None:
@@ -363,83 +307,6 @@ class RclpyGo2RosBridge:
             if sample is None:
                 continue
             self._on_sport_mode_state(sample, source_topic=source_topic)
-
-    def _direct_point_cloud_reader_loop(self) -> None:
-        timeout_sec = float(getattr(self.config.direct_dds, "read_timeout_sec", 0.5))
-        source_topic = f"dds:{self.config.direct_dds.point_cloud_topic}"
-        while not self._direct_dds_stop_event.is_set():
-            subscriber = self._direct_point_cloud_subscriber
-            if subscriber is None:
-                return
-            try:
-                sample = subscriber.Read(timeout_sec)
-            except Exception:
-                LOGGER.debug("读取 Go2 官方 DDS 点云失败。", exc_info=True)
-                time.sleep(0.1)
-                continue
-            if sample is None:
-                continue
-            self._queue_direct_point_cloud_sample(sample, source_topic=source_topic)
-
-    def _queue_direct_point_cloud_sample(self, sample: object, *, source_topic: str) -> None:
-        with self._direct_point_cloud_worker_condition:
-            if self._direct_point_cloud_pending_sequence != self._direct_point_cloud_processed_sequence:
-                with self._lock:
-                    self._direct_point_cloud_reader_drop_count += 1
-            self._direct_point_cloud_pending_sequence += 1
-            self._direct_point_cloud_pending_sample = sample
-            self._direct_point_cloud_pending_source_topic = str(source_topic or "")
-            self._direct_point_cloud_worker_condition.notify()
-
-    def _direct_point_cloud_worker_loop(self) -> None:
-        while not self._direct_dds_stop_event.is_set():
-            with self._direct_point_cloud_worker_condition:
-                while (
-                    not self._direct_dds_stop_event.is_set()
-                    and self._direct_point_cloud_pending_sequence == self._direct_point_cloud_processed_sequence
-                ):
-                    self._direct_point_cloud_worker_condition.wait(timeout=0.5)
-                if self._direct_dds_stop_event.is_set():
-                    return
-                sequence = self._direct_point_cloud_pending_sequence
-                sample = self._direct_point_cloud_pending_sample
-                source_topic = self._direct_point_cloud_pending_source_topic
-                self._direct_point_cloud_processed_sequence = sequence
-            if sample is None:
-                continue
-            self._on_direct_point_cloud(sample, source_topic=source_topic)
-
-    def _queue_direct_point_cloud_dispatch(self, point_cloud: PointCloudFrame) -> None:
-        with self._direct_point_cloud_dispatch_condition:
-            if self._direct_point_cloud_pending_dispatch_sequence != self._direct_point_cloud_dispatched_sequence:
-                with self._lock:
-                    self._direct_point_cloud_dispatch_drop_count += 1
-            self._direct_point_cloud_pending_dispatch_sequence += 1
-            self._direct_point_cloud_pending_dispatch_frame = point_cloud
-            self._direct_point_cloud_dispatch_condition.notify()
-
-    def _direct_point_cloud_dispatch_loop(self) -> None:
-        while not self._direct_dds_stop_event.is_set():
-            with self._direct_point_cloud_dispatch_condition:
-                while (
-                    not self._direct_dds_stop_event.is_set()
-                    and self._direct_point_cloud_pending_dispatch_sequence == self._direct_point_cloud_dispatched_sequence
-                ):
-                    self._direct_point_cloud_dispatch_condition.wait(timeout=0.5)
-                if self._direct_dds_stop_event.is_set():
-                    return
-                sequence = self._direct_point_cloud_pending_dispatch_sequence
-                point_cloud = self._direct_point_cloud_pending_dispatch_frame
-                self._direct_point_cloud_dispatched_sequence = sequence
-            if point_cloud is None:
-                continue
-            with self._lock:
-                callbacks = tuple(self._point_cloud_callbacks.values())
-            for callback in callbacks:
-                try:
-                    callback(point_cloud.model_copy(deep=False))
-                except Exception:
-                    LOGGER.debug("分发 Go2 DDS 点云帧失败。", exc_info=True)
 
     def _on_sport_mode_state(self, message: object, *, source_topic: str = "") -> None:
         pose = self._build_pose_from_sport_mode_state(message)
@@ -464,37 +331,6 @@ class RclpyGo2RosBridge:
                 callback(pose.model_copy(deep=False), frame_tree.model_copy(deep=False), dict(metadata))
             except Exception:
                 LOGGER.debug("分发 Go2 DDS 定位帧失败。", exc_info=True)
-
-    def _on_direct_point_cloud(self, message: object, *, source_topic: str = "") -> None:
-        points_xyz = self._extract_xyz_from_point_cloud(message)
-        if points_xyz.size == 0:
-            with self._lock:
-                self._direct_point_cloud_ready = True
-                self._latest_point_cloud_source_topic = str(source_topic or "")
-            return
-        max_points = max(50, int(getattr(self.config.direct_dds, "max_points_per_scan", 1200)))
-        if points_xyz.shape[0] > max_points:
-            stride = max(1, int(np.ceil(points_xyz.shape[0] / float(max_points))))
-            points_xyz = points_xyz[::stride][:max_points]
-
-        # 高性能路径：使用 ndarray 直接构造，跳过逐点 Vector3 实例化
-        point_cloud = PointCloudFrame(
-            frame_id=str(getattr(message, "header", None) and getattr(message.header, "frame_id", "") or "utlidar_lidar"),
-            point_count=int(points_xyz.shape[0]),
-            fields=[
-                PointField(name="x", offset=0, datatype=PointFieldDataType.FLOAT32, count=1),
-                PointField(name="y", offset=4, datatype=PointFieldDataType.FLOAT32, count=1),
-                PointField(name="z", offset=8, datatype=PointFieldDataType.FLOAT32, count=1),
-            ],
-            points_xyz_array=points_xyz.astype(np.float32, copy=False),
-            timestamp=datetime.now(timezone.utc),
-            metadata={"source_topic": str(source_topic or "")},
-        )
-        with self._lock:
-            self._latest_local_point_cloud = point_cloud
-            self._direct_point_cloud_ready = True
-            self._latest_point_cloud_source_topic = str(source_topic or "")
-        self._queue_direct_point_cloud_dispatch(point_cloud)
 
     def _build_pose_from_sport_mode_state(self, message: object) -> Pose:
         imu_state = getattr(message, "imu_state", None)
@@ -537,54 +373,6 @@ class RclpyGo2RosBridge:
                 z=float(accelerometer[2]),
             ),
         )
-
-    def _extract_xyz_from_point_cloud(self, message: object) -> np.ndarray:
-        fields = list(getattr(message, "fields", []) or [])
-        endian_prefix = ">" if bool(getattr(message, "is_bigendian", False)) else "<"
-        field_specs: Dict[str, Tuple[int, np.dtype]] = {}
-        for field in fields:
-            name = str(getattr(field, "name", "") or "").strip()
-            if name not in {"x", "y", "z"}:
-                continue
-            datatype = int(getattr(field, "datatype", 0) or 0)
-            count = int(getattr(field, "count", 1) or 1)
-            base_dtype = _POINT_FIELD_DTYPE_MAP.get(datatype)
-            if base_dtype is None or count != 1:
-                continue
-            field_specs[name] = (int(getattr(field, "offset", 0)), np.dtype(base_dtype).newbyteorder(endian_prefix))
-        if not {"x", "y", "z"}.issubset(field_specs):
-            return np.empty((0, 3), dtype=np.float32)
-
-        raw_data = bytes(getattr(message, "data", b"") or b"")
-        point_step = int(getattr(message, "point_step", 0) or 0)
-        width = int(getattr(message, "width", 0) or 0)
-        height = int(getattr(message, "height", 1) or 1)
-        declared_count = max(0, width * height)
-        if point_step <= 0 or declared_count <= 0 or len(raw_data) < point_step:
-            return np.empty((0, 3), dtype=np.float32)
-        point_count = min(declared_count, len(raw_data) // point_step)
-        max_field_end = max(offset + dtype.itemsize for offset, dtype in field_specs.values())
-        if max_field_end > point_step:
-            return np.empty((0, 3), dtype=np.float32)
-
-        try:
-            dtype = np.dtype(
-                {
-                    "names": ["x", "y", "z"],
-                    "formats": [field_specs[axis][1] for axis in ("x", "y", "z")],
-                    "offsets": [field_specs[axis][0] for axis in ("x", "y", "z")],
-                    "itemsize": point_step,
-                }
-            )
-            structured = np.frombuffer(raw_data, dtype=dtype, count=point_count)
-            points = np.column_stack((structured["x"], structured["y"], structured["z"])).astype(np.float32, copy=False)
-        except Exception:
-            LOGGER.debug("向量化解析 Go2 DDS 点云失败。", exc_info=True)
-            return np.empty((0, 3), dtype=np.float32)
-        finite_mask = np.isfinite(points).all(axis=1)
-        if not bool(finite_mask.any()):
-            return np.empty((0, 3), dtype=np.float32)
-        return np.ascontiguousarray(points[finite_mask], dtype=np.float32)
 
 
 @dataclass

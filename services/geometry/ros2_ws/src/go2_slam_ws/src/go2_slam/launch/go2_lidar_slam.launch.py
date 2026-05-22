@@ -29,12 +29,23 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
     database_path = LaunchConfiguration('database_path')
+    point_cloud_topic = LaunchConfiguration('point_cloud_topic')
+    odom_topic = LaunchConfiguration('odom_topic')
+    map_frame = LaunchConfiguration('map_frame')
+    odom_frame = LaunchConfiguration('odom_frame')
+    base_frame = LaunchConfiguration('base_frame')
+    lidar_frame = LaunchConfiguration('lidar_frame')
+    incremental_memory = LaunchConfiguration('incremental_memory')
+    init_wm_with_all_nodes = LaunchConfiguration('init_wm_with_all_nodes')
+    rtabmap_args = LaunchConfiguration('rtabmap_args')
+    planar_odom = LaunchConfiguration('planar_odom')
 
     # =========================================================================
     # 节点1: odom_to_tf — 里程计转 TF 广播器
@@ -44,7 +55,11 @@ def generate_launch_description():
     #       这个 Python 脚本订阅 /utlidar/robot_odom，把位姿转成 TF 广播出去。
     odom_to_tf = ExecuteProcess(
         cmd=['python3', os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'odom_to_tf.py')],
+            os.path.dirname(os.path.abspath(__file__)), 'odom_to_tf.py'),
+            '--odom-topic', odom_topic,
+            '--odom-frame', odom_frame,
+            '--base-frame', base_frame,
+            '--planar', planar_odom],
         output='screen',
     )
 
@@ -61,7 +76,7 @@ def generate_launch_description():
         package='tf2_ros',
         executable='static_transform_publisher',
         name='base_to_lidar_tf',
-        arguments=['0', '0', '0', '0', '0', '0', 'base_link', 'utlidar_lidar'],
+        arguments=['0', '0', '0', '0', '0', '0', base_frame, lidar_frame],
         parameters=[{'use_sim_time': use_sim_time}],
     )
 
@@ -76,24 +91,31 @@ def generate_launch_description():
     executable='rtabmap',
     name='rtabmap',
     output='screen',
-    # arguments=['--delete_db_on_start'],  # 注释掉，保留地图
+    arguments=[rtabmap_args],
     parameters=[{
         'use_sim_time': use_sim_time,
         'database_path': database_path,
-        'frame_id': 'base_link',
-        'odom_frame_id': 'odom',
-        'map_frame_id': 'map',
+        'frame_id': base_frame,
+        'odom_frame_id': odom_frame,
+        'map_frame_id': map_frame,
         'subscribe_scan_cloud': True,
         'subscribe_rgb': False,
         'subscribe_depth': False,
         'tf_tolerance': 1.0,
         'wait_for_transform': 1.0,
-        'Rtabmap/DetectionRate': '3.0',
+        # Unitree L1 publishes faster than 3 Hz; accepting more scan clouds
+        # makes the assembled RTAB-Map cloud less sparse while staying modest.
+        'Rtabmap/DetectionRate': '8.0',
         'Rtabmap/CreateIntermediateNodes': 'true',
         'Reg/Strategy': '1',
+        # GO2 is a ground robot. Keep the localization graph planar
+        # (x/y/yaw) so z/roll/pitch noise from odom/ICP cannot accumulate as
+        # apparent global drift. The local occupancy/grid data below remains 3D.
         'Reg/Force3DoF': 'true',
         'RGBD/NeighborLinkRefining': 'true',
         'RGBD/ProximityBySpace': 'true',
+        'RGBD/ProximityGlobalScanMap': 'true',
+        'RGBD/ProximityOdomGuess': 'true',
         'RGBD/ProximityMaxGraphDepth': '50',
         'RGBD/ProximityPathMaxNeighbors': '10',
         'RGBD/AngularUpdate': '0.05',
@@ -101,22 +123,25 @@ def generate_launch_description():
         'RGBD/OptimizeFromGraphEnd': 'false',
         'RGBD/StartAtOrigin': 'false',
         'RGBD/LocalImmunizationRatio': '0.25',
+        'Mem/IncrementalMemory': ParameterValue(incremental_memory, value_type=str),
         'Mem/NotLinkedNodesKept': 'false',
         'Mem/STMSize': '30',
-        'Mem/InitWMWithAllNodes': 'true',
+        'Mem/InitWMWithAllNodes': ParameterValue(init_wm_with_all_nodes, value_type=str),
         'Rtabmap/StartNewMapOnLoopClosure': 'false',
         'Rtabmap/MaxRetrieved': '2',
 
         'Grid/FromDepth': 'false',
         'Grid/Sensor': '0',
-        'Grid/3D': 'false',
+        # Build local occupancy data in 3D so cloud_map/cloud_obstacles keep
+        # height structure instead of being collapsed into a 2D layer.
+        'Grid/3D': 'true',
         'Grid/RangeMax': '15.0',
         'Grid/RangeMin': '0.2',
         'Grid/CellSize': '0.05',
-        'Grid/MaxGroundHeight': '0.05',
-        'Grid/MinGroundHeight': '-0.5',
-        'Grid/MaxObstacleHeight': '0.8',
-        'Grid/NormalsSegmentation': 'false',
+        'Grid/MaxGroundHeight': '0.12',
+        'Grid/MinGroundHeight': '-0.6',
+        'Grid/MaxObstacleHeight': '2.5',
+        'Grid/NormalsSegmentation': 'true',
         'Grid/PreVoxelFiltering': 'false',
         'Grid/MinClusterSize': '1',
         'Grid/FlatObstacleDetected': 'true',
@@ -136,17 +161,20 @@ def generate_launch_description():
         'GridGlobal/Eroded': 'false',
         'GridGlobal/FootprintRadius': '0.0',
 
-        'Icp/VoxelSize': '0.1',
+        'Icp/VoxelSize': '0.05',
         'Icp/PointToPlane': 'true',
         'Icp/MaxCorrespondenceDistance': '0.2',
+        'Icp/CorrespondenceRatio': '0.25',
+        'Icp/MaxTranslation': '0.5',
+        'Icp/MaxRotation': '0.7',
         'Icp/Iterations': '20',
 
         'Optimizer/Strategy': '1',
         'Optimizer/GravitySigma': '0.3',
     }],
     remappings=[
-        ('scan_cloud', '/utlidar/cloud_base'),
-        ('odom', '/utlidar/robot_odom'),
+        ('scan_cloud', point_cloud_topic),
+        ('odom', odom_topic),
     ],
 )
 
@@ -174,6 +202,16 @@ def generate_launch_description():
             'database_path',
             default_value=os.path.expanduser('~/.ros/go2_slam_rtabmap.db'),
         ),
+        DeclareLaunchArgument('point_cloud_topic', default_value='/utlidar/cloud_base'),
+        DeclareLaunchArgument('odom_topic', default_value='/utlidar/robot_odom'),
+        DeclareLaunchArgument('map_frame', default_value='map'),
+        DeclareLaunchArgument('odom_frame', default_value='odom'),
+        DeclareLaunchArgument('base_frame', default_value='base_link'),
+        DeclareLaunchArgument('lidar_frame', default_value='utlidar_lidar'),
+        DeclareLaunchArgument('incremental_memory', default_value='true'),
+        DeclareLaunchArgument('init_wm_with_all_nodes', default_value='false'),
+        DeclareLaunchArgument('rtabmap_args', default_value=''),
+        DeclareLaunchArgument('planar_odom', default_value='true'),
         odom_to_tf,         # 1. 先启动里程计转TF，确保TF树完整
         static_tf_lidar,    # 2. 发布静态TF
         rtabmap_node,       # 3. 最后启动SLAM

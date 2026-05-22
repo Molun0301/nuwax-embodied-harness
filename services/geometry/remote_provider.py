@@ -204,20 +204,25 @@ class RosBridgeProvider:
         """订阅位姿更新流，每次更新调用 callback(pose_dict)。返回后台线程。"""
         if not self._stub:
             return None
+        import time
         def _stream_worker():
-            try:
-                for update in self._stub.SubscribePose(pb2.PoseRequest()):
-                    pose = update.pose
-                    pos = pose.position
-                    ori = pose.orientation
-                    callback({
-                        "x": pos.x, "y": pos.y, "z": pos.z,
-                        "qx": ori.x, "qy": ori.y, "qz": ori.z, "qw": ori.w,
-                        "frame_id": pose.frame_id,
-                        "sequence": update.sequence,
-                    })
-            except grpc.RpcError:
-                pass
+            while self._stub:
+                try:
+                    for update in self._stub.SubscribePose(pb2.PoseRequest()):
+                        pose = update.pose
+                        pos = pose.position
+                        ori = pose.orientation
+                        callback({
+                            "x": pos.x, "y": pos.y, "z": pos.z,
+                            "qx": ori.x, "qy": ori.y, "qz": ori.z, "qw": ori.w,
+                            "frame_id": pose.frame_id,
+                            "sequence": update.sequence,
+                        })
+                except grpc.RpcError:
+                    pass
+                if not self._stub:
+                    break
+                time.sleep(1.0)
         t = threading.Thread(target=_stream_worker, name="ros_bridge_pose_stream", daemon=True)
         t.start()
         return t
@@ -226,18 +231,23 @@ class RosBridgeProvider:
         """订阅地图更新通知流，每次更新调用 callback(map_meta_dict)。"""
         if not self._stub:
             return None
+        import time
         def _stream_worker():
-            try:
-                for update in self._stub.SubscribeMapUpdates(pb2.Empty()):
-                    meta = update.meta
-                    callback({
-                        "width": meta.width, "height": meta.height,
-                        "resolution": meta.resolution,
-                        "origin_x": meta.origin_x, "origin_y": meta.origin_y,
-                        "frame_id": meta.frame_id, "revision": meta.revision,
-                    })
-            except grpc.RpcError:
-                pass
+            while self._stub:
+                try:
+                    for update in self._stub.SubscribeMapUpdates(pb2.Empty()):
+                        meta = update.meta
+                        callback({
+                            "width": meta.width, "height": meta.height,
+                            "resolution": meta.resolution,
+                            "origin_x": meta.origin_x, "origin_y": meta.origin_y,
+                            "frame_id": meta.frame_id, "revision": meta.revision,
+                        })
+                except grpc.RpcError:
+                    pass
+                if not self._stub:
+                    break
+                time.sleep(1.0)
         t = threading.Thread(target=_stream_worker, name="ros_bridge_map_stream", daemon=True)
         t.start()
         return t
@@ -246,17 +256,22 @@ class RosBridgeProvider:
         """订阅导航状态流，每次更新调用 callback(nav_state_dict)。"""
         if not self._stub:
             return None
+        import time
         def _stream_worker():
-            try:
-                for update in self._stub.SubscribeNavigationState(pb2.Empty()):
-                    callback({
-                        "status": update.status,
-                        "message": update.message,
-                        "goal_id": update.goal_id,
-                        "distance_remaining": update.distance_remaining,
-                    })
-            except grpc.RpcError:
-                pass
+            while self._stub:
+                try:
+                    for update in self._stub.SubscribeNavigationState(pb2.Empty()):
+                        callback({
+                            "status": update.status,
+                            "message": update.message,
+                            "goal_id": update.goal_id,
+                            "distance_remaining": update.distance_remaining,
+                        })
+                except grpc.RpcError:
+                    pass
+                if not self._stub:
+                    break
+                time.sleep(1.0)
         t = threading.Thread(target=_stream_worker, name="ros_bridge_nav_stream", daemon=True)
         t.start()
         return t

@@ -219,6 +219,8 @@ class PlatformGeometryRuntime:
         self._point_cloud_publisher = None
         self._live_geometry_start_lock = threading.RLock()
         self._live_geometry_start_attempted = False
+        self._pending_localization_callbacks = []
+        self._pending_map_callbacks = []
         self._runtime_state_lock = threading.RLock()
         self._runtime_phase = "disabled" if not self._is_geometry_profile_enabled() else "preflight"
         self._runtime_message = "平台几何运行时尚未启动。"
@@ -544,6 +546,10 @@ class PlatformGeometryRuntime:
         if provider.connect():
             self._remote_provider = provider
             LOGGER.info("Rust ros-bridge gRPC 连接已建立")
+            for cb in self._pending_localization_callbacks:
+                self._remote_provider.subscribe_pose(cb)
+            for cb in self._pending_map_callbacks:
+                self._remote_provider.subscribe_map_updates(cb)
         else:
             LOGGER.warning("Rust ros-bridge gRPC 连接失败，子进程仍在运行")
 
@@ -1586,9 +1592,10 @@ class PlatformGeometryRuntime:
         def wrapped_callback(payload):
             return callback(self._attach_active_map_version_to_live_map_payload(payload))
 
-        if self._remote_provider is not None:
+        self._pending_map_callbacks.append(wrapped_callback)
+        if self._remote_provider is not None and self._remote_provider.is_connected:
             self._remote_provider.subscribe_map_updates(wrapped_callback)
-        return 0  # stub subscription_id；Rust bridge 管理订阅生命周期
+        return 0
 
     def unsubscribe_map_updates(self, subscription_id: int) -> bool:
         return True  # Rust bridge 管理订阅生命周期，无需手动注销
@@ -3141,9 +3148,10 @@ class PlatformGeometryRuntime:
 
         if not self._is_geometry_profile_enabled():
             return None
-        if self._remote_provider is not None:
+        self._pending_localization_callbacks.append(callback)
+        if self._remote_provider is not None and self._remote_provider.is_connected:
             self._remote_provider.subscribe_pose(callback)
-        return 0  # stub subscription_id；Rust bridge 管理订阅生命周期
+        return 0
 
     def unsubscribe_localization_updates(self, subscription_id: Optional[int]) -> None:
         pass  # Rust bridge 管理订阅生命周期，无需手动注销

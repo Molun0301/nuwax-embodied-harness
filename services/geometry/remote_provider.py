@@ -54,6 +54,18 @@ class RosBridgeProvider:
     def is_connected(self) -> bool:
         return self._connected
 
+    def is_available(self) -> bool:
+        if not self._connected or not self._stub:
+            return False
+        try:
+            resp = self._stub.GetFrameTree(pb2.Empty())
+            return len(resp.transforms) > 0
+        except grpc.RpcError:
+            return False
+
+    def is_localization_available(self) -> bool:
+        return self.is_available()
+
     # === Localization ===
     def get_current_pose(self) -> Optional[Dict[str, Any]]:
         if not self._stub:

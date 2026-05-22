@@ -338,7 +338,6 @@ stop_gateway() {
   exit 0
 }
 
-export NUWAX_GEOMETRY_REQUIRE_ROS2="${NUWAX_GEOMETRY_REQUIRE_ROS2:-false}"
 
 if [[ -f "${ENV_FILE}" ]]; then
   load_env_file "${ENV_FILE}"

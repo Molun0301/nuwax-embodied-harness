@@ -26,13 +26,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let odom_topic = std::env::var("NUWAX_ODOM_TOPIC")
         .unwrap_or_else(|_| "/odom".into());
     let pointcloud_topic = std::env::var("NUWAX_POINTCLOUD_TOPIC")
-        .unwrap_or_else(|_| "/utlidar/cloud".into());
+        .unwrap_or_else(|_| "/utlidar/cloud_base".into());
     let map_topic = std::env::var("NUWAX_MAP_TOPIC")
         .unwrap_or_else(|_| "/map".into());
     let tf_topic = std::env::var("NUWAX_TF_TOPIC")
         .unwrap_or_else(|_| "/tf".into());
     let nav_action = std::env::var("NUWAX_NAV_ACTION")
         .unwrap_or_else(|_| "/navigate_to_pose".into());
+    let odom_source_topic = std::env::var("NUWAX_GO2_ODOM_SOURCE")
+        .unwrap_or_else(|_| "/utlidar/robot_odom".into());
+    let pointcloud_source_topic = std::env::var("NUWAX_GO2_POINTCLOUD_SOURCE")
+        .unwrap_or_else(|_| "/utlidar/cloud".into());
+    let direct_subscribe = std::env::var("NUWAX_GO2_DIRECT_SUBSCRIBE")
+        .unwrap_or_else(|_| "true".into())
+        .parse::<bool>()
+        .unwrap_or(true);
 
     let video_shm_path = PathBuf::from(
         std::env::var("NUWAX_VIDEO_SHM_PATH")
@@ -53,8 +61,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     info!("视频中转已启动: shm={:?}, uds={:?}", video_shm_path, video_uds_path);
 
+    let odom_src = if direct_subscribe { Some(odom_source_topic.as_str()) } else { None };
+    let pc_src = if direct_subscribe { Some(pointcloud_source_topic.as_str()) } else { None };
     let bridge = ros2_bridge::spawn_ros2_bridge(
-        &odom_topic, &pointcloud_topic, &map_topic, &tf_topic, &nav_action
+        &odom_topic, &pointcloud_topic, &map_topic, &tf_topic, &nav_action,
+        odom_src, pc_src,
     )?;
 
     let service = server::GeometryRuntimeService::new(bridge);

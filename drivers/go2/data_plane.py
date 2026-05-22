@@ -292,11 +292,14 @@ class RclpyGo2RosBridge:
                 modules["SportModeState"],
             )
             self._direct_pose_subscriber.Init()
-            self._direct_point_cloud_subscriber = subscriber_class(
-                self.config.direct_dds.point_cloud_topic,
-                modules["DirectPointCloud2"],
-            )
-            self._direct_point_cloud_subscriber.Init()
+            if self.config.direct_dds.point_cloud_enabled:
+                self._direct_point_cloud_subscriber = subscriber_class(
+                    self.config.direct_dds.point_cloud_topic,
+                    modules["DirectPointCloud2"],
+                )
+                self._direct_point_cloud_subscriber.Init()
+            else:
+                LOGGER.info("SDK 点云订阅已禁用，由 Rust bridge 直接订阅 Go2 原生 ROS2 话题")
         except Exception as exc:
             LOGGER.warning("初始化 Go2 官方 DDS 订阅器失败：%s", exc)
             self._direct_pose_subscriber = None
@@ -306,10 +309,13 @@ class RclpyGo2RosBridge:
         self._direct_dds_stop_event.clear()
         threads: List[threading.Thread] = [
             threading.Thread(target=self._direct_pose_reader_loop, name="go2_direct_pose_reader", daemon=True),
-            threading.Thread(target=self._direct_point_cloud_reader_loop, name="go2_direct_point_cloud_reader", daemon=True),
-            threading.Thread(target=self._direct_point_cloud_worker_loop, name="go2_direct_point_cloud_worker", daemon=True),
-            threading.Thread(target=self._direct_point_cloud_dispatch_loop, name="go2_direct_point_cloud_dispatch", daemon=True),
         ]
+        if self.config.direct_dds.point_cloud_enabled:
+            threads.extend([
+                threading.Thread(target=self._direct_point_cloud_reader_loop, name="go2_direct_point_cloud_reader", daemon=True),
+                threading.Thread(target=self._direct_point_cloud_worker_loop, name="go2_direct_point_cloud_worker", daemon=True),
+                threading.Thread(target=self._direct_point_cloud_dispatch_loop, name="go2_direct_point_cloud_dispatch", daemon=True),
+            ])
         self._direct_dds_threads = threads
         for thread in self._direct_dds_threads:
             thread.start()

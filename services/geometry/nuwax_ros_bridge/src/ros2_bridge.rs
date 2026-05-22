@@ -1,5 +1,7 @@
 use r2r::QosProfile;
 use std::sync::Arc;
+use std::rc::Rc;
+use std::cell::RefCell;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_stream::StreamExt;
 use tracing::{info, error};
@@ -148,6 +150,8 @@ pub fn spawn_ros2_bridge(
     map_topic: &str,
     tf_topic: &str,
     nav_action: &str,
+    odom_source_topic: Option<&str>,
+    pointcloud_source_topic: Option<&str>,
 ) -> Result<Ros2BridgeHandle, Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<BridgeCommand>(256);
     let state = Arc::new(RwLock::new(SharedState::default()));
@@ -158,6 +162,8 @@ pub fn spawn_ros2_bridge(
     let map_topic = map_topic.to_string();
     let tf_topic = tf_topic.to_string();
     let nav_action = nav_action.to_string();
+    let odom_src = odom_source_topic.map(|s| s.to_string());
+    let pc_src = pointcloud_source_topic.map(|s| s.to_string());
 
     let pc_shm_path = std::path::PathBuf::from(
         std::env::var("NUWAX_POINTCLOUD_SHM_PATH")
@@ -174,6 +180,7 @@ pub fn spawn_ros2_bridge(
             if let Err(e) = ros2_async_loop(
                 &odom_topic, &pc_topic, &map_topic, &tf_topic, &nav_action,
                 rx, state_clone, &pc_shm_path,
+                odom_src.as_deref(), pc_src.as_deref(),
             ).await {
                 error!("ROS2 桥接线程异常退出: {}", e);
             }
@@ -192,15 +199,19 @@ async fn ros2_async_loop(
     mut rx: mpsc::Receiver<BridgeCommand>,
     state: Arc<RwLock<SharedState>>,
     pc_shm_path: &std::path::Path,
+    odom_source_topic: Option<&str>,
+    pointcloud_source_topic: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 初始化点云共享内存写入器
-    let mut pc_shm_writer = match PointCloudShmWriter::new(pc_shm_path) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            error!("点云共享内存初始化失败（降级为无 SHM 模式）: {}", e);
-            None
+    let pc_shm_writer: Rc<RefCell<Option<PointCloudShmWriter>>> = Rc::new(RefCell::new(
+        match PointCloudShmWriter::new(pc_shm_path) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                error!("点云共享内存初始化失败（降级为无 SHM 模式）: {}", e);
+                None
+            }
         }
-    };
+    ));
 
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "nuwax_ros_bridge", "")?;
@@ -224,6 +235,69 @@ async fn ros2_async_loop(
     )?;
 
     info!("ROS2 桥接启动: odom={}, map={}, tf={}, nav={}", odom_topic, map_topic, tf_topic, nav_action);
+
+    // 直接订阅 Go2 原生话题（通过 CycloneDDS RMW 可见）
+    if let Some(src) = odom_source_topic {
+        let odom_src_sub = node.subscribe::<r2r::nav_msgs::msg::Odometry>(
+            src, QosProfile::default()
+        )?;
+        let odom_pub_clone = odom_pub.clone();
+        let odom_state = state.clone();
+        info!("直接订阅 Go2 里程计: {}", src);
+        tokio::task::spawn_local(async move {
+            let mut stream = odom_src_sub;
+            while let Some(msg) = stream.next().await {
+                let mut s = odom_state.write().await;
+                s.pose.x = msg.pose.pose.position.x;
+                s.pose.y = msg.pose.pose.position.y;
+                s.pose.z = msg.pose.pose.position.z;
+                s.pose.qx = msg.pose.pose.orientation.x;
+                s.pose.qy = msg.pose.pose.orientation.y;
+                s.pose.qz = msg.pose.pose.orientation.z;
+                s.pose.qw = msg.pose.pose.orientation.w;
+                s.pose.frame_id = msg.header.frame_id.clone();
+                drop(s);
+                let _ = odom_pub_clone.publish(&msg);
+            }
+        });
+    }
+
+    if let Some(src) = pointcloud_source_topic {
+        let pc_src_sub = node.subscribe::<r2r::sensor_msgs::msg::PointCloud2>(
+            src, QosProfile::default()
+        )?;
+        let pc_pub_clone = pc_pub.clone();
+        let pc_processor = PointCloudProcessor::default_go2();
+        let pc_shm_for_sub = pc_shm_writer.clone();
+        info!("直接订阅 Go2 点云: {}", src);
+        tokio::task::spawn_local(async move {
+            let mut stream = pc_src_sub;
+            while let Some(msg) = stream.next().await {
+                let (processed_data, processed_count) = pc_processor.process(
+                    &msg.data, msg.point_step
+                );
+                if processed_count == 0 { continue; }
+                if let Some(ref mut writer) = *pc_shm_for_sub.borrow_mut() {
+                    writer.write_frame(&processed_data, processed_count);
+                }
+                let out_step = 12u32;
+                let mut out_msg = r2r::sensor_msgs::msg::PointCloud2::default();
+                out_msg.header = msg.header.clone();
+                out_msg.height = 1;
+                out_msg.width = processed_count;
+                out_msg.point_step = out_step;
+                out_msg.row_step = out_step * processed_count;
+                out_msg.is_dense = true;
+                out_msg.data = processed_data;
+                out_msg.fields = vec![
+                    r2r::sensor_msgs::msg::PointField { name: "x".into(), offset: 0, datatype: 7, count: 1 },
+                    r2r::sensor_msgs::msg::PointField { name: "y".into(), offset: 4, datatype: 7, count: 1 },
+                    r2r::sensor_msgs::msg::PointField { name: "z".into(), offset: 8, datatype: 7, count: 1 },
+                ];
+                let _ = pc_pub_clone.publish(&out_msg);
+            }
+        });
+    }
 
     // 订阅 /map → 更新 SharedState.map
     let map_state = state.clone();
@@ -285,7 +359,7 @@ async fn ros2_async_loop(
         node.spin_once(std::time::Duration::from_millis(5));
 
         match rx.try_recv() {
-            Ok(cmd) => handle_command(cmd, &odom_pub, &pc_pub, &nav_client, &cmd_state, &mut pc_shm_writer).await,
+            Ok(cmd) => handle_command(cmd, &odom_pub, &pc_pub, &nav_client, &cmd_state, &pc_shm_writer).await,
             Err(mpsc::error::TryRecvError::Empty) => {}
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 info!("命令通道关闭，桥接线程退出");
@@ -305,7 +379,7 @@ async fn handle_command(
     pc_pub: &r2r::Publisher<r2r::sensor_msgs::msg::PointCloud2>,
     nav_client: &r2r::ActionClient<r2r::nav2_msgs::action::NavigateToPose::Action>,
     state: &Arc<RwLock<SharedState>>,
-    pc_shm_writer: &mut Option<PointCloudShmWriter>,
+    pc_shm_writer: &Rc<RefCell<Option<PointCloudShmWriter>>>,
 ) {
     match cmd {
         BridgeCommand::PublishOdom {
@@ -340,7 +414,7 @@ async fn handle_command(
             let out_step = 12u32; // XYZ only after processing
 
             // 写入共享内存供 Python 侧零拷贝读取
-            if let Some(ref mut writer) = pc_shm_writer {
+            if let Some(ref mut writer) = *pc_shm_writer.borrow_mut() {
                 writer.write_frame(&processed_data, processed_count);
             }
 

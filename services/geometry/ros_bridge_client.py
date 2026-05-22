@@ -91,8 +91,17 @@ class RosBridgeSubprocess:
         env = os.environ.copy()
         env["NUWAX_ROS_BRIDGE_PORT"] = str(self._port)
         env["NUWAX_ROS_BRIDGE_READY_FILE"] = self._ready_file
+        # 使用 CycloneDDS RMW 以直接订阅 Go2 原生 DDS 话题
+        env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+        cyclonedds_xml = os.path.expanduser("~/cyclonedds_ws/cyclonedds.xml")
+        if os.path.exists(cyclonedds_xml):
+            env["CYCLONEDDS_URI"] = cyclonedds_xml
         ros_setup = "/opt/ros/%s/setup.bash" % self._ros_distro
-        cmd = "source %s && exec %s" % (ros_setup, self._binary_path)
+        cyclonedds_setup = os.path.expanduser("~/cyclonedds_ws/install/setup.bash")
+        if os.path.exists(cyclonedds_setup):
+            cmd = "source %s && source %s && exec %s" % (ros_setup, cyclonedds_setup, self._binary_path)
+        else:
+            cmd = "source %s && exec %s" % (ros_setup, self._binary_path)
 
         try:
             self._process = subprocess.Popen(

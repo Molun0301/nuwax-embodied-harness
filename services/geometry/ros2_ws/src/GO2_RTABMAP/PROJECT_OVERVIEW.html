@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GO2 · RTAB-Map · Nav2 — 项目架构总览</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg:#fff8f1; --bg-card:#fff; --bg-soft:#fef3e7;
+  --w50:#fff7ed; --w100:#ffedd5; --w200:#fed7aa; --w300:#fdba74;
+  --w500:#f97316; --w600:#ea580c; --w700:#c2410c; --w800:#9a3412; --w900:#7c2d12; --w950:#431407;
+  --a50:#fffbeb; --a100:#fef3c7; --a500:#f59e0b; --a600:#d97706;
+  --r50:#fff1f2; --r200:#fecdd3; --r600:#e11d48;
+  --e50:#ecfdf5; --e200:#a7f3d0; --e600:#059669;
+  --s500:#64748b; --s700:#334155;
+  --ink:#2b1810; --ink-s:#5a3e2b;
+  --sh:0 12px 32px -12px rgba(194,65,12,.25),0 2px 8px -2px rgba(194,65,12,.08);
+  --sh2:0 24px 48px -16px rgba(194,65,12,.35);
+  --rad:14px; --rad-s:8px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:radial-gradient(circle at 15% 0%,#ffe4cc 0%,transparent 35%),radial-gradient(circle at 85% 35%,#fde7c8 0%,transparent 40%),var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.65;font-size:15.5px}
+code,pre,.mono{font-family:"JetBrains Mono","Fira Code","SF Mono",Menlo,Consolas,monospace;font-size:.92em}
+.container{max-width:1180px;margin:0 auto;padding:0 28px}
+
+nav.toc{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);background:rgba(255,248,241,.85);border-bottom:1px solid var(--w200)}
+nav.toc .inner{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px;padding:14px 28px;max-width:1180px;margin:0 auto}
+nav.toc .brand{font-weight:700;color:var(--w700);margin-right:auto;font-size:.95rem}
+nav.toc a{color:var(--ink-s);text-decoration:none;font-size:.88rem;padding:4px 10px;border-radius:999px;transition:all .15s}
+nav.toc a:hover{background:var(--w100);color:var(--w700)}
+
+header.hero{padding:88px 0 72px;text-align:center;position:relative}
+header.hero::before{content:"";position:absolute;inset:40px 0 0 0;background:radial-gradient(ellipse at center,rgba(251,146,60,.10) 0%,transparent 65%);z-index:-1}
+.eyebrow{display:inline-block;background:linear-gradient(135deg,var(--w100),var(--a100));color:var(--w800);padding:6px 14px;border-radius:999px;font-size:.78rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;margin-bottom:18px;border:1px solid var(--w200)}
+header.hero h1{margin:0 0 14px;font-size:clamp(2.2rem,5vw,3.4rem);font-weight:800;line-height:1.15;background:linear-gradient(135deg,var(--w700) 0%,var(--a600) 100%);-webkit-background-clip:text;background-clip:text;color:transparent;letter-spacing:-.02em}
+.subtitle{color:var(--ink-s);font-size:1.12rem;max-width:720px;margin:0 auto 28px}
+.badge-row{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:24px}
+.badge{display:inline-flex;align-items:center;gap:6px;background:var(--bg-card);border:1px solid var(--w200);color:var(--w800);padding:5px 12px;border-radius:999px;font-size:.82rem;font-weight:500}
+.badge .dot{width:6px;height:6px;border-radius:50%;background:var(--w500)}
+
+section{padding:56px 0}
+section+section{border-top:1px dashed var(--w200)}
+h2.section-title{font-size:1.85rem;margin:0 0 8px;color:var(--w900);font-weight:700;letter-spacing:-.01em;display:flex;align-items:center;gap:14px}
+h2.section-title::before{content:"";width:6px;height:28px;background:linear-gradient(180deg,var(--w500),var(--a500));border-radius:3px}
+.section-lead{color:var(--ink-s);margin:0 0 32px;font-size:1.02rem;max-width:820px}
+h3{color:var(--w800);margin-top:32px;margin-bottom:12px;font-size:1.18rem}
+p{margin:.6em 0}
+
+.card{background:var(--bg-card);border:1px solid var(--w200);border-radius:var(--rad);padding:24px 26px;box-shadow:var(--sh);transition:all .25s}
+.card:hover{transform:translateY(-2px);box-shadow:var(--sh2);border-color:var(--w300)}
+.card-title{margin:0 0 6px;font-size:1.15rem;color:var(--w800);font-weight:700;display:flex;align-items:center;gap:10px}
+.card-sub{color:var(--s500);font-size:.85rem;margin-bottom:16px}
+
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:22px}
+.grid-3{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px}
+.grid-4{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px}
+
+.mode-card{position:relative;overflow:hidden}
+.mode-tag{position:absolute;top:16px;right:16px;padding:4px 10px;border-radius:999px;font-size:.72rem;font-weight:600;letter-spacing:.04em}
+.mapping .mode-tag{background:var(--w100);color:var(--w800);border:1px solid var(--w200)}
+.localization .mode-tag{background:var(--e50);color:var(--e600);border:1px solid var(--e200)}
+.exploration .mode-tag{background:var(--r50);color:var(--r600);border:1px solid var(--r200)}
+
+.mode-cmd{background:var(--w950);color:#ffd9b5;padding:10px 14px;border-radius:var(--rad-s);font-family:"JetBrains Mono",monospace;font-size:.86rem;margin:12px 0;overflow-x:auto;white-space:nowrap}
+.mode-cmd::before{content:"$ ";color:var(--w300)}
+
+ul.feat{list-style:none;padding:0;margin:12px 0 0}
+ul.feat li{position:relative;padding:6px 0 6px 24px;color:var(--ink-s);font-size:.94rem}
+ul.feat li::before{content:"→";position:absolute;left:4px;top:6px;color:var(--w500);font-weight:700}
+
+.table-wrap{background:var(--bg-card);border:1px solid var(--w200);border-radius:var(--rad);overflow:hidden;box-shadow:var(--sh)}
+table{width:100%;border-collapse:collapse;font-size:.92rem}
+th,td{text-align:left;padding:11px 16px;border-bottom:1px solid var(--w100)}
+th{background:var(--w50);color:var(--w800);font-weight:600;font-size:.82rem;letter-spacing:.04em;text-transform:uppercase}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--bg-soft)}
+td code{background:var(--w50);color:var(--w800);padding:1px 7px;border-radius:4px;border:1px solid var(--w100)}
+
+.diagram{background:var(--bg-card);border:1px solid var(--w200);border-radius:var(--rad);padding:28px 22px;margin:18px 0;box-shadow:var(--sh);overflow-x:auto}
+.diagram-title{color:var(--w700);font-size:.85rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.diagram-title::before{content:"▸";color:var(--w500)}
+.mermaid{text-align:center;font-family:inherit}
+
+.topic{display:inline-block;background:var(--w50);color:var(--w700);padding:2px 8px;border-radius:4px;font-family:"JetBrains Mono",monospace;font-size:.84em;border:1px solid var(--w100)}
+.frame{display:inline-block;background:var(--e50);color:var(--e600);padding:2px 8px;border-radius:4px;font-family:"JetBrains Mono",monospace;font-size:.84em;border:1px solid var(--e200)}
+
+.legend{display:flex;flex-wrap:wrap;gap:16px;margin-top:14px;font-size:.82rem}
+.legend-item{display:flex;align-items:center;gap:6px;color:var(--ink-s)}
+.legend-swatch{width:16px;height:12px;border-radius:3px}
+
+.tree{font-family:"JetBrains Mono",monospace;font-size:.86rem;background:var(--bg-card);border:1px solid var(--w200);border-radius:var(--rad);padding:22px 26px;color:var(--ink-s);line-height:1.85;box-shadow:var(--sh)}
+.tree .dir{color:var(--w700);font-weight:600}
+.tree .py{color:var(--a600)}
+.tree .yaml{color:var(--r600)}
+.tree .sh{color:var(--e600)}
+.tree .com{color:var(--s500);font-style:italic}
+
+.callout{background:linear-gradient(135deg,var(--a50),var(--w50));border-left:4px solid var(--w500);padding:14px 18px;border-radius:var(--rad-s);margin:14px 0;color:var(--w900);font-size:.94rem}
+.callout strong{color:var(--w700)}
+
+kbd{background:var(--bg-card);border:1px solid var(--w200);border-bottom-width:2px;border-radius:4px;padding:1px 6px;font-family:"JetBrains Mono",monospace;font-size:.82em;color:var(--w800)}
+
+footer{text-align:center;padding:50px 0 70px;color:var(--s500);font-size:.86rem;border-top:1px dashed var(--w200)}
+
+@media(max-width:720px){nav.toc .inner{gap:4px 10px;padding:10px 18px}nav.toc .brand{width:100%}.container{padding:0 18px}section{padding:40px 0}.card{padding:20px}}
+</style>
+</head>
+<body>
+
+<nav class="toc"><div class="inner">
+<span class="brand">GO2 · RTAB-Map · Nav2</span>
+<a href="#overview">总览</a>
+<a href="#architecture">架构</a>
+<a href="#mapping">建图</a>
+<a href="#localization">定位</a>
+<a href="#exploration">探索</a>
+<a href="#nodes">节点</a>
+<a href="#stack">技术栈</a>
+<a href="#tree">文件结构</a>
+<a href="#tuning">关键调参</a>
+</div></nav>
+
+<header class="hero"><div class="container">
+<span class="eyebrow">Unitree GO2 × ROS 2 Foxy</span>
+<h1>四足机器狗自主<br>建图 · 定位 · 探索</h1>
+<p class="subtitle">基于 <strong>Livox L1 4线激光雷达</strong> 与 <strong>RTAB-Map</strong> 图优化 SLAM，结合 <strong>Nav2</strong> 路径规划与 <strong>frontier-based exploration</strong>，为 Unitree GO2 提供完整的自主导航栈。</p>
+<div class="badge-row">
+<span class="badge"><span class="dot"></span>ROS 2 Foxy</span>
+<span class="badge"><span class="dot"></span>RTAB-Map 0.21.1</span>
+<span class="badge"><span class="dot"></span>Nav2</span>
+<span class="badge"><span class="dot"></span>CycloneDDS rmw</span>
+<span class="badge"><span class="dot"></span>Unitree SDK</span>
+<span class="badge"><span class="dot"></span>Python · NumPy</span>
+</div>
+</div></header>
+
+<main id="main">
+
+<!-- ============== OVERVIEW ============== -->
+<section id="overview"><div class="container">
+<h2 class="section-title">项目总览</h2>
+<p class="section-lead">
+通过统一入口脚本 <code>./go2.sh</code> 提供三种互斥模式，共享同一套底层节点
+（<code>odom_tf_broadcaster</code> · <code>cloud_to_scan</code> · <code>cmd_vel_bridge</code>），
+上层根据模式叠加 RTAB-Map（mapping / localization）+ Nav2（可选）+ Frontier Explorer（仅探索）。
+</p>
+
+<div class="grid-3" style="margin-top:28px">
+<div class="card mode-card mapping">
+<span class="mode-tag">--new / -m</span>
+<div class="card-title">🗺 建图模式</div>
+<div class="card-sub">手动遥控 / 给 RViz 目标点 · 边走边建</div>
+<div class="mode-cmd">./go2.sh --new ./maps/lab.db</div>
+<ul class="feat">
+<li>RTAB-Map SLAM（增量记忆）</li>
+<li>Nav2 跟随 RViz 目标点</li>
+<li>Ctrl-C 自动保存 .db 文件</li>
+</ul>
+</div>
+
+<div class="card mode-card localization">
+<span class="mode-tag">--localization / -l</span>
+<div class="card-title">🧭 定位模式</div>
+<div class="card-sub">载入已有 .db · 只导航不建图</div>
+<div class="mode-cmd">./go2.sh --localization ./maps/lab.db</div>
+<ul class="feat">
+<li>RTAB-Map LOCALIZATION 模式</li>
+<li>RViz "2D Pose Estimate" 设初始位姿</li>
+<li>ICP 在已存图上重定位 → map→odom TF</li>
+</ul>
+</div>
+
+<div class="card mode-card exploration">
+<span class="mode-tag">--explore / -e</span>
+<div class="card-title">🚀 探索模式</div>
+<div class="card-sub">完全自主 · 自动找 frontier 走过去</div>
+<div class="mode-cmd">./go2.sh --explore ./maps/lab.db</div>
+<ul class="feat">
+<li>Mapping + Nav2 + Frontier Explorer</li>
+<li>启动宽限期 + 目标超时看门狗</li>
+<li>地图全部探索完自动停止</li>
+</ul>
+</div>
+</div>
+</div></section>
+
+<!-- ============== ARCHITECTURE ============== -->
+<section id="architecture"><div class="container">
+<h2 class="section-title">整体架构 & 数据流</h2>
+<p class="section-lead">传感器 → 感知节点 → SLAM/定位 → 规划 → 执行。所有模式共用前两层与最后一层，只在中间的 SLAM/规划层差异化组合。</p>
+
+<div class="diagram">
+<div class="diagram-title">总体数据流（涵盖三种模式）</div>
+<div class="mermaid">
+graph LR
+    classDef hw fill:#fed7aa,stroke:#c2410c,color:#7c2d12,stroke-width:2px
+    classDef custom fill:#fef3c7,stroke:#d97706,color:#7c2d12,stroke-width:2px
+    classDef rtab fill:#fff7ed,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+    classDef nav2 fill:#ecfdf5,stroke:#059669,color:#064e3b,stroke-width:2px
+    classDef explore fill:#fff1f2,stroke:#e11d48,color:#881337,stroke-width:2px
+
+    L1["Livox L1<br/>4线雷达"]:::hw
+    GO2["GO2 driver"]:::hw
+
+    L1 --> CD["/utlidar/cloud_deskewed<br/>PointCloud2 odom系"]
+    GO2 --> RO["/utlidar/robot_odom<br/>nav_msgs/Odometry"]
+
+    CD --> CTS["cloud_to_scan.py<br/>点云→2D LaserScan"]:::custom
+    RO --> OTB["odom_tf_broadcaster.py<br/>odom→base_link TF"]:::custom
+
+    CTS --> SCAN["/scan"]
+    CD --> RTAB["rtabmap_slam<br/>SLAM / Localization"]:::rtab
+    RO --> RTAB
+    OTB -.tf.-> RTAB
+
+    RTAB --> MAP["/map<br/>OccupancyGrid"]
+    RTAB -.tf.-> MAPTF["map→odom"]
+
+    SCAN --> NAV2["Nav2 stack<br/>controller·planner·BT"]:::nav2
+    MAP --> NAV2
+    MAPTF -.tf.-> NAV2
+
+    MAP --> FE["frontier_explorer.py<br/>仅 --explore"]:::explore
+    FE -->|"NavigateToPose<br/>action"| NAV2
+
+    NAV2 --> CV["/cmd_vel"]
+    CV --> CVB["cmd_vel_bridge.py<br/>Twist→Sport API"]:::custom
+    CVB --> SR["/api/sport/request"]
+    SR --> GO2
+</div>
+<div class="legend">
+<div class="legend-item"><span class="legend-swatch" style="background:#fed7aa"></span>硬件 / 驱动</div>
+<div class="legend-item"><span class="legend-swatch" style="background:#fef3c7"></span>项目自定义节点</div>
+<div class="legend-item"><span class="legend-swatch" style="background:#fff7ed"></span>RTAB-Map</div>
+<div class="legend-item"><span class="legend-swatch" style="background:#ecfdf5"></span>Nav2</div>
+<div class="legend-item"><span class="legend-swatch" style="background:#fff1f2"></span>探索器</div>
+</div>
+</div>
+
+<h3>TF 树</h3>
+<p>Unitree 驱动负责 <span class="frame">base_link → utlidar_lidar</span>（含倾角与外参）；项目层补齐 <span class="frame">odom → base_link</span>；定位/SLAM 时由 RTAB-Map 发 <span class="frame">map → odom</span>。</p>
+
+<div class="diagram"><div class="mermaid">
+graph TB
+    classDef map fill:#fef3c7,stroke:#d97706,color:#7c2d12,stroke-width:2px
+    classDef odom fill:#fff7ed,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+    classDef base fill:#ffedd5,stroke:#c2410c,color:#7c2d12,stroke-width:2px
+    classDef sensor fill:#fed7aa,stroke:#9a3412,color:#431407,stroke-width:2px
+
+    M["map"]:::map
+    O["odom"]:::odom
+    B["base_link"]:::base
+    L["utlidar_lidar"]:::sensor
+
+    M -->|"rtabmap (定位/SLAM 发布)"| O
+    O -->|"odom_tf_broadcaster.py"| B
+    B -->|"Unitree GO2 driver"| L
+</div></div>
+
+</div></section>
+
+<!-- ============== MAPPING ============== -->
+<section id="mapping"><div class="container">
+<h2 class="section-title">建图模式 (--new / -m)</h2>
+<p class="section-lead">启动 RTAB-Map 增量 SLAM。机器狗每走一段就把当前 3D 点云作为关键帧入图，形成位姿图（pose graph）。回环 / proximity-by-space 触发图优化（GTSAM/g2o），地图通过 <span class="topic">/map</span> 实时反馈给 Nav2。</p>
+
+<div class="grid-2">
+<div class="card">
+<div class="card-title">🧠 SLAM 核心</div>
+<p>RTAB-Map 节点订阅 <span class="topic">/utlidar/cloud_deskewed</span>（运动补偿后的 3D 点云）和 <span class="topic">/utlidar/robot_odom</span>。</p>
+<ul class="feat">
+<li><code>Mem/IncrementalMemory: true</code> 持续添加新节点</li>
+<li><code>Reg/Strategy: 1</code> ICP（无视觉，纯激光）</li>
+<li><code>Reg/Force3DoF: true</code> 平面运动假设</li>
+<li><code>RGBD/LinearUpdate: 0.05m</code> 5cm 触发新关键帧</li>
+<li><code>RGBD/AngularUpdate: 0.05 rad</code> ≈3° 触发新关键帧</li>
+<li><code>Rtabmap/DetectionRate: 3 Hz</code> 节流控制 CPU</li>
+<li><code>Rtabmap/CreateIntermediateNodes: true</code> 路径稠密化但不进图谱</li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">🔬 ICP 与栅格</div>
+<p>L1 是 4 线<strong>稀疏</strong> lidar，点法线估计极易出错。本项目<strong>禁用法线分割</strong>，全部用纯高度分类地面/障碍。</p>
+<ul class="feat">
+<li><code>Icp/PointToPlane: true</code></li>
+<li><code>Icp/VoxelSize: 0.10 m</code></li>
+<li><code>Icp/MaxCorrespondenceDistance: 0.20 m</code>（建图）</li>
+<li><code>Grid/NormalsSegmentation: false</code> 不依赖法线</li>
+<li><code>Grid/MaxGroundHeight: -0.15 m</code> 地面阈值</li>
+<li><code>Grid/MaxObstacleHeight: 1.0 m</code> 忽略天花板</li>
+<li><code>Grid/CellSize: 0.10 m</code></li>
+</ul>
+</div>
+</div>
+
+<h3>占用栅格的"黏性"（Sticky obstacles）</h3>
+<p>为了防止机器狗原地小转一圈就把已观测到的墙"擦掉"，配置不对称对数概率更新：</p>
+<div class="grid-2">
+<div class="card" style="background:var(--a50)">
+<div class="card-title" style="color:var(--a600)">🟢 命中</div>
+<p><code>GridGlobal/ProbHit: 0.85</code> → log-odds <strong>+1.73</strong> 每次（很快累积成饱和）</p>
+</div>
+<div class="card" style="background:var(--r50)">
+<div class="card-title" style="color:var(--r600)">🔴 未命中</div>
+<p><code>GridGlobal/ProbMiss: 0.45</code> → log-odds <strong>−0.20</strong> 每次（缓慢）</p>
+<p style="font-size:.85em;color:var(--s500)">需要约 15 次连续 miss 才能清除一个饱和障碍 ≈ 5s @ 3Hz。真实可移动物体仍能清除，但短促回头不会。</p>
+</div>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">建图模式时序流</div>
+<div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant L as Livox L1
+    participant DR as GO2 driver
+    participant CTS as cloud_to_scan
+    participant OTB as odom_tf
+    participant RT as rtabmap
+    participant N as Nav2
+    participant CV as cmd_vel_bridge
+    participant DOG as Sport API
+
+    L->>DR: 4线点云
+    DR->>RT: /utlidar/cloud_deskewed
+    DR->>OTB: /utlidar/robot_odom
+    DR->>CTS: /utlidar/cloud_deskewed
+    OTB->>RT: TF odom→base_link
+    OTB->>N: TF
+    CTS->>N: /scan (LaserScan in base_link)
+    RT->>N: /map (OccupancyGrid)
+    RT->>N: TF map→odom
+    Note over N: BT navigator + planner + controller<br/>(用户在 RViz 给 2D Goal Pose)
+    N->>CV: /cmd_vel (Twist)
+    CV->>DOG: /api/sport/request (api_id=1008 Move)
+</div>
+</div>
+</div></section>
+
+<!-- ============== LOCALIZATION ============== -->
+<section id="localization"><div class="container">
+<h2 class="section-title">定位模式 (--localization / -l)</h2>
+<p class="section-lead">载入之前 SLAM 出来的 .db 文件，进入<strong>只读重定位模式</strong>。RTAB-Map 把数据库中所有节点加载进 Working Memory，对当前激光帧用 ICP 匹配存档点云，匹配上之后发布 <span class="frame">map → odom</span> TF，让 Nav2 知道机器狗在世界中的真实位置。</p>
+
+<div class="grid-2">
+<div class="card">
+<div class="card-title">🔓 与建图模式的关键差异</div>
+<ul class="feat">
+<li><code>Mem/IncrementalMemory: <strong>false</strong></code> 不再添加节点</li>
+<li><code>Mem/InitWMWithAllNodes: true</code> 全图加载到 WM</li>
+<li><code>Icp/MaxCorrespondenceDistance: <strong>1.0 m</strong></code><br>（vs 建图的 0.2m，更宽容，因为初次重定位位姿误差可能很大）</li>
+<li><code>Icp/Iterations: 30</code>（vs 建图 20）</li>
+<li><code>RGBD/ProximityMaxGraphDepth: 0</code> 全图搜索 proximity 闭环</li>
+<li><code>RGBD/StartAtOrigin: false</code> 用上次保存的位姿做猜测</li>
+<li>启动时<strong>不</strong>加 <code>--delete_db_on_start</code></li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">📍 初始位姿与重定位状态</div>
+<p>启动后看 RTAB-Map 日志：</p>
+<ul class="feat">
+<li><code>local map = 0</code> → 还没重定位成功</li>
+<li><code>local map = N (N&gt;0)</code> → ✅ 重定位完成</li>
+</ul>
+<p>未重定位时 Nav2 会报 <em>"Robot is out of bounds of the costmap!"</em>。</p>
+<p>触发重定位：</p>
+<ol style="color:var(--ink-s)">
+<li>RViz 工具栏 <kbd>2D Pose Estimate</kbd> 在地图上点+拖</li>
+<li>命令行发 <span class="topic">/initialpose</span></li>
+<li>把机器狗物理摆回上次建图的起点</li>
+</ol>
+</div>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">定位模式数据流</div>
+<div class="mermaid">
+graph LR
+    classDef hw fill:#fed7aa,stroke:#c2410c,color:#7c2d12,stroke-width:2px
+    classDef custom fill:#fef3c7,stroke:#d97706,color:#7c2d12,stroke-width:2px
+    classDef rtab fill:#fff7ed,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+    classDef nav2 fill:#ecfdf5,stroke:#059669,color:#064e3b,stroke-width:2px
+    classDef ui fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a,stroke-width:2px
+    classDef db fill:#f3e8ff,stroke:#7e22ce,color:#581c87,stroke-width:2px
+
+    DB[("lab.db<br/>SQLite 图")]:::db
+    GO2["GO2 driver"]:::hw
+    RVIZ["RViz<br/>2D Pose Estimate"]:::ui
+
+    DB -->|启动加载| RT["rtabmap (LOCALIZATION)<br/>IncrementalMemory=false"]:::rtab
+    GO2 -->|/utlidar/cloud_deskewed| RT
+    GO2 -->|/utlidar/robot_odom| OTB["odom_tf_bcast"]:::custom
+    OTB -->|TF odom→base_link| RT
+    RVIZ -->|/initialpose| RT
+
+    RT -->|/map 静态| NAV2["Nav2"]:::nav2
+    RT -->|TF map→odom| NAV2
+    GO2 -->|cloud_deskewed| CTS["cloud_to_scan"]:::custom
+    CTS -->|/scan| NAV2
+    NAV2 -->|/cmd_vel| CVB["cmd_vel_bridge"]:::custom
+    CVB -->|Sport API| GO2
+</div>
+</div>
+</div></section>
+
+<!-- ============== EXPLORATION ============== -->
+<section id="exploration"><div class="container">
+<h2 class="section-title">探索模式 (--explore / -e)</h2>
+<p class="section-lead">在建图基础上叠加 <code>frontier_explorer.py</code>。它周期性扫描 <span class="topic">/map</span>，找出"已知 free 区域与未知区域的边界"（frontier），聚类后选择最优簇作为 Nav2 目标点。机器狗自动驶过去 → 雷达扫到新区域 → 地图扩张 → frontier 收缩 → 直到全部消失，探索结束。</p>
+
+<div class="grid-2">
+<div class="card">
+<div class="card-title">🔍 Frontier 检测算法</div>
+<ol style="color:var(--ink-s);padding-left:20px">
+<li>把 <span class="topic">/map</span> 转 numpy 数组：<code>0=free, -1=unknown, &gt;0=occupied</code></li>
+<li>frontier 像素 = <code>free</code> 且 4-邻域中至少有一个 <code>unknown</code></li>
+<li>对 frontier 像素做 8 连通区域标记（<code>scipy.ndimage.label</code>）</li>
+<li>过滤掉 size &lt; <code>min_frontier_size</code>（默认 10 cells）</li>
+<li>每个簇算质心 → 候选目标</li>
+</ol>
+</div>
+
+<div class="card">
+<div class="card-title">🏆 目标打分（贪心 + 距离惩罚）</div>
+<p style="font-family:monospace;background:var(--w50);padding:8px 12px;border-radius:6px;border:1px solid var(--w100);color:var(--w800)">
+score = size − α × dist_in_cells
+</p>
+<ul class="feat">
+<li><code>size</code> = 该簇 frontier 像素数（越多越优先）</li>
+<li><code>dist</code> = 机器狗到簇质心的欧氏距离（cell 单位）</li>
+<li><code>α = distance_weight = 0.5</code></li>
+<li>取最大 score 作为下一个目标</li>
+</ul>
+</div>
+</div>
+
+<h3>失败处理：黑名单 + 看门狗</h3>
+<div class="grid-2">
+<div class="card">
+<div class="card-title">🚫 失败黑名单</div>
+<p>Nav2 返回任何非 SUCCEEDED 状态时：</p>
+<ul class="feat">
+<li>把当前目标加入黑名单：<code>(x, y, expire_time)</code></li>
+<li>TTL 默认 <code>blacklist_ttl: 60s</code></li>
+<li>所有距离 &lt; <code>blacklist_radius: 0.5m</code> 的候选都被过滤</li>
+<li>连续失败 <code>max_consecutive_failures: 5</code> 次后停止探索</li>
+</ul>
+</div>
+
+<div class="card" style="background:var(--a50);border-color:var(--a500)">
+<div class="card-title" style="color:var(--a600)">⏱ 启动宽限期 + 目标超时</div>
+<p>针对 Nav2 BT navigator 在 Foxy + CycloneDDS 下偶发段错误：</p>
+<ul class="feat">
+<li><code>startup_grace_period: 8s</code> 等 Nav2 内部 action chain 完全就绪</li>
+<li><code>goal_timeout: 60s</code> 超时则 cancel + 黑名单 + 找新前沿</li>
+<li>避免 <code>result_future</code> 永远不回调时整个探索器死锁</li>
+</ul>
+</div>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">探索器主循环（每 3s tick 一次）</div>
+<div class="mermaid">
+flowchart TD
+    classDef start fill:#fff7ed,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+    classDef chk fill:#fef3c7,stroke:#d97706,color:#7c2d12
+    classDef act fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef bad fill:#fff1f2,stroke:#e11d48,color:#881337
+    classDef ok fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a
+
+    T["⏰ tick (replan_period=3s)"]:::start
+    T --> A{"已完成?"}:::chk
+    A -- 是 --> END1["DONE"]:::ok
+    A -- 否 --> B{"启动宽限期内?<br/>&lt;8s"}:::chk
+    B -- 是 --> WARM["WARMING UP"]:::ok
+    B -- 否 --> C{"有 /map 吗?"}:::chk
+    C -- 否 --> WAIT["WAITING for /map"]:::ok
+    C -- 是 --> D{"正在导航中?"}:::chk
+    D -- 是 --> E{"已超 60s?"}:::chk
+    E -- 是 --> TO["⚠ TIMEOUT<br/>cancel+blacklist"]:::bad
+    E -- 否 --> NAV["NAVIGATING"]:::ok
+    D -- 否 --> F["扫描 /map<br/>检测 frontier 簇"]:::act
+    F --> G{"有候选簇?"}:::chk
+    G -- 否 --> END2["✅ 探索完成"]:::ok
+    G -- 是 --> H["过滤黑名单<br/>计算 score 选最优"]:::act
+    H --> I["发布 /frontiers viz<br/>绿色箭头=目标"]:::act
+    I --> J["NavigateToPose<br/>send goal"]:::act
+    J --> K{"接受?"}:::chk
+    K -- 否 --> FAIL["黑名单 + failures+1"]:::bad
+    K -- 是 --> WAIT2["等待 result"]:::ok
+</div>
+</div>
+
+<div class="callout">
+<strong>RViz 状态文本：</strong> 探索器在 <span class="topic">/frontiers</span> 上发 MarkerArray，含青色簇球（大小=size）、绿色目标箭头、红色黑名单点，以及 TEXT 心跳：
+<code>WARMING UP (Xs)</code> → <code>NAVIGATING (Xs)</code> → <code>TIMEOUT (recovering)</code> → <code>DONE</code>
+</div>
+
+</div></section>
+
+<!-- ============== NODES ============== -->
+<section id="nodes"><div class="container">
+<h2 class="section-title">自定义节点详解</h2>
+<p class="section-lead">项目共写了 4 个 Python 节点，每个解决一个具体的桥接/转换问题。代码都在 <code>src/go2_nav/scripts/</code>。</p>
+
+<div class="grid-2">
+<div class="card">
+<div class="card-title">📡 cloud_to_scan.py</div>
+<div class="card-sub">PointCloud2 → LaserScan，Nav2 障碍层用</div>
+<p><strong>核心问题：</strong>Livox L1 输出的 <span class="topic">/utlidar/cloud_deskewed</span> 在 <span class="frame">odom</span> 系，但 Nav2 obstacle layer 期望 <span class="frame">base_link</span> 系的 LaserScan。</p>
+<p><strong>实现：</strong></p>
+<ul class="feat">
+<li>numpy 向量化解析 PointCloud2（避免 sensor_msgs_py 慢）</li>
+<li>tf2 查 <code>odom→base_link</code>（用 <code>Time(0)</code> 取最新）</li>
+<li>四元数 → 旋转矩阵自己算（避免 tf2_geometry_msgs 依赖）</li>
+<li>高度切片：<code>z ∈ [-0.20, +0.30]</code> 在 base_link 系下抓墙不抓地面</li>
+<li>极坐标 binning：每个角度槽取最小距离</li>
+<li>QoS：sub=BEST_EFFORT（匹配 GO2 发布器），pub=RELIABLE（Nav2 默认）</li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">📍 odom_tf_broadcaster.py</div>
+<div class="card-sub">/utlidar/robot_odom → TF odom→base_link</div>
+<p><strong>核心问题：</strong>GO2 内置驱动也发 TF，但 DDS QoS 配置偶尔与 ROS 2 端不匹配，导致 TF 缺失。</p>
+<p><strong>实现：</strong>极简，订阅 Odometry → 转 TransformStamped → broadcast。仅此而已。这是冗余路径，确保 TF 一定有。</p>
+</div>
+
+<div class="card">
+<div class="card-title">🐕 cmd_vel_bridge.py</div>
+<div class="card-sub">geometry_msgs/Twist → unitree_api/Request</div>
+<p><strong>核心问题：</strong>Nav2 输出 <span class="topic">/cmd_vel</span>（Twist），GO2 需要 Sport API（JSON 包裹的 Request 消息，<code>api_id=1008</code> Move）。</p>
+<p><strong>实现：</strong></p>
+<ul class="feat">
+<li>速度限幅：<code>max_vx=0.4</code>, <code>max_vy=0.2</code>, <code>max_vyaw=0.8</code></li>
+<li>JSON 序列化为 <code>{"x":vx,"y":vy,"z":vyaw}</code></li>
+<li>cmd_timeout=0.5s 超时自动发零速（防失控）</li>
+<li>每收到 Twist 立即 publish + 0.1s 定时器兜底超时</li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">🚀 frontier_explorer.py</div>
+<div class="card-sub">自主探索：找前沿 + 发 NavigateToPose 目标</div>
+<p><strong>核心问题：</strong>纯自主建图，机器狗自己决定下一步去哪。</p>
+<p><strong>实现：</strong></p>
+<ul class="feat">
+<li>3s 周期 tick，订阅 /map（QoS=TRANSIENT_LOCAL）</li>
+<li>numpy + scipy.ndimage 做 frontier 检测和 8 连通标记</li>
+<li>score = size − α·dist 选最优簇</li>
+<li>Nav2 NavigateToPose action client 异步发送</li>
+<li>失败黑名单（半径过滤 + TTL 过期）</li>
+<li>启动宽限期 + 目标超时看门狗（防 BT navigator 崩死）</li>
+<li>RViz MarkerArray 可视化：簇球 + 目标箭头 + 黑名单 X + 状态文本</li>
+</ul>
+</div>
+</div>
+</div></section>
+
+<!-- ============== STACK ============== -->
+<section id="stack"><div class="container">
+<h2 class="section-title">技术栈 & 依赖</h2>
+<p class="section-lead">所有依赖都来自 ROS 2 Foxy 官方仓库 + 项目自建的两个 workspace（cyclonedds_ws, unitree_msgs_ws），无私有 fork。</p>
+
+<div class="grid-3">
+<div class="card">
+<div class="card-title">🤖 ROS 2 中间件</div>
+<ul class="feat">
+<li><code>ros2 foxy</code> 基础 client / launch / lifecycle</li>
+<li><code>rmw_cyclonedds_cpp</code> 必须！GO2 驱动用的就是 CycloneDDS</li>
+<li><code>cyclonedds.xml</code> 自定义 IP 配置</li>
+<li><code>tf2_ros</code> · <code>geometry_msgs</code> · <code>nav_msgs</code> · <code>sensor_msgs</code></li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">🗺 SLAM</div>
+<ul class="feat">
+<li><code>rtabmap_slam</code> 主节点 (rtabmap)</li>
+<li><code>rtabmap_msgs</code></li>
+<li>底层：ICP（点对面）、g2o/GTSAM 图优化、SQLite 存储</li>
+<li>Loop closure：proximity-by-space（无 BoW 视觉特征）</li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">🧭 导航</div>
+<ul class="feat">
+<li><code>nav2_controller</code> · DWB local planner</li>
+<li><code>nav2_planner</code> · NavFn / Smac global planner</li>
+<li><code>nav2_recoveries</code> · BackUp / Spin / Wait</li>
+<li><code>nav2_bt_navigator</code> · 行为树驱动</li>
+<li><code>nav2_lifecycle_manager</code> · 自动激活 4 个节点</li>
+<li>Costmap 2D：global + local，obstacle + inflation 层</li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">🐕 Unitree</div>
+<ul class="feat">
+<li><code>unitree_api</code> Request/Response JSON-over-DDS</li>
+<li><code>unitree_go</code> SportModeState 等</li>
+<li>Sport API id 1008 = Move(vx, vy, vyaw)</li>
+<li>来自 <code>~/unitree_msgs_ws</code> 单独编译</li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">🐍 Python 库</div>
+<ul class="feat">
+<li><code>rclpy</code> ROS 2 Python 客户端</li>
+<li><code>numpy</code> 向量化点云/栅格运算</li>
+<li><code>scipy.ndimage</code> 8-连通标记（带 BFS fallback）</li>
+<li><code>tf2_ros</code> Buffer / Listener / Broadcaster</li>
+<li>纯标准库：<code>math</code> · <code>json</code> · <code>time</code></li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">🛠 构建与启动</div>
+<ul class="feat">
+<li><code>colcon</code> + <code>ament_cmake</code> 构建</li>
+<li>Launch 文件链路：<code>go2.sh</code> → <code>go2_*.launch.py</code> → 子 launch</li>
+<li>scripts/env.sh 统一 source ROS / cyclone / unitree / overlay</li>
+<li>CUDA 11.4（保留以防 RTAB-Map 链了 cuda 库）</li>
+</ul>
+</div>
+</div>
+</div></section>
+
+<!-- ============== TREE ============== -->
+<section id="tree"><div class="container">
+<h2 class="section-title">文件结构</h2>
+<p class="section-lead">单包 <code>go2_nav</code>，按 <em>launch / config / scripts</em> 三段式组织。</p>
+
+<div class="tree">
+<span class="dir">GO2_RTABMAP/</span>
+<br>├── <span class="sh">go2.sh</span>                         <span class="com"># 入口脚本：--new / --localization / --explore</span>
+<br>├── <span class="dir">scripts/</span>
+<br>│   └── <span class="sh">env.sh</span>                     <span class="com"># 统一环境 source（CycloneDDS, Unitree msgs, overlay）</span>
+<br>├── <span class="dir">maps/</span>                          <span class="com"># RTAB-Map 数据库 .db 文件</span>
+<br>├── <span class="dir">src/</span>
+<br>│   └── <span class="dir">go2_nav/</span>
+<br>│       ├── <span class="file">CMakeLists.txt</span>
+<br>│       ├── <span class="file">package.xml</span>
+<br>│       ├── <span class="dir">launch/</span>
+<br>│       │   ├── <span class="py">go2_mapping.launch.py</span>          <span class="com"># --new 入口</span>
+<br>│       │   ├── <span class="py">go2_navigation.launch.py</span>       <span class="com"># --localization 入口</span>
+<br>│       │   ├── <span class="py">go2_exploration.launch.py</span>      <span class="com"># --explore 入口</span>
+<br>│       │   ├── <span class="py">rtabmap_mapping.launch.py</span>      <span class="com"># RTAB-Map SLAM 模式</span>
+<br>│       │   ├── <span class="py">rtabmap_localization.launch.py</span> <span class="com"># RTAB-Map 定位模式</span>
+<br>│       │   └── <span class="py">nav2.launch.py</span>                 <span class="com"># Nav2 stack（4节点+lifecycle）</span>
+<br>│       ├── <span class="dir">config/</span>
+<br>│       │   └── <span class="yaml">nav2_params.yaml</span>             <span class="com"># costmap / DWB / BT / inflation 等</span>
+<br>│       └── <span class="dir">scripts/</span>
+<br>│           ├── <span class="py">cloud_to_scan.py</span>            <span class="com"># PointCloud2 → LaserScan</span>
+<br>│           ├── <span class="py">odom_tf_broadcaster.py</span>      <span class="com"># Odom → TF odom→base_link</span>
+<br>│           ├── <span class="py">cmd_vel_bridge.py</span>           <span class="com"># Twist → Sport API Move(1008)</span>
+<br>│           └── <span class="py">frontier_explorer.py</span>        <span class="com"># 自主探索器</span>
+<br>├── <span class="dir">install/</span>                       <span class="com"># colcon build 输出</span>
+<br>└── <span class="dir">log/</span>
+</div>
+</div></section>
+
+<!-- ============== TUNING ============== -->
+<section id="tuning"><div class="container">
+<h2 class="section-title">关键调参速查</h2>
+<p class="section-lead">下面这些参数都是项目针对 GO2 + Livox L1 + Foxy 实测调出来的，改之前先理解原因。</p>
+
+<h3>RTAB-Map（建图 vs 定位差异）</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>参数</th><th>建图模式</th><th>定位模式</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><code>Mem/IncrementalMemory</code></td><td>true</td><td><strong>false</strong></td><td>是否新增节点</td></tr>
+<tr><td><code>--delete_db_on_start</code></td><td>✅</td><td>❌</td><td>是否清空 db</td></tr>
+<tr><td><code>Icp/MaxCorrespondenceDistance</code></td><td>0.20 m</td><td><strong>1.0 m</strong></td><td>初次重定位需更宽容</td></tr>
+<tr><td><code>Icp/Iterations</code></td><td>20</td><td>30</td><td>定位迭代更彻底</td></tr>
+<tr><td><code>RGBD/ProximityMaxGraphDepth</code></td><td>50</td><td><strong>0</strong></td><td>0=全图搜索 proximity</td></tr>
+<tr><td><code>RGBD/StartAtOrigin</code></td><td>false</td><td>false</td><td>用上次保存的位姿</td></tr>
+<tr><td><code>Rtabmap/LoopThr</code></td><td>默认</td><td>0.11</td><td>定位时降低阈值</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Frontier Explorer</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>参数</th><th>默认值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>replan_period</code></td><td>3.0 s</td><td>tick 周期</td></tr>
+<tr><td><code>min_frontier_size</code></td><td>10 cells</td><td>过小簇直接丢弃</td></tr>
+<tr><td><code>distance_weight</code> (α)</td><td>0.5</td><td>score 中距离的惩罚系数</td></tr>
+<tr><td><code>blacklist_radius</code></td><td>0.5 m</td><td>黑名单去重半径</td></tr>
+<tr><td><code>blacklist_ttl</code></td><td>60 s</td><td>黑名单条目过期时间</td></tr>
+<tr><td><code>max_consecutive_failures</code></td><td>5</td><td>连续失败上限 → 停止探索</td></tr>
+<tr><td><code>startup_grace_period</code></td><td>8 s</td><td>等 Nav2 完全就绪</td></tr>
+<tr><td><code>goal_timeout</code></td><td>60 s</td><td>单目标硬超时（防 Nav2 崩死锁）</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>cmd_vel 桥</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>参数</th><th>默认值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>max_vx</code></td><td>0.4 m/s</td><td>纵向速度限幅</td></tr>
+<tr><td><code>max_vy</code></td><td>0.2 m/s</td><td>侧向速度限幅（保守）</td></tr>
+<tr><td><code>max_vyaw</code></td><td>0.8 rad/s</td><td>角速度限幅</td></tr>
+<tr><td><code>cmd_timeout</code></td><td>0.5 s</td><td>无新指令则发零速</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>cloud_to_scan（高度切片）</h3>
+<div class="callout">
+<strong>关键：</strong>切片高度是在 <span class="frame">base_link</span> 系下的相对值。GO2 base_link 在身体中心（≈30cm 离地），所以地面 z ≈ −0.30。设 <code>min_height=-0.20</code>, <code>max_height=+0.30</code> 抓"膝盖到头顶"那段，避开地面、避开天花板。
+</div>
+
+<h3>启动顺序与故障恢复</h3>
+<div class="grid-2">
+<div class="card">
+<div class="card-title">⚠ 已知问题</div>
+<ul class="feat">
+<li>Foxy + CycloneDDS rmw 偶发 <code>bt_navigator</code> 段错误（serdata.cpp:308 invalid data size）</li>
+<li>Nav2 lifecycle 报 active ≠ bt_navigator 的内部 action chain 完全就绪</li>
+<li>RTAB-Map 数据库目录不存在会 SIGABRT 拖垮整个 launch</li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">✅ 缓解措施</div>
+<ul class="feat">
+<li><code>go2.sh</code> 启动前先 <code>pkill</code> 残留进程，<code>mkdir -p</code> db 目录</li>
+<li>探索器 <code>startup_grace_period: 8s</code></li>
+<li>探索器 <code>goal_timeout: 60s</code> + cancel + 黑名单</li>
+<li>失败计数到 5 整体退出，不死循环</li>
+</ul>
+</div>
+</div>
+
+</div></section>
+
+</main>
+
+<footer>
+<div class="container">
+🐕 GO2_RTABMAP · 一份给自己看的项目档案 ·
+生成于 <span class="mono">2026-05-24</span>
+</div>
+</footer>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'base',
+  themeVariables: {
+    primaryColor: '#ffedd5',
+    primaryTextColor: '#7c2d12',
+    primaryBorderColor: '#c2410c',
+    lineColor: '#9a3412',
+    secondaryColor: '#fef3c7',
+    tertiaryColor: '#fff7ed',
+    fontFamily: '-apple-system, "PingFang SC", sans-serif',
+    fontSize: '14px'
+  }
+});
+</script>
+</body>
+</html>

@@ -7,6 +7,8 @@ from typing import Dict, Any
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
 from drivers.entry import create_active_robot_assembly
@@ -203,6 +205,9 @@ def create_gateway_app(
     app.include_router(build_mcp_router(runtime, access_manager))
     app.include_router(build_event_router(runtime, access_manager))
     app.include_router(build_data_stream_router(runtime, access_manager))
+    static_dir = Path(__file__).resolve().parent / "http" / "static"
+    if static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
     return app
 
 

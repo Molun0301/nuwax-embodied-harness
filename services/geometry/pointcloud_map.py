@@ -467,3 +467,94 @@ def _parse_positive_int(value: Optional[str], *, default: int) -> int:
     except ValueError:
         parsed = default
     return max(0, parsed)
+
+
+import mmap
+import struct
+
+
+class CloudMapMmapReader:
+    """读取 Rust bridge 写入的累积地图双缓冲 mmap。"""
+
+    MAGIC = 0x4E55_5741_584D_4150  # "NUWAXMAP"
+    HEADER_SIZE = 64
+    SINGLE_BUFFER_SIZE = 16 * 1024 * 1024  # 16MB
+    HEADER_FMT = "<QIIIQQf"
+    HEADER_STRUCT_SIZE = struct.calcsize(HEADER_FMT)  # 40 bytes
+
+    def __init__(self, shm_path: str = "/tmp/nuwax_cloudmap.mmap"):
+        self._path = Path(shm_path)
+        self._mm: Optional[mmap.mmap] = None
+        self._fd = None
+
+    def is_available(self) -> bool:
+        if not self._path.exists():
+            return False
+        if self._mm is None:
+            try:
+                self._open()
+            except Exception:
+                return False
+        return self._mm is not None
+
+    def _open(self) -> None:
+        self._fd = open(self._path, "rb")
+        self._mm = mmap.mmap(self._fd.fileno(), 0, access=mmap.ACCESS_READ)
+
+    def close(self) -> None:
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
+        if self._fd is not None:
+            self._fd.close()
+            self._fd = None
+
+    def read_header(self) -> Optional[Tuple]:
+        if not self.is_available():
+            return None
+        assert self._mm is not None
+        raw = self._mm[0:self.HEADER_STRUCT_SIZE]
+        vals = struct.unpack(self.HEADER_FMT, raw)
+        if vals[0] != self.MAGIC:
+            return None
+        return vals
+
+    def read_stable(self, max_points: int = 60000) -> Optional[Tuple[int, int, bytes]]:
+        """读取非活跃 buffer 的点云数据。返回 (revision, point_count, xyz_bytes) 或 None。"""
+        header = self.read_header()
+        if header is None:
+            return None
+        _, _, active_buf, point_count, _, revision, _ = header
+        if revision == 0 or point_count == 0:
+            return None
+        if revision == 1:
+            stable_buf = 0
+        else:
+            stable_buf = 1 - active_buf
+        buf_offset = self.HEADER_SIZE + stable_buf * self.SINGLE_BUFFER_SIZE
+        assert self._mm is not None
+        if point_count > max_points:
+            stride = point_count // max_points
+            data = bytearray()
+            for i in range(0, point_count * 12, stride * 12):
+                if len(data) >= max_points * 12:
+                    break
+                off = buf_offset + i
+                data.extend(self._mm[off:off + 12])
+            actual_count = len(data) // 12
+            xyz_bytes = bytes(data)
+        else:
+            data_size = point_count * 12
+            xyz_bytes = bytes(self._mm[buf_offset:buf_offset + data_size])
+            actual_count = point_count
+        return (revision, actual_count, xyz_bytes)
+
+    def build_binary_frame(self, max_points: int = 60000) -> Optional[bytes]:
+        """构建 Wire Format binary 帧: revision(u32) + point_count(u32) + XYZ data。"""
+        result = self.read_stable(max_points)
+        if result is None:
+            return None
+        revision, point_count, xyz_bytes = result
+        import struct as _struct
+        header_bytes = _struct.pack("<II", revision & 0xFFFFFFFF, point_count)
+        return header_bytes + xyz_bytes

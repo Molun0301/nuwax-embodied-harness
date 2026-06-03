@@ -1,146 +1,88 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::MmapMut;
 use tracing::{info, error};
 
-const VOXEL_SIZE: f32 = 0.05;
+pub const VOXEL_SIZE: f32 = 0.05;
 
-// ─── 点云共享内存常量 ───
-const PC_SHM_MAGIC: u64 = 0x4E55_5741_5850_434C; // "NUWAXPCL"
-const PC_SHM_VERSION: u32 = 1;
-/// 头部布局 (32 bytes):
-///   0-7:   magic (u64 LE)
-///   8-11:  version (u32 LE)
-///   12-15: point_count (u32 LE)
-///   16-23: timestamp_ns (u64 LE)
-///   24-31: frame_id / sequence (u64 LE)
-const PC_HEADER_SIZE: usize = 32;
-/// 最大支持点数（1200 点 × 12 字节/点 = 14400 字节）
-const PC_MAX_POINTS: usize = 4096;
-const PC_MAX_DATA_SIZE: usize = PC_MAX_POINTS * 12; // float32 × 3
-const PC_SHM_BUFFER_SIZE: usize = PC_HEADER_SIZE + PC_MAX_DATA_SIZE;
+// ─── 累积地图双缓冲共享内存写入器 ───
 
-pub struct PointCloudProcessor {
-    max_distance: f32,
-    min_distance: f32,
+const CM_SHM_MAGIC: u64 = 0x4E55_5741_584D_4150; // "NUWAXMAP"
+const CM_SHM_VERSION: u32 = 1;
+const CM_HEADER_SIZE: usize = 64;
+const CM_SINGLE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB per buffer
+const CM_TOTAL_SIZE: usize = CM_HEADER_SIZE + CM_SINGLE_BUFFER_SIZE * 2;
+
+pub struct CloudMapShmWriter {
+    mmap: MmapMut,
+    revision: u64,
     voxel_size: f32,
 }
 
-impl PointCloudProcessor {
-    pub fn new(min_distance: f32, max_distance: f32, voxel_size: f32) -> Self {
-        Self { max_distance, min_distance, voxel_size }
-    }
-
-    pub fn default_go2() -> Self {
-        Self::new(0.15, 5.0, VOXEL_SIZE)
-    }
-
-    /// NaN 过滤 + 距离裁剪 + 体素降采样。
-    /// 输入：原始 PointCloud2 data (XYZI 格式, point_step=16)
-    /// 输出：过滤后的 data + 有效点数
-    pub fn process(&self, data: &[u8], point_step: u32) -> (Vec<u8>, u32) {
-        let ps = point_step as usize;
-        if ps < 12 || data.len() < ps {
-            return (Vec::new(), 0);
-        }
-        let point_count = data.len() / ps;
-
-        // Pass 1: NaN filter + distance clip
-        let mut valid_points: Vec<[f32; 3]> = Vec::with_capacity(point_count / 2);
-        for i in 0..point_count {
-            let offset = i * ps;
-            let x = f32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
-            let y = f32::from_le_bytes(data[offset+4..offset+8].try_into().unwrap());
-            let z = f32::from_le_bytes(data[offset+8..offset+12].try_into().unwrap());
-
-            if x.is_nan() || y.is_nan() || z.is_nan() {
-                continue;
-            }
-            let dist_sq = x * x + y * y + z * z;
-            let min_sq = self.min_distance * self.min_distance;
-            let max_sq = self.max_distance * self.max_distance;
-            if dist_sq < min_sq || dist_sq > max_sq {
-                continue;
-            }
-            valid_points.push([x, y, z]);
-        }
-
-        // Pass 2: voxel downsample using hash grid
-        let downsampled = voxel_downsample(&valid_points, self.voxel_size);
-
-        // Serialize to PointCloud2 XYZ format (point_step=12)
-        let out_step = 12u32;
-        let mut output = Vec::with_capacity(downsampled.len() * out_step as usize);
-        for p in &downsampled {
-            output.extend_from_slice(&p[0].to_le_bytes());
-            output.extend_from_slice(&p[1].to_le_bytes());
-            output.extend_from_slice(&p[2].to_le_bytes());
-        }
-
-        (output, downsampled.len() as u32)
-    }
-}
-
-// ─── 点云共享内存写入器 ───
-
-pub struct PointCloudShmWriter {
-    mmap: MmapMut,
-    sequence: AtomicU64,
-}
-
-impl PointCloudShmWriter {
-    /// 创建点云共享内存写入器，路径默认 /tmp/nuwax_pointcloud.shm
+impl CloudMapShmWriter {
     pub fn new(shm_path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true).write(true).create(true).truncate(true)
             .open(shm_path)?;
-        file.set_len(PC_SHM_BUFFER_SIZE as u64)?;
+        file.set_len(CM_TOTAL_SIZE as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        // 写入 magic 和 version
-        mmap[0..8].copy_from_slice(&PC_SHM_MAGIC.to_le_bytes());
-        mmap[8..12].copy_from_slice(&PC_SHM_VERSION.to_le_bytes());
-        info!("点云共享内存已创建: {:?} ({} bytes)", shm_path, PC_SHM_BUFFER_SIZE);
-        Ok(Self { mmap, sequence: AtomicU64::new(0) })
+        mmap[0..8].copy_from_slice(&CM_SHM_MAGIC.to_le_bytes());
+        mmap[8..12].copy_from_slice(&CM_SHM_VERSION.to_le_bytes());
+        mmap[12..CM_HEADER_SIZE].fill(0);
+        info!("累积地图双缓冲 mmap 已创建: {:?} ({} bytes)", shm_path, CM_TOTAL_SIZE);
+        Ok(Self { mmap, revision: 0, voxel_size: VOXEL_SIZE })
     }
 
-    /// 将处理后的点云写入共享内存。
-    /// data: 连续 float32 XYZ 布局 (point_step=12)
-    /// point_count: 有效点数
-    pub fn write_frame(&mut self, data: &[u8], point_count: u32) {
-        let n = point_count as usize;
-        if n == 0 || n > PC_MAX_POINTS {
-            return;
+    pub fn write_cloud_map(&mut self, data: &[u8], point_step: u32) -> Option<(u64, u32, f32)> {
+        let ps = point_step as usize;
+        if ps < 12 || data.is_empty() { return None; }
+        let raw_count = data.len() / ps;
+        let mut points: Vec<[f32; 3]> = Vec::with_capacity(raw_count);
+        for i in 0..raw_count {
+            let off = i * ps;
+            if off + 12 > data.len() { break; }
+            let x = f32::from_le_bytes(data[off..off+4].try_into().unwrap());
+            let y = f32::from_le_bytes(data[off+4..off+8].try_into().unwrap());
+            let z = f32::from_le_bytes(data[off+8..off+12].try_into().unwrap());
+            if x.is_nan() || y.is_nan() || z.is_nan() { continue; }
+            points.push([x, y, z]);
         }
-        let data_size = n * 12;
-        if data.len() < data_size {
-            return;
+        if points.is_empty() { return None; }
+        let mut vs = self.voxel_size;
+        let downsampled = loop {
+            let ds = voxel_downsample(&points, vs);
+            let byte_size = ds.len() * 12;
+            if byte_size <= CM_SINGLE_BUFFER_SIZE || vs > 2.0 { break ds; }
+            vs *= 2.0;
+        };
+        self.voxel_size = vs;
+        let point_count = downsampled.len() as u32;
+        let data_size = downsampled.len() * 12;
+        self.revision += 1;
+        let rev = self.revision;
+        let active_buf = ((rev - 1) % 2) as usize;
+        let buf_offset = CM_HEADER_SIZE + active_buf * CM_SINGLE_BUFFER_SIZE;
+        for (i, p) in downsampled.iter().enumerate() {
+            let off = buf_offset + i * 12;
+            self.mmap[off..off+4].copy_from_slice(&p[0].to_le_bytes());
+            self.mmap[off+4..off+8].copy_from_slice(&p[1].to_le_bytes());
+            self.mmap[off+8..off+12].copy_from_slice(&p[2].to_le_bytes());
         }
-
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-
-        // 先写数据区
-        self.mmap[PC_HEADER_SIZE..PC_HEADER_SIZE + data_size]
-            .copy_from_slice(&data[..data_size]);
-
-        // 再写头部（sequence 最后写，作为 release fence）
-        self.mmap[8..12].copy_from_slice(&PC_SHM_VERSION.to_le_bytes());
-        self.mmap[12..16].copy_from_slice(&point_count.to_le_bytes());
-        self.mmap[16..24].copy_from_slice(&now_ns.to_le_bytes());
-        // sequence 最后写入，读端以此判断数据完整性
-        self.mmap[24..32].copy_from_slice(&seq.to_le_bytes());
-
-        if let Err(e) = self.mmap.flush_range(0, PC_HEADER_SIZE + data_size) {
-            error!("点云共享内存 flush 失败: {}", e);
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        self.mmap[12..16].copy_from_slice(&(active_buf as u32).to_le_bytes());
+        self.mmap[16..20].copy_from_slice(&point_count.to_le_bytes());
+        self.mmap[20..28].copy_from_slice(&now_ns.to_le_bytes());
+        self.mmap[36..40].copy_from_slice(&vs.to_le_bytes());
+        self.mmap[28..36].copy_from_slice(&rev.to_le_bytes());
+        if let Err(e) = self.mmap.flush_range(0, buf_offset + data_size) {
+            error!("累积地图 mmap flush 失败: {}", e);
         }
+        Some((rev, point_count, vs))
     }
 }
 
-fn voxel_downsample(points: &[[f32; 3]], voxel_size: f32) -> Vec<[f32; 3]> {
+pub fn voxel_downsample(points: &[[f32; 3]], voxel_size: f32) -> Vec<[f32; 3]> {
     if points.is_empty() || voxel_size <= 0.0 {
         return points.to_vec();
     }

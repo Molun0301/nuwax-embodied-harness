@@ -571,9 +571,11 @@ def _render_debug_page(access_token: str) -> str:
                 <span id="mapZoomValue" class="map-chip">100%</span>
                 <button id="mapZoomIn" class="map-control" type="button">+</button>
                 <button id="mapZoomReset" class="map-control" type="button">reset</button>
+                <button id="mapModeToggle" class="map-control" type="button" style="font-size:11px;padding:2px 8px;">3D</button>
               </div>
               <span id="mapStreamStatus" class="map-chip map-stream-chip">等待地图首帧</span>
               <canvas id="mapCanvas" width="1180" height="680"></canvas>
+              <div id="map3dContainer" style="width:100%;height:100%;min-height:480px;position:absolute;inset:0;display:none;"></div>
             </div>
             <div class="legend">
               <span class="legend-item"><span class="swatch" style="background: var(--unknown)"></span>未知</span>
@@ -2609,6 +2611,10 @@ def _render_debug_page(access_token: str) -> str:
           }
         });
         socket.addEventListener("message", (event) => {
+          if (event.data instanceof ArrayBuffer) {
+            if (window._pointcloud3dOnBinaryFrame) window._pointcloud3dOnBinaryFrame(event.data);
+            return;
+          }
           const message = JSON.parse(event.data);
           if (message.type === "keepalive") {
             setText(els.connectionText, "streaming");
@@ -2903,8 +2909,19 @@ def _render_debug_page(access_token: str) -> str:
         renderLogs();
       });
       connectStreams();
+      document.getElementById(mapModeToggle).addEventListener(click, () => {
+        const c = document.getElementById(mapCanvas);
+        const d = document.getElementById(map3dContainer);
+        const btn = document.getElementById(mapModeToggle);
+        const is3d = d.style.display !== none;
+        c.style.display = is3d ?  : none;
+        d.style.display = is3d ? none : ;
+        btn.textContent = is3d ? 3D : 2D;
+        if (!is3d && window._pointcloud3dInit) window._pointcloud3dInit(d);
+      });
     })();
   </script>
+  <script type=module src=/static/js/pointcloud3d.js></script>
 </body>
 </html>"""
     return html.replace("__DEBUG_ACCESS_TOKEN__", debug_access_token)

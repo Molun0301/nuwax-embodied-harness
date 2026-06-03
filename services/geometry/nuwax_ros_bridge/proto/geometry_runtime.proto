@@ -54,58 +54,7 @@ message MapUpdateNotification {
 }
 message OccupancyGridData {
   OccupancyGridMeta meta = 1;
-  bytes data = 2;  // 栅格数据（每字节一个cell，-1=unknown, 0=free, 100=occupied）
-}
-
-// === 导航 ===
-message NavigationGoal {
-  Pose target_pose = 1;
-  string behavior_tree = 2;
-}
-message NavigationAck {
-  bool accepted = 1;
-  string goal_id = 2;
-  string message = 3;
-}
-message CancelResult { bool success = 1; string message = 2; }
-message NavigationStateUpdate {
-  string status = 1;
-  string message = 2;
-  Pose current_pose = 3;
-  float distance_remaining = 4;
-  string goal_id = 5;
-  uint64 timestamp_ns = 6;
-}
-message Nav2Readiness {
-  bool ready = 1;
-  string waiting_for = 2;
-  string message = 3;
-  bool action_server_ready = 4;
-  bool tf_ready = 5;
-  map<string, string> lifecycle_states = 6;
-  map<string, string> errors = 7;
-}
-
-// === 探索 ===
-message Frontier {
-  Vec3 centroid = 1;
-  uint32 size = 2;
-  float cost = 3;
-}
-message FrontierList { repeated Frontier frontiers = 1; uint64 timestamp_ns = 2; }
-message FrontierUpdate { FrontierList frontiers = 1; uint64 sequence = 2; }
-
-// === 输入桥 ===
-message OdomInput {
-  Pose pose = 1;
-  Vec3 linear_velocity = 2;
-  Vec3 angular_velocity = 3;
-}
-message PointCloudShmRef {
-  ShmRef shm_ref = 1;
-  string frame_id = 2;
-  uint32 point_count = 3;
-  uint32 point_step = 4;
+  bytes data = 2;
 }
 
 // === 视频帧共享内存 ===
@@ -128,6 +77,13 @@ message HealthCheckResponse {
   uint32 video_fps_estimate = 6;
 }
 
+// === 累积地图共享内存引用 ===
+message CloudMapShmRef {
+  ShmRef shm_ref = 1;
+  uint32 point_count = 2;
+  float voxel_size = 3;
+}
+
 // === 服务定义 ===
 service GeometryRuntime {
   // 控制面
@@ -146,18 +102,5 @@ service GeometryRuntime {
   rpc GetOccupancyGridData(Empty) returns (OccupancyGridData);
   rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
   rpc GetOccupancyGridShm(Empty) returns (ShmRef);
-
-  // 导航
-  rpc SetNavigationGoal(NavigationGoal) returns (NavigationAck);
-  rpc CancelNavigation(Empty) returns (CancelResult);
-  rpc SubscribeNavigationState(Empty) returns (stream NavigationStateUpdate);
-  rpc GetNavigationReadiness(Empty) returns (Nav2Readiness);
-
-  // 探索
-  rpc GetFrontiers(Empty) returns (FrontierList);
-  rpc SubscribeFrontiers(Empty) returns (stream FrontierUpdate);
-
-  // 输入桥（网关 → ROS）
-  rpc PublishOdom(OdomInput) returns (Empty);
-  rpc PublishPointCloud(PointCloudShmRef) returns (Empty);
+  rpc SubscribeCloudMapUpdates(Empty) returns (stream CloudMapShmRef);
 }

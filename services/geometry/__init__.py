@@ -20,6 +20,7 @@ from services.geometry.config import (
 )
 from services.geometry.runtime import PlatformGeometryRuntime
 from services.geometry.pointcloud_map import (
+    CloudMapMmapReader,
     PointCloudMap,
     PointCloudMapCache,
     PointCloudMapError,
@@ -39,6 +40,7 @@ __all__ = [
     "Nav2Config",
     "PlatformGeometryConfig",
     "PlatformGeometryRuntime",
+    "CloudMapMmapReader",
     "PointCloudMap",
     "PointCloudMapCache",
     "PointCloudMapError",

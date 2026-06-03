@@ -171,96 +171,26 @@ impl GeometryRuntime for GeometryRuntimeService {
         Err(Status::unimplemented("Phase 2d shm 实现"))
     }
 
-    async fn set_navigation_goal(&self, req: Request<NavigationGoal>) -> Result<Response<NavigationAck>, Status> {
-        let goal = req.into_inner();
-        let pose = goal.target_pose.unwrap_or_default();
-        let pos = pose.position.unwrap_or_default();
-        let ori = pose.orientation.unwrap_or_default();
-        match self.bridge.send_nav_goal(pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w).await {
-            Ok(goal_id) => Ok(Response::new(NavigationAck {
-                accepted: true, goal_id, message: "目标已接受".into(),
-            })),
-            Err(e) => Ok(Response::new(NavigationAck {
-                accepted: false, goal_id: String::new(), message: e,
-            })),
-        }
-    }
-
-    async fn cancel_navigation(&self, _req: Request<Empty>) -> Result<Response<CancelResult>, Status> {
-        match self.bridge.cancel_nav().await {
-            Ok(()) => Ok(Response::new(CancelResult { success: true, message: "已取消".into() })),
-            Err(e) => Ok(Response::new(CancelResult { success: false, message: e })),
-        }
-    }
-
-    type SubscribeNavigationStateStream = tokio_stream::wrappers::ReceiverStream<Result<NavigationStateUpdate, Status>>;
-    async fn subscribe_navigation_state(&self, _req: Request<Empty>) -> Result<Response<Self::SubscribeNavigationStateStream>, Status> {
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let state = self.bridge.state.clone();
+    type SubscribeCloudMapUpdatesStream = tokio_stream::wrappers::ReceiverStream<Result<CloudMapShmRef, Status>>;
+    async fn subscribe_cloud_map_updates(&self, _req: Request<Empty>) -> Result<Response<Self::SubscribeCloudMapUpdatesStream>, Status> {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut broadcast_rx = self.bridge.cloud_map_tx.subscribe();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let s = state.read().await;
-                let update = NavigationStateUpdate {
-                    status: s.nav_state.status.clone(),
-                    message: s.nav_state.message.clone(),
-                    current_pose: None,
-                    distance_remaining: s.nav_state.distance_remaining,
-                    goal_id: s.nav_state.goal_id.clone(),
-                    timestamp_ns: 0,
+            while let Ok(notif) = broadcast_rx.recv().await {
+                let msg = CloudMapShmRef {
+                    shm_ref: Some(ShmRef {
+                        key: std::env::var("NUWAX_CLOUDMAP_SHM_PATH")
+                            .unwrap_or_else(|_| "/tmp/nuwax_cloudmap.mmap".into()),
+                        size: 0,
+                        revision: notif.revision,
+                    }),
+                    point_count: notif.point_count,
+                    voxel_size: notif.voxel_size,
                 };
-                if tx.send(Ok(update)).await.is_err() { break; }
+                if tx.send(Ok(msg)).await.is_err() { break; }
             }
         });
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
-    }
-
-    async fn get_navigation_readiness(&self, _req: Request<Empty>) -> Result<Response<Nav2Readiness>, Status> {
-        let s = self.bridge.state.read().await;
-        Ok(Response::new(Nav2Readiness {
-            ready: s.nav2_action_server_ready,
-            waiting_for: if s.nav2_action_server_ready { String::new() } else { "action_server".into() },
-            message: if s.nav2_action_server_ready { "Nav2 就绪".into() } else { "等待 Nav2 action server".into() },
-            action_server_ready: s.nav2_action_server_ready,
-            tf_ready: !s.transforms.is_empty(),
-            lifecycle_states: std::collections::HashMap::new(),
-            errors: std::collections::HashMap::new(),
-        }))
-    }
-
-    async fn get_frontiers(&self, _req: Request<Empty>) -> Result<Response<FrontierList>, Status> {
-        Ok(Response::new(FrontierList { frontiers: vec![], timestamp_ns: 0 }))
-    }
-
-    type SubscribeFrontiersStream = tokio_stream::wrappers::ReceiverStream<Result<FrontierUpdate, Status>>;
-    async fn subscribe_frontiers(&self, _req: Request<Empty>) -> Result<Response<Self::SubscribeFrontiersStream>, Status> {
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move { let _ = tx; });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
-    }
-
-    async fn publish_odom(&self, req: Request<OdomInput>) -> Result<Response<Empty>, Status> {
-        let input = req.into_inner();
-        let pose = input.pose.unwrap_or_default();
-        let pos = pose.position.unwrap_or_default();
-        let ori = pose.orientation.unwrap_or_default();
-        let lin = input.linear_velocity.unwrap_or_default();
-        let ang = input.angular_velocity.unwrap_or_default();
-        self.bridge.publish_odom(
-            &pose.frame_id, "base_link",
-            pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w,
-            lin.x, lin.y, lin.z, ang.x, ang.y, ang.z,
-        ).await.map_err(|e| Status::internal(e))?;
-        Ok(Response::new(Empty {}))
-    }
-
-    async fn publish_point_cloud(&self, req: Request<PointCloudShmRef>) -> Result<Response<Empty>, Status> {
-        let input = req.into_inner();
-        let shm = input.shm_ref.unwrap_or_default();
-        self.bridge.publish_pointcloud(
-            &input.frame_id, shm.key.into_bytes(), input.point_count, input.point_step,
-        ).await.map_err(|e| Status::internal(e))?;
-        Ok(Response::new(Empty {}))
     }
 }
 

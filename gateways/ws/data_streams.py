@@ -10,7 +10,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from contracts.streams import StreamFrame
+from contracts.streams import StreamFrame, StreamPayloadKind
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
 from gateways.runtime import GatewayRuntime
@@ -202,7 +202,10 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             while True:
                 try:
                     frame = await asyncio.wait_for(queue.get(), timeout=runtime.config.gateway.ws_ping_interval_sec)
-                    await websocket.send_json({"type": "stream.frame", "frame": to_jsonable(frame)})
+                    if getattr(frame, 'payload_kind', None) == StreamPayloadKind.BINARY and isinstance(frame.payload, (bytes, bytearray)):
+                        await websocket.send_bytes(frame.payload)
+                    else:
+                        await websocket.send_json({"type": "stream.frame", "frame": to_jsonable(frame)})
                 except asyncio.TimeoutError:
                     await websocket.send_json({"type": "keepalive", "cursor": runtime.stream_bus.latest_cursor()})
         except WebSocketDisconnect:

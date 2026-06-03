@@ -29,3 +29,13 @@ AGENTS.md
 CLAUDE.md
 services/geometry/nuwax_ros_bridge/Cargo.lock
 services/geometry/nuwax_ros_bridge/target/
+
+# === 未提交文档/日志/地图/杂项 忽略 (2026-06-03) ===
+/1.md
+/huang1.md
+/UDS
+/nuwax_robot_bridge技术手册5.25.md
+/nuwax_robot_bridge技术手册5.19(1).md
+/2026-05-25_RTAB-MAP+Nav2平台接入评测与交接文档.md
+/log/
+/maps/

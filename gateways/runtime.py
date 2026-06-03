@@ -45,6 +45,7 @@ from providers import ImageProvider, MotionControl, SafetyProvider, StateProvide
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
 from services.geometry import (
+    CloudMapMmapReader,
     PlatformGeometryRuntime,
     PointCloudMapCache,
     PointCloudMapError,
@@ -381,6 +382,11 @@ class GatewayRuntime:
         self._navigation_status_refresh_thread: Optional[threading.Thread] = None
         self._pointcloud_map_cache = PointCloudMapCache()
         self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
+        self._cloud_map_mmap_reader = CloudMapMmapReader()
+        self._cloud_map_mmap_poll_stop = threading.Event()
+        self._cloud_map_mmap_poll_thread: Optional[threading.Thread] = None
+        self._cloud_map_last_revision: int = 0
+        self._start_cloud_map_mmap_poll()
         self._base_capability_matrix = robot.manifest.capability_matrix
         self._gateway_capability_names: Tuple[str, ...] = ()
 
@@ -650,7 +656,55 @@ class GatewayRuntime:
                 continue
             self._publish_navigation_bootstrap_stream_frames()
 
+    _CLOUD_MAP_MMAP_POLL_INTERVAL_SEC = 0.1
+
+    def _start_cloud_map_mmap_poll(self) -> None:
+        if self._cloud_map_mmap_poll_thread is not None:
+            return
+        self._cloud_map_mmap_poll_stop.clear()
+        thread = threading.Thread(
+            target=self._run_cloud_map_mmap_poll,
+            name=nuwax-cloud-map-mmap-poll,
+            daemon=True,
+        )
+        self._cloud_map_mmap_poll_thread = thread
+        thread.start()
+
+    def _stop_cloud_map_mmap_poll(self) -> None:
+        thread = self._cloud_map_mmap_poll_thread
+        if thread is None:
+            return
+        self._cloud_map_mmap_poll_stop.set()
+        if thread.is_alive():
+            thread.join(timeout=self._CLOUD_MAP_MMAP_POLL_INTERVAL_SEC + 1.0)
+        self._cloud_map_mmap_poll_thread = None
+        self._cloud_map_mmap_reader.close()
+
+    def _run_cloud_map_mmap_poll(self) -> None:
+        while not self._cloud_map_mmap_poll_stop.wait(self._CLOUD_MAP_MMAP_POLL_INTERVAL_SEC):
+            try:
+                header = self._cloud_map_mmap_reader.read_header()
+                if header is None:
+                    continue
+                revision = int(header[5])
+                if revision == self._cloud_map_last_revision:
+                    continue
+                frame_bytes = self._cloud_map_mmap_reader.build_binary_frame()
+                if frame_bytes is None:
+                    continue
+                self._cloud_map_last_revision = revision
+                from contracts.streams import StreamPayloadKind
+                self.stream_bus.publish(
+                    "pointcloud_map.live_chunk",
+                    source="cloud_map_mmap",
+                    payload_kind=StreamPayloadKind.BINARY,
+                    payload=frame_bytes,
+                )
+            except Exception:
+                pass
+
     def _stop_data_frame_stream_sources(self) -> None:
+        self._stop_cloud_map_mmap_poll()
         self._stop_navigation_status_refresh_stream()
         if self._pointcloud_map_stream_subscription_id is not None:
             self.stream_bus.unsubscribe(self._pointcloud_map_stream_subscription_id)

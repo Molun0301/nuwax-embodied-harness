@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import shlex
+import socket
 import subprocess
 import threading
 import time
@@ -44,6 +46,7 @@ class RosBridgeSubprocess:
         self._stop_event = threading.Event()
         self._restart_count = 0
         self._started = False
+        self._attached = False
         self._last_error: Optional[str] = None
 
     @property
@@ -53,6 +56,8 @@ class RosBridgeSubprocess:
     @property
     def is_running(self) -> bool:
         with self._lock:
+            if self._attached:
+                return self._is_port_open()
             return self._process is not None and self._process.poll() is None
 
     @property
@@ -63,6 +68,11 @@ class RosBridgeSubprocess:
         """启动 Rust 子进程并等待 gRPC server 就绪。"""
         with self._lock:
             if self._started:
+                return True
+            if self._is_port_open():
+                self._attached = True
+                self._started = True
+                LOGGER.info("nuwax-ros-bridge 已在端口 %d 运行，挂接现有进程", self._port)
                 return True
             self._stop_event.clear()
             self._restart_count = 0
@@ -76,6 +86,7 @@ class RosBridgeSubprocess:
         """优雅停止子进程。"""
         with self._lock:
             self._started = False
+            self._attached = False
             self._stop_event.set()
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=2.0)
@@ -91,6 +102,7 @@ class RosBridgeSubprocess:
         env = os.environ.copy()
         env["NUWAX_ROS_BRIDGE_PORT"] = str(self._port)
         env["NUWAX_ROS_BRIDGE_READY_FILE"] = self._ready_file
+        self._apply_bridge_env_aliases(env)
         # 使用 CycloneDDS RMW 以直接订阅 Go2 原生 DDS 话题
         env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
         cyclonedds_xml = os.path.expanduser("~/cyclonedds_ws/cyclonedds.xml")
@@ -98,10 +110,14 @@ class RosBridgeSubprocess:
             env["CYCLONEDDS_URI"] = cyclonedds_xml
         ros_setup = "/opt/ros/%s/setup.bash" % self._ros_distro
         cyclonedds_setup = os.path.expanduser("~/cyclonedds_ws/install/setup.bash")
+        source_scripts = [ros_setup]
         if os.path.exists(cyclonedds_setup):
-            cmd = "source %s && source %s && exec %s" % (ros_setup, cyclonedds_setup, self._binary_path)
-        else:
-            cmd = "source %s && exec %s" % (ros_setup, self._binary_path)
+            source_scripts.append(cyclonedds_setup)
+        external_env_script = self._resolve_external_env_script()
+        if external_env_script is not None:
+            source_scripts.append(str(external_env_script))
+        source_cmd = " && ".join("source %s" % shlex.quote(script) for script in source_scripts)
+        cmd = "%s && exec %s" % (source_cmd, shlex.quote(self._binary_path))
 
         try:
             self._process = subprocess.Popen(
@@ -124,6 +140,7 @@ class RosBridgeSubprocess:
                 return False
             if os.path.exists(self._ready_file):
                 LOGGER.info("nuwax-ros-bridge 就绪, pid=%d, port=%d", self._process.pid, self._port)
+                self._attached = False
                 return True
             time.sleep(0.1)
 
@@ -136,6 +153,10 @@ class RosBridgeSubprocess:
         """终止子进程：SIGTERM → 等待 → SIGKILL。"""
         with self._lock:
             proc = self._process
+            if self._attached:
+                self._attached = False
+                self._process = None
+                return
             if proc is None:
                 return
             if proc.poll() is not None:
@@ -200,6 +221,40 @@ class RosBridgeSubprocess:
                 success = self._spawn_process()
                 if not success:
                     LOGGER.error("重启失败: %s", self._last_error)
+
+    def _is_port_open(self) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", self._port), timeout=0.25):
+                return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _apply_bridge_env_aliases(env: dict) -> None:
+        aliases = {
+            "NUWAX_MAP_TOPIC": ("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
+            "NUWAX_TF_TOPIC": ("NUWAX_GEOMETRY_TF_TOPIC", "/tf"),
+            "NUWAX_NAV_ACTION": ("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
+            "NUWAX_GO2_ODOM_SOURCE": ("NUWAX_GEOMETRY_ODOM_TOPIC", "/utlidar/robot_odom"),
+            "NUWAX_GO2_POINTCLOUD_SOURCE": ("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud"),
+        }
+        for target, (source, default_value) in aliases.items():
+            if str(env.get(target) or "").strip():
+                continue
+            value = str(env.get(source) or "").strip() or default_value
+            env[target] = value
+
+    @staticmethod
+    def _resolve_external_env_script() -> Optional[Path]:
+        configured = os.environ.get("NUWAX_ROS_BRIDGE_ENV_SCRIPT")
+        if configured:
+            path = Path(configured).expanduser()
+            return path if path.exists() else None
+        external_script = os.environ.get("NUWAX_GEOMETRY_EXTERNAL_SCRIPT")
+        if not external_script:
+            return None
+        candidate = Path(external_script).expanduser().resolve().parent / "scripts" / "env.sh"
+        return candidate if candidate.exists() else None
 
     @staticmethod
     def _resolve_binary(binary_path: Optional[str]) -> str:

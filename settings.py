@@ -512,7 +512,7 @@ class RuntimeDataConfig:
     memory_history_limit: int = 200
     map_catalog_root: str = ""
     map_auto_create_library: bool = True
-    map_active_restore_on_start: bool = True
+    map_active_restore_on_start: bool = False
     map_delete_also_delete_library: bool = False
     memory_db_path: str = ""
     memory_embedding_model: str = DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL
@@ -827,19 +827,24 @@ def load_config() -> NuwaxRobotBridgeConfig:
         cyclonedds_lib_dir=_cfg_str("NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR", ""),
         dds_iface=_cfg_str("NUWAX_GEOMETRY_DDS_IFACE", ""),
         topics=GeometryTopicsConfig(
-            odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/odom"),
+            odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/utlidar/robot_odom"),
             secondary_odom_topics=_cfg_csv("NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS", ()),
             imu_topic=_cfg_str("NUWAX_GEOMETRY_IMU_TOPIC", "/utlidar/imu"),
             point_cloud_topic=_cfg_str("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud_deskewed"),
             tf_topic=_cfg_str("NUWAX_GEOMETRY_TF_TOPIC", "/tf"),
             tf_static_topic=_cfg_str("NUWAX_GEOMETRY_TF_STATIC_TOPIC", "/tf_static"),
             occupancy_topic=_cfg_str("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
+            cloud_map_topic=_cfg_str_alias(
+                "NUWAX_GEOMETRY_CLOUD_MAP_TOPIC",
+                "NUWAX_CLOUD_MAP_TOPIC",
+                "/cloud_map",
+            ),
             cost_map_topic=_cfg_str("NUWAX_GEOMETRY_COST_MAP_TOPIC", "/global_costmap/costmap"),
         ),
         frames=GeometryFrameConfig(
             map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "map"),
             odom_frame=_cfg_str("NUWAX_GEOMETRY_ODOM_FRAME", "odom"),
-            base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "base_footprint"),
+            base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "base_link"),
             lidar_frame=_cfg_str("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),
             imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
@@ -913,7 +918,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         external=ExternalGeometryStackConfig(
             enabled=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_ENABLED", True),
             script_path=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_SCRIPT", build_default_external_slam_nav2_script()),
-            args=_cfg_csv("NUWAX_GEOMETRY_EXTERNAL_ARGS", ("--no-rviz",)),
+            args=_cfg_csv("NUWAX_GEOMETRY_EXTERNAL_ARGS", ()),
             process_name=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME", "external_slam_nav2"),
             log_name=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_LOG_NAME", "external_slam_nav2.log"),
             provides_map=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_MAP", True),
@@ -924,6 +929,8 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED",
                 external_input_bridge_enabled,
             ),
+            platform_odom_tf_bridge_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_ODOM_TF_BRIDGE_ENABLED", False),
+            platform_cmd_vel_bridge_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_CMD_VEL_BRIDGE_ENABLED", False),
         ),
     )
 
@@ -987,7 +994,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             str(BASE_DIR / "runtime_data" / "maps"),
         ),
         map_auto_create_library=_cfg_bool("NUWAX_MAP_AUTO_CREATE_LIBRARY", True),
-        map_active_restore_on_start=_cfg_bool("NUWAX_ACTIVE_MAP_RESTORE_ON_START", True),
+        map_active_restore_on_start=_cfg_bool("NUWAX_ACTIVE_MAP_RESTORE_ON_START", False),
         map_delete_also_delete_library=_cfg_bool("NUWAX_MAP_DELETE_ALSO_DELETE_LIBRARY", False),
         memory_db_path=_cfg_str(
             "NUWAX_MEMORY_DB_PATH",

@@ -6,6 +6,7 @@ from urllib.parse import quote
 from contracts.map_workspace import MapVersion
 from contracts.runtime_views import MapSnapshot
 from services.mapping.catalog import _to_safe_dir_segment
+from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 
 
@@ -59,19 +60,48 @@ class MapVersionRepository:
         map_name: str,
         snapshot: MapSnapshot,
         metadata: Optional[Dict[str, object]] = None,
+        version_id_override: Optional[str] = None,
     ) -> MapVersion:
-        latest = self.get_latest_map_version(map_name)
-        revision = 1 if latest is None else latest.revision + 1
-        version = MapVersion(
-            map_name=str(map_name or "").strip(),
-            version_id=self._build_version_id(revision),
-            revision=revision,
-            source_name=snapshot.source_name,
-            source_version_id=snapshot.version_id,
-            frame_id=self._resolve_map_frame_id(snapshot),
-            snapshot=snapshot.model_copy(deep=True),
-            metadata=dict(metadata or {}),
-        )
+        existing = None
+        override_id = str(version_id_override or "").strip()
+        if override_id:
+            existing = self.get_map_version(map_name, override_id)
+        if existing is not None:
+            version = existing.model_copy(
+                update={
+                    "timestamp": datetime.now(timezone.utc),
+                    "source_name": snapshot.source_name,
+                    "source_version_id": snapshot.version_id,
+                    "frame_id": self._resolve_map_frame_id(snapshot) or existing.frame_id,
+                    "snapshot": snapshot.model_copy(deep=True),
+                    "metadata": {
+                        **dict(existing.metadata or {}),
+                        **dict(metadata or {}),
+                    },
+                },
+                deep=True,
+            )
+        else:
+            latest = self.get_latest_map_version(map_name)
+            if override_id:
+                version_id = override_id
+                try:
+                    revision = int(override_id.split("_", 1)[1])
+                except (IndexError, ValueError):
+                    revision = 1 if latest is None else latest.revision + 1
+            else:
+                revision = 1 if latest is None else latest.revision + 1
+                version_id = self._build_version_id(revision)
+            version = MapVersion(
+                map_name=str(map_name or "").strip(),
+                version_id=version_id,
+                revision=revision,
+                source_name=snapshot.source_name,
+                source_version_id=snapshot.version_id,
+                frame_id=self._resolve_map_frame_id(snapshot),
+                snapshot=snapshot.model_copy(deep=True),
+                metadata=dict(metadata or {}),
+            )
         version_dir = self._versions_root(map_name) / version.version_id
         version_dir.mkdir(parents=True, exist_ok=True)
         self._version_path(map_name, version.version_id).write_text(

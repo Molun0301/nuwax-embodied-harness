@@ -387,6 +387,10 @@ class NavigationService:
         with self._lock:
             previous_context = self._latest_exploration_context
             current_request = self._current_explore_request
+            idle_without_request = bool(
+                exploration_state.status == ExplorationStatus.IDLE
+                and current_request is None
+            )
             if (
                 previous_context is not None
                 and previous_context.exploration_state.status
@@ -396,17 +400,23 @@ class NavigationService:
             ):
                 exploration_state = previous_context.exploration_state.model_copy(deep=True)
                 current_request = current_request or previous_context.current_request
+                idle_without_request = False
             runtime_metadata = self._build_map_runtime_metadata(
                 map_name=current_request.map_name if current_request is not None else None,
                 memory_library_name=current_request.map_name if current_request is not None else None,
-                existing_waiting_for=exploration_state.metadata.get("waiting_for"),
+                existing_waiting_for=None if idle_without_request else exploration_state.metadata.get("waiting_for"),
+                include_waiting_for=not idle_without_request,
             )
+            merged_metadata = {
+                **dict(exploration_state.metadata),
+                **runtime_metadata,
+            }
+            if idle_without_request:
+                merged_metadata.pop("waiting_for", None)
+                merged_metadata.pop("failure_code", None)
             exploration_state = exploration_state.model_copy(
                 update={
-                    "metadata": {
-                        **dict(exploration_state.metadata),
-                        **runtime_metadata,
-                    }
+                    "metadata": merged_metadata
                 },
                 deep=True,
             )
@@ -437,15 +447,37 @@ class NavigationService:
                     status="available",
                     metadata={"backend_name": provider.provider_name, "exploration_status": exploration_status},
                 )
-                frontiers = dict(getattr(context.exploration_state, "metadata", {}) or {}).get("latest_frontiers")
-                current_frontier = dict(getattr(context.exploration_state, "metadata", {}) or {}).get("current_frontier")
-                if frontiers is not None or current_frontier is not None:
+                exploration_metadata = dict(getattr(context.exploration_state, "metadata", {}) or {})
+                frontiers = exploration_metadata.get("latest_frontiers")
+                current_frontier = exploration_metadata.get("current_frontier")
+                observer_meta = exploration_metadata.get("external_frontier_debug_observer")
+                should_publish_frontier = (
+                    frontiers is not None
+                    or current_frontier is not None
+                    or bool(exploration_metadata.get("exploration_terminal"))
+                    or bool(exploration_metadata.get("status_text"))
+                    or isinstance(observer_meta, dict)
+                )
+                if should_publish_frontier:
+                    frontier_payload = {
+                        "latest_frontiers": frontiers if isinstance(frontiers, list) else [],
+                        "current_frontier": current_frontier if isinstance(current_frontier, dict) else None,
+                        "frontier_count": context.exploration_state.frontier_count,
+                        "status_text": exploration_metadata.get("status_text"),
+                        "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
+                        "terminal_status": exploration_metadata.get("terminal_status"),
+                        "external_frontier_debug_observer": observer_meta,
+                    }
                     self._stream_bus.publish(
                         "exploration.frontier",
                         source="navigation_service",
-                        payload={"latest_frontiers": frontiers, "current_frontier": current_frontier},
+                        payload=frontier_payload,
                         status="available",
-                        metadata={"backend_name": provider.provider_name},
+                        metadata={
+                            "backend_name": provider.provider_name,
+                            "exploration_status": exploration_status,
+                            "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
+                        },
                     )
             if context.exploration_state.status in {
                 ExplorationStatus.SUCCEEDED,
@@ -580,6 +612,13 @@ class NavigationService:
 
         return self._latest_exploration_context
 
+    def clear_latest_exploration_context(self, *, reason: str = "") -> None:
+        """清掉已结束探索任务缓存，避免地图激活响应继续携带旧探索状态。"""
+
+        with self._lock:
+            self._latest_exploration_context = None
+            self._current_explore_request = None
+
     def list_navigation_history(self, *, limit: Optional[int] = None) -> Tuple[NavigationContext, ...]:
         """返回导航历史。"""
 
@@ -602,9 +641,19 @@ class NavigationService:
         map_name: Optional[str],
         memory_library_name: Optional[str] = None,
         existing_waiting_for: Optional[object] = None,
+        include_waiting_for: bool = True,
     ) -> dict:
         map_snapshot = self._mapping_service.get_latest_snapshot()
         localization_session = self._localization_service.get_active_session()
+        if localization_session is not None:
+            try:
+                refreshed_session = self._localization_service.refresh_current_session(
+                    metadata={"source": "navigation_runtime_metadata"}
+                )
+                if refreshed_session is not None:
+                    localization_session = refreshed_session
+            except GatewayError:
+                pass
         localization_ready = bool(
             localization_session is not None
             and localization_session.status == LocalizationSessionStatus.READY
@@ -620,11 +669,13 @@ class NavigationService:
         else:
             map_status = MapAssetStatus.CREATED.value
         waiting_for = str(existing_waiting_for or "").strip() or None
-        if waiting_for is None:
+        if include_waiting_for and waiting_for is None:
             if not has_map:
                 waiting_for = "mapping_ready"
             elif not localization_ready:
                 waiting_for = "localization_ready"
+        elif not include_waiting_for:
+            waiting_for = None
         return {
             "map_name": map_name,
             "map_status": map_status,

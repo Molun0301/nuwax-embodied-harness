@@ -5,6 +5,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime
 import logging
 import math
+import os
 from pathlib import Path
 import threading
 import time
@@ -26,7 +27,7 @@ from contracts.geometry import Pose, Quaternion, Twist, Vector3
 from contracts.memory import MemoryPayloadFilter
 from contracts.spatial_memory import SceneSpaceReviewStatus
 from contracts.skills import SkillCategory, SkillDescriptor
-from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
+from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationStatus
 from contracts.runtime_views import RuntimeGovernanceSummary
 from contracts.image import ImageFrame
 from contracts.streams import StreamPayloadKind
@@ -415,11 +416,16 @@ class GatewayRuntime:
             RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
         self._start_safety_watchdog_loop()
         self._start_data_frame_stream_sources()
+        # 地图工作区仅由 MCP（activate_map / load_map_version 等）显式切换，启动时不自动恢复。
         if self.config.runtime_data.map_active_restore_on_start:
             try:
                 self.map_workspace_service.restore_active_workspace(load_memory_history=True)
             except Exception:
                 RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
+        else:
+            RUNTIME_LOGGER.info(
+                "启动时跳过自动恢复地图工作区（NUWAX_ACTIVE_MAP_RESTORE_ON_START=false）。"
+            )
         self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
         self._refresh_dynamic_capability_matrix()
 
@@ -563,6 +569,10 @@ class GatewayRuntime:
         self._publish_runtime_governance_stream_frame()
         self._publish_pointcloud_map_stream_frame(reason="runtime_stream_start")
         self._start_navigation_status_refresh_stream()
+        try:
+            self.platform_geometry_runtime.start_external_debug_observers()
+        except Exception:
+            RUNTIME_LOGGER.debug("启动外部几何 debug observer 失败。", exc_info=True)
         if self._pointcloud_map_stream_subscription_id is None:
             self._pointcloud_map_stream_subscription_id = self.stream_bus.subscribe(
                 self._handle_map_frame_for_pointcloud_map_stream,
@@ -2496,14 +2506,16 @@ class GatewayRuntime:
                     message=f"异步能力 {descriptor.name} 任务已接受。",
                 )
                 status = self.task_manager.get_task_status(result.task_id)
-                return {
-                    "request_id": completed_context.get("request_id"),
-                    "task_id": result.task_id,
-                    "capability_name": descriptor.name,
-                    "mode": descriptor.execution_mode.value,
-                    "task": result,
-                    "status": status,
-                }
+                return self._slim_async_capability_response(
+                    {
+                        "request_id": completed_context.get("request_id"),
+                        "task_id": result.task_id,
+                        "capability_name": descriptor.name,
+                        "mode": descriptor.execution_mode.value,
+                        "task": result,
+                        "status": status,
+                    }
+                )
 
             self._publish_capability_invocation_event(
                 "capability.invocation.completed",
@@ -2512,11 +2524,20 @@ class GatewayRuntime:
                 payload={"mode": descriptor.execution_mode.value},
                 message=f"同步能力 {descriptor.name} 调用完成。",
             )
+            slim_result = result
+            if isinstance(result, dict) and descriptor.name in {
+                "create_map",
+                "activate_map",
+                "list_maps",
+                "get_active_map",
+                "delete_map",
+            }:
+                slim_result = self._slim_sync_map_capability_result(descriptor.name, result)
             return {
                 "request_id": completed_context.get("request_id"),
                 "capability_name": descriptor.name,
                 "mode": descriptor.execution_mode.value,
-                "result": result,
+                "result": slim_result,
             }
         except Exception as exc:
             duration_ms = (time.perf_counter() - started_at) * 1000.0
@@ -2927,13 +2948,268 @@ class GatewayRuntime:
     def get_task_snapshot(self, task_id: str) -> Dict[str, Any]:
         """读取任务状态快照。"""
 
-        return {
+        snapshot = {
             "task_id": task_id,
             "status": self.task_manager.get_task_status(task_id),
             "events": self.task_manager.get_task_events(task_id),
             "result": self.task_manager.get_task_result(task_id),
             "error": self.task_manager.get_task_error(task_id),
             "error_payload": self.task_manager.get_task_error_payload(task_id),
+        }
+        return self._slim_task_snapshot(snapshot)
+
+    @staticmethod
+    def _slim_map_asset(asset: Any) -> Dict[str, Any]:
+        if asset is None:
+            return {}
+        if hasattr(asset, "model_dump"):
+            data = asset.model_dump(mode="json")
+        elif isinstance(asset, dict):
+            data = dict(asset)
+        else:
+            return {"map_name": str(asset)}
+        return {
+            key: data[key]
+            for key in (
+                "map_name",
+                "display_name",
+                "status",
+                "active",
+                "latest_version_id",
+                "latest_revision",
+                "frame_id",
+                "localization_ready",
+                "last_activated_at",
+            )
+            if key in data
+        }
+
+    @staticmethod
+    def _slim_memory_summary(summary: Any) -> Dict[str, Any]:
+        if summary is None:
+            return {}
+        if hasattr(summary, "model_dump"):
+            data = summary.model_dump(mode="json")
+        elif isinstance(summary, dict):
+            data = dict(summary)
+        else:
+            return {}
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        return {
+            "memory_enabled": metadata.get("memory_enabled"),
+            "active_library_name": metadata.get("active_library_name"),
+            "tagged_location_count": data.get("tagged_location_count"),
+            "semantic_memory_count": data.get("semantic_memory_count"),
+        }
+
+    @staticmethod
+    def _slim_workspace(workspace: Any, *, include_memory: bool = False) -> Dict[str, Any]:
+        if workspace is None:
+            return {}
+        if hasattr(workspace, "model_dump"):
+            data = workspace.model_dump(mode="json")
+        elif isinstance(workspace, dict):
+            data = dict(workspace)
+        else:
+            return {}
+        slim: Dict[str, Any] = {
+            "active_map_name": data.get("active_map_name"),
+            "active_memory_library_name": data.get("active_memory_library_name"),
+            "map_loaded": data.get("map_loaded"),
+            "localization_ready": data.get("localization_ready"),
+            "mapping_runtime_enabled": data.get("mapping_runtime_enabled"),
+            "map_asset": GatewayRuntime._slim_map_asset(data.get("map_asset")),
+        }
+        if include_memory:
+            slim["memory_summary"] = GatewayRuntime._slim_memory_summary(data.get("latest_memory_summary"))
+        exploration_context = data.get("exploration_context")
+        if exploration_context is not None:
+            slim["exploration_context"] = GatewayRuntime._slim_exploration_context(exploration_context)
+        return slim
+
+    @staticmethod
+    def _slim_map_catalog(maps: Any) -> List[Dict[str, Any]]:
+        if not isinstance(maps, (list, tuple)):
+            return []
+        return [GatewayRuntime._slim_map_asset(item) for item in maps]
+
+    @staticmethod
+    def _slim_task_acceptance(task: Any, status: Any) -> Dict[str, Any]:
+        task_data: Dict[str, Any] = {}
+        if hasattr(task, "model_dump"):
+            task_data = task.model_dump(mode="json")
+        elif isinstance(task, dict):
+            task_data = dict(task)
+        spec = task_data.get("spec") if isinstance(task_data.get("spec"), dict) else task_data
+        input_payload = spec.get("input_payload") if isinstance(spec.get("input_payload"), dict) else {}
+        metadata = spec.get("metadata") if isinstance(spec.get("metadata"), dict) else {}
+        slim_input = {
+            key: input_payload[key]
+            for key in (
+                "request_id",
+                "map_name",
+                "strategy",
+                "max_duration_sec",
+                "target_name",
+                "radius_m",
+            )
+            if key in input_payload
+        }
+        status_data: Dict[str, Any] = {}
+        if hasattr(status, "model_dump"):
+            status_data = status.model_dump(mode="json")
+        elif isinstance(status, dict):
+            status_data = dict(status)
+        slim: Dict[str, Any] = {
+            "task_id": spec.get("task_id") or task_data.get("task_id"),
+            "capability_name": spec.get("capability_name") or task_data.get("capability_name"),
+            "input_payload": slim_input,
+            "status": {
+                key: status_data[key]
+                for key in ("task_id", "state", "progress", "stage", "message", "started_at", "updated_at")
+                if key in status_data
+            },
+        }
+        launch_keys = (
+            "exploration_launch_mode",
+            "exploration_script",
+            "exploration_command",
+            "exploration_database_path",
+            "exploration_version_id",
+        )
+        launch_plan = {key: metadata[key] for key in launch_keys if key in metadata}
+        if launch_plan:
+            slim["exploration_launch"] = launch_plan
+        return slim
+
+    def _slim_async_capability_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        task = response.get("task")
+        status = response.get("status")
+        if task is None and status is None:
+            return response
+        slim = dict(response)
+        slim["task"] = self._slim_task_acceptance(task, status)
+        return slim
+
+    def _slim_sync_map_capability_result(self, capability_name: str, result: Any) -> Dict[str, Any]:
+        if not isinstance(result, dict):
+            return result if isinstance(result, dict) else {"result": result}
+        slim = dict(result)
+        if "map_asset" in slim:
+            slim["map_asset"] = self._slim_map_asset(slim.get("map_asset"))
+        if "active_workspace" in slim:
+            include_memory = capability_name == "activate_map"
+            slim["active_workspace"] = self._slim_workspace(
+                slim.get("active_workspace"),
+                include_memory=include_memory,
+            )
+        if "memory_summary" in slim:
+            slim["memory_summary"] = self._slim_memory_summary(slim.get("memory_summary"))
+        if "maps" in slim:
+            maps = slim.pop("maps")
+            slim["maps_count"] = len(maps) if isinstance(maps, (list, tuple)) else 0
+            if capability_name == "list_maps":
+                slim["maps"] = self._slim_map_catalog(maps)
+        return slim
+
+    @staticmethod
+    def _slim_task_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        events = snapshot.get("events")
+        if isinstance(events, (list, tuple)):
+            snapshot["events"] = [
+                GatewayRuntime._slim_task_event(event)
+                for event in events
+            ]
+        result = snapshot.get("result")
+        if isinstance(result, dict):
+            snapshot["result"] = GatewayRuntime._slim_task_payload(result)
+        return snapshot
+
+    @staticmethod
+    def _slim_task_event(event: Any) -> Any:
+        if not hasattr(event, "model_copy"):
+            return event
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            return event
+        return event.model_copy(
+            update={"payload": GatewayRuntime._slim_task_payload(payload)},
+            deep=True,
+        )
+
+    @staticmethod
+    def _slim_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        slim = dict(payload)
+        diagnostics = slim.get("mapping_chain_diagnostics")
+        if isinstance(diagnostics, dict):
+            slim["mapping_chain_diagnostics"] = GatewayRuntime._summarize_mapping_chain_diagnostics(diagnostics)
+        exploration_context = slim.get("exploration_context")
+        if exploration_context is not None:
+            slim["exploration_context"] = GatewayRuntime._slim_exploration_context(exploration_context)
+        return slim
+
+    @staticmethod
+    def _summarize_mapping_chain_diagnostics(diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+        runtime_status = diagnostics.get("runtime_status") if isinstance(diagnostics.get("runtime_status"), dict) else {}
+        rtabmap_readiness = diagnostics.get("rtabmap_readiness") if isinstance(diagnostics.get("rtabmap_readiness"), dict) else {}
+        map_stream = rtabmap_readiness.get("map_stream") if isinstance(rtabmap_readiness.get("map_stream"), dict) else {}
+        return {
+            "ready": diagnostics.get("ready"),
+            "waiting_for": diagnostics.get("waiting_for"),
+            "message": diagnostics.get("message"),
+            "runtime_phase": runtime_status.get("phase"),
+            "runtime_message": runtime_status.get("message"),
+            "localization_ready": rtabmap_readiness.get("localization_ready"),
+            "first_frame_ready": rtabmap_readiness.get("first_frame_ready"),
+            "streaming_ready": rtabmap_readiness.get("streaming_ready"),
+            "known_cell_count": map_stream.get("known_cell_count"),
+            "occupancy_revision": map_stream.get("occupancy_revision"),
+            "occupancy_message_count": map_stream.get("occupancy_message_count"),
+        }
+
+    @staticmethod
+    def _slim_exploration_context(context: Any) -> Dict[str, Any]:
+        if hasattr(context, "model_dump"):
+            data = context.model_dump(mode="json")
+        elif isinstance(context, dict):
+            data = dict(context)
+        else:
+            return {"summary": str(context)}
+        exploration_state = data.get("exploration_state") if isinstance(data.get("exploration_state"), dict) else {}
+        metadata = exploration_state.get("metadata") if isinstance(exploration_state.get("metadata"), dict) else {}
+        slim_metadata = {
+            key: metadata.get(key)
+            for key in (
+                "waiting_for",
+                "status_text",
+                "exploration_terminal",
+                "terminal_status",
+                "elapsed_time_sec",
+                "max_duration_sec",
+                "explorer_status_text",
+                "frontier_count",
+                "exploration_database_path",
+                "exploration_version_id",
+                "exploration_command",
+                "exploration_script",
+                "exploration_launch_mode",
+            )
+            if key in metadata
+        }
+        diagnostics = metadata.get("mapping_chain_diagnostics")
+        if isinstance(diagnostics, dict):
+            slim_metadata["mapping_chain_diagnostics"] = GatewayRuntime._summarize_mapping_chain_diagnostics(diagnostics)
+        return {
+            "current_request": data.get("current_request"),
+            "exploration_state": {
+                "current_request_id": exploration_state.get("current_request_id"),
+                "status": exploration_state.get("status"),
+                "strategy": exploration_state.get("strategy"),
+                "message": exploration_state.get("message"),
+                "frontier_count": exploration_state.get("frontier_count"),
+                "covered_ratio": exploration_state.get("covered_ratio"),
+                "metadata": slim_metadata,
+            },
         }
 
     def _handle_get_robot_status(self, _: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
@@ -3235,10 +3511,11 @@ class GatewayRuntime:
             map_name=map_name,
             metadata={"requested_by": requested_by or "unknown"},
         )
+        active_workspace = self.map_workspace_service.get_active_workspace()
         return {
             "map_asset": map_asset,
-            "maps": self.map_workspace_service.list_maps(),
-            "active_workspace": self.map_workspace_service.get_active_workspace(),
+            "maps_count": len(self.map_workspace_service.list_maps()),
+            "active_workspace": active_workspace,
         }
 
     def _handle_activate_map(
@@ -3248,6 +3525,14 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         map_name = self._require_str(arguments, "map_name")
+        self._ensure_geometry_runtime_started("activate_map")
+        exploration_context = self.navigation_service.get_latest_exploration_context()
+        exploration_status = getattr(getattr(exploration_context, "exploration_state", None), "status", None)
+        if getattr(exploration_status, "value", exploration_status) in {"accepted", "running"}:
+            try:
+                self.navigation_service.stop_exploration()
+            except Exception:
+                RUNTIME_LOGGER.debug("activate_map 前 stop_exploration 忽略异常", exc_info=True)
         active_workspace = self.map_workspace_service.activate_map(
             map_name=map_name,
             create_if_missing=False,
@@ -3260,13 +3545,16 @@ class GatewayRuntime:
             and active_workspace.map_asset is not None
             and active_workspace.map_asset.latest_version_id
         )
-        if not has_platform_map_version:
-            self._refresh_workspace_snapshots()
+        if has_platform_map_version:
+            self._refresh_workspace_snapshots(refresh_localization=False)
+            self._publish_pointcloud_map_stream_frame(reason="activate_map")
+            self._publish_runtime_governance_stream_frame()
+        else:
+            self._refresh_workspace_snapshots(refresh_localization=False)
         self._sync_perception_runtime_for_memory_state(enabled=True)
-        active_workspace = self.map_workspace_service.get_active_workspace() or active_workspace
+        active_workspace = self.map_workspace_service.get_active_workspace(refresh_localization=False) or active_workspace
         return {
             "active_workspace": active_workspace,
-            "maps": self.map_workspace_service.list_maps(),
             "memory_summary": self.memory_service.get_summary(),
         }
 
@@ -3352,6 +3640,9 @@ class GatewayRuntime:
             reset_memory_library=bool(arguments.get("reset_memory_library", False)),
             metadata={"requested_by": requested_by or "unknown", "source": "load_map_version"},
         )
+        self._refresh_workspace_snapshots(refresh_localization=False)
+        self._publish_pointcloud_map_stream_frame(reason="load_map_version")
+        self._publish_runtime_governance_stream_frame()
         return {
             "map_version": map_version,
             "active_workspace": workspace,
@@ -4023,12 +4314,21 @@ class GatewayRuntime:
             stop_conditions=stop_conditions,
             metadata={"requested_by": requested_by or "unknown"},
         )
+        self._ensure_geometry_runtime_for_capability("explore_area")
+        launch_plan = self.platform_geometry_runtime.plan_external_exploration(request)
+        task_metadata = self._build_task_request_metadata(
+            capability_name="explore_area",
+            requested_by=requested_by,
+            request_context=request_context,
+        )
+        task_metadata.update(launch_plan)
         return self._submit_exploration_task(
             request=request,
             poll_interval_sec=poll_interval_sec,
             timeout_sec=timeout_sec,
             requested_by=requested_by,
             request_context=request_context,
+            task_metadata=task_metadata,
         )
 
     def _handle_explore_and_find_target(
@@ -4844,8 +5144,10 @@ class GatewayRuntime:
             )
         return workspace.active_map_name, workspace
 
-    def _refresh_workspace_snapshots(self) -> None:
-        active_workspace = self.map_workspace_service.get_active_workspace()
+    def _refresh_workspace_snapshots(self, *, refresh_localization: bool = True) -> None:
+        active_workspace = self.map_workspace_service.get_active_workspace(
+            refresh_localization=refresh_localization,
+        )
         try:
             if active_workspace is not None:
                 self.map_workspace_service.sync_active_localization_session(
@@ -6421,6 +6723,7 @@ class GatewayRuntime:
         timeout_sec: float,
         requested_by: Optional[str],
         request_context: Optional[MetadataDict] = None,
+        task_metadata: Optional[MetadataDict] = None,
     ):
         descriptor = self.capability_registry.get_descriptor("explore_area")
         poll_interval_sec = max(0.05, poll_interval_sec)
@@ -6459,31 +6762,43 @@ class GatewayRuntime:
                     last_context = self.navigation_service.refresh_exploration()
                     status = last_context.exploration_state.status
                     exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
+                    if self._exploration_metadata_indicates_done(exploration_metadata):
+                        last_context = self.navigation_service.refresh_exploration()
+                        status = last_context.exploration_state.status
+                        exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
+                    progress = self._estimate_exploration_progress(last_context)
+                    stage = f"exploration_{status.value}"
+                    message = last_context.exploration_state.message or "探索执行中。"
+                    if status.value == "succeeded" or self._exploration_metadata_indicates_done(exploration_metadata):
+                        progress = 1.0
+                        stage = "exploration_completed"
+                        message = last_context.exploration_state.message or "探索器已报告完成。"
                     context.update(
-                        progress=self._estimate_exploration_progress(last_context),
-                        stage=f"exploration_{status.value}",
-                        message=last_context.exploration_state.message or "探索执行中。",
-                        payload={
-                            "request_id": request.request_id,
-                            "covered_ratio": last_context.exploration_state.covered_ratio,
-                            "frontier_count": last_context.exploration_state.frontier_count,
-                            "waiting_for": exploration_metadata.get("waiting_for"),
-                            "mapping_chain_diagnostics": exploration_metadata.get("mapping_chain_diagnostics"),
-                        },
+                        progress=progress,
+                        stage=stage,
+                        message=message,
+                        payload=self._exploration_task_progress_payload(
+                            request=request,
+                            last_context=last_context,
+                            exploration_metadata=exploration_metadata,
+                        ),
                     )
                     if status.value == "succeeded":
-                        context.update(progress=1.0, stage="completed", message="探索任务已完成。")
+                        context.update(
+                            progress=1.0,
+                            stage="completed",
+                            message=last_context.exploration_state.message or "探索任务已完成。",
+                        )
                         result = {
                             "request_id": request.request_id,
                             "exploration_context": last_context,
+                            "finalize_pending": True,
                         }
-                        result.update(
-                            self._finalize_workspace_assets_after_task(
-                                map_name=request.map_name,
-                                trigger="explore_area_completed",
-                            )
-                        )
                         finalized = True
+                        self._schedule_exploration_workspace_finalize(
+                            map_name=request.map_name,
+                            trigger="explore_area_completed",
+                        )
                         return result
                     if status.value == "failed":
                         raise GatewayError(last_context.exploration_state.message or "探索执行失败。")
@@ -6524,7 +6839,8 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
-            metadata=self._build_task_request_metadata(
+            metadata=task_metadata
+            or self._build_task_request_metadata(
                 capability_name="explore_area",
                 requested_by=requested_by,
                 request_context=request_context,
@@ -6750,6 +7066,55 @@ class GatewayRuntime:
                 details={"capability_name": capability_name},
             )
         self._ensure_geometry_runtime_started(capability_name)
+
+    def _schedule_exploration_workspace_finalize(self, *, map_name: str, trigger: str) -> None:
+        """探索任务先标记 succeeded，地图版本保存放到后台，避免阻塞 get_task_status。"""
+
+        def _run_finalize() -> None:
+            try:
+                try:
+                    self.navigation_service.stop_exploration()
+                except Exception:
+                    RUNTIME_LOGGER.debug("探索 finalize 前 stop_exploration 忽略异常", exc_info=True)
+                try:
+                    delay_sec = max(0.0, float(os.environ.get("NUWAX_EXPLORE_FINALIZE_DELAY_SEC", "8")))
+                except (TypeError, ValueError):
+                    delay_sec = 8.0
+                if delay_sec > 0.0:
+                    time.sleep(delay_sec)
+                self._finalize_workspace_assets_after_task(map_name=map_name, trigger=trigger)
+            except Exception:
+                RUNTIME_LOGGER.exception(
+                    "探索任务后台保存地图版本失败 map_name=%s trigger=%s",
+                    map_name,
+                    trigger,
+                )
+
+        threading.Thread(
+            target=_run_finalize,
+            name="explore_finalize_%s" % (map_name or "unknown"),
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _exploration_task_progress_payload(
+        *,
+        request: ExploreAreaRequest,
+        last_context,
+        exploration_metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "request_id": request.request_id,
+            "covered_ratio": last_context.exploration_state.covered_ratio,
+            "frontier_count": last_context.exploration_state.frontier_count,
+            "waiting_for": exploration_metadata.get("waiting_for"),
+            "explorer_status_text": exploration_metadata.get("status_text"),
+            "exploration_terminal": exploration_metadata.get("exploration_terminal"),
+            "terminal_status": exploration_metadata.get("terminal_status"),
+            "mapping_chain_diagnostics": GatewayRuntime._summarize_mapping_chain_diagnostics(
+                exploration_metadata.get("mapping_chain_diagnostics")
+            ) if isinstance(exploration_metadata.get("mapping_chain_diagnostics"), dict) else None,
+        }
 
     def _finalize_workspace_assets_after_task(
         self,
@@ -7139,15 +7504,65 @@ class GatewayRuntime:
         return max(0.05, min(0.95, 1.0 - (remaining_distance / estimated_total)))
 
     def _estimate_exploration_progress(self, context) -> float:
+        status = str(getattr(context.exploration_state.status, "value", context.exploration_state.status) or "")
+        if status == ExplorationStatus.SUCCEEDED.value:
+            return 1.0
+        metadata = dict(getattr(context.exploration_state, "metadata", {}) or {})
+        if self._exploration_metadata_indicates_done(metadata):
+            return 1.0
+        if bool(metadata.get("exploration_terminal")):
+            return 1.0
+        status_text = str(metadata.get("status_text") or metadata.get("explorer_status_text") or "").upper()
+        if "DONE" in status_text or "COMPLETE" in status_text or "EXPLORATION FINISHED" in status_text:
+            return 1.0
+        observer_meta = metadata.get("external_frontier_debug_observer")
+        if isinstance(observer_meta, dict):
+            observer_payload = observer_meta.get("metadata") if isinstance(observer_meta.get("metadata"), dict) else {}
+            observer_status = str(observer_payload.get("status_text") or "").upper()
+            if bool(observer_payload.get("exploration_terminal")) or "DONE" in observer_status or "EXPLORATION FINISHED" in observer_status:
+                return 1.0
+        if metadata.get("exploration_mode") == "go2_rtabmap_script":
+            if "FOLLOWING" in status_text:
+                return 0.82
+            if "TIMEOUT" in status_text or "RECOVER" in status_text:
+                return 0.7
+            if "WARMING UP" in status_text:
+                return 0.12
+            if "WAITING" in status_text:
+                return 0.08
+            waiting_for = str(metadata.get("waiting_for") or "")
+            if waiting_for in {"external_map_streaming", "external_slam_nav2", "nav2_lifecycle", "nav2_action"}:
+                return 0.18
+            if waiting_for:
+                return 0.25
         covered_ratio = context.exploration_state.covered_ratio
         if covered_ratio is not None:
-            return max(0.05, min(0.99, covered_ratio))
+            return max(0.05, min(0.95, covered_ratio))
         frontier_count = context.exploration_state.frontier_count
         if frontier_count is None:
             return 0.2
+        if frontier_count <= 0 and self._exploration_metadata_indicates_done(metadata):
+            return 1.0
         if frontier_count <= 0:
-            return 0.99
-        return max(0.1, min(0.9, 1.0 / float(frontier_count + 1)))
+            return 0.85
+        return max(0.1, min(0.8, 1.0 / float(frontier_count + 1)))
+
+    @staticmethod
+    def _exploration_metadata_indicates_done(metadata: Dict[str, Any]) -> bool:
+        if bool(metadata.get("exploration_terminal")) or bool(metadata.get("terminal")):
+            return True
+        status_text = str(metadata.get("status_text") or metadata.get("explorer_status_text") or "").upper()
+        if "DONE" in status_text or "EXPLORATION FINISHED" in status_text:
+            return True
+        observer_meta = metadata.get("external_frontier_debug_observer")
+        if isinstance(observer_meta, dict):
+            observer_payload = observer_meta.get("metadata") if isinstance(observer_meta.get("metadata"), dict) else {}
+            if bool(observer_payload.get("exploration_terminal")):
+                return True
+            observer_status = str(observer_payload.get("status_text") or "").upper()
+            if "DONE" in observer_status or "EXPLORATION FINISHED" in observer_status:
+                return True
+        return False
 
     def _build_runtime_request_id(self, prefix: str) -> str:
         return f"{prefix}_{time.time_ns()}"

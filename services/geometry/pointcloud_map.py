@@ -165,6 +165,143 @@ class PointCloudMapCache:
         return loaded
 
 
+def write_pcd_binary_xyz(path: Path, points_xyz: np.ndarray) -> None:
+    """将 Nx3 float32 点云写入 binary PCD（仅 x/y/z 字段）。"""
+
+    points = np.asarray(points_xyz, dtype=np.float32, order="C")
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise PointCloudMapError("点云数组必须是 Nx3。")
+    finite_mask = np.isfinite(points).all(axis=1)
+    if not bool(finite_mask.all()):
+        points = points[finite_mask]
+    if points.size == 0:
+        raise PointCloudMapError("点云数组没有可用点。")
+    point_count = int(points.shape[0])
+    header = (
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
+        "WIDTH %d\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        "POINTS %d\n"
+        "DATA binary\n"
+    ) % (point_count, point_count)
+    resolved = path.expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with resolved.open("wb") as handle:
+        handle.write(header.encode("ascii"))
+        handle.write(points.tobytes(order="C"))
+
+
+def read_ply_xyz(path: Path) -> Tuple[PcdHeader, np.ndarray]:
+    """读取 PLY 顶点坐标，返回与 read_pcd_xyz 相同形状的 float32 Nx3 数组。"""
+
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise PointCloudMapError("PLY 点云文件不存在：%s" % resolved)
+    header_lines: List[str] = []
+    with resolved.open("rb") as handle:
+        while True:
+            line_bytes = handle.readline()
+            if not line_bytes:
+                raise PointCloudMapError("PLY 文件缺少 end_header。")
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+            header_lines.append(line)
+            if line == "end_header":
+                break
+        format_line = next((item for item in header_lines if item.startswith("format ")), "")
+        vertex_count = 0
+        properties: List[Tuple[str, str]] = []
+        in_vertex = False
+        for line in header_lines:
+            if line.startswith("element "):
+                parts = line.split()
+                in_vertex = len(parts) >= 3 and parts[1] == "vertex"
+                if in_vertex:
+                    vertex_count = int(parts[2])
+                    properties = []
+                continue
+            if in_vertex and line.startswith("property "):
+                parts = line.split()
+                if len(parts) >= 3:
+                    properties.append((parts[1], parts[2]))
+        if vertex_count <= 0:
+            raise PointCloudMapError("PLY 文件缺少 vertex 数量。")
+        if "binary_little_endian" in format_line:
+            dtype_fields = []
+            for kind, name in properties:
+                if kind != "float":
+                    raise UnsupportedPointCloudMapError("PLY 仅支持 float 顶点属性。")
+                size = 8 if name == "double" else 4
+                dtype_fields.append((name, "<f%d" % size))
+            if not dtype_fields:
+                raise PointCloudMapError("PLY 顶点没有属性定义。")
+            vertex_dtype = np.dtype(dtype_fields)
+            payload = handle.read(vertex_count * vertex_dtype.itemsize)
+            if len(payload) < vertex_count * vertex_dtype.itemsize:
+                raise PointCloudMapError("PLY 二进制数据不完整。")
+            vertices = np.frombuffer(payload, dtype=vertex_dtype, count=vertex_count)
+            if "x" not in vertices.dtype.names or "y" not in vertices.dtype.names or "z" not in vertices.dtype.names:
+                raise PointCloudMapError("PLY 顶点缺少 x/y/z 字段。")
+            xyz = np.stack(
+                [vertices["x"], vertices["y"], vertices["z"]],
+                axis=1,
+            ).astype(np.float32, copy=False)
+            header = PcdHeader(
+                fields=("x", "y", "z"),
+                size=(4, 4, 4),
+                type=("F", "F", "F"),
+                count=(1, 1, 1),
+                width=vertex_count,
+                height=1,
+                points=vertex_count,
+                data="binary",
+                header_bytes=0,
+                raw={},
+            )
+            return header, xyz
+        if "ascii" in format_line:
+            values = np.fromfile(handle, sep=" ", dtype=np.float64)
+            width = len(properties) or 3
+            if values.size < vertex_count * width:
+                raise PointCloudMapError("PLY ASCII 数据不完整。")
+            matrix = values[: vertex_count * width].reshape(vertex_count, width)
+            name_to_index = {name: index for index, (_, name) in enumerate(properties)}
+            try:
+                xyz = matrix[:, [name_to_index["x"], name_to_index["y"], name_to_index["z"]]].astype(np.float32)
+            except KeyError as exc:
+                raise PointCloudMapError("PLY 顶点缺少 x/y/z 字段。") from exc
+            header = PcdHeader(
+                fields=("x", "y", "z"),
+                size=(4, 4, 4),
+                type=("F", "F", "F"),
+                count=(1, 1, 1),
+                width=vertex_count,
+                height=1,
+                points=vertex_count,
+                data="ascii",
+                header_bytes=0,
+                raw={},
+            )
+            return header, xyz
+        raise UnsupportedPointCloudMapError("不支持的 PLY 格式：%s" % format_line)
+
+
+def read_pcd_point_count(path: Path) -> int:
+    """仅解析 PCD 头中的 POINTS 数量，用于快速校验资产是否可用。"""
+
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise PointCloudMapError("PCD 点云文件不存在：%s" % resolved)
+    with resolved.open("rb") as stream:
+        header = _read_pcd_header(stream)
+    return int(header.points)
+
+
 def read_pcd_xyz(path: Path) -> Tuple[PcdHeader, np.ndarray]:
     """读取 PCD 文件中的 x/y/z 字段，返回 float32 Nx3 数组。"""
 

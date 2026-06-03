@@ -12,6 +12,17 @@ pub mod proto {
     tonic::include_proto!("nuwax.geometry");
 }
 
+fn env_first(names: &[&str], default_value: &str) -> String {
+    for name in names {
+        if let Ok(value) = std::env::var(name) {
+            if !value.trim().is_empty() {
+                return value;
+            }
+        }
+    }
+    default_value.into()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -23,20 +34,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "50051".into())
         .parse()
         .unwrap_or(50051);
-    let odom_topic = std::env::var("NUWAX_ODOM_TOPIC")
-        .unwrap_or_else(|_| "/odom".into());
-    let pointcloud_topic = std::env::var("NUWAX_POINTCLOUD_TOPIC")
-        .unwrap_or_else(|_| "/utlidar/cloud_base".into());
-    let map_topic = std::env::var("NUWAX_MAP_TOPIC")
-        .unwrap_or_else(|_| "/map".into());
-    let tf_topic = std::env::var("NUWAX_TF_TOPIC")
-        .unwrap_or_else(|_| "/tf".into());
-    let nav_action = std::env::var("NUWAX_NAV_ACTION")
-        .unwrap_or_else(|_| "/navigate_to_pose".into());
-    let odom_source_topic = std::env::var("NUWAX_GO2_ODOM_SOURCE")
-        .unwrap_or_else(|_| "/utlidar/robot_odom".into());
-    let pointcloud_source_topic = std::env::var("NUWAX_GO2_POINTCLOUD_SOURCE")
-        .unwrap_or_else(|_| "/utlidar/cloud".into());
+    let odom_topic = env_first(&["NUWAX_ODOM_TOPIC"], "/odom");
+    let pointcloud_topic = env_first(&["NUWAX_POINTCLOUD_TOPIC"], "/utlidar/cloud_base");
+    let map_topic = env_first(&["NUWAX_MAP_TOPIC", "NUWAX_GEOMETRY_OCCUPANCY_TOPIC"], "/map");
+    let tf_topic = env_first(&["NUWAX_TF_TOPIC", "NUWAX_GEOMETRY_TF_TOPIC"], "/tf");
+    let nav_action = env_first(&["NUWAX_NAV_ACTION", "NUWAX_NAV2_ACTION_NAME"], "/navigate_to_pose");
+    let odom_source_topic = env_first(
+        &["NUWAX_GO2_ODOM_SOURCE", "NUWAX_GEOMETRY_ODOM_TOPIC"],
+        "/utlidar/robot_odom",
+    );
+    let pointcloud_source_topic = env_first(
+        &["NUWAX_GO2_POINTCLOUD_SOURCE", "NUWAX_GEOMETRY_POINT_CLOUD_TOPIC"],
+        "/utlidar/cloud",
+    );
     let direct_subscribe = std::env::var("NUWAX_GO2_DIRECT_SUBSCRIBE")
         .unwrap_or_else(|_| "true".into())
         .parse::<bool>()

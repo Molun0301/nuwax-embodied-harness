@@ -38,13 +38,14 @@ def build_default_external_slam_nav2_script() -> str:
 class GeometryTopicsConfig:
     """平台几何侧车统一话题配置。"""
 
-    odom_topic: str = "/odom"
+    odom_topic: str = "/utlidar/robot_odom"
     secondary_odom_topics: Tuple[str, ...] = ()
     imu_topic: str = "/utlidar/imu"
     point_cloud_topic: str = "/utlidar/cloud_deskewed"
     tf_topic: str = "/tf"
     tf_static_topic: str = "/tf_static"
     occupancy_topic: str = "/map"
+    cloud_map_topic: str = "/cloud_map"
     cost_map_topic: str = "/global_costmap/costmap"
 
 
@@ -54,7 +55,7 @@ class GeometryFrameConfig:
 
     map_frame: str = "map"
     odom_frame: str = "odom"
-    base_frame: str = "base_footprint"
+    base_frame: str = "base_link"
     lidar_frame: str = "utlidar_lidar"
     imu_frame: str = "utlidar_imu"
 
@@ -169,7 +170,7 @@ class ExternalGeometryStackConfig:
 
     enabled: bool = True
     script_path: str = field(default_factory=build_default_external_slam_nav2_script)
-    args: Tuple[str, ...] = ("--no-rviz",)
+    args: Tuple[str, ...] = ()
     process_name: str = "external_slam_nav2"
     log_name: str = "external_slam_nav2.log"
     provides_map: bool = True
@@ -177,6 +178,8 @@ class ExternalGeometryStackConfig:
     provides_tf: bool = True
     input_bridge_enabled: bool = False
     point_cloud_bridge_enabled: bool = False
+    platform_odom_tf_bridge_enabled: bool = False
+    platform_cmd_vel_bridge_enabled: bool = False
 
 
 @dataclass

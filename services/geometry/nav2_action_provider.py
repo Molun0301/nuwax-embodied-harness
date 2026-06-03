@@ -187,8 +187,8 @@ class Nav2ActionNavigationProvider:
                         "goal_sequence": goal_sequence,
                     },
                 )
-            LOGGER.debug(
-                "Nav2 bridge 发送 NavigateToPose goal_id=%s goal_sequence=%s target=(%.3f, %.3f, %.3f) frame=%s action=%s",
+            LOGGER.info(
+                "Nav2 action 发送 NavigateToPose goal_id=%s goal_sequence=%s target=(%.3f, %.3f, %.3f) frame=%s action=%s",
                 goal.goal_id,
                 goal_sequence,
                 float(goal_msg.pose.pose.position.x),
@@ -197,20 +197,13 @@ class Nav2ActionNavigationProvider:
                 goal_msg.pose.header.frame_id,
                 self.runtime.config.nav2.action_name,
             )
-            from geometry_msgs.msg import PoseStamped
-            bridge_msg = PoseStamped()
-            bridge_msg.header.frame_id = str(goal.target_pose.frame_id or self.runtime.config.frames.map_frame)
-            bridge_msg.header.stamp = self._node.get_clock().now().to_msg()
-            bridge_msg.pose.position.x = float(goal.target_pose.position.x)
-            bridge_msg.pose.position.y = float(goal.target_pose.position.y)
-            bridge_msg.pose.position.z = float(goal.target_pose.position.z)
-            bridge_msg.pose.orientation.x = float(goal.target_pose.orientation.x)
-            bridge_msg.pose.orientation.y = float(goal.target_pose.orientation.y)
-            bridge_msg.pose.orientation.z = float(goal.target_pose.orientation.z)
-            bridge_msg.pose.orientation.w = float(goal.target_pose.orientation.w)
-            self._bridge_goal_pub.publish(bridge_msg)
-            with self._lock:
-                self._state = self._state.model_copy(update={"status": NavigationStatus.RUNNING, "message": "Nav2 目标已通过 bridge 发送。"}, deep=True)
+            send_future = self._action_client.send_goal_async(
+                goal_msg,
+                feedback_callback=lambda feedback: self._on_feedback(feedback, goal.goal_id, goal_sequence),
+            )
+            send_future.add_done_callback(
+                lambda completed: self._on_goal_response(completed, goal.goal_id, goal_sequence)
+            )
         except Exception as exc:
             LOGGER.info("Nav2 action 发送目标异常 goal_id=%s target=%s error=%s", goal.goal_id, target_pose_metadata, exc)
             metadata = {"backend": "nav2", "failure_reason": "action_send_failed", "error": str(exc), "target_pose": target_pose_metadata}
@@ -230,12 +223,13 @@ class Nav2ActionNavigationProvider:
     def cancel_goal(self) -> bool:
         with self._lock:
             current_goal_id = self._state.current_goal_id
+            goal_handle = self._goal_handle
             self._goal_sequence += 1
             self._goal_handle = None
             self._result_future = None
         try:
-            from std_msgs.msg import Empty
-            self._bridge_cancel_pub.publish(Empty())
+            if goal_handle is not None:
+                goal_handle.cancel_goal_async()
         except Exception:
             pass
         with self._lock:
@@ -369,12 +363,6 @@ class Nav2ActionNavigationProvider:
                 self._action_client = ActionClient(self._node, NavigateToPose, str(self.runtime.config.nav2.action_name or "/navigate_to_pose"))
                 self._node.create_subscription(OccupancyGrid, self._global_costmap.topic, self._on_global_costmap, 10)
                 self._node.create_subscription(OccupancyGrid, self._local_costmap.topic, self._on_local_costmap, 10)
-                from geometry_msgs.msg import PoseStamped
-                from std_msgs.msg import Empty, String
-                self._bridge_goal_pub = self._node.create_publisher(PoseStamped, "/nuwax/nav2_goal", 5)
-                self._bridge_cancel_pub = self._node.create_publisher(Empty, "/nuwax/nav2_cancel", 5)
-                self._node.create_subscription(String, "/nuwax/nav2_result", self._on_bridge_result, 5)
-                self._node.create_subscription(String, "/nuwax/nav2_feedback", self._on_bridge_feedback, 5)
                 for node_name in _NAV2_LIFECYCLE_NODES:
                     self._lifecycle_clients[node_name] = self._node.create_client(GetState, "/%s/get_state" % node_name)
                 self._thread = threading.Thread(target=self._executor.spin, name="nuwax_nav2_action_provider", daemon=True)
@@ -540,7 +528,7 @@ class Nav2ActionNavigationProvider:
                 )
                 self._state = NavigationState(current_goal_id=goal_id, status=NavigationStatus.FAILED, current_pose=self._read_current_pose(), message="Nav2 action server 拒绝导航目标。", metadata={"backend": "nav2", "failure_reason": "goal_rejected", "goal_sequence": goal_sequence, "target_pose": target_pose})
                 return
-            LOGGER.debug(
+            LOGGER.info(
                 "Nav2 action server 接受目标 goal_id=%s goal_sequence=%s target=%s",
                 goal_id,
                 goal_sequence,

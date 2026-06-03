@@ -10,6 +10,8 @@ RESTART_SEC="${NUWAX_GATEWAY_RESTART_SEC:-3}"
 RESTART_MAX_ATTEMPTS="${NUWAX_GATEWAY_RESTART_MAX_ATTEMPTS:-0}"
 ACTION="${1:-start}"
 PID_FILE=""
+LOCK_FILE=""
+LOCK_FD=""
 GATEWAY_PID=""
 VIDEO_STREAMER_PID=""
 ROS_BRIDGE_PID=""
@@ -35,6 +37,9 @@ load_env_file() {
     fi
     key="$(trim_whitespace "${line%%=*}")"
     value="$(trim_whitespace "${line#*=}")"
+    if [[ "${value}" == *[[:space:]]\#* ]]; then
+      value="$(trim_whitespace "${value%%#*}")"
+    fi
     if [[ -z "${key}" ]]; then
       continue
     fi
@@ -61,6 +66,18 @@ source_runtime_script() {
   if [[ -f "${target}" ]]; then
     # shellcheck disable=SC1090
     source "${target}"
+  fi
+}
+
+acquire_script_lock() {
+  local lock_path="$1"
+  mkdir -p "$(dirname "${lock_path}")"
+  # shellcheck disable=SC3045
+  exec {LOCK_FD}>"${lock_path}"
+  if ! flock -n "${LOCK_FD}"; then
+    echo "another start_gateway.sh instance is running (lock: ${lock_path})." >&2
+    echo "please stop existing one before running '${ACTION}' again." >&2
+    exit 1
   fi
 }
 
@@ -174,11 +191,42 @@ cleanup_stale_gateway_processes() {
   done < <(ps -eo pid=,args=)
 }
 
+cleanup_stale_ros_bridge_processes() {
+  local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
+  local pid=""
+  local args=""
+
+  while read -r pid args; do
+    if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
+      continue
+    fi
+    if [[ "${args}" == *"nuwax-ros-bridge"* ]]; then
+      terminate_process_scope "${pid}" "stale ros-bridge"
+    fi
+  done < <(ps -eo pid=,args=)
+
+  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+}
+
 cleanup_external_geometry_processes() {
   local geometry_root="${REPO_ROOT}/services/geometry/ros2_ws/src/go2slam"
   local pid=""
   local args=""
   local pgid=""
+  local pattern=""
+  local go2_patterns=(
+    "ros2 launch go2_nav"
+    "ros2 service call /rtabmap/publish_map"
+    "/rtabmap_slam/rtabmap"
+    "/nav2_controller/controller_server"
+    "/nav2_planner/planner_server"
+    "/nav2_recoveries/recoveries_server"
+    "/nav2_bt_navigator/bt_navigator"
+    "/nav2_map_server/map_server"
+    "/nav2_lifecycle_manager/lifecycle_manager"
+    "go2_nav/(wait_for_map_tf|rtabmap_force_localization_params)[.]sh"
+    "go2_nav/(odom_tf_broadcaster|cloud_to_scan|cmd_vel_bridge|frontier_explorer)[.]py"
+  )
   declare -A seen_pgids=()
 
   if ! is_truthy "${NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY:-true}"; then
@@ -199,6 +247,14 @@ cleanup_external_geometry_processes() {
     seen_pgids["${pgid}"]=1
     terminate_process_scope "${pid}" "external geometry process group ${pgid}"
   done < <(ps -eo pid=,args=)
+
+  for pattern in "${go2_patterns[@]}"; do
+    pkill -TERM -f "${pattern}" 2>/dev/null || true
+  done
+  sleep 1
+  for pattern in "${go2_patterns[@]}"; do
+    pkill -KILL -f "${pattern}" 2>/dev/null || true
+  done
 }
 
 remove_pid_file() {
@@ -221,6 +277,7 @@ stop_existing_gateway() {
   if [[ -z "${pid}" ]]; then
     echo "gateway pid file not found: ${PID_FILE}"
     cleanup_stale_gateway_processes
+    cleanup_stale_ros_bridge_processes
     cleanup_external_geometry_processes
     return 0
   fi
@@ -229,6 +286,7 @@ stop_existing_gateway() {
     echo "gateway pid ${pid} is not running; removing stale pid file."
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
+    cleanup_stale_ros_bridge_processes
     cleanup_external_geometry_processes
     return 0
   fi
@@ -236,6 +294,7 @@ stop_existing_gateway() {
   terminate_process_scope "${pid}" "gateway supervisor"
   rm -f "${PID_FILE}"
   cleanup_stale_gateway_processes
+  cleanup_stale_ros_bridge_processes
   cleanup_external_geometry_processes
 }
 
@@ -269,8 +328,32 @@ start_ros_bridge() {
     return 0
   fi
   local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
+  local bridge_env_script="${NUWAX_ROS_BRIDGE_ENV_SCRIPT:-}"
+  if [[ -z "${bridge_env_script}" && -n "${NUWAX_GEOMETRY_EXTERNAL_SCRIPT:-}" ]]; then
+    bridge_env_script="$(dirname "${NUWAX_GEOMETRY_EXTERNAL_SCRIPT}")/scripts/env.sh"
+  fi
+  local bridge_map_topic="${NUWAX_MAP_TOPIC:-${NUWAX_GEOMETRY_OCCUPANCY_TOPIC:-/map}}"
+  local bridge_tf_topic="${NUWAX_TF_TOPIC:-${NUWAX_GEOMETRY_TF_TOPIC:-/tf}}"
+  local bridge_nav_action="${NUWAX_NAV_ACTION:-${NUWAX_NAV2_ACTION_NAME:-/navigate_to_pose}}"
+  local bridge_odom_source="${NUWAX_GO2_ODOM_SOURCE:-${NUWAX_GEOMETRY_ODOM_TOPIC:-/utlidar/robot_odom}}"
+  local bridge_cloud_source="${NUWAX_GO2_POINTCLOUD_SOURCE:-${NUWAX_GEOMETRY_POINT_CLOUD_TOPIC:-/utlidar/cloud}}"
   echo "starting Rust ros-bridge: ${binary}"
-  (set +u; source /opt/ros/foxy/setup.bash; set -u; exec "${binary}") &
+  (
+    set +u
+    export NUWAX_MAP_TOPIC="${bridge_map_topic}"
+    export NUWAX_TF_TOPIC="${bridge_tf_topic}"
+    export NUWAX_NAV_ACTION="${bridge_nav_action}"
+    export NUWAX_GO2_ODOM_SOURCE="${bridge_odom_source}"
+    export NUWAX_GO2_POINTCLOUD_SOURCE="${bridge_cloud_source}"
+    if [[ -f "${bridge_env_script}" ]]; then
+      source "${bridge_env_script}"
+    else
+      source /opt/ros/foxy/setup.bash
+      export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    fi
+    set -u
+    exec "${binary}"
+  ) &
   ROS_BRIDGE_PID="$!"
   # 等待 UDS socket 出现
   local waited=0
@@ -303,7 +386,7 @@ stop_ros_bridge() {
     wait "${ROS_BRIDGE_PID}" >/dev/null 2>&1 || true
   fi
   ROS_BRIDGE_PID=""
-  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm
+  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
 }
 
 monitor_ros_bridge() {
@@ -311,7 +394,7 @@ monitor_ros_bridge() {
     sleep 5
     if [[ -n "${ROS_BRIDGE_PID}" ]] && ! is_pid_alive "${ROS_BRIDGE_PID}"; then
       echo "Rust ros-bridge (pid ${ROS_BRIDGE_PID}) crashed, restarting..." >&2
-      rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm
+      rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
       ROS_BRIDGE_PID=""
       start_ros_bridge
     fi
@@ -347,10 +430,19 @@ if [[ -f "${GO2_DATA_PLANE_ENV_FILE}" ]]; then
   load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
 fi
 
+unset RMW_IMPLEMENTATION
+if grep -q '^CYCLONEDDS_URI=' "${ENV_FILE}" 2>/dev/null; then
+  CYCLONEDDS_URI="$(grep '^CYCLONEDDS_URI=' "${ENV_FILE}" | head -1)"
+  CYCLONEDDS_URI="${CYCLONEDDS_URI#CYCLONEDDS_URI=}"
+  export CYCLONEDDS_URI
+fi
+
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
 PID_FILE="${NUWAX_GATEWAY_PID_FILE:-${REPO_ROOT}/runtime_data/gateway/gateway.pid}"
+LOCK_FILE="${NUWAX_GATEWAY_LOCK_FILE:-${REPO_ROOT}/runtime_data/gateway/start_gateway.lock}"
 HOST="${NUWAX_GATEWAY_HOST:-0.0.0.0}"
 PORT="${NUWAX_GATEWAY_PORT:-8766}"
+acquire_script_lock "${LOCK_FILE}"
 
 case "${ACTION}" in
   start)
@@ -360,6 +452,7 @@ case "${ACTION}" in
     fi
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
+    cleanup_stale_ros_bridge_processes
     cleanup_external_geometry_processes
     ;;
   stop)

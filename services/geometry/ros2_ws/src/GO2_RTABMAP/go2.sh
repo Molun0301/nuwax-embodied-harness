@@ -150,10 +150,41 @@ source "$SCRIPT_DIR/scripts/env.sh"
 # Kill any stale processes from a previous run so launch can rebind cleanly.
 # ---------------------------------------------------------------------------
 echo "[go2.sh] Cleaning up any leftover Nav2/RTAB-Map/explorer processes..."
-pkill -9 -f \
-  "bt_navigator|planner_server|controller_server|recoveries_server|lifecycle_manager|cloud_to_scan|rtabmap|odom_tf_broadcaster|cmd_vel_bridge|frontier_explorer" \
-  2>/dev/null || true
+KILL_PATTERNS=(
+  "ros2 launch go2_nav"
+  "go2_mapping.launch.py|go2_navigation.launch.py|go2_exploration.launch.py"
+  "bt_navigator|planner_server|controller_server|recoveries_server|behavior_server|smoother_server|waypoint_follower|velocity_smoother"
+  "map_server|amcl|lifecycle_manager"
+  "rtabmap|rtabmap_ros|rtabmap_viz|rtabmap_sync"
+  "cloud_to_scan|odom_tf_broadcaster|cmd_vel_bridge|frontier_explorer"
+)
+
+for pattern in "${KILL_PATTERNS[@]}"; do
+  pkill -TERM -f "$pattern" 2>/dev/null || true
+done
 sleep 1
+
+# Escalate to SIGKILL if anything still survives.
+for pattern in "${KILL_PATTERNS[@]}"; do
+  if pgrep -f "$pattern" >/dev/null 2>&1; then
+    echo "[go2.sh] Force killing leftover: $pattern"
+    pkill -KILL -f "$pattern" 2>/dev/null || true
+  fi
+done
+
+# Verify no leftovers remain; retry a few rounds for stubborn children.
+for attempt in 1 2 3; do
+  leftovers=0
+  for pattern in "${KILL_PATTERNS[@]}"; do
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+      leftovers=1
+      echo "[go2.sh] Cleanup retry $attempt for: $pattern"
+      pkill -KILL -f "$pattern" 2>/dev/null || true
+    fi
+  done
+  [[ "$leftovers" -eq 0 ]] && break
+  sleep 1
+done
 
 # ---------------------------------------------------------------------------
 # Dispatch to the matching ROS 2 launch file.

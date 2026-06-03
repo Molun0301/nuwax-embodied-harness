@@ -11,7 +11,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -39,13 +39,18 @@ def generate_launch_description():
         ),
 
         # Nav2 stack
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                os.path.join(go2_nav_dir, 'launch', 'nav2.launch.py')
-            ),
-            launch_arguments={
-                'use_sim_time': use_sim_time,
-            }.items(),
+        TimerAction(
+            period=6.0,
+            actions=[
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        os.path.join(go2_nav_dir, 'launch', 'nav2.launch.py')
+                    ),
+                    launch_arguments={
+                        'use_sim_time': use_sim_time,
+                    }.items(),
+                ),
+            ],
         ),
 
         # cmd_vel -> GO2 sport API bridge
@@ -64,21 +69,28 @@ def generate_launch_description():
 
         # Frontier-based autonomous exploration.
         # Starts ~5s late so /map and Nav2 lifecycle have time to come up.
-        Node(
-            package='go2_nav',
-            executable='frontier_explorer.py',
-            name='frontier_explorer',
-            output='screen',
-            parameters=[{
-                'map_topic': '/map',
-                'global_frame': 'map',
-                'robot_frame': 'base_link',
-                'replan_period': 3.0,           # re-evaluate every 3s
-                'min_frontier_size': 10,        # cells, after clustering
-                'distance_weight': 0.5,         # score = size - alpha*dist_cells
-                'blacklist_radius': 0.5,        # m
-                'blacklist_ttl': 60.0,          # s
-                'max_consecutive_failures': 5,
-            }],
+        TimerAction(
+            period=15.0,
+            actions=[
+                Node(
+                    package='go2_nav',
+                    executable='frontier_explorer.py',
+                    name='frontier_explorer',
+                    output='screen',
+                    parameters=[{
+                        'map_topic': '/map',
+                        'global_frame': 'map',
+                        'robot_frame': 'base_link',
+                        'replan_period': 3.0,           # re-evaluate every 3s
+                        'min_frontier_size': 10,        # cells, after clustering
+                        'distance_weight': 0.5,         # score = size - alpha*dist_cells
+                        'blacklist_radius': 0.5,        # m
+                        'blacklist_ttl': 60.0,          # s
+                        'max_consecutive_failures': 5,
+                        # Extra warmup to avoid Nav2 "send_goal failed" race.
+                        'startup_grace_period': 15.0,
+                    }],
+                ),
+            ],
         ),
     ])

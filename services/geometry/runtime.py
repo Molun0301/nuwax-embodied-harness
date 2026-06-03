@@ -7,18 +7,26 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import signal
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Protocol, TYPE_CHECKING, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING, runtime_checkable
 from urllib.parse import quote
 
 from contracts.geometry import Pose, Vector3
 from contracts.map_workspace import MapGeometryAssetBinding, MapGeometryAssetRef, MapGeometryAssetType, MapVersion
-from contracts.navigation import ExplorationState, ExplorationStatus, NavigationGoal, NavigationState, NavigationStatus
+from contracts.navigation import (
+    ExplorationState,
+    ExplorationStatus,
+    ExploreAreaRequest,
+    NavigationGoal,
+    NavigationState,
+    NavigationStatus,
+)
 from contracts.runtime_views import MapSnapshot
 from drivers.common import ExplorationDataPlane, LocalizationDataPlane, MappingDataPlane, NavigationDataPlane, RobotAssemblyBase
 from providers.exploration import ExplorationProvider
@@ -27,11 +35,14 @@ from providers.maps import MapProvider
 from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
 from providers.pointcloud import PointCloudProvider
+from services.geometry.cmd_vel_bridge import Ros2CmdVelMotionBridge
 from services.geometry.config import PlatformGeometryConfig
+from services.geometry.external_debug_observer import ExternalGeometryDebugObserver
 from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
 from services.geometry.ros_bridge_client import RosBridgeSubprocess
 from services.geometry.remote_provider import RosBridgeProvider
 from services.geometry.rosout_bridge import RosoutBridge
+from services.mapping.catalog import _to_safe_dir_segment
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
 from services.navigation.frontier import FrontierExplorer
@@ -98,28 +109,46 @@ class _ManagedProcess:
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
-    def stop(self, *, timeout_sec: float = 5.0) -> None:
+    def stop(
+        self,
+        *,
+        timeout_sec: float = 5.0,
+        graceful_launch_shutdown: bool = False,
+        graceful_timeout_sec: float = 20.0,
+    ) -> None:
         process = self.process
         if process is None or process.poll() is not None:
             self.poll()
             return
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        except Exception:
+
+        def _signal_process_group(sig: signal.Signals) -> None:
             try:
-                process.terminate()
+                os.killpg(os.getpgid(process.pid), sig)
             except Exception:
+                try:
+                    if sig == signal.SIGINT:
+                        process.send_signal(signal.SIGINT)
+                    elif sig == signal.SIGTERM:
+                        process.terminate()
+                    else:
+                        process.kill()
+                except Exception:
+                    pass
+
+        if graceful_launch_shutdown:
+            _signal_process_group(signal.SIGINT)
+            try:
+                process.wait(timeout=max(1.0, float(graceful_timeout_sec)))
+                self.poll()
+                return
+            except subprocess.TimeoutExpired:
                 pass
+
+        _signal_process_group(signal.SIGTERM)
         try:
             process.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+            _signal_process_group(signal.SIGKILL)
             try:
                 process.wait(timeout=1.0)
             except Exception:
@@ -233,9 +262,12 @@ class PlatformGeometryRuntime:
         self._map_stream_tracker: Dict[str, object] = {}
         self._nav2_launch_attempted = False
         self._nav2_action_provider = Nav2ActionNavigationProvider(self)
+        self._cmd_vel_bridge: Optional[Ros2CmdVelMotionBridge] = None
         self._ros_bridge_subprocess: Optional[RosBridgeSubprocess] = None
         self._remote_provider: Optional[RosBridgeProvider] = None
         self._rosout_bridge = RosoutBridge()
+        self._external_debug_observer: Optional[ExternalGeometryDebugObserver] = None
+        self._external_debug_frontier_payload: Optional[Dict[str, object]] = None
         self._platform_exploration_config = ExplorationConfig(enabled=True)
         self._platform_exploration_runtime = PlatformExplorationRuntime(
             frontier_explorer=FrontierExplorer(self._platform_exploration_config),
@@ -253,6 +285,13 @@ class PlatformGeometryRuntime:
         self._exploration_last_tick_source: Optional[str] = None
         self._exploration_update_subscribers: Dict[int, Callable[[ExplorationState], None]] = {}
         self._next_exploration_subscription_id = 1
+        self._external_exploration_request: Optional[ExploreAreaRequest] = None
+        self._external_exploration_started_at_monotonic: Optional[float] = None
+        self._external_exploration_started_at_iso: Optional[str] = None
+        self._external_exploration_deadline_monotonic: Optional[float] = None
+        self._external_exploration_database_path: Optional[str] = None
+        self._external_exploration_version_id: Optional[str] = None
+        self._external_exploration_terminal_state: Optional[ExplorationState] = None
         self.providers = PlatformGeometryProviderBundle(self)
 
     def start(self) -> None:
@@ -282,6 +321,7 @@ class PlatformGeometryRuntime:
             if not self._uses_external_geometry_stack():
                 raise RuntimeError(self._removed_internal_stack_message())
             self._set_runtime_state("starting_external", "正在启动外部 SLAM/Nav2 几何脚本。")
+            self._start_ros_bridge_subprocess()
             self._ensure_external_geometry_observers_started()
             self._start_required_processes()
             self._set_runtime_state("starting_external", "外部 SLAM/Nav2 几何脚本已启动，等待 /map、TF 与 Nav2 action。")
@@ -297,11 +337,29 @@ class PlatformGeometryRuntime:
             if self.config.require_ros2:
                 raise
 
+    def _get_motion_provider(self) -> Optional[MotionControl]:
+        providers = getattr(self.robot, "providers", None)
+        if providers is not None and isinstance(providers, MotionControl):
+            return providers
+        return None
+
     def stop(self) -> None:
         """停止平台几何运行时。"""
 
         self._set_runtime_state("stopping", "正在停止平台几何侧车进程。")
         self._runtime_stop_event.set()
+        if self._cmd_vel_bridge is not None:
+            try:
+                self._cmd_vel_bridge.stop()
+            except Exception:
+                pass
+            self._cmd_vel_bridge = None
+        if self._external_debug_observer is not None:
+            try:
+                self._external_debug_observer.stop()
+            except Exception:
+                pass
+            self._external_debug_observer = None
         self._stop_platform_exploration_loop(cancel_navigation=True, notify=True)
         thread = self._runtime_monitor_thread
         if thread is not None and thread.is_alive():
@@ -373,7 +431,147 @@ class PlatformGeometryRuntime:
         return [str(item) for item in raw_args if str(item or "").strip()]
 
     def _build_external_geometry_command(self) -> List[str]:
-        return [str(self._external_script_path()), *self._external_args()]
+        script_path = self._external_script_path()
+        args = self._external_args()
+        mode_flags = {"-m", "--new", "--mapping", "-l", "--loc", "--localization", "-e", "--explore", "--exploration"}
+        # go2.sh 要求必须显式指定 mode；若未配置 mode，则默认走 mapping 模式，避免直接退出(code=2)。
+        if script_path.name == "go2.sh" and not any(arg in mode_flags for arg in args):
+            args = ["--mapping", *args]
+        return [str(script_path), *args]
+
+    def _build_external_exploration_command(self, request: Optional[ExploreAreaRequest] = None) -> List[str]:
+        mode_flags = {"-m", "--new", "--mapping", "-l", "--loc", "--localization", "-e", "--explore", "--exploration"}
+        passthrough_args = [arg for arg in self._external_args() if arg not in mode_flags]
+        db_path = self._external_exploration_database_path_for_request(request)
+        return [str(self._external_script_path()), "--explore", *passthrough_args, str(db_path)]
+
+    def _external_exploration_database_path_for_request(self, request: Optional[ExploreAreaRequest]) -> Path:
+        map_name = str(getattr(request, "map_name", "") or "").strip() if request is not None else ""
+        if map_name:
+            version_id = self._next_exploration_map_version_id(map_name)
+            path = self._version_backend_state_path(map_name, version_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._exploration_loop_lock:
+                self._external_exploration_version_id = version_id
+            return path
+        return self._default_external_exploration_database_path()
+
+    def plan_external_exploration(self, request: ExploreAreaRequest) -> Dict[str, object]:
+        """返回即将执行的 launch_rtabmap.sh --explore 命令与版本目录下的 .db 路径。"""
+
+        command = self._build_external_exploration_command(request)
+        db_path = self._extract_external_exploration_database_path(command)
+        version_id = self.get_exploration_pinned_version_id()
+        return {
+            "exploration_launch_mode": "explore",
+            "exploration_script": str(self._external_script_path()),
+            "exploration_command": command,
+            "exploration_database_path": db_path,
+            "exploration_version_id": version_id,
+        }
+
+    def get_exploration_pinned_version_id(self) -> Optional[str]:
+        """返回当前探索会话绑定的 mapver_*，保存版本时应写入同一路径。"""
+
+        with self._exploration_loop_lock:
+            return str(self._external_exploration_version_id or "").strip() or None
+
+    def clear_exploration_pinned_version_context(self) -> None:
+        with self._exploration_loop_lock:
+            self._external_exploration_version_id = None
+            self._external_exploration_database_path = None
+
+    def clear_external_exploration_state(self, *, reason: str = "") -> None:
+        with self._exploration_loop_lock:
+            self._external_exploration_request = None
+            self._external_exploration_started_at_monotonic = None
+            self._external_exploration_started_at_iso = None
+            self._external_exploration_deadline_monotonic = None
+            self._external_exploration_database_path = None
+            self._external_exploration_version_id = None
+            self._external_exploration_terminal_state = None
+            self._external_debug_frontier_payload = None
+            self._exploration_tick_count = 0
+            self._exploration_last_tick_at_iso = None
+            self._exploration_last_tick_monotonic = None
+            self._exploration_last_tick_source = str(reason or "").strip() or "clear_external_exploration_state"
+
+    def _next_exploration_map_version_id(self, map_name: str) -> str:
+        versions_root = self._safe_map_dir(map_name) / "versions"
+        latest_revision = 0
+        if versions_root.exists():
+            for version_dir in versions_root.iterdir():
+                if not version_dir.is_dir() or not (version_dir / "version.json").exists():
+                    continue
+                name = version_dir.name
+                if not name.startswith("mapver_"):
+                    continue
+                try:
+                    latest_revision = max(latest_revision, int(name.split("_", 1)[1]))
+                except (IndexError, ValueError):
+                    continue
+        return "mapver_%06d" % (latest_revision + 1)
+
+    def _default_external_exploration_database_path(self) -> Path:
+        raw_path = (
+            os.environ.get("NUWAX_BACKEND_DATABASE_PATH")
+            or os.environ.get("NUWAX_RTABMAP_DATABASE_PATH")
+            or ""
+        ).strip()
+        if raw_path:
+            path = Path(raw_path).expanduser()
+        else:
+            root = (
+                os.environ.get("NUWAX_BACKEND_DATABASE_ROOT")
+                or os.environ.get("NUWAX_RTABMAP_DATABASE_ROOT")
+                or self.config.rtabmap.database_root
+            )
+            path = Path(str(root)).expanduser() / "live_rtabmap.db"
+        if not path.is_absolute():
+            path = self._repo_root() / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _env_truthy(*names: str, default: str = "false") -> bool:
+        value = default
+        for name in names:
+            candidate = os.environ.get(name)
+            if candidate is not None:
+                value = candidate
+                break
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _external_localization_uses_static_map_yaml(self) -> bool:
+        return self._env_truthy(
+            "GO2_NAV_USE_STATIC_MAP_YAML",
+            "NUWAX_NAV2_USE_STATIC_MAP_YAML",
+            "GO2_NAV_AUTO_MAP_YAML",
+        )
+
+    @staticmethod
+    def _command_uses_external_exploration(command: List[str]) -> bool:
+        return any(str(part) in {"-e", "--explore", "--exploration"} for part in command)
+
+    def _external_geometry_process_is_exploration(self) -> bool:
+        process = self._managed_processes.get(self._external_process_name())
+        return bool(
+            process is not None
+            and process.is_running()
+            and self._command_uses_external_exploration(process.command)
+        )
+
+    @staticmethod
+    def _command_uses_external_localization(command: List[str]) -> bool:
+        return any(str(part) in {"-l", "--loc", "--localization"} for part in command)
+
+    def _external_geometry_process_is_localization(self) -> bool:
+        process = self._managed_processes.get(self._external_process_name())
+        return bool(
+            process is not None
+            and process.is_running()
+            and self._command_uses_external_localization(process.command)
+        )
 
     def _external_input_bridge_enabled(self) -> bool:
         return bool(getattr(self.config.external, "input_bridge_enabled", False))
@@ -382,6 +580,14 @@ class PlatformGeometryRuntime:
         return self._external_input_bridge_enabled() or bool(
             getattr(self.config.external, "point_cloud_bridge_enabled", False)
         )
+
+    def _platform_odom_tf_bridge_enabled(self) -> bool:
+        return self._external_input_bridge_enabled() or bool(
+            getattr(self.config.external, "platform_odom_tf_bridge_enabled", False)
+        )
+
+    def _platform_cmd_vel_bridge_enabled(self) -> bool:
+        return bool(getattr(self.config.external, "platform_cmd_vel_bridge_enabled", False))
 
     def _run_preflight_checks(self) -> List[str]:
         if self._uses_external_geometry_stack():
@@ -402,7 +608,7 @@ class PlatformGeometryRuntime:
             errors.append("外部 SLAM/Nav2 script 不是文件 %s" % script_path)
         elif not os.access(script_path, os.X_OK):
             errors.append("外部 SLAM/Nav2 script 不可执行 %s" % script_path)
-        if self._external_input_bridge_enabled():
+        if self._external_input_bridge_enabled() or self._platform_odom_tf_bridge_enabled():
             launch_script = self._geometry_script("launch_ros2_stack.sh")
             if not launch_script.exists():
                 errors.append("缺少 ROS2 环境启动脚本 %s，无法启动可选 odom/TF 桥。" % launch_script)
@@ -453,25 +659,42 @@ class PlatformGeometryRuntime:
             message = self._removed_internal_stack_message()
             self._record_runtime_diagnostic("removed_internal_rtabmap_stack", message)
             raise RuntimeError(message)
-        # odom_tf_bridge 在平台进程（FastRTPS）中启动：Unitree SDK 在 FastRTPS 域发布 /odom，
-        # odom_tf_bridge 订阅后发布 odom→base_footprint TF，跨 RMW 对 slam_toolbox 可见
-        self._start_managed_process(
-            "external_odom_tf_bridge",
-            self._build_odom_tf_bridge_command(),
-            "external_odom_tf_bridge.log",
-        )
+        platform_odom_tf_bridge_enabled = self._platform_odom_tf_bridge_enabled()
+        platform_cmd_vel_bridge_enabled = self._platform_cmd_vel_bridge_enabled()
+        if platform_odom_tf_bridge_enabled:
+            self._start_managed_process(
+                "external_odom_tf_bridge",
+                self._build_odom_tf_bridge_command(),
+                "external_odom_tf_bridge.log",
+            )
         self._start_managed_process(
             self._external_process_name(),
             self._build_external_geometry_command(),
             self._external_log_name(),
         )
+        if platform_cmd_vel_bridge_enabled:
+            try:
+                bridge = Ros2CmdVelMotionBridge(
+                    config=self.config,
+                    motion_provider_resolver=self._get_motion_provider,
+                )
+                bridge.start()
+                self._cmd_vel_bridge = bridge
+                LOGGER.info("ROS2 cmd_vel 运动桥已启动，订阅 %s", bridge.topic)
+            except Exception as exc:
+                LOGGER.warning("ROS2 cmd_vel 运动桥启动失败（机器人不会响应 Nav2 /cmd_vel）：%s", exc)
         if self._external_input_bridge_enabled():
             self._start_ros_bridge_subprocess()
-            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台启动 ROS2 odom/点云输入桥与 odom TF bridge，不启动内置 RTAB-Map/Nav2。"
+            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台启动 ROS2 odom/点云输入桥，不启动内置 RTAB-Map/Nav2。"
         elif self._external_point_cloud_bridge_enabled():
             bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台只启动 ROS2 点云输入桥，跳过 odom/odom_tf_bridge。"
         else:
-            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台启动 odom_tf_bridge，跳过内置 RTAB-Map/Nav2。"
+            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台跳过 odom_tf_bridge/cmd_vel_bridge 与内置 RTAB-Map/Nav2。"
+        if platform_odom_tf_bridge_enabled or platform_cmd_vel_bridge_enabled:
+            bridge_message += " 平台兼容桥启用：odom_tf=%s, cmd_vel=%s。" % (
+                platform_odom_tf_bridge_enabled,
+                platform_cmd_vel_bridge_enabled,
+            )
         self._record_runtime_diagnostic(
             "external_slam_nav2",
             bridge_message,
@@ -510,8 +733,34 @@ class PlatformGeometryRuntime:
 
     def _start_managed_process(self, name: str, command: List[str], log_name: str, *, restart: bool = False) -> None:
         current = self._managed_processes.get(name)
+        if name == self._external_process_name():
+            with self._exploration_loop_lock:
+                exploration_active = (
+                    self._external_exploration_request is not None
+                    and self._external_exploration_terminal_state is None
+                )
+            if (
+                exploration_active
+                and current is not None
+                and current.is_running()
+                and self._command_uses_external_exploration(current.command)
+                and not self._command_uses_external_exploration(command)
+            ):
+                LOGGER.info(
+                    "外部探索运行中，忽略非探索模式进程切换请求。current=%s incoming=%s",
+                    current.command,
+                    list(command),
+                )
+                return
         if current is not None and current.is_running():
-            return
+            if current.command == list(command):
+                return
+            current.stop(
+                timeout_sec=12.0,
+                graceful_launch_shutdown=(name == self._external_process_name()),
+                graceful_timeout_sec=15.0,
+            )
+            restart = True
         process = current or _ManagedProcess(
             name=name,
             command=list(command),
@@ -525,6 +774,12 @@ class PlatformGeometryRuntime:
     def _stop_managed_processes(self) -> None:
         for process in list(self._managed_processes.values()):
             process.stop()
+        if self._external_debug_observer is not None:
+            try:
+                self._external_debug_observer.stop()
+            except Exception:
+                pass
+            self._external_debug_observer = None
         if self._ros_bridge_subprocess is not None:
             self._ros_bridge_subprocess.stop()
             self._ros_bridge_subprocess = None
@@ -564,10 +819,22 @@ class PlatformGeometryRuntime:
                 if self.config.require_ros2:
                     return
 
+    def _should_suppress_external_process_autorestart(self) -> bool:
+        """探索进行中或 finalize 落盘前，禁止 monitor 把外部栈自动拉回 --mapping live db。"""
+
+        with self._exploration_loop_lock:
+            if self._external_exploration_request is not None:
+                return True
+            if self._external_exploration_database_path:
+                return True
+        return False
+
     def _monitor_processes_once(self) -> None:
         for name, process in list(self._managed_processes.items()):
             exit_code = process.poll()
             if exit_code is None or process.is_running():
+                continue
+            if name == self._external_process_name() and self._should_suppress_external_process_autorestart():
                 continue
             if process.restart_count < _GEOMETRY_SIDE_CAR_RESTART_LIMIT:
                 self._set_runtime_state("recovering", "%s 进程异常退出，正在尝试恢复。" % name)
@@ -612,11 +879,11 @@ class PlatformGeometryRuntime:
         if not bool(readiness.get("first_frame_ready")):
             self._set_runtime_state("waiting_map", str(readiness.get("message") or "等待外部 SLAM/Nav2 /map 首帧。"))
             return
-        if not bool(readiness.get("streaming_ready")):
+        if bool(readiness.get("streaming_required")) and not bool(readiness.get("streaming_ready")):
             self._set_runtime_state("first_frame", str(readiness.get("message") or "外部 SLAM/Nav2 已发布 /map 首帧，正在确认连续流式更新。"))
             return
         if not bool(readiness.get("localization_ready")):
-            self._set_runtime_state("streaming", str(readiness.get("message") or "地图 streaming 已就绪，等待外部 SLAM/Nav2 定位与 TF。"))
+            self._set_runtime_state("streaming", str(readiness.get("message") or "地图首帧已就绪，等待外部 SLAM/Nav2 定位与 TF。"))
             return
         nav2_status = self._build_nav2_status()
         nav2_phase = str(nav2_status.get("phase") or "")
@@ -626,12 +893,12 @@ class PlatformGeometryRuntime:
         if nav2_phase == "failed":
             self._set_runtime_state("failed", str(nav2_status.get("message") or "外部 Nav2 action 失败。"), blocked=True)
             return
-        exploration_state = self._platform_exploration_runtime.get_exploration_state()
+        exploration_state = self.get_platform_exploration_state()
         if getattr(exploration_state.status, "value", exploration_state.status) in {
             ExplorationStatus.ACCEPTED.value,
             ExplorationStatus.RUNNING.value,
         }:
-            self._set_runtime_state("exploring", "外部 SLAM/Nav2 地图 streaming、TF 与 Nav2 action 已就绪，平台探索任务运行中。")
+            self._set_runtime_state("exploring", "GO2_RTABMAP 原生探索任务运行中。")
             return
         if nav2_phase != "ready":
             self._set_runtime_state("streaming", "外部 SLAM/Nav2 地图 streaming 与 TF 已就绪；Nav2 状态：%s。" % nav2_status.get("phase"))
@@ -745,8 +1012,14 @@ class PlatformGeometryRuntime:
             and int(live_map_status.get("occupancy_message_count") or 0) > 0
             and live_map_status.get("occupancy_has_publisher") is not False
         )
+        localization_process = bool(
+            self._external_geometry_process_is_localization()
+            or str((self._last_activation_result or {}).get("backend_mode") or "") == "rtabmap_localization"
+        )
         streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
-        localization_ready = bool(process_running and input_bridge_ready and streaming_ready and tf_chain.get("ready"))
+        streaming_required = not localization_process
+        map_ready = bool(first_frame_ready and (streaming_ready or not streaming_required))
+        localization_ready = bool(process_running and input_bridge_ready and map_ready and tf_chain.get("ready"))
         if not process_running:
             message = "外部 SLAM/Nav2 脚本尚未运行。"
             waiting_for = "external_process"
@@ -760,14 +1033,20 @@ class PlatformGeometryRuntime:
         elif not first_frame_ready:
             message = "等待外部 SLAM/Nav2 发布 /map 首帧。"
             waiting_for = "external_map"
-        elif not streaming_ready:
+        elif streaming_required and not streaming_ready:
             message = "外部 SLAM/Nav2 已发布 /map 首帧，正在确认连续 streaming。"
             waiting_for = "external_map_streaming"
         elif not tf_chain.get("ready"):
-            message = "外部 SLAM/Nav2 /map 已 streaming，等待 map -> odom -> base TF 链就绪。"
+            if localization_process:
+                message = "外部 SLAM/Nav2 定位模式已收到 /map 首帧，等待 map -> odom -> base TF 链就绪。"
+            else:
+                message = "外部 SLAM/Nav2 /map 已 streaming，等待 map -> odom -> base TF 链就绪。"
             waiting_for = "external_tf"
         else:
-            message = "外部 SLAM/Nav2 /map streaming 与 TF 链均已就绪。"
+            if localization_process:
+                message = "外部 SLAM/Nav2 定位地图首帧与 TF 链均已就绪。"
+            else:
+                message = "外部 SLAM/Nav2 /map streaming 与 TF 链均已就绪。"
             waiting_for = None
         return {
             "ready": localization_ready,
@@ -775,6 +1054,9 @@ class PlatformGeometryRuntime:
             "input_bridge_ready": bool(input_bridge_ready),
             "first_frame_ready": first_frame_ready,
             "streaming_ready": streaming_ready,
+            "streaming_required": streaming_required,
+            "map_ready": map_ready,
+            "external_launch_mode": "localization" if localization_process else "mapping_or_exploration",
             "localization_ready": localization_ready,
             "relocalization_ready": localization_ready,
             "waiting_for": waiting_for,
@@ -803,6 +1085,8 @@ class PlatformGeometryRuntime:
                 "provides_tf": bool(getattr(self.config.external, "provides_tf", True)),
                 "input_bridge_enabled": input_bridge_enabled,
                 "point_cloud_bridge_enabled": point_cloud_bridge_enabled,
+                "platform_odom_tf_bridge_enabled": self._platform_odom_tf_bridge_enabled(),
+                "platform_cmd_vel_bridge_enabled": self._platform_cmd_vel_bridge_enabled(),
             },
             "external_process": external_process.status() if external_process is not None else None,
         }
@@ -812,7 +1096,7 @@ class PlatformGeometryRuntime:
         removed_internal_stack = not self._uses_external_geometry_stack()
         if self._uses_external_geometry_stack():
             required_processes = [self._external_process_name()]
-            if self._external_input_bridge_enabled():
+            if self._platform_odom_tf_bridge_enabled():
                 required_processes.append("external_odom_tf_bridge")
         else:
             required_processes = []
@@ -1061,6 +1345,7 @@ class PlatformGeometryRuntime:
             "rtabmap_readiness": self._build_rtabmap_readiness(),
             "nav2": self._build_nav2_status(),
             "external_geometry": self.config.build_metadata().get("external_geometry"),
+            "external_debug_observer": self._external_debug_observer_status(),
             "tf_localization_provider": self._ros_bridge_status_stub("tf_localization_provider"),
             "diagnostics": diagnostics,
             "launch_ros2_stack": {
@@ -1070,11 +1355,29 @@ class PlatformGeometryRuntime:
             },
         }
 
+    def _external_debug_observer_status(self) -> Dict[str, object]:
+        observer = self._external_debug_observer
+        with self._exploration_loop_lock:
+            frontier_payload = self._clone_metadata(self._external_debug_frontier_payload or {})
+        return {
+            "running": bool(observer is not None and observer.is_running),
+            "last_error": observer.last_error if observer is not None else None,
+            "frontier_count": frontier_payload.get("frontier_count"),
+            "frontier_updated_at": frontier_payload.get("updated_at"),
+        }
+
     def _ensure_live_geometry_started(self) -> None:
         if not self._is_geometry_profile_enabled():
             return
         if not self._uses_external_geometry_stack():
             raise RuntimeError(self._removed_internal_stack_message())
+        self._ensure_external_geometry_observers_started()
+
+    def start_external_debug_observers(self) -> None:
+        """Start read-only observers for externally launched GO2 map/frontier streams."""
+
+        if not self._is_geometry_profile_enabled() or not self._uses_external_geometry_stack():
+            return
         self._ensure_external_geometry_observers_started()
 
     def _ros_bridge_status_stub(self, provider_key: str) -> Dict[str, object]:
@@ -1106,6 +1409,7 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return
         with self._live_geometry_start_lock:
+            self._ensure_external_debug_observer_started_locked()
             input_bridge_enabled = self._external_input_bridge_enabled()
             point_cloud_bridge_enabled = self._external_point_cloud_bridge_enabled()
             ros_bridge_active = self._ros_bridge_handles_input_bridge()
@@ -1126,6 +1430,65 @@ class PlatformGeometryRuntime:
             except Exception:
                 self._live_geometry_start_attempted = False
                 raise
+
+    def _ensure_external_debug_observer_started_locked(self) -> None:
+        observer = self._external_debug_observer
+        if observer is None:
+            observer = ExternalGeometryDebugObserver(
+                config=self.config,
+                map_callback=self._handle_external_debug_map_update,
+                frontier_callback=self._handle_external_debug_frontier_update,
+                pose_callback=self._handle_external_debug_pose_update,
+            )
+            self._external_debug_observer = observer
+        if not observer.is_running:
+            observer.start()
+
+    def _handle_external_debug_map_update(self, payload: Dict[str, object]) -> None:
+        callbacks = list(self._pending_map_callbacks)
+        for callback in callbacks:
+            try:
+                callback(payload)
+            except Exception:
+                LOGGER.debug("投递外部 GO2 /map debug update 失败。", exc_info=True)
+
+    def _handle_external_debug_pose_update(
+        self,
+        pose: Any,
+        frame_tree: Any = None,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> None:
+        callbacks = list(self._pending_localization_callbacks)
+        meta = dict(metadata or {})
+        for callback in callbacks:
+            try:
+                callback(pose, frame_tree, meta)
+            except Exception:
+                LOGGER.debug("投递外部 GO2 位姿 debug update 失败。", exc_info=True)
+
+    def _handle_external_debug_frontier_update(self, payload: Dict[str, object]) -> None:
+        terminal_state = None
+        with self._exploration_loop_lock:
+            self._external_debug_frontier_payload = self._clone_metadata(payload)
+            has_external_request = self._external_exploration_request is not None
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        if has_external_request and self._metadata_indicates_exploration_done(metadata):
+            terminal_status = str(metadata.get("terminal_status") or "succeeded").lower()
+            status = ExplorationStatus.SUCCEEDED if terminal_status == "succeeded" else ExplorationStatus.FAILED
+            message = "GO2_RTABMAP 原生探索已完成。"
+            status_text = str(metadata.get("status_text") or "").strip()
+            if status_text:
+                message = "GO2_RTABMAP 原生探索已完成：%s" % status_text
+            terminal_state = self._finish_external_script_exploration(
+                status=status,
+                reason="external_explorer_terminal_status",
+                message=message,
+                notify_compat=False,
+            )
+        try:
+            self._notify_exploration_update(terminal_state or self.get_platform_exploration_state())
+        except Exception:
+            LOGGER.debug("投递外部 GO2 frontier debug update 失败。", exc_info=True)
 
     def is_available(self) -> bool:
         """返回是否存在可供平台消费的几何后端。"""
@@ -1421,7 +1784,12 @@ class PlatformGeometryRuntime:
         self._active_map_version = None
         self._last_activation_result = {"cleared": True, "reason": str(reason or "").strip() or None}
 
-    def prepare_map_version_assets(self, version: MapVersion) -> MapVersion:
+    def prepare_map_version_assets(
+        self,
+        version: MapVersion,
+        *,
+        skip_pcd_export: bool = False,
+    ) -> MapVersion:
         """为平台地图版本补齐并落盘几何资产描述。"""
 
         previous_asset = version.geometry_asset
@@ -1432,8 +1800,17 @@ class PlatformGeometryRuntime:
         built_at = previous_asset.built_at if previous_asset is not None else version.timestamp
         backend_run = self._build_rtabmap_run_metadata()
         database_metadata = self._materialize_backend_state(backend_state_path)
-        pcd_metadata = self._materialize_pcd_asset(pcd_path)
+        database_for_pcd = backend_state_path if backend_state_path.exists() and backend_state_path.is_file() else None
+        # Nav2 归档来自 version 快照，不依赖 PCD 导出；PCD 失败不应阻塞 yaml/geometry_asset 落盘。
         nav2_map_metadata = self._materialize_nav2_map_assets(version)
+        if skip_pcd_export:
+            pcd_metadata = {
+                "pcd_present": self._is_usable_pcd_file(pcd_path),
+                "pcd_source_kind": "skipped_for_activation",
+                "pcd_target_path": str(pcd_path.resolve(strict=False)),
+            }
+        else:
+            pcd_metadata = self._materialize_pcd_asset(pcd_path, database_path=database_for_pcd)
         quality_metrics = self._build_geometry_quality_metrics(
             database_metadata=database_metadata,
             pcd_metadata=pcd_metadata,
@@ -1443,11 +1820,8 @@ class PlatformGeometryRuntime:
         database_quality = dict(quality_metrics.get("database") or {})
         database_required = bool(database_quality.get("required", True))
         database_present = bool(database_quality.get("present", False))
-        # external_slam_nav2 真实后端是 slam_toolbox：state asset type 用新枚举值。
-        if self._uses_external_geometry_stack():
-            database_asset_type = MapGeometryAssetType.SLAM_TOOLBOX_POSEGRAPH
-        else:
-            database_asset_type = MapGeometryAssetType.RTABMAP_DATABASE
+        # RTAB-Map .db 是唯一 SLAM 后端资产类型。
+        database_asset_type = MapGeometryAssetType.RTABMAP_DATABASE
         asset_refs = []
         if database_required or database_present:
             asset_refs.append(
@@ -1556,6 +1930,10 @@ class PlatformGeometryRuntime:
             deep=True,
         )
 
+    def _version_db_ready_for_activation(self, version: MapVersion) -> bool:
+        db_path = self._resolve_existing_rtabmap_db_for_version(version)
+        return db_path is not None and self._is_usable_rtabmap_db_file(db_path)
+
     def activate_map_version(
         self,
         version: MapVersion,
@@ -1564,11 +1942,15 @@ class PlatformGeometryRuntime:
     ) -> MapSnapshot:
         """激活平台地图版本对应的几何资产。
 
-        require_backend_switch=False 时（activate_map / restore_active_workspace 默认路径）：
-        实时栈下不重启 SLAM 进程，仅在平台层标记活跃版本，让上层 ingest 种子图。
+        载入已有 .db 时不重复跑 PCD 导出（activate_map 需快速返回）。
         """
 
-        prepared_version = self.prepare_map_version_assets(version)
+        if self._version_db_ready_for_activation(version) and version.geometry_asset is not None:
+            prepared_version = version
+        elif self._version_db_ready_for_activation(version):
+            prepared_version = self.prepare_map_version_assets(version, skip_pcd_export=True)
+        else:
+            prepared_version = self.prepare_map_version_assets(version)
         geometry_asset = prepared_version.geometry_asset
         assert geometry_asset is not None
         activation_result = self._activate_backend_map_version(
@@ -1616,6 +1998,10 @@ class PlatformGeometryRuntime:
         ))
         if self._platform_exploration_runtime.is_running:
             pass  # 探索模式下不抑制 live map（新建地图从小到大增长是正常的）
+        elif self._external_geometry_process_is_localization() or str(
+            (self._last_activation_result or {}).get("backend_mode") or ""
+        ) == "rtabmap_localization":
+            pass  # 定位模式以 RTAB-Map .db 为准，允许 live /map 从空到完整逐步刷新
         elif self._live_map_payload_under_covers_seed(payload, metadata, version):
             live_known_cells = self._metadata_known_cell_count(metadata)
             if live_known_cells is None:
@@ -1985,10 +2371,21 @@ class PlatformGeometryRuntime:
         return self._resolve_backend(ExplorationDataPlane, ExplorationProvider)
 
     def _safe_map_dir(self, map_name: str) -> Path:
-        return self._catalog_root / quote(str(map_name or "").strip(), safe="")
+        primary = self._catalog_root / _to_safe_dir_segment(map_name)
+        if not primary.exists():
+            legacy = self._catalog_root / quote(str(map_name or "").strip(), safe="")
+            if legacy.exists():
+                return legacy
+        return primary
 
     def _version_dir(self, map_name: str, version_id: str) -> Path:
-        return self._safe_map_dir(map_name) / "versions" / quote(str(version_id or "").strip(), safe="")
+        versions_root = self._safe_map_dir(map_name) / "versions"
+        primary = versions_root / _to_safe_dir_segment(version_id)
+        if not primary.exists():
+            legacy = versions_root / quote(str(version_id or "").strip(), safe="")
+            if legacy.exists():
+                return legacy
+        return primary
 
     def _version_geometry_root(self, map_name: str, version_id: str) -> Path:
         return self._version_dir(map_name, version_id) / "geometry" / self.config.stack
@@ -2001,32 +2398,35 @@ class PlatformGeometryRuntime:
 
         return self._version_backend_state_path(map_name, version_id)
 
+    def _map_named_backend_db_filename(self, map_name: str) -> str:
+        """探索/定位使用的 .db 文件名与地图名一致，避免多图共用 live_rtabmap.db。"""
+
+        safe_name = _to_safe_dir_segment(map_name) or "map"
+        return "%s.db" % safe_name
+
     def _version_backend_state_path(self, map_name: str, version_id: str) -> Path:
-        """统一返回该地图版本的 SLAM 后端状态文件路径。
+        """返回该地图版本的 RTAB-Map .db 状态文件路径。"""
 
-        - external_slam_nav2 真实后端是 slam_toolbox：状态文件由
-          slam_toolbox `serialize_map` 服务写出 `<prefix>.posegraph` + `<prefix>.data`，
-          这里返回 prefix（不带后缀）：`slam_toolbox/<safe(map_name)>`。
-        - 兼容内置 RTAB-Map 历史栈：返回 `<root>/rtabmap/<database_asset_name>`。
-        """
+        return self._version_geometry_root(map_name, version_id) / "rtabmap" / self._map_named_backend_db_filename(map_name)
 
-        if self._uses_external_geometry_stack():
-            return self._version_geometry_root(map_name, version_id) / "slam_toolbox" / self._slam_toolbox_state_basename(map_name)
-        return self._version_geometry_root(map_name, version_id) / "rtabmap" / self.config.rtabmap.outputs.database_asset_name
+    def _candidate_version_backend_state_paths(self, map_name: str, version_id: str) -> List[Path]:
+        """主路径为 <map_name>.db，兼容旧版 external_slam_nav2_state.db。"""
 
-    def _slam_toolbox_state_basename(self, map_name: str) -> str:
-        """规整 map_name 为 slam_toolbox serialize/deserialize 用的文件名前缀。"""
-
-        normalized = []
-        for ch in str(map_name or "").strip():
-            if ch.isalnum():
-                normalized.append(ch.lower())
-            else:
-                normalized.append("_")
-        joined = "".join(normalized).strip("_") or "map"
-        while "__" in joined:
-            joined = joined.replace("__", "_")
-        return joined
+        rtabmap_dir = self._version_geometry_root(map_name, version_id) / "rtabmap"
+        candidates = [
+            rtabmap_dir / self._map_named_backend_db_filename(map_name),
+            rtabmap_dir / self._external_slam_nav2_state_asset_name(),
+            rtabmap_dir / _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME,
+        ]
+        seen: set[str] = set()
+        ordered: List[Path] = []
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(candidate)
+        return ordered
 
     def _external_slam_nav2_state_asset_name(self) -> str:
         configured_name = str(getattr(self.config.rtabmap.outputs, "database_asset_name", "") or "").strip()
@@ -2117,90 +2517,294 @@ class PlatformGeometryRuntime:
         return self._materialize_backend_state(target_path)
 
     def _materialize_backend_state(self, target_path: Path) -> Dict[str, object]:
-        """根据当前几何栈持久化 SLAM 后端状态。
+        """持久化 RTAB-Map .db 状态到版本目录（sqlite3 .backup 安全拷贝）。"""
 
-        - external_slam_nav2（slam_toolbox）：调 `/slam_toolbox/serialize_map`
-          把 `<prefix>.posegraph + <prefix>.data` 写到 target_path 同名前缀。
-        - 历史 RTAB-Map 内置栈：保留原 .db 拷贝逻辑。
-        """
+        return self._materialize_rtabmap_db(target_path)
 
-        if self._uses_external_geometry_stack():
-            return self._materialize_slam_toolbox_state(target_path)
-        return self._materialize_rtabmap_db_legacy(target_path)
+    def _is_usable_rtabmap_db_file(self, path: Path) -> bool:
+        resolved = path.expanduser().resolve(strict=False)
+        if not resolved.is_file():
+            return False
+        try:
+            return int(resolved.stat().st_size) > 4096
+        except OSError:
+            return False
 
-    def _materialize_slam_toolbox_state(self, target_prefix: Path) -> Dict[str, object]:
-        """让 slam_toolbox 把当前 pose-graph 持久化到 versions/<v>/geometry/slam_toolbox/<prefix>。"""
+    def _locate_runtime_backend_state_for_materialize(self, target_path: Path) -> Optional[Path]:
+        """定位可拷贝到版本目录的运行中 .db，避免误用其它地图版本或 active 版本路径。"""
 
-        target_prefix.parent.mkdir(parents=True, exist_ok=True)
-        posegraph_path = target_prefix.with_suffix(".posegraph")
-        data_path = target_prefix.with_suffix(".data")
-        # 调 /slam_toolbox/serialize_map 服务（filename 不带后缀，slam_toolbox 自动加 .posegraph + .data）。
-        service_result = self._call_slam_toolbox_serialize_map(str(target_prefix))
-        present = posegraph_path.exists() and posegraph_path.is_file() and data_path.exists() and data_path.is_file()
-        if present:
-            return {
-                "database_present": True,
-                "database_source_kind": "slam_toolbox_serialize",
-                "database_source_path": str(target_prefix.resolve()),
-                "database_target_path": str(target_prefix.resolve()),
-                "database_target": self._file_metadata(posegraph_path),
-                "posegraph_path": str(posegraph_path.resolve()),
-                "posegraph": self._file_metadata(posegraph_path),
-                "data_path": str(data_path.resolve()),
-                "data": self._file_metadata(data_path),
-                "service_call": service_result,
-            }
-        # 服务调用失败或文件没出现：保留磁盘上已有 checkpoint 的兜底（再激活流程能恢复）。
-        if posegraph_path.exists() and data_path.exists():
-            return {
-                "database_present": True,
-                "database_source_kind": "persisted_asset",
-                "database_source_path": str(target_prefix.resolve()),
-                "database_target_path": str(target_prefix.resolve()),
-                "database_target": self._file_metadata(posegraph_path),
-                "posegraph_path": str(posegraph_path.resolve()),
-                "data_path": str(data_path.resolve()),
-                "service_call": service_result,
-            }
-        return {
-            "database_present": False,
-            "database_source_kind": "slam_toolbox_serialize_unavailable",
-            "database_source_path": None,
-            "database_target_path": str(target_prefix.resolve()),
-            "posegraph_path": str(posegraph_path.resolve()),
-            "data_path": str(data_path.resolve()),
-            "service_call": service_result,
-        }
+        resolved_target = target_path.expanduser().resolve(strict=False)
+        mapping_backend = self._resolve_mapping_backend()
+        if mapping_backend is not None:
+            getter = getattr(mapping_backend, "get_backend_state_path", None) or getattr(
+                mapping_backend, "get_rtabmap_database_path", None
+            )
+            if callable(getter):
+                candidate = Path(str(getter() or "").strip()).expanduser()
+                if (
+                    candidate.suffix == ".db"
+                    and self._is_usable_rtabmap_db_file(candidate)
+                    and candidate.resolve(strict=False) != resolved_target
+                ):
+                    return candidate
 
-    def _materialize_pcd_asset(self, target_path: Path) -> Dict[str, object]:
+        configured_root = Path(str(self.config.rtabmap.database_root or "").strip()).expanduser()
+        candidates: List[Path] = []
+        if configured_root.suffix == ".db":
+            candidates.append(configured_root)
+        else:
+            candidates.extend(
+                (
+                    configured_root / "live_rtabmap.db",
+                    configured_root / "rtabmap.db",
+                )
+            )
+        for candidate in candidates:
+            if (
+                self._is_usable_rtabmap_db_file(candidate)
+                and candidate.resolve(strict=False) != resolved_target
+            ):
+                return candidate
+        return None
+
+    def _locate_active_exploration_backend_state(self) -> Optional[Path]:
+        """定位当前探索会话写入的 .db（即使与本次 save 目标 version 路径不同）。"""
+
+        with self._exploration_loop_lock:
+            raw_path = self._external_exploration_database_path
+        if not raw_path:
+            return None
+        candidate = Path(str(raw_path)).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._repo_root() / candidate
+        if candidate.suffix == ".db" and self._is_usable_rtabmap_db_file(candidate):
+            return candidate
+        return None
+
+    def _db_file_size_bytes(self, path: Path) -> int:
+        try:
+            return int(path.expanduser().resolve(strict=False).stat().st_size)
+        except OSError:
+            return 0
+
+    def _resolve_db_materialization_source(self, target_path: Path) -> Tuple[Optional[Path], str]:
+        """按优先级选择 .db 落盘来源，探索产物优先于共享 live_rtabmap.db。"""
+
+        exploration_source = self._locate_external_exploration_backend_state_for_target(target_path)
+        if exploration_source is not None:
+            return exploration_source, "exploration_target"
+
+        active_exploration_source = self._locate_active_exploration_backend_state()
+        resolved_target = target_path.expanduser().resolve(strict=False)
+        if active_exploration_source is not None:
+            resolved_active = active_exploration_source.expanduser().resolve(strict=False)
+            if resolved_active != resolved_target:
+                return active_exploration_source, "exploration_runtime"
+            return active_exploration_source, "exploration_target"
+
+        if self._is_usable_rtabmap_db_file(resolved_target):
+            return resolved_target, "persisted_target"
+
+        runtime_source = self._locate_runtime_backend_state_for_materialize(resolved_target)
+        if runtime_source is not None:
+            if active_exploration_source is not None and self._db_file_size_bytes(
+                active_exploration_source
+            ) > self._db_file_size_bytes(runtime_source):
+                return active_exploration_source, "exploration_runtime"
+            return runtime_source, "live_runtime"
+        if active_exploration_source is not None:
+            return active_exploration_source, "exploration_runtime"
+        return None, "unavailable"
+
+    def _materialize_rtabmap_db(self, target_path: Path) -> Dict[str, object]:
+        """持久化 RTAB-Map .db 到版本目录，优先使用 sqlite3 .backup 保证写入安全。"""
+
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        source_path = self._locate_live_pcd_asset()
+        source_path, source_kind_hint = self._resolve_db_materialization_source(target_path)
         if source_path is None:
             if target_path.exists() and target_path.is_file():
                 return {
-                    "pcd_present": True,
-                    "pcd_source_kind": "persisted_asset",
-                    "pcd_source_path": str(target_path.resolve()),
-                    "pcd_target_path": str(target_path.resolve()),
-                    "pcd_target": self._file_metadata(target_path),
+                    "database_present": True,
+                    "database_source_kind": "persisted_asset",
+                    "database_source_path": str(target_path.resolve()),
+                    "database_target_path": str(target_path.resolve()),
+                    "database_target": self._file_metadata(target_path),
                 }
             return {
-                "pcd_present": False,
-                "pcd_source_kind": "unavailable",
-                "pcd_source_path": None,
-                "pcd_target_path": str(target_path.resolve()),
+                "database_present": False,
+                "database_source_kind": "unavailable",
+                "database_source_path": None,
+                "database_target_path": str(target_path.resolve()),
             }
         resolved_source = source_path.resolve()
         resolved_target = target_path.resolve()
-        if resolved_source != resolved_target:
+        if resolved_source == resolved_target:
+            return {
+                "database_present": True,
+                "database_source_kind": source_kind_hint,
+                "database_source_path": str(resolved_source),
+                "database_target_path": str(resolved_target),
+                "database_target": self._file_metadata(resolved_target),
+            }
+        if (
+            source_kind_hint == "live_runtime"
+            and self._is_usable_rtabmap_db_file(resolved_target)
+            and self._db_file_size_bytes(resolved_target)
+            > max(self._db_file_size_bytes(resolved_source), 4096) * 12 // 10
+        ):
+            return {
+                "database_present": True,
+                "database_source_kind": "persisted_target",
+                "database_source_path": str(resolved_target),
+                "database_target_path": str(resolved_target),
+                "database_target": self._file_metadata(resolved_target),
+                "skipped_live_runtime_overwrite": True,
+            }
+        source_before = self._file_metadata(resolved_source)
+        backup_ok = False
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["sqlite3", str(resolved_source), ".backup '%s'" % str(resolved_target)],
+                capture_output=True, timeout=30,
+            )
+            backup_ok = result.returncode == 0 and resolved_target.exists()
+        except Exception:
+            pass
+        if not backup_ok:
             shutil.copy2(resolved_source, resolved_target)
+        source_after = self._file_metadata(resolved_source)
         return {
-            "pcd_present": target_path.exists(),
-            "pcd_source_kind": "live_runtime",
-            "pcd_source_path": str(resolved_source),
+            "database_present": target_path.exists(),
+            "database_source_kind": "sqlite3_backup" if backup_ok else source_kind_hint,
+            "database_source_path": str(resolved_source),
+            "database_target_path": str(resolved_target),
+            "database_source_before": source_before,
+            "database_source_after": source_after,
+            "database_target": self._file_metadata(resolved_target),
+            "live_db_size_changed_during_copy": (
+                source_before.get("size_bytes") != source_after.get("size_bytes")
+                or source_before.get("mtime_ns") != source_after.get("mtime_ns")
+            ),
+        }
+
+    def _locate_external_exploration_backend_state_for_target(self, target_path: Path) -> Optional[Path]:
+        with self._exploration_loop_lock:
+            raw_path = self._external_exploration_database_path
+        if not raw_path:
+            return None
+        candidate = Path(str(raw_path)).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._repo_root() / candidate
+        try:
+            if candidate.resolve(strict=False) != target_path.resolve(strict=False):
+                return None
+        except Exception:
+            return None
+        if candidate.suffix == ".db" and candidate.exists() and candidate.is_file():
+            return candidate
+        return None
+
+    def _pcd_min_points(self) -> int:
+        from services.geometry.cloud_map_fetcher import default_min_points
+
+        return default_min_points()
+
+    def _is_usable_pcd_file(self, path: Path) -> bool:
+        from services.geometry.pointcloud_map import read_pcd_point_count
+
+        resolved = path.expanduser().resolve(strict=False)
+        if not resolved.is_file():
+            return False
+        try:
+            if int(resolved.stat().st_size) < 1024:
+                return False
+            return int(read_pcd_point_count(resolved)) >= self._pcd_min_points()
+        except Exception:
+            return False
+
+    def _materialize_pcd_asset(
+        self,
+        target_path: Path,
+        *,
+        database_path: Optional[Path] = None,
+    ) -> Dict[str, object]:
+        """将 RTAB-Map 累计点云落盘为版本 PCD（优先实时 /cloud_map，其次 .db 导出）。"""
+
+        from services.geometry.cloud_map_fetcher import (
+            database_export_enabled,
+            default_db_export_timeout_sec,
+            export_cloud_map_pcd_from_database,
+            fetch_cloud_map_xyz,
+        )
+        from services.geometry.pointcloud_map import PointCloudMapError, write_pcd_binary_xyz
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_target = target_path.expanduser().resolve()
+        min_points = self._pcd_min_points()
+        cloud_topic = str(getattr(self.config.topics, "cloud_map_topic", "") or "/cloud_map").strip() or "/cloud_map"
+        map_frame = self.config.frames.map_frame
+
+        if self._is_usable_pcd_file(resolved_target):
+            return {
+                "pcd_present": True,
+                "pcd_source_kind": "persisted_asset",
+                "pcd_source_path": str(resolved_target),
+                "pcd_target_path": str(resolved_target),
+                "pcd_target": self._file_metadata(resolved_target),
+            }
+
+        fetched = fetch_cloud_map_xyz(
+            cloud_topic,
+            map_frame=map_frame,
+            min_points=min_points,
+        )
+        if fetched is not None:
+            xyz, frame_id, source_topic = fetched
+            write_pcd_binary_xyz(resolved_target, xyz)
+            return {
+                "pcd_present": True,
+                "pcd_source_kind": "ros_cloud_map",
+                "pcd_source_path": source_topic,
+                "pcd_target_path": str(resolved_target),
+                "pcd_point_count": int(xyz.shape[0]),
+                "pcd_frame_id": frame_id,
+                "pcd_target": self._file_metadata(resolved_target),
+            }
+
+        db_candidate = database_path if database_path is not None else self._locate_live_backend_state()
+        if db_candidate is not None and database_export_enabled():
+            resolved_db = Path(db_candidate).expanduser()
+            if resolved_db.suffix == ".db" and resolved_db.is_file():
+                try:
+                    point_count = export_cloud_map_pcd_from_database(
+                        resolved_db,
+                        resolved_target,
+                        min_points=min_points,
+                        timeout_sec=default_db_export_timeout_sec(),
+                    )
+                    return {
+                        "pcd_present": True,
+                        "pcd_source_kind": "rtabmap_export_scan",
+                        "pcd_source_path": str(resolved_db.resolve(strict=False)),
+                        "pcd_target_path": str(resolved_target),
+                        "pcd_point_count": int(point_count),
+                        "pcd_target": self._file_metadata(resolved_target),
+                    }
+                except (PointCloudMapError, subprocess.TimeoutExpired) as exc:
+                    LOGGER.warning("从 RTAB-Map 数据库导出累计点云失败：%s", exc)
+
+        if resolved_target.exists() and not self._is_usable_pcd_file(resolved_target):
+            try:
+                resolved_target.unlink()
+            except Exception:
+                LOGGER.debug("删除无效版本 PCD 失败：%s", resolved_target, exc_info=True)
+
+        return {
+            "pcd_present": False,
+            "pcd_source_kind": "unavailable",
+            "pcd_source_path": None,
             "pcd_target_path": str(resolved_target),
-            "pcd_source": self._file_metadata(resolved_source),
-            "pcd_target": self._file_metadata(resolved_target),
         }
 
     def _build_geometry_quality_metrics(
@@ -2263,6 +2867,18 @@ class PlatformGeometryRuntime:
                     "message": "external_slam_nav2 状态数据库已落盘为离线 checkpoint，但未证明外部几何状态正在随 /map streaming 更新。",
                 }
             )
+        pcd_target_path = str(pcd_metadata.get("pcd_target_path") or "").strip()
+        if pcd_target_path:
+            target_pcd = Path(pcd_target_path).expanduser()
+            if target_pcd.is_file() and not self._is_usable_pcd_file(target_pcd):
+                pcd_present = False
+                diagnostics.append(
+                    {
+                        "level": "error",
+                        "code": "pcd_asset_stale_or_too_small",
+                        "message": "地图版本 PCD 点云无效（点数过少或为模板占位文件），请重新保存或从 RTAB-Map 数据库导出。",
+                    }
+                )
         if not pcd_present:
             diagnostics.append(
                 {
@@ -2279,8 +2895,7 @@ class PlatformGeometryRuntime:
                     "message": "未能从外部 SLAM/Nav2 进程状态解析真实 run_id。",
                 }
             )
-        # external_slam_nav2 真实后端是 slam_toolbox：backend_checkpoint_ready 必须证明 posegraph
-        # 已落盘（database_present 来自 _materialize_slam_toolbox_state 的 .posegraph + .data 校验）。
+        # external_slam_nav2 后端使用 RTAB-Map：backend_checkpoint_ready 证明 .db 已落盘。
         # status="ready" 必须 backend checkpoint 与 nav2 map 同时就位，否则只是 snapshot_only。
         if external_stack:
             backend_checkpoint_ready = bool(database_present)
@@ -2304,7 +2919,7 @@ class PlatformGeometryRuntime:
             "backend_switch_supported": True,
             "source_mode": (
                 "live_streaming_checkpoint" if live_streaming_ready
-                else "slam_toolbox_pose_graph" if external_stack and backend_checkpoint_ready
+                else "rtabmap_db_checkpoint" if external_stack and backend_checkpoint_ready
                 else "nav2_map_checkpoint" if external_stack and nav2_map_present
                 else "platform_snapshot_only" if external_stack
                 else "offline_checkpoint"
@@ -2395,7 +3010,7 @@ class PlatformGeometryRuntime:
         if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
             geometry_asset = self._active_map_version.geometry_asset
             current_path = geometry_asset.pcd_path
-            if current_path:
+            if current_path and self._is_usable_pcd_file(Path(current_path).expanduser()):
                 return self._pointcloud_map_asset_summary(
                     Path(current_path).expanduser(),
                     source_kind="map_version_pcd",
@@ -2423,7 +3038,7 @@ class PlatformGeometryRuntime:
 
         candidates = self._configured_pcd_asset_candidates()
         for candidate in candidates:
-            if candidate.exists() and candidate.is_file():
+            if self._is_usable_pcd_file(candidate):
                 return self._pointcloud_map_asset_summary(
                     candidate,
                     source_kind="configured_pcd_root",
@@ -2513,7 +3128,7 @@ class PlatformGeometryRuntime:
             current_path = self._active_map_version.geometry_asset.pcd_path
             if current_path:
                 current_pcd = Path(current_path).expanduser()
-                if current_pcd.exists() and current_pcd.is_file():
+                if self._is_usable_pcd_file(current_pcd):
                     return current_pcd
 
         mapping_backend = self._resolve_mapping_backend()
@@ -2523,24 +3138,11 @@ class PlatformGeometryRuntime:
                 candidate = str(getter() or "").strip()
                 if candidate:
                     candidate_path = Path(candidate).expanduser()
-                    if candidate_path.exists() and candidate_path.is_file():
+                    if self._is_usable_pcd_file(candidate_path):
                         return candidate_path
 
-        configured_root = Path(str(self.config.rtabmap.pcd_root or "").strip()).expanduser()
-        candidates = []
-        if configured_root.suffix == ".pcd":
-            candidates.append(configured_root)
-        else:
-            candidates.extend(
-                (
-                    configured_root / self.config.rtabmap.outputs.pcd_asset_name,
-                    configured_root / "cloud_map.pcd",
-                    configured_root / "map.pcd",
-                    configured_root / "current.pcd",
-                )
-            )
-        for candidate in candidates:
-            if candidate.exists() and candidate.is_file():
+        for candidate in self._configured_pcd_asset_candidates():
+            if self._is_usable_pcd_file(candidate):
                 return candidate
         return None
 
@@ -2550,24 +3152,13 @@ class PlatformGeometryRuntime:
         return self._locate_live_backend_state()
 
     def _locate_live_backend_state(self) -> Optional[Path]:
-        """定位当前活跃的 SLAM 后端状态文件。
-
-        - external_slam_nav2（slam_toolbox）：同名 .posegraph 路径（与 .data 配对）；
-          活跃地图版本的 backend_state_path 对应 prefix，加 `.posegraph` 后缀检查。
-        - 历史 RTAB-Map 内置栈：保留 .db 扫描路径。
-        """
+        """定位当前活跃的 RTAB-Map .db 状态文件。"""
 
         if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
             asset = self._active_map_version.geometry_asset
-            current_prefix = Path(asset.backend_state_path or asset.rtabmap_db_path or "").expanduser()
-            if self._uses_external_geometry_stack():
-                posegraph = current_prefix.with_suffix(".posegraph")
-                data = current_prefix.with_suffix(".data")
-                if posegraph.exists() and data.exists():
-                    return posegraph
-            else:
-                if current_prefix.exists() and current_prefix.is_file():
-                    return current_prefix
+            current_path = Path(asset.backend_state_path or asset.rtabmap_db_path or "").expanduser()
+            if current_path.suffix == ".db" and current_path.exists() and current_path.is_file():
+                return current_path
 
         mapping_backend = self._resolve_mapping_backend()
         if mapping_backend is not None:
@@ -2576,116 +3167,50 @@ class PlatformGeometryRuntime:
                 candidate = str(getter() or "").strip()
                 if candidate:
                     candidate_path = Path(candidate).expanduser()
-                    if self._uses_external_geometry_stack():
-                        posegraph = candidate_path.with_suffix(".posegraph")
-                        data = candidate_path.with_suffix(".data")
-                        if posegraph.exists() and data.exists():
-                            return posegraph
-                    elif candidate_path.exists() and candidate_path.is_file():
+                    if candidate_path.suffix == ".db" and candidate_path.exists() and candidate_path.is_file():
                         return candidate_path
 
         configured_root = Path(str(self.config.rtabmap.database_root or "").strip()).expanduser()
         candidates: List[Path] = []
-        if self._uses_external_geometry_stack():
-            # slam_toolbox 默认在 ROS workspace 默认 cwd 或 NUWAX_RTABMAP_DATABASE_ROOT 下写
-            # `<map>.posegraph + <map>.data`；尝试常见前缀。
-            for prefix_name in ("current", "active", "map", "slam_toolbox"):
-                candidates.append(configured_root / (prefix_name + ".posegraph"))
+        if configured_root.suffix == ".db":
+            candidates.append(configured_root)
         else:
-            if configured_root.suffix == ".db":
-                candidates.append(configured_root)
-            else:
-                candidates.extend(
-                    (
-                        configured_root / "rtabmap.db",
-                        configured_root / "current.db",
-                        configured_root / "active.db",
-                    )
+            candidates.extend(
+                (
+                    configured_root / "live_rtabmap.db",
+                    configured_root / "rtabmap.db",
+                    configured_root / "current.db",
+                    configured_root / "active.db",
                 )
+            )
         for candidate in candidates:
             if candidate.exists() and candidate.is_file():
                 return candidate
         return None
 
-    def _materialize_rtabmap_db_legacy(self, target_path: Path) -> Dict[str, object]:
-        """RTAB-Map 历史栈下的 .db 文件拷贝（仅供非 external_slam_nav2 stack 使用）。"""
-
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        source_path = self._locate_live_backend_state()
-        if source_path is None:
-            if target_path.exists() and target_path.is_file():
-                return {
-                    "database_present": True,
-                    "database_source_kind": "persisted_asset",
-                    "database_source_path": str(target_path.resolve()),
-                    "database_target_path": str(target_path.resolve()),
-                    "database_target": self._file_metadata(target_path),
-                }
-            return {
-                "database_present": False,
-                "database_source_kind": "unavailable",
-                "database_source_path": None,
-                "database_target_path": str(target_path.resolve()),
-            }
-        resolved_source = source_path.resolve()
-        resolved_target = target_path.resolve()
-        source_before = self._file_metadata(resolved_source)
-        if resolved_source != resolved_target:
-            shutil.copy2(resolved_source, resolved_target)
-        source_after = self._file_metadata(resolved_source)
-        return {
-            "database_present": target_path.exists(),
-            "database_source_kind": "live_runtime",
-            "database_source_path": str(resolved_source),
-            "database_target_path": str(resolved_target),
-            "database_source_before": source_before,
-            "database_source_after": source_after,
-            "database_target": self._file_metadata(resolved_target),
-            "live_db_size_changed_during_copy": (
-                source_before.get("size_bytes") != source_after.get("size_bytes")
-                or source_before.get("mtime_ns") != source_after.get("mtime_ns")
-            ),
-        }
-
-    def _call_slam_toolbox_serialize_map(self, filename_prefix: str) -> Dict[str, object]:
-        """调用 /slam_toolbox/serialize_map 把当前 pose-graph 落到指定 prefix。"""
-
-        return self._call_slam_toolbox_filename_service(
-            service_name="/slam_toolbox/serialize_map",
-            service_type="slam_toolbox/srv/SerializePoseGraph",
-            filename_prefix=filename_prefix,
-        )
-
-    def _call_slam_toolbox_deserialize_pose_graph(self, filename_prefix: str) -> Dict[str, object]:
-        """调用 /slam_toolbox/deserialize_pose_graph 把指定 prefix 恢复到 slam_toolbox。
-
-        slam_toolbox 服务定义带 match_type / initial_pose 字段；这里只走最简形态：
-        match_type=START_AT_FIRST_NODE(0) + initial_pose=零。失败由调用方按 fallback 处理。
-        """
-
-        request = (
-            "{filename: '%s', match_type: 0, "
-            "initial_pose: {x: 0.0, y: 0.0, theta: 0.0}}"
-        ) % filename_prefix
-        return self._invoke_ros2_service_call(
-            service_name="/slam_toolbox/deserialize_pose_graph",
-            service_type="slam_toolbox/srv/DeserializePoseGraph",
-            request=request,
-        )
-
-    def _call_slam_toolbox_filename_service(
-        self,
-        *,
-        service_name: str,
-        service_type: str,
-        filename_prefix: str,
-    ) -> Dict[str, object]:
-        request = "{filename: '%s'}" % filename_prefix
-        return self._invoke_ros2_service_call(
-            service_name=service_name,
-            service_type=service_type,
-            request=request,
-        )
+    def _resolve_existing_rtabmap_db_for_version(self, version: MapVersion) -> Optional[Path]:
+        """Find the .db file for a specific map version."""
+        geometry_asset = version.geometry_asset
+        candidates: List[Path] = []
+        if geometry_asset is not None:
+            for raw in (geometry_asset.backend_state_path, geometry_asset.rtabmap_db_path):
+                if raw:
+                    candidates.append(Path(str(raw)).expanduser())
+            for asset_ref in geometry_asset.assets:
+                if asset_ref.asset_type in (
+                    MapGeometryAssetType.RTABMAP_DATABASE,
+                    MapGeometryAssetType.SLAM_TOOLBOX_POSEGRAPH,
+                    MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE,
+                ):
+                    candidates.append(Path(asset_ref.path).expanduser())
+        candidates.append(self._version_backend_state_path(version.map_name, version.version_id))
+        for candidate in self._candidate_version_backend_state_paths(version.map_name, version.version_id):
+            if candidate.suffix == ".db" and candidate.exists() and candidate.is_file():
+                return candidate
+        for candidate in candidates:
+            if candidate.suffix == ".db" and candidate.exists() and candidate.is_file():
+                return candidate
+        return None
 
     def _invoke_ros2_service_call(
         self,
@@ -2827,100 +3352,122 @@ class PlatformGeometryRuntime:
             "reason": "backend_missing_activate_platform_map_version",
         }
 
-    def _try_activate_slam_toolbox_pose_graph(
-        self,
-        version: MapVersion,
-        activation_payload: Dict[str, object],
-    ) -> Optional[Dict[str, object]]:
-        """如果该地图版本带有 slam_toolbox posegraph 资产，调 deserialize_pose_graph 真恢复。
-
-        - 返回 dict 表示 deserialize 路径已成功，调用方直接使用该结果。
-        - 返回 None 表示"调用方应回落到 AMCL"。
-          为了不丢失 deserialize 失败原因，本函数会把 service_result 写到
-          `activation_payload["slam_toolbox_deserialize"]`（caller 共享 dict）；
-          上层 `_activate_external_nav2_map_version` 拼 AMCL 返回值时会一同带回，
-          消费方就能在 metadata 看到 `slam_toolbox_deserialize: {ok: false, reason: ...}`。
-        """
-
-        prefix = self._resolve_existing_slam_toolbox_state_prefix(version)
-        if prefix is None:
-            # 没有 posegraph checkpoint，留给 AMCL 走 map.yaml 路线。
-            activation_payload["slam_toolbox_deserialize"] = {
-                "ok": False,
-                "reason": "posegraph_checkpoint_missing",
-            }
-            return None
-        service_result = self._call_slam_toolbox_deserialize_pose_graph(str(prefix))
-        if not service_result.get("ok"):
-            # deserialize 服务调用失败：把失败原因带回 caller，让 AMCL 兜底返回值能看到。
-            activation_payload["slam_toolbox_deserialize"] = service_result
-            return None
-        return {
-            **activation_payload,
-            "backend_switch_applied": True,
-            "backend_map_loaded": True,
-            "backend_mode": "slam_toolbox_pose_graph",
-            "active_backend_version_id": version.version_id,
-            "reason": "slam_toolbox_deserialize_pose_graph_succeeded",
-            "slam_toolbox": {
-                "switch_method": "slam_toolbox_deserialize_pose_graph",
-                "filename_prefix": str(prefix),
-                "service_call": service_result,
-            },
-        }
-
-    def _resolve_existing_slam_toolbox_state_prefix(self, version: MapVersion) -> Optional[Path]:
-        """返回带 .posegraph + .data 配对的 prefix（不含后缀）路径；都不存在返回 None。"""
-
-        geometry_asset = version.geometry_asset
-        candidates: List[Path] = []
-        if geometry_asset is not None:
-            for raw in (geometry_asset.backend_state_path, geometry_asset.rtabmap_db_path):
-                if raw:
-                    candidates.append(Path(str(raw)).expanduser())
-            for asset_ref in geometry_asset.assets:
-                if asset_ref.asset_type in (
-                    MapGeometryAssetType.SLAM_TOOLBOX_POSEGRAPH,
-                    MapGeometryAssetType.RTABMAP_DATABASE,
-                    MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE,
-                ):
-                    candidates.append(Path(asset_ref.path).expanduser())
-        candidates.append(self._version_backend_state_path(version.map_name, version.version_id))
-        for prefix in candidates:
-            if prefix.suffix in (".posegraph", ".data"):
-                prefix = prefix.with_suffix("")
-            posegraph = prefix.with_suffix(".posegraph")
-            data = prefix.with_suffix(".data")
-            if posegraph.exists() and posegraph.is_file() and data.exists() and data.is_file():
-                return prefix
-        return None
-
     def _activate_external_nav2_map_version(
         self,
         version: MapVersion,
         activation_payload: Dict[str, object],
     ) -> Dict[str, object]:
-        # 优先尝试 slam_toolbox 真恢复（deserialize_pose_graph + start_localization）；
-        # 仅在 deserialize 不可用或文件缺失时回落到"重启进程切 AMCL 离线 map.yaml"。
-        slam_toolbox_result = self._try_activate_slam_toolbox_pose_graph(version, activation_payload)
-        if slam_toolbox_result is not None:
-            return slam_toolbox_result
-
+        # RTAB-Map activation: restart the managed process with the version's .db
+        # Use mapping mode for empty/new DBs, localization mode for populated DBs.
+        db_path = self._resolve_existing_rtabmap_db_for_version(version)
         nav2_map_metadata = self._resolve_nav2_map_metadata(version)
         nav2_yaml_path = self._resolve_existing_nav2_map_yaml_path(version, nav2_map_metadata)
         if nav2_yaml_path is None:
             materialized_metadata = self._materialize_nav2_map_assets(version)
             nav2_map_metadata = {**nav2_map_metadata, **self._clone_metadata(materialized_metadata)}
             nav2_yaml_path = self._resolve_existing_nav2_map_yaml_path(version, nav2_map_metadata)
+        if nav2_yaml_path is not None:
+            nav2_yaml_path = nav2_yaml_path.expanduser().resolve(strict=False)
+        if db_path is not None and db_path.exists():
+            self._ensure_external_geometry_observers_started()
+            process_name = self._external_process_name()
+            current_process = self._managed_processes.get(process_name)
+            resolved_db = db_path.expanduser().resolve()
+            db_has_map_data = db_path.stat().st_size > 4096
+            mode_flag = "--localization" if db_has_map_data else "--mapping"
+            backend_mode = "rtabmap_localization" if db_has_map_data else "rtabmap_mapping"
+            use_static_map_yaml = self._external_localization_uses_static_map_yaml()
+            static_map_yaml_path = (
+                nav2_yaml_path
+                if db_has_map_data and nav2_yaml_path is not None and use_static_map_yaml
+                else None
+            )
+            static_map_requested = static_map_yaml_path is not None
+            if db_has_map_data:
+                self.clear_external_exploration_state(reason="activate_rtabmap_localization")
+            if (
+                db_has_map_data
+                and current_process is not None
+                and current_process.is_running()
+                and self._external_process_serves_database(current_process.command, resolved_db, localization=True)
+                and (
+                    not static_map_requested
+                    or self._external_process_uses_map_yaml(current_process.command, static_map_yaml_path)
+                )
+            ):
+                return {
+                    **activation_payload,
+                    "backend_switch_applied": True,
+                    "backend_map_loaded": True,
+                    "backend_mode": backend_mode,
+                    "active_backend_version_id": version.version_id,
+                    "reason": "rtabmap_localization_already_active",
+                    "rtabmap": {
+                        "switch_method": "reuse_running_localization",
+                        "database_path": str(resolved_db),
+                    },
+                    "nav2_map": {
+                        **nav2_map_metadata,
+                        "map_yaml_path": str(nav2_yaml_path) if nav2_yaml_path is not None else None,
+                        "used_for_static_map": static_map_requested,
+                    },
+                }
+            restart = current_process is not None
+            if current_process is not None and current_process.is_running():
+                current_process.stop(
+                    timeout_sec=12.0,
+                    graceful_launch_shutdown=True,
+                    graceful_timeout_sec=15.0,
+                )
+            self._map_stream_tracker = {}
+            command = [str(self._external_script_path()), mode_flag, str(db_path)]
+            if static_map_yaml_path is not None:
+                command.extend(["--map-yaml", str(static_map_yaml_path)])
+            # Default to db-only localization: RTAB-Map publishes /map directly.
+            # Static map_server /map is opt-in via GO2_NAV_USE_STATIC_MAP_YAML=true.
+            self._start_managed_process(process_name, command, self._external_log_name(), restart=restart)
+            process = self._managed_processes.get(process_name)
+            process_running = bool(process is not None and process.is_running())
+            if process_running:
+                return {
+                    **activation_payload,
+                    "backend_switch_applied": True,
+                    "backend_map_loaded": True,
+                    "backend_mode": backend_mode,
+                    "active_backend_version_id": version.version_id,
+                    "reason": f"{backend_mode}_started",
+                    "rtabmap": {
+                        "switch_method": f"process_restart_{mode_flag.lstrip('-')}",
+                        "database_path": str(db_path),
+                    },
+                    "nav2_map": {
+                        **nav2_map_metadata,
+                        "map_yaml_path": str(nav2_yaml_path) if nav2_yaml_path is not None else None,
+                        "used_for_static_map": static_map_requested,
+                    },
+                }
+            return {
+                **activation_payload,
+                "backend_switch_applied": False,
+                "reason": f"{backend_mode}_start_failed",
+                "backend_mode": "unavailable",
+                "rtabmap": {"database_path": str(db_path)},
+                "nav2_map": {
+                    **nav2_map_metadata,
+                    "map_yaml_path": str(nav2_yaml_path) if nav2_yaml_path is not None else None,
+                    "used_for_static_map": False,
+                },
+            }
+
+        # Fallback: try Nav2 AMCL with map.yaml
         if nav2_yaml_path is None:
             return {
                 **activation_payload,
                 "backend_switch_applied": False,
-                "reason": "nav2_map_yaml_missing",
+                "reason": "nav2_map_yaml_missing_and_rtabmap_db_missing",
                 "backend_mode": "unavailable",
                 "nav2_map": nav2_map_metadata,
             }
-        nav2_yaml_path = nav2_yaml_path.expanduser().resolve(strict=False)
         pcd_path = self._resolve_existing_version_pcd_path(version)
         command = self._build_nav2_map_activation_command(
             map_yaml_path=nav2_yaml_path,
@@ -2932,7 +3479,7 @@ class PlatformGeometryRuntime:
         restart = current_process is not None
         if current_process is not None:
             current_process.stop()
-        self._map_stream_tracker = {}  # Rust bridge 管理地图缓存，无需 reset_cached_map
+        self._map_stream_tracker = {}
         self._start_managed_process(process_name, command, self._external_log_name(), restart=restart)
         process = self._managed_processes.get(process_name)
         process_status = process.status() if process is not None else None
@@ -2957,10 +3504,9 @@ class PlatformGeometryRuntime:
             **activation_payload,
             "backend_switch_applied": True,
             "backend_map_loaded": True,
-            "backend_mode": "slam_localization",
+            "backend_mode": "amcl_localization_only",
             "active_backend_version_id": version.version_id,
             "reason": "external_nav2_amcl_started",
-            "nav2_map": nav2_map_metadata,
             "nav2": {
                 "switch_method": "managed_ros2_launch_amcl",
                 "map_yaml_path": str(nav2_yaml_path),
@@ -3030,7 +3576,7 @@ class PlatformGeometryRuntime:
         return None
 
     def _build_nav2_map_activation_command(self, *, map_yaml_path: Path, pcd_path: Optional[Path]) -> List[str]:
-        # 直接复用外部 SLAM/Nav2 脚本（它管理 odom_tf_bridge + nav2_goal_bridge）
+        # 直接复用外部 SLAM/Nav2 脚本；平台只连接外部 Nav2 action。
         return self._build_external_geometry_command()
 
     def _generate_slam_params_with_posegraph(self, map_yaml_path: Path) -> Optional[Path]:
@@ -3149,6 +3695,11 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return None
         self._pending_localization_callbacks.append(callback)
+        # 外部栈位姿由 ExternalGeometryDebugObserver 在 robot.start() 之后启动
+        # （见 GatewayRuntime._start_data_frame_stream_sources），此处不能提前启动 observer：
+        # 它会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp，导致 Unitree SDK ChannelFactory 初始化失败。
+        if self._uses_external_geometry_stack():
+            return 0
         if self._remote_provider is not None and self._remote_provider.is_connected:
             self._remote_provider.subscribe_pose(callback)
         return 0
@@ -3187,17 +3738,9 @@ class PlatformGeometryRuntime:
         if old_thread is not None and old_thread.is_alive() and old_thread is not threading.current_thread():
             old_thread.join(timeout=max(0.2, self._exploration_loop_interval_sec() * 2.0))
         self._cancel_platform_exploration_navigation()
-        accepted = self._platform_exploration_runtime.start_exploration(request)
+        accepted = self._start_external_script_exploration(request)
         if not accepted:
             return False
-        with self._exploration_loop_lock:
-            self._exploration_loop_stop_event.clear()
-            self._exploration_loop_generation += 1
-            self._exploration_tick_count = 0
-            self._exploration_last_tick_at_iso = None
-            self._exploration_last_tick_monotonic = None
-            self._exploration_last_tick_source = "start_exploration"
-            self._ensure_platform_exploration_loop_locked()
         self._notify_exploration_update(self.get_platform_exploration_state())
         return True
 
@@ -3209,17 +3752,12 @@ class PlatformGeometryRuntime:
     def report_platform_exploration_hit_stop(self, reason: str) -> None:
         if not self._is_geometry_profile_enabled():
             return
-        thread = None
-        with self._exploration_loop_lock:
-            self._exploration_loop_stop_event.set()
-            self._exploration_loop_generation += 1
-            thread = self._exploration_loop_thread
-        current_goal = self._platform_exploration_runtime.get_current_navigation_goal()
-        self._platform_exploration_runtime.report_hit_stop(reason)
-        self._cancel_platform_exploration_navigation(current_goal=current_goal)
-        self._notify_compat_exploration_stopped()
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=max(0.2, self._exploration_loop_interval_sec() * 2.0))
+        self._finish_external_script_exploration(
+            status=ExplorationStatus.SUCCEEDED,
+            reason="hit_stop",
+            message=str(reason or "").strip() or "探索命中停机。",
+            notify_compat=True,
+        )
         self._notify_exploration_update(self.get_platform_exploration_state())
 
     def _stop_platform_exploration_loop(self, *, cancel_navigation: bool, notify: bool) -> bool:
@@ -3228,17 +3766,273 @@ class PlatformGeometryRuntime:
             self._exploration_loop_stop_event.set()
             self._exploration_loop_generation += 1
             thread = self._exploration_loop_thread
-        current_goal = self._platform_exploration_runtime.get_current_navigation_goal()
-        stopped = self._platform_exploration_runtime.stop_exploration()
-        if cancel_navigation:
-            self._cancel_platform_exploration_navigation(current_goal=current_goal)
-        if stopped:
-            self._notify_compat_exploration_stopped()
+        current_goal = None
+        stopped = self._stop_external_script_exploration(
+            cancel_navigation=cancel_navigation,
+            notify_compat=True,
+        )
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.2, self._exploration_loop_interval_sec() * 2.0))
         if notify:
             self._notify_exploration_update(self.get_platform_exploration_state())
         return stopped
+
+    @staticmethod
+    def _remove_rtabmap_database_files(db_path: Path) -> None:
+        resolved = db_path.expanduser()
+        for candidate in (
+            resolved,
+            Path(str(resolved) + "-journal"),
+            Path(str(resolved) + "-wal"),
+            Path(str(resolved) + "-shm"),
+        ):
+            try:
+                if candidate.is_file():
+                    candidate.unlink()
+            except Exception:
+                LOGGER.debug("删除旧 RTAB-Map 数据库文件失败：%s", candidate, exc_info=True)
+
+    def _start_external_script_exploration(self, request: ExploreAreaRequest) -> bool:
+        process_name = self._external_process_name()
+        current_process = self._managed_processes.get(process_name)
+        command = self._build_external_exploration_command(request)
+        db_path = self._extract_external_exploration_database_path(command)
+        if db_path:
+            self._remove_rtabmap_database_files(Path(str(db_path)))
+        duration_limit = self._external_exploration_duration_limit_sec(request)
+        now = time.monotonic()
+        with self._exploration_loop_lock:
+            self._external_exploration_request = request.model_copy(deep=True)
+            self._external_exploration_started_at_monotonic = now
+            self._external_exploration_started_at_iso = _utc_now_iso()
+            self._external_exploration_deadline_monotonic = None if duration_limit is None else now + duration_limit
+            self._external_exploration_database_path = db_path
+            self._external_exploration_terminal_state = None
+            self._exploration_tick_count = 0
+            self._exploration_last_tick_at_iso = None
+            self._exploration_last_tick_monotonic = None
+            self._exploration_last_tick_source = "external_script_start"
+        if current_process is not None:
+            self._managed_processes.pop(process_name, None)
+            current_process.stop()
+        self._map_stream_tracker = {}
+        self._start_managed_process(process_name, command, self._external_log_name(), restart=True)
+        process = self._managed_processes.get(process_name)
+        if process is None or not process.is_running():
+            self._finish_external_script_exploration(
+                status=ExplorationStatus.FAILED,
+                reason="external_explore_start_failed",
+                message="GO2_RTABMAP 原生探索脚本启动失败。",
+                notify_compat=False,
+                process_status=process.status() if process is not None else None,
+            )
+            return False
+        self._record_runtime_diagnostic(
+            "external_go2_exploration_started",
+            "explore_area 已委托 GO2_RTABMAP 脚本执行：%s" % process.command_display(),
+        )
+        return True
+
+    def _stop_external_script_exploration(self, *, cancel_navigation: bool, notify_compat: bool) -> bool:
+        with self._exploration_loop_lock:
+            has_request = self._external_exploration_request is not None
+            terminal_state = self._external_exploration_terminal_state
+        if not has_request and terminal_state is None and not self._external_geometry_process_is_exploration():
+            return False
+        if cancel_navigation:
+            self._cancel_platform_exploration_navigation()
+        self._finish_external_script_exploration(
+            status=ExplorationStatus.CANCELLED,
+            reason="manual_cancel",
+            message="GO2_RTABMAP 原生探索任务已取消。",
+            notify_compat=notify_compat,
+        )
+        return True
+
+    def _finish_external_script_exploration(
+        self,
+        *,
+        status: ExplorationStatus,
+        reason: str,
+        message: str,
+        notify_compat: bool,
+        process_status: Optional[Dict[str, object]] = None,
+    ) -> ExplorationState:
+        process_name = self._external_process_name()
+        process = self._managed_processes.pop(process_name, None)
+        if process is not None and process.is_running():
+            process.stop(
+                timeout_sec=15.0,
+                graceful_launch_shutdown=True,
+                graceful_timeout_sec=25.0,
+            )
+            time.sleep(3.0)
+        if process_status is None and process is not None:
+            process_status = process.status()
+        with self._exploration_loop_lock:
+            request = self._external_exploration_request
+        metadata = self._build_external_exploration_metadata(
+            request=request,
+            process_status=process_status,
+            waiting_for=None,
+            reason=reason,
+            terminal=True,
+        )
+        frontier_metadata, _ = self._external_debug_frontier_metadata()
+        if frontier_metadata:
+            metadata.update(frontier_metadata)
+        metadata["exploration_terminal"] = True
+        metadata["terminal_status"] = str(getattr(status, "value", status) or "succeeded")
+        state = ExplorationState(
+            current_request_id=request.request_id if request is not None else None,
+            status=status,
+            strategy=request.strategy if request is not None else "frontier",
+            message=message,
+            metadata=metadata,
+        )
+        with self._exploration_loop_lock:
+            self._external_exploration_terminal_state = state
+            self._external_exploration_request = None
+            self._external_exploration_deadline_monotonic = None
+        if notify_compat:
+            self._notify_compat_exploration_stopped()
+        return state
+
+    def _external_exploration_duration_limit_sec(self, request: ExploreAreaRequest) -> Optional[float]:
+        limits: List[float] = []
+        if request.max_duration_sec is not None:
+            limits.append(float(request.max_duration_sec))
+        stop_conditions = dict(getattr(request, "stop_conditions", {}) or {})
+        value = stop_conditions.get("max_duration_sec")
+        if value is not None and not isinstance(value, bool):
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                parsed = 0.0
+            if math.isfinite(parsed) and parsed > 0.0:
+                limits.append(parsed)
+        return min(limits) if limits else None
+
+    def _external_exploration_elapsed_sec(self) -> float:
+        with self._exploration_loop_lock:
+            started = self._external_exploration_started_at_monotonic
+        if started is None:
+            return 0.0
+        return max(0.0, time.monotonic() - started)
+
+    @staticmethod
+    def _external_process_serves_database(
+        command: List[str],
+        database_path: Path,
+        *,
+        localization: bool = False,
+    ) -> bool:
+        if not command:
+            return False
+        if localization and not PlatformGeometryRuntime._command_uses_external_localization(command):
+            return False
+        extracted = PlatformGeometryRuntime._extract_external_exploration_database_path(command)
+        if extracted is None and command:
+            extracted = str(command[-1])
+        if not extracted:
+            return False
+        try:
+            return Path(str(extracted)).expanduser().resolve() == database_path.expanduser().resolve()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _external_process_uses_map_yaml(command: List[str], map_yaml_path: Optional[Path]) -> bool:
+        if map_yaml_path is None or not command:
+            return False
+        idx = 0
+        extracted = None
+        while idx < len(command):
+            item = str(command[idx])
+            if item in {"--map-yaml", "--map-yaml-path"} and idx + 1 < len(command):
+                extracted = str(command[idx + 1])
+                break
+            idx += 1
+        if not extracted:
+            return False
+        try:
+            return Path(str(extracted)).expanduser().resolve() == map_yaml_path.expanduser().resolve()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _extract_external_exploration_database_path(command: List[str]) -> Optional[str]:
+        if not command:
+            return None
+        idx = 0
+        result = None
+        while idx < len(command):
+            item = str(command[idx])
+            if item == "--database-path" and idx + 1 < len(command):
+                result = str(command[idx + 1])
+                idx += 2
+                continue
+            if item in {"--map-yaml", "--map-yaml-path"} and idx + 1 < len(command):
+                idx += 2
+                continue
+            if idx > 0 and not item.startswith("-") and ":=" not in item:
+                result = item
+            idx += 1
+        return result
+
+    def _build_external_exploration_metadata(
+        self,
+        *,
+        request: Optional[ExploreAreaRequest],
+        process_status: Optional[Dict[str, object]],
+        waiting_for: Optional[str],
+        reason: Optional[str] = None,
+        terminal: bool = False,
+    ) -> Dict[str, object]:
+        duration_limit = self._external_exploration_duration_limit_sec(request) if request is not None else None
+        elapsed = self._external_exploration_elapsed_sec()
+        with self._exploration_loop_lock:
+            started_at = self._external_exploration_started_at_iso
+            deadline = self._external_exploration_deadline_monotonic
+            database_path = self._external_exploration_database_path
+            exploration_version_id = self._external_exploration_version_id
+        remaining = None
+        if deadline is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+        metadata: Dict[str, object] = {
+            "exploration_mode": "go2_rtabmap_script",
+            "exploration_runtime": "external_go2_rtabmap",
+            "exploration_script": str(self._external_script_path()),
+            "exploration_process_name": self._external_process_name(),
+            "exploration_database_path": database_path,
+            "exploration_version_id": exploration_version_id,
+            "exploration_launch_mode": "explore",
+            "started_at": started_at,
+            "elapsed_time_sec": elapsed,
+            "max_duration_sec": duration_limit,
+            "remaining_time_sec": remaining,
+            "terminal": bool(terminal),
+            "exploration_terminal": bool(terminal),
+            "terminal_reason": reason,
+            "waiting_for": waiting_for,
+            "external_process": process_status,
+            "platform_frontier_runtime_bypassed": True,
+            "native_go2_frontier_explorer": True,
+        }
+        if request is not None:
+            metadata.update(
+                {
+                    "map_name": request.map_name,
+                    "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
+                    "radius_m": request.radius_m,
+                    "target_name": request.target_name,
+                    "stop_conditions": dict(request.stop_conditions),
+                }
+            )
+        if process_status is not None:
+            metadata["exploration_command"] = process_status.get("command")
+            metadata["exploration_log_path"] = process_status.get("log_path")
+        return metadata
 
     def _exploration_loop_interval_sec(self) -> float:
         return max(0.02, float(getattr(self._platform_exploration_config, "status_poll_interval_sec", 0.2) or 0.2))
@@ -3518,7 +4312,7 @@ class PlatformGeometryRuntime:
                     return
             target_pose = current_goal.target_pose
             if target_pose is not None:
-                LOGGER.debug(
+                LOGGER.info(
                     "平台探索下发 frontier 导航目标 backend=%s previous_goal_id=%s previous_status=%s goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s metadata=%s",
                     navigation_backend_name,
                     navigation_state.current_goal_id,
@@ -3560,6 +4354,11 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return self._platform_exploration_runtime.get_exploration_state()
         with self._exploration_loop_lock:
+            request = self._external_exploration_request
+            terminal_state = self._external_exploration_terminal_state
+        if request is not None or terminal_state is not None:
+            return self._get_external_script_exploration_state()
+        with self._exploration_loop_lock:
             if self._platform_exploration_runtime.is_running:
                 self._ensure_platform_exploration_loop_locked()
         state = self._platform_exploration_runtime.get_exploration_state()
@@ -3580,15 +4379,246 @@ class PlatformGeometryRuntime:
                 "current_frontier": current_frontier,
                 "frontier_source": frontier_source or "platform_frontier_explorer",
             }
+        external_frontier_metadata, external_frontier_count = self._external_debug_frontier_metadata()
+        if external_frontier_metadata:
+            frontier_metadata = external_frontier_metadata
+            latest_frontiers = list(external_frontier_metadata.get("latest_frontiers") or [])
         metadata = {
             **dict(getattr(state, "metadata", {}) or {}),
             **frontier_metadata,
             **self._exploration_loop_metadata(tick_source="get_exploration_state"),
         }
         update: Dict[str, object] = {"metadata": metadata}
-        if latest_frontiers:
+        if external_frontier_count is not None:
+            update["frontier_count"] = external_frontier_count
+        elif latest_frontiers:
             update["frontier_count"] = len(latest_frontiers)
         return state.model_copy(update=update, deep=True)
+
+    def _external_debug_frontier_metadata(self) -> tuple[Dict[str, object], Optional[int]]:
+        with self._exploration_loop_lock:
+            payload = self._clone_metadata(self._external_debug_frontier_payload or {})
+        if not payload:
+            return {}, None
+        latest_frontiers = payload.get("latest_frontiers") if isinstance(payload.get("latest_frontiers"), list) else []
+        current_frontier = payload.get("current_frontier") if isinstance(payload.get("current_frontier"), dict) else None
+        try:
+            frontier_count = int(payload.get("frontier_count")) if payload.get("frontier_count") is not None else len(latest_frontiers)
+        except (TypeError, ValueError):
+            frontier_count = len(latest_frontiers)
+        payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        metadata = {
+            "latest_frontiers": latest_frontiers,
+            "current_frontier": current_frontier,
+            "frontier_source": payload.get("source") or "go2_rtabmap_debug_observer",
+            "native_go2_frontier_explorer": True,
+            "status_text": payload_metadata.get("status_text"),
+            "exploration_terminal": bool(payload_metadata.get("exploration_terminal")),
+            "terminal_status": payload_metadata.get("terminal_status"),
+            "external_frontier_debug_observer": {
+                "source_name": payload.get("source_name"),
+                "updated_at": payload.get("updated_at"),
+                "sequence": payload.get("sequence"),
+                "frontier_count": frontier_count,
+                "metadata": payload_metadata,
+            },
+        }
+        return metadata, frontier_count
+
+    @staticmethod
+    def _metadata_indicates_exploration_done(metadata: Dict[str, object]) -> bool:
+        if bool(metadata.get("exploration_terminal")) or bool(metadata.get("terminal")):
+            return True
+        status_text = str(metadata.get("status_text") or "").upper()
+        if "DONE" in status_text or "EXPLORATION FINISHED" in status_text:
+            return True
+        observer_meta = metadata.get("external_frontier_debug_observer")
+        if isinstance(observer_meta, dict):
+            observer_payload = observer_meta.get("metadata") if isinstance(observer_meta.get("metadata"), dict) else {}
+            if bool(observer_payload.get("exploration_terminal")):
+                return True
+            observer_status = str(observer_payload.get("status_text") or "").upper()
+            if "DONE" in observer_status or "EXPLORATION FINISHED" in observer_status:
+                return True
+        return False
+
+    def _external_exploration_terminal_from_frontier_observer(self) -> Optional[ExplorationState]:
+        with self._exploration_loop_lock:
+            request = self._external_exploration_request
+            payload = self._clone_metadata(self._external_debug_frontier_payload or {})
+        if request is None or not payload:
+            return None
+        payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        frontier_metadata, _ = self._external_debug_frontier_metadata()
+        if not self._metadata_indicates_exploration_done({**frontier_metadata, **payload_metadata}):
+            return None
+        terminal_status = str(payload_metadata.get("terminal_status") or "succeeded").lower()
+        status = ExplorationStatus.SUCCEEDED if terminal_status == "succeeded" else ExplorationStatus.FAILED
+        status_text = str(payload_metadata.get("status_text") or "").strip()
+        message = "GO2_RTABMAP 原生探索已完成。"
+        if status_text:
+            message = "GO2_RTABMAP 原生探索已完成：%s" % status_text
+        process = self._managed_processes.get(self._external_process_name())
+        process_status = process.status() if process is not None else None
+        return self._finish_external_script_exploration(
+            status=status,
+            reason="external_explorer_frontier_done",
+            message=message,
+            notify_compat=False,
+            process_status=process_status,
+        )
+
+    def _get_external_script_exploration_state(self) -> ExplorationState:
+        with self._exploration_loop_lock:
+            request = self._external_exploration_request
+            terminal_state = self._external_exploration_terminal_state
+            deadline = self._external_exploration_deadline_monotonic
+        if terminal_state is not None:
+            return self._augment_exploration_state_with_mapping_diagnostics(terminal_state)
+        if request is None:
+            return ExplorationState(status=ExplorationStatus.IDLE)
+
+        frontier_terminal_state = self._external_exploration_terminal_from_frontier_observer()
+        if frontier_terminal_state is not None:
+            return self._augment_exploration_state_with_mapping_diagnostics(frontier_terminal_state)
+
+        process = self._managed_processes.get(self._external_process_name())
+        process_status = process.status() if process is not None else None
+        process_running = bool(process is not None and process.is_running())
+        elapsed = self._external_exploration_elapsed_sec()
+        if deadline is not None and time.monotonic() >= deadline:
+            state = self._finish_external_script_exploration(
+                status=ExplorationStatus.SUCCEEDED,
+                reason="max_duration_sec",
+                message="GO2_RTABMAP 原生探索已达到最大时长，任务已结束。",
+                notify_compat=False,
+                process_status=process_status,
+            )
+            return self._augment_exploration_state_with_mapping_diagnostics(state)
+
+        if not process_running:
+            exit_code = process_status.get("exit_code") if isinstance(process_status, dict) else None
+            if exit_code == 0:
+                state = self._finish_external_script_exploration(
+                    status=ExplorationStatus.SUCCEEDED,
+                    reason="external_process_completed",
+                    message="GO2_RTABMAP 原生探索脚本已正常退出。",
+                    notify_compat=False,
+                    process_status=process_status,
+                )
+                return self._augment_exploration_state_with_mapping_diagnostics(state)
+            state = self._finish_external_script_exploration(
+                status=ExplorationStatus.FAILED,
+                reason="external_process_exited",
+                message="GO2_RTABMAP 原生探索脚本已退出，exit_code=%s。" % exit_code,
+                notify_compat=False,
+                process_status=process_status,
+            )
+            return self._augment_exploration_state_with_mapping_diagnostics(state)
+
+        log_terminal = self._external_exploration_terminal_from_process_log(process)
+        if log_terminal is not None:
+            state = self._finish_external_script_exploration(
+                status=log_terminal["status"],
+                reason=str(log_terminal["reason"]),
+                message=str(log_terminal["message"]),
+                notify_compat=False,
+                process_status=process_status,
+            )
+            return self._augment_exploration_state_with_mapping_diagnostics(state)
+
+        diagnostics = self.get_live_mapping_diagnostics()
+        runtime_status = diagnostics.get("runtime_status") if isinstance(diagnostics.get("runtime_status"), dict) else {}
+        rtabmap_readiness = diagnostics.get("rtabmap_readiness") if isinstance(diagnostics.get("rtabmap_readiness"), dict) else {}
+        nav2_status = runtime_status.get("nav2") if isinstance(runtime_status.get("nav2"), dict) else self._build_nav2_status()
+        waiting_for = None
+        message = "GO2_RTABMAP 原生 frontier 探索运行中。"
+        if diagnostics.get("waiting_for"):
+            waiting_for = str(diagnostics.get("waiting_for"))
+            message = str(diagnostics.get("message") or "等待 GO2_RTABMAP 探索输入链路 ready。")
+        elif not bool(rtabmap_readiness.get("localization_ready")):
+            waiting_for = str(rtabmap_readiness.get("waiting_for") or "external_slam_nav2")
+            message = str(rtabmap_readiness.get("message") or "等待 GO2_RTABMAP SLAM/TF ready。")
+        elif not bool(nav2_status.get("ready")):
+            waiting_for = self._normalize_exploration_waiting_for(nav2_status.get("waiting_for") or "nav2_action")
+            message = str(nav2_status.get("message") or "等待 GO2_RTABMAP Nav2 ready。")
+
+        metadata = self._build_external_exploration_metadata(
+            request=request,
+            process_status=process_status,
+            waiting_for=waiting_for,
+            reason=None,
+            terminal=False,
+        )
+        metadata["mapping_chain_diagnostics"] = diagnostics
+        metadata["rtabmap_readiness"] = self._clone_metadata(rtabmap_readiness)
+        metadata["nav2_readiness"] = self._clone_metadata(nav2_status)
+        metadata["elapsed_time_sec"] = elapsed
+        if waiting_for:
+            metadata["waiting_detail"] = message
+        frontier_metadata, frontier_count = self._external_debug_frontier_metadata()
+        if frontier_metadata:
+            metadata.update(frontier_metadata)
+        return ExplorationState(
+            current_request_id=request.request_id,
+            status=ExplorationStatus.RUNNING,
+            strategy=request.strategy,
+            frontier_count=frontier_count,
+            message=message,
+            metadata=metadata,
+        )
+
+    def _external_exploration_terminal_from_process_log(self, process: Optional[_ManagedProcess]) -> Optional[Dict[str, object]]:
+        if process is None:
+            return None
+        try:
+            text = _read_recent_log(process.log_path, max_bytes=65536)
+        except Exception:
+            return None
+        texts = [text]
+        texts.extend(self._read_external_frontier_ros_logs(text))
+        for candidate in texts:
+            terminal = self._external_exploration_terminal_from_log_text(candidate)
+            if terminal is not None:
+                return terminal
+        return None
+
+    def _read_external_frontier_ros_logs(self, launch_log_text: str) -> List[str]:
+        pids: List[str] = []
+        for match in re.finditer(r"\[frontier_explorer\.py-\d+\]: process started with pid \[(\d+)\]", launch_log_text or ""):
+            pids.append(match.group(1))
+        if not pids:
+            return []
+        ros_log_root = Path.home() / ".ros" / "log"
+        texts: List[str] = []
+        for pid in dict.fromkeys(pids):
+            for path in sorted(ros_log_root.glob(f"python3_{pid}_*.log"), key=lambda item: item.stat().st_mtime if item.exists() else 0.0, reverse=True)[:2]:
+                try:
+                    texts.append(_read_recent_log(path, max_bytes=65536))
+                except Exception:
+                    continue
+        return texts
+
+    def _external_exploration_terminal_from_log_text(self, text: str) -> Optional[Dict[str, object]]:
+        if not text:
+            return None
+        latest_start = text.rfind("] start ")
+        if latest_start >= 0:
+            text = text[latest_start:]
+        normalized = text.lower()
+        if "exploration complete" in normalized or "exploration reached a terminal state" in normalized or "done (exploration finished)" in normalized:
+            return {
+                "status": ExplorationStatus.SUCCEEDED,
+                "reason": "external_explorer_log_complete",
+                "message": "GO2_RTABMAP 原生探索已完成。",
+            }
+        if "stopping exploration:" in normalized and "consecutive navigation failures" in normalized:
+            return {
+                "status": ExplorationStatus.SUCCEEDED,
+                "reason": "external_explorer_log_navigation_failures_terminal",
+                "message": "GO2_RTABMAP 原生探索已结束：连续导航失败，可能已探索完或剩余前沿被阻塞。",
+            }
+        return None
 
     def _read_exploration_pose(self):
         navigation_backend = self._resolve_navigation_backend()
@@ -3755,6 +4785,8 @@ class PlatformGeometryRuntime:
     def _notify_compat_exploration_stopped(self) -> None:
         backend = self._resolve_backend(ExplorationDataPlane, ExplorationProvider)
         if backend is None:
+            return
+        if backend is self._platform_exploration_runtime:
             return
         stopper = getattr(backend, "stop_exploration", None)
         if not callable(stopper):

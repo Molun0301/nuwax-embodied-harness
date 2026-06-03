@@ -756,6 +756,28 @@ def _render_debug_page(access_token: str) -> str:
       const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
       const VIDEO_JPEG_DECODE_TIMEOUT_MS = 3000;
       const MJPEG_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+      const MAP_DISPLAY_FRESH_MS = 20000;
+      const MAP_DISPLAY_IDLE_MESSAGE = "未启动建图/导航/探索，隐藏缓存地图。";
+      const LOCALIZATION_DISPLAY_IDLE_MESSAGE = "无活跃地图/建图/导航/探索，隐藏定位。";
+      const ACTIVE_SPATIAL_STATUSES = new Set(["accepted", "planning", "running"]);
+      const ACTIVE_SPATIAL_CAPABILITIES = new Set([
+        "explore_area",
+        "explore_and_find_target",
+        "navigate_to_pose",
+        "navigate_to_named_location",
+        "find_target",
+        "inspect_target",
+        "relocalize_active_map",
+        "load_map_version",
+        "activate_map",
+      ]);
+      const ACTIVE_LOCALIZATION_STATUSES = new Set([
+        "accepted",
+        "running",
+        "localizing",
+        "relocalizing",
+        "ready",
+      ]);
       const state = {
         mapGrid: null,
         mapViewport: null,
@@ -800,6 +822,7 @@ def _render_debug_page(access_token: str) -> str:
         overviewLastRenderAt: 0,
         overviewReceivedAt: null,
         latestHealth: null,
+        latestGovernance: null,
         latestTasks: { active_tasks: [], history_tasks: [] },
         taskActiveById: new Map(),
         taskHistoryById: new Map(),
@@ -810,6 +833,9 @@ def _render_debug_page(access_token: str) -> str:
         mapDrawFrame: null,
         mapBaseCache: null,
         mapGridContentKey: "",
+        lastMapEnvelope: null,
+        lastLocalizationEnvelope: null,
+        lastMapHeartbeatEnvelope: null,
       };
       const els = {
         robotName: document.getElementById("robotName"),
@@ -1113,6 +1139,7 @@ def _render_debug_page(access_token: str) -> str:
         state.latestTasks = { active_tasks: active, history_tasks: history };
         updateTasks(state.latestTasks);
         updateHealth({ ...(state.latestHealth || {}), active_task_count: active.length });
+        reevaluateCachedMapDisplay();
       }
       function replaceTaskStore(payload) {
         state.taskActiveById.clear();
@@ -1318,6 +1345,234 @@ def _render_debug_page(access_token: str) -> str:
         const revision = (diagnostics && (diagnostics.occupancy_content_hash || diagnostics.content_hash || diagnostics.grid_hash || diagnostics.occupancy_content_revision || diagnostics.content_revision || diagnostics.revision)) || (grid.metadata && (grid.metadata.occupancy_content_hash || grid.metadata.content_hash || grid.metadata.grid_hash || grid.metadata.occupancy_content_revision || grid.metadata.content_revision || grid.metadata.revision)) || envelope.revision || grid.revision || mapGridDataSignature(grid);
         return [grid.frame_id || envelope.frame_id || "", grid.width, grid.height, grid.resolution_m, Number(origin.x || 0), Number(origin.y || 0), originYaw(grid), revision].join("|");
       }
+      function normalizeStatusValue(value) {
+        const raw = value && typeof value === "object" && "value" in value ? value.value : value;
+        return String(raw || "").trim().toLowerCase().replace(/^(task|navigation|exploration)\./, "");
+      }
+      function isActiveSpatialStatus(value) {
+        return ACTIVE_SPATIAL_STATUSES.has(normalizeStatusValue(value));
+      }
+      function isTerminalSpatialStatus(value) {
+        return ["succeeded", "failed", "cancelled", "timeout", "idle"].includes(normalizeStatusValue(value));
+      }
+      function getNestedState(payload, key) {
+        if (!payload) return {};
+        if (payload[key] && typeof payload[key] === "object") return payload[key];
+        return payload;
+      }
+      function activeSpatialTaskReason() {
+        for (const task of state.taskActiveById.values()) {
+          const capability = String(task.capability_name || task.name || "").trim();
+          const taskState = normalizeStatusValue(task.state || task.status);
+          if (!capability || isTerminalSpatialStatus(taskState)) continue;
+          if (ACTIVE_SPATIAL_CAPABILITIES.has(capability) || capability.startsWith("navigate_") || capability.includes("explore")) {
+            return `task:${capability}`;
+          }
+        }
+        return null;
+      }
+      function backendSpatialProcessReason() {
+        const geoRuntime = state.latestGovernance && state.latestGovernance.metadata && state.latestGovernance.metadata.geometry_runtime;
+        const processes = geoRuntime && geoRuntime.processes;
+        const external = processes && processes.external_slam_nav2;
+        if (!external || external.running !== true) return null;
+        const cmd = String(external.command_display || (Array.isArray(external.command) ? external.command.join(" ") : external.command) || "").toLowerCase();
+        if (cmd.includes("--explore") || cmd.includes("--exploration")) return "exploration";
+        if (cmd.includes("--localization") || cmd.includes("--loc")) return "backend_localization";
+        if (cmd.includes("--mapping") || cmd.includes("--new")) return "mapping";
+        return "backend_geometry";
+      }
+      function activeSpatialContextReason() {
+        const taskReason = activeSpatialTaskReason();
+        if (taskReason) return taskReason;
+        const navPayload = state.latestStreamFrames["navigation.state"] && state.latestStreamFrames["navigation.state"].payload;
+        const navState = getNestedState(navPayload, "navigation_state");
+        if (isActiveSpatialStatus(navState.status) || (navState.current_goal_id && !isTerminalSpatialStatus(navState.status))) return "navigation";
+        const explorationPayload = state.latestStreamFrames["exploration.state"] && state.latestStreamFrames["exploration.state"].payload;
+        const explorationState = getNestedState(explorationPayload, "exploration_state");
+        if (isActiveSpatialStatus(explorationState.status) || (explorationState.current_request_id && !isTerminalSpatialStatus(explorationState.status))) return "exploration";
+        const backendReason = backendSpatialProcessReason();
+        if (backendReason) return backendReason;
+        const localizationReason = activeLocalizationSessionReason();
+        if (localizationReason) return localizationReason;
+        return null;
+      }
+      function activeLocalizationSessionReason() {
+        const session = state.latestGovernance && state.latestGovernance.localization_session;
+        if (!session || session.available !== true) return null;
+        const status = normalizeStatusValue(session.status);
+        if (!status || !ACTIVE_LOCALIZATION_STATUSES.has(status)) return null;
+        return "localization";
+      }
+      function loadedMapVersionShouldDisplay(diagnostics) {
+        if (!diagnostics) return false;
+        const mapName = String(diagnostics.active_map_name || diagnostics.map_name || "").trim();
+        if (!mapName) return false;
+        const versionId = String(
+          diagnostics.platform_map_version_id ||
+          diagnostics.seed_map_version_id ||
+          diagnostics.map_version_id ||
+          ""
+        ).trim();
+        const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
+        const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
+        return Boolean(
+          versionId ||
+          snapshotKind === "offline_checkpoint" ||
+          sourceKind === "platform_map_version" ||
+          diagnostics.checkpoint_ready === true ||
+          diagnostics.geometry_ready === true
+        );
+      }
+      function firstFiniteNumber(...values) {
+        for (const value of values) {
+          if (value === undefined || value === null || value === "") continue;
+          const number = Number(value);
+          if (Number.isFinite(number)) return number;
+        }
+        return null;
+      }
+      function timestampIsFresh(...values) {
+        const now = Date.now();
+        for (const value of values) {
+          if (!value) continue;
+          const parsed = Date.parse(value);
+          if (!Number.isFinite(parsed)) continue;
+          const age = now - parsed;
+          if (age >= -5000 && age <= MAP_DISPLAY_FRESH_MS) return true;
+        }
+        return false;
+      }
+      function diagnosticsAgeIsFresh(envelope, diagnostics) {
+        const streamAgeMs = firstFiniteNumber(
+          diagnostics && diagnostics.stream_age_ms,
+          diagnostics && diagnostics.cache_age !== undefined ? Number(diagnostics.cache_age) * 1000 : null,
+          diagnostics && diagnostics.source_age !== undefined ? Number(diagnostics.source_age) * 1000 : null
+        );
+        if (streamAgeMs !== null && streamAgeMs <= MAP_DISPLAY_FRESH_MS) return true;
+        return timestampIsFresh(
+          envelope && envelope.source_timestamp,
+          diagnostics && diagnostics.source_timestamp,
+          diagnostics && diagnostics.last_message_at,
+          diagnostics && diagnostics.latest_occupancy_received_at,
+          diagnostics && diagnostics.latest_occupancy_timestamp
+        );
+      }
+      function mapSnapshotIsOffline(diagnostics) {
+        const sourceKind = String(diagnostics && diagnostics.source_kind || "").toLowerCase();
+        const snapshotKind = String(diagnostics && diagnostics.map_snapshot_kind || "").toLowerCase();
+        return sourceKind === "platform_map_version" || snapshotKind === "offline_checkpoint";
+      }
+      function hasLiveMapFlag(diagnostics, streamBridge) {
+        if (!diagnostics) return false;
+        if (mapSnapshotIsOffline(diagnostics)) return false;
+        const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
+        const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
+        const bridgeMode = String((streamBridge && (streamBridge.status || streamBridge.state || streamBridge.mode)) || "").toLowerCase();
+        return Boolean(
+          sourceKind === "platform_live_map_provider" ||
+          snapshotKind === "live_streaming" ||
+          diagnostics.source_alive === true ||
+          diagnostics.streaming === true ||
+          diagnostics.live_mapping_ready === true ||
+          diagnostics.rtabmap_live_streaming_ready === true ||
+          bridgeMode === "streaming" ||
+          (streamBridge && streamBridge.streaming === true)
+        );
+      }
+      function hasPositiveMapCount(diagnostics) {
+        const count = firstFiniteNumber(
+          diagnostics && diagnostics.message_count,
+          diagnostics && diagnostics.occupancy_message_count,
+          diagnostics && diagnostics.occupancy_sequence,
+          diagnostics && diagnostics.update_sequence,
+          diagnostics && diagnostics.sequence
+        );
+        return count === null || count > 0;
+      }
+      function shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared) {
+        if (cleared) return { display: false, status: "cleared", message: mapClearedMessage(diagnostics) };
+        if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) {
+          return { display: false, status: status === "error" ? "error" : "missing", message: errorReason(envelope, "无 occupancy_grid，占据栅格不可用。") };
+        }
+        const activeReason = activeSpatialContextReason();
+        if (activeReason) return { display: true, reason: activeReason };
+        if (status === "available" && loadedMapVersionShouldDisplay(diagnostics)) {
+          return { display: true, reason: "loaded_map_version" };
+        }
+        if (status !== "available") {
+          return { display: false, status: status || "stale", message: status === "stale" ? "地图数据已过期，已隐藏缓存帧。" : errorReason(envelope, MAP_DISPLAY_IDLE_MESSAGE) };
+        }
+        if (hasLiveMapFlag(diagnostics, streamBridge) && hasPositiveMapCount(diagnostics) && diagnosticsAgeIsFresh(envelope, diagnostics || {})) {
+          return { display: true, reason: "live_map_stream" };
+        }
+        return { display: false, status: "missing", message: MAP_DISPLAY_IDLE_MESSAGE };
+      }
+      function computeMapDisplayDecision(envelope) {
+        if (!envelope) return { display: false, status: "missing", message: MAP_DISPLAY_IDLE_MESSAGE };
+        const data = envelope.data || {};
+        const grid = data.occupancy_grid || (data.map_snapshot && data.map_snapshot.occupancy_grid) || null;
+        const diagnostics = data.diagnostics || data.metadata || (data.map_snapshot && data.map_snapshot.metadata) || {};
+        const streamBridge = diagnostics.stream_bridge || {};
+        const status = statusOf(envelope);
+        const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
+        return shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared);
+      }
+      function shouldDisplaySpatialPose() {
+        if (activeSpatialContextReason()) return true;
+        return computeMapDisplayDecision(state.lastMapEnvelope).display === true;
+      }
+      function clearLocalizationDisplay(message, status) {
+        state.pose = null;
+        state.trajectory = [];
+        setPill(els.localizationStatus, status || "missing");
+        setKv(els.localizationMeta, [
+          ["显示状态", "hidden"],
+          ["reason", message || LOCALIZATION_DISPLAY_IDLE_MESSAGE],
+          ["frame", "--"],
+          ["pose", "--"],
+          ["yaw", "--"],
+          ["trajectory_count", 0],
+        ]);
+        setPill(els.poseStatus, status || "missing");
+        setKv(els.missionPoseMeta, [
+          ["frame", "--"],
+          ["position", "--"],
+          ["yaw", "--"],
+          ["trajectory", 0],
+        ]);
+      }
+      function clearMapOverlayState() {
+        state.frontiers = [];
+        state.goalPose = null;
+        state.navigationPath = [];
+      }
+      function clearMapDisplay(message, status, diagnostics, streamBridge, envelope, grid) {
+        state.mapGrid = null;
+        state.mapGridContentKey = "";
+        state.mapBaseCache = null;
+        state.mapViewport = null;
+        if (!activeSpatialContextReason()) clearMapOverlayState();
+        setPill(els.mapStatus, status || "missing");
+        els.mapEmpty.hidden = false;
+        els.mapEmpty.textContent = message || MAP_DISPLAY_IDLE_MESSAGE;
+        requestMapDraw(true);
+        const displayDiagnostics = { ...(diagnostics || {}), display_suppressed_reason: message || MAP_DISPLAY_IDLE_MESSAGE };
+        setKv(els.mapMeta, [
+          ["地图名称", displayDiagnostics.active_map_name || displayDiagnostics.map_name || (envelope && envelope.frame_id) || (grid && grid.frame_id) || "--"],
+          ["总栅格数", grid ? `${grid.width * grid.height}` : "--"],
+          ["显示状态", "hidden"],
+          ["reason", message || MAP_DISPLAY_IDLE_MESSAGE],
+          ["source_timestamp", shortTime(envelope && envelope.source_timestamp)],
+          ["revision", (envelope && envelope.revision) || displayDiagnostics.content_revision],
+          ["sequence", (envelope && envelope.sequence) || displayDiagnostics.message_count],
+          ["streaming", mapStreamLabel(status || "missing", displayDiagnostics, streamBridge || {})],
+          ["latency", fmt(envelope && envelope.latency_ms, " ms")],
+          ["前端接收", shortTime(envelope && envelope.__receivedAt)],
+        ]);
+        updateMapStreamChip(status || "missing", displayDiagnostics, streamBridge || {}, envelope && envelope.source_timestamp);
+        reevaluateCachedLocalizationDisplay();
+      }
       function ensureMapBaseCanvas(ctx, grid) {
         const width = Number(grid.width);
         const height = Number(grid.height);
@@ -1466,6 +1721,7 @@ def _render_debug_page(access_token: str) -> str:
         ctx.restore();
       }
       function updateMap(envelope) {
+        state.lastMapEnvelope = envelope;
         const status = statusOf(envelope);
         const data = envelope.data || {};
         const grid = data.occupancy_grid || (data.map_snapshot && data.map_snapshot.occupancy_grid) || null;
@@ -1473,8 +1729,13 @@ def _render_debug_page(access_token: str) -> str:
         const streamBridge = diagnostics.stream_bridge || {};
         const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
         state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp, cleared };
-        setPill(els.mapStatus, cleared ? "cleared" : status);
-        if (!cleared && grid && Array.isArray(grid.data)) {
+        const displayDecision = shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared);
+        if (!displayDecision.display) {
+          clearMapDisplay(displayDecision.message, displayDecision.status || (cleared ? "cleared" : status), diagnostics, streamBridge, envelope, grid);
+          return;
+        }
+        setPill(els.mapStatus, status);
+        if (grid && Array.isArray(grid.data)) {
           const nextContentKey = mapGridContentKey(grid, envelope, diagnostics);
           const baseDirty = state.mapGridContentKey !== nextContentKey;
           state.mapGrid = grid;
@@ -1482,15 +1743,6 @@ def _render_debug_page(access_token: str) -> str:
           els.mapEmpty.hidden = status === "available";
           els.mapEmpty.textContent = status === "stale" ? "地图数据已过期，保留最后一帧。" : "";
           requestMapDraw(baseDirty);
-        } else {
-          state.mapGrid = null;
-          state.mapGridContentKey = "";
-          state.mapBaseCache = null;
-          requestMapDraw(true);
-          els.mapEmpty.hidden = false;
-          els.mapEmpty.textContent = cleared
-            ? mapClearedMessage(diagnostics)
-            : errorReason(envelope, "无 occupancy_grid，占据栅格不可用。");
         }
         setKv(els.mapMeta, [
           ["地图名称", diagnostics.active_map_name || diagnostics.map_name || envelope.frame_id || (grid && grid.frame_id) || "--"],
@@ -1519,6 +1771,8 @@ def _render_debug_page(access_token: str) -> str:
         return "地图已清空，等待新工作区激活。";
       }
       function mapStreamLabel(status, diagnostics, streamBridge) {
+        if (diagnostics && diagnostics.display_suppressed_reason) return "缓存地图已隐藏";
+        if (loadedMapVersionShouldDisplay(diagnostics)) return "已载入地图版本";
         const messageCount = diagnostics && (diagnostics.message_count || diagnostics.update_sequence || diagnostics.sequence);
         const revision = diagnostics && (diagnostics.content_revision || diagnostics.occupancy_content_revision || diagnostics.revision);
         const delta = diagnostics && diagnostics.message_count_delta;
@@ -1532,26 +1786,26 @@ def _render_debug_page(access_token: str) -> str:
         els.mapStreamStatus.textContent = `${mapStreamLabel(status, diagnostics, streamBridge)} · ${shortTime(timestamp)}`;
       }
       function updateMapHeartbeat(envelope) {
+        state.lastMapHeartbeatEnvelope = envelope;
         const status = statusOf(envelope);
         const heartbeat = envelope.data || {};
         const diagnostics = { ...((state.mapStream && state.mapStream.diagnostics) || {}), ...(envelope.metadata || {}), ...heartbeat };
         const streamBridge = diagnostics.stream_bridge || {};
         const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
-        if (cleared) {
-          state.mapGrid = null;
-          state.mapGridContentKey = "";
-          state.mapBaseCache = null;
-          requestMapDraw(true);
-        }
         const grid = cleared ? null : state.mapGrid;
         state.mapStream = { diagnostics, streamBridge, revision: envelope.revision || diagnostics.content_revision, sequence: envelope.sequence || diagnostics.update_sequence, timestamp: envelope.source_timestamp, cleared };
-        setPill(els.mapStatus, cleared ? "cleared" : status);
-        if (!cleared && grid && Array.isArray(grid.data)) {
+        const displayDecision = shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared);
+        if (!displayDecision.display) {
+          clearMapDisplay(displayDecision.message, displayDecision.status || (cleared ? "cleared" : status), diagnostics, streamBridge, envelope, grid);
+          return;
+        }
+        setPill(els.mapStatus, status);
+        if (grid && Array.isArray(grid.data)) {
           els.mapEmpty.hidden = true;
           els.mapEmpty.textContent = "";
         } else {
           els.mapEmpty.hidden = false;
-          els.mapEmpty.textContent = cleared ? mapClearedMessage(diagnostics) : "地图源在线，等待内容更新帧。";
+          els.mapEmpty.textContent = "地图源在线，等待内容更新帧。";
         }
         setKv(els.mapMeta, [
           ["frame", envelope.frame_id || diagnostics.frame_id || (grid && grid.frame_id)],
@@ -1565,9 +1819,39 @@ def _render_debug_page(access_token: str) -> str:
           ["stale", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
-        updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
+        updateMapStreamChip(status, diagnostics, streamBridge, envelope.source_timestamp);
       }
-      function updateLocalization(envelope) {
+      function reevaluateCachedMapDisplay() {
+        if (!state.lastMapEnvelope) {
+          reevaluateCachedLocalizationDisplay();
+          return;
+        }
+        const envelope = state.lastMapEnvelope;
+        const data = envelope.data || {};
+        const grid = data.occupancy_grid || (data.map_snapshot && data.map_snapshot.occupancy_grid) || null;
+        const diagnostics = data.diagnostics || data.metadata || (data.map_snapshot && data.map_snapshot.metadata) || {};
+        const streamBridge = diagnostics.stream_bridge || {};
+        const status = statusOf(envelope);
+        const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
+        const decision = shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared);
+        if (decision.display || state.mapGrid) updateMap(envelope);
+        else if (state.mapGrid) {
+          clearMapDisplay(decision.message, decision.status || status, diagnostics, streamBridge, envelope, grid);
+        }
+        reevaluateCachedLocalizationDisplay();
+      }
+      function reevaluateCachedLocalizationDisplay() {
+        if (!state.lastLocalizationEnvelope) return;
+        applyLocalizationDisplay(state.lastLocalizationEnvelope, { reevaluateMap: false });
+      }
+      function applyLocalizationDisplay(envelope, options) {
+        const reevaluateMap = !options || options.reevaluateMap !== false;
+        state.lastLocalizationEnvelope = envelope;
+        if (!shouldDisplaySpatialPose()) {
+          clearLocalizationDisplay(LOCALIZATION_DISPLAY_IDLE_MESSAGE, "missing");
+          requestMapDraw(false);
+          return;
+        }
         const status = statusOf(envelope);
         const data = envelope.data || {};
         state.pose = data.pose || null;
@@ -1593,7 +1877,11 @@ def _render_debug_page(access_token: str) -> str:
           ["trajectory", state.trajectory.length],
           ["latency", fmt(envelope.latency_ms, " ms")],
         ]);
-        requestMapDraw(false);
+        if (reevaluateMap) reevaluateCachedMapDisplay();
+        else requestMapDraw(false);
+      }
+      function updateLocalization(envelope) {
+        applyLocalizationDisplay(envelope, { reevaluateMap: true });
       }
       function firstArrayValue(...values) {
         for (const value of values) {
@@ -1640,10 +1928,21 @@ def _render_debug_page(access_token: str) -> str:
       function summarizeContext(context, key) {
         const stateObj = context && context[key];
         if (!stateObj) return "--";
+        const metadata = stateObj.metadata || {};
+        const explorerStatus = metadata.status_text || metadata.explorer_status_text;
+        if (metadata.exploration_terminal || metadata.terminal) {
+          const terminal = metadata.terminal_status || stateObj.status || "completed";
+          return explorerStatus ? `${terminal} · ${explorerStatus}` : String(terminal);
+        }
+        if (explorerStatus) {
+          const base = stateObj.status || stateObj.phase || stateObj.message || stateObj.state || "available";
+          return `${base} · ${explorerStatus}`;
+        }
         return stateObj.status || stateObj.phase || stateObj.message || stateObj.state || "available";
       }
       function updateGovernance(envelope) {
         const data = envelope.runtime_governance || (envelope.data && envelope.data.runtime_governance) || envelope.data || {};
+        state.latestGovernance = data;
         const status = envelope.status ? statusOf(envelope) : (data && data.rtabmap_profile ? "available" : "missing");
         const profile = data.rtabmap_profile || {};
         const asset = data.geometry_asset || {};
@@ -1665,6 +1964,7 @@ def _render_debug_page(access_token: str) -> str:
           ["source", (data.metadata && data.metadata.source) || "platform_service_contracts"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
+        reevaluateCachedMapDisplay();
       }
       function updateNavigation(envelope) {
         const status = statusOf(envelope);
@@ -1672,6 +1972,11 @@ def _render_debug_page(access_token: str) -> str:
         setPill(els.navigationStatus, status);
         const frontierCount = data.frontier_count;
         const waitingFor = data.waiting_for;
+        const explorerStatus = data.explorer_status_text
+          || (data.exploration_context && data.exploration_context.exploration_state && data.exploration_context.exploration_state.metadata && data.exploration_context.exploration_state.metadata.status_text)
+          || (data.exploration_context && data.exploration_context.exploration_state && data.exploration_context.exploration_state.metadata && data.exploration_context.exploration_state.metadata.explorer_status_text);
+        const explorationTerminal = data.exploration_terminal
+          || (data.exploration_context && data.exploration_context.exploration_state && data.exploration_context.exploration_state.metadata && data.exploration_context.exploration_state.metadata.exploration_terminal);
         const mappingDiag = data.mapping_chain_diagnostics || {};
         const liveMap = mappingDiag.live_map_provider || {};
         const cloudPub = mappingDiag.point_cloud_publisher || {};
@@ -1683,6 +1988,8 @@ def _render_debug_page(access_token: str) -> str:
         setKv(els.navigationMeta, [
           ["navigation", summarizeContext(data.navigation_context, "navigation_state")],
           ["exploration", summarizeContext(data.exploration_context, "exploration_state")],
+          ["explorer_status", explorerStatus || "--"],
+          ["exploration_terminal", explorationTerminal === true ? "true" : (explorationTerminal === false ? "false" : "--")],
           ["frontier_count", frontierCount === null || frontierCount === undefined ? "--" : frontierCount],
           ["waiting_for", waitingFor],
           ["mapping_detail", mappingDiag.message],
@@ -1696,8 +2003,11 @@ def _render_debug_page(access_token: str) -> str:
           ["stale", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
-        els.frontierNotice.hidden = Boolean(frontiers && frontiers.length);
-        els.frontierNotice.textContent = frontiers && frontiers.length ? "" : "当前探索上下文还没有 frontier 几何，请确认探索运行态已生成候选。";
+        els.frontierNotice.hidden = Boolean(explorationTerminal || (frontiers && frontiers.length));
+        els.frontierNotice.textContent = explorationTerminal
+          ? "探索器已报告完成（DONE）。"
+          : (frontiers && frontiers.length ? "" : "当前探索上下文还没有 frontier 几何，请确认探索运行态已生成候选。");
+        reevaluateCachedMapDisplay();
         requestMapDraw(false);
       }
       function scheduleVideoUpdate(envelope) {
@@ -2421,7 +2731,9 @@ def _render_debug_page(access_token: str) -> str:
           navigation_context: state.latestStreamFrames["navigation.state"] && state.latestStreamFrames["navigation.state"].payload,
           exploration_context: state.latestStreamFrames["exploration.state"] && state.latestStreamFrames["exploration.state"].payload,
           frontiers,
-          frontier_count: frontiers.length,
+          frontier_count: payload.frontier_count !== undefined && payload.frontier_count !== null ? payload.frontier_count : frontiers.length,
+          explorer_status_text: payload.status_text,
+          exploration_terminal: payload.exploration_terminal,
         }));
       }
       function updatePointcloudMapFrame(frame) {

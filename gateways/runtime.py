@@ -664,7 +664,7 @@ class GatewayRuntime:
         self._cloud_map_mmap_poll_stop.clear()
         thread = threading.Thread(
             target=self._run_cloud_map_mmap_poll,
-            name=nuwax-cloud-map-mmap-poll,
+            name="nuwax-cloud-map-mmap-poll",
             daemon=True,
         )
         self._cloud_map_mmap_poll_thread = thread

@@ -64,6 +64,69 @@ from settings import NuwaxRobotBridgeConfig
 
 
 RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.runtime")
+
+
+class _ShmVideoFrameSource:
+    """把 VideoShmReader 包装成感知服务所需的 VideoFrameSource 协议。"""
+
+    def __init__(self, shm_path: str) -> None:
+        self._shm_path = shm_path
+        self._reader = None
+        self._last_frame = None
+        self._connected = False
+        self._ensure_open()
+
+    def _ensure_open(self) -> bool:
+        if self._reader is not None and self._connected:
+            return True
+        try:
+            from services.geometry.video_shm_reader import VideoShmReader
+            reader = VideoShmReader(self._shm_path)
+            self._connected = reader.open()
+            if self._connected:
+                self._reader = reader
+        except Exception:
+            self._connected = False
+        return self._connected
+
+    def get_latest_image(self, camera_id=None):
+        if not self._ensure_open() or self._reader is None:
+            return None
+        try:
+            result = self._reader.read_latest()
+        except Exception:
+            self._connected = False
+            self._reader = None
+            return None
+        if result is None:
+            return result
+        frame_bytes, _seq, ts_ns = result
+        if not frame_bytes:
+            return None
+        try:
+            from contracts.image import ImageFrame, ImageEncoding
+            from contracts.base import utc_now
+            return ImageFrame(
+                camera_id=str(camera_id or "front_camera"),
+                frame_id="go2/front_camera",
+                width_px=1280,
+                height_px=720,
+                encoding=ImageEncoding.JPEG,
+                data=frame_bytes,
+                metadata={"source_kind": "video_shm_ingest", "ts_ns": ts_ns},
+            )
+        except Exception:
+            return None
+
+    def status_snapshot(self):
+        ok = self._ensure_open()
+        return {
+            "available": ok,
+            "connected": ok,
+            "reason": "ok" if ok else "shm_not_available",
+            "shm_path": self._shm_path,
+        }
+
 _RUNTIME_EVENT_LOG_RATE_LIMIT_SEC = 10.0
 _REQUEST_CONTEXT_KEYS = (
     "request_id",
@@ -294,7 +357,9 @@ class GatewayRuntime:
             event_bus=self.event_bus,
             stream_bus=self.stream_bus,
             video_frame_sink=None,
-            video_frame_source=None,
+            video_frame_source=_ShmVideoFrameSource(
+                __import__("os").environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+            ),
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),
         )

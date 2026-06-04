@@ -24,6 +24,7 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
     database_path = LaunchConfiguration('database_path',
         default=os.path.expanduser('~/rtabmap.db'))
+    non_nav_output = 'log' if os.environ.get('GO2_NAV2_LOG_ONLY') == '1' else 'screen'
 
     rtabmap_parameters = {
         'use_sim_time': use_sim_time,
@@ -155,7 +156,7 @@ def generate_launch_description():
             package='go2_nav',
             executable='odom_tf_broadcaster.py',
             name='odom_tf_broadcaster',
-            output='screen',
+            output=non_nav_output,
         ),
 
         # NOTE: We rely on Unitree's driver to publish base_link -> utlidar_lidar
@@ -172,7 +173,7 @@ def generate_launch_description():
             package='go2_nav',
             executable='cloud_to_scan.py',
             name='cloud_to_scan',
-            output='screen',
+            output=non_nav_output,
             parameters=[{
                 'input_topic': '/utlidar/cloud_deskewed',
                 'output_topic': '/scan',
@@ -192,7 +193,7 @@ def generate_launch_description():
             package='rtabmap_slam',
             executable='rtabmap',
             name='rtabmap',
-            output='screen',
+            output=non_nav_output,
             parameters=[rtabmap_parameters, {'database_path': database_path}],
             remappings=[
                 ('scan_cloud', '/utlidar/cloud_deskewed'),

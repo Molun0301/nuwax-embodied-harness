@@ -18,6 +18,7 @@ def generate_launch_description():
     database_path = LaunchConfiguration('database_path', default='~/rtabmap.db')
 
     go2_nav_dir = get_package_share_directory('go2_nav')
+    non_nav_output = 'log' if os.environ.get('GO2_NAV2_LOG_ONLY') == '1' else 'screen'
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='false'),
@@ -49,7 +50,7 @@ def generate_launch_description():
             package='go2_nav',
             executable='cmd_vel_bridge.py',
             name='cmd_vel_bridge',
-            output='screen',
+            output=non_nav_output,
             parameters=[{
                 'max_vx': 0.4,
                 'max_vy': 0.2,

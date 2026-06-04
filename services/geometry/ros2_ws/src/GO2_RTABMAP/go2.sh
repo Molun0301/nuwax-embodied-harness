@@ -49,6 +49,9 @@ Arguments:
               localization  : required, must exist
 
 Options:
+  --nav2-log-only                  Only print Nav2 node logs to the terminal.
+                                   RTAB-Map and bridge logs still go to ~/.ros/log
+  --print-nav2-params              Print the effective nav2_params.yaml and exit
   -h, --help                       Show this help
 
 Examples:
@@ -69,6 +72,8 @@ fi
 
 MODE=""
 DB_PATH=""
+NAV2_LOG_ONLY=0
+PRINT_NAV2_PARAMS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -91,6 +96,14 @@ while [[ $# -gt 0 ]]; do
       MODE="exploration"
       shift
       ;;
+    --nav2-log-only)
+      NAV2_LOG_ONLY=1
+      shift
+      ;;
+    --print-nav2-params)
+      PRINT_NAV2_PARAMS=1
+      shift
+      ;;
     -*)
       echo "ERROR: unknown option '$1'" >&2
       usage
@@ -107,7 +120,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$MODE" ]]; then
+if [[ -z "$MODE" && "$PRINT_NAV2_PARAMS" -eq 0 ]]; then
   echo "ERROR: missing mode flag (--new / --localization / --explore)" >&2
   usage
   exit 2
@@ -145,6 +158,17 @@ fi
 # Environment
 # ---------------------------------------------------------------------------
 source "$SCRIPT_DIR/scripts/env.sh"
+
+if [[ "$PRINT_NAV2_PARAMS" -eq 1 ]]; then
+  NAV2_PARAMS_FILE="$SCRIPT_DIR/install/go2_nav/share/go2_nav/config/nav2_params.yaml"
+  if [[ ! -f "$NAV2_PARAMS_FILE" ]]; then
+    NAV2_PARAMS_FILE="$SCRIPT_DIR/src/go2_nav/config/nav2_params.yaml"
+  fi
+  echo "[go2.sh] nav2_params = $NAV2_PARAMS_FILE"
+  echo
+  sed -n '1,260p' "$NAV2_PARAMS_FILE"
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Kill any stale processes from a previous run so launch can rebind cleanly.
@@ -244,6 +268,12 @@ case "$MODE" in
     LAUNCH=go2_exploration.launch.py
     ;;
 esac
+if [[ "$NAV2_LOG_ONLY" -eq 1 ]]; then
+  export GO2_NAV2_LOG_ONLY=1
+  echo "[go2.sh]   nav2_log_only = true (non-Nav2 node output -> ~/.ros/log)"
+else
+  unset GO2_NAV2_LOG_ONLY
+fi
 echo
 
 exec ros2 launch go2_nav "$LAUNCH" "database_path:=$DB_PATH"

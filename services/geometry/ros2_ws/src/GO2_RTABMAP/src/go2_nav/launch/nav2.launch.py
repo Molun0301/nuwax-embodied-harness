@@ -26,6 +26,8 @@ def generate_launch_description():
             executable='controller_server',
             name='controller_server',
             output='screen',
+            respawn=True,
+            respawn_delay=2.0,
             parameters=[nav2_params_file, {'use_sim_time': use_sim_time}],
             remappings=[('cmd_vel', '/cmd_vel')],
         ),
@@ -35,6 +37,8 @@ def generate_launch_description():
             executable='planner_server',
             name='planner_server',
             output='screen',
+            respawn=True,
+            respawn_delay=2.0,
             parameters=[nav2_params_file, {'use_sim_time': use_sim_time}],
         ),
 
@@ -43,6 +47,8 @@ def generate_launch_description():
             executable='recoveries_server',
             name='recovery_server',
             output='screen',
+            respawn=True,
+            respawn_delay=2.0,
             parameters=[nav2_params_file, {'use_sim_time': use_sim_time}],
         ),
 
@@ -51,6 +57,8 @@ def generate_launch_description():
             executable='bt_navigator',
             name='bt_navigator',
             output='screen',
+            respawn=True,
+            respawn_delay=2.0,
             parameters=[nav2_params_file, {'use_sim_time': use_sim_time}],
         ),
 
@@ -59,6 +67,8 @@ def generate_launch_description():
             executable='lifecycle_manager',
             name='lifecycle_manager_navigation',
             output='screen',
+            respawn=True,
+            respawn_delay=2.0,
             parameters=[{
                 'use_sim_time': use_sim_time,
                 'autostart': True,

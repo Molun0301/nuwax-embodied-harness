@@ -113,7 +113,7 @@ class _ShmVideoFrameSource:
                 height_px=720,
                 encoding=ImageEncoding.JPEG,
                 data=frame_bytes,
-                metadata={"source_kind": "video_shm_ingest", "ts_ns": ts_ns},
+                metadata={"source_kind": "platform_video_ingest_stream", "ingest_sequence": _seq, "ts_ns": ts_ns},
             )
         except Exception:
             return None

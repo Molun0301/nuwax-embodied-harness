@@ -3440,6 +3440,28 @@ class GatewayRuntime:
         del requested_by
         return {"perception_runtime": self.perception_video_runtime.stop()}
 
+    def _attach_perception_to_exploration(self) -> None:
+        """探索任务启动时拉起感知线程（若尚未运行），并记录本任务拉起标志。"""
+        if not self.perception_video_runtime.is_enabled():
+            return
+        if self.perception_video_runtime.is_running():
+            return
+        try:
+            self.perception_video_runtime.start()
+            self._exploration_started_perception = True
+        except Exception:
+            RUNTIME_LOGGER.warning("探索联动启动感知线程失败，忽略继续。", exc_info=True)
+
+    def _detach_perception_from_exploration(self) -> None:
+        """探索任务结束时停止感知线程（仅当本任务拉起）。"""
+        if not getattr(self, "_exploration_started_perception", False):
+            return
+        self._exploration_started_perception = False
+        try:
+            self.perception_video_runtime.stop()
+        except Exception:
+            RUNTIME_LOGGER.warning("探索联动停止感知线程失败，忽略继续。", exc_info=True)
+
     def _handle_get_localization_snapshot(
         self,
         _: Dict[str, Any],
@@ -4531,6 +4553,7 @@ class GatewayRuntime:
                 active_request = request
                 context.update(progress=0.08, stage="exploration_accepted", message="开始探索并持续查找目标。")
                 exploration_context = self.navigation_service.start_exploration(active_request)
+                self._attach_perception_to_exploration()
                 while True:
                     context.ensure_active()
                     exploration_context = self.navigation_service.refresh_exploration()
@@ -4737,6 +4760,7 @@ class GatewayRuntime:
                         self.navigation_service.cancel_goal()
                     except Exception:
                         pass
+                self._detach_perception_from_exploration()
 
         return self.task_manager.submit(
             "explore_and_find_target",
@@ -6810,6 +6834,7 @@ class GatewayRuntime:
             context.ensure_active()
             self._ensure_geometry_runtime_for_capability("explore_area")
             last_context = self.navigation_service.start_exploration(request)
+            self._attach_perception_to_exploration()
             finalized = False
             exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
             context.update(
@@ -6888,6 +6913,7 @@ class GatewayRuntime:
                     self.navigation_service.stop_exploration()
                 except Exception:
                     pass
+                self._detach_perception_from_exploration()
 
         return self.task_manager.submit(
             "explore_area",

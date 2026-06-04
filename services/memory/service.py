@@ -1575,6 +1575,7 @@ class MemoryService:
         *,
         expected_map_version_id: Optional[str],
         expected_localization_session_id: Optional[str],
+        goal_spec: Optional[GoalSpec] = None,
     ) -> GoalCandidateScoreBreakdown:
         metadata = dict(candidate.metadata or {})
         navigation_quality = metadata.get("navigation_quality") if isinstance(metadata.get("navigation_quality"), dict) else {}
@@ -1611,6 +1612,8 @@ class MemoryService:
             and localization_session_id != expected_localization_session_id
         )
         safety_score = 0.0 if quality_level == "not_navigable" or map_mismatch or localization_mismatch else 0.65 if quality_level == "needs_review" else 1.0
+        attribute_bonus = self._compute_attribute_bonus(candidate, goal_spec)
+        semantic_score = self._clamp_score(semantic_score + attribute_bonus)
         total_score = self._clamp_score(
             (0.32 * semantic_score)
             + (0.16 * spatial_score)
@@ -1638,8 +1641,39 @@ class MemoryService:
                 "failure_trajectory_event_ids": failure_evidence.get("trajectory_event_ids") or [],
                 "map_version_valid": not map_mismatch,
                 "localization_session_valid": not localization_mismatch,
+                "attribute_bonus": round(attribute_bonus, 6),
             },
         )
+
+    def _compute_attribute_bonus(
+        self,
+        candidate: MemoryNavigationCandidate,
+        goal_spec: Optional[GoalSpec],
+    ) -> float:
+        """计算属性匹配加成分（≤0.15），以 target_class 命中为门控。"""
+        if goal_spec is None or not goal_spec.attributes:
+            return 0.0
+        target_class = self._normalize_text(goal_spec.target_category or "")
+        metadata = dict(candidate.metadata or {})
+        candidate_text = self._normalize_text(" ".join(filter(None, [
+            str(metadata.get("label") or ""),
+            " ".join(metadata.get("semantic_labels") or []),
+            " ".join(metadata.get("visual_labels") or []),
+            " ".join(metadata.get("vision_tags") or []),
+            str(metadata.get("verification_text") or ""),
+        ])))
+        if target_class and target_class not in candidate_text:
+            return 0.0
+        matched = sum(
+            1 for attr in goal_spec.attributes
+            if not attr.hard_filter
+            and attr.operator != "not_match"
+            and attr.value
+            and self._normalize_text(attr.value) in candidate_text
+        )
+        if matched == 0:
+            return 0.0
+        return min(0.15, 0.08 * matched)
 
     def _navigation_candidate_decision(
         self,
@@ -1927,6 +1961,7 @@ class MemoryService:
                 candidate,
                 expected_map_version_id=effective_map_version_id,
                 expected_localization_session_id=effective_localization_session_id,
+                goal_spec=goal_spec,
             )
             decision, reasons, allowed_for_navigation = self._navigation_candidate_decision(candidate, score_breakdown)
             decorated_pool.append(

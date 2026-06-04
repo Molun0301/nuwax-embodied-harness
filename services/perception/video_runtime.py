@@ -43,11 +43,9 @@ class PerceptionVideoRuntime:
         store_artifact: bool = False,
         failure_backoff_sec: float = 2.0,
         keyframe_min_interval_sec: float = 1.0,
-        keyframe_max_interval_sec: float = 5.0,
         keyframe_translation_threshold_m: float = 0.75,
         keyframe_yaw_threshold_deg: float = 20.0,
         remember_keyframes: bool = True,
-        remember_min_interval_sec: float = 15.0,
         burst_frame_count: int = 8,
         burst_interval_sec: float = 0.15,
     ) -> None:
@@ -65,13 +63,11 @@ class PerceptionVideoRuntime:
         self._store_artifact = bool(store_artifact)
         self._failure_backoff_sec = max(0.1, float(failure_backoff_sec))
         self._remember_keyframes = bool(remember_keyframes)
-        self._remember_min_interval_sec = max(0.0, float(remember_min_interval_sec))
         self._burst_frame_count = max(1, int(burst_frame_count))
         self._burst_interval_sec = max(0.05, float(burst_interval_sec))
         self._semantic_map_builder = SemanticMapBuilder()
         self._keyframe_selector = PerceptionKeyframeSelector(
             min_interval_sec=keyframe_min_interval_sec,
-            max_interval_sec=keyframe_max_interval_sec,
             translation_threshold_m=keyframe_translation_threshold_m,
             yaw_threshold_deg=keyframe_yaw_threshold_deg,
         )
@@ -81,7 +77,6 @@ class PerceptionVideoRuntime:
         self._processed_frames = 0
         self._failure_count = 0
         self._last_keyframe_reason = None
-        self._last_memory_write_at = None
         self._last_success_message = None
         self._last_error = None
         self._last_status_metadata = {}
@@ -397,10 +392,6 @@ class PerceptionVideoRuntime:
             return False
         if hasattr(self._memory_service, "is_enabled") and not self._memory_service.is_enabled():
             return False
-        if not force and self._last_memory_write_at is not None:
-            elapsed_sec = max(0.0, (now - self._last_memory_write_at).total_seconds())
-            if elapsed_sec < self._remember_min_interval_sec:
-                return False
         try:
             self._memory_service.remember_current_scene(
                 title="自动场景记忆：%s" % context.scene_summary.headline[:48],
@@ -422,7 +413,6 @@ class PerceptionVideoRuntime:
                 exc,
             )
             return False
-        self._last_memory_write_at = now
         return True
 
     def _build_memory_tags(self, context) -> Tuple[str, ...]:

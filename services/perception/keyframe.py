@@ -33,12 +33,10 @@ class PerceptionKeyframeSelector:
         self,
         *,
         min_interval_sec: float,
-        max_interval_sec: float,
         translation_threshold_m: float,
         yaw_threshold_deg: float,
     ) -> None:
         self._min_interval_sec = max(0.05, float(min_interval_sec))
-        self._max_interval_sec = max(self._min_interval_sec, float(max_interval_sec))
         self._translation_threshold_m = max(0.0, float(translation_threshold_m))
         self._yaw_threshold_rad = math.radians(max(0.0, float(yaw_threshold_deg)))
         self._last_keyframe_at = None
@@ -109,16 +107,6 @@ class PerceptionKeyframeSelector:
                 return KeyframeDecision(False, "stationary_anchor_hold", metadata)
             return KeyframeDecision(True, "topology_node_changed", metadata)
 
-        if elapsed_sec >= self._max_interval_sec:
-            metadata.update(
-                {
-                    "max_interval_elapsed": True,
-                    "stationary_suppressed": has_pose_context,
-                }
-            )
-            if has_pose_context:
-                return KeyframeDecision(False, "stationary_pose_hold", metadata)
-            return KeyframeDecision(True, "max_interval", metadata)
         return KeyframeDecision(False, "no_significant_change", metadata)
 
     def mark_processed(

@@ -467,11 +467,9 @@ class PerceptionStreamRuntimeConfig:
     store_artifact: bool = False
     failure_backoff_sec: float = 2.0
     keyframe_min_interval_sec: float = 1.0
-    keyframe_max_interval_sec: float = 5.0
     keyframe_translation_threshold_m: float = 0.75
     keyframe_yaw_threshold_deg: float = 20.0
     remember_keyframes: bool = True
-    remember_min_interval_sec: float = 15.0
     burst_frame_count: int = 4
     burst_interval_sec: float = 0.08
 
@@ -804,11 +802,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
             store_artifact=_cfg_bool("NUWAX_PERCEPTION_STREAM_STORE_ARTIFACT", False),
             failure_backoff_sec=max(0.1, _cfg_float("NUWAX_PERCEPTION_STREAM_FAILURE_BACKOFF_SEC", 2.0)),
             keyframe_min_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_MIN_INTERVAL_SEC", 1.0)),
-            keyframe_max_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_MAX_INTERVAL_SEC", 5.0)),
             keyframe_translation_threshold_m=max(0.0, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_TRANSLATION_M", 0.75)),
             keyframe_yaw_threshold_deg=max(0.0, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_YAW_DEG", 20.0)),
             remember_keyframes=_cfg_bool("NUWAX_PERCEPTION_KEYFRAME_REMEMBER_ENABLED", True),
-            remember_min_interval_sec=max(0.0, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_REMEMBER_MIN_INTERVAL_SEC", 15.0)),
             burst_frame_count=max(1, _cfg_int("NUWAX_PERCEPTION_BURST_FRAME_COUNT", 4)),
             burst_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_BURST_INTERVAL_SEC", 0.08)),
         ),

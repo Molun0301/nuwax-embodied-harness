@@ -3,10 +3,10 @@
 Frontier-based autonomous exploration for Nav2.
 
 Periodically scans the OccupancyGrid published on /map and finds frontiers
-(free cells adjacent to unknown space). Picks the best frontier cluster as
-the next exploration goal and dispatches it to Nav2 via the
-/navigate_to_pose action. Failed goals are blacklisted briefly so we don't
-loop on the same unreachable spot.
+(free cells adjacent to unknown space). It scores each frontier by a mix of
+information gain, travel cost, turn cost, and local clearance, then dispatches
+the best goal to Nav2 via the /navigate_to_pose action. Failed goals are
+blacklisted briefly so we don't loop on the same unreachable spot.
 
 Stops automatically when no frontiers remain (map fully explored).
 
@@ -16,7 +16,13 @@ Tunables (ROS parameters, all overridable from launch):
   - robot_frame         : base_link
   - replan_period       : 3.0   seconds between exploration ticks
   - min_frontier_size   : 10    cells (after clustering) to be considered
-  - distance_weight     : 0.5   alpha in score = size - alpha * distance_in_cells
+  - info_gain_radius    : 1.5   meters used to estimate unknown area around a goal
+  - info_gain_weight    : 1.0   reward for unknown area near a frontier
+  - size_weight         : 0.6   reward for larger frontiers
+  - travel_weight       : 0.8   penalty for long navigation
+  - turn_weight         : 0.25  penalty for large heading changes
+  - clearance_weight    : 0.8   reward for open space around the goal
+  - max_goal_candidates_per_frontier : 80 cells sampled per frontier cluster
   - blacklist_radius    : 0.5   meters; nearby failed goals share a slot
   - blacklist_ttl       : 60.0  seconds before a failed goal is retryable
   - goal_yaw_to_robot   : true  face the goal back toward current robot
@@ -51,6 +57,19 @@ class FrontierCluster:
     size: int
 
 
+@dataclass
+class FrontierCandidate:
+    """Frontier cluster plus the concrete goal chosen for it."""
+    cluster: FrontierCluster
+    goal_world: Tuple[float, float]
+    goal_cell: Tuple[int, int]
+    info_gain: int
+    clearance_m: float
+    heading_error: float
+    travel_m: float
+    score: float
+
+
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
@@ -61,7 +80,13 @@ class FrontierExplorer(Node):
         self.declare_parameter('robot_frame', 'base_link')
         self.declare_parameter('replan_period', 3.0)
         self.declare_parameter('min_frontier_size', 10)
-        self.declare_parameter('distance_weight', 0.5)
+        self.declare_parameter('info_gain_radius', 1.5)
+        self.declare_parameter('info_gain_weight', 1.0)
+        self.declare_parameter('size_weight', 0.6)
+        self.declare_parameter('travel_weight', 0.8)
+        self.declare_parameter('turn_weight', 0.25)
+        self.declare_parameter('clearance_weight', 0.8)
+        self.declare_parameter('max_goal_candidates_per_frontier', 80)
         self.declare_parameter('blacklist_radius', 0.5)
         self.declare_parameter('blacklist_ttl', 60.0)
         self.declare_parameter('goal_yaw_to_robot', True)
@@ -85,7 +110,13 @@ class FrontierExplorer(Node):
         self.robot_frame = gp('robot_frame').value
         self.replan_period = float(gp('replan_period').value)
         self.min_frontier_size = int(gp('min_frontier_size').value)
-        self.distance_weight = float(gp('distance_weight').value)
+        self.info_gain_radius = float(gp('info_gain_radius').value)
+        self.info_gain_weight = float(gp('info_gain_weight').value)
+        self.size_weight = float(gp('size_weight').value)
+        self.travel_weight = float(gp('travel_weight').value)
+        self.turn_weight = float(gp('turn_weight').value)
+        self.clearance_weight = float(gp('clearance_weight').value)
+        self.max_goal_candidates_per_frontier = int(gp('max_goal_candidates_per_frontier').value)
         self.blacklist_radius = float(gp('blacklist_radius').value)
         self.blacklist_ttl = float(gp('blacklist_ttl').value)
         self.goal_yaw_to_robot = bool(gp('goal_yaw_to_robot').value)
@@ -138,7 +169,8 @@ class FrontierExplorer(Node):
         self.get_logger().info(
             f'FrontierExplorer started. map_topic={self.map_topic}, '
             f'replan={self.replan_period}s, '
-            f'min_frontier_size={self.min_frontier_size} cells'
+            f'min_frontier_size={self.min_frontier_size} cells, '
+            f'info_gain_radius={self.info_gain_radius:.1f}m'
         )
 
     # ------------------------------------------------------------------
@@ -208,12 +240,13 @@ class FrontierExplorer(Node):
             return
 
         # 1) Robot pose
-        robot = self.get_robot_xy()
+        robot = self.get_robot_pose()
         if robot is None:
             self.get_logger().warn(
                 'No TF map->base_link yet, skipping exploration tick.',
                 throttle_duration_sec=5.0)
             return
+        rx, ry, ryaw = robot
 
         # 2) Frontier detection
         all_clusters = self.find_frontier_clusters(self.latest_map)
@@ -223,29 +256,31 @@ class FrontierExplorer(Node):
             self.exploration_done = True
             return
 
-        # 3) Filter out blacklisted clusters
+        # 3) Expire blacklisted goals before scoring. Blacklist filtering is
+        # applied to the concrete candidate goal, not just the cluster centroid.
         self.expire_blacklist()
-        clusters = [c for c in all_clusters if not self.is_blacklisted(*c.centroid_world)]
-        if not clusters:
-            self.publish_viz(all_clusters, None)
-            self.get_logger().info(
-                'All frontiers are blacklisted; waiting for blacklist to expire.',
-                throttle_duration_sec=5.0)
-            return
 
         # 4) Score and pick best
-        best = self.pick_best(clusters, robot)
-        gx, gy = best.centroid_world
+        best = self.pick_best(all_clusters, robot)
+        if best is None:
+            self.publish_viz(all_clusters, None)
+            self.get_logger().info(
+                'All frontier goals are blacklisted; waiting for blacklist to expire.',
+                throttle_duration_sec=5.0)
+            return
+        gx, gy = best.goal_world
         self.get_logger().info(
-            f'Selected frontier: ({gx:.2f},{gy:.2f}) size={best.size} '
-            f'from {len(clusters)} candidates'
+            f'Selected frontier: ({gx:.2f},{gy:.2f}) score={best.score:.2f} '
+            f'gain={best.info_gain} size={best.cluster.size} '
+            f'd={best.travel_m:.2f}m turn={math.degrees(best.heading_error):.0f}deg '
+            f'clear={best.clearance_m:.2f}m from {len(all_clusters)} candidates'
         )
 
         # 5) Visualize all candidates + chosen goal
         self.publish_viz(all_clusters, best)
 
         # 6) Send goal
-        self.send_nav_goal(gx, gy, robot)
+        self.send_nav_goal(gx, gy, (rx, ry, ryaw))
 
     # ------------------------------------------------------------------
     # Frontier detection
@@ -337,22 +372,128 @@ class FrontierExplorer(Node):
     # Goal selection
     # ------------------------------------------------------------------
     def pick_best(self, clusters: List[FrontierCluster],
-                  robot_xy: Tuple[float, float]) -> FrontierCluster:
-        rx, ry = robot_xy
-        res = self.latest_map.info.resolution
-        # Normalize: distance is in meters; size is in cells. Convert distance
-        # to "cell units" so the user-facing weight is dimensionally consistent.
+                  robot_pose: Tuple[float, float, float]) -> Optional[FrontierCandidate]:
+        grid = np.array(self.latest_map.data, dtype=np.int16).reshape(
+            self.latest_map.info.height, self.latest_map.info.width
+        )
+        info = self.latest_map.info
         best = None
         best_score = -float('inf')
         for c in clusters:
-            cx, cy = c.centroid_world
-            d_m = math.hypot(cx - rx, cy - ry)
-            d_cells = d_m / res if res > 1e-6 else d_m
-            score = c.size - self.distance_weight * d_cells
-            if score > best_score:
-                best_score = score
-                best = c
+            candidate = self.evaluate_cluster(c, robot_pose, grid, info)
+            if self.is_blacklisted(*candidate.goal_world):
+                continue
+            if candidate.score > best_score:
+                best_score = candidate.score
+                best = candidate
         return best
+
+    def evaluate_cluster(self, cluster: FrontierCluster,
+                         robot_pose: Tuple[float, float, float],
+                         grid: np.ndarray,
+                         info) -> FrontierCandidate:
+        rx, ry, ryaw = robot_pose
+        res = info.resolution
+        ox = info.origin.position.x
+        oy = info.origin.position.y
+
+        best_goal = None
+        best_goal_cell = None
+        best_goal_score = -float('inf')
+        best_gain = 0
+        best_clearance = 0.0
+        best_heading_error = 0.0
+        best_travel = 0.0
+
+        gain_radius_cells = max(1, int(round(self.info_gain_radius / res))) if res > 1e-6 else 3
+        clearance_radius_cells = max(1, int(round(0.35 / res))) if res > 1e-6 else 3
+
+        cells = cluster.cells
+        max_samples = max(1, self.max_goal_candidates_per_frontier)
+        if cells.shape[0] > max_samples:
+            step = max(1, int(math.ceil(cells.shape[0] / max_samples)))
+            cells = cells[::step]
+
+        for rr, cc in cells:
+            if not self._is_valid_cell(rr, cc, grid.shape):
+                continue
+            gx = ox + (cc + 0.5) * res
+            gy = oy + (rr + 0.5) * res
+            travel = math.hypot(gx - rx, gy - ry)
+            bearing = math.atan2(gy - ry, gx - rx)
+            heading_error = abs(self._angle_diff(bearing, ryaw))
+            info_gain = self._count_unknown_in_radius(grid, rr, cc, gain_radius_cells)
+            clearance_m = self._estimate_clearance_m(grid, rr, cc, clearance_radius_cells, res)
+            local_score = (
+                self.info_gain_weight * math.log1p(info_gain) +
+                self.size_weight * math.log1p(cluster.size) -
+                self.travel_weight * travel -
+                self.turn_weight * heading_error +
+                self.clearance_weight * clearance_m
+            )
+            if local_score > best_goal_score:
+                best_goal_score = local_score
+                best_goal = (gx, gy)
+                best_goal_cell = (rr, cc)
+                best_gain = info_gain
+                best_clearance = clearance_m
+                best_heading_error = heading_error
+                best_travel = travel
+
+        if best_goal is None:
+            best_goal = cluster.centroid_world
+            best_goal_cell = (int(round((best_goal[1] - oy) / res)), int(round((best_goal[0] - ox) / res)))
+            best_gain = 0
+            best_clearance = 0.0
+            best_heading_error = abs(self._angle_diff(math.atan2(best_goal[1] - ry, best_goal[0] - rx), ryaw))
+            best_travel = math.hypot(best_goal[0] - rx, best_goal[1] - ry)
+            best_goal_score = (
+                self.size_weight * math.log1p(cluster.size) -
+                self.travel_weight * best_travel -
+                self.turn_weight * best_heading_error
+            )
+
+        return FrontierCandidate(
+            cluster=cluster,
+            goal_world=best_goal,
+            goal_cell=best_goal_cell,
+            info_gain=best_gain,
+            clearance_m=best_clearance,
+            heading_error=best_heading_error,
+            travel_m=best_travel,
+            score=best_goal_score,
+        )
+
+    @staticmethod
+    def _is_valid_cell(r: int, c: int, shape: Tuple[int, int]) -> bool:
+        return 0 <= r < shape[0] and 0 <= c < shape[1]
+
+    @staticmethod
+    def _angle_diff(a: float, b: float) -> float:
+        return math.atan2(math.sin(a - b), math.cos(a - b))
+
+    def _count_unknown_in_radius(self, grid: np.ndarray, r: int, c: int, radius_cells: int) -> int:
+        r0 = max(0, r - radius_cells)
+        r1 = min(grid.shape[0], r + radius_cells + 1)
+        c0 = max(0, c - radius_cells)
+        c1 = min(grid.shape[1], c + radius_cells + 1)
+        window = grid[r0:r1, c0:c1]
+        return int(np.count_nonzero(window < 0))
+
+    def _estimate_clearance_m(self, grid: np.ndarray, r: int, c: int,
+                              radius_cells: int, res: float) -> float:
+        r0 = max(0, r - radius_cells)
+        r1 = min(grid.shape[0], r + radius_cells + 1)
+        c0 = max(0, c - radius_cells)
+        c1 = min(grid.shape[1], c + radius_cells + 1)
+        window = grid[r0:r1, c0:c1]
+        occupied = np.argwhere(window > 50)
+        if occupied.size == 0:
+            return radius_cells * res
+        rr = r - r0
+        cc = c - c0
+        dists = np.sqrt((occupied[:, 0] - rr) ** 2 + (occupied[:, 1] - cc) ** 2)
+        return float(np.min(dists) * res)
 
     # ------------------------------------------------------------------
     # Blacklist
@@ -380,7 +521,7 @@ class FrontierExplorer(Node):
     # ------------------------------------------------------------------
     def publish_viz(self,
                     clusters: List[FrontierCluster],
-                    chosen: Optional[FrontierCluster]):
+                    chosen: Optional[FrontierCandidate]):
         """Publish RViz markers on /frontiers (MarkerArray)."""
         ma = MarkerArray()
         stamp = self.get_clock().now().to_msg()
@@ -423,7 +564,7 @@ class FrontierExplorer(Node):
                 m.scale = Vector3(x=d, y=d, z=d)
                 # Cyan unless chosen, then green
                 is_chosen = (chosen is not None
-                             and c.centroid_world == chosen.centroid_world)
+                             and c.centroid_world == chosen.cluster.centroid_world)
                 if is_chosen:
                     m.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.95)
                 else:
@@ -439,7 +580,7 @@ class FrontierExplorer(Node):
             arrow.id = 0
             arrow.type = Marker.ARROW
             arrow.action = Marker.ADD
-            gx, gy = chosen.centroid_world
+            gx, gy = chosen.goal_world
             # Vertical arrow: from (gx,gy,1.0) down to (gx,gy,0.1)
             arrow.points = [
                 Point(x=gx, y=gy, z=1.0),
@@ -489,9 +630,9 @@ class FrontierExplorer(Node):
         m.id = 0
         m.type = Marker.TEXT_VIEW_FACING
         m.action = Marker.ADD
-        rxy = self.get_robot_xy()
-        if rxy is not None:
-            m.pose.position.x, m.pose.position.y = rxy
+        robot_pose = self.get_robot_pose()
+        if robot_pose is not None:
+            m.pose.position.x, m.pose.position.y = robot_pose[0], robot_pose[1]
         m.pose.position.z = 1.5
         m.pose.orientation.w = 1.0
         m.scale.z = 0.3
@@ -524,19 +665,24 @@ class FrontierExplorer(Node):
     # ------------------------------------------------------------------
     # TF helper
     # ------------------------------------------------------------------
-    def get_robot_xy(self) -> Optional[Tuple[float, float]]:
+    def get_robot_pose(self) -> Optional[Tuple[float, float, float]]:
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.global_frame, self.robot_frame, Time())
         except TransformException:
             return None
-        return (tf.transform.translation.x, tf.transform.translation.y)
+        q = tf.transform.rotation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        return (tf.transform.translation.x, tf.transform.translation.y, yaw)
 
     # ------------------------------------------------------------------
     # Nav2 action client
     # ------------------------------------------------------------------
     def send_nav_goal(self, gx: float, gy: float,
-                      robot_xy: Tuple[float, float]):
+                      robot_pose: Tuple[float, float, float]):
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn(
                 'navigate_to_pose action server not available; will retry.')
@@ -548,8 +694,11 @@ class FrontierExplorer(Node):
         goal_msg.pose.pose.position = Point(x=gx, y=gy, z=0.0)
         # Yaw: face toward goal (from current robot pose) for nicer
         # approach. The robot is rotation-symmetric for nav purposes anyway.
-        rx, ry = robot_xy
-        yaw = math.atan2(gy - ry, gx - rx)
+        rx, ry, ryaw = robot_pose
+        if self.goal_yaw_to_robot:
+            yaw = math.atan2(gy - ry, gx - rx)
+        else:
+            yaw = ryaw
         goal_msg.pose.pose.orientation = Quaternion(
             x=0.0, y=0.0, z=math.sin(yaw / 2.0), w=math.cos(yaw / 2.0)
         )

@@ -84,7 +84,17 @@ def generate_launch_description():
                         'robot_frame': 'base_link',
                         'replan_period': 3.0,           # re-evaluate every 3s
                         'min_frontier_size': 10,        # cells, after clustering
-                        'distance_weight': 0.5,         # score = size - alpha*dist_cells
+                        # Balanced frontier utility:
+                        # reward nearby unknown area + useful frontier length,
+                        # penalize long travel and sharp heading changes,
+                        # prefer goal points with local obstacle clearance.
+                        'info_gain_radius': 1.5,        # m around candidate goal
+                        'info_gain_weight': 1.0,
+                        'size_weight': 0.6,
+                        'travel_weight': 0.8,
+                        'turn_weight': 0.25,
+                        'clearance_weight': 0.8,
+                        'max_goal_candidates_per_frontier': 80,
                         'blacklist_radius': 0.5,        # m
                         'blacklist_ttl': 60.0,          # s
                         'max_consecutive_failures': 5,

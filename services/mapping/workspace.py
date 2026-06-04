@@ -449,6 +449,23 @@ class MapWorkspaceService:
                 http_status=409,
                 jsonrpc_code=-32000,
             )
+        if active_workspace is None or not active_workspace.map_loaded:
+            raise GatewayError(
+                "地图 %s 尚未加载到运行态；请先调用 load_map_version(map_name=%s, version_id=<latest_version_id>) 启动旧地图 localization，再执行重定位。"
+                % (resolved_name, resolved_name),
+                error_code="map_runtime_not_loaded",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    "map_name": resolved_name,
+                    "latest_version_id": (
+                        active_workspace.map_asset.latest_version_id
+                        if active_workspace is not None and active_workspace.map_asset is not None
+                        else None
+                    ),
+                    "recommended_next_tool": "load_map_version",
+                },
+            )
         expected_version_id = (
             active_workspace.map_asset.latest_version_id
             if active_workspace is not None and active_workspace.map_asset is not None
@@ -622,6 +639,13 @@ class MapWorkspaceService:
             self._ensure_active_localization_session_binding(refresh=refresh_localization) if asset.active else None
         )
         latest_localization_snapshot = self._localization_service.get_latest_snapshot() if asset.active else None
+        runtime_readiness = self._active_runtime_readiness() if asset.active else {}
+        live_map_loaded = bool(latest_map_snapshot is not None and runtime_readiness.get("map_loaded", True))
+        live_localization_ready = bool(
+            active_localization_session is not None
+            and active_localization_session.status == LocalizationSessionStatus.READY
+            and runtime_readiness.get("localization_ready", True)
+        )
         memory_summary = self._memory_service.get_summary()
         navigation_context = self._navigation_service.get_latest_navigation_context()
         exploration_context = self._navigation_service.get_latest_exploration_context()
@@ -629,20 +653,18 @@ class MapWorkspaceService:
             active_map_name=asset.map_name,
             active_memory_library_name=self._memory_service.get_active_library_name(),
             map_asset=asset,
-            map_loaded=latest_map_snapshot is not None,
-            localization_ready=bool(
-                active_localization_session is not None
-                and active_localization_session.status == LocalizationSessionStatus.READY
-            ),
+            map_loaded=live_map_loaded,
+            localization_ready=live_localization_ready,
             active_localization_session=active_localization_session,
-            mapping_runtime_enabled=self._mapping_service.is_available(),
-            latest_map_snapshot=latest_map_snapshot,
-            latest_localization_snapshot=latest_localization_snapshot,
+            mapping_runtime_enabled=bool(runtime_readiness.get("runtime_enabled", self._mapping_service.is_available())),
+            latest_map_snapshot=latest_map_snapshot if live_map_loaded else None,
+            latest_localization_snapshot=latest_localization_snapshot if live_localization_ready else None,
             latest_memory_summary=memory_summary,
             navigation_context=navigation_context,
             exploration_context=exploration_context,
             metadata={
                 "catalog_root": self.catalog_root,
+                "runtime_readiness": runtime_readiness,
             },
         )
         self._state_store.write(
@@ -662,12 +684,15 @@ class MapWorkspaceService:
             else None
         )
         memory_summary = self._memory_service.get_summary()
+        runtime_readiness = self._active_runtime_readiness() if is_active else {}
+        live_map_loaded = bool(latest_map_snapshot is not None and runtime_readiness.get("map_loaded", True))
         frame_id = asset.frame_id
-        if latest_map_snapshot is not None:
+        if live_map_loaded and latest_map_snapshot is not None:
             frame_id = self._resolve_map_frame_id(latest_map_snapshot)
         localization_ready = bool(
             active_localization_session is not None
             and active_localization_session.status == LocalizationSessionStatus.READY
+            and runtime_readiness.get("localization_ready", True)
         )
         updated_asset = asset.model_copy(
             update={
@@ -678,7 +703,7 @@ class MapWorkspaceService:
                 "localization_ready": localization_ready,
                 "status": self._infer_status(
                     is_active=is_active,
-                    has_map=latest_map_snapshot is not None,
+                    has_map=live_map_loaded,
                     has_saved_version=bool(asset.latest_version_id),
                     localization_ready=localization_ready,
                     memory_active=(memory_summary.metadata.get("active_library_name") == asset.bound_memory_library_name),
@@ -689,6 +714,51 @@ class MapWorkspaceService:
         )
         self._save_asset(updated_asset)
         return updated_asset
+
+    def _active_runtime_readiness(self) -> Dict[str, object]:
+        """Return live SLAM/Nav2 readiness for the active workspace.
+
+        Map and localization services may retain the last good snapshot after
+        exploration exits. The active workspace should expose live runtime
+        readiness, not merely cached snapshots, so agents know to call
+        load_map_version before navigating on a saved map.
+        """
+
+        diagnostics_reader = getattr(self._geometry_runtime, "get_live_mapping_diagnostics", None)
+        if not callable(diagnostics_reader):
+            return {}
+        try:
+            diagnostics = diagnostics_reader()
+        except Exception:
+            return {}
+        if not isinstance(diagnostics, dict):
+            return {}
+        readiness = diagnostics.get("rtabmap_readiness")
+        if not isinstance(readiness, dict):
+            readiness = {}
+        runtime_status = diagnostics.get("runtime_status")
+        if not isinstance(runtime_status, dict):
+            runtime_status = {}
+        process_running = False
+        processes = runtime_status.get("processes")
+        if isinstance(processes, dict):
+            external = processes.get("external_slam_nav2")
+            if isinstance(external, dict):
+                process_running = bool(external.get("running"))
+        runtime_enabled = bool(
+            process_running
+            or readiness.get("map_ready")
+            or readiness.get("localization_ready")
+            or readiness.get("streaming_ready")
+        )
+        return {
+            "runtime_enabled": runtime_enabled,
+            "map_loaded": bool(runtime_enabled and readiness.get("map_ready")),
+            "localization_ready": bool(runtime_enabled and readiness.get("localization_ready")),
+            "waiting_for": diagnostics.get("waiting_for") or readiness.get("waiting_for"),
+            "message": diagnostics.get("message") or readiness.get("message"),
+            "runtime_phase": runtime_status.get("phase"),
+        }
 
     def _infer_status(
         self,

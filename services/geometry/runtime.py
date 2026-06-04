@@ -122,10 +122,17 @@ class _ManagedProcess:
             return
 
         def _signal_process_group(sig: signal.Signals) -> None:
+            # 先验证进程是否仍在运行，避免 PID 回收竞态：
+            # 旧进程退出后新进程恰好分配相同 PID，os.killpg 会误杀新进程。
+            if process.poll() is not None:
+                return
             try:
                 os.killpg(os.getpgid(process.pid), sig)
             except Exception:
                 try:
+                    # 再次确认进程仍在运行后再发信号
+                    if process.poll() is not None:
+                        return
                     if sig == signal.SIGINT:
                         process.send_signal(signal.SIGINT)
                     elif sig == signal.SIGTERM:
@@ -430,13 +437,14 @@ class PlatformGeometryRuntime:
             return shlex.split(raw_args)
         return [str(item) for item in raw_args if str(item or "").strip()]
 
+    # go2.sh mode 标志集合
+    _GO2_MODE_FLAGS: frozenset = frozenset({"-m", "--new", "--mapping", "-l", "--loc", "--localization", "-e", "--explore", "--exploration"})
+
     def _build_external_geometry_command(self) -> List[str]:
         script_path = self._external_script_path()
         args = self._external_args()
-        mode_flags = {"-m", "--new", "--mapping", "-l", "--loc", "--localization", "-e", "--explore", "--exploration"}
-        # go2.sh 要求必须显式指定 mode；若未配置 mode，则默认走 mapping 模式，避免直接退出(code=2)。
-        if script_path.name == "go2.sh" and not any(arg in mode_flags for arg in args):
-            args = ["--mapping", *args]
+        # 不再默认添加 --mapping：mapping 是手动建图专用，平台自动场景不启动。
+        # 如果 go2.sh 且未配置 mode，让 go2.sh 自己报错退出(code=2)。
         return [str(script_path), *args]
 
     def _build_external_exploration_command(self, request: Optional[ExploreAreaRequest] = None) -> List[str]:
@@ -565,6 +573,10 @@ class PlatformGeometryRuntime:
     def _command_uses_external_localization(command: List[str]) -> bool:
         return any(str(part) in {"-l", "--loc", "--localization"} for part in command)
 
+    def _command_has_mode_flag(self, command: List[str]) -> bool:
+        """检查命令是否包含任何 go2.sh mode 标志（explore/localization/mapping）。"""
+        return any(str(part) in self._GO2_MODE_FLAGS for part in command)
+
     def _external_geometry_process_is_localization(self) -> bool:
         process = self._managed_processes.get(self._external_process_name())
         return bool(
@@ -667,11 +679,20 @@ class PlatformGeometryRuntime:
                 self._build_odom_tf_bridge_command(),
                 "external_odom_tf_bridge.log",
             )
-        self._start_managed_process(
-            self._external_process_name(),
-            self._build_external_geometry_command(),
-            self._external_log_name(),
-        )
+        external_command = self._build_external_geometry_command()
+        # 如果外部脚本未配置 mode 标志（如 go2.sh 无 --explore/--localization），
+        # 不自动启动外部几何进程，避免默认进入 manual mapping 模式。
+        if not self._command_has_mode_flag(external_command):
+            self._record_runtime_diagnostic(
+                "external_slam_nav2_skipped",
+                "外部 SLAM/Nav2 脚本未配置 mode 标志，平台启动时不自动启动 go2.sh（mapping 为手动建图专用）。",
+            )
+        else:
+            self._start_managed_process(
+                self._external_process_name(),
+                external_command,
+                self._external_log_name(),
+            )
         if platform_cmd_vel_bridge_enabled:
             try:
                 bridge = Ros2CmdVelMotionBridge(
@@ -760,6 +781,7 @@ class PlatformGeometryRuntime:
                 graceful_launch_shutdown=(name == self._external_process_name()),
                 graceful_timeout_sec=15.0,
             )
+            time.sleep(3.0)
             restart = True
         process = current or _ManagedProcess(
             name=name,
@@ -3374,7 +3396,6 @@ class PlatformGeometryRuntime:
             current_process = self._managed_processes.get(process_name)
             resolved_db = db_path.expanduser().resolve()
             db_has_map_data = db_path.stat().st_size > 4096
-            mode_flag = "--localization" if db_has_map_data else "--mapping"
             backend_mode = "rtabmap_localization" if db_has_map_data else "rtabmap_mapping"
             use_static_map_yaml = self._external_localization_uses_static_map_yaml()
             static_map_yaml_path = (
@@ -3385,9 +3406,39 @@ class PlatformGeometryRuntime:
             static_map_requested = static_map_yaml_path is not None
             if db_has_map_data:
                 self.clear_external_exploration_state(reason="activate_rtabmap_localization")
+            # 空数据库时不启动 --mapping：mapping 是手动建图专用。
+            # 新地图（空数据库）激活时只需停止当前外部进程，等待 explore 时再启动 --explore。
+            if not db_has_map_data:
+                if current_process is not None and current_process.is_running():
+                    current_process.stop(
+                        timeout_sec=12.0,
+                        graceful_launch_shutdown=True,
+                        graceful_timeout_sec=15.0,
+                    )
+                    time.sleep(3.0)
+                    self._managed_processes.pop(process_name, None)
+                self._map_stream_tracker = {}
+                return {
+                    **activation_payload,
+                    "backend_switch_applied": True,
+                    "backend_map_loaded": False,
+                    "backend_mode": "unavailable",
+                    "active_backend_version_id": version.version_id,
+                    "reason": "rtabmap_empty_db_no_auto_mapping",
+                    "rtabmap": {
+                        "switch_method": "stop_previous_no_start",
+                        "database_path": str(resolved_db),
+                        "note": "mapping is manual-only; use explore_area to start --explore",
+                    },
+                    "nav2_map": {
+                        **nav2_map_metadata,
+                        "map_yaml_path": str(nav2_yaml_path) if nav2_yaml_path is not None else None,
+                        "used_for_static_map": False,
+                    },
+                }
+            # 有数据的数据库：走 --localization
             if (
-                db_has_map_data
-                and current_process is not None
+                current_process is not None
                 and current_process.is_running()
                 and self._external_process_serves_database(current_process.command, resolved_db, localization=True)
                 and (
@@ -3419,8 +3470,9 @@ class PlatformGeometryRuntime:
                     graceful_launch_shutdown=True,
                     graceful_timeout_sec=15.0,
                 )
+                time.sleep(3.0)
             self._map_stream_tracker = {}
-            command = [str(self._external_script_path()), mode_flag, str(db_path)]
+            command = [str(self._external_script_path()), "--localization", str(db_path)]
             if static_map_yaml_path is not None:
                 command.extend(["--map-yaml", str(static_map_yaml_path)])
             # Default to db-only localization: RTAB-Map publishes /map directly.
@@ -3437,7 +3489,7 @@ class PlatformGeometryRuntime:
                     "active_backend_version_id": version.version_id,
                     "reason": f"{backend_mode}_started",
                     "rtabmap": {
-                        "switch_method": f"process_restart_{mode_flag.lstrip('-')}",
+                        "switch_method": "process_restart_localization",
                         "database_path": str(db_path),
                     },
                     "nav2_map": {
@@ -3449,7 +3501,7 @@ class PlatformGeometryRuntime:
             return {
                 **activation_payload,
                 "backend_switch_applied": False,
-                "reason": f"{backend_mode}_start_failed",
+                "reason": "rtabmap_localization_start_failed",
                 "backend_mode": "unavailable",
                 "rtabmap": {"database_path": str(db_path)},
                 "nav2_map": {
@@ -3815,6 +3867,7 @@ class PlatformGeometryRuntime:
         if current_process is not None:
             self._managed_processes.pop(process_name, None)
             current_process.stop()
+            time.sleep(3.0)
         self._map_stream_tracker = {}
         self._start_managed_process(process_name, command, self._external_log_name(), restart=True)
         process = self._managed_processes.get(process_name)
@@ -3839,6 +3892,17 @@ class PlatformGeometryRuntime:
             terminal_state = self._external_exploration_terminal_state
         if not has_request and terminal_state is None and not self._external_geometry_process_is_exploration():
             return False
+        if terminal_state is not None:
+            # 终端状态已设置（探索已成功/失败/超时），不覆盖；仅兜底清理残留进程
+            process_name = self._external_process_name()
+            process = self._managed_processes.pop(process_name, None)
+            if process is not None and process.is_running():
+                process.stop(
+                    timeout_sec=10.0,
+                    graceful_launch_shutdown=True,
+                    graceful_timeout_sec=15.0,
+                )
+            return True
         if cancel_navigation:
             self._cancel_platform_exploration_navigation()
         self._finish_external_script_exploration(

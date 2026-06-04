@@ -110,6 +110,7 @@ class FrontierExplorer(Node):
         self.active_goal_send_time: Optional[float] = None
         self.consecutive_failures = 0
         self.exploration_done = False
+        self._shutdown_requested = False
 
         # Wall-clock startup time used for the initial grace period.
         self.start_time = self.get_clock().now().nanoseconds * 1e-9
@@ -149,6 +150,12 @@ class FrontierExplorer(Node):
     def tick(self):
         if self.exploration_done:
             self.publish_status('DONE (exploration finished)')
+            if not self._shutdown_requested:
+                self._shutdown_requested = True
+                self.get_logger().info('Exploration complete. Shutting down frontier_explorer node.')
+                self.timer.cancel()
+                self.destroy_node()
+                rclpy.shutdown()
             return
 
         now = self.get_clock().now().nanoseconds * 1e-9

@@ -86,6 +86,11 @@ def generate_launch_description():
         'Grid/CellSize': '0.10',
         'Grid/RangeMin': '0.3',
         'Grid/RangeMax': '8.0',
+
+        'cloud_output_voxelized': True,
+        'cloud_subtract_filtering': True,
+        'cloud_subtract_filtering_min_neighbors': 2,
+        
         # Ground/obstacle by HEIGHT in base_link frame.
         # GO2: base_link ≈ body center (~30cm above ground).
         # Floor ≈ z=-0.30, body ≈ z=-0.10..+0.10, walls/obstacles span larger.

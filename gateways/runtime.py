@@ -669,6 +669,7 @@ class GatewayRuntime:
         )
         self._cloud_map_mmap_poll_thread = thread
         thread.start()
+        RUNTIME_LOGGER.info("cloud_map mmap 轮询线程已启动 alive=%s", thread.is_alive())
 
     def _stop_cloud_map_mmap_poll(self) -> None:
         thread = self._cloud_map_mmap_poll_thread
@@ -680,19 +681,30 @@ class GatewayRuntime:
         self._cloud_map_mmap_poll_thread = None
         self._cloud_map_mmap_reader.close()
 
+    # 心跳重发间隔：每 N 次轮询（N*100ms）重发一次最新帧，
+    # 保证后连接的客户端在 revision 静止时也能拿到当前地图（参考 map.heartbeat）。
+    _CLOUD_MAP_HEARTBEAT_TICKS = 20
+
     def _run_cloud_map_mmap_poll(self) -> None:
+        ticks_since_publish = 0
         while not self._cloud_map_mmap_poll_stop.wait(self._CLOUD_MAP_MMAP_POLL_INTERVAL_SEC):
             try:
                 header = self._cloud_map_mmap_reader.read_header()
                 if header is None:
                     continue
                 revision = int(header[5])
-                if revision == self._cloud_map_last_revision:
+                if revision == 0:
+                    continue  # mmap 尚无有效数据
+                ticks_since_publish += 1
+                changed = revision != self._cloud_map_last_revision
+                heartbeat_due = ticks_since_publish >= self._CLOUD_MAP_HEARTBEAT_TICKS
+                if not changed and not heartbeat_due:
                     continue
                 frame_bytes = self._cloud_map_mmap_reader.build_binary_frame()
                 if frame_bytes is None:
                     continue
                 self._cloud_map_last_revision = revision
+                ticks_since_publish = 0
                 from contracts.streams import StreamPayloadKind
                 self.stream_bus.publish(
                     "pointcloud_map.live_chunk",
@@ -700,8 +712,8 @@ class GatewayRuntime:
                     payload_kind=StreamPayloadKind.BINARY,
                     payload=frame_bytes,
                 )
-            except Exception:
-                pass
+            except Exception as _e:
+                RUNTIME_LOGGER.warning("cloud_map mmap 轮询异常: %s", _e, exc_info=True)
 
     def _stop_data_frame_stream_sources(self) -> None:
         self._stop_cloud_map_mmap_poll()
@@ -1213,7 +1225,7 @@ class GatewayRuntime:
             _descriptor(
                 "relocalize_active_map",
                 "重定位当前地图",
-                "对当前激活地图执行一次平台重定位刷新，并更新定位会话状态。",
+                "仅在当前地图版本已经通过 load_map_version 加载且 active_workspace.map_loaded=true 后，执行一次平台重定位刷新。加载旧地图必须先调用 load_map_version，不要用本能力启动地图加载。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object({"map_name": {"type": "string"}}),
@@ -2042,7 +2054,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="relocalize_active_map",
                 display_name="重定位当前地图",
-                description="对当前激活地图执行一次平台重定位刷新。",
+                description="仅在地图版本已加载且 active_workspace.map_loaded=true 后刷新定位；加载旧地图请先调用 load_map_version。",
                 category=SkillCategory.SYSTEM,
                 capability_name="relocalize_active_map",
             ),
@@ -2217,7 +2229,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="load_map_version",
                 display_name="加载地图版本",
-                description="把平台侧已保存的地图版本加载到当前地图工作区。",
+                description="加载平台侧已保存的地图版本到当前工作区，并启动 go2.sh --localization <db> 进入旧地图定位/导航模式。",
                 category=SkillCategory.MEMORY,
                 capability_name="load_map_version",
             ),
@@ -6871,11 +6883,11 @@ class GatewayRuntime:
                             "探索任务结束后刷新地图工作区失败 map_name=%s",
                             request.map_name,
                         )
-                if context.is_cancel_requested() or context.is_timed_out():
-                    try:
-                        self.navigation_service.stop_exploration()
-                    except Exception:
-                        pass
+                # 兜底：无论任务是否成功完成，都确保外部探索进程被清理，防止残留进程导致系统越来越卡
+                try:
+                    self.navigation_service.stop_exploration()
+                except Exception:
+                    pass
 
         return self.task_manager.submit(
             "explore_area",

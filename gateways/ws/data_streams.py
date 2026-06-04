@@ -190,6 +190,8 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         try:
             for frame in _replay_stream_frames(runtime, after_cursor=after_cursor, topics=topic_filter):
+                if getattr(frame, 'payload_kind', None) == StreamPayloadKind.BINARY:
+                    continue  # binary 帧不回放
                 await websocket.send_json({"type": "stream.frame", "frame": to_jsonable(frame)})
         except WebSocketDisconnect:
             return

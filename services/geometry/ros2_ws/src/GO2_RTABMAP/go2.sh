@@ -159,16 +159,54 @@ KILL_PATTERNS=(
   "cloud_to_scan|odom_tf_broadcaster|cmd_vel_bridge|frontier_explorer"
 )
 
+kill_matching_processes() {
+  local signal_name="$1"
+  local pattern="$2"
+  local pid
+  local cmd
+
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    # The DB path passed to this script contains "/rtabmap/..."; a broad
+    # "rtabmap" cleanup pattern must not kill this launcher itself.
+    [[ "$pid" == "$$" ]] && continue
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ -z "$cmd" ]] && continue
+    if [[ "$cmd" == *"$SCRIPT_DIR/go2.sh"* ]] || [[ "$cmd" == *"/go2.sh "* ]]; then
+      continue
+    fi
+    kill "-$signal_name" "$pid" 2>/dev/null || true
+  done < <(pgrep -f "$pattern" 2>/dev/null || true)
+}
+
+has_matching_processes() {
+  local pattern="$1"
+  local pid
+  local cmd
+
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    [[ "$pid" == "$$" ]] && continue
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ -z "$cmd" ]] && continue
+    if [[ "$cmd" == *"$SCRIPT_DIR/go2.sh"* ]] || [[ "$cmd" == *"/go2.sh "* ]]; then
+      continue
+    fi
+    return 0
+  done < <(pgrep -f "$pattern" 2>/dev/null || true)
+  return 1
+}
+
 for pattern in "${KILL_PATTERNS[@]}"; do
-  pkill -TERM -f "$pattern" 2>/dev/null || true
+  kill_matching_processes TERM "$pattern"
 done
 sleep 1
 
 # Escalate to SIGKILL if anything still survives.
 for pattern in "${KILL_PATTERNS[@]}"; do
-  if pgrep -f "$pattern" >/dev/null 2>&1; then
+  if has_matching_processes "$pattern"; then
     echo "[go2.sh] Force killing leftover: $pattern"
-    pkill -KILL -f "$pattern" 2>/dev/null || true
+    kill_matching_processes KILL "$pattern"
   fi
 done
 
@@ -176,10 +214,10 @@ done
 for attempt in 1 2 3; do
   leftovers=0
   for pattern in "${KILL_PATTERNS[@]}"; do
-    if pgrep -f "$pattern" >/dev/null 2>&1; then
+    if has_matching_processes "$pattern"; then
       leftovers=1
       echo "[go2.sh] Cleanup retry $attempt for: $pattern"
-      pkill -KILL -f "$pattern" 2>/dev/null || true
+      kill_matching_processes KILL "$pattern"
     fi
   done
   [[ "$leftovers" -eq 0 ]] && break

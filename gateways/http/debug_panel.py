@@ -2565,6 +2565,7 @@ def _render_debug_page(access_token: str) -> str:
         "exploration.frontier",
         "runtime.governance",
         "pointcloud_map.meta",
+        "pointcloud_map.live_chunk",
         "pointcloud.frame",
         "video.frame",
         "video.detections",
@@ -2601,6 +2602,7 @@ def _render_debug_page(access_token: str) -> str:
       function connectStreams() {
         if (state.streamSocket && state.streamSocket.readyState === WebSocket.OPEN) return;
         const socket = new WebSocket(buildStreamUrl());
+        socket.binaryType = "arraybuffer";
         state.streamSocket = socket;
         socket.addEventListener("open", () => {
           setText(els.connectionText, "streaming");
@@ -2612,7 +2614,7 @@ def _render_debug_page(access_token: str) -> str:
         });
         socket.addEventListener("message", (event) => {
           if (event.data instanceof ArrayBuffer) {
-            if (window._pointcloud3dOnBinaryFrame) window._pointcloud3dOnBinaryFrame(event.data);
+            window.dispatchEvent(new CustomEvent("stream:pointcloud_map.binary", { detail: event.data }));
             return;
           }
           const message = JSON.parse(event.data);
@@ -2909,19 +2911,19 @@ def _render_debug_page(access_token: str) -> str:
         renderLogs();
       });
       connectStreams();
-      document.getElementById(mapModeToggle).addEventListener(click, () => {
-        const c = document.getElementById(mapCanvas);
-        const d = document.getElementById(map3dContainer);
-        const btn = document.getElementById(mapModeToggle);
-        const is3d = d.style.display !== none;
-        c.style.display = is3d ?  : none;
-        d.style.display = is3d ? none : ;
-        btn.textContent = is3d ? 3D : 2D;
-        if (!is3d && window._pointcloud3dInit) window._pointcloud3dInit(d);
+      document.getElementById('mapModeToggle').addEventListener('click', () => {
+        const c = document.getElementById('mapCanvas');
+        const d = document.getElementById('map3dContainer');
+        const btn = document.getElementById('mapModeToggle');
+        const is3d = d.style.display !== 'none';
+        c.style.display = is3d ? '' : 'none';
+        d.style.display = is3d ? 'none' : '';
+        btn.textContent = is3d ? '3D' : '2D';
+        if (!is3d && window.pointcloud3d) window.pointcloud3d.init(d);
       });
     })();
   </script>
-  <script type=module src=/static/js/pointcloud3d.js></script>
+  <script type="module" src="/static/js/pointcloud3d.js"></script>
 </body>
 </html>"""
     return html.replace("__DEBUG_ACCESS_TOKEN__", debug_access_token)

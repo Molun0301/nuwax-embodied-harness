@@ -198,6 +198,29 @@ def _read_recent_log(path: Path, *, max_bytes: int = 4096) -> str:
     return "\n".join(lines[-20:])
 
 
+def _read_log_from_offset(path: Path, offset: int, *, max_bytes: int = 8 * 1024 * 1024) -> str:
+    """Read log bytes from offset (used to scan the current exploration session)."""
+    try:
+        safe_offset = max(0, int(offset))
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if safe_offset >= size:
+                return ""
+            handle.seek(safe_offset, os.SEEK_SET)
+            data = handle.read(max(1, min(max_bytes, size - safe_offset))).decode("utf-8", errors="replace")
+    except Exception as exc:
+        return "读取日志失败：%s" % exc
+    return data
+
+
+def _capture_log_file_offset(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except Exception:
+        return 0
+
+
 def _parse_iso_timestamp(value: object) -> Optional[datetime]:
     if not value:
         return None
@@ -267,6 +290,13 @@ class PlatformGeometryRuntime:
         self._managed_processes: Dict[str, _ManagedProcess] = {}
         self._runtime_diagnostics: List[Dict[str, object]] = []
         self._map_stream_tracker: Dict[str, object] = {}
+        # 外部 /map 观察器（ExternalGeometryDebugObserver）才是 /map 占据栅格的真实来源；
+        # Rust bridge 的 get_status 只返回 {phase,message,rss_kb}，不含占据状态。
+        # 此处缓存观察器最近一帧的就绪元数据，供 _ros_bridge_status_stub("live_map_provider")
+        # 合并，从而让 _build_rtabmap_readiness / _classify_live_mapping_wait /
+        # _update_stream_tracker 读到真实的 occupancy 状态。
+        self._observer_occupancy_snapshot: Dict[str, object] = {}
+        self._observer_occupancy_lock = threading.Lock()
         self._nav2_launch_attempted = False
         self._nav2_action_provider = Nav2ActionNavigationProvider(self)
         self._cmd_vel_bridge: Optional[Ros2CmdVelMotionBridge] = None
@@ -299,6 +329,7 @@ class PlatformGeometryRuntime:
         self._external_exploration_database_path: Optional[str] = None
         self._external_exploration_version_id: Optional[str] = None
         self._external_exploration_terminal_state: Optional[ExplorationState] = None
+        self._external_exploration_log_offset: Optional[int] = None
         self.providers = PlatformGeometryProviderBundle(self)
 
     def start(self) -> None:
@@ -313,6 +344,8 @@ class PlatformGeometryRuntime:
             self._managed_processes = {}
             self._nav2_launch_attempted = False
             self._map_stream_tracker = {}
+            with self._observer_occupancy_lock:
+                self._observer_occupancy_snapshot = {}
         if not self._is_geometry_profile_enabled():
             self._set_runtime_state("disabled", "平台几何运行时或几何 profile 已禁用。")
             return
@@ -498,6 +531,7 @@ class PlatformGeometryRuntime:
             self._external_exploration_database_path = None
             self._external_exploration_version_id = None
             self._external_exploration_terminal_state = None
+            self._external_exploration_log_offset = None
             self._external_debug_frontier_payload = None
             self._exploration_tick_count = 0
             self._exploration_last_tick_at_iso = None
@@ -1410,13 +1444,21 @@ class PlatformGeometryRuntime:
                 remote_status = self._remote_provider.get_status() or {}
             except Exception:
                 remote_status = {}
-        return {
+        stub = {
             "provider": "ros_bridge",
             "provider_key": provider_key,
             "status": "active" if self._ros_bridge_handles_input_bridge() else "inactive",
             "ros_bridge_connected": self._ros_bridge_handles_input_bridge(),
             **remote_status,
         }
+        # /map 占据栅格的真实状态由外部 observer 提供（Rust get_status 不含占据字段），
+        # 仅对 live_map_provider 合并 observer 快照，使其 occupancy 字段生效。
+        if provider_key == "live_map_provider":
+            with self._observer_occupancy_lock:
+                observer_snapshot = dict(self._observer_occupancy_snapshot)
+            if observer_snapshot:
+                stub.update(observer_snapshot)
+        return stub
 
     def _ros_bridge_handles_input_bridge(self) -> bool:
         """Rust bridge 直接订阅 Go2 ROS2 话题时，Python publishers 无需启动。"""
@@ -1467,12 +1509,50 @@ class PlatformGeometryRuntime:
             observer.start()
 
     def _handle_external_debug_map_update(self, payload: Dict[str, object]) -> None:
+        self._cache_observer_occupancy_snapshot(payload)
         callbacks = list(self._pending_map_callbacks)
         for callback in callbacks:
             try:
                 callback(payload)
             except Exception:
                 LOGGER.debug("投递外部 GO2 /map debug update 失败。", exc_info=True)
+
+    def _cache_observer_occupancy_snapshot(self, payload: Dict[str, object]) -> None:
+        """从外部 /map 观察器 payload 提取就绪元数据并缓存。
+
+        观察器 metadata 不含 `occupancy_grid_ready` / `occupancy_has_publisher`，
+        这里据 occupancy_message_count 显式合成，供 readiness 链路读取。
+        """
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if not isinstance(metadata, dict):
+            return
+        message_count = int(metadata.get("occupancy_message_count") or metadata.get("message_count") or 0)
+        snapshot: Dict[str, object] = {
+            "occupancy_grid_ready": message_count > 0,
+            "occupancy_has_publisher": True,
+            "occupancy_message_count": message_count,
+            "occupancy_sequence": int(metadata.get("occupancy_sequence") or message_count),
+            "cost_map_message_count": int(metadata.get("cost_map_message_count") or 0),
+            "occupancy_topic": str(metadata.get("source_topic") or self.config.topics.occupancy_topic or "/map"),
+            "streaming": bool(metadata.get("streaming")),
+            "known_cell_count": int(metadata.get("known_cell_count") or 0),
+        }
+        for key in (
+            "latest_occupancy_timestamp",
+            "latest_occupancy_received_at",
+            "latest_occupancy_source_timestamp",
+        ):
+            value = metadata.get(key)
+            if value is not None:
+                snapshot[key] = value
+        occupancy_metrics = metadata.get("occupancy_metrics")
+        if isinstance(occupancy_metrics, dict):
+            snapshot["occupancy_metrics"] = dict(occupancy_metrics)
+        cost_map_metrics = metadata.get("cost_map_metrics")
+        if isinstance(cost_map_metrics, dict):
+            snapshot["cost_map_metrics"] = dict(cost_map_metrics)
+        with self._observer_occupancy_lock:
+            self._observer_occupancy_snapshot = snapshot
 
     def _handle_external_debug_pose_update(
         self,
@@ -1783,21 +1863,52 @@ class PlatformGeometryRuntime:
             ExplorationStatus.ACCEPTED.value,
             ExplorationStatus.RUNNING.value,
         }
+        # scheme(b): 直接读外部 frontier observer 数据（不依赖 state 上尚未合并的字段）。
+        # _external_debug_frontier_metadata 持 RLock，可重入；返回 (metadata, frontier_count)。
+        frontier_meta, frontier_count = self._external_debug_frontier_metadata()
+        frontier_status_text = str((frontier_meta or {}).get("status_text") or "").upper()
+        # 来源 frontier_explorer.py publish_status：实际发射 NAVIGATING；FOLLOWING 为防御性保留。
+        _MOTION_KEYWORDS = ("NAVIGATING", "FOLLOWING")
+        explorer_actually_running = bool(
+            active
+            and (
+                (frontier_count or 0) > 0
+                or any(kw in frontier_status_text for kw in _MOTION_KEYWORDS)
+            )
+        )
+        # 安全条款：_error 结尾的诊断必须始终覆写 headline（真实错误不被遮蔽）。
+        is_error_diagnostic = bool(
+            diagnostic_waiting_for and str(diagnostic_waiting_for).endswith("_error")
+        )
+        # 覆写条件：错误诊断恒覆写；非错误诊断仅在 explorer 尚未实际运行时覆写。
         override_waiting = bool(
             active
             and diagnostic_waiting_for
             and (
-                current_waiting_for in {None, "occupancy_grid", "mapping_ready", "point_cloud_input", "external_occupancy_grid"}
-                or str(diagnostic_waiting_for).endswith("_error")
+                is_error_diagnostic
+                or (
+                    not explorer_actually_running
+                    and current_waiting_for in {
+                        None, "occupancy_grid", "mapping_ready",
+                        "point_cloud_input", "external_occupancy_grid",
+                    }
+                )
             )
         )
-        if override_waiting:
-            metadata["waiting_for"] = diagnostic_waiting_for
-            metadata["waiting_detail"] = diagnostics.get("message")
-        metadata["mapping_chain_diagnostics"] = diagnostics
+        metadata["mapping_chain_diagnostics"] = diagnostics  # 始终保留诊断
         updates = {"metadata": metadata}
-        if override_waiting and diagnostics.get("message"):
-            updates["message"] = diagnostics.get("message")
+        if override_waiting:
+            if diagnostic_waiting_for:
+                metadata["waiting_for"] = diagnostic_waiting_for
+            metadata["waiting_detail"] = diagnostics.get("message")
+            if diagnostics.get("message"):
+                updates["message"] = diagnostics.get("message")
+        elif explorer_actually_running and not is_error_diagnostic:
+            # explorer 在跑且非错误 → headline 反映真实探索进度（frontier_meta 暂无覆盖率）。
+            if frontier_count and frontier_count > 0:
+                updates["message"] = "正在探索：追踪 %d 个前沿点" % int(frontier_count)
+            else:
+                updates["message"] = "正在探索。"
         return state.model_copy(update=updates, deep=True)
 
     def clear_active_map_version(self, *, reason: str = "") -> None:
@@ -3418,6 +3529,8 @@ class PlatformGeometryRuntime:
                     time.sleep(3.0)
                     self._managed_processes.pop(process_name, None)
                 self._map_stream_tracker = {}
+                with self._observer_occupancy_lock:
+                    self._observer_occupancy_snapshot = {}
                 return {
                     **activation_payload,
                     "backend_switch_applied": True,
@@ -3472,6 +3585,8 @@ class PlatformGeometryRuntime:
                 )
                 time.sleep(3.0)
             self._map_stream_tracker = {}
+            with self._observer_occupancy_lock:
+                self._observer_occupancy_snapshot = {}
             command = [str(self._external_script_path()), "--localization", str(db_path)]
             if static_map_yaml_path is not None:
                 command.extend(["--map-yaml", str(static_map_yaml_path)])
@@ -3532,6 +3647,8 @@ class PlatformGeometryRuntime:
         if current_process is not None:
             current_process.stop()
         self._map_stream_tracker = {}
+        with self._observer_occupancy_lock:
+            self._observer_occupancy_snapshot = {}
         self._start_managed_process(process_name, command, self._external_log_name(), restart=restart)
         process = self._managed_processes.get(process_name)
         process_status = process.status() if process is not None else None
@@ -3869,8 +3986,13 @@ class PlatformGeometryRuntime:
             current_process.stop()
             time.sleep(3.0)
         self._map_stream_tracker = {}
+        with self._observer_occupancy_lock:
+            self._observer_occupancy_snapshot = {}
         self._start_managed_process(process_name, command, self._external_log_name(), restart=True)
         process = self._managed_processes.get(process_name)
+        if process is not None:
+            with self._exploration_loop_lock:
+                self._external_exploration_log_offset = _capture_log_file_offset(process.log_path)
         if process is None or not process.is_running():
             self._finish_external_script_exploration(
                 status=ExplorationStatus.FAILED,
@@ -3958,6 +4080,7 @@ class PlatformGeometryRuntime:
             self._external_exploration_terminal_state = state
             self._external_exploration_request = None
             self._external_exploration_deadline_monotonic = None
+            self._external_exploration_log_offset = None
         if notify_compat:
             self._notify_compat_exploration_stopped()
         return state
@@ -4632,16 +4755,32 @@ class PlatformGeometryRuntime:
             metadata=metadata,
         )
 
-    def _external_exploration_terminal_from_process_log(self, process: Optional[_ManagedProcess]) -> Optional[Dict[str, object]]:
+    def _read_external_exploration_log_texts(self, process: Optional[_ManagedProcess]) -> List[str]:
         if process is None:
-            return None
+            return []
+        texts: List[str] = []
+        with self._exploration_loop_lock:
+            log_offset = self._external_exploration_log_offset
         try:
-            text = _read_recent_log(process.log_path, max_bytes=65536)
+            if log_offset is not None:
+                texts.append(_read_log_from_offset(process.log_path, log_offset))
+            texts.append(_read_recent_log(process.log_path, max_bytes=65536))
         except Exception:
-            return None
-        texts = [text]
-        texts.extend(self._read_external_frontier_ros_logs(text))
-        for candidate in texts:
+            return texts
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for text in texts:
+            normalized = str(text or "")
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        for text in list(deduped):
+            deduped.extend(self._read_external_frontier_ros_logs(text))
+        return deduped
+
+    def _external_exploration_terminal_from_process_log(self, process: Optional[_ManagedProcess]) -> Optional[Dict[str, object]]:
+        for candidate in self._read_external_exploration_log_texts(process):
             terminal = self._external_exploration_terminal_from_log_text(candidate)
             if terminal is not None:
                 return terminal
@@ -4670,7 +4809,13 @@ class PlatformGeometryRuntime:
         if latest_start >= 0:
             text = text[latest_start:]
         normalized = text.lower()
-        if "exploration complete" in normalized or "exploration reached a terminal state" in normalized or "done (exploration finished)" in normalized:
+        if (
+            "exploration complete" in normalized
+            or "exploration reached a terminal state" in normalized
+            or "done (exploration finished)" in normalized
+            or "no frontiers found. exploration complete" in normalized
+            or "shutting down frontier_explorer node" in normalized
+        ):
             return {
                 "status": ExplorationStatus.SUCCEEDED,
                 "reason": "external_explorer_log_complete",

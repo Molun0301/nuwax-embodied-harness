@@ -208,6 +208,22 @@ cleanup_stale_ros_bridge_processes() {
   rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
 }
 
+cleanup_stale_go2_video_streamer() {
+  # 终止任何残留的 go2 视频推流进程（无论由本脚本、systemd 还是手动启动），
+  # 保证网关成为唯一管理者，避免"网关停了 streamer 还在"以及双拉起。
+  local pid=""
+  local args=""
+
+  while read -r pid args; do
+    if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
+      continue
+    fi
+    if [[ "${args}" == *"drivers.go2.video_streamer"* ]]; then
+      terminate_process_scope "${pid}" "stale go2 video streamer"
+    fi
+  done < <(ps -eo pid=,args=)
+}
+
 cleanup_external_geometry_processes() {
   local geometry_root="${REPO_ROOT}/services/geometry/ros2_ws/src/go2slam"
   local pid=""
@@ -278,6 +294,7 @@ stop_existing_gateway() {
     echo "gateway pid file not found: ${PID_FILE}"
     cleanup_stale_gateway_processes
     cleanup_stale_ros_bridge_processes
+    cleanup_stale_go2_video_streamer
     cleanup_external_geometry_processes
     return 0
   fi
@@ -287,6 +304,7 @@ stop_existing_gateway() {
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
     cleanup_stale_ros_bridge_processes
+    cleanup_stale_go2_video_streamer
     cleanup_external_geometry_processes
     return 0
   fi
@@ -407,6 +425,9 @@ stop_go2_video_streamer() {
     wait "${VIDEO_STREAMER_PID}" >/dev/null 2>&1 || true
   fi
   VIDEO_STREAMER_PID=""
+  # 兜底：清理任何未被本脚本跟踪的残留 streamer（如 systemd/手动启动的），
+  # 确保网关停止后不会留下推流进程。
+  cleanup_stale_go2_video_streamer
 }
 
 stop_gateway() {
@@ -453,6 +474,7 @@ case "${ACTION}" in
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
     cleanup_stale_ros_bridge_processes
+    cleanup_stale_go2_video_streamer
     cleanup_external_geometry_processes
     ;;
   stop)

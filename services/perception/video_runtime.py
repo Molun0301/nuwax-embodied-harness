@@ -80,6 +80,11 @@ class PerceptionVideoRuntime:
         self._last_success_message = None
         self._last_error = None
         self._last_status_metadata = {}
+        # 跳帧诊断限流：避免 0.5s 循环刷屏，同时让"视频不可用"等失败可见。
+        self._skip_log_interval_sec = 10.0
+        self._last_skip_log_at = 0.0
+        self._last_skip_log_reason = None
+        self._consecutive_skip_count = 0
         self._write_status(running=False)
 
     def is_enabled(self) -> bool:
@@ -212,6 +217,11 @@ class PerceptionVideoRuntime:
                     "video_ingest_status": dict(video_status),
                     **dict(decision.metadata),
                 }
+            self._log_skip(
+                reason="video_ingest_not_ready",
+                level=logging.WARNING,
+                detail="端侧视频推流未就绪（共享内存/视频源不可用），持续感知本次跳过。video_status=%s" % dict(video_status),
+            )
             self._write_status(running=self.is_running())
             return None
         effective_reason = reason
@@ -231,6 +241,11 @@ class PerceptionVideoRuntime:
                         "video_ingest_status": dict(video_status),
                         **dict(decision.metadata),
                     }
+                self._log_skip(
+                    reason=str(decision.reason or "keyframe_not_due"),
+                    level=logging.DEBUG,
+                    detail="未达关键帧条件（reason=%s），持续感知本次跳过。" % decision.reason,
+                )
                 self._write_status(running=self.is_running())
                 return None
             effective_reason = decision.reason
@@ -261,6 +276,8 @@ class PerceptionVideoRuntime:
             self._processed_frames += 1
             self._last_keyframe_reason = effective_reason
             self._last_error = None
+            self._consecutive_skip_count = 0
+            self._last_skip_log_reason = None
             self._last_success_message = context.scene_summary.headline
             self._last_status_metadata = {
                 "pipeline_name": context.pipeline_name,
@@ -344,6 +361,28 @@ class PerceptionVideoRuntime:
             remaining = self._interval_sec - (time.monotonic() - frame_start)
             if remaining > 0 and self._stop_event.wait(remaining):
                 break
+
+    def _log_skip(self, *, reason: str, level: int, detail: str) -> None:
+        """限流记录跳帧诊断：原因变化或超过间隔才输出，避免 0.5s 循环刷屏。"""
+
+        now = time.monotonic()
+        with self._lock:
+            self._consecutive_skip_count += 1
+            skip_count = self._consecutive_skip_count
+            reason_changed = reason != self._last_skip_log_reason
+            due = (now - self._last_skip_log_at) >= self._skip_log_interval_sec
+            if not (reason_changed or due):
+                return
+            self._last_skip_log_at = now
+            self._last_skip_log_reason = reason
+        PERCEPTION_RUNTIME_LOGGER.log(
+            level,
+            "持续视频感知跳过 camera=%s reason=%s 连续跳过=%d 次：%s",
+            self._camera_id,
+            reason,
+            skip_count,
+            detail,
+        )
 
     def _resolve_runtime_context(self) -> Tuple[Optional[Pose], Optional[SemanticMapBuildResult]]:
         current_pose = None

@@ -127,8 +127,6 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
         remaining = frame_interval_sec - elapsed
         if remaining > 0:
             await asyncio.sleep(remaining)
-            if remaining > 0:
-                await asyncio.sleep(remaining)
 
 
 async def run_forever(config: Go2DataPlaneConfig) -> None:

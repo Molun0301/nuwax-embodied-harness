@@ -466,6 +466,8 @@ class NavigationService:
                         "status_text": exploration_metadata.get("status_text"),
                         "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
                         "terminal_status": exploration_metadata.get("terminal_status"),
+                        "planned_path": exploration_metadata.get("planned_path") if isinstance(exploration_metadata.get("planned_path"), list) else [],
+                        "current_goal": exploration_metadata.get("current_goal") if isinstance(exploration_metadata.get("current_goal"), dict) else None,
                         "external_frontier_debug_observer": observer_meta,
                     }
                     self._stream_bus.publish(

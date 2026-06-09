@@ -8,6 +8,7 @@ go2_navigation.launch.py for localization-only operation.
 """
 
 import os
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -16,8 +17,12 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from geometry_launch_config import GeometryLaunchConfig  # noqa: E402
+
 
 def generate_launch_description():
+    cfg = GeometryLaunchConfig.from_env()
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
     database_path = LaunchConfiguration('database_path', default='~/rtabmap.db')
 
@@ -79,9 +84,9 @@ def generate_launch_description():
                     name='frontier_explorer',
                     output=non_nav_output,
                     parameters=[{
-                        'map_topic': '/map',
-                        'global_frame': 'map',
-                        'robot_frame': 'base_link',
+                        'map_topic': cfg.map_topic,
+                        'global_frame': cfg.map_frame,
+                        'robot_frame': cfg.base_frame,
                         'replan_period': 3.0,           # re-evaluate every 3s
                         'min_frontier_size': 10,        # cells, after clustering
                         # Balanced frontier utility:
@@ -100,6 +105,10 @@ def generate_launch_description():
                         'max_consecutive_failures': 5,
                         # Extra warmup to avoid Nav2 "send_goal failed" race.
                         'startup_grace_period': 15.0,
+                        # Skip frontiers the robot is already beside; require a
+                        # real drive before accepting Nav2 success.
+                        'min_travel_m': 1.0,
+                        'goal_success_tolerance': 0.45,
                     }],
                 ),
             ],

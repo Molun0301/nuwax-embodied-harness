@@ -59,6 +59,9 @@ class ExternalGeometryDebugObserver:
         self._last_goal_at = 0.0
         self._last_status_text: Optional[str] = None
         self._last_terminal_status: Optional[str] = None
+        self._last_planned_path: List[Dict[str, float]] = []
+        self._last_plan_at = 0.0
+        self._last_plan_emit_at = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -97,6 +100,10 @@ class ExternalGeometryDebugObserver:
                 map_topic = str(self.config.topics.occupancy_topic or "/map")
                 frontier_topic = str(getattr(self.config.external, "frontier_topic", "") or "/frontiers")
                 next_goal_topic = str(getattr(self.config.external, "next_goal_topic", "") or "/exploration/next_goal")
+                plan_topic = str(
+                    getattr(self.config.external, "plan_topic", "")
+                    or os.environ.get("NUWAX_GEOMETRY_PLAN_TOPIC", "/plan")
+                )
 
                 reliable_volatile = QoSProfile(
                     history=HistoryPolicy.KEEP_LAST,
@@ -126,6 +133,14 @@ class ExternalGeometryDebugObserver:
                 self._subscriptions.append(
                     self._node.create_subscription(PoseStamped, next_goal_topic, self._on_next_goal, reliable_volatile)
                 )
+                try:
+                    from nav_msgs.msg import Path as RosPath
+
+                    self._subscriptions.append(
+                        self._node.create_subscription(RosPath, plan_topic, self._on_plan, reliable_volatile)
+                    )
+                except Exception:
+                    LOGGER.warning("无法订阅 Nav2 全局规划路径 topic=%s", plan_topic, exc_info=True)
                 if self._pose_callback is not None:
                     self._tf_buffer = Buffer()
                     self._tf_listener = TransformListener(self._tf_buffer, self._node)
@@ -139,10 +154,11 @@ class ExternalGeometryDebugObserver:
                 self._started = True
                 self._last_error = None
                 LOGGER.info(
-                    "GO2 外部几何 debug observer 已启动 map=%s frontiers=%s next_goal=%s pose=%s",
+                    "GO2 外部几何 debug observer 已启动 map=%s frontiers=%s next_goal=%s plan=%s pose=%s",
                     map_topic,
                     frontier_topic,
                     next_goal_topic,
+                    plan_topic,
                     "enabled" if self._pose_callback is not None else "disabled",
                 )
             except Exception as exc:
@@ -409,32 +425,71 @@ class ExternalGeometryDebugObserver:
             self._last_goal_at = time.monotonic()
         self._emit_frontier_payload()
 
+    def _on_plan(self, msg: Any) -> None:
+        path = self._planned_path_from_ros(msg)
+        now = time.monotonic()
+        with self._lock:
+            self._last_planned_path = path
+            self._last_plan_at = now
+        if now - self._last_plan_emit_at >= 0.2:
+            self._last_plan_emit_at = now
+            self._emit_frontier_payload()
+
+    @staticmethod
+    def _planned_path_from_ros(msg: Any) -> List[Dict[str, float]]:
+        points: List[Dict[str, float]] = []
+        for pose_stamped in list(getattr(msg, "poses", []) or []):
+            pose = getattr(pose_stamped, "pose", None)
+            position = getattr(pose, "position", None)
+            if position is None:
+                continue
+            x = float(getattr(position, "x", 0.0) or 0.0)
+            y = float(getattr(position, "y", 0.0) or 0.0)
+            z = float(getattr(position, "z", 0.0) or 0.0)
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                continue
+            points.append({"x": x, "y": y, "z": z})
+        return points
+
     def _emit_frontier_payload(self) -> None:
         with self._lock:
             current = self._last_goal if self._last_goal_at and time.monotonic() - self._last_goal_at <= _GOAL_FRESH_SEC else None
             frontiers = [current] if current is not None else []
             status_text = self._last_status_text
             terminal_status = self._last_terminal_status
+            planned_path = list(self._last_planned_path)
+            plan_fresh = self._last_plan_at and time.monotonic() - self._last_plan_at <= 5.0
             self._frontier_sequence += 1
             sequence = self._frontier_sequence
         now = datetime.now(timezone.utc)
+        current_goal = None
+        if current is not None:
+            pose = current.get("pose") if isinstance(current.get("pose"), dict) else None
+            if pose is not None:
+                current_goal = {"target_pose": pose}
         payload = {
             "source_name": "go2_rtabmap_debug_observer",
             "source": "go2_rtabmap_debug_observer",
             "latest_frontiers": frontiers,
             "current_frontier": current,
             "frontier_count": len(frontiers),
+            "planned_path": planned_path if plan_fresh else [],
+            "current_goal": current_goal,
             "updated_at": now.isoformat(),
             "sequence": sequence,
             "metadata": {
                 "source": "go2_rtabmap_debug_observer",
                 "frontier_topic": "/frontiers",
                 "next_goal_topic": "/exploration/next_goal",
+                "plan_topic": os.environ.get("NUWAX_GEOMETRY_PLAN_TOPIC", "/plan"),
                 "display_mode": "next_goal_only",
                 "status_text": status_text,
                 "exploration_terminal": terminal_status is not None,
                 "terminal_status": terminal_status,
                 "message_count": sequence,
+                "planned_path": planned_path if plan_fresh else [],
+                "plan_point_count": len(planned_path) if plan_fresh else 0,
+                "plan_fresh": plan_fresh,
             },
         }
         try:

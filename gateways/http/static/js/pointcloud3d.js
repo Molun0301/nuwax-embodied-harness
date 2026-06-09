@@ -5,7 +5,7 @@ const COLORS = {
   robot: 0xfbbf24,
   frontier: 0xf472b6,
   trajectory: 0x22d3ee,
-  navPath: 0x38bdf8,
+  navPath: 0x22ff66,
   navGoal: 0xa78bfa,
   grid: 0x334155,
 };

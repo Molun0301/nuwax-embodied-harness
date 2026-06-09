@@ -4602,6 +4602,10 @@ class PlatformGeometryRuntime:
             "status_text": payload_metadata.get("status_text"),
             "exploration_terminal": bool(payload_metadata.get("exploration_terminal")),
             "terminal_status": payload_metadata.get("terminal_status"),
+            "planned_path": payload.get("planned_path") if isinstance(payload.get("planned_path"), list) else payload_metadata.get("planned_path"),
+            "plan_point_count": payload_metadata.get("plan_point_count"),
+            "plan_fresh": payload_metadata.get("plan_fresh"),
+            "current_goal": payload.get("current_goal") if isinstance(payload.get("current_goal"), dict) else None,
             "external_frontier_debug_observer": {
                 "source_name": payload.get("source_name"),
                 "updated_at": payload.get("updated_at"),

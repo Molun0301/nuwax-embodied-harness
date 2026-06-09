@@ -181,6 +181,7 @@ def _render_debug_page(access_token: str) -> str:
       --accent: #2563eb;
       --accent-strong: #0ea5e9;
       --map-line: #0ea5e9;
+      --nav-plan: #22ff66;
       --map-robot: #f59e0b;
       --unknown: #cbd5e1;
       --free: #dbeafe;
@@ -213,6 +214,7 @@ def _render_debug_page(access_token: str) -> str:
       --accent: #38bdf8;
       --accent-strong: #22d3ee;
       --map-line: #38bdf8;
+      --nav-plan: #22ff66;
       --map-robot: #fbbf24;
       --unknown: #334155;
       --free: #93c5fd;
@@ -582,6 +584,7 @@ def _render_debug_page(access_token: str) -> str:
               <span class="legend-item"><span class="swatch" style="background: var(--free)"></span>可通行</span>
               <span class="legend-item"><span class="swatch" style="background: var(--occupied)"></span>占据</span>
               <span class="legend-item"><span class="swatch" style="background: var(--map-line)"></span>轨迹</span>
+              <span class="legend-item"><span class="swatch" style="background: var(--nav-plan)"></span>规划路径</span>
               <span class="legend-item"><span class="swatch" style="background: var(--map-robot)"></span>机器人</span>
               <span class="legend-item"><span class="swatch" style="background: var(--frontier)"></span>探索前沿</span>
             </div>
@@ -748,7 +751,7 @@ def _render_debug_page(access_token: str) -> str:
         robotStroke: "#fef3c7",
         goal: "#a78bfa",
         goalStroke: "#ddd6fe",
-        navPath: "#38bdf8",
+        navPath: "#22ff66",
       };
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", logs: "日志" };
@@ -1900,10 +1903,16 @@ def _render_debug_page(access_token: str) -> str:
         if (value.x !== undefined && value.y !== undefined) return { x: Number(value.x), y: Number(value.y), z: Number(value.z || 0) };
         return null;
       }
-      function extractNavigationPath(context) {
+      function explorationStateMetadata(context) {
+        if (!context) return {};
+        const stateObj = context.exploration_state || context;
+        return (stateObj && stateObj.metadata) || context.metadata || {};
+      }
+      function extractNavigationPath(context, explorationContext) {
         const metadata = context && context.metadata ? context.metadata : {};
         const stateObj = context && context.navigation_state ? context.navigation_state : {};
         const stateMetadata = stateObj && stateObj.metadata ? stateObj.metadata : {};
+        const explorationMetadata = explorationStateMetadata(explorationContext);
         const raw = firstArrayValue(
           context && context.planned_path,
           context && context.current_path,
@@ -1919,13 +1928,22 @@ def _render_debug_page(access_token: str) -> str:
           stateMetadata.current_path,
           stateMetadata.remaining_path,
           stateMetadata.nav_path,
-          stateMetadata.waypoints
+          stateMetadata.waypoints,
+          explorationContext && explorationContext.planned_path,
+          explorationMetadata.planned_path,
+          explorationMetadata.nav_path
         );
         return raw.map(pathPointFromValue).filter(Boolean);
       }
-      function extractNavigationGoal(context) {
+      function extractNavigationGoal(context, explorationContext) {
         const goal = context && context.current_goal ? context.current_goal : null;
-        return goal && goal.target_pose ? goal.target_pose : null;
+        if (goal && goal.target_pose) return goal.target_pose;
+        const explorationMetadata = explorationStateMetadata(explorationContext);
+        const explorationGoal = explorationContext && explorationContext.current_goal;
+        if (explorationGoal && explorationGoal.target_pose) return explorationGoal.target_pose;
+        const frontier = explorationMetadata.current_frontier;
+        if (frontier && frontier.pose) return frontier.pose;
+        return null;
       }
       function summarizeContext(context, key) {
         const stateObj = context && context[key];
@@ -1985,8 +2003,14 @@ def _render_debug_page(access_token: str) -> str:
         const cloudSource = mappingDiag.point_cloud_source || {};
         const frontiers = Array.isArray(data.frontiers) ? data.frontiers : null;
         state.frontiers = frontiers || [];
-        state.goalPose = extractNavigationGoal(data.navigation_context);
-        state.navigationPath = extractNavigationPath(data.navigation_context);
+        state.goalPose = extractNavigationGoal(data.navigation_context, data.exploration_context);
+        state.navigationPath = extractNavigationPath(data.navigation_context, data.exploration_context);
+        if (!state.navigationPath.length && Array.isArray(data.planned_path)) {
+          state.navigationPath = data.planned_path.map(pathPointFromValue).filter(Boolean);
+        }
+        if (!state.goalPose && data.current_goal && data.current_goal.target_pose) {
+          state.goalPose = data.current_goal.target_pose;
+        }
         setKv(els.navigationMeta, [
           ["navigation", summarizeContext(data.navigation_context, "navigation_state")],
           ["exploration", summarizeContext(data.exploration_context, "exploration_state")],
@@ -2742,6 +2766,8 @@ def _render_debug_page(access_token: str) -> str:
           frontier_count: payload.frontier_count !== undefined && payload.frontier_count !== null ? payload.frontier_count : frontiers.length,
           explorer_status_text: payload.status_text,
           exploration_terminal: payload.exploration_terminal,
+          planned_path: payload.planned_path,
+          current_goal: payload.current_goal,
         }));
       }
       function updatePointcloudMapFrame(frame) {

@@ -1,9 +1,11 @@
 """
 Nav2 launch for Unitree GO2.
-Launches controller, planner, recovery, bt_navigator and lifecycle manager.
+
+nav2_params.yaml is patched at launch time from NUWAX_GEOMETRY_* environment.
 """
 
 import os
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -11,12 +13,15 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from geometry_launch_config import GeometryLaunchConfig, materialize_nav2_params  # noqa: E402
+
 
 def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
-
+    cfg = GeometryLaunchConfig.from_env()
     go2_nav_dir = get_package_share_directory('go2_nav')
-    nav2_params_file = os.path.join(go2_nav_dir, 'config', 'nav2_params.yaml')
+    nav2_params_file = materialize_nav2_params(go2_nav_dir, cfg)
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='false'),

@@ -46,7 +46,7 @@ controller_server:
 
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.15
       yaw_goal_tolerance: 0.25
       stateful: true
 
@@ -59,8 +59,8 @@ controller_server:
       lookahead_time: 1.5
       use_velocity_scaled_lookahead_dist: true
       transform_tolerance: 0.5
-      xy_goal_tolerance: 0.25
-      goal_dist_tol: 0.25
+      xy_goal_tolerance: 0.15
+      goal_dist_tol: 0.15
       use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.45
       rotate_to_heading_angular_vel: 0.55
@@ -83,7 +83,7 @@ planner_server:
 
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.5
+      tolerance: 0.2
       use_astar: false
       allow_unknown: true
 

@@ -38,7 +38,7 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, PoseStamped, Quaternion, Vector3
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -103,6 +103,14 @@ class FrontierExplorer(Node):
         # forever with active_goal_handle != None. After this timeout we
         # cancel, blacklist the goal, and try a new frontier.
         self.declare_parameter('goal_timeout', 60.0)
+        # Ignore frontier goals closer than this (m). Prevents picking a goal the
+        # robot is already beside, which Nav2 immediately marks as succeeded.
+        self.declare_parameter('min_travel_m', 1.0)
+        # After Nav2 reports success, reject the result if the robot is still
+        # farther than this from the dispatched goal (planner snap / early stop).
+        self.declare_parameter('goal_success_tolerance', 0.45)
+        self.declare_parameter('global_plan_topic', '/plan')
+        self.declare_parameter('next_goal_topic', '/exploration/next_goal')
 
         gp = self.get_parameter
         self.map_topic = gp('map_topic').value
@@ -123,6 +131,10 @@ class FrontierExplorer(Node):
         self.max_consecutive_failures = int(gp('max_consecutive_failures').value)
         self.startup_grace_period = float(gp('startup_grace_period').value)
         self.goal_timeout = float(gp('goal_timeout').value)
+        self.min_travel_m = float(gp('min_travel_m').value)
+        self.goal_success_tolerance = float(gp('goal_success_tolerance').value)
+        self.global_plan_topic = str(gp('global_plan_topic').value)
+        self.next_goal_topic = str(gp('next_goal_topic').value)
 
         # ---- State
         self.latest_map: Optional[OccupancyGrid] = None
@@ -138,7 +150,11 @@ class FrontierExplorer(Node):
         # navigation state
         self.active_goal_handle = None
         self.active_goal_xy: Optional[Tuple[float, float]] = None
+        self.active_goal_yaw: Optional[float] = None
         self.active_goal_send_time: Optional[float] = None
+        self.active_clusters_snapshot: Optional[List[FrontierCluster]] = None
+        self.active_chosen_snapshot: Optional[FrontierCandidate] = None
+        self.latest_plan: Optional[Path] = None
         self.consecutive_failures = 0
         self.exploration_done = False
         self._shutdown_requested = False
@@ -162,6 +178,10 @@ class FrontierExplorer(Node):
         #   - chosen goal (green arrow)
         #   - blacklist points (red X)
         self.viz_pub = self.create_publisher(MarkerArray, '/frontiers', 5)
+        self.next_goal_pub = self.create_publisher(PoseStamped, self.next_goal_topic, 5)
+        # Subscribe Nav2 global plan for the nav_plan marker overlay on /frontiers.
+        self.plan_sub = self.create_subscription(
+            Path, self.global_plan_topic, self.plan_cb, 5)
 
         # ---- Timer: re-evaluate periodically
         self.timer = self.create_timer(self.replan_period, self.tick)
@@ -178,6 +198,9 @@ class FrontierExplorer(Node):
     # ------------------------------------------------------------------
     def map_cb(self, msg: OccupancyGrid):
         self.latest_map = msg
+
+    def plan_cb(self, msg: Path):
+        self.latest_plan = msg
 
     def tick(self):
         if self.exploration_done:
@@ -234,8 +257,13 @@ class FrontierExplorer(Node):
                 self.fail_active_goal()
                 self.publish_status('TIMEOUT (recovering)')
                 return
-            # Already navigating; do not interrupt.
-            self.publish_status(f'NAVIGATING ({elapsed:.0f}s)')
+            # Already navigating; keep goal + plan visible in RViz.
+            self.publish_markers(
+                status=f'NAVIGATING ({elapsed:.0f}s)',
+                clusters=self.active_clusters_snapshot,
+                chosen=self.active_chosen_snapshot,
+                navigating=True,
+            )
             return
         if self.consecutive_failures >= self.max_consecutive_failures:
             self.get_logger().warn(
@@ -257,7 +285,7 @@ class FrontierExplorer(Node):
         # 2) Frontier detection
         all_clusters = self.find_frontier_clusters(self.latest_map)
         if not all_clusters:
-            self.publish_viz([], None)
+            self.publish_markers(status='NO FRONTIERS')
             self.get_logger().info('No frontiers found. Exploration COMPLETE.')
             self.exploration_done = True
             return
@@ -269,9 +297,12 @@ class FrontierExplorer(Node):
         # 4) Score and pick best
         best = self.pick_best(all_clusters, robot)
         if best is None:
-            self.publish_viz(all_clusters, None)
+            self.publish_markers(
+                status='WAITING (no reachable frontiers)',
+                clusters=all_clusters,
+            )
             self.get_logger().info(
-                'All frontier goals are blacklisted; waiting for blacklist to expire.',
+                'No frontier goal meets min travel / blacklist filters; waiting.',
                 throttle_duration_sec=5.0)
             return
         gx, gy = best.goal_world
@@ -282,10 +313,18 @@ class FrontierExplorer(Node):
             f'clear={best.clearance_m:.2f}m from {len(all_clusters)} candidates'
         )
 
-        # 5) Visualize all candidates + chosen goal
-        self.publish_viz(all_clusters, best)
+        # 5) Remember snapshot for RViz while navigating
+        self.active_clusters_snapshot = all_clusters
+        self.active_chosen_snapshot = best
 
-        # 6) Send goal
+        # 6) Visualize all candidates + chosen goal
+        self.publish_markers(
+            status='DISPATCHING GOAL',
+            clusters=all_clusters,
+            chosen=best,
+        )
+
+        # 7) Send goal
         self.send_nav_goal(gx, gy, (rx, ry, ryaw))
 
     # ------------------------------------------------------------------
@@ -388,6 +427,8 @@ class FrontierExplorer(Node):
         for c in clusters:
             candidate = self.evaluate_cluster(c, robot_pose, grid, info)
             if self.is_blacklisted(*candidate.goal_world):
+                continue
+            if candidate.travel_m < self.min_travel_m:
                 continue
             if candidate.score > best_score:
                 best_score = candidate.score
@@ -525,35 +566,35 @@ class FrontierExplorer(Node):
     # ------------------------------------------------------------------
     # Visualization
     # ------------------------------------------------------------------
-    def publish_viz(self,
-                    clusters: List[FrontierCluster],
-                    chosen: Optional[FrontierCandidate]):
-        """Publish RViz markers on /frontiers (MarkerArray)."""
+    def publish_status(self, text: str):
+        """Heartbeat text for warming-up / done states."""
+        self.publish_markers(status=text)
+
+    def publish_markers(self,
+                        *,
+                        status: Optional[str] = None,
+                        clusters: Optional[List[FrontierCluster]] = None,
+                        chosen: Optional[FrontierCandidate] = None,
+                        navigating: bool = False):
+        """Publish a full RViz marker set on /frontiers (MarkerArray).
+
+        During navigation we keep the active goal arrow, robot-to-goal line,
+        and the latest Nav2 global plan visible instead of wiping markers.
+        """
         ma = MarkerArray()
         stamp = self.get_clock().now().to_msg()
+        robot_pose = self.get_robot_pose()
 
-        # 0) DELETEALL to clear stale markers from previous tick
         clear = Marker()
         clear.header.frame_id = self.global_frame
         clear.header.stamp = stamp
         clear.action = Marker.DELETEALL
         ma.markers.append(clear)
 
-        # 1) All frontier clusters as cyan SPHERE_LIST (one sphere per cluster,
-        #    radius scaled by cluster size).
-        if clusters:
-            spheres = Marker()
-            spheres.header.frame_id = self.global_frame
-            spheres.header.stamp = stamp
-            spheres.ns = 'frontier_clusters'
-            spheres.id = 0
-            spheres.type = Marker.SPHERE_LIST
-            spheres.action = Marker.ADD
-            spheres.pose.orientation.w = 1.0
-            # SPHERE_LIST: per-marker scale is the *uniform* sphere diameter;
-            # to get per-cluster size we publish each as separate Marker below.
-            ma.markers.append(self._cluster_text_marker(clusters, stamp))
-            for i, c in enumerate(clusters):
+        cluster_list = clusters or []
+        if cluster_list:
+            ma.markers.append(self._cluster_text_marker(cluster_list, stamp))
+            for i, c in enumerate(cluster_list):
                 m = Marker()
                 m.header.frame_id = self.global_frame
                 m.header.stamp = stamp
@@ -565,38 +606,43 @@ class FrontierExplorer(Node):
                 m.pose.position.y = c.centroid_world[1]
                 m.pose.position.z = 0.05
                 m.pose.orientation.w = 1.0
-                # Diameter scaled with size, clamped to [0.15, 0.6] m.
                 d = max(0.15, min(0.6, 0.05 + 0.01 * math.sqrt(c.size)))
                 m.scale = Vector3(x=d, y=d, z=d)
-                # Cyan unless chosen, then green
-                is_chosen = (chosen is not None
-                             and c.centroid_world == chosen.cluster.centroid_world)
+                is_chosen = (
+                    chosen is not None
+                    and math.hypot(
+                        c.centroid_world[0] - chosen.cluster.centroid_world[0],
+                        c.centroid_world[1] - chosen.cluster.centroid_world[1],
+                    ) < 0.05
+                )
                 if is_chosen:
                     m.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.95)
                 else:
                     m.color = ColorRGBA(r=0.0, g=0.7, b=1.0, a=0.7)
                 ma.markers.append(m)
 
-        # 2) Chosen goal as a tall green ARROW pointing up.
-        if chosen is not None:
-            arrow = Marker()
-            arrow.header.frame_id = self.global_frame
-            arrow.header.stamp = stamp
-            arrow.ns = 'frontier_goal'
-            arrow.id = 0
-            arrow.type = Marker.ARROW
-            arrow.action = Marker.ADD
-            gx, gy = chosen.goal_world
-            # Vertical arrow: from (gx,gy,1.0) down to (gx,gy,0.1)
-            arrow.points = [
-                Point(x=gx, y=gy, z=1.0),
-                Point(x=gx, y=gy, z=0.1),
-            ]
-            arrow.scale = Vector3(x=0.05, y=0.12, z=0.0)  # shaft / head
-            arrow.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-            ma.markers.append(arrow)
+        goal_xy = None
+        goal_yaw = None
+        goal_ns = 'frontier_goal'
+        if navigating and self.active_goal_xy is not None:
+            goal_xy = self.active_goal_xy
+            goal_yaw = self.active_goal_yaw
+            goal_ns = 'active_frontier_goal'
+        elif chosen is not None:
+            goal_xy = chosen.goal_world
+            rx, ry, _ = robot_pose if robot_pose is not None else (0.0, 0.0, 0.0)
+            goal_yaw = math.atan2(goal_xy[1] - ry, goal_xy[0] - rx)
 
-        # 3) Blacklist points as red X (CUBE_LIST scaled small).
+        if goal_xy is not None and goal_yaw is not None:
+            ma.markers.append(self._goal_arrow_marker(
+                goal_xy[0], goal_xy[1], goal_yaw, ns=goal_ns, stamp=stamp))
+            if robot_pose is not None:
+                ma.markers.append(self._robot_to_goal_line(
+                    robot_pose[0], robot_pose[1], goal_xy[0], goal_xy[1], stamp))
+
+        if self.latest_plan is not None and self.latest_plan.poses:
+            ma.markers.append(self._nav_plan_marker(self.latest_plan, stamp))
+
         if self.blacklist:
             cubes = Marker()
             cubes.header.frame_id = self.global_frame
@@ -612,41 +658,75 @@ class FrontierExplorer(Node):
                 cubes.points.append(Point(x=bx, y=by, z=0.1))
             ma.markers.append(cubes)
 
+        if status is not None:
+            m = Marker()
+            m.header.frame_id = self.global_frame
+            m.header.stamp = stamp
+            m.ns = 'frontier_status'
+            m.id = 0
+            m.type = Marker.TEXT_VIEW_FACING
+            m.action = Marker.ADD
+            if robot_pose is not None:
+                m.pose.position.x, m.pose.position.y = robot_pose[0], robot_pose[1]
+            m.pose.position.z = 1.5
+            m.pose.orientation.w = 1.0
+            m.scale.z = 0.3
+            m.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=0.9)
+            m.text = f'[explorer] {status}'
+            ma.markers.append(m)
+
         self.viz_pub.publish(ma)
 
-    def publish_status(self, text: str):
-        """Always-on heartbeat: shows explorer's current state as text in RViz.
-        Lets you visually confirm the node is alive even when no frontiers exist.
-        """
-        ma = MarkerArray()
-        stamp = self.get_clock().now().to_msg()
-
-        # Clear previous markers
-        clear = Marker()
-        clear.header.frame_id = self.global_frame
-        clear.header.stamp = stamp
-        clear.action = Marker.DELETEALL
-        ma.markers.append(clear)
-
-        # Status text near origin (or robot if known)
+    def _goal_arrow_marker(self, gx: float, gy: float, yaw: float,
+                           *, ns: str, stamp) -> Marker:
+        """Horizontal ground-plane arrow at the exploration goal."""
         m = Marker()
         m.header.frame_id = self.global_frame
         m.header.stamp = stamp
-        m.ns = 'frontier_status'
+        m.ns = ns
         m.id = 0
-        m.type = Marker.TEXT_VIEW_FACING
+        m.type = Marker.ARROW
         m.action = Marker.ADD
-        robot_pose = self.get_robot_pose()
-        if robot_pose is not None:
-            m.pose.position.x, m.pose.position.y = robot_pose[0], robot_pose[1]
-        m.pose.position.z = 1.5
-        m.pose.orientation.w = 1.0
-        m.scale.z = 0.3
-        m.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=0.9)
-        m.text = f'[explorer] {text}'
-        ma.markers.append(m)
+        m.pose.position = Point(x=gx, y=gy, z=0.12)
+        m.pose.orientation = Quaternion(
+            x=0.0, y=0.0, z=math.sin(yaw / 2.0), w=math.cos(yaw / 2.0))
+        m.scale = Vector3(x=0.9, y=0.18, z=0.18)
+        m.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+        return m
 
-        self.viz_pub.publish(ma)
+    def _robot_to_goal_line(self, rx: float, ry: float,
+                            gx: float, gy: float, stamp) -> Marker:
+        m = Marker()
+        m.header.frame_id = self.global_frame
+        m.header.stamp = stamp
+        m.ns = 'goal_approach_line'
+        m.id = 0
+        m.type = Marker.LINE_STRIP
+        m.action = Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.x = 0.06
+        m.color = ColorRGBA(r=0.2, g=1.0, b=0.2, a=0.85)
+        m.points = [
+            Point(x=rx, y=ry, z=0.08),
+            Point(x=gx, y=gy, z=0.08),
+        ]
+        return m
+
+    def _nav_plan_marker(self, path: Path, stamp) -> Marker:
+        m = Marker()
+        m.header.frame_id = path.header.frame_id or self.global_frame
+        m.header.stamp = stamp
+        m.ns = 'nav_plan'
+        m.id = 0
+        m.type = Marker.LINE_STRIP
+        m.action = Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.x = 0.05
+        m.color = ColorRGBA(r=0.1, g=0.5, b=1.0, a=0.9)
+        for pose_stamped in path.poses:
+            p = pose_stamped.pose.position
+            m.points.append(Point(x=p.x, y=p.y, z=0.06))
+        return m
 
     def _cluster_text_marker(self, clusters: List[FrontierCluster], stamp) -> Marker:
         """Single text marker showing cluster count near the first cluster."""
@@ -710,7 +790,14 @@ class FrontierExplorer(Node):
         )
 
         self.active_goal_xy = (gx, gy)
+        self.active_goal_yaw = yaw
         self.active_goal_send_time = self.get_clock().now().nanoseconds * 1e-9
+
+        next_goal = PoseStamped()
+        next_goal.header = goal_msg.pose.header
+        next_goal.pose = goal_msg.pose.pose
+        self.next_goal_pub.publish(next_goal)
+
         send_future = self.nav_client.send_goal_async(goal_msg)
         send_future.add_done_callback(self.on_goal_response)
 
@@ -737,29 +824,50 @@ class FrontierExplorer(Node):
             self.fail_active_goal()
             return
         status = result.status
+        goal_xy = self.active_goal_xy
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info(
-                f'Reached frontier {self.active_goal_xy}, looking for next.'
-            )
-            self.consecutive_failures = 0
+            robot = self.get_robot_pose()
+            dist = None
+            if robot is not None and goal_xy is not None:
+                dist = math.hypot(robot[0] - goal_xy[0], robot[1] - goal_xy[1])
+            if dist is not None and dist > self.goal_success_tolerance:
+                self.get_logger().warn(
+                    f'Nav2 succeeded but robot is {dist:.2f}m from goal '
+                    f'{goal_xy} (tolerance={self.goal_success_tolerance:.2f}m); '
+                    f'treating as incomplete and blacklisting.'
+                )
+                if goal_xy is not None:
+                    self.add_to_blacklist(*goal_xy)
+                self.consecutive_failures += 1
+            else:
+                self.get_logger().info(
+                    f'Reached frontier {goal_xy}'
+                    + (f' (dist={dist:.2f}m)' if dist is not None else '')
+                    + ', looking for next.'
+                )
+                self.consecutive_failures = 0
         else:
             self.get_logger().warn(
-                f'Goal {self.active_goal_xy} failed (status={status}); blacklisting.'
+                f'Goal {goal_xy} failed (status={status}); blacklisting.'
             )
-            if self.active_goal_xy is not None:
-                self.add_to_blacklist(*self.active_goal_xy)
+            if goal_xy is not None:
+                self.add_to_blacklist(*goal_xy)
             self.consecutive_failures += 1
-        self.active_goal_handle = None
-        self.active_goal_xy = None
-        self.active_goal_send_time = None
+        self._clear_active_goal()
 
     def fail_active_goal(self):
         if self.active_goal_xy is not None:
             self.add_to_blacklist(*self.active_goal_xy)
+        self._clear_active_goal()
+        self.consecutive_failures += 1
+
+    def _clear_active_goal(self):
         self.active_goal_handle = None
         self.active_goal_xy = None
+        self.active_goal_yaw = None
         self.active_goal_send_time = None
-        self.consecutive_failures += 1
+        self.active_clusters_snapshot = None
+        self.active_chosen_snapshot = None
 
 
 def main():

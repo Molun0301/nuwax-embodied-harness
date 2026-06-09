@@ -158,6 +158,8 @@ fi
 # Environment
 # ---------------------------------------------------------------------------
 source "$SCRIPT_DIR/scripts/env.sh"
+# Platform geometry topic/frame settings (.env -> NUWAX_GEOMETRY_* exports).
+source "$SCRIPT_DIR/scripts/load_platform_geometry_env.sh"
 
 if [[ "$PRINT_NAV2_PARAMS" -eq 1 ]]; then
   NAV2_PARAMS_FILE="$SCRIPT_DIR/install/go2_nav/share/go2_nav/config/nav2_params.yaml"
@@ -274,6 +276,15 @@ if [[ "$NAV2_LOG_ONLY" -eq 1 ]]; then
 else
   unset GO2_NAV2_LOG_ONLY
 fi
+echo "[go2.sh] geometry env (from platform .env):"
+echo "[go2.sh]   odom_topic        = ${NUWAX_GEOMETRY_ODOM_TOPIC}"
+echo "[go2.sh]   point_cloud_topic = ${NUWAX_GEOMETRY_POINT_CLOUD_TOPIC}"
+echo "[go2.sh]   scan_topic        = ${NUWAX_GEOMETRY_SCAN_TOPIC}"
+echo "[go2.sh]   map_topic         = ${NUWAX_GEOMETRY_OCCUPANCY_TOPIC}"
+echo "[go2.sh]   map_frame         = ${NUWAX_GEOMETRY_MAP_FRAME}"
+echo "[go2.sh]   odom_frame        = ${NUWAX_GEOMETRY_ODOM_FRAME}"
+echo "[go2.sh]   base_frame        = ${NUWAX_GEOMETRY_BASE_FRAME}"
+echo "[go2.sh]   lidar_frame       = ${NUWAX_GEOMETRY_LIDAR_FRAME}"
 echo
 
 exec ros2 launch go2_nav "$LAUNCH" "database_path:=$DB_PATH"

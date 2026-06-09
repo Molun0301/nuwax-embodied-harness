@@ -756,7 +756,7 @@ def _render_debug_page(access_token: str) -> str:
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 500;
-      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.state", "exploration.frontier", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state"];
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
       const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
       const VIDEO_JPEG_DECODE_TIMEOUT_MS = 3000;
@@ -841,6 +841,7 @@ def _render_debug_page(access_token: str) -> str:
         lastMapEnvelope: null,
         lastLocalizationEnvelope: null,
         lastMapHeartbeatEnvelope: null,
+        latestFrontierStream: null,
       };
       const els = {
         robotName: document.getElementById("robotName"),
@@ -1998,9 +1999,29 @@ def _render_debug_page(access_token: str) -> str:
         ]);
         reevaluateCachedMapDisplay();
       }
+      function mergeLatestFrontierStream(data) {
+        const fr = state.latestFrontierStream;
+        if (!fr) return data;
+        const merged = { ...data };
+        if (!merged.explorer_status_text && fr.status_text) merged.explorer_status_text = fr.status_text;
+        if ((merged.frontier_count === null || merged.frontier_count === undefined) && fr.frontier_count != null) {
+          merged.frontier_count = fr.frontier_count;
+        }
+        if ((!merged.frontiers || !merged.frontiers.length) && Array.isArray(fr.latest_frontiers) && fr.latest_frontiers.length) {
+          merged.frontiers = fr.latest_frontiers;
+        }
+        if ((!merged.planned_path || !merged.planned_path.length) && Array.isArray(fr.planned_path) && fr.planned_path.length) {
+          merged.planned_path = fr.planned_path;
+        }
+        if (!merged.current_goal && fr.current_goal) merged.current_goal = fr.current_goal;
+        if (merged.exploration_terminal === undefined || merged.exploration_terminal === null) {
+          merged.exploration_terminal = fr.exploration_terminal;
+        }
+        return merged;
+      }
       function updateNavigation(envelope) {
         const status = statusOf(envelope);
-        const data = envelope.data || {};
+        const data = mergeLatestFrontierStream(envelope.data || {});
         setPill(els.navigationStatus, status);
         const frontierCount = data.frontier_count;
         const waitingFor = data.waiting_for;
@@ -2777,6 +2798,16 @@ def _render_debug_page(access_token: str) -> str:
       }
       function updateFrontierFrame(frame) {
         const payload = frame.payload || {};
+        state.latestFrontierStream = {
+          status_text: payload.status_text,
+          frontier_count: payload.frontier_count,
+          latest_frontiers: Array.isArray(payload.latest_frontiers) ? payload.latest_frontiers : [],
+          planned_path: Array.isArray(payload.planned_path) ? payload.planned_path : [],
+          current_goal: payload.current_goal || null,
+          exploration_terminal: payload.exploration_terminal,
+          sequence: frame.sequence,
+          received_at: frame.timestamp,
+        };
         const frontiers = Array.isArray(payload.latest_frontiers) ? payload.latest_frontiers : [];
         state.frontiers = frontiers;
         updateNavigation(envelopeFromFrame(frame, {

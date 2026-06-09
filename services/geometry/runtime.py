@@ -53,6 +53,9 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.runtime")
 
+_LIVE_MAPPING_DIAGNOSTICS_TTL_SEC = 0.5
+_EXTERNAL_EXPLORATION_LOG_SCAN_MIN_INTERVAL_SEC = 2.0
+
 
 _GEOMETRY_SIDE_CAR_RESTART_LIMIT = 2
 _GEOMETRY_MONITOR_INTERVAL_SEC = 1.0
@@ -330,6 +333,9 @@ class PlatformGeometryRuntime:
         self._external_exploration_version_id: Optional[str] = None
         self._external_exploration_terminal_state: Optional[ExplorationState] = None
         self._external_exploration_log_offset: Optional[int] = None
+        self._external_exploration_last_log_scan_at = 0.0
+        self._live_mapping_diagnostics_cache: Optional[Dict[str, object]] = None
+        self._live_mapping_diagnostics_cache_at = 0.0
         self.providers = PlatformGeometryProviderBundle(self)
 
     def start(self) -> None:
@@ -1588,7 +1594,12 @@ class PlatformGeometryRuntime:
                 notify_compat=False,
             )
         try:
-            self._notify_exploration_update(terminal_state or self.get_platform_exploration_state())
+            if terminal_state is not None:
+                self._notify_exploration_update(terminal_state)
+            else:
+                # 热路径：避免每次 frontier 回调扫描外部日志与完整 runtime 诊断，
+                # 否则会阻塞 ROS observer 单线程，导致 debug 面板地图/路径滞后数秒。
+                self._notify_exploration_update(self._build_fast_external_exploration_state_from_frontier())
         except Exception:
             LOGGER.debug("投递外部 GO2 frontier debug update 失败。", exc_info=True)
 
@@ -1666,9 +1677,23 @@ class PlatformGeometryRuntime:
             **self.config.build_metadata(),
         }
 
-    def get_live_mapping_diagnostics(self) -> Dict[str, object]:
+    def get_live_mapping_diagnostics(self, *, force_refresh: bool = False) -> Dict[str, object]:
         """返回探索建图输入链路的可行动诊断。"""
 
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._live_mapping_diagnostics_cache is not None
+            and now - self._live_mapping_diagnostics_cache_at < _LIVE_MAPPING_DIAGNOSTICS_TTL_SEC
+        ):
+            return self._clone_metadata(self._live_mapping_diagnostics_cache)
+
+        diagnostics = self._build_live_mapping_diagnostics()
+        self._live_mapping_diagnostics_cache = diagnostics
+        self._live_mapping_diagnostics_cache_at = now
+        return self._clone_metadata(diagnostics)
+
+    def _build_live_mapping_diagnostics(self) -> Dict[str, object]:
         live_map_status = self._clone_metadata(self._ros_bridge_status_stub("live_map_provider"))
         tf_localization_status = self._clone_metadata(self._ros_bridge_status_stub("tf_localization_provider"))
         odometry_status = self._clone_metadata(self._ros_bridge_status_stub("odometry_publisher"))
@@ -4708,6 +4733,51 @@ class PlatformGeometryRuntime:
             process_status=process_status,
         )
 
+    def _should_scan_external_exploration_log(self) -> bool:
+        now = time.monotonic()
+        if now - self._external_exploration_last_log_scan_at < _EXTERNAL_EXPLORATION_LOG_SCAN_MIN_INTERVAL_SEC:
+            return False
+        self._external_exploration_last_log_scan_at = now
+        return True
+
+    def _build_fast_external_exploration_state_from_frontier(self) -> ExplorationState:
+        """从已缓存的 frontier observer payload 构建轻量探索态，供 ROS 热路径推送。"""
+
+        with self._exploration_loop_lock:
+            request = self._external_exploration_request
+            terminal_state = self._external_exploration_terminal_state
+        if terminal_state is not None:
+            return terminal_state.model_copy(deep=True)
+        if request is None:
+            return ExplorationState(status=ExplorationStatus.IDLE)
+
+        frontier_metadata, frontier_count = self._external_debug_frontier_metadata()
+        explorer_message = self._external_explorer_headline_message(
+            frontier_metadata,
+            frontier_count=frontier_count,
+        )
+        process = self._managed_processes.get(self._external_process_name())
+        process_status = process.status() if process is not None else None
+        waiting_for = None
+        message = explorer_message or "GO2_RTABMAP 原生 frontier 探索运行中。"
+        metadata = self._build_external_exploration_metadata(
+            request=request,
+            process_status=process_status,
+            waiting_for=waiting_for,
+            reason=None,
+            terminal=False,
+        )
+        if frontier_metadata:
+            metadata.update(frontier_metadata)
+        return ExplorationState(
+            current_request_id=request.request_id,
+            status=ExplorationStatus.RUNNING,
+            strategy=request.strategy,
+            frontier_count=frontier_count,
+            message=message,
+            metadata=metadata,
+        )
+
     def _get_external_script_exploration_state(self) -> ExplorationState:
         with self._exploration_loop_lock:
             request = self._external_exploration_request
@@ -4756,7 +4826,9 @@ class PlatformGeometryRuntime:
             )
             return self._augment_exploration_state_with_mapping_diagnostics(state)
 
-        log_terminal = self._external_exploration_terminal_from_process_log(process)
+        log_terminal = None
+        if self._should_scan_external_exploration_log():
+            log_terminal = self._external_exploration_terminal_from_process_log(process)
         if log_terminal is not None:
             state = self._finish_external_script_exploration(
                 status=log_terminal["status"],

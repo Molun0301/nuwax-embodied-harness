@@ -403,6 +403,11 @@ class MappingService:
         latest = self._latest_snapshot
         if latest is None or latest.source_name != source_name:
             return False
+        latest_meta = latest.metadata if isinstance(latest.metadata, dict) else {}
+        new_hash = metadata.get("content_hash") or metadata.get("occupancy_content_hash")
+        latest_hash = latest_meta.get("content_hash") or latest_meta.get("occupancy_content_hash")
+        if new_hash and latest_hash and str(new_hash) == str(latest_hash):
+            return True
         return (
             self._normalize_snapshot_value(latest.occupancy_grid)
             == self._normalize_snapshot_value(occupancy_grid)

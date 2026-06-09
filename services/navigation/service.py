@@ -379,11 +379,23 @@ class NavigationService:
         if provider is None:
             return
         try:
-            self._ingest_exploration_state(provider, exploration_state)
+            exploration_metadata = dict(getattr(exploration_state, "metadata", {}) or {})
+            status_value = getattr(exploration_state.status, "value", exploration_state.status)
+            lightweight = bool(
+                exploration_metadata.get("native_go2_frontier_explorer")
+                and status_value == ExplorationStatus.RUNNING.value
+            )
+            self._ingest_exploration_state(provider, exploration_state, lightweight=lightweight)
         except Exception:
             return
 
-    def _ingest_exploration_state(self, provider: ExplorationProvider, exploration_state) -> ExplorationContext:
+    def _ingest_exploration_state(
+        self,
+        provider: ExplorationProvider,
+        exploration_state,
+        *,
+        lightweight: bool = False,
+    ) -> ExplorationContext:
         with self._lock:
             previous_context = self._latest_exploration_context
             current_request = self._current_explore_request
@@ -401,12 +413,17 @@ class NavigationService:
                 exploration_state = previous_context.exploration_state.model_copy(deep=True)
                 current_request = current_request or previous_context.current_request
                 idle_without_request = False
-            runtime_metadata = self._build_map_runtime_metadata(
-                map_name=current_request.map_name if current_request is not None else None,
-                memory_library_name=current_request.map_name if current_request is not None else None,
-                existing_waiting_for=None if idle_without_request else exploration_state.metadata.get("waiting_for"),
-                include_waiting_for=not idle_without_request,
-            )
+            if lightweight and previous_context is not None:
+                runtime_metadata = dict(previous_context.metadata or {})
+            elif lightweight:
+                runtime_metadata = {}
+            else:
+                runtime_metadata = self._build_map_runtime_metadata(
+                    map_name=current_request.map_name if current_request is not None else None,
+                    memory_library_name=current_request.map_name if current_request is not None else None,
+                    existing_waiting_for=None if idle_without_request else exploration_state.metadata.get("waiting_for"),
+                    include_waiting_for=not idle_without_request,
+                )
             merged_metadata = {
                 **dict(exploration_state.metadata),
                 **runtime_metadata,
@@ -470,10 +487,17 @@ class NavigationService:
                         "current_goal": exploration_metadata.get("current_goal") if isinstance(exploration_metadata.get("current_goal"), dict) else None,
                         "external_frontier_debug_observer": observer_meta,
                     }
+                    frontier_sequence = None
+                    if isinstance(observer_meta, dict):
+                        try:
+                            frontier_sequence = int(observer_meta.get("sequence"))
+                        except (TypeError, ValueError):
+                            frontier_sequence = None
                     self._stream_bus.publish(
                         "exploration.frontier",
                         source="navigation_service",
                         payload=frontier_payload,
+                        sequence=frontier_sequence,
                         status="available",
                         metadata={
                             "backend_name": provider.provider_name,

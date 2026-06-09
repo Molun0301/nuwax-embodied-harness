@@ -431,7 +431,7 @@ class ExternalGeometryDebugObserver:
         with self._lock:
             self._last_planned_path = path
             self._last_plan_at = now
-        if now - self._last_plan_emit_at >= 0.2:
+        if now - self._last_plan_emit_at >= 0.1:
             self._last_plan_emit_at = now
             self._emit_frontier_payload()
 

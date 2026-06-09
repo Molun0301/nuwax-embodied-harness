@@ -90,7 +90,7 @@ class FrontierExplorer(Node):
         self.declare_parameter('blacklist_radius', 0.5)
         self.declare_parameter('blacklist_ttl', 60.0)
         self.declare_parameter('goal_yaw_to_robot', True)
-        self.declare_parameter('max_consecutive_failures', 5)
+        self.declare_parameter('max_consecutive_failures', 10)
         # Grace period after launch before sending the first goal. Nav2's
         # lifecycle manager reports 'active' before the bt_navigator finishes
         # wiring up its internal action clients (compute_path_to_pose,
@@ -105,7 +105,9 @@ class FrontierExplorer(Node):
         self.declare_parameter('goal_timeout', 60.0)
         # Ignore frontier goals closer than this (m). Prevents picking a goal the
         # robot is already beside, which Nav2 immediately marks as succeeded.
-        self.declare_parameter('min_travel_m', 1.0)
+        self.declare_parameter('min_travel_m', 0.5)
+        # Skip goal cells with less than this clearance to occupied space (m).
+        self.declare_parameter('min_goal_clearance_m', 0.25)
         # After Nav2 reports success, reject the result if the robot is still
         # farther than this from the dispatched goal (planner snap / early stop).
         self.declare_parameter('goal_success_tolerance', 0.45)
@@ -132,6 +134,7 @@ class FrontierExplorer(Node):
         self.startup_grace_period = float(gp('startup_grace_period').value)
         self.goal_timeout = float(gp('goal_timeout').value)
         self.min_travel_m = float(gp('min_travel_m').value)
+        self.min_goal_clearance_m = float(gp('min_goal_clearance_m').value)
         self.goal_success_tolerance = float(gp('goal_success_tolerance').value)
         self.global_plan_topic = str(gp('global_plan_topic').value)
         self.next_goal_topic = str(gp('next_goal_topic').value)
@@ -271,6 +274,7 @@ class FrontierExplorer(Node):
                 f'navigation failures. Map may be fully explored or blocked.'
             )
             self.exploration_done = True
+            self.publish_status('DONE (exploration finished)')
             return
 
         # 1) Robot pose
@@ -429,6 +433,8 @@ class FrontierExplorer(Node):
             if self.is_blacklisted(*candidate.goal_world):
                 continue
             if candidate.travel_m < self.min_travel_m:
+                continue
+            if candidate.clearance_m < self.min_goal_clearance_m:
                 continue
             if candidate.score > best_score:
                 best_score = candidate.score

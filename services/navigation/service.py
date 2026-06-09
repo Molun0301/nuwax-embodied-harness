@@ -8,7 +8,7 @@ import time
 from contracts.events import RuntimeEventCategory
 from contracts.map_workspace import MapAssetStatus
 from contracts.runtime_views import LocalizationSessionStatus
-from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationStatus
+from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.runtime_views import ExplorationContext, NavigationContext
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from gateways.errors import GatewayError
@@ -481,6 +481,7 @@ class NavigationService:
                             "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
                         },
                     )
+                self._publish_external_exploration_navigation_overlay(context)
             if context.exploration_state.status in {
                 ExplorationStatus.SUCCEEDED,
                 ExplorationStatus.FAILED,
@@ -603,6 +604,122 @@ class NavigationService:
             if state == ExplorationStatus.CANCELLED:
                 raise GatewayError(context.exploration_state.message or "探索已取消。")
             time.sleep(max(0.01, poll_interval_sec))
+
+    def _publish_external_exploration_navigation_overlay(self, exploration_context: ExplorationContext) -> None:
+        if self._stream_bus is None:
+            return
+        exploration_state = exploration_context.exploration_state
+        metadata = dict(getattr(exploration_state, "metadata", {}) or {})
+        if metadata.get("exploration_mode") != "go2_rtabmap_script":
+            return
+        if exploration_state.status not in {
+            ExplorationStatus.ACCEPTED,
+            ExplorationStatus.RUNNING,
+            ExplorationStatus.SUCCEEDED,
+            ExplorationStatus.FAILED,
+            ExplorationStatus.CANCELLED,
+        }:
+            return
+
+        status_text = str(metadata.get("status_text") or "")
+        upper = status_text.upper()
+        terminal = bool(metadata.get("exploration_terminal"))
+        expl_status = exploration_state.status
+
+        if terminal or expl_status in {
+            ExplorationStatus.SUCCEEDED,
+            ExplorationStatus.FAILED,
+            ExplorationStatus.CANCELLED,
+        }:
+            if expl_status == ExplorationStatus.SUCCEEDED:
+                nav_status = NavigationStatus.SUCCEEDED
+            elif expl_status == NavigationStatus.CANCELLED:
+                nav_status = NavigationStatus.CANCELLED
+            else:
+                nav_status = NavigationStatus.FAILED
+            message = exploration_state.message or "外部前沿探索已结束。"
+        elif any(token in upper for token in ("NAVIGATING", "FOLLOWING")):
+            nav_status = NavigationStatus.RUNNING
+            message = "外部 Nav2 前沿探索导航中。"
+        elif "DISPATCHING" in upper:
+            nav_status = NavigationStatus.PLANNING
+            message = "外部 Nav2 正在派发前沿目标。"
+        elif "WARMING UP" in upper:
+            nav_status = NavigationStatus.PLANNING
+            message = "探索器预热中，等待派发前沿目标。"
+        elif "WAITING" in upper:
+            nav_status = NavigationStatus.ACCEPTED
+            message = "探索器等待可达前沿点。"
+        elif expl_status == ExplorationStatus.RUNNING:
+            nav_status = NavigationStatus.RUNNING
+            message = exploration_state.message or "外部前沿探索运行中。"
+        else:
+            return
+
+        current_goal_payload = metadata.get("current_goal") if isinstance(metadata.get("current_goal"), dict) else None
+        goal_id = "external_frontier_%s" % (exploration_state.current_request_id or "active")
+        current_goal = None
+        if current_goal_payload is not None:
+            try:
+                from contracts.geometry import Pose, Quaternion, Vector3
+
+                target_pose = current_goal_payload.get("target_pose")
+                if isinstance(target_pose, dict):
+                    position = target_pose.get("position") if isinstance(target_pose.get("position"), dict) else {}
+                    orientation = target_pose.get("orientation") if isinstance(target_pose.get("orientation"), dict) else {}
+                    current_goal = NavigationGoal(
+                        goal_id=goal_id,
+                        target_pose=Pose(
+                            frame_id=str(target_pose.get("frame_id") or "map"),
+                            position=Vector3(
+                                x=float(position.get("x") or 0.0),
+                                y=float(position.get("y") or 0.0),
+                                z=float(position.get("z") or 0.0),
+                            ),
+                            orientation=Quaternion(
+                                x=float(orientation.get("x") or 0.0),
+                                y=float(orientation.get("y") or 0.0),
+                                z=float(orientation.get("z") or 0.0),
+                                w=float(orientation.get("w") or 1.0),
+                            ),
+                        ),
+                        metadata={"source": "external_frontier_explorer"},
+                    )
+            except Exception:
+                current_goal = None
+
+        navigation_state = NavigationState(
+            current_goal_id=goal_id if current_goal is not None else None,
+            status=nav_status,
+            message=message,
+            goal_reached=nav_status == NavigationStatus.SUCCEEDED,
+            metadata={
+                "synthetic": True,
+                "source": "external_frontier_explorer",
+                "explorer_status_text": status_text or None,
+                "exploration_request_id": exploration_state.current_request_id,
+                "exploration_terminal": terminal,
+            },
+        )
+        navigation_context = NavigationContext(
+            current_goal=current_goal,
+            navigation_state=navigation_state,
+            backend_name=exploration_context.backend_name,
+            goal_reached=navigation_state.goal_reached,
+            metadata={"synthetic_external_exploration_navigation": True},
+        )
+        navigation_status = str(getattr(navigation_state.status, "value", navigation_state.status))
+        self._stream_bus.publish(
+            "navigation.state",
+            source="navigation_service",
+            payload=navigation_context,
+            status="available",
+            metadata={
+                "backend_name": exploration_context.backend_name,
+                "navigation_status": navigation_status,
+                "synthetic_external_exploration_navigation": True,
+            },
+        )
 
     def get_latest_navigation_context(self) -> Optional[NavigationContext]:
         """返回最新导航上下文。"""

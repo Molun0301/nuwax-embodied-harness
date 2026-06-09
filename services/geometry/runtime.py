@@ -1854,6 +1854,45 @@ class PlatformGeometryRuntime:
         request.metadata = metadata
         return request
 
+    @staticmethod
+    def _resolve_explorer_status_text(frontier_meta: Dict[str, object]) -> str:
+        status_text = str((frontier_meta or {}).get("status_text") or "").strip()
+        if not status_text:
+            return ""
+        upper = status_text.upper()
+        observer_meta = (frontier_meta or {}).get("external_frontier_debug_observer")
+        observer_payload = (
+            observer_meta.get("metadata")
+            if isinstance(observer_meta, dict) and isinstance(observer_meta.get("metadata"), dict)
+            else {}
+        )
+        plan_fresh = bool(observer_payload.get("plan_fresh"))
+        plan_points = int(observer_payload.get("plan_point_count") or 0)
+        if plan_fresh and plan_points > 0 and any(
+            term in upper for term in ("WARMING UP", "WAITING (NO REACHABLE")
+        ):
+            return "[explorer] NAVIGATING"
+        return status_text
+
+    @staticmethod
+    def _external_explorer_headline_message(
+        frontier_meta: Dict[str, object],
+        *,
+        frontier_count: Optional[int] = None,
+    ) -> Optional[str]:
+        status_text = PlatformGeometryRuntime._resolve_explorer_status_text(frontier_meta)
+        if not status_text:
+            return None
+        cleaned = re.sub(r"^\[explorer\]\s*", "", status_text, flags=re.IGNORECASE).strip()
+        if not cleaned:
+            return None
+        upper = cleaned.upper()
+        if "DONE" in upper or "EXPLORATION FINISHED" in upper:
+            return "GO2_RTABMAP 原生探索已完成：%s" % cleaned
+        if frontier_count is not None and frontier_count > 0:
+            return "正在探索（%s）：%d 个前沿点" % (cleaned, int(frontier_count))
+        return "正在探索：%s" % cleaned
+
     def _augment_exploration_state_with_mapping_diagnostics(self, state):
         diagnostics = self.get_live_mapping_diagnostics()
         metadata = dict(getattr(state, "metadata", {}) or {})
@@ -1867,14 +1906,14 @@ class PlatformGeometryRuntime:
         # _external_debug_frontier_metadata 持 RLock，可重入；返回 (metadata, frontier_count)。
         frontier_meta, frontier_count = self._external_debug_frontier_metadata()
         frontier_status_text = str((frontier_meta or {}).get("status_text") or "").upper()
-        # 来源 frontier_explorer.py publish_status：实际发射 NAVIGATING；FOLLOWING 为防御性保留。
-        _MOTION_KEYWORDS = ("NAVIGATING", "FOLLOWING")
+        explorer_message = self._external_explorer_headline_message(
+            frontier_meta,
+            frontier_count=frontier_count,
+        )
         explorer_actually_running = bool(
             active
-            and (
-                (frontier_count or 0) > 0
-                or any(kw in frontier_status_text for kw in _MOTION_KEYWORDS)
-            )
+            and explorer_message is not None
+            and not any(term in frontier_status_text for term in ("DONE", "EXPLORATION FINISHED"))
         )
         # 安全条款：_error 结尾的诊断必须始终覆写 headline（真实错误不被遮蔽）。
         is_error_diagnostic = bool(
@@ -1904,11 +1943,10 @@ class PlatformGeometryRuntime:
             if diagnostics.get("message"):
                 updates["message"] = diagnostics.get("message")
         elif explorer_actually_running and not is_error_diagnostic:
-            # explorer 在跑且非错误 → headline 反映真实探索进度（frontier_meta 暂无覆盖率）。
-            if frontier_count and frontier_count > 0:
-                updates["message"] = "正在探索：追踪 %d 个前沿点" % int(frontier_count)
-            else:
-                updates["message"] = "正在探索。"
+            updates["message"] = explorer_message
+            status_text = str((frontier_meta or {}).get("status_text") or "").strip()
+            if status_text:
+                metadata["status_text"] = status_text
         return state.model_copy(update=updates, deep=True)
 
     def clear_active_map_version(self, *, reason: str = "") -> None:
@@ -4069,6 +4107,9 @@ class PlatformGeometryRuntime:
             metadata.update(frontier_metadata)
         metadata["exploration_terminal"] = True
         metadata["terminal_status"] = str(getattr(status, "value", status) or "succeeded")
+        metadata["status_text"] = self._terminal_explorer_status_text(str(reason or ""), message)
+        metadata.pop("waiting_for", None)
+        metadata.pop("waiting_detail", None)
         state = ExplorationState(
             current_request_id=request.request_id if request is not None else None,
             status=status,
@@ -4594,12 +4635,20 @@ class PlatformGeometryRuntime:
         except (TypeError, ValueError):
             frontier_count = len(latest_frontiers)
         payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        raw_status_text = str(payload_metadata.get("status_text") or "").strip()
+        provisional_meta = {
+            "status_text": raw_status_text,
+            "external_frontier_debug_observer": {
+                "metadata": payload_metadata,
+            },
+        }
+        resolved_status_text = self._resolve_explorer_status_text(provisional_meta) or raw_status_text
         metadata = {
             "latest_frontiers": latest_frontiers,
             "current_frontier": current_frontier,
             "frontier_source": payload.get("source") or "go2_rtabmap_debug_observer",
             "native_go2_frontier_explorer": True,
-            "status_text": payload_metadata.get("status_text"),
+            "status_text": resolved_status_text,
             "exploration_terminal": bool(payload_metadata.get("exploration_terminal")),
             "terminal_status": payload_metadata.get("terminal_status"),
             "planned_path": payload.get("planned_path") if isinstance(payload.get("planned_path"), list) else payload_metadata.get("planned_path"),
@@ -4718,21 +4767,30 @@ class PlatformGeometryRuntime:
             )
             return self._augment_exploration_state_with_mapping_diagnostics(state)
 
+        frontier_metadata, frontier_count = self._external_debug_frontier_metadata()
+        explorer_message = self._external_explorer_headline_message(
+            frontier_metadata,
+            frontier_count=frontier_count,
+        )
+
         diagnostics = self.get_live_mapping_diagnostics()
         runtime_status = diagnostics.get("runtime_status") if isinstance(diagnostics.get("runtime_status"), dict) else {}
         rtabmap_readiness = diagnostics.get("rtabmap_readiness") if isinstance(diagnostics.get("rtabmap_readiness"), dict) else {}
         nav2_status = runtime_status.get("nav2") if isinstance(runtime_status.get("nav2"), dict) else self._build_nav2_status()
         waiting_for = None
         message = "GO2_RTABMAP 原生 frontier 探索运行中。"
-        if diagnostics.get("waiting_for"):
-            waiting_for = str(diagnostics.get("waiting_for"))
-            message = str(diagnostics.get("message") or "等待 GO2_RTABMAP 探索输入链路 ready。")
-        elif not bool(rtabmap_readiness.get("localization_ready")):
-            waiting_for = str(rtabmap_readiness.get("waiting_for") or "external_slam_nav2")
-            message = str(rtabmap_readiness.get("message") or "等待 GO2_RTABMAP SLAM/TF ready。")
-        elif not bool(nav2_status.get("ready")):
-            waiting_for = self._normalize_exploration_waiting_for(nav2_status.get("waiting_for") or "nav2_action")
-            message = str(nav2_status.get("message") or "等待 GO2_RTABMAP Nav2 ready。")
+        if not explorer_message:
+            if diagnostics.get("waiting_for"):
+                waiting_for = str(diagnostics.get("waiting_for"))
+                message = str(diagnostics.get("message") or "等待 GO2_RTABMAP 探索输入链路 ready。")
+            elif not bool(rtabmap_readiness.get("localization_ready")):
+                waiting_for = str(rtabmap_readiness.get("waiting_for") or "external_slam_nav2")
+                message = str(rtabmap_readiness.get("message") or "等待 GO2_RTABMAP SLAM/TF ready。")
+            elif not bool(nav2_status.get("ready")):
+                waiting_for = self._normalize_exploration_waiting_for(nav2_status.get("waiting_for") or "nav2_action")
+                message = str(nav2_status.get("message") or "等待 GO2_RTABMAP Nav2 ready。")
+        else:
+            message = explorer_message
 
         metadata = self._build_external_exploration_metadata(
             request=request,
@@ -4747,16 +4805,17 @@ class PlatformGeometryRuntime:
         metadata["elapsed_time_sec"] = elapsed
         if waiting_for:
             metadata["waiting_detail"] = message
-        frontier_metadata, frontier_count = self._external_debug_frontier_metadata()
         if frontier_metadata:
             metadata.update(frontier_metadata)
-        return ExplorationState(
-            current_request_id=request.request_id,
-            status=ExplorationStatus.RUNNING,
-            strategy=request.strategy,
-            frontier_count=frontier_count,
-            message=message,
-            metadata=metadata,
+        return self._augment_exploration_state_with_mapping_diagnostics(
+            ExplorationState(
+                current_request_id=request.request_id,
+                status=ExplorationStatus.RUNNING,
+                strategy=request.strategy,
+                frontier_count=frontier_count,
+                message=message,
+                metadata=metadata,
+            )
         )
 
     def _read_external_exploration_log_texts(self, process: Optional[_ManagedProcess]) -> List[str]:
@@ -4784,11 +4843,30 @@ class PlatformGeometryRuntime:
         return deduped
 
     def _external_exploration_terminal_from_process_log(self, process: Optional[_ManagedProcess]) -> Optional[Dict[str, object]]:
+        best: Optional[Dict[str, object]] = None
         for candidate in self._read_external_exploration_log_texts(process):
             terminal = self._external_exploration_terminal_from_log_text(candidate)
-            if terminal is not None:
+            if terminal is None:
+                continue
+            if terminal.get("reason") == "external_explorer_log_complete":
                 return terminal
-        return None
+            best = terminal
+        return best
+
+    @staticmethod
+    def _terminal_explorer_status_text(reason: str, message: str) -> str:
+        normalized_message = str(message or "").lower()
+        if "done" in normalized_message or "exploration finished" in normalized_message:
+            return "DONE (exploration finished)"
+        if reason in {
+            "external_explorer_frontier_done",
+            "external_explorer_log_complete",
+            "external_explorer_terminal_status",
+        }:
+            return "DONE (exploration finished)"
+        if reason == "external_explorer_log_navigation_failures_terminal":
+            return "DONE (exploration finished)"
+        return "DONE (exploration finished)"
 
     def _read_external_frontier_ros_logs(self, launch_log_text: str) -> List[str]:
         pids: List[str] = []
@@ -4813,23 +4891,27 @@ class PlatformGeometryRuntime:
         if latest_start >= 0:
             text = text[latest_start:]
         normalized = text.lower()
-        if (
-            "exploration complete" in normalized
-            or "exploration reached a terminal state" in normalized
-            or "done (exploration finished)" in normalized
-            or "no frontiers found. exploration complete" in normalized
-            or "shutting down frontier_explorer node" in normalized
-        ):
+        complete_markers = (
+            "exploration complete",
+            "exploration reached a terminal state",
+            "done (exploration finished)",
+            "no frontiers found. exploration complete",
+            "shutting down frontier_explorer node",
+        )
+        complete_pos = max((normalized.rfind(marker) for marker in complete_markers), default=-1)
+        failure_pos = normalized.rfind("stopping exploration:")
+        has_failure = failure_pos >= 0 and "consecutive navigation failures" in normalized
+        if complete_pos >= 0 and complete_pos >= failure_pos:
             return {
                 "status": ExplorationStatus.SUCCEEDED,
                 "reason": "external_explorer_log_complete",
                 "message": "GO2_RTABMAP 原生探索已完成。",
             }
-        if "stopping exploration:" in normalized and "consecutive navigation failures" in normalized:
+        if has_failure:
             return {
                 "status": ExplorationStatus.SUCCEEDED,
                 "reason": "external_explorer_log_navigation_failures_terminal",
-                "message": "GO2_RTABMAP 原生探索已结束：连续导航失败，可能已探索完或剩余前沿被阻塞。",
+                "message": "GO2_RTABMAP 原生探索已完成（连续导航失败终止，可能已探索完或剩余前沿被阻塞）。",
             }
         return None
 

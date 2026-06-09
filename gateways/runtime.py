@@ -63,6 +63,74 @@ from logging_utils import LogRateLimiter, format_log_preview, is_low_value_runti
 from settings import NuwaxRobotBridgeConfig
 
 
+class _ShmVideoFrameSource:
+    """把 VideoShmReader 包装成感知服务所需的 VideoFrameSource 协议。
+
+    持续感知运行时每次 run_once 调用 status_snapshot()/get_latest_image()，
+    SHM 未就绪时 _ensure_open() 惰性重试，不抛异常。与 web 视频流读取器共用
+    同一只读 mmap，互不冲突。来源: dev 分支 gateways/runtime.py。
+    """
+
+    def __init__(self, shm_path: str) -> None:
+        self._shm_path = shm_path
+        self._reader = None
+        self._last_frame = None
+        self._connected = False
+        self._ensure_open()
+
+    def _ensure_open(self) -> bool:
+        if self._reader is not None and self._connected:
+            return True
+        try:
+            from services.geometry.video_shm_reader import VideoShmReader
+            reader = VideoShmReader(self._shm_path)
+            self._connected = reader.open()
+            if self._connected:
+                self._reader = reader
+        except Exception:
+            self._connected = False
+        return self._connected
+
+    def get_latest_image(self, camera_id=None):
+        if not self._ensure_open() or self._reader is None:
+            return None
+        try:
+            result = self._reader.read_latest()
+        except Exception:
+            self._connected = False
+            self._reader = None
+            return None
+        if result is None:
+            return result
+        frame_bytes, _seq, ts_ns = result
+        if not frame_bytes:
+            return None
+        # __SHM_FRAME_SOURCE_PLACEHOLDER__
+        try:
+            from contracts.image import ImageFrame, ImageEncoding
+            from contracts.base import utc_now
+            return ImageFrame(
+                camera_id=str(camera_id or "front_camera"),
+                frame_id="go2/front_camera",
+                width_px=1280,
+                height_px=720,
+                encoding=ImageEncoding.JPEG,
+                data=frame_bytes,
+                metadata={"source_kind": "platform_video_ingest_stream", "ingest_sequence": _seq, "ts_ns": ts_ns},
+            )
+        except Exception:
+            return None
+
+    def status_snapshot(self):
+        ok = self._ensure_open()
+        return {
+            "available": ok,
+            "connected": ok,
+            "reason": "ok" if ok else "shm_not_available",
+            "shm_path": self._shm_path,
+        }
+
+
 RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.runtime")
 _RUNTIME_EVENT_LOG_RATE_LIMIT_SEC = 10.0
 _REQUEST_CONTEXT_KEYS = (
@@ -294,7 +362,9 @@ class GatewayRuntime:
             event_bus=self.event_bus,
             stream_bus=self.stream_bus,
             video_frame_sink=None,
-            video_frame_source=None,
+            video_frame_source=_ShmVideoFrameSource(
+                os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+            ),
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),
         )
@@ -365,6 +435,13 @@ class GatewayRuntime:
         )
         self._lock = threading.RLock()
         self._started = False
+        # 探索感知耦合标志（替代旧 _exploration_started_perception）。
+        # NOTE: 探索耦合交互设计：
+        #   - 探索启动 → _attach → 标记耦合（无论感知是否已运行）
+        #   - 探索结束 → _detach → 仅在耦合仍有效时停止感知
+        #   - 用户手动 start/stop（capability 或 HTTP）→ _manual_perception_* → 解除耦合
+        # TODO: 若出现第 3 个生命周期源（如定时任务），升级为 owner-enum。
+        self._perception_exploration_coupled = False
         self._runtime_event_log_limiter = LogRateLimiter()
         self._event_log_subscription_id = self.event_bus.subscribe(self._log_runtime_event)
         self._geometry_runtime_lock = threading.RLock()
@@ -3420,6 +3497,16 @@ class GatewayRuntime:
         del requested_by
         return {"perception_runtime": self.perception_video_runtime.get_status()}
 
+    def _manual_perception_start(self) -> Dict[str, Any]:
+        """用户显式启动感知：解除探索耦合后启动。capability + HTTP 均走此入口。"""
+        self._perception_exploration_coupled = False
+        return self.perception_video_runtime.start()
+
+    def _manual_perception_stop(self) -> Dict[str, Any]:
+        """用户显式停止感知：解除探索耦合后停止。capability + HTTP 均走此入口。"""
+        self._perception_exploration_coupled = False
+        return self.perception_video_runtime.stop()
+
     def _handle_start_perception_runtime(
         self,
         _: Dict[str, Any],
@@ -3427,7 +3514,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         del requested_by
-        return {"perception_runtime": self.perception_video_runtime.start()}
+        return {"perception_runtime": self._manual_perception_start()}
 
     def _handle_stop_perception_runtime(
         self,
@@ -3436,25 +3523,25 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         del requested_by
-        return {"perception_runtime": self.perception_video_runtime.stop()}
+        return {"perception_runtime": self._manual_perception_stop()}
 
     def _attach_perception_to_exploration(self) -> None:
-        """探索任务启动时拉起感知线程（若尚未运行），并记录本任务拉起标志。"""
+        """探索任务启动时确保感知运行，并标记探索耦合（无论是否已运行）。"""
         if not self.perception_video_runtime.is_enabled():
             return
+        self._perception_exploration_coupled = True
         if self.perception_video_runtime.is_running():
             return
         try:
             self.perception_video_runtime.start()
-            self._exploration_started_perception = True
         except Exception:
             RUNTIME_LOGGER.warning("探索联动启动感知线程失败，忽略继续。", exc_info=True)
 
     def _detach_perception_from_exploration(self) -> None:
-        """探索任务结束时停止感知线程（仅当本任务拉起）。"""
-        if not getattr(self, "_exploration_started_perception", False):
+        """探索任务结束时停止感知线程（仅当耦合仍有效）。"""
+        if not self._perception_exploration_coupled:
             return
-        self._exploration_started_perception = False
+        self._perception_exploration_coupled = False
         try:
             self.perception_video_runtime.stop()
         except Exception:
@@ -7198,7 +7285,7 @@ class GatewayRuntime:
             "covered_ratio": last_context.exploration_state.covered_ratio,
             "frontier_count": last_context.exploration_state.frontier_count,
             "waiting_for": exploration_metadata.get("waiting_for"),
-            "explorer_status_text": exploration_metadata.get("status_text"),
+            "explorer_status_text": exploration_metadata.get("status_text") or exploration_metadata.get("explorer_status_text"),
             "exploration_terminal": exploration_metadata.get("exploration_terminal"),
             "terminal_status": exploration_metadata.get("terminal_status"),
             "mapping_chain_diagnostics": GatewayRuntime._summarize_mapping_chain_diagnostics(
@@ -7612,14 +7699,30 @@ class GatewayRuntime:
             if bool(observer_payload.get("exploration_terminal")) or "DONE" in observer_status or "EXPLORATION FINISHED" in observer_status:
                 return 1.0
         if metadata.get("exploration_mode") == "go2_rtabmap_script":
+            if "NAVIGATING" in status_text:
+                open_paren = status_text.find("(")
+                close_paren = status_text.find(")", open_paren + 1) if open_paren >= 0 else -1
+                if open_paren >= 0 and close_paren > open_paren:
+                    try:
+                        elapsed = int(
+                            status_text[open_paren + 1:close_paren].lower().replace("s", "").strip()
+                        )
+                        return max(0.35, min(0.9, 0.35 + elapsed / 180.0))
+                    except ValueError:
+                        pass
+                return 0.55
+            if "DISPATCHING" in status_text:
+                return 0.45
             if "FOLLOWING" in status_text:
                 return 0.82
             if "TIMEOUT" in status_text or "RECOVER" in status_text:
                 return 0.7
-            if "WARMING UP" in status_text:
+            if "WAITING FOR /MAP" in status_text:
                 return 0.12
-            if "WAITING" in status_text:
-                return 0.08
+            if "WAITING (NO REACHABLE" in status_text:
+                return 0.5
+            if "WARMING UP" in status_text:
+                return 0.15
             waiting_for = str(metadata.get("waiting_for") or "")
             if waiting_for in {"external_map_streaming", "external_slam_nav2", "nav2_lifecycle", "nav2_action"}:
                 return 0.18

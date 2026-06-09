@@ -102,12 +102,14 @@ def generate_launch_description():
                         'max_goal_candidates_per_frontier': 80,
                         'blacklist_radius': 0.5,        # m
                         'blacklist_ttl': 60.0,          # s
-                        'max_consecutive_failures': 5,
+                        'max_consecutive_failures': 10,
                         # Extra warmup to avoid Nav2 "send_goal failed" race.
                         'startup_grace_period': 15.0,
                         # Skip frontiers the robot is already beside; require a
                         # real drive before accepting Nav2 success.
-                        'min_travel_m': 1.0,
+                        'min_travel_m': 0.5,
+                        # Reject goals squeezed into tight corners (planner/collision).
+                        'min_goal_clearance_m': 0.25,
                         'goal_success_tolerance': 0.45,
                     }],
                 ),

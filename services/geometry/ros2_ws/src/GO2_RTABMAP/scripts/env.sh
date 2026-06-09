@@ -33,11 +33,16 @@ export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
 export PATH="/usr/local/cuda-11.4/bin:${PATH:-}"
 export LD_LIBRARY_PATH="/usr/local/cuda-11.4/lib64:${LD_LIBRARY_PATH:-}"
 
-# ---- CycloneDDS native install (used by cyclonedds_ws build)
+# ---- CycloneDDS native install (build-time only)
+# cyclonedds_ws already provides runtime libddsc via setup.bash above.
+# Prepending ~/cyclonedds/install/lib causes libddsc version skew and breaks
+# some Nav2 binaries (recoveries_server symbol lookup at shutdown).
 if [[ -d "$HOME/cyclonedds/install" ]]; then
   export CYCLONEDDS_HOME="$HOME/cyclonedds/install"
   export CMAKE_PREFIX_PATH="$CYCLONEDDS_HOME:${CMAKE_PREFIX_PATH:-}"
-  export LD_LIBRARY_PATH="$CYCLONEDDS_HOME/lib:${LD_LIBRARY_PATH:-}"
+fi
+if [[ -d "$HOME/cyclonedds_ws/install/cyclonedds/lib" ]]; then
+  export LD_LIBRARY_PATH="$HOME/cyclonedds_ws/install/cyclonedds/lib:${LD_LIBRARY_PATH:-}"
 fi
 
 # ---- Unitree messages workspace (provides unitree_api, unitree_go, etc.)

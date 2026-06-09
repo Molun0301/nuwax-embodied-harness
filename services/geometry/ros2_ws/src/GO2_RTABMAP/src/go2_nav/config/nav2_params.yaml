@@ -73,7 +73,7 @@ controller_server:
       regulated_linear_scaling_min_radius: 0.75
       regulated_linear_scaling_min_speed: 0.08
       use_cost_regulated_linear_velocity_scaling: false
-      max_allowed_time_to_collision: 1.0
+      max_allowed_time_to_collision: 1.5
 
 planner_server:
   ros__parameters:
@@ -133,11 +133,10 @@ local_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # Lower scaling factor + larger radius = wider "soft" keep-out zone,
-        # so the planner routes the robot further from walls. Bumped from
-        # 3.0/0.55 after observing wall scrapes during autonomous exploration.
+        # Balanced for GO2 in narrow indoor spaces: too large (0.85) blocks
+        # valid paths on fresh maps; too small risks wall scrapes.
         cost_scaling_factor: 2.5
-        inflation_radius: 0.85
+        inflation_radius: 0.60
 
 global_costmap:
   global_costmap:
@@ -173,11 +172,8 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # Matches local_costmap inflation. Wider keep-out so the global plan
-        # itself routes away from walls (otherwise local controller has to
-        # fix it last-minute and may scrape).
         cost_scaling_factor: 2.5
-        inflation_radius: 0.85
+        inflation_radius: 0.60
 
 lifecycle_manager_navigation:
   ros__parameters:

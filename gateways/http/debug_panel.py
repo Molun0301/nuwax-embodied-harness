@@ -1945,6 +1945,15 @@ def _render_debug_page(access_token: str) -> str:
         if (frontier && frontier.pose) return frontier.pose;
         return null;
       }
+      function normalizeExplorerStatusText(statusText) {
+        const text = safeText(statusText);
+        if (!text) return "";
+        return text.replace(/^\[explorer\]\s*/i, "").trim();
+      }
+      function isTerminalExplorerStatus(statusText) {
+        const upper = normalizeExplorerStatusText(statusText).toUpperCase();
+        return upper.includes("DONE") || upper.includes("EXPLORATION FINISHED") || upper.includes("COMPLETE");
+      }
       function summarizeContext(context, key) {
         const stateObj = context && context[key];
         if (!stateObj) return "--";
@@ -1952,11 +1961,14 @@ def _render_debug_page(access_token: str) -> str:
         const explorerStatus = metadata.status_text || metadata.explorer_status_text;
         if (metadata.exploration_terminal || metadata.terminal) {
           const terminal = metadata.terminal_status || stateObj.status || "completed";
-          return explorerStatus ? `${terminal} · ${explorerStatus}` : String(terminal);
+          if (explorerStatus && isTerminalExplorerStatus(explorerStatus)) {
+            return `${terminal} · ${normalizeExplorerStatusText(explorerStatus)}`;
+          }
+          return String(terminal);
         }
         if (explorerStatus) {
           const base = stateObj.status || stateObj.phase || stateObj.message || stateObj.state || "available";
-          return `${base} · ${explorerStatus}`;
+          return `${base} · ${normalizeExplorerStatusText(explorerStatus)}`;
         }
         return stateObj.status || stateObj.phase || stateObj.message || stateObj.state || "available";
       }
@@ -1992,11 +2004,19 @@ def _render_debug_page(access_token: str) -> str:
         setPill(els.navigationStatus, status);
         const frontierCount = data.frontier_count;
         const waitingFor = data.waiting_for;
-        const explorerStatus = data.explorer_status_text
-          || (data.exploration_context && data.exploration_context.exploration_state && data.exploration_context.exploration_state.metadata && data.exploration_context.exploration_state.metadata.status_text)
-          || (data.exploration_context && data.exploration_context.exploration_state && data.exploration_context.exploration_state.metadata && data.exploration_context.exploration_state.metadata.explorer_status_text);
+        const explorationState = data.exploration_context && data.exploration_context.exploration_state;
+        const explorationMetadata = explorationState && explorationState.metadata ? explorationState.metadata : {};
+        let explorerStatus = data.explorer_status_text
+          || explorationMetadata.status_text
+          || explorationMetadata.explorer_status_text;
         const explorationTerminal = data.exploration_terminal
-          || (data.exploration_context && data.exploration_context.exploration_state && data.exploration_context.exploration_state.metadata && data.exploration_context.exploration_state.metadata.exploration_terminal);
+          || explorationMetadata.exploration_terminal
+          || (explorationState && ["succeeded", "failed", "cancelled"].includes(String(explorationState.status || "")));
+        if (explorationTerminal && explorerStatus && !isTerminalExplorerStatus(explorerStatus)) {
+          explorerStatus = explorationMetadata.status_text && isTerminalExplorerStatus(explorationMetadata.status_text)
+            ? explorationMetadata.status_text
+            : "DONE (exploration finished)";
+        }
         const mappingDiag = data.mapping_chain_diagnostics || {};
         const liveMap = mappingDiag.live_map_provider || {};
         const cloudPub = mappingDiag.point_cloud_publisher || {};
@@ -2014,7 +2034,7 @@ def _render_debug_page(access_token: str) -> str:
         setKv(els.navigationMeta, [
           ["navigation", summarizeContext(data.navigation_context, "navigation_state")],
           ["exploration", summarizeContext(data.exploration_context, "exploration_state")],
-          ["explorer_status", explorerStatus || "--"],
+          ["explorer_status", explorerStatus ? normalizeExplorerStatusText(explorerStatus) : "--"],
           ["exploration_terminal", explorationTerminal === true ? "true" : (explorationTerminal === false ? "false" : "--")],
           ["frontier_count", frontierCount === null || frontierCount === undefined ? "--" : frontierCount],
           ["waiting_for", waitingFor],

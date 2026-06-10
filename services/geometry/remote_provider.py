@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import grpc
 
+from contracts.frame_semantics import infer_frame_role
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
@@ -77,6 +78,78 @@ def _build_frame_tree(transforms: Any) -> Optional[FrameTree]:
         return None
 
 
+def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Transform]) -> Optional[FrameTree]:
+    """把装配期缓存的静态外参边合并进每帧重建的 frame_tree。
+
+    设计约束（见评测报告 §4.5 不变量）：
+    1. frame_tree 每帧由 gRPC 全量重建，本函数在重建后合并，不在 _build_frame_tree
+       纯函数里做一次性注入（那样会被下一帧覆盖）。
+    2. 静态边只新增标定自有的 child（如相机光学系），**禁止覆盖** map/odom/base
+       等动态定位链；child 已存在或角色属动态链时跳过。
+    3. 静态边声明的 parent 是端侧 driver 的 base 命名（如 world/go2/base），可能与
+       实机 tf 实际发布的 base 串（base_footprint/base_link）不同。这里按语义角色把
+       parent 重锚定到“当前帧真实存在的 base 节点串”，否则静态边会成为孤岛、
+       camera→map 路径不可达。找不到 base 节点则跳过该边（不兜底、不投错链）。
+    """
+    if not static_edges or frame_tree is None:
+        return frame_tree
+    existing = list(frame_tree.transforms)
+    present_children = {t.child_frame_id for t in existing}
+    present_frames = set()
+    for t in existing:
+        present_frames.add(t.parent_frame_id)
+        present_frames.add(t.child_frame_id)
+    # 当前帧真实存在的 base 节点串（按语义角色匹配，取第一个角色为 base 的 frame）。
+    live_base_frame = next((f for f in present_frames if infer_frame_role(f) == "base"), None)
+
+    merged = list(existing)
+    appended = 0
+    for edge in static_edges:
+        # 守护：child 已存在 → 跳过，绝不覆盖既有边（含动态链）。
+        if edge.child_frame_id in present_children:
+            continue
+        # 守护：静态边的 child 不得是 map/odom/base 等动态语义角色。
+        if infer_frame_role(edge.child_frame_id) in {"map", "odom", "world", "base"}:
+            LOGGER.warning("拒绝合并静态外参边：child=%s 属动态定位链角色", edge.child_frame_id)
+            continue
+        # 重锚定 parent 到当前帧真实 base 节点串。
+        parent_frame = edge.parent_frame_id
+        if parent_frame not in present_frames:
+            if live_base_frame is None:
+                LOGGER.warning(
+                    "静态外参边 parent=%s 在当前 frame_tree 不存在且无 base 节点可锚定，跳过 child=%s",
+                    parent_frame, edge.child_frame_id,
+                )
+                continue
+            if infer_frame_role(parent_frame) == "base":
+                parent_frame = live_base_frame
+            else:
+                LOGGER.warning(
+                    "静态外参边 parent=%s 既不在当前 frame_tree 也非 base 角色，跳过 child=%s",
+                    parent_frame, edge.child_frame_id,
+                )
+                continue
+        try:
+            merged.append(
+                Transform(
+                    parent_frame_id=parent_frame,
+                    child_frame_id=edge.child_frame_id,
+                    translation=edge.translation,
+                    rotation=edge.rotation,
+                )
+            )
+            appended += 1
+        except Exception:  # pragma: no cover - 非法 frame_id
+            continue
+    if appended == 0:
+        return frame_tree
+    try:
+        return FrameTree(root_frame_id=frame_tree.root_frame_id, transforms=merged)
+    except Exception:  # pragma: no cover
+        return frame_tree
+
+
+
 class RosBridgeProvider:
     """统一的 RosBridgeProvider，封装所有 gRPC 调用。"""
 
@@ -85,6 +158,17 @@ class RosBridgeProvider:
         self._channel: Optional[grpc.Channel] = None
         self._stub: Optional[pb2_grpc.GeometryRuntimeStub] = None
         self._connected = False
+        # 装配期一次性缓存的静态外参边（相机光学系等），每帧 get_frame_tree 合并。
+        self._static_extrinsic_edges: List[Transform] = []
+
+    def set_static_extrinsics(self, edges: List[Transform]) -> None:
+        """装配期由平台几何运行时注入静态外参边（来自 CalibrationProvider）。
+
+        外参为静态值，此处缓存一次；get_frame_tree 每帧重建后零 I/O 合并这些边，
+        既不被全量重建覆盖，又不引入运行时读盘/高频写。重复调用以最新一次为准。
+        """
+        self._static_extrinsic_edges = list(edges or [])
+        LOGGER.info("已缓存 %d 条静态外参边用于 frame_tree 合并", len(self._static_extrinsic_edges))
 
     def connect(self) -> bool:
         """连接到 Rust 子进程的 gRPC server。"""
@@ -140,7 +224,8 @@ class RosBridgeProvider:
             return None
         try:
             resp = self._stub.GetFrameTree(pb2.Empty())
-            return _build_frame_tree(resp.transforms)
+            frame_tree = _build_frame_tree(resp.transforms)
+            return _merge_static_edges(frame_tree, self._static_extrinsic_edges)
         except grpc.RpcError:
             return None
 

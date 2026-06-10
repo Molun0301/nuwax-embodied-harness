@@ -412,16 +412,77 @@ class VisionToMapProjectionService:
         return center_u, center_v, "bbox_center"
 
     def _backproject_pixel_with_depth(self, *, pixel_u: float, pixel_v: float, depth_m: float, camera_info) -> Vector3:
-        centered_x = (float(pixel_u) - float(camera_info.cx)) * float(depth_m) / max(1e-6, float(camera_info.fx))
-        centered_y = (float(pixel_v) - float(camera_info.cy)) * float(depth_m) / max(1e-6, float(camera_info.fy))
+        """像素 + 深度 → 相机光学系 3D 点，按 camera_info.distortion_model 反畸变。
+
+        归一化坐标 (x_n, y_n) 先按畸变模型反畸变，再乘深度得相机系坐标
+        （光学系：+X 右、+Y 下、+Z 前）。畸变系数全 0 时严格退化为针孔。
+        不预设鱼眼——模型由 Phase0 实机棋盘格残差裁定并写入 camera_info。
+        """
+        fx = max(1e-6, float(camera_info.fx))
+        fy = max(1e-6, float(camera_info.fy))
+        # 畸变像素 → 归一化坐标（含畸变）
+        x_d = (float(pixel_u) - float(camera_info.cx)) / fx
+        y_d = (float(pixel_v) - float(camera_info.cy)) / fy
+        x_n, y_n = self._undistort_normalized(x_d, y_d, camera_info)
         return Vector3(
-            x=float(centered_x),
-            y=float(centered_y),
+            x=float(x_n * float(depth_m)),
+            y=float(y_n * float(depth_m)),
             z=float(depth_m),
         )
 
+    @staticmethod
+    def _undistort_normalized(x_d: float, y_d: float, camera_info) -> Tuple[float, float]:
+        """把含畸变的归一化坐标反算为无畸变归一化坐标。
+
+        - plumb_bob / rational_polynomial：径向切向 (k1,k2,p1,p2[,k3]) 迭代反解。
+        - fisheye / equidistant（Kannala-Brandt）：等距角度模型 (k1..k4) 反解。
+        - 其他/无系数：原样返回（针孔）。
+        """
+        model = (getattr(camera_info, "distortion_model", None) or "").strip().lower()
+        coeffs = [float(c) for c in (getattr(camera_info, "distortion_coefficients", None) or [])]
+        if not coeffs or not any(abs(c) > 1e-12 for c in coeffs):
+            return x_d, y_d
+
+        if model in ("fisheye", "equidistant", "kannala_brandt", "kb"):
+            k1 = coeffs[0] if len(coeffs) > 0 else 0.0
+            k2 = coeffs[1] if len(coeffs) > 1 else 0.0
+            k3 = coeffs[2] if len(coeffs) > 2 else 0.0
+            k4 = coeffs[3] if len(coeffs) > 3 else 0.0
+            theta_d = float((x_d * x_d + y_d * y_d) ** 0.5)
+            if theta_d < 1e-9:
+                return x_d, y_d
+            theta = theta_d
+            for _ in range(10):  # 牛顿迭代解 theta_d = theta(1+k1θ²+k2θ⁴+k3θ⁶+k4θ⁸)
+                t2 = theta * theta
+                poly = 1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4)))
+                d_poly = 1.0 + t2 * (3 * k1 + t2 * (5 * k2 + t2 * (7 * k3 + t2 * 9 * k4)))
+                f = theta * poly - theta_d
+                theta -= f / max(1e-9, d_poly)
+            scale = float(np.tan(theta) / theta_d) if theta_d > 1e-9 else 1.0
+            return x_d * scale, y_d * scale
+
+        # 默认 plumb_bob（径向切向），迭代反解
+        k1 = coeffs[0] if len(coeffs) > 0 else 0.0
+        k2 = coeffs[1] if len(coeffs) > 1 else 0.0
+        p1 = coeffs[2] if len(coeffs) > 2 else 0.0
+        p2 = coeffs[3] if len(coeffs) > 3 else 0.0
+        k3 = coeffs[4] if len(coeffs) > 4 else 0.0
+        x, y = x_d, y_d
+        for _ in range(10):
+            r2 = x * x + y * y
+            radial = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+            dx = 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
+            dy = p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+            radial = radial if abs(radial) > 1e-9 else 1e-9
+            x = (x_d - dx) / radial
+            y = (y_d - dy) / radial
+        return x, y
+
     def _lateral_offset_from_pixel(self, *, pixel_u: float, depth_m: float, camera_info) -> float:
-        return (float(pixel_u) - float(camera_info.cx)) * float(depth_m) / max(1e-6, float(camera_info.fx))
+        x_d = (float(pixel_u) - float(camera_info.cx)) / max(1e-6, float(camera_info.fx))
+        y_d = 0.0
+        x_n, _ = self._undistort_normalized(x_d, y_d, camera_info)
+        return float(x_n * float(depth_m))
 
     def _extract_points(
         self,

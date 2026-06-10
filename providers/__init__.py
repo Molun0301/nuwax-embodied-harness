@@ -1,6 +1,7 @@
 """平台统一提供器接口导出。"""
 
 from providers.base import BaseProvider
+from providers.calibration import CalibrationProvider
 from providers.exploration import ExplorationProvider
 from providers.image import ImageProvider, StreamingImageProvider
 from providers.localization import LocalizationProvider, StreamingLocalizationProvider
@@ -13,6 +14,7 @@ from providers.state import StateProvider, StreamingStateProvider
 
 __all__ = [
     "BaseProvider",
+    "CalibrationProvider",
     "ExplorationProvider",
     "ImageProvider",
     "StreamingImageProvider",

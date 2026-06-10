@@ -71,12 +71,30 @@ class _ShmVideoFrameSource:
     同一只读 mmap，互不冲突。来源: dev 分支 gateways/runtime.py。
     """
 
-    def __init__(self, shm_path: str) -> None:
+    def __init__(self, shm_path: str, camera_info_provider=None) -> None:
         self._shm_path = shm_path
         self._reader = None
         self._last_frame = None
         self._connected = False
+        # 平台侧零 import driver：经鸭子类型持有提供 get_camera_info() 的 provider
+        # （通常是 robot.providers）。用于给 SHM 帧注入真实内参与分辨率，消除硬编码旁路。
+        self._camera_info_provider = camera_info_provider
+        self._camera_info_cache = None
         self._ensure_open()
+
+    def _resolve_camera_info(self, camera_id):
+        """取一次相机内参并缓存（内参为静态物理参数，无需每帧重取）。"""
+        if self._camera_info_cache is not None:
+            return self._camera_info_cache
+        getter = getattr(self._camera_info_provider, "get_camera_info", None)
+        if not callable(getter):
+            return None
+        try:
+            info = getter(camera_id) if camera_id else getter()
+        except Exception:
+            return None
+        self._camera_info_cache = info
+        return info
 
     def _ensure_open(self) -> bool:
         if self._reader is not None and self._connected:
@@ -109,14 +127,37 @@ class _ShmVideoFrameSource:
         try:
             from contracts.image import ImageFrame, ImageEncoding
             from contracts.base import utc_now
+            resolved_camera_id = str(camera_id or "front_camera")
+            camera_info = self._resolve_camera_info(resolved_camera_id)
+            # 内参可用时用其真实分辨率与 frame_id；不可用时回退为实机推流实测
+            # 1920×1080 占位，并在 metadata 标注缺内参，由感知侧报错。
+            if camera_info is not None:
+                width_px = int(camera_info.width_px)
+                height_px = int(camera_info.height_px)
+                frame_id = str(camera_info.frame_id)
+            else:
+                width_px = 1920
+                height_px = 1080
+                frame_id = "go2/front_camera"
+            metadata = {
+                "source_kind": "platform_video_ingest_stream",
+                "ingest_sequence": _seq,
+                "ts_ns": ts_ns,
+                "width_px": width_px,
+                "height_px": height_px,
+            }
+            if camera_info is not None:
+                metadata["camera_info"] = camera_info
+            else:
+                metadata["camera_info_missing"] = "no_camera_info_provider"
             return ImageFrame(
-                camera_id=str(camera_id or "front_camera"),
-                frame_id="go2/front_camera",
-                width_px=1280,
-                height_px=720,
+                camera_id=resolved_camera_id,
+                frame_id=frame_id,
+                width_px=width_px,
+                height_px=height_px,
                 encoding=ImageEncoding.JPEG,
                 data=frame_bytes,
-                metadata={"source_kind": "platform_video_ingest_stream", "ingest_sequence": _seq, "ts_ns": ts_ns},
+                metadata=metadata,
             )
         except Exception:
             return None
@@ -363,7 +404,8 @@ class GatewayRuntime:
             stream_bus=self.stream_bus,
             video_frame_sink=None,
             video_frame_source=_ShmVideoFrameSource(
-                os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+                os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm"),
+                camera_info_provider=getattr(robot, "providers", None),
             ),
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),

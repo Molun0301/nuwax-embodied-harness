@@ -108,8 +108,8 @@ def load_sensor_topology_from_env() -> SensorTopology:
         camera_fy=_env_float("NUWAX_CAMERA_FY", 0.0),
         camera_cx=_env_float("NUWAX_CAMERA_CX", 0.0),
         camera_cy=_env_float("NUWAX_CAMERA_CY", 0.0),
-        camera_width_px=_env_int("NUWAX_CAMERA_WIDTH_PX", 1280),
-        camera_height_px=_env_int("NUWAX_CAMERA_HEIGHT_PX", 720),
+        camera_width_px=_env_int("NUWAX_CAMERA_WIDTH_PX", 1920),
+        camera_height_px=_env_int("NUWAX_CAMERA_HEIGHT_PX", 1080),
         camera_distortion_model=_env_str("NUWAX_CAMERA_DISTORTION_MODEL", "plumb_bob"),
         camera_distortion_coeffs=_env_float_list("NUWAX_CAMERA_DISTORTION_COEFFS"),
     )

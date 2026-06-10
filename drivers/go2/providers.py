@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
+from contracts.calibration import SensorTopology
 from contracts.geometry import FrameTree, Pose, Quaternion, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.common import MotionCommandDataPlane
-from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO
+from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO, GO2_DEFAULT_SENSOR_TOPOLOGY
+from providers.calibration import CalibrationProvider
 from providers.image import ImageProvider
 from providers.localization import StreamingLocalizationProvider
 from providers.motion import MotionControl
@@ -48,6 +50,7 @@ class Go2ProviderBundle(
     StreamingStateProvider,
     MotionControl,
     SafetyProvider,
+    CalibrationProvider,
 ):
     """Go2 默认提供器集合。"""
 
@@ -184,6 +187,14 @@ class Go2ProviderBundle(
         if camera_id:
             camera_info.camera_id = camera_id
         return camera_info
+
+    def get_sensor_topology(self) -> Optional[SensorTopology]:
+        """CalibrationProvider 接口：返回 Go2 传感器标定拓扑（外参初值 + 相机内参）。
+
+        外参为 URDF 建模值 + 光学坐标系修正的静态初值（端侧物理参数唯一真相源），
+        平台几何运行时装配期取一次合并进 frame_tree 静态边。见 drivers/go2/defaults.py。
+        """
+        return GO2_DEFAULT_SENSOR_TOPOLOGY.model_copy(deep=True)
 
     def subscribe_robot_state(self, callback: Callable[[RobotState], None]) -> Optional[int]:
         return self.subscribe_localization(lambda pose, frame_tree, metadata: callback(self._build_robot_state_from_stream(pose, metadata)))

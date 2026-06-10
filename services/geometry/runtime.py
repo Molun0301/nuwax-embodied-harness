@@ -863,12 +863,59 @@ class PlatformGeometryRuntime:
         if provider.connect():
             self._remote_provider = provider
             LOGGER.info("Rust ros-bridge gRPC 连接已建立")
+            self._inject_static_extrinsics(provider)
             for cb in self._pending_localization_callbacks:
                 self._remote_provider.subscribe_pose(cb)
             for cb in self._pending_map_callbacks:
                 self._remote_provider.subscribe_map_updates(cb)
         else:
             LOGGER.warning("Rust ros-bridge gRPC 连接失败，子进程仍在运行")
+
+    def _inject_static_extrinsics(self, provider: "RosBridgeProvider") -> None:
+        """装配期：从机器人 CalibrationProvider 取静态外参拓扑，缓存进 RosBridgeProvider。
+
+        平台侧零 import driver：经 self.robot.providers 鸭子类型取 get_sensor_topology，
+        将各 SensorPair 转为 Transform(parent=base, child=camera_optical) 静态边，由
+        provider 每帧合并进重建的 frame_tree。外参为静态值，此处只取一次。
+
+        无 CalibrationProvider / 无拓扑 / 转换失败时记诊断并跳过（不兜底、不投错链），
+        投影侧将因 camera→map 不可达而报错，符合“能用就用、不能用报错”契约。
+        """
+        from contracts.geometry import Transform
+
+        providers = getattr(self.robot, "providers", None)
+        topo_getter = getattr(providers, "get_sensor_topology", None)
+        if not callable(topo_getter):
+            LOGGER.info("机器人未提供 CalibrationProvider.get_sensor_topology，跳过静态外参注入")
+            return
+        try:
+            topology = topo_getter()
+        except Exception as exc:
+            self._record_runtime_diagnostic("static_extrinsics_topology", exc)
+            return
+        if topology is None or not getattr(topology, "pairs", None):
+            LOGGER.info("CalibrationProvider 返回空标定拓扑，跳过静态外参注入")
+            return
+
+        edges = []
+        for pair in topology.pairs:
+            try:
+                edges.append(
+                    Transform(
+                        parent_frame_id=pair.parent_frame_id,
+                        child_frame_id=pair.child_frame_id,
+                        translation=pair.initial_translation,
+                        rotation=pair.initial_rotation,
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - 非法 frame_id 等
+                self._record_runtime_diagnostic("static_extrinsics_pair", exc)
+                continue
+        if not edges:
+            LOGGER.warning("CalibrationProvider 拓扑未产出有效静态外参边")
+            return
+        provider.set_static_extrinsics(edges)
+        LOGGER.info("已装配 %d 条静态外参边（robot_id=%s）", len(edges), getattr(topology, "robot_id", "?"))
 
     def _monitor_runtime_loop(self) -> None:
         while not self._runtime_stop_event.wait(_GEOMETRY_MONITOR_INTERVAL_SEC):

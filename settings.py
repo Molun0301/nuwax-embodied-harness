@@ -352,11 +352,7 @@ class PerceptionYoloWorldConfig:
     enabled: bool = True
     backend_name: str = "yolo_world"
     model_name: str = str(BASE_DIR / "runtime_data" / "models" / "yolov8s-worldv2.pt")
-    runtime_preference: str = "auto"
-    engine_path: str = ""
     device: str = ""
-    half: bool = True
-    int8: bool = False
     image_size: int = 640
     confidence_threshold: float = 0.25
     iou_threshold: float = 0.45
@@ -704,11 +700,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "NUWAX_PERCEPTION_YOLO_WORLD_MODEL",
                 str(BASE_DIR / "runtime_data" / "models" / "yolov8s-worldv2.pt"),
             ),
-            runtime_preference=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME", "auto"),
-            engine_path=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH", ""),
             device=_cfg_str("NUWAX_PERCEPTION_YOLO_WORLD_DEVICE", ""),
-            half=_cfg_bool("NUWAX_PERCEPTION_YOLO_WORLD_HALF", True),
-            int8=_cfg_bool("NUWAX_PERCEPTION_YOLO_WORLD_INT8", False),
             image_size=max(32, _cfg_int("NUWAX_PERCEPTION_YOLO_WORLD_IMAGE_SIZE", 640)),
             confidence_threshold=max(
                 0.0,

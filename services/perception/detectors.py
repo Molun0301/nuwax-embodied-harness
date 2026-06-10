@@ -340,29 +340,23 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         *,
         name: str = "yolo_world",
         weights: str = "yolov8s-worldv2.pt",
-        runtime_preference: str = "auto",
-        engine_path: str = "",
         device: str = "",
-        half: bool = True,
-        int8: bool = False,
         confidence_threshold: float = 0.25,
         iou_threshold: float = 0.45,
         image_size: int = 640,
         max_detections: int = 100,
     ) -> None:
         self._weights = str(weights).strip() or "yolov8s-worldv2.pt"
-        self._runtime_preference = str(runtime_preference or "auto").strip().lower()
-        self._engine_path = str(engine_path).strip()
+        # 按模型文件后缀自动决定推理链路：.engine → TensorRT(YOLO 类)，其余 → PyTorch(YOLOWorld 开放词汇类)。
+        self._use_tensorrt = self._weights.lower().endswith(".engine")
         self._device = str(device).strip()
-        self._half = bool(half)
-        self._int8 = bool(int8)
         self._confidence_threshold = max(0.0, min(1.0, float(confidence_threshold)))
         self._iou_threshold = max(0.0, min(1.0, float(iou_threshold)))
         self._image_size = max(32, int(image_size))
         self._max_detections = max(1, int(max_detections))
         self._model = None
         self._resolved_model_source = ""
-        self._resolved_backend_kind = "yolo_world"
+        self._resolved_backend_kind = "yolo_world_tensorrt" if self._use_tensorrt else "yolo_world_pytorch"
         self._inference_worker = None
         self._use_worker_process = True  # 可通过子类或配置关闭
         provider_metadata = resolve_detection_provider_spec(
@@ -377,11 +371,8 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 "provider": provider_metadata,
                 **provider_metadata,
                 "weights": self._weights,
-                "runtime_preference": self._runtime_preference,
-                "engine_path": self._engine_path,
+                "runtime": "tensorrt" if self._use_tensorrt else "pytorch",
                 "device": self._device or "auto",
-                "half": self._half,
-                "int8": self._int8,
                 "supports_runtime_switch": True,
                 "input_contract": "ImageFrame/CameraInfo",
             },
@@ -407,7 +398,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 "raw_detection_count": len(detections_2d),
                 "weights": self._weights,
                 "model_source": self._resolved_model_source,
-                "runtime_preference": self._runtime_preference,
+                "runtime": "tensorrt" if self._use_tensorrt else "pytorch",
                 "device": self._device or "auto",
             },
         )
@@ -445,9 +436,8 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
             DETECTOR_LOGGER.warning("无法导入 YoloInferenceWorker，回退到主线程推理: %s", exc)
             self._use_worker_process = False
             return None
-        model_source, _ = self._resolve_model_source()
         worker = YoloInferenceWorker(
-            model_source,
+            self._weights,
             confidence_threshold=self._confidence_threshold,
             iou_threshold=self._iou_threshold,
             image_size=self._image_size,
@@ -472,43 +462,15 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
             raise RuntimeError(
                 "当前环境未安装 ultralytics，无法启用 YOLO-World 检测。"
             ) from exc
-        model_source, backend_kind = self._resolve_model_source()
-        self._model = YOLO(model_source)
-        self._resolved_model_source = model_source
-        self._resolved_backend_kind = backend_kind
+        self._model = YOLO(self._weights)
+        self._resolved_model_source = self._weights
+        self._resolved_backend_kind = self._resolved_backend_kind or "yolo_world"
         DETECTOR_LOGGER.info(
-            "YOLO-World 检测后端已加载 source=%s backend=%s preference=%s",
-            model_source,
-            backend_kind,
-            self._runtime_preference,
+            "YOLO-World 检测后端已加载 source=%s runtime=%s",
+            self._weights,
+            "tensorrt" if self._use_tensorrt else "pytorch",
         )
         return self._model
-
-    def _resolve_model_source(self) -> Tuple[str, str]:
-        weights_path = Path(self._weights)
-        explicit_engine_path = Path(self._engine_path) if self._engine_path else None
-
-        if weights_path.suffix.lower() == ".engine":
-            return str(weights_path), "yolo_world_tensorrt"
-
-        engine_candidates = []
-        if explicit_engine_path is not None:
-            engine_candidates.append(explicit_engine_path)
-        if weights_path.suffix:
-            engine_candidates.append(weights_path.with_suffix(".engine"))
-
-        if self._runtime_preference in ("tensorrt", "auto"):
-            for candidate in engine_candidates:
-                if candidate.exists():
-                    return str(candidate), "yolo_world_tensorrt"
-            if self._runtime_preference == "tensorrt":
-                DETECTOR_LOGGER.warning(
-                    "未找到 TensorRT 引擎，已回退到原始权重 source=%s candidates=%s",
-                    self._weights,
-                    [str(item) for item in engine_candidates],
-                )
-
-        return self._weights, "yolo_world_pytorch"
 
     def _normalize_yolo_result(
         self,
@@ -786,11 +748,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         *,
         name: str = "yolo_world",
         weights: str = "yolov8s-worldv2.pt",
-        runtime_preference: str = "pytorch",
-        engine_path: str = "",
         device: str = "",
-        half: bool = True,
-        int8: bool = False,
         confidence_threshold: float = 0.25,
         iou_threshold: float = 0.45,
         image_size: int = 640,
@@ -802,11 +760,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         super().__init__(
             name=name,
             weights=weights,
-            runtime_preference=runtime_preference,
-            engine_path=engine_path,
             device=device,
-            half=half,
-            int8=int8,
             confidence_threshold=confidence_threshold,
             iou_threshold=iou_threshold,
             image_size=image_size,
@@ -845,11 +799,8 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                 "provider": provider_metadata,
                 **provider_metadata,
                 "weights": self._weights,
-                "runtime_preference": self._runtime_preference,
-                "engine_path": self._engine_path,
+                "runtime": "tensorrt" if self._use_tensorrt else "pytorch",
                 "device": self._device or "auto",
-                "half": self._half,
-                "int8": self._int8,
                 "supports_runtime_switch": True,
                 "input_contract": "ImageFrame/CameraInfo",
                 "open_vocabulary": True,
@@ -876,7 +827,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             "open_vocabulary_class_source": class_source,
             "weights": self._weights,
             "model_source": self._resolved_model_source,
-            "runtime_preference": self._runtime_preference,
+            "runtime": "tensorrt" if self._use_tensorrt else "pytorch",
             "device": self._device or "auto",
         }
         image_bgr = decode_image_frame_to_bgr(image_frame)
@@ -939,21 +890,21 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         self._ensure_local_model_source_available()
         _ensure_torchvision_nms_fallback()
         try:
-            from ultralytics import YOLOWorld as model_class
-        except ImportError:
-            try:
-                from ultralytics import YOLO as model_class
-            except ImportError as exc:
-                raise RuntimeError("当前环境未安装 ultralytics，无法启用 YOLO-World 检测。") from exc
-        model_source, backend_kind = self._resolve_model_source()
-        self._model = model_class(model_source)
-        self._resolved_model_source = model_source
-        self._resolved_backend_kind = "yolo_world_tensorrt" if "tensorrt" in backend_kind else "yolo_world_pytorch"
+            from ultralytics import YOLO, YOLOWorld
+        except ImportError as exc:
+            raise RuntimeError("当前环境未安装 ultralytics，无法启用 YOLO-World 检测。") from exc
+        # 按后缀选链路：.engine → TensorRT(用 YOLO，类别已固化进引擎，set_classes 不可用)；
+        # 其余 → PyTorch(用 YOLOWorld 开放词汇类，set_classes 动态设类别)。
+        # 注意 YOLOWorld 无法加载 .engine（ultralytics 8.x 会报 'str' object has no attribute 'names'）。
+        model_class = YOLO if self._use_tensorrt else YOLOWorld
+        self._model = model_class(self._weights)
+        self._resolved_model_source = self._weights
+        self._resolved_backend_kind = self._resolved_backend_kind or "yolo_world"
         DETECTOR_LOGGER.info(
-            "YOLO-World 开放词汇检测后端已加载 source=%s backend=%s preference=%s",
-            model_source,
-            self._resolved_backend_kind,
-            self._runtime_preference,
+            "YOLO-World 开放词汇检测后端已加载 source=%s runtime=%s class=%s",
+            self._weights,
+            "tensorrt" if self._use_tensorrt else "pytorch",
+            model_class.__name__,
         )
         return self._model
 
@@ -974,7 +925,8 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         return list(model.predict(image_bgr, **kwargs))
 
     def _ensure_local_model_source_available(self) -> None:
-        candidate = Path(self._engine_path) if self._engine_path and self._runtime_preference == "tensorrt" else Path(self._weights)
+        # 校验本地模型文件存在（仅校验带目录的绝对/相对路径，纯文件名交给 ultralytics 自动下载）。
+        candidate = Path(self._weights)
         if candidate.is_absolute() or str(candidate.parent) not in {"", "."}:
             if not candidate.exists():
                 raise RuntimeError("YOLO-World 模型文件不存在：%s" % candidate)

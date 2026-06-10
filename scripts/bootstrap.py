@@ -809,8 +809,8 @@ class BootstrapPlanner:
                 }
             )
 
-        yolo_world_runtime = "tensorrt" if self.export_yolo_engine else "pytorch"
-        yolo_world_int8 = "false"
+        # 模型路径后缀即推理链路：导出引擎时指向 .engine(TensorRT)，否则 .pt(PyTorch 开放词汇)。
+        yolo_world_model = DEFAULT_YOLO_WORLD_ENGINE if self.export_yolo_engine else DEFAULT_YOLO_WORLD_MODEL
         if self.perception_mode == "local":
             values.update(
                 {
@@ -820,10 +820,7 @@ class BootstrapPlanner:
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "false",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_AUTO_START": "false",
-                    "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": DEFAULT_YOLO_WORLD_MODEL,
-                    "NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH": DEFAULT_YOLO_WORLD_ENGINE,
-                    "NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME": yolo_world_runtime,
-                    "NUWAX_PERCEPTION_YOLO_WORLD_INT8": yolo_world_int8,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": yolo_world_model,
                     "NUWAX_PERCEPTION_TRACKER_BACKEND": "bytetrack",
                 }
             )
@@ -836,10 +833,7 @@ class BootstrapPlanner:
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_AUTO_START": "false",
-                    "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": DEFAULT_YOLO_WORLD_MODEL,
-                    "NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH": DEFAULT_YOLO_WORLD_ENGINE,
-                    "NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME": yolo_world_runtime,
-                    "NUWAX_PERCEPTION_YOLO_WORLD_INT8": yolo_world_int8,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": yolo_world_model,
                     "NUWAX_PERCEPTION_TRACKER_BACKEND": "bytetrack",
                 }
             )
@@ -852,10 +846,7 @@ class BootstrapPlanner:
                     "NUWAX_PERCEPTION_OPENAI_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_ENABLED": "true",
                     "NUWAX_PERCEPTION_STREAM_AUTO_START": "false",
-                    "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": DEFAULT_YOLO_WORLD_MODEL,
-                    "NUWAX_PERCEPTION_YOLO_WORLD_ENGINE_PATH": DEFAULT_YOLO_WORLD_ENGINE,
-                    "NUWAX_PERCEPTION_YOLO_WORLD_RUNTIME": yolo_world_runtime,
-                    "NUWAX_PERCEPTION_YOLO_WORLD_INT8": yolo_world_int8,
+                    "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": yolo_world_model,
                     "NUWAX_PERCEPTION_TRACKER_BACKEND": "bytetrack",
                 }
             )

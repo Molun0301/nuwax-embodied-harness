@@ -27,11 +27,7 @@ def build_platform_perception_components(config: "NuwaxRobotBridgeConfig") -> Di
             YoloWorldDetectorBackend(
                 name=config.perception.yolo_world.backend_name,
                 weights=config.perception.yolo_world.model_name,
-                runtime_preference=config.perception.yolo_world.runtime_preference,
-                engine_path=config.perception.yolo_world.engine_path,
                 device=config.perception.yolo_world.device,
-                half=config.perception.yolo_world.half,
-                int8=config.perception.yolo_world.int8,
                 confidence_threshold=config.perception.yolo_world.confidence_threshold,
                 iou_threshold=config.perception.yolo_world.iou_threshold,
                 image_size=config.perception.yolo_world.image_size,

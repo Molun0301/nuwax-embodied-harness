@@ -1053,23 +1053,21 @@ def test_yolo_detector_backend_falls_back_for_invalid_mask_polygon() -> None:
     assert "stability_score" not in detection.attributes
 
 
-def test_yolo_detector_backend_prefers_engine_when_available(tmp_path: Path) -> None:
-    """当 TensorRT 引擎存在时，YOLO-World 后端应优先加载 .engine。"""
+def test_yolo_detector_backend_selects_runtime_by_suffix(tmp_path: Path) -> None:
+    """模型文件后缀决定推理链路：.engine → TensorRT，.pt → PyTorch 开放词汇。"""
 
-    weights_path = tmp_path / "yolov8s-world.pt"
     engine_path = tmp_path / "yolov8s-world.engine"
-    weights_path.write_bytes(b"fake-pt")
+    weights_path = tmp_path / "yolov8s-world.pt"
     engine_path.write_bytes(b"fake-engine")
+    weights_path.write_bytes(b"fake-pt")
 
-    backend = YoloWorldDetectorBackend(
-        weights=str(weights_path),
-        engine_path=str(engine_path),
-        runtime_preference="tensorrt",
-    )
-    resolved_source, backend_kind = backend._resolve_model_source()
+    engine_backend = YoloWorldDetectorBackend(weights=str(engine_path))
+    assert engine_backend._use_tensorrt is True
+    assert engine_backend.spec.metadata["runtime"] == "tensorrt"
 
-    assert resolved_source == str(engine_path)
-    assert backend_kind == "yolo_world_tensorrt"
+    pytorch_backend = YoloWorldDetectorBackend(weights=str(weights_path))
+    assert pytorch_backend._use_tensorrt is False
+    assert pytorch_backend.spec.metadata["runtime"] == "pytorch"
 
 
 def test_perception_service_enriches_detection_geometry_from_pointcloud(tmp_path: Path) -> None:

@@ -32,6 +32,7 @@ class PerceptionVideoRuntime:
         perception_service: PerceptionService,
         state_store: StateStore,
         localization_service=None,
+        live_pose_provider=None,
         mapping_service=None,
         memory_service=None,
         event_bus: Optional[EventBus] = None,
@@ -52,6 +53,7 @@ class PerceptionVideoRuntime:
         self._perception_service = perception_service
         self._state_store = state_store
         self._localization_service = localization_service
+        self._live_pose_provider = live_pose_provider
         self._mapping_service = mapping_service
         self._memory_service = memory_service
         self._event_bus = event_bus
@@ -387,17 +389,38 @@ class PerceptionVideoRuntime:
     def _resolve_runtime_context(self) -> Tuple[Optional[Pose], Optional[SemanticMapBuildResult]]:
         current_pose = None
         map_context = None
-        localization_service = self._localization_service
-        if localization_service is not None:
-            snapshot = self._refresh_service_snapshot(localization_service)
-            if snapshot is not None:
-                current_pose = snapshot.current_pose
+
+        # 优先取实时位姿源（SLAM/Nav2 map→base 实时 TF）：探索建图阶段定位会话
+        # 尚未重定位就绪（usable_pose 恒 None），但实时位姿随机器人移动/旋转持续更新，
+        # 是关键帧 translation/yaw 判定的有效依据。定位会话 pose 仅作重定位就绪后的兜底。
+        current_pose = self._read_live_pose()
+        if current_pose is None:
+            localization_service = self._localization_service
+            if localization_service is not None:
+                snapshot = self._refresh_service_snapshot(localization_service)
+                if snapshot is not None:
+                    current_pose = snapshot.current_pose
 
         mapping_service = self._mapping_service
         if mapping_service is not None:
             map_snapshot = self._refresh_service_snapshot(mapping_service)
             map_context = self._semantic_map_builder.build(map_snapshot)
         return current_pose, map_context
+
+    def _read_live_pose(self) -> Optional[Pose]:
+        """从实时位姿源（几何运行时 provider 门面）取当前位姿，鸭子类型，失败返回 None。"""
+        provider = self._live_pose_provider
+        if provider is None:
+            return None
+        getter = getattr(provider, "get_current_pose", None)
+        if not callable(getter):
+            return None
+        try:
+            pose = getter()
+        except Exception:
+            PERCEPTION_RUNTIME_LOGGER.debug("读取实时位姿失败。", exc_info=True)
+            return None
+        return pose if isinstance(pose, Pose) else None
 
     def _refresh_service_snapshot(self, service):
         refresher = getattr(service, "refresh", None)

@@ -414,6 +414,7 @@ class GatewayRuntime:
             perception_service=self.perception_service,
             state_store=self.state_store,
             localization_service=self.localization_service,
+            live_pose_provider=getattr(self.platform_geometry_runtime, "providers", None),
             mapping_service=self.mapping_service,
             event_bus=self.event_bus,
             enabled=config.perception.stream_runtime.enabled,

@@ -162,13 +162,24 @@ source "$SCRIPT_DIR/scripts/env.sh"
 source "$SCRIPT_DIR/scripts/load_platform_geometry_env.sh"
 
 if [[ "$PRINT_NAV2_PARAMS" -eq 1 ]]; then
-  NAV2_PARAMS_FILE="$SCRIPT_DIR/install/go2_nav/share/go2_nav/config/nav2_params.yaml"
-  if [[ ! -f "$NAV2_PARAMS_FILE" ]]; then
-    NAV2_PARAMS_FILE="$SCRIPT_DIR/src/go2_nav/config/nav2_params.yaml"
+  GO2_NAV_DIR="$SCRIPT_DIR/install/go2_nav/share/go2_nav"
+  if [[ ! -d "$GO2_NAV_DIR" ]]; then
+    GO2_NAV_DIR="$SCRIPT_DIR/src/go2_nav"
   fi
-  echo "[go2.sh] nav2_params = $NAV2_PARAMS_FILE"
+  EFFECTIVE_NAV2_PARAMS="$(
+    python3 - "$GO2_NAV_DIR" <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.path.join(sys.argv[1], "launch"))
+from geometry_launch_config import GeometryLaunchConfig, materialize_nav2_params
+
+print(materialize_nav2_params(sys.argv[1], GeometryLaunchConfig.from_env()))
+PY
+  )"
+  echo "[go2.sh] nav2_params (effective, patched from .env) = $EFFECTIVE_NAV2_PARAMS"
   echo
-  sed -n '1,260p' "$NAV2_PARAMS_FILE"
+  sed -n '1,260p' "$EFFECTIVE_NAV2_PARAMS"
   exit 0
 fi
 
@@ -285,6 +296,9 @@ echo "[go2.sh]   map_frame         = ${NUWAX_GEOMETRY_MAP_FRAME}"
 echo "[go2.sh]   odom_frame        = ${NUWAX_GEOMETRY_ODOM_FRAME}"
 echo "[go2.sh]   base_frame        = ${NUWAX_GEOMETRY_BASE_FRAME}"
 echo "[go2.sh]   lidar_frame       = ${NUWAX_GEOMETRY_LIDAR_FRAME}"
+echo "[go2.sh]   robot_radius      = ${NUWAX_GEOMETRY_ROBOT_RADIUS}"
+echo "[go2.sh]   inflation_radius  = ${NUWAX_GEOMETRY_INFLATION_RADIUS}"
+echo "[go2.sh]   inflation_scaling = ${NUWAX_GEOMETRY_INFLATION_COST_SCALING}"
 echo
 
 exec ros2 launch go2_nav "$LAUNCH" "database_path:=$DB_PATH"

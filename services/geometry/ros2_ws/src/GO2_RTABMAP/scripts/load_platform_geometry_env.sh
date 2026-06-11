@@ -42,6 +42,9 @@ _go2_load_env_value NUWAX_GEOMETRY_ODOM_FRAME "odom"
 _go2_load_env_value NUWAX_GEOMETRY_BASE_FRAME "base_link"
 _go2_load_env_value NUWAX_GEOMETRY_LIDAR_FRAME "utlidar_lidar"
 _go2_load_env_value NUWAX_GEOMETRY_IMU_TOPIC "/utlidar/imu"
+_go2_load_env_value NUWAX_GEOMETRY_ROBOT_RADIUS "0.30"
+_go2_load_env_value NUWAX_GEOMETRY_INFLATION_RADIUS "0.60"
+_go2_load_env_value NUWAX_GEOMETRY_INFLATION_COST_SCALING "2.5"
 _go2_load_env_value NUWAX_NAV2_ACTION_NAME "/navigate_to_pose"
 
 unset -f _go2_load_env_value

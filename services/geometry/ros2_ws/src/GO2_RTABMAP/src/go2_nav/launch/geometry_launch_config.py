@@ -12,6 +12,16 @@ def _env(name: str, default: str) -> str:
     return value or default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class GeometryLaunchConfig:
     odom_topic: str
@@ -23,6 +33,9 @@ class GeometryLaunchConfig:
     base_frame: str
     lidar_frame: str
     imu_topic: str
+    robot_radius: float
+    inflation_radius: float
+    inflation_cost_scaling: float
     nav2_action_name: str
 
     @classmethod
@@ -39,6 +52,11 @@ class GeometryLaunchConfig:
             base_frame=_env("NUWAX_GEOMETRY_BASE_FRAME", "base_link"),
             lidar_frame=_env("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),
             imu_topic=_env("NUWAX_GEOMETRY_IMU_TOPIC", "/utlidar/imu"),
+            robot_radius=_env_float("NUWAX_GEOMETRY_ROBOT_RADIUS", 0.30),
+            inflation_radius=_env_float("NUWAX_GEOMETRY_INFLATION_RADIUS", 0.60),
+            inflation_cost_scaling=_env_float(
+                "NUWAX_GEOMETRY_INFLATION_COST_SCALING", 2.5
+            ),
             nav2_action_name=_env("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
         )
 
@@ -72,12 +90,18 @@ def materialize_nav2_params(go2_nav_dir: str, cfg: GeometryLaunchConfig) -> str:
     local = data["local_costmap"]["local_costmap"]["ros__parameters"]
     local["global_frame"] = cfg.odom_frame
     local["robot_base_frame"] = cfg.base_frame
+    local["robot_radius"] = cfg.robot_radius
     local["obstacle_layer"]["scan"]["topic"] = cfg.scan_topic
+    local["inflation_layer"]["inflation_radius"] = cfg.inflation_radius
+    local["inflation_layer"]["cost_scaling_factor"] = cfg.inflation_cost_scaling
 
     global_cm = data["global_costmap"]["global_costmap"]["ros__parameters"]
     global_cm["global_frame"] = cfg.map_frame
     global_cm["robot_base_frame"] = cfg.base_frame
+    global_cm["robot_radius"] = cfg.robot_radius
     global_cm["obstacle_layer"]["scan"]["topic"] = cfg.scan_topic
+    global_cm["inflation_layer"]["inflation_radius"] = cfg.inflation_radius
+    global_cm["inflation_layer"]["cost_scaling_factor"] = cfg.inflation_cost_scaling
 
     runtime_dir = os.environ.get(
         "GO2_NAV2_PARAMS_RUNTIME_DIR",

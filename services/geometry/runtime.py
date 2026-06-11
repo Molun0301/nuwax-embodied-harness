@@ -5332,6 +5332,18 @@ class PlatformGeometryProviderBundle(
         backend = self.runtime._resolve_localization_backend()
         return None if backend is None else backend.get_current_pose()
 
+    def get_exploration_pose(self):
+        """探索/建图阶段的实时位姿：优先导航后端 map→base 实时 TF，定位会话后端仅兜底。
+
+        定位后端在重定位就绪前 get_current_pose() 恒返回 None，而探索建图时机器人
+        持续移动/旋转，需要实时位姿驱动关键帧判定，故复用 runtime._read_exploration_pose()
+        的优先级（导航后端实时 TF > 定位后端兜底）。
+        """
+
+        if not self._is_geometry_profile_enabled():
+            return None
+        return self.runtime._read_exploration_pose()
+
     def get_frame_tree(self):
         if not self._is_geometry_profile_enabled():
             return None

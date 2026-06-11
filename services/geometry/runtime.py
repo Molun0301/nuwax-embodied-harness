@@ -336,6 +336,7 @@ class PlatformGeometryRuntime:
         self._external_exploration_last_log_scan_at = 0.0
         self._live_mapping_diagnostics_cache: Optional[Dict[str, object]] = None
         self._live_mapping_diagnostics_cache_at = 0.0
+        self._external_geometry_session_mode: Optional[str] = None
         self.providers = PlatformGeometryProviderBundle(self)
 
     def start(self) -> None:
@@ -492,6 +493,17 @@ class PlatformGeometryRuntime:
         db_path = self._external_exploration_database_path_for_request(request)
         return [str(self._external_script_path()), "--explore", *passthrough_args, str(db_path)]
 
+    def _build_external_mapping_command(self, *, map_name: Optional[str] = None) -> List[str]:
+        mode_flags = {"-m", "--new", "--mapping", "-l", "--loc", "--localization", "-e", "--explore", "--exploration"}
+        passthrough_args = [arg for arg in self._external_args() if arg not in mode_flags]
+        request = ExploreAreaRequest(
+            request_id="manual_mapping",
+            map_name=str(map_name or "").strip() or None,
+            strategy="manual",
+        )
+        db_path = self._external_exploration_database_path_for_request(request)
+        return [str(self._external_script_path()), "--mapping", *passthrough_args, str(db_path)]
+
     def _external_exploration_database_path_for_request(self, request: Optional[ExploreAreaRequest]) -> Path:
         map_name = str(getattr(request, "map_name", "") or "").strip() if request is not None else ""
         if map_name:
@@ -539,6 +551,7 @@ class PlatformGeometryRuntime:
             self._external_exploration_terminal_state = None
             self._external_exploration_log_offset = None
             self._external_debug_frontier_payload = None
+            self._external_geometry_session_mode = None
             self._exploration_tick_count = 0
             self._exploration_last_tick_at_iso = None
             self._exploration_last_tick_monotonic = None
@@ -608,6 +621,22 @@ class PlatformGeometryRuntime:
             and process.is_running()
             and self._command_uses_external_exploration(process.command)
         )
+
+    @staticmethod
+    def _command_uses_external_mapping(command: List[str]) -> bool:
+        return any(str(part) in {"-m", "--new", "--mapping"} for part in command)
+
+    def _external_geometry_process_is_mapping(self) -> bool:
+        process = self._managed_processes.get(self._external_process_name())
+        return bool(
+            process is not None
+            and process.is_running()
+            and self._command_uses_external_mapping(process.command)
+        )
+
+    def _external_geometry_stack_is_running(self) -> bool:
+        process = self._managed_processes.get(self._external_process_name())
+        return bool(process is not None and process.is_running())
 
     @staticmethod
     def _command_uses_external_localization(command: List[str]) -> bool:
@@ -929,10 +958,14 @@ class PlatformGeometryRuntime:
                     return
 
     def _should_suppress_external_process_autorestart(self) -> bool:
-        """探索进行中或 finalize 落盘前，禁止 monitor 把外部栈自动拉回 --mapping live db。"""
+        """探索/建图会话或探索完成后保留几何时，禁止 monitor 自动重启 go2.sh。"""
 
         with self._exploration_loop_lock:
             if self._external_exploration_request is not None:
+                return True
+            if self._external_exploration_terminal_state is not None:
+                return True
+            if self._external_geometry_session_mode in {"mapping", "explore"}:
                 return True
             if self._external_exploration_database_path:
                 return True
@@ -1639,6 +1672,7 @@ class PlatformGeometryRuntime:
                 reason="external_explorer_terminal_status",
                 message=message,
                 notify_compat=False,
+                kill_geometry_process=False,
             )
         try:
             if terminal_state is not None:
@@ -4036,6 +4070,7 @@ class PlatformGeometryRuntime:
             reason="hit_stop",
             message=str(reason or "").strip() or "探索命中停机。",
             notify_compat=True,
+            kill_geometry_process=False,
         )
         self._notify_exploration_update(self.get_platform_exploration_state())
 
@@ -4087,6 +4122,7 @@ class PlatformGeometryRuntime:
             self._external_exploration_deadline_monotonic = None if duration_limit is None else now + duration_limit
             self._external_exploration_database_path = db_path
             self._external_exploration_terminal_state = None
+            self._external_geometry_session_mode = "explore"
             self._exploration_tick_count = 0
             self._exploration_last_tick_at_iso = None
             self._exploration_last_tick_monotonic = None
@@ -4110,6 +4146,7 @@ class PlatformGeometryRuntime:
                 message="GO2_RTABMAP 原生探索脚本启动失败。",
                 notify_compat=False,
                 process_status=process.status() if process is not None else None,
+                kill_geometry_process=True,
             )
             return False
         self._record_runtime_diagnostic(
@@ -4125,25 +4162,35 @@ class PlatformGeometryRuntime:
         if not has_request and terminal_state is None and not self._external_geometry_process_is_exploration():
             return False
         if terminal_state is not None:
-            # 终端状态已设置（探索已成功/失败/超时），不覆盖；仅兜底清理残留进程
-            process_name = self._external_process_name()
-            process = self._managed_processes.pop(process_name, None)
-            if process is not None and process.is_running():
-                process.stop(
-                    timeout_sec=10.0,
-                    graceful_launch_shutdown=True,
-                    graceful_timeout_sec=15.0,
-                )
             return True
         if cancel_navigation:
             self._cancel_platform_exploration_navigation()
         self._finish_external_script_exploration(
             status=ExplorationStatus.CANCELLED,
             reason="manual_cancel",
-            message="GO2_RTABMAP 原生探索任务已取消。",
+            message="GO2_RTABMAP 原生探索任务已取消；RTAB-Map/Nav2 仍保持运行，请使用 stop_mapping 结束几何栈。",
             notify_compat=notify_compat,
+            kill_geometry_process=False,
         )
         return True
+
+    def _kill_external_geometry_process(self) -> Optional[Dict[str, object]]:
+        process_name = self._external_process_name()
+        process = self._managed_processes.pop(process_name, None)
+        if process is None:
+            return None
+        process_status = process.status()
+        if process.is_running():
+            process.stop(
+                timeout_sec=15.0,
+                graceful_launch_shutdown=True,
+                graceful_timeout_sec=25.0,
+            )
+            time.sleep(3.0)
+            process_status = process.status()
+        with self._exploration_loop_lock:
+            self._external_geometry_session_mode = None
+        return process_status
 
     def _finish_external_script_exploration(
         self,
@@ -4153,17 +4200,14 @@ class PlatformGeometryRuntime:
         message: str,
         notify_compat: bool,
         process_status: Optional[Dict[str, object]] = None,
+        kill_geometry_process: bool = False,
     ) -> ExplorationState:
         process_name = self._external_process_name()
-        process = self._managed_processes.pop(process_name, None)
-        if process is not None and process.is_running():
-            process.stop(
-                timeout_sec=15.0,
-                graceful_launch_shutdown=True,
-                graceful_timeout_sec=25.0,
-            )
-            time.sleep(3.0)
-        if process_status is None and process is not None:
+        process = self._managed_processes.get(process_name)
+        if kill_geometry_process:
+            process_status = self._kill_external_geometry_process() or process_status
+            process = None
+        elif process_status is None and process is not None:
             process_status = process.status()
         with self._exploration_loop_lock:
             request = self._external_exploration_request
@@ -4182,6 +4226,12 @@ class PlatformGeometryRuntime:
         metadata["status_text"] = self._terminal_explorer_status_text(str(reason or ""), message)
         metadata.pop("waiting_for", None)
         metadata.pop("waiting_detail", None)
+        if not kill_geometry_process and self._external_geometry_stack_is_running():
+            metadata["geometry_stack_kept_alive"] = True
+            metadata["geometry_stack_stop_via"] = "stop_mapping"
+            metadata["geometry_stack_running"] = True
+        else:
+            metadata["geometry_stack_running"] = False
         state = ExplorationState(
             current_request_id=request.request_id if request is not None else None,
             status=status,
@@ -4194,9 +4244,166 @@ class PlatformGeometryRuntime:
             self._external_exploration_request = None
             self._external_exploration_deadline_monotonic = None
             self._external_exploration_log_offset = None
+            if kill_geometry_process:
+                self._external_geometry_session_mode = None
         if notify_compat:
             self._notify_compat_exploration_stopped()
         return state
+
+    def start_external_mapping(self, *, map_name: Optional[str] = None) -> Dict[str, object]:
+        """启动 go2.sh --mapping，供遥控/手动建图。"""
+
+        if not self._is_geometry_profile_enabled() or not self._uses_external_geometry_stack():
+            raise RuntimeError(self._removed_internal_stack_message())
+        self._ensure_external_geometry_observers_started()
+        process_name = self._external_process_name()
+        current_process = self._managed_processes.get(process_name)
+        command = self._build_external_mapping_command(map_name=map_name)
+        db_path = self._extract_external_exploration_database_path(command)
+        if db_path:
+            self._remove_rtabmap_database_files(Path(str(db_path)))
+        with self._exploration_loop_lock:
+            self._external_geometry_session_mode = "mapping"
+            self._external_exploration_terminal_state = None
+            self._external_exploration_request = None
+            self._external_exploration_started_at_monotonic = time.monotonic()
+            self._external_exploration_started_at_iso = _utc_now_iso()
+            self._external_exploration_deadline_monotonic = None
+            self._external_exploration_database_path = db_path
+        if current_process is not None:
+            self._managed_processes.pop(process_name, None)
+            current_process.stop(
+                timeout_sec=12.0,
+                graceful_launch_shutdown=True,
+                graceful_timeout_sec=15.0,
+            )
+            time.sleep(3.0)
+        self._map_stream_tracker = {}
+        with self._observer_occupancy_lock:
+            self._observer_occupancy_snapshot = {}
+        self._start_managed_process(process_name, command, self._external_log_name(), restart=True)
+        process = self._managed_processes.get(process_name)
+        if process is None or not process.is_running():
+            with self._exploration_loop_lock:
+                self._external_geometry_session_mode = None
+            raise RuntimeError("GO2_RTABMAP 手动建图脚本启动失败。")
+        self._record_runtime_diagnostic(
+            "external_go2_mapping_started",
+            "start_mapping 已委托 GO2_RTABMAP 脚本执行：%s" % process.command_display(),
+        )
+        return {
+            "mapping_launch_mode": "mapping",
+            "mapping_script": str(self._external_script_path()),
+            "mapping_command": command,
+            "mapping_database_path": db_path,
+            "mapping_version_id": self.get_exploration_pinned_version_id(),
+            "geometry_stack_running": True,
+        }
+
+    def get_geometry_stack_status(self) -> Dict[str, object]:
+        """返回 go2.sh 几何栈运行态，供 Agent 区分工作区 mapping 与真实 SLAM 进程。"""
+
+        process = self._managed_processes.get(self._external_process_name())
+        process_status = process.status() if process is not None else None
+        running = bool(process is not None and process.is_running())
+        command = list(process.command) if process is not None else []
+        launch_mode = None
+        if self._command_uses_external_exploration(command):
+            launch_mode = "explore"
+        elif self._command_uses_external_mapping(command):
+            launch_mode = "mapping"
+        elif self._command_uses_external_localization(command):
+            launch_mode = "localization"
+        with self._exploration_loop_lock:
+            session_mode = self._external_geometry_session_mode
+            terminal_state = self._external_exploration_terminal_state
+            has_active_exploration = self._external_exploration_request is not None
+            mapping_database_path = self._external_exploration_database_path
+            mapping_version_id = self._external_exploration_version_id
+        guidance = None
+        if not running:
+            guidance = (
+                "几何栈未运行。遥控建图请调用 start_mapping(map_name)；"
+                "自主探索请调用 explore_area(map_name)。"
+                "activate_map 仅切换工作区，不会启动 go2.sh。"
+            )
+        elif launch_mode == "mapping":
+            guidance = "遥控建图进行中：用户可遥控移动，完成后 save_active_map_version，再 stop_mapping。"
+        elif launch_mode == "explore" and terminal_state is not None:
+            guidance = (
+                "自主探索已结束，RTAB-Map/Nav2 仍在运行。"
+                "可继续手动导航/遥控，完成后 save_active_map_version，再 stop_mapping。"
+            )
+        elif launch_mode == "explore" and has_active_exploration:
+            guidance = "自主探索进行中；不要用 explore_area 启动遥控建图。"
+        return {
+            "geometry_stack_running": running,
+            "launch_mode": launch_mode,
+            "session_mode": session_mode,
+            "process_running": running,
+            "process_status": process_status,
+            "mapping_database_path": mapping_database_path,
+            "mapping_version_id": mapping_version_id,
+            "exploration_active": has_active_exploration,
+            "exploration_terminal": terminal_state is not None,
+            "teleop_mapping_api": "start_mapping",
+            "autonomous_explore_api": "explore_area",
+            "stop_geometry_stack_api": "stop_mapping",
+            "agent_guidance": guidance,
+        }
+
+    def stop_mapping(self, *, reason: str = "stop_mapping") -> Dict[str, object]:
+        """统一停止 go2.sh 几何栈（探索/遥控建图/定位均由该入口结束）。"""
+
+        with self._exploration_loop_lock:
+            has_request = self._external_exploration_request is not None
+            terminal_state = self._external_exploration_terminal_state
+            session_mode = self._external_geometry_session_mode
+        process_was_running = self._external_geometry_stack_is_running()
+        exploration_state: Optional[ExplorationState] = None
+        if has_request:
+            self._cancel_platform_exploration_navigation()
+            exploration_state = self._finish_external_script_exploration(
+                status=ExplorationStatus.CANCELLED,
+                reason=str(reason or "stop_mapping"),
+                message="GO2_RTABMAP 几何栈已通过 stop_mapping 停止。",
+                notify_compat=True,
+                kill_geometry_process=True,
+            )
+        else:
+            process_status = self._kill_external_geometry_process()
+            if terminal_state is not None and not process_was_running:
+                exploration_state = terminal_state.model_copy(deep=True)
+            elif terminal_state is not None:
+                metadata = dict(terminal_state.metadata or {})
+                metadata["geometry_stack_running"] = False
+                metadata["geometry_stack_stopped_via"] = str(reason or "stop_mapping")
+                exploration_state = terminal_state.model_copy(
+                    update={"metadata": metadata},
+                    deep=True,
+                )
+                with self._exploration_loop_lock:
+                    self._external_exploration_terminal_state = exploration_state
+            if exploration_state is not None:
+                self._notify_exploration_update(exploration_state)
+        stopped = not self._external_geometry_stack_is_running()
+        if not stopped and process_was_running:
+            raise RuntimeError("GO2_RTABMAP 几何栈停止失败，外部进程仍在运行。")
+        self._record_runtime_diagnostic(
+            "external_go2_mapping_stopped",
+            "stop_mapping 已停止 GO2_RTABMAP 几何栈 reason=%s session_mode=%s" % (reason, session_mode),
+        )
+        with self._exploration_loop_lock:
+            mapping_database_path = self._external_exploration_database_path
+        return {
+            "stopped": stopped,
+            "reason": str(reason or "stop_mapping"),
+            "session_mode": session_mode,
+            "geometry_stack_running": False,
+            "exploration_state": exploration_state.model_dump(mode="json") if exploration_state is not None else None,
+            "mapping_version_id": self.get_exploration_pinned_version_id(),
+            "mapping_database_path": mapping_database_path,
+        }
 
     def _external_exploration_duration_limit_sec(self, request: ExploreAreaRequest) -> Optional[float]:
         limits: List[float] = []
@@ -4778,6 +4985,7 @@ class PlatformGeometryRuntime:
             message=message,
             notify_compat=False,
             process_status=process_status,
+            kill_geometry_process=False,
         )
 
     def _should_scan_external_exploration_log(self) -> bool:
@@ -4850,6 +5058,7 @@ class PlatformGeometryRuntime:
                 message="GO2_RTABMAP 原生探索已达到最大时长，任务已结束。",
                 notify_compat=False,
                 process_status=process_status,
+                kill_geometry_process=False,
             )
             return self._augment_exploration_state_with_mapping_diagnostics(state)
 
@@ -4862,6 +5071,7 @@ class PlatformGeometryRuntime:
                     message="GO2_RTABMAP 原生探索脚本已正常退出。",
                     notify_compat=False,
                     process_status=process_status,
+                    kill_geometry_process=False,
                 )
                 return self._augment_exploration_state_with_mapping_diagnostics(state)
             state = self._finish_external_script_exploration(
@@ -4870,6 +5080,7 @@ class PlatformGeometryRuntime:
                 message="GO2_RTABMAP 原生探索脚本已退出，exit_code=%s。" % exit_code,
                 notify_compat=False,
                 process_status=process_status,
+                kill_geometry_process=False,
             )
             return self._augment_exploration_state_with_mapping_diagnostics(state)
 
@@ -4883,6 +5094,7 @@ class PlatformGeometryRuntime:
                 message=str(log_terminal["message"]),
                 notify_compat=False,
                 process_status=process_status,
+                kill_geometry_process=False,
             )
             return self._augment_exploration_state_with_mapping_diagnostics(state)
 
@@ -5331,6 +5543,18 @@ class PlatformGeometryProviderBundle(
             return None
         backend = self.runtime._resolve_localization_backend()
         return None if backend is None else backend.get_current_pose()
+
+    def get_exploration_pose(self):
+        """探索/建图阶段的实时位姿：优先导航后端 map→base 实时 TF，定位会话后端仅兜底。
+
+        定位后端在重定位就绪前 get_current_pose() 恒返回 None，而探索建图时机器人
+        持续移动/旋转，需要实时位姿驱动关键帧判定，故复用 runtime._read_exploration_pose()
+        的优先级（导航后端实时 TF > 定位后端兜底）。
+        """
+
+        if not self._is_geometry_profile_enabled():
+            return None
+        return self.runtime._read_exploration_pose()
 
     def get_frame_tree(self):
         if not self._is_geometry_profile_enabled():

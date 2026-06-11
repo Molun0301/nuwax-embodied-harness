@@ -216,6 +216,8 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
         "relocalize_active_map",
         "load_map_version",
         "save_active_map_version",
+        "start_mapping",
+        "stop_mapping",
     }
 )
 _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
@@ -223,6 +225,8 @@ _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
         "relocalize_active_map",
         "load_map_version",
         "save_active_map_version",
+        "start_mapping",
+        "stop_mapping",
     }
 )
 
@@ -1429,7 +1433,7 @@ class GatewayRuntime:
             _descriptor(
                 "activate_map",
                 "启用地图",
-                "启用一个命名地图工作区，并切换到其同名记忆库。",
+                "仅切换/启用地图工作区与记忆库，不启动 go2.sh。遥控建图需在 activate_map 后调用 start_mapping；自主探索用 explore_area。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -1493,6 +1497,50 @@ class GatewayRuntime:
                     },
                 ),
                 output_schema=_schema_object({"map_version": {"type": "object"}, "active_workspace": {"type": "object"}}),
+            ),
+            _descriptor(
+                "start_mapping",
+                "启动遥控建图",
+                "遥控/手动建图专用：启动 go2.sh --mapping（RTAB-Map+Nav2），不启动 frontier 探索、不下发探索点。"
+                "典型流程：create_map → activate_map → start_mapping → 用户遥控移动 → save_active_map_version → stop_mapping。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                    },
+                    required=("map_name",),
+                ),
+                output_schema=_schema_object(
+                    {
+                        "mapping_launch_mode": {"type": "string"},
+                        "mapping_database_path": {"type": "string"},
+                        "mapping_version_id": {"type": "string"},
+                        "geometry_stack_running": {"type": "boolean"},
+                    }
+                ),
+                required_resources=(RuntimeResource.NAVIGATION.value,),
+            ),
+            _descriptor(
+                "stop_mapping",
+                "停止几何建图栈",
+                "统一停止 go2.sh 托管的 RTAB-Map/Nav2 几何栈；自主探索结束不会自动调用，需显式 stop_mapping。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object(
+                    {
+                        "reason": {"type": "string"},
+                    },
+                ),
+                output_schema=_schema_object(
+                    {
+                        "stopped": {"type": "boolean"},
+                        "geometry_stack_running": {"type": "boolean"},
+                        "mapping_database_path": {"type": "string"},
+                        "mapping_version_id": {"type": "string"},
+                    }
+                ),
+                required_resources=(RuntimeResource.NAVIGATION.value,),
             ),
             _descriptor(
                 "load_map_version",
@@ -1856,7 +1904,8 @@ class GatewayRuntime:
             _descriptor(
                 "explore_area",
                 "探索区域",
-                "以统一探索接口发起前沿或覆盖式探索任务。",
+                "自主前沿探索：启动 go2.sh --explore 并由 frontier_explorer 自动导航建图。"
+                "非遥控建图；用户手动遥控建图必须用 start_mapping，不要用 explore_area。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -2061,6 +2110,8 @@ class GatewayRuntime:
             "get_active_map": self._handle_get_active_map,
             "list_map_versions": self._handle_list_map_versions,
             "save_active_map_version": self._handle_save_active_map_version,
+            "start_mapping": self._handle_start_mapping,
+            "stop_mapping": self._handle_stop_mapping,
             "load_map_version": self._handle_load_map_version,
             "list_memory_libraries": self._handle_list_memory_libraries,
             "create_memory_library": self._handle_create_memory_library,
@@ -2312,7 +2363,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="activate_map",
                 display_name="启用地图",
-                description="启用一个命名地图工作区，并切换到其同名记忆库。",
+                description="仅启用地图工作区，不启动 go2.sh。遥控建图后接 start_mapping；自主探索用 explore_area。",
                 category=SkillCategory.MEMORY,
                 capability_name="activate_map",
             ),
@@ -2326,7 +2377,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="get_active_map",
                 display_name="获取激活地图",
-                description="读取当前激活地图工作区摘要。",
+                description="读取激活地图工作区与 geometry_stack 状态；mapping_runtime_enabled=false 时需 start_mapping。",
                 category=SkillCategory.MEMORY,
                 capability_name="get_active_map",
             ),
@@ -2343,6 +2394,20 @@ class GatewayRuntime:
                 description="把当前激活地图工作区中的地图快照保存为平台版本。",
                 category=SkillCategory.MEMORY,
                 capability_name="save_active_map_version",
+            ),
+            SkillDescriptor(
+                name="start_mapping",
+                display_name="启动遥控建图",
+                description="遥控建图专用：go2.sh --mapping，无自主探索点。不要用 explore_area 代替遥控建图。",
+                category=SkillCategory.TASK,
+                capability_name="start_mapping",
+            ),
+            SkillDescriptor(
+                name="stop_mapping",
+                display_name="停止几何建图栈",
+                description="唯一入口停止 go2.sh（RTAB-Map/Nav2）。探索结束不会自动停栈，必须显式 stop_mapping。",
+                category=SkillCategory.TASK,
+                capability_name="stop_mapping",
             ),
             SkillDescriptor(
                 name="load_map_version",
@@ -2452,7 +2517,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="explore_area",
                 display_name="探索区域",
-                description="发起一次前沿或覆盖式探索任务。",
+                description="自主前沿探索（go2.sh --explore）。遥控建图请用 start_mapping，不要用 explore_area。",
                 category=SkillCategory.TASK,
                 capability_name="explore_area",
             ),
@@ -2715,6 +2780,8 @@ class GatewayRuntime:
                 "list_maps",
                 "get_active_map",
                 "delete_map",
+                "start_mapping",
+                "stop_mapping",
             }:
                 slim_result = self._slim_sync_map_capability_result(descriptor.name, result)
             return {
@@ -3196,12 +3263,17 @@ class GatewayRuntime:
             data = dict(workspace)
         else:
             return {}
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        runtime_readiness = metadata.get("runtime_readiness") if isinstance(metadata.get("runtime_readiness"), dict) else {}
         slim: Dict[str, Any] = {
             "active_map_name": data.get("active_map_name"),
             "active_memory_library_name": data.get("active_memory_library_name"),
             "map_loaded": data.get("map_loaded"),
             "localization_ready": data.get("localization_ready"),
             "mapping_runtime_enabled": data.get("mapping_runtime_enabled"),
+            "geometry_stack_running": runtime_readiness.get("geometry_stack_running"),
+            "geometry_stack_launch_mode": runtime_readiness.get("geometry_stack_launch_mode"),
+            "geometry_stack_agent_guidance": runtime_readiness.get("geometry_stack_agent_guidance"),
             "map_asset": GatewayRuntime._slim_map_asset(data.get("map_asset")),
         }
         if include_memory:
@@ -3287,6 +3359,18 @@ class GatewayRuntime:
                 slim.get("active_workspace"),
                 include_memory=include_memory,
             )
+        if "geometry_stack" in slim and isinstance(slim.get("geometry_stack"), dict):
+            stack = slim["geometry_stack"]
+            slim["geometry_stack"] = {
+                "geometry_stack_running": stack.get("geometry_stack_running"),
+                "launch_mode": stack.get("launch_mode"),
+                "teleop_mapping_api": stack.get("teleop_mapping_api"),
+                "autonomous_explore_api": stack.get("autonomous_explore_api"),
+                "stop_geometry_stack_api": stack.get("stop_geometry_stack_api"),
+                "agent_guidance": stack.get("agent_guidance"),
+            }
+        if slim.get("next_step_hint"):
+            slim["next_step_hint"] = str(slim.get("next_step_hint"))
         if "memory_summary" in slim:
             slim["memory_summary"] = self._slim_memory_summary(slim.get("memory_summary"))
         if "maps" in slim:
@@ -3769,9 +3853,12 @@ class GatewayRuntime:
             self._refresh_workspace_snapshots(refresh_localization=False)
         self._sync_perception_runtime_for_memory_state(enabled=True)
         active_workspace = self.map_workspace_service.get_active_workspace(refresh_localization=False) or active_workspace
+        geometry_stack = self._geometry_stack_summary()
         return {
             "active_workspace": active_workspace,
             "memory_summary": self.memory_service.get_summary(),
+            "geometry_stack": geometry_stack,
+            "next_step_hint": geometry_stack.get("agent_guidance"),
         }
 
     def _handle_delete_map(
@@ -3799,6 +3886,16 @@ class GatewayRuntime:
             "active_workspace": self.map_workspace_service.get_active_workspace(),
         }
 
+    def _geometry_stack_summary(self) -> Dict[str, Any]:
+        reader = getattr(self.platform_geometry_runtime, "get_geometry_stack_status", None)
+        if not callable(reader):
+            return {}
+        try:
+            return dict(reader())
+        except Exception:
+            RUNTIME_LOGGER.debug("读取 geometry_stack 状态失败。", exc_info=True)
+            return {}
+
     def _handle_get_active_map(
         self,
         _: Dict[str, Any],
@@ -3808,6 +3905,7 @@ class GatewayRuntime:
         del requested_by
         return {
             "active_workspace": self.map_workspace_service.get_active_workspace(),
+            "geometry_stack": self._geometry_stack_summary(),
         }
 
     def _handle_list_map_versions(
@@ -3840,6 +3938,48 @@ class GatewayRuntime:
             "map_version": map_version,
             "active_workspace": self.map_workspace_service.get_active_workspace(),
         }
+
+    def _handle_start_mapping(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        map_name, _workspace = self._resolve_map_workspace_for_request(
+            arguments,
+            capability_name="start_mapping",
+            requested_by=requested_by,
+            create_if_missing=True,
+        )
+        self._ensure_geometry_runtime_for_capability("start_mapping")
+        try:
+            launch_plan = self.platform_geometry_runtime.start_external_mapping(map_name=map_name)
+        except RuntimeError as exc:
+            raise GatewayError(str(exc), error_code="start_mapping_failed", http_status=503) from exc
+        launch_plan["map_name"] = map_name
+        launch_plan["requested_by"] = requested_by or "unknown"
+        launch_plan["geometry_stack"] = self._geometry_stack_summary()
+        launch_plan["next_step_hint"] = (
+            "go2.sh --mapping 已启动。请遥控机器狗移动建图；"
+            "完成后调用 save_active_map_version，再 stop_mapping。"
+        )
+        return launch_plan
+
+    def _handle_stop_mapping(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        self._ensure_geometry_runtime_for_capability("stop_mapping")
+        reason = str(arguments.get("reason", "")).strip() or "stop_mapping"
+        try:
+            result = self.platform_geometry_runtime.stop_mapping(reason=reason)
+        except RuntimeError as exc:
+            raise GatewayError(str(exc), error_code="stop_mapping_failed", http_status=503) from exc
+        self.navigation_service.refresh_exploration()
+        return result
 
     def _handle_load_map_version(
         self,
@@ -7036,7 +7176,7 @@ class GatewayRuntime:
                             "探索任务结束后刷新地图工作区失败 map_name=%s",
                             request.map_name,
                         )
-                # 兜底：无论任务是否成功完成，都确保外部探索进程被清理，防止残留进程导致系统越来越卡
+                # 探索结束后仅同步平台探索态，不杀 go2.sh；几何栈由 stop_mapping 统一结束。
                 try:
                     self.navigation_service.stop_exploration()
                 except Exception:
@@ -7293,9 +7433,9 @@ class GatewayRuntime:
         def _run_finalize() -> None:
             try:
                 try:
-                    self.navigation_service.stop_exploration()
+                    self.navigation_service.refresh_exploration()
                 except Exception:
-                    RUNTIME_LOGGER.debug("探索 finalize 前 stop_exploration 忽略异常", exc_info=True)
+                    RUNTIME_LOGGER.debug("探索 finalize 前 refresh_exploration 忽略异常", exc_info=True)
                 try:
                     delay_sec = max(0.0, float(os.environ.get("NUWAX_EXPLORE_FINALIZE_DELAY_SEC", "8")))
                 except (TypeError, ValueError):
@@ -7540,6 +7680,14 @@ class GatewayRuntime:
                 None,
             ),
             "save_active_map_version": (
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
+            ),
+            "start_mapping": (
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
+            ),
+            "stop_mapping": (
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
             ),

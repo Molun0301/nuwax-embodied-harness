@@ -38,6 +38,13 @@ _MCP_COLLECTIONS = {
     "device": {"display_name": "端侧设备功能集合", "layers": {"robot_private", "ops_debug"}},
 }
 
+# 这些能力除收录在 platform.function 枚举外，还以独立 MCP tool 暴露，
+# 避免 NuwaClaw 代理缓存的 platform 枚举漏掉新功能时 Agent 无法发现。
+_MCP_STANDALONE_PLATFORM_TOOLS: Tuple[str, ...] = (
+    "start_mapping",
+    "stop_mapping",
+)
+
 
 def _tool_layer(descriptor: SkillDescriptor) -> str:
     return str(getattr(descriptor, "metadata", {}).get("capability_layer") or "platform")
@@ -109,9 +116,30 @@ def _build_collection_input_schema(catalog: Dict[str, Dict[str, Any]]) -> Dict[s
     }
 
 
+def _build_standalone_platform_tools(platform_catalog: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    tools: List[Dict[str, Any]] = []
+    for tool_name in _MCP_STANDALONE_PLATFORM_TOOLS:
+        item = platform_catalog.get(tool_name)
+        if item is None:
+            continue
+        tools.append(
+            {
+                "name": tool_name,
+                "description": (
+                    f"{item['display_name']}。{item['description']} "
+                    "这是独立 MCP 工具，直接传参调用，不要走 platform.function。"
+                ),
+                "inputSchema": item["input_schema"],
+            }
+        )
+    return tools
+
+
 def _build_collection_tools(runtime: GatewayRuntime) -> List[Dict[str, Any]]:
     catalogs = _build_collection_catalogs(runtime)
-    return [
+    platform_catalog = catalogs["platform"]
+    standalone_tools = _build_standalone_platform_tools(platform_catalog)
+    collection_tools = [
         {
             "name": collection_name,
             "description": _build_collection_description(collection_name, catalogs[collection_name]),
@@ -119,6 +147,37 @@ def _build_collection_tools(runtime: GatewayRuntime) -> List[Dict[str, Any]]:
         }
         for collection_name in ("platform", "device")
     ]
+    if standalone_tools:
+        geometry_names = ", ".join(tool["name"] for tool in standalone_tools)
+        collection_tools[0]["description"] = (
+            f"平台侧功能集合。几何建图相关请优先使用独立 MCP 工具：{geometry_names}。"
+            "其余能力通过 function 选择，parameters 传参。\n"
+            + collection_tools[0]["description"]
+        )
+    return standalone_tools + collection_tools
+
+
+def _resolve_tool_invocation(
+    runtime: GatewayRuntime,
+    tool_name: str,
+    arguments: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    if tool_name in _MCP_COLLECTIONS:
+        return _resolve_collection_call(runtime, tool_name, arguments)
+
+    catalogs = _build_collection_catalogs(runtime)
+    for catalog in catalogs.values():
+        if tool_name in catalog:
+            parameters = arguments if isinstance(arguments, dict) else {}
+            return tool_name, parameters
+
+    raise GatewayError(
+        f"未知 MCP 工具: {tool_name}。",
+        error_code="invalid_params",
+        http_status=422,
+        jsonrpc_code=-32602,
+        details={"tool_name": tool_name},
+    )
 
 
 def _negotiate_protocol_version(params: Dict[str, Any]) -> str:
@@ -292,7 +351,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                         http_status=422,
                         jsonrpc_code=-32602,
                     )
-                function_name, function_arguments = _resolve_collection_call(runtime, name, arguments)
+                function_name, function_arguments = _resolve_tool_invocation(runtime, name, arguments)
                 try:
                     result = await run_in_threadpool(
                         lambda: runtime.invoke_tool(

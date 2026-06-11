@@ -211,12 +211,16 @@ class FrontierExplorer(Node):
             # do not miss the single volatile /frontiers heartbeat.
             if not self._shutdown_requested:
                 self._shutdown_requested = True
-                self.get_logger().info('Exploration complete. Shutting down frontier_explorer node.')
+                self.get_logger().info(
+                    'Exploration complete. Shutting down frontier_explorer node; '
+                    'RTAB-Map/Nav2 remain running until stop_mapping.'
+                )
                 for _ in range(3):
                     self.publish_status('DONE (exploration finished)')
                     time.sleep(0.2)
                 self.timer.cancel()
                 self.destroy_node()
+                # shutdown 仅结束本探索节点进程；RTAB-Map/Nav2 由独立进程托管，继续运行。
                 rclpy.shutdown()
             else:
                 self.publish_status('DONE (exploration finished)')

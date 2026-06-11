@@ -745,18 +745,34 @@ class MapWorkspaceService:
             external = processes.get("external_slam_nav2")
             if isinstance(external, dict):
                 process_running = bool(external.get("running"))
+        geometry_stack_status: Dict[str, object] = {}
+        stack_reader = getattr(self._geometry_runtime, "get_geometry_stack_status", None)
+        if callable(stack_reader):
+            try:
+                raw_stack = stack_reader()
+                if isinstance(raw_stack, dict):
+                    geometry_stack_status = raw_stack
+            except Exception:
+                geometry_stack_status = {}
+        geometry_stack_running = bool(geometry_stack_status.get("geometry_stack_running"))
         runtime_enabled = bool(
-            process_running
+            geometry_stack_running
+            or process_running
             or readiness.get("map_ready")
             or readiness.get("localization_ready")
             or readiness.get("streaming_ready")
         )
         return {
             "runtime_enabled": runtime_enabled,
+            "geometry_stack_running": geometry_stack_running,
+            "geometry_stack_launch_mode": geometry_stack_status.get("launch_mode"),
+            "geometry_stack_agent_guidance": geometry_stack_status.get("agent_guidance"),
             "map_loaded": bool(runtime_enabled and readiness.get("map_ready")),
             "localization_ready": bool(runtime_enabled and readiness.get("localization_ready")),
             "waiting_for": diagnostics.get("waiting_for") or readiness.get("waiting_for"),
-            "message": diagnostics.get("message") or readiness.get("message"),
+            "message": geometry_stack_status.get("agent_guidance")
+            or diagnostics.get("message")
+            or readiness.get("message"),
             "runtime_phase": runtime_status.get("phase"),
         }
 

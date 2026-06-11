@@ -42,6 +42,7 @@ from contracts.spatial_memory import (
     GroundingQueryPlan,
     InstanceDynamicState,
     InstanceLifecycleState,
+    InstanceMovability,
     NavigationCandidate,
     NavigationTrajectoryEvent,
     NavigationTrajectoryEventKind,
@@ -94,9 +95,14 @@ from services.memory.vectorizer import (
     build_text_embedder,
     build_vision_language_embedder,
 )
-from services.memory.vision_to_map_projection_service import ProjectedObservation, VisionToMapProjectionService
+from services.memory.vision_to_map_projection_service import (
+    InstanceCacheRayHistoryProvider,
+    ProjectedObservation,
+    VisionToMapProjectionService,
+)
 from services.observation_service import ObservationService
 from services.perception import PerceptionService
+from services.perception.deferred_pointcloud_projection import project_cone
 
 LOGGER = logging.getLogger(__name__)
 
@@ -181,6 +187,8 @@ class MemoryService:
         vision_language_embedder: Optional[VisionLanguageEmbedder] = None,
         vector_store: Optional[SQLiteNamedVectorStore] = None,
         evaluation_service: Optional[Any] = None,
+        deferred_projection_config: Optional[Any] = None,
+        accumulated_cloud_provider: Optional[Any] = None,
     ) -> None:
         self._localization_service = localization_service
         self._mapping_service = mapping_service
@@ -223,7 +231,21 @@ class MemoryService:
         )
         self._scene_space_sampler = SceneSpaceSampler()
         self._scene_space_understanding_adapter = SceneSpaceUnderstandingAdapter()
-        self._vision_projection_service = VisionToMapProjectionService()
+        self._deferred_projection_config = deferred_projection_config
+        self._accumulated_cloud_provider = accumulated_cloud_provider
+        _triangulation_enabled = bool(
+            getattr(deferred_projection_config, "triangulation_enabled", False)
+        )
+        self._vision_projection_service = VisionToMapProjectionService(
+            triangulation_enabled=_triangulation_enabled,
+            triangulation_min_rays=int(getattr(deferred_projection_config, "triangulation_min_rays", 2)),
+            triangulation_min_parallax_deg=float(
+                getattr(deferred_projection_config, "triangulation_min_parallax_deg", 5.0)
+            ),
+            triangulation_max_residual_m=float(
+                getattr(deferred_projection_config, "triangulation_max_residual_m", 0.5)
+            ),
+        )
         self._instance_association_service = InstanceAssociationService(
             text_embedder=self._text_embedder,
             inspection_pose_planner=self._inspection_pose_planner,
@@ -265,6 +287,11 @@ class MemoryService:
         self._pending_lock = threading.Lock()
         # ObservationEvent TTL 清理计数器：每 100 次写入触发一次过期清理
         self._observation_event_write_count: int = 0
+
+        # 延迟点云重投影精化 worker：低频扫描 pending 实例，用累积点云锥内取点精化坐标。
+        self._deferred_refine_worker: Optional[threading.Thread] = None
+        self._deferred_refine_stop_event = threading.Event()
+        self._instances_lock = threading.RLock()
 
     def is_enabled(self) -> bool:
         """返回记忆库当前是否已启用。"""
@@ -324,6 +351,7 @@ class MemoryService:
         self._active_library_name = resolved_name
         if load_history:
             self._load_persisted_memory(library_name=resolved_name)
+        self._start_deferred_refine_worker()
         summary = self.get_summary()
         self._publish_memory_event(
             "memory.library_enabled",
@@ -387,6 +415,7 @@ class MemoryService:
         """停用当前记忆库，并清空激活态缓存。"""
 
         previous_name = self._active_library_name
+        self._stop_deferred_refine_worker()
         self._clear_active_memory_state()
         self._memory_enabled = False
         self._active_library_name = None
@@ -4264,6 +4293,248 @@ class MemoryService:
         self._vectorization_worker = None
         logger.info("后台向量化 worker 已停止")
 
+    # ------------------------------------------------------------------
+    # 延迟点云重投影精化 worker（阶段2）
+    # ------------------------------------------------------------------
+
+    def _delayed_pointcloud_enabled(self) -> bool:
+        """延迟点云策略是否开启（delayed_pointcloud / triangulation_first）。"""
+
+        return bool(getattr(self._deferred_projection_config, "delayed_pointcloud_enabled", False))
+
+    def _start_deferred_refine_worker(self) -> None:
+        """启动延迟点云精化 worker（仅 delayed_pointcloud 策略 + 点云源就绪时）。"""
+
+        if not self._delayed_pointcloud_enabled():
+            return
+        if self._accumulated_cloud_provider is None:
+            logger.warning(
+                "NUWAX_PERCEPTION_DEFERRED_STRATEGY 含延迟点云，但未注入累积点云源；"
+                "延迟点云精化降级为仅三角化（不启动精化线程）。"
+            )
+            return
+        if self._deferred_refine_worker is not None and self._deferred_refine_worker.is_alive():
+            return
+        self._deferred_refine_stop_event.clear()
+        self._deferred_refine_worker = threading.Thread(
+            target=self._deferred_refine_worker_loop,
+            name="memory-deferred-refine-worker",
+            daemon=True,
+        )
+        self._deferred_refine_worker.start()
+        logger.info("延迟点云精化 worker 已启动")
+
+    def _stop_deferred_refine_worker(self) -> None:
+        """停止延迟点云精化 worker。"""
+
+        if self._deferred_refine_worker is None or not self._deferred_refine_worker.is_alive():
+            self._deferred_refine_worker = None
+            return
+        self._deferred_refine_stop_event.set()
+        self._deferred_refine_worker.join(timeout=10.0)
+        self._deferred_refine_worker = None
+        logger.info("延迟点云精化 worker 已停止")
+
+    def _deferred_refine_worker_loop(self) -> None:
+        """精化主循环：低频扫描 pending 实例，用累积点云锥内取点精化坐标。
+
+        仅 pending（navigable=False 待定位）且非动态、movability∈{STATIC,MOVABLE}
+        的实例才进入精化；空闲不拉点云。
+        """
+
+        interval = float(getattr(self._deferred_projection_config, "delayed_pc_refine_interval_sec", 6.0))
+        max_concurrency = int(getattr(self._deferred_projection_config, "delayed_pc_max_concurrency", 2))
+        while not self._deferred_refine_stop_event.is_set():
+            # 用 Event.wait 实现可中断 sleep；停用时立即返回。
+            if self._deferred_refine_stop_event.wait(timeout=max(1.0, interval)):
+                break
+            if not self._memory_enabled:
+                continue
+            try:
+                self._run_deferred_refine_pass(max_targets=max(1, max_concurrency))
+            except Exception:  # noqa: BLE001 - 精化线程不得因单轮异常退出
+                logger.exception("延迟点云精化轮次异常，跳过本轮")
+
+    def _select_deferred_refine_targets(self, *, max_targets: int) -> List[str]:
+        """挑选待精化实例 id：pending 待定位 + 非动态 + 有延迟投影缓存。
+
+        用 list() 取 GIL 原子快照迭代，避免主 ingest 路径并发改写导致
+        "dictionary changed size during iteration"。
+        """
+
+        targets: List[str] = []
+        snapshot = list(self._semantic_instances_by_id.items())
+        for instance_id, instance in snapshot:
+            metadata = instance.metadata or {}
+            if metadata.get("pending_localization") is not True:
+                continue
+            if not (instance.deferred_projection_cache or []):
+                continue
+            retry_count = self._coerce_optional_int(metadata.get("deferred_pc_retry_count")) or 0
+            max_retry = int(getattr(self._deferred_projection_config, "delayed_pc_max_retry", 3))
+            if retry_count > max_retry:
+                continue
+            # 动态守卫：DYNAMIC/QUASI_STATIC 不精化（位置无长期意义）。
+            if self._instance_dynamic_state(instance) in {
+                InstanceDynamicState.DYNAMIC,
+                InstanceDynamicState.QUASI_STATIC,
+            }:
+                continue
+            if instance.movability == InstanceMovability.TRANSIENT:
+                continue
+            targets.append(instance_id)
+            if len(targets) >= max_targets:
+                break
+        return targets
+
+    def _run_deferred_refine_pass(self, *, max_targets: int) -> None:
+        """单轮精化：仅 pending 非空时才拉取累积点云（空闲零开销）。"""
+
+        target_ids = self._select_deferred_refine_targets(max_targets=max_targets)
+        if not target_ids:
+            return
+        try:
+            cloud_xyz = self._accumulated_cloud_provider()
+        except Exception:  # noqa: BLE001
+            logger.exception("拉取累积点云失败，本轮精化跳过")
+            return
+        if cloud_xyz is None or getattr(cloud_xyz, "shape", (0,))[0] == 0:
+            return
+        for instance_id in target_ids:
+            if self._deferred_refine_stop_event.is_set():
+                break
+            try:
+                self._refine_instance_with_pointcloud(instance_id, cloud_xyz)
+            except Exception:  # noqa: BLE001
+                logger.exception("实例 %s 延迟点云精化异常", instance_id)
+
+    def _refine_instance_with_pointcloud(self, instance_id: str, cloud_xyz) -> None:
+        """对单个实例用最近一条缓存视锥做锥内取点；成功则覆盖坐标转 ACTIVE。"""
+
+        with self._instances_lock:
+            instance = self._semantic_instances_by_id.get(instance_id)
+            if instance is None:
+                return
+            cache = list(instance.deferred_projection_cache or [])
+        # 取最近一条带射线 + 半角的缓存条目。
+        entry = None
+        for candidate in reversed(cache):
+            if (
+                candidate.ray_origin_map
+                and candidate.ray_dir_map
+                and candidate.cone_half_angle_rad is not None
+            ):
+                entry = candidate
+                break
+        if entry is None:
+            return
+        min_points = int(getattr(self._deferred_projection_config, "delayed_pc_min_points", 5))
+        max_range = float(getattr(self._deferred_projection_config, "delayed_pc_max_range_m", 8.0))
+        result, count = project_cone(
+            cloud_xyz,
+            origin=(float(entry.ray_origin_map[0]), float(entry.ray_origin_map[1]), float(entry.ray_origin_map[2])),
+            direction=(float(entry.ray_dir_map[0]), float(entry.ray_dir_map[1]), float(entry.ray_dir_map[2])),
+            half_angle_rad=float(entry.cone_half_angle_rad),
+            min_points=min_points,
+            max_range_m=max_range,
+        )
+        if result is None:
+            self._record_deferred_refine_failure(instance_id, in_cone_count=count)
+            return
+        self._apply_deferred_refine_success(instance_id, result=result)
+
+    def _record_deferred_refine_failure(self, instance_id: str, *, in_cone_count: int) -> None:
+        """记录一次 fast-fail：retry 计数 +1，超限标 exhausted。"""
+
+        with self._instances_lock:
+            instance = self._semantic_instances_by_id.get(instance_id)
+            if instance is None:
+                return
+            metadata = dict(instance.metadata or {})
+            retry_count = (self._coerce_optional_int(metadata.get("deferred_pc_retry_count")) or 0) + 1
+            max_retry = int(getattr(self._deferred_projection_config, "delayed_pc_max_retry", 3))
+            metadata["deferred_pc_retry_count"] = retry_count
+            metadata["deferred_pc_last_in_cone_count"] = int(in_cone_count)
+            metadata["deferred_pc_status"] = (
+                "deferred_projection_exhausted" if retry_count > max_retry else "deferred_pointcloud_insufficient"
+            )
+            updated = instance.model_copy(update={"metadata": metadata}, deep=True)
+            self._semantic_instances_by_id[instance_id] = updated
+
+    def _apply_deferred_refine_success(self, instance_id: str, *, result) -> None:
+        """精化成功：覆盖坐标、清 pending、恢复 navigable；triangulation_first 做 cross-validation。"""
+
+        with self._instances_lock:
+            instance = self._semantic_instances_by_id.get(instance_id)
+            if instance is None:
+                return
+            metadata = dict(instance.metadata or {})
+            centroid = result.centroid
+            pc_pose = Pose(
+                frame_id=str(instance.pose.frame_id or "map"),
+                position=Vector3(x=float(centroid[0]), y=float(centroid[1]), z=float(centroid[2])),
+                orientation=instance.pose.orientation,
+            )
+            strategy = str(getattr(self._deferred_projection_config, "strategy", "") or "")
+            confidence = 0.85
+            projection_method = "delayed_pointcloud_projection"
+            xval_meta: Dict[str, object] = {}
+            # triangulation_first：与现存三角化坐标 cross-validation。
+            if strategy == "triangulation_first" and not bool(metadata.get("pending_localization")):
+                prev_method = str(metadata.get("projection_method") or "")
+                if prev_method == "ray_triangulation":
+                    dist = self._euclidean_distance(instance.pose, pc_pose)
+                    threshold = float(getattr(self._deferred_projection_config, "xval_threshold_m", 0.3))
+                    xval_meta["deferred_pc_xval_distance_m"] = round(float(dist), 4)
+                    if dist > threshold:
+                        # 分歧大：标 uncertain、降置信，仍采用点云坐标（更稠密）。
+                        confidence = 0.85 * 0.5
+                        xval_meta["deferred_pc_xval_agreement"] = False
+                    else:
+                        xval_meta["deferred_pc_xval_agreement"] = True
+            metadata.pop("pending_localization", None)
+            metadata["navigable"] = True
+            metadata.pop("non_navigable_reason", None)
+            metadata["projection_method"] = projection_method
+            metadata["projection_confidence"] = float(confidence)
+            metadata["support_point_count"] = int(result.point_count)
+            metadata["deferred_pc_status"] = "deferred_pointcloud_projected"
+            metadata["deferred_pc_point_count"] = int(result.point_count)
+            metadata["deferred_pc_mean_range_m"] = round(float(result.mean_range_m), 4)
+            metadata.update(xval_meta)
+            lifecycle = instance.lifecycle_state
+            if lifecycle == InstanceLifecycleState.UNCERTAIN:
+                lifecycle = InstanceLifecycleState.ACTIVE
+            updated = instance.model_copy(
+                update={"pose": pc_pose, "metadata": metadata, "lifecycle_state": lifecycle},
+                deep=True,
+            )
+            self._semantic_instances_by_id[instance_id] = updated
+        # 锁外做持久化（避免长时间持锁）。
+        self._write_semantic_instance_state(updated)
+        if self._is_long_term_static_instance(updated):
+            self._repository.upsert_semantic_instance(updated)
+            self._upsert_vector_point_for_instance(updated)
+        logger.info(
+            "实例 %s 延迟点云精化成功：%d 点，坐标=(%.3f, %.3f, %.3f)",
+            instance_id,
+            result.point_count,
+            result.centroid[0],
+            result.centroid[1],
+            result.centroid[2],
+        )
+
+    @staticmethod
+    def _euclidean_distance(pose_a: Pose, pose_b: Pose) -> float:
+        return float(
+            (
+                (float(pose_a.position.x) - float(pose_b.position.x)) ** 2
+                + (float(pose_a.position.y) - float(pose_b.position.y)) ** 2
+                + (float(pose_a.position.z) - float(pose_b.position.z)) ** 2
+            )
+            ** 0.5
+        )
+
     def _vectorization_worker_loop(self) -> None:
         """worker 主循环：从队列取任务，生成向量后写入 vector_store。"""
         while not self._vectorization_stop_event.is_set():
@@ -5514,11 +5785,15 @@ class MemoryService:
         if perception_context is None or current_pose is None:
             return
         map_context = self._refresh_semantic_map_context(map_snapshot)
+        ray_history = None
+        if getattr(self._deferred_projection_config, "triangulation_enabled", False):
+            ray_history = InstanceCacheRayHistoryProvider(self._semantic_instances_by_id.values())
         projected = self._vision_projection_service.project(
             perception_context,
             current_pose=current_pose,
             map_context=map_context,
             localization_snapshot=localization_snapshot,
+            ray_history=ray_history,
         )
         if not projected:
             return

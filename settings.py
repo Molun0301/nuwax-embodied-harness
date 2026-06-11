@@ -478,6 +478,38 @@ class VideoIngestConfig:
 
 
 @dataclass
+class DeferredProjectionConfig:
+    """延迟投影(射线三角化 / 延迟点云重投影)配置。
+
+    strategy 单轴枚举(消除 MODE×METHOD 笛卡尔积的无意义组合)：
+    - disabled：仅现有实时点云链(默认，向后兼容，=现状)
+    - triangulation：多视角射线三角化(L2 主推，不等点云，置信≤0.7)
+    - delayed_pointcloud：延迟点云重投影(稠密激光雷达/地面物品，等累积点云，置信0.85)
+    - triangulation_first：三角化即时 + 点云累积后 cross-validation(求更高精度)
+    """
+
+    strategy: str = "disabled"
+    triangulation_min_rays: int = 2
+    triangulation_min_parallax_deg: float = 5.0
+    triangulation_max_residual_m: float = 0.5
+    delayed_pc_min_points: int = 5
+    delayed_pc_max_retry: int = 3
+    delayed_pc_retry_interval_sec: float = 5.0
+    delayed_pc_max_range_m: float = 8.0
+    delayed_pc_refine_interval_sec: float = 6.0
+    delayed_pc_max_concurrency: int = 2
+    xval_threshold_m: float = 0.3
+
+    @property
+    def triangulation_enabled(self) -> bool:
+        return self.strategy in ("triangulation", "triangulation_first")
+
+    @property
+    def delayed_pointcloud_enabled(self) -> bool:
+        return self.strategy in ("delayed_pointcloud", "triangulation_first")
+
+
+@dataclass
 class PerceptionConfig:
     """统一视觉感知配置。"""
 
@@ -490,6 +522,7 @@ class PerceptionConfig:
     segmentation: PerceptionSegmentationConfig = field(default_factory=PerceptionSegmentationConfig)
     stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
     video_ingest: VideoIngestConfig = field(default_factory=VideoIngestConfig)
+    deferred_projection: DeferredProjectionConfig = field(default_factory=DeferredProjectionConfig)
 
 
 @dataclass
@@ -578,6 +611,34 @@ class RelayServerConfig:
     upstream_base_url: str = "http://host.docker.internal:8766"
     incoming_tokens: Tuple[str, ...] = ()
     upstream_token: str = ""
+
+
+def _build_deferred_projection_config() -> DeferredProjectionConfig:
+    """构建延迟投影配置，校验 strategy 单轴枚举。"""
+
+    raw_strategy = _cfg_str("NUWAX_PERCEPTION_DEFERRED_STRATEGY", "disabled").strip().lower()
+    allowed = {"disabled", "triangulation", "delayed_pointcloud", "triangulation_first"}
+    if raw_strategy in allowed:
+        strategy = raw_strategy
+    else:
+        if raw_strategy:
+            logging.getLogger("nuwax.settings").warning(
+                "未知 NUWAX_PERCEPTION_DEFERRED_STRATEGY=%s，回退 disabled。", raw_strategy
+            )
+        strategy = "disabled"
+    return DeferredProjectionConfig(
+        strategy=strategy,
+        triangulation_min_rays=max(2, _cfg_int("NUWAX_PERCEPTION_TRIANGULATION_MIN_RAYS", 2)),
+        triangulation_min_parallax_deg=max(0.0, _cfg_float("NUWAX_PERCEPTION_TRIANGULATION_MIN_PARALLAX_DEG", 5.0)),
+        triangulation_max_residual_m=max(0.01, _cfg_float("NUWAX_PERCEPTION_TRIANGULATION_MAX_RESIDUAL_M", 0.5)),
+        delayed_pc_min_points=max(1, _cfg_int("NUWAX_PERCEPTION_DELAYED_PC_MIN_POINTS", 5)),
+        delayed_pc_max_retry=max(0, _cfg_int("NUWAX_PERCEPTION_DELAYED_PC_MAX_RETRY", 3)),
+        delayed_pc_retry_interval_sec=max(0.5, _cfg_float("NUWAX_PERCEPTION_DELAYED_PC_RETRY_INTERVAL_SEC", 5.0)),
+        delayed_pc_max_range_m=max(0.5, _cfg_float("NUWAX_PERCEPTION_DELAYED_PC_MAX_RANGE_M", 8.0)),
+        delayed_pc_refine_interval_sec=max(1.0, _cfg_float("NUWAX_PERCEPTION_DELAYED_PC_REFINE_INTERVAL_SEC", 6.0)),
+        delayed_pc_max_concurrency=max(1, _cfg_int("NUWAX_PERCEPTION_DELAYED_PC_MAX_CONCURRENCY", 2)),
+        xval_threshold_m=max(0.01, _cfg_float("NUWAX_PERCEPTION_DEFERRED_XVAL_THRESHOLD_M", 0.3)),
+    )
 
 
 def load_config() -> NuwaxRobotBridgeConfig:
@@ -803,6 +864,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         video_ingest=VideoIngestConfig(
             max_frame_age_sec=max(0.1, _cfg_float("NUWAX_VIDEO_INGEST_MAX_FRAME_AGE_SEC", 2.0)),
         ),
+        deferred_projection=_build_deferred_projection_config(),
     )
 
     external_input_bridge_enabled = _cfg_bool("NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED", False)

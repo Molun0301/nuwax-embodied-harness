@@ -60,10 +60,41 @@ class InstanceObservationWindowSample(TimestampedContract):
     """实例短时观测窗口样本。"""
 
     pose: Pose = Field(description="观察到的对象位姿，统一使用 map frame。")
+    observer_pose: Optional[Pose] = Field(
+        default=None,
+        description="观测时相机/机器人位姿(map frame)，区别于对象位姿，供射线三角化与延迟点云重投影使用。",
+    )
     bbox_xyxy: List[float] = Field(default_factory=list, description="观察时二维包围盒。")
     confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="观察置信度。")
     track_id: Optional[str] = Field(default=None, description="观察关联的跟踪标识。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class DeferredProjectionInput(ContractModel):
+    """延迟投影(射线三角化 / 点云重投影)所需的单次观测输入缓存。
+
+    独立于 observation_window 滚动窗口，不被 8 样本上限驱逐，
+    供 pending 实例在累积点云稠密后重投影时使用。
+    """
+
+    observer_pose: Pose = Field(description="观测时相机/机器人位姿(map frame)。")
+    bbox_xyxy: List[float] = Field(default_factory=list, description="观测时二维包围盒。")
+    track_id: Optional[str] = Field(default=None, description="观测关联的跟踪标识(三角化主键)。")
+    camera_frame_id: Optional[str] = Field(default=None, description="相机坐标系标识。")
+    fx: Optional[float] = Field(default=None, description="相机内参 fx。")
+    fy: Optional[float] = Field(default=None, description="相机内参 fy。")
+    cx: Optional[float] = Field(default=None, description="相机内参 cx。")
+    cy: Optional[float] = Field(default=None, description="相机内参 cy。")
+    image_width_px: Optional[int] = Field(default=None, description="图像宽度像素。")
+    image_height_px: Optional[int] = Field(default=None, description="图像高度像素。")
+    ray_origin_map: Optional[List[float]] = Field(default=None, description="射线光心(map frame, [x,y,z])。")
+    ray_dir_map: Optional[List[float]] = Field(default=None, description="射线方向单位向量(map frame, [x,y,z])。")
+    cone_half_angle_rad: Optional[float] = Field(
+        default=None,
+        description="bbox 角张成的视锥半角(弧度)，供延迟点云锥内取点。",
+    )
+    source_observation_id: Optional[str] = Field(default=None, description="来源观测事件标识。")
+    timestamp: Optional[datetime] = Field(default=None, description="观测时间。")
 
 
 class SpatialAnchor(TimestampedContract):
@@ -306,6 +337,10 @@ class SemanticInstance(TimestampedContract):
     observation_window: List[InstanceObservationWindowSample] = Field(
         default_factory=list,
         description="用于动态实体隔离的短时观测窗口。",
+    )
+    deferred_projection_cache: List[DeferredProjectionInput] = Field(
+        default_factory=list,
+        description="延迟投影(射线三角化/点云重投影)输入缓存，独立于 observation_window，不被 8 样本上限驱逐。",
     )
     lifecycle_state: InstanceLifecycleState = Field(
         default=InstanceLifecycleState.ACTIVE,

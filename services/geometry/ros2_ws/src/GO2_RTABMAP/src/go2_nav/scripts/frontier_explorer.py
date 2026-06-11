@@ -161,6 +161,7 @@ class FrontierExplorer(Node):
         self.consecutive_failures = 0
         self.exploration_done = False
         self._shutdown_requested = False
+        self._idle_heartbeat_timer = None
 
         # Wall-clock startup time used for the initial grace period.
         self.start_time = self.get_clock().now().nanoseconds * 1e-9
@@ -205,25 +206,32 @@ class FrontierExplorer(Node):
     def plan_cb(self, msg: Path):
         self.latest_plan = msg
 
+    def _publish_done_heartbeat(self):
+        if not self.exploration_done:
+            return
+        self.publish_status('DONE (exploration finished)')
+
     def tick(self):
         if self.exploration_done:
-            # Publish DONE several times so late subscribers (platform debug observer)
-            # do not miss the single volatile /frontiers heartbeat.
+            # 探索结束：停止派点，但保持本节点进程存活，避免 ros2 launch/go2.sh 随子进程退出。
+            # RTAB-Map/Nav2 仅由平台 stop_mapping 统一结束。
             if not self._shutdown_requested:
                 self._shutdown_requested = True
                 self.get_logger().info(
-                    'Exploration complete. Shutting down frontier_explorer node; '
+                    'Exploration complete. frontier_explorer is idle; '
                     'RTAB-Map/Nav2 remain running until stop_mapping.'
                 )
                 for _ in range(3):
                     self.publish_status('DONE (exploration finished)')
                     time.sleep(0.2)
                 self.timer.cancel()
-                self.destroy_node()
-                # shutdown 仅结束本探索节点进程；RTAB-Map/Nav2 由独立进程托管，继续运行。
-                rclpy.shutdown()
-            else:
-                self.publish_status('DONE (exploration finished)')
+                if self.active_goal_handle is not None:
+                    try:
+                        self.active_goal_handle.cancel_goal_async()
+                    except Exception:
+                        pass
+                self._clear_active_goal()
+                self._idle_heartbeat_timer = self.create_timer(10.0, self._publish_done_heartbeat)
             return
 
         now = self.get_clock().now().nanoseconds * 1e-9

@@ -606,6 +606,17 @@ class NavigationService:
             self._current_explore_request = None
         return context
 
+    def sync_exploration_after_task(self) -> ExplorationContext:
+        """探索任务自然结束后的轻量同步：不杀 go2.sh，不标 CANCELLED。"""
+
+        provider = self._get_exploration_provider()
+        sync_hook = getattr(provider, "sync_exploration_after_task", None)
+        if callable(sync_hook):
+            sync_hook()
+        else:
+            provider.stop_exploration()
+        return self.refresh_exploration()
+
     def explore_until_complete(
         self,
         request: ExploreAreaRequest,

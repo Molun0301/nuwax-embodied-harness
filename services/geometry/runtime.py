@@ -1051,6 +1051,8 @@ class PlatformGeometryRuntime:
         for name, process in self._managed_processes.items():
             if process.is_running():
                 continue
+            if name == self._external_process_name() and self._should_suppress_external_process_autorestart():
+                continue
             exit_code = process.poll()
             if exit_code is None:
                 continue
@@ -4062,6 +4064,17 @@ class PlatformGeometryRuntime:
             return False
         return self._stop_platform_exploration_loop(cancel_navigation=True, notify=True)
 
+    def sync_platform_exploration_after_task(self) -> bool:
+        """探索任务收尾：自然完成时仅同步状态，不取消 Nav2、不杀 go2.sh。"""
+
+        if not self._is_geometry_profile_enabled():
+            return False
+        with self._exploration_loop_lock:
+            if self._external_exploration_terminal_state is not None:
+                self._notify_exploration_update(self.get_platform_exploration_state())
+                return True
+        return self._stop_platform_exploration_loop(cancel_navigation=False, notify=True)
+
     def report_platform_exploration_hit_stop(self, reason: str) -> None:
         if not self._is_geometry_profile_enabled():
             return
@@ -4077,13 +4090,16 @@ class PlatformGeometryRuntime:
     def _stop_platform_exploration_loop(self, *, cancel_navigation: bool, notify: bool) -> bool:
         thread = None
         with self._exploration_loop_lock:
+            if self._external_exploration_terminal_state is not None:
+                if notify:
+                    self._notify_exploration_update(self.get_platform_exploration_state())
+                return True
             self._exploration_loop_stop_event.set()
             self._exploration_loop_generation += 1
             thread = self._exploration_loop_thread
-        current_goal = None
         stopped = self._stop_external_script_exploration(
             cancel_navigation=cancel_navigation,
-            notify_compat=True,
+            notify_compat=cancel_navigation,
         )
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.2, self._exploration_loop_interval_sec() * 2.0))
@@ -5227,6 +5243,7 @@ class PlatformGeometryRuntime:
             "exploration reached a terminal state",
             "done (exploration finished)",
             "no frontiers found. exploration complete",
+            "frontier_explorer is idle",
             "shutting down frontier_explorer node",
         )
         complete_pos = max((normalized.rfind(marker) for marker in complete_markers), default=-1)
@@ -5733,6 +5750,11 @@ class PlatformGeometryProviderBundle(
         if not self._is_geometry_profile_enabled():
             return False
         return self.runtime.stop_platform_exploration()
+
+    def sync_exploration_after_task(self) -> bool:
+        if not self._is_geometry_profile_enabled():
+            return False
+        return self.runtime.sync_platform_exploration_after_task()
 
     def subscribe_exploration_updates(self, callback) -> Optional[int]:
         if not self._is_geometry_profile_enabled():

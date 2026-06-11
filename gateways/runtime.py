@@ -7435,9 +7435,9 @@ class GatewayRuntime:
                             "探索任务结束后刷新地图工作区失败 map_name=%s",
                             request.map_name,
                         )
-                # 探索结束后仅同步平台探索态，不杀 go2.sh；几何栈由 stop_mapping 统一结束。
+                # 探索自然结束时仅同步平台态；go2.sh/RTAB-Map/Nav2 由 stop_mapping 统一结束。
                 try:
-                    self.navigation_service.stop_exploration()
+                    self.navigation_service.sync_exploration_after_task()
                 except Exception:
                     pass
                 self._detach_perception_from_exploration()

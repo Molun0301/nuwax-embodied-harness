@@ -316,7 +316,10 @@ class ExternalGeometryDebugObserver:
         data = [int(value) for value in list(getattr(msg, "data", []) or [])]
         if width <= 0 or height <= 0 or resolution <= 0.0 or len(data) != width * height:
             raise ValueError("invalid occupancy grid dimensions")
-        frame_id = str(getattr(header, "frame_id", "") or self.config.frames.map_frame or "map")
+        frame_id = self._normalize_frame_id(
+            str(getattr(header, "frame_id", "") or self.config.frames.map_frame or "map"),
+            "map",
+        )
         origin_msg = getattr(info, "origin", None)
         position_msg = getattr(origin_msg, "position", None)
         orientation_msg = getattr(origin_msg, "orientation", None)

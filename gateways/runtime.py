@@ -4277,6 +4277,139 @@ class GatewayRuntime:
         )
         return {"semantic_memory": entry}
 
+    def dispatch_debug_nav2_goal(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Debug 面板直通 Nav2 action：绕过 navigate_to_pose 任务链与资源锁。"""
+
+        pose = self._build_pose_from_arguments(arguments)
+        map_name = str(arguments.get("map_name", "")).strip() or None
+        goal = NavigationGoal(
+            goal_id=self._build_runtime_request_id("debug_nav2"),
+            map_name=map_name,
+            target_pose=pose,
+            tolerance_position_m=self._float(arguments, "tolerance_position_m", 0.3),
+            tolerance_yaw_rad=self._float(arguments, "tolerance_yaw_rad", 0.3),
+            metadata={
+                "force_nav2_goal": True,
+                "requested_by": requested_by or "debug_panel",
+                "source": "debug_panel_direct",
+            },
+        )
+        provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
+        if provider is None:
+            raise GatewayError(
+                "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
+                error_code="nav2_provider_unavailable",
+                http_status=503,
+            )
+        accept_timeout_sec = self._float(arguments, "accept_timeout_sec", 8.0)
+        result = provider.send_goal_direct(goal, accept_timeout_sec=accept_timeout_sec)
+        result = dict(result)
+        result["target_pose"] = pose.model_dump(mode="json")
+        result["direct_nav2"] = True
+        if not bool(result.get("accepted")) and not bool(result.get("pending")):
+            raise GatewayError(
+                str(result.get("message") or "Nav2 拒绝导航目标。"),
+                error_code="nav2_goal_rejected",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details=result,
+            )
+        yaw_rad = self._float(arguments, "yaw_rad", 0.0)
+        robot_pose = None
+        try:
+            robot_pose = provider._read_current_pose()
+        except Exception:
+            robot_pose = None
+        robot_xy = None
+        if robot_pose is not None and getattr(robot_pose, "position", None) is not None:
+            robot_xy = (
+                float(robot_pose.position.x),
+                float(robot_pose.position.y),
+                str(getattr(robot_pose, "frame_id", "") or ""),
+            )
+        RUNTIME_LOGGER.info(
+            "debug_nav2_goal direct dispatch goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s yaw=%.3f robot=%s accepted=%s pending=%s action=%s message=%s",
+            goal.goal_id,
+            float(pose.position.x),
+            float(pose.position.y),
+            float(pose.position.z),
+            pose.frame_id,
+            yaw_rad,
+            robot_xy,
+            result.get("accepted"),
+            result.get("pending"),
+            result.get("action_name"),
+            result.get("message"),
+        )
+        if robot_xy is not None:
+            result["robot_pose"] = {
+                "frame_id": robot_xy[2] or pose.frame_id,
+                "x": robot_xy[0],
+                "y": robot_xy[1],
+            }
+            result["distance_m"] = math.hypot(
+                float(pose.position.x) - robot_xy[0],
+                float(pose.position.y) - robot_xy[1],
+            )
+        return result
+
+    def dispatch_debug_clicked_point(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Debug 面板 RViz Publish Point：发布 /clicked_point，不触发导航。"""
+
+        pose = self._build_pose_from_arguments(arguments)
+        provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
+        if provider is None:
+            raise GatewayError(
+                "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
+                error_code="nav2_provider_unavailable",
+                http_status=503,
+            )
+        result = dict(provider.publish_clicked_point(pose))
+        result["target_pose"] = pose.model_dump(mode="json")
+        result["requested_by"] = requested_by or "debug_panel"
+        if not bool(result.get("published")):
+            raise GatewayError(
+                str(result.get("message") or "发布 /clicked_point 失败。"),
+                error_code="clicked_point_publish_failed",
+                http_status=503,
+                details=result,
+            )
+        robot_pose = None
+        try:
+            robot_pose = provider._read_current_pose()
+        except Exception:
+            robot_pose = None
+        if robot_pose is not None and getattr(robot_pose, "position", None) is not None:
+            robot_x = float(robot_pose.position.x)
+            robot_y = float(robot_pose.position.y)
+            result["robot_pose"] = {
+                "frame_id": str(getattr(robot_pose, "frame_id", "") or pose.frame_id),
+                "x": robot_x,
+                "y": robot_y,
+            }
+            result["distance_m"] = math.hypot(float(pose.position.x) - robot_x, float(pose.position.y) - robot_y)
+        RUNTIME_LOGGER.info(
+            "debug_clicked_point publish topic=%s point=(%.3f, %.3f, %.3f) frame=%s robot=%s distance_m=%s",
+            result.get("topic"),
+            float(pose.position.x),
+            float(pose.position.y),
+            float(pose.position.z),
+            pose.frame_id,
+            result.get("robot_pose"),
+            result.get("distance_m"),
+        )
+        return result
+
     def _handle_navigate_to_pose(
         self,
         arguments: Dict[str, Any],
@@ -4291,19 +4424,24 @@ class GatewayRuntime:
             create_if_missing=False,
         )
         self._refresh_workspace_snapshots()
-        self._ensure_localization_ready(
+        self._ensure_localization_for_navigation(
             capability_name="navigate_to_pose",
             map_name=map_name,
             workspace=workspace,
+            requested_by=requested_by,
+            arguments=arguments,
         )
         pose = self._build_pose_from_arguments(arguments)
+        goal_metadata = {"requested_by": requested_by or "unknown"}
+        if bool(arguments.get("force_nav2_goal", False)):
+            goal_metadata["force_nav2_goal"] = True
         goal = NavigationGoal(
             goal_id=self._build_runtime_request_id("nav_pose"),
             map_name=map_name,
             target_pose=pose,
             tolerance_position_m=self._float(arguments, "tolerance_position_m", 0.3),
             tolerance_yaw_rad=self._float(arguments, "tolerance_yaw_rad", 0.3),
-            metadata={"requested_by": requested_by or "unknown"},
+            metadata=goal_metadata,
         )
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
         timeout_sec = self._resolve_async_timeout("navigate_to_pose", arguments, minimum_sec=0.1)
@@ -5572,6 +5710,127 @@ class GatewayRuntime:
                 ),
             },
         )
+
+    def _ensure_live_navigation_ready(
+        self,
+        *,
+        capability_name: str,
+        map_name: str,
+        force_nav2_goal: bool = False,
+    ):
+        """在实时位姿与 Nav2 action 可用时，允许直接下发导航目标（对齐 RViz 2D Goal）。"""
+
+        localization_snapshot = self.localization_service.get_latest_snapshot()
+        if localization_snapshot is None or localization_snapshot.current_pose is None:
+            raise GatewayError(
+                "当前没有可用实时位姿，无法执行 %s。" % capability_name,
+                error_code="localization_unavailable",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={"map_name": map_name, "capability_name": capability_name},
+            )
+        nav2_provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
+        if nav2_provider is not None:
+            readiness = nav2_provider._readiness_force() if force_nav2_goal else None
+            if readiness is not None:
+                if readiness.ready:
+                    RUNTIME_LOGGER.info(
+                        "trust_live_navigation: Nav2 action ready + live pose, bypass session gate for %s map=%s force=%s",
+                        capability_name,
+                        map_name,
+                        force_nav2_goal,
+                    )
+                    return localization_snapshot
+                raise GatewayError(
+                    readiness.message or "Nav2 未就绪，无法执行 %s。" % capability_name,
+                    error_code="nav2_not_ready",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={
+                        "map_name": map_name,
+                        "capability_name": capability_name,
+                        "waiting_for": readiness.waiting_for,
+                        "force_nav2_goal": force_nav2_goal,
+                    },
+                )
+        nav2_status = self.platform_geometry_runtime._build_nav2_status()
+        if not bool(nav2_status.get("ready")):
+            raise GatewayError(
+                str(nav2_status.get("message") or "Nav2 未就绪，无法执行 %s。" % capability_name),
+                error_code="nav2_not_ready",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    "map_name": map_name,
+                    "capability_name": capability_name,
+                    "waiting_for": nav2_status.get("waiting_for"),
+                    "nav2_status": nav2_status,
+                },
+            )
+        RUNTIME_LOGGER.info(
+            "trust_live_navigation: Nav2 ready + live pose available, bypass localization session gate for %s map=%s",
+            capability_name,
+            map_name,
+        )
+        return localization_snapshot
+
+    def _ensure_localization_for_navigation(
+        self,
+        *,
+        capability_name: str,
+        map_name: str,
+        workspace,
+        requested_by: Optional[str],
+        arguments: Dict[str, Any],
+    ):
+        force_nav2_goal = bool(arguments.get("force_nav2_goal", False))
+        trust_live_navigation = bool(arguments.get("trust_live_navigation", False))
+        if trust_live_navigation or force_nav2_goal:
+            try:
+                return self._ensure_localization_ready(
+                    capability_name=capability_name,
+                    map_name=map_name,
+                    workspace=workspace,
+                )
+            except GatewayError as exc:
+                if exc.error_code != "localization_unavailable":
+                    raise
+                return self._ensure_live_navigation_ready(
+                    capability_name=capability_name,
+                    map_name=map_name,
+                    force_nav2_goal=force_nav2_goal,
+                )
+        if bool(arguments.get("sync_localization_session", False)):
+            try:
+                self.map_workspace_service.sync_active_localization_session(
+                    refresh=True,
+                    metadata={"requested_by": requested_by or "unknown", "source": capability_name},
+                )
+            except Exception:
+                RUNTIME_LOGGER.debug("sync_active_localization_session failed", exc_info=True)
+        try:
+            return self._ensure_localization_ready(
+                capability_name=capability_name,
+                map_name=map_name,
+                workspace=workspace,
+            )
+        except GatewayError as exc:
+            if exc.error_code != "localization_unavailable":
+                raise
+            if bool(arguments.get("auto_relocalize", False)):
+                return self._ensure_localization_ready_or_relocalize(
+                    capability_name=capability_name,
+                    map_name=map_name,
+                    workspace=workspace,
+                    requested_by=requested_by,
+                )
+            if trust_live_navigation or force_nav2_goal:
+                return self._ensure_live_navigation_ready(
+                    capability_name=capability_name,
+                    map_name=map_name,
+                    force_nav2_goal=force_nav2_goal,
+                )
+            raise
 
     def _ensure_localization_ready_or_relocalize(
         self,
@@ -7850,7 +8109,7 @@ class GatewayRuntime:
         return providers is not None and isinstance(providers, provider_type)
 
     def _build_pose_from_arguments(self, arguments: Dict[str, Any]) -> Pose:
-        frame_id = self._require_str(arguments, "frame_id")
+        frame_id = str(self._require_str(arguments, "frame_id")).strip().lstrip("/") or "map"
         x = self._require_float(arguments, "x")
         y = self._require_float(arguments, "y")
         z = self._float(arguments, "z", 0.0)

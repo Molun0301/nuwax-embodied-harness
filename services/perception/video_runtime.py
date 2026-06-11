@@ -408,19 +408,28 @@ class PerceptionVideoRuntime:
         return current_pose, map_context
 
     def _read_live_pose(self) -> Optional[Pose]:
-        """从实时位姿源（几何运行时 provider 门面）取当前位姿，鸭子类型，失败返回 None。"""
+        """从实时位姿源（几何运行时 provider 门面）取当前位姿，鸭子类型，失败返回 None。
+
+        优先 get_exploration_pose()（探索建图时导航后端 map→base 实时 TF），
+        回退 get_current_pose()（定位会话后端，仅在重定位就绪后有值）。
+        """
         provider = self._live_pose_provider
         if provider is None:
             return None
-        getter = getattr(provider, "get_current_pose", None)
-        if not callable(getter):
-            return None
-        try:
-            pose = getter()
-        except Exception:
-            PERCEPTION_RUNTIME_LOGGER.debug("读取实时位姿失败。", exc_info=True)
-            return None
-        return pose if isinstance(pose, Pose) else None
+        for getter_name in ("get_exploration_pose", "get_current_pose"):
+            getter = getattr(provider, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                pose = getter()
+            except Exception:
+                PERCEPTION_RUNTIME_LOGGER.debug(
+                    "读取实时位姿失败 source=%s。", getter_name, exc_info=True
+                )
+                continue
+            if isinstance(pose, Pose):
+                return pose
+        return None
 
     def _refresh_service_snapshot(self, service):
         refresher = getattr(service, "refresh", None)

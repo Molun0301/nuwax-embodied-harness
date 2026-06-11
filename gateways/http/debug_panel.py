@@ -13,6 +13,8 @@ from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from gateways.errors import as_gateway_error
+
 from contracts.base import utc_now
 from contracts.debug_views import (
     DebugDataStatus,
@@ -146,6 +148,35 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         access_manager.authenticate_http(request)
         return _stream_migration_response('logs.entry')
 
+    @router.post("/api/debug/navigation/goal")
+    async def debug_navigation_goal(request: Request) -> JSONResponse:
+        """Debug 面板 2D Goal：直通 go2.sh 已拉起的 Nav2 action，不经 navigate_to_pose 任务链。"""
+
+        access_manager.authenticate_http(request)
+        body = await request.json()
+        arguments = dict(body or {})
+        try:
+            result = await run_in_threadpool(
+                lambda: runtime.dispatch_debug_nav2_goal(arguments, requested_by="debug_panel"),
+            )
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+        return JSONResponse(to_jsonable(result))
+
+    @router.post("/api/debug/map/clicked_point")
+    async def debug_map_clicked_point(request: Request) -> JSONResponse:
+        """Debug 面板 RViz Publish Point：发布 /clicked_point，不导航。"""
+
+        access_manager.authenticate_http(request)
+        body = await request.json()
+        arguments = dict(body or {})
+        try:
+            result = await run_in_threadpool(
+                lambda: runtime.dispatch_debug_clicked_point(arguments, requested_by="debug_panel"),
+            )
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+        return JSONResponse(to_jsonable(result))
 
     return router
 
@@ -384,6 +415,15 @@ def _render_debug_page(access_token: str) -> str:
     .map-toolbar { position: absolute; z-index: 2; left: 12px; top: 12px; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
     .map-control { min-height: 30px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface-strong); color: var(--accent-strong); padding: 5px 9px; font: inherit; font-size: 12px; font-weight: 740; cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease; }
     .map-control:hover { border-color: var(--accent); background: var(--panel-soft); }
+    .map-control.active { border-color: #34d399; background: rgba(52, 211, 153, 0.14); color: #6ee7b7; }
+    #mapCanvas.goal-pick { cursor: crosshair; }
+    #mapCanvas.goal-pick.pan-ready { cursor: grab; }
+    #mapCanvas.goal-pick.panning { cursor: grabbing; }
+    #mapCanvas.publish-point { cursor: crosshair; }
+    .map-goal-chip { position: absolute; z-index: 3; left: 12px; top: 50px; max-width: min(62vw, 420px); }
+    .map-goal-chip.ok { border-color: rgba(52, 211, 153, 0.45); color: #6ee7b7; }
+    .map-goal-chip.pending { border-color: rgba(250, 204, 21, 0.45); color: #fde68a; }
+    .map-goal-chip.error { border-color: rgba(248, 113, 113, 0.45); color: #fca5a5; }
     .map-chip { border: 1px solid var(--border-strong); background: var(--surface-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: var(--accent-strong); backdrop-filter: blur(10px); }
     .map-stream-chip { position: absolute; z-index: 2; right: 12px; top: 12px; max-width: min(520px, calc(100% - 24px)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .map-info-grid { grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); margin-top: 10px; max-height: 176px; overflow: auto; padding-right: 2px; }
@@ -563,18 +603,22 @@ def _render_debug_page(access_token: str) -> str:
             <div class="card-head">
               <div>
                 <div class="eyebrow">Live Spatial Canvas</div>
-                <h2>空间态势 · 2D 地图 / 定位 / 轨迹</h2>
+                <h2>空间态势 · 2D 地图 / 定位 / 轨迹 / 导航目标</h2>
               </div>
               <span id="mapStatus" class="pill missing">missing</span>
             </div>
             <div class="canvas-wrap">
-              <div class="map-toolbar" aria-label="地图缩放控制">
+              <div class="map-toolbar" aria-label="地图缩放与导航控制">
                 <button id="mapZoomOut" class="map-control" type="button">-</button>
                 <span id="mapZoomValue" class="map-chip">100%</span>
                 <button id="mapZoomIn" class="map-control" type="button">+</button>
                 <button id="mapZoomReset" class="map-control" type="button">reset</button>
+                <button id="mapCenterRobot" class="map-control" type="button" title="视图居中到机器人（RViz 风格）" hidden>居中</button>
+                <button id="mapGoalToggle" class="map-control" type="button" title="RViz 风格 2D Goal：北向 map、左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
+                <button id="mapPublishPointToggle" class="map-control" type="button" title="RViz Publish Point：左键发布 /clicked_point，不导航">选点</button>
                 <button id="mapModeToggle" class="map-control" type="button" style="font-size:11px;padding:2px 8px;">3D</button>
               </div>
+              <span id="mapGoalStatus" class="map-chip map-goal-chip" hidden></span>
               <span id="mapStreamStatus" class="map-chip map-stream-chip">等待地图首帧</span>
               <canvas id="mapCanvas" width="1180" height="680"></canvas>
               <div id="map3dContainer" style="width:100%;height:100%;min-height:480px;position:absolute;inset:0;display:none;"></div>
@@ -587,6 +631,9 @@ def _render_debug_page(access_token: str) -> str:
               <span class="legend-item"><span class="swatch" style="background: var(--nav-plan)"></span>规划路径</span>
               <span class="legend-item"><span class="swatch" style="background: var(--map-robot)"></span>机器人</span>
               <span class="legend-item"><span class="swatch" style="background: var(--frontier)"></span>探索前沿</span>
+              <span class="legend-item"><span class="swatch" style="background: #34d399"></span>导航目标</span>
+              <span class="legend-item"><span class="swatch" style="background: #38bdf8"></span>选点</span>
+              <span id="mapRvizHint" class="legend-item" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
             </div>
             <div id="mapEmpty" class="empty panel-meta">等待地图数据。</div>
             <div class="grid map-info-grid">
@@ -751,6 +798,10 @@ def _render_debug_page(access_token: str) -> str:
         robotStroke: "#fef3c7",
         goal: "#a78bfa",
         goalStroke: "#ddd6fe",
+        goalPick: "#34d399",
+        goalPickStroke: "#6ee7b7",
+        clickedPoint: "#38bdf8",
+        clickedPointStroke: "#7dd3fc",
         navPath: "#22ff66",
       };
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
@@ -787,11 +838,19 @@ def _render_debug_page(access_token: str) -> str:
         mapGrid: null,
         mapViewport: null,
         mapZoom: 1,
+        mapRvizView: { center: null, zoom: 1 },
+        mapPanDrag: null,
         mapStream: null,
         pose: null,
         trajectory: [],
         frontiers: [],
         goalPose: null,
+        goalPickMode: false,
+        publishPointMode: false,
+        goalPickDrag: null,
+        publishPointClick: null,
+        clickedPoints: [],
+        pendingNavGoal: null,
         navigationPath: [],
         logs: [],
         logCursor: 0,
@@ -866,7 +925,12 @@ def _render_debug_page(access_token: str) -> str:
         mapZoomIn: document.getElementById("mapZoomIn"),
         mapZoomOut: document.getElementById("mapZoomOut"),
         mapZoomReset: document.getElementById("mapZoomReset"),
+        mapCenterRobot: document.getElementById("mapCenterRobot"),
         mapZoomValue: document.getElementById("mapZoomValue"),
+        mapRvizHint: document.getElementById("mapRvizHint"),
+        mapGoalToggle: document.getElementById("mapGoalToggle"),
+        mapPublishPointToggle: document.getElementById("mapPublishPointToggle"),
+        mapGoalStatus: document.getElementById("mapGoalStatus"),
         mapStreamStatus: document.getElementById("mapStreamStatus"),
         mapStatus: document.getElementById("mapStatus"),
         mapEmpty: document.getElementById("mapEmpty"),
@@ -1234,8 +1298,29 @@ def _render_debug_page(access_token: str) -> str:
           setKv(els.logsMeta, [["error", message], ["前端接收", nowText()]]);
         }
       }
-      function originPosition(grid) { return grid && grid.origin && grid.origin.position ? grid.origin.position : { x: 0, y: 0 }; }
-      function originYaw(grid) { return yawFromPose(grid && grid.origin) || 0; }
+      function normalizeFrameId(value, fallback) {
+        const raw = String(value || fallback || "map").trim().replace(/^\/+/, "");
+        return raw || "map";
+      }
+      function gridResolution(grid) {
+        if (!grid) return 1;
+        const candidates = [grid.resolution_m, grid.resolution, grid.metadata && grid.metadata.resolution];
+        for (const value of candidates) {
+          const number = Number(value);
+          if (Number.isFinite(number) && number > 0) return number;
+        }
+        return 1;
+      }
+      function originPosition(grid) {
+        const origin = grid && grid.origin;
+        if (!origin) return { x: 0, y: 0, z: 0 };
+        if (origin.position) return origin.position;
+        if (origin.x !== undefined && origin.y !== undefined) {
+          return { x: Number(origin.x), y: Number(origin.y), z: Number(origin.z || 0) };
+        }
+        return { x: 0, y: 0, z: 0 };
+      }
+      function originYaw(grid) { return planarYawFromPose(grid && grid.origin) || 0; }
       function pointFromPose(pose) {
         const pos = pose && pose.position;
         if (!pos) return null;
@@ -1251,13 +1336,25 @@ def _render_debug_page(access_token: str) -> str:
         const cosy = 1 - 2 * ((Number(q.y) || 0) * (Number(q.y) || 0) + (Number(q.z) || 0) * (Number(q.z) || 0));
         return Math.atan2(siny, cosy);
       }
+      function planarYawFromPose(pose) {
+        const q = pose && pose.orientation;
+        if (!q) return yawFromPose(pose);
+        const x = Number(q.x) || 0;
+        const y = Number(q.y) || 0;
+        const z = Number(q.z) || 0;
+        const w = Number(q.w) || 1;
+        const forwardX = 1 - 2 * (y * y + z * z);
+        const forwardY = 2 * (x * y + w * z);
+        if (Math.hypot(forwardX, forwardY) < 1e-6) return yawFromPose(pose);
+        return Math.atan2(forwardY, forwardX);
+      }
       function mapCorners(grid) {
         if (!grid || !grid.width || !grid.height) return [];
         const origin = originPosition(grid);
         const yaw = originYaw(grid);
         const cos = Math.cos(yaw);
         const sin = Math.sin(yaw);
-        const resolution = Number(grid.resolution_m) || 1;
+        const resolution = gridResolution(grid);
         const width = Number(grid.width) * resolution;
         const height = Number(grid.height) * resolution;
         return [[0, 0], [width, 0], [width, height], [0, height]].map(([x, y]) => ({
@@ -1265,15 +1362,73 @@ def _render_debug_page(access_token: str) -> str:
           y: Number(origin.y || 0) + x * sin + y * cos,
         }));
       }
-      function cameraAnchor() {
+      function isMapToolActive() {
+        return Boolean(state.goalPickMode || state.publishPointMode);
+      }
+      function usesRvizMapView() {
+        return Boolean(isMapToolActive() || state.goalPickDrag || state.mapPanDrag);
+      }
+      function mapViewZoom() {
+        return usesRvizMapView() ? (state.mapRvizView.zoom || 1) : state.mapZoom;
+      }
+      function defaultMapViewCenter() {
         const posePoint = pointFromPose(state.pose);
-        if (posePoint) return { point: posePoint, yaw: yawFromPose(state.pose) || 0, locked: true };
+        if (posePoint) return { x: posePoint.x, y: posePoint.y };
         const corners = mapCorners(state.mapGrid);
-        if (!corners.length) return { point: { x: 0, y: 0 }, yaw: 0, locked: false };
-        const point = corners.reduce((acc, item) => ({ x: acc.x + item.x / corners.length, y: acc.y + item.y / corners.length }), { x: 0, y: 0 });
-        return { point, yaw: 0, locked: false };
+        if (!corners.length) return { x: 0, y: 0 };
+        return corners.reduce((acc, item) => ({ x: acc.x + item.x / corners.length, y: acc.y + item.y / corners.length }), { x: 0, y: 0 });
+      }
+      function getMapRvizViewCenter() {
+        const center = state.mapRvizView && state.mapRvizView.center;
+        if (center && Number.isFinite(Number(center.x)) && Number.isFinite(Number(center.y))) {
+          return { x: Number(center.x), y: Number(center.y) };
+        }
+        return defaultMapViewCenter();
+      }
+      function resetRvizMapView(focusPose) {
+        const posePoint = focusPose || pointFromPose(state.pose);
+        state.mapRvizView = {
+          center: posePoint ? { x: posePoint.x, y: posePoint.y } : defaultMapViewCenter(),
+          zoom: 1,
+        };
+      }
+      function centerRvizMapOnRobot() {
+        const posePoint = pointFromPose(state.pose);
+        if (!posePoint) return;
+        if (!state.mapRvizView) state.mapRvizView = { center: null, zoom: 1 };
+        state.mapRvizView.center = { x: posePoint.x, y: posePoint.y };
+        requestMapDraw(false);
+      }
+      function cameraAnchor() {
+        if (usesRvizMapView()) {
+          const center = getMapRvizViewCenter();
+          return { point: { x: center.x, y: center.y, z: 0 }, yaw: 0, locked: false, mapFixed: true };
+        }
+        const posePoint = pointFromPose(state.pose);
+        if (posePoint) return { point: posePoint, yaw: planarYawFromPose(state.pose) || 0, locked: true, mapFixed: false };
+        const fallback = defaultMapViewCenter();
+        return { point: { x: fallback.x, y: fallback.y, z: 0 }, yaw: 0, locked: false, mapFixed: false };
+      }
+      function basePixelsPerMeterRviz() {
+        const canvas = els.mapCanvas;
+        const corners = mapCorners(state.mapGrid);
+        if (!corners.length) return 60;
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minY = Infinity;
+        let maxY = -Infinity;
+        for (const corner of corners) {
+          minX = Math.min(minX, Number(corner.x));
+          maxX = Math.max(maxX, Number(corner.x));
+          minY = Math.min(minY, Number(corner.y));
+          maxY = Math.max(maxY, Number(corner.y));
+        }
+        const spanX = Math.max(maxX - minX, 1);
+        const spanY = Math.max(maxY - minY, 1);
+        return Math.max(4, Math.min(canvas.width / (spanX * 1.12), canvas.height / (spanY * 1.12)));
       }
       function basePixelsPerMeter(anchor) {
+        if (anchor && anchor.mapFixed) return basePixelsPerMeterRviz();
         const canvas = els.mapCanvas;
         const corners = mapCorners(state.mapGrid);
         if (!corners.length) return 60;
@@ -1293,14 +1448,20 @@ def _render_debug_page(access_token: str) -> str:
         return Math.max(4, Math.min(canvas.width / (maxX * 2.16), canvas.height / (maxY * 2.16)));
       }
       function cameraScale(anchor) {
-        return basePixelsPerMeter(anchor) * state.mapZoom;
+        return basePixelsPerMeter(anchor) * mapViewZoom();
       }
       function applyCameraTransform(ctx, anchor, scale) {
+        const centerX = els.mapCanvas.width / 2;
+        const centerY = els.mapCanvas.height / 2;
+        if (anchor && anchor.mapFixed) {
+          const ax = Number(anchor.point.x) || 0;
+          const ay = Number(anchor.point.y) || 0;
+          ctx.setTransform(scale, 0, 0, -scale, centerX - scale * ax, centerY + scale * ay);
+          return;
+        }
         const yaw = anchor.yaw || 0;
         const sin = Math.sin(yaw);
         const cos = Math.cos(yaw);
-        const centerX = els.mapCanvas.width / 2;
-        const centerY = els.mapCanvas.height / 2;
         const a = scale * sin;
         const b = -scale * cos;
         const c = -scale * cos;
@@ -1309,17 +1470,424 @@ def _render_debug_page(access_token: str) -> str:
         const f = centerY - b * anchor.point.x - d * anchor.point.y;
         ctx.setTransform(a, b, c, d, e, f);
       }
-      function mapToCanvas(point) {
+      function mapToCanvas(point, anchorOverride, scaleOverride) {
         if (!point) return null;
-        const anchor = cameraAnchor();
-        const scale = cameraScale(anchor);
+        const anchor = anchorOverride || cameraAnchor();
+        const scale = scaleOverride || cameraScale(anchor);
+        const centerX = els.mapCanvas.width / 2;
+        const centerY = els.mapCanvas.height / 2;
+        const dx = Number(point.x) - Number(anchor.point.x);
+        const dy = Number(point.y) - Number(anchor.point.y);
+        if (anchor.mapFixed) {
+          return { x: centerX + dx * scale, y: centerY - dy * scale };
+        }
         const yaw = anchor.yaw || 0;
-        const dx = Number(point.x) - anchor.point.x;
-        const dy = Number(point.y) - anchor.point.y;
         return {
-          x: els.mapCanvas.width / 2 + (Math.sin(yaw) * dx - Math.cos(yaw) * dy) * scale,
-          y: els.mapCanvas.height / 2 - (Math.cos(yaw) * dx + Math.sin(yaw) * dy) * scale,
+          x: centerX + (Math.sin(yaw) * dx - Math.cos(yaw) * dy) * scale,
+          y: centerY - (Math.cos(yaw) * dx + Math.sin(yaw) * dy) * scale,
         };
+      }
+      function worldToCanvasMatrix(anchor, scale) {
+        const centerX = els.mapCanvas.width / 2;
+        const centerY = els.mapCanvas.height / 2;
+        if (anchor && anchor.mapFixed) {
+          const ax = Number(anchor.point.x) || 0;
+          const ay = Number(anchor.point.y) || 0;
+          return { a: scale, b: 0, c: 0, d: -scale, e: centerX - scale * ax, f: centerY + scale * ay };
+        }
+        const yaw = anchor.yaw || 0;
+        const sin = Math.sin(yaw);
+        const cos = Math.cos(yaw);
+        const a = scale * sin;
+        const b = -scale * cos;
+        const c = -scale * cos;
+        const d = -scale * sin;
+        const e = centerX - a * anchor.point.x - c * anchor.point.y;
+        const f = centerY - b * anchor.point.x - d * anchor.point.y;
+        return { a, b, c, d, e, f };
+      }
+      function canvasToMap(px, py, anchorOverride) {
+        const anchor = anchorOverride || cameraAnchor();
+        const scale = cameraScale(anchor);
+        if (!Number.isFinite(scale) || scale <= 0) {
+          return { x: Number(anchor.point.x) || 0, y: Number(anchor.point.y) || 0 };
+        }
+        const centerX = els.mapCanvas.width / 2;
+        const centerY = els.mapCanvas.height / 2;
+        if (anchor.mapFixed) {
+          return {
+            x: Number(anchor.point.x) + (px - centerX) / scale,
+            y: Number(anchor.point.y) - (py - centerY) / scale,
+          };
+        }
+        const yaw = anchor.yaw || 0;
+        const { a, b, c, d, e, f } = worldToCanvasMatrix(anchor, scale);
+        const det = a * d - b * c;
+        if (!Number.isFinite(det) || Math.abs(det) < 1e-12) {
+          return { x: Number(anchor.point.x) || 0, y: Number(anchor.point.y) || 0 };
+        }
+        const sx = px - e;
+        const sy = py - f;
+        return {
+          x: (d * sx - c * sy) / det,
+          y: (-b * sx + a * sy) / det,
+        };
+      }
+      function zoomRvizMapAt(pointer, factor) {
+        const anchor = cameraAnchor();
+        const scaleBefore = cameraScale(anchor);
+        if (!Number.isFinite(scaleBefore) || scaleBefore <= 0) return;
+        const world = canvasToMap(pointer.x, pointer.y, anchor);
+        const nextZoom = Math.min(8, Math.max(0.25, mapViewZoom() * factor));
+        if (!state.mapRvizView) state.mapRvizView = { center: null, zoom: 1 };
+        state.mapRvizView.zoom = nextZoom;
+        const anchorAfter = cameraAnchor();
+        const scaleAfter = cameraScale(anchorAfter);
+        const centerX = els.mapCanvas.width / 2;
+        const centerY = els.mapCanvas.height / 2;
+        state.mapRvizView.center = {
+          x: world.x - (pointer.x - centerX) / scaleAfter,
+          y: world.y + (pointer.y - centerY) / scaleAfter,
+        };
+      }
+      function formatMapPoint(point) {
+        if (!point) return "--";
+        return `(${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)})`;
+      }
+      function planarDistanceMeters(a, b) {
+        if (!a || !b) return null;
+        const dx = Number(a.x) - Number(b.x);
+        const dy = Number(a.y) - Number(b.y);
+        if (!Number.isFinite(dx) || !Number.isFinite(dy)) return null;
+        return Math.hypot(dx, dy);
+      }
+      function navGoalMatchesPending(targetPose, pending) {
+        if (!targetPose || !pending) return false;
+        const point = pointFromPose(targetPose);
+        if (!point) return false;
+        const dist = planarDistanceMeters(point, pending);
+        return dist !== null && dist < 0.35;
+      }
+      function syncDebugNavGoalFromStream(navPayload) {
+        const pending = state.pendingNavGoal;
+        if (!pending || pending.status === "sending") return;
+        const navState = getNestedState(navPayload, "navigation_state");
+        if (!navState) return;
+        const status = String(navState.status || "").toLowerCase();
+        const metadata = navState.metadata || {};
+        const targetPose = metadata.target_pose || null;
+        const matches = navGoalMatchesPending(targetPose, pending);
+        if (status === "running" || status === "planning") {
+          if (!matches) return;
+          const remain = navState.remaining_distance_m;
+          const remainLabel = remain === null || remain === undefined ? "" : ` · 剩余 ${Number(remain).toFixed(2)}m`;
+          updateGoalPickStatus(`Nav2 执行中 → ${formatMapPoint(pending)}${remainLabel}`, "ok");
+          pending.status = "accepted";
+          return;
+        }
+        if (status === "succeeded") {
+          if (!matches) return;
+          updateGoalPickStatus(`已到达 ${formatMapPoint(pending)}`, "ok");
+          state.pendingNavGoal = null;
+          requestMapDraw(false);
+          return;
+        }
+        if (status === "failed" || status === "cancelled") {
+          if (!matches && pending.status !== "pending" && pending.status !== "accepted") return;
+          const message = navState.message || (status === "cancelled" ? "导航已取消" : "导航失败");
+          const failureReason = String(metadata.failure_reason || "");
+          if (
+            failureReason === "nav2_not_ready"
+            || message.includes("Nav2 未 ready")
+            || message.includes("lifecycle 未全部 active")
+            || message.includes("costmap 尚未首帧")
+          ) {
+            return;
+          }
+          pending.status = "error";
+          pending.message = message;
+          updateGoalPickStatus(`${message}（目标 ${formatMapPoint(pending)}）`, "error");
+          requestMapDraw(false);
+        }
+      }
+      function mapGoalUsesOfflineGrid() {
+        const diagnostics = state.mapStream && state.mapStream.diagnostics ? state.mapStream.diagnostics : {};
+        const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
+        const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
+        return sourceKind === "platform_map_version" || snapshotKind === "offline_checkpoint";
+      }
+      function canvasPointer(event) {
+        const rect = els.mapCanvas.getBoundingClientRect();
+        const scaleX = els.mapCanvas.width / Math.max(rect.width, 1);
+        const scaleY = els.mapCanvas.height / Math.max(rect.height, 1);
+        return {
+          x: (event.clientX - rect.left) * scaleX,
+          y: (event.clientY - rect.top) * scaleY,
+        };
+      }
+      function activeMapName() {
+        const diagnostics = state.mapStream && state.mapStream.diagnostics ? state.mapStream.diagnostics : {};
+        const governance = state.latestGovernance || {};
+        const overview = state.latestOverview || {};
+        const overviewGovernance = overview.runtime_governance || {};
+        return diagnostics.active_map_name
+          || diagnostics.map_name
+          || governance.active_map_name
+          || overviewGovernance.active_map_name
+          || null;
+      }
+      function navigationFrameId() {
+        const poseFrame = state.pose && state.pose.frame_id;
+        const gridFrame = state.mapGrid && state.mapGrid.frame_id;
+        return normalizeFrameId(poseFrame || gridFrame, "map");
+      }
+      function updateGoalPickStatus(text, tone) {
+        if (!els.mapGoalStatus) return;
+        const value = String(text || "").trim();
+        if (!value) {
+          els.mapGoalStatus.hidden = true;
+          els.mapGoalStatus.textContent = "";
+          els.mapGoalStatus.className = "map-chip map-goal-chip";
+          return;
+        }
+        els.mapGoalStatus.hidden = false;
+        els.mapGoalStatus.textContent = value;
+        els.mapGoalStatus.className = `map-chip map-goal-chip${tone ? ` ${tone}` : ""}`;
+      }
+      function syncMapToolUi() {
+        const goalActive = Boolean(state.goalPickMode);
+        const pointActive = Boolean(state.publishPointMode);
+        const toolActive = goalActive || pointActive;
+        if (els.mapGoalToggle) els.mapGoalToggle.classList.toggle("active", goalActive);
+        if (els.mapPublishPointToggle) els.mapPublishPointToggle.classList.toggle("active", pointActive);
+        if (els.mapCanvas) {
+          els.mapCanvas.classList.toggle("goal-pick", toolActive);
+          els.mapCanvas.classList.toggle("publish-point", pointActive && !goalActive);
+          els.mapCanvas.classList.toggle("pan-ready", toolActive && !state.mapPanDrag);
+          els.mapCanvas.classList.toggle("panning", Boolean(state.mapPanDrag));
+        }
+        if (els.mapCenterRobot) els.mapCenterRobot.hidden = !toolActive;
+        if (els.mapRvizHint) {
+          els.mapRvizHint.hidden = !toolActive;
+          if (goalActive) {
+            els.mapRvizHint.textContent = "2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放";
+          } else if (pointActive) {
+            els.mapRvizHint.textContent = "选点：左键发布 /clicked_point · 中/右键平移 · 滚轮缩放";
+          }
+        }
+      }
+      const syncGoalPickUi = syncMapToolUi;
+      function goalPickYawFromDrag(drag) {
+        const pointerDx = drag.pointerCurrent.x - drag.pointerStart.x;
+        const pointerDy = drag.pointerCurrent.y - drag.pointerStart.y;
+        if (Math.hypot(pointerDx, pointerDy) < 8) {
+          return planarYawFromPose(state.pose) || 0;
+        }
+        const mapDx = drag.current.x - drag.start.x;
+        const mapDy = drag.current.y - drag.start.y;
+        return Math.atan2(mapDy, mapDx);
+      }
+      function formatNavGoalError(payload, status) {
+        const code = String((payload && payload.code) || "").trim();
+        const message = String((payload && payload.message) || "").trim();
+        if (code === "localization_unavailable") {
+          return "平台定位会话未就绪（与 go2.sh 模式无关）。mapping / explore / localization 任一模式均可导航，但需先 activate_map，且定位 session 进入 ready。";
+        }
+        if (code === "map_not_activated") {
+          return "未激活地图。请先调用 activate_map 选择地图。";
+        }
+        if (code === "access_denied") {
+          return "当前令牌无权调用 navigate_to_pose。";
+        }
+        if (code === "nav2_not_ready") {
+          const waitingFor = payload && payload.details && payload.details.waiting_for;
+          return waitingFor
+            ? `Nav2 未就绪（等待 ${waitingFor}）。${message || ""}`
+            : (message || "Nav2 未就绪，无法导航。");
+        }
+        if (code === "nav2_goal_rejected") {
+          const details = payload && payload.details ? payload.details : {};
+          const actionName = details.action_name ? ` action=${details.action_name}` : "";
+          return `${message || "Nav2 拒绝目标。"}${actionName}`;
+        }
+        if (code === "nav2_provider_unavailable") {
+          return message || "Nav2 action provider 未初始化。";
+        }
+        return message || `HTTP ${status}`;
+      }
+      async function dispatchNavGoal(mapPoint, yawRad) {
+        if (!state.mapGrid) {
+          updateGoalPickStatus("地图未显示，无法下发导航目标", "error");
+          return;
+        }
+        if (!state.pose || !pointFromPose(state.pose)) {
+          updateGoalPickStatus("定位位姿不可用，无法将点击坐标变换到 map 系", "error");
+          return;
+        }
+        if (mapGoalUsesOfflineGrid()) {
+          updateGoalPickStatus("当前为离线/缓存地图，与 Nav2 实时 costmap 可能不一致，建议等待实时流后再发目标", "error");
+          return;
+        }
+        if (state.pendingNavGoal && state.pendingNavGoal.status === "sending") {
+          updateGoalPickStatus("上一条 Nav2 目标仍在下发，请稍候", "pending");
+          return;
+        }
+        const frameId = navigationFrameId();
+        const mapName = activeMapName();
+        const robotPoint = pointFromPose(state.pose);
+        const distanceM = planarDistanceMeters(mapPoint, robotPoint);
+        const body = {
+          frame_id: frameId,
+          x: Number(mapPoint.x),
+          y: Number(mapPoint.y),
+          z: 0,
+          yaw_rad: Number(yawRad),
+          accept_timeout_sec: 8,
+        };
+        if (mapName) body.map_name = mapName;
+        state.pendingNavGoal = {
+          x: body.x,
+          y: body.y,
+          yaw_rad: body.yaw_rad,
+          frame_id: frameId,
+          status: "sending",
+        };
+        const robotLabel = robotPoint ? formatMapPoint(robotPoint) : "--";
+        const distanceLabel = distanceM === null ? "" : ` · 距离 ${distanceM.toFixed(2)}m`;
+        updateGoalPickStatus(`下发 map 目标 ${formatMapPoint(mapPoint)} · 机器人 ${robotLabel}${distanceLabel} · frame=${frameId}`, "pending");
+        requestMapDraw(false);
+        const controller = new AbortController();
+        const requestTimeout = window.setTimeout(() => controller.abort(), 12000);
+        try {
+          const response = await fetch(withAccessToken("/api/debug/navigation/goal"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(formatNavGoalError(payload, response.status));
+          }
+          const accepted = payload.accepted === true;
+          const pending = payload.pending === true;
+          const apiDistance = payload.distance_m;
+          const distanceSuffix = Number.isFinite(Number(apiDistance))
+            ? ` · 距离 ${Number(apiDistance).toFixed(2)}m`
+            : distanceLabel;
+          state.pendingNavGoal = {
+            x: body.x,
+            y: body.y,
+            yaw_rad: body.yaw_rad,
+            frame_id: frameId,
+            status: accepted ? "accepted" : (pending ? "pending" : "error"),
+            goalId: payload.goal_id || null,
+            actionName: payload.action_name || null,
+          };
+          const actionLabel = payload.action_name ? ` · ${payload.action_name}` : "";
+          const goalLabel = `${formatMapPoint(mapPoint)}${distanceSuffix} · ${frameId}`;
+          if (accepted) {
+            updateGoalPickStatus(`Nav2 已接受 ${goalLabel}${actionLabel}`, "ok");
+          } else if (pending) {
+            updateGoalPickStatus(`Nav2 已发送 ${goalLabel}，等待接受（坐标与地图一致；若未移动请看导航面板失败原因）${actionLabel}`, "pending");
+          } else {
+            updateGoalPickStatus(payload.message || "Nav2 未接受目标", "error");
+          }
+        } catch (error) {
+          const message = error && error.name === "AbortError"
+            ? "Nav2 下发超时（12s），请确认 go2.sh / Nav2 action server 已启动。"
+            : (error && error.message ? error.message : String(error));
+          state.pendingNavGoal = {
+            x: body.x,
+            y: body.y,
+            yaw_rad: body.yaw_rad,
+            frame_id: frameId,
+            status: "error",
+            message,
+          };
+          updateGoalPickStatus(`下发失败：${message}`, "error");
+        } finally {
+          window.clearTimeout(requestTimeout);
+        }
+        requestMapDraw(false);
+      }
+      async function dispatchClickedPoint(mapPoint) {
+        if (!state.mapGrid) {
+          updateGoalPickStatus("地图未显示，无法发布选点", "error");
+          return;
+        }
+        if (!state.pose || !pointFromPose(state.pose)) {
+          updateGoalPickStatus("定位位姿不可用，无法将点击坐标变换到 map 系", "error");
+          return;
+        }
+        const frameId = navigationFrameId();
+        const robotPoint = pointFromPose(state.pose);
+        const distanceM = planarDistanceMeters(mapPoint, robotPoint);
+        const body = {
+          frame_id: frameId,
+          x: Number(mapPoint.x),
+          y: Number(mapPoint.y),
+          z: 0,
+        };
+        const distanceLabel = distanceM === null ? "" : ` · 距机器人 ${distanceM.toFixed(2)}m`;
+        updateGoalPickStatus(`发布 /clicked_point ${formatMapPoint(mapPoint)}${distanceLabel} · ${frameId}`, "pending");
+        try {
+          const response = await fetch(withAccessToken("/api/debug/map/clicked_point"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const message = String((payload && payload.message) || `HTTP ${response.status}`);
+            throw new Error(message);
+          }
+          state.clickedPoints = [
+            {
+              x: body.x,
+              y: body.y,
+              z: body.z,
+              frame_id: frameId,
+              at: Date.now(),
+            },
+            ...(state.clickedPoints || []),
+          ].slice(0, 30);
+          const topic = payload.topic || "/clicked_point";
+          updateGoalPickStatus(`已发布 ${topic} ${formatMapPoint(mapPoint)}${distanceLabel} · ${frameId}`, "ok");
+        } catch (error) {
+          const message = error && error.message ? error.message : String(error);
+          updateGoalPickStatus(`选点发布失败：${message}`, "error");
+        }
+        requestMapDraw(false);
+      }
+      function drawOrientedGoal(ctx, anchor, scale, point, yawRad, colors, pixels) {
+        if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return;
+        ctx.save();
+        applyCameraTransform(ctx, anchor, scale);
+        ctx.translate(Number(point.x), Number(point.y));
+        ctx.rotate(Number(yawRad) || 0);
+        const shaft = Math.max(0.35, 14 / scale);
+        const head = Math.max(0.18, 7 / scale);
+        ctx.strokeStyle = colors.stroke;
+        ctx.fillStyle = colors.fill;
+        ctx.lineWidth = Math.max(1 / scale, pixels / scale);
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(shaft, 0);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(shaft, 0);
+        ctx.lineTo(shaft - head, head * 0.55);
+        ctx.lineTo(shaft - head, -head * 0.55);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(0, 0, Math.max(0.08, 4 / scale), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
       }
       function setWorldLineStyle(ctx, scale, color, pixels) {
         ctx.strokeStyle = color;
@@ -1349,7 +1917,7 @@ def _render_debug_page(access_token: str) -> str:
         if (!grid) return "missing";
         const origin = originPosition(grid);
         const revision = (diagnostics && (diagnostics.occupancy_content_hash || diagnostics.content_hash || diagnostics.grid_hash || diagnostics.occupancy_content_revision || diagnostics.content_revision || diagnostics.revision)) || (grid.metadata && (grid.metadata.occupancy_content_hash || grid.metadata.content_hash || grid.metadata.grid_hash || grid.metadata.occupancy_content_revision || grid.metadata.content_revision || grid.metadata.revision)) || envelope.revision || grid.revision || mapGridDataSignature(grid);
-        return [grid.frame_id || envelope.frame_id || "", grid.width, grid.height, grid.resolution_m, Number(origin.x || 0), Number(origin.y || 0), originYaw(grid), revision].join("|");
+        return [grid.frame_id || envelope.frame_id || "", grid.width, grid.height, gridResolution(grid), Number(origin.x || 0), Number(origin.y || 0), originYaw(grid), revision].join("|");
       }
       function normalizeStatusValue(value) {
         const raw = value && typeof value === "object" && "value" in value ? value.value : value;
@@ -1365,6 +1933,15 @@ def _render_debug_page(access_token: str) -> str:
         if (!payload) return {};
         if (payload[key] && typeof payload[key] === "object") return payload[key];
         return payload;
+      }
+      function localizationPoseStreamReason() {
+        const envelope = state.lastLocalizationEnvelope;
+        if (!envelope || statusOf(envelope) !== "available") return null;
+        return pointFromPose(state.pose) ? "localization_pose_stream" : null;
+      }
+      function goalInteractionReason() {
+        if (state.goalPickMode || state.publishPointMode || state.pendingNavGoal) return "goal_pick";
+        return null;
       }
       function activeSpatialTaskReason() {
         for (const task of state.taskActiveById.values()) {
@@ -1401,6 +1978,10 @@ def _render_debug_page(access_token: str) -> str:
         if (backendReason) return backendReason;
         const localizationReason = activeLocalizationSessionReason();
         if (localizationReason) return localizationReason;
+        const poseStreamReason = localizationPoseStreamReason();
+        if (poseStreamReason) return poseStreamReason;
+        const goalReason = goalInteractionReason();
+        if (goalReason) return goalReason;
         return null;
       }
       function activeLocalizationSessionReason() {
@@ -1497,6 +2078,11 @@ def _render_debug_page(access_token: str) -> str:
         return count === null || count > 0;
       }
       function shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared) {
+        if (goalInteractionReason()) {
+          if (grid && Array.isArray(grid.data) && grid.width && grid.height) {
+            return { display: true, reason: "goal_pick" };
+          }
+        }
         if (cleared) return { display: false, status: "cleared", message: mapClearedMessage(diagnostics) };
         if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) {
           return { display: false, status: status === "error" ? "error" : "missing", message: errorReason(envelope, "无 occupancy_grid，占据栅格不可用。") };
@@ -1554,6 +2140,11 @@ def _render_debug_page(access_token: str) -> str:
         state.navigationPath = [];
       }
       function clearMapDisplay(message, status, diagnostics, streamBridge, envelope, grid) {
+        if (state.goalPickMode || state.publishPointMode || state.pendingNavGoal) {
+          els.mapEmpty.hidden = false;
+          els.mapEmpty.textContent = message || MAP_DISPLAY_IDLE_MESSAGE;
+          return;
+        }
         state.mapGrid = null;
         state.mapGridContentKey = "";
         state.mapBaseCache = null;
@@ -1617,7 +2208,7 @@ def _render_debug_page(access_token: str) -> str:
         const anchor = cameraAnchor();
         const scale = cameraScale(anchor);
         state.mapViewport = { centerX: canvas.width / 2, centerY: canvas.height / 2, scale, zoom: state.mapZoom, robotLocked: anchor.locked };
-        if (els.mapZoomValue) els.mapZoomValue.textContent = `${Math.round(state.mapZoom * 100)}%`;
+        if (els.mapZoomValue) els.mapZoomValue.textContent = `${Math.round(mapViewZoom() * 100)}%`;
         if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) return;
         const width = Number(grid.width);
         const height = Number(grid.height);
@@ -1625,7 +2216,7 @@ def _render_debug_page(access_token: str) -> str:
         ctx.save();
         applyCameraTransform(ctx, anchor, scale);
         const origin = originPosition(grid);
-        const resolution = Number(grid.resolution_m) || 1;
+        const resolution = gridResolution(grid);
         ctx.translate(Number(origin.x || 0), Number(origin.y || 0));
         ctx.rotate(originYaw(grid));
         ctx.scale(resolution, -resolution);
@@ -1635,8 +2226,10 @@ def _render_debug_page(access_token: str) -> str:
         drawTrajectory(ctx, anchor, scale);
         drawNavigationPath(ctx, anchor, scale);
         drawGoal(ctx, anchor, scale);
+        drawGoalPickPreview(ctx, anchor, scale);
+        drawClickedPoints(ctx, anchor, scale);
         drawFrontiers(ctx, anchor, scale);
-        drawRobot(ctx, anchor.locked);
+        drawRobot(ctx, anchor);
       }
       function pointFromFrontier(frontier) {
         const geometry = frontier && frontier.geometry ? frontier.geometry : frontier;
@@ -1688,8 +2281,33 @@ def _render_debug_page(access_token: str) -> str:
         drawWorldPoints(ctx, anchor, scale, state.navigationPath, CANVAS_THEME.navPath, 3);
       }
       function drawGoal(ctx, anchor, scale) {
+        const pending = state.pendingNavGoal;
+        if (pending && pending.status !== "error") {
+          drawOrientedGoal(
+            ctx,
+            anchor,
+            scale,
+            { x: pending.x, y: pending.y },
+            pending.yaw_rad,
+            { fill: CANVAS_THEME.goalPick, stroke: CANVAS_THEME.goalPickStroke },
+            2.8,
+          );
+        }
         const point = pointFromPose(state.goalPose);
         if (!point) return;
+        const yaw = yawFromPose(state.goalPose);
+        if (Number.isFinite(yaw)) {
+          drawOrientedGoal(
+            ctx,
+            anchor,
+            scale,
+            point,
+            yaw,
+            { fill: CANVAS_THEME.goal, stroke: CANVAS_THEME.goalStroke },
+            2.4,
+          );
+          return;
+        }
         ctx.save();
         applyCameraTransform(ctx, anchor, scale);
         ctx.strokeStyle = CANVAS_THEME.goalStroke;
@@ -1700,19 +2318,61 @@ def _render_debug_page(access_token: str) -> str:
         ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
         ctx.fill();
         ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(point.x - radius * 1.45, point.y);
-        ctx.lineTo(point.x + radius * 1.45, point.y);
-        ctx.moveTo(point.x, point.y - radius * 1.45);
-        ctx.lineTo(point.x, point.y + radius * 1.45);
-        ctx.stroke();
         ctx.restore();
       }
-      function drawRobot(ctx, locked) {
-        if (!locked) return;
+      function drawClickedPoints(ctx, anchor, scale) {
+        const points = state.clickedPoints || [];
+        if (!points.length) return;
+        ctx.save();
+        applyCameraTransform(ctx, anchor, scale);
+        ctx.fillStyle = CANVAS_THEME.clickedPoint;
+        ctx.strokeStyle = CANVAS_THEME.clickedPointStroke;
+        for (const point of points) {
+          if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) continue;
+          const radius = Math.max(0.1, 6 / scale);
+          ctx.lineWidth = Math.max(1 / scale, 2 / scale);
+          ctx.beginPath();
+          ctx.arc(Number(point.x), Number(point.y), radius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+      function drawGoalPickPreview(ctx, anchor, scale) {
+        const drag = state.goalPickDrag;
+        if (!drag || !drag.start) return;
+        const previewAnchor = drag.anchor || anchor;
+        const previewScale = drag.anchor ? cameraScale(previewAnchor) : scale;
+        const yaw = goalPickYawFromDrag(drag);
+        drawOrientedGoal(
+          ctx,
+          previewAnchor,
+          previewScale,
+          drag.start,
+          yaw,
+          { fill: CANVAS_THEME.goalPick, stroke: CANVAS_THEME.goalPickStroke },
+          3,
+        );
+      }
+      function drawRobot(ctx, anchor) {
+        const posePoint = pointFromPose(state.pose);
+        if (!posePoint) return;
+        const locked = anchor && anchor.locked === true;
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.translate(els.mapCanvas.width / 2, els.mapCanvas.height / 2);
+        if (locked) {
+          ctx.translate(els.mapCanvas.width / 2, els.mapCanvas.height / 2);
+        } else {
+          const canvasPoint = mapToCanvas(posePoint);
+          if (!canvasPoint) {
+            ctx.restore();
+            return;
+          }
+          ctx.translate(canvasPoint.x, canvasPoint.y);
+          const yaw = planarYawFromPose(state.pose) || 0;
+          // 北向 map 视图：屏幕 Y 向上对应 world +Y，三角形默认指屏幕上方，需用 π/2 - yaw（不是 yaw + π/2）
+          ctx.rotate(Math.PI / 2 - yaw);
+        }
         ctx.fillStyle = CANVAS_THEME.robot;
         ctx.strokeStyle = CANVAS_THEME.robotStroke;
         ctx.lineWidth = 2;
@@ -2051,6 +2711,10 @@ def _render_debug_page(access_token: str) -> str:
         }
         if (!state.goalPose && data.current_goal && data.current_goal.target_pose) {
           state.goalPose = data.current_goal.target_pose;
+        }
+        syncDebugNavGoalFromStream(data.navigation_context || data);
+        if (state.pendingNavGoal && state.pendingNavGoal.status === "accepted" && state.goalPose) {
+          state.pendingNavGoal = null;
         }
         setKv(els.navigationMeta, [
           ["navigation", summarizeContext(data.navigation_context, "navigation_state")],
@@ -2969,14 +3633,200 @@ def _render_debug_page(access_token: str) -> str:
       window.addEventListener("resize", scheduleVideoDetectionDraw);
       startVideoStream();
       function setMapZoom(nextZoom) {
-        state.mapZoom = Math.min(8, Math.max(0.25, nextZoom));
+        const zoom = Math.min(8, Math.max(0.25, nextZoom));
+        if (usesRvizMapView() || isMapToolActive()) {
+          if (!state.mapRvizView) state.mapRvizView = { center: null, zoom: 1 };
+          state.mapRvizView.zoom = zoom;
+        } else {
+          state.mapZoom = zoom;
+        }
         requestMapDraw(false);
       }
-      els.mapZoomIn.addEventListener("click", () => setMapZoom(state.mapZoom * 1.25));
-      els.mapZoomOut.addEventListener("click", () => setMapZoom(state.mapZoom / 1.25));
-      els.mapZoomReset.addEventListener("click", () => setMapZoom(1));
+      els.mapZoomIn.addEventListener("click", () => setMapZoom(mapViewZoom() * 1.25));
+      els.mapZoomOut.addEventListener("click", () => setMapZoom(mapViewZoom() / 1.25));
+      els.mapZoomReset.addEventListener("click", () => {
+        if (isMapToolActive()) resetRvizMapView();
+        else setMapZoom(1);
+        requestMapDraw(false);
+      });
+      if (els.mapCenterRobot) {
+        els.mapCenterRobot.addEventListener("click", () => centerRvizMapOnRobot());
+      }
+      function isMap3dVisible() {
+        const container = document.getElementById("map3dContainer");
+        return Boolean(container && container.style.display !== "none");
+      }
+      function finishGoalPick(event) {
+        if (!state.goalPickDrag) return;
+        if (state.pendingNavGoal && state.pendingNavGoal.status === "sending") {
+          state.goalPickDrag = null;
+          return;
+        }
+        const drag = state.goalPickDrag;
+        state.goalPickDrag = null;
+        const yaw = goalPickYawFromDrag(drag);
+        void dispatchNavGoal(drag.start, yaw);
+        if (event && event.pointerId !== undefined && els.mapCanvas.releasePointerCapture) {
+          try { els.mapCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
+        }
+        requestMapDraw(false);
+      }
+      function disableMapTools(clearStatus) {
+        state.goalPickMode = false;
+        state.publishPointMode = false;
+        state.goalPickDrag = null;
+        state.publishPointClick = null;
+        state.mapPanDrag = null;
+        syncMapToolUi();
+        if (clearStatus) updateGoalPickStatus("", "");
+        requestMapDraw(false);
+      }
+      if (els.mapGoalToggle) {
+        els.mapGoalToggle.addEventListener("click", () => {
+          const next = !state.goalPickMode;
+          disableMapTools(false);
+          state.goalPickMode = next;
+          syncMapToolUi();
+          if (state.goalPickMode) {
+            resetRvizMapView();
+            reevaluateCachedMapDisplay();
+            updateGoalPickStatus(
+              state.mapGrid
+                ? "RViz 模式：左键设目标 · 中/右键平移 · 滚轮缩放"
+                : "2D Goal 已开启，但地图未显示。请先 activate_map 并启动 go2.sh（mapping / explore / localization 均可）。",
+              state.mapGrid ? "pending" : "error",
+            );
+          } else {
+            updateGoalPickStatus("", "");
+          }
+          requestMapDraw(false);
+        });
+      }
+      if (els.mapPublishPointToggle) {
+        els.mapPublishPointToggle.addEventListener("click", () => {
+          const next = !state.publishPointMode;
+          disableMapTools(false);
+          state.publishPointMode = next;
+          syncMapToolUi();
+          if (state.publishPointMode) {
+            resetRvizMapView();
+            reevaluateCachedMapDisplay();
+            updateGoalPickStatus(
+              state.mapGrid
+                ? "选点模式：左键发布 /clicked_point（不导航）"
+                : "选点已开启，但地图未显示。请先 activate_map 并启动 go2.sh。",
+              state.mapGrid ? "pending" : "error",
+            );
+          } else {
+            updateGoalPickStatus("", "");
+          }
+          requestMapDraw(false);
+        });
+      }
+      function finishMapPan(event) {
+        if (!state.mapPanDrag) return;
+        state.mapPanDrag = null;
+        syncGoalPickUi();
+        if (event && event.pointerId !== undefined && els.mapCanvas.releasePointerCapture) {
+          try { els.mapCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
+        }
+      }
+      function finishPublishPoint(event) {
+        if (!state.publishPointClick) return;
+        const click = state.publishPointClick;
+        state.publishPointClick = null;
+        if (event && event.pointerId !== undefined && els.mapCanvas.releasePointerCapture) {
+          try { els.mapCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
+        }
+        void dispatchClickedPoint(click.mapPoint);
+      }
+      els.mapCanvas.addEventListener("contextmenu", (event) => {
+        if (isMapToolActive()) event.preventDefault();
+      });
+      els.mapCanvas.addEventListener("pointerdown", (event) => {
+        if (!isMapToolActive() || isMap3dVisible()) return;
+        const pointer = canvasPointer(event);
+        if (event.button === 1 || event.button === 2) {
+          event.preventDefault();
+          state.mapPanDrag = {
+            pointerStart: pointer,
+            centerStart: getMapRvizViewCenter(),
+          };
+          syncMapToolUi();
+          if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
+          return;
+        }
+        if (event.button !== 0) return;
+        event.preventDefault();
+        const anchor = cameraAnchor();
+        const mapPoint = canvasToMap(pointer.x, pointer.y, anchor);
+        if (state.publishPointMode) {
+          state.publishPointClick = { pointer, anchor, mapPoint };
+          if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
+          return;
+        }
+        state.goalPickDrag = {
+          pointerStart: pointer,
+          pointerCurrent: pointer,
+          anchor,
+          start: mapPoint,
+          current: mapPoint,
+        };
+        if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
+        requestMapDraw(false);
+      });
+      els.mapCanvas.addEventListener("pointermove", (event) => {
+        if (state.mapPanDrag) {
+          const pointer = canvasPointer(event);
+          const anchor = cameraAnchor();
+          const scale = cameraScale(anchor);
+          if (!Number.isFinite(scale) || scale <= 0) return;
+          const dx = pointer.x - state.mapPanDrag.pointerStart.x;
+          const dy = pointer.y - state.mapPanDrag.pointerStart.y;
+          if (!state.mapRvizView) state.mapRvizView = { center: null, zoom: 1 };
+          state.mapRvizView.center = {
+            x: state.mapPanDrag.centerStart.x - dx / scale,
+            y: state.mapPanDrag.centerStart.y + dy / scale,
+          };
+          requestMapDraw(false);
+          return;
+        }
+        if (!state.goalPickDrag) return;
+        const pointer = canvasPointer(event);
+        state.goalPickDrag.pointerCurrent = pointer;
+        state.goalPickDrag.current = canvasToMap(pointer.x, pointer.y, state.goalPickDrag.anchor);
+        requestMapDraw(false);
+      });
+      els.mapCanvas.addEventListener("pointerup", (event) => {
+        if (state.mapPanDrag) {
+          finishMapPan(event);
+          return;
+        }
+        if (state.publishPointClick) {
+          finishPublishPoint(event);
+          return;
+        }
+        finishGoalPick(event);
+      });
+      els.mapCanvas.addEventListener("pointercancel", (event) => {
+        if (state.mapPanDrag) {
+          finishMapPan(event);
+          return;
+        }
+        if (state.publishPointClick) {
+          finishPublishPoint(event);
+          return;
+        }
+        finishGoalPick(event);
+      });
       els.mapCanvas.addEventListener("wheel", (event) => {
         event.preventDefault();
+        if (isMapToolActive()) {
+          const pointer = canvasPointer(event);
+          zoomRvizMapAt(pointer, event.deltaY < 0 ? 1.12 : 1 / 1.12);
+          requestMapDraw(false);
+          return;
+        }
         setMapZoom(state.mapZoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12));
       }, { passive: false });
       els.logLevelFilter.addEventListener("change", () => {
@@ -2996,7 +3846,10 @@ def _render_debug_page(access_token: str) -> str:
         c.style.display = is3d ? '' : 'none';
         d.style.display = is3d ? 'none' : '';
         btn.textContent = is3d ? '3D' : '2D';
-        if (!is3d && window.pointcloud3d) window.pointcloud3d.init(d);
+        if (!is3d) {
+          disableMapTools(true);
+          if (window.pointcloud3d) window.pointcloud3d.init(d);
+        }
       });
     })();
   </script>

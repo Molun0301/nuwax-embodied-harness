@@ -22,6 +22,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class GeometryLaunchConfig:
     odom_topic: str
@@ -36,6 +46,11 @@ class GeometryLaunchConfig:
     robot_radius: float
     inflation_radius: float
     inflation_cost_scaling: float
+    exploration_min_frontier_size: int
+    exploration_failures_before_relaxed: int
+    exploration_failures_before_corridor: int
+    exploration_failures_before_retry: int
+    exploration_bootstrap_forward_m: float
     nav2_action_name: str
 
     @classmethod
@@ -57,8 +72,57 @@ class GeometryLaunchConfig:
             inflation_cost_scaling=_env_float(
                 "NUWAX_GEOMETRY_INFLATION_COST_SCALING", 2.5
             ),
+            exploration_min_frontier_size=_env_int(
+                "NUWAX_GEOMETRY_EXPLORATION_MIN_FRONTIER_SIZE", 25
+            ),
+            exploration_failures_before_relaxed=_env_int(
+                "NUWAX_GEOMETRY_EXPLORATION_FAILURES_BEFORE_RELAXED", 4
+            ),
+            exploration_failures_before_corridor=_env_int(
+                "NUWAX_GEOMETRY_EXPLORATION_FAILURES_BEFORE_CORRIDOR", 7
+            ),
+            exploration_failures_before_retry=_env_int(
+                "NUWAX_GEOMETRY_EXPLORATION_FAILURES_BEFORE_RETRY", 10
+            ),
+            exploration_bootstrap_forward_m=_env_float(
+                "NUWAX_GEOMETRY_EXPLORATION_BOOTSTRAP_FORWARD_M", 0.2
+            ),
             nav2_action_name=_env("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
         )
+
+    def frontier_explorer_parameters(self) -> Dict[str, Any]:
+        """ROS params for frontier_explorer (office + corridor tuned defaults)."""
+        return {
+            'map_topic': self.map_topic,
+            'global_frame': self.map_frame,
+            'robot_frame': self.base_frame,
+            'replan_period': 3.0,
+            'min_frontier_size': self.exploration_min_frontier_size,
+            'info_gain_radius': 1.5,
+            'info_gain_weight': 1.0,
+            'size_weight': 0.6,
+            'travel_weight': 0.8,
+            'turn_weight': 0.25,
+            'clearance_weight': 0.8,
+            'max_goal_candidates_per_frontier': 80,
+            'blacklist_radius': 0.5,
+            'blacklist_ttl': 60.0,
+            'max_consecutive_failures': 10,
+            'failures_before_relaxed': self.exploration_failures_before_relaxed,
+            'failures_before_corridor': self.exploration_failures_before_corridor,
+            'failures_before_retry_reset': self.exploration_failures_before_retry,
+            'relaxed_min_goal_clearance_m': 0.15,
+            'relaxed_min_travel_m': 0.35,
+            'corridor_travel_weight_scale': 1.35,
+            'corridor_turn_weight_scale': 1.5,
+            'retry_cooldown_sec': 12.0,
+            'bootstrap_forward_enabled': True,
+            'bootstrap_forward_m': self.exploration_bootstrap_forward_m,
+            'startup_grace_period': 15.0,
+            'min_travel_m': 0.5,
+            'min_goal_clearance_m': 0.25,
+            'goal_success_tolerance': 0.45,
+        }
 
     @property
     def nav2_action_basename(self) -> str:

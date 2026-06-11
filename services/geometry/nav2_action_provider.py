@@ -107,6 +107,7 @@ class Nav2ActionNavigationProvider:
         self._send_goal_sequence = 0
         self._goal_pose_publisher = None
         self._clicked_point_publisher = None
+        self._initial_pose_publisher = None
         self._goal_sequence = 0
         self._rclpy = None
         self._get_state_type = None
@@ -364,6 +365,61 @@ class Nav2ActionNavigationProvider:
             self._result_future.add_done_callback(
                 lambda completed: self._on_result(completed, goal.goal_id, goal_sequence)
             )
+
+    def publish_initial_pose(self, target_pose: Pose) -> Dict[str, object]:
+        """RViz 2D Pose Estimate 等价：发布 PoseWithCovarianceStamped 到 /initialpose。"""
+
+        if not self._ensure_started() or self._node is None:
+            return {
+                "published": False,
+                "topic": "/initialpose",
+                "message": "Nav2 action ROS 节点未启动，无法发布 /initialpose。",
+            }
+        try:
+            from geometry_msgs.msg import PoseWithCovarianceStamped
+            from rclpy.duration import Duration
+
+            if self._initial_pose_publisher is None:
+                self._initial_pose_publisher = self._node.create_publisher(
+                    PoseWithCovarianceStamped, "/initialpose", 10
+                )
+            frame_id = str(target_pose.frame_id or "map").lstrip("/") or "map"
+            msg = PoseWithCovarianceStamped()
+            msg.header.frame_id = frame_id
+            # 与 localization service 一致：略早于 now，避免 AMCL TF 外推失败。
+            msg.header.stamp = (self._node.get_clock().now() - Duration(seconds=0.5)).to_msg()
+            msg.pose.pose.position.x = float(target_pose.position.x)
+            msg.pose.pose.position.y = float(target_pose.position.y)
+            msg.pose.pose.position.z = float(target_pose.position.z)
+            msg.pose.pose.orientation.x = float(target_pose.orientation.x)
+            msg.pose.pose.orientation.y = float(target_pose.orientation.y)
+            msg.pose.pose.orientation.z = float(target_pose.orientation.z)
+            msg.pose.pose.orientation.w = float(target_pose.orientation.w)
+            msg.pose.covariance = [0.25 if i in (0, 7, 35) else 0.0 for i in range(36)]
+            self._initial_pose_publisher.publish(msg)
+            LOGGER.info(
+                "debug 发布 /initialpose pose=(%.3f, %.3f, %.3f) frame=%s",
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z,
+                frame_id,
+            )
+            return {
+                "published": True,
+                "topic": "/initialpose",
+                "frame_id": frame_id,
+                "x": msg.pose.pose.position.x,
+                "y": msg.pose.pose.position.y,
+                "z": msg.pose.pose.position.z,
+                "message": "已发布 /initialpose（RViz 2D Pose Estimate 等价）。",
+            }
+        except Exception as exc:
+            LOGGER.info("debug 发布 /initialpose 失败：%s", exc)
+            return {
+                "published": False,
+                "topic": "/initialpose",
+                "message": "发布 /initialpose 失败：%s" % exc,
+            }
 
     def publish_clicked_point(self, target_pose: Pose) -> Dict[str, object]:
         """RViz Publish Point 等价：发布 geometry_msgs/PointStamped 到 /clicked_point。"""

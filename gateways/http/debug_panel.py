@@ -178,6 +178,21 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             raise as_gateway_error(exc) from exc
         return JSONResponse(to_jsonable(result))
 
+    @router.post("/api/debug/map/initial_pose")
+    async def debug_map_initial_pose(request: Request) -> JSONResponse:
+        """Debug 面板 RViz 2D Pose Estimate：发布 /initialpose，手动初始化位姿。"""
+
+        access_manager.authenticate_http(request)
+        body = await request.json()
+        arguments = dict(body or {})
+        try:
+            result = await run_in_threadpool(
+                lambda: runtime.dispatch_debug_initial_pose(arguments, requested_by="debug_panel"),
+            )
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+        return JSONResponse(to_jsonable(result))
+
     return router
 
 
@@ -416,6 +431,7 @@ def _render_debug_page(access_token: str) -> str:
     .map-control { min-height: 30px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface-strong); color: var(--accent-strong); padding: 5px 9px; font: inherit; font-size: 12px; font-weight: 740; cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease; }
     .map-control:hover { border-color: var(--accent); background: var(--panel-soft); }
     .map-control.active { border-color: #34d399; background: rgba(52, 211, 153, 0.14); color: #6ee7b7; }
+    .map-control.active.pose-tool { border-color: #f97316; background: rgba(249, 115, 22, 0.14); color: #fdba74; }
     #mapCanvas.goal-pick { cursor: crosshair; }
     #mapCanvas.goal-pick.pan-ready { cursor: grab; }
     #mapCanvas.goal-pick.panning { cursor: grabbing; }
@@ -614,6 +630,7 @@ def _render_debug_page(access_token: str) -> str:
                 <button id="mapZoomIn" class="map-control" type="button">+</button>
                 <button id="mapZoomReset" class="map-control" type="button">reset</button>
                 <button id="mapCenterRobot" class="map-control" type="button" title="视图居中到机器人（RViz 风格）" hidden>居中</button>
+                <button id="mapInitialPoseToggle" class="map-control pose-tool" type="button" title="RViz 2D Pose Estimate：左键拖拽设初始位姿，发布 /initialpose">2D Pose</button>
                 <button id="mapGoalToggle" class="map-control" type="button" title="RViz 风格 2D Goal：北向 map、左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
                 <button id="mapPublishPointToggle" class="map-control" type="button" title="RViz Publish Point：左键发布 /clicked_point，不导航">选点</button>
                 <button id="mapModeToggle" class="map-control" type="button" style="font-size:11px;padding:2px 8px;">3D</button>
@@ -631,6 +648,7 @@ def _render_debug_page(access_token: str) -> str:
               <span class="legend-item"><span class="swatch" style="background: var(--nav-plan)"></span>规划路径</span>
               <span class="legend-item"><span class="swatch" style="background: var(--map-robot)"></span>机器人</span>
               <span class="legend-item"><span class="swatch" style="background: var(--frontier)"></span>探索前沿</span>
+              <span class="legend-item"><span class="swatch" style="background: #f97316"></span>初始位姿</span>
               <span class="legend-item"><span class="swatch" style="background: #34d399"></span>导航目标</span>
               <span class="legend-item"><span class="swatch" style="background: #38bdf8"></span>选点</span>
               <span id="mapRvizHint" class="legend-item" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
@@ -802,6 +820,8 @@ def _render_debug_page(access_token: str) -> str:
         goalPickStroke: "#6ee7b7",
         clickedPoint: "#38bdf8",
         clickedPointStroke: "#7dd3fc",
+        initialPosePick: "#f97316",
+        initialPosePickStroke: "#fdba74",
         navPath: "#22ff66",
       };
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
@@ -847,9 +867,12 @@ def _render_debug_page(access_token: str) -> str:
         goalPose: null,
         goalPickMode: false,
         publishPointMode: false,
+        initialPosePickMode: false,
         goalPickDrag: null,
+        initialPosePickDrag: null,
         publishPointClick: null,
         clickedPoints: [],
+        initialPoses: [],
         pendingNavGoal: null,
         navigationPath: [],
         logs: [],
@@ -928,6 +951,7 @@ def _render_debug_page(access_token: str) -> str:
         mapCenterRobot: document.getElementById("mapCenterRobot"),
         mapZoomValue: document.getElementById("mapZoomValue"),
         mapRvizHint: document.getElementById("mapRvizHint"),
+        mapInitialPoseToggle: document.getElementById("mapInitialPoseToggle"),
         mapGoalToggle: document.getElementById("mapGoalToggle"),
         mapPublishPointToggle: document.getElementById("mapPublishPointToggle"),
         mapGoalStatus: document.getElementById("mapGoalStatus"),
@@ -1363,10 +1387,15 @@ def _render_debug_page(access_token: str) -> str:
         }));
       }
       function isMapToolActive() {
-        return Boolean(state.goalPickMode || state.publishPointMode);
+        return Boolean(state.goalPickMode || state.publishPointMode || state.initialPosePickMode);
       }
       function usesRvizMapView() {
-        return Boolean(isMapToolActive() || state.goalPickDrag || state.mapPanDrag);
+        return Boolean(
+          isMapToolActive()
+          || state.goalPickDrag
+          || state.initialPosePickDrag
+          || state.mapPanDrag,
+        );
       }
       function mapViewZoom() {
         return usesRvizMapView() ? (state.mapRvizView.zoom || 1) : state.mapZoom;
@@ -1657,19 +1686,24 @@ def _render_debug_page(access_token: str) -> str:
       function syncMapToolUi() {
         const goalActive = Boolean(state.goalPickMode);
         const pointActive = Boolean(state.publishPointMode);
-        const toolActive = goalActive || pointActive;
+        const initialPoseActive = Boolean(state.initialPosePickMode);
+        const toolActive = goalActive || pointActive || initialPoseActive;
+        if (els.mapInitialPoseToggle) els.mapInitialPoseToggle.classList.toggle("active", initialPoseActive);
         if (els.mapGoalToggle) els.mapGoalToggle.classList.toggle("active", goalActive);
         if (els.mapPublishPointToggle) els.mapPublishPointToggle.classList.toggle("active", pointActive);
         if (els.mapCanvas) {
           els.mapCanvas.classList.toggle("goal-pick", toolActive);
-          els.mapCanvas.classList.toggle("publish-point", pointActive && !goalActive);
+          els.mapCanvas.classList.toggle("publish-point", pointActive && !goalActive && !initialPoseActive);
+          els.mapCanvas.classList.toggle("initial-pose", initialPoseActive && !goalActive && !pointActive);
           els.mapCanvas.classList.toggle("pan-ready", toolActive && !state.mapPanDrag);
           els.mapCanvas.classList.toggle("panning", Boolean(state.mapPanDrag));
         }
         if (els.mapCenterRobot) els.mapCenterRobot.hidden = !toolActive;
         if (els.mapRvizHint) {
           els.mapRvizHint.hidden = !toolActive;
-          if (goalActive) {
+          if (initialPoseActive) {
+            els.mapRvizHint.textContent = "2D Pose：左键拖拽设初始位姿 · 中/右键平移 · 滚轮缩放";
+          } else if (goalActive) {
             els.mapRvizHint.textContent = "2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放";
           } else if (pointActive) {
             els.mapRvizHint.textContent = "选点：左键发布 /clicked_point · 中/右键平移 · 滚轮缩放";
@@ -1860,6 +1894,53 @@ def _render_debug_page(access_token: str) -> str:
         }
         requestMapDraw(false);
       }
+      async function dispatchInitialPose(mapPoint, yawRad) {
+        if (!state.mapGrid) {
+          updateGoalPickStatus("地图未显示，无法发布初始位姿", "error");
+          return;
+        }
+        const frameId = navigationFrameId();
+        const robotPoint = pointFromPose(state.pose);
+        const distanceM = planarDistanceMeters(mapPoint, robotPoint);
+        const body = {
+          frame_id: frameId,
+          x: Number(mapPoint.x),
+          y: Number(mapPoint.y),
+          z: 0,
+          yaw_rad: Number(yawRad),
+        };
+        const distanceLabel = distanceM === null ? "" : ` · 距当前位姿 ${distanceM.toFixed(2)}m`;
+        updateGoalPickStatus(`发布 /initialpose ${formatMapPoint(mapPoint)} yaw=${(body.yaw_rad * 180 / Math.PI).toFixed(0)}°${distanceLabel} · ${frameId}`, "pending");
+        try {
+          const response = await fetch(withAccessToken("/api/debug/map/initial_pose"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const message = String((payload && payload.message) || `HTTP ${response.status}`);
+            throw new Error(message);
+          }
+          state.initialPoses = [
+            {
+              x: body.x,
+              y: body.y,
+              z: body.z,
+              yaw_rad: body.yaw_rad,
+              frame_id: frameId,
+              at: Date.now(),
+            },
+            ...(state.initialPoses || []),
+          ].slice(0, 20);
+          const topic = payload.topic || "/initialpose";
+          updateGoalPickStatus(`已发布 ${topic} ${formatMapPoint(mapPoint)} yaw=${(body.yaw_rad * 180 / Math.PI).toFixed(0)}°${distanceLabel} · ${frameId}`, "ok");
+        } catch (error) {
+          const message = error && error.message ? error.message : String(error);
+          updateGoalPickStatus(`初始位姿发布失败：${message}`, "error");
+        }
+        requestMapDraw(false);
+      }
       function drawOrientedGoal(ctx, anchor, scale, point, yawRad, colors, pixels) {
         if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return;
         ctx.save();
@@ -1940,7 +2021,9 @@ def _render_debug_page(access_token: str) -> str:
         return pointFromPose(state.pose) ? "localization_pose_stream" : null;
       }
       function goalInteractionReason() {
-        if (state.goalPickMode || state.publishPointMode || state.pendingNavGoal) return "goal_pick";
+        if (state.goalPickMode || state.publishPointMode || state.initialPosePickMode || state.pendingNavGoal) {
+          return "goal_pick";
+        }
         return null;
       }
       function activeSpatialTaskReason() {
@@ -2140,7 +2223,7 @@ def _render_debug_page(access_token: str) -> str:
         state.navigationPath = [];
       }
       function clearMapDisplay(message, status, diagnostics, streamBridge, envelope, grid) {
-        if (state.goalPickMode || state.publishPointMode || state.pendingNavGoal) {
+        if (state.goalPickMode || state.publishPointMode || state.initialPosePickMode || state.pendingNavGoal) {
           els.mapEmpty.hidden = false;
           els.mapEmpty.textContent = message || MAP_DISPLAY_IDLE_MESSAGE;
           return;
@@ -2227,6 +2310,8 @@ def _render_debug_page(access_token: str) -> str:
         drawNavigationPath(ctx, anchor, scale);
         drawGoal(ctx, anchor, scale);
         drawGoalPickPreview(ctx, anchor, scale);
+        drawInitialPosePickPreview(ctx, anchor, scale);
+        drawInitialPoses(ctx, anchor, scale);
         drawClickedPoints(ctx, anchor, scale);
         drawFrontiers(ctx, anchor, scale);
         drawRobot(ctx, anchor);
@@ -2353,6 +2438,38 @@ def _render_debug_page(access_token: str) -> str:
           { fill: CANVAS_THEME.goalPick, stroke: CANVAS_THEME.goalPickStroke },
           3,
         );
+      }
+      function drawInitialPosePickPreview(ctx, anchor, scale) {
+        const drag = state.initialPosePickDrag;
+        if (!drag || !drag.start) return;
+        const previewAnchor = drag.anchor || anchor;
+        const previewScale = drag.anchor ? cameraScale(previewAnchor) : scale;
+        const yaw = goalPickYawFromDrag(drag);
+        drawOrientedGoal(
+          ctx,
+          previewAnchor,
+          previewScale,
+          drag.start,
+          yaw,
+          { fill: CANVAS_THEME.initialPosePick, stroke: CANVAS_THEME.initialPosePickStroke },
+          3,
+        );
+      }
+      function drawInitialPoses(ctx, anchor, scale) {
+        const poses = state.initialPoses || [];
+        if (!poses.length) return;
+        for (const pose of poses) {
+          if (!pose || !Number.isFinite(Number(pose.x)) || !Number.isFinite(Number(pose.y))) continue;
+          drawOrientedGoal(
+            ctx,
+            anchor,
+            scale,
+            { x: pose.x, y: pose.y },
+            Number(pose.yaw_rad) || 0,
+            { fill: CANVAS_THEME.initialPosePick, stroke: CANVAS_THEME.initialPosePickStroke },
+            2.4,
+          );
+        }
       }
       function drawRobot(ctx, anchor) {
         const posePoint = pointFromPose(state.pose);
@@ -3674,12 +3791,46 @@ def _render_debug_page(access_token: str) -> str:
       function disableMapTools(clearStatus) {
         state.goalPickMode = false;
         state.publishPointMode = false;
+        state.initialPosePickMode = false;
         state.goalPickDrag = null;
+        state.initialPosePickDrag = null;
         state.publishPointClick = null;
         state.mapPanDrag = null;
         syncMapToolUi();
         if (clearStatus) updateGoalPickStatus("", "");
         requestMapDraw(false);
+      }
+      function finishInitialPosePick(event) {
+        if (!state.initialPosePickDrag) return;
+        const drag = state.initialPosePickDrag;
+        state.initialPosePickDrag = null;
+        const yaw = goalPickYawFromDrag(drag);
+        void dispatchInitialPose(drag.start, yaw);
+        if (event && event.pointerId !== undefined && els.mapCanvas.releasePointerCapture) {
+          try { els.mapCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
+        }
+        requestMapDraw(false);
+      }
+      if (els.mapInitialPoseToggle) {
+        els.mapInitialPoseToggle.addEventListener("click", () => {
+          const next = !state.initialPosePickMode;
+          disableMapTools(false);
+          state.initialPosePickMode = next;
+          syncMapToolUi();
+          if (state.initialPosePickMode) {
+            resetRvizMapView();
+            reevaluateCachedMapDisplay();
+            updateGoalPickStatus(
+              state.mapGrid
+                ? "2D Pose 模式：左键拖拽设初始位姿 · 中/右键平移 · 滚轮缩放"
+                : "2D Pose 已开启，但地图未显示。请先 activate_map 并启动 go2.sh。",
+              state.mapGrid ? "pending" : "error",
+            );
+          } else {
+            updateGoalPickStatus("", "");
+          }
+          requestMapDraw(false);
+        });
       }
       if (els.mapGoalToggle) {
         els.mapGoalToggle.addEventListener("click", () => {
@@ -3765,6 +3916,18 @@ def _render_debug_page(access_token: str) -> str:
           if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
           return;
         }
+        if (state.initialPosePickMode) {
+          state.initialPosePickDrag = {
+            pointerStart: pointer,
+            pointerCurrent: pointer,
+            anchor,
+            start: mapPoint,
+            current: mapPoint,
+          };
+          if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
+          requestMapDraw(false);
+          return;
+        }
         state.goalPickDrag = {
           pointerStart: pointer,
           pointerCurrent: pointer,
@@ -3791,6 +3954,13 @@ def _render_debug_page(access_token: str) -> str:
           requestMapDraw(false);
           return;
         }
+        if (state.initialPosePickDrag) {
+          const pointer = canvasPointer(event);
+          state.initialPosePickDrag.pointerCurrent = pointer;
+          state.initialPosePickDrag.current = canvasToMap(pointer.x, pointer.y, state.initialPosePickDrag.anchor);
+          requestMapDraw(false);
+          return;
+        }
         if (!state.goalPickDrag) return;
         const pointer = canvasPointer(event);
         state.goalPickDrag.pointerCurrent = pointer;
@@ -3806,6 +3976,10 @@ def _render_debug_page(access_token: str) -> str:
           finishPublishPoint(event);
           return;
         }
+        if (state.initialPosePickDrag) {
+          finishInitialPosePick(event);
+          return;
+        }
         finishGoalPick(event);
       });
       els.mapCanvas.addEventListener("pointercancel", (event) => {
@@ -3815,6 +3989,10 @@ def _render_debug_page(access_token: str) -> str:
         }
         if (state.publishPointClick) {
           finishPublishPoint(event);
+          return;
+        }
+        if (state.initialPosePickDrag) {
+          finishInitialPosePick(event);
           return;
         }
         finishGoalPick(event);

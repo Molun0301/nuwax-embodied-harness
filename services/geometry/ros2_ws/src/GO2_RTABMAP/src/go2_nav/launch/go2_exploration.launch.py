@@ -83,35 +83,7 @@ def generate_launch_description():
                     executable='frontier_explorer.py',
                     name='frontier_explorer',
                     output=non_nav_output,
-                    parameters=[{
-                        'map_topic': cfg.map_topic,
-                        'global_frame': cfg.map_frame,
-                        'robot_frame': cfg.base_frame,
-                        'replan_period': 3.0,           # re-evaluate every 3s
-                        'min_frontier_size': 10,        # cells, after clustering
-                        # Balanced frontier utility:
-                        # reward nearby unknown area + useful frontier length,
-                        # penalize long travel and sharp heading changes,
-                        # prefer goal points with local obstacle clearance.
-                        'info_gain_radius': 1.5,        # m around candidate goal
-                        'info_gain_weight': 1.0,
-                        'size_weight': 0.6,
-                        'travel_weight': 0.8,
-                        'turn_weight': 0.25,
-                        'clearance_weight': 0.8,
-                        'max_goal_candidates_per_frontier': 80,
-                        'blacklist_radius': 0.5,        # m
-                        'blacklist_ttl': 60.0,          # s
-                        'max_consecutive_failures': 10,
-                        # Extra warmup to avoid Nav2 "send_goal failed" race.
-                        'startup_grace_period': 15.0,
-                        # Skip frontiers the robot is already beside; require a
-                        # real drive before accepting Nav2 success.
-                        'min_travel_m': 0.5,
-                        # Reject goals squeezed into tight corners (planner/collision).
-                        'min_goal_clearance_m': 0.25,
-                        'goal_success_tolerance': 0.45,
-                    }],
+                    parameters=[cfg.frontier_explorer_parameters()],
                 ),
             ],
         ),

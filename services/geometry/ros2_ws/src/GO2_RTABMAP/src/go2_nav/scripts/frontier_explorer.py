@@ -8,7 +8,8 @@ information gain, travel cost, turn cost, and local clearance, then dispatches
 the best goal to Nav2 via the /navigate_to_pose action. Failed goals are
 blacklisted briefly so we don't loop on the same unreachable spot.
 
-Stops automatically when no frontiers remain (map fully explored).
+Stops only when no frontiers remain. On repeated Nav2 failures it escalates
+strategy (relaxed -> corridor -> retry reset) instead of ending exploration.
 
 Tunables (ROS parameters, all overridable from launch):
   - map_topic           : /map
@@ -91,11 +92,27 @@ class FrontierExplorer(Node):
         self.declare_parameter('blacklist_ttl', 60.0)
         self.declare_parameter('goal_yaw_to_robot', True)
         self.declare_parameter('max_consecutive_failures', 10)
+        # After this many consecutive nav failures, relax goal clearance / travel filters.
+        self.declare_parameter('failures_before_relaxed', 4)
+        # Prefer nearer goals with gentler turns (office corridor friendly).
+        self.declare_parameter('failures_before_corridor', 7)
+        # Clear blacklist, cooldown, then retry — never treat as exploration complete.
+        self.declare_parameter('failures_before_retry_reset', 10)
+        self.declare_parameter('relaxed_min_goal_clearance_m', 0.15)
+        self.declare_parameter('relaxed_min_travel_m', 0.35)
+        self.declare_parameter('corridor_travel_weight_scale', 1.35)
+        self.declare_parameter('corridor_turn_weight_scale', 1.5)
+        self.declare_parameter('retry_cooldown_sec', 12.0)
         # Grace period after launch before sending the first goal. Nav2's
         # lifecycle manager reports 'active' before the bt_navigator finishes
         # wiring up its internal action clients (compute_path_to_pose,
         # follow_path, ...), so sending a goal immediately races and gets
         # rejected with 'send_goal failed'. Wait a few seconds to be safe.
+        # Before frontier scoring, send one short forward goal so RTAB-Map/Nav2
+        # get fresh odometry and map updates (stack is unreliable if the robot
+        # never moves after launch).
+        self.declare_parameter('bootstrap_forward_enabled', True)
+        self.declare_parameter('bootstrap_forward_m', 0.2)
         self.declare_parameter('startup_grace_period', 8.0)
         # Hard timeout for a single navigation goal. Foxy's bt_navigator
         # occasionally segfaults mid-execution (CycloneDDS rmw bug); when that
@@ -131,6 +148,16 @@ class FrontierExplorer(Node):
         self.blacklist_ttl = float(gp('blacklist_ttl').value)
         self.goal_yaw_to_robot = bool(gp('goal_yaw_to_robot').value)
         self.max_consecutive_failures = int(gp('max_consecutive_failures').value)
+        self.failures_before_relaxed = int(gp('failures_before_relaxed').value)
+        self.failures_before_corridor = int(gp('failures_before_corridor').value)
+        self.failures_before_retry_reset = int(gp('failures_before_retry_reset').value)
+        self.relaxed_min_goal_clearance_m = float(gp('relaxed_min_goal_clearance_m').value)
+        self.relaxed_min_travel_m = float(gp('relaxed_min_travel_m').value)
+        self.corridor_travel_weight_scale = float(gp('corridor_travel_weight_scale').value)
+        self.corridor_turn_weight_scale = float(gp('corridor_turn_weight_scale').value)
+        self.retry_cooldown_sec = float(gp('retry_cooldown_sec').value)
+        self.bootstrap_forward_enabled = bool(gp('bootstrap_forward_enabled').value)
+        self.bootstrap_forward_m = float(gp('bootstrap_forward_m').value)
         self.startup_grace_period = float(gp('startup_grace_period').value)
         self.goal_timeout = float(gp('goal_timeout').value)
         self.min_travel_m = float(gp('min_travel_m').value)
@@ -162,6 +189,10 @@ class FrontierExplorer(Node):
         self.exploration_done = False
         self._shutdown_requested = False
         self._idle_heartbeat_timer = None
+        self._cooldown_until: Optional[float] = None
+        self._active_strategy = 'normal'
+        self._bootstrap_forward_pending = self.bootstrap_forward_enabled
+        self._bootstrap_goal_active = False
 
         # Wall-clock startup time used for the initial grace period.
         self.start_time = self.get_clock().now().nanoseconds * 1e-9
@@ -245,14 +276,6 @@ class FrontierExplorer(Node):
             )
             return
 
-        if self.latest_map is None:
-            self.get_logger().info(
-                f'Waiting for first /map on topic "{self.map_topic}" '
-                f'(check QoS / topic name)',
-                throttle_duration_sec=5.0)
-            self.publish_status('WAITING for /map')
-            return
-
         # Watchdog: if a goal has been active too long, assume bt_navigator
         # is wedged (or has crashed silently) and recover. This prevents the
         # explorer from getting stuck forever when Nav2 dies mid-navigation.
@@ -269,24 +292,40 @@ class FrontierExplorer(Node):
                     self.active_goal_handle.cancel_goal_async()
                 except Exception as e:
                     self.get_logger().warn(f'cancel_goal_async failed: {e}')
-                self.fail_active_goal()
-                self.publish_status('TIMEOUT (recovering)')
+                if self._bootstrap_goal_active:
+                    self._finish_bootstrap_goal(succeeded=False)
+                    self.publish_status('STRATEGY:bootstrap TIMEOUT')
+                else:
+                    self.fail_active_goal()
+                    self.publish_status('TIMEOUT (recovering)')
                 return
             # Already navigating; keep goal + plan visible in RViz.
+            nav_status = (
+                f'STRATEGY:bootstrap NAVIGATING ({elapsed:.0f}s)'
+                if self._bootstrap_goal_active
+                else f'NAVIGATING ({elapsed:.0f}s)'
+            )
             self.publish_markers(
-                status=f'NAVIGATING ({elapsed:.0f}s)',
+                status=nav_status,
                 clusters=self.active_clusters_snapshot,
                 chosen=self.active_chosen_snapshot,
                 navigating=True,
             )
             return
-        if self.consecutive_failures >= self.max_consecutive_failures:
-            self.get_logger().warn(
-                f'Stopping exploration: {self.consecutive_failures} consecutive '
-                f'navigation failures. Map may be fully explored or blocked.'
+        if self._cooldown_until is not None:
+            if now < self._cooldown_until:
+                remaining = self._cooldown_until - now
+                self.publish_status(
+                    f'STRATEGY: cooldown ({remaining:.0f}s, failures={self.consecutive_failures})'
+                )
+                return
+            self._cooldown_until = None
+            self.get_logger().info(
+                'Cooldown finished; resuming frontier exploration with fresh blacklist.'
             )
-            self.exploration_done = True
-            self.publish_status('DONE (exploration finished)')
+
+        if self.consecutive_failures >= self.failures_before_retry_reset:
+            self._trigger_retry_reset(now)
             return
 
         # 1) Robot pose
@@ -297,6 +336,29 @@ class FrontierExplorer(Node):
                 throttle_duration_sec=5.0)
             return
         rx, ry, ryaw = robot
+
+        if self._bootstrap_forward_pending:
+            gx = rx + self.bootstrap_forward_m * math.cos(ryaw)
+            gy = ry + self.bootstrap_forward_m * math.sin(ryaw)
+            self.get_logger().info(
+                f'Bootstrap: dispatching forward goal ({gx:.2f},{gy:.2f}) '
+                f'{self.bootstrap_forward_m:.2f}m ahead to refresh map/Nav2.'
+            )
+            self.publish_status(
+                f'STRATEGY:bootstrap FORWARD {self.bootstrap_forward_m:.2f}m'
+            )
+            self.publish_markers(status='STRATEGY:bootstrap DISPATCHING')
+            self.send_nav_goal(gx, gy, (rx, ry, ryaw))
+            self._bootstrap_goal_active = self.active_goal_xy is not None
+            return
+
+        if self.latest_map is None:
+            self.get_logger().info(
+                f'Waiting for first /map on topic "{self.map_topic}" '
+                f'(check QoS / topic name)',
+                throttle_duration_sec=5.0)
+            self.publish_status('WAITING for /map')
+            return
 
         # 2) Frontier detection
         all_clusters = self.find_frontier_clusters(self.latest_map)
@@ -310,16 +372,21 @@ class FrontierExplorer(Node):
         # applied to the concrete candidate goal, not just the cluster centroid.
         self.expire_blacklist()
 
-        # 4) Score and pick best
-        best = self.pick_best(all_clusters, robot)
+        # 4) Score and pick best (strategy adjusts clearance / scoring after nav failures)
+        selection = self._selection_params()
+        self._active_strategy = selection['strategy']
+        best = self.pick_best(all_clusters, robot, selection=selection)
         if best is None:
-            self.publish_markers(
-                status='WAITING (no reachable frontiers)',
-                clusters=all_clusters,
+            status = (
+                f'WAITING:{selection["strategy"]} (no reachable frontiers, '
+                f'failures={self.consecutive_failures})'
             )
+            self.publish_markers(status=status, clusters=all_clusters)
             self.get_logger().info(
-                'No frontier goal meets min travel / blacklist filters; waiting.',
-                throttle_duration_sec=5.0)
+                'No frontier goal meets filters for strategy=%s; waiting.'
+                % selection['strategy'],
+                throttle_duration_sec=5.0,
+            )
             return
         gx, gy = best.goal_world
         self.get_logger().info(
@@ -335,7 +402,7 @@ class FrontierExplorer(Node):
 
         # 6) Visualize all candidates + chosen goal
         self.publish_markers(
-            status='DISPATCHING GOAL',
+            status=f'STRATEGY:{selection["strategy"]} DISPATCHING GOAL',
             clusters=all_clusters,
             chosen=best,
         )
@@ -432,8 +499,53 @@ class FrontierExplorer(Node):
     # ------------------------------------------------------------------
     # Goal selection
     # ------------------------------------------------------------------
+    def _selection_params(self) -> dict:
+        failures = self.consecutive_failures
+        if failures >= self.failures_before_corridor:
+            strategy = 'corridor'
+            min_travel = self.relaxed_min_travel_m
+            min_clearance = self.relaxed_min_goal_clearance_m
+            travel_weight = self.travel_weight * self.corridor_travel_weight_scale
+            turn_weight = self.turn_weight * self.corridor_turn_weight_scale
+        elif failures >= self.failures_before_relaxed:
+            strategy = 'relaxed'
+            min_travel = self.relaxed_min_travel_m
+            min_clearance = self.relaxed_min_goal_clearance_m
+            travel_weight = self.travel_weight
+            turn_weight = self.turn_weight
+        else:
+            strategy = 'normal'
+            min_travel = self.min_travel_m
+            min_clearance = self.min_goal_clearance_m
+            travel_weight = self.travel_weight
+            turn_weight = self.turn_weight
+        return {
+            'strategy': strategy,
+            'min_travel_m': min_travel,
+            'min_goal_clearance_m': min_clearance,
+            'travel_weight': travel_weight,
+            'turn_weight': turn_weight,
+        }
+
+    def _trigger_retry_reset(self, now: float) -> None:
+        self.get_logger().warn(
+            f'{self.consecutive_failures} consecutive navigation failures — '
+            f'switching strategy: clear blacklist, cooldown {self.retry_cooldown_sec:.0f}s, '
+            f'then retry (exploration continues).'
+        )
+        self.blacklist.clear()
+        self.consecutive_failures = 0
+        self._active_strategy = 'retry_reset'
+        self._cooldown_until = now + max(1.0, self.retry_cooldown_sec)
+        self.publish_status(
+            f'STRATEGY:retry_reset (cooldown {self.retry_cooldown_sec:.0f}s)'
+        )
+
     def pick_best(self, clusters: List[FrontierCluster],
-                  robot_pose: Tuple[float, float, float]) -> Optional[FrontierCandidate]:
+                  robot_pose: Tuple[float, float, float],
+                  *,
+                  selection: Optional[dict] = None) -> Optional[FrontierCandidate]:
+        selection = selection or self._selection_params()
         grid = np.array(self.latest_map.data, dtype=np.int16).reshape(
             self.latest_map.info.height, self.latest_map.info.width
         )
@@ -441,12 +553,14 @@ class FrontierExplorer(Node):
         best = None
         best_score = -float('inf')
         for c in clusters:
-            candidate = self.evaluate_cluster(c, robot_pose, grid, info)
+            candidate = self.evaluate_cluster(
+                c, robot_pose, grid, info, selection=selection,
+            )
             if self.is_blacklisted(*candidate.goal_world):
                 continue
-            if candidate.travel_m < self.min_travel_m:
+            if candidate.travel_m < selection['min_travel_m']:
                 continue
-            if candidate.clearance_m < self.min_goal_clearance_m:
+            if candidate.clearance_m < selection['min_goal_clearance_m']:
                 continue
             if candidate.score > best_score:
                 best_score = candidate.score
@@ -456,7 +570,12 @@ class FrontierExplorer(Node):
     def evaluate_cluster(self, cluster: FrontierCluster,
                          robot_pose: Tuple[float, float, float],
                          grid: np.ndarray,
-                         info) -> FrontierCandidate:
+                         info,
+                         *,
+                         selection: Optional[dict] = None) -> FrontierCandidate:
+        selection = selection or self._selection_params()
+        travel_weight = float(selection['travel_weight'])
+        turn_weight = float(selection['turn_weight'])
         rx, ry, ryaw = robot_pose
         res = info.resolution
         ox = info.origin.position.x
@@ -492,8 +611,8 @@ class FrontierExplorer(Node):
             local_score = (
                 self.info_gain_weight * math.log1p(info_gain) +
                 self.size_weight * math.log1p(cluster.size) -
-                self.travel_weight * travel -
-                self.turn_weight * heading_error +
+                travel_weight * travel -
+                turn_weight * heading_error +
                 self.clearance_weight * clearance_m
             )
             if local_score > best_goal_score:
@@ -514,8 +633,8 @@ class FrontierExplorer(Node):
             best_travel = math.hypot(best_goal[0] - rx, best_goal[1] - ry)
             best_goal_score = (
                 self.size_weight * math.log1p(cluster.size) -
-                self.travel_weight * best_travel -
-                self.turn_weight * best_heading_error
+                travel_weight * best_travel -
+                turn_weight * best_heading_error
             )
 
         return FrontierCandidate(
@@ -842,6 +961,17 @@ class FrontierExplorer(Node):
             self.fail_active_goal()
             return
         status = result.status
+        if self._bootstrap_goal_active:
+            succeeded = status == GoalStatus.STATUS_SUCCEEDED
+            if succeeded:
+                self.get_logger().info('Bootstrap forward step completed.')
+            else:
+                self.get_logger().warn(
+                    f'Bootstrap forward step failed (status={status}); '
+                    f'continuing with frontier exploration.'
+                )
+            self._finish_bootstrap_goal(succeeded=succeeded)
+            return
         goal_xy = self.active_goal_xy
         if status == GoalStatus.STATUS_SUCCEEDED:
             robot = self.get_robot_pose()
@@ -864,6 +994,7 @@ class FrontierExplorer(Node):
                     + ', looking for next.'
                 )
                 self.consecutive_failures = 0
+                self._active_strategy = 'normal'
         else:
             self.get_logger().warn(
                 f'Goal {goal_xy} failed (status={status}); blacklisting.'
@@ -874,10 +1005,21 @@ class FrontierExplorer(Node):
         self._clear_active_goal()
 
     def fail_active_goal(self):
+        if self._bootstrap_goal_active:
+            self._finish_bootstrap_goal(succeeded=False)
+            return
         if self.active_goal_xy is not None:
             self.add_to_blacklist(*self.active_goal_xy)
         self._clear_active_goal()
         self.consecutive_failures += 1
+
+    def _finish_bootstrap_goal(self, *, succeeded: bool) -> None:
+        self._bootstrap_goal_active = False
+        self._bootstrap_forward_pending = False
+        if succeeded:
+            self.consecutive_failures = 0
+            self._active_strategy = 'normal'
+        self._clear_active_goal()
 
     def _clear_active_goal(self):
         self.active_goal_handle = None

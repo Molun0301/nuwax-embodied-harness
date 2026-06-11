@@ -510,11 +510,7 @@ class ExternalGeometryDebugObserver:
             if not text:
                 continue
             normalized = text.upper()
-            done = (
-                "DONE" in normalized
-                or "COMPLETE" in normalized
-                or "EXPLORATION FINISHED" in normalized
-            )
+            done = "DONE (EXPLORATION FINISHED)" in normalized
             return {
                 "text": text,
                 "terminal": done,

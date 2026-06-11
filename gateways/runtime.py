@@ -4410,6 +4410,58 @@ class GatewayRuntime:
         )
         return result
 
+    def dispatch_debug_initial_pose(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Debug 面板 RViz 2D Pose Estimate：发布 /initialpose，触发重定位。"""
+
+        pose = self._build_pose_from_arguments(arguments)
+        provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
+        if provider is None:
+            raise GatewayError(
+                "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
+                error_code="nav2_provider_unavailable",
+                http_status=503,
+            )
+        result = dict(provider.publish_initial_pose(pose))
+        result["target_pose"] = pose.model_dump(mode="json")
+        result["requested_by"] = requested_by or "debug_panel"
+        if not bool(result.get("published")):
+            raise GatewayError(
+                str(result.get("message") or "发布 /initialpose 失败。"),
+                error_code="initial_pose_publish_failed",
+                http_status=503,
+                details=result,
+            )
+        robot_pose = None
+        try:
+            robot_pose = provider._read_current_pose()
+        except Exception:
+            robot_pose = None
+        if robot_pose is not None and getattr(robot_pose, "position", None) is not None:
+            robot_x = float(robot_pose.position.x)
+            robot_y = float(robot_pose.position.y)
+            result["robot_pose"] = {
+                "frame_id": str(getattr(robot_pose, "frame_id", "") or pose.frame_id),
+                "x": robot_x,
+                "y": robot_y,
+            }
+            result["distance_m"] = math.hypot(float(pose.position.x) - robot_x, float(pose.position.y) - robot_y)
+        RUNTIME_LOGGER.info(
+            "debug_initial_pose publish topic=%s pose=(%.3f, %.3f, %.3f) frame=%s robot=%s distance_m=%s",
+            result.get("topic"),
+            float(pose.position.x),
+            float(pose.position.y),
+            float(pose.position.z),
+            pose.frame_id,
+            result.get("robot_pose"),
+            result.get("distance_m"),
+        )
+        return result
+
     def _handle_navigate_to_pose(
         self,
         arguments: Dict[str, Any],

@@ -1995,8 +1995,10 @@ class PlatformGeometryRuntime:
         if not cleaned:
             return None
         upper = cleaned.upper()
-        if "DONE" in upper or "EXPLORATION FINISHED" in upper:
+        if "DONE (EXPLORATION FINISHED)" in upper:
             return "GO2_RTABMAP 原生探索已完成：%s" % cleaned
+        if upper.startswith("STRATEGY:"):
+            return "探索换策略中：%s" % cleaned
         if frontier_count is not None and frontier_count > 0:
             return "正在探索（%s）：%d 个前沿点" % (cleaned, int(frontier_count))
         return "正在探索：%s" % cleaned
@@ -2021,7 +2023,7 @@ class PlatformGeometryRuntime:
         explorer_actually_running = bool(
             active
             and explorer_message is not None
-            and not any(term in frontier_status_text for term in ("DONE", "EXPLORATION FINISHED"))
+            and "DONE (EXPLORATION FINISHED)" not in frontier_status_text
         )
         # 安全条款：_error 结尾的诊断必须始终覆写 headline（真实错误不被遮蔽）。
         is_error_diagnostic = bool(
@@ -4965,7 +4967,7 @@ class PlatformGeometryRuntime:
         if bool(metadata.get("exploration_terminal")) or bool(metadata.get("terminal")):
             return True
         status_text = str(metadata.get("status_text") or "").upper()
-        if "DONE" in status_text or "EXPLORATION FINISHED" in status_text:
+        if "DONE (EXPLORATION FINISHED)" in status_text:
             return True
         observer_meta = metadata.get("external_frontier_debug_observer")
         if isinstance(observer_meta, dict):
@@ -4973,7 +4975,7 @@ class PlatformGeometryRuntime:
             if bool(observer_payload.get("exploration_terminal")):
                 return True
             observer_status = str(observer_payload.get("status_text") or "").upper()
-            if "DONE" in observer_status or "EXPLORATION FINISHED" in observer_status:
+            if "DONE (EXPLORATION FINISHED)" in observer_status:
                 return True
         return False
 
@@ -5247,19 +5249,11 @@ class PlatformGeometryRuntime:
             "shutting down frontier_explorer node",
         )
         complete_pos = max((normalized.rfind(marker) for marker in complete_markers), default=-1)
-        failure_pos = normalized.rfind("stopping exploration:")
-        has_failure = failure_pos >= 0 and "consecutive navigation failures" in normalized
-        if complete_pos >= 0 and complete_pos >= failure_pos:
+        if complete_pos >= 0:
             return {
                 "status": ExplorationStatus.SUCCEEDED,
                 "reason": "external_explorer_log_complete",
                 "message": "GO2_RTABMAP 原生探索已完成。",
-            }
-        if has_failure:
-            return {
-                "status": ExplorationStatus.SUCCEEDED,
-                "reason": "external_explorer_log_navigation_failures_terminal",
-                "message": "GO2_RTABMAP 原生探索已完成（连续导航失败终止，可能已探索完或剩余前沿被阻塞）。",
             }
         return None
 

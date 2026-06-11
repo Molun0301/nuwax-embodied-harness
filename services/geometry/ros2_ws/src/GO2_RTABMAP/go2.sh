@@ -299,6 +299,11 @@ echo "[go2.sh]   lidar_frame       = ${NUWAX_GEOMETRY_LIDAR_FRAME}"
 echo "[go2.sh]   robot_radius      = ${NUWAX_GEOMETRY_ROBOT_RADIUS}"
 echo "[go2.sh]   inflation_radius  = ${NUWAX_GEOMETRY_INFLATION_RADIUS}"
 echo "[go2.sh]   inflation_scaling = ${NUWAX_GEOMETRY_INFLATION_COST_SCALING}"
+echo "[go2.sh]   explore_min_frontier = ${NUWAX_GEOMETRY_EXPLORATION_MIN_FRONTIER_SIZE}"
+echo "[go2.sh]   explore_fail_relaxed = ${NUWAX_GEOMETRY_EXPLORATION_FAILURES_BEFORE_RELAXED}"
+echo "[go2.sh]   explore_fail_corridor = ${NUWAX_GEOMETRY_EXPLORATION_FAILURES_BEFORE_CORRIDOR}"
+echo "[go2.sh]   explore_fail_retry   = ${NUWAX_GEOMETRY_EXPLORATION_FAILURES_BEFORE_RETRY}"
+echo "[go2.sh]   explore_bootstrap_m  = ${NUWAX_GEOMETRY_EXPLORATION_BOOTSTRAP_FORWARD_M}"
 echo
 
 exec ros2 launch go2_nav "$LAUNCH" "database_path:=$DB_PATH"

@@ -11,6 +11,7 @@ from contracts.base import utc_now
 from contracts.geometry import Pose
 from contracts.naming import build_anchor_id, build_instance_id
 from contracts.spatial_memory import (
+    DeferredProjectionInput,
     InstanceDynamicState,
     InstanceLifecycleState,
     InstanceMovability,
@@ -68,6 +69,7 @@ class InstanceAssociationService:
         InstanceMovability.TRANSIENT: 24 * 3600.0,
     }
     _OBSERVATION_WINDOW_LIMIT = 8
+    _DEFERRED_CACHE_LIMIT = 32
     _STATIC_CLASS_KEYWORDS = ("wall", "door", "dock", "station", "shelf", "charger", "table", "cabinet")
     _DYNAMIC_CLASS_KEYWORDS = ("person", "human", "pedestrian", "dog", "cat", "visitor", "worker", "vehicle", "car", "truck", "bus", "bicycle", "motorcycle")
     _QUASI_STATIC_CLASS_KEYWORDS = ("chair", "cart", "box", "bag", "cone", "barrier", "barricade", "trash")
@@ -206,11 +208,15 @@ class InstanceAssociationService:
             return 0.0
         distance_m = self._distance(observation.pose, candidate.pose)
         max_distance_m = self._MERGE_DISTANCE_M.get(candidate.movability, 1.0)
-        if distance_m > max_distance_m:
+        same_track = bool(observation.track_id and observation.track_id == str(candidate.metadata.get("last_track_id") or ""))
+        # 阶段0：待定位实例的 pose 是机器人哨兵位姿(空间无意义)，距离门控不适用；
+        # 同 track 的可信观测应允许"救回"该实例，绕过距离硬门。
+        candidate_pending = (candidate.metadata or {}).get("pending_localization") is True
+        bypass_distance_gate = same_track and candidate_pending
+        if distance_m > max_distance_m and not bypass_distance_gate:
             return 0.0
         observation_segmentation = self._summarize_segmentation_metadata(observation.attributes)
         candidate_segmentation = self._summarize_segmentation_metadata(candidate.metadata)
-        same_track = bool(observation.track_id and observation.track_id == str(candidate.metadata.get("last_track_id") or ""))
         if not same_track and self._segmentation_blocks_merge(
             observation.attributes,
             candidate.metadata,
@@ -488,7 +494,20 @@ class InstanceAssociationService:
         now: datetime,
     ) -> SemanticInstance:
         updated_count = current.observation_count + 1
-        blended_pose = self._blend_pose(current.pose, observation.pose, weight=float(current.observation_count) / float(updated_count))
+        # 阶段0 quality-gated blend：
+        # - fallback 观测(坐标=机器人位姿)不参与位置加权；既有可信则保留，否则用本次。
+        # - 可信观测遇到 pending/不可信的既有坐标(哨兵无意义) → 完全覆盖，不做加权。
+        # - 其余(双方可信) → 正常按观测次数加权融合。
+        if self._is_fallback_observation(observation):
+            blended_pose = current.pose if self._instance_pose_is_reliable(current) else observation.pose
+        elif not self._instance_pose_is_reliable(current):
+            blended_pose = observation.pose
+        else:
+            blended_pose = self._blend_pose(
+                current.pose,
+                observation.pose,
+                weight=float(current.observation_count) / float(updated_count),
+            )
         visual_labels = self._merge_strings(current.visual_labels, observation.visual_labels)
         semantic_labels = self._merge_strings(current.semantic_labels, observation.semantic_labels)
         artifact_ids = self._merge_strings(current.artifact_ids, observation.source_artifact_ids)
@@ -507,6 +526,11 @@ class InstanceAssociationService:
             observation,
             now=now,
         )
+        deferred_cache = self._build_deferred_projection_cache(
+            current.deferred_projection_cache,
+            observation,
+            now=now,
+        )
         dynamic_state, dynamic_metadata = self._classify_dynamic_state(
             label=observation.label,
             movability=current.movability,
@@ -520,6 +544,15 @@ class InstanceAssociationService:
         )
         metadata.update(dynamic_metadata)
         metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
+        # 阶段0：待定位实例收到首个可信投影时，清除 pending_localization 标记并转回 ACTIVE。
+        was_pending = bool((current.metadata or {}).get("pending_localization"))
+        if was_pending and not self._is_fallback_observation(observation):
+            metadata.pop("pending_localization", None)
+        elif was_pending:
+            metadata["pending_localization"] = True
+        merged_lifecycle = InstanceLifecycleState.ACTIVE
+        if was_pending and self._is_fallback_observation(observation):
+            merged_lifecycle = InstanceLifecycleState.UNCERTAIN
         return current.model_copy(
             update={
                 "pose": blended_pose,
@@ -537,7 +570,8 @@ class InstanceAssociationService:
                 "inspection_poses": inspection_poses,
                 "dynamic_state": dynamic_state,
                 "observation_window": observation_window,
-                "lifecycle_state": InstanceLifecycleState.ACTIVE,
+                "deferred_projection_cache": deferred_cache,
+                "lifecycle_state": merged_lifecycle,
                 "metadata": metadata,
                 "supporting_observation_event_ids": supporting_event_ids,
             },
@@ -564,6 +598,7 @@ class InstanceAssociationService:
         )
         movability = self._infer_movability(observation.label, observation.attributes)
         observation_window = self._build_observation_window((), observation, now=now)
+        deferred_cache = self._build_deferred_projection_cache((), observation, now=now)
         dynamic_state, dynamic_metadata = self._classify_dynamic_state(
             label=observation.label,
             movability=movability,
@@ -576,6 +611,14 @@ class InstanceAssociationService:
         )
         metadata.update(dynamic_metadata)
         metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
+        # 阶段0：首观测即 fallback 时，不把机器人位姿当作物体坐标暴露给导航。
+        # 标记 pending_localization + navigable=False + UNCERTAIN，等后续可信投影覆盖。
+        created_lifecycle = InstanceLifecycleState.ACTIVE
+        if self._is_fallback_observation(observation):
+            metadata["pending_localization"] = True
+            metadata["navigable"] = False
+            metadata["non_navigable_reason"] = "current_pose_fallback_no_geometry"
+            created_lifecycle = InstanceLifecycleState.UNCERTAIN
         return SemanticInstance(
             instance_id=instance_id,
             anchor_id=anchor_id,
@@ -590,7 +633,8 @@ class InstanceAssociationService:
             movability=movability,
             dynamic_state=dynamic_state,
             observation_window=observation_window,
-            lifecycle_state=InstanceLifecycleState.ACTIVE,
+            deferred_projection_cache=deferred_cache,
+            lifecycle_state=created_lifecycle,
             confidence=float(observation.score),
             observation_count=1,
             first_seen_ts=now,
@@ -744,7 +788,7 @@ class InstanceAssociationService:
             previous_navigable is False
             and previous_non_navigable_reason == "current_pose_fallback_no_geometry"
             and projection_method != "current_pose_fallback"
-            and support_point_count > 0
+            and (support_point_count > 0 or projection_method in ("ray_triangulation", "delayed_pointcloud_projection"))
         )
         if navigable is None and not fallback_recovered:
             navigable = previous_navigable
@@ -806,21 +850,83 @@ class InstanceAssociationService:
         now: datetime,
     ) -> List[InstanceObservationWindowSample]:
         window = [item for item in current_window if isinstance(item, InstanceObservationWindowSample)]
+        projection_method = str(observation.attributes.get("projection_method") or "")
         window.append(
             InstanceObservationWindowSample(
                 timestamp=now,
                 pose=observation.pose,
+                observer_pose=self._observer_pose_from_observation(observation),
                 bbox_xyxy=self._observation_bbox_xyxy(observation.attributes),
                 confidence=float(observation.score),
                 track_id=observation.track_id,
                 metadata={
                     "camera_id": observation.camera_id or "",
                     "source_observation_id": observation.source_observation_id,
-                    "projection_method": str(observation.attributes.get("projection_method") or ""),
+                    "projection_method": projection_method,
+                    # 阶段0：标记该样本坐标是否可信(非 fallback)，供动态分类位移计算过滤。
+                    "projection_reliable": not self._is_fallback_observation(observation),
                 },
             )
         )
         return window[-self._OBSERVATION_WINDOW_LIMIT :]
+
+    def _observer_pose_from_observation(self, observation: ProjectedObservation) -> Optional[Pose]:
+        """从观测的射线光心(map frame)构造观测者位姿，供三角化/延迟投影使用。"""
+
+        origin = observation.attributes.get("ray_origin_map")
+        if not isinstance(origin, (list, tuple)) or len(origin) < 3:
+            return None
+        try:
+            from contracts.geometry import Vector3
+
+            return Pose(
+                frame_id="map",
+                position=Vector3(x=float(origin[0]), y=float(origin[1]), z=float(origin[2])),
+                orientation=observation.pose.orientation,
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _build_deferred_projection_cache(
+        self,
+        current_cache: Iterable[DeferredProjectionInput],
+        observation: ProjectedObservation,
+        *,
+        now: datetime,
+    ) -> List[DeferredProjectionInput]:
+        """累积延迟投影输入(射线/observer_pose/bbox)，独立于 8 样本观测窗口不被驱逐。
+
+        仅当本次观测带有效射线时追加；上限取较大窗口(32)避免无限增长。
+        """
+
+        cache = [item for item in current_cache if isinstance(item, DeferredProjectionInput)]
+        observer_pose = self._observer_pose_from_observation(observation)
+        if observer_pose is None:
+            return cache
+        origin = observation.attributes.get("ray_origin_map")
+        direction = observation.attributes.get("ray_dir_map")
+        ray_origin = [float(v) for v in origin[:3]] if isinstance(origin, (list, tuple)) and len(origin) >= 3 else None
+        ray_dir = [float(v) for v in direction[:3]] if isinstance(direction, (list, tuple)) and len(direction) >= 3 else None
+        cone_half_angle = observation.attributes.get("ray_cone_half_angle_rad")
+        try:
+            cone_half_angle_rad = float(cone_half_angle) if cone_half_angle is not None else None
+        except (TypeError, ValueError):
+            cone_half_angle_rad = None
+        cache.append(
+            DeferredProjectionInput(
+                observer_pose=observer_pose,
+                bbox_xyxy=self._observation_bbox_xyxy(observation.attributes),
+                track_id=observation.track_id,
+                camera_frame_id=str(observation.attributes.get("camera_frame_id") or "") or None,
+                ray_origin_map=ray_origin,
+                ray_dir_map=ray_dir,
+                cone_half_angle_rad=cone_half_angle_rad,
+                source_observation_id=observation.source_observation_id,
+                timestamp=now,
+            )
+        )
+        return cache[-self._DEFERRED_CACHE_LIMIT :]
+
 
     def _observation_bbox_xyxy(self, attributes: Dict[str, object]) -> List[float]:
         for key in ("bbox_xyxy", "segmentation_bbox_xyxy", "bbox", "2d_bbox"):
@@ -923,9 +1029,19 @@ class InstanceAssociationService:
         first = observation_window[0]
         last = observation_window[-1]
         duration_sec = max(0.0, (last.timestamp - first.timestamp).total_seconds())
+        # 阶段0：位移仅基于坐标可信(非 fallback)的样本计算，避免 fallback 机器人位姿
+        # 与三角化/点云物体位姿混算位移导致的假 DYNAMIC 误判。
+        reliable = [item for item in observation_window if self._sample_projection_reliable(item)]
+        displacement_samples = reliable if len(reliable) >= 2 else observation_window
+        ref_first = displacement_samples[0]
+        ref_last = displacement_samples[-1]
         max_displacement = 0.0
-        for item in observation_window:
-            max_displacement = max(max_displacement, self._distance(first.pose, item.pose), self._distance(last.pose, item.pose))
+        for item in displacement_samples:
+            max_displacement = max(
+                max_displacement,
+                self._distance(ref_first.pose, item.pose),
+                self._distance(ref_last.pose, item.pose),
+            )
         speed = max_displacement / duration_sec if duration_sec > 0.0 else 0.0
         track_ids: List[str] = []
         for item in observation_window:
@@ -938,6 +1054,17 @@ class InstanceAssociationService:
             "estimated_speed_mps": round(float(speed), 6),
             "track_ids": track_ids,
         }
+
+    @staticmethod
+    def _sample_projection_reliable(sample: InstanceObservationWindowSample) -> bool:
+        """观测窗口样本坐标是否可信(非 current_pose_fallback)。"""
+
+        metadata = sample.metadata or {}
+        if "projection_reliable" in metadata:
+            return bool(metadata.get("projection_reliable"))
+        # 兼容旧样本(无该标记)：按 projection_method 推断。
+        method = str(metadata.get("projection_method") or "")
+        return method != "current_pose_fallback"
 
     def _apply_dynamic_navigation_policy(
         self,
@@ -1003,6 +1130,10 @@ class InstanceAssociationService:
             lifecycle_state = InstanceLifecycleState.STALE
         elif age_sec >= uncertain_after_sec:
             lifecycle_state = InstanceLifecycleState.UNCERTAIN
+        # 阶段0：待定位实例(坐标尚不可信)保持 UNCERTAIN，不因年龄年轻被提升为 ACTIVE。
+        if (instance.metadata or {}).get("pending_localization") is True:
+            if lifecycle_state == InstanceLifecycleState.ACTIVE:
+                lifecycle_state = InstanceLifecycleState.UNCERTAIN
         if lifecycle_state == instance.lifecycle_state:
             return instance
         return instance.model_copy(
@@ -1054,6 +1185,24 @@ class InstanceAssociationService:
         left_vector = self._text_embedder.embed_text(left_text)
         right_vector = self._text_embedder.embed_text(right_text)
         return max(0.0, self._text_embedder.cosine_similarity(left_vector, right_vector))
+
+    @staticmethod
+    def _is_fallback_observation(observation: ProjectedObservation) -> bool:
+        """该观测是否为 current_pose_fallback(坐标=机器人位姿，不可信)。"""
+
+        method = str(observation.attributes.get("projection_method") or "")
+        reason = str(observation.attributes.get("projection_degradation_reason") or "")
+        return method == "current_pose_fallback" or reason == "current_pose_fallback_no_geometry"
+
+    @staticmethod
+    def _instance_pose_is_reliable(instance: SemanticInstance) -> bool:
+        """既有实例坐标是否来自可信投影(非 fallback / 非待定位)。"""
+
+        metadata = instance.metadata or {}
+        if metadata.get("pending_localization") is True:
+            return False
+        method = str(metadata.get("projection_method") or "")
+        return method != "" and method != "current_pose_fallback"
 
     def _blend_pose(self, left: Pose, right: Pose, *, weight: float) -> Pose:
         clamped_weight = max(0.0, min(1.0, float(weight)))

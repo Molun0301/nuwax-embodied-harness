@@ -454,6 +454,8 @@ class GatewayRuntime:
             embedding_api_key=config.runtime_data.memory_embedding_api_key,
             embedding_base_url=config.runtime_data.memory_embedding_base_url,
             embedding_timeout_sec=config.runtime_data.memory_embedding_timeout_sec,
+            deferred_projection_config=config.perception.deferred_projection,
+            accumulated_cloud_provider=self._provide_accumulated_pointcloud_xyz,
         )
         self.perception_video_runtime.bind_memory_service(self.memory_service)
         self.navigation_service = NavigationService(
@@ -899,6 +901,36 @@ class GatewayRuntime:
     def _handle_map_frame_for_pointcloud_map_stream(self, frame: Any) -> None:
         del frame
         self._publish_pointcloud_map_stream_frame(reason="map_frame_update")
+
+    def _provide_accumulated_pointcloud_xyz(self):
+        """供延迟点云精化 worker 拉取的累积点云(map frame, Nx3 ndarray)。
+
+        读累计点云 PCD 资产 → PointCloudMapCache 按 mtime/size 缓存加载 →
+        返回 .points_xyz。资产缺失/加载失败返回 None（worker 据此优雅降级）。
+        """
+
+        try:
+            source_summary = self.platform_geometry_runtime.get_live_pointcloud_map_asset_summary()
+        except Exception:  # noqa: BLE001 - 不让精化拉取拖垮调用方
+            logger.debug("累积点云资产摘要获取失败", exc_info=True)
+            return None
+        pcd_path = source_summary.get("pcd_path") or source_summary.get("path")
+        if not pcd_path or not bool(source_summary.get("available")):
+            return None
+        frame_id = str(source_summary.get("frame_id") or self.config.geometry.frames.map_frame or "map")
+        source_kind = str(source_summary.get("source_kind") or "configured_pcd_root")
+        try:
+            pointcloud_map = self._pointcloud_map_cache.load_pcd(
+                pcd_path if isinstance(pcd_path, Path) else Path(str(pcd_path)),
+                frame_id=frame_id,
+                source_kind=source_kind,
+            )
+        except (PointCloudMapError, UnsupportedPointCloudMapError):
+            return None
+        except Exception:  # noqa: BLE001
+            logger.debug("累积点云加载失败", exc_info=True)
+            return None
+        return getattr(pointcloud_map, "points_xyz", None)
 
     def _publish_pointcloud_map_stream_frame(self, *, reason: str = "manual_refresh") -> None:
         source_summary = self.platform_geometry_runtime.get_live_pointcloud_map_asset_summary()

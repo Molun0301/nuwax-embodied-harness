@@ -51,6 +51,10 @@ class GeometryLaunchConfig:
     exploration_failures_before_corridor: int
     exploration_failures_before_retry: int
     exploration_bootstrap_forward_m: float
+    exploration_min_nav_commit_sec: float
+    exploration_max_goal_retries: int
+    exploration_post_goal_pause_sec: float
+    exploration_min_travel_m: float
     nav2_action_name: str
 
     @classmethod
@@ -87,6 +91,18 @@ class GeometryLaunchConfig:
             exploration_bootstrap_forward_m=_env_float(
                 "NUWAX_GEOMETRY_EXPLORATION_BOOTSTRAP_FORWARD_M", 0.2
             ),
+            exploration_min_nav_commit_sec=_env_float(
+                "NUWAX_GEOMETRY_EXPLORATION_MIN_NAV_COMMIT_SEC", 15.0
+            ),
+            exploration_max_goal_retries=_env_int(
+                "NUWAX_GEOMETRY_EXPLORATION_MAX_GOAL_RETRIES", 4
+            ),
+            exploration_post_goal_pause_sec=_env_float(
+                "NUWAX_GEOMETRY_EXPLORATION_POST_GOAL_PAUSE_SEC", 0.0
+            ),
+            exploration_min_travel_m=_env_float(
+                "NUWAX_GEOMETRY_EXPLORATION_MIN_TRAVEL_M", 1.2
+            ),
             nav2_action_name=_env("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
         )
 
@@ -96,7 +112,7 @@ class GeometryLaunchConfig:
             'map_topic': self.map_topic,
             'global_frame': self.map_frame,
             'robot_frame': self.base_frame,
-            'replan_period': 3.0,
+            'replan_period': 5.0,
             'min_frontier_size': self.exploration_min_frontier_size,
             'info_gain_radius': 1.5,
             'info_gain_weight': 1.0,
@@ -105,23 +121,34 @@ class GeometryLaunchConfig:
             'turn_weight': 0.25,
             'clearance_weight': 0.8,
             'max_goal_candidates_per_frontier': 80,
-            'blacklist_radius': 0.5,
+            'blacklist_radius': 1.2,
             'blacklist_ttl': 60.0,
             'max_consecutive_failures': 10,
             'failures_before_relaxed': self.exploration_failures_before_relaxed,
             'failures_before_corridor': self.exploration_failures_before_corridor,
             'failures_before_retry_reset': self.exploration_failures_before_retry,
             'relaxed_min_goal_clearance_m': 0.15,
-            'relaxed_min_travel_m': 0.35,
+            'relaxed_min_travel_m': 0.85,
             'corridor_travel_weight_scale': 1.35,
             'corridor_turn_weight_scale': 1.5,
             'retry_cooldown_sec': 12.0,
             'bootstrap_forward_enabled': True,
             'bootstrap_forward_m': self.exploration_bootstrap_forward_m,
             'startup_grace_period': 15.0,
-            'min_travel_m': 0.5,
+            'min_travel_m': self.exploration_min_travel_m,
             'min_goal_clearance_m': 0.25,
-            'goal_success_tolerance': 0.45,
+            'goal_success_tolerance': 0.35,
+            'post_goal_pause_sec': self.exploration_post_goal_pause_sec,
+            'min_goal_progress_m': 0.40,
+            'success_min_elapsed_sec': 4.0,
+            'min_nav_commit_sec': self.exploration_min_nav_commit_sec,
+            'max_goal_retries': self.exploration_max_goal_retries,
+            'goal_retry_delay_sec': 3.0,
+            'goal_accept_timeout': 12.0,
+            'stuck_escape_enabled': True,
+            'stuck_escape_forward_m': 0.35,
+            'stuck_escape_after_failures': 5,
+            'stuck_escape_max_attempts': 3,
         }
 
     @property

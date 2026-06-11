@@ -51,8 +51,14 @@ Arguments:
 Options:
   --nav2-log-only                  Only print Nav2 node logs to the terminal.
                                    RTAB-Map and bridge logs still go to ~/.ros/log
-  --print-nav2-params              Print the effective nav2_params.yaml and exit
-  -h, --help                       Show this help
+  --explore-log [FILE]           (explore mode) Export Nav2 + frontier_explorer
+                                   lines to FILE (default: ~/logs/go2_explore_*.log).
+                                   Implies --nav2-log-only on terminal; explorer
+                                   stays visible. Full ROS logs remain in ~/.ros/log
+  --explore-log-quiet            With --explore-log: terminal shows filtered log
+                                   only (same as FILE content).
+  --print-nav2-params            Print the effective nav2_params.yaml and exit
+  -h, --help                     Show this help
 
 Examples:
   $(basename "$0") --new
@@ -73,6 +79,8 @@ fi
 MODE=""
 DB_PATH=""
 NAV2_LOG_ONLY=0
+EXPLORE_LOG_FILE=""
+EXPLORE_LOG_QUIET=0
 PRINT_NAV2_PARAMS=0
 
 while [[ $# -gt 0 ]]; do
@@ -100,6 +108,19 @@ while [[ $# -gt 0 ]]; do
       NAV2_LOG_ONLY=1
       shift
       ;;
+    --explore-log)
+      if [[ $# -ge 2 && "$2" != -* ]]; then
+        EXPLORE_LOG_FILE="$2"
+        shift 2
+      else
+        EXPLORE_LOG_FILE="__AUTO__"
+        shift
+      fi
+      ;;
+    --explore-log-quiet)
+      EXPLORE_LOG_QUIET=1
+      shift
+      ;;
     --print-nav2-params)
       PRINT_NAV2_PARAMS=1
       shift
@@ -123,6 +144,16 @@ done
 if [[ -z "$MODE" && "$PRINT_NAV2_PARAMS" -eq 0 ]]; then
   echo "ERROR: missing mode flag (--new / --localization / --explore)" >&2
   usage
+  exit 2
+fi
+
+if [[ -n "$EXPLORE_LOG_FILE" && "$MODE" != "exploration" ]]; then
+  echo "ERROR: --explore-log is only valid with --explore mode." >&2
+  exit 2
+fi
+
+if [[ "$EXPLORE_LOG_QUIET" -eq 1 && -z "$EXPLORE_LOG_FILE" ]]; then
+  echo "ERROR: --explore-log-quiet requires --explore-log." >&2
   exit 2
 fi
 
@@ -281,9 +312,32 @@ case "$MODE" in
     LAUNCH=go2_exploration.launch.py
     ;;
 esac
+if [[ -n "$EXPLORE_LOG_FILE" ]]; then
+  if [[ "$EXPLORE_LOG_FILE" == "__AUTO__" ]]; then
+    EXPLORE_LOG_FILE="${HOME}/logs/go2_explore_$(date +%Y%m%d_%H%M%S).log"
+  fi
+  EXPLORE_LOG_FILE="${EXPLORE_LOG_FILE/#\~/$HOME}"
+  if [[ ! "$EXPLORE_LOG_FILE" = /* ]]; then
+    EXPLORE_LOG_FILE="$(pwd)/$EXPLORE_LOG_FILE"
+  fi
+  mkdir -p "$(dirname "$EXPLORE_LOG_FILE")"
+  export GO2_EXPLORE_LOG_FILE="$EXPLORE_LOG_FILE"
+  NAV2_LOG_ONLY=1
+  echo "[go2.sh]   explore_log_file = $EXPLORE_LOG_FILE"
+  {
+    echo "===== go2.sh explore+nav2 log $(date -Iseconds) ====="
+    echo "database_path=$DB_PATH"
+    echo "explore_min_travel_m=${NUWAX_GEOMETRY_EXPLORATION_MIN_TRAVEL_M:-}"
+    echo "explore_post_pause_s=${NUWAX_GEOMETRY_EXPLORATION_POST_GOAL_PAUSE_SEC:-}"
+    echo "===================================================="
+  } >"$EXPLORE_LOG_FILE"
+elif [[ -n "${GO2_EXPLORE_LOG_FILE:-}" ]]; then
+  unset GO2_EXPLORE_LOG_FILE
+fi
+
 if [[ "$NAV2_LOG_ONLY" -eq 1 ]]; then
   export GO2_NAV2_LOG_ONLY=1
-  echo "[go2.sh]   nav2_log_only = true (non-Nav2 node output -> ~/.ros/log)"
+  echo "[go2.sh]   nav2_log_only = true (RTAB-Map -> ~/.ros/log; Nav2+explorer on terminal)"
 else
   unset GO2_NAV2_LOG_ONLY
 fi
@@ -304,6 +358,29 @@ echo "[go2.sh]   explore_fail_relaxed = ${NUWAX_GEOMETRY_EXPLORATION_FAILURES_BE
 echo "[go2.sh]   explore_fail_corridor = ${NUWAX_GEOMETRY_EXPLORATION_FAILURES_BEFORE_CORRIDOR}"
 echo "[go2.sh]   explore_fail_retry   = ${NUWAX_GEOMETRY_EXPLORATION_FAILURES_BEFORE_RETRY}"
 echo "[go2.sh]   explore_bootstrap_m  = ${NUWAX_GEOMETRY_EXPLORATION_BOOTSTRAP_FORWARD_M}"
+echo "[go2.sh]   explore_nav_commit_s = ${NUWAX_GEOMETRY_EXPLORATION_MIN_NAV_COMMIT_SEC}"
+echo "[go2.sh]   explore_goal_retries = ${NUWAX_GEOMETRY_EXPLORATION_MAX_GOAL_RETRIES}"
+echo "[go2.sh]   explore_post_pause_s = ${NUWAX_GEOMETRY_EXPLORATION_POST_GOAL_PAUSE_SEC}"
+echo "[go2.sh]   explore_min_travel_m = ${NUWAX_GEOMETRY_EXPLORATION_MIN_TRAVEL_M}"
 echo
 
-exec ros2 launch go2_nav "$LAUNCH" "database_path:=$DB_PATH"
+run_launch() {
+  ros2 launch go2_nav "$LAUNCH" "database_path:=$DB_PATH"
+}
+
+if [[ -n "$EXPLORE_LOG_FILE" ]]; then
+  FILTER_SCRIPT="$SCRIPT_DIR/scripts/filter_explore_nav2_log.sh"
+  if [[ ! -x "$FILTER_SCRIPT" ]]; then
+    chmod +x "$FILTER_SCRIPT"
+  fi
+  set -o pipefail
+  if [[ "$EXPLORE_LOG_QUIET" -eq 1 ]]; then
+    echo "[go2.sh] explore log (quiet terminal) -> $EXPLORE_LOG_FILE"
+    run_launch 2>&1 | tee >(bash "$FILTER_SCRIPT" >>"$EXPLORE_LOG_FILE") | bash "$FILTER_SCRIPT"
+  else
+    echo "[go2.sh] explore log (tee) -> $EXPLORE_LOG_FILE"
+    run_launch 2>&1 | tee >(bash "$FILTER_SCRIPT" >>"$EXPLORE_LOG_FILE")
+  fi
+else
+  exec ros2 launch go2_nav "$LAUNCH" "database_path:=$DB_PATH"
+fi

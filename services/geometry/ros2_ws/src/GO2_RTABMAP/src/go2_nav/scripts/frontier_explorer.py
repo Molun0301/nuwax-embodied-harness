@@ -128,6 +128,26 @@ class FrontierExplorer(Node):
         # After Nav2 reports success, reject the result if the robot is still
         # farther than this from the dispatched goal (planner snap / early stop).
         self.declare_parameter('goal_success_tolerance', 0.45)
+        # Do not treat Nav2 abort/reject as final until the goal had time to execute
+        # and the robot had a chance to move (prevents rapid frontier hopping in RViz).
+        self.declare_parameter('min_nav_commit_sec', 15.0)
+        self.declare_parameter('min_failure_robot_move_m', 0.12)
+        self.declare_parameter('max_goal_retries', 2)
+        self.declare_parameter('goal_retry_delay_sec', 3.0)
+        # While waiting for Nav2 to accept send_goal_async, hold the dispatch slot.
+        self.declare_parameter('goal_accept_timeout', 12.0)
+        # After ABORTED / stuck-without-motion, nudge forward/back to leave costmap pinch.
+        self.declare_parameter('stuck_escape_enabled', True)
+        self.declare_parameter('stuck_escape_forward_m', 0.35)
+        self.declare_parameter('stuck_escape_after_failures', 2)
+        self.declare_parameter('stuck_escape_max_attempts', 3)
+        # Pause between frontier goals so Nav2 is not hammered with short hops.
+        # Optional idle gap before the *next* frontier after a verified arrival.
+        # 0 = disabled (robot should not stand still between goals).
+        self.declare_parameter('post_goal_pause_sec', 0.0)
+        # Nav2 xy_goal_tolerance is ~0.15m; reject instant SUCCEEDED with no motion.
+        self.declare_parameter('min_goal_progress_m', 0.40)
+        self.declare_parameter('success_min_elapsed_sec', 4.0)
         self.declare_parameter('global_plan_topic', '/plan')
         self.declare_parameter('next_goal_topic', '/exploration/next_goal')
 
@@ -163,6 +183,18 @@ class FrontierExplorer(Node):
         self.min_travel_m = float(gp('min_travel_m').value)
         self.min_goal_clearance_m = float(gp('min_goal_clearance_m').value)
         self.goal_success_tolerance = float(gp('goal_success_tolerance').value)
+        self.min_nav_commit_sec = float(gp('min_nav_commit_sec').value)
+        self.min_failure_robot_move_m = float(gp('min_failure_robot_move_m').value)
+        self.max_goal_retries = int(gp('max_goal_retries').value)
+        self.goal_retry_delay_sec = float(gp('goal_retry_delay_sec').value)
+        self.goal_accept_timeout = float(gp('goal_accept_timeout').value)
+        self.stuck_escape_enabled = bool(gp('stuck_escape_enabled').value)
+        self.stuck_escape_forward_m = float(gp('stuck_escape_forward_m').value)
+        self.stuck_escape_after_failures = int(gp('stuck_escape_after_failures').value)
+        self.stuck_escape_max_attempts = int(gp('stuck_escape_max_attempts').value)
+        self.post_goal_pause_sec = float(gp('post_goal_pause_sec').value)
+        self.min_goal_progress_m = float(gp('min_goal_progress_m').value)
+        self.success_min_elapsed_sec = float(gp('success_min_elapsed_sec').value)
         self.global_plan_topic = str(gp('global_plan_topic').value)
         self.next_goal_topic = str(gp('next_goal_topic').value)
 
@@ -193,6 +225,14 @@ class FrontierExplorer(Node):
         self._active_strategy = 'normal'
         self._bootstrap_forward_pending = self.bootstrap_forward_enabled
         self._bootstrap_goal_active = False
+        self._goal_send_robot_xy: Optional[Tuple[float, float]] = None
+        self._goal_retry_count = 0
+        self._retry_resend_at: Optional[float] = None
+        self._stuck_escape_pending = False
+        self._stuck_escape_attempts = 0
+        self._stuck_escape_active = False
+        self._post_goal_pause_until: Optional[float] = None
+        self._active_goal_travel_m: Optional[float] = None
 
         # Wall-clock startup time used for the initial grace period.
         self.start_time = self.get_clock().now().nanoseconds * 1e-9
@@ -242,6 +282,298 @@ class FrontierExplorer(Node):
             return
         self.publish_status('DONE (exploration finished)')
 
+    def _goal_elapsed_sec(self, now: Optional[float] = None) -> float:
+        if self.active_goal_send_time is None:
+            return 0.0
+        if now is None:
+            now = self.get_clock().now().nanoseconds * 1e-9
+        return max(0.0, now - self.active_goal_send_time)
+
+    def _robot_movement_since_send(self) -> float:
+        if self._goal_send_robot_xy is None:
+            return 0.0
+        robot = self.get_robot_pose()
+        if robot is None:
+            return 0.0
+        sx, sy = self._goal_send_robot_xy
+        return math.hypot(robot[0] - sx, robot[1] - sy)
+
+    def _is_premature_failure(self) -> bool:
+        return (
+            self._goal_elapsed_sec() < self.min_nav_commit_sec
+            and self._robot_movement_since_send() < self.min_failure_robot_move_m
+        )
+
+    @staticmethod
+    def _nav_status_is_terminal(status: int) -> bool:
+        # Nav2 planner/controller abort = unreachable; retrying the same pose loops forever.
+        return status in {
+            GoalStatus.STATUS_ABORTED,
+            GoalStatus.STATUS_CANCELED,
+        }
+
+    def _should_retry_goal_failure(self, reason: str, status: Optional[int] = None) -> bool:
+        if status is not None and self._nav_status_is_terminal(status):
+            return False
+        if reason in {'success_too_soon', 'success_too_far'}:
+            return self._goal_retry_count < self.max_goal_retries
+        if reason in {'rejected', 'accept_timeout', 'retry_resend_failed'}:
+            return False
+        if reason.startswith('status_'):
+            try:
+                code = int(reason.split('_', 1)[1])
+            except (IndexError, ValueError):
+                code = None
+            if code is not None and self._nav_status_is_terminal(code):
+                return False
+        return self._is_premature_failure()
+
+    def _start_post_goal_pause(self) -> None:
+        if self.post_goal_pause_sec <= 0.0:
+            return
+        pause = self.post_goal_pause_sec
+        self._post_goal_pause_until = (
+            self.get_clock().now().nanoseconds * 1e-9 + pause
+        )
+        self.get_logger().info(
+            f'Pausing {pause:.1f}s before next frontier (verified arrival).'
+        )
+
+    def _success_is_meaningful(
+        self,
+        *,
+        dist: Optional[float],
+        moved: float,
+        elapsed: float,
+    ) -> bool:
+        """Only count success when the robot is actually at the goal in map frame."""
+        if dist is None:
+            return False
+        if dist > self.goal_success_tolerance:
+            return False
+        travel = float(self._active_goal_travel_m or 0.0)
+        if travel >= 0.8:
+            # Nav2 may report SUCCEEDED early; require real progress along the leg.
+            progress = 1.0 - min(dist / travel, 1.0)
+            if progress < 0.55 and moved < travel * 0.50:
+                self.get_logger().warn(
+                    f'Rejecting Nav2 SUCCEEDED: only {progress * 100:.0f}% of '
+                    f'{travel:.2f}m leg (moved={moved:.2f}m dist={dist:.2f}m).',
+                    throttle_duration_sec=3.0,
+                )
+                return False
+        if travel > 0.5 and moved < 0.10:
+            return False
+        return True
+
+    def _maybe_queue_stuck_escape(self) -> None:
+        if not self.stuck_escape_enabled:
+            return
+        if self._stuck_escape_attempts >= self.stuck_escape_max_attempts:
+            return
+        if self._robot_movement_since_send() >= self.min_failure_robot_move_m:
+            return
+        if self.consecutive_failures < self.stuck_escape_after_failures:
+            return
+        self._stuck_escape_pending = True
+
+    def _finalize_goal_failure(
+        self,
+        goal_xy: Optional[Tuple[float, float]],
+        *,
+        reason: str,
+        status: Optional[int] = None,
+    ) -> None:
+        if goal_xy is not None:
+            self.add_to_blacklist(*goal_xy)
+        self.consecutive_failures += 1
+        self._maybe_queue_stuck_escape()
+        label = f'status_{status}' if status is not None else reason
+        self.get_logger().warn(
+            f'Goal {goal_xy} abandoned ({label}); blacklisted. '
+            f'failures={self.consecutive_failures}, moved='
+            f'{self._robot_movement_since_send():.2f}m.'
+        )
+        self._clear_active_goal()
+
+    def _schedule_same_goal_retry(self, reason: str, status: Optional[int] = None) -> bool:
+        if not self._should_retry_goal_failure(reason, status):
+            return False
+        if self._goal_retry_count >= self.max_goal_retries:
+            return False
+        self._goal_retry_count += 1
+        self.active_goal_handle = None
+        self.active_goal_send_time = None
+        delay = (
+            0.8
+            if reason in {'success_too_soon', 'success_too_far'}
+            else self.goal_retry_delay_sec
+        )
+        self._retry_resend_at = self.get_clock().now().nanoseconds * 1e-9 + delay
+        if self._stuck_escape_active:
+            strategy = 'escape'
+        elif self._bootstrap_goal_active:
+            strategy = 'bootstrap'
+        else:
+            strategy = self._active_strategy
+        self.get_logger().warn(
+            f'Premature nav failure ({reason}) on {self.active_goal_xy}; '
+            f'retry {self._goal_retry_count}/{self.max_goal_retries} in '
+            f'{self.goal_retry_delay_sec:.0f}s (robot moved '
+            f'{self._robot_movement_since_send():.2f}m, '
+            f'elapsed {self._goal_elapsed_sec():.1f}s).'
+        )
+        hold_label = (
+            'HOLDING GOAL'
+            if reason in {'success_too_soon', 'success_too_far'}
+            else 'RETRY'
+        )
+        self.publish_status(
+            f'STRATEGY:{strategy} {hold_label} {self._goal_retry_count}/'
+            f'{self.max_goal_retries} ({reason})'
+        )
+        return True
+
+    def _resend_active_goal(self) -> bool:
+        if self.active_goal_xy is None:
+            return False
+        robot = self.get_robot_pose()
+        if robot is None:
+            return False
+        gx, gy = self.active_goal_xy
+        if not self.send_nav_goal(gx, gy, robot):
+            self._retry_resend_at = (
+                self.get_clock().now().nanoseconds * 1e-9 + self.goal_retry_delay_sec
+            )
+            self.get_logger().warn(
+                f'Resend to {self.active_goal_xy} failed (Nav2 unavailable); '
+                f'retrying in {self.goal_retry_delay_sec:.0f}s.'
+            )
+            return True
+        return True
+
+    def _dispatch_stuck_escape(self, robot_pose: Tuple[float, float, float]) -> None:
+        rx, ry, ryaw = robot_pose
+        attempt = self._stuck_escape_attempts
+        self._stuck_escape_attempts += 1
+        self._stuck_escape_pending = False
+        if attempt % 2 == 0:
+            dist = self.stuck_escape_forward_m
+            label = 'forward'
+        else:
+            dist = -self.stuck_escape_forward_m * 0.85
+            label = 'back'
+        gx = rx + dist * math.cos(ryaw)
+        gy = ry + dist * math.sin(ryaw)
+        self.get_logger().warn(
+            f'Stuck escape #{self._stuck_escape_attempts}: {label} '
+            f'{abs(dist):.2f}m to ({gx:.2f},{gy:.2f}) after '
+            f'{self.consecutive_failures} nav failures.'
+        )
+        self.publish_status(
+            f'STRATEGY:escape {label} {abs(dist):.2f}m '
+            f'({self._stuck_escape_attempts}/{self.stuck_escape_max_attempts})'
+        )
+        self.publish_markers(status=f'STRATEGY:escape {label}')
+        self._stuck_escape_active = True
+        self._goal_retry_count = 0
+        self._retry_resend_at = None
+        self.send_nav_goal(gx, gy, robot_pose)
+
+    def _handle_in_flight_navigation(self, now: float) -> bool:
+        """Return True to keep tick from dispatching a new frontier goal."""
+
+        if self._retry_resend_at is not None:
+            if now < self._retry_resend_at:
+                remaining = self._retry_resend_at - now
+                if self._stuck_escape_active:
+                    strategy = 'escape'
+                elif self._bootstrap_goal_active:
+                    strategy = 'bootstrap'
+                else:
+                    strategy = self._active_strategy
+                self.publish_markers(
+                    status=(
+                        f'STRATEGY:{strategy} RETRY WAIT ({remaining:.0f}s, '
+                        f'{self._goal_retry_count}/{self.max_goal_retries})'
+                    ),
+                    clusters=self.active_clusters_snapshot,
+                    chosen=self.active_chosen_snapshot,
+                    navigating=True,
+                )
+                return True
+            self._retry_resend_at = None
+            if self._resend_active_goal():
+                return True
+            self.fail_active_goal('retry_resend_failed', force=True)
+            return False
+
+        if self.active_goal_handle is None:
+            elapsed = self._goal_elapsed_sec(now)
+            if elapsed <= self.goal_accept_timeout:
+                if self._stuck_escape_active:
+                    strategy = 'escape'
+                elif self._bootstrap_goal_active:
+                    strategy = 'bootstrap'
+                else:
+                    strategy = self._active_strategy
+                self.publish_markers(
+                    status=f'STRATEGY:{strategy} PENDING ({elapsed:.0f}s)',
+                    clusters=self.active_clusters_snapshot,
+                    chosen=self.active_chosen_snapshot,
+                    navigating=True,
+                )
+                return True
+            self.get_logger().warn(
+                f'Goal {self.active_goal_xy} not accepted within '
+                f'{self.goal_accept_timeout:.0f}s.'
+            )
+            if self._bootstrap_goal_active:
+                if self._schedule_same_goal_retry('accept_timeout'):
+                    return True
+                self._finish_bootstrap_goal(succeeded=False)
+                self.publish_status('STRATEGY:bootstrap ACCEPT TIMEOUT')
+                return False
+            if self._schedule_same_goal_retry('accept_timeout'):
+                return True
+            self.fail_active_goal('accept_timeout', force=True)
+            return False
+
+        elapsed = self._goal_elapsed_sec(now)
+        if elapsed > self.goal_timeout:
+            self.get_logger().warn(
+                f'Goal {self.active_goal_xy} timed out after {elapsed:.1f}s '
+                f'(>{self.goal_timeout:.0f}s). Cancelling; Nav2 may have crashed.'
+            )
+            try:
+                self.active_goal_handle.cancel_goal_async()
+            except Exception as e:
+                self.get_logger().warn(f'cancel_goal_async failed: {e}')
+            if self._bootstrap_goal_active:
+                if self._schedule_same_goal_retry('timeout'):
+                    return True
+                self._finish_bootstrap_goal(succeeded=False)
+                self.publish_status('STRATEGY:bootstrap TIMEOUT')
+                return False
+            if self._schedule_same_goal_retry('timeout'):
+                return True
+            self.fail_active_goal('timeout', force=True)
+            return False
+
+        if self._stuck_escape_active:
+            nav_status = f'STRATEGY:escape NAVIGATING ({elapsed:.0f}s)'
+        elif self._bootstrap_goal_active:
+            nav_status = f'STRATEGY:bootstrap NAVIGATING ({elapsed:.0f}s)'
+        else:
+            nav_status = f'NAVIGATING ({elapsed:.0f}s)'
+        self.publish_markers(
+            status=nav_status,
+            clusters=self.active_clusters_snapshot,
+            chosen=self.active_chosen_snapshot,
+            navigating=True,
+        )
+        return True
+
     def tick(self):
         if self.exploration_done:
             # 探索结束：停止派点，但保持本节点进程存活，避免 ros2 launch/go2.sh 随子进程退出。
@@ -276,42 +608,27 @@ class FrontierExplorer(Node):
             )
             return
 
-        # Watchdog: if a goal has been active too long, assume bt_navigator
-        # is wedged (or has crashed silently) and recover. This prevents the
-        # explorer from getting stuck forever when Nav2 dies mid-navigation.
-        if self.active_goal_handle is not None:
-            elapsed = (now - self.active_goal_send_time
-                       if self.active_goal_send_time is not None else 0.0)
-            if elapsed > self.goal_timeout:
-                self.get_logger().warn(
-                    f'Goal {self.active_goal_xy} timed out after {elapsed:.1f}s '
-                    f'(>{self.goal_timeout:.0f}s). Cancelling and blacklisting; '
-                    f'Nav2 may have crashed.'
-                )
-                try:
-                    self.active_goal_handle.cancel_goal_async()
-                except Exception as e:
-                    self.get_logger().warn(f'cancel_goal_async failed: {e}')
-                if self._bootstrap_goal_active:
-                    self._finish_bootstrap_goal(succeeded=False)
-                    self.publish_status('STRATEGY:bootstrap TIMEOUT')
-                else:
-                    self.fail_active_goal()
-                    self.publish_status('TIMEOUT (recovering)')
+        # Hold the current dispatch until Nav2 finishes or we exhaust retries.
+        # active_goal_xy is set at send time; active_goal_handle arrives async.
+        if self.active_goal_xy is not None:
+            if not self._handle_in_flight_navigation(now):
                 return
-            # Already navigating; keep goal + plan visible in RViz.
-            nav_status = (
-                f'STRATEGY:bootstrap NAVIGATING ({elapsed:.0f}s)'
-                if self._bootstrap_goal_active
-                else f'NAVIGATING ({elapsed:.0f}s)'
-            )
-            self.publish_markers(
-                status=nav_status,
-                clusters=self.active_clusters_snapshot,
-                chosen=self.active_chosen_snapshot,
-                navigating=True,
-            )
             return
+
+        if self._post_goal_pause_until is not None:
+            if now < self._post_goal_pause_until:
+                remaining = self._post_goal_pause_until - now
+                self.publish_status(
+                    f'STRATEGY:{self._active_strategy} PAUSE ({remaining:.0f}s)'
+                )
+                self.publish_markers(
+                    status=f'PAUSE before next goal ({remaining:.0f}s)',
+                    clusters=self.active_clusters_snapshot,
+                    chosen=self.active_chosen_snapshot,
+                )
+                return
+            self._post_goal_pause_until = None
+
         if self._cooldown_until is not None:
             if now < self._cooldown_until:
                 remaining = self._cooldown_until - now
@@ -337,6 +654,14 @@ class FrontierExplorer(Node):
             return
         rx, ry, ryaw = robot
 
+        if (
+            self._stuck_escape_pending
+            and self.active_goal_xy is None
+            and not self._bootstrap_forward_pending
+        ):
+            self._dispatch_stuck_escape((rx, ry, ryaw))
+            return
+
         if self._bootstrap_forward_pending:
             gx = rx + self.bootstrap_forward_m * math.cos(ryaw)
             gy = ry + self.bootstrap_forward_m * math.sin(ryaw)
@@ -348,6 +673,8 @@ class FrontierExplorer(Node):
                 f'STRATEGY:bootstrap FORWARD {self.bootstrap_forward_m:.2f}m'
             )
             self.publish_markers(status='STRATEGY:bootstrap DISPATCHING')
+            self._goal_retry_count = 0
+            self._retry_resend_at = None
             self.send_nav_goal(gx, gy, (rx, ry, ryaw))
             self._bootstrap_goal_active = self.active_goal_xy is not None
             return
@@ -389,12 +716,6 @@ class FrontierExplorer(Node):
             )
             return
         gx, gy = best.goal_world
-        self.get_logger().info(
-            f'Selected frontier: ({gx:.2f},{gy:.2f}) score={best.score:.2f} '
-            f'gain={best.info_gain} size={best.cluster.size} '
-            f'd={best.travel_m:.2f}m turn={math.degrees(best.heading_error):.0f}deg '
-            f'clear={best.clearance_m:.2f}m from {len(all_clusters)} candidates'
-        )
 
         # 5) Remember snapshot for RViz while navigating
         self.active_clusters_snapshot = all_clusters
@@ -407,8 +728,19 @@ class FrontierExplorer(Node):
             chosen=best,
         )
 
-        # 7) Send goal
-        self.send_nav_goal(gx, gy, (rx, ry, ryaw))
+        # 7) Send goal (new frontier — reset per-goal retry budget)
+        self._goal_retry_count = 0
+        self._retry_resend_at = None
+        self._active_goal_travel_m = float(best.travel_m)
+        if not self.send_nav_goal(gx, gy, (rx, ry, ryaw)):
+            return
+
+        self.get_logger().info(
+            f'Selected frontier: ({gx:.2f},{gy:.2f}) score={best.score:.2f} '
+            f'gain={best.info_gain} size={best.cluster.size} '
+            f'd={best.travel_m:.2f}m turn={math.degrees(best.heading_error):.0f}deg '
+            f'clear={best.clearance_m:.2f}m from {len(all_clusters)} candidates'
+        )
 
     # ------------------------------------------------------------------
     # Frontier detection
@@ -905,11 +1237,13 @@ class FrontierExplorer(Node):
     # Nav2 action client
     # ------------------------------------------------------------------
     def send_nav_goal(self, gx: float, gy: float,
-                      robot_pose: Tuple[float, float, float]):
+                      robot_pose: Tuple[float, float, float]) -> bool:
+        if self.active_goal_xy is not None and self.active_goal_handle is not None:
+            return False
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn(
                 'navigate_to_pose action server not available; will retry.')
-            return
+            return False
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = self.global_frame
@@ -929,6 +1263,8 @@ class FrontierExplorer(Node):
         self.active_goal_xy = (gx, gy)
         self.active_goal_yaw = yaw
         self.active_goal_send_time = self.get_clock().now().nanoseconds * 1e-9
+        self._goal_send_robot_xy = (rx, ry)
+        self.active_goal_handle = None
 
         next_goal = PoseStamped()
         next_goal.header = goal_msg.pose.header
@@ -937,17 +1273,18 @@ class FrontierExplorer(Node):
 
         send_future = self.nav_client.send_goal_async(goal_msg)
         send_future.add_done_callback(self.on_goal_response)
+        return True
 
     def on_goal_response(self, future):
         try:
             handle = future.result()
         except Exception as e:
             self.get_logger().warn(f'Goal request error: {e}')
-            self.fail_active_goal()
+            self.fail_active_goal('request_error')
             return
         if not handle.accepted:
             self.get_logger().warn('Goal rejected by Nav2.')
-            self.fail_active_goal()
+            self.fail_active_goal('rejected')
             return
         self.active_goal_handle = handle
         result_future = handle.get_result_async()
@@ -961,6 +1298,18 @@ class FrontierExplorer(Node):
             self.fail_active_goal()
             return
         status = result.status
+        if self._stuck_escape_active:
+            succeeded = status == GoalStatus.STATUS_SUCCEEDED
+            if succeeded:
+                self.get_logger().info('Stuck escape step completed.')
+                self._stuck_escape_attempts = 0
+                self.consecutive_failures = max(0, self.consecutive_failures - 1)
+            else:
+                self.get_logger().warn(
+                    f'Stuck escape failed (status={status}).'
+                )
+            self._clear_active_goal()
+            return
         if self._bootstrap_goal_active:
             succeeded = status == GoalStatus.STATUS_SUCCEEDED
             if succeeded:
@@ -978,40 +1327,64 @@ class FrontierExplorer(Node):
             dist = None
             if robot is not None and goal_xy is not None:
                 dist = math.hypot(robot[0] - goal_xy[0], robot[1] - goal_xy[1])
+            moved = self._robot_movement_since_send()
+            elapsed = self._goal_elapsed_sec()
             if dist is not None and dist > self.goal_success_tolerance:
                 self.get_logger().warn(
-                    f'Nav2 succeeded but robot is {dist:.2f}m from goal '
-                    f'{goal_xy} (tolerance={self.goal_success_tolerance:.2f}m); '
-                    f'treating as incomplete and blacklisting.'
+                    f'Nav2 SUCCEEDED but robot is {dist:.2f}m from goal {goal_xy} '
+                    f'(tolerance={self.goal_success_tolerance:.2f}m); holding goal.'
                 )
-                if goal_xy is not None:
-                    self.add_to_blacklist(*goal_xy)
-                self.consecutive_failures += 1
-            else:
-                self.get_logger().info(
-                    f'Reached frontier {goal_xy}'
-                    + (f' (dist={dist:.2f}m)' if dist is not None else '')
-                    + ', looking for next.'
+                if self._schedule_same_goal_retry('success_too_far'):
+                    return
+                self._finalize_goal_failure(goal_xy, reason='success_too_far')
+                return
+            if not self._success_is_meaningful(dist=dist, moved=moved, elapsed=elapsed):
+                self.get_logger().warn(
+                    f'Nav2 false SUCCEEDED on {goal_xy}: moved={moved:.2f}m '
+                    f'elapsed={elapsed:.1f}s dist={dist} '
+                    f'travel={self._active_goal_travel_m}; holding same goal.'
                 )
-                self.consecutive_failures = 0
-                self._active_strategy = 'normal'
+                if self._schedule_same_goal_retry('success_too_soon'):
+                    return
+                self._finalize_goal_failure(goal_xy, reason='success_too_soon')
+                return
+            self.get_logger().info(
+                f'Reached frontier {goal_xy}'
+                + (f' (dist={dist:.2f}m, moved={moved:.2f}m, {elapsed:.1f}s)' if dist is not None else '')
+                + '; pausing before next.'
+            )
+            self.consecutive_failures = 0
+            self._active_strategy = 'normal'
+            self._goal_retry_count = 0
+            self._stuck_escape_attempts = 0
+            self._start_post_goal_pause()
         else:
             self.get_logger().warn(
-                f'Goal {goal_xy} failed (status={status}); blacklisting.'
+                f'Goal {goal_xy} failed (status={status}).'
             )
-            if goal_xy is not None:
-                self.add_to_blacklist(*goal_xy)
-            self.consecutive_failures += 1
+            if self._schedule_same_goal_retry(f'status_{status}', status=status):
+                return
+            self._finalize_goal_failure(
+                goal_xy, reason=f'status_{status}', status=status,
+            )
+            return
         self._clear_active_goal()
 
-    def fail_active_goal(self):
+    def fail_active_goal(self, reason: str = 'failed', *, force: bool = False):
+        if self._stuck_escape_active:
+            if not force and self._schedule_same_goal_retry(reason):
+                return
+            self._clear_active_goal()
+            return
         if self._bootstrap_goal_active:
+            if not force and self._schedule_same_goal_retry(reason):
+                return
             self._finish_bootstrap_goal(succeeded=False)
             return
-        if self.active_goal_xy is not None:
-            self.add_to_blacklist(*self.active_goal_xy)
-        self._clear_active_goal()
-        self.consecutive_failures += 1
+        goal_xy = self.active_goal_xy
+        if not force and self._schedule_same_goal_retry(reason):
+            return
+        self._finalize_goal_failure(goal_xy, reason=reason)
 
     def _finish_bootstrap_goal(self, *, succeeded: bool) -> None:
         self._bootstrap_goal_active = False
@@ -1026,6 +1399,10 @@ class FrontierExplorer(Node):
         self.active_goal_xy = None
         self.active_goal_yaw = None
         self.active_goal_send_time = None
+        self._goal_send_robot_xy = None
+        self._retry_resend_at = None
+        self._stuck_escape_active = False
+        self._active_goal_travel_m = None
         self.active_clusters_snapshot = None
         self.active_chosen_snapshot = None
 

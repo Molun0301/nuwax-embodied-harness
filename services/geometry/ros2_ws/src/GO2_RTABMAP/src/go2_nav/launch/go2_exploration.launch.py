@@ -27,7 +27,10 @@ def generate_launch_description():
     database_path = LaunchConfiguration('database_path', default='~/rtabmap.db')
 
     go2_nav_dir = get_package_share_directory('go2_nav')
-    non_nav_output = 'log' if os.environ.get('GO2_NAV2_LOG_ONLY') == '1' else 'screen'
+    explore_log = bool(os.environ.get('GO2_EXPLORE_LOG_FILE'))
+    nav2_log_only = os.environ.get('GO2_NAV2_LOG_ONLY') == '1'
+    non_nav_output = 'log' if nav2_log_only and not explore_log else 'screen'
+    explorer_output = 'screen' if explore_log else non_nav_output
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='false'),
@@ -82,7 +85,7 @@ def generate_launch_description():
                     package='go2_nav',
                     executable='frontier_explorer.py',
                     name='frontier_explorer',
-                    output=non_nav_output,
+                    output=explorer_output,
                     parameters=[cfg.frontier_explorer_parameters()],
                 ),
             ],

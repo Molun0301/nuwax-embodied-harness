@@ -186,7 +186,7 @@ python3 scripts/bootstrap.py apply --non-interactive \
 
 ## 更多文档
 
-- [部署文档.md](部署文档.md)
+- [部署文档.md](docs/公开文档/部署文档.md)
 - [文档导航.md](docs/公开介绍文档/文档导航.md)
 - [平台架构说明.md](docs/公开介绍文档/平台架构说明.md)
 - [宿主机与容器通信说明.md](docs/公开介绍文档/宿主机与容器通信说明.md)

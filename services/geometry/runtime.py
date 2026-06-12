@@ -28,7 +28,13 @@ from contracts.navigation import (
     NavigationStatus,
 )
 from contracts.runtime_views import MapSnapshot
-from drivers.common import ExplorationDataPlane, LocalizationDataPlane, MappingDataPlane, NavigationDataPlane, RobotAssemblyBase
+from providers.data_plane import (
+    ExplorationDataPlane,
+    LocalizationDataPlane,
+    MappingDataPlane,
+    NavigationDataPlane,
+    RobotAssemblyProtocol,
+)
 from providers.exploration import ExplorationProvider
 from providers.localization import LocalizationProvider
 from providers.maps import MapProvider
@@ -42,7 +48,7 @@ from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
 from services.geometry.ros_bridge_client import RosBridgeSubprocess
 from services.geometry.remote_provider import RosBridgeProvider
 from services.geometry.rosout_bridge import RosoutBridge
-from services.mapping.catalog import _to_safe_dir_segment
+from contracts.naming import build_safe_dir_segment
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
 from services.navigation.frontier import FrontierExplorer
@@ -264,7 +270,7 @@ class PlatformGeometryRuntime:
         *,
         config: PlatformGeometryConfig,
         catalog_root: str,
-        robot: RobotAssemblyBase,
+        robot: RobotAssemblyProtocol,
         event_bus: Optional["EventBus"] = None,
     ) -> None:
         self.config = config
@@ -2614,7 +2620,7 @@ class PlatformGeometryRuntime:
         return self._resolve_backend(ExplorationDataPlane, ExplorationProvider)
 
     def _safe_map_dir(self, map_name: str) -> Path:
-        primary = self._catalog_root / _to_safe_dir_segment(map_name)
+        primary = self._catalog_root / build_safe_dir_segment(map_name)
         if not primary.exists():
             legacy = self._catalog_root / quote(str(map_name or "").strip(), safe="")
             if legacy.exists():
@@ -2623,7 +2629,7 @@ class PlatformGeometryRuntime:
 
     def _version_dir(self, map_name: str, version_id: str) -> Path:
         versions_root = self._safe_map_dir(map_name) / "versions"
-        primary = versions_root / _to_safe_dir_segment(version_id)
+        primary = versions_root / build_safe_dir_segment(version_id)
         if not primary.exists():
             legacy = versions_root / quote(str(version_id or "").strip(), safe="")
             if legacy.exists():
@@ -2644,7 +2650,7 @@ class PlatformGeometryRuntime:
     def _map_named_backend_db_filename(self, map_name: str) -> str:
         """探索/定位使用的 .db 文件名与地图名一致，避免多图共用 live_rtabmap.db。"""
 
-        safe_name = _to_safe_dir_segment(map_name) or "map"
+        safe_name = build_safe_dir_segment(map_name) or "map"
         return "%s.db" % safe_name
 
     def _version_backend_state_path(self, map_name: str, version_id: str) -> Path:
@@ -3925,7 +3931,7 @@ class PlatformGeometryRuntime:
             msg = PoseWithCovarianceStamped()
             msg.header.stamp.sec = 0
             msg.header.stamp.nanosec = 0
-            msg.header.frame_id = "map"
+            msg.header.frame_id = self.config.frames.map_frame
             msg.pose.pose.orientation.w = 1.0
             msg.pose.covariance[0] = 0.25
             msg.pose.covariance[7] = 0.25
@@ -4726,7 +4732,8 @@ class PlatformGeometryRuntime:
             "planned_path": payload.get("planned_path") if isinstance(payload.get("planned_path"), list) else payload_metadata.get("planned_path"),
             "plan_point_count": payload_metadata.get("plan_point_count"),
             "plan_fresh": payload_metadata.get("plan_fresh"),
-            "current_goal": payload.get("current_goal") if isinstance(payload.get("current_goal"), dict) else None,
+            # current_goal 已在源头解析为 NavigationGoal|None，直接透传，不做 dict 类型过滤。
+            "current_goal": payload.get("current_goal") if isinstance(payload.get("current_goal"), NavigationGoal) else None,
             "external_frontier_debug_observer": {
                 "source_name": payload.get("source_name"),
                 "updated_at": payload.get("updated_at"),

@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from urllib.parse import quote
 
 from contracts.map_workspace import MapVersion
+from contracts.naming import build_safe_dir_segment
 from contracts.runtime_views import MapSnapshot
-from services.mapping.catalog import _to_safe_dir_segment
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写文本：同目录写 .tmp 再 os.replace 替换，避免写一半崩溃留下损坏文件。"""
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 class MapVersionRepository:
@@ -48,9 +56,9 @@ class MapVersionRepository:
         """覆盖写回已存在的平台地图版本。"""
 
         self._version_path(version.map_name, version.version_id).parent.mkdir(parents=True, exist_ok=True)
-        self._version_path(version.map_name, version.version_id).write_text(
+        _atomic_write_text(
+            self._version_path(version.map_name, version.version_id),
             version.model_dump_json(indent=2),
-            encoding="utf-8",
         )
         return version
 
@@ -104,9 +112,9 @@ class MapVersionRepository:
             )
         version_dir = self._versions_root(map_name) / version.version_id
         version_dir.mkdir(parents=True, exist_ok=True)
-        self._version_path(map_name, version.version_id).write_text(
+        _atomic_write_text(
+            self._version_path(map_name, version.version_id),
             version.model_dump_json(indent=2),
-            encoding="utf-8",
         )
         return version
 
@@ -124,7 +132,7 @@ class MapVersionRepository:
 
     def _version_path(self, map_name: str, version_id: str) -> Path:
         versions_root = self._versions_root(map_name)
-        safe_version = _to_safe_dir_segment(version_id)
+        safe_version = build_safe_dir_segment(version_id)
         primary = versions_root / safe_version / "version.json"
         if not primary.exists():
             # 兼容旧版本写出的 URL 编码 version_id 目录（含特殊字符时才有差异）。
@@ -134,7 +142,7 @@ class MapVersionRepository:
         return primary
 
     def _versions_root(self, map_name: str) -> Path:
-        safe_map_name = _to_safe_dir_segment(map_name)
+        safe_map_name = build_safe_dir_segment(map_name)
         primary = self._root_dir / safe_map_name / "versions"
         # 同 catalog.py 中 _map_dir 的兼容策略：旧目录走 URL 编码名时不破坏读取。
         if not primary.exists():

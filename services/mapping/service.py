@@ -7,7 +7,7 @@ from typing import Any
 from contracts.events import RuntimeEventCategory
 from contracts.runtime_views import MapSnapshot
 from core import EventBus, StateNamespace, StateStore, StreamBus
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from providers import MapProvider
 from typing import Deque, Dict, List, Optional, Tuple
 

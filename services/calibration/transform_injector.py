@@ -1,15 +1,26 @@
+"""标定结果的欧拉/四元数转换、持久化（active.json）与 frame_tree 注入。
+
+【本包未接线、本期冻结】仅被 calibration 包内引用。生效链路见 CalibrationProvider
+（drivers/go2/providers.py + services/geometry/runtime.py 的 _inject_static_extrinsics
+静态外参边）；注意本文件 inject_calibration_to_frame_tree 瞄准的 ingest_transform_snapshot
+注入面与现行 provider.set_static_extrinsics 并非同一个（05-P1-6）。MI 在线标定
+【严禁直接接线】，理由见 05-P2-8/P2-9。详见 config.py 头部冻结说明。
+
+已知缺陷（接线前必修，05-P2-11）：load_persisted_calibration 无 robot_id/frame 对一致性
+校验，换机或改 frame 命名后旧 active.json 仍会被加载注入。
+"""
+
 from __future__ import annotations
 
 import json
 import logging
 import math
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from contracts.calibration import ExtrinsicCalibration
-from contracts.geometry import Quaternion, Vector3
+from contracts.geometry import Quaternion
 
 
 LOGGER = logging.getLogger(__name__)

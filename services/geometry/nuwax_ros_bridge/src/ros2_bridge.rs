@@ -36,7 +36,13 @@ pub struct TransformEntry {
     pub child: String,
     pub tx: f64, pub ty: f64, pub tz: f64,
     pub rx: f64, pub ry: f64, pub rz: f64, pub rw: f64,
+    /// 该 TF 边的 header.stamp（纳秒，ROS 时间域）。0 表示无戳（latched/静态边），永不过期。
+    pub stamp_ns: u64,
 }
+
+// 动态 /tf 边的存活时长（纳秒）。超过此 TTL 且带有效戳的边在合成位姿前被裁剪，
+// 避免 RTAB-Map 重启/地图版本切换后陈旧 map→odom 边污染 BFS。stamp_ns==0 的边不过期。
+const TF_ENTRY_TTL_NS: u64 = 5_000_000_000; // 5s
 
 #[derive(Clone, Default)]
 pub struct NavState {
@@ -333,6 +339,7 @@ async fn ros2_async_loop(
             let mut s = tf_state.write().await;
             let mut max_stamp_ns: u64 = 0;
             for tf in &msg.transforms {
+                let stamp_ns = (tf.header.stamp.sec as u64) * 1_000_000_000 + (tf.header.stamp.nanosec as u64);
                 let entry = TransformEntry {
                     parent: tf.header.frame_id.clone(),
                     child: tf.child_frame_id.clone(),
@@ -343,14 +350,21 @@ async fn ros2_async_loop(
                     ry: tf.transform.rotation.y,
                     rz: tf.transform.rotation.z,
                     rw: tf.transform.rotation.w,
+                    stamp_ns,
                 };
                 if let Some(existing) = s.transforms.iter_mut().find(|t| t.parent == entry.parent && t.child == entry.child) {
                     *existing = entry;
                 } else {
                     s.transforms.push(entry);
                 }
-                let stamp_ns = (tf.header.stamp.sec as u64) * 1_000_000_000 + (tf.header.stamp.nanosec as u64);
                 if stamp_ns > max_stamp_ns { max_stamp_ns = stamp_ns; }
+            }
+            // TTL 裁剪：以"已见最新戳"为参考时间（ROS 时间域），丢弃带戳且超过 TTL 的陈旧动态边；
+            // stamp_ns==0（无戳/latched）的边视为静态、永不过期。这同时给 transforms 长度上界，
+            // 并阻止 RTAB-Map 重启遗留的旧 map→odom 边参与下面的 BFS 合成。
+            if max_stamp_ns > TF_ENTRY_TTL_NS {
+                let cutoff = max_stamp_ns - TF_ENTRY_TTL_NS;
+                s.transforms.retain(|t| t.stamp_ns == 0 || t.stamp_ns >= cutoff);
             }
             // 合成 base→map 链，得到机器人在 map 系下的位姿。链路不完整时保留上次有效值。
             if let Some((x, y, z, qx, qy, qz, qw, _base)) =

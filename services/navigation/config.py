@@ -41,6 +41,9 @@ class ExplorationConfig:
     goal_timeout_sec: float = 20.0
     reach_distance_m: float = 0.45
     status_poll_interval_sec: float = 0.2
+    # 首轮 frontier 计算前等待 costmap revision 稳定的非阻塞守卫阈值（P0-2/P2-12）
+    costmap_min_revision: int = 5
+    costmap_wait_timeout_sec: float = 15.0
 
 
 __all__ = [

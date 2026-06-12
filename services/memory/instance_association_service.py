@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from contracts.base import utc_now
 from contracts.geometry import Pose
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.naming import build_anchor_id, build_instance_id
 from contracts.spatial_memory import (
     DeferredProjectionInput,
@@ -880,7 +881,7 @@ class InstanceAssociationService:
             from contracts.geometry import Vector3
 
             return Pose(
-                frame_id="map",
+                frame_id=DEFAULT_MAP_FRAME,
                 position=Vector3(x=float(origin[0]), y=float(origin[1]), z=float(origin[2])),
                 orientation=observation.pose.orientation,
             )

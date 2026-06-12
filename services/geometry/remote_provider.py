@@ -341,15 +341,25 @@ class RosBridgeProvider:
         if not self._stub:
             return None
         import time
+        # frame_tree 由 GetFrameTree 全量重建（_build_frame_tree + 静态边合并），代价较高。
+        # pose 流频率可能远高于 tf 实际变化频率，逐帧重建是冗余。此处按时间节流缓存：
+        # 同一帧位姿到来时复用最近 _FRAME_TREE_TTL_S 内的 frame_tree，超时才重新拉取。
+        # tf 边自带 stamp/TTL，下游容忍亚秒级陈旧，正确性不受影响。
+        _FRAME_TREE_TTL_S = 0.2
         def _stream_worker():
+            cached_tree: Optional[FrameTree] = None
+            cached_at = 0.0
             while self._stub:
                 try:
                     for update in self._stub.SubscribePose(pb2.PoseRequest()):
                         pose = _build_pose(update.pose)
                         if pose is None:
                             continue
-                        frame_tree = self.get_frame_tree()
-                        callback(pose, frame_tree, {"sequence": update.sequence})
+                        now = time.monotonic()
+                        if cached_tree is None or (now - cached_at) >= _FRAME_TREE_TTL_S:
+                            cached_tree = self.get_frame_tree()
+                            cached_at = now
+                        callback(pose, cached_tree, {"sequence": update.sequence})
                 except grpc.RpcError:
                     pass
                 if not self._stub:

@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
+
 
 _PCD_NUMPY_TYPES = {
     ("F", 4): "<f4",
@@ -118,7 +120,7 @@ class PointCloudMapCache:
         self,
         path: Path,
         *,
-        frame_id: str = "map",
+        frame_id: str = DEFAULT_MAP_FRAME,
         source_kind: str = "map_version_pcd",
     ) -> PointCloudMap:
         resolved = path.expanduser().resolve(strict=False)
@@ -146,7 +148,7 @@ class PointCloudMapCache:
         loaded = PointCloudMap(
             path=str(resolved),
             revision="pcd:%d:%d" % (int(stat.st_mtime_ns), int(stat.st_size)),
-            frame_id=str(frame_id or "map"),
+            frame_id=str(frame_id or DEFAULT_MAP_FRAME),
             source_kind=str(source_kind or "map_version_pcd"),
             point_count=int(points_xyz.shape[0]),
             points_xyz=points_xyz,
@@ -520,34 +522,47 @@ class CloudMapMmapReader:
         return vals
 
     def read_stable(self, max_points: int = 60000) -> Optional[Tuple[int, int, bytes]]:
-        """读取非活跃 buffer 的点云数据。返回 (revision, point_count, xyz_bytes) 或 None。"""
-        header = self.read_header()
-        if header is None:
-            return None
-        _, _, active_buf, point_count, _, revision, _ = header
-        if revision == 0 or point_count == 0:
-            return None
-        if revision == 1:
-            stable_buf = 0
-        else:
-            stable_buf = 1 - active_buf
-        buf_offset = self.HEADER_SIZE + stable_buf * self.SINGLE_BUFFER_SIZE
-        assert self._mm is not None
-        if point_count > max_points:
-            stride = point_count // max_points
-            data = bytearray()
-            for i in range(0, point_count * 12, stride * 12):
-                if len(data) >= max_points * 12:
-                    break
-                off = buf_offset + i
-                data.extend(self._mm[off:off + 12])
-            actual_count = len(data) // 12
-            xyz_bytes = bytes(data)
-        else:
-            data_size = point_count * 12
-            xyz_bytes = bytes(self._mm[buf_offset:buf_offset + data_size])
-            actual_count = point_count
-        return (revision, actual_count, xyz_bytes)
+        """读取非活跃 buffer 的点云数据。返回 (revision, point_count, xyz_bytes) 或 None。
+
+        seqlock 读侧校验：读 header(rev1)→读数据→再读 header(rev2)，若 revision 在读取期间
+        发生变化（写者翻转了 active_buf，"stable" buffer 变成写入目标）则重试，上限 3 次。
+        与 Rust 写侧 fence(Release)（pointcloud.rs write_cloud_map）配套，消除撕裂读。
+        """
+        for _ in range(3):
+            header = self.read_header()
+            if header is None:
+                return None
+            _, _, active_buf, point_count, _, revision, _ = header
+            if revision == 0 or point_count == 0:
+                return None
+            if revision == 1:
+                stable_buf = 0
+            else:
+                stable_buf = 1 - active_buf
+            buf_offset = self.HEADER_SIZE + stable_buf * self.SINGLE_BUFFER_SIZE
+            assert self._mm is not None
+            if point_count > max_points:
+                stride = point_count // max_points
+                data = bytearray()
+                for i in range(0, point_count * 12, stride * 12):
+                    if len(data) >= max_points * 12:
+                        break
+                    off = buf_offset + i
+                    data.extend(self._mm[off:off + 12])
+                actual_count = len(data) // 12
+                xyz_bytes = bytes(data)
+            else:
+                data_size = point_count * 12
+                xyz_bytes = bytes(self._mm[buf_offset:buf_offset + data_size])
+                actual_count = point_count
+            # 读后再校验 revision：未变则数据一致，已变说明读期间被写者翻转，重试。
+            header_after = self.read_header()
+            if header_after is None:
+                return None
+            if header_after[5] == revision:
+                return (revision, actual_count, xyz_bytes)
+        # 连续 3 次都被写者抢占，放弃本轮（上层轮询下次重试）。
+        return None
 
     def build_binary_frame(self, max_points: int = 60000) -> Optional[bytes]:
         """构建 Wire Format binary 帧: revision(u32) + point_count(u32) + XYZ data。"""

@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import BoundingBox2D, Detection2D, Detection3D, SegmentationMask2D, SegmentationQuality
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from services.model_providers import resolve_detection_provider_spec
 from services.perception.base import DetectionBundle, DetectorBackend, DetectorBackendSpec
 from services.perception.image_utils import decode_image_frame_to_bgr

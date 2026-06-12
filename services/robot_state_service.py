@@ -8,9 +8,9 @@ import json
 from contracts.runtime_views import DiagnosticItem, DiagnosticLevel, DiagnosticSnapshot, RobotStatusSnapshot
 from contracts.events import RuntimeEventCategory
 from core import EventBus, StateNamespace, StateStore, StreamBus
-from drivers.common.assembly import RobotAssemblyBase
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from providers import SafetyProvider, StateProvider
+from providers.data_plane import RobotAssemblyProtocol
 from typing import Deque, List, Optional, Tuple
 
 
@@ -19,7 +19,7 @@ class RobotStateService:
 
     def __init__(
         self,
-        robot: RobotAssemblyBase,
+        robot: RobotAssemblyProtocol,
         *,
         state_store: StateStore,
         event_bus: Optional[EventBus] = None,

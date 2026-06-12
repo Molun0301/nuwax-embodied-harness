@@ -1,9 +1,19 @@
+"""标定数据采集：静止检测 + 时间同步点云-图像帧对采集 + 深度多样性筛选。
+
+【本包未接线、本期冻结】CalibrationDataCollector 的 feed/update 无调用方（已 grep 核实）。
+生效链路见 CalibrationProvider（drivers/go2/providers.py + services/geometry/runtime.py
+静态外参边）。MI 在线标定【严禁直接接线】，理由见 05-P2-8/P2-9。详见 config.py 头部冻结说明。
+
+已知缺陷（接线前必修，05-P2-10）：StaticDetector.update 直接比较有符号速度
+（linear_velocity_mps > threshold），负值（倒退）会被误判为静止，应取 abs()。
+"""
+
 from __future__ import annotations
 
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 

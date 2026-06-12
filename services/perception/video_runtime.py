@@ -74,6 +74,10 @@ class PerceptionVideoRuntime:
             yaw_threshold_deg=keyframe_yaw_threshold_deg,
         )
         self._lock = threading.RLock()
+        # P1-2：串行 run_once 的三个入口（background 后台线程 / burst 复核 / manual 能力调用），
+        # 避免并发触发感知管线与共享运行时状态竞态。与 _lock（护状态字段）分开，
+        # 因为 run_once 全程持有此锁、内部还会取 _lock 更新状态。
+        self._run_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
         self._processed_frames = 0
@@ -189,7 +193,31 @@ class PerceptionVideoRuntime:
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> Optional[str]:
-        """手动执行一次抓帧与感知，返回摘要标题。"""
+        """手动执行一次抓帧与感知，返回摘要标题。
+
+        P1-2：以 _run_lock 串行 background/burst/manual 三入口，避免并发触发
+        感知管线与运行时状态竞态。
+        """
+
+        with self._run_lock:
+            return self._run_once_locked(
+                force_keyframe=force_keyframe,
+                reason=reason,
+                allow_memory_write=allow_memory_write,
+                detection_metadata=detection_metadata,
+                open_vocabulary_classes=open_vocabulary_classes,
+            )
+
+    def _run_once_locked(
+        self,
+        *,
+        force_keyframe: bool = False,
+        reason: str = "manual",
+        allow_memory_write: bool = True,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
+    ) -> Optional[str]:
+        """run_once 的实际实现，调用方须已持有 _run_lock。"""
 
         if not self._enabled:
             self._last_error = "持续视频感知功能未启用。"

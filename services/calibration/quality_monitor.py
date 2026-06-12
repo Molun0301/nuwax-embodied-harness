@@ -1,14 +1,21 @@
+"""标定质量在线监控：重投影误差采样 + 漂移检测 + 连续超阈触发重标定。
+
+【本包未接线、本期冻结】CalibrationQualityMonitor.add_sample 无调用方（已 grep 核实）。
+生效链路见 CalibrationProvider（drivers/go2/providers.py + services/geometry/runtime.py
+静态外参边）。MI 在线标定【严禁直接接线】，理由见 05-P2-8/P2-9（calibrate 从不计算
+reprojection_error_px，本监控体系实际无数据可用）。详见 config.py 头部冻结说明。
+"""
+
 from __future__ import annotations
 
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Deque, Dict, List
 
 import numpy as np
 
-from contracts.calibration import CalibrationState, CalibrationStatus
 from services.calibration.config import get_calibration_reprojection_threshold
 
 

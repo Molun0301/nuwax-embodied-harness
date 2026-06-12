@@ -12,6 +12,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from services.geometry.pointcloud_map import PointCloudMapError, read_ply_xyz, write_pcd_binary_xyz
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.cloud_map_fetcher")
@@ -20,7 +21,16 @@ FetchResult = Tuple[np.ndarray, str, str]
 
 
 def default_cloud_map_topic() -> str:
-    return str(os.environ.get("NUWAX_CLOUD_MAP_TOPIC", "/cloud_map") or "/cloud_map").strip() or "/cloud_map"
+    # 与 core/settings.py:856-860 的 cloud_map_topic 别名口径完全一致：
+    # 首选 NUWAX_GEOMETRY_CLOUD_MAP_TOPIC，legacy NUWAX_CLOUD_MAP_TOPIC 回退。
+    # 本模块属 services 层，按 R6 不引入模块级 import settings，仅对齐读取口径以消除 split-brain。
+    preferred = str(os.environ.get("NUWAX_GEOMETRY_CLOUD_MAP_TOPIC") or "").strip()
+    if preferred:
+        return preferred
+    legacy = str(os.environ.get("NUWAX_CLOUD_MAP_TOPIC") or "").strip()
+    if legacy:
+        return legacy
+    return "/cloud_map"
 
 
 def default_min_points() -> int:
@@ -56,7 +66,7 @@ def database_export_enabled() -> bool:
 def fetch_cloud_map_xyz(
     topic: Optional[str] = None,
     *,
-    map_frame: str = "map",
+    map_frame: str = DEFAULT_MAP_FRAME,
     timeout_sec: Optional[float] = None,
     min_points: Optional[int] = None,
 ) -> Optional[FetchResult]:
@@ -118,7 +128,7 @@ def fetch_cloud_map_xyz(
         message = holder["message"]
         if message is None:
             return None
-        frame_id = str(getattr(message.header, "frame_id", "") or map_frame or "map")
+        frame_id = str(getattr(message.header, "frame_id", "") or map_frame)
         points = list(
             point_cloud2.read_points(
                 message,

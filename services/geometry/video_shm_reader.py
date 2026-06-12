@@ -62,33 +62,39 @@ class VideoShmReader:
             self._mm = None
 
     def read_latest(self) -> Optional[Tuple[bytes, int, int]]:
-        """读取最新帧。返回 (jpeg_data, sequence, timestamp_ns) 或 None。"""
+        """读取最新帧。返回 (jpeg_data, sequence, timestamp_ns) 或 None。
+
+        seqlock 读侧校验：读 seq(前)→读数据→读 seq(后)，若读期间 seq 变化（写者已发布新帧）
+        则重试，上限 3 次。与 Rust 写侧 fence(Release)（video_relay.rs）配套，消除撕裂读。
+        """
         if self._mm is None and not self.open():
             return None
         mm = self._mm
         assert mm is not None
 
-        seq = struct.unpack_from("<Q", mm, 16)[0]
-        if seq == 0 or seq == self._last_seq:
-            return None
+        for _ in range(3):
+            seq = struct.unpack_from("<Q", mm, 16)[0]
+            if seq == 0 or seq == self._last_seq:
+                return None
 
-        frame_size = struct.unpack_from("<I", mm, 24)[0]
-        timestamp_ns = struct.unpack_from("<Q", mm, 32)[0]
-        active_buf = struct.unpack_from("<I", mm, 40)[0]
+            frame_size = struct.unpack_from("<I", mm, 24)[0]
+            timestamp_ns = struct.unpack_from("<Q", mm, 32)[0]
+            active_buf = struct.unpack_from("<I", mm, 40)[0]
 
-        if frame_size == 0 or frame_size > MAX_FRAME_SIZE:
-            return None
+            if frame_size == 0 or frame_size > MAX_FRAME_SIZE:
+                return None
 
-        buf_offset = HEADER_SIZE + int(active_buf) * MAX_FRAME_SIZE
-        data = bytes(mm[buf_offset:buf_offset + frame_size])
+            buf_offset = HEADER_SIZE + int(active_buf) * MAX_FRAME_SIZE
+            data = bytes(mm[buf_offset:buf_offset + frame_size])
 
-        # Verify sequence didn't change during read (torn read check)
-        seq_after = struct.unpack_from("<Q", mm, 16)[0]
-        if seq_after != seq:
-            return None
-
-        self._last_seq = seq
-        return (data, seq, timestamp_ns)
+            # Verify sequence didn't change during read (torn read check)
+            seq_after = struct.unpack_from("<Q", mm, 16)[0]
+            if seq_after == seq:
+                self._last_seq = seq
+                return (data, seq, timestamp_ns)
+            # seq 在读取期间被写者更新，重试读取最新帧。
+        # 连续 3 次都被写者抢占，放弃本轮（上层轮询下次重试）。
+        return None
 
     def has_new_frame(self) -> bool:
         """检查是否有新帧可用。"""

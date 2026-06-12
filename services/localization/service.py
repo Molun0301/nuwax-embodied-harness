@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from collections import deque
-import time
+import logging
+import threading
 
 from contracts.base import utc_now
 from contracts.events import RuntimeEventCategory
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus, LocalizationSnapshot, RelocalizationCandidate
 from core import EventBus, StateNamespace, StateStore, StreamBus
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from providers import LocalizationProvider
 from typing import Deque, Dict, Optional, Tuple
 
@@ -18,6 +20,9 @@ from .state_machine import (
     LocalizationDiagnostics,
     create_localization_state_machine,
 )
+
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.localization.service")
 
 
 class LocalizationService:
@@ -43,6 +48,7 @@ class LocalizationService:
         self._state_store = state_store
         self._event_bus = event_bus
         self._stream_bus = stream_bus
+        self._lock = threading.RLock()
         self._history: Deque[LocalizationSnapshot] = deque(maxlen=max(1, history_limit))
         self._session_history: Deque[LocalizationSession] = deque(maxlen=max(1, history_limit))
         self._latest_snapshot: Optional[LocalizationSnapshot] = None
@@ -97,9 +103,10 @@ class LocalizationService:
             if event_type != "geometry.odom_publisher_failed":
                 return
             self._odom_publisher_failure_message = str(getattr(event, "message", "") or "odom publisher failed")
-            # 故障即丢弃位姿可用性，让状态机进入 stale
-            self._state_machine.pose_received(pose_available=False, tracking_quality=0.0)
-            self._state_machine.check_timeouts()
+            # 故障即丢弃位姿可用性，让状态机进入 stale（状态机调用收敛锁内）
+            with self._lock:
+                self._state_machine.pose_received(pose_available=False, tracking_quality=0.0)
+                self._state_machine.check_timeouts()
         except Exception:
             pass
 
@@ -143,55 +150,60 @@ class LocalizationService:
 
         resolved_geometry_asset = self._clone_metadata(geometry_asset) if geometry_asset is not None else None
         asset_failure = self._resolve_geometry_asset_failure(resolved_geometry_asset)
-        existing = self._active_session
-        if (
-            existing is not None
-            and existing.map_name == str(map_name or "").strip()
-            and existing.map_version_id == str(map_version_id or "").strip()
-            and (
-                existing.frame_id == (str(frame_id or "").strip() or None)
-                or (
-                    existing.frame_id is not None
-                    and str(frame_id or "").strip()
-                    and frame_ids_semantically_equal(existing.frame_id, str(frame_id or "").strip())
+        with self._lock:
+            existing = self._active_session
+            if (
+                existing is not None
+                and existing.map_name == str(map_name or "").strip()
+                and existing.map_version_id == str(map_version_id or "").strip()
+                and (
+                    existing.frame_id == (str(frame_id or "").strip() or None)
+                    or (
+                        existing.frame_id is not None
+                        and str(frame_id or "").strip()
+                        and frame_ids_semantically_equal(existing.frame_id, str(frame_id or "").strip())
+                    )
                 )
-            )
-        ):
-            if resolved_geometry_asset is None or existing.geometry_asset == resolved_geometry_asset:
-                return existing
-            updated = existing.model_copy(
-                update={
-                    "geometry_asset": resolved_geometry_asset,
-                    "status": LocalizationSessionStatus.FAILED if asset_failure else existing.status,
-                    "last_error": asset_failure or existing.last_error,
-                    "metadata": {
-                        **dict(existing.metadata),
-                        "geometry_asset_summary": resolved_geometry_asset,
-                        **dict(metadata or {}),
+            ):
+                if resolved_geometry_asset is None or existing.geometry_asset == resolved_geometry_asset:
+                    return existing
+                updated = existing.model_copy(
+                    update={
+                        "geometry_asset": resolved_geometry_asset,
+                        "status": LocalizationSessionStatus.FAILED if asset_failure else existing.status,
+                        "last_error": asset_failure or existing.last_error,
+                        "metadata": {
+                            **dict(existing.metadata),
+                            "geometry_asset_summary": resolved_geometry_asset,
+                            **dict(metadata or {}),
+                        },
                     },
-                },
-                deep=True,
-            )
-            self._set_active_session(updated)
-            return updated
-        session = LocalizationSession(
-            session_id=self._build_session_id(map_name=map_name, map_version_id=map_version_id),
-            map_name=str(map_name or "").strip(),
-            map_version_id=str(map_version_id or "").strip(),
-            frame_id=str(frame_id or "").strip() or None,
-            status=LocalizationSessionStatus.FAILED if asset_failure else LocalizationSessionStatus.LOCALIZING,
-            source_name="platform_localization_runtime",
-            pose_available=False,
-            geometry_asset=resolved_geometry_asset,
-            last_error=asset_failure,
-            metadata={
-                **dict(metadata or {}),
-                "geometry_asset_summary": resolved_geometry_asset,
-            },
-        )
-        self._latest_snapshot = None
-        self._set_active_session(session)
-        return session
+                    deep=True,
+                )
+                self._set_active_session_locked(updated)
+                published_session = updated
+            else:
+                session = LocalizationSession(
+                    session_id=self._build_session_id(map_name=map_name, map_version_id=map_version_id),
+                    map_name=str(map_name or "").strip(),
+                    map_version_id=str(map_version_id or "").strip(),
+                    frame_id=str(frame_id or "").strip() or None,
+                    status=LocalizationSessionStatus.FAILED if asset_failure else LocalizationSessionStatus.LOCALIZING,
+                    source_name="platform_localization_runtime",
+                    pose_available=False,
+                    geometry_asset=resolved_geometry_asset,
+                    last_error=asset_failure,
+                    metadata={
+                        **dict(metadata or {}),
+                        "geometry_asset_summary": resolved_geometry_asset,
+                    },
+                )
+                self._latest_snapshot = None
+                self._set_active_session_locked(session)
+                published_session = session
+        # 锁外发布
+        self._publish_session(published_session)
+        return published_session
 
     def refresh_active_session(
         self,
@@ -230,117 +242,146 @@ class LocalizationService:
         provider = self._get_localization_provider()
         provider_name = provider.provider_name
 
-        # 从平台几何运行时获取位姿数据（数据源可能是 RTAB-Map 或 Go2 SDK，但通过平台 provider 层抽象）
+        # 从平台几何运行时获取位姿数据（provider IO，不持锁；不触及共享会话状态）
         current_pose, frame_tree = self._capture_provider_data(provider)
 
-        # 构建定位诊断信息
-        diagnostics = self._build_localization_diagnostics(
-            provider=provider,
-            current_pose=current_pose,
-            session_frame_id=session.frame_id,
-        )
-        self._last_diagnostics = diagnostics
+        # 以下读改写会话与状态机的段落统一加锁；发布动作（StreamBus/EventBus/StateStore）延后到锁外。
+        with self._lock:
+            # 防旧会话复活：provider IO 期间另一线程可能 clear/switch active session。
+            # 写回前必须校验 active session 仍是本次刷新开始时绑定的同一会话（以 session_id 为身份令牌）。
+            # 若已被清空或切换，则丢弃本次刷新结果（不驱动共享状态机、不写回、不发布），避免旧会话被刷新线程重新写回。
+            active = self._active_session
+            if active is None or active.session_id != session.session_id:
+                LOGGER.warning(
+                    "丢弃过期定位刷新：active session 在 provider IO 期间已被清空或切换"
+                    "（refresh_session_id=%s, current_session_id=%s）。",
+                    session.session_id,
+                    active.session_id if active is not None else None,
+                )
+                return session
 
-        # 新会话首次刷新或显式重定位时，都应进入 LOCALIZING 周期。
-        if force_relocalize or self._state_machine.current_state == "idle":
-            self._state_machine.start()
-
-        # 更新状态机并检查超时
-        self._state_machine.check_timeouts()
-
-        if current_pose is not None:
-            # 位姿可用，根据跟踪质量更新状态机
-            pose_available = True
-            tracking_quality = diagnostics.tracking_quality
-            backend_state = diagnostics.backend_state
-
-            # 检查坐标系匹配
-            if session.frame_id and not frame_ids_semantically_equal(current_pose.frame_id, session.frame_id):
-                pose_available = False
-                diagnostics.last_error = "坐标系不匹配：%s vs %s" % (current_pose.frame_id, session.frame_id)
-                tracking_quality = 0.0
-
-            self._state_machine.pose_received(
-                pose_available=pose_available,
-                tracking_quality=tracking_quality,
-                backend_state=backend_state,
+            # 构建定位诊断信息
+            diagnostics = self._build_localization_diagnostics(
+                provider=provider,
+                current_pose=current_pose,
+                session_frame_id=session.frame_id,
             )
-        else:
-            # 无位姿
-            self._state_machine.pose_received(
-                pose_available=False,
-                tracking_quality=0.0,
-                backend_state=diagnostics.backend_state,
+            self._last_diagnostics = diagnostics
+
+            # 新会话首次刷新或显式重定位时，都应进入 LOCALIZING 周期。
+            if force_relocalize or self._state_machine.current_state == "idle":
+                self._state_machine.start()
+
+            # 更新状态机并检查超时
+            self._state_machine.check_timeouts()
+
+            if current_pose is not None:
+                # 位姿可用，根据跟踪质量更新状态机
+                pose_available = True
+                tracking_quality = diagnostics.tracking_quality
+                backend_state = diagnostics.backend_state
+
+                # 检查坐标系匹配
+                if session.frame_id and not frame_ids_semantically_equal(current_pose.frame_id, session.frame_id):
+                    pose_available = False
+                    diagnostics.last_error = "坐标系不匹配：%s vs %s" % (current_pose.frame_id, session.frame_id)
+                    tracking_quality = 0.0
+
+                self._state_machine.pose_received(
+                    pose_available=pose_available,
+                    tracking_quality=tracking_quality,
+                    backend_state=backend_state,
+                )
+            else:
+                # 无位姿
+                self._state_machine.pose_received(
+                    pose_available=False,
+                    tracking_quality=0.0,
+                    backend_state=diagnostics.backend_state,
+                )
+
+            # 再次检查超时
+            self._state_machine.check_timeouts()
+
+            # 获取最终状态机状态
+            machine_state = self._state_machine.current_state
+
+            # 映射到 LocalizationSessionStatus
+            session_status = self._map_machine_state_to_session_status(machine_state)
+            asset_failure = self._resolve_geometry_asset_failure(session.geometry_asset)
+            if asset_failure:
+                session_status = LocalizationSessionStatus.FAILED
+
+            relocalization_candidates = self._build_relocalization_candidates(
+                diagnostics=diagnostics,
+                current_pose=current_pose,
+                geometry_asset=session.geometry_asset,
+                session_status=session_status,
+            )
+            last_relocalization = relocalization_candidates[-1] if relocalization_candidates else None
+
+            # 构建 last_error
+            last_error = asset_failure or self._build_session_last_error(
+                diagnostics=diagnostics,
+                session_status=session_status,
             )
 
-        # 再次检查超时
-        self._state_machine.check_timeouts()
-
-        # 获取最终状态机状态
-        machine_state = self._state_machine.current_state
-
-        # 映射到 LocalizationSessionStatus
-        session_status = self._map_machine_state_to_session_status(machine_state)
-        asset_failure = self._resolve_geometry_asset_failure(session.geometry_asset)
-        if asset_failure:
-            session_status = LocalizationSessionStatus.FAILED
-
-        relocalization_candidates = self._build_relocalization_candidates(
-            diagnostics=diagnostics,
-            current_pose=current_pose,
-            geometry_asset=session.geometry_asset,
-            session_status=session_status,
-        )
-        last_relocalization = relocalization_candidates[-1] if relocalization_candidates else None
-
-        # 构建 last_error
-        last_error = asset_failure or self._build_session_last_error(
-            diagnostics=diagnostics,
-            session_status=session_status,
-        )
-
-        # 构建快照
-        usable_pose = current_pose if session_status == LocalizationSessionStatus.READY else None
-        snapshot = self.ingest_external_snapshot(
-            source_name="platform_localization:%s" % session.map_name,
-            current_pose=usable_pose,
-            frame_tree=frame_tree if usable_pose is not None else None,
-            metadata={
-                "source_kind": "platform_localization_session",
-                "map_name": session.map_name,
-                "platform_map_version_id": session.map_version_id,
-                "localization_session_id": session.session_id,
-                "provider_name": provider_name,
-                "machine_state": machine_state,
-                "diagnostics": diagnostics.model_dump(mode="json"),
-                "relocalization_candidates": [item.model_dump(mode="json") for item in relocalization_candidates],
-                "last_relocalization": last_relocalization.model_dump(mode="json") if last_relocalization is not None else None,
-                "geometry_asset_summary": session.geometry_asset,
-                "force_relocalize": force_relocalize,
-                **dict(metadata or {}),
-            },
-        )
-
-        # 更新会话
-        updated = session.model_copy(
-            update={
-                "status": session_status,
-                "source_name": provider_name,
-                "pose_available": session_status == LocalizationSessionStatus.READY,
-                "relocalization_candidates": relocalization_candidates,
-                "last_relocalization": last_relocalization,
-                "last_localized_at": utc_now() if session_status == LocalizationSessionStatus.READY else session.last_localized_at,
-                "last_error": last_error,
-                "metadata": {
-                    **dict(session.metadata),
+            # 构建快照（锁内记录，锁外发布）
+            usable_pose = current_pose if session_status == LocalizationSessionStatus.READY else None
+            snapshot_frame_tree = frame_tree if usable_pose is not None else None
+            snapshot = LocalizationSnapshot(
+                source_name="platform_localization:%s" % session.map_name,
+                current_pose=usable_pose,
+                frame_tree=snapshot_frame_tree,
+                metadata={
+                    "source_kind": "platform_localization_session",
+                    "map_name": session.map_name,
+                    "platform_map_version_id": session.map_version_id,
+                    "localization_session_id": session.session_id,
+                    "provider_name": provider_name,
                     "machine_state": machine_state,
-                    "asset_failure": asset_failure,
-                    **dict(snapshot.metadata),
+                    "diagnostics": diagnostics.model_dump(mode="json"),
+                    "relocalization_candidates": [item.model_dump(mode="json") for item in relocalization_candidates],
+                    "last_relocalization": last_relocalization.model_dump(mode="json") if last_relocalization is not None else None,
+                    "geometry_asset_summary": session.geometry_asset,
+                    "force_relocalize": force_relocalize,
+                    **dict(metadata or {}),
                 },
-            },
-            deep=True,
+            )
+            snapshot_trajectory, snapshot_history_size = self._record_snapshot_locked(snapshot)
+
+            # 更新会话
+            updated = session.model_copy(
+                update={
+                    "status": session_status,
+                    "source_name": provider_name,
+                    "pose_available": session_status == LocalizationSessionStatus.READY,
+                    "relocalization_candidates": relocalization_candidates,
+                    "last_relocalization": last_relocalization,
+                    "last_localized_at": utc_now() if session_status == LocalizationSessionStatus.READY else session.last_localized_at,
+                    "last_error": last_error,
+                    "metadata": {
+                        **dict(session.metadata),
+                        "machine_state": machine_state,
+                        "asset_failure": asset_failure,
+                        **dict(snapshot.metadata),
+                    },
+                },
+                deep=True,
+            )
+            self._set_active_session_locked(updated)
+            snapshot_source_name = snapshot.source_name
+
+        # 锁外发布快照与会话
+        self._publish_snapshot(
+            snapshot,
+            source_name=snapshot_source_name,
+            current_pose=usable_pose,
+            frame_tree=snapshot_frame_tree,
+            trajectory_poses=snapshot_trajectory,
+            history_size=snapshot_history_size,
         )
-        self._set_active_session(updated)
+        self._publish_session(updated)
         return updated
 
     def relocalize_active_session(
@@ -364,9 +405,11 @@ class LocalizationService:
         """
 
         # 触发状态机重定位（清 stale_since 计时、attempts++）
-        self._state_machine.relocalize()
+        with self._lock:
+            self._state_machine.relocalize()
 
         # 真接入：根据当前 session/asset 解析后端模式，向 SLAM/AMCL 发出真实重定位指令
+        # （含 ROS2 阻塞 IO，不持锁）
         backend_dispatch = self._dispatch_backend_relocalize(
             geometry_asset=geometry_asset,
             metadata=metadata,
@@ -467,8 +510,8 @@ class LocalizationService:
                 )
                 pub = node.create_publisher(PoseWithCovarianceStamped, "/initialpose", qos)
                 msg = PoseWithCovarianceStamped()
-                # AMCL 期望 frame=map
-                msg.header.frame_id = "map"
+                # AMCL 期望 frame=map（平台动态链 frame 单一出口）
+                msg.header.frame_id = DEFAULT_MAP_FRAME
                 # 关键：必须显式设 header.stamp，否则默认 (sec=0, nanosec=0) 会让 AMCL Foxy
                 # 在 lookupTransform(base_footprint, odom) 时报 "Failed to transform initial pose
                 # in time"，并触发 setPose 在 TF 异常后强写 PF 状态的已知 SIGSEGV bug
@@ -828,7 +871,8 @@ class LocalizationService:
     ) -> Optional[LocalizationSession]:
         """刷新当前已存在的平台定位会话。"""
 
-        session = self._active_session
+        with self._lock:
+            session = self._active_session
         if session is None:
             return None
         return self.refresh_active_session(
@@ -842,14 +886,16 @@ class LocalizationService:
     def get_active_session(self) -> Optional[LocalizationSession]:
         """返回当前激活的平台定位会话。"""
 
-        return self._active_session
+        with self._lock:
+            return self._active_session
 
     def clear_active_session(self, *, reason: str = "") -> None:
         """清空当前激活的平台定位会话。"""
 
-        self._active_session = None
-        self._state_machine.reset()
-        self._last_diagnostics = None
+        with self._lock:
+            self._active_session = None
+            self._state_machine.reset()
+            self._last_diagnostics = None
         self._state_store.write(
             StateNamespace.LOCALIZATION,
             "active_session",
@@ -874,8 +920,42 @@ class LocalizationService:
             frame_tree=frame_tree,
             metadata=dict(metadata or {}),
         )
+        # 读改写共享状态在锁内完成，发布动作在锁外执行（持快照引用）。
+        with self._lock:
+            trajectory_poses, history_size = self._record_snapshot_locked(snapshot)
+        self._publish_snapshot(
+            snapshot,
+            source_name=source_name,
+            current_pose=current_pose,
+            frame_tree=frame_tree,
+            trajectory_poses=trajectory_poses,
+            history_size=history_size,
+        )
+        return snapshot
+
+    def _record_snapshot_locked(self, snapshot: LocalizationSnapshot):
+        """在持锁状态下记录快照并返回发布所需的轨迹快照。
+
+        调用方必须已持有 self._lock。
+        """
+
         self._latest_snapshot = snapshot
         self._history.append(snapshot)
+        trajectory_poses = [item.current_pose for item in self._history if item.current_pose is not None]
+        return trajectory_poses, len(self._history)
+
+    def _publish_snapshot(
+        self,
+        snapshot: LocalizationSnapshot,
+        *,
+        source_name: str,
+        current_pose,
+        frame_tree,
+        trajectory_poses,
+        history_size: int,
+    ) -> None:
+        """在锁外发布定位快照到 StateStore/EventBus/StreamBus。"""
+
         self._state_store.write(
             StateNamespace.LOCALIZATION,
             source_name,
@@ -915,12 +995,11 @@ class LocalizationService:
             self._stream_bus.publish(
                 "localization.trajectory",
                 source="localization_service",
-                payload={"trajectory": [item.current_pose for item in self._history if item.current_pose is not None]},
+                payload={"trajectory": trajectory_poses},
                 frame_id=getattr(current_pose, "frame_id", None),
                 status="available" if current_pose is not None else "missing",
-                metadata={"source_name": source_name, "history_size": len(self._history)},
+                metadata={"source_name": source_name, "history_size": history_size},
             )
-        return snapshot
 
     def get_latest_snapshot(self) -> Optional[LocalizationSnapshot]:
         """返回最新定位快照。"""
@@ -985,8 +1064,23 @@ class LocalizationService:
         return value
 
     def _set_active_session(self, session: LocalizationSession) -> LocalizationSession:
+        """记录并发布激活会话。锁内记录、锁外发布。"""
+
+        with self._lock:
+            self._set_active_session_locked(session)
+        self._publish_session(session)
+        return session
+
+    def _set_active_session_locked(self, session: LocalizationSession) -> LocalizationSession:
+        """在持锁状态下记录激活会话。调用方必须已持有 self._lock，且需在锁外调用 _publish_session。"""
+
         self._active_session = session
         self._session_history.append(session)
+        return session
+
+    def _publish_session(self, session: LocalizationSession) -> None:
+        """在锁外发布激活会话到 StateStore/EventBus。"""
+
         self._state_store.write(
             StateNamespace.LOCALIZATION,
             "active_session",
@@ -1013,7 +1107,6 @@ class LocalizationService:
                     },
                 )
             )
-        return session
 
     def _build_session_id(self, *, map_name: str, map_version_id: str) -> str:
         timestamp = int(utc_now().timestamp() * 1000)

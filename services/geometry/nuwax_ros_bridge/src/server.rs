@@ -77,18 +77,28 @@ impl GeometryRuntime for GeometryRuntimeService {
         let state = self.bridge.state.clone();
         tokio::spawn(async move {
             let mut seq = 0u64;
+            // 变化驱动：仅当位姿实际更新（timestamp_ns 变化）时才推送帧，
+            // 避免静止时以 100ms 周期推送大量重复帧。last_stamp 初值 u64::MAX
+            // 确保首个有效帧（含 stamp==0 的早期态）至少推送一次后再去重。
+            let mut last_stamp = u64::MAX;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let s = state.read().await;
-                seq += 1;
-                let update = PoseUpdate {
-                    pose: Some(Pose {
-                        position: Some(Vec3 { x: s.pose.x, y: s.pose.y, z: s.pose.z }),
-                        orientation: Some(Quat { x: s.pose.qx, y: s.pose.qy, z: s.pose.qz, w: s.pose.qw }),
-                        frame_id: s.pose.frame_id.clone(),
-                        timestamp_ns: s.pose.timestamp_ns,
-                    }),
-                    sequence: seq,
+                let update = {
+                    let s = state.read().await;
+                    if s.pose.timestamp_ns == last_stamp {
+                        continue;
+                    }
+                    last_stamp = s.pose.timestamp_ns;
+                    seq += 1;
+                    PoseUpdate {
+                        pose: Some(Pose {
+                            position: Some(Vec3 { x: s.pose.x, y: s.pose.y, z: s.pose.z }),
+                            orientation: Some(Quat { x: s.pose.qx, y: s.pose.qy, z: s.pose.qz, w: s.pose.qw }),
+                            frame_id: s.pose.frame_id.clone(),
+                            timestamp_ns: s.pose.timestamp_ns,
+                        }),
+                        sequence: seq,
+                    }
                 };
                 if tx.send(Ok(update)).await.is_err() { break; }
             }
@@ -103,7 +113,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             child_frame: t.child.clone(),
             translation: Some(Vec3 { x: t.tx, y: t.ty, z: t.tz }),
             rotation: Some(Quat { x: t.rx, y: t.ry, z: t.rz, w: t.rw }),
-            timestamp_ns: 0,
+            timestamp_ns: t.stamp_ns,
         }).collect();
         Ok(Response::new(FrameTree { transforms }))
     }
@@ -123,19 +133,27 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
 
     async fn get_occupancy_grid_data(&self, _req: Request<Empty>) -> Result<Response<OccupancyGridData>, Status> {
-        let s = self.bridge.state.read().await;
+        // 缩小读锁临界区：锁内只 clone 最小原始数据（meta 字段 + Vec<i8>），
+        // i8→u8 的逐元素转换移到锁外，避免在持锁期间做 O(width*height) 的转换拷贝。
+        let (meta, raw_data) = {
+            let s = self.bridge.state.read().await;
+            (
+                OccupancyGridMeta {
+                    width: s.map.width,
+                    height: s.map.height,
+                    resolution: s.map.resolution,
+                    origin_x: s.map.origin_x,
+                    origin_y: s.map.origin_y,
+                    frame_id: s.map.frame_id.clone(),
+                    revision: s.map.revision,
+                    timestamp_ns: s.map.timestamp_ns,
+                },
+                s.map.data.clone(),
+            )
+        };
         Ok(Response::new(OccupancyGridData {
-            meta: Some(OccupancyGridMeta {
-                width: s.map.width,
-                height: s.map.height,
-                resolution: s.map.resolution,
-                origin_x: s.map.origin_x,
-                origin_y: s.map.origin_y,
-                frame_id: s.map.frame_id.clone(),
-                revision: s.map.revision,
-                timestamp_ns: s.map.timestamp_ns,
-            }),
-            data: s.map.data.iter().map(|&v| v as u8).collect(),
+            meta: Some(meta),
+            data: raw_data.iter().map(|&v| v as u8).collect(),
         }))
     }
 

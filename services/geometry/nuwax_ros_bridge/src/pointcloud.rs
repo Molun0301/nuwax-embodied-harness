@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{fence, Ordering};
 
 use memmap2::MmapMut;
 use tracing::{info, error};
@@ -74,6 +75,9 @@ impl CloudMapShmWriter {
         self.mmap[16..20].copy_from_slice(&point_count.to_le_bytes());
         self.mmap[20..28].copy_from_slice(&now_ns.to_le_bytes());
         self.mmap[36..40].copy_from_slice(&vs.to_le_bytes());
+        // Release fence：保证上面的点数据与 header 字段写入对读侧可见后，再发布 revision。
+        // 读侧 read_stable 用 revision 做 seqlock 双读校验，依赖此处的发布顺序语义。
+        fence(Ordering::Release);
         self.mmap[28..36].copy_from_slice(&rev.to_le_bytes());
         if let Err(e) = self.mmap.flush_range(0, buf_offset + data_size) {
             error!("累积地图 mmap flush 失败: {}", e);

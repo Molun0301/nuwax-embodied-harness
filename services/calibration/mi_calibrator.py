@@ -1,3 +1,15 @@
+"""NMI（归一化互信息）最大化的相机-激光雷达外参标定算法。
+
+【本包未接线、本期冻结】生效链路见 CalibrationProvider（drivers/go2/providers.py +
+services/geometry/runtime.py 静态外参边）。MI 在线标定【严禁直接接线】，已知缺陷：
+- 05-P2-8：compute_nmi ∈ [1,2]，NMI 门控默认阈值 0.3 低于理论下界 1.0，恒通过（伪保护）；
+  bounds 越界检查恒假（nelder_mead_optimize 内部已 _clip 到 bounds）。
+- 05-P2-9：project_points_to_image 把 6 维参数当 lidar->camera 用，但 SensorPair 初值
+  语义是 parent=base -> child=camera_optical，方向相反且源系不同；calibrate 从不计算
+  reprojection_error_px，质量监控无数据可用。
+接线前须重写帧语义并补重投影误差计算路径。详见 config.py 头部冻结说明。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -8,10 +20,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from contracts.calibration import ExtrinsicCalibration, SensorPair
-from contracts.geometry import Quaternion, Vector3
+from contracts.geometry import Vector3
 from services.calibration.config import (
     get_calibration_nmi_threshold,
-    get_calibration_reprojection_threshold,
 )
 from services.calibration.data_collector import FramePair
 from services.calibration.transform_injector import euler_to_quaternion

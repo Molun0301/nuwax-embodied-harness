@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from compat import StrEnum
+from contracts.compat import StrEnum
 from datetime import datetime
 
 from pydantic import Field, model_validator

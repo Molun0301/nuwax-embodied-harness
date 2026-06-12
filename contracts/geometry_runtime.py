@@ -49,15 +49,25 @@ class GeometryTopicsConfig:
     cost_map_topic: str = "/global_costmap/costmap"
 
 
+# 平台动态链 frame 默认值的单一出口（治理规范 §4.1 第 1 条 / 检查规则 R8 白名单）。
+# services/gateways 内不得再出现裸 "map"/"odom"/"base_link" 字面量；
+# 无法持有运行时 config.geometry.frames 的服务应从这些常量读取默认值。
+DEFAULT_MAP_FRAME = "map"
+DEFAULT_ODOM_FRAME = "odom"
+DEFAULT_BASE_FRAME = "base_link"
+DEFAULT_LIDAR_FRAME = "utlidar_lidar"
+DEFAULT_IMU_FRAME = "utlidar_imu"
+
+
 @dataclass
 class GeometryFrameConfig:
     """平台几何侧车统一坐标系配置。"""
 
-    map_frame: str = "map"
-    odom_frame: str = "odom"
-    base_frame: str = "base_link"
-    lidar_frame: str = "utlidar_lidar"
-    imu_frame: str = "utlidar_imu"
+    map_frame: str = DEFAULT_MAP_FRAME
+    odom_frame: str = DEFAULT_ODOM_FRAME
+    base_frame: str = DEFAULT_BASE_FRAME
+    lidar_frame: str = DEFAULT_LIDAR_FRAME
+    imu_frame: str = DEFAULT_IMU_FRAME
 
 
 @dataclass

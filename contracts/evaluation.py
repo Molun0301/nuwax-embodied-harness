@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from compat import StrEnum
+from contracts.compat import StrEnum
 from pydantic import Field, model_validator
 
 from contracts.base import ContractModel, MetadataDict, TimestampedContract

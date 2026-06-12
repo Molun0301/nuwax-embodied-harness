@@ -5,7 +5,7 @@ from typing import Optional, TYPE_CHECKING
 from drivers.common.manifest import RobotDefaults
 
 if TYPE_CHECKING:
-    from settings import NuwaxRobotBridgeConfig
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 def build_g1_defaults(config: "NuwaxRobotBridgeConfig", iface: Optional[str] = None) -> RobotDefaults:

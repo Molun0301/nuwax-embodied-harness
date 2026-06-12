@@ -319,5 +319,9 @@ GO2_CAPABILITY_MATRIX = CapabilityMatrix(
     metadata={
         "entrypoint": "drivers/go2",
         "control_modes": ["high", "low"],
+        # execute_sport_command 可用的高层机身动作集（damp/balance_stand/...）。
+        # 网关泛化读取本字段，平台侧不再 import drivers.go2，新机器人在自己的
+        # capability_matrix.metadata 声明同名字段即可被通用分发。
+        "sport_command_names": list(GO2_SPORT_COMMAND_NAMES),
     },
 )

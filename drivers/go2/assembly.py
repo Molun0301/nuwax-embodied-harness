@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import sys
 import time
-from typing import Dict, Optional, Tuple, Any, Callable, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, Any, Callable, TYPE_CHECKING
 
 from adapters.base import AdapterBase, AdapterConfig
 from drivers.common import ManagedRobotDeviceDataPlane, RobotAssemblyBase, RobotAssemblyStatus
@@ -17,7 +17,7 @@ from drivers.go2.providers import Go2ProviderBundle
 from drivers.go2.settings import load_go2_data_plane_config
 
 if TYPE_CHECKING:
-    from settings import NuwaxRobotBridgeConfig
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 @dataclass

@@ -23,7 +23,7 @@ import numpy as np
 from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
 from contracts.pointcloud import PointCloudFrame, PointField, PointFieldDataType
 from contracts.robot_state import IMUState
-from logging_utils import LogRateLimiter
+from core.logging_utils import LogRateLimiter
 
 if TYPE_CHECKING:
     from drivers.go2.settings import Go2DataPlaneConfig
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane")
 
-from logging_utils import SamplingLogFilter as _SamplingLogFilter
+from core.logging_utils import SamplingLogFilter as _SamplingLogFilter
 LOGGER.addFilter(_SamplingLogFilter(sample_rate=0.01))
 _GO2_INFO_LOG_RATE_LIMIT_SEC = 30.0
 _GO2_MOTION_ERROR_LOG_RATE_LIMIT_SEC = 5.0
@@ -363,8 +363,14 @@ class RclpyGo2RosBridge:
             gyroscope.append(0.0)
         while len(accelerometer) < 3:
             accelerometer.append(0.0)
+        expected_imu_frame = str(getattr(self.config, "expected_imu_frame", "") or "").strip()
+        if not expected_imu_frame:
+            raise ValueError(
+                "Go2DataPlaneConfig.expected_imu_frame 必须由 assembly.defaults.frame_ids['imu'] 注入；"
+                "禁止使用硬编码兜底字符串。"
+            )
         return IMUState(
-            frame_id="body",
+            frame_id=expected_imu_frame,
             orientation=quaternion,
             angular_velocity_rad_s=Vector3(x=float(gyroscope[0]), y=float(gyroscope[1]), z=float(gyroscope[2])),
             linear_acceleration_m_s2=Vector3(

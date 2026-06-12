@@ -6,7 +6,7 @@ from drivers.common.manifest import ComponentBinding, RobotDefaults, RobotManife
 from drivers.customrobot.capabilities import CUSTOMROBOT_CAPABILITY_MATRIX
 
 if TYPE_CHECKING:
-    from settings import NuwaxRobotBridgeConfig
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 def build_customrobot_defaults(config: Optional["NuwaxRobotBridgeConfig"] = None) -> RobotDefaults:

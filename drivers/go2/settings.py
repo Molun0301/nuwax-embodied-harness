@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 from contracts.geometry_runtime import PlatformGeometryConfig
+from drivers.go2.defaults import GO2_DEFAULT_FRAME_IDS
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _GO2_ENV_FILE = Path(__file__).resolve().with_name("data_plane.env")
 
@@ -124,7 +125,7 @@ class Go2VideoStreamConfig:
     access_token: str = ""
     fps: float = 15.0
     camera_id: str = "front_camera"
-    frame_id: str = "go2/front_camera"
+    frame_id: str = GO2_DEFAULT_FRAME_IDS["camera_front"]
     width_px: int = 1280
     height_px: int = 720
     reconnect_sec: float = 1.0
@@ -165,6 +166,7 @@ class Go2DataPlaneConfig:
     sdk_path: str = ""
     dds_iface: str = ""
     expected_odom_frame: str = ""
+    expected_imu_frame: str = ""
     direct_dds: Go2DirectDdsConfig = field(default_factory=Go2DirectDdsConfig)
     official: Go2OfficialControlConfig = field(default_factory=Go2OfficialControlConfig)
     video_stream: Go2VideoStreamConfig = field(default_factory=Go2VideoStreamConfig)
@@ -191,6 +193,7 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
         expected_odom_frame=str(
             platform_geometry.frames.odom_frame if platform_geometry is not None else ""
         ).strip(),
+        expected_imu_frame=GO2_DEFAULT_FRAME_IDS["imu"],
         direct_dds=Go2DirectDdsConfig(
             enabled=_cfg_bool("GO2_DIRECT_DDS_ENABLED", True),
             pose_topic=_cfg_str("GO2_DIRECT_DDS_POSE_TOPIC", "rt/sportmodestate"),
@@ -218,7 +221,7 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
             access_token=_cfg_str("GO2_VIDEO_STREAM_ACCESS_TOKEN", ""),
             fps=max(1.0, _cfg_float("GO2_VIDEO_STREAM_FPS", 15.0)),
             camera_id=_cfg_str("GO2_VIDEO_STREAM_CAMERA_ID", "front_camera"),
-            frame_id=_cfg_str("GO2_VIDEO_STREAM_FRAME_ID", "go2/front_camera"),
+            frame_id=_cfg_str("GO2_VIDEO_STREAM_FRAME_ID", GO2_DEFAULT_FRAME_IDS["camera_front"]),
             width_px=max(1, _cfg_int("GO2_VIDEO_STREAM_WIDTH_PX", 1280)),
             height_px=max(1, _cfg_int("GO2_VIDEO_STREAM_HEIGHT_PX", 720)),
             reconnect_sec=max(0.1, _cfg_float("GO2_VIDEO_STREAM_RECONNECT_SEC", 1.0)),

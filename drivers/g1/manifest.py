@@ -6,7 +6,7 @@ from drivers.common.manifest import ComponentBinding, RobotManifest
 from drivers.g1.capabilities import G1_CAPABILITY_MATRIX
 
 if TYPE_CHECKING:
-    from settings import NuwaxRobotBridgeConfig
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 def build_g1_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> RobotManifest:

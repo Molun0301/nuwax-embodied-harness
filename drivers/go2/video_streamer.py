@@ -10,11 +10,7 @@ import time
 from typing import Callable, Optional, TypeVar
 
 from drivers.go2.settings import Go2DataPlaneConfig, load_go2_data_plane_config
-
-try:
-    from services.geometry.video_uds_sender import VideoUdsSender
-except ImportError:
-    VideoUdsSender = None
+from drivers.common.video_uds_sender import VideoUdsSender
 
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.video_streamer")
@@ -106,8 +102,6 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
     frame_interval_sec = 1.0 / max(1.0, float(stream_config.fps))
 
     uds_path = os.environ.get("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
-    if VideoUdsSender is None:
-        raise RuntimeError("VideoUdsSender 不可用，无法启动视频推流。")
     uds_sender = VideoUdsSender(uds_path, reconnect_interval=1.0)
     if not uds_sender.connect():
         raise RuntimeError(f"无法连接 Rust 视频中转 UDS: {uds_path}")

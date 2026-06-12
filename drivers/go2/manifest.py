@@ -7,7 +7,7 @@ from drivers.go2.capabilities import GO2_CAPABILITY_MATRIX
 from drivers.go2.defaults import GO2_DEFAULT_ADAPTER_BINDINGS, GO2_DEFAULT_AUDIO_BINDINGS, GO2_DEFAULT_SENSOR_BINDINGS
 
 if TYPE_CHECKING:
-    from settings import NuwaxRobotBridgeConfig
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 def build_go2_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> RobotManifest:

@@ -27,8 +27,8 @@ from gateways.relay.server import create_relay_app
 from gateways.runtime import GatewayRuntime, create_default_gateway_runtime
 from gateways.ws.data_streams import build_data_stream_router
 from gateways.ws.events import build_event_router
-from logging_utils import LogRateLimiter
-from settings import NuwaxRobotBridgeConfig, configure_logging, load_config
+from core.logging_utils import LogRateLimiter
+from core.settings import NuwaxRobotBridgeConfig, configure_logging, load_config
 
 
 APP_LOGGER = logging.getLogger("nuwax_robot_bridge.gateway")

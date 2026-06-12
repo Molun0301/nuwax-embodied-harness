@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from compat import StrEnum
+from contracts.compat import StrEnum
 from typing import Tuple
 
 

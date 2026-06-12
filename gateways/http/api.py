@@ -315,6 +315,19 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             return request.client.host
         return "-"
 
+    def _assert_admin(access, *, endpoint: str) -> None:
+        """管理面破坏性端点的 admin 角色断言。
+
+        参照 /api/legacy/tcp_policy 写法：删除/激活/保存/加载等绕过能力级风险鉴权的
+        管理端点，统一要求 admin 角色，防止 agent 令牌直接清空地图/记忆库资产。
+        """
+
+        if access.role.value != "admin":
+            raise AccessDeniedError(
+                "该管理端点仅 admin 角色可访问。",
+                details={"role": access.role.value, "endpoint": endpoint},
+            )
+
     def _build_capability_request_context(
         request: Request,
         *,
@@ -551,7 +564,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         delete_memory_library: bool = False,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
+        access = access_manager.authenticate_http(request)
+        _assert_admin(access, endpoint="DELETE /api/maps/catalog/{map_name}")
         delete_result = runtime.map_workspace_service.delete_map(
             map_name=map_name,
             delete_memory_library=delete_memory_library,
@@ -566,7 +580,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/maps/activate")
     async def api_maps_activate(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
+        access = access_manager.authenticate_http(request)
+        _assert_admin(access, endpoint="POST /api/maps/activate")
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -610,7 +625,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/maps/versions/save")
     async def api_map_versions_save(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
+        access = access_manager.authenticate_http(request)
+        _assert_admin(access, endpoint="POST /api/maps/versions/save")
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -626,7 +642,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/maps/versions/load")
     async def api_map_versions_load(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
+        access = access_manager.authenticate_http(request)
+        _assert_admin(access, endpoint="POST /api/maps/versions/load")
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -696,7 +713,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.delete("/api/memory/libraries/{library_name}")
     async def api_delete_memory_library(library_name: str, request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
+        access = access_manager.authenticate_http(request)
+        _assert_admin(access, endpoint="DELETE /api/memory/libraries/{library_name}")
         active_workspace = runtime.map_workspace_service.get_active_workspace()
         delete_result = runtime.memory_service.delete_memory_library(library_name=library_name)
         if active_workspace is not None and active_workspace.active_map_name == library_name:

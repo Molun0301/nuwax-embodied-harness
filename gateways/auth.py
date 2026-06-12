@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from compat import StrEnum
+from contracts.compat import StrEnum
 import ipaddress
+import logging
 
 from contracts.capabilities import CapabilityDescriptor, CapabilityRiskLevel
-from gateways.errors import AccessDeniedError, AuthenticationRequiredError
-from settings import GatewayServerConfig
+from gateways.errors import AccessDeniedError, AuthenticationRequiredError, GatewayError
+from core.settings import GatewayServerConfig
 from starlette.datastructures import Headers, QueryParams
 from starlette.requests import Request
 from starlette.websockets import WebSocket
@@ -18,6 +19,12 @@ class AccessRole(StrEnum):
 
     AGENT = "agent"
     ADMIN = "admin"
+
+
+AUTH_LOGGER = logging.getLogger("nuwax.gateway.auth")
+
+
+_LOOPBACK_HOST_LITERALS = frozenset({"localhost"})
 
 
 @dataclass(frozen=True)
@@ -39,6 +46,42 @@ class GatewayAccessManager:
         self._agent_tokens = frozenset(token for token in config.agent_tokens if token)
         self._admin_tokens = frozenset(token for token in config.admin_tokens if token)
         self._agent_high_risk_allowlist = frozenset(config.agent_high_risk_allowlist)
+        self._assert_credentials_configured()
+
+    def _assert_credentials_configured(self) -> None:
+        """无任何有效令牌时执行 fail-closed 校验。
+
+        仅监听回环地址时降级为告警放行（便于本机开发）；对外暴露时直接拒绝启动，
+        避免在缺失 .env 的部署场景下以弱默认凭据对外提供服务。
+        """
+
+        if self._agent_tokens or self._admin_tokens:
+            return
+        host = getattr(self._config, "host", "") or ""
+        if self._is_loopback_host(host):
+            AUTH_LOGGER.warning(
+                "网关未配置任何 agent/admin 令牌，当前仅监听回环地址(%s)，以无鉴权降级模式启动；"
+                "对外部署前必须配置 NUWAX_GATEWAY_AGENT_TOKENS / NUWAX_GATEWAY_ADMIN_TOKENS。",
+                host or "<loopback>",
+            )
+            return
+        raise GatewayError(
+            "网关未配置任何 agent/admin 令牌且监听非回环地址(%s)，拒绝以弱默认凭据对外启动。"
+            "请设置 NUWAX_GATEWAY_AGENT_TOKENS 与 NUWAX_GATEWAY_ADMIN_TOKENS。" % (host or "0.0.0.0"),
+            error_code="gateway_misconfigured",
+            http_status=500,
+            details={"host": host},
+        )
+
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        normalized = host.strip().lower()
+        if normalized in _LOOPBACK_HOST_LITERALS:
+            return True
+        try:
+            return ipaddress.ip_address(normalized).is_loopback
+        except ValueError:
+            return False
 
     def authenticate_http(self, request: Request) -> AccessContext:
         """校验 HTTP 请求。"""

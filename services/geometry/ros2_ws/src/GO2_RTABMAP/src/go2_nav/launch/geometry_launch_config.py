@@ -55,6 +55,8 @@ class GeometryLaunchConfig:
     exploration_max_goal_retries: int
     exploration_post_goal_pause_sec: float
     exploration_min_travel_m: float
+    exploration_goal_setback_m: float
+    cost_map_topic: str
     nav2_action_name: str
 
     @classmethod
@@ -103,6 +105,12 @@ class GeometryLaunchConfig:
             exploration_min_travel_m=_env_float(
                 "NUWAX_GEOMETRY_EXPLORATION_MIN_TRAVEL_M", 1.2
             ),
+            exploration_goal_setback_m=_env_float(
+                "NUWAX_GEOMETRY_EXPLORATION_GOAL_SETBACK_M", 0.6
+            ),
+            cost_map_topic=_env(
+                "NUWAX_GEOMETRY_COST_MAP_TOPIC", "/global_costmap/costmap"
+            ),
             nav2_action_name=_env("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
         )
 
@@ -118,7 +126,10 @@ class GeometryLaunchConfig:
             'info_gain_weight': 1.0,
             'size_weight': 0.6,
             'travel_weight': 0.8,
-            'turn_weight': 0.25,
+            # Heavier turn penalty so the explorer prefers frontiers roughly
+            # ahead of the robot instead of ones behind it (turn=120deg+),
+            # which forced slow in-place spins ("turn-a-step-then-stop").
+            'turn_weight': 0.6,
             'clearance_weight': 0.8,
             'max_goal_candidates_per_frontier': 80,
             'blacklist_radius': 1.2,
@@ -128,7 +139,10 @@ class GeometryLaunchConfig:
             'failures_before_corridor': self.exploration_failures_before_corridor,
             'failures_before_retry_reset': self.exploration_failures_before_retry,
             'relaxed_min_goal_clearance_m': 0.15,
-            'relaxed_min_travel_m': 0.85,
+            # relaxed kicks in AFTER failures, so it must be <= normal min_travel
+            # (0.7) — requiring a farther goal when we're already struggling makes
+            # no sense and was an inversion bug.
+            'relaxed_min_travel_m': 0.5,
             'corridor_travel_weight_scale': 1.35,
             'corridor_turn_weight_scale': 1.5,
             'retry_cooldown_sec': 12.0,
@@ -137,6 +151,13 @@ class GeometryLaunchConfig:
             'startup_grace_period': 15.0,
             'min_travel_m': self.exploration_min_travel_m,
             'min_goal_clearance_m': 0.25,
+            'goal_setback_m': self.exploration_goal_setback_m,
+            # Validate goals against Nav2's global costmap (live obstacles +
+            # inflation + unknown) so we never dispatch an un-plannable goal.
+            'costmap_topic': self.cost_map_topic,
+            'costmap_lethal_cost': 90,
+            'costmap_allow_unknown': True,
+            'require_costmap_traversable': True,
             'goal_success_tolerance': 0.35,
             'post_goal_pause_sec': self.exploration_post_goal_pause_sec,
             'min_goal_progress_m': 0.40,

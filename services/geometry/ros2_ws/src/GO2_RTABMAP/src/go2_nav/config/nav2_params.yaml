@@ -73,7 +73,11 @@ controller_server:
       regulated_linear_scaling_min_radius: 0.75
       regulated_linear_scaling_min_speed: 0.08
       use_cost_regulated_linear_velocity_scaling: false
-      max_allowed_time_to_collision: 1.5
+      # ~1.0s * 0.28m/s ≈ 0.28m forward collision check. Shorter than the old
+      # 1.5s to cut 'collision ahead' false-aborts on freshly-built maps where
+      # the path briefly grazes inflation; goals are also retreated into free
+      # space so real head-on collisions stay covered by the costmap footprint.
+      max_allowed_time_to_collision: 1.0
 
 planner_server:
   ros__parameters:
@@ -83,7 +87,11 @@ planner_server:
 
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.2
+      # 0.5m lets the planner snap a goal that landed near the unknown/inflation
+      # border onto the closest reachable free cell instead of aborting with
+      # 'failed to create plan'. Frontier goals are retreated into free space
+      # too (goal_setback_m), so this is belt-and-suspenders for edge cases.
+      tolerance: 0.5
       use_astar: false
       allow_unknown: true
 

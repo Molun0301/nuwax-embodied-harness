@@ -125,6 +125,34 @@ class FrontierExplorer(Node):
         self.declare_parameter('min_travel_m', 0.5)
         # Skip goal cells with less than this clearance to occupied space (m).
         self.declare_parameter('min_goal_clearance_m', 0.25)
+        # Pull the dispatched goal back from the frontier line toward the robot
+        # by this distance (m), snapping to a free, well-clear cell. Frontier
+        # cells sit on the free/unknown border and hug inflation, so sending a
+        # goal *there* makes the planner fail ('failed to create plan') or the
+        # controller abort ('collision ahead'). Retreating into open free space
+        # gives a goal Nav2 can actually plan to and reach; the robot's lidar
+        # still sees the unknown area beyond from the retreated stand-off point.
+        self.declare_parameter('goal_setback_m', 0.6)
+        # Validate every dispatched goal against Nav2's global costmap (which
+        # includes live scan obstacles + inflation + unknown space) instead of
+        # only the raw /map. A goal that is 'free' on /map can still be lethal on
+        # the costmap after 0.6m inflation, which is why the planner kept
+        # returning 'failed to create plan'. We subscribe to the costmap, reject
+        # candidates whose cell cost is >= costmap_lethal_cost, and retreat goals
+        # along the robot ray until they land on a low-cost, plannable cell.
+        self.declare_parameter('costmap_topic', '/global_costmap/costmap')
+        # OccupancyGrid cost (0..100). >= this is treated as untraversable.
+        # 90 keeps a margin below 99/100 lethal+inscribed so we stay off walls.
+        self.declare_parameter('costmap_lethal_cost', 90)
+        # The global planner runs with allow_unknown:=true, so it CAN plan
+        # through unknown space. Frontier goals sit right on the free/unknown
+        # border and read as unknown (-1) on the costmap; rejecting those was
+        # wrong and caused 'no reachable frontiers' freezes. Treat unknown as
+        # traversable to match the planner; only hard-lethal cells are rejected.
+        self.declare_parameter('costmap_allow_unknown', True)
+        # If True and the costmap has been received, a goal that is lethal /
+        # unknown on the costmap is skipped entirely (no dispatch).
+        self.declare_parameter('require_costmap_traversable', True)
         # After Nav2 reports success, reject the result if the robot is still
         # farther than this from the dispatched goal (planner snap / early stop).
         self.declare_parameter('goal_success_tolerance', 0.45)
@@ -182,6 +210,11 @@ class FrontierExplorer(Node):
         self.goal_timeout = float(gp('goal_timeout').value)
         self.min_travel_m = float(gp('min_travel_m').value)
         self.min_goal_clearance_m = float(gp('min_goal_clearance_m').value)
+        self.goal_setback_m = float(gp('goal_setback_m').value)
+        self.costmap_topic = str(gp('costmap_topic').value)
+        self.costmap_lethal_cost = int(gp('costmap_lethal_cost').value)
+        self.costmap_allow_unknown = bool(gp('costmap_allow_unknown').value)
+        self.require_costmap_traversable = bool(gp('require_costmap_traversable').value)
         self.goal_success_tolerance = float(gp('goal_success_tolerance').value)
         self.min_nav_commit_sec = float(gp('min_nav_commit_sec').value)
         self.min_failure_robot_move_m = float(gp('min_failure_robot_move_m').value)
@@ -200,6 +233,7 @@ class FrontierExplorer(Node):
 
         # ---- State
         self.latest_map: Optional[OccupancyGrid] = None
+        self.latest_costmap: Optional[OccupancyGrid] = None
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -247,6 +281,11 @@ class FrontierExplorer(Node):
         self.map_sub = self.create_subscription(
             OccupancyGrid, self.map_topic, self.map_cb, map_qos)
 
+        # ---- Subscriber: Nav2 global costmap (TRANSIENT_LOCAL like /map).
+        # Used to validate/retreat goals against real planner cost.
+        self.costmap_sub = self.create_subscription(
+            OccupancyGrid, self.costmap_topic, self.costmap_cb, map_qos)
+
         # ---- Visualization publisher
         # /frontiers (MarkerArray):
         #   - cluster spheres (cyan, radius scales with size)
@@ -273,6 +312,45 @@ class FrontierExplorer(Node):
     # ------------------------------------------------------------------
     def map_cb(self, msg: OccupancyGrid):
         self.latest_map = msg
+
+    def costmap_cb(self, msg: OccupancyGrid):
+        self.latest_costmap = msg
+
+    def _costmap_cost_at(self, wx: float, wy: float) -> Optional[int]:
+        """Cost (0..100) at a world point on the global costmap, or None.
+
+        Returns None when no costmap has been received or the point is outside
+        its bounds. -1 (unknown) is returned as-is so callers can treat unknown
+        distinctly from free.
+        """
+        cm = self.latest_costmap
+        if cm is None:
+            return None
+        info = cm.info
+        res = info.resolution
+        if res <= 1e-6:
+            return None
+        col = int((wx - info.origin.position.x) / res)
+        row = int((wy - info.origin.position.y) / res)
+        if not (0 <= col < info.width and 0 <= row < info.height):
+            return None
+        return int(cm.data[row * info.width + col])
+
+    def _is_costmap_traversable(self, wx: float, wy: float) -> bool:
+        """True if the planner can plausibly reach this costmap cell.
+
+        Matches the global planner's allow_unknown:=true behaviour: unknown
+        cells (-1) are traversable (frontier goals legitimately sit on the
+        unknown border). Only cells at/above the lethal threshold are rejected.
+        When no costmap is available we return True (cannot validate) so the
+        explorer still works during the brief window before the first costmap.
+        """
+        cost = self._costmap_cost_at(wx, wy)
+        if cost is None:
+            return True  # costmap not ready / out of bounds — don't over-filter
+        if cost < 0:
+            return self.costmap_allow_unknown  # unknown: allow (planner does)
+        return cost < self.costmap_lethal_cost
 
     def plan_cb(self, msg: Path):
         self.latest_plan = msg
@@ -306,7 +384,12 @@ class FrontierExplorer(Node):
 
     @staticmethod
     def _nav_status_is_terminal(status: int) -> bool:
-        # Nav2 planner/controller abort = unreachable; retrying the same pose loops forever.
+        # Nav2 planner/controller abort = goal unreachable on the current
+        # costmap. Retrying the SAME pose just makes the robot sit still for
+        # max_goal_retries * retry_delay seconds (observed: ~25s frozen) before
+        # blacklisting anyway. A goal that fails to plan in <100ms with the
+        # robot not moving is genuinely unreachable, so treat ABORTED/CANCELED
+        # as terminal: blacklist immediately and pick a different frontier.
         return status in {
             GoalStatus.STATUS_ABORTED,
             GoalStatus.STATUS_CANCELED,
@@ -884,6 +967,14 @@ class FrontierExplorer(Node):
         info = self.latest_map.info
         best = None
         best_score = -float('inf')
+        # Fallback: best candidate that passed every filter EXCEPT the costmap
+        # gate. If the gate rejects everything (e.g. costmap not filled in yet
+        # around distant frontiers), we still dispatch this so the robot keeps
+        # exploring instead of freezing on 'no reachable frontiers'. ABORTED now
+        # blacklists+hops immediately, so a wrong guess here is cheap.
+        fallback = None
+        fallback_score = -float('inf')
+        n_costmap_rejected = 0
         for c in clusters:
             candidate = self.evaluate_cluster(
                 c, robot_pose, grid, info, selection=selection,
@@ -894,9 +985,29 @@ class FrontierExplorer(Node):
                 continue
             if candidate.clearance_m < selection['min_goal_clearance_m']:
                 continue
+            if candidate.score > fallback_score:
+                fallback_score = candidate.score
+                fallback = candidate
+            # Final gate: the (already retreated) goal must be traversable on
+            # Nav2's global costmap, or the planner returns 'failed to create
+            # plan' the instant we dispatch. Prefer candidates that pass it.
+            if (
+                self.require_costmap_traversable
+                and self.latest_costmap is not None
+                and not self._is_costmap_traversable(*candidate.goal_world)
+            ):
+                n_costmap_rejected += 1
+                continue
             if candidate.score > best_score:
                 best_score = candidate.score
                 best = candidate
+        if best is None and fallback is not None:
+            self.get_logger().info(
+                f'All {n_costmap_rejected} candidate(s) failed the costmap gate; '
+                f'dispatching best-scoring frontier anyway (Nav2 will arbitrate).',
+                throttle_duration_sec=5.0,
+            )
+            return fallback
         return best
 
     def evaluate_cluster(self, cluster: FrontierCluster,
@@ -969,6 +1080,25 @@ class FrontierExplorer(Node):
                 turn_weight * best_heading_error
             )
 
+        # Retreat the goal from the frontier line back toward the robot so Nav2
+        # gets a plan, reachable stand-off point in open free space instead of a
+        # cell hugging the unknown/inflation border (which aborts as
+        # 'failed to create plan' / 'collision ahead'). Keeps the unknown area
+        # in lidar view from the retreated point.
+        if self.goal_setback_m > 1e-3 and best_goal_cell is not None:
+            retreated = self._retreat_goal_to_free(
+                best_goal_cell, robot_pose, grid, info, clearance_radius_cells,
+            )
+            if retreated is not None:
+                (gx_r, gy_r), cell_r, clear_r = retreated
+                best_goal = (gx_r, gy_r)
+                best_goal_cell = cell_r
+                best_clearance = clear_r
+                best_travel = math.hypot(gx_r - rx, gy_r - ry)
+                best_heading_error = abs(
+                    self._angle_diff(math.atan2(gy_r - ry, gx_r - rx), ryaw)
+                )
+
         return FrontierCandidate(
             cluster=cluster,
             goal_world=best_goal,
@@ -1010,6 +1140,70 @@ class FrontierExplorer(Node):
         cc = c - c0
         dists = np.sqrt((occupied[:, 0] - rr) ** 2 + (occupied[:, 1] - cc) ** 2)
         return float(np.min(dists) * res)
+
+    def _retreat_goal_to_free(
+        self,
+        goal_cell: Tuple[int, int],
+        robot_pose: Tuple[float, float, float],
+        grid: np.ndarray,
+        info,
+        clearance_radius_cells: int,
+    ) -> Optional[Tuple[Tuple[float, float], Tuple[int, int], float]]:
+        """Step the goal back from a frontier cell toward the robot.
+
+        Walks from the frontier cell along the cell->robot direction in ~half-cell
+        increments up to goal_setback_m. Prefers the first cell that is FREE on
+        /map, meets min_goal_clearance_m, AND is traversable on the Nav2 global
+        costmap (so the planner can actually reach it). Falls back to the best
+        costmap-traversable free cell, then to the best free cell, then None.
+        """
+        res = info.resolution
+        if res <= 1e-6:
+            return None
+        ox = info.origin.position.x
+        oy = info.origin.position.y
+        h, w = grid.shape
+
+        rr0, cc0 = goal_cell  # (row, col)
+        gx0 = ox + (cc0 + 0.5) * res
+        gy0 = oy + (rr0 + 0.5) * res
+        rx, ry, _ = robot_pose
+        # Unit vector from goal back toward the robot.
+        dx = rx - gx0
+        dy = ry - gy0
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            return None
+        ux, uy = dx / dist, dy / dist
+
+        max_setback = min(self.goal_setback_m, dist)
+        step = max(res * 0.5, 1e-3)
+        n_steps = max(1, int(round(max_setback / step)))
+
+        best_free = None       # best by clearance, any costmap status
+        best_traversable = None  # best by clearance AND costmap-traversable
+        for i in range(1, n_steps + 1):
+            d = min(i * step, max_setback)
+            wx = gx0 + ux * d
+            wy = gy0 + uy * d
+            cc = int((wx - ox) / res)
+            rrow = int((wy - oy) / res)
+            if not self._is_valid_cell(rrow, cc, grid.shape):
+                continue
+            if grid[rrow, cc] != 0:  # only stand on known-free cells
+                continue
+            clearance = self._estimate_clearance_m(
+                grid, rrow, cc, clearance_radius_cells, res
+            )
+            cand = ((wx, wy), (rrow, cc), clearance)
+            traversable = self._is_costmap_traversable(wx, wy)
+            if traversable and clearance >= self.min_goal_clearance_m:
+                return cand  # ideal: free, clear, and plannable
+            if traversable and (best_traversable is None or clearance > best_traversable[2]):
+                best_traversable = cand
+            if best_free is None or clearance > best_free[2]:
+                best_free = cand
+        return best_traversable or best_free
 
     # ------------------------------------------------------------------
     # Blacklist
@@ -1077,17 +1271,13 @@ class FrontierExplorer(Node):
                 m.pose.orientation.w = 1.0
                 d = max(0.15, min(0.6, 0.05 + 0.01 * math.sqrt(c.size)))
                 m.scale = Vector3(x=d, y=d, z=d)
-                is_chosen = (
-                    chosen is not None
-                    and math.hypot(
-                        c.centroid_world[0] - chosen.cluster.centroid_world[0],
-                        c.centroid_world[1] - chosen.cluster.centroid_world[1],
-                    ) < 0.05
-                )
-                if is_chosen:
-                    m.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.95)
-                else:
-                    m.color = ColorRGBA(r=0.0, g=0.7, b=1.0, a=0.7)
+                # All clusters are cyan markers showing WHERE the unknown
+                # borders are (their centroids). The actual goal the robot
+                # drives to is a separate green sphere at goal_xy below — do
+                # NOT recolour the chosen cluster green, since its centroid is
+                # offset from the retreated goal and that mismatch ('two greens,
+                # arrow in a wall') is confusing.
+                m.color = ColorRGBA(r=0.0, g=0.7, b=1.0, a=0.7)
                 ma.markers.append(m)
 
         goal_xy = None
@@ -1103,6 +1293,13 @@ class FrontierExplorer(Node):
             goal_yaw = math.atan2(goal_xy[1] - ry, goal_xy[0] - rx)
 
         if goal_xy is not None and goal_yaw is not None:
+            # Single unambiguous GOAL marker: a green sphere AT the real goal
+            # point the robot navigates to (the retreated, plannable point) —
+            # this is "the exploration target". The short arrow only shows the
+            # approach heading; it is deliberately short so it does not visually
+            # stab into far obstacles/unknown space.
+            ma.markers.append(self._goal_sphere_marker(
+                goal_xy[0], goal_xy[1], ns=goal_ns + '_pt', stamp=stamp))
             ma.markers.append(self._goal_arrow_marker(
                 goal_xy[0], goal_xy[1], goal_yaw, ns=goal_ns, stamp=stamp))
             if robot_pose is not None:
@@ -1159,7 +1356,24 @@ class FrontierExplorer(Node):
         m.pose.position = Point(x=gx, y=gy, z=0.12)
         m.pose.orientation = Quaternion(
             x=0.0, y=0.0, z=math.sin(yaw / 2.0), w=math.cos(yaw / 2.0))
-        m.scale = Vector3(x=0.9, y=0.18, z=0.18)
+        # Short arrow (0.35m): heading hint only, so it doesn't stab into far
+        # obstacles and get mistaken for "the goal is inside that wall".
+        m.scale = Vector3(x=0.35, y=0.10, z=0.10)
+        m.color = ColorRGBA(r=0.0, g=0.9, b=0.2, a=0.9)
+        return m
+
+    def _goal_sphere_marker(self, gx: float, gy: float, *, ns: str, stamp) -> Marker:
+        """Bright green sphere AT the real exploration goal point."""
+        m = Marker()
+        m.header.frame_id = self.global_frame
+        m.header.stamp = stamp
+        m.ns = ns
+        m.id = 0
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position = Point(x=gx, y=gy, z=0.12)
+        m.pose.orientation.w = 1.0
+        m.scale = Vector3(x=0.3, y=0.3, z=0.3)
         m.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
         return m
 

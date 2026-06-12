@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from gateways.app import create_gateway_app, create_gateway_app_from_env, create_relay_app_from_env
-    from gateways.artifacts import LocalArtifactStore
+    from services.artifact_store import LocalArtifactStore
     from gateways.auth import AccessContext, AccessRole, GatewayAccessManager
     from gateways.runtime import GatewayRuntime, create_default_gateway_runtime
 
@@ -35,7 +35,7 @@ def __getattr__(name: str):
             "GatewayAccessManager": GatewayAccessManager,
         }[name]
     if name == "LocalArtifactStore":
-        from gateways.artifacts import LocalArtifactStore
+        from services.artifact_store import LocalArtifactStore
 
         return LocalArtifactStore
     if name in {"GatewayRuntime", "create_default_gateway_runtime"}:

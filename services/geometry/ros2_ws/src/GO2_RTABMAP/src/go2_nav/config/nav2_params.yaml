@@ -4,7 +4,11 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /utlidar/robot_odom
-    default_bt_xml_filename: "/home/unitree/GO2_RTABMAP/src/go2_nav/config/navigate_simple_replanning.xml"
+    # NOTE: overridden at launch by materialize_nav2_params() with the absolute
+    # path under the installed go2_nav share dir. This relative placeholder only
+    # applies if you bypass nav2.launch.py and feed this yaml to Nav2 directly
+    # (the old hard-coded /home/unitree/GO2_RTABMAP/... path no longer exists).
+    default_bt_xml_filename: "navigate_simple_replanning.xml"
     server_timeout: 5000
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node

@@ -79,6 +79,10 @@ class FrontierExplorer(Node):
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('global_frame', 'map')
         self.declare_parameter('robot_frame', 'base_link')
+        # Nav2 action this explorer sends goals to. Basename (no leading slash);
+        # fed from NUWAX_NAV2_ACTION_NAME so a platform can rename the action
+        # without editing this script.
+        self.declare_parameter('nav2_action_name', 'navigate_to_pose')
         self.declare_parameter('replan_period', 3.0)
         self.declare_parameter('min_frontier_size', 10)
         self.declare_parameter('info_gain_radius', 1.5)
@@ -183,6 +187,7 @@ class FrontierExplorer(Node):
         self.map_topic = gp('map_topic').value
         self.global_frame = gp('global_frame').value
         self.robot_frame = gp('robot_frame').value
+        self.nav2_action_name = str(gp('nav2_action_name').value)
         self.replan_period = float(gp('replan_period').value)
         self.min_frontier_size = int(gp('min_frontier_size').value)
         self.info_gain_radius = float(gp('info_gain_radius').value)
@@ -241,7 +246,7 @@ class FrontierExplorer(Node):
         self.blacklist: List[Tuple[float, float, float]] = []
 
         # NavigateToPose action client
-        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.nav_client = ActionClient(self, NavigateToPose, self.nav2_action_name)
 
         # navigation state
         self.active_goal_handle = None

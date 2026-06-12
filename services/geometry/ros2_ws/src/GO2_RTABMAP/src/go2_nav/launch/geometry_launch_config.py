@@ -120,6 +120,7 @@ class GeometryLaunchConfig:
             'map_topic': self.map_topic,
             'global_frame': self.map_frame,
             'robot_frame': self.base_frame,
+            'nav2_action_name': self.nav2_action_basename,
             'replan_period': 5.0,
             'min_frontier_size': self.exploration_min_frontier_size,
             'info_gain_radius': 1.5,

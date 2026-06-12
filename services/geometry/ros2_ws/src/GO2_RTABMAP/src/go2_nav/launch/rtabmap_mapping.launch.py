@@ -73,11 +73,24 @@ def generate_launch_description():
         'Grid/RayTracing': 'true',
         'Grid/Scan2dUnknownSpaceFilled': 'false',
         'GridGlobal/UpdateError': '0.01',
-        'GridGlobal/ProbHit': '0.85',
-        'GridGlobal/ProbMiss': '0.45',
+        # Occupancy log-odds tuned for the GO2's chin-mounted lidar, which has a
+        # rear blind spot: an obstacle the robot drives past stops receiving any
+        # "hit" evidence, while rays cast at the ground BEHIND the robot keep
+        # ray-tracing (Grid/ProjRayTracing) "miss" votes through that obstacle's
+        # cell, slowly erasing it. Behind = blind = only a FINITE burst of miss
+        # votes before the cell goes fully unobserved; a pedestrian in FRONT
+        # gets CONTINUOUS miss votes once it walks away.
+        # Strategy (verified via log-odds math): make a single hit STRONG so an
+        # obstacle is locked in after ~1 frame (banks ~+2.2 logodds), and a
+        # single miss WEAK (-0.08) so the finite rear miss-burst can't erase it
+        # (would need ~28 misses; the blind spot never supplies that many). A
+        # pedestrian seen for many frames then walking away still clears in
+        # ~16s of continuous misses — acceptable for crowded scenes.
+        'GridGlobal/ProbHit': '0.9',     # was 0.85: lock obstacles in fast
+        'GridGlobal/ProbMiss': '0.48',   # was 0.45: a single miss barely counts
         'GridGlobal/OccupancyThr': '0.5',
-        'GridGlobal/ProbClampingMin': '0.10',
-        'GridGlobal/ProbClampingMax': '0.95',
+        'GridGlobal/ProbClampingMin': '0.25',  # was 0.10: cells keep a floor
+        'GridGlobal/ProbClampingMax': '0.98',  # was 0.95: a hit can bank more
         'GridGlobal/FullUpdate': 'true',
         'GridGlobal/MinSize': '0.0',
         'GridGlobal/Eroded': 'false',

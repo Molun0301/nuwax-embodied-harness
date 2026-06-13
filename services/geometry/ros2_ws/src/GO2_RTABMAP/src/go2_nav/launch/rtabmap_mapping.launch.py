@@ -60,37 +60,30 @@ def generate_launch_description():
         'cloud_output_voxelized': True,
         'cloud_subtract_filtering': True,
         'cloud_subtract_filtering_min_neighbors': 2,
-        'Grid/MaxGroundHeight': '-0.15',
+        # Slightly lenient ground/obstacle split: sparse 4-line lidar often tags
+        # low hits (carpet, slope, body roll) as obstacles when MaxGroundHeight
+        # is too tight. FlatObstacleDetected off avoids ground-bump false walls.
+        'Grid/MaxGroundHeight': '-0.05',
         'Grid/MinGroundHeight': '-0.50',
         'Grid/MaxObstacleHeight': '1.0',
         'Grid/NormalsSegmentation': 'false',
         'Grid/PreVoxelFiltering': 'true',
         'Grid/CellSize_PreVoxel': '0.10',
-        'Grid/MinClusterSize': '3',
-        'Grid/FlatObstacleDetected': 'true',
-        'Grid/NoiseFilteringRadius': '0.0',
-        'Grid/NoiseFilteringMinNeighbors': '0',
+        'Grid/MinClusterSize': '5',
+        'Grid/FlatObstacleDetected': 'false',
+        'Grid/NoiseFilteringRadius': '0.15',
+        'Grid/NoiseFilteringMinNeighbors': '2',
         'Grid/RayTracing': 'true',
         'Grid/Scan2dUnknownSpaceFilled': 'false',
         'GridGlobal/UpdateError': '0.01',
-        # Occupancy log-odds tuned for the GO2's chin-mounted lidar, which has a
-        # rear blind spot: an obstacle the robot drives past stops receiving any
-        # "hit" evidence, while rays cast at the ground BEHIND the robot keep
-        # ray-tracing (Grid/ProjRayTracing) "miss" votes through that obstacle's
-        # cell, slowly erasing it. Behind = blind = only a FINITE burst of miss
-        # votes before the cell goes fully unobserved; a pedestrian in FRONT
-        # gets CONTINUOUS miss votes once it walks away.
-        # Strategy (verified via log-odds math): make a single hit STRONG so an
-        # obstacle is locked in after ~1 frame (banks ~+2.2 logodds), and a
-        # single miss WEAK (-0.08) so the finite rear miss-burst can't erase it
-        # (would need ~28 misses; the blind spot never supplies that many). A
-        # pedestrian seen for many frames then walking away still clears in
-        # ~16s of continuous misses — acceptable for crowded scenes.
-        'GridGlobal/ProbHit': '0.9',     # was 0.85: lock obstacles in fast
-        'GridGlobal/ProbMiss': '0.48',   # was 0.45: a single miss barely counts
-        'GridGlobal/OccupancyThr': '0.5',
-        'GridGlobal/ProbClampingMin': '0.25',  # was 0.10: cells keep a floor
-        'GridGlobal/ProbClampingMax': '0.98',  # was 0.95: a hit can bank more
+        # Occupancy log-odds: balance rear blind-spot stickiness vs false walls.
+        # ProbHit 0.80 needs ~2 hits before occupied (was 0.9 / 1 frame). Higher
+        # OccupancyThr and noise/cluster filters above drop sparse ghost cells.
+        'GridGlobal/ProbHit': '0.80',
+        'GridGlobal/ProbMiss': '0.45',
+        'GridGlobal/OccupancyThr': '0.55',
+        'GridGlobal/ProbClampingMin': '0.15',
+        'GridGlobal/ProbClampingMax': '0.95',
         'GridGlobal/FullUpdate': 'true',
         'GridGlobal/MinSize': '0.0',
         'GridGlobal/Eroded': 'false',

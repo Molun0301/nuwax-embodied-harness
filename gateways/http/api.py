@@ -630,10 +630,12 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        map_version = runtime.map_workspace_service.save_map_version(
-            map_name=str(payload.get("map_name", "")).strip() or None,
-            reason=str(payload.get("reason", "")).strip(),
-            metadata={"requested_by": "http_api"},
+        map_version = await run_in_threadpool(
+            lambda: runtime.map_workspace_service.save_map_version(
+                map_name=str(payload.get("map_name", "")).strip() or None,
+                reason=str(payload.get("reason", "")).strip(),
+                metadata={"requested_by": "http_api"},
+            )
         )
         return {
             "map_version": to_jsonable(map_version),
@@ -648,13 +650,15 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         if not isinstance(payload, dict):
             payload = {}
         map_name = str(payload.get("map_name", "")).strip()
-        map_version, workspace = runtime.map_workspace_service.load_map_version(
-            map_name=map_name,
-            version_id=str(payload.get("version_id", "")).strip() or None,
-            activate_if_needed=True,
-            load_memory_history=bool(payload.get("load_memory_history", True)),
-            reset_memory_library=bool(payload.get("reset_memory_library", False)),
-            metadata={"requested_by": "http_api", "source": "http_api_load_map_version"},
+        map_version, workspace = await run_in_threadpool(
+            lambda: runtime.map_workspace_service.load_map_version(
+                map_name=map_name,
+                version_id=str(payload.get("version_id", "")).strip() or None,
+                activate_if_needed=True,
+                load_memory_history=bool(payload.get("load_memory_history", True)),
+                reset_memory_library=bool(payload.get("reset_memory_library", False)),
+                metadata={"requested_by": "http_api", "source": "http_api_load_map_version"},
+            )
         )
         return {
             "map_version": to_jsonable(map_version),

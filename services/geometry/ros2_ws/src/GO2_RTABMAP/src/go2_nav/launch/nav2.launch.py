@@ -85,4 +85,15 @@ def generate_launch_description():
                 ],
             }],
         ),
+
+        # Nav2 Foxy only publishes /plan when a compatible subscriber exists; relay
+        # for RViz (see plan_relay.py).
+        Node(
+            package='go2_nav',
+            executable='plan_relay.py',
+            name='plan_relay',
+            output='screen',
+            respawn=True,
+            respawn_delay=2.0,
+        ),
     ])

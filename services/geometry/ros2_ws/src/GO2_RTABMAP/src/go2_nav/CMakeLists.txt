@@ -9,6 +9,7 @@ install(PROGRAMS
   scripts/odom_tf_broadcaster.py
   scripts/cloud_to_scan.py
   scripts/frontier_explorer.py
+  scripts/plan_relay.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

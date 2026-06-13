@@ -6,7 +6,9 @@
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
     <PipelineSequence name="NavigateWithReplanning">
-      <RateController hz="1.0">
+      <!-- 0.25 Hz: mapping mode /map shifts often; 1 Hz replan made FollowPath
+           restart every second when side walls flickered, causing stop-go. -->
+      <RateController hz="0.25">
         <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" server_timeout="5000"/>
       </RateController>
       <FollowPath path="{path}" controller_id="FollowPath" server_timeout="5000"/>

@@ -60,30 +60,28 @@ def generate_launch_description():
         'cloud_output_voxelized': True,
         'cloud_subtract_filtering': True,
         'cloud_subtract_filtering_min_neighbors': 2,
-        # Slightly lenient ground/obstacle split: sparse 4-line lidar often tags
-        # low hits (carpet, slope, body roll) as obstacles when MaxGroundHeight
-        # is too tight. FlatObstacleDetected off avoids ground-bump false walls.
-        'Grid/MaxGroundHeight': '-0.05',
+        # Ground/obstacle split: a bit lenient vs -0.15 to limit false walls on carpet/
+        # roll, but not as loose as -0.05. Sticky log-odds below: sparse L1 + ray
+        # tracing used to erase side walls as the dog walked past (ProbMiss too strong
+        # at 0.45). ProbMiss 0.49 makes misses weak so walls stay until many frames.
+        'Grid/MaxGroundHeight': '-0.08',
         'Grid/MinGroundHeight': '-0.50',
         'Grid/MaxObstacleHeight': '1.0',
         'Grid/NormalsSegmentation': 'false',
         'Grid/PreVoxelFiltering': 'true',
         'Grid/CellSize_PreVoxel': '0.10',
-        'Grid/MinClusterSize': '5',
+        'Grid/MinClusterSize': '4',
         'Grid/FlatObstacleDetected': 'false',
-        'Grid/NoiseFilteringRadius': '0.15',
+        'Grid/NoiseFilteringRadius': '0.12',
         'Grid/NoiseFilteringMinNeighbors': '2',
         'Grid/RayTracing': 'true',
         'Grid/Scan2dUnknownSpaceFilled': 'false',
         'GridGlobal/UpdateError': '0.01',
-        # Occupancy log-odds: balance rear blind-spot stickiness vs false walls.
-        # ProbHit 0.80 needs ~2 hits before occupied (was 0.9 / 1 frame). Higher
-        # OccupancyThr and noise/cluster filters above drop sparse ghost cells.
-        'GridGlobal/ProbHit': '0.80',
-        'GridGlobal/ProbMiss': '0.45',
-        'GridGlobal/OccupancyThr': '0.55',
-        'GridGlobal/ProbClampingMin': '0.15',
-        'GridGlobal/ProbClampingMax': '0.95',
+        'GridGlobal/ProbHit': '0.88',
+        'GridGlobal/ProbMiss': '0.49',
+        'GridGlobal/OccupancyThr': '0.50',
+        'GridGlobal/ProbClampingMin': '0.22',
+        'GridGlobal/ProbClampingMax': '0.97',
         'GridGlobal/FullUpdate': 'true',
         'GridGlobal/MinSize': '0.0',
         'GridGlobal/Eroded': 'false',

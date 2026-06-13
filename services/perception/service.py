@@ -25,7 +25,10 @@ from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from contracts.image import ImageFrame
 
 VideoFrameSink = Callable[[object], Optional[object]]
 
@@ -394,7 +397,6 @@ class PerceptionService:
                     "ingest_status": ingest_status,
                 },
             )
-        resolved_camera_id = image_frame.camera_id
         camera_info = self._camera_info_from_video_frame(image_frame)
         source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
         self._publish_video_frame(

@@ -19,7 +19,7 @@ from contracts.base import utc_now
 from contracts.events import RuntimeEventCategory
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
-from contracts.maps import SemanticMap, SemanticRegion
+from contracts.maps import SemanticMap
 from contracts.memory import (
     GoalCandidateScoreBreakdown,
     GoalConstraint,
@@ -60,7 +60,6 @@ from contracts.spatial_memory import (
     SemanticSummaryNode,
     SpatialAnchor,
     SpatialAnchorKind,
-    VerificationResult,
 )
 from core import EventBus, StateNamespace, StateStore
 from services.artifact_store import LocalArtifactStore
@@ -83,7 +82,6 @@ from services.memory.vector_store import (
     NamedVector,
     SQLiteNamedVectorStore,
     VectorPoint,
-    VectorSearchHit,
 )
 from services.model_providers import (
     resolve_grounding_provider_spec,
@@ -237,7 +235,7 @@ class MemoryService:
         self._deferred_projection_config = deferred_projection_config
         self._accumulated_cloud_provider = accumulated_cloud_provider
         # 05-P0-1：探索期实时位姿门面（鸭子类型，与 PerceptionService._read_live_pose 同源）。
-        # 网关注入待 leader 串行接线（runtime.py 被占用）；此处仅具备接收能力，默认 None 向后兼容。
+        # 网关已在 gateways/runtime.py:464 构造 MemoryService 时同源注入；未注入时默认 None 向后兼容。
         self._live_pose_provider = live_pose_provider
         _triangulation_enabled = bool(
             getattr(deferred_projection_config, "triangulation_enabled", False)
@@ -4198,38 +4196,51 @@ class MemoryService:
 
     def _upsert_vector_point_for_location(self, location: TaggedLocation) -> None:
         payload = self._build_location_payload(location)
-        image_bytes = self._load_primary_image_bytes([])
+        artifact_ids: List[str] = []
         if location.memory_id is not None:
             linked_memory = self._semantic_entries_by_id.get(location.memory_id)
             if linked_memory is not None:
-                image_bytes = self._load_primary_image_bytes(linked_memory.artifact_ids) or image_bytes
-        vectors = self._build_named_vectors(
-            retrieval_text=str(payload["retrieval_text"]),
-            image_bytes=image_bytes,
-        )
+                artifact_ids = list(linked_memory.artifact_ids)
+        # 先写入不含向量的记录，降低 ingest 主链路延迟
         self._vector_store.upsert_point(
             point_id=location.location_id,
             collection_name=PLACE_NODES_COLLECTION,
             record_kind=MemoryRecordKind.TAGGED_LOCATION.value,
             payload=payload,
-            vectors=vectors,
+            vectors={},
             updated_at=location.timestamp.isoformat(),
+        )
+        # 异步补充向量
+        self._enqueue_vectorization(
+            point_id=location.location_id,
+            collection_name=PLACE_NODES_COLLECTION,
+            record_kind=MemoryRecordKind.TAGGED_LOCATION.value,
+            retrieval_text=str(payload["retrieval_text"]),
+            artifact_ids=artifact_ids,
+            updated_at=location.timestamp.isoformat(),
+            payload=payload,
         )
 
     def _upsert_vector_point_for_memory(self, entry: SemanticMemoryEntry) -> None:
         payload = self._build_memory_payload(entry)
-        image_bytes = self._load_primary_image_bytes(entry.artifact_ids)
-        vectors = self._build_named_vectors(
-            retrieval_text=str(payload["retrieval_text"]),
-            image_bytes=image_bytes,
-        )
+        # 先写入不含向量的记录，降低 ingest 主链路延迟
         self._vector_store.upsert_point(
             point_id=entry.memory_id,
             collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
             record_kind=entry.kind.value,
             payload=payload,
-            vectors=vectors,
+            vectors={},
             updated_at=entry.timestamp.isoformat(),
+        )
+        # 异步补充向量
+        self._enqueue_vectorization(
+            point_id=entry.memory_id,
+            collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
+            record_kind=entry.kind.value,
+            retrieval_text=str(payload["retrieval_text"]),
+            artifact_ids=list(entry.artifact_ids),
+            updated_at=entry.timestamp.isoformat(),
+            payload=payload,
         )
 
     def _upsert_vector_point_for_instance(self, instance: SemanticInstance) -> None:

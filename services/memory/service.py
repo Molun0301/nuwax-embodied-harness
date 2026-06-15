@@ -5795,19 +5795,34 @@ class MemoryService:
         self._scene_spaces_by_id[scene_space.scene_space_id] = scene_space
         self._scene_space_history.append(scene_space)
 
-    def _ingest_spatial_semantic_observation(
+    def ingest_perception_observation(
         self,
         *,
-        memory_entry: SemanticMemoryEntry,
         perception_context,
-        observation_context,
         map_snapshot,
         localization_snapshot: Optional[LocalizationSnapshot],
         current_pose: Optional[Pose],
-        camera_id: Optional[str],
-    ) -> None:
+        camera_id: Optional[str] = None,
+        map_version_id: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+        persist: bool = True,
+    ):
+        """感知摄入（连续路径）：投影 + 关联 + 射线累积，独立于记忆写入。
+
+        方案 B 解耦：本方法可在每个感知 tick 调用（不依赖 SemanticMemoryEntry），
+        让 track_id 帧间连续、射线累积进同一实例的 deferred_projection_cache，
+        三角化得以获得多视角输入。
+
+        persist=False（连续 tick）：只更新实例内存 + state 快照，**不**落盘 repository、
+        **不**向量化（避免向量化队列在 2Hz 下被同一实例反复入队，徒增 embedding 成本）。
+        persist=True（关键帧记忆写入路径）：完整落盘 + 向量化，与改动前行为一致。
+
+        返回 (projected, outcomes, linked_instance_ids)；无投影时返回 (None, None, [])。
+        """
         if perception_context is None or current_pose is None:
-            return
+            return None, None, []
+        resolved_now = now or utc_now()
         map_context = self._refresh_semantic_map_context(map_snapshot)
         ray_history = None
         if getattr(self._deferred_projection_config, "triangulation_enabled", False):
@@ -5820,20 +5835,22 @@ class MemoryService:
             ray_history=ray_history,
         )
         if not projected:
-            return
+            return None, None, []
+        resolved_map_version_id = map_version_id or (map_snapshot.version_id if map_snapshot is not None else None)
+        resolved_session_id = localization_session_id or (
+            str((localization_snapshot.metadata or {}).get("session_id") or "") if localization_snapshot else None
+        ) or None
         # P0-3：实例字典的「读快照→关联→整体替换」必须相对延迟精化 worker 原子，
         # 否则 worker 刚写回的精化坐标会被本路径的旧快照整体覆盖（静默回退 fallback）。
         with self._instances_lock:
             updated_instances, outcomes = self._instance_association_service.associate(
                 projected,
                 existing_instances=self._semantic_instances_by_id,
-                map_version_id=memory_entry.map_version_id,
-                localization_session_id=memory_entry.localization_session_id
-                or str(memory_entry.metadata.get("localization_session_id") or "")
-                or None,
+                map_version_id=resolved_map_version_id,
+                localization_session_id=resolved_session_id,
                 occupancy_grid=map_snapshot.occupancy_grid if map_snapshot is not None else None,
                 cost_map=map_snapshot.cost_map if map_snapshot is not None else None,
-                now=memory_entry.timestamp,
+                now=resolved_now,
             )
             self._semantic_instances_by_id = dict(updated_instances)
         linked_instance_ids: List[str] = []
@@ -5887,12 +5904,43 @@ class MemoryService:
             linked_instance_ids.append(instance.instance_id)
             self._semantic_instance_history.append(instance)
             self._write_semantic_instance_state(instance)
-            if self._is_long_term_static_instance(instance):
-                self._repository.upsert_semantic_instance(instance)
-                self._upsert_vector_point_for_instance(instance)
-            else:
-                self._repository.delete_semantic_instances([instance.instance_id])
-                self._vector_store.delete_points([instance.instance_id])
+            # persist=False（连续 tick）只更新内存+state；落盘与向量化推迟到关键帧记忆写入。
+            if persist:
+                if self._is_long_term_static_instance(instance):
+                    self._repository.upsert_semantic_instance(instance)
+                    self._upsert_vector_point_for_instance(instance)
+                else:
+                    self._repository.delete_semantic_instances([instance.instance_id])
+                    self._vector_store.delete_points([instance.instance_id])
+        return projected, outcomes, linked_instance_ids
+
+    def _ingest_spatial_semantic_observation(
+        self,
+        *,
+        memory_entry: SemanticMemoryEntry,
+        perception_context,
+        observation_context,
+        map_snapshot,
+        localization_snapshot: Optional[LocalizationSnapshot],
+        current_pose: Optional[Pose],
+        camera_id: Optional[str],
+    ) -> None:
+        # 记忆写入路径（低频）：完整感知摄入（persist=True）+ ObservationEvent 绑定。
+        projected, outcomes, linked_instance_ids = self.ingest_perception_observation(
+            perception_context=perception_context,
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+            current_pose=current_pose,
+            camera_id=camera_id,
+            map_version_id=memory_entry.map_version_id,
+            localization_session_id=memory_entry.localization_session_id
+            or str(memory_entry.metadata.get("localization_session_id") or "")
+            or None,
+            now=memory_entry.timestamp,
+            persist=True,
+        )
+        if not projected:
+            return
 
         observation_events = self._build_projected_observation_events(
             memory_entry=memory_entry,

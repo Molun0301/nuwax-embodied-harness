@@ -223,7 +223,7 @@ class PerceptionVideoRuntime:
             return None
 
         now = utc_now()
-        current_pose = self._resolve_runtime_context()
+        current_pose, map_snapshot, localization_snapshot = self._resolve_runtime_context()
         decision = self._keyframe_selector.decide(
             now=now,
             current_pose=current_pose,
@@ -251,32 +251,11 @@ class PerceptionVideoRuntime:
             )
             self._write_status(running=self.is_running())
             return None
-        effective_reason = reason
-        if not force_keyframe:
-            if not decision.should_process:
-                self._perception_service.publish_current_video_frame(
-                    camera_id=self._camera_id,
-                    requested_by="perception_video_runtime",
-                )
-                with self._lock:
-                    self._last_error = None
-                    self._last_status_metadata = {
-                        **dict(self._last_status_metadata),
-                        "camera_id": self._camera_id,
-                        "capture_mode": "video_stream",
-                        "last_skip_reason": decision.reason,
-                        "video_ingest_status": dict(video_status),
-                        **dict(decision.metadata),
-                    }
-                self._log_skip(
-                    reason=str(decision.reason or "keyframe_not_due"),
-                    level=logging.DEBUG,
-                    detail="未达关键帧条件（reason=%s），持续感知本次跳过。" % decision.reason,
-                )
-                self._write_status(running=self.is_running())
-                return None
-            effective_reason = decision.reason
 
+        # 方案 B：检测与关联在每个 tick 无条件执行（YOLO 已常驻，门控不该掐检测）。
+        # 关键帧门控只决定是否做低频记忆写入（scene entry + 向量化）。
+        # 每 tick 恰好一次 associate：关键帧 tick 走 remember_current_scene（内部 persist=True
+        # 全摄入），非关键帧 tick 走 ingest_perception_observation(persist=False)，避免双重计数。
         context = self._perception_service.perceive_current_scene(
             camera_id=self._camera_id,
             requested_by="perception_video_runtime",
@@ -285,18 +264,36 @@ class PerceptionVideoRuntime:
             detection_metadata=detection_metadata,
             open_vocabulary_classes=open_vocabulary_classes,
         )
-        self._keyframe_selector.mark_processed(
-            timestamp=now,
-            current_pose=current_pose,
-        )
-        memory_written = self._remember_from_keyframe(
-            context=context,
-            current_pose=current_pose,
-            reason=effective_reason,
-            now=now,
-            force=force_keyframe,
-            allow_memory_write=allow_memory_write,
-        )
+        write_memory = force_keyframe or decision.should_process
+        effective_reason = decision.reason if (decision.should_process and not force_keyframe) else reason
+        memory_written = False
+        if write_memory:
+            # 关键帧路径：完整记忆写入（remember_current_scene 内部走 persist=True 全摄入）。
+            # mark_processed 只在此处调用——它更新 _last_keyframe_at/_last_keyframe_pose 基准，
+            # 若每 tick 都调，位移基准会被刷成上一 tick（几厘米），永远达不到阈值、关键帧永不触发。
+            self._keyframe_selector.mark_processed(
+                timestamp=now,
+                current_pose=current_pose,
+            )
+            memory_written = self._remember_from_keyframe(
+                context=context,
+                current_pose=current_pose,
+                reason=effective_reason,
+                now=now,
+                force=force_keyframe,
+                allow_memory_write=allow_memory_write,
+            )
+        else:
+            # 非关键帧路径：仅连续感知摄入（关联 + 射线累积，不落盘不向量化）
+            self._ingest_continuous_observation(
+                context=context,
+                map_snapshot=map_snapshot,
+                localization_snapshot=localization_snapshot,
+                current_pose=current_pose,
+                now=now,
+            )
+
+        capture_mode = "burst" if force_keyframe else ("keyframe" if decision.should_process else "continuous")
         with self._lock:
             self._processed_frames += 1
             self._last_keyframe_reason = effective_reason
@@ -315,7 +312,7 @@ class PerceptionVideoRuntime:
                 "detection_count": context.scene_summary.detection_count,
                 "active_track_count": context.scene_summary.active_track_count,
                 "store_artifact": self._store_artifact,
-                "capture_mode": "keyframe" if not force_keyframe else "burst",
+                "capture_mode": capture_mode,
                 "keyframe_reason": effective_reason,
                 "memory_written": memory_written,
                 "remember_keyframes": self._remember_keyframes,
@@ -325,6 +322,43 @@ class PerceptionVideoRuntime:
             }
         self._write_status(running=self.is_running())
         return context.scene_summary.headline
+
+    def _ingest_continuous_observation(
+        self,
+        *,
+        context,
+        map_snapshot,
+        localization_snapshot,
+        current_pose: Optional[Pose],
+        now: datetime,
+    ) -> None:
+        """非关键帧 tick 的连续感知摄入：关联 + 射线累积，不落盘不向量化。
+
+        方案 B：让 track_id 帧间连续、射线累积进同一实例的 deferred_projection_cache，
+        三角化得以获得多视角输入。memory_service 缺失或未启用时静默跳过。
+        """
+        memory_service = self._memory_service
+        if memory_service is None or current_pose is None:
+            return
+        if hasattr(memory_service, "is_enabled") and not memory_service.is_enabled():
+            return
+        ingest = getattr(memory_service, "ingest_perception_observation", None)
+        if not callable(ingest):
+            return
+        try:
+            ingest(
+                perception_context=context,
+                map_snapshot=map_snapshot,
+                localization_snapshot=localization_snapshot,
+                current_pose=current_pose,
+                camera_id=self._camera_id,
+                now=now,
+                persist=False,
+            )
+        except Exception:
+            PERCEPTION_RUNTIME_LOGGER.debug(
+                "连续感知摄入失败 camera=%s。", self._camera_id, exc_info=True
+            )
 
     def run_burst(
         self,
@@ -409,18 +443,26 @@ class PerceptionVideoRuntime:
             detail,
         )
 
-    def _resolve_runtime_context(self) -> Optional[Pose]:
-        # 优先取实时位姿源（SLAM/Nav2 map→base 实时 TF）：探索建图阶段定位会话
-        # 尚未重定位就绪（usable_pose 恒 None），但实时位姿随机器人移动/旋转持续更新，
-        # 是关键帧 translation/yaw 判定的有效依据。定位会话 pose 仅作重定位就绪后的兜底。
+    def _resolve_runtime_context(self):
+        """返回 (current_pose, map_snapshot, localization_snapshot)。
+
+        方案 B：除关键帧位姿判定所需的 current_pose 外，还返回 map_snapshot /
+        localization_snapshot，供每 tick 的连续感知摄入（ingest_perception_observation）
+        使用。current_pose 优先实时位姿源（SLAM/Nav2 map→base 实时 TF），探索建图阶段
+        定位会话尚未重定位就绪时回退定位会话快照 pose。
+        """
         current_pose = self._read_live_pose()
-        if current_pose is None:
-            localization_service = self._localization_service
-            if localization_service is not None:
-                snapshot = self._refresh_service_snapshot(localization_service)
-                if snapshot is not None:
-                    current_pose = snapshot.current_pose
-        return current_pose
+        localization_snapshot = None
+        localization_service = self._localization_service
+        if localization_service is not None:
+            localization_snapshot = self._refresh_service_snapshot(localization_service)
+            if current_pose is None and localization_snapshot is not None:
+                current_pose = localization_snapshot.current_pose
+        map_snapshot = None
+        mapping_service = self._mapping_service
+        if mapping_service is not None:
+            map_snapshot = self._refresh_service_snapshot(mapping_service)
+        return current_pose, map_snapshot, localization_snapshot
 
     def _read_live_pose(self) -> Optional[Pose]:
         """从实时位姿源（几何运行时 provider 门面）取当前位姿，鸭子类型，失败返回 None。

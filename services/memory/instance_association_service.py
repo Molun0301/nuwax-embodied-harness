@@ -210,11 +210,12 @@ class InstanceAssociationService:
         distance_m = self._distance(observation.pose, candidate.pose)
         max_distance_m = self._MERGE_DISTANCE_M.get(candidate.movability, 1.0)
         same_track = bool(observation.track_id and observation.track_id == str(candidate.metadata.get("last_track_id") or ""))
-        # 阶段0：待定位实例的 pose 是机器人哨兵位姿(空间无意义)，距离门控不适用；
-        # 同 track 的可信观测应允许"救回"该实例，绕过距离硬门。
-        candidate_pending = (candidate.metadata or {}).get("pending_localization") is True
-        bypass_distance_gate = same_track and candidate_pending
-        if distance_m > max_distance_m and not bypass_distance_gate:
+        # 方案 B：同 track_id 即绕过距离硬门。track_id 是 ByteTrack 的 2D 框连续性证据，
+        # 比 fallback 的 3D 坐标距离可靠。连续检测下，同一物体多帧观测虽因机器人位移
+        # 坐标被拉开，但 track 一致即应合并，射线才能累积进同一实例的 deferred_projection_cache。
+        # 安全边界：不同物体 track_id 不同，不会被误并（避免"三门塌一"过度合并）。
+        # fallback 观测的 3D 坐标无空间意义，不能反过来用距离把同 track 观测拆开。
+        if distance_m > max_distance_m and not same_track:
             return 0.0
         observation_segmentation = self._summarize_segmentation_metadata(observation.attributes)
         candidate_segmentation = self._summarize_segmentation_metadata(candidate.metadata)

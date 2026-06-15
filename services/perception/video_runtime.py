@@ -10,7 +10,6 @@ from contracts.base import utc_now
 from contracts.geometry import Pose
 from contracts.runtime_views import PerceptionRuntimeStatus
 from core import EventBus, StateNamespace, StateStore
-from services.memory.semantic_map_builder import SemanticMapBuildResult, SemanticMapBuilder
 from services.perception.keyframe import PerceptionKeyframeSelector
 from services.perception.service import PerceptionService
 
@@ -67,7 +66,6 @@ class PerceptionVideoRuntime:
         self._remember_keyframes = bool(remember_keyframes)
         self._burst_frame_count = max(1, int(burst_frame_count))
         self._burst_interval_sec = max(0.05, float(burst_interval_sec))
-        self._semantic_map_builder = SemanticMapBuilder()
         self._keyframe_selector = PerceptionKeyframeSelector(
             min_interval_sec=keyframe_min_interval_sec,
             translation_threshold_m=keyframe_translation_threshold_m,
@@ -225,11 +223,10 @@ class PerceptionVideoRuntime:
             return None
 
         now = utc_now()
-        current_pose, map_context = self._resolve_runtime_context()
+        current_pose = self._resolve_runtime_context()
         decision = self._keyframe_selector.decide(
             now=now,
             current_pose=current_pose,
-            map_context=map_context,
         )
         video_status = self._perception_service.video_frame_source_status()
         if not bool(video_status.get("available")):
@@ -291,12 +288,10 @@ class PerceptionVideoRuntime:
         self._keyframe_selector.mark_processed(
             timestamp=now,
             current_pose=current_pose,
-            map_context=map_context,
         )
         memory_written = self._remember_from_keyframe(
             context=context,
             current_pose=current_pose,
-            map_context=map_context,
             reason=effective_reason,
             now=now,
             force=force_keyframe,
@@ -414,10 +409,7 @@ class PerceptionVideoRuntime:
             detail,
         )
 
-    def _resolve_runtime_context(self) -> Tuple[Optional[Pose], Optional[SemanticMapBuildResult]]:
-        current_pose = None
-        map_context = None
-
+    def _resolve_runtime_context(self) -> Optional[Pose]:
         # 优先取实时位姿源（SLAM/Nav2 map→base 实时 TF）：探索建图阶段定位会话
         # 尚未重定位就绪（usable_pose 恒 None），但实时位姿随机器人移动/旋转持续更新，
         # 是关键帧 translation/yaw 判定的有效依据。定位会话 pose 仅作重定位就绪后的兜底。
@@ -428,12 +420,7 @@ class PerceptionVideoRuntime:
                 snapshot = self._refresh_service_snapshot(localization_service)
                 if snapshot is not None:
                     current_pose = snapshot.current_pose
-
-        mapping_service = self._mapping_service
-        if mapping_service is not None:
-            map_snapshot = self._refresh_service_snapshot(mapping_service)
-            map_context = self._semantic_map_builder.build(map_snapshot)
-        return current_pose, map_context
+        return current_pose
 
     def _read_live_pose(self) -> Optional[Pose]:
         """从实时位姿源（几何运行时 provider 门面）取当前位姿，鸭子类型，失败返回 None。
@@ -476,13 +463,12 @@ class PerceptionVideoRuntime:
         *,
         context,
         current_pose: Optional[Pose],
-        map_context: Optional[SemanticMapBuildResult],
         reason: str,
         now: datetime,
         force: bool,
         allow_memory_write: bool,
     ) -> bool:
-        del current_pose, map_context
+        del current_pose
         if not allow_memory_write:
             return False
         if self._memory_service is None:

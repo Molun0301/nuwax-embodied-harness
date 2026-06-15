@@ -27,7 +27,7 @@ try:
 except ImportError:  # pragma: no cover - Windows 环境不提供 fcntl
     fcntl = None
 
-from logging_utils import (
+from core.logging_utils import (
     CorrelationContextFilter,
     DeduplicatingLogFilter,
     DropPatternLogFilter,
@@ -206,18 +206,9 @@ class LoggingConfig:
 
 
 @dataclass
-class TcpServerConfig:
-    """TCP 控制服务配置。"""
-
-    host: str = "0.0.0.0"
-    port: int = 8765
-
-
-@dataclass
 class DDSConfig:
     """DDS 与 SDK 路径配置。"""
 
-    cyclone_dds_uri: str
     iface: str = ""
     sdk_path: str = "/home/unitree/unitree_sdk2_python"
 
@@ -271,7 +262,10 @@ class TTSPlayerConfig:
     auto_start: bool = True
     print_subtitle: bool = False
     initial_volume: float = 1.0
-    backend_mode: str = "robot_webrtc"
+    # 实时 TTS 播放与 WebRTC 音频通道已随 tts/ 包删除，AudioService 现为 record_only。
+    # backend_mode 当前无消费方（保留字段形态以免破坏配置级联），默认置为 "disabled"，
+    # 不再指向已下线的 robot_webrtc 后端。tts.initial_volume 仍被音量服务消费故保留。
+    backend_mode: str = "disabled"
     fallback_backend_mode: str = "alsa_local"
     local: LocalPlaybackConfig = field(default_factory=LocalPlaybackConfig)
     robot: RobotWebRTCPlaybackConfig = field(default_factory=RobotWebRTCPlaybackConfig)
@@ -332,17 +326,12 @@ class TTSLogBridgeConfig:
 class VolumeControlConfig:
     """音量控制配置。
 
-    默认优先走 Go2 的 VUI 音量，Jetson 本地混音器仅作为兼容链路保留。
+    默认优先走 Go2 的 VUI 音量。
     """
 
-    prefer_vui: bool = True
     auto_enable_vui_switch: bool = True
     vui_min_level: int = 0
     vui_max_level: int = 10
-    init_volume_on_start: bool = False
-    mixer_device: str = "default"
-    mixer_control: str = ""
-    audio_command_timeout: float = 1.0
 
 
 @dataclass
@@ -471,13 +460,6 @@ class PerceptionStreamRuntimeConfig:
 
 
 @dataclass
-class VideoIngestConfig:
-    """端侧视频推流接收配置。"""
-
-    max_frame_age_sec: float = 2.0
-
-
-@dataclass
 class DeferredProjectionConfig:
     """延迟投影(射线三角化 / 延迟点云重投影)配置。
 
@@ -494,7 +476,6 @@ class DeferredProjectionConfig:
     triangulation_max_residual_m: float = 0.5
     delayed_pc_min_points: int = 5
     delayed_pc_max_retry: int = 3
-    delayed_pc_retry_interval_sec: float = 5.0
     delayed_pc_max_range_m: float = 8.0
     delayed_pc_refine_interval_sec: float = 6.0
     delayed_pc_max_concurrency: int = 2
@@ -521,7 +502,6 @@ class PerceptionConfig:
     openai_vision: PerceptionOpenAIVisionConfig = field(default_factory=PerceptionOpenAIVisionConfig)
     segmentation: PerceptionSegmentationConfig = field(default_factory=PerceptionSegmentationConfig)
     stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
-    video_ingest: VideoIngestConfig = field(default_factory=VideoIngestConfig)
     deferred_projection: DeferredProjectionConfig = field(default_factory=DeferredProjectionConfig)
 
 
@@ -549,7 +529,6 @@ class RuntimeDataConfig:
     memory_embedding_api_key: str = ""
     memory_embedding_base_url: str = DEFAULT_MEMORY_EMBEDDING_BASE_URL
     memory_embedding_timeout_sec: float = 20.0
-    memory_vector_store_backend: str = "sqlite_named_vectors"
     artifact_retention_days: int = 7
     artifact_max_count: int = 1000
     artifact_max_total_bytes: int = 1073741824
@@ -562,7 +541,6 @@ class NuwaxRobotBridgeConfig:
 
     base_dir: str
     logging: LoggingConfig
-    tcp: TcpServerConfig
     gateway: "GatewayServerConfig"
     relay: "RelayServerConfig"
     runtime_data: RuntimeDataConfig
@@ -633,7 +611,6 @@ def _build_deferred_projection_config() -> DeferredProjectionConfig:
         triangulation_max_residual_m=max(0.01, _cfg_float("NUWAX_PERCEPTION_TRIANGULATION_MAX_RESIDUAL_M", 0.5)),
         delayed_pc_min_points=max(1, _cfg_int("NUWAX_PERCEPTION_DELAYED_PC_MIN_POINTS", 5)),
         delayed_pc_max_retry=max(0, _cfg_int("NUWAX_PERCEPTION_DELAYED_PC_MAX_RETRY", 3)),
-        delayed_pc_retry_interval_sec=max(0.5, _cfg_float("NUWAX_PERCEPTION_DELAYED_PC_RETRY_INTERVAL_SEC", 5.0)),
         delayed_pc_max_range_m=max(0.5, _cfg_float("NUWAX_PERCEPTION_DELAYED_PC_MAX_RANGE_M", 8.0)),
         delayed_pc_refine_interval_sec=max(1.0, _cfg_float("NUWAX_PERCEPTION_DELAYED_PC_REFINE_INTERVAL_SEC", 6.0)),
         delayed_pc_max_concurrency=max(1, _cfg_int("NUWAX_PERCEPTION_DELAYED_PC_MAX_CONCURRENCY", 2)),
@@ -682,7 +659,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         auto_start=_cfg_bool("TTS_PLAYER_AUTO_START", True),
         print_subtitle=_cfg_bool("TTS_PLAYER_PRINT_SUBTITLE", False),
         initial_volume=_clamp_volume(_cfg_float("TTS_PLAYER_VOLUME", 1.0)),
-        backend_mode=_cfg_str("TTS_PLAYER_BACKEND_MODE", "robot_webrtc"),
+        backend_mode=_cfg_str("TTS_PLAYER_BACKEND_MODE", "disabled"),
         fallback_backend_mode=_cfg_str("TTS_PLAYER_FALLBACK_BACKEND_MODE", "alsa_local"),
         local=local_playback,
         robot=robot_playback,
@@ -737,14 +714,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
     )
 
     volume = VolumeControlConfig(
-        prefer_vui=_cfg_bool("GO2_VOLUME_PREFER_VUI", True),
         auto_enable_vui_switch=_cfg_bool("GO2_VOLUME_AUTO_ENABLE_VUI_SWITCH", True),
         vui_min_level=_cfg_int("GO2_VUI_MIN_LEVEL", 0),
         vui_max_level=_cfg_int("GO2_VUI_MAX_LEVEL", 10),
-        init_volume_on_start=_cfg_bool("GO2_INIT_VOLUME_ON_START", False),
-        mixer_device=_cfg_str("GO2_VOLUME_MIXER_DEVICE", "default"),
-        mixer_control=_cfg_str("GO2_VOLUME_MIXER_CONTROL", ""),
-        audio_command_timeout=_cfg_float("GO2_AUDIO_COMMAND_TIMEOUT", 1.0),
     )
 
     perception = PerceptionConfig(
@@ -860,9 +832,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
             remember_keyframes=_cfg_bool("NUWAX_PERCEPTION_KEYFRAME_REMEMBER_ENABLED", True),
             burst_frame_count=max(1, _cfg_int("NUWAX_PERCEPTION_BURST_FRAME_COUNT", 4)),
             burst_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_BURST_INTERVAL_SEC", 0.08)),
-        ),
-        video_ingest=VideoIngestConfig(
-            max_frame_age_sec=max(0.1, _cfg_float("NUWAX_VIDEO_INGEST_MAX_FRAME_AGE_SEC", 2.0)),
         ),
         deferred_projection=_build_deferred_projection_config(),
     )
@@ -985,10 +954,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
     )
 
     dds = DDSConfig(
-        cyclone_dds_uri=_cfg_str(
-            "CYCLONEDDS_URI",
-            "<CycloneDDS><Domain><Compatibility><StandardsConformance>lax</StandardsConformance></Compatibility></Domain></CycloneDDS>",
-        ),
         iface=_cfg_str("GO2_DDS_IFACE", ""),
         sdk_path=_cfg_str("GO2_SDK_PATH", "/home/unitree/unitree_sdk2_python"),
     )
@@ -1009,11 +974,11 @@ def load_config() -> NuwaxRobotBridgeConfig:
         port=gateway_port,
         public_base_url=_cfg_str("NUWAX_GATEWAY_PUBLIC_BASE_URL", default_public_base_url),
         artifact_dir=_cfg_str("NUWAX_GATEWAY_ARTIFACT_DIR", str(BASE_DIR / "artifacts")),
-        agent_tokens=_cfg_csv("NUWAX_GATEWAY_AGENT_TOKENS", ("dev-agent-token",)),
-        admin_tokens=_cfg_csv("NUWAX_GATEWAY_ADMIN_TOKENS", ("dev-admin-token",)),
+        agent_tokens=_cfg_csv("NUWAX_GATEWAY_AGENT_TOKENS", ()),
+        admin_tokens=_cfg_csv("NUWAX_GATEWAY_ADMIN_TOKENS", ()),
         agent_high_risk_allowlist=_cfg_csv("NUWAX_GATEWAY_AGENT_HIGH_RISK_ALLOWLIST", ()),
         allowed_source_cidrs=_cfg_csv("NUWAX_GATEWAY_ALLOWED_SOURCE_CIDRS", ("127.0.0.1/32", "172.17.0.0/16")),
-        allow_unknown_client_hosts=_cfg_bool("NUWAX_GATEWAY_ALLOW_UNKNOWN_CLIENT_HOSTS", True),
+        allow_unknown_client_hosts=_cfg_bool("NUWAX_GATEWAY_ALLOW_UNKNOWN_CLIENT_HOSTS", False),
         sse_keepalive_sec=_cfg_float("NUWAX_GATEWAY_SSE_KEEPALIVE_SEC", 10.0),
         ws_ping_interval_sec=_cfg_float("NUWAX_GATEWAY_WS_PING_INTERVAL_SEC", 15.0),
     )
@@ -1080,7 +1045,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
             DEFAULT_MEMORY_EMBEDDING_BASE_URL,
         ),
         memory_embedding_timeout_sec=max(1.0, _cfg_float("NUWAX_MEMORY_EMBEDDING_TIMEOUT_SEC", 20.0)),
-        memory_vector_store_backend=_cfg_str("NUWAX_MEMORY_VECTOR_STORE_BACKEND", "sqlite_named_vectors"),
         artifact_retention_days=max(1, _cfg_int("NUWAX_ARTIFACT_RETENTION_DAYS", 7)),
         artifact_max_count=max(1, _cfg_int("NUWAX_ARTIFACT_MAX_COUNT", 1000)),
         artifact_max_total_bytes=max(1, _cfg_int("NUWAX_ARTIFACT_MAX_TOTAL_BYTES", 1073741824)),
@@ -1104,10 +1068,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
                     _cfg_int("GO2_PROXY_LOG_TRIM_CHECK_INTERVAL", 200),
                 ),
             ),
-        ),
-        tcp=TcpServerConfig(
-            host=_cfg_str("GO2_PROXY_TCP_HOST", "0.0.0.0"),
-            port=_cfg_int("GO2_PROXY_TCP_PORT", 8765),
         ),
         gateway=gateway,
         relay=relay,
@@ -1248,7 +1208,6 @@ def _configure_third_party_logger_levels() -> None:
         "httpcore",
         "httpx",
         "pyee",
-        "unitree_webrtc_connect",
         "websockets",
     ):
         logging.getLogger(logger_name).setLevel(logging.WARNING)

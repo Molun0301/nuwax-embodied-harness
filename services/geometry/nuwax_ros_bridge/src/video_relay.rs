@@ -3,7 +3,7 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{info, error};
@@ -147,6 +147,9 @@ fn handle_video_connection(
         header[24..28].copy_from_slice(&(frame_len as u32).to_le_bytes());
         header[32..40].copy_from_slice(&now_ns.to_le_bytes());
         header[40..44].copy_from_slice(&active_buf.to_le_bytes());
+        // Release fence：确保帧数据与上面的 header 字段对读侧可见后，再发布 sequence。
+        // 读侧用 sequence 做 seqlock 双读校验，依赖此处的发布顺序语义。
+        fence(Ordering::Release);
         // Write sequence last (acts as release fence for readers)
         header[16..24].copy_from_slice(&seq.to_le_bytes());
         mmap.flush_range(0, HEADER_SIZE + frame_len)?;

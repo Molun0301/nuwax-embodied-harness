@@ -14,5 +14,8 @@
 
 sentence-transformers==3.2.1
 transformers==4.46.3
-sentencepiece>=0.1.91
-safetensors>=0.4.1
+# 锁定依据（2026-06-12 CX-08 实机复核）：实机 192.168.31.245 已恢复，SSH 实证 pip show：
+#   sentencepiece 0.2.0 / safetensors 0.5.3（Python 3.8.10）。
+# 此前 0.1.99 / 0.4.5 为实机离线时的推定值，现按实机实装精确版本修正：
+sentencepiece==0.2.0
+safetensors==0.5.3

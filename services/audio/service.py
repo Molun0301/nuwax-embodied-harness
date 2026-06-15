@@ -6,20 +6,20 @@ import time
 
 from contracts.events import RuntimeEventCategory
 from core import EventBus
-from settings import NuwaxRobotBridgeConfig
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, Optional, Tuple, TYPE_CHECKING
 
-try:
-    from tts.doubao_realtime_client import SpeechSettings, build_doubao_realtime_client
-    from tts.realtime_tts_player import build_player_from_config
-except Exception:  # pragma: no cover - 运行环境缺依赖时走降级
-    SpeechSettings = None
-    build_doubao_realtime_client = None
-    build_player_from_config = None
+if TYPE_CHECKING:
+    # settings 是横跨全平台的 god 配置模块；服务层不得在运行时硬依赖它（治理规则 R6）。
+    # 这里仅用于构造函数 config 形参的类型注解，文件头 `from __future__ import annotations`
+    # 已保证注解惰性求值，运行时不会触发 settings 导入。
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 class AudioService:
-    """统一音量与文本播报服务。"""
+    """统一音量与文本播报服务。
+
+    实时语音（豆包 WebRTC TTS）已随 tts 包一并下线，文本播报固定走记录模式。
+    """
 
     def __init__(
         self,
@@ -33,8 +33,6 @@ class AudioService:
         self._robot = robot
         self._event_bus = event_bus
         self._lock = threading.RLock()
-        self._player = None
-        self._tts_client = None
         self._software_volume = max(0.0, min(1.0, float(config.tts.initial_volume)))
         self._speech_history: Deque[Dict[str, object]] = deque(maxlen=max(1, history_limit))
         self._last_error = ""
@@ -42,19 +40,8 @@ class AudioService:
     def stop(self) -> None:
         """停止音频运行时。"""
 
-        with self._lock:
-            if self._tts_client is not None:
-                try:
-                    self._tts_client.stop()
-                except Exception:
-                    pass
-                self._tts_client = None
-            if self._player is not None:
-                try:
-                    self._player.stop()
-                except Exception:
-                    pass
-                self._player = None
+        # 实时语音后端已下线，无运行时资源需要释放。
+        return
 
     def get_volume_state(self) -> Dict[str, object]:
         """读取当前音量状态。"""
@@ -62,7 +49,7 @@ class AudioService:
         result: Dict[str, object] = {
             "volume": self._software_volume,
             "backend": "software",
-            "realtime_speech_available": self._can_use_realtime_speech(),
+            "realtime_speech_available": False,
             "last_error": self._last_error,
         }
         if hasattr(self._robot, "get_vui_volume_info"):
@@ -81,14 +68,6 @@ class AudioService:
         normalized = max(0.0, min(1.0, float(volume)))
         self._software_volume = normalized
         result: Dict[str, object] = {"volume": normalized, "backend": "software"}
-
-        with self._lock:
-            if self._player is not None:
-                try:
-                    result["player_volume"] = self._player.set_volume(normalized)
-                except Exception as exc:
-                    self._last_error = str(exc)
-                    result["player_volume_error"] = str(exc)
 
         if hasattr(self._robot, "set_vui_volume_ratio"):
             try:
@@ -129,21 +108,6 @@ class AudioService:
             "realtime_started": False,
         }
 
-        try:
-            if self._ensure_realtime_runtime():
-                settings = self._build_speech_settings()
-                if settings is not None and self._tts_client is not None:
-                    actual_session_id = self._tts_client.start_stream(settings, session_id=requested_session_id)
-                    self._tts_client.append_stream(actual_session_id, content)
-                    self._tts_client.finish_stream(actual_session_id)
-                    result["session_id"] = actual_session_id
-                    result["mode"] = "doubao_realtime"
-                    result["realtime_started"] = True
-        except Exception as exc:
-            self._last_error = str(exc)
-            result["mode"] = "record_only"
-            result["realtime_error"] = str(exc)
-
         record = {
             **result,
             "metadata": dict(metadata or {}),
@@ -173,60 +137,10 @@ class AudioService:
     def is_speech_available(self) -> bool:
         """判断文本播报是否可用。
 
-        首版即使没有实时语音后端，也允许进入记录模式，因此始终返回 True。
+        实时语音后端已下线，播报固定走记录模式，因此始终返回 True。
         """
 
         return True
-
-    def _ensure_realtime_runtime(self) -> bool:
-        if not self._can_use_realtime_speech():
-            return False
-        with self._lock:
-            if self._player is None:
-                self._player = build_player_from_config(self._config.tts)
-                self._player.start()
-                self._player.set_volume(self._software_volume)
-            if self._tts_client is None:
-                self._tts_client = build_doubao_realtime_client(self._player, self._config.doubao)
-                self._tts_client.start()
-        return True
-
-    def _can_use_realtime_speech(self) -> bool:
-        return bool(
-            SpeechSettings is not None
-            and build_player_from_config is not None
-            and build_doubao_realtime_client is not None
-            and self._config.doubao.app_id
-            and self._config.doubao.access_key
-            and (self._config.log_tts.speaker or self._config.doubao.default_speaker)
-        )
-
-    def _build_speech_settings(self):
-        if not self._can_use_realtime_speech() or SpeechSettings is None:
-            return None
-        speaker = (self._config.log_tts.speaker or self._config.doubao.default_speaker).strip()
-        return SpeechSettings(
-            speaker=speaker,
-            resource_id=(self._config.log_tts.resource_id or self._config.doubao.resource_id).strip()
-            or self._config.doubao.resource_id,
-            uid=(self._config.log_tts.uid or self._config.doubao.default_uid).strip()
-            or self._config.doubao.default_uid,
-            audio_format=(self._config.log_tts.audio_format or self._config.doubao.default_audio_format).strip()
-            or self._config.doubao.default_audio_format,
-            sample_rate=int(self._config.log_tts.sample_rate or self._config.doubao.default_sample_rate),
-            speech_rate=int(self._config.log_tts.speech_rate),
-            loudness_rate=int(self._config.log_tts.loudness_rate),
-            emotion=self._config.log_tts.emotion.strip(),
-            emotion_scale=int(self._config.log_tts.emotion_scale),
-            enable_subtitle=bool(self._config.log_tts.enable_subtitle),
-            enable_timestamp=bool(self._config.log_tts.enable_timestamp),
-            disable_markdown_filter=bool(self._config.log_tts.disable_markdown_filter),
-            silence_duration_ms=int(self._config.log_tts.silence_duration_ms),
-            explicit_language=self._config.log_tts.explicit_language.strip(),
-            model=(self._config.log_tts.model or self._config.doubao.default_model).strip(),
-            interrupt=True,
-            metadata={},
-        )
 
     def _publish_audio_event(self, event_type: str, message: str, *, payload: Dict[str, object]) -> None:
         if self._event_bus is None:

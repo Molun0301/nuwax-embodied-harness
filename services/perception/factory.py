@@ -13,7 +13,7 @@ from services.perception.scene import HybridSceneDescriptionBackend, OpenAICompa
 from services.perception.trackers import Basic2DTrackerBackend, ByteTrackTrackerBackend
 
 if TYPE_CHECKING:
-    from settings import NuwaxRobotBridgeConfig
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 def build_platform_perception_components(config: "NuwaxRobotBridgeConfig") -> Dict[str, Any]:

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from contracts.artifacts import ArtifactCleanupResult, ArtifactKind, ArtifactRef, ArtifactRetentionPolicy, ArtifactStorageSummary
 from contracts.image import ImageEncoding, ImageFrame
-from gateways.artifacts import LocalArtifactStore
-from gateways.errors import GatewayError
+from services.artifact_store import LocalArtifactStore
+from core.errors import GatewayError
 from typing import Dict, Optional, Tuple
 
 

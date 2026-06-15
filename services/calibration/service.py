@@ -1,9 +1,18 @@
+"""平台侧相机-激光雷达自动标定服务。
+
+【本包未接线、本期冻结】CalibrationService 全仓零实例化（已 grep 核实），feed_frame_pair /
+update_motion_state 无调用方。实际生效的标定链路在 CalibrationProvider 主线
+（drivers/go2/providers.py + services/geometry/runtime.py 的 _inject_static_extrinsics
+静态外参边），不在本包。MI 在线标定【严禁直接接线】，理由见 05-P2-8（NMI 门控恒通过）/
+05-P2-9（外参坐标系错位）。详见 config.py 头部冻结说明。
+"""
+
 from __future__ import annotations
 
 import logging
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from contracts.calibration import (
     CalibrationState,
@@ -11,16 +20,13 @@ from contracts.calibration import (
     ExtrinsicCalibration,
     SensorTopology,
 )
-from contracts.geometry import Quaternion, Vector3
 from services.calibration.config import (
     get_calibration_persist_dir,
     is_calibration_enabled,
-    load_sensor_topology_from_env,
 )
 from services.calibration.data_collector import CalibrationDataCollector
 from services.calibration.quality_monitor import CalibrationQualityMonitor
 from services.calibration.transform_injector import (
-    euler_to_quaternion,
     inject_calibration_to_frame_tree,
     load_persisted_calibration,
     persist_calibration,
@@ -33,9 +39,19 @@ LOGGER = logging.getLogger(__name__)
 class CalibrationService:
     """平台侧相机-激光雷达自动标定服务。"""
 
-    def __init__(self, *, localization_provider: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        localization_provider: Any = None,
+        topology: Optional[SensorTopology] = None,
+    ) -> None:
         self._enabled = is_calibration_enabled()
-        self._topology = load_sensor_topology_from_env()
+        # 治理边界（01-P1-3 / 08-P1-3）：物理参数（内参/外参初值）不再从 env 直读。
+        # 未来接线时由 CalibrationProvider.get_sensor_topology() 注入 topology；
+        # 未注入时为空拓扑，is_enabled 恒 False，与本包未接线现状一致。
+        self._topology = topology if topology is not None else SensorTopology(
+            robot_id="unknown", pairs=[]
+        )
         self._localization_provider = localization_provider
         self._persist_dir = get_calibration_persist_dir()
         self._state = CalibrationState.UNCALIBRATED
@@ -95,9 +111,9 @@ class CalibrationService:
             LOGGER.info("已加载持久化标定: source=%s, error=%.2f px",
                        persisted.source, persisted.reprojection_error_px or -1)
         else:
-            # 2. 使用 initial_guess 作为临时外参
+            # 2. 使用注入 topology 的 initial_guess 作为临时外参
             self._inject_initial_guess()
-            LOGGER.info("无持久化标定，使用 .env initial_guess 作为临时外参。")
+            LOGGER.info("无持久化标定，使用注入 topology 的 initial_guess 作为临时外参。")
 
         # 3. 启动后台标定线程
         self._data_collector = CalibrationDataCollector()
@@ -241,7 +257,7 @@ class CalibrationService:
             LOGGER.warning("标定注入 frame_tree 失败。")
 
     def _inject_initial_guess(self) -> None:
-        """注入 .env 中的 initial_guess 作为临时外参。"""
+        """注入 topology 中的 initial_guess 作为临时外参。"""
         if not self._topology.pairs or self._localization_provider is None:
             return
         pair = self._topology.pairs[0]

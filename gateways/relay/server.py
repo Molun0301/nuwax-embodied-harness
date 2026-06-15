@@ -17,9 +17,9 @@ from fastapi.responses import StreamingResponse
 import httpx
 import websockets
 
-from logging_utils import LogRateLimiter
+from core.logging_utils import LogRateLimiter
 from gateways.request_context import REQUEST_ID_HEADER, error_category_from_status, normalize_request_id
-from settings import RelayServerConfig
+from core.settings import RelayServerConfig
 
 
 RELAY_LOGGER = logging.getLogger("nuwax_robot_bridge.relay")

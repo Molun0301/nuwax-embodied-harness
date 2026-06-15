@@ -411,8 +411,8 @@ class PlatformExplorationRuntime:
         center_pose = state.request.center_pose or current_pose
 
         if len(attempted_poses) == 0:
-            self._wait_for_costmap_stable(state)
-            if not self.is_running:
+            if self._costmap_not_ready_guard(state):
+                # 非阻塞守卫：costmap 尚未稳定，本 tick 直接返回，等待下一 tick 自然推进。
                 return
 
         LOGGER.info(
@@ -528,52 +528,57 @@ class PlatformExplorationRuntime:
         )
         state.phase = ExplorationRuntimePhase.MOVING_TO_FRONTIER
 
-    def _wait_for_costmap_stable(self, state: ExplorationRuntimeState) -> None:
-        """首轮 frontier 计算前等待 costmap revision 达到稳定阈值。"""
+    def _costmap_not_ready_guard(self, state: ExplorationRuntimeState) -> bool:
+        """首轮 frontier 计算前的非阻塞 costmap 稳定守卫。
 
-        _COSTMAP_MIN_REVISION = 5
-        _WAIT_TIMEOUT_SEC = 15.0
-        _POLL_INTERVAL_SEC = 0.5
+        单线程 tick 模型下不能在函数内自旋等待（costmap_revision 只能由后续 tick 推进），
+        因此改为非阻塞守卫：未达阈值且未超时则设置 waiting_for 并要求本 tick 提前返回，
+        让 geometry 探索循环线程在下一个 tick 继续推进；超时后放行并告警。
 
-        def _parse_costmap_revision(revision: Optional[str]) -> int:
-            if not revision:
-                return 0
-            try:
-                return int(revision.split(":")[-1])
-            except (ValueError, IndexError):
-                return 0
+        Returns:
+            True 表示尚未就绪、本 tick 应提前返回；False 表示已就绪或已超时，可继续 frontier 计算。
+        """
 
-        current_rev = _parse_costmap_revision(state.costmap_revision)
-        if current_rev >= _COSTMAP_MIN_REVISION:
-            return
+        min_revision = int(getattr(self._config, "costmap_min_revision", 5))
+        timeout_sec = float(getattr(self._config, "costmap_wait_timeout_sec", 15.0))
 
-        LOGGER.info(
-            "首轮 frontier 计算前等待 costmap 稳定 request_id=%s current_revision=%s min_revision=%d timeout_sec=%.1f",
-            state.request_id,
-            state.costmap_revision,
-            _COSTMAP_MIN_REVISION,
-            _WAIT_TIMEOUT_SEC,
-        )
-        deadline = time.monotonic() + _WAIT_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            if not self.is_running:
-                return
-            current_rev = _parse_costmap_revision(state.costmap_revision)
-            if current_rev >= _COSTMAP_MIN_REVISION:
-                LOGGER.info(
-                    "costmap 已稳定 request_id=%s revision=%s",
-                    state.request_id,
-                    state.costmap_revision,
-                )
-                return
-            time.sleep(_POLL_INTERVAL_SEC)
+        current_rev = self._parse_costmap_revision(state.costmap_revision)
+        if current_rev >= min_revision:
+            return False
 
-        LOGGER.warning(
-            "等待 costmap 稳定超时，继续执行首轮 frontier 计算 request_id=%s current_revision=%s min_revision=%d",
-            state.request_id,
-            state.costmap_revision,
-            _COSTMAP_MIN_REVISION,
-        )
+        wait_started = state.metadata.get("costmap_wait_started_monotonic")
+        now = time.monotonic()
+        if not isinstance(wait_started, (int, float)):
+            wait_started = now
+            state.metadata["costmap_wait_started_monotonic"] = wait_started
+            LOGGER.info(
+                "首轮 frontier 计算前等待 costmap 稳定 request_id=%s current_revision=%s min_revision=%d timeout_sec=%.1f",
+                state.request_id,
+                state.costmap_revision,
+                min_revision,
+                timeout_sec,
+            )
+
+        if (now - float(wait_started)) >= timeout_sec:
+            LOGGER.warning(
+                "等待 costmap 稳定超时，继续执行首轮 frontier 计算 request_id=%s current_revision=%s min_revision=%d",
+                state.request_id,
+                state.costmap_revision,
+                min_revision,
+            )
+            return False
+
+        state.waiting_for = "costmap_stabilizing"
+        return True
+
+    @staticmethod
+    def _parse_costmap_revision(revision: Optional[str]) -> int:
+        if not revision:
+            return 0
+        try:
+            return int(str(revision).split(":")[-1])
+        except (ValueError, IndexError):
+            return 0
 
     def _handle_moving_state(
         self,

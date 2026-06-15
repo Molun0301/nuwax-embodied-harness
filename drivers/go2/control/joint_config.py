@@ -6,7 +6,7 @@ Go2 关节配置。
 定义关节索引和安全限制。
 """
 
-from settings import APP_CONFIG
+from core.settings import APP_CONFIG
 
 # 关节ID映射 (来自 unitree_legged_const.py)
 LegID = {

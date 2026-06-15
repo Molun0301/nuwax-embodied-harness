@@ -1,6 +1,12 @@
 """视频帧 UDS 发送器 — 将 JPEG 帧推送到 Rust 视频中转进程。
 
-协议：每帧 = [4字节 LE 长度][JPEG 数据]
+协议：每帧 = [4字节 LE 长度][JPEG 数据]（与 Rust 视频中转进程约定，不含魔数/头部）。
+
+历史上位于 services/geometry/video_uds_sender.py，实为端侧推流的纯传输工具，与平台几何
+服务无业务关系，被错放在 services 下并由驱动 try/except 兜底引用，构成 drivers ⇄ services
+循环。现迁至 drivers/common（发送端归端侧）。接收端为 Rust 中转进程，平台侧
+services/geometry/video_shm_reader.py 走的是 SHM（64字节魔数头）另一套协议，二者无共享帧
+格式常量，迁移无需提取公共契约。
 """
 from __future__ import annotations
 

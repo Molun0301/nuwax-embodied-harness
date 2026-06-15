@@ -7,7 +7,7 @@ from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.map_workspace import MapAsset, MapAssetStatus, MapVersion, MapWorkspace
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus
 from core import EventBus, StateNamespace, StateStore
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from services.geometry import PlatformGeometryRuntime
 from services.localization import LocalizationService
 from services.mapping.catalog import MapCatalogRepository
@@ -158,10 +158,19 @@ class MapWorkspaceService:
             clear_exploration_context(reason="activate_map")
         if load_latest_version and synced_asset.latest_version_id:
             # activate_map 与 load_map_version 一致：启动 launch_rtabmap.sh --localization {map}.db
-            self._load_map_version_into_runtime(
-                self._require_map_version(resolved_name, synced_asset.latest_version_id),
-                require_backend_switch=True,
-            )
+            # load 失败时回滚 active map：set_active_map_name 已在前面改写，
+            # 若不回滚会留下「active 指向尚未成功载入 runtime 的地图」的不一致状态。
+            try:
+                self._load_map_version_into_runtime(
+                    self._require_map_version(resolved_name, synced_asset.latest_version_id),
+                    require_backend_switch=True,
+                )
+            except Exception:
+                if previous_active_map_name:
+                    self._repository.set_active_map_name(previous_active_map_name)
+                else:
+                    self._repository.clear_active_map_name()
+                raise
         self._ensure_active_localization_session_binding(
             metadata={
                 "requested_by": (metadata or {}).get("requested_by", "unknown"),

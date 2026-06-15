@@ -1,16 +1,34 @@
+"""相机-激光雷达标定服务配置（阈值类纯算法参数）。
+
+================================ 本包冻结说明 ================================
+services/calibration 整包当前【未接线、本期冻结】：CalibrationService 全仓零实例
+化，feed_frame_pair/update_motion_state/quality_monitor.add_sample 均无调用方
+（已 grep 核实）。
+
+实际生效的标定链路【不在本包】，而是 CalibrationProvider 主线：
+  drivers/go2/defaults.py（GO2_DEFAULT_CAMERA_INFO 内参 + GO2_DEFAULT_SENSOR_TOPOLOGY 外参）
+  → drivers/go2/providers.py（get_camera_info / get_sensor_topology）
+  → 内参经 gateways/runtime.py 注入 SHM 帧 metadata
+  → 外参经 services/geometry/runtime.py 的 _inject_static_extrinsics 注入 frame_tree 静态边。
+
+治理边界（01-P1-3 / 08-P1-3）：services 禁止从 env 直读相机物理参数，内参归 driver、
+外参走 CalibrationProvider。因此本文件原 `load_sensor_topology_from_env`（从 env 直读
+NUWAX_CAMERA_FX/FY/CX/CY、畸变、NUWAX_CALIBRATION_INITIAL_TX..RZ 外参初值等 27 键）
+已删除。未来若复活 MI 在线标定，SensorTopology 应由 CalibrationProvider 注入
+（见 CalibrationService.__init__ 的 topology 构造参数），不得再从 env 读物理参数。
+
+MI 在线标定【严禁直接接线】：NMI 安全门控阈值低于理论下界恒通过（05-P2-8）、外参方向/
+坐标系语义错位（05-P2-9），接线即错。本期仅保留为纯算法库 + 阈值配置。
+
+本文件仅保留【阈值类纯算法参数】的 env 读取（开关 / 最小帧数 / 静止检测阈值 /
+重投影阈值 / NMI 阈值 / 持久化目录），不属物理参数红线。
+============================================================================
+"""
+
 from __future__ import annotations
 
 import logging
-import math
 import os
-from typing import Optional
-
-from contracts.calibration import (
-    SensorPair,
-    SensorTopology,
-    TransformBounds,
-)
-from contracts.geometry import Quaternion, Vector3
 
 
 LOGGER = logging.getLogger(__name__)
@@ -49,82 +67,6 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return raw in ("true", "1", "yes", "on")
 
 
-def _env_float_list(key: str) -> tuple:
-    raw = os.environ.get(key, "").strip()
-    if not raw:
-        return ()
-    try:
-        return tuple(float(x.strip()) for x in raw.split(",") if x.strip())
-    except (ValueError, TypeError):
-        return ()
-
-
-def _euler_to_quaternion(rx: float, ry: float, rz: float) -> Quaternion:
-    """欧拉角（弧度）转四元数（ZYX 顺序）。"""
-    cr, sr = math.cos(rx / 2), math.sin(rx / 2)
-    cp, sp = math.cos(ry / 2), math.sin(ry / 2)
-    cy, sy = math.cos(rz / 2), math.sin(rz / 2)
-    return Quaternion(
-        w=cr * cp * cy + sr * sp * sy,
-        x=sr * cp * cy - cr * sp * sy,
-        y=cr * sp * cy + sr * cp * sy,
-        z=cr * cp * sy - sr * sp * cy,
-    )
-
-
-def load_sensor_topology_from_env() -> SensorTopology:
-    """从环境变量加载传感器拓扑配置。"""
-    camera_frame_id = _env_str("NUWAX_CAMERA_FRAME_ID")
-    lidar_frame_id = _env_str("NUWAX_LIDAR_FRAME_ID")
-    lidar_parent_frame_id = _env_str("NUWAX_LIDAR_PARENT_FRAME_ID", "base_link")
-
-    if not camera_frame_id or not lidar_frame_id:
-        LOGGER.info("未配置 NUWAX_CAMERA_FRAME_ID 或 NUWAX_LIDAR_FRAME_ID，标定服务不启用。")
-        return SensorTopology(robot_id=_env_str("NUWAX_ROBOT_ID", "unknown"), pairs=[])
-
-    initial_translation = Vector3(
-        x=_env_float("NUWAX_CALIBRATION_INITIAL_TX", 0.0),
-        y=_env_float("NUWAX_CALIBRATION_INITIAL_TY", 0.0),
-        z=_env_float("NUWAX_CALIBRATION_INITIAL_TZ", 0.0),
-    )
-    initial_rotation = _euler_to_quaternion(
-        rx=_env_float("NUWAX_CALIBRATION_INITIAL_RX", 0.0),
-        ry=_env_float("NUWAX_CALIBRATION_INITIAL_RY", 0.0),
-        rz=_env_float("NUWAX_CALIBRATION_INITIAL_RZ", 0.0),
-    )
-    bounds = TransformBounds(
-        translation_m=_env_float("NUWAX_CALIBRATION_BOUNDS_T", 0.10),
-        rotation_rad=_env_float("NUWAX_CALIBRATION_BOUNDS_R", 0.26),
-    )
-
-    pair = SensorPair(
-        parent_frame_id=lidar_parent_frame_id,
-        child_frame_id=camera_frame_id,
-        point_cloud_frame_id=lidar_frame_id,
-        initial_translation=initial_translation,
-        initial_rotation=initial_rotation,
-        bounds=bounds,
-        camera_fx=_env_float("NUWAX_CAMERA_FX", 0.0),
-        camera_fy=_env_float("NUWAX_CAMERA_FY", 0.0),
-        camera_cx=_env_float("NUWAX_CAMERA_CX", 0.0),
-        camera_cy=_env_float("NUWAX_CAMERA_CY", 0.0),
-        camera_width_px=_env_int("NUWAX_CAMERA_WIDTH_PX", 1920),
-        camera_height_px=_env_int("NUWAX_CAMERA_HEIGHT_PX", 1080),
-        camera_distortion_model=_env_str("NUWAX_CAMERA_DISTORTION_MODEL", "plumb_bob"),
-        camera_distortion_coeffs=_env_float_list("NUWAX_CAMERA_DISTORTION_COEFFS"),
-    )
-
-    topology = SensorTopology(
-        robot_id=_env_str("NUWAX_ROBOT_ID", "unknown"),
-        pairs=[pair],
-    )
-    LOGGER.info(
-        "标定传感器拓扑已加载: robot_id=%s, pairs=%d, camera=%s, lidar=%s",
-        topology.robot_id, len(topology.pairs), camera_frame_id, lidar_frame_id,
-    )
-    return topology
-
-
 def is_calibration_enabled() -> bool:
     """检查标定功能是否启用。"""
     return _env_bool("NUWAX_CALIBRATION_AUTO_ENABLED", False)
@@ -151,7 +93,12 @@ def get_calibration_reprojection_threshold() -> float:
 
 
 def get_calibration_nmi_threshold() -> float:
-    """获取 NMI（归一化互信息）最小接受阈值。"""
+    """获取 NMI（归一化互信息）最小接受阈值。
+
+    注意（05-P2-8）：compute_nmi 返回值 ∈ [1, 2]，默认阈值 0.3 低于理论下界 1.0，
+    门控恒通过——属伪保护。MI 标定接线前必须把默认提到 >= 1.0（如 1.05）。本期不接线，
+    保持原默认不动，仅在此标注缺陷。
+    """
     return _env_float("NUWAX_CALIBRATION_NMI_MIN_THRESHOLD", 0.3)
 
 

@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from contracts.image import ImageEncoding, ImageFrame
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 
 
 def decode_image_frame_to_bgr(image_frame: ImageFrame) -> np.ndarray:

@@ -9,7 +9,7 @@ from drivers.customrobot.manifest import build_customrobot_defaults, build_custo
 from drivers.customrobot.providers import CustomRobotProviderBundle
 
 if TYPE_CHECKING:
-    from settings import NuwaxRobotBridgeConfig
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 @dataclass
@@ -27,20 +27,24 @@ class CustomRobotAssembly(RobotAssemblyBase):
         self.providers = CustomRobotProviderBundle()
 
     def start(self) -> None:
-        raise NotImplementedError("customrobot 入口骨架尚未实现。")
+        """安全空实现：骨架入口未实现，启动为 no-op，使网关启动后如实呈现未实现态。"""
 
     def stop(self) -> None:
-        raise NotImplementedError("customrobot 入口骨架尚未实现。")
+        """安全空实现：骨架入口未实现，停止为 no-op。"""
 
     def get_status(self) -> RobotAssemblyStatus:
+        adapter_statuses = self.get_adapter_health_statuses()
+        # 消费 manifest implemented 元数据（capabilities.py metadata["implemented"]）声明未实现态，
+        # 装配生命周期据此如实呈现，而非硬编码。
+        implemented = bool(self.manifest.capability_matrix.metadata.get("implemented", False))
         return RobotAssemblyStatus(
             robot_name=self.manifest.robot_name,
-            initialized=False,
+            initialized=implemented,
             control_mode="unknown",
             low_level_ready=False,
             low_level_running=False,
-            adapter_count=len(self.get_adapter_health_statuses()),
-            healthy_adapter_count=sum(1 for status in self.get_adapter_health_statuses() if status.is_healthy),
+            adapter_count=len(adapter_statuses),
+            healthy_adapter_count=sum(1 for status in adapter_statuses if status.is_healthy),
         )
 
 

@@ -10,7 +10,9 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.maps import OccupancyGrid
+from contracts.navigation import NavigationGoal
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
 
@@ -206,7 +208,7 @@ class ExternalGeometryDebugObserver:
     def _on_pose_timer(self) -> None:
         if self._pose_callback is None or self._tf_buffer is None:
             return
-        map_frame = self._normalize_frame_id(self.config.frames.map_frame or "map", "map")
+        map_frame = self._normalize_frame_id(self.config.frames.map_frame, DEFAULT_MAP_FRAME)
         base_frame = self._normalize_frame_id(self.config.frames.base_frame or "base_link", "base_link")
         try:
             from rclpy.time import Time
@@ -268,7 +270,7 @@ class ExternalGeometryDebugObserver:
         received_at = datetime.now(timezone.utc)
         return Pose(
             timestamp=source_timestamp or received_at,
-            frame_id=self._normalize_frame_id(frame_id, "map"),
+            frame_id=self._normalize_frame_id(frame_id, DEFAULT_MAP_FRAME),
             position=Vector3(
                 x=float(getattr(translation, "x", 0.0) or 0.0),
                 y=float(getattr(translation, "y", 0.0) or 0.0),
@@ -317,8 +319,8 @@ class ExternalGeometryDebugObserver:
         if width <= 0 or height <= 0 or resolution <= 0.0 or len(data) != width * height:
             raise ValueError("invalid occupancy grid dimensions")
         frame_id = self._normalize_frame_id(
-            str(getattr(header, "frame_id", "") or self.config.frames.map_frame or "map"),
-            "map",
+            str(getattr(header, "frame_id", "") or self.config.frames.map_frame or DEFAULT_MAP_FRAME),
+            DEFAULT_MAP_FRAME,
         )
         origin_msg = getattr(info, "origin", None)
         position_msg = getattr(origin_msg, "position", None)
@@ -465,11 +467,39 @@ class ExternalGeometryDebugObserver:
             self._frontier_sequence += 1
             sequence = self._frontier_sequence
         now = datetime.now(timezone.utc)
-        current_goal = None
+        current_goal: Optional[NavigationGoal] = None
         if current is not None:
             pose = current.get("pose") if isinstance(current.get("pose"), dict) else None
             if pose is not None:
-                current_goal = {"target_pose": pose}
+                # 在源头将裸 dict 一次性解析为 NavigationGoal 契约对象；
+                # frame_id 缺失或非法时记诊断日志并保持 None，不做 "map" 兜底。
+                try:
+                    frame_id = pose.get("frame_id")
+                    if not frame_id:
+                        raise ValueError("current_goal pose 缺少 frame_id，无法构造 NavigationGoal")
+                    position = pose.get("position") if isinstance(pose.get("position"), dict) else {}
+                    orientation = pose.get("orientation") if isinstance(pose.get("orientation"), dict) else {}
+                    current_goal = NavigationGoal(
+                        goal_id="external_frontier_active",
+                        target_pose=Pose(
+                            frame_id=str(frame_id),
+                            position=Vector3(
+                                x=float(position.get("x") or 0.0),
+                                y=float(position.get("y") or 0.0),
+                                z=float(position.get("z") or 0.0),
+                            ),
+                            orientation=Quaternion(
+                                x=float(orientation.get("x") or 0.0),
+                                y=float(orientation.get("y") or 0.0),
+                                z=float(orientation.get("z") or 0.0),
+                                w=float(orientation.get("w") or 1.0),
+                            ),
+                        ),
+                        metadata={"source": "external_frontier_explorer"},
+                    )
+                except Exception:
+                    LOGGER.debug("外部前沿目标 NavigationGoal 解析失败，丢弃 current_goal。", exc_info=True)
+                    current_goal = None
         payload = {
             "source_name": "go2_rtabmap_debug_observer",
             "source": "go2_rtabmap_debug_observer",
@@ -539,7 +569,7 @@ class ExternalGeometryDebugObserver:
         x, y, z = point
         ns = str(getattr(marker, "ns", "") or "")
         marker_type = int(getattr(marker, "type", -1) or -1)
-        frame_id = str(getattr(getattr(marker, "header", None), "frame_id", "") or self.config.frames.map_frame or "map")
+        frame_id = str(getattr(getattr(marker, "header", None), "frame_id", "") or self.config.frames.map_frame)
         return self._frontier_from_xyz(
             x,
             y,
@@ -560,7 +590,7 @@ class ExternalGeometryDebugObserver:
         position = getattr(pose_msg, "position", None)
         if position is None:
             return None
-        frame_id = str(getattr(getattr(msg, "header", None), "frame_id", "") or self.config.frames.map_frame or "map")
+        frame_id = str(getattr(getattr(msg, "header", None), "frame_id", "") or self.config.frames.map_frame)
         orientation = getattr(pose_msg, "orientation", None)
         return self._frontier_from_xyz(
             float(getattr(position, "x", 0.0) or 0.0),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import deque
 from urllib.parse import urlencode
 from time import perf_counter
@@ -9,7 +10,7 @@ from contracts.naming import build_observation_id
 from contracts.perception import Detection2D, Observation, SegmentationMask2D, Track, TrackState
 from contracts.runtime_views import PerceptionContext
 from core import EventBus, StateNamespace, StateStore, StreamBus
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from providers import LocalizationProvider, PointCloudProvider
 from services.artifact_service import ArtifactService
 from services.perception.base import (
@@ -24,7 +25,10 @@ from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from contracts.image import ImageFrame
 
 VideoFrameSink = Callable[[object], Optional[object]]
 
@@ -58,6 +62,7 @@ class PerceptionService:
         stream_bus: Optional[StreamBus] = None,
         video_frame_sink: Optional[VideoFrameSink] = None,
         video_frame_source: Optional[VideoFrameSource] = None,
+        live_pose_provider=None,
         history_limit: int = 100,
         pipeline_name: str = "default_perception_pipeline",
     ) -> None:
@@ -74,9 +79,14 @@ class PerceptionService:
         self._stream_bus = stream_bus
         self._video_frame_sink = video_frame_sink
         self._video_frame_source = video_frame_source
+        self._live_pose_provider = live_pose_provider
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
         self._latest_by_camera: Dict[str, PerceptionContext] = {}
         self._pipeline_name = pipeline_name
+        # P1-2：感知全管线无并发保护——process_image 可被后台运行时线程、
+        # FastAPI threadpool 能力调用、memory 到点复核并发触发，模型/跟踪器状态
+        # 在无锁下会竞态损坏。粗粒度串行整条管线（推理本身是吞吐瓶颈）。
+        self._pipeline_lock = threading.Lock()
 
     def set_video_frame_sink(self, video_frame_sink: Optional[VideoFrameSink]) -> None:
         self._video_frame_sink = video_frame_sink
@@ -114,7 +124,38 @@ class PerceptionService:
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
     ) -> PerceptionContext:
-        """消费标准图像并产出检测、跟踪和场景摘要。"""
+        """消费标准图像并产出检测、跟踪和场景摘要。
+
+        P1-2：整条管线（检测/分割/几何/跟踪/场景摘要）在一把锁内串行执行，
+        避免后台运行时线程、HTTP threadpool 能力、memory 到点复核并发触发时
+        模型与跟踪器内部状态竞态损坏。
+        """
+
+        with self._pipeline_lock:
+            return self._process_image_locked(
+                image_frame,
+                camera_info,
+                image_artifact=image_artifact,
+                requested_by=requested_by,
+                detector_backend_name=detector_backend_name,
+                source_name=source_name,
+                detection_metadata=detection_metadata,
+                open_vocabulary_classes=open_vocabulary_classes,
+            )
+
+    def _process_image_locked(
+        self,
+        image_frame,
+        camera_info=None,
+        *,
+        image_artifact=None,
+        requested_by: Optional[str] = None,
+        detector_backend_name: Optional[str] = None,
+        source_name: Optional[str] = None,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
+    ) -> PerceptionContext:
+        """process_image 的实际实现，调用方须已持有 _pipeline_lock。"""
 
         from contracts.artifacts import ArtifactRef
         from contracts.image import CameraInfo, ImageFrame
@@ -356,7 +397,6 @@ class PerceptionService:
                     "ingest_status": ingest_status,
                 },
             )
-        resolved_camera_id = image_frame.camera_id
         camera_info = self._camera_info_from_video_frame(image_frame)
         source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
         self._publish_video_frame(
@@ -783,6 +823,41 @@ class PerceptionService:
             return None
         return providers
 
+    def _read_live_pose_and_frame_tree(self):
+        """从实时位姿门面（几何运行时 providers）取探索期实时位姿与坐标树。
+
+        鸭子类型，与 PerceptionVideoRuntime._read_live_pose 同源：优先
+        get_exploration_pose()（探索建图时导航后端 map→base 实时 TF），回退
+        get_current_pose()（定位会话后端，仅重定位就绪后有值）；frame_tree 走
+        get_frame_tree()。任一失败返回 None，禁兜底假位姿。
+        """
+
+        from contracts.geometry import Pose
+
+        provider = self._live_pose_provider
+        if provider is None:
+            return None, None
+        pose = None
+        for getter_name in ("get_exploration_pose", "get_current_pose"):
+            getter = getattr(provider, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                candidate = getter()
+            except Exception:
+                continue
+            if isinstance(candidate, Pose):
+                pose = candidate
+                break
+        frame_tree = None
+        frame_tree_getter = getattr(provider, "get_frame_tree", None)
+        if callable(frame_tree_getter):
+            try:
+                frame_tree = frame_tree_getter()
+            except Exception:
+                frame_tree = None
+        return pose, frame_tree
+
     def _get_point_cloud_provider_optional(self) -> Optional[PointCloudProvider]:
         providers = getattr(self._provider_owner, "providers", None)
         if providers is None or not isinstance(providers, PointCloudProvider):
@@ -826,6 +901,16 @@ class PerceptionService:
                     pose_getter = getattr(localization_provider, "get_current_pose", None)
                     if callable(pose_getter):
                         current_pose = pose_getter()
+        # P0-1：探索建图阶段定位会话尚未重定位就绪，上面流/会话源的 current_pose 恒 None，
+        # 导致 map_frame_id=None、support_points_map 永不生成、下游丢失最高优先级
+        # map_point_samples 投影路径。与 PerceptionVideoRuntime._read_live_pose 同源回退到
+        # 实时位姿门面（导航后端 map→base 实时 TF）。frame_tree 同源缺失时一并回退。
+        if current_pose is None or frame_tree is None:
+            live_pose, live_frame_tree = self._read_live_pose_and_frame_tree()
+            if current_pose is None and live_pose is not None:
+                current_pose = live_pose
+            if frame_tree is None and live_frame_tree is not None:
+                frame_tree = live_frame_tree
 
         detections_2d, geometry_metadata = self._geometry_augmentor.augment_detections(
             detection_bundle.detections_2d,

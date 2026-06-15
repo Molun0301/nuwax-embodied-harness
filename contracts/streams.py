@@ -5,7 +5,7 @@ from typing import Any, Optional
 from pydantic import Field
 
 from contracts.base import MetadataDict, TimestampedContract
-from compat import StrEnum
+from contracts.compat import StrEnum
 
 
 class StreamPayloadKind(StrEnum):
@@ -21,6 +21,7 @@ class StreamPayloadKind(StrEnum):
 class StreamFrame(TimestampedContract):
     """平台实时数据帧。"""
 
+    schema_version: int = Field(default=1, ge=1, description="契约模式版本号，跨进程演进协商用，新增字段必须 Optional+default 保持向后兼容。")
     topic: str = Field(description="流主题。")
     payload_kind: StreamPayloadKind = Field(default=StreamPayloadKind.JSON, description="载荷类型。")
     cursor: Optional[int] = Field(default=None, ge=1, description="流游标。")

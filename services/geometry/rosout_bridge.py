@@ -4,7 +4,7 @@ import logging
 import threading
 from typing import Optional
 
-from logging_utils import LogRateLimiter
+from core.logging_utils import LogRateLimiter
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.ros2")
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from compat import StrEnum
+from contracts.compat import StrEnum
 from typing import Dict, Optional, Any, Generic, TypeVar
 
 from pydantic import Field

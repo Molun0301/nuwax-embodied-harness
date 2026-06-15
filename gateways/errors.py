@@ -1,110 +1,24 @@
+"""网关异常过渡再导出。
+
+GatewayError 及其子类已下沉至 `core.errors`（解开 services ⇄ gateways 包级循环）。
+本模块保留为再导出 shim，供尚未迁移的网关内部引用过渡使用。新代码请直接从
+`core.errors` 导入。
+"""
+
 from __future__ import annotations
 
-from typing import Dict, Optional, Any
+from core.errors import (
+    AccessDeniedError,
+    ArtifactNotFoundError,
+    AuthenticationRequiredError,
+    GatewayError,
+    as_gateway_error,
+)
 
-from core.capability_registry import CapabilityNotRegisteredError
-from core.resource_lock import ResourceConflictError
-
-
-class GatewayError(RuntimeError):
-    """网关统一异常。"""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        error_code: str = "gateway_error",
-        http_status: int = 400,
-        jsonrpc_code: int = -32000,
-        details: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        super().__init__(message)
-        self.message = message
-        self.error_code = error_code
-        self.http_status = http_status
-        self.jsonrpc_code = jsonrpc_code
-        self.details = dict(details or {})
-
-    def to_payload(self) -> Dict[str, Any]:
-        """导出标准错误载荷。"""
-
-        return {
-            "code": self.error_code,
-            "message": self.message,
-            "details": self.details,
-        }
-
-
-class AuthenticationRequiredError(GatewayError):
-    """缺少认证信息。"""
-
-    def __init__(self, message: str = "请求缺少有效认证信息。") -> None:
-        super().__init__(
-            message,
-            error_code="authentication_required",
-            http_status=401,
-            jsonrpc_code=-32001,
-        )
-
-
-class AccessDeniedError(GatewayError):
-    """访问被拒绝。"""
-
-    def __init__(self, message: str, *, details: Optional[Dict[str, Any]] = None) -> None:
-        super().__init__(
-            message,
-            error_code="access_denied",
-            http_status=403,
-            jsonrpc_code=-32003,
-            details=details,
-        )
-
-
-class ArtifactNotFoundError(GatewayError):
-    """制品不存在。"""
-
-    def __init__(self, artifact_id: str) -> None:
-        super().__init__(
-            f"制品 {artifact_id} 不存在。",
-            error_code="artifact_not_found",
-            http_status=404,
-            jsonrpc_code=-32004,
-            details={"artifact_id": artifact_id},
-        )
-
-
-def as_gateway_error(exc: Exception) -> GatewayError:
-    """把未知异常转换为网关异常。"""
-
-    if isinstance(exc, GatewayError):
-        return exc
-    if isinstance(exc, CapabilityNotRegisteredError):
-        capability_name = str(exc)
-        return GatewayError(
-            f"能力 {capability_name} 未注册。",
-            error_code="capability_not_registered",
-            http_status=404,
-            jsonrpc_code=-32601,
-            details={"capability_name": capability_name},
-        )
-    if isinstance(exc, ResourceConflictError):
-        return GatewayError(
-            "资源冲突，当前能力无法执行。",
-            error_code="resource_conflict",
-            http_status=409,
-            jsonrpc_code=-32009,
-            details={"conflicts": [item.model_dump(mode="json") for item in exc.conflicts]},
-        )
-    if isinstance(exc, KeyError):
-        return GatewayError(
-            "请求的资源不存在。",
-            error_code="not_found",
-            http_status=404,
-            jsonrpc_code=-32004,
-        )
-    return GatewayError(
-        f"网关执行失败: {exc}",
-        error_code="execution_failed",
-        http_status=500,
-        jsonrpc_code=-32010,
-    )
+__all__ = [
+    "GatewayError",
+    "AuthenticationRequiredError",
+    "AccessDeniedError",
+    "ArtifactNotFoundError",
+    "as_gateway_error",
+]

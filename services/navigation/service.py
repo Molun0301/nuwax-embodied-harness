@@ -11,7 +11,7 @@ from contracts.runtime_views import LocalizationSessionStatus
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.runtime_views import ExplorationContext, NavigationContext
 from core import EventBus, StateNamespace, StateStore, StreamBus
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from providers import ExplorationProvider, NavigationProvider
 from services.localization import LocalizationService
 from services.mapping.service import MappingService
@@ -67,6 +67,9 @@ class NavigationService:
         self._lock = threading.RLock()
         self._navigation_update_subscription_id: Optional[int] = None
         self._exploration_update_subscription_id: Optional[int] = None
+        # 定位会话刷新节流：避免 *_until_complete 高频轮询每轮触发完整定位刷新副作用链（P0-3）
+        self._localization_refresh_min_interval_sec: float = 1.0
+        self._last_localization_refresh_monotonic: Optional[float] = None
         self._subscribe_provider_navigation_updates()
         self._subscribe_provider_exploration_updates()
 
@@ -322,12 +325,19 @@ class NavigationService:
         self,
         goal: NavigationGoal,
         *,
-        poll_interval_sec: float = 0.05,
+        poll_interval_sec: float = 0.2,
+        timeout_sec: Optional[float] = None,
         on_progress=None,
     ) -> NavigationContext:
-        """同步等待导航目标达到终态。"""
+        """同步等待导航目标达到终态。
+
+        Args:
+            timeout_sec: 任务级超时上限（秒）。超时后下发 cancel_goal 并抛 GatewayError，
+                避免后端永驻 RUNNING（如 Nav2 action 卡死）导致调用方线程永久阻塞。None 表示不限时。
+        """
 
         self.set_goal(goal)
+        deadline = None if timeout_sec is None or timeout_sec <= 0 else time.monotonic() + float(timeout_sec)
         while True:
             context = self.refresh_navigation()
             if callable(on_progress):
@@ -341,6 +351,15 @@ class NavigationService:
                 raise GatewayError(context.navigation_state.message or "导航执行失败。")
             if state == NavigationStatus.CANCELLED:
                 raise GatewayError(context.navigation_state.message or "导航已取消。")
+            if deadline is not None and time.monotonic() >= deadline:
+                try:
+                    self.cancel_goal()
+                except Exception:
+                    LOGGER.exception("导航超时取消失败 goal_id=%s", goal.goal_id)
+                raise GatewayError(
+                    "导航在 %.1fs 内未达终态，已下发取消。" % float(timeout_sec),
+                    error_code="navigation_timeout",
+                )
             time.sleep(max(0.01, poll_interval_sec))
 
     def resolve_named_goal(self, target_name: str) -> NavigationGoal:
@@ -484,7 +503,8 @@ class NavigationService:
                         "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
                         "terminal_status": exploration_metadata.get("terminal_status"),
                         "planned_path": exploration_metadata.get("planned_path") if isinstance(exploration_metadata.get("planned_path"), list) else [],
-                        "current_goal": exploration_metadata.get("current_goal") if isinstance(exploration_metadata.get("current_goal"), dict) else None,
+                        # current_goal 已在源头解析为 NavigationGoal|None，直接透传。
+                        "current_goal": exploration_metadata.get("current_goal") if isinstance(exploration_metadata.get("current_goal"), NavigationGoal) else None,
                         "external_frontier_debug_observer": observer_meta,
                     }
                     frontier_sequence = None
@@ -621,12 +641,19 @@ class NavigationService:
         self,
         request: ExploreAreaRequest,
         *,
-        poll_interval_sec: float = 0.05,
+        poll_interval_sec: float = 0.2,
+        timeout_sec: Optional[float] = None,
         on_progress=None,
     ) -> ExplorationContext:
-        """同步等待探索任务达到终态。"""
+        """同步等待探索任务达到终态。
+
+        Args:
+            timeout_sec: 任务级超时上限（秒）。超时后下发 stop_exploration 并抛 GatewayError，
+                避免探索后端永驻 RUNNING 导致调用方线程永久阻塞。None 表示不限时。
+        """
 
         self.start_exploration(request)
+        deadline = None if timeout_sec is None or timeout_sec <= 0 else time.monotonic() + float(timeout_sec)
         while True:
             context = self.refresh_exploration()
             if callable(on_progress):
@@ -638,6 +665,15 @@ class NavigationService:
                 raise GatewayError(context.exploration_state.message or "探索执行失败。")
             if state == ExplorationStatus.CANCELLED:
                 raise GatewayError(context.exploration_state.message or "探索已取消。")
+            if deadline is not None and time.monotonic() >= deadline:
+                try:
+                    self.stop_exploration()
+                except Exception:
+                    LOGGER.exception("探索超时停止失败 request_id=%s", request.request_id)
+                raise GatewayError(
+                    "探索在 %.1fs 内未达终态，已下发停止。" % float(timeout_sec),
+                    error_code="exploration_timeout",
+                )
             time.sleep(max(0.01, poll_interval_sec))
 
     def _publish_external_exploration_navigation_overlay(self, exploration_context: ExplorationContext) -> None:
@@ -668,7 +704,7 @@ class NavigationService:
         }:
             if expl_status == ExplorationStatus.SUCCEEDED:
                 nav_status = NavigationStatus.SUCCEEDED
-            elif expl_status == NavigationStatus.CANCELLED:
+            elif expl_status == ExplorationStatus.CANCELLED:
                 nav_status = NavigationStatus.CANCELLED
             else:
                 nav_status = NavigationStatus.FAILED
@@ -691,37 +727,14 @@ class NavigationService:
         else:
             return
 
-        current_goal_payload = metadata.get("current_goal") if isinstance(metadata.get("current_goal"), dict) else None
+        # current_goal 已在生产端（external_debug_observer）解析为 NavigationGoal|None，直接取用。
+        # goal_id 在此补充为含 request_id 的标识，保持原有语义。
         goal_id = "external_frontier_%s" % (exploration_state.current_request_id or "active")
-        current_goal = None
-        if current_goal_payload is not None:
-            try:
-                from contracts.geometry import Pose, Quaternion, Vector3
-
-                target_pose = current_goal_payload.get("target_pose")
-                if isinstance(target_pose, dict):
-                    position = target_pose.get("position") if isinstance(target_pose.get("position"), dict) else {}
-                    orientation = target_pose.get("orientation") if isinstance(target_pose.get("orientation"), dict) else {}
-                    current_goal = NavigationGoal(
-                        goal_id=goal_id,
-                        target_pose=Pose(
-                            frame_id=str(target_pose.get("frame_id") or "map"),
-                            position=Vector3(
-                                x=float(position.get("x") or 0.0),
-                                y=float(position.get("y") or 0.0),
-                                z=float(position.get("z") or 0.0),
-                            ),
-                            orientation=Quaternion(
-                                x=float(orientation.get("x") or 0.0),
-                                y=float(orientation.get("y") or 0.0),
-                                z=float(orientation.get("z") or 0.0),
-                                w=float(orientation.get("w") or 1.0),
-                            ),
-                        ),
-                        metadata={"source": "external_frontier_explorer"},
-                    )
-            except Exception:
-                current_goal = None
+        _raw_goal = metadata.get("current_goal")
+        current_goal: Optional[NavigationGoal] = None
+        if isinstance(_raw_goal, NavigationGoal):
+            # 用 model_copy 覆盖 goal_id，保持其余字段不变。
+            current_goal = _raw_goal.model_copy(update={"goal_id": goal_id})
 
         navigation_state = NavigationState(
             current_goal_id=goal_id if current_goal is not None else None,
@@ -789,6 +802,24 @@ class NavigationService:
             items = items[-max(0, limit) :]
         return tuple(items)
 
+    def _should_refresh_localization(self) -> bool:
+        """定位会话刷新节流。
+
+        高频轮询（navigate/explore_until_complete）每轮都会触发 _build_map_runtime_metadata，
+        进而触发 LocalizationService 完整刷新副作用链（pose 捕获 + 诊断 + 三条流发布 + StateStore 写）。
+        此处按最小刷新间隔节流：未达间隔时返回 False，复用 get_active_session() 缓存。
+
+        调用方位于 _ingest_navigation_state/_ingest_exploration_state 的 self._lock 临界区内，
+        故节流时间戳读写受锁保护。
+        """
+
+        now = time.monotonic()
+        last = self._last_localization_refresh_monotonic
+        if last is not None and (now - last) < self._localization_refresh_min_interval_sec:
+            return False
+        self._last_localization_refresh_monotonic = now
+        return True
+
     def _build_map_runtime_metadata(
         self,
         *,
@@ -799,7 +830,7 @@ class NavigationService:
     ) -> dict:
         map_snapshot = self._mapping_service.get_latest_snapshot()
         localization_session = self._localization_service.get_active_session()
-        if localization_session is not None:
+        if localization_session is not None and self._should_refresh_localization():
             try:
                 refreshed_session = self._localization_service.refresh_current_session(
                     metadata={"source": "navigation_runtime_metadata"}

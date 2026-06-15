@@ -2,37 +2,35 @@
 drivers/go2/data_plane.env
 go2_proxy.log
 nuwax_robot_bridge.log
+nuwax_robot_bridge.log.lock
 __pycache__/
 *.pyc
 .omc/
 .omx/
 .claude/
-docs/内部开发文档/
 docs/开发文档/
 GO2_inner_slam/
-runtime_data/**/*.db
 artifacts/
 .venv_model_download/
+.venv/
 memory_models_20260402.tar.zst
-runtime_data/models/
+runtime_data/
 tests/
 .vscode/
-drivers/go2/ros2_ws/
-nuwax_robot_bridge.log.lock
-runtime_data/
-.venv/
 .pytest_cache
 .playwright-mcp
+drivers/go2/ros2_ws/
 功能列表.md
-.env
 AGENTS.md
 CLAUDE.md
 services/geometry/nuwax_ros_bridge/Cargo.lock
 services/geometry/nuwax_ros_bridge/target/
 
+# === bootstrap 生成物（含 token，禁止入库；保留 *.example） ===
+deploy/systemd/nuwax-host-gateway.service
+deploy/nuwaclaw/*.host_gateway.json
+
 # === 未提交文档/日志/地图/杂项 忽略 (2026-06-03) ===
-/1.md
-/huang1.md
 /UDS
 /nuwax_robot_bridge技术手册5.25.md
 /nuwax_robot_bridge技术手册5.19(1).md

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from compat import StrEnum
+from contracts.compat import StrEnum
 import threading
 from typing import Dict, Optional, Tuple, Any
 

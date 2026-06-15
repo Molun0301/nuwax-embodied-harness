@@ -10,6 +10,7 @@ import logging
 import queue
 import re
 import threading
+import time
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -17,7 +18,8 @@ import numpy as np
 from contracts.base import utc_now
 from contracts.events import RuntimeEventCategory
 from contracts.geometry import Pose, Quaternion, Vector3
-from contracts.maps import SemanticMap, SemanticRegion
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
+from contracts.maps import SemanticMap
 from contracts.memory import (
     GoalCandidateScoreBreakdown,
     GoalConstraint,
@@ -58,11 +60,10 @@ from contracts.spatial_memory import (
     SemanticSummaryNode,
     SpatialAnchor,
     SpatialAnchorKind,
-    VerificationResult,
 )
 from core import EventBus, StateNamespace, StateStore
-from gateways.artifacts import LocalArtifactStore
-from gateways.errors import GatewayError
+from services.artifact_store import LocalArtifactStore
+from core.errors import GatewayError
 from services.localization import LocalizationService
 from services.mapping.service import MappingService
 from services.memory.grounding_query_planner import GroundingQueryPlanner
@@ -81,7 +82,6 @@ from services.memory.vector_store import (
     NamedVector,
     SQLiteNamedVectorStore,
     VectorPoint,
-    VectorSearchHit,
 )
 from services.model_providers import (
     resolve_grounding_provider_spec,
@@ -189,6 +189,7 @@ class MemoryService:
         evaluation_service: Optional[Any] = None,
         deferred_projection_config: Optional[Any] = None,
         accumulated_cloud_provider: Optional[Any] = None,
+        live_pose_provider: Optional[Any] = None,
     ) -> None:
         self._localization_service = localization_service
         self._mapping_service = mapping_service
@@ -233,6 +234,9 @@ class MemoryService:
         self._scene_space_understanding_adapter = SceneSpaceUnderstandingAdapter()
         self._deferred_projection_config = deferred_projection_config
         self._accumulated_cloud_provider = accumulated_cloud_provider
+        # 05-P0-1：探索期实时位姿门面（鸭子类型，与 PerceptionService._read_live_pose 同源）。
+        # 网关已在 gateways/runtime.py:464 构造 MemoryService 时同源注入；未注入时默认 None 向后兼容。
+        self._live_pose_provider = live_pose_provider
         _triangulation_enabled = bool(
             getattr(deferred_projection_config, "triangulation_enabled", False)
         )
@@ -263,7 +267,7 @@ class MemoryService:
         self._semantic_summary_nodes_by_id: Dict[str, SemanticSummaryNode] = {}
         self._latest_semantic_map_context = SemanticMapBuildResult(
             map_version_id=None,
-            frame_id="map",
+            frame_id=DEFAULT_MAP_FRAME,
             semantic_regions=(),
             anchors_by_id={},
             topology_nodes_by_id={},
@@ -351,6 +355,7 @@ class MemoryService:
         self._active_library_name = resolved_name
         if load_history:
             self._load_persisted_memory(library_name=resolved_name)
+        self._start_vectorization_worker()
         self._start_deferred_refine_worker()
         summary = self.get_summary()
         self._publish_memory_event(
@@ -416,6 +421,7 @@ class MemoryService:
 
         previous_name = self._active_library_name
         self._stop_deferred_refine_worker()
+        self._stop_vectorization_worker()
         self._clear_active_memory_state()
         self._memory_enabled = False
         self._active_library_name = None
@@ -732,7 +738,7 @@ class MemoryService:
         self._semantic_summary_history.clear()
         self._latest_semantic_map_context = SemanticMapBuildResult(
             map_version_id=None,
-            frame_id="map",
+            frame_id=DEFAULT_MAP_FRAME,
             semantic_regions=(),
             anchors_by_id={},
             topology_nodes_by_id={},
@@ -1584,14 +1590,19 @@ class MemoryService:
         new_value = min(0.6, previous + amount)
         decay_state[key] = new_value
         if record_kind in {MemoryRecordKind.OBJECT_INSTANCE.value, "object_instance"} and record_id_str:
-            instance = self._semantic_instances_by_id.get(record_id_str)
-            if instance is not None:
-                merged_metadata = dict(instance.metadata or {})
-                merged_metadata["arrival_failure_decay"] = round(new_value, 6)
-                merged_metadata["arrival_failure_reason_code"] = reason_code
-                merged_metadata["arrival_failure_last_candidate_id"] = candidate_id_str
-                updated = instance.model_copy(update={"metadata": merged_metadata}, deep=True)
-                self._semantic_instances_by_id[record_id_str] = updated
+            # P0-3：读改写必须整体持锁，与精化 worker 写回串行。
+            with self._instances_lock:
+                instance = self._semantic_instances_by_id.get(record_id_str)
+                if instance is not None:
+                    merged_metadata = dict(instance.metadata or {})
+                    merged_metadata["arrival_failure_decay"] = round(new_value, 6)
+                    merged_metadata["arrival_failure_reason_code"] = reason_code
+                    merged_metadata["arrival_failure_last_candidate_id"] = candidate_id_str
+                    updated = instance.model_copy(update={"metadata": merged_metadata}, deep=True)
+                    self._semantic_instances_by_id[record_id_str] = updated
+                else:
+                    updated = None
+            if updated is not None:
                 try:
                     self._repository.upsert_semantic_instance(updated)
                 except Exception:
@@ -4185,38 +4196,51 @@ class MemoryService:
 
     def _upsert_vector_point_for_location(self, location: TaggedLocation) -> None:
         payload = self._build_location_payload(location)
-        image_bytes = self._load_primary_image_bytes([])
+        artifact_ids: List[str] = []
         if location.memory_id is not None:
             linked_memory = self._semantic_entries_by_id.get(location.memory_id)
             if linked_memory is not None:
-                image_bytes = self._load_primary_image_bytes(linked_memory.artifact_ids) or image_bytes
-        vectors = self._build_named_vectors(
-            retrieval_text=str(payload["retrieval_text"]),
-            image_bytes=image_bytes,
-        )
+                artifact_ids = list(linked_memory.artifact_ids)
+        # 先写入不含向量的记录，降低 ingest 主链路延迟
         self._vector_store.upsert_point(
             point_id=location.location_id,
             collection_name=PLACE_NODES_COLLECTION,
             record_kind=MemoryRecordKind.TAGGED_LOCATION.value,
             payload=payload,
-            vectors=vectors,
+            vectors={},
             updated_at=location.timestamp.isoformat(),
+        )
+        # 异步补充向量
+        self._enqueue_vectorization(
+            point_id=location.location_id,
+            collection_name=PLACE_NODES_COLLECTION,
+            record_kind=MemoryRecordKind.TAGGED_LOCATION.value,
+            retrieval_text=str(payload["retrieval_text"]),
+            artifact_ids=artifact_ids,
+            updated_at=location.timestamp.isoformat(),
+            payload=payload,
         )
 
     def _upsert_vector_point_for_memory(self, entry: SemanticMemoryEntry) -> None:
         payload = self._build_memory_payload(entry)
-        image_bytes = self._load_primary_image_bytes(entry.artifact_ids)
-        vectors = self._build_named_vectors(
-            retrieval_text=str(payload["retrieval_text"]),
-            image_bytes=image_bytes,
-        )
+        # 先写入不含向量的记录，降低 ingest 主链路延迟
         self._vector_store.upsert_point(
             point_id=entry.memory_id,
             collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
             record_kind=entry.kind.value,
             payload=payload,
-            vectors=vectors,
+            vectors={},
             updated_at=entry.timestamp.isoformat(),
+        )
+        # 异步补充向量
+        self._enqueue_vectorization(
+            point_id=entry.memory_id,
+            collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
+            record_kind=entry.kind.value,
+            retrieval_text=str(payload["retrieval_text"]),
+            artifact_ids=list(entry.artifact_ids),
+            updated_at=entry.timestamp.isoformat(),
+            payload=payload,
         )
 
     def _upsert_vector_point_for_instance(self, instance: SemanticInstance) -> None:
@@ -4278,7 +4302,7 @@ class MemoryService:
             daemon=True,
         )
         self._vectorization_worker.start()
-        logger.info("后台向量化 worker 已启动")
+        LOGGER.info("后台向量化 worker 已启动")
 
     def _stop_vectorization_worker(self) -> None:
         """停止后台向量化 worker 线程。"""
@@ -4291,7 +4315,7 @@ class MemoryService:
             pass
         self._vectorization_worker.join(timeout=10.0)
         self._vectorization_worker = None
-        logger.info("后台向量化 worker 已停止")
+        LOGGER.info("后台向量化 worker 已停止")
 
     # ------------------------------------------------------------------
     # 延迟点云重投影精化 worker（阶段2）
@@ -4308,7 +4332,7 @@ class MemoryService:
         if not self._delayed_pointcloud_enabled():
             return
         if self._accumulated_cloud_provider is None:
-            logger.warning(
+            LOGGER.warning(
                 "NUWAX_PERCEPTION_DEFERRED_STRATEGY 含延迟点云，但未注入累积点云源；"
                 "延迟点云精化降级为仅三角化（不启动精化线程）。"
             )
@@ -4322,7 +4346,7 @@ class MemoryService:
             daemon=True,
         )
         self._deferred_refine_worker.start()
-        logger.info("延迟点云精化 worker 已启动")
+        LOGGER.info("延迟点云精化 worker 已启动")
 
     def _stop_deferred_refine_worker(self) -> None:
         """停止延迟点云精化 worker。"""
@@ -4333,7 +4357,7 @@ class MemoryService:
         self._deferred_refine_stop_event.set()
         self._deferred_refine_worker.join(timeout=10.0)
         self._deferred_refine_worker = None
-        logger.info("延迟点云精化 worker 已停止")
+        LOGGER.info("延迟点云精化 worker 已停止")
 
     def _deferred_refine_worker_loop(self) -> None:
         """精化主循环：低频扫描 pending 实例，用累积点云锥内取点精化坐标。
@@ -4353,7 +4377,7 @@ class MemoryService:
             try:
                 self._run_deferred_refine_pass(max_targets=max(1, max_concurrency))
             except Exception:  # noqa: BLE001 - 精化线程不得因单轮异常退出
-                logger.exception("延迟点云精化轮次异常，跳过本轮")
+                LOGGER.exception("延迟点云精化轮次异常，跳过本轮")
 
     def _select_deferred_refine_targets(self, *, max_targets: int) -> List[str]:
         """挑选待精化实例 id：pending 待定位 + 非动态 + 有延迟投影缓存。
@@ -4396,7 +4420,7 @@ class MemoryService:
         try:
             cloud_xyz = self._accumulated_cloud_provider()
         except Exception:  # noqa: BLE001
-            logger.exception("拉取累积点云失败，本轮精化跳过")
+            LOGGER.exception("拉取累积点云失败，本轮精化跳过")
             return
         if cloud_xyz is None or getattr(cloud_xyz, "shape", (0,))[0] == 0:
             return
@@ -4406,7 +4430,7 @@ class MemoryService:
             try:
                 self._refine_instance_with_pointcloud(instance_id, cloud_xyz)
             except Exception:  # noqa: BLE001
-                logger.exception("实例 %s 延迟点云精化异常", instance_id)
+                LOGGER.exception("实例 %s 延迟点云精化异常", instance_id)
 
     def _refine_instance_with_pointcloud(self, instance_id: str, cloud_xyz) -> None:
         """对单个实例用最近一条缓存视锥做锥内取点；成功则覆盖坐标转 ACTIVE。"""
@@ -4471,7 +4495,7 @@ class MemoryService:
             metadata = dict(instance.metadata or {})
             centroid = result.centroid
             pc_pose = Pose(
-                frame_id=str(instance.pose.frame_id or "map"),
+                frame_id=str(instance.pose.frame_id or DEFAULT_MAP_FRAME),
                 position=Vector3(x=float(centroid[0]), y=float(centroid[1]), z=float(centroid[2])),
                 orientation=instance.pose.orientation,
             )
@@ -4515,7 +4539,7 @@ class MemoryService:
         if self._is_long_term_static_instance(updated):
             self._repository.upsert_semantic_instance(updated)
             self._upsert_vector_point_for_instance(updated)
-        logger.info(
+        LOGGER.info(
             "实例 %s 延迟点云精化成功：%d 点，坐标=(%.3f, %.3f, %.3f)",
             instance_id,
             result.point_count,
@@ -4561,7 +4585,7 @@ class MemoryService:
                     updated_at=str(task["updated_at"]),
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("后台向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
+                LOGGER.warning("后台向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
             finally:
                 self._vectorization_queue.task_done()
 
@@ -4609,7 +4633,7 @@ class MemoryService:
         try:
             self._vectorization_queue.put_nowait(task)
         except queue.Full:
-            logger.warning("向量化队列已满，标记待处理 point_id=%s", point_id)
+            LOGGER.warning("向量化队列已满，标记待处理 point_id=%s", point_id)
             # 标记为 pending，后续 worker 空闲时补充
             self._mark_pending_vectorization(point_id, task)
             return  # 不阻塞调用方
@@ -4636,7 +4660,7 @@ class MemoryService:
                 updated_at=str(task["updated_at"]),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("同步向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
+            LOGGER.warning("同步向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
 
     def _upsert_vector_point_for_scene_space(self, scene_space: SceneSpace) -> None:
         payload = self._build_scene_space_payload(scene_space)
@@ -5797,18 +5821,21 @@ class MemoryService:
         )
         if not projected:
             return
-        updated_instances, outcomes = self._instance_association_service.associate(
-            projected,
-            existing_instances=self._semantic_instances_by_id,
-            map_version_id=memory_entry.map_version_id,
-            localization_session_id=memory_entry.localization_session_id
-            or str(memory_entry.metadata.get("localization_session_id") or "")
-            or None,
-            occupancy_grid=map_snapshot.occupancy_grid if map_snapshot is not None else None,
-            cost_map=map_snapshot.cost_map if map_snapshot is not None else None,
-            now=memory_entry.timestamp,
-        )
-        self._semantic_instances_by_id = dict(updated_instances)
+        # P0-3：实例字典的「读快照→关联→整体替换」必须相对延迟精化 worker 原子，
+        # 否则 worker 刚写回的精化坐标会被本路径的旧快照整体覆盖（静默回退 fallback）。
+        with self._instances_lock:
+            updated_instances, outcomes = self._instance_association_service.associate(
+                projected,
+                existing_instances=self._semantic_instances_by_id,
+                map_version_id=memory_entry.map_version_id,
+                localization_session_id=memory_entry.localization_session_id
+                or str(memory_entry.metadata.get("localization_session_id") or "")
+                or None,
+                occupancy_grid=map_snapshot.occupancy_grid if map_snapshot is not None else None,
+                cost_map=map_snapshot.cost_map if map_snapshot is not None else None,
+                now=memory_entry.timestamp,
+            )
+            self._semantic_instances_by_id = dict(updated_instances)
         linked_instance_ids: List[str] = []
         for projected_item, outcome in zip(projected, outcomes):
             projection_metadata = dict(outcome.instance.metadata)
@@ -5853,7 +5880,10 @@ class MemoryService:
                 },
                 deep=True,
             )
-            self._semantic_instances_by_id[instance.instance_id] = instance
+            # P0-3：与延迟精化 worker 共享 _instances_lock，单点写回必须在锁内，
+            # 与 worker 的 get→copy→set 串行；I/O 留在锁外（沿用本类既有模式）。
+            with self._instances_lock:
+                self._semantic_instances_by_id[instance.instance_id] = instance
             linked_instance_ids.append(instance.instance_id)
             self._semantic_instance_history.append(instance)
             self._write_semantic_instance_state(instance)
@@ -5887,22 +5917,25 @@ class MemoryService:
                 linked_events_by_instance_id.setdefault(instance_id, []).append(observation_event.event_id)
 
         for instance_id in linked_instance_ids:
-            current_instance = self._semantic_instances_by_id.get(instance_id)
-            if current_instance is None:
-                continue
-            new_event_ids = linked_events_by_instance_id.get(instance_id, [])
-            if not new_event_ids:
-                continue
-            updated_instance = current_instance.model_copy(
-                update={
-                    "last_observation_event_id": new_event_ids[-1],
-                    "supporting_observation_event_ids": self._normalize_aliases(
-                        [*current_instance.supporting_observation_event_ids, *new_event_ids]
-                    ),
-                },
-                deep=True,
-            )
-            self._semantic_instances_by_id[instance_id] = updated_instance
+            # P0-3：get→copy→set 的读改写必须整体持锁，否则与精化 worker 的
+            # 并发写回互相覆盖；I/O（state/repository/vector）留在锁外。
+            with self._instances_lock:
+                current_instance = self._semantic_instances_by_id.get(instance_id)
+                if current_instance is None:
+                    continue
+                new_event_ids = linked_events_by_instance_id.get(instance_id, [])
+                if not new_event_ids:
+                    continue
+                updated_instance = current_instance.model_copy(
+                    update={
+                        "last_observation_event_id": new_event_ids[-1],
+                        "supporting_observation_event_ids": self._normalize_aliases(
+                            [*current_instance.supporting_observation_event_ids, *new_event_ids]
+                        ),
+                    },
+                    deep=True,
+                )
+                self._semantic_instances_by_id[instance_id] = updated_instance
             self._semantic_instance_history.append(updated_instance)
             self._write_semantic_instance_state(updated_instance)
             if self._is_long_term_static_instance(updated_instance):
@@ -5933,11 +5966,9 @@ class MemoryService:
         遍历内存索引，找出 timestamp 超过 max_age_sec 的事件，从内存、历史队列、
         持久化仓库和向量库中一并删除。返回清理的事件数量。
         """
-        import logging
         from datetime import timezone
 
-        logger = logging.getLogger(__name__)
-        now = __import__("datetime").datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
         expired_ids = [
             event_id
             for event_id, event in list(self._observation_events_by_id.items())
@@ -5965,7 +5996,7 @@ class MemoryService:
         # 从向量库中删除
         self._vector_store.delete_points(expired_ids)
 
-        logger.info("ObservationEvent TTL 清理：已删除 %d 条过期事件（max_age_sec=%.0f）", len(expired_ids), max_age_sec)
+        LOGGER.info("ObservationEvent TTL 清理：已删除 %d 条过期事件（max_age_sec=%.0f）", len(expired_ids), max_age_sec)
         return len(expired_ids)
 
     def _is_long_term_static_instance(self, instance: SemanticInstance) -> bool:
@@ -6567,14 +6598,16 @@ class MemoryService:
         if not relation_id:
             return
         if node_kind in {MemoryRecordKind.OBJECT_INSTANCE.value, "object_instance", "semantic_instance"}:
-            instance = self._semantic_instances_by_id.get(node_id)
-            if instance is None or relation_id in instance.graph_relation_ids:
-                return
-            updated = instance.model_copy(
-                update={"graph_relation_ids": self._normalize_aliases([*instance.graph_relation_ids, relation_id])},
-                deep=True,
-            )
-            self._semantic_instances_by_id[updated.instance_id] = updated
+            # P0-3：读改写必须整体持锁，与精化 worker 写回串行；I/O 留在锁外。
+            with self._instances_lock:
+                instance = self._semantic_instances_by_id.get(node_id)
+                if instance is None or relation_id in instance.graph_relation_ids:
+                    return
+                updated = instance.model_copy(
+                    update={"graph_relation_ids": self._normalize_aliases([*instance.graph_relation_ids, relation_id])},
+                    deep=True,
+                )
+                self._semantic_instances_by_id[updated.instance_id] = updated
             self._semantic_instance_history.append(updated)
             self._write_semantic_instance_state(updated)
             self._repository.upsert_semantic_instance(updated)
@@ -7029,9 +7062,33 @@ class MemoryService:
         return best_node_id
 
     def _get_current_pose(self) -> Optional[Pose]:
-        snapshot = self._get_or_refresh_localization(allow_missing=True)
+        # 05-P0-1：ingest 主链经此取 pose，探索期定位会话 current_pose 恒 None 会致入库跳过；
+        # prefer_live=True 让其在 live provider 就绪时用实时位姿补齐（provider 为 None 时行为不变）。
+        snapshot = self._get_or_refresh_localization(allow_missing=True, prefer_live=True)
         if snapshot is not None and snapshot.current_pose is not None:
             return snapshot.current_pose
+        return None
+
+    def _read_live_pose(self) -> Optional[Pose]:
+        """从实时位姿门面取探索期实时位姿（鸭子类型，与 PerceptionService._read_live_pose 同源）。
+
+        优先 get_exploration_pose()（探索建图时导航后端 map→base 实时 TF），回退
+        get_current_pose()（定位会话后端，仅重定位就绪后有值）。任一失败返回 None，禁兜底假位姿。
+        """
+
+        provider = self._live_pose_provider
+        if provider is None:
+            return None
+        for getter_name in ("get_exploration_pose", "get_current_pose"):
+            getter = getattr(provider, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                candidate = getter()
+            except Exception:
+                continue
+            if isinstance(candidate, Pose):
+                return candidate
         return None
 
     def _get_or_refresh_localization(
@@ -7041,6 +7098,20 @@ class MemoryService:
         prefer_live: bool = False,
     ):
         snapshot = self._localization_service.get_latest_snapshot()
+        # 05-P0-1：探索期重定位未就绪时定位会话 current_pose 恒 None，导致 memory 入库被跳过。
+        # prefer_live=True 且 live provider 可用时，用实时位姿补齐快照的 current_pose。
+        if prefer_live and self._live_pose_provider is not None:
+            live_pose = self._read_live_pose()
+            if live_pose is not None:
+                if snapshot is not None:
+                    if snapshot.current_pose is None:
+                        return snapshot.model_copy(update={"current_pose": live_pose}, deep=True)
+                    return snapshot
+                return LocalizationSnapshot(
+                    source_name="memory_live_pose_provider",
+                    current_pose=live_pose,
+                    metadata={"pose_source": "live_pose_provider"},
+                )
         if snapshot is not None:
             return snapshot
         if allow_missing:
@@ -7230,27 +7301,32 @@ class MemoryService:
         if verified and legacy_candidate is not None:
             observation_ids = self._normalize_aliases(observation_event_ids)
             if legacy_candidate.record_kind == MemoryRecordKind.OBJECT_INSTANCE:
-                instance = self._semantic_instances_by_id.get(legacy_candidate.record_id)
-                if instance is not None:
-                    updated_instance = instance.model_copy(
-                        update={
-                            "confidence": self._clamp_score(max(instance.confidence, verification.score if verification is not None else instance.confidence)),
-                            "observation_count": instance.observation_count + 1,
-                            "last_seen_ts": utc_now(),
-                            "supporting_observation_event_ids": self._normalize_aliases([*instance.supporting_observation_event_ids, *observation_ids]),
-                            "metadata": self._attach_library_metadata(
-                                {
-                                    **dict(instance.metadata),
-                                    "last_navigation_verified_at": utc_now().isoformat(),
-                                    "last_navigation_candidate_id": candidate_id,
-                                    "last_navigation_trajectory_event_ids": trajectory_event_ids,
-                                    "last_navigation_verification_policy": dict(verification_policy or {}),
-                                }
-                            ),
-                        },
-                        deep=True,
-                    )
-                    self._semantic_instances_by_id[updated_instance.instance_id] = updated_instance
+                # P0-3：读改写必须整体持锁，与精化 worker 写回串行；I/O 留在锁外。
+                with self._instances_lock:
+                    instance = self._semantic_instances_by_id.get(legacy_candidate.record_id)
+                    if instance is not None:
+                        updated_instance = instance.model_copy(
+                            update={
+                                "confidence": self._clamp_score(max(instance.confidence, verification.score if verification is not None else instance.confidence)),
+                                "observation_count": instance.observation_count + 1,
+                                "last_seen_ts": utc_now(),
+                                "supporting_observation_event_ids": self._normalize_aliases([*instance.supporting_observation_event_ids, *observation_ids]),
+                                "metadata": self._attach_library_metadata(
+                                    {
+                                        **dict(instance.metadata),
+                                        "last_navigation_verified_at": utc_now().isoformat(),
+                                        "last_navigation_candidate_id": candidate_id,
+                                        "last_navigation_trajectory_event_ids": trajectory_event_ids,
+                                        "last_navigation_verification_policy": dict(verification_policy or {}),
+                                    }
+                                ),
+                            },
+                            deep=True,
+                        )
+                        self._semantic_instances_by_id[updated_instance.instance_id] = updated_instance
+                    else:
+                        updated_instance = None
+                if updated_instance is not None:
                     self._semantic_instance_history.append(updated_instance)
                     self._write_semantic_instance_state(updated_instance)
                     self._repository.upsert_semantic_instance(updated_instance)

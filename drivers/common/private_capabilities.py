@@ -21,6 +21,7 @@ class PrivateCapabilitySpec:
     timeout_sec: Optional[int] = None
     cancel_supported: bool = False
     tags: Tuple[str, ...] = ()
-
-
-PLATFORM_COMMON_PRIVATE_CAPABILITY_SPECS: tuple[PrivateCapabilitySpec, ...] = ()
+    # 通用分发约定：网关无专用 handler 时，按 dispatch 方式把本能力转发到机器人入口。
+    # action_name 缺省取 name；dispatch 当前仅支持 "execute_action"（调 robot.execute_action）。
+    action_name: Optional[str] = None
+    dispatch: str = "execute_action"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
+from functools import partial
 import logging
 import math
 import os
@@ -23,6 +24,7 @@ from contracts.capabilities import (
 from contracts.base import MetadataDict
 from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from contracts.frame_semantics import frame_ids_semantically_equal
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.geometry import Pose, Quaternion, Twist, Vector3
 from contracts.memory import MemoryPayloadFilter
 from contracts.spatial_memory import SceneSpaceReviewStatus
@@ -37,6 +39,7 @@ from drivers.common import (
     ObstacleAvoidanceControlDataPlane,
     RobotAssemblyBase,
 )
+from drivers.common.private_capabilities import PrivateCapabilitySpec
 from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
 from gateways.request_context import categorize_gateway_error
@@ -52,15 +55,24 @@ from services.geometry import (
     UnsupportedPointCloudMapError,
 )
 from services.localization import LocalizationService
-from services.mapping import MappingService, MapWorkspaceService
+from services.mapping import MappingService
+from skills.map_workspace import MapWorkspaceService
 from services.memory import MemoryService
 from services.navigation import NavigationService
 from services.observation_service import ObservationService
 from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
 from services.robot_state_service import RobotStateService
 from skills import SkillRegistry
-from logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event, set_correlation_context, clear_correlation_context, StreamBusLogHandler, DropPatternLogFilter
-from settings import NuwaxRobotBridgeConfig
+from skills.common import params as skill_params
+from skills.common.context import SkillContext
+from skills.handlers import system_skills
+from skills.handlers import localization_skills
+from skills.handlers import memory_skills
+from skills.handlers import motion_skills
+from skills.handlers import audio_skills
+from skills.handlers import perception_skills
+from core.logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event, set_correlation_context, clear_correlation_context, StreamBusLogHandler, DropPatternLogFilter
+from core.settings import NuwaxRobotBridgeConfig
 
 
 class _ShmVideoFrameSource:
@@ -71,7 +83,7 @@ class _ShmVideoFrameSource:
     同一只读 mmap，互不冲突。来源: dev 分支 gateways/runtime.py。
     """
 
-    def __init__(self, shm_path: str, camera_info_provider=None) -> None:
+    def __init__(self, shm_path: str, camera_info_provider=None, fallback_frame_id: str = "world/robot/camera_front") -> None:
         self._shm_path = shm_path
         self._reader = None
         self._last_frame = None
@@ -79,6 +91,9 @@ class _ShmVideoFrameSource:
         # 平台侧零 import driver：经鸭子类型持有提供 get_camera_info() 的 provider
         # （通常是 robot.providers）。用于给 SHM 帧注入真实内参与分辨率，消除硬编码旁路。
         self._camera_info_provider = camera_info_provider
+        # 内参不可用时的 frame_id 回退：由实例化点从 robot.defaults.frame_ids 注入，
+        # 平台侧不再硬编码任何具体机器人的坐标系命名。
+        self._fallback_frame_id = str(fallback_frame_id)
         self._camera_info_cache = None
         self._ensure_open()
 
@@ -138,7 +153,7 @@ class _ShmVideoFrameSource:
             else:
                 width_px = 1920
                 height_px = 1080
-                frame_id = "go2/front_camera"
+                frame_id = self._fallback_frame_id
             metadata = {
                 "source_kind": "platform_video_ingest_stream",
                 "ingest_sequence": _seq,
@@ -398,6 +413,7 @@ class GatewayRuntime:
         self.perception_service = PerceptionService(
             provider_owner=robot,
             localization_provider_owner=self.platform_geometry_runtime,
+            live_pose_provider=getattr(self.platform_geometry_runtime, "providers", None),
             artifact_service=self.artifact_service,
             state_store=self.state_store,
             detector_pipeline=perception_components["detector_pipeline"],
@@ -410,6 +426,9 @@ class GatewayRuntime:
             video_frame_source=_ShmVideoFrameSource(
                 os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm"),
                 camera_info_provider=getattr(robot, "providers", None),
+                fallback_frame_id=robot.defaults.frame_ids.get(
+                    "camera_front", f"world/{robot.manifest.robot_name}/camera_front"
+                ),
             ),
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),
@@ -446,6 +465,7 @@ class GatewayRuntime:
             mapping_service=self.mapping_service,
             observation_service=self.observation_service,
             perception_service=self.perception_service,
+            live_pose_provider=getattr(self.platform_geometry_runtime, "providers", None),
             state_store=self.state_store,
             event_bus=self.event_bus,
             artifact_store=self.artifact_store,
@@ -481,6 +501,36 @@ class GatewayRuntime:
             state_store=self.state_store,
             event_bus=self.event_bus,
             auto_create_library=config.runtime_data.map_auto_create_library,
+        )
+        # P2-4 批0：组合根构造 SkillContext，供后续批 handler 下放共用。
+        # 本批仅就位备用，不改 handlers dict 指向。serialize 以可调用注入（设计文档 §3.1 选项 A）。
+        self._skill_ctx = SkillContext(
+            capability_registry=self.capability_registry,
+            robot=self.robot,
+            robot_state_service=self.robot_state_service,
+            observation_service=self.observation_service,
+            perception_service=self.perception_service,
+            mapping_service=self.mapping_service,
+            localization_service=self.localization_service,
+            memory_service=self.memory_service,
+            navigation_service=self.navigation_service,
+            map_workspace_service=self.map_workspace_service,
+            perception_video_runtime=self.perception_video_runtime,
+            audio_service=self.audio_service,
+            safety_guard=self.safety_guard,
+            task_manager=self.task_manager,
+            state_store=self.state_store,
+            event_bus=self.event_bus,
+            serialize=self._serialize,
+            serialize_lightweight=self._serialize_lightweight,
+            ensure_geometry_runtime_for_capability=self._ensure_geometry_runtime_for_capability,
+            ensure_geometry_runtime_started=self._ensure_geometry_runtime_started,
+            refresh_workspace_snapshots=self._refresh_workspace_snapshots,
+            publish_pointcloud_map_stream_frame=self._publish_pointcloud_map_stream_frame,
+            publish_runtime_governance_stream_frame=self._publish_runtime_governance_stream_frame,
+            sync_perception_runtime_for_memory_state=self._sync_perception_runtime_for_memory_state,
+            map_delete_also_delete_library=lambda: self.config.runtime_data.map_delete_also_delete_library,
+            geometry_stack_summary=self._geometry_stack_summary,
         )
         self._lock = threading.RLock()
         self._started = False
@@ -916,12 +966,12 @@ class GatewayRuntime:
         try:
             source_summary = self.platform_geometry_runtime.get_live_pointcloud_map_asset_summary()
         except Exception:  # noqa: BLE001 - 不让精化拉取拖垮调用方
-            logger.debug("累积点云资产摘要获取失败", exc_info=True)
+            RUNTIME_LOGGER.debug("累积点云资产摘要获取失败", exc_info=True)
             return None
         pcd_path = source_summary.get("pcd_path") or source_summary.get("path")
         if not pcd_path or not bool(source_summary.get("available")):
             return None
-        frame_id = str(source_summary.get("frame_id") or self.config.geometry.frames.map_frame or "map")
+        frame_id = str(source_summary.get("frame_id") or self.config.geometry.frames.map_frame)
         source_kind = str(source_summary.get("source_kind") or "configured_pcd_root")
         try:
             pointcloud_map = self._pointcloud_map_cache.load_pcd(
@@ -932,14 +982,14 @@ class GatewayRuntime:
         except (PointCloudMapError, UnsupportedPointCloudMapError):
             return None
         except Exception:  # noqa: BLE001
-            logger.debug("累积点云加载失败", exc_info=True)
+            RUNTIME_LOGGER.debug("累积点云加载失败", exc_info=True)
             return None
         return getattr(pointcloud_map, "points_xyz", None)
 
     def _publish_pointcloud_map_stream_frame(self, *, reason: str = "manual_refresh") -> None:
         source_summary = self.platform_geometry_runtime.get_live_pointcloud_map_asset_summary()
         pcd_path = source_summary.get("pcd_path") or source_summary.get("path")
-        frame_id = str(source_summary.get("frame_id") or self.config.geometry.frames.map_frame or "map")
+        frame_id = str(source_summary.get("frame_id") or self.config.geometry.frames.map_frame)
         source_kind = str(source_summary.get("source_kind") or "configured_pcd_root")
         if not pcd_path or not bool(source_summary.get("available")):
             self._publish_pointcloud_map_diagnostic(
@@ -1483,7 +1533,7 @@ class GatewayRuntime:
                 "删除地图",
                 "按名称删除地图资产，并按需删除同名记忆库。",
                 execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.LOW,
+                risk_level=CapabilityRiskLevel.HIGH,
                 input_schema=_schema_object(
                     {
                         "map_name": {"type": "string"},
@@ -1663,7 +1713,7 @@ class GatewayRuntime:
                 "删除记忆库",
                 "按名称删除命名记忆库及其历史记录；若当前激活的正是该库，则会一并停用。",
                 execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.LOW,
+                risk_level=CapabilityRiskLevel.HIGH,
                 input_schema=_schema_object(
                     {
                         "library_name": {"type": "string"},
@@ -2112,52 +2162,53 @@ class GatewayRuntime:
         )
 
         handlers = {
-            "get_robot_status": self._handle_get_robot_status,
+            "get_robot_status": partial(system_skills.handle_get_robot_status, self._skill_ctx),
             "get_active_tasks": self._handle_get_active_tasks,
             "list_capabilities": self._handle_list_capabilities,
             "get_task_status": self._handle_get_task_status,
             "cancel_task": self._handle_cancel_task,
-            "stop_all_motion": self._handle_stop_all_motion,
-            "capture_image": self._handle_capture_image,
-            "get_joint_state": self._handle_get_joint_state,
-            "get_imu_state": self._handle_get_imu_state,
-            "get_latest_observation": self._handle_get_latest_observation,
-            "perceive_current_scene": self._handle_perceive_current_scene,
-            "describe_current_scene": self._handle_describe_current_scene,
-            "get_latest_perception": self._handle_get_latest_perception,
-            "get_perception_runtime_status": self._handle_get_perception_runtime_status,
+            "stop_all_motion": partial(system_skills.handle_stop_all_motion, self._skill_ctx),
+            "capture_image": partial(perception_skills.handle_capture_image, self._skill_ctx),
+            "get_joint_state": partial(perception_skills.handle_get_joint_state, self._skill_ctx),
+            "get_imu_state": partial(perception_skills.handle_get_imu_state, self._skill_ctx),
+            "get_latest_observation": partial(perception_skills.handle_get_latest_observation, self._skill_ctx),
+            "perceive_current_scene": partial(perception_skills.handle_perceive_current_scene, self._skill_ctx),
+            "describe_current_scene": partial(perception_skills.handle_describe_current_scene, self._skill_ctx),
+            "get_latest_perception": partial(perception_skills.handle_get_latest_perception, self._skill_ctx),
+            "get_perception_runtime_status": partial(perception_skills.handle_get_perception_runtime_status, self._skill_ctx),
             "start_perception_runtime": self._handle_start_perception_runtime,
             "stop_perception_runtime": self._handle_stop_perception_runtime,
-            "get_localization_snapshot": self._handle_get_localization_snapshot,
-            "get_localization_session": self._handle_get_localization_session,
-            "relocalize_active_map": self._handle_relocalize_active_map,
-            "get_map_snapshot": self._handle_get_map_snapshot,
-            "get_navigation_snapshot": self._handle_get_navigation_snapshot,
-            "get_navigation_semantic_context": self._handle_get_navigation_semantic_context,
-            "resolve_navigation_candidates": self._handle_resolve_navigation_candidates,
-            "list_maps": self._handle_list_maps,
-            "create_map": self._handle_create_map,
-            "activate_map": self._handle_activate_map,
-            "delete_map": self._handle_delete_map,
-            "get_active_map": self._handle_get_active_map,
-            "list_map_versions": self._handle_list_map_versions,
-            "save_active_map_version": self._handle_save_active_map_version,
+            "get_localization_snapshot": partial(localization_skills.handle_get_localization_snapshot, self._skill_ctx),
+            "get_localization_session": partial(localization_skills.handle_get_localization_session, self._skill_ctx),
+            "relocalize_active_map": partial(localization_skills.handle_relocalize_active_map, self._skill_ctx),
+            "get_map_snapshot": partial(localization_skills.handle_get_map_snapshot, self._skill_ctx),
+            "get_navigation_snapshot": partial(localization_skills.handle_get_navigation_snapshot, self._skill_ctx),
+            "get_navigation_semantic_context": partial(localization_skills.handle_get_navigation_semantic_context, self._skill_ctx),
+            "resolve_navigation_candidates": partial(localization_skills.handle_resolve_navigation_candidates, self._skill_ctx),
+            "list_maps": partial(localization_skills.handle_list_maps, self._skill_ctx),
+            "create_map": partial(localization_skills.handle_create_map, self._skill_ctx),
+            "activate_map": partial(localization_skills.handle_activate_map, self._skill_ctx),
+            "delete_map": partial(localization_skills.handle_delete_map, self._skill_ctx),
+            "get_active_map": partial(localization_skills.handle_get_active_map, self._skill_ctx),
+            "list_map_versions": partial(localization_skills.handle_list_map_versions, self._skill_ctx),
+            "save_active_map_version": partial(localization_skills.handle_save_active_map_version, self._skill_ctx),
+            # RTAB 新增建图能力（skills 未下放），保留 runtime 方法派发：
             "start_mapping": self._handle_start_mapping,
             "stop_mapping": self._handle_stop_mapping,
-            "load_map_version": self._handle_load_map_version,
-            "list_memory_libraries": self._handle_list_memory_libraries,
-            "create_memory_library": self._handle_create_memory_library,
-            "enable_memory_library": self._handle_enable_memory_library,
-            "disable_memory_library": self._handle_disable_memory_library,
-            "delete_memory_library": self._handle_delete_memory_library,
-            "tag_location": self._handle_tag_location,
-            "query_location": self._handle_query_location,
-            "query_semantic_memory": self._handle_query_semantic_memory,
-            "list_scene_spaces": self._handle_list_scene_spaces,
-            "get_scene_space": self._handle_get_scene_space,
-            "query_scene_spaces": self._handle_query_scene_spaces,
-            "review_scene_space": self._handle_review_scene_space,
-            "remember_current_scene": self._handle_remember_current_scene,
+            "load_map_version": partial(localization_skills.handle_load_map_version, self._skill_ctx),
+            "list_memory_libraries": partial(memory_skills.handle_list_memory_libraries, self._skill_ctx),
+            "create_memory_library": partial(memory_skills.handle_create_memory_library, self._skill_ctx),
+            "enable_memory_library": partial(memory_skills.handle_enable_memory_library, self._skill_ctx),
+            "disable_memory_library": partial(memory_skills.handle_disable_memory_library, self._skill_ctx),
+            "delete_memory_library": partial(memory_skills.handle_delete_memory_library, self._skill_ctx),
+            "tag_location": partial(memory_skills.handle_tag_location, self._skill_ctx),
+            "query_location": partial(memory_skills.handle_query_location, self._skill_ctx),
+            "query_semantic_memory": partial(memory_skills.handle_query_semantic_memory, self._skill_ctx),
+            "list_scene_spaces": partial(memory_skills.handle_list_scene_spaces, self._skill_ctx),
+            "get_scene_space": partial(memory_skills.handle_get_scene_space, self._skill_ctx),
+            "query_scene_spaces": partial(memory_skills.handle_query_scene_spaces, self._skill_ctx),
+            "review_scene_space": partial(memory_skills.handle_review_scene_space, self._skill_ctx),
+            "remember_current_scene": partial(memory_skills.handle_remember_current_scene, self._skill_ctx),
             "navigate_to_pose": self._handle_navigate_to_pose,
             "navigate_to_named_location": self._handle_navigate_to_named_location,
             "find_target": self._handle_find_target,
@@ -2166,20 +2217,26 @@ class GatewayRuntime:
             "inspect_target": self._handle_inspect_target,
             "follow_target": self._handle_follow_target,
             "relative_move": self._handle_relative_move,
-            "execute_sport_command": self._handle_execute_sport_command,
-            "set_body_pose": self._handle_set_body_pose,
-            "set_speed_level": self._handle_set_speed_level,
-            "get_volume": self._handle_get_volume,
-            "set_volume": self._handle_set_volume,
+            "execute_sport_command": partial(motion_skills.handle_execute_sport_command, self._skill_ctx),
+            "set_body_pose": partial(motion_skills.handle_set_body_pose, self._skill_ctx),
+            "set_speed_level": partial(motion_skills.handle_set_speed_level, self._skill_ctx),
+            "get_volume": partial(audio_skills.handle_get_volume, self._skill_ctx),
+            "set_volume": partial(audio_skills.handle_set_volume, self._skill_ctx),
             "speak_text": self._handle_speak_text,
-            "switch_control_mode": self._handle_switch_control_mode,
-            "set_obstacle_avoidance": self._handle_set_obstacle_avoidance,
+            "switch_control_mode": partial(motion_skills.handle_switch_control_mode, self._skill_ctx),
+            "set_obstacle_avoidance": partial(motion_skills.handle_set_obstacle_avoidance, self._skill_ctx),
         }
 
+        spec_by_name = {spec.name: spec for spec in private_specs}
         for descriptor in capabilities:
+            handler = handlers.get(descriptor.name)
+            if handler is None and descriptor.name in spec_by_name:
+                handler = self._build_private_capability_handler(spec_by_name[descriptor.name])
+            if handler is None:
+                raise GatewayError(f"能力 {descriptor.name} 缺少处理器。")
             self.capability_registry.register(
                 descriptor,
-                handlers[descriptor.name],
+                handler,
                 owner=self._resolve_gateway_capability_owner(
                     descriptor.name,
                     active_private_names=active_private_names,
@@ -3512,15 +3569,6 @@ class GatewayRuntime:
             },
         }
 
-    def _handle_get_robot_status(self, _: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        snapshot = self.robot_state_service.get_latest_snapshot()
-        if snapshot is None:
-            raise GatewayError("当前还没有可用的机器人状态流帧。")
-        payload = snapshot.model_dump(mode="json")
-        payload["perception_runtime"] = self._serialize(self.perception_video_runtime.get_status())
-        return payload
-
     def _handle_get_active_tasks(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         del requested_by
         history_limit = int(arguments.get("history_limit", 20))
@@ -3557,104 +3605,6 @@ class GatewayRuntime:
             "cancelled": cancelled,
             "task": self.get_task_snapshot(task_id),
         }
-
-    def _handle_stop_all_motion(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        reason = arguments.get("reason") or f"{requested_by or 'unknown'} 请求安全停止。"
-        self.safety_guard.stop_all_motion(reason)
-        return {"stopped": True, "reason": reason}
-
-    def _handle_capture_image(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        camera_id = arguments.get("camera_id")
-        context = self.observation_service.capture_observation(
-            camera_id=camera_id,
-            requested_by=requested_by,
-        )
-        artifact = context.image_artifact
-        if artifact is None:
-            raise GatewayError("观察上下文未生成图像制品。")
-        self.event_bus.publish(
-            self.event_bus.build_event(
-                "artifact.created",
-                category=RuntimeEventCategory.PERCEPTION,
-                source="gateway_runtime",
-                subject_id=artifact.artifact_id,
-                message="图像制品已写入宿主机。",
-                payload={"artifact_id": artifact.artifact_id, "camera_id": context.camera_id},
-            )
-        )
-        return {
-            "artifact": artifact,
-            "observation_context": context,
-            "camera_id": context.camera_id,
-            "frame_id": context.observation.frame_id,
-            "encoding": context.observation.metadata.get("encoding"),
-        }
-
-    def _handle_get_joint_state(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        state_provider = self._get_provider(StateProvider, "状态提供器")
-        joints = list(state_provider.get_joint_states())
-        joint_name = str(arguments.get("joint_name", "")).strip()
-        if not joint_name:
-            return {"joints": joints, "joint": None}
-        joint = next((item for item in joints if item.name == joint_name), None)
-        return {"joints": joints, "joint": joint}
-
-    def _handle_get_imu_state(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del arguments, requested_by
-        state_provider = self._get_provider(StateProvider, "状态提供器")
-        return {"imu_state": state_provider.get_imu_state()}
-
-    def _handle_get_latest_observation(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        camera_id = arguments.get("camera_id")
-        context = self.observation_service.get_latest_observation(camera_id)
-        if context is None:
-            raise GatewayError("当前还没有可用的观察缓存。")
-        return {"observation_context": context}
-
-    def _handle_perceive_current_scene(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        camera_id = arguments.get("camera_id")
-        detector_backend = arguments.get("detector_backend")
-        context = self.perception_service.perceive_current_scene(
-            camera_id=camera_id,
-            requested_by=requested_by,
-            detector_backend_name=detector_backend,
-        )
-        return {"perception_context": context}
-
-    def _handle_describe_current_scene(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        camera_id = arguments.get("camera_id")
-        detector_backend = arguments.get("detector_backend")
-        refresh = bool(arguments.get("refresh", True))
-        context = self.perception_service.describe_current_scene(
-            camera_id=camera_id,
-            refresh=refresh,
-            requested_by=requested_by,
-            detector_backend_name=detector_backend,
-        )
-        return {
-            "summary": context.scene_summary.headline,
-            "scene_summary": context.scene_summary,
-            "perception_context": context,
-        }
-
-    def _handle_get_latest_perception(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        camera_id = arguments.get("camera_id")
-        context = self.perception_service.get_latest_perception(camera_id)
-        if context is None:
-            raise GatewayError("当前还没有可用的感知缓存。")
-        return {"perception_context": context}
-
-    def _handle_get_perception_runtime_status(
-        self,
-        _: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        return {"perception_runtime": self.perception_video_runtime.get_status()}
 
     def _manual_perception_start(self) -> Dict[str, Any]:
         """用户显式启动感知：解除探索耦合后启动。capability + HTTP 均走此入口。"""
@@ -3706,218 +3656,6 @@ class GatewayRuntime:
         except Exception:
             RUNTIME_LOGGER.warning("探索联动停止感知线程失败，忽略继续。", exc_info=True)
 
-    def _handle_get_localization_snapshot(
-        self,
-        _: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        snapshot = self.localization_service.get_latest_snapshot()
-        if snapshot is None:
-            raise GatewayError("当前还没有可用的定位流帧。")
-        return {
-            "localization_snapshot": snapshot,
-            "localization_session": self.map_workspace_service.get_active_localization_session(),
-        }
-
-    def _handle_get_localization_session(
-        self,
-        _: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        return {
-            "localization_session": self.map_workspace_service.get_active_localization_session(),
-            "active_workspace": self.map_workspace_service.get_active_workspace(),
-        }
-
-    def _handle_relocalize_active_map(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        self._ensure_geometry_runtime_for_capability("relocalize_active_map")
-        localization_session, active_workspace = self.map_workspace_service.relocalize_active_map(
-            map_name=str(arguments.get("map_name", "")).strip() or None,
-            metadata={"requested_by": requested_by or "unknown", "source": "relocalize_active_map"},
-        )
-        return {
-            "localization_session": localization_session,
-            "localization_snapshot": self.localization_service.get_latest_snapshot(),
-            "active_workspace": active_workspace,
-        }
-
-    def _handle_get_map_snapshot(self, _: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        snapshot = self.mapping_service.get_latest_snapshot()
-        if snapshot is None:
-            raise GatewayError("当前还没有可用的地图流帧。")
-        return {"map_snapshot": snapshot}
-
-    def _handle_get_navigation_snapshot(
-        self,
-        _: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        navigation_context = self.navigation_service.get_latest_navigation_context()
-        exploration_context = self.navigation_service.get_latest_exploration_context()
-
-        if navigation_context is None and exploration_context is None:
-            raise GatewayError("当前还没有可用的导航或探索流帧。")
-        return {
-            "navigation_context": navigation_context,
-            "exploration_context": exploration_context,
-        }
-
-    def _handle_get_navigation_semantic_context(
-        self,
-        _: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        active_workspace = self.map_workspace_service.get_active_workspace()
-        return {
-            "navigation_semantic_context": self.memory_service.get_navigation_semantic_context(
-                map_name=active_workspace.active_map_name if active_workspace is not None else None,
-            )
-        }
-
-    def _handle_resolve_navigation_candidates(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        query = self._require_str(arguments, "query")
-        return {
-            "navigation_candidates": self.memory_service.resolve_navigation_candidates(
-                query,
-                camera_id=self._optional_str(arguments, "camera_id"),
-                similarity_threshold=self._float(arguments, "similarity_threshold", 0.25),
-                max_age_sec=self._float(arguments, "max_age_sec", 0.0) or None,
-                map_version_id=self._optional_str(arguments, "map_version_id"),
-                localization_session_id=self._optional_str(arguments, "localization_session_id"),
-                limit=max(1, self._int(arguments, "limit", 5)),
-            )
-        }
-
-    def _handle_list_memory_libraries(
-        self,
-        _: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        return {
-            "libraries": self.memory_service.list_memory_libraries(),
-            "memory_summary": self.memory_service.get_summary(),
-        }
-
-    def _handle_list_maps(
-        self,
-        _: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        return {
-            "maps": self.map_workspace_service.list_maps(),
-            "active_workspace": self.map_workspace_service.get_active_workspace(),
-        }
-
-    def _handle_create_map(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        map_name = self._require_str(arguments, "map_name")
-        map_asset = self.map_workspace_service.create_map(
-            map_name=map_name,
-            metadata={"requested_by": requested_by or "unknown"},
-        )
-        active_workspace = self.map_workspace_service.get_active_workspace()
-        return {
-            "map_asset": map_asset,
-            "maps_count": len(self.map_workspace_service.list_maps()),
-            "active_workspace": active_workspace,
-        }
-
-    def _handle_activate_map(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        map_name = self._require_str(arguments, "map_name")
-        self._ensure_geometry_runtime_started("activate_map")
-        exploration_context = self.navigation_service.get_latest_exploration_context()
-        exploration_status = getattr(getattr(exploration_context, "exploration_state", None), "status", None)
-        if getattr(exploration_status, "value", exploration_status) in {"accepted", "running"}:
-            try:
-                self.navigation_service.stop_exploration()
-            except Exception:
-                RUNTIME_LOGGER.debug("activate_map 前 stop_exploration 忽略异常", exc_info=True)
-        active_workspace = self.map_workspace_service.activate_map(
-            map_name=map_name,
-            create_if_missing=False,
-            load_memory_history=bool(arguments.get("load_memory_history", True)),
-            reset_memory_library=bool(arguments.get("reset_memory_library", False)),
-            metadata={"requested_by": requested_by or "unknown"},
-        )
-        has_platform_map_version = bool(
-            active_workspace is not None
-            and active_workspace.map_asset is not None
-            and active_workspace.map_asset.latest_version_id
-        )
-        if has_platform_map_version:
-            self._refresh_workspace_snapshots(refresh_localization=False)
-            self._publish_pointcloud_map_stream_frame(reason="activate_map")
-            self._publish_runtime_governance_stream_frame()
-        else:
-            self._refresh_workspace_snapshots(refresh_localization=False)
-        self._sync_perception_runtime_for_memory_state(enabled=True)
-        active_workspace = self.map_workspace_service.get_active_workspace(refresh_localization=False) or active_workspace
-        geometry_stack = self._geometry_stack_summary()
-        return {
-            "active_workspace": active_workspace,
-            "memory_summary": self.memory_service.get_summary(),
-            "geometry_stack": geometry_stack,
-            "next_step_hint": geometry_stack.get("agent_guidance"),
-        }
-
-    def _handle_delete_map(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        map_name = self._require_str(arguments, "map_name")
-        delete_result = self.map_workspace_service.delete_map(
-            map_name=map_name,
-            delete_memory_library=bool(
-                arguments.get(
-                    "delete_memory_library",
-                    self.config.runtime_data.map_delete_also_delete_library,
-                )
-            ),
-        )
-        if bool(delete_result.get("was_active")):
-            self._sync_perception_runtime_for_memory_state(enabled=False)
-        return {
-            "delete_result": delete_result,
-            "maps": self.map_workspace_service.list_maps(),
-            "active_workspace": self.map_workspace_service.get_active_workspace(),
-        }
-
     def _geometry_stack_summary(self) -> Dict[str, Any]:
         reader = getattr(self.platform_geometry_runtime, "get_geometry_stack_status", None)
         if not callable(reader):
@@ -3927,49 +3665,6 @@ class GatewayRuntime:
         except Exception:
             RUNTIME_LOGGER.debug("读取 geometry_stack 状态失败。", exc_info=True)
             return {}
-
-    def _handle_get_active_map(
-        self,
-        _: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        return {
-            "active_workspace": self.map_workspace_service.get_active_workspace(),
-            "geometry_stack": self._geometry_stack_summary(),
-        }
-
-    def _handle_list_map_versions(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        map_name = self._require_str(arguments, "map_name")
-        return {
-            "map_versions": self.map_workspace_service.list_map_versions(
-                map_name=map_name,
-                limit=self._int(arguments, "limit", 20),
-            )
-        }
-
-    def _handle_save_active_map_version(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        map_version = self.map_workspace_service.save_map_version(
-            map_name=str(arguments.get("map_name", "")).strip() or None,
-            reason=str(arguments.get("reason", "")).strip(),
-            metadata={"requested_by": requested_by or "unknown"},
-        )
-        return {
-            "map_version": map_version,
-            "active_workspace": self.map_workspace_service.get_active_workspace(),
-        }
 
     def _handle_start_mapping(
         self,
@@ -4012,302 +3707,6 @@ class GatewayRuntime:
             raise GatewayError(str(exc), error_code="stop_mapping_failed", http_status=503) from exc
         self.navigation_service.refresh_exploration()
         return result
-
-    def _handle_load_map_version(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        map_name = self._require_str(arguments, "map_name")
-        map_version, workspace = self.map_workspace_service.load_map_version(
-            map_name=map_name,
-            version_id=str(arguments.get("version_id", "")).strip() or None,
-            activate_if_needed=True,
-            load_memory_history=bool(arguments.get("load_memory_history", True)),
-            reset_memory_library=bool(arguments.get("reset_memory_library", False)),
-            metadata={"requested_by": requested_by or "unknown", "source": "load_map_version"},
-        )
-        self._refresh_workspace_snapshots(refresh_localization=False)
-        self._publish_pointcloud_map_stream_frame(reason="load_map_version")
-        self._publish_runtime_governance_stream_frame()
-        return {
-            "map_version": map_version,
-            "active_workspace": workspace,
-        }
-
-    def _handle_create_memory_library(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        library_name = self._require_str(arguments, "library_name")
-        create_result = self.memory_service.create_memory_library(library_name=library_name)
-        return {
-            "create_result": create_result,
-            "libraries": self.memory_service.list_memory_libraries(),
-            "memory_summary": self.memory_service.get_summary(),
-        }
-
-    def _handle_enable_memory_library(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        library_name = self._require_str(arguments, "library_name")
-        map_asset = self.map_workspace_service.get_map(library_name)
-        active_workspace = None
-        compatibility_mode = "memory_library_only"
-        if map_asset is not None:
-            active_workspace = self.map_workspace_service.activate_map(
-                map_name=library_name,
-                create_if_missing=False,
-                load_memory_history=bool(arguments.get("load_history", True)),
-                reset_memory_library=bool(arguments.get("reset_library", False)),
-                metadata={"requested_by": requested_by or "unknown", "source": "enable_memory_library"},
-            )
-            compatibility_mode = "map_workspace"
-        else:
-            self.memory_service.activate_memory_library(
-                library_name=library_name,
-                load_history=bool(arguments.get("load_history", True)),
-                reset_library=bool(arguments.get("reset_library", False)),
-        )
-        if compatibility_mode == "map_workspace" and active_workspace is not None:
-            self._refresh_workspace_snapshots()
-        self._sync_perception_runtime_for_memory_state(enabled=True)
-        return {
-            "compatibility_mode": compatibility_mode,
-            "active_workspace": active_workspace or self.map_workspace_service.get_active_workspace(),
-            "maps": self.map_workspace_service.list_maps(),
-            "libraries": self.memory_service.list_memory_libraries(),
-            "memory_summary": self.memory_service.get_summary(),
-        }
-
-    def _handle_disable_memory_library(
-        self,
-        _: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        active_workspace = self.map_workspace_service.get_active_workspace()
-        self.memory_service.disable_memory_library()
-        if active_workspace is not None and active_workspace.active_map_name == active_workspace.active_memory_library_name:
-            self.map_workspace_service.clear_active_map(disable_memory_library=False)
-        self._sync_perception_runtime_for_memory_state(enabled=False)
-        return {
-            "active_workspace": self.map_workspace_service.get_active_workspace(),
-            "maps": self.map_workspace_service.list_maps(),
-            "libraries": self.memory_service.list_memory_libraries(),
-            "memory_summary": self.memory_service.get_summary(),
-        }
-
-    def _handle_delete_memory_library(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        library_name = self._require_str(arguments, "library_name")
-        active_workspace = self.map_workspace_service.get_active_workspace()
-        delete_result = self.memory_service.delete_memory_library(library_name=library_name)
-        if active_workspace is not None and active_workspace.active_map_name == library_name:
-            self.map_workspace_service.clear_active_map(disable_memory_library=False)
-        if bool(delete_result.get("was_active")):
-            self._sync_perception_runtime_for_memory_state(enabled=False)
-        return {
-            "delete_result": delete_result,
-            "active_workspace": self.map_workspace_service.get_active_workspace(),
-            "maps": self.map_workspace_service.list_maps(),
-            "libraries": self.memory_service.list_memory_libraries(),
-            "memory_summary": self.memory_service.get_summary(),
-        }
-
-    def _handle_tag_location(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        name = self._require_str(arguments, "name")
-        aliases = arguments.get("aliases") or []
-        if not isinstance(aliases, list):
-            raise GatewayError(
-                "aliases 必须为数组。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        tagged_location, semantic_memory = self.memory_service.tag_location(
-            name,
-            aliases=aliases,
-            description=str(arguments.get("description", "")).strip() or None,
-            camera_id=str(arguments.get("camera_id", "")).strip() or None,
-            auto_create_memory=bool(arguments.get("auto_create_memory", True)),
-            metadata={"requested_by": requested_by or "unknown"},
-        )
-        return {
-            "tagged_location": tagged_location,
-            "semantic_memory": semantic_memory,
-        }
-
-    def _handle_query_location(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        query = self._require_str(arguments, "query")
-        payload_filter = self._build_memory_payload_filter(arguments)
-        return {
-            "query_result": self.memory_service.query_location(
-                query,
-                similarity_threshold=self._float(arguments, "similarity_threshold", 0.55),
-                limit=self._int(arguments, "limit", 5),
-                payload_filter=payload_filter,
-                max_age_sec=payload_filter.max_age_sec if payload_filter is not None else None,
-                near_pose=payload_filter.near_pose if payload_filter is not None else None,
-                max_distance_m=payload_filter.max_distance_m if payload_filter is not None else None,
-            )
-        }
-
-    def _handle_query_semantic_memory(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        query = self._require_str(arguments, "query")
-        payload_filter = self._build_memory_payload_filter(arguments)
-        return {
-            "query_result": self.memory_service.query_semantic_memory(
-                query,
-                similarity_threshold=self._float(arguments, "similarity_threshold", 0.25),
-                limit=self._int(arguments, "limit", 5),
-                payload_filter=payload_filter,
-                max_age_sec=payload_filter.max_age_sec if payload_filter is not None else None,
-                near_pose=payload_filter.near_pose if payload_filter is not None else None,
-                max_distance_m=payload_filter.max_distance_m if payload_filter is not None else None,
-            )
-        }
-
-    def _handle_list_scene_spaces(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        payload_filter = self._build_memory_payload_filter(arguments)
-        return {
-            "scene_spaces": self.memory_service.list_scene_spaces(
-                limit=max(1, self._int(arguments, "limit", 20)),
-                payload_filter=payload_filter,
-                scene_space_ids=self._scene_space_ids_from_arguments(arguments) or None,
-                map_version_id=self._optional_str(arguments, "map_version_id"),
-                localization_session_id=self._optional_str(arguments, "localization_session_id"),
-                review_statuses=self._review_statuses_from_arguments(arguments) or None,
-            ),
-            "memory_summary": self.memory_service.get_summary(),
-        }
-
-    def _handle_get_scene_space(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        scene_space_id = self._require_str(arguments, "scene_space_id")
-        spaces = self.memory_service.list_scene_spaces(
-            limit=1,
-            scene_space_ids=[scene_space_id],
-        )
-        if not spaces:
-            raise GatewayError(
-                "未找到场景空间：%s" % scene_space_id,
-                error_code="scene_space_not_found",
-                http_status=404,
-                jsonrpc_code=-32004,
-            )
-        return {"scene_space": spaces[0]}
-
-    def _handle_query_scene_spaces(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        del requested_by
-        query = self._require_str(arguments, "query")
-        payload_filter = self._build_memory_payload_filter(arguments)
-        return {
-            "query_result": self.memory_service.query_scene_spaces(
-                query,
-                similarity_threshold=self._float(arguments, "similarity_threshold", 0.25),
-                limit=max(1, self._int(arguments, "limit", 5)),
-                payload_filter=payload_filter,
-                max_age_sec=payload_filter.max_age_sec if payload_filter is not None else None,
-                near_pose=payload_filter.near_pose if payload_filter is not None else None,
-                max_distance_m=payload_filter.max_distance_m if payload_filter is not None else None,
-                include_non_direct_navigation_candidates=bool(
-                    arguments.get("include_non_direct_navigation_candidates", False)
-                ),
-            )
-        }
-
-    def _handle_review_scene_space(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        scene_space_id = self._require_str(arguments, "scene_space_id")
-        human_aliases = arguments.get("human_aliases")
-        if human_aliases is not None and not isinstance(human_aliases, list):
-            raise GatewayError(
-                "human_aliases 必须为数组。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        attributes = arguments.get("attributes")
-        if attributes is not None and not isinstance(attributes, dict):
-            raise GatewayError(
-                "attributes 必须为对象。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        metadata = arguments.get("metadata")
-        if metadata is not None and not isinstance(metadata, dict):
-            raise GatewayError(
-                "metadata 必须为对象。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        return {
-            "scene_space": self.memory_service.review_scene_space(
-                scene_space_id,
-                primary_label=self._optional_str(arguments, "primary_label") if "primary_label" in arguments else None,
-                human_aliases=human_aliases,
-                review_status=self._optional_str(arguments, "review_status"),
-                attributes=attributes,
-                metadata={**dict(metadata or {}), "requested_by": requested_by or "unknown"},
-            )
-        }
-
-    def _handle_remember_current_scene(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        entry = self.memory_service.remember_current_scene(
-            title=str(arguments.get("title", "")).strip() or None,
-            camera_id=str(arguments.get("camera_id", "")).strip() or None,
-            summary_override=str(arguments.get("summary", "")).strip() or None,
-            metadata={"requested_by": requested_by or "unknown"},
-        )
-        return {"semantic_memory": entry}
 
     def dispatch_debug_nav2_goal(
         self,
@@ -4800,6 +4199,7 @@ class GatewayRuntime:
                     search_state=search_state,
                     rejected_record_ids=rejected_record_ids,
                     allow_not_found=False,
+                    timeout_sec=timeout_sec,
                 )
                 result = {
                     "query": query,
@@ -5020,6 +4420,7 @@ class GatewayRuntime:
                     search_state=search_state,
                     rejected_record_ids=rejected_record_ids,
                     allow_not_found=True,
+                    timeout_sec=timeout_sec,
                 )
                 if precheck_navigation is not None:
                     context.update(progress=1.0, stage="completed", message="已根据记忆候选找到目标。")
@@ -5119,6 +4520,7 @@ class GatewayRuntime:
                             search_state=search_state,
                             rejected_record_ids=rejected_record_ids,
                             allow_not_found=True,
+                            timeout_sec=timeout_sec,
                         )
                         if navigation_result is not None:
                             context.update(progress=1.0, stage="completed", message="探索中已找到目标。")
@@ -5196,6 +4598,7 @@ class GatewayRuntime:
                             search_state=final_search_state,
                             rejected_record_ids=rejected_record_ids,
                             allow_not_found=True,
+                            timeout_sec=timeout_sec,
                         )
                         if final_navigation_result is not None:
                             context.update(progress=1.0, stage="completed", message="探索结束后已找到目标。")
@@ -5315,6 +4718,7 @@ class GatewayRuntime:
                 self.navigation_service.navigate_until_complete(
                     goal,
                     poll_interval_sec=max(0.02, poll_interval_sec),
+                    timeout_sec=timeout_sec,
                     on_progress=lambda nav_context: context.update(
                         progress=0.3 + 0.5 * self._estimate_navigation_progress(nav_context),
                         stage=f"inspect_navigation_{nav_context.navigation_state.status.value}",
@@ -5552,75 +4956,35 @@ class GatewayRuntime:
             ),
         )
 
-    def _handle_execute_sport_command(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        if not hasattr(self.robot, "execute_action"):
-            raise GatewayError("当前机器人入口未实现 execute_action。")
-        action = self._require_str(arguments, "action")
-        supported_actions: Tuple[str, ...] = ()
-        if self._resolve_active_robot_namespace() == "go2":
-            from drivers.go2.capabilities import GO2_SPORT_COMMAND_NAMES
+    def _build_private_capability_handler(self, spec: PrivateCapabilitySpec):
+        """为没有专用 handler 的机器人私有能力构造通用处理器。
 
-            supported_actions = tuple(GO2_SPORT_COMMAND_NAMES)
-        if action not in supported_actions:
-            raise GatewayError(
-                "execute_sport_command 当前只支持已公开的 Go2 高层机身动作命令。",
-                error_code="invalid_action",
-                http_status=422,
-                jsonrpc_code=-32602,
-                details={
-                    "action": action,
-                    "supported_actions": list(supported_actions),
-                    "hint": "姿态、速度档位、控制模式和低层关节控制请使用专用工具。",
-                },
-            )
-        params = arguments.get("params") or {}
-        if not isinstance(params, dict):
-            raise GatewayError(
-                "params 必须为对象。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        code, result = self.robot.execute_action(action, params)
-        if code is None:
-            raise GatewayError(str(result or f"动作 {action} 执行失败。"))
-        return {"code": code, "result": result or {}, "action": action}
+        统一把私有能力转发到机器人入口的 execute_action，复用
+        motion_skills.handle_execute_sport_command 的 code/result 错误包装协议。
+        新机器人在自己的 private_capabilities.py 声明能力即可，无需在网关加 handler。
+        """
 
-    def _handle_set_body_pose(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        if not hasattr(self.robot, "execute_action"):
-            raise GatewayError("当前机器人入口未实现 execute_action。")
-        code, result = self.robot.execute_action(
-            "euler",
-            {
-                "roll": self._float(arguments, "roll", 0.0),
-                "pitch": self._float(arguments, "pitch", 0.0),
-                "yaw": self._float(arguments, "yaw", 0.0),
-            },
-        )
-        if code is None:
-            raise GatewayError(str(result or "机身姿态设置失败。"))
-        return {"code": code, "result": result or {}}
+        action_name = spec.action_name or spec.name
+        dispatch = spec.dispatch
 
-    def _handle_set_speed_level(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        if not hasattr(self.robot, "execute_action"):
-            raise GatewayError("当前机器人入口未实现 execute_action。")
-        level = self._int(arguments, "level", 1)
-        code, result = self.robot.execute_action("speed_level", {"level": level})
-        if code is None:
-            raise GatewayError(str(result or "速度档位设置失败。"))
-        return {"code": code, "result": result or {}, "level": level}
+        def handler(arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
+            del requested_by
+            if dispatch != "execute_action":
+                raise GatewayError(
+                    f"私有能力 {spec.name} 的分发方式 {dispatch} 暂不支持。",
+                    error_code="unsupported_dispatch",
+                    http_status=422,
+                    jsonrpc_code=-32601,
+                )
+            if not hasattr(self.robot, "execute_action"):
+                raise GatewayError("当前机器人入口未实现 execute_action。")
+            params = arguments if isinstance(arguments, dict) else {}
+            code, result = self.robot.execute_action(action_name, params)
+            if code is None:
+                raise GatewayError(str(result or f"动作 {action_name} 执行失败。"))
+            return {"code": code, "result": result or {}, "action": action_name}
 
-    def _handle_get_volume(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del arguments, requested_by
-        return {"volume_state": self.audio_service.get_volume_state()}
-
-    def _handle_set_volume(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        volume = self._require_float(arguments, "volume")
-        return {"volume_state": self.audio_service.set_volume(volume)}
+        return handler
 
     def _handle_speak_text(
         self,
@@ -5653,39 +5017,6 @@ class GatewayRuntime:
                 request_context=request_context,
             ),
         )
-
-    def _handle_switch_control_mode(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
-        del requested_by
-        if not hasattr(self.robot, "switch_mode"):
-            raise GatewayError("当前机器人入口未实现 switch_mode。")
-        mode = self._require_str(arguments, "mode")
-        if mode not in {"high", "low"}:
-            raise GatewayError(
-                "mode 仅支持 high 或 low。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        code, result = self.robot.switch_mode(mode)
-        return {"code": code, "result": result or {}, "mode": mode}
-
-    def _handle_set_obstacle_avoidance(
-        self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None
-    ) -> Dict[str, Any]:
-        del requested_by
-        enabled = bool(arguments.get("enabled", True))
-        data_plane = getattr(self.robot, "data_plane", None)
-        if data_plane is None or not isinstance(data_plane, ObstacleAvoidanceControlDataPlane):
-            raise GatewayError("当前机器人入口不支持避障开关控制。")
-        if not data_plane.is_obstacle_avoidance_control_available():
-            raise GatewayError("Go2 官方 obstacles_avoid 服务未就绪，当前不能切换实时避障。")
-        try:
-            result = data_plane.set_obstacle_avoidance_enabled(enabled)
-        except Exception as exc:
-            raise GatewayError(f"设置实时避障失败：{exc}") from exc
-        if isinstance(result, dict):
-            return result
-        return {"obstacle_avoidance_enabled": enabled}
 
     def _is_obstacle_avoidance_control_available(self) -> bool:
         data_plane = getattr(self.robot, "data_plane", None)
@@ -6303,7 +5634,7 @@ class GatewayRuntime:
 
     def _target_navigation_map_frame_ids(self, workspace: Any = None) -> Set[str]:
         configured_map_frame = str(getattr(getattr(self.config.geometry, "frames", None), "map_frame", "") or "").strip()
-        accepted_frames = {"map"}
+        accepted_frames = {DEFAULT_MAP_FRAME}
         if configured_map_frame and not self._target_navigation_frame_is_disallowed(configured_map_frame):
             accepted_frames.add(configured_map_frame)
         if workspace is None:
@@ -6587,14 +5918,7 @@ class GatewayRuntime:
         return max(float(timeout_sec), max(float(value) for value in duration_candidates) + guard_sec)
 
     def _coerce_optional_str_list(self, value: Any) -> List[str]:
-        if value is None or isinstance(value, bool):
-            return []
-        if isinstance(value, str):
-            normalized = value.strip()
-            return [normalized] if normalized else []
-        if isinstance(value, (list, tuple, set, frozenset)):
-            return [str(item).strip() for item in value if str(item or "").strip()]
-        return [str(value).strip()] if str(value).strip() else []
+        return skill_params.coerce_optional_str_list(value)
 
     def _build_target_candidate_diagnostic(
         self,
@@ -7026,6 +6350,7 @@ class GatewayRuntime:
         search_state: Dict[str, Any],
         rejected_record_ids: Set[str],
         allow_not_found: bool,
+        timeout_sec: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         self._ensure_workspace_memory_library_ready(map_name=map_name)
         memory_candidates = list(search_state["memory_candidates"])
@@ -7119,6 +6444,7 @@ class GatewayRuntime:
                 navigation_context = self.navigation_service.navigate_until_complete(
                     goal,
                     poll_interval_sec=max(0.02, poll_interval_sec),
+                    timeout_sec=timeout_sec,
                     on_progress=lambda nav_context: (
                         task_context.ensure_active(),
                         task_context.update(
@@ -7184,6 +6510,7 @@ class GatewayRuntime:
                 navigation_context = self.navigation_service.navigate_until_complete(
                     semantic_goal,
                     poll_interval_sec=max(0.02, poll_interval_sec),
+                    timeout_sec=timeout_sec,
                     on_progress=lambda nav_context: (
                         task_context.ensure_active(),
                         task_context.update(
@@ -8302,18 +7629,10 @@ class GatewayRuntime:
         return max(minimum_sec, selected_timeout)
 
     def _normalize_query(self, value: Optional[str]) -> str:
-        normalized = "".join(
-            char.lower() if char.isalnum() or "\u4e00" <= char <= "\u9fff" else " "
-            for char in str(value or "")
-        )
-        return " ".join(normalized.split())
+        return skill_params.normalize_query(value)
 
     def _optional_str(self, payload: Dict[str, Any], key: str) -> Optional[str]:
-        value = payload.get(key)
-        if value is None or isinstance(value, bool):
-            return None
-        normalized = str(value).strip()
-        return normalized or None
+        return skill_params.optional_str(payload, key)
 
     def _serialize(self, value: Any) -> Any:
         if is_dataclass(value):
@@ -8336,141 +7655,16 @@ class GatewayRuntime:
         return self._serialize(value)
 
     def _require_str(self, payload: Dict[str, Any], key: str) -> str:
-        value = str(payload.get(key, "")).strip()
-        if not value:
-            raise GatewayError(
-                f"参数 {key} 不能为空。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        return value
+        return skill_params.require_str(payload, key)
 
     def _require_float(self, payload: Dict[str, Any], key: str) -> float:
-        if key not in payload:
-            raise GatewayError(
-                f"缺少参数 {key}。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        return self._float(payload, key, 0.0)
+        return skill_params.require_float(payload, key)
 
     def _float(self, payload: Dict[str, Any], key: str, default: float) -> float:
-        if key not in payload:
-            return default
-        try:
-            return float(payload[key])
-        except (TypeError, ValueError) as exc:
-            raise GatewayError(
-                f"参数 {key} 必须为数字。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            ) from exc
+        return skill_params.optional_float(payload, key, default)
 
     def _int(self, payload: Dict[str, Any], key: str, default: int) -> int:
-        if key not in payload:
-            return default
-        try:
-            return int(payload[key])
-        except (TypeError, ValueError) as exc:
-            raise GatewayError(
-                f"参数 {key} 必须为整数。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            ) from exc
-
-    def _scene_space_ids_from_arguments(self, payload: Dict[str, Any]) -> List[str]:
-        values = self._coerce_optional_str_list(payload.get("scene_space_ids"))
-        scene_space_id = self._optional_str(payload, "scene_space_id") or ""
-        if scene_space_id:
-            values.insert(0, scene_space_id)
-        return list(dict.fromkeys(values))
-
-    def _review_statuses_from_arguments(self, payload: Dict[str, Any]) -> List[SceneSpaceReviewStatus]:
-        values = self._coerce_optional_str_list(payload.get("review_statuses"))
-        review_status = self._optional_str(payload, "review_status") or ""
-        if review_status:
-            values.insert(0, review_status)
-        statuses: List[SceneSpaceReviewStatus] = []
-        for value in dict.fromkeys(values):
-            try:
-                statuses.append(SceneSpaceReviewStatus(value))
-            except ValueError as exc:
-                raise GatewayError(
-                    "未知场景空间审核状态：%s" % value,
-                    error_code="invalid_scene_space_review_status",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                ) from exc
-        return statuses
-
-    def _build_memory_payload_filter(self, payload: Dict[str, Any]) -> Optional[MemoryPayloadFilter]:
-        normalized_semantic_labels = self._coerce_optional_str_list(payload.get("semantic_labels"))
-        normalized_visual_labels = self._coerce_optional_str_list(payload.get("visual_labels"))
-        normalized_vision_tags = self._coerce_optional_str_list(payload.get("vision_tags"))
-        topo_node_ids = self._coerce_optional_str_list(payload.get("topo_node_ids"))
-        topo_node_id = self._optional_str(payload, "topo_node_id") or ""
-        if topo_node_id:
-            topo_node_ids.insert(0, topo_node_id)
-        topo_node_ids = list(dict.fromkeys(topo_node_ids))
-        anchor_ids = self._coerce_optional_str_list(payload.get("anchor_ids"))
-        anchor_id = self._optional_str(payload, "anchor_id") or ""
-        if anchor_id:
-            anchor_ids.insert(0, anchor_id)
-        anchor_ids = list(dict.fromkeys(anchor_ids))
-        scene_space_ids = self._scene_space_ids_from_arguments(payload)
-        review_statuses = self._review_statuses_from_arguments(payload)
-        near_pose = None
-        if "near_frame_id" in payload or "near_x" in payload or "near_y" in payload:
-            near_pose = Pose(
-                frame_id=str(payload.get("near_frame_id") or "map"),
-                position=Vector3(
-                    x=self._float(payload, "near_x", 0.0),
-                    y=self._float(payload, "near_y", 0.0),
-                    z=self._float(payload, "near_z", 0.0),
-                ),
-                orientation=Quaternion(w=1.0),
-            )
-        filter_payload = MemoryPayloadFilter(
-            map_version_id=self._optional_str(payload, "map_version_id"),
-            localization_session_id=self._optional_str(payload, "localization_session_id"),
-            linked_location_id=self._optional_str(payload, "linked_location_id"),
-            camera_ids=[self._optional_str(payload, "camera_id")] if self._optional_str(payload, "camera_id") else [],
-            semantic_labels_any=normalized_semantic_labels,
-            visual_labels_any=normalized_visual_labels,
-            vision_tags_any=normalized_vision_tags,
-            topo_node_ids=topo_node_ids,
-            anchor_ids=anchor_ids,
-            scene_space_ids=scene_space_ids,
-            review_statuses=review_statuses,
-            max_age_sec=self._float(payload, "max_age_sec", 0.0) or None,
-            near_pose=near_pose,
-            max_distance_m=self._float(payload, "max_distance_m", 0.0) or None,
-        )
-        has_filter = any(
-            [
-                filter_payload.map_version_id,
-                filter_payload.localization_session_id,
-                filter_payload.linked_location_id,
-                filter_payload.camera_ids,
-                filter_payload.semantic_labels_any,
-                filter_payload.visual_labels_any,
-                filter_payload.vision_tags_any,
-                filter_payload.topo_node_ids,
-                filter_payload.anchor_ids,
-                filter_payload.scene_space_ids,
-                filter_payload.review_statuses,
-                filter_payload.max_age_sec is not None,
-                filter_payload.near_pose is not None,
-                filter_payload.max_distance_m is not None,
-            ]
-        )
-        if not has_filter:
-            return None
-        return filter_payload
+        return skill_params.optional_int(payload, key, default)
 
 
 def create_default_gateway_runtime(

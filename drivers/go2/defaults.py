@@ -9,7 +9,7 @@ from contracts.image import CameraInfo
 from drivers.common.manifest import RobotDefaults
 
 if TYPE_CHECKING:
-    from settings import NuwaxRobotBridgeConfig
+    from core.settings import NuwaxRobotBridgeConfig
 
 
 @dataclass(frozen=True)
@@ -45,14 +45,15 @@ GO2_DEFAULT_TOPICS = {
 }
 
 GO2_DEFAULT_SENSOR_BINDINGS = (
-    "drivers/sensor/cameras/unitree/front_camera",
-    "drivers/sensor/imu/unitree/body_imu",
+    "front_camera",
+    "body_imu",
 )
 
-GO2_DEFAULT_AUDIO_BINDINGS = (
-    "drivers/audio/unitree_vui",
-    "drivers/audio/unitree_webrtc",
-)
+# 实时音频后端已随 tts/ 包与 WebRTC 音频通道删除（AudioService 改 record_only），
+# 原先的 "drivers/audio/unitree_vui"/"drivers/audio/unitree_webrtc" 指向已不存在的
+# drivers/audio 目录，是死值。manifest 的 default_audio_backends 字段本身按治理保守
+# 保留（待容器侧确认是否读取该 metadata），此处仅清空失效路径值，不暴露不存在的后端。
+GO2_DEFAULT_AUDIO_BINDINGS: Tuple[str, ...] = ()
 
 GO2_DEFAULT_ADAPTER_BINDINGS: Tuple[str, ...] = ()
 

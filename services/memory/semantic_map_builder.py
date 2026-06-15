@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 from contracts.base import utc_now
 from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.maps import SemanticMap
 from contracts.runtime_views import MapSnapshot
 from contracts.spatial_memory import (
@@ -42,7 +43,7 @@ class SemanticMapBuilder:
         if snapshot is None:
             return SemanticMapBuildResult(
                 map_version_id=None,
-                frame_id="map",
+                frame_id=DEFAULT_MAP_FRAME,
                 semantic_regions=(),
                 scene_spaces=(),
                 anchors_by_id={},
@@ -603,7 +604,7 @@ class SemanticMapBuilder:
             return snapshot.occupancy_grid.frame_id
         if snapshot.cost_map is not None:
             return snapshot.cost_map.frame_id
-        return "map"
+        return DEFAULT_MAP_FRAME
 
     def _extract_aliases(self, attributes: Dict[str, object]) -> List[str]:
         aliases: List[str] = []

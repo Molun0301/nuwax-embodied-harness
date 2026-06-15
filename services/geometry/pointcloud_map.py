@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
+
 
 _PCD_NUMPY_TYPES = {
     ("F", 4): "<f4",
@@ -118,7 +120,7 @@ class PointCloudMapCache:
         self,
         path: Path,
         *,
-        frame_id: str = "map",
+        frame_id: str = DEFAULT_MAP_FRAME,
         source_kind: str = "map_version_pcd",
     ) -> PointCloudMap:
         resolved = path.expanduser().resolve(strict=False)
@@ -146,7 +148,7 @@ class PointCloudMapCache:
         loaded = PointCloudMap(
             path=str(resolved),
             revision="pcd:%d:%d" % (int(stat.st_mtime_ns), int(stat.st_size)),
-            frame_id=str(frame_id or "map"),
+            frame_id=str(frame_id or DEFAULT_MAP_FRAME),
             source_kind=str(source_kind or "map_version_pcd"),
             point_count=int(points_xyz.shape[0]),
             points_xyz=points_xyz,
@@ -520,34 +522,58 @@ class CloudMapMmapReader:
         return vals
 
     def read_stable(self, max_points: int = 60000) -> Optional[Tuple[int, int, bytes]]:
-        """读取非活跃 buffer 的点云数据。返回 (revision, point_count, xyz_bytes) 或 None。"""
-        header = self.read_header()
-        if header is None:
-            return None
-        _, _, active_buf, point_count, _, revision, _ = header
-        if revision == 0 or point_count == 0:
-            return None
-        if revision == 1:
-            stable_buf = 0
-        else:
-            stable_buf = 1 - active_buf
-        buf_offset = self.HEADER_SIZE + stable_buf * self.SINGLE_BUFFER_SIZE
-        assert self._mm is not None
-        if point_count > max_points:
-            stride = point_count // max_points
-            data = bytearray()
-            for i in range(0, point_count * 12, stride * 12):
-                if len(data) >= max_points * 12:
-                    break
-                off = buf_offset + i
-                data.extend(self._mm[off:off + 12])
-            actual_count = len(data) // 12
-            xyz_bytes = bytes(data)
-        else:
-            data_size = point_count * 12
-            xyz_bytes = bytes(self._mm[buf_offset:buf_offset + data_size])
-            actual_count = point_count
-        return (revision, actual_count, xyz_bytes)
+        """读取最新已发布的点云数据。返回 (revision, point_count, xyz_bytes) 或 None。
+
+        seqlock 读侧校验：读 header(rev1)→读推算 buffer 的数据→再读 header(rev2)，
+        若 revision 在读取期间变化则重试，上限 3 次。与 Rust 写侧 fence(Release) 后最后
+        发布 revision（pointcloud.rs write_cloud_map）配套，消除撕裂读。
+
+        关键（fix-mmap4）：buffer 选择**不读 header 的 active_buf 字段**，改用双读一致的
+        revision 自己推算 `read_buf = (revision - 1) % 2`（与写侧 active_buf=((rev-1)%2)
+        同一公式）。原因：active_buf/point_count 字段（pointcloud.rs:74-75）先于 revision
+        (:81) 写入，未被 fence(Release) 保护；一次 read_header 的非原子 unpack 可能读到
+        “新 active_buf + 旧 revision”交错态，用新 active_buf 去读 writer 正在写的当前帧
+        buffer，且双读 revision 仍见旧值（误判一致）→ 撕裂。改用 revision 推算后，buffer
+        选择与发布点严格同源：双读 revision 一致==R ⟹ 帧 R 已发布、其 buffer (R-1)%2 完整；
+        writer 当前写帧 R+1 的另一个 buffer R%2，不碰 (R-1)%2；要帧 R+2 才回头覆盖，届时
+        revision 已 advance，下方双读必捕获并重试。
+        point_count 偏差无害：双读 revision==R 时它至多取到 R 或抢跑的 R+1 帧值，二者下
+        reader 读的 (R-1)%2 buffer 均静默（帧 R+1 写另一 buffer），多读的字节是同 buffer
+        历史有效点（累积地图单调增长），且写侧保证单帧 count*12<=16MB 不会溢出到另一 buffer。
+        """
+        for _ in range(3):
+            header = self.read_header()
+            if header is None:
+                return None
+            _, _, _active_buf, point_count, _, revision, _ = header
+            if revision == 0 or point_count == 0:
+                return None
+            # 用双读一致的 revision 推算 buffer(而非读 active_buf 字段,后者先于 revision 发布有交错窗口)
+            read_buf = (revision - 1) % 2
+            buf_offset = self.HEADER_SIZE + read_buf * self.SINGLE_BUFFER_SIZE
+            assert self._mm is not None
+            if point_count > max_points:
+                stride = point_count // max_points
+                data = bytearray()
+                for i in range(0, point_count * 12, stride * 12):
+                    if len(data) >= max_points * 12:
+                        break
+                    off = buf_offset + i
+                    data.extend(self._mm[off:off + 12])
+                actual_count = len(data) // 12
+                xyz_bytes = bytes(data)
+            else:
+                data_size = point_count * 12
+                xyz_bytes = bytes(self._mm[buf_offset:buf_offset + data_size])
+                actual_count = point_count
+            # 读后再校验 revision：未变则数据一致，已变说明读期间被写者翻转，重试。
+            header_after = self.read_header()
+            if header_after is None:
+                return None
+            if header_after[5] == revision:
+                return (revision, actual_count, xyz_bytes)
+        # 连续 3 次都被写者抢占，放弃本轮（上层轮询下次重试）。
+        return None
 
     def build_binary_frame(self, max_points: int = 60000) -> Optional[bytes]:
         """构建 Wire Format binary 帧: revision(u32) + point_count(u32) + XYZ data。"""

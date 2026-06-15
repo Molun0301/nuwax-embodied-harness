@@ -3,7 +3,7 @@
 from providers.base import BaseProvider
 from providers.calibration import CalibrationProvider
 from providers.exploration import ExplorationProvider
-from providers.image import ImageProvider, StreamingImageProvider
+from providers.image import ImageProvider
 from providers.localization import LocalizationProvider, StreamingLocalizationProvider
 from providers.maps import MapProvider
 from providers.motion import MotionControl
@@ -17,7 +17,6 @@ __all__ = [
     "CalibrationProvider",
     "ExplorationProvider",
     "ImageProvider",
-    "StreamingImageProvider",
     "LocalizationProvider",
     "MapProvider",
     "MotionControl",

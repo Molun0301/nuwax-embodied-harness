@@ -7,7 +7,7 @@ from contracts.perception import Observation
 from contracts.runtime_views import ObservationContext
 from contracts.events import RuntimeEventCategory
 from core import EventBus, StateNamespace, StateStore
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from providers import ImageProvider
 from services.artifact_service import ArtifactService
 from typing import Deque, Dict, Optional, Tuple

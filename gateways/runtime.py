@@ -62,6 +62,7 @@ from services.navigation import NavigationService
 from services.observation_service import ObservationService
 from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
 from services.robot_state_service import RobotStateService
+from services.telemetry import SystemMetricsCollector
 from skills import SkillRegistry
 from skills.common import params as skill_params
 from skills.common.context import SkillContext
@@ -561,6 +562,14 @@ class GatewayRuntime:
         self._cloud_map_mmap_poll_thread: Optional[threading.Thread] = None
         self._cloud_map_last_revision: int = 0
         self._start_cloud_map_mmap_poll()
+        # 性能监控（CPU/内存/进程）采集线程，启停由数据流源聚合入口统一编排。
+        self._system_telemetry_stop = threading.Event()
+        self._system_telemetry_thread: Optional[threading.Thread] = None
+        self._system_metrics_collector = SystemMetricsCollector(
+            keywords=config.gateway.telemetry_process_keywords or None,
+            include_process_tree=config.gateway.telemetry_include_process_tree,
+            sample_interval_sec=config.gateway.telemetry_interval_sec,
+        )
         self._base_capability_matrix = robot.manifest.capability_matrix
         self._gateway_capability_names: Tuple[str, ...] = ()
 
@@ -750,6 +759,10 @@ class GatewayRuntime:
         self._publish_pointcloud_map_stream_frame(reason="runtime_stream_start")
         self._start_navigation_status_refresh_stream()
         try:
+            self._start_system_telemetry_stream()
+        except Exception:
+            RUNTIME_LOGGER.debug("启动性能监控采集线程失败。", exc_info=True)
+        try:
             self.platform_geometry_runtime.start_external_debug_observers()
         except Exception:
             RUNTIME_LOGGER.debug("启动外部几何 debug observer 失败。", exc_info=True)
@@ -830,6 +843,62 @@ class GatewayRuntime:
                 continue
             self._publish_navigation_bootstrap_stream_frames()
 
+    def _start_system_telemetry_stream(self) -> None:
+        """启动性能监控采集线程（daemon），失败不影响其它流源启动。"""
+
+        if not self.config.gateway.telemetry_enabled:
+            return
+        if self._system_telemetry_thread is not None:
+            return
+        self._system_telemetry_stop.clear()
+        thread = threading.Thread(
+            target=self._run_system_telemetry_stream,
+            name="nuwax-system-telemetry",
+            daemon=True,
+        )
+        self._system_telemetry_thread = thread
+        thread.start()
+
+    def _stop_system_telemetry_stream(self) -> None:
+        thread = self._system_telemetry_thread
+        if thread is None:
+            return
+        self._system_telemetry_stop.set()
+        if thread.is_alive():
+            thread.join(timeout=self._system_metrics_collector.sample_interval_sec + 1.0)
+        self._system_telemetry_thread = None
+
+    def _run_system_telemetry_stream(self) -> None:
+        collector = self._system_metrics_collector
+        interval = collector.sample_interval_sec
+        try:
+            collector.warmup()
+        except Exception:
+            RUNTIME_LOGGER.debug("性能监控预热失败。", exc_info=True)
+        while not self._system_telemetry_stop.wait(interval):
+            try:
+                snapshot = collector.sample()
+                self.stream_bus.publish(
+                    "system.metrics",
+                    source="gateway",
+                    payload_kind=StreamPayloadKind.JSON,
+                    status=str(snapshot.status),
+                    payload=snapshot.model_dump(),
+                )
+            except Exception:
+                RUNTIME_LOGGER.debug("性能监控采集/推送失败，本周期跳过。", exc_info=True)
+                try:
+                    self.stream_bus.publish(
+                        "system.metrics",
+                        source="gateway",
+                        payload_kind=StreamPayloadKind.JSON,
+                        status="error",
+                        payload={"status": "error", "psutil_available": False},
+                    )
+                except Exception:
+                    RUNTIME_LOGGER.debug("性能监控降级帧推送失败。", exc_info=True)
+
+
     _CLOUD_MAP_MMAP_POLL_INTERVAL_SEC = 0.1
 
     def _start_cloud_map_mmap_poll(self) -> None:
@@ -892,6 +961,7 @@ class GatewayRuntime:
     def _stop_data_frame_stream_sources(self) -> None:
         self._stop_cloud_map_mmap_poll()
         self._stop_navigation_status_refresh_stream()
+        self._stop_system_telemetry_stream()
         if self._pointcloud_map_stream_subscription_id is not None:
             self.stream_bus.unsubscribe(self._pointcloud_map_stream_subscription_id)
             self._pointcloud_map_stream_subscription_id = None

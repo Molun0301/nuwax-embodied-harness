@@ -57,3 +57,8 @@ git+https://github.com/ultralytics/CLIP.git@577b3cfa75f072c20a3f02b44ffde111d93e
 onnx==1.17.0
 onnxslim==0.1.93
 ultralytics==8.4.33
+# 性能监控（CPU/内存/进程）采集库，平台侧 services/telemetry 使用。
+# 选型依据：psutil 纯读 /proc、/sys、syscall，与 SoC/厂商无关，
+# 在 Jetson(L4T) / 树莓派 / 香橙派(Armbian) 的 aarch64 与 x86 上行为一致；
+# PyPI 提供 cp36-abi3 预编译 wheel，命中实机 Python 3.8.10，无需现场编译。
+psutil==7.2.2

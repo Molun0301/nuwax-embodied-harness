@@ -37,3 +37,11 @@ deploy/nuwaclaw/*.host_gateway.json
 /2026-05-25_RTAB-MAP+Nav2平台接入评测与交接文档.md
 /log/
 /maps/
+
+# === 本地产物/备份/启动日志 忽略 (2026-06-15) ===
+*.bak_*
+.env copy
+.env.copy
+/docs/内部开发文档/
+/1.md
+/huang1.md

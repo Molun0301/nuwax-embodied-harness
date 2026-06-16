@@ -604,8 +604,8 @@ def _render_debug_page(access_token: str) -> str:
         <div class="metric"><b id="connectionText">connecting</b><span>网关连接</span></div>
         <div class="metric"><b id="runtimeMode">--</b><span>运行模式</span></div>
         <div class="metric"><b id="batteryMetric">--</b><span>电池状态</span></div>
-        <div class="metric"><b id="networkLatency" class="mono">--</b><span>HTTP 往返</span></div>
-        <div class="metric"><b id="resourceMetric">--</b><span>资源/任务</span></div>
+        <div class="metric"><b id="networkLatency" class="mono">--</b><span>CPU</span></div>
+        <div class="metric"><b id="resourceMetric">--</b><span>运存</span></div>
         <div class="metric"><b id="clockNow" class="mono">--</b><span>当前时间</span></div>
         <div class="metric"><b id="lastReceive" class="mono">--</b><span>数据接收</span></div>
         <span id="estopStatus" class="pill estop">急停状态：只读展示</span>
@@ -731,7 +731,7 @@ def _render_debug_page(access_token: str) -> str:
               <div class="tab-menu" role="tablist" aria-label="运行诊断二级菜单">
                 <button class="tab-button active" type="button" data-tab-target="governance-pane">治理</button>
                 <button class="tab-button" type="button" data-tab-target="video-pane">视频</button>
-                <button class="tab-button" type="button" data-tab-target="service-pane">服务</button>
+                <button class="tab-button" type="button" data-tab-target="service-pane">进程</button>
                 <button class="tab-button" type="button" data-tab-target="logs-pane">日志</button>
               </div>
               <div class="tab-content">
@@ -764,9 +764,10 @@ def _render_debug_page(access_token: str) -> str:
                 <div id="service-pane" class="tab-pane">
                   <section id="services" class="panel compact">
                     <div class="card-head">
-                      <h3>服务矩阵</h3>
+                      <h3>进程矩阵</h3>
                       <span id="servicesStatus" class="pill missing">missing</span>
                     </div>
+                    <div id="serviceMatrixScope" class="muted small panel-meta"></div>
                     <div id="serviceMatrix" class="service-list"></div>
                   </section>
                 </div>
@@ -827,7 +828,7 @@ def _render_debug_page(access_token: str) -> str:
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "RTAB-Map治理", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 500;
-      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state"];
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state", "system.metrics"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
       const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
       const VIDEO_JPEG_DECODE_TIMEOUT_MS = 3000;
@@ -909,6 +910,7 @@ def _render_debug_page(access_token: str) -> str:
         overviewLastRenderAt: 0,
         overviewReceivedAt: null,
         latestHealth: null,
+        latestSystemMetrics: null,
         latestGovernance: null,
         latestTasks: { active_tasks: [], history_tasks: [] },
         taskActiveById: new Map(),
@@ -976,6 +978,7 @@ def _render_debug_page(access_token: str) -> str:
         videoFpsStatus: document.getElementById("videoFpsStatus"),
         servicesStatus: document.getElementById("servicesStatus"),
         serviceMatrix: document.getElementById("serviceMatrix"),
+        serviceMatrixScope: document.getElementById("serviceMatrixScope"),
         logsStatus: document.getElementById("logsStatus"),
         logsMeta: document.getElementById("logsMeta"),
         logs: document.getElementById("logs"),
@@ -1116,7 +1119,6 @@ def _render_debug_page(access_token: str) -> str:
         const data = envelope && envelope.data ? envelope.data : {};
         state.latestOverview = data;
         if (!state.streamSocket || state.streamSocket.readyState !== WebSocket.OPEN) setText(els.connectionText, "online");
-        setText(els.networkLatency, fmt(envelope.__frontendLatencyMs, " ms"));
         for (const name of overviewNames) {
           const summary = data[name] || {};
           const section = document.getElementById(`overview-${name}`);
@@ -1133,7 +1135,6 @@ def _render_debug_page(access_token: str) -> str:
         const mission = worstStatus([data.health, data.state, data.localization, data.map, data.navigation, data.video, data.logs]);
         setPill(els.missionStatus, mission, "mission");
         updateSensorSummary(data);
-        renderServiceMatrix(data);
       }
       function updateSensorSummary(data) {
         const map = data.map || {};
@@ -1151,40 +1152,56 @@ def _render_debug_page(access_token: str) -> str:
           ["video", `${safeText(video.status)} source=${safeText(video.metadata && video.metadata.source)}`],
         ]);
       }
-      function renderServiceMatrix(data) {
-        const rows = [
-          ["gateway", data.health],
-          ["robot_state", data.state],
-          ["mapping", data.map],
-          ["localization", data.localization],
-          ["navigation", data.navigation],
-          ["exploration", data.exploration],
-          ["rtabmap_governance", data.runtime_governance],
-          ["pointcloud_map", data.pointcloud_map],
-          ["pointcloud", data.pointcloud],
-          ["video", data.video],
-          ["logs", data.logs],
-        ];
+      function formatGB(bytes) {
+        const n = Number(bytes);
+        if (!Number.isFinite(n) || n < 0) return "--";
+        return (n / 1024 / 1024 / 1024).toFixed(1) + " GB";
+      }
+      function updateSystemMetrics(payload) {
+        const snap = payload || {};
+        state.latestSystemMetrics = snap;
+        const available = snap.psutil_available === true;
+        // 顶栏 CPU 块（复用 #networkLatency）
+        const cpu = snap.cpu || {};
+        setText(els.networkLatency, available && cpu.percent !== undefined ? `${Math.round(cpu.percent)}%` : "N/A");
+        // 顶栏 运存块（复用 #resourceMetric）
+        const mem = snap.memory || {};
+        setText(els.resourceMetric, available && mem.percent !== undefined
+          ? `${Math.round(mem.percent)}% · ${formatGB(mem.used_bytes)}/${formatGB(mem.total_bytes)}`
+          : "N/A");
+        renderProcessMatrix(snap);
+      }
+      function renderProcessMatrix(snap) {
+        const status = snap && snap.status ? snap.status : "missing";
+        setPill(els.servicesStatus, status);
+        if (els.serviceMatrixScope) {
+          els.serviceMatrixScope.textContent = snap && snap.monitor_scope
+            ? `监控范围：${snap.monitor_scope}` : "";
+        }
         els.serviceMatrix.replaceChildren();
-        const serviceStatus = worstStatus(rows.map((item) => item[1]));
-        setPill(els.servicesStatus, serviceStatus);
-        for (const [name, summary] of rows) {
-          const status = summary && summary.status ? summary.status : "missing";
+        const processes = snap && Array.isArray(snap.processes) ? snap.processes : [];
+        if (!processes.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty panel-meta";
+          empty.textContent = snap && snap.psutil_available === false
+            ? "psutil 不可用，性能监控降级。" : "未匹配到本项目进程。";
+          els.serviceMatrix.appendChild(empty);
+          return;
+        }
+        for (const proc of processes) {
           const row = document.createElement("article");
           row.className = "service-row";
           const left = document.createElement("div");
           const title = document.createElement("div");
-          title.textContent = name;
+          title.textContent = `${safeText(proc.name)} · ${safeText(proc.pid)}`;
           title.className = "mono";
           const meta = document.createElement("div");
           meta.className = "meta";
-          meta.textContent = `${safeText(summary && summary.metadata && summary.metadata.source)} · latency ${fmt(summary && summary.latency_ms, " ms")} · ${shortTime(summary && summary.source_timestamp)}`;
-          const line = document.createElement("div");
-          line.className = `health-line ${statusSeverity(status) >= 3 ? "bad" : statusSeverity(status) >= 1 ? "warn" : ""}`;
-          left.append(title, meta, line);
+          meta.textContent = `内存 ${formatGB(proc.rss_bytes)} · CPU ${fmt(proc.cpu_percent, "%")} · ${safeText(proc.matched_keyword)}`;
+          left.append(title, meta);
           const pill = document.createElement("span");
-          pill.className = `pill ${statusClass(status)}`;
-          pill.textContent = status;
+          pill.className = "pill mono";
+          pill.textContent = `${Math.round(Number(proc.cpu_percent) || 0)}%`;
           row.append(left, pill);
           els.serviceMatrix.appendChild(row);
         }
@@ -1204,7 +1221,6 @@ def _render_debug_page(access_token: str) -> str:
           ? `${Math.round(rawBattery <= 1 ? rawBattery * 100 : rawBattery)}%`
           : (battery.level !== undefined ? `${battery.level}%` : "--");
         setText(els.batteryMetric, batteryValue);
-        setText(els.resourceMetric, `tasks ${health.active_task_count ?? 0} · events ${health.latest_event_cursor ?? 0}`);
         const estopped = safety.is_estopped === true || safety.estopped === true;
         setPill(els.estopStatus, estopped ? "error" : "available", estopped ? "急停状态：触发" : "急停状态：清除");
         els.estopStatus.classList.add("estop");
@@ -3452,7 +3468,6 @@ def _render_debug_page(access_token: str) -> str:
         state.streamSocket = socket;
         socket.addEventListener("open", () => {
           setText(els.connectionText, "streaming");
-          setText(els.networkLatency, "stream");
           if (state.streamReconnectTimer) {
             window.clearTimeout(state.streamReconnectTimer);
             state.streamReconnectTimer = null;
@@ -3551,6 +3566,9 @@ def _render_debug_page(access_token: str) -> str:
           updateLogFrame(frame);
         } else if (frame.topic === "tasks.state") {
           updateTaskFrame(frame);
+        } else if (frame.topic === "system.metrics") {
+          updateSystemMetrics(frame.payload);
+          updateOverviewForFrame = false;
         } else {
           updateOverviewForFrame = false;
         }

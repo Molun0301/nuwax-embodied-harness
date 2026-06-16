@@ -577,6 +577,11 @@ class GatewayServerConfig:
     allow_unknown_client_hosts: bool = True
     sse_keepalive_sec: float = 10.0
     ws_ping_interval_sec: float = 15.0
+    # 性能监控（CPU/内存/进程）采集配置（平台侧，通用不绑定机器人）。
+    telemetry_enabled: bool = True
+    telemetry_interval_sec: float = 2.0
+    telemetry_process_keywords: Tuple[str, ...] = ("gateway", "rtabmap", "nav2", "robot_bridge", "ros2")
+    telemetry_include_process_tree: bool = True
 
 
 @dataclass
@@ -981,6 +986,13 @@ def load_config() -> NuwaxRobotBridgeConfig:
         allow_unknown_client_hosts=_cfg_bool("NUWAX_GATEWAY_ALLOW_UNKNOWN_CLIENT_HOSTS", False),
         sse_keepalive_sec=_cfg_float("NUWAX_GATEWAY_SSE_KEEPALIVE_SEC", 10.0),
         ws_ping_interval_sec=_cfg_float("NUWAX_GATEWAY_WS_PING_INTERVAL_SEC", 15.0),
+        telemetry_enabled=_cfg_bool("NUWAX_GATEWAY_TELEMETRY_ENABLED", True),
+        telemetry_interval_sec=max(0.5, _cfg_float("NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC", 2.0)),
+        telemetry_process_keywords=_cfg_csv(
+            "NUWAX_GATEWAY_TELEMETRY_PROCESS_KEYWORDS",
+            ("gateway", "rtabmap", "nav2", "robot_bridge", "ros2"),
+        ),
+        telemetry_include_process_tree=_cfg_bool("NUWAX_GATEWAY_TELEMETRY_INCLUDE_PROCESS_TREE", True),
     )
 
     relay = RelayServerConfig(

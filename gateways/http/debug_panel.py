@@ -285,6 +285,27 @@ def _render_debug_page(access_token: str) -> str:
       transition: background 0.3s ease, color 0.3s ease;
     }
     .app-shell { width: min(100%, 2260px); margin: 0 auto; display: grid; gap: 12px; }
+    #view-host { min-width: 0; min-height: 0; }
+    .view-pane { display: none; min-width: 0; min-height: 0; }
+    .view-pane.active { display: block; }
+    .view-switch { display: inline-flex; gap: 6px; margin-top: 8px; }
+    .view-switch-btn { border: 1px solid var(--border-soft); border-radius: 999px; background: var(--panel-strong); color: var(--muted-strong); min-height: 30px; padding: 5px 18px; font: inherit; font-size: 12px; font-weight: 780; cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease; }
+    .view-switch-btn:hover, .view-switch-btn.active { border-color: var(--border-strong); background: rgba(37, 99, 235, 0.14); color: var(--text); }
+    [data-theme="dark"] .view-switch-btn:hover, [data-theme="dark"] .view-switch-btn.active { background: rgba(34, 211, 238, 0.16); }
+    .config-fullpage { display: grid; grid-template-rows: auto auto auto auto auto minmax(0, 1fr); gap: 10px; min-height: 0; height: 100%; overflow: hidden; }
+    .config-fullpage .config-sections { overflow: auto; min-height: 0; padding-right: 4px; }
+    .config-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .config-toolbar .field { flex: 1 1 280px; min-width: 200px; }
+    .config-auth-note { font-size: 12px; font-weight: 680; color: #b45309; background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 8px; padding: 7px 12px; }
+    [data-theme="dark"] .config-auth-note { color: #fbbf24; }
+    .config-section-block { border: 1px solid var(--border-soft); border-radius: 10px; margin-bottom: 10px; background: rgba(255,255,255,0.03); }
+    [data-theme="dark"] .config-section-block { background: rgba(15, 23, 42, 0.3); }
+    .config-section-block > .config-section-title { font-weight: 800; padding: 9px 12px; font-size: 13px; }
+    .config-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 8px 14px; padding: 0 12px 12px; }
+    .config-adv-fold { margin: 0 12px 12px; }
+    .config-adv-fold > summary { cursor: pointer; font-size: 12px; font-weight: 720; color: var(--muted-strong); padding: 6px 0; }
+    .config-row.invalid .field { border-color: #ef4444; }
+    .config-row .config-err { color: #ef4444; font-size: 11px; min-height: 0; }
     .topbar {
       display: grid;
       grid-template-columns: minmax(300px, 0.46fr) minmax(0, 1.54fr);
@@ -531,6 +552,8 @@ def _render_debug_page(access_token: str) -> str:
     html, body { height: 100%; overflow: hidden; }
     body { padding: 10px; }
     .app-shell { height: calc(100vh - 20px); max-height: calc(100vh - 20px); width: min(100%, 2260px); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
+    #view-host { height: 100%; min-height: 0; overflow: hidden; }
+    .view-pane.active { height: 100%; min-height: 0; overflow: hidden; }
     .topbar { grid-template-columns: minmax(250px, 0.36fr) minmax(0, 1.64fr); gap: 10px; min-height: 78px; }
     .brand-block { padding: 10px 14px; gap: 4px; }
     .brand-block .small { display: none; }
@@ -615,6 +638,10 @@ def _render_debug_page(access_token: str) -> str:
           <span id="robotModel" class="pill missing">型号：--</span>
         </div>
         <div class="muted small">单屏实时地图驾驶舱 · 关键态势优先</div>
+        <div class="view-switch" role="tablist" aria-label="监控 / 配置 视图切换">
+          <button id="viewSwitchMonitor" class="view-switch-btn active" type="button" data-view-target="monitor-view">监控</button>
+          <button id="viewSwitchConfig" class="view-switch-btn" type="button" data-view-target="config-view">配置</button>
+        </div>
       </div>
       <div class="global-status">
         <div class="metric"><b id="connectionText">connecting</b><span>网关连接</span></div>
@@ -628,6 +655,8 @@ def _render_debug_page(access_token: str) -> str:
       </div>
     </header>
 
+    <div id="view-host">
+    <div id="monitor-view" class="view-pane active">
     <div class="mission-layout">
       <div class="mission-content">
         <main class="grid workspace">
@@ -749,7 +778,6 @@ def _render_debug_page(access_token: str) -> str:
                 <button class="tab-button" type="button" data-tab-target="video-pane">视频</button>
                 <button class="tab-button" type="button" data-tab-target="service-pane">进程</button>
                 <button class="tab-button" type="button" data-tab-target="logs-pane">日志</button>
-                <button class="tab-button" type="button" data-tab-target="config-pane">配置</button>
               </div>
               <div class="tab-content">
                 <div id="governance-pane" class="tab-pane active">
@@ -809,28 +837,34 @@ def _render_debug_page(access_token: str) -> str:
                     <div id="logs" class="logs panel-meta"></div>
                   </section>
                 </div>
-                <div id="config-pane" class="tab-pane">
-                  <section id="config-section" class="panel compact">
-                    <div class="card-head">
-                      <h3>配置管理</h3>
-                      <span id="configStatus" class="pill missing">missing</span>
-                    </div>
-                    <div class="toolbar">
-                      <input id="configSearch" class="field" type="search" placeholder="搜索配置键 / 中文名" aria-label="搜索配置">
-                      <label class="overlay-chip overlay-toggle"><input id="configShowAdvanced" type="checkbox">显示高级项</label>
-                      <button id="configReload" class="tab-button" type="button">重载</button>
-                      <button id="configSave" class="tab-button" type="button">保存改动</button>
-                    </div>
-                    <div id="configEffectNote" class="muted small panel-meta">保存后写入 .env，需重启网关生效（非热重载）。</div>
-                    <div id="configDirty" class="muted small panel-meta"></div>
-                    <div id="configSections" class="config-sections"></div>
-                  </section>
-                </div>
               </div>
             </section>
           </aside>
         </main>
       </div>
+    </div>
+    </div>
+    <div id="config-view" class="view-pane">
+      <section id="config-section" class="panel config-fullpage">
+        <div class="card-head">
+          <div>
+            <div class="eyebrow">Configuration</div>
+            <h2>配置管理</h2>
+          </div>
+          <span id="configStatus" class="pill missing">missing</span>
+        </div>
+        <div class="config-toolbar">
+          <input id="configSearch" class="field" type="search" placeholder="搜索配置键 / 中文名" aria-label="搜索配置">
+          <label class="overlay-chip overlay-toggle"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
+          <button id="configReload" class="tab-button" type="button">重载</button>
+          <button id="configSave" class="tab-button" type="button">保存改动</button>
+        </div>
+        <div id="configEffectNote" class="muted small panel-meta">保存后写入 .env，需重启网关生效（非热重载）。</div>
+        <div id="configAuthNote" class="config-auth-note">⚠ 网关当前不鉴权：任何可访问本页面者都能保存配置并写入 .env。建议仅在回环 / 内网环境暴露。</div>
+        <div id="configDirty" class="muted small panel-meta"></div>
+        <div id="configSections" class="config-sections"></div>
+      </section>
+    </div>
     </div>
   </div>
 
@@ -1055,6 +1089,21 @@ def _render_debug_page(access_token: str) -> str:
         }
       }
       initTabPanels();
+
+      function initViewSwitch() {
+        const buttons = Array.from(document.querySelectorAll(".view-switch-btn"));
+        const panes = Array.from(document.querySelectorAll("#view-host > .view-pane"));
+        for (const button of buttons) {
+          button.addEventListener("click", () => {
+            const targetId = button.dataset.viewTarget;
+            for (const item of buttons) item.classList.toggle("active", item === button);
+            for (const pane of panes) pane.classList.toggle("active", pane.id === targetId);
+            if (targetId === "config-view" && !configState.loaded) loadConfigSchema();
+            if (targetId === "monitor-view") redrawMapAfterResize();
+          });
+        }
+      }
+      initViewSwitch();
 
       function nowText() { return new Date().toLocaleTimeString(); }
       function shortTime(value) { return value ? new Date(value).toLocaleTimeString() : "--"; }
@@ -1373,7 +1422,7 @@ def _render_debug_page(access_token: str) -> str:
         }
       }
       function normalizeFrameId(value, fallback) {
-        const raw = String(value || fallback || "map").trim().replace(/^\/+/, "");
+        const raw = String(value || fallback || "map").trim().replace(/^\\/+/, "");
         return raw || "map";
       }
       function gridResolution(grid) {
@@ -2052,7 +2101,7 @@ def _render_debug_page(access_token: str) -> str:
       }
       function normalizeStatusValue(value) {
         const raw = value && typeof value === "object" && "value" in value ? value.value : value;
-        return String(raw || "").trim().toLowerCase().replace(/^(task|navigation|exploration)\./, "");
+        return String(raw || "").trim().toLowerCase().replace(/^(task|navigation|exploration)\\./, "");
       }
       function isActiveSpatialStatus(value) {
         return ACTIVE_SPATIAL_STATUSES.has(normalizeStatusValue(value));
@@ -2776,7 +2825,7 @@ def _render_debug_page(access_token: str) -> str:
       function normalizeExplorerStatusText(statusText) {
         const text = safeText(statusText);
         if (!text) return "";
-        return text.replace(/^\[explorer\]\s*/i, "").trim();
+        return text.replace(/^\\[explorer\\]\\s*/i, "").trim();
       }
       function isTerminalExplorerStatus(statusText) {
         const upper = normalizeExplorerStatusText(statusText).toUpperCase();
@@ -3466,7 +3515,8 @@ def _render_debug_page(access_token: str) -> str:
         "video.frame",
         "video.detections",
         "logs.entry",
-        "tasks.state"
+        "tasks.state",
+        "system.metrics"
       ];
       function envelopeFromFrame(frame, payloadOverride) {
         const receivedAt = new Date().toISOString();
@@ -3800,30 +3850,42 @@ def _render_debug_page(access_token: str) -> str:
       function renderConfigSchema(schema) {
         const host = document.getElementById("configSections");
         host.replaceChildren();
-        const showAdvanced = document.getElementById("configShowAdvanced").checked;
+        const forceAdvanced = document.getElementById("configShowAdvanced").checked;
         const query = (document.getElementById("configSearch").value || "").trim().toLowerCase();
+        const match = (f) => !query || f.key.toLowerCase().includes(query) || (f.zh_name || "").toLowerCase().includes(query);
         for (const section of schema.sections || []) {
-          const visible = (section.fields || []).filter((f) => {
-            if (!showAdvanced && f.advanced) return false;
-            if (query && !(f.key.toLowerCase().includes(query) || (f.zh_name || "").toLowerCase().includes(query))) return false;
-            return true;
-          });
-          if (!visible.length) continue;
-          const details = document.createElement("details");
-          details.className = "config-section";
-          if (query || !visible.some((f) => f.advanced)) details.open = true;
-          const summary = document.createElement("summary");
-          summary.innerHTML = configEscape(section.section_title) +
-            ' <span class="config-badge">' + visible.length + "</span>";
-          details.appendChild(summary);
-          const grid = document.createElement("div");
-          grid.className = "config-grid";
-          for (const f of visible) {
-            configState.fields.set(f.key, f);
-            grid.appendChild(buildConfigRow(f));
+          const fields = (section.fields || []).filter(match);
+          if (!fields.length) continue;
+          const normal = fields.filter((f) => !f.advanced);
+          const advanced = fields.filter((f) => f.advanced);
+          const block = document.createElement("div");
+          block.className = "config-section-block";
+          const title = document.createElement("div");
+          title.className = "config-section-title";
+          title.innerHTML = configEscape(section.section_title) +
+            ' <span class="config-badge">' + fields.length + "</span>";
+          block.appendChild(title);
+          if (normal.length) {
+            const grid = document.createElement("div");
+            grid.className = "config-grid";
+            for (const f of normal) { configState.fields.set(f.key, f); grid.appendChild(buildConfigRow(f)); }
+            block.appendChild(grid);
           }
-          details.appendChild(grid);
-          host.appendChild(details);
+          if (advanced.length) {
+            // 高级项默认折叠（不是隐藏）：搜索命中或勾选「展开高级项」时自动展开。
+            const fold = document.createElement("details");
+            fold.className = "config-adv-fold";
+            fold.open = forceAdvanced || !!query;
+            const sum = document.createElement("summary");
+            sum.textContent = "高级项（" + advanced.length + "）";
+            fold.appendChild(sum);
+            const grid = document.createElement("div");
+            grid.className = "config-grid";
+            for (const f of advanced) { configState.fields.set(f.key, f); grid.appendChild(buildConfigRow(f)); }
+            fold.appendChild(grid);
+            block.appendChild(fold);
+          }
+          host.appendChild(block);
         }
         if (!host.children.length) {
           host.innerHTML = '<div class="empty panel-meta">无匹配配置项。</div>';
@@ -3840,6 +3902,7 @@ def _render_debug_page(access_token: str) -> str:
         if (f.sensitive) badges += ' <span class="config-badge sec">敏感</span>';
         label.innerHTML = configEscape(f.zh_name) + badges +
           '<span class="ckey">' + configEscape(f.key) + "</span>";
+        if (f.description) label.title = f.description;
         const cell = document.createElement("div");
         cell.className = "cfield";
         let input;
@@ -3864,14 +3927,21 @@ def _render_debug_page(access_token: str) -> str:
             input.appendChild(o);
           }
           input.value = f.value || f.choices[0];
+        } else if ((f.type === "int" || f.type === "float") && !f.sensitive) {
+          input = document.createElement("input");
+          input.type = "number";
+          if (f.type === "float") input.step = "any";
+          input.value = f.value == null ? "" : f.value;
         } else {
           input = document.createElement("input");
           input.type = f.sensitive ? "password" : "text";
           input.value = f.sensitive ? "" : (f.value == null ? "" : f.value);
           if (f.sensitive) input.placeholder = f.is_set ? "（已设置，留空不改）" : "（未设置）";
+          else if (f.type === "csv") input.placeholder = "逗号分隔，如 a,b,c";
         }
         input.id = "cfg__" + f.key;
         input.className = "field";
+        if (f.description) input.title = f.description;
         input.dataset.original = (f.sensitive && f.is_set) ? "" : (f.value == null ? "" : String(f.value));
         if (configState.dirty.has(f.key)) {
           input.value = configState.dirty.get(f.key);
@@ -3880,6 +3950,10 @@ def _render_debug_page(access_token: str) -> str:
         input.addEventListener("input", () => onConfigInput(f.key, input, row));
         input.addEventListener("change", () => onConfigInput(f.key, input, row));
         cell.appendChild(input);
+        const err = document.createElement("div");
+        err.className = "config-err";
+        err.id = "cfgerr__" + f.key;
+        cell.appendChild(err);
         row.append(label, cell);
         return row;
       }
@@ -3909,10 +3983,21 @@ def _render_debug_page(access_token: str) -> str:
           });
           const result = await resp.json();
           if (!resp.ok) throw new Error(result.detail || ("HTTP " + resp.status));
-          const rejected = Object.keys(result.rejected || {});
+          document.querySelectorAll(".config-row.invalid").forEach((r) => r.classList.remove("invalid"));
+          document.querySelectorAll(".config-err").forEach((e) => { e.textContent = ""; });
+          const rejected = result.rejected || {};
+          const rejectedKeys = Object.keys(rejected);
           const note = document.getElementById("configDirty");
-          if (rejected.length) {
-            note.textContent = "部分被拒绝：" + rejected.join(", ");
+          if (rejectedKeys.length) {
+            for (const k of rejectedKeys) {
+              const row = document.querySelector('.config-row[data-key="' + (window.CSS && CSS.escape ? CSS.escape(k) : k) + '"]');
+              if (row) {
+                row.classList.add("invalid");
+                const err = row.querySelector(".config-err");
+                if (err) err.textContent = rejected[k];
+              }
+            }
+            note.textContent = "部分被拒绝（已标红）：" + rejectedKeys.join(", ");
             setPill(status, "error", "配置");
           } else {
             note.textContent = "已保存，重启网关后生效。";
@@ -3934,8 +4019,6 @@ def _render_debug_page(access_token: str) -> str:
         const rerender = () => { if (configState.loaded && configState.lastSchema) renderConfigSchema(configState.lastSchema); };
         if (search) search.addEventListener("input", rerender);
         if (adv) adv.addEventListener("change", rerender);
-        const tabBtn = document.querySelector('[data-tab-target="config-pane"]');
-        if (tabBtn) tabBtn.addEventListener("click", () => { if (!configState.loaded) loadConfigSchema(); }, { once: false });
       })();
       buildOverview();
       renderLogs();

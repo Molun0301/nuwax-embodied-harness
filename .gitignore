@@ -1,5 +1,12 @@
 .env
 drivers/go2/data_plane.env
+# Web 配置面板写回产生的锁与备份（紧邻真实 env，不入库）
+.env.lock
+.env.bak
+.env.bak.*
+drivers/go2/data_plane.env.lock
+drivers/go2/data_plane.env.bak
+drivers/go2/data_plane.env.bak.*
 go2_proxy.log
 nuwax_robot_bridge.log
 nuwax_robot_bridge.log.lock

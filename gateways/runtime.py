@@ -882,8 +882,8 @@ class GatewayRuntime:
                     "system.metrics",
                     source="gateway",
                     payload_kind=StreamPayloadKind.JSON,
-                    status=str(snapshot.status),
-                    payload=snapshot.model_dump(),
+                    status=getattr(snapshot.status, "value", str(snapshot.status)),
+                    payload=snapshot.model_dump(mode="json"),
                 )
             except Exception:
                 RUNTIME_LOGGER.debug("性能监控采集/推送失败，本周期跳过。", exc_info=True)

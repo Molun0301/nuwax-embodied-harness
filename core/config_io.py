@@ -13,9 +13,16 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+try:
+    import fcntl  # POSIX 文件锁；Windows 无此模块时降级为无锁。
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore
 
 from core import config_registry as R
 
@@ -173,14 +180,43 @@ def _apply_updates_to_text(original: str, updates: Dict[str, str]) -> str:
     return "\n".join(out_lines) + "\n"
 
 
+@contextmanager
+def _target_lock(path: Path):
+    """对单个目标 env 文件加排他锁（per-target lock file），串行化并发写回。
+
+    无鉴权模式下任何客户端都能触发保存，并发写更易发生；用 flock 防止最后写者覆盖。
+    Windows / 无 fcntl 时降级为无锁（不阻塞功能）。
+    """
+
+    if fcntl is None:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = str(path) + ".lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def _atomic_write(path: Path, content: str) -> str:
-    """原子写：临时文件 + os.replace；写前备份原文件。返回备份路径（无原文件则空串）。"""
+    """原子写：临时文件 + os.replace；写前备份原文件为带时间戳的 .bak.<ts>。
+
+    返回备份路径（无原文件则空串）。同时维护一个固定 .bak 指向最近备份，便于人工回滚。
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = ""
     if path.exists():
-        backup = str(path) + ".bak"
-        Path(backup).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        backup = f"{path}.bak.{ts}"
+        original = path.read_text(encoding="utf-8")
+        Path(backup).write_text(original, encoding="utf-8")
+        # 固定 .bak 始终指向最近一次备份内容（覆盖），时间戳副本保留历史。
+        Path(str(path) + ".bak").write_text(original, encoding="utf-8")
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".cfg_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -197,7 +233,7 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
 
     规则：
     - 未知键 / 类型非法 → rejected，不写。
-    - 敏感键值等于脱敏掩码（未改动）→ skipped，不覆盖原密钥。
+    - 敏感键值等于脱敏掩码或为空串（未改动）→ skipped，不覆盖原密钥。
     - 其余按 target_file 路由到 core .env 或 go2 data_plane.env，原子写回。
     """
 
@@ -211,23 +247,28 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
         if field is None:
             rejected[key] = "未知配置键"
             continue
-        if field.sensitive and raw.strip() == _SENSITIVE_MASK:
+        if field.sensitive and raw.strip() in (_SENSITIVE_MASK, ""):
+            # 敏感键：脱敏掩码（未改动）或空串都视为“不改”，保留原密钥，避免被清空。
             skipped.append(key)
             continue
         normalized = _validate(key, raw, field.type)
         if normalized is None:
             rejected[key] = f"值不符合类型 {field.type}"
             continue
+        if field.choices and normalized not in field.choices:
+            rejected[key] = f"值必须是以下之一：{', '.join(field.choices)}"
+            continue
         per_target.setdefault(field.target_file, {})[key] = normalized
 
     backups: Dict[str, str] = {}
     for target_file, kv in per_target.items():
         path = _target_path(target_file)
-        original = path.read_text(encoding="utf-8") if path.exists() else ""
-        new_text = _apply_updates_to_text(original, kv)
-        backups[target_file] = _atomic_write(path, new_text)
-        # 回读校验
-        readback = _read_env_values(path)
+        with _target_lock(path):
+            original = path.read_text(encoding="utf-8") if path.exists() else ""
+            new_text = _apply_updates_to_text(original, kv)
+            backups[target_file] = _atomic_write(path, new_text)
+            # 回读校验（仍在锁内，避免并发写者插入）
+            readback = _read_env_values(path)
         confirmed = [k for k, v in kv.items() if readback.get(k) == v]
         written[target_file] = sorted(confirmed)
         missing = set(kv) - set(confirmed)

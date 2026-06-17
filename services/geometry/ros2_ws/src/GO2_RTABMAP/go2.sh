@@ -224,7 +224,7 @@ KILL_PATTERNS=(
   "bt_navigator|planner_server|controller_server|recoveries_server|behavior_server|smoother_server|waypoint_follower|velocity_smoother"
   "map_server|amcl|lifecycle_manager"
   "rtabmap|rtabmap_ros|rtabmap_viz|rtabmap_sync"
-  "cloud_to_scan|odom_tf_broadcaster|cmd_vel_bridge|frontier_explorer"
+  "cloud_to_scan|odom_tf_broadcaster|cmd_vel_bridge|plan_relay|frontier_explorer"
 )
 
 kill_matching_processes() {

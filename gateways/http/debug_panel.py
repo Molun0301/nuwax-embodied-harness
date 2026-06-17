@@ -78,8 +78,9 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     @router.get("/debug", response_class=HTMLResponse)
     @router.get("/debug/", response_class=HTMLResponse)
     async def debug_page(request: Request) -> HTMLResponse:
-        access = access_manager.authenticate_local_debug_page(request)
-        return HTMLResponse(_render_debug_page(access.token))
+        access_manager.authenticate_local_debug_page(request)
+        # 个人机器狗：网关不鉴权，前端无需注入访问令牌（保留空串占位，沿用现有 fetch 逻辑）。
+        return HTMLResponse(_render_debug_page(""))
 
     @router.get("/api/debug/overview")
     @router.get("/api/debug/snapshot")
@@ -562,6 +563,21 @@ def _render_debug_page(access_token: str) -> str:
     .tab-pane.active { display: block; }
     .tab-pane > .panel, .tab-pane > section.panel { box-shadow: none; background: rgba(255, 255, 255, 0.04); }
     [data-theme="dark"] .tab-pane > .panel, [data-theme="dark"] .tab-pane > section.panel { background: rgba(15, 23, 42, 0.28); }
+    .config-sections { display: flex; flex-direction: column; gap: 8px; }
+    .config-section { border: 1px solid var(--border-soft); border-radius: 10px; overflow: hidden; }
+    .config-section > summary { cursor: pointer; padding: 8px 10px; font-weight: 760; font-size: 12px; background: var(--panel-strong); list-style: none; display: flex; justify-content: space-between; align-items: center; }
+    .config-section > summary::-webkit-details-marker { display: none; }
+    .config-section[open] > summary { border-bottom: 1px solid var(--border-soft); }
+    .config-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 4px 10px; padding: 8px 10px; }
+    .config-row { display: contents; }
+    .config-row label { display: flex; flex-direction: column; gap: 1px; font-size: 11.5px; padding: 3px 0; }
+    .config-row label .ckey { color: var(--muted-strong); font-size: 10px; font-family: ui-monospace, monospace; }
+    .config-row .cfield { display: flex; align-items: center; gap: 6px; }
+    .config-row .cfield input, .config-row .cfield select { flex: 1; min-width: 0; }
+    .config-row.changed .cfield input, .config-row.changed .cfield select { border-color: var(--nav-plan); }
+    .config-badge { font-size: 9px; padding: 1px 5px; border-radius: 999px; background: rgba(148,163,184,0.18); color: var(--muted-strong); }
+    .config-badge.adv { background: rgba(245,158,11,0.18); color: #b45309; }
+    .config-badge.sec { background: rgba(239,68,68,0.16); color: #b91c1c; }
     .overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     #overview .overview-grid { max-height: none; overflow: visible; padding-right: 0; }
     #overview .status-card, .status-card { min-height: 92px; padding: 10px; }
@@ -733,6 +749,7 @@ def _render_debug_page(access_token: str) -> str:
                 <button class="tab-button" type="button" data-tab-target="video-pane">视频</button>
                 <button class="tab-button" type="button" data-tab-target="service-pane">进程</button>
                 <button class="tab-button" type="button" data-tab-target="logs-pane">日志</button>
+                <button class="tab-button" type="button" data-tab-target="config-pane">配置</button>
               </div>
               <div class="tab-content">
                 <div id="governance-pane" class="tab-pane active">
@@ -790,6 +807,23 @@ def _render_debug_page(access_token: str) -> str:
                     </div>
                     <div id="logsMeta" class="kv"></div>
                     <div id="logs" class="logs panel-meta"></div>
+                  </section>
+                </div>
+                <div id="config-pane" class="tab-pane">
+                  <section id="config-section" class="panel compact">
+                    <div class="card-head">
+                      <h3>配置管理</h3>
+                      <span id="configStatus" class="pill missing">missing</span>
+                    </div>
+                    <div class="toolbar">
+                      <input id="configSearch" class="field" type="search" placeholder="搜索配置键 / 中文名" aria-label="搜索配置">
+                      <label class="overlay-chip overlay-toggle"><input id="configShowAdvanced" type="checkbox">显示高级项</label>
+                      <button id="configReload" class="tab-button" type="button">重载</button>
+                      <button id="configSave" class="tab-button" type="button">保存改动</button>
+                    </div>
+                    <div id="configEffectNote" class="muted small panel-meta">保存后写入 .env，需重启网关生效（非热重载）。</div>
+                    <div id="configDirty" class="muted small panel-meta"></div>
+                    <div id="configSections" class="config-sections"></div>
                   </section>
                 </div>
               </div>
@@ -3737,6 +3771,172 @@ def _render_debug_page(access_token: str) -> str:
         const elapsed = Date.now() - state.overviewLastRenderAt;
         state.overviewRenderTimer = window.setTimeout(render, Math.max(0, OVERVIEW_RENDER_INTERVAL_MS - elapsed));
       }
+      const configState = { loaded: false, fields: new Map(), dirty: new Map(), lastSchema: null };
+      function configEscape(text) {
+        return String(text == null ? "" : text).replace(/[&<>"']/g, (c) => (
+          { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+        ));
+      }
+      async function loadConfigSchema() {
+        const status = document.getElementById("configStatus");
+        try {
+          const resp = await fetch(withAccessToken("/api/config/schema"));
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          const schema = await resp.json();
+          configState.fields.clear();
+          configState.dirty.clear();
+          configState.lastSchema = schema;
+          renderConfigSchema(schema);
+          configState.loaded = true;
+          setPill(status, "available", "配置");
+          document.getElementById("configEffectNote").textContent = schema.effect_note || "";
+          updateConfigDirty();
+        } catch (err) {
+          setPill(status, "error", "配置");
+          document.getElementById("configSections").innerHTML =
+            '<div class="empty panel-meta">加载配置失败：' + configEscape(err.message) + "</div>";
+        }
+      }
+      function renderConfigSchema(schema) {
+        const host = document.getElementById("configSections");
+        host.replaceChildren();
+        const showAdvanced = document.getElementById("configShowAdvanced").checked;
+        const query = (document.getElementById("configSearch").value || "").trim().toLowerCase();
+        for (const section of schema.sections || []) {
+          const visible = (section.fields || []).filter((f) => {
+            if (!showAdvanced && f.advanced) return false;
+            if (query && !(f.key.toLowerCase().includes(query) || (f.zh_name || "").toLowerCase().includes(query))) return false;
+            return true;
+          });
+          if (!visible.length) continue;
+          const details = document.createElement("details");
+          details.className = "config-section";
+          if (query || !visible.some((f) => f.advanced)) details.open = true;
+          const summary = document.createElement("summary");
+          summary.innerHTML = configEscape(section.section_title) +
+            ' <span class="config-badge">' + visible.length + "</span>";
+          details.appendChild(summary);
+          const grid = document.createElement("div");
+          grid.className = "config-grid";
+          for (const f of visible) {
+            configState.fields.set(f.key, f);
+            grid.appendChild(buildConfigRow(f));
+          }
+          details.appendChild(grid);
+          host.appendChild(details);
+        }
+        if (!host.children.length) {
+          host.innerHTML = '<div class="empty panel-meta">无匹配配置项。</div>';
+        }
+      }
+      function buildConfigRow(f) {
+        const row = document.createElement("div");
+        row.className = "config-row";
+        row.dataset.key = f.key;
+        const label = document.createElement("label");
+        label.htmlFor = "cfg__" + f.key;
+        let badges = "";
+        if (f.advanced) badges += ' <span class="config-badge adv">高级</span>';
+        if (f.sensitive) badges += ' <span class="config-badge sec">敏感</span>';
+        label.innerHTML = configEscape(f.zh_name) + badges +
+          '<span class="ckey">' + configEscape(f.key) + "</span>";
+        const cell = document.createElement("div");
+        cell.className = "cfield";
+        let input;
+        if (f.type === "bool") {
+          input = document.createElement("select");
+          for (const opt of ["true", "false"]) {
+            const o = document.createElement("option");
+            o.value = opt; o.textContent = opt;
+            input.appendChild(o);
+          }
+          input.value = String(f.value).toLowerCase() === "true" ? "true" : "false";
+        } else if (Array.isArray(f.choices) && f.choices.length) {
+          input = document.createElement("select");
+          for (const opt of f.choices) {
+            const o = document.createElement("option");
+            o.value = opt; o.textContent = opt;
+            input.appendChild(o);
+          }
+          if (!f.choices.includes(f.value) && f.value) {
+            const o = document.createElement("option");
+            o.value = f.value; o.textContent = f.value + "（当前）";
+            input.appendChild(o);
+          }
+          input.value = f.value || f.choices[0];
+        } else {
+          input = document.createElement("input");
+          input.type = f.sensitive ? "password" : "text";
+          input.value = f.sensitive ? "" : (f.value == null ? "" : f.value);
+          if (f.sensitive) input.placeholder = f.is_set ? "（已设置，留空不改）" : "（未设置）";
+        }
+        input.id = "cfg__" + f.key;
+        input.className = "field";
+        input.dataset.original = (f.sensitive && f.is_set) ? "" : (f.value == null ? "" : String(f.value));
+        if (configState.dirty.has(f.key)) {
+          input.value = configState.dirty.get(f.key);
+          row.classList.add("changed");
+        }
+        input.addEventListener("input", () => onConfigInput(f.key, input, row));
+        input.addEventListener("change", () => onConfigInput(f.key, input, row));
+        cell.appendChild(input);
+        row.append(label, cell);
+        return row;
+      }
+      function onConfigInput(key, input, row) {
+        const changed = input.value !== input.dataset.original;
+        row.classList.toggle("changed", changed);
+        if (changed) configState.dirty.set(key, input.value);
+        else configState.dirty.delete(key);
+        updateConfigDirty();
+      }
+      function updateConfigDirty() {
+        const el = document.getElementById("configDirty");
+        const n = configState.dirty.size;
+        el.textContent = n ? ("待保存改动：" + n + " 项") : "无未保存改动。";
+      }
+      async function saveConfig() {
+        if (!configState.dirty.size) { updateConfigDirty(); return; }
+        const status = document.getElementById("configStatus");
+        const updates = {};
+        for (const [k, v] of configState.dirty.entries()) updates[k] = v;
+        try {
+          setPill(status, "stale", "保存中");
+          const resp = await fetch(withAccessToken("/api/config/save"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ updates }),
+          });
+          const result = await resp.json();
+          if (!resp.ok) throw new Error(result.detail || ("HTTP " + resp.status));
+          const rejected = Object.keys(result.rejected || {});
+          const note = document.getElementById("configDirty");
+          if (rejected.length) {
+            note.textContent = "部分被拒绝：" + rejected.join(", ");
+            setPill(status, "error", "配置");
+          } else {
+            note.textContent = "已保存，重启网关后生效。";
+            setPill(status, "available", "配置");
+          }
+          await loadConfigSchema();
+        } catch (err) {
+          setPill(status, "error", "配置");
+          document.getElementById("configDirty").textContent = "保存失败：" + err.message;
+        }
+      }
+      (function wireConfigPanel() {
+        const reload = document.getElementById("configReload");
+        const save = document.getElementById("configSave");
+        const search = document.getElementById("configSearch");
+        const adv = document.getElementById("configShowAdvanced");
+        if (reload) reload.addEventListener("click", loadConfigSchema);
+        if (save) save.addEventListener("click", saveConfig);
+        const rerender = () => { if (configState.loaded && configState.lastSchema) renderConfigSchema(configState.lastSchema); };
+        if (search) search.addEventListener("input", rerender);
+        if (adv) adv.addEventListener("change", rerender);
+        const tabBtn = document.querySelector('[data-tab-target="config-pane"]');
+        if (tabBtn) tabBtn.addEventListener("click", () => { if (!configState.loaded) loadConfigSchema(); }, { once: false });
+      })();
       buildOverview();
       renderLogs();
       updateClock();

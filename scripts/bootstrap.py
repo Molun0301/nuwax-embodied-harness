@@ -35,8 +35,6 @@ DEFAULT_PROXY_MCP_TEMPLATE = PROJECT_ROOT / "deploy" / "nuwaclaw" / "mcp_proxy_c
 DEFAULT_EXTERNAL_MCP_OUTPUT = PROJECT_ROOT / "deploy" / "nuwaclaw" / "external_mcp_servers.host_gateway.json"
 DEFAULT_PROXY_MCP_OUTPUT = PROJECT_ROOT / "deploy" / "nuwaclaw" / "mcp_proxy_config.host_gateway.json"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8766/api/health"
-DEFAULT_AGENT_TOKEN = "agent-robot-bridge-token"
-DEFAULT_ADMIN_TOKEN = "admin-robot-bridge-token"
 DEFAULT_NUWACLAW_CLIENT_CONTAINER_NAME = "nuwax-client"
 DEFAULT_NUWACLAW_CLIENT_VOLUME_NAME = "nuwax_home"
 DEFAULT_NUWACLAW_CLIENT_IMAGE = "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/nuwax-agent-client:latest"
@@ -647,8 +645,6 @@ class BootstrapPlanner:
         self.run_healthcheck = self._resolve_bool("healthcheck", default=False)
         self.mcp_mode = self._resolve_choice("mcp_mode", ("auto", "config-only", "skip"), default="auto")
         self.health_url = str(args.health_url or DEFAULT_HEALTH_URL).strip() or DEFAULT_HEALTH_URL
-        self.agent_token = str(args.agent_token or self.root_existing.get("NUWAX_GATEWAY_AGENT_TOKENS", DEFAULT_AGENT_TOKEN)).strip() or DEFAULT_AGENT_TOKEN
-        self.admin_token = str(args.admin_token or self.root_existing.get("NUWAX_GATEWAY_ADMIN_TOKENS", DEFAULT_ADMIN_TOKEN)).strip() or DEFAULT_ADMIN_TOKEN
         self.install_nuwaclaw_docker = self._resolve_bool("install_nuwaclaw_docker", default=False)
         self.nuwaclaw_saved_key = str(args.nuwaclaw_saved_key or os.environ.get("NUWAX_SAVED_KEY", "")).strip()
         self.nuwaclaw_host_mount = self._resolve_choice(
@@ -741,8 +737,6 @@ class BootstrapPlanner:
             "NUWAX_MAP_CATALOG_ROOT": str(PROJECT_ROOT / "runtime_data" / "maps"),
             "NUWAX_RTABMAP_DATABASE_ROOT": str(PROJECT_ROOT / "runtime_data" / "geometry" / "rtabmap"),
             "NUWAX_MEMORY_DB_PATH": str(PROJECT_ROOT / "runtime_data" / "memory" / "vector_memory.db"),
-            "NUWAX_GATEWAY_AGENT_TOKENS": self.agent_token,
-            "NUWAX_GATEWAY_ADMIN_TOKENS": self.admin_token,
             "NUWAX_RELAY_ENABLED": _bool_text(self.relay_enabled),
         }
         if self.selected_robot == "go2" and self.geometry_enabled:
@@ -985,8 +979,7 @@ def run_checks(planner: BootstrapPlanner) -> int:
         results.append((_file_exists(DEFAULT_PROXY_MCP_TEMPLATE), _check_result("SQLite MCP 模板", _file_exists(DEFAULT_PROXY_MCP_TEMPLATE), str(DEFAULT_PROXY_MCP_TEMPLATE))))
 
     if planner.run_healthcheck:
-        token_ok = bool(planner.agent_token.strip())
-        results.append((token_ok, _check_result("健康检查 token", token_ok, "将使用 Authorization: Bearer <agent token> 调用 /api/health")))
+        results.append((True, _check_result("健康检查", True, "将匿名调用 /api/health（网关不鉴权）")))
 
     if planner.install_nuwaclaw_docker:
         docker_ok = _which("docker") is not None
@@ -1317,12 +1310,11 @@ def install_nuwaclaw_client(planner: BootstrapPlanner) -> None:
         )
 
 
-def render_mcp_payload(token: str) -> Dict[str, object]:
+def render_mcp_payload() -> Dict[str, object]:
     return {
         "mcpServers": {
             "nuwax_robot_bridge": {
                 "url": "http://host.docker.internal:8766/mcp",
-                "headers": {"Authorization": f"Bearer {token}"},
             }
         }
     }
@@ -1333,7 +1325,7 @@ def configure_mcp(planner: BootstrapPlanner) -> None:
         print("跳过 MCP 注入。")
         return
 
-    payload = render_mcp_payload(planner.agent_token)
+    payload = render_mcp_payload()
     _write_text(planner.external_mcp_output, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     _write_text(planner.proxy_mcp_output, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     print(f"已生成外部 MCP 配置: {planner.external_mcp_output}")
@@ -1435,7 +1427,6 @@ def run_healthcheck(planner: BootstrapPlanner) -> None:
         print("跳过健康检查。")
         return
     request = urllib.request.Request(planner.health_url)
-    request.add_header("Authorization", f"Bearer {planner.agent_token}")
     try:
         with urllib.request.urlopen(request, timeout=10.0) as response:
             payload = response.read().decode("utf-8", errors="replace")
@@ -1534,8 +1525,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--memory-mode", choices=("cloud", "local", "disabled"), help="记忆模式。")
         subparser.add_argument("--perception-mode", choices=("local", "hybrid", "cloud-scene", "disabled"), help="感知模式。")
         subparser.add_argument("--mcp-mode", choices=("auto", "config-only", "skip"), help="MCP 注入模式。")
-        subparser.add_argument("--agent-token", default="", help="健康检查与 MCP 默认使用的 agent token。")
-        subparser.add_argument("--admin-token", default="", help="写入 .env 的 admin token。")
         subparser.add_argument("--nuwaclaw-saved-key", default="", help="安装 NuwaxClaw Docker 客户端时写入的个人密钥。")
         subparser.add_argument(
             "--nuwaclaw-host-mount",

@@ -15,6 +15,7 @@ from gateways.errors import AccessDeniedError, as_gateway_error
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable
 from gateways.tcp_legacy.policy import build_tcp_legacy_policy
+from core import config_io
 from skills.handlers import localization_skills
 from skills.handlers import memory_skills
 
@@ -212,11 +213,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
       <section class="card">
         <h2>安全策略</h2>
         <ul>
-          <li><span>允许网段</span><span class="mono">{", ".join(security_policy["allowed_source_cidrs"]) or "未限制"}</span></li>
-          <li><span>允许未知来源</span><span class="mono">{security_policy["allow_unknown_client_hosts"]}</span></li>
-          <li><span>Agent 令牌数</span><span class="mono">{security_policy["agent_token_count"]}</span></li>
-          <li><span>Admin 令牌数</span><span class="mono">{security_policy["admin_token_count"]}</span></li>
-          <li><span>高风险白名单</span><span class="mono">{", ".join(security_policy["agent_high_risk_allowlist"]) or "空"}</span></li>
+          <li><span>鉴权</span><span class="mono">{security_policy["auth"]}</span></li>
+          <li><span>高危能力白名单</span><span class="mono">{", ".join(security_policy["capability_high_risk_allowlist"]) or "空"}</span></li>
         </ul>
       </section>
       <section class="card">
@@ -279,11 +277,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         include_unsupported: bool = False,
     ) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
-        exposed_only = None if access.role.value == "admin" else True
+        access_manager.authenticate_http(request)
+        # 个人机器狗不鉴权：工具清单全量展示（exposed_only=None）。
         views = await run_in_threadpool(
             lambda: runtime.list_tools(
-                exposed_only=exposed_only,
+                exposed_only=None,
                 include_unsupported=include_unsupported,
             )
         )
@@ -293,6 +291,36 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_security_policy(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         return access_manager.export_policy()
+
+    @router.get("/api/config/schema")
+    async def api_config_schema(request: Request) -> Dict[str, Any]:
+        """返回全量配置 schema（按板块分组，敏感项脱敏）。"""
+
+        access_manager.authenticate_http(request)
+        return await run_in_threadpool(config_io.build_schema)
+
+    @router.post("/api/config/save")
+    async def api_config_save(request: Request) -> Dict[str, Any]:
+        """批量写回配置项到 .env（按 target_file 路由，原子写 + 备份）。重启后生效。"""
+
+        access_manager.authenticate_http(request)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise as_gateway_error(ValueError("请求体必须为对象 {key: value}"))
+        updates = payload.get("updates", payload)
+        if not isinstance(updates, dict):
+            raise as_gateway_error(ValueError("updates 必须为对象 {key: value}"))
+        clean = {str(k): str(v) for k, v in updates.items()}
+        result = await run_in_threadpool(config_io.save_values, clean)
+        return {
+            "written": result.written,
+            "skipped": result.skipped,
+            "rejected": result.rejected,
+            "backups": {k: bool(v) for k, v in result.backups.items()},
+            "restart_required": bool(result.written),
+            "effect_note": "已写入 .env，需重启网关生效（非热重载）。",
+        }
+
 
     @router.get("/api/deployment/layout")
     async def api_deployment_layout(request: Request) -> Dict[str, Any]:
@@ -316,19 +344,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         if request.client is not None and request.client.host:
             return request.client.host
         return "-"
-
-    def _assert_admin(access, *, endpoint: str) -> None:
-        """管理面破坏性端点的 admin 角色断言。
-
-        参照 /api/legacy/tcp_policy 写法：删除/激活/保存/加载等绕过能力级风险鉴权的
-        管理端点，统一要求 admin 角色，防止 agent 令牌直接清空地图/记忆库资产。
-        """
-
-        if access.role.value != "admin":
-            raise AccessDeniedError(
-                "该管理端点仅 admin 角色可访问。",
-                details={"role": access.role.value, "endpoint": endpoint},
-            )
 
     def _build_capability_request_context(
         request: Request,
@@ -414,12 +429,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/legacy/tcp_policy")
     async def api_tcp_policy(request: Request) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
-        if access.role.value != "admin":
-            raise AccessDeniedError(
-                "tcp_legacy 策略仅 admin 角色可访问。",
-                details={"role": access.role.value, "endpoint": "/api/legacy/tcp_policy"},
-            )
+        access_manager.authenticate_http(request)
         return to_jsonable(build_tcp_legacy_policy())
 
     @router.get("/api/state/latest")
@@ -568,8 +578,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         delete_memory_library: bool = False,
     ) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
-        _assert_admin(access, endpoint="DELETE /api/maps/catalog/{map_name}")
+        access_manager.authenticate_http(request)
         delete_result = runtime.map_workspace_service.delete_map(
             map_name=map_name,
             delete_memory_library=delete_memory_library,
@@ -584,8 +593,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/maps/activate")
     async def api_maps_activate(request: Request) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
-        _assert_admin(access, endpoint="POST /api/maps/activate")
+        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -629,8 +637,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/maps/versions/save")
     async def api_map_versions_save(request: Request) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
-        _assert_admin(access, endpoint="POST /api/maps/versions/save")
+        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -648,8 +655,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/maps/versions/load")
     async def api_map_versions_load(request: Request) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
-        _assert_admin(access, endpoint="POST /api/maps/versions/load")
+        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -721,8 +727,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.delete("/api/memory/libraries/{library_name}")
     async def api_delete_memory_library(library_name: str, request: Request) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
-        _assert_admin(access, endpoint="DELETE /api/memory/libraries/{library_name}")
+        access_manager.authenticate_http(request)
         active_workspace = runtime.map_workspace_service.get_active_workspace()
         delete_result = runtime.memory_service.delete_memory_library(library_name=library_name)
         if active_workspace is not None and active_workspace.active_map_name == library_name:

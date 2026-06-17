@@ -570,11 +570,7 @@ class GatewayServerConfig:
     port: int = 8766
     public_base_url: str = "http://host.docker.internal:8766"
     artifact_dir: str = ""
-    agent_tokens: Tuple[str, ...] = ()
-    admin_tokens: Tuple[str, ...] = ()
-    agent_high_risk_allowlist: Tuple[str, ...] = ()
-    allowed_source_cidrs: Tuple[str, ...] = ("127.0.0.1/32",)
-    allow_unknown_client_hosts: bool = True
+    capability_high_risk_allowlist: Tuple[str, ...] = ()
     sse_keepalive_sec: float = 10.0
     ws_ping_interval_sec: float = 15.0
     # 性能监控（CPU/内存/进程）采集配置（平台侧，通用不绑定机器人）。
@@ -979,11 +975,10 @@ def load_config() -> NuwaxRobotBridgeConfig:
         port=gateway_port,
         public_base_url=_cfg_str("NUWAX_GATEWAY_PUBLIC_BASE_URL", default_public_base_url),
         artifact_dir=_cfg_str("NUWAX_GATEWAY_ARTIFACT_DIR", str(BASE_DIR / "artifacts")),
-        agent_tokens=_cfg_csv("NUWAX_GATEWAY_AGENT_TOKENS", ()),
-        admin_tokens=_cfg_csv("NUWAX_GATEWAY_ADMIN_TOKENS", ()),
-        agent_high_risk_allowlist=_cfg_csv("NUWAX_GATEWAY_AGENT_HIGH_RISK_ALLOWLIST", ()),
-        allowed_source_cidrs=_cfg_csv("NUWAX_GATEWAY_ALLOWED_SOURCE_CIDRS", ("127.0.0.1/32", "172.17.0.0/16")),
-        allow_unknown_client_hosts=_cfg_bool("NUWAX_GATEWAY_ALLOW_UNKNOWN_CLIENT_HOSTS", False),
+        capability_high_risk_allowlist=_cfg_csv(
+            "NUWAX_GATEWAY_HIGH_RISK_ALLOWLIST",
+            _cfg_csv("NUWAX_GATEWAY_AGENT_HIGH_RISK_ALLOWLIST", ()),
+        ),
         sse_keepalive_sec=_cfg_float("NUWAX_GATEWAY_SSE_KEEPALIVE_SEC", 10.0),
         ws_ping_interval_sec=_cfg_float("NUWAX_GATEWAY_WS_PING_INTERVAL_SEC", 15.0),
         telemetry_enabled=_cfg_bool("NUWAX_GATEWAY_TELEMETRY_ENABLED", True),
@@ -1000,11 +995,8 @@ def load_config() -> NuwaxRobotBridgeConfig:
         host=_cfg_str("NUWAX_RELAY_HOST", "127.0.0.1"),
         port=_cfg_int("NUWAX_RELAY_PORT", 9766),
         upstream_base_url=_cfg_str("NUWAX_RELAY_UPSTREAM_BASE_URL", gateway.public_base_url),
-        incoming_tokens=_cfg_csv("NUWAX_RELAY_INCOMING_TOKENS", gateway.agent_tokens),
-        upstream_token=_cfg_str(
-            "NUWAX_RELAY_UPSTREAM_TOKEN",
-            gateway.agent_tokens[0] if gateway.agent_tokens else "",
-        ),
+        incoming_tokens=_cfg_csv("NUWAX_RELAY_INCOMING_TOKENS", ()),
+        upstream_token=_cfg_str("NUWAX_RELAY_UPSTREAM_TOKEN", ""),
     )
 
     runtime_data = RuntimeDataConfig(

@@ -59,6 +59,23 @@ class _RawKey:
     target_file: str
 
 
+def _node_source(node: ast.AST, source: str) -> str:
+    """取 AST 节点对应的源码文本，Python 3.8 兼容。
+
+    优先 ``ast.get_source_segment``（3.8 起可用）；缺失时回退到 ``ast.unparse``
+    （3.9+）；都没有则空串。替代直接用 ``ast.unparse``——后者 3.8 不存在，
+    实机（Python 3.8）会 AttributeError 导致 build_registry 崩溃。
+    """
+
+    seg = ast.get_source_segment(source, node)
+    if seg is not None:
+        return seg
+    unparse = getattr(ast, "unparse", None)
+    if unparse is not None:
+        return unparse(node)
+    return ""
+
+
 def _parse_settings_keys(path: Path, target_file: str) -> Dict[str, _RawKey]:
     """AST 解析 settings 文件，提取每个 _cfg_* 调用的键/类型/默认值/alias。
 
@@ -67,7 +84,8 @@ def _parse_settings_keys(path: Path, target_file: str) -> Dict[str, _RawKey]:
     """
 
     raw: Dict[str, _RawKey] = {}
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
             continue
@@ -82,7 +100,7 @@ def _parse_settings_keys(path: Path, target_file: str) -> Dict[str, _RawKey]:
                     try:
                         default_repr = repr(ast.literal_eval(args[2]))
                     except Exception:
-                        default_repr = ast.unparse(args[2])
+                        default_repr = _node_source(args[2], source)
                 raw.setdefault(key, _RawKey(key, "str", default_repr, None, target_file))
             continue
         if not fn.startswith("_cfg_"):
@@ -109,7 +127,7 @@ def _parse_settings_keys(path: Path, target_file: str) -> Dict[str, _RawKey]:
             try:
                 default_repr = repr(ast.literal_eval(args[default_idx]))
             except Exception:
-                default_repr = ast.unparse(args[default_idx])
+                default_repr = _node_source(args[default_idx], source)
         # 同键多次出现以首次为准（settings.py 内通常唯一）。
         raw.setdefault(key, _RawKey(key, typ, default_repr, alias_of, target_file))
     return raw

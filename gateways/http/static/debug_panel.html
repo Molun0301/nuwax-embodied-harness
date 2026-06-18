@@ -293,8 +293,13 @@ button{font-family:inherit;cursor:pointer}
 .config-section-block{border:1px solid var(--line-2);border-radius:var(--r);overflow:hidden;background:var(--surface-2);scroll-margin-top:8px}
 .config-section-title{font-weight:660;padding:11px 14px;font-size:12.5px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--line-2)}
 .config-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:11px 18px;padding:13px 14px}
-.config-adv-fold{padding:0 14px 13px}
-.config-adv-fold>summary{cursor:pointer;font-size:11.5px;font-weight:620;color:var(--muted);padding:8px 0}
+.config-adv{border-top:1px dashed var(--line-2)}
+.config-adv-bar{display:flex;align-items:center;gap:8px;padding:8px 14px;font-size:11px;font-weight:620;color:var(--faint)}
+.config-adv-inner{display:grid;grid-template-rows:0fr;transition:grid-template-rows .28s cubic-bezier(.22,.61,.36,1)}
+.config-adv-inner>.config-grid{overflow:hidden;min-height:0;padding-top:0;transition:opacity .2s ease;opacity:0}
+.config-sections.show-adv .config-adv-inner,.config-adv.open .config-adv-inner{grid-template-rows:1fr}
+.config-sections.show-adv .config-adv-inner>.config-grid,.config-adv.open .config-adv-inner>.config-grid{opacity:1}
+.config-sections:not(.show-adv) .config-adv:not(.open) .config-adv-bar{opacity:.6}
 .config-row{display:flex;flex-direction:column;gap:4px}
 .config-row label{display:flex;flex-direction:column;gap:2px;font-size:11.5px;font-weight:600}
 .config-row label .ckey{color:var(--faint);font-size:9.5px;font-family:var(--mono);font-weight:400}
@@ -3570,21 +3575,24 @@ button{font-family:inherit;cursor:pointer}
             block.appendChild(grid);
           }
           if (advanced.length) {
-            // 高级项默认折叠（不是隐藏）：搜索命中或勾选「展开高级项」时自动展开。
-            const fold = document.createElement("details");
-            fold.className = "config-adv-fold";
-            fold.open = forceAdvanced || !!query;
-            const sum = document.createElement("summary");
-            sum.textContent = "高级项（" + advanced.length + "）";
-            fold.appendChild(sum);
+            // 高级项：默认隐藏，勾选「展开高级项」或搜索命中时展开（带高度动画）。
+            const wrap = document.createElement("div");
+            wrap.className = "config-adv" + (query ? " open" : "");
+            const bar = document.createElement("div");
+            bar.className = "config-adv-bar";
+            bar.innerHTML = '<span>高级项</span><span class="config-badge">' + advanced.length + "</span>";
+            const inner = document.createElement("div");
+            inner.className = "config-adv-inner";
             const grid = document.createElement("div");
             grid.className = "config-grid";
             for (const f of advanced) { configState.fields.set(f.key, f); grid.appendChild(buildConfigRow(f)); }
-            fold.appendChild(grid);
-            block.appendChild(fold);
+            inner.appendChild(grid);
+            wrap.append(bar, inner);
+            block.appendChild(wrap);
           }
           host.appendChild(block);
         }
+        host.classList.toggle("show-adv", forceAdvanced);
         if (navLinks.length) navLinks[0].classList.add("on");
         setupConfigScrollSpy(host, navLinks);
         if (!host.children.length) {
@@ -3732,7 +3740,11 @@ button{font-family:inherit;cursor:pointer}
         if (save) save.addEventListener("click", saveConfig);
         const rerender = () => { if (configState.loaded && configState.lastSchema) renderConfigSchema(configState.lastSchema); };
         if (search) search.addEventListener("input", rerender);
-        if (adv) adv.addEventListener("change", rerender);
+        // 勾选直接切 class 触发高度动画，不重渲染（重渲染会打断过渡）。
+        if (adv) adv.addEventListener("change", () => {
+          const host = document.getElementById("configSections");
+          if (host) host.classList.toggle("show-adv", adv.checked);
+        });
       })();
       buildOverview();
       renderLogs();

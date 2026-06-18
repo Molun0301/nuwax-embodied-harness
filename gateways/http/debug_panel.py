@@ -206,429 +206,226 @@ def _render_debug_page(access_token: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>nuwax_robot_bridge 只读机器人监控驾驶舱</title>
   <style>
-    :root {
-      --bg: #f4f7fb;
-      --bg-grad-a: rgba(37, 99, 235, 0.10);
-      --bg-grad-b: rgba(14, 165, 233, 0.08);
-      --surface: rgba(255, 255, 255, 0.88);
-      --surface-strong: rgba(255, 255, 255, 0.96);
-      --panel: rgba(255, 255, 255, 0.86);
-      --panel-soft: rgba(248, 250, 252, 0.80);
-      --panel-strong: #f8fafc;
-      --border: rgba(148, 163, 184, 0.32);
-      --border-soft: rgba(148, 163, 184, 0.18);
-      --border-strong: rgba(37, 99, 235, 0.46);
-      --text: #0f172a;
-      --muted: #64748b;
-      --muted-strong: #334155;
-      --good: #16a34a;
-      --warn: #ca8a04;
-      --bad: #dc2626;
-      --info: #2563eb;
-      --accent: #2563eb;
-      --accent-strong: #0ea5e9;
-      --map-line: #0ea5e9;
-      --nav-plan: #22ff66;
-      --map-robot: #f59e0b;
-      --unknown: #cbd5e1;
-      --free: #dbeafe;
-      --occupied: #172033;
-      --frontier: #db2777;
-      --shadow: 0 22px 70px rgba(15, 23, 42, 0.12);
-      --shadow-soft: 0 10px 34px rgba(15, 23, 42, 0.08);
-      --radius: 20px;
-      --radius-sm: 14px;
+    :root{
+      --bg:#F5F6F8; --surface:#fff; --surface-2:#FBFBFC; --inset:#F2F3F5; --inset-2:#ECEEF1;
+      --text:#16191D; --strong:#33373D; --muted:#6A7079; --faint:#9AA0A8;
+      --line:rgba(20,24,30,.085); --line-2:rgba(20,24,30,.05); --ring:rgba(20,24,30,.14);
+      --good:#1F9D57; --good-w:rgba(31,157,87,.10);
+      --warn:#C98A12; --warn-w:rgba(201,138,18,.12);
+      --bad:#D23B2E; --bad-w:rgba(210,59,46,.10);
+      --info:#3F73C4; --info-w:rgba(63,115,196,.10);
+      --accent:#16191D; --accent-w:rgba(20,24,30,.06);
+      --robot:#E8833A; --traj:#5B6B7B; --plan:#1F9D57; --frontier:#C2477E; --goal:#7C5CFC;
+      --map-line:#5B6B7B; --nav-plan:#1F9D57; --map-robot:#E8833A; --frontier-c:#C2477E;
+      --unknown:#EAECEF; --free:#EAECEF; --occupied:#22262B; --grid-bg:#fff;
+      --sh-sm:0 1px 2px rgba(16,20,28,.04),0 4px 14px -8px rgba(16,20,28,.14);
+      --sh:0 2px 6px rgba(16,20,28,.05),0 18px 40px -26px rgba(16,20,28,.28);
+      --r-xl:18px; --r-lg:15px; --r:11px; --r-sm:8px; --pill:999px;
+      --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      --sans:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","Noto Sans SC",sans-serif;
     }
-    [data-theme="dark"] {
-      --bg: #07111f;
-      --bg-grad-a: rgba(34, 211, 238, 0.14);
-      --bg-grad-b: rgba(37, 99, 235, 0.12);
-      --surface: rgba(15, 23, 42, 0.72);
-      --surface-strong: rgba(15, 23, 42, 0.90);
-      --panel: rgba(15, 23, 42, 0.74);
-      --panel-soft: rgba(30, 41, 59, 0.58);
-      --panel-strong: rgba(15, 23, 42, 0.92);
-      --border: rgba(148, 163, 184, 0.18);
-      --border-soft: rgba(148, 163, 184, 0.11);
-      --border-strong: rgba(34, 211, 238, 0.42);
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --muted-strong: #cbd5e1;
-      --good: #4ade80;
-      --warn: #facc15;
-      --bad: #f87171;
-      --info: #60a5fa;
-      --accent: #38bdf8;
-      --accent-strong: #22d3ee;
-      --map-line: #38bdf8;
-      --nav-plan: #22ff66;
-      --map-robot: #fbbf24;
-      --unknown: #334155;
-      --free: #93c5fd;
-      --occupied: #020617;
-      --frontier: #f472b6;
-      --shadow: 0 28px 90px rgba(0, 0, 0, 0.36);
-      --shadow-soft: 0 16px 44px rgba(0, 0, 0, 0.24);
+    [data-theme="dark"]{
+      --bg:#0C0D0F; --surface:#161819; --surface-2:#131516; --inset:#1C1F21; --inset-2:#23262A;
+      --text:#ECEEF1; --strong:#C9CDD3; --muted:#8B9199; --faint:#666C74;
+      --line:rgba(255,255,255,.09); --line-2:rgba(255,255,255,.05); --ring:rgba(255,255,255,.16);
+      --good:#3FBE76; --good-w:rgba(63,190,118,.14);
+      --warn:#E0A93E; --warn-w:rgba(224,169,62,.14);
+      --bad:#E4604F; --bad-w:rgba(228,96,79,.14);
+      --info:#6F9FE0; --info-w:rgba(111,159,224,.14);
+      --accent:#ECEEF1; --accent-w:rgba(255,255,255,.08);
+      --robot:#F09A52; --traj:#8A97A4; --plan:#3FBE76; --frontier:#DC6FA0; --goal:#9B82FB;
+      --map-line:#8A97A4; --nav-plan:#3FBE76; --map-robot:#F09A52; --frontier-c:#DC6FA0;
+      --unknown:#23272C; --free:#23272C; --occupied:#05070A; --grid-bg:#0E1012;
+      --sh-sm:0 1px 2px rgba(0,0,0,.4),0 4px 14px -8px rgba(0,0,0,.6);
+      --sh:0 2px 6px rgba(0,0,0,.4),0 22px 48px -28px rgba(0,0,0,.8);
     }
-    * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
-    body {
-      margin: 0;
-      padding: 14px;
-      min-height: 100vh;
-      background:
-        radial-gradient(circle at 10% 6%, var(--bg-grad-a), transparent 32rem),
-        radial-gradient(circle at 88% 4%, var(--bg-grad-b), transparent 36rem),
-        linear-gradient(135deg, var(--bg) 0%, var(--panel-strong) 100%);
-      color: var(--text);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
-      transition: background 0.3s ease, color 0.3s ease;
-    }
-    .app-shell { width: min(100%, 2260px); margin: 0 auto; display: grid; gap: 12px; }
-    #view-host { min-width: 0; min-height: 0; }
-    .view-pane { display: none; min-width: 0; min-height: 0; }
-    .view-pane.active { display: block; }
-    .view-switch { display: inline-flex; gap: 6px; margin-top: 8px; }
-    .view-switch-btn { border: 1px solid var(--border-soft); border-radius: 999px; background: var(--panel-strong); color: var(--muted-strong); min-height: 30px; padding: 5px 18px; font: inherit; font-size: 12px; font-weight: 780; cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease; }
-    .view-switch-btn:hover, .view-switch-btn.active { border-color: var(--border-strong); background: rgba(37, 99, 235, 0.14); color: var(--text); }
-    [data-theme="dark"] .view-switch-btn:hover, [data-theme="dark"] .view-switch-btn.active { background: rgba(34, 211, 238, 0.16); }
-    .config-fullpage { display: grid; grid-template-rows: auto auto auto auto auto minmax(0, 1fr); gap: 10px; min-height: 0; height: 100%; overflow: hidden; }
-    .config-fullpage .config-sections { overflow: auto; min-height: 0; padding-right: 4px; }
-    .config-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    .config-toolbar .field { flex: 1 1 280px; min-width: 200px; }
-    .config-auth-note { font-size: 12px; font-weight: 680; color: #b45309; background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 8px; padding: 7px 12px; }
-    [data-theme="dark"] .config-auth-note { color: #fbbf24; }
-    .config-section-block { border: 1px solid var(--border-soft); border-radius: 10px; margin-bottom: 10px; background: rgba(255,255,255,0.03); }
-    [data-theme="dark"] .config-section-block { background: rgba(15, 23, 42, 0.3); }
-    .config-section-block > .config-section-title { font-weight: 800; padding: 9px 12px; font-size: 13px; }
-    .config-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 8px 14px; padding: 0 12px 12px; }
-    .config-adv-fold { margin: 0 12px 12px; }
-    .config-adv-fold > summary { cursor: pointer; font-size: 12px; font-weight: 720; color: var(--muted-strong); padding: 6px 0; }
-    .config-row.invalid .field { border-color: #ef4444; }
-    .config-row .config-err { color: #ef4444; font-size: 11px; min-height: 0; }
-    .topbar {
-      display: grid;
-      grid-template-columns: minmax(300px, 0.46fr) minmax(0, 1.54fr);
-      gap: 12px;
-      align-items: stretch;
-    }
-    .brand-block, .global-status, .panel, .card, .side-nav {
-      position: relative;
-      overflow: hidden;
-      background: linear-gradient(180deg, var(--panel), var(--panel-soft));
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow-soft);
-      backdrop-filter: blur(18px);
-      transition: background 0.3s ease, border-color 0.3s ease;
-    }
-    .brand-block::before, .global-status::before, .panel::before, .card::before, .side-nav::before {
-      content: "";
-      position: absolute;
-      inset: 0 0 auto;
-      height: 1px;
-      background: linear-gradient(90deg, transparent, var(--accent-strong), transparent);
-      opacity: 0.58;
-      pointer-events: none;
-    }
-    .brand-block { padding: 14px 16px; display: grid; align-content: center; gap: 6px; }
-    .brand-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    h1, h2, h3 { margin: 0; }
-    h1 { font-size: clamp(22px, 1.55vw, 32px); line-height: 1.05; font-weight: 780; letter-spacing: -0.04em; }
-    h2 { font-size: 15px; line-height: 1.25; font-weight: 720; letter-spacing: -0.01em; }
-    h3 { font-size: 13px; line-height: 1.35; color: var(--muted-strong); font-weight: 700; }
-    code { color: var(--accent-strong); word-break: break-all; }
-    canvas { display: block; width: 100%; border-radius: var(--radius-sm); background: var(--occupied); border: 1px solid var(--border-soft); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04); }
-    .muted { color: var(--muted); }
-    .small { font-size: 12px; line-height: 1.45; }
-    .eyebrow { color: var(--accent-strong); font-size: 11px; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; }
-    .readonly { color: var(--info); }
-    .grid { display: grid; gap: 12px; min-width: 0; }
-    .mission-layout { display: grid; gap: 12px; min-width: 0; }
-    .side-nav {
-      display: flex;
-      gap: 6px;
-      align-items: center;
-      overflow-x: auto;
-      padding: 8px;
-      border-radius: 16px;
-      scrollbar-width: thin;
-    }
-    .side-nav a {
-      color: var(--muted-strong);
-      text-decoration: none;
-      border: 1px solid transparent;
-      border-radius: 999px;
-      padding: 8px 11px;
-      font-size: 12px;
-      font-weight: 700;
-      white-space: nowrap;
-      transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
-    }
-    .side-nav a:hover { border-color: var(--border-strong); background: rgba(37, 99, 235, 0.09); color: var(--text); }
-    [data-theme="dark"] .side-nav a:hover { background: rgba(34, 211, 238, 0.10); }
-    .mission-content { display: grid; gap: 12px; min-width: 0; }
-    .section-band { scroll-margin-top: 16px; display: grid; gap: 12px; min-width: 0; }
-    .section-title { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 0 3px; }
-    .overview-grid { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); align-items: stretch; }
-    #overview .overview-grid { max-height: min(32vh, 320px); overflow: auto; padding-right: 2px; }
-    #overview .status-card { min-height: 104px; }
-    .mission-grid { grid-template-columns: minmax(230px, 0.88fr) minmax(260px, 1fr) minmax(260px, 1fr); }
-    .workspace {
-      grid-template-columns: minmax(0, 1.95fr) minmax(330px, 0.72fr);
-      align-items: stretch;
-      gap: 12px;
-      min-height: calc(100vh - 166px);
-    }
-    .right-rail { grid-template-columns: 1fr; gap: 12px; max-height: calc(100vh - 154px); overflow: auto; padding-right: 2px; }
-    .diagnostics-grid { grid-template-columns: minmax(340px, 0.8fr) minmax(360px, 0.78fr) minmax(420px, 1.08fr); align-items: start; }
-    .card, .panel { padding: 13px; }
-    .panel.compact { padding: 12px; }
-    .panel.map-panel { padding: 12px; box-shadow: var(--shadow); display: flex; flex-direction: column; min-height: calc(100vh - 166px); }
-    .status-card { display: grid; gap: 8px; min-height: 136px; align-content: start; }
-    .status-card .card-head { align-items: flex-start; margin-bottom: 4px; }
-    .status-card .kv { grid-template-columns: minmax(92px, 0.36fr) minmax(0, 1fr); }
-    .status-card .kv div { min-width: 0; }
-    .status-card .mono { white-space: normal; word-break: normal; overflow-wrap: break-word; }
-    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-    .global-status { display: grid; grid-template-columns: repeat(8, minmax(108px, 1fr)) auto; gap: 8px; align-items: stretch; padding: 10px; }
-    .metric-strip { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
-    .metric {
-      border: 1px solid var(--border-soft);
-      border-radius: 14px;
-      padding: 8px 10px;
-      background: var(--panel-strong);
-      color: var(--muted-strong);
-      min-width: 0;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-      transition: background 0.3s ease, border-color 0.3s ease;
-    }
-    .metric b { display: block; font-size: 14px; color: var(--text); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .metric span { display: block; color: var(--muted); font-size: 10.5px; margin-top: 3px; }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      border-radius: 999px;
-      padding: 5px 9px;
-      font-size: 11.5px;
-      font-weight: 760;
-      border: 1px solid var(--border);
-      background: var(--panel-strong);
-      color: var(--muted-strong);
-      white-space: nowrap;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-      transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease;
-    }
-    .pill::before { content: ""; width: 7px; height: 7px; border-radius: 999px; background: var(--muted); box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.12); }
-    .pill.available { border-color: rgba(22, 163, 74, 0.45); background: rgba(22, 163, 74, 0.10); color: #15803d; }
-    [data-theme="dark"] .pill.available { border-color: rgba(74, 222, 128, 0.45); background: rgba(22, 101, 52, 0.24); color: #dcfce7; }
-    .pill.available::before { background: var(--good); box-shadow: 0 0 12px rgba(22, 163, 74, 0.45); }
-    [data-theme="dark"] .pill.available::before { box-shadow: 0 0 16px rgba(74, 222, 128, 0.55); }
-    .pill.stale { border-color: rgba(202, 138, 4, 0.45); background: rgba(202, 138, 4, 0.10); color: #a16207; }
-    [data-theme="dark"] .pill.stale { border-color: rgba(250, 204, 21, 0.45); background: rgba(113, 63, 18, 0.26); color: #fef3c7; }
-    .pill.stale::before { background: var(--warn); box-shadow: 0 0 12px rgba(202, 138, 4, 0.45); }
-    [data-theme="dark"] .pill.stale::before { box-shadow: 0 0 16px rgba(250, 204, 21, 0.55); }
-    .pill.missing, .pill.unsupported { border-color: rgba(148, 163, 184, 0.30); background: rgba(148, 163, 184, 0.10); color: #64748b; }
-    [data-theme="dark"] .pill.missing, [data-theme="dark"] .pill.unsupported { border-color: rgba(148, 163, 184, 0.28); background: rgba(51, 65, 85, 0.32); color: #cbd5e1; }
-    .pill.missing::before, .pill.unsupported::before { background: var(--unknown); }
-    .pill.error { border-color: rgba(220, 38, 38, 0.45); background: rgba(220, 38, 38, 0.10); color: #b91c1c; }
-    [data-theme="dark"] .pill.error { border-color: rgba(248, 113, 113, 0.50); background: rgba(127, 29, 29, 0.30); color: #fee2e2; }
-    .pill.error::before { background: var(--bad); box-shadow: 0 0 12px rgba(220, 38, 38, 0.45); }
-    [data-theme="dark"] .pill.error::before { box-shadow: 0 0 16px rgba(248, 113, 113, 0.55); }
-    .estop { align-self: center; justify-content: center; border-color: rgba(220, 38, 38, 0.55); color: #b91c1c; background: rgba(220, 38, 38, 0.10); }
-    [data-theme="dark"] .estop { border-color: rgba(248, 113, 113, 0.58); color: #fee2e2; background: rgba(127, 29, 29, 0.22); }
-    .kv { display: grid; grid-template-columns: minmax(108px, 0.40fr) minmax(0, 1fr); gap: 5px 9px; font-size: 11.5px; line-height: 1.42; }
-    .kv div:nth-child(odd) { color: var(--muted); }
-    .kv div:nth-child(even) { color: var(--muted-strong); }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; overflow-wrap: break-word; word-break: normal; font-variant-numeric: tabular-nums; }
-    .empty, .error-text { color: #b91c1c; background: rgba(220, 38, 38, 0.08); border: 1px solid rgba(220, 38, 38, 0.25); border-radius: 12px; padding: 9px 10px; }
-    [data-theme="dark"] .empty, [data-theme="dark"] .error-text { color: #fee2e2; background: rgba(127, 29, 29, 0.20); border-color: rgba(252, 165, 165, 0.28); }
-    .notice { color: #a16207; background: rgba(202, 138, 4, 0.08); border: 1px solid rgba(202, 138, 4, 0.25); border-radius: 12px; padding: 9px 10px; }
-    [data-theme="dark"] .notice { color: #fef3c7; background: rgba(113, 63, 18, 0.22); border-color: rgba(253, 230, 138, 0.28); }
-    .panel-meta { margin-top: 9px; }
-    .canvas-wrap { position: relative; flex: 1 1 auto; background: var(--occupied); border-radius: var(--radius-sm); padding: 1px; border: 1px solid var(--border-soft); overflow: hidden; min-height: 480px; }
-    #mapCanvas { height: 100%; min-height: 480px; image-rendering: pixelated; }
-    .map-toolbar { position: absolute; z-index: 2; left: 12px; top: 12px; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
-    .map-control { min-height: 30px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface-strong); color: var(--accent-strong); padding: 5px 9px; font: inherit; font-size: 12px; font-weight: 740; cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease; }
-    .map-control:hover { border-color: var(--accent); background: var(--panel-soft); }
-    .map-control.active { border-color: #34d399; background: rgba(52, 211, 153, 0.14); color: #6ee7b7; }
-    .map-control.active.pose-tool { border-color: #f97316; background: rgba(249, 115, 22, 0.14); color: #fdba74; }
-    #mapCanvas.goal-pick { cursor: crosshair; }
-    #mapCanvas.goal-pick.pan-ready { cursor: grab; }
-    #mapCanvas.goal-pick.panning { cursor: grabbing; }
-    #mapCanvas.publish-point { cursor: crosshair; }
-    .map-goal-chip { position: absolute; z-index: 3; left: 12px; top: 50px; max-width: min(62vw, 420px); }
-    .map-goal-chip.ok { border-color: rgba(52, 211, 153, 0.45); color: #6ee7b7; }
-    .map-goal-chip.pending { border-color: rgba(250, 204, 21, 0.45); color: #fde68a; }
-    .map-goal-chip.error { border-color: rgba(248, 113, 113, 0.45); color: #fca5a5; }
-    .map-chip { border: 1px solid var(--border-strong); background: var(--surface-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: var(--accent-strong); backdrop-filter: blur(10px); }
-    .map-stream-chip { position: absolute; z-index: 2; right: 12px; top: 12px; max-width: min(520px, calc(100% - 24px)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .map-info-grid { grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); margin-top: 10px; max-height: 176px; overflow: auto; padding-right: 2px; }
-    .video-stage { position: relative; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border-soft); background: var(--occupied); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04); }
-    .video-frame { display: block; width: 100%; min-height: 210px; max-height: 300px; object-fit: contain; position: relative; z-index: 1; }
-    .video-detection-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-    .video-overlay { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; pointer-events: none; }
-    .overlay-chip { border: 1px solid var(--border-strong); background: var(--surface-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; color: var(--accent-strong); backdrop-filter: blur(10px); }
-    .overlay-toggle { display: inline-flex; align-items: center; gap: 6px; pointer-events: auto; cursor: pointer; }
-    .overlay-toggle input { accent-color: var(--accent); }
-    .legend { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 9px; }
-    .legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px; }
-    .swatch { width: 12px; height: 12px; border: 1px solid var(--border); border-radius: 4px; }
-    .logs { display: grid; gap: 8px; max-height: min(38vh, 430px); overflow: auto; padding-right: 2px; }
-    .log-line { border: 1px solid var(--border-soft); border-left: 3px solid var(--info); border-radius: 12px; padding: 9px 10px; background: var(--panel-strong); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.45; transition: background 0.3s ease; }
-    .log-line .meta { color: var(--info); font-size: 12px; margin-bottom: 4px; }
-    .log-line.warn, .log-line.warning { border-left-color: var(--warn); }
-    .log-line.warn .meta, .log-line.warning .meta { color: var(--warn); }
-    .log-line.error, .log-line.critical { border-left-color: var(--bad); }
-    .log-line.error .meta, .log-line.critical .meta { color: var(--bad); }
-    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .field { min-height: 34px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-strong); color: var(--text); padding: 7px 10px; font: inherit; font-size: 12px; outline: none; transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease; }
-    .field:focus { border-color: var(--border-strong); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12); }
-    [data-theme="dark"] .field:focus { box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.12); }
-    .service-list, .event-list, .task-list { display: grid; gap: 8px; max-height: min(34vh, 380px); overflow: auto; padding-right: 2px; }
-    .service-row, .task-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 8px; align-items: center; border: 1px solid var(--border-soft); border-radius: 12px; padding: 8px 9px; background: var(--panel-soft); transition: background 0.3s ease; }
-    .service-row .meta, .task-row .meta { color: var(--muted); font-size: 12px; }
-    .health-line { height: 6px; border-radius: 999px; background: linear-gradient(90deg, var(--good), var(--accent)); opacity: 0.95; }
-    .health-line.warn { background: linear-gradient(90deg, var(--warn), #fb923c); }
-    .health-line.bad { background: linear-gradient(90deg, var(--bad), #ef4444); }
-    .split-two { grid-template-columns: 1fr 1fr; }
-    .theme-toggle {
-      position: fixed;
-      top: 16px;
-      right: 16px;
-      z-index: 100;
-      width: 40px;
-      height: 40px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: var(--surface-strong);
-      color: var(--text);
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 18px;
-      box-shadow: var(--shadow-soft);
-      transition: background 0.3s ease, color 0.3s ease, border-color 0.3s ease, transform 0.2s ease;
-    }
-    .theme-toggle:hover { transform: scale(1.08); border-color: var(--border-strong); }
-    @media (min-width: 1800px) {
-      body { padding: 16px 20px; }
-      .workspace { grid-template-columns: minmax(0, 2.25fr) minmax(360px, 0.70fr); }
-      .workspace, .panel.map-panel { min-height: calc(100vh - 170px); }
-      .canvas-wrap { min-height: 560px; }
-      #mapCanvas { min-height: 560px; }
-    }
-    @media (max-width: 1500px) {
-      .topbar { grid-template-columns: 1fr; }
-      .global-status { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
-      .workspace { grid-template-columns: minmax(0, 1.5fr) minmax(300px, 0.75fr); }
-      .overview-grid { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
-      .diagnostics-grid { grid-template-columns: 1fr 1fr; }
-    }
-    @media (max-width: 1120px) {
-      .workspace, .mission-grid, .diagnostics-grid { grid-template-columns: 1fr; }
-      .right-rail { grid-template-columns: repeat(2, minmax(260px, 1fr)); max-height: none; overflow: visible; padding-right: 0; }
-      #runtime-settings { grid-column: span 2; }
-      .workspace, .panel.map-panel { min-height: auto; }
-      .canvas-wrap { min-height: 460px; }
-      #mapCanvas { height: min(68vh, 760px); min-height: 460px; }
-    }
-    @media (max-width: 720px) {
-      body { padding: 10px; }
-      .brand-block, .global-status, .panel, .card, .side-nav { border-radius: 14px; padding: 11px; }
-      .side-nav { padding: 7px; }
-      .split-two, .right-rail, .overview-grid, .map-info-grid { grid-template-columns: 1fr; }
-      #runtime-settings { grid-column: auto; }
-      .global-status { grid-template-columns: 1fr 1fr; }
-      .kv { grid-template-columns: 1fr; }
-      .canvas-wrap { min-height: 340px; }
-      #mapCanvas { height: 58vh; min-height: 340px; }
-      .map-stream-chip { left: 12px; top: 50px; right: auto; max-width: calc(100% - 24px); }
-      .theme-toggle { top: 10px; right: 10px; width: 36px; height: 36px; font-size: 16px; }
-    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0;padding:12px;font-family:var(--sans);color:var(--text);background:var(--bg);
+      -webkit-font-smoothing:antialiased;overflow:hidden;transition:background .45s ease,color .3s ease}
+    ::-webkit-scrollbar{width:8px;height:8px}
+    ::-webkit-scrollbar-thumb{background:var(--ring);border-radius:99px;border:2px solid transparent;background-clip:padding-box}
+    h1,h2,h3{margin:0;font-weight:660;letter-spacing:-.01em}
+    h1{font-size:15px;letter-spacing:-.02em}h2{font-size:13px}h3{font-size:12px;color:var(--strong)}
+    .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+    .muted{color:var(--muted)}.faint{color:var(--faint)}
+    .small{font-size:11px;line-height:1.5}
+    .eyebrow{font-size:9.5px;font-weight:720;letter-spacing:.15em;text-transform:uppercase;color:var(--muted)}
+    code{font-family:var(--mono);color:var(--strong);word-break:break-all}
+    button{font-family:inherit;cursor:pointer}
+    canvas{display:block;width:100%}
 
-    html, body { height: 100%; overflow: hidden; }
-    body { padding: 10px; }
-    .app-shell { height: calc(100vh - 20px); max-height: calc(100vh - 20px); width: min(100%, 2260px); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
-    #view-host { height: 100%; min-height: 0; overflow: hidden; }
-    .view-pane.active { height: 100%; min-height: 0; overflow: hidden; }
-    .topbar { grid-template-columns: minmax(250px, 0.36fr) minmax(0, 1.64fr); gap: 10px; min-height: 78px; }
-    .brand-block { padding: 10px 14px; gap: 4px; }
-    .brand-block .small { display: none; }
-    h1 { font-size: clamp(20px, 1.25vw, 28px); }
-    .global-status { grid-template-columns: repeat(8, minmax(92px, 1fr)) auto; gap: 6px; padding: 8px; }
-    .metric { padding: 7px 9px; }
-    .metric b { font-size: 13px; }
-    .metric span { font-size: 10px; }
-    .mission-layout, .mission-content { height: 100%; min-height: 0; overflow: hidden; }
-    .workspace { height: 100%; min-height: 0; grid-template-columns: minmax(0, 1.55fr) minmax(410px, 0.82fr); align-items: stretch; }
-    .panel.map-panel { min-height: 0; height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto auto; overflow: hidden; }
-    .map-panel .card-head { margin-bottom: 8px; }
-    .canvas-wrap { min-height: 0; }
-    #mapCanvas { height: 100%; min-height: 0; }
-    .legend { margin-top: 6px; gap: 7px; }
-    #mapEmpty { margin-top: 6px; padding: 7px 9px; }
-    .map-info-grid { max-height: 142px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); margin-top: 6px; overflow: hidden; }
-    .map-info-grid .panel { min-height: 0; padding: 9px; }
-    .map-info-grid .card-head { margin-bottom: 6px; }
-    .map-info-grid .kv { max-height: 86px; overflow: auto; }
-    .right-rail { height: 100%; max-height: none; overflow: hidden; padding-right: 0; grid-template-rows: minmax(0, 1.08fr) minmax(0, 0.92fr); }
-    .tab-panel { display: grid; grid-template-rows: auto auto minmax(0, 1fr); min-height: 0; overflow: hidden; }
-    .tab-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
-    .tab-menu { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 6px; margin-bottom: 8px; }
-    .tab-button { border: 1px solid var(--border-soft); border-radius: 999px; background: var(--panel-strong); color: var(--muted-strong); min-height: 30px; padding: 6px 8px; font: inherit; font-size: 11.5px; font-weight: 760; cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease; }
-    .tab-button:hover, .tab-button.active { border-color: var(--border-strong); background: rgba(37, 99, 235, 0.11); color: var(--text); }
-    [data-theme="dark"] .tab-button:hover, [data-theme="dark"] .tab-button.active { background: rgba(34, 211, 238, 0.12); }
-    .tab-content { min-height: 0; overflow: auto; padding-right: 2px; }
-    .tab-pane { display: none; min-height: 0; }
-    .tab-pane.active { display: block; }
-    .tab-pane > .panel, .tab-pane > section.panel { box-shadow: none; background: rgba(255, 255, 255, 0.04); }
-    [data-theme="dark"] .tab-pane > .panel, [data-theme="dark"] .tab-pane > section.panel { background: rgba(15, 23, 42, 0.28); }
-    .config-sections { display: flex; flex-direction: column; gap: 8px; }
-    .config-section { border: 1px solid var(--border-soft); border-radius: 10px; overflow: hidden; }
-    .config-section > summary { cursor: pointer; padding: 8px 10px; font-weight: 760; font-size: 12px; background: var(--panel-strong); list-style: none; display: flex; justify-content: space-between; align-items: center; }
-    .config-section > summary::-webkit-details-marker { display: none; }
-    .config-section[open] > summary { border-bottom: 1px solid var(--border-soft); }
-    .config-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 4px 10px; padding: 8px 10px; }
-    .config-row { display: contents; }
-    .config-row label { display: flex; flex-direction: column; gap: 1px; font-size: 11.5px; padding: 3px 0; }
-    .config-row label .ckey { color: var(--muted-strong); font-size: 10px; font-family: ui-monospace, monospace; }
-    .config-row .cfield { display: flex; align-items: center; gap: 6px; }
-    .config-row .cfield input, .config-row .cfield select { flex: 1; min-width: 0; }
-    .config-row.changed .cfield input, .config-row.changed .cfield select { border-color: var(--nav-plan); }
-    .config-badge { font-size: 9px; padding: 1px 5px; border-radius: 999px; background: rgba(148,163,184,0.18); color: var(--muted-strong); }
-    .config-badge.adv { background: rgba(245,158,11,0.18); color: #b45309; }
-    .config-badge.sec { background: rgba(239,68,68,0.16); color: #b91c1c; }
-    .overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-    #overview .overview-grid { max-height: none; overflow: visible; padding-right: 0; }
-    #overview .status-card, .status-card { min-height: 92px; padding: 10px; }
-    .status-card .kv { gap: 4px 7px; }
-    .task-list, .service-list { max-height: none; }
-    .logs { max-height: none; }
-    .video-frame { min-height: 170px; max-height: 230px; }
-    .diagnostics-grid, .side-nav { display: none; }
-    @media (max-width: 1500px) {
-      .topbar { grid-template-columns: 1fr; min-height: 126px; }
-      .global-status { grid-template-columns: repeat(4, minmax(120px, 1fr)); }
-      .workspace { grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.85fr); }
+    /* ===== shell ===== */
+    .app-shell{height:calc(100vh - 24px);display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;max-width:2300px;margin:0 auto}
+    .card,.panel,.brand-block,.global-status,.side-nav{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--sh-sm)}
+    #view-host{min-height:0}
+    .view-pane{display:none;min-height:0;height:100%}
+    .view-pane.active{display:block}
+    .side-nav{display:none}
+
+    /* ===== topbar / vitals ===== */
+    .topbar{display:grid;grid-template-columns:minmax(280px,.42fr) minmax(0,1.58fr);gap:10px;align-items:stretch}
+    .brand-block{padding:11px 16px;display:grid;align-content:center;gap:5px}
+    .brand-row{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+    .brand-row h1{font-size:15px}
+    .eyebrow+.brand-row{margin-top:1px}
+    .view-switch{display:inline-flex;gap:2px;padding:3px;background:var(--inset);border-radius:var(--pill);width:max-content;margin-top:4px}
+    .view-switch-btn{border:0;background:transparent;color:var(--muted);font-size:12px;font-weight:620;padding:5px 15px;border-radius:var(--pill);transition:.2s}
+    .view-switch-btn.active{background:var(--surface);color:var(--text);box-shadow:var(--sh-sm)}
+    .global-status{display:flex;align-items:center;gap:0;padding:9px 14px;flex-wrap:wrap}
+    .global-status .metric{padding:2px 15px;border-left:1px solid var(--line-2);min-width:0;background:none;border-radius:0}
+    .global-status .metric:first-child{border-left:0;padding-left:0}
+    .metric b{display:block;font-size:13px;font-weight:640;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .metric span{display:block;font-size:9.5px;color:var(--faint);margin-top:1px}
+    .estop{margin-left:auto}
+
+    /* ===== pills (JS status vocab) ===== */
+    .pill{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-weight:620;padding:3px 10px;border-radius:var(--pill);background:var(--inset);color:var(--muted);white-space:nowrap;border:1px solid transparent}
+    .pill::before{content:"";width:6px;height:6px;border-radius:99px;background:currentColor;opacity:.85;flex:none}
+    .pill.available{color:var(--good);background:var(--good-w)}
+    .pill.available::before{animation:pulse 1.9s ease-in-out infinite}
+    .pill.stale{color:var(--warn);background:var(--warn-w)}
+    .pill.error{color:var(--bad);background:var(--bad-w)}
+    .pill.missing,.pill.unsupported{color:var(--faint);background:var(--inset)}
+    .pill.estop{color:var(--faint);background:var(--inset)}
+    @keyframes pulse{0%,100%{opacity:1}55%{opacity:.4}}
+    .pill.changed,.config-badge{}
+
+    /* ===== generic card / kv / text ===== */
+    .card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:11px}
+    .card-head h2,.card-head h3{margin-top:1px}
+    .panel.compact{padding:0}
+    .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:11.5px;line-height:1.5}
+    .kv div:nth-child(odd){color:var(--muted);white-space:nowrap}
+    .kv div:nth-child(even){color:var(--strong);text-align:right;overflow-wrap:anywhere}
+    .empty{color:var(--bad);background:var(--bad-w);border-radius:var(--r);padding:9px 11px;font-size:11.5px}
+    .notice{color:var(--warn);background:var(--warn-w);border-radius:var(--r);padding:9px 11px;font-size:11.5px}
+    .panel-meta{margin-top:9px}
+    .rise{animation:rise .5s cubic-bezier(.22,.61,.36,1) both}
+    @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+
+    /* ===== monitor: command-center grid ===== */
+    .mission-layout,.mission-content{height:100%;min-height:0}
+    .workspace{display:grid;height:100%;min-height:0;
+      grid-template-columns:minmax(0,1fr) clamp(340px,25vw,420px);
+      grid-template-rows:minmax(0,1fr) auto;gap:10px}
+    .map-panel{grid-row:1;grid-column:1;position:relative;overflow:hidden;border-radius:var(--r-xl);padding:0;display:block}
+    .right-rail{grid-column:2;grid-row:1;display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;min-height:0;overflow:hidden;padding:0;background:none;border:0;box-shadow:none}
+
+    /* hero map */
+    .map-panel>.card-head{position:absolute;left:14px;top:14px;right:14px;z-index:4;margin:0;pointer-events:none}
+    .map-panel>.card-head .eyebrow,.map-panel>.card-head h2{display:none}
+    #mapStatus{display:none}
+    .canvas-wrap{position:absolute;inset:0;border-radius:var(--r-xl);overflow:hidden;background:var(--grid-bg)}
+    #mapCanvas{position:absolute;inset:0;width:100%;height:100%;background:var(--grid-bg);border:0}
+    #map3dContainer{border-radius:var(--r-xl)}
+    .map-toolbar{position:absolute;left:14px;top:14px;z-index:5;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+    .glass,.map-chip,.map-control,.overlay-chip{background:color-mix(in srgb,var(--surface) 82%,transparent);backdrop-filter:blur(16px) saturate(1.5);border:1px solid var(--line);box-shadow:var(--sh-sm)}
+    .map-control{min-height:31px;padding:6px 11px;border-radius:var(--r);font-size:11.5px;font-weight:620;color:var(--strong);transition:.18s}
+    .map-control:hover{color:var(--text);transform:translateY(-1px)}
+    .map-control.active{background:var(--accent);color:var(--surface);border-color:transparent}
+    .map-control.active.pose-tool{background:var(--robot);color:#fff}
+    .map-chip{padding:6px 11px;border-radius:var(--pill);font-size:10.5px;color:var(--strong)}
+    .map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .map-goal-chip{position:absolute;left:14px;top:54px;z-index:5}
+    #mapZoomValue{font-family:var(--mono);min-width:46px;text-align:center;display:inline-block}
+    .legend{position:absolute;left:14px;bottom:14px;z-index:5;display:flex;gap:5px 12px;flex-wrap:wrap;max-width:62%;padding:7px 11px;border-radius:var(--r);font-size:10.5px;
+      background:color-mix(in srgb,var(--surface) 82%,transparent);backdrop-filter:blur(16px) saturate(1.5);border:1px solid var(--line);box-shadow:var(--sh-sm)}
+    .legend-item{display:inline-flex;align-items:center;gap:5px;color:var(--muted)}
+    .swatch{width:10px;height:10px;border-radius:3px;border:1px solid var(--line)}
+    #mapEmpty{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;max-width:70%}
+    .map-info-grid{display:none}
+
+    /* right-rail panels */
+    .right-rail>.panel,.right-rail>section{min-height:0;overflow:auto}
+    #video-perception{grid-row:1}
+    .right-rail .merged-rail{grid-row:2;display:flex;flex-direction:column;gap:0}
+    .rail-sub+.rail-sub{margin-top:12px;padding-top:12px;border-top:1px solid var(--line-2)}
+
+    /* video */
+    .video-stage{position:relative;border-radius:var(--r);overflow:hidden;background:var(--occupied);aspect-ratio:16/10;border:1px solid var(--line)}
+    .video-frame{width:100%;height:100%;object-fit:cover;display:block}
+    .video-detection-canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+    .video-overlay{position:absolute;left:9px;right:9px;bottom:9px;display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap}
+    .overlay-chip{padding:3px 9px;border-radius:var(--pill);font-size:10px;color:var(--strong)}
+    .overlay-toggle{display:inline-flex;align-items:center;gap:5px;cursor:pointer}
+    .overlay-toggle input{accent-color:var(--accent)}
+
+    /* ===== bottom dock · all visible ===== */
+    .dock{grid-column:1 / -1;grid-row:2;height:248px}
+    .dock-grid{display:grid;height:100%;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr) minmax(0,1.05fr) minmax(0,1fr)}
+    .dcol{display:flex;flex-direction:column;min-height:0;padding:12px 14px;border-left:1px solid var(--line)}
+    .dcol:first-child{border-left:0}
+    .dcol>.card-head{margin-bottom:9px}
+    .dscroll{flex:1;min-height:0;overflow:auto;padding-right:3px}
+    .dgap{margin-top:12px;padding-top:11px;border-top:1px solid var(--line-2)}
+
+    /* service / task rows */
+    .service-list,.task-list,.logs{display:grid;gap:6px}
+    .service-row,.task-row{display:flex;flex-direction:column;gap:6px;padding:8px 11px;background:var(--inset);border-radius:var(--r);border:0}
+    .service-row .meta,.task-row .meta{color:var(--faint);font-size:10px}
+    .health-line{height:5px;border-radius:99px;background:var(--good);opacity:1}
+    .health-line.warn{background:var(--warn)}.health-line.bad{background:var(--bad)}
+
+    /* logs */
+    .toolbar{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-bottom:9px}
+    .field{min-height:31px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--inset);color:var(--text);padding:6px 10px;font:inherit;font-size:11.5px;outline:none;transition:.18s}
+    .field:focus{border-color:var(--ring);box-shadow:0 0 0 3px var(--line-2);background:var(--surface)}
+    .log-line{font-family:var(--mono);font-size:10.5px;line-height:1.5;padding:6px 10px;background:var(--inset);border-left:2.5px solid var(--info);border-radius:0 var(--r-sm) var(--r-sm) 0}
+    .log-line.warn,.log-line.warning{border-left-color:var(--warn)}
+    .log-line.error,.log-line.critical{border-left-color:var(--bad)}
+    .log-line .meta{color:var(--muted);font-size:10px;margin-bottom:1px}
+    .log-line.error .meta,.log-line.critical .meta{color:var(--bad)}
+    .log-line.warn .meta,.log-line.warning .meta{color:var(--warn)}
+
+    /* hidden legacy overview (still drives mission/sensor/conn) */
+    .overview-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);pointer-events:none;opacity:0}
+
+    /* ===== config view (full takeover) ===== */
+    .config-fullpage{height:100%;display:grid;grid-template-rows:auto auto auto auto auto minmax(0,1fr);gap:10px;padding:16px 18px;overflow:hidden}
+    .config-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .config-toolbar .field{flex:1;min-width:220px}
+    .config-auth-note{font-size:11.5px;padding:8px 12px;border-radius:var(--r-sm);background:var(--warn-w);color:var(--warn)}
+    .config-sections{overflow:auto;display:grid;gap:14px;align-content:start;padding-right:4px}
+    .config-section-block{border:1px solid var(--line-2);border-radius:var(--r);overflow:hidden;background:var(--surface-2)}
+    .config-section-title{font-weight:660;padding:11px 14px;font-size:12.5px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--line-2)}
+    .config-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:11px 18px;padding:13px 14px}
+    .config-adv-fold{padding:0 14px 13px}
+    .config-adv-fold>summary{cursor:pointer;font-size:11.5px;font-weight:620;color:var(--muted);padding:8px 0}
+    .config-row{display:flex;flex-direction:column;gap:4px}
+    .config-row label{display:flex;flex-direction:column;gap:2px;font-size:11.5px;font-weight:600}
+    .config-row label .ckey{color:var(--faint);font-size:9.5px;font-family:var(--mono);font-weight:400}
+    .config-row .cfield{display:flex;flex-direction:column;gap:3px}
+    .config-row .cfield input,.config-row .cfield select{width:100%}
+    .config-row.changed .cfield input,.config-row.changed .cfield select{border-color:var(--robot);box-shadow:0 0 0 3px var(--warn-w)}
+    .config-row.invalid .cfield input{border-color:var(--bad)}
+    .config-err{color:var(--bad);font-size:10px}
+    .config-badge{font-size:9px;font-weight:600;padding:1px 6px;border-radius:var(--pill);background:var(--inset-2);color:var(--muted)}
+    .config-badge.adv{background:var(--warn-w);color:var(--warn)}
+    .config-badge.sec{background:var(--bad-w);color:var(--bad)}
+    .config-fullpage .tab-button{min-height:31px;padding:6px 15px;border-radius:var(--r-sm);font-size:12px;font-weight:620;border:1px solid var(--line);background:var(--inset);color:var(--strong);transition:.18s}
+    .config-fullpage .tab-button:hover{border-color:var(--ring);color:var(--text)}
+    #configSave{background:var(--accent);color:var(--surface);border-color:transparent}
+
+    /* theme toggle */
+    .theme-toggle{position:fixed;bottom:18px;right:18px;z-index:60;width:38px;height:38px;border-radius:99px;display:grid;place-items:center;font-size:15px;border:1px solid var(--line);background:var(--surface);color:var(--text);box-shadow:var(--sh-sm);transition:.25s}
+    .theme-toggle:hover{transform:scale(1.1) rotate(-12deg)}
+
+    @media(max-width:1240px){
+      html,body{overflow:auto}body{padding:10px}
+      .app-shell{height:auto}
+      .topbar{grid-template-columns:1fr}
+      .workspace{grid-template-columns:1fr;grid-template-rows:none}
+      .map-panel{grid-column:1;min-height:480px}
+      .right-rail{grid-column:1;grid-row:auto;grid-template-rows:none}
+      .dock-grid{grid-template-columns:1fr 1fr}
+      .global-status .metric{padding:2px 10px}
     }
-    @media (max-width: 1120px) {
-      html, body { overflow: auto; }
-      body { padding: 10px; }
-      .app-shell { height: auto; max-height: none; overflow: visible; }
-      .workspace { height: auto; grid-template-columns: 1fr; }
-      .panel.map-panel { height: auto; min-height: 620px; }
-      .canvas-wrap { min-height: 420px; }
-      #mapCanvas { height: 52vh; min-height: 420px; }
-      .right-rail { height: auto; grid-template-rows: none; }
-      .diagnostics-grid { display: none; }
-    }
+    @media(max-width:760px){.dock-grid{grid-template-columns:1fr}.global-status{gap:6px}}
   </style>
 </head>
 <body>
-  <button id="themeToggle" class="theme-toggle" title="切换主题" aria-label="切换白天/黑夜主题">☀️</button>
+  <button id="themeToggle" class="theme-toggle" title="切换主题" aria-label="切换白天/黑夜主题">🌙</button>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand-block">
@@ -637,7 +434,6 @@ def _render_debug_page(access_token: str) -> str:
           <h1 id="robotName">nuwax_robot_bridge</h1>
           <span id="robotModel" class="pill missing">型号：--</span>
         </div>
-        <div class="muted small">单屏实时地图驾驶舱 · 关键态势优先</div>
         <div class="view-switch" role="tablist" aria-label="监控 / 配置 视图切换">
           <button id="viewSwitchMonitor" class="view-switch-btn active" type="button" data-view-target="monitor-view">监控</button>
           <button id="viewSwitchConfig" class="view-switch-btn" type="button" data-view-target="config-view">配置</button>
@@ -654,220 +450,148 @@ def _render_debug_page(access_token: str) -> str:
         <span id="estopStatus" class="pill estop">急停状态：只读展示</span>
       </div>
     </header>
-
     <div id="view-host">
     <div id="monitor-view" class="view-pane active">
-    <div class="mission-layout">
-      <div class="mission-content">
-        <main class="grid workspace">
-          <section id="live-map" class="panel map-panel">
-            <div class="card-head">
-              <div>
-                <div class="eyebrow">Live Spatial Canvas</div>
-                <h2>空间态势 · 2D 地图 / 定位 / 轨迹 / 导航目标</h2>
-              </div>
-              <span id="mapStatus" class="pill missing">missing</span>
+    <div class="mission-layout"><div class="mission-content">
+      <main class="workspace">
+        <section id="live-map" class="panel map-panel">
+          <div class="card-head">
+            <div><div class="eyebrow">Live Spatial Canvas</div><h2>空间态势</h2></div>
+            <span id="mapStatus" class="pill missing">missing</span>
+          </div>
+          <div class="canvas-wrap">
+            <div class="map-toolbar" aria-label="地图缩放与导航控制">
+              <button id="mapZoomOut" class="map-control" type="button">-</button>
+              <span id="mapZoomValue" class="map-chip">100%</span>
+              <button id="mapZoomIn" class="map-control" type="button">+</button>
+              <button id="mapZoomReset" class="map-control" type="button">reset</button>
+              <button id="mapCenterRobot" class="map-control" type="button" title="视图居中到机器人" hidden>居中</button>
+              <button id="mapInitialPoseToggle" class="map-control pose-tool" type="button" title="2D Pose Estimate：发布 /initialpose">2D Pose</button>
+              <button id="mapGoalToggle" class="map-control" type="button" title="2D Goal：左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
+              <button id="mapPublishPointToggle" class="map-control" type="button" title="Publish Point：发布 /clicked_point">选点</button>
+              <button id="mapModeToggle" class="map-control" type="button" style="font-size:11px;padding:5px 10px;">3D</button>
             </div>
-            <div class="canvas-wrap">
-              <div class="map-toolbar" aria-label="地图缩放与导航控制">
-                <button id="mapZoomOut" class="map-control" type="button">-</button>
-                <span id="mapZoomValue" class="map-chip">100%</span>
-                <button id="mapZoomIn" class="map-control" type="button">+</button>
-                <button id="mapZoomReset" class="map-control" type="button">reset</button>
-                <button id="mapCenterRobot" class="map-control" type="button" title="视图居中到机器人（RViz 风格）" hidden>居中</button>
-                <button id="mapInitialPoseToggle" class="map-control pose-tool" type="button" title="RViz 2D Pose Estimate：左键拖拽设初始位姿，发布 /initialpose">2D Pose</button>
-                <button id="mapGoalToggle" class="map-control" type="button" title="RViz 风格 2D Goal：北向 map、左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
-                <button id="mapPublishPointToggle" class="map-control" type="button" title="RViz Publish Point：左键发布 /clicked_point，不导航">选点</button>
-                <button id="mapModeToggle" class="map-control" type="button" style="font-size:11px;padding:2px 8px;">3D</button>
-              </div>
-              <span id="mapGoalStatus" class="map-chip map-goal-chip" hidden></span>
-              <span id="mapStreamStatus" class="map-chip map-stream-chip">等待地图首帧</span>
-              <canvas id="mapCanvas" width="1180" height="680"></canvas>
-              <div id="map3dContainer" style="width:100%;height:100%;min-height:480px;position:absolute;inset:0;display:none;"></div>
-            </div>
+            <span id="mapGoalStatus" class="map-chip map-goal-chip" hidden></span>
+            <span id="mapStreamStatus" class="map-chip map-stream-chip">等待地图首帧</span>
+            <canvas id="mapCanvas" width="1180" height="680"></canvas>
+            <div id="map3dContainer" style="width:100%;height:100%;position:absolute;inset:0;display:none;"></div>
             <div class="legend">
-              <span class="legend-item"><span class="swatch" style="background: var(--unknown)"></span>未知</span>
-              <span class="legend-item"><span class="swatch" style="background: var(--free)"></span>可通行</span>
-              <span class="legend-item"><span class="swatch" style="background: var(--occupied)"></span>占据</span>
-              <span class="legend-item"><span class="swatch" style="background: var(--map-line)"></span>轨迹</span>
-              <span class="legend-item"><span class="swatch" style="background: var(--nav-plan)"></span>规划路径</span>
-              <span class="legend-item"><span class="swatch" style="background: var(--map-robot)"></span>机器人</span>
-              <span class="legend-item"><span class="swatch" style="background: var(--frontier)"></span>探索前沿</span>
-              <span class="legend-item"><span class="swatch" style="background: #f97316"></span>初始位姿</span>
-              <span class="legend-item"><span class="swatch" style="background: #34d399"></span>导航目标</span>
-              <span class="legend-item"><span class="swatch" style="background: #38bdf8"></span>选点</span>
+              <span class="legend-item"><span class="swatch" style="background:var(--unknown)"></span>未知</span>
+              <span class="legend-item"><span class="swatch" style="background:var(--free)"></span>可通行</span>
+              <span class="legend-item"><span class="swatch" style="background:var(--occupied)"></span>占据</span>
+              <span class="legend-item"><span class="swatch" style="background:var(--map-line)"></span>轨迹</span>
+              <span class="legend-item"><span class="swatch" style="background:var(--nav-plan)"></span>规划</span>
+              <span class="legend-item"><span class="swatch" style="background:var(--map-robot)"></span>机器人</span>
+              <span class="legend-item"><span class="swatch" style="background:var(--frontier-c)"></span>前沿</span>
+              <span class="legend-item"><span class="swatch" style="background:#7C5CFC"></span>目标</span>
               <span id="mapRvizHint" class="legend-item" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
             </div>
-            <div id="mapEmpty" class="empty panel-meta">等待地图数据。</div>
-            <div class="grid map-info-grid">
-              <section class="panel compact">
-                <div class="card-head"><h3>地图信息</h3><span class="muted small">occupancy grid</span></div>
-                <div id="mapMeta" class="kv"></div>
-              </section>
-              <section class="panel compact">
-                <div class="card-head">
-                  <h3>定位/轨迹</h3>
-                  <span id="localizationStatus" class="pill missing">missing</span>
-                </div>
-                <div id="localizationMeta" class="kv"></div>
-              </section>
+            <div id="mapEmpty" class="empty">等待地图数据。</div>
+          </div>
+        </section>
+        <aside class="right-rail" aria-label="态势与诊断面板">
+          <section id="video-perception" class="card panel rise" style="animation-delay:.05s">
+            <div class="card-head">
+              <div><div class="eyebrow">Perception</div><h2>端侧推流视频感知</h2></div>
+              <span id="videoStatus" class="pill missing">missing</span>
+            </div>
+            <div class="video-stage">
+              <img id="videoFrame" class="video-frame" alt="Go2 端侧推流视频帧" hidden>
+              <canvas id="videoDetections" class="video-detection-canvas" hidden></canvas>
+              <div class="video-overlay">
+                <span id="visionModelStatus" class="overlay-chip">本地模型：--</span>
+                <span id="videoFpsStatus" class="overlay-chip">帧率：--</span>
+                <label class="overlay-chip overlay-toggle"><input id="showDetections" type="checkbox">检测框</label>
+              </div>
+            </div>
+            <div id="videoEmpty" class="empty panel-meta">等待 Go2 端侧视频推流。</div>
+            <div id="videoMeta" class="kv panel-meta"></div>
+          </section>
+          <section class="card panel rise merged-rail" style="animation-delay:.1s">
+            <div class="card-head">
+              <div><div class="eyebrow">Navigation · Pose · Map</div><h2>导航 · 位姿 · 地图</h2></div>
+              <span id="missionStatus" class="pill missing">mission: warming</span>
+            </div>
+            <div class="rail-sub">
+              <div class="card-head" style="margin-bottom:8px"><h3>导航态势 / frontier</h3><span id="navigationStatus" class="pill missing">missing</span></div>
+              <div id="navigationMeta" class="kv"></div>
+              <div id="frontierNotice" class="notice panel-meta">等待探索前沿候选几何。</div>
+            </div>
+            <div class="rail-sub">
+              <div class="card-head" style="margin-bottom:8px"><h3>位姿与运动</h3><span id="poseStatus" class="pill missing">missing</span></div>
+              <div id="missionPoseMeta" class="kv"></div>
+            </div>
+            <div class="rail-sub">
+              <div class="card-head" style="margin-bottom:8px"><h3>定位 / 轨迹</h3><span id="localizationStatus" class="pill missing">missing</span></div>
+              <div id="localizationMeta" class="kv"></div>
+            </div>
+            <div class="rail-sub">
+              <div class="card-head" style="margin-bottom:8px"><h3>地图信息 <span class="faint small">occupancy</span></h3></div>
+              <div id="mapMeta" class="kv"></div>
             </div>
           </section>
-
-          <aside class="grid right-rail" aria-label="态势与诊断面板">
-            <section class="panel tab-panel" data-tab-group="situation">
-              <div class="tab-title">
-                <div>
-                  <div class="eyebrow">Situation</div>
-                  <h2>状态总览</h2>
-                </div>
-                <span id="missionStatus" class="pill missing">mission: warming</span>
+        </aside>
+        <section class="card dock rise" style="animation-delay:.2s">
+          <div class="dock-grid">
+            <div class="dcol">
+              <div class="card-head">
+                <div><div class="eyebrow">Logs</div><h3>运行日志尾部</h3></div>
+                <span id="logsStatus" class="pill missing">missing</span>
               </div>
-              <div class="tab-menu" role="tablist" aria-label="状态总览二级菜单">
-                <button class="tab-button active" type="button" data-tab-target="navigation-pane">导航</button>
-                <button class="tab-button" type="button" data-tab-target="overview-pane">总览</button>
-                <button class="tab-button" type="button" data-tab-target="task-pane">任务</button>
-                <button class="tab-button" type="button" data-tab-target="sensor-pane">传感器</button>
+              <div class="toolbar">
+                <select id="logLevelFilter" class="field" style="flex:0 0 84px" aria-label="日志等级过滤">
+                  <option value="">ALL</option><option value="debug">DEBUG</option><option value="info">INFO</option>
+                  <option value="warn">WARN</option><option value="error">ERROR</option><option value="critical">CRITICAL</option>
+                </select>
+                <input id="logSearch" class="field" style="flex:1" type="search" placeholder="搜索日志、节点或关键词" aria-label="搜索日志">
               </div>
-              <div class="tab-content">
-                <div id="navigation-pane" class="tab-pane active">
-                  <section id="navigation" class="panel compact">
-                    <div class="card-head">
-                      <h3>导航态势 / frontier（探索前沿）</h3>
-                      <span id="navigationStatus" class="pill missing">missing</span>
-                    </div>
-                    <div id="navigationMeta" class="kv"></div>
-                    <div id="frontierNotice" class="notice panel-meta">等待探索前沿候选几何。</div>
-                  </section>
-                </div>
-                <div id="overview-pane" class="tab-pane">
-                  <section id="overview" class="panel compact">
-                    <div class="card-head"><h3>运行态总览</h3><span class="muted small">核心链路</span></div>
-                    <section id="overviewGrid" class="grid overview-grid" aria-label="运行态总览"></section>
-                  </section>
-                </div>
-                <div id="task-pane" class="tab-pane">
-                  <section class="panel compact">
-                    <div class="card-head"><h3>当前任务</h3><span id="taskStatus" class="pill missing">missing</span></div>
-                    <div id="taskSummary" class="task-list"></div>
-                  </section>
-                </div>
-                <div id="sensor-pane" class="tab-pane">
-                  <section class="panel compact">
-                    <div class="card-head"><h3>位姿与运动</h3><span id="poseStatus" class="pill missing">missing</span></div>
-                    <div id="missionPoseMeta" class="kv"></div>
-                  </section>
-                  <section class="panel compact panel-meta">
-                    <div class="card-head"><h3>传感器链路</h3><span id="sensorStatus" class="pill missing">missing</span></div>
-                    <div id="sensorSummary" class="kv"></div>
-                  </section>
+              <div id="logsMeta" class="kv panel-meta" style="margin:0 0 7px"></div>
+              <div class="dscroll"><div id="logs" class="logs"></div></div>
+            </div>
+            <div class="dcol">
+              <div class="card-head"><div><div class="eyebrow">Processes</div><h3>进程矩阵</h3></div><span id="servicesStatus" class="pill missing">missing</span></div>
+              <div id="serviceMatrixScope" class="muted small"></div>
+              <div class="dscroll"><div id="serviceMatrix" class="service-list"></div></div>
+            </div>
+            <div class="dcol">
+              <div class="card-head"><div><div class="eyebrow">Tasks</div><h3>任务 / 传感器</h3></div><span id="taskStatus" class="pill missing">missing</span></div>
+              <div class="dscroll">
+                <div id="taskSummary" class="task-list"></div>
+                <div class="dgap">
+                  <div class="card-head" style="margin-bottom:8px"><h3>传感器链路</h3><span id="sensorStatus" class="pill missing">missing</span></div>
+                  <div id="sensorSummary" class="kv"></div>
                 </div>
               </div>
-            </section>
-
-            <section class="panel tab-panel" data-tab-group="diagnostics">
-              <div class="tab-title">
-                <div>
-                  <div class="eyebrow">Diagnostics</div>
-                  <h2>运行诊断</h2>
-                </div>
-                <span id="governanceStatus" class="pill missing">missing</span>
-              </div>
-              <div class="tab-menu" role="tablist" aria-label="运行诊断二级菜单">
-                <button class="tab-button active" type="button" data-tab-target="governance-pane">治理</button>
-                <button class="tab-button" type="button" data-tab-target="video-pane">视频</button>
-                <button class="tab-button" type="button" data-tab-target="service-pane">进程</button>
-                <button class="tab-button" type="button" data-tab-target="logs-pane">日志</button>
-              </div>
-              <div class="tab-content">
-                <div id="governance-pane" class="tab-pane active">
-                  <section id="runtime-settings" class="panel compact">
-                    <div class="card-head"><h3>RTAB-Map 运行治理</h3><span class="muted small">只读</span></div>
-                    <div id="governanceMeta" class="kv"></div>
-                    <div class="muted small panel-meta">展示 profile、几何资产、重定位质量和导航门控摘要。</div>
-                  </section>
-                </div>
-                <div id="video-pane" class="tab-pane">
-                  <section id="video-perception" class="panel compact">
-                    <div class="card-head">
-                      <h3>端侧推流视频感知</h3>
-                      <span id="videoStatus" class="pill missing">missing</span>
-                    </div>
-                    <div class="video-stage">
-                      <img id="videoFrame" class="video-frame" alt="Go2 端侧推流视频帧" hidden>
-                      <canvas id="videoDetections" class="video-detection-canvas" hidden></canvas>
-                      <div class="video-overlay">
-                        <span id="visionModelStatus" class="overlay-chip">本地模型：--</span>
-                        <span id="videoFpsStatus" class="overlay-chip">帧率：--</span>
-                        <label class="overlay-chip overlay-toggle"><input id="showDetections" type="checkbox">显示检测框</label>
-                      </div>
-                    </div>
-                    <div id="videoEmpty" class="empty panel-meta">等待 Go2 端侧视频推流。</div>
-                    <div id="videoMeta" class="kv panel-meta"></div>
-                  </section>
-                </div>
-                <div id="service-pane" class="tab-pane">
-                  <section id="services" class="panel compact">
-                    <div class="card-head">
-                      <h3>进程矩阵</h3>
-                      <span id="servicesStatus" class="pill missing">missing</span>
-                    </div>
-                    <div id="serviceMatrixScope" class="muted small panel-meta"></div>
-                    <div id="serviceMatrix" class="service-list"></div>
-                  </section>
-                </div>
-                <div id="logs-pane" class="tab-pane">
-                  <section id="logs-section" class="panel compact">
-                    <div class="card-head">
-                      <h3>运行日志尾部</h3>
-                      <span id="logsStatus" class="pill missing">missing</span>
-                    </div>
-                    <div class="toolbar">
-                      <select id="logLevelFilter" class="field" aria-label="日志等级过滤">
-                        <option value="">ALL</option>
-                        <option value="debug">DEBUG</option>
-                        <option value="info">INFO</option>
-                        <option value="warn">WARN</option>
-                        <option value="error">ERROR</option>
-                        <option value="critical">CRITICAL</option>
-                      </select>
-                      <input id="logSearch" class="field" type="search" placeholder="搜索日志、节点或关键词" aria-label="搜索日志">
-                    </div>
-                    <div id="logsMeta" class="kv"></div>
-                    <div id="logs" class="logs panel-meta"></div>
-                  </section>
-                </div>
-              </div>
-            </section>
-          </aside>
-        </main>
-      </div>
-    </div>
-    </div>
+            </div>
+            <div class="dcol">
+              <div class="card-head"><div><div class="eyebrow">RTAB-Map</div><h3>运行治理</h3></div><span id="governanceStatus" class="pill missing">missing</span></div>
+              <div class="dscroll"><div id="governanceMeta" class="kv"></div></div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div></div></div>
+    <div class="overview-hidden"><section id="overviewGrid" aria-hidden="true"></section></div>
     <div id="config-view" class="view-pane">
       <section id="config-section" class="panel config-fullpage">
         <div class="card-head">
-          <div>
-            <div class="eyebrow">Configuration</div>
-            <h2>配置管理</h2>
-          </div>
+          <div><div class="eyebrow">Configuration</div><h2>配置管理</h2></div>
           <span id="configStatus" class="pill missing">missing</span>
         </div>
         <div class="config-toolbar">
           <input id="configSearch" class="field" type="search" placeholder="搜索配置键 / 中文名" aria-label="搜索配置">
-          <label class="overlay-chip overlay-toggle"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
+          <label class="overlay-toggle small muted"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
           <button id="configReload" class="tab-button" type="button">重载</button>
           <button id="configSave" class="tab-button" type="button">保存改动</button>
         </div>
-        <div id="configEffectNote" class="muted small panel-meta">保存后写入 .env，需重启网关生效（非热重载）。</div>
+        <div id="configEffectNote" class="muted small">保存后写入 .env，需重启网关生效（非热重载）。</div>
         <div id="configAuthNote" class="config-auth-note">⚠ 网关当前不鉴权：任何可访问本页面者都能保存配置并写入 .env。建议仅在回环 / 内网环境暴露。</div>
-        <div id="configDirty" class="muted small panel-meta"></div>
+        <div id="configDirty" class="muted small"></div>
         <div id="configSections" class="config-sections"></div>
       </section>
     </div>
     </div>
   </div>
-
   <script>
     (() => {
       const DEBUG_ACCESS_TOKEN = __DEBUG_ACCESS_TOKEN__;

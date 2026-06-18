@@ -1979,6 +1979,21 @@ class GatewayRuntime:
                 output_schema=_schema_object({"semantic_memory": {"type": "object"}}),
             ),
             _descriptor(
+                "list_semantic_instances",
+                "列出语义实例",
+                "返回记忆库中已持久化的语义实例列表（含 pose/frame_id/confidence/is_fallback）。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "library_name": {"type": "string"},
+                        "label": {"type": "string"},
+                    }
+                ),
+                output_schema=_schema_object({"instances": {"type": "array", "items": {"type": "object"}}}),
+                exposed_to_agent=False,
+            ),
+            _descriptor(
                 "navigate_to_pose",
                 "导航到位姿",
                 "以统一导航接口把机器人导航到二维目标位姿。",
@@ -2279,6 +2294,7 @@ class GatewayRuntime:
             "query_scene_spaces": partial(memory_skills.handle_query_scene_spaces, self._skill_ctx),
             "review_scene_space": partial(memory_skills.handle_review_scene_space, self._skill_ctx),
             "remember_current_scene": partial(memory_skills.handle_remember_current_scene, self._skill_ctx),
+            "list_semantic_instances": partial(memory_skills.handle_list_semantic_instances, self._skill_ctx),
             "navigate_to_pose": self._handle_navigate_to_pose,
             "navigate_to_named_location": self._handle_navigate_to_named_location,
             "find_target": self._handle_find_target,
@@ -2651,6 +2667,13 @@ class GatewayRuntime:
                 description="把当前观察或感知结果写入语义记忆。",
                 category=SkillCategory.MEMORY,
                 capability_name="remember_current_scene",
+            ),
+            SkillDescriptor(
+                name="list_semantic_instances",
+                display_name="列出语义实例",
+                description="返回记忆库中已持久化的语义实例列表（含 pose/frame_id/is_fallback）。",
+                category=SkillCategory.MEMORY,
+                capability_name="list_semantic_instances",
             ),
             SkillDescriptor(
                 name="navigate_to_pose",
@@ -7486,6 +7509,10 @@ class GatewayRuntime:
             "remember_current_scene": (
                 lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
+            ),
+            "list_semantic_instances": (
+                lambda: True,
+                None,
             ),
             "navigate_to_pose": (
                 lambda: geometry_config_enabled,

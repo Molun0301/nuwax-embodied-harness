@@ -2552,6 +2552,61 @@ class MemoryService:
             items = items[-max(0, limit) :]
         return tuple(items)
 
+    def list_semantic_instances(
+        self,
+        *,
+        library_name: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> List[Dict[str, object]]:
+        """列出语义实例，返回精简 DTO 列表（供 Web 面板和 capability 消费）。
+
+        参数:
+            library_name: 若指定则仅返回该记忆库的实例；否则返回全部实例。
+            label: 若指定则按 label 过滤（大小写不敏感）。
+
+        返回字段：instance_id / label / display_name / pose{x,y,z} /
+        frame_id / confidence / instance_type / last_seen_ts / is_fallback。
+        is_fallback 判定规则：confidence < 0.3 视为 fallback（真实精确坐标
+        缺失时后端注入 confidence=0.2）；frame_id 非 map 系也归入 fallback。
+        """
+        all_instances = self._repository.load_semantic_instances()
+        label_lower = str(label).lower().strip() if label else None
+        result: List[Dict[str, object]] = []
+        for inst in all_instances:
+            if library_name is not None:
+                if self._record_library_name(inst) != str(library_name).strip():
+                    continue
+            if label_lower is not None:
+                if str(inst.label).lower().strip() != label_lower:
+                    continue
+            pose = inst.pose
+            frame_id = pose.frame_id if pose else ""
+            pos = pose.position if pose else None
+            is_fallback = (inst.confidence < 0.3) or (frame_id != "map")
+            last_seen: object = (
+                inst.last_seen_ts.isoformat()
+                if hasattr(inst.last_seen_ts, "isoformat")
+                else inst.last_seen_ts
+            )
+            result.append(
+                {
+                    "instance_id": inst.instance_id,
+                    "label": inst.label,
+                    "display_name": inst.display_name or inst.label,
+                    "pose": {
+                        "x": pos.x if pos else 0.0,
+                        "y": pos.y if pos else 0.0,
+                        "z": pos.z if pos else 0.0,
+                    },
+                    "frame_id": frame_id,
+                    "confidence": inst.confidence,
+                    "instance_type": inst.instance_type,
+                    "last_seen_ts": last_seen,
+                    "is_fallback": is_fallback,
+                }
+            )
+        return result
+
     def list_scene_spaces(
         self,
         *,

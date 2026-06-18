@@ -423,7 +423,12 @@ button{font-family:inherit;cursor:pointer}
                 <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
                 <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
                 <span id="mapRvizHint" class="lg" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
+                <label class="lg" style="display:flex;gap:4px;align-items:center;cursor:pointer">
+                  <input id="showSemanticInstances" type="checkbox" checked>
+                  <span class="sw" style="background:#f59e0b"></span>物品
+                </label>
               </div>
+              <button id="semanticInstancesRefresh" class="tool glass" type="button" title="手动刷新物品标记" style="position:absolute;right:14px;top:14px;z-index:5">刷新物品</button>
               <div id="mapStatus" class="pill missing" style="position:absolute;right:14px;bottom:14px;z-index:5">missing</div>
               <div id="mapEmpty" class="empty">等待地图数据。</div>
             </div>
@@ -660,6 +665,13 @@ button{font-family:inherit;cursor:pointer}
         lastLocalizationEnvelope: null,
         lastMapHeartbeatEnvelope: null,
         latestFrontierStream: null,
+        semanticInstances: [],
+        showSemanticInstances: true,
+        highlightTarget: null,
+        clusterAnim: null,
+        _prevClusters: null,
+        _semanticPollTimer: null,
+        _zoomDebounceTimer: null,
       };
       const els = {
         robotName: document.getElementById("robotName"),
@@ -706,6 +718,8 @@ button{font-family:inherit;cursor:pointer}
         videoFrame: document.getElementById("videoFrame"),
         videoDetections: document.getElementById("videoDetections"),
         showDetections: document.getElementById("showDetections"),
+        showSemanticInstances: document.getElementById("showSemanticInstances"),
+        semanticInstancesRefresh: document.getElementById("semanticInstancesRefresh"),
         videoEmpty: document.getElementById("videoEmpty"),
         videoMeta: document.getElementById("videoMeta"),
         visionModelStatus: document.getElementById("visionModelStatus"),
@@ -2099,6 +2113,7 @@ button{font-family:inherit;cursor:pointer}
         drawInitialPoses(ctx, anchor, scale);
         drawClickedPoints(ctx, anchor, scale);
         drawFrontiers(ctx, anchor, scale);
+        drawSemanticInstances(ctx, anchor, scale);
         drawRobot(ctx, anchor);
       }
       function pointFromFrontier(frontier) {
@@ -2287,6 +2302,418 @@ button{font-family:inherit;cursor:pointer}
         ctx.fill();
         ctx.stroke();
         ctx.restore();
+      }
+      // ── 语义实例 marker 层 ──────────────────────────────────────────────
+      function loadSemanticInstances() {
+        fetch("/api/memory/instances")
+          .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+          .then((body) => {
+            const list = Array.isArray(body && body.instances) ? body.instances : [];
+            state.semanticInstances = list;
+            requestMapDraw(false);
+          })
+          .catch((err) => console.warn("[semantic] 实例拉取失败", err));
+      }
+      function isFallbackInstance(inst) {
+        if (inst.is_fallback) return true;
+        if (typeof inst.confidence === "number" && inst.confidence < 0.3) return true;
+        const posePoint = pointFromPose(state.pose);
+        if (posePoint && inst.pose) {
+          const dx = Number(inst.pose.x || 0) - Number(posePoint.x);
+          const dy = Number(inst.pose.y || 0) - Number(posePoint.y);
+          if (Math.sqrt(dx * dx + dy * dy) < 0.15) return true;
+        }
+        return false;
+      }
+      function isUnknownFrame(inst) {
+        const fid = String(inst.frame_id || "").toLowerCase();
+        return fid !== "" && fid !== "map";
+      }
+      const CLUSTER_PX_THRESHOLD = 28;
+      function clusterInstances(instances, anchor, scale) {
+        // 视口裁剪：只处理可见区域 + margin
+        const canvas = els.mapCanvas;
+        const margin = CLUSTER_PX_THRESHOLD * 2;
+        const visible = [];
+        for (const inst of instances) {
+          if (!inst.pose) continue;
+          const cp = mapToCanvas({ x: inst.pose.x, y: inst.pose.y }, anchor, scale);
+          if (!cp) continue;
+          if (cp.x < -margin || cp.x > canvas.width + margin) continue;
+          if (cp.y < -margin || cp.y > canvas.height + margin) continue;
+          visible.push({ inst, cx: cp.x, cy: cp.y });
+        }
+        if (visible.length > 1000) visible.splice(1000);
+        // O(n) 网格聚类
+        const cellSize = CLUSTER_PX_THRESHOLD;
+        const grid = new Map();
+        for (const item of visible) {
+          const gx = Math.floor(item.cx / cellSize);
+          const gy = Math.floor(item.cy / cellSize);
+          let merged = false;
+          for (let dx = -1; dx <= 1 && !merged; dx++) {
+            for (let dy = -1; dy <= 1 && !merged; dy++) {
+              const key = `${gx + dx},${gy + dy}`;
+              const cell = grid.get(key);
+              if (!cell) continue;
+              const lx = cell.sumX / cell.members.length;
+              const ly = cell.sumY / cell.members.length;
+              const dist = Math.sqrt((item.cx - lx) ** 2 + (item.cy - ly) ** 2);
+              if (dist < CLUSTER_PX_THRESHOLD) {
+                cell.members.push(item.inst);
+                cell.sumX += item.cx;
+                cell.sumY += item.cy;
+                merged = true;
+              }
+            }
+          }
+          if (!merged) {
+            const key = `${gx},${gy}`;
+            grid.set(key, { members: [item.inst], sumX: item.cx, sumY: item.cy });
+          }
+        }
+        const clusters = [];
+        for (const cell of grid.values()) {
+          const cx = cell.sumX / cell.members.length;
+          const cy = cell.sumY / cell.members.length;
+          const ids = cell.members.map((m) => m.instance_id).sort().join("|");
+          clusters.push({ key: ids, members: cell.members, cx, cy });
+        }
+        return clusters;
+      }
+      function resolveHighlightCluster(clusters) {
+        const ht = state.highlightTarget;
+        if (!ht) return null;
+        // record_id 精确优先
+        if (ht.record_id) {
+          for (const cl of clusters) {
+            for (const m of cl.members) {
+              if (m.instance_id === ht.record_id) return cl.key;
+            }
+          }
+        }
+        // 坐标就近兜底
+        if (ht.target_pose) {
+          const tp = ht.target_pose;
+          let bestDist = 80;
+          let bestKey = null;
+          for (const cl of clusters) {
+            for (const m of cl.members) {
+              if (!m.pose) continue;
+              const d = Math.sqrt((m.pose.x - (tp.x || 0)) ** 2 + (m.pose.y - (tp.y || 0)) ** 2);
+              if (d < bestDist) { bestDist = d; bestKey = cl.key; }
+            }
+          }
+          if (bestKey) return bestKey;
+        }
+        return null;
+      }
+      function drawSemanticInstances(ctx, anchor, scale) {
+        if (!state.showSemanticInstances) return;
+        const instances = state.semanticInstances;
+        if (!instances || !instances.length) {
+          // 若有 target_pose 但无实例，画临时高亮环
+          if (state.highlightTarget && state.highlightTarget.target_pose) {
+            const tp = state.highlightTarget.target_pose;
+            const cp = mapToCanvas({ x: tp.x || 0, y: tp.y || 0 }, anchor, scale);
+            if (cp) {
+              ctx.save();
+              ctx.setTransform(1, 0, 0, 1, 0, 0);
+              ctx.strokeStyle = "#f59e0b";
+              ctx.lineWidth = 2.5;
+              ctx.setLineDash([6, 4]);
+              ctx.beginPath();
+              ctx.arc(cp.x, cp.y, 18, 0, Math.PI * 2);
+              ctx.stroke();
+              ctx.setLineDash([]);
+              ctx.restore();
+            }
+          }
+          return;
+        }
+        const clusters = clusterInstances(instances, anchor, scale);
+        // 动画插值
+        const anim = state.clusterAnim;
+        const now = performance.now();
+        let animT = 1;
+        if (anim && anim.active) {
+          const elapsed = now - anim.startTs;
+          const raw = Math.min(1, elapsed / anim.durationMs);
+          animT = raw < 1 ? 1 - Math.pow(1 - raw, 3) : 1; // easeOutCubic
+          if (raw >= 1) anim.active = false;
+        }
+        // 检测簇变化，启动动画
+        detectAndStartClusterAnim(clusters, now);
+        state._prevClusters = clusters;
+        const hlKey = resolveHighlightCluster(clusters);
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        for (const cl of clusters) {
+          let drawX = cl.cx;
+          let drawY = cl.cy;
+          if (anim && anim.active && anim.from[cl.key]) {
+            const from = anim.from[cl.key];
+            drawX = from.cx + (cl.cx - from.cx) * animT;
+            drawY = from.cy + (cl.cy - from.cy) * animT;
+          }
+          const isHighlighted = cl.key === hlKey;
+          const allFallback = cl.members.every((m) => isFallbackInstance(m) || isUnknownFrame(m));
+          const anyUnknown = cl.members.some((m) => isUnknownFrame(m));
+          const fallbackCount = cl.members.filter((m) => isFallbackInstance(m) || isUnknownFrame(m)).length;
+          const isSingle = cl.members.length === 1;
+          if (isSingle) {
+            drawSingleMarker(ctx, drawX, drawY, cl.members[0], allFallback, anyUnknown, isHighlighted);
+          } else {
+            drawClusterMarker(ctx, drawX, drawY, cl, allFallback, fallbackCount, isHighlighted);
+          }
+        }
+        // target_pose 保底环（无实例命中时）
+        if (state.highlightTarget && state.highlightTarget.target_pose && !hlKey) {
+          const tp = state.highlightTarget.target_pose;
+          const cp = mapToCanvas({ x: tp.x || 0, y: tp.y || 0 }, anchor, scale);
+          if (cp) {
+            ctx.strokeStyle = "#f59e0b";
+            ctx.lineWidth = 2.5;
+            ctx.setLineDash([6, 4]);
+            ctx.beginPath();
+            ctx.arc(cp.x, cp.y, 18, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+        }
+        ctx.restore();
+      }
+      function drawSingleMarker(ctx, x, y, inst, fallback, unknownFrame, highlighted) {
+        const r = highlighted ? 10 : 8;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        if (fallback || unknownFrame) {
+          ctx.setLineDash([4, 3]);
+          ctx.strokeStyle = highlighted ? "#fbbf24" : "#9ca3af";
+          ctx.lineWidth = 1.8;
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = "rgba(156,163,175,0.18)";
+          ctx.fill();
+        } else {
+          ctx.fillStyle = highlighted ? "#fbbf24" : "#f59e0b";
+          ctx.fill();
+          ctx.strokeStyle = highlighted ? "#fff" : "#fef3c7";
+          ctx.lineWidth = highlighted ? 2.5 : 1.5;
+          ctx.stroke();
+        }
+        if (highlighted) {
+          ctx.strokeStyle = "#fbbf24";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.arc(x, y, r + 6, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        const label = String(inst.display_name || inst.label || "?");
+        const tag = label.length > 6 ? label.slice(0, 5) + "…" : label;
+        ctx.font = "10px sans-serif";
+        ctx.fillStyle = fallback || unknownFrame ? "#9ca3af" : "#fff";
+        ctx.textAlign = "center";
+        ctx.fillText(tag, x, y - r - 3);
+        if (fallback) {
+          ctx.font = "9px sans-serif";
+          ctx.fillStyle = "#6b7280";
+          ctx.fillText("粗略", x, y + r + 11);
+        } else if (unknownFrame) {
+          ctx.font = "9px sans-serif";
+          ctx.fillStyle = "#6b7280";
+          ctx.fillText("坐标系未知", x, y + r + 11);
+        }
+      }
+      function drawClusterMarker(ctx, x, y, cl, allFallback, fallbackCount, highlighted) {
+        const r = highlighted ? 14 : 12;
+        const preciseCount = cl.members.length - fallbackCount;
+        if (allFallback) {
+          ctx.setLineDash([4, 3]);
+          ctx.strokeStyle = highlighted ? "#fbbf24" : "#9ca3af";
+          ctx.lineWidth = 2;
+          ctx.fillStyle = "rgba(156,163,175,0.18)";
+        } else {
+          ctx.setLineDash([]);
+          ctx.fillStyle = highlighted ? "rgba(251,191,36,0.25)" : "rgba(245,158,11,0.22)";
+          ctx.strokeStyle = highlighted ? "#fbbf24" : "#f59e0b";
+          ctx.lineWidth = highlighted ? 2.5 : 2;
+        }
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.setLineDash([]);
+        if (!allFallback && fallbackCount > 0) {
+          // 分段环：精确占比 arc
+          const ratio = preciseCount / cl.members.length;
+          ctx.beginPath();
+          ctx.strokeStyle = "#f59e0b";
+          ctx.lineWidth = 3;
+          ctx.arc(x, y, r + 3, -Math.PI / 2, -Math.PI / 2 + ratio * Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.strokeStyle = "#6b7280";
+          ctx.lineWidth = 3;
+          ctx.arc(x, y, r + 3, -Math.PI / 2 + ratio * Math.PI * 2, -Math.PI / 2 + Math.PI * 2);
+          ctx.stroke();
+        }
+        if (highlighted) {
+          ctx.strokeStyle = "#fbbf24";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(x, y, r + (allFallback ? 6 : 9), 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        ctx.font = "bold 11px sans-serif";
+        ctx.fillStyle = allFallback ? "#9ca3af" : (highlighted ? "#fbbf24" : "#fff");
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(String(cl.members.length), x, y);
+        ctx.textBaseline = "alphabetic";
+        if (allFallback) {
+          ctx.font = "9px sans-serif";
+          ctx.fillStyle = "#6b7280";
+          ctx.fillText("粗略", x, y + r + 11);
+        }
+      }
+      function detectAndStartClusterAnim(newClusters, now) {
+        const prev = state._prevClusters;
+        if (!prev || !prev.length) return;
+        const prevMap = new Map(prev.map((c) => [c.key, c]));
+        const newMap = new Map(newClusters.map((c) => [c.key, c]));
+        let changed = false;
+        for (const [key, nc] of newMap) {
+          const oc = prevMap.get(key);
+          if (!oc || Math.abs(oc.cx - nc.cx) > 1 || Math.abs(oc.cy - nc.cy) > 1) { changed = true; break; }
+        }
+        if (!changed && prev.length === newClusters.length) return;
+        const fromMap = {};
+        for (const [key, oc] of prevMap) fromMap[key] = { cx: oc.cx, cy: oc.cy };
+        const existing = state.clusterAnim;
+        if (existing && existing.active) {
+          existing.from = fromMap;
+          existing.startTs = now;
+        } else {
+          state.clusterAnim = { active: true, startTs: now, durationMs: 220, from: fromMap };
+          animateClusters();
+        }
+      }
+      function animateClusters() {
+        const anim = state.clusterAnim;
+        if (!anim || !anim.active) return;
+        const elapsed = performance.now() - anim.startTs;
+        if (elapsed >= anim.durationMs) { anim.active = false; requestMapDraw(false); return; }
+        requestMapDraw(false);
+        window.requestAnimationFrame(animateClusters);
+      }
+      function hitTestSemanticMarkers(px, py) {
+        if (!state.showSemanticInstances || !state.semanticInstances.length) return null;
+        const anchor = cameraAnchor();
+        const scale = cameraScale(anchor);
+        const clusters = clusterInstances(state.semanticInstances, anchor, scale);
+        let bestDist = 20;
+        let bestHit = null;
+        for (const cl of clusters) {
+          const dist = Math.sqrt((px - cl.cx) ** 2 + (py - cl.cy) ** 2);
+          const r = cl.members.length === 1 ? 10 : 14;
+          if (dist <= r + 4 && dist < bestDist) {
+            bestDist = dist;
+            bestHit = cl.members.length === 1
+              ? { type: "single", instance: cl.members[0] }
+              : { type: "cluster", cluster: cl };
+          }
+        }
+        return bestHit;
+      }
+      function closeSemanticOverlay() {
+        const el = document.getElementById("semanticOverlay");
+        if (el) el.remove();
+      }
+      function navigateToInstance(inst) {
+        closeSemanticOverlay();
+        const body = { arguments: { target_pose: { x: inst.pose && inst.pose.x || 0, y: inst.pose && inst.pose.y || 0, frame_id: "map" } } };
+        fetch("/api/capabilities/navigate_to_pose/invoke", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+          .then((r) => r.json())
+          .then((d) => console.info("[semantic] 导航已下发 task_id=", d.task_id || d.id || JSON.stringify(d)))
+          .catch((e) => console.warn("[semantic] 导航下发失败", e));
+      }
+      function formatLastSeen(ts) {
+        if (!ts) return "--";
+        const d = new Date(typeof ts === "number" && ts < 1e12 ? ts * 1000 : ts);
+        return isNaN(d.getTime()) ? String(ts) : d.toLocaleTimeString();
+      }
+      function buildDetailCard(inst) {
+        const fallback = isFallbackInstance(inst);
+        const unknownFrame = isUnknownFrame(inst);
+        const div = document.createElement("div");
+        div.id = "semanticOverlay";
+        div.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9999;min-width:260px;max-width:360px;background:var(--glass,rgba(15,23,42,0.92));border:1px solid var(--line,rgba(255,255,255,0.12));border-radius:12px;padding:18px 20px;color:var(--fg,#e2e8f0);backdrop-filter:blur(12px);box-shadow:0 8px 32px rgba(0,0,0,0.5)";
+        const rows = [
+          ["名称", inst.display_name || inst.label || "--"],
+          ["标签", inst.label || "--"],
+          ["实例 ID", inst.instance_id || "--"],
+          ["位置", inst.pose ? `x=${(inst.pose.x||0).toFixed(2)}, y=${(inst.pose.y||0).toFixed(2)}` : "--"],
+          ["坐标系", inst.frame_id || "--"],
+          ["置信度", typeof inst.confidence === "number" ? inst.confidence.toFixed(2) : "--"],
+          ["最后见到", formatLastSeen(inst.last_seen_ts)],
+          ["类型", inst.instance_type || "--"],
+        ];
+        let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><strong style="font-size:14px">物品详情</strong><button onclick="document.getElementById('semanticOverlay').remove()" style="background:none;border:none;color:inherit;cursor:pointer;font-size:16px;padding:0">×</button></div>`;
+        if (fallback) html += `<div style="color:#f87171;font-size:11px;margin-bottom:8px;padding:4px 8px;background:rgba(248,113,113,0.1);border-radius:6px">位置粗略（依赖投影修复）</div>`;
+        if (unknownFrame) html += `<div style="color:#fb923c;font-size:11px;margin-bottom:8px;padding:4px 8px;background:rgba(251,146,60,0.1);border-radius:6px">坐标系未知（frame_id: ${inst.frame_id}）</div>`;
+        html += `<table style="width:100%;border-collapse:collapse;font-size:12px">`;
+        for (const [k, v] of rows) html += `<tr><td style="color:#94a3b8;padding:3px 0;width:80px">${k}</td><td style="padding:3px 0;word-break:break-all">${v}</td></tr>`;
+        html += `</table>`;
+        div.innerHTML = html;
+        const btn = document.createElement("button");
+        btn.textContent = "导航到此";
+        btn.style.cssText = "margin-top:12px;width:100%;padding:7px;background:#f59e0b;border:none;border-radius:8px;color:#000;font-weight:600;cursor:pointer;font-size:13px";
+        btn.onclick = () => navigateToInstance(inst);
+        div.appendChild(btn);
+        div.addEventListener("click", (e) => e.stopPropagation());
+        return div;
+      }
+      function showSemanticInstanceDetail(inst) {
+        closeSemanticOverlay();
+        document.body.appendChild(buildDetailCard(inst));
+        const closeOnOut = (e) => {
+          if (!document.getElementById("semanticOverlay")) { document.removeEventListener("pointerdown", closeOnOut); return; }
+          if (!document.getElementById("semanticOverlay").contains(e.target)) { closeSemanticOverlay(); document.removeEventListener("pointerdown", closeOnOut); }
+        };
+        setTimeout(() => document.addEventListener("pointerdown", closeOnOut), 0);
+      }
+      function showSemanticClusterList(cluster) {
+        closeSemanticOverlay();
+        const div = document.createElement("div");
+        div.id = "semanticOverlay";
+        div.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9999;min-width:240px;max-width:340px;background:var(--glass,rgba(15,23,42,0.92));border:1px solid var(--line,rgba(255,255,255,0.12));border-radius:12px;padding:18px 20px;color:var(--fg,#e2e8f0);backdrop-filter:blur(12px);box-shadow:0 8px 32px rgba(0,0,0,0.5)";
+        let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><strong style="font-size:14px">物品簇（${cluster.members.length} 个）</strong><button onclick="document.getElementById('semanticOverlay').remove()" style="background:none;border:none;color:inherit;cursor:pointer;font-size:16px;padding:0">×</button></div>`;
+        html += `<div style="max-height:260px;overflow-y:auto">`;
+        for (const inst of cluster.members) {
+          const fb = isFallbackInstance(inst);
+          const uf = isUnknownFrame(inst);
+          html += `<div data-iid="${inst.instance_id}" style="padding:7px 10px;border-radius:8px;cursor:pointer;margin-bottom:4px;background:rgba(255,255,255,0.05);font-size:13px;display:flex;justify-content:space-between;align-items:center">`;
+          html += `<span>${inst.display_name || inst.label || inst.instance_id}</span>`;
+          if (fb) html += `<span style="color:#6b7280;font-size:10px">粗略</span>`;
+          else if (uf) html += `<span style="color:#fb923c;font-size:10px">未知系</span>`;
+          else html += `<span style="color:#f59e0b;font-size:10px">精确</span>`;
+          html += `</div>`;
+        }
+        html += `</div>`;
+        div.innerHTML = html;
+        for (const inst of cluster.members) {
+          const row = div.querySelector(`[data-iid="${inst.instance_id}"]`);
+          if (row) row.addEventListener("click", () => showSemanticInstanceDetail(inst));
+        }
+        div.addEventListener("click", (e) => e.stopPropagation());
+        document.body.appendChild(div);
+        const closeOnOut = (e) => {
+          if (!document.getElementById("semanticOverlay")) { document.removeEventListener("pointerdown", closeOnOut); return; }
+          if (!document.getElementById("semanticOverlay").contains(e.target)) { closeSemanticOverlay(); document.removeEventListener("pointerdown", closeOnOut); }
+        };
+        setTimeout(() => document.addEventListener("pointerdown", closeOnOut), 0);
       }
       function updateMap(envelope) {
         state.lastMapEnvelope = envelope;
@@ -3318,6 +3745,21 @@ button{font-family:inherit;cursor:pointer}
           updateLocalization(envelopeFromFrame(frame, { pose: state.pose, trajectory }));
         } else if (frame.topic === "navigation.state") {
           updateNavigation(envelopeFromFrame(frame, { navigation_context: frame.payload, exploration_context: state.latestStreamFrames["exploration.state"] && state.latestStreamFrames["exploration.state"].payload }));
+          const navCtx = frame.payload || {};
+          const goal = navCtx.current_goal || null;
+          const navStatus = String((navCtx.status && (navCtx.status.value || navCtx.status)) || "").toLowerCase();
+          const terminal = ["succeeded", "failed", "cancelled", "timeout"].includes(navStatus);
+          if (goal && !terminal) {
+            state.highlightTarget = {
+              record_id: goal.metadata && goal.metadata.record_id || null,
+              record_kind: goal.metadata && goal.metadata.record_kind || null,
+              target_pose: goal.target_pose || null,
+              target_name: goal.target_name || null,
+            };
+          } else if (terminal) {
+            state.highlightTarget = null;
+          }
+          requestMapDraw(false);
         } else if (frame.topic === "exploration.state") {
           updateNavigation(envelopeFromFrame(frame, { navigation_context: state.latestStreamFrames["navigation.state"] && state.latestStreamFrames["navigation.state"].payload, exploration_context: frame.payload }));
         } else if (frame.topic === "exploration.frontier") {
@@ -3923,6 +4365,16 @@ button{font-family:inherit;cursor:pointer}
         if (isMapToolActive()) event.preventDefault();
       });
       els.mapCanvas.addEventListener("pointerdown", (event) => {
+        if (!isMap3dVisible() && event.button === 0 && !isMapToolActive()) {
+          const pointer = canvasPointer(event);
+          const hit = hitTestSemanticMarkers(pointer.x, pointer.y);
+          if (hit) {
+            event.preventDefault();
+            if (hit.type === "cluster") showSemanticClusterList(hit.cluster);
+            else showSemanticInstanceDetail(hit.instance);
+            return;
+          }
+        }
         if (!isMapToolActive() || isMap3dVisible()) return;
         const pointer = canvasPointer(event);
         if (event.button === 1 || event.button === 2) {
@@ -4043,6 +4495,17 @@ button{font-family:inherit;cursor:pointer}
         state.logSearch = els.logSearch.value;
         renderLogs();
       });
+      if (els.showSemanticInstances) {
+        els.showSemanticInstances.addEventListener("change", () => {
+          state.showSemanticInstances = Boolean(els.showSemanticInstances.checked);
+          requestMapDraw(false);
+        });
+      }
+      if (els.semanticInstancesRefresh) {
+        els.semanticInstancesRefresh.addEventListener("click", () => loadSemanticInstances());
+      }
+      state._semanticPollTimer = window.setInterval(() => loadSemanticInstances(), 30000);
+      loadSemanticInstances();
       connectStreams();
       document.getElementById('mapModeToggle').addEventListener('click', () => {
         const c = document.getElementById('mapCanvas');

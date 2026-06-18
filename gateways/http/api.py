@@ -758,6 +758,22 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
         }
 
+    @router.get("/api/memory/instances")
+    async def api_memory_instances(
+        request: Request,
+        library_name: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        result = await run_in_threadpool(
+            lambda: runtime.invoke_capability(
+                "list_semantic_instances",
+                {"library_name": library_name, "label": label},
+                requested_by="http_api",
+            )
+        )
+        return to_jsonable(result)
+
     @router.get("/api/memory/scene_spaces")
     async def api_memory_scene_spaces(
         request: Request,

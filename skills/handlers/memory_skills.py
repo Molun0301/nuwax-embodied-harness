@@ -432,3 +432,20 @@ def handle_remember_current_scene(
         metadata={"requested_by": requested_by or "unknown"},
     )
     return {"semantic_memory": entry}
+
+
+def handle_list_semantic_instances(
+    ctx: SkillContext,
+    payload: Dict[str, Any],
+    *,
+    requested_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """列出语义实例，返回精简 DTO 列表。"""
+    del requested_by
+    library_name = params.optional_str(payload, "library_name")
+    label = params.optional_str(payload, "label")
+    instances = ctx.memory_service.list_semantic_instances(
+        library_name=library_name,
+        label=label,
+    )
+    return {"instances": instances}

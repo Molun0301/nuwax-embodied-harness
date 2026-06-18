@@ -188,14 +188,6 @@ button{font-family:inherit;cursor:pointer}
 /* ===== config view (full takeover) ===== */
 .view{display:none;min-height:0}.view.on{display:grid;height:100%}
 #config.view.on{grid-template-rows:minmax(0,1fr)}
-.cfg{display:grid;grid-template-columns:230px minmax(0,1fr);min-height:0;overflow:hidden}
-.cfg-nav{border-right:1px solid var(--line);padding:14px 12px;display:flex;flex-direction:column;gap:3px;overflow:auto}
-.cfg-nav .hd{padding:0 6px 10px}
-.cfg-nav a{padding:8px 11px;border-radius:var(--r-sm);font-size:12px;font-weight:560;color:var(--muted);
-  text-decoration:none;display:flex;justify-content:space-between;align-items:center;transition:.16s;cursor:pointer}
-.cfg-nav a:hover{background:var(--inset);color:var(--ink)}
-.cfg-nav a.on{background:var(--ink);color:var(--surface)}
-.cfg-main{display:grid;grid-template-rows:auto auto minmax(0,1fr);min-height:0}
 .cfg-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:14px 16px 0}
 .cfg-bar .field{flex:1;min-width:200px}
 .btn{min-height:31px;padding:6px 15px;border-radius:var(--r-sm);font-size:12px;font-weight:620;
@@ -286,13 +278,19 @@ button{font-family:inherit;cursor:pointer}
 #mapCanvas.pan-ready{cursor:grab}#mapCanvas.panning{cursor:grabbing}
 
 /* ===== config view (full takeover, real #config-view structure) ===== */
-.config-fullpage{height:100%;display:grid;
-  grid-template-rows:auto auto auto auto auto minmax(0,1fr);gap:10px;padding:16px 18px;overflow:hidden}
-.config-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.cfg{height:100%;display:grid;grid-template-columns:230px minmax(0,1fr);min-height:0;overflow:hidden;padding:0}
+.cfg-nav{border-right:1px solid var(--line);padding:14px 12px;display:flex;flex-direction:column;gap:3px;overflow:auto;min-height:0}
+.cfg-nav .hd{padding:0 6px 10px}
+.cfg-nav a{padding:8px 11px;border-radius:var(--r-sm);font-size:12px;font-weight:560;color:var(--muted);
+  text-decoration:none;display:flex;justify-content:space-between;align-items:center;gap:8px;transition:.16s;cursor:pointer}
+.cfg-nav a:hover{background:var(--inset);color:var(--ink)}
+.cfg-nav a.on{background:var(--ink);color:var(--surface)}
+.cfg-main{display:grid;grid-template-rows:auto auto auto auto auto minmax(0,1fr);gap:10px;min-height:0;overflow:hidden;padding:0 0 14px}
+.config-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:0 16px}
 .config-toolbar .field{flex:1;min-width:220px}
-.config-auth-note{font-size:11.5px;padding:8px 12px;border-radius:var(--r-sm);background:var(--warn-w);color:var(--warn)}
-.config-sections{overflow:auto;display:grid;gap:14px;align-content:start;padding-right:4px}
-.config-section-block{border:1px solid var(--line-2);border-radius:var(--r);overflow:hidden;background:var(--surface-2)}
+.config-auth-note{font-size:11.5px;margin:0 16px;padding:8px 12px;border-radius:var(--r-sm);background:var(--warn-w);color:var(--warn)}
+.config-sections{overflow:auto;display:grid;gap:14px;align-content:start;padding:0 16px 0}
+.config-section-block{border:1px solid var(--line-2);border-radius:var(--r);overflow:hidden;background:var(--surface-2);scroll-margin-top:8px}
 .config-section-title{font-weight:660;padding:11px 14px;font-size:12.5px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--line-2)}
 .config-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:11px 18px;padding:13px 14px}
 .config-adv-fold{padding:0 14px 13px}
@@ -508,21 +506,24 @@ button{font-family:inherit;cursor:pointer}
       <div class="overview-hidden"><section id="overviewGrid" aria-hidden="true"></section></div>
     </div>
     <div id="config-view" class="view-pane">
-      <section id="config-section" class="card config-fullpage rise">
-        <div class="card-head">
-          <div class="t"><div class="eyebrow">Configuration</div><h2>配置管理</h2></div>
-          <span id="configStatus" class="pill missing">missing</span>
+      <section id="config-section" class="card cfg rise">
+        <nav class="cfg-nav" id="configNav"><div class="hd eyebrow">配置板块</div></nav>
+        <div class="cfg-main">
+          <div class="card-head" style="padding:14px 16px 0;margin:0">
+            <div class="t"><div class="eyebrow">Configuration</div><h2>配置管理</h2></div>
+            <span id="configStatus" class="pill missing">missing</span>
+          </div>
+          <div class="config-toolbar">
+            <input id="configSearch" class="field" type="search" placeholder="搜索配置键 / 中文名" aria-label="搜索配置">
+            <label class="small muted" style="display:flex;gap:5px;align-items:center"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
+            <button id="configReload" class="btn" type="button">重载</button>
+            <button id="configSave" class="btn primary" type="button">保存改动</button>
+          </div>
+          <div id="configEffectNote" class="muted small" style="padding:0 16px">保存后写入 .env，需重启网关生效（非热重载）。</div>
+          <div id="configAuthNote" class="config-auth-note">⚠ 网关当前不鉴权：任何可访问本页面者都能保存配置并写入 .env。建议仅在回环 / 内网环境暴露。</div>
+          <div id="configDirty" class="muted small" style="padding:0 16px"></div>
+          <div id="configSections" class="config-sections"></div>
         </div>
-        <div class="config-toolbar">
-          <input id="configSearch" class="field" type="search" placeholder="搜索配置键 / 中文名" aria-label="搜索配置">
-          <label class="small muted" style="display:flex;gap:5px;align-items:center"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
-          <button id="configReload" class="btn" type="button">重载</button>
-          <button id="configSave" class="btn primary" type="button">保存改动</button>
-        </div>
-        <div id="configEffectNote" class="muted small">保存后写入 .env，需重启网关生效（非热重载）。</div>
-        <div id="configAuthNote" class="config-auth-note">⚠ 网关当前不鉴权：任何可访问本页面者都能保存配置并写入 .env。建议仅在回环 / 内网环境暴露。</div>
-        <div id="configDirty" class="muted small"></div>
-        <div id="configSections" class="config-sections"></div>
       </section>
     </div>
   </div>
@@ -3529,9 +3530,13 @@ button{font-family:inherit;cursor:pointer}
       function renderConfigSchema(schema) {
         const host = document.getElementById("configSections");
         host.replaceChildren();
+        const nav = document.getElementById("configNav");
+        if (nav) nav.replaceChildren(Object.assign(document.createElement("div"), { className: "hd eyebrow", textContent: "配置板块" }));
+        const navLinks = [];
         const forceAdvanced = document.getElementById("configShowAdvanced").checked;
         const query = (document.getElementById("configSearch").value || "").trim().toLowerCase();
         const match = (f) => !query || f.key.toLowerCase().includes(query) || (f.zh_name || "").toLowerCase().includes(query);
+        let sectionIndex = 0;
         for (const section of schema.sections || []) {
           const fields = (section.fields || []).filter(match);
           if (!fields.length) continue;
@@ -3539,11 +3544,25 @@ button{font-family:inherit;cursor:pointer}
           const advanced = fields.filter((f) => f.advanced);
           const block = document.createElement("div");
           block.className = "config-section-block";
+          const blockId = "cfgsec-" + sectionIndex++;
+          block.id = blockId;
           const title = document.createElement("div");
           title.className = "config-section-title";
           title.innerHTML = configEscape(section.section_title) +
             ' <span class="config-badge">' + fields.length + "</span>";
           block.appendChild(title);
+          if (nav) {
+            const link = document.createElement("a");
+            link.dataset.target = blockId;
+            link.innerHTML = configEscape(section.section_title) +
+              ' <span class="config-badge">' + fields.length + "</span>";
+            link.addEventListener("click", () => {
+              block.scrollIntoView({ behavior: "smooth", block: "start" });
+              for (const l of navLinks) l.classList.toggle("on", l === link);
+            });
+            nav.appendChild(link);
+            navLinks.push(link);
+          }
           if (normal.length) {
             const grid = document.createElement("div");
             grid.className = "config-grid";
@@ -3566,9 +3585,25 @@ button{font-family:inherit;cursor:pointer}
           }
           host.appendChild(block);
         }
+        if (navLinks.length) navLinks[0].classList.add("on");
+        setupConfigScrollSpy(host, navLinks);
         if (!host.children.length) {
           host.innerHTML = '<div class="empty panel-meta">无匹配配置项。</div>';
         }
+      }
+      function setupConfigScrollSpy(host, navLinks) {
+        if (host._spy) host.removeEventListener("scroll", host._spy);
+        if (!navLinks.length) return;
+        host._spy = () => {
+          const top = host.getBoundingClientRect().top;
+          let current = navLinks[0];
+          for (const link of navLinks) {
+            const block = document.getElementById(link.dataset.target);
+            if (block && block.getBoundingClientRect().top - top <= 12) current = link;
+          }
+          for (const l of navLinks) l.classList.toggle("on", l === current);
+        };
+        host.addEventListener("scroll", host._spy, { passive: true });
       }
       function buildConfigRow(f) {
         const row = document.createElement("div");

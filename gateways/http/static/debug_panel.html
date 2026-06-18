@@ -275,9 +275,8 @@ button{font-family:inherit;cursor:pointer}
 .view-switch-btn{border:0;background:transparent;color:var(--muted);font-size:12px;font-weight:620;
   padding:5px 15px;border-radius:var(--pill);transition:.2s}
 .view-switch-btn.active{background:var(--surface);color:var(--ink);box-shadow:var(--sh-sm)}
-.view-pane{display:none;min-height:0}
-.view-pane.active{display:grid;height:100%}
-#config-view.view-pane.active{grid-template-rows:minmax(0,1fr)}
+.view-pane{display:none;min-height:0;height:100%}
+.view-pane.active{display:block}
 
 /* map tool active state (real .active -> mockup .tool.on) */
 .tool.active{background:var(--ink);color:var(--surface);border-color:transparent}

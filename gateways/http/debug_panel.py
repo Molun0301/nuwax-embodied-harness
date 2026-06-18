@@ -308,9 +308,17 @@ def _render_debug_page(access_token: str) -> str:
     .mission-layout,.mission-content{height:100%;min-height:0}
     .workspace{display:grid;height:100%;min-height:0;
       grid-template-columns:minmax(0,1fr) clamp(340px,25vw,420px);
-      grid-template-rows:minmax(0,1fr) auto;gap:10px}
-    .map-panel{grid-row:1;grid-column:1;position:relative;overflow:hidden;border-radius:var(--r-xl);padding:0;display:block}
-    .right-rail{grid-column:2;grid-row:1;display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;min-height:0;overflow:hidden;padding:0;background:none;border:0;box-shadow:none}
+      grid-template-rows:clamp(208px,34%,300px) minmax(0,1fr) auto;
+      grid-template-areas:"hero mini" "hero rail" "dock dock";gap:10px}
+    .map-panel{grid-area:hero;position:relative;overflow:hidden;border-radius:var(--r-xl);padding:0;display:block;min-height:0}
+    #video-perception{grid-area:mini;min-height:0;overflow:auto}
+    .merged-rail{grid-area:rail;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:0}
+    .workspace.swapped .map-panel{grid-area:mini}
+    .workspace.swapped #video-perception{grid-area:hero}
+    /* media-swap button */
+    .media-swap{display:inline-flex;align-items:center;gap:5px}
+    #video-perception .media-swap{border:1px solid var(--line);background:var(--inset);color:var(--strong);min-height:28px;padding:4px 11px;border-radius:var(--r-sm);font-size:11.5px;font-weight:620;transition:.18s}
+    #video-perception .media-swap:hover{border-color:var(--ring);color:var(--text)}
 
     /* hero map */
     .map-panel>.card-head{position:absolute;left:14px;top:14px;right:14px;z-index:4;margin:0;pointer-events:none}
@@ -336,10 +344,7 @@ def _render_debug_page(access_token: str) -> str:
     #mapEmpty{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;max-width:70%}
     .map-info-grid{display:none}
 
-    /* right-rail panels */
-    .right-rail>.panel,.right-rail>section{min-height:0;overflow:auto}
-    #video-perception{grid-row:1}
-    .right-rail .merged-rail{grid-row:2;display:flex;flex-direction:column;gap:0}
+    /* rail sub-sections */
     .rail-sub+.rail-sub{margin-top:12px;padding-top:12px;border-top:1px solid var(--line-2)}
 
     /* video */
@@ -352,7 +357,7 @@ def _render_debug_page(access_token: str) -> str:
     .overlay-toggle input{accent-color:var(--accent)}
 
     /* ===== bottom dock · all visible ===== */
-    .dock{grid-column:1 / -1;grid-row:2;height:248px}
+    .dock{grid-area:dock;height:248px}
     .dock-grid{display:grid;height:100%;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr) minmax(0,1.05fr) minmax(0,1fr)}
     .dcol{display:flex;flex-direction:column;min-height:0;padding:12px 14px;border-left:1px solid var(--line)}
     .dcol:first-child{border-left:0}
@@ -415,9 +420,10 @@ def _render_debug_page(access_token: str) -> str:
       html,body{overflow:auto}body{padding:10px}
       .app-shell{height:auto}
       .topbar{grid-template-columns:1fr}
-      .workspace{grid-template-columns:1fr;grid-template-rows:none}
-      .map-panel{grid-column:1;min-height:480px}
-      .right-rail{grid-column:1;grid-row:auto;grid-template-rows:none}
+      .workspace{grid-template-columns:1fr;grid-template-rows:none;
+        grid-template-areas:"hero" "mini" "rail" "dock"}
+      .map-panel{min-height:480px}
+      .workspace.swapped .map-panel{min-height:300px}
       .dock-grid{grid-template-columns:1fr 1fr}
       .global-status .metric{padding:2px 10px}
     }
@@ -470,6 +476,7 @@ def _render_debug_page(access_token: str) -> str:
               <button id="mapGoalToggle" class="map-control" type="button" title="2D Goal：左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
               <button id="mapPublishPointToggle" class="map-control" type="button" title="Publish Point：发布 /clicked_point">选点</button>
               <button id="mapModeToggle" class="map-control" type="button" style="font-size:11px;padding:5px 10px;">3D</button>
+              <button id="mediaSwapBtn" class="map-control media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ 视频</button>
             </div>
             <span id="mapGoalStatus" class="map-chip map-goal-chip" hidden></span>
             <span id="mapStreamStatus" class="map-chip map-stream-chip">等待地图首帧</span>
@@ -489,11 +496,13 @@ def _render_debug_page(access_token: str) -> str:
             <div id="mapEmpty" class="empty">等待地图数据。</div>
           </div>
         </section>
-        <aside class="right-rail" aria-label="态势与诊断面板">
-          <section id="video-perception" class="card panel rise" style="animation-delay:.05s">
+        <section id="video-perception" class="card panel rise" style="animation-delay:.05s">
             <div class="card-head">
               <div><div class="eyebrow">Perception</div><h2>端侧推流视频感知</h2></div>
-              <span id="videoStatus" class="pill missing">missing</span>
+              <div style="display:flex;align-items:center;gap:8px">
+                <button id="mediaSwapBtnVideo" class="media-swap" type="button" title="地图 / 视频 互换位置与大小">⇄ 放大</button>
+                <span id="videoStatus" class="pill missing">missing</span>
+              </div>
             </div>
             <div class="video-stage">
               <img id="videoFrame" class="video-frame" alt="Go2 端侧推流视频帧" hidden>
@@ -530,7 +539,6 @@ def _render_debug_page(access_token: str) -> str:
               <div id="mapMeta" class="kv"></div>
             </div>
           </section>
-        </aside>
         <section class="card dock rise" style="animation-delay:.2s">
           <div class="dock-grid">
             <div class="dcol">
@@ -828,6 +836,26 @@ def _render_debug_page(access_token: str) -> str:
         }
       }
       initViewSwitch();
+
+      function initMediaSwap() {
+        const workspace = document.querySelector(".workspace");
+        const video = document.getElementById("video-perception");
+        const btnMap = document.getElementById("mediaSwapBtn");
+        const btnVideo = document.getElementById("mediaSwapBtnVideo");
+        if (!workspace) return;
+        function toggle() {
+          const swapped = workspace.classList.toggle("swapped");
+          if (btnMap) btnMap.textContent = swapped ? "⇄ 地图" : "⇄ 视频";
+          if (btnVideo) btnVideo.textContent = swapped ? "⇄ 缩小" : "⇄ 放大";
+          if (video) video.classList.toggle("rise", false);
+          // 槽位尺寸变化后重排地图画布并重绘（视频靠 CSS 自适应，无需干预）
+          setTimeout(redrawMapAfterResize, 60);
+          setTimeout(redrawMapAfterResize, 320);
+        }
+        if (btnMap) btnMap.addEventListener("click", toggle);
+        if (btnVideo) btnVideo.addEventListener("click", toggle);
+      }
+      initMediaSwap();
 
       function nowText() { return new Date().toLocaleTimeString(); }
       function shortTime(value) { return value ? new Date(value).toLocaleTimeString() : "--"; }

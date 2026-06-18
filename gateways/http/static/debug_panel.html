@@ -2308,7 +2308,11 @@ button{font-family:inherit;cursor:pointer}
         fetch("/api/memory/instances")
           .then((r) => r.ok ? r.json() : Promise.reject(r.status))
           .then((body) => {
-            const list = Array.isArray(body && body.instances) ? body.instances : [];
+            // 兼容两种结构：契约 {instances:[...]} 或 capability 信封 {result:{instances:[...]}}
+            const src = (body && Array.isArray(body.instances)) ? body
+              : (body && body.result && Array.isArray(body.result.instances)) ? body.result
+              : null;
+            const list = src ? src.instances : [];
             state.semanticInstances = list;
             requestMapDraw(false);
           })

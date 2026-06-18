@@ -772,7 +772,12 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                 requested_by="http_api",
             )
         )
-        return to_jsonable(result)
+        payload = to_jsonable(result)
+        # invoke_capability 返回 capability 信封 {request_id, capability_name, result:{instances:[...]}}
+        # 端点契约为 {instances:[...]}，解包取内层 result 载荷
+        if isinstance(payload, dict) and "instances" not in payload and isinstance(payload.get("result"), dict):
+            return payload["result"]
+        return payload
 
     @router.get("/api/memory/scene_spaces")
     async def api_memory_scene_spaces(

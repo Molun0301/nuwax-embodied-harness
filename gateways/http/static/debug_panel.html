@@ -435,7 +435,7 @@ button{font-family:inherit;cursor:pointer}
           </section>
           <section id="video-perception" class="card panel rise" style="animation-delay:.05s">
             <div class="ph">
-              <div class="t"><div class="eyebrow">Perception</div><h2>端侧推流视频感知</h2></div>
+              <div class="t"><div class="eyebrow">Perception</div><h2>摄像头画面</h2></div>
               <div style="display:flex;align-items:center;gap:8px">
                 <button id="mediaSwapBtnVideo" class="media-swap" type="button" title="地图 / 视频 互换位置与大小">⇄ 放大</button>
                 <span id="videoStatus" class="pill missing">missing</span>
@@ -451,7 +451,6 @@ button{font-family:inherit;cursor:pointer}
               </div>
             </div>
             <div id="videoEmpty" class="empty panel-meta">等待 Go2 端侧视频推流。</div>
-            <div id="videoMeta" class="kv panel-meta"></div>
           </section>
           <section class="card panel rise merged-rail" style="animation-delay:.1s;overflow:auto">
             <div class="ph">
@@ -489,7 +488,6 @@ button{font-family:inherit;cursor:pointer}
                 </select>
                 <input id="logSearch" class="field" style="flex:1" type="search" placeholder="搜索日志、节点或关键词" aria-label="搜索日志">
               </div>
-              <div id="logsMeta" class="kv panel-meta" style="margin:0 0 7px"></div>
               <div class="dscroll"><div id="logs" class="logs"></div></div>
             </div>
             <div class="dcol">
@@ -821,6 +819,7 @@ button{font-family:inherit;cursor:pointer}
         el.textContent = label ? `${label}: ${value}` : value;
       }
       function setKv(el, rows) {
+        if (!el) return;
         const scrollContainer = el.closest(".map-info-grid, .tab-content, .kv");
         const savedScroll = scrollContainer ? scrollContainer.scrollTop : 0;
         el.replaceChildren();
@@ -928,11 +927,11 @@ button{font-family:inherit;cursor:pointer}
         const sensorStatus = worstStatus([map, localization, pointcloudMap, pointcloud, video]);
         setPill(els.sensorStatus, sensorStatus);
         setKv(els.sensorSummary, [
-          ["2D_map", `${safeText(map.status)} latency=${fmt(map.latency_ms, " ms")}`],
-          ["localization", `${safeText(localization.status)} frame=${safeText(localization.frame_id)}`],
-          ["pointcloud_map", `${safeText(pointcloudMap.status)} frame=${safeText(pointcloudMap.frame_id)} rev=${safeText(pointcloudMap.revision)} points=${safeText(pointcloudMap.metadata && pointcloudMap.metadata.point_count)} source=${safeText(pointcloudMap.metadata && pointcloudMap.metadata.source_kind)}`],
-          ["pointcloud", `${safeText(pointcloud.status)} points=${safeText(pointcloud.metadata && pointcloud.metadata.point_count)} source=${safeText(pointcloud.metadata && pointcloud.metadata.source)}`],
-          ["video", `${safeText(video.status)} source=${safeText(video.metadata && video.metadata.source)}`],
+          ["2D地图", `${safeText(map.status)} latency=${fmt(map.latency_ms, " ms")}`],
+          ["定位", `${safeText(localization.status)} frame=${safeText(localization.frame_id)}`],
+          ["点云地图", `${safeText(pointcloudMap.status)} frame=${safeText(pointcloudMap.frame_id)} rev=${safeText(pointcloudMap.revision)} points=${safeText(pointcloudMap.metadata && pointcloudMap.metadata.point_count)} source=${safeText(pointcloudMap.metadata && pointcloudMap.metadata.source_kind)}`],
+          ["扫描点云", `${safeText(pointcloud.status)} points=${safeText(pointcloud.metadata && pointcloud.metadata.point_count)} source=${safeText(pointcloud.metadata && pointcloud.metadata.source)}`],
+          ["视频", `${safeText(video.status)} source=${safeText(video.metadata && video.metadata.source)}`],
         ]);
       }
       function formatGB(bytes) {
@@ -1101,24 +1100,24 @@ button{font-family:inherit;cursor:pointer}
       function showPanelError(kind, message) {
         if (kind === "governance") {
           setPill(els.governanceStatus, "error");
-          setKv(els.governanceMeta, [["error", message], ["前端接收", nowText()]]);
+          setKv(els.governanceMeta, [["错误", message], ["前端接收", nowText()]]);
         } else if (kind === "map") {
           setPill(els.mapStatus, "error");
           els.mapEmpty.hidden = false;
           els.mapEmpty.textContent = message;
         } else if (kind === "localization") {
           setPill(els.localizationStatus, "error");
-          setKv(els.localizationMeta, [["error", message], ["前端接收", nowText()]]);
+          setKv(els.localizationMeta, [["错误", message], ["前端接收", nowText()]]);
         } else if (kind === "navigation") {
           setPill(els.navigationStatus, "error");
-          setKv(els.navigationMeta, [["error", message], ["前端接收", nowText()]]);
+          setKv(els.navigationMeta, [["错误", message], ["前端接收", nowText()]]);
         } else if (kind === "video") {
           setPill(els.videoStatus, "error");
           els.videoEmpty.hidden = false;
           els.videoEmpty.textContent = message;
         } else if (kind === "logs") {
           setPill(els.logsStatus, "error");
-          setKv(els.logsMeta, [["error", message], ["前端接收", nowText()]]);
+          setKv(els.logsMeta, [["错误", message], ["前端接收", nowText()]]);
         }
       }
       function normalizeFrameId(value, fallback) {
@@ -2002,18 +2001,18 @@ button{font-family:inherit;cursor:pointer}
         setPill(els.localizationStatus, status || "missing");
         setKv(els.localizationMeta, [
           ["显示状态", "hidden"],
-          ["reason", message || LOCALIZATION_DISPLAY_IDLE_MESSAGE],
-          ["frame", "--"],
-          ["pose", "--"],
-          ["yaw", "--"],
-          ["trajectory_count", 0],
+          ["原因", message || LOCALIZATION_DISPLAY_IDLE_MESSAGE],
+          ["坐标系", "--"],
+          ["位姿", "--"],
+          ["偏航角", "--"],
+          ["轨迹点数", 0],
         ]);
         setPill(els.poseStatus, status || "missing");
         setKv(els.missionPoseMeta, [
-          ["frame", "--"],
-          ["position", "--"],
-          ["yaw", "--"],
-          ["trajectory", 0],
+          ["坐标系", "--"],
+          ["位置", "--"],
+          ["偏航角", "--"],
+          ["轨迹点数", 0],
         ]);
       }
       function clearMapOverlayState() {
@@ -2041,12 +2040,12 @@ button{font-family:inherit;cursor:pointer}
           ["地图名称", displayDiagnostics.active_map_name || displayDiagnostics.map_name || (envelope && envelope.frame_id) || (grid && grid.frame_id) || "--"],
           ["总栅格数", grid ? `${grid.width * grid.height}` : "--"],
           ["显示状态", "hidden"],
-          ["reason", message || MAP_DISPLAY_IDLE_MESSAGE],
-          ["source_timestamp", shortTime(envelope && envelope.source_timestamp)],
-          ["revision", (envelope && envelope.revision) || displayDiagnostics.content_revision],
-          ["sequence", (envelope && envelope.sequence) || displayDiagnostics.message_count],
-          ["streaming", mapStreamLabel(status || "missing", displayDiagnostics, streamBridge || {})],
-          ["latency", fmt(envelope && envelope.latency_ms, " ms")],
+          ["原因", message || MAP_DISPLAY_IDLE_MESSAGE],
+          ["数据时间", shortTime(envelope && envelope.source_timestamp)],
+          ["版本号", (envelope && envelope.revision) || displayDiagnostics.content_revision],
+          ["序号", (envelope && envelope.sequence) || displayDiagnostics.message_count],
+          ["推流状态", mapStreamLabel(status || "missing", displayDiagnostics, streamBridge || {})],
+          ["延迟", fmt(envelope && envelope.latency_ms, " ms")],
           ["前端接收", shortTime(envelope && envelope.__receivedAt)],
         ]);
         updateMapStreamChip(status || "missing", displayDiagnostics, streamBridge || {}, envelope && envelope.source_timestamp);
@@ -2746,11 +2745,11 @@ button{font-family:inherit;cursor:pointer}
         setKv(els.mapMeta, [
           ["地图名称", diagnostics.active_map_name || diagnostics.map_name || envelope.frame_id || (grid && grid.frame_id) || "--"],
           ["总栅格数", grid ? `${grid.width * grid.height}` : "--"],
-          ["source_timestamp", shortTime(envelope.source_timestamp)],
-          ["revision", envelope.revision || diagnostics.content_revision],
-          ["sequence", envelope.sequence || diagnostics.message_count],
-          ["streaming", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
-          ["latency", fmt(envelope.latency_ms, " ms")],
+          ["数据时间", shortTime(envelope.source_timestamp)],
+          ["版本号", envelope.revision || diagnostics.content_revision],
+          ["序号", envelope.sequence || diagnostics.message_count],
+          ["推流状态", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
+          ["延迟", fmt(envelope.latency_ms, " ms")],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
@@ -2807,15 +2806,15 @@ button{font-family:inherit;cursor:pointer}
           els.mapEmpty.textContent = "地图源在线，等待内容更新帧。";
         }
         setKv(els.mapMeta, [
-          ["frame", envelope.frame_id || diagnostics.frame_id || (grid && grid.frame_id)],
-          ["size", grid ? `${grid.width} x ${grid.height}` : "--"],
-          ["resolution", grid ? `${grid.resolution_m} m` : "--"],
-          ["source_timestamp", shortTime(envelope.source_timestamp)],
-          ["revision", envelope.revision || diagnostics.content_revision],
-          ["sequence", envelope.sequence || diagnostics.update_sequence || diagnostics.message_count],
-          ["streaming", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
-          ["latency", fmt(envelope.latency_ms, " ms")],
-          ["stale", envelope.stale === true ? "true" : "false"],
+          ["坐标系", envelope.frame_id || diagnostics.frame_id || (grid && grid.frame_id)],
+          ["尺寸", grid ? `${grid.width} x ${grid.height}` : "--"],
+          ["分辨率", grid ? `${grid.resolution_m} m` : "--"],
+          ["数据时间", shortTime(envelope.source_timestamp)],
+          ["版本号", envelope.revision || diagnostics.content_revision],
+          ["序号", envelope.sequence || diagnostics.update_sequence || diagnostics.message_count],
+          ["推流状态", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
+          ["延迟", fmt(envelope.latency_ms, " ms")],
+          ["已过期", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         updateMapStreamChip(status, diagnostics, streamBridge, envelope.source_timestamp);
@@ -2859,22 +2858,22 @@ button{font-family:inherit;cursor:pointer}
         const p = pointFromPose(state.pose);
         const yaw = yawFromPose(state.pose);
         setKv(els.localizationMeta, [
-          ["frame", envelope.frame_id || (state.pose && state.pose.frame_id)],
-          ["pose", p ? `x=${fmt(p.x)} y=${fmt(p.y)} z=${fmt(p.z)}` : errorReason(envelope, "--")],
-          ["yaw", yaw === null ? "--" : fmt(yaw, " rad")],
-          ["trajectory_count", state.trajectory.length],
-          ["source_timestamp", shortTime(envelope.source_timestamp)],
-          ["latency", fmt(envelope.latency_ms, " ms")],
-          ["stale", envelope.stale === true ? "true" : "false"],
+          ["坐标系", envelope.frame_id || (state.pose && state.pose.frame_id)],
+          ["位姿", p ? `x=${fmt(p.x)} y=${fmt(p.y)} z=${fmt(p.z)}` : errorReason(envelope, "--")],
+          ["偏航角", yaw === null ? "--" : fmt(yaw, " rad")],
+          ["轨迹点数", state.trajectory.length],
+          ["数据时间", shortTime(envelope.source_timestamp)],
+          ["延迟", fmt(envelope.latency_ms, " ms")],
+          ["已过期", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         setPill(els.poseStatus, status);
         setKv(els.missionPoseMeta, [
-          ["frame", envelope.frame_id || (state.pose && state.pose.frame_id)],
-          ["position", p ? `x=${fmt(p.x)} y=${fmt(p.y)} z=${fmt(p.z)}` : "--"],
-          ["yaw", yaw === null ? "--" : fmt(yaw, " rad")],
-          ["trajectory", state.trajectory.length],
-          ["latency", fmt(envelope.latency_ms, " ms")],
+          ["坐标系", envelope.frame_id || (state.pose && state.pose.frame_id)],
+          ["位置", p ? `x=${fmt(p.x)} y=${fmt(p.y)} z=${fmt(p.z)}` : "--"],
+          ["偏航角", yaw === null ? "--" : fmt(yaw, " rad")],
+          ["轨迹点数", state.trajectory.length],
+          ["延迟", fmt(envelope.latency_ms, " ms")],
         ]);
         if (reevaluateMap) reevaluateCachedMapDisplay();
         else requestMapDraw(false);
@@ -2979,15 +2978,15 @@ button{font-family:inherit;cursor:pointer}
         const rotate = policy.rotate_relocalization || {};
         setPill(els.governanceStatus, status);
         setKv(els.governanceMeta, [
-          ["profile", `${safeText(profile.name)} / ${safeText(profile.status)} / route=${safeText(profile.route)}`],
-          ["geometry_asset", asset.available ? `${safeText(asset.geometry_stack)} db=${safeText(asset.database_present)} pcd=${safeText(asset.pcd_present)}` : "missing"],
-          ["asset_frame", asset.frame_id],
-          ["localization", session.available ? `${safeText(session.status)} pose=${safeText(session.pose_available)}` : "missing"],
-          ["last_relocalization", relocalization.available ? `fitness=${safeText(relocalization.fitness)} inlier=${safeText(relocalization.inlier_ratio)}` : safeText(relocalization.status)],
-          ["relocalization_failure", relocalization.failure_reason || session.last_error],
-          ["front_align", `${safeText(frontAlign.enabled)} triggered=${safeText(frontAlign.triggered)} reason=${safeText(frontAlign.reason)}`],
-          ["rotate_reloc", `${safeText(rotate.enabled)} triggered=${safeText(rotate.triggered)} reason=${safeText(rotate.reason)}`],
-          ["source", (data.metadata && data.metadata.source) || "platform_service_contracts"],
+          ["配置档", `${safeText(profile.name)} / ${safeText(profile.status)} / route=${safeText(profile.route)}`],
+          ["几何资产", asset.available ? `${safeText(asset.geometry_stack)} db=${safeText(asset.database_present)} pcd=${safeText(asset.pcd_present)}` : "missing"],
+          ["资产坐标系", asset.frame_id],
+          ["定位", session.available ? `${safeText(session.status)} pose=${safeText(session.pose_available)}` : "missing"],
+          ["上次重定位", relocalization.available ? `fitness=${safeText(relocalization.fitness)} inlier=${safeText(relocalization.inlier_ratio)}` : safeText(relocalization.status)],
+          ["重定位失败", relocalization.failure_reason || session.last_error],
+          ["前向对齐", `${safeText(frontAlign.enabled)} triggered=${safeText(frontAlign.triggered)} reason=${safeText(frontAlign.reason)}`],
+          ["旋转重定位", `${safeText(rotate.enabled)} triggered=${safeText(rotate.triggered)} reason=${safeText(rotate.reason)}`],
+          ["来源", (data.metadata && data.metadata.source) || "platform_service_contracts"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         reevaluateCachedMapDisplay();
@@ -3050,21 +3049,21 @@ button{font-family:inherit;cursor:pointer}
           state.pendingNavGoal = null;
         }
         setKv(els.navigationMeta, [
-          ["navigation", summarizeContext(data.navigation_context, "navigation_state")],
-          ["exploration", summarizeContext(data.exploration_context, "exploration_state")],
-          ["explorer_status", explorerStatus ? normalizeExplorerStatusText(explorerStatus) : "--"],
-          ["exploration_terminal", explorationTerminal === true ? "true" : (explorationTerminal === false ? "false" : "--")],
-          ["frontier_count", frontierCount === null || frontierCount === undefined ? "--" : frontierCount],
-          ["waiting_for", waitingFor],
-          ["mapping_detail", mappingDiag.message],
-          ["occupancy", `${safeText(liveMap.occupancy_topic)} ready=${safeText(liveMap.occupancy_grid_ready)} count=${safeText(liveMap.occupancy_message_count)}`],
-          ["pointcloud_bridge", `${safeText(cloudPub.topic || cloudPub.point_cloud_topic)} published=${safeText(cloudPub.published_count)} source=${safeText(cloudPub.source || cloudPub.last_source_topic || cloudSource.source_topic)}`],
-          ["frontier_geometry", frontiers && frontiers.length ? `${frontiers.length} 个几何` : "暂无候选"],
-          ["goal", state.goalPose ? "target_pose" : "--"],
-          ["nav_path", state.navigationPath.length ? `${state.navigationPath.length} 点` : "--"],
-          ["source_timestamp", shortTime(envelope.source_timestamp)],
-          ["latency", fmt(envelope.latency_ms, " ms")],
-          ["stale", envelope.stale === true ? "true" : "false"],
+          ["导航", summarizeContext(data.navigation_context, "navigation_state")],
+          ["探索", summarizeContext(data.exploration_context, "exploration_state")],
+          ["探索器状态", explorerStatus ? normalizeExplorerStatusText(explorerStatus) : "--"],
+          ["探索终止", explorationTerminal === true ? "true" : (explorationTerminal === false ? "false" : "--")],
+          ["前沿数量", frontierCount === null || frontierCount === undefined ? "--" : frontierCount],
+          ["等待中", waitingFor],
+          ["建图详情", mappingDiag.message],
+          ["占据栅格", `${safeText(liveMap.occupancy_topic)} ready=${safeText(liveMap.occupancy_grid_ready)} count=${safeText(liveMap.occupancy_message_count)}`],
+          ["点云桥接", `${safeText(cloudPub.topic || cloudPub.point_cloud_topic)} published=${safeText(cloudPub.published_count)} source=${safeText(cloudPub.source || cloudPub.last_source_topic || cloudSource.source_topic)}`],
+          ["前沿几何", frontiers && frontiers.length ? `${frontiers.length} 个几何` : "暂无候选"],
+          ["目标点", state.goalPose ? "target_pose" : "--"],
+          ["导航路径", state.navigationPath.length ? `${state.navigationPath.length} 点` : "--"],
+          ["数据时间", shortTime(envelope.source_timestamp)],
+          ["延迟", fmt(envelope.latency_ms, " ms")],
+          ["已过期", envelope.stale === true ? "true" : "false"],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
         els.frontierNotice.hidden = Boolean(explorationTerminal || (frontiers && frontiers.length));
@@ -3461,29 +3460,6 @@ button{font-family:inherit;cursor:pointer}
           clearVideoDisplay(errorReason(envelope, "尚未收到 Go2 端侧主动推送的视频帧。"));
           els.videoEmpty.textContent = errorReason(envelope, "尚未收到 Go2 端侧主动推送的视频帧。");
         }
-        setKv(els.videoMeta, [
-          ["camera", data.camera_id],
-          ["frame", envelope.frame_id || data.frame_id],
-          ["size", data.width_px && data.height_px ? `${data.width_px} x ${data.height_px}` : "--"],
-          ["encoding", data.encoding],
-          ["transport", data.transport],
-          ["ingest_connected", data.ingest_status && data.ingest_status.connected],
-          ["ingest_fps", data.ingest_status && fmt(data.ingest_status.fps_estimate, " fps")],
-          ["ingest_last_client", data.ingest_status && data.ingest_status.last_client_id],
-          ["stream_url", data.stream_url],
-          ["payload_bytes", data.payload_bytes],
-          ["browser_stream", state.videoStreamStatus],
-          ["browser_bytes", state.videoStreamBytes],
-          ["decoded_bytes", state.videoDecodedBytes],
-          ["decode_errors", state.videoDecodeErrors],
-          ["last_decode_error", state.videoLastError],
-          ["detections", state.videoDetections.length],
-          ["rendered_frames", state.videoFrames],
-          ["last_rendered_at", state.videoLastFrameAt ? new Date(state.videoLastFrameAt).toLocaleTimeString() : "--"],
-          ["source_timestamp", shortTime(envelope.source_timestamp)],
-          ["latency", fmt(envelope.latency_ms, " ms")],
-          ["前端接收", shortTime(envelope.__receivedAt)],
-        ]);
         setText(els.visionModelStatus, `本地模型：${status}`);
         setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${state.videoStreamStatus} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
       }
@@ -3571,17 +3547,6 @@ button{font-family:inherit;cursor:pointer}
           state.logs = state.logs.slice(-200);
         }
         if (typeof data.next_cursor === "number") state.logCursor = data.next_cursor;
-        const metrics = data.metrics || {};
-        setKv(els.logsMeta, [
-          ["entries", state.logs.length],
-          ["next_cursor", state.logCursor],
-          ["source_status", data.source_status || status],
-          ["source_message", data.source_message || (envelope.error && envelope.error.message)],
-          ["server_compute_ms", fmt(metrics.server_compute_ms, " ms")],
-          ["file_read_ms", fmt(metrics.file_read_ms, " ms")],
-          ["bytes_read", metrics.bytes_read],
-          ["前端接收", shortTime(envelope.__receivedAt)],
-        ]);
         renderLogs();
       }
       function renderLogs() {

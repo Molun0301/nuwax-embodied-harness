@@ -1,7 +1,7 @@
 {
   "GO2_DATA_PLANE_ENABLED": "是否启用 Go2 设备侧数据面",
   "NUWAX_ACTIVE_MAP_RESTORE_ON_START": "启动网关时不自动恢复/加载地图；由 Agent 通过 MCP 显式 activate_map / load_map_version",
-  "NUWAX_ARTIFACT_RETENTION_DAYS": "默认：",
+  "NUWAX_ARTIFACT_RETENTION_DAYS": "制品保留天数；超过该天数的历史制品可被清理。",
   "NUWAX_BACKEND_DATABASE_PATH": "后端数据库绝对路径（runtime.py:565；留空则由 DATABASE_ROOT 推导）",
   "NUWAX_GATEWAY_HIGH_RISK_ALLOWLIST": "个人机器狗：网关不鉴权（无 agent/admin 令牌、无来源网段限制）。 仅保留能力风险门控白名单：列出的 HIGH 风险能力才允许被能力调用入口（含 LLM）触发，逗号分隔。",
   "NUWAX_GATEWAY_TELEMETRY_ENABLED": "性能监控（CPU/内存/进程）采集，平台侧用 psutil，通用不绑定机器人型号。",
@@ -9,8 +9,8 @@
   "NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC": "采集周期（秒），弱算力 ARM 设备可调大以降低开销。",
   "NUWAX_GATEWAY_TELEMETRY_PROCESS_KEYWORDS": "被监控进程关键字白名单（逗号分隔，按 cmdline 子串匹配，name 作补充）。",
   "NUWAX_GEOMETRY_CLOUD_MAP_TOPIC": "cloud_map 首选名（legacy NUWAX_CLOUD_MAP_TOPIC 已弃用，建图 PCD 导出链消费）",
-  "NUWAX_GEOMETRY_EXTERNAL_ENABLED": "外部 SLAM/Nav2 栈能力声明",
-  "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "GO2_NAV_NAV2_START_DELAY_SEC=8             wait for map->odom before Nav2 GO2_NAV_LOCALIZATION_FROZEN_GRID=true      default: latch /map from db (no live grid growth)",
+  "NUWAX_GEOMETRY_EXTERNAL_ENABLED": "统一几何外部进程能力声明；关闭时平台不托管外部几何脚本。",
+  "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "统一几何外部进程的显示/管理名称；留空时使用默认名称。",
   "NUWAX_GEOMETRY_ODOM_QUALITY_SOURCE": "里程计质量",
   "NUWAX_GEOMETRY_ODOM_TOPIC": "odom 话题：实机由 Unitree 驱动发布 /utlidar/robot_odom（/odom 在实机零消费）。 与 settings.py 默认 (/utlidar/robot_odom) 对齐，勿改回 /odom 否则建图链路接到无人发布话题。",
   "NUWAX_GEOMETRY_PLAN_TOPIC": "外部几何栈 plan 话题（external_debug_observer.py:105,484）",
@@ -36,7 +36,7 @@
   "NUWAX_ROS_SETUP_SCRIPT": "NUWAX_ROS_SETUP_SCRIPT 由 build_ros2_workspace.sh / bootstrap.py 消费（ROS2 环境 setup）",
   "NUWAX_VIDEO_SHM_PATH": "视频共享内存 / Unix socket 路径（gateways/ws/data_streams.py、ros_bridge_client.py:73-74）",
   "ROBOT_IP": "机器人地址别名",
-  "TTS_PLAYER_BACKEND_MODE": "- robot_webrtc  : 已下线的 Go2 机身扬声器链路 - alsa_local    : 已下线的 Jetson 本地 ALSA/Pulse 链路",
+  "TTS_PLAYER_BACKEND_MODE": "已下线兼容项；旧播放器后端模式保留字段形态，当前运行时不建议依赖。",
   "TTS_PLAYER_PREFERRED_BACKEND": "Jetson 本地 ALSA/Pulse 链路配置",
   "TTS_PLAYER_ROBOT_IP": "Go2 机身扬声器 WebRTC 链路配置（已下线，无运行时消费，仅保留字段形态）"
 }

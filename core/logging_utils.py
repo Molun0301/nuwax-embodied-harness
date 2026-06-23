@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import contextvars
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import logging
 import random
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, Hashable, Iterable, Mapping, Optional
@@ -14,6 +16,8 @@ _STANDARD_LOG_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__.keys(
 DEFAULT_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 DEFAULT_EXTRA_VALUE_MAX_LENGTH = 240
 DEFAULT_PREVIEW_MAX_LENGTH = 600
+DEFAULT_LOG_DETAILS_TOTAL_MAX_LENGTH = 2000
+_REDACTED = "********"
 _EXTRA_FIELD_ORDER = (
     "event",
     "request_id",
@@ -26,11 +30,22 @@ _EXTRA_FIELD_ORDER = (
     "error_category",
     "category",
     "runtime_event_type",
+    "runtime_message",
+    "payload_preview",
+    "metadata_preview",
     "source",
+    "cursor",
     "subject_id",
     "severity",
     "suppressed_count",
     "rate_limit_window_sec",
+)
+_SENSITIVE_KEY_RE = re.compile(
+    r"(token|api[_-]?key|secret|password|access[_-]?key|authorization|cookie)",
+    re.IGNORECASE,
+)
+_SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+|\b(?:sk|ak)-[A-Za-z0-9._-]{8,}\b"
 )
 _DEFAULT_DROP_PATTERNS = (
     "Received message on data channel:",
@@ -59,6 +74,54 @@ def _truncate_text(text: str, max_length: int) -> str:
     if limit <= len(suffix):
         return text[:limit]
     return f"{text[: limit - len(suffix)]}{suffix}"
+
+
+def _is_sensitive_key(key: object) -> bool:
+    return bool(_SENSITIVE_KEY_RE.search(str(key or "")))
+
+
+def _redact_sensitive_text(text: str) -> str:
+    redacted = _SENSITIVE_VALUE_RE.sub(_REDACTED, text)
+    return redacted
+
+
+def _redact_and_compact_log_value(value: Any, *, key: object = "", max_depth: int = 2, max_items: int = 8) -> Any:
+    if _is_sensitive_key(key):
+        return _REDACTED
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _redact_sensitive_text(value.strip())
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<bytes len={len(value)}>"
+    if max_depth <= 0:
+        return f"<{type(value).__name__}>"
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        compacted = {
+            str(item_key): _redact_and_compact_log_value(
+                item,
+                key=item_key,
+                max_depth=max_depth - 1,
+                max_items=max_items,
+            )
+            for item_key, item in items[:max_items]
+        }
+        if len(items) > max_items:
+            compacted["..."] = f"+{len(items) - max_items} keys"
+        return compacted
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        compacted_items = [
+            _redact_and_compact_log_value(item, key=key, max_depth=max_depth - 1, max_items=max_items)
+            for item in items[:max_items]
+        ]
+        if len(items) > max_items:
+            compacted_items.append(f"...(+{len(items) - max_items} items)")
+        return compacted_items
+    return _redact_sensitive_text(str(value))
 
 
 def _compact_log_value(value: Any, *, max_depth: int, max_items: int) -> Any:
@@ -112,6 +175,19 @@ def compact_log_value(
     return _truncate_text(rendered, max_length)
 
 
+def compact_log_detail_value(value: Any, *, key: object = "", max_length: int = DEFAULT_EXTRA_VALUE_MAX_LENGTH) -> str:
+    compacted = _redact_and_compact_log_value(value, key=key, max_depth=3, max_items=10)
+    if compacted is None:
+        return "-"
+    if isinstance(compacted, str):
+        return _truncate_text(compacted, max_length)
+    try:
+        rendered = json.dumps(compacted, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        rendered = str(compacted)
+    return _truncate_text(_redact_sensitive_text(rendered), max_length)
+
+
 def format_log_preview(value: Any, *, max_length: int = DEFAULT_PREVIEW_MAX_LENGTH) -> str:
     if not value:
         return "-"
@@ -151,6 +227,29 @@ def _iter_extra_items(record: logging.LogRecord) -> Iterable[tuple[str, Any]]:
             yield key, extras.pop(key)
     for key in sorted(extras):
         yield key, extras[key]
+
+
+def _format_record_time_text(record: logging.LogRecord) -> str:
+    dt = datetime.fromtimestamp(record.created)
+    return "%s,%03d" % (dt.strftime("%Y-%m-%d %H:%M:%S"), int(getattr(record, "msecs", 0)))
+
+
+def _build_details_compact(record: logging.LogRecord) -> Dict[str, str]:
+    details: Dict[str, str] = {}
+    total = 0
+    for key, value in _iter_extra_items(record):
+        rendered = compact_log_detail_value(value, key=key)
+        if rendered == "-":
+            continue
+        remaining = DEFAULT_LOG_DETAILS_TOTAL_MAX_LENGTH - total
+        if remaining <= 0:
+            details["..."] = "...(truncated)"
+            break
+        if len(rendered) > remaining:
+            rendered = _truncate_text(rendered, remaining)
+        details[key] = rendered
+        total += len(key) + len(rendered)
+    return details
 
 
 class ContextAwareFormatter(logging.Formatter):
@@ -406,22 +505,38 @@ class StreamBusLogHandler(logging.Handler):
             if severity == "warning":
                 severity = "warn"
             message = self.format(record) if self.formatter else record.getMessage()
-            extra = {}
+            details = _build_details_compact(record)
+            extra: Dict[str, Any] = {}
             for key in _EXTRA_FIELD_ORDER:
                 value = getattr(record, key, None)
                 if value is not None:
                     extra[key] = value
+            timestamp_iso = datetime.fromtimestamp(record.created, timezone.utc).isoformat()
+            runtime_message = extra.get("runtime_message")
+            runtime_event_type = extra.get("runtime_event_type")
+            display_message = runtime_message or (runtime_event_type if message == "运行时事件" else message)
             self._stream_bus.publish(
                 "logs.entry",
                 source=record.name,
                 payload={
                     "timestamp": record.created,
+                    "timestamp_unix_sec": record.created,
+                    "timestamp_iso": timestamp_iso,
+                    "timestamp_text": _format_record_time_text(record),
                     "severity": severity,
                     "level": severity,
                     "source": record.name,
                     "message": message,
+                    "display_message": display_message,
                     "event_type": extra.get("event"),
+                    "runtime_event_type": runtime_event_type,
+                    "runtime_message": runtime_message,
+                    "payload_preview": details.get("payload_preview"),
+                    "metadata_preview": details.get("metadata_preview"),
+                    "details_compact": details,
                     "task_id": extra.get("task_id"),
+                    "category": extra.get("category"),
+                    "subject_id": extra.get("subject_id"),
                 },
                 sequence=self._sequence,
                 status="available",

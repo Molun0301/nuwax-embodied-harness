@@ -28,6 +28,7 @@ from gateways.runtime import GatewayRuntime, create_default_gateway_runtime
 from gateways.ws.data_streams import build_data_stream_router
 from gateways.ws.events import build_event_router
 from core.logging_utils import LogRateLimiter
+from core.process_title import set_process_title
 from core.settings import NuwaxRobotBridgeConfig, configure_logging, load_config
 
 
@@ -214,6 +215,7 @@ def create_gateway_app(
 def create_gateway_app_from_env() -> FastAPI:
     """按环境配置创建宿主机网关应用。"""
 
+    set_process_title("nuwax-gateway")
     config = load_config()
     configure_logging(config.logging)
     APP_LOGGER.info(

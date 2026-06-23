@@ -139,7 +139,11 @@ class RosBridgeSubprocess:
         if external_env_script is not None:
             source_scripts.append(str(external_env_script))
         source_cmd = " && ".join("source %s" % shlex.quote(script) for script in source_scripts)
-        cmd = "%s && exec %s" % (source_cmd, shlex.quote(self._binary_path))
+        cmd = "%s && exec -a %s %s" % (
+            source_cmd,
+            shlex.quote(_DEFAULT_BINARY_NAME),
+            shlex.quote(self._binary_path),
+        )
 
         try:
             self._process = subprocess.Popen(

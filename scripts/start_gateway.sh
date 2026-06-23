@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${NUWAX_GATEWAY_SUPERVISOR_TITLED:-0}" != "1" && -n "${BASH:-}" ]]; then
+  export NUWAX_GATEWAY_SUPERVISOR_TITLED=1
+  exec -a nuwax-gateway-supervisor "${BASH}" "$0" "$@"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${NUWAX_BOOTSTRAP_ENV_FILE:-${REPO_ROOT}/.env}"
@@ -67,6 +72,15 @@ source_runtime_script() {
     # shellcheck disable=SC1090
     source "${target}"
   fi
+}
+
+run_with_title() {
+  local process_title="$1"
+  shift
+  if [[ -n "${BASH_VERSION:-}" ]]; then
+    exec -a "${process_title}" "$@"
+  fi
+  exec "$@"
 }
 
 acquire_script_lock() {
@@ -370,7 +384,7 @@ start_ros_bridge() {
       export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     fi
     set -u
-    exec "${binary}"
+    run_with_title "nuwax-ros-bridge" "${binary}"
   ) &
   ROS_BRIDGE_PID="$!"
   # 等待 UDS socket 出现
@@ -394,7 +408,7 @@ start_go2_video_streamer() {
     return 0
   fi
   echo "starting Go2 side video streamer -> UDS /tmp/nuwax_video.sock"
-  "${PYTHON_BIN}" -m drivers.go2.video_streamer &
+  (run_with_title "nuwax-go2-video-streamer" "${PYTHON_BIN}" -m drivers.go2.video_streamer) &
   VIDEO_STREAMER_PID="$!"
 }
 
@@ -513,7 +527,7 @@ trap stop_gateway INT TERM
 
 if ! is_restart_enabled "${RESTART_POLICY}"; then
   set +e
-  "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}" &
+  (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
   start_ros_bridge
   start_go2_video_streamer
@@ -528,7 +542,7 @@ fi
 attempt=0
 while true; do
   set +e
-  "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}" &
+  (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
   start_ros_bridge
   start_go2_video_streamer

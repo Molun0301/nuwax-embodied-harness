@@ -54,8 +54,9 @@ trap cleanup EXIT INT TERM
 
 start_background() {
   local log_file="$1"
-  shift
-  "$@" > "${LOG_DIR}/${log_file}" 2>&1 &
+  local process_title="${2:-nuwax-geometry-sidecar}"
+  shift 2
+  (exec -a "${process_title}" "$@") > "${LOG_DIR}/${log_file}" 2>&1 &
   PIDS+=("$!")
 }
 
@@ -77,12 +78,12 @@ start_static_tf() {
   if [[ -z "${parent_frame}" || -z "${child_frame}" || "${parent_frame}" == "${child_frame}" ]]; then
     return 0
   fi
-  start_background "${log_name}.log" \
+  start_background "${log_name}.log" "nuwax-${log_name//_/-}" \
     bash "${REPO_ROOT}/services/geometry/launch_ros2_stack.sh" \
     ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 "${parent_frame}" "${child_frame}"
 }
 
-start_background "odom_tf_bridge.log" \
+start_background "odom_tf_bridge.log" "nuwax-odom-tf-bridge" \
   bash "${REPO_ROOT}/services/geometry/launch_ros2_stack.sh" \
   python3 "${REPO_ROOT}/services/geometry/odom_tf_bridge.py" \
   --odom-topic "${ODOM_TOPIC}" \
@@ -95,7 +96,7 @@ start_static_tf "static_tf_base_to_body" "${BASE_FRAME}" "body"
 start_static_tf "static_tf_base_to_lidar" "${BASE_FRAME}" "${LIDAR_FRAME}"
 start_static_tf "static_tf_base_to_imu" "${BASE_FRAME}" "${IMU_FRAME}"
 
-start_background "rtabmap_live.log" \
+start_background "rtabmap_live.log" "nuwax-rtabmap-live" \
   bash "${REPO_ROOT}/services/geometry/launch_ros2_stack.sh" \
   ros2 launch "${RTABMAP_LAUNCH_PACKAGE}" "${RTABMAP_LAUNCH_FILE}" \
   namespace:='/' rtabmapviz:=false rviz:=false \
@@ -118,7 +119,7 @@ case "${NAV2_MODE,,}" in
     if [[ -n "${NAV2_PARAMS_FILE}" ]]; then
       NAV2_ARGS+=("params_file:=${NAV2_PARAMS_FILE}")
     fi
-    start_background "nav2.log" "${NAV2_ARGS[@]}"
+    start_background "nav2.log" "nuwax-nav2" "${NAV2_ARGS[@]}"
     ;;
   external|external_action|action|client|pending|disabled|off|none|"")
     ;;

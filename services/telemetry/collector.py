@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
 from contracts.debug_views import (
@@ -35,6 +37,64 @@ TELEMETRY_LOGGER = logging.getLogger("nuwax_robot_bridge.telemetry")
 # 默认通用进程关键字集：覆盖网关与常见 ROS/导航/建图组件，按 cmdline 子串匹配。
 # 不绑定任何机器人型号；“python” 因过宽（会误纳无关解释器进程）被刻意排除。
 _DEFAULT_PROCESS_KEYWORDS = ("gateway", "rtabmap", "nav2", "robot_bridge", "ros2")
+_CMDLINE_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(--?(?:token|api[_-]?key|secret|password|access[_-]?key|authorization|cookie)(?:=|\s+))([^\s]+)"
+)
+_CMDLINE_SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+|\b(?:sk|ak)-[A-Za-z0-9._-]{8,}\b"
+)
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    role: str
+    display_name: str
+
+
+_PROCESS_PATTERNS: Sequence[tuple[str, str, str]] = (
+    ("gateway_web", "网关 Web 服务", "nuwax-gateway-web"),
+    ("gateway_supervisor", "网关守护脚本", "nuwax-gateway-supervisor"),
+    ("go2_video_streamer", "Go2 视频推流", "nuwax-go2-video-streamer"),
+    ("ros_bridge", "ROS 数据桥", "nuwax-ros-bridge"),
+    ("geometry_external", "统一几何服务", "nuwax-geometry-external"),
+    ("odom_tf_bridge", "里程计 TF 桥", "nuwax-odom-tf-bridge"),
+    ("rtabmap_live", "RTAB-Map 建图", "nuwax-rtabmap-live"),
+    ("nav2", "Nav2 导航", "nuwax-nav2"),
+    ("static_tf", "静态 TF", "nuwax-static-tf"),
+    ("go2_video_streamer", "Go2 视频推流", "drivers.go2.video_streamer"),
+    ("gateway_web", "网关 Web 服务", "uvicorn gateways.app:create_gateway_app_from_env"),
+    ("ros_bridge", "ROS 数据桥", "nuwax_ros_bridge"),
+)
+
+
+def sanitize_cmdline_preview(cmdline: str, *, max_length: int = 240) -> str:
+    """返回截断、脱敏后的命令行摘要。"""
+
+    text = str(cmdline or "").strip()
+    if not text:
+        return ""
+    text = _CMDLINE_SENSITIVE_KEY_RE.sub(lambda m: m.group(1) + "********", text)
+    text = _CMDLINE_SENSITIVE_VALUE_RE.sub("********", text)
+    if len(text) <= max_length:
+        return text
+    suffix = "...(truncated)"
+    if max_length <= len(suffix):
+        return text[:max_length]
+    return text[: max_length - len(suffix)] + suffix
+
+
+def infer_process_identity(name: str, cmdline: str, matched_keyword: Optional[str] = None) -> ProcessIdentity:
+    """根据命名规范和命令行推导项目进程角色。"""
+
+    haystack = " ".join([str(name or ""), str(cmdline or ""), str(matched_keyword or "")]).lower()
+    for role, display_name, pattern in _PROCESS_PATTERNS:
+        if pattern.lower() in haystack:
+            return ProcessIdentity(role=role, display_name=display_name)
+    if matched_keyword == "process_tree":
+        return ProcessIdentity(role="project_process", display_name="项目子进程")
+    if matched_keyword:
+        return ProcessIdentity(role=str(matched_keyword).replace("-", "_"), display_name="项目相关进程")
+    return ProcessIdentity(role="unknown", display_name=str(name or "未知进程"))
 
 
 class SystemMetricsCollector:
@@ -271,11 +331,15 @@ class SystemMetricsCollector:
                     matched_keyword = "process_tree"
                 else:
                     matched_keyword = self._matches(name, cmdline)
+                identity = infer_process_identity(name, cmdline, matched_keyword)
                 results.append(
                     ProcessMetric(
                         pid=pid,
                         name=name,
                         matched_keyword=matched_keyword,
+                        display_name=identity.display_name,
+                        role=identity.role,
+                        cmdline_preview=sanitize_cmdline_preview(cmdline),
                         rss_bytes=rss,
                         cpu_percent=cpu_percent,
                     )
@@ -289,6 +353,3 @@ class SystemMetricsCollector:
         # 按 CPU 占用降序，便于面板优先展示重载进程。
         results.sort(key=lambda p: p.cpu_percent, reverse=True)
         return results
-
-
-

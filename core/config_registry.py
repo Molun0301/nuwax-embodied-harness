@@ -274,11 +274,35 @@ _ZH_NAME_OVERRIDES: Dict[str, str] = {
     "NUWAX_ACTIVE_ROBOT": "激活机器人",
     "NUWAX_GATEWAY_HOST": "网关监听地址",
     "NUWAX_GATEWAY_PORT": "网关端口",
+    "NUWAX_GATEWAY_TELEMETRY_ENABLED": "启用性能监控",
+    "NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC": "性能监控采集间隔",
     "NUWAX_LOG_LEVEL": "日志级别",
     "NUWAX_GEOMETRY_ENABLED": "启用几何引擎",
     "NUWAX_GEOMETRY_STACK": "几何栈类型",
+    "NUWAX_GEOMETRY_EXTERNAL_ENABLED": "启用统一几何外部进程",
+    "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "统一几何进程名",
+    "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": "统一几何启动脚本",
+    "NUWAX_GEOMETRY_OCCUPANCY_TOPIC": "占据栅格话题",
+    "NUWAX_GEOMETRY_ODOM_TOPIC": "里程计话题",
+    "NUWAX_GEOMETRY_POINT_CLOUD_TOPIC": "点云话题",
+    "NUWAX_GEOMETRY_MAP_FRAME": "地图坐标系",
+    "NUWAX_GEOMETRY_ODOM_FRAME": "里程计坐标系",
+    "NUWAX_GEOMETRY_BASE_FRAME": "机器人基座坐标系",
     "NUWAX_NAV2_MODE": "Nav2 模式",
-    "NUWAX_BACKEND_PROFILE_NAME": "建图后端配置档",
+    "NUWAX_NAV2_AUTOSTART": "自动启动导航",
+    "NUWAX_BACKEND_PROFILE_NAME": "几何配置名称",
+    "NUWAX_BACKEND_ENABLED": "启用建图后端",
+    "NUWAX_PERCEPTION_OPENAI_ENABLED": "启用 OpenAI 视觉分析",
+    "NUWAX_PERCEPTION_OPENAI_API_KEY": "OpenAI API 密钥",
+    "NUWAX_PERCEPTION_OPENAI_MODEL": "OpenAI 视觉模型",
+    "NUWAX_PERCEPTION_SEGMENTATION_ENABLED": "启用实例分割",
+    "NUWAX_PERCEPTION_STREAM_ENABLED": "启用持续视频感知",
+    "NUWAX_PERCEPTION_STREAM_AUTO_START": "启动时自动开启视频感知",
+    "NUWAX_PERCEPTION_STREAM_INTERVAL_SEC": "视频感知间隔",
+    "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "启用 YOLO-World 检测",
+    "NUWAX_PERCEPTION_YOLO_WORLD_CONFIDENCE": "YOLO-World 置信度阈值",
+    "NUWAX_MEMORY_EMBEDDING_API_KEY": "记忆嵌入 API 密钥",
+    "NUWAX_MAP_CATALOG_ROOT": "地图目录",
     "DOUBAO_APP_ID": "豆包 App ID",
     "DOUBAO_ACCESS_KEY": "豆包 Access Key",
     "DOUBAO_DEFAULT_SPEAKER": "豆包默认音色",
@@ -292,9 +316,58 @@ _ZH_NAME_OVERRIDES: Dict[str, str] = {
     "ROBOT_IP": "机器人 IP",
 }
 
+_TOKEN_ZH: Dict[str, str] = {
+    "enabled": "启用",
+    "auto": "自动",
+    "start": "启动",
+    "host": "监听地址",
+    "port": "端口",
+    "model": "模型",
+    "path": "路径",
+    "root": "根目录",
+    "topic": "话题",
+    "frame": "坐标系",
+    "interval": "间隔",
+    "timeout": "超时",
+    "confidence": "置信度",
+    "threshold": "阈值",
+    "source": "来源",
+    "target": "目标",
+    "map": "地图",
+    "odom": "里程计",
+    "base": "基座",
+    "point": "点",
+    "cloud": "云",
+    "bridge": "桥接",
+    "process": "进程",
+    "name": "名称",
+    "script": "脚本",
+    "database": "数据库",
+    "directory": "目录",
+    "file": "文件",
+    "level": "级别",
+    "format": "格式",
+    "fps": "帧率",
+    "stream": "流",
+    "video": "视频",
+    "api": "API",
+    "key": "密钥",
+    "url": "URL",
+    "tts": "TTS",
+    "relay": "Relay",
+    "nav2": "Nav2",
+    "rtabmap": "RTAB-Map",
+    "go2": "Go2",
+    "ros": "ROS",
+    "dds": "DDS",
+    "yolo": "YOLO",
+    "world": "World",
+    "openai": "OpenAI",
+}
+
 
 def _derive_zh_name(key: str, section_id: str) -> str:
-    """为未精修的键机械生成可读名：板块标题 + 去前缀的小写化后缀。"""
+    """为未精修的键机械生成可读中文名，避免裸露 enabled/path/topic 等后缀。"""
 
     if key in _ZH_NAME_OVERRIDES:
         return _ZH_NAME_OVERRIDES[key]
@@ -307,7 +380,11 @@ def _derive_zh_name(key: str, section_id: str) -> str:
         else:
             continue
         break
-    pretty = suffix.replace("_", " ").lower()
+    tokens = [part.lower() for part in suffix.split("_") if part]
+    if not tokens:
+        return _SECTION_TITLES.get(section_id, key)
+    translated = [_TOKEN_ZH.get(token, token.upper() if len(token) <= 3 else token) for token in tokens]
+    pretty = "".join(translated)
     return pretty or key
 
 
@@ -352,5 +429,3 @@ def get_field(key: str) -> Optional[ConfigField]:
 
 def sensitive_keys() -> frozenset:
     return _SENSITIVE_KEYS
-
-

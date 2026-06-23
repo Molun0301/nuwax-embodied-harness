@@ -80,6 +80,8 @@ class _ManagedProcess:
     command: List[str]
     log_path: Path
     cwd: Path
+    process_title: Optional[str] = None
+    display_name: Optional[str] = None
     process: Optional[subprocess.Popen] = None
     started_at: Optional[float] = None
     started_at_iso: Optional[str] = None
@@ -94,7 +96,7 @@ class _ManagedProcess:
         with self.log_path.open("ab") as log_file:
             log_file.write(("\n[%s] start %s\n" % (_utc_now_iso(), self.command_display())).encode("utf-8"))
             self.process = subprocess.Popen(
-                self.command,
+                self.launch_command(),
                 cwd=str(self.cwd),
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
@@ -175,6 +177,8 @@ class _ManagedProcess:
         self.poll()
         return {
             "name": self.name,
+            "process_title": self.process_title,
+            "display_name": self.display_name,
             "running": self.is_running(),
             "pid": self.process.pid if self.process is not None and self.is_running() else None,
             "command": self.command,
@@ -188,6 +192,12 @@ class _ManagedProcess:
 
     def command_display(self) -> str:
         return " ".join(shlex.quote(str(part)) for part in self.command)
+
+    def launch_command(self) -> List[str]:
+        title = str(self.process_title or "").strip()
+        if not title:
+            return list(self.command)
+        return ["bash", "-c", 'exec -a "$0" "$@"', title, *self.command]
 
 
 def _utc_now_iso() -> str:
@@ -473,6 +483,14 @@ class PlatformGeometryRuntime:
     def _external_log_name(self) -> str:
         log_name = str(getattr(self.config.external, "log_name", "") or "").strip()
         return log_name or "external_slam_nav2.log"
+
+    def _managed_process_identity(self, name: str) -> Tuple[str, str]:
+        if name == self._external_process_name():
+            return "nuwax-geometry-external", "统一几何服务"
+        if name == "external_odom_tf_bridge":
+            return "nuwax-odom-tf-bridge", "里程计 TF 桥"
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in str(name or "geometry")).strip("-_")
+        return f"nuwax-{safe or 'geometry'}", "项目几何进程"
 
     def _external_script_path(self) -> Path:
         return Path(str(getattr(self.config.external, "script_path", "") or "")).expanduser()
@@ -864,7 +882,10 @@ class PlatformGeometryRuntime:
             log_path=self._geometry_log_dir() / log_name,
             cwd=self._repo_root(),
         )
+        process_title, display_name = self._managed_process_identity(name)
         process.command = list(command)
+        process.process_title = process_title
+        process.display_name = display_name
         process.start(restart=restart)
         self._managed_processes[name] = process
 

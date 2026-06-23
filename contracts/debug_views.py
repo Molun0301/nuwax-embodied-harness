@@ -229,6 +229,9 @@ class ProcessMetric(ContractModel):
     pid: int = Field(description="进程号。")
     name: str = Field(description="进程名称。")
     matched_keyword: Optional[str] = Field(default=None, description="命中的白名单关键字或匹配来源（如 process_tree）。")
+    display_name: Optional[str] = Field(default=None, description="前端展示用中文角色名。")
+    role: Optional[str] = Field(default=None, description="项目内稳定进程角色标识。")
+    cmdline_preview: Optional[str] = Field(default=None, description="截断并脱敏后的命令行摘要。")
     rss_bytes: int = Field(default=0, ge=0, description="常驻内存集 RSS（字节）。")
     cpu_percent: float = Field(default=0.0, ge=0.0, description="进程 CPU 占用率；多核可超 100%（按核累加，不平均）。")
 

@@ -38,7 +38,7 @@ TELEMETRY_LOGGER = logging.getLogger("nuwax_robot_bridge.telemetry")
 # 不绑定任何机器人型号；“python” 因过宽（会误纳无关解释器进程）被刻意排除。
 _DEFAULT_PROCESS_KEYWORDS = ("gateway", "rtabmap", "nav2", "robot_bridge", "ros2")
 _CMDLINE_SENSITIVE_KEY_RE = re.compile(
-    r"(?i)(--?(?:token|api[_-]?key|secret|password|access[_-]?key|authorization|cookie)(?:=|\s+))([^\s]+)"
+    r"(?i)(--?(?:token|api[_-]?key|secret|password|access[_-]?key|authorization|cookie)(?:=|\s+))(?:Bearer\s+)?([^\s]+)"
 )
 _CMDLINE_SENSITIVE_VALUE_RE = re.compile(
     r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+|\b(?:sk|ak)-[A-Za-z0-9._-]{8,}\b"

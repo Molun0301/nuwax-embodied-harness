@@ -21,7 +21,7 @@ from contracts.capabilities import (
     CapabilityMatrix,
     CapabilityRiskLevel,
 )
-from contracts.base import MetadataDict
+from contracts.base import MetadataDict, utc_now
 from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
@@ -30,7 +30,12 @@ from contracts.memory import MemoryPayloadFilter
 from contracts.spatial_memory import SceneSpaceReviewStatus
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationStatus
-from contracts.runtime_views import RuntimeGovernanceSummary
+from contracts.runtime_views import (
+    RuntimeGovernanceSummary,
+    ServiceHealthEntry,
+    ServiceHealthStatus,
+    ServiceHealthSummary,
+)
 from contracts.image import ImageFrame
 from contracts.streams import StreamPayloadKind
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, StreamBus, TaskManager
@@ -249,6 +254,27 @@ _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
 
 def _has_observability_value(value: Any) -> bool:
     return value is not None and value != ""
+
+
+_SERVICE_HEALTH_SEVERITY = {
+    ServiceHealthStatus.AVAILABLE.value: 0,
+    ServiceHealthStatus.READY.value: 0,
+    ServiceHealthStatus.IDLE.value: 10,
+    ServiceHealthStatus.DISABLED.value: 15,
+    ServiceHealthStatus.UNSUPPORTED.value: 15,
+    ServiceHealthStatus.STALE.value: 30,
+    ServiceHealthStatus.DEGRADED.value: 35,
+    ServiceHealthStatus.MISSING.value: 45,
+    ServiceHealthStatus.ERROR.value: 60,
+}
+_SERVICE_HEALTH_ATTENTION_STATUSES = frozenset(
+    {
+        ServiceHealthStatus.DEGRADED.value,
+        ServiceHealthStatus.STALE.value,
+        ServiceHealthStatus.MISSING.value,
+        ServiceHealthStatus.ERROR.value,
+    }
+)
 
 
 _OPS_DEBUG_CAPABILITY_NAMES = frozenset(
@@ -565,6 +591,7 @@ class GatewayRuntime:
         # 性能监控（CPU/内存/进程）采集线程，启停由数据流源聚合入口统一编排。
         self._system_telemetry_stop = threading.Event()
         self._system_telemetry_thread: Optional[threading.Thread] = None
+        self._latest_system_metrics_snapshot: Optional[Any] = None
         self._system_metrics_collector = SystemMetricsCollector(
             keywords=config.gateway.telemetry_process_keywords or None,
             include_process_tree=config.gateway.telemetry_include_process_tree,
@@ -878,6 +905,7 @@ class GatewayRuntime:
         while not self._system_telemetry_stop.wait(interval):
             try:
                 snapshot = collector.sample()
+                self._latest_system_metrics_snapshot = snapshot
                 self.stream_bus.publish(
                     "system.metrics",
                     source="gateway",
@@ -3075,23 +3103,41 @@ class GatewayRuntime:
         localization_snapshot = self.localization_service.get_latest_snapshot()
         localization_session = self.localization_service.get_active_session()
         navigation_context = self.navigation_service.get_latest_navigation_context()
+        exploration_context = self.navigation_service.get_latest_exploration_context()
+        perception_runtime = self.perception_video_runtime.get_status()
+        active_workspace = self.map_workspace_service.get_active_workspace()
+        artifact_summary = self.artifact_service.get_summary()
         profile = self._runtime_rtabmap_profile_summary(map_snapshot)
         geometry_asset = self._runtime_geometry_asset_summary(map_snapshot, localization_session)
         last_relocalization = self._runtime_last_relocalization_summary(localization_session, localization_snapshot)
         navigation_policy = self._runtime_navigation_control_policy_summary(navigation_context)
+        geometry_runtime_status = self.platform_geometry_runtime.get_runtime_status()
+        service_health = self._build_service_health_summary(
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+            localization_session=localization_session,
+            navigation_context=navigation_context,
+            exploration_context=exploration_context,
+            perception_runtime=perception_runtime,
+            active_workspace=active_workspace,
+            artifact_summary=artifact_summary,
+            geometry_asset=geometry_asset,
+            geometry_runtime_status=geometry_runtime_status,
+        )
         return RuntimeGovernanceSummary(
             rtabmap_profile=profile,
             geometry_asset=geometry_asset,
             localization_session=self._runtime_localization_session_summary(localization_session, localization_snapshot),
             last_relocalization=last_relocalization,
             navigation_control_policy=navigation_policy,
+            service_health=service_health,
             metadata={
                 "route": profile.get("route") or "unknown",
                 "go2_boundary": "dds_only",
                 "source": "platform_service_contracts",
                 "map_version_id": getattr(map_snapshot, "version_id", None),
                 "localization_session_id": getattr(localization_session, "session_id", None),
-                "geometry_runtime": self.platform_geometry_runtime.get_runtime_status(),
+                "geometry_runtime": geometry_runtime_status,
                 "live_mapping_diagnostics": self.platform_geometry_runtime.get_live_mapping_diagnostics(),
             },
         )
@@ -3111,6 +3157,20 @@ class GatewayRuntime:
         perception_runtime = self.perception_video_runtime.get_status()
         active_workspace = self.map_workspace_service.get_active_workspace()
         artifact_summary = self.artifact_service.get_summary()
+        localization_session = self.localization_service.get_active_session()
+        geometry_asset = self._runtime_geometry_asset_summary(map_snapshot, localization_session)
+        service_health = self._build_service_health_summary(
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+            localization_session=localization_session,
+            navigation_context=navigation_context,
+            exploration_context=exploration_context,
+            perception_runtime=perception_runtime,
+            active_workspace=active_workspace,
+            artifact_summary=artifact_summary,
+            geometry_asset=geometry_asset,
+            geometry_runtime_status=self.platform_geometry_runtime.get_runtime_status(),
+        )
         robot_state = getattr(robot_snapshot, "robot_state", robot_snapshot)
         return {
             "runtime_started": self._started,
@@ -3144,6 +3204,7 @@ class GatewayRuntime:
             ],
             "payload_contract": "lightweight_health_summary",
             "stream_bus": self.stream_bus.status(),
+            "service_health": service_health.model_dump(mode="json"),
         }
 
     def _health_robot_state_summary(self, robot_state: Any) -> Dict[str, Any]:
@@ -3368,6 +3429,448 @@ class GatewayRuntime:
             },
             "source": "navigation_state.metadata" if policy else "missing",
         }
+
+    @staticmethod
+    def _coerce_service_health_status(status: Any) -> ServiceHealthStatus:
+        raw = getattr(status, "value", status)
+        raw_text = str(raw or ServiceHealthStatus.MISSING.value).strip().lower()
+        try:
+            return ServiceHealthStatus(raw_text)
+        except ValueError:
+            return ServiceHealthStatus.DEGRADED
+
+    @staticmethod
+    def _runtime_state_to_service_health_status(status: Any) -> ServiceHealthStatus:
+        raw = getattr(status, "value", status)
+        raw_text = str(raw or "").strip().lower()
+        if not raw_text:
+            return ServiceHealthStatus.IDLE
+        if raw_text in {"error", "failed", "failure", "timeout", "cancelled", "aborted"}:
+            return ServiceHealthStatus.ERROR
+        if raw_text in {"degraded", "stale", "warning", "warn"}:
+            return ServiceHealthStatus.DEGRADED
+        if raw_text in {"disabled"}:
+            return ServiceHealthStatus.DISABLED
+        if raw_text in {"unsupported"}:
+            return ServiceHealthStatus.UNSUPPORTED
+        if raw_text in {"idle", "pending", "queued", "accepted", "missing"}:
+            return ServiceHealthStatus.IDLE
+        return ServiceHealthStatus.AVAILABLE
+
+    @staticmethod
+    def _service_health_overall_status(entries: List[ServiceHealthEntry]) -> ServiceHealthStatus:
+        if not entries:
+            return ServiceHealthStatus.MISSING
+        return max(
+            (entry.status for entry in entries),
+            key=lambda item: _SERVICE_HEALTH_SEVERITY.get(getattr(item, "value", str(item)), 0),
+        )
+
+    @staticmethod
+    def _payload_get(payload: Any, key: str, default: Any = None) -> Any:
+        if isinstance(payload, dict):
+            return payload.get(key, default)
+        return getattr(payload, key, default)
+
+    def _service_process_evidence(self, roles: Tuple[str, ...]) -> List[MetadataDict]:
+        if not roles:
+            return []
+        snapshot = self._latest_system_metrics_snapshot
+        processes = self._payload_get(snapshot, "processes", []) if snapshot is not None else []
+        sampled_at = self._payload_get(snapshot, "sampled_at")
+        evidence: List[MetadataDict] = []
+        role_set = set(roles)
+        for proc in processes or []:
+            role = self._payload_get(proc, "role")
+            if role not in role_set:
+                continue
+            evidence.append(
+                {
+                    "role": role,
+                    "display_name": self._payload_get(proc, "display_name") or self._payload_get(proc, "name"),
+                    "pid": self._payload_get(proc, "pid"),
+                    "cpu_percent": self._payload_get(proc, "cpu_percent"),
+                    "rss_bytes": self._payload_get(proc, "rss_bytes"),
+                    "sampled_at": sampled_at,
+                    "source": "system.metrics",
+                }
+            )
+        return evidence
+
+    def _make_service_health_entry(
+        self,
+        *,
+        service_id: str,
+        display_name: str,
+        group: str,
+        status: Any,
+        summary: str,
+        evidence: str,
+        source: str,
+        advice: str,
+        order: int,
+        updated_at: Optional[Any] = None,
+        reason: Optional[str] = None,
+        related_streams: Optional[Tuple[str, ...]] = None,
+        expected_process_roles: Optional[Tuple[str, ...]] = None,
+        metadata: Optional[MetadataDict] = None,
+    ) -> ServiceHealthEntry:
+        roles = tuple(expected_process_roles or ())
+        return ServiceHealthEntry(
+            service_id=service_id,
+            display_name=display_name,
+            group=group,
+            status=self._coerce_service_health_status(status),
+            summary=summary,
+            evidence=evidence,
+            source=source,
+            updated_at=updated_at,
+            reason=reason,
+            advice=advice,
+            related_streams=list(related_streams or ()),
+            expected_process_roles=list(roles),
+            process_evidence=self._service_process_evidence(roles),
+            order=order,
+            metadata=dict(metadata or {}),
+        )
+
+    def _build_service_health_summary(
+        self,
+        *,
+        map_snapshot: Any = None,
+        localization_snapshot: Any = None,
+        localization_session: Any = None,
+        navigation_context: Any = None,
+        exploration_context: Any = None,
+        perception_runtime: Any = None,
+        active_workspace: Any = None,
+        artifact_summary: Any = None,
+        geometry_asset: Optional[MetadataDict] = None,
+        geometry_runtime_status: Optional[MetadataDict] = None,
+    ) -> ServiceHealthSummary:
+        stream_status = self.stream_bus.status()
+        geometry_runtime_status = dict(geometry_runtime_status or {})
+        geometry_asset = dict(geometry_asset or {})
+        entries: List[ServiceHealthEntry] = []
+
+        entries.append(
+            self._make_service_health_entry(
+                service_id="gateway_web",
+                display_name="网关 Web 服务",
+                group="系统服务",
+                status=ServiceHealthStatus.AVAILABLE if self._started else ServiceHealthStatus.MISSING,
+                summary="网关运行时已启动" if self._started else "网关运行时尚未启动",
+                evidence=f"流游标 {stream_status.get('latest_cursor', 0)}，订阅 {stream_status.get('subscription_count', 0)} 个",
+                source="gateway_runtime",
+                advice="异常时查看网关运行日志",
+                order=10,
+                updated_at=utc_now(),
+                related_streams=("robot.state", "runtime.governance"),
+                expected_process_roles=("gateway_web", "gateway_supervisor"),
+                metadata={"stream_bus": stream_status},
+            )
+        )
+
+        entries.append(
+            self._make_service_health_entry(
+                service_id="stream_bus",
+                display_name="实时流总线",
+                group="系统服务",
+                status=ServiceHealthStatus.AVAILABLE,
+                summary="实时流总线可用",
+                evidence=f"已记录 {stream_status.get('topic_count', 0)} 类 topic",
+                source="stream_bus",
+                advice="若前端无数据，检查 WebSocket/SSE 连接和浏览器控制台",
+                order=20,
+                updated_at=utc_now(),
+                related_streams=tuple(stream_status.get("topics", []) or ()),
+                metadata={"dropped_by_topic": stream_status.get("dropped_by_topic", {})},
+            )
+        )
+
+        active_task_count = len(self.task_manager.list_active_tasks())
+        entries.append(
+            self._make_service_health_entry(
+                service_id="task_manager",
+                display_name="任务调度服务",
+                group="系统服务",
+                status=ServiceHealthStatus.AVAILABLE if active_task_count else ServiceHealthStatus.IDLE,
+                summary=f"当前 {active_task_count} 个任务活跃" if active_task_count else "当前无运行任务",
+                evidence="任务管理器可访问",
+                source="task_manager",
+                advice="任务异常时查看任务状态和运行日志",
+                order=30,
+                updated_at=utc_now(),
+                related_streams=("tasks.state",),
+            )
+        )
+
+        occupancy_grid = getattr(map_snapshot, "occupancy_grid", None) if map_snapshot is not None else None
+        map_ts = getattr(occupancy_grid, "timestamp", None) or getattr(map_snapshot, "timestamp", None)
+        map_workspace_name = getattr(active_workspace, "map_name", None)
+        if occupancy_grid is not None:
+            width = getattr(occupancy_grid, "width", None)
+            height = getattr(occupancy_grid, "height", None)
+            map_status = ServiceHealthStatus.AVAILABLE
+            map_summary = "地图帧已上报"
+            map_evidence = f"栅格 {width or '--'}×{height or '--'}，版本 {getattr(map_snapshot, 'version_id', None) or '--'}"
+        elif map_workspace_name:
+            map_status = ServiceHealthStatus.IDLE
+            map_summary = "已加载地图工作区，等待实时地图帧"
+            map_evidence = f"活动地图 {map_workspace_name}"
+        else:
+            map_status = ServiceHealthStatus.IDLE
+            map_summary = "未加载活动地图"
+            map_evidence = "地图服务空闲，尚无地图帧"
+        entries.append(
+            self._make_service_health_entry(
+                service_id="map",
+                display_name="地图服务",
+                group="导航地图",
+                status=map_status,
+                summary=map_summary,
+                evidence=map_evidence,
+                source="mapping_service",
+                advice="需要地图时启动建图、加载地图或查看地图流日志",
+                order=40,
+                updated_at=map_ts,
+                related_streams=("map.frame", "map.heartbeat"),
+            )
+        )
+
+        pose = getattr(localization_snapshot, "current_pose", None) if localization_snapshot is not None else None
+        session_status = getattr(getattr(localization_session, "status", None), "value", getattr(localization_session, "status", None))
+        pose_ts = getattr(pose, "timestamp", None) or getattr(localization_snapshot, "timestamp", None)
+        if pose is not None:
+            loc_status = ServiceHealthStatus.AVAILABLE
+            loc_summary = "定位位姿已上报"
+            loc_evidence = f"坐标系 {getattr(pose, 'frame_id', None) or '--'}"
+        elif localization_session is not None:
+            loc_status = ServiceHealthStatus.DEGRADED if str(session_status or "").lower() in {"ready", "running"} else ServiceHealthStatus.IDLE
+            loc_summary = "定位会话存在但暂无位姿" if loc_status == ServiceHealthStatus.DEGRADED else "定位会话空闲"
+            loc_evidence = f"会话 {getattr(localization_session, 'session_id', None) or '--'}，状态 {session_status or '--'}"
+        else:
+            loc_status = ServiceHealthStatus.IDLE
+            loc_summary = "未创建定位会话"
+            loc_evidence = "等待加载地图或启动定位"
+        entries.append(
+            self._make_service_health_entry(
+                service_id="localization",
+                display_name="定位服务",
+                group="导航地图",
+                status=loc_status,
+                summary=loc_summary,
+                evidence=loc_evidence,
+                source="localization_service",
+                advice="需要定位时加载地图并检查定位流/运行日志",
+                order=50,
+                updated_at=pose_ts,
+                related_streams=("localization.pose", "localization.trajectory"),
+            )
+        )
+
+        navigation_state = getattr(navigation_context, "navigation_state", None) if navigation_context is not None else None
+        exploration_state = getattr(exploration_context, "exploration_state", None) if exploration_context is not None else None
+        nav_status_raw = getattr(navigation_state, "status", None)
+        exp_status_raw = getattr(exploration_state, "status", None)
+        nav_status = (
+            self._runtime_state_to_service_health_status(nav_status_raw)
+            if navigation_state is not None
+            else ServiceHealthStatus.IDLE
+        )
+        exp_status = (
+            self._runtime_state_to_service_health_status(exp_status_raw)
+            if exploration_state is not None
+            else ServiceHealthStatus.IDLE
+        )
+        nav_entry_status = max(
+            (nav_status, exp_status),
+            key=lambda item: _SERVICE_HEALTH_SEVERITY.get(item.value, 0),
+        )
+        entries.append(
+            self._make_service_health_entry(
+                service_id="navigation",
+                display_name="导航/探索服务",
+                group="导航地图",
+                status=nav_entry_status,
+                summary="导航上下文已上报" if navigation_state is not None else "导航服务空闲",
+                evidence=(
+                    f"导航 {getattr(nav_status_raw, 'value', nav_status_raw) or 'idle'}；"
+                    f"探索 {getattr(exp_status_raw, 'value', exp_status_raw) or 'idle'}"
+                ),
+                source="navigation_service",
+                advice="导航异常时查看导航状态、地图和运行日志",
+                order=60,
+                updated_at=getattr(navigation_state, "timestamp", None) or getattr(exploration_state, "timestamp", None),
+                related_streams=("navigation.state", "exploration.state", "exploration.frontier"),
+            )
+        )
+
+        perception_enabled = self._payload_get(perception_runtime, "enabled")
+        perception_running = self._payload_get(perception_runtime, "running")
+        perception_error = self._payload_get(perception_runtime, "last_error")
+        if perception_error:
+            perception_status = ServiceHealthStatus.ERROR
+            perception_summary = "感知/视频运行异常"
+        elif perception_enabled is False:
+            perception_status = ServiceHealthStatus.DISABLED
+            perception_summary = "感知/视频未启用"
+        elif perception_running:
+            perception_status = ServiceHealthStatus.AVAILABLE
+            perception_summary = "感知/视频运行中"
+        else:
+            perception_status = ServiceHealthStatus.IDLE
+            perception_summary = "感知/视频空闲"
+        processed_frames = self._payload_get(perception_runtime, "processed_frames")
+        entries.append(
+            self._make_service_health_entry(
+                service_id="perception_video",
+                display_name="感知/视频服务",
+                group="机器人数据",
+                status=perception_status,
+                summary=perception_summary,
+                evidence=f"相机 {self._payload_get(perception_runtime, 'camera_id') or '--'}，已处理 {processed_frames if processed_frames is not None else '--'} 帧",
+                source="perception_video_runtime",
+                advice="视频或感知异常时检查 Go2 推流、模型配置和感知日志",
+                order=70,
+                updated_at=utc_now(),
+                reason="last_error" if perception_error else None,
+                related_streams=("video.frame", "video.detections"),
+                expected_process_roles=("go2_video_streamer",),
+                metadata={"last_error": perception_error},
+            )
+        )
+
+        artifact_count = getattr(artifact_summary, "artifact_count", None)
+        total_size = getattr(artifact_summary, "total_size_bytes", None)
+        entries.append(
+            self._make_service_health_entry(
+                service_id="artifacts",
+                display_name="记忆/制品服务",
+                group="机器人数据",
+                status=ServiceHealthStatus.AVAILABLE,
+                summary="制品存储可访问",
+                evidence=f"制品 {artifact_count if artifact_count is not None else '--'} 个，总量 {total_size if total_size is not None else '--'} bytes",
+                source="artifact_service",
+                advice="制品异常时检查 runtime_data 目录权限和磁盘空间",
+                order=80,
+                updated_at=utc_now(),
+            )
+        )
+
+        geometry_enabled = bool(self.platform_geometry_runtime.config.enabled)
+        geometry_started = bool(geometry_runtime_status.get("started") or geometry_runtime_status.get("running"))
+        geometry_asset_available = bool(geometry_asset.get("available"))
+        if not geometry_enabled:
+            geometry_status = ServiceHealthStatus.DISABLED
+            geometry_summary = "统一几何服务未启用"
+        elif geometry_started or geometry_asset_available:
+            geometry_status = ServiceHealthStatus.AVAILABLE
+            geometry_summary = "统一几何服务可用"
+        else:
+            geometry_status = ServiceHealthStatus.IDLE
+            geometry_summary = "统一几何服务空闲"
+        entries.append(
+            self._make_service_health_entry(
+                service_id="geometry",
+                display_name="统一几何服务",
+                group="导航地图",
+                status=geometry_status,
+                summary=geometry_summary,
+                evidence=(
+                    f"栈 {geometry_asset.get('geometry_stack') or self.platform_geometry_runtime.config.stack}；"
+                    f"资产 {'可用' if geometry_asset_available else '未就绪'}"
+                ),
+                source="platform_geometry_runtime",
+                advice="需要建图/导航时检查统一几何服务日志",
+                order=90,
+                updated_at=utc_now(),
+                related_streams=("runtime.governance", "pointcloud_map.meta"),
+                expected_process_roles=("geometry_external", "rtabmap_live", "nav2"),
+                metadata={"geometry_runtime": geometry_runtime_status, "geometry_asset": geometry_asset},
+            )
+        )
+
+        try:
+            robot_status = self._serialize(self.robot.get_status())
+        except Exception:
+            robot_status = {}
+        try:
+            adapter_count = len(self.robot.get_adapter_health_statuses())
+        except Exception:
+            adapter_count = None
+        robot_available = bool(robot_status)
+        entries.append(
+            self._make_service_health_entry(
+                service_id="robot_data_plane",
+                display_name="Go2 数据面服务",
+                group="机器人数据",
+                status=ServiceHealthStatus.AVAILABLE if robot_available else ServiceHealthStatus.DEGRADED,
+                summary="机器人数据面可访问" if robot_available else "机器人数据面状态未上报",
+                evidence=f"适配器 {adapter_count if adapter_count is not None else '--'} 个",
+                source="robot_assembly",
+                advice="数据面异常时检查机器人连接和驱动日志",
+                order=100,
+                updated_at=utc_now(),
+                metadata={"assembly_status": robot_status},
+            )
+        )
+
+        ros_roles = ("ros_bridge",)
+        ros_processes = self._service_process_evidence(ros_roles)
+        require_ros2 = bool(self.platform_geometry_runtime.config.require_ros2)
+        if not geometry_enabled or not require_ros2:
+            ros_status = ServiceHealthStatus.DISABLED
+            ros_summary = "ROS 数据桥当前不需要"
+            ros_evidence = "统一几何配置未要求 ROS2 数据桥"
+        elif ros_processes:
+            ros_status = ServiceHealthStatus.AVAILABLE
+            ros_summary = "ROS 数据桥进程已匹配"
+            ros_evidence = "；".join(
+                f"PID {item.get('pid')} {item.get('display_name') or item.get('role')}"
+                for item in ros_processes
+            )
+        else:
+            ros_status = ServiceHealthStatus.MISSING
+            ros_summary = "未发现 ROS 数据桥进程"
+            ros_evidence = "进程矩阵未匹配 role=ros_bridge"
+        entries.append(
+            self._make_service_health_entry(
+                service_id="ros_bridge",
+                display_name="ROS 数据桥/命令桥",
+                group="系统服务",
+                status=ros_status,
+                summary=ros_summary,
+                evidence=ros_evidence,
+                source="system.metrics",
+                advice="检查 ROS 数据桥启动日志和进程命名",
+                order=110,
+                updated_at=utc_now(),
+                reason=None if ros_status != ServiceHealthStatus.MISSING else "expected_process_absent",
+                expected_process_roles=ros_roles,
+                related_streams=("system.metrics",),
+            )
+        )
+
+        entries.sort(key=lambda entry: entry.order)
+        overall = self._service_health_overall_status(entries)
+        attention_count = sum(
+            1
+            for entry in entries
+            if getattr(entry.status, "value", str(entry.status)) in _SERVICE_HEALTH_ATTENTION_STATUSES
+        )
+        return ServiceHealthSummary(
+            status=overall,
+            authoritative=True,
+            generated_at=utc_now(),
+            entries=entries,
+            source="gateway_runtime",
+            metadata={
+                "attention_count": attention_count,
+                "entry_count": len(entries),
+                "process_sampled_at": self._payload_get(self._latest_system_metrics_snapshot, "sampled_at"),
+            },
+        )
 
     def _runtime_nested_bool(self, payload: MetadataDict, outer_key: str, inner_key: str) -> Optional[bool]:
         outer = payload.get(outer_key)

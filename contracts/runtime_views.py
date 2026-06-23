@@ -6,7 +6,7 @@ from datetime import datetime
 from pydantic import Field, model_validator
 
 from contracts.artifacts import ArtifactRef
-from contracts.base import MetadataDict, TimestampedContract
+from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
 from contracts.geometry import FrameTree, Pose
 from contracts.image import CameraInfo
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap
@@ -238,6 +238,51 @@ class NavigationContext(TimestampedContract):
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
 
+class ServiceHealthStatus(StrEnum):
+    """Web 监控服务健康状态。"""
+
+    AVAILABLE = "available"
+    READY = "ready"
+    IDLE = "idle"
+    DEGRADED = "degraded"
+    STALE = "stale"
+    MISSING = "missing"
+    ERROR = "error"
+    UNSUPPORTED = "unsupported"
+    DISABLED = "disabled"
+
+
+class ServiceHealthEntry(ContractModel):
+    """单个系统服务的健康展示条目。"""
+
+    service_id: str = Field(description="稳定服务标识。")
+    display_name: str = Field(description="前端展示用中文服务名。")
+    group: str = Field(default="系统服务", description="服务分组。")
+    status: ServiceHealthStatus = Field(default=ServiceHealthStatus.MISSING, description="服务健康状态。")
+    summary: str = Field(default="", description="一句话状态摘要。")
+    evidence: str = Field(default="", description="可展示证据。")
+    source: str = Field(default="", description="状态来源。")
+    updated_at: Optional[datetime] = Field(default=None, description="状态更新时间。")
+    reason: Optional[str] = Field(default=None, description="机器可读原因。")
+    advice: str = Field(default="", description="排障建议。")
+    related_streams: List[str] = Field(default_factory=list, description="相关实时流 topic。")
+    expected_process_roles: List[str] = Field(default_factory=list, description="期望关联的进程角色。")
+    process_evidence: List[MetadataDict] = Field(default_factory=list, description="关联进程证据。")
+    order: int = Field(default=0, description="前端排序权重。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class ServiceHealthSummary(TimestampedContract):
+    """Web 监控服务健康聚合快照。"""
+
+    status: ServiceHealthStatus = Field(default=ServiceHealthStatus.MISSING, description="整体服务健康状态。")
+    authoritative: bool = Field(default=True, description="是否由后端权威健康聚合器生成。")
+    generated_at: datetime = Field(default_factory=utc_now, description="生成时间。")
+    entries: List[ServiceHealthEntry] = Field(default_factory=list, description="服务健康条目。")
+    source: str = Field(default="gateway_runtime", description="聚合来源。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
 class RuntimeGovernanceSummary(TimestampedContract):
     """运行时观察与治理摘要。"""
 
@@ -246,6 +291,7 @@ class RuntimeGovernanceSummary(TimestampedContract):
     localization_session: MetadataDict = Field(default_factory=dict, description="当前定位会话摘要。")
     last_relocalization: MetadataDict = Field(default_factory=dict, description="最近一次 RTAB-Map/ICP 重定位摘要。")
     navigation_control_policy: MetadataDict = Field(default_factory=dict, description="导航控制策略摘要。")
+    service_health: ServiceHealthSummary = Field(default_factory=ServiceHealthSummary, description="Web 监控服务健康聚合快照。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加治理元数据。")
 
 

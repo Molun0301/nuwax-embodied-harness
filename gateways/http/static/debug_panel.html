@@ -253,6 +253,23 @@ button{font-family:inherit;cursor:pointer}
 .service-row .mono,.task-row .mono{font-size:11.5px;font-weight:600}
 .health-line{height:5px;border-radius:99px;background:var(--good)}
 .health-line.warn{background:var(--warn)}.health-line.bad{background:var(--bad)}
+.service-health-list{display:grid;gap:7px}
+.service-health-card{display:grid;gap:5px;padding:9px 11px;border-radius:var(--r);
+  background:var(--inset);border-left:3px solid var(--faint);transition:.16s}
+.service-health-card:hover{background:var(--inset-2)}
+.service-health-card.available{border-left-color:var(--good)}
+.service-health-card.stale{border-left-color:var(--warn)}
+.service-health-card.error{border-left-color:var(--bad)}
+.service-health-card.missing,.service-health-card.unsupported{border-left-color:var(--faint)}
+.service-health-top{display:flex;align-items:center;justify-content:space-between;gap:9px;min-width:0}
+.service-health-title{font-size:11.5px;font-weight:660;color:var(--strong);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.service-health-summary{font-size:11px;color:var(--strong);line-height:1.35;overflow-wrap:anywhere}
+.service-health-evidence{font-size:10px;color:var(--muted);line-height:1.35;overflow-wrap:anywhere}
+.service-health-foot{display:flex;gap:5px;flex-wrap:wrap}
+.service-health-chip{font-size:9.5px;color:var(--faint);background:var(--surface-2);border:1px solid var(--line-2);
+  border-radius:var(--pill);padding:2px 7px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.service-health-card.degraded .service-health-chip,.service-health-card.stale .service-health-chip{color:var(--warn);background:var(--warn-w)}
+.service-health-card.error .service-health-chip{color:var(--bad);background:var(--bad-w)}
 
 /* logs -> mockup .log look */
 .log-line{font-family:var(--mono);font-size:10.5px;line-height:1.5;padding:6px 10px;
@@ -499,7 +516,7 @@ button{font-family:inherit;cursor:pointer}
             </div>
             <div class="dcol">
               <div class="dh"><div class="t"><div class="eyebrow">Services</div><h3>服务状态</h3></div><span id="governanceStatus" class="pill missing">缺失</span></div>
-              <div class="dscroll"><div id="governanceMeta" class="kv"></div></div>
+              <div class="dscroll"><div id="governanceMeta" class="service-health-list"></div></div>
             </div>
           </section>
         </div>
@@ -641,6 +658,7 @@ button{font-family:inherit;cursor:pointer}
         latestHealth: null,
         latestSystemMetrics: null,
         latestGovernance: null,
+        latestServiceHealth: null,
         latestTasks: { active_tasks: [], history_tasks: [] },
         taskActiveById: new Map(),
         taskHistoryById: new Map(),
@@ -1062,82 +1080,252 @@ button{font-family:inherit;cursor:pointer}
         const processes = Array.isArray(snap.processes) ? snap.processes : [];
         return processes.find((proc) => roles.includes(proc.role));
       }
-      function serviceLine(name, status, evidence, advice) {
-        return [name, `${displayStatus(status)} · ${safeText(evidence)} · ${safeText(advice)}`];
+      const SERVICE_SOURCE_LABELS = {
+        gateway_runtime: "网关运行时",
+        stream_bus: "实时流总线",
+        task_manager: "任务管理器",
+        mapping_service: "地图服务",
+        localization_service: "定位服务",
+        navigation_service: "导航服务",
+        perception_video_runtime: "感知视频运行时",
+        artifact_service: "制品服务",
+        platform_geometry_runtime: "统一几何运行时",
+        robot_assembly: "机器人数据面",
+        "system.metrics": "系统进程采集",
+        frontend_fallback: "前端兼容推断",
+      };
+      const SERVICE_ATTENTION_STATUSES = new Set(["error", "missing", "degraded", "stale"]);
+      function displayServiceSource(value) {
+        const key = String(value || "").trim();
+        return SERVICE_SOURCE_LABELS[key] || displaySource(value);
       }
-      function renderServiceStatus() {
-        if (!els.governanceMeta) return;
+      function normalizeServiceHealthSummary(raw, sourceLabel) {
+        if (!raw || typeof raw !== "object") return null;
+        const entries = Array.isArray(raw.entries) ? raw.entries : (Array.isArray(raw.services) ? raw.services : []);
+        if (!entries.length) return null;
+        const normalizedEntries = entries
+          .filter(Boolean)
+          .map((entry, index) => ({
+            ...entry,
+            service_id: entry.service_id || entry.id || `service-${index}`,
+            display_name: entry.display_name || entry.name || entry.service_id || `服务 ${index + 1}`,
+            status: String(entry.status || "missing").toLowerCase(),
+            order: Number.isFinite(Number(entry.order)) ? Number(entry.order) : index,
+            source: entry.source || sourceLabel || raw.source || "service_health",
+          }))
+          .sort((a, b) => (Number(a.order) || 0) - (Number(b.order) || 0));
+        return {
+          ...raw,
+          entries: normalizedEntries,
+          status: String(raw.status || worstStatus(normalizedEntries)).toLowerCase(),
+          source: raw.source || sourceLabel || "service_health",
+          authoritative: raw.authoritative !== false,
+        };
+      }
+      function mergeServiceHealth(raw, sourceLabel) {
+        const normalized = normalizeServiceHealthSummary(raw, sourceLabel);
+        if (!normalized) return false;
+        state.latestServiceHealth = normalized;
+        patchServiceHealthProcessEvidence(state.latestSystemMetrics || {});
+        renderServiceStatus();
+        return true;
+      }
+      function patchServiceHealthProcessEvidence(snap) {
+        if (!state.latestServiceHealth || !Array.isArray(state.latestServiceHealth.entries)) return false;
+        const processes = Array.isArray(snap && snap.processes) ? snap.processes : [];
+        if (!processes.length) return false;
+        const byRole = new Map();
+        for (const proc of processes) {
+          const role = proc && proc.role;
+          if (!role) continue;
+          if (!byRole.has(role)) byRole.set(role, []);
+          byRole.get(role).push(proc);
+        }
+        let changed = false;
+        const entries = state.latestServiceHealth.entries.map((entry) => {
+          const roles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
+          if (!roles.length) return entry;
+          const processEvidence = [];
+          for (const role of roles) {
+            for (const proc of byRole.get(role) || []) {
+              processEvidence.push({
+                role,
+                display_name: proc.display_name || proc.name || role,
+                pid: proc.pid,
+                cpu_percent: proc.cpu_percent,
+                rss_bytes: proc.rss_bytes,
+                sampled_at: snap.sampled_at,
+                source: "system.metrics",
+              });
+            }
+          }
+          if (!processEvidence.length) return entry;
+          changed = true;
+          return {
+            ...entry,
+            process_evidence: processEvidence,
+            process_sampled_at: snap.sampled_at,
+            process_source: "system.metrics",
+          };
+        });
+        if (changed) state.latestServiceHealth = { ...state.latestServiceHealth, entries };
+        return changed;
+      }
+      function serviceHealthAttentionCount(summary) {
+        const fromBackend = summary && summary.metadata && Number(summary.metadata.attention_count);
+        if (Number.isFinite(fromBackend)) return fromBackend;
+        const entries = summary && Array.isArray(summary.entries) ? summary.entries : [];
+        return entries.filter((entry) => SERVICE_ATTENTION_STATUSES.has(String(entry.status || "").toLowerCase())).length;
+      }
+      function serviceProcessText(entry) {
+        const evidence = Array.isArray(entry.process_evidence) ? entry.process_evidence : [];
+        if (evidence.length) {
+          return evidence.slice(0, 2).map((proc) => {
+            const name = proc.display_name || proc.role || "进程";
+            const pid = proc.pid === undefined || proc.pid === null ? "--" : proc.pid;
+            return `${name} PID ${pid}`;
+          }).join(" / ");
+        }
+        const roles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
+        return roles.length ? "期望进程未匹配" : "";
+      }
+      function serviceHealthChip(label, value, title) {
+        const chip = document.createElement("span");
+        chip.className = "service-health-chip";
+        chip.textContent = `${label}：${safeText(value)}`;
+        if (title) chip.title = title;
+        return chip;
+      }
+      function appendServiceHealthCard(entry, options) {
+        const status = String(entry.status || "missing").toLowerCase();
+        const cls = statusClass(status);
+        const card = document.createElement("article");
+        card.className = `service-health-card ${cls} ${status}`;
+        if (entry.reason) card.title = `原因：${entry.reason}`;
+
+        const top = document.createElement("div");
+        top.className = "service-health-top";
+        const title = document.createElement("div");
+        title.className = "service-health-title";
+        title.textContent = safeText(entry.display_name || entry.service_id);
+        const pill = document.createElement("span");
+        setPill(pill, status);
+        top.append(title, pill);
+
+        const summary = document.createElement("div");
+        summary.className = "service-health-summary";
+        summary.textContent = safeText(entry.summary || displayStatus(status));
+        const evidence = document.createElement("div");
+        evidence.className = "service-health-evidence";
+        evidence.textContent = safeText(entry.evidence || entry.reason || entry.advice || "暂无详细证据");
+
+        const foot = document.createElement("div");
+        foot.className = "service-health-foot";
+        foot.appendChild(serviceHealthChip("来源", displayServiceSource(entry.source || (options && options.source))));
+        const updated = entry.updated_at || (options && (options.generated_at || options.timestamp));
+        if (updated) foot.appendChild(serviceHealthChip("更新", shortTime(updated), String(updated)));
+        const processText = serviceProcessText(entry);
+        if (processText) foot.appendChild(serviceHealthChip("进程", processText, JSON.stringify(entry.process_evidence || entry.expected_process_roles || [])));
+        if (entry.advice) foot.appendChild(serviceHealthChip("建议", entry.advice));
+        if (options && options.compatibleFallback) foot.appendChild(serviceHealthChip("模式", "兼容推断"));
+
+        card.append(top, summary, evidence, foot);
+        els.governanceMeta.appendChild(card);
+      }
+      function buildLegacyServiceHealthFallback() {
         const overview = state.latestOverview || {};
         const governance = state.latestGovernance || {};
         const metrics = state.latestSystemMetrics || {};
-        const rows = [];
+        const entries = [{
+          service_id: "service_health_bootstrap",
+          display_name: "服务健康链路",
+          status: "degraded",
+          summary: "等待后端权威 service_health 快照",
+          evidence: "当前为前端兼容推断，不能作为验收成功状态",
+          source: "frontend_fallback",
+          advice: "检查 /api/health 与 runtime.governance 是否返回 service_health",
+          order: 0,
+        }];
         const health = overview.health || {};
-        rows.push(serviceLine(
-          "网关 Web 服务",
-          serviceStatusValue(health, metrics.psutil_available === false ? "unsupported" : "available"),
-          health.status ? serviceEvidenceFromSummary(health, "网关健康流已上报") : "前端已连接调试流",
-          "异常时查看网关运行日志"
-        ));
-        const activeTasks = state.latestTasks && Array.isArray(state.latestTasks.active_tasks) ? state.latestTasks.active_tasks.length : 0;
-        rows.push(serviceLine(
-          "运行时调度/任务管理服务",
-          "available",
-          activeTasks ? `当前 ${activeTasks} 个任务活跃` : "任务接口可访问",
-          "任务失败时查看左侧任务状态和运行日志"
-        ));
-        const geometryAsset = governance.geometry_asset || {};
-        const geometryStatus = governance.status || (geometryAsset.available === true ? "available" : (Object.keys(governance).length ? "stale" : "missing"));
-        rows.push(serviceLine(
-          "统一几何服务",
-          geometryStatus,
-          geometryAsset.available === true ? "几何资产字段已上报" : (Object.keys(governance).length ? "服务状态已上报但几何资产未就绪" : "未上报服务健康字段"),
-          serviceAdvice(geometryStatus, "查看统一几何服务日志")
-        ));
+        entries.push({
+          service_id: "gateway_web_fallback",
+          display_name: "网关 Web 服务",
+          status: serviceStatusValue(health, metrics.psutil_available === false ? "unsupported" : "available"),
+          summary: health.status ? "网关健康流已上报" : "前端已连接调试流",
+          evidence: health.status ? serviceEvidenceFromSummary(health, "网关健康流已上报") : "等待 /api/health 首屏健康快照",
+          source: "frontend_fallback",
+          advice: "异常时查看网关运行日志",
+          order: 10,
+        });
         const map = overview.map || {};
-        rows.push(serviceLine("地图服务", serviceStatusValue(map), serviceEvidenceFromSummary(map, "地图流已上报"), serviceAdvice(map.status, "等待地图服务上报或查看运行日志")));
+        entries.push({
+          service_id: "map_fallback",
+          display_name: "地图服务",
+          status: serviceStatusValue(map, "idle"),
+          summary: map.status ? "地图流已上报" : "地图服务空闲或未上报",
+          evidence: serviceEvidenceFromSummary(map, "地图流已上报"),
+          source: "frontend_fallback",
+          advice: "需要地图时启动建图或加载地图",
+          order: 40,
+        });
         const localization = overview.localization || {};
         const session = governance.localization_session || {};
-        rows.push(serviceLine(
-          "定位服务",
-          serviceStatusValue(localization, session.status),
-          localization.status ? serviceEvidenceFromSummary(localization, "定位流已上报") : (session.available ? "定位会话字段已上报" : "未上报定位健康字段"),
-          serviceAdvice(localization.status || session.status, "检查定位服务和运行日志")
-        ));
-        const navigation = overview.navigation || {};
-        rows.push(serviceLine("导航服务", serviceStatusValue(navigation), serviceEvidenceFromSummary(navigation, "导航流已上报"), serviceAdvice(navigation.status, "检查导航服务和运行日志")));
-        const video = overview.video || {};
-        rows.push(serviceLine("感知服务", serviceStatusValue(video), serviceEvidenceFromSummary(video, "视频/感知流已上报"), serviceAdvice(video.status, "检查视频推流和感知日志")));
-        const memory = overview.runtime_data || overview.artifacts || null;
-        rows.push(serviceLine(
-          "记忆/制品服务",
-          memory ? serviceStatusValue(memory) : "missing",
-          memory ? serviceEvidenceFromSummary(memory, "记忆/制品字段已上报") : "未上报服务健康字段",
-          "需要排障时查看配置和运行日志"
-        ));
-        const videoProc = processByRole("go2_video_streamer");
-        rows.push(serviceLine(
-          "Go2 数据/视频服务",
-          videoProc || video.status ? (videoProc ? "available" : video.status) : "missing",
-          videoProc ? `进程运行中 PID ${videoProc.pid}` : serviceEvidenceFromSummary(video, "视频流已上报"),
-          videoProc ? "无需处理" : "检查 Go2 数据面和视频推流进程"
-        ));
-        const rosBridgeProc = processByRole("ros_bridge");
-        rows.push(serviceLine(
-          "ROS 数据桥/命令桥",
-          rosBridgeProc ? "available" : "missing",
-          rosBridgeProc ? `进程运行中 PID ${rosBridgeProc.pid}` : "未在进程矩阵中匹配到 ROS 数据桥",
-          rosBridgeProc ? "无需处理" : "检查 ROS 数据桥启动日志"
-        ));
-        if (overview.tts || overview.audio) {
-          const audio = overview.tts || overview.audio;
-          rows.push(serviceLine("音频/TTS 服务", serviceStatusValue(audio), serviceEvidenceFromSummary(audio, "音频字段已上报"), serviceAdvice(audio.status, "检查音频/TTS 服务日志")));
-        }
-        const rawStatuses = rows.map((row) => {
-          const value = row[1].split(" · ", 1)[0];
-          return Object.entries(STATUS_LABELS).find(([, label]) => label === value)?.[0] || "available";
+        entries.push({
+          service_id: "localization_fallback",
+          display_name: "定位服务",
+          status: serviceStatusValue(localization, session.status || "idle"),
+          summary: localization.status ? "定位流已上报" : "定位服务空闲或未上报",
+          evidence: localization.status ? serviceEvidenceFromSummary(localization, "定位流已上报") : (session.available ? "定位会话字段已上报" : "等待定位健康字段"),
+          source: "frontend_fallback",
+          advice: "检查定位服务和运行日志",
+          order: 50,
         });
-        setPill(els.governanceStatus, worstStatus(rawStatuses.map((status) => ({ status }))));
-        setKv(els.governanceMeta, rows);
+        const navigation = overview.navigation || {};
+        entries.push({
+          service_id: "navigation_fallback",
+          display_name: "导航/探索服务",
+          status: serviceStatusValue(navigation, "idle"),
+          summary: navigation.status ? "导航流已上报" : "导航服务空闲或未上报",
+          evidence: serviceEvidenceFromSummary(navigation, "导航流已上报"),
+          source: "frontend_fallback",
+          advice: "检查导航服务和运行日志",
+          order: 60,
+        });
+        const video = overview.video || {};
+        const videoProc = processByRole("go2_video_streamer");
+        entries.push({
+          service_id: "perception_video_fallback",
+          display_name: "感知/视频服务",
+          status: videoProc ? "available" : serviceStatusValue(video, "idle"),
+          summary: videoProc ? "视频推流进程已匹配" : "视频/感知等待上报",
+          evidence: videoProc ? `进程运行中 PID ${videoProc.pid}` : serviceEvidenceFromSummary(video, "视频/感知流已上报"),
+          source: "frontend_fallback",
+          advice: videoProc ? "无需处理" : "检查 Go2 推流和感知日志",
+          order: 70,
+        });
+        return {
+          status: worstStatus(entries),
+          authoritative: false,
+          generated_at: new Date().toISOString(),
+          entries,
+          source: "frontend_fallback",
+          metadata: { attention_count: entries.filter((entry) => SERVICE_ATTENTION_STATUSES.has(entry.status)).length },
+        };
+      }
+      function renderServiceStatus() {
+        if (!els.governanceMeta) return;
+        els.governanceMeta.replaceChildren();
+        const summary = state.latestServiceHealth || buildLegacyServiceHealthFallback();
+        const entries = Array.isArray(summary.entries) ? summary.entries : [];
+        const status = summary.status || worstStatus(entries);
+        const attention = serviceHealthAttentionCount(summary);
+        setPill(els.governanceStatus, status, attention ? `${attention} 项需处理` : "服务");
+        for (const entry of entries) appendServiceHealthCard(entry, {
+          source: summary.source,
+          generated_at: summary.generated_at,
+          timestamp: summary.timestamp,
+          compatibleFallback: summary.authoritative === false,
+        });
       }
       function formatGB(bytes) {
         const n = Number(bytes);
@@ -1157,6 +1345,7 @@ button{font-family:inherit;cursor:pointer}
           ? `${Math.round(mem.percent)}% · ${formatGB(mem.used_bytes)}/${formatGB(mem.total_bytes)}`
           : "N/A");
         renderProcessMatrix(snap);
+        patchServiceHealthProcessEvidence(snap);
         renderServiceStatus();
       }
       function renderProcessMatrix(snap) {
@@ -1213,6 +1402,11 @@ button{font-family:inherit;cursor:pointer}
         const estopped = safety.is_estopped === true || safety.estopped === true;
         setPill(els.estopStatus, estopped ? "error" : "available", estopped ? "急停状态：触发" : "急停状态：清除");
         els.estopStatus.classList.add("estop");
+        if (health.service_health) {
+          mergeServiceHealth(health.service_health, "/api/health");
+        } else {
+          renderServiceStatus();
+        }
       }
       function normalizeTaskState(value) {
         const raw = value && typeof value === "object" && "value" in value ? value.value : value;
@@ -1303,6 +1497,15 @@ button{font-family:inherit;cursor:pointer}
           showPanelError("logs", `任务列表初始化失败：${err.message || err}`);
         }
       }
+      async function loadInitialHealth() {
+        try {
+          const response = await fetch(withAccessToken("/api/health"));
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          updateHealth(await response.json());
+        } catch (err) {
+          showPanelError("governance", `服务健康初始化失败：${err.message || err}`);
+        }
+      }
       function startTaskPolling() {
         setInterval(async () => {
           try {
@@ -1317,7 +1520,17 @@ button{font-family:inherit;cursor:pointer}
       function showPanelError(kind, message) {
         if (kind === "governance") {
           setPill(els.governanceStatus, "error");
-          setKv(els.governanceMeta, [["错误", message], ["前端接收", nowText()]]);
+          els.governanceMeta.replaceChildren();
+          appendServiceHealthCard({
+            service_id: "service_health_error",
+            display_name: "服务健康链路",
+            status: "error",
+            summary: "服务健康数据读取失败",
+            evidence: message,
+            source: "frontend_fallback",
+            advice: "检查 /api/health、runtime.governance 和网关运行日志",
+            updated_at: new Date().toISOString(),
+          }, { compatibleFallback: true, source: "frontend_fallback" });
         } else if (kind === "map") {
           setPill(els.mapStatus, "error");
           els.mapEmpty.hidden = false;
@@ -3171,7 +3384,11 @@ button{font-family:inherit;cursor:pointer}
         const data = envelope.runtime_governance || (envelope.data && envelope.data.runtime_governance) || envelope.data || {};
         state.latestGovernance = data;
         data.status = data.status || (envelope.status ? statusOf(envelope) : undefined);
-        renderServiceStatus();
+        if (data.service_health) {
+          mergeServiceHealth(data.service_health, "runtime.governance");
+        } else {
+          renderServiceStatus();
+        }
         reevaluateCachedMapDisplay();
       }
       function mergeLatestFrontierStream(data) {
@@ -4356,6 +4573,7 @@ button{font-family:inherit;cursor:pointer}
       buildOverview();
       renderLogs();
       updateClock();
+      loadInitialHealth();
       loadInitialTasks();
       startTaskPolling();
       syncMapCanvasSize();

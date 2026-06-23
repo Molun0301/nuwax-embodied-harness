@@ -397,7 +397,7 @@ class LocalizationService:
 
         正式主链：
         1. 重置状态机到 LOCALIZING 状态
-        2. 根据后端模式真实驱动 SLAM/AMCL 重定位（slam_toolbox/clear_changes、AMCL /initialpose）
+        2. 根据 RTAB-Map/Nav2 单链路发布 /initialpose 重定位 hint
         3. 刷新会话并返回最新状态
 
         Returns:
@@ -435,7 +435,7 @@ class LocalizationService:
         geometry_asset: Optional[Dict[str, object]],
         metadata: Optional[Dict[str, object]],
     ) -> Dict[str, object]:
-        """根据后端模式向真实 SLAM/AMCL 发出重定位指令。"""
+        """根据 RTAB-Map/Nav2 单链路向定位系统发出重定位 hint。"""
 
         backend_mode = self._resolve_backend_mode(
             geometry_asset=geometry_asset,
@@ -456,12 +456,7 @@ class LocalizationService:
             "actions": [],
             "errors": [],
         }
-        if backend_mode == "amcl_localization_only":
-            self._publish_initialpose(hint_pose, result)
-        elif backend_mode == "slam_toolbox":
-            # slam_toolbox 在线建图模式下，发 clear_changes 让其重新接受新 keyframe；
-            # 同时 /initialpose 让 AMCL（如同时启用）重新撒粒子。
-            self._call_slam_toolbox_clear_changes(result)
+        if backend_mode in {"rtabmap", "rtabmap_mapping", "rtabmap_localization", "amcl_localization_only"}:
             self._publish_initialpose(hint_pose, result)
         else:
             result["errors"].append(
@@ -482,10 +477,10 @@ class LocalizationService:
             value = str(source.get("backend_mode") or "").strip().lower()
             if value:
                 return value
-        # 兜底：external_slam_nav2 默认 slam_toolbox（在线 SLAM）。
+        # 单链路兜底：external_slam_nav2 使用 RTAB-Map + Nav2 action。
         stack = str((geometry_asset or {}).get("geometry_stack") or "").strip().lower()
         if stack == "external_slam_nav2":
-            return "slam_toolbox"
+            return "rtabmap"
         return "unknown"
 
     def _publish_initialpose(self, hint_pose: Optional[Pose], result: Dict[str, object]) -> None:
@@ -535,32 +530,6 @@ class LocalizationService:
                 release_ros2_context()
         except Exception as exc:
             result["errors"].append("/initialpose 发布失败：%s" % exc)
-
-    def _call_slam_toolbox_clear_changes(self, result: Dict[str, object]) -> None:
-        """调用 slam_toolbox `/slam_toolbox/clear_changes` service 清除累积修正。"""
-
-        try:
-            from slam_toolbox.srv import Clear  # type: ignore
-            from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
-
-            rclpy = acquire_ros2_context()
-            node = rclpy.create_node("nuwax_localization_slam_toolbox_client")
-            try:
-                client = node.create_client(Clear, "/slam_toolbox/clear_changes")
-                if not client.wait_for_service(timeout_sec=2.0):
-                    result["errors"].append("/slam_toolbox/clear_changes service 未就绪。")
-                    return
-                future = client.call_async(Clear.Request())
-                rclpy.spin_until_future_complete(node, future, timeout_sec=2.0)
-                if future.done() and future.result() is not None:
-                    result["actions"].append({"target": "/slam_toolbox/clear_changes", "status": "called"})
-                else:
-                    result["errors"].append("/slam_toolbox/clear_changes 调用未返回结果。")
-            finally:
-                node.destroy_node()
-                release_ros2_context()
-        except Exception as exc:
-            result["errors"].append("/slam_toolbox/clear_changes 调用失败：%s" % exc)
 
     def get_localization_diagnostics(self) -> Optional[LocalizationDiagnostics]:
         """返回当前平台定位诊断信息。"""
@@ -675,13 +644,11 @@ class LocalizationService:
         assets = geometry_asset.get("assets")
         if isinstance(assets, list):
             return [self._clone_metadata(item) for item in assets if isinstance(item, dict)]
-        is_external_stack = str(geometry_asset.get("geometry_stack") or "").strip().lower() == "external_slam_nav2"
-        # external_slam_nav2 真实后端是 slam_toolbox。
-        state_asset_type = "slam_toolbox_posegraph" if is_external_stack else "rtabmap_database"
+        state_asset_type = "rtabmap_database"
         refs = []
-        # 优先读 backend_state_path（新命名），缺失时 fallback 到老 rtabmap_db_path（兼容老 version.json）。
+        # 优先读 rtabmap_database_path（新命名），缺失时 fallback 到老 rtabmap_db_path（兼容老 version.json）。
         backend_path = (
-            str(geometry_asset.get("backend_state_path") or "").strip()
+            str(geometry_asset.get("rtabmap_database_path") or "").strip()
             or str(geometry_asset.get("rtabmap_db_path") or "").strip()
         )
         if backend_path:
@@ -805,22 +772,19 @@ class LocalizationService:
     def _resolve_backend_type(self, provider: LocalizationProvider) -> str:
         """解析后端类型。
 
-        历史命名 `rtabmap` 已退场；当前真实在线 SLAM 后端是 `slam_toolbox`。
-        provider_name 同时匹配 `slam_toolbox` 与历史 `rtabmap` 字面值，统一归一为
-        `slam_toolbox`。
+        当前定位主线为 RTAB-Map + Nav2 action。
         """
 
         backend_type = getattr(provider, "backend_type", None)
         if backend_type:
             normalized = str(backend_type).strip().lower()
-            # 兼容存量 backend_type="rtabmap" 写入，统一对外语义为 slam_toolbox。
             if normalized == "rtabmap":
-                return "slam_toolbox"
+                return "rtabmap"
             return str(backend_type)
 
         provider_name = str(getattr(provider, "provider_name", "") or "").lower()
-        if "slam_toolbox" in provider_name or "rtabmap" in provider_name:
-            return "slam_toolbox"
+        if "rtabmap" in provider_name:
+            return "rtabmap"
         if "go2" in provider_name:
             return "go2_sdk"
         if "nav2" in provider_name:

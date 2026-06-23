@@ -4,8 +4,7 @@
 SkillContext，函数体内原 self.audio_service→ctx.audio_service，原 self._require_float
 改用 skills.common.params。行为与抛错条件与迁移前完全一致。
 
-本批下放（分析文档 §1 音频域，2 个全 A 类）：handle_get_volume、handle_set_volume。
-留网关（B 类，任务化）：speak_text（依赖 _resolve_async_timeout/_build_task_request_metadata，R3）。
+本批音频域仅保留音量控制：handle_get_volume、handle_set_volume。
 """
 
 from __future__ import annotations

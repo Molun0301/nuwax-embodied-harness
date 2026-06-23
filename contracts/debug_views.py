@@ -143,7 +143,7 @@ class DebugPointCloudMapView(ContractModel):
     source: Optional[str] = None
     source_kind: Optional[str] = None
     geometry_stack: Optional[str] = None
-    backend_state_path: Optional[str] = None
+    rtabmap_database_path: Optional[str] = None
     rtabmap_db_path: Optional[str] = None
     pcd_path: Optional[str] = None
     point_count: int = 0
@@ -156,13 +156,13 @@ class DebugPointCloudMapView(ContractModel):
     metrics: MetadataDict = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def _sync_backend_state_path_alias(self) -> "DebugPointCloudMapView":
-        """保持 backend_state_path 与 rtabmap_db_path 双向兼容。"""
+    def _sync_rtabmap_database_path_alias(self) -> "DebugPointCloudMapView":
+        """保持 rtabmap_database_path 与 rtabmap_db_path 双向兼容。"""
 
-        if self.backend_state_path is None and self.rtabmap_db_path is not None:
-            object.__setattr__(self, "backend_state_path", self.rtabmap_db_path)
-        elif self.rtabmap_db_path is None and self.backend_state_path is not None:
-            object.__setattr__(self, "rtabmap_db_path", self.backend_state_path)
+        if self.rtabmap_database_path is None and self.rtabmap_db_path is not None:
+            object.__setattr__(self, "rtabmap_database_path", self.rtabmap_db_path)
+        elif self.rtabmap_db_path is None and self.rtabmap_database_path is not None:
+            object.__setattr__(self, "rtabmap_db_path", self.rtabmap_database_path)
         return self
 
 

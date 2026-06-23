@@ -225,7 +225,6 @@ _RUNTIME_METADATA_LOG_KEYS = (
 _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 0.5
 _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
 _DEFAULT_ASYNC_TASK_TIMEOUT_SEC = 15 * 60
-_SPEAK_TEXT_DEFAULT_TIMEOUT_SEC = 60
 _SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC = 1.5
 _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
     {
@@ -1164,7 +1163,8 @@ class GatewayRuntime:
             "source": "pointcloud_map_cache",
             "source_kind": pointcloud_map.source_kind,
             "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "rtabmap_db_path": source_summary.get("backend_state_path") or source_summary.get("rtabmap_db_path"),
+            "rtabmap_database_path": source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
+            "rtabmap_db_path": source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
             "pcd_path": pointcloud_map.path,
             "point_count": pointcloud_map.point_count,
             "fields": [
@@ -1256,7 +1256,8 @@ class GatewayRuntime:
             "source": "pointcloud_map_cache",
             "source_kind": source_summary.get("source_kind") or "configured_pcd_root",
             "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "rtabmap_db_path": source_summary.get("backend_state_path") or source_summary.get("rtabmap_db_path"),
+            "rtabmap_database_path": source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
+            "rtabmap_db_path": source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
             "pcd_path": source_summary.get("pcd_path") or source_summary.get("path"),
             "point_count": 0,
             "fields": [],
@@ -2230,24 +2231,6 @@ class GatewayRuntime:
                 timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
             ),
-            _descriptor(
-                "speak_text",
-                "播报文本",
-                "提交一段中文文本到宿主机播报服务；未配置实时语音时退化为记录模式。",
-                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
-                risk_level=CapabilityRiskLevel.LOW,
-                input_schema=_schema_object(
-                    {
-                        "text": {"type": "string"},
-                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
-                    },
-                    required=("text",),
-                ),
-                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
-                required_resources=(RuntimeResource.AUDIO_OUT.value,),
-                timeout_sec=_SPEAK_TEXT_DEFAULT_TIMEOUT_SEC,
-                cancel_supported=True,
-            ),
         )
         capabilities = tuple(
             self._decorate_gateway_descriptor(descriptor, active_private_names=active_private_names)
@@ -2336,7 +2319,6 @@ class GatewayRuntime:
             "set_speed_level": partial(motion_skills.handle_set_speed_level, self._skill_ctx),
             "get_volume": partial(audio_skills.handle_get_volume, self._skill_ctx),
             "set_volume": partial(audio_skills.handle_set_volume, self._skill_ctx),
-            "speak_text": self._handle_speak_text,
             "switch_control_mode": partial(motion_skills.handle_switch_control_mode, self._skill_ctx),
             "set_obstacle_avoidance": partial(motion_skills.handle_set_obstacle_avoidance, self._skill_ctx),
         }
@@ -2534,13 +2516,6 @@ class GatewayRuntime:
                 description="按给定速度和时长执行短时底盘移动。",
                 category=SkillCategory.MOTION,
                 capability_name="relative_move",
-            ),
-            SkillDescriptor(
-                name="speak_text",
-                display_name="播报文本",
-                description="把一段文本提交给宿主机播报服务。",
-                category=SkillCategory.AUDIO,
-                capability_name="speak_text",
             ),
             SkillDescriptor(
                 name="tag_location",
@@ -3337,10 +3312,16 @@ class GatewayRuntime:
             "available": bool(summary),
             "geometry_stack": summary.get("geometry_stack") or metadata.get("geometry_stack") or self.platform_geometry_runtime.config.stack,
             "frame_id": summary.get("frame_id") or getattr(map_snapshot, "frame_id", None),
-            "rtabmap_db_path": (
-                summary.get("backend_state_path")
+            "rtabmap_database_path": (
+                summary.get("rtabmap_database_path")
                 or summary.get("rtabmap_db_path")
-                or metadata.get("backend_state_path")
+                or metadata.get("rtabmap_database_path")
+                or metadata.get("rtabmap_db_path")
+            ),
+            "rtabmap_db_path": (
+                summary.get("rtabmap_database_path")
+                or summary.get("rtabmap_db_path")
+                or metadata.get("rtabmap_database_path")
                 or metadata.get("rtabmap_db_path")
             ),
             "pcd_path": summary.get("pcd_path") or metadata.get("pcd_path"),
@@ -5581,38 +5562,6 @@ class GatewayRuntime:
             return {"code": code, "result": result or {}, "action": action_name}
 
         return handler
-
-    def _handle_speak_text(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-        request_context: Optional[MetadataDict] = None,
-    ):
-        text = self._require_str(arguments, "text")
-        timeout_sec = self._resolve_async_timeout("speak_text", arguments, minimum_sec=0.1)
-        descriptor = self.capability_registry.get_descriptor("speak_text")
-        speak_metadata = {"requested_by": requested_by or "unknown"}
-
-        def runner(context) -> Dict[str, Any]:
-            context.update(progress=0.05, stage="accepted", message="开始播报文本。")
-            speech = self.audio_service.speak_text(text, metadata=speak_metadata)
-            context.update(progress=1.0, stage="completed", message="文本播报完成。")
-            return {"speech": speech}
-
-        return self.task_manager.submit(
-            "speak_text",
-            runner,
-            input_payload={"text": text},
-            requested_by=requested_by,
-            required_resources=list(descriptor.required_resources),
-            timeout_sec=timeout_sec,
-            metadata=self._build_task_request_metadata(
-                capability_name="speak_text",
-                requested_by=requested_by,
-                request_context=request_context,
-            ),
-        )
 
     def _is_obstacle_avoidance_control_available(self) -> bool:
         data_plane = getattr(self.robot, "data_plane", None)
@@ -8075,12 +8024,8 @@ class GatewayRuntime:
                 "当前机器人入口未提供机器人音量控制，仅保留软件音量。",
             ),
             "set_volume": (
-                lambda: self.audio_service.is_speech_available(),
-                "当前播报与音量服务不可用。",
-            ),
-            "speak_text": (
-                lambda: self.audio_service.is_speech_available(),
-                "当前播报服务不可用。",
+                lambda: self.audio_service.is_volume_available(),
+                "当前机器人入口未提供机器人音量控制，仅保留软件音量。",
             ),
             "stop_all_motion": (
                 lambda: self._has_provider(SafetyProvider) or self._has_provider(MotionControl),

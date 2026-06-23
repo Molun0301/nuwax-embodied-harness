@@ -66,10 +66,6 @@ _EXTERNAL_EXPLORATION_LOG_SCAN_MIN_INTERVAL_SEC = 2.0
 _GEOMETRY_SIDE_CAR_RESTART_LIMIT = 2
 _GEOMETRY_MONITOR_INTERVAL_SEC = 1.0
 _GEOMETRY_STREAMING_WINDOW_SEC = 3.0
-_NAV2_SIDECAR_MODES = {"sidecar", "managed", "launch", "internal"}
-_NAV2_EXTERNAL_MODES = {"external", "external_action", "action", "client", "pending"}
-_NAV2_DISABLED_MODES = {"", "disabled", "off", "none"}
-_REMOVED_PLATFORM_GRID_MODES = {"platform", "platform_grid", "grid", "fallback", "platform_fallback"}
 _EXTERNAL_GEOMETRY_STACKS = {"external_slam_nav2"}
 _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME = "external_slam_nav2_state.db"
 
@@ -464,17 +460,13 @@ class PlatformGeometryRuntime:
         return self._repo_root() / "runtime_data" / "geometry" / "logs"
 
     def _geometry_stack(self) -> str:
-        return str(getattr(self.config, "stack", "") or "").strip().lower()
+        return "external_slam_nav2"
 
     def _uses_external_geometry_stack(self) -> bool:
-        return self._geometry_stack() in _EXTERNAL_GEOMETRY_STACKS
+        return True
 
     def _removed_internal_stack_message(self) -> str:
-        stack = self._geometry_stack() or "<未配置>"
-        return (
-            "几何 stack=%s 不再受支持；旧 RTAB-Map 内置启动链路已删除，"
-            "当前运行时只允许使用 external_slam_nav2 外部 SLAM/Nav2 侧车栈。"
-        ) % stack
+        return "当前运行时固定使用 external_slam_nav2（RTAB-Map + Nav2 action）单链路。"
 
     def _external_process_name(self) -> str:
         name = str(getattr(self.config.external, "process_name", "") or "").strip()
@@ -532,7 +524,7 @@ class PlatformGeometryRuntime:
         map_name = str(getattr(request, "map_name", "") or "").strip() if request is not None else ""
         if map_name:
             version_id = self._next_exploration_map_version_id(map_name)
-            path = self._version_backend_state_path(map_name, version_id)
+            path = self._version_rtabmap_database_path(map_name, version_id)
             path.parent.mkdir(parents=True, exist_ok=True)
             with self._exploration_loop_lock:
                 self._external_exploration_version_id = version_id
@@ -598,19 +590,11 @@ class PlatformGeometryRuntime:
         return "mapver_%06d" % (latest_revision + 1)
 
     def _default_external_exploration_database_path(self) -> Path:
-        raw_path = (
-            os.environ.get("NUWAX_BACKEND_DATABASE_PATH")
-            or os.environ.get("NUWAX_RTABMAP_DATABASE_PATH")
-            or ""
-        ).strip()
+        raw_path = (os.environ.get("NUWAX_RTABMAP_DATABASE_PATH") or "").strip()
         if raw_path:
             path = Path(raw_path).expanduser()
         else:
-            root = (
-                os.environ.get("NUWAX_BACKEND_DATABASE_ROOT")
-                or os.environ.get("NUWAX_RTABMAP_DATABASE_ROOT")
-                or self.config.rtabmap.database_root
-            )
+            root = os.environ.get("NUWAX_RTABMAP_DATABASE_ROOT") or self.config.rtabmap.database_root
             path = Path(str(root)).expanduser() / "live_rtabmap.db"
         if not path.is_absolute():
             path = self._repo_root() / path
@@ -702,7 +686,7 @@ class PlatformGeometryRuntime:
     def _run_external_geometry_preflight_checks(self) -> List[str]:
         errors: List[str] = []
         if not bool(getattr(self.config.external, "enabled", True)):
-            errors.append("外部 SLAM/Nav2 几何栈已禁用，但 NUWAX_GEOMETRY_STACK=%s 需要外部脚本。" % self.config.stack)
+            errors.append("external_slam_nav2 单链路需要启用外部 SLAM/Nav2 脚本。")
         raw_script_path = str(getattr(self.config.external, "script_path", "") or "").strip()
         script_path = self._external_script_path()
         if not raw_script_path:
@@ -747,8 +731,6 @@ class PlatformGeometryRuntime:
         for name, value in required_frames.items():
             if not str(value or "").strip():
                 errors.append("缺少外部 SLAM/Nav2 TF frame 配置 %s" % name)
-        if self._nav2_mode() in _NAV2_SIDECAR_MODES:
-            errors.append("旧 Nav2 sidecar/internal 启动链路已删除；请把 NUWAX_NAV2_MODE 配置为 external、action 或 client。")
         return errors
 
     def _ros_setup_candidates(self) -> List[Path]:
@@ -1386,59 +1368,21 @@ class PlatformGeometryRuntime:
         self._map_stream_tracker["stream_age_ms"] = received_age_sec * 1000.0 if received_age_sec is not None else None
         self._map_stream_tracker["streaming"] = streaming
 
-    def _nav2_mode(self) -> str:
-        return str(getattr(self.config.nav2, "mode", "external") or "external").strip().lower()
-
     def _navigation_backend_policy(self) -> Dict[str, object]:
-        mode = self._nav2_mode()
         nav2_provider = getattr(self, "_nav2_action_provider", None)
         nav2_provider_name = getattr(nav2_provider, "provider_name", "nav2_action_navigation")
-        policy = {
-            "mode": mode,
+        return {
+            "selection": "nav2_action",
             "execution_chain": "nav2_action_only",
             "single_execution_chain": True,
-            "platform_grid_removed": True,
-            "removed_backend_kind": "platform_grid",
-            "removed_backend_provider": None,
             "nav2_action_provider_name": nav2_provider_name,
-            "nav2_action_active": False,
-            "platform_grid_active": False,
-            "selected_provider_name": None,
-            "active_backend_provider": None,
-            "active_backend_kind": None,
-            "message": None,
+            "nav2_action_active": nav2_provider is not None,
+            "selected_provider_name": nav2_provider_name if nav2_provider is not None else None,
+            "active_backend_provider": nav2_provider_name if nav2_provider is not None else None,
+            "active_navigation_backend": nav2_provider_name if nav2_provider is not None else None,
+            "active_backend_kind": "nav2_action" if nav2_provider is not None else None,
+            "message": "当前正式导航执行链为 Nav2 action。",
         }
-        if mode in _NAV2_DISABLED_MODES:
-            policy.update({
-                "selection": "disabled",
-                "message": "Nav2 已禁用，平台未选择导航执行后端。",
-            })
-        elif mode in _REMOVED_PLATFORM_GRID_MODES:
-            policy.update({
-                "selection": "removed_platform_grid",
-                "message": "platform_grid 自定义导航执行链已删除；请使用 Nav2 action 模式。",
-            })
-        elif mode in _NAV2_EXTERNAL_MODES:
-            policy.update({
-                "selection": "nav2_action",
-                "selected_provider_name": nav2_provider_name,
-                "active_backend_provider": nav2_provider_name,
-                "active_backend_kind": "nav2_action",
-                "nav2_action_active": True,
-                "message": "当前正式导航执行链为 Nav2 action。",
-            })
-        elif mode in _NAV2_SIDECAR_MODES:
-            policy.update({
-                "selection": "removed_nav2_sidecar",
-                "message": "旧 Nav2 sidecar/internal 启动链路已删除；请使用外部 Nav2 action 模式。",
-            })
-        else:
-            policy.update({
-                "selection": "unsupported",
-                "message": "Nav2 模式 %s 尚未接入导航后端选择。" % mode,
-            })
-        policy["active_navigation_backend"] = policy["active_backend_provider"]
-        return policy
 
     def _with_navigation_backend_policy(self, status: Dict[str, object]) -> Dict[str, object]:
         policy = self._navigation_backend_policy()
@@ -1447,47 +1391,23 @@ class PlatformGeometryRuntime:
             "navigation_backend_policy": policy,
             "active_navigation_backend": policy.get("active_backend_provider"),
             "nav2_action_active": bool(policy.get("nav2_action_active")),
-            "platform_grid_active": bool(policy.get("platform_grid_active")),
-            "platform_grid_removed": bool(policy.get("platform_grid_removed")),
         }
 
     def _build_nav2_status(self) -> Dict[str, object]:
-        mode = self._nav2_mode()
         process = self._managed_processes.get("nav2")
-        if mode in _NAV2_DISABLED_MODES:
-            phase = "disabled"
-            message = "Nav2 已禁用；平台不再提供 platform_grid 自定义导航执行链。"
-        elif mode in _REMOVED_PLATFORM_GRID_MODES:
-            phase = "removed_platform_grid"
-            message = "platform_grid 自定义导航执行链已删除；请把 NUWAX_NAV2_MODE 配置为 external、action 或 client。"
-        elif mode in _NAV2_EXTERNAL_MODES:
-            provider = getattr(self, "_nav2_action_provider", None)
-            if provider is not None:
-                status = dict(provider.get_nav2_status())
-                status.pop("launch_package", None)
-                status.pop("launch_file", None)
-                status["sidecar_launch_removed"] = True
-                return self._with_navigation_backend_policy(status)
-            phase = "external"
-            message = "Nav2 配置为外部模式，但 action provider 尚未初始化。"
-        elif mode in _NAV2_SIDECAR_MODES:
-            phase = "removed_nav2_sidecar"
-            message = "旧 Nav2 sidecar/internal 启动链路已删除；运行时只连接外部 Nav2 action。"
-        else:
-            phase = "pending_integration"
-            message = "Nav2 模式 %s 尚未接入。" % mode
+        provider = getattr(self, "_nav2_action_provider", None)
+        if provider is not None:
+            status = dict(provider.get_nav2_status())
+            status.pop("launch_package", None)
+            status.pop("launch_file", None)
+            return self._with_navigation_backend_policy(status)
         status = {
-            "mode": mode,
-            "phase": phase,
-            "message": message,
+            "phase": "external",
+            "message": "Nav2 action provider 尚未初始化。",
             "action_name": self.config.nav2.action_name,
             "global_costmap_topic": self.config.nav2.global_costmap_topic,
             "local_costmap_topic": self.config.nav2.local_costmap_topic,
             "costmap_source": self.config.nav2.costmap_source,
-            "sidecar_launch_removed": True,
-            "platform_grid_removed": True,
-            "grid_navigation_backend": None,
-            "grid_navigation_is_nav2": False,
             "action_client_connected": False,
             "lifecycle_ready": False,
             "launch_attempted": self._nav2_launch_attempted,
@@ -2103,12 +2023,12 @@ class PlatformGeometryRuntime:
         previous_asset = version.geometry_asset
         parameter_summary = self._build_parameter_summary()
         profile_summary = self._clone_metadata(parameter_summary.get("profile") or {})
-        backend_state_path = self._version_backend_state_path(version.map_name, version.version_id)
+        rtabmap_database_path = self._version_rtabmap_database_path(version.map_name, version.version_id)
         pcd_path = self._version_pcd_asset_path(version.map_name, version.version_id)
         built_at = previous_asset.built_at if previous_asset is not None else version.timestamp
         backend_run = self._build_rtabmap_run_metadata()
-        database_metadata = self._materialize_backend_state(backend_state_path)
-        database_for_pcd = backend_state_path if backend_state_path.exists() and backend_state_path.is_file() else None
+        database_metadata = self._materialize_backend_state(rtabmap_database_path)
+        database_for_pcd = rtabmap_database_path if rtabmap_database_path.exists() and rtabmap_database_path.is_file() else None
         # Nav2 归档来自 version 快照，不依赖 PCD 导出；PCD 失败不应阻塞 yaml/geometry_asset 落盘。
         nav2_map_metadata = self._materialize_nav2_map_assets(version)
         if skip_pcd_export:
@@ -2135,7 +2055,7 @@ class PlatformGeometryRuntime:
             asset_refs.append(
                 MapGeometryAssetRef(
                     asset_type=database_asset_type,
-                    path=str(backend_state_path),
+                    path=str(rtabmap_database_path),
                     frame_id=version.frame_id,
                     profile_summary=profile_summary,
                     built_at=built_at,
@@ -2172,9 +2092,9 @@ class PlatformGeometryRuntime:
             version_id=version.version_id,
             geometry_stack=self.config.stack,
             frame_id=version.frame_id,
-            backend_state_path=str(backend_state_path),
-            # 老 version.json 兼容：rtabmap_db_path 与 backend_state_path 同步写。
-            rtabmap_db_path=str(backend_state_path),
+            rtabmap_database_path=str(rtabmap_database_path),
+            # 老 version.json 兼容：rtabmap_db_path 与 rtabmap_database_path 同步写。
+            rtabmap_db_path=str(rtabmap_database_path),
             pcd_path=str(pcd_path),
             occupancy_projection=self.config.rtabmap.occupancy_projection,
             costmap_source=self.config.nav2.costmap_source,
@@ -2222,12 +2142,11 @@ class PlatformGeometryRuntime:
                     "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset),
                     "backend_session_id": backend_run.get("session_id"),
                     "backend_run_id": backend_run.get("run_id"),
-                    "backend_state_path": database_metadata.get("database_source_path") or database_metadata.get("database_target_path"),
+                    "rtabmap_database_path": database_metadata.get("database_source_path") or database_metadata.get("database_target_path"),
                     "backend_streaming_ready": quality_metrics.get("live_streaming_ready"),
                     # 老消费方读老 metadata key 时仍能解析（迁移期保留 alias）。
                     "rtabmap_session_id": backend_run.get("session_id"),
                     "rtabmap_run_id": backend_run.get("run_id"),
-                    "rtabmap_database_path": database_metadata.get("database_source_path") or database_metadata.get("database_target_path"),
                     "rtabmap_live_streaming_ready": quality_metrics.get("live_streaming_ready"),
                     "map_version_source_mode": quality_metrics.get("source_mode"),
                     "checkpoint_ready": quality_metrics.get("checkpoint_ready"),
@@ -2660,15 +2579,7 @@ class PlatformGeometryRuntime:
     def _resolve_navigation_backend(self):
         if not self._is_geometry_profile_enabled():
             return None
-        mode = self._nav2_mode()
-        if mode in _NAV2_DISABLED_MODES:
-            return None
-        if mode in _REMOVED_PLATFORM_GRID_MODES:
-            return None
-        nav2_provider = getattr(self, "_nav2_action_provider", None)
-        if mode in _NAV2_EXTERNAL_MODES:
-            return nav2_provider
-        return None
+        return getattr(self, "_nav2_action_provider", None)
 
     def _resolve_exploration_backend(self):
         if not self._is_geometry_profile_enabled():
@@ -2701,23 +2612,18 @@ class PlatformGeometryRuntime:
     def _geometry_asset_path(self, map_name: str, version_id: str) -> Path:
         return self._version_geometry_root(map_name, version_id) / "geometry_asset.json"
 
-    def _version_rtabmap_database_path(self, map_name: str, version_id: str) -> Path:
-        """Deprecated alias —— 转向通用 _version_backend_state_path。"""
-
-        return self._version_backend_state_path(map_name, version_id)
-
     def _map_named_backend_db_filename(self, map_name: str) -> str:
         """探索/定位使用的 .db 文件名与地图名一致，避免多图共用 live_rtabmap.db。"""
 
         safe_name = build_safe_dir_segment(map_name) or "map"
         return "%s.db" % safe_name
 
-    def _version_backend_state_path(self, map_name: str, version_id: str) -> Path:
+    def _version_rtabmap_database_path(self, map_name: str, version_id: str) -> Path:
         """返回该地图版本的 RTAB-Map .db 状态文件路径。"""
 
         return self._version_geometry_root(map_name, version_id) / "rtabmap" / self._map_named_backend_db_filename(map_name)
 
-    def _candidate_version_backend_state_paths(self, map_name: str, version_id: str) -> List[Path]:
+    def _candidate_version_rtabmap_database_paths(self, map_name: str, version_id: str) -> List[Path]:
         """主路径为 <map_name>.db，兼容旧版 external_slam_nav2_state.db。"""
 
         rtabmap_dir = self._version_geometry_root(map_name, version_id) / "rtabmap"
@@ -2844,9 +2750,7 @@ class PlatformGeometryRuntime:
         resolved_target = target_path.expanduser().resolve(strict=False)
         mapping_backend = self._resolve_mapping_backend()
         if mapping_backend is not None:
-            getter = getattr(mapping_backend, "get_backend_state_path", None) or getattr(
-                mapping_backend, "get_rtabmap_database_path", None
-            )
+            getter = getattr(mapping_backend, "get_rtabmap_database_path", None)
             if callable(getter):
                 candidate = Path(str(getter() or "").strip()).expanduser()
                 if (
@@ -3464,13 +3368,13 @@ class PlatformGeometryRuntime:
 
         if self._active_map_version is not None and self._active_map_version.geometry_asset is not None:
             asset = self._active_map_version.geometry_asset
-            current_path = Path(asset.backend_state_path or asset.rtabmap_db_path or "").expanduser()
+            current_path = Path(asset.rtabmap_database_path or asset.rtabmap_db_path or "").expanduser()
             if current_path.suffix == ".db" and current_path.exists() and current_path.is_file():
                 return current_path
 
         mapping_backend = self._resolve_mapping_backend()
         if mapping_backend is not None:
-            getter = getattr(mapping_backend, "get_backend_state_path", None) or getattr(mapping_backend, "get_rtabmap_database_path", None)
+            getter = getattr(mapping_backend, "get_rtabmap_database_path", None)
             if callable(getter):
                 candidate = str(getter() or "").strip()
                 if candidate:
@@ -3501,18 +3405,17 @@ class PlatformGeometryRuntime:
         geometry_asset = version.geometry_asset
         candidates: List[Path] = []
         if geometry_asset is not None:
-            for raw in (geometry_asset.backend_state_path, geometry_asset.rtabmap_db_path):
+            for raw in (geometry_asset.rtabmap_database_path, geometry_asset.rtabmap_db_path):
                 if raw:
                     candidates.append(Path(str(raw)).expanduser())
             for asset_ref in geometry_asset.assets:
                 if asset_ref.asset_type in (
                     MapGeometryAssetType.RTABMAP_DATABASE,
-                    MapGeometryAssetType.SLAM_TOOLBOX_POSEGRAPH,
                     MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE,
                 ):
                     candidates.append(Path(asset_ref.path).expanduser())
-        candidates.append(self._version_backend_state_path(version.map_name, version.version_id))
-        for candidate in self._candidate_version_backend_state_paths(version.map_name, version.version_id):
+        candidates.append(self._version_rtabmap_database_path(version.map_name, version.version_id))
+        for candidate in self._candidate_version_rtabmap_database_paths(version.map_name, version.version_id):
             if candidate.suffix == ".db" and candidate.exists() and candidate.is_file():
                 return candidate
         for candidate in candidates:
@@ -3591,7 +3494,7 @@ class PlatformGeometryRuntime:
 
         geometry_asset = version.geometry_asset
         backend_state = (
-            geometry_asset.backend_state_path or geometry_asset.rtabmap_db_path
+            geometry_asset.rtabmap_database_path or geometry_asset.rtabmap_db_path
             if geometry_asset is not None
             else None
         )
@@ -3599,7 +3502,7 @@ class PlatformGeometryRuntime:
             "map_name": version.map_name,
             "version_id": version.version_id,
             "geometry_stack": self.config.stack,
-            "backend_state_path": backend_state,
+            "rtabmap_database_path": backend_state,
             # 老消费方兼容：保持 rtabmap_db_path 字段读得到。
             "rtabmap_db_path": backend_state,
             "pcd_path": geometry_asset.pcd_path if geometry_asset is not None else None,
@@ -3922,32 +3825,6 @@ class PlatformGeometryRuntime:
     def _build_nav2_map_activation_command(self, *, map_yaml_path: Path, pcd_path: Optional[Path]) -> List[str]:
         # 直接复用外部 SLAM/Nav2 脚本；平台只连接外部 Nav2 action。
         return self._build_external_geometry_command()
-
-    def _generate_slam_params_with_posegraph(self, map_yaml_path: Path) -> Optional[Path]:
-        """基于默认 slam_toolbox yaml 生成包含 map_file_name 的临时配置。"""
-        import shutil
-        slam_dir = map_yaml_path.parent.parent / "slam_toolbox"
-        if not slam_dir.exists():
-            return None
-        posegraph_files = list(slam_dir.glob("*.posegraph"))
-        if not posegraph_files:
-            return None
-        prefix = posegraph_files[0].with_suffix("")  # 去掉 .posegraph 后缀
-        data_file = prefix.with_suffix(".data")
-        if not data_file.exists():
-            return None
-        default_yaml = Path("/home/unitree/nuwax-robot-bridge/services/geometry/ros2_ws/install/go2_slam/share/go2_slam/config/mapper_params_online_async.yaml")
-        if not default_yaml.exists():
-            default_yaml = Path(self.config.geometry_setup_script).parent.parent / "install/go2_slam/share/go2_slam/config/mapper_params_online_async.yaml"
-        if not default_yaml.exists():
-            return None
-        tmp_yaml = Path("/tmp/nuwax_slam_params_with_map.yaml")
-        shutil.copy2(str(default_yaml), str(tmp_yaml))
-        with open(tmp_yaml, "a") as f:
-            f.write("\n    map_file_name: %s\n" % str(prefix))
-            f.write("    map_start_at_dock: true\n")
-        LOGGER.debug("生成 slam_toolbox 增量建图配置 posegraph=%s yaml=%s", prefix, tmp_yaml)
-        return tmp_yaml
 
     def _ensure_amcl_initialized(self) -> None:
         """等待 AMCL 发布 map→odom TF；超时后发布 identity initialpose 作为 fallback。"""
@@ -5741,9 +5618,7 @@ class PlatformGeometryProviderBundle(
             from contracts.navigation import NavigationState, NavigationStatus
 
             policy = self.runtime._navigation_backend_policy()
-            message = "平台几何运行时未绑定导航后端。"
-            if policy.get("selection") == "removed_platform_grid":
-                message = "platform_grid 自定义导航执行链已删除；请配置并使用 Nav2 action 导航。"
+            message = "平台几何运行时未绑定 Nav2 action provider。"
             return NavigationState(
                 status=NavigationStatus.IDLE,
                 message=message,
@@ -5751,8 +5626,6 @@ class PlatformGeometryProviderBundle(
                     "navigation_backend_policy": self.runtime._clone_metadata(policy),
                     "active_navigation_backend": policy.get("active_backend_provider"),
                     "nav2_action_active": bool(policy.get("nav2_action_active")),
-                    "platform_grid_active": bool(policy.get("platform_grid_active")),
-                    "platform_grid_removed": bool(policy.get("platform_grid_removed")),
                 },
             )
         return backend.get_navigation_state()

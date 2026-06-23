@@ -1,7 +1,6 @@
 """平台几何运行时导出。"""
 
 from services.geometry.config import (
-    BackendStateConfig,
     ExternalGeometryStackConfig,
     GeometryFrameConfig,
     GeometryOdometryQualityConfig,
@@ -29,7 +28,6 @@ from services.geometry.pointcloud_map import (
 )
 
 __all__ = [
-    "BackendStateConfig",
     "ExternalGeometryStackConfig",
     "GeometryFrameConfig",
     "GeometryOdometryQualityConfig",

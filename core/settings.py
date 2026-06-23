@@ -68,6 +68,8 @@ DEFAULT_MEMORY_TEXT_EMBEDDING_MODEL = _default_model_dir("BAAI/bge-m3")
 DEFAULT_MEMORY_IMAGE_EMBEDDING_MODEL = _default_model_dir("openai/clip-vit-base-patch32")
 DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL = "tongyi-embedding-vision-flash-2026-03-06"
 DEFAULT_MEMORY_EMBEDDING_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
+DEFAULT_GEOMETRY_STACK_NAME = "external_slam_nav2"
+
 
 
 def _strip_quotes(value: str) -> str:
@@ -180,18 +182,6 @@ def _cfg_str_alias(preferred_name: str, legacy_name: str, default: str = "") -> 
     return value if value else default
 
 
-def _cfg_bool_alias(preferred_name: str, legacy_name: str, default: bool) -> bool:
-    raw = _resolve_alias_env_value(preferred_name, legacy_name)
-    if raw is None:
-        return default
-    value = raw.strip()
-    if not value:
-        return default
-    return value.lower() in ("1", "true", "yes", "on")
-
-
-def _clamp_volume(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
 
 
 @dataclass
@@ -223,103 +213,6 @@ class LowLevelControlConfig:
     max_torque: float = 10.0
     control_interval_sec: float = 0.002
 
-
-@dataclass
-class LocalPlaybackConfig:
-    """Jetson 本地声卡兼容播放链路配置。"""
-
-    preferred_backend: str = "aplay"
-    audio_device: str = ""
-    enable_spk_ctl: bool = True
-    enable_ape_route: bool = True
-    ape_card: str = "APE"
-    ape_admaif: int = 1
-    ape_speaker: str = "DSPK1"
-
-
-@dataclass
-class RobotWebRTCPlaybackConfig:
-    """Go2 机身扬声器 WebRTC 播放链路配置。"""
-
-    robot_ip: str = ""
-    connection_mode: str = "ai"
-    python_path: str = ""
-    use_megaphone: bool = True
-    streaming_enabled: bool = False
-    streaming_chunk_ms: int = 200
-    connect_timeout: float = 15.0
-    request_timeout: float = 20.0
-    upload_chunk_size: int = 61440
-    megaphone_chunk_size: int = 16384
-    sentence_segment_min_duration_sec: float = 3.0
-    auto_fallback_to_local: bool = True
-
-
-@dataclass
-class TTSPlayerConfig:
-    """本地播放器配置。"""
-
-    auto_start: bool = True
-    print_subtitle: bool = False
-    initial_volume: float = 1.0
-    # 实时 TTS 播放与 WebRTC 音频通道已随 tts/ 包删除，AudioService 现为 record_only。
-    # backend_mode 当前无消费方（保留字段形态以免破坏配置级联），默认置为 "disabled"，
-    # 不再指向已下线的 robot_webrtc 后端。tts.initial_volume 仍被音量服务消费故保留。
-    backend_mode: str = "disabled"
-    fallback_backend_mode: str = "alsa_local"
-    local: LocalPlaybackConfig = field(default_factory=LocalPlaybackConfig)
-    robot: RobotWebRTCPlaybackConfig = field(default_factory=RobotWebRTCPlaybackConfig)
-
-
-@dataclass
-class DoubaoConfig:
-    """豆包鉴权与默认参数配置。"""
-
-    app_id: str = ""
-    access_key: str = ""
-    resource_id: str = "seed-tts-1.0"
-    default_speaker: str = ""
-    default_uid: str = "nuwax_robot_bridge-tts"
-    default_model: str = ""
-    default_audio_format: str = "pcm"
-    default_sample_rate: int = 24000
-    request_usage_tokens: bool = True
-    send_app_id_header: bool = False
-    send_app_key_header: bool = True
-
-
-@dataclass
-class TTSLogBridgeConfig:
-    """日志监听转 TTS 的配置。"""
-
-    enabled: bool = True
-    log_path: str = "/var/lib/docker/volumes/nuwax_home/_data/.nuwaxbot/logs/main.log"
-    require_root: bool = True
-    speaker: str = ""
-    resource_id: str = "seed-tts-1.0"
-    uid: str = "nuwax_robot_bridge-tts"
-    model: str = ""
-    audio_format: str = "pcm"
-    sample_rate: int = 24000
-    speech_rate: int = 0
-    loudness_rate: int = 0
-    emotion: str = ""
-    emotion_scale: int = 4
-    enable_subtitle: bool = False
-    enable_timestamp: bool = False
-    disable_markdown_filter: bool = True
-    silence_duration_ms: int = 0
-    interrupt: bool = True
-    explicit_language: str = "zh"
-    start_from_end: bool = True
-    poll_interval_sec: float = 0.2
-    quiet_period_sec: float = 1.5
-    flush_interval_sec: float = 0.35
-    stream_min_chars: int = 8
-    min_text_length: int = 2
-    request_timeout_sec: float = 15.0
-    start_retry_backoff_sec: float = 2.0
-    max_start_failures_per_turn: int = 3
 
 
 @dataclass
@@ -563,9 +456,6 @@ class NuwaxRobotBridgeConfig:
     robot: "RobotDriverConfig"
     dds: DDSConfig
     low_level: LowLevelControlConfig
-    tts: TTSPlayerConfig
-    doubao: DoubaoConfig
-    log_tts: TTSLogBridgeConfig
     volume: VolumeControlConfig
     perception: PerceptionConfig
 
@@ -643,91 +533,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
         _cfg_str("GO2_PROXY_LOG_FILE", str(Path(log_dir) / "nuwax_robot_bridge.log")),
     )
 
-    local_playback = LocalPlaybackConfig(
-        preferred_backend=_cfg_str("TTS_PLAYER_PREFERRED_BACKEND", "aplay"),
-        audio_device=_cfg_str("TTS_PLAYER_AUDIO_DEVICE", ""),
-        enable_spk_ctl=_cfg_bool("TTS_PLAYER_ENABLE_SPK_CTL", True),
-        enable_ape_route=_cfg_bool("TTS_PLAYER_ENABLE_APE_ROUTE", True),
-        ape_card=_cfg_str("TTS_PLAYER_APE_CARD", "APE"),
-        ape_admaif=_cfg_int("TTS_PLAYER_APE_ADMAIF", 1),
-        ape_speaker=_cfg_str("TTS_PLAYER_APE_SPEAKER", "DSPK1"),
-    )
-
-    robot_playback = RobotWebRTCPlaybackConfig(
-        robot_ip=_cfg_str("TTS_PLAYER_ROBOT_IP", _cfg_str("GO2_ROBOT_IP", _cfg_str("ROBOT_IP", ""))),
-        connection_mode=_cfg_str("TTS_PLAYER_ROBOT_MODE", "ai"),
-        python_path=_cfg_str("TTS_PLAYER_ROBOT_PYTHONPATH", ""),
-        use_megaphone=_cfg_bool("TTS_PLAYER_USE_MEGAPHONE", True),
-        streaming_enabled=_cfg_bool("TTS_PLAYER_STREAMING_ENABLED", False),
-        streaming_chunk_ms=_cfg_int("TTS_PLAYER_STREAMING_CHUNK_MS", 200),
-        connect_timeout=_cfg_float("TTS_PLAYER_ROBOT_CONNECT_TIMEOUT", 15.0),
-        request_timeout=_cfg_float("TTS_PLAYER_ROBOT_REQUEST_TIMEOUT", 20.0),
-        upload_chunk_size=_cfg_int("TTS_PLAYER_UPLOAD_CHUNK_SIZE", 61440),
-        megaphone_chunk_size=_cfg_int("TTS_PLAYER_MEGAPHONE_CHUNK_SIZE", 16384),
-        sentence_segment_min_duration_sec=_cfg_float(
-            "TTS_PLAYER_SEGMENT_MIN_DURATION_SEC",
-            3.0,
-        ),
-        auto_fallback_to_local=_cfg_bool("TTS_PLAYER_AUTO_FALLBACK_TO_LOCAL", True),
-    )
-
-    tts_player = TTSPlayerConfig(
-        auto_start=_cfg_bool("TTS_PLAYER_AUTO_START", True),
-        print_subtitle=_cfg_bool("TTS_PLAYER_PRINT_SUBTITLE", False),
-        initial_volume=_clamp_volume(_cfg_float("TTS_PLAYER_VOLUME", 1.0)),
-        backend_mode=_cfg_str("TTS_PLAYER_BACKEND_MODE", "disabled"),
-        fallback_backend_mode=_cfg_str("TTS_PLAYER_FALLBACK_BACKEND_MODE", "alsa_local"),
-        local=local_playback,
-        robot=robot_playback,
-    )
-
-    doubao = DoubaoConfig(
-        app_id=_cfg_str("DOUBAO_APP_ID", ""),
-        access_key=_cfg_str("DOUBAO_ACCESS_KEY", ""),
-        resource_id=_cfg_str("DOUBAO_RESOURCE_ID", "seed-tts-1.0"),
-        default_speaker=_cfg_str("DOUBAO_DEFAULT_SPEAKER", ""),
-        default_uid=_cfg_str("DOUBAO_DEFAULT_UID", "nuwax_robot_bridge-tts"),
-        default_model=_cfg_str("DOUBAO_DEFAULT_MODEL", ""),
-        default_audio_format=_cfg_str("DOUBAO_DEFAULT_AUDIO_FORMAT", "pcm"),
-        default_sample_rate=_cfg_int("DOUBAO_DEFAULT_SAMPLE_RATE", 24000),
-        request_usage_tokens=_cfg_bool("DOUBAO_REQUEST_USAGE_TOKENS", True),
-        send_app_id_header=_cfg_bool("DOUBAO_SEND_APP_ID_HEADER", False),
-        send_app_key_header=_cfg_bool("DOUBAO_SEND_APP_KEY_HEADER", True),
-    )
-
-    log_tts = TTSLogBridgeConfig(
-        enabled=_cfg_bool("TTS_LOG_BRIDGE_ENABLED", True),
-        log_path=_cfg_str(
-            "TTS_LOG_BRIDGE_LOG_PATH",
-            "/var/lib/docker/volumes/nuwax_home/_data/.nuwaxbot/logs/main.log",
-        ),
-        require_root=_cfg_bool("TTS_LOG_BRIDGE_REQUIRE_ROOT", True),
-        speaker=_cfg_str("TTS_LOG_BRIDGE_SPEAKER", doubao.default_speaker),
-        resource_id=_cfg_str("TTS_LOG_BRIDGE_RESOURCE_ID", doubao.resource_id),
-        uid=_cfg_str("TTS_LOG_BRIDGE_UID", doubao.default_uid),
-        model=_cfg_str("TTS_LOG_BRIDGE_MODEL", doubao.default_model),
-        audio_format=_cfg_str("TTS_LOG_BRIDGE_AUDIO_FORMAT", doubao.default_audio_format),
-        sample_rate=_cfg_int("TTS_LOG_BRIDGE_SAMPLE_RATE", doubao.default_sample_rate),
-        speech_rate=_cfg_int("TTS_LOG_BRIDGE_SPEECH_RATE", 0),
-        loudness_rate=_cfg_int("TTS_LOG_BRIDGE_LOUDNESS_RATE", 0),
-        emotion=_cfg_str("TTS_LOG_BRIDGE_EMOTION", ""),
-        emotion_scale=_cfg_int("TTS_LOG_BRIDGE_EMOTION_SCALE", 4),
-        enable_subtitle=_cfg_bool("TTS_LOG_BRIDGE_ENABLE_SUBTITLE", False),
-        enable_timestamp=_cfg_bool("TTS_LOG_BRIDGE_ENABLE_TIMESTAMP", False),
-        disable_markdown_filter=_cfg_bool("TTS_LOG_BRIDGE_DISABLE_MARKDOWN_FILTER", True),
-        silence_duration_ms=_cfg_int("TTS_LOG_BRIDGE_SILENCE_DURATION_MS", 0),
-        interrupt=_cfg_bool("TTS_LOG_BRIDGE_INTERRUPT", True),
-        explicit_language=_cfg_str("TTS_LOG_BRIDGE_EXPLICIT_LANGUAGE", "zh"),
-        start_from_end=_cfg_bool("TTS_LOG_BRIDGE_START_FROM_END", True),
-        poll_interval_sec=_cfg_float("TTS_LOG_BRIDGE_POLL_INTERVAL_SEC", 0.2),
-        quiet_period_sec=_cfg_float("TTS_LOG_BRIDGE_QUIET_PERIOD_SEC", 1.5),
-        flush_interval_sec=_cfg_float("TTS_LOG_BRIDGE_FLUSH_INTERVAL_SEC", 0.35),
-        stream_min_chars=_cfg_int("TTS_LOG_BRIDGE_STREAM_MIN_CHARS", 8),
-        min_text_length=_cfg_int("TTS_LOG_BRIDGE_MIN_TEXT_LENGTH", 2),
-        request_timeout_sec=_cfg_float("TTS_LOG_BRIDGE_REQUEST_TIMEOUT_SEC", 15.0),
-        start_retry_backoff_sec=_cfg_float("TTS_LOG_BRIDGE_START_RETRY_BACKOFF_SEC", 2.0),
-        max_start_failures_per_turn=_cfg_int("TTS_LOG_BRIDGE_MAX_START_FAILURES_PER_TURN", 3),
-    )
 
     volume = VolumeControlConfig(
         auto_enable_vui_switch=_cfg_bool("GO2_VOLUME_AUTO_ENABLE_VUI_SWITCH", True),
@@ -863,7 +668,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
 
     geometry = PlatformGeometryConfig(
         enabled=_cfg_bool("NUWAX_GEOMETRY_ENABLED", True),
-        stack=_cfg_str("NUWAX_GEOMETRY_STACK", "external_slam_nav2"),
+        stack=DEFAULT_GEOMETRY_STACK_NAME,
         require_ros2=_cfg_bool("NUWAX_GEOMETRY_REQUIRE_ROS2", True),
         setup_script=_cfg_str("NUWAX_GEOMETRY_SETUP_SCRIPT", build_default_geometry_setup_script()),
         cyclonedds_lib_dir=_cfg_str("NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR", ""),
@@ -891,16 +696,16 @@ def load_config() -> NuwaxRobotBridgeConfig:
             imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
         rtabmap=RtabmapConfig(
-            profile_name=_cfg_str_alias("NUWAX_BACKEND_PROFILE_NAME", "NUWAX_RTABMAP_PROFILE_NAME", "external_slam_nav2"),
-            profile_enabled=_cfg_bool_alias("NUWAX_BACKEND_PROFILE_ENABLED", "NUWAX_RTABMAP_PROFILE_ENABLED", True),
-            default_profile=_cfg_bool_alias("NUWAX_BACKEND_DEFAULT_PROFILE", "NUWAX_RTABMAP_DEFAULT_PROFILE", True),
-            database_root=_cfg_str_alias("NUWAX_BACKEND_DATABASE_ROOT", "NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
-            pcd_root=_cfg_str_alias("NUWAX_BACKEND_PCD_ROOT", "NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()),
-            launch_package=_cfg_str_alias("NUWAX_BACKEND_LAUNCH_PACKAGE", "NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_launch"),
-            launch_file=_cfg_str_alias("NUWAX_BACKEND_LAUNCH_FILE", "NUWAX_RTABMAP_LAUNCH_FILE", "rtabmap.launch.py"),
-            occupancy_projection=_cfg_str_alias("NUWAX_BACKEND_OCCUPANCY_PROJECTION", "NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
-            input_contract=_cfg_str_alias("NUWAX_BACKEND_INPUT_CONTRACT", "NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"),
-            output_contract=_cfg_str_alias("NUWAX_BACKEND_OUTPUT_CONTRACT", "NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
+            profile_name=_cfg_str("NUWAX_RTABMAP_PROFILE_NAME", DEFAULT_GEOMETRY_STACK_NAME),
+            profile_enabled=_cfg_bool("NUWAX_RTABMAP_PROFILE_ENABLED", True),
+            default_profile=_cfg_bool("NUWAX_RTABMAP_DEFAULT_PROFILE", True),
+            database_root=_cfg_str("NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
+            pcd_root=_cfg_str("NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()),
+            launch_package=_cfg_str("NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_launch"),
+            launch_file=_cfg_str("NUWAX_RTABMAP_LAUNCH_FILE", "rtabmap.launch.py"),
+            occupancy_projection=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
+            input_contract=_cfg_str("NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"),
+            output_contract=_cfg_str("NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
             timestamp_quality=GeometryTimestampQualityConfig(
                 source=_cfg_str("NUWAX_GEOMETRY_TIMESTAMP_SOURCE", "sensor_header"),
                 max_point_cloud_age_sec=max(0.0, _cfg_float("NUWAX_GEOMETRY_POINT_CLOUD_MAX_AGE_SEC", 0.5)),
@@ -935,17 +740,16 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 output_layer=_cfg_str("NUWAX_GEOMETRY_TRAVERSABILITY_OUTPUT_LAYER", "traversability"),
             ),
             outputs=RtabmapOutputConfig(
-                database_asset_name=_cfg_str_alias("NUWAX_BACKEND_DATABASE_ASSET_NAME", "NUWAX_RTABMAP_DATABASE_ASSET_NAME", "external_slam_nav2_state.db"),
-                pcd_asset_name=_cfg_str_alias("NUWAX_BACKEND_PCD_ASSET_NAME", "NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"),
-                occupancy_layer=_cfg_str_alias("NUWAX_BACKEND_OCCUPANCY_LAYER", "NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"),
-                costmap_layer=_cfg_str_alias("NUWAX_BACKEND_COSTMAP_LAYER", "NUWAX_RTABMAP_COSTMAP_LAYER", "nav2_global_costmap"),
-                traversability_layer=_cfg_str_alias("NUWAX_BACKEND_TRAVERSABILITY_LAYER", "NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"),
-                localization_status=_cfg_str_alias("NUWAX_BACKEND_LOCALIZATION_STATUS", "NUWAX_RTABMAP_LOCALIZATION_STATUS", "rtabmap_localization"),
-                relocalization_diagnostics=_cfg_str_alias("NUWAX_BACKEND_RELOCALIZATION_DIAGNOSTICS", "NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "rtabmap_icp"),
+                database_asset_name=_cfg_str("NUWAX_RTABMAP_DATABASE_ASSET_NAME", "external_slam_nav2_state.db"),
+                pcd_asset_name=_cfg_str("NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"),
+                occupancy_layer=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"),
+                costmap_layer=_cfg_str("NUWAX_RTABMAP_COSTMAP_LAYER", "nav2_global_costmap"),
+                traversability_layer=_cfg_str("NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"),
+                localization_status=_cfg_str("NUWAX_RTABMAP_LOCALIZATION_STATUS", "rtabmap_localization"),
+                relocalization_diagnostics=_cfg_str("NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "rtabmap_icp"),
             ),
         ),
         nav2=Nav2Config(
-            mode=_cfg_str("NUWAX_NAV2_MODE", "external"),
             action_name=_cfg_str("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
             launch_package=_cfg_str("NUWAX_NAV2_LAUNCH_PACKAGE", "nav2_bringup"),
             launch_file=_cfg_str("NUWAX_NAV2_LAUNCH_FILE", "navigation_launch.py"),
@@ -1102,9 +906,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
         robot=robot,
         dds=dds,
         low_level=low_level,
-        tts=tts_player,
-        doubao=doubao,
-        log_tts=log_tts,
         volume=volume,
         perception=perception,
     )

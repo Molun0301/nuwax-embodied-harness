@@ -552,7 +552,6 @@ class Nav2ActionNavigationProvider:
     def get_nav2_status(self) -> Dict[str, object]:
         readiness = self._readiness()
         return {
-            "mode": self.runtime._nav2_mode(),
             "phase": "ready" if readiness.ready else "blocked",
             "message": readiness.message,
             "action_name": self.runtime.config.nav2.action_name,
@@ -561,9 +560,6 @@ class Nav2ActionNavigationProvider:
             "global_costmap_topic": self.runtime.config.nav2.global_costmap_topic,
             "local_costmap_topic": self.runtime.config.nav2.local_costmap_topic,
             "costmap_source": self.runtime.config.nav2.costmap_source,
-            "platform_grid_removed": True,
-            "grid_navigation_backend": None,
-            "grid_navigation_is_nav2": False,
             "action_client_connected": readiness.action_server_ready,
             "lifecycle_ready": self._lifecycle_ready(readiness.lifecycle),
             "ready": readiness.ready,
@@ -583,8 +579,6 @@ class Nav2ActionNavigationProvider:
             "navigation_backend_policy": self.runtime._clone_metadata(policy),
             "active_navigation_backend": policy.get("active_backend_provider"),
             "nav2_action_active": bool(policy.get("nav2_action_active")),
-            "platform_grid_active": bool(policy.get("platform_grid_active")),
-            "platform_grid_removed": bool(policy.get("platform_grid_removed")),
         }
 
     def _readiness(self) -> _Nav2Readiness:

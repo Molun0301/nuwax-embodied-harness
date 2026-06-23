@@ -532,15 +532,8 @@ def _pointcloud_points(pointcloud: Any) -> List[Dict[str, float]]:
 
 def _resolve_debug_log_path(runtime: GatewayRuntime) -> Optional[Path]:
     configured = Path(str(runtime.config.logging.log_file)).expanduser().resolve(strict=False)
-    candidates = [configured]
-    tts_path = str(getattr(runtime.config.log_tts, "log_path", "") or "").strip()
-    if tts_path:
-        tts_candidate = Path(tts_path).expanduser().resolve(strict=False)
-        if tts_candidate != configured:
-            candidates.append(tts_candidate)
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            return candidate
+    if configured.exists() and configured.is_file():
+        return configured
     return configured if configured.parent.exists() else None
 
 

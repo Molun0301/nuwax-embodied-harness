@@ -316,11 +316,10 @@ class MapWorkspaceService:
                 "checkpoint_ready": snapshot.metadata.get("checkpoint_ready"),
                 "backend_session_id": snapshot.metadata.get("backend_session_id") or snapshot.metadata.get("rtabmap_session_id") or snapshot.metadata.get("session_id"),
                 "backend_run_id": snapshot.metadata.get("backend_run_id") or snapshot.metadata.get("rtabmap_run_id") or snapshot.metadata.get("run_id"),
-                "backend_state_path": snapshot.metadata.get("backend_state_path") or snapshot.metadata.get("rtabmap_database_path") or snapshot.metadata.get("rtabmap_db_path"),
+                "rtabmap_database_path": snapshot.metadata.get("rtabmap_database_path") or snapshot.metadata.get("rtabmap_db_path"),
                 # 老消费方继续兼容：保留 rtabmap_* 别名。
                 "rtabmap_session_id": snapshot.metadata.get("backend_session_id") or snapshot.metadata.get("rtabmap_session_id") or snapshot.metadata.get("session_id"),
                 "rtabmap_run_id": snapshot.metadata.get("backend_run_id") or snapshot.metadata.get("rtabmap_run_id") or snapshot.metadata.get("run_id"),
-                "rtabmap_database_path": snapshot.metadata.get("backend_state_path") or snapshot.metadata.get("rtabmap_database_path") or snapshot.metadata.get("rtabmap_db_path"),
                 "update_sequence": snapshot.metadata.get("update_sequence"),
                 "content_revision": snapshot.metadata.get("content_revision"),
                 "seed_map_version_id": snapshot.metadata.get("seed_map_version_id"),

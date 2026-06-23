@@ -76,7 +76,6 @@ ROBOT_DEVICE_CAPABILITIES = frozenset(
         "set_obstacle_avoidance",
         "get_volume",
         "set_volume",
-        "speak_text",
     }
 )
 

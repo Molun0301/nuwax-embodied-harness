@@ -321,25 +321,8 @@ def _render_env_from_template(template_path: Path, overrides: Mapping[str, str])
     template = _read_text(template_path)
     lines: List[str] = []
     seen: set[str] = set()
-    strip_go2_geometry_notes = (
-        overrides.get("NUWAX_GEOMETRY_STACK") == "disabled"
-        and overrides.get("NUWAX_GEOMETRY_EXTERNAL_SCRIPT") == ""
-    )
-    skipping_go2_geometry_note = False
     for raw_line in template.splitlines():
         stripped = raw_line.strip()
-        if strip_go2_geometry_notes:
-            lowered = raw_line.lower()
-            if stripped.startswith("# external_slam_nav2 默认外部 SLAM/Nav2 栈说明"):
-                skipping_go2_geometry_note = True
-                continue
-            if skipping_go2_geometry_note:
-                if not stripped:
-                    skipping_go2_geometry_note = False
-                    lines.append(raw_line)
-                continue
-            if "go2slam" in lowered or "start_go2_slam_nav2.sh" in lowered or "start_rtabmap_sidecar" in lowered:
-                continue
         if not stripped or stripped.startswith("#") or "=" not in raw_line:
             lines.append(raw_line)
             continue
@@ -703,7 +686,6 @@ class BootstrapPlanner:
             "NUWAX_GEOMETRY_ENABLED": _bool_text(go2_geometry_enabled),
             "NUWAX_GEOMETRY_REQUIRE_ROS2": _bool_text(go2_geometry_enabled),
             "NUWAX_ROS_SETUP_SCRIPT": str(ros_setup) if ros_setup is not None else "",
-            "NUWAX_GEOMETRY_STACK": "disabled",
             "NUWAX_GEOMETRY_SETUP_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash"),
             "NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR": "",
             "NUWAX_GEOMETRY_ODOM_TOPIC": "",
@@ -718,7 +700,6 @@ class BootstrapPlanner:
             "NUWAX_GEOMETRY_ODOM_FRAME": "",
             "NUWAX_GEOMETRY_BASE_FRAME": "",
             "NUWAX_GEOMETRY_LIDAR_FRAME": "",
-            "NUWAX_NAV2_MODE": "disabled",
             "NUWAX_NAV2_ACTION_NAME": "",
             "NUWAX_NAV2_LAUNCH_PACKAGE": "",
             "NUWAX_NAV2_LAUNCH_FILE": "",
@@ -742,7 +723,6 @@ class BootstrapPlanner:
         if self.selected_robot == "go2" and self.geometry_enabled:
             values.update(
                 {
-                    "NUWAX_GEOMETRY_STACK": "external_slam_nav2",
                     "NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR": "/usr/local/lib",
                     "NUWAX_GEOMETRY_ODOM_TOPIC": "/odom",
                     "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS": "/uslam/localization/odom,/lio_sam_ros2/mapping/odometry,/odom_lio",
@@ -761,11 +741,10 @@ class BootstrapPlanner:
                     "NUWAX_RTABMAP_OCCUPANCY_PROJECTION": "projected_occupancy",
                     "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "start_rtabmap_sidecar.sh"),
                     "NUWAX_GEOMETRY_EXTERNAL_ARGS": "",
-                    "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "rtabmap_nav2",
-                    "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "rtabmap_nav2.log",
+                    "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "external_slam_nav2",
+                    "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "external_slam_nav2.log",
                     "NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED": "false",
                     "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED": "false",
-                    "NUWAX_NAV2_MODE": "external",
                     "NUWAX_NAV2_ACTION_NAME": "/navigate_to_pose",
                     "NUWAX_NAV2_LAUNCH_PACKAGE": "nav2_bringup",
                     "NUWAX_NAV2_LAUNCH_FILE": "navigation_launch.py",

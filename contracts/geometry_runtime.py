@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 
+GEOMETRY_STACK_NAME = "external_slam_nav2"
+NAV2_PROVIDER_NAME = "nav2_action_navigation"
+
+
 def build_default_geometry_setup_script() -> str:
     """返回当前仓库内默认几何侧车 setup 脚本路径。"""
 
@@ -134,11 +138,7 @@ class RtabmapOutputConfig:
 
 @dataclass
 class RtabmapConfig:
-    """SLAM 后端状态侧车配置（当前默认后端为 RTAB-Map，保留 slam_toolbox 兼容路径）。
-
-    类已重命名为 ``BackendStateConfig``；``RtabmapConfig`` 保留作为兼容 alias，
-    旧名仍然可用但应在后续治理任务中切换到新名。
-    """
+    """RTAB-Map 状态与输出配置。"""
 
     profile_name: str = "external_slam_nav2"
     profile_enabled: bool = True
@@ -159,9 +159,8 @@ class RtabmapConfig:
 
 @dataclass
 class Nav2Config:
-    """Nav2 侧车配置。"""
+    """Nav2 action provider 配置。"""
 
-    mode: str = "external"
     action_name: str = "/navigate_to_pose"
     launch_package: str = "nav2_bringup"
     launch_file: str = "navigation_launch.py"
@@ -197,7 +196,7 @@ class PlatformGeometryConfig:
     """平台几何引擎统一配置。"""
 
     enabled: bool = True
-    stack: str = "external_slam_nav2"
+    stack: str = GEOMETRY_STACK_NAME
     require_ros2: bool = True
     setup_script: str = field(default_factory=build_default_geometry_setup_script)
     cyclonedds_lib_dir: str = ""
@@ -222,7 +221,7 @@ class PlatformGeometryConfig:
                 "name": self.rtabmap.profile_name,
                 "enabled": self.rtabmap.profile_enabled,
                 "default": self.rtabmap.default_profile,
-                "route": self.nav2.mode or "external",
+                "provider": NAV2_PROVIDER_NAME,
                 "stack": self.stack,
             },
             "topics": {
@@ -347,7 +346,7 @@ class PlatformGeometryConfig:
                 "launch_file": self.nav2.launch_file,
                 "global_costmap_topic": self.nav2.global_costmap_topic,
                 "local_costmap_topic": self.nav2.local_costmap_topic,
-                "mode": self.nav2.mode,
+                "provider": NAV2_PROVIDER_NAME,
                 "costmap_source": self.nav2.costmap_source,
                 "map_yaml": self.nav2.map_yaml or None,
                 "params_file": self.nav2.params_file or None,
@@ -355,10 +354,3 @@ class PlatformGeometryConfig:
                 "autostart": self.nav2.autostart,
             },
         }
-
-
-# 类重命名兼容 alias：
-# - 新名 BackendStateConfig 更准确反映”SLAM 后端状态”职责（当前默认后端是 RTAB-Map）。
-# - 老名 RtabmapConfig 仍然指向同一个类对象，外部 import 不破坏。
-# - 后续治理任务里再彻底切换到新名，这里暂不主动迁移调用方。
-BackendStateConfig = RtabmapConfig

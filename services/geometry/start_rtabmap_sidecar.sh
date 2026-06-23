@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${NUWAX_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
-# 从 .env 读取 frame 和后端配置（不读取 topic 变量——sidecar 运行在 CycloneDDS 域，
+# 从 .env 读取 frame 和 RTAB-Map/Nav2 配置（不读取 topic 变量——脚本运行在 CycloneDDS 域，
 # 使用平台桥接后的 topic，与 .env 中 FastRTPS 域的 topic 不同）
 if [[ -f "${REPO_ROOT}/.env" ]]; then
   while IFS='=' read -r key value; do
@@ -32,7 +32,6 @@ IMU_FRAME="${NUWAX_GEOMETRY_IMU_FRAME:-utlidar_imu}"
 RTABMAP_LAUNCH_PACKAGE="${NUWAX_RTABMAP_LAUNCH_PACKAGE:-rtabmap_launch}"
 RTABMAP_LAUNCH_FILE="${NUWAX_RTABMAP_LAUNCH_FILE:-rtabmap.launch.py}"
 RTABMAP_DB_PATH="${NUWAX_RTABMAP_DATABASE_PATH:-${DB_ROOT}/live_rtabmap.db}"
-NAV2_MODE="${NUWAX_NAV2_MODE:-sidecar}"
 NAV2_LAUNCH_PACKAGE="${NUWAX_NAV2_LAUNCH_PACKAGE:-nav2_bringup}"
 NAV2_LAUNCH_FILE="${NUWAX_NAV2_LAUNCH_FILE:-navigation_launch.py}"
 NAV2_MAP_YAML="${NUWAX_NAV2_MAP_YAML:-}"
@@ -110,22 +109,15 @@ start_background "rtabmap_live.log" "nuwax-rtabmap-live" \
   database_path:="${RTABMAP_DB_PATH}" \
   args:='--delete_db_on_start --RGBD/CreateOccupancyGrid true --Grid/FromDepth false --Grid/RangeMax 8.0 --Grid/CellSize 0.05 --Grid/3D true --Grid/RayTracing true --Grid/FlatObstacleDetected true --Grid/MaxGroundHeight 0.35 --Grid/MaxObstacleHeight 1.8 --Grid/NormalsSegmentation false --Grid/MinClusterSize 5'
 
-case "${NAV2_MODE,,}" in
-  sidecar|managed|launch|internal)
-    NAV2_ARGS=(bash "${REPO_ROOT}/services/geometry/launch_ros2_stack.sh" ros2 launch "${NAV2_LAUNCH_PACKAGE}" "${NAV2_LAUNCH_FILE}" "use_sim_time:=${NAV2_USE_SIM_TIME}" "autostart:=${NAV2_AUTOSTART}")
-    if [[ -n "${NAV2_MAP_YAML}" ]]; then
-      NAV2_ARGS+=("map:=${NAV2_MAP_YAML}")
-    fi
-    if [[ -n "${NAV2_PARAMS_FILE}" ]]; then
-      NAV2_ARGS+=("params_file:=${NAV2_PARAMS_FILE}")
-    fi
-    start_background "nav2.log" "nuwax-nav2" "${NAV2_ARGS[@]}"
-    ;;
-  external|external_action|action|client|pending|disabled|off|none|"")
-    ;;
-  *)
-    printf '未知 NUWAX_NAV2_MODE=%s，Nav2 未启动。\n' "${NAV2_MODE}" >&2
-    ;;
-esac
+if [[ "${NAV2_AUTOSTART,,}" == "1" || "${NAV2_AUTOSTART,,}" == "true" || "${NAV2_AUTOSTART,,}" == "yes" || "${NAV2_AUTOSTART,,}" == "on" ]]; then
+  NAV2_ARGS=(bash "${REPO_ROOT}/services/geometry/launch_ros2_stack.sh" ros2 launch "${NAV2_LAUNCH_PACKAGE}" "${NAV2_LAUNCH_FILE}" "use_sim_time:=${NAV2_USE_SIM_TIME}" "autostart:=true")
+  if [[ -n "${NAV2_MAP_YAML}" ]]; then
+    NAV2_ARGS+=("map:=${NAV2_MAP_YAML}")
+  fi
+  if [[ -n "${NAV2_PARAMS_FILE}" ]]; then
+    NAV2_ARGS+=("params_file:=${NAV2_PARAMS_FILE}")
+  fi
+  start_background "nav2.log" "nuwax-nav2" "${NAV2_ARGS[@]}"
+fi
 
 wait "${PIDS[@]}"

@@ -9,6 +9,7 @@ from services.perception.base import (
     DisabledSegmentationBackend,
 )
 from services.perception.detectors import DetectorPipeline, MetadataDrivenDetectorBackend, YoloWorldDetectorBackend
+from services.perception.postprocess import ClassAgnosticNmsPostProcessor
 from services.perception.scene import HybridSceneDescriptionBackend, OpenAICompatibleVisionSceneDescriptionBackend, SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend, ByteTrackTrackerBackend
 
@@ -134,7 +135,14 @@ def build_platform_perception_components(config: "NuwaxRobotBridgeConfig") -> Di
 
     return {
         "pipeline_name": "platform_perception_pipeline",
-        "detector_pipeline": DetectorPipeline(tuple(detector_backends), default_backend_name=default_detector_name),
+        "detector_pipeline": DetectorPipeline(
+            tuple(detector_backends),
+            default_backend_name=default_detector_name,
+            post_processor=ClassAgnosticNmsPostProcessor(
+                iou_threshold=config.perception.postprocess.iou_threshold,
+                enabled=config.perception.postprocess.enabled,
+            ),
+        ),
         "tracker_backend": tracker_backend,
         "scene_description_backend": scene_backend,
         "segmentation_backend": segmentation_backend,

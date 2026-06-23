@@ -491,6 +491,20 @@ class DeferredProjectionConfig:
 
 
 @dataclass
+class PerceptionPostProcessConfig:
+    """检测后处理配置：类无关 NMS（杠杆二，见方案文档第 6.2 节）。
+
+    在 detector 之后、tracker 之前，对单帧检测做类无关 NMS：忽略标签，凡 bbox IoU
+    高于阈值的重叠框只保留置信度最高的一个，解决「同一物体被同时框成多个重叠标签」
+    导致的重复识别。纯单帧无状态，下游 tracker / 关联 / 记忆无需改动。
+    """
+
+    enabled: bool = True
+    # 偏高（默认 0.8）：只合并几乎完全重合的框，空间分离的同类物体不会被误并。
+    iou_threshold: float = 0.8
+
+
+@dataclass
 class PerceptionConfig:
     """统一视觉感知配置。"""
 
@@ -503,6 +517,7 @@ class PerceptionConfig:
     segmentation: PerceptionSegmentationConfig = field(default_factory=PerceptionSegmentationConfig)
     stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
     deferred_projection: DeferredProjectionConfig = field(default_factory=DeferredProjectionConfig)
+    postprocess: PerceptionPostProcessConfig = field(default_factory=lambda: PerceptionPostProcessConfig())
 
 
 @dataclass
@@ -835,6 +850,13 @@ def load_config() -> NuwaxRobotBridgeConfig:
             burst_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_BURST_INTERVAL_SEC", 0.08)),
         ),
         deferred_projection=_build_deferred_projection_config(),
+        postprocess=PerceptionPostProcessConfig(
+            enabled=_cfg_bool("NUWAX_PERCEPTION_POSTPROCESS_NMS_ENABLED", True),
+            iou_threshold=max(
+                0.0,
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_POSTPROCESS_NMS_IOU", 0.8)),
+            ),
+        ),
     )
 
     external_input_bridge_enabled = _cfg_bool("NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED", False)

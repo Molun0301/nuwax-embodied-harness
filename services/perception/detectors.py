@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import BoundingBox2D, Detection2D, Detection3D, SegmentationMask2D, SegmentationQuality
@@ -10,6 +10,9 @@ from core.errors import GatewayError
 from services.model_providers import resolve_detection_provider_spec
 from services.perception.base import DetectionBundle, DetectorBackend, DetectorBackendSpec
 from services.perception.image_utils import decode_image_frame_to_bgr
+
+if TYPE_CHECKING:
+    from services.perception.postprocess import ClassAgnosticNmsPostProcessor
 
 
 DETECTOR_LOGGER = logging.getLogger("nuwax_robot_bridge.perception.detectors")
@@ -1057,6 +1060,7 @@ class DetectorPipeline:
         backends: Tuple[DetectorBackend, ...],
         *,
         default_backend_name: Optional[str] = None,
+        post_processor: Optional["ClassAgnosticNmsPostProcessor"] = None,
     ) -> None:
         if not backends:
             raise ValueError("DetectorPipeline 至少需要一个检测后端。")
@@ -1064,6 +1068,8 @@ class DetectorPipeline:
         self._default_backend_name = default_backend_name or backends[0].spec.name
         if self._default_backend_name not in self._backends:
             raise ValueError("默认检测后端未注册。")
+        # 类无关 NMS 后处理（杠杆二）；None 时 detect() 原样透传，行为与改动前一致。
+        self._post_processor = post_processor
 
     def list_backends(self) -> Tuple[DetectorBackendSpec, ...]:
         """返回当前所有已注册检测后端规范。"""
@@ -1090,4 +1096,11 @@ class DetectorPipeline:
         if backend is None:
             raise GatewayError(f"未注册检测后端：{resolved_backend_name}")
         bundle = backend.detect(image_frame, camera_info)
+        if self._post_processor is not None and self._post_processor.enabled:
+            kept, nms_stats = self._post_processor.process(bundle.detections_2d)
+            bundle = DetectionBundle(
+                detections_2d=kept,
+                detections_3d=bundle.detections_3d,
+                metadata={**dict(bundle.metadata or {}), "postprocess": nms_stats},
+            )
         return bundle, backend.spec

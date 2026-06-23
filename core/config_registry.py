@@ -239,7 +239,7 @@ _REGULAR_KEYS = frozenset({
 _CHOICES: Dict[str, Tuple[str, ...]] = {
     "NUWAX_LOG_LEVEL": ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
     "NUWAX_GEOMETRY_STACK": ("external_slam_nav2", "rtabmap", "none"),
-    "NUWAX_NAV2_MODE": ("nav_only", "slam", "localization", "disabled"),
+    "NUWAX_NAV2_MODE": ("external", "nav_only", "slam", "localization", "disabled"),
 }
 
 

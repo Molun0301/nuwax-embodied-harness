@@ -13,11 +13,11 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-import time
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import fcntl  # POSIX 文件锁；Windows 无此模块时降级为无锁。
@@ -32,6 +32,7 @@ _CORE_ENV = _REPO_ROOT / ".env"
 _GO2_ENV = _REPO_ROOT / "drivers" / "go2" / "data_plane.env"
 
 _SENSITIVE_MASK = "********"
+_EFFECTIVE_VALUES_LOCK = threading.RLock()
 
 
 def _target_path(target_file: str) -> Path:
@@ -78,26 +79,157 @@ def _is_set_in_file(key: str, target_file: str) -> bool:
     return key in _read_env_values(_target_path(target_file))
 
 
+def _format_config_value(value: Any, typ: str) -> str:
+    """把 settings 返回的结构化值转换成 env 文件可保存的字符串。"""
+
+    if value is None:
+        return ""
+    if typ == "bool" or isinstance(value, bool):
+        return "true" if bool(value) else "false"
+    if typ == "csv" or isinstance(value, (tuple, list)):
+        return ",".join(str(item) for item in value)
+    return str(value)
+
+
+def _collect_effective_values(core_vals: Dict[str, str], go2_vals: Dict[str, str]) -> Dict[str, str]:
+    """收集每个配置 key 的实际生效值（显式配置优先，否则 settings 默认值）。
+
+    配置页不能只展示 .env 中已有键；settings.py / drivers/go2/settings.py 中有默认值的键
+    也需要显示并允许保存回填。这里通过临时包装 _cfg_* 读取函数，复用运行时配置解析逻辑，
+    避免手工再维护一份默认值表。
+    """
+
+    with _EFFECTIVE_VALUES_LOCK:
+        return _collect_effective_values_locked(core_vals, go2_vals)
+
+
+def _collect_effective_values_locked(core_vals: Dict[str, str], go2_vals: Dict[str, str]) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+
+    def record(key: str, typ: str, value: Any) -> None:
+        if key in R.all_keys():
+            values[key] = _format_config_value(value, typ)
+
+    def patch_cfg_readers(module: Any) -> Callable[[], None]:
+        originals: Dict[str, Any] = {}
+
+        def set_attr(name: str, value: Any) -> None:
+            originals[name] = getattr(module, name)
+            setattr(module, name, value)
+
+        def wrap(name: str, typ: str) -> Callable[..., Any]:
+            original = getattr(module, name)
+
+            def _wrapped(key: str, *args: Any, **kwargs: Any) -> Any:
+                value = original(key, *args, **kwargs)
+                record(key, typ, value)
+                return value
+
+            return _wrapped
+
+        for fn, typ in (
+            ("_cfg_str", "str"),
+            ("_cfg_int", "int"),
+            ("_cfg_float", "float"),
+            ("_cfg_bool", "bool"),
+            ("_cfg_csv", "csv"),
+        ):
+            if hasattr(module, fn):
+                set_attr(fn, wrap(fn, typ))
+
+        if hasattr(module, "_cfg_str_alias"):
+            original = getattr(module, "_cfg_str_alias")
+
+            def _wrapped_str_alias(preferred_name: str, legacy_name: str, *args: Any, **kwargs: Any) -> Any:
+                value = original(preferred_name, legacy_name, *args, **kwargs)
+                record(preferred_name, "str", value)
+                return value
+
+            set_attr("_cfg_str_alias", _wrapped_str_alias)
+
+        if hasattr(module, "_cfg_bool_alias"):
+            original = getattr(module, "_cfg_bool_alias")
+
+            def _wrapped_bool_alias(preferred_name: str, legacy_name: str, *args: Any, **kwargs: Any) -> Any:
+                value = original(preferred_name, legacy_name, *args, **kwargs)
+                record(preferred_name, "bool", value)
+                return value
+
+            set_attr("_cfg_bool_alias", _wrapped_bool_alias)
+
+        if hasattr(module, "_prefer_platform_str"):
+            original = getattr(module, "_prefer_platform_str")
+
+            def _wrapped_prefer_platform_str(platform_value: str, legacy_name: str, default: str) -> str:
+                value = original(platform_value, legacy_name, default)
+                record(legacy_name, "str", value)
+                return value
+
+            set_attr("_prefer_platform_str", _wrapped_prefer_platform_str)
+
+        def restore() -> None:
+            for name, original in originals.items():
+                setattr(module, name, original)
+
+        return restore
+
+    platform_geometry = None
+    try:
+        from core import settings as core_settings
+
+        original_core_file_values = getattr(core_settings, "_FILE_VALUES", {})
+        restore_core = patch_cfg_readers(core_settings)
+        core_settings._FILE_VALUES = dict(core_vals)
+        try:
+            cfg = core_settings.load_config()
+            platform_geometry = cfg.geometry
+        finally:
+            core_settings._FILE_VALUES = original_core_file_values
+            restore_core()
+    except Exception as exc:  # pragma: no cover - 配置页不能因默认值辅助采集而整体不可用
+        _IO_LOGGER.warning("收集 core settings 生效默认值失败: %s", exc)
+
+    try:
+        from drivers.go2 import settings as go2_settings
+
+        original_go2_file_values = getattr(go2_settings, "_FILE_VALUES", {})
+        restore_go2 = patch_cfg_readers(go2_settings)
+        go2_settings._FILE_VALUES = dict(go2_vals)
+        try:
+            go2_settings.load_go2_data_plane_config(platform_geometry)
+        finally:
+            go2_settings._FILE_VALUES = original_go2_file_values
+            restore_go2()
+    except Exception as exc:  # pragma: no cover
+        _IO_LOGGER.warning("收集 Go2 settings 生效默认值失败: %s", exc)
+
+    return values
+
+
 def build_schema() -> Dict[str, object]:
     """构建前端 schema：按板块分组，含当前值（敏感脱敏）、默认值、常规/高级标记。"""
 
     core_vals = _read_env_values(_CORE_ENV)
     go2_vals = _read_env_values(_GO2_ENV)
+    effective_vals = _collect_effective_values(core_vals, go2_vals)
 
-    def current(key: str, target_file: str) -> str:
+    def explicit_value(key: str, target_file: str) -> Optional[str]:
         if key in os.environ:
             return os.environ[key]
         src = go2_vals if target_file == R.TARGET_GO2 else core_vals
-        return src.get(key, "")
+        if key in src:
+            return src[key]
+        return None
 
     sections: Dict[str, Dict[str, object]] = {}
     for sid, title in R.SECTIONS:
         sections[sid] = {"section_id": sid, "section_title": title, "fields": []}
 
     for f in R.build_registry():
-        raw_value = current(f.key, f.target_file)
-        has_value = bool(raw_value) or _is_set_in_file(f.key, f.target_file)
-        display_value = _SENSITIVE_MASK if (f.sensitive and raw_value) else raw_value
+        raw_value = explicit_value(f.key, f.target_file)
+        value_source = "explicit" if raw_value is not None else "default"
+        effective_value = raw_value if raw_value is not None else effective_vals.get(f.key, "")
+        display_value = _SENSITIVE_MASK if (f.sensitive and effective_value) else effective_value
         sections[f.section_id]["fields"].append({
             "key": f.key,
             "zh_name": f.zh_name,
@@ -110,14 +242,15 @@ def build_schema() -> Dict[str, object]:
             "alias_of": f.alias_of,
             "choices": list(f.choices),
             "value": display_value,
-            "is_set": has_value,
+            "value_source": value_source,
+            "is_set": raw_value is not None,
         })
 
     ordered = [sections[sid] for sid, _t in R.SECTIONS if sections[sid]["fields"]]
     return {
         "sections": ordered,
         "field_count": len(R.build_registry()),
-        "effect_note": "保存后写入 .env，需重启网关生效（非热重载）。",
+        "effect_note": "保存后写入 .env，需重启网关生效；保存时会补齐缺失的默认配置项。",
     }
 
 
@@ -203,20 +336,18 @@ def _target_lock(path: Path):
 
 
 def _atomic_write(path: Path, content: str) -> str:
-    """原子写：临时文件 + os.replace；写前备份原文件为带时间戳的 .bak.<ts>。
+    """原子写：临时文件 + os.replace；写前只保留一个固定 .bak 备份。
 
-    返回备份路径（无原文件则空串）。同时维护一个固定 .bak 指向最近备份，便于人工回滚。
+    返回备份路径（无原文件则空串）。固定 .bak 每次覆盖，避免反复点击保存产生大量
+    .bak.<timestamp> 文件。
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = ""
     if path.exists():
-        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-        backup = f"{path}.bak.{ts}"
+        backup = str(path) + ".bak"
         original = path.read_text(encoding="utf-8")
         Path(backup).write_text(original, encoding="utf-8")
-        # 固定 .bak 始终指向最近一次备份内容（覆盖），时间戳副本保留历史。
-        Path(str(path) + ".bak").write_text(original, encoding="utf-8")
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".cfg_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -266,11 +397,16 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
         with _target_lock(path):
             original = path.read_text(encoding="utf-8") if path.exists() else ""
             new_text = _apply_updates_to_text(original, kv)
-            backups[target_file] = _atomic_write(path, new_text)
-            # 回读校验（仍在锁内，避免并发写者插入）
-            readback = _read_env_values(path)
+            if new_text == original:
+                backups[target_file] = ""
+                readback = _read_env_values(path)
+            else:
+                backups[target_file] = _atomic_write(path, new_text)
+                # 回读校验（仍在锁内，避免并发写者插入）
+                readback = _read_env_values(path)
         confirmed = [k for k, v in kv.items() if readback.get(k) == v]
-        written[target_file] = sorted(confirmed)
+        if backups.get(target_file) or new_text != original:
+            written[target_file] = sorted(confirmed)
         missing = set(kv) - set(confirmed)
         if missing:
             for k in missing:

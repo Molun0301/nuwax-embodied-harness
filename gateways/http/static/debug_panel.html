@@ -4513,13 +4513,27 @@ button{font-family:inherit;cursor:pointer}
       function updateConfigDirty() {
         const el = document.getElementById("configDirty");
         const n = configState.dirty.size;
-        el.textContent = n ? ("待保存改动：" + n + " 项") : "无未保存改动。";
+        el.textContent = n ? ("待保存改动：" + n + " 项") : "无未保存改动；点击保存会补齐缺失默认配置。";
+      }
+      function collectConfigSaveUpdates() {
+        const updates = {};
+        const schema = configState.lastSchema || {};
+        for (const section of (schema.sections || [])) {
+          for (const f of (section.fields || [])) {
+            if (configState.dirty.has(f.key)) {
+              updates[f.key] = configState.dirty.get(f.key);
+            } else if (!f.sensitive) {
+              updates[f.key] = f.value == null ? "" : String(f.value);
+            }
+          }
+        }
+        return updates;
       }
       async function saveConfig() {
-        if (!configState.dirty.size) { updateConfigDirty(); return; }
+        if (!configState.lastSchema) { updateConfigDirty(); return; }
         const status = document.getElementById("configStatus");
-        const updates = {};
-        for (const [k, v] of configState.dirty.entries()) updates[k] = v;
+        const updates = collectConfigSaveUpdates();
+        if (!Object.keys(updates).length) { updateConfigDirty(); return; }
         try {
           setPill(status, "stale", "保存中");
           const resp = await fetch(withAccessToken("/api/config/save"), {
@@ -4546,7 +4560,9 @@ button{font-family:inherit;cursor:pointer}
             note.textContent = "部分被拒绝（已标红）：" + rejectedKeys.join(", ");
             setPill(status, "error", "配置");
           } else {
-            note.textContent = "已保存，重启网关后生效。";
+            const written = result.written || {};
+            const writtenCount = Object.values(written).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
+            note.textContent = writtenCount ? "已保存并补齐配置，重启网关后生效。" : "配置已是最新，无需写入。";
             setPill(status, "available", "配置");
           }
           await loadConfigSchema();

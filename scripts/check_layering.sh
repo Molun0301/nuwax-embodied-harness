@@ -39,18 +39,18 @@ echo "== 分层依赖治理检查（R1-R9）=="
 # R1: contracts 不得 import 任何顶层包（contracts 为最底层，仅允许 stdlib/第三方）。
 scan "R1" "contracts 不得 import 上层包" \
     "contracts" \
-    "^\s*(from|import) (gateways|services|adapters|providers|drivers|core|tts|skills)(\.|\s|$)"
+    "^\s*(from|import) (gateways|services|adapters|providers|drivers|core|skills)(\.|\s|$)"
 
 # R2: providers/adapters/core 只准 import contracts（不得 import 彼此之上或同级业务层）。
 scan "R2a" "providers 只准依赖 contracts" \
     "providers" \
-    "^\s*(from|import) (gateways|services|adapters|drivers|tts|skills)(\.|\s|$)"
+    "^\s*(from|import) (gateways|services|adapters|drivers|skills)(\.|\s|$)"
 scan "R2b" "adapters 只准依赖 contracts" \
     "adapters" \
-    "^\s*(from|import) (gateways|services|providers|drivers|core|tts|skills)(\.|\s|$)"
+    "^\s*(from|import) (gateways|services|providers|drivers|core|skills)(\.|\s|$)"
 scan "R2c" "core 只准依赖 contracts" \
     "core" \
-    "^\s*(from|import) (gateways|services|adapters|providers|drivers|tts|skills)(\.|\s|$)"
+    "^\s*(from|import) (gateways|services|adapters|providers|drivers|skills)(\.|\s|$)"
 
 # R3: services 禁止 import gateways、drivers（01-P0-1/P0-2/P0-3 核心解环成果）。
 scan "R3" "services 禁止 import gateways/drivers" \

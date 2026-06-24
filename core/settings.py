@@ -1057,7 +1057,6 @@ _SUBSYSTEM_LOGGERS = {
     "geometry": "nuwax_robot_bridge.geometry",
     "navigation": "nuwax_robot_bridge.navigation",
     "perception": "nuwax_robot_bridge.perception",
-    "tts": "nuwax_robot_bridge.tts",
     "gateway": "nuwax_robot_bridge.gateway",
     "runtime": "nuwax_robot_bridge.runtime",
     "ros2": "nuwax_robot_bridge.ros2",

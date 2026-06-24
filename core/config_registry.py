@@ -189,7 +189,7 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("go2_video", ("GO2_VIDEO_STREAM",)),
     ("go2_official", ("GO2_OFFICIAL",)),
     ("go2_input", ("GO2_DATA_PLANE", "GO2_DIRECT_DDS", "GO2_CYCLONEDDS", "GO2_DDS")),
-    ("robot", ("NUWAX_ACTIVE_ROBOT", "ROBOT_IP", "GO2_SDK", "GO2_LOW_LEVEL", "GO2_NETWORK", "GO2_")),
+    ("robot", ("NUWAX_ACTIVE_ROBOT", "GO2_SDK", "GO2_LOW_LEVEL", "GO2_NETWORK", "GO2_")),
 )
 
 # 敏感键（脱敏不回显）。鉴权已移除，故仅余各类外部服务密钥/令牌。
@@ -206,7 +206,7 @@ _SENSITIVE_KEYS = frozenset({
 
 # 常规项（高频，默认展开）。来自实施计划 §二「常规项」列；其余一律高级（默认折叠）。
 _REGULAR_KEYS = frozenset({
-    "NUWAX_ACTIVE_ROBOT", "GO2_DDS_IFACE", "ROBOT_IP",
+    "NUWAX_ACTIVE_ROBOT", "GO2_DDS_IFACE",
     "NUWAX_GATEWAY_HOST", "NUWAX_GATEWAY_PORT",
     "NUWAX_GATEWAY_TELEMETRY_ENABLED", "NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC",
     "NUWAX_LOG_LEVEL",

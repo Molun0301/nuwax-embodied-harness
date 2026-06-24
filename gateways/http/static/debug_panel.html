@@ -912,6 +912,15 @@ button{font-family:inherit;cursor:pointer}
         return `${value}${suffix || ""}`;
       }
       function safeText(value) { return value === null || value === undefined || value === "" ? "--" : String(value); }
+      function compactLogValue(value) {
+        if (value === null || value === undefined || value === "" || value === "-") return "";
+        if (typeof value === "string") return value;
+        try {
+          return JSON.stringify(value);
+        } catch (_error) {
+          return String(value);
+        }
+      }
       function displayStatus(value) {
         const key = String(value === null || value === undefined || value === "" ? "missing" : value).toLowerCase();
         return STATUS_LABELS[key] || TASK_STATE_LABELS[key] || String(value);
@@ -3948,7 +3957,24 @@ button{font-family:inherit;cursor:pointer}
         const query = String(state.logSearch || "").trim().toLowerCase();
         const filtered = state.logs.filter((entry) => {
           const level = String(entry.level || "").toLowerCase();
-          const haystack = `${entry.timestamp_text || ""} ${entry.timestamp || ""} ${entry.level || ""} ${entry.source || ""} ${entry.message || ""} ${entry.display_message || ""} ${entry.event_type || ""} ${entry.runtime_event_type || ""} ${entry.payload_preview || ""} ${entry.metadata_preview || ""}`.toLowerCase();
+          const haystack = [
+            entry.timestamp_text,
+            entry.timestamp,
+            entry.level,
+            entry.source,
+            entry.message,
+            entry.display_message,
+            entry.runtime_message,
+            entry.event_type,
+            entry.runtime_event_type,
+            entry.request_id,
+            entry.task_id,
+            entry.capability_name,
+            entry.duration_ms,
+            compactLogValue(entry.payload_preview),
+            compactLogValue(entry.metadata_preview),
+            compactLogValue(entry.details_compact),
+          ].filter((value) => value !== null && value !== undefined && value !== "").join(" ").toLowerCase();
           if (normalizedLevel && level !== normalizedLevel && !(normalizedLevel === "warn" && level === "warning") && !(normalizedLevel === "warning" && level === "warn")) return false;
           if (query && !haystack.includes(query)) return false;
           return true;
@@ -3972,11 +3998,17 @@ button{font-family:inherit;cursor:pointer}
           if (baseMessage === "运行时事件" || entry.event_type || entry.runtime_event_type) {
             const eventName = entry.runtime_event_type || entry.event_type;
             if (eventName && !parts.includes(eventName)) parts.push(`事件 ${eventName}`);
-            if (entry.payload_preview) parts.push(`载荷 ${entry.payload_preview}`);
-            if (entry.metadata_preview) parts.push(`元数据 ${entry.metadata_preview}`);
           }
+          if (entry.capability_name) parts.push(`能力 ${entry.capability_name}`);
+          const durationNumber = Number(entry.duration_ms);
+          if (Number.isFinite(durationNumber)) parts.push(`耗时 ${fmt(durationNumber, " ms")}`);
+          if (entry.request_id) parts.push(`请求 ${entry.request_id}`);
+          const payloadPreview = compactLogValue(entry.payload_preview);
+          const metadataPreview = compactLogValue(entry.metadata_preview);
+          if (payloadPreview) parts.push(`载荷 ${payloadPreview}`);
+          if (metadataPreview) parts.push(`元数据 ${metadataPreview}`);
           message.textContent = parts.filter(Boolean).join(" · ");
-          if (entry.details_compact) message.title = JSON.stringify(entry.details_compact);
+          if (entry.details_compact) message.title = compactLogValue(entry.details_compact);
           line.append(meta, message);
           els.logs.appendChild(line);
         }
@@ -4217,6 +4249,8 @@ button{font-family:inherit;cursor:pointer}
       }
       function logEntryFromFrame(frame) {
         const payload = frame.payload || {};
+        const details = payload.details_compact || {};
+        const durationMs = payload.duration_ms ?? details.duration_ms;
         return {
           sequence: frame.sequence ?? frame.cursor,
           timestamp: payload.timestamp_text || payload.timestamp_iso || payload.timestamp_unix_ms || payload.timestamp_unix_sec || payload.log_timestamp || payload.timestamp || frame.timestamp,
@@ -4226,14 +4260,19 @@ button{font-family:inherit;cursor:pointer}
           timestamp_unix_ms: payload.timestamp_unix_ms,
           level: String(payload.severity || payload.level || frame.status || "info").toLowerCase(),
           source: payload.source || frame.source,
-          event_type: payload.event_type,
-          runtime_event_type: payload.runtime_event_type,
-          runtime_message: payload.runtime_message,
+          event_type: payload.event_type || payload.event || details.event,
+          runtime_event_type: payload.runtime_event_type || details.runtime_event_type,
+          runtime_message: payload.runtime_message || details.runtime_message,
           display_message: payload.display_message,
-          payload_preview: payload.payload_preview,
-          metadata_preview: payload.metadata_preview,
-          details_compact: payload.details_compact,
-          message: payload.message || payload.display_message || payload.runtime_message || payload.event_type || "runtime.event",
+          request_id: payload.request_id || details.request_id,
+          task_id: payload.task_id || details.task_id,
+          capability_name: payload.capability_name || details.capability_name,
+          duration_ms: durationMs,
+          error_category: payload.error_category || details.error_category,
+          payload_preview: payload.payload_preview ?? details.payload_preview,
+          metadata_preview: payload.metadata_preview ?? details.metadata_preview,
+          details_compact: details,
+          message: payload.message || payload.display_message || payload.runtime_message || payload.event_type || payload.event || details.event || "runtime.event",
         };
       }
       function updateLogFrame(frame) {

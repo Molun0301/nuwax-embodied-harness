@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover
 
 from core import config_registry as R
 
-_IO_LOGGER = logging.getLogger("nuwax.config_io")
+_IO_LOGGER = logging.getLogger("nuwax_robot_bridge.config_io")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CORE_ENV = _REPO_ROOT / ".env"
 _GO2_ENV = _REPO_ROOT / "drivers" / "go2" / "data_plane.env"
@@ -414,7 +414,6 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
         _IO_LOGGER.info("配置写回 %s: %d 项, 备份=%s", target_file, len(confirmed), backups[target_file] or "无")
 
     return SaveResult(written=written, skipped=skipped, rejected=rejected, backups=backups)
-
 
 
 

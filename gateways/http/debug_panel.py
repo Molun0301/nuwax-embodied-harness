@@ -39,6 +39,33 @@ from gateways.serialization import to_jsonable
 _DEBUG_PANEL_HTML_PATH = Path(__file__).resolve().parent / "static" / "debug_panel.html"
 
 _LOG_LINE_RE = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d{1,6})?) \[(?P<level>[A-Z]+)\] \[(?P<source>[^\]]+)\] (?P<message>.*)$")
+_LOG_EXTRA_KEY_RE = re.compile(r"(?:(?<=^)|(?<=\s))(?P<key>[A-Za-z_][A-Za-z0-9_.]*)=")
+_STRUCTURED_LOG_KEYS = frozenset(
+    {
+        "event",
+        "request_id",
+        "task_id",
+        "capability_name",
+        "method",
+        "path",
+        "status_code",
+        "duration_ms",
+        "error_category",
+        "category",
+        "runtime_event_type",
+        "runtime_message",
+        "payload_preview",
+        "metadata_preview",
+        "source",
+        "cursor",
+        "subject_id",
+        "severity",
+        "suppressed_count",
+        "rate_limit_window_sec",
+        "request_id_generated",
+        "request_id_replaced",
+    }
+)
 
 _STALE_THRESHOLDS_SEC = {
     "health": 3.0,
@@ -565,14 +592,141 @@ def _parse_log_line(raw_line: str, *, sequence: int) -> DebugLogEntry:
     if match:
         timestamp_text = match.group("timestamp")
         timestamp = _parse_log_timestamp(timestamp_text)
+        message, extra = _parse_log_message_extra(match.group("message"))
         return DebugLogEntry(
             sequence=sequence,
             timestamp=timestamp,
             level=match.group("level").lower(),
             source=match.group("source"),
-            message=match.group("message"),
+            message=message,
+            event_type=_optional_str(extra.get("event")),
+            runtime_event_type=_optional_str(extra.get("runtime_event_type")),
+            runtime_message=_optional_str(extra.get("runtime_message")),
+            display_message=_optional_str(extra.get("runtime_message")) or message,
+            request_id=_optional_str(extra.get("request_id")),
+            task_id=_optional_str(extra.get("task_id")),
+            capability_name=_optional_str(extra.get("capability_name")),
+            duration_ms=_optional_float(extra.get("duration_ms")),
+            error_category=_optional_str(extra.get("error_category")),
+            payload_preview=extra.get("payload_preview"),
+            metadata_preview=extra.get("metadata_preview"),
+            details_compact={key: value for key, value in extra.items() if value is not None and value != "-"},
+            suppressed_count=_optional_int(extra.get("suppressed_count")),
+            payload=extra,
         )
     return DebugLogEntry(sequence=sequence, timestamp=utc_now(), level="info", source="log_file", message=line)
+
+
+def _parse_log_message_extra(message: str) -> Tuple[str, Dict[str, Any]]:
+    """Conservatively parse ContextAwareFormatter key=value extras from a log message."""
+
+    for match in _LOG_EXTRA_KEY_RE.finditer(message):
+        key = match.group("key")
+        if key not in _STRUCTURED_LOG_KEYS:
+            continue
+        prefix = message[: match.start()].rstrip()
+        suffix = message[match.start() :].strip()
+        parsed = _parse_log_extra_tokens(suffix)
+        if parsed:
+            return prefix or message, parsed
+    return message, {}
+
+
+def _parse_log_extra_tokens(text: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        key_match = re.match(r"([A-Za-z_][A-Za-z0-9_.]*)=", text[index:])
+        if not key_match:
+            break
+        key = key_match.group(1)
+        index += len(key) + 1
+        value_text, index = _consume_log_extra_value(text, index)
+        result[key] = _decode_log_extra_value(value_text)
+    return result
+
+
+def _consume_log_extra_value(text: str, index: int) -> Tuple[str, int]:
+    if index >= len(text):
+        return "", index
+    if text[index] == '"':
+        start = index
+        index += 1
+        escaped = False
+        while index < len(text):
+            char = text[index]
+            index += 1
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                break
+        return text[start:index], index
+    start = index
+    while index < len(text) and not text[index].isspace():
+        index += 1
+    return text[start:index], index
+
+
+def _decode_log_extra_value(value_text: str) -> Any:
+    text = str(value_text or "")
+    if not text:
+        return ""
+    if text.startswith('"') and text.endswith('"'):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text.strip('"')
+    if text in {"true", "false"}:
+        return text == "true"
+    if text and text[0] in "[{":
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    if re.fullmatch(r"-?\d+", text):
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    if re.fullmatch(r"-?(?:\d+\.\d*|\d*\.\d+)", text):
+        try:
+            return float(text)
+        except ValueError:
+            return text
+    return text
+
+
+def _optional_str(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_log_timestamp(value: str) -> datetime:

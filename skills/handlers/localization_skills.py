@@ -23,7 +23,7 @@ from core.errors import GatewayError
 from skills.common import params
 from skills.common.context import SkillContext
 
-_LOGGER = logging.getLogger("nuwax.skills.localization")
+_LOGGER = logging.getLogger("nuwax_robot_bridge.skills.localization")
 
 
 def handle_get_localization_snapshot(

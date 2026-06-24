@@ -23,8 +23,22 @@ from core.settings import RelayServerConfig
 
 
 RELAY_LOGGER = logging.getLogger("nuwax_robot_bridge.relay")
-_LOW_VALUE_RELAY_PATHS = frozenset(("/relay/health", "/events/stream", "/streams/sse", "/streams/video.mjpeg"))
+_LOW_VALUE_RELAY_PATHS = frozenset(
+    (
+        "/relay/health",
+        "/api/health",
+        "/api/tasks",
+        "/api/memory/instances",
+        "/events/stream",
+        "/streams/sse",
+        "/streams/video.mjpeg",
+        "/debug",
+        "/debug/",
+    )
+)
+_LOW_VALUE_RELAY_PREFIXES = ("/api/debug/", "/static/")
 _RELAY_REQUEST_LOG_RATE_LIMIT_SEC = 30.0
+_RELAY_SLOW_REQUEST_THRESHOLD_MS = 1000.0
 
 
 def _resolve_client_host(request: Request) -> str:
@@ -36,10 +50,12 @@ def _resolve_client_host(request: Request) -> str:
     return "-"
 
 
-def _should_rate_limit_relay_request(path: str, status_code: int) -> bool:
+def _should_rate_limit_relay_request(path: str, status_code: int, duration_ms: float) -> bool:
     if status_code >= 400:
         return False
-    return path in _LOW_VALUE_RELAY_PATHS
+    if duration_ms >= _RELAY_SLOW_REQUEST_THRESHOLD_MS:
+        return False
+    return path in _LOW_VALUE_RELAY_PATHS or any(path.startswith(prefix) for prefix in _LOW_VALUE_RELAY_PREFIXES)
 
 
 def create_relay_app(
@@ -130,10 +146,15 @@ def create_relay_app(
             extra["upstream_status_code"] = upstream_status_code
         if upstream_duration_ms is not None:
             extra["upstream_duration_ms"] = upstream_duration_ms
-        if _should_rate_limit_relay_request(path, response.status_code):
+        if duration_ms >= _RELAY_SLOW_REQUEST_THRESHOLD_MS:
+            extra["slow_request"] = True
+            extra["slow_request_threshold_ms"] = _RELAY_SLOW_REQUEST_THRESHOLD_MS
+        if _should_rate_limit_relay_request(path, response.status_code, duration_ms):
+            extra["low_value_request"] = True
+            extra["slow_request_threshold_ms"] = _RELAY_SLOW_REQUEST_THRESHOLD_MS
             request_log_limiter.log(
                 RELAY_LOGGER,
-                level,
+                logging.DEBUG,
                 "Relay 请求完成",
                 key=("relay_request", method, path, response.status_code),
                 interval_sec=_RELAY_REQUEST_LOG_RATE_LIMIT_SEC,

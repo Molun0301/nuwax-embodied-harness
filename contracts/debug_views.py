@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from contracts.compat import StrEnum
 from pydantic import Field, model_validator
@@ -191,6 +191,18 @@ class DebugLogEntry(ContractModel):
     source: str
     message: str
     event_type: Optional[str] = None
+    runtime_event_type: Optional[str] = None
+    runtime_message: Optional[str] = None
+    display_message: Optional[str] = None
+    request_id: Optional[str] = None
+    task_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    duration_ms: Optional[float] = None
+    error_category: Optional[str] = None
+    payload_preview: Optional[Any] = None
+    metadata_preview: Optional[Any] = None
+    details_compact: MetadataDict = Field(default_factory=dict)
+    suppressed_count: Optional[int] = None
     payload: MetadataDict = Field(default_factory=dict)
 
 

@@ -30,7 +30,7 @@ from core.errors import GatewayError
 from skills.common import params
 from skills.common.context import SkillContext
 
-_LOGGER = logging.getLogger("nuwax.skills.memory")
+_LOGGER = logging.getLogger("nuwax_robot_bridge.skills.memory")
 
 
 def _scene_space_ids_from_arguments(payload: Dict[str, Any]) -> List[str]:

@@ -506,7 +506,7 @@ def _build_deferred_projection_config() -> DeferredProjectionConfig:
         strategy = raw_strategy
     else:
         if raw_strategy:
-            logging.getLogger("nuwax.settings").warning(
+            logging.getLogger("nuwax_robot_bridge.settings").warning(
                 "未知 NUWAX_PERCEPTION_DEFERRED_STRATEGY=%s，回退 disabled。", raw_strategy
             )
         strategy = "disabled"
@@ -1059,6 +1059,9 @@ _SUBSYSTEM_LOGGERS = {
     "perception": "nuwax_robot_bridge.perception",
     "gateway": "nuwax_robot_bridge.gateway",
     "runtime": "nuwax_robot_bridge.runtime",
+    "config": "nuwax_robot_bridge.config_io",
+    "settings": "nuwax_robot_bridge.settings",
+    "skills": "nuwax_robot_bridge.skills",
     "ros2": "nuwax_robot_bridge.ros2",
     "driver": "nuwax_robot_bridge.driver",
 }

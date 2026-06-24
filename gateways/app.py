@@ -34,9 +34,22 @@ from core.settings import NuwaxRobotBridgeConfig, configure_logging, load_config
 
 APP_LOGGER = logging.getLogger("nuwax_robot_bridge.gateway")
 HTTP_LOGGER = logging.getLogger("nuwax_robot_bridge.http")
-_LOW_VALUE_HTTP_PATHS = frozenset(("/api/health", "/events/stream", "/ops"))
-_LOW_VALUE_HTTP_PREFIXES = ("/api/debug/",)
+_LOW_VALUE_HTTP_PATHS = frozenset(
+    (
+        "/api/health",
+        "/api/tasks",
+        "/api/memory/instances",
+        "/events/stream",
+        "/streams/sse",
+        "/streams/video.mjpeg",
+        "/ops",
+        "/debug",
+        "/debug/",
+    )
+)
+_LOW_VALUE_HTTP_PREFIXES = ("/api/debug/", "/static/")
 _REQUEST_LOG_RATE_LIMIT_SEC = 30.0
+_HTTP_SLOW_REQUEST_THRESHOLD_MS = 1000.0
 
 
 def _resolve_client_host(request: Request) -> str:
@@ -48,8 +61,10 @@ def _resolve_client_host(request: Request) -> str:
     return "-"
 
 
-def _should_rate_limit_http_request(path: str, status_code: int) -> bool:
+def _should_rate_limit_http_request(path: str, status_code: int, duration_ms: float) -> bool:
     if status_code >= 400:
+        return False
+    if duration_ms >= _HTTP_SLOW_REQUEST_THRESHOLD_MS:
         return False
     return path in _LOW_VALUE_HTTP_PATHS or any(path.startswith(prefix) for prefix in _LOW_VALUE_HTTP_PREFIXES)
 
@@ -146,10 +161,15 @@ def create_gateway_app(
             "error_category": getattr(request.state, "error_category", None)
             or error_category_from_status(response.status_code),
         }
-        if _should_rate_limit_http_request(path, response.status_code):
+        if duration_ms >= _HTTP_SLOW_REQUEST_THRESHOLD_MS:
+            extra["slow_request"] = True
+            extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS
+        if _should_rate_limit_http_request(path, response.status_code, duration_ms):
+            extra["low_value_request"] = True
+            extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS
             request_log_limiter.log(
                 HTTP_LOGGER,
-                level,
+                logging.DEBUG,
                 "HTTP 请求完成",
                 key=("http_request", method, path, response.status_code),
                 interval_sec=_REQUEST_LOG_RATE_LIMIT_SEC,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
+import logging
 import threading
 from threading import Timer
 from typing import Dict, List, Optional, Tuple, Any, Callable
@@ -11,9 +12,12 @@ from contracts.base import MetadataDict, utc_now
 from contracts.naming import build_event_id, build_task_id
 from contracts.tasks import TaskEvent, TaskSpec, TaskState, TaskStatus
 from core.event_bus import EventBus
+from core.logging_utils import LogRateLimiter
 from core.resource_lock import ResourceLockManager
 
 TaskRunner = Callable[["TaskExecutionContext"], Any]
+TASK_LOGGER = logging.getLogger("nuwax_robot_bridge.task_manager")
+_TASK_CLEANUP_LOG_RATE_LIMIT_SEC = 30.0
 
 _REQUEST_CONTEXT_KEYS = (
     "request_id",
@@ -140,6 +144,7 @@ class TaskManager:
         self._records: Dict[str, TaskRecord] = {}
         self._history_order: List[str] = []
         self._lock = threading.RLock()
+        self._cleanup_log_limiter = LogRateLimiter()
 
     def submit(
         self,
@@ -652,13 +657,38 @@ class TaskManager:
     def _release_resources(self, task_id: str) -> None:
         if self._resource_lock_manager is None:
             return
-        self._resource_lock_manager.release(task_id)
+        try:
+            self._resource_lock_manager.release(task_id)
+        except Exception as exc:
+            self._log_cleanup_failure("release_resources", task_id, exc)
+            raise
 
     def _cancel_timer(self, task_id: str) -> None:
-        with self._lock:
-            record = self._records.get(task_id)
-            if record is None or record.timeout_timer is None:
-                return
-            timer = record.timeout_timer
-            record.timeout_timer = None
-        timer.cancel()
+        try:
+            with self._lock:
+                record = self._records.get(task_id)
+                if record is None or record.timeout_timer is None:
+                    return
+                timer = record.timeout_timer
+                record.timeout_timer = None
+            timer.cancel()
+        except Exception as exc:
+            self._log_cleanup_failure("cancel_timer", task_id, exc)
+            raise
+
+    def _log_cleanup_failure(self, action: str, task_id: str, exc: Exception) -> None:
+        self._cleanup_log_limiter.log(
+            TASK_LOGGER,
+            logging.WARNING,
+            "任务后台清理异常",
+            key=("task_cleanup_failure", action),
+            interval_sec=_TASK_CLEANUP_LOG_RATE_LIMIT_SEC,
+            extra={
+                "event": "task.cleanup.failed",
+                "task_id": task_id,
+                "error_category": "internal",
+                "cleanup_action": action,
+                "exception_type": exc.__class__.__name__,
+            },
+            exc_info=True,
+        )

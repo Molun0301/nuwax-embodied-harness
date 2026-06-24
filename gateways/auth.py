@@ -11,7 +11,7 @@ from starlette.websockets import WebSocket
 from typing import Dict, Optional, Tuple
 
 
-AUTH_LOGGER = logging.getLogger("nuwax.gateway.auth")
+AUTH_LOGGER = logging.getLogger("nuwax_robot_bridge.gateway.auth")
 
 
 @dataclass(frozen=True)
@@ -119,4 +119,3 @@ class GatewayAccessManager:
                 "exposed_to_agent_false": "不经能力调用入口暴露",
             },
         }
-

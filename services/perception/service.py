@@ -8,7 +8,7 @@ from time import perf_counter
 from contracts.events import RuntimeEventCategory
 from contracts.naming import build_observation_id
 from contracts.perception import Detection2D, Observation, SegmentationMask2D, Track, TrackState
-from contracts.runtime_views import PerceptionContext
+from contracts.runtime_views import PerceptionContext, SceneObjectSummary, SceneSummary
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
 from providers import LocalizationProvider, PointCloudProvider
@@ -82,7 +82,9 @@ class PerceptionService:
         self._live_pose_provider = live_pose_provider
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
         self._latest_by_camera: Dict[str, PerceptionContext] = {}
+        self._latest_full_by_camera: Dict[str, PerceptionContext] = {}
         self._pipeline_name = pipeline_name
+        self._last_detection_overlay_publish_at_by_camera: Dict[str, float] = {}
         # P1-2：感知全管线无并发保护——process_image 可被后台运行时线程、
         # FastAPI threadpool 能力调用、memory 到点复核并发触发，模型/跟踪器状态
         # 在无锁下会竞态损坏。粗粒度串行整条管线（推理本身是吞吐瓶颈）。
@@ -167,17 +169,11 @@ class PerceptionService:
         if image_artifact is not None and not isinstance(image_artifact, ArtifactRef):
             raise TypeError("PerceptionService.process_image 的 image_artifact 必须是 ArtifactRef。")
 
-        metadata_update = dict(detection_metadata or {})
-        if open_vocabulary_classes is not None:
-            class_names = [str(item).strip() for item in open_vocabulary_classes if str(item or "").strip()]
-            if class_names:
-                metadata_update["open_vocabulary_classes"] = class_names
-                metadata_update.setdefault("target_classes", class_names)
-        if metadata_update:
-            image_frame = image_frame.model_copy(
-                update={"metadata": {**dict(image_frame.metadata or {}), **metadata_update}},
-                deep=False,
-            )
+        image_frame = self._apply_detection_metadata(
+            image_frame,
+            detection_metadata=detection_metadata,
+            open_vocabulary_classes=open_vocabulary_classes,
+        )
 
         pipeline_started_at = perf_counter()
         stage_duration_ms: Dict[str, float] = {}
@@ -327,6 +323,7 @@ class PerceptionService:
             },
         )
         self._latest_by_camera[context.camera_id] = context
+        self._latest_full_by_camera[context.camera_id] = context
         self._history.append(context)
         self._state_store.write(
             StateNamespace.PERCEPTION,
@@ -420,6 +417,218 @@ class PerceptionService:
             open_vocabulary_classes=open_vocabulary_classes,
         )
 
+    def detect_current_frame_fast(
+        self,
+        *,
+        camera_id: Optional[str] = None,
+        requested_by: Optional[str] = None,
+        detector_backend_name: Optional[str] = None,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
+    ) -> PerceptionContext:
+        """执行高频检测观测链路。
+
+        该路径只做视频抽帧、detector、2D tracker、track_id 附加和
+        `video.detections` 发布；不执行 segmentation / geometry /
+        scene_description / keyframe memory，从而让 Web 检测框和连续
+        三角测量观测跟随 YOLO 节奏。
+        """
+
+        image_frame = self._read_latest_pushed_image(camera_id)
+        if image_frame is None:
+            ingest_status = self._video_frame_source_status()
+            raise GatewayError(
+                "端侧视频推流尚未接入或尚未收到首帧，无法执行实时检测；平台不会主动采集图像帧。",
+                error_code="video_ingest_not_ready",
+                http_status=503,
+                details={
+                    "camera_id": camera_id,
+                    "required_source": "go2_side_stream_push",
+                    "platform_role": "video_ingest_receiver",
+                    "ingest_status": ingest_status,
+                },
+            )
+        camera_info = self._camera_info_from_video_frame(image_frame)
+        source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
+        self._publish_video_frame(
+            image_frame,
+            source_name=source_name,
+        )
+        return self.process_image_fast(
+            image_frame,
+            camera_info,
+            requested_by=requested_by,
+            detector_backend_name=detector_backend_name,
+            source_name=source_name,
+            detection_metadata=detection_metadata,
+            open_vocabulary_classes=open_vocabulary_classes,
+        )
+
+    def process_image_fast(
+        self,
+        image_frame,
+        camera_info=None,
+        *,
+        requested_by: Optional[str] = None,
+        detector_backend_name: Optional[str] = None,
+        source_name: Optional[str] = None,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
+    ) -> PerceptionContext:
+        """消费标准图像并产出 detector/tracker 级快速观测结果。"""
+
+        with self._pipeline_lock:
+            return self._process_image_fast_locked(
+                image_frame,
+                camera_info,
+                requested_by=requested_by,
+                detector_backend_name=detector_backend_name,
+                source_name=source_name,
+                detection_metadata=detection_metadata,
+                open_vocabulary_classes=open_vocabulary_classes,
+            )
+
+    def _process_image_fast_locked(
+        self,
+        image_frame,
+        camera_info=None,
+        *,
+        requested_by: Optional[str] = None,
+        detector_backend_name: Optional[str] = None,
+        source_name: Optional[str] = None,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
+    ) -> PerceptionContext:
+        """process_image_fast 的实际实现，调用方须已持有 _pipeline_lock。"""
+
+        from contracts.image import CameraInfo, ImageFrame
+
+        if not isinstance(image_frame, ImageFrame):
+            raise TypeError("PerceptionService.process_image_fast 仅接受标准 ImageFrame。")
+        if camera_info is not None and not isinstance(camera_info, CameraInfo):
+            raise TypeError("PerceptionService.process_image_fast 的 camera_info 必须是 CameraInfo。")
+
+        image_frame = self._apply_detection_metadata(
+            image_frame,
+            detection_metadata=detection_metadata,
+            open_vocabulary_classes=open_vocabulary_classes,
+        )
+        pipeline_started_at = perf_counter()
+        stage_duration_ms: Dict[str, float] = {}
+        stage_status: Dict[str, str] = {
+            "segmentation": "skipped_fast_path",
+            "geometry": "skipped_fast_path",
+            "scene_description": "skipped_fast_path",
+        }
+
+        stage_started_at = perf_counter()
+        detection_bundle, detector_spec = self._detector_pipeline.detect(
+            image_frame,
+            camera_info,
+            backend_name=detector_backend_name,
+        )
+        stage_duration_ms["detector"] = self._elapsed_ms(stage_started_at)
+        stage_status["detector"] = self._provider_stage_status(
+            detector_spec.backend_kind,
+            detection_bundle.metadata,
+        )
+
+        stage_started_at = perf_counter()
+        tracks = self._tracker_backend.update(
+            image_frame,
+            detections_2d=detection_bundle.detections_2d,
+            detections_3d=detection_bundle.detections_3d,
+            camera_info=camera_info,
+        )
+        stage_duration_ms["tracker"] = self._elapsed_ms(stage_started_at)
+        stage_status["tracker"] = "completed"
+
+        detections_2d = self._attach_track_ids(detection_bundle.detections_2d, tracks)
+        stage_duration_ms["total"] = self._elapsed_ms(pipeline_started_at)
+        detector_backend_metadata = dict(detector_spec.metadata)
+        detector_provider = dict(
+            detector_backend_metadata.get("provider") or detection_bundle.metadata.get("detector_provider") or {}
+        )
+        scene_summary = self._build_fast_scene_summary(
+            camera_id=image_frame.camera_id,
+            detections_2d=detections_2d,
+            tracks=tracks,
+            stage_duration_ms=stage_duration_ms,
+        )
+        observation = Observation(
+            observation_id=build_observation_id(self._normalize_camera_id(image_frame.camera_id)),
+            frame_id=image_frame.frame_id,
+            summary=scene_summary.headline,
+            detections_2d=list(detections_2d),
+            detections_3d=list(detection_bundle.detections_3d),
+            tracks=list(tracks),
+            metadata={
+                "camera_id": image_frame.camera_id,
+                "detector_backend": detector_spec.name,
+                "detector_provider": dict(detector_provider),
+                "detector_backend_metadata": dict(detector_backend_metadata),
+                "detection_metadata": dict(detection_bundle.metadata),
+                "tracker_backend": self._tracker_backend.spec.name,
+                "segmentation_backend": self._segmentation_backend.spec.name,
+                "segmentation_backend_kind": self._segmentation_backend.spec.backend_kind,
+                "segmentation_count": 0,
+                "scene_description_backend": "fast_detection_summary",
+                "stage_duration_ms": dict(stage_duration_ms),
+                "stage_status": dict(stage_status),
+                "pipeline_name": self._pipeline_name,
+                "requested_by": requested_by or "unknown",
+                "source_name": source_name or "unknown",
+                "image_encoding": image_frame.encoding.value,
+                "width_px": image_frame.width_px,
+                "height_px": image_frame.height_px,
+                "detection_count": len(detections_2d),
+                "track_count": len(tracks),
+                "overlay_phase": "detector_ready",
+                "fast_path": True,
+                **dict(detection_bundle.metadata),
+            },
+        )
+        context = PerceptionContext(
+            camera_id=image_frame.camera_id,
+            observation=observation,
+            scene_summary=scene_summary,
+            image_artifact=None,
+            camera_info=camera_info,
+            pipeline_name=self._pipeline_name,
+            detector_backend=detector_spec.name,
+            tracker_backend=self._tracker_backend.spec.name,
+            metadata={
+                "source_name": source_name or "unknown",
+                "requested_by": requested_by or "unknown",
+                "scene_description_backend": "fast_detection_summary",
+                "segmentation_backend": self._segmentation_backend.spec.name,
+                "detector_provider": dict(detector_provider),
+                "detector_backend_metadata": dict(detector_backend_metadata),
+                "detection_metadata": dict(detection_bundle.metadata),
+                "detector_backend_kind": detector_spec.backend_kind,
+                "tracker_backend_kind": self._tracker_backend.spec.backend_kind,
+                "segmentation_backend_kind": self._segmentation_backend.spec.backend_kind,
+                "segmentation_count": 0,
+                "detection_count": len(detections_2d),
+                "track_count": len(tracks),
+                "stage_duration_ms": dict(stage_duration_ms),
+                "stage_status": dict(stage_status),
+                "overlay_phase": "detector_ready",
+                "fast_path": True,
+            },
+        )
+        self._latest_by_camera[context.camera_id] = context
+        self._history.append(context)
+        self._state_store.write(
+            StateNamespace.PERCEPTION,
+            context.camera_id,
+            context,
+            source=source_name or detector_spec.name,
+            metadata={"kind": "latest_perception_fast", "pipeline_name": self._pipeline_name},
+        )
+        self._publish_detection_overlay_frame(context)
+        return context
+
     def describe_current_scene(
         self,
         *,
@@ -494,6 +703,15 @@ class PerceptionService:
             return None
         return max(self._latest_by_camera.values(), key=lambda item: item.timestamp)
 
+    def get_latest_full_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
+        """返回最近一次完整感知结果；fast path 结果不会覆盖该缓存。"""
+
+        if camera_id is not None:
+            return self._latest_full_by_camera.get(camera_id)
+        if not self._latest_full_by_camera:
+            return None
+        return max(self._latest_full_by_camera.values(), key=lambda item: item.timestamp)
+
     def list_history(
         self,
         *,
@@ -508,6 +726,26 @@ class PerceptionService:
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
+
+    def _apply_detection_metadata(
+        self,
+        image_frame,
+        *,
+        detection_metadata: Optional[Dict[str, object]] = None,
+        open_vocabulary_classes: Optional[Iterable[str]] = None,
+    ):
+        metadata_update = dict(detection_metadata or {})
+        if open_vocabulary_classes is not None:
+            class_names = [str(item).strip() for item in open_vocabulary_classes if str(item or "").strip()]
+            if class_names:
+                metadata_update["open_vocabulary_classes"] = class_names
+                metadata_update.setdefault("target_classes", class_names)
+        if metadata_update:
+            return image_frame.model_copy(
+                update={"metadata": {**dict(image_frame.metadata or {}), **metadata_update}},
+                deep=False,
+            )
+        return image_frame
 
     def list_latest_contexts(self) -> Tuple[PerceptionContext, ...]:
         """返回各相机当前最新感知结果。"""
@@ -674,11 +912,79 @@ class PerceptionService:
             )
         return tuple(assigned)
 
+    def _build_fast_scene_summary(
+        self,
+        *,
+        camera_id: str,
+        detections_2d: Tuple[Detection2D, ...],
+        tracks: Tuple[Track, ...],
+        stage_duration_ms: Dict[str, float],
+    ) -> SceneSummary:
+        object_counts: Dict[str, Dict[str, object]] = {}
+        active_track_ids = {
+            track.track_id
+            for track in tracks
+            if track.state in {TrackState.TENTATIVE, TrackState.TRACKED}
+        }
+        for detection in detections_2d:
+            label = str(detection.label or "unknown")
+            bucket = object_counts.setdefault(
+                label,
+                {
+                    "count": 0,
+                    "max_score": 0.0,
+                    "track_ids": set(),
+                },
+            )
+            bucket["count"] = int(bucket["count"]) + 1
+            bucket["max_score"] = max(float(bucket["max_score"]), float(detection.score))
+            if detection.track_id and detection.track_id in active_track_ids:
+                bucket["track_ids"].add(detection.track_id)
+        objects = []
+        for label, bucket in sorted(object_counts.items(), key=lambda item: item[0]):
+            track_ids = sorted(str(item) for item in bucket["track_ids"])
+            objects.append(
+                SceneObjectSummary(
+                    label=label,
+                    count=int(bucket["count"]),
+                    tracked_count=len(track_ids),
+                    max_score=float(bucket["max_score"]),
+                    camera_ids=[camera_id],
+                    track_ids=track_ids,
+                    attributes={"summary_source": "fast_detection"},
+                )
+            )
+        if objects:
+            headline = "当前画面检测到 " + "、".join(f"{item.label} {item.count} 个" for item in objects) + "。"
+        else:
+            headline = "当前画面未检测到目标。"
+        active_count = sum(1 for track in tracks if track.state in {TrackState.TENTATIVE, TrackState.TRACKED})
+        return SceneSummary(
+            headline=headline,
+            details=[
+                "快速检测链路结果：仅包含 detector 与 2D tracker，未等待 segmentation/geometry/scene_description。",
+            ],
+            objects=objects,
+            detection_count=len(detections_2d),
+            active_track_count=active_count,
+            metadata={
+                "summary_source": "fast_detection",
+                "stage_duration_ms": dict(stage_duration_ms),
+            },
+        )
+
     def _publish_detection_overlay_frame(self, context: PerceptionContext) -> None:
         if self._stream_bus is None:
             return
         observation = context.observation
         detections = tuple(self._serialize_detection_overlay(detection) for detection in observation.detections_2d)
+        now = perf_counter()
+        previous_publish_at = self._last_detection_overlay_publish_at_by_camera.get(context.camera_id)
+        publish_interval_ms = None
+        if previous_publish_at is not None:
+            publish_interval_ms = round((now - previous_publish_at) * 1000.0, 3)
+        self._last_detection_overlay_publish_at_by_camera[context.camera_id] = now
+        overlay_phase = str(context.metadata.get("overlay_phase") or "full_scene_ready")
         payload = {
             "available": True,
             "camera_id": context.camera_id,
@@ -691,6 +997,8 @@ class PerceptionService:
             "detections_2d": detections,
             "stage_status": dict(context.metadata.get("stage_status") or {}),
             "stage_duration_ms": dict(context.metadata.get("stage_duration_ms") or {}),
+            "overlay_phase": overlay_phase,
+            "publish_interval_ms": publish_interval_ms,
         }
         self._stream_bus.publish(
             "video.detections",
@@ -702,6 +1010,8 @@ class PerceptionService:
                 "camera_id": context.camera_id,
                 "detector_backend": context.detector_backend,
                 "detection_count": len(detections),
+                "overlay_phase": overlay_phase,
+                "publish_interval_ms": publish_interval_ms,
             },
         )
 

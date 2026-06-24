@@ -84,6 +84,17 @@ class PerceptionVideoRuntime:
         self._last_success_message = None
         self._last_error = None
         self._last_status_metadata = {}
+        self._fast_processed_frames = 0
+        self._continuous_ingest_count = 0
+        self._last_fast_loop_duration_ms = None
+        self._last_video_detections_interval_ms = None
+        self._memory_write_lock = threading.Lock()
+        self._memory_write_in_flight = False
+        self._memory_write_pending = None
+        self._memory_write_scheduled_count = 0
+        self._memory_write_completed_count = 0
+        self._memory_write_failed_count = 0
+        self._last_memory_write_error = None
         # 跳帧诊断限流：避免 0.5s 循环刷屏，同时让"视频不可用"等失败可见。
         self._skip_log_interval_sec = 10.0
         self._last_skip_log_at = 0.0
@@ -252,21 +263,34 @@ class PerceptionVideoRuntime:
             self._write_status(running=self.is_running())
             return None
 
-        # 方案 B：检测与关联在每个 tick 无条件执行（YOLO 已常驻，门控不该掐检测）。
-        # 关键帧门控只决定是否做低频记忆写入（scene entry + 向量化）。
-        # 每 tick 恰好一次 associate：关键帧 tick 走 remember_current_scene（内部 persist=True
-        # 全摄入），非关键帧 tick 走 ingest_perception_observation(persist=False)，避免双重计数。
-        context = self._perception_service.perceive_current_scene(
+        fast_started_at = time.monotonic()
+        # 高频检测观测链路：每 tick 只执行 detector + 2D tracker + video.detections。
+        # segmentation/geometry/scene_description/keyframe memory 属于慢链路，不能反压下一次 YOLO tick。
+        context = self._perception_service.detect_current_frame_fast(
             camera_id=self._camera_id,
             requested_by="perception_video_runtime",
             detector_backend_name=self._detector_backend_name or None,
-            store_artifact=self._store_artifact,
             detection_metadata=detection_metadata,
             open_vocabulary_classes=open_vocabulary_classes,
         )
+        fast_loop_duration_ms = round((time.monotonic() - fast_started_at) * 1000.0, 3)
+        stage_duration_ms = dict(context.metadata.get("stage_duration_ms") or {})
+        last_full_stage_duration_ms_total = self._latest_full_stage_duration_ms_total()
+        video_detections_interval_ms = self._coerce_optional_float(
+            context.observation.metadata.get("publish_interval_ms")
+        )
+        if video_detections_interval_ms is None:
+            latest_detection_frame = self._latest_stream_frame("video.detections")
+            if latest_detection_frame is not None:
+                video_detections_interval_ms = self._coerce_optional_float(
+                    (latest_detection_frame.payload or {}).get("publish_interval_ms")
+                    if isinstance(latest_detection_frame.payload, dict)
+                    else None
+                )
         write_memory = force_keyframe or decision.should_process
         effective_reason = decision.reason if (decision.should_process and not force_keyframe) else reason
         memory_written = False
+        continuous_ingested = False
         if write_memory:
             # 关键帧路径：完整记忆写入（remember_current_scene 内部走 persist=True 全摄入）。
             # mark_processed 只在此处调用——它更新 _last_keyframe_at/_last_keyframe_pose 基准，
@@ -275,7 +299,7 @@ class PerceptionVideoRuntime:
                 timestamp=now,
                 current_pose=current_pose,
             )
-            memory_written = self._remember_from_keyframe(
+            memory_written = self._schedule_memory_write(
                 context=context,
                 current_pose=current_pose,
                 reason=effective_reason,
@@ -292,10 +316,16 @@ class PerceptionVideoRuntime:
                 current_pose=current_pose,
                 now=now,
             )
+            continuous_ingested = True
 
         capture_mode = "burst" if force_keyframe else ("keyframe" if decision.should_process else "continuous")
         with self._lock:
             self._processed_frames += 1
+            self._fast_processed_frames += 1
+            if continuous_ingested:
+                self._continuous_ingest_count += 1
+            self._last_fast_loop_duration_ms = fast_loop_duration_ms
+            self._last_video_detections_interval_ms = video_detections_interval_ms
             self._last_keyframe_reason = effective_reason
             self._last_error = None
             self._consecutive_skip_count = 0
@@ -315,9 +345,23 @@ class PerceptionVideoRuntime:
                 "capture_mode": capture_mode,
                 "keyframe_reason": effective_reason,
                 "memory_written": memory_written,
+                "memory_write_scheduled": memory_written,
                 "remember_keyframes": self._remember_keyframes,
                 "detection_metadata": dict(detection_metadata or {}),
                 "video_ingest_status": dict(video_status),
+                "fast_path": True,
+                "fast_processed_frames": self._fast_processed_frames,
+                "continuous_ingest_count": self._continuous_ingest_count,
+                "fast_loop_duration_ms": fast_loop_duration_ms,
+                "detector_duration_ms": stage_duration_ms.get("detector"),
+                "tracker_duration_ms": stage_duration_ms.get("tracker"),
+                "video_detections_interval_ms": video_detections_interval_ms,
+                "last_full_stage_duration_ms_total": last_full_stage_duration_ms_total,
+                "memory_write_in_flight": self._memory_write_in_flight,
+                "memory_write_scheduled_count": self._memory_write_scheduled_count,
+                "memory_write_completed_count": self._memory_write_completed_count,
+                "memory_write_failed_count": self._memory_write_failed_count,
+                "last_memory_write_error": self._last_memory_write_error,
                 **dict(decision.metadata),
             }
         self._write_status(running=self.is_running())
@@ -359,6 +403,119 @@ class PerceptionVideoRuntime:
             PERCEPTION_RUNTIME_LOGGER.debug(
                 "连续感知摄入失败 camera=%s。", self._camera_id, exc_info=True
             )
+
+    def _schedule_memory_write(
+        self,
+        *,
+        context,
+        current_pose: Optional[Pose],
+        reason: str,
+        now: datetime,
+        force: bool,
+        allow_memory_write: bool,
+    ) -> bool:
+        """latest-only 调度关键帧记忆写入，避免阻塞高频检测 tick。"""
+
+        if not allow_memory_write:
+            return False
+        memory_service = self._memory_service
+        if memory_service is None:
+            return False
+        if not self._remember_keyframes and not force:
+            return False
+        if hasattr(memory_service, "is_enabled"):
+            try:
+                if not memory_service.is_enabled():
+                    return False
+            except Exception:
+                return False
+        job = {
+            "context": context,
+            "current_pose": current_pose,
+            "reason": reason,
+            "now": now,
+            "force": force,
+            "allow_memory_write": allow_memory_write,
+        }
+        with self._memory_write_lock:
+            self._memory_write_scheduled_count += 1
+            if self._memory_write_in_flight:
+                self._memory_write_pending = job
+                return True
+            self._memory_write_in_flight = True
+        thread = threading.Thread(
+            target=self._memory_write_worker,
+            args=(job,),
+            name="nuwax_perception_memory_write",
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _memory_write_worker(self, initial_job) -> None:
+        job = initial_job
+        while job is not None:
+            ok = False
+            error = None
+            try:
+                ok = self._remember_from_keyframe(**job)
+            except Exception as exc:  # 防御性兜底；_remember_from_keyframe 自身通常吞异常。
+                ok = False
+                error = str(exc)
+                PERCEPTION_RUNTIME_LOGGER.debug(
+                    "关键帧记忆后台写入失败 camera=%s reason=%s error=%s",
+                    self._camera_id,
+                    job.get("reason"),
+                    exc,
+                    exc_info=True,
+                )
+            with self._lock:
+                if ok:
+                    self._memory_write_completed_count += 1
+                    self._last_memory_write_error = None
+                else:
+                    self._memory_write_failed_count += 1
+                    self._last_memory_write_error = error or "memory_write_skipped_or_failed"
+            with self._memory_write_lock:
+                job = self._memory_write_pending
+                self._memory_write_pending = None
+                if job is None:
+                    self._memory_write_in_flight = False
+                    return
+
+    @staticmethod
+    def _coerce_optional_float(value) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _latest_full_stage_duration_ms_total(self) -> Optional[float]:
+        getter = getattr(self._perception_service, "get_latest_full_perception", None)
+        if not callable(getter):
+            return None
+        try:
+            context = getter(self._camera_id)
+        except Exception:
+            return None
+        if context is None:
+            return None
+        stage_duration_ms = dict(getattr(context, "metadata", {}).get("stage_duration_ms") or {})
+        return self._coerce_optional_float(stage_duration_ms.get("total"))
+
+    def _latest_stream_frame(self, topic: str):
+        stream_bus = getattr(self._perception_service, "_stream_bus", None)
+        if stream_bus is None:
+            return None
+        latest_frame = getattr(stream_bus, "latest_frame", None)
+        if not callable(latest_frame):
+            return None
+        try:
+            return latest_frame(topic)
+        except Exception:
+            return None
 
     def run_burst(
         self,

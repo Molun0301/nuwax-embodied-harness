@@ -1043,6 +1043,7 @@ def _configure_third_party_logger_levels() -> None:
         logger = logging.getLogger(logger_name)
         logger.handlers = []
         logger.propagate = True
+        logger.setLevel(logging.WARNING)
 
     access_logger = logging.getLogger("uvicorn.access")
     access_logger.handlers = []

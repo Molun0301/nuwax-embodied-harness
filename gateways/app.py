@@ -39,6 +39,7 @@ _LOW_VALUE_HTTP_PATHS = frozenset(
         "/api/health",
         "/api/tasks",
         "/api/memory/instances",
+        "/mcp",
         "/events/stream",
         "/streams/sse",
         "/streams/video.mjpeg",
@@ -162,6 +163,8 @@ def create_gateway_app(
             or error_category_from_status(response.status_code),
         }
         if duration_ms >= _HTTP_SLOW_REQUEST_THRESHOLD_MS:
+            if level < logging.WARNING:
+                level = logging.WARNING
             extra["slow_request"] = True
             extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS
         if _should_rate_limit_http_request(path, response.status_code, duration_ms):

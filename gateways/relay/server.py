@@ -29,6 +29,7 @@ _LOW_VALUE_RELAY_PATHS = frozenset(
         "/api/health",
         "/api/tasks",
         "/api/memory/instances",
+        "/mcp",
         "/events/stream",
         "/streams/sse",
         "/streams/video.mjpeg",
@@ -147,6 +148,8 @@ def create_relay_app(
         if upstream_duration_ms is not None:
             extra["upstream_duration_ms"] = upstream_duration_ms
         if duration_ms >= _RELAY_SLOW_REQUEST_THRESHOLD_MS:
+            if level < logging.WARNING:
+                level = logging.WARNING
             extra["slow_request"] = True
             extra["slow_request_threshold_ms"] = _RELAY_SLOW_REQUEST_THRESHOLD_MS
         if _should_rate_limit_relay_request(path, response.status_code, duration_ms):

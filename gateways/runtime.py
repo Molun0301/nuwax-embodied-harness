@@ -195,6 +195,18 @@ class _ShmVideoFrameSource:
 
 RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.runtime")
 _RUNTIME_EVENT_LOG_RATE_LIMIT_SEC = 10.0
+_RUNTIME_SLOW_EVENT_THRESHOLD_MS = 1000.0
+_LOW_VALUE_RUNTIME_CAPABILITY_NAMES = frozenset(
+    (
+        "list_semantic_instances",
+    )
+)
+_LOW_VALUE_RUNTIME_CAPABILITY_EVENT_TYPES = frozenset(
+    (
+        "capability.invocation.started",
+        "capability.invocation.completed",
+    )
+)
 _REQUEST_CONTEXT_KEYS = (
     "request_id",
     "task_id",
@@ -221,6 +233,36 @@ _RUNTIME_METADATA_LOG_KEYS = (
     "map_version_id",
     "localization_session_id",
 )
+
+
+def _runtime_event_duration_ms(event) -> Optional[float]:
+    metadata = getattr(event, "metadata", {}) or {}
+    payload = getattr(event, "payload", {}) or {}
+    value = metadata.get("duration_ms") if isinstance(metadata, dict) else None
+    if value is None and isinstance(payload, dict):
+        value = payload.get("duration_ms")
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_low_value_runtime_capability_event(event_type: str, event) -> bool:
+    if str(event_type or "") not in _LOW_VALUE_RUNTIME_CAPABILITY_EVENT_TYPES:
+        return False
+    metadata = getattr(event, "metadata", {}) or {}
+    payload = getattr(event, "payload", {}) or {}
+    capability_name = metadata.get("capability_name") if isinstance(metadata, dict) else None
+    if not capability_name and isinstance(payload, dict):
+        capability_name = payload.get("capability_name")
+    if not capability_name:
+        capability_name = getattr(event, "subject_id", None)
+    if str(capability_name or "") not in _LOW_VALUE_RUNTIME_CAPABILITY_NAMES:
+        return False
+    duration_ms = _runtime_event_duration_ms(event)
+    return duration_ms is None or duration_ms < _RUNTIME_SLOW_EVENT_THRESHOLD_MS
 
 _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 0.5
 _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
@@ -709,6 +751,8 @@ class GatewayRuntime:
             }.get(str(event.severity), logging.INFO)
             if level <= logging.INFO and is_low_value_runtime_event(event_type):
                 level = logging.DEBUG
+            if level <= logging.INFO and _is_low_value_runtime_capability_event(event_type, event):
+                level = logging.DEBUG
             if not RUNTIME_LOGGER.isEnabledFor(level):
                 return
             payload_preview = self._build_log_preview(event.payload)
@@ -734,6 +778,9 @@ class GatewayRuntime:
                 extra["payload_preview"] = payload_preview
             if metadata_preview != "-":
                 extra["metadata_preview"] = metadata_preview
+            if _is_low_value_runtime_capability_event(event_type, event):
+                extra["low_value_runtime_event"] = True
+                extra["slow_runtime_event_threshold_ms"] = _RUNTIME_SLOW_EVENT_THRESHOLD_MS
             if level > logging.INFO:
                 RUNTIME_LOGGER.log(level, "运行时事件", extra=extra)
                 return

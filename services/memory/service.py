@@ -593,7 +593,100 @@ class MemoryService:
         }
 
     def list_memory_libraries(self) -> Tuple[Dict[str, object], ...]:
-        """列出当前仓库内可见的命名记忆库。"""
+        """列出当前仓库内可见的命名记忆库。
+
+        —— speed-up-list-maps-summary ——
+        默认走轻量快路径：仅依赖 SQL GROUP BY 聚合，不反序列化 payload。
+        - 当 8 张记忆表的 library_name 列均已就绪（has_library_name_columns()）时走轻量路径；
+        - 否则回退到原全量反序列化实现（_list_memory_libraries_legacy）；
+        - 通过环境变量 NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS=0 可强制回退到旧实现。
+        """
+
+        if self._use_lightweight_library_stats() and self._repository.has_library_name_columns():
+            return self._list_memory_libraries_lightweight()
+        return self._list_memory_libraries_legacy()
+
+    @staticmethod
+    def _use_lightweight_library_stats() -> bool:
+        """轻量快路径开关；HIL 验证前默认开启，回退开关 NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS=0。"""
+
+        import os
+        flag = os.environ.get("NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS", "1").strip().lower()
+        return flag not in ("0", "false", "no", "off")
+
+    def _list_memory_libraries_lightweight(self) -> Tuple[Dict[str, object], ...]:
+        """轻量快路径：仅 SQL GROUP BY 聚合，不反序列化 payload。"""
+
+        counts_by_library = self._repository.count_records_by_library()
+        last_updated_by_library = self._repository.library_last_updated_at()
+        # 与旧实现一致：以 memory_libraries 登记表为基底（保证 active 字段正确判定）。
+        stats_by_name: Dict[str, _MemoryLibraryStats] = {}
+        for item in self._repository.load_memory_libraries():
+            stats_by_name[item.library_name] = _MemoryLibraryStats(
+                library_name=item.library_name,
+                last_updated_at=datetime.fromisoformat(item.updated_at),
+            )
+        for library_name, kind_counts in counts_by_library.items():
+            current = stats_by_name.get(library_name)
+            if current is None:
+                current = _MemoryLibraryStats(library_name=library_name)
+            stats_by_name[library_name] = _MemoryLibraryStats(
+                library_name=library_name,
+                tagged_location_count=int(kind_counts.get("tagged_location", 0)),
+                semantic_memory_count=int(kind_counts.get("semantic_memory", 0)),
+                semantic_instance_count=int(kind_counts.get("semantic_instance", 0)),
+                observation_event_count=int(kind_counts.get("observation_event", 0)),
+                scene_space_count=int(kind_counts.get("scene_space", 0)),
+                navigation_trajectory_count=int(kind_counts.get("navigation_trajectory", 0)),
+                semantic_graph_relation_count=int(kind_counts.get("semantic_graph_relation", 0)),
+                semantic_summary_count=int(kind_counts.get("semantic_summary", 0)),
+                last_updated_at=current.last_updated_at,
+            )
+        # 用 library_last_updated_at 覆盖/补充 last_updated_at（与旧实现一致取最大 updated_at）。
+        for library_name, last_ts in last_updated_by_library.items():
+            current = stats_by_name.get(library_name)
+            try:
+                last_dt = datetime.fromisoformat(last_ts)
+            except ValueError:
+                continue
+            if current is None:
+                stats_by_name[library_name] = _MemoryLibraryStats(
+                    library_name=library_name, last_updated_at=last_dt,
+                )
+            elif current.last_updated_at is None or last_dt > current.last_updated_at:
+                stats_by_name[library_name] = _MemoryLibraryStats(
+                    library_name=library_name,
+                    tagged_location_count=current.tagged_location_count,
+                    semantic_memory_count=current.semantic_memory_count,
+                    semantic_instance_count=current.semantic_instance_count,
+                    observation_event_count=current.observation_event_count,
+                    scene_space_count=current.scene_space_count,
+                    navigation_trajectory_count=current.navigation_trajectory_count,
+                    semantic_graph_relation_count=current.semantic_graph_relation_count,
+                    semantic_summary_count=current.semantic_summary_count,
+                    last_updated_at=last_dt,
+                )
+        libraries: List[Dict[str, object]] = []
+        for stats in sorted(stats_by_name.values(), key=lambda item: (item.library_name.lower(), item.library_name)):
+            libraries.append(
+                {
+                    "library_name": stats.library_name,
+                    "active": stats.library_name == self._active_library_name,
+                    "tagged_location_count": stats.tagged_location_count,
+                    "semantic_memory_count": stats.semantic_memory_count,
+                    "semantic_instance_count": stats.semantic_instance_count,
+                    "observation_event_count": stats.observation_event_count,
+                    "scene_space_count": stats.scene_space_count,
+                    "navigation_trajectory_count": stats.navigation_trajectory_count,
+                    "semantic_graph_relation_count": stats.semantic_graph_relation_count,
+                    "semantic_summary_count": stats.semantic_summary_count,
+                    "last_updated_at": stats.last_updated_at.isoformat() if stats.last_updated_at is not None else None,
+                }
+            )
+        return tuple(libraries)
+
+    def _list_memory_libraries_legacy(self) -> Tuple[Dict[str, object], ...]:
+        """旧全量实现：逐行 model_validate_json 反序列化 payload；保留作为回退路径。"""
 
         stats_by_name: Dict[str, _MemoryLibraryStats] = {
             item.library_name: _MemoryLibraryStats(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import sqlite3
 import threading
 from typing import Dict, Iterable, List, Optional, Sequence
@@ -323,6 +324,7 @@ class MemoryRepository:
     def upsert_tagged_location(self, location: TaggedLocation) -> None:
         payload_json = location.model_dump_json()
         created_at = location.timestamp.isoformat()
+        library_name = self._resolve_record_library_name(location)
         with self._lock:
             self._conn.execute(
                 """
@@ -331,13 +333,15 @@ class MemoryRepository:
                     normalized_name,
                     payload_json,
                     created_at,
-                    updated_at
+                    updated_at,
+                    library_name
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(location_id) DO UPDATE SET
                     normalized_name = excluded.normalized_name,
                     payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    library_name = excluded.library_name
                 """,
                 (
                     location.location_id,
@@ -345,6 +349,7 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     created_at,
+                    library_name,
                 ),
             )
             self._conn.commit()
@@ -352,6 +357,7 @@ class MemoryRepository:
     def upsert_semantic_memory(self, entry: SemanticMemoryEntry) -> None:
         payload_json = entry.model_dump_json()
         created_at = entry.timestamp.isoformat()
+        library_name = self._resolve_record_library_name(entry)
         with self._lock:
             self._conn.execute(
                 """
@@ -362,15 +368,17 @@ class MemoryRepository:
                     summary,
                     payload_json,
                     created_at,
-                    updated_at
+                    updated_at,
+                    library_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(memory_id) DO UPDATE SET
                     kind = excluded.kind,
                     title = excluded.title,
                     summary = excluded.summary,
                     payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    library_name = excluded.library_name
                 """,
                 (
                     entry.memory_id,
@@ -380,6 +388,7 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     created_at,
+                    library_name,
                 ),
             )
             self._conn.commit()
@@ -388,6 +397,7 @@ class MemoryRepository:
         payload_json = entry.model_dump_json()
         created_at = entry.first_seen_ts.isoformat()
         updated_at = entry.last_seen_ts.isoformat()
+        library_name = self._resolve_record_library_name(entry)
         with self._lock:
             self._conn.execute(
                 """
@@ -399,16 +409,18 @@ class MemoryRepository:
                     localization_session_id,
                     payload_json,
                     created_at,
-                    updated_at
+                    updated_at,
+                    library_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(instance_id) DO UPDATE SET
                     label = excluded.label,
                     lifecycle_state = excluded.lifecycle_state,
                     map_version_id = excluded.map_version_id,
                     localization_session_id = excluded.localization_session_id,
                     payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    library_name = excluded.library_name
                 """,
                 (
                     entry.instance_id,
@@ -419,6 +431,7 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     updated_at,
+                    library_name,
                 ),
             )
             self._conn.commit()
@@ -426,6 +439,7 @@ class MemoryRepository:
     def upsert_observation_event(self, entry: ObservationEvent) -> None:
         payload_json = entry.model_dump_json()
         created_at = entry.timestamp.isoformat()
+        library_name = self._resolve_record_library_name(entry)
         with self._lock:
             self._conn.execute(
                 """
@@ -436,15 +450,17 @@ class MemoryRepository:
                     localization_session_id,
                     payload_json,
                     created_at,
-                    updated_at
+                    updated_at,
+                    library_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_id) DO UPDATE SET
                     anchor_id = excluded.anchor_id,
                     map_version_id = excluded.map_version_id,
                     localization_session_id = excluded.localization_session_id,
                     payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    library_name = excluded.library_name
                 """,
                 (
                     entry.event_id,
@@ -454,6 +470,7 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     created_at,
+                    library_name,
                 ),
             )
             self._conn.commit()
@@ -463,6 +480,7 @@ class MemoryRepository:
         created_at = entry.timestamp.isoformat()
         semantic_updated_at = entry.semantic_updated_at.isoformat() if entry.semantic_updated_at else None
         updated_at = semantic_updated_at or created_at
+        library_name = self._resolve_record_library_name(entry)
         with self._lock:
             self._conn.execute(
                 """
@@ -476,9 +494,10 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     updated_at,
-                    semantic_updated_at
+                    semantic_updated_at,
+                    library_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scene_space_id) DO UPDATE SET
                     map_version_id = excluded.map_version_id,
                     localization_session_id = excluded.localization_session_id,
@@ -487,7 +506,8 @@ class MemoryRepository:
                     review_status = excluded.review_status,
                     payload_json = excluded.payload_json,
                     updated_at = excluded.updated_at,
-                    semantic_updated_at = excluded.semantic_updated_at
+                    semantic_updated_at = excluded.semantic_updated_at,
+                    library_name = excluded.library_name
                 """,
                 (
                     entry.scene_space_id,
@@ -500,6 +520,7 @@ class MemoryRepository:
                     created_at,
                     updated_at,
                     semantic_updated_at,
+                    library_name,
                 ),
             )
             self._conn.commit()
@@ -507,6 +528,7 @@ class MemoryRepository:
     def upsert_navigation_trajectory_event(self, entry: NavigationTrajectoryEvent) -> None:
         payload_json = entry.model_dump_json()
         created_at = entry.timestamp.isoformat()
+        library_name = self._resolve_record_library_name(entry)
         with self._lock:
             self._conn.execute(
                 """
@@ -518,16 +540,18 @@ class MemoryRepository:
                     source_record_id,
                     payload_json,
                     created_at,
-                    updated_at
+                    updated_at,
+                    library_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trajectory_event_id) DO UPDATE SET
                     event_kind = excluded.event_kind,
                     map_version_id = excluded.map_version_id,
                     localization_session_id = excluded.localization_session_id,
                     source_record_id = excluded.source_record_id,
                     payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    library_name = excluded.library_name
                 """,
                 (
                     entry.trajectory_event_id,
@@ -538,6 +562,7 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     created_at,
+                    library_name,
                 ),
             )
             self._conn.commit()
@@ -545,6 +570,7 @@ class MemoryRepository:
     def upsert_semantic_graph_relation(self, entry: SemanticGraphRelation) -> None:
         payload_json = entry.model_dump_json()
         created_at = entry.timestamp.isoformat()
+        library_name = self._resolve_record_library_name(entry)
         with self._lock:
             self._conn.execute(
                 """
@@ -559,9 +585,10 @@ class MemoryRepository:
                     localization_session_id,
                     payload_json,
                     created_at,
-                    updated_at
+                    updated_at,
+                    library_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(relation_id) DO UPDATE SET
                     relation_kind = excluded.relation_kind,
                     source_node_kind = excluded.source_node_kind,
@@ -571,7 +598,8 @@ class MemoryRepository:
                     map_version_id = excluded.map_version_id,
                     localization_session_id = excluded.localization_session_id,
                     payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    library_name = excluded.library_name
                 """,
                 (
                     entry.relation_id,
@@ -585,6 +613,7 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     created_at,
+                    library_name,
                 ),
             )
             self._conn.commit()
@@ -592,6 +621,7 @@ class MemoryRepository:
     def upsert_semantic_summary_node(self, entry: SemanticSummaryNode) -> None:
         payload_json = entry.model_dump_json()
         created_at = entry.timestamp.isoformat()
+        library_name = self._resolve_record_library_name(entry)
         with self._lock:
             self._conn.execute(
                 """
@@ -605,9 +635,10 @@ class MemoryRepository:
                     label,
                     payload_json,
                     created_at,
-                    updated_at
+                    updated_at,
+                    library_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(summary_id) DO UPDATE SET
                     summary_kind = excluded.summary_kind,
                     map_version_id = excluded.map_version_id,
@@ -616,7 +647,8 @@ class MemoryRepository:
                     semantic_region_id = excluded.semantic_region_id,
                     label = excluded.label,
                     payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    library_name = excluded.library_name
                 """,
                 (
                     entry.summary_id,
@@ -629,6 +661,7 @@ class MemoryRepository:
                     payload_json,
                     created_at,
                     created_at,
+                    library_name,
                 ),
             )
             self._conn.commit()
@@ -943,6 +976,202 @@ class MemoryRepository:
             if column_name not in existing:
                 self._conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table_name, column_name, column_type))
 
+    # —— speed-up-list-maps-summary ——
+    # 8 张记忆表与 library_name 列 / 索引的常量映射；供 _ensure_library_name_columns /
+    # _ensure_library_name_indexes / count_records_by_library / backfill_library_names 共用。
+    _LIBRARY_NAME_TABLES: Sequence[str] = (
+        "tagged_locations",
+        "semantic_memories",
+        "semantic_instances",
+        "observation_events",
+        "scene_spaces",
+        "navigation_trajectory_events",
+        "semantic_graph_relations",
+        "semantic_summary_nodes",
+    )
+
+    def _ensure_library_name_columns(self) -> None:
+        """确保 8 张记忆表都有 library_name 列（不存在则 ALTER）。"""
+
+        for table_name in self._LIBRARY_NAME_TABLES:
+            self._ensure_columns(table_name, {"library_name": "TEXT"})
+
+    @staticmethod
+    def _resolve_record_library_name(record: object) -> str:
+        """从 record.metadata 提取 MEMORY_LIBRARY_METADATA_KEY；缺失则 LEGACY_DEFAULT。
+
+        与 services/memory/service.py::_record_library_name 行为保持一致：
+        - metadata[MEMORY_LIBRARY_METADATA_KEY] 非空字符串 → 用之；
+        - 否则返回 LEGACY_DEFAULT（"legacy_default"），与旧全量实现兜底语义一致。
+        """
+
+        MEMORY_LIBRARY_METADATA_KEY = "memory_library_name"
+        LEGACY_DEFAULT = "legacy_default"
+        metadata = getattr(record, "metadata", None)
+        if isinstance(metadata, dict):
+            value = metadata.get(MEMORY_LIBRARY_METADATA_KEY)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return LEGACY_DEFAULT
+
+    def _ensure_library_name_indexes(self) -> None:
+        """为每张记忆表的 library_name 列加索引（按库聚合 O(logN)）。"""
+
+        for table_name in self._LIBRARY_NAME_TABLES:
+            index_name = "idx_%s_library_name" % table_name
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS %s ON %s(library_name)" % (index_name, table_name)
+            )
+
+    def has_library_name_columns(self) -> bool:
+        """检测所有记忆表是否都已具备 library_name 列（用于轻量快路径就绪判定）。"""
+
+        with self._lock:
+            for table_name in self._LIBRARY_NAME_TABLES:
+                columns = {
+                    str(row["name"])
+                    for row in self._conn.execute("PRAGMA table_info(%s)" % table_name).fetchall()
+                }
+                if "library_name" not in columns:
+                    return False
+        return True
+
+    def count_records_by_library(self) -> Dict[str, Dict[str, int]]:
+        """按库聚合各记忆表的轻量计数（不反序列化 payload）。
+
+        返回结构：{ library_name: { record_kind: count, ... }, ... }。
+        record_kind 取值：tagged_location / semantic_memory / semantic_instance /
+        observation_event / scene_space / navigation_trajectory /
+        semantic_graph_relation / semantic_summary。
+        """
+
+        table_to_kind = (
+            ("tagged_locations", "tagged_location"),
+            ("semantic_memories", "semantic_memory"),
+            ("semantic_instances", "semantic_instance"),
+            ("observation_events", "observation_event"),
+            ("scene_spaces", "scene_space"),
+            ("navigation_trajectory_events", "navigation_trajectory"),
+            ("semantic_graph_relations", "semantic_graph_relation"),
+            ("semantic_summary_nodes", "semantic_summary"),
+        )
+        result: Dict[str, Dict[str, int]] = {}
+        with self._lock:
+            for table_name, record_kind in table_to_kind:
+                rows = self._conn.execute(
+                    """
+                    SELECT COALESCE(library_name, '') AS library_name, COUNT(*) AS cnt
+                    FROM %s
+                    GROUP BY library_name
+                    """ % table_name
+                ).fetchall()
+                for row in rows:
+                    name = str(row["library_name"] or "").strip()
+                    if not name:
+                        # 列虽存在但未回填；按 legacy_default 计入以与旧全量实现语义一致。
+                        name = "legacy_default"
+                    bucket = result.setdefault(name, {})
+                    bucket[record_kind] = int(row["cnt"])
+        return result
+
+    def library_last_updated_at(self) -> Dict[str, str]:
+        """按库返回最新更新时间（取各表 updated_at/created_at 最大值）。"""
+
+        table_to_kind: tuple = ()  # 仅用于按表选 updated 列名
+        del table_to_kind
+        table_to_updated = (
+            ("tagged_locations", "updated_at"),
+            ("semantic_memories", "updated_at"),
+            ("semantic_instances", "updated_at"),
+            ("observation_events", "updated_at"),
+            ("scene_spaces", "updated_at"),
+            ("navigation_trajectory_events", "updated_at"),
+            ("semantic_graph_relations", "updated_at"),
+            ("semantic_summary_nodes", "updated_at"),
+        )
+        merged: Dict[str, str] = {}
+        with self._lock:
+            for table_name, updated_col in table_to_updated:
+                rows = self._conn.execute(
+                    """
+                    SELECT COALESCE(library_name, '') AS library_name, MAX(%s) AS last_ts
+                    FROM %s
+                    GROUP BY library_name
+                    """ % (updated_col, table_name)
+                ).fetchall()
+                for row in rows:
+                    name = str(row["library_name"] or "").strip() or "legacy_default"
+                    last_ts = str(row["last_ts"] or "") if row["last_ts"] is not None else ""
+                    if not last_ts:
+                        continue
+                    existing = merged.get(name)
+                    if existing is None or last_ts > existing:
+                        merged[name] = last_ts
+        return merged
+
+    def backfill_library_names(self, *, batch_size: int = 500) -> Dict[str, int]:
+        """从 payload_json 元数据回填 library_name 列；幂等可重入。
+
+        - 仅处理 library_name IS NULL 的行；
+        - 从 payload_json 提取 MEMORY_LIBRARY_METADATA_KEY（'memory_library_name'）作为库名；
+        - 缺失则写入 LEGACY_DEFAULT('legacy_default')；
+        - 按 batch_size 分批提交；返回 {table_name: updated_rows}。
+        """
+
+        MEMORY_LIBRARY_METADATA_KEY = "memory_library_name"
+        LEGACY_DEFAULT = "legacy_default"
+        table_to_pk = (
+            ("tagged_locations", "location_id"),
+            ("semantic_memories", "memory_id"),
+            ("semantic_instances", "instance_id"),
+            ("observation_events", "event_id"),
+            ("scene_spaces", "scene_space_id"),
+            ("navigation_trajectory_events", "trajectory_event_id"),
+            ("semantic_graph_relations", "relation_id"),
+            ("semantic_summary_nodes", "summary_id"),
+        )
+        updated_totals: Dict[str, int] = {}
+        with self._lock:
+            for table_name, pk_col in table_to_pk:
+                updated = 0
+                while True:
+                    rows = self._conn.execute(
+                        """
+                        SELECT %s AS pk, payload_json AS payload_json
+                        FROM %s
+                        WHERE library_name IS NULL
+                        LIMIT ?
+                        """ % (pk_col, table_name),
+                        (batch_size,),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    updates: List[tuple] = []
+                    for row in rows:
+                        payload_str = str(row["payload_json"] or "")
+                        library_name = LEGACY_DEFAULT
+                        if payload_str:
+                            try:
+                                metadata = json.loads(payload_str).get("metadata") or {}
+                                value = (metadata or {}).get(MEMORY_LIBRARY_METADATA_KEY) if isinstance(metadata, dict) else None
+                                if isinstance(value, str) and value.strip():
+                                    library_name = value.strip()
+                            except (ValueError, TypeError):
+                                # payload 损坏时按 legacy_default 处理，保持与 _record_library_name 兜底一致。
+                                library_name = LEGACY_DEFAULT
+                        updates.append((library_name, str(row["pk"])))
+                    self._conn.executemany(
+                        "UPDATE %s SET library_name = ? WHERE %s = ?" % (table_name, pk_col),
+                        updates,
+                    )
+                    self._conn.commit()
+                    updated += len(updates)
+                    if len(rows) < batch_size:
+                        break
+                if updated:
+                    updated_totals[table_name] = updated
+        return updated_totals
+
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.execute(
@@ -1199,6 +1428,11 @@ class MemoryRepository:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_label ON semantic_summary_nodes(label)"
             )
+            # —— speed-up-list-maps-summary ——
+            # 给 8 张记忆表加 library_name 列 + 索引，供 list_memory_libraries
+            # 轻量聚合使用；写入路径通过 upsert_* 从 payload_json 元数据里提取后落列。
+            self._ensure_library_name_columns()
+            self._ensure_library_name_indexes()
             self._conn.commit()
 
     def __del__(self) -> None:

@@ -702,7 +702,11 @@ class MapWorkspaceService:
             if is_active and self._repository.get_active_map_name() == asset.map_name
             else None
         )
-        memory_summary = self._memory_service.get_summary()
+        # —— speed-up-list-maps-summary ——
+        # 非活跃资产不调 get_summary()（其内部 list_memory_libraries 会逐行反序列化
+        # 8 张记忆表 payload，×8 资产 ≈8s 是 list_maps 实测 13s 的根因）。非活跃资产的
+        # 状态推断无需 memory_active 信息，置为 None 即可。活跃资产仍按原路径算一次完整 summary。
+        memory_summary = self._memory_service.get_summary() if is_active else None
         runtime_readiness = self._active_runtime_readiness() if is_active else {}
         live_map_loaded = bool(latest_map_snapshot is not None and runtime_readiness.get("map_loaded", True))
         frame_id = asset.frame_id
@@ -712,6 +716,10 @@ class MapWorkspaceService:
             active_localization_session is not None
             and active_localization_session.status == LocalizationSessionStatus.READY
             and runtime_readiness.get("localization_ready", True)
+        )
+        memory_active = (
+            memory_summary is not None
+            and memory_summary.metadata.get("active_library_name") == asset.bound_memory_library_name
         )
         updated_asset = asset.model_copy(
             update={
@@ -725,7 +733,7 @@ class MapWorkspaceService:
                     has_map=live_map_loaded,
                     has_saved_version=bool(asset.latest_version_id),
                     localization_ready=localization_ready,
-                    memory_active=(memory_summary.metadata.get("active_library_name") == asset.bound_memory_library_name),
+                    memory_active=memory_active,
                 ),
                 "updated_at": asset.updated_at if latest_map_snapshot is None and asset.active == is_active else datetime.now(asset.updated_at.tzinfo) if asset.updated_at.tzinfo is not None else datetime.utcnow(),
             },

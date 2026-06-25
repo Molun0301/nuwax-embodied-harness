@@ -6,6 +6,7 @@ Rust 桥是主要的 ROS2 交互层，本模块封装其 gRPC 接口，
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any, Callable, Dict, List, Optional
 
@@ -18,6 +19,62 @@ from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
 from services.geometry.ros_bridge_client import RosBridgeSubprocess
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.remote_provider")
+
+
+def _read_deadline_sec() -> float:
+    """unary 轻量读类 gRPC 调用 deadline（秒）。
+
+    下游 Rust 桥/RTAB-Map 慢或未就绪时，无 deadline 的 unary 调用会无界阻塞，
+    单点挂死整条 MCP 请求（参见超时根因 D1）。轻量读类（GetStatus / GetOccupancyGrid 元数据 /
+    GetNavigationReadiness / CancelNavigation / SetNavigationGoal / PublishOdom）统一施加该 deadline。
+
+    经 NUWAX_GEOMETRY_GRPC_READ_DEADLINE_SEC 可配；默认 2.0s，下限 0.1s 避免误配为 0。
+    """
+    try:
+        return max(0.1, float(os.environ.get("NUWAX_GEOMETRY_GRPC_READ_DEADLINE_SEC", "2.0")))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def _pose_deadline_sec() -> float:
+    """unary 位姿/坐标树读类 gRPC 调用 deadline（秒）。
+
+    GetCurrentPose / GetFrameTree 在首帧 map→odom→base_link tf2 链合成偏慢时可能 >2s
+    （见 rust-bridge-pose-localizing-bug），用轻量读 deadline 会把"合法但偏慢"的首帧误降级成
+    None（伪"无定位"）。故单独给位姿类一档更宽的 deadline，仍有界（不退回无界阻塞）。
+
+    经 NUWAX_GEOMETRY_GRPC_POSE_DEADLINE_SEC 可配；默认 5.0s，下限 0.1s。
+    默认值需按实机 p95 复核。
+    """
+    try:
+        return max(0.1, float(os.environ.get("NUWAX_GEOMETRY_GRPC_POSE_DEADLINE_SEC", "5.0")))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _heavy_deadline_sec() -> float:
+    """unary 重操作 gRPC 调用 deadline（秒）。
+
+    用于可能传输较大载荷的 unary 调用（如 GetOccupancyGridData 全量栅格字节）。
+    经 NUWAX_GEOMETRY_GRPC_HEAVY_DEADLINE_SEC 可配；默认 10.0s，下限 0.5s。
+    """
+    try:
+        return max(0.5, float(os.environ.get("NUWAX_GEOMETRY_GRPC_HEAVY_DEADLINE_SEC", "10.0")))
+    except (TypeError, ValueError):
+        return 10.0
+
+
+def _log_rpc_error(rpc_name: str, exc: grpc.RpcError) -> None:
+    """统一记录 unary gRPC 失败；区分 DEADLINE_EXCEEDED 以便排障检索。
+
+    DEADLINE_EXCEEDED 表示下游未在 deadline 内回包（本应触发降级而非挂死），
+    单列 warning 便于在运行时日志中检索"被 deadline 截断"的调用。
+    """
+    code = exc.code() if callable(getattr(exc, "code", None)) else None
+    if code == grpc.StatusCode.DEADLINE_EXCEEDED:
+        LOGGER.warning("gRPC %s 超过 deadline 被截断（DEADLINE_EXCEEDED），按降级返回", rpc_name)
+    else:
+        LOGGER.debug("gRPC %s 调用失败: %s", rpc_name, exc)
 
 
 def _normalize_frame(frame_id: str) -> str:
@@ -178,7 +235,7 @@ class RosBridgeProvider:
         try:
             self._channel = grpc.insecure_channel(self._bridge.grpc_target)
             self._stub = pb2_grpc.GeometryRuntimeStub(self._channel)
-            resp = self._stub.GetStatus(pb2.Empty())
+            resp = self._stub.GetStatus(pb2.Empty(), timeout=_read_deadline_sec())
             LOGGER.info("gRPC 连接成功: phase=%s, rss=%dKB", resp.phase, resp.rss_kb)
             self._connected = True
             return True
@@ -201,9 +258,10 @@ class RosBridgeProvider:
         if not self._connected or not self._stub:
             return False
         try:
-            resp = self._stub.GetFrameTree(pb2.Empty())
+            resp = self._stub.GetFrameTree(pb2.Empty(), timeout=_pose_deadline_sec())
             return len(resp.transforms) > 0
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            _log_rpc_error("GetFrameTree(is_available)", e)
             return False
 
     def is_localization_available(self) -> bool:
@@ -214,19 +272,21 @@ class RosBridgeProvider:
         if not self._stub:
             return None
         try:
-            resp = self._stub.GetCurrentPose(pb2.PoseRequest())
+            resp = self._stub.GetCurrentPose(pb2.PoseRequest(), timeout=_pose_deadline_sec())
             return _build_pose(resp)
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            _log_rpc_error("GetCurrentPose", e)
             return None
 
     def get_frame_tree(self) -> Optional[FrameTree]:
         if not self._stub:
             return None
         try:
-            resp = self._stub.GetFrameTree(pb2.Empty())
+            resp = self._stub.GetFrameTree(pb2.Empty(), timeout=_pose_deadline_sec())
             frame_tree = _build_frame_tree(resp.transforms)
             return _merge_static_edges(frame_tree, self._static_extrinsic_edges)
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            _log_rpc_error("GetFrameTree", e)
             return None
 
     # === Mapping ===
@@ -234,14 +294,15 @@ class RosBridgeProvider:
         if not self._stub:
             return None
         try:
-            resp = self._stub.GetOccupancyGrid(pb2.Empty())
+            resp = self._stub.GetOccupancyGrid(pb2.Empty(), timeout=_read_deadline_sec())
             return {
                 "width": resp.width, "height": resp.height,
                 "resolution": resp.resolution,
                 "origin_x": resp.origin_x, "origin_y": resp.origin_y,
                 "frame_id": resp.frame_id, "revision": resp.revision,
             }
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            _log_rpc_error("GetOccupancyGrid", e)
             return None
 
     def get_occupancy_grid_data(self) -> Optional[Dict[str, Any]]:
@@ -249,7 +310,8 @@ class RosBridgeProvider:
         if not self._stub:
             return None
         try:
-            resp = self._stub.GetOccupancyGridData(pb2.Empty())
+            # 全量栅格字节可能较大，用重操作 deadline 而非读类 deadline。
+            resp = self._stub.GetOccupancyGridData(pb2.Empty(), timeout=_heavy_deadline_sec())
             meta = resp.meta
             return {
                 "width": meta.width, "height": meta.height,
@@ -258,7 +320,8 @@ class RosBridgeProvider:
                 "frame_id": meta.frame_id, "revision": meta.revision,
                 "data": bytes(resp.data),
             }
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            _log_rpc_error("GetOccupancyGridData", e)
             return None
 
     # === Navigation ===
@@ -272,25 +335,27 @@ class RosBridgeProvider:
                     orientation=pb2.Quat(x=qx, y=qy, z=qz, w=qw),
                 )
             )
-            resp = self._stub.SetNavigationGoal(goal)
+            resp = self._stub.SetNavigationGoal(goal, timeout=_read_deadline_sec())
             return {"accepted": resp.accepted, "goal_id": resp.goal_id, "message": resp.message}
         except grpc.RpcError as e:
+            _log_rpc_error("SetNavigationGoal", e)
             return {"accepted": False, "message": str(e)}
 
     def cancel_navigation(self) -> bool:
         if not self._stub:
             return False
         try:
-            resp = self._stub.CancelNavigation(pb2.Empty())
+            resp = self._stub.CancelNavigation(pb2.Empty(), timeout=_read_deadline_sec())
             return resp.success
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            _log_rpc_error("CancelNavigation", e)
             return False
 
     def get_navigation_readiness(self) -> Dict[str, Any]:
         if not self._stub:
             return {"ready": False, "message": "未连接"}
         try:
-            resp = self._stub.GetNavigationReadiness(pb2.Empty())
+            resp = self._stub.GetNavigationReadiness(pb2.Empty(), timeout=_read_deadline_sec())
             return {
                 "ready": resp.ready,
                 "waiting_for": resp.waiting_for,
@@ -298,7 +363,8 @@ class RosBridgeProvider:
                 "action_server_ready": resp.action_server_ready,
                 "tf_ready": resp.tf_ready,
             }
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            _log_rpc_error("GetNavigationReadiness", e)
             return {"ready": False, "message": "gRPC 错误"}
 
     # === 输入桥 ===
@@ -318,18 +384,20 @@ class RosBridgeProvider:
                 linear_velocity=pb2.Vec3(x=lvx, y=lvy, z=lvz),
                 angular_velocity=pb2.Vec3(x=avx, y=avy, z=avz),
             )
-            self._stub.PublishOdom(msg)
+            self._stub.PublishOdom(msg, timeout=_read_deadline_sec())
             return True
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            _log_rpc_error("PublishOdom", e)
             return False
 
     def get_status(self) -> Dict[str, Any]:
         if not self._stub:
             return {"phase": "disconnected", "rss_kb": 0}
         try:
-            resp = self._stub.GetStatus(pb2.Empty())
+            resp = self._stub.GetStatus(pb2.Empty(), timeout=_read_deadline_sec())
             return {"phase": resp.phase, "message": resp.message, "rss_kb": resp.rss_kb}
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            _log_rpc_error("GetStatus", e)
             return {"phase": "error", "rss_kb": 0}
 
     # === 流式订阅 ===

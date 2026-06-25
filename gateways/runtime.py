@@ -284,8 +284,9 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
 )
 _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
     {
-        "relocalize_active_map",
-        "load_map_version",
+        # relocalize_active_map / load_map_version 已改为 ASYNC_TASK（见超时根因 D3）：
+        # 它们的重型阻塞段在后台 task runner 内 ensure 几何运行时，不再走此同步门禁，
+        # 故从本集合移除，否则 _ensure_geometry_runtime_for_invoke 会在异步分派前同步等待。
         "save_active_map_version",
         "start_mapping",
         "stop_mapping",
@@ -1575,17 +1576,18 @@ class GatewayRuntime:
             _descriptor(
                 "relocalize_active_map",
                 "重定位当前地图",
-                "仅在当前地图版本已经通过 load_map_version 加载且 active_workspace.map_loaded=true 后，执行一次平台重定位刷新。加载旧地图必须先调用 load_map_version，不要用本能力启动地图加载。",
-                execution_mode=CapabilityExecutionMode.SYNC,
+                "仅在当前地图版本已经通过 load_map_version 加载且 active_workspace.map_loaded=true 后，执行一次平台重定位刷新。加载旧地图必须先调用 load_map_version，不要用本能力启动地图加载。本能力为异步任务：立即返回 task_id，用 get_task_status 轮询直到完成。",
+                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
-                input_schema=_schema_object({"map_name": {"type": "string"}}),
-                output_schema=_schema_object(
+                input_schema=_schema_object(
                     {
-                        "localization_session": {"type": "object"},
-                        "localization_snapshot": {"type": "object"},
-                        "active_workspace": {"type": "object"},
+                        "map_name": {"type": "string"},
+                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     }
                 ),
+                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
+                required_resources=(RuntimeResource.MAP_WORKSPACE.value,),
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
             ),
             _descriptor(
                 "get_map_snapshot",
@@ -1661,18 +1663,21 @@ class GatewayRuntime:
             _descriptor(
                 "activate_map",
                 "启用地图",
-                "仅切换/启用地图工作区与记忆库，不启动 go2.sh。遥控建图需在 activate_map 后调用 start_mapping；自主探索用 explore_area。",
-                execution_mode=CapabilityExecutionMode.SYNC,
+                "仅切换/启用地图工作区与记忆库，不启动 go2.sh。遥控建图需在 activate_map 后调用 start_mapping；自主探索用 explore_area。本能力为异步任务：立即返回 task_id，用 get_task_status 轮询直到完成。",
+                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
                     {
                         "map_name": {"type": "string"},
                         "load_memory_history": {"type": "boolean", "default": True},
                         "reset_memory_library": {"type": "boolean", "default": False},
+                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     },
                     required=("map_name",),
                 ),
-                output_schema=_schema_object({"active_workspace": {"type": "object"}, "maps": {"type": "array"}, "memory_summary": {"type": "object"}}),
+                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
+                required_resources=(RuntimeResource.MAP_WORKSPACE.value,),
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
             ),
             _descriptor(
                 "delete_map",
@@ -1773,8 +1778,8 @@ class GatewayRuntime:
             _descriptor(
                 "load_map_version",
                 "加载地图版本",
-                "把平台侧已保存的地图版本加载到当前地图工作区。",
-                execution_mode=CapabilityExecutionMode.SYNC,
+                "把平台侧已保存的地图版本加载到当前地图工作区。本能力为异步任务：立即返回 task_id，用 get_task_status 轮询直到完成。",
+                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
                     {
@@ -1782,10 +1787,13 @@ class GatewayRuntime:
                         "version_id": {"type": "string"},
                         "load_memory_history": {"type": "boolean", "default": True},
                         "reset_memory_library": {"type": "boolean", "default": False},
+                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     },
                     required=("map_name",),
                 ),
-                output_schema=_schema_object({"map_version": {"type": "object"}, "active_workspace": {"type": "object"}}),
+                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
+                required_resources=(RuntimeResource.MAP_WORKSPACE.value,),
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
             ),
             _descriptor(
                 "list_memory_libraries",
@@ -2323,14 +2331,14 @@ class GatewayRuntime:
             "stop_perception_runtime": self._handle_stop_perception_runtime,
             "get_localization_snapshot": partial(localization_skills.handle_get_localization_snapshot, self._skill_ctx),
             "get_localization_session": partial(localization_skills.handle_get_localization_session, self._skill_ctx),
-            "relocalize_active_map": partial(localization_skills.handle_relocalize_active_map, self._skill_ctx),
+            "relocalize_active_map": self._handle_relocalize_active_map_async,
             "get_map_snapshot": partial(localization_skills.handle_get_map_snapshot, self._skill_ctx),
             "get_navigation_snapshot": partial(localization_skills.handle_get_navigation_snapshot, self._skill_ctx),
             "get_navigation_semantic_context": partial(localization_skills.handle_get_navigation_semantic_context, self._skill_ctx),
             "resolve_navigation_candidates": partial(localization_skills.handle_resolve_navigation_candidates, self._skill_ctx),
             "list_maps": partial(localization_skills.handle_list_maps, self._skill_ctx),
             "create_map": partial(localization_skills.handle_create_map, self._skill_ctx),
-            "activate_map": partial(localization_skills.handle_activate_map, self._skill_ctx),
+            "activate_map": self._handle_activate_map_async,
             "delete_map": partial(localization_skills.handle_delete_map, self._skill_ctx),
             "get_active_map": partial(localization_skills.handle_get_active_map, self._skill_ctx),
             "list_map_versions": partial(localization_skills.handle_list_map_versions, self._skill_ctx),
@@ -2338,7 +2346,7 @@ class GatewayRuntime:
             # RTAB 新增建图能力（skills 未下放），保留 runtime 方法派发：
             "start_mapping": self._handle_start_mapping,
             "stop_mapping": self._handle_stop_mapping,
-            "load_map_version": partial(localization_skills.handle_load_map_version, self._skill_ctx),
+            "load_map_version": self._handle_load_map_version_async,
             "list_memory_libraries": partial(memory_skills.handle_list_memory_libraries, self._skill_ctx),
             "create_memory_library": partial(memory_skills.handle_create_memory_library, self._skill_ctx),
             "enable_memory_library": partial(memory_skills.handle_enable_memory_library, self._skill_ctx),
@@ -3007,8 +3015,9 @@ class GatewayRuntime:
             )
             slim_result = result
             if isinstance(result, dict) and descriptor.name in {
+                # 注意：activate_map 已改 ASYNC_TASK（超时根因 D3），其结果走异步分支不经此 SYNC 瘦身，
+                # 故不再列入；保留仍为 SYNC 的几何/地图能力。
                 "create_map",
-                "activate_map",
                 "list_maps",
                 "get_active_map",
                 "delete_map",
@@ -7186,6 +7195,105 @@ class GatewayRuntime:
                 "candidate_diagnostics": candidate_diagnostics,
                 "rejected_candidate_ids": sorted(rejected_record_ids),
             },
+        )
+
+    def _submit_geometry_skill_task(
+        self,
+        *,
+        capability_name: str,
+        skill_handler: Callable[..., Dict[str, Any]],
+        arguments: Dict[str, Any],
+        requested_by: Optional[str],
+        request_context: Optional[MetadataDict],
+    ):
+        """把重型几何 skill handler 包进后台 task runner（超时根因 D3）。
+
+        activate_map / relocalize_active_map / load_map_version 原为 SYNC，其 handler 内
+        会同步启动 RTAB-Map 栈 + 重定位/后端切换（数十秒），在 MCP 单次请求线程内执行会
+        超过客户端 ~60s 超时（-32001）。此处复用既有 ASYNC_TASK 机制（参照
+        _submit_navigation_task）：立即返回 task_id，handler 整体在后台线程执行。
+
+        handler 自身已携带各自的几何运行时 ensure（activate_map→ensure_geometry_runtime_started，
+        relocalize→ensure_geometry_runtime_for_capability）；load_map_version 的 handler 不自带
+        ensure，由本 runner 在调用 handler 前显式补 ensure（见下，N2 收口）。
+        """
+        descriptor = self.capability_registry.get_descriptor(capability_name)
+        timeout_sec = self._resolve_async_timeout(capability_name, arguments, minimum_sec=1.0)
+        payload = dict(arguments or {})
+
+        def runner(context) -> Dict[str, Any]:
+            context.ensure_active()
+            context.update(
+                progress=0.05,
+                stage="prepare_geometry_runtime",
+                message=f"准备执行 {capability_name}（含按需启动几何运行时）。",
+            )
+            # N2：load_map_version 的 handler 体内无 ensure，移出 _SYNC_ 后门禁不再启栈，
+            # 故 runner 必须在调用 handler 前显式启动几何运行时（其它两者 handler 自带 ensure）。
+            if capability_name == "load_map_version":
+                self._ensure_geometry_runtime_for_capability("load_map_version")
+            context.ensure_active()
+            result = skill_handler(payload, requested_by=requested_by)
+            context.update(progress=1.0, stage="completed", message=f"{capability_name} 已完成。")
+            return result
+
+        return self.task_manager.submit(
+            capability_name,
+            runner,
+            input_payload={k: v for k, v in payload.items() if _has_observability_value(v)},
+            requested_by=requested_by,
+            required_resources=list(descriptor.required_resources),
+            timeout_sec=timeout_sec,
+            metadata=self._build_task_request_metadata(
+                capability_name=capability_name,
+                requested_by=requested_by,
+                request_context=request_context,
+            ),
+        )
+
+    def _handle_activate_map_async(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
+        return self._submit_geometry_skill_task(
+            capability_name="activate_map",
+            skill_handler=partial(localization_skills.handle_activate_map, self._skill_ctx),
+            arguments=arguments,
+            requested_by=requested_by,
+            request_context=request_context,
+        )
+
+    def _handle_relocalize_active_map_async(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
+        return self._submit_geometry_skill_task(
+            capability_name="relocalize_active_map",
+            skill_handler=partial(localization_skills.handle_relocalize_active_map, self._skill_ctx),
+            arguments=arguments,
+            requested_by=requested_by,
+            request_context=request_context,
+        )
+
+    def _handle_load_map_version_async(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
+        return self._submit_geometry_skill_task(
+            capability_name="load_map_version",
+            skill_handler=partial(localization_skills.handle_load_map_version, self._skill_ctx),
+            arguments=arguments,
+            requested_by=requested_by,
+            request_context=request_context,
         )
 
     def _safe_stop_robot(self, reason: Optional[str]) -> None:

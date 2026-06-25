@@ -49,18 +49,29 @@ class MapWorkspaceService:
     def catalog_root(self) -> str:
         return str(self._repository.root_dir)
 
-    def list_maps(self) -> Tuple[MapAsset, ...]:
+    def list_maps(self, *, refresh_localization: bool = True) -> Tuple[MapAsset, ...]:
         active_map_name = self._repository.get_active_map_name()
-        assets = [self._sync_asset(item, is_active=(item.map_name == active_map_name)) for item in self._repository.list_map_assets()]
+        assets = [
+            self._sync_asset(
+                item,
+                is_active=(item.map_name == active_map_name),
+                refresh_localization=refresh_localization,
+            )
+            for item in self._repository.list_map_assets()
+        ]
         assets.sort(key=lambda item: (not item.active, item.display_name.lower(), item.display_name))
         return tuple(assets)
 
-    def get_map(self, map_name: str) -> Optional[MapAsset]:
+    def get_map(self, map_name: str, *, refresh_localization: bool = True) -> Optional[MapAsset]:
         asset = self._repository.get_map_asset(self._require_map_name(map_name))
         if asset is None:
             return None
         active_map_name = self._repository.get_active_map_name()
-        return self._sync_asset(asset, is_active=(asset.map_name == active_map_name))
+        return self._sync_asset(
+            asset,
+            is_active=(asset.map_name == active_map_name),
+            refresh_localization=refresh_localization,
+        )
 
     def create_map(
         self,

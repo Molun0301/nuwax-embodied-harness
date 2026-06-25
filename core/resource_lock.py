@@ -16,6 +16,10 @@ class RuntimeResource(StrEnum):
     NAVIGATION = "navigation"
     AUDIO_OUT = "audio_out"
     CAMERA_OBSERVATION = "camera_observation"
+    # 地图工作区互斥：activate_map / relocalize_active_map / load_map_version 异步化后
+    # （超时根因 D3）不再天然串行，三者并发会竞态改写 workspace/记忆库/会话绑定。
+    # 共用此资源令牌使它们互斥（冲突即 ResourceConflictError 快速失败，非排队）。
+    MAP_WORKSPACE = "map_workspace"
 
 
 class ResourceLease(ContractModel):

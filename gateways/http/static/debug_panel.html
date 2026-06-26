@@ -571,8 +571,8 @@ button{font-family:inherit;cursor:pointer}
         initialPosePickStroke: "#fdba74",
         navPath: "#22ff66",
       };
-      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "logs"];
-      const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", logs: "日志" };
+      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "perception_nms", "logs"];
+      const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 500;
       const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state", "system.metrics"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
@@ -1043,6 +1043,9 @@ button{font-family:inherit;cursor:pointer}
         state.latestOverview = data;
         if (!state.streamSocket || state.streamSocket.readyState !== WebSocket.OPEN) setText(els.connectionText, "在线");
         for (const name of overviewNames) {
+          // perception_nms 卡片由 video.detections 流（updatePerceptionNmsCard）驱动，
+          // 不走通用 overview envelope，避免被 missing 覆盖。
+          if (name === "perception_nms") continue;
           const summary = data[name] || {};
           const section = document.getElementById(`overview-${name}`);
           if (!section) continue;
@@ -3871,7 +3874,28 @@ button{font-family:inherit;cursor:pointer}
         setPill(els.videoStatus, statusOf(envelope), `${state.videoDetections.length} 个检测`);
         setText(els.visionModelStatus, `本地模型：${data.detector_backend || envelope.source || "perception"}`);
         setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${displayStatus(state.videoStreamStatus)}`);
+        updatePerceptionNmsCard(data, envelope);
         scheduleVideoDetectionDraw();
+      }
+      // vis-three-fixes 任务 1.7 / AC3.4：用 video.detections 流里的 nms_stats 填充感知 NMS 卡片。
+      function updatePerceptionNmsCard(data, envelope) {
+        const section = document.getElementById("overview-perception_nms");
+        if (!section) return;
+        const nms = (data && data.nms_stats) || {};
+        const raw = nms.raw_count;
+        const kept = nms.kept_count;
+        const suppressed = nms.suppressed_count;
+        const hasStats = raw !== undefined || kept !== undefined || suppressed !== undefined;
+        setPill(section.querySelector(".pill"), hasStats ? statusOf(envelope) : "missing");
+        const stageMs = (data && data.stage_duration_ms) || {};
+        setKv(section.querySelector(".kv"), [
+          ["原始框", raw === undefined ? "--" : String(raw)],
+          ["保留框", kept === undefined ? "--" : String(kept)],
+          ["抑制框", suppressed === undefined ? "--" : String(suppressed)],
+          ["检测耗时", fmt(stageMs.detector, " ms")],
+          ["锁等待", fmt(data && data.pipeline_lock_wait_ms, " ms")],
+        ]);
+        section.querySelector(".small").textContent = `前端接收 ${shortTime(envelope.__receivedAt)}`;
       }
       function scheduleVideoDetectionDraw() {
         if (state.videoDetectionDrawFrame) return;

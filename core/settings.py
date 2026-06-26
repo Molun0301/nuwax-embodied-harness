@@ -260,6 +260,8 @@ class PerceptionYoloWorldConfig:
     )
     class_aliases: Tuple[str, ...] = ()
     dynamic_class_metadata_keys: Tuple[str, ...] = ()
+    # vis-three-fixes 任务 3.2：worker 进程推理开关，默认 True 与 detectors.py:364 现状一致。
+    use_worker_process: bool = True
 
 
 @dataclass
@@ -393,8 +395,9 @@ class PerceptionPostProcessConfig:
     """
 
     enabled: bool = True
-    # 偏高（默认 0.8）：只合并几乎完全重合的框，空间分离的同类物体不会被误并。
-    iou_threshold: float = 0.8
+    # vis-three-fixes 任务 4.2：开放词汇模型对同一物体的多标签框 IoU 通常 0.5-0.7，
+    # 原默认 0.8 偏高导致跨类重叠不被抑制（NMS 看似无效）；降到 0.55 与杠杆二意图一致。
+    iou_threshold: float = 0.55
 
 
 @dataclass
@@ -571,6 +574,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             ),
             class_aliases=_cfg_csv("NUWAX_PERCEPTION_YOLO_WORLD_ALIASES", ()),
             dynamic_class_metadata_keys=_cfg_csv("NUWAX_PERCEPTION_YOLO_WORLD_DYNAMIC_CLASS_KEYS", ()),
+            use_worker_process=_cfg_bool("NUWAX_PERCEPTION_YOLO_WORLD_USE_WORKER", True),
         ),
         tracker=PerceptionTrackerConfig(
             default_backend=_cfg_str("NUWAX_PERCEPTION_TRACKER_BACKEND", "bytetrack"),
@@ -659,7 +663,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             enabled=_cfg_bool("NUWAX_PERCEPTION_POSTPROCESS_NMS_ENABLED", True),
             iou_threshold=max(
                 0.0,
-                min(1.0, _cfg_float("NUWAX_PERCEPTION_POSTPROCESS_NMS_IOU", 0.8)),
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_POSTPROCESS_NMS_IOU", 0.55)),
             ),
         ),
     )

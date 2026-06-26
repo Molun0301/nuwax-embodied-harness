@@ -348,6 +348,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         iou_threshold: float = 0.45,
         image_size: int = 640,
         max_detections: int = 100,
+        use_worker_process: bool = True,
     ) -> None:
         self._weights = str(weights).strip() or "yolov8s-worldv2.pt"
         # 按模型文件后缀自动决定推理链路：.engine → TensorRT(YOLO 类)，其余 → PyTorch(YOLOWorld 开放词汇类)。
@@ -361,7 +362,10 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         self._resolved_model_source = ""
         self._resolved_backend_kind = "yolo_world_tensorrt" if self._use_tensorrt else "yolo_world_pytorch"
         self._inference_worker = None
-        self._use_worker_process = True  # 可通过子类或配置关闭
+        # vis-three-fixes 任务 3.4：worker 进程开关，默认 True；由配置/构造参数显式覆盖。
+        self._use_worker_process = bool(use_worker_process)
+        # 任务 3.9：最近一次 worker 推理耗时（毫秒），detect() 元数据透传。
+        self._last_worker_inference_ms = None
         provider_metadata = resolve_detection_provider_spec(
             backend_name=name,
             backend_kind="yolo_world",
@@ -408,11 +412,14 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
 
     def _predict(self, image_bgr) -> List[Any]:
         # 优先使用独立进程推理（释放主线程 GIL）
+        self._last_worker_inference_ms = None
         if self._use_worker_process:
             worker = self._get_inference_worker()
             if worker is not None and worker.is_ready:
                 result = worker.predict(image_bgr)
                 if result is not None:
+                    # vis-three-fixes 任务 3.9：记录 worker 推理耗时供 detect() 元数据透传。
+                    self._last_worker_inference_ms = getattr(worker, "last_inference_ms", None)
                     return [_WorkerResult(*result)]
                 # worker 返回 None 时回退到主线程推理
 
@@ -759,6 +766,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         class_names: Tuple[str, ...] = (),
         class_aliases: Tuple[str, ...] = (),
         dynamic_class_metadata_keys: Tuple[str, ...] = (),
+        use_worker_process: bool = True,
     ) -> None:
         super().__init__(
             name=name,
@@ -768,6 +776,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             iou_threshold=iou_threshold,
             image_size=image_size,
             max_detections=max_detections,
+            use_worker_process=use_worker_process,
         )
         self._configured_class_names = self._normalize_class_names(class_names) or ("object",)
         self._dynamic_class_metadata_keys = tuple(
@@ -884,6 +893,8 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                 "model_loaded": self._model is not None,
                 "model_source": self._resolved_model_source or self._weights,
                 "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
+                "worker_inference_ms": self._last_worker_inference_ms,
+                "use_worker_process": self._use_worker_process,
             },
         )
 
@@ -912,6 +923,18 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         return self._model
 
     def _predict_with_classes(self, image_bgr, class_names: Tuple[str, ...]) -> List[Any]:
+        # vis-three-fixes 任务 3.9：TensorRT engine 的类别已固化进引擎，set_classes 不可用，
+        # 此路径可走 worker 子进程（释放 GIL）。.pt 需主线程 set_classes，故仍走主线程。
+        self._last_worker_inference_ms = None
+        if self._use_tensorrt and self._use_worker_process:
+            worker = self._get_inference_worker()
+            if worker is not None and worker.is_ready:
+                result = worker.predict(image_bgr)
+                if result is not None:
+                    self._last_worker_inference_ms = getattr(worker, "last_inference_ms", None)
+                    return [_WorkerResult(*result)]
+                # worker 返回 None 时回退主线程推理
+
         model = self._get_model()
         if class_names != self._last_class_names and hasattr(model, "set_classes"):
             model.set_classes(list(class_names))
@@ -1076,11 +1099,34 @@ class DetectorPipeline:
 
         return tuple(backend.spec for backend in self._backends.values())
 
+    def get_backend(self, name: Optional[str] = None) -> Optional["DetectorBackend"]:
+        """返回指定（或默认）检测后端实例。
+
+        vis-three-fixes 任务 2.2：prewarm 需拿到 YoloWorld 后端实例触发 _get_model + 首帧推理。
+        """
+
+        resolved = name or self._default_backend_name
+        return self._backends.get(resolved)
+
     @property
     def default_backend_name(self) -> str:
         """返回默认检测后端名称。"""
 
         return self._default_backend_name
+
+    @property
+    def nms_iou_threshold(self) -> Optional[float]:
+        """返回类无关 NMS 的 iou 阈值（未启用 post_processor 时 None）。vis-three-fixes 任务 4.5。"""
+
+        if self._post_processor is None:
+            return None
+        return getattr(self._post_processor, "iou_threshold", None)
+
+    @property
+    def nms_enabled(self) -> bool:
+        """返回类无关 NMS 是否启用。"""
+
+        return self._post_processor is not None and bool(getattr(self._post_processor, "enabled", False))
 
     def detect(
         self,

@@ -133,7 +133,10 @@ class PerceptionService:
         模型与跟踪器内部状态竞态损坏。
         """
 
+        # vis-three-fixes AC2.4a：在加锁前后各打点，计算 pipeline_lock_wait_ms。
+        requested_at = perf_counter()
         with self._pipeline_lock:
+            acquired_at = perf_counter()
             return self._process_image_locked(
                 image_frame,
                 camera_info,
@@ -143,6 +146,7 @@ class PerceptionService:
                 source_name=source_name,
                 detection_metadata=detection_metadata,
                 open_vocabulary_classes=open_vocabulary_classes,
+                lock_wait_ms=(acquired_at - requested_at) * 1000.0,
             )
 
     def _process_image_locked(
@@ -156,6 +160,7 @@ class PerceptionService:
         source_name: Optional[str] = None,
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
+        lock_wait_ms: Optional[float] = None,
     ) -> PerceptionContext:
         """process_image 的实际实现，调用方须已持有 _pipeline_lock。"""
 
@@ -288,6 +293,9 @@ class PerceptionService:
                 "height_px": image_frame.height_px,
                 "detection_count": len(detections_2d),
                 "track_count": len(tracks),
+                "pipeline_lock_wait_ms": (
+                    round(lock_wait_ms, 3) if lock_wait_ms is not None else None
+                ),
                 **dict(detection_bundle.metadata),
             },
         )
@@ -320,6 +328,9 @@ class PerceptionService:
                 "stage_status": dict(stage_status),
                 "provider_fallback_used": provider_fallback_used,
                 "provider_fallback_reason": provider_fallback_reason,
+                "pipeline_lock_wait_ms": (
+                    round(lock_wait_ms, 3) if lock_wait_ms is not None else None
+                ),
             },
         )
         self._latest_by_camera[context.camera_id] = context
@@ -477,7 +488,10 @@ class PerceptionService:
     ) -> PerceptionContext:
         """消费标准图像并产出 detector/tracker 级快速观测结果。"""
 
+        # vis-three-fixes AC2.4a：同上 process_image，记录 pipeline_lock_wait_ms。
+        requested_at = perf_counter()
         with self._pipeline_lock:
+            acquired_at = perf_counter()
             return self._process_image_fast_locked(
                 image_frame,
                 camera_info,
@@ -486,6 +500,7 @@ class PerceptionService:
                 source_name=source_name,
                 detection_metadata=detection_metadata,
                 open_vocabulary_classes=open_vocabulary_classes,
+                lock_wait_ms=(acquired_at - requested_at) * 1000.0,
             )
 
     def _process_image_fast_locked(
@@ -498,6 +513,7 @@ class PerceptionService:
         source_name: Optional[str] = None,
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
+        lock_wait_ms: Optional[float] = None,
     ) -> PerceptionContext:
         """process_image_fast 的实际实现，调用方须已持有 _pipeline_lock。"""
 
@@ -585,6 +601,9 @@ class PerceptionService:
                 "track_count": len(tracks),
                 "overlay_phase": "detector_ready",
                 "fast_path": True,
+                "pipeline_lock_wait_ms": (
+                    round(lock_wait_ms, 3) if lock_wait_ms is not None else None
+                ),
                 **dict(detection_bundle.metadata),
             },
         )
@@ -615,6 +634,9 @@ class PerceptionService:
                 "stage_status": dict(stage_status),
                 "overlay_phase": "detector_ready",
                 "fast_path": True,
+                "pipeline_lock_wait_ms": (
+                    round(lock_wait_ms, 3) if lock_wait_ms is not None else None
+                ),
             },
         )
         self._latest_by_camera[context.camera_id] = context
@@ -985,6 +1007,10 @@ class PerceptionService:
             publish_interval_ms = round((now - previous_publish_at) * 1000.0, 3)
         self._last_detection_overlay_publish_at_by_camera[context.camera_id] = now
         overlay_phase = str(context.metadata.get("overlay_phase") or "full_scene_ready")
+        # vis-three-fixes AC0.3 / AC3.2：从 observation.metadata.detection_metadata 中提取 NMS 统计，
+        # 写入 payload.nms_stats 与 stage_duration_ms.pipeline_lock_wait_ms。
+        detection_metadata = dict(context.metadata.get("detection_metadata") or {})
+        nms_stats = dict(detection_metadata.get("postprocess") or {})
         payload = {
             "available": True,
             "camera_id": context.camera_id,
@@ -999,6 +1025,8 @@ class PerceptionService:
             "stage_duration_ms": dict(context.metadata.get("stage_duration_ms") or {}),
             "overlay_phase": overlay_phase,
             "publish_interval_ms": publish_interval_ms,
+            "nms_stats": nms_stats,
+            "pipeline_lock_wait_ms": context.metadata.get("pipeline_lock_wait_ms"),
         }
         self._stream_bus.publish(
             "video.detections",

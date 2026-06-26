@@ -5548,8 +5548,11 @@ class PlatformGeometryProviderBundle(
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.occupancy_grid
-        backend = self.runtime._resolve_mapping_backend()
-        return None if backend is None else backend.get_occupancy_grid()
+        # RosBridgeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
+        # 当前推送路径（subscribe_map_updates → _attach_active_map_version_to_live_map_payload）
+        # 仅 seed 来自 active map version 的 semantic_map，不携带 occupancy_grid/cost_map；
+        # snapshot 缺失时返回 None（push 路径在 Rust 桥当前实现下不会补齐 occupancy/cost）。
+        return None
 
     def get_cost_map(self):
         if not self._is_geometry_profile_enabled():
@@ -5557,8 +5560,11 @@ class PlatformGeometryProviderBundle(
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.cost_map
-        backend = self.runtime._resolve_mapping_backend()
-        return None if backend is None else backend.get_cost_map()
+        # RosBridgeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
+        # 当前推送路径（subscribe_map_updates → _attach_active_map_version_to_live_map_payload）
+        # 仅 seed 来自 active map version 的 semantic_map，不携带 occupancy_grid/cost_map；
+        # snapshot 缺失时返回 None（push 路径在 Rust 桥当前实现下不会补齐 occupancy/cost）。
+        return None
 
     def get_semantic_map(self):
         if not self._is_geometry_profile_enabled():
@@ -5566,8 +5572,11 @@ class PlatformGeometryProviderBundle(
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.semantic_map
-        backend = self.runtime._resolve_mapping_backend()
-        return None if backend is None else backend.get_semantic_map()
+        # RosBridgeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
+        # 当前推送路径（subscribe_map_updates → _attach_active_map_version_to_live_map_payload）
+        # 仅 seed 来自 active map version 的 semantic_map，不携带 occupancy_grid/cost_map；
+        # snapshot 缺失时返回 None（push 路径在 Rust 桥当前实现下不会补齐 occupancy/cost）。
+        return None
 
     def set_goal(self, goal):
         if not self._is_geometry_profile_enabled():

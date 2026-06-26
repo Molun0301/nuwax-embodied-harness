@@ -587,6 +587,11 @@ class GatewayRuntime:
             accumulated_cloud_provider=self._provide_accumulated_pointcloud_xyz,
         )
         self.perception_video_runtime.bind_memory_service(self.memory_service)
+        # vis-three-fixes 任务 2.4/2.5：装配期预热 YOLO-World，把模型加载 + 首帧 warmup
+        # 挪到启动期，消除探索 MCP 调用后的 5-10s 检测空窗。失败静默降级（不 raise），
+        # _prewarm_done=False 时后续 start_perception_runtime 仍走兜底懒加载。
+        self._prewarm_done = False
+        self._run_yolo_prewarm()
         self.navigation_service = NavigationService(
             provider_owner=self.platform_geometry_runtime,
             localization_service=self.localization_service,
@@ -989,6 +994,8 @@ class GatewayRuntime:
         while not self._system_telemetry_stop.wait(interval):
             try:
                 snapshot = collector.sample()
+                # 任务 5.2：硬约束顺序 —— 必须先更新 _latest_system_metrics_snapshot 再 publish，
+                # 保证后续 _build_service_health_summary 调用读到最新快照，process_evidence 与 metadata.process_sampled_at_iso 同源
                 self._latest_system_metrics_snapshot = snapshot
                 self.stream_bus.publish(
                     "system.metrics",
@@ -3345,12 +3352,15 @@ class GatewayRuntime:
         }
 
     def _health_perception_summary(self, status: Any) -> Dict[str, Any]:
+        metadata = getattr(status, "metadata", {}) or {}
         return {
             "enabled": getattr(status, "enabled", None),
             "running": getattr(status, "running", None),
             "camera_id": getattr(status, "camera_id", None),
             "processed_frames": getattr(status, "processed_frames", None),
             "last_error": getattr(status, "last_error", None),
+            # vis-three-fixes 任务 6.3：启动期预热状态并入健康摘要。
+            "prewarm_status": metadata.get("prewarm_status"),
         }
 
     def _health_workspace_summary(self, workspace: Any) -> Dict[str, Any]:
@@ -3952,6 +3962,14 @@ class GatewayRuntime:
                 "attention_count": attention_count,
                 "entry_count": len(entries),
                 "process_sampled_at": self._payload_get(self._latest_system_metrics_snapshot, "sampled_at"),
+                # 任务 5.1：process_evidence 元数据一致性 —— 与 _service_process_evidence 内部 sampled_at 同一 source_ts，
+                # 便于前端对账 telemetry collector 的采样时刻
+                "process_evidence_source": "system.metrics",
+                "process_sampled_at_iso": (
+                    self._payload_get(self._latest_system_metrics_snapshot, "sampled_at").isoformat()
+                    if self._payload_get(self._latest_system_metrics_snapshot, "sampled_at") is not None
+                    else None
+                ),
             },
         )
 
@@ -4557,8 +4575,36 @@ class GatewayRuntime:
             "task": self.get_task_snapshot(task_id),
         }
 
+    def _run_yolo_prewarm(self) -> None:
+        """启动期预热 YOLO-World（vis-three-fixes 任务 2.4/2.5）。
+
+        只调一次（_prewarm_done 标志）；失败静默降级，绝不打断网关启动。
+        预热结果写入 perception_video_runtime，get_perception_runtime_status 透传。
+        """
+        if getattr(self, "_prewarm_done", False):
+            return
+        self._prewarm_done = True
+        try:
+            from services.perception.prewarm import prewarm_yolo_world
+
+            prewarm_status = prewarm_yolo_world(
+                self.perception_service.detector_pipeline,
+                self.config,
+                camera_id=self.config.perception.stream_runtime.camera_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — 预热失败不得影响网关启动。
+            RUNTIME_LOGGER.warning("YOLO 预热调用异常，降级为懒加载：%s", exc)
+            prewarm_status = {"status": "deferred", "reason": str(exc)}
+        try:
+            self.perception_video_runtime.set_prewarm_status(prewarm_status)
+        except Exception:  # noqa: BLE001
+            RUNTIME_LOGGER.debug("写入 prewarm_status 失败，忽略。", exc_info=True)
+
     def _manual_perception_start(self) -> Dict[str, Any]:
         """用户显式启动感知：解除探索耦合后启动。capability + HTTP 均走此入口。"""
+        # 任务 2.5：兜底——若装配期预热未完成（如失败或被跳过），首次手动启动前补一次。
+        if not getattr(self, "_prewarm_done", False):
+            self._run_yolo_prewarm()
         self._perception_exploration_coupled = False
         return self.perception_video_runtime.start()
 

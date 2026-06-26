@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import time
 from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +31,14 @@ def _worker_loop(
         return
 
     model = YOLO(model_source)
+    # vis-three-fixes 任务 3.7：第一次 predict 前 warmup，消除首帧 GPU kernel cache 构建阻塞。
+    try:
+        warmup_imgsz = int(predict_kwargs.get("imgsz", 640) or 640)
+        warmup = getattr(model, "warmup", None)
+        if callable(warmup):
+            warmup(imgsz=(1, 3, warmup_imgsz, warmup_imgsz))
+    except Exception as exc:  # noqa: BLE001 — warmup 失败不影响推理，仅丢失首帧加速。
+        logger.warning("YOLO worker warmup 失败，忽略：%s", exc)
     response_queue.put(("ready", None))  # 通知主进程模型已加载
 
     while True:
@@ -131,6 +140,8 @@ class YoloInferenceWorker:
         self._shm_size: int = 0
         self._req_counter: int = 0
         self._ready: bool = False
+        # vis-three-fixes 任务 3.8：最近一次 worker 推理往返耗时（毫秒），供观测透传。
+        self._last_inference_ms: Optional[float] = None
 
     def start(self) -> bool:
         """启动 worker 进程，阻塞等待模型加载完成。"""
@@ -191,6 +202,7 @@ class YoloInferenceWorker:
 
         self._req_counter += 1
         req_id = self._req_counter
+        inference_started_at = time.perf_counter()
         self._request_queue.put(
             (self._shm.name, image_bgr.shape, str(image_bgr.dtype), req_id)
         )
@@ -199,6 +211,8 @@ class YoloInferenceWorker:
         try:
             msg = self._response_queue.get(timeout=10.0)
             if msg[0] == "result" and msg[1] == req_id:
+                # 任务 3.8：记录 worker 推理往返耗时（毫秒）。
+                self._last_inference_ms = round((time.perf_counter() - inference_started_at) * 1000.0, 3)
                 raw = msg[2]
                 if raw and len(raw) >= 3:
                     return (
@@ -244,3 +258,8 @@ class YoloInferenceWorker:
     def is_ready(self) -> bool:
         """worker 进程是否就绪且存活。"""
         return self._ready and self._process is not None and self._process.is_alive()
+
+    @property
+    def last_inference_ms(self) -> Optional[float]:
+        """最近一次 worker 推理往返耗时（毫秒），无则 None。vis-three-fixes 任务 3.8。"""
+        return self._last_inference_ms

@@ -84,6 +84,11 @@ class PerceptionVideoRuntime:
         self._last_success_message = None
         self._last_error = None
         self._last_status_metadata = {}
+        # vis-three-fixes 任务 2.6：启动期预热状态，由网关装配期写入，get_status 透传。
+        self._prewarm_status = {"status": "pending"}
+        # 任务 6.4：性能摘要日志节流（5 分钟一次），避免每 tick 刷屏。
+        self._perf_log_interval_sec = 300.0
+        self._last_perf_log_at = 0.0
         self._fast_processed_frames = 0
         self._continuous_ingest_count = 0
         self._last_fast_loop_duration_ms = None
@@ -126,6 +131,15 @@ class PerceptionVideoRuntime:
 
         self._memory_service = memory_service
 
+    def set_prewarm_status(self, prewarm_status: Dict[str, object]) -> None:
+        """注入启动期预热状态（vis-three-fixes 任务 2.6）。
+
+        网关装配期调 prewarm_yolo_world 后写入；get_status 在 metadata.prewarm_status 透传。
+        """
+
+        with self._lock:
+            self._prewarm_status = dict(prewarm_status or {})
+
     def is_running(self) -> bool:
         """返回后台线程是否处于运行状态。"""
 
@@ -148,7 +162,10 @@ class PerceptionVideoRuntime:
                 failure_count=self._failure_count,
                 last_success_message=self._last_success_message,
                 last_error=self._last_error,
-                metadata=dict(self._last_status_metadata),
+                metadata={
+                    **dict(self._last_status_metadata),
+                    "prewarm_status": dict(self._prewarm_status),
+                },
             )
         return status
 
@@ -355,6 +372,10 @@ class PerceptionVideoRuntime:
                 "fast_loop_duration_ms": fast_loop_duration_ms,
                 "detector_duration_ms": stage_duration_ms.get("detector"),
                 "tracker_duration_ms": stage_duration_ms.get("tracker"),
+                "worker_inference_ms": dict(context.metadata.get("detection_metadata") or {}).get("worker_inference_ms"),
+                "pipeline_lock_wait_ms": context.metadata.get("pipeline_lock_wait_ms"),
+                "nms_iou_threshold": self._perception_service.detector_pipeline.nms_iou_threshold,
+                "nms_stats": dict(context.metadata.get("detection_metadata") or {}).get("postprocess"),
                 "video_detections_interval_ms": video_detections_interval_ms,
                 "last_full_stage_duration_ms_total": last_full_stage_duration_ms_total,
                 "memory_write_in_flight": self._memory_write_in_flight,
@@ -560,6 +581,7 @@ class PerceptionVideoRuntime:
             frame_start = time.monotonic()
             try:
                 self.run_once(force_keyframe=False, reason="background_keyframe")
+                self._maybe_log_perf_summary()
             except Exception as exc:
                 with self._lock:
                     self._failure_count += 1
@@ -598,6 +620,29 @@ class PerceptionVideoRuntime:
             reason,
             skip_count,
             detail,
+        )
+
+    def _maybe_log_perf_summary(self) -> None:
+        """节流（5 分钟一次）记录感知延迟摘要。vis-three-fixes 任务 6.4。
+
+        数据已在 get_perception_runtime_status / video.detections 暴露，本日志仅作离线排查用，
+        节流避免污染实机日志（呼应近期"降低实机日志噪声"提交）。
+        """
+        now = time.monotonic()
+        if (now - self._last_perf_log_at) < self._perf_log_interval_sec:
+            return
+        self._last_perf_log_at = now
+        with self._lock:
+            meta = dict(self._last_status_metadata)
+        PERCEPTION_RUNTIME_LOGGER.info(
+            "感知延迟摘要 camera=%s detector_ms=%s fast_loop_ms=%s worker_ms=%s lock_wait_ms=%s interval_ms=%s nms_iou=%s",
+            self._camera_id,
+            meta.get("detector_duration_ms"),
+            meta.get("fast_loop_duration_ms"),
+            meta.get("worker_inference_ms"),
+            meta.get("pipeline_lock_wait_ms"),
+            meta.get("video_detections_interval_ms"),
+            meta.get("nms_iou_threshold"),
         )
 
     def _resolve_runtime_context(self):

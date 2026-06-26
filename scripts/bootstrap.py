@@ -60,7 +60,8 @@ DEFAULT_MEMORY_LOCAL_IMAGE_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" 
 DEFAULT_YOLO_WORLD_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-worldv2.pt")
 DEFAULT_YOLO_WORLD_ENGINE = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-worldv2.engine")
 GEOMETRY_WS_DIR = PROJECT_ROOT / "services" / "geometry" / "ros2_ws"
-GO2SLAM_WS_DIR = GEOMETRY_WS_DIR / "src" / "go2slam"
+GO2_RTABNAV2_WS_DIR = GEOMETRY_WS_DIR / "src" / "GO2_RTABNAV2" / "ws"
+GO2SLAM_WS_DIR = GO2_RTABNAV2_WS_DIR
 GEOMETRY_APT_BASE_PACKAGES = (
     "build-essential",
     "cmake",
@@ -88,10 +89,9 @@ GO2SLAM_APT_BASE_PACKAGES = (
     "libpcl-dev",
 )
 GO2SLAM_RUNTIME_REQUIRED_PACKAGES = (
-    "go2_navigation2",
-    "go2_slam",
-    "go2_driver",
-    "go2_perception",
+    "go2_slam_nav",
+    "go2_cmd_processor",
+    "explore_lite",
 )
 GO2SLAM_SOURCE_STALE_SUFFIXES = (
     ".xml",
@@ -389,7 +389,11 @@ def go2slam_setup_path() -> Path:
 def find_go2slam_stale_source(setup_path: Path) -> Optional[Path]:
     if not setup_path.exists():
         return None
-    roots = [GO2SLAM_WS_DIR / "src"]
+    roots = [
+        GO2SLAM_WS_DIR / "src",
+        GO2SLAM_WS_DIR.parent / "unitree-go2-slam-nav2",
+        GO2SLAM_WS_DIR.parent / "m-explore-ros2",
+    ]
     for root in roots:
         if not root.exists():
             continue
@@ -621,7 +625,11 @@ class BootstrapPlanner:
         self.prepare_yolo = self._resolve_bool("prepare_yolo", default=self.perception_mode != "disabled")
         self.export_yolo_engine = self._resolve_bool("export_yolo_engine", default=False)
         self.build_geometry = self._resolve_bool("build_geometry", default=self.geometry_enabled)
-        self.build_go2slam = self._resolve_bool("build_go2slam", default=self.selected_robot == "go2" and self.build_geometry)
+        build_go2_rtabnav2 = bool(getattr(args, "build_go2_rtabnav2", False))
+        self.build_go2slam = build_go2_rtabnav2 or self._resolve_bool(
+            "build_go2slam",
+            default=self.selected_robot == "go2" and self.build_geometry,
+        )
         self.install_geometry_deps = self._resolve_bool("install_geometry_deps", default=self.geometry_enabled or self.build_geometry or self.build_go2slam)
         self.repair_ros2_apt_source = self._resolve_bool("repair_ros2_apt_source", default=True)
         self.start_gateway = self._resolve_bool("start_gateway", default=False)
@@ -730,7 +738,8 @@ class BootstrapPlanner:
                     "NUWAX_GEOMETRY_POINT_CLOUD_TOPIC": "/utlidar/cloud_deskewed",
                     "NUWAX_GEOMETRY_TF_TOPIC": "/tf",
                     "NUWAX_GEOMETRY_TF_STATIC_TOPIC": "/tf_static",
-                    "NUWAX_GEOMETRY_OCCUPANCY_TOPIC": "/map",
+                    "NUWAX_GEOMETRY_OCCUPANCY_TOPIC": "/map_obstacles",
+                    "NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC": "explore/frontiers",
                     "NUWAX_GEOMETRY_COST_MAP_TOPIC": "/global_costmap/costmap",
                     "NUWAX_GEOMETRY_MAP_FRAME": "map",
                     "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
@@ -739,7 +748,9 @@ class BootstrapPlanner:
                     "NUWAX_RTABMAP_LAUNCH_PACKAGE": "rtabmap_launch",
                     "NUWAX_RTABMAP_LAUNCH_FILE": "rtabmap.launch.py",
                     "NUWAX_RTABMAP_OCCUPANCY_PROJECTION": "projected_occupancy",
-                    "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "start_rtabmap_sidecar.sh"),
+                    "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(
+                        PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "src" / "GO2_RTABNAV2" / "go2.sh"
+                    ),
                     "NUWAX_GEOMETRY_EXTERNAL_ARGS": "",
                     "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "external_slam_nav2",
                     "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "external_slam_nav2.log",
@@ -931,7 +942,7 @@ def run_checks(planner: BootstrapPlanner) -> int:
             results.append((sudo_ok, _check_result("sudo/root", sudo_ok, "root 或 sudo 用于安装系统包")))
         if planner.build_go2slam or (planner.selected_robot == "go2" and planner.geometry_enabled):
             go2slam_ok = GO2SLAM_WS_DIR.exists()
-            results.append((go2slam_ok, _check_result("Go2SLAM 工作区", go2slam_ok, str(GO2SLAM_WS_DIR) if go2slam_ok else "未找到 services/geometry/ros2_ws/src/go2slam")))
+            results.append((go2slam_ok, _check_result("GO2_RTABNAV2 工作区", go2slam_ok, str(GO2SLAM_WS_DIR) if go2slam_ok else "未找到 services/geometry/ros2_ws/src/GO2_RTABNAV2/ws")))
             setup_path = go2slam_setup_path()
             setup_ready = setup_path.exists() or planner.build_go2slam
             setup_detail = str(setup_path) if setup_path.exists() else "将由 --build-go2slam 构建生成"
@@ -1529,7 +1540,16 @@ def build_parser() -> argparse.ArgumentParser:
         add_boolean_flag(subparser, "prepare_yolo", "准备 YOLO-World 权重")
         add_boolean_flag(subparser, "export_yolo_engine", "导出 YOLO-World TensorRT 引擎")
         add_boolean_flag(subparser, "build_geometry", "构建 geometry ROS2 工作空间")
-        add_boolean_flag(subparser, "build_go2slam", "Go2 默认额外构建 services/geometry/ros2_ws/src/go2slam")
+        add_boolean_flag(
+            subparser,
+            "build_go2slam",
+            "Go2 默认额外构建 services/geometry/ros2_ws/src/GO2_RTABNAV2/ws",
+        )
+        subparser.add_argument(
+            "--build-go2-rtabnav2",
+            action="store_true",
+            help="与 --build-go2slam 等价，构建 GO2_RTABNAV2/ws。",
+        )
         add_boolean_flag(subparser, "install_geometry_deps", "安装 RTAB-Map/Nav2 系统依赖")
         add_boolean_flag(subparser, "repair_ros2_apt_source", "自动修复异常 ROS2 apt 源")
         add_boolean_flag(subparser, "start_gateway", "启动 gateway")

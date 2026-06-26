@@ -19,13 +19,18 @@ from services.geometry.ros2_context import acquire_ros2_context, release_ros2_co
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.external_debug_observer")
 
 _DUPLICATE_MAP_SUPPRESS_SEC = 0.2
+_MAP_MAPPING_THROTTLE_SEC = 1.2
+_SESSION_FRONTIER_MODES = frozenset({"explore"})
 _GOAL_FRESH_SEC = 10.0
 _POSE_EMIT_MIN_INTERVAL_SEC = 0.08
 _POSE_TIMER_PERIOD_SEC = 0.1
+_POSE_MAP_UNCHANGED_FREEZE_COUNT = 4
+_POSE_MAP_POSITION_EPS = 0.02
+_POSE_MAP_TF_DIVERGE_M = 0.2
 
 
 class ExternalGeometryDebugObserver:
-    """Read-only ROS2 observer for externally launched GO2 RTAB-Map/Nav2 debug data."""
+    """Read-only ROS2 observer for externally launched GO2 RTABNAV2 debug data."""
 
     def __init__(
         self,
@@ -53,6 +58,12 @@ class ExternalGeometryDebugObserver:
         self._last_error: Optional[str] = None
         self._pose_sequence = 0
         self._last_pose_emit_at = 0.0
+        self._last_pose_map_at = 0.0
+        self._last_pose_map_pose: Optional[Pose] = None
+        self._pose_map_unchanged_count = 0
+        self._pose_map_topic = str(
+            os.environ.get("NUWAX_GEOMETRY_POSE_TOPIC", "/go2/pose_map") or "/go2/pose_map"
+        ).strip() or "/go2/pose_map"
         self._map_message_count = 0
         self._last_map_signature: Optional[Tuple[object, ...]] = None
         self._last_map_signature_at = 0.0
@@ -64,6 +75,34 @@ class ExternalGeometryDebugObserver:
         self._last_planned_path: List[Dict[str, float]] = []
         self._last_plan_at = 0.0
         self._last_plan_emit_at = 0.0
+        self._frontier_topic = "explore/frontiers"
+        self._explore_status_topic = "explore/status"
+        self._latest_frontier_markers: List[Dict[str, object]] = []
+        self._session_mode: Optional[str] = None
+        self._last_map_emit_monotonic = 0.0
+        self._last_map_emit_content_hash: Optional[str] = None
+        self._last_map_emit_geometry_signature: Optional[Tuple[object, ...]] = None
+
+    def set_session_mode(self, mode: Optional[str]) -> None:
+        """平台会话模式：仅 explore 时向前端投递前沿几何。"""
+        normalized = str(mode or "").strip().lower() or None
+        with self._lock:
+            self._session_mode = normalized
+            if normalized not in _SESSION_FRONTIER_MODES:
+                self._reset_frontier_state_locked()
+
+    def reset_frontier_state(self) -> None:
+        with self._lock:
+            self._reset_frontier_state_locked()
+
+    def _reset_frontier_state_locked(self) -> None:
+        self._latest_frontier_markers = []
+        self._last_status_text = None
+        self._last_terminal_status = None
+        self._last_goal = None
+        self._last_goal_at = 0.0
+        self._last_planned_path = []
+        self._last_plan_at = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -99,8 +138,9 @@ class ExternalGeometryDebugObserver:
                 self._executor = SingleThreadedExecutor()
                 self._executor.add_node(self._node)
 
-                map_topic = str(self.config.topics.occupancy_topic or "/map")
-                frontier_topic = str(getattr(self.config.external, "frontier_topic", "") or "/frontiers")
+                map_topic = str(self.config.topics.occupancy_topic or "/map_obstacles")
+                frontier_topic = str(self.config.external.frontier_topic or "explore/frontiers")
+                self._frontier_topic = frontier_topic
                 next_goal_topic = str(getattr(self.config.external, "next_goal_topic", "") or "/exploration/next_goal")
                 plan_topic = str(
                     getattr(self.config.external, "plan_topic", "")
@@ -128,10 +168,23 @@ class ExternalGeometryDebugObserver:
                         self._node.create_subscription(RosOccupancyGrid, map_topic, self._on_map, reliable_transient)
                     )
                 except Exception:
-                    LOGGER.debug("创建 transient /map 订阅失败，保留 volatile 订阅。", exc_info=True)
+                    LOGGER.debug("创建 transient %s 订阅失败，保留 volatile 订阅。", map_topic, exc_info=True)
                 self._subscriptions.append(
                     self._node.create_subscription(MarkerArray, frontier_topic, self._on_frontiers, reliable_volatile)
                 )
+                try:
+                    from explore_lite_msgs.msg import ExploreStatus
+
+                    self._subscriptions.append(
+                        self._node.create_subscription(
+                            ExploreStatus,
+                            self._explore_status_topic,
+                            self._on_explore_status,
+                            reliable_volatile,
+                        )
+                    )
+                except Exception:
+                    LOGGER.debug("explore_lite_msgs 不可用，跳过 explore/status 订阅。", exc_info=True)
                 self._subscriptions.append(
                     self._node.create_subscription(PoseStamped, next_goal_topic, self._on_next_goal, reliable_volatile)
                 )
@@ -146,6 +199,14 @@ class ExternalGeometryDebugObserver:
                 if self._pose_callback is not None:
                     self._tf_buffer = Buffer()
                     self._tf_listener = TransformListener(self._tf_buffer, self._node)
+                    self._subscriptions.append(
+                        self._node.create_subscription(
+                            PoseStamped,
+                            self._pose_map_topic,
+                            self._on_pose_map,
+                            reliable_volatile,
+                        )
+                    )
                     self._pose_timer = self._node.create_timer(_POSE_TIMER_PERIOD_SEC, self._on_pose_timer)
                 self._thread = threading.Thread(
                     target=self._executor.spin,
@@ -156,12 +217,13 @@ class ExternalGeometryDebugObserver:
                 self._started = True
                 self._last_error = None
                 LOGGER.info(
-                    "GO2 外部几何 debug observer 已启动 map=%s frontiers=%s next_goal=%s plan=%s pose=%s",
+                    "GO2 外部几何 debug observer 已启动 map=%s frontiers=%s next_goal=%s plan=%s pose=%s pose_topic=%s",
                     map_topic,
                     frontier_topic,
                     next_goal_topic,
                     plan_topic,
                     "enabled" if self._pose_callback is not None else "disabled",
+                    self._pose_map_topic if self._pose_callback is not None else "disabled",
                 )
             except Exception as exc:
                 self._last_error = str(exc)
@@ -205,32 +267,98 @@ class ExternalGeometryDebugObserver:
         self._has_ros2_context = False
         self._rclpy = None
 
-    def _on_pose_timer(self) -> None:
-        if self._pose_callback is None or self._tf_buffer is None:
-            return
+    def _base_frame_candidates(self) -> Tuple[str, ...]:
+        configured = self._normalize_frame_id(self.config.frames.base_frame or "", "")
+        candidates: List[str] = []
+        for item in (configured, "go2_base_link", "base_link", "base_footprint"):
+            frame = self._normalize_frame_id(item, "")
+            if frame and frame not in candidates:
+                candidates.append(frame)
+        return tuple(candidates or ("go2_base_link", "base_link"))
+
+    def _pose_planar_distance(self, left: Pose, right: Pose) -> float:
+        return math.hypot(
+            float(left.position.x) - float(right.position.x),
+            float(left.position.y) - float(right.position.y),
+        )
+
+    def _pose_map_unchanged(self, pose: Pose) -> bool:
+        previous = self._last_pose_map_pose
+        if previous is None:
+            return False
+        return self._pose_planar_distance(previous, pose) <= _POSE_MAP_POSITION_EPS
+
+    def _lookup_tf_pose(self) -> Optional[Pose]:
+        if self._tf_buffer is None:
+            return None
         map_frame = self._normalize_frame_id(self.config.frames.map_frame, DEFAULT_MAP_FRAME)
-        base_frame = self._normalize_frame_id(self.config.frames.base_frame or "base_link", "base_link")
         try:
             from rclpy.time import Time
             from tf2_ros import TransformException
-
-            transform = self._tf_buffer.lookup_transform(map_frame, base_frame, Time())
-        except TransformException:
-            return
         except Exception:
-            LOGGER.debug("GO2 debug observer TF 查询失败。", exc_info=True)
+            return None
+        for base_frame in self._base_frame_candidates():
+            try:
+                transform = self._tf_buffer.lookup_transform(map_frame, base_frame, Time())
+            except TransformException:
+                continue
+            except Exception:
+                LOGGER.debug("GO2 debug observer TF 查询失败 frame=%s", base_frame, exc_info=True)
+                continue
+            try:
+                return self._pose_from_transform(transform, map_frame)
+            except Exception:
+                LOGGER.debug("GO2 debug observer 位姿转换失败 frame=%s", base_frame, exc_info=True)
+                continue
+        return None
+
+    def _on_pose_map(self, msg: Any) -> None:
+        if self._pose_callback is None:
             return
         try:
-            pose = self._pose_from_transform(transform, map_frame)
+            pose = self._pose_from_pose_stamped(msg)
         except Exception:
-            LOGGER.debug("GO2 debug observer 位姿转换失败。", exc_info=True)
+            LOGGER.debug("GO2 debug observer pose_map 转换失败 topic=%s", self._pose_map_topic, exc_info=True)
             return
+        if self._pose_map_unchanged(pose):
+            self._pose_map_unchanged_count += 1
+        else:
+            self._pose_map_unchanged_count = 0
+            self._last_pose_map_pose = pose.model_copy(deep=True)
+        if self._pose_map_unchanged_count >= _POSE_MAP_UNCHANGED_FREEZE_COUNT:
+            tf_pose = self._lookup_tf_pose()
+            if tf_pose is not None and self._pose_planar_distance(pose, tf_pose) > _POSE_MAP_TF_DIVERGE_M:
+                return
+        self._last_pose_map_at = time.monotonic()
+        self._emit_pose(
+            pose,
+            {
+                "source_kind": "external_pose_topic",
+                "pose_topic": self._pose_map_topic,
+                "pose_map_unchanged_count": self._pose_map_unchanged_count,
+            },
+        )
+
+    def _on_pose_timer(self) -> None:
+        if self._pose_callback is None or self._tf_buffer is None:
+            return
+        pose_map_recent = time.monotonic() - self._last_pose_map_at <= 0.5
+        pose_map_frozen = self._pose_map_unchanged_count >= _POSE_MAP_UNCHANGED_FREEZE_COUNT
+        if pose_map_recent and not pose_map_frozen:
+            return
+        pose = self._lookup_tf_pose()
+        if pose is None:
+            return
+        if pose_map_frozen and self._last_pose_map_pose is not None:
+            if self._pose_planar_distance(pose, self._last_pose_map_pose) <= _POSE_MAP_TF_DIVERGE_M:
+                return
         self._emit_pose(
             pose,
             {
                 "source_kind": "external_tf_observer",
-                "tf_target": base_frame,
-                "tf_source": map_frame,
+                "tf_target": self._base_frame_candidates()[0],
+                "tf_source": self._normalize_frame_id(self.config.frames.map_frame, DEFAULT_MAP_FRAME),
+                "pose_map_frozen": pose_map_frozen,
             },
         )
 
@@ -245,7 +373,7 @@ class ExternalGeometryDebugObserver:
             self._pose_sequence += 1
             sequence = self._pose_sequence
         payload = {
-            "source_name": "go2_rtabmap_debug_observer",
+            "source_name": "go2_rtabnav2_debug_observer",
             "source_kind": "external_tf_observer",
             "sequence": sequence,
             **metadata,
@@ -259,6 +387,35 @@ class ExternalGeometryDebugObserver:
     def _normalize_frame_id(frame_id: str, default: str) -> str:
         value = str(frame_id or "").strip().lstrip("/") or default
         return value
+
+    def _pose_from_pose_stamped(self, msg: Any) -> Pose:
+        pose_msg = getattr(msg, "pose", None)
+        position = getattr(pose_msg, "position", None)
+        orientation = getattr(pose_msg, "orientation", None)
+        if position is None or orientation is None:
+            raise ValueError("pose_stamped missing pose.position or pose.orientation")
+        header = getattr(msg, "header", None)
+        frame_id = self._normalize_frame_id(
+            str(getattr(header, "frame_id", "") or "").strip(),
+            self._normalize_frame_id(self.config.frames.map_frame, DEFAULT_MAP_FRAME),
+        )
+        source_timestamp = self._timestamp_from_header(header)
+        received_at = datetime.now(timezone.utc)
+        return Pose(
+            timestamp=source_timestamp or received_at,
+            frame_id=frame_id,
+            position=Vector3(
+                x=float(getattr(position, "x", 0.0) or 0.0),
+                y=float(getattr(position, "y", 0.0) or 0.0),
+                z=float(getattr(position, "z", 0.0) or 0.0),
+            ),
+            orientation=Quaternion(
+                x=float(getattr(orientation, "x", 0.0) or 0.0),
+                y=float(getattr(orientation, "y", 0.0) or 0.0),
+                z=float(getattr(orientation, "z", 0.0) or 0.0),
+                w=float(getattr(orientation, "w", 1.0) or 1.0),
+            ),
+        )
 
     def _pose_from_transform(self, transform: Any, frame_id: str) -> Pose:
         translation = getattr(getattr(transform, "transform", None), "translation", None)
@@ -284,15 +441,41 @@ class ExternalGeometryDebugObserver:
             ),
         )
 
+    @staticmethod
+    def _map_content_hash(msg: Any) -> str:
+        data = list(getattr(msg, "data", []) or [])
+        if not data:
+            return "empty"
+        return hashlib.blake2s(
+            bytes((int(value) + 1) & 0xFF for value in data),
+            digest_size=8,
+        ).hexdigest()
+
     def _on_map(self, msg: Any) -> None:
         now_monotonic = time.monotonic()
         signature = self._map_signature(msg)
+        content_hash = self._map_content_hash(msg)
+        geometry_signature = signature[3:]
         with self._lock:
             if (
                 signature == self._last_map_signature
                 and now_monotonic - self._last_map_signature_at <= _DUPLICATE_MAP_SUPPRESS_SEC
             ):
                 return
+            if self._session_mode in {"mapping", "explore"}:
+                if (
+                    self._last_map_emit_geometry_signature == geometry_signature
+                    and self._last_map_emit_content_hash == content_hash
+                ):
+                    return
+                if (
+                    self._last_map_emit_geometry_signature == geometry_signature
+                    and now_monotonic - self._last_map_emit_monotonic < _MAP_MAPPING_THROTTLE_SEC
+                ):
+                    return
+                self._last_map_emit_monotonic = now_monotonic
+                self._last_map_emit_content_hash = content_hash
+                self._last_map_emit_geometry_signature = geometry_signature
             self._last_map_signature = signature
             self._last_map_signature_at = now_monotonic
             self._map_message_count += 1
@@ -300,12 +483,12 @@ class ExternalGeometryDebugObserver:
         try:
             payload = self._map_payload_from_msg(msg, message_count=message_count)
         except Exception:
-            LOGGER.debug("转换 GO2 /map debug 帧失败。", exc_info=True)
+            LOGGER.debug("转换 GO2 占据栅格 debug 帧失败。", exc_info=True)
             return
         try:
             self._map_callback(payload)
         except Exception:
-            LOGGER.debug("投递 GO2 /map debug 帧失败。", exc_info=True)
+            LOGGER.debug("投递 GO2 占据栅格 debug 帧失败。", exc_info=True)
 
     def _map_payload_from_msg(self, msg: Any, *, message_count: int) -> Dict[str, object]:
         header = getattr(msg, "header", None)
@@ -332,7 +515,7 @@ class ExternalGeometryDebugObserver:
         content_hash = hashlib.blake2s(bytes((value + 1) & 0xFF for value in data), digest_size=8).hexdigest()
         occupancy_grid = OccupancyGrid(
             timestamp=source_timestamp or received_at,
-            map_id="go2_rtabmap:%s:%d" % (self.config.topics.occupancy_topic or "/map", message_count),
+            map_id="go2_rtabnav2:%s:%d" % (self.config.topics.occupancy_topic or "/map_obstacles", message_count),
             frame_id=frame_id,
             width=width,
             height=height,
@@ -357,8 +540,11 @@ class ExternalGeometryDebugObserver:
         metadata = {
             "event_type": "content_update",
             "source_kind": "platform_live_map_provider",
-            "source_name": "go2_rtabmap_debug_observer",
-            "source_topic": str(self.config.topics.occupancy_topic or "/map"),
+            "source_name": "go2_rtabnav2_debug_observer",
+            "source_topic": str(self.config.topics.occupancy_topic or "/map_obstacles"),
+            "map_composition": "rtabmap_map_plus_cloud_obstacles",
+            "map_excludes_live_scan": True,
+            "map_display_note": "Debug 仅展示 /map_obstacles 静态图层，不叠加 live 雷达扇形",
             "map_snapshot_kind": "live_streaming",
             "live_streaming_ready": True,
             "rtabmap_live_streaming_ready": True,
@@ -387,7 +573,7 @@ class ExternalGeometryDebugObserver:
             },
         }
         return {
-            "source_name": "go2_rtabmap_debug_observer",
+            "source_name": "go2_rtabnav2_debug_observer",
             "occupancy_grid": occupancy_grid,
             "cost_map": None,
             "semantic_map": None,
@@ -402,6 +588,7 @@ class ExternalGeometryDebugObserver:
     def _on_frontiers(self, msg: Any) -> None:
         status = self._status_from_marker_array(msg)
         goal = self._goal_from_marker_array(msg)
+        frontier_markers = self._frontiers_from_explore_lite_markers(msg)
         with self._lock:
             terminal = bool(status and status.get("terminal"))
             if status is not None:
@@ -410,15 +597,30 @@ class ExternalGeometryDebugObserver:
                     self._last_terminal_status = str(status.get("terminal_status") or "succeeded")
                     self._last_goal = None
                     self._last_goal_at = 0.0
+            if frontier_markers:
+                self._latest_frontier_markers = frontier_markers
             if goal is not None and not terminal:
                 self._last_goal = goal
                 self._last_goal_at = time.monotonic()
-            elif status is None and goal is None and self._last_terminal_status is None:
+            elif status is None and goal is None and not frontier_markers and self._last_terminal_status is None:
                 return
             terminal_status = self._last_terminal_status
         if terminal_status is not None:
             self._emit_frontier_payload()
             return
+        self._emit_frontier_payload()
+
+    def _on_explore_status(self, msg: Any) -> None:
+        status = str(getattr(msg, "status", "") or "").strip()
+        if not status:
+            return
+        normalized = status.lower()
+        with self._lock:
+            self._last_status_text = status
+            if normalized == "exploration_complete":
+                self._last_terminal_status = "succeeded"
+                self._last_goal = None
+                self._last_goal_at = 0.0
         self._emit_frontier_payload()
 
     def _on_next_goal(self, msg: Any) -> None:
@@ -456,10 +658,49 @@ class ExternalGeometryDebugObserver:
             points.append({"x": x, "y": y, "z": z})
         return points
 
+    def _frontiers_from_explore_lite_markers(self, msg: Any) -> List[Dict[str, object]]:
+        markers = list(getattr(msg, "markers", []) or [])
+        frontiers: List[Dict[str, object]] = []
+        for index, marker in enumerate(markers):
+            action = int(getattr(marker, "action", 0) or 0)
+            if action == 3:
+                continue
+            ns = str(getattr(marker, "ns", "") or "")
+            marker_type = int(getattr(marker, "type", -1) or -1)
+            if ns != "frontiers" or marker_type != 2:
+                continue
+            point = self._marker_point(marker)
+            if point is None:
+                continue
+            x, y, z = point
+            frame_id = str(getattr(getattr(marker, "header", None), "frame_id", "") or self.config.frames.map_frame)
+            try:
+                frontiers.append(
+                    self._frontier_from_xyz(
+                        x,
+                        y,
+                        z,
+                        frame_id=frame_id,
+                        role="candidate",
+                        source="go2_explore_lite_marker",
+                        frontier_id="explore_lite:%d" % int(getattr(marker, "id", index) or index),
+                        metadata={"marker_ns": ns, "marker_id": int(getattr(marker, "id", index) or index)},
+                    )
+                )
+            except Exception:
+                LOGGER.debug("解析 explore_lite 前沿 marker 失败。", exc_info=True)
+        return frontiers
+
     def _emit_frontier_payload(self) -> None:
         with self._lock:
+            if self._session_mode not in _SESSION_FRONTIER_MODES:
+                return
             current = self._last_goal if self._last_goal_at and time.monotonic() - self._last_goal_at <= _GOAL_FRESH_SEC else None
-            frontiers = [current] if current is not None else []
+            marker_frontiers = list(self._latest_frontier_markers)
+            if current is not None:
+                frontiers = [current] + [item for item in marker_frontiers if item.get("frontier_id") != current.get("frontier_id")]
+            else:
+                frontiers = marker_frontiers
             status_text = self._last_status_text
             terminal_status = self._last_terminal_status
             planned_path = list(self._last_planned_path)
@@ -501,8 +742,8 @@ class ExternalGeometryDebugObserver:
                     LOGGER.debug("外部前沿目标 NavigationGoal 解析失败，丢弃 current_goal。", exc_info=True)
                     current_goal = None
         payload = {
-            "source_name": "go2_rtabmap_debug_observer",
-            "source": "go2_rtabmap_debug_observer",
+            "source_name": "go2_rtabnav2_debug_observer",
+            "source": "go2_rtabnav2_debug_observer",
             "latest_frontiers": frontiers,
             "current_frontier": current,
             "frontier_count": len(frontiers),
@@ -511,8 +752,9 @@ class ExternalGeometryDebugObserver:
             "updated_at": now.isoformat(),
             "sequence": sequence,
             "metadata": {
-                "source": "go2_rtabmap_debug_observer",
-                "frontier_topic": "/frontiers",
+                "source": "go2_rtabnav2_debug_observer",
+                "frontier_topic": self._frontier_topic,
+                "explore_status_topic": self._explore_status_topic,
                 "next_goal_topic": "/exploration/next_goal",
                 "plan_topic": os.environ.get("NUWAX_GEOMETRY_PLAN_TOPIC", "/plan"),
                 "display_mode": "next_goal_only",

@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, TYPE_CH
 from urllib.parse import quote
 
 from contracts.geometry import Pose, Vector3
+from core.logging_utils import StreamBusLogHandler
 from contracts.map_workspace import MapGeometryAssetBinding, MapGeometryAssetRef, MapGeometryAssetType, MapVersion
 from contracts.navigation import (
     ExplorationState,
@@ -49,6 +50,7 @@ from services.geometry.ros_bridge_client import RosBridgeSubprocess
 from services.geometry.remote_provider import RosBridgeProvider
 from services.geometry.rosout_bridge import RosoutBridge
 from contracts.naming import build_safe_dir_segment
+from services.localization.frame_tree_ops import resolve_frame_transform
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig
 from services.navigation.exploration_runtime import PlatformExplorationRuntime
 from services.navigation.frontier import FrontierExplorer
@@ -68,6 +70,59 @@ _GEOMETRY_MONITOR_INTERVAL_SEC = 1.0
 _GEOMETRY_STREAMING_WINDOW_SEC = 3.0
 _EXTERNAL_GEOMETRY_STACKS = {"external_slam_nav2"}
 _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME = "external_slam_nav2_state.db"
+_MAIN_LOG_APPEND_LOCK = threading.Lock()
+_GO2_SH_MAIN_LOG_LOGGER = "nuwax_robot_bridge.geometry.go2.sh"
+
+
+def _project_log_file() -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    log_dir = Path(os.environ.get("NUWAX_LOG_DIR", str(repo_root))).expanduser()
+    configured = str(os.environ.get("NUWAX_LOG_FILE", "") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return log_dir / "nuwax_robot_bridge.log"
+
+
+def _format_main_log_line(logger_name: str, message: str, *, level: str = "INFO") -> str:
+    now = datetime.now()
+    asctime = now.strftime("%Y-%m-%d %H:%M:%S") + ",%03d" % (now.microsecond // 1000)
+    return "%s [%s] [%s] %s\n" % (asctime, level, logger_name, message)
+
+
+def _publish_main_log_stream(logger_name: str, message: str) -> None:
+    """将 go2.sh 子进程行推送到 StreamBus logs.entry（不经 file handler，避免重复写盘）。"""
+
+    record = logging.LogRecord(
+        name=str(logger_name or _GO2_SH_MAIN_LOG_LOGGER),
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg=str(message or ""),
+        args=(),
+        exc_info=None,
+    )
+    for handler in logging.getLogger().handlers:
+        if not isinstance(handler, StreamBusLogHandler):
+            continue
+        try:
+            if handler.filter(record):
+                handler.emit(record)
+        except Exception:
+            LOGGER.debug("go2.sh 日志推送到 StreamBus 失败。", exc_info=True)
+        return
+
+
+def _append_main_log_line(logger_name: str, message: str) -> None:
+    text = str(message or "").rstrip("\r\n")
+    if not text:
+        return
+    path = _project_log_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = _format_main_log_line(logger_name, text)
+    with _MAIN_LOG_APPEND_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    _publish_main_log_stream(logger_name, text)
 
 
 @dataclass
@@ -78,30 +133,76 @@ class _ManagedProcess:
     cwd: Path
     process_title: Optional[str] = None
     display_name: Optional[str] = None
+    mirror_main_log: bool = False
     process: Optional[subprocess.Popen] = None
     started_at: Optional[float] = None
     started_at_iso: Optional[str] = None
     exit_code: Optional[int] = None
     last_error: Optional[str] = None
     restart_count: int = 0
+    _output_thread: Optional[threading.Thread] = field(default=None, repr=False)
 
     def start(self, *, restart: bool = False) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         if restart:
             self.restart_count += 1
-        with self.log_path.open("ab") as log_file:
-            log_file.write(("\n[%s] start %s\n" % (_utc_now_iso(), self.command_display())).encode("utf-8"))
+        banner = "\n[%s] start %s\n" % (_utc_now_iso(), self.command_display())
+        if self.mirror_main_log:
+            with self.log_path.open("ab") as log_file:
+                log_file.write(banner.encode("utf-8"))
+            _append_main_log_line(self._main_log_logger_name(), banner.strip())
             self.process = subprocess.Popen(
                 self.launch_command(),
                 cwd=str(self.cwd),
-                stdout=log_file,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                bufsize=0,
             )
+            self._output_thread = threading.Thread(
+                target=self._pump_output_to_logs,
+                name="nuwax-managed-process-%s" % self.name,
+                daemon=True,
+            )
+            self._output_thread.start()
+        else:
+            with self.log_path.open("ab") as log_file:
+                log_file.write(banner.encode("utf-8"))
+                self.process = subprocess.Popen(
+                    self.launch_command(),
+                    cwd=str(self.cwd),
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
         self.started_at = time.monotonic()
         self.started_at_iso = _utc_now_iso()
         self.exit_code = None
         self.last_error = None
+
+    def _main_log_logger_name(self) -> str:
+        if self.name == "external_slam_nav2":
+            return _GO2_SH_MAIN_LOG_LOGGER
+        return "nuwax_robot_bridge.geometry.%s" % self.name
+
+    def _pump_output_to_logs(self) -> None:
+        process = self.process
+        if process is None or process.stdout is None:
+            return
+        logger_name = self._main_log_logger_name()
+        try:
+            with self.log_path.open("ab") as sidecar:
+                while True:
+                    chunk = process.stdout.readline()
+                    if not chunk:
+                        break
+                    sidecar.write(chunk)
+                    sidecar.flush()
+                    text = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if text:
+                        _append_main_log_line(logger_name, text)
+        except Exception:
+            LOGGER.debug("托管进程日志同步到主日志失败 process=%s", self.name, exc_info=True)
 
     def poll(self) -> Optional[int]:
         if self.process is None:
@@ -312,6 +413,13 @@ class PlatformGeometryRuntime:
         # _update_stream_tracker 读到真实的 occupancy 状态。
         self._observer_occupancy_snapshot: Dict[str, object] = {}
         self._observer_occupancy_lock = threading.Lock()
+        self._external_live_pose: Optional[Pose] = None
+        self._external_live_pose_at_monotonic = 0.0
+        self._external_live_pose_lock = threading.Lock()
+        self._debug_initial_pose_hint: Optional[Pose] = None
+        self._debug_initial_pose_anchor: Optional[Pose] = None
+        self._debug_initial_pose_hint_until = 0.0
+        self._debug_initial_pose_hint_stable_count = 0
         self._nav2_launch_attempted = False
         self._nav2_action_provider = Nav2ActionNavigationProvider(self)
         self._cmd_vel_bridge: Optional[Ros2CmdVelMotionBridge] = None
@@ -383,7 +491,7 @@ class PlatformGeometryRuntime:
             self._start_ros_bridge_subprocess()
             self._ensure_external_geometry_observers_started()
             self._start_required_processes()
-            self._set_runtime_state("starting_external", "外部 SLAM/Nav2 几何脚本已启动，等待 /map、TF 与 Nav2 action。")
+            self._set_runtime_state("starting_external", "外部 SLAM/Nav2 几何脚本已启动，等待 /map_obstacles、TF 与 Nav2 action。")
             self._rosout_bridge.start()
             self._start_monitor_thread()
         except Exception as exc:
@@ -612,11 +720,8 @@ class PlatformGeometryRuntime:
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _external_localization_uses_static_map_yaml(self) -> bool:
-        return self._env_truthy(
-            "GO2_NAV_USE_STATIC_MAP_YAML",
-            "NUWAX_NAV2_USE_STATIC_MAP_YAML",
-            "GO2_NAV_AUTO_MAP_YAML",
-        )
+        # GO2_RTABNAV2 uses localize_only/restart_map/slam_mode; legacy GO2_NAV_* keys are deprecated.
+        return self._env_truthy("NUWAX_NAV2_USE_STATIC_MAP_YAML")
 
     @staticmethod
     def _command_uses_external_exploration(command: List[str]) -> bool:
@@ -858,17 +963,27 @@ class PlatformGeometryRuntime:
             )
             time.sleep(3.0)
             restart = True
+        mirror_main_log = name == self._external_process_name()
         process = current or _ManagedProcess(
             name=name,
             command=list(command),
             log_path=self._geometry_log_dir() / log_name,
             cwd=self._repo_root(),
+            mirror_main_log=mirror_main_log,
         )
         process_title, display_name = self._managed_process_identity(name)
         process.command = list(command)
         process.process_title = process_title
         process.display_name = display_name
+        process.mirror_main_log = mirror_main_log
         process.start(restart=restart)
+        if mirror_main_log:
+            LOGGER.info(
+                "外部几何脚本日志已同步到主日志：process=%s main_log=%s sidecar=%s",
+                name,
+                _project_log_file(),
+                process.log_path,
+            )
         self._managed_processes[name] = process
 
     def _stop_managed_processes(self) -> None:
@@ -1028,10 +1143,18 @@ class PlatformGeometryRuntime:
             self._set_runtime_state("waiting_input_bridge", str(readiness.get("message") or "等待外部 SLAM/Nav2 输入桥。"))
             return
         if not bool(readiness.get("first_frame_ready")):
-            self._set_runtime_state("waiting_map", str(readiness.get("message") or "等待外部 SLAM/Nav2 /map 首帧。"))
+            self._set_runtime_state("waiting_map", str(readiness.get("message") or "等待外部 SLAM/Nav2 /map_obstacles 首帧。"))
             return
         if bool(readiness.get("streaming_required")) and not bool(readiness.get("streaming_ready")):
-            self._set_runtime_state("first_frame", str(readiness.get("message") or "外部 SLAM/Nav2 已发布 /map 首帧，正在确认连续流式更新。"))
+            self._set_runtime_state("first_frame", str(readiness.get("message") or "外部 SLAM/Nav2 已发布 /map_obstacles 首帧，正在确认连续流式更新。"))
+            return
+        exploration_state = self.get_platform_exploration_state()
+        if getattr(exploration_state.status, "value", exploration_state.status) in {
+            ExplorationStatus.ACCEPTED.value,
+            ExplorationStatus.RUNNING.value,
+        }:
+            explore_message = exploration_state.message or "GO2_RTABNAV2 原生探索任务运行中。"
+            self._set_runtime_state("exploring", explore_message)
             return
         if not bool(readiness.get("localization_ready")):
             self._set_runtime_state("streaming", str(readiness.get("message") or "地图首帧已就绪，等待外部 SLAM/Nav2 定位与 TF。"))
@@ -1043,13 +1166,6 @@ class PlatformGeometryRuntime:
             return
         if nav2_phase == "failed":
             self._set_runtime_state("failed", str(nav2_status.get("message") or "外部 Nav2 action 失败。"), blocked=True)
-            return
-        exploration_state = self.get_platform_exploration_state()
-        if getattr(exploration_state.status, "value", exploration_state.status) in {
-            ExplorationStatus.ACCEPTED.value,
-            ExplorationStatus.RUNNING.value,
-        }:
-            self._set_runtime_state("exploring", "GO2_RTABMAP 原生探索任务运行中。")
             return
         if nav2_phase != "ready":
             self._set_runtime_state("streaming", "外部 SLAM/Nav2 地图 streaming 与 TF 已就绪；Nav2 状态：%s。" % nav2_status.get("phase"))
@@ -1184,22 +1300,22 @@ class PlatformGeometryRuntime:
             )
             waiting_for = "external_input_bridge"
         elif not first_frame_ready:
-            message = "等待外部 SLAM/Nav2 发布 /map 首帧。"
+            message = "等待外部 SLAM/Nav2 发布 /map_obstacles 首帧。"
             waiting_for = "external_map"
         elif streaming_required and not streaming_ready:
-            message = "外部 SLAM/Nav2 已发布 /map 首帧，正在确认连续 streaming。"
+            message = "外部 SLAM/Nav2 已发布 /map_obstacles 首帧，正在确认连续 streaming。"
             waiting_for = "external_map_streaming"
         elif not tf_chain.get("ready"):
             if localization_process:
-                message = "外部 SLAM/Nav2 定位模式已收到 /map 首帧，等待 map -> odom -> base TF 链就绪。"
+                message = "外部 SLAM/Nav2 定位模式已收到 /map_obstacles 首帧，等待 map -> odom -> base TF 链就绪。"
             else:
-                message = "外部 SLAM/Nav2 /map 已 streaming，等待 map -> odom -> base TF 链就绪。"
+                message = "外部 SLAM/Nav2 /map_obstacles 已 streaming，等待 map -> odom -> base TF 链就绪。"
             waiting_for = "external_tf"
         else:
             if localization_process:
                 message = "外部 SLAM/Nav2 定位地图首帧与 TF 链均已就绪。"
             else:
-                message = "外部 SLAM/Nav2 /map streaming 与 TF 链均已就绪。"
+                message = "外部 SLAM/Nav2 /map_obstacles streaming 与 TF 链均已就绪。"
             waiting_for = None
         return {
             "ready": localization_ready,
@@ -1471,6 +1587,90 @@ class PlatformGeometryRuntime:
             return
         self._ensure_external_geometry_observers_started()
 
+    def _resolve_external_tf_localization_status(
+        self,
+        *,
+        base_stub: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        """合成 GO2_RTABNAV2 外部栈 TF 就绪状态。
+
+        Rust bridge GetStatus 不含 pose_ready/map_to_base_ready；探索/建图时 RTAB-Map
+        通过 /go2/pose_map 与 /tf 提供 map 系位姿，须合并 debug observer 与 gRPC 信号。
+        """
+        status = dict(base_stub or {})
+        map_frame = str(self.config.frames.map_frame or "map").strip().lstrip("/")
+        odom_frame = str(self.config.frames.odom_frame or "odom").strip().lstrip("/")
+        base_frame = str(self.config.frames.base_frame or "base_link").strip().lstrip("/")
+        base_candidates = tuple(
+            dict.fromkeys(
+                candidate
+                for candidate in (
+                    base_frame,
+                    "base_footprint",
+                    "base_link",
+                )
+                if candidate
+            )
+        )
+        pose_ready = bool(status.get("pose_ready") or status.get("pose_available"))
+        map_to_base_ready = bool(status.get("map_to_base_ready"))
+        map_to_odom_ready = bool(status.get("map_to_odom_ready"))
+        odom_to_base_ready = bool(status.get("odom_to_base_ready"))
+        source_kind = status.get("source_kind")
+
+        live_pose = self.get_external_live_pose(max_age_sec=3.0)
+        if live_pose is not None:
+            frame_id = str(live_pose.frame_id or "").strip().lstrip("/")
+            if not frame_id or frame_id == map_frame:
+                pose_ready = True
+                map_to_base_ready = True
+                source_kind = source_kind or "external_pose_topic"
+
+        if not map_to_base_ready and self._remote_provider is not None and self._remote_provider.is_connected:
+            bridge_pose = self._remote_provider.get_current_pose()
+            if bridge_pose is not None:
+                frame_id = str(bridge_pose.frame_id or "").strip().lstrip("/")
+                if frame_id == map_frame:
+                    pose_ready = True
+                    map_to_base_ready = True
+                    source_kind = source_kind or "ros_bridge_pose"
+            if not map_to_base_ready:
+                frame_tree = self._remote_provider.get_frame_tree()
+                if frame_tree is not None:
+                    present_frames = {
+                        frame_id
+                        for transform in frame_tree.transforms
+                        for frame_id in (transform.parent_frame_id, transform.child_frame_id)
+                    }
+                    map_to_odom_ready = map_to_odom_ready or (
+                        map_frame in present_frames and odom_frame in present_frames
+                    )
+                    odom_to_base_ready = odom_to_base_ready or any(
+                        candidate in present_frames for candidate in base_candidates
+                    )
+                    for candidate in base_candidates:
+                        if resolve_frame_transform(
+                            frame_tree,
+                            source_frame_id=map_frame,
+                            target_frame_id=candidate,
+                        ) is not None:
+                            pose_ready = True
+                            map_to_base_ready = True
+                            source_kind = source_kind or "ros_bridge_tf_chain"
+                            break
+
+        status.update(
+            {
+                "pose_ready": pose_ready,
+                "pose_available": pose_ready,
+                "map_to_base_ready": map_to_base_ready,
+                "map_to_odom_ready": map_to_odom_ready,
+                "odom_to_base_ready": odom_to_base_ready,
+                "source_kind": source_kind,
+            }
+        )
+        return status
+
     def _ros_bridge_status_stub(self, provider_key: str) -> Dict[str, object]:
         """返回 Rust bridge 替代 Python provider 后的状态占位 dict，保持调用方 key 兼容。"""
         remote_status = {}
@@ -1493,6 +1693,8 @@ class PlatformGeometryRuntime:
                 observer_snapshot = dict(self._observer_occupancy_snapshot)
             if observer_snapshot:
                 stub.update(observer_snapshot)
+        if provider_key == "tf_localization_provider":
+            stub = self._resolve_external_tf_localization_status(base_stub=stub)
         return stub
 
     def _ros_bridge_handles_input_bridge(self) -> bool:
@@ -1542,6 +1744,22 @@ class PlatformGeometryRuntime:
             self._external_debug_observer = observer
         if not observer.is_running:
             observer.start()
+        with self._exploration_loop_lock:
+            session_mode = self._external_geometry_session_mode
+        observer.set_session_mode(session_mode)
+
+    def _on_external_geometry_session_mode_changed(self, mode: Optional[str]) -> None:
+        """同步 debug observer 会话模式，并在非 explore 时清空前沿缓存。"""
+        observer = self._external_debug_observer
+        if observer is not None:
+            observer.set_session_mode(mode)
+        if mode != "explore":
+            with self._exploration_loop_lock:
+                self._external_debug_frontier_payload = None
+            try:
+                self._notify_exploration_update(self.get_platform_exploration_state())
+            except Exception:
+                LOGGER.debug("清空非 explore 前沿缓存后通知失败。", exc_info=True)
 
     def _handle_external_debug_map_update(self, payload: Dict[str, object]) -> None:
         self._cache_observer_occupancy_snapshot(payload)
@@ -1568,7 +1786,7 @@ class PlatformGeometryRuntime:
             "occupancy_message_count": message_count,
             "occupancy_sequence": int(metadata.get("occupancy_sequence") or message_count),
             "cost_map_message_count": int(metadata.get("cost_map_message_count") or 0),
-            "occupancy_topic": str(metadata.get("source_topic") or self.config.topics.occupancy_topic or "/map"),
+            "occupancy_topic": str(metadata.get("source_topic") or self.config.topics.occupancy_topic or "/map_obstacles"),
             "streaming": bool(metadata.get("streaming")),
             "known_cell_count": int(metadata.get("known_cell_count") or 0),
         }
@@ -1589,21 +1807,227 @@ class PlatformGeometryRuntime:
         with self._observer_occupancy_lock:
             self._observer_occupancy_snapshot = snapshot
 
+    def get_external_live_pose(self, *, max_age_sec: float = 2.0) -> Optional[Pose]:
+        """返回 GO2 debug observer /go2/pose_map 缓存的 map 系位姿，供 Nav2 下发目标。"""
+
+        with self._external_live_pose_lock:
+            pose = self._external_live_pose
+            updated_at = self._external_live_pose_at_monotonic
+        if pose is None:
+            return None
+        if max_age_sec > 0.0 and (time.monotonic() - updated_at) > max_age_sec:
+            return None
+        return self._resolve_pose_after_initial_hint(pose.model_copy(deep=True))
+
+    def invalidate_external_live_pose_cache(self) -> None:
+        """清空 /go2/pose_map 缓存，便于 2D Pose 后尽快接受新 TF。"""
+
+        with self._external_live_pose_lock:
+            self._external_live_pose = None
+            self._external_live_pose_at_monotonic = 0.0
+
+    def _set_debug_initial_pose_hint(self, target_pose: Pose, *, ttl_sec: float = 12.0) -> None:
+        with self._external_live_pose_lock:
+            self._debug_initial_pose_hint = target_pose.model_copy(deep=True)
+            self._debug_initial_pose_anchor = (
+                self._external_live_pose.model_copy(deep=True)
+                if self._external_live_pose is not None
+                else None
+            )
+            self._debug_initial_pose_hint_until = time.monotonic() + max(1.0, float(ttl_sec))
+            self._debug_initial_pose_hint_stable_count = 0
+
+    def _resolve_pose_after_initial_hint(self, pose: Pose) -> Pose:
+        with self._external_live_pose_lock:
+            hint = self._debug_initial_pose_hint
+            anchor = self._debug_initial_pose_anchor
+            expires_at = self._debug_initial_pose_hint_until
+        if hint is None or time.monotonic() > expires_at:
+            with self._external_live_pose_lock:
+                self._debug_initial_pose_hint = None
+                self._debug_initial_pose_anchor = None
+                self._debug_initial_pose_hint_until = 0.0
+            return pose
+        try:
+            hx = float(hint.position.x)
+            hy = float(hint.position.y)
+            nx = float(pose.position.x)
+            ny = float(pose.position.y)
+            dist_to_hint = math.hypot(nx - hx, ny - hy)
+            if anchor is not None:
+                ax = float(anchor.position.x)
+                ay = float(anchor.position.y)
+                dist_anchor_to_hint = math.hypot(ax - hx, ay - hy)
+                if dist_to_hint + 0.35 >= dist_anchor_to_hint:
+                    return hint.model_copy(deep=True)
+            if dist_to_hint <= 0.45:
+                if anchor is not None:
+                    ax = float(anchor.position.x)
+                    ay = float(anchor.position.y)
+                    if math.hypot(nx - ax, ny - ay) <= 0.35:
+                        with self._external_live_pose_lock:
+                            self._debug_initial_pose_hint_stable_count = 0
+                        return hint.model_copy(deep=True)
+                with self._external_live_pose_lock:
+                    self._debug_initial_pose_hint_stable_count += 1
+                    if self._debug_initial_pose_hint_stable_count >= 3:
+                        self._debug_initial_pose_hint = None
+                        self._debug_initial_pose_anchor = None
+                        self._debug_initial_pose_hint_until = 0.0
+                        self._debug_initial_pose_hint_stable_count = 0
+                        return pose
+                return hint.model_copy(deep=True)
+            with self._external_live_pose_lock:
+                self._debug_initial_pose_hint_stable_count = 0
+            return hint.model_copy(deep=True)
+        except (TypeError, ValueError):
+            return pose
+
+    def publish_debug_initial_pose(self, target_pose: Pose) -> Dict[str, object]:
+        """RViz 2D Pose Estimate：向 RTAB-Map 发布 /initialpose 触发重定位。"""
+
+        from contracts.geometry_runtime import DEFAULT_MAP_FRAME
+        from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
+
+        frame_id = str(target_pose.frame_id or DEFAULT_MAP_FRAME).strip().lstrip("/") or DEFAULT_MAP_FRAME
+        topics = ("/initialpose",)
+        publish_attempts = 2
+        wait_for_subscriber_sec = 3.0
+        publish_interval_sec = 0.2
+        node = None
+        rclpy = None
+        has_context = False
+        try:
+            from geometry_msgs.msg import PoseWithCovarianceStamped
+            from rclpy.duration import Duration
+            from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+            rclpy = acquire_ros2_context()
+            has_context = True
+            node = rclpy.create_node("nuwax_debug_initialpose_publisher")
+            qos = QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+            )
+            publishers = {
+                topic: node.create_publisher(PoseWithCovarianceStamped, topic, qos)
+                for topic in topics
+            }
+            msg = PoseWithCovarianceStamped()
+            msg.header.frame_id = frame_id
+            msg.header.stamp = (node.get_clock().now() - Duration(seconds=0.5)).to_msg()
+            msg.pose.pose.position.x = float(target_pose.position.x)
+            msg.pose.pose.position.y = float(target_pose.position.y)
+            msg.pose.pose.position.z = float(target_pose.position.z)
+            msg.pose.pose.orientation.x = float(target_pose.orientation.x)
+            msg.pose.pose.orientation.y = float(target_pose.orientation.y)
+            msg.pose.pose.orientation.z = float(target_pose.orientation.z)
+            msg.pose.pose.orientation.w = float(target_pose.orientation.w)
+            msg.pose.covariance = [0.25 if index in (0, 7, 35) else 0.0 for index in range(36)]
+
+            deadline = time.monotonic() + wait_for_subscriber_sec
+            subscriber_counts: Dict[str, int] = {topic: 0 for topic in topics}
+            while time.monotonic() < deadline:
+                for topic, publisher in publishers.items():
+                    subscriber_counts[topic] = int(publisher.get_subscription_count())
+                if any(count > 0 for count in subscriber_counts.values()):
+                    break
+                time.sleep(0.1)
+
+            self._set_debug_initial_pose_hint(target_pose)
+            for attempt in range(publish_attempts):
+                for publisher in publishers.values():
+                    publisher.publish(msg)
+                if attempt + 1 < publish_attempts:
+                    time.sleep(publish_interval_sec)
+
+            self.invalidate_external_live_pose_cache()
+            hint_pose = target_pose.model_copy(deep=True)
+            self._handle_external_debug_pose_update(
+                hint_pose,
+                metadata={"source_kind": "debug_initial_pose_hint", "source_name": "nuwax_debug_initialpose_publisher"},
+            )
+            total_subscribers = sum(subscriber_counts.values())
+            mapping_hint = (
+                "当前为建图模式时 /initialpose 主要用于重定位 hint，效果弱于定位模式。"
+                if total_subscribers == 0
+                else None
+            )
+            log_line = (
+                "debug 2D Pose 已发布 /initialpose pose=(%.3f, %.3f, %.3f) frame=%s "
+                "subscribers=%s attempts=%d"
+                % (
+                    msg.pose.pose.position.x,
+                    msg.pose.pose.position.y,
+                    msg.pose.pose.position.z,
+                    frame_id,
+                    subscriber_counts,
+                    publish_attempts,
+                )
+            )
+            LOGGER.info(log_line)
+            _append_main_log_line(_GO2_SH_MAIN_LOG_LOGGER, log_line)
+            message = "已发布 /initialpose（RViz 2D Pose Estimate 等价）。"
+            if total_subscribers == 0:
+                message = (
+                    "已发布 /initialpose，但当前无 RTAB-Map 订阅者；"
+                    "请确认 go2.sh 已启动且 rtabmap 节点在运行。"
+                )
+            return {
+                "published": True,
+                "topic": "/initialpose",
+                "topics": list(topics),
+                "frame_id": frame_id,
+                "x": msg.pose.pose.position.x,
+                "y": msg.pose.pose.position.y,
+                "z": msg.pose.pose.position.z,
+                "subscriber_counts": subscriber_counts,
+                "publish_attempts": publish_attempts,
+                "mapping_hint": mapping_hint,
+                "message": message,
+            }
+        except Exception as exc:
+            LOGGER.info("debug 发布 /initialpose 失败：%s", exc)
+            return {
+                "published": False,
+                "topic": "/initialpose",
+                "topics": list(topics),
+                "message": "发布 /initialpose 失败：%s" % exc,
+            }
+        finally:
+            if node is not None:
+                try:
+                    node.destroy_node()
+                except Exception:
+                    pass
+            if has_context:
+                release_ros2_context()
+
     def _handle_external_debug_pose_update(
         self,
         pose: Any,
         frame_tree: Any = None,
         metadata: Optional[Dict[str, object]] = None,
     ) -> None:
+        resolved_pose = pose
+        if pose is not None and hasattr(pose, "model_copy"):
+            resolved_pose = self._resolve_pose_after_initial_hint(pose.model_copy(deep=True))
+            with self._external_live_pose_lock:
+                self._external_live_pose = resolved_pose.model_copy(deep=True)
+                self._external_live_pose_at_monotonic = time.monotonic()
         callbacks = list(self._pending_localization_callbacks)
         meta = dict(metadata or {})
         for callback in callbacks:
             try:
-                callback(pose, frame_tree, meta)
+                callback(resolved_pose, frame_tree, meta)
             except Exception:
                 LOGGER.debug("投递外部 GO2 位姿 debug update 失败。", exc_info=True)
 
     def _handle_external_debug_frontier_update(self, payload: Dict[str, object]) -> None:
+        with self._exploration_loop_lock:
+            if self._external_geometry_session_mode != "explore":
+                return
         terminal_state = None
         with self._exploration_loop_lock:
             self._external_debug_frontier_payload = self._clone_metadata(payload)
@@ -1612,10 +2036,10 @@ class PlatformGeometryRuntime:
         if has_external_request and self._metadata_indicates_exploration_done(metadata):
             terminal_status = str(metadata.get("terminal_status") or "succeeded").lower()
             status = ExplorationStatus.SUCCEEDED if terminal_status == "succeeded" else ExplorationStatus.FAILED
-            message = "GO2_RTABMAP 原生探索已完成。"
+            message = "GO2_RTABNAV2 原生探索已完成。"
             status_text = str(metadata.get("status_text") or "").strip()
             if status_text:
-                message = "GO2_RTABMAP 原生探索已完成：%s" % status_text
+                message = "GO2_RTABNAV2 原生探索已完成：%s" % status_text
             terminal_state = self._finish_external_script_exploration(
                 status=status,
                 reason="external_explorer_terminal_status",
@@ -1936,14 +2360,28 @@ class PlatformGeometryRuntime:
         frontier_count: Optional[int] = None,
     ) -> Optional[str]:
         status_text = PlatformGeometryRuntime._resolve_explorer_status_text(frontier_meta)
+        observer_meta = (frontier_meta or {}).get("external_frontier_debug_observer")
+        observer_payload = (
+            observer_meta.get("metadata")
+            if isinstance(observer_meta, dict) and isinstance(observer_meta.get("metadata"), dict)
+            else {}
+        )
+        plan_fresh = bool(observer_payload.get("plan_fresh"))
+        plan_points = int(observer_payload.get("plan_point_count") or 0)
         if not status_text:
+            if frontier_count is not None and frontier_count > 0:
+                return "正在探索：%d 个前沿点" % int(frontier_count)
+            if plan_fresh and plan_points > 0:
+                return "正在探索：已规划路径（%d 点）" % plan_points
             return None
         cleaned = re.sub(r"^\[explorer\]\s*", "", status_text, flags=re.IGNORECASE).strip()
         if not cleaned:
+            if frontier_count is not None and frontier_count > 0:
+                return "正在探索：%d 个前沿点" % int(frontier_count)
             return None
         upper = cleaned.upper()
         if "DONE (EXPLORATION FINISHED)" in upper:
-            return "GO2_RTABMAP 原生探索已完成：%s" % cleaned
+            return "GO2_RTABNAV2 原生探索已完成：%s" % cleaned
         if upper.startswith("STRATEGY:"):
             return "探索换策略中：%s" % cleaned
         if frontier_count is not None and frontier_count > 0:
@@ -1967,10 +2405,20 @@ class PlatformGeometryRuntime:
             frontier_meta,
             frontier_count=frontier_count,
         )
+        observer_meta = (frontier_meta or {}).get("external_frontier_debug_observer")
+        observer_payload = (
+            observer_meta.get("metadata")
+            if isinstance(observer_meta, dict) and isinstance(observer_meta.get("metadata"), dict)
+            else {}
+        )
         explorer_actually_running = bool(
             active
-            and explorer_message is not None
             and "DONE (EXPLORATION FINISHED)" not in frontier_status_text
+            and (
+                explorer_message is not None
+                or (frontier_count is not None and frontier_count > 0)
+                or bool(observer_payload.get("plan_fresh"))
+            )
         )
         # 安全条款：_error 结尾的诊断必须始终覆写 headline（真实错误不被遮蔽）。
         is_error_diagnostic = bool(
@@ -2000,10 +2448,15 @@ class PlatformGeometryRuntime:
             if diagnostics.get("message"):
                 updates["message"] = diagnostics.get("message")
         elif explorer_actually_running and not is_error_diagnostic:
-            updates["message"] = explorer_message
+            updates["message"] = explorer_message or updates.get("message")
+            metadata["waiting_for"] = None
+            metadata.pop("waiting_detail", None)
             status_text = str((frontier_meta or {}).get("status_text") or "").strip()
             if status_text:
                 metadata["status_text"] = status_text
+        with self._exploration_loop_lock:
+            metadata["geometry_session_mode"] = self._external_geometry_session_mode
+        updates["metadata"] = metadata
         return state.model_copy(update=updates, deep=True)
 
     def clear_active_map_version(self, *, reason: str = "") -> None:
@@ -3668,8 +4121,8 @@ class PlatformGeometryRuntime:
             command = [str(self._external_script_path()), "--localization", str(db_path)]
             if static_map_yaml_path is not None:
                 command.extend(["--map-yaml", str(static_map_yaml_path)])
-            # Default to db-only localization: RTAB-Map publishes /map directly.
-            # Static map_server /map is opt-in via GO2_NAV_USE_STATIC_MAP_YAML=true.
+            # GO2_RTABNAV2 localization reads the passed .db directly (localize_only:=true).
+            # Static map_server is opt-in via NUWAX_NAV2_USE_STATIC_MAP_YAML=true (legacy GO2_NAV_* deprecated).
             self._start_managed_process(process_name, command, self._external_log_name(), restart=restart)
             process = self._managed_processes.get(process_name)
             process_running = bool(process is not None and process.is_running())
@@ -4049,6 +4502,7 @@ class PlatformGeometryRuntime:
             self._exploration_last_tick_at_iso = None
             self._exploration_last_tick_monotonic = None
             self._exploration_last_tick_source = "external_script_start"
+        self._on_external_geometry_session_mode_changed("explore")
         if current_process is not None:
             self._managed_processes.pop(process_name, None)
             current_process.stop()
@@ -4065,7 +4519,7 @@ class PlatformGeometryRuntime:
             self._finish_external_script_exploration(
                 status=ExplorationStatus.FAILED,
                 reason="external_explore_start_failed",
-                message="GO2_RTABMAP 原生探索脚本启动失败。",
+                message="GO2_RTABNAV2 原生探索脚本启动失败。",
                 notify_compat=False,
                 process_status=process.status() if process is not None else None,
                 kill_geometry_process=True,
@@ -4073,7 +4527,7 @@ class PlatformGeometryRuntime:
             return False
         self._record_runtime_diagnostic(
             "external_go2_exploration_started",
-            "explore_area 已委托 GO2_RTABMAP 脚本执行：%s" % process.command_display(),
+            "explore_area 已委托 GO2_RTABNAV2 脚本执行：%s" % process.command_display(),
         )
         return True
 
@@ -4090,7 +4544,7 @@ class PlatformGeometryRuntime:
         self._finish_external_script_exploration(
             status=ExplorationStatus.CANCELLED,
             reason="manual_cancel",
-            message="GO2_RTABMAP 原生探索任务已取消；RTAB-Map/Nav2 仍保持运行，请使用 stop_mapping 结束几何栈。",
+            message="GO2_RTABNAV2 原生探索任务已取消；RTAB-Map/Nav2 仍保持运行，请使用 stop_mapping 结束几何栈。",
             notify_compat=notify_compat,
             kill_geometry_process=False,
         )
@@ -4192,6 +4646,7 @@ class PlatformGeometryRuntime:
             self._external_exploration_started_at_iso = _utc_now_iso()
             self._external_exploration_deadline_monotonic = None
             self._external_exploration_database_path = db_path
+        self._on_external_geometry_session_mode_changed("mapping")
         if current_process is not None:
             self._managed_processes.pop(process_name, None)
             current_process.stop(
@@ -4208,10 +4663,10 @@ class PlatformGeometryRuntime:
         if process is None or not process.is_running():
             with self._exploration_loop_lock:
                 self._external_geometry_session_mode = None
-            raise RuntimeError("GO2_RTABMAP 手动建图脚本启动失败。")
+            raise RuntimeError("GO2_RTABNAV2 手动建图脚本启动失败。")
         self._record_runtime_diagnostic(
             "external_go2_mapping_started",
-            "start_mapping 已委托 GO2_RTABMAP 脚本执行：%s" % process.command_display(),
+            "start_mapping 已委托 GO2_RTABNAV2 脚本执行：%s" % process.command_display(),
         )
         return {
             "mapping_launch_mode": "mapping",
@@ -4257,7 +4712,10 @@ class PlatformGeometryRuntime:
                 "可继续手动导航/遥控，完成后 save_active_map_version，再 stop_mapping。"
             )
         elif launch_mode == "explore" and has_active_exploration:
-            guidance = "自主探索进行中；不要用 explore_area 启动遥控建图。"
+            guidance = (
+                "自主探索进行中；用 get_task_status 查看 frontier_count 与 message，"
+                "不要 relocalize_active_map，也不要因 localization_ready=false 误判卡住。"
+            )
         return {
             "geometry_stack_running": running,
             "launch_mode": launch_mode,
@@ -4288,7 +4746,7 @@ class PlatformGeometryRuntime:
             exploration_state = self._finish_external_script_exploration(
                 status=ExplorationStatus.CANCELLED,
                 reason=str(reason or "stop_mapping"),
-                message="GO2_RTABMAP 几何栈已通过 stop_mapping 停止。",
+                message="GO2_RTABNAV2 几何栈已通过 stop_mapping 停止。",
                 notify_compat=True,
                 kill_geometry_process=True,
             )
@@ -4310,10 +4768,11 @@ class PlatformGeometryRuntime:
                 self._notify_exploration_update(exploration_state)
         stopped = not self._external_geometry_stack_is_running()
         if not stopped and process_was_running:
-            raise RuntimeError("GO2_RTABMAP 几何栈停止失败，外部进程仍在运行。")
+            raise RuntimeError("GO2_RTABNAV2 几何栈停止失败，外部进程仍在运行。")
+        self._on_external_geometry_session_mode_changed(None)
         self._record_runtime_diagnostic(
             "external_go2_mapping_stopped",
-            "stop_mapping 已停止 GO2_RTABMAP 几何栈 reason=%s session_mode=%s" % (reason, session_mode),
+            "stop_mapping 已停止 GO2_RTABNAV2 几何栈 reason=%s session_mode=%s" % (reason, session_mode),
         )
         with self._exploration_loop_lock:
             mapping_database_path = self._external_exploration_database_path
@@ -4429,8 +4888,8 @@ class PlatformGeometryRuntime:
         if deadline is not None:
             remaining = max(0.0, deadline - time.monotonic())
         metadata: Dict[str, object] = {
-            "exploration_mode": "go2_rtabmap_script",
-            "exploration_runtime": "external_go2_rtabmap",
+            "exploration_mode": "go2_rtabnav2_script",
+            "exploration_runtime": "external_go2_rtabnav2",
             "exploration_script": str(self._external_script_path()),
             "exploration_process_name": self._external_process_name(),
             "exploration_database_path": database_path,
@@ -4446,7 +4905,8 @@ class PlatformGeometryRuntime:
             "waiting_for": waiting_for,
             "external_process": process_status,
             "platform_frontier_runtime_bypassed": True,
-            "native_go2_frontier_explorer": True,
+            "native_go2_explore_lite": True,
+            "native_go2_frontier_explorer": False,
         }
         if request is not None:
             metadata.update(
@@ -4826,6 +5286,8 @@ class PlatformGeometryRuntime:
 
     def _external_debug_frontier_metadata(self) -> tuple[Dict[str, object], Optional[int]]:
         with self._exploration_loop_lock:
+            if self._external_geometry_session_mode != "explore":
+                return {}, None
             payload = self._clone_metadata(self._external_debug_frontier_payload or {})
         if not payload:
             return {}, None
@@ -4847,8 +5309,9 @@ class PlatformGeometryRuntime:
         metadata = {
             "latest_frontiers": latest_frontiers,
             "current_frontier": current_frontier,
-            "frontier_source": payload.get("source") or "go2_rtabmap_debug_observer",
-            "native_go2_frontier_explorer": True,
+            "frontier_source": payload.get("source") or "go2_rtabnav2_debug_observer",
+            "native_go2_explore_lite": True,
+            "native_go2_frontier_explorer": False,
             "status_text": resolved_status_text,
             "exploration_terminal": bool(payload_metadata.get("exploration_terminal")),
             "terminal_status": payload_metadata.get("terminal_status"),
@@ -4897,9 +5360,9 @@ class PlatformGeometryRuntime:
         terminal_status = str(payload_metadata.get("terminal_status") or "succeeded").lower()
         status = ExplorationStatus.SUCCEEDED if terminal_status == "succeeded" else ExplorationStatus.FAILED
         status_text = str(payload_metadata.get("status_text") or "").strip()
-        message = "GO2_RTABMAP 原生探索已完成。"
+        message = "GO2_RTABNAV2 原生探索已完成。"
         if status_text:
-            message = "GO2_RTABMAP 原生探索已完成：%s" % status_text
+            message = "GO2_RTABNAV2 原生探索已完成：%s" % status_text
         process = self._managed_processes.get(self._external_process_name())
         process_status = process.status() if process is not None else None
         return self._finish_external_script_exploration(
@@ -4937,7 +5400,7 @@ class PlatformGeometryRuntime:
         process = self._managed_processes.get(self._external_process_name())
         process_status = process.status() if process is not None else None
         waiting_for = None
-        message = explorer_message or "GO2_RTABMAP 原生 frontier 探索运行中。"
+        message = explorer_message or "GO2_RTABNAV2 原生 frontier 探索运行中。"
         metadata = self._build_external_exploration_metadata(
             request=request,
             process_status=process_status,
@@ -4978,7 +5441,7 @@ class PlatformGeometryRuntime:
             state = self._finish_external_script_exploration(
                 status=ExplorationStatus.SUCCEEDED,
                 reason="max_duration_sec",
-                message="GO2_RTABMAP 原生探索已达到最大时长，任务已结束。",
+                message="GO2_RTABNAV2 原生探索已达到最大时长，任务已结束。",
                 notify_compat=False,
                 process_status=process_status,
                 kill_geometry_process=False,
@@ -4991,7 +5454,7 @@ class PlatformGeometryRuntime:
                 state = self._finish_external_script_exploration(
                     status=ExplorationStatus.SUCCEEDED,
                     reason="external_process_completed",
-                    message="GO2_RTABMAP 原生探索脚本已正常退出。",
+                    message="GO2_RTABNAV2 原生探索脚本已正常退出。",
                     notify_compat=False,
                     process_status=process_status,
                     kill_geometry_process=False,
@@ -5000,7 +5463,7 @@ class PlatformGeometryRuntime:
             state = self._finish_external_script_exploration(
                 status=ExplorationStatus.FAILED,
                 reason="external_process_exited",
-                message="GO2_RTABMAP 原生探索脚本已退出，exit_code=%s。" % exit_code,
+                message="GO2_RTABNAV2 原生探索脚本已退出，exit_code=%s。" % exit_code,
                 notify_compat=False,
                 process_status=process_status,
                 kill_geometry_process=False,
@@ -5032,18 +5495,24 @@ class PlatformGeometryRuntime:
         rtabmap_readiness = diagnostics.get("rtabmap_readiness") if isinstance(diagnostics.get("rtabmap_readiness"), dict) else {}
         nav2_status = runtime_status.get("nav2") if isinstance(runtime_status.get("nav2"), dict) else self._build_nav2_status()
         waiting_for = None
-        message = "GO2_RTABMAP 原生 frontier 探索运行中。"
-        if not explorer_message:
-            if diagnostics.get("waiting_for"):
-                waiting_for = str(diagnostics.get("waiting_for"))
-                message = str(diagnostics.get("message") or "等待 GO2_RTABMAP 探索输入链路 ready。")
-            elif not bool(rtabmap_readiness.get("localization_ready")):
-                waiting_for = str(rtabmap_readiness.get("waiting_for") or "external_slam_nav2")
-                message = str(rtabmap_readiness.get("message") or "等待 GO2_RTABMAP SLAM/TF ready。")
-            elif not bool(nav2_status.get("ready")):
-                waiting_for = self._normalize_exploration_waiting_for(nav2_status.get("waiting_for") or "nav2_action")
-                message = str(nav2_status.get("message") or "等待 GO2_RTABMAP Nav2 ready。")
-        else:
+        message = "GO2_RTABNAV2 原生 frontier 探索运行中。"
+        exploration_signals_active = bool(
+            explorer_message is not None
+            or (frontier_count is not None and frontier_count > 0)
+            or bool((frontier_metadata or {}).get("plan_fresh"))
+        )
+        if exploration_signals_active:
+            message = explorer_message or message
+        elif diagnostics.get("waiting_for"):
+            waiting_for = str(diagnostics.get("waiting_for"))
+            message = str(diagnostics.get("message") or "等待 GO2_RTABNAV2 探索输入链路 ready。")
+        elif not bool(rtabmap_readiness.get("localization_ready")):
+            waiting_for = str(rtabmap_readiness.get("waiting_for") or "external_slam_nav2")
+            message = str(rtabmap_readiness.get("message") or "等待 GO2_RTABNAV2 SLAM/TF ready。")
+        elif not bool(nav2_status.get("ready")):
+            waiting_for = self._normalize_exploration_waiting_for(nav2_status.get("waiting_for") or "nav2_action")
+            message = str(nav2_status.get("message") or "等待 GO2_RTABNAV2 Nav2 ready。")
+        elif explorer_message:
             message = explorer_message
 
         metadata = self._build_external_exploration_metadata(
@@ -5124,8 +5593,14 @@ class PlatformGeometryRuntime:
 
     def _read_external_frontier_ros_logs(self, launch_log_text: str) -> List[str]:
         pids: List[str] = []
-        for match in re.finditer(r"\[frontier_explorer\.py-\d+\]: process started with pid \[(\d+)\]", launch_log_text or ""):
-            pids.append(match.group(1))
+        pid_patterns = (
+            r"\[frontier_explorer\.py-\d+\]: process started with pid \[(\d+)\]",
+            r"\[explore-\d+\]: process started with pid \[(\d+)\]",
+            r"\[explore_node-\d+\]: process started with pid \[(\d+)\]",
+        )
+        for pattern in pid_patterns:
+            for match in re.finditer(pattern, launch_log_text or ""):
+                pids.append(match.group(1))
         if not pids:
             return []
         ros_log_root = Path.home() / ".ros" / "log"
@@ -5147,9 +5622,11 @@ class PlatformGeometryRuntime:
         normalized = text.lower()
         complete_markers = (
             "exploration complete",
+            "exploration_complete",
             "exploration reached a terminal state",
             "done (exploration finished)",
             "no frontiers found. exploration complete",
+            "所有前沿已尝试完毕",
             "frontier_explorer is idle",
             "shutting down frontier_explorer node",
         )
@@ -5158,7 +5635,7 @@ class PlatformGeometryRuntime:
             return {
                 "status": ExplorationStatus.SUCCEEDED,
                 "reason": "external_explorer_log_complete",
-                "message": "GO2_RTABMAP 原生探索已完成。",
+                "message": "GO2_RTABNAV2 原生探索已完成。",
             }
         return None
 
@@ -5239,7 +5716,7 @@ class PlatformGeometryRuntime:
         failure_code = None
         if occupancy_grid is None:
             waiting_for = "map"
-            message = "等待外部 SLAM/Nav2 /map 首帧。"
+            message = "等待外部 SLAM/Nav2 /map_obstacles 首帧。"
             failure_code = "map_unavailable"
         elif not bool(rtabmap_readiness.get("streaming_ready")):
             waiting_for = "live_map_streaming"

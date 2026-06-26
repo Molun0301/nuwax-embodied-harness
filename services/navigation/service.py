@@ -487,7 +487,10 @@ class NavigationService:
                 frontiers = exploration_metadata.get("latest_frontiers")
                 current_frontier = exploration_metadata.get("current_frontier")
                 observer_meta = exploration_metadata.get("external_frontier_debug_observer")
-                should_publish_frontier = (
+                geometry_session_mode = str(
+                    exploration_metadata.get("geometry_session_mode") or "",
+                ).strip().lower()
+                should_publish_frontier = geometry_session_mode == "explore" and (
                     frontiers is not None
                     or current_frontier is not None
                     or bool(exploration_metadata.get("exploration_terminal"))
@@ -499,6 +502,7 @@ class NavigationService:
                         "latest_frontiers": frontiers if isinstance(frontiers, list) else [],
                         "current_frontier": current_frontier if isinstance(current_frontier, dict) else None,
                         "frontier_count": context.exploration_state.frontier_count,
+                        "geometry_session_mode": geometry_session_mode or "explore",
                         "status_text": exploration_metadata.get("status_text"),
                         "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
                         "terminal_status": exploration_metadata.get("terminal_status"),
@@ -681,7 +685,7 @@ class NavigationService:
             return
         exploration_state = exploration_context.exploration_state
         metadata = dict(getattr(exploration_state, "metadata", {}) or {})
-        if metadata.get("exploration_mode") != "go2_rtabmap_script":
+        if metadata.get("exploration_mode") not in {"go2_rtabnav2_script", "go2_rtabmap_script"}:
             return
         if exploration_state.status not in {
             ExplorationStatus.ACCEPTED,

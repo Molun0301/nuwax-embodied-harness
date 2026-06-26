@@ -239,23 +239,28 @@ cleanup_stale_go2_video_streamer() {
 }
 
 cleanup_external_geometry_processes() {
-  local geometry_root="${REPO_ROOT}/services/geometry/ros2_ws/src/go2slam"
+  local geometry_root="${REPO_ROOT}/services/geometry/ros2_ws/src/GO2_RTABNAV2"
   local pid=""
   local args=""
   local pgid=""
   local pattern=""
   local go2_patterns=(
-    "ros2 launch go2_nav"
-    "ros2 service call /rtabmap/publish_map"
-    "/rtabmap_slam/rtabmap"
+    "ros2 launch go2_slam_nav"
+    "lib/rtabmap_slam/rtabmap"
+    "lib/rtabmap_odom/icp_odometry"
+    "lib/go2_slam_nav/sensor_stamp_relay"
+    "lib/go2_slam_nav/obstacle_grid_projector"
+    "lib/go2_slam_nav/go2_tf_relay"
+    "lib/go2_cmd_processor/sport_ctrl"
+    "explore_node"
+    "explore_preroll"
+    "nav2_container"
+    "component_container_isolated"
+    "lifecycle_manager"
     "/nav2_controller/controller_server"
     "/nav2_planner/planner_server"
     "/nav2_recoveries/recoveries_server"
     "/nav2_bt_navigator/bt_navigator"
-    "/nav2_map_server/map_server"
-    "/nav2_lifecycle_manager/lifecycle_manager"
-    "go2_nav/(wait_for_map_tf|rtabmap_force_localization_params)[.]sh"
-    "go2_nav/(odom_tf_broadcaster|cloud_to_scan|cmd_vel_bridge|frontier_explorer)[.]py"
   )
   declare -A seen_pgids=()
 
@@ -364,7 +369,7 @@ start_ros_bridge() {
   if [[ -z "${bridge_env_script}" && -n "${NUWAX_GEOMETRY_EXTERNAL_SCRIPT:-}" ]]; then
     bridge_env_script="$(dirname "${NUWAX_GEOMETRY_EXTERNAL_SCRIPT}")/scripts/env.sh"
   fi
-  local bridge_map_topic="${NUWAX_MAP_TOPIC:-${NUWAX_GEOMETRY_OCCUPANCY_TOPIC:-/map}}"
+  local bridge_map_topic="${NUWAX_MAP_TOPIC:-${NUWAX_GEOMETRY_OCCUPANCY_TOPIC:-/map_obstacles}}"
   local bridge_tf_topic="${NUWAX_TF_TOPIC:-${NUWAX_GEOMETRY_TF_TOPIC:-/tf}}"
   local bridge_nav_action="${NUWAX_NAV_ACTION:-${NUWAX_NAV2_ACTION_NAME:-/navigate_to_pose}}"
   local bridge_odom_source="${NUWAX_GO2_ODOM_SOURCE:-${NUWAX_GEOMETRY_ODOM_TOPIC:-/utlidar/robot_odom}}"

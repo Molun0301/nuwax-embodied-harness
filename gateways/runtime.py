@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 import logging
 import math
@@ -267,6 +267,42 @@ def _is_low_value_runtime_capability_event(event_type: str, event) -> bool:
 _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 0.5
 _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
 _DEFAULT_ASYNC_TASK_TIMEOUT_SEC = 15 * 60
+_ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
+    "load_map_version": {
+        "initial_wait_sec": 45.0,
+        "poll_interval_sec": 12.0,
+        "hint": (
+            "load_map_version 会启动 go2.sh --localization，通常需 45–90 秒。"
+            "提交后请先等待约 45 秒，再调用 get_task_status；之后每 12 秒轮询一次直至 state=succeeded。"
+            "禁止连续秒级高频轮询。"
+        ),
+    },
+    "activate_map": {
+        "initial_wait_sec": 15.0,
+        "poll_interval_sec": 8.0,
+        "hint": (
+            "activate_map 为异步任务。提交后等待约 15 秒再 get_task_status，之后每 8 秒轮询一次。"
+            "勿连续高频轮询。"
+        ),
+    },
+    "relocalize_active_map": {
+        "initial_wait_sec": 20.0,
+        "poll_interval_sec": 10.0,
+        "hint": (
+            "relocalize_active_map 为异步任务。提交后等待约 20 秒再 get_task_status，之后每 10 秒轮询一次。"
+            "勿连续高频轮询。"
+        ),
+    },
+    "explore_area": {
+        "initial_wait_sec": 30.0,
+        "poll_interval_sec": 15.0,
+        "hint": (
+            "explore_area 提交后等待约 30 秒再 get_task_status，之后每 15 秒轮询直至 state=succeeded。"
+            "进度看 frontier_count 与 message，不要查 TF 或触发 relocalize_active_map。"
+            "探索进行中 localization_ready=false 属正常，勿误判卡住。"
+        ),
+    },
+}
 _SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC = 1.5
 _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
     {
@@ -629,6 +665,7 @@ class GatewayRuntime:
         self._cloud_map_mmap_poll_stop = threading.Event()
         self._cloud_map_mmap_poll_thread: Optional[threading.Thread] = None
         self._cloud_map_last_revision: int = 0
+        self._task_status_last_polled_at: Dict[str, float] = {}
         self._start_cloud_map_mmap_poll()
         # 性能监控（CPU/内存/进程）采集线程，启停由数据流源聚合入口统一编排。
         self._system_telemetry_stop = threading.Event()
@@ -1409,7 +1446,7 @@ class GatewayRuntime:
             _descriptor(
                 "get_task_status",
                 "获取任务状态",
-                "按任务标识读取状态和事件。",
+                "按 task_id 读取异步任务状态。running 时响应含 polling_advisory.retry_after_sec 与 next_step_hint，请按指引等待后再 poll，勿连续高频调用。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object({"task_id": {"type": "string"}}, required=("task_id",)),
@@ -1576,7 +1613,7 @@ class GatewayRuntime:
             _descriptor(
                 "relocalize_active_map",
                 "重定位当前地图",
-                "仅在当前地图版本已经通过 load_map_version 加载且 active_workspace.map_loaded=true 后，执行一次平台重定位刷新。加载旧地图必须先调用 load_map_version，不要用本能力启动地图加载。本能力为异步任务：立即返回 task_id，用 get_task_status 轮询直到完成。",
+                "仅在当前地图版本已经通过 load_map_version 加载且 active_workspace.map_loaded=true 后，执行一次平台重定位刷新。本能力为异步任务：立即返回 task_id；请等待约 20s 后再 get_task_status，之后每 10s 轮询，勿高频连刷。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -1663,7 +1700,7 @@ class GatewayRuntime:
             _descriptor(
                 "activate_map",
                 "启用地图",
-                "仅切换/启用地图工作区与记忆库，不启动 go2.sh。遥控建图需在 activate_map 后调用 start_mapping；自主探索用 explore_area。本能力为异步任务：立即返回 task_id，用 get_task_status 轮询直到完成。",
+                "仅切换/启用地图工作区与记忆库，不启动 go2.sh。本能力为异步任务：立即返回 task_id；请等待约 15s 后再 get_task_status，之后每 8s 轮询，勿高频连刷。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -1720,7 +1757,8 @@ class GatewayRuntime:
             _descriptor(
                 "save_active_map_version",
                 "保存当前地图版本",
-                "把当前激活地图工作区中的地图快照保存为平台正式版本。",
+                "把当前激活地图工作区中的地图快照保存为平台正式版本。"
+                "MCP 响应仅返回版本摘要（不含 occupancy_grid.data 数组）；完整栅格已写入 version.json。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -1778,7 +1816,7 @@ class GatewayRuntime:
             _descriptor(
                 "load_map_version",
                 "加载地图版本",
-                "把平台侧已保存的地图版本加载到当前地图工作区。本能力为异步任务：立即返回 task_id，用 get_task_status 轮询直到完成。",
+                "把平台侧已保存的地图版本加载到当前地图工作区并启动 go2.sh --localization。异步任务：立即返回 task_id；请等待约 45s 后再 get_task_status，之后每 12s 轮询直至 succeeded，勿秒级高频连刷。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -2155,7 +2193,7 @@ class GatewayRuntime:
             _descriptor(
                 "explore_area",
                 "探索区域",
-                "自主前沿探索：启动 go2.sh --explore 并由 frontier_explorer 自动导航建图。"
+                "自主前沿探索：启动 GO2_RTABNAV2/go2.sh --explore，由 explore_lite 自动导航建图。"
                 "非遥控建图；用户手动遥控建图必须用 start_mapping，不要用 explore_area。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
@@ -2428,7 +2466,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="get_task_status",
                 display_name="获取任务状态",
-                description="按任务 ID 读取后台任务状态和结果摘要。",
+                description="按 task_id 查询异步任务；running 时看 polling_advisory.retry_after_sec，按 next_step_hint 等待后再 poll。",
                 category=SkillCategory.SYSTEM,
                 capability_name="get_task_status",
             ),
@@ -2624,7 +2662,10 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="save_active_map_version",
                 display_name="保存当前地图版本",
-                description="把当前激活地图工作区中的地图快照保存为平台版本。",
+                description=(
+                    "把当前激活地图工作区中的地图快照保存为平台版本。"
+                    "响应为精简摘要（无栅格 data 数组）；完整数据落盘于 version.json。"
+                ),
                 category=SkillCategory.MEMORY,
                 capability_name="save_active_map_version",
             ),
@@ -2645,7 +2686,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="load_map_version",
                 display_name="加载地图版本",
-                description="加载平台侧已保存的地图版本到当前工作区，并启动 go2.sh --localization <db> 进入旧地图定位/导航模式。",
+                description="加载已保存地图版本并启动 go2.sh --localization。异步：返回 task_id 后等待约 45s 再 get_task_status，每 12s 轮询，勿高频连刷。",
                 category=SkillCategory.MEMORY,
                 capability_name="load_map_version",
             ),
@@ -2757,7 +2798,10 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="explore_area",
                 display_name="探索区域",
-                description="自主前沿探索（go2.sh --explore）。遥控建图请用 start_mapping，不要用 explore_area。",
+                description=(
+                    "自主前沿探索（go2.sh --explore）。遥控建图请用 start_mapping，不要用 explore_area。"
+                    "运行中用 get_task_status 看 frontier_count，勿 relocalize_active_map 或查 TF。"
+                ),
                 category=SkillCategory.TASK,
                 capability_name="explore_area",
             ),
@@ -3021,6 +3065,8 @@ class GatewayRuntime:
                 "list_maps",
                 "get_active_map",
                 "delete_map",
+                "list_map_versions",
+                "save_active_map_version",
                 "start_mapping",
                 "stop_mapping",
             }:
@@ -3929,7 +3975,247 @@ class GatewayRuntime:
             "error": self.task_manager.get_task_error(task_id),
             "error_payload": self.task_manager.get_task_error_payload(task_id),
         }
-        return self._slim_task_snapshot(snapshot)
+        snapshot = self._slim_task_snapshot(snapshot)
+        return self._attach_async_task_polling_advisory(task_id, snapshot)
+
+    @staticmethod
+    def _async_task_polling_guidance(capability_name: str) -> Optional[Dict[str, object]]:
+        guidance = _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE.get(str(capability_name or "").strip())
+        return dict(guidance) if isinstance(guidance, dict) else None
+
+    def _attach_async_task_polling_advisory(self, task_id: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            spec = self.task_manager.get_task_spec(task_id)
+        except KeyError:
+            return snapshot
+        guidance = self._async_task_polling_guidance(spec.capability_name)
+        if guidance is None:
+            return snapshot
+
+        status_obj = snapshot.get("status")
+        if hasattr(status_obj, "model_dump"):
+            status_data = status_obj.model_dump(mode="json")
+        elif isinstance(status_obj, dict):
+            status_data = dict(status_obj)
+        else:
+            status_data = {}
+        state = str(status_data.get("state") or "").lower()
+        terminal_states = {"succeeded", "failed", "cancelled", "timeout"}
+        if state in terminal_states:
+            if state == "succeeded" and isinstance(snapshot.get("result"), dict):
+                result = dict(snapshot["result"])
+                if not result.get("next_step_hint"):
+                    if spec.capability_name == "load_map_version":
+                        result["next_step_hint"] = (
+                            "地图版本已加载。Debug 应立即可见 checkpoint 地图；"
+                            "live /map_obstacles 可能仍需数十秒。可直接 navigate_to_pose。"
+                        )
+                    snapshot["result"] = result
+            return snapshot
+
+        started_at = status_data.get("started_at")
+        elapsed_sec = 0.0
+        if started_at:
+            try:
+                if isinstance(started_at, datetime):
+                    started_dt = started_at
+                else:
+                    started_dt = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+                elapsed_sec = max(0.0, (datetime.now(timezone.utc) - started_dt.astimezone(timezone.utc)).total_seconds())
+            except (TypeError, ValueError):
+                elapsed_sec = 0.0
+
+        initial_wait_sec = float(guidance.get("initial_wait_sec") or 0.0)
+        poll_interval_sec = float(guidance.get("poll_interval_sec") or 10.0)
+        now_mono = time.monotonic()
+        previous_poll_at = self._task_status_last_polled_at.get(task_id)
+        polled_too_soon = (
+            previous_poll_at is not None
+            and (now_mono - previous_poll_at) < min(poll_interval_sec, 5.0)
+        )
+        self._task_status_last_polled_at[task_id] = now_mono
+
+        if elapsed_sec < initial_wait_sec:
+            retry_after_sec = max(1.0, initial_wait_sec - elapsed_sec)
+            next_step_hint = (
+                "任务执行中（已 %.0fs）。请等待约 %.0fs 后再调用 get_task_status，勿连续高频轮询。"
+                % (elapsed_sec, retry_after_sec)
+            )
+        elif polled_too_soon and previous_poll_at is not None:
+            retry_after_sec = max(1.0, poll_interval_sec - (now_mono - previous_poll_at))
+            next_step_hint = (
+                "距上次查询过近。请约 %.0fs 后再 poll；每 %.0fs 轮询一次直至 state=succeeded。"
+                % (retry_after_sec, poll_interval_sec)
+            )
+        else:
+            retry_after_sec = poll_interval_sec
+            next_step_hint = (
+                "任务执行中（已 %.0fs）。若仍未完成，%.0fs 后再 get_task_status。"
+                % (elapsed_sec, poll_interval_sec)
+            )
+
+        advisory = {
+            "polling_guidance": guidance,
+            "retry_after_sec": round(retry_after_sec, 1),
+            "elapsed_sec": round(elapsed_sec, 1),
+            "next_step_hint": next_step_hint,
+        }
+        if polled_too_soon:
+            advisory["polled_too_soon"] = True
+        snapshot["polling_advisory"] = advisory
+        snapshot["next_step_hint"] = next_step_hint
+        events = snapshot.get("events")
+        if isinstance(events, list) and len(events) > 3:
+            snapshot["events_truncated"] = True
+            snapshot["events"] = events[-2:]
+        return snapshot
+
+    @staticmethod
+    def _slim_grid_layer(layer: Any) -> Dict[str, Any]:
+        if layer is None:
+            return {}
+        if hasattr(layer, "model_dump"):
+            data = layer.model_dump(mode="json")
+        elif isinstance(layer, dict):
+            data = dict(layer)
+        else:
+            return {}
+        raw_data = data.get("data")
+        cell_count = len(raw_data) if isinstance(raw_data, (list, tuple)) else None
+        slim = {
+            key: data[key]
+            for key in (
+                "timestamp",
+                "map_id",
+                "frame_id",
+                "width",
+                "height",
+                "resolution_m",
+                "origin",
+            )
+            if key in data
+        }
+        if cell_count is not None:
+            slim["data_cell_count"] = cell_count
+            slim["data_omitted"] = True
+        return slim
+
+    @staticmethod
+    def _slim_map_snapshot(snapshot: Any) -> Dict[str, Any]:
+        if snapshot is None:
+            return {}
+        if hasattr(snapshot, "model_dump"):
+            data = snapshot.model_dump(mode="json")
+        elif isinstance(snapshot, dict):
+            data = dict(snapshot)
+        else:
+            return {}
+        slim: Dict[str, Any] = {
+            key: data[key]
+            for key in ("timestamp", "source_name", "version_id", "revision", "frame_id")
+            if key in data
+        }
+        if data.get("occupancy_grid") is not None:
+            slim["occupancy_grid"] = GatewayRuntime._slim_grid_layer(data.get("occupancy_grid"))
+        if data.get("cost_map") is not None:
+            slim["cost_map"] = GatewayRuntime._slim_grid_layer(data.get("cost_map"))
+        if data.get("semantic_map") is not None:
+            slim["semantic_map"] = GatewayRuntime._slim_grid_layer(data.get("semantic_map"))
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            slim["metadata"] = {
+                key: metadata[key]
+                for key in (
+                    "map_snapshot_kind",
+                    "live_streaming_ready",
+                    "checkpoint_ready",
+                    "rtabmap_database_path",
+                    "rtabmap_db_path",
+                    "update_sequence",
+                    "content_revision",
+                )
+                if key in metadata
+            }
+        return slim
+
+    @staticmethod
+    def _slim_geometry_asset_binding(asset: Any) -> Dict[str, Any]:
+        if asset is None:
+            return {}
+        if hasattr(asset, "model_dump"):
+            data = asset.model_dump(mode="json")
+        elif isinstance(asset, dict):
+            data = dict(asset)
+        else:
+            return {}
+        quality = data.get("quality_metrics") if isinstance(data.get("quality_metrics"), dict) else {}
+        assets = data.get("assets")
+        asset_types: List[Any] = []
+        if isinstance(assets, (list, tuple)):
+            for item in assets:
+                if isinstance(item, dict):
+                    asset_types.append(item.get("asset_type"))
+                elif hasattr(item, "asset_type"):
+                    asset_types.append(getattr(item, "asset_type", None))
+        return {
+            "geometry_stack": data.get("geometry_stack"),
+            "frame_id": data.get("frame_id"),
+            "rtabmap_database_path": data.get("rtabmap_database_path") or data.get("rtabmap_db_path"),
+            "pcd_path": data.get("pcd_path"),
+            "built_at": data.get("built_at"),
+            "occupancy_projection": data.get("occupancy_projection"),
+            "costmap_source": data.get("costmap_source"),
+            "quality_metrics": {
+                key: quality[key]
+                for key in ("database", "nav2_map", "pcd", "diagnostics")
+                if key in quality
+            },
+            "asset_types": asset_types,
+        }
+
+    @staticmethod
+    def _slim_map_version(version: Any) -> Dict[str, Any]:
+        if version is None:
+            return {}
+        if hasattr(version, "model_dump"):
+            data = version.model_dump(mode="json")
+        elif isinstance(version, dict):
+            data = dict(version)
+        else:
+            return {"version_id": str(version)}
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        slim: Dict[str, Any] = {
+            key: data[key]
+            for key in (
+                "timestamp",
+                "map_name",
+                "version_id",
+                "revision",
+                "source_name",
+                "source_version_id",
+                "frame_id",
+            )
+            if key in data
+        }
+        slim["snapshot"] = GatewayRuntime._slim_map_snapshot(data.get("snapshot"))
+        slim["geometry_asset"] = GatewayRuntime._slim_geometry_asset_binding(data.get("geometry_asset"))
+        slim["metadata"] = {
+            key: metadata[key]
+            for key in (
+                "reason",
+                "snapshot_kind",
+                "live_streaming_ready",
+                "checkpoint_ready",
+                "rtabmap_database_path",
+                "rtabmap_db_path",
+                "backend_session_id",
+                "backend_run_id",
+                "exploration_pinned_version_id",
+                "requested_by",
+            )
+            if key in metadata
+        }
+        return slim
 
     @staticmethod
     def _slim_map_asset(asset: Any) -> Dict[str, Any]:
@@ -4058,6 +4344,12 @@ class GatewayRuntime:
         launch_plan = {key: metadata[key] for key in launch_keys if key in metadata}
         if launch_plan:
             slim["exploration_launch"] = launch_plan
+        polling_guidance = metadata.get("polling_guidance")
+        if isinstance(polling_guidance, dict):
+            slim["polling_guidance"] = dict(polling_guidance)
+            hint = polling_guidance.get("hint")
+            if hint:
+                slim["next_step_hint"] = str(hint)
         return slim
 
     def _slim_async_capability_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
@@ -4067,6 +4359,12 @@ class GatewayRuntime:
             return response
         slim = dict(response)
         slim["task"] = self._slim_task_acceptance(task, status)
+        capability_name = str(slim.get("capability_name") or slim.get("task", {}).get("capability_name") or "")
+        if not slim.get("next_step_hint"):
+            guidance = self._async_task_polling_guidance(capability_name)
+            if guidance is not None:
+                slim["polling_guidance"] = guidance
+                slim["next_step_hint"] = str(guidance.get("hint") or "")
         return slim
 
     def _slim_sync_map_capability_result(self, capability_name: str, result: Any) -> Dict[str, Any]:
@@ -4100,6 +4398,14 @@ class GatewayRuntime:
             slim["maps_count"] = len(maps) if isinstance(maps, (list, tuple)) else 0
             if capability_name == "list_maps":
                 slim["maps"] = self._slim_map_catalog(maps)
+        if "map_version" in slim:
+            slim["map_version"] = self._slim_map_version(slim.get("map_version"))
+        if "map_versions" in slim:
+            versions = slim.get("map_versions")
+            if isinstance(versions, (list, tuple)):
+                slim["map_versions"] = [self._slim_map_version(item) for item in versions]
+        if capability_name == "save_active_map_version" and not slim.get("next_step_hint"):
+            slim["next_step_hint"] = "地图版本已保存。请调用 stop_mapping 停止几何建图栈。"
         return slim
 
     @staticmethod
@@ -4136,6 +4442,18 @@ class GatewayRuntime:
         exploration_context = slim.get("exploration_context")
         if exploration_context is not None:
             slim["exploration_context"] = GatewayRuntime._slim_exploration_context(exploration_context)
+        if "map_version" in slim:
+            slim["map_version"] = GatewayRuntime._slim_map_version(slim.get("map_version"))
+        if "saved_map_version" in slim:
+            slim["saved_map_version"] = GatewayRuntime._slim_map_version(slim.get("saved_map_version"))
+        if "map_versions" in slim:
+            versions = slim.get("map_versions")
+            if isinstance(versions, (list, tuple)):
+                slim["map_versions"] = [GatewayRuntime._slim_map_version(item) for item in versions]
+        if "active_workspace" in slim:
+            slim["active_workspace"] = GatewayRuntime._slim_workspace(slim.get("active_workspace"))
+        if slim.get("next_step_hint"):
+            slim["next_step_hint"] = str(slim.get("next_step_hint"))
         return slim
 
     @staticmethod
@@ -4370,6 +4688,10 @@ class GatewayRuntime:
                 error_code="nav2_provider_unavailable",
                 http_status=503,
             )
+        try:
+            self.platform_geometry_runtime._cancel_platform_exploration_navigation()
+        except Exception:
+            RUNTIME_LOGGER.debug("debug_nav2_goal 取消平台探索在途目标失败。", exc_info=True)
         accept_timeout_sec = self._float(arguments, "accept_timeout_sec", 8.0)
         result = provider.send_goal_direct(goal, accept_timeout_sec=accept_timeout_sec)
         result = dict(result)
@@ -4483,14 +4805,21 @@ class GatewayRuntime:
         """Debug 面板 RViz 2D Pose Estimate：发布 /initialpose，触发重定位。"""
 
         pose = self._build_pose_from_arguments(arguments)
-        provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
-        if provider is None:
+        geometry_runtime = self.platform_geometry_runtime
+        if geometry_runtime is None:
             raise GatewayError(
-                "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
-                error_code="nav2_provider_unavailable",
+                "平台几何 runtime 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
+                error_code="geometry_runtime_unavailable",
                 http_status=503,
             )
-        result = dict(provider.publish_initial_pose(pose))
+        publish_fn = getattr(geometry_runtime, "publish_debug_initial_pose", None)
+        if not callable(publish_fn):
+            raise GatewayError(
+                "平台几何 runtime 不支持 2D Pose 发布。",
+                error_code="initial_pose_publish_unsupported",
+                http_status=503,
+            )
+        result = dict(publish_fn(pose))
         result["target_pose"] = pose.model_dump(mode="json")
         result["requested_by"] = requested_by or "debug_panel"
         if not bool(result.get("published")):
@@ -4502,7 +4831,7 @@ class GatewayRuntime:
             )
         robot_pose = None
         try:
-            robot_pose = provider._read_current_pose()
+            robot_pose = geometry_runtime.get_external_live_pose(max_age_sec=0.0)
         except Exception:
             robot_pose = None
         if robot_pose is not None and getattr(robot_pose, "position", None) is not None:
@@ -7237,6 +7566,14 @@ class GatewayRuntime:
             context.update(progress=1.0, stage="completed", message=f"{capability_name} 已完成。")
             return result
 
+        task_metadata = self._build_task_request_metadata(
+            capability_name=capability_name,
+            requested_by=requested_by,
+            request_context=request_context,
+        )
+        polling_guidance = self._async_task_polling_guidance(capability_name)
+        if polling_guidance is not None:
+            task_metadata["polling_guidance"] = polling_guidance
         return self.task_manager.submit(
             capability_name,
             runner,
@@ -7244,11 +7581,7 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
-            metadata=self._build_task_request_metadata(
-                capability_name=capability_name,
-                requested_by=requested_by,
-                request_context=request_context,
-            ),
+            metadata=task_metadata,
         )
 
     def _handle_activate_map_async(
@@ -8259,7 +8592,10 @@ class GatewayRuntime:
             observer_status = str(observer_payload.get("status_text") or "").upper()
             if bool(observer_payload.get("exploration_terminal")) or "DONE" in observer_status or "EXPLORATION FINISHED" in observer_status:
                 return 1.0
-        if metadata.get("exploration_mode") == "go2_rtabmap_script":
+        frontier_count = context.exploration_state.frontier_count
+        if frontier_count is not None and frontier_count > 0:
+            return max(0.35, min(0.85, 1.0 / float(frontier_count + 1)))
+        if metadata.get("exploration_mode") in {"go2_rtabnav2_script", "go2_rtabmap_script"}:
             if "NAVIGATING" in status_text:
                 open_paren = status_text.find("(")
                 close_paren = status_text.find(")", open_paren + 1) if open_paren >= 0 else -1
@@ -8292,7 +8628,6 @@ class GatewayRuntime:
         covered_ratio = context.exploration_state.covered_ratio
         if covered_ratio is not None:
             return max(0.05, min(0.95, covered_ratio))
-        frontier_count = context.exploration_state.frontier_count
         if frontier_count is None:
             return 0.2
         if frontier_count <= 0 and self._exploration_metadata_indicates_done(metadata):

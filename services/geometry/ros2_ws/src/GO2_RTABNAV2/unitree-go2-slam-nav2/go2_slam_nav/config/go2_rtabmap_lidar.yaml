@@ -1,0 +1,50 @@
+# RTAB-Map parameters tuned for Unitree GO2 built-in L1 LiDAR (/utlidar/cloud).
+# 18 scan lines, ~180 deg FOV, ~4k points/scan, frame_id: utlidar_lidar
+
+/**:
+  ros__parameters:
+    # Shared
+    frame_id: go2_base_link
+    odom_frame_id: go2_odom
+    map_frame_id: map
+    use_sim_time: false
+
+    # LiDAR-only subscriptions
+    subscribe_depth: false
+    subscribe_rgb: false
+    subscribe_scan_cloud: true
+    approx_sync: true
+    wait_for_transform: 0.5
+
+    # RTAB-Map string parameters (also passed as node arguments in launch)
+    Reg/Strategy: '1'
+    Reg/Force3DoF: 'true'
+    Icp/PointToPlaneGroundNormalsUp: '0.9'
+    Icp/VoxelSize: '0.05'
+    Icp/RangeMin: '0.3'
+    Icp/MaxCorrespondenceDistance: '0.5'
+    Icp/PointToPlane: 'true'
+    Icp/PointToPlaneK: '20'
+    Icp/Iterations: '10'
+    Icp/MaxTranslation: '2'
+    Icp/OutlierRatio: '0.7'
+    Icp/CorrespondenceRatio: '0.2'
+    Vis/MaxFeatures: '0'
+    Kp/MaxFeatures: '0'
+    Kp/DetectorStrategy: '0'
+    # Proximity tuned per-mode in rtab_lidar_go2.launch.py (mapping + localization)
+    RGBD/ProximityBySpace: 'true'
+    RGBD/ProximityMaxGraphDepth: '0'
+    RGBD/ProximityPathMaxNeighbors: '10'
+    RGBD/AngularUpdate: '0.02'
+    RGBD/LinearUpdate: '0.02'
+    RGBD/CreateOccupancyGrid: 'true'
+    Grid/Sensor: '0'
+    Grid/RangeMin: '0.3'
+    Grid/RangeMax: '20.0'
+    Grid/MaxGroundHeight: '0.04'
+    Grid/MaxObstacleHeight: '1.5'
+    Grid/RayTracing: 'true'
+    Mem/NotLinkedNodesKept: 'false'
+    Mem/STMSize: '30'
+    Mem/LaserScanNormalK: '20'

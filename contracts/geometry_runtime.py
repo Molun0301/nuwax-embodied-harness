@@ -28,13 +28,16 @@ def build_default_rtabmap_pcd_root() -> str:
 
 
 def build_default_external_slam_nav2_script() -> str:
-    """返回仓库内默认外部 SLAM/Nav2 启动脚本路径。"""
+    """返回仓库内默认外部 SLAM/Nav2 启动脚本路径（GO2_RTABNAV2 顶层 go2.sh）。"""
 
     return str(
         Path(__file__).resolve().parents[1]
         / "services"
         / "geometry"
-        / "start_rtabmap_sidecar.sh"
+        / "ros2_ws"
+        / "src"
+        / "GO2_RTABNAV2"
+        / "go2.sh"
     )
 
 
@@ -48,7 +51,7 @@ class GeometryTopicsConfig:
     point_cloud_topic: str = "/utlidar/cloud_deskewed"
     tf_topic: str = "/tf"
     tf_static_topic: str = "/tf_static"
-    occupancy_topic: str = "/map"
+    occupancy_topic: str = "/map_obstacles"
     cloud_map_topic: str = "/cloud_map"
     cost_map_topic: str = "/global_costmap/costmap"
 
@@ -189,6 +192,7 @@ class ExternalGeometryStackConfig:
     point_cloud_bridge_enabled: bool = False
     platform_odom_tf_bridge_enabled: bool = False
     platform_cmd_vel_bridge_enabled: bool = False
+    frontier_topic: str = "explore/frontiers"
 
 
 @dataclass

@@ -1,0 +1,24 @@
+# Project RTAB-Map /map + /cloud_obstacles (+ live /go2/cloud) -> /map_obstacles
+
+obstacle_grid_projector:
+  ros__parameters:
+    map_topic: /map
+    cloud_obstacles_topic: /cloud_obstacles
+    live_cloud_topic: /go2/cloud
+    live_cloud_enabled: true
+    map_frame: map
+    robot_base_frame: go2_base_link
+    output_topic: /map_obstacles
+    output_updates_topic: /map_obstacles_updates
+    min_obstacle_height: 0.04
+    max_obstacle_height: 1.5
+    obstacle_value: 100
+    # 栅格分辨率 0.05m，1 格 = 5cm 障碍膨胀
+    inflate_cells: 1
+    publish_rate: 10.0
+    publish_on_cloud: true
+    min_publish_interval: 0.1
+    live_cloud_max_range: 6.0
+    max_cloud_points: 25000
+    max_live_cloud_points: 12000
+    transform_tolerance: 0.5

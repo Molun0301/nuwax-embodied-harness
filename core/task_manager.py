@@ -243,6 +243,12 @@ class TaskManager:
         with self._lock:
             return self._records[task_id].status
 
+    def get_task_spec(self, task_id: str) -> TaskSpec:
+        """获取任务定义（含 metadata / polling 指引）。"""
+
+        with self._lock:
+            return self._records[task_id].spec
+
     def get_task_events(self, task_id: str) -> Tuple[TaskEvent, ...]:
         """获取任务事件。"""
 

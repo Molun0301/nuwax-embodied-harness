@@ -659,7 +659,13 @@ class MapWorkspaceService:
         )
         latest_localization_snapshot = self._localization_service.get_latest_snapshot() if asset.active else None
         runtime_readiness = self._active_runtime_readiness() if asset.active else {}
-        live_map_loaded = bool(latest_map_snapshot is not None and runtime_readiness.get("map_loaded", True))
+        live_map_loaded = bool(
+            latest_map_snapshot is not None
+            and (
+                runtime_readiness.get("map_loaded", True)
+                or self._checkpoint_map_displayable(latest_map_snapshot)
+            )
+        )
         live_localization_ready = bool(
             active_localization_session is not None
             and active_localization_session.status == LocalizationSessionStatus.READY
@@ -708,7 +714,13 @@ class MapWorkspaceService:
         # 状态推断无需 memory_active 信息，置为 None 即可。活跃资产仍按原路径算一次完整 summary。
         memory_summary = self._memory_service.get_summary() if is_active else None
         runtime_readiness = self._active_runtime_readiness() if is_active else {}
-        live_map_loaded = bool(latest_map_snapshot is not None and runtime_readiness.get("map_loaded", True))
+        live_map_loaded = bool(
+            latest_map_snapshot is not None
+            and (
+                runtime_readiness.get("map_loaded", True)
+                or self._checkpoint_map_displayable(latest_map_snapshot)
+            )
+        )
         frame_id = asset.frame_id
         if live_map_loaded and latest_map_snapshot is not None:
             frame_id = self._resolve_map_frame_id(latest_map_snapshot)
@@ -794,7 +806,13 @@ class MapWorkspaceService:
             "geometry_stack_running": geometry_stack_running,
             "geometry_stack_launch_mode": geometry_stack_status.get("launch_mode"),
             "geometry_stack_agent_guidance": geometry_stack_status.get("agent_guidance"),
-            "map_loaded": bool(runtime_enabled and readiness.get("map_ready")),
+            "map_loaded": bool(
+                runtime_enabled
+                and (
+                    readiness.get("map_ready")
+                    or self._checkpoint_map_displayable(self._mapping_service.get_latest_snapshot())
+                )
+            ),
             "localization_ready": bool(runtime_enabled and readiness.get("localization_ready")),
             "waiting_for": diagnostics.get("waiting_for") or readiness.get("waiting_for"),
             "message": geometry_stack_status.get("agent_guidance")
@@ -861,6 +879,72 @@ class MapWorkspaceService:
             "pcd": latest_map_snapshot.metadata.get("pcd"),
         }
 
+    def _ingest_localization_checkpoint_snapshot(
+        self,
+        *,
+        prepared_version: MapVersion,
+        runtime_snapshot,
+        runtime_metadata: Dict[str, object],
+    ) -> None:
+        """定位模式加载版本后先展示离线 checkpoint，待 /map_obstacles 首帧再切 live。"""
+
+        occupancy_grid = (
+            prepared_version.snapshot.occupancy_grid
+            if prepared_version.snapshot is not None
+            else None
+        )
+        cost_map = prepared_version.snapshot.cost_map if prepared_version.snapshot is not None else None
+        semantic_map = prepared_version.snapshot.semantic_map if prepared_version.snapshot is not None else None
+        if occupancy_grid is None and runtime_snapshot is not None:
+            occupancy_grid = runtime_snapshot.occupancy_grid
+            cost_map = runtime_snapshot.cost_map
+            semantic_map = runtime_snapshot.semantic_map
+        checkpoint_metadata = {
+            **dict(prepared_version.snapshot.metadata if prepared_version.snapshot is not None else {}),
+            **dict(runtime_metadata or {}),
+            "map_snapshot_kind": "offline_checkpoint",
+            "source_kind": "platform_map_version",
+            "platform_map_version_id": prepared_version.version_id,
+            "platform_map_version_revision": prepared_version.revision,
+            "active_map_name": prepared_version.map_name,
+            "map_name": prepared_version.map_name,
+            "checkpoint_ready": True,
+            "geometry_ready": True,
+            "loaded_as_seed": True,
+            "continues_live_updates": True,
+            "waiting_for_live_stream": True,
+            "live_streaming_ready": False,
+            "rtabmap_live_streaming_ready": False,
+            "backend_mode": "rtabmap_localization",
+        }
+        self._mapping_service.ingest_external_snapshot(
+            source_name=(
+                prepared_version.snapshot.source_name
+                if prepared_version.snapshot is not None
+                else getattr(runtime_snapshot, "source_name", "platform_geometry_runtime")
+            ),
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+            semantic_map=semantic_map,
+            metadata=checkpoint_metadata,
+            version_id_override=prepared_version.version_id,
+            revision_override=prepared_version.revision,
+        )
+
+    def _checkpoint_map_displayable(self, latest_map_snapshot) -> bool:
+        if latest_map_snapshot is None:
+            return False
+        metadata = dict(getattr(latest_map_snapshot, "metadata", {}) or {})
+        snapshot_kind = str(metadata.get("map_snapshot_kind") or "").lower()
+        source_kind = str(metadata.get("source_kind") or "").lower()
+        if snapshot_kind == "offline_checkpoint" or source_kind == "platform_map_version":
+            return True
+        return bool(
+            metadata.get("checkpoint_ready")
+            or metadata.get("platform_map_version_id")
+            or metadata.get("seed_map_version_id")
+        )
+
     def _load_map_version_into_runtime(
         self,
         version: MapVersion,
@@ -890,10 +974,11 @@ class MapWorkspaceService:
         ):
             nav2_map = activation_result.get("nav2_map") if isinstance(activation_result.get("nav2_map"), dict) else {}
             if not bool(nav2_map.get("used_for_static_map")):
-                # db-only 定位模式由 RTAB-Map 从 .db 发布 /map；不要再 ingest 版本快照，避免 debug 双源闪烁。
-                self._mapping_service.clear_latest_snapshot(
-                    cleared_map_name=prepared_version.map_name,
-                    reason="rtabmap_localization_backend_active",
+                # 定位模式 live /map_obstacles 可能数十秒后才首帧；先 ingest 版本 checkpoint 供 Debug/MCP 立即可见。
+                self._ingest_localization_checkpoint_snapshot(
+                    prepared_version=prepared_version,
+                    runtime_snapshot=runtime_snapshot,
+                    runtime_metadata=runtime_metadata,
                 )
                 self._localization_service.clear_latest_snapshot()
                 return

@@ -152,7 +152,7 @@ class Nav2ActionNavigationProvider:
         target_pose_metadata = goal.target_pose.model_dump(mode="json") if goal.target_pose is not None else None
         force_nav2_goal = bool((goal.metadata or {}).get("force_nav2_goal"))
         if force_nav2_goal:
-            self._cancel_inflight_goal_for_resend()
+            self._cancel_active_nav2_goals_before_send()
         readiness = self._readiness_force() if force_nav2_goal else self._readiness()
         if not readiness.ready:
             LOGGER.info(
@@ -217,7 +217,7 @@ class Nav2ActionNavigationProvider:
                 lambda completed: self._on_goal_response(completed, goal.goal_id, goal_sequence)
             )
             if force_nav2_goal:
-                self._publish_goal_pose_topic(goal.target_pose)
+                self._wait_action_dispatch(send_future, timeout_sec=1.5)
         except Exception as exc:
             LOGGER.info("Nav2 action 发送目标异常 goal_id=%s target=%s error=%s", goal.goal_id, target_pose_metadata, exc)
             metadata = {"backend": "nav2", "failure_reason": "action_send_failed", "error": str(exc), "target_pose": target_pose_metadata}
@@ -336,14 +336,42 @@ class Nav2ActionNavigationProvider:
         }
 
     def _cancel_inflight_goal_for_resend(self) -> None:
+        self._cancel_active_nav2_goals_before_send()
+
+    def _cancel_active_nav2_goals_before_send(self, *, wait_timeout_sec: float = 2.0) -> None:
+        """取消在途 Nav2 目标并等待完成，避免 Debug 新目标发出后仍短暂跟随旧目标（常见为 map 原点）。"""
+
         with self._lock:
             prev_handle = self._goal_handle
-        if prev_handle is None:
+            self._goal_sequence += 1
+            self._goal_handle = None
+            self._result_future = None
+            self._send_future = None
+        cancel_future = None
+        if prev_handle is not None:
+            try:
+                cancel_future = prev_handle.cancel_goal_async()
+            except Exception:
+                LOGGER.debug("取消在途 Nav2 目标失败。", exc_info=True)
+        if cancel_future is not None:
+            deadline = time.monotonic() + max(0.2, float(wait_timeout_sec))
+            while time.monotonic() < deadline and not cancel_future.done():
+                time.sleep(0.05)
+            if cancel_future.done():
+                try:
+                    cancel_future.result()
+                except Exception:
+                    pass
+        time.sleep(0.05)
+
+    def _wait_action_dispatch(self, send_future: Any, *, timeout_sec: float = 1.5) -> None:
+        """等待 action client 把 NavigateToPose 请求真正发到 server，缩短旧目标残留窗口。"""
+
+        if send_future is None:
             return
-        try:
-            prev_handle.cancel_goal_async()
-        except Exception:
-            pass
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        while time.monotonic() < deadline and not send_future.done():
+            time.sleep(0.05)
 
     def _ensure_goal_running(self, goal: NavigationGoal, goal_sequence: int, goal_handle: Any) -> None:
         with self._lock:
@@ -367,59 +395,16 @@ class Nav2ActionNavigationProvider:
             )
 
     def publish_initial_pose(self, target_pose: Pose) -> Dict[str, object]:
-        """RViz 2D Pose Estimate 等价：发布 PoseWithCovarianceStamped 到 /initialpose。"""
+        """RViz 2D Pose Estimate 等价：委托 geometry runtime 独立发布 /initialpose。"""
 
-        if not self._ensure_started() or self._node is None:
-            return {
-                "published": False,
-                "topic": "/initialpose",
-                "message": "Nav2 action ROS 节点未启动，无法发布 /initialpose。",
-            }
-        try:
-            from geometry_msgs.msg import PoseWithCovarianceStamped
-            from rclpy.duration import Duration
-
-            if self._initial_pose_publisher is None:
-                self._initial_pose_publisher = self._node.create_publisher(
-                    PoseWithCovarianceStamped, "/initialpose", 10
-                )
-            frame_id = str(target_pose.frame_id or "map").lstrip("/") or "map"
-            msg = PoseWithCovarianceStamped()
-            msg.header.frame_id = frame_id
-            # 与 localization service 一致：略早于 now，避免 AMCL TF 外推失败。
-            msg.header.stamp = (self._node.get_clock().now() - Duration(seconds=0.5)).to_msg()
-            msg.pose.pose.position.x = float(target_pose.position.x)
-            msg.pose.pose.position.y = float(target_pose.position.y)
-            msg.pose.pose.position.z = float(target_pose.position.z)
-            msg.pose.pose.orientation.x = float(target_pose.orientation.x)
-            msg.pose.pose.orientation.y = float(target_pose.orientation.y)
-            msg.pose.pose.orientation.z = float(target_pose.orientation.z)
-            msg.pose.pose.orientation.w = float(target_pose.orientation.w)
-            msg.pose.covariance = [0.25 if i in (0, 7, 35) else 0.0 for i in range(36)]
-            self._initial_pose_publisher.publish(msg)
-            LOGGER.info(
-                "debug 发布 /initialpose pose=(%.3f, %.3f, %.3f) frame=%s",
-                msg.pose.pose.position.x,
-                msg.pose.pose.position.y,
-                msg.pose.pose.position.z,
-                frame_id,
-            )
-            return {
-                "published": True,
-                "topic": "/initialpose",
-                "frame_id": frame_id,
-                "x": msg.pose.pose.position.x,
-                "y": msg.pose.pose.position.y,
-                "z": msg.pose.pose.position.z,
-                "message": "已发布 /initialpose（RViz 2D Pose Estimate 等价）。",
-            }
-        except Exception as exc:
-            LOGGER.info("debug 发布 /initialpose 失败：%s", exc)
-            return {
-                "published": False,
-                "topic": "/initialpose",
-                "message": "发布 /initialpose 失败：%s" % exc,
-            }
+        publish_fn = getattr(self.runtime, "publish_debug_initial_pose", None)
+        if callable(publish_fn):
+            return publish_fn(target_pose)
+        return {
+            "published": False,
+            "topic": "/initialpose",
+            "message": "geometry runtime 不支持 /initialpose 发布。",
+        }
 
     def publish_clicked_point(self, target_pose: Pose) -> Dict[str, object]:
         """RViz Publish Point 等价：发布 geometry_msgs/PointStamped 到 /clicked_point。"""
@@ -777,6 +762,14 @@ class Nav2ActionNavigationProvider:
         return True, None
 
     def _read_current_pose(self) -> Optional[Pose]:
+        live_pose_getter = getattr(self.runtime, "get_external_live_pose", None)
+        if callable(live_pose_getter):
+            try:
+                cached_pose = live_pose_getter()
+            except Exception:
+                cached_pose = None
+            if cached_pose is not None:
+                return cached_pose.model_copy(deep=True)
         backend = self.runtime._resolve_localization_backend()
         if backend is None:
             return None
@@ -787,11 +780,13 @@ class Nav2ActionNavigationProvider:
         return None if pose is None else pose.model_copy(deep=True)
 
     def _build_nav2_goal(self, target_pose: Pose) -> Any:
+        from builtin_interfaces.msg import Time
         from nav2_msgs.action import NavigateToPose
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = str(target_pose.frame_id or self.runtime.config.frames.map_frame)
-        goal_msg.pose.header.stamp = self._node.get_clock().now().to_msg()
+        # stamp=0：Nav2 使用最新 TF，避免时间戳超前导致目标被错误变换到 map 原点。
+        goal_msg.pose.header.stamp = Time(sec=0, nanosec=0)
         goal_msg.pose.pose.position.x = float(target_pose.position.x)
         goal_msg.pose.pose.position.y = float(target_pose.position.y)
         goal_msg.pose.pose.position.z = float(target_pose.position.z)

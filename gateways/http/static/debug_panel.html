@@ -270,6 +270,7 @@ button{font-family:inherit;cursor:pointer}
   border-radius:var(--pill);padding:2px 7px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .service-health-card.degraded .service-health-chip,.service-health-card.stale .service-health-chip{color:var(--warn);background:var(--warn-w)}
 .service-health-card.error .service-health-chip{color:var(--bad);background:var(--bad-w)}
+.service-health-chip.service-health-reason{color:var(--warn);background:var(--warn-w);border-color:var(--warn)}
 
 /* logs -> mockup .log look */
 .log-line{font-family:var(--mono);font-size:10.5px;line-height:1.5;padding:6px 10px;
@@ -662,6 +663,8 @@ button{font-family:inherit;cursor:pointer}
         latestTasks: { active_tasks: [], history_tasks: [] },
         taskActiveById: new Map(),
         taskHistoryById: new Map(),
+        bootstrapComplete: { health: false, tasks: false, governance: false },
+        bootstrapQueue: { health: [], tasks: [], governance: [] },
         lastRobotStateRevision: null,
         lastRobotStateHash: null,
         logFilter: "",
@@ -1134,17 +1137,27 @@ button{font-family:inherit;cursor:pointer}
           authoritative: raw.authoritative !== false,
         };
       }
-      function mergeServiceHealth(raw, sourceLabel) {
+      function mergeServiceHealth(raw, sourceLabel, mode = "replace") {
+        // 任务 4.1：mode 参数；默认 "replace"（向后兼容任务 4.8）
+        if (mode === "replace") return mergeServiceHealthReplace(raw, sourceLabel);
+        if (mode === "patch") return mergeServiceHealthPatch(raw, sourceLabel);
+        return false;
+      }
+      function mergeServiceHealthReplace(raw, sourceLabel) {
         const normalized = normalizeServiceHealthSummary(raw, sourceLabel);
         if (!normalized) return false;
         state.latestServiceHealth = normalized;
-        patchServiceHealthProcessEvidence(state.latestSystemMetrics || {});
+        // replace 模式同时刷一次进程证据（后端 snapshot 已包含 process_evidence，但前端 frame 未带）
+        patchServiceHealthProcessEvidence();
         renderServiceStatus();
         return true;
       }
-      function patchServiceHealthProcessEvidence(snap) {
+      function mergeServiceHealthPatch(raw, sourceLabel) {
+        // 任务 4.3：patch 模式 —— 仅更新 process_evidence/process_sampled_at/process_source
+        // 禁止覆盖 status/summary/evidence/reason/advice 主字段
         if (!state.latestServiceHealth || !Array.isArray(state.latestServiceHealth.entries)) return false;
-        const processes = Array.isArray(snap && snap.processes) ? snap.processes : [];
+        const snap = state.latestSystemMetrics || {};
+        const processes = Array.isArray(snap.processes) ? snap.processes : [];
         if (!processes.length) return false;
         const byRole = new Map();
         for (const proc of processes) {
@@ -1154,6 +1167,7 @@ button{font-family:inherit;cursor:pointer}
           byRole.get(role).push(proc);
         }
         let changed = false;
+        const frameSampledAt = snap.sampled_at;
         const entries = state.latestServiceHealth.entries.map((entry) => {
           const roles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
           if (!roles.length) return entry;
@@ -1166,22 +1180,34 @@ button{font-family:inherit;cursor:pointer}
                 pid: proc.pid,
                 cpu_percent: proc.cpu_percent,
                 rss_bytes: proc.rss_bytes,
-                sampled_at: snap.sampled_at,
+                sampled_at: frameSampledAt,
                 source: "system.metrics",
               });
             }
           }
           if (!processEvidence.length) return entry;
           changed = true;
-          return {
+          const updated = {
             ...entry,
             process_evidence: processEvidence,
-            process_sampled_at: snap.sampled_at,
+            process_sampled_at: frameSampledAt,
             process_source: "system.metrics",
           };
+          // 任务 4.6a：patch 必须使用 frame 自身 sampled_at（dev 模式断言；生产可注释）
+          if (typeof console !== "undefined" && console.assert) {
+            console.assert(updated.process_sampled_at === frameSampledAt, "process_sampled_at drift between frame and patched entry");
+          }
+          return updated;
         });
-        if (changed) state.latestServiceHealth = { ...state.latestServiceHealth, entries };
+        if (changed) {
+          state.latestServiceHealth = { ...state.latestServiceHealth, entries };
+          renderServiceStatus();
+        }
         return changed;
+      }
+      function patchServiceHealthProcessEvidence() {
+        // 兼容旧调用方（replace 模式内部仍用）；统一走 patch 实现，数据源固定为 state.latestSystemMetrics
+        return mergeServiceHealthPatch();
       }
       function serviceHealthAttentionCount(summary) {
         const fromBackend = summary && summary.metadata && Number(summary.metadata.attention_count);
@@ -1192,10 +1218,11 @@ button{font-family:inherit;cursor:pointer}
       function serviceProcessText(entry) {
         const evidence = Array.isArray(entry.process_evidence) ? entry.process_evidence : [];
         if (evidence.length) {
+          // 任务 6.1.3：命中时显示 ✓ PID xxx 已匹配
           return evidence.slice(0, 2).map((proc) => {
             const name = proc.display_name || proc.role || "进程";
             const pid = proc.pid === undefined || proc.pid === null ? "--" : proc.pid;
-            return `${name} PID ${pid}`;
+            return `✓ PID ${pid} ${name}`;
           }).join(" / ");
         }
         const roles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
@@ -1238,11 +1265,34 @@ button{font-family:inherit;cursor:pointer}
         if (updated) foot.appendChild(serviceHealthChip("更新", shortTime(updated), String(updated)));
         const processText = serviceProcessText(entry);
         if (processText) foot.appendChild(serviceHealthChip("进程", processText, JSON.stringify(entry.process_evidence || entry.expected_process_roles || [])));
+        // 任务 6.1.3：expected_process_roles —— 未命中时显式列出期望角色（让用户知道哪个进程应当启动）
+        const expectedRoles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
+        const evidenceList = Array.isArray(entry.process_evidence) ? entry.process_evidence : [];
+        if (expectedRoles.length && !evidenceList.length) {
+          foot.appendChild(serviceHealthChip("期望角色", expectedRoles.join(", "), "未匹配任何进程"));
+        }
         if (entry.advice) foot.appendChild(serviceHealthChip("建议", entry.advice));
         if (options && options.compatibleFallback) foot.appendChild(serviceHealthChip("模式", "兼容推断"));
 
+        // 任务 6.1.1：reason 行（独立 chip，机器可读原因在 title 中展示完整值）
+        if (entry.reason) {
+          const reasonChip = serviceHealthChip("原因", displayReasonLabel(entry.reason), String(entry.reason));
+          reasonChip.classList.add("service-health-reason");
+          foot.appendChild(reasonChip);
+        }
+
         card.append(top, summary, evidence, foot);
         els.governanceMeta.appendChild(card);
+      }
+      function displayReasonLabel(reason) {
+        // 任务 6.1.1：reason 字段为机器可读 token 时映射为中文短标签
+        const map = {
+          expected_process_absent: "进程未匹配",
+          process_evidence_drift: "进程证据漂移",
+          no_signal_in_window: "窗口内无信号",
+          upstream_disabled: "上游已禁用",
+        };
+        return map[reason] || String(reason);
       }
       function buildLegacyServiceHealthFallback() {
         const overview = state.latestOverview || {};
@@ -1357,8 +1407,11 @@ button{font-family:inherit;cursor:pointer}
           ? `${Math.round(mem.percent)}% · ${formatGB(mem.used_bytes)}/${formatGB(mem.total_bytes)}`
           : "N/A");
         renderProcessMatrix(snap);
-        patchServiceHealthProcessEvidence(snap);
-        renderServiceStatus();
+        // 任务 4.6：system.metrics 改走 patch 模式（仅刷 process_evidence，不覆盖主字段）
+        // state.latestServiceHealth 缺失时（即 bootstrap 与流式都未到）则跳过
+        if (state.latestServiceHealth) {
+          mergeServiceHealth(state.latestServiceHealth, "system.metrics", "patch");
+        }
       }
       function renderProcessMatrix(snap) {
         const status = snap && snap.status ? snap.status : "missing";
@@ -1397,6 +1450,14 @@ button{font-family:inherit;cursor:pointer}
         }
       }
       function updateHealth(payload) {
+        // 闸门：bootstrap 未完成时入队，避免流式帧抢在 /api/health 之前写入 state
+        if (!state.bootstrapComplete.health) {
+          state.bootstrapQueue.health.push(payload);
+          return;
+        }
+        updateHealthImpl(payload);
+      }
+      function updateHealthImpl(payload) {
         const health = payload || {};
         state.latestHealth = health;
         setText(els.robotName, health.robot_name || "nuwax_robot_bridge");
@@ -1415,7 +1476,7 @@ button{font-family:inherit;cursor:pointer}
         setPill(els.estopStatus, estopped ? "error" : "available", estopped ? "急停状态：触发" : "急停状态：清除");
         els.estopStatus.classList.add("estop");
         if (health.service_health) {
-          mergeServiceHealth(health.service_health, "/api/health");
+          mergeServiceHealth(health.service_health, "/api/health", "replace");
         } else {
           renderServiceStatus();
         }
@@ -1439,21 +1500,43 @@ button{font-family:inherit;cursor:pointer}
         return typeof limit === "number" ? items.slice(0, limit) : items;
       }
       function refreshTaskStore() {
+        // 任务 4.0a Map 内存截断：保留窗口 active=50 / history=200，防止长会话内存增长
+        trimMapByUpdatedAt(state.taskActiveById, 50);
+        trimMapByUpdatedAt(state.taskHistoryById, 200);
         const active = taskListFromMap(state.taskActiveById);
         const history = taskListFromMap(state.taskHistoryById, 20);
         state.latestTasks = { active_tasks: active, history_tasks: history };
         updateTasks(state.latestTasks);
-        updateHealth({ ...(state.latestHealth || {}), active_task_count: active.length });
+        // 任务 4.7：active_task_count 不再触发 service_health 重渲染，只更新顶栏文本
+        if (els.activeTaskMetric) setText(els.activeTaskMetric, active.length);
         reevaluateCachedMapDisplay();
       }
+      function trimMapByUpdatedAt(map, keep) {
+        if (!map || map.size <= keep) return;
+        const sorted = Array.from(map.entries()).sort((a, b) => taskUpdatedMs(b[1]) - taskUpdatedMs(a[1]));
+        for (const [key] of sorted.slice(keep)) map.delete(key);
+      }
       function replaceTaskStore(payload) {
-        state.taskActiveById.clear();
-        state.taskHistoryById.clear();
+        // 任务 3.1：merge 语义而非 clear+set —— 保留流式期间累积的增量
         for (const task of Array.isArray(payload && payload.active_tasks) ? payload.active_tasks : []) {
-          if (task && task.task_id) state.taskActiveById.set(String(task.task_id), task);
+          if (!task || !task.task_id) continue;
+          const key = String(task.task_id);
+          const existing = state.taskActiveById.get(key);
+          if (!existing) {
+            state.taskActiveById.set(key, task);
+          } else {
+            state.taskActiveById.set(key, { ...existing, ...task });
+          }
         }
         for (const task of Array.isArray(payload && payload.history_tasks) ? payload.history_tasks : []) {
-          if (task && task.task_id) state.taskHistoryById.set(String(task.task_id), task);
+          if (!task || !task.task_id) continue;
+          const key = String(task.task_id);
+          const existing = state.taskHistoryById.get(key);
+          if (!existing) {
+            state.taskHistoryById.set(key, task);
+          } else if (taskUpdatedMs(task) > taskUpdatedMs(existing)) {
+            state.taskHistoryById.set(key, { ...existing, ...task });
+          }
         }
         refreshTaskStore();
       }
@@ -1507,6 +1590,10 @@ button{font-family:inherit;cursor:pointer}
           replaceTaskStore(await response.json());
         } catch (err) {
           showPanelError("logs", `任务列表初始化失败：${err.message || err}`);
+        } finally {
+          // bootstrap 闸门：完成后才允许 updateTaskFrame 直接写 Map；flush 期间累积的流式事件
+          flushTaskQueue();
+          state.bootstrapComplete.tasks = true;
         }
       }
       async function loadInitialHealth() {
@@ -1516,19 +1603,25 @@ button{font-family:inherit;cursor:pointer}
           updateHealth(await response.json());
         } catch (err) {
           showPanelError("governance", `服务健康初始化失败：${err.message || err}`);
+        } finally {
+          // 风险 4 不变量：bootstrapComplete 必须在 resolve/catch 后无条件写 true，
+          // 让 flush 队列中后续 runtime.governance 帧能继续触发 merge。
+          flushHealthQueue();
+          state.bootstrapComplete.health = true;
         }
       }
-      function startTaskPolling() {
-        setInterval(async () => {
-          try {
-            const response = await fetch(withAccessToken("/api/tasks?history_limit=20"));
-            if (!response.ok) return;
-            replaceTaskStore(await response.json());
-          } catch (err) {
-            // 静默忽略轮询失败
-          }
-        }, 3000);
+      function flushHealthQueue() {
+        const queue = state.bootstrapQueue.health;
+        for (const queued of queue) updateHealthImpl(queued);
+        state.bootstrapQueue.health = [];
       }
+      function flushTaskQueue() {
+        const queue = state.bootstrapQueue.tasks;
+        for (const frame of queue) updateTaskFrameImpl(frame);
+        state.bootstrapQueue.tasks = [];
+      }
+      // 任务 4.0：删除 startTaskPolling —— tasks.state WebSocket 流为单一来源；
+      // 轮询 replaceTaskStore 会反复擦除流式期间累积的增量。
       function showPanelError(kind, message) {
         if (kind === "governance") {
           setPill(els.governanceStatus, "error");
@@ -3397,7 +3490,7 @@ button{font-family:inherit;cursor:pointer}
         state.latestGovernance = data;
         data.status = data.status || (envelope.status ? statusOf(envelope) : undefined);
         if (data.service_health) {
-          mergeServiceHealth(data.service_health, "runtime.governance");
+          mergeServiceHealth(data.service_health, "runtime.governance", "replace");
         } else {
           renderServiceStatus();
         }
@@ -4309,6 +4402,14 @@ button{font-family:inherit;cursor:pointer}
         updateStreamOverview(latest);
       }
       function updateTaskFrame(frame) {
+        // 闸门：bootstrap 未完成时入队，避免流式单条事件抢在 /api/tasks 之前写入 Map
+        if (!state.bootstrapComplete.tasks) {
+          state.bootstrapQueue.tasks.push(frame);
+          return;
+        }
+        updateTaskFrameImpl(frame);
+      }
+      function updateTaskFrameImpl(frame) {
         const framePayload = frame.payload || {};
         if (Array.isArray(framePayload.active_tasks) || Array.isArray(framePayload.history_tasks)) {
           replaceTaskStore(framePayload);
@@ -4319,24 +4420,35 @@ button{font-family:inherit;cursor:pointer}
         const requestContext = payload.request_context || {};
         const taskId = event.task_id || payload.task_id || requestContext.task_id;
         if (!taskId) return;
-        const existing = state.taskActiveById.get(String(taskId)) || state.taskHistoryById.get(String(taskId)) || {};
+        const key = String(taskId);
+        const existing = state.taskActiveById.get(key) || state.taskHistoryById.get(key) || {};
+        // 任务 3.2.1：state 字段回退链移除 event.event_type 兜底（避免 "task.progress" 字面量进入 state）
+        const derivedStage = event.event_type ? String(event.event_type).replace(/^task\./, "") : null;
         const task = {
           ...existing,
           task_id: taskId,
           capability_name: payload.capability_name || requestContext.capability_name || existing.capability_name,
-          state: payload.state || event.state || existing.state || event.event_type,
-          stage: payload.stage || event.message || existing.stage || event.event_type,
+          state: payload.state || event.state || existing.state || null,
+          stage: payload.stage || event.message || existing.stage || derivedStage,
           message: payload.message || event.message || existing.message,
           progress: payload.progress !== undefined ? payload.progress : existing.progress,
           updated_at: event.timestamp || payload.updated_at || frame.timestamp || existing.updated_at,
           completed_at: payload.completed_at || existing.completed_at,
         };
+        // 任务 3.2.3：终态时强制 progress=1.0（如果 state 是 SUCCEEDED 且 payload.progress 为 null/undefined）
+        if (isTerminalTaskState(task.state) && task.state === "succeeded" && task.progress === undefined) {
+          task.progress = 1.0;
+        }
         if (isTerminalTaskState(task.state)) {
-          state.taskActiveById.delete(String(taskId));
-          state.taskHistoryById.set(String(taskId), task);
+          state.taskActiveById.delete(key);
+          // 任务 3.3：history 幂等守卫 —— 已存在且更新版本不晚于新值时跳过覆盖
+          const existingHistory = state.taskHistoryById.get(key);
+          if (!existingHistory || taskUpdatedMs(task) > taskUpdatedMs(existingHistory)) {
+            state.taskHistoryById.set(key, task);
+          }
         } else {
-          state.taskHistoryById.delete(String(taskId));
-          state.taskActiveById.set(String(taskId), task);
+          state.taskHistoryById.delete(key);
+          state.taskActiveById.set(key, task);
         }
         refreshTaskStore();
       }
@@ -4654,7 +4766,7 @@ button{font-family:inherit;cursor:pointer}
       updateClock();
       loadInitialHealth();
       loadInitialTasks();
-      startTaskPolling();
+      // 任务 4.0：已删除 startTaskPolling 调用 —— tasks.state WebSocket 流为单一来源
       syncMapCanvasSize();
       if (window.ResizeObserver) {
         new ResizeObserver(redrawMapAfterResize).observe(els.mapCanvas);

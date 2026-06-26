@@ -957,6 +957,8 @@ class GatewayRuntime:
         while not self._system_telemetry_stop.wait(interval):
             try:
                 snapshot = collector.sample()
+                # 任务 5.2：硬约束顺序 —— 必须先更新 _latest_system_metrics_snapshot 再 publish，
+                # 保证后续 _build_service_health_summary 调用读到最新快照，process_evidence 与 metadata.process_sampled_at_iso 同源
                 self._latest_system_metrics_snapshot = snapshot
                 self.stream_bus.publish(
                     "system.metrics",
@@ -3914,6 +3916,14 @@ class GatewayRuntime:
                 "attention_count": attention_count,
                 "entry_count": len(entries),
                 "process_sampled_at": self._payload_get(self._latest_system_metrics_snapshot, "sampled_at"),
+                # 任务 5.1：process_evidence 元数据一致性 —— 与 _service_process_evidence 内部 sampled_at 同一 source_ts，
+                # 便于前端对账 telemetry collector 的采样时刻
+                "process_evidence_source": "system.metrics",
+                "process_sampled_at_iso": (
+                    self._payload_get(self._latest_system_metrics_snapshot, "sampled_at").isoformat()
+                    if self._payload_get(self._latest_system_metrics_snapshot, "sampled_at") is not None
+                    else None
+                ),
             },
         )
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 import logging
 import math
@@ -3906,6 +3906,7 @@ class GatewayRuntime:
             for entry in entries
             if getattr(entry.status, "value", str(entry.status)) in _SERVICE_HEALTH_ATTENTION_STATUSES
         )
+        process_sampled_at = self._payload_get(self._latest_system_metrics_snapshot, "sampled_at")
         return ServiceHealthSummary(
             status=overall,
             authoritative=True,
@@ -3915,17 +3916,40 @@ class GatewayRuntime:
             metadata={
                 "attention_count": attention_count,
                 "entry_count": len(entries),
-                "process_sampled_at": self._payload_get(self._latest_system_metrics_snapshot, "sampled_at"),
+                "process_sampled_at": process_sampled_at,
                 # 任务 5.1：process_evidence 元数据一致性 —— 与 _service_process_evidence 内部 sampled_at 同一 source_ts，
-                # 便于前端对账 telemetry collector 的采样时刻
+                # 便于前端对账 telemetry collector 的采样时刻。
+                # 注意：SystemMetricsSnapshot.sampled_at 是 float（Unix 秒，见 contracts/debug_views.py），
+                # 不是 datetime；需用 _iso_from_sampled_at 安全转换，避免 'float' object has no attribute 'isoformat'。
                 "process_evidence_source": "system.metrics",
-                "process_sampled_at_iso": (
-                    self._payload_get(self._latest_system_metrics_snapshot, "sampled_at").isoformat()
-                    if self._payload_get(self._latest_system_metrics_snapshot, "sampled_at") is not None
-                    else None
-                ),
+                "process_sampled_at_iso": self._iso_from_sampled_at(process_sampled_at),
             },
         )
+
+    @staticmethod
+    def _iso_from_sampled_at(value: Any) -> Optional[str]:
+        """把 telemetry 采样时刻安全转为 ISO 8601 字符串。
+
+        SystemMetricsSnapshot.sampled_at 是 float（Unix 秒时间戳）；
+        但为兼容历史/异常输入，同时接受 datetime 与可解析字符串，无法识别时返回 None。
+        """
+
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                return None
+        isoformat = getattr(value, "isoformat", None)
+        if callable(isoformat):
+            try:
+                return isoformat()
+            except Exception:
+                return None
+        return None
 
     def _runtime_nested_bool(self, payload: MetadataDict, outer_key: str, inner_key: str) -> Optional[bool]:
         outer = payload.get(outer_key)

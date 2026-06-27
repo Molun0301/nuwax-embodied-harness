@@ -1003,13 +1003,39 @@ class PlatformGeometryRuntime:
             self._remote_provider = None
 
     def _start_ros_bridge_subprocess(self) -> None:
-        """启动 Rust nuwax-ros-bridge 子进程并建立 gRPC 连接。"""
-        if self._ros_bridge_subprocess is not None and self._ros_bridge_subprocess.is_running:
-            return
+        """启动 Rust nuwax-ros-bridge 子进程并建立 gRPC 连接。
+
+        zombie 自愈：
+        - 上一次启动可能在 attach 路径下成功，但端口/RPC 健康检查随后失败。
+        - 这种状态下 `bridge.is_running` 已为 False 但 `bridge._started` 仍为 True，
+          直接 `bridge.start()` 仍会 short-circuit；新一次启动会永远拉不起新 bridge，
+          客户端 GetFrameTree/GetCurrentPose 持续 UNAVAILABLE。
+        - 入口处先 zombie 检测：subprocess 存在但 is_running=False → 主动 stop+清空，
+          强制走完整 spawn 路径（参见 grpc-attach-zombie-bridge-2026-06-27）。
+        """
+        if self._ros_bridge_subprocess is not None:
+            if self._ros_bridge_subprocess.is_running:
+                return
+            LOGGER.warning(
+                "Rust ros-bridge 子进程状态僵死，主动 stop+清空以重新 spawn"
+            )
+            try:
+                self._ros_bridge_subprocess.stop()
+            except Exception as exc:
+                LOGGER.warning("zombie bridge.stop 失败（不影响主流程）: %s", exc)
+            self._ros_bridge_subprocess = None
         bridge = RosBridgeSubprocess()
         if not bridge.start():
             LOGGER.warning("Rust ros-bridge 子进程启动失败: %s", bridge.last_error)
             self._record_runtime_diagnostic("ros_bridge_start", bridge.last_error or "启动失败")
+            # attach 验活失败但 spawn 也失败的场景：bridge.start() 内部已清状态，这里
+            # 仅记录诊断；下一次 _start_ros_bridge_subprocess 调用可再次尝试 spawn。
+            if bridge.is_running is False and getattr(bridge, "_attached", False):
+                LOGGER.warning("bridge.attach 残留状态异常，主动清空避免下次 short-circuit")
+                try:
+                    bridge.disconnect()
+                except Exception:  # pragma: no cover
+                    pass
             return
         self._ros_bridge_subprocess = bridge
         provider = RosBridgeProvider(bridge)
@@ -1023,6 +1049,11 @@ class PlatformGeometryRuntime:
                 self._remote_provider.subscribe_map_updates(cb)
         else:
             LOGGER.warning("Rust ros-bridge gRPC 连接失败，子进程仍在运行")
+            # connect() 内部已调 bridge.disconnect() 清状态；下一次
+            # _start_ros_bridge_subprocess 会 zombie 自愈重 spawn。
+            if self._ros_bridge_subprocess is not None and not self._ros_bridge_subprocess.is_running:
+                LOGGER.warning("bridge 已被 disconnect 清空，提前置 None 让下次入口重 spawn")
+                self._ros_bridge_subprocess = None
 
     def _inject_static_extrinsics(self, provider: "RosBridgeProvider") -> None:
         """装配期：从机器人 CalibrationProvider 取静态外参拓扑，缓存进 RosBridgeProvider。

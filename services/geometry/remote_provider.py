@@ -251,7 +251,14 @@ class RosBridgeProvider:
         LOGGER.info("已缓存 %d 条静态外参边用于 frame_tree 合并", len(self._static_extrinsic_edges))
 
     def connect(self) -> bool:
-        """连接到 Rust 子进程的 gRPC server。"""
+        """连接到 Rust 子进程的 gRPC server。
+
+        失败时必须清空 channel/stub 并调 `bridge.disconnect()`，让下一次
+        RosBridgeSubprocess.start() 不再 short-circuit。attach 到僵尸进程时
+        `bridge.is_running` 在 attach 状态短暂为 True（端口刚关但状态未清），
+        RPC 失败后必须 reset bridge 状态，否则会留下永久 `_started=True`
+        假活锁（参见 grpc-attach-zombie-bridge-2026-06-27）。
+        """
         if not self._bridge.is_running:
             LOGGER.error("子进程未启动，无法连接")
             return False
@@ -264,7 +271,27 @@ class RosBridgeProvider:
             return True
         except grpc.RpcError as e:
             LOGGER.error("gRPC 连接失败: %s", e)
+            self._cleanup_after_failed_connect()
             return False
+
+    def _cleanup_after_failed_connect(self) -> None:
+        """connect 失败时释放已建 channel/stub 并强制 bridge 进入未启动状态。"""
+        # 先关 channel 让底层连接断开，再清 stub 防止后续误用。
+        if self._channel is not None:
+            try:
+                self._channel.close()
+            except Exception:  # pragma: no cover - 关 channel 失败不影响 reset 目标
+                pass
+        self._channel = None
+        self._stub = None
+        self._connected = False
+        # 关键：让 bridge 子进程对象也回到「未启动」状态，使下一次 start() 走完整 spawn。
+        # 注意只清状态不杀进程：调用方后续会走 _start_ros_bridge_subprocess 的 zombie 自愈路径，
+        # 视情况 stop() 旧 bridge 或直接 spawn 新 bridge 取代。
+        try:
+            self._bridge.disconnect()
+        except Exception as exc:  # pragma: no cover - disconnect 失败不影响主流程
+            LOGGER.warning("bridge.disconnect 失败（不影响主流程）: %s", exc)
 
     def disconnect(self) -> None:
         if self._channel:

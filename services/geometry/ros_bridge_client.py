@@ -25,6 +25,19 @@ _HEALTH_CHECK_INTERVAL_SEC = 2.0
 _STOP_TIMEOUT_SEC = 5.0
 _MAX_RESTART_ATTEMPTS = 3
 _RESTART_BACKOFF_BASE_SEC = 1.0
+# attach 状态下端口探测到 listen 后，做一次 gRPC 健康检查（GetStatus）的缓存 TTL（秒）。
+# 监控线程 2s 一次轮询 is_running，TTL 1s 既保证轮询期内不重复 RPC，又能在下一次轮询及时反映故障。
+_ATTACHED_HEALTH_CHECK_TTL_SEC = 1.0
+# attach 验活/GetStatus 单次 RPC 超时。复用 _read_deadline_sec 默认值 2.0s；
+# 单独定义便于测试时压低到 0.5s。
+_ATTACHED_HEALTH_CHECK_TIMEOUT_SEC = float(
+    os.environ.get("NUWAX_ROS_BRIDGE_ATTACH_HEALTH_TIMEOUT_SEC", "2.0")
+)
+# 紧急跳过 attach gRPC 验活的 hotfix 开关；置 1 后退回旧的「仅端口探测」行为。
+# 默认关闭：attach 路径必须 RPC 验活，避免挂接已僵死的进程导致后续 UNAVAILABLE 死锁。
+_SKIP_ATTACH_HEALTH_CHECK = os.environ.get(
+    "NUWAX_ROS_BRIDGE_SKIP_HEALTH_CHECK", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class RosBridgeSubprocess:
@@ -48,6 +61,9 @@ class RosBridgeSubprocess:
         self._started = False
         self._attached = False
         self._last_error: Optional[str] = None
+        # attach 状态下 gRPC 健康检查缓存（monitor_loop / is_running 复用）
+        self._attached_health_check_at = 0.0
+        self._attached_health_check_ok = False
 
     @property
     def grpc_target(self) -> str:
@@ -57,7 +73,15 @@ class RosBridgeSubprocess:
     def is_running(self) -> bool:
         with self._lock:
             if self._attached:
-                return self._is_port_open()
+                # attach 状态下不能仅凭端口探测判定可用：进程僵死/被冲掉后端口可能短暂
+                # 仍在 LISTEN 或 TIME_WAIT，但任何 RPC 都会立即 UNAVAILABLE，会让上层
+                # _start_ros_bridge_subprocess 误以为"已就绪"而走 fast-return，
+                # 留下永久 _started=True 假活锁（参见 grpc-attach-zombie-bridge-2026-06-27）。
+                # 这里走带 TTL 缓存的 gRPC 健康检查；失败时清状态允许 respawn。
+                if not self._is_port_open():
+                    self._reset_attached_state_locked()
+                    return False
+                return self._check_attached_health_locked()
             return self._process is not None and self._process.poll() is None
 
     @property
@@ -86,16 +110,43 @@ class RosBridgeSubprocess:
             )
 
     def start(self) -> bool:
-        """启动 Rust 子进程并等待 gRPC server 就绪。"""
+        """启动 Rust 子进程并等待 gRPC server 就绪。
+
+        attach 路径必须 RPC 验活：仅端口探测不能区分「进程还活着能响应 RPC」
+        与「进程僵死/被冲掉但 listen socket 仍在」两种状态。后者若直接挂接，
+        后续 GetFrameTree/GetCurrentPose 都会立即 UNAVAILABLE，且 self._started
+        永远为 True 让下一次 start() 走 short-circuit 不再 spawn，
+        形成永久假活锁（参见 grpc-attach-zombie-bridge-2026-06-27）。
+        验活失败则**跳过 attach 继续走 spawn 路径**，让 spawn 取代失败的端口占用。
+        """
         with self._lock:
             if self._started:
-                return True
+                # 已启动状态也允许 zombie 自愈：attach 但 RPC 不可用 → 清状态后走 spawn。
+                if self._attached and not self._check_attached_health_locked(
+                    force=True
+                ):
+                    LOGGER.warning(
+                        "nuwax-ros-bridge attach 状态健康检查失败，强制清理并重新 spawn"
+                    )
+                    self._reset_attached_state_locked()
+                    self._started = False
+                else:
+                    return True
             if self._is_port_open():
-                self._attached = True
-                self._started = True
-                LOGGER.info("nuwax-ros-bridge 已在端口 %d 运行，挂接现有进程", self._port)
-                self._warn_if_video_relay_missing()
-                return True
+                if self._verify_attached_bridge_locked():
+                    self._attached = True
+                    self._started = True
+                    self._attached_health_check_at = time.monotonic()
+                    self._attached_health_check_ok = True
+                    LOGGER.info("nuwax-ros-bridge 已在端口 %d 运行，gRPC 验活通过，挂接现有进程", self._port)
+                    self._warn_if_video_relay_missing()
+                    return True
+                LOGGER.warning(
+                    "端口 %d 已被占用但 gRPC 验活失败（疑似僵死/被冲掉的 nuwax-ros-bridge 残留），"
+                    "跳过 attach 继续走 spawn 路径",
+                    self._port,
+                )
+                self._reset_attached_state_locked()
             self._stop_event.clear()
             self._restart_count = 0
             success = self._spawn_process()
@@ -109,10 +160,25 @@ class RosBridgeSubprocess:
         with self._lock:
             self._started = False
             self._attached = False
+            self._attached_health_check_at = 0.0
+            self._attached_health_check_ok = False
             self._stop_event.set()
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=2.0)
         self._kill_process()
+
+    def disconnect(self) -> None:
+        """仅清空 attach/started 状态与健康检查缓存，不杀进程也不动监听 socket。
+
+        供 RemoteProvider.connect() 失败后调用：
+        - 让下一次 RosBridgeSubprocess.start() 不再 short-circuit，能走到 spawn 路径取代僵死 attach。
+        - 不主动 kill 端口：调用方已确认 attach 不可用，spawn 时新进程会重新 bind 同端口
+          （依赖 start_gateway.sh cleanup_stale_ros_bridge_processes 已杀过旧进程），
+          或者 spawn 失败时由调用方根据 last_error 决策。
+        """
+        with self._lock:
+            self._reset_attached_state_locked()
+            self._started = False
 
     def _spawn_process(self) -> bool:
         """fork 子进程并等待 ready 文件出现。"""
@@ -254,6 +320,63 @@ class RosBridgeSubprocess:
                 return True
         except OSError:
             return False
+
+    def _verify_attached_bridge_locked(self) -> bool:
+        """attach 候选进程是否真的能响应 gRPC GetStatus。
+
+        用一次性 insecure_channel + GetStatus RPC 直接打 127.0.0.1:port。
+        成功 → 返回 True（可挂接）。失败/超时/拒绝 → 返回 False（僵死/被冲掉，spawn 取代）。
+        """
+        if _SKIP_ATTACH_HEALTH_CHECK:
+            return True
+        try:
+            import grpc  # 局部 import 避免拉起整个 gRPC 栈（无 grpc 也能跑非 gRPC 路径）
+            from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
+            from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
+        except Exception as exc:  # pragma: no cover - 导入失败时降级放行
+            LOGGER.warning("attach 验活: gRPC proto 导入失败，降级为端口探测: %s", exc)
+            return True
+        try:
+            channel = grpc.insecure_channel(self.grpc_target)
+            try:
+                stub = pb2_grpc.GeometryRuntimeStub(channel)
+                stub.GetStatus(pb2.Empty(), timeout=_ATTACHED_HEALTH_CHECK_TIMEOUT_SEC)
+                return True
+            finally:
+                channel.close()
+        except Exception as exc:
+            LOGGER.info("attach 验活: gRPC GetStatus 失败: %s", exc)
+            return False
+
+    def _check_attached_health_locked(self, *, force: bool = False) -> bool:
+        """带 TTL 缓存的 attach 健康检查。
+
+        TTL 内复用上次结果，避免监控线程 2s 轮询时每轮都打 RPC。
+        force=True 跳过缓存（仅用于 start() 顶部 zombie 自愈路径）。
+        失败时**清空 attach/started 状态**，让下次 start() 走完整 spawn。
+        """
+        if _SKIP_ATTACH_HEALTH_CHECK:
+            return True
+        now = time.monotonic()
+        if not force and self._attached_health_check_ok and (
+            now - self._attached_health_check_at
+        ) < _ATTACHED_HEALTH_CHECK_TTL_SEC:
+            return True
+        ok = self._verify_attached_bridge_locked()
+        self._attached_health_check_at = now
+        self._attached_health_check_ok = ok
+        if not ok:
+            LOGGER.warning(
+                "attach 状态下 gRPC 健康检查失败，清状态允许 respawn"
+            )
+            self._reset_attached_state_locked()
+        return ok
+
+    def _reset_attached_state_locked(self) -> None:
+        """调用方必须已持有 self._lock。清空 attach 状态与健康检查缓存。"""
+        self._attached = False
+        self._attached_health_check_at = 0.0
+        self._attached_health_check_ok = False
 
     @staticmethod
     def _apply_bridge_env_aliases(env: dict) -> None:

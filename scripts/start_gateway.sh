@@ -219,6 +219,36 @@ cleanup_stale_ros_bridge_processes() {
     fi
   done < <(ps -eo pid=,args=)
 
+  # 兜底清理：nuwax-ros-bridge 可能已被 pgrep 杀过但 listen socket 仍处 TIME_WAIT，
+  # 或被 SIGKILL 后 socket 未立即释放。下次 spawn 会因 port-in-use 失败，
+  # 而 Python 端 RosBridgeSubprocess 端口探测会误报"端口已开"导致 attach 到僵尸。
+  # 这里先看端口状态：若 50051 仍 LISTEN 且 pgrep 已无匹配 → 主动 fuser 杀端口持有者。
+  # 顺序约束：必须等 gateway worker 已停（本函数仅在 cleanup_stale_gateway_processes 之后
+  # 调用），否则会误杀在跑 bridge 的 listen socket。当前所有调用点均已满足。
+  local bridge_port="${NUWAX_ROS_BRIDGE_PORT:-50051}"
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)${bridge_port}$"; then
+      if ! pgrep -f "nuwax-ros-bridge" >/dev/null 2>&1; then
+        echo "==> port ${bridge_port} still LISTEN but no nuwax-ros-bridge process; clearing residual socket"
+        if command -v fuser >/dev/null 2>&1; then
+          fuser -KILL "${bridge_port}/tcp" >/dev/null 2>&1 || true
+        else
+          # 退化路径：用 lsof 找持有者再 kill；缺失时记 warning 不阻塞。
+          if command -v lsof >/dev/null 2>&1; then
+            local residual_pid
+            residual_pid="$(lsof -ti tcp:${bridge_port} 2>/dev/null || true)"
+            if [[ -n "${residual_pid}" ]]; then
+              kill -KILL ${residual_pid} >/dev/null 2>&1 || true
+            fi
+          else
+            echo "WARNING: fuser/lsof 都不可用，端口 ${bridge_port} 残留可能让 spawn 失败" >&2
+          fi
+        fi
+        sleep 0.5
+      fi
+    fi
+  fi
+
   rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
 }
 

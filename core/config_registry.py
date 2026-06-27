@@ -171,7 +171,7 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("relay", ("NUWAX_RELAY",)),
     ("logging", ("NUWAX_LOG", "GO2_PROXY_LOG")),
     ("rtabmap", ("NUWAX_RTABMAP",)),
-    ("nav2", ("NUWAX_NAV2",)),
+    ("nav2", ("NUWAX_NAV2", "NUWAX_NAV_")),
     ("external_geometry", ("NUWAX_GEOMETRY_EXTERNAL", "NUWAX_GEOMETRY_INPUT", "NUWAX_GEOMETRY_POINT_CLOUD_BRIDGE",
                             "NUWAX_GEOMETRY_ODOM_TF", "NUWAX_GEOMETRY_CMD_VEL", "NUWAX_GEOMETRY_PROVIDES")),
     ("geometry_quality", ("NUWAX_GEOMETRY_VOXEL", "NUWAX_GEOMETRY_CROP", "NUWAX_GEOMETRY_MAX_RANGE",
@@ -382,6 +382,15 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_NAV2_MAP_YAML": "Nav2 地图 YAML 文件",
     "NUWAX_NAV2_PARAMS_FILE": "Nav2 参数文件",
     "NUWAX_NAV2_USE_SIM_TIME": "Nav2 使用仿真时间",
+
+    # 导航代理（navigation_proxy gRPC + 闭环判据）
+    "NUWAX_NAV_ACTION_NAMESPACE": "Nav2 导航动作命名空间",
+    "NUWAX_NAV_LOOP_CLOSURE_THRESHOLD": "闭环判据计数阈值",
+    "NUWAX_NAV_LOOP_CLOSURE_POLL_INTERVAL_SEC": "闭环判据轮询间隔（秒）",
+    "NUWAX_NAV_DB_SQLITE_FALLBACK_ENABLED": "启用 RTAB-Map DB SQLite 闭环 fallback",
+    "NUWAX_NAV_PROXY_GRPC_PORT": "导航代理 gRPC 端口",
+    "NUWAX_NAV_PROXY_PENDING_QUEUE_MAX_SIZE": "导航代理 PENDING 队列上限",
+    "NUWAX_NAV_PROXY_RMW": "导航代理 RMW 实现",
 
     # 外部几何栈与桥接
     "NUWAX_GEOMETRY_EXTERNAL_ENABLED": "启用统一几何外部进程",

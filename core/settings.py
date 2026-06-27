@@ -150,6 +150,29 @@ _DEPRECATION_LOGGER = logging.getLogger("nuwax_robot_bridge.settings.deprecation
 _DEPRECATED_ENV_NOTIFIED: set[str] = set()
 
 
+# ============================================================
+# V2：navigation_proxy gRPC + 闭环判据 + 手划边界扩展（design.md 附录 K）
+# ============================================================
+# 这些常量在 import 时通过 _cfg_* 解析环境变量一次，作为 module-level 暴露。
+# services/geometry/external_debug_observer.py / services/geometry/runtime.py /
+# services/geometry/navigation_proxy_client.py 都直接 from core.settings import ...。
+# 注意：模块级常量在 pytest / 多进程场景下**不会**自动跟随环境变量重载；如需运行时
+# 热更新走 config_registry 的 lru_cache 路径（参见 web-config-panel-architecture.md）。
+
+NAV_ACTION_NAMESPACE: str = _cfg_str("NUWAX_NAV_ACTION_NAMESPACE", "/navigate_to_pose")
+NAV_LOOP_CLOSURE_THRESHOLD: int = max(1, _cfg_int("NUWAX_NAV_LOOP_CLOSURE_THRESHOLD", 3))
+NAV_LOOP_CLOSURE_POLL_INTERVAL_SEC: float = max(
+    0.5, _cfg_float("NUWAX_NAV_LOOP_CLOSURE_POLL_INTERVAL_SEC", 5.0)
+)
+NAV_DB_SQLITE_FALLBACK_ENABLED: bool = _cfg_bool("NUWAX_NAV_DB_SQLITE_FALLBACK_ENABLED", True)
+
+NAV_PROXY_GRPC_PORT: int = _cfg_int("NUWAX_NAV_PROXY_GRPC_PORT", 50061)
+NAV_PROXY_PENDING_QUEUE_MAX_SIZE: int = max(
+    1, _cfg_int("NUWAX_NAV_PROXY_PENDING_QUEUE_MAX_SIZE", 4)
+)
+NAV_PROXY_RMW: str = _cfg_str("NUWAX_NAV_PROXY_RMW", "rmw_cyclonedds_cpp")
+
+
 def _notify_deprecated_env(legacy_name: str, preferred_name: str) -> None:
     if legacy_name in _DEPRECATED_ENV_NOTIFIED:
         return

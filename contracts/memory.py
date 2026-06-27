@@ -82,6 +82,14 @@ class SemanticMemoryEntry(TimestampedContract):
     tags: List[str] = Field(default_factory=list, description="检索标签。")
     linked_location_id: Optional[str] = Field(default=None, description="关联地点标识。")
     pose: Optional[Pose] = Field(default=None, description="关联位姿。")
+    last_observed_at: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "最近一次观测时间（UTC）；机器人通过 navigate_to_pose 到达物品坐标 1m 内时刷新。"
+            "spec 记忆库与地图绑定 §到达物品坐标 场景依赖此字段。"
+        ),
+    )
+    observation_count: int = Field(default=0, ge=0, description="累计观测次数。")
     map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
     localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点标识。")

@@ -196,6 +196,17 @@
       }
       overlay.style.display = 'block';
       setV2ActiveFlag(true);
+      // V2 冻结相机：写入冻结中心 + 开关。cameraAnchor() 入口会优先判断此开关，
+      // 强制走 mapFixed 路径——canvas 不再 robotLocked 跟随 pose 旋转/平移。
+      // 冻结中心取当前 anchor.point：此刻世界米坐标系中心。
+      const anchor = (typeof window.__nuwaxCameraAnchor === 'function') ? window.__nuwaxCameraAnchor() : null;
+      if (anchor && anchor.point) {
+        window.__nuwaxMapFreezeCenter = { x: Number(anchor.point.x) || 0, y: Number(anchor.point.y) || 0 };
+      } else {
+        // 兜底：第一次划线 / 还没收到 pose 时，中心设 (0,0)
+        window.__nuwaxMapFreezeCenter = { x: 0, y: 0 };
+      }
+      window.__nuwaxMapFreeze = true;
       // 立即拉一次 viewport，不然首次画线前 SVG 还没 viewBox
       syncViewBox();
     } else {
@@ -204,6 +215,9 @@
       state.currentEnd = null;
       state.activePointerId = null;
       setV2ActiveFlag(false);
+      // V2 解冻：清掉开关与冻结中心，cameraAnchor() 下帧恢复 pose-locked 跟随
+      try { window.__nuwaxMapFreeze = false; } catch (_) {}
+      try { delete window.__nuwaxMapFreezeCenter; } catch (_) {}
     }
     if (state.btnToggle) state.btnToggle.dataset.active = state.drawing ? 'true' : 'false';
     if (state.btnToggle) state.btnToggle.textContent = state.drawing ? '停止划线' : '开始划线';

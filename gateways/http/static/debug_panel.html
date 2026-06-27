@@ -1765,6 +1765,19 @@ button{font-family:inherit;cursor:pointer}
         requestMapDraw(false);
       }
       function cameraAnchor() {
+        // V2 boundary draw freeze：划线模式下冻结相机，强制走 mapFixed 路径——
+        // canvas 不再 robotLocked 跟随 pose 旋转/平移，地图视觉静止。
+        // 冻结中心由 boundary_draw.js 在 setDrawing(true) 时写入当前 anchor.point；
+        // 解冻时清掉（false/未设）：原路径不变。
+        if (window.__nuwaxMapFreeze && window.__nuwaxMapFreezeCenter) {
+          const fc = window.__nuwaxMapFreezeCenter;
+          return {
+            point: { x: Number(fc.x) || 0, y: Number(fc.y) || 0, z: 0 },
+            yaw: 0,
+            locked: false,
+            mapFixed: true,
+          };
+        }
         if (usesRvizMapView()) {
           const center = getMapRvizViewCenter();
           return { point: { x: center.x, y: center.y, z: 0 }, yaw: 0, locked: false, mapFixed: true };
@@ -5124,6 +5137,12 @@ button{font-family:inherit;cursor:pointer}
       // V2 boundary tick：drawMap() 每帧末尾调用，boundary_draw.js 注册回调同步 viewBox。
       // 解耦：boundary 模块自己挂回调，不在主循环 import boundary 模块。
       window.__nuwaxMapDrawTick = window.__nuwaxMapDrawTick || null;
+      // V2 boundary freeze：boundary_draw.js 在 setDrawing(true) 时调一次取当前 anchor
+      // 作冻结中心；setDrawing(false) 时清掉。cameraAnchor() 入口的 __nuwaxMapFreeze
+      // 短路优先于 usesRvizMapView() 与 pose-locked 路径。
+      window.__nuwaxCameraAnchor = function () {
+        return cameraAnchor();
+      };
       els.logLevelFilter.addEventListener("change", () => {
         state.logFilter = els.logLevelFilter.value;
         renderLogs();

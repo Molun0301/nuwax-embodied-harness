@@ -2451,8 +2451,11 @@ class GatewayRuntime:
             "list_semantic_instances": partial(memory_skills.handle_list_semantic_instances, self._skill_ctx),
             "navigate_to_pose": self._handle_navigate_to_pose,
             "navigate_to_named_location": self._handle_navigate_to_named_location,
+            "cancel_navigation": self._handle_cancel_navigation,
+            "get_navigation_state": self._handle_get_navigation_state,
             "find_target": self._handle_find_target,
             "explore_area": self._handle_explore_area,
+            "explore_area_v2": self._handle_explore_area_v2,
             "explore_and_find_target": self._handle_explore_and_find_target,
             "inspect_target": self._handle_inspect_target,
             "follow_target": self._handle_follow_target,
@@ -2865,6 +2868,37 @@ class GatewayRuntime:
                 ),
                 category=SkillCategory.TASK,
                 capability_name="explore_area",
+            ),
+            SkillDescriptor(
+                name="explore_area_v2",
+                display_name="探索区域（手划范围）",
+                description=(
+                    "V2 探索：支持手划多段线段范围（boundary_line_segments）+ 闭环判据（auto_loop_close）。"
+                    "范围通过 /tmp/go2_boundary.json 传给 go2.sh --boundary，"
+                    "闭环判据作为第 8 条完成路径（rtabmap:loop_closed 命名空间）。"
+                ),
+                category=SkillCategory.TASK,
+                capability_name="explore_area_v2",
+            ),
+            SkillDescriptor(
+                name="cancel_navigation",
+                display_name="取消导航",
+                description=(
+                    "取消当前 ACTIVE 导航目标；可选 request_id 参数指定具体目标。"
+                    "返回 CancelResponse；nav2_action_proxy 不可达时回退 PROXY_UNAVAILABLE。"
+                ),
+                category=SkillCategory.TASK,
+                capability_name="cancel_navigation",
+            ),
+            SkillDescriptor(
+                name="get_navigation_state",
+                display_name="读取导航状态",
+                description=(
+                    "读取当前导航状态快照（status/current_pose/remaining_distance_m 等）；"
+                    "无入参。MCP 暴露的同步 tool。"
+                ),
+                category=SkillCategory.SYSTEM,
+                capability_name="get_navigation_state",
             ),
             SkillDescriptor(
                 name="explore_and_find_target",
@@ -5079,6 +5113,104 @@ class GatewayRuntime:
                 else None
             ),
         )
+
+    # ------------------------------------------------------------------
+    # V2 新增 handlers（navigation-and-exploration-boundary §6.2）
+    # ------------------------------------------------------------------
+
+    def _handle_cancel_navigation(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ) -> Dict[str, Any]:
+        """取消导航（同步 tool）。
+
+        - request_id 缺省：取消当前 ACTIVE 目标；
+        - request_id 给出：取消指定 request_id 的目标。
+        """
+        request_id = str(arguments.get("request_id", "")).strip() or None
+        # TODO(runtime_dispatch_not_ready): worker-C _dispatch_navigate 未就绪时返回 stub。
+        # 待 worker-C 接入 NavigationProxyClient 后替换为真实调用：
+        #   return self.platform_geometry_runtime.cancel_navigation(request_id=request_id)
+        return {
+            "ok": True,
+            "alias_of": "cancel_navigation",
+            "request_id": request_id,
+            "message": "TODO:runtime_dispatch_not_ready — 等 worker-C _dispatch_navigate 接入",
+            "metadata": {
+                "requested_by": requested_by or "unknown",
+                "stub": True,
+            },
+        }
+
+    def _handle_get_navigation_state(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ) -> Dict[str, Any]:
+        """读取当前导航状态（同步 tool，无入参）。"""
+        del arguments, request_context
+        # TODO(runtime_dispatch_not_ready): worker-C _dispatch_navigate 未就绪时返回 stub。
+        # 待 worker-C 接入 NavigationProxyClient.get_state() 后替换为真实调用：
+        #   return self.platform_geometry_runtime.get_navigation_state()
+        return {
+            "ok": True,
+            "alias_of": "get_navigation_state",
+            "navigation_state": {
+                "status": "idle",
+                "message": "TODO:runtime_dispatch_not_ready — 等 worker-C _dispatch_navigate 接入",
+            },
+            "metadata": {
+                "requested_by": requested_by or "unknown",
+                "stub": True,
+            },
+        }
+
+    def _handle_explore_area_v2(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        request_context: Optional[MetadataDict] = None,
+    ):
+        """V2 探索：手划多段线段 + 闭环判据。
+
+        数据流：boundary_line_segments → 后端几何外扩 → /tmp/go2_boundary.json →
+        go2.sh --explore --boundary /tmp/go2_boundary.json → frontier_explorer costmap keepout mask。
+        """
+        # 委托给 explore_area handler 主体，再附加 boundary_line_segments 透传。
+        # V1 _handle_explore_area 收 x/y/frame_id/radius_m；V2 额外收 boundary_line_segments
+        # 与 auto_loop_close，platform_geometry_runtime 在 worker-C 5.3 接入 _compute_boundary_polygon 后消费。
+        try:
+            primary = self._handle_explore_area(
+                arguments, requested_by=requested_by, request_context=request_context,
+            )
+        except Exception as exc:  # noqa: BLE001 — 透传 explore_area 的全部错误码
+            primary = {"ok": False, "error": str(exc)}
+        # 透传 V2 元数据（worker-C 5.3 / 5.4 尚未接入时仅记录 metadata，不阻断主流程）
+        v2_metadata = {
+            "v2_capability": "explore_area_v2",
+            "boundary_line_segments_provided": bool(arguments.get("boundary_line_segments")),
+            "auto_loop_close": bool(arguments.get("auto_loop_close", True)),
+            "extend_radius_m": float(arguments.get("extend_radius_m", 3.0) or 3.0),
+            "boundary_polygon_file": "/tmp/go2_boundary.json",
+            "TODO_runtime_dispatch_not_ready": True,
+        }
+        if isinstance(primary, dict):
+            enriched = dict(primary)
+            existing = enriched.get("metadata") or {}
+            if isinstance(existing, dict):
+                existing.update(v2_metadata)
+            else:
+                existing = v2_metadata
+            enriched["metadata"] = existing
+            enriched.setdefault("v2_capability", "explore_area_v2")
+            return enriched
+        return {"result": primary, "metadata": v2_metadata, "v2_capability": "explore_area_v2"}
 
     def _handle_navigate_to_named_location(
         self,

@@ -40,11 +40,106 @@ _MCP_COLLECTIONS = {
 
 # 这些能力除收录在 platform.function 枚举外，还以独立 MCP tool 暴露，
 # 避免 NuwaClaw 代理缓存的 platform 枚举漏掉新功能时 Agent 无法发现。
+#
+# V2 扩展（navigation-and-exploration-boundary §6.3）：从 3 扩到 7 个 tool：
+#   start_mapping / stop_mapping / stop_exploration / navigate_to_pose /
+#   cancel_navigation / get_navigation_state / start_exploration（v2 带 boundary + loop_close）。
 _MCP_STANDALONE_PLATFORM_TOOLS: Tuple[str, ...] = (
     "start_mapping",
     "stop_mapping",
     "stop_exploration",
+    "navigate_to_pose",
+    "cancel_navigation",
+    "get_navigation_state",
+    "start_exploration",
 )
+
+
+# V2 新增 tool 的 input_schema（spec mcp-end-to-end §MCP 工具四件套 + §错误码契约统一）。
+_MCP_STANDALONE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    "navigate_to_pose": {
+        "type": "object",
+        "properties": {
+            "pose": {
+                "type": "object",
+                "description": "目标位姿 Pose2D。",
+                "properties": {
+                    "x": {"type": "number", "description": "X 坐标（米）。"},
+                    "y": {"type": "number", "description": "Y 坐标（米）。"},
+                    "yaw": {"type": "number", "description": "偏航角（弧度）。"},
+                    "frame_id": {"type": "string", "description": "坐标系 ID，默认 map。"},
+                },
+                "required": ["x", "y"],
+            },
+            "timeout_sec": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 60,
+                "description": "超时秒数（默认 60s）。",
+            },
+        },
+        "required": ["pose"],
+        "additionalProperties": False,
+    },
+    "cancel_navigation": {
+        "type": "object",
+        "properties": {
+            "request_id": {
+                "type": "string",
+                "description": "可选；指定 request_id 时仅取消该目标，缺省取消当前 ACTIVE。",
+            },
+        },
+        "additionalProperties": False,
+    },
+    "get_navigation_state": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+    "start_exploration": {
+        "type": "object",
+        "properties": {
+            "boundary_line_segments": {
+                "type": "array",
+                "description": "手划多段线段；每段 [p1, p2]，p = {x, y, yaw?}。",
+                "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                            "yaw": {"type": "number"},
+                            "frame_id": {"type": "string"},
+                        },
+                        "required": ["x", "y"],
+                        "additionalProperties": False,
+                    },
+                },
+                "minItems": 1,
+            },
+            "auto_loop_close": {
+                "type": "boolean",
+                "default": True,
+                "description": "启用闭环判据作为第 8 条完成路径（rtabmap:loop_closed 命名空间）。",
+            },
+            "extend_radius_m": {
+                "type": "number",
+                "default": 3.0,
+                "minimum": 0.0,
+                "maximum": 8.0,
+                "description": "边界外扩半径硬上限 8m，默认 3m。",
+            },
+            "map_name": {
+                "type": "string",
+                "description": "目标地图名称（可选；缺省走当前激活地图）。",
+            },
+        },
+        "additionalProperties": False,
+    },
+}
 
 
 def _tool_layer(descriptor: SkillDescriptor) -> str:
@@ -121,7 +216,23 @@ def _build_standalone_platform_tools(platform_catalog: Dict[str, Dict[str, Any]]
     tools: List[Dict[str, Any]] = []
     for tool_name in _MCP_STANDALONE_PLATFORM_TOOLS:
         item = platform_catalog.get(tool_name)
+        # V2：4 个新 tool（navigate_to_pose/cancel_navigation/get_navigation_state/start_exploration）
+        # 优先从平台目录取 display_name/description/input_schema；缺则回退到本地 V2 schema 表。
+        fallback_schema = _MCP_STANDALONE_TOOL_SCHEMAS.get(tool_name)
+        if item is None and fallback_schema is None:
+            continue
         if item is None:
+            # 缺平台目录条目时使用 V2 schema 占位（display_name/description 走默认文案）
+            tools.append(
+                {
+                    "name": tool_name,
+                    "description": (
+                        f"{tool_name}（V2 navigation-and-exploration-boundary）。"
+                        "独立 MCP 工具，直接传参调用。"
+                    ),
+                    "inputSchema": fallback_schema,
+                }
+            )
             continue
         tools.append(
             {
@@ -130,7 +241,7 @@ def _build_standalone_platform_tools(platform_catalog: Dict[str, Dict[str, Any]]
                     f"{item['display_name']}。{item['description']} "
                     "这是独立 MCP 工具，直接传参调用，不要走 platform.function。"
                 ),
-                "inputSchema": item["input_schema"],
+                "inputSchema": item.get("input_schema") or fallback_schema or {"type": "object", "properties": {}, "additionalProperties": False},
             }
         )
     return tools

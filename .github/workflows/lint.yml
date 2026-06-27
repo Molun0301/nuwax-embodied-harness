@@ -1,0 +1,52 @@
+name: lint
+
+# 平台分层守门 + Py3.8.10 兼容 + fixture 不入仓。
+# 与 openspec/changes/navigation-and-exploration-boundary/specs/ci-guardrails/spec.md 对齐。
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+
+jobs:
+  guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # (a) 分层守门：services 顶层禁 import drivers。
+      # 注意：services/geometry/ros2_ws/src/ 下历来就是 ROS 节点（frontier_explorer.py 等），
+      # 该子目录不在本 change 守门范围（既有架构约束）。
+      - name: 分层守门 — services 顶层禁 import drivers
+        run: |
+          set +e
+          # 只扫 services 顶层 + services/navigation，避开 services/geometry/ros2_ws/ 历史 ROS 节点
+          ! grep -rE "from drivers\.|import drivers\." services/geometry/*.py services/navigation/*.py services/geometry/__init__.py services/navigation/__init__.py
+          rc1=$?
+          # 新增的 nav2_action_proxy 独立进程在 services/navigation/，但仍允许 rclpy（独立 cyclonedds 进程）
+          # 禁：services/geometry/ 顶层 platform 侧直订 Nav2 action
+          # 既有基线 nav2_action_provider.py 是历史 rclpy.action 实现，本 change 的 ADR-1 决策是
+          # 用独立 nav2_action_proxy.py 进程替换（不在本 PR 范围），故保留它仅作历史兼容，不拦截。
+          # 拦截范围：本 change 新增的 navigation_proxy_client.py + gateways/*.py
+          ! grep -rE "(^| )from rclpy\.action|^(import rclpy\.action)" services/geometry/navigation_proxy_client.py gateways/*.py 2>/dev/null
+          rc2=$?
+          if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ]; then
+            echo "分层守门失败：services 顶层禁 import drivers / rclpy 直订 Nav2 action"
+            exit 1
+          fi
+
+      # (b) PEP 604 union ast 检测
+      # 只扫本 change 新增 + 顶层 platform 代码；避开 services/geometry/ros2_ws/ 历史 ROS 节点
+      - name: PEP 604 union 检测（实机 Py3.8.10 兼容）
+        run: python3 scripts/ci/check_pep604.py services/geometry/__init__.py services/geometry/loop_closure_state.py services/geometry/navigation_proxy_client.py services/navigation services/geometry/runtime.py services/geometry/external_debug_observer.py gateways
+
+      # (c) fixture / mock / integration 测试文件不入仓
+      - name: 测试文件不入仓
+        run: |
+          if git ls-files tests/fixtures/ tests/mocks/ tests/integration/ 2>/dev/null | grep -q .; then
+            echo "测试文件入仓拦截：tests/fixtures/ + tests/mocks/ + tests/integration/ 应在 .gitignore 中"
+            git ls-files tests/fixtures/ tests/mocks/ tests/integration/
+            exit 1
+          fi

@@ -5096,5 +5096,20 @@ button{font-family:inherit;cursor:pointer}
     })();
   </script>
   <script type="module" src="/static/js/pointcloud3d.js"></script>
+  <!-- V2 navigation-and-exploration-boundary §9.3：容器 + 拆模块 script 引用（不堆业务） -->
+  <div id="navigation-container" data-role="v2-navigation" style="display:none">
+    <span data-role="nav-status">未选点</span>
+    <button data-role="nav-submit">导航到选点</button>
+    <button data-role="nav-cancel">取消导航</button>
+    <pre data-role="nav-detail"></pre>
+  </div>
+  <div id="boundary-draw-container" data-role="v2-boundary" style="display:none">
+    <button data-role="boundary-toggle">开始划线</button>
+    <button data-role="boundary-submit">提交探索范围</button>
+    <button data-role="boundary-clear">清空</button>
+    <ul data-role="boundary-list"></ul>
+  </div>
+  <script src="/static/js/navigation.js"></script>
+  <script src="/static/js/boundary_draw.js"></script>
 </body>
 </html>

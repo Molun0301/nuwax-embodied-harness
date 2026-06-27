@@ -4946,6 +4946,8 @@ button{font-family:inherit;cursor:pointer}
         if (isMapToolActive()) event.preventDefault();
       });
       els.mapCanvas.addEventListener("pointerdown", (event) => {
+        // V2 boundary/navigation 模式：把事件让给 SVG overlay，canvas 主循环不参与。
+        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
         if (!isMap3dVisible() && event.button === 0 && !isMapToolActive()) {
           const pointer = canvasPointer(event);
           const hit = hitTestSemanticMarkers(pointer.x, pointer.y);
@@ -5000,6 +5002,7 @@ button{font-family:inherit;cursor:pointer}
         requestMapDraw(false);
       });
       els.mapCanvas.addEventListener("pointermove", (event) => {
+        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
         if (state.mapPanDrag) {
           const pointer = canvasPointer(event);
           const anchor = cameraAnchor();
@@ -5029,6 +5032,7 @@ button{font-family:inherit;cursor:pointer}
         requestMapDraw(false);
       });
       els.mapCanvas.addEventListener("pointerup", (event) => {
+        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
         if (state.mapPanDrag) {
           finishMapPan(event);
           return;
@@ -5044,6 +5048,7 @@ button{font-family:inherit;cursor:pointer}
         finishGoalPick(event);
       });
       els.mapCanvas.addEventListener("pointercancel", (event) => {
+        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
         if (state.mapPanDrag) {
           finishMapPan(event);
           return;
@@ -5068,6 +5073,26 @@ button{font-family:inherit;cursor:pointer}
         }
         setMapZoom(state.mapZoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12));
       }, { passive: false });
+      // V2 navigation-and-exploration-boundary §9.3 全局钩子：
+      // boundary_draw.js / navigation.js 拆模块需要从屏幕坐标拿世界坐标，
+      // canvasToMap / canvasPointer / cameraAnchor 是 IIFE 闭包私有的，必须挂 window。
+      window.__nuwaxMapUnproject = function (screenX, screenY) {
+        if (!els.mapCanvas) return null;
+        const fakeEv = { clientX: Number(screenX), clientY: Number(screenY) };
+        const pointer = canvasPointer(fakeEv);
+        const anchor = cameraAnchor();
+        const world = canvasToMap(pointer.x, pointer.y, anchor);
+        if (!world) return null;
+        return { x: world.x, y: world.y, frame_id: 'map' };
+      };
+      // 选点回调：navigation.js 会在启动时 monkey-patch 此函数缓存点击坐标。
+      // 这里默认 no-op；publish-point 走的是 isMapToolActive() 的现有 publishPoint 流程。
+      window.__nuwaxMapClick = window.__nuwaxMapClick || null;
+      // V2 模块互斥开关：boundary_draw.js / navigation.js 在激活时会置 true，
+      // 主循环的 pointerdown/pointermove/pointerup 入口据此提前 return 让事件落到 SVG overlay。
+      window.__nuwaxMapToolV2 = {
+        active: function () { return Boolean(window.__nuwaxBoundaryActive || window.__nuwaxNavigationActive); },
+      };
       els.logLevelFilter.addEventListener("change", () => {
         state.logFilter = els.logLevelFilter.value;
         renderLogs();

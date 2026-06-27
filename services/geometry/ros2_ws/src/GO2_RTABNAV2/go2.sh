@@ -6,6 +6,7 @@
 #   ./go2.sh --mapping-only [map.db]   # SLAM only, faster (no Nav2 / obstacle_grid)
 #   ./go2.sh --localization <map.db>   # Load map, localize only, Nav2 (db required, read-only source)
 #   ./go2.sh --explore [map.db]        # SLAM + Nav2 + m-explore (default: ~/.ros/rtabmap.db)
+#   ./go2.sh --explore --boundary <p>  # V2: 手划范围 JSON 文件，frontier_explorer 加载 keepout mask
 #   ./go2.sh --fresh --mapping         # Force restart_map:=true (new SLAM session)
 #
 # Environment overrides (optional):
@@ -84,6 +85,16 @@ while [[ $# -gt 0 ]]; do
         shift
       fi
       ;;
+    --boundary)
+      # V2 navigation-and-exploration-boundary §8.1：手划探索范围 JSON 文件路径。
+      # --explore 模式下读 /tmp/go2_boundary.json，frontier_explorer 加载 polygon keepout mask。
+      shift
+      if [[ $# -lt 1 ]]; then
+        die "--boundary requires a JSON file path"
+      fi
+      BOUNDARY_FILE="$1"
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -95,6 +106,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$MODE" ]] || die "missing mode: --mapping | --mapping-only | --localization | --explore"
+
+# V2：boundary 文件缺省指向 platform 写入路径（worker-C 5.3 写入 /tmp/go2_boundary.json）。
+BOUNDARY_FILE="${BOUNDARY_FILE:-/tmp/go2_boundary.json}"
+if [[ "$MODE" != "explore" ]]; then
+  warn "--boundary 仅在 --explore 模式下生效；当前 MODE=${MODE}，忽略。"
+elif [[ ! -f "$BOUNDARY_FILE" ]]; then
+  warn "boundary 文件不存在：${BOUNDARY_FILE}（忽略 --boundary，frontier_explorer 不加载 keepout mask）"
+fi
+export GO2_BOUNDARY_FILE="${BOUNDARY_FILE}"
 
 if [[ "$MODE" == "localization" ]]; then
   [[ -n "$DB_ARG" ]] || die "--localization requires a database path"
@@ -367,6 +387,12 @@ launch_stack() {
   if [[ "${GO2_USE_RVIZ:-1}" == "0" ]]; then
     args+=("use_rviz:=false")
     echo "==> RViz disabled (GO2_USE_RVIZ=0)"
+  fi
+
+  # V2：boundary 文件路径传给 frontier_explorer（仅 --explore 模式生效）。
+  if [[ "$launch_file" == "explore_go2.launch.py" ]]; then
+    args+=("boundary_file:=${GO2_BOUNDARY_FILE:-/tmp/go2_boundary.json}")
+    echo "==> Boundary file: ${GO2_BOUNDARY_FILE:-/tmp/go2_boundary.json}"
   fi
 
   echo "==> Mode: ${MODE}"

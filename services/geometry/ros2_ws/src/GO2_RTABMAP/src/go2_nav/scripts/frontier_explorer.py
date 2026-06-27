@@ -33,6 +33,8 @@ import math
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+import json
+import os
 
 import numpy as np
 import rclpy
@@ -124,6 +126,13 @@ class FrontierExplorer(Node):
         # forever with active_goal_handle != None. After this timeout we
         # cancel, blacklist the goal, and try a new frontier.
         self.declare_parameter('goal_timeout', 60.0)
+        # V2 navigation-and-exploration-boundary §8.2：手划范围 JSON 文件路径；
+        # --explore --boundary /tmp/go2_boundary.json 注入；frontier 检测跳过 polygon 外的 cell。
+        self.declare_parameter('boundary_file', '/tmp/go2_boundary.json')
+        self.declare_parameter('boundary_keepout_enabled', True)
+        # 内部状态：costmap keepout mask polygon（world 坐标 List[Tuple[float, float]]）。
+        self._boundary_polygon: List[Tuple[float, float]] = []
+        self._boundary_polygon_mtime: Optional[float] = None
         # Ignore frontier goals closer than this (m). Prevents picking a goal the
         # robot is already beside, which Nav2 immediately marks as succeeded.
         self.declare_parameter('min_travel_m', 0.5)
@@ -662,7 +671,113 @@ class FrontierExplorer(Node):
         )
         return True
 
+    # ------------------------------------------------------------------
+    # V2 navigation-and-exploration-boundary §8.2：boundary keepout mask
+    # ------------------------------------------------------------------
+    def _reload_boundary_polygon_if_changed(self) -> None:
+        """按文件 mtime 增量加载 boundary JSON。
+
+        JSON 格式与 _compute_boundary_polygon 输出一致：
+        ``{"polygon": [{"x": ..., "y": ...}, ...]}``。
+        缺文件/解析失败时保留上一次成功加载结果（避免热重启期间误清空）。
+        """
+        if not bool(self.get_parameter('boundary_keepout_enabled').value):
+            return
+        path = str(self.get_parameter('boundary_file').value or '').strip()
+        if not path:
+            return
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        if self._boundary_polygon_mtime is not None and st.st_mtime <= self._boundary_polygon_mtime:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as fp:
+                payload = json.load(fp)
+        except (OSError, ValueError) as exc:
+            self.get_logger().warn(
+                f'boundary file unreadable, keep previous polygon: {exc}',
+                throttle_duration_sec=10.0,
+            )
+            return
+        poly_raw = payload.get('polygon') if isinstance(payload, dict) else None
+        if not isinstance(poly_raw, list) or len(poly_raw) < 3:
+            self.get_logger().warn(
+                'boundary polygon invalid (need >= 3 vertices), keep previous',
+                throttle_duration_sec=10.0,
+            )
+            return
+        poly: List[Tuple[float, float]] = []
+        for item in poly_raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                poly.append((float(item['x']), float(item['y'])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if len(poly) < 3:
+            return
+        self._boundary_polygon = poly
+        self._boundary_polygon_mtime = st.st_mtime
+        self.get_logger().info(
+            f'boundary keepout polygon loaded: {len(poly)} verts from {path}',
+        )
+
+    def _point_in_keepout(self, x: float, y: float) -> bool:
+        """射线法判断 (x, y) 是否在 boundary polygon 内。
+
+        V2 spec exploration-boundary §方向无关性 中点法向量 ±90° 合并后 polygon 应为闭合凸/凹形；
+        此处用标准 ray-casting。空 polygon 视为无限制。
+        """
+        poly = self._boundary_polygon
+        if not poly:
+            return True
+        inside = False
+        n = len(poly)
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > y) != (yj > y)) and (
+                x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
+            ):
+                inside = not inside
+            j = i
+        return inside
+
+    def _filter_clusters_by_boundary(
+        self, clusters: List[FrontierCluster],
+    ) -> List[FrontierCluster]:
+        """跳过 boundary polygon 外的 frontier cluster。
+
+        任一 cell 落在 polygon 内即保留；全在 polygon 外才丢弃。
+        空 polygon / keepout 未启用 → 原样返回。
+        """
+        if not self._boundary_polygon or not bool(
+            self.get_parameter('boundary_keepout_enabled').value,
+        ):
+            return clusters
+        kept: List[FrontierCluster] = []
+        for cluster in clusters:
+            try:
+                cells = cluster.cells  # type: ignore[attr-defined]
+            except AttributeError:
+                kept.append(cluster)
+                continue
+            retain = False
+            for cell in cells:
+                cx, cy = cell
+                if self._point_in_keepout(float(cx), float(cy)):
+                    retain = True
+                    break
+            if retain:
+                kept.append(cluster)
+        return kept
+
     def tick(self):
+        # V2 navigation-and-exploration-boundary §8.2：每次 tick 增量加载 boundary 文件。
+        self._reload_boundary_polygon_if_changed()
         if self.exploration_done:
             # 探索结束：停止派点，但保持本节点进程存活，避免 ros2 launch/go2.sh 随子进程退出。
             # RTAB-Map/Nav2 仅由平台 stop_mapping 统一结束。
@@ -777,6 +892,16 @@ class FrontierExplorer(Node):
 
         # 2) Frontier detection
         all_clusters = self.find_frontier_clusters(self.latest_map)
+        # V2 §8.2：boundary keepout mask — 跳过 polygon 外的 cluster。
+        if all_clusters and self._boundary_polygon:
+            before_count = len(all_clusters)
+            all_clusters = self._filter_clusters_by_boundary(all_clusters)
+            skipped = before_count - len(all_clusters)
+            if skipped > 0:
+                self.get_logger().info(
+                    f'boundary keepout: skipped {skipped}/{before_count} frontier clusters outside polygon',
+                    throttle_duration_sec=5.0,
+                )
         if not all_clusters:
             self.publish_markers(status='NO FRONTIERS')
             self.get_logger().info('No frontiers found. Exploration COMPLETE.')

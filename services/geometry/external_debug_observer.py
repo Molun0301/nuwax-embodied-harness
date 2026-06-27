@@ -121,12 +121,69 @@ class ExternalGeometryDebugObserver:
         self._explore_status_done = False
 
     def set_session_mode(self, mode: Optional[str]) -> None:
-        """平台会话模式：仅 explore 时向前端投递前沿几何。"""
+        """平台会话模式：仅 explore 时向前端投递前沿几何。
+
+        commit 1 §1.3：``normalized != "explore"`` 时 MUST 调用
+        ``reset_loop_closure_state()``，清零上一会话闭环检测缓存。
+        commit 1 §1.4：早返回路径（with 锁内立即清零） MUST 把
+        ``_explore_status_done`` 置零，避免上一会话 explore/status 终态
+        信号串味到当前会话。
+        commit 3a §3.1：``localization`` 模式进入时 MUST 把
+        ``_pose_map_unchanged_count`` 置零，避免上一会话冻结计数把当前
+        /go2/pose_map 首帧误判为"持续未变"并触发外推（commit 3b cherry-pick
+        触发条件：实机 ``ros2 topic hz /tf`` < 0.5Hz 且 HIL 步骤 6 报
+        ExtrapolationError）。
+        """
         normalized = str(mode or "").strip().lower() or None
         with self._lock:
+            # 早返回路径（commit 1 §1.4）：session 切换时立即清零
+            # explore/status 终态信号，避免上一会话缓存串味。
+            self._explore_status_done = False
             self._session_mode = normalized
             if normalized not in _SESSION_FRONTIER_MODES:
                 self._reset_frontier_state_locked()
+            if normalized == "localization":
+                # commit 3a：localization 会话切换时清空 pose_map 冻结计数器
+                self._pose_map_unchanged_count = 0
+            if normalized != "explore":
+                # commit 1 §1.3：切换到非 explore 模式（含 localization/
+                # mapping/None）时 MUST 重置闭环检测状态，避免上一会话
+                # 缓存串味到当前会话。与 reset_loop_closure_state 公开契约对齐。
+                self.reset_loop_closure_state()
+
+    def get_current_session_mode(self) -> Optional[str]:
+        """commit 2 §2.6 新增：公开只读方法，返回当前 session_mode 字符串副本。
+
+        供 runtime 层幂等校验使用（如 start_platform_exploration /
+        start_external_mapping），调用方据此判断是否需要再次触发 reset 副作用。
+        返回值与 set_session_mode 写入的 ``normalized`` 完全一致（含 None
+        表示从未设置）。锁内读 + 返回基础类型（str/None），线程安全。
+        """
+
+        with self._lock:
+            return self._session_mode
+
+    def emit_initial_heartbeat(self) -> None:
+        """commit 2 §2.7 新增：心跳代理——通过 self._map_stream.emit_initial_heartbeat()
+        触发 mapping service 的初始心跳帧，顶掉前端 SSE 滞留的 cleared 信号。
+
+        若 _map_stream 不可用或方法缺失，捕获异常并 DEBUG 日志后跳过——不阻塞 observer 启动。
+        同步等待 mapping service 写完初始心跳再返回，调用方可保证后续 SSE 推送
+        看到 ``live_streaming_ready=True`` 帧。
+        """
+
+        map_stream = getattr(self, "_map_stream", None)
+        if map_stream is None:
+            LOGGER.debug("emit_initial_heartbeat 跳过：observer 未持有 _map_stream 引用。")
+            return
+        heartbeat = getattr(map_stream, "emit_initial_heartbeat", None)
+        if heartbeat is None or not callable(heartbeat):
+            LOGGER.debug("emit_initial_heartbeat 跳过：_map_stream 未实现 emit_initial_heartbeat 方法。")
+            return
+        try:
+            heartbeat()
+        except Exception:
+            LOGGER.debug("emit_initial_heartbeat 调用失败。", exc_info=True)
 
     def reset_frontier_state(self) -> None:
         with self._lock:
@@ -174,9 +231,19 @@ class ExternalGeometryDebugObserver:
             return list(self._latest_boundary_polygon)
 
     def reset_loop_closure_state(self) -> None:
-        """重置闭环状态（探索会话开始时调用，避免缓存串味）。
+        """重置闭环检测缓存（会话边界专用）。
 
-        与 spec exploration-completion-criteria "reset 同步" 场景对齐。
+        must be called at session boundary events (saved_map_activate /
+        explore_start / mapping_start)。其它调用视为 bug。
+
+        调用方契约（spec 运行时核心 §外部公开入口）：
+        - 仅允许在 session 边界事件入口调用；
+        - 其它调用视为 bug，CI 守门 ``scripts/ci/check_reset_call_site.py``
+          会扫描所有调用点，命中非白名单函数名即 fail。
+
+        实现：清零 ``_loop_closure_state_buffer`` + ``_explore_status_done``
+        + ``_last_loop_closure_emit_monotonic`` +
+        ``_last_loop_closure_observed_count`` + ``_latest_boundary_polygon``。
         """
 
         threshold = self._resolve_loop_closure_threshold()

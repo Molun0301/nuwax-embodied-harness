@@ -1,0 +1,33 @@
+# ruff 配置（commit 1 §1.6：extend-select 注册 NUX001 自定义规则）
+#
+# NUX001 = reset_loop_closure_state 必须在 session 边界白名单内调用。
+# 配套守门：
+# - scripts/ci/check_reset_call_site.py（AST 解析入口，CI 强制执行）
+# - services/geometry/external_debug_observer.py::reset_loop_closure_state docstring 硬契约
+#
+# NUX 前缀 = Nuwax Robot Bridge 自定义规则（项目约定，避免与 ruff 内置规则冲突）。
+# 新增 NUX00x 时仅需追加到 extend-select 列表即可。
+
+# 扫描目标：与 check_reset_call_site.py 一致
+target-version = "py38"
+line-length = 120
+
+# 自定义规则注册（NUX = Nuwax Robot Bridge）
+extend-select = [
+    "NUX001",  # reset_loop_closure_state 调用点必须在 session 边界白名单
+]
+
+[lint.flake8-quotes]
+inline-quotes = "double"
+docstring-quotes = "double"
+
+[lint.pydocstyle]
+convention = "google"
+
+# 排除不参与 lint 的目录（与 .gitignore tests/ 屏蔽对齐）
+extend-exclude = [
+    "tests",
+    ".venv_model_download",
+    "build",
+    "dist",
+]

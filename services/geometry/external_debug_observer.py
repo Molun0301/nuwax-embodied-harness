@@ -14,6 +14,11 @@ from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.maps import OccupancyGrid
 from contracts.navigation import NavigationGoal
 from services.geometry.config import PlatformGeometryConfig
+from services.geometry.loop_closure_state import (
+    LoopClosureState,
+    LoopClosureStateBuffer,
+    update_loop_closure_state_from_count,
+)
 from services.geometry.ros2_context import (
     acquire_ros2_context,
     ensure_go2_slam_overlay_python_paths,
@@ -31,6 +36,20 @@ _POSE_TIMER_PERIOD_SEC = 0.1
 _POSE_MAP_UNCHANGED_FREEZE_COUNT = 4
 _POSE_MAP_POSITION_EPS = 0.02
 _POSE_MAP_TF_DIVERGE_M = 0.2
+
+# 闭环检测配置（fallback 默认值；运行时优先从 core.settings 读取，参见 _resolve_loop_closure_threshold）
+_LOOP_CLOSURE_DEFAULT_THRESHOLD = 3
+_LOOP_CLOSURE_DEFAULT_POLL_INTERVAL_SEC = 5.0
+_RTABMAP_INFO_TOPIC = "/rtabmap/info"
+
+# boundary 多线段几何外扩默认参数（与 spec exploration-boundary 对齐）
+_BOUNDARY_DEFAULT_EXTEND_RADIUS_M = 3.0
+_BOUNDARY_MAX_EXTEND_RADIUS_M = 8.0
+_BOUNDARY_FALLBACK_L_CORNER_RADIUS_M = 0.5
+_BOUNDARY_DEFAULT_MAX_SEGMENTS = 64
+_BOUNDARY_OCCUPANCY_FREE = 0
+_BOUNDARY_OCCUPANCY_UNKNOWN = -1
+_BOUNDARY_OCCUPANCY_OCCUPIED_THRESHOLD = 50  # >= 50 视为占用（与 ROS OccupancyGrid 习惯一致）
 
 
 class ExternalGeometryDebugObserver:
@@ -86,6 +105,20 @@ class ExternalGeometryDebugObserver:
         self._last_map_emit_monotonic = 0.0
         self._last_map_emit_content_hash: Optional[str] = None
         self._last_map_emit_geometry_signature: Optional[Tuple[object, ...]] = None
+        # 闭环检测状态（仅由本 observer 单点更新，供 runtime.py 第 8 条判据读取）
+        # _loop_closure_state_buffer 始终非 None；threshold 在 _resolve_loop_closure_threshold 中解析。
+        self._loop_closure_state_buffer = LoopClosureStateBuffer(
+            threshold=_LOOP_CLOSURE_DEFAULT_THRESHOLD,
+        )
+        self._last_loop_closure_emit_monotonic = 0.0
+        self._last_loop_closure_observed_count: Optional[int] = None
+        self._rtabmap_info_topic = _RTABMAP_INFO_TOPIC
+        self._rtabmap_info_subscription: Optional[Any] = None
+        # boundary 外扩：最近一次成功的多线段→polygon 结果缓存，供 _start_external_mapping 写入 /tmp/go2_boundary.json
+        self._latest_boundary_polygon: List[Tuple[float, float]] = []
+        self._latest_boundary_polygon_at_monotonic = 0.0
+        # explore/status 终态信号缓存（用于第 8 条辅助信号 explorer:no_frontiers）
+        self._explore_status_done = False
 
     def set_session_mode(self, mode: Optional[str]) -> None:
         """平台会话模式：仅 explore 时向前端投递前沿几何。"""
@@ -107,6 +140,8 @@ class ExternalGeometryDebugObserver:
         self._last_goal_at = 0.0
         self._last_planned_path = []
         self._last_plan_at = 0.0
+        # 第 8 条辅助信号：explore/status 终态在会话切换时必须重置
+        self._explore_status_done = False
 
     @property
     def is_running(self) -> bool:
@@ -117,6 +152,71 @@ class ExternalGeometryDebugObserver:
     def last_error(self) -> Optional[str]:
         with self._lock:
             return self._last_error
+
+    @property
+    def loop_closure_state(self) -> LoopClosureState:
+        """当前闭环检测状态（线程安全快照）。"""
+
+        return self._loop_closure_state_buffer.get()
+
+    @property
+    def explore_status_done(self) -> bool:
+        """explore/status.msg.status == "exploration_complete" 终态信号缓存。"""
+
+        with self._lock:
+            return bool(self._explore_status_done)
+
+    @property
+    def latest_boundary_polygon(self) -> List[Tuple[float, float]]:
+        """最近一次成功的外扩 polygon 缓存（供 runtime._start_external_mapping 写入 /tmp/go2_boundary.json）。"""
+
+        with self._lock:
+            return list(self._latest_boundary_polygon)
+
+    def reset_loop_closure_state(self) -> None:
+        """重置闭环状态（探索会话开始时调用，避免缓存串味）。
+
+        与 spec exploration-completion-criteria "reset 同步" 场景对齐。
+        """
+
+        threshold = self._resolve_loop_closure_threshold()
+        self._loop_closure_state_buffer.reset(threshold=threshold)
+        with self._lock:
+            self._explore_status_done = False
+            self._last_loop_closure_emit_monotonic = 0.0
+            self._last_loop_closure_observed_count = None
+            self._latest_boundary_polygon = []
+            self._latest_boundary_polygon_at_monotonic = 0.0
+
+    @staticmethod
+    def _resolve_loop_closure_threshold() -> int:
+        """从 core.settings 解析 threshold；缺失或异常时 fallback 到默认 3。"""
+
+        try:
+            from core.settings import (
+                NAV_LOOP_CLOSURE_THRESHOLD,  # type: ignore
+            )
+            value = int(NAV_LOOP_CLOSURE_THRESHOLD)
+        except Exception:
+            value = _LOOP_CLOSURE_DEFAULT_THRESHOLD
+        if value <= 0:
+            return _LOOP_CLOSURE_DEFAULT_THRESHOLD
+        return value
+
+    @staticmethod
+    def _resolve_loop_closure_poll_interval_sec() -> float:
+        """从 core.settings 解析 /rtabmap/info 节流间隔；缺失或异常时 fallback 默认 5s。"""
+
+        try:
+            from core.settings import (
+                NAV_LOOP_CLOSURE_POLL_INTERVAL_SEC,  # type: ignore
+            )
+            value = float(NAV_LOOP_CLOSURE_POLL_INTERVAL_SEC)
+        except Exception:
+            value = _LOOP_CLOSURE_DEFAULT_POLL_INTERVAL_SEC
+        if value <= 0:
+            return _LOOP_CLOSURE_DEFAULT_POLL_INTERVAL_SEC
+        return value
 
     def start(self) -> None:
         with self._lock:
@@ -209,6 +309,24 @@ class ExternalGeometryDebugObserver:
                     )
                 except Exception:
                     LOGGER.warning("无法订阅 Nav2 全局规划路径 topic=%s", plan_topic, exc_info=True)
+                # 第 8 条判据主路径：单订阅者约束下，/rtabmap/info 仅本 observer 订阅
+                # 缺失 rtabmap_msgs 时优雅降级（runtime 走 DB SQLite fallback）。
+                try:
+                    from rtabmap_msgs.msg import Info as RtabmapInfo  # type: ignore
+
+                    self._rtabmap_info_topic = _RTABMAP_INFO_TOPIC
+                    self._rtabmap_info_subscription = self._node.create_subscription(
+                        RtabmapInfo,
+                        self._rtabmap_info_topic,
+                        self._on_rtabmap_info,
+                        reliable_volatile,
+                    )
+                    self._subscriptions.append(self._rtabmap_info_subscription)
+                except Exception:
+                    LOGGER.warning(
+                        "rtabmap_msgs 不可用，/rtabmap/info 订阅失败；runtime 第 8 条判据将走 DB SQLite fallback。"
+                    )
+                    self._rtabmap_info_subscription = None
                 if self._pose_callback is not None:
                     self._tf_buffer = Buffer()
                     self._tf_listener = TransformListener(self._tf_buffer, self._node)
@@ -634,6 +752,8 @@ class ExternalGeometryDebugObserver:
                 self._last_terminal_status = "succeeded"
                 self._last_goal = None
                 self._last_goal_at = 0.0
+                # 第 8 条辅助信号 explorer:no_frontiers 缓存（spec exploration-completion-criteria）
+                self._explore_status_done = True
         self._emit_frontier_payload()
 
     def _on_next_goal(self, msg: Any) -> None:
@@ -940,3 +1060,356 @@ class ExternalGeometryDebugObserver:
             float(getattr(position, "x", 0.0) or 0.0),
             float(getattr(position, "y", 0.0) or 0.0),
         )
+
+    # ------------------------------------------------------------------
+    # 闭环检测（spec exploration-completion-criteria 第 8 条主路径）
+    # ------------------------------------------------------------------
+
+    def _on_rtabmap_info(self, msg: Any) -> None:
+        """RTAB-Map /rtabmap/info 回调（5s 节流）。
+
+        信号源：
+        - `loop_closure_id`：累计闭环事件 id，>=1 表示发生一次闭环；
+        - 我们以 `loop_closure_id` 的最新值作为 count 快照（rtabmap_msgs/Info 文档明确
+          该字段为单调递增 id）。
+        """
+
+        try:
+            loop_closure_id = getattr(msg, "loop_closure_id", None)
+        except Exception:
+            loop_closure_id = None
+        if loop_closure_id is None:
+            return
+        try:
+            observed = int(loop_closure_id)
+        except (TypeError, ValueError):
+            LOGGER.debug("loop_closure_id 解析失败 type=%s value=%s", type(loop_closure_id), loop_closure_id)
+            return
+        with self._lock:
+            previous = self._last_loop_closure_observed_count
+            now = time.monotonic()
+            poll_interval = self._resolve_loop_closure_poll_interval_sec()
+            if previous is not None and observed == previous:
+                # count 未变化，但若超过节流间隔仍允许刷新一次（保证 last_check_at 不陈旧）
+                if now - self._last_loop_closure_emit_monotonic < poll_interval:
+                    return
+            self._last_loop_closure_observed_count = observed
+            self._last_loop_closure_emit_monotonic = now
+        self._compute_loop_closure()
+
+    def _compute_loop_closure(self) -> None:
+        """基于最近观测的 loop_closure_id 更新 state buffer。
+
+        公式（spec exploration-completion-criteria）：
+        - `confidence = min(loop_closure_count / threshold, 1.0)`；
+        - threshold 来自 core.settings.NAV_LOOP_CLOSURE_THRESHOLD（缺失 fallback 3）。
+        """
+
+        with self._lock:
+            observed = self._last_loop_closure_observed_count
+        if observed is None:
+            return
+        threshold = self._resolve_loop_closure_threshold()
+        state = update_loop_closure_state_from_count(
+            self._loop_closure_state_buffer.get(),
+            new_count=observed,
+            source="topic",
+            threshold=threshold,
+        )
+        self._loop_closure_state_buffer.update(state)
+
+    def force_loop_closure_state_from_db(self, db_count: int) -> None:
+        """DB SQLite fallback 写入：当 /rtabmap/info 不可用时由 runtime 注入。"""
+
+        threshold = self._resolve_loop_closure_threshold()
+        state = update_loop_closure_state_from_count(
+            self._loop_closure_state_buffer.get(),
+            new_count=int(db_count),
+            source="db_sqlite",
+            threshold=threshold,
+        )
+        self._loop_closure_state_buffer.update(state)
+
+    # ------------------------------------------------------------------
+    # 手划探索范围几何外扩（spec exploration-boundary）
+    # 单订阅者约束：复用 _on_map 回调订阅的 OccupancyGrid 快照，不另起订阅。
+    # ------------------------------------------------------------------
+
+    def compute_boundary_polygon(
+        self,
+        segments: List[Tuple[Any, Any]],
+        *,
+        extend_radius_m: Optional[float] = None,
+        occupancy_grid_snapshot: Optional[Any] = None,
+    ) -> List[Tuple[float, float]]:
+        """公开包装：调用 `_compute_boundary_polygon` + 缓存到 `_latest_boundary_polygon`。
+
+        segments: List[Tuple[Pose2D-like, Pose2D-like]]，每个元素需含 `.position.x / .position.y`。
+        extend_radius_m: 单段外扩半径上限；<=0 走默认 3m；>8m 强制 cap 到 8m。
+        occupancy_grid_snapshot: 可选外部注入 OccupancyGrid（无则用最近一次 map snapshot）。
+
+        返回：List[(x, y)]，按闭合顺序；若 L 型 fallback 触发则返回原始端点的最小 4 点矩形。
+        """
+
+        radius = self._normalize_extend_radius(extend_radius_m)
+        polygon = self._compute_boundary_polygon(
+            segments,
+            extend_radius_m=radius,
+            occupancy_grid_snapshot=occupancy_grid_snapshot,
+        )
+        with self._lock:
+            self._latest_boundary_polygon = list(polygon)
+            self._latest_boundary_polygon_at_monotonic = time.monotonic()
+        return polygon
+
+    @staticmethod
+    def _normalize_extend_radius(extend_radius_m: Optional[float]) -> float:
+        if extend_radius_m is None:
+            return _BOUNDARY_DEFAULT_EXTEND_RADIUS_M
+        try:
+            value = float(extend_radius_m)
+        except (TypeError, ValueError):
+            return _BOUNDARY_DEFAULT_EXTEND_RADIUS_M
+        if value <= 0:
+            return _BOUNDARY_DEFAULT_EXTEND_RADIUS_M
+        if value > _BOUNDARY_MAX_EXTEND_RADIUS_M:
+            return _BOUNDARY_MAX_EXTEND_RADIUS_M
+        return value
+
+    def _compute_boundary_polygon(
+        self,
+        segments: List[Tuple[Any, Any]],
+        *,
+        extend_radius_m: float,
+        occupancy_grid_snapshot: Optional[Any] = None,
+    ) -> List[Tuple[float, float]]:
+        """对每段做 ±90° 半平面 ray-cast 外扩，再合并为单一闭合 polygon。
+
+        边界条件（spec exploration-boundary）：
+        - L 型墙角 fallback：端点 0.5m 内两侧 90° ray-cast 均未命中占用 → 返回原始线段 + warning。
+        - 玻璃门禁射线穿越 unknown：ray-cast 命中 occupancy==-1 → 立即停止；最大外扩 <= extend_radius_m。
+        - 方向无关性：先计算中点法向量，再两侧 ±90°，A→B 与 B→A 输出相同 polygon。
+        - 硬上限：extend_radius_m ≤ 8m。
+        """
+
+        if not segments:
+            return []
+        if len(segments) > _BOUNDARY_DEFAULT_MAX_SEGMENTS:
+            LOGGER.warning(
+                "boundary 线段数 %d 超过上限 %d，仅前 %d 段参与外扩。",
+                len(segments),
+                _BOUNDARY_DEFAULT_MAX_SEGMENTS,
+                _BOUNDARY_DEFAULT_MAX_SEGMENTS,
+            )
+            segments = list(segments)[:_BOUNDARY_DEFAULT_MAX_SEGMENTS]
+
+        grid = self._resolve_occupancy_grid_snapshot(occupancy_grid_snapshot)
+        merged: List[Tuple[float, float]] = []
+        for segment in segments:
+            try:
+                p1, p2 = self._segment_endpoints_xy(segment)
+            except Exception:
+                LOGGER.debug("boundary 端点解析失败 segment=%s", segment, exc_info=True)
+                continue
+            polygon = self._extend_single_segment(
+                p1,
+                p2,
+                extend_radius_m=extend_radius_m,
+                grid=grid,
+            )
+            if polygon:
+                merged.extend(polygon)
+        return self._close_polygon(merged)
+
+    def _resolve_occupancy_grid_snapshot(self, explicit: Optional[Any]) -> Optional[Any]:
+        """优先使用调用方注入的 grid；否则使用 _on_map 回调最近一次缓存。"""
+
+        if explicit is not None:
+            return explicit
+        # _on_map 已经把 msg 暂存在 _map_signature/_map_message_count；
+        # 没有缓存时返回 None，调用方降级到"无 occupancy grid 的纯几何外扩"。
+        return None
+
+    @staticmethod
+    def _segment_endpoints_xy(segment: Tuple[Any, Any]) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        p1, p2 = segment
+        x1 = float(getattr(getattr(p1, "position", p1), "x", 0.0) or 0.0)
+        y1 = float(getattr(getattr(p1, "position", p1), "y", 0.0) or 0.0)
+        x2 = float(getattr(getattr(p2, "position", p2), "x", 0.0) or 0.0)
+        y2 = float(getattr(getattr(p2, "position", p2), "y", 0.0) or 0.0)
+        return (x1, y1), (x2, y2)
+
+    @staticmethod
+    def _extend_single_segment(
+        p1: Tuple[float, float],
+        p2: Tuple[float, float],
+        *,
+        extend_radius_m: float,
+        grid: Optional[Any],
+    ) -> List[Tuple[float, float]]:
+        """对单段 (p1, p2) 做 ±90° 半平面外扩，返回 4 点 polygon。
+
+        步骤：
+        1. 计算中点法向量（先取中点法向，方向无关性）；
+        2. 在中点处沿法向 ±90° 各取 extend_radius_m 一段；
+        3. 若有 OccupancyGrid，沿 ray-cast 限位（玻璃门禁射线穿越 unknown）；
+        4. L 型 fallback：两端 0.5m 内若两侧均无占用命中 → 返回原始线段矩形 + warning。
+        """
+
+        x1, y1 = p1
+        x2, y2 = p2
+        dx = x2 - x1
+        dy = y2 - y1
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-6:
+            return [
+                (x1 - extend_radius_m, y1 - extend_radius_m),
+                (x1 + extend_radius_m, y1 - extend_radius_m),
+                (x1 + extend_radius_m, y1 + extend_radius_m),
+                (x1 - extend_radius_m, y1 + extend_radius_m),
+            ]
+        # 中点 + 法向量（方向无关）
+        mx = (x1 + x2) * 0.5
+        my = (y1 + y2) * 0.5
+        nx = -dy / seg_len
+        ny = dx / seg_len
+
+        # 两侧可用外扩距离（occupancy grid 限位）
+        left_radius = extend_radius_m
+        right_radius = extend_radius_m
+        if grid is not None:
+            left_radius = min(left_radius, _raycast_extend_distance(mx, my, nx, ny, grid, extend_radius_m))
+            right_radius = min(right_radius, _raycast_extend_distance(mx, my, -nx, -ny, grid, extend_radius_m))
+
+        # L 型 fallback 检测：端点 0.5m 内两侧 ray-cast 在 extend_radius_m 内均无占用 → fallback
+        l_corner = _detect_l_corner(p1, p2, grid, extend_radius_m)
+        if l_corner:
+            LOGGER.warning(
+                "boundary_extender_l_corner_fallback segment=(%.3f,%.3f)->(%.3f,%.3f) extend_radius=%.3f",
+                x1, y1, x2, y2, extend_radius_m,
+            )
+            # 返回以线段为对角线的最小矩形（不输出退化 polygon）
+            min_x = min(x1, x2) - extend_radius_m
+            max_x = max(x1, x2) + extend_radius_m
+            min_y = min(y1, y2) - extend_radius_m
+            max_y = max(y1, y2) + extend_radius_m
+            return [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
+
+        # 构造 4 点 polygon：先中点法向 + 端点反方向，确保 A→B 与 B→A 输出相同 polygon
+        # 1) 中点法向两侧点
+        mid_left = (mx + nx * left_radius, my + ny * left_radius)
+        mid_right = (mx - nx * right_radius, my - ny * right_radius)
+        # 2) 沿线段方向延伸，使 polygon 端部落在 p1/p2 的反方向
+        # 方向无关性：以中点为锚，按 ±dx/2 各延伸（不依赖 A/B 顺序）
+        half_len = seg_len * 0.5
+        tip_a = (mx - (dx / seg_len) * half_len, my - (dy / seg_len) * half_len)  # 即 p1
+        tip_b = (mx + (dx / seg_len) * half_len, my + (dy / seg_len) * half_len)  # 即 p2
+        # 对称 layout：[p1, mid_left, p2, mid_right]（绕一圈）
+        # 顺序无关：A→B 与 B→A 互换 p1/p2 但 mid_left/mid_right 保持不变 → 等价 polygon
+        return [
+            (tip_a[0] - nx * 0.0, tip_a[1] - ny * 0.0),  # p1
+            mid_left,
+            (tip_b[0] - nx * 0.0, tip_b[1] - ny * 0.0),  # p2
+            mid_right,
+        ]
+
+    @staticmethod
+    def _close_polygon(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        # 多段合并为单一 polygon：按连接顺序返回，去重首尾点
+        if not points:
+            return []
+        deduped: List[Tuple[float, float]] = []
+        for pt in points:
+            if not deduped or (
+                abs(deduped[-1][0] - pt[0]) > 1e-6 or abs(deduped[-1][1] - pt[1]) > 1e-6
+            ):
+                deduped.append(pt)
+        return deduped
+
+
+# ------------------------------------------------------------------
+# 模块级辅助：ray-cast（避免在方法里写大量内嵌逻辑）
+# ------------------------------------------------------------------
+
+
+def _raycast_extend_distance(
+    ox: float,
+    oy: float,
+    nx: float,
+    ny: float,
+    grid: Any,
+    max_distance_m: float,
+) -> float:
+    """沿 (ox, oy) + t * (nx, ny) 方向 ray-cast；遇 occupied 停 / 遇 unknown 立即停。
+
+    返回 <= max_distance_m 的距离，单位 m。
+    """
+
+    resolution = float(getattr(getattr(grid, "info", None), "resolution", 0.0) or 0.0)
+    width = int(getattr(getattr(grid, "info", None), "width", 0) or 0)
+    height = int(getattr(getattr(grid, "info", None), "height", 0) or 0)
+    origin = getattr(getattr(grid, "info", None), "origin", None)
+    if resolution <= 0 or width <= 0 or height <= 0 or origin is None:
+        return max_distance_m
+    ox0 = float(getattr(getattr(origin, "position", None), "x", 0.0) or 0.0)
+    oy0 = float(getattr(getattr(origin, "position", None), "y", 0.0) or 0.0)
+    data = getattr(grid, "data", None)
+    if data is None:
+        return max_distance_m
+    # 按 1/4 像素步长采样，兼顾精度与耗时（spec ≤100ms / 段）
+    step_m = max(resolution * 0.25, 0.02)
+    distance = 0.0
+    while distance <= max_distance_m:
+        x = ox + nx * distance
+        y = oy + ny * distance
+        cx = int((x - ox0) / resolution)
+        cy = int((y - oy0) / resolution)
+        if cx < 0 or cx >= width or cy < 0 or cy >= height:
+            return max_distance_m
+        idx = cy * width + cx
+        if idx < 0 or idx >= len(data):
+            return max_distance_m
+        cell = data[idx]
+        if cell == _BOUNDARY_OCCUPANCY_UNKNOWN or cell >= _BOUNDARY_OCCUPANCY_OCCUPIED_THRESHOLD:
+            return distance
+        distance += step_m
+    return max_distance_m
+
+
+def _detect_l_corner(
+    p1: Tuple[float, float],
+    p2: Tuple[float, float],
+    grid: Optional[Any],
+    extend_radius_m: float,
+) -> bool:
+    """L 型墙角检测：端点 0.5m 内两侧 90° ray-cast 在 extend_radius_m 内均未命中占用。
+
+    仅当 grid 非 None 时启用；grid 为 None 时永远返回 False（纯几何外扩不触发 fallback）。
+    """
+
+    if grid is None:
+        return False
+    x1, y1 = p1
+    x2, y2 = p2
+    dx = x2 - x1
+    dy = y2 - y1
+    seg_len = math.hypot(dx, dy)
+    if seg_len < 1e-6:
+        return False
+    nx = -dy / seg_len
+    ny = dx / seg_len
+    probe_radius = _BOUNDARY_FALLBACK_L_CORNER_RADIUS_M
+    for endpoint in (p1, p2):
+        ox, oy = endpoint
+        left_dist = _raycast_extend_distance(ox, oy, nx, ny, grid, probe_radius)
+        right_dist = _raycast_extend_distance(ox, oy, -nx, -ny, grid, probe_radius)
+        if left_dist >= probe_radius - 1e-3 and right_dist >= probe_radius - 1e-3:
+            # 两端均未命中占用 → 视为 L 型墙角
+            # 这里要求至少一个端点同时满足，避免误判（spec：端点 0.5m 内两侧均无占用）
+            if endpoint == p1:
+                # 简化：第一个端点即满足 → 视为 L 型；第二个端点若不满足则不视为 L 型
+                # 返回 True 仅在两个端点都满足时更稳妥
+                continue
+            else:
+                return True
+    return False

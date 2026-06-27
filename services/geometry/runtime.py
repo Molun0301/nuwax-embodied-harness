@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import json
 import logging
 import math
 import os
@@ -45,6 +46,7 @@ from providers.pointcloud import PointCloudProvider
 from services.geometry.cmd_vel_bridge import Ros2CmdVelMotionBridge
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.external_debug_observer import ExternalGeometryDebugObserver
+from services.geometry.loop_closure_state import LoopClosureState, read_loop_closure_from_db
 from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
 from services.geometry.ros_bridge_client import RosBridgeSubprocess
 from services.geometry.remote_provider import RosBridgeProvider
@@ -626,7 +628,15 @@ class PlatformGeometryRuntime:
             strategy="manual",
         )
         db_path = self._external_exploration_database_path_for_request(request)
-        return [str(self._external_script_path()), "--mapping", *passthrough_args, str(db_path)]
+        command: List[str] = [str(self._external_script_path()), "--mapping", *passthrough_args, str(db_path)]
+        # 第 5.3 task：boundary JSON 写入后由 start_external_mapping 拼接 --boundary
+        boundary_path = self._maybe_persist_boundary_for_external_command(
+            command=command,
+            session="mapping",
+        )
+        if boundary_path is not None:
+            command = [*command, "--boundary", str(boundary_path)]
+        return command
 
     def _external_exploration_database_path_for_request(self, request: Optional[ExploreAreaRequest]) -> Path:
         map_name = str(getattr(request, "map_name", "") or "").strip() if request is not None else ""
@@ -2064,12 +2074,16 @@ class PlatformGeometryRuntime:
             self._external_debug_frontier_payload = self._clone_metadata(payload)
             has_external_request = self._external_exploration_request is not None
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        if has_external_request and self._metadata_indicates_exploration_done(metadata):
+        done, reasons = self._metadata_indicates_exploration_done(metadata)
+        if has_external_request and done:
             terminal_status = str(metadata.get("terminal_status") or "succeeded").lower()
             status = ExplorationStatus.SUCCEEDED if terminal_status == "succeeded" else ExplorationStatus.FAILED
             message = "GO2_RTABNAV2 原生探索已完成。"
+            if reasons:
+                # 第 8 条：闭环 / NO FRONTIERS 信号优先体现在 message 中
+                message = "GO2_RTABNAV2 原生探索已完成：%s" % ", ".join(reasons)
             status_text = str(metadata.get("status_text") or "").strip()
-            if status_text:
+            if status_text and not reasons:
                 message = "GO2_RTABNAV2 原生探索已完成：%s" % status_text
             terminal_state = self._finish_external_script_exploration(
                 status=status,
@@ -2077,6 +2091,7 @@ class PlatformGeometryRuntime:
                 message=message,
                 notify_compat=False,
                 kill_geometry_process=False,
+                completion_reasons=reasons,
             )
         try:
             if terminal_state is not None:
@@ -4454,6 +4469,82 @@ class PlatformGeometryRuntime:
             return False
         return self._stop_platform_exploration_loop(cancel_navigation=True, notify=True)
 
+    # ------------------------------------------------------------------
+    # 导航入口（capability navigation.navigate_to_pose 调用层）
+    # ------------------------------------------------------------------
+
+    def _dispatch_navigate(
+        self,
+        pose: Optional[object] = None,
+        *,
+        goal: Optional[object] = None,
+    ) -> bool:
+        """导航请求分发入口（5.4 task）。
+
+        完整实现路径（设计文档决策 D1/D3）：
+        1. 构造 NavigationGoal 契约对象；
+        2. 走 `NavigationProxyClient` gRPC + asyncio.Lock 串行化；
+        3. PENDING 队列上限 NAV_PROXY_PENDING_QUEUE_MAX_SIZE（默认 4）；
+        4. 状态机 PENDING → ACTIVE → (SUCCEEDED | FAILED | CANCELED)；
+        5. 并发 5 次 e2e ≤ 90s（spec §几何导航）。
+
+        临时状态（worker-B 未就绪）：
+        - 当前函数体降级到 `_resolve_navigation_backend().set_goal(goal)`；
+        - 等 worker-B 完成 `services/geometry/navigation_proxy_client.py` 后，
+          在此处替换为 gRPC client 串行锁调用；
+        - TODO:nav2_proxy_client_not_ready。
+
+        返回：
+        - True: 已接收（同步路径）/ 已入队（异步路径）；
+        - False: 几何 profile 关闭 / backend 未绑定 / 入参非法。
+        """
+
+        # TODO:nav2_proxy_client_not_ready —— worker-B 的
+        # services/geometry/navigation_proxy_client.py 完成前，此处保留为占位：
+        # 仍然调用现有 backend（Nav2ActionNavigationProvider）以保持功能不中断；
+        # worker-B 落地后切换到 NavigationProxyClient.submit() + asyncio.Lock。
+        from contracts.navigation import NavigationGoal, NavigationStatus
+
+        if not self._is_geometry_profile_enabled():
+            return False
+        backend = self._resolve_navigation_backend()
+        if backend is None:
+            LOGGER.warning(
+                "_dispatch_navigate backend_unavailable pose=%s",
+                getattr(pose, "frame_id", None),
+            )
+            return False
+
+        target_pose = None
+        if goal is not None and hasattr(goal, "target_pose"):
+            target_pose = getattr(goal, "target_pose", None)
+        elif pose is not None and hasattr(pose, "position"):
+            target_pose = pose
+
+        goal_id = ""
+        if goal is not None:
+            goal_id = str(getattr(goal, "goal_id", "") or "")
+        if not goal_id:
+            goal_id = "dispatch_navigate:%d" % int(time.time() * 1000)
+
+        navigation_goal = NavigationGoal(
+            goal_id=goal_id,
+            target_pose=target_pose,
+            metadata={
+                "dispatch_source": "_dispatch_navigate",
+                "proxy_backend_pending": True,  # TODO:nav2_proxy_client_not_ready
+            },
+        )
+        try:
+            return bool(backend.set_goal(navigation_goal))
+        except Exception:
+            LOGGER.warning(
+                "_dispatch_navigate backend.set_goal 异常 goal_id=%s",
+                goal_id,
+                exc_info=True,
+            )
+            return False
+
     def sync_platform_exploration_after_task(self) -> bool:
         """探索任务收尾：自然完成时仅同步状态，不取消 Nav2、不杀 go2.sh。"""
 
@@ -4533,6 +4624,11 @@ class PlatformGeometryRuntime:
             self._exploration_last_tick_at_iso = None
             self._exploration_last_tick_monotonic = None
             self._exploration_last_tick_source = "external_script_start"
+        # 第 8 条判据 reset 同步（spec exploration-completion-criteria "reset 同步"）：
+        # 探索会话切换时必须 reset loop_closure_state + explore_status_done +
+        # external_exploration_terminal_state，避免上一会话缓存串味。
+        self._reset_exploration_completion_state()
+        self._on_external_geometry_session_mode_changed("explore")
         self._on_external_geometry_session_mode_changed("explore")
         if current_process is not None:
             self._managed_processes.pop(process_name, None)
@@ -4608,6 +4704,7 @@ class PlatformGeometryRuntime:
         notify_compat: bool,
         process_status: Optional[Dict[str, object]] = None,
         kill_geometry_process: bool = False,
+        completion_reasons: Optional[List[str]] = None,
     ) -> ExplorationState:
         process_name = self._external_process_name()
         process = self._managed_processes.get(process_name)
@@ -4631,6 +4728,12 @@ class PlatformGeometryRuntime:
         metadata["exploration_terminal"] = True
         metadata["terminal_status"] = str(getattr(status, "value", status) or "succeeded")
         metadata["status_text"] = self._terminal_explorer_status_text(str(reason or ""), message)
+        # 第 8 条判据新增：reasons 命名空间前缀（spec exploration-completion-criteria）
+        # 仅当显式传入 completion_reasons 时覆盖；旧调用点不传则留空 list，保留兼容。
+        if completion_reasons is not None:
+            metadata["reasons"] = list(completion_reasons)
+        else:
+            metadata.setdefault("reasons", [])
         metadata.pop("waiting_for", None)
         metadata.pop("waiting_detail", None)
         if not kill_geometry_process and self._external_geometry_stack_is_running():
@@ -5363,22 +5466,213 @@ class PlatformGeometryRuntime:
         }
         return metadata, frontier_count
 
-    @staticmethod
-    def _metadata_indicates_exploration_done(metadata: Dict[str, object]) -> bool:
+    def _metadata_indicates_exploration_done(
+        self, metadata: Dict[str, object]
+    ) -> tuple[bool, List[str]]:
+        """判断探索任务是否已结束，并返回 reasons 命名空间前缀列表。
+
+        原 7 条判据路径（marker DONE / explore.status exploration_complete /
+        max_duration_sec / external_process_completed / external_process_exited /
+        日志扫描 / stop_mapping / hit_stop / manual_cancel） MUST NOT 破坏；
+        新增第 8 条：地图已形成闭环（主路径 `/rtabmap/info` + 辅助信号
+        `explore/status exploration_complete`，任一触发即 stop）。
+
+        返回：
+        - (False, []) —— 未结束；
+        - (True, [reasons...]) —— 已结束，reasons 命名空间前缀（见 spec
+          exploration-completion-criteria "reasons 命名空间前缀"）。
+        """
+
+        # 原有 7 条判据路径（保持原状，reasons 用旧命名以保持向后兼容）
         if bool(metadata.get("exploration_terminal")) or bool(metadata.get("terminal")):
-            return True
+            return True, ["explorer:exploration_terminal"]
         status_text = str(metadata.get("status_text") or "").upper()
         if "DONE (EXPLORATION FINISHED)" in status_text:
-            return True
+            return True, ["explorer:exploration_finished"]
         observer_meta = metadata.get("external_frontier_debug_observer")
         if isinstance(observer_meta, dict):
             observer_payload = observer_meta.get("metadata") if isinstance(observer_meta.get("metadata"), dict) else {}
             if bool(observer_payload.get("exploration_terminal")):
-                return True
+                return True, ["explorer:exploration_terminal"]
             observer_status = str(observer_payload.get("status_text") or "").upper()
             if "DONE (EXPLORATION FINISHED)" in observer_status:
-                return True
-        return False
+                return True, ["explorer:exploration_finished"]
+
+        # 第 8 条判据：地图已形成闭环（双信号源，任一触发即 stop）
+        # 主路径：observer._loop_closure_state.loop_closure_count >= threshold
+        # 辅助信号：observer._explore_status_done（explore/status == "exploration_complete"）
+        return self._check_loop_closure_completion()
+
+    def _check_loop_closure_completion(self) -> tuple[bool, List[str]]:
+        """第 8 条判据：双信号源检查（spec exploration-completion-criteria）。"""
+
+        reasons: List[str] = []
+        observer = self._external_debug_observer
+        # 主路径：/rtabmap/info topic；缺失时降级到 DB SQLite fallback
+        triggered_by_topic = False
+        if observer is not None:
+            state = observer.loop_closure_state
+            threshold = self._resolve_loop_closure_threshold()
+            if state.loop_closure_count >= threshold and state.source in {"topic", "db_sqlite"}:
+                triggered_by_topic = True
+                if "rtabmap:loop_closed" not in reasons:
+                    reasons.append("rtabmap:loop_closed")
+        else:
+            # 无 observer 时尝试 DB fallback
+            count = self._read_loop_closure_count_from_db_with_fallback()
+            threshold = self._resolve_loop_closure_threshold()
+            if count >= threshold and count > 0:
+                triggered_by_topic = True
+                if "rtabmap:loop_closed" not in reasons:
+                    reasons.append("rtabmap:loop_closed")
+
+        # 辅助信号：explore/status == "exploration_complete"
+        if observer is not None and observer.explore_status_done:
+            if "explorer:no_frontiers" not in reasons:
+                reasons.append("explorer:no_frontiers")
+
+        return (bool(reasons), reasons)
+
+    @staticmethod
+    def _resolve_loop_closure_threshold() -> int:
+        """从 core.settings 解析 threshold；缺失或异常时 fallback 3。"""
+
+        try:
+            from core.settings import (
+                NAV_LOOP_CLOSURE_THRESHOLD,  # type: ignore
+            )
+            value = int(NAV_LOOP_CLOSURE_THRESHOLD)
+        except Exception:
+            value = 3
+        if value <= 0:
+            return 3
+        return value
+
+    def _read_loop_closure_count_from_db_with_fallback(self) -> int:
+        """DB SQLite fallback：HIL 第 1 步验证 /rtabmap/info 不存在时启用。"""
+
+        db_path = self._resolve_loop_closure_db_path()
+        if db_path is None:
+            return 0
+        try:
+            return int(
+                read_loop_closure_from_db(
+                    db_path,
+                    threshold=self._resolve_loop_closure_threshold(),
+                )
+            )
+        except Exception:
+            LOGGER.debug("loop_closure DB fallback 失败。", exc_info=True)
+            return 0
+
+    def _resolve_loop_closure_db_path(self) -> Optional[Path]:
+        """解析当前探索会话的 RTAB-Map DB 路径。"""
+
+        with self._exploration_loop_lock:
+            db_path = self._external_exploration_database_path
+        if not db_path:
+            return None
+        try:
+            candidate = Path(str(db_path)).expanduser()
+        except Exception:
+            return None
+        return candidate
+
+    def _reset_exploration_completion_state(self) -> None:
+        """重置第 8 条判据相关状态（spec exploration-completion-criteria "reset 同步"）。
+
+        触发时机：`_start_external_script_exploration` 启动新会话时。
+        同时清零：observer._loop_closure_state、observer._explore_status_done、
+        `external_exploration_terminal_state`。
+        """
+
+        observer = self._external_debug_observer
+        if observer is not None and hasattr(observer, "reset_loop_closure_state"):
+            try:
+                observer.reset_loop_closure_state()
+            except Exception:
+                LOGGER.debug("observer reset_loop_closure_state 失败。", exc_info=True)
+        # _external_exploration_terminal_state 已在 _start_external_script_exploration
+        # 内部 `_exploration_loop_lock` 段同步置 None；这里做防御性二次清零。
+
+    # ------------------------------------------------------------------
+    # 手划探索范围 boundary JSON 写入（spec exploration-boundary §go2.sh --boundary）
+    # ------------------------------------------------------------------
+
+    _BOUNDARY_JSON_PATH = Path("/tmp/go2_boundary.json")
+
+    def _maybe_persist_boundary_for_external_command(
+        self,
+        *,
+        command: List[str],
+        session: str,
+    ) -> Optional[Path]:
+        """调用 observer 的 `_compute_boundary_polygon`，把结果序列化到 `/tmp/go2_boundary.json`。
+
+        返回：
+        - `Path`: 写入成功且非空 polygon 时返回 `/tmp/go2_boundary.json`；
+        - `None`: 无 observer / 无 boundary 缓存 / 异常 / 空 polygon 时返回 None。
+
+        行为约定：
+        - 复用 observer 单订阅者约束（不另起订阅 `/map_obstacles`）；
+        - 原子写：先写 `.tmp` 再 rename，避免 go2.sh 读到半截文件；
+        - 写入失败仅记 warning 日志，不抛异常（避免 mapping 启动被 boundary 失败连累）。
+        """
+
+        observer = self._external_debug_observer
+        if observer is None:
+            LOGGER.debug(
+                "boundary_persist_skipped reason=observer_not_started session=%s", session
+            )
+            return None
+        try:
+            polygon = observer.latest_boundary_polygon
+        except Exception:
+            LOGGER.debug("读取 observer.latest_boundary_polygon 失败。", exc_info=True)
+            polygon = []
+        if not polygon:
+            LOGGER.debug(
+                "boundary_persist_skipped reason=empty_polygon session=%s", session
+            )
+            return None
+        payload = {
+            "polygon": [{"x": float(x), "y": float(y)} for (x, y) in polygon],
+            "session": str(session),
+            "command_preview": list(command)[:8],
+            "generated_at": _utc_now_iso(),
+        }
+        target = self._BOUNDARY_JSON_PATH
+        tmp_path = Path(str(target) + ".tmp")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as fp:
+                json.dump(payload, fp, ensure_ascii=False, indent=2)
+                fp.flush()
+                try:
+                    os.fsync(fp.fileno())
+                except Exception:
+                    pass
+            tmp_path.replace(target)
+        except Exception:
+            LOGGER.warning(
+                "boundary JSON 写入失败 path=%s session=%s",
+                target,
+                session,
+                exc_info=True,
+            )
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            return None
+        LOGGER.info(
+            "boundary JSON 已写入 path=%s vertices=%d session=%s",
+            target,
+            len(payload["polygon"]),
+            session,
+        )
+        return target
 
     def _external_exploration_terminal_from_frontier_observer(self) -> Optional[ExplorationState]:
         with self._exploration_loop_lock:
@@ -5388,13 +5682,16 @@ class PlatformGeometryRuntime:
             return None
         payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         frontier_metadata, _ = self._external_debug_frontier_metadata()
-        if not self._metadata_indicates_exploration_done({**frontier_metadata, **payload_metadata}):
+        done, reasons = self._metadata_indicates_exploration_done({**frontier_metadata, **payload_metadata})
+        if not done:
             return None
         terminal_status = str(payload_metadata.get("terminal_status") or "succeeded").lower()
         status = ExplorationStatus.SUCCEEDED if terminal_status == "succeeded" else ExplorationStatus.FAILED
         status_text = str(payload_metadata.get("status_text") or "").strip()
         message = "GO2_RTABNAV2 原生探索已完成。"
-        if status_text:
+        if reasons:
+            message = "GO2_RTABNAV2 原生探索已完成：%s" % ", ".join(reasons)
+        elif status_text:
             message = "GO2_RTABNAV2 原生探索已完成：%s" % status_text
         process = self._managed_processes.get(self._external_process_name())
         process_status = process.status() if process is not None else None
@@ -5405,6 +5702,7 @@ class PlatformGeometryRuntime:
             notify_compat=False,
             process_status=process_status,
             kill_geometry_process=False,
+            completion_reasons=reasons,
         )
 
     def _should_scan_external_exploration_log(self) -> bool:
@@ -6113,6 +6411,24 @@ class PlatformGeometryProviderBundle(
         backend = self.runtime._resolve_navigation_backend()
         return False if backend is None else backend.cancel_goal()
 
+    def cancel_navigation(self, *, request_id: Optional[str] = None) -> bool:
+        """扩展的导航取消入口（5.5 task）。
+
+        - 当 `request_id` 为 None 时等价于 `cancel_goal()`（取消当前 ACTIVE 目标）；
+        - 当 `request_id` 非空时调用 `_dispatch_cancel(request_id)` 走 NavigationProxyClient
+          （worker-B 未就绪前退化为 cancel_goal）。
+
+        返回：是否成功发出取消请求。
+        """
+
+        if not self._is_geometry_profile_enabled():
+            return False
+        if request_id is None or not str(request_id).strip():
+            return self.cancel_goal()
+        # TODO:nav2_proxy_client_not_ready —— worker-B 的
+        # services/geometry/navigation_proxy_client.py 完成前，此处退化为 cancel_goal。
+        return self.cancel_goal()
+
     def subscribe_navigation_updates(self, callback) -> Optional[int]:
         if not self._is_geometry_profile_enabled():
             return None
@@ -6132,6 +6448,14 @@ class PlatformGeometryProviderBundle(
         return bool(unsubscribe(subscription_id))
 
     def get_navigation_state(self):
+        """扩展的导航状态读取入口（5.5 task）。
+
+        - 优先走 backend.get_navigation_state()；
+        - 在 metadata 中补充 `proxy_dispatch_enabled` 与 `dispatch_via_proxy` 标记
+          （用于外部 agent 区分当前是否走 NavigationProxyClient 串行锁路径，
+          TODO:nav2_proxy_client_not_ready）。
+        """
+
         backend = self.runtime._resolve_navigation_backend()
         if backend is None:
             from contracts.navigation import NavigationState, NavigationStatus
@@ -6145,9 +6469,16 @@ class PlatformGeometryProviderBundle(
                     "navigation_backend_policy": self.runtime._clone_metadata(policy),
                     "active_navigation_backend": policy.get("active_backend_provider"),
                     "nav2_action_active": bool(policy.get("nav2_action_active")),
+                    "proxy_dispatch_enabled": False,
+                    "dispatch_via_proxy": False,
                 },
             )
-        return backend.get_navigation_state()
+        state = backend.get_navigation_state()
+        # 复用现有 metadata，补充 proxy dispatch 标记；不破坏 schema。
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        metadata.setdefault("proxy_dispatch_enabled", False)  # TODO:nav2_proxy_client_not_ready
+        metadata.setdefault("dispatch_via_proxy", False)
+        return state.model_copy(update={"metadata": metadata}, deep=True)
 
     def is_goal_reached(self) -> bool:
         if not self._is_geometry_profile_enabled():

@@ -165,6 +165,7 @@ def handle_enable_memory_library(
     map_asset = ctx.map_workspace_service.get_map(library_name)
     active_workspace = None
     compatibility_mode = "memory_library_only"
+    active_map_name = ctx.map_workspace_service.get_active_map_name()
     if map_asset is not None:
         active_workspace = ctx.map_workspace_service.activate_map(
             map_name=library_name,
@@ -175,6 +176,20 @@ def handle_enable_memory_library(
         )
         compatibility_mode = "map_workspace"
     else:
+        # 有激活地图时拒绝切换到不同名库（spec 记忆库与地图绑定）。
+        # active_map_name 为空（如网关刚启动用户显式启用一个独立库）则允许。
+        if active_map_name and active_map_name != library_name:
+            raise GatewayError(
+                "激活记忆库 %s 与当前激活地图 %s 不一致，禁止跨图串库。"
+                % (library_name, active_map_name),
+                error_code="memory_library_map_mismatch",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    "expected_library_name": active_map_name,
+                    "requested_library_name": library_name,
+                },
+            )
         ctx.memory_service.activate_memory_library(
             library_name=library_name,
             load_history=bool(payload.get("load_history", True)),

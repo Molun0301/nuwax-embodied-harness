@@ -431,7 +431,7 @@ class RuntimeDataConfig:
     map_catalog_root: str = ""
     map_auto_create_library: bool = True
     map_active_restore_on_start: bool = False
-    map_delete_also_delete_library: bool = False
+    map_delete_also_delete_library: bool = True
     memory_db_path: str = ""
     memory_embedding_model: str = DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL
     memory_embedding_dimension: int = 768
@@ -845,7 +845,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         ),
         map_auto_create_library=_cfg_bool("NUWAX_MAP_AUTO_CREATE_LIBRARY", True),
         map_active_restore_on_start=_cfg_bool("NUWAX_ACTIVE_MAP_RESTORE_ON_START", False),
-        map_delete_also_delete_library=_cfg_bool("NUWAX_MAP_DELETE_ALSO_DELETE_LIBRARY", False),
+        map_delete_also_delete_library=_cfg_bool("NUWAX_MAP_DELETE_ALSO_DELETE_LIBRARY", True),
         memory_db_path=_cfg_str(
             "NUWAX_MEMORY_DB_PATH",
             str(BASE_DIR / "runtime_data" / "memory" / "vector_memory.db"),

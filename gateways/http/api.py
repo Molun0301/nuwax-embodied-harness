@@ -576,12 +576,16 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_maps_catalog_delete(
         map_name: str,
         request: Request,
-        delete_memory_library: bool = False,
+        delete_memory_library: Optional[bool] = None,
     ) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         delete_result = runtime.map_workspace_service.delete_map(
             map_name=map_name,
-            delete_memory_library=delete_memory_library,
+            delete_memory_library=(
+                delete_memory_library
+                if delete_memory_library is not None
+                else runtime.config.runtime_data.map_delete_also_delete_library
+            ),
         )
         if bool(delete_result.get("was_active")):
             runtime._sync_perception_runtime_for_memory_state(enabled=False)
@@ -745,8 +749,14 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/memory/locations")
     async def api_memory_locations(request: Request, limit: int = 20) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
+        # 未启用 active 库时返回空列表（避免跨库串数据），service 已默认按 active 库过滤。
         return {
-            "locations": to_jsonable(runtime.memory_service.list_tagged_locations(limit=limit)),
+            "locations": to_jsonable(
+                runtime.memory_service.list_tagged_locations(
+                    limit=limit,
+                    library_name=runtime.memory_service.get_active_library_name(),
+                )
+            ),
             "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
         }
 
@@ -754,7 +764,12 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_memory_semantic(request: Request, limit: int = 20) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         return {
-            "entries": to_jsonable(runtime.memory_service.list_semantic_memories(limit=limit)),
+            "entries": to_jsonable(
+                runtime.memory_service.list_semantic_memories(
+                    limit=limit,
+                    library_name=runtime.memory_service.get_active_library_name(),
+                )
+            ),
             "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
         }
 
@@ -765,10 +780,15 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         label: Optional[str] = None,
     ) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
+        # list_semantic_instances 已默认按 active 库过滤；前端显式传 library_name 时透传。
         result = await run_in_threadpool(
             lambda: runtime.invoke_capability(
                 "list_semantic_instances",
-                {"library_name": library_name, "label": label},
+                {
+                    "library_name": library_name
+                    or runtime.memory_service.get_active_library_name(),
+                    "label": label,
+                },
                 requested_by="http_api",
             )
         )

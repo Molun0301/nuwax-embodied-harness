@@ -147,6 +147,7 @@ class MapWorkspaceService:
             library_name=resolved_name,
             load_history=load_memory_history,
             reset_library=reset_memory_library,
+            expected_library_name=resolved_name,
         )
         now = datetime.now(asset.updated_at.tzinfo) if asset.updated_at.tzinfo is not None else datetime.utcnow()
         synced_asset = self._sync_asset(
@@ -602,7 +603,7 @@ class MapWorkspaceService:
         self,
         *,
         map_name: str,
-        delete_memory_library: bool = False,
+        delete_memory_library: bool = True,
     ) -> Dict[str, object]:
         resolved_name = self._require_map_name(map_name)
         asset = self._repository.get_map_asset(resolved_name)

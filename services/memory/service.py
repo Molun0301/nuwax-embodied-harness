@@ -334,8 +334,19 @@ class MemoryService:
         library_name: str,
         load_history: bool = True,
         reset_library: bool = False,
+        expected_library_name: Optional[str] = None,
     ) -> Dict[str, object]:
-        """启用指定命名记忆库，并按需加载历史。"""
+        """启用指定命名记忆库，并按需加载历史。
+
+        参数:
+            library_name: 目标库名。
+            load_history: 是否加载历史记录。
+            reset_library: 是否在启用前清空该库记录。
+            expected_library_name: 当调用方（如 `MapWorkspaceService.activate_map`）要求
+                "激活的库名必须等于预期值"时传入；与 ``library_name`` 不一致时抛
+                ``memory_library_map_mismatch`` 错误。默认 None 表示不校验，
+                沿用旧行为（无激活态时允许任意库）。
+        """
 
         resolved_name = str(library_name or "").strip()
         if not resolved_name:
@@ -345,6 +356,21 @@ class MemoryService:
                 http_status=422,
                 jsonrpc_code=-32602,
             )
+
+        if expected_library_name is not None:
+            expected = str(expected_library_name).strip()
+            if expected and expected != resolved_name:
+                raise GatewayError(
+                    "激活记忆库 %s 与预期库 %s 不一致，禁止跨图串库。"
+                    % (resolved_name, expected),
+                    error_code="memory_library_map_mismatch",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={
+                        "expected_library_name": expected,
+                        "requested_library_name": resolved_name,
+                    },
+                )
 
         self._repository.upsert_memory_library(resolved_name)
         if reset_library:
@@ -2629,18 +2655,55 @@ class MemoryService:
             orientation=Quaternion(w=1.0),
         )
 
-    def list_tagged_locations(self, *, limit: Optional[int] = None) -> Tuple[TaggedLocation, ...]:
-        """列出地点记忆。"""
+    def list_tagged_locations(
+        self,
+        *,
+        limit: Optional[int] = None,
+        library_name: Optional[str] = None,
+    ) -> Tuple[TaggedLocation, ...]:
+        """列出地点记忆。
 
-        items = list(self._tagged_location_history)
+        参数:
+            limit: 返回的最大条数（按写入顺序倒序截取最近 N 条）。
+            library_name: 若指定则仅返回该记忆库的地点；未指定时按当前激活库
+                ``_active_library_name`` 自动过滤；激活库未启用时返回空 tuple。
+                显式传 ``library_name=""`` 视为"未启用"语义，返回空 tuple。
+        """
+
+        target_library = library_name if library_name is not None else self._active_library_name
+        if not target_library:
+            return tuple()
+        items = [
+            item
+            for item in self._tagged_location_history
+            if self._record_library_name(item) == target_library
+        ]
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
 
-    def list_semantic_memories(self, *, limit: Optional[int] = None) -> Tuple[SemanticMemoryEntry, ...]:
-        """列出语义记忆。"""
+    def list_semantic_memories(
+        self,
+        *,
+        limit: Optional[int] = None,
+        library_name: Optional[str] = None,
+    ) -> Tuple[SemanticMemoryEntry, ...]:
+        """列出语义记忆。
 
-        items = list(self._semantic_history)
+        参数:
+            limit: 返回的最大条数（按写入顺序倒序截取最近 N 条）。
+            library_name: 若指定则仅返回该记忆库的语义记忆；未指定时按当前激活库
+                自动过滤；激活库未启用时返回空 tuple。
+        """
+
+        target_library = library_name if library_name is not None else self._active_library_name
+        if not target_library:
+            return tuple()
+        items = [
+            item
+            for item in self._semantic_history
+            if self._record_library_name(item) == target_library
+        ]
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
@@ -2654,7 +2717,9 @@ class MemoryService:
         """列出语义实例，返回精简 DTO 列表（供 Web 面板和 capability 消费）。
 
         参数:
-            library_name: 若指定则仅返回该记忆库的实例；否则返回全部实例。
+            library_name: 若指定则仅返回该记忆库的实例；未指定时按当前激活库
+                ``_active_library_name`` 自动过滤；激活库未启用时返回空列表。
+                显式传 ``library_name=""`` 视为"未启用"语义，返回空列表。
             label: 若指定则按 label 过滤（大小写不敏感）。
 
         返回字段：instance_id / label / display_name / pose{x,y,z} /
@@ -2663,11 +2728,18 @@ class MemoryService:
         缺失时后端注入 confidence=0.2）；frame_id 非 map 系也归入 fallback。
         """
         all_instances = self._repository.load_semantic_instances()
+        target_library = (
+            str(library_name).strip() if library_name is not None else self._active_library_name
+        )
+        if not target_library:
+            return []
         label_lower = str(label).lower().strip() if label else None
         result: List[Dict[str, object]] = []
         for inst in all_instances:
-            if library_name is not None:
-                if self._record_library_name(inst) != str(library_name).strip():
+            if self._record_library_name(inst) != target_library:
+                continue
+            if label_lower is not None:
+                if str(inst.label).lower().strip() != label_lower:
                     continue
             if label_lower is not None:
                 if str(inst.label).lower().strip() != label_lower:

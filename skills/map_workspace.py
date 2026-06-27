@@ -416,6 +416,20 @@ class MapWorkspaceService:
             },
             refresh=False,
         )
+        # commit 2 §2.5：load_map_version 是 MCP 用户显式选择切到已保存地图的入口，
+        # 完成 active session 绑定后 MUST 触发 observer 切到 "localization" 模式并 emit
+        # 初始心跳（_on_external_geometry_session_mode_changed("localization") 内部会调
+        # set_session_mode + emit_initial_heartbeat），闭合 R3 设计的 saved-map activate 入口。
+        _geometry_runtime = getattr(self, "_geometry_runtime", None)
+        if _geometry_runtime is not None:
+            try:
+                _geometry_runtime._on_external_geometry_session_mode_changed("localization")
+            except Exception:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "load_map_version 触发 _on_external_geometry_session_mode_changed(\"localization\") 失败。",
+                    exc_info=True,
+                )
         asset = self._repository.get_map_asset(resolved_name)
         if asset is None:
             raise GatewayError(

@@ -1788,9 +1788,21 @@ class PlatformGeometryRuntime:
         with self._exploration_loop_lock:
             session_mode = self._external_geometry_session_mode
         observer.set_session_mode(session_mode)
+        # commit 2 §2.2：localization 模式默认启动后必须立即 emit_initial_heartbeat，
+        # 顶掉前端 SSE 滞留的 cleared 信号，避免复现 Symptom 2（地图变空白视觉表现）。
+        if session_mode == "localization":
+            try:
+                self._map_stream.emit_initial_heartbeat()
+            except Exception:
+                LOGGER.debug("emit_initial_heartbeat 失败，忽略（localization 模式启动路径）。", exc_info=True)
 
     def _on_external_geometry_session_mode_changed(self, mode: Optional[str]) -> None:
-        """同步 debug observer 会话模式，并在非 explore 时清空前沿缓存。"""
+        """同步 debug observer 会话模式，并在非 explore 时清空前沿缓存。
+
+        commit 2 §2.1 扩展：接受 ``"localization"`` 入参；仅触发 observer
+        ``set_session_mode("localization")``，不再清空 ``_external_debug_frontier_payload``
+        （避免与 commit 1 set_session_mode 双清；该清空责任在 set_session_mode 内）。
+        """
         observer = self._external_debug_observer
         if observer is not None:
             observer.set_session_mode(mode)
@@ -4628,7 +4640,12 @@ class PlatformGeometryRuntime:
         # 探索会话切换时必须 reset loop_closure_state + explore_status_done +
         # external_exploration_terminal_state，避免上一会话缓存串味。
         self._reset_exploration_completion_state()
-        self._on_external_geometry_session_mode_changed("explore")
+        # commit 2 §2.4：幂等校验——若 observer 当前 session_mode 已为 "explore"，
+        # 跳过显式 set_session_mode("explore") 副作用（避免重复 reset loop_closure_state）；
+        # 第二次双调按原规约保留，确保 caller 端语义稳定。
+        _observer_for_idempotent_explore = self._external_debug_observer
+        if _observer_for_idempotent_explore is None or _observer_for_idempotent_explore.get_current_session_mode() != "explore":
+            self._on_external_geometry_session_mode_changed("explore")
         self._on_external_geometry_session_mode_changed("explore")
         if current_process is not None:
             self._managed_processes.pop(process_name, None)
@@ -4768,6 +4785,13 @@ class PlatformGeometryRuntime:
         self._ensure_external_geometry_observers_started()
         process_name = self._external_process_name()
         current_process = self._managed_processes.get(process_name)
+        # commit 2 §2.3：幂等校验——若 observer 当前 session_mode 已为 "mapping"，
+        # 跳过 set_session_mode 副作用（避免重复 reset loop_closure_state）。
+        _observer_for_idempotent = self._external_debug_observer
+        if _observer_for_idempotent is not None and _observer_for_idempotent.get_current_session_mode() == "mapping":
+            pass
+        else:
+            self._on_external_geometry_session_mode_changed("mapping")
         command = self._build_external_mapping_command(map_name=map_name)
         db_path = self._extract_external_exploration_database_path(command)
         if db_path:
@@ -4780,7 +4804,6 @@ class PlatformGeometryRuntime:
             self._external_exploration_started_at_iso = _utc_now_iso()
             self._external_exploration_deadline_monotonic = None
             self._external_exploration_database_path = db_path
-        self._on_external_geometry_session_mode_changed("mapping")
         if current_process is not None:
             self._managed_processes.pop(process_name, None)
             current_process.stop(

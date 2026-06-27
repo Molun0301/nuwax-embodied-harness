@@ -300,6 +300,7 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
             "explore_area 提交后等待约 30 秒再 get_task_status，之后每 15 秒轮询直至 state=succeeded。"
             "进度看 frontier_count 与 message，不要查 TF 或触发 relocalize_active_map。"
             "探索进行中 localization_ready=false 属正常，勿误判卡住。"
+            "用户要求结束探索时请调用独立工具 stop_exploration（内部等同 stop_mapping，会停止 go2.sh）。"
         ),
     },
 }
@@ -316,6 +317,7 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
         "save_active_map_version",
         "start_mapping",
         "stop_mapping",
+        "stop_exploration",
     }
 )
 _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
@@ -326,6 +328,7 @@ _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
         "save_active_map_version",
         "start_mapping",
         "stop_mapping",
+        "stop_exploration",
     }
 )
 
@@ -1821,6 +1824,29 @@ class GatewayRuntime:
                 required_resources=(RuntimeResource.NAVIGATION.value,),
             ),
             _descriptor(
+                "stop_exploration",
+                "停止自主探索",
+                "与 explore_area 配对：停止自主前沿探索并杀掉 go2.sh（RTAB-Map/Nav2）几何栈。"
+                "内部调用 stop_mapping；遥控建图结束仍用 stop_mapping。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object(
+                    {
+                        "reason": {"type": "string"},
+                    },
+                ),
+                output_schema=_schema_object(
+                    {
+                        "stopped": {"type": "boolean"},
+                        "geometry_stack_running": {"type": "boolean"},
+                        "mapping_database_path": {"type": "string"},
+                        "mapping_version_id": {"type": "string"},
+                        "alias_of": {"type": "string"},
+                    }
+                ),
+                required_resources=(RuntimeResource.NAVIGATION.value,),
+            ),
+            _descriptor(
                 "load_map_version",
                 "加载地图版本",
                 "把平台侧已保存的地图版本加载到当前地图工作区并启动 go2.sh --localization。异步任务：立即返回 task_id；请等待约 45s 后再 get_task_status，之后每 12s 轮询直至 succeeded，勿秒级高频连刷。",
@@ -2201,7 +2227,8 @@ class GatewayRuntime:
                 "explore_area",
                 "探索区域",
                 "自主前沿探索：启动 GO2_RTABNAV2/go2.sh --explore，由 explore_lite 自动导航建图。"
-                "非遥控建图；用户手动遥控建图必须用 start_mapping，不要用 explore_area。",
+                "非遥控建图；用户手动遥控建图必须用 start_mapping，不要用 explore_area。"
+                "用户要求结束探索时请调用 stop_exploration。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -2391,6 +2418,7 @@ class GatewayRuntime:
             # RTAB 新增建图能力（skills 未下放），保留 runtime 方法派发：
             "start_mapping": self._handle_start_mapping,
             "stop_mapping": self._handle_stop_mapping,
+            "stop_exploration": self._handle_stop_exploration,
             "load_map_version": self._handle_load_map_version_async,
             "list_memory_libraries": partial(memory_skills.handle_list_memory_libraries, self._skill_ctx),
             "create_memory_library": partial(memory_skills.handle_create_memory_library, self._skill_ctx),
@@ -2686,9 +2714,19 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="stop_mapping",
                 display_name="停止几何建图栈",
-                description="唯一入口停止 go2.sh（RTAB-Map/Nav2）。探索结束不会自动停栈，必须显式 stop_mapping。",
+                description="停止 go2.sh（RTAB-Map/Nav2）；遥控建图结束用此工具。自主探索结束优先 stop_exploration。",
                 category=SkillCategory.TASK,
                 capability_name="stop_mapping",
+            ),
+            SkillDescriptor(
+                name="stop_exploration",
+                display_name="停止自主探索",
+                description=(
+                    "与 explore_area 配对：用户说结束/停止探索时调用，会杀掉 go2.sh 几何栈。"
+                    "内部等同 stop_mapping，不要误用 stop_all_motion。"
+                ),
+                category=SkillCategory.TASK,
+                capability_name="stop_exploration",
             ),
             SkillDescriptor(
                 name="load_map_version",
@@ -2808,6 +2846,7 @@ class GatewayRuntime:
                 description=(
                     "自主前沿探索（go2.sh --explore）。遥控建图请用 start_mapping，不要用 explore_area。"
                     "运行中用 get_task_status 看 frontier_count，勿 relocalize_active_map 或查 TF。"
+                    "用户要求结束探索时调用 stop_exploration。"
                 ),
                 category=SkillCategory.TASK,
                 capability_name="explore_area",
@@ -3076,6 +3115,7 @@ class GatewayRuntime:
                 "save_active_map_version",
                 "start_mapping",
                 "stop_mapping",
+                "stop_exploration",
             }:
                 slim_result = self._slim_sync_map_capability_result(descriptor.name, result)
             return {
@@ -4728,6 +4768,30 @@ class GatewayRuntime:
             raise GatewayError(str(exc), error_code="stop_mapping_failed", http_status=503) from exc
         self.navigation_service.refresh_exploration()
         return result
+
+    def _handle_stop_exploration(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        merged = dict(arguments or {})
+        if not str(merged.get("reason", "")).strip():
+            merged["reason"] = "stop_exploration"
+        result = self._handle_stop_mapping(merged, requested_by=requested_by)
+        if isinstance(result, dict):
+            enriched = dict(result)
+            enriched["alias_of"] = "stop_mapping"
+            enriched.setdefault(
+                "next_step_hint",
+                "自主探索与 go2.sh 几何栈已停止。如需保留地图可调用 save_active_map_version。",
+            )
+            return enriched
+        return {
+            "result": result,
+            "alias_of": "stop_mapping",
+            "next_step_hint": "自主探索与 go2.sh 几何栈已停止。如需保留地图可调用 save_active_map_version。",
+        }
 
     def dispatch_debug_nav2_goal(
         self,
@@ -8461,6 +8525,10 @@ class GatewayRuntime:
                 "平台几何运行时已禁用。",
             ),
             "stop_mapping": (
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
+            ),
+            "stop_exploration": (
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
             ),

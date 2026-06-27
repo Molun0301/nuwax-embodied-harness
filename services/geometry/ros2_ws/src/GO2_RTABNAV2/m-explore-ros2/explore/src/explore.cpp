@@ -377,6 +377,7 @@ void Explore::cancelStuckGoal(const std::string& reason)
       last_frontiers_available_, last_frontiers_found_);
   goal_active_ = false;
   pursuit_active_ = false;
+  saw_cmd_vel_ = false;
   move_base_client_->async_cancel_all_goals();
   publishExploreStatus(
       explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS);
@@ -488,18 +489,22 @@ void Explore::makePlan()
   }
 
   if (pursuit_active_) {
-    if (same_goal) {
-      if ((this->now() - last_status_publish_time_) >
-          tf2::durationFromSec(2.0)) {
-        publishExploreStatus(
-            explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS);
-        last_status_publish_time_ = this->now();
-      }
+    if ((this->now() - last_status_publish_time_) >
+        tf2::durationFromSec(2.0)) {
+      publishExploreStatus(
+          explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS);
+      last_status_publish_time_ = this->now();
+    }
+    // Nav2 still executing — do not preempt when SLAM frontiers shift.
+    if (goal_active_) {
       RCLCPP_INFO_THROTTLE(
           logger_, *this->get_clock(), 5000,
           "追击中 (%.2f, %.2f) | 已拉黑 %zu 点 | 可用前沿 %zu/%zu",
           prev_goal_.x, prev_goal_.y, frontier_blacklist_.size(),
           last_frontiers_available_, last_frontiers_found_);
+      return;
+    }
+    if (same_goal) {
       return;
     }
     if ((this->now() - last_goal_sent_time_) <
@@ -531,8 +536,9 @@ void Explore::makePlan()
   goal_active_ = true;
   pursuit_active_ = true;
   last_goal_sent_time_ = this->now();
+  saw_cmd_vel_ = false;
+  goal_start_time_ = this->now();
   if (new_pursuit) {
-    goal_start_time_ = this->now();
     geometry_msgs::msg::Point odom_pos;
     if (lookupOdomPosition(odom_pos)) {
       last_robot_pose_ = odom_pos;
@@ -656,6 +662,8 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
       // Foxy: retry on next planner timer tick (avoid cancel/recovery race).
       RCLCPP_DEBUG(logger_, "Goal aborted on Foxy — will retry on next timer");
 #endif
+      pursuit_active_ = false;
+      saw_cmd_vel_ = false;
       return;
     case rclcpp_action::ResultCode::CANCELED:
       RCLCPP_DEBUG(logger_, "Goal was canceled");

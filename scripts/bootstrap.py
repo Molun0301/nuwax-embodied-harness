@@ -695,6 +695,7 @@ class BootstrapPlanner:
             "NUWAX_GEOMETRY_REQUIRE_ROS2": _bool_text(go2_geometry_enabled),
             "NUWAX_ROS_SETUP_SCRIPT": str(ros_setup) if ros_setup is not None else "",
             "NUWAX_GEOMETRY_SETUP_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash"),
+            "NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT": str(go2slam_setup_path()),
             "NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR": "",
             "NUWAX_GEOMETRY_ODOM_TOPIC": "",
             "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS": "",

@@ -4715,6 +4715,7 @@ class PlatformGeometryRuntime:
             guidance = (
                 "自主探索进行中；用 get_task_status 查看 frontier_count 与 message，"
                 "不要 relocalize_active_map，也不要因 localization_ready=false 误判卡住。"
+                "用户要求结束探索时请调用 stop_exploration。"
             )
         return {
             "geometry_stack_running": running,
@@ -4728,6 +4729,7 @@ class PlatformGeometryRuntime:
             "exploration_terminal": terminal_state is not None,
             "teleop_mapping_api": "start_mapping",
             "autonomous_explore_api": "explore_area",
+            "stop_exploration_api": "stop_exploration",
             "stop_geometry_stack_api": "stop_mapping",
             "agent_guidance": guidance,
         }

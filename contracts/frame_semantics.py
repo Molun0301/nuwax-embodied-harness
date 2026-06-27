@@ -15,7 +15,19 @@ _BASE_FRAME_ALIASES = {
     "base_link",
     "base_footprint",
     "body",
+    "go2_base_link",
 }
+
+_BASE_FRAME_SUFFIXES = (
+    "_base_link",
+    "_base_footprint",
+)
+
+
+def _is_base_leaf(leaf: str) -> bool:
+    if leaf in _BASE_FRAME_ALIASES:
+        return True
+    return any(leaf.endswith(suffix) for suffix in _BASE_FRAME_SUFFIXES)
 
 
 def _normalized_tokens(frame_id: str) -> Tuple[str, ...]:
@@ -36,7 +48,7 @@ def infer_frame_role(frame_id: str) -> str:
     for role, aliases in _GLOBAL_FRAME_ROLES.items():
         if leaf in aliases:
             return role
-    if leaf in _BASE_FRAME_ALIASES:
+    if _is_base_leaf(leaf):
         return "base"
     return "other"
 
@@ -63,7 +75,7 @@ def frame_ids_semantically_equal(left: str, right: str) -> bool:
         return True
 
     if left_role == "base":
-        return frame_leaf(normalized_left) in _BASE_FRAME_ALIASES and frame_leaf(normalized_right) in _BASE_FRAME_ALIASES
+        return _is_base_leaf(frame_leaf(normalized_left)) and _is_base_leaf(frame_leaf(normalized_right))
 
     return False
 

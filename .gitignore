@@ -58,3 +58,4 @@ deploy/nuwaclaw/*.host_gateway.json
 
 # === 本地 OpenSpec 工作区（不上传 GitHub） ===
 scripts/check_openspec.sh
+temp_docs

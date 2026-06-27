@@ -14,7 +14,11 @@ from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.maps import OccupancyGrid
 from contracts.navigation import NavigationGoal
 from services.geometry.config import PlatformGeometryConfig
-from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
+from services.geometry.ros2_context import (
+    acquire_ros2_context,
+    ensure_go2_slam_overlay_python_paths,
+    release_ros2_context,
+)
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.external_debug_observer")
 
@@ -172,19 +176,28 @@ class ExternalGeometryDebugObserver:
                 self._subscriptions.append(
                     self._node.create_subscription(MarkerArray, frontier_topic, self._on_frontiers, reliable_volatile)
                 )
-                try:
-                    from explore_lite_msgs.msg import ExploreStatus
+                if ensure_go2_slam_overlay_python_paths():
+                    try:
+                        from explore_lite_msgs.msg import ExploreStatus
 
-                    self._subscriptions.append(
-                        self._node.create_subscription(
-                            ExploreStatus,
-                            self._explore_status_topic,
-                            self._on_explore_status,
-                            reliable_volatile,
+                        self._subscriptions.append(
+                            self._node.create_subscription(
+                                ExploreStatus,
+                                self._explore_status_topic,
+                                self._on_explore_status,
+                                reliable_volatile,
+                            )
                         )
+                    except Exception:
+                        LOGGER.warning(
+                            "explore_lite_msgs 已加入 PYTHONPATH 但订阅 explore/status 失败，跳过。",
+                            exc_info=True,
+                        )
+                else:
+                    LOGGER.warning(
+                        "explore_lite_msgs 不可用，跳过 explore/status 订阅。"
+                        "请确认 GO2_RTABNAV2/ws 已 colcon build，且网关已 source 其 install/setup.bash。"
                     )
-                except Exception:
-                    LOGGER.debug("explore_lite_msgs 不可用，跳过 explore/status 订阅。", exc_info=True)
                 self._subscriptions.append(
                     self._node.create_subscription(PoseStamped, next_goal_topic, self._on_next_goal, reliable_volatile)
                 )

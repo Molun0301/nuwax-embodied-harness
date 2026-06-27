@@ -20,6 +20,24 @@ from services.geometry.ros_bridge_client import RosBridgeSubprocess
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.remote_provider")
 
+_STATIC_EDGE_SKIP_LOG_INTERVAL_SEC = 30.0
+_last_static_edge_skip_log_at = 0.0
+_last_static_edge_skip_signature: Optional[str] = None
+
+
+def _warn_static_edge_skip(message: str, *, signature: str) -> None:
+    """对重复的静态外参跳过告警做节流，避免 get_frame_tree 高频刷屏。"""
+    global _last_static_edge_skip_log_at, _last_static_edge_skip_signature
+
+    import time
+
+    now = time.monotonic()
+    if signature == _last_static_edge_skip_signature and now - _last_static_edge_skip_log_at < _STATIC_EDGE_SKIP_LOG_INTERVAL_SEC:
+        return
+    _last_static_edge_skip_log_at = now
+    _last_static_edge_skip_signature = signature
+    LOGGER.warning(message)
+
 
 def _read_deadline_sec() -> float:
     """unary 轻量读类 gRPC 调用 deadline（秒）。
@@ -158,6 +176,10 @@ def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Tran
         present_frames.add(t.child_frame_id)
     # 当前帧真实存在的 base 节点串（按语义角色匹配，取第一个角色为 base 的 frame）。
     live_base_frame = next((f for f in present_frames if infer_frame_role(f) == "base"), None)
+    if live_base_frame is None:
+        configured_base = _normalize_frame(os.environ.get("NUWAX_GEOMETRY_BASE_FRAME", ""))
+        if configured_base and configured_base in present_frames:
+            live_base_frame = configured_base
 
     merged = list(existing)
     appended = 0
@@ -173,9 +195,10 @@ def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Tran
         parent_frame = edge.parent_frame_id
         if parent_frame not in present_frames:
             if live_base_frame is None:
-                LOGGER.warning(
-                    "静态外参边 parent=%s 在当前 frame_tree 不存在且无 base 节点可锚定，跳过 child=%s",
-                    parent_frame, edge.child_frame_id,
+                _warn_static_edge_skip(
+                    "静态外参边 parent=%s 在当前 frame_tree 不存在且无 base 节点可锚定，跳过 child=%s"
+                    % (parent_frame, edge.child_frame_id),
+                    signature="missing_base:%s:%s" % (parent_frame, edge.child_frame_id),
                 )
                 continue
             if infer_frame_role(parent_frame) == "base":

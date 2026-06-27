@@ -15,6 +15,22 @@ def build_default_geometry_setup_script() -> str:
     return str(Path(__file__).resolve().parents[1] / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash")
 
 
+def build_default_geometry_go2slam_setup_script() -> str:
+    """返回 GO2_RTABNAV2 嵌套工作区 setup 脚本路径（explore_lite_msgs 等）。"""
+
+    return str(
+        Path(__file__).resolve().parents[1]
+        / "services"
+        / "geometry"
+        / "ros2_ws"
+        / "src"
+        / "GO2_RTABNAV2"
+        / "ws"
+        / "install"
+        / "setup.bash"
+    )
+
+
 def build_default_rtabmap_database_root() -> str:
     """返回默认 RTAB-Map 数据库存储根目录。"""
 

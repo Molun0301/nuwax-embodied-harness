@@ -45,6 +45,7 @@ PLATFORM_GEOMETRY_CAPABILITIES = frozenset(
         "explore_and_find_target",
         "start_mapping",
         "stop_mapping",
+        "stop_exploration",
         "find_target",
         "inspect_target",
         "follow_target",

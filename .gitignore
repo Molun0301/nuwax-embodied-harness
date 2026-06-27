@@ -73,3 +73,9 @@ tests/manual/__pycache__/
 # 不再单独列 .installer.lock（D4 已废弃 .installer.lock 路径）。
 runtime_data/installer_state.json
 runtime_data/.venv-installer/
+
+# === 测试 fixture + mock + integration 全部本地验证不入仓 (2026-06-27) ===
+# 与 spec ci-guardrails spec.md 对齐：CI grep 守门 `! git ls-files tests/fixtures/ tests/mocks/ tests/integration/`
+tests/fixtures/
+tests/mocks/
+tests/integration/

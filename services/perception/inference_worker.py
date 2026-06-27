@@ -30,6 +30,18 @@ def _worker_loop(
         response_queue.put(("error", "ultralytics 未安装"))
         return
 
+    # vis-three-fixes worker NMS 修复：worker 是 spawn 子进程，不继承主进程对
+    # torchvision.ops.nms 的 monkeypatch。若 torchvision C++ NMS 算子本机不可用
+    # （PyTorch/torchvision 版本不匹配），子进程首次 predict 会因 "Couldn't load custom
+    # C++ ops" 抛错 → worker.predict 返回 None → 永久回退主线程，GIL 无法释放、worker 形同虚设。
+    # 故在子进程内显式安装与主线程一致的纯 torch NMS 回退。
+    try:
+        from services.perception.detectors import _ensure_torchvision_nms_fallback
+
+        _ensure_torchvision_nms_fallback()
+    except Exception as exc:  # noqa: BLE001 — 回退安装失败不致命，继续尝试原生推理。
+        logger.warning("YOLO worker torchvision NMS 回退安装失败，忽略：%s", exc)
+
     model = YOLO(model_source)
     # vis-three-fixes 任务 3.7：第一次 predict 前 warmup，消除首帧 GPU kernel cache 构建阻塞。
     try:

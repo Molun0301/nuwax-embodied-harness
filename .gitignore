@@ -58,3 +58,17 @@ deploy/nuwaclaw/*.host_gateway.json
 
 # === 本地 OpenSpec 工作区（不上传 GitHub） ===
 scripts/check_openspec.sh
+
+# === installer verification 工具（按 memory feedback_no_test_commits.md，不入仓） ===
+# 上方已有 tests/ 整目录排除；此处追加显式模式做双保险，避免 .gitignore
+# 行号漂移后误提交 installer_*.{sh,py} 与 __pycache__。
+tests/manual/installer_*.sh
+tests/manual/installer_*.py
+tests/manual/__pycache__/
+
+# === installer 运行时产物（plan 4.2 / RK11 / RK18 / D4） ===
+# 状态文件 + installer 隔离 venv 入仓均不入仓；lock 由 _lock.py 共享
+# scripts/start_gateway.sh:86-96 flock 协议，统一走 runtime_data/gateway/start_gateway.lock，
+# 不再单独列 .installer.lock（D4 已废弃 .installer.lock 路径）。
+runtime_data/installer_state.json
+runtime_data/.venv-installer/

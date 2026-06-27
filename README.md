@@ -86,11 +86,10 @@ bash scripts/start_gateway.sh
 ### 5. 验证接口
 
 ```bash
-curl http://127.0.0.1:8766/api/health \
-  -H 'Authorization: Bearer agent-robot-bridge-token'
+# 网关已完全移除鉴权，无需 Authorization header，直接 curl 即可
+curl http://127.0.0.1:8766/api/health
 
-curl http://127.0.0.1:8766/api/tools \
-  -H 'Authorization: Bearer agent-robot-bridge-token'
+curl http://127.0.0.1:8766/api/tools
 ```
 
 ### 6. 打开本机只读 Web 调试面板

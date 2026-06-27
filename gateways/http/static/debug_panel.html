@@ -3286,10 +3286,15 @@ button{font-family:inherit;cursor:pointer}
         updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
       }
       function isMapClearedEnvelope(envelope, diagnostics, status) {
-        if (status === "cleared") return true;
-        const eventType = diagnostics && (diagnostics.event_type || diagnostics.suppressed_live_map_reason);
-        if (typeof eventType === "string" && (eventType === "catalog_cleared" || eventType === "workspace_cleared")) return true;
-        return false;
+        const cleared = status === "cleared"
+          || (typeof (diagnostics && (diagnostics.event_type || diagnostics.suppressed_live_map_reason)) === "string"
+              && ((diagnostics.event_type || diagnostics.suppressed_live_map_reason) === "catalog_cleared"
+                  || (diagnostics.event_type || diagnostics.suppressed_live_map_reason) === "workspace_cleared"));
+        // 地图/工作区切换时清空 2D Pose 历史 marker，避免旧坐标错位被误读为新位姿
+        if (cleared && Array.isArray(state.initialPoses) && state.initialPoses.length) {
+          state.initialPoses = [];
+        }
+        return cleared;
       }
       function mapClearedMessage(diagnostics) {
         const cleared = diagnostics && (diagnostics.cleared_map_name || diagnostics.previous_active_map_name);

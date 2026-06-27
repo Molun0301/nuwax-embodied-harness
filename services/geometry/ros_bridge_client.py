@@ -260,6 +260,8 @@ class RosBridgeSubprocess:
         aliases = {
             "NUWAX_MAP_TOPIC": ("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
             "NUWAX_TF_TOPIC": ("NUWAX_GEOMETRY_TF_TOPIC", "/tf"),
+            "NUWAX_MAP_FRAME": ("NUWAX_GEOMETRY_MAP_FRAME", "map"),
+            "NUWAX_BASE_FRAME": ("NUWAX_GEOMETRY_BASE_FRAME", "base_link"),
             "NUWAX_NAV_ACTION": ("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
             "NUWAX_GO2_ODOM_SOURCE": ("NUWAX_GEOMETRY_ODOM_TOPIC", "/utlidar/robot_odom"),
             "NUWAX_GO2_POINTCLOUD_SOURCE": ("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud"),

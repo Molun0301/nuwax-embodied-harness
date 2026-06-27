@@ -1,0 +1,20 @@
+# ROS 2 workspace artifacts
+ws/build/
+ws/install/
+ws/log/
+
+# IDE / tooling
+.codegraph/
+*.pyc
+__pycache__/
+*.egg-info/
+.eggs/
+
+# Misc
+100
+*.swp
+*~
+
+# Nested git metadata (monorepo vendors source; sub-repo .git kept locally only)
+unitree-go2-slam-nav2/.git/
+m-explore-ros2/.git/

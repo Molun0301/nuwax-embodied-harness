@@ -43,6 +43,7 @@ _MCP_COLLECTIONS = {
 _MCP_STANDALONE_PLATFORM_TOOLS: Tuple[str, ...] = (
     "start_mapping",
     "stop_mapping",
+    "stop_exploration",
 )
 
 

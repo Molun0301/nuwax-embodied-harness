@@ -1,0 +1,20 @@
+# ROS 2 / colcon
+build/
+install/
+log/
+ws/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*~
+
+# RTAB-Map database
+*.db

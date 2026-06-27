@@ -280,7 +280,7 @@ async fn ros2_async_loop(
 
     info!("ROS2 桥接启动: map={}, tf={}", map_topic, tf_topic);
 
-    // 订阅 /map → 更新 SharedState.map
+    // 订阅占据栅格（默认 /map_obstacles）→ 更新 SharedState.map
     let map_state = state.clone();
     tokio::task::spawn_local(async move {
         let mut stream = map_sub;

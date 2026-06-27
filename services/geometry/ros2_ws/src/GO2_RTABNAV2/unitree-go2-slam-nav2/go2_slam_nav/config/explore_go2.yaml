@@ -1,0 +1,26 @@
+# m-explore (explore_lite) parameters for Unitree GO2 + RTAB-Map /map.
+
+/**:
+  ros__parameters:
+    use_sim_time: false
+    robot_base_frame: go2_base_link
+    return_to_init: false
+    costmap_topic: /map_obstacles
+    costmap_updates_topic: /map_obstacles_updates
+    visualize: true
+    planner_frequency: 1.0
+    goal_tolerance: 0.35
+    min_goal_interval: 10.0
+    progress_timeout: 30.0
+    robot_progress_timeout: 18.0
+    robot_progress_radius: 0.25
+    cmd_vel_topic: /cmd_vel
+    cmd_vel_stale_timeout: 20.0
+    cmd_vel_linear_threshold: 0.02
+    cmd_vel_angular_threshold: 0.05
+    progress_odom_frame: go2_odom
+    potential_scale: 3.0
+    orientation_scale: 0.0
+    gain_scale: 1.0
+    transform_tolerance: 1.0
+    min_frontier_size: 0.3

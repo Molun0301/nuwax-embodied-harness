@@ -684,7 +684,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             point_cloud_topic=_cfg_str("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud_deskewed"),
             tf_topic=_cfg_str("NUWAX_GEOMETRY_TF_TOPIC", "/tf"),
             tf_static_topic=_cfg_str("NUWAX_GEOMETRY_TF_STATIC_TOPIC", "/tf_static"),
-            occupancy_topic=_cfg_str("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
+            occupancy_topic=_cfg_str("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map_obstacles"),
             cloud_map_topic=_cfg_str_alias(
                 "NUWAX_GEOMETRY_CLOUD_MAP_TOPIC",
                 "NUWAX_CLOUD_MAP_TOPIC",
@@ -781,6 +781,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             ),
             platform_odom_tf_bridge_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_ODOM_TF_BRIDGE_ENABLED", False),
             platform_cmd_vel_bridge_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_CMD_VEL_BRIDGE_ENABLED", False),
+            frontier_topic=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC", "explore/frontiers"),
         ),
     )
 

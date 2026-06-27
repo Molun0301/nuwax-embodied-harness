@@ -312,4 +312,8 @@ def handle_load_map_version(
     return {
         "map_version": map_version,
         "active_workspace": workspace,
+        "next_step_hint": (
+            "地图版本已加载。Debug 应立即可见 checkpoint 地图；"
+            "live /map_obstacles 可能仍需数十秒。可直接 navigate_to_pose 或等待定位收敛。"
+        ),
     }

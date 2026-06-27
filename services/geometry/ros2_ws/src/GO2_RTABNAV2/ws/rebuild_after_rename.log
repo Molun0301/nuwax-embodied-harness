@@ -1,0 +1,329 @@
+========== 2026-06-25T13:09:34+08:00 rebuild_after_rename.sh ==========
+
+=== STEP 1: Check ws/src symlinks ===
+总计 12
+drwxrwxr-x 2 huang huang 4096  6月 24 13:46 .
+drwxrwxr-x 6 huang huang 4096  6月 25 13:09 ..
+lrwxrwxrwx 1 huang huang   45  6月 24 13:46 explore_lite -> /home/huang/huang_grok/m-explore-ros2/explore
+lrwxrwxrwx 1 huang huang   55  6月 24 13:46 explore_lite_msgs -> /home/huang/huang_grok/m-explore-ros2/explore_lite_msgs
+lrwxrwxrwx 1 huang huang   53  6月 24 12:16 frontier -> /home/huang/huang_grok/unitree-go2-slam-nav2/frontier
+lrwxrwxrwx 1 huang huang   62  6月 24 11:36 go2_cmd_processor -> /home/huang/huang_grok/unitree-go2-slam-nav2/go2_cmd_processor
+lrwxrwxrwx 1 huang huang   57  6月 24 11:04 go2_slam_nav -> /home/huang/huang_grok/unitree-go2-slam-nav2/go2_slam_nav
+
+=== STEP 2: Create/fix symlinks ===
+Symlinks after fix:
+总计 12
+drwxrwxr-x 2 huang huang 4096  6月 25 13:09 .
+drwxrwxr-x 6 huang huang 4096  6月 25 13:09 ..
+lrwxrwxrwx 1 huang huang   47  6月 25 13:09 explore_lite -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore
+lrwxrwxrwx 1 huang huang   57  6月 25 13:09 explore_lite_msgs -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore_lite_msgs
+lrwxrwxrwx 1 huang huang   53  6月 24 12:16 frontier -> /home/huang/huang_grok/unitree-go2-slam-nav2/frontier
+lrwxrwxrwx 1 huang huang   64  6月 25 13:09 go2_cmd_processor -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_cmd_processor
+lrwxrwxrwx 1 huang huang   59  6月 25 13:09 go2_slam_nav -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_slam_nav
+
+=== STEP 3: Clean and rebuild ===
+/opt/ros/jazzy/setup.bash: 行 8: AMENT_TRACE_SETUP_FILES: 未绑定的变量
+========== 2026-06-25T13:09:43+08:00 rebuild_after_rename.sh ==========
+
+=== STEP 1: Check ws/src symlinks ===
+总计 12
+drwxrwxr-x 2 huang huang 4096  6月 25 13:09 .
+drwxrwxr-x 3 huang huang 4096  6月 25 13:09 ..
+lrwxrwxrwx 1 huang huang   47  6月 25 13:09 explore_lite -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore
+lrwxrwxrwx 1 huang huang   57  6月 25 13:09 explore_lite_msgs -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore_lite_msgs
+lrwxrwxrwx 1 huang huang   53  6月 24 12:16 frontier -> /home/huang/huang_grok/unitree-go2-slam-nav2/frontier
+lrwxrwxrwx 1 huang huang   64  6月 25 13:09 go2_cmd_processor -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_cmd_processor
+lrwxrwxrwx 1 huang huang   59  6月 25 13:09 go2_slam_nav -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_slam_nav
+
+=== STEP 2: Create/fix symlinks ===
+Symlinks after fix:
+总计 12
+drwxrwxr-x 2 huang huang 4096  6月 25 13:09 .
+drwxrwxr-x 3 huang huang 4096  6月 25 13:09 ..
+lrwxrwxrwx 1 huang huang   47  6月 25 13:09 explore_lite -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore
+lrwxrwxrwx 1 huang huang   57  6月 25 13:09 explore_lite_msgs -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore_lite_msgs
+lrwxrwxrwx 1 huang huang   55  6月 25 13:09 frontier -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/frontier
+lrwxrwxrwx 1 huang huang   64  6月 25 13:09 go2_cmd_processor -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_cmd_processor
+lrwxrwxrwx 1 huang huang   59  6月 25 13:09 go2_slam_nav -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_slam_nav
+
+=== STEP 3: Clean and rebuild ===
+Starting >>> explore_lite_msgs
+Starting >>> go2_cmd_processor
+Starting >>> frontier
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'script-dir' will not be supported in future
+        versions. Please use the underscore name 'script_dir' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'install-scripts' will not be supported in future
+        versions. Please use the underscore name 'install_scripts' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'script-dir' will not be supported in future
+        versions. Please use the underscore name 'script_dir' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'install-scripts' will not be supported in future
+        versions. Please use the underscore name 'install_scripts' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+--- stderr: explore_lite_msgs
+Traceback (most recent call last):
+  File "/opt/ros/jazzy/share/ament_cmake_core/cmake/core/package_xml_2_cmake.py", line 22, in <module>
+    from catkin_pkg.package import parse_package_string
+ModuleNotFoundError: No module named 'catkin_pkg'
+CMake Error at /opt/ros/jazzy/share/ament_cmake_core/cmake/core/ament_package_xml.cmake:95 (message):
+  execute_process(/home/huang/.local/bin/python3.11
+  /opt/ros/jazzy/share/ament_cmake_core/cmake/core/package_xml_2_cmake.py
+  /home/huang/GO2_RTABNAV2/ws/src/explore_lite_msgs/package.xml
+  /home/huang/GO2_RTABNAV2/ws/build/explore_lite_msgs/ament_cmake_core/package.cmake)
+  returned error code 1
+Call Stack (most recent call first):
+  /opt/ros/jazzy/share/ament_cmake_core/cmake/core/ament_package_xml.cmake:49 (_ament_package_xml)
+  /opt/ros/jazzy/share/rosidl_cmake/cmake/rosidl_generate_interfaces.cmake:220 (ament_package_xml)
+  CMakeLists.txt:7 (rosidl_generate_interfaces)
+
+
+---
+Failed   <<< explore_lite_msgs [0.64s, exited with code 1]
+Aborted  <<< frontier [0.82s]
+Aborted  <<< go2_cmd_processor [0.82s]
+
+Summary: 0 packages finished [0.92s]
+  1 package failed: explore_lite_msgs
+  2 packages aborted: frontier go2_cmd_processor
+  3 packages had stderr output: explore_lite_msgs frontier go2_cmd_processor
+  2 packages not processed
+========== 2026-06-25T13:09:50+08:00 rebuild_after_rename.sh ==========
+
+=== STEP 1: Check ws/src symlinks ===
+总计 12
+drwxrwxr-x 2 huang huang 4096  6月 25 13:09 .
+drwxrwxr-x 6 huang huang 4096  6月 25 13:09 ..
+lrwxrwxrwx 1 huang huang   47  6月 25 13:09 explore_lite -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore
+lrwxrwxrwx 1 huang huang   57  6月 25 13:09 explore_lite_msgs -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore_lite_msgs
+lrwxrwxrwx 1 huang huang   55  6月 25 13:09 frontier -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/frontier
+lrwxrwxrwx 1 huang huang   64  6月 25 13:09 go2_cmd_processor -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_cmd_processor
+lrwxrwxrwx 1 huang huang   59  6月 25 13:09 go2_slam_nav -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_slam_nav
+
+=== STEP 2: Create/fix symlinks ===
+Symlinks after fix:
+总计 12
+drwxrwxr-x 2 huang huang 4096  6月 25 13:09 .
+drwxrwxr-x 6 huang huang 4096  6月 25 13:09 ..
+lrwxrwxrwx 1 huang huang   47  6月 25 13:09 explore_lite -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore
+lrwxrwxrwx 1 huang huang   57  6月 25 13:09 explore_lite_msgs -> /home/huang/GO2_RTABNAV2/m-explore-ros2/explore_lite_msgs
+lrwxrwxrwx 1 huang huang   55  6月 25 13:09 frontier -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/frontier
+lrwxrwxrwx 1 huang huang   64  6月 25 13:09 go2_cmd_processor -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_cmd_processor
+lrwxrwxrwx 1 huang huang   59  6月 25 13:09 go2_slam_nav -> /home/huang/GO2_RTABNAV2/unitree-go2-slam-nav2/go2_slam_nav
+
+=== STEP 3: Clean and rebuild ===
+Starting >>> explore_lite_msgs
+Starting >>> go2_cmd_processor
+Starting >>> frontier
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'script-dir' will not be supported in future
+        versions. Please use the underscore name 'script_dir' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'install-scripts' will not be supported in future
+        versions. Please use the underscore name 'install_scripts' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'script-dir' will not be supported in future
+        versions. Please use the underscore name 'script_dir' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'install-scripts' will not be supported in future
+        versions. Please use the underscore name 'install_scripts' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+--- stderr: frontier
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'script-dir' will not be supported in future
+        versions. Please use the underscore name 'script_dir' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+---
+Finished <<< frontier [0.85s]
+--- stderr: go2_cmd_processor
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'script-dir' will not be supported in future
+        versions. Please use the underscore name 'script_dir' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+---
+Finished <<< go2_cmd_processor [0.86s]
+Finished <<< explore_lite_msgs [3.44s]
+Starting >>> explore_lite
+Finished <<< explore_lite [8.56s]
+Starting >>> go2_slam_nav
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'script-dir' will not be supported in future
+        versions. Please use the underscore name 'script_dir' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'install-scripts' will not be supported in future
+        versions. Please use the underscore name 'install_scripts' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+--- stderr: go2_slam_nav
+/usr/lib/python3/dist-packages/setuptools/dist.py:744: SetuptoolsDeprecationWarning: Invalid dash-separated options
+!!
+
+        ********************************************************************************
+        Usage of dash-separated 'script-dir' will not be supported in future
+        versions. Please use the underscore name 'script_dir' instead.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://setuptools.pypa.io/en/latest/userguide/declarative_config.html for details.
+        ********************************************************************************
+
+!!
+  opt = self.warn_dash_deprecation(opt, section)
+---
+Finished <<< go2_slam_nav [0.70s]
+
+Summary: 5 packages finished [12.8s]
+  3 packages had stderr output: frontier go2_cmd_processor go2_slam_nav
+colcon build exit code: 0
+BUILD SUCCEEDED
+
+=== STEP 4: Verify package prefixes ===
+==> DDS interface: enx00e04c123598  ROS_DOMAIN_ID=0
+==> GO2 workspace ready: /home/huang/GO2_RTABNAV2/ws
+==> go2_slam_nav: /home/huang/GO2_RTABNAV2/ws/install/go2_slam_nav
+go2_slam_nav:     /home/huang/GO2_RTABNAV2/ws/install/go2_slam_nav
+go2_cmd_processor: /home/huang/GO2_RTABNAV2/ws/install/go2_cmd_processor
+explore_lite:     /home/huang/GO2_RTABNAV2/ws/install/explore_lite
+
+=== DONE ===

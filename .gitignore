@@ -58,6 +58,7 @@ deploy/nuwaclaw/*.host_gateway.json
 
 # === 本地 OpenSpec 工作区（不上传 GitHub） ===
 scripts/check_openspec.sh
+temp_docs
 
 # === installer verification 工具（按 memory feedback_no_test_commits.md，不入仓） ===
 # 上方已有 tests/ 整目录排除；此处追加显式模式做双保险，避免 .gitignore

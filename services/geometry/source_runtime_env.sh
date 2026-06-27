@@ -142,6 +142,16 @@ if geometry_is_truthy "${NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV}"; then
   if [[ -f "${GEOMETRY_RUNTIME_WS_DIR}/install/setup.bash" ]]; then
     geometry_source_without_nounset "${GEOMETRY_RUNTIME_WS_DIR}/install/setup.bash"
   fi
+
+  GEOMETRY_RUNTIME_GO2SLAM_SETUP=""
+  if [[ -n "${NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT:-}" && -f "${NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT}" ]]; then
+    GEOMETRY_RUNTIME_GO2SLAM_SETUP="${NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT}"
+  elif [[ -f "${GEOMETRY_RUNTIME_REPO_ROOT}/services/geometry/ros2_ws/src/GO2_RTABNAV2/ws/install/setup.bash" ]]; then
+    GEOMETRY_RUNTIME_GO2SLAM_SETUP="${GEOMETRY_RUNTIME_REPO_ROOT}/services/geometry/ros2_ws/src/GO2_RTABNAV2/ws/install/setup.bash"
+  fi
+  if [[ -n "${GEOMETRY_RUNTIME_GO2SLAM_SETUP}" ]]; then
+    geometry_source_without_nounset "${GEOMETRY_RUNTIME_GO2SLAM_SETUP}"
+  fi
 fi
 
 GEOMETRY_RUNTIME_CYCLONEDDS_LIB_DIR="$(geometry_resolve_cyclonedds_lib_dir || true)"
@@ -152,6 +162,7 @@ fi
 geometry_configure_cyclonedds_participant_limit
 
 unset GEOMETRY_RUNTIME_ROS_SETUP
+unset GEOMETRY_RUNTIME_GO2SLAM_SETUP
 unset GEOMETRY_RUNTIME_CYCLONEDDS_LIB_DIR
 unset NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV
 unset NUWAX_GEOMETRY_RUNTIME_FORCE_CYCLONEDDS

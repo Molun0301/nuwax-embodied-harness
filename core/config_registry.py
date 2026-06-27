@@ -338,6 +338,7 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_GEOMETRY_REQUIRE_ROS2": "要求 ROS2 环境",
     "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS": "备用里程计话题",
     "NUWAX_GEOMETRY_SETUP_SCRIPT": "几何环境初始化脚本",
+    "NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT": "GO2 SLAM 工作区 setup 脚本（explore_lite_msgs 等）",
     "NUWAX_GEOMETRY_TF_MAX_AGE_SEC": "TF 最大允许延迟（秒）",
     "NUWAX_GEOMETRY_TF_STATIC_TOPIC": "静态 TF 话题",
     "NUWAX_GEOMETRY_TF_TOPIC": "TF 话题",

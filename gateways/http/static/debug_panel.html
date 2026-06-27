@@ -2645,6 +2645,11 @@ button{font-family:inherit;cursor:pointer}
         drawFrontiers(ctx, anchor, scale);
         drawSemanticInstances(ctx, anchor, scale);
         drawRobot(ctx, anchor);
+        // V2 boundary draw tick：每帧画完后通知 SVG overlay 同步 viewBox，
+        // 这样线段跟着机器人 pose / 缩放 / pan 移动。
+        if (typeof window.__nuwaxMapDrawTick === 'function') {
+          try { window.__nuwaxMapDrawTick(); } catch (_) { /* boundary 模块出错不影响主循环 */ }
+        }
       }
       function pointFromFrontier(frontier) {
         const geometry = frontier && frontier.geometry ? frontier.geometry : frontier;
@@ -5093,6 +5098,32 @@ button{font-family:inherit;cursor:pointer}
       window.__nuwaxMapToolV2 = {
         active: function () { return Boolean(window.__nuwaxBoundaryActive || window.__nuwaxNavigationActive); },
       };
+      // V2 boundary 绘制坐标系：返回当前相机可见范围的世界米 viewBox。
+      // boundary_draw.js 每帧调一次同步 SVG viewBox，让线段在世界坐标系下跟随 pose/zoom 移动。
+      // 返回 null 表示 canvas 还没准备好（首次加载或 grid 缺失）——boundary 应降级为不绘制而不是报错。
+      window.__nuwaxMapWorldViewport = function () {
+        if (!els.mapCanvas) return null;
+        const canvas = els.mapCanvas;
+        const anchor = cameraAnchor();
+        const scale = cameraScale(anchor);
+        if (!Number.isFinite(scale) || scale <= 0) return null;
+        const centerWorld = anchor.point || { x: 0, y: 0 };
+        return {
+          cx: Number(centerWorld.x) || 0,
+          cy: Number(centerWorld.y) || 0,
+          halfX: canvas.width / 2 / scale,   // 世界米
+          halfY: canvas.height / 2 / scale,  // 世界米
+          scale: scale,
+          yaw: anchor.yaw || 0,
+          mapFixed: Boolean(anchor.mapFixed),
+          // canvas pixel 尺寸（用于 SVG 元素 width/height 属性）
+          pixelWidth: canvas.width,
+          pixelHeight: canvas.height,
+        };
+      };
+      // V2 boundary tick：drawMap() 每帧末尾调用，boundary_draw.js 注册回调同步 viewBox。
+      // 解耦：boundary 模块自己挂回调，不在主循环 import boundary 模块。
+      window.__nuwaxMapDrawTick = window.__nuwaxMapDrawTick || null;
       els.logLevelFilter.addEventListener("change", () => {
         state.logFilter = els.logLevelFilter.value;
         renderLogs();

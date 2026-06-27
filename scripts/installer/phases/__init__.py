@@ -32,6 +32,7 @@ DEFAULT_PHASE_ORDER: tuple[str, ...] = (
     "config_env",
     "models",
     "systemd",
+    "install_nav2_action_proxy",
     "mcp",
     "nuwaclaw",
     "health",

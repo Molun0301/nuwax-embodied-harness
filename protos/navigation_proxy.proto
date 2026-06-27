@@ -1,0 +1,75 @@
+syntax = "proto3";
+package nuwax.navigation_proxy;
+
+// gRPC 服务契约：独立 ROS 进程 nav2_action_proxy.py 与 platform 侧
+// services/geometry/navigation_proxy_client.py 之间的接口。
+// 平台侧 services 层 MUST NOT 直接订阅或调用 Nav2 action server（跨 RMW 不可见硬约束）。
+
+service NavigationProxyService {
+  // 双向流：client 发送 NavigateToPoseRequest，server 流式推送 NavigationStateUpdate
+  rpc NavigateToPose(stream NavigationStateUpdate) returns (stream NavigationStateUpdate);
+  // 单向：取消指定 request_id 的导航
+  rpc CancelNavigateToPose(CancelRequest) returns (CancelResponse);
+}
+
+// 请求：提交一个导航目标
+message NavigateToPoseRequest {
+  string request_id = 1;        // 全局唯一 request_id（UUID v4）
+  Pose2D pose = 2;              // 目标位姿
+  int32 timeout_sec = 3;        // 超时秒数（默认 60s，services 注入）
+}
+
+// 2D 位姿
+message Pose2D {
+  double x = 1;
+  double y = 2;
+  double yaw = 3;               // 偏航角（弧度）
+}
+
+// 状态更新：双向流的载荷
+message NavigationStateUpdate {
+  string request_id = 1;
+  NavigationStatus status = 2;
+  Pose2D current_pose = 3;       // 当前位姿（最新）
+  NavigationFailure failure = 4; // 终态时填充
+  int64 timestamp_ms = 5;        // UTC 毫秒时间戳
+}
+
+// 导航状态机
+enum NavigationStatus {
+  NAVIGATION_STATUS_UNKNOWN = 0;
+  NAVIGATION_STATUS_PENDING = 1;   // 已接收，等待串行锁
+  NAVIGATION_STATUS_ACTIVE = 2;    // 正在执行
+  NAVIGATION_STATUS_SUCCEEDED = 3;
+  NAVIGATION_STATUS_FAILED = 4;
+  NAVIGATION_STATUS_CANCELED = 5;
+}
+
+// 失败信息
+message NavigationFailure {
+  NavigationFailureCode code = 1;
+  string message = 2;
+  bool recoverable = 3;
+}
+
+// 错误码枚举（与 NavigationError.code 一一对应）
+enum NavigationFailureCode {
+  NAVIGATION_FAILURE_UNKNOWN = 0;
+  NAVIGATION_FAILURE_TIMEOUT = 1;
+  NAVIGATION_FAILURE_OBSTACLE = 2;
+  NAVIGATION_FAILURE_NO_PATH = 3;
+  NAVIGATION_FAILURE_CANCELED = 4;
+  NAVIGATION_FAILURE_QUEUE_FULL = 5;        // PENDING 队列满
+  NAVIGATION_FAILURE_PROXY_UNAVAILABLE = 6; // nav2_action_proxy 进程不可达
+}
+
+// 取消请求
+message CancelRequest {
+  string request_id = 1;
+}
+
+// 取消响应
+message CancelResponse {
+  bool canceled = 1;
+  string message = 2;
+}

@@ -761,7 +761,16 @@ class GatewayRuntime:
         )
 
     def stop(self) -> None:
-        """停止宿主机运行时。"""
+        """停止宿主机运行时。
+
+        关闭顺序（关键约束，参见 grpc-unavailable-shutdown-rootcause-2026-06-28）：
+        1. geometry 子进程先停：杀 _ros_bridge_subprocess + 关 gRPC channel +
+           置 _stopping 标记，让 in-flight RPC 入口立即抛 shutting_down
+        2. task_manager 再 shutdown(wait=True)：先 cancel_all_active_tasks
+           让 runner 下次 ensure_active 抛 TaskCancelledError 优雅退出
+        3. perception / audio / robot 后续清理
+        顺序不可颠倒：颠倒会让 in-flight task 拿陈旧 stub 继续打 RPC 全 UNAVAILABLE。
+        """
 
         with self._lock:
             if not self._started:
@@ -770,11 +779,13 @@ class GatewayRuntime:
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
             self._stop_safety_watchdog_loop()
             self.safety_guard.stop_all_motion("宿主机网关关闭。")
-            self.task_manager.shutdown(wait=False)
+            # 顺序：先关 geometry 子进程与 gRPC 通道，
+            # 再让 task_manager 失活并等待 task 退出。
+            self.platform_geometry_runtime.stop()
+            self.task_manager.shutdown(wait=True)
             self.audio_service.stop()
             self._stop_data_frame_stream_sources()
             self.perception_video_runtime.stop()
-            self.platform_geometry_runtime.stop()
             self.robot.stop()
             self._started = False
 

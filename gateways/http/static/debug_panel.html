@@ -429,6 +429,9 @@ button{font-family:inherit;cursor:pointer}
                 <button id="mapPublishPointToggle" class="tool glass" type="button" title="Publish Point：发布 /clicked_point">选点</button>
                 <button id="mapModeToggle" class="tool glass" type="button">3D</button>
                 <button id="mediaSwapBtn" class="tool glass media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ 视频</button>
+                <span style="width:1px;height:22px;background:var(--line)"></span>
+                <button id="mapNavToggle" class="tool glass" type="button" title="进入导航模式：在地图上左键选点后提交 navigate_to_pose">导航</button>
+                <button id="mapBoundaryToggle" class="tool glass" type="button" title="进入手划探索范围模式：在地图上拖拽画线段后提交 explore_area_v2">划线</button>
               </div>
               <span id="mapGoalStatus" class="mchip glass map-goal-chip" hidden></span>
               <span id="mapStreamStatus" class="mchip glass map-stream-chip">等待地图首帧</span>
@@ -5097,13 +5100,14 @@ button{font-family:inherit;cursor:pointer}
   </script>
   <script type="module" src="/static/js/pointcloud3d.js"></script>
   <!-- V2 navigation-and-exploration-boundary §9.3：容器 + 拆模块 script 引用（不堆业务） -->
-  <div id="navigation-container" data-role="v2-navigation" style="display:none">
+  <!-- 默认隐藏，由 map-toolbar 的"导航"按钮 / "划线"按钮点击后展开 -->
+  <div id="navigation-container" data-role="v2-navigation" hidden>
     <span data-role="nav-status">未选点</span>
     <button data-role="nav-submit">导航到选点</button>
     <button data-role="nav-cancel">取消导航</button>
     <pre data-role="nav-detail"></pre>
   </div>
-  <div id="boundary-draw-container" data-role="v2-boundary" style="display:none">
+  <div id="boundary-draw-container" data-role="v2-boundary" hidden>
     <button data-role="boundary-toggle">开始划线</button>
     <button data-role="boundary-submit">提交探索范围</button>
     <button data-role="boundary-clear">清空</button>
@@ -5111,5 +5115,34 @@ button{font-family:inherit;cursor:pointer}
   </div>
   <script src="/static/js/navigation.js"></script>
   <script src="/static/js/boundary_draw.js"></script>
+  <script>
+    // V2 navigation-and-exploration-boundary §9.3 入口开关：
+    // map-toolbar 上的"导航"按钮 → 显示 navigation-container
+    // map-toolbar 上的"划线"按钮 → 显示 boundary-draw-container
+    // 同时只允许一个容器可见（互斥模式）。
+    (function () {
+      'use strict';
+      var navContainer = document.getElementById('navigation-container');
+      var boundaryContainer = document.getElementById('boundary-draw-container');
+      var navBtn = document.getElementById('mapNavToggle');
+      var boundaryBtn = document.getElementById('mapBoundaryToggle');
+      function setActive(target) {
+        if (navContainer) navContainer.hidden = (target !== 'nav');
+        if (boundaryContainer) boundaryContainer.hidden = (target !== 'boundary');
+        if (navBtn) navBtn.classList.toggle('active', target === 'nav');
+        if (boundaryBtn) boundaryBtn.classList.toggle('active', target === 'boundary');
+      }
+      if (navBtn) {
+        navBtn.addEventListener('click', function () {
+          setActive(navContainer && navContainer.hidden ? 'nav' : null);
+        });
+      }
+      if (boundaryBtn) {
+        boundaryBtn.addEventListener('click', function () {
+          setActive(boundaryContainer && boundaryContainer.hidden ? 'boundary' : null);
+        });
+      }
+    })();
+  </script>
 </body>
 </html>

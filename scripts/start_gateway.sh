@@ -325,6 +325,9 @@ stop_existing_gateway() {
 
   terminate_process_scope "${pid}" "gateway supervisor"
   rm -f "${PID_FILE}"
+  # 顺序：先杀网关 worker（切断 geometry/perception 客户端调用）→
+  # 再停 ros-bridge（避免重启窗口期 GetFrameTree 抛 UNAVAILABLE 刷日志）→
+  # 最后清理外部几何进程。
   cleanup_stale_gateway_processes
   cleanup_stale_ros_bridge_processes
   cleanup_external_geometry_processes
@@ -446,12 +449,16 @@ stop_go2_video_streamer() {
 
 stop_gateway() {
   STOP_REQUESTED=1
-  stop_go2_video_streamer
-  stop_ros_bridge
+  # 顺序：先杀网关 worker → 再停 ros-bridge → 最后停 video streamer。
+  # 关键是先切断网关（geometry / perception 客户端），否则 ros-bridge 一停，
+  # 客户端在重启窗口期 GetFrameTree 立即抛 UNAVAILABLE，日志刷一长串
+  # "failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:50051"。
   if [[ -n "${GATEWAY_PID}" ]] && kill -0 "${GATEWAY_PID}" >/dev/null 2>&1; then
     terminate_process_scope "${GATEWAY_PID}" "gateway worker"
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
   fi
+  stop_ros_bridge
+  stop_go2_video_streamer
   cleanup_external_geometry_processes
   exit 0
 }

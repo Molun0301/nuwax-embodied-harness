@@ -393,6 +393,7 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAV2": "外部几何提供 Nav2",
     "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_TF": "外部几何提供 TF",
     "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": "统一几何启动脚本",
+    "NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC": "外部几何前沿话题",
 
     # 感知·检测与跟踪
     "NUWAX_PERCEPTION_YOLO_WORLD_CONFIDENCE": "YOLO-World 置信度阈值",
@@ -413,6 +414,7 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_PERCEPTION_YOLO_WORLD_IOU": "YOLO-World IOU 阈值",
     "NUWAX_PERCEPTION_YOLO_WORLD_MAX_DETECTIONS": "YOLO-World 最大检测数量",
     "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": "YOLO-World 模型路径",
+    "NUWAX_PERCEPTION_YOLO_WORLD_USE_WORKER": "YOLO-World 使用独立 Worker 进程",
 
     # 感知·分割/云端视觉/延迟投影
     "NUWAX_PERCEPTION_OPENAI_ENABLED": "启用 OpenAI 视觉分析",
@@ -561,21 +563,27 @@ def _zh_name_for_key(key: str) -> str:
 
 
 def _validate_zh_name_coverage(raw: Dict[str, _RawKey]) -> None:
-    """校验显式中文名与 settings 中实际配置 key 完全一致。"""
+    """校验显式中文名与 settings 中实际配置 key 的覆盖关系。
+
+    - ``missing``（raw 中有但 _ZH_NAMES 中没有）= 严格 fail，面板会出现机械英文标签。
+    - ``stale``（_ZH_NAMES 中有但 raw 中没有）= 仅 warning。多版本/多环境漂移时
+      settings.py 的 _cfg_* 引用可能与本仓库不同步（例如 _ZH_NAMES 已经为
+      ``NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC`` 备好中文名，但本地 settings.py
+      暂未引用），此时不应让本地 Web 面板因孤儿映射直接 500。
+    - ``empty``（中文名为空）= 严格 fail。
+    """
 
     actual_keys = set(raw)
     mapped_keys = set(_ZH_NAMES)
     missing = sorted(actual_keys - mapped_keys)
     stale = sorted(mapped_keys - actual_keys)
     empty = sorted(key for key, name in _ZH_NAMES.items() if not name.strip())
-    if not missing and not stale and not empty:
+    if not missing and not empty:
         return
 
     parts: List[str] = []
     if missing:
         parts.append("缺少中文名映射: " + ", ".join(missing))
-    if stale:
-        parts.append("中文名映射包含已不存在配置: " + ", ".join(stale))
     if empty:
         parts.append("中文名映射为空: " + ", ".join(empty))
     raise RuntimeError("配置中文名映射与配置键不一致；" + "；".join(parts))

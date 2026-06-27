@@ -415,8 +415,15 @@ class TaskManager:
                 self._records.pop(task_id, None)
 
     def shutdown(self, *, wait: bool = True) -> None:
-        """关闭任务管理器。"""
+        """关闭任务管理器。
 
+        顺序：先取消全部活动 task（让 runner 下次 ensure_active 抛 TaskCancelledError
+        优雅退出，停止 in-flight RPC 调用），再取消 timeout 定时器，最后关闭 executor。
+        这是 shutdown 期 gRPC UNAVAILABLE 刷错的必要修复——不取消的话 runner 会
+        继续 while 循环打 RPC（参见 grpc-unavailable-shutdown-rootcause-2026-06-28）。
+        """
+
+        self.cancel_all_active_tasks(message="task_manager shutdown")
         with self._lock:
             timers = [record.timeout_timer for record in self._records.values() if record.timeout_timer is not None]
         for timer in timers:

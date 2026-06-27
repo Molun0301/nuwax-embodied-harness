@@ -1952,7 +1952,6 @@ class PlatformGeometryRuntime:
         has_context = False
         try:
             from geometry_msgs.msg import PoseWithCovarianceStamped
-            from rclpy.duration import Duration
             from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
             rclpy = acquire_ros2_context()
@@ -1969,7 +1968,12 @@ class PlatformGeometryRuntime:
             }
             msg = PoseWithCovarianceStamped()
             msg.header.frame_id = frame_id
-            msg.header.stamp = (node.get_clock().now() - Duration(seconds=0.5)).to_msg()
+            # fix-tf2-stamp-stuck S1 Step 1：去除 -0.5s stamp 回退（避免 rtabmap TF cache
+            # 锁定老 stamp 导致 ExtrapolationError；改为 now()，与 ROS2 /initialpose
+            # 标准做法对齐）。与 services/localization/service.py:516 的合法 -0.5s
+            # 用途（规避 AMCL Foxy SIGSEGV）不同——本路径是 debug_panel 2D Pose 触发，
+            # 不存在 AMCL Foxy 的 lookupTransform 边界条件。
+            msg.header.stamp = node.get_clock().now().to_msg()
             msg.pose.pose.position.x = float(target_pose.position.x)
             msg.pose.pose.position.y = float(target_pose.position.y)
             msg.pose.pose.position.z = float(target_pose.position.z)

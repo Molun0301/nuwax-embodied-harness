@@ -394,13 +394,14 @@ class PerceptionService:
         image_frame = self._read_latest_pushed_image(camera_id)
         if image_frame is None:
             ingest_status = self._video_frame_source_status()
+            required_source = self._resolve_required_source_id(camera_id)
             raise GatewayError(
                 "端侧视频推流尚未接入或尚未收到首帧，无法执行实时感知；平台不会主动采集图像帧。",
                 error_code="video_ingest_not_ready",
                 http_status=503,
                 details={
                     "camera_id": camera_id,
-                    "required_source": "go2_side_stream_push",
+                    "required_source": required_source,
                     "platform_role": "video_ingest_receiver",
                     "ingest_status": ingest_status,
                 },
@@ -448,13 +449,14 @@ class PerceptionService:
         image_frame = self._read_latest_pushed_image(camera_id)
         if image_frame is None:
             ingest_status = self._video_frame_source_status()
+            required_source = self._resolve_required_source_id(camera_id)
             raise GatewayError(
                 "端侧视频推流尚未接入或尚未收到首帧，无法执行实时检测；平台不会主动采集图像帧。",
                 error_code="video_ingest_not_ready",
                 http_status=503,
                 details={
                     "camera_id": camera_id,
-                    "required_source": "go2_side_stream_push",
+                    "required_source": required_source,
                     "platform_role": "video_ingest_receiver",
                     "ingest_status": ingest_status,
                 },
@@ -1132,6 +1134,32 @@ class PerceptionService:
         except Exception as exc:
             return {"available": False, "connected": False, "reason": "status_snapshot_failed", "error": str(exc)}
         return dict(status or {})
+
+    def _resolve_required_source_id(self, camera_id: Optional[str] = None) -> str:
+        """从当前 ImageProvider 拉取 `get_stream_source_id()`，作为 ingest 门禁期望的源标识。
+
+        若 platform 侧未挂 ImageProvider 或 provider 不实现该协议方法，降级返回
+        `video_ingest_receiver`（与 `image_frame.metadata.source_kind` 默认值一致），
+        保持向后兼容。cross-robot-generalization-foundations G5。
+        """
+
+        providers = getattr(self, "_image_providers", None) or {}
+        # 优先按 camera_id 命中；未命中时取第一个 provider。
+        provider = None
+        if camera_id is not None:
+            provider = providers.get(camera_id)
+        if provider is None and providers:
+            provider = next(iter(providers.values()))
+        if provider is not None:
+            get_id = getattr(provider, "get_stream_source_id", None)
+            if callable(get_id):
+                try:
+                    source_id = str(get_id() or "").strip()
+                except Exception:
+                    source_id = ""
+                if source_id:
+                    return source_id
+        return "video_ingest_receiver"
 
     def video_frame_source_status(self) -> Dict[str, Any]:
         """返回平台端侧推流接收状态，供持续感知运行时做实时性门禁。"""

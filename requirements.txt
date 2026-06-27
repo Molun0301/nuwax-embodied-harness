@@ -1,20 +1,20 @@
-# `nuwax_robot_bridge` 的 Python 运行时依赖
+# `nuwax_robot_bridge` 的 Python 运行时依赖（机器人无关基础层）
 #
 # 本文件只记录 Python 包层面的依赖。
-# 宿主机仍然需要自行准备 pip 无法提供的系统依赖，包括：
-# - 供 `cyclonedds` / `unitree_sdk2py` 使用的 CycloneDDS 原生动态库
-# - 供本地播放和音量回退链路使用的 ALSA / Pulse / PipeWire 命令
+# 宿主机仍然需要自行准备 pip 无法提供的系统依赖。
 #
 # 当前主线已回收到 Python 3.8.10 兼容。
 # Jetson + JetPack 场景建议优先使用系统自带的 Python 3.8.10，
 # 避免破坏 CUDA / TensorRT / NVIDIA 相关预编译环境。
 #
-# 如果通过 `GO2_SDK_PATH` 使用本地 Unitree SDK，请保持这些依赖已安装，
-# 并确保当前解释器可以直接导入 `unitree_sdk2py`。
+# 【机器人专属依赖】见 requirements-<robot>.txt，由 installer 按 robot profile 自动选装：
+#   - requirements-go2.txt   Go2 专属（unitree_sdk2py + cyclonedds）
+#   - requirements-g1.txt    G1 专属（aiortc + aiohttp）
+#   - requirements-raspi.txt raspi_lidar_robot 专属（pyserial）
+#
+# 跨机器人变更记录：cross-robot-generalization-foundations（G2）
 
 websockets==10.4
-unitree_sdk2py==1.0.1
-cyclonedds==0.10.2
 numpy==1.24.4
 opencv-python==4.10.0.84
 pydantic==2.10.6

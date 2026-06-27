@@ -1,0 +1,9 @@
+# `nuwax_robot_bridge` raspi_lidar_robot 专属依赖
+#
+# 适用场景：`NUWAX_ACTIVE_ROBOT=raspi_lidar_robot` 或 installer --robot raspi_lidar_robot 时装。
+# 树莓派 + 2D 激光雷达 + USB 摄像头小机器狗，无 GPU，tier=lite。
+# 底盘通信走 pyserial；视频流走 V4L2（系统库，不在此列）。
+#
+# 跨机器人变更记录：cross-robot-generalization-foundations（G2）
+
+pyserial>=3.5

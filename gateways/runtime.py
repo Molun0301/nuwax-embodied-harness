@@ -235,6 +235,21 @@ _RUNTIME_METADATA_LOG_KEYS = (
 )
 
 
+def _resolve_telemetry_process_roles(robot) -> Tuple[str, ...]:
+    """从当前机器人 manifest 读 telemetry 进程角色白名单。
+
+    顺序：manifest.robot_profile.telemetry_process_keywords（按 robot 真实值）→
+    fallback 原 Go2 默认 ("go2_video_streamer",)。返回 tuple 以保持下游不可变。
+    """
+
+    manifest = getattr(robot, "manifest", None)
+    profile = getattr(manifest, "robot_profile", None) if manifest is not None else None
+    keywords = getattr(profile, "telemetry_process_keywords", None)
+    if keywords:
+        return tuple(str(k) for k in keywords)
+    return ("go2_video_streamer",)
+
+
 def _runtime_event_duration_ms(event) -> Optional[float]:
     metadata = getattr(event, "metadata", {}) or {}
     payload = getattr(event, "payload", {}) or {}
@@ -3783,7 +3798,7 @@ class GatewayRuntime:
                 updated_at=utc_now(),
                 reason="last_error" if perception_error else None,
                 related_streams=("video.frame", "video.detections"),
-                expected_process_roles=("go2_video_streamer",),
+                expected_process_roles=_resolve_telemetry_process_roles(self.robot),
                 metadata={"last_error": perception_error},
             )
         )

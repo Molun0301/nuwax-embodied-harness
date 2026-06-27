@@ -26,6 +26,9 @@ class McpPhase(Phase):
     dry_run_capable = True
 
     def run(self, planner, ctx) -> int:
+        if self._is_forbidden_by_robot_profile(planner):
+            ctx.info(self._robot_profile_skip_message())
+            return 0
         ctx.info(f"[phase: {self.name}] 注入 MCP 配置（mcp_mode={getattr(planner, 'mcp_mode', 'auto')}）")
         call_configure_mcp(planner)
         ctx.success(f"[phase: {self.name}] MCP 注入完成")

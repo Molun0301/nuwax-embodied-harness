@@ -61,7 +61,7 @@ _PROCESS_PATTERNS: Sequence[tuple[str, str, str]] = (
     ("rtabmap_live", "RTAB-Map 建图", "nuwax-rtabmap-live"),
     ("nav2", "Nav2 导航", "nuwax-nav2"),
     ("static_tf", "静态 TF", "nuwax-static-tf"),
-    ("go2_video_streamer", "Go2 视频推流", "drivers.go2.video_streamer"),
+    ("go2_video_streamer", "Go2 视频推流", "nuwax-go2-video-streamer"),
     ("gateway_web", "网关 Web 服务", "uvicorn gateways.app:create_gateway_app_from_env"),
     ("ros_bridge", "ROS 数据桥", "nuwax_ros_bridge"),
 )

@@ -1,0 +1,9 @@
+# `nuwax_robot_bridge` G1 专属依赖
+#
+# 适用场景：`NUWAX_ACTIVE_ROBOT=g1` 或 installer --robot g1 时装。
+# G1 走 Unitree WebRTC 通信，不需要 unitree_sdk2py 也不需要 cyclonedds。
+#
+# 跨机器人变更记录：cross-robot-generalization-foundations（G2）
+
+aiortc>=1.6
+aiohttp>=3.9

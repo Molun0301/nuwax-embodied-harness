@@ -45,6 +45,9 @@ class PreflightPhase(Phase):
     dry_run_capable = True
 
     def run(self, planner, ctx) -> int:
+        if self._is_forbidden_by_robot_profile(planner):
+            ctx.info(self._robot_profile_skip_message())
+            return 0
         ctx.info(f"[phase: {self.name}] 环境探测开始")
         # OS / 架构 / Python
         os_name = platform.system()

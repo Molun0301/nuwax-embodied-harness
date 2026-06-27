@@ -44,6 +44,9 @@ class ModelsPhase(Phase):
 
     def run(self, planner, ctx) -> int:
         """执行阶段 6；副作用全部委托给 scripts.bootstrap.prepare_assets。"""
+        if self._is_forbidden_by_robot_profile(planner):
+            ctx.info(self._robot_profile_skip_message())
+            return 0
         note = _resolve_planner_note(planner)
         ctx.guard_network(self.name)
         ctx.info(

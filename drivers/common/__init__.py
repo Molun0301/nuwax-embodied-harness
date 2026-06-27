@@ -13,7 +13,7 @@ from drivers.common.data_plane import (
     ObstacleAvoidanceControlDataPlane,
     RobotStateSensorDataPlane,
 )
-from drivers.common.manifest import ComponentBinding, RobotDefaults, RobotManifest
+from drivers.common.manifest import ComponentBinding, RobotDefaults, RobotManifest, RobotProfile
 
 __all__ = [
     "ComponentBinding",
@@ -30,5 +30,6 @@ __all__ = [
     "RobotAssemblyStatus",
     "RobotDefaults",
     "RobotManifest",
+    "RobotProfile",
     "RobotStateSensorDataPlane",
 ]

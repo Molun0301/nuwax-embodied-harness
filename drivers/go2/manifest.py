@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional, TYPE_CHECKING
 
-from drivers.common.manifest import ComponentBinding, RobotManifest
+from drivers.common.manifest import ComponentBinding, RobotManifest, RobotProfile
 from drivers.go2.capabilities import GO2_CAPABILITY_MATRIX
 from drivers.go2.defaults import GO2_DEFAULT_ADAPTER_BINDINGS, GO2_DEFAULT_AUDIO_BINDINGS, GO2_DEFAULT_SENSOR_BINDINGS
 
@@ -60,6 +60,26 @@ def build_go2_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Rob
         default_sensors=GO2_DEFAULT_SENSOR_BINDINGS,
         default_audio_backends=GO2_DEFAULT_AUDIO_BINDINGS,
         default_adapters=GO2_DEFAULT_ADAPTER_BINDINGS,
+        sensor_topology_ref="drivers.go2.defaults:GO2_DEFAULT_SENSOR_TOPOLOGY",
+        robot_profile=RobotProfile(
+            robot_name="go2",
+            tier_recommendation="full",
+            required_phases=(
+                "preflight", "system", "python_env", "geometry_deps",
+                "build_ws", "config_env", "models", "systemd", "mcp", "nuwaclaw", "health",
+            ),
+            forbidden_phases=(),
+            required_apt_packages=("ros-${ROS_DISTRO}-navigation2", "ros-${ROS_DISTRO}-rtabmap-ros"),
+            forbidden_apt_packages=(),
+            required_python_packages=("unitree_sdk2py==1.0.1", "cyclonedds==0.10.2"),
+            external_slam_script="Go2ShSlamScript",
+            calibration_required=True,
+            slam_dimension="3d",
+            memory_mode_recommendation="cloud",
+            perception_mode_recommendation="hybrid",
+            telemetry_interval_sec=2.0,
+            telemetry_process_keywords=("gateway", "rtabmap", "nav2", "robot_bridge", "ros2", "go2_video_streamer"),
+        ),
     )
 
 

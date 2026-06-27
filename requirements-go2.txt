@@ -1,0 +1,9 @@
+# `nuwax_robot_bridge` Go2 专属依赖
+#
+# 适用场景：`NUWAX_ACTIVE_ROBOT=go2` 或 installer --robot go2 时装。
+# 配套：仍需 `cyclonedds` 原生动态库（libddsc.so）以支持 Unitree DDS 数据面。
+#
+# 跨机器人变更记录：cross-robot-generalization-foundations（G2）
+
+unitree_sdk2py==1.0.1
+cyclonedds==0.10.2

@@ -3,20 +3,19 @@
 """nuwaclaw phase：阶段 9 — NuwaxClaw Docker（可选，默认关闭）。
 
 设计要点（plan RK6 + spec "错误定位输出契约" / RK15）：
-- 默认 disabled（``planner.install_nuwaclaw_docker = False``）；wizard 中显式确认才打开。
-- 启用时 ``nuwaclaw_host_mount == "rw"`` 必须双重确认（plan RK6）；installer 阶段抛
-  ``InstallerError(code=3, NUWACLAW_RISK_REFUSED)``。
+- 默认 disabled（``planner.install_nuwaclaw_docker = False``）；cli 先 skip。
+- 启用时 ``nuwaclaw_host_mount == "rw"`` 必须双重确认（plan RK6）；由 wizard 阶段
+  完成确认，installer 阶段不重复。
 - 镜像源 ``nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com`` 在 ``--offline``
-  模式下视为网络依赖；spec "offline 模式网络拦截" 要求 ``exit 8`` 提示。
-- ``dry_run_capable = False``（spec "dry-run 渲染契约"）：Docker 副作用无法精确模拟。
-- task 1 骨架：run/dry_run 占位；后续 task 5 替换为
-  ``_legacy_bridge.call_install_nuwaclaw_client`` 调用（bootstrap 内部 L1255）。
+  模式下视为网络依赖；本 phase 受 ``ctx.guard_network`` 拦截。
+- ``dry_run_capable = False``（spec "dry-run 渲染契约"）。
+- 调 ``_legacy_bridge.call_install_nuwaclaw_client``（bootstrap.install_nuwaclaw_client L1255）。
 """
-
 from __future__ import annotations
 
 from typing import List
 
+from scripts.installer._legacy_bridge import call_install_nuwaclaw_client
 from scripts.installer.phases.base import Phase
 
 
@@ -30,10 +29,18 @@ class NuwaclawPhase(Phase):
     dry_run_capable = False  # spec "dry-run 渲染契约"
 
     def run(self, planner, ctx) -> int:
-        print(f"[phase: {self.name}] 启动 NuwaxClaw Docker 客户端（task 1 骨架）")
+        if not bool(getattr(planner, "install_nuwaclaw_docker", False)):
+            ctx.info(f"[phase: {self.name}] planner.install_nuwaclaw_docker=False，跳过")
+            return 0
+        ctx.guard_network(self.name)
+        ctx.info(f"[phase: {self.name}] 启动 NuwaxClaw Docker 客户端（host_mount={getattr(planner, 'nuwaclaw_host_mount', 'none')}）")
+        call_install_nuwaclaw_client(planner)
+        ctx.success(f"[phase: {self.name}] NuwaxClaw Docker 客户端已启动")
         return 0
 
     def dry_run(self, planner, ctx) -> List[str]:
+        if not bool(getattr(planner, "install_nuwaclaw_docker", False)):
+            return ["[SKIP] planner.install_nuwaclaw_docker=False"]
         return [
             "[WARN] nuwaclaw 阶段 dry-run 不模拟真实副作用（Docker pull/run 无法精确 dry-run）",
             "+ docker run -d --name nuwax-client ...",

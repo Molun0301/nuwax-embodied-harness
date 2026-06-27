@@ -3,16 +3,19 @@
 """config_env phase：阶段 5 — 生成 .env + data_plane.env。
 
 设计要点（plan RK5）：
-- 检测到 ``.env`` 已存在时走 ``--migrate`` 路径：用 dotenv 解析旧值，写回新模板空白处，
-  原值保留。强制覆盖需 ``--force-overwrite-env``。
-- task 1 骨架：run/dry_run 占位；后续 task 5 替换为
-  ``_legacy_bridge.call_write_root_env`` + ``call_write_robot_env`` 调用。
+- 调 ``_legacy_bridge.call_write_root_env`` + ``call_write_robot_env``，
+  分别触发 bootstrap.write_root_env（L983）与 write_robot_env（L990）。
+- 检测到 ``.env`` 已存在时由 bootstrap.write_root_env 的 _read_existing_env
+  路径处理；强制覆盖需 ``--force-overwrite-env``（RK5，本期未实装强制覆盖开关）。
 """
-
 from __future__ import annotations
 
 from typing import List
 
+from scripts.installer._legacy_bridge import (
+    call_write_root_env,
+    call_write_robot_env,
+)
 from scripts.installer.phases.base import Phase
 
 
@@ -26,7 +29,10 @@ class ConfigEnvPhase(Phase):
     dry_run_capable = True
 
     def run(self, planner, ctx) -> int:
-        print(f"[phase: {self.name}] 生成根 .env + 机器人专属 env（task 1 骨架）")
+        ctx.info(f"[phase: {self.name}] 生成根 .env + 机器人专属 env")
+        call_write_root_env(planner)
+        call_write_robot_env(planner)
+        ctx.success(f"[phase: {self.name}] env 渲染完成")
         return 0
 
     def dry_run(self, planner, ctx) -> List[str]:

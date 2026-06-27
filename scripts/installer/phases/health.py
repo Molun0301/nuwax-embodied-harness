@@ -17,6 +17,9 @@ Requirement "health phase 区分 gateway 来源" + RK13/RK19）：
 * ``runtime_data/.gateway.lock`` 由 ``scripts.installer._lock`` 写入持有者 PID
 * ``runtime_data/installer_state.json`` 由 ``scripts.installer.state`` 维护
   ``phases[health].started_pids: list[int]`` 字段（写时记，启动时清）
+
+实现形式：作为 ``Phase`` 子类暴露 ``run(planner, ctx)`` / ``dry_run(planner, ctx)``，
+保留原 module-level ``run()`` 供向后兼容 / 单测调用。
 """
 
 from __future__ import annotations
@@ -26,9 +29,10 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Tuple
 
 from scripts.installer._lock import LOCK_FILE, current_holder_pid
+from scripts.installer.phases.base import Phase
 
 STATE_FILE = Path("runtime_data/installer_state.json")
 HEALTH_URL = "http://127.0.0.1:8766/api/health"
@@ -97,7 +101,7 @@ def _curl_health() -> tuple[int, str]:
 
 
 def run() -> dict[str, Any]:
-    """health phase 主入口。
+    """health phase 主入口（module-level 兼容旧调用）。
 
     返回 ``{"status": "success"|"skipped"|"failed",
              "holder_pid": int|None,
@@ -148,6 +152,46 @@ def run() -> dict[str, Any]:
         "message": f"[health] curl exit {exit_code}: {output.strip()[:200]}",
         "curl_exit": exit_code,
     }
+
+
+class HealthPhase(Phase):
+    """阶段 11（最后一个）— gateway /api/health 探测。"""
+
+    name = "health"
+    order = 10
+    requires: tuple = ()
+    retryable = True
+    dry_run_capable = True
+
+    def run(self, planner, ctx) -> int:
+        if not bool(getattr(planner, "healthcheck", False)):
+            ctx.info(f"[phase: {self.name}] planner.healthcheck=False，跳过")
+            return 0
+        result = run()
+        if result["status"] == "success":
+            ctx.success(result["message"])
+            return 0
+        if result["status"] == "skipped":
+            # 外部启动：不算失败
+            ctx.info(result["message"])
+            return 0
+        # failed
+        ctx.error(result["message"])
+        return 1
+
+    def dry_run(self, planner, ctx) -> List[str]:
+        if not bool(getattr(planner, "healthcheck", False)):
+            return ["[SKIP] planner.healthcheck=False"]
+        return [
+            f"+ curl -sS -m {CURL_TIMEOUT_SEC} {HEALTH_URL}（5s timeout，禁止订阅 ROS 主题）",
+            "+ if PID ∈ state.json started_pids → installer 自启 → 走 curl",
+            "+ else → 外部启动 → 跳过 + 打印 'gateway 已由外部启动'",
+        ]
+
+
+from scripts.installer.phases import default_registry  # noqa: E402
+
+default_registry.register(name="health", cls=HealthPhase)
 
 
 if __name__ == "__main__":  # pragma: no cover —— 仅供本地手动调试

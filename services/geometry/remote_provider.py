@@ -95,6 +95,12 @@ def _log_rpc_error(rpc_name: str, exc: grpc.RpcError) -> None:
         LOGGER.debug("gRPC %s 调用失败: %s", rpc_name, exc)
 
 
+def _is_shutdown_guard_enabled() -> bool:
+    """NUWAX_GEOMETRY_SHUTDOWN_GUARD=0 时关闭（紧急回滚）。"""
+    value = os.environ.get("NUWAX_GEOMETRY_SHUTDOWN_GUARD", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def _normalize_frame(frame_id: str) -> str:
     """去掉 ROS 风格前导斜杠并去空白，便于契约校验。"""
     return str(frame_id or "").strip().lstrip("/")
@@ -238,6 +244,9 @@ class RosBridgeProvider:
         self._channel: Optional[grpc.Channel] = None
         self._stub: Optional[pb2_grpc.GeometryRuntimeStub] = None
         self._connected = False
+        # shutdown 期守卫标志：disconnect()/清状态时置 True，所有 RPC 入口 guard。
+        # 防止 in-flight task 持陈旧 _stub 引用继续打 RPC 全 UNAVAILABLE。
+        self._stopping = False
         # 装配期一次性缓存的静态外参边（相机光学系等），每帧 get_frame_tree 合并。
         self._static_extrinsic_edges: List[Transform] = []
 
@@ -259,6 +268,10 @@ class RosBridgeProvider:
         RPC 失败后必须 reset bridge 状态，否则会留下永久 `_started=True`
         假活锁（参见 grpc-attach-zombie-bridge-2026-06-27）。
         """
+        # shutdown 后禁止重连——防止留下半连接 ghost channel。
+        if self._stopping and _is_shutdown_guard_enabled():
+            LOGGER.debug("shutdown 中，拒绝重新连接 gRPC")
+            return False
         if not self._bridge.is_running:
             LOGGER.error("子进程未启动，无法连接")
             return False
@@ -276,6 +289,8 @@ class RosBridgeProvider:
 
     def _cleanup_after_failed_connect(self) -> None:
         """connect 失败时释放已建 channel/stub 并强制 bridge 进入未启动状态。"""
+        # 第一行置位 _stopping：竞态防护，确保后续清理时 guard 已生效。
+        self._stopping = True
         # 先关 channel 让底层连接断开，再清 stub 防止后续误用。
         if self._channel is not None:
             try:
@@ -294,6 +309,8 @@ class RosBridgeProvider:
             LOGGER.warning("bridge.disconnect 失败（不影响主流程）: %s", exc)
 
     def disconnect(self) -> None:
+        # 第一行置位 _stopping：竞态防护，确保 guard 在 channel 关闭前生效。
+        self._stopping = True
         if self._channel:
             self._channel.close()
             self._channel = None
@@ -304,7 +321,19 @@ class RosBridgeProvider:
     def is_connected(self) -> bool:
         return self._connected
 
+    def _raise_if_stopping(self, rpc_name: str) -> None:
+        """shutdown 守卫：_stopping=True 且 guard 启用时，所有 RPC 入口抛 shutting_down。
+
+        防止 shutdown 期间 in-flight task 持陈旧 _stub 引用继续打 RPC 全 UNAVAILABLE。
+        调用方（task runner 等）应 catch RuntimeError 优雅退出（AC4 期望 DEBUG 日志）。
+        通过 NUWAX_GEOMETRY_SHUTDOWN_GUARD=0 可紧急回滚禁用此守卫。
+        """
+        if self._stopping and _is_shutdown_guard_enabled():
+            LOGGER.debug("RosBridgeProvider.%s 在 shutdown 期被阻断", rpc_name)
+            raise RuntimeError("shutting_down")
+
     def is_available(self) -> bool:
+        self._raise_if_stopping("is_available")
         if not self._connected or not self._stub:
             return False
         try:
@@ -319,6 +348,7 @@ class RosBridgeProvider:
 
     # === Localization ===
     def get_current_pose(self) -> Optional[Pose]:
+        self._raise_if_stopping("get_current_pose")
         if not self._stub:
             return None
         try:
@@ -329,6 +359,7 @@ class RosBridgeProvider:
             return None
 
     def get_frame_tree(self) -> Optional[FrameTree]:
+        self._raise_if_stopping("get_frame_tree")
         if not self._stub:
             return None
         try:
@@ -341,6 +372,7 @@ class RosBridgeProvider:
 
     # === Mapping ===
     def get_occupancy_grid_meta(self) -> Optional[Dict[str, Any]]:
+        self._raise_if_stopping("get_occupancy_grid_meta")
         if not self._stub:
             return None
         try:
@@ -357,6 +389,7 @@ class RosBridgeProvider:
 
     def get_occupancy_grid_data(self) -> Optional[Dict[str, Any]]:
         """获取完整 OccupancyGrid 数据（元数据 + 栅格字节）。"""
+        self._raise_if_stopping("get_occupancy_grid_data")
         if not self._stub:
             return None
         try:
@@ -376,6 +409,7 @@ class RosBridgeProvider:
 
     # === Navigation ===
     def set_navigation_goal(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float) -> Dict[str, Any]:
+        self._raise_if_stopping("set_navigation_goal")
         if not self._stub:
             return {"accepted": False, "message": "未连接"}
         try:
@@ -392,6 +426,7 @@ class RosBridgeProvider:
             return {"accepted": False, "message": str(e)}
 
     def cancel_navigation(self) -> bool:
+        self._raise_if_stopping("cancel_navigation")
         if not self._stub:
             return False
         try:
@@ -402,6 +437,7 @@ class RosBridgeProvider:
             return False
 
     def get_navigation_readiness(self) -> Dict[str, Any]:
+        self._raise_if_stopping("get_navigation_readiness")
         if not self._stub:
             return {"ready": False, "message": "未连接"}
         try:
@@ -422,6 +458,7 @@ class RosBridgeProvider:
                      lvx: float = 0, lvy: float = 0, lvz: float = 0,
                      avx: float = 0, avy: float = 0, avz: float = 0,
                      frame_id: str = "odom") -> bool:
+        self._raise_if_stopping("publish_odom")
         if not self._stub:
             return False
         try:
@@ -441,6 +478,7 @@ class RosBridgeProvider:
             return False
 
     def get_status(self) -> Dict[str, Any]:
+        self._raise_if_stopping("get_status")
         if not self._stub:
             return {"phase": "disconnected", "rss_kb": 0}
         try:

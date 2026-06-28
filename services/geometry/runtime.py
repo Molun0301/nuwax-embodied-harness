@@ -74,6 +74,73 @@ _EXTERNAL_GEOMETRY_STACKS = {"external_slam_nav2"}
 _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME = "external_slam_nav2_state.db"
 _MAIN_LOG_APPEND_LOCK = threading.Lock()
 _GO2_SH_MAIN_LOG_LOGGER = "nuwax_robot_bridge.geometry.go2.sh"
+_SUBPROCESS_LOG_LEVEL_NAMES = frozenset(
+    {"DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"}
+)
+_ROS2_NODE_LOG_RE = re.compile(
+    r"^\[(?P<proc>[^\]]+)\]\s+"
+    r"\[(?P<level>DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\]\s+"
+    r"\[(?P<stamp>[\d.]+)\]\s+"
+    r"(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_LAUNCH_LOG_RE = re.compile(
+    r"^\[(?P<level>DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\]\s+"
+    r"(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+
+
+def _canonical_main_log_level(level: str) -> str:
+    upper = str(level or "INFO").strip().upper()
+    if upper in {"WARN", "WARNING"}:
+        return "WARNING"
+    if upper in {"FATAL", "CRITICAL"}:
+        return "ERROR"
+    if upper in _SUBPROCESS_LOG_LEVEL_NAMES:
+        return upper
+    return "INFO"
+
+
+def _main_log_level_to_logging(level: str) -> int:
+    canonical = _canonical_main_log_level(level)
+    return {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+    }.get(canonical, logging.INFO)
+
+
+def _normalize_subprocess_log_line(message: str) -> Tuple[str, str]:
+    """解析 go2.sh / ros2 launch 子进程行，提取真实等级并去掉重复前缀。"""
+
+    text = str(message or "").strip()
+    if not text:
+        return "INFO", text
+
+    node_match = _ROS2_NODE_LOG_RE.match(text)
+    if node_match:
+        level = _canonical_main_log_level(node_match.group("level"))
+        proc = node_match.group("proc")
+        rest = node_match.group("rest")
+        return level, "[%s] %s" % (proc, rest)
+
+    launch_match = _LAUNCH_LOG_RE.match(text)
+    if launch_match:
+        level = _canonical_main_log_level(launch_match.group("level"))
+        return level, launch_match.group("rest").strip()
+
+    lowered = text.lower()
+    if (
+        "deprecationwarning" in lowered
+        or ": warning:" in lowered
+        or lowered.startswith("warning:")
+        or lowered.startswith("go2.sh: warning:")
+    ):
+        return "WARNING", text
+
+    return "INFO", text
 
 
 def _project_log_file() -> Path:
@@ -91,12 +158,12 @@ def _format_main_log_line(logger_name: str, message: str, *, level: str = "INFO"
     return "%s [%s] [%s] %s\n" % (asctime, level, logger_name, message)
 
 
-def _publish_main_log_stream(logger_name: str, message: str) -> None:
+def _publish_main_log_stream(logger_name: str, message: str, *, level: str = "INFO") -> None:
     """将 go2.sh 子进程行推送到 StreamBus logs.entry（不经 file handler，避免重复写盘）。"""
 
     record = logging.LogRecord(
         name=str(logger_name or _GO2_SH_MAIN_LOG_LOGGER),
-        level=logging.INFO,
+        level=_main_log_level_to_logging(level),
         pathname=__file__,
         lineno=0,
         msg=str(message or ""),
@@ -118,13 +185,14 @@ def _append_main_log_line(logger_name: str, message: str) -> None:
     text = str(message or "").rstrip("\r\n")
     if not text:
         return
+    level, normalized = _normalize_subprocess_log_line(text)
     path = _project_log_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = _format_main_log_line(logger_name, text)
+    line = _format_main_log_line(logger_name, normalized, level=level)
     with _MAIN_LOG_APPEND_LOCK:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
-    _publish_main_log_stream(logger_name, text)
+    _publish_main_log_stream(logger_name, normalized, level=level)
 
 
 @dataclass

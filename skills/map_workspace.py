@@ -373,6 +373,24 @@ class MapWorkspaceService:
         )
         return version
 
+    def _ensure_workspace_memory_active(
+        self,
+        *,
+        map_name: str,
+        load_memory_history: bool = True,
+        reset_memory_library: bool = False,
+    ) -> None:
+        """确保地图同名记忆库进入激活态（load_map_version 必调，避免仅切几何栈而记忆库未启用）。"""
+
+        resolved_name = self._require_map_name(map_name)
+        self._memory_service.ensure_memory_library(library_name=resolved_name)
+        self._memory_service.activate_memory_library(
+            library_name=resolved_name,
+            load_history=load_memory_history,
+            reset_library=reset_memory_library,
+            expected_library_name=resolved_name,
+        )
+
     def load_map_version(
         self,
         *,
@@ -393,6 +411,17 @@ class MapWorkspaceService:
                 metadata=metadata,
                 load_latest_version=False,
             )
+        else:
+            self._ensure_workspace_memory_active(
+                map_name=resolved_name,
+                load_memory_history=load_memory_history,
+                reset_memory_library=reset_memory_library,
+            )
+            if activate_if_needed:
+                asset = self._repository.get_map_asset(resolved_name)
+                if asset is not None:
+                    self._repository.set_active_map_name(resolved_name)
+                    self._sync_asset(asset, is_active=True, refresh_localization=False)
         version = (
             self._require_map_version(resolved_name, version_id)
             if version_id

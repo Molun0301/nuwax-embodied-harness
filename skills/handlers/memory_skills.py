@@ -173,6 +173,7 @@ def handle_enable_memory_library(
             load_memory_history=bool(payload.get("load_history", True)),
             reset_memory_library=bool(payload.get("reset_library", False)),
             metadata={"requested_by": requested_by or "unknown", "source": "enable_memory_library"},
+            load_latest_version=False,
         )
         compatibility_mode = "map_workspace"
     else:

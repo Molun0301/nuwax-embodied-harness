@@ -287,7 +287,8 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
         "initial_wait_sec": 45.0,
         "poll_interval_sec": 12.0,
         "hint": (
-            "load_map_version 会启动 go2.sh --localization，通常需 45–90 秒。"
+            "load_map_version 会启动 go2.sh --localization，通常需 45–90 秒；"
+            "并自动激活与 map_name 同名的记忆库（无需再调 enable_memory_library）。"
             "提交后请先等待约 45 秒，再调用 get_task_status；之后每 12 秒轮询一次直至 state=succeeded。"
             "禁止连续秒级高频轮询。"
         ),
@@ -1875,7 +1876,9 @@ class GatewayRuntime:
             _descriptor(
                 "load_map_version",
                 "加载地图版本",
-                "把平台侧已保存的地图版本加载到当前地图工作区并启动 go2.sh --localization。异步任务：立即返回 task_id；请等待约 45s 后再 get_task_status，之后每 12s 轮询直至 succeeded，勿秒级高频连刷。",
+                "把平台侧已保存的地图版本加载到当前地图工作区、自动激活同名记忆库，并启动 go2.sh --localization。"
+                "异步任务：立即返回 task_id；请等待约 45s 后再 get_task_status，之后每 12s 轮询直至 succeeded，勿秒级高频连刷。"
+                "加载成功后无需再单独调用 enable_memory_library。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -2760,7 +2763,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="load_map_version",
                 display_name="加载地图版本",
-                description="加载已保存地图版本并启动 go2.sh --localization。异步：返回 task_id 后等待约 45s 再 get_task_status，每 12s 轮询，勿高频连刷。",
+                description="加载已保存地图版本、自动激活同名记忆库，并启动 go2.sh --localization。成功后无需再调 enable_memory_library。异步：返回 task_id 后等待约 45s 再 get_task_status，每 12s 轮询，勿高频连刷。",
                 category=SkillCategory.MEMORY,
                 capability_name="load_map_version",
             ),
@@ -4148,9 +4151,16 @@ class GatewayRuntime:
                 result = dict(snapshot["result"])
                 if not result.get("next_step_hint"):
                     if spec.capability_name == "load_map_version":
+                        map_name = str(result.get("map_version", {}).get("map_name") or "").strip()
+                        memory_ok = result.get("memory_library_activated")
+                        memory_note = (
+                            "同名记忆库已激活。"
+                            if memory_ok is not False
+                            else "请检查 memory_summary.active_library_name 是否与地图一致。"
+                        )
                         result["next_step_hint"] = (
-                            "地图版本已加载。Debug 应立即可见 checkpoint 地图；"
-                            "live /map_obstacles 可能仍需数十秒。可直接 navigate_to_pose。"
+                            "地图版本已加载%s。%s Debug 应立即可见 checkpoint 地图；可直接 navigate_to_pose。"
+                            % (("（%s）" % map_name) if map_name else "", memory_note)
                         )
                     snapshot["result"] = result
             return snapshot
@@ -4516,7 +4526,7 @@ class GatewayRuntime:
         if "map_asset" in slim:
             slim["map_asset"] = self._slim_map_asset(slim.get("map_asset"))
         if "active_workspace" in slim:
-            include_memory = capability_name == "activate_map"
+            include_memory = capability_name in {"activate_map", "load_map_version"}
             slim["active_workspace"] = self._slim_workspace(
                 slim.get("active_workspace"),
                 include_memory=include_memory,

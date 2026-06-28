@@ -309,11 +309,18 @@ def handle_load_map_version(
     ctx.refresh_workspace_snapshots(refresh_localization=False)
     ctx.publish_pointcloud_map_stream_frame(reason="load_map_version")
     ctx.publish_runtime_governance_stream_frame()
+    ctx.sync_perception_runtime_for_memory_state(enabled=True)
+    active_workspace = ctx.map_workspace_service.get_active_workspace(refresh_localization=False) or workspace
+    memory_summary = ctx.memory_service.get_summary()
+    active_library = memory_summary.metadata.get("active_library_name") if memory_summary is not None else None
     return {
         "map_version": map_version,
-        "active_workspace": workspace,
+        "active_workspace": active_workspace,
+        "memory_summary": memory_summary,
+        "memory_library_activated": str(active_library or "") == map_name,
         "next_step_hint": (
-            "地图版本已加载。Debug 应立即可见 checkpoint 地图；"
-            "live /map_obstacles 可能仍需数十秒。可直接 navigate_to_pose 或等待定位收敛。"
+            "地图版本已加载，同名记忆库 %s 已一并激活（无需再调 enable_memory_library）。"
+            "Debug 应立即可见 checkpoint 地图；可直接 navigate_to_pose 或等待定位收敛。"
+            % map_name
         ),
     }

@@ -1990,6 +1990,15 @@ button{font-family:inherit;cursor:pointer}
       }
       function mapGoalUsesOfflineGrid() {
         const diagnostics = state.mapStream && state.mapStream.diagnostics ? state.mapStream.diagnostics : {};
+        // 定位模式固定 checkpoint 仅作 Debug 底图；Nav2 仍用已加载静态图，允许 RViz 式 2D Goal。
+        if (shouldPinLocalizationCheckpointDisplay(diagnostics)) return false;
+        if (activeLocalizationSessionReason()) {
+          const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
+          const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
+          if (sourceKind === "platform_map_version" || snapshotKind === "offline_checkpoint") {
+            return false;
+          }
+        }
         const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
         const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
         return sourceKind === "platform_map_version" || snapshotKind === "offline_checkpoint";
@@ -2088,13 +2097,14 @@ button{font-family:inherit;cursor:pointer}
             ? `Nav2 未就绪（等待 ${waitingFor}）。${message || ""}`
             : (message || "Nav2 未就绪，无法导航。");
         }
-        if (code === "nav2_goal_rejected") {
-          const details = payload && payload.details ? payload.details : {};
-          const actionName = details.action_name ? ` action=${details.action_name}` : "";
-          return `${message || "Nav2 拒绝目标。"}${actionName}`;
+        if (code === "goal_pose_publish_failed" || code === "goal_pose_publish_unsupported") {
+          return message || "发布 /goal_pose 失败。";
+        }
+        if (code === "initial_pose_publish_failed" || code === "initial_pose_publish_unsupported") {
+          return message || "发布 /initialpose 失败。";
         }
         if (code === "nav2_provider_unavailable") {
-          return message || "Nav2 action provider 未初始化。";
+          return message || "Nav2 provider 未初始化。";
         }
         return message || `HTTP ${status}`;
       }
@@ -2125,7 +2135,6 @@ button{font-family:inherit;cursor:pointer}
           y: Number(mapPoint.y),
           z: 0,
           yaw_rad: Number(yawRad),
-          accept_timeout_sec: 8,
         };
         if (mapName) body.map_name = mapName;
         state.pendingNavGoal = {
@@ -2140,7 +2149,7 @@ button{font-family:inherit;cursor:pointer}
         updateGoalPickStatus(`下发 map 目标 ${formatMapPoint(mapPoint)} · 机器人 ${robotLabel}${distanceLabel} · 坐标系 ${frameId}`, "pending");
         requestMapDraw(false);
         const controller = new AbortController();
-        const requestTimeout = window.setTimeout(() => controller.abort(), 12000);
+        const requestTimeout = window.setTimeout(() => controller.abort(), 5000);
         try {
           const response = await fetch(withAccessToken("/api/debug/navigation/goal"), {
             method: "POST",
@@ -2152,8 +2161,9 @@ button{font-family:inherit;cursor:pointer}
           if (!response.ok) {
             throw new Error(formatNavGoalError(payload, response.status));
           }
-          const accepted = payload.accepted === true;
-          const pending = payload.pending === true;
+          if (!payload.published) {
+            throw new Error(payload.message || "发布 /goal_pose 失败。");
+          }
           const apiDistance = payload.distance_m;
           const distanceSuffix = Number.isFinite(Number(apiDistance))
             ? ` · 距离 ${Number(apiDistance).toFixed(2)}m`
@@ -2163,22 +2173,15 @@ button{font-family:inherit;cursor:pointer}
             y: body.y,
             yaw_rad: body.yaw_rad,
             frame_id: frameId,
-            status: accepted ? "accepted" : (pending ? "pending" : "error"),
-            goalId: payload.goal_id || null,
-            actionName: payload.action_name || null,
+            status: "published",
+            topic: payload.topic || "/goal_pose",
           };
-          const actionLabel = payload.action_name ? ` · ${payload.action_name}` : "";
+          const topicLabel = payload.topic ? ` · ${payload.topic}` : "";
           const goalLabel = `${formatMapPoint(mapPoint)}${distanceSuffix} · ${frameId}`;
-          if (accepted) {
-            updateGoalPickStatus(`Nav2 已接受 ${goalLabel}${actionLabel}`, "ok");
-          } else if (pending) {
-            updateGoalPickStatus(`Nav2 已发送 ${goalLabel}，等待接受（坐标与地图一致；若未移动请看导航面板失败原因）${actionLabel}`, "pending");
-          } else {
-            updateGoalPickStatus(payload.message || "Nav2 未接受目标", "error");
-          }
+          updateGoalPickStatus(`已发布 RViz 目标 ${goalLabel}${topicLabel}`, "ok");
         } catch (error) {
           const message = error && error.name === "AbortError"
-            ? "Nav2 下发超时（12s），请确认 go2.sh / Nav2 action server 已启动。"
+            ? "发布 /goal_pose 超时（5s），请确认网关与 go2.sh 已启动。"
             : (error && error.message ? error.message : String(error));
           state.pendingNavGoal = {
             x: body.x,
@@ -2268,8 +2271,10 @@ button{font-family:inherit;cursor:pointer}
           });
           const payload = await response.json().catch(() => ({}));
           if (!response.ok) {
-            const message = String((payload && payload.message) || `HTTP ${response.status}`);
-            throw new Error(message);
+            throw new Error(formatNavGoalError(payload, response.status));
+          }
+          if (!payload.published) {
+            throw new Error(payload.message || "发布 /initialpose 失败。");
           }
           state.initialPoses = [
             {
@@ -2283,7 +2288,7 @@ button{font-family:inherit;cursor:pointer}
             ...(state.initialPoses || []),
           ].slice(0, 20);
           const topic = payload.topic || "/initialpose";
-          updateGoalPickStatus(`已发布 ${topic} ${formatMapPoint(mapPoint)} yaw=${(body.yaw_rad * 180 / Math.PI).toFixed(0)}°${distanceLabel} · ${frameId}`, "ok");
+          updateGoalPickStatus(`已发布 RViz 初始位姿 ${formatMapPoint(mapPoint)} yaw=${(body.yaw_rad * 180 / Math.PI).toFixed(0)}°${distanceLabel} · ${topic} · ${frameId}`, "ok");
         } catch (error) {
           const message = error && error.message ? error.message : String(error);
           updateGoalPickStatus(`初始位姿发布失败：${message}`, "error");
@@ -2482,6 +2487,19 @@ button{font-family:inherit;cursor:pointer}
         const snapshotKind = String(diagnostics && diagnostics.map_snapshot_kind || "").toLowerCase();
         return sourceKind === "platform_map_version" || snapshotKind === "offline_checkpoint";
       }
+      function shouldPinLocalizationCheckpointDisplay(diagnostics) {
+        if (!diagnostics) return false;
+        if (diagnostics.pin_checkpoint_display === true) return true;
+        if (String(diagnostics.suppressed_live_map_reason || "") === "localization_mode_pin_checkpoint_display") {
+          return true;
+        }
+        const backendMode = String(
+          diagnostics.backend_mode
+          || (diagnostics.geometry_activation && diagnostics.geometry_activation.backend_mode)
+          || ""
+        ).trim().toLowerCase();
+        return backendMode === "rtabmap_localization" && loadedMapVersionShouldDisplay(diagnostics);
+      }
       function hasLiveMapFlag(diagnostics, streamBridge) {
         if (!diagnostics) return false;
         if (mapSnapshotIsOffline(diagnostics)) return false;
@@ -2561,8 +2579,33 @@ button{font-family:inherit;cursor:pointer}
       }
       function clearMapOverlayState() {
         state.frontiers = [];
+        state.latestFrontierStream = null;
         state.goalPose = null;
         state.navigationPath = [];
+      }
+      function resolveGeometrySessionMode(data) {
+        const direct = data && data.geometry_session_mode;
+        if (direct) return String(direct).trim().toLowerCase();
+        const explorationContext = data && data.exploration_context;
+        const contextMeta = explorationContext && explorationContext.metadata;
+        if (contextMeta && contextMeta.geometry_session_mode) {
+          return String(contextMeta.geometry_session_mode).trim().toLowerCase();
+        }
+        const explorationState = explorationContext && explorationContext.exploration_state;
+        const stateMeta = explorationState && explorationState.metadata;
+        if (stateMeta && stateMeta.geometry_session_mode) {
+          return String(stateMeta.geometry_session_mode).trim().toLowerCase();
+        }
+        return "";
+      }
+      function shouldRetainFrontierStreamCache(fr, data) {
+        if (!fr) return false;
+        if (fr.frontier_cleared === true) return false;
+        const sessionMode = resolveGeometrySessionMode(data)
+          || String(fr.geometry_session_mode || "").trim().toLowerCase();
+        if (sessionMode && sessionMode !== "explore") return false;
+        if (fr.exploration_terminal === true) return false;
+        return true;
       }
       function clearMapDisplay(message, status, diagnostics, streamBridge, envelope, grid) {
         if (state.goalPickMode || state.publishPointMode || state.initialPosePickMode || state.pendingNavGoal) {
@@ -3282,7 +3325,10 @@ button{font-family:inherit;cursor:pointer}
           return;
         }
         setPill(els.mapStatus, status);
-        if (grid && Array.isArray(grid.data)) {
+        const pinCheckpoint = shouldPinLocalizationCheckpointDisplay(diagnostics);
+        const incomingIsLive = !mapSnapshotIsOffline(diagnostics);
+        const keepCheckpointGrid = pinCheckpoint && incomingIsLive && state.mapGrid && Array.isArray(state.mapGrid.data);
+        if (grid && Array.isArray(grid.data) && !keepCheckpointGrid) {
           const nextContentKey = mapGridContentKey(grid, envelope, diagnostics);
           const baseDirty = state.mapGridContentKey !== nextContentKey;
           state.mapGrid = grid;
@@ -3290,6 +3336,10 @@ button{font-family:inherit;cursor:pointer}
           els.mapEmpty.hidden = status === "available";
           els.mapEmpty.textContent = status === "stale" ? "地图数据已过期，保留最后一帧。" : "";
           requestMapDraw(baseDirty);
+        } else if (keepCheckpointGrid) {
+          els.mapEmpty.hidden = true;
+          els.mapEmpty.textContent = "";
+          requestMapDraw(false);
         }
         setKv(els.mapMeta, [
           ["地图名称", diagnostics.active_map_name || diagnostics.map_name || envelope.frame_id || (grid && grid.frame_id) || "--"],
@@ -3324,6 +3374,7 @@ button{font-family:inherit;cursor:pointer}
       }
       function mapStreamLabel(status, diagnostics, streamBridge) {
         if (diagnostics && diagnostics.display_suppressed_reason) return "缓存地图已隐藏";
+        if (shouldPinLocalizationCheckpointDisplay(diagnostics)) return "定位模式·已载入版本";
         if (loadedMapVersionShouldDisplay(diagnostics)) return "已载入地图版本";
         const messageCount = diagnostics && (diagnostics.message_count || diagnostics.update_sequence || diagnostics.sequence);
         const revision = diagnostics && (diagnostics.content_revision || diagnostics.occupancy_content_revision || diagnostics.revision);
@@ -3526,6 +3577,14 @@ button{font-family:inherit;cursor:pointer}
         const fr = state.latestFrontierStream;
         if (!fr) return data;
         const merged = { ...data };
+        if (!shouldRetainFrontierStreamCache(fr, merged)) {
+          if (!merged.frontiers || !merged.frontiers.length) merged.frontiers = [];
+          if (merged.frontier_count === null || merged.frontier_count === undefined) merged.frontier_count = 0;
+          if (merged.exploration_terminal === undefined || merged.exploration_terminal === null) {
+            merged.exploration_terminal = fr.exploration_terminal === true || fr.frontier_cleared === true;
+          }
+          return merged;
+        }
         if (!merged.explorer_status_text && fr.status_text) merged.explorer_status_text = fr.status_text;
         if ((merged.frontier_count === null || merged.frontier_count === undefined) && fr.frontier_count != null) {
           merged.frontier_count = fr.frontier_count;
@@ -4355,6 +4414,36 @@ button{font-family:inherit;cursor:pointer}
       }
       function updateFrontierFrame(frame) {
         const payload = frame.payload || {};
+        const frameMetadata = frame.metadata || {};
+        const cleared = payload.frontier_cleared === true || frameMetadata.frontier_cleared === true;
+        const sessionMode = String(payload.geometry_session_mode || "").trim().toLowerCase();
+        if (cleared || (sessionMode && sessionMode !== "explore")) {
+          state.latestFrontierStream = {
+            status_text: payload.status_text,
+            frontier_count: 0,
+            latest_frontiers: [],
+            planned_path: [],
+            current_goal: null,
+            exploration_terminal: true,
+            frontier_cleared: true,
+            geometry_session_mode: sessionMode || "idle",
+            sequence: frame.sequence,
+            received_at: frame.timestamp,
+          };
+          state.frontiers = [];
+          updateNavigation(envelopeFromFrame(frame, {
+            navigation_context: state.latestStreamFrames["navigation.state"] && state.latestStreamFrames["navigation.state"].payload,
+            exploration_context: state.latestStreamFrames["exploration.state"] && state.latestStreamFrames["exploration.state"].payload,
+            frontiers: [],
+            frontier_count: 0,
+            explorer_status_text: payload.status_text,
+            exploration_terminal: true,
+            planned_path: [],
+            current_goal: null,
+            geometry_session_mode: sessionMode || "idle",
+          }));
+          return;
+        }
         state.latestFrontierStream = {
           status_text: payload.status_text,
           frontier_count: payload.frontier_count,
@@ -4362,6 +4451,7 @@ button{font-family:inherit;cursor:pointer}
           planned_path: Array.isArray(payload.planned_path) ? payload.planned_path : [],
           current_goal: payload.current_goal || null,
           exploration_terminal: payload.exploration_terminal,
+          geometry_session_mode: sessionMode || "explore",
           sequence: frame.sequence,
           received_at: frame.timestamp,
         };

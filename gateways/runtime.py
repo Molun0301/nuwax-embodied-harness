@@ -4859,22 +4859,9 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Debug 面板直通 Nav2 action：绕过 navigate_to_pose 任务链与资源锁。"""
+        """Debug 面板 RViz 2D Goal 直通：发布 /goal_pose → bt_navigator。"""
 
         pose = self._build_pose_from_arguments(arguments)
-        map_name = str(arguments.get("map_name", "")).strip() or None
-        goal = NavigationGoal(
-            goal_id=self._build_runtime_request_id("debug_nav2"),
-            map_name=map_name,
-            target_pose=pose,
-            tolerance_position_m=self._float(arguments, "tolerance_position_m", 0.3),
-            tolerance_yaw_rad=self._float(arguments, "tolerance_yaw_rad", 0.3),
-            metadata={
-                "force_nav2_goal": True,
-                "requested_by": requested_by or "debug_panel",
-                "source": "debug_panel_direct",
-            },
-        )
         provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
         if provider is None:
             raise GatewayError(
@@ -4886,17 +4873,21 @@ class GatewayRuntime:
             self.platform_geometry_runtime._cancel_platform_exploration_navigation()
         except Exception:
             RUNTIME_LOGGER.debug("debug_nav2_goal 取消平台探索在途目标失败。", exc_info=True)
-        accept_timeout_sec = self._float(arguments, "accept_timeout_sec", 8.0)
-        result = provider.send_goal_direct(goal, accept_timeout_sec=accept_timeout_sec)
-        result = dict(result)
-        result["target_pose"] = pose.model_dump(mode="json")
-        result["direct_nav2"] = True
-        if not bool(result.get("accepted")) and not bool(result.get("pending")):
+        publish_fn = getattr(provider, "publish_rviz_goal_pose", None)
+        if not callable(publish_fn):
             raise GatewayError(
-                str(result.get("message") or "Nav2 拒绝导航目标。"),
-                error_code="nav2_goal_rejected",
-                http_status=409,
-                jsonrpc_code=-32000,
+                "Nav2 provider 不支持 RViz /goal_pose 发布。",
+                error_code="goal_pose_publish_unsupported",
+                http_status=503,
+            )
+        result = dict(publish_fn(pose))
+        result["target_pose"] = pose.model_dump(mode="json")
+        result["requested_by"] = requested_by or "debug_panel"
+        if not bool(result.get("published")):
+            raise GatewayError(
+                str(result.get("message") or "发布 /goal_pose 失败。"),
+                error_code="goal_pose_publish_failed",
+                http_status=503,
                 details=result,
             )
         yaw_rad = self._float(arguments, "yaw_rad", 0.0)
@@ -4913,17 +4904,15 @@ class GatewayRuntime:
                 str(getattr(robot_pose, "frame_id", "") or ""),
             )
         RUNTIME_LOGGER.info(
-            "debug_nav2_goal direct dispatch goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s yaw=%.3f robot=%s accepted=%s pending=%s action=%s message=%s",
-            goal.goal_id,
+            "debug_nav2_goal rviz_goal_pose topic=%s target=(%.3f, %.3f, %.3f) frame=%s yaw=%.3f robot=%s published=%s message=%s",
+            result.get("topic"),
             float(pose.position.x),
             float(pose.position.y),
             float(pose.position.z),
             pose.frame_id,
             yaw_rad,
             robot_xy,
-            result.get("accepted"),
-            result.get("pending"),
-            result.get("action_name"),
+            result.get("published"),
             result.get("message"),
         )
         if robot_xy is not None:
@@ -4996,20 +4985,20 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Debug 面板 RViz 2D Pose Estimate：发布 /initialpose，触发重定位。"""
+        """Debug 面板 RViz 2D Pose Estimate 直通：发布 /initialpose → RTAB-Map 重定位。"""
 
         pose = self._build_pose_from_arguments(arguments)
-        geometry_runtime = self.platform_geometry_runtime
-        if geometry_runtime is None:
+        provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
+        if provider is None:
             raise GatewayError(
-                "平台几何 runtime 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
-                error_code="geometry_runtime_unavailable",
+                "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
+                error_code="nav2_provider_unavailable",
                 http_status=503,
             )
-        publish_fn = getattr(geometry_runtime, "publish_debug_initial_pose", None)
+        publish_fn = getattr(provider, "publish_rviz_initial_pose", None)
         if not callable(publish_fn):
             raise GatewayError(
-                "平台几何 runtime 不支持 2D Pose 发布。",
+                "Nav2 provider 不支持 RViz /initialpose 发布。",
                 error_code="initial_pose_publish_unsupported",
                 http_status=503,
             )
@@ -5023,9 +5012,32 @@ class GatewayRuntime:
                 http_status=503,
                 details=result,
             )
+        geometry_runtime = self.platform_geometry_runtime
+        if geometry_runtime is not None:
+            try:
+                clear_hint = getattr(geometry_runtime, "clear_debug_initial_pose_hint", None)
+                if callable(clear_hint):
+                    clear_hint()
+                invalidate_cache = getattr(geometry_runtime, "invalidate_external_live_pose_cache", None)
+                if callable(invalidate_cache):
+                    invalidate_cache()
+            except Exception:
+                RUNTIME_LOGGER.debug("debug_initial_pose 清理位姿 hint/缓存失败。", exc_info=True)
+        try:
+            restore_checkpoint = getattr(
+                self.map_workspace_service,
+                "restore_localization_checkpoint_display",
+                None,
+            )
+            if callable(restore_checkpoint):
+                restored = bool(restore_checkpoint())
+                if restored:
+                    result["checkpoint_display_restored"] = True
+        except Exception:
+            RUNTIME_LOGGER.debug("debug_initial_pose 恢复 checkpoint 显示失败。", exc_info=True)
         robot_pose = None
         try:
-            robot_pose = geometry_runtime.get_external_live_pose(max_age_sec=0.0)
+            robot_pose = provider._read_current_pose()
         except Exception:
             robot_pose = None
         if robot_pose is not None and getattr(robot_pose, "position", None) is not None:
@@ -5038,7 +5050,7 @@ class GatewayRuntime:
             }
             result["distance_m"] = math.hypot(float(pose.position.x) - robot_x, float(pose.position.y) - robot_y)
         RUNTIME_LOGGER.info(
-            "debug_initial_pose publish topic=%s pose=(%.3f, %.3f, %.3f) frame=%s robot=%s distance_m=%s",
+            "debug_initial_pose rviz_initial_pose topic=%s pose=(%.3f, %.3f, %.3f) frame=%s robot=%s distance_m=%s published=%s message=%s",
             result.get("topic"),
             float(pose.position.x),
             float(pose.position.y),
@@ -5046,6 +5058,8 @@ class GatewayRuntime:
             pose.frame_id,
             result.get("robot_pose"),
             result.get("distance_m"),
+            result.get("published"),
+            result.get("message"),
         )
         return result
 

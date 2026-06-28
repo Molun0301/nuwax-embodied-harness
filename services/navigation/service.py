@@ -529,6 +529,11 @@ class NavigationService:
                             "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
                         },
                     )
+                elif geometry_session_mode != "explore" and self._frontier_stream_has_active_geometry():
+                    self._publish_cleared_exploration_frontier(
+                        geometry_session_mode=geometry_session_mode,
+                        reason="geometry_session_not_explore",
+                    )
                 self._publish_external_exploration_navigation_overlay(context)
             if context.exploration_state.status in {
                 ExplorationStatus.SUCCEEDED,
@@ -680,6 +685,65 @@ class NavigationService:
                 )
             time.sleep(max(0.01, poll_interval_sec))
 
+    def _frontier_stream_has_active_geometry(self) -> bool:
+        """判断 exploration.frontier 最新帧是否仍携带可展示的前沿几何。"""
+
+        if self._stream_bus is None:
+            return False
+        frame = self._stream_bus.latest_frame("exploration.frontier")
+        if frame is None:
+            return False
+        payload = frame.payload if isinstance(getattr(frame, "payload", None), dict) else {}
+        if payload.get("frontier_cleared"):
+            return False
+        frame_metadata = frame.metadata if isinstance(getattr(frame, "metadata", None), dict) else {}
+        if frame_metadata.get("frontier_cleared"):
+            return False
+        frontiers = payload.get("latest_frontiers")
+        if isinstance(frontiers, list) and frontiers:
+            return True
+        try:
+            return int(payload.get("frontier_count") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _publish_cleared_exploration_frontier(
+        self,
+        *,
+        geometry_session_mode: str = "",
+        reason: str = "",
+    ) -> None:
+        """发布空前沿帧，顶掉 StreamBus / Debug 面板中滞留的探索前沿缓存。"""
+
+        if self._stream_bus is None:
+            return
+        cleared_payload = {
+            "latest_frontiers": [],
+            "current_frontier": None,
+            "frontier_count": 0,
+            "geometry_session_mode": geometry_session_mode or "idle",
+            "status_text": None,
+            "exploration_terminal": True,
+            "terminal_status": "cleared",
+            "planned_path": [],
+            "current_goal": None,
+            "external_frontier_debug_observer": None,
+            "frontier_cleared": True,
+            "clear_reason": str(reason or "").strip() or None,
+        }
+        self._stream_bus.publish(
+            "exploration.frontier",
+            source="navigation_service",
+            payload=cleared_payload,
+            status="available",
+            metadata={
+                "exploration_status": "idle",
+                "exploration_terminal": True,
+                "frontier_cleared": True,
+                "clear_reason": str(reason or "").strip() or None,
+            },
+        )
+
     def _publish_external_exploration_navigation_overlay(self, exploration_context: ExplorationContext) -> None:
         if self._stream_bus is None:
             return
@@ -789,6 +853,10 @@ class NavigationService:
         with self._lock:
             self._latest_exploration_context = None
             self._current_explore_request = None
+        if self._frontier_stream_has_active_geometry():
+            self._publish_cleared_exploration_frontier(
+                reason=reason or "clear_latest_exploration_context",
+            )
 
     def list_navigation_history(self, *, limit: Optional[int] = None) -> Tuple[NavigationContext, ...]:
         """返回导航历史。"""

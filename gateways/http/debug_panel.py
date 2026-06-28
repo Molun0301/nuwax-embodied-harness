@@ -181,7 +181,7 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
     @router.post("/api/debug/navigation/goal")
     async def debug_navigation_goal(request: Request) -> JSONResponse:
-        """Debug 面板 2D Goal：直通 go2.sh 已拉起的 Nav2 action，不经 navigate_to_pose 任务链。"""
+        """Debug 面板 2D Goal：RViz SetGoal 直通，发布 /goal_pose → bt_navigator。"""
 
         access_manager.authenticate_http(request)
         body = await request.json()
@@ -211,7 +211,7 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
     @router.post("/api/debug/map/initial_pose")
     async def debug_map_initial_pose(request: Request) -> JSONResponse:
-        """Debug 面板 RViz 2D Pose Estimate：发布 /initialpose，手动初始化位姿。"""
+        """Debug 面板 RViz 2D Pose Estimate 直通：发布 /initialpose → RTAB-Map 重定位。"""
 
         access_manager.authenticate_http(request)
         body = await request.json()

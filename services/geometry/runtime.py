@@ -1879,6 +1879,15 @@ class PlatformGeometryRuntime:
             self._external_live_pose = None
             self._external_live_pose_at_monotonic = 0.0
 
+    def clear_debug_initial_pose_hint(self) -> None:
+        """清除 debug 2D Pose 的 UI hint，避免与真实 TF 打架。"""
+
+        with self._external_live_pose_lock:
+            self._debug_initial_pose_hint = None
+            self._debug_initial_pose_anchor = None
+            self._debug_initial_pose_hint_until = 0.0
+            self._debug_initial_pose_hint_stable_count = 0
+
     def _set_debug_initial_pose_hint(self, target_pose: Pose, *, ttl_sec: float = 12.0) -> None:
         with self._external_live_pose_lock:
             self._debug_initial_pose_hint = target_pose.model_copy(deep=True)
@@ -1937,129 +1946,21 @@ class PlatformGeometryRuntime:
             return pose
 
     def publish_debug_initial_pose(self, target_pose: Pose) -> Dict[str, object]:
-        """RViz 2D Pose Estimate：向 RTAB-Map 发布 /initialpose 触发重定位。"""
+        """RViz 2D Pose Estimate：委托 Nav2 provider 直通 /initialpose。"""
 
-        from contracts.geometry_runtime import DEFAULT_MAP_FRAME
-        from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
-
-        frame_id = str(target_pose.frame_id or DEFAULT_MAP_FRAME).strip().lstrip("/") or DEFAULT_MAP_FRAME
-        topics = ("/initialpose",)
-        publish_attempts = 2
-        wait_for_subscriber_sec = 3.0
-        publish_interval_sec = 0.2
-        node = None
-        rclpy = None
-        has_context = False
-        try:
-            from geometry_msgs.msg import PoseWithCovarianceStamped
-            from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-
-            rclpy = acquire_ros2_context()
-            has_context = True
-            node = rclpy.create_node("nuwax_debug_initialpose_publisher")
-            qos = QoSProfile(
-                history=HistoryPolicy.KEEP_LAST,
-                depth=1,
-                reliability=ReliabilityPolicy.RELIABLE,
-            )
-            publishers = {
-                topic: node.create_publisher(PoseWithCovarianceStamped, topic, qos)
-                for topic in topics
-            }
-            msg = PoseWithCovarianceStamped()
-            msg.header.frame_id = frame_id
-            # fix-tf2-stamp-stuck S1 Step 1：去除 -0.5s stamp 回退（避免 rtabmap TF cache
-            # 锁定老 stamp 导致 ExtrapolationError；改为 now()，与 ROS2 /initialpose
-            # 标准做法对齐）。与 services/localization/service.py:516 的合法 -0.5s
-            # 用途（规避 AMCL Foxy SIGSEGV）不同——本路径是 debug_panel 2D Pose 触发，
-            # 不存在 AMCL Foxy 的 lookupTransform 边界条件。
-            msg.header.stamp = node.get_clock().now().to_msg()
-            msg.pose.pose.position.x = float(target_pose.position.x)
-            msg.pose.pose.position.y = float(target_pose.position.y)
-            msg.pose.pose.position.z = float(target_pose.position.z)
-            msg.pose.pose.orientation.x = float(target_pose.orientation.x)
-            msg.pose.pose.orientation.y = float(target_pose.orientation.y)
-            msg.pose.pose.orientation.z = float(target_pose.orientation.z)
-            msg.pose.pose.orientation.w = float(target_pose.orientation.w)
-            msg.pose.covariance = [0.25 if index in (0, 7, 35) else 0.0 for index in range(36)]
-
-            deadline = time.monotonic() + wait_for_subscriber_sec
-            subscriber_counts: Dict[str, int] = {topic: 0 for topic in topics}
-            while time.monotonic() < deadline:
-                for topic, publisher in publishers.items():
-                    subscriber_counts[topic] = int(publisher.get_subscription_count())
-                if any(count > 0 for count in subscriber_counts.values()):
-                    break
-                time.sleep(0.1)
-
-            self._set_debug_initial_pose_hint(target_pose)
-            for attempt in range(publish_attempts):
-                for publisher in publishers.values():
-                    publisher.publish(msg)
-                if attempt + 1 < publish_attempts:
-                    time.sleep(publish_interval_sec)
-
-            self.invalidate_external_live_pose_cache()
-            hint_pose = target_pose.model_copy(deep=True)
-            self._handle_external_debug_pose_update(
-                hint_pose,
-                metadata={"source_kind": "debug_initial_pose_hint", "source_name": "nuwax_debug_initialpose_publisher"},
-            )
-            total_subscribers = sum(subscriber_counts.values())
-            mapping_hint = (
-                "当前为建图模式时 /initialpose 主要用于重定位 hint，效果弱于定位模式。"
-                if total_subscribers == 0
-                else None
-            )
-            log_line = (
-                "debug 2D Pose 已发布 /initialpose pose=(%.3f, %.3f, %.3f) frame=%s "
-                "subscribers=%s attempts=%d"
-                % (
-                    msg.pose.pose.position.x,
-                    msg.pose.pose.position.y,
-                    msg.pose.pose.position.z,
-                    frame_id,
-                    subscriber_counts,
-                    publish_attempts,
-                )
-            )
-            LOGGER.info(log_line)
-            _append_main_log_line(_GO2_SH_MAIN_LOG_LOGGER, log_line)
-            message = "已发布 /initialpose（RViz 2D Pose Estimate 等价）。"
-            if total_subscribers == 0:
-                message = (
-                    "已发布 /initialpose，但当前无 RTAB-Map 订阅者；"
-                    "请确认 go2.sh 已启动且 rtabmap 节点在运行。"
-                )
-            return {
-                "published": True,
-                "topic": "/initialpose",
-                "topics": list(topics),
-                "frame_id": frame_id,
-                "x": msg.pose.pose.position.x,
-                "y": msg.pose.pose.position.y,
-                "z": msg.pose.pose.position.z,
-                "subscriber_counts": subscriber_counts,
-                "publish_attempts": publish_attempts,
-                "mapping_hint": mapping_hint,
-                "message": message,
-            }
-        except Exception as exc:
-            LOGGER.info("debug 发布 /initialpose 失败：%s", exc)
+        provider = getattr(self, "_nav2_action_provider", None)
+        publish_fn = getattr(provider, "publish_rviz_initial_pose", None)
+        if not callable(publish_fn):
             return {
                 "published": False,
                 "topic": "/initialpose",
-                "topics": list(topics),
-                "message": "发布 /initialpose 失败：%s" % exc,
+                "message": "Nav2 provider 未就绪，无法发布 /initialpose。",
             }
-        finally:
-            if node is not None:
-                try:
-                    node.destroy_node()
-                except Exception:
-                    pass
-            if has_context:
-                release_ros2_context()
+        self.clear_debug_initial_pose_hint()
+        result = dict(publish_fn(target_pose))
+        if bool(result.get("published")):
+            self.invalidate_external_live_pose_cache()
+        return result
 
     def _handle_external_debug_pose_update(
         self,
@@ -2740,10 +2641,36 @@ class PlatformGeometryRuntime:
         ))
         if self._platform_exploration_runtime.is_running:
             pass  # 探索模式下不抑制 live map（新建地图从小到大增长是正常的）
-        elif self._external_geometry_process_is_localization() or str(
-            (self._last_activation_result or {}).get("backend_mode") or ""
-        ) == "rtabmap_localization":
-            pass  # 定位模式以 RTAB-Map .db 为准，允许 live /map 从空到完整逐步刷新
+        elif (
+            self._external_geometry_process_is_localization()
+            or str((self._last_activation_result or {}).get("backend_mode") or "") == "rtabmap_localization"
+        ) and version.snapshot.occupancy_grid is not None:
+            # 定位模式 Debug 固定展示已加载的平台 checkpoint；live /map_obstacles
+            # （含 2D Pose 后零星重发）与保存版本栅格不一致，不得替换显示层。
+            metadata.update({
+                "event_type": "heartbeat",
+                "suppressed_live_map_update": True,
+                "suppressed_live_map_reason": "localization_mode_pin_checkpoint_display",
+                "pin_checkpoint_display": True,
+                "map_snapshot_kind": "offline_checkpoint",
+                "source_kind": "platform_map_version",
+                "display_map_snapshot_kind": "offline_checkpoint",
+                "platform_map_version_id": version.version_id,
+                "platform_map_version_revision": version.revision,
+                "active_map_name": version.map_name,
+                "map_name": version.map_name,
+                "checkpoint_ready": True,
+                "geometry_ready": True,
+                "backend_mode": "rtabmap_localization",
+                "waiting_for_live_stream": False,
+            })
+            return {
+                **payload,
+                "occupancy_grid": None,
+                "cost_map": None,
+                "semantic_map": self._clone_contract(version.snapshot.semantic_map),
+                "metadata": metadata,
+            }
         elif self._live_map_payload_under_covers_seed(payload, metadata, version):
             live_known_cells = self._metadata_known_cell_count(metadata)
             if live_known_cells is None:

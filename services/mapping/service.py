@@ -93,6 +93,9 @@ class MappingService:
         metadata = payload.get("metadata")
         source_metadata = dict(metadata) if isinstance(metadata, dict) else {}
         self._publish_map_heartbeat(source_name=source_name, metadata=source_metadata)
+        if source_metadata.get("suppressed_live_map_update"):
+            with self._lock:
+                return self._latest_snapshot
         if str(source_metadata.get("event_type") or "content_update") != "content_update":
             with self._lock:
                 return self._latest_snapshot

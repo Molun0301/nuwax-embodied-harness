@@ -234,112 +234,11 @@ class Nav2ActionNavigationProvider:
             return False
         return True
 
-    def send_goal_direct(self, goal: NavigationGoal, *, accept_timeout_sec: float = 8.0) -> Dict[str, object]:
-        """Debug/RViz 直通：只走 Nav2 action，不经过平台 navigation 任务链。"""
-
-        action_name = str(self.runtime.config.nav2.action_name or "/navigate_to_pose")
-        if not self.set_goal(goal):
-            with self._lock:
-                state = self._state.model_copy(deep=True)
-            readiness = state.metadata.get("nav2_readiness") if isinstance(state.metadata.get("nav2_readiness"), dict) else {}
-            return {
-                "accepted": False,
-                "action_name": action_name,
-                "goal_id": goal.goal_id,
-                "message": state.message,
-                "navigation_status": str(getattr(state.status, "value", state.status)),
-                "waiting_for": readiness.get("waiting_for") if isinstance(readiness, dict) else None,
-            }
-        with self._lock:
-            send_future = self._send_future
-            goal_sequence = self._send_goal_sequence
-        if send_future is None:
-            with self._lock:
-                state = self._state.model_copy(deep=True)
-            return {
-                "accepted": False,
-                "action_name": action_name,
-                "goal_id": goal.goal_id,
-                "message": state.message or "Nav2 action future 未创建。",
-                "navigation_status": str(getattr(state.status, "value", state.status)),
-            }
-        deadline = time.monotonic() + max(0.5, float(accept_timeout_sec))
-        goal_handle = None
-        send_error: Optional[str] = None
-        while time.monotonic() < deadline:
-            if send_future.done():
-                try:
-                    goal_handle = send_future.result()
-                except Exception as exc:
-                    send_error = str(exc)
-                break
-            if self._rclpy is not None and self._node is not None:
-                try:
-                    self._rclpy.spin_until_future_complete(
-                        self._node,
-                        send_future,
-                        executor=self._executor,
-                        timeout_sec=0.1,
-                    )
-                except Exception:
-                    time.sleep(0.02)
-            else:
-                time.sleep(0.05)
-        if goal_handle is not None:
-            accepted = bool(getattr(goal_handle, "accepted", False))
-            if accepted:
-                self._ensure_goal_running(goal, goal_sequence, goal_handle)
-                with self._lock:
-                    state = self._state.model_copy(deep=True)
-                return {
-                    "accepted": True,
-                    "action_name": action_name,
-                    "goal_id": goal.goal_id,
-                    "message": state.message or "Nav2 action 已接受目标并开始执行。",
-                    "navigation_status": str(getattr(state.status, "value", state.status)),
-                    "remaining_distance_m": state.remaining_distance_m,
-                }
-            return {
-                "accepted": False,
-                "action_name": action_name,
-                "goal_id": goal.goal_id,
-                "message": "Nav2 action server 拒绝导航目标。",
-                "navigation_status": "failed",
-            }
-        if send_error:
-            return {
-                "accepted": False,
-                "action_name": action_name,
-                "goal_id": goal.goal_id,
-                "message": "Nav2 action 接受目标失败：%s" % send_error,
-                "navigation_status": "failed",
-            }
-        with self._lock:
-            state = self._state.model_copy(deep=True)
-        status = state.status
-        if status in {NavigationStatus.RUNNING, NavigationStatus.SUCCEEDED}:
-            return {
-                "accepted": True,
-                "action_name": action_name,
-                "goal_id": goal.goal_id,
-                "message": state.message,
-                "navigation_status": str(getattr(status, "value", status)),
-                "remaining_distance_m": state.remaining_distance_m,
-            }
-        return {
-            "accepted": False,
-            "pending": True,
-            "action_name": action_name,
-            "goal_id": goal.goal_id,
-            "message": state.message or "Nav2 action 已发送，等待 server 接受超时。",
-            "navigation_status": str(getattr(status, "value", status)),
-        }
-
     def _cancel_inflight_goal_for_resend(self) -> None:
         self._cancel_active_nav2_goals_before_send()
 
     def _cancel_active_nav2_goals_before_send(self, *, wait_timeout_sec: float = 2.0) -> None:
-        """取消在途 Nav2 目标并等待完成，避免 Debug 新目标发出后仍短暂跟随旧目标（常见为 map 原点）。"""
+        """取消在途 Nav2 action 目标并等待完成，避免新目标发出后仍短暂跟随旧目标。"""
 
         with self._lock:
             prev_handle = self._goal_handle
@@ -373,38 +272,66 @@ class Nav2ActionNavigationProvider:
         while time.monotonic() < deadline and not send_future.done():
             time.sleep(0.05)
 
-    def _ensure_goal_running(self, goal: NavigationGoal, goal_sequence: int, goal_handle: Any) -> None:
-        with self._lock:
-            stale = goal_sequence != self._goal_sequence or self._state.current_goal_id != goal.goal_id
-            if stale:
-                return
-            if self._state.status in {NavigationStatus.RUNNING, NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED}:
-                if self._goal_handle is not None:
-                    return
-            self._goal_handle = goal_handle
-            self._state = self._state.model_copy(
-                update={
-                    "status": NavigationStatus.RUNNING,
-                    "message": "Nav2 action 已接受目标并开始执行。",
-                },
-                deep=True,
-            )
-            self._result_future = goal_handle.get_result_async()
-            self._result_future.add_done_callback(
-                lambda completed: self._on_result(completed, goal.goal_id, goal_sequence)
-            )
-
     def publish_initial_pose(self, target_pose: Pose) -> Dict[str, object]:
-        """RViz 2D Pose Estimate 等价：委托 geometry runtime 独立发布 /initialpose。"""
+        """RViz 2D Pose Estimate 等价：发布 /initialpose 触发重定位。"""
 
-        publish_fn = getattr(self.runtime, "publish_debug_initial_pose", None)
-        if callable(publish_fn):
-            return publish_fn(target_pose)
-        return {
-            "published": False,
-            "topic": "/initialpose",
-            "message": "geometry runtime 不支持 /initialpose 发布。",
-        }
+        return self.publish_rviz_initial_pose(target_pose)
+
+    def publish_rviz_initial_pose(self, target_pose: Pose) -> Dict[str, object]:
+        """RViz 2D Pose Estimate 等价：发布 geometry_msgs/PoseWithCovarianceStamped 到 /initialpose。"""
+
+        if not self._ensure_started() or self._node is None:
+            return {
+                "published": False,
+                "topic": "/initialpose",
+                "message": "Nav2 action ROS 节点未启动，无法发布 /initialpose。",
+            }
+        try:
+            from geometry_msgs.msg import PoseWithCovarianceStamped
+
+            if self._initial_pose_publisher is None:
+                self._initial_pose_publisher = self._node.create_publisher(
+                    PoseWithCovarianceStamped,
+                    "/initialpose",
+                    10,
+                )
+            frame_id = str(target_pose.frame_id or "map").lstrip("/") or "map"
+            msg = PoseWithCovarianceStamped()
+            msg.header.frame_id = frame_id
+            msg.header.stamp = self._node.get_clock().now().to_msg()
+            msg.pose.pose.position.x = float(target_pose.position.x)
+            msg.pose.pose.position.y = float(target_pose.position.y)
+            msg.pose.pose.position.z = float(target_pose.position.z)
+            msg.pose.pose.orientation.x = float(target_pose.orientation.x)
+            msg.pose.pose.orientation.y = float(target_pose.orientation.y)
+            msg.pose.pose.orientation.z = float(target_pose.orientation.z)
+            msg.pose.pose.orientation.w = float(target_pose.orientation.w)
+            msg.pose.covariance = [0.25 if index in (0, 7, 35) else 0.0 for index in range(36)]
+            self._initial_pose_publisher.publish(msg)
+            LOGGER.info(
+                "debug 发布 /initialpose（RViz 2D Pose Estimate 等价）pose=(%.3f, %.3f, %.3f) frame=%s",
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z,
+                frame_id,
+            )
+            return {
+                "published": True,
+                "topic": "/initialpose",
+                "frame_id": frame_id,
+                "x": msg.pose.pose.position.x,
+                "y": msg.pose.pose.position.y,
+                "z": msg.pose.pose.position.z,
+                "dispatch_mode": "rviz_initial_pose_topic",
+                "message": "已发布 /initialpose（RViz 2D Pose Estimate 直通）。",
+            }
+        except Exception as exc:
+            LOGGER.info("debug 发布 /initialpose 失败：%s", exc)
+            return {
+                "published": False,
+                "topic": "/initialpose",
+                "message": "发布 /initialpose 失败：%s" % exc,
+            }
 
     def publish_clicked_point(self, target_pose: Pose) -> Dict[str, object]:
         """RViz Publish Point 等价：发布 geometry_msgs/PointStamped 到 /clicked_point。"""
@@ -452,16 +379,23 @@ class Nav2ActionNavigationProvider:
                 "message": "发布 /clicked_point 失败：%s" % exc,
             }
 
-    def _publish_goal_pose_topic(self, target_pose: Pose) -> bool:
+    def publish_rviz_goal_pose(self, target_pose: Pose) -> Dict[str, object]:
+        """RViz SetGoal 等价：发布 geometry_msgs/PoseStamped 到 /goal_pose。"""
+
         if not self._ensure_started() or self._node is None:
-            return False
+            return {
+                "published": False,
+                "topic": "/goal_pose",
+                "message": "Nav2 action ROS 节点未启动，无法发布 /goal_pose。",
+            }
         try:
             from geometry_msgs.msg import PoseStamped
 
             if self._goal_pose_publisher is None:
                 self._goal_pose_publisher = self._node.create_publisher(PoseStamped, "/goal_pose", 10)
+            frame_id = str(target_pose.frame_id or "map").lstrip("/") or "map"
             msg = PoseStamped()
-            msg.header.frame_id = str(target_pose.frame_id or "map").lstrip("/") or "map"
+            msg.header.frame_id = frame_id
             msg.header.stamp = self._node.get_clock().now().to_msg()
             msg.pose.position.x = float(target_pose.position.x)
             msg.pose.position.y = float(target_pose.position.y)
@@ -472,16 +406,29 @@ class Nav2ActionNavigationProvider:
             msg.pose.orientation.w = float(target_pose.orientation.w)
             self._goal_pose_publisher.publish(msg)
             LOGGER.info(
-                "Nav2 debug 同步发布 /goal_pose target=(%.3f, %.3f, %.3f) frame=%s",
+                "debug 发布 /goal_pose（RViz SetGoal 等价）target=(%.3f, %.3f, %.3f) frame=%s",
                 msg.pose.position.x,
                 msg.pose.position.y,
                 msg.pose.position.z,
-                msg.header.frame_id,
+                frame_id,
             )
-            return True
+            return {
+                "published": True,
+                "topic": "/goal_pose",
+                "frame_id": frame_id,
+                "x": msg.pose.position.x,
+                "y": msg.pose.position.y,
+                "z": msg.pose.position.z,
+                "dispatch_mode": "rviz_goal_pose_topic",
+                "message": "已发布 /goal_pose（RViz 2D Goal 直通）。",
+            }
         except Exception as exc:
-            LOGGER.info("Nav2 debug 发布 /goal_pose 失败：%s", exc)
-            return False
+            LOGGER.info("debug 发布 /goal_pose 失败：%s", exc)
+            return {
+                "published": False,
+                "topic": "/goal_pose",
+                "message": "发布 /goal_pose 失败：%s" % exc,
+            }
 
     def cancel_goal(self) -> bool:
         with self._lock:

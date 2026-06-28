@@ -894,6 +894,38 @@ class MapWorkspaceService:
             "pcd": latest_map_snapshot.metadata.get("pcd"),
         }
 
+    def restore_localization_checkpoint_display(self) -> bool:
+        """定位模式下把 Debug 显示层恢复为已加载的平台 checkpoint 栅格。"""
+
+        workspace = self.get_active_workspace(refresh_localization=False)
+        if workspace is None or workspace.map_asset is None:
+            return False
+        map_name = workspace.active_map_name
+        version_id = workspace.map_asset.latest_version_id
+        if not map_name or not version_id:
+            return False
+        try:
+            prepared_version = self._require_map_version(map_name, version_id)
+        except GatewayError:
+            return False
+        latest_snapshot = self._mapping_service.get_latest_snapshot()
+        if latest_snapshot is not None:
+            metadata = dict(getattr(latest_snapshot, "metadata", {}) or {})
+            snapshot_kind = str(metadata.get("map_snapshot_kind") or "").lower()
+            if (
+                snapshot_kind == "offline_checkpoint"
+                and str(metadata.get("platform_map_version_id") or "") == version_id
+            ):
+                return True
+        runtime_snapshot = self._geometry_runtime.get_map_snapshot()
+        runtime_metadata = dict(runtime_snapshot.metadata or {}) if runtime_snapshot is not None else {}
+        self._ingest_localization_checkpoint_snapshot(
+            prepared_version=prepared_version,
+            runtime_snapshot=runtime_snapshot,
+            runtime_metadata=runtime_metadata,
+        )
+        return True
+
     def _ingest_localization_checkpoint_snapshot(
         self,
         *,
@@ -901,7 +933,7 @@ class MapWorkspaceService:
         runtime_snapshot,
         runtime_metadata: Dict[str, object],
     ) -> None:
-        """定位模式加载版本后先展示离线 checkpoint，待 /map_obstacles 首帧再切 live。"""
+        """定位模式加载版本后先展示离线 checkpoint，live /map_obstacles 不替换显示层。"""
 
         occupancy_grid = (
             prepared_version.snapshot.occupancy_grid

@@ -3226,13 +3226,34 @@ button{font-family:inherit;cursor:pointer}
         const el = document.getElementById("semanticOverlay");
         if (el) el.remove();
       }
-      function navigateToInstance(inst) {
+      async function navigateToInstance(inst) {
         closeSemanticOverlay();
-        const body = { arguments: { target_pose: { x: inst.pose && inst.pose.x || 0, y: inst.pose && inst.pose.y || 0, frame_id: "map" } } };
-        fetch("/api/capabilities/navigate_to_pose/invoke", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
-          .then((r) => r.json())
-          .then((d) => console.info("[semantic] 导航已下发 task_id=", d.task_id || d.id || JSON.stringify(d)))
-          .catch((e) => console.warn("[semantic] 导航下发失败", e));
+        if (!inst || !inst.pose) {
+          updateGoalPickStatus("物品无有效位置，无法导航", "error");
+          return;
+        }
+        const x = Number(inst.pose.x);
+        const y = Number(inst.pose.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          updateGoalPickStatus("物品坐标无效，无法导航", "error");
+          return;
+        }
+        const mapPoint = { x, y, z: Number(inst.pose.z) || 0 };
+        const robotPoint = pointFromPose(state.pose);
+        let yawRad = 0;
+        if (robotPoint) {
+          yawRad = Math.atan2(mapPoint.y - robotPoint.y, mapPoint.x - robotPoint.x);
+        }
+        const label = inst.display_name || inst.label || inst.instance_id || "物品";
+        state.highlightTarget = {
+          record_id: inst.instance_id || null,
+          record_kind: inst.instance_type || "object",
+          target_pose: { x: mapPoint.x, y: mapPoint.y, z: mapPoint.z },
+          target_name: label,
+        };
+        requestMapDraw(false);
+        updateGoalPickStatus(`导航到 ${label} ${formatMapPoint(mapPoint)} · 发布 /goal_pose`, "pending");
+        await dispatchNavGoal(mapPoint, yawRad);
       }
       function formatLastSeen(ts) {
         if (!ts) return "--";

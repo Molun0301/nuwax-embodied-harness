@@ -5,7 +5,7 @@ obstacle_grid_projector:
     map_topic: /map
     cloud_obstacles_topic: /cloud_obstacles
     live_cloud_topic: /go2/cloud
-    live_cloud_enabled: true
+    live_cloud_enabled: false
     map_frame: map
     robot_base_frame: go2_base_link
     output_topic: /map_obstacles
@@ -13,10 +13,10 @@ obstacle_grid_projector:
     min_obstacle_height: 0.04
     max_obstacle_height: 1.5
     obstacle_value: 100
-    # 栅格分辨率 0.05m，1 格 = 5cm 障碍膨胀
-    inflate_cells: 1
+    # 栅格分辨率 0.05m；0=仅投影格(1×1)，1=中心+8邻格(3×3)
+    inflate_cells: 0
     publish_rate: 10.0
-    publish_on_cloud: true
+    publish_on_cloud: false
     min_publish_interval: 0.1
     live_cloud_max_range: 6.0
     max_cloud_points: 25000

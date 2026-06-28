@@ -44,7 +44,9 @@
     Grid/RangeMax: '20.0'
     Grid/MaxGroundHeight: '0.04'
     Grid/MaxObstacleHeight: '1.5'
-    Grid/RayTracing: 'true'
+    Grid/RayTracing: 'true'   # do not disable in mapping — free space needs ray fill
+    Rtabmap/DetectionRate: '2.5'
+    GridGlobal/UpdateError: '0.005'
     Mem/NotLinkedNodesKept: 'false'
     Mem/STMSize: '30'
     Mem/LaserScanNormalK: '20'

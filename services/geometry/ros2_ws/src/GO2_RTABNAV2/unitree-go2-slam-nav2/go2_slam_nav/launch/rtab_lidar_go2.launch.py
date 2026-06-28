@@ -58,6 +58,7 @@ RTABMAP_TUNING_BASE = [
     'Grid/RangeMax', '20.0',
     'Grid/MaxGroundHeight', '0.04',
     'Grid/MaxObstacleHeight', '1.5',
+    # Required for 2D free-space ahead of the robot (without it only ~1m clears).
     'Grid/RayTracing', 'true',
     'Mem/NotLinkedNodesKept', 'false',
     'Mem/STMSize', '30',
@@ -70,7 +71,6 @@ RTABMAP_TUNING_BASE = [
     'Icp/PointToPlaneK', '20',
     'Icp/PointToPlaneRadius', '0',
     'Icp/PointToPlane', 'true',
-    'Icp/Iterations', '10',
     'Icp/Epsilon', '0.001',
     'Icp/MaxTranslation', '2',
     'Icp/MaxCorrespondenceDistance', '0.5',
@@ -82,23 +82,37 @@ RTABMAP_TUNING_BASE = [
 ]
 
 
-def _proximity_tuning_args():
-    """LiDAR proximity: local ICP loop closure + global scan map relocalization (all modes)."""
+def _proximity_tuning_args(localize_only, slam_mode):
+    """建图/探索：轻量邻近回环；定位：全图搜索 + 全局激光地图重定位。"""
+    loc_cond = [
+        '("', localize_only, '" == "true" or "', slam_mode, '" == "localization")'
+    ]
     return [
-        # Local proximity loop closure (drift correction on re-visit)
         'RGBD/ProximityBySpace', 'true',
-        # 0 = 全图搜索。50 走几圈后搜不到起点，漂移重影无法校正。
-        'RGBD/ProximityMaxGraphDepth', '0',
-        'RGBD/ProximityPathMaxNeighbors', '10',
+        'RGBD/ProximityMaxGraphDepth',
+        PythonExpression(['"0" if '] + loc_cond + [' else "50"']),
+        'RGBD/ProximityPathMaxNeighbors',
+        PythonExpression(['"10" if '] + loc_cond + [' else "5"']),
         'RGBD/ProximityPathFilteringRadius', '1.0',
         'Rtabmap/LoopThr', '0.11',
-        # Global assembled scan map (mapping / explore / localization)
-        'RGBD/ProximityGlobalScanMap', 'true',
+        'RGBD/ProximityGlobalScanMap',
+        PythonExpression(['"true" if '] + loc_cond + [' else "false"']),
     ]
 
 
-def _rtabmap_tuning_args(localize_only):
-    return RTABMAP_TUNING_BASE + _proximity_tuning_args()
+def _rtabmap_tuning_args(localize_only, slam_mode):
+    loc_cond = [
+        '("', localize_only, '" == "true" or "', slam_mode, '" == "localization")'
+    ]
+    return RTABMAP_TUNING_BASE + [
+        'Icp/Iterations',
+        PythonExpression(['"10" if '] + loc_cond + [' else "6"']),
+        # Default 1 Hz; bump mapping/explore so /map free space keeps up while walking.
+        'Rtabmap/DetectionRate',
+        PythonExpression(['"1" if '] + loc_cond + [' else "2.5"']),
+        'GridGlobal/UpdateError',
+        PythonExpression(['"0.01" if '] + loc_cond + [' else "0.005"']),
+    ] + _proximity_tuning_args(localize_only, slam_mode)
 
 
 RTABMAP_CORE_PARAMS = {
@@ -153,6 +167,7 @@ def _mapping_mode_args(localize_only):
 
 def generate_launch_description():
     localize_only = LaunchConfiguration('localize_only')
+    slam_mode = LaunchConfiguration('slam_mode')
     odom_source = LaunchConfiguration('odom_source')
     restart_map = LaunchConfiguration('restart_map')
     deskewing = LaunchConfiguration('deskewing')
@@ -408,7 +423,9 @@ def generate_launch_description():
                 ('odom', LaunchConfiguration('odom_topic')),
             ],
             condition=IfCondition(robot_keep_db),
-            arguments=_mapping_mode_args(localize_only) + _rtabmap_tuning_args(localize_only) + [
+            arguments=_mapping_mode_args(localize_only) + _rtabmap_tuning_args(
+                localize_only, slam_mode,
+            ) + [
                 '--ros-args', '--log-level', LaunchConfiguration('rtabmap_log_level'),
             ],
         ),
@@ -429,7 +446,9 @@ def generate_launch_description():
                 ('odom', LaunchConfiguration('odom_topic')),
             ],
             condition=IfCondition(robot_reset_db),
-            arguments=_mapping_mode_args(localize_only) + _rtabmap_tuning_args(localize_only) + [
+            arguments=_mapping_mode_args(localize_only) + _rtabmap_tuning_args(
+                localize_only, slam_mode,
+            ) + [
                 '--delete_db_on_start',
                 '--ros-args', '--log-level', LaunchConfiguration('rtabmap_log_level'),
             ],
@@ -451,7 +470,9 @@ def generate_launch_description():
                 ('odom', 'icp_odom'),
             ],
             condition=IfCondition(icp_keep_db),
-            arguments=_mapping_mode_args(localize_only) + _rtabmap_tuning_args(localize_only) + [
+            arguments=_mapping_mode_args(localize_only) + _rtabmap_tuning_args(
+                localize_only, slam_mode,
+            ) + [
                 '--ros-args', '--log-level', LaunchConfiguration('rtabmap_log_level'),
             ],
         ),
@@ -472,7 +493,9 @@ def generate_launch_description():
                 ('odom', 'icp_odom'),
             ],
             condition=IfCondition(icp_reset_db),
-            arguments=_mapping_mode_args(localize_only) + _rtabmap_tuning_args(localize_only) + [
+            arguments=_mapping_mode_args(localize_only) + _rtabmap_tuning_args(
+                localize_only, slam_mode,
+            ) + [
                 '--delete_db_on_start',
                 '--ros-args', '--log-level', LaunchConfiguration('rtabmap_log_level'),
             ],

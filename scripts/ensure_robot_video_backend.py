@@ -23,6 +23,8 @@ LOGGER = logging.getLogger("nuwax_robot_bridge.ensure_video_backend")
 G1_VIDEHUB_BIN = Path("/unitree/module/video_hub_pc4/videohub_pc4")
 G1_VIDEHUB_CYCLONEDDS = "/unitree/module/video_hub_pc4/cyclonedds.xml"
 G1_CAMERA_CONFIG = Path("/unitree/etc/rgb_camera/CAMAERA_CONFIG")
+G1_MSCLI_BIN = Path("/unitree/sbin/mscli")
+G1_VIDEHUB_SERVICE_NAME = "video_hub_pc4"
 DEFAULT_GEOMETRY_CYCLONEDDS = str(Path.home() / "cyclonedds_ws" / "cyclonedds.xml")
 
 
@@ -57,28 +59,108 @@ def _camera_devices_present() -> bool:
     return any(Path(f"/dev/video{i}").exists() for i in range(8)) or Path("/dev/media0").exists()
 
 
-def ensure_g1_videohub_process() -> bool:
-    if not G1_VIDEHUB_BIN.is_file():
-        LOGGER.info("未找到 %s，跳过 G1 videohub 重启。", G1_VIDEHUB_BIN)
-        return False
-    if not _camera_devices_present():
-        LOGGER.warning(
-            "未检测到 /dev/video* 或 /dev/media0；请确认 RealSense/相机已连接后再启动网关。"
+def _run_mscli(*args: str, timeout_sec: float = 10.0) -> tuple[int, str]:
+    """直接调 unitree master_service 自带的 mscli（非 sudo）。"""
+    if not G1_MSCLI_BIN.is_file():
+        return 127, ""
+    try:
+        proc = subprocess.run(
+            [str(G1_MSCLI_BIN), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
         )
+        return proc.returncode, (proc.stdout or "")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        LOGGER.debug("mscli 执行异常: %s", exc)
+        return 126, ""
+
+
+def _g1_videohub_alive() -> bool:
+    """通过 mscli getservice 查询 videohub 状态。stdout 含 "status:0" 视为 running。"""
+    rc, stdout = _run_mscli("getservice", G1_VIDEHUB_SERVICE_NAME)
+    if rc != 0:
+        return False
+    return "status:0" in stdout
+
+
+def _g1_kill_stale_videohub_via_mscli() -> None:
+    """让 master_service 停掉当前 fork 出来的 videohub（如果有）。"""
+    rc, _ = _run_mscli("stopservice", G1_VIDEHUB_SERVICE_NAME, timeout_sec=5.0)
+    LOGGER.debug("mscli stopservice 返回 rc=%s", rc)
+
+
+def _g1_kill_stale_videohub_via_pidfile() -> None:
+    """兜底：杀 start-stop-daemon 历史路径留下的孤儿进程。"""
+    script = (
+        "/unitree/sbin/start-stop-daemon "
+        "--stop --pidfile=/unitree/var/run/videohub_pc4.pid "
+        f"--exec {G1_VIDEHUB_BIN} 2>/dev/null || true"
+    )
+    _run_sudo_shell(script)
+
+
+def _g1_init_camera_config() -> None:
+    """确保 /unitree/etc/rgb_camera/CAMAERA_CONFIG 存在（unitree 上游拼写是事实）。"""
     script = f"""
 mkdir -p {G1_CAMERA_CONFIG.parent}
 if [[ ! -f {G1_CAMERA_CONFIG} ]]; then
   printf '%s\\n' '{{' '  "Backlight Compensation": 0,' '  "Exposure": 0,' '  "Gain": 0' '}}' > {G1_CAMERA_CONFIG}
 fi
-/unitree/sbin/start-stop-daemon --stop --pidfile=/unitree/var/run/videohub_pc4.pid --exec {G1_VIDEHUB_BIN} 2>/dev/null || true
-sleep 1
-export CYCLONEDDS_URI={G1_VIDEHUB_CYCLONEDDS}
-/unitree/sbin/start-stop-daemon --start --background --make-pidfile --pidfile=/unitree/var/run/videohub_pc4.pid --exec {G1_VIDEHUB_BIN}
 """
-    if not _run_sudo_shell(script):
+    _run_sudo_shell(script)
+
+
+def ensure_g1_videohub_process() -> bool:
+    """G1 端启动 videohub_pc4 并等待 ready。
+
+    走 master_service 自带的 mscli 控制通道（而非 start-stop-daemon），
+    让 videohub 进程纳入 master_service 的 fork 树：
+    - 进程崩溃后 master_service 5 秒内自动重启（与 ota_pipe 同守护等级）
+    - start-stop-daemon 路径会派生 PPid=1 的孤儿进程，master_service 看不到，
+      进程崩了不会自动重启，是 2026-06-29 实机视频恢复不稳的根因。
+
+    Returns:
+        True 表示 mscli 通道可用且 videohub 进入 status:0；False 表示退化路径。
+    """
+    if not G1_VIDEHUB_BIN.is_file():
+        LOGGER.info("未找到 %s，跳过 G1 videohub 重启。", G1_VIDEHUB_BIN)
         return False
-    time.sleep(2)
-    return True
+    if not G1_MSCLI_BIN.is_file():
+        LOGGER.warning(
+            "未找到 %s，无法通过 master_service 通道拉起 videohub；"
+            "退化到 streamer 重试链路。",
+            G1_MSCLI_BIN,
+        )
+        return False
+    if not _camera_devices_present():
+        LOGGER.warning(
+            "未检测到 /dev/video* 或 /dev/media0；请确认 RealSense/相机已连接后再启动网关。"
+        )
+
+    # 1) 前置：CAMAERA_CONFIG 初始化（master_service 启 videohub 前要读到该文件）
+    _g1_init_camera_config()
+
+    # 2) 双清残留：先让 master_service 停自己 fork 的，再用 pidfile 杀孤儿
+    _g1_kill_stale_videohub_via_mscli()
+    _g1_kill_stale_videohub_via_pidfile()
+
+    # 3) 让 master_service fork 新进程
+    rc, _ = _run_mscli("startservice", G1_VIDEHUB_SERVICE_NAME, timeout_sec=10.0)
+    if rc != 0:
+        LOGGER.warning("mscli startservice 返回 rc=%s", rc)
+        return False
+
+    # 4) 轮询直到 status:0，最多 10 秒
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if _g1_videohub_alive():
+            LOGGER.info("已通过 master_service (mscli) 拉起 videohub_pc4。")
+            return True
+        time.sleep(0.5)
+
+    LOGGER.warning("mscli startservice 后 videohub_pc4 10s 内未就绪。")
+    return False
 
 
 def _prepare_g1_sdk_env() -> None:

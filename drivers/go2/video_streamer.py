@@ -96,27 +96,61 @@ async def _run_blocking(callable_obj: Callable[..., T], *args: object, **kwargs:
     return await loop.run_in_executor(None, lambda: callable_obj(*args, **kwargs))
 
 
+def _wait_for_first_frame(client: object, *, timeout_sec: float) -> None:
+    deadline = time.monotonic() + max(1.0, timeout_sec)
+    last_code = None
+    while time.monotonic() < deadline:
+        code, data = client.GetImageSample()
+        last_code = code
+        if code == 0 and data and _extract_jpeg_payload(data) is not None:
+            LOGGER.info("Go2 SDK VideoClient 首次取帧成功。")
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"Go2 SDK VideoClient.GetImageSample 在 {timeout_sec:.0f}s 内未就绪（最后 code={last_code}）。"
+    )
+
+
 async def _stream_once(config: Go2DataPlaneConfig) -> None:
     stream_config = config.video_stream
     client = await _run_blocking(_create_video_client, config)
+    ready_timeout = float(os.environ.get("NUWAX_VIDEO_BACKEND_READY_TIMEOUT_SEC", "60"))
+    await _run_blocking(_wait_for_first_frame, client, timeout_sec=ready_timeout)
     frame_interval_sec = 1.0 / max(1.0, float(stream_config.fps))
 
     uds_path = os.environ.get("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
+    uds_timeout = float(os.environ.get("NUWAX_VIDEO_UDS_READY_TIMEOUT_SEC", "30"))
     uds_sender = VideoUdsSender(uds_path, reconnect_interval=1.0)
-    if not uds_sender.connect():
-        raise RuntimeError(f"无法连接 Rust 视频中转 UDS: {uds_path}")
+    if not await _run_blocking(uds_sender.wait_until_connected, uds_timeout):
+        raise RuntimeError(
+            f"无法连接 Rust 视频中转 UDS: {uds_path}（等待 {uds_timeout:.0f}s）"
+        )
     LOGGER.info("视频推流已连接 Rust UDS: %s", uds_path)
 
+    consecutive_failures = 0
     while True:
         started_at = time.monotonic()
         code, data = await _run_blocking(client.GetImageSample)
         if code != 0 or not data:
-            raise RuntimeError(f"Go2 VideoClient.GetImageSample 失败: code={code}")
+            consecutive_failures += 1
+            if consecutive_failures >= 30:
+                raise RuntimeError(f"Go2 VideoClient.GetImageSample 连续失败: code={code}")
+            await asyncio.sleep(0.1)
+            continue
         payload = _extract_jpeg_payload(data)
         if payload is None:
-            raise RuntimeError("Go2 VideoClient 返回的数据不是完整 JPEG。")
+            consecutive_failures += 1
+            if consecutive_failures >= 30:
+                raise RuntimeError("Go2 VideoClient 连续返回非完整 JPEG。")
+            await asyncio.sleep(0.1)
+            continue
         if not uds_sender.send_frame(payload):
-            raise RuntimeError("UDS 发送失败，连接已断开。")
+            consecutive_failures += 1
+            if consecutive_failures >= 10:
+                raise RuntimeError("UDS 发送连续失败，连接已断开。")
+            await asyncio.sleep(0.2)
+            continue
+        consecutive_failures = 0
         elapsed = time.monotonic() - started_at
         remaining = frame_interval_sec - elapsed
         if remaining > 0:

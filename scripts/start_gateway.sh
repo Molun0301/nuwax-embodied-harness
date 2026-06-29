@@ -20,6 +20,7 @@ LOCK_FD=""
 GATEWAY_PID=""
 VIDEO_STREAMER_PID=""
 ROS_BRIDGE_PID=""
+VIDEO_RELAY_PID=""
 STOP_REQUESTED=0
 
 trim_whitespace() {
@@ -214,8 +215,8 @@ cleanup_stale_ros_bridge_processes() {
     if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
       continue
     fi
-    if [[ "${args}" == *"nuwax-ros-bridge"* ]]; then
-      terminate_process_scope "${pid}" "stale ros-bridge"
+    if [[ "${args}" == *"nuwax-ros-bridge"* || "${args}" == *"nuwax_video_relay.py"* ]]; then
+      terminate_process_scope "${pid}" "stale video/ros bridge"
     fi
   done < <(ps -eo pid=,args=)
 
@@ -252,8 +253,8 @@ cleanup_stale_ros_bridge_processes() {
   rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
 }
 
-cleanup_stale_go2_video_streamer() {
-  # 终止任何残留的 go2 视频推流进程（无论由本脚本、systemd 还是手动启动），
+cleanup_stale_video_streamer() {
+  # 终止任何残留的端侧视频推流进程（无论由本脚本、systemd 还是手动启动），
   # 保证网关成为唯一管理者，避免"网关停了 streamer 还在"以及双拉起。
   local pid=""
   local args=""
@@ -262,8 +263,8 @@ cleanup_stale_go2_video_streamer() {
     if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
       continue
     fi
-    if [[ "${args}" == *"drivers.go2.video_streamer"* ]]; then
-      terminate_process_scope "${pid}" "stale go2 video streamer"
+    if [[ "${args}" == *"drivers.go2.video_streamer"* || "${args}" == *"drivers.g1.video_streamer"* ]]; then
+      terminate_process_scope "${pid}" "stale video streamer"
     fi
   done < <(ps -eo pid=,args=)
 }
@@ -343,7 +344,7 @@ stop_existing_gateway() {
     echo "gateway pid file not found: ${PID_FILE}"
     cleanup_stale_gateway_processes
     cleanup_stale_ros_bridge_processes
-    cleanup_stale_go2_video_streamer
+    cleanup_stale_video_streamer
     cleanup_external_geometry_processes
     return 0
   fi
@@ -353,7 +354,7 @@ stop_existing_gateway() {
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
     cleanup_stale_ros_bridge_processes
-    cleanup_stale_go2_video_streamer
+    cleanup_stale_video_streamer
     cleanup_external_geometry_processes
     return 0
   fi
@@ -379,22 +380,128 @@ status_gateway() {
   return 3
 }
 
-should_start_ros_bridge() {
+should_start_ros2_bridge() {
   local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
-  [[ -x "${binary}" ]] && is_truthy "${NUWAX_ROS_BRIDGE_ENABLED:-true}"
+  is_truthy "${NUWAX_ROS2_BRIDGE_ENABLED:-false}" && [[ -x "${binary}" ]]
+}
+
+should_start_video_relay() {
+  should_start_go2_video_streamer || should_start_g1_video_streamer
+}
+
+should_start_ros_bridge() {
+  should_start_ros2_bridge || should_start_video_relay
+}
+
+active_robot_name() {
+  printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]'
 }
 
 should_start_go2_video_streamer() {
   is_truthy "${GO2_VIDEO_STREAM_ENABLED:-true}" \
     && is_truthy "${GO2_DATA_PLANE_ENABLED:-false}" \
-    && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "go2" ]]
+    && [[ "$(active_robot_name)" == "go2" ]]
+}
+
+should_start_g1_video_streamer() {
+  is_truthy "${G1_VIDEO_STREAM_ENABLED:-true}" \
+    && is_truthy "${G1_DATA_PLANE_ENABLED:-false}" \
+    && [[ "$(active_robot_name)" == "g1" ]]
+}
+
+geometry_cyclonedds_uri() {
+  local candidate="${NUWAX_GEOMETRY_CYCLONEDDS_URI:-}"
+  if [[ -z "${candidate}" && -f "${HOME}/cyclonedds_ws/cyclonedds.xml" ]]; then
+    candidate="${HOME}/cyclonedds_ws/cyclonedds.xml"
+  fi
+  if [[ -z "${candidate}" && -f "${HOME}/unitree_ros2/cyclonedds_ws/cyclonedds.xml" ]]; then
+    candidate="${HOME}/unitree_ros2/cyclonedds_ws/cyclonedds.xml"
+  fi
+  printf '%s' "${candidate}"
+}
+
+wait_for_video_uds_socket() {
+  local uds_path="${NUWAX_VIDEO_UDS_PATH:-/tmp/nuwax_video.sock}"
+  local timeout_sec="${NUWAX_VIDEO_UDS_READY_TIMEOUT_SEC:-30}"
+  local waited=0
+  while [[ "${waited}" -lt "${timeout_sec}" ]]; do
+    if [[ -S "${uds_path}" ]]; then
+      echo "video UDS ready (${uds_path})"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "WARNING: video UDS not ready after ${timeout_sec}s (${uds_path})" >&2
+  return 1
+}
+
+prepare_robot_video_backend() {
+  if ! should_start_video_streamer; then
+    return 0
+  fi
+  local robot_name
+  robot_name="$(active_robot_name)"
+  echo "preparing SDK video backend for robot=${robot_name}..."
+  if ! "${PYTHON_BIN}" "${REPO_ROOT}/scripts/ensure_robot_video_backend.py" --robot "${robot_name}"; then
+    echo "WARNING: SDK 视频后端尚未就绪，video streamer 将继续重试。" >&2
+  fi
+}
+
+wait_for_video_shm_frame() {
+  local shm_path="${NUWAX_VIDEO_SHM_PATH:-/tmp/nuwax_video.shm}"
+  local timeout_sec="${NUWAX_VIDEO_SHM_READY_TIMEOUT_SEC:-${G1_VIDEO_SHM_READY_TIMEOUT_SEC:-90}}"
+  local waited=0
+  while [[ "${waited}" -lt "${timeout_sec}" ]]; do
+    if [[ -f "${shm_path}" ]] && "${PYTHON_BIN}" -c "
+from services.geometry.video_shm_reader import VideoShmReader
+reader = VideoShmReader('${shm_path}')
+try:
+    raise SystemExit(0 if reader.has_new_frame() else 1)
+finally:
+    reader.close()
+" 2>/dev/null; then
+      echo "video SHM ready (${shm_path})"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  echo "WARNING: video SHM has no frames after ${timeout_sec}s (debug 面板将等待首帧)" >&2
+}
+
+should_start_video_streamer() {
+  should_start_video_relay
+}
+
+start_python_video_relay() {
+  if [[ -n "${VIDEO_RELAY_PID}" ]] && is_pid_alive "${VIDEO_RELAY_PID}"; then
+    return 0
+  fi
+  if ! should_start_video_relay; then
+    return 0
+  fi
+  echo "starting Python video relay (UDS -> SHM)"
+  (
+    run_with_title "nuwax-video-relay" "${PYTHON_BIN}" "${REPO_ROOT}/scripts/nuwax_video_relay.py"
+  ) &
+  VIDEO_RELAY_PID="$!"
+  wait_for_video_uds_socket || echo "WARNING: Python video relay UDS not ready (pid ${VIDEO_RELAY_PID})" >&2
+}
+
+start_video_relay() {
+  if should_start_ros2_bridge; then
+    start_ros_bridge
+    return 0
+  fi
+  start_python_video_relay
 }
 
 start_ros_bridge() {
   if [[ -n "${ROS_BRIDGE_PID}" ]] && is_pid_alive "${ROS_BRIDGE_PID}"; then
     return 0
   fi
-  if ! should_start_ros_bridge; then
+  if ! should_start_ros2_bridge; then
     return 0
   fi
   local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
@@ -407,6 +514,9 @@ start_ros_bridge() {
   local bridge_nav_action="${NUWAX_NAV_ACTION:-${NUWAX_NAV2_ACTION_NAME:-/navigate_to_pose}}"
   local bridge_odom_source="${NUWAX_GO2_ODOM_SOURCE:-${NUWAX_GEOMETRY_ODOM_TOPIC:-/utlidar/robot_odom}}"
   local bridge_cloud_source="${NUWAX_GO2_POINTCLOUD_SOURCE:-${NUWAX_GEOMETRY_POINT_CLOUD_TOPIC:-/utlidar/cloud}}"
+  local geometry_cyclonedds
+  geometry_cyclonedds="$(geometry_cyclonedds_uri)"
+  local cyclonedds_lib_dir="${NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR:-${G1_CYCLONEDDS_LIB_DIR:-${GO2_CYCLONEDDS_LIB_DIR:-}}}"
   echo "starting Rust ros-bridge: ${binary}"
   (
     set +u
@@ -415,27 +525,38 @@ start_ros_bridge() {
     export NUWAX_NAV_ACTION="${bridge_nav_action}"
     export NUWAX_GO2_ODOM_SOURCE="${bridge_odom_source}"
     export NUWAX_GO2_POINTCLOUD_SOURCE="${bridge_cloud_source}"
+    if [[ -n "${geometry_cyclonedds}" ]]; then
+      export CYCLONEDDS_URI="${geometry_cyclonedds}"
+    else
+      unset CYCLONEDDS_URI
+    fi
     if [[ -f "${bridge_env_script}" ]]; then
       source "${bridge_env_script}"
+    elif [[ -f "${REPO_ROOT}/services/geometry/source_runtime_env.sh" ]]; then
+      export NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV="${NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV:-true}"
+      # shellcheck disable=SC1091
+      source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
     else
       source /opt/ros/foxy/setup.bash
       export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    fi
+    if [[ -n "${cyclonedds_lib_dir}" && -d "${cyclonedds_lib_dir}" ]]; then
+      case ":${LD_LIBRARY_PATH:-}:" in
+        *":${cyclonedds_lib_dir}:"*) ;;
+        *)
+          if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+            export LD_LIBRARY_PATH="${cyclonedds_lib_dir}:${LD_LIBRARY_PATH}"
+          else
+            export LD_LIBRARY_PATH="${cyclonedds_lib_dir}"
+          fi
+          ;;
+      esac
     fi
     set -u
     run_with_title "nuwax-ros-bridge" "${binary}"
   ) &
   ROS_BRIDGE_PID="$!"
-  # 等待 UDS socket 出现
-  local waited=0
-  while [[ ! -S /tmp/nuwax_video.sock ]] && [[ "${waited}" -lt 5 ]]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-  if [[ -S /tmp/nuwax_video.sock ]]; then
-    echo "Rust ros-bridge ready (pid ${ROS_BRIDGE_PID})"
-  else
-    echo "WARNING: Rust ros-bridge UDS not ready after 5s" >&2
-  fi
+  wait_for_video_uds_socket || echo "WARNING: Rust ros-bridge UDS not ready (pid ${ROS_BRIDGE_PID})" >&2
 }
 
 start_go2_video_streamer() {
@@ -445,41 +566,124 @@ start_go2_video_streamer() {
   if ! should_start_go2_video_streamer; then
     return 0
   fi
-  echo "starting Go2 side video streamer -> UDS /tmp/nuwax_video.sock"
-  (run_with_title "nuwax-go2-video-streamer" "${PYTHON_BIN}" -m drivers.go2.video_streamer) &
+  echo "starting Go2 side video streamer (unitree_sdk2py) -> UDS /tmp/nuwax_video.sock"
+  (
+    if [[ -f "${GO2_DATA_PLANE_ENV_FILE}" ]]; then
+      set +u
+      # shellcheck disable=SC1090
+      source "${GO2_DATA_PLANE_ENV_FILE}"
+      set -u
+    fi
+    run_with_title "nuwax-go2-video-streamer" "${PYTHON_BIN}" -m drivers.go2.video_streamer
+  ) &
   VIDEO_STREAMER_PID="$!"
 }
 
-stop_ros_bridge() {
+start_g1_video_streamer() {
+  if [[ -n "${VIDEO_STREAMER_PID}" ]] && is_pid_alive "${VIDEO_STREAMER_PID}"; then
+    return 0
+  fi
+  if ! should_start_g1_video_streamer; then
+    return 0
+  fi
+  echo "starting G1 side video streamer (unitree_sdk2py) -> UDS /tmp/nuwax_video.sock"
+  (
+    if [[ -f "${G1_DATA_PLANE_ENV_FILE}" ]]; then
+      set +u
+      # shellcheck disable=SC1090
+      source "${G1_DATA_PLANE_ENV_FILE}"
+      set -u
+    fi
+    run_with_title "nuwax-g1-video-streamer" "${PYTHON_BIN}" -m drivers.g1.video_streamer
+  ) &
+  VIDEO_STREAMER_PID="$!"
+}
+
+start_video_streamer() {
+  wait_for_video_uds_socket || true
+  prepare_robot_video_backend
+  case "$(active_robot_name)" in
+    go2)
+      start_go2_video_streamer
+      ;;
+    g1)
+      start_g1_video_streamer
+      ;;
+    *)
+      if should_start_go2_video_streamer; then
+        start_go2_video_streamer
+      elif should_start_g1_video_streamer; then
+        start_g1_video_streamer
+      fi
+      ;;
+  esac
+}
+
+monitor_video_streamer() {
+  while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
+    sleep 5
+    if [[ -z "${VIDEO_STREAMER_PID}" ]] || ! is_pid_alive "${VIDEO_STREAMER_PID}"; then
+      if should_start_video_streamer; then
+        echo "video streamer (pid ${VIDEO_STREAMER_PID:-none}) exited, restarting..." >&2
+        VIDEO_STREAMER_PID=""
+        start_video_streamer
+      fi
+    fi
+  done
+}
+
+stop_video_relay() {
   if [[ -n "${ROS_BRIDGE_PID}" ]] && is_pid_alive "${ROS_BRIDGE_PID}"; then
     terminate_process_scope "${ROS_BRIDGE_PID}" "rust ros-bridge"
     wait "${ROS_BRIDGE_PID}" >/dev/null 2>&1 || true
   fi
   ROS_BRIDGE_PID=""
+  if [[ -n "${VIDEO_RELAY_PID}" ]] && is_pid_alive "${VIDEO_RELAY_PID}"; then
+    terminate_process_scope "${VIDEO_RELAY_PID}" "python video relay"
+    wait "${VIDEO_RELAY_PID}" >/dev/null 2>&1 || true
+  fi
+  VIDEO_RELAY_PID=""
   rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
 }
 
-monitor_ros_bridge() {
+stop_ros_bridge() {
+  stop_video_relay
+}
+
+monitor_video_relay() {
   while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
     sleep 5
-    if [[ -n "${ROS_BRIDGE_PID}" ]] && ! is_pid_alive "${ROS_BRIDGE_PID}"; then
-      echo "Rust ros-bridge (pid ${ROS_BRIDGE_PID}) crashed, restarting..." >&2
-      rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
-      ROS_BRIDGE_PID=""
-      start_ros_bridge
+    if should_start_ros2_bridge; then
+      if [[ -n "${ROS_BRIDGE_PID}" ]] && ! is_pid_alive "${ROS_BRIDGE_PID}"; then
+        echo "Rust ros-bridge (pid ${ROS_BRIDGE_PID}) crashed, restarting..." >&2
+        rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+        ROS_BRIDGE_PID=""
+        start_ros_bridge
+      fi
+      continue
+    fi
+    if [[ -n "${VIDEO_RELAY_PID}" ]] && ! is_pid_alive "${VIDEO_RELAY_PID}"; then
+      echo "Python video relay (pid ${VIDEO_RELAY_PID}) exited, restarting..." >&2
+      rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm 2>/dev/null || true
+      VIDEO_RELAY_PID=""
+      start_python_video_relay
     fi
   done
 }
 
-stop_go2_video_streamer() {
+monitor_ros_bridge() {
+  monitor_video_relay
+}
+
+stop_video_streamer() {
   if [[ -n "${VIDEO_STREAMER_PID}" ]] && is_pid_alive "${VIDEO_STREAMER_PID}"; then
-    terminate_process_scope "${VIDEO_STREAMER_PID}" "go2 video streamer"
+    terminate_process_scope "${VIDEO_STREAMER_PID}" "video streamer"
     wait "${VIDEO_STREAMER_PID}" >/dev/null 2>&1 || true
   fi
   VIDEO_STREAMER_PID=""
   # 兜底：清理任何未被本脚本跟踪的残留 streamer（如 systemd/手动启动的），
   # 确保网关停止后不会留下推流进程。
-  cleanup_stale_go2_video_streamer
+  cleanup_stale_video_streamer
 }
 
 stop_gateway() {
@@ -493,7 +697,7 @@ stop_gateway() {
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
   fi
   stop_ros_bridge
-  stop_go2_video_streamer
+  stop_video_streamer
   cleanup_external_geometry_processes
   exit 0
 }
@@ -505,6 +709,10 @@ fi
 GO2_DATA_PLANE_ENV_FILE="${GO2_DATA_PLANE_ENV_FILE:-${REPO_ROOT}/drivers/go2/data_plane.env}"
 if [[ -f "${GO2_DATA_PLANE_ENV_FILE}" ]]; then
   load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
+fi
+G1_DATA_PLANE_ENV_FILE="${G1_DATA_PLANE_ENV_FILE:-${REPO_ROOT}/drivers/g1/data_plane.env}"
+if [[ -f "${G1_DATA_PLANE_ENV_FILE}" ]]; then
+  load_env_file "${G1_DATA_PLANE_ENV_FILE}"
 fi
 
 unset RMW_IMPLEMENTATION
@@ -530,7 +738,7 @@ case "${ACTION}" in
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
     cleanup_stale_ros_bridge_processes
-    cleanup_stale_go2_video_streamer
+    cleanup_stale_video_streamer
     cleanup_external_geometry_processes
     ;;
   stop)
@@ -557,6 +765,12 @@ if is_truthy "${NUWAX_GEOMETRY_ENABLED:-true}"; then
   source_runtime_script "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
 fi
 
+if is_truthy "${NUWAX_GEOMETRY_ENABLED:-true}" && is_truthy "${NUWAX_GEOMETRY_REQUIRE_ROS2:-true}"; then
+  export NUWAX_ROS2_BRIDGE_ENABLED="${NUWAX_ROS2_BRIDGE_ENABLED:-true}"
+else
+  export NUWAX_ROS2_BRIDGE_ENABLED="${NUWAX_ROS2_BRIDGE_ENABLED:-false}"
+fi
+
 export PYTHONUNBUFFERED=1
 export GO2_VIDEO_STREAM_GATEWAY_URL="${GO2_VIDEO_STREAM_GATEWAY_URL:-ws://127.0.0.1:${PORT}/streams/video.ingest}"
 # 个人机器狗：网关不鉴权，视频推流令牌默认留空（如需可单独设置 GO2_VIDEO_STREAM_ACCESS_TOKEN）。
@@ -571,12 +785,14 @@ if ! is_restart_enabled "${RESTART_POLICY}"; then
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
-  start_ros_bridge
-  start_go2_video_streamer
-  monitor_ros_bridge &
+  start_video_relay
+  start_video_streamer
+  monitor_video_relay &
+  monitor_video_streamer &
+  wait_for_video_shm_frame &
   wait "${GATEWAY_PID}"
   exit_code="$?"
-  stop_go2_video_streamer
+  stop_video_streamer
   stop_ros_bridge
   exit "${exit_code}"
 fi
@@ -586,12 +802,14 @@ while true; do
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
-  start_ros_bridge
-  start_go2_video_streamer
-  monitor_ros_bridge &
+  start_video_relay
+  start_video_streamer
+  monitor_video_relay &
+  monitor_video_streamer &
+  wait_for_video_shm_frame &
   wait "${GATEWAY_PID}"
   exit_code="$?"
-  stop_go2_video_streamer
+  stop_video_streamer
   GATEWAY_PID=""
   set -e
 

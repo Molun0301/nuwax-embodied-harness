@@ -123,33 +123,17 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         fps: float = 15.0,
     ):
         access_manager.authenticate_http(request)
-        video_available = False
-        if VideoShmReader is not None:
-            import os as _os
-            _shm_path = _os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
-            _probe = VideoShmReader(_shm_path)
-            video_available = _probe.has_new_frame()
-            _probe.close()
-        if not video_available:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "video_stream_not_available",
-                    "reason": "rust_bridge_no_frames",
-                    "message": "Rust 视频中转尚未收到帧数据。",
-                },
-            )
         requested_fps = float(fps or 15.0)
         if not math.isfinite(requested_fps):
             requested_fps = 15.0
         frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 24.0)
 
         async def frame_generator():
-            last_sequence = 0
+            import os
+
             shm_reader = None
+            shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
             if VideoShmReader is not None:
-                import os
-                shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
                 shm_reader = VideoShmReader(shm_path)
 
             while not await request.is_disconnected():
@@ -158,8 +142,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 if shm_reader is not None:
                     result = shm_reader.read_latest()
                     if result is not None:
-                        frame_data, seq, _ = result
-                        last_sequence = seq
+                        frame_data, _, _ = result
                 if frame_data is not None:
                     yield _format_mjpeg_frame(frame_data)
                 elapsed = time.monotonic() - started_at

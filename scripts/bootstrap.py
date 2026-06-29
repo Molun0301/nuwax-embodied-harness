@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -44,6 +45,11 @@ DEFAULT_NUWACLAW_FILE_SERVER_PORT = 60005
 DEFAULT_NUWACLAW_WEB_PORT = 6080
 DEFAULT_NUWACLAW_WORKSPACE_DIR = "/home/user/nuwaxbot/workspace"
 DEFAULT_NUWACLAW_HOST_MOUNT = "none"
+DEFAULT_NUWACLAW_DOCKER_DNS = ("223.5.5.5", "114.114.114.114")
+DEFAULT_NUWACLAW_CLOUD_HOSTS = (
+    ("nac01.nuwax.com", "NUWAX_LANPROXY_HOST"),
+    ("agent.nuwax.com", "NUWAX_AGENT_HOST"),
+)
 DEFAULT_NUWACLAW_PROXY_SCRIPT = (
     Path("/var/lib/docker/volumes")
     / DEFAULT_NUWACLAW_CLIENT_VOLUME_NAME
@@ -1199,6 +1205,45 @@ def _build_nuwaclaw_host_mount(mode: str) -> Optional[str]:
     return None
 
 
+def _is_fake_proxy_ip(ip: str) -> bool:
+    return ip.startswith("198.18.") or ip.startswith("198.19.")
+
+
+def _resolve_public_host_ips(hostname: str) -> List[str]:
+    try:
+        infos = socket.getaddrinfo(hostname, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return []
+    ips: List[str] = []
+    for info in infos:
+        ip = str(info[4][0])
+        if _is_fake_proxy_ip(ip) or ip in ips:
+            continue
+        ips.append(ip)
+    return ips
+
+
+def _nuwaclaw_docker_network_args() -> List[str]:
+    """避免容器继承机器人内网 DNS 后把云端域名解析到 198.18.x 假地址。"""
+    args: List[str] = []
+    dns_csv = str(os.environ.get("NUWACLAW_DOCKER_DNS", "") or "").strip()
+    dns_servers = [item.strip() for item in dns_csv.split(",") if item.strip()]
+    if not dns_servers:
+        dns_servers = list(DEFAULT_NUWACLAW_DOCKER_DNS)
+    for dns in dns_servers:
+        args.extend(["--dns", dns])
+
+    for hostname, env_override in DEFAULT_NUWACLAW_CLOUD_HOSTS:
+        override = str(os.environ.get(env_override, "") or "").strip()
+        if override:
+            args.extend(["--add-host", f"{hostname}:{override}"])
+            continue
+        ips = _resolve_public_host_ips(hostname)
+        if ips:
+            args.extend(["--add-host", f"{hostname}:{ips[0]}"])
+    return args
+
+
 def build_nuwaclaw_docker_run_command(planner: BootstrapPlanner) -> List[str]:
     if not planner.nuwaclaw_saved_key:
         raise BootstrapError("已选择安装 NuwaxClaw Docker 客户端，但未提供个人密钥。")
@@ -1213,6 +1258,7 @@ def build_nuwaclaw_docker_run_command(planner: BootstrapPlanner) -> List[str]:
         "always",
         "--add-host",
         "host.docker.internal:host-gateway",
+        *_nuwaclaw_docker_network_args(),
         "-p",
         f"{DEFAULT_NUWACLAW_WEB_PORT}:{DEFAULT_NUWACLAW_WEB_PORT}",
         "-p",

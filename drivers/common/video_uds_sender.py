@@ -46,6 +46,15 @@ class VideoUdsSender:
         except (OSError, ConnectionRefusedError):
             return False
 
+    def wait_until_connected(self, timeout_sec: float) -> bool:
+        """在超时内轮询连接 UDS，用于 ros-bridge 启动/重启窗口。"""
+        deadline = time.monotonic() + max(1.0, timeout_sec)
+        while time.monotonic() < deadline:
+            if self.connect():
+                return True
+            time.sleep(min(self._reconnect_interval, 0.5))
+        return False
+
     def send_frame(self, jpeg_data: bytes) -> bool:
         """发送一帧 JPEG 数据。返回是否成功。"""
         if self._sock is None:

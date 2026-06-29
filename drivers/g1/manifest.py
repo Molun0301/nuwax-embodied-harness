@@ -44,7 +44,7 @@ def build_g1_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Robo
             memory_mode_recommendation="cloud",
             perception_mode_recommendation="hybrid",
             telemetry_interval_sec=2.0,
-            telemetry_process_keywords=("gateway", "robot_bridge", "ros2", "g1_webrtc_stream"),
+            telemetry_process_keywords=("gateway", "robot_bridge", "ros2", "g1_video_streamer", "g1_webrtc_stream"),
         ),
     )
 

@@ -1357,7 +1357,7 @@ button{font-family:inherit;cursor:pointer}
           order: 60,
         });
         const video = overview.video || {};
-        const videoProc = processByRole("go2_video_streamer");
+        const videoProc = processByRole("g1_video_streamer") || processByRole("go2_video_streamer");
         entries.push({
           service_id: "perception_video_fallback",
           display_name: "感知/视频服务",
@@ -1365,7 +1365,7 @@ button{font-family:inherit;cursor:pointer}
           summary: videoProc ? "视频推流进程已匹配" : "视频/感知等待上报",
           evidence: videoProc ? `进程运行中 PID ${videoProc.pid}` : serviceEvidenceFromSummary(video, "视频/感知流已上报"),
           source: "frontend_fallback",
-          advice: videoProc ? "无需处理" : "检查 Go2 推流和感知日志",
+          advice: videoProc ? "无需处理" : "检查端侧视频推流和感知日志",
           order: 70,
         });
         return {

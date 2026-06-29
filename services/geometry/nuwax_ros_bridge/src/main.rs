@@ -12,6 +12,24 @@ pub mod proto {
     tonic::include_proto!("nuwax.geometry");
 }
 
+fn is_truthy_env(name: &str, default_value: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => default_value,
+    }
+}
+
+fn ros2_bridge_enabled() -> bool {
+    if std::env::var("NUWAX_ROS2_BRIDGE_ENABLED").is_ok() {
+        return is_truthy_env("NUWAX_ROS2_BRIDGE_ENABLED", true);
+    }
+    is_truthy_env("NUWAX_GEOMETRY_REQUIRE_ROS2", true)
+        && is_truthy_env("NUWAX_GEOMETRY_ENABLED", true)
+}
+
 fn env_first(names: &[&str], default_value: &str) -> String {
     for name in names {
         if let Ok(value) = std::env::var(name) {
@@ -57,10 +75,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     info!("视频中转已启动: shm={:?}, uds={:?}", video_shm_path, video_uds_path);
 
-    let bridge = ros2_bridge::spawn_ros2_bridge(
-        &map_topic, &tf_topic,
-        cloud_map_topic.as_deref(),
-    )?;
+    let bridge = if ros2_bridge_enabled() {
+        info!("ROS2 桥接已启用");
+        ros2_bridge::spawn_ros2_bridge(
+            &map_topic, &tf_topic,
+            cloud_map_topic.as_deref(),
+        )?
+    } else {
+        info!("ROS2 桥接已禁用（仅视频中转 + gRPC 存根）");
+        ros2_bridge::stub_ros2_bridge_handle()
+    };
 
     let service = server::GeometryRuntimeService::new(bridge);
 

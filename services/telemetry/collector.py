@@ -65,6 +65,7 @@ _PROCESS_PATTERNS: Sequence[tuple[str, str, str]] = (
     ("gateway_web", "网关 Web 服务", "nuwax-gateway-web"),
     ("gateway_supervisor", "网关守护脚本", "nuwax-gateway-supervisor"),
     ("go2_video_streamer", "Go2 视频推流", "nuwax-go2-video-streamer"),
+    ("g1_video_streamer", "G1 视频推流", "nuwax-g1-video-streamer"),
     ("ros_bridge", "ROS 数据桥", "nuwax-ros-bridge"),
     ("geometry_external", "统一几何服务", "nuwax-geometry-external"),
     ("odom_tf_bridge", "里程计 TF 桥", "nuwax-odom-tf-bridge"),

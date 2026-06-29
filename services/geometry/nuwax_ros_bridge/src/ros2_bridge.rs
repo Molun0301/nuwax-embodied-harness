@@ -88,6 +88,14 @@ pub struct Ros2BridgeHandle {
     pub cloud_map_tx: broadcast::Sender<CloudMapNotification>,
 }
 
+pub fn stub_ros2_bridge_handle() -> Ros2BridgeHandle {
+    let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
+    Ros2BridgeHandle {
+        state: Arc::new(RwLock::new(SharedState::default())),
+        cloud_map_tx,
+    }
+}
+
 pub fn spawn_ros2_bridge(
     map_topic: &str,
     tf_topic: &str,

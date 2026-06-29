@@ -37,14 +37,14 @@ def build_g1_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Robo
             forbidden_phases=("data_plane",),
             required_apt_packages=("ros-${ROS_DISTRO}-navigation2",),
             forbidden_apt_packages=("ros-${ROS_DISTRO}-rtabmap-ros",),
-            required_python_packages=("aiortc>=1.6", "aiohttp>=3.9"),
+            required_python_packages=("aiortc>=1.6", "aiohttp>=3.9", "unitree_sdk2py==1.0.1"),
             external_slam_script="G1WebRtcSlamScript",
             calibration_required=True,
             slam_dimension="3d",
             memory_mode_recommendation="cloud",
             perception_mode_recommendation="hybrid",
             telemetry_interval_sec=2.0,
-            telemetry_process_keywords=("gateway", "robot_bridge", "ros2", "g1_video_streamer", "g1_webrtc_stream"),
+            telemetry_process_keywords=("gateway", "robot_bridge", "ros2", "g1_webrtc_stream"),
         ),
     )
 

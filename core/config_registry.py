@@ -23,11 +23,14 @@ from typing import Dict, List, Optional, Tuple
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CORE_SETTINGS = _REPO_ROOT / "core" / "settings.py"
 _GO2_SETTINGS = _REPO_ROOT / "drivers" / "go2" / "settings.py"
+_G1_SETTINGS = _REPO_ROOT / "drivers" / "g1" / "settings.py"
 _DESCRIPTIONS_JSON = _REPO_ROOT / "core" / "config_descriptions.json"
 
-# 目标文件标识：core 主 .env / go2 数据面独立 env（drivers/go2/data_plane.env）。
+# 目标文件标识：core 主 .env / go2 数据面独立 env（drivers/go2/data_plane.env）/
+# g1 数据面独立 env（drivers/g1/data_plane.env）。
 TARGET_CORE = "core_env"
 TARGET_GO2 = "go2_data_plane_env"
+TARGET_G1 = "g1_data_plane_env"
 
 
 @dataclass(frozen=True)
@@ -138,6 +141,8 @@ def _all_raw_keys() -> Dict[str, _RawKey]:
     merged.update(_parse_settings_keys(_CORE_SETTINGS, TARGET_CORE))
     for key, rk in _parse_settings_keys(_GO2_SETTINGS, TARGET_GO2).items():
         merged.setdefault(key, rk)
+    for key, rk in _parse_settings_keys(_G1_SETTINGS, TARGET_G1).items():
+        merged.setdefault(key, rk)
     return merged
 
 
@@ -159,6 +164,9 @@ SECTIONS: Tuple[Tuple[str, str], ...] = (
     ("go2_input", "Go2 数据面·输入流"),
     ("go2_official", "Go2 数据面·官方控制"),
     ("go2_video", "Go2 数据面·视频推流"),
+    ("g1_data_plane", "G1 数据面·总开关与 DDS 环境"),
+    ("g1_video", "G1 数据面·视频推流"),
+    ("g1_control", "G1 数据面·DDS 控制"),
     ("relay", "容器内 Relay 转发"),
     ("misc", "其它"),
 )
@@ -189,6 +197,11 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("go2_video", ("GO2_VIDEO_STREAM",)),
     ("go2_official", ("GO2_OFFICIAL",)),
     ("go2_input", ("GO2_DATA_PLANE", "GO2_DIRECT_DDS", "GO2_CYCLONEDDS", "GO2_DDS")),
+    ("g1_video", ("G1_VIDEO_STREAM_",)),
+    ("g1_control", ("G1_DDS_CONTROL_", "G1_DDS_CLIENT_TIMEOUT_SEC", "G1_VIDEO_CLIENT_TIMEOUT_SEC",
+                     "G1_DDS_POST_INIT_STABILIZE_SEC", "G1_MOVE_FOR_INTERVAL_SEC",
+                     "G1_MAX_LINEAR_VELOCITY_MPS", "G1_MAX_YAW_RATE_RPS")),
+    ("g1_data_plane", ("G1_",)),
     ("robot", ("NUWAX_ACTIVE_ROBOT", "GO2_SDK", "GO2_LOW_LEVEL", "GO2_NETWORK", "GO2_")),
 )
 
@@ -223,6 +236,7 @@ _REGULAR_KEYS = frozenset({
     "GO2_OFFICIAL_BACKEND_ENABLED", "GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED",
     "GO2_VIDEO_STREAM_ENABLED", "GO2_VIDEO_STREAM_FPS",
     "NUWAX_RELAY_ENABLED",
+    "G1_DATA_PLANE_ENABLED", "G1_VIDEO_STREAM_ENABLED", "G1_DDS_CONTROL_ENABLED",
 })
 
 # 枚举型键的可选值（用于前端下拉）。
@@ -483,6 +497,7 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_PERCEPTION_STREAM_CAMERA_ID": "持续感知相机 ID",
     "NUWAX_PERCEPTION_STREAM_DETECTOR_BACKEND": "持续感知检测后端",
     "NUWAX_PERCEPTION_STREAM_FAILURE_BACKOFF_SEC": "持续感知失败退避（秒）",
+    "NUWAX_PERCEPTION_STREAM_SKIP_WHEN_LOCALIZATION": "定位模式下跳过自动感知",
     "NUWAX_PERCEPTION_STREAM_STORE_ARTIFACT": "保存持续感知制品",
     "NUWAX_PERCEPTION_TRIANGULATION_MAX_RESIDUAL_M": "三角化最大残差（米）",
     "NUWAX_PERCEPTION_TRIANGULATION_MIN_PARALLAX_DEG": "三角化最小视差角（度）",
@@ -560,6 +575,32 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_RELAY_PORT": "中继端口",
     "NUWAX_RELAY_UPSTREAM_BASE_URL": "中继上游网关地址",
     "NUWAX_RELAY_UPSTREAM_TOKEN": "中继上游令牌",
+
+    # G1 数据面·总开关与 DDS 环境
+    "G1_DATA_PLANE_ENABLED": "启用 G1 数据面",
+    "G1_SDK_PATH": "G1 SDK 路径",
+    "G1_CYCLONEDDS_LIB_DIR": "G1 CycloneDDS 库目录",
+    "G1_CYCLONEDDS_URI": "G1 CycloneDDS 配置文件",
+    "G1_DDS_IFACE": "G1 DDS 网卡",
+    "G1_DATA_PLANE_DDS_IFACE": "G1 数据面 DDS 网卡",
+
+    # G1 数据面·视频推流
+    "G1_VIDEO_STREAM_ENABLED": "启用 G1 视频推流",
+    "G1_VIDEO_STREAM_FPS": "G1 推流帧率",
+    "G1_VIDEO_STREAM_CAMERA_ID": "G1 视频相机 ID",
+    "G1_VIDEO_STREAM_FRAME_ID": "G1 视频坐标系 ID",
+    "G1_VIDEO_STREAM_WIDTH_PX": "G1 视频宽度（像素）",
+    "G1_VIDEO_STREAM_HEIGHT_PX": "G1 视频高度（像素）",
+    "G1_VIDEO_STREAM_RECONNECT_SEC": "G1 视频重连间隔（秒）",
+
+    # G1 数据面·DDS 控制
+    "G1_DDS_CONTROL_ENABLED": "启用 G1 DDS 控制",
+    "G1_DDS_CLIENT_TIMEOUT_SEC": "G1 DDS 客户端超时（秒）",
+    "G1_VIDEO_CLIENT_TIMEOUT_SEC": "G1 视频客户端超时（秒）",
+    "G1_DDS_POST_INIT_STABILIZE_SEC": "G1 DDS 初始化稳定等待（秒）",
+    "G1_MOVE_FOR_INTERVAL_SEC": "G1 单次运动指令时长（秒）",
+    "G1_MAX_LINEAR_VELOCITY_MPS": "G1 最大线速度（米/秒）",
+    "G1_MAX_YAW_RATE_RPS": "G1 最大偏航角速度（弧度/秒）",
 }
 
 

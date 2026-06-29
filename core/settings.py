@@ -375,6 +375,9 @@ class PerceptionStreamRuntimeConfig:
     remember_keyframes: bool = True
     burst_frame_count: int = 4
     burst_interval_sec: float = 0.08
+    # 定位模式(rtabmap_localization 后端激活)下默认不联动拉起后台感知线程。
+    # 手动 start_perception_runtime MCP 入口会绕过该门控。
+    skip_when_localization: bool = True
 
 
 @dataclass
@@ -680,6 +683,10 @@ def load_config() -> NuwaxRobotBridgeConfig:
             remember_keyframes=_cfg_bool("NUWAX_PERCEPTION_KEYFRAME_REMEMBER_ENABLED", True),
             burst_frame_count=max(1, _cfg_int("NUWAX_PERCEPTION_BURST_FRAME_COUNT", 4)),
             burst_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_BURST_INTERVAL_SEC", 0.08)),
+            # 定位模式(rtabmap_localization)下默认不联动后台感知；手动 start MCP 绕过该门控。
+            skip_when_localization=_cfg_bool(
+                "NUWAX_PERCEPTION_STREAM_SKIP_WHEN_LOCALIZATION", True
+            ),
         ),
         deferred_projection=_build_deferred_projection_config(),
         postprocess=PerceptionPostProcessConfig(

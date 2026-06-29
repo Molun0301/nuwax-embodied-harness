@@ -10,6 +10,7 @@ from contracts.base import utc_now
 from contracts.geometry import Pose
 from contracts.runtime_views import PerceptionRuntimeStatus
 from core import EventBus, StateNamespace, StateStore
+from core.errors import GatewayError
 from services.perception.keyframe import PerceptionKeyframeSelector
 from services.perception.service import PerceptionService
 
@@ -48,6 +49,9 @@ class PerceptionVideoRuntime:
         remember_keyframes: bool = True,
         burst_frame_count: int = 8,
         burst_interval_sec: float = 0.15,
+        # 定位模式（rtabmap_localization 后端激活态）下默认不联动后台感知线程；
+        # 只影响 auto_start 时的宿主机启动联动决策，不影响手动 start_perception_runtime MCP。
+        skip_when_localization: bool = True,
     ) -> None:
         self._perception_service = perception_service
         self._state_store = state_store
@@ -58,6 +62,7 @@ class PerceptionVideoRuntime:
         self._event_bus = event_bus
         self._enabled = bool(enabled)
         self._auto_start = bool(auto_start)
+        self._skip_when_localization = bool(skip_when_localization)
         self._camera_id = str(camera_id or "front_camera")
         self._interval_sec = max(0.05, float(interval_sec))
         self._detector_backend_name = str(detector_backend_name or "").strip()
@@ -117,6 +122,11 @@ class PerceptionVideoRuntime:
 
         if not (self._enabled and self._auto_start):
             return False
+        # 定位模式门控：live_pose_provider 是 PlatformGeometryProviderBundle 鸭子类型代理，
+        # 它不直接暴露 _external_geometry_process_is_localization；改用上游 platform_geometry_runtime
+        # 经由 robot 装配层或外部 owner 引用读取——这里取一个不破坏封装的判定方法 is_localization_mode()。
+        if self._skip_when_localization and self._is_localization_mode():
+            return False
         if self._memory_service is None:
             return True
         if hasattr(self._memory_service, "is_enabled"):
@@ -125,6 +135,40 @@ class PerceptionVideoRuntime:
             except Exception:
                 return False
         return True
+
+    def _is_localization_mode(self) -> bool:
+        """判断平台几何运行时当前是否处于定位模式。
+
+        通过 live_pose_provider（=PlatformGeometryProviderBundle）暴露的
+        is_localization_available / _external_geometry_process_is_localization /
+        activation_backend_mode 三个口径来判定，任一为 True 即视为定位模式。
+        鸭子类型：live_pose_provider 为 None 时返回 False（系统尚未装配完）。
+        """
+
+        provider = self._live_pose_provider
+        if provider is None:
+            return False
+        checker = getattr(provider, "is_localization_active", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                pass
+        direct = getattr(provider, "_external_geometry_process_is_localization", None)
+        if callable(direct):
+            try:
+                if bool(direct()):
+                    return True
+            except Exception:
+                pass
+        mode_getter = getattr(provider, "get_active_backend_mode", None)
+        if callable(mode_getter):
+            try:
+                if str(mode_getter() or "") == "rtabmap_localization":
+                    return True
+            except Exception:
+                pass
+        return False
 
     def bind_memory_service(self, memory_service) -> None:
         """显式注入 memory_service，避免外部直接赋值私有字段。"""
@@ -695,6 +739,13 @@ class PerceptionVideoRuntime:
         if callable(refresher):
             try:
                 return refresher()
+            except GatewayError:
+                # refresh 路径在 push 抑制/live 等待期 raise GatewayError 时，显式回退到
+                # get_latest_snapshot() 而非 raise，避免持续感知 tick 反复刷栈。
+                PERCEPTION_RUNTIME_LOGGER.debug("刷新持续感知上下文失败。", exc_info=True)
+                getter = getattr(service, "get_latest_snapshot", None)
+                if callable(getter):
+                    return getter()
             except Exception:
                 PERCEPTION_RUNTIME_LOGGER.debug("刷新持续感知上下文失败。", exc_info=True)
         getter = getattr(service, "get_latest_snapshot", None)

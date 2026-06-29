@@ -577,6 +577,7 @@ class GatewayRuntime:
             remember_keyframes=config.perception.stream_runtime.remember_keyframes,
             burst_frame_count=config.perception.stream_runtime.burst_frame_count,
             burst_interval_sec=config.perception.stream_runtime.burst_interval_sec,
+            skip_when_localization=config.perception.stream_runtime.skip_when_localization,
             memory_service=None,
         )
         self.audio_service = AudioService(
@@ -4766,8 +4767,22 @@ class GatewayRuntime:
         return {"perception_runtime": self._manual_perception_stop()}
 
     def _attach_perception_to_exploration(self) -> None:
-        """探索任务启动时确保感知运行，并标记探索耦合（无论是否已运行）。"""
+        """探索任务启动时确保感知运行，并标记探索耦合（无论是否已运行）。
+
+        定位模式（rtabmap_localization 后端激活态）下不联动拉起后台感知线程：
+        此时地图/定位已就绪，常态任务态由按需 MCP 触发，7×24 后台线程会反复撞
+        refresh() 的 GatewayError。手动 start_perception_runtime MCP 仍可绕过本门控。
+        """
         if not self.perception_video_runtime.is_enabled():
+            return
+        # 定位模式门控：双源判定（外部几何进程 + last_activation_result.backend_mode）。
+        providers = getattr(self.platform_geometry_runtime, "providers", None)
+        localization_active = bool(getattr(providers, "is_localization_active", lambda: False)())
+        if localization_active:
+            RUNTIME_LOGGER.info(
+                "定位模式下跳过探索联动启动持续感知线程（地图/定位已就绪，"
+                "需要时手动调用 start_perception_runtime MCP）。"
+            )
             return
         self._perception_exploration_coupled = True
         if self.perception_video_runtime.is_running():

@@ -6250,6 +6250,27 @@ class PlatformGeometryProviderBundle(
             return bool(backend.is_localization_available())
         return bool(backend.is_available())
 
+    def is_localization_active(self) -> bool:
+        """对外暴露"是否处于定位模式"判定，供感知/记忆门控使用。
+
+        双源口径（与 runtime.py:1394~1395 / 2713~2714 的本地判定完全一致）：
+        1. 外部几何进程在跑且为定位模式
+        2. 最近一次 activate_* 报告的 backend_mode == "rtabmap_localization"
+        任一为 True 即视为定位模式。
+        """
+
+        if not self._is_geometry_profile_enabled():
+            return False
+        try:
+            if bool(self.runtime._external_geometry_process_is_localization()):
+                return True
+        except Exception:
+            pass
+        activation = getattr(self.runtime, "_last_activation_result", None)
+        if isinstance(activation, dict):
+            return str(activation.get("backend_mode") or "") == "rtabmap_localization"
+        return False
+
     def is_map_available(self) -> bool:
         if not self._is_geometry_profile_enabled():
             return False

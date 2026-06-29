@@ -80,11 +80,22 @@ class MappingService:
                 provider_metadata["live_mapping_diagnostics"] = diagnostics_reader()
             except Exception as exc:
                 provider_metadata["live_mapping_diagnostics_error"] = str(exc)
+        occupancy_grid = provider.get_occupancy_grid()
+        cost_map = provider.get_cost_map()
+        semantic_map = provider.get_semantic_map()
+        # 兜底：Rust 桥场景下 RosBridgeProvider 不暴露 layer getter，三键会全 None。
+        # 此时 push 路径（subscribe_map_updates）通常已写入 _latest_snapshot，refresh 走轮询语义
+        # 应当复用过期 snapshot 而非 raise，避免持续感知 tick 反复撞 GatewayError 刷屏。
+        if occupancy_grid is None and cost_map is None and semantic_map is None:
+            latest_snapshot = self.get_latest_snapshot()
+            if latest_snapshot is not None:
+                return latest_snapshot
+            raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
         return self.ingest_external_snapshot(
             source_name=provider.provider_name,
-            occupancy_grid=provider.get_occupancy_grid(),
-            cost_map=provider.get_cost_map(),
-            semantic_map=provider.get_semantic_map(),
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+            semantic_map=semantic_map,
             metadata=provider_metadata,
         )
 

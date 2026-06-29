@@ -37,6 +37,13 @@ ROBOT_DRIVER_REGISTRY: Dict[str, RobotDriverRegistration] = {
         private_capabilities_module="drivers.customrobot.private_capabilities",
         description="用户自定义机器人入口骨架。",
     ),
+    "puppypi": RobotDriverRegistration(
+        robot_name="puppypi",
+        package="drivers.puppypi",
+        factory_name="create_puppypi_assembly",
+        private_capabilities_module="drivers.puppypi.private_capabilities",
+        description="幻尔 PuppyPi 薄驱动（motion_proxy + video_proxy）。",
+    ),
 }
 
 

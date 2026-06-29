@@ -182,6 +182,13 @@ ROBOT_BOOTSTRAP_METADATA: Dict[str, RobotBootstrapMetadata] = {
         supports_data_plane=True,
         recommended_tier="full",
     ),
+    "puppypi": RobotBootstrapMetadata(
+        robot_name="puppypi",
+        env_template=None,
+        env_target=None,
+        supports_data_plane=False,
+        recommended_tier="lite",
+    ),
     "g1": RobotBootstrapMetadata(
         robot_name="g1",
         env_template=None,

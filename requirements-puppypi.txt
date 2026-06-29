@@ -1,0 +1,10 @@
+# PuppyPi 部署用 Python 依赖（不含 Go2 / Unitree 专用包）
+websockets==10.4
+numpy==1.24.4
+opencv-python==4.10.0.84
+pydantic==2.10.6
+fastapi==0.115.14
+uvicorn==0.30.6
+httpx==0.27.2
+psutil==7.2.2
+paho-mqtt>=1.6.1

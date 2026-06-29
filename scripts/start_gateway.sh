@@ -19,6 +19,7 @@ LOCK_FILE=""
 LOCK_FD=""
 GATEWAY_PID=""
 VIDEO_STREAMER_PID=""
+PUPPYPI_VIDEO_BRIDGE_PID=""
 ROS_BRIDGE_PID=""
 STOP_REQUESTED=0
 
@@ -66,6 +67,11 @@ is_truthy() {
   [[ "${value}" == "1" || "${value}" == "true" || "${value}" == "yes" || "${value}" == "on" ]]
 }
 
+docker_with_timeout() {
+  local timeout_sec="${PUPPYPI_DOCKER_TIMEOUT_SEC:-8}"
+  timeout "${timeout_sec}" docker "$@"
+}
+
 source_runtime_script() {
   local target="$1"
   if [[ -f "${target}" ]]; then
@@ -77,6 +83,11 @@ source_runtime_script() {
 run_with_title() {
   local process_title="$1"
   shift
+  local command_name="${1##*/}"
+  if [[ "${command_name}" == "python" || "${command_name}" == python3* ]]; then
+    # Python venv detection depends on argv[0]; exec -a breaks .venv site-packages.
+    exec "$@"
+  fi
   if [[ -n "${BASH_VERSION:-}" ]]; then
     exec -a "${process_title}" "$@"
   fi
@@ -219,7 +230,7 @@ cleanup_stale_ros_bridge_processes() {
     fi
   done < <(ps -eo pid=,args=)
 
-  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+  rm -f /tmp/nuwax_video.sock /tmp/nuwax_pointcloud.shm 2>/dev/null || true
 }
 
 cleanup_stale_go2_video_streamer() {
@@ -236,6 +247,31 @@ cleanup_stale_go2_video_streamer() {
       terminate_process_scope "${pid}" "stale go2 video streamer"
     fi
   done < <(ps -eo pid=,args=)
+}
+
+cleanup_stale_puppypi_video_bridge() {
+  local pid=""
+  local args=""
+
+  while read -r pid args; do
+    if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
+      continue
+    fi
+    if [[ "${args}" == *"web_video_snapshot_to_shm.py"* ]]; then
+      terminate_process_scope "${pid}" "stale puppypi video bridge"
+    fi
+  done < <(ps -eo pid=,args=)
+}
+
+cleanup_stale_puppypi_motion_proxy() {
+  if ! should_start_puppypi_motion_proxy; then
+    return 0
+  fi
+  local container="${PUPPYPI_ROS1_CONTAINER:-puppypi}"
+  if ! command -v docker >/dev/null 2>&1 || ! docker_with_timeout inspect "${container}" >/dev/null 2>&1; then
+    return 0
+  fi
+  docker_with_timeout exec "${container}" /bin/bash -lc 'pkill -f "[m]otion_proxy.py" || true' >/dev/null 2>&1 || true
 }
 
 cleanup_external_geometry_processes() {
@@ -309,6 +345,8 @@ stop_existing_gateway() {
     cleanup_stale_gateway_processes
     cleanup_stale_ros_bridge_processes
     cleanup_stale_go2_video_streamer
+    cleanup_stale_puppypi_video_bridge
+    cleanup_stale_puppypi_motion_proxy
     cleanup_external_geometry_processes
     return 0
   fi
@@ -319,6 +357,8 @@ stop_existing_gateway() {
     cleanup_stale_gateway_processes
     cleanup_stale_ros_bridge_processes
     cleanup_stale_go2_video_streamer
+    cleanup_stale_puppypi_video_bridge
+    cleanup_stale_puppypi_motion_proxy
     cleanup_external_geometry_processes
     return 0
   fi
@@ -330,6 +370,8 @@ stop_existing_gateway() {
   # 最后清理外部几何进程。
   cleanup_stale_gateway_processes
   cleanup_stale_ros_bridge_processes
+  cleanup_stale_puppypi_video_bridge
+  cleanup_stale_puppypi_motion_proxy
   cleanup_external_geometry_processes
 }
 
@@ -353,6 +395,16 @@ should_start_go2_video_streamer() {
   is_truthy "${GO2_VIDEO_STREAM_ENABLED:-true}" \
     && is_truthy "${GO2_DATA_PLANE_ENABLED:-false}" \
     && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "go2" ]]
+}
+
+should_start_puppypi_video_bridge() {
+  is_truthy "${PUPPYPI_WEB_VIDEO_BRIDGE_ENABLED:-true}" \
+    && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "puppypi" ]]
+}
+
+should_start_puppypi_motion_proxy() {
+  is_truthy "${PUPPYPI_MOTION_PROXY_ENABLED:-true}" \
+    && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "puppypi" ]]
 }
 
 start_ros_bridge() {
@@ -415,13 +467,79 @@ start_go2_video_streamer() {
   VIDEO_STREAMER_PID="$!"
 }
 
+start_puppypi_video_bridge() {
+  if [[ -n "${PUPPYPI_VIDEO_BRIDGE_PID}" ]] && is_pid_alive "${PUPPYPI_VIDEO_BRIDGE_PID}"; then
+    return 0
+  fi
+  if ! should_start_puppypi_video_bridge; then
+    return 0
+  fi
+  local bridge_script="${REPO_ROOT}/deploy/puppypi/platform_bridge/web_video_snapshot_to_shm.py"
+  if [[ ! -f "${bridge_script}" ]]; then
+    echo "WARNING: PuppyPi video bridge script not found: ${bridge_script}" >&2
+    return 0
+  fi
+  local shm_path="${NUWAX_VIDEO_SHM_PATH:-/tmp/nuwax_video.shm}"
+  mkdir -p "$(dirname "${shm_path}")" 2>/dev/null || true
+  if [[ -d "${shm_path}" ]]; then
+    echo "WARNING: ${shm_path} is a directory; replacing with video SHM file." >&2
+    rm -rf "${shm_path}"
+  fi
+  touch "${shm_path}" 2>/dev/null || true
+  truncate -s 1048640 "${shm_path}" 2>/dev/null || true
+  echo "starting PuppyPi web_video snapshot bridge -> ${shm_path}"
+  (run_with_title "nuwax-puppypi-video-bridge" "${PYTHON_BIN}" "${bridge_script}") &
+  PUPPYPI_VIDEO_BRIDGE_PID="$!"
+}
+
+start_puppypi_motion_proxy() {
+  if ! should_start_puppypi_motion_proxy; then
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "WARNING: docker not found; PuppyPi motion proxy not started." >&2
+    return 0
+  fi
+  local container="${PUPPYPI_ROS1_CONTAINER:-puppypi}"
+  local ros_setup="${PUPPYPI_ROS1_SETUP:-source /opt/ros/noetic/setup.bash; source /home/ubuntu/puppypi/devel/setup.bash}"
+  local bridge_script="${REPO_ROOT}/deploy/puppypi/platform_bridge/motion_proxy_ros1.py"
+  local container_script="${PUPPYPI_MOTION_PROXY_CONTAINER_SCRIPT:-/home/ubuntu/nuwax/motion_proxy.py}"
+  if [[ ! -f "${bridge_script}" ]]; then
+    echo "WARNING: PuppyPi motion proxy script not found: ${bridge_script}" >&2
+    return 0
+  fi
+  if ! docker_with_timeout inspect "${container}" >/dev/null 2>&1; then
+    echo "WARNING: PuppyPi ROS1 container not found: ${container}" >&2
+    return 0
+  fi
+  docker_with_timeout start "${container}" >/dev/null 2>&1 || true
+  docker_with_timeout exec "${container}" /bin/bash -lc "mkdir -p '$(dirname "${container_script}")'" >/dev/null 2>&1 || true
+  docker_with_timeout cp "${bridge_script}" "${container}:${container_script}" >/dev/null 2>&1 || true
+  echo "starting PuppyPi ROS1 motion proxy in container ${container} -> ${PUPPYPI_PROXY_URL:-http://127.0.0.1:8090}"
+  docker_with_timeout exec "${container}" /bin/bash -lc "pkill -f '[m]otion_proxy.py' || true" >/dev/null 2>&1 || true
+  docker_with_timeout exec -u ubuntu -d "${container}" /bin/bash -lc "${ros_setup}; python3 '${container_script}' >/tmp/motion_proxy.log 2>&1" >/dev/null 2>&1 || {
+    echo "WARNING: failed to start PuppyPi motion proxy in ${container}." >&2
+    return 0
+  }
+  local waited=0
+  while [[ "${waited}" -lt 8 ]]; do
+    if timeout 2 curl -fsS "http://127.0.0.1:8090/health" >/dev/null 2>&1; then
+      echo "PuppyPi motion proxy ready on :8090"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "WARNING: PuppyPi motion proxy started but /health not ready after 8s" >&2
+}
+
 stop_ros_bridge() {
   if [[ -n "${ROS_BRIDGE_PID}" ]] && is_pid_alive "${ROS_BRIDGE_PID}"; then
     terminate_process_scope "${ROS_BRIDGE_PID}" "rust ros-bridge"
     wait "${ROS_BRIDGE_PID}" >/dev/null 2>&1 || true
   fi
   ROS_BRIDGE_PID=""
-  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+  rm -f /tmp/nuwax_video.sock /tmp/nuwax_pointcloud.shm 2>/dev/null || true
 }
 
 monitor_ros_bridge() {
@@ -429,7 +547,7 @@ monitor_ros_bridge() {
     sleep 5
     if [[ -n "${ROS_BRIDGE_PID}" ]] && ! is_pid_alive "${ROS_BRIDGE_PID}"; then
       echo "Rust ros-bridge (pid ${ROS_BRIDGE_PID}) crashed, restarting..." >&2
-      rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+      rm -f /tmp/nuwax_video.sock /tmp/nuwax_pointcloud.shm 2>/dev/null || true
       ROS_BRIDGE_PID=""
       start_ros_bridge
     fi
@@ -447,6 +565,33 @@ stop_go2_video_streamer() {
   cleanup_stale_go2_video_streamer
 }
 
+stop_puppypi_video_bridge() {
+  if [[ -n "${PUPPYPI_VIDEO_BRIDGE_PID}" ]] && is_pid_alive "${PUPPYPI_VIDEO_BRIDGE_PID}"; then
+    terminate_process_scope "${PUPPYPI_VIDEO_BRIDGE_PID}" "puppypi video bridge"
+    wait "${PUPPYPI_VIDEO_BRIDGE_PID}" >/dev/null 2>&1 || true
+  fi
+  PUPPYPI_VIDEO_BRIDGE_PID=""
+  cleanup_stale_puppypi_video_bridge
+}
+
+stop_puppypi_motion_proxy() {
+  if ! should_start_puppypi_motion_proxy; then
+    return 0
+  fi
+  local proxy_url="${PUPPYPI_PROXY_URL:-http://127.0.0.1:8090}"
+  "${PYTHON_BIN}" - "${proxy_url}" <<'PY' >/dev/null 2>&1 || true
+import json
+import sys
+from urllib.request import Request, urlopen
+
+url = sys.argv[1].rstrip("/") + "/twist"
+payload = json.dumps({"x_mps": 0.0, "yaw_rate": 0.0}).encode("utf-8")
+request = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+urlopen(request, timeout=1).read()
+PY
+  cleanup_stale_puppypi_motion_proxy
+}
+
 stop_gateway() {
   STOP_REQUESTED=1
   # 顺序：先杀网关 worker → 再停 ros-bridge → 最后停 video streamer。
@@ -459,6 +604,8 @@ stop_gateway() {
   fi
   stop_ros_bridge
   stop_go2_video_streamer
+  stop_puppypi_video_bridge
+  stop_puppypi_motion_proxy
   cleanup_external_geometry_processes
   exit 0
 }
@@ -470,6 +617,12 @@ fi
 GO2_DATA_PLANE_ENV_FILE="${GO2_DATA_PLANE_ENV_FILE:-${REPO_ROOT}/drivers/go2/data_plane.env}"
 if [[ -f "${GO2_DATA_PLANE_ENV_FILE}" ]]; then
   load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
+fi
+
+PROJECT_VENV_PYTHON="${REPO_ROOT}/.venv/bin/python"
+if [[ -z "${NUWAX_PYTHON_BIN:-}" && -x "${PROJECT_VENV_PYTHON}" ]]; then
+  # 兜底：如果 .env 没把解释器带进来，优先使用仓库自带虚拟环境。
+  export NUWAX_PYTHON_BIN="${PROJECT_VENV_PYTHON}"
 fi
 
 unset RMW_IMPLEMENTATION
@@ -496,6 +649,7 @@ case "${ACTION}" in
     cleanup_stale_gateway_processes
     cleanup_stale_ros_bridge_processes
     cleanup_stale_go2_video_streamer
+    cleanup_stale_puppypi_video_bridge
     cleanup_external_geometry_processes
     ;;
   stop)
@@ -534,14 +688,18 @@ trap stop_gateway INT TERM
 
 if ! is_restart_enabled "${RESTART_POLICY}"; then
   set +e
+  start_puppypi_motion_proxy
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
   start_ros_bridge
   start_go2_video_streamer
+  start_puppypi_video_bridge
   monitor_ros_bridge &
   wait "${GATEWAY_PID}"
   exit_code="$?"
   stop_go2_video_streamer
+  stop_puppypi_video_bridge
+  stop_puppypi_motion_proxy
   stop_ros_bridge
   exit "${exit_code}"
 fi
@@ -549,14 +707,18 @@ fi
 attempt=0
 while true; do
   set +e
+  start_puppypi_motion_proxy
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
   start_ros_bridge
   start_go2_video_streamer
+  start_puppypi_video_bridge
   monitor_ros_bridge &
   wait "${GATEWAY_PID}"
   exit_code="$?"
   stop_go2_video_streamer
+  stop_puppypi_video_bridge
+  stop_puppypi_motion_proxy
   GATEWAY_PID=""
   set -e
 

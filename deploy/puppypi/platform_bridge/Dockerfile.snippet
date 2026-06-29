@@ -1,0 +1,8 @@
+# 片段：并入 puppypi_ros2 镜像构建
+# 将 platform_bridge 打入容器（SHM 兜底链路：ROS2 Image -> JPEG -> /tmp/nuwax_video.shm）
+
+COPY deploy/puppypi/platform_bridge/video_proxy.py /opt/nuwax/platform_bridge/video_proxy.py
+COPY deploy/puppypi/platform_bridge/motion_proxy.py /opt/nuwax/platform_bridge/motion_proxy.py
+COPY deploy/puppypi/platform_bridge/camera_publisher.py /opt/nuwax/platform_bridge/camera_publisher.py
+
+RUN chmod +x /opt/nuwax/platform_bridge/*.py

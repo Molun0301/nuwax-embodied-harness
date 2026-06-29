@@ -70,6 +70,11 @@ class LocoController:
             self.loco_client = LocoClient()
             self.loco_client.SetTimeout(self.client_timeout_sec)
             self.loco_client.Init()
+            # 拿 lease（必须！）：Init() 仅注册 RPC handler，必须 Start() 让主控完成 fsm 切换才能 RPC。
+            # 不调 Start() → WaveHand 等高层命令会 publish 到 rt/loco/wave_hand 但主控没 lease 上下文，
+            # SDK 内部同步阻塞 → timeout → 静默返 None → 调用方把 None 归零误判成功。
+            self.loco_client.Start()
+            LOGGER.info("LocoClient.Start() 完成（lease 应已就绪，wave_hand 等高层命令可走通）")
         except Exception as exc:
             LOGGER.error("LocoClient 初始化失败: %s", exc)
             return False
@@ -139,7 +144,7 @@ class LocoController:
             raise RuntimeError("LocoController 未初始化")
         code = self.loco_client.Move(float(vx), float(vy), float(vyaw))
         LOGGER.info("Loco Move(vx=%.3f, vy=%.3f, vyaw=%.3f) code=%s", vx, vy, vyaw, code)
-        return int(code) if code is not None else 0
+        return self._normalize_code("Move", code)
 
     def wave_hand(self) -> int:
         """招手动作（不转身）。"""
@@ -215,10 +220,30 @@ class LocoController:
         try:
             code = method()
             LOGGER.info("Loco %s() code=%s", method_name, code)
-            return int(code) if code is not None else 0
+            return self._normalize_code(method_name, code)
         except Exception as exc:
             LOGGER.error("Loco %s() 抛错: %s", method_name, exc)
             raise
+
+    @staticmethod
+    def _normalize_code(method_name: str, code: Any) -> int:
+        """归一 SDK 返回值。
+
+        历史的 "int(code) if code is not None else 0" 会把 SDK 的 None（无订阅者 / lease 没收完）
+        静默归零为 0，导致远端看到 code=0 误判成功而机器人没动。
+
+        新策略：code is None → LOGGER.warning + 返 -1，强制让 runtime 把错误透传到 MCP 端。
+        """
+        if code is None:
+            LOGGER.warning(
+                "Loco %s() 返回 None（多半是 lease 未就绪或主控未启动高层控制服务）；"
+                "请确认 (a) LocoClient.Start() 在 init 里已调（loco_controller.py）；"
+                "(b) G1 主控已开机并 enable_motor；"
+                "(c) iface 与 G1 主控同网段。",
+                method_name,
+            )
+            return -1
+        return int(code)
 
 
 def main() -> None:

@@ -23,6 +23,11 @@ def build_g1_defaults(config: "NuwaxRobotBridgeConfig", iface: Optional[str] = N
             "robot_id": "g1",
             "robot_model": "unitree_g1",
             "dds_iface": iface or config.dds.iface,
+            # v4 范围收窄硬约束：G1 mapping/localization 模式，不接 Nav2 闭环。
+            # 物理量（lidar topic / imu topic / frame_id / odom topic / footprint）
+            # 不在此处声明，SSOT 在项目根 .env.G1_example（由 scripts/start_gateway.sh
+            # 在 NUWAX_ACTIVE_ROBOT=g1 时 source 覆盖）。
+            "enable_nav2": False,
         },
     )
 

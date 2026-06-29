@@ -715,6 +715,19 @@ if [[ -f "${G1_DATA_PLANE_ENV_FILE}" ]]; then
   load_env_file "${G1_DATA_PLANE_ENV_FILE}"
 fi
 
+# 当 NUWAX_ACTIVE_ROBOT=g1 时，source 项目根 .env.G1_example 覆盖已加载的物理量键
+# （RTAB-Map lidar topic / imu topic / base frame / lidar frame / robot_radius / inflation_radius）。
+# 0 新增键：与 .env.example 键名 1:1 对齐。详见 openspec/changes/g1-rtabnav2-adapter/。
+# 注意：load_env_file 对已 export 的变量不会覆盖；这里用 set -a + source 强制 export。
+G1_ROBOT_ENV_FILE="${G1_ROBOT_ENV_FILE:-${REPO_ROOT}/.env.G1_example}"
+if [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "g1" \
+   && -f "${G1_ROBOT_ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${G1_ROBOT_ENV_FILE}"
+  set +a
+fi
+
 unset RMW_IMPLEMENTATION
 if grep -q '^CYCLONEDDS_URI=' "${ENV_FILE}" 2>/dev/null; then
   CYCLONEDDS_URI="$(grep '^CYCLONEDDS_URI=' "${ENV_FILE}" | head -1)"

@@ -113,9 +113,20 @@ else
 fi
 
 echo
-if [ "${VIOLATIONS}" -eq 0 ]; then
-    echo "== 硬规则全部通过（R1-R5、R8、R9 共 0 违规；R6/R7 为人工复核）=="
-    exit 0
+if [ "${VIOLATIONS}" -ne 0 ]; then
+    echo "== 存在 ${VIOLATIONS} 类硬规则违规，见上 =="
+    exit 1
 fi
-echo "== 存在 ${VIOLATIONS} 类硬规则违规，见上 =="
-exit 1
+echo "== 硬规则全部通过（R1-R5、R8、R9 共 0 违规；R6/R7 为人工复核）=="
+
+# G1 RTAB/Nav2 静态校验（v4 7 条断言 A1-A7；OpenSpec g1-rtabnav2-adapter）
+# 注意：G1 校验失败不归入 VIOLATIONS（分层违规 vs 应用配置违规分立返码）。
+if [[ -f "${REPO_ROOT}/scripts/check_launch_args.py" ]]; then
+    if python3 "${REPO_ROOT}/scripts/check_launch_args.py"; then
+        echo "== G1 RTAB/Nav2 校验通过（7 条断言 A1-A7）=="
+    else
+        echo "!! G1 RTAB/Nav2 校验失败（OpenSpec g1-rtabnav2-adapter 退化）；请查 stderr 修复"
+        exit 1
+    fi
+fi
+exit 0

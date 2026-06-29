@@ -1,0 +1,50 @@
+# nuwax-g1-gateway.service (v8)
+#
+# Unit file for G1 mode gateway（NUWAX_ACTIVE_ROBOT=g1）。
+# 复制到 /etc/systemd/system/ 后 sudo systemctl daemon-reload。
+#
+# v8 修复要点（OpenSpec g1-rtabnav2-adapter v8）：
+#   1. ExecStartPre=pkill -9 -f nuwax-gateway-supervisor
+#      防御：systemd 重启 service 时先清理上次残留的 supervisor 进程，
+#      防止 18 个 supervisor 累积（实机 2026-06-30 真因）；
+#   2. Type=forking
+#      start_gateway.sh 是 bash 包装（不是 Python 守护），需要 forking 类型；
+#   3. PIDFile
+#      配合 forking 类型指向 runtime_data/gateway/gateway.pid；
+#   4. TimeoutStopSec + KillMode=mixed
+#      start_gateway.sh 是 bash + 多子进程（uvicorn / video_streamer / ros_bridge），
+#      不用 process / control group 模式避免杀不全。
+#
+# 与 v5/v6/v7 的关系：v5 删 go2.sh、v6 .env fill_empty、v7 POSE_TOPIC 清空；v8 是部署层修复。
+
+[Unit]
+Description=Nuwax G1 Robot Bridge Gateway (G1 mode)
+After=network.target network-online.target
+Wants=network-online.target
+# v8：supervisor 累积防护——5 次/300s 限制
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=forking
+User=unitree
+WorkingDirectory=/home/unitree/nuwax-robot-bridge
+EnvironmentFile=-/home/unitree/nuwax-robot-bridge/.env
+EnvironmentFile=-/home/unitree/nuwax-robot-bridge/drivers/g1/data_plane.env
+PIDFile=/home/unitree/nuwax-robot-bridge/runtime_data/gateway/gateway.pid
+# v8：先杀掉上次残留的 supervisor 进程（防累积）
+ExecStartPre=/usr/bin/pkill -9 -f nuwax-gateway-supervisor || true
+# v8：start_gateway.sh 内部 uvicorn 健康检查失败会 exit 1
+ExecStart=/usr/bin/env bash /home/unitree/nuwax-robot-bridge/scripts/start_gateway.sh start
+ExecStop=/usr/bin/env bash /home/unitree/nuwax-robot-bridge/scripts/start_gateway.sh stop
+ExecReload=/bin/kill -HUP $MAINPID
+# v8：on-failure + 5s 间隔（避免 fast retry 累积）
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

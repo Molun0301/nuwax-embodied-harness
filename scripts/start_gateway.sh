@@ -3,6 +3,11 @@ set -euo pipefail
 
 if [[ "${NUWAX_GATEWAY_SUPERVISOR_TITLED:-0}" != "1" && -n "${BASH:-}" ]]; then
   export NUWAX_GATEWAY_SUPERVISOR_TITLED=1
+  export NUWAX_GATEWAY_SUPERVISOR_DEPTH=$((${NUWAX_GATEWAY_SUPERVISOR_DEPTH:-0}+1))
+  if [[ "${NUWAX_GATEWAY_SUPERVISOR_DEPTH}" -gt "2" ]]; then
+    echo "[v8 FATAL] start_gateway.sh self-exec depth=${NUWAX_GATEWAY_SUPERVISOR_DEPTH} > 2; abort to prevent supervisor fork storm" >&2
+    exit 1
+  fi
   exec -a nuwax-gateway-supervisor "${BASH}" "$0" "$@"
 fi
 
@@ -94,6 +99,23 @@ acquire_script_lock() {
     echo "please stop existing one before running '${ACTION}' again." >&2
     exit 1
   fi
+}
+
+wait_for_port_listen() {
+  local port="$1"
+  local timeout_sec="$2"
+  local waited=0
+  if ! command -v ss >/dev/null 2>&1; then
+    return 0
+  fi
+  while [[ "${waited}" -lt "${timeout_sec}" ]]; do
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)${port}$"; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
 }
 
 is_restart_enabled() {
@@ -831,6 +853,12 @@ if ! is_restart_enabled "${RESTART_POLICY}"; then
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
+  # v8 防护：uvicorn 5s 健康检查（监听 8766）
+  if ! wait_for_port_listen "${PORT}" 5; then
+    echo "[v8 FATAL] uvicorn gateway not listening on port ${PORT} after 5s; killing to prevent restart loop" >&2
+    kill -TERM "${GATEWAY_PID}" 2>/dev/null || true
+    exit 1
+  fi
   start_video_relay
   start_video_streamer
   monitor_video_relay &
@@ -848,6 +876,12 @@ while true; do
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
+  # v8 防护：uvicorn 5s 健康检查（监听 8766）
+  if ! wait_for_port_listen "${PORT}" 5; then
+    echo "[v8 FATAL] uvicorn gateway not listening on port ${PORT} after 5s; killing to prevent restart loop" >&2
+    kill -TERM "${GATEWAY_PID}" 2>/dev/null || true
+    exit 1
+  fi
   start_video_relay
   start_video_streamer
   monitor_video_relay &

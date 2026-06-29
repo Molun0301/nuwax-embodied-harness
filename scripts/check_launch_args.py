@@ -12,6 +12,7 @@ A4: .env.G1_example 含所有 G1 覆盖键
 A5: .env.G1_example 与 .env.example 物理量差异只来自 v4 B.3 表（lidar/imu/base/lidar_frame/robot_radius/inflation_radius/odom 7 项）
 A6: _POINT_CLOUD_TOPIC=/utlidar/cloud_livox_mid360（防退化）
 A7: _IMU_TOPIC=/utlidar/imu_livox_mid360（防退化）
+A8 (v6 新增): NUWAX_GEOMETRY_ENABLED=true + NUWAX_GEOMETRY_EXTERNAL_SCRIPT 必含 robot_slam.sh
 
 退出 0 = 全过；非 0 = 至少 1 条失败（打印具体失败键与修复建议）。
 """
@@ -206,6 +207,21 @@ def main() -> int:
                 f"A7 FAIL: NUWAX_GEOMETRY_IMU_TOPIC={imu!r} "
                 f"(expected '/utlidar/imu_livox_mid360')"
             )
+
+    # ---- A8 (v6 新增): GEOMETRY_ENABLED=true + EXTERNAL_SCRIPT 路径必含 robot_slam.sh ----
+    enabled = g1_env.get("NUWAX_GEOMETRY_ENABLED", "")
+    if enabled.lower() not in {"true", "1", "yes", "on"}:
+        failures.append(
+            f"A8 FAIL: NUWAX_GEOMETRY_ENABLED={enabled!r} (expected true) —"
+            f"v6 关键修复；runtime 报 geometry_runtime_disabled 根因"
+        )
+
+    script = g1_env.get("NUWAX_GEOMETRY_EXTERNAL_SCRIPT", "")
+    if "robot_slam.sh" not in script:
+        failures.append(
+            f"A8 FAIL: NUWAX_GEOMETRY_EXTERNAL_SCRIPT={script!r} —"
+            f"v6 必须含 robot_slam.sh 路径（v5 漏导致 runtime 报 geometry_runtime_unavailable）"
+        )
 
     # ---- 输出 ----
     if failures:

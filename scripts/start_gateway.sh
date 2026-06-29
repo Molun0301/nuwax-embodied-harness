@@ -715,17 +715,50 @@ if [[ -f "${G1_DATA_PLANE_ENV_FILE}" ]]; then
   load_env_file "${G1_DATA_PLANE_ENV_FILE}"
 fi
 
-# 当 NUWAX_ACTIVE_ROBOT=g1 时，source 项目根 .env.G1_example 覆盖已加载的物理量键
-# （RTAB-Map lidar topic / imu topic / base frame / lidar frame / robot_radius / inflation_radius）。
-# 0 新增键：与 .env.example 键名 1:1 对齐。详见 openspec/changes/g1-rtabnav2-adapter/。
-# 注意：load_env_file 对已 export 的变量不会覆盖；这里用 set -a + source 强制 export。
+# 当 NUWAX_ACTIVE_ROBOT=g1 时，从项目根 .env.G1_example 回填空键。
+# v6 修订（OpenSpec g1-rtabnav2-adapter）：
+#   - load_env_file 对已 export 变量不会覆盖（G1 回填时不能 source 强覆盖，会破坏 .env 已配项）；
+#   - v5 的 set -a source 强制 export 是错误的：用户手动配的 GO2 默认值会被 G1 默认值强行覆盖；
+#   - 正确语义："只填空键，不覆盖已有值"（含未定义 + 已定义但值为空两种情况）。
+#   - load_env_file_fill_empty 函数：本函数在 load_env_file 基础上，对每行判断目标键是否已 export
+#     且非空；只有"未定义 或 空字符串"才 export 模板里的值；已 export 非空值保持不变。
+load_env_file_fill_empty() {
+  local target="$1"
+  local raw_line=""
+  local line=""
+  local key=""
+  local value=""
+  while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
+    line="$(trim_whitespace "${raw_line}")"
+    if [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]]; then
+      continue
+    fi
+    key="$(trim_whitespace "${line%%=*}")"
+    value="$(trim_whitespace "${line#*=}")"
+    if [[ "${value}" == *[[:space:]]\#* ]]; then
+      value="$(trim_whitespace "${value%%#*}")"
+    fi
+    if [[ ${#value} -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    if [[ -z "${key}" ]]; then
+      continue
+    fi
+    # 关键：只在变量未定义 或 已定义但值为空字符串时填入模板值
+    if [[ -z "${!key+x}" || -z "${!key:-}" ]]; then
+      export "${key}=${value}"
+    fi
+  done < "${target}"
+}
+
 G1_ROBOT_ENV_FILE="${G1_ROBOT_ENV_FILE:-${REPO_ROOT}/.env.G1_example}"
 if [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "g1" \
    && -f "${G1_ROBOT_ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "${G1_ROBOT_ENV_FILE}"
-  set +a
+  load_env_file_fill_empty "${G1_ROBOT_ENV_FILE}"
 fi
 
 unset RMW_IMPLEMENTATION

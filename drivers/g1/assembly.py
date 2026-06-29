@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from adapters.base import AdapterConfig
 from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
@@ -30,6 +30,27 @@ LOGGER = logging.getLogger("nuwax_robot_bridge.g1.assembly")
 # 默认参数（与 drivers/g1/data_plane.env 一致；env 可覆盖）
 DEFAULT_IFACE = "eth0"
 DEFAULT_CLIENT_TIMEOUT_SEC = 10.0
+
+# G1 私有能力 → LocoController 无参方法名映射（与 drivers/g1/private_capabilities.py
+# 的 ROBOT_PRIVATE_CAPABILITY_SPECS 严格对齐；LocoController 上的同名方法是这层契约的
+# 真值源）。9 个 one_shot Loco 动作均不接 params。
+_G1_LOCO_NO_PARAM_ACTIONS: Dict[str, str] = {
+    "g1_damp": "damp",
+    "g1_squat_to_stand": "squat_to_stand",
+    "g1_stand_to_squat": "stand_to_squat",
+    "g1_zero_torque": "zero_torque",
+    "g1_lie_to_stand": "lie_to_stand",
+    "g1_low_stand": "low_stand",
+    "g1_high_stand": "high_stand",
+    "g1_wave_hand": "wave_hand",
+    "g1_shake_hand": "shake_hand",
+}
+
+# G1 私有能力集合（用于错误信息提示，不参与路由）。
+_G1_KNOWN_ACTIONS: frozenset[str] = frozenset(
+    list(_G1_LOCO_NO_PARAM_ACTIONS.keys())
+    + ["g1_move", "g1_arm_action", "g1_play_audio", "g1_get_state"]
+)
 
 
 @dataclass
@@ -143,6 +164,108 @@ class G1RobotAssembly(RobotAssemblyBase):
             adapter_count=len(adapter_statuses),
             healthy_adapter_count=sum(1 for status in adapter_statuses if status.is_healthy),
         )
+
+    # ------------------ 端侧 MCP 分发入口（private_capabilities 的 dispatch="execute_action" 落点） ------------------
+
+    def execute_action(
+        self,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[int], Any]:
+        """G1 入口动作分发（被 runtime._build_private_capability_handler 调用）。
+
+        路由表（13 个 g1.* capability 与 drivers/g1/private_capabilities.py 一一对齐）：
+        - LocoPrimitive（5，无参）：g1_damp / g1_squat_to_stand / g1_stand_to_squat /
+          g1_zero_torque / g1_lie_to_stand → LocoController 同名方法
+        - G1Specific（4，无参）：g1_low_stand / g1_high_stand / g1_wave_hand / g1_shake_hand →
+          LocoController 同名方法
+        - G1Specific（1，带参）：g1_arm_action → ArmController.execute_action(action_seq)
+        - Generic：g1_move(vx, vy, vyaw) → LocoController.move；g1_get_state → provider 快照；
+          g1_play_audio → 暂留占位（未接 AudioClient）
+
+        Returns:
+            (code, result)：code=0/SDK 返回码表示成功；-1 + 错误字符串表示失败。
+            与 go2/assembly.py:331 范式严格一致，方便 runtime._build_private_capability_handler 透明透传。
+        """
+
+        params = params or {}
+
+        with self._lock:
+            if not self.high_level_initialized:
+                return (-1, "G1 装配未启动，请先调用 start()。")
+
+            # 1) Loco 一档（9 个无参 one_shot）
+            method_name = _G1_LOCO_NO_PARAM_ACTIONS.get(action)
+            if method_name is not None:
+                loco = self.loco_controller
+                if loco is None or not loco.is_running():
+                    return (-1, f"LocoController 未初始化，无法执行 {action}。")
+                try:
+                    code = getattr(loco, method_name)()
+                    return (int(code) if code is not None else 0, None)
+                except Exception as exc:
+                    LOGGER.error("G1 action=%s 抛错: %s", action, exc)
+                    return (-1, f"{action} 执行失败: {exc}")
+
+            # 2) 持续移动（streaming）
+            if action == "g1_move":
+                loco = self.loco_controller
+                if loco is None or not loco.is_running():
+                    return (-1, "LocoController 未初始化，无法执行 g1_move。")
+                try:
+                    code = loco.move(
+                        float(params.get("vx", 0.0) or 0.0),
+                        float(params.get("vy", 0.0) or 0.0),
+                        float(params.get("vyaw", 0.0) or 0.0),
+                    )
+                    return (int(code) if code is not None else 0, None)
+                except Exception as exc:
+                    LOGGER.error("G1 g1_move 抛错: %s", exc)
+                    return (-1, f"g1_move 执行失败: {exc}")
+
+            # 3) 手臂动作（透传 action_seq）
+            if action == "g1_arm_action":
+                arm = self.arm_controller
+                if arm is None or not arm.is_running():
+                    return (-1, "ArmController 未初始化，无法执行 g1_arm_action。")
+                action_seq = params.get("action_seq")
+                if action_seq is None:
+                    return (-1, "g1_arm_action 缺少必要参数: action_seq。")
+                if not isinstance(action_seq, (list, tuple)):
+                    return (-1, "g1_arm_action.action_seq 必须为 list/tuple 形态。")
+                try:
+                    code = arm.execute_action(action_seq)
+                    return (int(code) if code is not None else 0, None)
+                except Exception as exc:
+                    LOGGER.error("G1 g1_arm_action 抛错: %s", exc)
+                    return (-1, f"g1_arm_action 执行失败: {exc}")
+
+            # 4) 状态快照（同步，只读）
+            if action == "g1_get_state":
+                loco = self.loco_controller
+                ready = bool(loco is not None and loco.has_state_frame())
+                snapshot = {
+                    "ready": ready,
+                    "reason": "" if ready else "no frame",
+                    "timestamp": 0.0,
+                    "control_mode": self.current_mode,
+                    "initialized": bool(self.high_level_initialized),
+                    "loco_running": bool(loco is not None and loco.is_running()),
+                    "arm_running": bool(self.arm_controller is not None and self.arm_controller.is_running()),
+                }
+                return (0, snapshot)
+
+            # 5) 语音播放 — 暂留占位，待 AudioClient 接入
+            if action == "g1_play_audio":
+                wav_path = params.get("wav_path")
+                if not wav_path or not isinstance(wav_path, str):
+                    return (-1, "g1_play_audio 缺少必要参数: wav_path（绝对路径字符串）。")
+                LOGGER.warning("g1_play_audio 本期未实装，wav_path=%s 已接收（待 AudioClient 接入）", wav_path)
+                return (-1, "g1_play_audio 本期未实装，请接入 G1ProviderBundle.AudioTTSProvider。")
+
+            # 6) 未识别 action
+            supported = ", ".join(sorted(_G1_KNOWN_ACTIONS))
+            return (-1, f"G1 未实现的 action: {action}。当前支持: {supported}")
 
 
 def create_g1_assembly(

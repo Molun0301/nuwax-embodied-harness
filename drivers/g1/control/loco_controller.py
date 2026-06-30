@@ -27,11 +27,14 @@ DEFAULT_MOVE_FOR_INTERVAL_SEC = 0.5
 
 
 def _build_motion_switcher_or_none(iface: Optional[str], target_mode: str, acquire_on_init: bool):
-    """工厂函数：构造 MotionSwitcherController，依赖失败时返回 None（不阻塞 loco init）。
+    """工厂函数：构造 MotionSwitcherController，依赖失败时返回 None。
 
     引入 motion_switcher 是修高层动作 code=None 的真实根因（实机 2026-06-30 反馈）：
-    LocoClient.Start() 仅 SetFsmId(200) 不切 mode，必须先 MotionSwitcherClient 抢占 advanced。
-    若 SDK 没装或模块缺失，warn 后继续，调用方后续可通过 g1_select_motion_mode 补救。
+    LocoClient.Start() 仅 SetFsmId(200) 不切 motion_switcher mode，必须先
+    MotionSwitcherClient SelectMode("advanced")。
+
+    注意：本函数只构造控制器，不调用 init()；调用方必须显式 init()，这样初始化失败
+    能被调用方按启动期 hard fail / 懒加载报错分别处理。
     """
     try:
         from drivers.g1.control.motion_switcher_controller import MotionSwitcherController
@@ -114,7 +117,8 @@ class LocoController:
                         "MotionSwitcherController 工厂返 None，无法保证 LocoClient 后续 RPC 可用。"
                         "若单元测试场景可设 acquire_motion_mode_on_init=False 跳过。"
                     )
-                # 工厂内部已 init + acquire；这里只做 sanity check
+                if not self.motion_switcher.init():
+                    raise RuntimeError("MotionSwitcherController.init() 返 False")
                 if not self.motion_switcher.is_running():
                     raise RuntimeError("MotionSwitcherController 抢占后未 running，hard fail")
 

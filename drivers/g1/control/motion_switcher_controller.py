@@ -7,10 +7,14 @@
     * advanced  — 高级 SDK（本控制器目标）
     * ai-w      — 轮式 AI
 - LocoClient（sport service RPC）和 LowCmd pub（rt/lowcmd）必须在对应 mode 抢占成功后才会被主控响应。
-- example/g1/low_level/g1_low_level_example.py:89-99 显示标准抢占流程：
-    CheckMode → 若 result['name'] != '' 则循环 ReleaseMode → 直到空 → 才能发命令。
+- example/motionSwitcher/motion_switcher_example.py 显示 high-level 模式切换流程：
+    MotionSwitcherClient.Init() → SelectMode("advanced")。
+- example/g1/low_level/g1_low_level_example.py:90-99 的
+    CheckMode → ReleaseMode → 直到空
+  是 low-level LowCmd 发布前释放高层/AI 占主的流程，不应作为 G1 high-level
+  LocoClient 接管 advanced 的默认路径。
 - LocoClient.Start() 内部 = SetFsmId(200) 不切 mode，所以 Start() 成功 ≠ 模式已切。
-- acquire_high_level() 业务级封装：循环 Check → Release 占主 → SelectMode("advanced") → CheckMode 复核。
+- acquire_high_level() 业务级封装：SelectMode("advanced") → CheckMode 复核。
 
 入口：
 - 仅供 drivers/g1/ 内部使用，services / core / gateways 不允许 import。
@@ -184,16 +188,14 @@ class MotionSwitcherController:
             target = self._validate_mode(name)
         except ValueError as exc:
             return (-1, "", str(exc))
-        # 抢占前先查一下当前；已被别人占主时报清晰错误
+        # SDK 官方 motion_switcher_example.py 直接 SelectMode(name) 在 ai/normal/advanced/ai-w
+        # 间切换；ReleaseMode 只用于 low-level 示例在发布 LowCmd 前清空当前占主。
         current_code, current_name, _ = self.check_mode()
         if current_code != 0:
             return (current_code, current_name, "抢占前 CheckMode 失败")
-        if current_name and current_name != target:
-            return (
-                -1, current_name,
-                f"当前模式 {current_name} 被占用，请先 g1_release_motion_mode 或 "
-                f"g1_acquire_high_level 抢占；目标 {target}",
-            )
+        if current_name == target:
+            LOGGER.info("MotionSwitcher 当前已在目标模式 %s，跳过 SelectMode", target)
+            return (0, target, "")
         try:
             ret_code, _ = self.ms_client.SelectMode(target)
         except Exception as exc:
@@ -209,7 +211,7 @@ class MotionSwitcherController:
             LOGGER.info("MotionSwitcher SelectMode(%s) 成功并复核通过", target)
             return (0, target, "")
         return (
-            0 if confirm_code == 0 else confirm_code,
+            -1 if confirm_code == 0 else confirm_code,
             confirm_name or current_name,
             "SelectMode 返回成功但复核模式不匹配，请检查主控状态",
         )
@@ -236,9 +238,11 @@ class MotionSwitcherController:
         self,
         target: Optional[str] = None,
     ) -> Tuple[int, str, str]:
-        """业务级封装：循环 Release 占主 → SelectMode(target) → 复核。
+        """业务级封装：SelectMode(target) → CheckMode 复核。
 
-        流程对应 example/g1/low_level/g1_low_level_example.py:89-99 的标准抢占范式。
+        流程对应 example/motionSwitcher/motion_switcher_example.py 的 high-level
+        模式切换范式。low-level 示例中的 ReleaseMode 循环只用于 LowCmd 发布前清空
+        当前占主，不适合作为 G1 high-level advanced 接管的默认路径。
         默认 target = self.target_mode（advanced）。
 
         Returns:
@@ -252,27 +256,6 @@ class MotionSwitcherController:
         except ValueError as exc:
             return (-1, "", str(exc))
 
-        for round_idx in range(self.max_release_rounds):
-            code, current_name, _ = self.check_mode()
-            if code != 0:
-                return (code, current_name, f"抢占第 {round_idx+1} 轮 CheckMode 失败")
-            if current_name == "":
-                break
-            LOGGER.info(
-                "MotionSwitcher 抢占第 %d/%d 轮：当前 name=%s，主动 Release",
-                round_idx + 1, self.max_release_rounds, current_name,
-            )
-            rel_code, _, _ = self.release_mode()
-            if rel_code != 0:
-                return (rel_code, current_name, f"第 {round_idx+1} 轮 ReleaseMode 失败")
-            time.sleep(self.release_interval_sec)
-        else:
-            return (
-                -1, current_name,
-                f"连续 {self.max_release_rounds} 轮 Release 后仍被占用，请人工检查主控状态",
-            )
-
-        # 现在 name==''，可以抢
         sel_code, current_name, sel_msg = self.select_mode(target_mode)
         if sel_code != 0:
             return (sel_code, current_name, sel_msg)

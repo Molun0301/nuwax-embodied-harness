@@ -3,12 +3,12 @@
 设计要点（修复 G1 端未接入端侧 MCP 的根因 — 详见 docs/开发文档/G1接入/G1-MCP接入修复.md）：
 - 历史上 `ROBOT_PRIVATE_CAPABILITY_SPECS` 是空元组，导致 `runtime.register_default_capabilities`
   拿不到任何 G1 私有 spec，进而 MCP tools 列表里看不到任何 g1.* 能力。
-- 本文件把 `drivers/g1/capabilities.py` 已声明的 13 个 CapabilityDescriptor 一对一
+- 本文件把 `drivers/g1/capabilities.py` 已声明的 31 个 CapabilityDescriptor 一对一
   灌进 `PrivateCapabilitySpec`；不再额外维护 spec 副本，避免 schema / risk_level 双写漂移。
 - action_name 与 spec.name 严格保持一致，这样 `dispatch="execute_action"`（默认值）
   会把 spec.name 直接作为 action 转发到 `G1RobotAssembly.execute_action`，
-  后续在 assembly.py 里按 action 名分发到 LocoController / ArmController；挥手/握手按
-  宇树官方 ArmAction 服务执行，不再走 LocoClient.WaveHand/ShakeHand。
+  后续在 assembly.py 里按 action 名分发到 LocoController / ArmController；官方互动
+  手臂动作按宇树 ArmAction 服务执行，不再走 LocoClient.WaveHand/ShakeHand。
 - 三个不进 capability 的订阅方法（subscribe_sport_mode_state / subscribe_imu_state /
   subscribe_point_cloud）保持不进 specs，与 capabilities.py:subscribed_methods_not_in_capability 一致。
 """
@@ -50,13 +50,30 @@ _LOCO_PRIMITIVE_ACTIONS: tuple[str, ...] = (
     "g1_lie_to_stand",  # → LocoController.lie_to_stand
 )
 
-# G1Specific 组（5 个 one_shot）— low/high stand 走 LocoController；
-# wave/shake/arm_action 走 ArmController 的官方 ExecuteAction(action_id/action_name)。
+# G1Specific 组 — low/high stand 走 LocoController；ArmAction 预置动作走官方 ExecuteAction(action_id)。
+_G1_ARM_PRESET_ACTIONS: tuple[str, ...] = (
+    "g1_release_arm",
+    "g1_two_hand_kiss",
+    "g1_single_hand_kiss",
+    "g1_right_kiss",
+    "g1_hands_up",
+    "g1_clap",
+    "g1_high_five",
+    "g1_hug",
+    "g1_heart",
+    "g1_right_heart",
+    "g1_reject",
+    "g1_right_hand_up",
+    "g1_x_ray",
+    "g1_wave_hand",
+    "g1_high_wave",
+    "g1_shake_hand",
+)
+
 _G1_SPECIFIC_ACTIONS: tuple[str, ...] = (
     "g1_low_stand",
     "g1_high_stand",
-    "g1_wave_hand",
-    "g1_shake_hand",
+    *_G1_ARM_PRESET_ACTIONS,
     # g1_arm_action：见下，走 ArmController.execute_action(action_id/action_name)
 )
 
@@ -88,7 +105,7 @@ def _build_spec(capability_name: str) -> PrivateCapabilitySpec:
     )
 
 
-# 17 个 G1 私有能力一次性灌入；顺序按 capabilities.py 的四分组，方便后续 audit。
+# 31 个 G1 私有能力一次性灌入；顺序按 capabilities.py 的四分组，方便后续 audit。
 _G1_PRIVATE_SPECS: tuple[PrivateCapabilitySpec, ...] = (
     # LocoPrimitive（5）
     _build_spec("g1_damp"),
@@ -96,11 +113,10 @@ _G1_PRIVATE_SPECS: tuple[PrivateCapabilitySpec, ...] = (
     _build_spec("g1_stand_to_squat"),
     _build_spec("g1_zero_torque"),
     _build_spec("g1_lie_to_stand"),
-    # G1Specific（5）
+    # G1Specific（19：low/high + ArmAction 预置 16 个 + 通用 g1_arm_action）
     _build_spec("g1_low_stand"),
     _build_spec("g1_high_stand"),
-    _build_spec("g1_wave_hand"),
-    _build_spec("g1_shake_hand"),
+    *(_build_spec(action_name) for action_name in _G1_ARM_PRESET_ACTIONS),
     _build_spec("g1_arm_action"),
     # Generic（3）
     _build_spec("g1_move"),
@@ -121,6 +137,7 @@ __all__ = [
     "ROBOT_PRIVATE_CAPABILITY_SPECS",
     # 暴露给外部校验用的常量（tests / debugging / 一致性核对）
     "_LOCO_PRIMITIVE_ACTIONS",
+    "_G1_ARM_PRESET_ACTIONS",
     "_G1_SPECIFIC_ACTIONS",
     "_GENERIC_ACTIONS",
 ]

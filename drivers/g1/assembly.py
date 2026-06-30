@@ -51,10 +51,25 @@ _G1_LOCO_NO_PARAM_ACTIONS: Dict[str, str] = {
 }
 
 # G1 互动手臂动作 → ArmAction action_map 名称。
-# 官方 Arm Action 文档：胸前挥手=25，高举挥手=26，握手=27，恢复初始手臂位姿=99；
-# Python 官方示例对 shake hand 执行后 sleep(2) 再 release arm。
+# 官方 Arm Action 文档列出的预置动作均通过 ArmAction.ExecuteAction(action_id) 执行；
+# Python 官方示例对部分持续/接触类动作执行后 sleep(2) 再 release arm。
 _G1_ARM_PRESET_ACTIONS: Dict[str, Dict[str, Any]] = {
+    "g1_release_arm": {"action_name": "release arm", "release_after_sec": None},
+    "g1_two_hand_kiss": {"action_name": "two-hand kiss", "release_after_sec": None},
+    "g1_single_hand_kiss": {"action_name": "left kiss", "release_after_sec": None},
+    # SDK action_map 额外暴露；中文支持页的“单手飞吻”对应 ID 12。
+    "g1_right_kiss": {"action_name": "right kiss", "release_after_sec": None},
+    "g1_hands_up": {"action_name": "hands up", "release_after_sec": 2.0},
+    "g1_clap": {"action_name": "clap", "release_after_sec": None},
+    "g1_high_five": {"action_name": "high five", "release_after_sec": 2.0},
+    "g1_hug": {"action_name": "hug", "release_after_sec": 2.0},
+    "g1_heart": {"action_name": "heart", "release_after_sec": 2.0},
+    "g1_right_heart": {"action_name": "right heart", "release_after_sec": 2.0},
+    "g1_reject": {"action_name": "reject", "release_after_sec": 2.0},
+    "g1_right_hand_up": {"action_name": "right hand up", "release_after_sec": 2.0},
+    "g1_x_ray": {"action_name": "x-ray", "release_after_sec": 2.0},
     "g1_wave_hand": {"action_name": "face wave", "release_after_sec": None},
+    "g1_high_wave": {"action_name": "high wave", "release_after_sec": None},
     "g1_shake_hand": {"action_name": "shake hand", "release_after_sec": 2.0},
 }
 
@@ -239,11 +254,11 @@ class G1RobotAssembly(RobotAssemblyBase):
     ) -> Tuple[Optional[int], Any]:
         """G1 入口动作分发（被 runtime._build_private_capability_handler 调用）。
 
-        路由表（17 个 g1.* capability 与 drivers/g1/private_capabilities.py 一一对齐）：
+        路由表（31 个 g1.* capability 与 drivers/g1/private_capabilities.py 一一对齐）：
         - LocoPrimitive（5，无参）：g1_damp / g1_squat_to_stand / g1_stand_to_squat /
           g1_zero_torque / g1_lie_to_stand → LocoController 同名方法
         - G1Specific：g1_low_stand / g1_high_stand → LocoController 同名方法
-        - G1Specific：g1_wave_hand / g1_shake_hand → ArmController.execute_preset_action(...)
+        - G1Specific：官方 ArmAction 预置互动动作 → ArmController.execute_preset_action(...)
         - G1Specific（带参）：g1_arm_action → ArmController.execute_action(action_id/action_name)
         - Generic：g1_move(vx, vy, vyaw) → LocoController.move；g1_get_state → provider 快照；
           g1_play_audio → 暂留占位（未接 AudioClient）

@@ -1,8 +1,8 @@
-"""G1 能力矩阵（13 个 capability 显式三分组 + g1. 前缀）。
+"""G1 能力矩阵（31 个 capability 显式分组 + g1. 前缀）。
 
 设计要点（吸收 Critic 张力 2 + R8）：
 - LocoPrimitive 组（5 个，one_shot）：g1.damp / g1.squat_to_stand / g1.stand_to_squat / g1.zero_torque / g1.lie_to_stand
-- G1Specific 组（5 个，one_shot）：g1.low_stand / g1.high_stand / g1.wave_hand / g1.shake_hand / g1.arm_action
+- G1Specific 组：g1.low_stand / g1.high_stand / 官方 ArmAction 预置互动动作 / g1.arm_action
 - Generic 组（3 个，streaming/sync）：g1.move (streaming) / g1.play_audio (sync) / g1.get_state (sync)
 - capability name 显式含 `g1.` 前缀（吸收 Critic §2.2），与 gateways/runtime.py:capability_registry 按全名查表配合
 - 不进 capability 列表的 provider 内部方法：subscribe_sport_mode_state / subscribe_imu_state / subscribe_point_cloud
@@ -98,7 +98,7 @@ G1_LIE_TO_STAND = _descriptor(
     tags=("loco", "primitive"),
 )
 
-# ------------------ G1Specific 组（5 个，one_shot） ------------------
+# ------------------ G1Specific 组（one_shot） ------------------
 
 G1_LOW_STAND = _descriptor(
     name="g1_low_stand",
@@ -206,22 +206,166 @@ G1_HIGH_STAND = _descriptor(
     tags=("loco", "g1_specific"),
 )
 
-G1_WAVE_HAND = _descriptor(
-    name="g1_wave_hand",
-    display_name="G1 招手",
-    description="通过 G1 ArmAction 服务执行胸前挥手（face wave，官方预置动作 ID 25）。",
-    risk_level=CapabilityRiskLevel.LOW,
-    timeout_sec=10,
-    tags=("arm", "g1_specific", "interactive"),
+def _arm_preset_descriptor(
+    *,
+    name: str,
+    display_name: str,
+    zh_action: str,
+    sdk_action_name: str,
+    action_id: int,
+    release_after_sec: float | None = None,
+) -> CapabilityDescriptor:
+    release_text = ""
+    if release_after_sec is not None:
+        release_text = f"，随后约 {release_after_sec:g} 秒后恢复初始手臂位姿（ID 99）"
+    return _descriptor(
+        name=name,
+        display_name=display_name,
+        description=(
+            f"通过 G1 ArmAction 服务执行{zh_action}"
+            f"（{sdk_action_name}，官方预置动作 ID {action_id}）{release_text}。"
+        ),
+        risk_level=CapabilityRiskLevel.LOW,
+        timeout_sec=10,
+        tags=("arm", "g1_specific", "interactive", "arm_action_preset"),
+    )
+
+
+G1_RELEASE_ARM = _arm_preset_descriptor(
+    name="g1_release_arm",
+    display_name="G1 恢复手臂初始位姿",
+    zh_action="恢复初始手臂位姿",
+    sdk_action_name="release arm",
+    action_id=99,
 )
 
-G1_SHAKE_HAND = _descriptor(
+G1_TWO_HAND_KISS = _arm_preset_descriptor(
+    name="g1_two_hand_kiss",
+    display_name="G1 双手飞吻",
+    zh_action="双手飞吻",
+    sdk_action_name="two-hand kiss",
+    action_id=11,
+)
+
+G1_SINGLE_HAND_KISS = _arm_preset_descriptor(
+    name="g1_single_hand_kiss",
+    display_name="G1 单手飞吻",
+    zh_action="单手飞吻",
+    sdk_action_name="left kiss",
+    action_id=12,
+)
+
+G1_RIGHT_KISS = _arm_preset_descriptor(
+    name="g1_right_kiss",
+    display_name="G1 右手飞吻",
+    zh_action="右手飞吻",
+    sdk_action_name="right kiss",
+    action_id=13,
+)
+
+G1_HANDS_UP = _arm_preset_descriptor(
+    name="g1_hands_up",
+    display_name="G1 平举",
+    zh_action="平举",
+    sdk_action_name="hands up",
+    action_id=15,
+    release_after_sec=2.0,
+)
+
+G1_CLAP = _arm_preset_descriptor(
+    name="g1_clap",
+    display_name="G1 鼓掌",
+    zh_action="鼓掌",
+    sdk_action_name="clap",
+    action_id=17,
+)
+
+G1_HIGH_FIVE = _arm_preset_descriptor(
+    name="g1_high_five",
+    display_name="G1 击掌",
+    zh_action="击掌",
+    sdk_action_name="high five",
+    action_id=18,
+    release_after_sec=2.0,
+)
+
+G1_HUG = _arm_preset_descriptor(
+    name="g1_hug",
+    display_name="G1 拥抱",
+    zh_action="拥抱",
+    sdk_action_name="hug",
+    action_id=19,
+    release_after_sec=2.0,
+)
+
+G1_HEART = _arm_preset_descriptor(
+    name="g1_heart",
+    display_name="G1 双手比心",
+    zh_action="双手比心",
+    sdk_action_name="heart",
+    action_id=20,
+    release_after_sec=2.0,
+)
+
+G1_RIGHT_HEART = _arm_preset_descriptor(
+    name="g1_right_heart",
+    display_name="G1 右手比心",
+    zh_action="右手比心",
+    sdk_action_name="right heart",
+    action_id=21,
+    release_after_sec=2.0,
+)
+
+G1_REJECT = _arm_preset_descriptor(
+    name="g1_reject",
+    display_name="G1 双手打X",
+    zh_action="双手打X",
+    sdk_action_name="reject",
+    action_id=22,
+    release_after_sec=2.0,
+)
+
+G1_RIGHT_HAND_UP = _arm_preset_descriptor(
+    name="g1_right_hand_up",
+    display_name="G1 右手平举",
+    zh_action="右手平举",
+    sdk_action_name="right hand up",
+    action_id=23,
+    release_after_sec=2.0,
+)
+
+G1_X_RAY = _arm_preset_descriptor(
+    name="g1_x_ray",
+    display_name="G1 动感光波",
+    zh_action="动感光波",
+    sdk_action_name="x-ray",
+    action_id=24,
+    release_after_sec=2.0,
+)
+
+G1_WAVE_HAND = _arm_preset_descriptor(
+    name="g1_wave_hand",
+    display_name="G1 胸前挥手",
+    zh_action="胸前挥手",
+    sdk_action_name="face wave",
+    action_id=25,
+)
+
+G1_HIGH_WAVE = _arm_preset_descriptor(
+    name="g1_high_wave",
+    display_name="G1 高举挥手",
+    zh_action="高举挥手",
+    sdk_action_name="high wave",
+    action_id=26,
+)
+
+G1_SHAKE_HAND = _arm_preset_descriptor(
     name="g1_shake_hand",
     display_name="G1 握手",
-    description="通过 G1 ArmAction 服务执行握手（shake hand，官方预置动作 ID 27），随后恢复初始手臂位姿（ID 99）。",
-    risk_level=CapabilityRiskLevel.LOW,
-    timeout_sec=10,
-    tags=("arm", "g1_specific", "interactive"),
+    zh_action="握手",
+    sdk_action_name="shake hand",
+    action_id=27,
+    release_after_sec=2.0,
 )
 
 G1_ARM_ACTION = _descriptor(
@@ -235,7 +379,12 @@ G1_ARM_ACTION = _descriptor(
         "properties": {
             "action_id": {
                 "type": "integer",
-                "description": "宇树固件预置 ArmAction ID，例如 25=胸前挥手，26=高举挥手，27=握手，99=恢复手臂。",
+                "description": (
+                    "宇树固件预置 ArmAction ID，例如 11=双手飞吻，12=单手飞吻，15=平举，"
+                    "17=鼓掌，18=击掌，19=拥抱，20=双手比心，21=右手比心，22=双手打X，"
+                    "23=右手平举，24=动感光波，25=胸前挥手，26=高举挥手，27=握手，"
+                    "99=恢复手臂。"
+                ),
             },
             "action_name": {
                 "type": "string",
@@ -309,7 +458,7 @@ G1_GET_STATE = _descriptor(
     tags=("state", "sync"),
 )
 
-# ------------------ 17 capability 显式四分组汇总 ------------------
+# ------------------ 31 capability 显式四分组汇总 ------------------
 
 G1_CAPABILITY_DESCRIPTORS: List[CapabilityDescriptor] = [
     # LocoPrimitive（5）
@@ -318,10 +467,24 @@ G1_CAPABILITY_DESCRIPTORS: List[CapabilityDescriptor] = [
     G1_STAND_TO_SQUAT,
     G1_ZERO_TORQUE,
     G1_LIE_TO_STAND,
-    # G1Specific（5）
+    # G1Specific（19：low/high + ArmAction 预置 16 个 + 通用 g1_arm_action）
     G1_LOW_STAND,
     G1_HIGH_STAND,
+    G1_RELEASE_ARM,
+    G1_TWO_HAND_KISS,
+    G1_SINGLE_HAND_KISS,
+    G1_RIGHT_KISS,
+    G1_HANDS_UP,
+    G1_CLAP,
+    G1_HIGH_FIVE,
+    G1_HUG,
+    G1_HEART,
+    G1_RIGHT_HEART,
+    G1_REJECT,
+    G1_RIGHT_HAND_UP,
+    G1_X_RAY,
     G1_WAVE_HAND,
+    G1_HIGH_WAVE,
     G1_SHAKE_HAND,
     G1_ARM_ACTION,
     # Generic（3）
@@ -351,7 +514,8 @@ G1_CAPABILITY_MATRIX = CapabilityMatrix(
         "capability_count": len(G1_CAPABILITY_DESCRIPTORS),
         "groups": {
             "LocoPrimitive": 5,
-            "G1Specific": 5,
+            "G1Specific": 19,
+            "ArmActionPreset": 16,
             "Generic": 3,
             "MotionSwitcher": 4,
         },

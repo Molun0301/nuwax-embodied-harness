@@ -4,7 +4,7 @@
 # 范围（v4 收敛 + OpenSpec g1-rtabnav2-adapter）：
 #   - mapping (SLAM + 实时 2D 障碍)
 #   - localization (重定位 + Nav2)
-#   - 未来可加 explore / camera_fusion（follow-up）
+#   - explore (GO2 自主探索；G1 暂未开放)
 #
 # 替代 go2.sh 的逻辑（保留 GO2 历史行为），但去 GO2 专属命名：
 #   - 模式分发：--mapping / --localization（v4 范围）
@@ -15,11 +15,12 @@
 # 用法：
 #   ./robot_slam.sh --mapping [map.db]
 #   ./robot_slam.sh --localization <map.db>
+#   ./robot_slam.sh --explore [map.db]
 #   ./robot_slam.sh --fresh --mapping   # 强制 restart_map=true
 #   ROBOT=g1 ./robot_slam.sh --mapping  # G1 端（需 NUWAX_ACTIVE_ROBOT=g1 + .env.G1_example）
 #
 # 本期不在范围：
-#   - --mapping-only / --explore / --boundary（v4 范围外；未来 follow-up 加）
+#   - --mapping-only / --boundary（v4 范围外；未来 follow-up 加）
 #   - go2.sh → 已删除（本脚本唯一入口）
 
 set -euo pipefail
@@ -55,15 +56,78 @@ warn() {
   echo "robot_slam.sh: warning: $*" >&2
 }
 
+source_without_nounset() {
+  local target="$1"
+  local had_nounset=0
+  if [[ $- == *u* ]]; then
+    had_nounset=1
+    set +u
+  fi
+  # shellcheck disable=SC1090
+  source "${target}"
+  if [[ "${had_nounset}" -eq 1 ]]; then
+    set -u
+  fi
+}
+
+prepend_path_once() {
+  local target="$1"
+  [[ -n "${target}" && -d "${target}" ]] || return 0
+  case ":${PATH:-}:" in
+    *":${target}:"*) return 0 ;;
+  esac
+  export PATH="${target}:${PATH:-}"
+}
+
+source_ros_runtime_env() {
+  local shared_runtime_env="${SCRIPT_DIR}/../../../source_runtime_env.sh"
+  if [[ -f "${shared_runtime_env}" ]]; then
+    export NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV=true
+    export NUWAX_GEOMETRY_RUNTIME_FORCE_CYCLONEDDS="${NUWAX_GEOMETRY_RUNTIME_FORCE_CYCLONEDDS:-true}"
+    source_without_nounset "${shared_runtime_env}"
+    echo "==> ROS env: sourced ${shared_runtime_env}"
+  else
+    local ros_setup=""
+    if [[ -n "${NUWAX_ROS_SETUP_SCRIPT:-}" && -f "${NUWAX_ROS_SETUP_SCRIPT}" ]]; then
+      ros_setup="${NUWAX_ROS_SETUP_SCRIPT}"
+    elif [[ -f "/opt/ros/${GO2_ROS_DISTRO}/setup.bash" ]]; then
+      ros_setup="/opt/ros/${GO2_ROS_DISTRO}/setup.bash"
+    fi
+    if [[ -n "${ros_setup}" ]]; then
+      source_without_nounset "${ros_setup}"
+      echo "==> ROS env: sourced ${ros_setup}"
+    fi
+    if [[ -n "${NUWAX_GEOMETRY_SETUP_SCRIPT:-}" && -f "${NUWAX_GEOMETRY_SETUP_SCRIPT}" ]]; then
+      source_without_nounset "${NUWAX_GEOMETRY_SETUP_SCRIPT}"
+      echo "==> ROS env: sourced ${NUWAX_GEOMETRY_SETUP_SCRIPT}"
+    fi
+    if [[ -n "${NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT:-}" && -f "${NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT}" ]]; then
+      source_without_nounset "${NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT}"
+      echo "==> ROS env: sourced ${NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT}"
+    elif [[ -f "${SCRIPT_DIR}/ws/install/setup.bash" ]]; then
+      source_without_nounset "${SCRIPT_DIR}/ws/install/setup.bash"
+      echo "==> ROS env: sourced ${SCRIPT_DIR}/ws/install/setup.bash"
+    fi
+  fi
+  prepend_path_once "/opt/ros/${GO2_ROS_DISTRO}/bin"
+  if ! command -v ros2 >/dev/null 2>&1; then
+    die "ros2 not found after sourcing ROS env. Set NUWAX_ROS_SETUP_SCRIPT=/opt/ros/${GO2_ROS_DISTRO}/setup.bash or install ROS2 ${GO2_ROS_DISTRO}."
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fresh)
       FRESH_MAP="true"
       shift
       ;;
-    --mapping|--localization)
+    -m|--new|--mapping|-l|--loc|--localization|-e|--explore|--exploration)
       [[ -z "$MODE" ]] || die "only one mode flag allowed"
-      MODE="${1#--}"
+      case "$1" in
+        -m|--new|--mapping) MODE="mapping" ;;
+        -l|--loc|--localization) MODE="localization" ;;
+        -e|--explore|--exploration) MODE="explore" ;;
+      esac
       shift
       if [[ $# -gt 0 && "$1" != --* ]]; then
         DB_ARG="$1"
@@ -80,7 +144,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$MODE" ]] || die "missing mode: --mapping | --localization"
+[[ -n "$MODE" ]] || die "missing mode: --mapping | --localization | --explore"
 
 if [[ "$MODE" == "localization" ]]; then
   [[ -n "$DB_ARG" ]] || die "--localization requires a database path"
@@ -89,11 +153,10 @@ fi
 # 物理量注入：GO2 端走既有 scripts/load_platform_geometry_env.sh 注入 16 个 NUWAX_GEOMETRY_* 键；
 # G1 端走 start_gateway.sh 的 .env.G1_example 覆盖路径（不调用本脚本）。
 if [[ -f "${SCRIPT_DIR}/scripts/load_platform_geometry_env.sh" ]]; then
-  set +u
-  # shellcheck disable=SC1091
-  source "${SCRIPT_DIR}/scripts/load_platform_geometry_env.sh"
-  set -u
+  source_without_nounset "${SCRIPT_DIR}/scripts/load_platform_geometry_env.sh"
 fi
+
+source_ros_runtime_env
 
 # 数据库路径解析（沿用 v3 范式）
 resolve_default_db() {
@@ -132,6 +195,12 @@ case "$MODE" in
   mapping)
     launch_file="mapping_${ROBOT}.launch.py"
     ;;
+  explore)
+    launch_file="explore_${ROBOT}.launch.py"
+    if [[ "${ROBOT}" == "g1" ]]; then
+      die "G1 explore 模式暂未开放（follow-up F2）；请用 mapping 模式或切换到 GO2"
+    fi
+    ;;
   localization)
     launch_file="localization_${ROBOT}.launch.py"
     # v4 范围：本期内 localization 模式复用 navigation_go2.launch.py（GO2 端）
@@ -151,6 +220,9 @@ args=(
 )
 case "$MODE" in
   localization) args+=("slam_mode:=localization") ;;
+  # explore_go2.launch.py 内部已向 nav_go2.launch.py 透传 slam_mode:=explore；
+  # 顶层未声明 slam_mode，避免额外传参触发 ROS2 launch unknown argument。
+  explore) ;;
   *) args+=("slam_mode:=mapping") ;;
 esac
 

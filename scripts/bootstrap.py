@@ -692,13 +692,14 @@ class BootstrapPlanner:
         return value
 
     def root_overrides(self) -> Dict[str, str]:
-        go2_geometry_enabled = self.selected_robot == "go2" and self.geometry_enabled
-        ros_setup = _detect_ros_setup() if go2_geometry_enabled else None
+        ros_geometry_enabled = self.selected_robot in {"go2", "g1"} and self.geometry_enabled
+        ros_setup = _detect_ros_setup() if ros_geometry_enabled else None
+        robot_slam_script = PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "src" / "GO2_RTABNAV2" / "robot_slam.sh"
         values: Dict[str, str] = {
             "NUWAX_ACTIVE_ROBOT": self.selected_robot,
             "NUWAX_PYTHON_BIN": self.python_bin,
-            "NUWAX_GEOMETRY_ENABLED": _bool_text(go2_geometry_enabled),
-            "NUWAX_GEOMETRY_REQUIRE_ROS2": _bool_text(go2_geometry_enabled),
+            "NUWAX_GEOMETRY_ENABLED": _bool_text(ros_geometry_enabled),
+            "NUWAX_GEOMETRY_REQUIRE_ROS2": _bool_text(ros_geometry_enabled),
             "NUWAX_ROS_SETUP_SCRIPT": str(ros_setup) if ros_setup is not None else "",
             "NUWAX_GEOMETRY_SETUP_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash"),
             "NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT": str(go2slam_setup_path()),
@@ -755,9 +756,7 @@ class BootstrapPlanner:
                     "NUWAX_RTABMAP_LAUNCH_PACKAGE": "rtabmap_launch",
                     "NUWAX_RTABMAP_LAUNCH_FILE": "rtabmap.launch.py",
                     "NUWAX_RTABMAP_OCCUPANCY_PROJECTION": "projected_occupancy",
-                    "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(
-                        PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "src" / "GO2_RTABNAV2" / "go2.sh"
-                    ),
+                    "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(robot_slam_script),
                     "NUWAX_GEOMETRY_EXTERNAL_ARGS": "",
                     "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "external_slam_nav2",
                     "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "external_slam_nav2.log",
@@ -766,6 +765,44 @@ class BootstrapPlanner:
                     "NUWAX_NAV2_ACTION_NAME": "/navigate_to_pose",
                     "NUWAX_NAV2_LAUNCH_PACKAGE": "nav2_bringup",
                     "NUWAX_NAV2_LAUNCH_FILE": "navigation_launch.py",
+                    "NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC": "/global_costmap/costmap",
+                    "NUWAX_NAV2_LOCAL_COSTMAP_TOPIC": "/local_costmap/costmap",
+                    "NUWAX_NAV2_COSTMAP_SOURCE": "nav2_global",
+                }
+            )
+        elif self.selected_robot == "g1" and self.geometry_enabled:
+            values.update(
+                {
+                    "NUWAX_GEOMETRY_ODOM_TOPIC": "/unitree/slam_mapping/odom",
+                    "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS": "",
+                    "NUWAX_GEOMETRY_IMU_TOPIC": "/utlidar/imu_livox_mid360",
+                    "NUWAX_GEOMETRY_POINT_CLOUD_TOPIC": "/utlidar/cloud_livox_mid360",
+                    "NUWAX_GEOMETRY_TF_TOPIC": "/tf",
+                    "NUWAX_GEOMETRY_TF_STATIC_TOPIC": "/tf_static",
+                    "NUWAX_GEOMETRY_OCCUPANCY_TOPIC": "/map_obstacles",
+                    "NUWAX_GEOMETRY_CLOUD_MAP_TOPIC": "/cloud_map",
+                    "NUWAX_GEOMETRY_COST_MAP_TOPIC": "/global_costmap/costmap",
+                    "NUWAX_GEOMETRY_MAP_FRAME": "map",
+                    "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
+                    "NUWAX_GEOMETRY_BASE_FRAME": "pelvis",
+                    "NUWAX_GEOMETRY_LIDAR_FRAME": "livox_mid360_link",
+                    "NUWAX_GEOMETRY_ROBOT_RADIUS": "0.20",
+                    "NUWAX_GEOMETRY_INFLATION_RADIUS": "0.65",
+                    "NUWAX_RTABMAP_LAUNCH_PACKAGE": "rtabmap_launch",
+                    "NUWAX_RTABMAP_LAUNCH_FILE": "rtabmap.launch.py",
+                    "NUWAX_RTABMAP_OCCUPANCY_PROJECTION": "projected_occupancy",
+                    "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(robot_slam_script),
+                    "NUWAX_GEOMETRY_EXTERNAL_ARGS": "--mapping",
+                    "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "robot_slam.sh",
+                    "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "robot_slam.log",
+                    "NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED": "false",
+                    "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED": "false",
+                    "NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC": "explore/frontiers",
+                    "NUWAX_NAV2_AUTOSTART": "false",
+                    "NUWAX_NAV2_USE_SIM_TIME": "false",
+                    "NUWAX_NAV2_ACTION_NAME": "/navigate_to_pose",
+                    "NUWAX_NAV2_LAUNCH_PACKAGE": "nav2_bringup",
+                    "NUWAX_NAV2_LAUNCH_FILE": "nav2.launch.py",
                     "NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC": "/global_costmap/costmap",
                     "NUWAX_NAV2_LOCAL_COSTMAP_TOPIC": "/local_costmap/costmap",
                     "NUWAX_NAV2_COSTMAP_SOURCE": "nav2_global",

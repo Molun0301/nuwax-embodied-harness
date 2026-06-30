@@ -44,7 +44,7 @@ def build_default_rtabmap_pcd_root() -> str:
 
 
 def build_default_external_slam_nav2_script() -> str:
-    """返回仓库内默认外部 SLAM/Nav2 启动脚本路径（GO2_RTABNAV2 顶层 go2.sh）。"""
+    """返回仓库内默认外部 SLAM/Nav2 启动脚本路径（统一 robot_slam.sh 入口）。"""
 
     return str(
         Path(__file__).resolve().parents[1]
@@ -53,7 +53,7 @@ def build_default_external_slam_nav2_script() -> str:
         / "ros2_ws"
         / "src"
         / "GO2_RTABNAV2"
-        / "go2.sh"
+        / "robot_slam.sh"
     )
 
 

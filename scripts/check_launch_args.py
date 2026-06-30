@@ -12,7 +12,7 @@ A4: .env.G1_example 含所有 G1 覆盖键
 A5: .env.G1_example 与 .env.example 物理量差异只来自 v4 B.3 表（lidar/imu/base/lidar_frame/robot_radius/inflation_radius/odom 7 项）
 A6: _POINT_CLOUD_TOPIC=/utlidar/cloud_livox_mid360（防退化）
 A7: _IMU_TOPIC=/utlidar/imu_livox_mid360（防退化）
-A8 (v6 新增): NUWAX_GEOMETRY_ENABLED=true + NUWAX_GEOMETRY_EXTERNAL_SCRIPT 必含 robot_slam.sh
+A8 (v6 新增): NUWAX_GEOMETRY_ENABLED=true + REQUIRE_ROS2=true + EXTERNAL_SCRIPT 必含 robot_slam.sh
 
 退出 0 = 全过；非 0 = 至少 1 条失败（打印具体失败键与修复建议）。
 """
@@ -216,6 +216,13 @@ def main() -> int:
             f"v6 关键修复；runtime 报 geometry_runtime_disabled 根因"
         )
 
+    require_ros2 = g1_env.get("NUWAX_GEOMETRY_REQUIRE_ROS2", "")
+    if require_ros2.lower() not in {"true", "1", "yes", "on"}:
+        failures.append(
+            f"A8 FAIL: NUWAX_GEOMETRY_REQUIRE_ROS2={require_ros2!r} (expected true) —"
+            f"G1 robot_slam.sh 依赖 ROS2 环境；false 会导致 gateway 子进程缺 ros2"
+        )
+
     script = g1_env.get("NUWAX_GEOMETRY_EXTERNAL_SCRIPT", "")
     if "robot_slam.sh" not in script:
         failures.append(
@@ -234,7 +241,7 @@ def main() -> int:
         )
         return 1
 
-    print("=== G1 RTAB/Nav2 静态校验通过（A1-A7 全过）===")
+    print("=== G1 RTAB/Nav2 静态校验通过（A1-A8 全过）===")
     return 0
 
 

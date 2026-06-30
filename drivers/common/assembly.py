@@ -19,6 +19,9 @@ class RobotAssemblyStatus:
     low_level_running: bool
     adapter_count: int = 0
     healthy_adapter_count: int = 0
+    # 修复 openspec/changes/fix-g1-loco-init-no-motion-switcher：
+    # 优雅降级后暴露失败原因（默认空字符串）；仅 G1 装配启用，其他机器人保留默认。
+    last_error: str = ""
 
 
 class RobotAssemblyBase(ABC):

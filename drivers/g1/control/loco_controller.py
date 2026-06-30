@@ -61,17 +61,23 @@ class LocoController:
         *,
         client_timeout_sec: float = DEFAULT_CLIENT_TIMEOUT_SEC,
         target_mode: str = "advanced",
-        acquire_motion_mode_on_init: bool = True,
+        # 修复 openspec/changes/fix-g1-loco-init-no-motion-switcher：
+        # 默认 False — G1 高层控制官方路径 = LocoClient 直连，不走 MotionSwitcher 抢占
+        # （参见 unitree_sdk2/example/g1/high_level/g1_loco_client_example.cpp 全程无 MotionSwitcher）。
+        # 仅在 env NUWAX_G1_REQUIRE_MOTION_SWITCHER=true 时由调用方传 True。
+        acquire_motion_mode_on_init: bool = False,
     ) -> None:
         self.iface = iface
         self.client_timeout_sec = float(client_timeout_sec)
-        # 高层动作 code=None 真实根因修复：先 motion_switcher 抢占 advanced
+        # 高层动作 code=None 真实根因修复：先 motion_switcher 抢占 advanced（可选）
         self._target_mode = target_mode
         self._acquire_motion_mode_on_init = bool(acquire_motion_mode_on_init)
         self.is_initialized = False
         self.loco_client: Any = None
         # MotionSwitcher 控制器（依赖注入，缺 SDK 时为 None）
         self.motion_switcher: Any = None
+        # 修复：init 失败原因缓存，供 assembly.get_status().last_error 透出
+        self._init_last_error: str = ""
         # 流式状态订阅相关
         self._state_subscriber: Any = None
         self._state_callback: Optional[Callable[[Any], None]] = None
@@ -86,16 +92,22 @@ class LocoController:
     def init(self) -> bool:
         """初始化 LocoClient + 准备 SportModeState_ 订阅。
 
-        关键次序（实机 2026-06-30 教训，必须按以下顺序）：
-        1. MotionSwitcher 抢占 advanced — 必须先抢到，主控才接受 sport RPC
-        2. LocoClient.Init() + Start() — 此时才真正拿到 lease
-        任何次序颠倒都会导致 WaveHand / Lie2StandUp code=None。
+        修复 openspec/changes/fix-g1-loco-init-no-motion-switcher 后步骤：
+        1. ChannelFactoryInitialize(0, iface)
+        2. LocoClient.Init() + SetTimeout(10)
+        3. LocoClient.Start() — 与宇树官方 g1_loco_client_example.cpp 严格对齐
+        4. (可选) motion_switcher 后置抢占 — 仅在 env NUWAX_G1_REQUIRE_MOTION_SWITCHER=true
+           且 acquire_motion_mode_on_init=True 时执行；失败 LOGGER.warning 不 raise
+           （D3 优雅降级）
+
+        任何步骤失败均 LOGGER.error 缓存 _init_last_error 并返 False，由调用方决定是否降级。
         """
 
         if self.is_initialized:
             LOGGER.warning("LocoController 已初始化")
             return True
 
+        self._init_last_error = ""
         try:
             channel_module = importlib.import_module("unitree_sdk2py.core.channel")
             channel_factory_initialize = getattr(channel_module, "ChannelFactoryInitialize")
@@ -104,24 +116,8 @@ class LocoController:
             else:
                 channel_factory_initialize(0)
 
-            # 【修复 #1 + #2】先 motion_switcher 抢占 advanced；hard fail。
-            # 实机 2026-06-30 教训：主控当前 mode=ai 时若不抢占直接 Init/Start LocoClient，
-            # LocoClient.Start() "成功"（仅注册 RPC handler）但主控把 lease 给了 ai 进程，
-            # 所有 sport RPC 返 None。必须先抢到 advanced 再 Init/Start。
-            if self._acquire_motion_mode_on_init:
-                self.motion_switcher = _build_motion_switcher_or_none(
-                    self.iface, self._target_mode, acquire_on_init=True,
-                )
-                if self.motion_switcher is None:
-                    raise RuntimeError(
-                        "MotionSwitcherController 工厂返 None，无法保证 LocoClient 后续 RPC 可用。"
-                        "若单元测试场景可设 acquire_motion_mode_on_init=False 跳过。"
-                    )
-                if not self.motion_switcher.init():
-                    raise RuntimeError("MotionSwitcherController.init() 返 False")
-                if not self.motion_switcher.is_running():
-                    raise RuntimeError("MotionSwitcherController 抢占后未 running，hard fail")
-
+            # 【D2 修复】先 LocoClient 直连，再可选后置 motion_switcher 抢占
+            # 严格对齐宇树官方 g1_loco_client_example.cpp：LocoClient.Init() + Start() 是必经路径
             loco_module = importlib.import_module("unitree_sdk2py.g1.loco.g1_loco_client")
             LocoClient = getattr(loco_module, "LocoClient")
             self.loco_client = LocoClient()
@@ -132,9 +128,47 @@ class LocoController:
             # SDK 内部同步阻塞 → timeout → 静默返 None → 调用方把 None 归零误判成功。
             self.loco_client.Start()
             LOGGER.info(
-                "LocoClient.Start() 完成（lease 应已就绪，主控 mode=%s，wave_hand 等高层命令可走通）",
-                self._target_mode,
+                "LocoClient 直连 Init+Start 完成（iface=%s, timeout=%.1fs）；"
+                "wave_hand 等高层命令可走通",
+                self.iface or "default", self.client_timeout_sec,
             )
+
+            # 【D2 修复】后置 motion_switcher 抢占（仅 env 开启时）
+            # 注意：抢占在 LocoClient 之后 — 即便抢占失败 LocoClient 仍可用。
+            # 实机 2026-06-30 教训：原"先抢占再 Init/Start"范式失败时 hard fail → 网关退出；
+            # 新策略"直连 + 可选后置"避免单点失败。
+            if self._acquire_motion_mode_on_init:
+                self.motion_switcher = _build_motion_switcher_or_none(
+                    self.iface, self._target_mode, acquire_on_init=True,
+                )
+                if self.motion_switcher is None:
+                    LOGGER.warning(
+                        "MotionSwitcherController 工厂返 None（SDK 缺失？）；"
+                        "LocoClient 已直连可用，高层 mode 抢占能力受限但不影响 Loco 命令"
+                    )
+                else:
+                    if not self.motion_switcher.init():
+                        LOGGER.warning(
+                            "MotionSwitcher 后置抢占 init 失败；LocoClient 仍可用，"
+                            "用户可手动调 g1_select_motion_mode 接管 mode"
+                        )
+                        self.motion_switcher = None
+                    elif not self.motion_switcher.is_running():
+                        LOGGER.warning(
+                            "MotionSwitcher 后置抢占未 running；LocoClient 仍可用"
+                        )
+                        self.motion_switcher = None
+                    else:
+                        LOGGER.info(
+                            "MotionSwitcher 后置抢占成功（mode=%s）",
+                            self._target_mode,
+                        )
+        except Exception as exc:
+            LOGGER.error("LocoController 初始化失败: %s", exc)
+            self._init_last_error = f"{type(exc).__name__}: {exc}"
+            self.motion_switcher = None
+            self.loco_client = None
+            return False
         except Exception as exc:
             LOGGER.error("LocoController 初始化失败: %s", exc)
             self.motion_switcher = None

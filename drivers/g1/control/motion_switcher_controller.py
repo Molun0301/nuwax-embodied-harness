@@ -36,9 +36,9 @@ SUPPORTED_MODES: tuple[str, ...] = ("ai", "normal", "advanced", "ai-w")
 DEFAULT_TARGET_MODE = "advanced"
 # 抢占/查询超时（SDK 默认 5.0s；与 low_level_example.py:91 对齐）
 DEFAULT_CLIENT_TIMEOUT_SEC = 5.0
-# 抢占时连续 ReleaseMode 的最大次数（防死循环兜底）
-DEFAULT_MAX_RELEASE_ROUNDS = 5
-# 每次 CheckMode 之间的间隔（low_level_example.py:99 用的是 1.0s）
+# 抢占时连续 ReleaseMode 的最大次数（防死循环兜底；spec Scenario "D1 清场成功标准" = 10 轮）
+DEFAULT_MAX_RELEASE_ROUNDS = 10
+# 每次 CheckMode 之间的间隔（low_level_example.py:99 用的是 1.0s；启动阻塞容忍 10s 上限）
 DEFAULT_RELEASE_INTERVAL_SEC = 1.0
 # acquire_high_level 复核等待时间
 DEFAULT_ACQUIRE_CONFIRM_SEC = 0.5
@@ -196,6 +196,16 @@ class MotionSwitcherController:
         if current_name == target:
             LOGGER.info("MotionSwitcher 当前已在目标模式 %s，跳过 SelectMode", target)
             return (0, target, "")
+        # 修复（D1 + 2.4）：当前 mode 非空且 != target 时先 ReleaseMode 清场，
+        # 避免主控返 7004 (UT_SWITCH_ERR_NAME) "name or alias is invalid" 拒绝抢占。
+        # 注意：清场最多 10 轮 × 1s = 10s 上限；acquire_high_level 已做清场，
+        # 此处 select_mode 独立被调时也做一次（保守双保险）。
+        if current_name:
+            LOGGER.info(
+                "MotionSwitcher 抢占前检测到当前 mode=%s 非空，先做清场",
+                current_name,
+            )
+            self._release_until_empty()
         try:
             ret_code, _ = self.ms_client.SelectMode(target)
         except Exception as exc:
@@ -238,12 +248,19 @@ class MotionSwitcherController:
         self,
         target: Optional[str] = None,
     ) -> Tuple[int, str, str]:
-        """业务级封装：SelectMode(target) → CheckMode 复核。
+        """业务级封装：先 ReleaseMode 循环清场 → SelectMode(target) → CheckMode 复核。
 
-        流程对应 example/motionSwitcher/motion_switcher_example.py 的 high-level
-        模式切换范式。low-level 示例中的 ReleaseMode 循环只用于 LowCmd 发布前清空
-        当前占主，不适合作为 G1 high-level advanced 接管的默认路径。
-        默认 target = self.target_mode（advanced）。
+        修复 openspec/changes/fix-g1-loco-init-no-motion-switcher：
+        实机 2026-06-30 7004 = "name or alias is invalid" 根因修复 ——
+        当前主控若被 ai 占主，直接 SelectMode("advanced") 主控判定 "advanced" 是非法 alias
+        （motion_switcher_error.hpp: UT_SWITCH_ERR_NAME）。
+
+        流程贴合宇树 G1 官方 low-level 示例 g1_ankle_swing_example.cpp:170-192：
+        CheckMode → while name 非空 → ReleaseMode + sleep(1) → 再次 CheckMode 清场
+        → 直到 name=="" 才尝试 SelectMode(target)。
+
+        默认 target = self.target_mode（advanced）；env NUWAX_G1_REQUIRE_MOTION_SWITCHER=true
+        时由 assembly 调到这里。
 
         Returns:
             (code, current_name, message)
@@ -256,10 +273,74 @@ class MotionSwitcherController:
         except ValueError as exc:
             return (-1, "", str(exc))
 
+        # Step 1: ReleaseMode 循环清场（贴合宇树官方 low-level 示例范式）
+        cleared, clear_name, clear_msg = self._release_until_empty()
+        if not cleared:
+            # 清场失败 — LOGGER.warning 不 raise，让上层决定是否降级（D3 优雅降级）
+            LOGGER.warning(
+                "acquire_high_level 抢占前清场未成功（current=%s msg=%s），"
+                "继续尝试 SelectMode 兜底",
+                clear_name, clear_msg,
+            )
+            # 不直接返失败 — 主控可能允许在非空占主时直接抢占
+
+        # Step 2: 业务级 SelectMode（含 CheckMode 前置分支在 select_mode 内已处理）
         sel_code, current_name, sel_msg = self.select_mode(target_mode)
         if sel_code != 0:
+            # 修复：D1 SelectMode 失败不再 LOGGER.error hard fail，返 (code, current_name, msg)
+            LOGGER.warning(
+                "acquire_high_level SelectMode(%s) 失败 code=%s current=%s msg=%s；"
+                "上层可降级处理",
+                target_mode, sel_code, current_name, sel_msg,
+            )
             return (sel_code, current_name, sel_msg)
         return (0, current_name, "")
+
+    def _release_until_empty(self) -> Tuple[bool, str, str]:
+        """ReleaseMode 循环清场直到 CheckMode 返回 name==""。
+
+        适配宇树 G1 官方 low-level 示例 g1_ankle_swing_example.cpp:178-192 严格范式：
+            while (msc_->CheckMode(form, name), !name.empty()) {
+                msc_->ReleaseMode();
+                sleep(5);
+            }
+
+        Returns:
+            (cleared, current_name, message)
+            cleared=True 当且仅当 CheckMode().name == "" 或 max 轮内被清空。
+        """
+        for round_idx in range(self.max_release_rounds):
+            check_code, current_name, check_msg = self.check_mode()
+            if check_code != 0:
+                return (False, current_name, f"清场第 {round_idx+1} 轮 CheckMode 失败: {check_msg}")
+            if not current_name:
+                # 已空 — 清场完成
+                if round_idx > 0:
+                    LOGGER.info(
+                        "MotionSwitcher 清场完成（%d 轮后 name==''）",
+                        round_idx,
+                    )
+                return (True, "", "")
+            # 仍有人占主 — ReleaseMode 一次后等间隔再 CheckMode
+            release_code, release_name, release_msg = self.release_mode()
+            LOGGER.info(
+                "MotionSwitcher 清场第 %d 轮（current=%s release_code=%s）",
+                round_idx + 1, current_name, release_code,
+            )
+            if release_code != 0:
+                # ReleaseMode 失败 — 仍继续尝试（多轮后可能成功）
+                LOGGER.warning(
+                    "MotionSwitcher 清场第 %d 轮 ReleaseMode 失败 code=%s msg=%s",
+                    round_idx + 1, release_code, release_msg,
+                )
+            time.sleep(self.release_interval_sec)
+        # 达到 max 轮仍未清空
+        final_code, final_name, final_msg = self.check_mode()
+        LOGGER.warning(
+            "MotionSwitcher 清场 %d 轮后仍未清空（final name=%s）",
+            self.max_release_rounds, final_name,
+        )
+        return (False, final_name, f"清场超时 {self.max_release_rounds} 轮仍未空: {final_msg}")
 
     # ------------------ 内部 ------------------
 
@@ -277,13 +358,13 @@ class MotionSwitcherController:
 
 
 def main() -> None:
-    """CLI 入口：python3 -m drivers.g1.control.motion_switcher_controller check|select|release|acquire [--name advanced]"""
+    """CLI 入口：python3 -m drivers.g1.control.motion_switcher_controller check|select|release|acquire|probe [--name advanced]"""
     import argparse
     import sys
 
     parser = argparse.ArgumentParser(description="G1 MotionSwitcherController CLI 测试入口")
-    parser.add_argument("command", choices=["check", "select", "release", "acquire"],
-                        help="check=查模式；select=抢占指定模式；release=释放；acquire=业务级抢占")
+    parser.add_argument("command", choices=["check", "select", "release", "acquire", "probe"],
+                        help="check=查模式；select=抢占指定模式；release=释放；acquire=业务级抢占；probe=串行探测 4 个 mode 输出主控支持集合")
     parser.add_argument("--iface", default=None, help="DDS 网卡（默认沿用 ChannelFactoryInitialize(0)）")
     parser.add_argument("--name", default=None,
                         help="select/acquire 的目标 mode（ai/normal/advanced/ai-w）")
@@ -294,10 +375,12 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # probe 子命令不需要 init 自动抢占（acquire_on_init=False），仅 init MSClient 即可
+    acquire_on_init = (args.command != "probe") and (not args.no_auto_acquire)
     controller = MotionSwitcherController(
         iface=args.iface,
         client_timeout_sec=args.timeout,
-        acquire_on_init=not args.no_auto_acquire,
+        acquire_on_init=acquire_on_init,
     )
     if not controller.init():
         LOGGER.error("MotionSwitcherController.init() 失败")
@@ -316,8 +399,56 @@ def main() -> None:
         elif args.command == "acquire":
             code, name, msg = controller.acquire_high_level(args.name)
             print(f"acquire: code={code} name={name!r} msg={msg}")
+        elif args.command == "probe":
+            _run_probe(controller)
     finally:
         controller.stop()
+
+
+def _run_probe(controller: "MotionSwitcherController") -> None:
+    """probe 子命令实现：串行测试 ai/normal/advanced/ai-w 4 个 mode 并汇总主控支持集合。
+
+    行为规范（见 openspec/changes/fix-g1-loco-init-no-motion-switcher/tasks.md 6.1-6.3）：
+    - 串行：每个 mode 间 sleep 1s，避免触发主控 BUSY（7002）
+    - 早停：首个 code≠0 的 mode 后立即停止后续探测（避免对主控造成连续打扰）
+    - 表格输出：(mode, code, current_name) 三列
+    - 末尾汇总：主控支持集合 = [...]，便于运维决策 Option A vs B
+
+    判定决策树：
+    - 4 mode 全 code≠0 → 主控不支持任意抢占 → 保留 Option A 默认（_acquire_motion_mode_on_init=False）
+    - advanced code=0 → 主控支持 advanced → 切 Option B（env NUWAX_G1_REQUIRE_MOTION_SWITCHER=true）
+    """
+    import time
+
+    probe_modes = ("ai", "normal", "advanced", "ai-w")
+    results = []  # list[tuple[str, int, str]]
+    first_failure_index: int | None = None
+
+    print(f"{'mode':<10} {'code':<6} current_name")
+    print("-" * 40)
+    for idx, mode in enumerate(probe_modes):
+        code, current_name, msg = controller.select_mode(mode)
+        results.append((mode, code, current_name))
+        print(f"{mode:<10} {code:<6} {current_name!r}")
+        if code != 0 and first_failure_index is None:
+            first_failure_index = idx
+            LOGGER.warning(
+                "probe 在 mode=%s 首次遇非 0 code=%s，停止后续探测以避免对主控打扰",
+                mode, code,
+            )
+            break
+        if idx < len(probe_modes) - 1:
+            time.sleep(1.0)
+
+    supported = [m for m, code, _ in results if code == 0]
+    print("-" * 40)
+    print(f"主控支持集合 = {supported or '(空)'}")
+    if not supported:
+        print("判定：主控不支持任意 mode 抢占，建议保留 Option A 默认（NUWAX_G1_REQUIRE_MOTION_SWITCHER=false）")
+    elif "advanced" in supported:
+        print("判定：主控支持 advanced，可考虑切换 Option B（env NUWAX_G1_REQUIRE_MOTION_SWITCHER=true）")
+    else:
+        print("判定：主控支持部分 mode 但不含 advanced，建议保留 Option A 默认")
 
 
 if __name__ == "__main__":

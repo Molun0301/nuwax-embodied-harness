@@ -83,6 +83,9 @@ class G1RobotAssembly(RobotAssemblyBase):
         self.arm_controller: Optional[ArmController] = None
         self.high_level_initialized: bool = False
         self.current_mode: str = "unknown"  # "loco" / "low" / "unknown"
+        # 修复 openspec/changes/fix-g1-loco-init-no-motion-switcher：
+        # 优雅降级缓存 last_error，get_status() 透出便于 dashboard 红色告警
+        self._last_error: str = ""
         # 装配状态互斥锁
         self._lock = threading.RLock()
         # Provider bundle（按 Go2 范式：assembly 注入 bundle）
@@ -112,7 +115,16 @@ class G1RobotAssembly(RobotAssemblyBase):
     def _create_loco_controller(self) -> LocoController:
         if self.loco_controller_factory is not None:
             return self.loco_controller_factory()
-        return LocoController(iface=self._resolved_dds_iface(), client_timeout_sec=DEFAULT_CLIENT_TIMEOUT_SEC)
+        # 修复（D2）：env NUWAX_G1_REQUIRE_MOTION_SWITCHER=true 时透传 acquire_motion_mode_on_init=True
+        # 拼装为 env 读取（与 [[config-layering-and-env-mechanics]] 重启生效语义一致）
+        acquire_motion_mode_on_init = str(
+            os.environ.get("NUWAX_G1_REQUIRE_MOTION_SWITCHER", "false")
+        ).strip().lower() in ("true", "1", "yes")
+        return LocoController(
+            iface=self._resolved_dds_iface(),
+            client_timeout_sec=DEFAULT_CLIENT_TIMEOUT_SEC,
+            acquire_motion_mode_on_init=acquire_motion_mode_on_init,
+        )
 
     def _create_arm_controller(self) -> ArmController:
         if self.arm_controller_factory is not None:
@@ -122,23 +134,36 @@ class G1RobotAssembly(RobotAssemblyBase):
     # ------------------ 生命周期 ------------------
 
     def start(self) -> None:
-        """启动 G1 装配：初始化 LocoController + ArmController + adapters。"""
+        """启动 G1 装配：初始化 LocoController + ArmController + adapters。
+
+        修复 openspec/changes/fix-g1-loco-init-no-motion-switcher (D3 优雅降级)：
+        LocoController.init 失败时 LOGGER.error + 缓存 last_error，不再 raise RuntimeError。
+        网关可继续跑通；dashboard 通过 get_status().last_error 渲染红色告警条。
+        """
         with self._lock:
             if self.high_level_initialized:
                 LOGGER.info("G1 装配已启动，跳过。")
                 return
             LOGGER.info("启动 G1 装配（iface=%s）...", self._resolved_dds_iface() or "default")
-            # 1. LocoController（内部会触发 motion_switcher 自动抢占 advanced）
+            self._last_error = ""
+            # 1. LocoController（D3 优雅降级：失败 LOGGER.error 不 raise）
             try:
                 self.loco_controller = self._create_loco_controller()
                 if not self.loco_controller.init():
-                    raise RuntimeError("LocoController.init() 返 False")
+                    err_msg = getattr(self.loco_controller, "_init_last_error", "") or "LocoController.init() 返 False"
+                    LOGGER.error("LocoController 启动失败: %s（优雅降级，gateway 继续跑通）", err_msg)
+                    self._last_error = f"loco_init_failed: {err_msg}"
+                    self.loco_controller = None
+                    self.high_level_initialized = False
+                    self.current_mode = "unknown"
+                    return
             except Exception as exc:
-                LOGGER.error("LocoController 启动失败: %s", exc)
+                LOGGER.error("LocoController 启动异常: %s（优雅降级）", exc)
+                self._last_error = f"loco_init_exception: {type(exc).__name__}: {exc}"
                 self.loco_controller = None
                 self.high_level_initialized = False
                 self.current_mode = "unknown"
-                raise
+                return
             # 2. ArmController（失败仅警告，不阻塞运动）
             try:
                 self.arm_controller = self._create_arm_controller()
@@ -194,6 +219,7 @@ class G1RobotAssembly(RobotAssemblyBase):
             low_level_running=False,
             adapter_count=len(adapter_statuses),
             healthy_adapter_count=sum(1 for status in adapter_statuses if status.is_healthy),
+            last_error=self._last_error,  # 修复（D3）：暴露优雅降级失败原因
         )
 
     # ------------------ 端侧 MCP 分发入口（private_capabilities 的 dispatch="execute_action" 落点） ------------------

@@ -42,6 +42,8 @@ DEFAULT_MAX_RELEASE_ROUNDS = 10
 DEFAULT_RELEASE_INTERVAL_SEC = 1.0
 # acquire_high_level 复核等待时间
 DEFAULT_ACQUIRE_CONFIRM_SEC = 0.5
+# 修复 D9：SelectMode 返 7002 BUSY 时最大重试次数（实机 2026-06-30 14:11:41 教训）
+DEFAULT_SELECT_MODE_BUSY_RETRIES = 3
 
 
 class MotionSwitcherController:
@@ -206,14 +208,33 @@ class MotionSwitcherController:
                 current_name,
             )
             self._release_until_empty()
-        try:
-            ret_code, _ = self.ms_client.SelectMode(target)
-        except Exception as exc:
-            LOGGER.error("MotionSwitcher SelectMode(%s) 抛错: %s", target, exc)
-            return (-1, current_name, f"SelectMode 抛错: {exc}")
+
+        # 修复 D9：SelectMode 返 7002 UT_SWITCH_ERR_BUSY 时等 1s 重试，最多 3 次
+        # 实机 2026-06-30 14:11:41 教训：主控刚从 ai 占主释放，SelectMode 立刻进 BUSY 状态；
+        # 等 1s 让主控 fsm 切换完成后再试，3 次后仍 BUSY 才是真异常。
+        ret_code = None
+        for retry_round in range(DEFAULT_SELECT_MODE_BUSY_RETRIES):
+            try:
+                ret_code, _ = self.ms_client.SelectMode(target)
+            except Exception as exc:
+                LOGGER.error("MotionSwitcher SelectMode(%s) 抛错: %s", target, exc)
+                return (-1, current_name, f"SelectMode 抛错: {exc}")
+            if ret_code == 0:
+                break
+            # 7002 BUSY 重试；其他错误（7004 NAME/7001 PARAMETER 等）立即退出
+            if ret_code == 7002 and retry_round < DEFAULT_SELECT_MODE_BUSY_RETRIES - 1:
+                LOGGER.warning(
+                    "MotionSwitcher SelectMode(%s) 返 BUSY(7002)，第 %d/%d 次重试前等 1s",
+                    target, retry_round + 1, DEFAULT_SELECT_MODE_BUSY_RETRIES,
+                )
+                time.sleep(1.0)
+                continue
+            return (int(ret_code) if ret_code is not None else -1, current_name,
+                    f"SelectMode({target}) 失败 code={ret_code}")
+
         if ret_code != 0:
             return (int(ret_code) if ret_code is not None else -1, current_name,
-                    f"SelectMode({target}) 失败")
+                    f"SelectMode({target}) 失败 code={ret_code}")
         # 等一小段时间后复核（主控 fsm 切换有 ms 级延迟）
         time.sleep(DEFAULT_ACQUIRE_CONFIRM_SEC)
         confirm_code, confirm_name, _ = self.check_mode()

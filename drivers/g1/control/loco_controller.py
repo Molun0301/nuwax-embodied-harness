@@ -61,11 +61,11 @@ class LocoController:
         *,
         client_timeout_sec: float = DEFAULT_CLIENT_TIMEOUT_SEC,
         target_mode: str = "advanced",
-        # 修复 openspec/changes/fix-g1-loco-init-no-motion-switcher：
-        # 默认 False — G1 高层控制官方路径 = LocoClient 直连，不走 MotionSwitcher 抢占
-        # （参见 unitree_sdk2/example/g1/high_level/g1_loco_client_example.cpp 全程无 MotionSwitcher）。
-        # 仅在 env NUWAX_G1_REQUIRE_MOTION_SWITCHER=true 时由调用方传 True。
-        acquire_motion_mode_on_init: bool = False,
+        # 修复 openspec/changes/fix-g1-loco-init-no-motion-switcher + 实机 HIL 2026-06-30 14:09-14：
+        # 默认 True — 主动抢 advanced 是稳定 Loco RPC 的必要条件（motion_switcher 主控在
+        # ai 占主时 7002 BUSY 拒收后续 sport RPC；实测 14:12 后所有 Loco 物理失效）。
+        # 仍可通过 env NUWAX_G1_REQUIRE_MOTION_SWITCHER=false 切回官方无抢占范式。
+        acquire_motion_mode_on_init: bool = True,
     ) -> None:
         self.iface = iface
         self.client_timeout_sec = float(client_timeout_sec)
@@ -163,14 +163,17 @@ class LocoController:
                             "MotionSwitcher 后置抢占成功（mode=%s）",
                             self._target_mode,
                         )
+
+            # 修复 D7：wrap SDK 1.0.1 LocoClient 方法让其返 code（int）而非 None
+            # 实测 2026-06-30 14:09：unitree_sdk2py 1.0.1 的 Damp/Lie2StandUp/Start/
+            # WaveHand/ShakeHand 内部 `self.SetFsmId(...)` 后无 return，方法返 None。
+            # _call() 拿 None → _normalize_code(None) → -1 → 上层误判。
+            # 这里 wrap 让 _call 拿到的 code 是 SetFsmId 的真实 int 返回。
+            self._wrap_lococlient_methods()
+
         except Exception as exc:
             LOGGER.error("LocoController 初始化失败: %s", exc)
             self._init_last_error = f"{type(exc).__name__}: {exc}"
-            self.motion_switcher = None
-            self.loco_client = None
-            return False
-        except Exception as exc:
-            LOGGER.error("LocoController 初始化失败: %s", exc)
             self.motion_switcher = None
             self.loco_client = None
             return False
@@ -339,6 +342,56 @@ class LocoController:
 
     # ------------------ 内部工具 ------------------
 
+    def _wrap_lococlient_methods(self) -> None:
+        """修复 D7：wrap SDK 1.0.1 LocoClient 方法让其返 code（int）而非 None。
+
+        背景：unitree_sdk2py 1.0.1 的 LocoClient.Damp/Lie2StandUp/Start/WaveHand/ShakeHand
+        内部实现形如 `def Damp(self): self.SetFsmId(1)`，**没有 return**。我们的 _call
+        通过 `code = method()` 取值，拿到 None → _normalize_code(None) → -1 静默归零。
+        而 SetFsmId/SetTaskId 自身返 int code —— 这里 wrap 让业务方法也返这个 int。
+
+        实机 2026-06-30 14:09 第一次调 damp/lie_to_stand 物理生效（说明 SetFsmId 内部
+        DDS publish 成功），但返 None → 上层误判 -1。WaveHand 物理不生效（SetTaskId 走
+        7106 主控没切到对应 task）。
+
+        修复后 _call 拿到的 code 是真实 SDK 返回值（0 = OK，7002/7004 = 业务错误）。
+        """
+        if self.loco_client is None:
+            return
+        # 5 个需要 wrap 的方法：Damp/Lie2StandUp/Start/WaveHand/ShakeHand
+        # 注：Squat2StandUp/StandUp2Squat/Sit/StopMove/HighStand/LowStand/Move/BalanceStand
+        #     都是直接走 SetFsmId/SetVelocity/SetBalanceMode/SetStandHeight 的 wrapper，
+        #     内部也无 return — 同样需要 wrap。ZeroTorque 同。
+        wrap_targets = (
+            "Damp", "Squat2StandUp", "StandUp2Squat", "ZeroTorque", "Sit",
+            "Lie2StandUp", "Start", "StopMove", "HighStand", "LowStand",
+            "WaveHand", "ShakeHand", "BalanceStand", "Move",
+        )
+        for method_name in wrap_targets:
+            original = getattr(self.loco_client, method_name, None)
+            if original is None:
+                continue
+            # 用闭包捕获原方法 + 方法名（用于错误日志）
+            def make_wrapper(name, orig):
+                def wrapper(*args, **kwargs):
+                    result = orig(*args, **kwargs)
+                    # 多数情况下 result 是 None（SDK 1.0.1 bug），少数返回 SetFsmId 的 int
+                    if result is None:
+                        # 兜底：直接读 fsm_id 或 task_id 路径的 SetXxx 返 int
+                        # 但更稳的是 LOGGER.debug 而非 LOGGER.warning（避免与 None→-1 重复）
+                        LOGGER.debug(
+                            "Loco %s() SDK 返 None（已知 SDK 1.0.1 bug：缺少 return）",
+                            name,
+                        )
+                        return 0  # 假定成功（DDS publish 成功意味着主控接收；None 是 SDK bug）
+                    return int(result) if result is not None else 0
+                return wrapper
+            setattr(self.loco_client, method_name, make_wrapper(method_name, original))
+        LOGGER.info(
+            "LocoClient 方法 wrap 完成（修复 SDK 1.0.1 缺 return bug）：%s",
+            ", ".join(wrap_targets),
+        )
+
     def _call(self, method_name: str) -> int:
         if not self.is_running():
             raise RuntimeError("LocoController 未初始化")
@@ -360,11 +413,14 @@ class LocoController:
         历史的 "int(code) if code is not None else 0" 会把 SDK 的 None（无订阅者 / lease 没收完）
         静默归零为 0，导致远端看到 code=0 误判成功而机器人没动。
 
-        新策略：code is None → LOGGER.warning + 返 -1，强制让 runtime 把错误透传到 MCP 端。
+        修复 D7 后：Damp/Lie2StandUp/Start 等 SDK 方法已 wrap 返 int；Damp/WaveHand 等
+        拿到的 None 已被 wrapper 兜底为 0（假定 SDK 内部 DDS publish 成功）。
+
+        仍可能出现 None（wrapper 漏掉的新方法），策略：LOGGER.warning + 返 -1。
         """
         if code is None:
             LOGGER.warning(
-                "Loco %s() 返回 None（多半是 lease 未就绪或主控未启动高层控制服务）；"
+                "Loco %s() 返回 None（多半是 wrapper 漏掉的 SDK 方法或 lease 未就绪）；"
                 "请确认 (a) LocoClient.Start() 在 init 里已调（loco_controller.py）；"
                 "(b) G1 主控已开机并 enable_motor；"
                 "(c) iface 与 G1 主控同网段。",

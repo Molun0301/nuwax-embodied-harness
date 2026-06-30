@@ -1,6 +1,6 @@
 """G1 底盘运动控制器（封装 LocoClient）。
 
-10 个高层方法 + 1 个流式状态订阅入口。
+G1 底盘 / 姿态 Loco 方法 + 1 个流式状态订阅入口。
 SportsModeState_ 实测在 unitree_sdk2py.idl.unitree_go.msg.dds_._SportModeState_（**不是** unitree_hg）。
 
 设计要点：
@@ -124,12 +124,10 @@ class LocoController:
             self.loco_client.SetTimeout(self.client_timeout_sec)
             self.loco_client.Init()
             # 拿 lease（必须！）：Init() 仅注册 RPC handler，必须 Start() 让主控完成 fsm 切换才能 RPC。
-            # 不调 Start() → WaveHand 等高层命令会 publish 到 rt/loco/wave_hand 但主控没 lease 上下文，
-            # SDK 内部同步阻塞 → timeout → 静默返 None → 调用方把 None 归零误判成功。
             self.loco_client.Start()
             LOGGER.info(
                 "LocoClient 直连 Init+Start 完成（iface=%s, timeout=%.1fs）；"
-                "wave_hand 等高层命令可走通",
+                "底盘 / 姿态 Loco 命令可走通",
                 self.iface or "default", self.client_timeout_sec,
             )
 
@@ -165,8 +163,8 @@ class LocoController:
                         )
 
             # 修复 D7：wrap SDK 1.0.1 LocoClient 方法让其返 code（int）而非 None
-            # 实测 2026-06-30 14:09：unitree_sdk2py 1.0.1 的 Damp/Lie2StandUp/Start/
-            # WaveHand/ShakeHand 内部 `self.SetFsmId(...)` 后无 return，方法返 None。
+            # 实测 2026-06-30 14:09：unitree_sdk2py 1.0.1 的 Damp/Lie2StandUp/Start
+            # 等方法内部 `self.SetFsmId(...)` 后无 return，方法返 None。
             # _call() 拿 None → _normalize_code(None) → -1 → 上层误判。
             # 这里 wrap 让 _call 拿到的 code 是 SetFsmId 的真实 int 返回。
             self._wrap_lococlient_methods()
@@ -243,7 +241,7 @@ class LocoController:
     def is_running(self) -> bool:
         return self.is_initialized and self.loco_client is not None
 
-    # ------------------ 高层命令（10 个 LocoPrimitive / G1Specific） ------------------
+    # ------------------ 高层命令（LocoPrimitive / 姿态类 G1Specific） ------------------
 
     def damp(self) -> int:
         """进入阻尼模式（所有电机松力）。"""
@@ -278,12 +276,18 @@ class LocoController:
         return self._normalize_code("Move", code)
 
     def wave_hand(self) -> int:
-        """招手动作（不转身）。"""
-        return self._call("WaveHand")
+        """已废弃：G1 挥手属于 ArmAction 服务，不属于 LocoClient。"""
+        raise RuntimeError(
+            "G1 挥手必须走 ArmController.execute_preset_action('face wave') "
+            "或 g1_wave_hand capability（官方 ArmAction ID 25）。"
+        )
 
     def shake_hand(self) -> int:
-        """握手动作（转身伸手）。"""
-        return self._call("ShakeHand")
+        """已废弃：G1 握手属于 ArmAction 服务，不属于 LocoClient。"""
+        raise RuntimeError(
+            "G1 握手必须走 ArmController.execute_preset_action('shake hand') "
+            "或 g1_shake_hand capability（官方 ArmAction ID 27，随后 release arm ID 99）。"
+        )
 
     def lie_to_stand(self) -> int:
         """从躺姿到站立。"""
@@ -345,27 +349,27 @@ class LocoController:
     def _wrap_lococlient_methods(self) -> None:
         """修复 D7：wrap SDK 1.0.1 LocoClient 方法让其返 code（int）而非 None。
 
-        背景：unitree_sdk2py 1.0.1 的 LocoClient.Damp/Lie2StandUp/Start/WaveHand/ShakeHand
+        背景：unitree_sdk2py 1.0.1 的 LocoClient.Damp/Lie2StandUp/Start 等方法
         内部实现形如 `def Damp(self): self.SetFsmId(1)`，**没有 return**。我们的 _call
         通过 `code = method()` 取值，拿到 None → _normalize_code(None) → -1 静默归零。
         而 SetFsmId/SetTaskId 自身返 int code —— 这里 wrap 让业务方法也返这个 int。
 
         实机 2026-06-30 14:09 第一次调 damp/lie_to_stand 物理生效（说明 SetFsmId 内部
-        DDS publish 成功），但返 None → 上层误判 -1。WaveHand 物理不生效（SetTaskId 走
-        7106 主控没切到对应 task）。
+        DDS publish 成功），但返 None → 上层误判 -1。挥手/握手经官方复核后应走
+        ArmAction 服务，不能再在这里 wrap 或调用 LocoClient.WaveHand/ShakeHand。
 
         修复后 _call 拿到的 code 是真实 SDK 返回值（0 = OK，7002/7004 = 业务错误）。
         """
         if self.loco_client is None:
             return
-        # 5 个需要 wrap 的方法：Damp/Lie2StandUp/Start/WaveHand/ShakeHand
+        # 需要 wrap 的 Loco/FSM 方法。
         # 注：Squat2StandUp/StandUp2Squat/Sit/StopMove/HighStand/LowStand/Move/BalanceStand
         #     都是直接走 SetFsmId/SetVelocity/SetBalanceMode/SetStandHeight 的 wrapper，
         #     内部也无 return — 同样需要 wrap。ZeroTorque 同。
         wrap_targets = (
             "Damp", "Squat2StandUp", "StandUp2Squat", "ZeroTorque", "Sit",
             "Lie2StandUp", "Start", "StopMove", "HighStand", "LowStand",
-            "WaveHand", "ShakeHand", "BalanceStand", "Move",
+            "BalanceStand", "Move",
         )
         for method_name in wrap_targets:
             original = getattr(self.loco_client, method_name, None)

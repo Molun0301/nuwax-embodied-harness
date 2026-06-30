@@ -209,37 +209,47 @@ G1_HIGH_STAND = _descriptor(
 G1_WAVE_HAND = _descriptor(
     name="g1_wave_hand",
     display_name="G1 招手",
-    description="G1 招手动作（不转身）。",
+    description="通过 G1 ArmAction 服务执行胸前挥手（face wave，官方预置动作 ID 25）。",
     risk_level=CapabilityRiskLevel.LOW,
     timeout_sec=10,
-    tags=("motion", "g1_specific"),
+    tags=("arm", "g1_specific", "interactive"),
 )
 
 G1_SHAKE_HAND = _descriptor(
     name="g1_shake_hand",
     display_name="G1 握手",
-    description="G1 握手动作（转身伸手）。",
+    description="通过 G1 ArmAction 服务执行握手（shake hand，官方预置动作 ID 27），随后恢复初始手臂位姿（ID 99）。",
     risk_level=CapabilityRiskLevel.LOW,
     timeout_sec=10,
-    tags=("motion", "g1_specific"),
+    tags=("arm", "g1_specific", "interactive"),
 )
 
 G1_ARM_ACTION = _descriptor(
     name="g1_arm_action",
     display_name="G1 手臂动作",
-    description="G1 手臂 Action 序列（透传 SDK action_seq）。",
+    description="G1 ArmAction 官方 RPC：按 action_id 执行预置动作，或按 action_name 执行预置/示教动作。",
     risk_level=CapabilityRiskLevel.MEDIUM,
     timeout_sec=15,
     input_schema={
         "type": "object",
         "properties": {
-            "action_seq": {
-                "type": "array",
-                "items": {"type": "object"},
-                "description": "G1 SDK arm action 序列（每项为 SDK action dict 或数字 sequence_id）",
-            }
+            "action_id": {
+                "type": "integer",
+                "description": "宇树固件预置 ArmAction ID，例如 25=胸前挥手，26=高举挥手，27=握手，99=恢复手臂。",
+            },
+            "action_name": {
+                "type": "string",
+                "description": "动作名；可为 SDK action_map 名称（如 face wave / high wave / shake hand）或 App 示教动作名。",
+            },
+            "release_after_sec": {
+                "type": "number",
+                "description": "可选：动作成功后等待该秒数再执行 release arm(ID 99)。",
+            },
         },
-        "required": ["action_seq"],
+        "oneOf": [
+            {"required": ["action_id"]},
+            {"required": ["action_name"]},
+        ],
     },
     tags=("arm", "g1_specific"),
 )

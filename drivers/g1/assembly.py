@@ -13,6 +13,7 @@ import logging
 import threading
 from dataclasses import dataclass
 import os
+import time
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from adapters.base import AdapterConfig
@@ -38,7 +39,7 @@ DEFAULT_CLIENT_TIMEOUT_SEC = 10.0
 
 # G1 私有能力 → LocoController 无参方法名映射（与 drivers/g1/private_capabilities.py
 # 的 ROBOT_PRIVATE_CAPABILITY_SPECS 严格对齐；LocoController 上的同名方法是这层契约的
-# 真值源）。9 个 one_shot Loco 动作均不接 params。
+# 真值源）。挥手 / 握手不是 Loco/FSM 动作，必须走 ArmAction 服务。
 _G1_LOCO_NO_PARAM_ACTIONS: Dict[str, str] = {
     "g1_damp": "damp",
     "g1_squat_to_stand": "squat_to_stand",
@@ -47,13 +48,20 @@ _G1_LOCO_NO_PARAM_ACTIONS: Dict[str, str] = {
     "g1_lie_to_stand": "lie_to_stand",
     "g1_low_stand": "low_stand",
     "g1_high_stand": "high_stand",
-    "g1_wave_hand": "wave_hand",
-    "g1_shake_hand": "shake_hand",
+}
+
+# G1 互动手臂动作 → ArmAction action_map 名称。
+# 官方 Arm Action 文档：胸前挥手=25，高举挥手=26，握手=27，恢复初始手臂位姿=99；
+# Python 官方示例对 shake hand 执行后 sleep(2) 再 release arm。
+_G1_ARM_PRESET_ACTIONS: Dict[str, Dict[str, Any]] = {
+    "g1_wave_hand": {"action_name": "face wave", "release_after_sec": None},
+    "g1_shake_hand": {"action_name": "shake hand", "release_after_sec": 2.0},
 }
 
 # G1 私有能力集合（用于错误信息提示，不参与路由）。
 _G1_KNOWN_ACTIONS: frozenset[str] = frozenset(
     list(_G1_LOCO_NO_PARAM_ACTIONS.keys())
+    + list(_G1_ARM_PRESET_ACTIONS.keys())
     + [
         "g1_move", "g1_arm_action", "g1_play_audio", "g1_get_state",
         # MotionSwitcher 4 个（2026-06-30 实机新增：修高层动作 code=None 根因）
@@ -231,12 +239,12 @@ class G1RobotAssembly(RobotAssemblyBase):
     ) -> Tuple[Optional[int], Any]:
         """G1 入口动作分发（被 runtime._build_private_capability_handler 调用）。
 
-        路由表（13 个 g1.* capability 与 drivers/g1/private_capabilities.py 一一对齐）：
+        路由表（17 个 g1.* capability 与 drivers/g1/private_capabilities.py 一一对齐）：
         - LocoPrimitive（5，无参）：g1_damp / g1_squat_to_stand / g1_stand_to_squat /
           g1_zero_torque / g1_lie_to_stand → LocoController 同名方法
-        - G1Specific（4，无参）：g1_low_stand / g1_high_stand / g1_wave_hand / g1_shake_hand →
-          LocoController 同名方法
-        - G1Specific（1，带参）：g1_arm_action → ArmController.execute_action(action_seq)
+        - G1Specific：g1_low_stand / g1_high_stand → LocoController 同名方法
+        - G1Specific：g1_wave_hand / g1_shake_hand → ArmController.execute_preset_action(...)
+        - G1Specific（带参）：g1_arm_action → ArmController.execute_action(action_id/action_name)
         - Generic：g1_move(vx, vy, vyaw) → LocoController.move；g1_get_state → provider 快照；
           g1_play_audio → 暂留占位（未接 AudioClient）
 
@@ -251,7 +259,7 @@ class G1RobotAssembly(RobotAssemblyBase):
             if not self.high_level_initialized:
                 return (-1, "G1 装配未启动，请先调用 start()。")
 
-            # 1) Loco 一档（9 个无参 one_shot）
+            # 1) Loco 一档（7 个无参 one_shot，不含挥手/握手）
             method_name = _G1_LOCO_NO_PARAM_ACTIONS.get(action)
             if method_name is not None:
                 loco = self.loco_controller
@@ -264,7 +272,23 @@ class G1RobotAssembly(RobotAssemblyBase):
                     LOGGER.error("G1 action=%s 抛错: %s", action, exc)
                     return (-1, f"{action} 执行失败: {exc}")
 
-            # 2) 持续移动（streaming）
+            # 2) 官方 ArmAction 预置互动动作（挥手 / 握手等）
+            preset = _G1_ARM_PRESET_ACTIONS.get(action)
+            if preset is not None:
+                arm = self.arm_controller
+                if arm is None or not arm.is_running():
+                    return (-1, f"ArmController 未初始化，无法执行 {action}。")
+                try:
+                    code = arm.execute_preset_action(
+                        str(preset["action_name"]),
+                        release_after_sec=preset.get("release_after_sec"),
+                    )
+                    return (int(code) if code is not None else 0, None)
+                except Exception as exc:
+                    LOGGER.error("G1 arm preset action=%s 抛错: %s", action, exc)
+                    return (-1, f"{action} 执行失败: {exc}")
+
+            # 3) 持续移动（streaming）
             if action == "g1_move":
                 loco = self.loco_controller
                 if loco is None or not loco.is_running():
@@ -280,24 +304,41 @@ class G1RobotAssembly(RobotAssemblyBase):
                     LOGGER.error("G1 g1_move 抛错: %s", exc)
                     return (-1, f"g1_move 执行失败: {exc}")
 
-            # 3) 手臂动作（透传 action_seq）
+            # 4) 手臂动作（官方 action_id / action_name）
             if action == "g1_arm_action":
                 arm = self.arm_controller
                 if arm is None or not arm.is_running():
                     return (-1, "ArmController 未初始化，无法执行 g1_arm_action。")
-                action_seq = params.get("action_seq")
-                if action_seq is None:
-                    return (-1, "g1_arm_action 缺少必要参数: action_seq。")
-                if not isinstance(action_seq, (list, tuple)):
-                    return (-1, "g1_arm_action.action_seq 必须为 list/tuple 形态。")
+                arm_action: Any = params.get("action_id")
+                if arm_action is None:
+                    arm_action = params.get("action_name")
+                if arm_action is None and "action_seq" in params:
+                    action_seq = params.get("action_seq")
+                    if isinstance(action_seq, (list, tuple)) and len(action_seq) == 1:
+                        arm_action = action_seq[0]
+                    else:
+                        return (
+                            -1,
+                            "g1_arm_action 已按宇树官方 ArmAction 修正：请传 action_id(int) "
+                            "或 action_name(str)，不要传 action_seq 序列。",
+                        )
+                if arm_action is None:
+                    return (-1, "g1_arm_action 缺少必要参数: action_id 或 action_name。")
                 try:
-                    code = arm.execute_action(action_seq)
+                    code = arm.execute_action(arm_action)
+                    release_after_sec = params.get("release_after_sec")
+                    if code == 0 and release_after_sec is not None:
+                        seconds = float(release_after_sec)
+                        if seconds > 0:
+                            time.sleep(seconds)
+                        release_code = arm.execute_action("release arm")
+                        code = release_code
                     return (int(code) if code is not None else 0, None)
                 except Exception as exc:
                     LOGGER.error("G1 g1_arm_action 抛错: %s", exc)
                     return (-1, f"g1_arm_action 执行失败: {exc}")
 
-            # 4) 状态快照（同步，只读）
+            # 5) 状态快照（同步，只读）
             if action == "g1_get_state":
                 loco = self.loco_controller
                 ready = bool(loco is not None and loco.has_state_frame())
@@ -312,12 +353,12 @@ class G1RobotAssembly(RobotAssemblyBase):
                 }
                 return (0, snapshot)
 
-            # 5) MotionSwitcher 4 个（2026-06-30 新增：修高层动作 code=None 真实根因）
+            # 6) MotionSwitcher 4 个（2026-06-30 新增：修高层动作 code=None 真实根因）
             if action in ("g1_check_motion_mode", "g1_select_motion_mode",
                           "g1_release_motion_mode", "g1_acquire_high_level"):
                 return self._dispatch_motion_switcher(action, params)
 
-            # 6) 语音播放 — 暂留占位，待 AudioClient 接入
+            # 7) 语音播放 — 暂留占位，待 AudioClient 接入
             if action == "g1_play_audio":
                 wav_path = params.get("wav_path")
                 if not wav_path or not isinstance(wav_path, str):
@@ -325,7 +366,7 @@ class G1RobotAssembly(RobotAssemblyBase):
                 LOGGER.warning("g1_play_audio 本期未实装，wav_path=%s 已接收（待 AudioClient 接入）", wav_path)
                 return (-1, "g1_play_audio 本期未实装，请接入 G1ProviderBundle.AudioTTSProvider。")
 
-            # 6) 未识别 action
+            # 8) 未识别 action
             supported = ", ".join(sorted(_G1_KNOWN_ACTIONS))
             return (-1, f"G1 未实现的 action: {action}。当前支持: {supported}")
 

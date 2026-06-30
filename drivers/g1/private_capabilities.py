@@ -7,7 +7,8 @@
   灌进 `PrivateCapabilitySpec`；不再额外维护 spec 副本，避免 schema / risk_level 双写漂移。
 - action_name 与 spec.name 严格保持一致，这样 `dispatch="execute_action"`（默认值）
   会把 spec.name 直接作为 action 转发到 `G1RobotAssembly.execute_action`，
-  后续在 assembly.py 里按 action 名分发到 LocoController / ArmController。
+  后续在 assembly.py 里按 action 名分发到 LocoController / ArmController；挥手/握手按
+  宇树官方 ArmAction 服务执行，不再走 LocoClient.WaveHand/ShakeHand。
 - 三个不进 capability 的订阅方法（subscribe_sport_mode_state / subscribe_imu_state /
   subscribe_point_cloud）保持不进 specs，与 capabilities.py:subscribed_methods_not_in_capability 一致。
 """
@@ -49,13 +50,14 @@ _LOCO_PRIMITIVE_ACTIONS: tuple[str, ...] = (
     "g1_lie_to_stand",  # → LocoController.lie_to_stand
 )
 
-# G1Specific 组（5 个 one_shot）— 同上，LocoController 同名方法直通。
+# G1Specific 组（5 个 one_shot）— low/high stand 走 LocoController；
+# wave/shake/arm_action 走 ArmController 的官方 ExecuteAction(action_id/action_name)。
 _G1_SPECIFIC_ACTIONS: tuple[str, ...] = (
     "g1_low_stand",
     "g1_high_stand",
     "g1_wave_hand",
     "g1_shake_hand",
-    # g1_arm_action：见下，走 ArmController.execute_action(action_seq)
+    # g1_arm_action：见下，走 ArmController.execute_action(action_id/action_name)
 )
 
 # Generic 组（3 个）— 其中 g1_move 是 streaming，g1_play_audio / g1_get_state 走子控制器。

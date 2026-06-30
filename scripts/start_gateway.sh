@@ -879,8 +879,11 @@ if ! is_restart_enabled "${RESTART_POLICY}"; then
   wait_for_video_shm_frame &
   wait "${GATEWAY_PID}"
   exit_code="$?"
-  stop_video_streamer
+  # g1-rtabnav2-adapter v9 fix：主循环退出路径 stop 顺序与 stop_gateway() 对齐。
+  # 顺序：先停 ros_bridge（切断 geometry/perception 客户端调用）→ 再停 video_streamer。
+  # 反序会让 ros-bridge 先停 → gateway 重启窗口期 GetFrameTree 抛 UNAVAILABLE 刷日志。
   stop_ros_bridge
+  stop_video_streamer
   exit "${exit_code}"
 fi
 
@@ -902,6 +905,9 @@ while true; do
   wait_for_video_shm_frame &
   wait "${GATEWAY_PID}"
   exit_code="$?"
+  # g1-rtabnav2-adapter v9 fix：主循环 RESTART_ENABLED 退出路径补 stop_ros_bridge
+  # （原代码只调 stop_video_streamer 会导致 ros_bridge 残留）。
+  stop_ros_bridge
   stop_video_streamer
   GATEWAY_PID=""
   set -e

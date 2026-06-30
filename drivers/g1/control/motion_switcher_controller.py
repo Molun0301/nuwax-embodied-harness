@@ -101,20 +101,35 @@ class MotionSwitcherController:
 
         self.is_initialized = True
 
-        # 启动期自动抢占 advanced；失败仅警告，调用方后续可重试
+        # 启动期自动抢占 advanced；抛异常视为 hard fail，由调用方走补救。
+        # 任何 RPC 异常都不能被静默吞掉（实机 2026-06-30 教训：mode=ai 时 Release 抛错被吞了，
+        # 导致 LocoClient 后续 RPC 全部 code=None）。
         if self.acquire_on_init:
-            code, msg, current = self.acquire_high_level()
+            try:
+                code, current_name, msg = self.acquire_high_level()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error(
+                    "MotionSwitcher 启动期自动抢占抛异常（多半是 ReleaseMode 与 ai 模式冲突）：%s；"
+                    "请检查 G1 主控是否处于 ai 模式并人工切到 advanced 后再启动网关",
+                    exc,
+                )
+                self.is_initialized = False
+                self.ms_client = None
+                return False
             if code == 0:
                 LOGGER.info(
                     "MotionSwitcher 启动期自动抢占成功（mode=%s → %s）",
-                    current or "(空)", self.target_mode,
+                    current_name or "(空)", self.target_mode,
                 )
             else:
-                LOGGER.warning(
-                    "MotionSwitcher 启动期自动抢占失败 code=%s msg=%s current=%s；"
-                    "可稍后通过 g1_select_motion_mode 或 g1_acquire_high_level 重试",
-                    code, msg, current,
+                LOGGER.error(
+                    "MotionSwitcher 启动期自动抢占失败 code=%s current=%s msg=%s；"
+                    "hard fail — LocoController 不应继续 Init/Start，否则高层动作仍 code=None",
+                    code, current_name, msg,
                 )
+                self.is_initialized = False
+                self.ms_client = None
+                return False
         return True
 
     def stop(self) -> None:

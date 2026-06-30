@@ -81,7 +81,13 @@ class LocoController:
     # ------------------ 生命周期 ------------------
 
     def init(self) -> bool:
-        """初始化 LocoClient + 准备 SportModeState_ 订阅。"""
+        """初始化 LocoClient + 准备 SportModeState_ 订阅。
+
+        关键次序（实机 2026-06-30 教训，必须按以下顺序）：
+        1. MotionSwitcher 抢占 advanced — 必须先抢到，主控才接受 sport RPC
+        2. LocoClient.Init() + Start() — 此时才真正拿到 lease
+        任何次序颠倒都会导致 WaveHand / Lie2StandUp code=None。
+        """
 
         if self.is_initialized:
             LOGGER.warning("LocoController 已初始化")
@@ -95,27 +101,40 @@ class LocoController:
             else:
                 channel_factory_initialize(0)
 
-            loco_module = importlib.import_module("unitree_sdk2py.g1.loco.g1_loco_client")
-            LocoClient = getattr(loco_module, "LocoClient")
-            self.loco_client = LocoClient()
-            self.loco_client.SetTimeout(self.client_timeout_sec)
-            # 【修复 #1】先 motion_switcher 抢占 advanced；不抢占直接 Start() 主控静默丢 RPC（code=None）。
-            # 工厂失败不抛错（缺 SDK 时降级），调用方后续可走 g1_acquire_high_level 补救。
+            # 【修复 #1 + #2】先 motion_switcher 抢占 advanced；hard fail。
+            # 实机 2026-06-30 教训：主控当前 mode=ai 时若不抢占直接 Init/Start LocoClient，
+            # LocoClient.Start() "成功"（仅注册 RPC handler）但主控把 lease 给了 ai 进程，
+            # 所有 sport RPC 返 None。必须先抢到 advanced 再 Init/Start。
             if self._acquire_motion_mode_on_init:
                 self.motion_switcher = _build_motion_switcher_or_none(
                     self.iface, self._target_mode, acquire_on_init=True,
                 )
+                if self.motion_switcher is None:
+                    raise RuntimeError(
+                        "MotionSwitcherController 工厂返 None，无法保证 LocoClient 后续 RPC 可用。"
+                        "若单元测试场景可设 acquire_motion_mode_on_init=False 跳过。"
+                    )
+                # 工厂内部已 init + acquire；这里只做 sanity check
+                if not self.motion_switcher.is_running():
+                    raise RuntimeError("MotionSwitcherController 抢占后未 running，hard fail")
+
+            loco_module = importlib.import_module("unitree_sdk2py.g1.loco.g1_loco_client")
+            LocoClient = getattr(loco_module, "LocoClient")
+            self.loco_client = LocoClient()
+            self.loco_client.SetTimeout(self.client_timeout_sec)
             self.loco_client.Init()
             # 拿 lease（必须！）：Init() 仅注册 RPC handler，必须 Start() 让主控完成 fsm 切换才能 RPC。
             # 不调 Start() → WaveHand 等高层命令会 publish 到 rt/loco/wave_hand 但主控没 lease 上下文，
             # SDK 内部同步阻塞 → timeout → 静默返 None → 调用方把 None 归零误判成功。
             self.loco_client.Start()
             LOGGER.info(
-                "LocoClient.Start() 完成（lease 应已就绪，mode=%s，wave_hand 等高层命令可走通）",
+                "LocoClient.Start() 完成（lease 应已就绪，主控 mode=%s，wave_hand 等高层命令可走通）",
                 self._target_mode,
             )
         except Exception as exc:
-            LOGGER.error("LocoClient 初始化失败: %s", exc)
+            LOGGER.error("LocoController 初始化失败: %s", exc)
+            self.motion_switcher = None
+            self.loco_client = None
             return False
 
         # 准备 SportModeState_ idl（用于流式订阅）
@@ -130,7 +149,8 @@ class LocoController:
             LOGGER.warning("SportModeState_ idl 加载失败（不影响高层命令，仅影响 subscribe_sport_mode_state）: %s", exc)
 
         self.is_initialized = True
-        LOGGER.info("LocoController 初始化成功（iface=%s, timeout=%.1fs）", self.iface or "default", self.client_timeout_sec)
+        LOGGER.info("LocoController 初始化成功（iface=%s, timeout=%.1fs, mode=%s）",
+                    self.iface or "default", self.client_timeout_sec, self._target_mode)
         return True
 
     def stop(self) -> None:

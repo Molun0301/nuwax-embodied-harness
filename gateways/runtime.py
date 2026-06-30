@@ -610,8 +610,19 @@ class GatewayRuntime:
         # vis-three-fixes 任务 2.4/2.5：装配期预热 YOLO-World，把模型加载 + 首帧 warmup
         # 挪到启动期，消除探索 MCP 调用后的 5-10s 检测空窗。失败静默降级（不 raise），
         # _prewarm_done=False 时后续 start_perception_runtime 仍走兜底懒加载。
+        # g1-rtabnav2-adapter v9 fix：装配期同步 _run_yolo_prewarm() 会阻塞主进程 5-25s
+        # （cache miss 可达 120s），导致 v8 FATAL 5s 健康检查必中。改为 daemon 线程异步执行：
+        # - _prewarm_done 仍保留 idempotency 守卫语义（防重入）
+        # - _prewarm_event 承担"完成"信号（被 _manual_perception_start 用 event.wait 等待）
+        # - 两者不合并：合并会导致 GIL 释放期间 thread B 看到 _prewarm_done=True 但 prewarm 未完成
         self._prewarm_done = False
-        self._run_yolo_prewarm()
+        self._prewarm_event = threading.Event()
+        self._prewarm_thread = threading.Thread(
+            target=self._run_yolo_prewarm,
+            daemon=True,
+            name="yolo-prewarm",
+        )
+        self._prewarm_thread.start()
         self.navigation_service = NavigationService(
             provider_owner=self.platform_geometry_runtime,
             localization_service=self.localization_service,
@@ -4715,6 +4726,11 @@ class GatewayRuntime:
 
         只调一次（_prewarm_done 标志）；失败静默降级，绝不打断网关启动。
         预热结果写入 perception_video_runtime，get_perception_runtime_status 透传。
+
+        g1-rtabnav2-adapter v9 fix：
+        - _prewarm_done 在 try 块外（L4721）保留为 idempotency 守卫（防重入）
+        - _prewarm_event 在 finally 块承担"完成"信号语义
+        - 两者语义分离，不可合并
         """
         if getattr(self, "_prewarm_done", False):
             return
@@ -4730,6 +4746,12 @@ class GatewayRuntime:
         except Exception as exc:  # noqa: BLE001 — 预热失败不得影响网关启动。
             RUNTIME_LOGGER.warning("YOLO 预热调用异常，降级为懒加载：%s", exc)
             prewarm_status = {"status": "deferred", "reason": str(exc)}
+        finally:
+            # 完成信号：无论成功/失败/异常都 set，让 _manual_perception_start 的
+            # event.wait(timeout) 可以立刻返回而不是死等。
+            prewarm_event = getattr(self, "_prewarm_event", None)
+            if prewarm_event is not None:
+                prewarm_event.set()
         try:
             self.perception_video_runtime.set_prewarm_status(prewarm_status)
         except Exception:  # noqa: BLE001
@@ -4737,9 +4759,22 @@ class GatewayRuntime:
 
     def _manual_perception_start(self) -> Dict[str, Any]:
         """用户显式启动感知：解除探索耦合后启动。capability + HTTP 均走此入口。"""
-        # 任务 2.5：兜底——若装配期预热未完成（如失败或被跳过），首次手动启动前补一次。
-        if not getattr(self, "_prewarm_done", False):
-            self._run_yolo_prewarm()
+        # g1-rtabnav2-adapter v9 fix：用 event.wait(timeout) 取代"重跑"，消除双线程竞态。
+        # - 装配完成后 _prewarm_done 通常已 True（idempotency 守卫在 L4721 提前 set）
+        # - 但 prewarm 内部 backend.detect() 释放 GIL 期间，thread B 看到 True 但 prewarm 未真正完成
+        # - _prewarm_event 在 _run_yolo_prewarm 的 finally 块 set，承载"完成"语义
+        # - 默认等 120s；NUWAX_PREWARM_WAIT_TIMEOUT_SEC 环境变量可覆盖（Jetson cache miss 调大）
+        # - 极端兜底：wait 超时后仍未完成才走"重跑"路径（罕见，prewarm 线程死锁场景）
+        prewarm_event = getattr(self, "_prewarm_event", None)
+        if prewarm_event is not None and not prewarm_event.is_set():
+            wait_timeout = float(
+                os.environ.get("NUWAX_PREWARM_WAIT_TIMEOUT_SEC", "120")
+            )
+            prewarm_event.wait(timeout=wait_timeout)
+            if not getattr(self, "_prewarm_done", False):
+                # 120s 仍未完成（prewarm 线程死锁），兜底重跑。
+                # _run_yolo_prewarm 内部 idempotent：重入会被 L4719 idempotency 守卫吞掉。
+                self._run_yolo_prewarm()
         self._perception_exploration_coupled = False
         return self.perception_video_runtime.start()
 

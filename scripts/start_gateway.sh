@@ -106,7 +106,20 @@ wait_for_port_listen() {
   local timeout_sec="$2"
   local waited=0
   if ! command -v ss >/dev/null 2>&1; then
-    return 0
+    # g1-rtabnav2-adapter v9 fix：ss 缺失时 fallback /proc/net/tcp 解析。
+    # 注意：/proc/net/tcp 的端口字段是 16 进制（8766 = 2236），awk 用十进制字符串永远匹配不到。
+    # 必须用 printf '%04X' 把端口转 hex 后再匹配。
+    local port_hex
+    port_hex="$(printf '%04X' "${port}")"
+    while [[ "${waited}" -lt "${timeout_sec}" ]]; do
+      if awk -v hx="${port_hex}" '$2 ~ ":"hx"$" && $4 == "0A" {found=1; exit} END{exit !found}' \
+          /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+        return 0
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+    return 1
   fi
   while [[ "${waited}" -lt "${timeout_sec}" ]]; do
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)${port}$"; then
@@ -854,7 +867,7 @@ if ! is_restart_enabled "${RESTART_POLICY}"; then
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
   # v8 防护：uvicorn 5s 健康检查（监听 8766）
-  if ! wait_for_port_listen "${PORT}" 5; then
+  if ! wait_for_port_listen "${PORT}" ${NUWAX_GATEWAY_PORT_READY_TIMEOUT_SEC:-90}; then
     echo "[v8 FATAL] uvicorn gateway not listening on port ${PORT} after 5s; killing to prevent restart loop" >&2
     kill -TERM "${GATEWAY_PID}" 2>/dev/null || true
     exit 1
@@ -877,7 +890,7 @@ while true; do
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
   # v8 防护：uvicorn 5s 健康检查（监听 8766）
-  if ! wait_for_port_listen "${PORT}" 5; then
+  if ! wait_for_port_listen "${PORT}" ${NUWAX_GATEWAY_PORT_READY_TIMEOUT_SEC:-90}; then
     echo "[v8 FATAL] uvicorn gateway not listening on port ${PORT} after 5s; killing to prevent restart loop" >&2
     kill -TERM "${GATEWAY_PID}" 2>/dev/null || true
     exit 1

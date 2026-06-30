@@ -86,7 +86,7 @@ def _build_spec(capability_name: str) -> PrivateCapabilitySpec:
     )
 
 
-# 13 个 G1 私有能力一次性灌入；顺序按 capabilities.py 的三分组，方便后续 audit。
+# 17 个 G1 私有能力一次性灌入；顺序按 capabilities.py 的四分组，方便后续 audit。
 _G1_PRIVATE_SPECS: tuple[PrivateCapabilitySpec, ...] = (
     # LocoPrimitive（5）
     _build_spec("g1_damp"),
@@ -104,6 +104,11 @@ _G1_PRIVATE_SPECS: tuple[PrivateCapabilitySpec, ...] = (
     _build_spec("g1_move"),
     _build_spec("g1_play_audio"),
     _build_spec("g1_get_state"),
+    # MotionSwitcher（4，2026-06-30 新增：修高层动作 code=None 根因）
+    _build_spec("g1_check_motion_mode"),
+    _build_spec("g1_select_motion_mode"),
+    _build_spec("g1_release_motion_mode"),
+    _build_spec("g1_acquire_high_level"),
 )
 
 

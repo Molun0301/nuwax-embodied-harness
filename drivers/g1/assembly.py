@@ -12,12 +12,17 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
+import os
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from adapters.base import AdapterConfig
 from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
 from drivers.g1.control.loco_controller import LocoController
 from drivers.g1.control.arm_controller import ArmController
+from drivers.g1.control.motion_switcher_controller import (
+    MotionSwitcherController,
+    SUPPORTED_MODES,
+)
 from drivers.g1.defaults import build_g1_defaults
 from drivers.g1.manifest import build_g1_manifest
 from drivers.g1.providers import G1ProviderBundle
@@ -49,7 +54,12 @@ _G1_LOCO_NO_PARAM_ACTIONS: Dict[str, str] = {
 # G1 私有能力集合（用于错误信息提示，不参与路由）。
 _G1_KNOWN_ACTIONS: frozenset[str] = frozenset(
     list(_G1_LOCO_NO_PARAM_ACTIONS.keys())
-    + ["g1_move", "g1_arm_action", "g1_play_audio", "g1_get_state"]
+    + [
+        "g1_move", "g1_arm_action", "g1_play_audio", "g1_get_state",
+        # MotionSwitcher 4 个（2026-06-30 实机新增：修高层动作 code=None 根因）
+        "g1_check_motion_mode", "g1_select_motion_mode",
+        "g1_release_motion_mode", "g1_acquire_high_level",
+    ]
 )
 
 
@@ -78,15 +88,36 @@ class G1RobotAssembly(RobotAssemblyBase):
         # Provider bundle（按 Go2 范式：assembly 注入 bundle）
         self.providers = G1ProviderBundle(assembly=self)
 
+    def _resolved_dds_iface(self) -> Optional[str]:
+        """Resolve the DDS interface G1 control clients should bind to.
+
+        G1 deployments keep the device-side DDS interface in
+        ``G1_DATA_PLANE_DDS_IFACE`` (see drivers/g1/data_plane.env). The
+        platform-wide ``config.dds.iface`` is still accepted for explicit
+        overrides and backwards compatibility.
+        """
+
+        candidates = (
+            self.iface,
+            os.environ.get("G1_DATA_PLANE_DDS_IFACE"),
+            os.environ.get("G1_DDS_IFACE"),
+            getattr(getattr(self.config, "dds", None), "iface", ""),
+        )
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return None
+
     def _create_loco_controller(self) -> LocoController:
         if self.loco_controller_factory is not None:
             return self.loco_controller_factory()
-        return LocoController(iface=self.iface, client_timeout_sec=DEFAULT_CLIENT_TIMEOUT_SEC)
+        return LocoController(iface=self._resolved_dds_iface(), client_timeout_sec=DEFAULT_CLIENT_TIMEOUT_SEC)
 
     def _create_arm_controller(self) -> ArmController:
         if self.arm_controller_factory is not None:
             return self.arm_controller_factory()
-        return ArmController(iface=self.iface, client_timeout_sec=DEFAULT_CLIENT_TIMEOUT_SEC)
+        return ArmController(iface=self._resolved_dds_iface(), client_timeout_sec=DEFAULT_CLIENT_TIMEOUT_SEC)
 
     # ------------------ 生命周期 ------------------
 
@@ -96,8 +127,8 @@ class G1RobotAssembly(RobotAssemblyBase):
             if self.high_level_initialized:
                 LOGGER.info("G1 装配已启动，跳过。")
                 return
-            LOGGER.info("启动 G1 装配（iface=%s）...", self.iface or "default")
-            # 1. LocoController
+            LOGGER.info("启动 G1 装配（iface=%s）...", self._resolved_dds_iface() or "default")
+            # 1. LocoController（内部会触发 motion_switcher 自动抢占 advanced）
             try:
                 self.loco_controller = self._create_loco_controller()
                 if not self.loco_controller.init():
@@ -255,7 +286,12 @@ class G1RobotAssembly(RobotAssemblyBase):
                 }
                 return (0, snapshot)
 
-            # 5) 语音播放 — 暂留占位，待 AudioClient 接入
+            # 5) MotionSwitcher 4 个（2026-06-30 新增：修高层动作 code=None 真实根因）
+            if action in ("g1_check_motion_mode", "g1_select_motion_mode",
+                          "g1_release_motion_mode", "g1_acquire_high_level"):
+                return self._dispatch_motion_switcher(action, params)
+
+            # 6) 语音播放 — 暂留占位，待 AudioClient 接入
             if action == "g1_play_audio":
                 wav_path = params.get("wav_path")
                 if not wav_path or not isinstance(wav_path, str):
@@ -266,6 +302,57 @@ class G1RobotAssembly(RobotAssemblyBase):
             # 6) 未识别 action
             supported = ", ".join(sorted(_G1_KNOWN_ACTIONS))
             return (-1, f"G1 未实现的 action: {action}。当前支持: {supported}")
+
+    # ------------------ MotionSwitcher 分发（4 个 capability 共享） ------------------
+
+    def _resolve_motion_switcher(self) -> MotionSwitcherController:
+        """获取 motion_switcher 控制器：优先用 LocoController 注入的，缺失时惰性创建。"""
+        loco = self.loco_controller
+        if loco is None or not loco.is_running():
+            raise RuntimeError("LocoController 未运行，无法访问 MotionSwitcher。")
+        return loco.ensure_motion_switcher()
+
+    def _dispatch_motion_switcher(
+        self,
+        action: str,
+        params: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[int], Any]:
+        """g1_check_motion_mode / g1_select_motion_mode / g1_release_motion_mode / g1_acquire_high_level 分发。"""
+        params = params or {}
+        try:
+            ms = self._resolve_motion_switcher()
+        except Exception as exc:
+            LOGGER.error("MotionSwitcher 不可用: %s", exc)
+            return (-1, str(exc))
+
+        if action == "g1_check_motion_mode":
+            code, name, msg = ms.check_mode()
+            return (code, {
+                "name": name,
+                "is_high_level_owned": name == "advanced",
+                "supported_modes": list(SUPPORTED_MODES),
+                "target_mode": getattr(self.loco_controller, "_target_mode", "advanced"),
+                "message": msg,
+            })
+
+        if action == "g1_select_motion_mode":
+            target = params.get("name")
+            if not target or not isinstance(target, str):
+                return (-1, f"g1_select_motion_mode 缺少必要参数 name（{SUPPORTED_MODES}）。")
+            code, name, msg = ms.select_mode(target)
+            return (code, {"name": name, "target": target, "message": msg})
+
+        if action == "g1_release_motion_mode":
+            code, name, msg = ms.release_mode()
+            return (code, {"name": name, "message": msg})
+
+        if action == "g1_acquire_high_level":
+            target = params.get("name")
+            code, name, msg = ms.acquire_high_level(target)
+            return (code, {"name": name, "target": target or getattr(ms, "target_mode", "advanced"),
+                           "message": msg})
+
+        return (-1, f"MotionSwitcher 未实现的 action: {action}")
 
 
 def create_g1_assembly(

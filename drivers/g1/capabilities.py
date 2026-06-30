@@ -109,6 +109,94 @@ G1_LOW_STAND = _descriptor(
     tags=("loco", "g1_specific"),
 )
 
+# ------------------ MotionSwitcher 组（4 个，sync）— 2026-06-30 新增 ------------------
+# 修 G1 端高层动作 code=None 真实根因：LocoClient.Start() 不切 mode，必须先 MotionSwitcher 抢占 advanced。
+# 参考 unitree_sdk2_python/example/motionSwitcher/motion_switcher_example.py:30-33。
+
+G1_CHECK_MOTION_MODE = _descriptor(
+    name="g1_check_motion_mode",
+    display_name="G1 查询运动模式",
+    description="查询 G1 主控当前 motion_switcher 模式（ai / normal / advanced / ai-w / 空）。",
+    risk_level=CapabilityRiskLevel.LOW,
+    timeout_sec=5,
+    output_schema={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "当前模式；空字符串表示无人占主。"},
+            "is_high_level_owned": {"type": "boolean", "description": "当前是否处于 advanced 模式。"},
+            "supported_modes": {"type": "array", "description": "SDK 支持的 4 个 mode。"},
+            "target_mode": {"type": "string", "description": "本进程目标 mode（默认 advanced）。"},
+            "message": {"type": "string", "description": "错误或补充说明（成功时为空）。"},
+        },
+    },
+    tags=("motion_switcher", "system"),
+)
+
+G1_SELECT_MOTION_MODE = _descriptor(
+    name="g1_select_motion_mode",
+    display_name="G1 切换运动模式",
+    description="抢占目标 motion 模式（ai / normal / advanced / ai-w）；若已被别人占主返回 -1。",
+    risk_level=CapabilityRiskLevel.HIGH,
+    timeout_sec=10,
+    input_schema={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "enum": ["ai", "normal", "advanced", "ai-w"],
+                     "description": "目标 motion 模式。"},
+        },
+        "required": ["name"],
+    },
+    output_schema={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "target": {"type": "string"},
+            "message": {"type": "string"},
+        },
+    },
+    tags=("motion_switcher", "system"),
+)
+
+G1_RELEASE_MOTION_MODE = _descriptor(
+    name="g1_release_motion_mode",
+    display_name="G1 释放运动模式",
+    description="主动释放当前 motion 模式（让位给手柄 / AI / 其它进程）。",
+    risk_level=CapabilityRiskLevel.MEDIUM,
+    timeout_sec=5,
+    output_schema={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "释放后主控当前模式（通常为空）。"},
+            "message": {"type": "string"},
+        },
+    },
+    tags=("motion_switcher", "system"),
+)
+
+G1_ACQUIRE_HIGH_LEVEL = _descriptor(
+    name="g1_acquire_high_level",
+    display_name="G1 抢占高级 SDK 模式",
+    description="业务级封装：循环 Release 占主 → SelectMode(target) → 复核。默认 target=advanced。",
+    risk_level=CapabilityRiskLevel.HIGH,
+    timeout_sec=15,
+    input_schema={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "enum": ["ai", "normal", "advanced", "ai-w"],
+                     "description": "可选：目标 mode，默认 advanced。"},
+        },
+    },
+    output_schema={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "target": {"type": "string"},
+            "message": {"type": "string"},
+        },
+    },
+    tags=("motion_switcher", "system"),
+)
+
 G1_HIGH_STAND = _descriptor(
     name="g1_high_stand",
     display_name="G1 高姿态站立",
@@ -211,7 +299,7 @@ G1_GET_STATE = _descriptor(
     tags=("state", "sync"),
 )
 
-# ------------------ 13 capability 显式三分组汇总 ------------------
+# ------------------ 17 capability 显式四分组汇总 ------------------
 
 G1_CAPABILITY_DESCRIPTORS: List[CapabilityDescriptor] = [
     # LocoPrimitive（5）
@@ -230,6 +318,11 @@ G1_CAPABILITY_DESCRIPTORS: List[CapabilityDescriptor] = [
     G1_MOVE,
     G1_PLAY_AUDIO,
     G1_GET_STATE,
+    # MotionSwitcher（4，2026-06-30 新增：修高层动作 code=None 根因）
+    G1_CHECK_MOTION_MODE,
+    G1_SELECT_MOTION_MODE,
+    G1_RELEASE_MOTION_MODE,
+    G1_ACQUIRE_HIGH_LEVEL,
 ]
 
 G1_CAPABILITY_DESCRIPTORS_BY_NAME: Dict[str, CapabilityDescriptor] = {
@@ -250,6 +343,7 @@ G1_CAPABILITY_MATRIX = CapabilityMatrix(
             "LocoPrimitive": 5,
             "G1Specific": 5,
             "Generic": 3,
+            "MotionSwitcher": 4,
         },
         "subscribed_methods_not_in_capability": [
             "subscribe_sport_mode_state",

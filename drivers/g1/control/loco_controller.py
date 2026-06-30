@@ -26,6 +26,29 @@ DEFAULT_STATE_WAIT_TIMEOUT_SEC = 5.0
 DEFAULT_MOVE_FOR_INTERVAL_SEC = 0.5
 
 
+def _build_motion_switcher_or_none(iface: Optional[str], target_mode: str, acquire_on_init: bool):
+    """工厂函数：构造 MotionSwitcherController，依赖失败时返回 None（不阻塞 loco init）。
+
+    引入 motion_switcher 是修高层动作 code=None 的真实根因（实机 2026-06-30 反馈）：
+    LocoClient.Start() 仅 SetFsmId(200) 不切 mode，必须先 MotionSwitcherClient 抢占 advanced。
+    若 SDK 没装或模块缺失，warn 后继续，调用方后续可通过 g1_select_motion_mode 补救。
+    """
+    try:
+        from drivers.g1.control.motion_switcher_controller import MotionSwitcherController
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("MotionSwitcherController 加载失败，高层动作需手动抢占 advanced: %s", exc)
+        return None
+    try:
+        return MotionSwitcherController(
+            iface=iface,
+            target_mode=target_mode,
+            acquire_on_init=acquire_on_init,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("MotionSwitcherController 构造失败: %s", exc)
+        return None
+
+
 class LocoController:
     """G1 底盘运动控制器。"""
 
@@ -34,11 +57,18 @@ class LocoController:
         iface: Optional[str] = None,
         *,
         client_timeout_sec: float = DEFAULT_CLIENT_TIMEOUT_SEC,
+        target_mode: str = "advanced",
+        acquire_motion_mode_on_init: bool = True,
     ) -> None:
         self.iface = iface
         self.client_timeout_sec = float(client_timeout_sec)
+        # 高层动作 code=None 真实根因修复：先 motion_switcher 抢占 advanced
+        self._target_mode = target_mode
+        self._acquire_motion_mode_on_init = bool(acquire_motion_mode_on_init)
         self.is_initialized = False
         self.loco_client: Any = None
+        # MotionSwitcher 控制器（依赖注入，缺 SDK 时为 None）
+        self.motion_switcher: Any = None
         # 流式状态订阅相关
         self._state_subscriber: Any = None
         self._state_callback: Optional[Callable[[Any], None]] = None
@@ -69,12 +99,21 @@ class LocoController:
             LocoClient = getattr(loco_module, "LocoClient")
             self.loco_client = LocoClient()
             self.loco_client.SetTimeout(self.client_timeout_sec)
+            # 【修复 #1】先 motion_switcher 抢占 advanced；不抢占直接 Start() 主控静默丢 RPC（code=None）。
+            # 工厂失败不抛错（缺 SDK 时降级），调用方后续可走 g1_acquire_high_level 补救。
+            if self._acquire_motion_mode_on_init:
+                self.motion_switcher = _build_motion_switcher_or_none(
+                    self.iface, self._target_mode, acquire_on_init=True,
+                )
             self.loco_client.Init()
             # 拿 lease（必须！）：Init() 仅注册 RPC handler，必须 Start() 让主控完成 fsm 切换才能 RPC。
             # 不调 Start() → WaveHand 等高层命令会 publish 到 rt/loco/wave_hand 但主控没 lease 上下文，
             # SDK 内部同步阻塞 → timeout → 静默返 None → 调用方把 None 归零误判成功。
             self.loco_client.Start()
-            LOGGER.info("LocoClient.Start() 完成（lease 应已就绪，wave_hand 等高层命令可走通）")
+            LOGGER.info(
+                "LocoClient.Start() 完成（lease 应已就绪，mode=%s，wave_hand 等高层命令可走通）",
+                self._target_mode,
+            )
         except Exception as exc:
             LOGGER.error("LocoClient 初始化失败: %s", exc)
             return False
@@ -103,11 +142,42 @@ class LocoController:
             self.damp()
         except Exception as exc:
             LOGGER.warning("停止时 Damp 失败: %s", exc)
+        # 优雅释放 MotionSwitcher 抢占（ReleaseMode 可能引发骤停，仅在配置显式开启时执行）
+        if self.motion_switcher is not None and getattr(self, "_release_on_stop", False):
+            try:
+                self.motion_switcher.release_mode()
+            except Exception as exc:
+                LOGGER.warning("停止时 MotionSwitcher Release 失败: %s", exc)
+            try:
+                self.motion_switcher.stop()
+            except Exception as exc:
+                LOGGER.warning("MotionSwitcherController 停止失败: %s", exc)
+            self.motion_switcher = None
         self._state_subscriber = None
         self._state_callback = None
         self.loco_client = None
         self.is_initialized = False
         LOGGER.info("LocoController 已停止。")
+
+    # ------------------ MotionSwitcher 透传（供 capability g1_select_motion_mode 等调用） ------------------
+
+    def ensure_motion_switcher(self) -> Any:
+        """惰性创建 motion_switcher 控制器（若 init 时未创建）。
+
+        用于 g1_select_motion_mode / g1_release_motion_mode / g1_acquire_high_level 等 MCP 能力
+        在 loco 已 init 但 motion_switcher 因 SDK 缺失未创建时的兜底。
+        """
+        if self.motion_switcher is not None and self.motion_switcher.is_running():
+            return self.motion_switcher
+        self.motion_switcher = _build_motion_switcher_or_none(
+            self.iface, self._target_mode, acquire_on_init=False,
+        )
+        if self.motion_switcher is None:
+            raise RuntimeError("MotionSwitcherController 创建失败，请检查 unitree_sdk2py 安装")
+        if not self.motion_switcher.init():
+            self.motion_switcher = None
+            raise RuntimeError("MotionSwitcherController.init() 返 False")
+        return self.motion_switcher
 
     def is_running(self) -> bool:
         return self.is_initialized and self.loco_client is not None

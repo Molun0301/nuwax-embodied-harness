@@ -4,7 +4,7 @@
 # 复制到 /etc/systemd/system/ 后 sudo systemctl daemon-reload。
 #
 # v8 修复要点（OpenSpec g1-rtabnav2-adapter v8）：
-#   1. ExecStartPre=pkill -9 -f nuwax-gateway-supervisor
+#   1. ExecStartPre=-/usr/bin/pkill -9 -x nuwax-gateway-supervisor
 #      防御：systemd 重启 service 时先清理上次残留的 supervisor 进程，
 #      防止 18 个 supervisor 累积（实机 2026-06-30 真因）；
 #   2. Type=forking
@@ -32,8 +32,9 @@ WorkingDirectory=/home/unitree/nuwax-robot-bridge
 EnvironmentFile=-/home/unitree/nuwax-robot-bridge/.env
 EnvironmentFile=-/home/unitree/nuwax-robot-bridge/drivers/g1/data_plane.env
 PIDFile=/home/unitree/nuwax-robot-bridge/runtime_data/gateway/gateway.pid
-# v8：先杀掉上次残留的 supervisor 进程（防累积）
-ExecStartPre=/usr/bin/pkill -9 -f nuwax-gateway-supervisor || true
+# v8：先杀掉上次残留的 supervisor 进程（防累积）。
+# systemd 的 ExecStartPre 不经 shell 解析，不能写 "|| true"；前导 "-" 表示忽略无匹配退出。
+ExecStartPre=-/usr/bin/pkill -9 -x nuwax-gateway-supervisor
 # v8：start_gateway.sh 内部 uvicorn 健康检查失败会 exit 1
 ExecStart=/usr/bin/env bash /home/unitree/nuwax-robot-bridge/scripts/start_gateway.sh start
 ExecStop=/usr/bin/env bash /home/unitree/nuwax-robot-bridge/scripts/start_gateway.sh stop

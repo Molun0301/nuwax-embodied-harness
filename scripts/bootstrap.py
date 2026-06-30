@@ -634,7 +634,7 @@ class BootstrapPlanner:
         build_go2_rtabnav2 = bool(getattr(args, "build_go2_rtabnav2", False))
         self.build_go2slam = build_go2_rtabnav2 or self._resolve_bool(
             "build_go2slam",
-            default=self.selected_robot == "go2" and self.build_geometry,
+            default=self.selected_robot in {"go2", "g1"} and self.build_geometry,
         )
         self.install_geometry_deps = self._resolve_bool("install_geometry_deps", default=self.geometry_enabled or self.build_geometry or self.build_go2slam)
         self.repair_ros2_apt_source = self._resolve_bool("repair_ros2_apt_source", default=True)
@@ -984,7 +984,7 @@ def run_checks(planner: BootstrapPlanner) -> int:
             results.append((apt_ok, _check_result("apt-get", apt_ok, _which("apt-get") or "未找到 apt-get，无法自动安装 RTAB-Map/Nav2")))
             sudo_ok = hasattr(os, "geteuid") and os.geteuid() == 0 or _which("sudo") is not None
             results.append((sudo_ok, _check_result("sudo/root", sudo_ok, "root 或 sudo 用于安装系统包")))
-        if planner.build_go2slam or (planner.selected_robot == "go2" and planner.geometry_enabled):
+        if planner.build_go2slam or (planner.selected_robot in {"go2", "g1"} and planner.geometry_enabled):
             go2slam_ok = GO2SLAM_WS_DIR.exists()
             results.append((go2slam_ok, _check_result("GO2_RTABNAV2 工作区", go2slam_ok, str(GO2SLAM_WS_DIR) if go2slam_ok else "未找到 services/geometry/ros2_ws/src/GO2_RTABNAV2/ws")))
             setup_path = go2slam_setup_path()
@@ -1486,7 +1486,7 @@ def start_gateway(planner: BootstrapPlanner) -> None:
     if not planner.start_gateway:
         print("跳过自动启动 gateway。")
         return
-    if planner.selected_robot == "go2" and planner.geometry_enabled:
+    if planner.selected_robot in {"go2", "g1"} and planner.geometry_enabled:
         ros_setup = _detect_ros_setup()
         if ros_setup is None:
             raise BootstrapError("未找到 ROS2 安装，不能启动 Go2 geometry 主链。")
@@ -1544,7 +1544,7 @@ def run_wizard(args: argparse.Namespace) -> int:
     args.systemd = prompt_bool("生成 systemd 示例", True)
     args.install_python = prompt_bool("安装 Python 依赖", True)
     args.build_geometry = prompt_bool("构建 geometry ROS2 工作空间", bool(args.geometry))
-    args.build_go2slam = prompt_bool("单独构建 Go2SLAM 工作区", args.robot == "go2" and bool(args.build_geometry))
+    args.build_go2slam = prompt_bool("单独构建 GO2_RTABNAV2 工作区", args.robot in {"go2", "g1"} and bool(args.build_geometry))
     args.install_geometry_deps = prompt_bool("安装 RTAB-Map/Nav2 系统依赖", bool(args.geometry))
     args.prepare_yolo = prompt_bool("准备 YOLO-World 权重", args.perception_mode != "disabled")
     args.prepare_memory = prompt_bool("准备本地 memory 模型", args.memory_mode == "local")

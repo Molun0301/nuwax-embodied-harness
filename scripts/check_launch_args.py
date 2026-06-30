@@ -13,6 +13,7 @@ A5: .env.G1_example 与 .env.example 物理量差异只来自 v4 B.3 表（lidar
 A6: _POINT_CLOUD_TOPIC=/utlidar/cloud_livox_mid360（防退化）
 A7: _IMU_TOPIC=/utlidar/imu_livox_mid360（防退化）
 A8 (v6 新增): NUWAX_GEOMETRY_ENABLED=true + REQUIRE_ROS2=true + EXTERNAL_SCRIPT 必含 robot_slam.sh
+A9 (v10 新增): robot_slam.sh 必须在 ros2 launch 前校验 go2_slam_nav overlay
 
 退出 0 = 全过；非 0 = 至少 1 条失败（打印具体失败键与修复建议）。
 """
@@ -230,6 +231,21 @@ def main() -> int:
             f"v6 必须含 robot_slam.sh 路径（v5 漏导致 runtime 报 geometry_runtime_unavailable）"
         )
 
+
+    # ---- A9 (v10 新增): robot_slam.sh 在 ros2 launch 前校验嵌套工作区 overlay ----
+    robot_slam = REPO_ROOT / "services" / "geometry" / "ros2_ws" / "src" / "GO2_RTABNAV2" / "robot_slam.sh"
+    robot_slam_source = robot_slam.read_text(encoding="utf-8") if robot_slam.exists() else ""
+    if "require_go2_slam_nav_package" not in robot_slam_source or "ros2 pkg prefix go2_slam_nav" not in robot_slam_source:
+        failures.append(
+            "A9 FAIL: robot_slam.sh 必须在 ros2 launch 前执行 go2_slam_nav overlay 预检，"
+            "否则实机会退化为 Package 'go2_slam_nav' not found 循环重启"
+        )
+    if "require_go2_slam_nav_launch_file" not in robot_slam_source:
+        failures.append(
+            "A9 FAIL: robot_slam.sh 必须校验 mapping_g1/explore_go2 等 launch 文件存在，"
+            "防止工作区未重编译时进入 ROS2 launch obscure failure"
+        )
+
     # ---- 输出 ----
     if failures:
         print("=== G1 RTAB/Nav2 静态校验失败 ===", file=sys.stderr)
@@ -241,7 +257,7 @@ def main() -> int:
         )
         return 1
 
-    print("=== G1 RTAB/Nav2 静态校验通过（A1-A8 全过）===")
+    print("=== G1 RTAB/Nav2 静态校验通过（A1-A9 全过）===")
     return 0
 
 

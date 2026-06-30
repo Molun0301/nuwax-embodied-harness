@@ -115,6 +115,42 @@ source_ros_runtime_env() {
   fi
 }
 
+build_go2slam_command_hint() {
+  local ros_setup="${NUWAX_ROS_SETUP_SCRIPT:-}"
+  if [[ -z "${ros_setup}" || ! -f "${ros_setup}" ]]; then
+    ros_setup="/opt/ros/${GO2_ROS_DISTRO}/setup.bash"
+  fi
+  printf 'cd %q && source %q && colcon build --symlink-install --parallel-workers 1' "${SCRIPT_DIR}/ws" "${ros_setup}"
+}
+
+require_go2_slam_nav_package() {
+  local setup_path="${NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT:-${SCRIPT_DIR}/ws/install/setup.bash}"
+  local build_hint
+  build_hint="$(build_go2slam_command_hint)"
+  if [[ ! -f "${setup_path}" ]]; then
+    die "go2_slam_nav package not found because GO2_RTABNAV2 workspace setup is missing: ${setup_path}. Build it first: ${build_hint}"
+  fi
+  local pkg_prefix=""
+  pkg_prefix="$(ros2 pkg prefix go2_slam_nav 2>/dev/null || true)"
+  if [[ -z "${pkg_prefix}" ]]; then
+    die "go2_slam_nav package not found after sourcing ROS env and ${setup_path}. Rebuild GO2_RTABNAV2 workspace: ${build_hint}"
+  fi
+  echo "==> go2_slam_nav: ${pkg_prefix}"
+}
+
+require_go2_slam_nav_launch_file() {
+  local launch_file="$1"
+  local pkg_prefix=""
+  pkg_prefix="$(ros2 pkg prefix go2_slam_nav 2>/dev/null || true)"
+  if [[ -z "${pkg_prefix}" ]]; then
+    require_go2_slam_nav_package
+    pkg_prefix="$(ros2 pkg prefix go2_slam_nav 2>/dev/null || true)"
+  fi
+  if [[ -z "${pkg_prefix}" || ! -f "${pkg_prefix}/share/go2_slam_nav/launch/${launch_file}" ]]; then
+    die "go2_slam_nav launch file ${launch_file} not found in ${pkg_prefix:-<missing>}. Rebuild GO2_RTABNAV2 workspace: $(build_go2slam_command_hint)"
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fresh)
@@ -157,6 +193,7 @@ if [[ -f "${SCRIPT_DIR}/scripts/load_platform_geometry_env.sh" ]]; then
 fi
 
 source_ros_runtime_env
+require_go2_slam_nav_package
 
 # 数据库路径解析（沿用 v3 范式）
 resolve_default_db() {
@@ -212,6 +249,7 @@ case "$MODE" in
 esac
 
 [[ -n "${launch_file}" ]] || die "ROBOT=${ROBOT} 不支持 MODE=${MODE}"
+require_go2_slam_nav_launch_file "${launch_file}"
 
 # 启动参数
 args=(

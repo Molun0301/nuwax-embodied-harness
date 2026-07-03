@@ -1,7 +1,7 @@
 """installer.ui.progress：多阶段进度条封装（rich.Progress 优先，降级 print）。
 
 设计目标：
-- 提供多阶段进度条（preflight / system / python_env / build_ws 等 10+ 阶段）。
+- 提供多阶段进度条（preflight / system / python_env / models 等 10 阶段）。
 - 阶段标签 + 当前步骤描述，遵循 plan 4.1 L123 "多阶段进度条 + 阶段标签"约定。
 - rich 不可用时降级为顺序打印 "[1/N] <phase> ... ok"。
 

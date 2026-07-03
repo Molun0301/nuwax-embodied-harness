@@ -59,106 +59,13 @@ DEFAULT_MEMORY_LOCAL_TEXT_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" /
 DEFAULT_MEMORY_LOCAL_IMAGE_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "openai__clip-vit-base-patch32")
 DEFAULT_YOLO_WORLD_MODEL = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-worldv2.pt")
 DEFAULT_YOLO_WORLD_ENGINE = str(PROJECT_ROOT / "runtime_data" / "models" / "yolov8s-worldv2.engine")
-GEOMETRY_WS_DIR = PROJECT_ROOT / "services" / "geometry" / "ros2_ws"
-GO2_RTABNAV2_WS_DIR = GEOMETRY_WS_DIR / "src" / "GO2_RTABNAV2" / "ws"
-GO2SLAM_WS_DIR = GO2_RTABNAV2_WS_DIR
-GEOMETRY_APT_BASE_PACKAGES = (
-    "build-essential",
-    "cmake",
-    "git",
-    "python3-colcon-common-extensions",
-    "python3-pip",
-    "python3-rosdep",
-    "python3-vcstool",
-)
-GEOMETRY_ROS_REQUIRED_PACKAGE_SUFFIXES = (
-    "navigation2",
-    "nav2-bringup",
-    "pointcloud-to-laserscan",
-    "rmw-cyclonedds-cpp",
-    "robot-localization",
-    "rtabmap-ros",
-    "tf-transformations",
-)
-GEOMETRY_ROS_OPTIONAL_PACKAGE_SUFFIXES = (
-    "nav2-simple-commander",
-)
-GO2SLAM_APT_BASE_PACKAGES = (
-    "libboost-thread-dev",
-    "libopencv-dev",
-    "libpcl-dev",
-)
-GO2SLAM_RUNTIME_REQUIRED_PACKAGES = (
-    "go2_slam_nav",
-    "go2_cmd_processor",
-    "explore_lite",
-)
-GO2SLAM_SOURCE_STALE_SUFFIXES = (
-    ".xml",
-    ".yaml",
-    ".yml",
-    ".py",
-    ".cpp",
-    ".hpp",
-    ".h",
-    ".launch.py",
-)
-GO2SLAM_ROS_REQUIRED_PACKAGE_SUFFIXES = (
-    "ament-cmake",
-    "ament-cmake-gtest",
-    "ament-index-python",
-    "ament-lint-auto",
-    "ament-lint-common",
-    "geometry-msgs",
-    "image-geometry",
-    "joint-state-publisher",
-    "laser-geometry",
-    "launch",
-    "launch-ros",
-    "map-msgs",
-    "message-filters",
-    "nav-msgs",
-    "nav2-amcl",
-    "nav2-bringup",
-    "nav2-bt-navigator",
-    "nav2-controller",
-    "nav2-core",
-    "nav2-costmap-2d",
-    "nav2-lifecycle-manager",
-    "nav2-map-server",
-    "nav2-msgs",
-    "nav2-planner",
-    "nav2-smoother",
-    "nav2-util",
-    "nav2-waypoint-follower",
-    "pcl-conversions",
-    "pcl-ros",
-    "pluginlib",
-    "rclcpp",
-    "rclcpp-components",
-    "rclcpp-lifecycle",
-    "rclpy",
-    "robot-localization",
-    "robot-state-publisher",
-    "ros2launch",
-    "rosidl-default-generators",
-    "rosidl-default-runtime",
-    "rviz2",
-    "sensor-msgs",
-    "sensor-msgs-py",
-    "slam-toolbox",
-    "std-msgs",
-    "tf2",
-    "tf2-geometry-msgs",
-    "tf2-ros",
-    "tf2-sensor-msgs",
-    "visualization-msgs",
-    "xacro",
-)
-DEFAULT_ROS2_APT_FALLBACK_URLS = (
-    "https://mirrors.ustc.edu.cn/ros2/ubuntu",
-    "http://packages.ros.org/ros2/ubuntu",
-)
+# 去 ROS2 化（2026-07-03 drop-ros2）：所有 ROS2 工作区常量 / 包后缀 / 运行时检查常量
+# 已物理删除。原包含的 GEOMETRY_WS_DIR / GO2SLAM_WS_DIR / GEOMETRY_ROS_* / GO2SLAM_*
+# / GO2SLAM_RUNTIME_REQUIRED_PACKAGES / GO2SLAM_SOURCE_STALE_SUFFIXES 等均整体下线；
+# geometry runtime 由 ``nuwax-geometry-runtime`` Rust 二进制承载，平台 Python 侧不再
+# 推导 ROS2 工作区路径。
+# DEFAULT_ROS2_APT_FALLBACK_URLS：
+# 已删除；geometry runtime 改由 ``nuwax-geometry-runtime`` 提供，未再需要 ROS2 apt 源。
 
 
 class BootstrapError(RuntimeError):
@@ -348,84 +255,16 @@ def _parse_csv(value: str) -> Tuple[str, ...]:
     return tuple(part.strip() for part in str(value or "").split(",") if part.strip())
 
 
-def _detect_ros_setup() -> Optional[Path]:
-    configured = str(os.environ.get("NUWAX_ROS_SETUP_SCRIPT", "")).strip()
-    candidates: List[Path] = []
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    candidates.extend(
-        (
-            Path("/opt/ros/jazzy/setup.bash"),
-            Path("/opt/ros/humble/setup.bash"),
-            Path("/opt/ros/iron/setup.bash"),
-            Path("/opt/ros/foxy/setup.bash"),
-        )
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def _detect_ros_distro(ros_setup: Optional[Path] = None) -> str:
-    env_distro = str(os.environ.get("ROS_DISTRO", "")).strip()
-    if env_distro:
-        return env_distro
-    setup_path = ros_setup or _detect_ros_setup()
-    if setup_path is None:
-        return ""
-    try:
-        parts = setup_path.parts
-        ros_index = parts.index("ros")
-        return parts[ros_index + 1]
-    except (ValueError, IndexError):
-        return ""
-
-
-def go2slam_setup_path() -> Path:
-    return GO2SLAM_WS_DIR / "install" / "setup.bash"
-
-
-def find_go2slam_stale_source(setup_path: Path) -> Optional[Path]:
-    if not setup_path.exists():
-        return None
-    roots = [
-        GO2SLAM_WS_DIR / "src",
-        GO2SLAM_WS_DIR.parent / "unitree-go2-slam-nav2",
-        GO2SLAM_WS_DIR.parent / "m-explore-ros2",
-    ]
-    for root in roots:
-        if not root.exists():
-            continue
-        for candidate in root.rglob("*"):
-            if not candidate.is_file():
-                continue
-            name = candidate.name
-            if not (name == "CMakeLists.txt" or name.endswith(GO2SLAM_SOURCE_STALE_SUFFIXES)):
-                continue
-            try:
-                if candidate.stat().st_mtime > setup_path.stat().st_mtime:
-                    return candidate
-            except OSError:
-                continue
-    return None
-
-
-def missing_go2slam_runtime_packages(ros_setup: Optional[Path], packages: Sequence[str] = GO2SLAM_RUNTIME_REQUIRED_PACKAGES) -> Tuple[str, ...]:
-    setup_path = go2slam_setup_path()
-    if ros_setup is None or not setup_path.exists():
-        return tuple(packages)
-    missing: List[str] = []
-    for package_name in packages:
-        command = (
-            f"source {shlex.quote(str(ros_setup))} "
-            f"&& source {shlex.quote(str(setup_path))} "
-            f"&& ros2 pkg prefix {shlex.quote(package_name)} >/dev/null"
-        )
-        result = _run(("bash", "-lc", command), cwd=GO2SLAM_WS_DIR, check=False, capture_output=True)
-        if result.returncode != 0:
-            missing.append(package_name)
-    return tuple(missing)
+# 去 ROS2 化（2026-07-03 drop-ros2）：以下 ROS2 探测 / 运行时检查函数已删除
+# - _detect_ros_setup / _detect_ros_distro（探测 /opt/ros/*）
+# - go2slam_setup_path / find_go2slam_stale_source / missing_go2slam_runtime_packages
+# - build_geometry_apt_packages / build_go2slam_apt_packages / build_geometry_optional_apt_packages
+# - apt_output_has_ros2_archive_404 / build_ros2_apt_fallback_urls / replace_ros2_apt_source_url
+# - filter_available_apt_packages / run_geometry_apt_update / install_geometry_apt_packages
+# - install_geometry_system_dependencies / assert_go2slam_workspace_ready /
+#   assert_go2slam_runtime_ready / build_workspaces
+# 替换说明：geometry runtime 已迁到 ``nuwax-geometry-runtime`` Rust 二进制，平台侧不再
+# 承担 ROS2 工作区构建、Nav2 / RTAB-Map ROS 适配、rosdep / colcon / apt-get 依赖解析。
 
 
 def _sudo_prefix() -> Tuple[str, ...]:
@@ -436,147 +275,14 @@ def _sudo_prefix() -> Tuple[str, ...]:
     return ("sudo",)
 
 
-def build_geometry_apt_packages(ros_distro: str) -> Tuple[str, ...]:
-    normalized = str(ros_distro or "").strip()
-    if not normalized:
-        raise BootstrapError("无法识别 ROS2 发行版，不能推导 RTAB-Map/Nav2 apt 包名。")
-    ros_packages = tuple(f"ros-{normalized}-{suffix}" for suffix in GEOMETRY_ROS_REQUIRED_PACKAGE_SUFFIXES)
-    return (*GEOMETRY_APT_BASE_PACKAGES, *ros_packages)
-
-
-def build_go2slam_apt_packages(ros_distro: str) -> Tuple[str, ...]:
-    normalized = str(ros_distro or "").strip()
-    if not normalized:
-        raise BootstrapError("无法识别 ROS2 发行版，不能推导 Go2SLAM apt 包名。")
-    nav2_recovery_suffix = "nav2-recoveries" if normalized == "foxy" else "nav2-behaviors"
-    ros_packages = tuple(f"ros-{normalized}-{suffix}" for suffix in (*GO2SLAM_ROS_REQUIRED_PACKAGE_SUFFIXES, nav2_recovery_suffix))
-    return (*GO2SLAM_APT_BASE_PACKAGES, *ros_packages)
-
-
-def build_geometry_optional_apt_packages(ros_distro: str) -> Tuple[str, ...]:
-    normalized = str(ros_distro or "").strip()
-    if not normalized:
-        raise BootstrapError("无法识别 ROS2 发行版，不能推导 RTAB-Map/Nav2 apt 包名。")
-    return tuple(f"ros-{normalized}-{suffix}" for suffix in GEOMETRY_ROS_OPTIONAL_PACKAGE_SUFFIXES)
-
-
-def apt_output_has_ros2_archive_404(output: str) -> bool:
-    normalized = str(output or "").lower()
-    return "404" in normalized and "not found" in normalized and "ros2/ubuntu" in normalized and "failed to fetch" in normalized
-
-
-def build_ros2_apt_fallback_urls() -> Tuple[str, ...]:
-    configured = _parse_csv(os.environ.get("NUWAX_ROS2_APT_FALLBACK_URLS", ""))
-    if configured:
-        return configured
-    return DEFAULT_ROS2_APT_FALLBACK_URLS
-
-
-def replace_ros2_apt_source_url(sudo: Sequence[str], replacement_url: str) -> bool:
-    script = r"""
-import re
-import sys
-from pathlib import Path
-
-replacement = sys.argv[1].rstrip("/")
-paths = [Path("/etc/apt/sources.list")]
-source_dir = Path("/etc/apt/sources.list.d")
-if source_dir.exists():
-    paths.extend(sorted(source_dir.glob("*.list")))
-
-changed = []
-for path in paths:
-    if not path.exists():
-        continue
-    text = path.read_text(encoding="utf-8", errors="replace")
-    updated = re.sub(r"https?://[^\s]+/ros2/ubuntu/?", replacement, text)
-    if updated == text:
-        continue
-    backup = Path(str(path) + ".nuwaxbak")
-    if not backup.exists():
-        backup.write_text(text, encoding="utf-8")
-    path.write_text(updated, encoding="utf-8")
-    changed.append(str(path))
-
-if changed:
-    print("已更新 ROS2 apt 源: " + ", ".join(changed))
-    sys.exit(0)
-
-print("没有找到可更新的 ROS2 apt 源文件。")
-sys.exit(3)
-"""
-    result = _run(
-        (*sudo, "python3", "-c", script, replacement_url),
-        cwd=PROJECT_ROOT,
-        check=False,
-        capture_output=True,
-        display_command=f"{shlex.join((*sudo, 'python3'))} -c '<replace ROS2 apt source>' {replacement_url}",
-    )
-    _print_completed_output(result)
-    return result.returncode == 0
-
-
-def filter_available_apt_packages(packages: Sequence[str]) -> Tuple[str, ...]:
-    if not packages:
-        return ()
-    if _which("apt-cache") is None:
-        print("未找到 apt-cache，跳过可选 geometry apt 包: " + " ".join(packages))
-        return ()
-
-    available: List[str] = []
-    skipped: List[str] = []
-    for package in packages:
-        result = _run(
-            ("apt-cache", "show", package),
-            cwd=PROJECT_ROOT,
-            check=False,
-            capture_output=True,
-            display_command=f"apt-cache show {package} >/dev/null",
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            available.append(package)
-        else:
-            skipped.append(package)
-
-    if skipped:
-        print("跳过当前 apt 源不存在的可选 geometry 包: " + " ".join(skipped))
-    return tuple(available)
-
-
-def run_geometry_apt_update(sudo: Sequence[str], env: Mapping[str, str]) -> None:
-    result = _run((*sudo, "apt-get", "update"), cwd=PROJECT_ROOT, env=env, check=False)
-    if result.returncode != 0:
-        print(
-            "apt-get update 未完全成功，通常是某个无关第三方 apt 源不可用。"
-            "将继续尝试安装 geometry 依赖；如果后续 apt-get install 仍失败，请先修复或临时禁用异常 apt 源。"
-        )
-
-
-def install_geometry_apt_packages(planner: "BootstrapPlanner", sudo: Sequence[str], env: Mapping[str, str], packages: Sequence[str]) -> None:
-    command = (*sudo, "apt-get", "install", "-y", *packages)
-    result = _run_streaming_capture(command, cwd=PROJECT_ROOT, env=env)
-    if result.returncode == 0:
-        return
-
-    combined_output = "\n".join((result.stdout or "", result.stderr or ""))
-    if not planner.repair_ros2_apt_source or not apt_output_has_ros2_archive_404(combined_output):
-        raise BootstrapError(f"命令执行失败: {shlex.join(list(command))}")
-
-    print("检测到 ROS2 apt 源包索引与实际归档不同步，准备切换 ROS2 apt 源并重试 geometry 依赖安装。")
-    for fallback_url in build_ros2_apt_fallback_urls():
-        print(f"尝试将 ROS2 apt 源切换到: {fallback_url}")
-        if not replace_ros2_apt_source_url(sudo, fallback_url):
-            continue
-        _run((*sudo, "apt-get", "clean"), cwd=PROJECT_ROOT, env=env, check=False)
-        run_geometry_apt_update(sudo, env)
-        retry = _run_streaming_capture(command, cwd=PROJECT_ROOT, env=env)
-        if retry.returncode == 0:
-            return
-
-    raise BootstrapError(
-        "ROS2 apt 源持续返回 404。请手工修复 /etc/apt/sources.list.d 中的 ros2/ubuntu 源，"
-        "或通过 NUWAX_ROS2_APT_FALLBACK_URLS 指定可用源后重试。"
-    )
+# 去 ROS2 化（2026-07-03 drop-ros2）：以下 ROS2 apt 派生 / 源回退 / 安装辅助函数已删除
+# - build_geometry_apt_packages / build_go2slam_apt_packages / build_geometry_optional_apt_packages
+# - apt_output_has_ros2_archive_404 / build_ros2_apt_fallback_urls / replace_ros2_apt_source_url
+# - filter_available_apt_packages / run_geometry_apt_update / install_geometry_apt_packages
+# 替换说明：geometry runtime 由 ``nuwax-geometry-runtime`` Rust 二进制承载，平台侧
+# 不再推导 ROS2 发行版 / 派生 apt 包名 / 处理 ROS2 apt 源 404 回退；
+# installer 的 system 阶段只负责通用基础工具 + nuwax-geometry-runtime 的 OS 依赖。
+# 注：原实现引用已删除的 GEOMETRY_ROS_*_PACKAGE_SUFFIXES 常量；本函数组整体下线。
 
 
 def _build_robot_choices() -> Tuple[str, ...]:
@@ -631,7 +337,7 @@ class BootstrapPlanner:
             default=self.selected_robot == "go2" and self.build_geometry,
         )
         self.install_geometry_deps = self._resolve_bool("install_geometry_deps", default=self.geometry_enabled or self.build_geometry or self.build_go2slam)
-        self.repair_ros2_apt_source = self._resolve_bool("repair_ros2_apt_source", default=True)
+        self.repair_ros2_apt_source = self._resolve_bool("repair_ros2_apt_source", default=False)
         self.start_gateway = self._resolve_bool("start_gateway", default=False)
         self.run_healthcheck = self._resolve_bool("healthcheck", default=False)
         self.mcp_mode = self._resolve_choice("mcp_mode", ("auto", "config-only", "skip"), default="auto")
@@ -687,40 +393,24 @@ class BootstrapPlanner:
 
     def root_overrides(self) -> Dict[str, str]:
         go2_geometry_enabled = self.selected_robot == "go2" and self.geometry_enabled
-        ros_setup = _detect_ros_setup() if go2_geometry_enabled else None
         values: Dict[str, str] = {
             "NUWAX_ACTIVE_ROBOT": self.selected_robot,
             "NUWAX_PYTHON_BIN": self.python_bin,
             "NUWAX_GEOMETRY_ENABLED": _bool_text(go2_geometry_enabled),
-            "NUWAX_GEOMETRY_REQUIRE_ROS2": _bool_text(go2_geometry_enabled),
-            "NUWAX_ROS_SETUP_SCRIPT": str(ros_setup) if ros_setup is not None else "",
-            "NUWAX_GEOMETRY_SETUP_SCRIPT": str(PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash"),
-            "NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT": str(go2slam_setup_path()),
-            "NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR": "",
-            "NUWAX_GEOMETRY_ODOM_TOPIC": "",
-            "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS": "",
-            "NUWAX_GEOMETRY_IMU_TOPIC": "",
-            "NUWAX_GEOMETRY_POINT_CLOUD_TOPIC": "",
-            "NUWAX_GEOMETRY_TF_TOPIC": "",
-            "NUWAX_GEOMETRY_TF_STATIC_TOPIC": "",
-            "NUWAX_GEOMETRY_OCCUPANCY_TOPIC": "",
-            "NUWAX_GEOMETRY_COST_MAP_TOPIC": "",
-            "NUWAX_GEOMETRY_MAP_FRAME": "",
-            "NUWAX_GEOMETRY_ODOM_FRAME": "",
-            "NUWAX_GEOMETRY_BASE_FRAME": "",
-            "NUWAX_GEOMETRY_LIDAR_FRAME": "",
-            "NUWAX_NAV2_ACTION_NAME": "",
-            "NUWAX_NAV2_LAUNCH_PACKAGE": "",
-            "NUWAX_NAV2_LAUNCH_FILE": "",
-            "NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC": "",
-            "NUWAX_NAV2_LOCAL_COSTMAP_TOPIC": "",
-            "NUWAX_NAV2_COSTMAP_SOURCE": "",
-            "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": "",
-            "NUWAX_GEOMETRY_EXTERNAL_ARGS": "",
-            "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "",
-            "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "",
-            "NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED": "false",
-            "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED": "false",
+            # 去 ROS2 化（2026-07-03 drop-ros2）：所有 ROS2 env 已删除；geometry runtime
+            # 由 ``nuwax-geometry-runtime`` 提供，平台侧不再 source ROS2 / 配置 RMW /
+            # 设置 ROS topic 默认值；运行时 I/O 全部走 LCM typed channel 与 native shm。
+            "NUWAX_GEOMETRY_RUNTIME_BINARY": str(PROJECT_ROOT / "services" / "geometry" / "nuwax_geometry_runtime" / "target" / "release" / "nuwax-geometry-runtime"),
+            "NUWAX_GEOMETRY_RUNTIME_PORT": "50051",
+            "NUWAX_GEOMETRY_RUNTIME_READY_FILE": str(PROJECT_ROOT / "runtime_data" / "geometry" / "nuwax_geometry_runtime.ready"),
+            "NUWAX_LCM_URL": "udpm://239.255.76.67:7667?ttl=0",
+            "NUWAX_LCM_BACKEND": "real-lcm",
+            "NUWAX_LCM_CHANNEL_ODOM": "/odom",
+            "NUWAX_LCM_CHANNEL_TF": "/tf",
+            "NUWAX_LCM_CHANNEL_POINTCLOUD": "/go2/lidar/points",
+            "NUWAX_LCM_CHANNEL_OCCUPANCY": "/map/occupancy",
+            "NUWAX_LCM_CHANNEL_CMD_VEL": "/cmd_vel",
+            "NUWAX_NUWAX_WORKSPACE_DIR": "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace",
             "NUWAX_LOG_DIR": str(PROJECT_ROOT),
             "NUWAX_LOG_FILE": str(PROJECT_ROOT / "nuwax_robot_bridge.log"),
             "NUWAX_GATEWAY_ARTIFACT_DIR": str(PROJECT_ROOT / "artifacts"),
@@ -729,42 +419,6 @@ class BootstrapPlanner:
             "NUWAX_MEMORY_DB_PATH": str(PROJECT_ROOT / "runtime_data" / "memory" / "vector_memory.db"),
             "NUWAX_RELAY_ENABLED": _bool_text(self.relay_enabled),
         }
-        if self.selected_robot == "go2" and self.geometry_enabled:
-            values.update(
-                {
-                    "NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR": "/usr/local/lib",
-                    "NUWAX_GEOMETRY_ODOM_TOPIC": "/odom",
-                    "NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS": "/uslam/localization/odom,/lio_sam_ros2/mapping/odometry,/odom_lio",
-                    "NUWAX_GEOMETRY_IMU_TOPIC": "/utlidar/imu",
-                    "NUWAX_GEOMETRY_POINT_CLOUD_TOPIC": "/utlidar/cloud_deskewed",
-                    "NUWAX_GEOMETRY_TF_TOPIC": "/tf",
-                    "NUWAX_GEOMETRY_TF_STATIC_TOPIC": "/tf_static",
-                    "NUWAX_GEOMETRY_OCCUPANCY_TOPIC": "/map_obstacles",
-                    "NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC": "explore/frontiers",
-                    "NUWAX_GEOMETRY_COST_MAP_TOPIC": "/global_costmap/costmap",
-                    "NUWAX_GEOMETRY_MAP_FRAME": "map",
-                    "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
-                    "NUWAX_GEOMETRY_BASE_FRAME": "base_footprint",
-                    "NUWAX_GEOMETRY_LIDAR_FRAME": "utlidar_lidar",
-                    "NUWAX_RTABMAP_LAUNCH_PACKAGE": "rtabmap_launch",
-                    "NUWAX_RTABMAP_LAUNCH_FILE": "rtabmap.launch.py",
-                    "NUWAX_RTABMAP_OCCUPANCY_PROJECTION": "projected_occupancy",
-                    "NUWAX_GEOMETRY_EXTERNAL_SCRIPT": str(
-                        PROJECT_ROOT / "services" / "geometry" / "ros2_ws" / "src" / "GO2_RTABNAV2" / "go2.sh"
-                    ),
-                    "NUWAX_GEOMETRY_EXTERNAL_ARGS": "",
-                    "NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME": "external_slam_nav2",
-                    "NUWAX_GEOMETRY_EXTERNAL_LOG_NAME": "external_slam_nav2.log",
-                    "NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED": "false",
-                    "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED": "false",
-                    "NUWAX_NAV2_ACTION_NAME": "/navigate_to_pose",
-                    "NUWAX_NAV2_LAUNCH_PACKAGE": "nav2_bringup",
-                    "NUWAX_NAV2_LAUNCH_FILE": "navigation_launch.py",
-                    "NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC": "/global_costmap/costmap",
-                    "NUWAX_NAV2_LOCAL_COSTMAP_TOPIC": "/local_costmap/costmap",
-                    "NUWAX_NAV2_COSTMAP_SOURCE": "nav2_global",
-                }
-            )
 
         if self.memory_mode == "cloud":
             values.update(
@@ -918,45 +572,14 @@ def run_checks(planner: BootstrapPlanner) -> int:
     results.append((_file_exists(PROJECT_ROOT / "requirements.txt"), _check_result("requirements.txt", _file_exists(PROJECT_ROOT / "requirements.txt"), str(PROJECT_ROOT / "requirements.txt"))))
 
     if planner.geometry_enabled or planner.build_geometry or planner.build_go2slam:
-        ros_setup = _detect_ros_setup()
-        results.append((ros_setup is not None, _check_result("ROS2", ros_setup is not None, str(ros_setup) if ros_setup else "未找到 /opt/ros/*/setup.bash")))
-        ros_distro = _detect_ros_distro(ros_setup)
-        results.append((bool(ros_distro), _check_result("ROS2 发行版", bool(ros_distro), ros_distro or "无法从 ROS_DISTRO 或 /opt/ros/*/setup.bash 推导")))
-        colcon_ok = _which("colcon") is not None
-        colcon_ready = colcon_ok or planner.install_geometry_deps
-        results.append((colcon_ready, _check_result("colcon", colcon_ready, _which("colcon") or "将由 --install-geometry-deps 安装")))
-        rosdep_ok = _which("rosdep") is not None
-        rosdep_ready = rosdep_ok or planner.install_geometry_deps
-        results.append((rosdep_ready, _check_result("rosdep", rosdep_ready, _which("rosdep") or "将由 --install-geometry-deps 安装")))
-        root_template_values = _read_existing_env(ROOT_ENV_TEMPLATE)
-        cyclone_value = (
-            os.environ.get("CYCLONEDDS_URI", "").strip()
-            or planner.root_existing.get("CYCLONEDDS_URI", "").strip()
-            or root_template_values.get("CYCLONEDDS_URI", "").strip()
-        )
-        cyclone_ok = bool(cyclone_value)
-        results.append((cyclone_ok, _check_result("CycloneDDS 配置", cyclone_ok, "环境变量、.env 或 .env.example 中需存在 CYCLONEDDS_URI")))
-        if planner.install_geometry_deps:
-            apt_ok = _which("apt-get") is not None
-            results.append((apt_ok, _check_result("apt-get", apt_ok, _which("apt-get") or "未找到 apt-get，无法自动安装 RTAB-Map/Nav2")))
-            sudo_ok = hasattr(os, "geteuid") and os.geteuid() == 0 or _which("sudo") is not None
-            results.append((sudo_ok, _check_result("sudo/root", sudo_ok, "root 或 sudo 用于安装系统包")))
-        if planner.build_go2slam or (planner.selected_robot == "go2" and planner.geometry_enabled):
-            go2slam_ok = GO2SLAM_WS_DIR.exists()
-            results.append((go2slam_ok, _check_result("GO2_RTABNAV2 工作区", go2slam_ok, str(GO2SLAM_WS_DIR) if go2slam_ok else "未找到 services/geometry/ros2_ws/src/GO2_RTABNAV2/ws")))
-            setup_path = go2slam_setup_path()
-            setup_ready = setup_path.exists() or planner.build_go2slam
-            setup_detail = str(setup_path) if setup_path.exists() else "将由 --build-go2slam 构建生成"
-            results.append((setup_ready, _check_result("Go2SLAM install/setup.bash", setup_ready, setup_detail)))
-            if setup_path.exists():
-                stale_source = find_go2slam_stale_source(setup_path)
-                stale_ok = stale_source is None or planner.build_go2slam
-                stale_detail = "源码未新于 install" if stale_source is None else f"{stale_source} 新于 install，将重新构建" if planner.build_go2slam else f"{stale_source} 新于 install，请重新构建"
-                results.append((stale_ok, _check_result("Go2SLAM 构建新鲜度", stale_ok, stale_detail)))
-                missing_runtime = missing_go2slam_runtime_packages(ros_setup) if ros_setup is not None else GO2SLAM_RUNTIME_REQUIRED_PACKAGES
-                packages_ok = not missing_runtime or planner.build_go2slam
-                packages_detail = "运行包可被当前 ROS2 环境解析" if not missing_runtime else "缺少: " + ", ".join(missing_runtime) + ("；将重新构建" if planner.build_go2slam else "")
-                results.append((packages_ok, _check_result("Go2SLAM 运行包", packages_ok, packages_detail)))
+        # 去 ROS2 化（2026-07-03 drop-ros2）：原本 6+ 项 ROS2 / colcon / rosdep / CycloneDDS /
+        # Go2SLAM 工作区校验整体删除。geometry runtime 由 ``nuwax-geometry-runtime`` 提供，
+        # 平台侧不再要求安装 ROS2 / colcon / rosdep / libddsc.so。
+        results.append((True, _check_result("ROS2 依赖", True, "已下线；geometry runtime 改由 nuwax-geometry-runtime 承载（LCM typed channel）")))
+        runtime_binary = PROJECT_ROOT / "services" / "geometry" / "nuwax_geometry_runtime" / "target" / "release" / "nuwax-geometry-runtime"
+        binary_ok = runtime_binary.exists() or bool(planner.install_geometry_deps)
+        binary_detail = str(runtime_binary) if runtime_binary.exists() else "将由 nuwax-workspace cargo build 产出"
+        results.append((binary_ok, _check_result("nuwax-geometry-runtime 二进制", binary_ok, binary_detail)))
 
     if planner.selected_robot == "go2" and planner.data_plane_enabled:
         go2_template_ok = planner.robot_meta.env_template is not None and planner.robot_meta.env_template.exists()
@@ -1029,135 +652,28 @@ def install_python_dependencies(planner: BootstrapPlanner) -> None:
         _run((planner_python, "-m", "pip", "install", "-r", "requirements-memory-models.txt"), cwd=PROJECT_ROOT)
 
 
-def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:
-    if not planner.install_geometry_deps:
-        print("跳过 geometry 系统依赖安装。")
-        return
-    if not (planner.geometry_enabled or planner.build_geometry or planner.build_go2slam):
-        print("未启用 geometry，跳过 RTAB-Map/Nav2 系统依赖安装。")
-        return
-
-    ros_setup = _detect_ros_setup()
-    if ros_setup is None:
-        raise BootstrapError("未找到 ROS2 安装。请先安装 ROS2 Foxy/Humble/Jazzy，再安装 RTAB-Map/Nav2。")
-    ros_distro = _detect_ros_distro(ros_setup)
-    package_set = set(build_geometry_apt_packages(ros_distro))
-    if planner.build_go2slam:
-        package_set.update(build_go2slam_apt_packages(ros_distro))
-    required_packages = tuple(sorted(package_set))
-    optional_candidates = build_geometry_optional_apt_packages(ros_distro)
-    sudo = _sudo_prefix()
-    env = dict(os.environ)
-    env["DEBIAN_FRONTEND"] = "noninteractive"
-
-    print(f"准备安装 geometry 系统依赖，ROS2 发行版: {ros_distro}")
-    run_geometry_apt_update(sudo, env)
-    optional_packages = filter_available_apt_packages(optional_candidates)
-    packages = (*required_packages, *optional_packages)
-    print("将安装: " + " ".join(packages))
-    install_geometry_apt_packages(planner, sudo, env, packages)
-
-    if _which("rosdep") is None:
-        print("未找到 rosdep，跳过工作区 rosdep 依赖解析。")
-        return
-
-    rosdep_sources = Path("/etc/ros/rosdep/sources.list.d/20-default.list")
-    if not rosdep_sources.exists():
-        init_result = _run((*sudo, "rosdep", "init"), cwd=PROJECT_ROOT, check=False)
-        if init_result.returncode != 0:
-            print("rosdep init 未成功；如果已经初始化过可忽略，否则请手工执行 sudo rosdep init。")
-    _run(("rosdep", "update"), cwd=PROJECT_ROOT)
-    _run(
-        (
-            "rosdep",
-            "install",
-            "--from-paths",
-            "src/vendor",
-            "--ignore-src",
-            "-r",
-            "-y",
-            "--rosdistro",
-            ros_distro,
-        ),
-        cwd=GEOMETRY_WS_DIR,
-    )
-    if planner.build_go2slam:
-        assert_go2slam_workspace_ready(ros_setup)
-        _run(
-            (
-                "rosdep",
-                "install",
-                "--from-paths",
-                "src",
-                "--ignore-src",
-                "-r",
-                "-y",
-                "--rosdistro",
-                ros_distro,
-            ),
-            cwd=GO2SLAM_WS_DIR,
-        )
+# 去 ROS2 化（2026-07-03 drop-ros2）：以下函数已删除并替换为 no-op 占位
+# - install_geometry_system_dependencies: 原负责 apt 安装 ROS2 + 派生包 / rosdep init
+#   / rosdep install / Go2SLAM 工作区校验；ROS2 工作空间已物理删除，故无对象可装。
+# - assert_go2slam_workspace_ready / assert_go2slam_runtime_ready: Go2SLAM 工作区已
+#   物理删除，对应 colcon build / install 校验流程整体下线。
+# - build_workspaces: 原负责 build_ros2_workspace.sh / colcon build；删除后无
+#   任何 ROS2 工作空间可构建。
+# 替换说明：geometry runtime 由 ``nuwax-geometry-runtime`` Rust 二进制承载，
+# 平台侧 ``phases/system.py`` 不再调这些函数；保留同名 ``_no_op`` 仅为防止
+# installer-redesign / 老脚本意外 import 时 NameError（执行方案 Phase 0+4）。
 
 
-def assert_go2slam_workspace_ready(ros_setup: Path) -> None:
-    if not GO2SLAM_WS_DIR.exists():
-        raise BootstrapError(f"未找到 Go2SLAM 工作区: {GO2SLAM_WS_DIR}")
-    missing: List[str] = []
-    for package_name in ("unitree_go", "unitree_api"):
-        command = f"source {shlex.quote(str(ros_setup))} && ros2 pkg prefix {shlex.quote(package_name)} >/dev/null"
-        result = _run(("bash", "-lc", command), cwd=GO2SLAM_WS_DIR, check=False, capture_output=True)
-        if result.returncode != 0:
-            missing.append(package_name)
-    if missing:
-        raise BootstrapError(
-            "Go2SLAM 构建前缺少 Unitree ROS2 接口包: "
-            + ", ".join(missing)
-            + "。请先按 Unitree 官方说明安装或编译 unitree_go/unitree_api，并确认 `ros2 pkg prefix unitree_go` 与 `ros2 pkg prefix unitree_api` 可用。"
-        )
+def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:  # noqa: ARG001
+    """no-op 占位：原 ROS2 apt 派生 + rosdep + Go2SLAM 校验已下线。"""
+    print("跳过 geometry 系统依赖安装（去 ROS2 化：geometry runtime 由 nuwax-geometry-runtime 承载）。")
+    return
 
 
-def assert_go2slam_runtime_ready(ros_setup: Path) -> None:
-    setup_path = go2slam_setup_path()
-    if not setup_path.exists():
-        raise BootstrapError(
-            f"缺少 Go2SLAM install/setup.bash: {setup_path}。"
-            f"请执行 `cd {GO2SLAM_WS_DIR} && source {ros_setup} && colcon build --symlink-install`。"
-        )
-    stale_source = find_go2slam_stale_source(setup_path)
-    if stale_source is not None:
-        raise BootstrapError(
-            f"Go2SLAM 工作区需要重新编译，源码文件新于 install: {stale_source}。"
-            f"请执行 `cd {GO2SLAM_WS_DIR} && source {ros_setup} && colcon build --symlink-install`。"
-        )
-    missing_runtime = missing_go2slam_runtime_packages(ros_setup)
-    if missing_runtime:
-        raise BootstrapError(
-            "Go2SLAM install 中缺少运行包: "
-            + ", ".join(missing_runtime)
-            + f"。请执行 `cd {GO2SLAM_WS_DIR} && source {ros_setup} && colcon build --symlink-install`。"
-        )
-
-
-def build_workspaces(planner: BootstrapPlanner) -> None:
-    geometry_script = PROJECT_ROOT / "services" / "geometry" / "build_ros2_workspace.sh"
-    if planner.build_geometry and geometry_script.exists():
-        _run(("bash", str(geometry_script)), cwd=PROJECT_ROOT)
-    if planner.build_go2slam:
-        ros_setup = _detect_ros_setup()
-        if ros_setup is None:
-            raise BootstrapError("未找到 ROS2 安装，不能构建 Go2SLAM 工作区。")
-        assert_go2slam_workspace_ready(ros_setup)
-        _run(
-            (
-                "bash",
-                "-lc",
-                "source "
-                + shlex.quote(str(ros_setup))
-                + " && colcon --log-base log build --symlink-install --parallel-workers 1 --build-base build --install-base install",
-            ),
-            cwd=GO2SLAM_WS_DIR,
-        )
-        assert_go2slam_runtime_ready(ros_setup)
+def build_workspaces(planner: BootstrapPlanner) -> None:  # noqa: ARG001
+    """no-op 占位：原 build_ros2_workspace.sh / colcon build 已下线。"""
+    print("跳过 ROS2 工作空间构建（去 ROS2 化：geometry runtime 由 nuwax-geometry-runtime 承载）。")
+    return
 
 
 def prepare_assets(planner: BootstrapPlanner) -> None:
@@ -1403,11 +919,9 @@ def start_gateway(planner: BootstrapPlanner) -> None:
     if not planner.start_gateway:
         print("跳过自动启动 gateway。")
         return
-    if planner.selected_robot == "go2" and planner.geometry_enabled:
-        ros_setup = _detect_ros_setup()
-        if ros_setup is None:
-            raise BootstrapError("未找到 ROS2 安装，不能启动 Go2 geometry 主链。")
-        assert_go2slam_runtime_ready(ros_setup)
+    # 去 ROS2 化（2026-07-03 drop-ros2）：Go2 geometry 不再要求 _detect_ros_setup /
+    # assert_go2slam_runtime_ready；geometry runtime 由 ``nuwax-geometry-runtime``
+    # 提供，依赖 go2.sh / start_gateway.sh 的 native 启动链。
     command = f"nohup bash {START_SCRIPT} > /tmp/nuwax_bootstrap_gateway.log 2>&1 &"
     _run_shell(command, cwd=PROJECT_ROOT)
     print("已在后台启动 gateway，日志位于 /tmp/nuwax_bootstrap_gateway.log")
@@ -1460,9 +974,13 @@ def run_wizard(args: argparse.Namespace) -> int:
     args.relay = prompt_bool("启用 relay", False)
     args.systemd = prompt_bool("生成 systemd 示例", True)
     args.install_python = prompt_bool("安装 Python 依赖", True)
-    args.build_geometry = prompt_bool("构建 geometry ROS2 工作空间", bool(args.geometry))
-    args.build_go2slam = prompt_bool("单独构建 Go2SLAM 工作区", args.robot == "go2" and bool(args.build_geometry))
-    args.install_geometry_deps = prompt_bool("安装 RTAB-Map/Nav2 系统依赖", bool(args.geometry))
+    # 去 ROS2 化（2026-07-03 drop-ros2）：原 build_geometry / build_go2slam /
+    # install_geometry_deps wizard 选项已下线；geometry runtime 由
+    # ``nuwax-geometry-runtime`` 提供，无 ROS2 工作空间可构建；默认值置 False 以保留
+    # argparse 接口兼容，避免旧 profile 加载崩溃。
+    args.build_geometry = False
+    args.build_go2slam = False
+    args.install_geometry_deps = prompt_bool("安装 nuwax-geometry-runtime OS 依赖", bool(args.geometry))
     args.prepare_yolo = prompt_bool("准备 YOLO-World 权重", args.perception_mode != "disabled")
     args.prepare_memory = prompt_bool("准备本地 memory 模型", args.memory_mode == "local")
     args.mcp_mode = prompt_choice("选择 MCP 注入模式", ("auto", "config-only", "skip"), "auto")
@@ -1540,19 +1058,34 @@ def build_parser() -> argparse.ArgumentParser:
         add_boolean_flag(subparser, "prepare_memory", "准备本地记忆模型")
         add_boolean_flag(subparser, "prepare_yolo", "准备 YOLO-World 权重")
         add_boolean_flag(subparser, "export_yolo_engine", "导出 YOLO-World TensorRT 引擎")
-        add_boolean_flag(subparser, "build_geometry", "构建 geometry ROS2 工作空间")
+        # 去 ROS2 化（2026-07-03 drop-ros2）：--build-geometry / --build-go2slam /
+        # --install-geometry-deps / --repair-ros2-apt-source 已下线；保留为 no-op
+        # argparse 接口以兼容老 profile / wizard；help 文本明确已下线。
+        add_boolean_flag(
+            subparser,
+            "build_geometry",
+            "[下线] 已删除 ROS2 geometry 工作空间构建",
+        )
         add_boolean_flag(
             subparser,
             "build_go2slam",
-            "Go2 默认额外构建 services/geometry/ros2_ws/src/GO2_RTABNAV2/ws",
+            "[下线] 已删除 Go2SLAM 工作空间构建",
         )
         subparser.add_argument(
             "--build-go2-rtabnav2",
             action="store_true",
-            help="与 --build-go2slam 等价，构建 GO2_RTABNAV2/ws。",
+            help="[下线] 已删除（与 --build-go2slam 等价，ROS2 工作空间已物理删除）",
         )
-        add_boolean_flag(subparser, "install_geometry_deps", "安装 RTAB-Map/Nav2 系统依赖")
-        add_boolean_flag(subparser, "repair_ros2_apt_source", "自动修复异常 ROS2 apt 源")
+        add_boolean_flag(
+            subparser,
+            "install_geometry_deps",
+            "安装 nuwax-geometry-runtime OS 依赖",
+        )
+        add_boolean_flag(
+            subparser,
+            "repair_ros2_apt_source",
+            "[下线] ROS2 apt 源修复已删除",
+        )
         add_boolean_flag(subparser, "start_gateway", "启动 gateway")
         add_boolean_flag(subparser, "healthcheck", "执行健康检查")
 

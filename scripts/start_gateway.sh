@@ -19,7 +19,7 @@ LOCK_FILE=""
 LOCK_FD=""
 GATEWAY_PID=""
 VIDEO_STREAMER_PID=""
-ROS_BRIDGE_PID=""
+GEOMETRY_RUNTIME_PID=""
 STOP_REQUESTED=0
 
 trim_whitespace() {
@@ -205,8 +205,11 @@ cleanup_stale_gateway_processes() {
   done < <(ps -eo pid=,args=)
 }
 
-cleanup_stale_ros_bridge_processes() {
-  local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
+cleanup_stale_geometry_runtime_processes() {
+  # 去 ROS2 化（2026-07-03 drop-ros2）：原 cleanup_stale_geometry_runtime_processes 改为
+  # cleanup_stale_geometry_runtime_processes；清理对象改为 nuwax-geometry-runtime，
+  # 端口 50051（gRPC 控制面兼容边界）复用同名变量。
+  local binary="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
   local pid=""
   local args=""
 
@@ -214,34 +217,30 @@ cleanup_stale_ros_bridge_processes() {
     if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
       continue
     fi
-    if [[ "${args}" == *"nuwax-ros-bridge"* ]]; then
-      terminate_process_scope "${pid}" "stale ros-bridge"
+    if [[ "${args}" == *"nuwax-geometry-runtime"* ]]; then
+      terminate_process_scope "${pid}" "stale geometry runtime"
     fi
   done < <(ps -eo pid=,args=)
 
-  # 兜底清理：nuwax-ros-bridge 可能已被 pgrep 杀过但 listen socket 仍处 TIME_WAIT，
-  # 或被 SIGKILL 后 socket 未立即释放。下次 spawn 会因 port-in-use 失败，
-  # 而 Python 端 RosBridgeSubprocess 端口探测会误报"端口已开"导致 attach 到僵尸。
-  # 这里先看端口状态：若 50051 仍 LISTEN 且 pgrep 已无匹配 → 主动 fuser 杀端口持有者。
-  # 顺序约束：必须等 gateway worker 已停（本函数仅在 cleanup_stale_gateway_processes 之后
-  # 调用），否则会误杀在跑 bridge 的 listen socket。当前所有调用点均已满足。
-  local bridge_port="${NUWAX_ROS_BRIDGE_PORT:-50051}"
+  # 兜底清理：nuwax-geometry-runtime 已被 pgrep 杀过但 gRPC listen socket 仍处
+  # TIME_WAIT，或被 SIGKILL 后 socket 未立即释放。下次 spawn 会因 port-in-use 失败，
+  # 平台侧 GeometryRuntimeProvider 端口探测会误报"端口已开"导致 attach 到僵尸。
+  local runtime_port="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
   if command -v ss >/dev/null 2>&1; then
-    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)${bridge_port}$"; then
-      if ! pgrep -f "nuwax-ros-bridge" >/dev/null 2>&1; then
-        echo "==> port ${bridge_port} still LISTEN but no nuwax-ros-bridge process; clearing residual socket"
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)${runtime_port}$"; then
+      if ! pgrep -f "nuwax-geometry-runtime" >/dev/null 2>&1; then
+        echo "==> port ${runtime_port} still LISTEN but no nuwax-geometry-runtime process; clearing residual socket"
         if command -v fuser >/dev/null 2>&1; then
-          fuser -KILL "${bridge_port}/tcp" >/dev/null 2>&1 || true
+          fuser -KILL "${runtime_port}/tcp" >/dev/null 2>&1 || true
         else
-          # 退化路径：用 lsof 找持有者再 kill；缺失时记 warning 不阻塞。
           if command -v lsof >/dev/null 2>&1; then
             local residual_pid
-            residual_pid="$(lsof -ti tcp:${bridge_port} 2>/dev/null || true)"
+            residual_pid="$(lsof -ti tcp:${runtime_port} 2>/dev/null || true)"
             if [[ -n "${residual_pid}" ]]; then
               kill -KILL ${residual_pid} >/dev/null 2>&1 || true
             fi
           else
-            echo "WARNING: fuser/lsof 都不可用，端口 ${bridge_port} 残留可能让 spawn 失败" >&2
+            echo "WARNING: fuser/lsof 都不可用，端口 ${runtime_port} 残留可能让 spawn 失败" >&2
           fi
         fi
         sleep 0.5
@@ -342,7 +341,7 @@ stop_existing_gateway() {
   if [[ -z "${pid}" ]]; then
     echo "gateway pid file not found: ${PID_FILE}"
     cleanup_stale_gateway_processes
-    cleanup_stale_ros_bridge_processes
+    cleanup_stale_geometry_runtime_processes
     cleanup_stale_go2_video_streamer
     cleanup_external_geometry_processes
     return 0
@@ -352,7 +351,7 @@ stop_existing_gateway() {
     echo "gateway pid ${pid} is not running; removing stale pid file."
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
-    cleanup_stale_ros_bridge_processes
+    cleanup_stale_geometry_runtime_processes
     cleanup_stale_go2_video_streamer
     cleanup_external_geometry_processes
     return 0
@@ -364,7 +363,7 @@ stop_existing_gateway() {
   # 再停 ros-bridge（避免重启窗口期 GetFrameTree 抛 UNAVAILABLE 刷日志）→
   # 最后清理外部几何进程。
   cleanup_stale_gateway_processes
-  cleanup_stale_ros_bridge_processes
+  cleanup_stale_geometry_runtime_processes
   cleanup_external_geometry_processes
 }
 
@@ -379,9 +378,9 @@ status_gateway() {
   return 3
 }
 
-should_start_ros_bridge() {
-  local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
-  [[ -x "${binary}" ]] && is_truthy "${NUWAX_ROS_BRIDGE_ENABLED:-true}"
+should_start_geometry_runtime() {
+  local binary="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
+  [[ -x "${binary}" ]] && is_truthy "${NUWAX_GEOMETRY_RUNTIME_ENABLED:-true}"
 }
 
 should_start_go2_video_streamer() {
@@ -390,51 +389,39 @@ should_start_go2_video_streamer() {
     && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "go2" ]]
 }
 
-start_ros_bridge() {
-  if [[ -n "${ROS_BRIDGE_PID}" ]] && is_pid_alive "${ROS_BRIDGE_PID}"; then
+start_geometry_runtime() {
+  # 去 ROS2 化（2026-07-03 drop-ros2）：原 start_geometry_runtime 改为 start_geometry_runtime；
+  # 不再 source /opt/ros/*/setup.bash / export RMW_IMPLEMENTATION；改走通用
+  # ``services/geometry/source_runtime_env.sh``（已重写为去 ROS2 化的通用 env 加载器）。
+  if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
     return 0
   fi
-  if ! should_start_ros_bridge; then
+  if ! should_start_geometry_runtime; then
     return 0
   fi
-  local binary="${REPO_ROOT}/services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge"
-  local bridge_env_script="${NUWAX_ROS_BRIDGE_ENV_SCRIPT:-}"
-  if [[ -z "${bridge_env_script}" && -n "${NUWAX_GEOMETRY_EXTERNAL_SCRIPT:-}" ]]; then
-    bridge_env_script="$(dirname "${NUWAX_GEOMETRY_EXTERNAL_SCRIPT}")/scripts/env.sh"
-  fi
-  local bridge_map_topic="${NUWAX_MAP_TOPIC:-${NUWAX_GEOMETRY_OCCUPANCY_TOPIC:-/map_obstacles}}"
-  local bridge_tf_topic="${NUWAX_TF_TOPIC:-${NUWAX_GEOMETRY_TF_TOPIC:-/tf}}"
-  local bridge_nav_action="${NUWAX_NAV_ACTION:-${NUWAX_NAV2_ACTION_NAME:-/navigate_to_pose}}"
-  local bridge_odom_source="${NUWAX_GO2_ODOM_SOURCE:-${NUWAX_GEOMETRY_ODOM_TOPIC:-/utlidar/robot_odom}}"
-  local bridge_cloud_source="${NUWAX_GO2_POINTCLOUD_SOURCE:-${NUWAX_GEOMETRY_POINT_CLOUD_TOPIC:-/utlidar/cloud}}"
-  echo "starting Rust ros-bridge: ${binary}"
+  local binary="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
+  echo "starting nuwax-geometry-runtime: ${binary}"
   (
     set +u
-    export NUWAX_MAP_TOPIC="${bridge_map_topic}"
-    export NUWAX_TF_TOPIC="${bridge_tf_topic}"
-    export NUWAX_NAV_ACTION="${bridge_nav_action}"
-    export NUWAX_GO2_ODOM_SOURCE="${bridge_odom_source}"
-    export NUWAX_GO2_POINTCLOUD_SOURCE="${bridge_cloud_source}"
-    if [[ -f "${bridge_env_script}" ]]; then
-      source "${bridge_env_script}"
-    else
-      source /opt/ros/foxy/setup.bash
-      export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-    fi
-    set -u
-    run_with_title "nuwax-ros-bridge" "${binary}"
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
+    export NUWAX_GEOMETRY_RUNTIME_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
+    export NUWAX_GEOMETRY_RUNTIME_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
+    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
+    run_with_title "nuwax-geometry-runtime" "${binary}"
   ) &
-  ROS_BRIDGE_PID="$!"
-  # 等待 UDS socket 出现
+  GEOMETRY_RUNTIME_PID="$!"
+  # 等待 ready file
   local waited=0
-  while [[ ! -S /tmp/nuwax_video.sock ]] && [[ "${waited}" -lt 5 ]]; do
+  local ready_file="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
+  while [[ ! -f "${ready_file}" ]] && [[ "${waited}" -lt 10 ]]; do
     sleep 1
     waited=$((waited + 1))
   done
-  if [[ -S /tmp/nuwax_video.sock ]]; then
-    echo "Rust ros-bridge ready (pid ${ROS_BRIDGE_PID})"
+  if [[ -f "${ready_file}" ]]; then
+    echo "nuwax-geometry-runtime ready (pid ${GEOMETRY_RUNTIME_PID})"
   else
-    echo "WARNING: Rust ros-bridge UDS not ready after 5s" >&2
+    echo "WARNING: nuwax-geometry-runtime ready file 未在 10s 内出现" >&2
   fi
 }
 
@@ -450,23 +437,24 @@ start_go2_video_streamer() {
   VIDEO_STREAMER_PID="$!"
 }
 
-stop_ros_bridge() {
-  if [[ -n "${ROS_BRIDGE_PID}" ]] && is_pid_alive "${ROS_BRIDGE_PID}"; then
-    terminate_process_scope "${ROS_BRIDGE_PID}" "rust ros-bridge"
-    wait "${ROS_BRIDGE_PID}" >/dev/null 2>&1 || true
+stop_geometry_runtime() {
+  if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
+    terminate_process_scope "${GEOMETRY_RUNTIME_PID}" "nuwax-geometry-runtime"
+    wait "${GEOMETRY_RUNTIME_PID}" >/dev/null 2>&1 || true
   fi
-  ROS_BRIDGE_PID=""
+  GEOMETRY_RUNTIME_PID=""
   rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+  rm -f "${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}" 2>/dev/null || true
 }
 
-monitor_ros_bridge() {
+monitor_geometry_runtime() {
   while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
     sleep 5
-    if [[ -n "${ROS_BRIDGE_PID}" ]] && ! is_pid_alive "${ROS_BRIDGE_PID}"; then
-      echo "Rust ros-bridge (pid ${ROS_BRIDGE_PID}) crashed, restarting..." >&2
+    if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && ! is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
+      echo "nuwax-geometry-runtime (pid ${GEOMETRY_RUNTIME_PID}) crashed, restarting..." >&2
       rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
-      ROS_BRIDGE_PID=""
-      start_ros_bridge
+      GEOMETRY_RUNTIME_PID=""
+      start_geometry_runtime
     fi
   done
 }
@@ -484,15 +472,15 @@ stop_go2_video_streamer() {
 
 stop_gateway() {
   STOP_REQUESTED=1
-  # 顺序：先杀网关 worker → 再停 ros-bridge → 最后停 video streamer。
-  # 关键是先切断网关（geometry / perception 客户端），否则 ros-bridge 一停，
+  # 顺序：先杀网关 worker → 再停 geometry runtime → 最后停 video streamer。
+  # 关键是先切断网关（geometry / perception 客户端），否则 geometry runtime 一停，
   # 客户端在重启窗口期 GetFrameTree 立即抛 UNAVAILABLE，日志刷一长串
   # "failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:50051"。
   if [[ -n "${GATEWAY_PID}" ]] && kill -0 "${GATEWAY_PID}" >/dev/null 2>&1; then
     terminate_process_scope "${GATEWAY_PID}" "gateway worker"
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
   fi
-  stop_ros_bridge
+  stop_geometry_runtime
   stop_go2_video_streamer
   cleanup_external_geometry_processes
   exit 0
@@ -507,12 +495,10 @@ if [[ -f "${GO2_DATA_PLANE_ENV_FILE}" ]]; then
   load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
 fi
 
-unset RMW_IMPLEMENTATION
-if grep -q '^CYCLONEDDS_URI=' "${ENV_FILE}" 2>/dev/null; then
-  CYCLONEDDS_URI="$(grep '^CYCLONEDDS_URI=' "${ENV_FILE}" | head -1)"
-  CYCLONEDDS_URI="${CYCLONEDDS_URI#CYCLONEDDS_URI=}"
-  export CYCLONEDDS_URI
-fi
+# 去 ROS2 化（2026-07-03 drop-ros2）：原 `unset RMW_IMPLEMENTATION` 与 `CYCLONEDDS_URI`
+# 回写 .env 的兼容代码段已删除；geometry runtime 走 LCM typed channel，不再需要 RMW /
+# CycloneDDS env。
+unset RMW_IMPLEMENTATION 2>/dev/null || true
 
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
 PID_FILE="${NUWAX_GATEWAY_PID_FILE:-${REPO_ROOT}/runtime_data/gateway/gateway.pid}"
@@ -529,7 +515,7 @@ case "${ACTION}" in
     fi
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
-    cleanup_stale_ros_bridge_processes
+    cleanup_stale_geometry_runtime_processes
     cleanup_stale_go2_video_streamer
     cleanup_external_geometry_processes
     ;;
@@ -551,9 +537,8 @@ case "${ACTION}" in
 esac
 
 if is_truthy "${NUWAX_GEOMETRY_ENABLED:-true}"; then
-  if is_truthy "${NUWAX_GEOMETRY_REQUIRE_ROS2:-true}"; then
-    export NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV="${NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV:-true}"
-  fi
+  # 去 ROS2 化（2026-07-03 drop-ros2）：原 NUWAX_GEOMETRY_REQUIRE_ROS2 / NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV
+  # 检查已删除；source_runtime_env.sh 改为通用 env 加载器（不再 source ROS setup）。
   source_runtime_script "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
 fi
 
@@ -571,13 +556,13 @@ if ! is_restart_enabled "${RESTART_POLICY}"; then
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
-  start_ros_bridge
+  start_geometry_runtime
   start_go2_video_streamer
-  monitor_ros_bridge &
+  monitor_geometry_runtime &
   wait "${GATEWAY_PID}"
   exit_code="$?"
   stop_go2_video_streamer
-  stop_ros_bridge
+  stop_geometry_runtime
   exit "${exit_code}"
 fi
 
@@ -586,9 +571,9 @@ while true; do
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
-  start_ros_bridge
+  start_geometry_runtime
   start_go2_video_streamer
-  monitor_ros_bridge &
+  monitor_geometry_runtime &
   wait "${GATEWAY_PID}"
   exit_code="$?"
   stop_go2_video_streamer

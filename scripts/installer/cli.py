@@ -41,7 +41,6 @@ import scripts.installer.phases.preflight  # noqa: F401, E402
 import scripts.installer.phases.system  # noqa: F401, E402
 import scripts.installer.phases.python_env  # noqa: F401, E402
 import scripts.installer.phases.geometry_deps  # noqa: F401, E402
-import scripts.installer.phases.build_ws  # noqa: F401, E402
 import scripts.installer.phases.config_env  # noqa: F401, E402
 import scripts.installer.phases.models  # noqa: F401, E402
 import scripts.installer.phases.systemd  # noqa: F401, E402
@@ -67,7 +66,7 @@ class PhaseContext:
     offline: bool = False
     non_interactive: bool = False
     # 离线模式阶段列表（NETWORK_HOOKS guard 触发阶段名）
-    offline_strict_phases: tuple = ("system", "geometry_deps", "build_ws", "models", "nuwaclaw", "health")
+    offline_strict_phases: tuple = ("system", "geometry_deps", "models", "nuwaclaw", "health")
 
     def _check_offline(self, phase_name: str) -> None:
         """离线模式下，被列入 strict_phases 的阶段拒绝执行（仅 dry_run 允许）。"""
@@ -119,7 +118,7 @@ def _add_parent_flags(parent: argparse.ArgumentParser) -> None:
         help=(
             "测试钩子：将指定 phase 的退出码覆盖为 EXIT_CODE（用于断点续跑与错误注入单测），"
             "可重复。格式: PHASE=exit-<int> 或 =skip。"
-            "示例: --phase-override build_ws=exit-1 --phase-override models=skip"
+            "示例: --phase-override models=exit-1 --phase-override nuwaclaw=skip"
         ),
     )
     parent.add_argument(
@@ -445,7 +444,6 @@ def _should_skip_phase(phase_name: str, planner: InstallPlanner, runtime: Runtim
     skip_flags: Dict[str, str] = {
         "python_env": "install_python",
         "geometry_deps": "install_geometry_deps",
-        "build_ws": "build_geometry",
         "systemd": "systemd",
         "nuwaclaw": "install_nuwaclaw_docker",
         "health": "healthcheck",

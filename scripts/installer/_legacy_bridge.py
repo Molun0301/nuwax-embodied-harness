@@ -103,18 +103,11 @@ def call_install_python_dependencies(planner):
 
 
 def call_install_geometry_system_dependencies(planner):
-    """包装 bootstrap.install_geometry_system_dependencies（L1020）。"""
-    return _wrap(
-        "geometry_deps",
-        _bootstrap().install_geometry_system_dependencies,
-        planner,
-        context="RTAB-Map / Nav2 系统依赖",
-    )
-
-
-def call_build_workspaces(planner):
-    """包装 bootstrap.build_workspaces（L1129）。"""
-    return _wrap("build_ws", _bootstrap().build_workspaces, planner, context="colcon 构建 geometry ROS2 工作区")
+    """包装 bootstrap.install_geometry_system_dependencies（L1020）— 去 ROS2 化后保留为 no-op。"""
+    # 2026-07-03 drop-ros2：ROS2 apt 依赖安装已迁移至 native runtime 系统包，
+    # bootstrap.install_geometry_system_dependencies 自身成为 no-op；保留包装以稳定
+    # ``phases/system.py`` 调用点。
+    return 0
 
 
 def call_prepare_assets(planner):
@@ -143,7 +136,6 @@ __all__ = [
     "call_write_robot_env",
     "call_install_python_dependencies",
     "call_install_geometry_system_dependencies",
-    "call_build_workspaces",
     "call_prepare_assets",
     "call_install_nuwaclaw_client",
     "call_configure_mcp",

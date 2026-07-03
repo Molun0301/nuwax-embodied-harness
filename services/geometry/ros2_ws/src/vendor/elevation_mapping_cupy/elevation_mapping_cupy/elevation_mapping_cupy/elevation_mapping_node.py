@@ -1,1 +1,0 @@
-../scripts/elevation_mapping_node.py

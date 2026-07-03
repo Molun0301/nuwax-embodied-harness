@@ -1,0 +1,45 @@
+[package]
+name = "nuwax-geometry-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "nuwax 平台几何 LCM/nuwax native runtime 子进程（独立于 Python 网关）"
+
+# 依赖来源：nuwax-workspace LCM-first Rust 栈
+# 路径：/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace
+# MSRV 1.88；目标机 aarch64 + Ubuntu 20.04；不允许引入 ROS2/r2r/DDS/RMW 依赖。
+
+[dependencies]
+# nuwax-workspace path deps（LCM-first）。P0 默认 fake backend，real-lcm feature 由 P1 实装。
+nuwax-protocol = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-protocol" }
+nuwax-transport = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-transport", default-features = false }
+nuwax-codec = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-codec" }
+nuwax-tf = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-tf" }
+
+# 原生 runtime 必备依赖（gRPC/HTTP/SHM/日志/系统调用）
+tokio = { version = "1", features = ["full", "net"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+memmap2 = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+nix = { version = "0.29", features = ["fs", "mman"] }
+futures = "0.3"
+parking_lot = "0.12"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[[bin]]
+name = "nuwax-geometry-runtime"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

@@ -1,6 +1,13 @@
 syntax = "proto3";
 package nuwax.geometry;
 
+// ============================================================================
+// 目标态 GeometryRuntime gRPC facade
+// - 内部数据协议走 nuwax-workspace LCM typed channels（fake backend 默认）；
+// - 该 proto 仅作为 Python 网关 ↔ Rust runtime 之间的 gRPC 控制面兼容边界；
+// - 旧 ROS2 / r2r / Nav2 action / CycloneDDS 依赖已删除；不允许恢复。
+// ============================================================================
+
 message Empty {}
 message Vec3 { double x = 1; double y = 2; double z = 3; }
 message Quat { double x = 1; double y = 2; double z = 3; double w = 4; }
@@ -24,6 +31,7 @@ message ShmRef {
   uint64 revision = 3;
 }
 
+// === 控制面 ===
 message StartRequest { string config_json = 1; }
 message StartResult { bool success = 1; string message = 2; }
 message StopRequest {}
@@ -33,11 +41,14 @@ message RuntimeStatus {
   string message = 2;
   uint64 uptime_ms = 3;
   uint32 rss_kb = 4;
+  string lcm_backend = 5;
 }
 
+// === 定位 ===
 message PoseRequest { string target_frame = 1; string source_frame = 2; }
 message PoseUpdate { Pose pose = 1; uint64 sequence = 2; }
 
+// === 地图 ===
 message OccupancyGridMeta {
   uint32 width = 1;
   uint32 height = 2;
@@ -75,6 +86,7 @@ message HealthCheckResponse {
   uint32 rss_kb = 4;
   uint64 video_frame_sequence = 5;
   uint32 video_fps_estimate = 6;
+  string lcm_backend = 7;
 }
 
 // === 累积地图共享内存引用 ===
@@ -84,7 +96,44 @@ message CloudMapShmRef {
   float voxel_size = 3;
 }
 
-// === 服务定义 ===
+// === 导航兼容 ===
+message NavigationGoal {
+  Pose pose = 1;
+  string frame_id = 2;
+  string goal_id = 3;
+}
+message CancelNavigationRequest { string goal_id = 1; }
+message NavigationState {
+  string status = 1;
+  string message = 2;
+  string goal_id = 3;
+  float distance_remaining = 4;
+  uint64 timestamp_ns = 5;
+}
+message NavigationReadiness {
+  bool ready = 1;
+  string reason = 2;
+}
+
+// === 探索 ===
+message Frontier {
+  Pose pose = 1;
+  uint32 size_cells = 2;
+  float heading = 3;
+}
+message FrontierList { repeated Frontier frontiers = 1; uint64 revision = 2; }
+
+// === 输入发布兼容（用于调试/自检/preview，区别于 nav2_action_provider）===
+message PublishOdomRequest { Pose pose = 1; }
+message PublishPointCloudRequest {
+  bytes points = 1;          // PointCloud2 字节（LCM codec 编码后 payload）
+  uint32 point_step = 2;
+}
+message PublishResult { bool success = 1; string message = 2; }
+
+// ============================================================================
+// 服务定义：GeometryRuntime gRPC facade
+// ============================================================================
 service GeometryRuntime {
   // 控制面
   rpc Start(StartRequest) returns (StartResult);
@@ -100,7 +149,21 @@ service GeometryRuntime {
   // 地图
   rpc GetOccupancyGrid(Empty) returns (OccupancyGridMeta);
   rpc GetOccupancyGridData(Empty) returns (OccupancyGridData);
-  rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
   rpc GetOccupancyGridShm(Empty) returns (ShmRef);
+  rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
   rpc SubscribeCloudMapUpdates(Empty) returns (stream CloudMapShmRef);
+
+  // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
+  rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);
+  rpc CancelNavigation(CancelNavigationRequest) returns (NavigationState);
+  rpc SubscribeNavigationState(Empty) returns (stream NavigationState);
+  rpc GetNavigationReadiness(Empty) returns (NavigationReadiness);
+
+  // 探索（与 nuwax-exploration LCM channel 接口对应）
+  rpc GetFrontiers(Empty) returns (FrontierList);
+  rpc SubscribeFrontiers(Empty) returns (stream FrontierList);
+
+  // 输入发布兼容
+  rpc PublishOdom(PublishOdomRequest) returns (PublishResult);
+  rpc PublishPointCloud(PublishPointCloudRequest) returns (PublishResult);
 }

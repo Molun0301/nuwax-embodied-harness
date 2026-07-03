@@ -1,4 +1,12 @@
-"""从 ROS /cloud_map 或 RTAB-Map 数据库抓取累计点云并落盘为 PCD。"""
+"""从 RTAB-Map 数据库抓取累计点云并落盘为 PCD。
+
+历史模块曾支持「订阅 /cloud_map ROS2 话题」路径；Phase 3 去 ROS2 后该路径下线，
+点云由 nuwax-geometry-runtime 持续维护 SHM（参见 services/geometry/pointcloud_map.py），
+平台层走 ``export_cloud_map_pcd_from_database``（rtabmap-export --scan）路径即可。
+
+本模块保留 ``fetch_cloud_map_xyz`` 入口签名作为 no-op（始终返回 ``None``），
+仅用于让上层调用方不报错地走「目标态 mmap 路径」。
+"""
 from __future__ import annotations
 
 import logging
@@ -6,7 +14,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -21,9 +28,10 @@ FetchResult = Tuple[np.ndarray, str, str]
 
 
 def default_cloud_map_topic() -> str:
-    # 与 core/settings.py:856-860 的 cloud_map_topic 别名口径完全一致：
-    # 首选 NUWAX_GEOMETRY_CLOUD_MAP_TOPIC，legacy NUWAX_CLOUD_MAP_TOPIC 回退。
-    # 本模块属 services 层，按 R6 不引入模块级 import settings，仅对齐读取口径以消除 split-brain。
+    """保留 NUWAX_GEOMETRY_CLOUD_MAP_TOPIC → NUWAX_CLOUD_MAP_TOPIC 回退链路。
+
+    Phase 3 目标态下「订阅 ROS2 话题」路径已下线，但默认话题名仍提供给上层做诊断日志。
+    """
     preferred = str(os.environ.get("NUWAX_GEOMETRY_CLOUD_MAP_TOPIC") or "").strip()
     if preferred:
         return preferred
@@ -70,99 +78,19 @@ def fetch_cloud_map_xyz(
     timeout_sec: Optional[float] = None,
     min_points: Optional[int] = None,
 ) -> Optional[FetchResult]:
-    """一次性订阅 RTAB-Map 发布的累计点云话题（默认 /cloud_map）。"""
+    """平台层累计点云获取入口（Phase 3 目标态 no-op）。
 
-    resolved_topic = str(topic or default_cloud_map_topic()).strip() or "/cloud_map"
-    resolved_timeout = float(timeout_sec if timeout_sec is not None else default_fetch_timeout_sec())
-    resolved_min_points = int(min_points if min_points is not None else default_min_points())
-    try:
-        from geometry_msgs.msg import PointCloud2
-        from rclpy.executors import SingleThreadedExecutor
-        from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-        from sensor_msgs_py import point_cloud2
+    历史「一次性订阅 /cloud_map 话题再写 mmap」路径已下线（ROS2 接触面已删除），
+    sensor_msgs_py / PointCloud2 等 ROS2 接触面）。点云由 nuwax-geometry-runtime
+    持续维护 SHM（参见 services/geometry/pointcloud_map.py），平台层走 mmap 读取即可。
 
-        from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
-    except ImportError as exc:
-        LOGGER.debug("ROS2 点云抓取依赖不可用：%s", exc)
-        return None
-
-    os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
-    cyclonedds_xml = os.path.expanduser("~/cyclonedds_ws/cyclonedds.xml")
-    if os.path.exists(cyclonedds_xml):
-        os.environ.setdefault("CYCLONEDDS_URI", cyclonedds_xml)
-
-    qos_profiles = (
-        QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        ),
-        QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        ),
+    本函数保留签名以兼容现有调用方：始终返回 ``None``，调用方应改走
+    ``export_cloud_map_pcd_from_database`` 或 runtime SHM 路径。
+    """
+    LOGGER.debug(
+        "fetch_cloud_map_xyz 目标态走 nuwax-geometry-runtime mmap 路径，不再订阅 /cloud_map topic。"
     )
-
-    holder: Dict[str, object] = {"message": None}
-
-    def _on_message(message: PointCloud2) -> None:
-        holder["message"] = message
-
-    rclpy = None
-    node = None
-    has_context = False
-    try:
-        rclpy = acquire_ros2_context()
-        has_context = True
-        node = rclpy.create_node("nuwax_cloud_map_fetcher")
-        for qos in qos_profiles:
-            node.create_subscription(PointCloud2, resolved_topic, _on_message, qos)
-        executor = SingleThreadedExecutor()
-        executor.add_node(node)
-        deadline = time.monotonic() + resolved_timeout
-        while time.monotonic() < deadline and holder["message"] is None:
-            executor.spin_once(timeout_sec=0.1)
-        message = holder["message"]
-        if message is None:
-            return None
-        frame_id = str(getattr(message.header, "frame_id", "") or map_frame)
-        points = list(
-            point_cloud2.read_points(
-                message,
-                field_names=("x", "y", "z"),
-                skip_nans=True,
-            )
-        )
-        if not points:
-            return None
-        xyz = np.asarray(points, dtype=np.float32)
-        if xyz.ndim != 2 or xyz.shape[1] != 3:
-            return None
-        finite_mask = np.isfinite(xyz).all(axis=1)
-        xyz = xyz[finite_mask]
-        if int(xyz.shape[0]) < resolved_min_points:
-            LOGGER.info(
-                "话题 %s 点云过少（%d < %d），跳过作为版本 PCD。",
-                resolved_topic,
-                int(xyz.shape[0]),
-                resolved_min_points,
-            )
-            return None
-        return xyz, frame_id, resolved_topic
-    except Exception as exc:
-        LOGGER.warning("从 ROS 话题 %s 抓取累计点云失败：%s", resolved_topic, exc)
-        return None
-    finally:
-        if node is not None:
-            try:
-                node.destroy_node()
-            except Exception:
-                pass
-        if has_context:
-            release_ros2_context()
+    return None
 
 
 def export_cloud_map_pcd_from_database(

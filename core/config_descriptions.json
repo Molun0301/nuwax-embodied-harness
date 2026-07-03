@@ -31,7 +31,7 @@
   "NUWAX_PERCEPTION_YOLO_WORLD_ALIASES": "YOLO-World 动态类别别名（CSV，默认空；settings.py:779）",
   "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": "模型文件后缀即推理链路：.pt → PyTorch(YOLOWorld 开放词汇)；.engine → TensorRT(YOLO，类别固化)",
   "NUWAX_PYTHON_BIN": "NUWAX_PYTHON_BIN 由 start_gateway.sh / bootstrap.py 消费（选择 Python 解释器）",
-  "NUWAX_ROS_BRIDGE_ENV_SCRIPT": "Rust 桥环境脚本（ros_bridge_client.py:272；留空走默认推导）",
   "NUWAX_ROS_SETUP_SCRIPT": "NUWAX_ROS_SETUP_SCRIPT 由 build_ros2_workspace.sh / bootstrap.py 消费（ROS2 环境 setup）",
-  "NUWAX_VIDEO_SHM_PATH": "视频共享内存 / Unix socket 路径（gateways/ws/data_streams.py、ros_bridge_client.py:73-74）"
+  "NUWAX_VIDEO_SHM_PATH": "视频共享内存 / Unix socket 路径（gateways/ws/data_streams.py、geometry_runtime_client.py:73-74）",
+  "NUWAX_GEOMETRY_RUNTIME_ENV_SCRIPT": "Rust runtime 环境脚本（geometry_runtime_client.py:272；留空走默认推导）"
 }

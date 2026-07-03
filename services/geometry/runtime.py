@@ -43,14 +43,12 @@ from providers.maps import MapProvider
 from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
 from providers.pointcloud import PointCloudProvider
-from services.geometry.cmd_vel_bridge import Ros2CmdVelMotionBridge
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.external_debug_observer import ExternalGeometryDebugObserver
+from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
+from services.geometry.geometry_runtime_provider import GeometryRuntimeProvider
 from services.geometry.loop_closure_state import LoopClosureState, read_loop_closure_from_db
-from services.geometry.nav2_action_provider import Nav2ActionNavigationProvider
-from services.geometry.ros_bridge_client import RosBridgeSubprocess
-from services.geometry.remote_provider import RosBridgeProvider
-from services.geometry.rosout_bridge import RosoutBridge
+
 from contracts.naming import build_safe_dir_segment
 from services.localization.frame_tree_ops import resolve_frame_transform
 from services.navigation.config import ExplorationConfig, NavigationBackendConfig
@@ -457,7 +455,7 @@ class PlatformGeometryRuntime:
         self._catalog_root.mkdir(parents=True, exist_ok=True)
         self._active_map_version: Optional[MapVersion] = None
         self._last_activation_result: Dict[str, object] = {}
-        # 以下4个 Python provider 已由 Rust bridge (RosBridgeProvider) 替代，保留 None 占位以兼容现有引用
+        # 以下4个 Python provider 已由 Rust bridge (GeometryRuntimeProvider) 替代，保留 None 占位以兼容现有引用
         self._live_map_provider = None
         self._tf_localization_provider = None
         self._odometry_publisher = None
@@ -478,7 +476,7 @@ class PlatformGeometryRuntime:
         self._map_stream_tracker: Dict[str, object] = {}
         # 外部 /map 观察器（ExternalGeometryDebugObserver）才是 /map 占据栅格的真实来源；
         # Rust bridge 的 get_status 只返回 {phase,message,rss_kb}，不含占据状态。
-        # 此处缓存观察器最近一帧的就绪元数据，供 _ros_bridge_status_stub("live_map_provider")
+        # 此处缓存观察器最近一帧的就绪元数据，供 _geometry_runtime_status_stub("live_map_provider")
         # 合并，从而让 _build_rtabmap_readiness / _classify_live_mapping_wait /
         # _update_stream_tracker 读到真实的 occupancy 状态。
         self._observer_occupancy_snapshot: Dict[str, object] = {}
@@ -491,11 +489,11 @@ class PlatformGeometryRuntime:
         self._debug_initial_pose_hint_until = 0.0
         self._debug_initial_pose_hint_stable_count = 0
         self._nav2_launch_attempted = False
-        self._nav2_action_provider = Nav2ActionNavigationProvider(self)
-        self._cmd_vel_bridge: Optional[Ros2CmdVelMotionBridge] = None
-        self._ros_bridge_subprocess: Optional[RosBridgeSubprocess] = None
-        self._remote_provider: Optional[RosBridgeProvider] = None
-        self._rosout_bridge = RosoutBridge()
+        self._nav2_action_provider = None
+        self._cmd_vel_bridge = None
+        self._geometry_runtime_subprocess: Optional[GeometryRuntimeSubprocess] = None
+        self._remote_provider: Optional[GeometryRuntimeProvider] = None
+        self._rosout_bridge = None
         self._external_debug_observer: Optional[ExternalGeometryDebugObserver] = None
         self._external_debug_frontier_payload: Optional[Dict[str, object]] = None
         self._platform_exploration_config = ExplorationConfig(enabled=True)
@@ -558,11 +556,10 @@ class PlatformGeometryRuntime:
             if not self._uses_external_geometry_stack():
                 raise RuntimeError(self._removed_internal_stack_message())
             self._set_runtime_state("starting_external", "正在启动外部 SLAM/Nav2 几何脚本。")
-            self._start_ros_bridge_subprocess()
+            self._start_geometry_runtime_subprocess()
             self._ensure_external_geometry_observers_started()
             self._start_required_processes()
             self._set_runtime_state("starting_external", "外部 SLAM/Nav2 几何脚本已启动，等待 /map_obstacles、TF 与 Nav2 action。")
-            self._rosout_bridge.start()
             self._start_monitor_thread()
         except Exception as exc:
             self._record_runtime_diagnostic("geometry_start", exc)
@@ -585,12 +582,7 @@ class PlatformGeometryRuntime:
 
         self._set_runtime_state("stopping", "正在停止平台几何侧车进程。")
         self._runtime_stop_event.set()
-        if self._cmd_vel_bridge is not None:
-            try:
-                self._cmd_vel_bridge.stop()
-            except Exception:
-                pass
-            self._cmd_vel_bridge = None
+        # Phase 3 目标态：cmd_vel 桥已下线，平台内建速度桥不再启动/停止
         if self._external_debug_observer is not None:
             try:
                 self._external_debug_observer.stop()
@@ -602,7 +594,6 @@ class PlatformGeometryRuntime:
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         self._stop_managed_processes()
-        self._rosout_bridge.stop()
         self._live_geometry_start_attempted = False
         with self._runtime_state_lock:
             self._runtime_started = False
@@ -952,18 +943,17 @@ class PlatformGeometryRuntime:
                 self._external_log_name(),
             )
         if platform_cmd_vel_bridge_enabled:
-            try:
-                bridge = Ros2CmdVelMotionBridge(
-                    config=self.config,
-                    motion_provider_resolver=self._get_motion_provider,
-                )
-                bridge.start()
-                self._cmd_vel_bridge = bridge
-                LOGGER.info("ROS2 cmd_vel 运动桥已启动，订阅 %s", bridge.topic)
-            except Exception as exc:
-                LOGGER.warning("ROS2 cmd_vel 运动桥启动失败（机器人不会响应 Nav2 /cmd_vel）：%s", exc)
+            # Phase 3 目标态：ROS2 cmd_vel 桥已删除（services/geometry/cmd_vel_bridge.py）。
+            # 速度命令改由 native geometry runtime 通过 LCM channel `/cmd_vel#geometry_msgs.Twist` 推
+            # （参见 docs/开发文档/.../00_执行方案.md §2.3 / §3.4）。此处保留开关位与日志，便于
+            # 业务侧判断是否启用平台内建速度桥；启用时只是 no-op + 告警，不再创建 rclpy 节点。
+            LOGGER.warning(
+                "platform_cmd_vel_bridge_enabled=true 但 ROS2 cmd_vel 桥已下线，"
+                "速度命令改由 nuwax-geometry-runtime / LCM channel 推送，"
+                "平台内建桥不再启动。"
+            )
         if self._external_input_bridge_enabled():
-            self._start_ros_bridge_subprocess()
+            self._start_geometry_runtime_subprocess()
             bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台启动 ROS2 odom/点云输入桥，不启动内置 RTAB-Map/Nav2。"
         elif self._external_point_cloud_bridge_enabled():
             bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台只启动 ROS2 点云输入桥，跳过 odom/odom_tf_bridge。"
@@ -1073,14 +1063,14 @@ class PlatformGeometryRuntime:
             except Exception:
                 pass
             self._external_debug_observer = None
-        if self._ros_bridge_subprocess is not None:
-            self._ros_bridge_subprocess.stop()
-            self._ros_bridge_subprocess = None
+        if self._geometry_runtime_subprocess is not None:
+            self._geometry_runtime_subprocess.stop()
+            self._geometry_runtime_subprocess = None
         if self._remote_provider is not None:
             self._remote_provider.disconnect()
             self._remote_provider = None
 
-    def _start_ros_bridge_subprocess(self) -> None:
+    def _start_geometry_runtime_subprocess(self) -> None:
         """启动 Rust nuwax-ros-bridge 子进程并建立 gRPC 连接。
 
         zombie 自愈：
@@ -1091,23 +1081,23 @@ class PlatformGeometryRuntime:
         - 入口处先 zombie 检测：subprocess 存在但 is_running=False → 主动 stop+清空，
           强制走完整 spawn 路径（参见 grpc-attach-zombie-bridge-2026-06-27）。
         """
-        if self._ros_bridge_subprocess is not None:
-            if self._ros_bridge_subprocess.is_running:
+        if self._geometry_runtime_subprocess is not None:
+            if self._geometry_runtime_subprocess.is_running:
                 return
             LOGGER.warning(
                 "Rust ros-bridge 子进程状态僵死，主动 stop+清空以重新 spawn"
             )
             try:
-                self._ros_bridge_subprocess.stop()
+                self._geometry_runtime_subprocess.stop()
             except Exception as exc:
                 LOGGER.warning("zombie bridge.stop 失败（不影响主流程）: %s", exc)
-            self._ros_bridge_subprocess = None
-        bridge = RosBridgeSubprocess()
+            self._geometry_runtime_subprocess = None
+        bridge = GeometryRuntimeSubprocess()
         if not bridge.start():
             LOGGER.warning("Rust ros-bridge 子进程启动失败: %s", bridge.last_error)
-            self._record_runtime_diagnostic("ros_bridge_start", bridge.last_error or "启动失败")
+            self._record_runtime_diagnostic("geometry_runtime_start", bridge.last_error or "启动失败")
             # attach 验活失败但 spawn 也失败的场景：bridge.start() 内部已清状态，这里
-            # 仅记录诊断；下一次 _start_ros_bridge_subprocess 调用可再次尝试 spawn。
+            # 仅记录诊断；下一次 _start_geometry_runtime_subprocess 调用可再次尝试 spawn。
             if bridge.is_running is False and getattr(bridge, "_attached", False):
                 LOGGER.warning("bridge.attach 残留状态异常，主动清空避免下次 short-circuit")
                 try:
@@ -1115,8 +1105,8 @@ class PlatformGeometryRuntime:
                 except Exception:  # pragma: no cover
                     pass
             return
-        self._ros_bridge_subprocess = bridge
-        provider = RosBridgeProvider(bridge)
+        self._geometry_runtime_subprocess = bridge
+        provider = GeometryRuntimeProvider(bridge)
         if provider.connect():
             self._remote_provider = provider
             LOGGER.info("Rust ros-bridge gRPC 连接已建立")
@@ -1128,13 +1118,13 @@ class PlatformGeometryRuntime:
         else:
             LOGGER.warning("Rust ros-bridge gRPC 连接失败，子进程仍在运行")
             # connect() 内部已调 bridge.disconnect() 清状态；下一次
-            # _start_ros_bridge_subprocess 会 zombie 自愈重 spawn。
-            if self._ros_bridge_subprocess is not None and not self._ros_bridge_subprocess.is_running:
+            # _start_geometry_runtime_subprocess 会 zombie 自愈重 spawn。
+            if self._geometry_runtime_subprocess is not None and not self._geometry_runtime_subprocess.is_running:
                 LOGGER.warning("bridge 已被 disconnect 清空，提前置 None 让下次入口重 spawn")
-                self._ros_bridge_subprocess = None
+                self._geometry_runtime_subprocess = None
 
-    def _inject_static_extrinsics(self, provider: "RosBridgeProvider") -> None:
-        """装配期：从机器人 CalibrationProvider 取静态外参拓扑，缓存进 RosBridgeProvider。
+    def _inject_static_extrinsics(self, provider: "GeometryRuntimeProvider") -> None:
+        """装配期：从机器人 CalibrationProvider 取静态外参拓扑，缓存进 GeometryRuntimeProvider。
 
         平台侧零 import driver：经 self.robot.providers 鸭子类型取 get_sensor_topology，
         将各 SensorPair 转为 Transform(parent=base, child=camera_optical) 静态边，由
@@ -1233,10 +1223,10 @@ class PlatformGeometryRuntime:
         if process_failure:
             self._set_runtime_state("failed", process_failure, blocked=True)
             return
-        live_map_status = self._clone_metadata(self._ros_bridge_status_stub("live_map_provider"))
-        tf_localization_status = self._clone_metadata(self._ros_bridge_status_stub("tf_localization_provider"))
-        odometry_status = self._clone_metadata(self._ros_bridge_status_stub("odometry_publisher"))
-        point_cloud_status = self._clone_metadata(self._ros_bridge_status_stub("point_cloud_publisher"))
+        live_map_status = self._clone_metadata(self._geometry_runtime_status_stub("live_map_provider"))
+        tf_localization_status = self._clone_metadata(self._geometry_runtime_status_stub("tf_localization_provider"))
+        odometry_status = self._clone_metadata(self._geometry_runtime_status_stub("odometry_publisher"))
+        point_cloud_status = self._clone_metadata(self._geometry_runtime_status_stub("point_cloud_publisher"))
         point_cloud_source = self._build_point_cloud_source_status()
         data_plane_status = self._build_data_plane_status()
         self._update_stream_tracker(live_map_status)
@@ -1304,10 +1294,10 @@ class PlatformGeometryRuntime:
         point_cloud_source: Optional[Dict[str, object]] = None,
         data_plane_status: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        live_map_status = live_map_status or self._clone_metadata(self._ros_bridge_status_stub("live_map_provider"))
-        tf_localization_status = tf_localization_status or self._clone_metadata(self._ros_bridge_status_stub("tf_localization_provider"))
-        odometry_status = odometry_status or self._clone_metadata(self._ros_bridge_status_stub("odometry_publisher"))
-        point_cloud_status = point_cloud_status or self._clone_metadata(self._ros_bridge_status_stub("point_cloud_publisher"))
+        live_map_status = live_map_status or self._clone_metadata(self._geometry_runtime_status_stub("live_map_provider"))
+        tf_localization_status = tf_localization_status or self._clone_metadata(self._geometry_runtime_status_stub("tf_localization_provider"))
+        odometry_status = odometry_status or self._clone_metadata(self._geometry_runtime_status_stub("odometry_publisher"))
+        point_cloud_status = point_cloud_status or self._clone_metadata(self._geometry_runtime_status_stub("point_cloud_publisher"))
         point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
         data_plane_status = data_plane_status or self._build_data_plane_status()
         if self._uses_external_geometry_stack():
@@ -1359,8 +1349,8 @@ class PlatformGeometryRuntime:
         point_cloud_source: Optional[Dict[str, object]] = None,
         data_plane_status: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        odometry_status = odometry_status or self._clone_metadata(self._ros_bridge_status_stub("odometry_publisher"))
-        point_cloud_status = point_cloud_status or self._clone_metadata(self._ros_bridge_status_stub("point_cloud_publisher"))
+        odometry_status = odometry_status or self._clone_metadata(self._geometry_runtime_status_stub("odometry_publisher"))
+        point_cloud_status = point_cloud_status or self._clone_metadata(self._geometry_runtime_status_stub("point_cloud_publisher"))
         point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
         data_plane_status = data_plane_status or self._build_data_plane_status()
         process_name = self._external_process_name()
@@ -1470,7 +1460,7 @@ class PlatformGeometryRuntime:
         }
 
     def _build_tf_chain_status(self, *, tf_localization_status: Optional[Dict[str, object]] = None) -> Dict[str, object]:
-        tf_localization_status = tf_localization_status or self._clone_metadata(self._ros_bridge_status_stub("tf_localization_provider"))
+        tf_localization_status = tf_localization_status or self._clone_metadata(self._geometry_runtime_status_stub("tf_localization_provider"))
         removed_internal_stack = not self._uses_external_geometry_stack()
         if self._uses_external_geometry_stack():
             required_processes = [self._external_process_name()]
@@ -1662,7 +1652,7 @@ class PlatformGeometryRuntime:
             "nav2": self._build_nav2_status(),
             "external_geometry": self.config.build_metadata().get("external_geometry"),
             "external_debug_observer": self._external_debug_observer_status(),
-            "tf_localization_provider": self._ros_bridge_status_stub("tf_localization_provider"),
+            "tf_localization_provider": self._geometry_runtime_status_stub("tf_localization_provider"),
             "diagnostics": diagnostics,
             "launch_ros2_stack": {
                 "script": str(self._geometry_script("launch_ros2_stack.sh")),
@@ -1742,7 +1732,7 @@ class PlatformGeometryRuntime:
                 if frame_id == map_frame:
                     pose_ready = True
                     map_to_base_ready = True
-                    source_kind = source_kind or "ros_bridge_pose"
+                    source_kind = source_kind or "geometry_runtime_pose"
             if not map_to_base_ready:
                 frame_tree = self._remote_provider.get_frame_tree()
                 if frame_tree is not None:
@@ -1765,7 +1755,7 @@ class PlatformGeometryRuntime:
                         ) is not None:
                             pose_ready = True
                             map_to_base_ready = True
-                            source_kind = source_kind or "ros_bridge_tf_chain"
+                            source_kind = source_kind or "geometry_runtime_tf_chain"
                             break
 
         status.update(
@@ -1780,7 +1770,7 @@ class PlatformGeometryRuntime:
         )
         return status
 
-    def _ros_bridge_status_stub(self, provider_key: str) -> Dict[str, object]:
+    def _geometry_runtime_status_stub(self, provider_key: str) -> Dict[str, object]:
         """返回 Rust bridge 替代 Python provider 后的状态占位 dict，保持调用方 key 兼容。"""
         remote_status = {}
         if self._remote_provider is not None:
@@ -1789,10 +1779,10 @@ class PlatformGeometryRuntime:
             except Exception:
                 remote_status = {}
         stub = {
-            "provider": "ros_bridge",
+            "provider": "geometry_runtime",
             "provider_key": provider_key,
-            "status": "active" if self._ros_bridge_handles_input_bridge() else "inactive",
-            "ros_bridge_connected": self._ros_bridge_handles_input_bridge(),
+            "status": "active" if self._geometry_runtime_handles_input_bridge() else "inactive",
+            "geometry_runtime_connected": self._geometry_runtime_handles_input_bridge(),
             **remote_status,
         }
         # /map 占据栅格的真实状态由外部 observer 提供（Rust get_status 不含占据字段），
@@ -1806,11 +1796,11 @@ class PlatformGeometryRuntime:
             stub = self._resolve_external_tf_localization_status(base_stub=stub)
         return stub
 
-    def _ros_bridge_handles_input_bridge(self) -> bool:
+    def _geometry_runtime_handles_input_bridge(self) -> bool:
         """Rust bridge 直接订阅 Go2 ROS2 话题时，Python publishers 无需启动。"""
         return (
-            self._ros_bridge_subprocess is not None
-            and self._ros_bridge_subprocess.is_running
+            self._geometry_runtime_subprocess is not None
+            and self._geometry_runtime_subprocess.is_running
             and self._remote_provider is not None
             and self._remote_provider.is_connected
         )
@@ -1822,21 +1812,21 @@ class PlatformGeometryRuntime:
             self._ensure_external_debug_observer_started_locked()
             input_bridge_enabled = self._external_input_bridge_enabled()
             point_cloud_bridge_enabled = self._external_point_cloud_bridge_enabled()
-            ros_bridge_active = self._ros_bridge_handles_input_bridge()
-            if ros_bridge_active:
+            geometry_runtime_active = self._geometry_runtime_handles_input_bridge()
+            if geometry_runtime_active:
                 LOGGER.debug("Rust bridge 活跃，跳过 Python odom/pointcloud publishers")
             input_bridge_ready = True
-            if ros_bridge_active:
+            if geometry_runtime_active:
                 input_bridge_ready = True  # Rust bridge 已处理 odom/pointcloud 输入
             elif input_bridge_enabled:
                 input_bridge_ready = False  # Python publishers 已移除，由 Rust bridge 替代
             elif point_cloud_bridge_enabled:
                 input_bridge_ready = False  # Python publishers 已移除，由 Rust bridge 替代
-            if ros_bridge_active and input_bridge_ready:
+            if geometry_runtime_active and input_bridge_ready:
                 return
             self._live_geometry_start_attempted = True
             try:
-                pass  # Python providers 已移除，由 Rust bridge (RosBridgeProvider) 替代
+                pass  # Python providers 已移除，由 Rust bridge (GeometryRuntimeProvider) 替代
             except Exception:
                 self._live_geometry_start_attempted = False
                 raise
@@ -2152,10 +2142,10 @@ class PlatformGeometryRuntime:
             "source_kind": source_kind,
             "backend_name": backend_name,
             "runtime_status": self.get_runtime_status(),
-            "live_map_provider": self._ros_bridge_status_stub("live_map_provider"),
-            "tf_localization_provider": self._ros_bridge_status_stub("tf_localization_provider"),
-            "odometry_publisher": self._ros_bridge_status_stub("odometry_publisher"),
-            "point_cloud_publisher": self._ros_bridge_status_stub("point_cloud_publisher"),
+            "live_map_provider": self._geometry_runtime_status_stub("live_map_provider"),
+            "tf_localization_provider": self._geometry_runtime_status_stub("tf_localization_provider"),
+            "odometry_publisher": self._geometry_runtime_status_stub("odometry_publisher"),
+            "point_cloud_publisher": self._geometry_runtime_status_stub("point_cloud_publisher"),
             "navigation_backend_policy": self._navigation_backend_policy(),
             "active_map_name": self._active_map_version.map_name if self._active_map_version is not None else None,
             "active_map_version_id": self._active_map_version.version_id if self._active_map_version is not None else None,
@@ -2179,10 +2169,10 @@ class PlatformGeometryRuntime:
         return self._clone_metadata(diagnostics)
 
     def _build_live_mapping_diagnostics(self) -> Dict[str, object]:
-        live_map_status = self._clone_metadata(self._ros_bridge_status_stub("live_map_provider"))
-        tf_localization_status = self._clone_metadata(self._ros_bridge_status_stub("tf_localization_provider"))
-        odometry_status = self._clone_metadata(self._ros_bridge_status_stub("odometry_publisher"))
-        point_cloud_status = self._clone_metadata(self._ros_bridge_status_stub("point_cloud_publisher"))
+        live_map_status = self._clone_metadata(self._geometry_runtime_status_stub("live_map_provider"))
+        tf_localization_status = self._clone_metadata(self._geometry_runtime_status_stub("tf_localization_provider"))
+        odometry_status = self._clone_metadata(self._geometry_runtime_status_stub("odometry_publisher"))
+        point_cloud_status = self._clone_metadata(self._geometry_runtime_status_stub("point_cloud_publisher"))
         point_cloud_source = self._build_point_cloud_source_status()
         data_plane_status = self._build_data_plane_status()
         waiting_for, message = self._classify_live_mapping_wait(
@@ -2875,7 +2865,7 @@ class PlatformGeometryRuntime:
         )
 
     def _build_live_map_snapshot(self, *, live_occupancy, live_cost_map, seed_version: Optional[MapVersion]) -> MapSnapshot:
-        live_status = self._clone_metadata(self._ros_bridge_status_stub("live_map_provider"))
+        live_status = self._clone_metadata(self._geometry_runtime_status_stub("live_map_provider"))
         update_sequence = live_status.get("update_sequence")
         occupancy_sequence = int(live_status.get("occupancy_sequence") or live_status.get("occupancy_message_count") or 0)
         cost_map_sequence = int(live_status.get("cost_map_sequence") or live_status.get("cost_map_message_count") or 0)
@@ -2904,7 +2894,7 @@ class PlatformGeometryRuntime:
             "map_snapshot_kind": "live_streaming",
             "live_streaming_ready": True,
             "rtabmap_live_streaming_ready": True,
-            "source_name": live_status.get("provider_name") or "ros_bridge",
+            "source_name": live_status.get("provider_name") or "geometry_runtime",
             "update_sequence": update_sequence,
             "occupancy_sequence": occupancy_sequence,
             "cost_map_sequence": cost_map_sequence,
@@ -2947,7 +2937,7 @@ class PlatformGeometryRuntime:
                 "geometry_backend": self.describe_backend(),
             })
         return MapSnapshot(
-            source_name=str(live_status.get("provider_name") or "ros_bridge"),
+            source_name=str(live_status.get("provider_name") or "geometry_runtime"),
             version_id="live_%s_%s" % (digest, live_revision),
             revision=live_revision,
             occupancy_grid=self._clone_contract(live_occupancy),
@@ -4363,39 +4353,26 @@ class PlatformGeometryRuntime:
         LOGGER.warning("AMCL 在 initialpose fallback 后仍未发布 TF，定位栈可能未就绪。")
 
     def _publish_initialpose_fallback(self) -> None:
-        """向 /initialpose 发布 identity PoseWithCovarianceStamped，触发 AMCL 初始化。"""
-        from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
-        node = None
-        rclpy = None
-        has_context = False
-        try:
-            from geometry_msgs.msg import PoseWithCovarianceStamped
-            rclpy = acquire_ros2_context()
-            has_context = True
-            node = rclpy.create_node("nuwax_amcl_initialpose_publisher")
-            pub = node.create_publisher(PoseWithCovarianceStamped, "/initialpose", 10)
-            msg = PoseWithCovarianceStamped()
-            msg.header.stamp.sec = 0
-            msg.header.stamp.nanosec = 0
-            msg.header.frame_id = self.config.frames.map_frame
-            msg.pose.pose.orientation.w = 1.0
-            msg.pose.covariance[0] = 0.25
-            msg.pose.covariance[7] = 0.25
-            msg.pose.covariance[35] = 0.06853891945200942
-            # 等待订阅者就绪后发布
-            time.sleep(0.5)
-            pub.publish(msg)
-            LOGGER.debug("已发布 identity initialpose 到 /initialpose。")
-        except Exception as exc:
-            LOGGER.warning("发布 initialpose fallback 失败：%s", exc)
-        finally:
-            if node is not None:
-                try:
-                    node.destroy_node()
-                except Exception:
-                    pass
-            if has_context:
-                release_ros2_context()
+        """触发 AMCL 初始化的兜底。
+
+        Phase 3 目标态：不再向 ROS2 ``/initialpose`` 话题发布；改由
+        ``nuwax-geometry-runtime`` 接受 relocalize 命令（LCM channel
+        ``/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped``
+        或 ``nuwax-rpc relocalize``），并写入定位栈。Python 平台层只暴露
+        ``publish_debug_initial_pose`` facade，不直接创建 ROS2 publisher。
+        """
+        provider = getattr(self, "_remote_provider", None)
+        if provider is not None and hasattr(provider, "relocalize"):
+            try:
+                provider.relocalize(pose=None, frame_id=str(self.config.frames.map_frame))
+                LOGGER.debug("已通过 GeometryRuntimeProvider.relocalize 触发 AMCL 初始化。")
+                return
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("relocalize via runtime 失败，平台层不直接发 /initialpose：%s", exc)
+        LOGGER.debug(
+            "Phase 3 目标态：AMCL 初始化由 nuwax-geometry-runtime 接管，"
+            "Python 平台层不再向 /initialpose 话题发布。"
+        )
 
     def _wait_for_geometry_snapshot(self, *, timeout_sec: float) -> Optional[MapSnapshot]:
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
@@ -6363,8 +6340,8 @@ class PlatformGeometryProviderBundle(
                     return {
                         **state,
                         "backend_name": getattr(backend, "provider_name", None),
-                        "raw_odom_input": self.runtime._clone_metadata(self.runtime._ros_bridge_status_stub("odometry_publisher")),
-                        "tf_localization_provider": self.runtime._clone_metadata(self.runtime._ros_bridge_status_stub("tf_localization_provider")),
+                        "raw_odom_input": self.runtime._clone_metadata(self.runtime._geometry_runtime_status_stub("odometry_publisher")),
+                        "tf_localization_provider": self.runtime._clone_metadata(self.runtime._geometry_runtime_status_stub("tf_localization_provider")),
                         "map_loaded": bool(state.get("map_loaded") or self.runtime._has_live_or_seed_map()),
                     }
             except Exception:
@@ -6389,8 +6366,8 @@ class PlatformGeometryProviderBundle(
             "localization_backend": getattr(self.runtime._resolve_localization_backend(), "provider_name", None),
             "navigation_backend_policy": self.runtime._clone_metadata(navigation_backend_policy),
             "active_navigation_backend": navigation_backend_policy.get("active_backend_provider"),
-            "tf_localization_provider": self.runtime._clone_metadata(self.runtime._ros_bridge_status_stub("tf_localization_provider")),
-            "live_map_provider": self.runtime._clone_metadata(self.runtime._ros_bridge_status_stub("live_map_provider")),
+            "tf_localization_provider": self.runtime._clone_metadata(self.runtime._geometry_runtime_status_stub("tf_localization_provider")),
+            "live_map_provider": self.runtime._clone_metadata(self.runtime._geometry_runtime_status_stub("live_map_provider")),
         }
 
     def get_occupancy_grid(self):
@@ -6399,7 +6376,7 @@ class PlatformGeometryProviderBundle(
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.occupancy_grid
-        # RosBridgeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
+        # GeometryRuntimeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
         # 当前推送路径（subscribe_map_updates → _attach_active_map_version_to_live_map_payload）
         # 仅 seed 来自 active map version 的 semantic_map，不携带 occupancy_grid/cost_map；
         # snapshot 缺失时返回 None（push 路径在 Rust 桥当前实现下不会补齐 occupancy/cost）。
@@ -6411,7 +6388,7 @@ class PlatformGeometryProviderBundle(
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.cost_map
-        # RosBridgeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
+        # GeometryRuntimeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
         # 当前推送路径（subscribe_map_updates → _attach_active_map_version_to_live_map_payload）
         # 仅 seed 来自 active map version 的 semantic_map，不携带 occupancy_grid/cost_map；
         # snapshot 缺失时返回 None（push 路径在 Rust 桥当前实现下不会补齐 occupancy/cost）。
@@ -6423,7 +6400,7 @@ class PlatformGeometryProviderBundle(
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.semantic_map
-        # RosBridgeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
+        # GeometryRuntimeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
         # 当前推送路径（subscribe_map_updates → _attach_active_map_version_to_live_map_payload）
         # 仅 seed 来自 active map version 的 semantic_map，不携带 occupancy_grid/cost_map；
         # snapshot 缺失时返回 None（push 路径在 Rust 桥当前实现下不会补齐 occupancy/cost）。

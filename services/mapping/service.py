@@ -83,7 +83,7 @@ class MappingService:
         occupancy_grid = provider.get_occupancy_grid()
         cost_map = provider.get_cost_map()
         semantic_map = provider.get_semantic_map()
-        # 兜底：Rust 桥场景下 RosBridgeProvider 不暴露 layer getter，三键会全 None。
+        # 兜底：Rust runtime 场景下 GeometryRuntimeProvider 不暴露 layer getter，三键会全 None。
         # 此时 push 路径（subscribe_map_updates）通常已写入 _latest_snapshot，refresh 走轮询语义
         # 应当复用过期 snapshot 而非 raise，避免持续感知 tick 反复撞 GatewayError 刷屏。
         if occupancy_grid is None and cost_map is None and semantic_map is None:

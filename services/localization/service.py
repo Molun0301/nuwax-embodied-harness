@@ -484,52 +484,52 @@ class LocalizationService:
         return "unknown"
 
     def _publish_initialpose(self, hint_pose: Optional[Pose], result: Dict[str, object]) -> None:
-        """向 AMCL `/initialpose` 发布初始位姿。"""
+        """向 AMCL 发送初始位姿。
 
+        Phase 3 目标态：不再向 ROS2 ``/initialpose`` 话题发布。
+        改由 ``nuwax-geometry-runtime`` 通过 LCM channel
+        ``/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped``
+        或 ``nuwax-rpc relocalize`` 触发定位栈初始化。
+
+        平台层本方法保留函数签名以兼容调用方，但不再 import ROS2 / geometry_msgs 接触面；
+        实际生效路径是记录 actions 给上层（debug UI / console）观察，由 MCP/external 路径发起
+        relocalize 调用，runtime 在收到命令后自行完成 PF 重置 / AMCL 启动。
+        """
         if hint_pose is None:
-            result["errors"].append("无可用 hint pose，跳过 /initialpose 发布。")
+            result["errors"].append("无可用 hint pose，跳过 relocalize 命令。")
             return
         try:
-            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-            from rclpy.duration import Duration
-            from geometry_msgs.msg import PoseWithCovarianceStamped
-            from services.geometry.ros2_context import acquire_ros2_context, release_ros2_context
-
-            rclpy = acquire_ros2_context()
-            node = rclpy.create_node("nuwax_localization_initialpose_publisher")
-            try:
-                qos = QoSProfile(
-                    history=HistoryPolicy.KEEP_LAST,
-                    depth=1,
-                    reliability=ReliabilityPolicy.RELIABLE,
+            provider = getattr(self, "_geometry_runtime_provider", None)
+            relocalize_fn = getattr(provider, "relocalize", None) if provider is not None else None
+            if callable(relocalize_fn):
+                relocalize_fn(pose=hint_pose, frame_id=DEFAULT_MAP_FRAME)
+                result["actions"].append(
+                    {"target": "nuwax-geometry-runtime.relocalize", "status": "submitted"}
                 )
-                pub = node.create_publisher(PoseWithCovarianceStamped, "/initialpose", qos)
-                msg = PoseWithCovarianceStamped()
-                # AMCL 期望 frame=map（平台动态链 frame 单一出口）
-                msg.header.frame_id = DEFAULT_MAP_FRAME
-                # 关键：必须显式设 header.stamp，否则默认 (sec=0, nanosec=0) 会让 AMCL Foxy
-                # 在 lookupTransform(base_footprint, odom) 时报 "Failed to transform initial pose
-                # in time"，并触发 setPose 在 TF 异常后强写 PF 状态的已知 SIGSEGV bug
-                # （exit code -11），导致 amcl 死亡、map→odom TF 不再发布、整条 nav2 链路废掉。
-                # 用 now() - 0.5s 避开 extrapolation_into_future（确保 stamp 落在 TF buffer
-                # 的已知区间内）。
-                msg.header.stamp = (node.get_clock().now() - Duration(seconds=0.5)).to_msg()
-                msg.pose.pose.position.x = float(hint_pose.position.x)
-                msg.pose.pose.position.y = float(hint_pose.position.y)
-                msg.pose.pose.position.z = float(hint_pose.position.z)
-                msg.pose.pose.orientation.x = float(hint_pose.orientation.x)
-                msg.pose.pose.orientation.y = float(hint_pose.orientation.y)
-                msg.pose.pose.orientation.z = float(hint_pose.orientation.z)
-                msg.pose.pose.orientation.w = float(hint_pose.orientation.w)
-                # 单位对角协方差作为 hint（不强约束）
-                msg.pose.covariance = [0.25 if i in (0, 7, 35) else 0.0 for i in range(36)]
-                pub.publish(msg)
-                result["actions"].append({"target": "/initialpose", "status": "published"})
-            finally:
-                node.destroy_node()
-                release_ros2_context()
+                return
+            # Phase 3 目标态：runtime 暴露 relocalize 之前，本方法只记录 hint。
+            result["actions"].append(
+                {
+                    "target": "localization_hint_staged",
+                    "status": "staged",
+                    "frame_id": DEFAULT_MAP_FRAME,
+                    "pose": {
+                        "position": {
+                            "x": float(hint_pose.position.x),
+                            "y": float(hint_pose.position.y),
+                            "z": float(hint_pose.position.z),
+                        },
+                        "orientation": {
+                            "x": float(hint_pose.orientation.x),
+                            "y": float(hint_pose.orientation.y),
+                            "z": float(hint_pose.orientation.z),
+                            "w": float(hint_pose.orientation.w),
+                        },
+                    },
+                }
+            )
         except Exception as exc:
-            result["errors"].append("/initialpose 发布失败：%s" % exc)
+            result["errors"].append("relocalize 命令提交失败：%s" % exc)
 
     def get_localization_diagnostics(self) -> Optional[LocalizationDiagnostics]:
         """返回当前平台定位诊断信息。"""

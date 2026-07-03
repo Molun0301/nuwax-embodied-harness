@@ -809,8 +809,8 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED",
                 external_input_bridge_enabled,
             ),
-            platform_odom_tf_bridge_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_ODOM_TF_BRIDGE_ENABLED", False),
-            platform_cmd_vel_bridge_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_CMD_VEL_BRIDGE_ENABLED", False),
+            platform_runtime_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_RUNTIME_ENABLED", False),
+            platform_cmd_vel_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_CMD_VEL_ENABLED", False),
             frontier_topic=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC", "explore/frontiers"),
         ),
     )

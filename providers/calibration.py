@@ -15,7 +15,7 @@ class CalibrationProvider(BaseProvider, Protocol):
     本接口与 contracts，不 import 任何具体 driver，保证换机器人时平台侧零改动。
 
     外参为静态值（机器人物理装配属性），由平台几何运行时在装配期取一次、缓存于
-    RosBridgeProvider 实例，每帧 frame_tree 重建后合并为静态边。本接口不承担运行时
+    GeometryRuntimeProvider 实例，每帧 frame_tree 重建后合并为静态边。本接口不承担运行时
     高频更新；后续在线 MI 精修经同一接口提供更新值（接口不变，实现增量）。
     """
 

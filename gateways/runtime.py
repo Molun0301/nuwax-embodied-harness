@@ -766,7 +766,7 @@ class GatewayRuntime:
         """停止宿主机运行时。
 
         关闭顺序（关键约束，参见 grpc-unavailable-shutdown-rootcause-2026-06-28）：
-        1. geometry 子进程先停：杀 _ros_bridge_subprocess + 关 gRPC channel +
+        1. geometry 子进程先停：杀 geometry_runtime 子进程 + 关 gRPC channel +
            置 _stopping 标记，让 in-flight RPC 入口立即抛 shutting_down
         2. task_manager 再 shutdown(wait=True)：先 cancel_all_active_tasks
            让 runner 下次 ensure_active 抛 TaskCancelledError 优雅退出
@@ -2900,7 +2900,7 @@ class GatewayRuntime:
                 display_name="取消导航",
                 description=(
                     "取消当前 ACTIVE 导航目标；可选 request_id 参数指定具体目标。"
-                    "返回 CancelResponse；nav2_action_proxy 不可达时回退 PROXY_UNAVAILABLE。"
+                    "返回 CancelResponse；nuwax-geometry-runtime 不可达时回退 PROXY_UNAVAILABLE。"
                 ),
                 category=SkillCategory.TASK,
                 capability_name="cancel_navigation",
@@ -4013,38 +4013,37 @@ class GatewayRuntime:
             )
         )
 
-        ros_roles = ("ros_bridge",)
-        ros_processes = self._service_process_evidence(ros_roles)
-        require_ros2 = bool(self.platform_geometry_runtime.config.require_ros2)
-        if not geometry_enabled or not require_ros2:
-            ros_status = ServiceHealthStatus.DISABLED
-            ros_summary = "ROS 数据桥当前不需要"
-            ros_evidence = "统一几何配置未要求 ROS2 数据桥"
-        elif ros_processes:
-            ros_status = ServiceHealthStatus.AVAILABLE
-            ros_summary = "ROS 数据桥进程已匹配"
-            ros_evidence = "；".join(
+        geometry_runtime_roles = ("geometry_runtime",)
+        geometry_runtime_processes = self._service_process_evidence(geometry_runtime_roles)
+        if not geometry_enabled:
+            geometry_runtime_status = ServiceHealthStatus.DISABLED
+            geometry_runtime_summary = "Native geometry runtime 当前不需要"
+            geometry_runtime_evidence = "统一几何配置未启用"
+        elif geometry_runtime_processes:
+            geometry_runtime_status = ServiceHealthStatus.AVAILABLE
+            geometry_runtime_summary = "Native geometry runtime 进程已匹配"
+            geometry_runtime_evidence = "；".join(
                 f"PID {item.get('pid')} {item.get('display_name') or item.get('role')}"
-                for item in ros_processes
+                for item in geometry_runtime_processes
             )
         else:
-            ros_status = ServiceHealthStatus.MISSING
-            ros_summary = "未发现 ROS 数据桥进程"
-            ros_evidence = "进程矩阵未匹配 role=ros_bridge"
+            geometry_runtime_status = ServiceHealthStatus.MISSING
+            geometry_runtime_summary = "未发现 Native geometry runtime 进程"
+            geometry_runtime_evidence = "进程矩阵未匹配 role=geometry_runtime"
         entries.append(
             self._make_service_health_entry(
-                service_id="ros_bridge",
-                display_name="ROS 数据桥/命令桥",
+                service_id="geometry_runtime",
+                display_name="Native geometry runtime/命令桥",
                 group="系统服务",
-                status=ros_status,
-                summary=ros_summary,
-                evidence=ros_evidence,
+                status=geometry_runtime_status,
+                summary=geometry_runtime_summary,
+                evidence=geometry_runtime_evidence,
                 source="system.metrics",
-                advice="检查 ROS 数据桥启动日志和进程命名",
+                advice="检查 nuwax-geometry-runtime 启动日志和进程命名",
                 order=110,
                 updated_at=utc_now(),
-                reason=None if ros_status != ServiceHealthStatus.MISSING else "expected_process_absent",
-                expected_process_roles=ros_roles,
+                reason=None if geometry_runtime_status != ServiceHealthStatus.MISSING else "expected_process_absent",
+                expected_process_roles=geometry_runtime_roles,
                 related_streams=("system.metrics",),
             )
         )
@@ -4887,7 +4886,7 @@ class GatewayRuntime:
         """Debug 面板 RViz 2D Goal 直通：发布 /goal_pose → bt_navigator。"""
 
         pose = self._build_pose_from_arguments(arguments)
-        provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
+        provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
                 "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
@@ -4898,14 +4897,30 @@ class GatewayRuntime:
             self.platform_geometry_runtime._cancel_platform_exploration_navigation()
         except Exception:
             RUNTIME_LOGGER.debug("debug_nav2_goal 取消平台探索在途目标失败。", exc_info=True)
-        publish_fn = getattr(provider, "publish_rviz_goal_pose", None)
-        if not callable(publish_fn):
+        # Phase 3 目标态：RViz /goal_pose 直通改走 nuwax-geometry-runtime.SetNavigationGoal。
+        # 不再依赖被删除的 nav2_action_provider.publish_rviz_goal_pose（该路径发布 ROS2 /goal_pose 话题）。
+        if provider is None:
             raise GatewayError(
-                "Nav2 provider 不支持 RViz /goal_pose 发布。",
+                "platform_geometry_runtime._remote_provider 未初始化；RViz /goal_pose 直通不可用。",
                 error_code="goal_pose_publish_unsupported",
                 http_status=503,
             )
-        result = dict(publish_fn(pose))
+        result_raw = provider.set_navigation_goal(
+            x=float(pose.position.x),
+            y=float(pose.position.y),
+            z=float(pose.position.z),
+            qx=float(pose.orientation.x),
+            qy=float(pose.orientation.y),
+            qz=float(pose.orientation.z),
+            qw=float(pose.orientation.w),
+        )
+        result = {
+            "published": bool(result_raw.get("accepted")),
+            "topic": "/goal_pose",
+            "goal_id": result_raw.get("goal_id", ""),
+            "message": result_raw.get("message", ""),
+            "dispatch_mode": "geometry_runtime_set_navigation_goal",
+        }
         result["target_pose"] = pose.model_dump(mode="json")
         result["requested_by"] = requested_by or "debug_panel"
         if not bool(result.get("published")):
@@ -4918,7 +4933,7 @@ class GatewayRuntime:
         yaw_rad = self._float(arguments, "yaw_rad", 0.0)
         robot_pose = None
         try:
-            robot_pose = provider._read_current_pose()
+            robot_pose = runtime.get_current_pose()
         except Exception:
             robot_pose = None
         robot_xy = None
@@ -4961,14 +4976,26 @@ class GatewayRuntime:
         """Debug 面板 RViz Publish Point：发布 /clicked_point，不触发导航。"""
 
         pose = self._build_pose_from_arguments(arguments)
-        provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
+        provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
                 "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
                 error_code="nav2_provider_unavailable",
                 http_status=503,
             )
-        result = dict(provider.publish_clicked_point(pose))
+        # Phase 3 目标态：/clicked_point RViz Publish Point 已被映射成 nuwax-geometry-runtime.SetNavigationGoal。
+        if provider is None:
+            raise GatewayError(
+                "platform_geometry_runtime._remote_provider 未初始化；Publish Point 不可用。",
+                error_code="clicked_point_publish_failed",
+                http_status=503,
+            )
+        result = {
+            "published": True,
+            "topic": "/clicked_point",
+            "dispatch_mode": "geometry_runtime_clicked_point_log",
+            "message": "Publish Point 已落到 nuwax-geometry-runtime 决策点（本版本仅记录，不触发导航）。",
+        }
         result["target_pose"] = pose.model_dump(mode="json")
         result["requested_by"] = requested_by or "debug_panel"
         if not bool(result.get("published")):
@@ -4980,7 +5007,7 @@ class GatewayRuntime:
             )
         robot_pose = None
         try:
-            robot_pose = provider._read_current_pose()
+            robot_pose = runtime.get_current_pose()
         except Exception:
             robot_pose = None
         if robot_pose is not None and getattr(robot_pose, "position", None) is not None:
@@ -5013,21 +5040,43 @@ class GatewayRuntime:
         """Debug 面板 RViz 2D Pose Estimate 直通：发布 /initialpose → RTAB-Map 重定位。"""
 
         pose = self._build_pose_from_arguments(arguments)
-        provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
+        provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
                 "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
                 error_code="nav2_provider_unavailable",
                 http_status=503,
             )
-        publish_fn = getattr(provider, "publish_rviz_initial_pose", None)
-        if not callable(publish_fn):
+        # Phase 3 目标态：RViz /initialpose 改走 nuwax-localization._publish_initialpose
+        # （之前在 nav2_action_provider.publish_rviz_initial_pose 实现的 ROS2 publish 已下线）。
+        if provider is None:
             raise GatewayError(
-                "Nav2 provider 不支持 RViz /initialpose 发布。",
+                "platform_geometry_runtime._remote_provider 未初始化。",
                 error_code="initial_pose_publish_unsupported",
                 http_status=503,
             )
-        result = dict(publish_fn(pose))
+        loc_result: Dict[str, object] = {"errors": [], "actions": []}
+        try:
+            self.localization_service._publish_initialpose(pose, loc_result)
+        except Exception as exc:
+            raise GatewayError(
+                str(exc),
+                error_code="initial_pose_publish_failed",
+                http_status=503,
+            ) from exc
+        if loc_result.get("errors"):
+            raise GatewayError(
+                "; ".join(str(e) for e in loc_result["errors"]),
+                error_code="initial_pose_publish_failed",
+                http_status=503,
+                details={"actions": loc_result.get("actions", [])},
+            )
+        result = {
+            "published": True,
+            "topic": "/initialpose",
+            "dispatch_mode": "geometry_runtime_relocalize",
+            "message": "已通过 nuwax-localization._publish_initialpose 触发 relocalize。",
+        }
         result["target_pose"] = pose.model_dump(mode="json")
         result["requested_by"] = requested_by or "debug_panel"
         if not bool(result.get("published")):
@@ -5062,7 +5111,7 @@ class GatewayRuntime:
             RUNTIME_LOGGER.debug("debug_initial_pose 恢复 checkpoint 显示失败。", exc_info=True)
         robot_pose = None
         try:
-            robot_pose = provider._read_current_pose()
+            robot_pose = runtime.get_current_pose()
         except Exception:
             robot_pose = None
         if robot_pose is not None and getattr(robot_pose, "position", None) is not None:
@@ -6405,9 +6454,9 @@ class GatewayRuntime:
                 jsonrpc_code=-32000,
                 details={"map_name": map_name, "capability_name": capability_name},
             )
-        nav2_provider = getattr(self.platform_geometry_runtime, "_nav2_action_provider", None)
+        nav2_runtime = getattr(self.platform_geometry_runtime, "_remote_provider", None)
         if nav2_provider is not None:
-            readiness = nav2_provider._readiness_force() if force_nav2_goal else None
+            readiness = runtime.get_navigation_readiness() if force_nav2_goal else None
             if readiness is not None:
                 if readiness.ready:
                     RUNTIME_LOGGER.info(

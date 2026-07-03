@@ -1,6 +1,6 @@
-"""RosBridgeProvider — 通过 gRPC 调用 Rust nuwax-ros-bridge 子进程。
+"""GeometryRuntimeProvider — 通过 gRPC 调用 Rust nuwax-geometry-runtime 子进程。
 
-Rust 桥是主要的 ROS2 交互层，本模块封装其 gRPC 接口，
+Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge），本模块封装其 gRPC 接口，
 提供与原始 Python Provider 相同的调用接口。
 """
 from __future__ import annotations
@@ -16,9 +16,9 @@ from contracts.frame_semantics import infer_frame_role
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
-from services.geometry.ros_bridge_client import RosBridgeSubprocess
+from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
 
-LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.remote_provider")
+LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_provider")
 
 _STATIC_EDGE_SKIP_LOG_INTERVAL_SEC = 30.0
 _last_static_edge_skip_log_at = 0.0
@@ -42,7 +42,7 @@ def _warn_static_edge_skip(message: str, *, signature: str) -> None:
 def _read_deadline_sec() -> float:
     """unary 轻量读类 gRPC 调用 deadline（秒）。
 
-    下游 Rust 桥/RTAB-Map 慢或未就绪时，无 deadline 的 unary 调用会无界阻塞，
+    下游 Rust runtime / RTAB-Map 慢或未就绪时，无 deadline 的 unary 调用会无界阻塞，
     单点挂死整条 MCP 请求（参见超时根因 D1）。轻量读类（GetStatus / GetOccupancyGrid 元数据 /
     GetNavigationReadiness / CancelNavigation / SetNavigationGoal / PublishOdom）统一施加该 deadline。
 
@@ -169,7 +169,7 @@ def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Tran
        等动态定位链；child 已存在或角色属动态链时跳过。
     3. 静态边声明的 parent 是端侧 driver 的 base 命名（如 world/go2/base），可能与
        实机 tf 实际发布的 base 串（base_footprint/base_link）不同。这里按语义角色把
-       parent 重锚定到“当前帧真实存在的 base 节点串”，否则静态边会成为孤岛、
+       parent 重锚定到"当前帧真实存在的 base 节点串"，否则静态边会成为孤岛、
        camera→map 路径不可达。找不到 base 节点则跳过该边（不兜底、不投错链）。
     """
     if not static_edges or frame_tree is None:
@@ -236,10 +236,10 @@ def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Tran
 
 
 
-class RosBridgeProvider:
-    """统一的 RosBridgeProvider，封装所有 gRPC 调用。"""
+class GeometryRuntimeProvider:
+    """统一的 GeometryRuntimeProvider，封装所有 gRPC 调用。"""
 
-    def __init__(self, bridge: RosBridgeSubprocess) -> None:
+    def __init__(self, bridge: GeometryRuntimeSubprocess) -> None:
         self._bridge = bridge
         self._channel: Optional[grpc.Channel] = None
         self._stub: Optional[pb2_grpc.GeometryRuntimeStub] = None
@@ -263,7 +263,7 @@ class RosBridgeProvider:
         """连接到 Rust 子进程的 gRPC server。
 
         失败时必须清空 channel/stub 并调 `bridge.disconnect()`，让下一次
-        RosBridgeSubprocess.start() 不再 short-circuit。attach 到僵尸进程时
+        GeometryRuntimeSubprocess.start() 不再 short-circuit。attach 到僵尸进程时
         `bridge.is_running` 在 attach 状态短暂为 True（端口刚关但状态未清），
         RPC 失败后必须 reset bridge 状态，否则会留下永久 `_started=True`
         假活锁（参见 grpc-attach-zombie-bridge-2026-06-27）。
@@ -301,7 +301,7 @@ class RosBridgeProvider:
         self._stub = None
         self._connected = False
         # 关键：让 bridge 子进程对象也回到「未启动」状态，使下一次 start() 走完整 spawn。
-        # 注意只清状态不杀进程：调用方后续会走 _start_ros_bridge_subprocess 的 zombie 自愈路径，
+        # 注意只清状态不杀进程：调用方后续会走 _start_geometry_runtime_subprocess 的 zombie 自愈路径，
         # 视情况 stop() 旧 bridge 或直接 spawn 新 bridge 取代。
         try:
             self._bridge.disconnect()
@@ -329,7 +329,7 @@ class RosBridgeProvider:
         通过 NUWAX_GEOMETRY_SHUTDOWN_GUARD=0 可紧急回滚禁用此守卫。
         """
         if self._stopping and _is_shutdown_guard_enabled():
-            LOGGER.debug("RosBridgeProvider.%s 在 shutdown 期被阻断", rpc_name)
+            LOGGER.debug("GeometryRuntimeProvider.%s 在 shutdown 期被阻断", rpc_name)
             raise RuntimeError("shutting_down")
 
     def is_available(self) -> bool:
@@ -468,7 +468,7 @@ class RosBridgeProvider:
                     orientation=pb2.Quat(x=qx, y=qy, z=qz, w=qw),
                     frame_id=frame_id,
                 ),
-                linear_velocity=pb2.Vec3(x=lvx, y=lvy, z=lvz),
+                linear_velocity=pb2.Vec3(x=lvx, lvy=lvy, z=lvz),
                 angular_velocity=pb2.Vec3(x=avx, y=avy, z=avz),
             )
             self._stub.PublishOdom(msg, timeout=_read_deadline_sec())
@@ -521,7 +521,7 @@ class RosBridgeProvider:
                 if not self._stub:
                     break
                 time.sleep(1.0)
-        t = threading.Thread(target=_stream_worker, name="ros_bridge_pose_stream", daemon=True)
+        t = threading.Thread(target=_stream_worker, name="geometry_runtime_pose_stream", daemon=True)
         t.start()
         return t
 
@@ -546,7 +546,7 @@ class RosBridgeProvider:
                 if not self._stub:
                     break
                 time.sleep(1.0)
-        t = threading.Thread(target=_stream_worker, name="ros_bridge_map_stream", daemon=True)
+        t = threading.Thread(target=_stream_worker, name="geometry_runtime_map_stream", daemon=True)
         t.start()
         return t
 
@@ -570,6 +570,6 @@ class RosBridgeProvider:
                 if not self._stub:
                     break
                 time.sleep(1.0)
-        t = threading.Thread(target=_stream_worker, name="ros_bridge_nav_stream", daemon=True)
+        t = threading.Thread(target=_stream_worker, name="geometry_runtime_nav_stream", daemon=True)
         t.start()
         return t

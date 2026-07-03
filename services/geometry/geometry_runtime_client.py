@@ -1,7 +1,20 @@
-"""nuwax_ros_bridge 子进程生命周期管理。
+"""nuwax_geometry_runtime 子进程生命周期管理。
 
-负责 spawn / monitor / stop Rust gRPC 子进程，
-提供健康检查和崩溃自动重启。
+负责 spawn / monitor / stop Rust gRPC 子进程，提供健康检查和崩溃自动重启。
+
+本文件替代旧的子进程生命周期管理模块，
+本仓库 Phase -0.5 选型后 nuwax-ros-bridge Rust crate 已改名为
+`nuwax-geometry-runtime`（同步仓库名、二进制名、ready file 命名空间）。
+调用方统一 import 本文件。
+
+设计要点（与原模块一致）：
+
+* spawn 子进程并等待 ready 文件
+* attach 模式：端口探测 + gRPC 验活双门（参见 grpc-attach-zombie-bridge-2026-06-27）
+* 监控线程 2s 一次轮询，崩溃时 backoff 重启，最多 3 次
+* ROS2 残留相关 env（RMW_IMPLEMENTATION / CYCLONEDDS_URI / NUWAX_ROS_BRIDGE_*）已删除：
+  本服务不再 spawn 任何 ROS2 节点 / DDS 话题订阅；所有 ROS2 接触面均已迁出
+  （见 docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/01_接触面详细盘点.md）。
 """
 from __future__ import annotations
 
@@ -16,9 +29,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
-LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.ros_bridge_client")
+LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_client")
 
-_DEFAULT_BINARY_NAME = "nuwax-ros-bridge"
+_DEFAULT_BINARY_NAME = "nuwax-geometry-runtime"
 _DEFAULT_PORT = 50051
 _STARTUP_TIMEOUT_SEC = 10.0
 _HEALTH_CHECK_INTERVAL_SEC = 2.0
@@ -31,23 +44,23 @@ _ATTACHED_HEALTH_CHECK_TTL_SEC = 1.0
 # attach 验活/GetStatus 单次 RPC 超时。复用 _read_deadline_sec 默认值 2.0s；
 # 单独定义便于测试时压低到 0.5s。
 _ATTACHED_HEALTH_CHECK_TIMEOUT_SEC = float(
-    os.environ.get("NUWAX_ROS_BRIDGE_ATTACH_HEALTH_TIMEOUT_SEC", "2.0")
+    os.environ.get("NUWAX_GEOMETRY_RUNTIME_ATTACH_HEALTH_TIMEOUT_SEC", "2.0")
 )
 # 紧急跳过 attach gRPC 验活的 hotfix 开关；置 1 后退回旧的「仅端口探测」行为。
 # 默认关闭：attach 路径必须 RPC 验活，避免挂接已僵死的进程导致后续 UNAVAILABLE 死锁。
 _SKIP_ATTACH_HEALTH_CHECK = os.environ.get(
-    "NUWAX_ROS_BRIDGE_SKIP_HEALTH_CHECK", "0"
+    "NUWAX_GEOMETRY_RUNTIME_SKIP_HEALTH_CHECK", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 
-class RosBridgeSubprocess:
-    """管理 nuwax-ros-bridge Rust 子进程的生命周期。"""
+class GeometryRuntimeSubprocess:
+    """管理 nuwax-geometry-runtime Rust 子进程的生命周期。"""
 
     def __init__(
         self,
         binary_path: Optional[str] = None,
         port: int = _DEFAULT_PORT,
-        ros_distro: str = "foxy",
+        ros_distro: str = "humble",
     ) -> None:
         self._binary_path = self._resolve_binary(binary_path)
         self._port = port
@@ -75,7 +88,7 @@ class RosBridgeSubprocess:
             if self._attached:
                 # attach 状态下不能仅凭端口探测判定可用：进程僵死/被冲掉后端口可能短暂
                 # 仍在 LISTEN 或 TIME_WAIT，但任何 RPC 都会立即 UNAVAILABLE，会让上层
-                # _start_ros_bridge_subprocess 误以为"已就绪"而走 fast-return，
+                # _start_geometry_runtime_subprocess 误以为"已就绪"而走 fast-return，
                 # 留下永久 _started=True 假活锁（参见 grpc-attach-zombie-bridge-2026-06-27）。
                 # 这里走带 TTL 缓存的 gRPC 健康检查；失败时清状态允许 respawn。
                 if not self._is_port_open():
@@ -89,9 +102,9 @@ class RosBridgeSubprocess:
         return self._last_error
 
     def _warn_if_video_relay_missing(self) -> None:
-        """挂接已有 bridge 时探测视频中转产物，缺失则告警（不阻断 geometry）。
+        """挂接已有 runtime 时探测视频中转产物，缺失则告警（不阻断 geometry）。
 
-        若挂接到的旧 bridge 未启用 video_relay，则 /tmp/nuwax_video.sock 与
+        若挂接到的旧 runtime 未启用 video_relay，则 /tmp/nuwax_video.sock 与
         .shm 不存在，感知视频源将永远 available=False 且静默失败，故显式告警。
         """
         shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
@@ -100,12 +113,11 @@ class RosBridgeSubprocess:
         uds_ok = os.path.exists(uds_path)
         if not (shm_ok and uds_ok):
             LOGGER.warning(
-                "挂接现有 nuwax-ros-bridge，但视频中转产物缺失 (shm=%s exists=%s, uds=%s exists=%s)；"
-                "该 bridge 可能未启用 video_relay，持续视频感知将不可用。"
-                "请重启 bridge 或确认 video_streamer 已连接。",
+                "挂接现有 nuwax-geometry-runtime，但视频中转产物缺失 (shm=%s exists=%s, uds=%s exists=%s)；"
+                "该 runtime 可能未启用 video_relay，持续视频感知将不可用。"
+                "请重启 runtime 或确认 video_streamer 已连接。",
                 shm_path,
                 shm_ok,
-                uds_path,
                 uds_ok,
             )
 
@@ -126,23 +138,23 @@ class RosBridgeSubprocess:
                     force=True
                 ):
                     LOGGER.warning(
-                        "nuwax-ros-bridge attach 状态健康检查失败，强制清理并重新 spawn"
+                        "nuwax-geometry-runtime attach 状态健康检查失败，强制清理并重新 spawn"
                     )
                     self._reset_attached_state_locked()
                     self._started = False
                 else:
                     return True
             if self._is_port_open():
-                if self._verify_attached_bridge_locked():
+                if self._verify_attached_runtime_locked():
                     self._attached = True
                     self._started = True
                     self._attached_health_check_at = time.monotonic()
                     self._attached_health_check_ok = True
-                    LOGGER.info("nuwax-ros-bridge 已在端口 %d 运行，gRPC 验活通过，挂接现有进程", self._port)
+                    LOGGER.info("nuwax-geometry-runtime 已在端口 %d 运行，gRPC 验活通过，挂接现有进程", self._port)
                     self._warn_if_video_relay_missing()
                     return True
                 LOGGER.warning(
-                    "端口 %d 已被占用但 gRPC 验活失败（疑似僵死/被冲掉的 nuwax-ros-bridge 残留），"
+                    "端口 %d 已被占用但 gRPC 验活失败（疑似僵死/被冲掉的 nuwax-geometry-runtime 残留），"
                     "跳过 attach 继续走 spawn 路径",
                     self._port,
                 )
@@ -170,10 +182,10 @@ class RosBridgeSubprocess:
     def disconnect(self) -> None:
         """仅清空 attach/started 状态与健康检查缓存，不杀进程也不动监听 socket。
 
-        供 RemoteProvider.connect() 失败后调用：
-        - 让下一次 RosBridgeSubprocess.start() 不再 short-circuit，能走到 spawn 路径取代僵死 attach。
+        供 GeometryRuntimeProvider.connect() 失败后调用：
+        - 让下一次 GeometryRuntimeSubprocess.start() 不再 short-circuit，能走到 spawn 路径取代僵死 attach。
         - 不主动 kill 端口：调用方已确认 attach 不可用，spawn 时新进程会重新 bind 同端口
-          （依赖 start_gateway.sh cleanup_stale_ros_bridge_processes 已杀过旧进程），
+          （依赖 start_gateway.sh cleanup_stale_geometry_runtime_processes 已杀过旧进程），
           或者 spawn 失败时由调用方根据 last_error 决策。
         """
         with self._lock:
@@ -183,37 +195,18 @@ class RosBridgeSubprocess:
     def _spawn_process(self) -> bool:
         """fork 子进程并等待 ready 文件出现。"""
         pid_tag = os.getpid()
-        self._ready_file = os.path.join("/tmp", "nuwax_ros_bridge_%d.ready" % pid_tag)
+        self._ready_file = os.path.join("/tmp", "nuwax_geometry_runtime_%d.ready" % pid_tag)
         if os.path.exists(self._ready_file):
             os.unlink(self._ready_file)
 
         env = os.environ.copy()
-        env["NUWAX_ROS_BRIDGE_PORT"] = str(self._port)
-        env["NUWAX_ROS_BRIDGE_READY_FILE"] = self._ready_file
-        self._apply_bridge_env_aliases(env)
-        # 使用 CycloneDDS RMW 以直接订阅 Go2 原生 DDS 话题
-        env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
-        cyclonedds_xml = os.path.expanduser("~/cyclonedds_ws/cyclonedds.xml")
-        if os.path.exists(cyclonedds_xml):
-            env["CYCLONEDDS_URI"] = cyclonedds_xml
-        ros_setup = "/opt/ros/%s/setup.bash" % self._ros_distro
-        cyclonedds_setup = os.path.expanduser("~/cyclonedds_ws/install/setup.bash")
-        source_scripts = [ros_setup]
-        if os.path.exists(cyclonedds_setup):
-            source_scripts.append(cyclonedds_setup)
-        external_env_script = self._resolve_external_env_script()
-        if external_env_script is not None:
-            source_scripts.append(str(external_env_script))
-        source_cmd = " && ".join("source %s" % shlex.quote(script) for script in source_scripts)
-        cmd = "%s && exec -a %s %s" % (
-            source_cmd,
-            shlex.quote(_DEFAULT_BINARY_NAME),
-            shlex.quote(self._binary_path),
-        )
+        env["NUWAX_GEOMETRY_RUNTIME_PORT"] = str(self._port)
+        env["NUWAX_GEOMETRY_RUNTIME_READY_FILE"] = self._ready_file
+        self._apply_runtime_env_aliases(env)
 
         try:
             self._process = subprocess.Popen(
-                ["bash", "-c", cmd],
+                [str(self._binary_path)],
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -231,7 +224,7 @@ class RosBridgeSubprocess:
                 LOGGER.error(self._last_error)
                 return False
             if os.path.exists(self._ready_file):
-                LOGGER.info("nuwax-ros-bridge 就绪, pid=%d, port=%d", self._process.pid, self._port)
+                LOGGER.info("nuwax-geometry-runtime 就绪, pid=%d, port=%d", self._process.pid, self._port)
                 self._attached = False
                 return True
             time.sleep(0.1)
@@ -279,7 +272,7 @@ class RosBridgeSubprocess:
         """启动后台监控线程。"""
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
-            name="ros_bridge_monitor",
+            name="geometry_runtime_monitor",
             daemon=True,
         )
         self._monitor_thread.start()
@@ -297,7 +290,7 @@ class RosBridgeSubprocess:
                     break
                 ret = self._process.poll()
             if ret is not None:
-                LOGGER.error("nuwax-ros-bridge 子进程异常退出 (code=%s)", ret)
+                LOGGER.error("nuwax-geometry-runtime 子进程异常退出 (code=%s)", ret)
                 if self._restart_count >= _MAX_RESTART_ATTEMPTS:
                     self._last_error = f"子进程连续崩溃 {_MAX_RESTART_ATTEMPTS} 次，放弃重启"
                     LOGGER.error(self._last_error)
@@ -321,7 +314,7 @@ class RosBridgeSubprocess:
         except OSError:
             return False
 
-    def _verify_attached_bridge_locked(self) -> bool:
+    def _verify_attached_runtime_locked(self) -> bool:
         """attach 候选进程是否真的能响应 gRPC GetStatus。
 
         用一次性 insecure_channel + GetStatus RPC 直接打 127.0.0.1:port。
@@ -362,7 +355,7 @@ class RosBridgeSubprocess:
             now - self._attached_health_check_at
         ) < _ATTACHED_HEALTH_CHECK_TTL_SEC:
             return True
-        ok = self._verify_attached_bridge_locked()
+        ok = self._verify_attached_runtime_locked()
         self._attached_health_check_at = now
         self._attached_health_check_ok = ok
         if not ok:
@@ -379,16 +372,16 @@ class RosBridgeSubprocess:
         self._attached_health_check_ok = False
 
     @staticmethod
-    def _apply_bridge_env_aliases(env: dict) -> None:
+    def _apply_runtime_env_aliases(env: dict) -> None:
+        """把 Nuwax 顶层语义 env 变量下沉为 nuwax-geometry-runtime 内部变量。
+
+        nuwax-geometry-runtime 子进程不再依赖 ROS2 节点 / DDS 话题（已全部迁出），
+        因此这里的 alias 列表不再包含 /utlidar/robot_odom 等 ROS2 话题源：
+        设备位姿由 LCM/SHM 直推（参见 docs/.../06_LCM接入与wire-format验证.md）。
+        """
         aliases = {
-            "NUWAX_MAP_TOPIC": ("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map"),
-            "NUWAX_TF_TOPIC": ("NUWAX_GEOMETRY_TF_TOPIC", "/tf"),
             "NUWAX_MAP_FRAME": ("NUWAX_GEOMETRY_MAP_FRAME", "map"),
             "NUWAX_BASE_FRAME": ("NUWAX_GEOMETRY_BASE_FRAME", "base_link"),
-            "NUWAX_NAV_ACTION": ("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
-            "NUWAX_GO2_ODOM_SOURCE": ("NUWAX_GEOMETRY_ODOM_TOPIC", "/utlidar/robot_odom"),
-            "NUWAX_GO2_POINTCLOUD_SOURCE": ("NUWAX_GEOMETRY_POINT_CLOUD_TOPIC", "/utlidar/cloud"),
-            "NUWAX_CLOUD_MAP_TOPIC": ("NUWAX_GEOMETRY_CLOUD_MAP_TOPIC", ""),
         }
         for target, (source, default_value) in aliases.items():
             if str(env.get(target) or "").strip():
@@ -398,7 +391,7 @@ class RosBridgeSubprocess:
 
     @staticmethod
     def _resolve_external_env_script() -> Optional[Path]:
-        configured = os.environ.get("NUWAX_ROS_BRIDGE_ENV_SCRIPT")
+        configured = os.environ.get("NUWAX_GEOMETRY_RUNTIME_ENV_SCRIPT")
         if configured:
             path = Path(configured).expanduser()
             return path if path.exists() else None
@@ -414,8 +407,8 @@ class RosBridgeSubprocess:
         if binary_path:
             return binary_path
         candidates = [
-            Path(__file__).parent / "nuwax_ros_bridge" / "target" / "release" / _DEFAULT_BINARY_NAME,
-            Path.home() / "nuwax_ros_bridge" / "target" / "release" / _DEFAULT_BINARY_NAME,
+            Path(__file__).parent / "nuwax_geometry_runtime" / "target" / "release" / _DEFAULT_BINARY_NAME,
+            Path.home() / "nuwax_geometry_runtime" / "target" / "release" / _DEFAULT_BINARY_NAME,
             Path("/usr/local/bin") / _DEFAULT_BINARY_NAME,
         ]
         for p in candidates:

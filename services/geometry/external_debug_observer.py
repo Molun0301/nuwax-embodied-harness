@@ -19,11 +19,22 @@ from services.geometry.loop_closure_state import (
     LoopClosureStateBuffer,
     update_loop_closure_state_from_count,
 )
-from services.geometry.ros2_context import (
-    acquire_ros2_context,
-    ensure_go2_slam_overlay_python_paths,
-    release_ros2_context,
-)
+# Phase 3 目标态：删除 ROS2 相关运行时依赖。
+# external_debug_observer.py 历史上使用 ROS2 订阅 /map_obstacles、/frontier 等话题，
+# 目标态下由 nuwax-geometry-runtime 通过 LCM typed channel 暴露等价状态流，
+# 平台层只观察 runtime gRPC 推送。
+# 保留以下函数签名（no-op）以兼容现有调用方。
+def acquire_ros2_context():
+    LOGGER.debug("acquire_ros2_context 已下线：ROS2 接触面删除，平台层由 nuwax-geometry-runtime 接管。")
+    return None
+
+
+def release_ros2_context() -> None:
+    LOGGER.debug("release_ros2_context 已下线：ROS2 接触面删除。")
+
+
+def ensure_go2_slam_overlay_python_paths() -> bool:
+    return False
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.external_debug_observer")
 
@@ -290,24 +301,16 @@ class ExternalGeometryDebugObserver:
             if self._started:
                 return
             try:
-                from geometry_msgs.msg import PoseStamped
-                from nav_msgs.msg import OccupancyGrid as RosOccupancyGrid
-                from rclpy.executors import SingleThreadedExecutor
-                from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-                from tf2_ros import Buffer, TransformListener
-                from visualization_msgs.msg import MarkerArray
-
-                os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
-                cyclonedds_xml = os.path.expanduser("~/cyclonedds_ws/cyclonedds.xml")
-                if os.path.exists(cyclonedds_xml):
-                    os.environ["CYCLONEDDS_URI"] = cyclonedds_xml
-
-                rclpy = acquire_ros2_context()
-                self._has_ros2_context = True
-                self._rclpy = rclpy
-                self._node = rclpy.create_node("nuwax_external_geometry_debug_observer")
-                self._executor = SingleThreadedExecutor()
-                self._executor.add_node(self._node)
+                # Phase 3 目标态：ROS2 相关运行时依赖已删除。
+                # 该 start() 走 ROS2 订阅路径已被 nuwax-geometry-runtime 的 LCM/nuwax 路径取代。
+                # 保留 try-block 是为了兼容历史 stack 抓取与回滚；当前直接走 fallback。
+                LOGGER.info(
+                    "external_debug_observer.start: ROS2 接触面已删除，"
+                    "本 observer 不再独立订阅 /map_obstacles；"
+                    "地图/前沿数据由 nuwax-geometry-runtime 通过 gRPC SubscribeMapUpdates 推送。"
+                )
+                self._started = True
+                return
 
                 map_topic = str(self.config.topics.occupancy_topic or "/map_obstacles")
                 frontier_topic = str(self.config.external.frontier_topic or "explore/frontiers")
@@ -490,11 +493,9 @@ class ExternalGeometryDebugObserver:
         if self._tf_buffer is None:
             return None
         map_frame = self._normalize_frame_id(self.config.frames.map_frame, DEFAULT_MAP_FRAME)
-        try:
-            from rclpy.time import Time
-            from tf2_ros import TransformException
-        except Exception:
-            return None
+        # Phase 3 目标态：位姿查询改走 GeometryRuntimeProvider.get_current_pose。
+        # 保留 None 返回以兼容旧调用方，但实际生效路径已切到 runtime。
+        return None
         for base_frame in self._base_frame_candidates():
             try:
                 transform = self._tf_buffer.lookup_transform(map_frame, base_frame, Time())

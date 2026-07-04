@@ -135,53 +135,47 @@ class G1WebRtcSlamScript(ExternalSlamNav2Script):
 # ---------------------------------------------------------------------------
 #
 # 依据：memory `feedback_prefer_rtabmap_over_slam_toolbox.md` —— 平台几何栈已选定
-# RTAB-Map 作为 SLAM 主线，**不**平行引入职责重叠的 SLAM Toolbox。树莓派 2D 场景
-# 复用 rtabmap_ros 的 2D 模式（订阅 /scan LaserScan + rgb_camera Image），与 Go2 的
-# 3D RTAB-Map 共用同一 ROS2 包，仅订阅话题与参数不同。
+# RTAB-Map 作为 SLAM 主线，**不**平行引入职责重叠的 SLAM Toolbox。
+#
+# Phase 3 目标态：树莓派 2D 场景不再启子进程脚本，沿用 nuwax-geometry-runtime
+# 共享运行时（与 Go2/G1 同一栈），详见 feedback_verification §2.2 残留 1。
+# 类保留以兼容旧 manifest.robot_profile.external_slam_script 字段，但所有方法
+# no-op，避免 100% 启动失败。
 
 
 class RaspiRtabMapScript(ExternalSlamNav2Script):
-    """树莓派走 RTAB-Map 2D 模式（复用 rtabmap_ros；不引入 slam_toolbox）。"""
+    """树莓派走共享 nuwax-geometry-runtime（不再启独立脚本）。
 
-    LAUNCH_FILE = "services/geometry/ros2_ws/src/nuwax_geometry/launch/raspi_rtabmap_2d_nav2.launch.py"
+    Phase 3 之前曾在 ROS2 包路径下启 rtabmap_ros 2D + Nav2；目标态下该路径
+    已删除，整类 no-op 化，保留入口仅为兼容旧 manifest 字段解析。
+    """
 
     def __init__(self, process_supervisor=None) -> None:
         self._supervisor = process_supervisor
         self._launched: bool = False
+        LOGGER.warning(
+            "RaspiRtabMapScript 已 no-op 化（Phase 3 目标态）："
+            "ros2_ws/.../raspi_rtabmap_2d_nav2.launch.py 已不存在，"
+            "树莓派与 Go2/G1 共用 nuwax-geometry-runtime。"
+        )
 
     def start(self, mode: str = "") -> None:
-        if self._supervisor is None:
-            return
-        try:
-            self._supervisor.launch(self.LAUNCH_FILE)
-            self._launched = True
-        except Exception:  # pragma: no cover
-            self._launched = False
+        # Phase 3 目标态：不再启子进程，外部 SLAM 共享 nuwax-geometry-runtime。
+        self._launched = False
+        return
 
     def stop(self) -> None:
-        if self._supervisor is not None and self._launched:
-            try:
-                self._supervisor.shutdown(self.LAUNCH_FILE)
-            except Exception:  # pragma: no cover
-                pass
         self._launched = False
 
     def get_state(self) -> ExternalSlamState:
         return ExternalSlamState(
             name="RaspiRtabMapScript",
-            is_ready=self.is_ready(),
-            detail="RTAB-Map 2D 模式 + nav2 action（复用 rtabmap_ros）",
+            is_ready=False,
+            detail="Phase 3 目标态：共享 nuwax-geometry-runtime，原 ros2_ws 启动路径已下线",
         )
 
     def is_ready(self) -> bool:
-        if not self._launched:
-            return False
-        supervisor = self._supervisor
-        if supervisor is None:
-            return False
-        check_fn = getattr(supervisor, "is_active", None)
-        if callable(check_fn):
-            return bool(check_fn(self.LAUNCH_FILE))
+        # Phase 3 目标态：不再独立 Ready，由 nuwax-geometry-runtime HealthCheck 表达。
         return False
 
 

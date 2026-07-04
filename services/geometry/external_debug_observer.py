@@ -84,7 +84,7 @@ class ExternalGeometryDebugObserver:
         self._node = None
         self._executor = None
         self._thread: Optional[threading.Thread] = None
-        self._rclpy = None
+        # Phase 3 目标态：_rclpy 字段已下线（无任何调用方），不再保留赋值。
         self._subscriptions: List[Any] = []
         self._pose_timer = None
         self._tf_buffer = None
@@ -366,7 +366,7 @@ class ExternalGeometryDebugObserver:
                 else:
                     LOGGER.warning(
                         "explore_lite_msgs 不可用，跳过 explore/status 订阅。"
-                        "请确认 GO2_RTABNAV2/ws 已 colcon build，且网关已 source 其 install/setup.bash。"
+                        "请确认 nuwax-geometry-runtime 已启动并通过 HealthCheck（共享运行时已编译并发布目标话题）。"
                     )
                 self._subscriptions.append(
                     self._node.create_subscription(PoseStamped, next_goal_topic, self._on_next_goal, reliable_volatile)
@@ -466,7 +466,7 @@ class ExternalGeometryDebugObserver:
         self._tf_buffer = None
         self._tf_listener = None
         self._has_ros2_context = False
-        self._rclpy = None
+        # Phase 3 目标态：_rclpy 字段已下线（无任何调用方），不再保留赋值。
 
     def _base_frame_candidates(self) -> Tuple[str, ...]:
         configured = self._normalize_frame_id(self.config.frames.base_frame or "", "")

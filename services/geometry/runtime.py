@@ -550,8 +550,7 @@ class PlatformGeometryRuntime:
             if preflight_errors:
                 message = "平台几何运行时预检失败：" + "；".join(preflight_errors)
                 self._set_runtime_state("failed", message, blocked=True)
-                if bool(getattr(self.config, "require_ros2", False)):
-                    raise RuntimeError(message)
+                # Phase 3 目标态：不再 raise，平台几何运行时失败交由 monitor 与 web 仪表呈现。
                 return
             if not self._uses_external_geometry_stack():
                 raise RuntimeError(self._removed_internal_stack_message())
@@ -568,8 +567,7 @@ class PlatformGeometryRuntime:
             self._live_geometry_start_attempted = False
             with self._runtime_state_lock:
                 self._runtime_started = False
-            if bool(getattr(self.config, "require_ros2", False)):
-                raise
+            # Phase 3 目标态：不再 raise，统一交给上层显式查询 /api/geometry/status。
 
     def _get_motion_provider(self) -> Optional[MotionControl]:
         providers = getattr(self.robot, "providers", None)
@@ -879,11 +877,14 @@ class PlatformGeometryRuntime:
             if not odom_bridge_script.exists():
                 errors.append("缺少 odom TF bridge 脚本 %s，无法启动可选 odom/TF 桥。" % odom_bridge_script)
             setup_script = Path(str(getattr(self.config, "setup_script", "") or "")).expanduser()
-            ros_setup_available = setup_script.exists() or any(path.exists() for path in self._ros_setup_candidates())
-            if bool(getattr(self.config, "require_ros2", False)) and not setup_script.exists():
-                errors.append("缺少 geometry setup script %s" % setup_script)
+            # Phase 3 目标态：不再探测 /opt/ros/* setup.bash；可选 odom/TF 桥由 setup_script 单独控制。
+            ros_setup_available = setup_script.exists()
+            if not setup_script.exists():
+                LOGGER.info(
+                    "geometry setup_script 未配置，可选 odom/TF 桥不启用（目标态为 nuwax-geometry-runtime 内置桥）。"
+                )
             if shutil.which("ros2") is None and not ros_setup_available:
-                errors.append("未找到 ros2 命令、geometry setup script 或系统 ROS setup，无法启动可选 odom/TF 桥。")
+                errors.append("未找到 ros2 命令或 geometry setup script，无法启动可选 odom/TF 桥。")
         required_topics = {
             "occupancy_topic": self.config.topics.occupancy_topic,
             "cost_map_topic": self.config.topics.cost_map_topic,
@@ -906,14 +907,6 @@ class PlatformGeometryRuntime:
             if not str(value or "").strip():
                 errors.append("缺少外部 SLAM/Nav2 TF frame 配置 %s" % name)
         return errors
-
-    def _ros_setup_candidates(self) -> List[Path]:
-        return [
-            Path("/opt/ros/humble/setup.bash"),
-            Path("/opt/ros/jazzy/setup.bash"),
-            Path("/opt/ros/iron/setup.bash"),
-            Path("/opt/ros/foxy/setup.bash"),
-        ]
 
     def _start_required_processes(self) -> None:
         if not self._uses_external_geometry_stack():
@@ -1177,8 +1170,7 @@ class PlatformGeometryRuntime:
             except Exception as exc:
                 self._record_runtime_diagnostic("monitor_loop", exc)
                 self._set_runtime_state("failed", "平台几何运行时监控失败：%s" % exc, blocked=True)
-                if bool(getattr(self.config, "require_ros2", False)):
-                    return
+                # Phase 3 目标态：监控循环遇错仅置 failed，不中断轮询；web 仪表可见即可。
 
     def _should_suppress_external_process_autorestart(self) -> bool:
         """探索/建图会话或探索完成后保留几何时，禁止 monitor 自动重启 go2.sh。"""
@@ -2212,7 +2204,6 @@ class PlatformGeometryRuntime:
         direct_dds = getattr(direct_dds, "direct_dds", None)
         return {
             "geometry_stack": self.config.stack,
-            "require_ros2": bool(getattr(self.config, "require_ros2", False)),
             "odom_topic": self.config.topics.odom_topic,
             "point_cloud_topic": self.config.topics.point_cloud_topic,
             "occupancy_topic": self.config.topics.occupancy_topic,

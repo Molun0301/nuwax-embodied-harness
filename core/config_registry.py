@@ -523,7 +523,6 @@ _ZH_NAMES: Dict[str, str] = {
     "GO2_DATA_PLANE_ENABLED": "启用 Go2 数据面",
     "GO2_DDS_IFACE": "Go2 DDS 网卡",
     "GO2_DIRECT_DDS_ENABLED": "启用 Go2 直连 DDS",
-    "GO2_CYCLONEDDS_LIB_DIR": "Go2 CycloneDDS 库目录",
     "GO2_DATA_PLANE_DDS_IFACE": "Go2 数据面 DDS 网卡",
     "GO2_DIRECT_DDS_LOW_STATE_TOPIC": "Go2 低状态 DDS 话题",
     "GO2_DIRECT_DDS_MAX_POINTS_PER_SCAN": "Go2 单次扫描最大点数",

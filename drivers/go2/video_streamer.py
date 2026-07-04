@@ -21,27 +21,12 @@ class Go2VideoStreamerConfigError(RuntimeError):
     """Go2 端侧推流配置错误。"""
 
 
-def _prepend_env_path(name: str, value: str) -> None:
-    normalized = str(value or "").strip()
-    if not normalized:
-        return
-    current = str(os.environ.get(name, "") or "").strip()
-    entries = [item for item in current.split(":") if item.strip()]
-    if normalized in entries:
-        entries = [item for item in entries if item != normalized]
-    os.environ[name] = ":".join([normalized, *entries]) if entries else normalized
-
-
 def _prepare_go2_sdk_environment(config: Go2DataPlaneConfig) -> None:
     sdk_path = str(getattr(config, "sdk_path", "") or "").strip()
     if sdk_path:
         candidate = Path(sdk_path).expanduser()
         if candidate.exists() and str(candidate) not in sys.path:
             sys.path.insert(0, str(candidate))
-
-    cyclonedds_lib_dir = str(getattr(config, "cyclonedds_lib_dir", "") or "").strip()
-    if cyclonedds_lib_dir:
-        _prepend_env_path("LD_LIBRARY_PATH", cyclonedds_lib_dir)
 
     importlib.invalidate_caches()
 

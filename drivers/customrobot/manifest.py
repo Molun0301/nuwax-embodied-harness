@@ -43,7 +43,7 @@ def build_customrobot_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None
             ),
             forbidden_phases=("data_plane", "models"),
             required_apt_packages=(),
-            forbidden_apt_packages=("ros-${ROS_DISTRO}-rtabmap-ros",),
+            forbidden_apt_packages=(),
             required_python_packages=(),
             external_slam_script="",
             calibration_required=False,
@@ -51,7 +51,7 @@ def build_customrobot_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None
             memory_mode_recommendation="disabled",
             perception_mode_recommendation="cloud-scene",
             telemetry_interval_sec=5.0,
-            telemetry_process_keywords=("gateway", "robot_bridge", "ros2"),
+            telemetry_process_keywords=("gateway", "nuwax_geometry_runtime", "robot_bridge"),
         ),
     )
 

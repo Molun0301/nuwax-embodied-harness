@@ -38,7 +38,7 @@ class RobotProfile:
     memory_mode_recommendation: str = "cloud"  # "cloud" | "local" | "disabled"
     perception_mode_recommendation: str = "hybrid"  # "local" | "hybrid" | "cloud-scene" | "disabled"
     telemetry_interval_sec: float = 2.0
-    telemetry_process_keywords: Tuple[str, ...] = ("gateway", "robot_bridge", "ros2")
+    telemetry_process_keywords: Tuple[str, ...] = ("gateway", "nuwax_geometry_runtime", "robot_bridge")
 
 
 @dataclass(frozen=True)

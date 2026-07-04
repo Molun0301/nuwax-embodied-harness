@@ -11,34 +11,6 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _GO2_ENV_FILE = Path(__file__).resolve().with_name("data_plane.env")
 
 
-def _looks_like_cyclonedds_lib_dir(candidate: Path) -> bool:
-    return candidate.is_dir() and any(candidate.glob("libddsc.so*"))
-
-
-def _resolve_cyclonedds_lib_dir(configured_value: str) -> str:
-    normalized = str(configured_value or "").strip()
-    candidates = []
-    if normalized:
-        candidates.append(Path(normalized).expanduser())
-    home_dir = Path.home()
-    candidates.extend(
-        (
-            home_dir / "cyclonedds_ws" / "install" / "cyclonedds" / "lib",
-            home_dir / "cyclonedds" / "install" / "lib",
-            Path("/usr/local/lib"),
-        )
-    )
-    seen = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        if _looks_like_cyclonedds_lib_dir(candidate):
-            return str(candidate)
-    return ""
-
-
 def _strip_quotes(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in {"'", '"'}:
@@ -162,7 +134,6 @@ class Go2DataPlaneConfig:
     """Go2 设备侧输入流与运动执行配置。"""
 
     enabled: bool = False
-    cyclonedds_lib_dir: str = ""
     sdk_path: str = ""
     dds_iface: str = ""
     expected_odom_frame: str = ""
@@ -177,13 +148,6 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
 
     return Go2DataPlaneConfig(
         enabled=_cfg_bool("GO2_DATA_PLANE_ENABLED", False),
-        cyclonedds_lib_dir=_resolve_cyclonedds_lib_dir(
-            _prefer_platform_str(
-                platform_geometry.cyclonedds_lib_dir if platform_geometry is not None else "",
-                "GO2_CYCLONEDDS_LIB_DIR",
-                "",
-            )
-        ),
         sdk_path=_cfg_str("GO2_SDK_PATH", ""),
         dds_iface=_prefer_platform_str(
             platform_geometry.dds_iface if platform_geometry is not None else "",

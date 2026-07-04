@@ -40,7 +40,7 @@ def build_raspi_lidar_robot_manifest(config: Optional["NuwaxRobotBridgeConfig"] 
         robot_name="raspi_lidar_robot",
         robot_model="raspi_lidar_robot",
         entrypoint="drivers/raspi_lidar_robot/assembly.py:create_raspi_lidar_robot_assembly",
-        description="树莓派 + 2D 激光雷达 + USB 摄像头小机器狗；tier=lite；RTAB-Map 2D 模式（复用 rtabmap_ros，不引入 slam_toolbox）。",
+        description="树莓派 + 2D 激光雷达 + USB 摄像头小机器狗；tier=lite；2D SLAM 走 native runtime（nuwax-geometry-runtime），不再引入 ROS2 包。",
         capability_matrix=RASPI_LIDAR_CAPABILITY_MATRIX,
         required_components=(
             ComponentBinding(
@@ -53,7 +53,7 @@ def build_raspi_lidar_robot_manifest(config: Optional["NuwaxRobotBridgeConfig"] 
             ComponentBinding(
                 name="raspi_rtabmap_script",
                 path="services.geometry.external_script_runner.RaspiRtabMapScript",
-                description="RTAB-Map 2D 模式 launcher（复用 rtabmap_ros）。",
+                description="2D 激光雷达 native SLAM launcher（nuwax-geometry-runtime 2D 后端）。",
                 required=False,
             ),
             ComponentBinding(
@@ -76,22 +76,17 @@ def build_raspi_lidar_robot_manifest(config: Optional["NuwaxRobotBridgeConfig"] 
             ),
             forbidden_phases=("data_plane", "models", "systemd", "nuwaclaw"),
             required_apt_packages=(
-                "python3-pip", "python3-serial",
-                "ros-${ROS_DISTRO}-navigation2",
-                "ros-${ROS_DISTRO}-rtabmap",
-                "ros-${ROS_DISTRO}-teleop-twist-keyboard",
-                "ros-${ROS_DISTRO}-cv-bridge",
-                "python3-opencv",
+                "python3-pip", "python3-serial", "python3-opencv",
             ),
-            forbidden_apt_packages=("ros-${ROS_DISTRO}-slam-toolbox",),
+            forbidden_apt_packages=(),
             required_python_packages=("pyserial>=3.5",),
-            external_slam_script="RaspiRtabMapScript",
+            external_slam_script="RaspiNativeSlamScript",
             calibration_required=False,
             slam_dimension="2d",
             memory_mode_recommendation="disabled",
             perception_mode_recommendation="cloud-scene",
             telemetry_interval_sec=5.0,
-            telemetry_process_keywords=("gateway", "robot_bridge", "ros2", "rtabmap"),
+            telemetry_process_keywords=("gateway", "nuwax_geometry_runtime", "robot_bridge"),
         ),
     )
 

@@ -60,27 +60,12 @@ def _unitree_wxyz_quaternion_to_contract(values: Sequence[float]) -> Quaternion:
     )
 
 
-def _prepend_env_path(name: str, value: str) -> None:
-    normalized = str(value or "").strip()
-    if not normalized:
-        return
-    current = str(os.environ.get(name, "") or "").strip()
-    entries = [item for item in current.split(":") if item.strip()]
-    if normalized in entries:
-        entries = [item for item in entries if item != normalized]
-    os.environ[name] = ":".join([normalized, *entries]) if entries else normalized
-
-
 def _prepare_go2_official_sdk_environment(config: "Go2DataPlaneConfig") -> None:
     sdk_path = str(getattr(config, "sdk_path", "") or "").strip()
     if sdk_path:
         candidate = Path(sdk_path).expanduser()
         if candidate.exists() and str(candidate) not in sys.path:
             sys.path.insert(0, str(candidate))
-
-    cyclonedds_lib_dir = str(getattr(config, "cyclonedds_lib_dir", "") or "").strip()
-    if cyclonedds_lib_dir:
-        _prepend_env_path("LD_LIBRARY_PATH", cyclonedds_lib_dir)
 
     importlib.invalidate_caches()
 
@@ -121,8 +106,8 @@ def _load_go2_official_sdk_modules(
         return None
 
 
-class RclpyGo2RosBridge:
-    """Go2 官方 DDS 原始输入桥。"""
+class Go2DirectDdsBridge:
+    """Go2 官方 DDS 原始输入桥（直连 unitree_sdk2py，绕开 ROS2 中间层）。"""
 
     def __init__(self, config: "Go2DataPlaneConfig") -> None:
         self.config = config
@@ -386,10 +371,10 @@ class Go2DataPlaneRuntime:
     """Go2 设备侧运行时。"""
 
     config: "Go2DataPlaneConfig"
-    bridge: Optional[RclpyGo2RosBridge] = None
+    bridge: Optional[Go2DirectDdsBridge] = None
 
     def __post_init__(self) -> None:
-        self.bridge = self.bridge or RclpyGo2RosBridge(self.config)
+        self.bridge = self.bridge or Go2DirectDdsBridge(self.config)
         self._started = False
         self._official_sport_client = None
         self._official_robot_state_client = None

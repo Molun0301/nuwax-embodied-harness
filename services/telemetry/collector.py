@@ -65,15 +65,14 @@ _PROCESS_PATTERNS: Sequence[tuple[str, str, str]] = (
     ("gateway_web", "网关 Web 服务", "nuwax-gateway-web"),
     ("gateway_supervisor", "网关守护脚本", "nuwax-gateway-supervisor"),
     ("go2_video_streamer", "Go2 视频推流", "nuwax-go2-video-streamer"),
-    ("ros_bridge", "ROS 数据桥", "nuwax-ros-bridge"),
+    ("geometry_runtime", "Native geometry runtime", "nuwax-geometry-runtime"),
     ("geometry_external", "统一几何服务", "nuwax-geometry-external"),
-    ("odom_tf_bridge", "里程计 TF 桥", "nuwax-odom-tf-bridge"),
     ("rtabmap_live", "RTAB-Map 建图", "nuwax-rtabmap-live"),
     ("nav2", "Nav2 导航", "nuwax-nav2"),
     ("static_tf", "静态 TF", "nuwax-static-tf"),
     ("go2_video_streamer", "Go2 视频推流", "nuwax-go2-video-streamer"),
     ("gateway_web", "网关 Web 服务", "uvicorn gateways.app:create_gateway_app_from_env"),
-    ("ros_bridge", "ROS 数据桥", "nuwax_ros_bridge"),
+    ("geometry_runtime", "Native geometry runtime", "nuwax_geometry_runtime"),
 )
 
 

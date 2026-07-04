@@ -5,9 +5,14 @@
 //! 累积到 `SharedState`，供 gRPC facade（`server.rs`）查询/订阅。
 //!
 //! ## backend 策略
-//! - P0 默认走 `LcmTransport::new_fake()`（CI/开发机不依赖 liblcm）。
-//! - P1（`real-lcm` feature）替换为 `RealLcmBackend`，由 `nuwax-workspace`
-//!   `real-lcm` 实装完成后切换；不允许回退 ROS2。
+//! - 默认走 `LcmTransport::new_fake()`（CI/开发机不依赖 liblcm）。
+//! - 可通过 `NUWAX_LCM_BACKEND` 环境变量显式选择：
+//!   - `fake`(默认)：内存 fake backend,不依赖 liblcm
+//!   - `real`：real-lcm backend；**当前上游 `nuwax-transport/real-lcm` feature 仍为空桩,
+//!     尚未实装 Rust LCM binding + MurmurHash64A fingerprint 切换**,
+//!     详见 `docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/06_LCM接入与wire-format验证.md`。
+//!     本期 `real` 选择会被强制 fallback 到 fake 并打印 warn。
+//! - 不允许回退 ROS2 / r2r / DDS / RMW。
 //!
 //! ## channel 命名约定
 //! 与 `00_执行方案.md` §2.3 一致：
@@ -123,13 +128,16 @@ pub struct CloudMapNotification {
     pub voxel_size: f32,
 }
 
-/// 几何 runtime 句柄。`server.rs` 通过此句柄读 SharedState、订阅 cloud_map_tx。
+/// 几何 runtime 句柄。`server.rs` 通过此句柄读 SharedState、订阅 cloud_map_tx
+/// 以及通过 transport.publish 推送 odom / point cloud（fake backend 直接
+/// 写入内存 topic;real backend 在上游 real-lcm feature 实装后透传）。
 #[derive(Clone)]
 pub struct GeometryRuntimeHandle {
     pub state: Arc<RwLock<SharedState>>,
     pub cloud_map_tx: broadcast::Sender<CloudMapNotification>,
     pub nav_state_tx: broadcast::Sender<NavState>,
     pub frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
+    pub transport: LcmTransport,
     pub transport_backend_name: &'static str,
 }
 
@@ -361,9 +369,42 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<(Vec<u8>, u32)> {
 // 启动：构造 LcmTransport (fake) + SharedState + 各订阅 task
 // ============================================================================
 
-/// 启动 geometry runtime 异步循环（LCM-first）。当前使用 fake backend；
-/// P1 实装 `real-lcm` feature 后，构造 `LcmTransport::new(real_lcm_backend)`
-/// 即可，无需改订阅语义。
+/// LCM backend 选择。基于 `NUWAX_LCM_BACKEND` 环境变量解析：
+/// - `fake`(默认)：内存 fake backend,不依赖 liblcm
+/// - `real`：real-lcm backend；**当前上游 nuwax-transport/real-lcm feature 仍为空桩**,
+///   启动期强制 fallback 到 fake 并打印 warn,避免误传 `real` 时偷偷走空 feature。
+/// 详见模块顶部 doc-comment 与
+/// `docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/06_LCM接入与wire-format验证.md`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LcmBackendKind {
+    /// 内存 fake backend（CI/开发机默认）
+    Fake,
+    /// 真实 liblcm backend；当前上游未实装,启动期 fallback 到 Fake
+    Real,
+}
+
+impl LcmBackendKind {
+    fn from_env() -> Self {
+        match std::env::var("NUWAX_LCM_BACKEND")
+            .unwrap_or_else(|_| "fake".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "real" | "real-lcm" => Self::Real,
+            // 默认/未知/显式 "fake" 都走 Fake backend
+            _ => Self::Fake,
+        }
+    }
+}
+
+/// 启动 geometry runtime 异步循环（LCM-first）。
+///
+/// 当前默认走 fake backend；`NUWAX_LCM_BACKEND=real` 会在启动期检测
+/// 上游 `nuwax-transport/real-lcm` feature 就位状态——目前 feature 为空桩,
+/// 启动会 warn 并强制 fallback 到 fake,避免误传环境变量时悄悄走错路。
+/// P1 实装 Rust LCM binding + MurmurHash64A fingerprint 切换后,
+/// 改 `select_transport` 实现即可,无需改订阅语义。
 pub fn spawn_geometry_runtime(
     occupancy_channel: &str,
     tf_channel: &str,
@@ -377,9 +418,23 @@ pub fn spawn_geometry_runtime(
 
     let state = Arc::new(RwLock::new(SharedState::default()));
 
-    // P0 默认 fake backend；real-lcm feature 由 P1 切换
-    let transport = LcmTransport::new_fake();
-    let backend_name: &'static str = "fake-lcm"; // 与 FakeLcmBackend::name() 对齐
+    // 按 NUWAX_LCM_BACKEND 选择 backend;real 当前未实装,启动期强制 fallback 到 fake。
+    let (transport, backend_name): (LcmTransport, &'static str) = match LcmBackendKind::from_env() {
+        LcmBackendKind::Fake => {
+            info!("LCM backend 选择: fake（默认；不依赖 liblcm）");
+            (LcmTransport::new_fake(), "fake-lcm")
+        }
+        LcmBackendKind::Real => {
+            // 上游 blocker:nuwax-transport real-lcm feature 为空 + fingerprint 未切 MurmurHash64A。
+            // 见 docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/06_LCM接入与wire-format验证.md §1.2 / §2.1。
+            warn!(
+                "NUWAX_LCM_BACKEND=real 当前不可用：上游 nuwax-transport/real-lcm feature 仍为空桩 \
+                 (Rust LCM binding 未实装 + fingerprint 未切 MurmurHash64A)。强制 fallback 到 fake。 \
+                 上游 PR 落地后,改 LcmBackendKind::Real 分支即可。"
+            );
+            (LcmTransport::new_fake(), "real-lcm-pending")
+        }
+    };
     info!("nuwax-geometry-runtime 启动：LCM backend = {}", backend_name);
 
     let occ_topic = LcmTopic::new(occupancy_channel)
@@ -657,6 +712,7 @@ pub fn spawn_geometry_runtime(
         cloud_map_tx,
         nav_state_tx,
         frontiers_tx,
+        transport,
         transport_backend_name: backend_name,
     }
 }

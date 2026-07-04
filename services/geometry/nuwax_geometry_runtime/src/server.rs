@@ -257,24 +257,48 @@ impl GeometryRuntime for GeometryRuntimeService {
     // ========================================================================
     // 导航兼容
     // ========================================================================
+    //
+    // B7 blocker: nuwax-nav-stack LCM channel 未接通,/nav/goal 与 /nav/cancel
+    // channel 尚未实现 publisher 端。本期不假装成功,所有 RPC 明确返回
+    // status="UNIMPLEMENTED" + 详细 message,避免上游灰度时把 placeholder
+    // 当成 success 接进去。
 
     async fn set_navigation_goal(&self, req: Request<NavigationGoal>) -> Result<Response<NavigationState>, Status> {
-        // nuwax-nav-stack 接 LCM /nav/goal channel 后的实装放到 Phase 3 之后的 lane；
-        // 当前返回 unconfigured。
+        // TODO(B7): 接通 nuwax-nav-stack LCM channel
+        // 当前阶段 fake LCM backend + 未对接 nav-stack crate;
+        // 同样不能误以为 success。返回 UNIMPLEMENTED,不写 nav_state、不持久化目标。
+        let goal_id = req.get_ref().goal_id.clone();
+        let frame_id = req.get_ref().frame_id.clone();
+        let msg = format!(
+            "SetNavigationGoal pending: nuwax-nav-stack LCM channel /nav/goal not yet wired (B7 blocker; \
+             goal_id={:?} frame_id={:?}). 上游 nuwax-nav-stack crate + channel 实现到位前不接受导航目标。",
+            goal_id, frame_id,
+        );
+        tracing::warn!("{}", msg);
         Ok(Response::new(NavigationState {
-            status: "UNCONFIGURED".into(),
-            message: "SetNavigationGoal 等待 nuwax-nav-stack LCM 接线完成".into(),
-            goal_id: req.get_ref().goal_id.clone(),
+            status: "UNIMPLEMENTED".into(),
+            message: msg,
+            goal_id,
             distance_remaining: 0.0,
             timestamp_ns: now_ns(),
         }))
     }
 
     async fn cancel_navigation(&self, req: Request<CancelNavigationRequest>) -> Result<Response<NavigationState>, Status> {
+        // TODO(B7): 接通 nuwax-nav-stack LCM channel
+        // 当前 fake LCM backend 不能可靠地 cancel 一个尚未存在的 in-flight 目标;
+        // 返回 UNIMPLEMENTED 不假装 cancel 成功,避免误清空上层状态机。
+        let goal_id = req.get_ref().goal_id.clone();
+        let msg = format!(
+            "CancelNavigation pending: nuwax-nav-stack LCM channel /nav/cancel not yet wired (B7 blocker; \
+             goal_id={:?}). 当前没有任何 in-flight 目标可以 cancel。",
+            goal_id,
+        );
+        tracing::warn!("{}", msg);
         Ok(Response::new(NavigationState {
-            status: "CANCELLED".into(),
-            message: "Cancel 已记录;真正下发走 nuwax-nav-stack LCM".into(),
-            goal_id: req.get_ref().goal_id.clone(),
+            status: "UNIMPLEMENTED".into(),
+            message: msg,
+            goal_id,
             distance_remaining: 0.0,
             timestamp_ns: now_ns(),
         }))
@@ -360,18 +384,143 @@ impl GeometryRuntime for GeometryRuntimeService {
     // ========================================================================
     // 输入发布兼容（gRPC 端用于调试；走 LCM 后端发布）
     // ========================================================================
+    //
+    // B6 blocker: 当前 nuwax-transport LcmTransport::publish 已可用,但
+    // typed payload 编码（与 nuwax-codec golden fixture 一致 + 与上游
+    // lcm-gen MurmurHash64A fingerprint 对账）在 Phase 5 才完成。
+    // 本期 publish_odom / publish_point_cloud 调用 LcmTransport.publish
+    // 把原始 bytes 透传（fake backend 直接 push 到内存 topic,real backend
+    // 由 LCM 序列化层处理);若 backend 异常或上游 binding 未就位,返回
+    // success=false + 明确错误,不假装成功。
 
-    async fn publish_odom(&self, _req: Request<PublishOdomRequest>) -> Result<Response<PublishResult>, Status> {
-        Ok(Response::new(PublishResult {
-            success: true,
-            message: "odom LCM publish 已接受;P1 走 real backend".into(),
-        }))
+    async fn publish_odom(&self, req: Request<PublishOdomRequest>) -> Result<Response<PublishResult>, Status> {
+        // TODO(B6): typed payload encoding + MurmurHash64A fingerprint 与 lcm-gen 对账
+        // 当前阶段 fake LCM backend 接受任意 bytes 作为 payload;P1 real-lcm 接入后必须
+        // 走 nuwax-codec 编码 Odometry typed message（fingerprint = MurmurHash64A）。
+        use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
+        let pose = req.get_ref().pose.as_ref();
+        let (frame_id, ts_ns) = match pose {
+            Some(p) => (p.frame_id.clone(), p.timestamp_ns),
+            None => (String::new(), now_ns()),
+        };
+        // 编码成 56B 位姿 + 8B stamp + 2B frame_len + frame bytes（与 lcm_runtime parse_odom 一致）
+        let mut payload = Vec::with_capacity(66 + frame_id.len());
+        if let Some(p) = pose {
+            if let Some(pos) = p.position.as_ref() {
+                payload.extend_from_slice(&pos.x.to_le_bytes());
+                payload.extend_from_slice(&pos.y.to_le_bytes());
+                payload.extend_from_slice(&pos.z.to_le_bytes());
+            } else {
+                payload.extend_from_slice(&[0u8; 24]);
+            }
+            if let Some(q) = p.orientation.as_ref() {
+                payload.extend_from_slice(&q.x.to_le_bytes());
+                payload.extend_from_slice(&q.y.to_le_bytes());
+                payload.extend_from_slice(&q.z.to_le_bytes());
+                payload.extend_from_slice(&q.w.to_le_bytes());
+            } else {
+                payload.extend_from_slice(&[0u8; 32]);
+            }
+        } else {
+            payload.extend_from_slice(&[0u8; 56]);
+        }
+        payload.extend_from_slice(&ts_ns.to_le_bytes());
+        let frame_len = frame_id.len() as u16;
+        payload.extend_from_slice(&frame_len.to_le_bytes());
+        payload.extend_from_slice(frame_id.as_bytes());
+
+        let topic = match LcmTopic::new("/odom") {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("publish_odom: LcmTopic 构造失败: {}", e);
+                return Ok(Response::new(PublishResult {
+                    success: false,
+                    message: format!("LcmTopic::new failed: {}", e),
+                }));
+            }
+        };
+        let msg_type = match LcmMessageType::new("nav_msgs/Odometry") {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("publish_odom: LcmMessageType 构造失败: {}", e);
+                return Ok(Response::new(PublishResult {
+                    success: false,
+                    message: format!("LcmMessageType::new failed: {}", e),
+                }));
+            }
+        };
+        let frame = RawLcmFrame {
+            topic,
+            msg_type: Some(msg_type),
+            payload,
+            stamp_ns: ts_ns,
+        };
+        let lcm_transport = self.bridge.transport.clone();
+        match lcm_transport.publish(frame).await {
+            Ok(()) => Ok(Response::new(PublishResult {
+                success: true,
+                message: format!("odom LCM publish 已接受（backend={}）", self.bridge.transport_backend_name),
+            })),
+            Err(e) => {
+                tracing::warn!("publish_odom: LCM publish 失败: {}", e);
+                Ok(Response::new(PublishResult {
+                    success: false,
+                    message: format!("LCM publish failed: {}", e),
+                }))
+            }
+        }
     }
 
-    async fn publish_point_cloud(&self, _req: Request<PublishPointCloudRequest>) -> Result<Response<PublishResult>, Status> {
-        Ok(Response::new(PublishResult {
-            success: true,
-            message: "PointCloud2 LCM publish 已接受;P1 走 real backend".into(),
-        }))
+    async fn publish_point_cloud(&self, req: Request<PublishPointCloudRequest>) -> Result<Response<PublishResult>, Status> {
+        // TODO(B6): typed payload encoding + MurmurHash64A fingerprint 与 lcm-gen 对账
+        // 当前阶段 fake LCM backend 接受任意 bytes 作为 payload;P1 real-lcm 接入后必须
+        // 走 nuwax-codec 编码 PointCloud2 typed message（fingerprint = MurmurHash64A）。
+        use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
+        let pcr = req.get_ref();
+        // payload: point_step(u32) + raw PointCloud2 bytes（与 lcm_runtime parse_pointcloud_payload 一致）
+        let mut payload = Vec::with_capacity(4 + pcr.points.len());
+        payload.extend_from_slice(&pcr.point_step.to_le_bytes());
+        payload.extend_from_slice(&pcr.points);
+
+        let topic = match LcmTopic::new("/go2/lidar/points") {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("publish_point_cloud: LcmTopic 构造失败: {}", e);
+                return Ok(Response::new(PublishResult {
+                    success: false,
+                    message: format!("LcmTopic::new failed: {}", e),
+                }));
+            }
+        };
+        let msg_type = match LcmMessageType::new("sensor_msgs/PointCloud2") {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("publish_point_cloud: LcmMessageType 构造失败: {}", e);
+                return Ok(Response::new(PublishResult {
+                    success: false,
+                    message: format!("LcmMessageType::new failed: {}", e),
+                }));
+            }
+        };
+        let frame = RawLcmFrame {
+            topic,
+            msg_type: Some(msg_type),
+            payload,
+            stamp_ns: now_ns(),
+        };
+        let lcm_transport = self.bridge.transport.clone();
+        match lcm_transport.publish(frame).await {
+            Ok(()) => Ok(Response::new(PublishResult {
+                success: true,
+                message: format!("PointCloud2 LCM publish 已接受（backend={}）", self.bridge.transport_backend_name),
+            })),
+            Err(e) => {
+                tracing::warn!("publish_point_cloud: LCM publish 失败: {}", e);
+                Ok(Response::new(PublishResult {
+                    success: false,
+                    message: format!("LCM publish failed: {}", e),
+                }))
+            }
+        }
     }
 }

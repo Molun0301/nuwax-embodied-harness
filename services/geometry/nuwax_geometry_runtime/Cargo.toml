@@ -9,7 +9,18 @@ description = "nuwax 平台几何 LCM/nuwax native runtime 子进程（独立于
 # MSRV 1.88；目标机 aarch64 + Ubuntu 20.04；不允许引入 ROS2/r2r/DDS/RMW 依赖。
 
 [dependencies]
-# nuwax-workspace path deps（LCM-first）。P0 默认 fake backend，real-lcm feature 由 P1 实装。
+# nuwax-workspace path deps（LCM-first）。
+#
+# real-lcm feature 依赖上游 nuwax-transport 实现,当前上游 feature 仍为空桩。
+# - 上游 `real-lcm = []` 尚未实装 Rust LCM binding
+# - 上游 `nuwax-codec` fingerprint 仍用 FNV-1a,与上游 lcm-gen MurmurHash64A 不等价
+# 详见 docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/06_LCM接入与wire-format验证.md
+#
+# 因此本仓 *默认* 走 fake backend;只有当上游 PR 完成（real-lcm binding +
+# MurmurHash64A 切换）后,才能在本仓启用 `NUWAX_LCM_BACKEND=real`。
+# 当前阶段显式将 nuwax-transport feature 锁定为 `default-features = false`,
+# 即使误设环境变量也不会意外拉入空 feature;`lcm_runtime.rs` 启动期
+# 进一步校验 fallback,见 `LcmBackendKind::from_env`。
 nuwax-protocol = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-protocol" }
 nuwax-transport = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-transport", default-features = false }
 nuwax-codec = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-codec" }

@@ -31,8 +31,8 @@ def build_g1_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Robo
             robot_name="g1",
             tier_recommendation="full",
             required_phases=(
-                "preflight", "system", "python_env", "geometry_deps",
-                "build_ws", "config_env", "models", "mcp", "health",
+                "preflight", "system", "python_env", "geometry_runtime_deps",
+                "config_env", "models", "mcp", "health",
             ),
             forbidden_phases=("data_plane",),
             required_apt_packages=(),

@@ -71,8 +71,8 @@ def build_raspi_lidar_robot_manifest(config: Optional["NuwaxRobotBridgeConfig"] 
             robot_name="raspi_lidar_robot",
             tier_recommendation="lite",
             required_phases=(
-                "preflight", "system", "python_env", "geometry_deps",
-                "build_ws", "config_env", "health",
+                "preflight", "system", "python_env", "geometry_runtime_deps",
+                "config_env", "health",
             ),
             forbidden_phases=("data_plane", "models", "systemd", "nuwaclaw"),
             required_apt_packages=(

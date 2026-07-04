@@ -38,7 +38,7 @@ def build_customrobot_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None
             robot_name="customrobot",
             tier_recommendation="lite",
             required_phases=(
-                "preflight", "system", "python_env", "build_ws",
+                "preflight", "system", "python_env", "geometry_runtime_deps",
                 "config_env", "health",
             ),
             forbidden_phases=("data_plane", "models"),

@@ -65,8 +65,8 @@ def build_go2_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Rob
             robot_name="go2",
             tier_recommendation="full",
             required_phases=(
-                "preflight", "system", "python_env", "geometry_deps",
-                "build_ws", "config_env", "models", "systemd", "mcp", "nuwaclaw", "health",
+                "preflight", "system", "python_env", "geometry_runtime_deps",
+                "config_env", "models", "systemd", "mcp", "nuwaclaw", "health",
             ),
             forbidden_phases=(),
             required_apt_packages=(),

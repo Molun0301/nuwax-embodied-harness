@@ -268,6 +268,47 @@ cleanup_stale_go2_video_streamer() {
 }
 
 cleanup_external_geometry_processes() {
+  # 去 ROS2 化（2026-07-04 drop-ros2 B4 修复）：默认清理对象改为 nuwax-geometry-runtime
+  # 与 LCM runtime 进程；不再扫描 services/geometry/ros2_ws/src/GO2_RTABNAV2 这条已删除
+  # 路径，也不 pkill ros2 launch / nav2_* / RTAB-Map 组件等 ROS2 进程模式。
+  # 历史 ROS2 进程清理（如旧 ws/旧 binary 仍以孤立进程残留）隔离到显式开关
+  # NUWAX_LEGACY_ROS2_CLEANUP=1；默认不进入 gateway lifecycle。
+  local pid=""
+  local args=""
+  local lcm_patterns=(
+    "nuwax-geometry-runtime"
+    "nuwax-lcm-runtime"
+    "nuwax-nav-stack"
+    "nuwax-video-streamer"
+  )
+
+  if ! is_truthy "${NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY:-true}"; then
+    return 0
+  fi
+
+  while read -r pid args; do
+    if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
+      continue
+    fi
+    for pattern in "${lcm_patterns[@]}"; do
+      if [[ "${args}" == *"${pattern}"* ]]; then
+        terminate_process_scope "${pid}" "external LCM/native geometry process (${pattern})"
+        break
+      fi
+    done
+  done < <(ps -eo pid=,args=)
+
+  if is_truthy "${NUWAX_LEGACY_ROS2_CLEANUP:-0}"; then
+    echo "WARNING: NUWAX_LEGACY_ROS2_CLEANUP=1 已启用，将一并扫描已删除 ROS2 工作区残留模式。" >&2
+    echo "         此开关仅用于一次性迁移验收，不属于日常 gateway lifecycle。" >&2
+    cleanup_legacy_ros2_processes
+  fi
+}
+
+cleanup_legacy_ros2_processes() {
+  # 仅在 NUWAX_LEGACY_ROS2_CLEANUP=1 时被调用；目标是一次性清理历史 ROS2 工作区
+  # 残留（已删除 services/geometry/ros2_ws，但实机 os 层 process 表里仍有遗留进程）。
+  # 此函数不进入默认 gateway 路径。
   local geometry_root="${REPO_ROOT}/services/geometry/ros2_ws/src/GO2_RTABNAV2"
   local pid=""
   local args=""
@@ -293,10 +334,6 @@ cleanup_external_geometry_processes() {
   )
   declare -A seen_pgids=()
 
-  if ! is_truthy "${NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY:-true}"; then
-    return 0
-  fi
-
   while read -r pid args; do
     if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
       continue
@@ -309,7 +346,7 @@ cleanup_external_geometry_processes() {
       continue
     fi
     seen_pgids["${pgid}"]=1
-    terminate_process_scope "${pid}" "external geometry process group ${pgid}"
+    terminate_process_scope "${pid}" "legacy geometry process group ${pgid}"
   done < <(ps -eo pid=,args=)
 
   for pattern in "${go2_patterns[@]}"; do
@@ -495,10 +532,10 @@ if [[ -f "${GO2_DATA_PLANE_ENV_FILE}" ]]; then
   load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
 fi
 
-# 去 ROS2 化（2026-07-03 drop-ros2）：原 `unset RMW_IMPLEMENTATION` 与 `CYCLONEDDS_URI`
-# 回写 .env 的兼容代码段已删除；geometry runtime 走 LCM typed channel，不再需要 RMW /
-# CycloneDDS env。
-unset RMW_IMPLEMENTATION 2>/dev/null || true
+# 去 ROS2 化（2026-07-04 drop-ros2 B4 修复）：`unset RMW_IMPLEMENTATION` /
+# `CYCLONEDDS_URI` / `ROS_DOMAIN_ID` 等 RMW/DDS env 兼容代码段已删除；geometry runtime
+# 走 LCM typed channel，不再需要这些变量。.env 中的对应键在 §B2 已由 contracts/config
+# 清场。
 
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
 PID_FILE="${NUWAX_GATEWAY_PID_FILE:-${REPO_ROOT}/runtime_data/gateway/gateway.pid}"

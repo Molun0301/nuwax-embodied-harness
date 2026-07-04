@@ -40,7 +40,7 @@ from scripts.installer.phases import DEFAULT_PHASE_ORDER, default_registry, pars
 import scripts.installer.phases.preflight  # noqa: F401, E402
 import scripts.installer.phases.system  # noqa: F401, E402
 import scripts.installer.phases.python_env  # noqa: F401, E402
-import scripts.installer.phases.geometry_deps  # noqa: F401, E402
+import scripts.installer.phases.geometry_runtime_deps  # noqa: F401, E402
 import scripts.installer.phases.config_env  # noqa: F401, E402
 import scripts.installer.phases.models  # noqa: F401, E402
 import scripts.installer.phases.systemd  # noqa: F401, E402
@@ -66,7 +66,7 @@ class PhaseContext:
     offline: bool = False
     non_interactive: bool = False
     # 离线模式阶段列表（NETWORK_HOOKS guard 触发阶段名）
-    offline_strict_phases: tuple = ("system", "geometry_deps", "models", "nuwaclaw", "health")
+    offline_strict_phases: tuple = ("system", "geometry_runtime_deps", "models", "nuwaclaw", "health")
 
     def _check_offline(self, phase_name: str) -> None:
         """离线模式下，被列入 strict_phases 的阶段拒绝执行（仅 dry_run 允许）。"""
@@ -443,7 +443,7 @@ def _should_skip_phase(phase_name: str, planner: InstallPlanner, runtime: Runtim
     # 每个 phase 对应的 planner flag（如未对应则视为不可跳）
     skip_flags: Dict[str, str] = {
         "python_env": "install_python",
-        "geometry_deps": "install_geometry_deps",
+        "geometry_runtime_deps": "install_geometry_deps",
         "systemd": "systemd",
         "nuwaclaw": "install_nuwaclaw_docker",
         "health": "healthcheck",

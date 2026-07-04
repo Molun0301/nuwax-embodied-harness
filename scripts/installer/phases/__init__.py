@@ -7,8 +7,9 @@
 - ``parse_phase_overrides()`` 把 ``['models=exit-1', 'nuwaclaw=skip']`` 解析为
   ``{'models': -1, 'nuwaclaw': 'skip'}``；解析失败抛 ``InstallerError(64)``。
 - ``DEFAULT_PHASE_ORDER`` 是去 ROS2 阶段化后的 10 个 phase 标准顺序（已移除
-  ``build_ws`` / ``install_nav2_action_proxy``）；后续 phase 注册、``--resume``
-  跳过已成功阶段、wizard 进度展示都依赖这个顺序。
+  ``build_ws`` / ``install_nav2_action_proxy``；原 ``geometry_deps`` 改名为
+  ``geometry_runtime_deps``，目标态承载 nuwax-geometry-runtime 产物校验）；后续
+  phase 注册、``--resume`` 跳过已成功阶段、wizard 进度展示都依赖这个顺序。
 - ``PhaseRegistry`` 是 phase 类的注册表，phases/*.py 在 import 时 ``register()``。
 """
 
@@ -23,12 +24,13 @@ from scripts.installer.errors import InstallerError, InstallerErrorCode
 # --phase-override 格式：phase_name=exit[-]<int> | =skip
 _PHASE_OVERRIDE_RE = re.compile(r"^(?P<phase>[a-z_]+)=(?P<code>exit-?\d+|skip)$")
 
-# phase 顺序（plan 4.1 L110-120 去 ROS2 阶段化后）：每个 phase 文件名（不含 .py）
+# phase 顺序（plan 4.1 L110-120 去 ROS2 阶段化后 + 2026-07-04 B3 重命名）：
+# 每个 phase 文件名（不含 .py）。
 DEFAULT_PHASE_ORDER: tuple[str, ...] = (
     "preflight",
     "system",
     "python_env",
-    "geometry_deps",
+    "geometry_runtime_deps",
     "config_env",
     "models",
     "systemd",

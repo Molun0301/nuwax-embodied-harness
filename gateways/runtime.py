@@ -3497,7 +3497,7 @@ class GatewayRuntime:
             "stack": profile.get("stack") or metadata.get("geometry_stack") or self.platform_geometry_runtime.config.stack,
             "status": "configured" if profile else "missing",
             "geometry_enabled": bool(self.platform_geometry_runtime.config.enabled),
-            "require_ros2": bool(self.platform_geometry_runtime.config.require_ros2),
+            "require_ros2": bool(getattr(self.platform_geometry_runtime.config, "require_ros2", False)),
             "source": "map_snapshot.metadata" if metadata else "geometry_runtime.config",
         }
 

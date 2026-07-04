@@ -5,30 +5,46 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 
-GEOMETRY_STACK_NAME = "external_slam_nav2"
-NAV2_PROVIDER_NAME = "nav2_action_navigation"
+GEOMETRY_STACK_NAME = "nuwax_geometry_runtime"
+NAVIGATION_BACKEND_NAME = "nuwax_navigation_stack"
 
 
-def build_default_geometry_setup_script() -> str:
-    """返回当前仓库内默认几何侧车 setup 脚本路径。"""
-
-    return str(Path(__file__).resolve().parents[1] / "services" / "geometry" / "ros2_ws" / "install" / "setup.bash")
-
-
-def build_default_geometry_go2slam_setup_script() -> str:
-    """返回 GO2_RTABNAV2 嵌套工作区 setup 脚本路径（explore_lite_msgs 等）。"""
+def build_default_geometry_runtime_binary() -> str:
+    """返回默认 nuwax-geometry-runtime 二进制路径。"""
 
     return str(
         Path(__file__).resolve().parents[1]
         / "services"
         / "geometry"
-        / "ros2_ws"
-        / "src"
-        / "GO2_RTABNAV2"
-        / "ws"
-        / "install"
-        / "setup.bash"
+        / "nuwax_geometry_runtime"
+        / "target"
+        / "release"
+        / "nuwax-geometry-runtime"
     )
+
+
+def build_default_geometry_runtime_ready_file() -> str:
+    """返回 nuwax-geometry-runtime ready 文件（健康检查就绪标记）。"""
+
+    return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "runtime.ready")
+
+
+def build_default_geometry_runtime_port() -> int:
+    """返回 nuwax-geometry-runtime gRPC 控制面默认端口。"""
+
+    return 50061
+
+
+def build_default_lcm_url() -> str:
+    """返回默认 LCM UDP multicast URL（real-lcm backend 启用时生效）。"""
+
+    return "udpm://239.255.76.67:7667?ttl=1"
+
+
+def build_default_nuwax_workspace_dir() -> str:
+    """返回 nuwax-workspace 路径依赖默认位置。"""
+
+    return "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace"
 
 
 def build_default_rtabmap_database_root() -> str:
@@ -43,17 +59,15 @@ def build_default_rtabmap_pcd_root() -> str:
     return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "pcd")
 
 
-def build_default_external_slam_nav2_script() -> str:
-    """返回仓库内默认外部 SLAM/Nav2 启动脚本路径（GO2_RTABNAV2 顶层 go2.sh）。"""
+def build_default_geometry_runtime_start_script() -> str:
+    """返回 nuwax-geometry-runtime 启动脚本路径。"""
 
     return str(
         Path(__file__).resolve().parents[1]
         / "services"
         / "geometry"
-        / "ros2_ws"
-        / "src"
-        / "GO2_RTABNAV2"
-        / "go2.sh"
+        / "scripts"
+        / "start_nuwax_geometry_runtime.sh"
     )
 
 
@@ -146,10 +160,10 @@ class GeometryTraversabilityFilterConfig:
 class RtabmapOutputConfig:
     """RTAB-Map 输出资产与诊断摘要配置。"""
 
-    database_asset_name: str = "external_slam_nav2_state.db"
+    database_asset_name: str = "nuwax_mapping_state.db"
     pcd_asset_name: str = "cloud_map.pcd"
     occupancy_layer: str = "occupancy_grid"
-    costmap_layer: str = "nav2_global_costmap"
+    costmap_layer: str = "nav_global_costmap"
     traversability_layer: str = "traversability"
     localization_status: str = "rtabmap_localization"
     relocalization_diagnostics: str = "rtabmap_icp"
@@ -157,15 +171,14 @@ class RtabmapOutputConfig:
 
 @dataclass
 class RtabmapConfig:
-    """RTAB-Map 状态与输出配置。"""
+    """RTAB-Map 状态与输出配置（由 nuwax-mapping crate 提供底层能力）。"""
 
-    profile_name: str = "external_slam_nav2"
+    profile_name: str = "nuwax_mapping"
     profile_enabled: bool = True
     default_profile: bool = True
     database_root: str = field(default_factory=build_default_rtabmap_database_root)
     pcd_root: str = field(default_factory=build_default_rtabmap_pcd_root)
-    launch_package: str = "rtabmap_ros"
-    launch_file: str = "rtabmap.launch.py"
+    mapping_crate: str = "nuwax-mapping"
     occupancy_projection: str = "projected_occupancy"
     input_contract: str = "platform_geometry_inputs"
     output_contract: str = "platform_map_version_geometry_asset"
@@ -177,55 +190,69 @@ class RtabmapConfig:
 
 
 @dataclass
-class Nav2Config:
-    """Nav2 action provider 配置。"""
+class NavigationBackendConfig:
+    """nuwax-nav-stack 导航后端配置（替代旧 Nav2 action provider）。"""
 
-    action_name: str = "/navigate_to_pose"
-    launch_package: str = "nav2_bringup"
-    launch_file: str = "navigation_launch.py"
-    global_costmap_topic: str = "/global_costmap/costmap"
-    local_costmap_topic: str = "/local_costmap/costmap"
-    costmap_source: str = "nav2_global"
-    map_yaml: str = ""
-    params_file: str = ""
-    use_sim_time: bool = False
+    goal_channel: str = "/nav/goal"
+    cancel_channel: str = "/nav/cancel"
+    state_channel: str = "/nav/state"
+    costmap_source: str = "nuwax_global_costmap"
+    costmap_channel: str = "/nav/costmap"
     autostart: bool = True
 
 
 @dataclass
 class ExternalGeometryStackConfig:
-    """外部几何栈托管配置。"""
+    """nuwax-geometry-runtime 托管配置（替代旧 ROS2 外部栈）。"""
 
     enabled: bool = True
-    script_path: str = field(default_factory=build_default_external_slam_nav2_script)
+    binary_path: str = field(default_factory=build_default_geometry_runtime_binary)
+    ready_file: str = field(default_factory=build_default_geometry_runtime_ready_file)
+    port: int = field(default_factory=build_default_geometry_runtime_port)
     args: Tuple[str, ...] = ()
-    process_name: str = "external_slam_nav2"
-    log_name: str = "external_slam_nav2.log"
+    process_name: str = "nuwax-geometry-runtime"
+    log_name: str = "nuwax_geometry_runtime.log"
     provides_map: bool = True
-    provides_nav2: bool = True
+    provides_navigation: bool = True
     provides_tf: bool = True
-    input_bridge_enabled: bool = False
-    point_cloud_bridge_enabled: bool = False
-    platform_odom_tf_bridge_enabled: bool = False
-    platform_cmd_vel_bridge_enabled: bool = False
-    frontier_topic: str = "explore/frontiers"
+    frontier_channel: str = "/explore/frontiers#nuwax_msgs.FrontierList"
+
+
+@dataclass
+class LcmChannelConfig:
+    """LCM typed channel 命名配置（real-lcm backend 默认启用后生效）。"""
+
+    odom: str = "/odom#nav_msgs.Odometry"
+    tf: str = "/tf#geometry_msgs.Transform"
+    tf_static: str = "/tf_static#geometry_msgs.Transform"
+    point_cloud: str = "/go2/lidar/points#sensor_msgs.PointCloud2"
+    occupancy: str = "/map/occupancy#nav_msgs.OccupancyGrid"
+    cmd_vel: str = "/cmd_vel#geometry_msgs.Twist"
+    initial_pose: str = "/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped"
+    goal_pose: str = "/nav/goal#geometry_msgs.PoseStamped"
+    frontier: str = "/explore/frontiers#nuwax_msgs.FrontierList"
+    cloud_map: str = "/cloud_map#sensor_msgs.PointCloud2"
 
 
 @dataclass
 class PlatformGeometryConfig:
-    """平台几何引擎统一配置。"""
+    """平台几何引擎统一配置（目标态：LCM + nuwax-geometry-runtime，无 ROS2/Nav2）。"""
 
     enabled: bool = True
     stack: str = GEOMETRY_STACK_NAME
-    require_ros2: bool = True
-    setup_script: str = field(default_factory=build_default_geometry_setup_script)
-    cyclonedds_lib_dir: str = ""
-    dds_iface: str = ""
+    runtime_binary: str = field(default_factory=build_default_geometry_runtime_binary)
+    runtime_port: int = field(default_factory=build_default_geometry_runtime_port)
+    runtime_ready_file: str = field(default_factory=build_default_geometry_runtime_ready_file)
+    runtime_start_script: str = field(default_factory=build_default_geometry_runtime_start_script)
+    lcm_url: str = field(default_factory=build_default_lcm_url)
+    lcm_backend: str = "real-lcm"
+    nuwax_workspace_dir: str = field(default_factory=build_default_nuwax_workspace_dir)
     topics: GeometryTopicsConfig = field(default_factory=GeometryTopicsConfig)
     frames: GeometryFrameConfig = field(default_factory=GeometryFrameConfig)
     rtabmap: RtabmapConfig = field(default_factory=RtabmapConfig)
-    nav2: Nav2Config = field(default_factory=Nav2Config)
+    navigation: NavigationBackendConfig = field(default_factory=NavigationBackendConfig)
     external: ExternalGeometryStackConfig = field(default_factory=ExternalGeometryStackConfig)
+    lcm_channels: LcmChannelConfig = field(default_factory=LcmChannelConfig)
 
     def build_metadata(self) -> Dict[str, object]:
         """返回便于状态面记录的几何配置摘要。"""
@@ -233,15 +260,17 @@ class PlatformGeometryConfig:
         return {
             "geometry_stack": self.stack,
             "geometry_enabled": self.enabled,
-            "require_ros2": self.require_ros2,
-            "setup_script": self.setup_script,
-            "cyclonedds_lib_dir": self.cyclonedds_lib_dir or None,
-            "dds_iface": self.dds_iface or None,
+            "runtime_binary": self.runtime_binary,
+            "runtime_port": self.runtime_port,
+            "runtime_ready_file": self.runtime_ready_file,
+            "lcm_url": self.lcm_url,
+            "lcm_backend": self.lcm_backend,
+            "nuwax_workspace_dir": self.nuwax_workspace_dir,
             "profile": {
                 "name": self.rtabmap.profile_name,
                 "enabled": self.rtabmap.profile_enabled,
                 "default": self.rtabmap.default_profile,
-                "provider": NAV2_PROVIDER_NAME,
+                "provider": NAVIGATION_BACKEND_NAME,
                 "stack": self.stack,
             },
             "topics": {
@@ -333,21 +362,33 @@ class PlatformGeometryConfig:
                 "default_profile": self.rtabmap.default_profile,
                 "database_root": self.rtabmap.database_root,
                 "pcd_root": self.rtabmap.pcd_root,
-                "launch_package": self.rtabmap.launch_package,
-                "launch_file": self.rtabmap.launch_file,
+                "mapping_crate": self.rtabmap.mapping_crate,
                 "occupancy_projection": self.rtabmap.occupancy_projection,
             },
             "external_geometry": {
                 "enabled": self.external.enabled,
-                "script_path": self.external.script_path,
+                "binary_path": self.external.binary_path,
+                "ready_file": self.external.ready_file,
+                "port": self.external.port,
                 "args": self.external.args,
                 "process_name": self.external.process_name,
                 "log_name": self.external.log_name,
                 "provides_map": self.external.provides_map,
-                "provides_nav2": self.external.provides_nav2,
+                "provides_navigation": self.external.provides_navigation,
                 "provides_tf": self.external.provides_tf,
-                "input_bridge_enabled": self.external.input_bridge_enabled,
-                "point_cloud_bridge_enabled": self.external.point_cloud_bridge_enabled,
+                "frontier_channel": self.external.frontier_channel,
+            },
+            "lcm_channels": {
+                "odom": self.lcm_channels.odom,
+                "tf": self.lcm_channels.tf,
+                "tf_static": self.lcm_channels.tf_static,
+                "point_cloud": self.lcm_channels.point_cloud,
+                "occupancy": self.lcm_channels.occupancy,
+                "cmd_vel": self.lcm_channels.cmd_vel,
+                "initial_pose": self.lcm_channels.initial_pose,
+                "goal_pose": self.lcm_channels.goal_pose,
+                "frontier": self.lcm_channels.frontier,
+                "cloud_map": self.lcm_channels.cloud_map,
             },
             "output_contract": {
                 "name": self.rtabmap.output_contract,
@@ -360,17 +401,13 @@ class PlatformGeometryConfig:
                 "relocalization_diagnostics": self.rtabmap.outputs.relocalization_diagnostics,
                 "navigable_layer": self.rtabmap.occupancy_projection,
             },
-            "nav2": {
-                "action_name": self.nav2.action_name,
-                "launch_package": self.nav2.launch_package,
-                "launch_file": self.nav2.launch_file,
-                "global_costmap_topic": self.nav2.global_costmap_topic,
-                "local_costmap_topic": self.nav2.local_costmap_topic,
-                "provider": NAV2_PROVIDER_NAME,
-                "costmap_source": self.nav2.costmap_source,
-                "map_yaml": self.nav2.map_yaml or None,
-                "params_file": self.nav2.params_file or None,
-                "use_sim_time": self.nav2.use_sim_time,
-                "autostart": self.nav2.autostart,
+            "navigation": {
+                "goal_channel": self.navigation.goal_channel,
+                "cancel_channel": self.navigation.cancel_channel,
+                "state_channel": self.navigation.state_channel,
+                "costmap_source": self.navigation.costmap_source,
+                "costmap_channel": self.navigation.costmap_channel,
+                "provider": NAVIGATION_BACKEND_NAME,
+                "autostart": self.navigation.autostart,
             },
         }

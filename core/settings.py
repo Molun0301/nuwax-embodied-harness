@@ -42,12 +42,17 @@ from contracts.geometry_runtime import (
     GeometryTimestampQualityConfig,
     GeometryTopicsConfig,
     GeometryTraversabilityFilterConfig,
-    Nav2Config,
+    LcmChannelConfig,
+    NavigationBackendConfig,
     PlatformGeometryConfig,
     RtabmapConfig,
     RtabmapOutputConfig,
-    build_default_external_slam_nav2_script,
-    build_default_geometry_setup_script,
+    build_default_geometry_runtime_binary,
+    build_default_geometry_runtime_port,
+    build_default_geometry_runtime_ready_file,
+    build_default_geometry_runtime_start_script,
+    build_default_lcm_url,
+    build_default_nuwax_workspace_dir,
     build_default_rtabmap_database_root,
     build_default_rtabmap_pcd_root,
 )
@@ -68,7 +73,7 @@ DEFAULT_MEMORY_TEXT_EMBEDDING_MODEL = _default_model_dir("BAAI/bge-m3")
 DEFAULT_MEMORY_IMAGE_EMBEDDING_MODEL = _default_model_dir("openai/clip-vit-base-patch32")
 DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL = "tongyi-embedding-vision-flash-2026-03-06"
 DEFAULT_MEMORY_EMBEDDING_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
-DEFAULT_GEOMETRY_STACK_NAME = "external_slam_nav2"
+DEFAULT_GEOMETRY_STACK_NAME = "nuwax_geometry_runtime"
 
 
 
@@ -170,7 +175,6 @@ NAV_PROXY_GRPC_PORT: int = _cfg_int("NUWAX_NAV_PROXY_GRPC_PORT", 50061)
 NAV_PROXY_PENDING_QUEUE_MAX_SIZE: int = max(
     1, _cfg_int("NUWAX_NAV_PROXY_PENDING_QUEUE_MAX_SIZE", 4)
 )
-NAV_PROXY_RMW: str = _cfg_str("NUWAX_NAV_PROXY_RMW", "rmw_cyclonedds_cpp")
 
 
 def _notify_deprecated_env(legacy_name: str, preferred_name: str) -> None:
@@ -698,15 +702,25 @@ def load_config() -> NuwaxRobotBridgeConfig:
         ),
     )
 
-    external_input_bridge_enabled = _cfg_bool("NUWAX_GEOMETRY_EXTERNAL_INPUT_BRIDGE_ENABLED", False)
-
     geometry = PlatformGeometryConfig(
         enabled=_cfg_bool("NUWAX_GEOMETRY_ENABLED", True),
         stack=DEFAULT_GEOMETRY_STACK_NAME,
-        require_ros2=_cfg_bool("NUWAX_GEOMETRY_REQUIRE_ROS2", True),
-        setup_script=_cfg_str("NUWAX_GEOMETRY_SETUP_SCRIPT", build_default_geometry_setup_script()),
-        cyclonedds_lib_dir=_cfg_str("NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR", ""),
-        dds_iface=_cfg_str("NUWAX_GEOMETRY_DDS_IFACE", ""),
+        runtime_binary=_cfg_str("NUWAX_GEOMETRY_RUNTIME_BINARY", build_default_geometry_runtime_binary()),
+        runtime_port=max(1, _cfg_int("NUWAX_GEOMETRY_RUNTIME_PORT", build_default_geometry_runtime_port())),
+        runtime_ready_file=_cfg_str(
+            "NUWAX_GEOMETRY_RUNTIME_READY_FILE",
+            build_default_geometry_runtime_ready_file(),
+        ),
+        runtime_start_script=_cfg_str(
+            "NUWAX_GEOMETRY_RUNTIME_START_SCRIPT",
+            build_default_geometry_runtime_start_script(),
+        ),
+        lcm_url=_cfg_str("NUWAX_LCM_URL", build_default_lcm_url()),
+        lcm_backend=_cfg_str("NUWAX_LCM_BACKEND", "real-lcm"),
+        nuwax_workspace_dir=_cfg_str(
+            "NUWAX_NUWAX_WORKSPACE_DIR",
+            build_default_nuwax_workspace_dir(),
+        ),
         topics=GeometryTopicsConfig(
             odom_topic=_cfg_str("NUWAX_GEOMETRY_ODOM_TOPIC", "/utlidar/robot_odom"),
             secondary_odom_topics=_cfg_csv("NUWAX_GEOMETRY_SECONDARY_ODOM_TOPICS", ()),
@@ -720,7 +734,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "NUWAX_CLOUD_MAP_TOPIC",
                 "/cloud_map",
             ),
-            cost_map_topic=_cfg_str("NUWAX_GEOMETRY_COST_MAP_TOPIC", "/global_costmap/costmap"),
+            cost_map_topic=_cfg_str("NUWAX_GEOMETRY_COST_MAP_TOPIC", "/nav/costmap"),
         ),
         frames=GeometryFrameConfig(
             map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "map"),
@@ -735,8 +749,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             default_profile=_cfg_bool("NUWAX_RTABMAP_DEFAULT_PROFILE", True),
             database_root=_cfg_str("NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
             pcd_root=_cfg_str("NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()),
-            launch_package=_cfg_str("NUWAX_RTABMAP_LAUNCH_PACKAGE", "rtabmap_launch"),
-            launch_file=_cfg_str("NUWAX_RTABMAP_LAUNCH_FILE", "rtabmap.launch.py"),
+            mapping_crate=_cfg_str("NUWAX_RTABMAP_MAPPING_CRATE", "nuwax-mapping"),
             occupancy_projection=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
             input_contract=_cfg_str("NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"),
             output_contract=_cfg_str("NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
@@ -774,44 +787,71 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 output_layer=_cfg_str("NUWAX_GEOMETRY_TRAVERSABILITY_OUTPUT_LAYER", "traversability"),
             ),
             outputs=RtabmapOutputConfig(
-                database_asset_name=_cfg_str("NUWAX_RTABMAP_DATABASE_ASSET_NAME", "external_slam_nav2_state.db"),
+                database_asset_name=_cfg_str("NUWAX_RTABMAP_DATABASE_ASSET_NAME", "nuwax_mapping_state.db"),
                 pcd_asset_name=_cfg_str("NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"),
                 occupancy_layer=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"),
-                costmap_layer=_cfg_str("NUWAX_RTABMAP_COSTMAP_LAYER", "nav2_global_costmap"),
+                costmap_layer=_cfg_str("NUWAX_RTABMAP_COSTMAP_LAYER", "nuwax_global_costmap"),
                 traversability_layer=_cfg_str("NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"),
                 localization_status=_cfg_str("NUWAX_RTABMAP_LOCALIZATION_STATUS", "rtabmap_localization"),
                 relocalization_diagnostics=_cfg_str("NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "rtabmap_icp"),
             ),
         ),
-        nav2=Nav2Config(
-            action_name=_cfg_str("NUWAX_NAV2_ACTION_NAME", "/navigate_to_pose"),
-            launch_package=_cfg_str("NUWAX_NAV2_LAUNCH_PACKAGE", "nav2_bringup"),
-            launch_file=_cfg_str("NUWAX_NAV2_LAUNCH_FILE", "navigation_launch.py"),
-            global_costmap_topic=_cfg_str("NUWAX_NAV2_GLOBAL_COSTMAP_TOPIC", "/global_costmap/costmap"),
-            local_costmap_topic=_cfg_str("NUWAX_NAV2_LOCAL_COSTMAP_TOPIC", "/local_costmap/costmap"),
-            costmap_source=_cfg_str("NUWAX_NAV2_COSTMAP_SOURCE", "nav2_global"),
-            map_yaml=_cfg_str("NUWAX_NAV2_MAP_YAML", ""),
-            params_file=_cfg_str("NUWAX_NAV2_PARAMS_FILE", ""),
-            use_sim_time=_cfg_bool("NUWAX_NAV2_USE_SIM_TIME", False),
-            autostart=_cfg_bool("NUWAX_NAV2_AUTOSTART", True),
+        navigation=NavigationBackendConfig(
+            goal_channel=_cfg_str("NUWAX_NAV_GOAL_CHANNEL", "/nav/goal"),
+            cancel_channel=_cfg_str("NUWAX_NAV_CANCEL_CHANNEL", "/nav/cancel"),
+            state_channel=_cfg_str("NUWAX_NAV_STATE_CHANNEL", "/nav/state"),
+            costmap_source=_cfg_str("NUWAX_NAV_COSTMAP_SOURCE", "nuwax_global_costmap"),
+            costmap_channel=_cfg_str("NUWAX_NAV_COSTMAP_CHANNEL", "/nav/costmap"),
+            autostart=_cfg_bool("NUWAX_NAV_AUTOSTART", True),
         ),
         external=ExternalGeometryStackConfig(
             enabled=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_ENABLED", True),
-            script_path=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_SCRIPT", build_default_external_slam_nav2_script()),
-            args=_cfg_csv("NUWAX_GEOMETRY_EXTERNAL_ARGS", ()),
-            process_name=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_PROCESS_NAME", "external_slam_nav2"),
-            log_name=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_LOG_NAME", "external_slam_nav2.log"),
-            provides_map=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_MAP", True),
-            provides_nav2=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAV2", True),
-            provides_tf=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_TF", True),
-            input_bridge_enabled=external_input_bridge_enabled,
-            point_cloud_bridge_enabled=_cfg_bool(
-                "NUWAX_GEOMETRY_EXTERNAL_POINT_CLOUD_BRIDGE_ENABLED",
-                external_input_bridge_enabled,
+            binary_path=_cfg_str(
+                "NUWAX_GEOMETRY_RUNTIME_BINARY",
+                build_default_geometry_runtime_binary(),
             ),
-            platform_runtime_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_RUNTIME_ENABLED", False),
-            platform_cmd_vel_enabled=_cfg_bool("NUWAX_GEOMETRY_PLATFORM_CMD_VEL_ENABLED", False),
-            frontier_topic=_cfg_str("NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC", "explore/frontiers"),
+            ready_file=_cfg_str(
+                "NUWAX_GEOMETRY_RUNTIME_READY_FILE",
+                build_default_geometry_runtime_ready_file(),
+            ),
+            port=max(1, _cfg_int("NUWAX_GEOMETRY_RUNTIME_PORT", build_default_geometry_runtime_port())),
+            args=_cfg_csv("NUWAX_GEOMETRY_RUNTIME_ARGS", ()),
+            process_name=_cfg_str("NUWAX_GEOMETRY_RUNTIME_PROCESS_NAME", "nuwax-geometry-runtime"),
+            log_name=_cfg_str("NUWAX_GEOMETRY_RUNTIME_LOG_NAME", "nuwax_geometry_runtime.log"),
+            provides_map=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_MAP", True),
+            provides_navigation=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAVIGATION", True),
+            provides_tf=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_TF", True),
+            frontier_channel=_cfg_str(
+                "NUWAX_LCM_CHANNEL_FRONTIER",
+                "/explore/frontiers#nuwax_msgs.FrontierList",
+            ),
+        ),
+        lcm_channels=LcmChannelConfig(
+            odom=_cfg_str("NUWAX_LCM_CHANNEL_ODOM", "/odom#nav_msgs.Odometry"),
+            tf=_cfg_str("NUWAX_LCM_CHANNEL_TF", "/tf#geometry_msgs.Transform"),
+            tf_static=_cfg_str("NUWAX_LCM_CHANNEL_TF_STATIC", "/tf_static#geometry_msgs.Transform"),
+            point_cloud=_cfg_str(
+                "NUWAX_LCM_CHANNEL_POINTCLOUD",
+                "/go2/lidar/points#sensor_msgs.PointCloud2",
+            ),
+            occupancy=_cfg_str(
+                "NUWAX_LCM_CHANNEL_OCCUPANCY",
+                "/map/occupancy#nav_msgs.OccupancyGrid",
+            ),
+            cmd_vel=_cfg_str("NUWAX_LCM_CHANNEL_CMD_VEL", "/cmd_vel#geometry_msgs.Twist"),
+            initial_pose=_cfg_str(
+                "NUWAX_LCM_CHANNEL_INITIAL_POSE",
+                "/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped",
+            ),
+            goal_pose=_cfg_str("NUWAX_LCM_CHANNEL_GOAL_POSE", "/nav/goal#geometry_msgs.PoseStamped"),
+            frontier=_cfg_str(
+                "NUWAX_LCM_CHANNEL_FRONTIER",
+                "/explore/frontiers#nuwax_msgs.FrontierList",
+            ),
+            cloud_map=_cfg_str(
+                "NUWAX_LCM_CHANNEL_CLOUD_MAP",
+                "/cloud_map#sensor_msgs.PointCloud2",
+            ),
         ),
     )
 

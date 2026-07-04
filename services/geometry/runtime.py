@@ -550,7 +550,7 @@ class PlatformGeometryRuntime:
             if preflight_errors:
                 message = "平台几何运行时预检失败：" + "；".join(preflight_errors)
                 self._set_runtime_state("failed", message, blocked=True)
-                if self.config.require_ros2:
+                if bool(getattr(self.config, "require_ros2", False)):
                     raise RuntimeError(message)
                 return
             if not self._uses_external_geometry_stack():
@@ -568,7 +568,7 @@ class PlatformGeometryRuntime:
             self._live_geometry_start_attempted = False
             with self._runtime_state_lock:
                 self._runtime_started = False
-            if self.config.require_ros2:
+            if bool(getattr(self.config, "require_ros2", False)):
                 raise
 
     def _get_motion_provider(self) -> Optional[MotionControl]:
@@ -878,9 +878,9 @@ class PlatformGeometryRuntime:
             odom_bridge_script = self._geometry_script("odom_tf_bridge.py")
             if not odom_bridge_script.exists():
                 errors.append("缺少 odom TF bridge 脚本 %s，无法启动可选 odom/TF 桥。" % odom_bridge_script)
-            setup_script = Path(str(self.config.setup_script or "")).expanduser()
+            setup_script = Path(str(getattr(self.config, "setup_script", "") or "")).expanduser()
             ros_setup_available = setup_script.exists() or any(path.exists() for path in self._ros_setup_candidates())
-            if self.config.require_ros2 and not setup_script.exists():
+            if bool(getattr(self.config, "require_ros2", False)) and not setup_script.exists():
                 errors.append("缺少 geometry setup script %s" % setup_script)
             if shutil.which("ros2") is None and not ros_setup_available:
                 errors.append("未找到 ros2 命令、geometry setup script 或系统 ROS setup，无法启动可选 odom/TF 桥。")
@@ -1177,7 +1177,7 @@ class PlatformGeometryRuntime:
             except Exception as exc:
                 self._record_runtime_diagnostic("monitor_loop", exc)
                 self._set_runtime_state("failed", "平台几何运行时监控失败：%s" % exc, blocked=True)
-                if self.config.require_ros2:
+                if bool(getattr(self.config, "require_ros2", False)):
                     return
 
     def _should_suppress_external_process_autorestart(self) -> bool:
@@ -1616,13 +1616,14 @@ class PlatformGeometryRuntime:
             status.pop("launch_package", None)
             status.pop("launch_file", None)
             return self._with_navigation_backend_policy(status)
+        nav2_cfg = getattr(self.config, "nav2", None)
         status = {
             "phase": "external",
             "message": "Nav2 action provider 尚未初始化。",
-            "action_name": self.config.nav2.action_name,
-            "global_costmap_topic": self.config.nav2.global_costmap_topic,
-            "local_costmap_topic": self.config.nav2.local_costmap_topic,
-            "costmap_source": self.config.nav2.costmap_source,
+            "action_name": getattr(nav2_cfg, "action_name", "/navigate_to_pose") if nav2_cfg else "/navigate_to_pose",
+            "global_costmap_topic": getattr(nav2_cfg, "global_costmap_topic", "/global_costmap/costmap") if nav2_cfg else "/global_costmap/costmap",
+            "local_costmap_topic": getattr(nav2_cfg, "local_costmap_topic", "/local_costmap/costmap") if nav2_cfg else "/local_costmap/costmap",
+            "costmap_source": getattr(nav2_cfg, "costmap_source", "nav2_global") if nav2_cfg else "nav2_global",
             "action_client_connected": False,
             "lifecycle_ready": False,
             "launch_attempted": self._nav2_launch_attempted,
@@ -2211,7 +2212,7 @@ class PlatformGeometryRuntime:
         direct_dds = getattr(direct_dds, "direct_dds", None)
         return {
             "geometry_stack": self.config.stack,
-            "require_ros2": self.config.require_ros2,
+            "require_ros2": bool(getattr(self.config, "require_ros2", False)),
             "odom_topic": self.config.topics.odom_topic,
             "point_cloud_topic": self.config.topics.point_cloud_topic,
             "occupancy_topic": self.config.topics.occupancy_topic,
@@ -2571,7 +2572,7 @@ class PlatformGeometryRuntime:
             rtabmap_db_path=str(rtabmap_database_path),
             pcd_path=str(pcd_path),
             occupancy_projection=self.config.rtabmap.occupancy_projection,
-            costmap_source=self.config.nav2.costmap_source,
+            costmap_source=(getattr(getattr(self.config, "nav2", None), "costmap_source", "nav2_global") if getattr(self.config, "nav2", None) else "nav2_global"),
             parameter_summary=parameter_summary,
             profile_summary=profile_summary,
             quality_metrics=quality_metrics,
@@ -2928,7 +2929,7 @@ class PlatformGeometryRuntime:
             metadata.update({
                 "geometry_stack": self.config.stack,
                 "occupancy_projection": self.config.rtabmap.occupancy_projection,
-                "costmap_source": self.config.nav2.costmap_source,
+                "costmap_source": (getattr(getattr(self.config, "nav2", None), "costmap_source", "nav2_global") if getattr(self.config, "nav2", None) else "nav2_global"),
                 "parameter_summary": self._build_parameter_summary(),
                 "profile": self._clone_metadata(self.config.build_metadata().get("profile")),
                 "input_contract": self._clone_metadata(self.config.build_metadata().get("input_contract")),
@@ -2977,7 +2978,7 @@ class PlatformGeometryRuntime:
             "rtabmap_db_path": geometry_asset.rtabmap_db_path if geometry_asset is not None else None,
             "pcd_path": geometry_asset.pcd_path if geometry_asset is not None else None,
             "occupancy_projection": geometry_asset.occupancy_projection if geometry_asset is not None else self.config.rtabmap.occupancy_projection,
-            "costmap_source": geometry_asset.costmap_source if geometry_asset is not None else self.config.nav2.costmap_source,
+            "costmap_source": geometry_asset.costmap_source if geometry_asset is not None else (getattr(getattr(self.config, "nav2", None), "costmap_source", "nav2_global") if getattr(self.config, "nav2", None) else "nav2_global"),
             "parameter_summary": self._clone_metadata(
                 geometry_asset.parameter_summary if geometry_asset is not None else self._build_parameter_summary()
             ),

@@ -14,6 +14,7 @@ import grpc
 
 from contracts.frame_semantics import infer_frame_role
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
+from contracts.navigation import NavigationState, NavigationStatus
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
 from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
@@ -249,6 +250,17 @@ class GeometryRuntimeProvider:
         self._stopping = False
         # 装配期一次性缓存的静态外参边（相机光学系等），每帧 get_frame_tree 合并。
         self._static_extrinsic_edges: List[Transform] = []
+        # NavigationProvider 协议 shim 的本地状态缓存：SubscribeNavigationState 流最近一帧
+        # + 上一次 set_goal/cancel_goal 触发的目标 id；get_navigation_state() 据此合成
+        # contracts.NavigationState。lock 防后台订阅线程与 caller 并发改写。
+        self._nav_state_lock = threading.Lock()
+        self._last_nav_goal_id: Optional[str] = None
+        self._last_nav_status: str = ""  # 空串表示尚未收到流更新；视为 IDLE
+        self._last_nav_message: Optional[str] = None
+        self._last_nav_distance_remaining: Optional[float] = None
+        self._last_nav_current_pose: Optional[Pose] = None
+        self._last_nav_timestamp_ns: int = 0
+        self._nav_stream_started = False
 
     def set_static_extrinsics(self, edges: List[Transform]) -> None:
         """装配期由平台几何运行时注入静态外参边（来自 CalibrationProvider）。
@@ -452,6 +464,248 @@ class GeometryRuntimeProvider:
         except grpc.RpcError as e:
             _log_rpc_error("GetNavigationReadiness", e)
             return {"ready": False, "message": "gRPC 错误"}
+
+    # === NavigationProvider 协议 shim ===
+    # 去 ROS2 目标态（round-4 HIGH 3 修复）：
+    # - provider bundle / runtime.py 直调 backend.set_goal/cancel_goal/get_navigation_state，
+    #   而 GeometryRuntimeProvider gRPC facade 的真实方法名是 set_navigation_goal / cancel_navigation
+    #   / (subscribe-driven 状态缓存)。
+    # - 这里在 provider 侧补齐旧 NavigationProvider 协议方法名，全部委托到 gRPC facade；
+    #   不假装成功——gRPC 失败或 backend 未就绪时，返回值如实反映（accepted=False / success=False / IDLE）。
+    # - 等 nuwax-nav-stack crate 上线、Nav2 动作语义彻底废弃后，可删除整个 shim 段。
+    def _ensure_nav_state_stream(self) -> None:
+        """懒启动 SubscribeNavigationState 后台线程；只起一次。"""
+        if self._nav_stream_started:
+            return
+        if not self._stub or self._stopping:
+            return
+        self._nav_stream_started = True
+        thread = threading.Thread(
+            target=self._nav_state_stream_worker,
+            name="geometry_runtime_nav_state_cache",
+            daemon=True,
+        )
+        thread.start()
+
+    def _nav_state_stream_worker(self) -> None:
+        """后台线程：拉 SubscribeNavigationState 流，把最近一帧写进本地缓存。
+
+        流断开时不重连（避免 hot loop），下次 set_goal/get_navigation_state 触发的 ensure
+        仍会 no-op 已启动标志；如确需重连，只能 disconnect+connect 重建 provider。
+        """
+        while self._stub and not self._stopping:
+            try:
+                for update in self._stub.SubscribeNavigationState(pb2.Empty()):
+                    goal_id = getattr(update, "goal_id", "") or None
+                    status = getattr(update, "status", "") or ""
+                    message = getattr(update, "message", "") or None
+                    distance = getattr(update, "distance_remaining", None)
+                    pose = _build_pose(getattr(update, "current_pose", None))
+                    ts_ns = int(getattr(update, "timestamp_ns", 0) or 0)
+                    with self._nav_state_lock:
+                        self._last_nav_goal_id = goal_id
+                        self._last_nav_status = status
+                        self._last_nav_message = message
+                        self._last_nav_distance_remaining = (
+                            float(distance) if distance is not None else None
+                        )
+                        self._last_nav_current_pose = pose
+                        self._last_nav_timestamp_ns = ts_ns
+                    if not self._stub or self._stopping:
+                        return
+            except grpc.RpcError as exc:
+                LOGGER.warning(
+                    "SubscribeNavigationState 流断开（不影响主流程）: %s", exc
+                )
+                return  # 不重连，下次 ensure 也不再启动（按设计）
+            except Exception:  # pragma: no cover - 防御性兜底
+                LOGGER.exception("SubscribeNavigationState worker 异常退出。")
+                return
+
+    @staticmethod
+    def _nav_status_to_enum(raw_status: str) -> NavigationStatus:
+        """把 gRPC 流推送的 status 字符串映射成 NavigationStatus 枚举。
+
+        未识别字符串映射为 IDLE（保守），绝不向上伪造 SUCCEEDED。
+        """
+        normalized = (raw_status or "").strip().lower()
+        mapping = {
+            "idle": NavigationStatus.IDLE,
+            "accepted": NavigationStatus.ACCEPTED,
+            "planning": NavigationStatus.PLANNING,
+            "running": NavigationStatus.RUNNING,
+            "succeeded": NavigationStatus.SUCCEEDED,
+            "success": NavigationStatus.SUCCEEDED,
+            "completed": NavigationStatus.SUCCEEDED,
+            "failed": NavigationStatus.FAILED,
+            "failure": NavigationStatus.FAILED,
+            "cancelled": NavigationStatus.CANCELLED,
+            "canceled": NavigationStatus.CANCELLED,
+        }
+        return mapping.get(normalized, NavigationStatus.IDLE)
+
+    def _build_navigation_state_snapshot(self) -> NavigationState:
+        """合成 NavigationState 契约（按本地缓存 + readiness，不假装 ready）。
+
+        - 未收到任何 SubscribeNavigationState 帧：返回 IDLE；
+        - readiness 不就绪：state.message 携带 readiness 提示；
+        - 缓存的 current_goal_id 与最近一次 set_goal 的 goal_id 不一致：以缓存为准
+          （流是 Rust 侧权威来源）。
+        """
+        with self._nav_state_lock:
+            raw_status = self._last_nav_status
+            goal_id = self._last_nav_goal_id
+            message = self._last_nav_message
+            distance = self._last_nav_distance_remaining
+            pose = self._last_nav_current_pose
+
+        status_enum = self._nav_status_to_enum(raw_status)
+        # 没有任何流帧 → IDLE，goal_id 留空，绝不假装有 current goal
+        if not raw_status:
+            return NavigationState(
+                status=NavigationStatus.IDLE,
+                current_goal_id=None,
+                goal_reached=False,
+                message="GeometryRuntimeProvider 尚未收到 SubscribeNavigationState 流更新。",
+                metadata={"provider": "geometry_runtime", "shim": True},
+            )
+
+        # readiness 兜底：未就绪时在 message 上补 waiting_for 提示（不伪造状态）
+        metadata: Dict[str, Any] = {"provider": "geometry_runtime", "shim": True}
+        try:
+            readiness = self.get_navigation_readiness()
+            if readiness:
+                metadata["nav2_readiness"] = dict(readiness)
+                if not bool(readiness.get("ready")):
+                    hint = readiness.get("message") or readiness.get("waiting_for") or "导航后端未就绪"
+                    if message:
+                        message = "%s | %s" % (message, hint)
+                    else:
+                        message = str(hint)
+        except Exception:  # pragma: no cover - readiness 失败不影响主流程
+            pass
+
+        goal_reached = status_enum == NavigationStatus.SUCCEEDED
+
+        return NavigationState(
+            status=status_enum,
+            current_goal_id=goal_id,
+            current_pose=pose,
+            remaining_distance_m=distance,
+            remaining_yaw_rad=None,
+            goal_reached=goal_reached,
+            message=message,
+            metadata=metadata,
+        )
+
+    def set_goal(self, goal) -> bool:
+        """NavigationProvider 协议 shim：下发导航目标到 nuwax-nav-stack。
+
+        参数：
+            goal: contracts.navigation.NavigationGoal 契约实例（runtime.py 的
+                  _dispatch_navigate / platform_exploration_runtime 实际传入的对象）。
+
+        返回：
+            bool: gRPC NavigationAck.accepted 透传；调用失败 / stub 不可用返回 False，
+            绝不假装成功。
+        """
+        self._raise_if_stopping("set_goal")
+        if not self._stub:
+            LOGGER.warning("GeometryRuntimeProvider.set_goal stub 不可用，返回 False。")
+            return False
+        target_pose = getattr(goal, "target_pose", None)
+        if target_pose is None:
+            LOGGER.warning(
+                "GeometryRuntimeProvider.set_goal goal=%s 缺少 target_pose，返回 False。",
+                getattr(goal, "goal_id", None),
+            )
+            return False
+        try:
+            proto_pose = pb2.Pose(
+                position=pb2.Vec3(
+                    x=float(target_pose.position.x),
+                    y=float(target_pose.position.y),
+                    z=float(target_pose.position.z),
+                ),
+                orientation=pb2.Quat(
+                    x=float(target_pose.orientation.x),
+                    y=float(target_pose.orientation.y),
+                    z=float(target_pose.orientation.z),
+                    w=float(target_pose.orientation.w),
+                ),
+                frame_id=str(getattr(target_pose, "frame_id", "") or ""),
+            )
+            request_goal_id = str(getattr(goal, "goal_id", "") or "")
+            proto_goal = pb2.NavigationGoal(
+                target_pose=proto_pose,
+                behavior_tree=request_goal_id or "",
+            )
+            resp = self._stub.SetNavigationGoal(proto_goal, timeout=_read_deadline_sec())
+            accepted = bool(getattr(resp, "accepted", False))
+            ack_goal_id = getattr(resp, "goal_id", "") or request_goal_id or None
+            ack_message = getattr(resp, "message", "") or None
+            # 同步本地缓存：accepted 时把状态置为 ACCEPTED，等待 SubscribeNavigationState 流覆盖
+            with self._nav_state_lock:
+                if accepted:
+                    self._last_nav_goal_id = ack_goal_id
+                    self._last_nav_status = "accepted"
+                    self._last_nav_message = ack_message
+                    self._last_nav_distance_remaining = None
+                    self._last_nav_current_pose = None
+                    self._last_nav_timestamp_ns = 0
+            # accepted 后再异步起流，避免 set_goal 同步路径被阻塞
+            self._ensure_nav_state_stream()
+            return accepted
+        except grpc.RpcError as exc:
+            _log_rpc_error("SetNavigationGoal", exc)
+            return False
+        except Exception:  # pragma: no cover - 防御性兜底
+            LOGGER.exception("GeometryRuntimeProvider.set_goal 异常。")
+            return False
+
+    def cancel_goal(self, request_id: Optional[str] = None) -> bool:
+        """NavigationProvider 协议 shim：取消当前导航目标。
+
+        request_id 参数在 Rust facade 当前实现下未消费（CancelNavigation 不接受参数），
+        保留以匹配 NavigationProvider 协议签名。
+        """
+        self._raise_if_stopping("cancel_goal")
+        if not self._stub:
+            LOGGER.warning("GeometryRuntimeProvider.cancel_goal stub 不可用，返回 False。")
+            return False
+        try:
+            resp = self._stub.CancelNavigation(pb2.Empty(), timeout=_read_deadline_sec())
+            success = bool(getattr(resp, "success", False))
+            cancel_message = getattr(resp, "message", "") or None
+            with self._nav_state_lock:
+                if success:
+                    self._last_nav_status = "cancelled"
+                    if cancel_message:
+                        self._last_nav_message = cancel_message
+            return success
+        except grpc.RpcError as exc:
+            _log_rpc_error("CancelNavigation", exc)
+            return False
+        except Exception:  # pragma: no cover
+            LOGGER.exception("GeometryRuntimeProvider.cancel_goal 异常。")
+            return False
+
+    def is_goal_reached(self) -> bool:
+        """NavigationProvider 协议 shim：当前目标是否已到达。
+
+        基于本地缓存（SubscribeNavigationState 最近一帧的 status）。
+        """
+        with self._nav_state_lock:
+            return self._last_nav_status == "succeeded"
+
+    def get_navigation_state(self) -> NavigationState:
+        """NavigationProvider 协议 shim：返回 NavigationState 契约实例。
+
+        第一次调用前若无 set_goal/get_navigation_state 触发，状态为 IDLE；订阅流启动后
+        Rust 端推送会持续覆盖本地缓存。
+        """
+        self._ensure_nav_state_stream()
+        return self._build_navigation_state_snapshot()
 
     # === 输入桥 ===
     def publish_odom(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float,

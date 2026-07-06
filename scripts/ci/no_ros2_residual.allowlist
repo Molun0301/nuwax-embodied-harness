@@ -1,0 +1,324 @@
+# no_ros2_residual.sh allowlist 规则集
+#
+# 目的：区分"真业务残留（必须阻断）"与"迁移说明/历史注释（保留文档价值）"。
+#
+# 守门脚本在 L1 阶段会把代码层非注释硬 import 全部视为真业务残留并 exit 1；
+# 注释行 / 文档字符串 / 历史说明等以本文件精确 file:line 形式放行。
+#
+# 规则格式：每条 4 字段
+#   - file: 仓库相对路径
+#   - line: 精确行号（git grep -n 输出格式）
+#   - category: 分桶标签
+#   - reason: 人类可读原因 + 引用修复 commit
+#
+# 任何新增条目都必须满足以下三条硬约束：
+#   1) 命中行是纯注释 / docstring / header 说明，不是可执行 Python / bash / TOML
+#   2) 命中行只描述"原 ROS2 X 已物理删除"的迁移事实，不携带 ROS2 调用路径
+#   3) 有对应 docs/ 备忘或 git commit 锚点可回溯
+#
+# 修改本文件需要同步 PR 描述 + 在 docs/开发文档 留 commit 链接。
+
+- file: .github/workflows/lint.yml
+  line: 20
+  category: ci_migration_note
+  reason: "B1 修复（commit d619629）：CI 守门整体重写前的旧注释，描述历史 lint.yml 为什么排除 ros2_ws/。现守门脚本已自带 --exclude 处理，无需保留语义但保留作为迁移背景文档。"
+
+- file: .github/workflows/lint.yml
+  line: 25
+  category: ci_migration_note
+  reason: "B1 迁移背景注释：原 lint.yml 路径排除说明；保留到 CI 工作流下一轮重构时一并清理。"
+
+- file: .github/workflows/lint.yml
+  line: 28
+  category: ci_migration_note
+  reason: "B1 迁移背景注释：nav2_action_proxy 历史允许说明；该 service 已随 eb57019 物理删除，本条注释属历史留痕。"
+
+- file: .github/workflows/lint.yml
+  line: 30
+  category: ci_migration_note
+  reason: "B1 迁移背景注释：nav2_action_provider.py ADR-1 历史决策留痕。"
+
+- file: .github/workflows/lint.yml
+  line: 31
+  category: ci_migration_note
+  reason: "B1 迁移背景注释：同上 ADR-1 留痕。"
+
+- file: .github/workflows/lint.yml
+  line: 33
+  category: ci_migration_note
+  reason: "B1 迁移背景注释：lint.yml grep 表达式中引用了已不存在的 services/geometry/navigation_proxy_client.py；本条是字面字符串非可执行代码，可保留至 lint.yml 下轮重构。"
+
+- file: .github/workflows/lint.yml
+  line: 36
+  category: ci_migration_note
+  reason: "B1 迁移背景注释：分层守门错误消息。"
+
+- file: .github/workflows/lint.yml
+  line: 41
+  category: ci_migration_note
+  reason: "B1 迁移背景注释：本 change 新增路径范围说明。"
+
+- file: .github/workflows/lint.yml
+  line: 7
+  category: ci_migration_note
+  reason: "B1 修复（commit d619629）：CI 守门 header 注释，列举本 workflow 已不再维护的 ros2_ws / nav2_action_proxy / rclpy.action 历史例外。属迁移背景文档。"
+
+- file: services/geometry/external_debug_observer.py
+  line: 353
+  category: dead_field_marker
+  reason: "B-FINAL-1 修复（commit eb57019）：_rclpy 死字段下线后行号漂移（87 → 353 因 commit 重构）；本行是 _rclpy 字段下线后的注释，保留作历史。"
+
+- file: services/geometry/runtime.py
+  line: 957
+  category: migration_doc_block
+  reason: "Phase 3 修复（commit 0e2083a）：platform_cmd_vel_bridge_enabled 注释续行，行号从 942 漂移到 957；说明 rclpy 节点不再创建。"
+
+- file: services/geometry/runtime.py
+  line: 967
+  category: migration_doc_block
+  reason: "Phase 3 修复 + runtime.py 主状态机去 external_slam_nav2 旧链（fix-B2 lane 工作中）：launch_ros2_stack.sh 注释续行；说明 launch_ros2_stack.sh + bash 前缀已下线。"
+
+- file: services/geometry/runtime.py
+  line: 4415
+  category: migration_doc_block
+  reason: "Phase 3 修复（commit 0e2083a）：ExternalGeometryDebugObserver 启动注释续行，行号从 4400 漂移到 4415；警告 RMW_IMPLEMENTATION 污染 ChannelFactory。"
+
+- file: services/geometry/runtime.py
+  line: 4419
+  category: migration_doc_block
+  reason: "runtime.py 主状态机去 external_slam_nav2 旧链（fix-B2 lane 工作中）：上一条 4415 的同一注释续行，行号随重构漂移。"
+
+- file: scripts/start_gateway.sh
+  line: 384
+  category: migration_doc_block
+  reason: "B4 修复（commit 93ffe25）：start_geometry_runtime 函数注释，行号从 431 漂移到 384；说明不再 source /opt/ros/*/setup.bash。"
+
+- file: scripts/start_gateway.sh
+  line: 488
+  category: migration_doc_block
+  reason: "B4 修复（commit 93ffe25）：start_gateway.sh 主流程注释，行号从 535 漂移到 488；列出被删除的 RMW/DDS env 兼容代码段。"
+
+- file: scripts/start_gateway.sh
+  line: 489
+  category: migration_doc_block
+  reason: "B4 修复：上一条 488 注释续行。"
+
+- file: scripts/bootstrap.py
+  line: 259
+  category: migration_doc_block
+  reason: "Phase 0+4 修复（commit f991346）：删除 _detect_ros_setup / _detect_ros_distro 后保留的删除函数清单 docstring。"
+
+- file: scripts/bootstrap.py
+  line: 267
+  category: migration_doc_block
+  reason: "Phase 0+4 修复：同上 docstring 续行。"
+
+- file: scripts/bootstrap.py
+  line: 575
+  category: migration_doc_block
+  reason: "Phase 0+4 修复（commit f991346）：preflight 检查中的迁移说明注释。"
+
+- file: scripts/bootstrap.py
+  line: 577
+  category: migration_doc_block
+  reason: "Phase 0+4 修复：同上 preflight 注释续行。"
+
+- file: scripts/bootstrap.py
+  line: 656
+  category: migration_doc_block
+  reason: "Phase 0+4 修复（commit f991346）：install_geometry_system_dependencies / build_workspaces 的 no-op 替换 docstring。"
+
+- file: scripts/bootstrap.py
+  line: 657
+  category: migration_doc_block
+  reason: "Phase 0+4 修复：同上 docstring 续行。"
+
+- file: scripts/bootstrap.py
+  line: 659
+  category: migration_doc_block
+  reason: "Phase 0+4 修复：同上 docstring 续行。"
+
+- file: scripts/bootstrap.py
+  line: 660
+  category: migration_doc_block
+  reason: "Phase 0+4 修复：同上 docstring 续行。"
+
+- file: scripts/bootstrap.py
+  line: 668
+  category: migration_doc_block
+  reason: "Phase 0+4 修复（commit f991346）：install_geometry_system_dependencies no-op 函数 docstring。"
+
+- file: scripts/bootstrap.py
+  line: 674
+  category: migration_doc_block
+  reason: "Phase 0+4 修复（commit f991346）：build_workspaces no-op 函数 docstring。"
+
+- file: scripts/check_layering.sh
+  line: 5
+  category: check_layering_prune
+  reason: "B1 修复（commit d619629）：check_layering.sh 的 PRUNE 模式说明，ros2_ws/ 已物理删除但脚本仍保留作为防御性排除。"
+
+- file: scripts/check_layering.sh
+  line: 17
+  category: check_layering_prune
+  reason: "B1 修复：PRUNE 正则包含 ros2_ws/，同样属防御性排除。"
+
+- file: scripts/installer/phases/__init__.py
+  line: 10
+  category: phase_docstring
+  reason: "Phase 0+4 修复（commit f5ab53c）：phases/__init__.py 的 phase 命名 docstring，说明原 build_ws/install_nav2_action_proxy 已删除。"
+
+- file: scripts/installer/phases/geometry_runtime_deps.py
+  line: 7
+  category: phase_docstring
+  reason: "Phase 0+4 修复（commit f991346）：新 geometry_runtime_deps phase 的 header docstring，说明原 geometry_deps 已物理删除。"
+
+- file: scripts/installer/phases/system.py
+  line: 9
+  category: phase_docstring
+  reason: "Phase 0+4 修复（commit f991346）：system.py header docstring 列出已物理删除的 ROS apt 包名。"
+
+- file: scripts/installer/phases/system.py
+  line: 10
+  category: phase_docstring
+  reason: "Phase 0+4 修复：同上 docstring 续行。"
+
+- file: scripts/start_gateway.sh
+  line: 272
+  category: migration_doc_block
+  reason: "B4 修复（commit 93ffe25）：cleanup_external_geometry_processes 注释，说明默认管理 nuwax-geometry-runtime，不再扫描 ros2_ws/。"
+
+- file: scripts/start_gateway.sh
+  line: 310
+  category: legacy_isolated_function
+  reason: "B4 修复：cleanup_legacy_ros2_processes 函数 docstring 注释；该函数仅在 NUWAX_LEGACY_ROS2_CLEANUP=1 显式开关下生效，命名带 legacy_ 隔离层，默认不进 gateway lifecycle。"
+
+- file: scripts/start_gateway.sh
+  line: 312
+  category: legacy_isolated_function
+  reason: "B4 修复：cleanup_legacy_ros2_processes 函数内部 local geometry_root 变量定义；同上默认不调用，属隔离层代码。"
+
+- file: scripts/start_gateway.sh
+  line: 431
+  category: migration_doc_block
+  reason: "B4 修复（commit 93ffe25）：start_geometry_runtime 函数注释，说明不再 source /opt/ros/*/setup.bash。"
+
+- file: scripts/start_gateway.sh
+  line: 535
+  category: migration_doc_block
+  reason: "B4 修复（commit 93ffe25）：start_gateway.sh 主流程注释，列出被删除的 RMW/DDS env 兼容代码段。"
+
+- file: scripts/start_gateway.sh
+  line: 536
+  category: migration_doc_block
+  reason: "B4 修复：同上注释续行。"
+
+- file: services/geometry/external_debug_observer.py
+  line: 87
+  category: dead_field_marker
+  reason: "B-FINAL-1 修复（commit eb57019）：_rclpy 死字段下线，注释明确"已下线（无任何调用方）"。"
+
+- file: services/geometry/external_debug_observer.py
+  line: 469
+  category: dead_field_marker
+  reason: "B-FINAL-1 修复（commit eb57019）：_rclpy 死字段下线，重复注释。"
+
+- file: services/geometry/external_script_runner.py
+  line: 158
+  category: migration_doc_block
+  reason: "B-FINAL-1 修复（commit eb57019）：raspi_rtabmap_2d_nav2.launch.py 不存在时的错误消息字符串。"
+
+- file: services/geometry/external_script_runner.py
+  line: 174
+  category: migration_doc_block
+  reason: "B-FINAL-1 修复（commit eb57019）：RaspiRtabMapScript 错误消息 detail 字段。"
+
+- file: services/geometry/geometry_runtime_client.py
+  line: 15
+  category: module_docstring
+  reason: "Phase 3 修复（commit 0e2083a）：geometry_runtime_client.py header docstring，说明 ROS2 env 残留已删除。"
+
+- file: services/geometry/loop_closure_state.py
+  line: 6
+  category: module_docstring
+  reason: "边界说明注释：services 层不订阅 ROS topic 的架构原则锚点；保留作为分层治理基线。"
+
+- file: services/geometry/nuwax_geometry_runtime/Cargo.toml
+  line: 9
+  category: rust_toml_header
+  reason: "Rust runtime header 注释，声明"不允许引入 ROS2/r2r/DDS/RMW 依赖"，属强约束反向锚点。"
+
+- file: services/geometry/nuwax_geometry_runtime/proto/geometry_runtime.proto
+  line: 8
+  category: proto_header
+  reason: "proto 文件 header 注释，声明"旧 ROS2/r2r/Nav2 action/CycloneDDS 依赖已删除"，属强约束反向锚点。"
+
+- file: services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs
+  line: 15
+  category: rust_module_doc
+  reason: "Rust lcm_runtime.rs module 注释，声明"不允许回退 ROS2/r2r/DDS/RMW"，属强约束反向锚点。"
+
+- file: services/geometry/nuwax_geometry_runtime/src/main.rs
+  line: 3
+  category: rust_module_doc
+  reason: "Rust main.rs module 注释，声明替换旧 nuwax-ros-bridge。"
+
+- file: services/geometry/nuwax_geometry_runtime/src/server.rs
+  line: 4
+  category: rust_module_doc
+  reason: "Rust server.rs module 注释，声明 backend 解耦与无 ROS2/r2r/DDS 依赖。"
+
+- file: services/geometry/runtime.py
+  line: 880
+  category: migration_doc_block
+  reason: "Phase 3 修复（commit 0e2083a）：setup_script 校验注释，明确不再探测 /opt/ros/* setup.bash。"
+
+- file: services/geometry/runtime.py
+  line: 942
+  category: migration_doc_block
+  reason: "Phase 3 修复：platform_cmd_vel_bridge_enabled 注释，说明 rclpy 节点不再创建。"
+
+- file: services/geometry/runtime.py
+  line: 4400
+  category: migration_doc_block
+  reason: "Phase 3 修复（commit 0e2083a）：ExternalGeometryDebugObserver 启动注释，警告 RMW_IMPLEMENTATION 污染 ChannelFactory。"
+
+- file: services/geometry/scripts/start_nuwax_geometry_runtime.sh
+  line: 5
+  category: script_header
+  reason: "新启动脚本 header 注释，替代 ROS2 工作区 + colcon build + NuwaxSLAM launch 链路（drop-ros2 后）。"
+
+- file: services/geometry/scripts/start_nuwax_geometry_runtime.sh
+  line: 8
+  category: script_header
+  reason: "新启动脚本 header 注释续行：不 source /opt/ros/*/setup.bash。"
+
+- file: services/geometry/scripts/start_nuwax_geometry_runtime.sh
+  line: 10
+  category: script_header
+  reason: "新启动脚本 header 注释续行：不依赖 colcon/rosdep/libddsc.so/CycloneDDS。"
+
+- file: scripts/legacy/cleanup_ros2_processes.sh
+  line: 7
+  category: legacy_isolated_script
+  reason: "M2 修复（fix-H1-H4-M1-M2 lane）：legacy 迁移脚本 header 注释，明确说明子脚本仅覆盖历史 ros2_ws/ + ROS2 包残留的进程表条目，属隔离层代码。"
+
+- file: scripts/legacy/cleanup_ros2_processes.sh
+  line: 10
+  category: legacy_isolated_script
+  reason: "M2 修复：legacy 迁移脚本 header 注释续行，说明 services/geometry/ros2_ws/src/GO2_RTABNAV2 已被删除的迁移背景。"
+
+- file: scripts/legacy/cleanup_ros2_processes.sh
+  line: 94
+  category: legacy_isolated_script
+  reason: "M2 修复：cleanup_legacy_geometry_processes 函数注释，明确显式清理历史 ros2_ws 工作区下进程组；该路径已删除，命中即孤儿。"
+
+- file: scripts/legacy/cleanup_ros2_processes.sh
+  line: 95
+  category: legacy_isolated_script
+  reason: "M2 修复：local geometry_root 变量定义，指向已被删除的 services/geometry/ros2_ws/src/GO2_RTABNAV2 路径；属隔离层代码，触发即被 NUWAX_LEGACY_ROS2_CLEANUP=1 显式开关控制。"
+
+- file: services/geometry/runtime.py
+  line: 4484
+  category: migration_doc_block
+  reason: "runtime.py 主状态机去 external_slam_nav2 旧链（fix-B2 lane 工作中）：_pending_localization_callbacks.append 后的注释，说明为什么不能提前启动 ExternalGeometryDebugObserver（它会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 导致 Unitree SDK ChannelFactory 初始化失败）。属反向锚点文档。"

@@ -2,6 +2,11 @@
 //!
 //! 所有状态来自 `GeometryRuntimeHandle`（持有 LCM runtime SharedState）；
 //! 与 backend（fake / real-lcm）解耦。本文件不引用任何 ROS2 / r2r / DDS 依赖。
+//!
+//! Phase 2 重构:
+//! - 状态聚合统一走 `runtime_diagnostics`（health / readiness / blockers）
+//! - typed payload encode 统一走 `typed_codec`（禁止再写 ad-hoc bytes）
+//! - env 解析入口统一走 `channel_registry`
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -11,28 +16,28 @@ use tracing::info;
 use crate::lcm_runtime::GeometryRuntimeHandle;
 use crate::proto::*;
 use crate::proto::geometry_runtime_server::GeometryRuntime;
+use crate::runtime_diagnostics::{self, RuntimeDiagnostics, ServiceState, SharedServiceState};
+use crate::typed_codec;
 
 pub struct GeometryRuntimeService {
-    state: Arc<RwLock<ServiceState>>,
+    state: SharedServiceState,
     bridge: GeometryRuntimeHandle,
-}
-
-struct ServiceState {
-    phase: String,
-    message: String,
-    started_at_ns: u64,
 }
 
 impl GeometryRuntimeService {
     pub fn new(bridge: GeometryRuntimeHandle) -> Self {
         Self {
-            state: Arc::new(RwLock::new(ServiceState {
-                phase: "running".into(),
-                message: "Geometry LCM runtime 已启动".into(),
-                started_at_ns: now_ns(),
-            })),
+            state: Arc::new(RwLock::new(ServiceState::new_running(
+                "Geometry LCM runtime 已启动",
+            ))),
             bridge,
         }
+    }
+
+    /// 构造本进程的 RuntimeDiagnostics(读 ServiceState 算 uptime)
+    async fn diagnostics(&self) -> RuntimeDiagnostics {
+        let s = self.state.read().await;
+        RuntimeDiagnostics::from_handle(&self.bridge, &s.phase, s.started_at_ns)
     }
 }
 
@@ -41,22 +46,6 @@ fn now_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
-}
-
-fn uptime_ms(started_at_ns: u64) -> u64 {
-    now_ns().saturating_sub(started_at_ns) / 1_000_000
-}
-
-fn get_rss_kb() -> u32 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse::<u32>().ok())
-        })
-        .unwrap_or(0)
 }
 
 #[tonic::async_trait]
@@ -76,33 +65,30 @@ impl GeometryRuntime for GeometryRuntimeService {
 
     async fn get_status(&self, _req: Request<Empty>) -> Result<Response<RuntimeStatus>, Status> {
         let s = self.state.read().await;
+        let diag = RuntimeDiagnostics::from_handle(&self.bridge, &s.phase, s.started_at_ns);
         Ok(Response::new(RuntimeStatus {
-            phase: s.phase.clone(),
+            phase: diag.phase,
             message: s.message.clone(),
-            uptime_ms: uptime_ms(s.started_at_ns),
-            rss_kb: get_rss_kb(),
-            lcm_backend: self.bridge.transport_backend_name.to_string(),
+            uptime_ms: diag.uptime_ms,
+            rss_kb: diag.rss_kb,
+            lcm_backend: diag.lcm_backend,
         }))
     }
 
     async fn health_check(&self, _req: Request<HealthCheckRequest>) -> Result<Response<HealthCheckResponse>, Status> {
-        let s = self.state.read().await;
-        // Phase 1 fail-fast:当 LCM backend 不可用时,health_check 必须
-        // 返回 healthy=false + 把 backend 名编码成 "real-lcm-unavailable",
-        // HealthCheck 调用方可从 lcm_backend 字段 grep "LCM_BACKEND_UNAVAILABLE" 关键字;
-        // 主进程也已在 spawn 阶段直接退出(exit 4),所以本分支属于
-        // 防御性兜底:例如未来 real-lcm feature 实装后但运行时 binding
-        // 初始化失败的场景。
-        let lcm_backend = self.bridge.transport_backend_name.to_string();
-        let healthy = self.bridge.lcm_backend_available;
+        let diag = self.diagnostics().await;
+        // Phase 1 fail-fast + Phase 2 diagnostics 收敛:health_check 统一
+        // 从 RuntimeDiagnostics 读 healthy + lcm_backend。
+        // HealthCheck 调用方可从 `lcm_backend` 字段 grep
+        // "LCM_BACKEND_UNAVAILABLE" 关键字做 CI gate。
         Ok(Response::new(HealthCheckResponse {
-            healthy,
-            phase: s.phase.clone(),
-            uptime_ms: uptime_ms(s.started_at_ns),
-            rss_kb: get_rss_kb(),
+            healthy: diag.healthy,
+            phase: diag.phase,
+            uptime_ms: diag.uptime_ms,
+            rss_kb: diag.rss_kb,
             video_frame_sequence: 0,
             video_fps_estimate: 0,
-            lcm_backend,
+            lcm_backend: diag.lcm_backend,
         }))
     }
 
@@ -332,11 +318,13 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
 
     async fn get_navigation_readiness(&self, _req: Request<Empty>) -> Result<Response<NavigationReadiness>, Status> {
-        let s = self.bridge.state.read().await;
-        let ready = !s.nav_state.status.is_empty() && s.nav_state.status != "UNCONFIGURED";
+        // Phase 2 收敛:readiness 判定走 runtime_diagnostics,不再直接
+        // 读 `nav_state.status` 这种"上一次 LCM frame"的瞬时值。
+        // Phase 4 nav_runtime.rs 实装后会改 `nav_ready_poll = true`。
+        let r = runtime_diagnostics::navigation_readiness(&self.bridge);
         Ok(Response::new(NavigationReadiness {
-            ready,
-            reason: if ready { "nuwax-nav-stack 已就绪".into() } else { "nuwax-nav-stack 尚未接线".into() },
+            ready: r.ready,
+            reason: r.reason,
         }))
     }
 
@@ -402,51 +390,39 @@ impl GeometryRuntime for GeometryRuntimeService {
     // success=false + 明确错误,不假装成功。
 
     async fn publish_odom(&self, req: Request<PublishOdomRequest>) -> Result<Response<PublishResult>, Status> {
-        // TODO(B6): typed payload encoding + MurmurHash64A fingerprint 与 lcm-gen 对账
-        // 当前阶段 fake LCM backend 接受任意 bytes 作为 payload;P1 real-lcm 接入后必须
-        // 走 nuwax-codec 编码 Odometry typed message（fingerprint = MurmurHash64A）。
-        use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
+        // Phase 2 重构:typed payload 编码走 typed_codec,禁止本文件再写
+        // ad-hoc bytes。
+        // P1 切 MurmurHash64A 时,typed_codec::build_typed_frame 是唯一改点。
+        use nuwax_protocol::LcmMessageType;
         let pose = req.get_ref().pose.as_ref();
         let (frame_id, ts_ns) = match pose {
             Some(p) => (p.frame_id.clone(), p.timestamp_ns),
             None => (String::new(), now_ns()),
         };
-        // 编码成 56B 位姿 + 8B stamp + 2B frame_len + frame bytes（与 lcm_runtime parse_odom 一致）
-        let mut payload = Vec::with_capacity(66 + frame_id.len());
-        if let Some(p) = pose {
-            if let Some(pos) = p.position.as_ref() {
-                payload.extend_from_slice(&pos.x.to_le_bytes());
-                payload.extend_from_slice(&pos.y.to_le_bytes());
-                payload.extend_from_slice(&pos.z.to_le_bytes());
-            } else {
-                payload.extend_from_slice(&[0u8; 24]);
+        let (x, y, z, qx, qy, qz, qw) = match pose {
+            Some(p) => {
+                let pos = p.position.as_ref();
+                let q = p.orientation.as_ref();
+                (
+                    pos.map(|v| v.x).unwrap_or(0.0),
+                    pos.map(|v| v.y).unwrap_or(0.0),
+                    pos.map(|v| v.z).unwrap_or(0.0),
+                    q.map(|v| v.x).unwrap_or(0.0),
+                    q.map(|v| v.y).unwrap_or(0.0),
+                    q.map(|v| v.z).unwrap_or(0.0),
+                    q.map(|v| v.w).unwrap_or(0.0),
+                )
             }
-            if let Some(q) = p.orientation.as_ref() {
-                payload.extend_from_slice(&q.x.to_le_bytes());
-                payload.extend_from_slice(&q.y.to_le_bytes());
-                payload.extend_from_slice(&q.z.to_le_bytes());
-                payload.extend_from_slice(&q.w.to_le_bytes());
-            } else {
-                payload.extend_from_slice(&[0u8; 32]);
-            }
-        } else {
-            payload.extend_from_slice(&[0u8; 56]);
-        }
-        payload.extend_from_slice(&ts_ns.to_le_bytes());
-        let frame_len = frame_id.len() as u16;
-        payload.extend_from_slice(&frame_len.to_le_bytes());
-        payload.extend_from_slice(frame_id.as_bytes());
-
-        let topic = match LcmTopic::new("/odom") {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("publish_odom: LcmTopic 构造失败: {}", e);
-                return Ok(Response::new(PublishResult {
-                    success: false,
-                    message: format!("LcmTopic::new failed: {}", e),
-                }));
-            }
+            None => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         };
+        let pose_state = crate::lcm_runtime::PoseState {
+            x, y, z, qx, qy, qz, qw,
+            frame_id,
+            timestamp_ns: ts_ns,
+        };
+        let payload = typed_codec::encode_odometry_payload(&pose_state);
+
+        let topic = typed_codec::topic_or_default("/odom", "/odom");
         let msg_type = match LcmMessageType::new("nav_msgs/Odometry") {
             Ok(m) => m,
             Err(e) => {
@@ -457,20 +433,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                 }));
             }
         };
-        let header = nuwax_protocol::LcmFrameHeader {
-            magic: nuwax_protocol::LCM_MAGIC,
-            fingerprint: msg_type.fingerprint(),
-            seqno: 0,
-            payload_len: payload.len() as u32,
-            protocol_major: 0,
-            protocol_minor: 0,
-        };
-        let frame = RawLcmFrame {
-            topic,
-            msg_type,
-            header,
-            payload,
-        };
+        let frame = typed_codec::build_typed_frame(topic, msg_type, payload, 0);
         let lcm_transport = self.bridge.transport.clone();
         match lcm_transport.publish(frame).await {
             Ok(()) => Ok(Response::new(PublishResult {
@@ -488,26 +451,12 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
 
     async fn publish_point_cloud(&self, req: Request<PublishPointCloudRequest>) -> Result<Response<PublishResult>, Status> {
-        // TODO(B6): typed payload encoding + MurmurHash64A fingerprint 与 lcm-gen 对账
-        // 当前阶段 fake LCM backend 接受任意 bytes 作为 payload;P1 real-lcm 接入后必须
-        // 走 nuwax-codec 编码 PointCloud2 typed message（fingerprint = MurmurHash64A）。
-        use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
+        // Phase 2 重构:typed payload 编码走 typed_codec。
+        use nuwax_protocol::LcmMessageType;
         let pcr = req.get_ref();
-        // payload: point_step(u32) + raw PointCloud2 bytes（与 lcm_runtime parse_pointcloud_payload 一致）
-        let mut payload = Vec::with_capacity(4 + pcr.points.len());
-        payload.extend_from_slice(&pcr.point_step.to_le_bytes());
-        payload.extend_from_slice(&pcr.points);
+        let payload = typed_codec::encode_pointcloud_payload(&pcr.points, pcr.point_step);
 
-        let topic = match LcmTopic::new("/go2/lidar/points") {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("publish_point_cloud: LcmTopic 构造失败: {}", e);
-                return Ok(Response::new(PublishResult {
-                    success: false,
-                    message: format!("LcmTopic::new failed: {}", e),
-                }));
-            }
-        };
+        let topic = typed_codec::topic_or_default("/go2/lidar/points", "/go2/lidar/points");
         let msg_type = match LcmMessageType::new("sensor_msgs/PointCloud2") {
             Ok(m) => m,
             Err(e) => {
@@ -518,20 +467,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                 }));
             }
         };
-        let header = nuwax_protocol::LcmFrameHeader {
-            magic: nuwax_protocol::LCM_MAGIC,
-            fingerprint: msg_type.fingerprint(),
-            seqno: 0,
-            payload_len: payload.len() as u32,
-            protocol_major: 0,
-            protocol_minor: 0,
-        };
-        let frame = RawLcmFrame {
-            topic,
-            msg_type,
-            header,
-            payload,
-        };
+        let frame = typed_codec::build_typed_frame(topic, msg_type, payload, 0);
         let lcm_transport = self.bridge.transport.clone();
         match lcm_transport.publish(frame).await {
             Ok(()) => Ok(Response::new(PublishResult {

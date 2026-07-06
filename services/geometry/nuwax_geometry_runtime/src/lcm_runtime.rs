@@ -161,6 +161,26 @@ pub struct GeometryRuntimeHandle {
     pub lcm_backend_available: bool,
 }
 
+impl GeometryRuntimeHandle {
+    /// mapping 板块 readiness。Phase 2 baseline:恒 `false`（adapter 未实装）。
+    /// Phase 3 在 mapping_adapter.rs 实装后改 true。
+    pub fn mapping_ready_poll(&self) -> bool {
+        false
+    }
+
+    /// navigation 板块 readiness。Phase 2 baseline:恒 `false`（nav_stack
+    /// LCM channel 未接通）。Phase 4 在 nav_runtime.rs 实装后改 true。
+    pub fn nav_ready_poll(&self) -> bool {
+        false
+    }
+
+    /// exploration 板块 readiness。Phase 2 baseline:恒 `false`（controller
+    /// 未实装）。Phase 5 在 explore_runtime.rs 实装后改 true。
+    pub fn explore_ready_poll(&self) -> bool {
+        false
+    }
+}
+
 // ============================================================================
 // 内部：tf2 坐标链合成（map→odom→base_link）。算法与原 ros2_bridge.rs 一致，
 // 保证 server.rs 语义不因 backend 切换而漂移。

@@ -357,3 +357,13 @@
   line: 4651
   category: migration_doc_block
   reason: "建图导航探索库接入 Phase 6 漂移到 4651：_pending_localization_callbacks.append 后注释续行，RMW_IMPLEMENTATION 反向锚点；说明不能提前启动 ExternalGeometryDebugObserver（会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 污染 Unitree SDK ChannelFactory）。Phase 6 物理 rename + helper 调用栈 guard 后行号从 4640 漂移到 4651。属反向锚点文档。"
+
+- file: services/geometry/runtime.py
+  line: 532
+  category: migration_doc_block
+  reason: "建图导航探索库接入 Phase 6 物理 rename:_platform_exploration_runtime → _legacy_exploration_placeholder_disabled docstring 注释行，提到原字段名 + NUWAX_EXPLORATION_LEGACY guard 行为。属反向锚点文档，不调用任何 nav2/rclpy。"
+
+- file: core/config_registry.py
+  line: 382
+  category: migration_doc_block
+  reason: "建图导航探索库接入 Phase 6 _ZH_NAMES 注册段注释：明确说明 NUWAX_NAV_PROFILE/EXPLORE_ARBITRATION/REAL_LCM_REQUIRED 对接 nuwax-geometry-runtime (Rust) 装配面,不再走旧 rclpy/Nav2。该注释是迁移背景说明,不调用任何 nav2/rclpy。属反向锚点文档。"

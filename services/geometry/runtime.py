@@ -6838,19 +6838,133 @@ class PlatformGeometryProviderBundle(
                 return None
             return None
 
+    # ------------------------------------------------------------------
+    # 探索入口 — Phase 5 收口：默认走 GeometryRuntimeProvider（gRPC facade）
+    # ------------------------------------------------------------------
+    # 默认 caller 走 gRPC，与 PlatformGeometryRuntime._resolve_exploration_backend
+    # 的方向一致（旧 `_legacy_exploration_placeholder_disabled` 字段仍保留以
+    # 兼容 1 release；只在 NUWAX_EXPLORATION_LEGACY=true 显式开关 + legacy
+    # backend 真存在时，才退回到 legacy 状态机）。
+    #
+    # 内部 helper（runtime.sync_platform_exploration / _platform_exploration_loop /
+    # _ensure_platform_exploration_loop_locked 等）继续容忍 legacy 字段以维持
+    # 现有 helpers 不变；本方法只切换 Bundle 对外的"默认入口"，与 Phase 0 硬隔离语义对齐。
+    def _resolve_remote_exploration_provider(self):
+        """解析连通的 gRPC facade provider；未连通返回 None。
+
+        `PlatformGeometryRuntime` 在 `_start_geometry_runtime_subprocess` 时挂 gRPC provider
+        于 `_remote_provider`；`_resolve_exploration_backend` 已遵循同一优先级。本 helper
+        把 Bundle 层与 runtime 层优先级再钉一次，避免新增 1 release 后被遗留 legacy 入口
+        覆盖 gRPC 路径。
+        """
+        remote = getattr(self.runtime, "_remote_provider", None)
+        if remote is None:
+            return None
+        try:
+            if not bool(remote.is_connected):
+                return None
+        except Exception:
+            return None
+        return remote
+
+    def _is_legacy_exploration_fallback_allowed(self) -> bool:
+        """legacy 探索回退开关（与 runtime._is_exploration_legacy_enabled 同步语义）。"""
+        try:
+            return _is_exploration_legacy_enabled()
+        except Exception:
+            return False
+
+    def _start_exploration_via_remote(self, request, remote) -> bool:
+        """把 request 翻译成 gRPC facade 的 start_exploration 调用。
+
+        request 是 platform 侧的 `ExploreAreaRequest` 契约（或 dict）；gRPC facade
+        期望 `request_id / strategy / arbitration / map_version_id`。translation
+        失败时返回 False，让 caller 走 fallback（不影响 Phase 0 现有 helpers）。
+        """
+        request_id = ""
+        strategy = "wavefront"
+        arbitration = "prefer_wavefront"
+        map_version_id = ""
+        if request is not None:
+            request_id = str(getattr(request, "request_id", "") or "")
+            if not request_id:
+                request_id = "platform_explore:%d" % int(time.time() * 1000)
+            try:
+                if getattr(request, "stop_conditions", None):
+                    strategy_hint = getattr(request.stop_conditions, "strategy", None)
+                    arbitration_hint = getattr(request.stop_conditions, "arbitration", None)
+                    if isinstance(strategy_hint, str) and strategy_hint.strip():
+                        strategy = strategy_hint.strip()
+                    if isinstance(arbitration_hint, str) and arbitration_hint.strip():
+                        arbitration = arbitration_hint.strip()
+            except Exception:
+                pass
+            map_name = getattr(request, "map_name", None)
+            if isinstance(map_name, str) and map_name.strip():
+                map_version_id = map_name.strip()
+        try:
+            result = remote.start_exploration(
+                request_id=request_id,
+                strategy=strategy,
+                arbitration=arbitration,
+                map_version_id=map_version_id,
+            )
+        except Exception:
+            LOGGER.exception("Bundle.start_exploration gRPC 失败，准备 fallback legacy。")
+            return False
+        return bool(result)
+
     def start_exploration(self, request) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
+        remote = self._resolve_remote_exploration_provider()
+        if remote is not None:
+            if self._start_exploration_via_remote(request, remote):
+                return True
+            if not self._is_legacy_exploration_fallback_allowed():
+                LOGGER.error(
+                    "Bundle.start_exploration gRPC 失败且 legacy 开关关闭，"
+                    "返回 False（不再悄悄走 Python 旧状态机）。"
+                )
+                return False
+        # legacy fallback：仅当显式 NUWAX_EXPLORATION_LEGACY=true 时才允许
         return self.runtime.start_platform_exploration(request)
 
     def stop_exploration(self) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
+        remote = self._resolve_remote_exploration_provider()
+        if remote is not None:
+            try:
+                result = remote.stop_exploration()
+                if result is not None:
+                    return bool(result)
+            except Exception:
+                LOGGER.exception("Bundle.stop_exploration gRPC 异常，准备 fallback legacy。")
+            if not self._is_legacy_exploration_fallback_allowed():
+                return False
         return self.runtime.stop_platform_exploration()
 
     def sync_exploration_after_task(self) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
+        remote = self._resolve_remote_exploration_provider()
+        if remote is not None:
+            diagnostics = None
+            try:
+                diagnostics = remote.get_exploration_diagnostics()
+            except Exception:
+                LOGGER.exception("Bundle.sync_exploration_after_task gRPC 异常，准备 fallback legacy。")
+                diagnostics = None
+            if diagnostics is not None:
+                active = bool(diagnostics.get("active"))
+                status = str(diagnostics.get("selected_source") or "")
+                if not active or status in {"succeeded", "failed", "cancelled", "stopped"}:
+                    self._notify_exploration_update(self.get_exploration_state())
+                    return True
+                return False
+            if not self._is_legacy_exploration_fallback_allowed():
+                return False
         return self.runtime.sync_platform_exploration_after_task()
 
     def subscribe_exploration_updates(self, callback) -> Optional[int]:
@@ -6864,4 +6978,102 @@ class PlatformGeometryProviderBundle(
         return self.runtime.unsubscribe_exploration_updates(subscription_id)
 
     def get_exploration_state(self):
+        """默认走 gRPC facade；NUWAX_EXPLORATION_LEGACY=true 时退回 legacy 状态机。
+
+        关键不变量：`_resolve_exploration_backend` 默认 owner 是 `_remote_provider`
+        (GeometryRuntimeProvider)。当 remote 不连通且 legacy 开关关闭时，必须返回
+        不允许假装成功的状态（沿用 `get_platform_exploration_state` 的 IDLE 语义）。
+        """
+        if not self._is_geometry_profile_enabled():
+            from contracts.navigation import ExplorationState, ExplorationStatus
+
+            return ExplorationState(
+                status=ExplorationStatus.IDLE,
+                message="platform_geometry profile 已禁用",
+                metadata={"provider": "platform_geometry_runtime", "shim": True},
+            )
+        remote = self._resolve_remote_exploration_provider()
+        if remote is not None:
+            try:
+                state = remote.get_exploration_state()
+            except Exception:
+                LOGGER.exception("Bundle.get_exploration_state gRPC 异常，准备 fallback legacy。")
+                state = None
+            if state is not None:
+                return self._wrap_remote_exploration_state(state)
+            if not self._is_legacy_exploration_fallback_allowed():
+                from contracts.navigation import ExplorationState, ExplorationStatus
+
+                return ExplorationState(
+                    status=ExplorationStatus.IDLE,
+                    message="gRPC facade 无响应且 legacy 关闭",
+                    metadata={
+                        "provider": "platform_geometry_runtime",
+                        "shim": True,
+                        "gRPC_facade": "available_no_state",
+                    },
+                )
         return self.runtime.get_platform_exploration_state()
+
+    @staticmethod
+    def _wrap_remote_exploration_state(state: Dict[str, object]):
+        """把 gRPC dict ExplorationState 装成 `contracts.navigation.ExplorationState`。
+
+        Phase 5 收口：契约字段对齐 dimos `nuwax_exploration::ExplorationState`
+        (status / message / request_id / selected_source / last_stop_reason /
+        frontier_count / revision / timestamp_ns)。
+        """
+        from contracts.navigation import ExplorationState, ExplorationStatus
+
+        raw_status = str(state.get("status") or "").strip().lower()
+        status_enum = {
+            "idle": ExplorationStatus.IDLE,
+            "accepted": ExplorationStatus.RUNNING,
+            "queued": ExplorationStatus.RUNNING,
+            "pending": ExplorationStatus.RUNNING,
+            "active": ExplorationStatus.RUNNING,
+            "running": ExplorationStatus.RUNNING,
+            "in_progress": ExplorationStatus.RUNNING,
+            "succeeded": ExplorationStatus.SUCCEEDED,
+            "success": ExplorationStatus.SUCCEEDED,
+            "completed": ExplorationStatus.SUCCEEDED,
+            "failed": ExplorationStatus.FAILED,
+            "failure": ExplorationStatus.FAILED,
+            "cancelled": ExplorationStatus.CANCELLED,
+            "canceled": ExplorationStatus.CANCELLED,
+            "rejected": ExplorationStatus.FAILED,
+            "stopped": ExplorationStatus.CANCELLED,
+            "unimplemented": ExplorationStatus.IDLE,
+        }.get(raw_status, ExplorationStatus.IDLE)
+        try:
+            frontier_count = state.get("frontier_count")
+            frontier_count = int(frontier_count) if frontier_count is not None else 0
+        except (TypeError, ValueError):
+            frontier_count = 0
+        try:
+            revision = state.get("revision")
+            revision = int(revision) if revision is not None else 0
+        except (TypeError, ValueError):
+            revision = 0
+        try:
+            timestamp_ns = state.get("timestamp_ns")
+            timestamp_ns = int(timestamp_ns) if timestamp_ns is not None else 0
+        except (TypeError, ValueError):
+            timestamp_ns = 0
+        message = str(state.get("message") or "") or None
+        metadata = {
+            "provider": "geometry_runtime",
+            "gRPC_facade": True,
+            "selected_source": state.get("selected_source") or None,
+            "last_stop_reason": state.get("last_stop_reason") or None,
+            "request_id": state.get("request_id") or None,
+            "revision": revision,
+            "timestamp_ns": timestamp_ns,
+        }
+        return ExplorationState(
+            status=status_enum,
+            message=message,
+            frontier_count=frontier_count,
+            revision=revision,
+            metadata=metadata,
+        )

@@ -26,11 +26,13 @@
 //! 可变状态,因此本模块把它放在 `Arc<tokio::sync::Mutex<...>>` 里;在 gRPC
 //! facade 多线程同步访问时按顺序获取锁即可,不影响 controller 的内部语义。
 
+#[allow(unused_imports)]
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use nuwax_exploration::conversions::frontier_goal_to_navigation_goal;
+#[allow(unused_imports)]
 use nuwax_exploration::runtime::WavefrontInputReceiver;
 use nuwax_exploration::wavefront_adapter::WavefrontGoalSourceAdapter;
 use nuwax_exploration::{

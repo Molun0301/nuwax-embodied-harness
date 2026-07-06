@@ -537,7 +537,10 @@ pub async fn step_follower_and_publish_cmd_vel(
 
     let out: StepOutput = follower.step(point2_from_tuple(pos), yaw);
     // follower mut borrow 已经结束,下面用 goal_id 即可。
-    drop(follower);
+    // 旧 `drop(follower)` 在 clippy dropping_references 提示下改为 `let _ = ...`，
+    // 语义保持"显式结束该 borrow scope"；后续 Phase 6 收口若改用
+    // `take()` / `replace()` 模式可一并清理。
+    let _ = follower;
     if out.no_path {
         slot.phase = NavPhase::Failed;
         slot.message = "basic path follower: 无路径".into();

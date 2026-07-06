@@ -51,12 +51,17 @@ cd "$REPO_ROOT"
 #  - 'import nav2_msgs' / 'from nav2_msgs' / 'import tf2_ros' / 'from tf2_ros'
 #  - 'import sensor_msgs' / 'from sensor_msgs' / 'import geometry_msgs' / 'from geometry_msgs'
 #  - 'import rosidl' / 'from rosidl' / 'import rclcpp' / 'from rclcpp'
+#  - `_invoke_ros2_service_call` 函数定义（已物理删除，任何 PR 复活即阻断）
 # 注意：本模式匹配的是 Python `import` 语句 + 紧跟空格 + 库名；不会误伤"rclpy 字段"、
 # "ros2_ws 路径字符串"等迁移注释/字符串字面量。
-L1_PATTERNS='(^|[[:space:]])import[[:space:]]+rclpy($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+rclpy($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+r2r($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+r2r($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+nav2_msgs($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+nav2_msgs($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+tf2_ros($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+tf2_ros($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+sensor_msgs($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+sensor_msgs($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+geometry_msgs($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+geometry_msgs($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+rosidl($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+rosidl($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+rclcpp($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+rclcpp($|[[:space:]]|\.)'
+L1_PATTERNS='(^|[[:space:]])import[[:space:]]+rclpy($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+rclpy($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+r2r($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+r2r($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+nav2_msgs($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+nav2_msgs($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+tf2_ros($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+tf2_ros($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+sensor_msgs($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+sensor_msgs($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+geometry_msgs($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+geometry_msgs($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+rosidl($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+rosidl($|[[:space:]]|\.)|(^|[[:space:]])import[[:space:]]+rclcpp($|[[:space:]]|\.)|(^|[[:space:]])from[[:space:]]+rclcpp($|[[:space:]]|\.)|def[[:space:]]+_invoke_ros2_service_call\b'
 
 # L2 全部命中模式：放宽到所有 ROS2 关键字
-PATTERNS='rclpy|r2r|nav2_msgs|tf2_ros|ros2_ws|colcon|rosdep|/opt/ros|ROS_DISTRO|RMW_IMPLEMENTATION|CYCLONEDDS|nav2_action_proxy|RosBridge|ros_bridge|nuwax_ros_bridge'
+#  - 通用库名 / 包名（rclpy / r2r / nav2_msgs / tf2_ros / ros2_ws / colcon / rosdep / opt/ros / DDS / RMW / CycloneDDS / bridge 命名）
+#  - `_nav2_action_provider`（HIGH-3 lane 重命名为 _geometry_runtime_nav_provider 前临时锚点）
+# 注意：刻意排除 `nav_msgs`（LCM typed message 命名空间字符串，命名沿用 nav_msgs.Odometry /
+#       nav_msgs.OccupancyGrid，不是 ROS2 import），以及 `NavigateToPose`（platform 侧 dataclass 类名）。
+PATTERNS='rclpy|r2r|nav2_msgs|tf2_ros|ros2_ws|colcon|rosdep|/opt/ros|ROS_DISTRO|RMW_IMPLEMENTATION|CYCLONEDDS|nav2_action_proxy|RosBridge|ros_bridge|nuwax_ros_bridge|_nav2_action_provider'
 
 # allowlist 文件路径
 ALLOWLIST_FILE="${REPO_ROOT}/scripts/ci/no_ros2_residual.allowlist"

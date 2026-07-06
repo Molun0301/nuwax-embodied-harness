@@ -319,6 +319,31 @@
   reason: "M2 修复：local geometry_root 变量定义，指向已被删除的 services/geometry/ros2_ws/src/GO2_RTABNAV2 路径；属隔离层代码，触发即被 NUWAX_LEGACY_ROS2_CLEANUP=1 显式开关控制。"
 
 - file: services/geometry/runtime.py
-  line: 4484
+  line: 4427
   category: migration_doc_block
-  reason: "runtime.py 主状态机去 external_slam_nav2 旧链（fix-B2 lane 工作中）：_pending_localization_callbacks.append 后的注释，说明为什么不能提前启动 ExternalGeometryDebugObserver（它会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 导致 Unitree SDK ChannelFactory 初始化失败）。属反向锚点文档。"
+  reason: "runtime.py 主状态机去 external_slam_nav2 旧链（fix-B2 lane 工作中）：_pending_localization_callbacks.append 后的注释，RMW_IMPLEMENTATION 反向锚点；行号从 4484 漂移到 4427（MEDIUM 5 删除 _invoke_ros2_service_call 函数 -56 行后）。说明为什么不能提前启动 ExternalGeometryDebugObserver（它会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 导致 Unitree SDK ChannelFactory 初始化失败）。属反向锚点文档。"
+
+- file: services/geometry/runtime.py
+  line: 497
+  category: pending_high3_rename
+  reason: "MEDIUM 6 守门扩展：_nav2_action_provider 属性初始化；HIGH 3 修复（_nav2_action_provider → _geometry_runtime_nav_provider 内部命名）本 lane 之后落地，HIGH-3 提交时同步删除本条 allowlist 与剩余 1663/1689/2086/3158 条目。"
+
+- file: services/geometry/runtime.py
+  line: 1663
+  category: pending_high3_rename
+  reason: "MEDIUM 6 守门扩展：_build_nav2_status 中 _nav2_action_provider getattr fallback；HIGH 3 重命名后失效，HIGH-3 提交时同步删除本条 allowlist。"
+
+- file: services/geometry/runtime.py
+  line: 1689
+  category: pending_high3_rename
+  reason: "MEDIUM 6 守门扩展：_build_navigation_backend_policy 中 _nav2_action_provider getattr fallback；HIGH 3 重命名后失效，HIGH-3 提交时同步删除本条 allowlist。"
+
+- file: services/geometry/runtime.py
+  line: 2086
+  category: pending_high3_rename
+  reason: "MEDIUM 6 守门扩展：publish_rviz_initial_pose 中 _nav2_action_provider getattr fallback；HIGH 3 重命名后失效，HIGH-3 提交时同步删除本条 allowlist。"
+
+- file: services/geometry/runtime.py
+  line: 3158
+  category: pending_high3_rename
+  reason: "MEDIUM 6 守门扩展：_nav2_action_provider getter 包装（provider_for_capability）；HIGH 3 重命名后失效，HIGH-3 提交时同步删除本条 allowlist。"

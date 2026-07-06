@@ -4877,40 +4877,16 @@ class GatewayRuntime:
             "next_step_hint": "自主探索与 go2.sh 几何栈已停止。如需保留地图可调用 save_active_map_version。",
         }
 
-    def dispatch_debug_nav2_goal(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Debug 面板 RViz 2D Goal 直通：发布 /goal_pose → bt_navigator。
-
-        Phase 0 收敛（去 ROS2 目标态）：
-        - 旧名 `dispatch_debug_nav2_goal` 保留为 alias 入口，内部调用
-          `dispatch_debug_navigation_goal`；错误码从 `nav2_provider_unavailable`
-          改为 `runtime_provider_unavailable`。
-        - 新默认入口：`dispatch_debug_navigation_goal`（直接调
-          nuwax-geometry-runtime.SetNavigationGoal）。
-        - Nav2/ROS2 链已删除；legacy name 仅作迁移期 alias，不接受新调用方使用。
-        """
-
-        return self.dispatch_debug_navigation_goal(
-            arguments,
-            requested_by=requested_by,
-            legacy_alias="dispatch_debug_nav2_goal",
-        )
-
     def dispatch_debug_navigation_goal(
         self,
         arguments: Dict[str, Any],
         *,
         requested_by: Optional[str] = None,
-        legacy_alias: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Debug 面板 RViz 2D Goal 直通 → nuwax-geometry-runtime SetNavigationGoal。
 
-        新默认入口。`legacy_alias` 仅当通过 `dispatch_debug_nav2_goal` 间接调用时
-        用于日志/响应标记；新调用方应直接传 `dispatch_debug_navigation_goal`。
+        Phase 0 收敛（去 ROS2 目标态）：直接调 nuwax-geometry-runtime。
+        Nav2/ROS2 链已删除，错误码统一为 `runtime_provider_unavailable`。
         """
 
         pose = self._build_pose_from_arguments(arguments)
@@ -4920,12 +4896,11 @@ class GatewayRuntime:
                 "GeometryRuntimeProvider 未初始化；请确认 nuwax-geometry-runtime 已启动且平台几何 profile 已启用。",
                 error_code="runtime_provider_unavailable",
                 http_status=503,
-                details={"legacy_alias": legacy_alias} if legacy_alias else None,
             )
         try:
             self.platform_geometry_runtime._cancel_platform_exploration_navigation()
         except Exception:
-            RUNTIME_LOGGER.debug("debug_nav2_goal 取消平台探索在途目标失败。", exc_info=True)
+            RUNTIME_LOGGER.debug("debug_navigation_goal 取消平台探索在途目标失败。", exc_info=True)
         # Phase 3 目标态：RViz /goal_pose 直通改走 nuwax-geometry-runtime.SetNavigationGoal。
         # 不再依赖被删除的 nav2_action_provider.publish_rviz_goal_pose（该路径发布 ROS2 /goal_pose 话题）。
         if provider is None:
@@ -4973,7 +4948,7 @@ class GatewayRuntime:
                 str(getattr(robot_pose, "frame_id", "") or ""),
             )
         RUNTIME_LOGGER.info(
-            "debug_nav2_goal rviz_goal_pose topic=%s target=(%.3f, %.3f, %.3f) frame=%s yaw=%.3f robot=%s published=%s message=%s",
+            "debug_navigation_goal rviz_goal_pose topic=%s target=(%.3f, %.3f, %.3f) frame=%s yaw=%.3f robot=%s published=%s message=%s",
             result.get("topic"),
             float(pose.position.x),
             float(pose.position.y),
@@ -5189,11 +5164,9 @@ class GatewayRuntime:
         )
         pose = self._build_pose_from_arguments(arguments)
         goal_metadata = {"requested_by": requested_by or "unknown"}
-        # Phase 0 收敛：优先 `force_runtime_goal`（新名），`force_nav2_goal` 保留为
-        # 迁移期 alias；同时写入 goal_metadata 时改用新 key。
+        # Phase 0 收敛（去 ROS2 目标态）：仅保留 `force_runtime_goal` 单一 key。
         force_runtime_goal = bool(
             arguments.get("force_runtime_goal", False)
-            or arguments.get("force_nav2_goal", False)
         )
         if force_runtime_goal:
             goal_metadata["force_runtime_goal"] = True
@@ -6497,18 +6470,12 @@ class GatewayRuntime:
         *,
         capability_name: str,
         map_name: str,
-        force_nav2_goal: bool = False,
-        force_runtime_goal: Optional[bool] = None,
+        force_runtime_goal: bool = False,
     ):
         """在实时位姿与 nuwax-geometry-runtime 可用时，允许直接下发导航目标。
 
-        Phase 0 收敛：`force_runtime_goal` 为新名（直接对应 nuwax navigation
-        语义）；`force_nav2_goal` 保留为迁移期 alias（默认 False，新调用方应传
-        `force_runtime_goal`）。
+        Phase 0 收敛（去 ROS2 目标态）：仅保留 `force_runtime_goal` 形参。
         """
-        # 兼容旧名：仅当调用方未显式传 `force_runtime_goal` 时使用旧值。
-        if force_runtime_goal is None:
-            force_runtime_goal = force_nav2_goal
 
         localization_snapshot = self.localization_service.get_latest_snapshot()
         if localization_snapshot is None or localization_snapshot.current_pose is None:
@@ -6573,11 +6540,10 @@ class GatewayRuntime:
         requested_by: Optional[str],
         arguments: Dict[str, Any],
     ):
-        force_nav2_goal = bool(arguments.get("force_nav2_goal", False))
         force_runtime_goal = bool(arguments.get("force_runtime_goal", False))
         trust_live_navigation = bool(arguments.get("trust_live_navigation", False))
-        # Phase 0 收敛：优先 `force_runtime_goal`（新名），旧 `force_nav2_goal` 保留为 alias。
-        effective_force = force_runtime_goal or force_nav2_goal
+        # Phase 0 收敛（去 ROS2 目标态）：仅保留 `force_runtime_goal` 单一 key。
+        effective_force = force_runtime_goal
         if trust_live_navigation or effective_force:
             try:
                 return self._ensure_localization_ready(
@@ -6591,7 +6557,6 @@ class GatewayRuntime:
                 return self._ensure_live_navigation_ready(
                     capability_name=capability_name,
                     map_name=map_name,
-                    force_nav2_goal=effective_force,
                     force_runtime_goal=effective_force,
                 )
         if bool(arguments.get("sync_localization_session", False)):
@@ -6622,7 +6587,6 @@ class GatewayRuntime:
                 return self._ensure_live_navigation_ready(
                     capability_name=capability_name,
                     map_name=map_name,
-                    force_nav2_goal=effective_force,
                     force_runtime_goal=effective_force,
                 )
             raise

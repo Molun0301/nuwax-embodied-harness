@@ -151,26 +151,12 @@ def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
     return tuple(items)
 
 
-# Phase 0 收敛（env-only 启动契约）：`NUWAX_GEOMETRY_RUNTIME_ARGS` 已废弃。
-# - 旧 contract 仍允许在 ExternalGeometryStackConfig.args 写入占位元组，但不再把
-#   env 解析为真实启动参数。
-# - 启动脚本 `services/geometry/scripts/start_nuwax_geometry_runtime.sh` 与
-#   `scripts/start_gateway.sh` 都已不再向 binary 传 CLI args。
-# - 该函数仅在 import 阶段读一次 env，并在首次显式调用时打一条 warning，让
-#   运维侧能定位仍然误传该 env 的部署。
-def _deprecated_runtime_args() -> Tuple[str, ...]:
-    raw = _raw_value("NUWAX_GEOMETRY_RUNTIME_ARGS", "")
-    if not raw.strip():
-        return ()
-    if "NUWAX_GEOMETRY_RUNTIME_ARGS" not in _DEPRECATED_ENV_NOTIFIED:
-        _DEPRECATION_LOGGER.warning(
-            "NUWAX_GEOMETRY_RUNTIME_ARGS 已废弃（Phase 0 env-only 启动契约）。"
-            " nuwax-geometry-runtime 只读 env，不再接受 CLI args。"
-            " 移除该 env 配置后不再生效；保留会写一条 diagnostics 但不传参。",
-        )
-        _DEPRECATED_ENV_NOTIFIED.add("NUWAX_GEOMETRY_RUNTIME_ARGS")
-    # 不把内容当 CLI args 转发给 binary；只保留为占位元组供 diagnostics/旧 contract 读取。
-    return ()
+# Phase 0 收敛（env-only 启动契约）：`ExternalGeometryStackConfig.args` 字段
+# 保留以兼容旧 diagnostics contract，但运行时硬编码为空元组——启动脚本与
+# systemd 都已不再向 nuwax-geometry-runtime binary 传 CLI args。Rust main.rs
+# 也只读 env，不再解析 argv。CLI 参数 env 入口已彻底移除，不再读任何
+# 兼容占位 env；如需调参请走 env 通道（NUWAX_GEOMETRY_RUNTIME_* 配项）。
+#
 
 
 def _normalize_lcm_backend(value: str) -> str:
@@ -880,11 +866,10 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 build_default_geometry_runtime_ready_file(),
             ),
             port=max(1, _cfg_int("NUWAX_GEOMETRY_RUNTIME_PORT", build_default_geometry_runtime_port())),
-            # Phase 0 收敛（env-only 启动契约）：保留字段但不再从
-            # `NUWAX_GEOMETRY_RUNTIME_ARGS` env 读取 CLI 参数——Rust main.rs
-            # 已不接 CLI 参数。`start_nuwax_geometry_runtime.sh` 与 systemd 都只
-            # 写 env。`args` 字段仅作历史兼容占位，写入时仅记录到 diagnostics。
-            args=tuple(_deprecated_runtime_args()),
+            # Phase 0 收敛（env-only 启动契约）：`args` 字段保留以兼容
+            # `contracts/geometry_runtime.py` 的 diagnostics 序列化；运行时
+            # 硬编码为空元组——启动脚本与 systemd 都已不再向 binary 传 CLI args。
+            args=(),
             process_name=_cfg_str("NUWAX_GEOMETRY_RUNTIME_PROCESS_NAME", "nuwax-geometry-runtime"),
             log_name=_cfg_str("NUWAX_GEOMETRY_RUNTIME_LOG_NAME", "nuwax_geometry_runtime.log"),
             provides_map=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_MAP", True),

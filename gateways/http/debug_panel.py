@@ -188,7 +188,7 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         arguments = dict(body or {})
         try:
             result = await run_in_threadpool(
-                lambda: runtime.dispatch_debug_nav2_goal(arguments, requested_by="debug_panel"),
+                lambda: runtime.dispatch_debug_navigation_goal(arguments, requested_by="debug_panel"),
             )
         except Exception as exc:
             raise as_gateway_error(exc) from exc

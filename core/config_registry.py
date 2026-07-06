@@ -386,7 +386,6 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_GEOMETRY_RUNTIME_START_SCRIPT": "nuwax-geometry-runtime 启动脚本",
     "NUWAX_GEOMETRY_RUNTIME_PROCESS_NAME": "nuwax-geometry-runtime 进程名",
     "NUWAX_GEOMETRY_RUNTIME_LOG_NAME": "nuwax-geometry-runtime 日志名",
-    "NUWAX_GEOMETRY_RUNTIME_ARGS": "nuwax-geometry-runtime 启动参数（已废弃，env-only 启动契约后不再消费）",
     "NUWAX_GEOMETRY_EXTERNAL_ENABLED": "启用 nuwax-geometry-runtime",
     "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_MAP": "runtime 提供地图",
     "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAVIGATION": "runtime 提供导航",

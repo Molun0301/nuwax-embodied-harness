@@ -91,7 +91,9 @@ pub fn voxel_downsample(points: &[[f32; 3]], voxel_size: f32) -> Vec<[f32; 3]> {
         return points.to_vec();
     }
     let inv = 1.0 / voxel_size;
-    let mut grid: HashMap<(i32, i32, i32), (f64, f64, f64, u32)> = HashMap::new();
+    type VoxelKey = (i32, i32, i32);
+    type VoxelAccum = (f64, f64, f64, u32);
+    let mut grid: HashMap<VoxelKey, VoxelAccum> = HashMap::new();
 
     for p in points {
         let key = (

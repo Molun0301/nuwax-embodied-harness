@@ -174,11 +174,12 @@ pub struct GeometryRuntimeHandle {
     /// Phase 3: mapping adapter 句柄。
     /// - `None` —— backend 不可用 / LCM fail-fast 路径不构造 adapter
     /// - `Some` —— adapter 已注入,`mapping_ready_poll` 通过该字段判定
-    /// `Arc<parking_lot::Mutex<MappingAdapter>>`:
-    /// - `Arc` 允许多订阅任务共享
-    /// - `parking_lot::Mutex` 走同步路径,避免 async 持锁跨 await
+    ///   类型为 `Arc<parking_lot::Mutex<MappingAdapter>>`:
+    ///   - `Arc` 允许多订阅任务共享
+    ///   - `parking_lot::Mutex` 走同步路径,避免 async 持锁跨 await
     pub mapping_adapter: Option<Arc<parking_lot::Mutex<MappingAdapter>>>,
     /// Phase 3: occupancy grid SHM sidecar 写入器。
+    ///
     /// - `None` —— backend 不可用 / LCM fail-fast 路径不构造
     /// - `Some` —— `get_occupancy_grid_shm` 走 SHM 直读
     pub occupancy_shm: Option<Arc<parking_lot::Mutex<OccupancyGridShmWriter>>>,
@@ -265,7 +266,11 @@ fn entry_to_matrix(e: &TransformEntry) -> Mat4 {
 
 fn rigid_inverse(m: &Mat4) -> Mat4 {
     let mut o = identity4();
-    for i in 0..3 { for j in 0..3 { o[i][j] = m[j][i]; } }
+    for (i, row) in o.iter_mut().enumerate().take(3) {
+        for (j, col) in row.iter_mut().enumerate().take(3) {
+            *col = m[j][i];
+        }
+    }
     for i in 0..3 {
         o[i][3] = -(o[i][0] * m[0][3] + o[i][1] * m[1][3] + o[i][2] * m[2][3]);
     }
@@ -325,11 +330,14 @@ fn mat_to_quat(m: &Mat4) -> (f64, f64, f64, f64) {
     }
 }
 
+/// (x, y, z, qx, qy, qz, qw, normalized_base_frame)
+type PoseWithFrame = (f64, f64, f64, f64, f64, f64, f64, String);
+
 fn resolve_map_pose(
     transforms: &[TransformEntry],
     map_frame: &str,
     base_frames: &[&str],
-) -> Option<(f64, f64, f64, f64, f64, f64, f64, String)> {
+) -> Option<PoseWithFrame> {
     for base in base_frames {
         if let Some(m) = resolve_transform(transforms, base, map_frame) {
             let (qx, qy, qz, qw) = mat_to_quat(&m);
@@ -449,8 +457,9 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<(Vec<u8>, u32)> {
 /// - `fake`(默认)：内存 fake backend,不依赖 liblcm
 /// - `real`：real-lcm backend；**当前上游 nuwax-transport/real-lcm feature 仍为空桩**,
 ///   启动期强制 fallback 到 fake 并打印 warn,避免误传 `real` 时偷偷走空 feature。
+///
 /// 详见模块顶部 doc-comment 与
-/// `docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/06_LCM接入与wire-format验证.md`。
+///   `docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/06_LCM接入与wire-format验证.md`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LcmBackendKind {
     /// 内存 fake backend（CI/开发机默认）

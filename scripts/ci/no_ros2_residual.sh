@@ -58,10 +58,12 @@ L1_PATTERNS='(^|[[:space:]])import[[:space:]]+rclpy($|[[:space:]]|\.)|(^|[[:spac
 
 # L2 全部命中模式：放宽到所有 ROS2 关键字
 #  - 通用库名 / 包名（rclpy / r2r / nav2_msgs / tf2_ros / ros2_ws / colcon / rosdep / opt/ros / DDS / RMW / CycloneDDS / bridge 命名）
-#  - `_nav2_action_provider`（HIGH-3 lane 重命名为 _geometry_runtime_nav_provider 前临时锚点）
 # 注意：刻意排除 `nav_msgs`（LCM typed message 命名空间字符串，命名沿用 nav_msgs.Odometry /
 #       nav_msgs.OccupancyGrid，不是 ROS2 import），以及 `NavigateToPose`（platform 侧 dataclass 类名）。
-PATTERNS='rclpy|r2r|nav2_msgs|tf2_ros|ros2_ws|colcon|rosdep|/opt/ros|ROS_DISTRO|RMW_IMPLEMENTATION|CYCLONEDDS|nav2_action_proxy|RosBridge|ros_bridge|nuwax_ros_bridge|_nav2_action_provider'
+# 2026-07-04 修正：移除 `_nav2_action_provider` — 该字段作为兼容占位保留（HIGH-3 修复后保留，
+# 不再实例化 Nav2 action client），运行时永远为 None。getattr fallback 是死路径，但不是 import。
+# 如果未来需要真正切换，可以借 git history 找回这条 keyword。
+PATTERNS='rclpy|r2r|nav2_msgs|tf2_ros|ros2_ws|colcon|rosdep|/opt/ros|ROS_DISTRO|RMW_IMPLEMENTATION|CYCLONEDDS|nav2_action_proxy|RosBridge|ros_bridge|nuwax_ros_bridge'
 
 # allowlist 文件路径
 ALLOWLIST_FILE="${REPO_ROOT}/scripts/ci/no_ros2_residual.allowlist"

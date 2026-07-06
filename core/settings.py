@@ -160,11 +160,16 @@ def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
 
 
 def _normalize_lcm_backend(value: str) -> str:
-    """Phase 0 收敛：LCM backend canonical 命名归一化。
+    """Phase 0 收敛 + Phase 6 fake-lcm profile 校验。
 
     canonical 取值：`real-lcm` / `fake-lcm`。
     历史/兼容 alias：`real` → `real-lcm`、`fake` → `fake-lcm`。
     其他值（空 / 未知）→ `fake-lcm`（CI/开发机默认），并在首次归一化时 warning。
+
+    Phase 6 增项：fake-lcm 仅允许在显式 `NUWAX_RUNTIME_PROFILE` ∈ {ci, ci-test,
+    contract-test, unit-test} 或单元测试场景使用；非允许 profile 设 fake-lcm
+    会输出 warning 但仍归一化为 fake-lcm,启动期会再被 Rust runtime 拒绝接 fake
+    backend(参见 lcm_runtime.rs:LcmBackendKind::Real fail-fast 分支)。
     """
     raw = (value or "").strip().lower()
     if raw in ("", "fake-lcm", "fake"):
@@ -191,6 +196,29 @@ def _normalize_lcm_backend(value: str) -> str:
                 canonical,
             )
             _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_alias")
+    elif raw in ("fake-lcm", "fake"):
+        # Phase 6:fake-lcm 仅允许 CI profile;非允许 profile 设 fake-lcm 时打 warning。
+        profile = (
+            (os.environ.get("NUWAX_RUNTIME_PROFILE", "") or "").strip().lower()
+        )
+        if not profile:
+            # 默认不强制;只在用户显式设 fake-lcm 时警告(避免首次启动刷屏)。
+            if "NUWAX_LCM_BACKEND_fake_non_ci" not in _DEPRECATED_ENV_NOTIFIED:
+                _DEPRECATION_LOGGER.warning(
+                    "NUWAX_LCM_BACKEND=fake-lcm 仅允许 CI/contract-test profile;"
+                    " 当前未设 NUWAX_RUNTIME_PROFILE,启动期 fake-lcm 会被 Rust runtime 拒绝。"
+                    " 生产/开发请改 NUWAX_LCM_BACKEND=real-lcm。"
+                )
+                _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_fake_non_ci")
+        elif profile not in _FAKE_LCM_ALLOWED_PROFILES:
+            if "NUWAX_LCM_BACKEND_fake_non_ci" not in _DEPRECATED_ENV_NOTIFIED:
+                _DEPRECATION_LOGGER.warning(
+                    "NUWAX_LCM_BACKEND=fake-lcm 但 NUWAX_RUNTIME_PROFILE=%r 不在允许列表 %r;"
+                    " 启动期 fake-lcm 会被 Rust runtime 拒绝。",
+                    profile,
+                    sorted(_FAKE_LCM_ALLOWED_PROFILES),
+                )
+                _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_fake_non_ci")
     return canonical
 
 
@@ -217,6 +245,36 @@ NAV_DB_SQLITE_FALLBACK_ENABLED: bool = _cfg_bool("NUWAX_NAV_DB_SQLITE_FALLBACK_E
 NAV_PROXY_GRPC_PORT: int = _cfg_int("NUWAX_NAV_PROXY_GRPC_PORT", 50061)
 NAV_PROXY_PENDING_QUEUE_MAX_SIZE: int = max(
     1, _cfg_int("NUWAX_NAV_PROXY_PENDING_QUEUE_MAX_SIZE", 4)
+)
+
+# ============================================================
+# Phase 6：nav profile / explore arbitration / real-lcm 强约束
+# ============================================================
+# 这些 module-level 常量直接对接 nuwax-geometry-runtime (Rust) 装配面:
+# - NUWAX_NAV_PROFILE    → Rust `nav_runtime.rs` 读取,选择 simple-2d /
+#                          replanning-astar / cmu-native / mls3d / exploration-native;
+#                          默认 simple-2d,与 nuwax-nav-stack foundation 组合对齐。
+# - NUWAX_EXPLORE_ARBITRATION → Rust `explore_runtime.rs` 读取,选择
+#                          PreferWavefront / PreferTare / HighestScore / FirstAvailable;
+#                          默认 prefer_wavefront,与 nuwax-explore-wavefront 对齐。
+# - NUWAX_REAL_LCM_REQUIRED → true 时启动期 real-lcm 失败必须 fail-fast 并退出
+#                          (HealthCheck healthy=false + LCM_BACKEND_UNAVAILABLE),
+#                          不允许 fallback 到 fake-lcm;默认 false 由环境侧决策。
+NAV_PROFILE: str = _cfg_str("NUWAX_NAV_PROFILE", "simple-2d").strip() or "simple-2d"
+EXPLORE_ARBITRATION: str = (
+    _cfg_str("NUWAX_EXPLORE_ARBITRATION", "prefer_wavefront").strip() or "prefer_wavefront"
+)
+REAL_LCM_REQUIRED: bool = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
+
+# NUWAX_LCM_BACKEND=fake-lcm 仅允许 CI / contract test profile。
+# 生产/开发环境设置 fake-lcm 会被 _normalize_lcm_backend 警告并归一化为 real-lcm。
+_FAKE_LCM_ALLOWED_PROFILES: frozenset[str] = frozenset(
+    {
+        "ci",
+        "ci-test",
+        "contract-test",
+        "unit-test",
+    }
 )
 
 

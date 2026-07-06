@@ -378,6 +378,11 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_NAV_DB_SQLITE_FALLBACK_ENABLED": "启用 RTAB-Map DB SQLite 闭环 fallback",
     "NUWAX_NAV_PROXY_GRPC_PORT": "导航代理 gRPC 端口",
     "NUWAX_NAV_PROXY_PENDING_QUEUE_MAX_SIZE": "导航代理 PENDING 队列上限",
+    # Phase 6:新增 nav profile / explore arbitration / real-lcm 硬约束。
+    # 三者均对接 nuwax-geometry-runtime (Rust) 装配面,不再走旧 rclpy/Nav2.
+    "NUWAX_NAV_PROFILE": "导航 profile（simple-2d / replanning-astar / cmu-native / mls3d / exploration-native；默认 simple-2d）",
+    "NUWAX_EXPLORE_ARBITRATION": "探索 source arbitration（prefer_wavefront / prefer_tare / highest_score / first_available；默认 prefer_wavefront）",
+    "NUWAX_REAL_LCM_REQUIRED": "real-lcm 启动失败 fail-fast 开关（true 时 fake-lcm 不允许作为 fallback）",
 
     # 几何运行时与 LCM
     "NUWAX_GEOMETRY_RUNTIME_BINARY": "nuwax-geometry-runtime 二进制路径",

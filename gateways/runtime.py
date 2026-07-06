@@ -5228,19 +5228,27 @@ class GatewayRuntime:
 
         - request_id 缺省：取消当前 ACTIVE 目标；
         - request_id 给出：取消指定 request_id 的目标。
+
+        当前 nuwax-nav-stack LCM channel 未接通（B7 blocker），返回明确 UNAVAILABLE
+        而非 ok=True 假成功，避免上层 caller 误以为已实际取消。
         """
         request_id = str(arguments.get("request_id", "")).strip() or None
-        # TODO(runtime_dispatch_not_ready): worker-C _dispatch_navigate 未就绪时返回 stub。
-        # 待 worker-C 接入 NavigationProxyClient 后替换为真实调用：
-        #   return self.platform_geometry_runtime.cancel_navigation(request_id=request_id)
         return {
-            "ok": True,
+            "ok": False,
             "alias_of": "cancel_navigation",
             "request_id": request_id,
-            "message": "TODO:runtime_dispatch_not_ready — 等 worker-C _dispatch_navigate 接入",
+            "error_code": "RUNTIME_NOT_READY",
+            "unavailable_reason": (
+                "navigation_runtime_dispatch_not_ready"
+            ),
+            "message": (
+                "导航 RPC 尚未接通 nuwax-nav-stack LCM channel（参见 B7 blocker），"
+                "无法执行 cancel_navigation。"
+            ),
             "metadata": {
                 "requested_by": requested_by or "unknown",
-                "stub": True,
+                "stub": False,
+                "capability_available": False,
             },
         }
 
@@ -5251,21 +5259,34 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ) -> Dict[str, Any]:
-        """读取当前导航状态（同步 tool，无入参）。"""
+        """读取当前导航状态（同步 tool，无入参）。
+
+        当前 nuwax-nav-stack LCM channel 未接通（B7 blocker），返回明确 UNAVAILABLE
+        而非固定 idle stub，避免上层 caller 把"无真实数据"误读为"已 idle"。
+        """
         del arguments, request_context
-        # TODO(runtime_dispatch_not_ready): worker-C _dispatch_navigate 未就绪时返回 stub。
-        # 待 worker-C 接入 NavigationProxyClient.get_state() 后替换为真实调用：
-        #   return self.platform_geometry_runtime.get_navigation_state()
         return {
-            "ok": True,
+            "ok": False,
             "alias_of": "get_navigation_state",
             "navigation_state": {
-                "status": "idle",
-                "message": "TODO:runtime_dispatch_not_ready — 等 worker-C _dispatch_navigate 接入",
+                "status": "UNAVAILABLE",
+                "message": (
+                    "导航运行时未就绪（参见 B7 blocker），"
+                    "当前无法提供真实导航状态。"
+                ),
             },
+            "error_code": "RUNTIME_NOT_READY",
+            "unavailable_reason": (
+                "navigation_runtime_dispatch_not_ready"
+            ),
+            "message": (
+                "导航 RPC 尚未接通 nuwax-nav-stack LCM channel（参见 B7 blocker），"
+                "无法提供 get_navigation_state。"
+            ),
             "metadata": {
                 "requested_by": requested_by or "unknown",
-                "stub": True,
+                "stub": False,
+                "capability_available": False,
             },
         }
 
@@ -5297,7 +5318,7 @@ class GatewayRuntime:
             "auto_loop_close": bool(arguments.get("auto_loop_close", True)),
             "extend_radius_m": float(arguments.get("extend_radius_m", 3.0) or 3.0),
             "boundary_polygon_file": "/tmp/go2_boundary.json",
-            "TODO_runtime_dispatch_not_ready": True,
+            "boundary_dispatch_ready": False,
         }
         if isinstance(primary, dict):
             enriched = dict(primary)
@@ -6455,10 +6476,10 @@ class GatewayRuntime:
                 details={"map_name": map_name, "capability_name": capability_name},
             )
         nav2_runtime = getattr(self.platform_geometry_runtime, "_remote_provider", None)
-        if nav2_provider is not None:
-            readiness = runtime.get_navigation_readiness() if force_nav2_goal else None
+        if nav2_runtime is not None and force_nav2_goal:
+            readiness = nav2_runtime.get_navigation_readiness()
             if readiness is not None:
-                if readiness.ready:
+                if bool(readiness.get("ready")):
                     RUNTIME_LOGGER.info(
                         "trust_live_navigation: Nav2 action ready + live pose, bypass session gate for %s map=%s force=%s",
                         capability_name,

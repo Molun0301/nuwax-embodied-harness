@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-import geometry_runtime_pb2 as geometry__runtime__pb2
+from . import geometry_runtime_pb2 as geometry__runtime__pb2
 
 GRPC_GENERATED_VERSION = '1.82.0'
 GRPC_VERSION = grpc.__version__
@@ -126,6 +126,26 @@ class GeometryRuntimeStub:
                 '/nuwax.geometry.GeometryRuntime/SubscribeFrontiers',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.FrontierList.FromString,
+                _registered_method=True)
+        self.StartExploration = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/StartExploration',
+                request_serializer=geometry__runtime__pb2.ExploreRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.ExplorationState.FromString,
+                _registered_method=True)
+        self.StopExploration = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/StopExploration',
+                request_serializer=geometry__runtime__pb2.StopExplorationRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.ExplorationState.FromString,
+                _registered_method=True)
+        self.GetExplorationState = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetExplorationState',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.ExplorationState.FromString,
+                _registered_method=True)
+        self.GetExplorationDiagnostics = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetExplorationDiagnostics',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.ExplorationDiagnostics.FromString,
                 _registered_method=True)
         self.PublishOdom = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/PublishOdom',
@@ -258,6 +278,37 @@ class GeometryRuntimeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StartExploration(self, request, context):
+        """Phase 5 additive: 探索 start/stop/state/diagnostics。
+        返回 ExplorationState.status 取值：
+        "ACCEPTED"   — controller 已 begin，调用方进入 active 状态
+        "REJECTED"   — request 被拒绝（NoSources / AlreadyActive / etc.）
+        "PENDING"    — controller 暂时没有可用 goal（wavefront / source pending）
+        "STOPPED"    — 已 stop，message 含 stop reason
+        "UNIMPLEMENTED" — Phase 5 stub 暂未接通 nuwax-exploration crate
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StopExploration(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetExplorationState(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetExplorationDiagnostics(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PublishOdom(self, request, context):
         """输入发布兼容
         """
@@ -363,6 +414,26 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.SubscribeFrontiers,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.FrontierList.SerializeToString,
+            ),
+            'StartExploration': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartExploration,
+                    request_deserializer=geometry__runtime__pb2.ExploreRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.ExplorationState.SerializeToString,
+            ),
+            'StopExploration': grpc.unary_unary_rpc_method_handler(
+                    servicer.StopExploration,
+                    request_deserializer=geometry__runtime__pb2.StopExplorationRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.ExplorationState.SerializeToString,
+            ),
+            'GetExplorationState': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetExplorationState,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.ExplorationState.SerializeToString,
+            ),
+            'GetExplorationDiagnostics': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetExplorationDiagnostics,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.ExplorationDiagnostics.SerializeToString,
             ),
             'PublishOdom': grpc.unary_unary_rpc_method_handler(
                     servicer.PublishOdom,
@@ -864,6 +935,114 @@ class GeometryRuntime:
             '/nuwax.geometry.GeometryRuntime/SubscribeFrontiers',
             geometry__runtime__pb2.Empty.SerializeToString,
             geometry__runtime__pb2.FrontierList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StartExploration(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/StartExploration',
+            geometry__runtime__pb2.ExploreRequest.SerializeToString,
+            geometry__runtime__pb2.ExplorationState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StopExploration(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/StopExploration',
+            geometry__runtime__pb2.StopExplorationRequest.SerializeToString,
+            geometry__runtime__pb2.ExplorationState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetExplorationState(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetExplorationState',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.ExplorationState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetExplorationDiagnostics(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetExplorationDiagnostics',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.ExplorationDiagnostics.FromString,
             options,
             channel_credentials,
             insecure,

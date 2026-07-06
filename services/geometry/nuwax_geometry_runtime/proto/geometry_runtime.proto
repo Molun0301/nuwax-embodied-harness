@@ -123,6 +123,46 @@ message Frontier {
 }
 message FrontierList { repeated Frontier frontiers = 1; uint64 revision = 2; }
 
+// 探索启动/停止/状态/诊断 — Phase 5 additive
+// 字段命名与执行方案 §3 Phase 5 + dimos `nuwax-exploration` facade 对齐。
+// strategy 取值:`"wavefront"` / `"tare"` / `"highest_score"` / `"first_available"`
+// （与 dimos `ExplorationArbitrationPolicy` enum 字符串名一致）。
+message ExploreRequest {
+  string strategy = 1;
+  string arbitration = 2;
+  string map_version_id = 3;
+  string request_id = 4;
+}
+message StopExplorationRequest {
+  string request_id = 1;
+}
+message ExplorationState {
+  string status = 1;
+  string message = 2;
+  string request_id = 3;
+  string selected_source = 4;
+  string last_stop_reason = 5;
+  uint32 frontier_count = 6;
+  uint64 revision = 7;
+  uint64 timestamp_ns = 8;
+}
+message ExplorationSourceDiag {
+  string source_name = 1;
+  bool is_active = 2;
+  string last_goal_id = 3;
+  string last_error = 4;
+}
+message ExplorationDiagnostics {
+  bool active = 1;
+  string arbitration = 2;
+  string selected_source = 3;
+  string last_stop_reason = 4;
+  repeated ExplorationSourceDiag sources = 5;
+  uint32 frontier_count = 6;
+  uint64 revision = 7;
+  uint64 timestamp_ns = 8;
+}
+
 // === 输入发布兼容（用于调试/自检/preview，区别于 nav2_action_provider）===
 message PublishOdomRequest { Pose pose = 1; }
 message PublishPointCloudRequest {
@@ -162,6 +202,17 @@ service GeometryRuntime {
   // 探索（与 nuwax-exploration LCM channel 接口对应）
   rpc GetFrontiers(Empty) returns (FrontierList);
   rpc SubscribeFrontiers(Empty) returns (stream FrontierList);
+  // Phase 5 additive: 探索 start/stop/state/diagnostics。
+  // 返回 ExplorationState.status 取值：
+  //   "ACCEPTED"   — controller 已 begin，调用方进入 active 状态
+  //   "REJECTED"   — request 被拒绝（NoSources / AlreadyActive / etc.）
+  //   "PENDING"    — controller 暂时没有可用 goal（wavefront / source pending）
+  //   "STOPPED"    — 已 stop，message 含 stop reason
+  //   "UNIMPLEMENTED" — Phase 5 stub 暂未接通 nuwax-exploration crate
+  rpc StartExploration(ExploreRequest) returns (ExplorationState);
+  rpc StopExploration(StopExplorationRequest) returns (ExplorationState);
+  rpc GetExplorationState(Empty) returns (ExplorationState);
+  rpc GetExplorationDiagnostics(Empty) returns (ExplorationDiagnostics);
 
   // 输入发布兼容
   rpc PublishOdom(PublishOdomRequest) returns (PublishResult);

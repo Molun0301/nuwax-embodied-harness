@@ -342,3 +342,8 @@
   line: 4510
   category: migration_doc_block
   reason: "MEDIUM 6 守门扩展（建图导航探索库接入 Phase 0 漂移到 4510）：_pending_localization_callbacks.append 后的注释，RMW_IMPLEMENTATION 反向锚点；说明为什么不能提前启动 ExternalGeometryDebugObserver（它会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 导致 Unitree SDK ChannelFactory 初始化失败）。HIGH-3 提交后还会再漂移，由 leader 最终化。"
+
+- file: services/geometry/runtime.py
+  line: 4608
+  category: migration_doc_block
+  reason: "建图导航探索库接入 Phase 3 漂移到 4608：Phase 3 在 prepare_map_version_assets 内追加 nuwax_mapping 资产引用块（约 +57 行），把 _pending_localization_callbacks.append 后注释推到 4608。该注释是 RMW_IMPLEMENTATION 反向锚点（警告不能提前启动 ExternalGeometryDebugObserver 会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 污染 Unitree SDK ChannelFactory）。Phase 6/7 在 runtime.py 再次重构后行号还会再漂移，由 leader 最终化。"

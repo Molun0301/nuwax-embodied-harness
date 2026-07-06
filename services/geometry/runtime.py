@@ -2696,6 +2696,63 @@ class PlatformGeometryRuntime:
                 metadata={"required": False},
             )
         )
+        # Phase 3: 追加 nuwax_mapping 资产引用。
+        # 默认路径：当 mapping_adapter 已经有点云数据(revision>0)时,
+        # 把 occupancy grid / costmap / cloud_map 三类资产写到 version 资产
+        # 清单。映射路径分别为:
+        # - occupancy: NUWAX_OCCUPANCY_SHM_PATH(默认 /tmp/nuwax_occupancy.mmap)
+        # - costmap:    同 occupancy SHM(由 server::get_occupancy_grid_shm 写入,
+        #               同一份 SHM 内包含 costmap 等价派生;此处仅引用同一文件)
+        # - cloud_map:  NUWAX_CLOUDMAP_SHM_PATH(默认 /tmp/nuwax_cloudmap.mmap,
+        #               既有 Phase 0 cloud_map SHM)
+        # 若 mapping_adapter 未启用(LCM backend 不可用 / adapter has_data=false),
+        # 则不追加这些 asset refs,保持历史 rtabmap 兼容路径。
+        if self._is_nuwax_mapping_active():
+            occupancy_shm_path = os.environ.get(
+                "NUWAX_OCCUPANCY_SHM_PATH", "/tmp/nuwax_occupancy.mmap"
+            )
+            cloud_map_shm_path = os.environ.get(
+                "NUWAX_CLOUDMAP_SHM_PATH", "/tmp/nuwax_cloudmap.mmap"
+            )
+            nuwax_mapping_meta = {
+                "backend_mode": "nuwax_mapping",
+                "lcm_backend": self._mapping_lcm_backend_name(),
+                "shm_layout_version": 1,
+                "required": False,
+            }
+            asset_refs.append(
+                MapGeometryAssetRef(
+                    asset_type=MapGeometryAssetType.NUWAX_MAPPING_OCCUPANCY_GRID,
+                    path=str(occupancy_shm_path),
+                    frame_id=version.frame_id,
+                    profile_summary=profile_summary,
+                    built_at=built_at,
+                    quality_metrics=dict(quality_metrics.get("nuwax_mapping") or {}),
+                    metadata=dict(nuwax_mapping_meta),
+                )
+            )
+            asset_refs.append(
+                MapGeometryAssetRef(
+                    asset_type=MapGeometryAssetType.NUWAX_MAPPING_COSTMAP,
+                    path=str(occupancy_shm_path),
+                    frame_id=version.frame_id,
+                    profile_summary=profile_summary,
+                    built_at=built_at,
+                    quality_metrics={},
+                    metadata={**dict(nuwax_mapping_meta), "costmap_source": "nuwax_mapping_cost_mapper"},
+                )
+            )
+            asset_refs.append(
+                MapGeometryAssetRef(
+                    asset_type=MapGeometryAssetType.NUWAX_MAPPING_CLOUD_MAP,
+                    path=str(cloud_map_shm_path),
+                    frame_id=version.frame_id,
+                    profile_summary=profile_summary,
+                    built_at=built_at,
+                    quality_metrics={},
+                    metadata={**dict(nuwax_mapping_meta), "voxel_size": 0.05},
+                )
+            )
         geometry_asset = MapGeometryAssetBinding(
             map_name=version.map_name,
             version_id=version.version_id,
@@ -3851,6 +3908,47 @@ class PlatformGeometryRuntime:
             "mtime_ns": int(stat.st_mtime_ns),
             "mtime_iso": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
         }
+
+    # ========================================================================
+    # Phase 3: nuwax_mapping 资产写入相关 helper
+    # ========================================================================
+
+    def _is_nuwax_mapping_active(self) -> bool:
+        """Phase 3: 检查 nuwax_mapping backend 是否就绪。
+
+        返回 True 当且仅当:
+        - `GeometryRuntimeProvider` 已在 self._runtime_provider
+        - 远程 runtime HealthCheck 返回 healthy=True
+        - remote 端 mapping_ready_poll() 返回 True(详见 feedback_phase3.md)
+
+        返回 False 时,`prepare_map_version_assets` 走历史 rtabmap 兼容路径,
+        不追加 nuwax_mapping_* asset refs。
+        """
+        provider = getattr(self, "_runtime_provider", None)
+        if provider is None:
+            return False
+        try:
+            return bool(provider.is_mapping_ready())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "_is_nuwax_mapping_active: provider.is_mapping_ready 失败,降级为 False: %s",
+                exc,
+            )
+            return False
+
+    def _mapping_lcm_backend_name(self) -> str:
+        """Phase 3: 取 LCM backend canonical 名(给 nuwax_mapping asset metadata)。"""
+        provider = getattr(self, "_runtime_provider", None)
+        if provider is None:
+            return "<unknown>"
+        try:
+            return str(provider.get_lcm_backend_name())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "_mapping_lcm_backend_name: provider.get_lcm_backend_name 失败,降级为 <unknown>: %s",
+                exc,
+            )
+            return "<unknown>"
 
     def _build_rtabmap_run_metadata(self) -> Dict[str, object]:
         process_name = self._external_process_name()

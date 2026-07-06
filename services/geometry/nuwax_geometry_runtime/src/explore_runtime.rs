@@ -188,7 +188,7 @@ impl ExploreRuntimeHandle {
         // Phase 5 默认 source = wavefront。
         // 即便 controller 暂未 begin,先把 source 装好;start 时再 begin。
         let mut ctrl = ExplorationController::new(inner.arbitration);
-        let adapter = nuwax_exploration::WavefrontGoalSourceAdapter::with_default_id(
+        let adapter = WavefrontGoalSourceAdapter::with_default_id(
             "wavefront",
             WavefrontConfig::default(),
         );
@@ -359,9 +359,9 @@ impl ExploreRuntimeHandle {
                         snapshot_out.message = format!("source unavailable: {reason}");
                     }
                     ExplorationPoll::Stop(reason) => {
-                        snapshot_out.message = format!("stopped: {}", stop_reason_str(reason));
-                        snapshot_out.last_stop_reason = stop_reason_str(reason).to_string();
-                        g.last_stop = Some(reason);
+                        snapshot_out.message = format!("stopped: {}", stop_reason_str(*reason));
+                        snapshot_out.last_stop_reason = stop_reason_str(*reason).to_string();
+                        g.last_stop = Some(*reason);
                         g.last_stop_reason = snapshot_out.last_stop_reason.clone();
                         g.last_selected_source = snapshot_out.selected_source.clone();
                     }

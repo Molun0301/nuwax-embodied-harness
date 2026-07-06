@@ -89,6 +89,14 @@ class MapGeometryAssetType(StrEnum):
     PCD = "pcd"
     # RTAB-Map SQLite .db 文件——当前主线生产资产类型。
     RTABMAP_DATABASE = "rtabmap_database"
+    # Phase 3: nuwax-mapping (Rust native mapping adapter) 产出的资产。
+    # Phase 3 实装后,新地图版本默认 backend_mode="nuwax_mapping",并
+    # 把 occupancy grid / costmap / 累积点云 (cloud_map) 作为附加 asset refs;
+    # 旧的 `rtabmap_database` / `external_slam_nav2_state` 仅保留为
+    # 历史地图版本兼容读取,不作为新地图默认。
+    NUWAX_MAPPING_OCCUPANCY_GRID = "nuwax_mapping_occupancy_grid"
+    NUWAX_MAPPING_COSTMAP = "nuwax_mapping_costmap"
+    NUWAX_MAPPING_CLOUD_MAP = "nuwax_mapping_cloud_map"
 
 
 class MapGeometryAssetRef(ContractModel):

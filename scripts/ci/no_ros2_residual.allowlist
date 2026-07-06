@@ -74,9 +74,9 @@
   reason: "Phase 3 修复（commit 0e2083a）：platform_cmd_vel_bridge_enabled 注释续行，行号从 942 漂移到 957；说明 rclpy 节点不再创建。"
 
 - file: services/geometry/runtime.py
-  line: 967
+  line: 980
   category: migration_doc_block
-  reason: "Phase 3 修复 + runtime.py 主状态机去 external_slam_nav2 旧链（fix-B2 lane 工作中）：launch_ros2_stack.sh 注释续行；说明 launch_ros2_stack.sh + bash 前缀已下线。"
+  reason: "Phase 3 修复 + runtime.py 主状态机去 external_slam_nav2 旧链（fix-B2 lane 工作中）：launch_ros2_stack.sh 注释续行；说明 launch_ros2_stack.sh + bash 前缀已下线。Phase 0 收敛（建图导航探索库接入）后行号从 967 漂移到 980。"
 
 - file: services/geometry/runtime.py
   line: 4415
@@ -339,6 +339,6 @@
   reason: "MEDIUM 6 守门扩展（行号漂移后补登）：_pending_localization_callbacks.append 后的注释，RMW_IMPLEMENTATION 反向锚点（HIGH-3 工作中再次漂移到 4484）。HIGH-3 commit 后会再次漂移，由 leader 在 HIGH-3 commit 后最终化。"
 
 - file: services/geometry/runtime.py
-  line: 4487
+  line: 4510
   category: migration_doc_block
-  reason: "MEDIUM 6 守门扩展（HIGH-3 commit 4825cd7 后再次漂移到 4487）：_pending_localization_callbacks.append 后的注释，RMW_IMPLEMENTATION 反向锚点；说明为什么不能提前启动 ExternalGeometryDebugObserver（它会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 导致 Unitree SDK ChannelFactory 初始化失败）。HIGH-3 提交后还会再漂移，由 leader 最终化。"
+  reason: "MEDIUM 6 守门扩展（建图导航探索库接入 Phase 0 漂移到 4510）：_pending_localization_callbacks.append 后的注释，RMW_IMPLEMENTATION 反向锚点；说明为什么不能提前启动 ExternalGeometryDebugObserver（它会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 导致 Unitree SDK ChannelFactory 初始化失败）。HIGH-3 提交后还会再漂移，由 leader 最终化。"

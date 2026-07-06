@@ -4883,15 +4883,44 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Debug 面板 RViz 2D Goal 直通：发布 /goal_pose → bt_navigator。"""
+        """Debug 面板 RViz 2D Goal 直通：发布 /goal_pose → bt_navigator。
+
+        Phase 0 收敛（去 ROS2 目标态）：
+        - 旧名 `dispatch_debug_nav2_goal` 保留为 alias 入口，内部调用
+          `dispatch_debug_navigation_goal`；错误码从 `nav2_provider_unavailable`
+          改为 `runtime_provider_unavailable`。
+        - 新默认入口：`dispatch_debug_navigation_goal`（直接调
+          nuwax-geometry-runtime.SetNavigationGoal）。
+        - Nav2/ROS2 链已删除；legacy name 仅作迁移期 alias，不接受新调用方使用。
+        """
+
+        return self.dispatch_debug_navigation_goal(
+            arguments,
+            requested_by=requested_by,
+            legacy_alias="dispatch_debug_nav2_goal",
+        )
+
+    def dispatch_debug_navigation_goal(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+        legacy_alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Debug 面板 RViz 2D Goal 直通 → nuwax-geometry-runtime SetNavigationGoal。
+
+        新默认入口。`legacy_alias` 仅当通过 `dispatch_debug_nav2_goal` 间接调用时
+        用于日志/响应标记；新调用方应直接传 `dispatch_debug_navigation_goal`。
+        """
 
         pose = self._build_pose_from_arguments(arguments)
         provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
-                "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
-                error_code="nav2_provider_unavailable",
+                "GeometryRuntimeProvider 未初始化；请确认 nuwax-geometry-runtime 已启动且平台几何 profile 已启用。",
+                error_code="runtime_provider_unavailable",
                 http_status=503,
+                details={"legacy_alias": legacy_alias} if legacy_alias else None,
             )
         try:
             self.platform_geometry_runtime._cancel_platform_exploration_navigation()
@@ -5160,8 +5189,14 @@ class GatewayRuntime:
         )
         pose = self._build_pose_from_arguments(arguments)
         goal_metadata = {"requested_by": requested_by or "unknown"}
-        if bool(arguments.get("force_nav2_goal", False)):
-            goal_metadata["force_nav2_goal"] = True
+        # Phase 0 收敛：优先 `force_runtime_goal`（新名），`force_nav2_goal` 保留为
+        # 迁移期 alias；同时写入 goal_metadata 时改用新 key。
+        force_runtime_goal = bool(
+            arguments.get("force_runtime_goal", False)
+            or arguments.get("force_nav2_goal", False)
+        )
+        if force_runtime_goal:
+            goal_metadata["force_runtime_goal"] = True
         goal = NavigationGoal(
             goal_id=self._build_runtime_request_id("nav_pose"),
             map_name=map_name,
@@ -6463,8 +6498,17 @@ class GatewayRuntime:
         capability_name: str,
         map_name: str,
         force_nav2_goal: bool = False,
+        force_runtime_goal: Optional[bool] = None,
     ):
-        """在实时位姿与 Nav2 action 可用时，允许直接下发导航目标（对齐 RViz 2D Goal）。"""
+        """在实时位姿与 nuwax-geometry-runtime 可用时，允许直接下发导航目标。
+
+        Phase 0 收敛：`force_runtime_goal` 为新名（直接对应 nuwax navigation
+        语义）；`force_nav2_goal` 保留为迁移期 alias（默认 False，新调用方应传
+        `force_runtime_goal`）。
+        """
+        # 兼容旧名：仅当调用方未显式传 `force_runtime_goal` 时使用旧值。
+        if force_runtime_goal is None:
+            force_runtime_goal = force_nav2_goal
 
         localization_snapshot = self.localization_service.get_latest_snapshot()
         if localization_snapshot is None or localization_snapshot.current_pose is None:
@@ -6476,27 +6520,27 @@ class GatewayRuntime:
                 details={"map_name": map_name, "capability_name": capability_name},
             )
         nav2_runtime = getattr(self.platform_geometry_runtime, "_remote_provider", None)
-        if nav2_runtime is not None and force_nav2_goal:
+        if nav2_runtime is not None and force_runtime_goal:
             readiness = nav2_runtime.get_navigation_readiness()
             if readiness is not None:
                 if bool(readiness.get("ready")):
                     RUNTIME_LOGGER.info(
-                        "trust_live_navigation: Nav2 action ready + live pose, bypass session gate for %s map=%s force=%s",
+                        "trust_live_navigation: nuwax-geometry-runtime ready + live pose, bypass session gate for %s map=%s force=%s",
                         capability_name,
                         map_name,
-                        force_nav2_goal,
+                        force_runtime_goal,
                     )
                     return localization_snapshot
                 raise GatewayError(
-                    readiness.get("message") or "Nav2 未就绪，无法执行 %s。" % capability_name,
-                    error_code="nav2_not_ready",
+                    readiness.get("message") or "nuwax-geometry-runtime 未就绪，无法执行 %s。" % capability_name,
+                    error_code="runtime_not_ready",
                     http_status=409,
                     jsonrpc_code=-32000,
                     details={
                         "map_name": map_name,
                         "capability_name": capability_name,
                         "waiting_for": readiness.get("waiting_for", []),
-                        "force_nav2_goal": force_nav2_goal,
+                        "force_runtime_goal": force_runtime_goal,
                     },
                 )
         nav2_status = self.platform_geometry_runtime._build_nav2_status()
@@ -6530,8 +6574,11 @@ class GatewayRuntime:
         arguments: Dict[str, Any],
     ):
         force_nav2_goal = bool(arguments.get("force_nav2_goal", False))
+        force_runtime_goal = bool(arguments.get("force_runtime_goal", False))
         trust_live_navigation = bool(arguments.get("trust_live_navigation", False))
-        if trust_live_navigation or force_nav2_goal:
+        # Phase 0 收敛：优先 `force_runtime_goal`（新名），旧 `force_nav2_goal` 保留为 alias。
+        effective_force = force_runtime_goal or force_nav2_goal
+        if trust_live_navigation or effective_force:
             try:
                 return self._ensure_localization_ready(
                     capability_name=capability_name,
@@ -6544,7 +6591,8 @@ class GatewayRuntime:
                 return self._ensure_live_navigation_ready(
                     capability_name=capability_name,
                     map_name=map_name,
-                    force_nav2_goal=force_nav2_goal,
+                    force_nav2_goal=effective_force,
+                    force_runtime_goal=effective_force,
                 )
         if bool(arguments.get("sync_localization_session", False)):
             try:
@@ -6570,11 +6618,12 @@ class GatewayRuntime:
                     workspace=workspace,
                     requested_by=requested_by,
                 )
-            if trust_live_navigation or force_nav2_goal:
+            if trust_live_navigation or effective_force:
                 return self._ensure_live_navigation_ready(
                     capability_name=capability_name,
                     map_name=map_name,
-                    force_nav2_goal=force_nav2_goal,
+                    force_nav2_goal=effective_force,
+                    force_runtime_goal=effective_force,
                 )
             raise
 

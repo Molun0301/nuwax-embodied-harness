@@ -496,6 +496,8 @@ class PlatformGeometryRuntime:
         # 去 ROS2 目标态：正式导航执行链已切到 nuwax-geometry-runtime（Rust gRPC bridge）。
         # 原 `_nav2_action_provider` 字段是 Nav2 ROS2 action 客户端的兼容占位。
         # 字段名保留（外部 getattr 引用方众多），但运行时不再实例化 Nav2 action 客户端。
+        # Phase 0 硬隔离后：`_resolve_navigation_backend()` 失败时不再 fallback 到此字段，
+        # 任何 nav2 fallback 路径收到 None + RUNTIME_NOT_READY。
         # 真正可用的导航后端由 `_remote_provider` (GeometryRuntimeProvider) 持有，由
         # `_resolve_navigation_backend()` 优先返回。
         self._nav2_launch_attempted = False
@@ -507,6 +509,12 @@ class PlatformGeometryRuntime:
         self._external_debug_observer: Optional[ExternalGeometryDebugObserver] = None
         self._external_debug_frontier_payload: Optional[Dict[str, object]] = None
         self._platform_exploration_config = ExplorationConfig(enabled=True)
+        # `_platform_exploration_runtime` 字段名保留以兼容 29 处旧引用（Phase 0 grep 盘点）；
+        # 实际行为降级为 legacy/manual only。Phase 0 硬隔离后：
+        # - `_resolve_exploration_backend()` 不再优先返回此字段
+        # - 默认探索路径走 `_remote_provider` (GeometryRuntimeProvider)
+        # - 此字段只允许显式 legacy/manual 入口或单测 fixture 引用
+        # 见 docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/执行方案.md §3.0
         self._platform_exploration_runtime = PlatformExplorationRuntime(
             frontier_explorer=FrontierExplorer(self._platform_exploration_config),
             navigation_planner=GridNavigationPlanner(NavigationBackendConfig()),
@@ -3206,23 +3214,38 @@ class PlatformGeometryRuntime:
     def _resolve_navigation_backend(self):
         """解析平台正式导航后端。
 
-        去 ROS2 目标态：优先返回 `_remote_provider` (GeometryRuntimeProvider, 即 nuwax-geometry-runtime
-        gRPC facade)。`_nav2_action_provider` 是历史 Nav2 ROS2 action 客户端的兼容占位，
-        仅在 GeometryRuntimeProvider 尚未装配时作为 fallback 返回，保持外部引用方不抛 AttributeError。
+        去 ROS2 目标态（Phase 0 硬隔离）：优先返回 `_remote_provider`
+        (GeometryRuntimeProvider, 即 nuwax-geometry-runtime gRPC facade)。
+        remote provider 不可用时**直接返回 None**，不再 fallback 到
+        `_nav2_action_provider`（历史 Nav2 ROS2 action 客户端占位，永远为 None，
+        仅作为外部 getattr 兼容字段保留）。任何依赖该 fallback 的路径将收到
+        `RUNTIME_NOT_READY` 错误，不再静默走旧链路。
         """
         if not self._is_geometry_profile_enabled():
             return None
         remote = getattr(self, "_remote_provider", None)
         if remote is not None and getattr(remote, "is_connected", False):
             return remote
-        return getattr(self, "_nav2_action_provider", None)
+        # Phase 0 硬隔离：删除 Nav2 fallback，调用方需显式处理 None。
+        return None
 
     def _resolve_exploration_backend(self):
+        """解析平台正式探索后端。
+
+        去 ROS2 目标态（Phase 0 硬隔离）：默认路径**不**返回
+        `_platform_exploration_runtime`（Python 旧探索状态机，已迁为
+        `legacy_exploration_placeholder`，仅供显式 legacy/manual 诊断或
+        单测 harness 使用）。默认优先返回 `_remote_provider`
+        (GeometryRuntimeProvider) 通过 gRPC facade 走 Rust explore_runtime。
+        remote provider 不可用时返回 None（调用方收到 RUNTIME_NOT_READY）。
+        """
         if not self._is_geometry_profile_enabled():
             return None
-        backend = getattr(self, "_platform_exploration_runtime", None)
-        if backend is not None:
-            return backend
+        remote = getattr(self, "_remote_provider", None)
+        if remote is not None and getattr(remote, "is_connected", False):
+            return remote
+        # Phase 0 硬隔离：不再静默走 Python 旧探索状态机；只允许显式 legacy/manual
+        # 入口通过 `_legacy_exploration_placeholder` 引用（不通过本方法）。
         return self._resolve_backend(ExplorationDataPlane, ExplorationProvider)
 
     def _safe_map_dir(self, map_name: str) -> Path:

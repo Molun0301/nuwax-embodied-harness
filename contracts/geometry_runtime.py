@@ -232,6 +232,11 @@ class LcmChannelConfig:
     goal_pose: str = "/nav/goal#geometry_msgs.PoseStamped"
     frontier: str = "/explore/frontiers#nuwax_msgs.FrontierList"
     cloud_map: str = "/cloud_map#sensor_msgs.PointCloud2"
+    # Phase 1 channel registry 补齐 4 类 typed channel。
+    # - pose_stamped:geometry_msgs/PoseStamped（独立于 /odom,用于外部位姿注入）
+    # - nav_cancel:nuwax_msgs/CancelNavigation（nav 取消命令专用通道）
+    pose_stamped: str = "/pose_stamped#geometry_msgs.PoseStamped"
+    nav_cancel: str = "/nav/cancel#nuwax_msgs.CancelNavigation"
 
 
 @dataclass

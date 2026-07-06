@@ -402,6 +402,15 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_LCM_CHANNEL_GOAL_POSE": "goal_pose LCM channel",
     "NUWAX_LCM_CHANNEL_FRONTIER": "frontier LCM channel",
     "NUWAX_LCM_CHANNEL_CLOUD_MAP": "cloud_map LCM channel",
+    # Phase 1 channel registry 补齐:typed channel for PoseStamped 和 CancelNavigation。
+    "NUWAX_LCM_CHANNEL_POSE_STAMPED": "pose_stamped LCM channel（geometry_msgs/PoseStamped）",
+    "NUWAX_LCM_CHANNEL_NAV_CANCEL": "nav_cancel LCM channel（nuwax_msgs/CancelNavigation）",
+    # Phase 1:runtime 进程解析的 typed channel env key(直接被 Rust main.rs 读取,
+    # 不通过 contracts/geometry_runtime.py 间接消费)。
+    "NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL": "runtime pose_stamped typed channel",
+    "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL": "runtime odom typed channel（与 NUWAX_LCM_CHANNEL_ODOM 等价别名）",
+    "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL": "runtime cmd_vel typed channel",
+    "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL": "runtime nav_cancel typed channel",
 
     # 感知·检测与跟踪
     "NUWAX_PERCEPTION_YOLO_WORLD_CONFIDENCE": "YOLO-World 置信度阈值",

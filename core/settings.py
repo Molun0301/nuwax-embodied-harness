@@ -906,6 +906,15 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "NUWAX_LCM_CHANNEL_CLOUD_MAP",
                 "/cloud_map#sensor_msgs.PointCloud2",
             ),
+            # Phase 1 channel registry 补齐 4 类 typed channel
+            pose_stamped=_cfg_str(
+                "NUWAX_LCM_CHANNEL_POSE_STAMPED",
+                "/pose_stamped#geometry_msgs.PoseStamped",
+            ),
+            nav_cancel=_cfg_str(
+                "NUWAX_LCM_CHANNEL_NAV_CANCEL",
+                "/nav/cancel#nuwax_msgs.CancelNavigation",
+            ),
         ),
     )
 

@@ -3999,63 +3999,6 @@ class PlatformGeometryRuntime:
                 return candidate
         return None
 
-    def _invoke_ros2_service_call(
-        self,
-        *,
-        service_name: str,
-        service_type: str,
-        request: str,
-        timeout_sec: float = 8.0,
-    ) -> Dict[str, object]:
-        """对当前 ROS2 环境发一次 `ros2 service call` 同步请求。"""
-
-        command = self._build_launch_prefix() + [
-            "ros2",
-            "service",
-            "call",
-            service_name,
-            service_type,
-            request,
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=max(2.0, float(timeout_sec)),
-            )
-        except subprocess.TimeoutExpired as exc:
-            return {
-                "ok": False,
-                "service": service_name,
-                "service_type": service_type,
-                "request": request,
-                "error": "timeout",
-                "timeout_sec": exc.timeout,
-                "command": command,
-            }
-        except FileNotFoundError as exc:
-            return {
-                "ok": False,
-                "service": service_name,
-                "service_type": service_type,
-                "request": request,
-                "error": "ros2_cli_unavailable",
-                "message": str(exc),
-                "command": command,
-            }
-        return {
-            "ok": completed.returncode == 0,
-            "service": service_name,
-            "service_type": service_type,
-            "request": request,
-            "returncode": completed.returncode,
-            "stdout_tail": (completed.stdout or "").strip().splitlines()[-5:],
-            "stderr_tail": (completed.stderr or "").strip().splitlines()[-5:],
-            "command": command,
-        }
-
     def _activate_backend_map_version(
         self,
         version: MapVersion,

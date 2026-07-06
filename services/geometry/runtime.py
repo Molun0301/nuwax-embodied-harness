@@ -68,7 +68,12 @@ _EXTERNAL_EXPLORATION_LOG_SCAN_MIN_INTERVAL_SEC = 2.0
 _GEOMETRY_SIDE_CAR_RESTART_LIMIT = 2
 _GEOMETRY_MONITOR_INTERVAL_SEC = 1.0
 _GEOMETRY_STREAMING_WINDOW_SEC = 3.0
-_EXTERNAL_GEOMETRY_STACKS = {"external_slam_nav2"}
+# 目标态：平台几何运行时由 Rust nuwax-geometry-runtime 子进程 + gRPC + LCM 驱动。
+# 旧 GO2_RTABNAV2 (external_slam_nav2) 单链路已下线，手动建图/探索/定位仍以脚本形式受
+# `start_external_mapping` / `_start_external_script_exploration` / `_launch_external_localization`
+# 拉起，保留常量作为兼容锚点（参见 contracts/geometry_runtime.py GEOMETRY_STACK_NAME）。
+_GEOMETRY_STACK_NAME = "nuwax_geometry_runtime"
+# 兼容旧 rtabmap 数据库资产名（保留以支持历史 checkpoint 探测，新数据走 <map_name>.db）
 _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME = "external_slam_nav2_state.db"
 _MAIN_LOG_APPEND_LOCK = threading.Lock()
 _GO2_SH_MAIN_LOG_LOGGER = "nuwax_robot_bridge.geometry.go2.sh"
@@ -545,20 +550,20 @@ class PlatformGeometryRuntime:
             self._set_runtime_state("disabled", "平台几何运行时或几何 profile 已禁用。")
             return
         try:
-            self._set_runtime_state("preflight", "正在检查外部 SLAM/Nav2 脚本、话题与 TF 配置。")
+            self._set_runtime_state("preflight", "正在检查 nuwax-geometry-runtime 二进制、gRPC 端口与 LCM 通道配置。")
             preflight_errors = self._run_preflight_checks()
             if preflight_errors:
                 message = "平台几何运行时预检失败：" + "；".join(preflight_errors)
                 self._set_runtime_state("failed", message, blocked=True)
                 # Phase 3 目标态：不再 raise，平台几何运行时失败交由 monitor 与 web 仪表呈现。
                 return
-            if not self._uses_external_geometry_stack():
-                raise RuntimeError(self._removed_internal_stack_message())
-            self._set_runtime_state("starting_external", "正在启动外部 SLAM/Nav2 几何脚本。")
+            self._set_runtime_state("starting_external", "正在启动 nuwax-geometry-runtime 子进程并建立 gRPC 连接。")
             self._start_geometry_runtime_subprocess()
             self._ensure_external_geometry_observers_started()
-            self._start_required_processes()
-            self._set_runtime_state("starting_external", "外部 SLAM/Nav2 几何脚本已启动，等待 /map_obstacles、TF 与 Nav2 action。")
+            self._set_runtime_state(
+                "starting_external",
+                "nuwax-geometry-runtime 子进程已启动，等待 gRPC HealthCheck/READY 与 LCM 通道。",
+            )
             self._start_monitor_thread()
         except Exception as exc:
             self._record_runtime_diagnostic("geometry_start", exc)
@@ -627,15 +632,27 @@ class PlatformGeometryRuntime:
         return self._repo_root() / "runtime_data" / "geometry" / "logs"
 
     def _geometry_stack(self) -> str:
-        return "external_slam_nav2"
+        # 目标态固定返回 nuwax_geometry_runtime（与 contracts/geometry_runtime.py GEOMETRY_STACK_NAME 对齐）。
+        # 旧 external_slam_nav2 字符串保留在 _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME / 兼容 checkpoint 探测中。
+        return _GEOMETRY_STACK_NAME
 
     def _uses_external_geometry_stack(self) -> bool:
-        return True
+        # 目标态：平台几何运行时由 nuwax-geometry-runtime 子进程承担；start/preflight/ready
+        # 链路不再走外部 SLAM/Nav2 脚本。手动 mapping/explore/localization 仍用
+        # `start_external_mapping` / `_start_external_script_exploration` / `_launch_external_localization`
+        # 走外部脚本，但它们不再受此标志门控（启动路径已显式使用 go2.sh 命令构造）。
+        # 保留方法名是为了兼容历史 caller 的导入和诊断信息，逻辑上始终返回 False。
+        return False
 
     def _removed_internal_stack_message(self) -> str:
-        return "当前运行时固定使用 external_slam_nav2（RTAB-Map + Nav2 action）单链路。"
+        # 目标态不再使用旧 RTAB-Map + Nav2 action 单链路；保留方法是给历史 caller 返回可读诊断。
+        return "当前运行时已切换到 nuwax-geometry-runtime + gRPC + LCM 链路；旧 RTAB-Map + Nav2 action 单链路已下线。"
 
     def _external_process_name(self) -> str:
+        # 默认进程名沿用旧 external_slam_nav2 字符串：手动 mapping/explore/localization
+        # 仍以子进程形式拉起（start_external_mapping / _start_external_script_exploration /
+        # _launch_external_localization），其 _managed_processes 注册键保留历史字符串以
+        # 兼容 start_gateway.sh / log scrubber / debug_panel 的过滤规则。
         name = str(getattr(self.config.external, "process_name", "") or "").strip()
         return name or "external_slam_nav2"
 
@@ -851,53 +868,72 @@ class PlatformGeometryRuntime:
         return bool(getattr(self.config.external, "platform_cmd_vel_bridge_enabled", False))
 
     def _run_preflight_checks(self) -> List[str]:
-        if self._uses_external_geometry_stack():
-            return self._run_external_geometry_preflight_checks()
-        return [self._removed_internal_stack_message()]
+        # 目标态：主预检检查 nuwax-geometry-runtime 子进程可达性；
+        # 旧 ROS2 launch / odom_tf_bridge.sh / ros2 命令探测已全部下线。
+        return self._run_geometry_runtime_preflight_checks()
 
-    def _run_external_geometry_preflight_checks(self) -> List[str]:
+    def _run_geometry_runtime_preflight_checks(self) -> List[str]:
+        """平台几何运行时预检：nuwax-geometry-runtime 二进制 + gRPC 端口 + LCM 通道配置。
+
+        返回错误列表；空列表表示预检通过。
+        """
+        import socket
+
         errors: List[str] = []
-        if not bool(getattr(self.config.external, "enabled", True)):
-            errors.append("external_slam_nav2 单链路需要启用外部 SLAM/Nav2 脚本。")
-        raw_script_path = str(getattr(self.config.external, "script_path", "") or "").strip()
-        script_path = self._external_script_path()
-        if not raw_script_path:
-            errors.append("缺少外部 SLAM/Nav2 script 配置 NUWAX_GEOMETRY_EXTERNAL_SCRIPT")
-        elif not script_path.exists():
-            errors.append("外部 SLAM/Nav2 script 不存在 %s" % script_path)
-        elif not script_path.is_file():
-            errors.append("外部 SLAM/Nav2 script 不是文件 %s" % script_path)
-        elif not os.access(script_path, os.X_OK):
-            errors.append("外部 SLAM/Nav2 script 不可执行 %s" % script_path)
-        if self._external_input_bridge_enabled() or self._platform_odom_tf_bridge_enabled():
-            launch_script = self._geometry_script("launch_ros2_stack.sh")
-            if not launch_script.exists():
-                errors.append("缺少 ROS2 环境启动脚本 %s，无法启动可选 odom/TF 桥。" % launch_script)
-            odom_bridge_script = self._geometry_script("odom_tf_bridge.py")
-            if not odom_bridge_script.exists():
-                errors.append("缺少 odom TF bridge 脚本 %s，无法启动可选 odom/TF 桥。" % odom_bridge_script)
-            setup_script = Path(str(getattr(self.config, "setup_script", "") or "")).expanduser()
-            # Phase 3 目标态：不再探测 /opt/ros/* setup.bash；可选 odom/TF 桥由 setup_script 单独控制。
-            ros_setup_available = setup_script.exists()
-            if not setup_script.exists():
-                LOGGER.info(
-                    "geometry setup_script 未配置，可选 odom/TF 桥不启用（目标态为 nuwax-geometry-runtime 内置桥）。"
+        runtime_binary = str(
+            getattr(self.config, "runtime_binary", "")
+            or getattr(self.config.external, "binary_path", "")
+            or ""
+        ).strip()
+        if runtime_binary:
+            binary_path = Path(runtime_binary).expanduser()
+            if not binary_path.exists():
+                errors.append("nuwax-geometry-runtime 二进制不存在 %s" % binary_path)
+            elif not binary_path.is_file():
+                errors.append("nuwax-geometry-runtime 二进制不是文件 %s" % binary_path)
+            elif not os.access(binary_path, os.X_OK):
+                errors.append("nuwax-geometry-runtime 二进制不可执行 %s" % binary_path)
+        else:
+            LOGGER.info(
+                "nuwax-geometry-runtime binary 未配置（NUWAX_GEOMETRY_RUNTIME_BINARY），"
+                "依赖 GeometryRuntimeSubprocess 默认路径解析。"
+            )
+        runtime_port = int(
+            getattr(self.config, "runtime_port", 0)
+            or getattr(self.config.external, "port", 0)
+            or 0
+        )
+        # 仅当显式配置了非零端口时主动探测端口空闲；attach 模式下 Subprocess 自行处理端口复用。
+        if runtime_port > 0:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.5)
+                    connect_result = sock.connect_ex(("127.0.0.1", runtime_port))
+                    if connect_result == 0:
+                        LOGGER.info(
+                            "nuwax-geometry-runtime gRPC 端口 %s 已被占用，"
+                            "尝试 attach 现有子进程；attach 失败将自动 spawn 新实例。",
+                            runtime_port,
+                        )
+            except OSError as exc:
+                errors.append(
+                    "探测 nuwax-geometry-runtime gRPC 端口 %s 失败：%s" % (runtime_port, exc)
                 )
-            if shutil.which("ros2") is None and not ros_setup_available:
-                errors.append("未找到 ros2 命令或 geometry setup script，无法启动可选 odom/TF 桥。")
-        required_topics = {
-            "occupancy_topic": self.config.topics.occupancy_topic,
-            "cost_map_topic": self.config.topics.cost_map_topic,
-            "tf_topic": self.config.topics.tf_topic,
-            "tf_static_topic": self.config.topics.tf_static_topic,
-        }
-        if self._external_point_cloud_bridge_enabled():
-            required_topics["point_cloud_topic"] = self.config.topics.point_cloud_topic
-        if self._external_input_bridge_enabled():
-            required_topics["odom_topic"] = self.config.topics.odom_topic
-        for name, value in required_topics.items():
-            if not str(value or "").strip():
-                errors.append("缺少外部 SLAM/Nav2 topic 配置 %s" % name)
+        ready_file = str(
+            getattr(self.config, "runtime_ready_file", "")
+            or getattr(self.config.external, "ready_file", "")
+            or ""
+        ).strip()
+        if not ready_file:
+            errors.append("缺少 nuwax-geometry-runtime ready_file 配置 NUWAX_GEOMETRY_RUNTIME_READY_FILE")
+        lcm_url = str(getattr(self.config, "lcm_url", "") or "").strip()
+        lcm_backend = str(getattr(self.config, "lcm_backend", "") or "").strip()
+        if not lcm_url:
+            errors.append("缺少 LCM url 配置 NUWAX_LCM_URL（nuwax-geometry-runtime 启动依赖）")
+        if lcm_backend and lcm_backend not in {"native", "real-lcm"}:
+            errors.append(
+                "LCM backend 配置 %s 非法；目标态仅支持 native / real-lcm。" % lcm_backend
+            )
         required_frames = {
             "map_frame": self.config.frames.map_frame,
             "odom_frame": self.config.frames.odom_frame,
@@ -905,62 +941,17 @@ class PlatformGeometryRuntime:
         }
         for name, value in required_frames.items():
             if not str(value or "").strip():
-                errors.append("缺少外部 SLAM/Nav2 TF frame 配置 %s" % name)
+                errors.append("缺少 TF frame 配置 %s" % name)
         return errors
 
     def _start_required_processes(self) -> None:
-        if not self._uses_external_geometry_stack():
-            message = self._removed_internal_stack_message()
-            self._record_runtime_diagnostic("removed_internal_rtabmap_stack", message)
-            raise RuntimeError(message)
-        platform_odom_tf_bridge_enabled = self._platform_odom_tf_bridge_enabled()
-        platform_cmd_vel_bridge_enabled = self._platform_cmd_vel_bridge_enabled()
-        if platform_odom_tf_bridge_enabled:
-            self._start_managed_process(
-                "external_odom_tf_bridge",
-                self._build_odom_tf_bridge_command(),
-                "external_odom_tf_bridge.log",
-            )
-        external_command = self._build_external_geometry_command()
-        # 如果外部脚本未配置 mode 标志（如 go2.sh 无 --explore/--localization），
-        # 不自动启动外部几何进程，避免默认进入 manual mapping 模式。
-        if not self._command_has_mode_flag(external_command):
-            self._record_runtime_diagnostic(
-                "external_slam_nav2_skipped",
-                "外部 SLAM/Nav2 脚本未配置 mode 标志，平台启动时不自动启动 go2.sh（mapping 为手动建图专用）。",
-            )
-        else:
-            self._start_managed_process(
-                self._external_process_name(),
-                external_command,
-                self._external_log_name(),
-            )
-        if platform_cmd_vel_bridge_enabled:
-            # Phase 3 目标态：ROS2 cmd_vel 桥已删除（services/geometry/cmd_vel_bridge.py）。
-            # 速度命令改由 native geometry runtime 通过 LCM channel `/cmd_vel#geometry_msgs.Twist` 推
-            # （参见 docs/开发文档/.../00_执行方案.md §2.3 / §3.4）。此处保留开关位与日志，便于
-            # 业务侧判断是否启用平台内建速度桥；启用时只是 no-op + 告警，不再创建 rclpy 节点。
-            LOGGER.warning(
-                "platform_cmd_vel_bridge_enabled=true 但 ROS2 cmd_vel 桥已下线，"
-                "速度命令改由 nuwax-geometry-runtime / LCM channel 推送，"
-                "平台内建桥不再启动。"
-            )
-        if self._external_input_bridge_enabled():
-            self._start_geometry_runtime_subprocess()
-            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台启动 ROS2 odom/点云输入桥，不启动内置 RTAB-Map/Nav2。"
-        elif self._external_point_cloud_bridge_enabled():
-            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台只启动 ROS2 点云输入桥，跳过 odom/odom_tf_bridge。"
-        else:
-            bridge_message = "外部 SLAM/Nav2 脚本托管启动；平台跳过 odom_tf_bridge/cmd_vel_bridge 与内置 RTAB-Map/Nav2。"
-        if platform_odom_tf_bridge_enabled or platform_cmd_vel_bridge_enabled:
-            bridge_message += " 平台兼容桥启用：odom_tf=%s, cmd_vel=%s。" % (
-                platform_odom_tf_bridge_enabled,
-                platform_cmd_vel_bridge_enabled,
-            )
-        self._record_runtime_diagnostic(
-            "external_slam_nav2",
-            bridge_message,
+        # 目标态：平台几何运行时启动链路已切到 `_start_geometry_runtime_subprocess()` +
+        # `_ensure_external_geometry_observers_started()`；旧 ROS2 odom_tf_bridge / cmd_vel_bridge /
+        # 外部 SLAM/Nav2 脚本兼容启动入口已下线，保留本方法为 no-op shim 以兼容历史 caller 的引用。
+        LOGGER.debug(
+            "_start_required_processes 已下线为目标态 no-op；请改用 _start_geometry_runtime_subprocess。"
         )
+        return None
 
     def _start_monitor_thread(self) -> None:
         if self._runtime_monitor_thread is not None and self._runtime_monitor_thread.is_alive():
@@ -973,25 +964,15 @@ class PlatformGeometryRuntime:
         self._runtime_monitor_thread.start()
 
     def _build_launch_prefix(self) -> List[str]:
-        return ["bash", str(self._geometry_script("launch_ros2_stack.sh"))]
+        # 目标态：launch_ros2_stack.sh + bash 前缀已下线（不再有 /opt/ros 探测）。
+        # 保留方法为 no-op shim 以兼容历史 caller；platform 启动走 _start_geometry_runtime_subprocess。
+        return []
 
     def _build_odom_tf_bridge_command(self) -> List[str]:
-        # 平台内部 odom 源由 odometry_publisher 写入固定 frame，使用「锁定值」语义；
-        # 外部 SLAM/Nav2 切换命名时由配置驱动，不靠 bridge 静默兜底。
-        return self._build_launch_prefix() + [
-            "python3",
-            str(self._geometry_script("odom_tf_bridge.py")),
-            "--odom-topic",
-            str(self.config.topics.odom_topic),
-            "--odom-frame",
-            str(self.config.frames.odom_frame),
-            "--default-odom-frame",
-            str(self.config.frames.odom_frame),
-            "--default-child-frame",
-            str(self.config.frames.base_frame),
-            "--child-frame",
-            str(self.config.frames.base_frame),
-        ]
+        # 目标态：odom_tf_bridge.py + odom/cmd_vel 兼容桥已下线（外部 SLAM/Nav2 不再
+        # 通过独立 Python 进程转译 ROS2 话题；nuwax-geometry-runtime 子进程内置 LCM channel
+        # 处理）。保留方法为 no-op shim 以兼容历史 caller。
+        return []
 
     def _start_managed_process(self, name: str, command: List[str], log_name: str, *, restart: bool = False) -> None:
         current = self._managed_processes.get(name)
@@ -1206,62 +1187,100 @@ class PlatformGeometryRuntime:
             self._record_runtime_diagnostic("process_failed", "%s exit_code=%s\n%s" % (name, exit_code, process.last_error or ""))
 
     def _advance_runtime_state_from_inputs(self) -> None:
+        # 目标态：runtime ready 由 nuwax-geometry-runtime 子进程存活 + gRPC HealthCheck/READY +
+        # LCM 通道订阅状态驱动，不再围绕外部 SLAM/Nav2 脚本、`/map_obstacles`、Nav2 action 推进。
         if not self._runtime_started or not self._is_geometry_profile_enabled():
             return
-        if not self._uses_external_geometry_stack():
-            self._set_runtime_state("failed", self._removed_internal_stack_message(), blocked=True)
+        bridge_alive = bool(
+            self._geometry_runtime_subprocess is not None
+            and self._geometry_runtime_subprocess.is_running
+        )
+        if not bridge_alive:
+            self._set_runtime_state(
+                "waiting_bridge",
+                "等待 nuwax-geometry-runtime 子进程启动。",
+            )
             return
-        process_failure = self._blocking_process_failure()
-        if process_failure:
-            self._set_runtime_state("failed", process_failure, blocked=True)
+        provider_connected = bool(
+            self._remote_provider is not None
+            and getattr(self._remote_provider, "is_connected", lambda: False)()
+        )
+        if not provider_connected:
+            self._set_runtime_state(
+                "waiting_bridge",
+                "nuwax-geometry-runtime 子进程已启动，等待 gRPC 连接。",
+            )
+            return
+        health_ok, health_message = self._probe_geometry_runtime_health()
+        if not health_ok:
+            self._set_runtime_state(
+                "waiting_bridge",
+                "等待 nuwax-geometry-runtime gRPC HealthCheck.healthy=True：%s"
+                % (health_message or "health check pending"),
+            )
             return
         live_map_status = self._clone_metadata(self._geometry_runtime_status_stub("live_map_provider"))
         tf_localization_status = self._clone_metadata(self._geometry_runtime_status_stub("tf_localization_provider"))
-        odometry_status = self._clone_metadata(self._geometry_runtime_status_stub("odometry_publisher"))
-        point_cloud_status = self._clone_metadata(self._geometry_runtime_status_stub("point_cloud_publisher"))
-        point_cloud_source = self._build_point_cloud_source_status()
-        data_plane_status = self._build_data_plane_status()
         self._update_stream_tracker(live_map_status)
         readiness = self._build_rtabmap_readiness(
             live_map_status=live_map_status,
             tf_localization_status=tf_localization_status,
-            odometry_status=odometry_status,
-            point_cloud_status=point_cloud_status,
-            point_cloud_source=point_cloud_source,
-            data_plane_status=data_plane_status,
         )
-        if not bool(readiness.get("go2_odom_ready")):
-            self._set_runtime_state("waiting_input_bridge", str(readiness.get("message") or "等待外部 SLAM/Nav2 输入桥。"))
-            return
         if not bool(readiness.get("first_frame_ready")):
-            self._set_runtime_state("waiting_map", str(readiness.get("message") or "等待外部 SLAM/Nav2 /map_obstacles 首帧。"))
+            self._set_runtime_state(
+                "waiting_map",
+                str(readiness.get("message") or "等待 nuwax-geometry-runtime 推送首帧占据栅格。"),
+            )
             return
         if bool(readiness.get("streaming_required")) and not bool(readiness.get("streaming_ready")):
-            self._set_runtime_state("first_frame", str(readiness.get("message") or "外部 SLAM/Nav2 已发布 /map_obstacles 首帧，正在确认连续流式更新。"))
+            self._set_runtime_state(
+                "first_frame",
+                str(readiness.get("message") or "nuwax-geometry-runtime 已发布首帧，正在确认连续流式更新。"),
+            )
             return
         exploration_state = self.get_platform_exploration_state()
         if getattr(exploration_state.status, "value", exploration_state.status) in {
             ExplorationStatus.ACCEPTED.value,
             ExplorationStatus.RUNNING.value,
         }:
-            explore_message = exploration_state.message or "GO2_RTABNAV2 原生探索任务运行中。"
+            explore_message = exploration_state.message or "平台探索任务运行中（外部脚本由 start_external_mapping 拉起）。"
             self._set_runtime_state("exploring", explore_message)
             return
         if not bool(readiness.get("localization_ready")):
-            self._set_runtime_state("streaming", str(readiness.get("message") or "地图首帧已就绪，等待外部 SLAM/Nav2 定位与 TF。"))
+            self._set_runtime_state(
+                "streaming",
+                str(readiness.get("message") or "地图首帧已就绪，等待 nuwax-geometry-runtime 定位与 TF。"),
+            )
             return
-        nav2_status = self._build_nav2_status()
-        nav2_phase = str(nav2_status.get("phase") or "")
-        if nav2_phase == "starting":
-            self._set_runtime_state("starting_nav2", "正在等待外部 Nav2 action 可用。")
-            return
-        if nav2_phase == "failed":
-            self._set_runtime_state("failed", str(nav2_status.get("message") or "外部 Nav2 action 失败。"), blocked=True)
-            return
-        if nav2_phase != "ready":
-            self._set_runtime_state("streaming", "外部 SLAM/Nav2 地图 streaming 与 TF 已就绪；Nav2 状态：%s。" % nav2_status.get("phase"))
-            return
-        self._set_runtime_state("ready", "外部 SLAM/Nav2 地图 streaming、TF 与 Nav2 action 均已就绪。")
+        self._set_runtime_state(
+            "ready",
+            "nuwax-geometry-runtime gRPC HealthCheck、地图 streaming 与 TF 链均已就绪。",
+        )
+
+    def _probe_geometry_runtime_health(self) -> Tuple[bool, str]:
+        """探测 nuwax-geometry-runtime gRPC HealthCheck.healthy 与 GetStatus 状态。
+
+        返回 (ok, message)：
+        - ok=True: bridge 可用，message 为附加诊断（可能为空）
+        - ok=False: bridge 不可用，message 给出原因
+        """
+        provider = self._remote_provider
+        if provider is None:
+            return False, "GeometryRuntimeProvider 未连接"
+        try:
+            status = provider.get_status()
+        except Exception as exc:  # pragma: no cover - gRPC 健康探测容错
+            return False, "GetStatus RPC 失败：%s" % exc
+        if not isinstance(status, dict):
+            return False, "GetStatus 返回非 dict：%r" % (status,)
+        phase = str(status.get("phase") or "").strip()
+        # target runtime state machine: BOOTING/STARTING/READY/FAILED
+        if phase == "FAILED":
+            message = str(status.get("message") or "nuwax-geometry-runtime 上报 FAILED")
+            return False, message
+        if phase and phase not in {"READY", "RUNNING", "STARTING", "BOOTING", ""}:
+            return False, "nuwax-geometry-runtime 未知状态 phase=%s" % phase
+        return True, str(status.get("message") or "")
 
     def _blocking_process_failure(self) -> Optional[str]:
         for name, process in self._managed_processes.items():
@@ -1301,20 +1320,85 @@ class PlatformGeometryRuntime:
                 point_cloud_source=point_cloud_source,
                 data_plane_status=data_plane_status,
             )
-        message = self._removed_internal_stack_message()
+        return self._build_geometry_runtime_readiness(
+            live_map_status=live_map_status,
+            tf_localization_status=tf_localization_status,
+            odometry_status=odometry_status,
+            point_cloud_status=point_cloud_status,
+            point_cloud_source=point_cloud_source,
+            data_plane_status=data_plane_status,
+        )
+
+    def _build_geometry_runtime_readiness(
+        self,
+        *,
+        live_map_status: Dict[str, object],
+        tf_localization_status: Dict[str, object],
+        odometry_status: Optional[Dict[str, object]] = None,
+        point_cloud_status: Optional[Dict[str, object]] = None,
+        point_cloud_source: Optional[Dict[str, object]] = None,
+        data_plane_status: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        """目标态 readiness 聚合：nuwax-geometry-runtime gRPC + 观察器 + LCM 通道。
+
+        与 _build_external_geometry_readiness 的差异：
+        - 不再以外部 SLAM/Nav2 脚本 + odom_tf_bridge 进程 + /map_obstacles 为主信号；
+        - 改为：live_map_status.occupancy_grid_ready（观察器首帧） +
+          self._map_stream_tracker.streaming（连续流式更新） +
+          tf_chain.ready（map→odom→base TF 链）+ bridge alive + HealthCheck.healthy。
+        """
+        odometry_status = odometry_status or self._clone_metadata(self._geometry_runtime_status_stub("odometry_publisher"))
+        point_cloud_status = point_cloud_status or self._clone_metadata(self._geometry_runtime_status_stub("point_cloud_publisher"))
+        point_cloud_source = point_cloud_source or self._build_point_cloud_source_status()
+        data_plane_status = data_plane_status or self._build_data_plane_status()
         map_stream = dict(self._map_stream_tracker)
         tf_chain = self._build_tf_chain_status(tf_localization_status=tf_localization_status)
+        first_frame_ready = bool(
+            live_map_status.get("occupancy_grid_ready")
+            and int(live_map_status.get("occupancy_message_count") or 0) > 0
+            and live_map_status.get("occupancy_has_publisher") is not False
+        )
+        localization_process = bool(
+            self._external_geometry_process_is_localization()
+            or str((self._last_activation_result or {}).get("backend_mode") or "") == "rtabmap_localization"
+        )
+        streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
+        streaming_required = not localization_process
+        map_ready = bool(first_frame_ready and (streaming_ready or not streaming_required))
+        localization_ready = bool(map_ready and tf_chain.get("ready"))
+        bridge_alive, health_message = self._probe_geometry_runtime_health()
+        if not bridge_alive:
+            message = "等待 nuwax-geometry-runtime gRPC HealthCheck：%s" % (health_message or "pending")
+            waiting_for = "geometry_runtime_health"
+        elif not first_frame_ready:
+            message = "等待 nuwax-geometry-runtime 推送首帧占据栅格。"
+            waiting_for = "geometry_runtime_first_frame"
+        elif streaming_required and not streaming_ready:
+            message = "nuwax-geometry-runtime 已发布首帧，正在确认连续流式更新。"
+            waiting_for = "geometry_runtime_streaming"
+        elif not tf_chain.get("ready"):
+            message = "等待 nuwax-geometry-runtime 推送 map→odom→base TF 链。"
+            waiting_for = "geometry_runtime_tf"
+        else:
+            message = "nuwax-geometry-runtime gRPC HealthCheck、地图 streaming 与 TF 链均已就绪。"
+            waiting_for = None
         return {
-            "ready": False,
-            "go2_odom_ready": False,
-            "input_bridge_ready": False,
-            "first_frame_ready": False,
-            "streaming_ready": False,
-            "localization_ready": False,
+            "ready": localization_ready,
+            "go2_odom_ready": bridge_alive,
+            "input_bridge_ready": bridge_alive,
+            "first_frame_ready": first_frame_ready,
+            "streaming_ready": streaming_ready,
+            "streaming_required": streaming_required,
+            "map_ready": map_ready,
+            "localization_ready": localization_ready,
             "relocalization_ready": False,
-            "waiting_for": "external_slam_nav2_stack",
+            "waiting_for": waiting_for,
             "message": message,
-            "removed_internal_stack": True,
+            "removed_internal_stack": False,
+            "geometry_runtime_health": {
+                "alive": bridge_alive,
+                "message": health_message,
+            },
             "map_stream": map_stream,
             "tf_chain": tf_chain,
             "tf_localization_provider": self._clone_metadata(tf_localization_status),

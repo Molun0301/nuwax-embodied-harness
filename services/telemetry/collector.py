@@ -34,18 +34,14 @@ except Exception:  # pragma: no cover - 仅在未安装 psutil 的环境触发
 
 TELEMETRY_LOGGER = logging.getLogger("nuwax_robot_bridge.telemetry")
 
-# 默认通用进程关键字集：覆盖网关与常见 ROS/导航/建图组件，按 cmdline 子串匹配。
+# 默认通用进程关键字集：覆盖网关与 native runtime / 导航栈 / LCM runtime / 视频推流组件，按 cmdline 子串匹配。
 # 不绑定任何机器人型号；“python” 因过宽（会误纳无关解释器进程）被刻意排除。
 _DEFAULT_PROCESS_KEYWORDS = (
     "gateway",
-    "rtabmap",
-    "nav2",
-    "robot_bridge",
-    "ros2",
-    "go2_slam_nav",
-    "go2_rtabnav2",
-    "explore_lite",
-    "explore_node",
+    "nuwax-geometry-runtime",
+    "nuwax-nav-stack",
+    "nuwax-lcm-runtime",
+    "go2_video_streamer",
 )
 _CMDLINE_SENSITIVE_KEY_RE = re.compile(
     r"(?i)(--?(?:token|api[_-]?key|secret|password|access[_-]?key|authorization|cookie)(?:=|\s+))(?:Bearer\s+)?([^\s]+)"
@@ -68,7 +64,7 @@ _PROCESS_PATTERNS: Sequence[tuple[str, str, str]] = (
     ("geometry_runtime", "Native geometry runtime", "nuwax-geometry-runtime"),
     ("geometry_external", "统一几何服务", "nuwax-geometry-external"),
     ("rtabmap_live", "RTAB-Map 建图", "nuwax-rtabmap-live"),
-    ("nav2", "Nav2 导航", "nuwax-nav2"),
+    ("nav_stack", "Native 导航栈", "nuwax-nav-stack"),
     ("static_tf", "静态 TF", "nuwax-static-tf"),
     ("go2_video_streamer", "Go2 视频推流", "nuwax-go2-video-streamer"),
     ("gateway_web", "网关 Web 服务", "uvicorn gateways.app:create_gateway_app_from_env"),

@@ -514,7 +514,13 @@ class GatewayServerConfig:
     # 性能监控（CPU/内存/进程）采集配置（平台侧，通用不绑定机器人）。
     telemetry_enabled: bool = True
     telemetry_interval_sec: float = 2.0
-    telemetry_process_keywords: Tuple[str, ...] = ("gateway", "rtabmap", "nav2", "robot_bridge", "ros2")
+    telemetry_process_keywords: Tuple[str, ...] = (
+        "gateway",
+        "nuwax-geometry-runtime",
+        "nuwax-nav-stack",
+        "nuwax-lcm-runtime",
+        "go2_video_streamer",
+    )
     telemetry_include_process_tree: bool = True
 
 
@@ -886,7 +892,13 @@ def load_config() -> NuwaxRobotBridgeConfig:
         telemetry_interval_sec=max(0.5, _cfg_float("NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC", 2.0)),
         telemetry_process_keywords=_cfg_csv(
             "NUWAX_GATEWAY_TELEMETRY_PROCESS_KEYWORDS",
-            ("gateway", "rtabmap", "nav2", "robot_bridge", "ros2"),
+            (
+                "gateway",
+                "nuwax-geometry-runtime",
+                "nuwax-nav-stack",
+                "nuwax-lcm-runtime",
+                "go2_video_streamer",
+            ),
         ),
         telemetry_include_process_tree=_cfg_bool("NUWAX_GATEWAY_TELEMETRY_INCLUDE_PROCESS_TREE", True),
     )

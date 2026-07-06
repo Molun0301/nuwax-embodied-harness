@@ -27,7 +27,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_client")
 
@@ -60,11 +60,17 @@ class GeometryRuntimeSubprocess:
         self,
         binary_path: Optional[str] = None,
         port: int = _DEFAULT_PORT,
-        ros_distro: str = "humble",
+        **_legacy_kwargs: Any,
     ) -> None:
+        # 历史兼容：旧调用方可能传 ros_distro / 等 ROS2 概念参数；
+        # 现 nuwax-geometry-runtime 不再依赖 ROS2 distro，按 **_legacy_kwargs 吞掉即可。
+        if _legacy_kwargs:
+            LOGGER.debug(
+                "GeometryRuntimeSubprocess 已忽略历史参数: %s",
+                sorted(_legacy_kwargs.keys()),
+            )
         self._binary_path = self._resolve_binary(binary_path)
         self._port = port
-        self._ros_distro = ros_distro
         self._process: Optional[subprocess.Popen] = None
         self._ready_file: Optional[str] = None
         self._lock = threading.RLock()

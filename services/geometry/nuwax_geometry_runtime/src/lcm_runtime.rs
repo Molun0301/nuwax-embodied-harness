@@ -499,6 +499,23 @@ impl LcmBackendKind {
     }
 }
 
+/// 读 `NUWAX_REAL_LCM_REQUIRED`：true/false/1/0/yes/no/on/off (大小写不敏感)。
+///
+/// 当 `NUWAX_REAL_LCM_REQUIRED=true` + 选择 real-lcm backend 但 real-lcm 上游 blocker
+/// 命中（feature 仍空桩 + fingerprint 未切 MurmurHash64A）时，启动期进程直接
+/// exit 1，**不**在 binary 端静默 fallback 到 fake-lcm；运行期故障仍只走
+/// `HealthCheck healthy=false` 路径，不重新触发 exit。
+///
+/// 默认 false；与 `core/settings.py::REAL_LCM_REQUIRED` 语义保持对齐（Python 端
+/// 也是 fail-fast 设计，但 Python 不执进程退出）。
+pub fn real_lcm_required_from_env() -> bool {
+    let raw = std::env::var("NUWAX_REAL_LCM_REQUIRED").unwrap_or_default();
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// 启动 geometry runtime 异步循环（LCM-first）。
 ///
 /// 当前默认走 fake backend；`NUWAX_LCM_BACKEND=real-lcm` 启动期直接
@@ -537,6 +554,12 @@ pub fn spawn_geometry_runtime(
 
     // 按 NUWAX_LCM_BACKEND 选择 backend。
     // Phase 1 fail-fast:real-lcm 请求启动期直接拒绝；不允许 fallback fake-lcm。
+    // Phase 5 加强（codex 反馈 P2）：当 `NUWAX_REAL_LCM_REQUIRED=true` 命中时，
+    // 进程直接 `process::exit(1)`（不再只 `return Err(...)` 让 main 软退出），
+    // 防止上游 systemd / start_gateway 把 binary restart-loop 仍以"启动期失败"
+    // 状态回写 ready_file，从而绕开生产意图。运行期故障仍仅走 HealthCheck
+    // healthy=false 路径，**不**重复触发 exit。
+    let real_lcm_required = real_lcm_required_from_env();
     let (transport, backend_name, backend_available): (LcmTransport, &'static str, bool) =
         match LcmBackendKind::from_env() {
             LcmBackendKind::Fake => {
@@ -550,6 +573,19 @@ pub fn spawn_geometry_runtime(
                 //   - fingerprint 当前 = FNV-1a 64-bit,非 lcm-gen MurmurHash64A
                 // 处置:启动期直接返回 RealLcmBackendUnavailable,main.rs 立即退出。
                 // **绝不**在 Real 失败路径调用 `LcmTransport::new_fake()`。
+                //
+                // Phase 5 (codex-P2) 进一步要求：
+                // 当 `NUWAX_REAL_LCM_REQUIRED=true` 时，进程**硬退出**（exit code = 1），
+                // 错误信息仍保留 stderr `LCM_BACKEND_UNAVAILABLE` 关键字
+                // 供 start 脚本与 smoke test grep 识别。
+                if real_lcm_required {
+                    eprintln!(
+                        "LCM_BACKEND_UNAVAILABLE: NUWAX_REAL_LCM_REQUIRED=true 时 real-lcm \
+                         backend 上游 dimos nuwax-transport/real-lcm feature 仍为空桩，\
+                         按生产意图立即硬退出 (exit code = 1)。"
+                    );
+                    std::process::exit(1);
+                }
                 return Err(RealLcmBackendUnavailable);
             }
         };

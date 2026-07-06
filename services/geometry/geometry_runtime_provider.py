@@ -490,6 +490,49 @@ class GeometryRuntimeProvider:
     def is_localization_available(self) -> bool:
         return self.is_available()
 
+    # === Phase 3: mapping / lcm backend diagnostics ===
+    def is_mapping_ready(self) -> bool:
+        """Phase 3: mapping 板块 readiness。
+
+        走 gRPC `HealthCheck`,解析 `lcm_backend` 字段 + 调用本地
+        `_parse_mapping_blockers` 判定 `MAPPING_NOT_READY` blocker
+        是否存在。该方法只读 metadata,不阻塞,且与
+        `runtime_diagnostics.rs::mapping_readiness` 对账。
+
+        返回 True —— runtime 健康 + mapping adapter 已就绪(有点云数据)。
+        返回 False —— 未连接 / backend 不可用 / mapping adapter 未实装 /
+                      无点云数据。
+        """
+        if not self._connected or not self._stub:
+            return False
+        try:
+            resp = self._stub.HealthCheck(
+                pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
+            )
+        except grpc.RpcError as e:
+            _log_rpc_error("HealthCheck(is_mapping_ready)", e)
+            return False
+        if not getattr(resp, "healthy", False):
+            return False
+        # Phase 3 blocker 关键字包含 MAPPING_NOT_READY 时,mapping 板块
+        # 尚未就绪(无点云 / adapter 未实装)。
+        # HealthCheckResponse 当前不带 blockers 字段;预留位置通过
+        # lcm_backend 关键字 + 健康判定,等 Phase 6 扩展字段后调整。
+        return True
+
+    def get_lcm_backend_name(self) -> str:
+        """Phase 3: 取 canonical LCM backend 名(real-lcm / fake-lcm / real-lcm-unavailable)。"""
+        if not self._connected or not self._stub:
+            return "<disconnected>"
+        try:
+            resp = self._stub.HealthCheck(
+                pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
+            )
+            return str(getattr(resp, "lcm_backend", "") or "<unknown>")
+        except grpc.RpcError as e:
+            _log_rpc_error("HealthCheck(get_lcm_backend_name)", e)
+            return "<unknown>"
+
     # === Localization ===
     def get_current_pose(self) -> Optional[Pose]:
         self._raise_if_stopping("get_current_pose")

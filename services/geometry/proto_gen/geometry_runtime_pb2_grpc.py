@@ -5,7 +5,7 @@ import warnings
 
 from . import geometry_runtime_pb2 as geometry__runtime__pb2
 
-GRPC_GENERATED_VERSION = '1.69.0'
+GRPC_GENERATED_VERSION = '1.71.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -26,7 +26,9 @@ if _version_not_supported:
 
 
 class GeometryRuntimeStub(object):
-    """=== 服务定义 ===
+    """============================================================================
+    服务定义：GeometryRuntime gRPC facade
+    ============================================================================
     """
 
     def __init__(self, channel):
@@ -80,35 +82,40 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.OccupancyGridData.FromString,
                 _registered_method=True)
-        self.SubscribeMapUpdates = channel.unary_stream(
-                '/nuwax.geometry.GeometryRuntime/SubscribeMapUpdates',
-                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.MapUpdateNotification.FromString,
-                _registered_method=True)
         self.GetOccupancyGridShm = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/GetOccupancyGridShm',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.ShmRef.FromString,
                 _registered_method=True)
+        self.SubscribeMapUpdates = channel.unary_stream(
+                '/nuwax.geometry.GeometryRuntime/SubscribeMapUpdates',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.MapUpdateNotification.FromString,
+                _registered_method=True)
+        self.SubscribeCloudMapUpdates = channel.unary_stream(
+                '/nuwax.geometry.GeometryRuntime/SubscribeCloudMapUpdates',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.CloudMapShmRef.FromString,
+                _registered_method=True)
         self.SetNavigationGoal = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/SetNavigationGoal',
                 request_serializer=geometry__runtime__pb2.NavigationGoal.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.NavigationAck.FromString,
+                response_deserializer=geometry__runtime__pb2.NavigationState.FromString,
                 _registered_method=True)
         self.CancelNavigation = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/CancelNavigation',
-                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.CancelResult.FromString,
+                request_serializer=geometry__runtime__pb2.CancelNavigationRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.NavigationState.FromString,
                 _registered_method=True)
         self.SubscribeNavigationState = channel.unary_stream(
                 '/nuwax.geometry.GeometryRuntime/SubscribeNavigationState',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.NavigationStateUpdate.FromString,
+                response_deserializer=geometry__runtime__pb2.NavigationState.FromString,
                 _registered_method=True)
         self.GetNavigationReadiness = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/GetNavigationReadiness',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.Nav2Readiness.FromString,
+                response_deserializer=geometry__runtime__pb2.NavigationReadiness.FromString,
                 _registered_method=True)
         self.GetFrontiers = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/GetFrontiers',
@@ -118,22 +125,24 @@ class GeometryRuntimeStub(object):
         self.SubscribeFrontiers = channel.unary_stream(
                 '/nuwax.geometry.GeometryRuntime/SubscribeFrontiers',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.FrontierUpdate.FromString,
+                response_deserializer=geometry__runtime__pb2.FrontierList.FromString,
                 _registered_method=True)
         self.PublishOdom = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/PublishOdom',
-                request_serializer=geometry__runtime__pb2.OdomInput.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.Empty.FromString,
+                request_serializer=geometry__runtime__pb2.PublishOdomRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.PublishResult.FromString,
                 _registered_method=True)
         self.PublishPointCloud = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/PublishPointCloud',
-                request_serializer=geometry__runtime__pb2.PointCloudShmRef.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.Empty.FromString,
+                request_serializer=geometry__runtime__pb2.PublishPointCloudRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.PublishResult.FromString,
                 _registered_method=True)
 
 
 class GeometryRuntimeServicer(object):
-    """=== 服务定义 ===
+    """============================================================================
+    服务定义：GeometryRuntime gRPC facade
+    ============================================================================
     """
 
     def Start(self, request, context):
@@ -193,20 +202,26 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def SubscribeMapUpdates(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
     def GetOccupancyGridShm(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SubscribeMapUpdates(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SubscribeCloudMapUpdates(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def SetNavigationGoal(self, request, context):
-        """导航
+        """导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -231,7 +246,7 @@ class GeometryRuntimeServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def GetFrontiers(self, request, context):
-        """探索
+        """探索（与 nuwax-exploration LCM channel 接口对应）
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -244,7 +259,7 @@ class GeometryRuntimeServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def PublishOdom(self, request, context):
-        """输入桥（网关 → ROS）
+        """输入发布兼容
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -304,35 +319,40 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.OccupancyGridData.SerializeToString,
             ),
-            'SubscribeMapUpdates': grpc.unary_stream_rpc_method_handler(
-                    servicer.SubscribeMapUpdates,
-                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
-                    response_serializer=geometry__runtime__pb2.MapUpdateNotification.SerializeToString,
-            ),
             'GetOccupancyGridShm': grpc.unary_unary_rpc_method_handler(
                     servicer.GetOccupancyGridShm,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.ShmRef.SerializeToString,
             ),
+            'SubscribeMapUpdates': grpc.unary_stream_rpc_method_handler(
+                    servicer.SubscribeMapUpdates,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.MapUpdateNotification.SerializeToString,
+            ),
+            'SubscribeCloudMapUpdates': grpc.unary_stream_rpc_method_handler(
+                    servicer.SubscribeCloudMapUpdates,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.CloudMapShmRef.SerializeToString,
+            ),
             'SetNavigationGoal': grpc.unary_unary_rpc_method_handler(
                     servicer.SetNavigationGoal,
                     request_deserializer=geometry__runtime__pb2.NavigationGoal.FromString,
-                    response_serializer=geometry__runtime__pb2.NavigationAck.SerializeToString,
+                    response_serializer=geometry__runtime__pb2.NavigationState.SerializeToString,
             ),
             'CancelNavigation': grpc.unary_unary_rpc_method_handler(
                     servicer.CancelNavigation,
-                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
-                    response_serializer=geometry__runtime__pb2.CancelResult.SerializeToString,
+                    request_deserializer=geometry__runtime__pb2.CancelNavigationRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.NavigationState.SerializeToString,
             ),
             'SubscribeNavigationState': grpc.unary_stream_rpc_method_handler(
                     servicer.SubscribeNavigationState,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
-                    response_serializer=geometry__runtime__pb2.NavigationStateUpdate.SerializeToString,
+                    response_serializer=geometry__runtime__pb2.NavigationState.SerializeToString,
             ),
             'GetNavigationReadiness': grpc.unary_unary_rpc_method_handler(
                     servicer.GetNavigationReadiness,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
-                    response_serializer=geometry__runtime__pb2.Nav2Readiness.SerializeToString,
+                    response_serializer=geometry__runtime__pb2.NavigationReadiness.SerializeToString,
             ),
             'GetFrontiers': grpc.unary_unary_rpc_method_handler(
                     servicer.GetFrontiers,
@@ -342,17 +362,17 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
             'SubscribeFrontiers': grpc.unary_stream_rpc_method_handler(
                     servicer.SubscribeFrontiers,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
-                    response_serializer=geometry__runtime__pb2.FrontierUpdate.SerializeToString,
+                    response_serializer=geometry__runtime__pb2.FrontierList.SerializeToString,
             ),
             'PublishOdom': grpc.unary_unary_rpc_method_handler(
                     servicer.PublishOdom,
-                    request_deserializer=geometry__runtime__pb2.OdomInput.FromString,
-                    response_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                    request_deserializer=geometry__runtime__pb2.PublishOdomRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.PublishResult.SerializeToString,
             ),
             'PublishPointCloud': grpc.unary_unary_rpc_method_handler(
                     servicer.PublishPointCloud,
-                    request_deserializer=geometry__runtime__pb2.PointCloudShmRef.FromString,
-                    response_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                    request_deserializer=geometry__runtime__pb2.PublishPointCloudRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.PublishResult.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -363,7 +383,9 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class GeometryRuntime(object):
-    """=== 服务定义 ===
+    """============================================================================
+    服务定义：GeometryRuntime gRPC facade
+    ============================================================================
     """
 
     @staticmethod
@@ -610,33 +632,6 @@ class GeometryRuntime(object):
             _registered_method=True)
 
     @staticmethod
-    def SubscribeMapUpdates(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/nuwax.geometry.GeometryRuntime/SubscribeMapUpdates',
-            geometry__runtime__pb2.Empty.SerializeToString,
-            geometry__runtime__pb2.MapUpdateNotification.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
     def GetOccupancyGridShm(request,
             target,
             options=(),
@@ -664,6 +659,60 @@ class GeometryRuntime(object):
             _registered_method=True)
 
     @staticmethod
+    def SubscribeMapUpdates(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/SubscribeMapUpdates',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.MapUpdateNotification.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubscribeCloudMapUpdates(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/SubscribeCloudMapUpdates',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.CloudMapShmRef.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def SetNavigationGoal(request,
             target,
             options=(),
@@ -679,7 +728,7 @@ class GeometryRuntime(object):
             target,
             '/nuwax.geometry.GeometryRuntime/SetNavigationGoal',
             geometry__runtime__pb2.NavigationGoal.SerializeToString,
-            geometry__runtime__pb2.NavigationAck.FromString,
+            geometry__runtime__pb2.NavigationState.FromString,
             options,
             channel_credentials,
             insecure,
@@ -705,8 +754,8 @@ class GeometryRuntime(object):
             request,
             target,
             '/nuwax.geometry.GeometryRuntime/CancelNavigation',
-            geometry__runtime__pb2.Empty.SerializeToString,
-            geometry__runtime__pb2.CancelResult.FromString,
+            geometry__runtime__pb2.CancelNavigationRequest.SerializeToString,
+            geometry__runtime__pb2.NavigationState.FromString,
             options,
             channel_credentials,
             insecure,
@@ -733,7 +782,7 @@ class GeometryRuntime(object):
             target,
             '/nuwax.geometry.GeometryRuntime/SubscribeNavigationState',
             geometry__runtime__pb2.Empty.SerializeToString,
-            geometry__runtime__pb2.NavigationStateUpdate.FromString,
+            geometry__runtime__pb2.NavigationState.FromString,
             options,
             channel_credentials,
             insecure,
@@ -760,7 +809,7 @@ class GeometryRuntime(object):
             target,
             '/nuwax.geometry.GeometryRuntime/GetNavigationReadiness',
             geometry__runtime__pb2.Empty.SerializeToString,
-            geometry__runtime__pb2.Nav2Readiness.FromString,
+            geometry__runtime__pb2.NavigationReadiness.FromString,
             options,
             channel_credentials,
             insecure,
@@ -814,7 +863,7 @@ class GeometryRuntime(object):
             target,
             '/nuwax.geometry.GeometryRuntime/SubscribeFrontiers',
             geometry__runtime__pb2.Empty.SerializeToString,
-            geometry__runtime__pb2.FrontierUpdate.FromString,
+            geometry__runtime__pb2.FrontierList.FromString,
             options,
             channel_credentials,
             insecure,
@@ -840,8 +889,8 @@ class GeometryRuntime(object):
             request,
             target,
             '/nuwax.geometry.GeometryRuntime/PublishOdom',
-            geometry__runtime__pb2.OdomInput.SerializeToString,
-            geometry__runtime__pb2.Empty.FromString,
+            geometry__runtime__pb2.PublishOdomRequest.SerializeToString,
+            geometry__runtime__pb2.PublishResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -867,8 +916,8 @@ class GeometryRuntime(object):
             request,
             target,
             '/nuwax.geometry.GeometryRuntime/PublishPointCloud',
-            geometry__runtime__pb2.PointCloudShmRef.SerializeToString,
-            geometry__runtime__pb2.Empty.FromString,
+            geometry__runtime__pb2.PublishPointCloudRequest.SerializeToString,
+            geometry__runtime__pb2.PublishResult.FromString,
             options,
             channel_credentials,
             insecure,

@@ -96,6 +96,50 @@ def _log_rpc_error(rpc_name: str, exc: grpc.RpcError) -> None:
         LOGGER.debug("gRPC %s 调用失败: %s", rpc_name, exc)
 
 
+# --- NavigationState.status 字符串语义映射（round-4 HIGH 3 同步） ---
+# Rust proto SetNavigationGoal / CancelNavigation / SubscribeNavigationState
+# 全部返回/推送 NavigationState，没有 Rust 端 NavigationAck.accepted / CancelResult.success
+# 之类的布尔字段；accepted / success 语义由 status 字符串反推。
+_NAV_ACCEPTED_STATUS = frozenset({
+    "",                # 空 status 也视作"服务端接受但尚未分类"，避免误判为失败
+    "accepted",
+    "queued",
+    "pending",
+    "planning",
+    "running",
+    "active",
+    "executing",
+    "in_progress",
+})
+_NAV_SUCCEEDED_STATUS = frozenset({
+    "succeeded",
+    "success",
+    "completed",
+    "reached",
+})
+_NAV_CANCELLED_STATUS = frozenset({
+    "cancelled",
+    "canceled",
+    "aborted",
+    "stopped",
+})
+
+
+def _status_means_accepted(status: str) -> bool:
+    """SetNavigationGoal 返回时：服务端是否接受请求（非失败类）。"""
+    return str(status or "").strip().lower() in _NAV_ACCEPTED_STATUS
+
+
+def _status_means_succeeded(status: str) -> bool:
+    """navigation 是否完成。"""
+    return str(status or "").strip().lower() in _NAV_SUCCEEDED_STATUS
+
+
+def _status_means_cancelled(status: str) -> bool:
+    """CancelNavigation 返回时：是否被服务端视为已取消。"""
+    return str(status or "").strip().lower() in _NAV_CANCELLED_STATUS
+
+
 def _is_shutdown_guard_enabled() -> bool:
     """NUWAX_GEOMETRY_SHUTDOWN_GUARD=0 时关闭（紧急回滚）。"""
     value = os.environ.get("NUWAX_GEOMETRY_SHUTDOWN_GUARD", "1").strip().lower()
@@ -420,30 +464,45 @@ class GeometryRuntimeProvider:
             return None
 
     # === Navigation ===
-    def set_navigation_goal(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float) -> Dict[str, Any]:
+    # Rust proto 字段映射（round-4 HIGH 3 同步）：
+    # - NavigationGoal.target_pose/behavior_tree → pose/frame_id/goal_id
+    # - SetNavigationGoal 返回 NavigationState（非 NavigationAck）：
+    #   accepted/goal_id/message → status/goal_id/message
+    # - CancelNavigation 接受 CancelNavigationRequest（带 goal_id），返回 NavigationState
+    # - NavigationReadiness 仅 ready + reason（去 Nav2 残留字段）
+    def set_navigation_goal(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float,
+                            frame_id: str = "map", goal_id: str = "") -> Dict[str, Any]:
         self._raise_if_stopping("set_navigation_goal")
         if not self._stub:
             return {"accepted": False, "message": "未连接"}
         try:
             goal = pb2.NavigationGoal(
-                target_pose=pb2.Pose(
+                pose=pb2.Pose(
                     position=pb2.Vec3(x=x, y=y, z=z),
                     orientation=pb2.Quat(x=qx, y=qy, z=qz, w=qw),
-                )
+                    frame_id=frame_id,
+                ),
+                frame_id=frame_id,
+                goal_id=goal_id,
             )
             resp = self._stub.SetNavigationGoal(goal, timeout=_read_deadline_sec())
-            return {"accepted": resp.accepted, "goal_id": resp.goal_id, "message": resp.message}
+            return {
+                "accepted": _status_means_accepted(resp.status),
+                "goal_id": resp.goal_id,
+                "message": resp.message,
+            }
         except grpc.RpcError as e:
             _log_rpc_error("SetNavigationGoal", e)
             return {"accepted": False, "message": str(e)}
 
-    def cancel_navigation(self) -> bool:
+    def cancel_navigation(self, goal_id: str = "") -> bool:
         self._raise_if_stopping("cancel_navigation")
         if not self._stub:
             return False
         try:
-            resp = self._stub.CancelNavigation(pb2.Empty(), timeout=_read_deadline_sec())
-            return resp.success
+            req = pb2.CancelNavigationRequest(goal_id=goal_id)
+            resp = self._stub.CancelNavigation(req, timeout=_read_deadline_sec())
+            return _status_means_accepted(resp.status) or _status_means_succeeded(resp.status)
         except grpc.RpcError as e:
             _log_rpc_error("CancelNavigation", e)
             return False
@@ -455,11 +514,8 @@ class GeometryRuntimeProvider:
         try:
             resp = self._stub.GetNavigationReadiness(pb2.Empty(), timeout=_read_deadline_sec())
             return {
-                "ready": resp.ready,
-                "waiting_for": resp.waiting_for,
-                "message": resp.message,
-                "action_server_ready": resp.action_server_ready,
-                "tf_ready": resp.tf_ready,
+                "ready": bool(resp.ready),
+                "message": resp.reason,
             }
         except grpc.RpcError as e:
             _log_rpc_error("GetNavigationReadiness", e)
@@ -496,11 +552,12 @@ class GeometryRuntimeProvider:
         while self._stub and not self._stopping:
             try:
                 for update in self._stub.SubscribeNavigationState(pb2.Empty()):
+                    # Rust SubscribeNavigationState 流推送 NavigationState
+                    # （非 NavigationStateUpdate，无 current_pose 字段；位姿由 SubscribePose 流补齐）
                     goal_id = getattr(update, "goal_id", "") or None
                     status = getattr(update, "status", "") or ""
                     message = getattr(update, "message", "") or None
                     distance = getattr(update, "distance_remaining", None)
-                    pose = _build_pose(getattr(update, "current_pose", None))
                     ts_ns = int(getattr(update, "timestamp_ns", 0) or 0)
                     with self._nav_state_lock:
                         self._last_nav_goal_id = goal_id
@@ -509,7 +566,7 @@ class GeometryRuntimeProvider:
                         self._last_nav_distance_remaining = (
                             float(distance) if distance is not None else None
                         )
-                        self._last_nav_current_pose = pose
+                        self._last_nav_current_pose = None  # 由 SubscribePose 流维护
                         self._last_nav_timestamp_ns = ts_ns
                     if not self._stub or self._stopping:
                         return
@@ -606,8 +663,9 @@ class GeometryRuntimeProvider:
                   _dispatch_navigate / platform_exploration_runtime 实际传入的对象）。
 
         返回：
-            bool: gRPC NavigationAck.accepted 透传；调用失败 / stub 不可用返回 False，
-            绝不假装成功。
+            bool: 由 NavigationState.status 经 _status_means_accepted 反推（accepted/
+            planning/running → True；failed/cancelled → False）；调用失败 / stub 不可用
+            返回 False，绝不假装成功。
         """
         self._raise_if_stopping("set_goal")
         if not self._stub:
@@ -636,12 +694,16 @@ class GeometryRuntimeProvider:
                 frame_id=str(getattr(target_pose, "frame_id", "") or ""),
             )
             request_goal_id = str(getattr(goal, "goal_id", "") or "")
+            target_frame_id = str(getattr(target_pose, "frame_id", "") or "") or "map"
             proto_goal = pb2.NavigationGoal(
-                target_pose=proto_pose,
-                behavior_tree=request_goal_id or "",
+                pose=proto_pose,
+                frame_id=target_frame_id,
+                goal_id=request_goal_id or "",
             )
             resp = self._stub.SetNavigationGoal(proto_goal, timeout=_read_deadline_sec())
-            accepted = bool(getattr(resp, "accepted", False))
+            # Rust SetNavigationGoal 返回 NavigationState（非 NavigationAck）；
+            # accepted 语义由 status 字符串反推（accepted/planning/running → True）
+            accepted = _status_means_accepted(getattr(resp, "status", ""))
             ack_goal_id = getattr(resp, "goal_id", "") or request_goal_id or None
             ack_message = getattr(resp, "message", "") or None
             # 同步本地缓存：accepted 时把状态置为 ACCEPTED，等待 SubscribeNavigationState 流覆盖
@@ -674,8 +736,10 @@ class GeometryRuntimeProvider:
             LOGGER.warning("GeometryRuntimeProvider.cancel_goal stub 不可用，返回 False。")
             return False
         try:
-            resp = self._stub.CancelNavigation(pb2.Empty(), timeout=_read_deadline_sec())
-            success = bool(getattr(resp, "success", False))
+            req = pb2.CancelNavigationRequest(goal_id=request_id or "")
+            resp = self._stub.CancelNavigation(req, timeout=_read_deadline_sec())
+            # Rust CancelNavigation 返回 NavigationState，status 含义反映取消结果
+            success = _status_means_cancelled(getattr(resp, "status", "")) or _status_means_accepted(getattr(resp, "status", ""))
             cancel_message = getattr(resp, "message", "") or None
             with self._nav_state_lock:
                 if success:
@@ -708,25 +772,26 @@ class GeometryRuntimeProvider:
         return self._build_navigation_state_snapshot()
 
     # === 输入桥 ===
+    # Rust proto PublishOdom 接受 PublishOdomRequest（仅 pose 字段；速度由 nuwax-nav-stack
+    # 内部从 pose 增量计算，不再走 gRPC facade）。速度参数保留以兼容旧调用方签名，丢弃。
     def publish_odom(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float,
                      lvx: float = 0, lvy: float = 0, lvz: float = 0,
                      avx: float = 0, avy: float = 0, avz: float = 0,
                      frame_id: str = "odom") -> bool:
+        del lvx, lvy, lvz, avx, avy, avz  # round-4 HIGH 3：Rust 端不再接收 velocity 字段
         self._raise_if_stopping("publish_odom")
         if not self._stub:
             return False
         try:
-            msg = pb2.OdomInput(
+            msg = pb2.PublishOdomRequest(
                 pose=pb2.Pose(
                     position=pb2.Vec3(x=x, y=y, z=z),
                     orientation=pb2.Quat(x=qx, y=qy, z=qz, w=qw),
                     frame_id=frame_id,
                 ),
-                linear_velocity=pb2.Vec3(x=lvx, lvy=lvy, z=lvz),
-                angular_velocity=pb2.Vec3(x=avx, y=avy, z=avz),
             )
-            self._stub.PublishOdom(msg, timeout=_read_deadline_sec())
-            return True
+            resp = self._stub.PublishOdom(msg, timeout=_read_deadline_sec())
+            return bool(getattr(resp, "success", False))
         except grpc.RpcError as e:
             _log_rpc_error("PublishOdom", e)
             return False

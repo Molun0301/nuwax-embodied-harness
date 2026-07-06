@@ -493,8 +493,13 @@ class PlatformGeometryRuntime:
         self._debug_initial_pose_anchor: Optional[Pose] = None
         self._debug_initial_pose_hint_until = 0.0
         self._debug_initial_pose_hint_stable_count = 0
+        # 去 ROS2 目标态：正式导航执行链已切到 nuwax-geometry-runtime（Rust gRPC bridge）。
+        # 原 `_nav2_action_provider` 字段是 Nav2 ROS2 action 客户端的兼容占位。
+        # 字段名保留（外部 getattr 引用方众多），但运行时不再实例化 Nav2 action 客户端。
+        # 真正可用的导航后端由 `_remote_provider` (GeometryRuntimeProvider) 持有，由
+        # `_resolve_navigation_backend()` 优先返回。
         self._nav2_launch_attempted = False
-        self._nav2_action_provider = None
+        self._nav2_action_provider: Optional[object] = None
         self._cmd_vel_bridge = None
         self._geometry_runtime_subprocess: Optional[GeometryRuntimeSubprocess] = None
         self._remote_provider: Optional[GeometryRuntimeProvider] = None
@@ -1660,19 +1665,33 @@ class PlatformGeometryRuntime:
         self._map_stream_tracker["streaming"] = streaming
 
     def _navigation_backend_policy(self) -> Dict[str, object]:
-        nav2_provider = getattr(self, "_nav2_action_provider", None)
-        nav2_provider_name = getattr(nav2_provider, "provider_name", "nav2_action_navigation")
+        """返回当前平台导航后端选择策略。
+
+        去 ROS2 目标态：正式导航后端是 nuwax-geometry-runtime (GeometryRuntimeProvider)
+        gRPC facade；原 Nav2 action 兼容层 `_nav2_action_provider` 仅作 fallback 占位，
+        永远为 None（不会实例化）。本方法报告当前真实装配的后端，而非历史 Nav2 action。
+        """
+        backend = self._resolve_navigation_backend()
+        backend_name = getattr(backend, "provider_name", None)
+        is_runtime_provider = bool(backend) and isinstance(backend, GeometryRuntimeProvider)
+        selection = "nuwax_geometry_runtime" if is_runtime_provider else "nav2_action_legacy_placeholder"
         return {
-            "selection": "nav2_action",
-            "execution_chain": "nav2_action_only",
+            "selection": selection,
+            "execution_chain": "nuwax_geometry_runtime_grpc" if is_runtime_provider else "nav2_action_only_legacy",
             "single_execution_chain": True,
-            "nav2_action_provider_name": nav2_provider_name,
-            "nav2_action_active": nav2_provider is not None,
-            "selected_provider_name": nav2_provider_name if nav2_provider is not None else None,
-            "active_backend_provider": nav2_provider_name if nav2_provider is not None else None,
-            "active_navigation_backend": nav2_provider_name if nav2_provider is not None else None,
-            "active_backend_kind": "nav2_action" if nav2_provider is not None else None,
-            "message": "当前正式导航执行链为 Nav2 action。",
+            "nav2_action_provider_name": getattr(self, "_nav2_action_provider", None) and getattr(self._nav2_action_provider, "provider_name", "nav2_action_navigation"),
+            "nav2_action_active": getattr(self, "_nav2_action_provider", None) is not None,
+            "selected_provider_name": backend_name,
+            "active_backend_provider": backend_name,
+            "active_navigation_backend": backend_name,
+            "active_backend_kind": "geometry_runtime_provider" if is_runtime_provider else (
+                "nav2_action" if getattr(self, "_nav2_action_provider", None) is not None else None
+            ),
+            "message": (
+                "当前正式导航执行链为 nuwax-geometry-runtime (Rust gRPC facade)。"
+                if is_runtime_provider
+                else "当前未绑定 GeometryRuntimeProvider；Nav2 action 兼容占位亦为空。"
+            ),
         }
 
     def _with_navigation_backend_policy(self, status: Dict[str, object]) -> Dict[str, object]:
@@ -1685,7 +1704,36 @@ class PlatformGeometryRuntime:
         }
 
     def _build_nav2_status(self) -> Dict[str, object]:
+        """返回当前导航后端的诊断状态。
+
+        去 ROS2 目标态：优先以 `_remote_provider` (GeometryRuntimeProvider) 真实状态为准。
+        `_nav2_action_provider` 兼容占位若存在（理论上永不实例化），仍可走老路径。
+        """
         process = self._managed_processes.get("nav2")
+        remote = getattr(self, "_remote_provider", None)
+        if remote is not None and getattr(remote, "is_connected", False):
+            try:
+                readiness = remote.get_navigation_readiness()
+            except Exception as exc:  # pragma: no cover - 防御性兜底
+                readiness = {"ready": False, "message": "gRPC 调用失败：%s" % exc}
+            status = {
+                "phase": "geometry_runtime",
+                "message": str(readiness.get("message") or "nuwax-geometry-runtime gRPC 已连接。"),
+                "action_name": "/navigate_to_pose",
+                "global_costmap_topic": "/global_costmap/costmap",
+                "local_costmap_topic": "/local_costmap/costmap",
+                "costmap_source": "geometry_runtime",
+                "action_client_connected": bool(remote.is_available()),
+                "lifecycle_ready": bool(readiness.get("ready")),
+                "tf_ready": bool(readiness.get("tf_ready")),
+                "action_server_ready": bool(readiness.get("action_server_ready")),
+                "waiting_for": readiness.get("waiting_for"),
+                "ready": bool(readiness.get("ready")),
+                "launch_attempted": False,
+            }
+            if process is not None:
+                status["process"] = process.status()
+            return self._with_navigation_backend_policy(status)
         provider = getattr(self, "_nav2_action_provider", None)
         if provider is not None:
             status = dict(provider.get_nav2_status())
@@ -1695,7 +1743,7 @@ class PlatformGeometryRuntime:
         nav2_cfg = getattr(self.config, "nav2", None)
         status = {
             "phase": "external",
-            "message": "Nav2 action provider 尚未初始化。",
+            "message": "Nav2 action provider 尚未初始化（目标态：等待 GeometryRuntimeProvider gRPC 接入）。",
             "action_name": getattr(nav2_cfg, "action_name", "/navigate_to_pose") if nav2_cfg else "/navigate_to_pose",
             "global_costmap_topic": getattr(nav2_cfg, "global_costmap_topic", "/global_costmap/costmap") if nav2_cfg else "/global_costmap/costmap",
             "local_costmap_topic": getattr(nav2_cfg, "local_costmap_topic", "/local_costmap/costmap") if nav2_cfg else "/local_costmap/costmap",
@@ -2081,21 +2129,24 @@ class PlatformGeometryRuntime:
             return pose
 
     def publish_debug_initial_pose(self, target_pose: Pose) -> Dict[str, object]:
-        """RViz 2D Pose Estimate：委托 Nav2 provider 直通 /initialpose。"""
+        """RViz 2D Pose Estimate 入口。
 
-        provider = getattr(self, "_nav2_action_provider", None)
-        publish_fn = getattr(provider, "publish_rviz_initial_pose", None)
-        if not callable(publish_fn):
-            return {
-                "published": False,
-                "topic": "/initialpose",
-                "message": "Nav2 provider 未就绪，无法发布 /initialpose。",
-            }
+        去 ROS2 目标态：不再有 Nav2 action provider 转发 /initialpose。
+        调用方可通过 debug 面板/外部 debug observer 路径注入初始位姿 hint；
+        本入口仅保留协议签名（HTTP 503 语义：明确告知功能下线），不再默默失败。
+        """
+        # 清掉旧的 hint，让下一次 _resolve_pose_after_initial_hint 走默认路径。
         self.clear_debug_initial_pose_hint()
-        result = dict(publish_fn(target_pose))
-        if bool(result.get("published")):
-            self.invalidate_external_live_pose_cache()
-        return result
+        return {
+            "published": False,
+            "topic": "/initialpose",
+            "message": (
+                "RViz 2D Pose Estimate 已下线（去 ROS2 目标态）："
+                "请通过 debug panel 或外部 debug observer 注入初始位姿，"
+                "或调用 activate_localization 走 GeometryRuntimeProvider.relocalize 路径。"
+            ),
+            "deprecated": True,
+        }
 
     def _handle_external_debug_pose_update(
         self,
@@ -3153,8 +3204,17 @@ class PlatformGeometryRuntime:
         return None
 
     def _resolve_navigation_backend(self):
+        """解析平台正式导航后端。
+
+        去 ROS2 目标态：优先返回 `_remote_provider` (GeometryRuntimeProvider, 即 nuwax-geometry-runtime
+        gRPC facade)。`_nav2_action_provider` 是历史 Nav2 ROS2 action 客户端的兼容占位，
+        仅在 GeometryRuntimeProvider 尚未装配时作为 fallback 返回，保持外部引用方不抛 AttributeError。
+        """
         if not self._is_geometry_profile_enabled():
             return None
+        remote = getattr(self, "_remote_provider", None)
+        if remote is not None and getattr(remote, "is_connected", False):
+            return remote
         return getattr(self, "_nav2_action_provider", None)
 
     def _resolve_exploration_backend(self):
@@ -6435,20 +6495,22 @@ class PlatformGeometryProviderBundle(
         if target_pose is not None:
             LOGGER.debug(
                 "几何 ProviderBundle 转发导航目标 backend=%s goal_id=%s target=(%.3f, %.3f, %.3f) frame=%s",
-                getattr(backend, "provider_name", None),
+                getattr(backend, "provider_name", None) or backend.__class__.__name__,
                 getattr(goal, "goal_id", None),
                 float(target_pose.position.x),
                 float(target_pose.position.y),
                 float(target_pose.position.z),
                 target_pose.frame_id,
             )
-        return backend.set_goal(goal)
+        return self._call_navigation_backend(backend, "set_goal", goal)
 
     def cancel_goal(self) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
         backend = self.runtime._resolve_navigation_backend()
-        return False if backend is None else backend.cancel_goal()
+        if backend is None:
+            return False
+        return self._call_navigation_backend(backend, "cancel_goal")
 
     def cancel_navigation(self, *, request_id: Optional[str] = None) -> bool:
         """扩展的导航取消入口（5.5 task）。
@@ -6500,7 +6562,7 @@ class PlatformGeometryProviderBundle(
             from contracts.navigation import NavigationState, NavigationStatus
 
             policy = self.runtime._navigation_backend_policy()
-            message = "平台几何运行时未绑定 Nav2 action provider。"
+            message = "平台几何运行时未绑定导航后端（GeometryRuntimeProvider 与 Nav2 兼容占位均为空）。"
             return NavigationState(
                 status=NavigationStatus.IDLE,
                 message=message,
@@ -6512,7 +6574,26 @@ class PlatformGeometryProviderBundle(
                     "dispatch_via_proxy": False,
                 },
             )
-        state = backend.get_navigation_state()
+        getter = getattr(backend, "get_navigation_state", None)
+        if not callable(getter):
+            from contracts.navigation import NavigationState, NavigationStatus
+
+            policy = self.runtime._navigation_backend_policy()
+            return NavigationState(
+                status=NavigationStatus.IDLE,
+                message="当前导航后端 %s 未实现 get_navigation_state 接口。" % (
+                    getattr(backend, "provider_name", None) or backend.__class__.__name__
+                ),
+                metadata={
+                    "navigation_backend_policy": self.runtime._clone_metadata(policy),
+                    "active_navigation_backend": policy.get("active_backend_provider"),
+                    "nav2_action_active": bool(policy.get("nav2_action_active")),
+                    "proxy_dispatch_enabled": False,
+                    "dispatch_via_proxy": False,
+                    "unimplemented": True,
+                },
+            )
+        state = getter()
         # 复用现有 metadata，补充 proxy dispatch 标记；不破坏 schema。
         metadata = dict(getattr(state, "metadata", {}) or {})
         metadata.setdefault("proxy_dispatch_enabled", False)  # TODO:nav2_proxy_client_not_ready
@@ -6523,7 +6604,45 @@ class PlatformGeometryProviderBundle(
         if not self._is_geometry_profile_enabled():
             return False
         backend = self.runtime._resolve_navigation_backend()
-        return False if backend is None else backend.is_goal_reached()
+        if backend is None:
+            return False
+        return self._call_navigation_backend(backend, "is_goal_reached")
+
+    def _call_navigation_backend(self, backend, method_name: str, *args, **kwargs):
+        """统一调用 backend 的协议方法。
+
+        去 ROS2 目标态：当前正式 backend 是 GeometryRuntimeProvider（gRPC facade），
+        其方法集（set_navigation_goal/cancel_navigation/get_navigation_readiness）与
+        NavigationProvider 协议方法（set_goal/cancel_goal/get_navigation_state/is_goal_reached）
+        名字不一致。Python 侧这里做"方法存在即转发，不存在则返回失败占位"，
+        避免调用方收到 AttributeError 或被默默假装成功。
+        """
+
+        method = getattr(backend, method_name, None)
+        if not callable(method):
+            LOGGER.warning(
+                "导航 backend=%s 未实现 %s；返回失败占位（不假装成功）。",
+                getattr(backend, "provider_name", None) or backend.__class__.__name__,
+                method_name,
+            )
+            if method_name in {"set_goal", "cancel_goal", "is_goal_reached"}:
+                return False
+            if method_name in {"subscribe_navigation_updates"}:
+                return None
+            return None
+        try:
+            return method(*args, **kwargs)
+        except Exception:
+            LOGGER.exception(
+                "导航 backend=%s.%s 调用异常。",
+                getattr(backend, "provider_name", None) or backend.__class__.__name__,
+                method_name,
+            )
+            if method_name in {"set_goal", "cancel_goal", "is_goal_reached"}:
+                return False
+            if method_name in {"subscribe_navigation_updates"}:
+                return None
+            return None
 
     def start_exploration(self, request) -> bool:
         if not self._is_geometry_profile_enabled():

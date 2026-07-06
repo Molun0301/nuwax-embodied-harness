@@ -94,6 +94,25 @@ _LAUNCH_LOG_RE = re.compile(
 )
 
 
+def _is_exploration_legacy_enabled() -> bool:
+    """`_platform_exploration_runtime` 旧探索状态机的环境开关。
+
+    Phase 5 收口：默认返回 `False`,`_resolve_exploration_backend`
+    不会再走 `_platform_exploration_runtime`,只有当显式设置
+    `NUWAX_EXPLORATION_LEGACY=true`/`1`/`yes`/`on` 时才允许走。
+    接受大小写不敏感 + 前后空格 trim。
+
+    引入原因:Phase 0 硬隔离时把 `_resolve_exploration_backend` 默认
+    owner 改为 `_remote_provider` (GeometryRuntimeProvider),但
+    `_platform_exploration_runtime` 字段仍被 28+ 处 helper 直接调用
+    (内部状态机,如 `is_running` / `tick` / `get_current_navigation_goal`)。
+    本期作为最小修复点,在 `_resolve_exploration_backend` 设门;Phase 6
+    完整重写时一并清理 helper 内的直接引用。
+    """
+    raw = os.environ.get("NUWAX_EXPLORATION_LEGACY", "")
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _canonical_main_log_level(level: str) -> str:
     upper = str(level or "INFO").strip().upper()
     if upper in {"WARN", "WARNING"}:
@@ -3289,21 +3308,34 @@ class PlatformGeometryRuntime:
     def _resolve_exploration_backend(self):
         """解析平台正式探索后端。
 
-        去 ROS2 目标态（Phase 0 硬隔离）：默认路径**不**返回
+        去 ROS2 目标态（Phase 0 硬隔离 + Phase 5 收口）：默认路径**不**返回
         `_platform_exploration_runtime`（Python 旧探索状态机，已迁为
         `legacy_exploration_placeholder`，仅供显式 legacy/manual 诊断或
         单测 harness 使用）。默认优先返回 `_remote_provider`
         (GeometryRuntimeProvider) 通过 gRPC facade 走 Rust explore_runtime。
         remote provider 不可用时返回 None（调用方收到 RUNTIME_NOT_READY）。
+
+        Phase 5 收口：新增 `NUWAX_EXPLORATION_LEGACY` env 开关（默认 `false`）。
+        仅当 env 显式设置为 `true`/`1`/`yes` 时,`_resolve_exploration_backend`
+        才允许返回 `_platform_exploration_runtime`(走 Python 旧状态机)。
+        Phase 6 完整重写 `_resolve_exploration_backend` 时会彻底删除
+        `_platform_exploration_runtime` 默认 owner,本方法作为最小修复点。
         """
         if not self._is_geometry_profile_enabled():
             return None
         remote = getattr(self, "_remote_provider", None)
         if remote is not None and getattr(remote, "is_connected", False):
             return remote
-        # Phase 0 硬隔离：不再静默走 Python 旧探索状态机；只允许显式 legacy/manual
-        # 入口通过 `_legacy_exploration_placeholder` 引用（不通过本方法）。
-        return self._resolve_backend(ExplorationDataPlane, ExplorationProvider)
+        # Phase 5 收口：默认不返回 _platform_exploration_runtime;
+        # 只有 NUWAX_EXPLORATION_LEGACY=true 才允许走旧状态机。
+        if not _is_exploration_legacy_enabled():
+            return None
+        # 显式 legacy/manual 入口走 _platform_exploration_runtime;
+        # Phase 6 完整重写时本段删除。
+        legacy = getattr(self, "_platform_exploration_runtime", None)
+        if legacy is not None:
+            return legacy
+        return None
 
     def _safe_map_dir(self, map_name: str) -> Path:
         primary = self._catalog_root / build_safe_dir_segment(map_name)

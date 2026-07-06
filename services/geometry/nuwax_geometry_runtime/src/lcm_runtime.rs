@@ -1077,9 +1077,15 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
         MappingAdapterConfig::from_env(),
     ))));
     // Phase 3: 测试 helper 也构造 occupancy_shm(走 /tmp 测试路径)
+    // 注意:必须包含 per-call 唯一后缀(monotonic counter),否则并行
+    // cargo test 跑多次 build_handle_for_tests 时,多个
+    // OccupancyGridShmWriter::new() 会同时 truncate 同一文件 + 同一
+    // mmap 段,导致 SIGBUS(实测:28 tests pass 后崩溃)。
+    static OCC_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let occ_test_path = std::path::PathBuf::from(format!(
-        "/tmp/nuwax_occupancy_test_{}.mmap",
-        std::process::id()
+        "/tmp/nuwax_occupancy_test_{}_{}.mmap",
+        std::process::id(),
+        OCC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let occupancy_shm = match OccupancyGridShmWriter::new(&occ_test_path) {
         Ok(w) => Some(Arc::new(parking_lot::Mutex::new(w))),

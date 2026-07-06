@@ -59,8 +59,11 @@ pub const PROFILE_REPLANNING_ASTAR: &str = "replanning-astar";
 pub const PROFILE_CMU_NATIVE: &str = "cmu-native";
 /// `exploration-native` profile 字符串(P1:依赖 native bridge 进程,本期未实装)。
 pub const PROFILE_EXPLORATION_NATIVE: &str = "exploration-native";
-/// `mls3d` profile 字符串(P1:`nuwax-nav-mls-planner` feature 未开)。
-pub const PROFILE_MLS3D: &str = "mls3d";
+/// `mls-3d` profile 字符串(P1:`nuwax-nav-mls-planner` feature 未开)。
+/// 注意:与 `NavStackProfile::Mls3D.as_str()` 一致,使用 kebab-case "mls-3d"
+/// 而非 "mls3d",否则 `build_nav_stack_handle_renders_for_all_profiles`
+/// 测试中 `text.contains(p)` 会失败。
+pub const PROFILE_MLS3D: &str = "mls-3d";
 
 /// 默认 profile(env 未设置或非法值时)。
 pub const DEFAULT_PROFILE: &str = PROFILE_SIMPLE_2D;
@@ -480,17 +483,33 @@ pub async fn cancel(
         warn!("publish zero cmd_vel 失败: {};状态机仍切到 cancelled", e);
     }
     // 3. 状态机切到 Cancelled。
-    let mut slot = state.inner.write().await;
-    let prev_goal_id = slot.goal.as_ref().map(|g| g.id.clone());
-    slot.phase = NavPhase::Cancelled;
-    slot.goal = None;
-    slot.follower = None;
-    slot.message = format!(
-        "导航已取消(goal_id={:?} requested={:?})",
-        prev_goal_id, goal_id,
-    );
-    let _ = slot; // 显式 drop 提前,避免持锁 publish。
-    let nav = state.snapshot(goal_id, 0.0).await;
+    let prev_goal_id;
+    let status_after;
+    let message_after;
+    {
+        let mut slot = state.inner.write().await;
+        prev_goal_id = slot.goal.as_ref().map(|g| g.id.clone());
+        slot.phase = NavPhase::Cancelled;
+        slot.goal = None;
+        slot.follower = None;
+        slot.message = format!(
+            "导航已取消(goal_id={:?} requested={:?})",
+            prev_goal_id, goal_id,
+        );
+        status_after = slot.phase.as_str().to_string();
+        message_after = slot.message.clone();
+        // slot 在 block 结束时 drop,锁随之释放。
+    }
+    // 不调 state.snapshot():cargo test 的 current_thread runtime 下,
+    // 紧跟 write 释放的 read().await 会出现 hanging(已 root cause 在
+    // phase3-5 fixup 反馈文档),改成直接构造 NavState 返回。
+    let nav = NavState {
+        status: status_after,
+        message: message_after,
+        goal_id,
+        distance_remaining: 0.0,
+        timestamp_ns: now_ns(),
+    };
     CancelOutcome { state: nav }
 }
 
@@ -610,6 +629,16 @@ fn quat_to_yaw(qx: f64, qy: f64, qz: f64, qw: f64) -> f64 {
     siny_cosp.atan2(cosy_cosp)
 }
 
+/// 把 `/topic#pkg.Msg` typed pattern 解析成 `LcmTopic` 与 suffix。
+///
+/// `LcmTopic::new` 强约束 channel 字符串不能含 `#`(typed suffix 分隔符);
+/// `channel_registry::resolve_channel` 默认值 = `/cmd_vel#geometry_msgs.Twist`
+/// 这种 typed pattern,所以需要先 split 再喂给 `LcmTopic::new`。
+fn parse_channel_with_suffix(channel: &str) -> Result<(LcmTopic, Option<String>), String> {
+    LcmTopic::parse_subscription_pattern(channel)
+        .map_err(|e| format!("LcmTopic::parse_subscription_pattern({}) 失败: {}", channel, e))
+}
+
 /// publish `/nav/goal` typed frame。
 async fn publish_goal_frame(
     handle: &GeometryRuntimeHandle,
@@ -620,10 +649,7 @@ async fn publish_goal_frame(
         GOAL_CHANNEL_PLATFORM,
         GOAL_CHANNEL_DEFAULT,
     );
-    let topic = match LcmTopic::new(&channel) {
-        Ok(t) => t,
-        Err(e) => return Err(format!("LcmTopic::new({}) 失败: {}", channel, e)),
-    };
+    let (topic, _suffix) = parse_channel_with_suffix(&channel)?;
     let payload = typed_codec::encode_pose_stamped_payload(&input.target);
     let frame: RawLcmFrame = typed_codec::build_typed_frame(
         topic,
@@ -648,10 +674,7 @@ async fn publish_cancel_frame(
         "NUWAX_LCM_CHANNEL_NAV_CANCEL",
         "/nav/cancel#nuwax_msgs.CancelNavigation",
     );
-    let topic = match LcmTopic::new(&channel) {
-        Ok(t) => t,
-        Err(e) => return Err(format!("LcmTopic::new({}) 失败: {}", channel, e)),
-    };
+    let (topic, _suffix) = parse_channel_with_suffix(&channel)?;
     let payload = typed_codec::encode_nav_cancel_payload(goal_id, now_ns());
     let msg_type = LcmMessageType::new("nuwax_msgs/CancelNavigation")
         .map_err(|e| format!("LcmMessageType::new 失败: {}", e))?;
@@ -680,10 +703,7 @@ async fn publish_cmd_vel(
         "NUWAX_LCM_CHANNEL_CMD_VEL",
         "/cmd_vel#geometry_msgs.Twist",
     );
-    let topic = match LcmTopic::new(&channel) {
-        Ok(t) => t,
-        Err(e) => return Err(format!("LcmTopic::new({}) 失败: {}", channel, e)),
-    };
+    let (topic, _suffix) = parse_channel_with_suffix(&channel)?;
     let payload = typed_codec::encode_cmd_vel_payload(linear, angular, now_ns());
     let msg_type = LcmMessageType::new("geometry_msgs/Twist")
         .map_err(|e| format!("LcmMessageType::new 失败: {}", e))?;

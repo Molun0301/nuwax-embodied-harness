@@ -241,7 +241,18 @@ class LcmChannelConfig:
 
 @dataclass
 class PlatformGeometryConfig:
-    """平台几何引擎统一配置（目标态：LCM + nuwax-geometry-runtime，无 ROS2/Nav2）。"""
+    """平台几何引擎统一配置（目标态：LCM + nuwax-geometry-runtime，无 ROS2/Nav2）。
+
+    ## LCM backend 默认
+    `lcm_backend` 默认 = `"real-lcm"`（Phase 1 fail-fast 收敛版）。
+    - 设 `real-lcm` 时,nuwax-geometry-runtime 启动期直接 fail-fast(exit 4 +
+      stderr 输出 `LCM_BACKEND_UNAVAILABLE` 关键字),不允许 fallback fake-lcm;
+      上游 dimos `nuwax-transport/real-lcm` feature 仍为空桩 + fingerprint
+      仍 FNV-1a(非 lcm-gen MurmurHash64A),属于 dependency mismatch blocker。
+    - CI / contract test 显式覆盖:设 `NUWAX_LCM_BACKEND=fake-lcm` 走 fake。
+    - Phase 2 + 后续阶段保持 `real-lcm` 不变;P1 上游 blocker 命中后,本字段
+      自动生效,fail-fast 行为取消。
+    """
 
     enabled: bool = True
     stack: str = GEOMETRY_STACK_NAME

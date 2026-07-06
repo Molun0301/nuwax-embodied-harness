@@ -464,8 +464,14 @@ impl LcmBackendKind {
         // Phase 0 收敛：canonical = `real-lcm` / `fake-lcm`；`real` / `fake` 为
         // 迁移 alias，归一化到 canonical 并打 warn。其他值（空 / 未知）默认
         // 走 Fake backend。
+        //
+        // Phase 6 (codex-round2 M2)：当 `NUWAX_REAL_LCM_REQUIRED=true` 时，
+        // backend 选择是 real-lcm/fake-lcm 必须显式 — fake-lcm 与 REAL_LCM_REQUIRED=true
+        // 是自相矛盾（fake backend 不存在 real-lcm fail 问题），进程立即
+        // exit 1 + `LCM_BACKEND_CONFIG_MISMATCH` 错误。
         let raw = std::env::var("NUWAX_LCM_BACKEND").unwrap_or_default();
         let normalized = raw.trim().to_ascii_lowercase();
+        let real_lcm_required = real_lcm_required_from_env();
         let canonical = match normalized.as_str() {
             "real-lcm" | "real" => {
                 if normalized == "real" {
@@ -475,11 +481,33 @@ impl LcmBackendKind {
                 }
                 "real-lcm"
             }
-            "fake-lcm" | "fake" | "" => {
+            "fake-lcm" | "fake" => {
                 if normalized == "fake" {
                     tracing::warn!(
                         "NUWAX_LCM_BACKEND=fake 是迁移 alias；已归一化为 fake-lcm。后续请直接传 canonical 名。"
                     );
+                }
+                // M2 mismatch 校验：REAL_LCM_REQUIRED=true + fake-lcm 是误配。
+                if real_lcm_required {
+                    eprintln!(
+                        "LCM_BACKEND_CONFIG_MISMATCH: NUWAX_REAL_LCM_REQUIRED=true 时 \
+                         NUWAX_LCM_BACKEND=fake-lcm 是自相矛盾配置；fake backend 不存在 \
+                         real-lcm 上游可用性问题。请改 NUWAX_LCM_BACKEND=real-lcm。退出。"
+                    );
+                    std::process::exit(1);
+                }
+                "fake-lcm"
+            }
+            "" => {
+                // 空值沿用历史默认：走 fake-lcm，但若 REAL_LCM_REQUIRED=true
+                // 仍触发 mismatch（默认行为本身与 REAL_LCM_REQUIRED=true 矛盾）。
+                if real_lcm_required {
+                    eprintln!(
+                        "LCM_BACKEND_CONFIG_MISMATCH: NUWAX_REAL_LCM_REQUIRED=true 时 \
+                         NUWAX_LCM_BACKEND 未设置（默认 fake-lcm）与要求 real-lcm 矛盾；\
+                         请显式设置 NUWAX_LCM_BACKEND=real-lcm。退出。"
+                    );
+                    std::process::exit(1);
                 }
                 "fake-lcm"
             }
@@ -501,13 +529,16 @@ impl LcmBackendKind {
 
 /// 读 `NUWAX_REAL_LCM_REQUIRED`：true/false/1/0/yes/no/on/off (大小写不敏感)。
 ///
-/// 当 `NUWAX_REAL_LCM_REQUIRED=true` + 选择 real-lcm backend 但 real-lcm 上游 blocker
-/// 命中（feature 仍空桩 + fingerprint 未切 MurmurHash64A）时，启动期进程直接
-/// exit 1，**不**在 binary 端静默 fallback 到 fake-lcm；运行期故障仍只走
-/// `HealthCheck healthy=false` 路径，不重新触发 exit。
-///
-/// 默认 false；与 `core/settings.py::REAL_LCM_REQUIRED` 语义保持对齐（Python 端
-/// 也是 fail-fast 设计，但 Python 不执进程退出）。
+/// Phase 6 (codex-round2 M2) 语义：
+/// - `true` 时强制要求 `NUWAX_LCM_BACKEND=real-lcm`；当 `NUWAX_LCM_BACKEND=fake-lcm`
+///   （显式 / 隐式 / 别名 / 空值）时，进程立即 exit 1 + `LCM_BACKEND_CONFIG_MISMATCH`，
+///   不允许静默 fallback。
+/// - `true` + real-lcm 选择 + real-lcm 上游 blocker 命中（feature 仍空桩 +
+///   fingerprint 未切 MurmurHash64A）时，启动期进程直接 exit 1，
+///   **不**在 binary 端静默 fallback 到 fake-lcm；运行期故障仍只走
+///   `HealthCheck healthy=false` 路径，不重新触发 exit。
+/// - 默认 false；与 `core/settings.py::REAL_LCM_REQUIRED` 语义保持对齐（Python 端
+///   也是 fail-fast 设计，但 Python 不执进程退出）。
 pub fn real_lcm_required_from_env() -> bool {
     let raw = std::env::var("NUWAX_REAL_LCM_REQUIRED").unwrap_or_default();
     matches!(

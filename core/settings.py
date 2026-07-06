@@ -257,9 +257,14 @@ NAV_PROXY_PENDING_QUEUE_MAX_SIZE: int = max(
 # - NUWAX_EXPLORE_ARBITRATION → Rust `explore_runtime.rs` 读取,选择
 #                          PreferWavefront / PreferTare / HighestScore / FirstAvailable;
 #                          默认 prefer_wavefront,与 nuwax-explore-wavefront 对齐。
-# - NUWAX_REAL_LCM_REQUIRED → true 时启动期 real-lcm 失败必须 fail-fast 并退出
-#                          (HealthCheck healthy=false + LCM_BACKEND_UNAVAILABLE),
-#                          不允许 fallback 到 fake-lcm;默认 false 由环境侧决策。
+# - NUWAX_REAL_LCM_REQUIRED → true 时强制要求 real-lcm backend；real-lcm
+#                          上游不可用时进程 exit 1 + LCM_BACKEND_UNAVAILABLE,
+#                          不允许 fallback 到 fake-lcm。**与 fake-lcm backend
+#                          互斥**：若同时设置 `NUWAX_LCM_BACKEND=fake-lcm`
+#                          （显式 / 别名 / 空值），进程启动时直接 exit 1 并打
+#                          LCM_BACKEND_CONFIG_MISMATCH 错误（Python 端
+#                          load_config 同步抛 ValueError）。
+#                          默认 false 由环境侧决策。
 NAV_PROFILE: str = _cfg_str("NUWAX_NAV_PROFILE", "simple-2d").strip() or "simple-2d"
 EXPLORE_ARBITRATION: str = (
     _cfg_str("NUWAX_EXPLORE_ARBITRATION", "prefer_wavefront").strip() or "prefer_wavefront"
@@ -666,6 +671,23 @@ def _build_deferred_projection_config() -> DeferredProjectionConfig:
 
 def load_config() -> NuwaxRobotBridgeConfig:
     """统一加载配置。"""
+
+    # Phase 6 (codex-round2 M2) mismatch 校验：
+    # `NUWAX_REAL_LCM_REQUIRED=true` 与 `NUWAX_LCM_BACKEND=fake-lcm` 是自相矛盾
+    # 配置（fake backend 不存在 real-lcm 上游可用性问题）。Python 端 load_config
+    # 必须先抛 ValueError，让上游调用方（gateway / start_gateway.sh /
+    # nuwax-geometry-runtime 启动链路）尽快暴露误配。Rust 端 lcm_runtime.rs
+    # 也独立做了同样的校验并以 `LCM_BACKEND_CONFIG_MISMATCH` 关键字退出。
+    _real_lcm_required = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
+    _lcm_backend_raw = _cfg_str("NUWAX_LCM_BACKEND", "fake-lcm").strip().lower()
+    if _real_lcm_required and _lcm_backend_raw in ("fake-lcm", "fake", ""):
+        raise ValueError(
+            "LCM_BACKEND_CONFIG_MISMATCH: NUWAX_REAL_LCM_REQUIRED=true 与 "
+            "NUWAX_LCM_BACKEND={!r} 互斥（fake backend 不存在 real-lcm 上游可用性问题）。"
+            "请改 NUWAX_LCM_BACKEND=real-lcm 或取消 NUWAX_REAL_LCM_REQUIRED=true。".format(
+                _lcm_backend_raw or "<empty>"
+            )
+        )
 
     log_dir = _cfg_str("NUWAX_LOG_DIR", _cfg_str("GO2_PROXY_LOG_DIR", str(BASE_DIR)))
     log_file = _cfg_str(

@@ -382,7 +382,7 @@ _ZH_NAMES: Dict[str, str] = {
     # 三者均对接 nuwax-geometry-runtime (Rust) 装配面,不再走旧 rclpy/Nav2.
     "NUWAX_NAV_PROFILE": "导航 profile（simple-2d / replanning-astar / cmu-native / mls3d / exploration-native；默认 simple-2d）",
     "NUWAX_EXPLORE_ARBITRATION": "探索 source arbitration（prefer_wavefront / prefer_tare / highest_score / first_available；默认 prefer_wavefront）",
-    "NUWAX_REAL_LCM_REQUIRED": "real-lcm 启动失败 fail-fast 开关（true 时 fake-lcm 不允许作为 fallback）",
+    "NUWAX_REAL_LCM_REQUIRED": "real-lcm 启动失败 fail-fast 开关（true 时强制要求 real-lcm backend；real-lcm 不可用时进程 exit 1。与 fake-lcm backend 互斥：若同时设置 NUWAX_LCM_BACKEND=fake-lcm（显式/别名/空值），进程启动时直接 exit 1 并打 LCM_BACKEND_CONFIG_MISMATCH 错误，Python load_config 同步抛 ValueError）",
 
     # 几何运行时与 LCM
     "NUWAX_GEOMETRY_RUNTIME_BINARY": "nuwax-geometry-runtime 二进制路径",

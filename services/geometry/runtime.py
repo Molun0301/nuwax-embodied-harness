@@ -6927,6 +6927,16 @@ class PlatformGeometryProviderBundle(
                     "返回 False（不再悄悄走 Python 旧状态机）。"
                 )
                 return False
+        # Phase 6 (codex-round2 M3)：remote is None 时也必须显式
+        # NUWAX_EXPLORATION_LEGACY guard。默认（NUWAX_EXPLORATION_LEGACY=false）
+        # 不允许悄悄走 Python 旧状态机，返回 False（语义：runtime 没起或不通，
+        # 调用方应当从 gRPC facade 拿到 NOT_READY）。
+        if not self._is_legacy_exploration_fallback_allowed():
+            LOGGER.error(
+                "Bundle.start_exploration remote=None 且 legacy 开关关闭，"
+                "返回 False（不再悄悄走 Python 旧状态机）。"
+            )
+            return False
         # legacy fallback：仅当显式 NUWAX_EXPLORATION_LEGACY=true 时才允许
         return self.runtime.start_platform_exploration(request)
 
@@ -6943,6 +6953,14 @@ class PlatformGeometryProviderBundle(
                 LOGGER.exception("Bundle.stop_exploration gRPC 异常，准备 fallback legacy。")
             if not self._is_legacy_exploration_fallback_allowed():
                 return False
+        # Phase 6 (codex-round2 M3)：remote is None 时也必须显式
+        # NUWAX_EXPLORATION_LEGACY guard，与 start_exploration 行为对齐。
+        if not self._is_legacy_exploration_fallback_allowed():
+            LOGGER.error(
+                "Bundle.stop_exploration remote=None 且 legacy 开关关闭，"
+                "返回 False。"
+            )
+            return False
         return self.runtime.stop_platform_exploration()
 
     def sync_exploration_after_task(self) -> bool:
@@ -6983,6 +7001,10 @@ class PlatformGeometryProviderBundle(
         关键不变量：`_resolve_exploration_backend` 默认 owner 是 `_remote_provider`
         (GeometryRuntimeProvider)。当 remote 不连通且 legacy 开关关闭时，必须返回
         不允许假装成功的状态（沿用 `get_platform_exploration_state` 的 IDLE 语义）。
+
+        Phase 6 (codex-round2 M3)：remote is None 时也必须显式
+        NUWAX_EXPLORATION_LEGACY guard,与 start_exploration / stop_exploration 行为
+        对齐：默认（NUWAX_EXPLORATION_LEGACY=false）下不允许悄悄走 Python 旧状态机。
         """
         if not self._is_geometry_profile_enabled():
             from contracts.navigation import ExplorationState, ExplorationStatus
@@ -7013,6 +7035,20 @@ class PlatformGeometryProviderBundle(
                         "gRPC_facade": "available_no_state",
                     },
                 )
+        # Phase 6 (codex-round2 M3)：remote is None 分支也必须走 guard,
+        # 默认不允许假装成功（与 start_exploration / stop_exploration 对齐）。
+        if not self._is_legacy_exploration_fallback_allowed():
+            from contracts.navigation import ExplorationState, ExplorationStatus
+
+            return ExplorationState(
+                status=ExplorationStatus.IDLE,
+                message="remote=None 且 legacy 关闭",
+                metadata={
+                    "provider": "platform_geometry_runtime",
+                    "shim": True,
+                    "remote_facade": "unavailable",
+                },
+            )
         return self.runtime.get_platform_exploration_state()
 
     @staticmethod

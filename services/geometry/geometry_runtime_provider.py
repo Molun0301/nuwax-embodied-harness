@@ -533,6 +533,114 @@ class GeometryRuntimeProvider:
             _log_rpc_error("HealthCheck(get_lcm_backend_name)", e)
             return "<unknown>"
 
+    # === Phase 6: mapping / nav / explore diagnostics facade ===
+    # 阶段目标:让 Python gateway/service 只感知 provider 协议,不再依赖历史
+    # 外部脚本或 nav2 命名。provider 对外暴露三套统一 diagnostics dict:
+    #   - get_mapping_diagnostics()    : 建图板块
+    #   - get_navigation_diagnostics() : 导航板块
+    #   - get_exploration_diagnostics(): 探索板块(已在 Phase 5 实装,本阶段保留入口)
+    # 任一方法失败都返回 None,绝不假成功。
+    def get_mapping_diagnostics(self) -> Optional[Dict[str, Any]]:
+        """返回 mapping 板块 diagnostics dict(走 `HealthCheck` + `GetOccupancyGrid`)。
+
+        字段:
+          - ``ready`` (bool): HealthCheck.healthy + occupancy grid 已发布
+          - ``lcm_backend`` (str): canonical LCM backend 名
+          - ``has_occupancy_grid`` (bool): 是否能从 occupancy grid meta 取到 revision
+          - ``occupancy_revision`` (int|None): 最近一帧 occupancy 修订号
+          - ``error`` (str|None): 失败原因
+
+        返回 None —— 子进程未连接。
+        """
+        if not self._connected or not self._stub:
+            return None
+        try:
+            health = self._stub.HealthCheck(
+                pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
+            )
+        except grpc.RpcError as e:
+            _log_rpc_error("HealthCheck(get_mapping_diagnostics)", e)
+            return {
+                "ready": False,
+                "lcm_backend": "<unknown>",
+                "has_occupancy_grid": False,
+                "occupancy_revision": None,
+                "error": "HealthCheck 失败: %s" % e,
+            }
+        lcm_backend = str(getattr(health, "lcm_backend", "") or "<unknown>")
+        has_occupancy = False
+        occupancy_revision: Optional[int] = None
+        try:
+            grid_meta = self._stub.GetOccupancyGrid(
+                pb2.Empty(), timeout=_pose_deadline_sec()
+            )
+            has_occupancy = bool(getattr(grid_meta, "width", 0) > 0 and getattr(grid_meta, "height", 0) > 0)
+            occupancy_revision = int(getattr(grid_meta, "revision", 0) or 0) or None
+        except grpc.RpcError as e:
+            _log_rpc_error("GetOccupancyGrid(get_mapping_diagnostics)", e)
+        return {
+            "ready": bool(getattr(health, "healthy", False)) and has_occupancy,
+            "lcm_backend": lcm_backend,
+            "has_occupancy_grid": has_occupancy,
+            "occupancy_revision": occupancy_revision,
+            "error": None,
+        }
+
+    def get_navigation_diagnostics(self) -> Optional[Dict[str, Any]]:
+        """返回 navigation 板块 diagnostics dict(走 `HealthCheck` + `GetNavigationReadiness`)。
+
+        字段:
+          - ``ready`` (bool): nuwax nav_runtime + lcm backend 都健康
+          - ``lcm_backend`` (str): canonical LCM backend 名
+          - ``readiness`` (dict): `GetNavigationReadiness` 解析后字段
+            (ready/message/lcm_backend/tf/costmap/planner/cmd_vel_sink/profile/
+             module_node_count/p1_native_profiles)
+          - ``profile`` (str|None): 当前 nav profile(由 readiness.profile 提取)
+          - ``module_node_count`` (int|None): NavStack module graph 节点数
+          - ``p1_native_profiles`` (list|None): 本期未启用的 native profile 列表
+          - ``error`` (str|None): 失败原因
+
+        返回 None —— 子进程未连接。
+        """
+        if not self._connected or not self._stub:
+            return None
+        lcm_backend = "<unknown>"
+        try:
+            health = self._stub.HealthCheck(
+                pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
+            )
+            lcm_backend = str(getattr(health, "lcm_backend", "") or "<unknown>")
+        except grpc.RpcError as e:
+            _log_rpc_error("HealthCheck(get_navigation_diagnostics)", e)
+            return {
+                "ready": False,
+                "lcm_backend": "<unknown>",
+                "readiness": None,
+                "profile": None,
+                "module_node_count": None,
+                "p1_native_profiles": None,
+                "error": "HealthCheck 失败: %s" % e,
+            }
+        readiness = self.get_navigation_readiness()
+        profile = readiness.get("profile") if isinstance(readiness, dict) else None
+        module_node_count = (
+            readiness.get("module_node_count") if isinstance(readiness, dict) else None
+        )
+        p1_native_profiles = (
+            readiness.get("p1_native_profiles") if isinstance(readiness, dict) else None
+        )
+        return {
+            "ready": bool(getattr(health, "healthy", False)) and bool(
+                isinstance(readiness, dict) and readiness.get("ready")
+            ),
+            "lcm_backend": lcm_backend,
+            "readiness": readiness,
+            "profile": profile,
+            "module_node_count": module_node_count,
+            "p1_native_profiles": p1_native_profiles,
+            "error": None,
+        }
+
     # === Localization ===
     def get_current_pose(self) -> Optional[Pose]:
         self._raise_if_stopping("get_current_pose")

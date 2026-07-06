@@ -87,14 +87,22 @@ impl GeometryRuntime for GeometryRuntimeService {
 
     async fn health_check(&self, _req: Request<HealthCheckRequest>) -> Result<Response<HealthCheckResponse>, Status> {
         let s = self.state.read().await;
+        // Phase 1 fail-fast:当 LCM backend 不可用时,health_check 必须
+        // 返回 healthy=false + 把 backend 名编码成 "real-lcm-unavailable",
+        // HealthCheck 调用方可从 lcm_backend 字段 grep "LCM_BACKEND_UNAVAILABLE" 关键字;
+        // 主进程也已在 spawn 阶段直接退出(exit 4),所以本分支属于
+        // 防御性兜底:例如未来 real-lcm feature 实装后但运行时 binding
+        // 初始化失败的场景。
+        let lcm_backend = self.bridge.transport_backend_name.to_string();
+        let healthy = self.bridge.lcm_backend_available;
         Ok(Response::new(HealthCheckResponse {
-            healthy: true,
+            healthy,
             phase: s.phase.clone(),
             uptime_ms: uptime_ms(s.started_at_ns),
             rss_kb: get_rss_kb(),
             video_frame_sequence: 0,
             video_fps_estimate: 0,
-            lcm_backend: self.bridge.transport_backend_name.to_string(),
+            lcm_backend,
         }))
     }
 

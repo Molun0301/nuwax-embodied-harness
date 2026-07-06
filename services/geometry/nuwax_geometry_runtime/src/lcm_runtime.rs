@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use nuwax_protocol::{LcmMessageType, LcmTopic};
 use nuwax_transport::LcmTransport;
+use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
@@ -39,6 +40,18 @@ use crate::pointcloud::CloudMapShmWriter;
 // ============================================================================
 // 状态定义（与原 ros2_bridge.rs 同结构，便于 server.rs 不感知 backend 切换）
 // ============================================================================
+
+/// Phase 1 fail-fast 错误：上游 dimos `nuwax-lcm-sys`/`nuwax-lcm` 尚不存在
+///（`nuwax-transport/real-lcm` feature 仍为空桩），所以 `real-lcm` backend
+/// 启动期直接拒绝；不允许 fallback fake-lcm。错误码 `LCM_BACKEND_UNAVAILABLE`
+/// 必须在 stderr 中可见供 start 脚本与运维 grep 识别。
+#[derive(Debug, Error)]
+#[error(
+    "LCM_BACKEND_UNAVAILABLE: NUWAX_LCM_BACKEND=real-lcm 不可用 —— 上游 dimos \
+     nuwax-transport/real-lcm feature 仍为空桩 (Rust LCM binding 未实装 + \
+     fingerprint 未切 MurmurHash64A)。详见 feedback_phase1.md。"
+)]
+pub struct RealLcmBackendUnavailable;
 
 #[derive(Clone, Default)]
 pub struct PoseState {
@@ -138,7 +151,14 @@ pub struct GeometryRuntimeHandle {
     pub nav_state_tx: broadcast::Sender<NavState>,
     pub frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
     pub transport: LcmTransport,
+    /// canonical LCM backend 名（HealthCheck / 日志 / diagnostics 用）：
+    /// - `fake-lcm` — 内存 fake（CI 默认）
+    /// - `real-lcm-unavailable` — 用户请求 real-lcm 但上游 blocker 命中
     pub transport_backend_name: &'static str,
+    /// backend 是否真正可用。当 `false` 时 server.rs 的 HealthCheck 必须
+    /// 返回 `healthy=false` + `LCM_BACKEND_UNAVAILABLE` message；
+    /// 该 flag 当前唯一触发源是 `LcmBackendKind::Real`（fail-fast 设计）。
+    pub lcm_backend_available: bool,
 }
 
 // ============================================================================
@@ -425,42 +445,62 @@ impl LcmBackendKind {
 
 /// 启动 geometry runtime 异步循环（LCM-first）。
 ///
-/// 当前默认走 fake backend；`NUWAX_LCM_BACKEND=real` 会在启动期检测
-/// 上游 `nuwax-transport/real-lcm` feature 就位状态——目前 feature 为空桩,
-/// 启动会 warn 并强制 fallback 到 fake,避免误传环境变量时悄悄走错路。
+/// 当前默认走 fake backend；`NUWAX_LCM_BACKEND=real-lcm` 启动期直接
+/// fail-fast 返回 [`RealLcmBackendUnavailable`]（不在 fake 路径静默 fallback）：
+/// 上游 dimos `nuwax-transport/real-lcm` feature 仍为空桩 + fingerprint 仍
+/// 是 FNV-1a（非 lcm-gen MurmurHash64A），属于 dependency mismatch blocker。
+/// 详见 feedback_phase1.md §2。
+///
 /// P1 实装 Rust LCM binding + MurmurHash64A fingerprint 切换后,
-/// 改 `select_transport` 实现即可,无需改订阅语义。
+/// 在 `LcmBackendKind::Real` 分支补 `LcmTransport::new_real(url)` 调用即可,
+/// 无需改订阅语义。
+///
+/// # Args
+///
+/// * `pose_channel` — Phase 1 新增；`geometry_msgs/PoseStamped` typed channel
+/// * `odometry_channel` — Phase 1 新增；`nav_msgs/Odometry` typed channel
+/// * `cmd_vel_channel` — Phase 1 新增；`geometry_msgs/Twist` typed channel
+/// * `nav_cancel_channel` — Phase 1 新增；`nuwax_msgs/CancelNavigation` typed channel
+/// * 其余形参来自 Phase 0 默认 channel registry
 pub fn spawn_geometry_runtime(
     occupancy_channel: &str,
     tf_channel: &str,
     cloud_map_channel: Option<&str>,
     nav_state_channel: Option<&str>,
     frontiers_channel: Option<&str>,
-) -> GeometryRuntimeHandle {
+    pose_channel: Option<&str>,
+    odometry_channel: Option<&str>,
+    cmd_vel_channel: Option<&str>,
+    nav_cancel_channel: Option<&str>,
+) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
     let (nav_state_tx, _) = broadcast::channel::<NavState>(8);
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
 
     let state = Arc::new(RwLock::new(SharedState::default()));
 
-    // 按 NUWAX_LCM_BACKEND 选择 backend;real 当前未实装,启动期强制 fallback 到 fake。
-    let (transport, backend_name): (LcmTransport, &'static str) = match LcmBackendKind::from_env() {
-        LcmBackendKind::Fake => {
-            info!("LCM backend 选择: fake（默认；不依赖 liblcm）");
-            (LcmTransport::new_fake(), "fake-lcm")
-        }
-        LcmBackendKind::Real => {
-            // 上游 blocker:nuwax-transport real-lcm feature 为空 + fingerprint 未切 MurmurHash64A。
-            // 见 docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/06_LCM接入与wire-format验证.md §1.2 / §2.1。
-            warn!(
-                "NUWAX_LCM_BACKEND=real 当前不可用：上游 nuwax-transport/real-lcm feature 仍为空桩 \
-                 (Rust LCM binding 未实装 + fingerprint 未切 MurmurHash64A)。强制 fallback 到 fake。 \
-                 上游 PR 落地后,改 LcmBackendKind::Real 分支即可。"
-            );
-            (LcmTransport::new_fake(), "real-lcm-pending")
-        }
-    };
-    info!("nuwax-geometry-runtime 启动：LCM backend = {}", backend_name);
+    // 按 NUWAX_LCM_BACKEND 选择 backend。
+    // Phase 1 fail-fast:real-lcm 请求启动期直接拒绝；不允许 fallback fake-lcm。
+    let (transport, backend_name, backend_available): (LcmTransport, &'static str, bool) =
+        match LcmBackendKind::from_env() {
+            LcmBackendKind::Fake => {
+                info!("LCM backend 选择: fake（默认；不依赖 liblcm）");
+                (LcmTransport::new_fake(), "fake-lcm", true)
+            }
+            LcmBackendKind::Real => {
+                // dependency mismatch blocker:
+                //   - dimos workspace 无 `nuwax-lcm-sys` / `nuwax-lcm` crate
+                //   - `nuwax-transport/real-lcm` feature 仍为 `[]` 空桩
+                //   - fingerprint 当前 = FNV-1a 64-bit,非 lcm-gen MurmurHash64A
+                // 处置:启动期直接返回 RealLcmBackendUnavailable,main.rs 立即退出。
+                // **绝不**在 Real 失败路径调用 `LcmTransport::new_fake()`。
+                return Err(RealLcmBackendUnavailable);
+            }
+        };
+    info!(
+        "nuwax-geometry-runtime 启动：LCM backend = {} (available={})",
+        backend_name, backend_available
+    );
 
     let occ_topic = LcmTopic::new(occupancy_channel)
         .unwrap_or_else(|_| LcmTopic::new("/map/occupancy").expect("default topic"));
@@ -469,12 +509,50 @@ pub fn spawn_geometry_runtime(
     let cm_topic = cloud_map_channel.map(LcmTopic::new).transpose().ok().flatten();
     let nav_topic = nav_state_channel.map(LcmTopic::new).transpose().ok().flatten();
     let fr_topic = frontiers_channel.map(LcmTopic::new).transpose().ok().flatten();
+    // Phase 1 channel registry 补齐:解析 4 类 typed channel;若 LcmTopic 校验失败
+    // (例如 typed suffix 缺失)回退到 default string,然后降级为 None。
+    let pose_topic = pose_channel
+        .map(|c| LcmTopic::new(c).unwrap_or_else(|_| LcmTopic::new("/pose_stamped").expect("default")))
+        .or_else(|| LcmTopic::new("/pose_stamped").ok());
+    let odom_topic = odometry_channel
+        .map(|c| LcmTopic::new(c).unwrap_or_else(|_| LcmTopic::new("/odom").expect("default")))
+        .or_else(|| LcmTopic::new("/odom").ok());
+    let cmd_vel_topic = cmd_vel_channel
+        .map(|c| LcmTopic::new(c).unwrap_or_else(|_| LcmTopic::new("/cmd_vel").expect("default")))
+        .or_else(|| LcmTopic::new("/cmd_vel").ok());
+    let nav_cancel_topic = nav_cancel_channel
+        .map(|c| LcmTopic::new(c).unwrap_or_else(|_| LcmTopic::new("/nav/cancel").expect("default")))
+        .or_else(|| LcmTopic::new("/nav/cancel").ok());
 
     let occ_msg_type = LcmMessageType::new("nav_msgs/OccupancyGrid").expect("typed");
     let tf_msg_type = LcmMessageType::new("geometry_msgs/Transform").expect("typed");
     let cm_msg_type = LcmMessageType::new("sensor_msgs/PointCloud2").expect("typed");
     let nav_msg_type = LcmMessageType::new("nuwax_msgs/NavigationState").expect("typed");
     let fr_msg_type = LcmMessageType::new("nuwax_msgs/FrontierList").expect("typed");
+    let pose_msg_type = LcmMessageType::new("geometry_msgs/PoseStamped").expect("typed");
+    let odom_msg_type = LcmMessageType::new("nav_msgs/Odometry").expect("typed");
+    let cmd_vel_msg_type = LcmMessageType::new("geometry_msgs/Twist").expect("typed");
+    let nav_cancel_msg_type = LcmMessageType::new("nuwax_msgs/CancelNavigation").expect("typed");
+    // Phase 1:打印 channel registry 让运维和 healthcheck 都能看到本进程
+    // 注册的全部 typed channel;Phase 2+ 将在此基础上挂接订阅任务。
+    info!(
+        "LCM channel registry: occupancy={} tf={} cloud_map={} nav_state={} frontiers={} pose={} odom={} cmd_vel={} nav_cancel={}",
+        occ_topic.channel(),
+        tf_topic.channel(),
+        cm_topic.as_ref().map(LcmTopic::channel).unwrap_or("<none>"),
+        nav_topic.as_ref().map(LcmTopic::channel).unwrap_or("<none>"),
+        fr_topic.as_ref().map(LcmTopic::channel).unwrap_or("<none>"),
+        pose_topic.as_ref().map(LcmTopic::channel).unwrap_or("<none>"),
+        odom_topic.as_ref().map(LcmTopic::channel).unwrap_or("<none>"),
+        cmd_vel_topic.as_ref().map(LcmTopic::channel).unwrap_or("<none>"),
+        nav_cancel_topic.as_ref().map(LcmTopic::channel).unwrap_or("<none>"),
+    );
+    info!(
+        "LCM msg-type registry: occupancy={} tf={} cloud_map={} nav_state={} frontiers={} pose={} odom={} cmd_vel={} nav_cancel={}",
+        occ_msg_type.fqn(), tf_msg_type.fqn(), cm_msg_type.fqn(),
+        nav_msg_type.fqn(), fr_msg_type.fqn(), pose_msg_type.fqn(),
+        odom_msg_type.fqn(), cmd_vel_msg_type.fqn(), nav_cancel_msg_type.fqn(),
+    );
 
     // 累积地图 mmap 初始化（降级允许）
     let cm_shm_path = std::path::PathBuf::from(
@@ -732,12 +810,13 @@ pub fn spawn_geometry_runtime(
         });
     }
 
-    GeometryRuntimeHandle {
+    Ok(GeometryRuntimeHandle {
         state,
         cloud_map_tx,
         nav_state_tx,
         frontiers_tx,
         transport,
         transport_backend_name: backend_name,
-    }
+        lcm_backend_available: backend_available,
+    })
 }

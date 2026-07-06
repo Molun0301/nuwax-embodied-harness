@@ -46,11 +46,11 @@ mkdir -p "$(dirname "${LOG_FILE}")"
 
 echo "==> 启动 nuwax-geometry-runtime: ${NUWAX_GEOMETRY_RUNTIME_BINARY}"
 echo "    gRPC port=${NUWAX_GEOMETRY_RUNTIME_PORT} ready_file=${NUWAX_GEOMETRY_RUNTIME_READY_FILE}"
-echo "    LCM_URL=${NUWAX_LCM_URL:-<unset>}"
+echo "    LCM_URL=${NUWAX_LCM_URL:-<unset>} LCM_BACKEND=${NUWAX_LCM_BACKEND:-<unset>}"
+# Phase 0 收敛：env-only 启动契约。Rust main.rs 只读 env，不再传 CLI args。
+# 旧 `--port/--ready-file/--lcm-url` 已被 nuwax-geometry-runtime main.rs:49-83 拒绝
+# （main.rs 当前只接受 env 解析），继续传只会让 binary 报 unknown arg。
 nohup "${NUWAX_GEOMETRY_RUNTIME_BINARY}" \
-  --port "${NUWAX_GEOMETRY_RUNTIME_PORT}" \
-  --ready-file "${NUWAX_GEOMETRY_RUNTIME_READY_FILE}" \
-  --lcm-url "${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}" \
   >> "${LOG_FILE}" 2>&1 &
 RUNTIME_PID=$!
 echo "==> runtime PID=${RUNTIME_PID}, 日志=${LOG_FILE}"

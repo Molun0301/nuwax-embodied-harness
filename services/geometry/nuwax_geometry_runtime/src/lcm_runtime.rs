@@ -385,14 +385,39 @@ enum LcmBackendKind {
 
 impl LcmBackendKind {
     fn from_env() -> Self {
-        match std::env::var("NUWAX_LCM_BACKEND")
-            .unwrap_or_else(|_| "fake".into())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "real" | "real-lcm" => Self::Real,
-            // 默认/未知/显式 "fake" 都走 Fake backend
+        // Phase 0 收敛：canonical = `real-lcm` / `fake-lcm`；`real` / `fake` 为
+        // 迁移 alias，归一化到 canonical 并打 warn。其他值（空 / 未知）默认
+        // 走 Fake backend。
+        let raw = std::env::var("NUWAX_LCM_BACKEND").unwrap_or_default();
+        let normalized = raw.trim().to_ascii_lowercase();
+        let canonical = match normalized.as_str() {
+            "real-lcm" | "real" => {
+                if normalized == "real" {
+                    tracing::warn!(
+                        "NUWAX_LCM_BACKEND=real 是迁移 alias；已归一化为 real-lcm。后续请直接传 canonical 名。"
+                    );
+                }
+                "real-lcm"
+            }
+            "fake-lcm" | "fake" | "" => {
+                if normalized == "fake" {
+                    tracing::warn!(
+                        "NUWAX_LCM_BACKEND=fake 是迁移 alias；已归一化为 fake-lcm。后续请直接传 canonical 名。"
+                    );
+                }
+                "fake-lcm"
+            }
+            other => {
+                tracing::warn!(
+                    "NUWAX_LCM_BACKEND={:?} 无法识别；归一化为 fake-lcm。canonical 取值只允许 real-lcm / fake-lcm。",
+                    other
+                );
+                "fake-lcm"
+            }
+        };
+        match canonical {
+            "real-lcm" => Self::Real,
+            // 默认/未知/显式 fake 都走 Fake backend
             _ => Self::Fake,
         }
     }

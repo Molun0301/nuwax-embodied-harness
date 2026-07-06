@@ -151,6 +151,63 @@ def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
     return tuple(items)
 
 
+# Phase 0 收敛（env-only 启动契约）：`NUWAX_GEOMETRY_RUNTIME_ARGS` 已废弃。
+# - 旧 contract 仍允许在 ExternalGeometryStackConfig.args 写入占位元组，但不再把
+#   env 解析为真实启动参数。
+# - 启动脚本 `services/geometry/scripts/start_nuwax_geometry_runtime.sh` 与
+#   `scripts/start_gateway.sh` 都已不再向 binary 传 CLI args。
+# - 该函数仅在 import 阶段读一次 env，并在首次显式调用时打一条 warning，让
+#   运维侧能定位仍然误传该 env 的部署。
+def _deprecated_runtime_args() -> Tuple[str, ...]:
+    raw = _raw_value("NUWAX_GEOMETRY_RUNTIME_ARGS", "")
+    if not raw.strip():
+        return ()
+    if "NUWAX_GEOMETRY_RUNTIME_ARGS" not in _DEPRECATED_ENV_NOTIFIED:
+        _DEPRECATION_LOGGER.warning(
+            "NUWAX_GEOMETRY_RUNTIME_ARGS 已废弃（Phase 0 env-only 启动契约）。"
+            " nuwax-geometry-runtime 只读 env，不再接受 CLI args。"
+            " 移除该 env 配置后不再生效；保留会写一条 diagnostics 但不传参。",
+        )
+        _DEPRECATED_ENV_NOTIFIED.add("NUWAX_GEOMETRY_RUNTIME_ARGS")
+    # 不把内容当 CLI args 转发给 binary；只保留为占位元组供 diagnostics/旧 contract 读取。
+    return ()
+
+
+def _normalize_lcm_backend(value: str) -> str:
+    """Phase 0 收敛：LCM backend canonical 命名归一化。
+
+    canonical 取值：`real-lcm` / `fake-lcm`。
+    历史/兼容 alias：`real` → `real-lcm`、`fake` → `fake-lcm`。
+    其他值（空 / 未知）→ `fake-lcm`（CI/开发机默认），并在首次归一化时 warning。
+    """
+    raw = (value or "").strip().lower()
+    if raw in ("", "fake-lcm", "fake"):
+        canonical = "fake-lcm"
+    elif raw in ("real-lcm", "real"):
+        canonical = "real-lcm"
+    else:
+        canonical = "fake-lcm"
+    if raw not in ("", "fake-lcm", "real-lcm", "fake", "real"):
+        if "NUWAX_LCM_BACKEND_unknown" not in _DEPRECATED_ENV_NOTIFIED:
+            _DEPRECATION_LOGGER.warning(
+                "NUWAX_LCM_BACKEND=%r 无法识别，归一化为 %r。"
+                " canonical 取值只允许 real-lcm / fake-lcm；real/fake 为迁移 alias。",
+                value,
+                canonical,
+            )
+            _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_unknown")
+    elif raw in ("real", "fake"):
+        if "NUWAX_LCM_BACKEND_alias" not in _DEPRECATED_ENV_NOTIFIED:
+            _DEPRECATION_LOGGER.warning(
+                "NUWAX_LCM_BACKEND=%r 是历史 alias；已归一化为 %r。"
+                " 后续请直接传 canonical 名 real-lcm / fake-lcm。",
+                raw,
+                canonical,
+            )
+            _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_alias")
+    return canonical
+
+
 _DEPRECATION_LOGGER = logging.getLogger("nuwax_robot_bridge.settings.deprecation")
 _DEPRECATED_ENV_NOTIFIED: set[str] = set()
 
@@ -722,7 +779,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
             build_default_geometry_runtime_start_script(),
         ),
         lcm_url=_cfg_str("NUWAX_LCM_URL", build_default_lcm_url()),
-        lcm_backend=_cfg_str("NUWAX_LCM_BACKEND", "real-lcm"),
+        # Phase 0 收敛：LCM backend canonical 命名只允许 real-lcm / fake-lcm；
+        # 历史 alias (real/fake) 在 _normalize_lcm_backend 归一化并打 warning。
+        lcm_backend=_normalize_lcm_backend(_cfg_str("NUWAX_LCM_BACKEND", "fake-lcm")),
         nuwax_workspace_dir=_cfg_str(
             "NUWAX_NUWAX_WORKSPACE_DIR",
             build_default_nuwax_workspace_dir(),
@@ -821,7 +880,11 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 build_default_geometry_runtime_ready_file(),
             ),
             port=max(1, _cfg_int("NUWAX_GEOMETRY_RUNTIME_PORT", build_default_geometry_runtime_port())),
-            args=_cfg_csv("NUWAX_GEOMETRY_RUNTIME_ARGS", ()),
+            # Phase 0 收敛（env-only 启动契约）：保留字段但不再从
+            # `NUWAX_GEOMETRY_RUNTIME_ARGS` env 读取 CLI 参数——Rust main.rs
+            # 已不接 CLI 参数。`start_nuwax_geometry_runtime.sh` 与 systemd 都只
+            # 写 env。`args` 字段仅作历史兼容占位，写入时仅记录到 diagnostics。
+            args=tuple(_deprecated_runtime_args()),
             process_name=_cfg_str("NUWAX_GEOMETRY_RUNTIME_PROCESS_NAME", "nuwax-geometry-runtime"),
             log_name=_cfg_str("NUWAX_GEOMETRY_RUNTIME_LOG_NAME", "nuwax_geometry_runtime.log"),
             provides_map=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_MAP", True),

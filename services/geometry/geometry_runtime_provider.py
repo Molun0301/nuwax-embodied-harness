@@ -5,6 +5,7 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -146,9 +147,96 @@ def _is_shutdown_guard_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+# Phase 4 nav_runtime:`get_navigation_readiness` 把细分 readiness 子项
+# JSON 序列化塞到 `reason` 字段尾部。本模块把该 dict 在 Python 侧解析出来。
+_NAV_READINESS_FIELDS = (
+    "lcm_backend",
+    "tf",
+    "costmap",
+    "planner",
+    "cmd_vel_sink",
+    "profile",
+    "module_node_count",
+    "p1_native_profiles",
+)
+
+
+def _parse_navigation_readiness_reason(ready: bool, reason: str) -> Dict[str, Any]:
+    """从 gRPC `NavigationReadiness.reason` 提取细分字段。
+
+    Rust 端格式:``"{top_reason}; details={...json...}"``。
+    解析失败或字段缺失时,top-level reason 仍保留,子项用 `None` 占位,
+    避免上层 `readiness["planner"]` 抛 `KeyError`。
+    """
+    result: Dict[str, Any] = {
+        "ready": ready,
+        "message": reason,
+        "lcm_backend": None,
+        "tf": None,
+        "costmap": None,
+        "planner": None,
+        "cmd_vel_sink": None,
+        "profile": None,
+        "module_node_count": None,
+        "p1_native_profiles": None,
+    }
+    marker = "; details="
+    idx = reason.find(marker)
+    if idx < 0:
+        return result
+    top_reason = reason[:idx].strip()
+    json_str = reason[idx + len(marker) :].strip()
+    result["message"] = top_reason
+    try:
+        details = json.loads(json_str)
+    except (ValueError, TypeError):
+        return result
+    if not isinstance(details, dict):
+        return result
+    for field in _NAV_READINESS_FIELDS:
+        if field in details:
+            result[field] = details[field]
+    return result
+
+
+def _nav_readiness_disconnected_dict(message: str = "未连接") -> Dict[str, Any]:
+    """``_stub`` 未就绪 / gRPC 失败时返回的最小 dict。"""
+    return {
+        "ready": False,
+        "message": message,
+        "lcm_backend": None,
+        "tf": None,
+        "costmap": None,
+        "planner": None,
+        "cmd_vel_sink": None,
+        "profile": None,
+        "module_node_count": None,
+        "p1_native_profiles": None,
+    }
+
+
 def _normalize_frame(frame_id: str) -> str:
     """去掉 ROS 风格前导斜杠并去空白，便于契约校验。"""
     return str(frame_id or "").strip().lstrip("/")
+
+
+def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
+    """把 proto `ExplorationState` 转成 dict(给 `GeometryRuntimeProvider` 对外契约用)。
+
+    Phase 5:与 dimos `nuwax_exploration::ExplorationController` 的 status 字符串
+    一一对应:ACCEPTED / REJECTED / PENDING / STOPPED / ACTIVE / UNIMPLEMENTED。
+    失败时上游 RPC 层已经处理,这里只做字段拷贝,不二次校验。
+    """
+    return {
+        "status": resp.status,
+        "message": resp.message,
+        "request_id": resp.request_id,
+        "selected_source": resp.selected_source,
+        "last_stop_reason": resp.last_stop_reason,
+        "frontier_count": int(resp.frontier_count),
+        "revision": int(resp.revision),
+        "timestamp_ns": int(resp.timestamp_ns),
+    }
 
 
 def _build_pose(proto_pose: Any) -> Optional[Pose]:
@@ -508,18 +596,35 @@ class GeometryRuntimeProvider:
             return False
 
     def get_navigation_readiness(self) -> Dict[str, Any]:
+        """Phase 4:从 gRPC `GetNavigationReadiness` 返回 dict。
+
+        Rust 端把细分 readiness 子项(LCM backend / tf / costmap /
+        planner / cmd_vel sink)JSON 序列化塞到 `reason` 字段尾部,
+        形如 `"{top_reason}; details={...json...}"`,本函数解析
+        返回 dict。
+
+        返回 dict 字段:
+        - ``ready`` (bool): 整体 ready
+        - ``message`` (str): 顶层 reason
+        - ``lcm_backend`` / ``tf`` / ``costmap`` / ``planner`` /
+          ``cmd_vel_sink`` (bool): 子项
+        - ``profile`` (str): 当前 NUWAX_NAV_PROFILE
+        - ``module_node_count`` (int): ModuleGraph 节点数
+        - ``p1_native_profiles`` (list[str]): 本期未启用的 native profile
+        """
         self._raise_if_stopping("get_navigation_readiness")
         if not self._stub:
-            return {"ready": False, "message": "未连接"}
+            return _nav_readiness_disconnected_dict()
         try:
-            resp = self._stub.GetNavigationReadiness(pb2.Empty(), timeout=_read_deadline_sec())
-            return {
-                "ready": bool(resp.ready),
-                "message": resp.reason,
-            }
+            resp = self._stub.GetNavigationReadiness(
+                pb2.Empty(), timeout=_read_deadline_sec()
+            )
+            return _parse_navigation_readiness_reason(
+                bool(resp.ready), str(resp.reason)
+            )
         except grpc.RpcError as e:
             _log_rpc_error("GetNavigationReadiness", e)
-            return {"ready": False, "message": "gRPC 错误"}
+            return _nav_readiness_disconnected_dict(message="gRPC 错误")
 
     # === NavigationProvider 协议 shim ===
     # 去 ROS2 目标态（round-4 HIGH 3 修复）：
@@ -770,6 +875,107 @@ class GeometryRuntimeProvider:
         """
         self._ensure_nav_state_stream()
         return self._build_navigation_state_snapshot()
+
+    # === 探索 RPC（Phase 5 additive, 走 Rust explore_runtime） ===
+    def start_exploration(
+        self,
+        *,
+        request_id: str = "",
+        strategy: str = "wavefront",
+        arbitration: str = "prefer_wavefront",
+        map_version_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """启动探索(走 Rust `nuwax_exploration::ExplorationController`)。
+
+        返回 dict 表示 ExplorationState 字段(status/message/request_id/
+        selected_source/last_stop_reason/frontier_count/revision/timestamp_ns);
+        stub 未就绪或 RPC 异常时返回 None,绝不假装成功。
+        """
+        self._raise_if_stopping("start_exploration")
+        if not self._stub:
+            return None
+        try:
+            req = pb2.ExploreRequest(
+                strategy=strategy,
+                arbitration=arbitration,
+                map_version_id=map_version_id,
+                request_id=request_id,
+            )
+            resp = self._stub.StartExploration(req, timeout=_read_deadline_sec())
+            return _exploration_state_to_dict(resp)
+        except grpc.RpcError as e:
+            _log_rpc_error("StartExploration", e)
+            return None
+
+    def stop_exploration(self, *, request_id: str = "") -> Optional[Dict[str, Any]]:
+        """停止探索。
+
+        返回 ExplorationState 字典(同 `start_exploration`),失败时 None。
+        """
+        self._raise_if_stopping("stop_exploration")
+        if not self._stub:
+            return None
+        try:
+            req = pb2.StopExplorationRequest(request_id=request_id)
+            resp = self._stub.StopExploration(req, timeout=_read_deadline_sec())
+            return _exploration_state_to_dict(resp)
+        except grpc.RpcError as e:
+            _log_rpc_error("StopExploration", e)
+            return None
+
+    def get_exploration_state(self) -> Optional[Dict[str, Any]]:
+        """读取当前 exploration controller 状态(单次 tick)。
+
+        返回 ExplorationState 字典;失败时 None。
+        """
+        self._raise_if_stopping("get_exploration_state")
+        if not self._stub:
+            return None
+        try:
+            resp = self._stub.GetExplorationState(
+                pb2.Empty(), timeout=_read_deadline_sec()
+            )
+            return _exploration_state_to_dict(resp)
+        except grpc.RpcError as e:
+            _log_rpc_error("GetExplorationState", e)
+            return None
+
+    def get_exploration_diagnostics(self) -> Optional[Dict[str, Any]]:
+        """读取探索 diagnostics(active/arbitration/sources/frontier_count)。
+
+        返回 dict 字段: active / arbitration / selected_source / last_stop_reason /
+        sources(list) / frontier_count / revision / timestamp_ns。
+        失败时返回 None。
+        """
+        self._raise_if_stopping("get_exploration_diagnostics")
+        if not self._stub:
+            return None
+        try:
+            resp = self._stub.GetExplorationDiagnostics(
+                pb2.Empty(), timeout=_read_deadline_sec()
+            )
+            sources = [
+                {
+                    "source_name": s.source_name,
+                    "is_active": bool(s.is_active),
+                    "last_goal_id": s.last_goal_id,
+                    "last_error": s.last_error,
+                }
+                for s in resp.sources
+            ]
+            return {
+                "active": bool(resp.active),
+                "arbitration": resp.arbitration,
+                "selected_source": resp.selected_source,
+                "last_stop_reason": resp.last_stop_reason,
+                "sources": sources,
+                "frontier_count": int(resp.frontier_count),
+                "revision": int(resp.revision),
+                "timestamp_ns": int(resp.timestamp_ns),
+            }
+        except grpc.RpcError as e:
+            _log_rpc_error("GetExplorationDiagnostics", e)
+            return None
 
     # === 输入桥 ===
     # Rust proto PublishOdom 接受 PublishOdomRequest（仅 pose 字段；速度由 nuwax-nav-stack

@@ -13,7 +13,11 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::lcm_runtime::GeometryRuntimeHandle;
+use crate::lcm_runtime::{GeometryRuntimeHandle, PoseState};
+use crate::nav_runtime::{
+    cancel as nav_cancel, compute_readiness, ensure_goal_id, readiness_to_reason, set_goal,
+    CancelOutcome, SetGoalInput, SetGoalOutcome,
+};
 use crate::proto::*;
 use crate::proto::geometry_runtime_server::GeometryRuntime;
 use crate::runtime_diagnostics::{self, RuntimeDiagnostics, ServiceState, SharedServiceState};
@@ -46,6 +50,18 @@ fn now_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+/// 把内部 `NavState`(crate::lcm_runtime::NavState)转成 gRPC
+/// `proto::NavigationState`,避免 server.rs 直接依赖 internal type。
+fn nav_state_to_proto(nav: crate::lcm_runtime::NavState) -> NavigationState {
+    NavigationState {
+        status: nav.status,
+        message: nav.message,
+        goal_id: nav.goal_id,
+        distance_remaining: nav.distance_remaining,
+        timestamp_ns: nav.timestamp_ns,
+    }
 }
 
 #[tonic::async_trait]
@@ -195,7 +211,38 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
 
     async fn get_occupancy_grid_shm(&self, _req: Request<Empty>) -> Result<Response<ShmRef>, Status> {
-        Err(Status::unimplemented("OccupancyGrid SHM sidecar 待 P1 接入"))
+        // Phase 3: 真实 SHM sidecar 写入(occupancy_shm::OccupancyGridShmWriter);
+        // 成功返回 ShmRef { key=shm_path, size=map.data.len(), revision=map.revision }
+        // 失败 / 无数据 / 写盘错误 → 返回 error message,不假装成功。
+        if self.bridge.occupancy_shm.is_none() {
+            return Err(Status::unavailable(
+                "occupancy_shm 未初始化 (LCM backend 不可用,导致 SHM 写入被禁用)",
+            ));
+        }
+        let shm_path = std::env::var("NUWAX_OCCUPANCY_SHM_PATH")
+            .unwrap_or_else(|_| "/tmp/nuwax_occupancy.mmap".into());
+        // 锁顺序:先 copy 关键字段(revision/size)再 drop read lock,最后持 writer lock;
+        // 避免 reader 与 writer 同时持锁导致自死锁。
+        let map_snapshot = {
+            let s = self.bridge.state.read().await;
+            if s.map.width == 0 || s.map.height == 0 {
+                return Err(Status::failed_precondition(
+                    "occupancy grid 尚未生成 (mapping adapter 无点云数据)",
+                ));
+            }
+            s.map.clone()
+        };
+        let size = map_snapshot.data.len();
+        let revision = map_snapshot.revision;
+        let mut writer = self.bridge.occupancy_shm.as_ref().expect("checked above").lock();
+        if let Err(e) = writer.write_occupancy(&map_snapshot) {
+            return Err(Status::internal(format!("write_occupancy 失败: {}", e)));
+        }
+        Ok(Response::new(ShmRef {
+            key: shm_path,
+            size: size as u64,
+            revision,
+        }))
     }
 
     type SubscribeMapUpdatesStream = tokio_stream::wrappers::ReceiverStream<Result<MapUpdateNotification, Status>>;
@@ -258,44 +305,53 @@ impl GeometryRuntime for GeometryRuntimeService {
     // 当成 success 接进去。
 
     async fn set_navigation_goal(&self, req: Request<NavigationGoal>) -> Result<Response<NavigationState>, Status> {
-        // TODO(B7): 接通 nuwax-nav-stack LCM channel
-        // 当前阶段 fake LCM backend + 未对接 nav-stack crate;
-        // 同样不能误以为 success。返回 UNIMPLEMENTED,不写 nav_state、不持久化目标。
-        let goal_id = req.get_ref().goal_id.clone();
-        let frame_id = req.get_ref().frame_id.clone();
-        let msg = format!(
-            "SetNavigationGoal pending: nuwax-nav-stack LCM channel /nav/goal not yet wired (B7 blocker; \
-             goal_id={:?} frame_id={:?}). 上游 nuwax-nav-stack crate + channel 实现到位前不接受导航目标。",
-            goal_id, frame_id,
-        );
-        tracing::warn!("{}", msg);
-        Ok(Response::new(NavigationState {
-            status: "UNIMPLEMENTED".into(),
-            message: msg,
-            goal_id,
-            distance_remaining: 0.0,
-            timestamp_ns: now_ns(),
-        }))
+        // Phase 4:接入 nav_runtime。流程:
+        // 1) 归一化 NavigationGoal -> SetGoalInput(自动生成 UUID 当 goal_id 空)
+        // 2) 调 set_goal():readiness 校验 -> publish /nav/goal typed frame
+        //    -> 状态机推进 -> publish /cmd_vel 起步速度
+        // 3) 把 NavState 同步到 SharedState.nav_state + broadcast 通道
+        let ng = req.get_ref();
+        let pose = ng.pose.as_ref();
+        let pos = pose.and_then(|p| p.position.as_ref());
+        let orient = pose.and_then(|p| p.orientation.as_ref());
+        let target = PoseState {
+            x: pos.map(|v| v.x).unwrap_or(0.0),
+            y: pos.map(|v| v.y).unwrap_or(0.0),
+            z: pos.map(|v| v.z).unwrap_or(0.0),
+            qx: orient.map(|v| v.x).unwrap_or(0.0),
+            qy: orient.map(|v| v.y).unwrap_or(0.0),
+            qz: orient.map(|v| v.z).unwrap_or(0.0),
+            qw: orient.map(|v| v.w).unwrap_or(1.0),
+            frame_id: pose.map(|p| p.frame_id.clone()).unwrap_or_default(),
+            timestamp_ns: pose.map(|p| p.timestamp_ns).unwrap_or(now_ns()),
+        };
+        let goal_id = ensure_goal_id(&ng.goal_id);
+        let frame_id = if ng.frame_id.is_empty() { "map".to_string() } else { ng.frame_id.clone() };
+        let input = SetGoalInput { goal_id: goal_id.clone(), frame_id, target };
+        let SetGoalOutcome { state: nav } = set_goal(&self.bridge, &self.bridge.nav, input).await;
+        // 同步到 SharedState.nav_state,供 SubscribeNavigationState 推送。
+        {
+            let mut s = self.bridge.state.write().await;
+            s.nav_state = nav.clone();
+        }
+        let _ = self.bridge.nav_state_tx.send(nav.clone());
+        Ok(Response::new(nav_state_to_proto(nav)))
     }
 
     async fn cancel_navigation(&self, req: Request<CancelNavigationRequest>) -> Result<Response<NavigationState>, Status> {
-        // TODO(B7): 接通 nuwax-nav-stack LCM channel
-        // 当前 fake LCM backend 不能可靠地 cancel 一个尚未存在的 in-flight 目标;
-        // 返回 UNIMPLEMENTED 不假装 cancel 成功,避免误清空上层状态机。
-        let goal_id = req.get_ref().goal_id.clone();
-        let msg = format!(
-            "CancelNavigation pending: nuwax-nav-stack LCM channel /nav/cancel not yet wired (B7 blocker; \
-             goal_id={:?}). 当前没有任何 in-flight 目标可以 cancel。",
-            goal_id,
-        );
-        tracing::warn!("{}", msg);
-        Ok(Response::new(NavigationState {
-            status: "UNIMPLEMENTED".into(),
-            message: msg,
-            goal_id,
-            distance_remaining: 0.0,
-            timestamp_ns: now_ns(),
-        }))
+        // Phase 4:接入 nav_runtime.cancel。流程:
+        // 1) publish /nav/cancel typed frame
+        // 2) publish zero cmd_vel
+        // 3) 状态机切到 Cancelled
+        let goal_id = ensure_goal_id(&req.get_ref().goal_id);
+        let CancelOutcome { state: nav } =
+            nav_cancel(&self.bridge, &self.bridge.nav, goal_id.clone()).await;
+        {
+            let mut s = self.bridge.state.write().await;
+            s.nav_state = nav.clone();
+        }
+        let _ = self.bridge.nav_state_tx.send(nav.clone());
+        Ok(Response::new(nav_state_to_proto(nav)))
     }
 
     type SubscribeNavigationStateStream = tokio_stream::wrappers::ReceiverStream<Result<NavigationState, Status>>;
@@ -318,13 +374,19 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
 
     async fn get_navigation_readiness(&self, _req: Request<Empty>) -> Result<Response<NavigationReadiness>, Status> {
-        // Phase 2 收敛:readiness 判定走 runtime_diagnostics,不再直接
-        // 读 `nav_state.status` 这种"上一次 LCM frame"的瞬时值。
-        // Phase 4 nav_runtime.rs 实装后会改 `nav_ready_poll = true`。
+        // Phase 4:细分 readiness 子项(LCM backend + tf + costmap +
+        // planner profile + cmd_vel sink)由 nav_runtime::compute_readiness
+        // 计算,JSON 序列化到 `reason` 字段。Python 侧
+        // `get_navigation_readiness` 解析 JSON 返回 dict(满足"costmap、
+        // tf、planner、cmd_vel sink、LCM backend 子项"要求)。
+        // 顶层 ready/reason 仍走 runtime_diagnostics 的粗略判定,保证
+        // CI/CLI 现有 grep "nav ready" 的守门不会失效。
         let r = runtime_diagnostics::navigation_readiness(&self.bridge);
+        let detail = compute_readiness(&self.bridge, &self.bridge.nav).await;
+        let json = readiness_to_reason(&detail);
         Ok(Response::new(NavigationReadiness {
-            ready: r.ready,
-            reason: r.reason,
+            ready: r.ready && detail.ready,
+            reason: format!("{}; details={}", r.reason, json),
         }))
     }
 
@@ -375,6 +437,102 @@ impl GeometryRuntime for GeometryRuntimeService {
             }
         });
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    // ========================================================================
+    // 探索 start / stop / state / diagnostics（Phase 5 additive）
+    // ========================================================================
+    //
+    // 这些 RPC 把 `nuwax-exploration::ExplorationController` 暴露给 Python
+    // 平台层；上游 `nuwax-exploration` crate 的 source adapter（wavefront）
+    // 在 `explore_runtime.rs` 内部组装；本 facade 只做字段转换 + 锁定 dimos
+    // 行为,不再自造隐式 fallback。
+    //
+    // 状态契约（与 proto 注释一致）：
+    // - `ACCEPTED` / `REJECTED` / `PENDING` / `STOPPED` / `ACTIVE` / `UNIMPLEMENTED`
+    // - `last_stop_reason` 字符串: `no_information_gain` / `no_reachable_free_space` /
+    //   `consecutive_failures_exceeded` / `user_cancelled` / 空串
+
+    async fn start_exploration(&self, req: Request<ExploreRequest>) -> Result<Response<ExplorationState>, Status> {
+        let r = req.get_ref();
+        let snapshot = self
+            .bridge
+            .explore
+            .start(&r.request_id, &r.arbitration)
+            .await;
+        Ok(Response::new(ExplorationState {
+            status: snapshot.status.to_string(),
+            message: snapshot.message,
+            request_id: snapshot.request_id,
+            selected_source: snapshot.selected_source,
+            last_stop_reason: snapshot.last_stop_reason,
+            frontier_count: snapshot.frontier_count,
+            revision: snapshot.revision,
+            timestamp_ns: now_ns(),
+        }))
+    }
+
+    async fn stop_exploration(&self, req: Request<StopExplorationRequest>) -> Result<Response<ExplorationState>, Status> {
+        let r = req.get_ref();
+        let snapshot = self
+            .bridge
+            .explore
+            .stop(&r.request_id)
+            .await;
+        Ok(Response::new(ExplorationState {
+            status: snapshot.status.to_string(),
+            message: snapshot.message,
+            request_id: snapshot.request_id,
+            selected_source: snapshot.selected_source,
+            last_stop_reason: snapshot.last_stop_reason,
+            frontier_count: snapshot.frontier_count,
+            revision: snapshot.revision,
+            timestamp_ns: now_ns(),
+        }))
+    }
+
+    async fn get_exploration_state(&self, _req: Request<Empty>) -> Result<Response<ExplorationState>, Status> {
+        // 单次 tick 触发 controller poll;即便上游没有 costmap 输入,
+        // 也保证状态机能跑通而不假装成功。
+        let pose_xy = {
+            let s = self.bridge.state.read().await;
+            (s.pose.x, s.pose.y)
+        };
+        let snapshot = self.bridge.explore.tick(pose_xy).await;
+        Ok(Response::new(ExplorationState {
+            status: snapshot.status.to_string(),
+            message: snapshot.message,
+            request_id: snapshot.request_id,
+            selected_source: snapshot.selected_source,
+            last_stop_reason: snapshot.last_stop_reason,
+            frontier_count: snapshot.frontier_count,
+            revision: snapshot.revision,
+            timestamp_ns: now_ns(),
+        }))
+    }
+
+    async fn get_exploration_diagnostics(&self, _req: Request<Empty>) -> Result<Response<ExplorationDiagnostics>, Status> {
+        let diag = self.bridge.explore.diagnostics().await;
+        let sources = diag
+            .sources
+            .into_iter()
+            .map(|s| ExplorationSourceDiag {
+                source_name: s.source_name,
+                is_active: s.is_active,
+                last_goal_id: s.last_goal_id,
+                last_error: s.last_error,
+            })
+            .collect();
+        Ok(Response::new(ExplorationDiagnostics {
+            active: diag.active,
+            arbitration: diag.arbitration,
+            selected_source: diag.selected_source,
+            last_stop_reason: diag.last_stop_reason,
+            sources,
+            frontier_count: diag.frontier_count,
+            revision: diag.revision,
+            timestamp_ns: now_ns(),
+        }))
     }
 
     // ========================================================================

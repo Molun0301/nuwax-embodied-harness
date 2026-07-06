@@ -35,6 +35,8 @@ use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
+use crate::mapping_adapter::{FeedOnlyAccumulator, MappingAdapter, MappingAdapterConfig};
+use crate::occupancy_shm::OccupancyGridShmWriter;
 use crate::pointcloud::CloudMapShmWriter;
 
 // ============================================================================
@@ -159,13 +161,43 @@ pub struct GeometryRuntimeHandle {
     /// 返回 `healthy=false` + `LCM_BACKEND_UNAVAILABLE` message；
     /// 该 flag 当前唯一触发源是 `LcmBackendKind::Real`（fail-fast 设计）。
     pub lcm_backend_available: bool,
+    /// Phase 5: 探索 runtime 句柄(由 `spawn_geometry_runtime` 注入)。
+    /// 负责 start / stop / state / diagnostics 四类 RPC。
+    /// 持有 `Arc<tokio::sync::Mutex<...>>` 内部,允许 `Clone` 句柄
+    /// 在 gRPC 任务间安全共享。
+    pub explore: crate::explore_runtime::ExploreRuntimeHandle,
+    /// Phase 4: 导航 runtime 状态(由 `spawn_geometry_runtime` / 单元测试
+    /// 构造时初始化)。`server.rs` 通过它调 `set_goal` / `cancel` /
+    /// `compute_readiness` 真实执行链。内部仅读 `state.pose.timestamp_ns`
+    /// 与 `state.map.revision`,不持有 LCM 订阅线程。
+    pub nav: crate::nav_runtime::NavRuntimeState,
+    /// Phase 3: mapping adapter 句柄。
+    /// - `None` —— backend 不可用 / LCM fail-fast 路径不构造 adapter
+    /// - `Some` —— adapter 已注入,`mapping_ready_poll` 通过该字段判定
+    /// `Arc<parking_lot::Mutex<MappingAdapter>>`:
+    /// - `Arc` 允许多订阅任务共享
+    /// - `parking_lot::Mutex` 走同步路径,避免 async 持锁跨 await
+    pub mapping_adapter: Option<Arc<parking_lot::Mutex<MappingAdapter>>>,
+    /// Phase 3: occupancy grid SHM sidecar 写入器。
+    /// - `None` —— backend 不可用 / LCM fail-fast 路径不构造
+    /// - `Some` —— `get_occupancy_grid_shm` 走 SHM 直读
+    pub occupancy_shm: Option<Arc<parking_lot::Mutex<OccupancyGridShmWriter>>>,
 }
 
 impl GeometryRuntimeHandle {
-    /// mapping 板块 readiness。Phase 2 baseline:恒 `false`（adapter 未实装）。
-    /// Phase 3 在 mapping_adapter.rs 实装后改 true。
+    /// mapping 板块 readiness。
+    /// - backend 不可用 → false
+    /// - adapter 未构造 → false
+    /// - adapter 已构造 + 有点云数据 → true
+    /// - adapter 已构造 + 无数据 → false (等待 LCM 输入)
     pub fn mapping_ready_poll(&self) -> bool {
-        false
+        if !self.lcm_backend_available {
+            return false;
+        }
+        match &self.mapping_adapter {
+            Some(a) => a.lock().has_data(),
+            None => false,
+        }
     }
 
     /// navigation 板块 readiness。Phase 2 baseline:恒 `false`（nav_stack
@@ -175,9 +207,13 @@ impl GeometryRuntimeHandle {
     }
 
     /// exploration 板块 readiness。Phase 2 baseline:恒 `false`（controller
-    /// 未实装）。Phase 5 在 explore_runtime.rs 实装后改 true。
+    /// 未实装）。Phase 5 在 explore_runtime.rs 实装后,只要 handle 存在
+    /// (`Spawn` 时已经构造默认 wavefront source)即视为 ready;
+    /// 详细 active/inactive 由 `ExploreRuntimeHandle::is_active` 暴露。
     pub fn explore_ready_poll(&self) -> bool {
-        false
+        // 当前实现:handle 在 spawn 时必已注入,仅在 spawn 失败时为 None
+        // (该路径上 LCM backend 阻断,会先报 LCM_BACKEND_UNAVAILABLE)。
+        true
     }
 }
 
@@ -830,6 +866,48 @@ pub fn spawn_geometry_runtime(
         });
     }
 
+    // Phase 3: 构造 mapping adapter。backend 不可用时为 None;
+    // 配置从 env 探测(NUWAX_MAPPING_*);默认 200×200 @ 0.05m/cell。
+    let mapping_adapter = if backend_available {
+        let cfg = MappingAdapterConfig::from_env();
+        info!(
+            "mapping_adapter 启动: resolution={}m width={} height={} origin=({:?})",
+            cfg.resolution, cfg.width_cells, cfg.height_cells, cfg.origin_xy
+        );
+        Some(Arc::new(parking_lot::Mutex::new(MappingAdapter::new(cfg))))
+    } else {
+        None
+    };
+
+    // Phase 3 增强:订阅 /odom 和 /go2/lidar/points 时同步把数据喂给 mapping
+    // adapter。`feed_pose` / `feed_pointcloud` 内部持 parking_lot 锁同步,
+    // 不会跨 await。
+    if let Some(mapping_arc) = mapping_adapter.clone() {
+        spawn_mapping_feed_tasks(transport.clone(), state.clone(), mapping_arc);
+    }
+
+    // Phase 3: 构造 occupancy grid SHM sidecar(默认 /tmp/nuwax_occupancy.mmap)。
+    // 与 cloud_map SHM 区分:occupancy 走 grid layout(Phase 3 新增);
+    // cloud_map 仍走 lcm_runtime 既有 `cm_writer`(Phase 0 已实装)。
+    let occ_shm_path = std::path::PathBuf::from(
+        std::env::var("NUWAX_OCCUPANCY_SHM_PATH")
+            .unwrap_or_else(|_| "/tmp/nuwax_occupancy.mmap".into())
+    );
+    let occupancy_shm = if backend_available {
+        match OccupancyGridShmWriter::new(&occ_shm_path) {
+            Ok(w) => {
+                info!("occupancy grid SHM 已就绪: {:?}", occ_shm_path);
+                Some(Arc::new(parking_lot::Mutex::new(w)))
+            }
+            Err(e) => {
+                warn!("occupancy grid SHM 初始化失败 (降级为无 SHM): {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(GeometryRuntimeHandle {
         state,
         cloud_map_tx,
@@ -838,5 +916,186 @@ pub fn spawn_geometry_runtime(
         transport,
         transport_backend_name: backend_name,
         lcm_backend_available: backend_available,
+        nav: crate::nav_runtime::NavRuntimeState::from_env(),
+        explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
+        mapping_adapter,
+        occupancy_shm,
+    })
+}
+
+/// Phase 3: 把 LCM `/odom` 与 `/go2/lidar/points` typed channel 喂给 mapping adapter。
+///
+/// 不替换 `spawn_geometry_runtime` 中已有的 odom/occupancy 订阅路径(那些驱动
+/// `SharedState`);mapping feed 是 **附加** 的数据通道,用于累积点云 +
+/// 维护 `last_sensor_origin`,然后调用 `build_and_publish` 写回 `SharedState.map`。
+///
+/// - `/odom` payload 走 `parse_odom_payload` → 提取 x/y/z → `feed_pose`
+/// - `/go2/lidar/points` payload 走 `parse_pointcloud_payload` → 转 Point3 →
+///   `feed_pointcloud` + `build_and_publish`
+///
+/// feed 路径持 parking_lot Mutex(同步,不跨 await);build_and_publish
+/// 内部走 `SharedState.try_write`(同步)。
+fn spawn_mapping_feed_tasks(
+    transport: LcmTransport,
+    state: Arc<RwLock<SharedState>>,
+    mapping_arc: Arc<parking_lot::Mutex<MappingAdapter>>,
+) {
+    use futures::StreamExt;
+    use nuwax_mapping::PointCloudAccumulator;
+    use nalgebra::Point3;
+
+    // ---- /odom → feed_pose ----
+    let odom_topic = match LcmTopic::new("/odom") {
+        Ok(t) => t,
+        Err(e) => {
+            error!("spawn_mapping_feed_tasks: /odom LcmTopic 构造失败: {}", e);
+            return;
+        }
+    };
+    let odom_msg_type = match LcmMessageType::new("nav_msgs/Odometry") {
+        Ok(m) => m,
+        Err(e) => {
+            error!(
+                "spawn_mapping_feed_tasks: nav_msgs/Odometry LcmMessageType 构造失败: {}",
+                e
+            );
+            return;
+        }
+    };
+    let transport_odom = transport.clone();
+    let mapping_odom = mapping_arc.clone();
+    tokio::spawn(async move {
+        let mut stream = transport_odom
+            .subscribe(odom_topic, Some(odom_msg_type))
+            .await;
+        while let Some(frame_result) = stream.next().await {
+            let frame = match frame_result {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("mapping_feed /odom LCM 订阅错误: {}", e);
+                    continue;
+                }
+            };
+            if let Some(pose) = parse_odom_payload(&frame.payload) {
+                let mut adapter = mapping_odom.lock();
+                adapter.feed_pose(pose.x, pose.y, pose.z);
+            }
+        }
+    });
+
+    // ---- /go2/lidar/points → feed_pointcloud + build_and_publish ----
+    let lidar_topic = match LcmTopic::new("/go2/lidar/points") {
+        Ok(t) => t,
+        Err(e) => {
+            error!(
+                "spawn_mapping_feed_tasks: /go2/lidar/points LcmTopic 构造失败: {}",
+                e
+            );
+            return;
+        }
+    };
+    let lidar_msg_type = match LcmMessageType::new("sensor_msgs/PointCloud2") {
+        Ok(m) => m,
+        Err(e) => {
+            error!(
+                "spawn_mapping_feed_tasks: sensor_msgs/PointCloud2 LcmMessageType 构造失败: {}",
+                e
+            );
+            return;
+        }
+    };
+    let transport_lidar = transport.clone();
+    let mapping_lidar = mapping_arc.clone();
+    let state_lidar = state.clone();
+    tokio::spawn(async move {
+        let mut stream = transport_lidar
+            .subscribe(lidar_topic, Some(lidar_msg_type))
+            .await;
+        while let Some(frame_result) = stream.next().await {
+            let frame = match frame_result {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("mapping_feed /go2/lidar/points LCM 订阅错误: {}", e);
+                    continue;
+                }
+            };
+            let (bytes, point_step) = match parse_pointcloud_payload(&frame.payload) {
+                Some(v) => v,
+                None => continue,
+            };
+            let ps = point_step as usize;
+            if ps < 12 {
+                continue;
+            }
+            let raw_count = bytes.len() / ps;
+            let mut points: Vec<Point3<f64>> = Vec::with_capacity(raw_count);
+            for i in 0..raw_count {
+                let off = i * ps;
+                if off + 12 > bytes.len() {
+                    break;
+                }
+                let x = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap_or([0; 4])) as f64;
+                let y = f32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap_or([0; 4])) as f64;
+                let z = f32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap_or([0; 4])) as f64;
+                if x.is_nan() || y.is_nan() || z.is_nan() {
+                    continue;
+                }
+                points.push(Point3::new(x, y, z));
+            }
+            if points.is_empty() {
+                continue;
+            }
+            // 同步持锁 feed + build_and_publish(后者用 try_write 写 SharedState)
+            let mut adapter = mapping_lidar.lock();
+            <FeedOnlyAccumulator as PointCloudAccumulator>::feed(
+                &mut adapter.accumulator,
+                &points,
+            );
+            adapter.has_data = true;
+            adapter.build_and_publish(&state_lidar);
+        }
+    });
+}
+
+/// 单元测试 helper:构造一个最简 `GeometryRuntimeHandle`。
+///
+/// 不会启动订阅任务,只提供 fake backend + 全新 `SharedState`,供
+/// `nav_runtime` / `mapping_adapter` / 其它模块做集成测试。
+///
+/// 与 `spawn_geometry_runtime` 的关键差异:
+/// - 不订阅任何 LCM typed channel
+/// - 不写 SHM 文件
+/// - 立即返回,适合 `#[tokio::test]` async 测试
+pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
+    let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
+    let (nav_state_tx, _) = broadcast::channel::<NavState>(8);
+    let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
+    let state = Arc::new(RwLock::new(SharedState::default()));
+    let transport = LcmTransport::new_fake();
+    // Phase 3: 测试 helper 也构造 mapping_adapter,便于 unit test 走完整链路。
+    let mapping_adapter = Some(Arc::new(parking_lot::Mutex::new(MappingAdapter::new(
+        MappingAdapterConfig::from_env(),
+    ))));
+    // Phase 3: 测试 helper 也构造 occupancy_shm(走 /tmp 测试路径)
+    let occ_test_path = std::path::PathBuf::from(format!(
+        "/tmp/nuwax_occupancy_test_{}.mmap",
+        std::process::id()
+    ));
+    let occupancy_shm = match OccupancyGridShmWriter::new(&occ_test_path) {
+        Ok(w) => Some(Arc::new(parking_lot::Mutex::new(w))),
+        Err(_) => None,
+    };
+    Ok(GeometryRuntimeHandle {
+        state,
+        cloud_map_tx,
+        nav_state_tx,
+        frontiers_tx,
+        transport,
+        transport_backend_name: "fake-lcm",
+        lcm_backend_available: true,
+        nav: crate::nav_runtime::NavRuntimeState::from_env(),
+        explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
+        mapping_adapter,
+        occupancy_shm,
     })
 }

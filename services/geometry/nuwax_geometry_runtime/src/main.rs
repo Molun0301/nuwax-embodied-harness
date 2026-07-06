@@ -13,7 +13,11 @@
 //! 6. tonic gRPC server 监听
 
 mod channel_registry;
+mod explore_runtime;
 mod lcm_runtime;
+mod mapping_adapter;
+mod nav_runtime;
+mod occupancy_shm;
 mod pointcloud;
 mod runtime_diagnostics;
 mod server;

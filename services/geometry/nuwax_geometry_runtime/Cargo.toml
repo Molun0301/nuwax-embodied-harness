@@ -36,6 +36,10 @@ nuwax-nav-types-messages = { path = "/home/ml/Deeprob/dimos/rust重写与移植/
 nuwax-nav-simple-planner = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-nav-simple-planner" }
 nuwax-nav-astar = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-nav-astar" }
 nuwax-nav-terrain-map-ext = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-nav-terrain-map-ext" }
+# Phase 4 nav_runtime:基本路径跟随器(simple-2d / astar profile 的 cmd_vel 生成)
+nuwax-nav-basic-path-follower = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-nav-basic-path-follower" }
+# Phase 4 nav_runtime:serde 用于 NavigationReadinessDetail JSON 序列化
+uuid = { version = "1", features = ["v4"] }
 nuwax-exploration = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-exploration", default-features = false, features = ["wavefront", "runtime"] }
 nuwax-explore-wavefront = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-explore-wavefront" }
 
@@ -54,6 +58,11 @@ thiserror = "1"
 nix = { version = "0.29", features = ["fs", "mman"] }
 futures = "0.3"
 parking_lot = "0.12"
+
+# Phase 3 mapping_adapter 需要 nalgebra 复用 nuwax-mapping 的 Point3/Isometry3
+# 类型(workspace 已经使用 0.33 + serde-serialize)。固定到同一版本以避免
+# `nuwax-mapping::OccupancyGrid.origin` (nalgebra::Isometry3) 跨 crate 类型错配。
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
 
 [build-dependencies]
 tonic-build = "0.12"

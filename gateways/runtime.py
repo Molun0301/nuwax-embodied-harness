@@ -6488,14 +6488,14 @@ class GatewayRuntime:
                     )
                     return localization_snapshot
                 raise GatewayError(
-                    readiness.message or "Nav2 未就绪，无法执行 %s。" % capability_name,
+                    readiness.get("message") or "Nav2 未就绪，无法执行 %s。" % capability_name,
                     error_code="nav2_not_ready",
                     http_status=409,
                     jsonrpc_code=-32000,
                     details={
                         "map_name": map_name,
                         "capability_name": capability_name,
-                        "waiting_for": readiness.waiting_for,
+                        "waiting_for": readiness.get("waiting_for", []),
                         "force_nav2_goal": force_nav2_goal,
                     },
                 )

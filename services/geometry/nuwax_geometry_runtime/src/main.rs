@@ -12,9 +12,12 @@
 //! 5. 写 ready file（通知父进程 / systemd）
 //! 6. tonic gRPC server 监听
 
+mod channel_registry;
 mod lcm_runtime;
 mod pointcloud;
+mod runtime_diagnostics;
 mod server;
+mod typed_codec;
 mod video_relay;
 
 use std::net::SocketAddr;
@@ -25,17 +28,6 @@ use tracing::{error, info};
 
 pub mod proto {
     tonic::include_proto!("nuwax.geometry");
-}
-
-fn env_first(names: &[&str], default_value: &str) -> String {
-    for name in names {
-        if let Ok(value) = std::env::var(name) {
-            if !value.trim().is_empty() {
-                return value;
-            }
-        }
-    }
-    default_value.into()
 }
 
 #[tokio::main]
@@ -54,36 +46,53 @@ async fn main() -> ExitCode {
         .unwrap_or(50051);
 
     // LCM channel 名称（typed channel `/topic#msg_type`）
-    let occupancy_channel = env_first(
-        &["NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL"],
+    // Phase 2 收敛:env 探测统一走 channel_registry::resolve_channel,
+    // 探测顺序 = NUWAX_GEOMETRY_RUNTIME_<X>_CHANNEL → NUWAX_LCM_CHANNEL_<X> → default
+    let occupancy_channel = channel_registry::resolve_channel(
+        "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL",
+        "NUWAX_LCM_CHANNEL_OCCUPANCY",
         "/map/occupancy#nav_msgs.OccupancyGrid",
     );
-    let tf_channel = env_first(
-        &["NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL"],
+    let tf_channel = channel_registry::resolve_channel(
+        "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL",
+        "NUWAX_LCM_CHANNEL_TF",
         "/tf#geometry_msgs.Transform",
     );
-    let cloud_map_channel = std::env::var("NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL").ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| Some("/go2/lidar/points#sensor_msgs.PointCloud2".into()));
-    let nav_state_channel = std::env::var("NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL").ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| Some("/nav/state#nuwax_msgs.NavigationState".into()));
-    let frontiers_channel = std::env::var("NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL").ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| Some("/explore/frontiers#nuwax_msgs.FrontierList".into()));
-    // Phase 1 channel registry 补齐 4 类 typed channel
-    let pose_channel = std::env::var("NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL").ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| Some("/pose_stamped#geometry_msgs.PoseStamped".into()));
-    let odometry_channel = std::env::var("NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL").ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| Some("/odom#nav_msgs.Odometry".into()));
-    let cmd_vel_channel = std::env::var("NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL").ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| Some("/cmd_vel#geometry_msgs.Twist".into()));
-    let nav_cancel_channel = std::env::var("NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL").ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| Some("/nav/cancel#nuwax_msgs.CancelNavigation".into()));
+    let cloud_map_channel = channel_registry::resolve_channel(
+        "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+        "NUWAX_LCM_CHANNEL_CLOUD_MAP",
+        "/go2/lidar/points#sensor_msgs.PointCloud2",
+    );
+    let nav_state_channel = channel_registry::resolve_channel(
+        "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL",
+        "NUWAX_LCM_CHANNEL_GOAL_POSE",
+        "/nav/state#nuwax_msgs.NavigationState",
+    );
+    let frontiers_channel = channel_registry::resolve_channel(
+        "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL",
+        "NUWAX_LCM_CHANNEL_FRONTIER",
+        "/explore/frontiers#nuwax_msgs.FrontierList",
+    );
+    let pose_channel = channel_registry::resolve_channel(
+        "NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL",
+        "NUWAX_LCM_CHANNEL_POSE_STAMPED",
+        "/pose_stamped#geometry_msgs.PoseStamped",
+    );
+    let odometry_channel = channel_registry::resolve_channel(
+        "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL",
+        "NUWAX_LCM_CHANNEL_ODOM",
+        "/odom#nav_msgs.Odometry",
+    );
+    let cmd_vel_channel = channel_registry::resolve_channel(
+        "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
+        "NUWAX_LCM_CHANNEL_CMD_VEL",
+        "/cmd_vel#geometry_msgs.Twist",
+    );
+    let nav_cancel_channel = channel_registry::resolve_channel(
+        "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
+        "NUWAX_LCM_CHANNEL_NAV_CANCEL",
+        "/nav/cancel#nuwax_msgs.CancelNavigation",
+    );
 
     let video_shm_path = PathBuf::from(
         std::env::var("NUWAX_VIDEO_SHM_PATH")
@@ -123,13 +132,13 @@ async fn main() -> ExitCode {
     let bridge = match lcm_runtime::spawn_geometry_runtime(
         &occupancy_channel,
         &tf_channel,
-        cm_chan_for_runtime.as_deref(),
-        nav_state_channel.as_deref(),
-        frontiers_channel.as_deref(),
-        pose_channel.as_deref(),
-        odometry_channel.as_deref(),
-        cmd_vel_channel.as_deref(),
-        nav_cancel_channel.as_deref(),
+        Some(&cm_chan_for_runtime),
+        Some(&nav_state_channel),
+        Some(&frontiers_channel),
+        Some(&pose_channel),
+        Some(&odometry_channel),
+        Some(&cmd_vel_channel),
+        Some(&nav_cancel_channel),
     ) {
         Ok(b) => b,
         Err(e) => {

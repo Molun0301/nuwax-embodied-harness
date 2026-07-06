@@ -310,122 +310,6 @@ class ExternalGeometryDebugObserver:
                     "地图/前沿数据由 nuwax-geometry-runtime 通过 gRPC SubscribeMapUpdates 推送。"
                 )
                 self._started = True
-                return
-
-                map_topic = str(self.config.topics.occupancy_topic or "/map_obstacles")
-                frontier_topic = str(self.config.external.frontier_topic or "explore/frontiers")
-                self._frontier_topic = frontier_topic
-                next_goal_topic = str(getattr(self.config.external, "next_goal_topic", "") or "/exploration/next_goal")
-                plan_topic = str(
-                    getattr(self.config.external, "plan_topic", "")
-                    or os.environ.get("NUWAX_GEOMETRY_PLAN_TOPIC", "/plan")
-                )
-
-                reliable_volatile = QoSProfile(
-                    history=HistoryPolicy.KEEP_LAST,
-                    depth=10,
-                    reliability=ReliabilityPolicy.RELIABLE,
-                    durability=DurabilityPolicy.VOLATILE,
-                )
-                reliable_transient = QoSProfile(
-                    history=HistoryPolicy.KEEP_LAST,
-                    depth=1,
-                    reliability=ReliabilityPolicy.RELIABLE,
-                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                )
-
-                self._subscriptions.append(
-                    self._node.create_subscription(RosOccupancyGrid, map_topic, self._on_map, reliable_volatile)
-                )
-                try:
-                    self._subscriptions.append(
-                        self._node.create_subscription(RosOccupancyGrid, map_topic, self._on_map, reliable_transient)
-                    )
-                except Exception:
-                    LOGGER.debug("创建 transient %s 订阅失败，保留 volatile 订阅。", map_topic, exc_info=True)
-                self._subscriptions.append(
-                    self._node.create_subscription(MarkerArray, frontier_topic, self._on_frontiers, reliable_volatile)
-                )
-                if ensure_go2_slam_overlay_python_paths():
-                    try:
-                        from explore_lite_msgs.msg import ExploreStatus
-
-                        self._subscriptions.append(
-                            self._node.create_subscription(
-                                ExploreStatus,
-                                self._explore_status_topic,
-                                self._on_explore_status,
-                                reliable_volatile,
-                            )
-                        )
-                    except Exception:
-                        LOGGER.warning(
-                            "explore_lite_msgs 已加入 PYTHONPATH 但订阅 explore/status 失败，跳过。",
-                            exc_info=True,
-                        )
-                else:
-                    LOGGER.warning(
-                        "explore_lite_msgs 不可用，跳过 explore/status 订阅。"
-                        "请确认 nuwax-geometry-runtime 已启动并通过 HealthCheck（共享运行时已编译并发布目标话题）。"
-                    )
-                self._subscriptions.append(
-                    self._node.create_subscription(PoseStamped, next_goal_topic, self._on_next_goal, reliable_volatile)
-                )
-                try:
-                    from nav_msgs.msg import Path as RosPath
-
-                    self._subscriptions.append(
-                        self._node.create_subscription(RosPath, plan_topic, self._on_plan, reliable_volatile)
-                    )
-                except Exception:
-                    LOGGER.warning("无法订阅 Nav2 全局规划路径 topic=%s", plan_topic, exc_info=True)
-                # 第 8 条判据主路径：单订阅者约束下，/rtabmap/info 仅本 observer 订阅
-                # 缺失 rtabmap_msgs 时优雅降级（runtime 走 DB SQLite fallback）。
-                try:
-                    from rtabmap_msgs.msg import Info as RtabmapInfo  # type: ignore
-
-                    self._rtabmap_info_topic = _RTABMAP_INFO_TOPIC
-                    self._rtabmap_info_subscription = self._node.create_subscription(
-                        RtabmapInfo,
-                        self._rtabmap_info_topic,
-                        self._on_rtabmap_info,
-                        reliable_volatile,
-                    )
-                    self._subscriptions.append(self._rtabmap_info_subscription)
-                except Exception:
-                    LOGGER.warning(
-                        "rtabmap_msgs 不可用，/rtabmap/info 订阅失败；runtime 第 8 条判据将走 DB SQLite fallback。"
-                    )
-                    self._rtabmap_info_subscription = None
-                if self._pose_callback is not None:
-                    self._tf_buffer = Buffer()
-                    self._tf_listener = TransformListener(self._tf_buffer, self._node)
-                    self._subscriptions.append(
-                        self._node.create_subscription(
-                            PoseStamped,
-                            self._pose_map_topic,
-                            self._on_pose_map,
-                            reliable_volatile,
-                        )
-                    )
-                    self._pose_timer = self._node.create_timer(_POSE_TIMER_PERIOD_SEC, self._on_pose_timer)
-                self._thread = threading.Thread(
-                    target=self._executor.spin,
-                    name="nuwax_external_geometry_debug_observer",
-                    daemon=True,
-                )
-                self._thread.start()
-                self._started = True
-                self._last_error = None
-                LOGGER.info(
-                    "GO2 外部几何 debug observer 已启动 map=%s frontiers=%s next_goal=%s plan=%s pose=%s pose_topic=%s",
-                    map_topic,
-                    frontier_topic,
-                    next_goal_topic,
-                    plan_topic,
-                    "enabled" if self._pose_callback is not None else "disabled",
-                    self._pose_map_topic if self._pose_callback is not None else "disabled",
-                )
             except Exception as exc:
                 self._last_error = str(exc)
                 self._cleanup_locked()
@@ -787,7 +671,10 @@ class ExternalGeometryDebugObserver:
     def _on_frontiers(self, msg: Any) -> None:
         status = self._status_from_marker_array(msg)
         goal = self._goal_from_marker_array(msg)
-        frontier_markers = self._frontiers_from_explore_lite_markers(msg)
+        # Phase 3 目标态：explore_lite ROS2 marker 解析下线，nuwax-geometry-runtime
+        # 通过 LCM/nuwax typed channel 直接推送等价 frontier 列表；这里不再做 marker-array
+        # 解析以避免死代码与 no_ros2 守门命中。
+        frontier_markers: List[Dict[str, object]] = []
         with self._lock:
             terminal = bool(status and status.get("terminal"))
             if status is not None:
@@ -858,39 +745,6 @@ class ExternalGeometryDebugObserver:
                 continue
             points.append({"x": x, "y": y, "z": z})
         return points
-
-    def _frontiers_from_explore_lite_markers(self, msg: Any) -> List[Dict[str, object]]:
-        markers = list(getattr(msg, "markers", []) or [])
-        frontiers: List[Dict[str, object]] = []
-        for index, marker in enumerate(markers):
-            action = int(getattr(marker, "action", 0) or 0)
-            if action == 3:
-                continue
-            ns = str(getattr(marker, "ns", "") or "")
-            marker_type = int(getattr(marker, "type", -1) or -1)
-            if ns != "frontiers" or marker_type != 2:
-                continue
-            point = self._marker_point(marker)
-            if point is None:
-                continue
-            x, y, z = point
-            frame_id = str(getattr(getattr(marker, "header", None), "frame_id", "") or self.config.frames.map_frame)
-            try:
-                frontiers.append(
-                    self._frontier_from_xyz(
-                        x,
-                        y,
-                        z,
-                        frame_id=frame_id,
-                        role="candidate",
-                        source="go2_explore_lite_marker",
-                        frontier_id="explore_lite:%d" % int(getattr(marker, "id", index) or index),
-                        metadata={"marker_ns": ns, "marker_id": int(getattr(marker, "id", index) or index)},
-                    )
-                )
-            except Exception:
-                LOGGER.debug("解析 explore_lite 前沿 marker 失败。", exc_info=True)
-        return frontiers
 
     def _emit_frontier_payload(self) -> None:
         with self._lock:

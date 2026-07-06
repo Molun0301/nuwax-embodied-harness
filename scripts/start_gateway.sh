@@ -270,7 +270,8 @@ cleanup_stale_go2_video_streamer() {
 cleanup_external_geometry_processes() {
   # 去 ROS2 化（2026-07-04 drop-ros2 B4 修复）：默认清理对象改为 nuwax-geometry-runtime
   # 与 LCM runtime 进程；不再扫描 services/geometry/ros2_ws/src/GO2_RTABNAV2 这条已删除
-  # 路径，也不 pkill ros2 launch / nav2_* / RTAB-Map 组件等 ROS2 进程模式。
+  # 路径，也不 pkill 任何 ROS2 / Nav2 进程模式（pattern 名/字符串迁移到
+  # scripts/legacy/cleanup_ros2_processes.sh，默认无 ROS2 字符串暴露）。
   # 历史 ROS2 进程清理（如旧 ws/旧 binary 仍以孤立进程残留）隔离到显式开关
   # NUWAX_LEGACY_ROS2_CLEANUP=1；默认不进入 gateway lifecycle。
   local pid=""
@@ -301,61 +302,13 @@ cleanup_external_geometry_processes() {
   if is_truthy "${NUWAX_LEGACY_ROS2_CLEANUP:-0}"; then
     echo "WARNING: NUWAX_LEGACY_ROS2_CLEANUP=1 已启用，将一并扫描已删除 ROS2 工作区残留模式。" >&2
     echo "         此开关仅用于一次性迁移验收，不属于日常 gateway lifecycle。" >&2
-    cleanup_legacy_ros2_processes
+    local legacy_script="${REPO_ROOT}/scripts/legacy/cleanup_ros2_processes.sh"
+    if [[ -x "${legacy_script}" ]]; then
+      bash "${legacy_script}"
+    else
+      echo "[legacy] 清理脚本不存在或不可执行: ${legacy_script}" >&2
+    fi
   fi
-}
-
-cleanup_legacy_ros2_processes() {
-  # 仅在 NUWAX_LEGACY_ROS2_CLEANUP=1 时被调用；目标是一次性清理历史 ROS2 工作区
-  # 残留（已删除 services/geometry/ros2_ws，但实机 os 层 process 表里仍有遗留进程）。
-  # 此函数不进入默认 gateway 路径。
-  local geometry_root="${REPO_ROOT}/services/geometry/ros2_ws/src/GO2_RTABNAV2"
-  local pid=""
-  local args=""
-  local pgid=""
-  local pattern=""
-  local go2_patterns=(
-    "ros2 launch go2_slam_nav"
-    "lib/rtabmap_slam/rtabmap"
-    "lib/rtabmap_odom/icp_odometry"
-    "lib/go2_slam_nav/sensor_stamp_relay"
-    "lib/go2_slam_nav/obstacle_grid_projector"
-    "lib/go2_slam_nav/go2_tf_relay"
-    "lib/go2_cmd_processor/sport_ctrl"
-    "explore_node"
-    "explore_preroll"
-    "nav2_container"
-    "component_container_isolated"
-    "lifecycle_manager"
-    "/nav2_controller/controller_server"
-    "/nav2_planner/planner_server"
-    "/nav2_recoveries/recoveries_server"
-    "/nav2_bt_navigator/bt_navigator"
-  )
-  declare -A seen_pgids=()
-
-  while read -r pid args; do
-    if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
-      continue
-    fi
-    if [[ "${args}" != *"${geometry_root}"* ]]; then
-      continue
-    fi
-    pgid="$(pid_pgid "${pid}")"
-    if [[ -z "${pgid}" || -n "${seen_pgids[${pgid}]:-}" ]]; then
-      continue
-    fi
-    seen_pgids["${pgid}"]=1
-    terminate_process_scope "${pid}" "legacy geometry process group ${pgid}"
-  done < <(ps -eo pid=,args=)
-
-  for pattern in "${go2_patterns[@]}"; do
-    pkill -TERM -f "${pattern}" 2>/dev/null || true
-  done
-  sleep 1
-  for pattern in "${go2_patterns[@]}"; do
-    pkill -KILL -f "${pattern}" 2>/dev/null || true
-  done
 }
 
 remove_pid_file() {

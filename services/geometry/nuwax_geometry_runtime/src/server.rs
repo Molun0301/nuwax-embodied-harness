@@ -449,11 +449,19 @@ impl GeometryRuntime for GeometryRuntimeService {
                 }));
             }
         };
+        let header = nuwax_protocol::LcmFrameHeader {
+            magic: nuwax_protocol::LCM_MAGIC,
+            fingerprint: msg_type.fingerprint(),
+            seqno: 0,
+            payload_len: payload.len() as u32,
+            protocol_major: 0,
+            protocol_minor: 0,
+        };
         let frame = RawLcmFrame {
             topic,
-            msg_type: Some(msg_type),
+            msg_type,
+            header,
             payload,
-            stamp_ns: ts_ns,
         };
         let lcm_transport = self.bridge.transport.clone();
         match lcm_transport.publish(frame).await {
@@ -502,11 +510,19 @@ impl GeometryRuntime for GeometryRuntimeService {
                 }));
             }
         };
+        let header = nuwax_protocol::LcmFrameHeader {
+            magic: nuwax_protocol::LCM_MAGIC,
+            fingerprint: msg_type.fingerprint(),
+            seqno: 0,
+            payload_len: payload.len() as u32,
+            protocol_major: 0,
+            protocol_minor: 0,
+        };
         let frame = RawLcmFrame {
             topic,
-            msg_type: Some(msg_type),
+            msg_type,
+            header,
             payload,
-            stamp_ns: now_ns(),
         };
         let lcm_transport = self.bridge.transport.clone();
         match lcm_transport.publish(frame).await {

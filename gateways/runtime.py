@@ -6510,22 +6510,22 @@ class GatewayRuntime:
                         "force_runtime_goal": force_runtime_goal,
                     },
                 )
-        nav2_status = self.platform_geometry_runtime._build_nav2_status()
-        if not bool(nav2_status.get("ready")):
+        navigation_status = self.platform_geometry_runtime._build_navigation_status()
+        if not bool(navigation_status.get("ready")):
             raise GatewayError(
-                str(nav2_status.get("message") or "Nav2 未就绪，无法执行 %s。" % capability_name),
-                error_code="nav2_not_ready",
+                str(navigation_status.get("message") or "nuwax-geometry-runtime 导航未就绪，无法执行 %s。" % capability_name),
+                error_code="navigation_not_ready",
                 http_status=409,
                 jsonrpc_code=-32000,
                 details={
                     "map_name": map_name,
                     "capability_name": capability_name,
-                    "waiting_for": nav2_status.get("waiting_for"),
-                    "nav2_status": nav2_status,
+                    "waiting_for": navigation_status.get("waiting_for"),
+                    "navigation_status": navigation_status,
                 },
             )
         RUNTIME_LOGGER.info(
-            "trust_live_navigation: Nav2 ready + live pose available, bypass localization session gate for %s map=%s",
+            "trust_live_navigation: nuwax-geometry-runtime ready + live pose, bypass session gate for %s map=%s",
             capability_name,
             map_name,
         )

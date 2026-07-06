@@ -1975,8 +1975,8 @@ button{font-family:inherit;cursor:pointer}
           const message = navState.message || (status === "cancelled" ? "导航已取消" : "导航失败");
           const failureReason = String(metadata.failure_reason || "");
           if (
-            failureReason === "nav2_not_ready"
-            || message.includes("Nav2 未 ready")
+            failureReason === "navigation_not_ready"
+            || message.includes("nav_runtime 未 ready")
             || message.includes("lifecycle 未全部 active")
             || message.includes("costmap 尚未首帧")
           ) {
@@ -2091,7 +2091,7 @@ button{font-family:inherit;cursor:pointer}
         if (code === "access_denied") {
           return "当前令牌无权调用 navigate_to_pose。";
         }
-        if (code === "nav2_not_ready") {
+        if (code === "navigation_not_ready") {
           const waitingFor = payload && payload.details && payload.details.waiting_for;
           return waitingFor
             ? `Nav2 未就绪（等待 ${waitingFor}）。${message || ""}`

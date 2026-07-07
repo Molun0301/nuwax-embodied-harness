@@ -12,21 +12,20 @@ commit 总数。
 
 ```
 $ git rev-list --count c30d6c2..HEAD
-39
+41
 
 $ git log -1 --format="%H"
-0b7b16c9a1d0d54110abc241512a5ebcbb89e5e0  # docs(codex-r3) HEAD（落盘后）
+096cf5e14ea310052bc584e00a59e56a80fe92ac  # chore(codex-r3): no_ros2_residual.allowlist 同步 Phase 6 (R3-4) 行号漂移（落盘后 HEAD）
 
 $ find docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/ -name "*.md" | wc -l
-29
+30
 ```
 
-39 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 4 (codex round3，
-本批次 4 个 R3-1/R3-2/R3-3/R3-4 修代码 + 1 个 R3-5 settings 注释 + 1 个
-R3-6 docs)。
+41 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 6 (codex round3，
+本批次 6 个 R3-1/R3-2/R3-3/R3-4/R3-5/R3-6 + 1 个 allowlist 行号漂移)。
 
-**md 文件数**：29/29（执行方案 1 + phase 反馈 8 + todolist 8 + feedback 12
-含本文件 + 中间备份 0）。feedback 12 = phase0-7 = 8 + codex round1/2/3 = 3 +
+**md 文件数**：30/30（执行方案 1 + phase 反馈 8 + todolist 8 + feedback 13
+含本文件 + 中间备份 0）。feedback 13 = phase0-7 = 8 + codex round1/2/3 = 3 +
 本文件覆盖的 round1/2 备份修复 + 本 round3 = 1。
 
 ## 1. Must-fix 3 项
@@ -282,7 +281,7 @@ test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 | `git log -1 --format="%H"` | 落盘 HEAD | 0b7b16c（docs commit，未含本文件） |
 | `find docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/ -name "*.md" \| wc -l` | 29/29 | 29（落盘后含本文件） |
 
-## 4. 6 个 round3 commit hash
+## 4. 7 个 round3 commit hash
 
 ```
 8f2c4e3 fix(codex-r3-R3-1): PlatformGeometryProviderBundle.sync_exploration_after_task 加 NUWAX_EXPLORATION_LEGACY guard
@@ -290,7 +289,8 @@ b028b53 fix(codex-r3-R3-2): start_nuwax_geometry_runtime.sh dry-run 提前到 mk
 3d101b9 chore(codex-r3-R3-3): .gitattributes 排除 proto_gen/ trailing whitespace
 b659534 chore(codex-r3-R3-4): cargo clippy dead_code/style 收敛 49 → 0 个 errors
 0b7b16c fix(codex-r3-R3-5): core/settings.py 三处 fake-lcm 注释改为与 REAL_LCM_REQUIRED 联动语义
-<pending> docs(codex-r3): feedback_codex_round2.md 数字/hash 全部修正 + 新建 feedback_codex_round3.md
+7559d19 docs(codex-r3): feedback_codex_round2.md 数字/hash 全部修正 + 新建 feedback_codex_round3.md
+096cf5e chore(codex-r3): no_ros2_residual.allowlist 同步 Phase 6 (R3-4) 行号漂移
 ```
 
 ## 5. Round3 收口后的下一步建议
@@ -312,15 +312,15 @@ b659534 chore(codex-r3-R3-4): cargo clippy dead_code/style 收敛 49 → 0 个 e
 
 ## 6. 真实 commit 总数（落盘后最终值）
 
-本文件落盘后：
+本文件落盘后（最终）：
 
 ```
 $ git rev-list --count c30d6c2..HEAD
-40   # 39 + 1 (docs commit)
+41
 
 $ find docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/ -name "*.md" | wc -l
-29
+30
 ```
 
-40 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 5
-(codex round3, 含本 docs commit)。
+41 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 6
+(codex round3, 含 allowlist 行号漂移 commit)。

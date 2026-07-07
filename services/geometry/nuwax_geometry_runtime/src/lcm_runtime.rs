@@ -44,6 +44,14 @@ use crate::mapping_adapter::{FeedOnlyAccumulator, MappingAdapter, MappingAdapter
 use crate::occupancy_shm::OccupancyGridShmWriter;
 use crate::pointcloud::CloudMapShmWriter;
 
+// Phase 4 (channel registry) + Phase 7 (readiness cache): 统一在这里导入,
+// 避免每个函数 body 内部重复 `use crate::channel_registry::...`。
+//
+// 同时 `use crate::channel_registry;` 让 module 名进 scope,内部多处以
+// `channel_registry::channel_for(...)` 限定调用,无需每次都写完整 `crate::` 路径。
+use crate::channel_registry;
+use crate::channel_registry::ChannelKey;
+
 // ============================================================================
 // 状态定义（与原 ros2_bridge.rs 同结构，便于 server.rs 不感知 backend 切换）
 // ============================================================================
@@ -645,6 +653,14 @@ pub fn spawn_geometry_runtime(
     // 防止上游 systemd / start_gateway 把 binary restart-loop 仍以"启动期失败"
     // 状态回写 ready_file，从而绕开生产意图。运行期故障仍仅走 HealthCheck
     // healthy=false 路径，**不**重复触发 exit。
+    //
+    // Phase 3 (2026-07-07) 修订：
+    //   - 当 binary 以 `--features real-lcm-bridge` 构建时,
+    //     `LcmBackendKind::Real` 分支**真正**调 `LcmTransport::new_real(provider)`,
+    //     失败按 NUWAX_REAL_LCM_REQUIRED 决定硬退出 / return Err;
+    //   - 当 binary 默认 fake-only 构建时,`real-lcm-bridge` feature **未启用**,
+    //     本分支仍按 Phase 2 baseline 返回 RealLcmBackendUnavailable,
+    //     不让 fake 假装真。
     let real_lcm_required = real_lcm_required_from_env();
     let (transport, backend_name, backend_available): (LcmTransport, &'static str, bool) =
         match LcmBackendKind::from_env() {
@@ -653,26 +669,47 @@ pub fn spawn_geometry_runtime(
                 (LcmTransport::new_fake(), "fake-lcm", true)
             }
             LcmBackendKind::Real => {
-                // dependency mismatch blocker:
-                //   - dimos workspace 无 `nuwax-lcm-sys` / `nuwax-lcm` crate
-                //   - `nuwax-transport/real-lcm` feature 仍为 `[]` 空桩
-                //   - fingerprint 当前 = FNV-1a 64-bit,非 lcm-gen MurmurHash64A
-                // 处置:启动期直接返回 RealLcmBackendUnavailable,main.rs 立即退出。
-                // **绝不**在 Real 失败路径调用 `LcmTransport::new_fake()`。
-                //
-                // Phase 5 (codex-P2) 进一步要求：
-                // 当 `NUWAX_REAL_LCM_REQUIRED=true` 时，进程**硬退出**（exit code = 1），
-                // 错误信息仍保留 stderr `LCM_BACKEND_UNAVAILABLE` 关键字
-                // 供 start 脚本与 smoke test grep 识别。
+                let lcm_url = std::env::var("NUWAX_LCM_URL").unwrap_or_else(|_| {
+                    "udpm://239.255.76.67:7667?ttl=1".to_owned()
+                });
                 if real_lcm_required {
                     eprintln!(
                         "LCM_BACKEND_UNAVAILABLE: NUWAX_REAL_LCM_REQUIRED=true 时 real-lcm \
-                         backend 上游 dimos nuwax-transport/real-lcm feature 仍为空桩，\
-                         按生产意图立即硬退出 (exit code = 1)。"
+                         backend 启动失败（liblcm 缺失或 provider URL 错），按生产意图 \
+                         立即硬退出 (exit code = 1)。"
                     );
                     std::process::exit(1);
                 }
-                return Err(RealLcmBackendUnavailable);
+                // real-lcm feature gate —— 二选一:
+                //   1. binary --features real-lcm-bridge → 真起 liblcm
+                //   2. binary 默认 fake-only → 保留 Phase 2 行为 (return Err)
+                #[cfg(feature = "real-lcm-bridge")]
+                {
+                    match LcmTransport::new_real(&lcm_url) {
+                        Ok(t) => {
+                            info!(
+                                "LCM backend 选择: real-lcm (provider={})",
+                                lcm_url
+                            );
+                            (t, "real-lcm", true)
+                        }
+                        Err(e) => {
+                            // 与 Phase 2 行为一致:不静默 fallback fake,直接 fail-fast。
+                            eprintln!(
+                                "LCM_BACKEND_UNAVAILABLE: LcmTransport::new_real({}) 失败: {} \
+                                 —— 请确认 liblcm-dev 已安装 (apt-get install liblcm-dev) \
+                                 且 provider URL 合法。",
+                                lcm_url, e
+                            );
+                            return Err(RealLcmBackendUnavailable);
+                        }
+                    }
+                }
+                #[cfg(not(feature = "real-lcm-bridge"))]
+                {
+                    let _ = lcm_url;
+                    return Err(RealLcmBackendUnavailable);
+                }
             }
         };
     info!(
@@ -912,7 +949,7 @@ pub fn spawn_geometry_runtime(
     let odom_state = state.clone();
     let odom_transport = transport.clone();
     // Phase 4: 改走 channel_registry::channel_for(Odom) —— 禁止再硬编码 /odom。
-    let odom_topic = channel_registry::channel_for(channel_registry::ChannelKey::Odom);
+    let odom_topic = channel_registry::channel_for(ChannelKey::Odom);
     let odom_msg_type = LcmMessageType::new("nav_msgs/Odometry").expect("typed");
     tokio::spawn(async move {
         let mut stream = odom_transport.subscribe(odom_topic, Some(odom_msg_type)).await;
@@ -1174,7 +1211,7 @@ fn spawn_mapping_feed_tasks(
 
     // ---- /odom → feed_pose ----
     // Phase 4: 改走 channel_registry::channel_for(Odom) —— 禁止硬编码 /odom。
-    let odom_topic = channel_registry::channel_for(channel_registry::ChannelKey::Odom);
+    let odom_topic = channel_registry::channel_for(ChannelKey::Odom);
     let odom_msg_type = match LcmMessageType::new("nav_msgs/Odometry") {
         Ok(m) => m,
         Err(e) => {
@@ -1208,7 +1245,7 @@ fn spawn_mapping_feed_tasks(
 
     // ---- /go2/lidar/points → feed_pointcloud + build_and_publish ----
     // Phase 4: 改走 channel_registry::channel_for(PointCloud) —— 禁止硬编码 /go2/lidar/points。
-    let lidar_topic = channel_registry::channel_for(channel_registry::ChannelKey::PointCloud);
+    let lidar_topic = channel_registry::channel_for(ChannelKey::PointCloud);
     let lidar_msg_type = match LcmMessageType::new("sensor_msgs/PointCloud2") {
         Ok(m) => m,
         Err(e) => {

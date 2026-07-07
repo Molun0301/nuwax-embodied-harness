@@ -11,20 +11,31 @@ description = "nuwax 平台几何 LCM/nuwax native runtime 子进程（独立于
 [dependencies]
 # nuwax-workspace path deps（LCM-first）。
 #
-# real-lcm feature 依赖上游 nuwax-transport 实现,当前上游 feature 仍为空桩。
-# - 上游 `real-lcm = []` 尚未实装 Rust LCM binding
-# - 上游 `nuwax-codec` fingerprint 仍用 FNV-1a,与上游 lcm-gen MurmurHash64A 不等价
-# 详见 docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/06_LCM接入与wire-format验证.md
+# Phase 3 (2026-07-07) 修订：
+# - `nuwax-transport/real-lcm` 已实装(本仓 `services/nuwax-workspace/crates/nuwax-lcm*`)
+# - real-lcm 默认关闭;本 binary 走 `default-features = false` 仍走 fake
+# - 下方 `real-lcm-bridge` feature(在 `[features]`)启用时显式打开 upstream real-lcm,
+#   并把 lcm_runtime 的 Real 分支切到 `LcmTransport::new_real(provider)`
+# - 没有 `liblcm-dev` 的 dev/CI 镜像不允许编译 `real-lcm-bridge`,否则
+#   `cargo build --features real-lcm-bridge` 在 `nuwax-lcm-sys/build.rs`
+#   探测阶段 fail-fast(exit 2);本仓 CI 不开此 feature。
 #
-# 因此本仓 *默认* 走 fake backend;只有当上游 PR 完成（real-lcm binding +
-# MurmurHash64A 切换）后,才能在本仓启用 `NUWAX_LCM_BACKEND=real`。
-# 当前阶段显式将 nuwax-transport feature 锁定为 `default-features = false`,
-# 即使误设环境变量也不会意外拉入空 feature;`lcm_runtime.rs` 启动期
-# 进一步校验 fallback,见 `LcmBackendKind::from_env`。
+# 上游 dimos 路径仍保留 Phase 1 baseline — Phase 8/9 再替换为本仓相对路径。
 nuwax-protocol = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-protocol" }
 nuwax-transport = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-transport", default-features = false }
 nuwax-codec = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-codec" }
 nuwax-tf = { path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/nuwax-tf" }
+
+# Phase 3:real-lcm bridge feature gate。binary 默认不启用,需 `--features
+# real-lcm-bridge` 显式打开。未开 feature 时 `lcm_runtime.rs` Real 分支
+# 仍走原 fail-fast 路径(`RealLcmBackendUnavailable` / 进程硬退出),
+# 与 Phase 2 baseline 行为一致;这样 CI 镜像编译 fake-only binary 仍然
+# 通过。生产镜像(installer 装 liblcm-dev 后)用 start_nuwax_geometry_runtime.sh
+# 显式 `--features real-lcm-bridge` 构建启停脚本。
+# 详见下方独立的 `[features]` 块 —— 移动到所有 `[dependencies]` 之后,
+# 因为 cargo 解析时遇到 `[features]` 会把后续依赖行当作 features 序列
+# 解析,不是依赖 map(原位置紧贴在 `nuwax-tf` 之后会让下面的
+# `nuwax-mapping/nuwax-nav-stack/...` 行全部 throw "expected a sequence" 错误)。
 
 # Phase 2:建图 / 导航 / 探索功能 crate 接入。
 # feature 名以 dimos 实际 Cargo.toml 为准(见 Phase 2 执行方案 / feedback_phase2.md)。
@@ -63,6 +74,13 @@ parking_lot = "0.12"
 # 类型(workspace 已经使用 0.33 + serde-serialize)。固定到同一版本以避免
 # `nuwax-mapping::OccupancyGrid.origin` (nalgebra::Isometry3) 跨 crate 类型错配。
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
+
+# Phase 3 `[features]`:real-lcm bridge feature gate。binary 默认不启用,
+# 需 `--features real-lcm-bridge` 显式打开;详见上方长注释。
+# 该块必须位于所有 `[dependencies]` 之后 —— cargo 解析遇到 `[features]`
+# 会把后续行当作 features 序列,不是依赖 map。
+[features]
+real-lcm-bridge = ["nuwax-transport/real-lcm"]
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -1,3 +1,9 @@
+// Phase 6 (codex-round3 R3-4):schema_hash_version / mapping_ready / nav_ready
+// / explore_ready / blockers / mapping_readiness / exploration_readiness /
+// format_blockers / readiness_pair 是 platform RuntimeDiagnostics 协议预留
+// (Phase 6 后续 Phase 6.1 readiness 协议升级时统一暴露)。
+#![allow(dead_code)]
+
 //! Runtime diagnostics —— 统一 health / readiness / blocker 输出。
 //!
 //! `server.rs` 的 `health_check` / `get_navigation_readiness` 当前内联散落;

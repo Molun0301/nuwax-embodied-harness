@@ -1,3 +1,7 @@
+// Phase 6 (codex-round3 R3-4)：pose_stamped_from_robot / add_source /
+// arbitration / is_active 是 Phase 5 explore RuntimeDiagnostics contract 预留。
+#![allow(dead_code)]
+
 //! Phase 5 explore_runtime —— 探索 orchestration runtime module
 //!
 //! 目标:把 `nuwax_exploration::ExplorationController` 接入当前 runtime,

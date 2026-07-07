@@ -1,3 +1,9 @@
+// Phase 6 (codex-round3 R3-4):ShmHeader / shm_path / uds_path / sequence /
+// notify 是 video relay SHM+UDS 双路 payload contract 预留(Phase 1.5 WebRTC
+// / SHM hybrid 接入时使用),Phase 6 当前先放 UDS 单路。line 132 的
+// `uninlined_format_args` 是风格性 lint,debug log 可读性优先。
+#![allow(dead_code, clippy::uninlined_format_args)]
+
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
 use std::io::Read;

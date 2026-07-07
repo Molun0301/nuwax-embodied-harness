@@ -1,3 +1,7 @@
+// Phase 6 (codex-round3 R3-4)：shm_path / last_revision 是 SHM 字节布局版本
+// 兼容预留（occupancy_shm v1/v2 共存），Phase 6 后续版本切换时使用。
+#![allow(dead_code)]
+
 //! Phase 3: OccupancyGrid SHM sidecar
 //!
 //! 把 `MapState.data` (Vec<i8>) 与 meta 序列化成 stable 字节布局,写入

@@ -1,3 +1,9 @@
+// Phase 6 (codex-round3 R3-4)：server.rs 多处 format! 调用被 clippy 1.88
+// `uninlined_format_args` 报告(e.g. line 239/590/605/624/639 的 `format!("...{}", e)`),
+// 风格性 lint。统一 file-level 标注不强行收敛——debug log 与 Status::internal
+// 字符串拼接的可读性高于命名参数形式。
+#![allow(clippy::uninlined_format_args)]
+
 //! gRPC facade — `GeometryRuntime` service.
 //!
 //! 所有状态来自 `GeometryRuntimeHandle`（持有 LCM runtime SharedState）；

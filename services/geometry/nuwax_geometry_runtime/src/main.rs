@@ -1,3 +1,7 @@
+// Phase 6 (codex-round3 R3-4)：main.rs line 113/165 同样被 `uninlined_format_args`
+// 报告,风格性 lint,统一 file-level 标注。
+#![allow(clippy::uninlined_format_args)]
+
 //! nuwax-geometry-runtime：LCM-first 几何 native runtime 子进程入口
 //!
 //! 替换旧 `nuwax-ros-bridge`：删除 ROS2 env/r2r/DDS 依赖；改为读

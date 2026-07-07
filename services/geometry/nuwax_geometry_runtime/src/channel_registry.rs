@@ -1,3 +1,8 @@
+// Phase 6 (codex-round3 R3-4)：TYPED_CHANNELS / resolve_all / strip_env_prefix
+// 是 platform API 预留入口（Phase 3 mapping / Phase 5 explore 调用面未全部接通）。
+// 在不破坏 contract 前提下用 file-level allow 标注；P2 收口期 Phase 6 后期再清理。
+#![allow(dead_code)]
+
 //! LCM typed channel registry —— 统一解析 env。
 //!
 //! 该模块把 `lcm_runtime.rs` 与 `main.rs` 中分散的 `std::env::var(...)` 读

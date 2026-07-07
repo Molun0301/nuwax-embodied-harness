@@ -1,3 +1,8 @@
+// Phase 6 (codex-round3 R3-4)：build_handle_for_tests 是 #[cfg(test)] 内部
+// 用的 helper,dead_code 是预期行为;needless_range_loop 与 too_many_arguments
+// 是 typed_codec 长 payload 拼接的合理选择,不强行收敛。
+#![allow(dead_code, clippy::needless_range_loop, clippy::too_many_arguments)]
+
 //! LCM-first geometry runtime state loop。
 //!
 //! 该模块替换原 `ros2_bridge.rs`：不再订阅 ROS2 topic，而是通过

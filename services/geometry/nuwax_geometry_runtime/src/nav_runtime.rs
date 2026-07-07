@@ -1,3 +1,10 @@
+// Phase 6 (codex-round3 R3-4):frame_id / target / accepted_at_ns / inner /
+// build_nav_stack_handle / render_dry_run / readiness_from_reason 是 Phase 4
+// nav RuntimeDiagnostics platform API 预留(共享 nuwax-nav-stack handle 与
+// 探测日志 trace 入口)。uninlined_format_args 是 debug log 模板代码风格,
+// 不动语义。
+#![allow(dead_code, clippy::uninlined_format_args)]
+
 //! Phase 4:nav runtime adapter —— 把 `SetNavigationGoal` / `CancelNavigation` /
 //! `SubscribeNavigationState` / `GetNavigationReadiness` 从 `UNIMPLEMENTED` 变成
 //! 真实导航执行链。

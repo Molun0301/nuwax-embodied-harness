@@ -1,3 +1,9 @@
+// Phase 6 (codex-round3 R3-4)：voxel_size / feed_pointcloud / accumulated_count
+// / cost_mapper_config / reset_accumulator / current_revision 是 Phase 3 mapping
+// adapter 对外 platform API 预留（SharedState.map / cloud_map 走 fetcher 而不
+// 直接调 FeedOnlyAccumulator.method），删了会破坏 Phase 4/5 调用面。
+#![allow(dead_code)]
+
 //! Phase 3: nuwax-mapping 接入 adapter。
 //!
 //! 目标:把 `nuwax-mapping::PointCloudAccumulator` / `OccupancyGrid` / `CostMapper`

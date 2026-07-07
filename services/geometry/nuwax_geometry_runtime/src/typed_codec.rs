@@ -1,3 +1,9 @@
+// Phase 6 (codex-round3 R3-4):POSE_STAMPED_PAYLOAD_HEADER_BYTES /
+// decode_odometry_payload / decode_nav_state_payload / decode_tf_payload /
+// decode_frontiers_payload 是 typed_codec payload 解码入口,目前 typed_codec
+// 走 Encode-only contract(写入侧),解码侧留给 Phase 6.1 WebSocket 接管。
+#![allow(dead_code)]
+
 //! LCM typed encode/decode —— 替换 `server.rs` / `lcm_runtime.rs` 中的
 //! ad-hoc bytes 段。
 //!

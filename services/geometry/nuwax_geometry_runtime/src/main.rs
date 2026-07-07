@@ -73,7 +73,10 @@ async fn main() -> ExitCode {
     );
     let nav_state_channel = channel_registry::resolve_channel(
         "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL",
-        "NUWAX_LCM_CHANNEL_GOAL_POSE",
+        // Phase 4 修复:platform alias 从 `NUWAX_LCM_CHANNEL_GOAL_POSE` 改为
+        // `NUWAX_LCM_CHANNEL_NAV_STATE`,与 channel_registry::TYPED_CHANNELS
+        // 对齐。历史误用让运维改 nav_state channel 时改到 goal_pose env。
+        "NUWAX_LCM_CHANNEL_NAV_STATE",
         "/nav/state#nuwax_msgs.NavigationState",
     );
     let frontiers_channel = channel_registry::resolve_channel(

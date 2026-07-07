@@ -60,19 +60,11 @@ pub const NAV_CANCEL_HEADER_BYTES: usize = 2 + 8;
 // encode 端
 // ============================================================================
 
-/// 构造 LcmTopic,失败时 fallback 到合法默认值并打 warn。
-///
-/// 业务上不应在 fake backend 路径抛错;只在 typed suffix 缺失时降级。
-pub fn topic_or_default(channel: &str, default: &str) -> LcmTopic {
-    LcmTopic::new(channel).unwrap_or_else(|_| {
-        tracing::warn!(
-            "LCM topic {:?} 不合法,回退到 default {:?}",
-            channel,
-            default
-        );
-        LcmTopic::new(default).expect("default channel must be valid")
-    })
-}
+// Phase 4:`topic_or_default(channel, default)` 已废弃 —— 它把 typed suffix
+// 缺失的 channel 静默 fallback 到 default，是 untyped channel 与 typed
+// channel 共存的过渡设计。Phase 4 起 channel 构造统一走
+// `channel_registry::channel_for(ChannelKey)` 公共 helper（保证 100% typed
+// suffix），不再提供 untyped fallback helper；旧调用方已迁移到 channel_for。
 
 /// 把 PoseState 编码成 odometry typed payload bytes。
 ///
@@ -373,7 +365,8 @@ mod tests {
 
     #[test]
     fn build_typed_frame_wire_size() {
-        let topic = topic_or_default("/odom", "/odom");
+        // Phase 4:直接用 `LcmTopic::new` typed 形式，不再走已废弃 `topic_or_default`。
+        let topic = LcmTopic::new("/odom").expect("typed /odom");
         let msg_type = LcmMessageType::new("nav_msgs/Odometry").expect("typed");
         let pose = sample_pose();
         let payload = encode_odometry_payload(&pose);

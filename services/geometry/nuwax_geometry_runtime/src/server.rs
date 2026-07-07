@@ -305,10 +305,17 @@ impl GeometryRuntime for GeometryRuntimeService {
     // 导航兼容
     // ========================================================================
     //
-    // B7 blocker: nuwax-nav-stack LCM channel 未接通,/nav/goal 与 /nav/cancel
-    // channel 尚未实现 publisher 端。本期不假装成功,所有 RPC 明确返回
-    // status="UNIMPLEMENTED" + 详细 message,避免上游灰度时把 placeholder
-    // 当成 success 接进去。
+    // Phase 4:`/nav/goal` 与 `/nav/cancel` publisher 已由 nav_runtime.rs 接管
+    // (`publish_goal_frame` / `publish_cancel_frame`),通过 LcmTransport.publish
+    // 推到 LCM typed channel。本节保留 setter RPC 入口供 Python/前端调用。
+    // 删除 Phase 3 的 "UNIMPLEMENTED" placeholder 注释 —— readiness 与状态机
+    // 都在 nav_runtime.rs 内真实执行(`set_goal` / `cancel`)。
+    //
+    // Phase 7:`SetNavigationGoal` 在 real production profile 且 cmd_vel_sink=false
+    // 时被 nav_runtime::set_goal 拒绝;readiness 全量字段由
+    // `mapping_adapter::MappingReadiness` / `nav_runtime::NavigationReadinessDetail`
+    // / `explore_runtime::ExplorationReadinessDetail` 暴露,见
+    // `docs/.../11_readiness_收敛.md`。
 
     async fn set_navigation_goal(&self, req: Request<NavigationGoal>) -> Result<Response<NavigationState>, Status> {
         // Phase 4:接入 nav_runtime。流程:
@@ -545,18 +552,15 @@ impl GeometryRuntime for GeometryRuntimeService {
     // 输入发布兼容（gRPC 端用于调试；走 LCM 后端发布）
     // ========================================================================
     //
-    // B6 blocker: 当前 nuwax-transport LcmTransport::publish 已可用,但
-    // typed payload 编码（与 nuwax-codec golden fixture 一致 + 与上游
-    // lcm-gen MurmurHash64A fingerprint 对账）在 Phase 5 才完成。
-    // 本期 publish_odom / publish_point_cloud 调用 LcmTransport.publish
-    // 把原始 bytes 透传（fake backend 直接 push 到内存 topic,real backend
-    // 由 LCM 序列化层处理);若 backend 异常或上游 binding 未就位,返回
-    // success=false + 明确错误,不假装成功。
+    // Phase 4 重写：`publish_odom` / `publish_point_cloud` 不再硬编码 channel；
+    // 改走 `channel_registry::channel_for(Odom / PointCloud)`，由 env 或
+    // default 拼 typed suffix。删除 stale "B6 blocker" / "Phase 5 才完成"
+    // 注释 —— typed payload 编码（typed_codec）与 LcmTransport.publish 调用
+    // 已是当前正确路径，real-lcm backend 待 Phase 3 完成后再启用。
 
     async fn publish_odom(&self, req: Request<PublishOdomRequest>) -> Result<Response<PublishResult>, Status> {
-        // Phase 2 重构:typed payload 编码走 typed_codec,禁止本文件再写
-        // ad-hoc bytes。
-        // P1 切 MurmurHash64A 时,typed_codec::build_typed_frame 是唯一改点。
+        // Phase 4:typed payload 编码走 typed_codec;channel 走 channel_registry;
+        // 禁止本文件再写硬编码 `/odom` 或 ad-hoc bytes。
         use nuwax_protocol::LcmMessageType;
         let pose = req.get_ref().pose.as_ref();
         let (frame_id, ts_ns) = match pose {
@@ -586,7 +590,10 @@ impl GeometryRuntime for GeometryRuntimeService {
         };
         let payload = typed_codec::encode_odometry_payload(&pose_state);
 
-        let topic = typed_codec::topic_or_default("/odom", "/odom");
+        // Phase 4:走 channel_registry::channel_for(Odom) 公共 helper。
+        let topic = crate::channel_registry::channel_for(
+            crate::channel_registry::ChannelKey::Odom,
+        );
         let msg_type = match LcmMessageType::new("nav_msgs/Odometry") {
             Ok(m) => m,
             Err(e) => {
@@ -600,10 +607,17 @@ impl GeometryRuntime for GeometryRuntimeService {
         let frame = typed_codec::build_typed_frame(topic, msg_type, payload, 0);
         let lcm_transport = self.bridge.transport.clone();
         match lcm_transport.publish(frame).await {
-            Ok(()) => Ok(Response::new(PublishResult {
-                success: true,
-                message: format!("odom LCM publish 已接受（backend={}）", self.bridge.transport_backend_name),
-            })),
+            Ok(()) => {
+                // Phase 7:发布成功后在 mapping_adapter 上累加 odom_count,
+                // readiness 暴露用。不动 feed_* 函数签名。
+                if let Some(adapter) = self.bridge.mapping_adapter.as_ref() {
+                    adapter.lock().increment_odom_count();
+                }
+                Ok(Response::new(PublishResult {
+                    success: true,
+                    message: format!("odom LCM publish 已接受（backend={}）", self.bridge.transport_backend_name),
+                }))
+            }
             Err(e) => {
                 tracing::warn!("publish_odom: LCM publish 失败: {}", e);
                 Ok(Response::new(PublishResult {
@@ -615,12 +629,15 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
 
     async fn publish_point_cloud(&self, req: Request<PublishPointCloudRequest>) -> Result<Response<PublishResult>, Status> {
-        // Phase 2 重构:typed payload 编码走 typed_codec。
+        // Phase 4:channel 走 channel_registry::channel_for(PointCloud)，
+        // 不再硬编码 `/go2/lidar/points`。
         use nuwax_protocol::LcmMessageType;
         let pcr = req.get_ref();
         let payload = typed_codec::encode_pointcloud_payload(&pcr.points, pcr.point_step);
 
-        let topic = typed_codec::topic_or_default("/go2/lidar/points", "/go2/lidar/points");
+        let topic = crate::channel_registry::channel_for(
+            crate::channel_registry::ChannelKey::PointCloud,
+        );
         let msg_type = match LcmMessageType::new("sensor_msgs/PointCloud2") {
             Ok(m) => m,
             Err(e) => {
@@ -634,10 +651,17 @@ impl GeometryRuntime for GeometryRuntimeService {
         let frame = typed_codec::build_typed_frame(topic, msg_type, payload, 0);
         let lcm_transport = self.bridge.transport.clone();
         match lcm_transport.publish(frame).await {
-            Ok(()) => Ok(Response::new(PublishResult {
-                success: true,
-                message: format!("PointCloud2 LCM publish 已接受（backend={}）", self.bridge.transport_backend_name),
-            })),
+            Ok(()) => {
+                // Phase 7:同 publish_odom,发布成功后累加 pointcloud_count + occupancy revision。
+                if let Some(adapter) = self.bridge.mapping_adapter.as_ref() {
+                    adapter.lock().increment_pointcloud_count();
+                    adapter.lock().increment_occupancy_revision();
+                }
+                Ok(Response::new(PublishResult {
+                    success: true,
+                    message: format!("PointCloud2 LCM publish 已接受（backend={}）", self.bridge.transport_backend_name),
+                }))
+            }
             Err(e) => {
                 tracing::warn!("publish_point_cloud: LCM publish 失败: {}", e);
                 Ok(Response::new(PublishResult {

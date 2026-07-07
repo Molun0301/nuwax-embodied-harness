@@ -39,6 +39,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use nuwax_nav_basic_path_follower::{
@@ -312,6 +313,44 @@ pub struct NavigationReadinessDetail {
     pub module_node_count: usize,
     /// 在 default profile 之外的,本阶段未启用的 native profile 列表。
     pub p1_native_profiles: Vec<String>,
+    // === Phase 7 增量字段 ===
+    /// canonical LCM backend 名("RealLcm" / "FakeLcm")。
+    pub backend: String,
+    /// 累计有效 tf 帧计数(`pose.timestamp_ns > 0` 时 +1)。
+    pub tf_count: u64,
+    /// 当前 `state.map.revision` 快照。
+    pub costmap_revision: u64,
+    /// Phase 6 cmd_vel consumer bridge real-LCM consumer + watchdog
+    /// 是否已就绪。real production profile + `false` → readiness.ready=false
+    /// 且 `SetNavigationGoal` 被拒绝。单元测试可调
+    /// `set_cmd_vel_sink_ready_override()` 注入强制分支;运行期默认按
+    /// `lcm_backend_available` 估算(Lane 6 P1 跨进程 watchdog 未实装)。
+    pub cmd_vel_sink_ready: bool,
+    /// 当前 profile canonical 名字(给 Python diagnostics operator 用)。
+    pub active_profile: String,
+}
+
+/// cmd_vel sink ready override(Lane 6 unit test 注入通道)。
+///
+/// Phase 6 cmd_vel consumer bridge 在生产环境 real-LCM 下应该把 watchdog
+/// 已就绪的真实状态写到这里。本期(Phase 7)保留 override 入口,Lane 6
+/// 实装完后会被跨进程 ack 替换;单元测试 / Python diagnostics 测试
+/// 用 `set_cmd_vel_sink_ready_override(Some(true/false))`。
+///
+/// 默认(`None`)时 `compute_readiness` 按 `lcm_backend_available` 估算。
+use std::sync::Mutex as StdMutex;
+static CMD_VEL_SINK_READY_OVERRIDE: StdMutex<Option<bool>> = StdMutex::new(None);
+
+/// 单元测试 / Lane 6 注入接口。传 `None` 解除 override,恢复按 backend 估算。
+pub fn set_cmd_vel_sink_ready_override(value: Option<bool>) {
+    if let Ok(mut g) = CMD_VEL_SINK_READY_OVERRIDE.lock() {
+        *g = value;
+    }
+}
+
+/// 当前 cmd_vel sink ready override(给 compute_readiness 内部用)。
+fn cmd_vel_sink_ready_override() -> Option<bool> {
+    CMD_VEL_SINK_READY_OVERRIDE.lock().ok().and_then(|g| *g)
 }
 
 const P1_NATIVE_PROFILES: &[&str] = &[
@@ -320,6 +359,17 @@ const P1_NATIVE_PROFILES: &[&str] = &[
     PROFILE_MLS3D,
 ];
 
+// Phase 7:tf_count 累计计数。`pose.timestamp_ns == 0` 视为未定位初态;
+// 一旦 timestamp_ns > 0 就在每次 readiness call site 累加 1,作为 readiness.
+// tf_count 字段暴露给 diagnostics。Lane 6 阶段会改成订阅层 set,本阶段保留
+// monotonic 计数(fork 进程不重置;单元测试可调用 reset_tf_count_for_test())。
+static TF_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn reset_tf_count_for_test() {
+    TF_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 计算细分 readiness。读 LCM handle 状态 + 内部 slot。
 pub async fn compute_readiness(
     handle: &GeometryRuntimeHandle,
@@ -327,16 +377,38 @@ pub async fn compute_readiness(
 ) -> NavigationReadinessDetail {
     let s = handle.state.read().await;
     let tf = s.pose.timestamp_ns > 0;
-    let costmap = s.map.revision > 0;
+    let costmap_revision = s.map.revision;
+    let costmap = costmap_revision > 0;
+    // Phase 7:tf_count 累计计数(每次 tf=true 时 +1)。
+    let tf_count = TF_COUNT.load(AtomicOrdering::Relaxed);
+    if tf {
+        TF_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    }
     drop(s);
     let profile = state.profile().await;
     let planner = matches!(profile, PROFILE_SIMPLE_2D | PROFILE_REPLANNING_ASTAR);
     let lcm_backend = handle.lcm_backend_available;
-    let cmd_vel_sink = lcm_backend; // transport 存在即 sink 可写
-    let ready = lcm_backend && tf && costmap && planner && cmd_vel_sink;
+    // Phase 7:cmd_vel_sink_ready 由 override 控制,缺省按 lcm_backend 估算。
+    // real production profile + override=false → readiness false,且
+    // SetNavigationGoal 在 set_goal 内会被强制拒绝。
+    let cmd_vel_sink = lcm_backend; // backward-compatible 字段
+    let cmd_vel_sink_ready = cmd_vel_sink_ready_override().unwrap_or(lcm_backend);
+    // Phase 7:backend canonical 名(用 transport_backend_name 反推)。
+    let backend = match handle.transport_backend_name {
+        "fake-lcm" => "FakeLcm",
+        "real-lcm" | "real-lcm-unavailable" => "RealLcm",
+        other => {
+            // 不在这里 panic;未知 backend 按当前 enum 语义映射并记 log。
+            tracing::warn!("nav readiness: 未知 transport_backend_name={}", other);
+            "Unknown"
+        }
+    };
+    let ready = lcm_backend && tf && costmap && planner && cmd_vel_sink_ready;
 
     let reason = if !lcm_backend {
         "LCM backend 不可用,nav runtime 无法发布 typed channel"
+    } else if !cmd_vel_sink_ready {
+        "/cmd_vel consumer + watchdog 未就绪,nav runtime 拒绝接目标"
     } else if !tf {
         "/tf 尚无有效位姿,等待 SLAM/定位 first frame"
     } else if !costmap {
@@ -359,8 +431,21 @@ pub async fn compute_readiness(
         profile: profile.to_string(),
         module_node_count: state.module_nodes().await.len(),
         p1_native_profiles: P1_NATIVE_PROFILES.iter().map(|s| s.to_string()).collect(),
+        backend: backend.to_string(),
+        tf_count,
+        costmap_revision,
+        cmd_vel_sink_ready,
+        active_profile: profile.to_string(),
     }
 }
+
+/// Phase 7:`SetNavigationGoal` readiness reject 时给出的 reason 标签。
+///
+/// 当 real production profile 下 `cmd_vel_sink_ready=false` 时,即便
+/// tf / costmap / planner 都齐,set_goal 也立即返回 FAILED + 该 reason,
+/// 让上层 / 前端能在日志 / NavState.message 里看到 `cmd_vel_sink=down`
+/// 阻塞原因,而不是被泛化的"未就绪"吞掉。
+pub const REJECT_REASON_CMD_VEL_SINK_DOWN: &str = "cmd_vel_sink 未就绪,SetNavigationGoal 被拒绝 (Phase 7 gate)";
 
 /// `set_goal` 的输入(已从 gRPC `NavigationGoal` 提取并归一化)。
 pub struct SetGoalInput {
@@ -399,13 +484,18 @@ pub async fn set_goal(
     // 1. readiness 校验。
     let detail = compute_readiness(handle, state).await;
     if !detail.ready {
+        // Phase 7:real production profile 下 cmd_vel_sink_ready=false 时,
+        // 单独给出 REJECT_REASON_CMD_VEL_SINK_DOWN,避免与"lcm_backend down /
+        // tf 缺失 / costmap 缺失"被一起泛化为"nav_runtime 未就绪"。
+        let reason_label = if !detail.cmd_vel_sink_ready {
+            REJECT_REASON_CMD_VEL_SINK_DOWN
+        } else {
+            detail.reason.as_str()
+        };
         return SetGoalOutcome {
             state: NavState {
                 status: NavPhase::Failed.as_str().to_string(),
-                message: format!(
-                    "SetNavigationGoal 失败:nav_runtime 未就绪 ({})",
-                    detail.reason
-                ),
+                message: format!("SetNavigationGoal 失败:nav_runtime 未就绪 ({})", reason_label),
                 goal_id: input.goal_id.clone(),
                 distance_remaining: distance_to_target(handle, &input.target).await,
                 timestamp_ns: now_ns(),
@@ -639,12 +729,15 @@ fn quat_to_yaw(qx: f64, qy: f64, qz: f64, qw: f64) -> f64 {
     siny_cosp.atan2(cosy_cosp)
 }
 
-/// 把 `/topic#pkg.Msg` typed pattern 解析成 `LcmTopic` 与 suffix。
+/// Phase 4:把 `/topic#pkg.Msg` typed pattern 解析成 `LcmTopic` 与 suffix。
 ///
 /// `LcmTopic::new` 强约束 channel 字符串不能含 `#`(typed suffix 分隔符);
 /// `channel_registry::resolve_channel` 默认值 = `/cmd_vel#geometry_msgs.Twist`
 /// 这种 typed pattern,所以需要先 split 再喂给 `LcmTopic::new`。
-fn parse_channel_with_suffix(channel: &str) -> Result<(LcmTopic, Option<String>), String> {
+///
+/// **Phase 4 提升为 `pub fn`**：lcm_runtime.rs / server.rs 等模块也用此
+/// helper 解析 typed channel；原 `fn` 仅在 nav_runtime.rs 内部使用。
+pub fn parse_channel_with_suffix(channel: &str) -> Result<(LcmTopic, Option<String>), String> {
     LcmTopic::parse_subscription_pattern(channel)
         .map_err(|e| format!("LcmTopic::parse_subscription_pattern({}) 失败: {}", channel, e))
 }
@@ -838,12 +931,94 @@ mod tests {
             profile: PROFILE_SIMPLE_2D.into(),
             module_node_count: 4,
             p1_native_profiles: P1_NATIVE_PROFILES.iter().map(|s| s.to_string()).collect(),
+            backend: "FakeLcm".into(),
+            tf_count: 7,
+            costmap_revision: 3,
+            cmd_vel_sink_ready: true,
+            active_profile: PROFILE_SIMPLE_2D.into(),
         };
         let s = readiness_to_reason(&d);
         let back = readiness_from_reason(&s).expect("parse");
         assert_eq!(back.ready, d.ready);
         assert_eq!(back.module_node_count, d.module_node_count);
         assert_eq!(back.p1_native_profiles, d.p1_native_profiles);
+        // Phase 7 增量字段 roundtrip
+        assert_eq!(back.backend, d.backend);
+        assert_eq!(back.tf_count, d.tf_count);
+        assert_eq!(back.costmap_revision, d.costmap_revision);
+        assert_eq!(back.cmd_vel_sink_ready, d.cmd_vel_sink_ready);
+        assert_eq!(back.active_profile, d.active_profile);
+    }
+
+    #[tokio::test]
+    async fn readiness_unready_when_cmd_vel_sink_down() {
+        // Phase 7:real production profile + cmd_vel_sink_ready=false → readiness false
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("handle");
+        let state = NavRuntimeState::from_env();
+        // 注入 cmd_vel_sink_ready=false,模拟 Lane 6 watchdog 未就绪
+        set_cmd_vel_sink_ready_override(Some(false));
+        let d = compute_readiness(&handle, &state).await;
+        assert!(!d.ready, "cmd_vel_sink_ready=false 时 readiness 必须 false");
+        assert!(!d.cmd_vel_sink_ready);
+        // 即使 tf / costmap 都齐,readiness.ready 仍 false
+        let mut s = handle.state.write().await;
+        use crate::lcm_runtime::{MapState, PoseState};
+        s.pose = PoseState {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            qx: 0.0,
+            qy: 0.0,
+            qz: 0.0,
+            qw: 1.0,
+            frame_id: "map".into(),
+            timestamp_ns: now_ns(),
+        };
+        s.map = MapState {
+            width: 10,
+            height: 10,
+            resolution: 0.5,
+            origin_x: -2.5,
+            origin_y: -2.5,
+            frame_id: "map".into(),
+            revision: 1,
+            timestamp_ns: now_ns(),
+            ..Default::default()
+        };
+        drop(s);
+        let d2 = compute_readiness(&handle, &state).await;
+        assert!(
+            !d2.ready,
+            "即便 tf+costmap 都齐,cmd_vel_sink_ready=false 仍 false"
+        );
+        assert!(d2.tf);
+        assert!(d2.costmap);
+        assert!(!d2.cmd_vel_sink_ready);
+        // reason 必须包含 cmd_vel_sink 提示
+        assert!(d2.reason.contains("cmd_vel"));
+        // 清理 override,避免污染其他测试
+        set_cmd_vel_sink_ready_override(None);
+    }
+
+    #[tokio::test]
+    async fn readiness_unready_lists_new_fields() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("handle");
+        let state = NavRuntimeState::from_env();
+        let d = compute_readiness(&handle, &state).await;
+        assert!(!d.ready);
+        assert!(!d.tf);
+        assert!(!d.costmap);
+        assert_eq!(d.profile, PROFILE_SIMPLE_2D);
+        // Phase 7 字段:初始 backend=FakeLcm(test handle),counters 全 0
+        assert_eq!(d.backend, "FakeLcm");
+        assert_eq!(d.tf_count, 0);
+        assert_eq!(d.costmap_revision, 0);
+        assert!(d.cmd_vel_sink_ready, "test handle 默认 lcm_backend=true → sink ready=true");
+        assert_eq!(d.active_profile, PROFILE_SIMPLE_2D);
     }
 
     #[test]

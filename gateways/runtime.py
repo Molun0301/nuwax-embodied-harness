@@ -3524,7 +3524,7 @@ class GatewayRuntime:
             "route": (
                 profile.get("route")
                 or metadata.get("route")
-                or getattr(self.platform_geometry_runtime.config.nav2, "mode", None)
+                or getattr(getattr(self.platform_geometry_runtime.config, "nav2", None), "mode", None)
                 or profile.get("stack")
                 or metadata.get("geometry_stack")
                 or self.platform_geometry_runtime.config.stack

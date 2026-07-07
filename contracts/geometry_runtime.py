@@ -220,7 +220,14 @@ class ExternalGeometryStackConfig:
 
 @dataclass
 class LcmChannelConfig:
-    """LCM typed channel 命名配置（real-lcm backend 默认启用后生效）。"""
+    """LCM typed channel 命名配置（real-lcm backend 默认启用后生效）。
+
+    Phase 4 约束:
+    - 所有字段强制 typed suffix `/topic#pkg.Msg`；构造时若缺 `#<msg_type>`
+      会按本类 `_MSG_TYPE_DEFAULTS` 表自动补 msg_type。
+    - 新增 `nav_state` 字段（历史误用 goal_pose alias，Phase 4 拆开）。
+    - `as_dict()` 输出供 gRPC facade / debug_panel 配置面板使用。
+    """
 
     odom: str = "/odom#nav_msgs.Odometry"
     tf: str = "/tf#geometry_msgs.Transform"
@@ -237,6 +244,89 @@ class LcmChannelConfig:
     # - nav_cancel:nuwax_msgs/CancelNavigation（nav 取消命令专用通道）
     pose_stamped: str = "/pose_stamped#geometry_msgs.PoseStamped"
     nav_cancel: str = "/nav/cancel#nuwax_msgs.CancelNavigation"
+    # Phase 4:nav_state 独立 platform alias 键（历史误用 goal_pose alias）。
+    nav_state: str = "/nav/state#nuwax_msgs.NavigationState"
+
+    # 字段 → 默认 msg_type 后缀（构造时缺 `#<msg_type>` 时自动补）。
+    # 与 Rust `channel_registry::CHANNEL_KEY_TABLE` 的 msg_type 默认值对齐。
+    _MSG_TYPE_DEFAULTS: Dict[str, str] = field(default_factory=lambda: {
+        "odom": "nav_msgs.Odometry",
+        "tf": "geometry_msgs.Transform",
+        "tf_static": "geometry_msgs.Transform",
+        "point_cloud": "sensor_msgs.PointCloud2",
+        "occupancy": "nav_msgs.OccupancyGrid",
+        "cmd_vel": "geometry_msgs.Twist",
+        "initial_pose": "geometry_msgs.PoseWithCovarianceStamped",
+        "goal_pose": "geometry_msgs.PoseStamped",
+        "frontier": "nuwax_msgs.FrontierList",
+        "cloud_map": "sensor_msgs.PointCloud2",
+        "pose_stamped": "geometry_msgs.PoseStamped",
+        "nav_cancel": "nuwax_msgs.CancelNavigation",
+        "nav_state": "nuwax_msgs.NavigationState",
+    })
+
+    def __post_init__(self) -> None:
+        """对每个字段做 typed-suffix 自检：缺 `#msg_type` 时按表补齐。"""
+        # `_MSG_TYPE_DEFAULTS` 是 dataclass field，在 `__post_init__` 之后才能
+        # 访问；这里直接内联，避免 dataclass `field(default_factory=...)` 在
+        # `__post_init__` 之前未初始化的细节。
+        defaults = {
+            "odom": "nav_msgs.Odometry",
+            "tf": "geometry_msgs.Transform",
+            "tf_static": "geometry_msgs.Transform",
+            "point_cloud": "sensor_msgs.PointCloud2",
+            "occupancy": "nav_msgs.OccupancyGrid",
+            "cmd_vel": "geometry_msgs.Twist",
+            "initial_pose": "geometry_msgs.PoseWithCovarianceStamped",
+            "goal_pose": "geometry_msgs.PoseStamped",
+            "frontier": "nuwax_msgs.FrontierList",
+            "cloud_map": "sensor_msgs.PointCloud2",
+            "pose_stamped": "geometry_msgs.PoseStamped",
+            "nav_cancel": "nuwax_msgs.CancelNavigation",
+            "nav_state": "nuwax_msgs.NavigationState",
+        }
+        for field_name, default_type in defaults.items():
+            value: str = getattr(self, field_name)
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"LcmChannelConfig.{field_name} 必须为 str，得到 {type(value).__name__}"
+                )
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError(
+                    f"LcmChannelConfig.{field_name} 不能为空字符串"
+                )
+            if "#" in stripped:
+                # 已 typed；保留原样（不做格式校验，调用方负责具体 msg_type 名）。
+                setattr(self, field_name, stripped)
+                continue
+            # 缺 typed suffix：补 default msg_type，并打 warning。
+            import warnings
+
+            warnings.warn(
+                f"LcmChannelConfig.{field_name}={stripped!r} 缺 typed suffix "
+                f"'#<msg_type>'，已自动补 msg_type={default_type!r}（推荐显式指定）",
+                stacklevel=2,
+            )
+            setattr(self, field_name, f"{stripped}#{default_type}")
+
+    def as_dict(self) -> Dict[str, str]:
+        """返回 `{字段: typed channel}` dict，供 gRPC facade / debug_panel 配置使用。"""
+        return {
+            "odom": self.odom,
+            "tf": self.tf,
+            "tf_static": self.tf_static,
+            "point_cloud": self.point_cloud,
+            "occupancy": self.occupancy,
+            "cmd_vel": self.cmd_vel,
+            "initial_pose": self.initial_pose,
+            "goal_pose": self.goal_pose,
+            "frontier": self.frontier,
+            "cloud_map": self.cloud_map,
+            "pose_stamped": self.pose_stamped,
+            "nav_cancel": self.nav_cancel,
+            "nav_state": self.nav_state,
+        }
 
 
 @dataclass

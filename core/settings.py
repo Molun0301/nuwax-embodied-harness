@@ -1017,6 +1017,12 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "NUWAX_LCM_CHANNEL_NAV_CANCEL",
                 "/nav/cancel#nuwax_msgs.CancelNavigation",
             ),
+            # Phase 4:nav_state 独立 platform alias（历史误用 GOAL_POSE env）。
+            # 与 Rust `channel_registry::TYPED_CHANNELS` 第 4 行对齐。
+            nav_state=_cfg_str(
+                "NUWAX_LCM_CHANNEL_NAV_STATE",
+                "/nav/state#nuwax_msgs.NavigationState",
+            ),
         ),
     )
 

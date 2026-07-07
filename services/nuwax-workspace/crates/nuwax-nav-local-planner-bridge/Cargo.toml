@@ -1,0 +1,24 @@
+[package]
+name = "nuwax-nav-local-planner-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Local Planner C++ native bridge — wraps result/bin/local_planner"
+
+[dependencies]
+nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3"
+nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
+nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
+tokio = { workspace = true }

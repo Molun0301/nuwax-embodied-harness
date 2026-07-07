@@ -1,0 +1,19 @@
+[package]
+name = "nuwax-nav-record"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "导航 topic 录制 profile（仅 topic/type 清单，录制执行委托 shared recorder）"
+
+[dependencies]
+# Foundation 共享类型 — 接入后允许跨 crate 共享 NavError 与 topic message type 引用
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

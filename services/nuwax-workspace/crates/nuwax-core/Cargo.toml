@@ -1,0 +1,20 @@
+[package]
+name = "nuwax-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax Module 基类与 In[T]/Out[T] 类型化流"
+
+[dependencies]
+nuwax-types = { path = "../nuwax-types" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
+pretty_assertions = { workspace = true }

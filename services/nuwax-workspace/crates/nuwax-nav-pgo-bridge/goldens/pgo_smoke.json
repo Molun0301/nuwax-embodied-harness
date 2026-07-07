@@ -1,0 +1,33 @@
+{
+  "name": "pgo_smoke",
+  "bridge": "pgo",
+  "topics": {
+    "registered_scan": "/scan",
+    "odometry": "/odom",
+    "corrected_odometry": "/corrected_odom",
+    "global_map": "/global_map",
+    "pgo_tf": "/pgo_tf"
+  },
+  "config_overrides": {
+    "world_frame": "map",
+    "local_frame": "odom",
+    "loop_submap_half_range": 5,
+    "global_map_voxel_size": 0.1
+  },
+  "expected_argv_contains": [
+    "/scan",
+    "/odom",
+    "/corrected_odom",
+    "/global_map",
+    "/pgo_tf",
+    "--world_frame",
+    "--local_frame"
+  ],
+  "expected_argv_pairs": [
+    ["--world_frame", "map"],
+    ["--local_frame", "odom"],
+    ["--loop_submap_half_range", "5"],
+    ["--global_map_voxel_size", "0.1"]
+  ],
+  "expected_topics_count": 5
+}

@@ -1,0 +1,24 @@
+[package]
+name = "nuwax-protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax 消息协议层，LCM-first;protobuf/tonic 仅作 compat 边界"
+
+[dependencies]
+nuwax-types = { path = "../nuwax-types" }
+nuwax-codec = { path = "../nuwax-codec" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# protobuf compat deps（仅在显式启用 compat feature 时存在,默认不编译）。
+# 当前 P0 foundation 阶段:`compat` 模块只占位,MessageEnvelope 走 serde_json
+# roundtrip 测试,不需要 prost/tonic。后续若启用 protobuf 编码,再加。
+
+# 暂不引入 prost/tonic 作为默认依赖。tonic-build 同步移除,避免 build.rs 下载。
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

@@ -42,9 +42,19 @@ def build_default_lcm_url() -> str:
 
 
 def build_default_nuwax_workspace_dir() -> str:
-    """返回 nuwax-workspace 路径依赖默认位置。"""
+    """返回 nuwax-workspace 路径依赖默认位置。
 
-    return "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace"
+    Phase 1 (2026-07-07):路径已并入本仓 ``services/nuwax-workspace``,
+    默认值改为 repo-local 相对路径,避免对开发机绝对路径的硬依赖。
+    历史 dimos snapshot 路径仍可通过环境变量 ``NUWAX_NUWAX_WORKSPACE_DIR``
+    覆盖(主要供实机 fallback / 调试用)。
+    """
+
+    return str(
+        Path(__file__).resolve().parents[1]
+        / "services"
+        / "nuwax-workspace"
+    )
 
 
 def build_default_rtabmap_database_root() -> str:

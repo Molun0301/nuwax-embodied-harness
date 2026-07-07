@@ -1,0 +1,40 @@
+{
+  "name": "local_planner_smoke",
+  "bridge": "local_planner",
+  "topics": {
+    "registered_scan": "/scan",
+    "odometry": "/odom",
+    "terrain_map": "/terrain",
+    "joy_cmd": "/joy",
+    "way_point": "/way_point",
+    "goal_pose": "/goal_pose",
+    "speed": "/speed",
+    "navigation_boundary": "/nav_boundary",
+    "added_obstacles": "/added_obstacles",
+    "check_obstacle": "/check_obstacle",
+    "cancel_goal": "/cancel_goal",
+    "path": "/path",
+    "effective_cmd_vel": "/effective_cmd_vel",
+    "free_paths": "/free_paths",
+    "slow_down": "/slow_down",
+    "goal_reached": "/goal_reached"
+  },
+  "config_overrides": {
+    "maxSpeed": 0.75,
+    "vehicleWidth": 0.5,
+    "useTerrainAnalysis": true
+  },
+  "expected_argv_contains": [
+    "/scan",
+    "/odom",
+    "/path",
+    "--maxSpeed",
+    "--vehicleWidth"
+  ],
+  "expected_argv_pairs": [
+    ["--maxSpeed", "0.75"],
+    ["--vehicleWidth", "0.5"],
+    ["--useTerrainAnalysis", "true"]
+  ],
+  "expected_topics_count": 16
+}

@@ -1,0 +1,22 @@
+[package]
+name = "nuwax-mapping-cloud"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax 地图云服务"
+
+[dependencies]
+nuwax-types = { path = "../nuwax-types" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+osmpbf = { workspace = true }
+image = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

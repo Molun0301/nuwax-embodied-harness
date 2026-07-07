@@ -1,0 +1,44 @@
+[package]
+name = "nuwax-mapping"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax 建图板块"
+
+[dependencies]
+nuwax-types = { path = "../nuwax-types" }
+nuwax-numeric = { path = "../nuwax-numeric" }
+nuwax-core = { path = "../nuwax-core" }
+nuwax-stream = { path = "../nuwax-stream" }
+nuwax-protocol = { path = "../nuwax-protocol" }
+
+nalgebra = { workspace = true }
+ndarray = { workspace = true }
+glam = { workspace = true }
+kiddo = { workspace = true }
+rayon = { workspace = true }
+# rstar removed: not yet used in mapping (kiddo suffices for KD-tree needs)
+
+ahash = { version = "0.8", features = ["serde"] }
+bitflags = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+# arrayvec removed: replaced by Vec<u8> in voxels.rs (see comment there)
+validator = { version = "0.20", features = ["derive"] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }
+approx = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
+
+# [[bench]] removed: benches/occupancy.rs not yet implemented
+# Re-add when benchmark file is created

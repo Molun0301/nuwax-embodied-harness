@@ -2,6 +2,32 @@
 # =============================================================================
 # vendor_dimos_crates.sh
 # -----------------------------------------------------------------------------
+# 状态:DEPRECATED(2026-07-07,Phase 1 起) — 不再被调用。
+#
+# 替代脚本:
+#   scripts/import_nuwax_workspace_snapshot.sh
+#   该脚本会把 dimos 整棵 nuwax-workspace(含 48+ 个 crate / Cargo.toml /
+#   Cargo.lock / .cargo/config.toml / lcmtypes)落到本仓
+#   services/nuwax-workspace/,入仓作为 tracked snapshot。
+#   services/geometry/nuwax_geometry_runtime/Cargo.toml 中的 13 条
+#   path dep 也已在 Phase 1 切到 repo-local 相对路径
+#   ../../nuwax-workspace/crates/<name>,不再需要 vendor/<name> 兜底。
+#
+# 历史背景:
+#   Phase 0 / Phase 8 期间,13 个 path dep 指向开发机绝对路径
+#   /home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/<name>,
+#   目标机 aarch64 + Ubuntu 20.04 没有该路径;本脚本当时把 crate 复制到
+#   services/geometry/nuwax_geometry_runtime/vendor/<name>/ 兜底。
+#
+# 保留原因:
+#   - 历史 commit 可读性:旧 commit hash 仍可回放;
+#   - 应急:如果新脚本 import_nuwax_workspace_snapshot.sh 失效,可临时
+#     走回本脚本对单一 crate 做 vendor(不推荐,会有 target/ 路径漂移)。
+#
+# 不删:
+#   见 .gitignore 注释:已不再忽略 vendor/vendor-config,改忽略
+#   services/nuwax-workspace/{target,.omc,.omx}。
+# -----------------------------------------------------------------------------
 # 目的:
 #   把 services/geometry/nuwax_geometry_runtime/Cargo.toml 中 13 个
 #   path = "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace/crates/<name>"

@@ -1,0 +1,28 @@
+[package]
+name = "nuwax-nav-simple-planner"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Pure-Rust grid A* global route planner for the navigation stack (Phase 3 migration of simple_planner.py)."
+
+[features]
+# 默认关闭；启用后提供 stream/RPC 适配器骨架
+module = []
+# 默认关闭；启用后提供 costmap_cloud 可视化点云输出
+viz = []
+
+[dependencies]
+# Foundation 类型与错误统一来源
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

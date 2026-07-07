@@ -81,8 +81,22 @@ tests/mocks/
 tests/integration/
 
 # === dimos crates 本地 vendor（vendor_dimos_crates.sh 产物，不入 git） ===
-# 目标机部署前由 scripts/vendor_dimos_crates.sh 把 13 个 nuwax-* crate
-# 落到 vendor/，并改 Cargo.toml 指向相对路径 vendor/<name>。
-# vendor/ 本身不入仓，但 .cargo/config.toml + vendor-config.json **入仓**。
+# Phase 1 (2026-07-07) 起弃用：vendor_dimos_crates.sh 已被
+# scripts/import_nuwax_workspace_snapshot.sh 取代，13 个 nuwax-* crate
+# 不再走 vendor/ 兜底，而是直接通过 repo-local path dep 指向
+# services/nuwax-workspace/crates/<name>。下方 vendor 行保留为安全网
+# （万一遗留旧 vendor 目录残留不入仓），但实际不会再生成。
 services/geometry/nuwax_geometry_runtime/vendor/
 services/geometry/nuwax_geometry_runtime/vendor-config.json
+
+# === services/nuwax-workspace 本地产物（入仓 tracked snapshot，但产物忽略） ===
+# Phase 1 (2026-07-07):整个 nuwax-workspace 50 个 crate + Cargo.toml/lock
+# 都入仓,但 build 产物 / runtime state / 临时 lock 仍不入仓:
+# - target/    : cargo build 产物(aarch64 + x86_64 都很大)
+# - .omc/      : omc agent runtime state
+# - .omx/      : omx runtime state
+# - *.lock.tmp : import_nuwax_workspace_snapshot.sh 中途产物
+services/nuwax-workspace/target/
+services/nuwax-workspace/.omc/
+services/nuwax-workspace/.omx/
+services/nuwax-workspace/*.lock.tmp

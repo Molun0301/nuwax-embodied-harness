@@ -1,0 +1,51 @@
+[package]
+name = "nuwax-mapping-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax Mapping CLI"
+
+# [features] 移除：raytracing 依赖已删除（待 dimos-module 兼容 shim 实装后恢复）
+# 原声明：
+#   [features]
+#   raytracing = ["dep:nuwax-mapping-raytracing"]
+
+[features]
+# MSRV 1.75 兼容模式：跳过 clap 依赖（clap 4.5+ 拉 clap_lex 1.1 需 edition2024）
+# 默认（features = ["default-tokio"]）下 clap 正常工作（stable / 1.85+）
+# 在 MSRV 1.75 上 build：`cargo build -p nuwax-mapping-cli --no-default-features`
+default = ["clap-on"]
+clap-on = ["dep:clap"]
+
+[[bin]]
+name = "nuwax-mapping-cli"
+path = "src/main.rs"
+required-features = ["clap-on"]
+
+[dependencies.clap]
+version = "=4.0.32"
+features = ["derive", "env"]
+optional = true
+
+[dependencies]
+nuwax-mapping = { path = "../nuwax-mapping" }
+nuwax-mapping-cloud = { path = "../nuwax-mapping-cloud" }
+# nuwax-mapping-raytracing 依赖已移除（ray_tracing 暂出 workspace，待 shim 实装）
+# 原 optional 声明改为注释保留：
+# nuwax-mapping-raytracing = { path = "../nuwax-mapping-raytracing", optional = true }
+nuwax-protocol = { path = "../nuwax-protocol" }
+nuwax-types = { path = "../nuwax-types" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "nuwax-nav-visual-query"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "视觉查询 trait + JSON bbox parser（仅兼容边界，不持有模型权重/GPU provider）"
+
+[dependencies]
+# Foundation 共享类型 — 引入后允许跨 crate 共享 BoundingBox2D 协议语义
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+
+nuwax-numeric = { path = "../nuwax-numeric" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

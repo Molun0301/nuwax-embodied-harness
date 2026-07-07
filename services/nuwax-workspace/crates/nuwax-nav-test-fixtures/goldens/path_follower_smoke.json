@@ -1,0 +1,35 @@
+{
+  "name": "path_follower_smoke",
+  "bridge": "path_follower",
+  "topics": {
+    "path": "/path",
+    "odometry": "/odom",
+    "speed": "/speed",
+    "slow_down": "/slow_down",
+    "safety_stop": "/safety_stop",
+    "cmd_vel": "/cmd_vel"
+  },
+  "config_overrides": {
+    "lookAheadDis": 0.5,
+    "maxSpeed": 1.0,
+    "maxYawRate": 45.0,
+    "slowDwnDisThre": 1.0,
+    "twoWayDrive": true
+  },
+  "expected_argv_contains": [
+    "/path",
+    "/odom",
+    "/speed",
+    "/cmd_vel",
+    "--lookAheadDis",
+    "--maxSpeed"
+  ],
+  "expected_argv_pairs": [
+    ["--lookAheadDis", "0.5"],
+    ["--maxSpeed", "1"],
+    ["--maxYawRate", "45"],
+    ["--slowDwnDisThre", "1"],
+    ["--twoWayDrive", "true"]
+  ],
+  "expected_topics_count": 6
+}

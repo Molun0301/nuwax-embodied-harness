@@ -410,7 +410,9 @@ class BootstrapPlanner:
             "NUWAX_LCM_CHANNEL_POINTCLOUD": "/go2/lidar/points",
             "NUWAX_LCM_CHANNEL_OCCUPANCY": "/map/occupancy",
             "NUWAX_LCM_CHANNEL_CMD_VEL": "/cmd_vel",
-            "NUWAX_NUWAX_WORKSPACE_DIR": "/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace",
+            # Phase 1 (2026-07-07):nuwax-workspace 已并入本仓 services/nuwax-workspace,
+            # 不再写入绝对路径,默认走 build_default_nuwax_workspace_dir() 计算 repo-local。
+            "NUWAX_NUWAX_WORKSPACE_DIR": str(PROJECT_ROOT / "services" / "nuwax-workspace"),
             "NUWAX_LOG_DIR": str(PROJECT_ROOT),
             "NUWAX_LOG_FILE": str(PROJECT_ROOT / "nuwax_robot_bridge.log"),
             "NUWAX_GATEWAY_ARTIFACT_DIR": str(PROJECT_ROOT / "artifacts"),

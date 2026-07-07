@@ -28,7 +28,11 @@ from scripts.installer.phases.base import Phase
 
 # Phase 8:repo-local nuwax-workspace 路径（与 .gitignore / phase 1 entrypoint 对齐）
 REPO_LOCAL_NUWAX_WORKSPACE: Path = Path("services/nuwax-workspace")
-EXPECTED_CRATE_COUNT: int = 48  # 与 services/nuwax-workspace/Cargo.toml members 对齐
+# Phase 1 (2026-07-07):实测 on-disk crates=50、Cargo.toml members=40。
+# 此处用 on-disk 数作 soft 校验下限,避免 CI 镜像漏拷部分子 crate 时漏报;
+# 真正严格校验仍由 scripts/ci/no_external_nuwax_workspace_path.sh
+# + IMPORT_MANIFEST.json.crate_count 三方对齐保证。
+EXPECTED_CRATE_COUNT: int = 50
 
 
 def _run_safe(args: tuple, timeout: int = 3) -> Tuple[bool, str]:

@@ -1,0 +1,200 @@
+[package]
+# 导航 stack 编排 crate
+# 严格遵循方案 §6.8:只编排,不持有算法
+# 关键约束:
+# - edition 2021、rust-version 1.88(workspace.package 一致)
+# - 默认 features 为空,所有 planner / bridge / visual 都走可选 feature
+# - 不引入 rcl / rmw / cyclonedds / DDS / CUDA 默认依赖
+# - 不在 build.rs 下载模型 / 二进制 /访问网络
+# - 不允许命名空间 nuwax-mapping-*;本 crate 仅供导航板块使用
+#
+# 设计原则(本轮 lane 的实操选择):
+# 1. stack 的核心职责是"组合配置 + 渲染 module graph + dry-run + smoke"。
+# 2. 默认 features 为空(只依赖 foundation),所有 planner / bridge / visual
+#    / mls 都通过 **optional path deps** 接入,避免默认编译拖入所有上游 crate。
+# 3. profiles.rs 中的 ModuleGraph 仍是纯数据,即便对应的 Cargo feature 未启用,
+#    仍然可以 build / dry-run(只控制是否能链接到真正可执行的上游 crate)。
+# 4. 通过 `tests/integration_smoke.rs` 启用 simple-2d feature,
+#    做 plan + follow 端到端 smoke,证明真实组合而不是空壳。
+name = "nuwax-nav-stack"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Navigation stack orchestration for the nuwax robot platform (profiles + module graph + dry-run + replay/smoke entry)."
+
+# ============================================================
+# 默认 features: 空
+# 仅依赖 foundation(types-messages + base),不启用任何 planner / bridge / visual
+# 暴露 NavStackProfile / Builder / ModuleGraph / dry-run
+# ============================================================
+[features]
+default = []
+
+# ---- Foundation(强制打开,因为 types-messages 是核心协议层)----
+foundation = [
+    "dep:nuwax-nav-types-messages",
+    "dep:nuwax-nav-base",
+]
+
+# ---- Pure Rust 算法类(可选)----
+simple-2d = [
+    "dep:nuwax-nav-simple-planner",
+    "dep:nuwax-nav-basic-path-follower",
+]
+replanning-astar = [
+    "dep:nuwax-nav-astar",
+    "dep:nuwax-nav-basic-path-follower",
+]
+
+# ---- Native C++ bridge(可选,均不默认启用)----
+# `native-runner` 是 `nuwax-nav-native-runner` 的显式 feature 名称,
+# 供源码内 `#[cfg(feature = "native-runner")]` 引用;真正的 binary spec 类型
+# 仍由 `dep:nuwax-nav-native-runner` 显式打开。
+native-runner = ["dep:nuwax-nav-native-runner", "dep:nuwax-exploration"]
+native-far = [
+    "dep:nuwax-nav-far-planner-bridge",
+    "dep:nuwax-nav-native-runner",
+]
+native-local = [
+    "dep:nuwax-nav-local-planner-bridge",
+    "dep:nuwax-nav-native-runner",
+]
+native-path-follower = [
+    "dep:nuwax-nav-path-follower-bridge",
+    "dep:nuwax-nav-native-runner",
+]
+native-pgo = [
+    "dep:nuwax-nav-pgo-bridge",
+    "dep:nuwax-nav-native-runner",
+]
+native-terrain = [
+    "dep:nuwax-explore-terrain-bridge",
+    "dep:nuwax-nav-native-runner",
+]
+native-tare = [
+    "dep:nuwax-explore-tare-bridge",
+    "dep:nuwax-nav-native-runner",
+]
+
+# ---- 行为层 crate(可选)----
+basic-path-follower = ["dep:nuwax-nav-basic-path-follower"]
+movement-manager = ["dep:nuwax-nav-movement-manager"]
+patrolling = ["dep:nuwax-nav-patrolling"]
+visual-servoing = ["dep:nuwax-nav-visual-servoing"]
+visual-query = ["dep:nuwax-nav-visual-query"]
+bbox-tracker = ["dep:nuwax-nav-bbox-tracker"]
+click-goal = ["dep:nuwax-nav-click-goal-bridge"]
+record = ["dep:nuwax-nav-record"]
+
+# ---- 3D / 探索(可选,本 crate 默认不引入 explore)----
+mls = ["dep:nuwax-nav-mls-planner"]
+explore = [
+    "native-far",
+    "native-local",
+    "native-path-follower",
+    "native-pgo",
+    "native-terrain",
+    "native-tare",
+    "dep:nuwax-nav-terrain-map-ext",
+]
+cmu-native = [
+    "native-far",
+    "native-local",
+    "native-path-follower",
+    "native-pgo",
+    "native-terrain",
+    "dep:nuwax-nav-terrain-map-ext",
+]
+
+# ---- Stack 行为开关(全部默认关闭)----
+replay = []                 # 启用 replay/smoke 入口,加载 rosbag fixture
+viewer = []                 # 启用可视化模块(rerun / foxglove 等),不影响核心规划
+record-profile = ["record"] # 导航 topic 录制 profile
+
+# ---- 实用聚合:一键启用完整 navigation stack(不含 explore / viewer)----
+# 注意:即使 all-in-one 也不引入 DDS / ROS2 / CUDA
+full = [
+    "foundation",
+    "simple-2d",
+    "replanning-astar",
+    "native-far",
+    "native-local",
+    "native-path-follower",
+    "native-pgo",
+    "basic-path-follower",
+    "movement-manager",
+    "patrolling",
+    "visual-servoing",
+    "visual-query",
+    "bbox-tracker",
+    "click-goal",
+    "record",
+    "mls",
+]
+
+[dependencies]
+# ---- Foundation(协议层与基础类型):不直接使用,留给上游 crate 各自引用
+# stack 是纯数据编排 + dry-run,不消费 Foundation 的具体类型
+# 因此保持 optional + 不强制打开,foundation 修复后再按需启用
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages", optional = true }
+nuwax-nav-base = { path = "../nuwax-nav-base", optional = true }
+
+# ---- Native spec 类型(Phase E6 typed wiring 需要)----
+# 暴露 `NativeProgramSpec` / `NativeBuildSpec`,使 `ModuleNode::from_native_specs`
+# 能在 typed 路径上工作;默认关闭,无 native spec 的纯 Rust stack 不依赖。
+nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner", optional = true }
+# `NativeSpecSummary` 聚合类型(板块 3 探索 facade 整合点)
+nuwax-exploration = { path = "../nuwax-exploration", optional = true, features = ["spec-summary"] }
+
+# ---- Pure Rust 算法类(可选)----
+nuwax-nav-astar = { path = "../nuwax-nav-astar", optional = true }
+nuwax-nav-simple-planner = { path = "../nuwax-nav-simple-planner", optional = true }
+nuwax-nav-terrain-map-ext = { path = "../nuwax-nav-terrain-map-ext", optional = true }
+
+# ---- Native C++ bridge(可选)----
+nuwax-nav-far-planner-bridge = { path = "../nuwax-nav-far-planner-bridge", optional = true }
+nuwax-nav-local-planner-bridge = { path = "../nuwax-nav-local-planner-bridge", optional = true }
+nuwax-nav-path-follower-bridge = { path = "../nuwax-nav-path-follower-bridge", optional = true }
+nuwax-nav-pgo-bridge = { path = "../nuwax-nav-pgo-bridge", optional = true }
+
+# ---- Explore bridge(可选,typed native spec 来源)----
+nuwax-explore-terrain-bridge = { path = "../nuwax-explore-terrain-bridge", optional = true }
+nuwax-explore-tare-bridge = { path = "../nuwax-explore-tare-bridge", optional = true }
+
+# ---- 行为层 crate(可选)----
+nuwax-nav-basic-path-follower = { path = "../nuwax-nav-basic-path-follower", optional = true }
+nuwax-nav-movement-manager = { path = "../nuwax-nav-movement-manager", optional = true }
+nuwax-nav-click-goal-bridge = { path = "../nuwax-nav-click-goal-bridge", optional = true }
+nuwax-nav-patrolling = { path = "../nuwax-nav-patrolling", optional = true }
+nuwax-nav-visual-servoing = { path = "../nuwax-nav-visual-servoing", optional = true }
+nuwax-nav-visual-query = { path = "../nuwax-nav-visual-query", optional = true }
+nuwax-nav-bbox-tracker = { path = "../nuwax-nav-bbox-tracker", optional = true }
+nuwax-nav-record = { path = "../nuwax-nav-record", optional = true }
+
+# ---- MLS Planner(可选)----
+nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner", optional = true }
+
+# 通用依赖(必须出现在共享 workspace.dependencies 中)
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+bitflags = { workspace = true }
+
+[dev-dependencies]
+# 单元测试可读 fixture / JSON
+serde_json = { workspace = true }
+pretty_assertions = { workspace = true }
+# Phase9 集成 smoke 测试只需要 stack + MLS,不直接拉入 simple-planner / astar
+# (Foundation lane 修复中)。simple-2d / replanning-astar feature 的端到端 smoke
+# 等 Foundation 收敛后再追加。
+nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner" }
+
+[[bin]]
+# 默认 CLI:提供 --profile / --dry-run / --replay / --list-features 入口
+name = "nuwax-nav-stack"
+path = "src/bin/nuwax_nav_stack.rs"
+required-features = []

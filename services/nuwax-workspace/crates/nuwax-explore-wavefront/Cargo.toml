@@ -1,0 +1,60 @@
+[package]
+name = "nuwax-explore-wavefront"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Pure-Rust wavefront frontier detector and exploration goal selector."
+
+[features]
+# R5-1: default = [] 真正关闭 AC-2 default test-internals leak。
+#   - 生产 build / 跨 crate 依赖(`nuwax-exploration --features wavefront`)完全不拉 test-internals;
+#   - test-internals 只在 `cargo test` 下通过下面 [dev-dependencies] 自引用 + features 启用。
+#   - `test_helpers` 模块自身 `#[doc(hidden)]` + `#[cfg(feature = "test-internals")]`,
+#     生产公共 API 永不暴露 DetectionOutcome / FrontierCandidate / CandidateGeometry。
+default = []
+runtime = ["dep:tokio", "dep:nuwax-core", "dep:nuwax-stream", "dep:nuwax-rpc"]
+mapping-inflate = ["dep:nuwax-mapping"]
+legacy-parity = []
+bench = ["dep:ndarray"]
+# 集成测试访问 crate-private 类型的 feature;**默认关闭**。
+# 由下方 [dev-dependencies] 自引用 + features = ["test-internals"] 在 `cargo test` 下启用。
+test-internals = []
+
+[dependencies]
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+nuwax-nav-base = { path = "../nuwax-nav-base" }
+tokio = { workspace = true, optional = true, features = ["time"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bitflags = { workspace = true }
+rayon = { workspace = true }
+uuid = { workspace = true }
+ndarray = { workspace = true, optional = true }
+nuwax-mapping = { path = "../nuwax-mapping", optional = true }
+nuwax-core = { path = "../nuwax-core", optional = true }
+nuwax-stream = { path = "../nuwax-stream", optional = true }
+nuwax-rpc = { path = "../nuwax-rpc", optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+serde_json = { workspace = true }
+# 集成测试访问 crate-private 类型(test_helpers 模块);
+# 通过 dev-dependencies 自引用 + features = ["test-internals"] 让
+# `cargo test` / `cargo test --no-default-features` 都自动启用 test-internals,
+# 而 production build(普通 `cargo build` / 跨 crate 依赖)完全不启用。
+# 因此 `default = []` 即可,R5-1 真正关闭 default test-internals leak。
+nuwax-explore-wavefront = { path = ".", features = ["test-internals"] }
+
+[[test]]
+name = "frontier_detection"
+[[test]]
+name = "scoring"
+
+[[bench]]
+name = "wavefront_500x500"
+harness = false

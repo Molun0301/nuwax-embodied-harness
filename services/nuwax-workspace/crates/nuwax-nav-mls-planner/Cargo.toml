@@ -1,0 +1,34 @@
+[package]
+name = "nuwax-nav-mls-planner"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Pure Rust multi-level surface (MLS) 3D path planner, migrated from dimos-mls-planner without pyo3/lcm/dimos-module."
+
+[lib]
+name = "nuwax_nav_mls_planner"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+# 注意:MLS core 不引入 nuwax-nav-types-messages / nuwax-nav-base 以保持独立编译
+# Foundation lane 正在修复类型收敛;本 crate 沿用原 dimos-mls-planner 的纯类型策略
+# 内部使用 (f32,f32,f32) 元组 / Point3 / VoxelKey;不引入 LCM / DDS / pyo3 / numpy
+ahash = "0.8"
+tracing = { workspace = true }
+# validator + validator_derive:`#[validate(...)]` 字段校验宏与 `derive` 提供的 Validate trait
+validator = { workspace = true, features = ["derive"] }
+image = { workspace = true }
+imageproc = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+
+[features]
+default = []
+# 占位 feature:不再实际启用 pyo3,保留以兼容 stack 的 feature 约定
+python-bindings = []

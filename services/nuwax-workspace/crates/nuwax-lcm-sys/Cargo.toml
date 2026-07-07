@@ -1,0 +1,26 @@
+[package]
+name = "nuwax-lcm-sys"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax real-LCM 系统的 liblcm C FFI 绑定(Phase 3,2026-07-07)。默认由 nuwax-transport/real-lcm feature gate 启用。"
+
+[features]
+# 默认 feature:仅在用户显式开启 `link-liblcm` 时,build.rs 才探测
+# 系统 liblcm 并链接。这保证 fake-only CI / dev 镜像可以 `cargo check`
+# workspace 而不依赖 liblcm-dev 安装。
+link-liblcm = []
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+# 注意:build.rs 用 std::process::Command 直跑 `pkg-config`(无 crate 依赖);
+# 这样 offline mirror 缺失 `pkg-config` crate 时 build.rs 仍可工作。
+
+# 重要:本 crate **不** 通过 cargo:rustc-link-lib 强加 liblcm 依赖;
+# build.rs 用 pkg-config 探测,失败 → 标准错误 + std::process::exit(2)。
+# 当前 P0/P1 阶段,fake backend 已够用,real-lcm feature 仍为 opt-in。

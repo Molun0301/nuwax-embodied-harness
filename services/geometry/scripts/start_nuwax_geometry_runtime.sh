@@ -39,10 +39,15 @@ export NUWAX_GEOMETRY_RUNTIME_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
 export NUWAX_GEOMETRY_RUNTIME_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
 export NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT:-30}"
 
-# LCM URL/backend 兜底（与 settings.py::build_default_lcm_url / fake-lcm 默认对齐）
+# LCM URL/backend 兜底（与 settings.py::build_default_lcm_url 对齐）
 # Phase 4 硬约束：必须 `udpm://...`；`udp://` 是非法（liblcm 不支持），start 脚本拒绝并退出。
+#
+# Production profile 必须走 real-lcm(plan §12.3 第 2 项 + §13.2 第 4 项):
+#   - 默认值由 `fake-lcm` 改为 `real-lcm`,与 systemd service / Cargo.toml
+#     `[features].default = ["real-lcm-bridge"]` 对齐
+#   - 显式 export `NUWAX_LCM_BACKEND=fake-lcm` 才走 fake(dev/CI 专用)
 export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
-export NUWAX_LCM_BACKEND="${NUWAX_LCM_BACKEND:-fake-lcm}"
+export NUWAX_LCM_BACKEND="${NUWAX_LCM_BACKEND:-real-lcm}"
 
 # Phase 4 typed channel 兜底（与 channel_registry::TYPED_CHANNELS 默认值一致；
 # 必须带 typed suffix `#<msg_type>`，与 lcm_runtime 默认 channel registry 对齐）。

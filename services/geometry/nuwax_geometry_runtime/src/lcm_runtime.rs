@@ -166,6 +166,14 @@ pub struct GeometryRuntimeHandle {
     /// 返回 `healthy=false` + `LCM_BACKEND_UNAVAILABLE` message；
     /// 该 flag 当前唯一触发源是 `LcmBackendKind::Real`（fail-fast 设计）。
     pub lcm_backend_available: bool,
+    /// Phase 6: Python `LcmMotionCommandBridge` 注入的 cmd_vel sink ready 信号。
+    /// - `true`  — Python 侧 LcmMotionCommandBridge 已订阅 `/cmd_vel`,
+    ///             watchdog 存活,sink 可写。
+    /// - `false` — bridge 未启动 / sink 未注入 / watchdog 失败。
+    /// 默认 `true` 以兼容旧单测(CI / fake backend 不接 Python bridge);
+    /// 生产模式(`NUWAX_NAV_REQUIRE_CMD_VEL_SINK=true`)会强制要求该 flag
+    /// 为 `true`,否则 `SetNavigationGoal` 返回 rejected。
+    pub cmd_vel_sink_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Phase 5: 探索 runtime 句柄(由 `spawn_geometry_runtime` 注入)。
     /// 负责 start / stop / state / diagnostics 四类 RPC。
     /// 持有 `Arc<tokio::sync::Mutex<...>>` 内部,允许 `Clone` 句柄
@@ -191,6 +199,23 @@ pub struct GeometryRuntimeHandle {
 }
 
 impl GeometryRuntimeHandle {
+    /// Phase 6: 读 cmd_vel sink ready flag。
+    /// 由 Python `LcmMotionCommandBridge` 注入:
+    /// - bridge 启动 + sink 已注入 + watchdog 存活 → `true`
+    /// - bridge 未启动 / sink 未注入 / watchdog 失败 → `false`
+    /// 默认构造时为 `true` 以兼容旧 fake-lcm 单测路径。
+    pub fn cmd_vel_sink_ready(&self) -> bool {
+        self.cmd_vel_sink_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Phase 6: Python LcmMotionCommandBridge 调用的 setter,
+    /// 用于把外部 cmd_vel sink ready 状态写到 handle。
+    pub fn set_cmd_vel_sink_ready(&self, ready: bool) {
+        self.cmd_vel_sink_ready
+            .store(ready, std::sync::atomic::Ordering::Release);
+    }
+
     /// mapping 板块 readiness。
     /// - backend 不可用 → false
     /// - adapter 未构造 → false
@@ -1114,6 +1139,11 @@ pub fn spawn_geometry_runtime(
         transport,
         transport_backend_name: backend_name,
         lcm_backend_available: backend_available,
+        // Phase 6: 默认 `true` 以兼容 fake-lcm 单测路径;生产模式(
+        // `NUWAX_NAV_REQUIRE_CMD_VEL_SINK=true`)由 Python
+        // LcmMotionCommandBridge 通过 `set_cmd_vel_sink_ready(false)` 显式
+        // 关掉,`SetNavigationGoal` 会因 `cmd_vel_sink_ready=false` 被拒绝。
+        cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         nav: crate::nav_runtime::NavRuntimeState::from_env(),
         explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
         mapping_adapter,
@@ -1284,6 +1314,7 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
         transport,
         transport_backend_name: "fake-lcm",
         lcm_backend_available: true,
+        cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         nav: crate::nav_runtime::NavRuntimeState::from_env(),
         explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
         mapping_adapter,

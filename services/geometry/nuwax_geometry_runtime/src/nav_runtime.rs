@@ -359,6 +359,23 @@ const P1_NATIVE_PROFILES: &[&str] = &[
     PROFILE_MLS3D,
 ];
 
+/// Phase 6: 是否启用"production profile 强制要求 cmd_vel sink ready" 门。
+///
+/// 备注:Phase 7 lane 已经实现无条件 gate(`cmd_vel_sink_ready=false` → 拒绝);
+/// 本函数保留作为未来通过 env 关闭 gate 的扩展点。当前不在 `compute_readiness`
+/// 中调用,以避免与 lane-7 决策冲突;若需启用,需在生产 env 显式
+/// `NUWAX_NAV_REQUIRE_CMD_VEL_SINK=true`,然后再让 compute_readiness 调它。
+#[allow(dead_code)]
+pub fn require_cmd_vel_sink_ready() -> bool {
+    matches!(
+        std::env::var("NUWAX_NAV_REQUIRE_CMD_VEL_SINK")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 // Phase 7:tf_count 累计计数。`pose.timestamp_ns == 0` 视为未定位初态;
 // 一旦 timestamp_ns > 0 就在每次 readiness call site 累加 1,作为 readiness.
 // tf_count 字段暴露给 diagnostics。Lane 6 阶段会改成订阅层 set,本阶段保留
@@ -389,10 +406,12 @@ pub async fn compute_readiness(
     let planner = matches!(profile, PROFILE_SIMPLE_2D | PROFILE_REPLANNING_ASTAR);
     let lcm_backend = handle.lcm_backend_available;
     // Phase 7:cmd_vel_sink_ready 由 override 控制,缺省按 lcm_backend 估算。
-    // real production profile + override=false → readiness false,且
-    // SetNavigationGoal 在 set_goal 内会被强制拒绝。
+    // Phase 6:Lane 6 注入接口(set_cmd_vel_sink_ready_override)与 handle 上
+    // 的 cmd_vel_sink_ready atomic bool 都参与决策;override > handle,
+    // handle 缺省时回退 lcm_backend。
     let cmd_vel_sink = lcm_backend; // backward-compatible 字段
-    let cmd_vel_sink_ready = cmd_vel_sink_ready_override().unwrap_or(lcm_backend);
+    let cmd_vel_sink_ready = cmd_vel_sink_ready_override()
+        .unwrap_or_else(|| handle.cmd_vel_sink_ready());
     // Phase 7:backend canonical 名(用 transport_backend_name 反推)。
     let backend = match handle.transport_backend_name {
         "fake-lcm" => "FakeLcm",
@@ -948,6 +967,40 @@ mod tests {
         assert_eq!(back.costmap_revision, d.costmap_revision);
         assert_eq!(back.cmd_vel_sink_ready, d.cmd_vel_sink_ready);
         assert_eq!(back.active_profile, d.active_profile);
+    }
+
+    /// Phase 6:Lane 6 注入接口(setter) → handle.cmd_vel_sink_ready() → readiness。
+    ///
+    /// 验证:
+    /// - 默认值 `true`(兼容旧 fake-lcm 单测)
+    /// - setter 写入后立刻被 readiness 读到
+    /// - override 优先级 > handle(setter 不影响 override 分支)
+    #[tokio::test]
+    async fn phase6_handle_cmd_vel_sink_ready_setter_propagates_to_readiness() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("handle");
+        let state = NavRuntimeState::from_env();
+        // 1. 默认值 true(无 override 时 readiness.cmd_vel_sink_ready 跟 lcm_backend)
+        assert!(handle.cmd_vel_sink_ready(), "默认 cmd_vel_sink_ready 必须 true");
+        // 2. setter 关掉
+        handle.set_cmd_vel_sink_ready(false);
+        // 3. readiness 必须反映 handle 关掉的状态(override=None → 回退 handle.cmd_vel_sink_ready())
+        let d = compute_readiness(&handle, &state).await;
+        assert!(!d.cmd_vel_sink_ready,
+            "setter 写入 false 后,readiness.cmd_vel_sink_ready 必须 false");
+        assert!(!d.ready,
+            "cmd_vel_sink_ready=false 时 readiness.ready 必须 false");
+        assert!(d.reason.contains("cmd_vel"),
+            "readiness.reason 必须含 cmd_vel 提示,实际={}", d.reason);
+        // 4. override 优先级 > handle:override=true 覆盖 handle=false
+        set_cmd_vel_sink_ready_override(Some(true));
+        let d2 = compute_readiness(&handle, &state).await;
+        assert!(d2.cmd_vel_sink_ready,
+            "override=true 应覆盖 handle=false");
+        set_cmd_vel_sink_ready_override(None);
+        // 5. 清理
+        handle.set_cmd_vel_sink_ready(true);
     }
 
     #[tokio::test]

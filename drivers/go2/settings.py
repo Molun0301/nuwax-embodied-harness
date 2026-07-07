@@ -150,7 +150,7 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
         enabled=_cfg_bool("GO2_DATA_PLANE_ENABLED", False),
         sdk_path=_cfg_str("GO2_SDK_PATH", ""),
         dds_iface=_prefer_platform_str(
-            platform_geometry.dds_iface if platform_geometry is not None else "",
+            getattr(platform_geometry, "dds_iface", "") if platform_geometry is not None else "",
             "GO2_DATA_PLANE_DDS_IFACE",
             _cfg_str("GO2_DDS_IFACE", ""),
         ),

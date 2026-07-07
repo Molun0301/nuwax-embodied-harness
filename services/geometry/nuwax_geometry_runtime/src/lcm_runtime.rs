@@ -212,14 +212,24 @@ impl GeometryRuntimeHandle {
         false
     }
 
-    /// exploration 板块 readiness。Phase 2 baseline:恒 `false`（controller
-    /// 未实装）。Phase 5 在 explore_runtime.rs 实装后,只要 handle 存在
-    /// (`Spawn` 时已经构造默认 wavefront source)即视为 ready;
-    /// 详细 active/inactive 由 `ExploreRuntimeHandle::is_active` 暴露。
+    /// exploration 板块 readiness。
+    /// Phase 7:从 `ExploreRuntimeHandle::readiness_cache` 取真实聚合
+    /// (`backend_available && controller.is_active() &&
+    /// frontier_source_ready && costmap_input_ready`),不再依赖
+    /// "handle 存在即 true" 的假 ready。
+    ///
+    /// 该方法在 sync context(diagnostics 聚合路径)被调;走缓存快照避免
+    /// await 内层 `tokio::Mutex`,cache 由 `ingest_costmap / start / stop
+    /// / tick` 在变更状态后刷新,以及 `refresh_readiness_cache_with_backend`
+    /// 在 backend 切换时刷新。
     pub fn explore_ready_poll(&self) -> bool {
-        // 当前实现:handle 在 spawn 时必已注入,仅在 spawn 失败时为 None
-        // (该路径上 LCM backend 阻断,会先报 LCM_BACKEND_UNAVAILABLE)。
-        true
+        if !self.lcm_backend_available {
+            return false;
+        }
+        // backend_available = lcm_backend_available,先用 sync 版本尝试刷新 cache;
+        // 抢不到锁则退到 cached_readiness(降级,不假装 ready)。
+        self.explore.refresh_readiness_cache_with_backend(self.lcm_backend_available);
+        self.explore.cached_readiness().ready
     }
 }
 
@@ -459,17 +469,23 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<(Vec<u8>, u32)> {
 // ============================================================================
 
 /// LCM backend 选择。基于 `NUWAX_LCM_BACKEND` 环境变量解析：
-/// - `fake`(默认)：内存 fake backend,不依赖 liblcm
-/// - `real`：real-lcm backend；**当前上游 nuwax-transport/real-lcm feature 仍为空桩**,
-///   启动期强制 fallback 到 fake 并打印 warn,避免误传 `real` 时偷偷走空 feature。
+/// - `fake-lcm`(默认)：内存 fake backend,不依赖 liblcm
+/// - `real-lcm`：真实 liblcm backend(Phase 3 已实装;由
+///   `NUWAX_REAL_LCM_REQUIRED` + mismatch 检测守门,不再静默 fallback 到 fake)
 ///
-/// 详见模块顶部 doc-comment 与
-///   `docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/06_LCM接入与wire-format验证.md`。
+/// Phase 7：本 enum 仅作 backend 解析 + readiness 暴露;
+/// readiness 字段由 `mapping_adapter::MappingReadiness`
+/// + `nav_runtime::NavigationReadinessDetail`
+/// + `explore_runtime::ExplorationReadinessDetail` 三个 layer 各自独立暴露
+/// counters + active backend,供 Python `GeometryRuntimeProvider` diagnostics
+/// 聚合。详见 `docs/开发文档/建图导航探索重构/2026-07-07_建图导航探索库真接入与real-lcm通信实施方案/11_readiness_收敛.md`
+/// + `00_最终执行方案.md` §5 Phase 7。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LcmBackendKind {
     /// 内存 fake backend（CI/开发机默认）
     Fake,
-    /// 真实 liblcm backend；当前上游未实装,启动期 fallback 到 Fake
+    /// 真实 liblcm backend(Phase 3 已实装,Real 与 Fake 都允许作为
+    /// 合法 readiness backend 字段值;启动期 mismatch 检测由 Phase 6 R2 M2 守门)
     Real,
 }
 
@@ -639,27 +655,127 @@ pub fn spawn_geometry_runtime(
         backend_name, backend_available
     );
 
-    let occ_topic = LcmTopic::new(occupancy_channel)
-        .unwrap_or_else(|_| LcmTopic::new("/map/occupancy").expect("default topic"));
-    let tf_topic = LcmTopic::new(tf_channel)
-        .unwrap_or_else(|_| LcmTopic::new("/tf").expect("default topic"));
-    let cm_topic = cloud_map_channel.map(LcmTopic::new).transpose().ok().flatten();
-    let nav_topic = nav_state_channel.map(LcmTopic::new).transpose().ok().flatten();
-    let fr_topic = frontiers_channel.map(LcmTopic::new).transpose().ok().flatten();
-    // Phase 1 channel registry 补齐:解析 4 类 typed channel;若 LcmTopic 校验失败
-    // (例如 typed suffix 缺失)回退到 default string,然后降级为 None。
-    let pose_topic = pose_channel
-        .map(|c| LcmTopic::new(c).unwrap_or_else(|_| LcmTopic::new("/pose_stamped").expect("default")))
-        .or_else(|| LcmTopic::new("/pose_stamped").ok());
-    let odom_topic = odometry_channel
-        .map(|c| LcmTopic::new(c).unwrap_or_else(|_| LcmTopic::new("/odom").expect("default")))
-        .or_else(|| LcmTopic::new("/odom").ok());
-    let cmd_vel_topic = cmd_vel_channel
-        .map(|c| LcmTopic::new(c).unwrap_or_else(|_| LcmTopic::new("/cmd_vel").expect("default")))
-        .or_else(|| LcmTopic::new("/cmd_vel").ok());
-    let nav_cancel_topic = nav_cancel_channel
-        .map(|c| LcmTopic::new(c).unwrap_or_else(|_| LcmTopic::new("/nav/cancel").expect("default")))
-        .or_else(|| LcmTopic::new("/nav/cancel").ok());
+    // Phase 4 startup health wire-up:在启动日志中暴露 backend 选择,供
+    // start 脚本 / smoke test / debug_panel 观测;字段值是 canonical
+    // `real-lcm` / `fake-lcm`,与 `NUWAX_LCM_BACKEND` 解析后归一化名一致。
+    {
+        let canonical_backend = match LcmBackendKind::from_env() {
+            LcmBackendKind::Fake => "fake-lcm",
+            LcmBackendKind::Real => "real-lcm",
+        };
+        info!(
+            "LCM backend status (Phase 4 startup wire-up): lcm_backend={} available={}",
+            canonical_backend, backend_available
+        );
+    }
+
+    let occ_topic = match crate::nav_runtime::parse_channel_with_suffix(occupancy_channel) {
+        Ok((t, _)) => t,
+        Err(e) => {
+            error!("lcm_runtime::fake 分支: occupancy channel 解析失败: {}", e);
+            return Err(RealLcmBackendUnavailable);
+        }
+    };
+    let tf_topic = match crate::nav_runtime::parse_channel_with_suffix(tf_channel) {
+        Ok((t, _)) => t,
+        Err(e) => {
+            error!("lcm_runtime::fake 分支: tf channel 解析失败: {}", e);
+            return Err(RealLcmBackendUnavailable);
+        }
+    };
+    let cm_topic = match cloud_map_channel {
+        Some(c) => match crate::nav_runtime::parse_channel_with_suffix(c) {
+            Ok((t, _)) => Some(t),
+            Err(e) => {
+                warn!(
+                    "lcm_runtime::fake 分支: cloud_map channel 解析失败 ({}): 降级无 cloud_map 模式",
+                    e
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let nav_topic = match nav_state_channel {
+        Some(c) => match crate::nav_runtime::parse_channel_with_suffix(c) {
+            Ok((t, _)) => Some(t),
+            Err(e) => {
+                warn!(
+                    "lcm_runtime::fake 分支: nav_state channel 解析失败 ({}): 降级无 nav 订阅",
+                    e
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let fr_topic = match frontiers_channel {
+        Some(c) => match crate::nav_runtime::parse_channel_with_suffix(c) {
+            Ok((t, _)) => Some(t),
+            Err(e) => {
+                warn!(
+                    "lcm_runtime::fake 分支: frontiers channel 解析失败 ({}): 降级无 frontier 订阅",
+                    e
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    // Phase 1 channel registry 补齐:解析 4 类 typed channel。
+    // Phase 4: 改走 `parse_channel_with_suffix`,强制 typed suffix;不再 untyped 兜底。
+    let pose_topic = match pose_channel {
+        Some(c) => match crate::nav_runtime::parse_channel_with_suffix(c) {
+            Ok((t, _)) => Some(t),
+            Err(e) => {
+                warn!(
+                    "lcm_runtime::fake 分支: pose channel 解析失败 ({}): 降级无 /pose_stamped 订阅",
+                    e
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let odom_topic = match odometry_channel {
+        Some(c) => match crate::nav_runtime::parse_channel_with_suffix(c) {
+            Ok((t, _)) => Some(t),
+            Err(e) => {
+                warn!(
+                    "lcm_runtime::fake 分支: odom channel 解析失败 ({}): 降级无 /odom 订阅",
+                    e
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let cmd_vel_topic = match cmd_vel_channel {
+        Some(c) => match crate::nav_runtime::parse_channel_with_suffix(c) {
+            Ok((t, _)) => Some(t),
+            Err(e) => {
+                warn!(
+                    "lcm_runtime::fake 分支: cmd_vel channel 解析失败 ({}): 降级无 /cmd_vel 订阅",
+                    e
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let nav_cancel_topic = match nav_cancel_channel {
+        Some(c) => match crate::nav_runtime::parse_channel_with_suffix(c) {
+            Ok((t, _)) => Some(t),
+            Err(e) => {
+                warn!(
+                    "lcm_runtime::fake 分支: nav_cancel channel 解析失败 ({}): 降级无 /nav/cancel 订阅",
+                    e
+                );
+                None
+            }
+        },
+        None => None,
+    };
 
     let occ_msg_type = LcmMessageType::new("nav_msgs/OccupancyGrid").expect("typed");
     let tf_msg_type = LcmMessageType::new("geometry_msgs/Transform").expect("typed");
@@ -770,7 +886,8 @@ pub fn spawn_geometry_runtime(
     // ---- 订阅 /odom：若上游 SLAM/odometry 节点直接发 odom，覆盖 pose ----
     let odom_state = state.clone();
     let odom_transport = transport.clone();
-    let odom_topic = LcmTopic::new("/odom").expect("default");
+    // Phase 4: 改走 channel_registry::channel_for(Odom) —— 禁止再硬编码 /odom。
+    let odom_topic = channel_registry::channel_for(channel_registry::ChannelKey::Odom);
     let odom_msg_type = LcmMessageType::new("nav_msgs/Odometry").expect("typed");
     tokio::spawn(async move {
         let mut stream = odom_transport.subscribe(odom_topic, Some(odom_msg_type)).await;
@@ -1026,13 +1143,8 @@ fn spawn_mapping_feed_tasks(
     use nalgebra::Point3;
 
     // ---- /odom → feed_pose ----
-    let odom_topic = match LcmTopic::new("/odom") {
-        Ok(t) => t,
-        Err(e) => {
-            error!("spawn_mapping_feed_tasks: /odom LcmTopic 构造失败: {}", e);
-            return;
-        }
-    };
+    // Phase 4: 改走 channel_registry::channel_for(Odom) —— 禁止硬编码 /odom。
+    let odom_topic = channel_registry::channel_for(channel_registry::ChannelKey::Odom);
     let odom_msg_type = match LcmMessageType::new("nav_msgs/Odometry") {
         Ok(m) => m,
         Err(e) => {
@@ -1065,16 +1177,8 @@ fn spawn_mapping_feed_tasks(
     });
 
     // ---- /go2/lidar/points → feed_pointcloud + build_and_publish ----
-    let lidar_topic = match LcmTopic::new("/go2/lidar/points") {
-        Ok(t) => t,
-        Err(e) => {
-            error!(
-                "spawn_mapping_feed_tasks: /go2/lidar/points LcmTopic 构造失败: {}",
-                e
-            );
-            return;
-        }
-    };
+    // Phase 4: 改走 channel_registry::channel_for(PointCloud) —— 禁止硬编码 /go2/lidar/points。
+    let lidar_topic = channel_registry::channel_for(channel_registry::ChannelKey::PointCloud);
     let lidar_msg_type = match LcmMessageType::new("sensor_msgs/PointCloud2") {
         Ok(m) => m,
         Err(e) => {

@@ -79,3 +79,10 @@ runtime_data/.venv-installer/
 tests/fixtures/
 tests/mocks/
 tests/integration/
+
+# === dimos crates 本地 vendor（vendor_dimos_crates.sh 产物，不入 git） ===
+# 目标机部署前由 scripts/vendor_dimos_crates.sh 把 13 个 nuwax-* crate
+# 落到 vendor/，并改 Cargo.toml 指向相对路径 vendor/<name>。
+# vendor/ 本身不入仓，但 .cargo/config.toml + vendor-config.json **入仓**。
+services/geometry/nuwax_geometry_runtime/vendor/
+services/geometry/nuwax_geometry_runtime/vendor-config.json

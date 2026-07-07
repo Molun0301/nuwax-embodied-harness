@@ -13,7 +13,9 @@
 # 扫描范围：
 #   - 目录：services core contracts scripts deploy
 #   - 单文件：.env.example
-#   - 扩展名过滤：.py .toml .sh .md .yaml .yml .env（避免误伤二进制）
+#   - 扩展名过滤：.py .toml .sh .md .yaml .yml .env .env.example
+#     （避免误伤二进制；必须显式枚举 .env 与 .env.example，
+#      因为 .env.example 不会匹配 \.env$ 这个普通扩展名锚点）
 #
 # 白名单（合理保留）：
 #   - 本任务目录自身的 .md / 文档归档：
@@ -79,7 +81,9 @@ SCAN_PATHS=(
 )
 
 # 扩展名过滤（仅扫描可读源/配置）
-EXTS_PATTERN='\.(py|toml|sh|md|yaml|yml|env)$'
+# 注意：必须显式列举 .env 与 .env.example；\.(...env)$ 会锚定到 ".env"
+# 末尾而不匹配 ".env.example"，因此用两条独立 alternative。
+EXTS_PATTERN='\.(py|toml|sh|md|yaml|yml)$|\.env$|\.env\.example$'
 
 # 把参数扩展为 git ls-files 可消费的 pathspec（仅 git 已跟踪 + 工作区存在文件）
 # 用 git ls-files + others --exclude-standard 覆盖 tracked + untracked（untracked 不纳入 CI）

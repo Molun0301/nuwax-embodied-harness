@@ -6983,6 +6983,16 @@ class PlatformGeometryProviderBundle(
                 return False
             if not self._is_legacy_exploration_fallback_allowed():
                 return False
+        # Phase 6 (codex-round3 R3-1): remote is None 时也必须显式
+        # NUWAX_EXPLORATION_LEGACY guard，与 start_exploration / stop_exploration
+        # 行为对齐：默认（NUWAX_EXPLORATION_LEGACY=false）下不允许悄悄走 Python
+        # 旧状态机。Round2 只在 remote.gRPC 失败路径加了 guard，但 `remote is None`
+        # 这条主路径上 sync 仍直接走 legacy。补这一刀。
+        if not self._is_legacy_exploration_fallback_allowed():
+            LOGGER.info(
+                "Bundle.sync_exploration_after_task remote=None 且 legacy 关闭，返回 False。"
+            )
+            return False
         return self.runtime.sync_platform_exploration_after_task()
 
     def subscribe_exploration_updates(self, callback) -> Optional[int]:

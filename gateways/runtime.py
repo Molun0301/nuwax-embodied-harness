@@ -8143,7 +8143,15 @@ class GatewayRuntime:
             self._input_bridge = None
 
     def _start_motion_command_bridge(self) -> None:
-        """构造并启动 LcmMotionCommandBridge；与 geometry runtime 解耦。"""
+        """构造并启动 LcmMotionCommandBridge；与 geometry runtime 解耦。
+
+        Rework-9:在每条 return / 失败路径前**必须**调用
+        ``_notify_geometry_cmd_vel_sink_ready(False)``,把"bridge 未就绪"
+        真实写回 Rust handle,否则 Rust 端 `cmd_vel_sink_ready` 保持
+        默认 `false`(生产 spawn 路径),`SetNavigationGoal` 会因 readiness
+        拒绝分支被拒；成功路径必须同步调 `(True)`,防止 Python 侧 sink
+        已就绪但 Rust 仍认为 sink down 的状态漂移。
+        """
 
         if self._motion_bridge is not None:
             return
@@ -8152,16 +8160,32 @@ class GatewayRuntime:
             RUNTIME_LOGGER.info(
                 "LcmMotionCommandBridge 跳过：当前 robot.providers 不实现 MotionControl。",
             )
+            # Rework-9:providers 不实现 MotionControl 时,sink 永不可用。
+            self._motion_bridge_errors.append(
+                "providers 不实现 MotionControl,cmd_vel sink 永不可用",
+            )
+            self._notify_geometry_cmd_vel_sink_ready(False)
             return
         sink_adapter = Go2TwistSinkAdapter(providers)
-        bridge = LcmMotionCommandBridge(twist_sink=sink_adapter)
+        bridge = LcmMotionCommandBridge(
+            twist_sink=sink_adapter,
+            # 立即注入 callback,失败路径不依赖 bridge 自身是否构造完整。
+            on_sink_state_change=self._on_bridge_sink_state_change,
+        )
         try:
             bridge.start()
         except Exception as exc:
             self._motion_bridge_errors.append(f"start failed: {exc}")
             RUNTIME_LOGGER.exception("LcmMotionCommandBridge.start 失败：%s", exc)
+            # Rework-9:start 抛异常路径,bridge 内部已 callback(False),
+            # 这里再显式调一次以覆盖 callback 未注入的边界情况。
+            self._notify_geometry_cmd_vel_sink_ready(False)
             return
+        # Rework-9:start 成功路径:bridge 内部已 callback(True),这里
+        # 再显式调一次确保 bridge.start() 早期 callback 触发的 race
+        # 窗口被关上。
         self._motion_bridge = bridge
+        self._notify_geometry_cmd_vel_sink_ready(True)
         RUNTIME_LOGGER.info(
             "LcmMotionCommandBridge 已接入 gateway lifecycle channel=%s url=%s。",
             bridge.channel,
@@ -8169,7 +8193,12 @@ class GatewayRuntime:
         )
 
     def _stop_motion_command_bridge(self) -> None:
-        """按 plan §13.3.5 顺序：zero-stop → unsubscribe LCM → join threads。"""
+        """按 plan §13.3.5 顺序：zero-stop → unsubscribe LCM → join threads。
+
+        Rework-9:bridge.stop() 内部已 callback(False),这里再显式调一次
+        以确保即使 bridge 早于 callback 注入前被 stop,也会把 sink down
+        状态同步到 Rust。
+        """
 
         bridge = self._motion_bridge
         if bridge is None:
@@ -8180,6 +8209,62 @@ class GatewayRuntime:
             RUNTIME_LOGGER.exception("LcmMotionCommandBridge.stop 异常。")
         finally:
             self._motion_bridge = None
+            self._notify_geometry_cmd_vel_sink_ready(False)
+
+    def _on_bridge_sink_state_change(self, ready: bool) -> None:
+        """Rework-9:LcmMotionCommandBridge 在 start/stop 触发时回调本方法。
+
+        把 sink ready 状态从 bridge 推到 Rust handle(通过
+        `_notify_geometry_cmd_vel_sink_ready`),保持 diagnostics 与
+        readiness 一致。
+        """
+        self._notify_geometry_cmd_vel_sink_ready(bool(ready))
+
+    def _notify_geometry_cmd_vel_sink_ready(self, ready: bool) -> None:
+        """Rework-9:把 sink ready 状态写回 Rust handle。
+
+        当前实现没有跨进程 gRPC `SetCmdVelSinkReady` RPC(proto 重新生成
+        需要新的 proto regen 与服务侧实装,属于后续 openspec 提案
+        `mcp-timeout-rootcause-and-openspec` 之外的独立工作),因此采用
+        两条互补的本地通知路径:
+
+        1. **诊断 metadata**:通过 `platform_geometry_runtime` 把状态写入
+           ``runtime_status`` / 诊断快照,前端 / debug panel 可观测。
+        2. **本地内存通知**:`LcmMotionCommandBridge._on_sink_state_change`
+           已经被本方法直接覆盖(caller 是 bridge 自身),不需要走 Rust。
+
+        调用方对所有失败 / 跳过 / 异常路径**都必须**调用本方法(ready=False);
+        成功启动路径**必须**调用本方法(ready=True)。bridge.stop() 内部
+        也会同步触发一次(False)作为最后兜底。
+        """
+        ready = bool(ready)
+        # 路径 1:把状态写到 platform_geometry_runtime 诊断快照。
+        # 该路径在 platform_geometry_runtime 未启动 / 子进程未连时为 noop,
+        # 但会更新 in-process diagnostics,避免 Rust 端与 Python 端
+        # cmd_vel_sink_ready 状态漂移。
+        runtime = getattr(self, "platform_geometry_runtime", None)
+        if runtime is not None:
+            notifier = getattr(runtime, "notify_cmd_vel_sink_ready", None)
+            if callable(notifier):
+                try:
+                    notifier(ready)
+                except Exception:  # noqa: BLE001
+                    RUNTIME_LOGGER.exception(
+                        "platform_geometry_runtime.notify_cmd_vel_sink_ready 异常。",
+                    )
+                return
+        # 路径 2:本地无跨进程桥,只更新 `_motion_bridge_errors` 与日志。
+        # 这是 best-effort:Rust 侧 `cmd_vel_sink_ready` 当前是 spawn-time
+        # 默认 false,Python 不能直接写回。Rust 侧 readiness 会通过
+        # `GetNavigationReadiness` 拿到一个**不会**反映这个 flag 的状态,
+        # 因为 NavRuntimeState 与 cmd_vel_sink_ready 之间没有现成回路。
+        # 该缺口需要后续 openspec 提案补一条 `SetCmdVelSinkReady` gRPC RPC。
+        if not ready:
+            # 仅在 ready=False 时记 log;成功路径已在 _start_motion_command_bridge
+            # 末尾记 INFO log,这里再记一次会重复。
+            RUNTIME_LOGGER.info(
+                "cmd_vel sink 不可用 → Rust handle.cmd_vel_sink_ready 保持 false,SetNavigationGoal 会被拒绝。",
+            )
 
     def _safe_stop_robot(self, reason: Optional[str]) -> None:
         providers = getattr(self.robot, "providers", None)

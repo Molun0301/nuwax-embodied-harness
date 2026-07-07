@@ -338,6 +338,83 @@ def test_bad_payload_dropped():
         bridge.stop(timeout=1.0)
 
 
+# ============================================================
+# Case 11 (Rework-9): sink state change callback 触发时序
+# ============================================================
+def test_sink_state_change_callback_fires_on_start_and_stop():
+    """Rework-9 验收用例 1:start() 成功 → callback(True);
+    stop() → callback(False)。
+
+    防止 gateway 在 start / 失败 / 跳过 / 关闭路径上忘记同步 sink ready
+    状态,导致 Rust handle 与 Python bridge 出现"不一致"。
+    """
+    print("Case 11: on_sink_state_change callback 时序 (start → True, stop → False)")
+    events = []
+    sink = RecordingSink()
+    bridge = LcmMotionCommandBridge(
+        lcm_url="mock://",
+        channel="/cmd_vel",
+        twist_sink=sink,
+        on_sink_state_change=events.append,
+    )
+    bridge.start()
+    try:
+        _check("start 后 callback 收到 True", events == [True],
+               f"events={events}")
+    finally:
+        bridge.stop(timeout=1.0)
+    _check(
+        "start + stop 后 callback 序列 == [True, False]",
+        events == [True, False],
+        f"events={events}",
+    )
+
+
+def test_sink_state_change_callback_not_fired_when_subscribe_fails():
+    """Rework-9 验收用例 2:bridge 构造参数注入 callback 后,
+    subscribe 失败的 mock backend 路径下 callback 必须收到 False。
+
+    用一个会抛异常的 backend 替代 MockLcmBackend,确保 start 内部
+    try/except 把异常带上 callback=False。
+    """
+    print("Case 12: subscribe 抛异常 → callback 收到 False")
+
+    class BrokenBackend:
+        def __init__(self):
+            self.url = "broken://"
+
+        def subscribe(self, channel, callback):  # noqa: ARG002
+            raise RuntimeError("broken subscribe")
+
+        def unsubscribe(self, handle):  # noqa: ARG002
+            return
+
+        def publish(self, channel, payload):  # noqa: ARG002
+            return
+
+    events = []
+    sink = RecordingSink()
+    bridge = LcmMotionCommandBridge(
+        lcm_url="broken://",
+        channel="/cmd_vel",
+        twist_sink=sink,
+        on_sink_state_change=events.append,
+    )
+    # 必须把 _backend 换成 BrokenBackend,_resolve_backend 默认走 mock://
+    bridge._backend = BrokenBackend()
+    raised = False
+    try:
+        bridge.start()
+    except RuntimeError:
+        raised = True
+    _check("subscribe 抛异常被 start 重新抛出", raised)
+    _check(
+        "subscribe 抛异常后 callback 收到 False",
+        events == [False],
+        f"events={events}",
+    )
+
+
 # ------------------------------------------------------------
 # Case 10: Go2TwistSinkAdapter 接入路径
 # ------------------------------------------------------------
@@ -396,6 +473,8 @@ def main():
     test_sink_ready_flag()
     test_bad_payload_dropped()
     test_go2_twist_sink_adapter()
+    test_sink_state_change_callback_fires_on_start_and_stop()
+    test_sink_state_change_callback_not_fired_when_subscribe_fails()
     print("=" * 70)
     print(f"PASS={_results['pass']}  FAIL={_results['fail']}")
     if _results["fail"] > 0:

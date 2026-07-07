@@ -271,6 +271,7 @@ class LcmMotionCommandBridge:
         timeout_s: float = WATCHDOG_TIMEOUT_S,
         tick_s: float = WATCHDOG_TICK_S,
         frame_id: str = "base_link",
+        on_sink_state_change: Optional[Callable[[bool], None]] = None,
     ) -> None:
         self.lcm_url = lcm_url or os.environ.get("NUWAX_LCM_URL", "mock://")
         self.channel = (
@@ -283,6 +284,21 @@ class LcmMotionCommandBridge:
         self.timeout_s = float(timeout_s)
         self.tick_s = float(tick_s)
         self.frame_id = frame_id
+        # Rework-9:gateway 注入的 sink 状态回写 callback。
+        # 调用语义:
+        #   - `True`  —— bridge.start() 成功后,cmd_vel sink 已就绪
+        #                (backend 订阅成功,watchdog 线程已 spawn)
+        #   - `False` —— bridge 启动失败 / subscribe 抛异常 /
+        #                providers 不实现 MotionControl /
+        #                后端不可用(状态不可恢复,需要 caller 决策)
+        # 注入实现细节:gateway 把这个 callback 接到
+        # `gateways/runtime.py:_start_motion_command_bridge`,在每条
+        # return / 失败路径前同步调用,确保 Python `_motion_bridge_errors`
+        # 与诊断 metadata 与该 callback 一致,避免出现"bridge 已挂但
+        # readiness 看不到"的不一致状态。
+        self._on_sink_state_change: Optional[Callable[[bool], None]] = (
+            on_sink_state_change
+        )
 
         # atomic state(整数计数器使用 Lock-free 单变量赋值,Python GIL 保障可见性)
         self._cmd_count = 0
@@ -304,26 +320,50 @@ class LcmMotionCommandBridge:
     # 公共 API
     # --------------------------------------------------------
     def start(self) -> None:
-        """启动 receiver + watchdog 线程;订阅 LCM。"""
+        """启动 receiver + watchdog 线程;订阅 LCM。
+
+        Rework-9:启动成功路径同步触发 `on_sink_state_change(True)`;
+        subscribe / 启动失败路径同步触发 `on_sink_state_change(False)`。
+        callback 由 gateway 在构造时注入,用于把 sink ready 状态写回
+        Rust 侧(handle.cmd_vel_sink_ready)以及 diagnostics metadata。
+        """
         if self._receiver_thread is not None or self._watchdog_thread is not None:
             return
         self._stop_event.clear()
-        self._lcm_sub_handle = self._backend.subscribe(self.channel, self._on_lcm_bytes)
+        try:
+            self._lcm_sub_handle = self._backend.subscribe(self.channel, self._on_lcm_bytes)
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(f"subscribe 失败: {exc}")
+            logger.exception("LcmMotionCommandBridge.subscribe 失败: %s", exc)
+            self._notify_sink_state(False)
+            raise
         self._receiver_thread = threading.Thread(
             target=self._receiver_loop, name="lcm-cmd-receiver", daemon=True
         )
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop, name="lcm-cmd-watchdog", daemon=True
         )
-        self._receiver_thread.start()
-        self._watchdog_thread.start()
+        try:
+            self._receiver_thread.start()
+            self._watchdog_thread.start()
+        except Exception as exc:  # noqa: BLE001
+            self._record_error(f"thread spawn 失败: {exc}")
+            logger.exception("LcmMotionCommandBridge thread spawn 失败: %s", exc)
+            self._notify_sink_state(False)
+            raise
+        self._notify_sink_state(True)
         logger.info(
             "LcmMotionCommandBridge started channel=%s url=%s timeout=%.0fms tick=%.0fms backend_real=%s",
             self.channel, self.lcm_url, self.timeout_s * 1000, self.tick_s * 1000, self._backend_real,
         )
 
     def stop(self, timeout: float = 1.0) -> None:
-        """顺序关闭:zero-stop -> unsubscribe LCM -> 停 watchdog -> 停 receiver。"""
+        """顺序关闭:zero-stop -> unsubscribe LCM -> 停 watchdog -> 停 receiver。
+
+        Rework-9:关闭成功后通知 `on_sink_state_change(False)`,
+        防止 gateway 已经把 bridge 拆掉但 Rust handle 还停留在 True 的
+        不一致状态(会被 `compute_readiness` 当成"ready"继续放行 goal)。
+        """
         self._stop_event.set()
         if self._lcm_sub_handle is not None:
             try:
@@ -338,6 +378,35 @@ class LcmMotionCommandBridge:
                 t.join(timeout=timeout)
         self._watchdog_thread = None
         self._receiver_thread = None
+        self._notify_sink_state(False)
+
+    def set_sink_state_change_callback(
+        self, callback: Optional[Callable[[bool], None]]
+    ) -> None:
+        """运行时注入/替换 sink state change callback。
+
+        gateway 在构造 bridge 之后调本方法,把真实写回 Rust handle 的
+        函数注入进来(允许延迟绑定,避免构造参数顺序问题)。
+        """
+        self._on_sink_state_change = callback
+
+    def _notify_sink_state(self, ready: bool) -> None:
+        """触发 sink state change callback(若已注入)。
+
+        callback 异常被吞掉 + 记 log:这是 best-effort 通知,不能反过来
+        影响 bridge 自身的启停流程;callback 失败会在 gateway 侧拿到
+        `_motion_bridge_errors`,但 bridge 实例本身仍能正常工作。
+        """
+        cb = self._on_sink_state_change
+        if cb is None:
+            return
+        try:
+            cb(bool(ready))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "LcmMotionCommandBridge on_sink_state_change callback 异常 ready=%s err=%s",
+                ready, exc,
+            )
 
     def request_immediate_zero(self, source: str = "cancel") -> None:
         """CancelNavigation / shutdown / 测试触发的同步 zero-stop。

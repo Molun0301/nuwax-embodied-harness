@@ -174,13 +174,18 @@ pub struct GeometryRuntimeHandle {
     /// 返回 `healthy=false` + `LCM_BACKEND_UNAVAILABLE` message；
     /// 该 flag 当前唯一触发源是 `LcmBackendKind::Real`（fail-fast 设计）。
     pub lcm_backend_available: bool,
-    /// Phase 6: Python `LcmMotionCommandBridge` 注入的 cmd_vel sink ready 信号。
+    /// Phase 6 / Rework-9: Python `LcmMotionCommandBridge` 注入的 cmd_vel sink ready 信号。
     /// - `true`  — Python 侧 LcmMotionCommandBridge 已订阅 `/cmd_vel`,
     ///             watchdog 存活,sink 可写。
-    /// - `false` — bridge 未启动 / sink 未注入 / watchdog 失败。
-    /// 默认 `true` 以兼容旧单测(CI / fake backend 不接 Python bridge);
-    /// 生产模式(`NUWAX_NAV_REQUIRE_CMD_VEL_SINK=true`)会强制要求该 flag
-    /// 为 `true`,否则 `SetNavigationGoal` 返回 rejected。
+    /// - `false` — bridge 未启动 / sink 未注入 / watchdog 失败 /
+    ///             providers 不实现 MotionControl / bridge.start() 抛异常。
+    /// **生产 spawn 路径默认 `false`** —— 必须由 Python
+    /// `LcmMotionCommandBridge.start()` 成功后通过 gateway 写回 `true`,
+    /// 否则 `SetNavigationGoal` 在 `compute_readiness` 因
+    /// `cmd_vel_sink_ready=false` 被拒绝(参见
+    /// `REJECT_REASON_CMD_VEL_SINK_DOWN`)。fake-only 单测 helper 路径保留
+    /// 默认 `true` 以兼容旧测试用例(显式 `set_cmd_vel_sink_ready(false)`
+    /// 验证 readiness 拒绝分支)。
     pub cmd_vel_sink_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Phase 5: 探索 runtime 句柄(由 `spawn_geometry_runtime` 注入)。
     /// 负责 start / stop / state / diagnostics 四类 RPC。
@@ -1176,11 +1181,17 @@ pub fn spawn_geometry_runtime(
         transport,
         transport_backend_name: backend_name,
         lcm_backend_available: backend_available,
-        // Phase 6: 默认 `true` 以兼容 fake-lcm 单测路径;生产模式(
-        // `NUWAX_NAV_REQUIRE_CMD_VEL_SINK=true`)由 Python
-        // LcmMotionCommandBridge 通过 `set_cmd_vel_sink_ready(false)` 显式
-        // 关掉,`SetNavigationGoal` 会因 `cmd_vel_sink_ready=false` 被拒绝。
-        cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        // Phase 6 / Rework-9: 默认 `false` —— 这是**生产 spawn 路径**,
+        // 该路径必须由 Python `LcmMotionCommandBridge.start()` 成功完成后,
+        // 通过 gateway `_start_motion_command_bridge` 链路真实写回 true;
+        // 若 Python 端未启动 / start 失败 / providers 不实现 MotionControl,
+        // 该 flag 保持 false,`SetNavigationGoal` 在 `compute_readiness` 因
+        // `cmd_vel_sink_ready=false` 被拒绝(参见 `REJECT_REASON_CMD_VEL_SINK_DOWN`)。
+        //
+        // 注意:`build_handle_for_tests`(第 1354 行 fake-only profile)
+        // 仍保留默认 `true` —— 单测直接调 `set_cmd_vel_sink_ready(false)`
+        // 验证 readiness 拒绝分支(参照 `phase6_handle_cmd_vel_sink_ready_setter_propagates_to_readiness`)。
+        cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         nav: crate::nav_runtime::NavRuntimeState::from_env(),
         explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
         mapping_adapter,
@@ -1351,6 +1362,9 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
         transport,
         transport_backend_name: "fake-lcm",
         lcm_backend_available: true,
+        // Phase 6 / Rework-9:fake-only 单测 helper **保留** 默认 `true`,
+        // 配套测试用 `set_cmd_vel_sink_ready(false)` 验证 readiness 拒绝
+        // 分支。生产 spawn 路径(`spawn_geometry_runtime`)默认 `false`。
         cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         nav: crate::nav_runtime::NavRuntimeState::from_env(),
         explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),

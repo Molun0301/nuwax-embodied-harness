@@ -977,10 +977,11 @@ mod tests {
         assert_eq!(back.active_profile, d.active_profile);
     }
 
-    /// Phase 6:Lane 6 注入接口(setter) → handle.cmd_vel_sink_ready() → readiness。
+    /// Phase 6 / Rework-9:Lane 6 注入接口(setter) → handle.cmd_vel_sink_ready() → readiness。
     ///
     /// 验证:
-    /// - 默认值 `true`(兼容旧 fake-lcm 单测)
+    /// - fake-only `build_handle_for_tests` helper 默认 `true`(单测兼容)
+    /// - 生产 `spawn_geometry_runtime` 默认 `false`(由 Python 写回)
     /// - setter 写入后立刻被 readiness 读到
     /// - override 优先级 > handle(setter 不影响 override 分支)
     #[tokio::test]
@@ -991,8 +992,9 @@ mod tests {
             .await
             .expect("handle");
         let state = NavRuntimeState::from_env();
-        // 1. 默认值 true(无 override 时 readiness.cmd_vel_sink_ready 跟 lcm_backend)
-        assert!(handle.cmd_vel_sink_ready(), "默认 cmd_vel_sink_ready 必须 true");
+        // 1. fake-only helper 默认值 true(无 override 时 readiness.cmd_vel_sink_ready 跟 lcm_backend)
+        assert!(handle.cmd_vel_sink_ready(),
+            "fake-only test helper 默认 cmd_vel_sink_ready 必须 true");
         // 2. setter 关掉
         handle.set_cmd_vel_sink_ready(false);
         // 3. readiness 必须反映 handle 关掉的状态(override=None → 回退 handle.cmd_vel_sink_ready())
@@ -1010,6 +1012,36 @@ mod tests {
             "override=true 应覆盖 handle=false");
         set_cmd_vel_sink_ready_override(None);
         // 5. 清理
+        handle.set_cmd_vel_sink_ready(true);
+    }
+
+    /// Phase 6 / Rework-9:test helper 默认仍 `true`,setter 翻转后 readiness 拒绝。
+    ///
+    /// 证明 fake-only profile 行为不变:旧单测断言
+    /// `默认 cmd_vel_sink_ready 必须 true` 仍然成立,因为生产 spawn path
+    /// (`spawn_geometry_runtime`)与 fake-only test helper 是两条独立
+    /// 构造路径(参见 `lcm_runtime.rs:1182` / `:1354` 分支说明)。
+    /// 本 test 同时把生产侧的"setter 关掉 → readiness 拒绝 → reason 含
+    /// cmd_vel"分支再固化一次,作为 rework9 的回归测试锚点。
+    #[tokio::test]
+    async fn rework9_test_helper_default_true_setter_blocks_readiness() {
+        super::reset_tf_count_for_test();
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("handle");
+        let state = NavRuntimeState::from_env();
+        assert!(handle.cmd_vel_sink_ready(),
+            "test helper 必须默认 true(fake-only profile 不接 Python bridge)");
+        // setter 关掉后:
+        handle.set_cmd_vel_sink_ready(false);
+        let d = compute_readiness(&handle, &state).await;
+        assert!(!d.ready, "setter=false 后 readiness 必须 false");
+        assert!(!d.cmd_vel_sink_ready);
+        let reason_contains = d.reason.contains("cmd_vel")
+            || d.reason.contains(REJECT_REASON_CMD_VEL_SINK_DOWN);
+        assert!(reason_contains,
+            "reason 必须指向 cmd_vel sink 未就绪,实际={}", d.reason);
+        // 清理
         handle.set_cmd_vel_sink_ready(true);
     }
 

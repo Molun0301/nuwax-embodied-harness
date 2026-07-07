@@ -1,0 +1,20 @@
+// LCM IDL — nuwax_msgs.NavigationState
+//
+// Phase 2 自有类型：承载当前导航会话 ID、目标点、规划状态机枚举。
+// fingerprint 由 `nuwax-codec` lcm_hash_64 推算并固化在测试中。
+struct nuwax_msgs__NavigationState
+{
+    string   session_id;
+    string   robot_frame;
+    int64_t  stamp_sec;
+    int32_t  stamp_nsec;
+    int32_t  state;            // 0=Idle 1=Planning 2=Moving 3=Arrived 4=Failed
+    double   goal_x;
+    double   goal_y;
+    double   goal_yaw;
+    double   current_x;
+    double   current_y;
+    double   current_yaw;
+    double   progress;
+    string   message;
+}

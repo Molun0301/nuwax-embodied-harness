@@ -1,0 +1,20 @@
+// LCM IDL — nav_msgs.OccupancyGrid
+//
+// 来源：lcm-gen 标准 .lcm 语法。2D 栅格地图 metadata + data bytes。
+// `data` 用 byte[] 表达以保证 lcm-gen 生成代码可编码 / 解码任意 octomap
+// 输出。
+struct nav_msgs__OccupancyGrid
+{
+    int32_t  width;
+    int32_t  height;
+    double   resolution;
+    double   origin_position_x;
+    double   origin_position_y;
+    double   origin_position_z;
+    double   origin_orientation_w;
+    double   origin_orientation_x;
+    double   origin_orientation_y;
+    double   origin_orientation_z;
+    byte     data_length;
+    byte     data[1048576];     // 最大 1 MiB,上限与上游一致
+}

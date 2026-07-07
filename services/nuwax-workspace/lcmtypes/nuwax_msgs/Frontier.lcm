@@ -1,0 +1,14 @@
+// LCM IDL — nuwax_msgs.Frontier
+//
+// Phase 2 自有类型：探索规划输出的 frontier candidate,带中心点 + 半径 +
+// 收益评分。
+struct nuwax_msgs__Frontier
+{
+    int64_t  id;
+    double   cx;
+    double   cy;
+    double   radius;
+    double   score;
+    int32_t  cell_count;
+    string   note;
+}

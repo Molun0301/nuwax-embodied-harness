@@ -1,0 +1,22 @@
+// LCM IDL — geometry_msgs.PoseStamped
+//
+// 来源：lcm-gen 标准 .lcm 语法,字段定义遵循上游 LCM 1.x 几何/位姿语义。
+// 用法：`lcm-gen -c --c-cpath <out> --c-hpath <out> PoseStamped.lcm` 生成
+// C 编码/解码代码(上游 liblcm 真 wire-format)。
+//
+// fingerprint(`geometry_msgs::PoseStamped`) = 由 `__lcm_hash_64` 滚动
+// 组合各字段类型得到；Rust 侧由 `nuwax-codec` 的 lcm_hash_64 计算与
+// 上游 lcm-gen `_get_hash` 完全一致。
+struct geometry_msgs__PoseStamped
+{
+    int64_t  stamp_sec;
+    int32_t  stamp_nsec;
+    string   frame_id;
+    double   position_x;
+    double   position_y;
+    double   position_z;
+    double   orientation_w;
+    double   orientation_x;
+    double   orientation_y;
+    double   orientation_z;
+}

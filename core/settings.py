@@ -168,8 +168,14 @@ def _normalize_lcm_backend(value: str) -> str:
 
     Phase 6 增项：fake-lcm 仅允许在显式 `NUWAX_RUNTIME_PROFILE` ∈ {ci, ci-test,
     contract-test, unit-test} 或单元测试场景使用；非允许 profile 设 fake-lcm
-    会输出 warning 但仍归一化为 fake-lcm,启动期会再被 Rust runtime 拒绝接 fake
-    backend(参见 lcm_runtime.rs:LcmBackendKind::Real fail-fast 分支)。
+    会输出 warning 但仍归一化为 fake-lcm。
+
+    fake-lcm 是否被 Rust 启动期拒收，**取决于 `NUWAX_REAL_LCM_REQUIRED`，与
+    `NUWAX_RUNTIME_PROFILE` 无关**：
+    - `REAL_LCM_REQUIRED=true` + fake-lcm → 启动期因 LCM_BACKEND_CONFIG_MISMATCH
+      退出，Python load_config 同步抛 ValueError。
+    - `REAL_LCM_REQUIRED=false`（默认） + fake-lcm → fake-lcm 可正常启动，
+      不会拒收。
     """
     raw = (value or "").strip().lower()
     if raw in ("", "fake-lcm", "fake"):
@@ -203,18 +209,30 @@ def _normalize_lcm_backend(value: str) -> str:
         )
         if not profile:
             # 默认不强制;只在用户显式设 fake-lcm 时警告(避免首次启动刷屏)。
+            #
+            # Phase 6 (codex-round3 R3-5)：fake-lcm 是否被 Rust 拒收要看
+            # NUWAX_REAL_LCM_REQUIRED,与是否设了 NUWAX_RUNTIME_PROFILE 无关。
+            # 当前未设 NUWAX_RUNTIME_PROFILE,且 NUWAX_REAL_LCM_REQUIRED=true
+            # 时,fake-lcm 在 Rust 启动期会因 LCM_BACKEND_CONFIG_MISMATCH 退出。
+            # `REAL_LCM_REQUIRED=false`(默认)时 fake-lcm 可正常启动,不会拒绝。
             if "NUWAX_LCM_BACKEND_fake_non_ci" not in _DEPRECATED_ENV_NOTIFIED:
                 _DEPRECATION_LOGGER.warning(
                     "NUWAX_LCM_BACKEND=fake-lcm 仅允许 CI/contract-test profile;"
-                    " 当前未设 NUWAX_RUNTIME_PROFILE,启动期 fake-lcm 会被 Rust runtime 拒绝。"
-                    " 生产/开发请改 NUWAX_LCM_BACKEND=real-lcm。"
+                    " 当前未设 NUWAX_RUNTIME_PROFILE。"
+                    " fake-lcm 是否被 Rust 拒收取决于 NUWAX_REAL_LCM_REQUIRED:"
+                    " =true 时启动期因 LCM_BACKEND_CONFIG_MISMATCH 退出；"
+                    " =false(默认)时 fake-lcm 可正常启动。"
+                    " 生产/开发若要连真实 lcmd,请 NUWAX_LCM_BACKEND=real-lcm +"
+                    " NUWAX_REAL_LCM_REQUIRED=true。"
                 )
                 _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_fake_non_ci")
         elif profile not in _FAKE_LCM_ALLOWED_PROFILES:
             if "NUWAX_LCM_BACKEND_fake_non_ci" not in _DEPRECATED_ENV_NOTIFIED:
                 _DEPRECATION_LOGGER.warning(
                     "NUWAX_LCM_BACKEND=fake-lcm 但 NUWAX_RUNTIME_PROFILE=%r 不在允许列表 %r;"
-                    " 启动期 fake-lcm 会被 Rust runtime 拒绝。",
+                    " fake-lcm 是否被 Rust 拒收取决于 NUWAX_REAL_LCM_REQUIRED:"
+                    " =true 时启动期因 LCM_BACKEND_CONFIG_MISMATCH 退出；"
+                    " =false(默认)时 fake-lcm 可正常启动。",
                     profile,
                     sorted(_FAKE_LCM_ALLOWED_PROFILES),
                 )
@@ -272,7 +290,11 @@ EXPLORE_ARBITRATION: str = (
 REAL_LCM_REQUIRED: bool = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
 
 # NUWAX_LCM_BACKEND=fake-lcm 仅允许 CI / contract test profile。
-# 生产/开发环境设置 fake-lcm 会被 _normalize_lcm_backend 警告并归一化为 real-lcm。
+# `NUWAX_LCM_BACKEND=fake` (历史 alias) 会被 _normalize_lcm_backend 归一化为
+# `fake-lcm` 并 warning。
+# **与 `NUWAX_REAL_LCM_REQUIRED` 无关**：当 `REAL_LCM_REQUIRED=true` 时 fake-lcm
+# 才被禁（启动期因 LCM_BACKEND_CONFIG_MISMATCH 退出）；
+# `REAL_LCM_REQUIRED=false`（默认）时 fake-lcm 可正常启动，不做归一化。
 _FAKE_LCM_ALLOWED_PROFILES: frozenset[str] = frozenset(
     {
         "ci",

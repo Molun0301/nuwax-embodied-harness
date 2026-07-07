@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # scripts/diagnostics/check_nuwax_runtime.sh
 #
-# 一页 evidence bundle —— 不依赖 grpcurl / lcm-logger / 外网。
+# 一页 evidence bundle —— 不依赖 grpcurl / lcm-logger / 外网,但 Phase 8 起
+# 必须主动跑 lcm roundtrip + 抓 channel counters,不再用"不依赖 lcm-logger"
+# 作为完成证据（§5 Phase 8 任务 4 + §12.6）。
 #
 # 用法:
 #   bash scripts/diagnostics/check_nuwax_runtime.sh                # 默认 127.0.0.1:50051
@@ -17,11 +19,14 @@
 #                    GetNavigationReadiness / GetExplorationState(grpc 缺失则 NOT RUN)
 #   7. env canonical — 抓 backend/profile 关键 env
 #   8. 日志尾部 — nuwax_geometry_runtime.log 最近 20 行
+#   9. LCM roundtrip — Python publisher+subscriber 跨进程互通（liblcm/udpm 不可用 → NOT RUN）
+#  10. Channel counters — 解析 nuwax_geometry_runtime.log 中 typed channel pub/sub 计数
+#  11. systemd unit — 检查 production unit 是否 hardcode NUWAX_LCM_BACKEND=real-lcm
 #
 # 退出码:0  evidence 全部产出(允许若干段 NOT READY)
 #
-# Phase 7 一次性脚本:运行结果归档到
-# docs/开发文档/建图导航探索重构/2026-07-06_.../70_installer_systemd_实机验收_phase7.md
+# Phase 8 一次性脚本:运行结果归档到
+# docs/开发文档/建图导航探索重构/2026-07-07_建图导航探索库真接入与real-lcm通信实施方案/
 
 set -uo pipefail
 
@@ -148,6 +153,79 @@ else
   nr "日志文件不存在: ${GATEWAY_LOG_FILE}"
 fi
 
+bar "9. LCM roundtrip (Phase 8 §12.6 硬约束)"
+if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --modversion lcm >/dev/null 2>&1; then
+  nr "liblcm-dev 不可用,跳过 roundtrip（CI 镜像需 apt install -y liblcm-dev pkg-config python3-lcm）"
+elif ! python3 -c 'import lcm' >/dev/null 2>&1; then
+  nr "python3-lcm 不可用,跳过 roundtrip（CI 镜像需 apt install -y python3-lcm）"
+else
+  RT_LOG="$(mktemp)"
+  if bash "${REPO_ROOT}/scripts/ci/smoke_real_lcm_roundtrip.sh" >"${RT_LOG}" 2>&1; then
+    ok "LCM 跨进程 roundtrip PASS"
+  else
+    rc=$?
+    if [[ "${rc}" -eq 2 ]]; then
+      nr "LCM roundtrip NOT_RUN（udpm multicast 在本网络被阻断,见 ${RT_LOG}）"
+    else
+      nr "LCM roundtrip FAIL rc=${rc}（详见 ${RT_LOG}）"
+    fi
+  fi
+  tail -n 10 "${RT_LOG}" | sed 's/^/    /'
+  rm -f "${RT_LOG}"
+fi
+
+bar "10. Channel counters (Phase 8 §12.6 / §13.5 关键 evidence)"
+if [[ -f "${GATEWAY_LOG_FILE}" ]]; then
+  # 解析最近 5000 行日志中 typed channel pub/sub 计数（不依赖 lcm-logger）
+  declare -A CHAN_PUB_COUNT=() CHAN_SUB_COUNT=()
+  recent_lines="$(wc -l < "${GATEWAY_LOG_FILE}")"
+  scan_start=$(( recent_lines > 5000 ? recent_lines - 5000 : 0 ))
+  while IFS= read -r line; do
+    if [[ "${line}" =~ publish[[:space:]]+channel=([A-Za-z0-9_/.\\-]+) ]]; then
+      ch="${BASH_REMATCH[1]}"
+      CHAN_PUB_COUNT[$ch]=$(( ${CHAN_PUB_COUNT[$ch]:-0} + 1 ))
+    fi
+    if [[ "${line}" =~ subscribe[[:space:]]+channel=([A-Za-z0-9_/.\\-]+) ]]; then
+      ch="${BASH_REMATCH[1]}"
+      CHAN_SUB_COUNT[$ch]=$(( ${CHAN_SUB_COUNT[$ch]:-0} + 1 ))
+    fi
+  done < <(tail -n +"$((scan_start+1))" "${GATEWAY_LOG_FILE}" 2>/dev/null)
+  if [[ ${#CHAN_PUB_COUNT[@]} -eq 0 && ${#CHAN_SUB_COUNT[@]} -eq 0 ]]; then
+    nr "日志中无 typed channel pub/sub 事件（runtime 未启动 / 走 fake backend / 未运行 Phase 5/6 bridge）"
+  else
+    printf '  %-40s %10s %10s\n' "channel" "publish" "subscribe"
+    all_channels="$(printf '%s\n' "${!CHAN_PUB_COUNT[@]}" "${!CHAN_SUB_COUNT[@]}" | sort -u)"
+    while IFS= read -r ch; do
+      [[ -z "${ch}" ]] && continue
+      printf '  %-40s %10s %10s\n' "${ch}" "${CHAN_PUB_COUNT[$ch]:-0}" "${CHAN_SUB_COUNT[$ch]:-0}"
+    done <<< "${all_channels}"
+  fi
+else
+  nr "日志不存在,跳过 channel counters"
+fi
+
+bar "11. systemd unit (production env)"
+SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-geometry-runtime.service"
+if [[ -f "${SERVICE_FILE}" ]]; then
+  if grep -qE '^Environment=NUWAX_LCM_BACKEND=real-lcm' "${SERVICE_FILE}"; then
+    ok "service hardcode NUWAX_LCM_BACKEND=real-lcm"
+  else
+    miss "service 缺 NUWAX_LCM_BACKEND=real-lcm"
+  fi
+  if grep -qE '^Environment=NUWAX_REAL_LCM_REQUIRED=true' "${SERVICE_FILE}"; then
+    ok "service hardcode NUWAX_REAL_LCM_REQUIRED=true"
+  else
+    miss "service 缺 NUWAX_REAL_LCM_REQUIRED=true"
+  fi
+  if grep -qE '^SuccessExitStatus=0 4' "${SERVICE_FILE}"; then
+    miss "service 仍把 real-lcm fail-fast code(4) 当 SuccessExitStatus（违反 §13.2）"
+  else
+    ok "service SuccessExitStatus 仅 0"
+  fi
+else
+  nr "service 文件不存在: ${SERVICE_FILE}"
+fi
+
 echo
-echo "==> evidence bundle 完成 (Phase 7 / 2026-07-06)"
+echo "==> evidence bundle 完成 (Phase 8 / 2026-07-07)"
 exit 0

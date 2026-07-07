@@ -21,6 +21,9 @@
 //! ## readiness 语义
 //! - `mapping_ready_poll()` 真实判定:`accumulator_has_data && lcm_backend_available`
 //!   之前 Phase 2 baseline 恒 `false`,本次实装后改 true (有数据时)
+//! - `readiness()` 暴露 odom_count / pointcloud_count / last_occupancy_revision
+//!   + `mapping_ready` 综合判定;参考 `00_最终执行方案.md` §5 Phase 7 任务 1。
+//!   缺 pointcloud (count==0) → mapping_ready=false,即便 odom_count > 0 也不算 ready。
 //!
 //! ## 为什么不用 XyzAccumulator
 //! - `nuwax_mapping::pointclouds::accumulators::XyzAccumulator::into_points(self)`
@@ -155,6 +158,10 @@ impl PointCloudAccumulator for FeedOnlyAccumulator {
 /// - `feed_pointcloud(&[Point3<f64>])` —— 喂入点云 (从 LCM /go2/lidar/points 解析)
 /// - `feed_pose(x, y, z)` —— 更新 sensor_origin (从 LCM /odom 解析)
 /// - `build_and_publish(&SharedState)` —— 生成 occupancy + costmap,写回 SharedState.map
+/// - `increment_odom_count() / increment_pointcloud_count() / increment_occupancy_revision()`
+///   —— `server.rs::publish_odom / publish_point_cloud` 同步累加计数
+///   (Phase 5 桥接层保持 feed_* 函数签名不变,只在 call site 加 +1)
+/// - `readiness()` —— 综合字段,给 Python diagnostics + runtime_diagnostics 对账
 pub struct MappingAdapter {
     config: MappingAdapterConfig,
     /// accumulator 字段需要 `pub(crate)` 让 `lcm_runtime::spawn_mapping_feed_tasks`
@@ -168,6 +175,10 @@ pub struct MappingAdapter {
     pub(crate) has_data: bool,
     /// occupancy grid 累计 revision(每次 build_and_publish 自增)
     revision: u64,
+    /// Phase 7:计数 odom / pointcloud / occupancy revision,给 readiness 暴露用。
+    /// 不参与 build_and_publish 写回 SharedState.map.revision 逻辑(那是 mapping 主路径)。
+    odom_count: u64,
+    pointcloud_count: u64,
 }
 
 impl MappingAdapter {
@@ -181,6 +192,8 @@ impl MappingAdapter {
             last_sensor_origin: [0.0, 0.0, 0.0],
             has_data: false,
             revision: 0,
+            odom_count: 0,
+            pointcloud_count: 0,
         }
     }
 
@@ -281,6 +294,125 @@ impl MappingAdapter {
     /// adapter 当前 revision(给 diagnostics / 调试用)。
     pub fn current_revision(&self) -> u64 {
         self.revision
+    }
+
+    // ============================================================================
+    // Phase 7:readiness counters + 综合 readiness 暴露
+    // ============================================================================
+    //
+    // 与 Phase 3 `feed_pointcloud / feed_pose` 业务路径解耦:
+    // server.rs `publish_odom` / `publish_point_cloud` 在调用 LCM publish 的同时
+    // 调 `increment_odom_count / increment_pointcloud_count`,由 readiness 统一聚合。
+    // 这样 mapping 主路径(feed_* + build_and_publish)与 readiness 诊断面分离:
+    // - 不动 feed_* 函数签名(Phase 5 占用约束)
+    // - 不动 build_and_publish 写回 SharedState.map.revision 业务
+    // - 只新增三个 +1 累加 + 一个 readiness struct
+
+    /// `publish_odom` 在 server.rs 调一次 +1
+    pub fn increment_odom_count(&mut self) {
+        self.odom_count = self.odom_count.saturating_add(1);
+    }
+
+    /// `publish_point_cloud` 在 server.rs 调一次 +1
+    pub fn increment_pointcloud_count(&mut self) {
+        self.pointcloud_count = self.pointcloud_count.saturating_add(1);
+    }
+
+    /// 真实 publish 后由 server.rs 同步触发,使 readiness.last_occupancy_revision
+    /// 反映"该 revision 已在 LCM wire 上"
+    pub fn increment_occupancy_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    /// odom 计数(对外只读)
+    pub fn odom_count(&self) -> u64 {
+        self.odom_count
+    }
+
+    /// pointcloud 计数(对外只读)
+    pub fn pointcloud_count(&self) -> u64 {
+        self.pointcloud_count
+    }
+}
+
+/// Mapping 板块 readiness 综合快照(Phase 7)。
+///
+/// 与 `NavigationReadinessDetail` / `ExplorationReadinessDetail` 对齐:
+/// `ready` 综合 bool + `last_error` 字段 + 各子项,Python 侧
+/// `get_mapping_diagnostics` 按字段名直接读。
+#[derive(Debug, Clone)]
+pub struct MappingReadiness {
+    /// 综合 ready(`has_data && pointcloud_count > 0`)
+    pub ready: bool,
+    /// 顶层 reason(中文 + 关键 blocker 标签)
+    pub reason: String,
+    /// LCM backend 是否可用
+    pub lcm_backend: bool,
+    /// adapter 是否已构造
+    pub adapter_present: bool,
+    /// 累计 odom 帧数
+    pub odom_count: u64,
+    /// 累计 pointcloud 帧数
+    pub pointcloud_count: u64,
+    /// 最近一次 occupancy grid revision
+    pub last_occupancy_revision: u64,
+    /// pointcloud 累计点数(给 frontend 决定要不要展示进度)
+    pub accumulated_point_count: usize,
+    /// 最近一次错误(若 lcm_backend=false / adapter 未构造等)
+    pub last_error: Option<String>,
+}
+
+impl MappingReadiness {
+    /// 综合判定:`has_data` + 真实 pointcloud 输入 + lcm_backend + adapter present
+    pub fn compute(
+        adapter: Option<&MappingAdapter>,
+        lcm_backend_available: bool,
+    ) -> Self {
+        let mut last_error: Option<String> = None;
+        if !lcm_backend_available {
+            last_error = Some("LCM backend 不可用,Mapping 板块输入被阻断".to_string());
+        }
+        let adapter_present = adapter.is_some();
+        let mut ready = false;
+        let (odom_count, pointcloud_count, last_occupancy_revision, accumulated_point_count) =
+            match adapter {
+                Some(a) => {
+                    if !a.has_data() && a.odom_count() == 0 && a.pointcloud_count() == 0 {
+                        last_error.get_or_insert_with(|| "尚未收到任何 odom / pointcloud 输入".to_string());
+                    } else if a.pointcloud_count() == 0 {
+                        last_error.get_or_insert_with(|| "尚未收到 pointcloud,仅有 odom 不算 ready".to_string());
+                    }
+                    (
+                        a.odom_count(),
+                        a.pointcloud_count(),
+                        a.current_revision(),
+                        a.accumulated_count(),
+                    )
+                }
+                None => {
+                    last_error.get_or_insert_with(|| "Mapping adapter 未构造(LCM backend 不可用)".to_string());
+                    (0, 0, 0, 0)
+                }
+            };
+        if lcm_backend_available && adapter_present {
+            ready = pointcloud_count > 0;
+        }
+        let reason = if ready {
+            "mapping 已就绪".to_string()
+        } else {
+            last_error.clone().unwrap_or_else(|| "mapping 未就绪".to_string())
+        };
+        Self {
+            ready,
+            reason,
+            lcm_backend: lcm_backend_available,
+            adapter_present,
+            odom_count,
+            pointcloud_count,
+            last_occupancy_revision,
+            accumulated_point_count,
+            last_error,
+        }
     }
 }
 
@@ -433,5 +565,92 @@ mod tests {
         assert_eq!(c.free_space_cost, 0);
         assert_eq!(c.lethal_cost, 254);
         assert_eq!(c.no_information_cost, 255);
+    }
+
+    // ========================================================================
+    // Phase 7:counters + readiness 综合
+    // ========================================================================
+
+    #[test]
+    fn counters_start_at_zero() {
+        let a = MappingAdapter::new(sample_config());
+        assert_eq!(a.odom_count(), 0);
+        assert_eq!(a.pointcloud_count(), 0);
+        assert_eq!(a.current_revision(), 0);
+    }
+
+    #[test]
+    fn increment_odom_count_advances_counter() {
+        let mut a = MappingAdapter::new(sample_config());
+        a.increment_odom_count();
+        a.increment_odom_count();
+        a.increment_odom_count();
+        assert_eq!(a.odom_count(), 3);
+    }
+
+    #[test]
+    fn increment_pointcloud_count_advances_counter() {
+        let mut a = MappingAdapter::new(sample_config());
+        for _ in 0..5 {
+            a.increment_pointcloud_count();
+        }
+        assert_eq!(a.pointcloud_count(), 5);
+    }
+
+    #[test]
+    fn increment_occupancy_revision_advances_field() {
+        let mut a = MappingAdapter::new(sample_config());
+        a.increment_occupancy_revision();
+        a.increment_occupancy_revision();
+        assert_eq!(a.current_revision(), 2);
+    }
+
+    #[test]
+    fn readiness_initial_state_unready() {
+        // adapter 未构造 → unready,无 pointcloud
+        let r = MappingReadiness::compute(None, true);
+        assert!(!r.ready);
+        assert!(!r.adapter_present);
+        assert!(!r.lcm_backend || r.lcm_backend);  // 仅覆盖字段本身
+        assert_eq!(r.odom_count, 0);
+        assert_eq!(r.pointcloud_count, 0);
+        assert!(r.last_error.is_some());
+    }
+
+    #[test]
+    fn readiness_with_only_odom_is_unready() {
+        let mut a = MappingAdapter::new(sample_config());
+        a.increment_odom_count();
+        let r = MappingReadiness::compute(Some(&a), true);
+        assert!(!r.ready, "缺 pointcloud 必须 unready");
+        assert_eq!(r.odom_count, 1);
+        assert_eq!(r.pointcloud_count, 0);
+        assert!(r.last_error.as_ref().unwrap().contains("pointcloud"));
+    }
+
+    #[test]
+    fn readiness_with_pointcloud_turns_ready() {
+        let mut a = MappingAdapter::new(sample_config());
+        a.feed_pointcloud(&[Point3::new(0.0, 0.0, 0.0)]);
+        a.increment_pointcloud_count();
+        a.increment_odom_count();
+        a.increment_occupancy_revision();
+        let r = MappingReadiness::compute(Some(&a), true);
+        assert!(r.ready);
+        assert_eq!(r.odom_count, 1);
+        assert_eq!(r.pointcloud_count, 1);
+        assert_eq!(r.last_occupancy_revision, 1);
+        assert_eq!(r.accumulated_point_count, 1);
+    }
+
+    #[test]
+    fn readiness_no_backend_is_unready() {
+        let mut a = MappingAdapter::new(sample_config());
+        a.feed_pointcloud(&[Point3::new(0.0, 0.0, 0.0)]);
+        a.increment_pointcloud_count();
+        let r = MappingReadiness::compute(Some(&a), false);
+        assert!(!r.ready);
+        assert!(!r.lcm_backend);
+        assert!(r.last_error.as_ref().unwrap().contains("backend"));
     }
 }

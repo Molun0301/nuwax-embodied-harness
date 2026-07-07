@@ -53,25 +53,33 @@ export NUWAX_LCM_CHANNEL_CMD_VEL="${NUWAX_LCM_CHANNEL_CMD_VEL:-/cmd_vel}"
 # --- 2.5 Dry-run 模式（必须在 binary 检查之前）：当 `NUWAX_DRY_RUN=1` 时只 echo
 # 启动命令与解析后的 env，不实际 nohup 启动 binary。用于 CI / 容器 / 开发机
 # sanity-check env 是否齐全（无需真实 cargo build 产物）。
+#
+# Phase 6 (codex-round3 R3-2)：dry-run 模式下不允许做文件系统操作。
+# dev 机的 home 是 /home/ml（不是 /home/unitree），LOG_DIR 默认会落到
+# /home/unitree/nuwax-robot-bridge，mkdir 会在 dev 上失败并 exit 1。
+# 把 mkdir 全部移到 dry-run 判读之后——dry-run 应该是纯 echo + env dump。
+echo "==> 启动 nuwax-geometry-runtime: ${NUWAX_GEOMETRY_RUNTIME_BINARY}"
+echo "    gRPC port=${NUWAX_GEOMETRY_RUNTIME_PORT} ready_file=${NUWAX_GEOMETRY_RUNTIME_READY_FILE}"
+echo "    LCM_URL=${NUWAX_LCM_URL:-<unset>} LCM_BACKEND=${NUWAX_LCM_BACKEND:-<unset>}"
+
+if [[ "${NUWAX_DRY_RUN:-0}" == "1" ]]; then
+  echo "==> NUWAX_DRY_RUN=1：仅 echo 启动命令，不实际 nohup binary，不创建任何目录。"
+  LOG_DIR="${NUWAX_LOG_DIR:-${REPO_ROOT}}"
+  LOG_FILE="${LOG_DIR}/nuwax_geometry_runtime.log"
+  echo "    binary=${NUWAX_GEOMETRY_RUNTIME_BINARY}"
+  echo "    log=${LOG_FILE}（dry-run 下不创建）"
+  echo "    全部 env:"
+  env | grep -E '^NUWAX_(GEOMETRY|LCM)' | sort || true
+  exit 0
+fi
+
+# 真实启动才创建 dir（dry-run 跳过，避免 dev 机上 mkdir 失败）
 mkdir -p "$(dirname "${NUWAX_GEOMETRY_RUNTIME_READY_FILE}")"
 rm -f "${NUWAX_GEOMETRY_RUNTIME_READY_FILE}"
 
 LOG_DIR="${NUWAX_LOG_DIR:-${REPO_ROOT}}"
 LOG_FILE="${LOG_DIR}/nuwax_geometry_runtime.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
-
-echo "==> 启动 nuwax-geometry-runtime: ${NUWAX_GEOMETRY_RUNTIME_BINARY}"
-echo "    gRPC port=${NUWAX_GEOMETRY_RUNTIME_PORT} ready_file=${NUWAX_GEOMETRY_RUNTIME_READY_FILE}"
-echo "    LCM_URL=${NUWAX_LCM_URL:-<unset>} LCM_BACKEND=${NUWAX_LCM_BACKEND:-<unset>}"
-
-if [[ "${NUWAX_DRY_RUN:-0}" == "1" ]]; then
-  echo "==> NUWAX_DRY_RUN=1：仅 echo 启动命令，不实际 nohup binary。"
-  echo "    binary=${NUWAX_GEOMETRY_RUNTIME_BINARY}"
-  echo "    log=${LOG_FILE}"
-  echo "    全部 env:"
-  env | grep -E '^NUWAX_(GEOMETRY|LCM)' | sort || true
-  exit 0
-fi
 
 # --- 3. 启动 runtime ---
 # Phase 0 收敛：env-only 启动契约。Rust main.rs 只读 env，不再传 CLI args。

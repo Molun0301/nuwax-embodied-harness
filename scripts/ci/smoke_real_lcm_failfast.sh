@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # scripts/ci/smoke_real_lcm_failfast.sh
 #
-# Phase 1 fail-fast smoke 守门:
+# Phase 0/1 fail-fast smoke 守门（已被 smoke_real_lcm_roundtrip.sh 取代为 NOT_RUN 降级路径）：
 #   验证 nuwax-geometry-runtime 在 NUWAX_LCM_BACKEND=real-lcm 启动时
 #   拒绝启动、不 fallback fake-lcm,并把 LCM_BACKEND_UNAVAILABLE 关键字
 #   输出到 stderr。
 #
+# 2026-07-07 Phase 8 降级（§5 Phase 0 任务 3）：
+#   此脚本在 real-LCM 通信完成前只能作 fail-fast 占位守门,real-LCM 通信完成后必须
+#   由 scripts/ci/smoke_real_lcm_roundtrip.sh 替代,本脚本仅保留为历史 evidence。
+#   若 real-LCM transport 已经实装（nuwax-transport real-lcm feature 落地）,
+#   本脚本不应再用于验收（fail-fast 不等于通信完成,违反 §12.6）。
+#
 # 退出码:
 #   0  - 验收通过(real-lcm 启动期被拒,stderr 含 LCM_BACKEND_UNAVAILABLE)
 #   1  - 验收失败(binary 不在 / 启动未拒绝 / 输出缺关键字)
-#
-# 失败模式:
-#   - binary 缺 → 提前 exit 1,提示先 cargo build
-#   - binary 启动但未拒 → exit 1
-#   - binary 拒但 stderr 缺 LCM_BACKEND_UNAVAILABLE → exit 1
 
 set -uo pipefail
 

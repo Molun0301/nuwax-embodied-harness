@@ -149,6 +149,9 @@ def _is_shutdown_guard_enabled() -> bool:
 
 # Phase 4 nav_runtime:`get_navigation_readiness` 把细分 readiness 子项
 # JSON 序列化塞到 `reason` 字段尾部。本模块把该 dict 在 Python 侧解析出来。
+# Phase 7 在此基础上新增 `backend` / `tf_count` / `costmap_revision` /
+# `cmd_vel_sink_ready` / `active_profile` 五个字段,下游 diagnostics
+# 调用方可逐一读取,不必 break 旧字段。
 _NAV_READINESS_FIELDS = (
     "lcm_backend",
     "tf",
@@ -158,6 +161,11 @@ _NAV_READINESS_FIELDS = (
     "profile",
     "module_node_count",
     "p1_native_profiles",
+    "backend",
+    "tf_count",
+    "costmap_revision",
+    "cmd_vel_sink_ready",
+    "active_profile",
 )
 
 
@@ -212,7 +220,33 @@ def _nav_readiness_disconnected_dict(message: str = "未连接") -> Dict[str, An
         "profile": None,
         "module_node_count": None,
         "p1_native_profiles": None,
+        # Phase 7 增量字段
+        "backend": None,
+        "tf_count": None,
+        "costmap_revision": None,
+        "cmd_vel_sink_ready": None,
+        "active_profile": None,
     }
+
+
+def _parse_readiness_message(message: str) -> Dict[str, Any]:
+    """把 Phase 7 gRPC `MappingReadiness.message` / `ExplorationReadiness.message`
+    中的 JSON 字符串解析为 dict。失败时返回空 dict(调用方负责补默认值)。
+
+    该 helper 与 `_parse_navigation_readiness_reason` 形状相似但 payload 不同:
+    - mapping: {lcm_backend, adapter_present, odom_count, pointcloud_count,
+                last_occupancy_revision, accumulated_point_count, last_error}
+    - exploration: {backend_available, controller_active, source_count,
+                    frontier_source_ready, costmap_input_ready,
+                    costmap_input_revision, active_source, arbitration}
+    """
+    try:
+        data = json.loads(message or "{}")
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
 
 
 def _normalize_frame(frame_id: str) -> str:
@@ -541,53 +575,79 @@ class GeometryRuntimeProvider:
     #   - get_exploration_diagnostics(): 探索板块(已在 Phase 5 实装,本阶段保留入口)
     # 任一方法失败都返回 None,绝不假成功。
     def get_mapping_diagnostics(self) -> Optional[Dict[str, Any]]:
-        """返回 mapping 板块 diagnostics dict(走 `HealthCheck` + `GetOccupancyGrid`)。
+        """返回 mapping 板块 diagnostics dict(Phase 7:走 `GetMappingReadiness`)。
+
+        Phase 7:不再只用 HealthCheck + GetOccupancyGrid 拼凑,直接走新增的
+        `GetMappingReadiness` RPC,`message` 字段为 JSON dict,涵盖
+        odom_count / pointcloud_count / last_occupancy_revision /
+        accumulated_point_count / last_error / adapter_present。
 
         字段:
-          - ``ready`` (bool): HealthCheck.healthy + occupancy grid 已发布
-          - ``lcm_backend`` (str): canonical LCM backend 名
-          - ``has_occupancy_grid`` (bool): 是否能从 occupancy grid meta 取到 revision
-          - ``occupancy_revision`` (int|None): 最近一帧 occupancy 修订号
-          - ``error`` (str|None): 失败原因
+          - ``ready`` (bool): 综合 ready(bool)
+          - ``lcm_backend`` (str): canonical LCM backend 名(从 message JSON 解析)
+          - ``adapter_present`` (bool): mapping adapter 是否已构造
+          - ``odom_count`` (int): 累计 odom 帧数
+          - ``pointcloud_count`` (int): 累计 pointcloud 帧数
+          - ``last_occupancy_revision`` (int): 最近 occupancy revision
+          - ``accumulated_point_count`` (int): accumulator 累计点数
+          - ``last_error`` (str|None): 失败原因
+          - ``error`` (str|None): RPC 层失败原因
 
         返回 None —— 子进程未连接。
         """
         if not self._connected or not self._stub:
             return None
+        # Phase 7:主路径走新增 GetMappingReadiness。
         try:
-            health = self._stub.HealthCheck(
-                pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
+            resp = self._stub.GetMappingReadiness(
+                pb2.Empty(), timeout=_read_deadline_sec()
             )
+            payload = self._parse_readiness_message(getattr(resp, "message", "") or "{}")
+            payload["ready"] = bool(getattr(resp, "ready", False))
+            payload["error"] = None
+            # fallback 字段名兼容旧调用方。
+            payload.setdefault("has_occupancy_grid", payload.get("last_occupancy_revision", 0) > 0)
+            payload.setdefault("occupancy_revision", payload.get("last_occupancy_revision"))
+            return payload
         except grpc.RpcError as e:
-            _log_rpc_error("HealthCheck(get_mapping_diagnostics)", e)
+            _log_rpc_error("GetMappingReadiness", e)
+            # 兜底:旧 HealthCheck + GetOccupancyGrid 路径,保持向后兼容。
+            try:
+                health = self._stub.HealthCheck(
+                    pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
+                )
+                lcm_backend = str(getattr(health, "lcm_backend", "") or "<unknown>")
+            except grpc.RpcError as e2:
+                _log_rpc_error("HealthCheck(get_mapping_diagnostics fallback)", e2)
+                return {
+                    "ready": False,
+                    "lcm_backend": "<unknown>",
+                    "odom_count": None,
+                    "pointcloud_count": None,
+                    "last_occupancy_revision": None,
+                    "accumulated_point_count": None,
+                    "adapter_present": None,
+                    "last_error": None,
+                    "has_occupancy_grid": False,
+                    "occupancy_revision": None,
+                    "error": "GetMappingReadiness+HealthCheck 失败: %s / %s" % (e, e2),
+                }
             return {
                 "ready": False,
-                "lcm_backend": "<unknown>",
+                "lcm_backend": lcm_backend,
+                "odom_count": None,
+                "pointcloud_count": None,
+                "last_occupancy_revision": None,
+                "accumulated_point_count": None,
+                "adapter_present": None,
+                "last_error": "GetMappingReadiness 不可用: %s" % e,
                 "has_occupancy_grid": False,
                 "occupancy_revision": None,
-                "error": "HealthCheck 失败: %s" % e,
+                "error": "GetMappingReadiness 失败: %s" % e,
             }
-        lcm_backend = str(getattr(health, "lcm_backend", "") or "<unknown>")
-        has_occupancy = False
-        occupancy_revision: Optional[int] = None
-        try:
-            grid_meta = self._stub.GetOccupancyGrid(
-                pb2.Empty(), timeout=_pose_deadline_sec()
-            )
-            has_occupancy = bool(getattr(grid_meta, "width", 0) > 0 and getattr(grid_meta, "height", 0) > 0)
-            occupancy_revision = int(getattr(grid_meta, "revision", 0) or 0) or None
-        except grpc.RpcError as e:
-            _log_rpc_error("GetOccupancyGrid(get_mapping_diagnostics)", e)
-        return {
-            "ready": bool(getattr(health, "healthy", False)) and has_occupancy,
-            "lcm_backend": lcm_backend,
-            "has_occupancy_grid": has_occupancy,
-            "occupancy_revision": occupancy_revision,
-            "error": None,
-        }
 
     def get_navigation_diagnostics(self) -> Optional[Dict[str, Any]]:
-        """返回 navigation 板块 diagnostics dict(走 `HealthCheck` + `GetNavigationReadiness`)。
+        """返回 navigation 板块 diagnostics dict(走 `GetNavigationReadiness`)。
 
         字段:
           - ``ready`` (bool): nuwax nav_runtime + lcm backend 都健康
@@ -595,9 +655,13 @@ class GeometryRuntimeProvider:
           - ``readiness`` (dict): `GetNavigationReadiness` 解析后字段
             (ready/message/lcm_backend/tf/costmap/planner/cmd_vel_sink/profile/
              module_node_count/p1_native_profiles)
-          - ``profile`` (str|None): 当前 nav profile(由 readiness.profile 提取)
-          - ``module_node_count`` (int|None): NavStack module graph 节点数
-          - ``p1_native_profiles`` (list|None): 本期未启用的 native profile 列表
+          - ``profile`` / ``active_profile`` (str|None): 当前 nav profile
+            (Phase 7 兼容旧 `profile` + 新 `active_profile`)
+          - ``backend`` (str|None): "RealLcm" / "FakeLcm" / "Unknown"
+          - ``tf_count`` (int|None): 累计 tf 帧数
+          - ``costmap_revision`` (int|None): 当前 occupancy revision
+          - ``cmd_vel_sink_ready`` (bool|None): cmd_vel consumer + watchdog 状态
+          - ``module_node_count`` / ``p1_native_profiles``: 兼容旧字段
           - ``error`` (str|None): 失败原因
 
         返回 None —— 子进程未连接。
@@ -617,17 +681,33 @@ class GeometryRuntimeProvider:
                 "lcm_backend": "<unknown>",
                 "readiness": None,
                 "profile": None,
+                "active_profile": None,
+                "backend": None,
+                "tf_count": None,
+                "costmap_revision": None,
+                "cmd_vel_sink_ready": None,
                 "module_node_count": None,
                 "p1_native_profiles": None,
                 "error": "HealthCheck 失败: %s" % e,
             }
         readiness = self.get_navigation_readiness()
         profile = readiness.get("profile") if isinstance(readiness, dict) else None
+        active_profile = (
+            readiness.get("active_profile") if isinstance(readiness, dict) else None
+        ) or profile
         module_node_count = (
             readiness.get("module_node_count") if isinstance(readiness, dict) else None
         )
         p1_native_profiles = (
             readiness.get("p1_native_profiles") if isinstance(readiness, dict) else None
+        )
+        backend = readiness.get("backend") if isinstance(readiness, dict) else None
+        tf_count = readiness.get("tf_count") if isinstance(readiness, dict) else None
+        costmap_revision = (
+            readiness.get("costmap_revision") if isinstance(readiness, dict) else None
+        )
+        cmd_vel_sink_ready = (
+            readiness.get("cmd_vel_sink_ready") if isinstance(readiness, dict) else None
         )
         return {
             "ready": bool(getattr(health, "healthy", False)) and bool(
@@ -636,6 +716,11 @@ class GeometryRuntimeProvider:
             "lcm_backend": lcm_backend,
             "readiness": readiness,
             "profile": profile,
+            "active_profile": active_profile,
+            "backend": backend,
+            "tf_count": tf_count,
+            "costmap_revision": costmap_revision,
+            "cmd_vel_sink_ready": cmd_vel_sink_ready,
             "module_node_count": module_node_count,
             "p1_native_profiles": p1_native_profiles,
             "error": None,
@@ -1092,41 +1177,79 @@ class GeometryRuntimeProvider:
             return None
 
     def get_exploration_diagnostics(self) -> Optional[Dict[str, Any]]:
-        """读取探索 diagnostics(active/arbitration/sources/frontier_count)。
+        """读取探索 diagnostics(Phase 7:主路径走新增的 `GetExplorationReadiness`)。
 
-        返回 dict 字段: active / arbitration / selected_source / last_stop_reason /
-        sources(list) / frontier_count / revision / timestamp_ns。
+        返回 dict 字段:
+          - 旧字段(active / arbitration / selected_source / last_stop_reason /
+            sources(list) / frontier_count / revision / timestamp_ns)
+          - Phase 7 readiness 字段(ready / backend_available / controller_active /
+            source_count / frontier_source_ready / costmap_input_ready /
+            costmap_input_revision / active_source / message)
+
         失败时返回 None。
         """
         self._raise_if_stopping("get_exploration_diagnostics")
         if not self._stub:
             return None
+        # Phase 7:主路径走 GetExplorationReadiness(JSON message)。
         try:
-            resp = self._stub.GetExplorationDiagnostics(
+            resp = self._stub.GetExplorationReadiness(
                 pb2.Empty(), timeout=_read_deadline_sec()
             )
-            sources = [
-                {
-                    "source_name": s.source_name,
-                    "is_active": bool(s.is_active),
-                    "last_goal_id": s.last_goal_id,
-                    "last_error": s.last_error,
-                }
-                for s in resp.sources
-            ]
-            return {
-                "active": bool(resp.active),
-                "arbitration": resp.arbitration,
-                "selected_source": resp.selected_source,
-                "last_stop_reason": resp.last_stop_reason,
-                "sources": sources,
-                "frontier_count": int(resp.frontier_count),
-                "revision": int(resp.revision),
-                "timestamp_ns": int(resp.timestamp_ns),
-            }
+            payload = _parse_readiness_message(getattr(resp, "message", "") or "{}")
+            payload["ready"] = bool(getattr(resp, "ready", False))
+            # 兼容旧字段(snake_case → 已有 Python 调用方)
+            payload.setdefault("backend_available", payload.get("backend_available"))
+            payload.setdefault("controller_active", payload.get("controller_active"))
+            payload.setdefault("active_source", payload.get("active_source"))
+            payload.setdefault("sources", [])
+            payload.setdefault("frontier_count", 0)
+            payload.setdefault("selected_source", payload.get("active_source", ""))
+            payload.setdefault("last_stop_reason", "")
+            payload.setdefault("revision", payload.get("costmap_input_revision"))
+            payload.setdefault("timestamp_ns", 0)
+            payload.setdefault("arbitration", payload.get("arbitration"))
+            payload["error"] = None
+            return payload
         except grpc.RpcError as e:
-            _log_rpc_error("GetExplorationDiagnostics", e)
-            return None
+            _log_rpc_error("GetExplorationReadiness", e)
+            # 兜底:旧 GetExplorationDiagnostics。
+            try:
+                resp = self._stub.GetExplorationDiagnostics(
+                    pb2.Empty(), timeout=_read_deadline_sec()
+                )
+                sources = [
+                    {
+                        "source_name": s.source_name,
+                        "is_active": bool(s.is_active),
+                        "last_goal_id": s.last_goal_id,
+                        "last_error": s.last_error,
+                    }
+                    for s in resp.sources
+                ]
+                return {
+                    "ready": bool(resp.active),
+                    "active": bool(resp.active),
+                    "backend_available": None,
+                    "controller_active": bool(resp.active),
+                    "source_count": len(sources),
+                    "frontier_source_ready": bool(resp.active) and len(sources) > 0,
+                    "costmap_input_ready": False,
+                    "costmap_input_revision": 0,
+                    "active_source": resp.selected_source,
+                    "arbitration": resp.arbitration,
+                    "selected_source": resp.selected_source,
+                    "last_stop_reason": resp.last_stop_reason,
+                    "sources": sources,
+                    "frontier_count": int(resp.frontier_count),
+                    "revision": int(resp.revision),
+                    "timestamp_ns": int(resp.timestamp_ns),
+                    "message": "Phase 6 fallback: GetExplorationReadiness 不可用",
+                    "error": "GetExplorationReadiness 失败: %s" % e,
+                }
+            except grpc.RpcError as e2:
+                _log_rpc_error("GetExplorationDiagnostics", e2)
+                return None
 
     # === 输入桥 ===
     # Rust proto PublishOdom 接受 PublishOdomRequest（仅 pose 字段；速度由 nuwax-nav-stack

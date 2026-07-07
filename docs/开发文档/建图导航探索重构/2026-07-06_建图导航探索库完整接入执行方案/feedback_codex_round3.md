@@ -12,17 +12,18 @@ commit 总数。
 
 ```
 $ git rev-list --count c30d6c2..HEAD
-41
+42
 
 $ git log -1 --format="%H"
-096cf5e14ea310052bc584e00a59e56a80fe92ac  # chore(codex-r3): no_ros2_residual.allowlist 同步 Phase 6 (R3-4) 行号漂移（落盘后 HEAD）
+73347b7012f6f8c6ad796f9961520c4022868c79  # docs(codex-r3-追写): feedback_codex_round3.md 落盘后 §0/§6 commit 总数修正（落盘后 HEAD）
 
 $ find docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/ -name "*.md" | wc -l
 30
 ```
 
-41 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 6 (codex round3，
-本批次 6 个 R3-1/R3-2/R3-3/R3-4/R3-5/R3-6 + 1 个 allowlist 行号漂移)。
+42 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 7 (codex round3，
+本批次 6 个 R3-1/R3-2/R3-3/R3-4/R3-5/R3-6 + 1 个 allowlist 行号漂移 + 1 个 docs
+追写 commit)。
 
 **md 文件数**：30/30（执行方案 1 + phase 反馈 8 + todolist 8 + feedback 13
 含本文件 + 中间备份 0）。feedback 13 = phase0-7 = 8 + codex round1/2/3 = 3 +
@@ -316,11 +317,11 @@ b659534 chore(codex-r3-R3-4): cargo clippy dead_code/style 收敛 49 → 0 个 e
 
 ```
 $ git rev-list --count c30d6c2..HEAD
-41
+42
 
 $ find docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/ -name "*.md" | wc -l
 30
 ```
 
-41 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 6
-(codex round3, 含 allowlist 行号漂移 commit)。
+42 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 7
+(codex round3, 含 allowlist 行号漂移 commit + 本 docs 追写 commit)。

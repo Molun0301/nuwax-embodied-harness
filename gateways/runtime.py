@@ -50,8 +50,21 @@ from gateways.errors import GatewayError
 from gateways.request_context import categorize_gateway_error
 from gateways.serialization import to_jsonable
 from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider
+from providers import StreamingLocalizationProvider, StreamingPointCloudProvider
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
+# Phase 5/6 lifecycle 接线（lane-5）：
+#   - RuntimeInputBridge 把 Go2 sensor producer -> GeometryRuntimeProvider gRPC publisher
+#   - LcmMotionCommandBridge 把 real LCM /cmd_vel -> Go2 MotionControl
+# 两个 bridge 仅在此处 import 与 start/stop 装配，不修改桥内部实现（lane-5/lane-6 占用）。
+from services.geometry.runtime_input_bridge import (
+    RuntimeInputBridge,
+    build_default_runtime_input_bridge,
+)
+from services.navigation.lcm_motion_command_bridge import (
+    Go2TwistSinkAdapter,
+    LcmMotionCommandBridge,
+)
 from services.geometry import (
     CloudMapMmapReader,
     PlatformGeometryRuntime,
@@ -715,6 +728,15 @@ class GatewayRuntime:
             self.register_default_capabilities()
             self.register_default_skills()
 
+        # === Phase 5/6 lifecycle 接线字段（lane-5）===
+        # ``_input_bridge`` 在 ``_ensure_geometry_runtime_started`` 完成（即
+        # ``platform_geometry_runtime.start()`` + Rust gRPC 已连）后才构造并启动；
+        # 之前保持 None，避免拿到未连的 ``_remote_provider``。
+        # ``_motion_bridge`` 在 ``start()`` 末尾构造并启动，不依赖 geometry runtime。
+        self._input_bridge: Optional[RuntimeInputBridge] = None
+        self._motion_bridge: Optional[LcmMotionCommandBridge] = None
+        self._motion_bridge_errors: List[str] = []
+
     def start(self) -> None:
         """启动宿主机运行时。"""
 
@@ -749,6 +771,12 @@ class GatewayRuntime:
         self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
         self._refresh_dynamic_capability_matrix()
 
+        # Phase 6 lifecycle 接线（lane-5）：在 sensor producer / perception_video_runtime 之后启动
+        # ``LcmMotionCommandBridge``，使 ``/cmd_vel`` consumer 早于任何导航 goal 准备就绪。
+        # plan §13.3.5：startup 顺序 = sensor producer → real LCM → bridge.start() → 接受 goal。
+        # 这里不依赖 geometry runtime（motion bridge 不调 gRPC），独立启停。
+        self._start_motion_command_bridge()
+
         self.event_bus.publish(
             self.event_bus.build_event(
                 "system.gateway_started",
@@ -781,6 +809,14 @@ class GatewayRuntime:
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
             self._stop_safety_watchdog_loop()
             self.safety_guard.stop_all_motion("宿主机网关关闭。")
+            # plan §13.3.5 shutdown 顺序（lane-5 接线）：
+            #   1) motion_bridge.stop() —— zero-stop → unsubscribe LCM → join threads
+            #   2) input_bridge.stop()  —— 注销 provider callbacks（不调 gRPC）
+            #   3) 再走原有 grpc-unavailable 安全顺序（geometry → task_manager → ...）
+            # 这两步不调 gRPC，因此放在 platform_geometry_runtime.stop() 之前无副作用，
+            # 同时让 motion watchdog 的 zero-stop 在 navigation 链路彻底下线前完成。
+            self._stop_motion_command_bridge()
+            self._stop_runtime_input_bridge()
             # 顺序：先关 geometry 子进程与 gRPC 通道，
             # 再让 task_manager 失活并等待 task 退出。
             self.platform_geometry_runtime.stop()
@@ -8043,6 +8079,108 @@ class GatewayRuntime:
             request_context=request_context,
         )
 
+    # ------------------------------------------------------------------
+    # Phase 5/6 lifecycle 接线（lane-5）：
+    # 在 GatewayRuntime 启动/停止链中装配 RuntimeInputBridge 与 LcmMotionCommandBridge。
+    # 严格遵守 plan §13.3.5：
+    #   startup:  sensor producer → gRPC 远程 provider 就绪 → input_bridge.start()
+    #             → motion_bridge.start() → 接受 SetNavigationGoal
+    #   shutdown: motion_bridge.stop()（zero → unsubscribe → join）→
+    #             input_bridge.stop()（注销 provider callback）→
+    #             platform_geometry_runtime.stop()（gRPC stop）→
+    #             原 grpc-unavailable 收尾链
+    # ------------------------------------------------------------------
+
+    def _start_runtime_input_bridge(self) -> None:
+        """构造并启动 RuntimeInputBridge；要求 geometry runtime 已连。"""
+
+        if self._input_bridge is not None:
+            return
+        remote_provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
+        if remote_provider is None:
+            RUNTIME_LOGGER.warning(
+                "RuntimeInputBridge: geometry runtime 尚未就绪，跳过本轮启动。",
+            )
+            return
+        providers = getattr(self.robot, "providers", None)
+        localization_provider = providers if providers is not None and isinstance(
+            providers, StreamingLocalizationProvider
+        ) else None
+        point_cloud_provider = providers if providers is not None and isinstance(
+            providers, StreamingPointCloudProvider
+        ) else None
+        bridge = build_default_runtime_input_bridge(
+            runtime_provider=remote_provider,
+            localization_provider=localization_provider,
+            point_cloud_provider=point_cloud_provider,
+        )
+        if not bridge.start():
+            status = bridge.get_status()
+            RUNTIME_LOGGER.warning(
+                "RuntimeInputBridge 启动失败 readiness=false counters=%s",
+                status.get("counters"),
+            )
+            return
+        self._input_bridge = bridge
+        RUNTIME_LOGGER.info(
+            "RuntimeInputBridge 已接入 gateway lifecycle "
+            "(localization=%s, pointcloud=%s)。",
+            localization_provider is not None,
+            point_cloud_provider is not None,
+        )
+
+    def _stop_runtime_input_bridge(self) -> None:
+        """注销 RuntimeInputBridge 订阅，幂等。"""
+
+        bridge = self._input_bridge
+        if bridge is None:
+            return
+        try:
+            bridge.stop()
+        except Exception:
+            RUNTIME_LOGGER.exception("RuntimeInputBridge.stop 异常。")
+        finally:
+            self._input_bridge = None
+
+    def _start_motion_command_bridge(self) -> None:
+        """构造并启动 LcmMotionCommandBridge；与 geometry runtime 解耦。"""
+
+        if self._motion_bridge is not None:
+            return
+        providers = getattr(self.robot, "providers", None)
+        if not isinstance(providers, MotionControl):
+            RUNTIME_LOGGER.info(
+                "LcmMotionCommandBridge 跳过：当前 robot.providers 不实现 MotionControl。",
+            )
+            return
+        sink_adapter = Go2TwistSinkAdapter(providers)
+        bridge = LcmMotionCommandBridge(twist_sink=sink_adapter)
+        try:
+            bridge.start()
+        except Exception as exc:
+            self._motion_bridge_errors.append(f"start failed: {exc}")
+            RUNTIME_LOGGER.exception("LcmMotionCommandBridge.start 失败：%s", exc)
+            return
+        self._motion_bridge = bridge
+        RUNTIME_LOGGER.info(
+            "LcmMotionCommandBridge 已接入 gateway lifecycle channel=%s url=%s。",
+            bridge.channel,
+            bridge.lcm_url,
+        )
+
+    def _stop_motion_command_bridge(self) -> None:
+        """按 plan §13.3.5 顺序：zero-stop → unsubscribe LCM → join threads。"""
+
+        bridge = self._motion_bridge
+        if bridge is None:
+            return
+        try:
+            bridge.stop(timeout=1.0)
+        except Exception:
+            RUNTIME_LOGGER.exception("LcmMotionCommandBridge.stop 异常。")
+        finally:
+            self._motion_bridge = None
+
     def _safe_stop_robot(self, reason: Optional[str]) -> None:
         providers = getattr(self.robot, "providers", None)
         if isinstance(providers, SafetyProvider):
@@ -8511,6 +8649,12 @@ class GatewayRuntime:
                     jsonrpc_code=-32010,
                     details={"capability_name": capability_name},
                 ) from exc
+            # Phase 5 lifecycle 接线（lane-5）：platform_geometry_runtime.start() 完成后，
+            # Rust gRPC 远程 provider 已就绪；此刻才构造并启动 RuntimeInputBridge，把
+            # sensor producer 的 localization/pointcloud 回调真正转译为 PublishOdom /
+            # PublishPointCloud。stop 时在 stop() 中早于 platform_geometry_runtime.stop()
+            # 先停，避免 callback 仍在运行而 gRPC 已下线。
+            self._start_runtime_input_bridge()
             event.set()
             with self._geometry_runtime_lock:
                 self._geometry_runtime_start_event = None

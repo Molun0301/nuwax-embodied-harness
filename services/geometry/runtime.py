@@ -617,6 +617,22 @@ class PlatformGeometryRuntime:
             return providers
         return None
 
+    def get_geometry_runtime_provider(self) -> Optional["GeometryRuntimeProvider"]:
+        """返回当前 Rust gRPC 远程 provider，未连/未启时返回 None。
+
+        生命周期说明：仅当 ``start()`` 成功完成 ``_start_geometry_runtime_subprocess`` 后
+        才会有非 None 实例；调用方（gateway runtime）必须按 §13.3.5 顺序在
+        ``PlatformGeometryRuntime.start()`` 之后再使用。
+        """
+        with self._runtime_state_lock:
+            provider = self._remote_provider
+        if provider is None:
+            return None
+        connected = getattr(provider, "is_connected", None)
+        if callable(connected) and not bool(connected()):
+            return None
+        return provider
+
     def stop(self) -> None:
         """停止平台几何运行时。"""
 

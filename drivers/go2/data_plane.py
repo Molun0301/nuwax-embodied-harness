@@ -100,6 +100,15 @@ def _load_go2_official_sdk_modules(
             unitree_go_dds_module = importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_")
             modules["ChannelSubscriber"] = getattr(channel_module, "ChannelSubscriber")
             modules["SportModeState"] = getattr(unitree_go_dds_module, "SportModeState_")
+            # sensor_msgs/PointCloud2 用于 DirectDDS 点云订阅；缺失则 point_cloud_enabled
+            # 启动时记录到 point_cloud_bridge_last_error，避免 silent fallback。
+            try:
+                sensor_pc_module = importlib.import_module(
+                    "unitree_sdk2py.idl.sensor_msgs.msg.dds_"
+                )
+                modules["PointCloud2"] = getattr(sensor_pc_module, "PointCloud2_")
+            except Exception as exc:
+                LOGGER.debug("导入 unitree_sdk2py PointCloud2 失败：%s", exc)
         return modules
     except Exception as exc:
         LOGGER.warning("导入 Go2 官方 SDK 模块失败：%s", exc)
@@ -117,6 +126,8 @@ class Go2DirectDdsBridge:
         self._direct_dds_stop_event = threading.Event()
         self._direct_dds_threads: List[threading.Thread] = []
         self._direct_pose_subscriber = None
+        self._direct_point_cloud_subscriber = None
+        self._direct_point_cloud_msg_type = None
         self._latest_pose_from_dds: Optional[Pose] = None
         self._latest_imu_state_from_dds: Optional[IMUState] = None
         self._latest_local_point_cloud: Optional[PointCloudFrame] = None
@@ -129,6 +140,10 @@ class Go2DirectDdsBridge:
         self._direct_pose_ready = False
         self._direct_imu_ready = False
         self._direct_point_cloud_ready = False
+        # Phase 5：点云 bridge 错误显式记录，禁止 silent fallback。
+        self._point_cloud_bridge_last_error: Optional[str] = None
+        self._point_cloud_bridge_last_error_at: Optional[float] = None
+        self._point_cloud_bridge_topic: str = ""
 
     def start(self) -> None:
         if self._started:
@@ -219,7 +234,16 @@ class Go2DirectDdsBridge:
                 "imu_source_topic": self._latest_imu_source_topic,
                 "point_cloud_source_topic": self._latest_point_cloud_source_topic,
                 "latest_point_cloud_points": self._latest_local_point_cloud.point_count if self._latest_local_point_cloud is not None else 0,
+                # Phase 5：§13.4 要求 status 暴露这些字段。
+                "point_cloud_bridge_topic": self._point_cloud_bridge_topic,
+                "point_cloud_bridge_last_error": self._point_cloud_bridge_last_error,
+                "point_cloud_bridge_last_error_at_monotonic": self._point_cloud_bridge_last_error_at,
             }
+
+    def _record_point_cloud_bridge_error(self, message: str) -> None:
+        with self._lock:
+            self._point_cloud_bridge_last_error = str(message)
+            self._point_cloud_bridge_last_error_at = time.monotonic()
 
     def _start_direct_dds_backend(self) -> None:
         if not getattr(self.config, "direct_dds", None) or not self.config.direct_dds.enabled:
@@ -241,6 +265,7 @@ class Go2DirectDdsBridge:
             LOGGER.warning("初始化 Go2 官方 DDS 直连失败：%s", exc)
             return
 
+        point_cloud_enabled = bool(self.config.direct_dds.point_cloud_enabled)
         try:
             subscriber_class = modules["ChannelSubscriber"]
             self._direct_pose_subscriber = subscriber_class(
@@ -248,9 +273,37 @@ class Go2DirectDdsBridge:
                 modules["SportModeState"],
             )
             self._direct_pose_subscriber.Init()
-            LOGGER.info("SDK 点云订阅已禁用，由 Rust bridge 直接订阅 Go2 原生 ROS2 话题")
+
+            self._direct_point_cloud_subscriber = None
+            self._direct_point_cloud_msg_type = None
+            if point_cloud_enabled:
+                point_cloud_type = modules.get("PointCloud2")
+                if point_cloud_type is None:
+                    message = (
+                        "Go2 DirectDDS 点云已启用，但 unitree_sdk2py PointCloud2 类型不可用；"
+                        " 请检查 unitree_sdk2py.idl.sensor_msgs.msg.dds_ 是否被安装。"
+                    )
+                    LOGGER.warning(message)
+                    self._record_point_cloud_bridge_error(message)
+                else:
+                    self._direct_point_cloud_msg_type = point_cloud_type
+                    self._direct_point_cloud_subscriber = subscriber_class(
+                        self.config.direct_dds.point_cloud_topic,
+                        point_cloud_type,
+                    )
+                    self._direct_point_cloud_subscriber.Init()
+                    LOGGER.info(
+                        "Go2 DirectDDS 点云订阅已启动：topic=%s",
+                        self.config.direct_dds.point_cloud_topic,
+                    )
+            else:
+                LOGGER.info(
+                    "Go2 DirectDDS 点云订阅未启用：config.direct_dds.point_cloud_enabled=false，"
+                    "需要启用该开关并保证 unitree SDK 提供 sensor_msgs/PointCloud2 IDL。"
+                )
         except Exception as exc:
             LOGGER.warning("初始化 Go2 官方 DDS 订阅器失败：%s", exc)
+            self._record_point_cloud_bridge_error(f"DirectDDS 订阅器初始化失败：{exc}")
             self._direct_pose_subscriber = None
             return
 
@@ -258,6 +311,14 @@ class Go2DirectDdsBridge:
         self._direct_dds_threads = [
             threading.Thread(target=self._direct_pose_reader_loop, name="go2_direct_pose_reader", daemon=True),
         ]
+        if self._direct_point_cloud_subscriber is not None:
+            self._direct_dds_threads.append(
+                threading.Thread(
+                    target=self._direct_point_cloud_reader_loop,
+                    name="go2_direct_point_cloud_reader",
+                    daemon=True,
+                )
+            )
         for thread in self._direct_dds_threads:
             thread.start()
         self._direct_dds_started = True
@@ -274,6 +335,13 @@ class Go2DirectDdsBridge:
             except Exception:
                 LOGGER.debug("关闭 Go2 官方 DDS 订阅器失败。", exc_info=True)
         self._direct_pose_subscriber = None
+        if self._direct_point_cloud_subscriber is not None:
+            try:
+                self._direct_point_cloud_subscriber.Close()
+            except Exception:
+                LOGGER.debug("关闭 Go2 官方 DDS 点云订阅器失败。", exc_info=True)
+        self._direct_point_cloud_subscriber = None
+        self._direct_point_cloud_msg_type = None
         self._direct_dds_started = False
 
     def _direct_pose_reader_loop(self) -> None:
@@ -364,6 +432,109 @@ class Go2DirectDdsBridge:
                 z=float(accelerometer[2]),
             ),
         )
+
+    # ------------------------------------------------------------------
+    # PointCloud2 订阅循环
+    # ------------------------------------------------------------------
+
+    def _direct_point_cloud_reader_loop(self) -> None:
+        """Go2 官方 sensor_msgs/PointCloud2 直订阅循环。
+
+        Phase 5 硬要求：必须真正填充 ``_latest_local_point_cloud`` 与 ``_point_cloud_callbacks``，
+        不能用「Rust bridge 直接订阅 Go2 原生 ROS2 话题」作为完成路径（该注释已删除）。
+        如果订阅器或消息类型不可用，``_start_direct_dds_backend`` 在启动时记录错误并跳过本线程。
+        """
+        timeout_sec = float(getattr(self.config.direct_dds, "read_timeout_sec", 0.5))
+        source_topic = f"dds:{self.config.direct_dds.point_cloud_topic}"
+        with self._lock:
+            self._point_cloud_bridge_topic = self.config.direct_dds.point_cloud_topic
+        while not self._direct_dds_stop_event.is_set():
+            subscriber = self._direct_point_cloud_subscriber
+            if subscriber is None:
+                return
+            try:
+                sample = subscriber.Read(timeout_sec)
+            except Exception as exc:
+                LOGGER.debug("读取 Go2 官方 DDS 点云失败。", exc_info=True)
+                self._record_point_cloud_bridge_error(f"PointCloud2 Read 异常：{exc}")
+                time.sleep(0.1)
+                continue
+            if sample is None:
+                continue
+            try:
+                self._on_point_cloud_message(sample, source_topic=source_topic)
+            except Exception as exc:
+                LOGGER.debug("分发 Go2 DDS 点云失败。", exc_info=True)
+                self._record_point_cloud_bridge_error(f"PointCloud2 callback 异常：{exc}")
+
+    def _on_point_cloud_message(self, message: object, *, source_topic: str) -> None:
+        """把 ``sensor_msgs/PointCloud2`` IDL 解析为 ``PointCloudFrame`` 并分发。"""
+        data = bytes(getattr(message, "data", b"") or b"")
+        point_step = int(getattr(message, "point_step", 0) or 0)
+        width = int(getattr(message, "width", 0) or 0)
+        height = int(getattr(message, "height", 0) or 0)
+        is_bigendian = bool(getattr(message, "is_bigendian", False))
+        is_dense = bool(getattr(message, "is_dense", True))
+
+        if not data:
+            self._record_point_cloud_bridge_error("PointCloud2 message.data 为空")
+            return
+        if point_step <= 0:
+            # 兜底：假定 xyz float32 little-endian
+            point_step = 12
+        if is_bigendian:
+            # 当前 LCM/Rust 端只接受 little-endian；这里记录一次并跳过本帧，避免 silent fallback。
+            self._record_point_cloud_bridge_error(
+                f"PointCloud2 is_bigendian=True 不被支持，跳过 frame topic={source_topic}"
+            )
+            return
+
+        xyz_array: Optional[np.ndarray] = None
+        try:
+            count = len(data) // point_step
+            if count <= 0:
+                self._record_point_cloud_bridge_error(
+                    f"PointCloud2 data/point_step 比例异常 data={len(data)} step={point_step}"
+                )
+                return
+            flat = np.frombuffer(data, dtype=np.float32, count=count * 3).reshape(count, 3)
+            xyz_array = np.ascontiguousarray(flat)
+        except Exception as exc:
+            self._record_point_cloud_bridge_error(f"PointCloud2 ndarray 解析失败：{exc}")
+            return
+
+        frame_id = str(getattr(self.config, "expected_odom_frame", "") or "odom")
+        try:
+            point_cloud = PointCloudFrame(
+                frame_id=frame_id,
+                point_count=int(xyz_array.shape[0]),
+                fields=[],
+                points=[],
+                points_xyz_array=xyz_array,
+                is_dense=is_dense,
+                metadata={
+                    "source_topic": source_topic,
+                    "width": width,
+                    "height": height,
+                    "point_step": point_step,
+                    "source": "go2_direct_dds_pointcloud",
+                },
+            )
+        except Exception as exc:
+            self._record_point_cloud_bridge_error(f"PointCloudFrame 构造失败：{exc}")
+            return
+
+        with self._lock:
+            self._latest_local_point_cloud = point_cloud
+            self._latest_point_cloud_source_topic = source_topic
+            self._direct_point_cloud_ready = True
+            callbacks = tuple(self._point_cloud_callbacks.values())
+
+        for callback in callbacks:
+            try:
+                callback(point_cloud.model_copy(deep=False))
+            except Exception:
+                LOGGER.debug("分发 Go2 DDS 点云回调失败。", exc_info=True)
 
 
 @dataclass

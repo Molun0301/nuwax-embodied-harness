@@ -5,7 +5,7 @@ import warnings
 
 from . import geometry_runtime_pb2 as geometry__runtime__pb2
 
-GRPC_GENERATED_VERSION = '1.82.0'
+GRPC_GENERATED_VERSION = '1.70.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,14 +18,14 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in geometry_runtime_pb2_grpc.py depends on'
+        + f' but the generated code in geometry_runtime_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
 
 
-class GeometryRuntimeStub:
+class GeometryRuntimeStub(object):
     """============================================================================
     服务定义：GeometryRuntime gRPC facade
     ============================================================================
@@ -174,7 +174,7 @@ class GeometryRuntimeStub:
                 _registered_method=True)
 
 
-class GeometryRuntimeServicer:
+class GeometryRuntimeServicer(object):
     """============================================================================
     服务定义：GeometryRuntime gRPC facade
     ============================================================================
@@ -506,7 +506,7 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class GeometryRuntime:
+class GeometryRuntime(object):
     """============================================================================
     服务定义：GeometryRuntime gRPC facade
     ============================================================================

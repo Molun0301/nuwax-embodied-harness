@@ -115,6 +115,23 @@ message NavigationReadiness {
   string reason = 2;
 }
 
+// Phase 7: 三套 readiness 字段打包 message(JSON 字符串给 Python 解析)。
+// 与 `NavigationReadiness.reason` 同模式:把综合判定 + 各子项字段 JSON 化
+// 塞进 message,Python 端用 dict 解码对应字段。
+message MappingReadiness {
+  bool ready = 1;
+  string message = 2;  // JSON: {lcm_backend, adapter_present, odom_count,
+                       //      pointcloud_count, last_occupancy_revision,
+                       //      accumulated_point_count, last_error}
+}
+message ExplorationReadiness {
+  bool ready = 1;
+  string message = 2;  // JSON: {backend_available, controller_active,
+                        //      source_count, frontier_source_ready,
+                        //      costmap_input_ready, costmap_input_revision,
+                        //      active_source, arbitration}
+}
+
 // === 探索 ===
 message Frontier {
   Pose pose = 1;
@@ -198,6 +215,11 @@ service GeometryRuntime {
   rpc CancelNavigation(CancelNavigationRequest) returns (NavigationState);
   rpc SubscribeNavigationState(Empty) returns (stream NavigationState);
   rpc GetNavigationReadiness(Empty) returns (NavigationReadiness);
+
+  // Phase 7: mapping + exploration readiness(各板块独立 RPC,message JSON 解析)。
+  // 详见 `mapping_adapter::MappingReadiness` / `explore_runtime::ExplorationReadinessDetail`。
+  rpc GetMappingReadiness(Empty) returns (MappingReadiness);
+  rpc GetExplorationReadiness(Empty) returns (ExplorationReadiness);
 
   // 探索（与 nuwax-exploration LCM channel 接口对应）
   rpc GetFrontiers(Empty) returns (FrontierList);

@@ -151,6 +151,12 @@ pub struct ExploreRuntimeInner {
     last_frontier_goal: Option<FrontierGoal>,
     /// 最近一次 controller 返回的 poll(保留用于 diagnostics 诊断)
     last_poll: Option<ExplorationPoll>,
+    /// Phase 7:由 mapping_adapter 通过 `ingest_costmap` 注入的 costmap 副本;
+    /// `tick()` 时通过 `ExplorationStateSnapshot::global_costmap` 喂给 wavefront
+    /// source,真正的 costmap -> frontier 流水线由此贯通。
+    costmap_input: Option<nuwax_nav_types_messages::grid::OccupancyGrid2D>,
+    /// costmap 注入累计计数;0 = 尚未收到(Phase 7 readiness 用)。
+    costmap_input_revision: u64,
 }
 
 impl ExploreRuntimeInner {
@@ -164,6 +170,8 @@ impl ExploreRuntimeInner {
             last_stop: None,
             last_frontier_goal: None,
             last_poll: None,
+            costmap_input: None,
+            costmap_input_revision: 0,
         }
     }
 
@@ -185,6 +193,12 @@ impl Default for ExploreRuntimeInner {
 #[derive(Clone)]
 pub struct ExploreRuntimeHandle {
     inner: Arc<Mutex<ExploreRuntimeInner>>,
+    /// Phase 7:readiness 缓存快照。`readiness()` / `cached_readiness()`
+    /// 都从这里读;`ingest_costmap` / `start` / `stop` / `tick` 在变更
+    /// controller 状态后调用 `refresh_readiness_cache` 重算。
+    /// 缓存 + parking_lot::Mutex 同步,保证 sync context(explore_ready_poll)
+    /// 也能不 await 拿到最新 readiness。
+    readiness_cache: Arc<parking_lot::Mutex<ExplorationReadinessDetail>>,
 }
 
 impl ExploreRuntimeHandle {
@@ -201,8 +215,21 @@ impl ExploreRuntimeHandle {
         ctrl.add_source(adapter);
         inner.controller = Some(ctrl);
 
+        let initial_cache = ExplorationReadinessDetail {
+            ready: false,
+            reason: "explore_runtime 刚构造,backend 状态未确认".into(),
+            backend_available: false,
+            controller_active: false,
+            source_count: 1, // 已经注册 1 个 wavefront source
+            frontier_source_ready: false,
+            costmap_input_ready: false,
+            costmap_input_revision: 0,
+            active_source: "wavefront".into(),
+            arbitration: "prefer_wavefront".into(),
+        };
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            readiness_cache: Arc::new(parking_lot::Mutex::new(initial_cache)),
         }
     }
 
@@ -308,6 +335,12 @@ impl ExploreRuntimeHandle {
     /// 决定走内部缓存或 `SourceUnavailable("missing costmap")`。
     pub async fn tick(&self, robot_xy: (f64, f64)) -> ExploreRuntimeSnapshot {
         let mut g = self.inner.lock().await;
+        // Phase 7:costmap 注入贯通。在拿 controller 的 `&mut` 借用之前,
+        // 先把 `g.costmap_input` 拷出来交给 snapshot——避免后续
+        // `g.controller.as_mut()` 的可变借用与 `g.costmap_input.clone()`
+        // 的不可变借用重叠(E0502 borrow checker conflict)。
+        let costmap_owned: Option<nuwax_nav_types_messages::grid::OccupancyGrid2D> =
+            g.costmap_input.clone();
         let Some(ctrl) = g.controller.as_mut() else {
             return ExploreRuntimeSnapshot {
                 status: STATUS_UNIMPLEMENTED,
@@ -319,10 +352,11 @@ impl ExploreRuntimeHandle {
                 revision: 0,
             };
         };
-        let snapshot = ExplorationStateSnapshot::from_xy(robot_xy, Timestamp {
+        let mut snapshot = ExplorationStateSnapshot::from_xy(robot_xy, Timestamp {
             nanos: now_unix_nanos() as i64,
             clock: ClockKind::Unix,
         });
+        snapshot.global_costmap = costmap_owned.as_ref();
         let poll_result = ctrl.poll_next_goal(&snapshot);
         let diags = ctrl.diagnostics();
         let status = match diags.last_stop_reason {
@@ -421,17 +455,49 @@ impl ExploreRuntimeHandle {
 
     /// wavefront input receiver 桥接入口(供 Phase 3 mapping_adapter 注入 costmap)。
     ///
-    /// 当前 controller 把 source 包成 trait object,无法直接 downcast 回
-    /// `WavefrontGoalSourceAdapter`,所以 Phase 5 仅暴露占位:costmap 注入留作
-    /// Phase 6 / P1 native profile 时,在 controller 注册时保留 adapter 的
-    /// 共享 `Arc<Mutex<>>` 句柄,在此方法内 ingest。本期实现先返回 false,
-    /// Phase 3 mapping_adapter 真正就绪时再 wire。
-    #[allow(dead_code)]
+    /// Phase 7:不再返回 false 占位 —— 真实路径是把 costmap snapshot 落到
+    /// `ExploreRuntimeInner::costmap_input`,由下一次 `tick()` 通过
+    /// `ExplorationStateSnapshot::global_costmap` 注入 wavefront source。
+    /// controller 已持有 `Box<dyn ExplorationGoalSource>`,无法 downcast,
+    /// 因此走"每次 tick 重新喂 snapshot costmap"路径;mapping_adapter 端
+    /// `build_and_publish` 完成后 server.rs::server loop 会调本方法。
+    /// 返回 true 表示 costmap 已写入共享 slot;costmap 校验
+    /// (cells.len == w*h / w,h > 0)由 wavefront source 在 `poll_goal` 内
+    /// 执行,失败时返回 SourceUnavailable("missing costmap"),不影响 ingest。
+    ///
+    /// 写入后立刻刷新 readiness 缓存(backend_available=未知,用上一次缓存值)。
     pub async fn ingest_costmap(
         &self,
-        _costmap: nuwax_nav_types_messages::grid::OccupancyGrid2D,
+        costmap: nuwax_nav_types_messages::grid::OccupancyGrid2D,
     ) -> bool {
-        false
+        let width = costmap.width;
+        let height = costmap.height;
+        let cells_len = costmap.cells.len();
+        let mut g = self.inner.lock().await;
+        g.costmap_input = Some(costmap);
+        g.costmap_input_revision = g.costmap_input_revision.saturating_add(1);
+        let backend_available = self.readiness_cache.lock().backend_available;
+        let fresh = Self::compute_readiness_locked(&g, backend_available);
+        *self.readiness_cache.lock() = fresh;
+        if width == 0 || height == 0 || cells_len != (width as usize) * (height as usize) {
+            tracing::warn!(
+                "ingest_costmap: costmap 尺寸异常 w={} h={} cells={} (revision 仍 ++,前端会标 bad costmap)",
+                width,
+                height,
+                cells_len,
+            );
+            return false;
+        }
+        true
+    }
+
+    /// 暴露给外部(通常是 Lane 6 cmd_vel_consumer 启动后 / runtime gRPC connect 后)
+    /// 显式刷 readiness 缓存并更新 backend_available flag。
+    pub fn refresh_readiness_cache_with_backend(&self, backend_available: bool) {
+        if let Ok(g) = self.inner.try_lock() {
+            let fresh = Self::compute_readiness_locked(&g, backend_available);
+            *self.readiness_cache.lock() = fresh;
+        }
     }
 
     /// 当前是否 active(= 至少有一个 source 已 begin 成功)
@@ -439,6 +505,124 @@ impl ExploreRuntimeHandle {
         let g = self.inner.lock().await;
         g.controller.as_ref().is_some_and(|c| c.is_active())
     }
+
+    /// Phase 7:readiness 真实聚合(替代 `mapping_ready_poll` 那种"handle 存在
+    /// 即 true"的假 ready)。返回 `ExplorationReadinessDetail`,由
+    /// `get_exploration_diagnostics` 走 gRPC 返回 Python。
+    ///
+    /// 综合判定:`backend_available && controller.is_active() &&
+    /// frontier_source_ready && costmap_input_ready`。
+    /// `frontier_source_ready` = controller 已 begin + 至少 1 个 source
+    /// 注册成功;`costmap_input_ready` = `costmap_input_revision > 0`
+    /// (由 `ingest_costmap` 维护)。
+    ///
+    /// 该方法**会更新** `readiness_cache`;sync context 直接读
+    /// `cached_readiness()`。
+    pub async fn readiness(&self, backend_available: bool) -> ExplorationReadinessDetail {
+        let g = self.inner.lock().await;
+        let detail = Self::compute_readiness_locked(&g, backend_available);
+        *self.readiness_cache.lock() = detail.clone();
+        detail
+    }
+
+    /// 同步版本:从内部字段直接算 readiness(不 await),更新 cache 并返回。
+    /// 用于 `lcm_runtime::explore_ready_poll()` 这类 sync context。
+    pub fn readiness_sync(&self, backend_available: bool) -> ExplorationReadinessDetail {
+        // 用 std::sync::Mutex 直读 inner 不行,因为 inner 是 tokio::Mutex。
+        // 这里用 try_lock 抢锁;抢不到返回缓存的快照(降级,不假装 ready)。
+        let cached = self.readiness_cache.lock().clone();
+        if let Ok(g) = self.inner.try_lock() {
+            let fresh = Self::compute_readiness_locked(&g, backend_available);
+            *self.readiness_cache.lock() = fresh.clone();
+            fresh
+        } else {
+            cached
+        }
+    }
+
+    /// 不重算,直接返回缓存的 readiness 快照。
+    pub fn cached_readiness(&self) -> ExplorationReadinessDetail {
+        self.readiness_cache.lock().clone()
+    }
+
+    fn compute_readiness_locked(
+        g: &ExploreRuntimeInner,
+        backend_available: bool,
+    ) -> ExplorationReadinessDetail {
+        let controller_active = g.controller.as_ref().is_some_and(|c| c.is_active());
+        let source_count = g.controller.as_ref().map(|c| c.source_count()).unwrap_or(0);
+        let arbitration_str = arbitration_policy_str(g.arbitration).to_string();
+        let costmap_input_ready = g.costmap_input_revision > 0;
+        let costmap_revision = g.costmap_input_revision;
+        let active_source = g
+            .controller
+            .as_ref()
+            .and_then(|c| c.diagnostics().selected_source)
+            .unwrap_or_default();
+        let active_source_name = if active_source.is_empty() {
+            if source_count > 0 {
+                "wavefront".to_string() // 默认 source 名,即便 controller 尚未选中
+            } else {
+                String::new()
+            }
+        } else {
+            active_source
+        };
+        let frontier_source_ready = controller_active && source_count > 0;
+        let ready = backend_available && frontier_source_ready && costmap_input_ready;
+
+        let reason = if !backend_available {
+            "LCM backend 不可用,explore_runtime 无法注册 wavefront source"
+        } else if !controller_active {
+            "exploration controller 尚未 begin_exploration"
+        } else if source_count == 0 {
+            "未注册任何 goal source"
+        } else if !costmap_input_ready {
+            "mapping adapter 尚未注入 costmap (costmap_input_revision==0)"
+        } else {
+            "explore_runtime 已就绪"
+        }
+        .to_string();
+
+        ExplorationReadinessDetail {
+            ready,
+            reason,
+            backend_available,
+            controller_active,
+            source_count,
+            frontier_source_ready,
+            costmap_input_ready,
+            costmap_input_revision: costmap_revision,
+            active_source: active_source_name,
+            arbitration: arbitration_str,
+        }
+    }
+}
+
+/// Exploration 板块 readiness 综合快照(Phase 7)。
+///
+/// 与 `NavigationReadinessDetail` / `MappingReadiness` 对齐:
+/// `ready` 综合 bool + `reason` + 各子项 + counters + active source。
+#[derive(Debug, Clone)]
+pub struct ExplorationReadinessDetail {
+    pub ready: bool,
+    pub reason: String,
+    /// LCM backend 是否可用(从 `GeometryRuntimeHandle.lcm_backend_available` 传入)
+    pub backend_available: bool,
+    /// controller 是否处于 active(`begin_exploration` 已成功)
+    pub controller_active: bool,
+    /// 当前 controller 注册的 source 总数
+    pub source_count: usize,
+    /// `controller_active && source_count > 0`
+    pub frontier_source_ready: bool,
+    /// `costmap_input_revision > 0`(由 ingest_costmap 维护)
+    pub costmap_input_ready: bool,
+    /// 累计 costmap 注入次数
+    pub costmap_input_revision: u64,
+    /// 当前 active source 名(空串 = 未选中;非空 = wavefront / tare 等)
+    pub active_source: String,
+    /// 当前 arbitration 字符串
+    pub arbitration: String,
 }
 
 /// 简化的 source diagnostics(给 gRPC 输出)
@@ -576,5 +760,101 @@ mod tests {
         );
         assert_eq!(ad.source_name(), Cow::Borrowed("wavefront"));
         assert!(ad.cached_costmap().is_none());
+    }
+
+    // ========================================================================
+    // Phase 7:readiness 真实聚合 + ingest_costmap 真实贯通
+    // ========================================================================
+
+    fn sample_costmap(w: u32, h: u32) -> nuwax_nav_types_messages::grid::OccupancyGrid2D {
+        // Phase 7:OccupancyGrid2D 没有 frame_id 字段(由 msg 携带 vs 由
+        // 栅格独立无关);frame 命名走 snapshot/global_costmap 调用方的
+        // 上下文(nuwax-nav-types-messages frames 模块)。
+        nuwax_nav_types_messages::grid::OccupancyGrid2D {
+            resolution: 0.1,
+            origin: nuwax_nav_types_messages::geometry::Point2 { x: 0.0, y: 0.0 },
+            width: w,
+            height: h,
+            cells: vec![nuwax_nav_types_messages::grid::OccupancyCell::Free; (w * h) as usize],
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_initial_state_unready() {
+        let h = ExploreRuntimeHandle::default_with_wavefront();
+        // 默认 handle 已注册 1 个 wavefront source 但 controller 未 begin,
+        // backend_available=false,即便 costmap 注入 readiness 仍 false。
+        let r = h.readiness(false).await;
+        assert!(!r.ready);
+        assert!(!r.backend_available);
+        assert!(!r.controller_active);
+        assert_eq!(r.source_count, 1);
+        assert!(r.active_source.contains("wavefront"));
+        assert!(!r.frontier_source_ready);
+        assert!(!r.costmap_input_ready);
+        assert_eq!(r.costmap_input_revision, 0);
+    }
+
+    #[tokio::test]
+    async fn readiness_with_backend_no_costmap_unready() {
+        let h = ExploreRuntimeHandle::default_with_wavefront();
+        let s = h.start("req-r1", "first_available").await;
+        assert_eq!(s.status, STATUS_ACCEPTED);
+        let r = h.readiness(true).await;
+        // controller active + 1 source 够 frontier_source_ready;
+        // 但 costmap_input_ready 仍 false → overall ready=false
+        assert!(r.backend_available);
+        assert!(r.controller_active);
+        assert!(r.frontier_source_ready);
+        assert!(!r.costmap_input_ready);
+        assert!(!r.ready);
+        // reason 包含 costmap 提示
+        assert!(r.reason.contains("costmap"));
+    }
+
+    #[tokio::test]
+    async fn ingest_costmap_then_readiness_ready() {
+        let h = ExploreRuntimeHandle::default_with_wavefront();
+        let s = h.start("req-r2", "prefer_wavefront").await;
+        assert_eq!(s.status, STATUS_ACCEPTED);
+        // 注入合法尺寸 costmap
+        let cm = sample_costmap(10, 10);
+        let ok = h.ingest_costmap(cm).await;
+        assert!(ok);
+        let r = h.readiness(true).await;
+        assert!(r.costmap_input_ready);
+        assert_eq!(r.costmap_input_revision, 1);
+        assert!(r.ready, "backend+controller+source+costmap 全齐 → ready");
+    }
+
+    #[tokio::test]
+    async fn ingest_costmap_invalid_dimensions_returns_false() {
+        let h = ExploreRuntimeHandle::default_with_wavefront();
+        // cells.len != w*h 应被拒绝
+        let bad = nuwax_nav_types_messages::grid::OccupancyGrid2D {
+            resolution: 0.1,
+            origin: nuwax_nav_types_messages::geometry::Point2 { x: 0.0, y: 0.0 },
+            width: 10,
+            height: 10,
+            cells: vec![], // 不匹配
+        };
+        let ok = h.ingest_costmap(bad).await;
+        assert!(!ok);
+        // revision 仍 ++ (以便 observer 区分 "从未注入" 与 "注入失败")
+        let r = h.readiness(true).await;
+        assert_eq!(r.costmap_input_revision, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_readiness_matches_async() {
+        let h = ExploreRuntimeHandle::default_with_wavefront();
+        let s = h.start("req-r3", "prefer_wavefront").await;
+        assert_eq!(s.status, STATUS_ACCEPTED);
+        let _ = h.ingest_costmap(sample_costmap(8, 8)).await;
+        let async_r = h.readiness(true).await;
+        // sync 版本不 await,直接 try_lock;若能拿到应与 async 一致。
+        let sync_r = h.readiness_sync(true);
+        assert_eq!(async_r.ready, sync_r.ready);
+        assert_eq!(async_r.costmap_input_revision, sync_r.costmap_input_revision);
     }
 }

@@ -403,6 +403,57 @@ impl GeometryRuntime for GeometryRuntimeService {
         }))
     }
 
+    /// Phase 7:mapping 板块 readiness 综合快照。
+    async fn get_mapping_readiness(&self, _req: Request<Empty>) -> Result<Response<MappingReadiness>, Status> {
+        use crate::mapping_adapter::MappingReadiness as MappingReadinessDetail;
+        // parking_lot Mutex guard 不能直接跨 await 持有,这里把锁解开再算。
+        let snapshot = {
+            let lcm_backend = self.bridge.lcm_backend_available;
+            match &self.bridge.mapping_adapter {
+                Some(arc) => {
+                    let g = arc.lock();
+                    MappingReadinessDetail::compute(Some(&*g), lcm_backend)
+                }
+                None => MappingReadinessDetail::compute(None, lcm_backend),
+            }
+        };
+        let message_json = serde_json::to_string(&serde_json::json!({
+            "lcm_backend": snapshot.lcm_backend,
+            "adapter_present": snapshot.adapter_present,
+            "odom_count": snapshot.odom_count,
+            "pointcloud_count": snapshot.pointcloud_count,
+            "last_occupancy_revision": snapshot.last_occupancy_revision,
+            "accumulated_point_count": snapshot.accumulated_point_count,
+            "last_error": snapshot.last_error,
+        }))
+        .unwrap_or_else(|e| format!("{{\"serialization_error\":\"{}\"}}", e));
+        Ok(Response::new(MappingReadiness {
+            ready: snapshot.ready,
+            message: message_json,
+        }))
+    }
+
+    /// Phase 7:exploration 板块 readiness 综合快照。
+    async fn get_exploration_readiness(&self, _req: Request<Empty>) -> Result<Response<ExplorationReadiness>, Status> {
+        let backend = self.bridge.lcm_backend_available;
+        let snapshot = self.bridge.explore.readiness(backend).await;
+        let message_json = serde_json::to_string(&serde_json::json!({
+            "backend_available": snapshot.backend_available,
+            "controller_active": snapshot.controller_active,
+            "source_count": snapshot.source_count,
+            "frontier_source_ready": snapshot.frontier_source_ready,
+            "costmap_input_ready": snapshot.costmap_input_ready,
+            "costmap_input_revision": snapshot.costmap_input_revision,
+            "active_source": snapshot.active_source,
+            "arbitration": snapshot.arbitration,
+        }))
+        .unwrap_or_else(|e| format!("{{\"serialization_error\":\"{}\"}}", e));
+        Ok(Response::new(ExplorationReadiness {
+            ready: snapshot.ready,
+            message: message_json,
+        }))
+    }
+
     // ========================================================================
     // 探索
     // ========================================================================

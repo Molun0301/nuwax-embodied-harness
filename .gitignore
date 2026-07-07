@@ -24,7 +24,7 @@ artifacts/
 .venv/
 memory_models_20260402.tar.zst
 runtime_data/
-tests/
+/tests/
 .vscode/
 .pytest_cache
 .playwright-mcp

@@ -8,7 +8,7 @@
 
 之前 leader 汇报"22 commits"是 codex round1 + Phase 0-7 的数量。
 codex round2 实际新增 **5 个 commit**（M1/M2/M3/L1/feedback），叠加前
-28 个（phase0-7 + codex round1），从基线 `5bc8bdb`（codex round1
+30 个（phase0-7 + codex round1），从基线 `5bc8bdb`（codex round1
 feedback commit）起算 round2 新增 **5 commits**。
 
 ```
@@ -16,11 +16,12 @@ $ git log --oneline 5bc8bdb..HEAD | wc -l
 5
 ```
 
-累积总 commit 数（从最早期到 HEAD）：
+累积总 commit 数（从最早期到 HEAD，本节在 round3 落盘前重新计；round3
+落盘后最终值见 feedback_codex_round3.md §0）：
 
 ```
-$ git log --oneline c30d6c2..HEAD | wc -l
-33
+$ git rev-list --count c30d6c2..HEAD
+35
 ```
 
 ## 1. Must-fix 3 项
@@ -184,19 +185,41 @@ $ echo "exit: $?"
 exit: 0
 ```
 
-**结论**：已通过（0 命中），无需改动。
+**结论**：HEAD~6..HEAD 范围通过（0 命中）。
+
+**但 c30d6c2^..HEAD 范围仍失败**（round3 复测时由 codex 提出）：
+`services/geometry/proto_gen/geometry_runtime_pb2.py:14` 存在 trailing
+whitespace（`+    ` 仅空格的空行），源自 protoc-gen-python 工具链的固定
+行为，无法通过改 `.proto` 源消除。
+
+该 trailing whitespace 落在生成物中，业务代码范围内不存在遗留问题。
+round3 R3-3 已通过 `.gitattributes` 把 `services/geometry/proto_gen/**`
+加入 `whitespace=fix,-trailing-space,...` 排除范围，参见
+`feedback_codex_round3.md §R3-3`。
 
 ### L3 — 最终汇总 commit 数修正
 
 之前 leader 汇报 "22 commits" 是 phase0-7 + codex round1 的中间数。
-**实际**：
+**实际**（round3 落盘前重新计；round3 落盘后最终值见
+feedback_codex_round3.md §0）：
 
 ```bash
-$ git log --oneline c30d6c2..HEAD | wc -l
-33
+$ git rev-list --count c30d6c2..HEAD
+35
 ```
 
-33 commits = 27 (phase0-7 + codex round1 baseline) + 6 (codex round2)。
+35 commits = 30 (phase0-7 + codex round1 baseline) + 5 (codex round2)。
+
+**md 文件数**：round2 收口时 `feedback_codex_round2.md` 已落盘 + 之前
+phase 反馈全部齐备：
+
+```bash
+$ find docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/ -name "*.md" | wc -l
+29
+```
+
+29/29（执行方案 1 + phase 反馈 8 + todolist 8 + feedback 11 + 中间备份 1
+= 29，与 plan §验收清单一致）。
 
 ## 3. 验收命令全清单 + 实际退出码
 
@@ -224,7 +247,7 @@ $ git log --oneline c30d6c2..HEAD | wc -l
 aab2cf3 fix(codex-r2-M2): 统一 NUWAX_REAL_LCM_REQUIRED 语义，与 fake-lcm 互斥
 c8afb6b fix(codex-r2-M3): Bundle start/stop/get_exploration_state 在 remote=None 时也走 NUWAX_EXPLORATION_LEGACY guard
 181cda5 chore(codex-r2-L1): cargo clippy 前 7 个非 dead-code 警告收敛
-8d4c28a docs(codex-r2): feedback_codex_round2.md 落盘 6 项详情 + 验收输出 + commit 数修正
+ae568db docs(codex-r2): feedback_codex_round2.md 落盘 6 项详情 + 验收输出 + commit 数修正
 ```
 
 ## 5. Round2 收口后的下一步建议

@@ -2,8 +2,7 @@
 # -*- coding:utf-8 -*-
 """geometry_runtime_deps phase：阶段 3 — native runtime（nuwax-geometry-runtime）系统依赖。
 
-2026-07-07 Phase 8 升级：路径依赖检查从 dimos 绝对路径
-(``/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace``) 切到本仓 repo-local
+2026-07-07 Phase 8 升级：路径依赖检查从旧外部 workspace 绝对路径切到本仓 repo-local
 ``services/nuwax-workspace``。移除对 ``services/geometry/nuwax_geometry_runtime/vendor``
 与 ``vendor-config.json`` 的假设（vendor_dimos_crates.sh 已退役）。
 

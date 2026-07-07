@@ -440,8 +440,7 @@ class Go2DirectDdsBridge:
     def _direct_point_cloud_reader_loop(self) -> None:
         """Go2 官方 sensor_msgs/PointCloud2 直订阅循环。
 
-        Phase 5 硬要求：必须真正填充 ``_latest_local_point_cloud`` 与 ``_point_cloud_callbacks``，
-        不能用「Rust bridge 直接订阅 Go2 原生 ROS2 话题」作为完成路径（该注释已删除）。
+        Phase 5 硬要求：必须真正填充 ``_latest_local_point_cloud`` 与 ``_point_cloud_callbacks``。
         如果订阅器或消息类型不可用，``_start_direct_dds_backend`` 在启动时记录错误并跳过本线程。
         """
         timeout_sec = float(getattr(self.config.direct_dds, "read_timeout_sec", 0.5))

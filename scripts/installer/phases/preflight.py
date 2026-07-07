@@ -8,8 +8,8 @@
   ``services/nuwax-workspace`` 路径 + LCM 系统库可用 + 48 crates 成员齐全 +
   ``nuwax-geometry-runtime`` 二进制（非强制，仅 print）。
 - 探测失败**仅警告**，不阻断；目标态运行门槛由实机启动 + health 阶段把关。
-- 2026-07-07 Phase 8：移除对 ``/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace``
-  绝对路径的探测；改为校验本仓 repo-local workspace 与 IMPORT_MANIFEST 一致性。
+- 2026-07-07 Phase 8：移除对旧外部 workspace 绝对路径的探测；
+  改为校验本仓 repo-local workspace 与 IMPORT_MANIFEST 一致性。
 - UI 交互：纯日志输出（无 questionary / rich 依赖），降级路径同样可用。
 - 任务范围：task 5（installer-ac-coverage）实装 + 2026-07-04 B3 目标态改造。
 """

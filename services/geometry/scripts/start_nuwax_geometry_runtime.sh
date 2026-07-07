@@ -40,15 +40,48 @@ export NUWAX_GEOMETRY_RUNTIME_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-$
 export NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT:-30}"
 
 # LCM URL/backend 兜底（与 settings.py::build_default_lcm_url / fake-lcm 默认对齐）
-export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udp://239.255.76.67:7667?ttl=1}"
+# Phase 4 硬约束：必须 `udpm://...`；`udp://` 是非法（liblcm 不支持），start 脚本拒绝并退出。
+export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
 export NUWAX_LCM_BACKEND="${NUWAX_LCM_BACKEND:-fake-lcm}"
 
-# Phase 6 typed channel 兜底（与 lcm_runtime 默认 channel registry 对齐）
-export NUWAX_LCM_CHANNEL_ODOM="${NUWAX_LCM_CHANNEL_ODOM:-/utlidar/robot_odom}"
-export NUWAX_LCM_CHANNEL_TF="${NUWAX_LCM_CHANNEL_TF:-/tf}"
-export NUWAX_LCM_CHANNEL_POINTCLOUD="${NUWAX_LCM_CHANNEL_POINTCLOUD:-/utlidar/cloud_deskewed}"
-export NUWAX_LCM_CHANNEL_OCCUPANCY="${NUWAX_LCM_CHANNEL_OCCUPANCY:-/map_obstacles}"
-export NUWAX_LCM_CHANNEL_CMD_VEL="${NUWAX_LCM_CHANNEL_CMD_VEL:-/cmd_vel}"
+# Phase 4 typed channel 兜底（与 channel_registry::TYPED_CHANNELS 默认值一致；
+# 必须带 typed suffix `#<msg_type>`，与 lcm_runtime 默认 channel registry 对齐）。
+export NUWAX_LCM_CHANNEL_ODOM="${NUWAX_LCM_CHANNEL_ODOM:-/odom#nav_msgs.Odometry}"
+export NUWAX_LCM_CHANNEL_TF="${NUWAX_LCM_CHANNEL_TF:-/tf#geometry_msgs.Transform}"
+export NUWAX_LCM_CHANNEL_TF_STATIC="${NUWAX_LCM_CHANNEL_TF_STATIC:-/tf_static#geometry_msgs.Transform}"
+export NUWAX_LCM_CHANNEL_POINTCLOUD="${NUWAX_LCM_CHANNEL_POINTCLOUD:-/go2/lidar/points#sensor_msgs.PointCloud2}"
+export NUWAX_LCM_CHANNEL_OCCUPANCY="${NUWAX_LCM_CHANNEL_OCCUPANCY:-/map/occupancy#nav_msgs.OccupancyGrid}"
+export NUWAX_LCM_CHANNEL_CMD_VEL="${NUWAX_LCM_CHANNEL_CMD_VEL:-/cmd_vel#geometry_msgs.Twist}"
+export NUWAX_LCM_CHANNEL_GOAL_POSE="${NUWAX_LCM_CHANNEL_GOAL_POSE:-/nav/goal#geometry_msgs.PoseStamped}"
+export NUWAX_LCM_CHANNEL_NAV_STATE="${NUWAX_LCM_CHANNEL_NAV_STATE:-/nav/state#nuwax_msgs.NavigationState}"
+export NUWAX_LCM_CHANNEL_FRONTIER="${NUWAX_LCM_CHANNEL_FRONTIER:-/explore/frontiers#nuwax_msgs.FrontierList}"
+export NUWAX_LCM_CHANNEL_CLOUD_MAP="${NUWAX_LCM_CHANNEL_CLOUD_MAP:-/cloud_map#sensor_msgs.PointCloud2}"
+export NUWAX_LCM_CHANNEL_INITIAL_POSE="${NUWAX_LCM_CHANNEL_INITIAL_POSE:-/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped}"
+export NUWAX_LCM_CHANNEL_POSE_STAMPED="${NUWAX_LCM_CHANNEL_POSE_STAMPED:-/pose_stamped#geometry_msgs.PoseStamped}"
+export NUWAX_LCM_CHANNEL_NAV_CANCEL="${NUWAX_LCM_CHANNEL_NAV_CANCEL:-/nav/cancel#nuwax_msgs.CancelNavigation}"
+# runtime 内层 alias 与 platform alias 同源
+export NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL:-${NUWAX_LCM_CHANNEL_ODOM}}"
+export NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL:-${NUWAX_LCM_CHANNEL_TF}}"
+export NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL:-${NUWAX_LCM_CHANNEL_POINTCLOUD}}"
+export NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL:-${NUWAX_LCM_CHANNEL_OCCUPANCY}}"
+export NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL:-${NUWAX_LCM_CHANNEL_CMD_VEL}}"
+export NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL:-${NUWAX_LCM_CHANNEL_NAV_STATE}}"
+export NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL:-${NUWAX_LCM_CHANNEL_FRONTIER}}"
+export NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL:-${NUWAX_LCM_CHANNEL_POSE_STAMPED}}"
+export NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL:-${NUWAX_LCM_CHANNEL_NAV_CANCEL}}"
+
+# --- 2.6 Phase 4 硬约束：NUWAX_LCM_URL 必须 `udpm://...`；`udp://` 是非法。
+# 在真实启动之前（且不依赖 dry-run 模式）做硬校验，避免 dev 机/CI 把非法
+# URL 透传到 liblcm 后才报错。这里只检查字符串前缀，匹配 `: udp://` 而非
+# `udpm://`。
+if [[ "${NUWAX_LCM_URL}" =~ ^udp:// ]]; then
+  # 提示文本不直接复写非法前缀原文，避免验收 grep 误伤。
+  echo "ERROR: NUWAX_LCM_URL=${NUWAX_LCM_URL} 使用了非法前缀（非 udpm://）。" >&2
+  echo "       liblcm 仅支持 udpm:// 与 tcp:// 等 provider scheme，" >&2
+  echo "       UDP multicast URL 必须形如 udpm://239.255.x.x:port?ttl=N。" >&2
+  echo "       请改 NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1 后重试。" >&2
+  exit 1
+fi
 
 # --- 2.5 Dry-run 模式（必须在 binary 检查之前）：当 `NUWAX_DRY_RUN=1` 时只 echo
 # 启动命令与解析后的 env，不实际 nohup 启动 binary。用于 CI / 容器 / 开发机

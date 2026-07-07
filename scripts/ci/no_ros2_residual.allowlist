@@ -254,19 +254,19 @@
   reason: "proto 文件 header 注释，声明"旧 ROS2/r2r/Nav2 action/CycloneDDS 依赖已删除"，属强约束反向锚点。"
 
 - file: services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs
-  line: 15
+  line: 20
   category: rust_module_doc
-  reason: "Rust lcm_runtime.rs module 注释，声明"不允许回退 ROS2/r2r/DDS/RMW"，属强约束反向锚点。"
+  reason: "Rust lcm_runtime.rs module 注释，声明"不允许回退 ROS2/r2r/DDS/RMW"，属强约束反向锚点。Phase 6 (codex-round3 R3-4) 在文件顶部插入 4 行 file-level #![allow(...)] 标注, 把原 line 15 的注释推到 line 20。"
 
 - file: services/geometry/nuwax_geometry_runtime/src/main.rs
-  line: 3
+  line: 7
   category: rust_module_doc
-  reason: "Rust main.rs module 注释，声明替换旧 nuwax-ros-bridge。"
+  reason: "Rust main.rs module 注释，声明替换旧 nuwax-ros-bridge。Phase 6 (codex-round3 R3-4) 在文件顶部插入 4 行 file-level #![allow(...)] 标注, 把原 line 3 的注释推到 line 7。"
 
 - file: services/geometry/nuwax_geometry_runtime/src/server.rs
-  line: 4
+  line: 10
   category: rust_module_doc
-  reason: "Rust server.rs module 注释，声明 backend 解耦与无 ROS2/r2r/DDS 依赖。"
+  reason: "Rust server.rs module 注释，声明 backend 解耦与无 ROS2/r2r/DDS 依赖。Phase 6 (codex-round3 R3-4) 在文件顶部插入 6 行 file-level #![allow(...)] 标注, 把原 line 4 的注释推到 line 10。"
 
 - file: services/geometry/runtime.py
   line: 880

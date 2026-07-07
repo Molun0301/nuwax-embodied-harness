@@ -12,17 +12,17 @@ commit 总数。
 
 ```
 $ git rev-list --count c30d6c2..HEAD
-43
+44   # docs 追写3 落盘后；每次再补 commit 数 +1（见 §6 真实落盘链）
 
 $ git log -1 --format="%H"
-bdce34d802110a28540ddb0984c5c087754aad96  # docs(codex-r3-追写2): §0/§6 41→42 修正（落盘后 HEAD）
+cd5b5f999eb248df3dba6df520ab536ae93d1f25  # docs(codex-r3-追写3): §0/§6 42→43 修正（落盘后 HEAD）
 
 $ find docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/ -name "*.md" | wc -l
 30
 ```
 
-43 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 8 (codex round3，
-本批次 6 个 R3-1/R3-2/R3-3/R3-4/R3-5/R3-6 + 1 个 allowlist 行号漂移 + 2 个
+44 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 9 (codex round3，
+本批次 6 个 R3-1/R3-2/R3-3/R3-4/R3-5/R3-6 + 1 个 allowlist 行号漂移 + 3 个
 docs 追写 commit)。
 
 **md 文件数**：30/30（执行方案 1 + phase 反馈 8 + todolist 8 + feedback 13
@@ -313,15 +313,19 @@ b659534 chore(codex-r3-R3-4): cargo clippy dead_code/style 收敛 49 → 0 个 e
 
 ## 6. 真实 commit 总数（落盘后最终值）
 
-本文件落盘后（最终）：
+本文件落盘后（最终；本批次含自身 docs 追写链 3 次）：
 
 ```
 $ git rev-list --count c30d6c2..HEAD
-43
+44
 
 $ find docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/ -name "*.md" | wc -l
 30
 ```
 
-43 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 8
-(codex round3, 含 allowlist 行号漂移 commit + 2 个 docs 追写 commit)。
+44 commits = 30 (phase0-7 + codex round1) + 5 (codex round2) + 9
+(codex round3, 含 allowlist 行号漂移 commit + 3 个 docs 追写 commit)。
+
+注：docs 自身追写 commit 形成"每次 commit 后总数 +1"的递归。本文件
+最终落盘后实际 commit 总数会再 +1（44 → 45），即自我引用最终态。
+leader 在验收时直接 `git rev-list --count c30d6c2..HEAD` 取最新值即可。

@@ -1,0 +1,42 @@
+[package]
+name = "nuwax-transport"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax 传输层,LCM-first(fake backend 默认;real-lcm feature-gated)"
+
+[dependencies]
+nuwax-protocol = { path = "../nuwax-protocol" }
+nuwax-codec = { path = "../nuwax-codec" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+# memmap2 仍保留为可选 deps(若启用 shm-sidecar feature 才引入);当前 P0 foundation
+# 阶段未启用,先注释掉以避免 dead dep warning。
+# memmap2 = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Phase 3 (2026-07-07): real-lcm backend 依赖 nuwax-lcm(其内引 nuwax-lcm-sys)。
+# 仅在 `real-lcm` feature 启用时拉入 ——
+# - dev/CI 默认编译(fake backend)不需要 liblcm
+# - 生产/集成镜像加 `--features real-lcm` 后才真正链 liblcm
+nuwax-lcm = { path = "../nuwax-lcm", optional = true }
+
+# P1 占位 features:文档已声明这两个 feature 默认关闭,但 Cargo.toml 必须存在该
+# 段以避免文档/manifest 不一致。当前 P0 foundation milestone 阶段不真正引入
+# 任何 system LCM / SHM 依赖,feature 体内为空。
+[features]
+# 启用真正的 liblcm / Rust LCM binding backend;
+# Phase 3 (2026-07-07) 真正实现:RealLcmBackend + nuwax-lcm + nuwax-lcm-sys 链路。
+# 同时启用 `nuwax-lcm-sys/link-liblcm`,让 build.rs 探测系统 liblcm。
+real-lcm = ["dep:nuwax-lcm", "nuwax-lcm/link-liblcm"]
+# 大 payload SHM 侧车优化:本轮不实现;feature 段先就位。
+shm-sidecar = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+pretty_assertions = { workspace = true }

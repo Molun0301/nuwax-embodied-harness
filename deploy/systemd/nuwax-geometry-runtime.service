@@ -1,6 +1,6 @@
 [Unit]
 Description=nuwax-geometry-runtime（LCM-first geometry native runtime）
-Documentation=docs/开发文档/建图导航探索重构/2026-07-06_建图导航探索库完整接入执行方案/70_installer_systemd_实机验收_phase7.md
+Documentation=docs/开发文档/建图导航探索重构/2026-07-07_建图导航探索库真接入与real-lcm通信实施方案/99_最终验收报告.md
 # 不依赖 nuwax-host-gateway.service:本 unit 自身由 start_gateway.sh 拉起;
 # 如果要独立启停,应 after 顺序=network-online → LCM 端口可监听。
 After=network-online.target
@@ -13,6 +13,12 @@ User=unitree
 Group=unitree
 WorkingDirectory=/home/unitree/nuwax-robot-bridge
 Environment=PYTHONUNBUFFERED=1
+# Phase 8 §13.2 / §13.5:production profile 必须显式启用 real-lcm 并打开
+# fail-fast 硬约束,避免 Rust runtime 静默回退 fake-lcm 或启动期 placeholder 退出。
+# 缺 liblcm / 缺 udpm multicast 应当作真实失败,由 systemd 触发 Restart=on-failure。
+Environment=NUWAX_LCM_BACKEND=real-lcm
+Environment=NUWAX_REAL_LCM_REQUIRED=true
+Environment=NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1
 # 启动器走 start_nuwax_geometry_runtime.sh(env-only 启动契约,不传 CLI args)
 ExecStart=/bin/bash /home/unitree/nuwax-robot-bridge/services/geometry/scripts/start_nuwax_geometry_runtime.sh
 Restart=on-failure
@@ -20,8 +26,10 @@ RestartSec=3
 TimeoutStopSec=20
 # runtime_data / /tmp SHM/UDS/日志/LCM 都可读写
 ReadWritePaths=/home/unitree/nuwax-robot-bridge/runtime_data /tmp /var/log/nuwax_robot_bridge
-# 弱化硬依赖:即便 LCM backend 启动期 fail-fast 退出 4,systemd 仅记录不滚雪球
-SuccessExitStatus=0 4
+# Phase 8 §13.2 修正:不再把 real-lcm fail-fast code(4) 当 SuccessExitStatus。
+# 启动期缺 liblcm / 缺 udpm multicast 应被 systemd 视为真实失败并触发
+# Restart=on-failure,只有 exit 0 算 success。
+SuccessExitStatus=0
 
 [Install]
 WantedBy=multi-user.target

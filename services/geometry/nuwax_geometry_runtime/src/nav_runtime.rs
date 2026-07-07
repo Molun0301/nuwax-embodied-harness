@@ -387,6 +387,15 @@ fn reset_tf_count_for_test() {
     TF_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Phase 7:tf feed path 通知 readiness 计数器增加 1。
+/// 该函数应由 lcm_runtime `/tf` typed frame 到达时被调用,
+/// 而**不**在 `compute_readiness` 这种查询路径里 fetch_add —— 否则
+/// parallel test 把 read+conditional-increment 当中 read-modify-write
+/// 跑会丢更新。Unit test env 没有真实 LCM feed,tf_count 永久 0。
+pub fn note_tf_observed() {
+    TF_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
 /// 计算细分 readiness。读 LCM handle 状态 + 内部 slot。
 pub async fn compute_readiness(
     handle: &GeometryRuntimeHandle,
@@ -396,11 +405,10 @@ pub async fn compute_readiness(
     let tf = s.pose.timestamp_ns > 0;
     let costmap_revision = s.map.revision;
     let costmap = costmap_revision > 0;
-    // Phase 7:tf_count 累计计数(每次 tf=true 时 +1)。
+    // Phase 7:tf_count 暴露给 diagnostics,真计数由 lcm_runtime tf feed path
+    // 调用 `note_tf_observed()` 维护,这里只读 —— 避免在查询路径上
+    // 做状态变更引起 parallel test race。
     let tf_count = TF_COUNT.load(AtomicOrdering::Relaxed);
-    if tf {
-        TF_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    }
     drop(s);
     let profile = state.profile().await;
     let planner = matches!(profile, PROFILE_SIMPLE_2D | PROFILE_REPLANNING_ASTAR);
@@ -977,6 +985,8 @@ mod tests {
     /// - override 优先级 > handle(setter 不影响 override 分支)
     #[tokio::test]
     async fn phase6_handle_cmd_vel_sink_ready_setter_propagates_to_readiness() {
+        // Phase 7:static TF_COUNT 跨 test 累计 → 重置本 test 看到的基础值。
+        super::reset_tf_count_for_test();
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("handle");
@@ -1006,6 +1016,8 @@ mod tests {
     #[tokio::test]
     async fn readiness_unready_when_cmd_vel_sink_down() {
         // Phase 7:real production profile + cmd_vel_sink_ready=false → readiness false
+        // 同样 reset TF_COUNT,避免并行测试累计导致其他 test 不稳。
+        super::reset_tf_count_for_test();
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("handle");
@@ -1057,6 +1069,11 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_unready_lists_new_fields() {
+        // Phase 7:tf_count 由 lcm_runtime tf feed path 调用
+        // `note_tf_observed()` 维护;test env 没有真实 LCM 推 /tf,
+        // 所以本测试 reset 后整个 process 期间 tf_count 始终为 0,
+        // 不存在 parallel test race。
+        super::reset_tf_count_for_test();
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("handle");
@@ -1215,6 +1232,8 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_unready_lists_all_false() {
+        // Phase 7:static TF_COUNT 跨 test 累计 → 重置本 test 看到的基础值。
+        super::reset_tf_count_for_test();
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("handle");

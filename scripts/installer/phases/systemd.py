@@ -2,8 +2,14 @@
 # -*- coding:utf-8 -*-
 """systemd phase：阶段 7 — systemd 模板渲染。
 
-设计要点（plan 4.1 L117）：
-- 模板来源：``deploy/systemd/nuwax-host-gateway.service.example``。
+2026-07-07 Phase 8 升级：
+- ``deploy/systemd/nuwax-geometry-runtime.service``（非 .example）已显式设置
+  ``NUWAX_LCM_BACKEND=real-lcm`` + ``NUWAX_REAL_LCM_REQUIRED=true`` 并移除
+  ``SuccessExitStatus=0 4``，让 systemd 把缺 liblcm / 缺 udpm multicast
+  视为真实失败。``nuwax-host-gateway.service.example`` 走 .env 默认值，
+  不在本 phase 强制覆盖。
+- 渲染顺序保持原 plan：``deploy/systemd/nuwax-host-gateway.service.example``
+  → ``nuwax-host-gateway.service``。
 - 调 ``_legacy_bridge.call_write_systemd_example``（bootstrap.write_systemd_example L1336）。
 - 默认 disabled（``planner.systemd = False``）；wizard 可显式启用。
 - 当 ``planner.systemd=False`` 时 cli 已先 skip；本函数防御性 return。
@@ -34,6 +40,14 @@ class SystemdPhase(Phase):
             return 0
         ctx.info(f"[phase: {self.name}] 渲染 systemd 模板")
         call_write_systemd_example(planner)
+        # Phase 8:为 production profile 明确提示 LCM env 已经随 systemd unit 注入,
+        # 操作员不需要在 .env 再覆盖。``nuwax-geometry-runtime.service``（非 example）
+        # 已含 NUWAX_LCM_BACKEND=real-lcm + NUWAX_REAL_LCM_REQUIRED=true + udpm URL。
+        ctx.info(
+            f"  [systemd] 提醒:nuwax-geometry-runtime.service 已 hardcode "
+            f"NUWAX_LCM_BACKEND=real-lcm + NUWAX_REAL_LCM_REQUIRED=true,"
+            f"SuccessExitStatus 仅 0。缺 liblcm/缺 udpm 视为真实失败并 Restart=on-failure。"
+        )
         ctx.success(f"[phase: {self.name}] systemd 示例已渲染")
         return 0
 
@@ -42,6 +56,9 @@ class SystemdPhase(Phase):
             return ["[SKIP] planner.systemd=False"]
         return [
             "+ render deploy/systemd/nuwax-host-gateway.service from .example",
+            "+ assert deploy/systemd/nuwax-geometry-runtime.service Environment=NUWAX_LCM_BACKEND=real-lcm",
+            "+ assert deploy/systemd/nuwax-geometry-runtime.service Environment=NUWAX_REAL_LCM_REQUIRED=true",
+            "+ assert deploy/systemd/nuwax-geometry-runtime.service SuccessExitStatus=0（不再 0 4）",
         ]
 
 

@@ -8221,24 +8221,25 @@ class GatewayRuntime:
         self._notify_geometry_cmd_vel_sink_ready(bool(ready))
 
     def _notify_geometry_cmd_vel_sink_ready(self, ready: bool) -> None:
-        """Rework-9:把 sink ready 状态写回 Rust handle。
+        """Rework-9 + Rework-17:把 sink ready 状态通过 gRPC 跨进程写回 Rust handle。
 
-        当前实现没有跨进程 gRPC `SetCmdVelSinkReady` RPC(proto 重新生成
-        需要新的 proto regen 与服务侧实装,属于后续 openspec 提案
-        `mcp-timeout-rootcause-and-openspec` 之外的独立工作),因此采用
-        两条互补的本地通知路径:
-
-        1. **诊断 metadata**:通过 `platform_geometry_runtime` 把状态写入
-           ``runtime_status`` / 诊断快照,前端 / debug panel 可观测。
-        2. **本地内存通知**:`LcmMotionCommandBridge._on_sink_state_change`
-           已经被本方法直接覆盖(caller 是 bridge 自身),不需要走 Rust。
+        跨进程链路(commit `90b839f` 实装):
+            `_notify_geometry_cmd_vel_sink_ready(ready)` →
+            `PlatformGeometryRuntime.notify_cmd_vel_sink_ready(ready)` →
+            `GeometryRuntimeProvider.notify_cmd_vel_sink_ready(ready)` →
+            gRPC stub `SetCmdVelSinkReady(pb2.CmdVelSinkReadyRequest(ready=...))` →
+            `[over network]` →
+            `server.rs::set_cmd_vel_sink_ready` →
+            `self.bridge.set_cmd_vel_sink_ready(ready)` →
+            `Arc<AtomicBool>::store(...)` →
+            `compute_readiness` 立即反映。
 
         调用方对所有失败 / 跳过 / 异常路径**都必须**调用本方法(ready=False);
         成功启动路径**必须**调用本方法(ready=True)。bridge.stop() 内部
         也会同步触发一次(False)作为最后兜底。
         """
         ready = bool(ready)
-        # 路径 1:把状态写到 platform_geometry_runtime 诊断快照。
+        # 路径 1:跨进程 gRPC SetCmdVelSinkReady RPC(rework17 端到端打通)。
         # 该路径在 platform_geometry_runtime 未启动 / 子进程未连时为 noop,
         # 但会更新 in-process diagnostics,避免 Rust 端与 Python 端
         # cmd_vel_sink_ready 状态漂移。
@@ -8253,12 +8254,11 @@ class GatewayRuntime:
                         "platform_geometry_runtime.notify_cmd_vel_sink_ready 异常。",
                     )
                 return
-        # 路径 2:本地无跨进程桥,只更新 `_motion_bridge_errors` 与日志。
-        # 这是 best-effort:Rust 侧 `cmd_vel_sink_ready` 当前是 spawn-time
-        # 默认 false,Python 不能直接写回。Rust 侧 readiness 会通过
-        # `GetNavigationReadiness` 拿到一个**不会**反映这个 flag 的状态,
-        # 因为 NavRuntimeState 与 cmd_vel_sink_ready 之间没有现成回路。
-        # 该缺口需要后续 openspec 提案补一条 `SetCmdVelSinkReady` gRPC RPC。
+        # 路径 2:platform_geometry_runtime 不可用时 fallback——更新
+        # `_motion_bridge_errors` 与日志。这种情况仅在子进程未连时发生,
+        # Rust 端 cmd_vel_sink_ready 仍是 spawn-time 默认 false,
+        # rejection 分支结构上必然触发(参见 nav_runtime.rs:
+        # REJECT_REASON_CMD_VEL_SINK_DOWN)。
         if not ready:
             # 仅在 ready=False 时记 log;成功路径已在 _start_motion_command_bridge
             # 末尾记 INFO log,这里再记一次会重复。

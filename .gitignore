@@ -61,6 +61,15 @@ scripts/check_openspec.sh
 temp_docs
 
 # === installer verification 工具（按 memory feedback_no_test_commits.md，不入仓） ===
+
+# === 本地 dev-only 文档/撤销日志/feedback 报告（rework17 共识：开发文档不进仓库） ===
+# 这些文件本地保留作为开发 lane 的 evidence / 决策痕迹，但不入 git 跟踪：
+# - REVERT_NOTES.md         : lane-15 撤销 docs(lcm) commit 的撤销日志
+# - feedback_rework*.md     : 各 rework lane 的 feedback 报告
+# - docs/开发文档/          : 任务执行方案的 PDR/feedback/验收报告（已由 .gitignore line 20 排除）
+# 清理原则：未来 lane 决定要入仓时再单独 commit
+REVERT_NOTES.md
+feedback_rework*.md
 # 上方已有 tests/ 整目录排除；此处追加显式模式做双保险，避免 .gitignore
 # 行号漂移后误提交 installer_*.{sh,py} 与 __pycache__。
 tests/manual/installer_*.sh

@@ -16,7 +16,8 @@
 //! 5. 写 ready file（通知父进程 / systemd）
 //! 6. tonic gRPC server 监听
 
-mod channel_registry;
+// Phase 4: `pub` 而非私有 —— 兄弟模块(lcm_runtime/server)需要 `crate::channel_registry::*`。
+pub mod channel_registry;
 mod explore_runtime;
 mod lcm_runtime;
 mod mapping_adapter;

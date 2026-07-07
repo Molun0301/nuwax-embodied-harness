@@ -168,9 +168,12 @@ pub fn channel_for(key: ChannelKey) -> nuwax_protocol::LcmTopic {
 
 /// 与 `channel_for` 等价，但额外返回 typed msg_type suffix 字符串，
 /// 供需要把 msg_type 单独传入 `transport.subscribe` 的调用方使用。
+///
+/// 返回 tuple 的第二个元素 `Option<String>`：当 raw pattern 含 `#msg_type`
+/// 后缀时为 `Some`，否则为 `None`（与 `parse_subscription_pattern` 行为一致）。
 pub fn channel_for_with_suffix(
     key: ChannelKey,
-) -> (nuwax_protocol::LcmTopic, String) {
+) -> (nuwax_protocol::LcmTopic, Option<String>) {
     let typed = resolve_typed(key);
     nuwax_protocol::LcmTopic::parse_subscription_pattern(&typed)
         .unwrap_or_else(|e| {

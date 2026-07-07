@@ -1,0 +1,20 @@
+[package]
+name = "nuwax-lcm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax real-LCM 安全包装 + 单 owner 事件线程(Phase 3,2026-07-07)。替代 fake backend;fake-lcm 仅保留给 unit/contract test。"
+
+[dependencies]
+nuwax-lcm-sys = { path = "../nuwax-lcm-sys" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+
+# Phase 3 (2026-07-07): real-lcm 必须 enable link-liblcm 让 nuwax-lcm-sys build.rs 探测
+# 系统 liblcm。dev/CI 默认编译(只跑 unit test)不开启 feature,build.rs 跳过探测。
+[features]
+link-liblcm = ["nuwax-lcm-sys/link-liblcm"]

@@ -18,14 +18,19 @@
 #
 # 使用方法：
 #   bash scripts/import_nuwax_workspace_snapshot.sh \
-#       --source /home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace
+#       --source <snapshot 路径>(必填;默认走 env NUWAX_SNAPSHOT_SOURCE)
 #
 #   可选参数：
 #       --source <PATH>   必填,源 nuwax-workspace 路径
+#                         (或 export NUWAX_SNAPSHOT_SOURCE=/path/to/nuwax-workspace)
 #       --dest   <PATH>   可选,目标,默认 services/nuwax-workspace
 #       --dry-run         只打印动作,不实际 rsync / 写 manifest
 #       --regen-manifest  不复制,只重新生成 IMPORT_MANIFEST.*
 #       --help            打印本帮助
+#
+#   示例:
+#       export NUWAX_SNAPSHOT_SOURCE=/path/to/nuwax-workspace
+#       bash scripts/import_nuwax_workspace_snapshot.sh
 #
 # 行为契约：
 #   - idempotent:重跑结果稳定(rsync -a --delete + 重新生成 manifest)

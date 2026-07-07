@@ -55,8 +55,9 @@ WHITELIST_PREFIXES=(
 # 这些是诚实保留(代码注释与示例需要准确反映上游路径),不是回归。
 WHITELIST_FILES=(
   # deprecation header + sed 模板 + UPSTREAM_ROOT 常量(脚本已 deprecated,
-  # 保留为历史 evidence / 应急 vendor 路径;不删)
-  "scripts/vendor_dimos_crates.sh"
+  # 2026-07-07 lane-12 移到 scripts/vendor_history/ 保留为历史 evidence;
+  # 不删,作为应急 vendor 路径。)
+  "scripts/vendor_history/vendor_dimos_crates.sh"
   # Phase 1 新建脚本的 help 示例需要展示 --source 用法
   "scripts/import_nuwax_workspace_snapshot.sh"
   # Phase 8 已重写但 docstring 仍保留上游路径作为历史锚点
@@ -64,6 +65,8 @@ WHITELIST_FILES=(
   # Phase 1 改 EXPECTED_CRATE_COUNT + 注释保留历史阶段号
   "scripts/installer/phases/preflight.py"
   # cargo metadata 自检脚本用 forbidden path 作为 grep 目标字符串
+  # (lane-12 已抽到顶部 DIMOS_REFERENCE 变量,但 grep 目标字符串仍
+  #  包含默认上游绝对路径,因此仍在白名单内)
   "scripts/ci/run_nuwax_workspace_checks.sh"
 )
 

@@ -51,6 +51,13 @@ RUNTIME_MANIFEST="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/Cargo.to
 WS_LOCK="${REPO_ROOT}/services/nuwax-workspace/Cargo.lock"
 RUNTIME_LOCK="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/Cargo.lock"
 
+# 上游 dimos nuwax-workspace 的开发机绝对路径 ——
+# §13.5 v3-2 用它做"runtime lockfile 不应含外部 workspace path"自检。
+# 这里只作为 grep 匹配字符串,不引用、不执行;若上游路径变更,只改这一处。
+# 默认与 scripts/ci/no_external_nuwax_workspace_path.sh 的 FORBIDDEN_PATH
+# 保持一致,可被环境变量 DIMOS_REFERENCE 覆盖。
+DIMOS_REFERENCE="${DIMOS_REFERENCE:-/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace}"
+
 bar() { printf '\n========== %s ==========\n' "$1"; }
 ok()  { printf '  [OK]      %s\n' "$1"; }
 nr()  { printf '  [NOT RUN] %s\n' "$1"; }
@@ -88,7 +95,7 @@ else
       >"${PHASE_LOG_DIR}/02_runtime_metadata.json" 2>"${PHASE_LOG_DIR}/02_runtime_metadata.err"; then
     # §13.5 v3-2 扩展：runtime lockfile 不能含 external workspace path
     if "${CARGO[@]}" metadata --manifest-path "${RUNTIME_MANIFEST}" --locked --format-version 1 2>/dev/null \
-        | grep -qF '/home/ml/Deeprob/dimos/rust重写与移植/nuwax-workspace'; then
+        | grep -qF "${DIMOS_REFERENCE}"; then
       fail "runtime lockfile 仍含 dimos 绝对 path（与 §13.5 v3-2 矛盾）"
       ANY_FAIL=1
     else

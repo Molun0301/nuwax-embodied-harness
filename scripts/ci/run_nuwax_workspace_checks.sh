@@ -21,6 +21,13 @@
 #   0  - 所有 step PASS 或 NOT_RUN（NOT_RUN 用于 lcm roundtrip 在 CI 镜像无 liblcm 时）
 #   1  - 任一 PASS-only step FAIL
 #
+# PASS-only vs NOT_RUN 语义（rework10 修复点）：
+#   - cargo check / cargo test 是 PASS-only：FAIL 必须进 ANY_FAIL=1，不能伪装成 NOT_RUN。
+#   - cargo metadata step 1: 缺 manifest/lockfile 视为 FAIL（进 ANY_FAIL=1），不允许 NOT_RUN。
+#   - cargo metadata step 2: 是过渡态：缺 manifest/lock 标 NOT_RUN（Phase 1 lane 未收尾），但若 lock 含 dimos 绝对 path 仍 FAIL。
+#   - smoke_real_lcm_roundtrip：liblcm/udpm 不可用时严格 NOT_RUN，不进 ANY_FAIL（§DoD-6 语义）。
+#   - 两个 gate（no_external_nuwax_workspace_path / no_fake_lcm_completion_claim）：FAIL 必进 ANY_FAIL=1。
+#
 # CI 镜像硬约束（§12.6 / §13.2）：
 #   Ubuntu 20.04 / 22.04 + liblcm-dev pkg-config python3-lcm 安装
 #   + rustup 1.88.0 + cargo 1.88.0
@@ -102,8 +109,10 @@ if [[ -f "${RUNTIME_MANIFEST}" && -f "${RUNTIME_LOCK}" ]]; then
       >"${PHASE_LOG_DIR}/03_runtime_check.log" 2>&1; then
     ok "cargo check runtime --locked --all-targets PASS"
   else
-    nr "cargo check runtime --locked --all-targets FAIL（详见 03_runtime_check.log,常因 Phase 1 path deps 未切或 Phase 3 real-lcm 未实装）"
+    # rework10: cargo check 是 PASS-only step,FAIL 必进 ANY_FAIL=1,不再伪装 NOT_RUN
+    fail "cargo check runtime --locked --all-targets FAIL（详见 03_runtime_check.log,常因 Phase 1 path deps 未切或 Phase 3 real-lcm 未实装）"
     tail -n 20 "${PHASE_LOG_DIR}/03_runtime_check.log" || true
+    ANY_FAIL=1
   fi
 else
   nr "skip runtime cargo check（缺 manifest/lockfile）"
@@ -116,8 +125,10 @@ if [[ -f "${RUNTIME_MANIFEST}" && -f "${RUNTIME_LOCK}" ]]; then
       >"${PHASE_LOG_DIR}/04_runtime_test.log" 2>&1; then
     ok "cargo test runtime --locked PASS"
   else
-    nr "cargo test runtime --locked FAIL（详见 04_runtime_test.log）"
+    # rework10: cargo test 是 PASS-only step,FAIL 必进 ANY_FAIL=1,不再伪装 NOT_RUN
+    fail "cargo test runtime --locked FAIL（详见 04_runtime_test.log）"
     tail -n 20 "${PHASE_LOG_DIR}/04_runtime_test.log" || true
+    ANY_FAIL=1
   fi
 else
   nr "skip runtime cargo test"

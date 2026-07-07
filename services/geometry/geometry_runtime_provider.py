@@ -1287,6 +1287,23 @@ class GeometryRuntimeProvider:
             _log_rpc_error("GetStatus", e)
             return {"phase": "error", "rss_kb": 0}
 
+    def notify_cmd_vel_sink_ready(self, ready: bool) -> bool:
+        """把 cmd_vel sink ready 状态跨进程写回到 Rust handle（rework17）。
+
+        Returns:
+            True 当 RPC 调用成功；False 当 stub 未连 / RPC 失败。
+        """
+        self._raise_if_stopping("notify_cmd_vel_sink_ready")
+        if not self._stub:
+            return False
+        try:
+            req = pb2.CmdVelSinkReadyRequest(ready=bool(ready))
+            resp = self._stub.SetCmdVelSinkReady(req, timeout=_read_deadline_sec())
+            return bool(resp.success)
+        except grpc.RpcError as e:
+            _log_rpc_error("SetCmdVelSinkReady", e)
+            return False
+
     # === 流式订阅 ===
     def subscribe_pose(self, callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]) -> Optional[threading.Thread]:
         """订阅位姿更新流。按 LocalizationProvider 协议回调 (Pose, Optional[FrameTree], metadata)。

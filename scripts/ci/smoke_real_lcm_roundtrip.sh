@@ -93,7 +93,13 @@ def on_msg(channel, data):
     received.append((channel, len(data)))
     if sys.stderr.isatty():
         print(f"got channel={channel} len={len(data)}", file=sys.stderr)
-    lc.unsubscribe("/smoke/test")
+    # LCM Python 1.5: unsubscribe 接受 LCMSubscription 对象或 channel name;
+    # 1.5 早期 API 接受 channel name,但 1.5 某些 build 严格要求 subscription 对象。
+    # 用 try/except 容错:两种 API 都试。
+    try:
+        lc.unsubscribe(sub)  # 1.5 严格模式:传 subscription
+    except TypeError:
+        lc.unsubscribe("/smoke/test")  # 旧 API:传 channel name
 sub = lc.subscribe("/smoke/test", on_msg)
 deadline = time.monotonic() + 4.0
 try:

@@ -633,6 +633,22 @@ class PlatformGeometryRuntime:
             return None
         return provider
 
+    def notify_cmd_vel_sink_ready(self, ready: bool) -> None:
+        """Rework-17:把 sink ready 状态跨进程写回 Rust handle（best-effort）。
+
+        内部通过当前 `_remote_provider` 调 `SetCmdVelSinkReady` gRPC RPC。
+        provider 未连接 / RPC 失败均吞掉异常记 diagnostic,允许 caller
+        （gateway runtime `_notify_geometry_cmd_vel_sink_ready`）继续走
+        fallback 路径,不抛错。
+        """
+        provider = self.get_geometry_runtime_provider()
+        if provider is None:
+            return
+        try:
+            provider.notify_cmd_vel_sink_ready(bool(ready))
+        except Exception as exc:  # noqa: BLE001
+            self._record_runtime_diagnostic("geometry_cmd_vel_sink_ready", exc)
+
     def stop(self) -> None:
         """停止平台几何运行时。"""
 

@@ -117,6 +117,21 @@ class GeometryRuntimeStub:
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.NavigationReadiness.FromString,
                 _registered_method=True)
+        self.GetMappingReadiness = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetMappingReadiness',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.MappingReadiness.FromString,
+                _registered_method=True)
+        self.GetExplorationReadiness = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetExplorationReadiness',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.ExplorationReadiness.FromString,
+                _registered_method=True)
+        self.SetCmdVelSinkReady = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/SetCmdVelSinkReady',
+                request_serializer=geometry__runtime__pb2.CmdVelSinkReadyRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.CmdVelSinkReadyResponse.FromString,
+                _registered_method=True)
         self.GetFrontiers = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/GetFrontiers',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
@@ -265,6 +280,29 @@ class GeometryRuntimeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetMappingReadiness(self, request, context):
+        """Phase 7: mapping + exploration readiness(各板块独立 RPC,message JSON 解析)。
+        详见 `mapping_adapter::MappingReadiness` / `explore_runtime::ExplorationReadinessDetail`。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetExplorationReadiness(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SetCmdVelSinkReady(self, request, context):
+        """cmd_vel sink readiness 写回(control plane):Python LcmMotionCommandBridge
+        在 start/stop 时调本接口把 sink ready 状态同步到 Rust handle,
+        让 `SetNavigationGoal` 的 readiness 拒绝链路读到真实状态。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetFrontiers(self, request, context):
         """探索（与 nuwax-exploration LCM channel 接口对应）
         """
@@ -404,6 +442,21 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.GetNavigationReadiness,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.NavigationReadiness.SerializeToString,
+            ),
+            'GetMappingReadiness': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMappingReadiness,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.MappingReadiness.SerializeToString,
+            ),
+            'GetExplorationReadiness': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetExplorationReadiness,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.ExplorationReadiness.SerializeToString,
+            ),
+            'SetCmdVelSinkReady': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetCmdVelSinkReady,
+                    request_deserializer=geometry__runtime__pb2.CmdVelSinkReadyRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.CmdVelSinkReadyResponse.SerializeToString,
             ),
             'GetFrontiers': grpc.unary_unary_rpc_method_handler(
                     servicer.GetFrontiers,
@@ -881,6 +934,87 @@ class GeometryRuntime:
             '/nuwax.geometry.GeometryRuntime/GetNavigationReadiness',
             geometry__runtime__pb2.Empty.SerializeToString,
             geometry__runtime__pb2.NavigationReadiness.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMappingReadiness(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetMappingReadiness',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.MappingReadiness.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetExplorationReadiness(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetExplorationReadiness',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.ExplorationReadiness.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetCmdVelSinkReady(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/SetCmdVelSinkReady',
+            geometry__runtime__pb2.CmdVelSinkReadyRequest.SerializeToString,
+            geometry__runtime__pb2.CmdVelSinkReadyResponse.FromString,
             options,
             channel_credentials,
             insecure,

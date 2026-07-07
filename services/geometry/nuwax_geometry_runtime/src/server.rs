@@ -455,6 +455,23 @@ impl GeometryRuntime for GeometryRuntimeService {
     }
 
     // ========================================================================
+    // cmd_vel sink readiness 写回（rework17）
+    // ========================================================================
+    //
+    // Python `LcmMotionCommandBridge` 在 start/stop 时通过本 RPC 把 sink ready
+    // 状态推到 Rust handle。`compute_readiness` 的 cmd_vel_sink 子项读这个 flag;
+    // 之前 spawn 默认 false + 跨进程无通道 → readiness 永远 false → 真实
+    // production 路径走不通。
+    async fn set_cmd_vel_sink_ready(
+        &self,
+        request: Request<CmdVelSinkReadyRequest>,
+    ) -> Result<Response<CmdVelSinkReadyResponse>, Status> {
+        let ready = request.into_inner().ready;
+        self.bridge.set_cmd_vel_sink_ready(ready);
+        Ok(Response::new(CmdVelSinkReadyResponse { success: true }))
+    }
+
+    // ========================================================================
     // 探索
     // ========================================================================
 

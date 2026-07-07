@@ -111,13 +111,25 @@ fi
 
 # ---------- step 3: runtime cargo check ----------
 bar "Step 3/7: cargo check --locked on nuwax_geometry_runtime"
+# rework16(codex round-3 blocker-1): liblcm 可用性探测
+# - liblcm 可用:走 default features(生产路径,需 real-lcm-bridge 链 liblcm)
+# - liblcm 不可用:fallback 到 fake-only 路径(--no-default-features --features fake-lcm-test)
+# 探测方式:pkg-config lcm;若探测失败且已装则 ok,若可执行结果 true/false
 if [[ -f "${RUNTIME_MANIFEST}" && -f "${RUNTIME_LOCK}" ]]; then
-  if "${CARGO[@]}" check --manifest-path "${RUNTIME_MANIFEST}" --locked --all-targets \
+  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists lcm 2>/dev/null; then
+    CARGO_FEAT_ARGS=()
+    LC_PROFILE="default(real-lcm-bridge)"
+  else
+    # fake-only:不依赖 liblcm,可在 dev/CI 镜像无 liblcm-dev 时通过
+    CARGO_FEAT_ARGS=(--no-default-features --features fake-lcm-test)
+    LC_PROFILE="fake-only(--no-default-features --features fake-lcm-test)"
+  fi
+  if "${CARGO[@]}" check --manifest-path "${RUNTIME_MANIFEST}" --locked --all-targets "${CARGO_FEAT_ARGS[@]}" \
       >"${PHASE_LOG_DIR}/03_runtime_check.log" 2>&1; then
-    ok "cargo check runtime --locked --all-targets PASS"
+    ok "cargo check runtime --locked --all-targets PASS（profile=${LC_PROFILE}）"
   else
     # rework10: cargo check 是 PASS-only step,FAIL 必进 ANY_FAIL=1,不再伪装 NOT_RUN
-    fail "cargo check runtime --locked --all-targets FAIL（详见 03_runtime_check.log,常因 Phase 1 path deps 未切或 Phase 3 real-lcm 未实装）"
+    fail "cargo check runtime --locked --all-targets FAIL（profile=${LC_PROFILE},详见 03_runtime_check.log,常因 Phase 1 path deps 未切或 Phase 3 real-lcm 未实装）"
     tail -n 20 "${PHASE_LOG_DIR}/03_runtime_check.log" || true
     ANY_FAIL=1
   fi
@@ -128,17 +140,42 @@ fi
 # ---------- step 4: runtime cargo test ----------
 bar "Step 4/7: cargo test --locked on nuwax_geometry_runtime"
 if [[ -f "${RUNTIME_MANIFEST}" && -f "${RUNTIME_LOCK}" ]]; then
-  if "${CARGO[@]}" test --manifest-path "${RUNTIME_MANIFEST}" --locked \
+  if "${CARGO[@]}" test --manifest-path "${RUNTIME_MANIFEST}" --locked "${CARGO_FEAT_ARGS[@]}" \
       >"${PHASE_LOG_DIR}/04_runtime_test.log" 2>&1; then
-    ok "cargo test runtime --locked PASS"
+    ok "cargo test runtime --locked PASS（profile=${LC_PROFILE}）"
   else
     # rework10: cargo test 是 PASS-only step,FAIL 必进 ANY_FAIL=1,不再伪装 NOT_RUN
-    fail "cargo test runtime --locked FAIL（详见 04_runtime_test.log）"
+    fail "cargo test runtime --locked FAIL（profile=${LC_PROFILE},详见 04_runtime_test.log）"
     tail -n 20 "${PHASE_LOG_DIR}/04_runtime_test.log" || true
     ANY_FAIL=1
   fi
 else
   nr "skip runtime cargo test"
+fi
+
+# ---------- step 4.5: cargo clippy --locked (rework16:补 codex round-3 blocker-5 clippy step) ----------
+bar "Step 4.5/7: cargo clippy --locked --all-targets -D warnings on nuwax_geometry_runtime"
+# 复用 step 3/4 的 CARGO_FEAT_ARGS:liblcm 可用走 default,否则 fake-only
+# clippy 是 cargo 子命令,探测 `cargo-clippy` 可执行文件是否存在(rustup component)
+#
+# rework17 升级:clippy 升级为 PASS-only step,与 cargo check/test 同等性质
+# (任何 error / -D warnings 失败必进 ANY_FAIL=1)。
+# 修 src/ 真实 lint errors 的工作由 rework17 subagent 负责:
+#   - mapping_adapter.rs:614 tautology assert (`!r.lcm_backend || r.lcm_backend`)
+#   - 13 处 doc list 缩进 warnings
+#   - real_backend.rs 编译错(line 208 type mismatch + line 181 async block unpinned)
+if [[ -f "${RUNTIME_MANIFEST}" && -f "${RUNTIME_LOCK}" ]] && "${CARGO[@]}" clippy --version >/dev/null 2>&1; then
+  if "${CARGO[@]}" clippy --manifest-path "${RUNTIME_MANIFEST}" --locked --all-targets -- -D warnings "${CARGO_FEAT_ARGS[@]}" \
+      >"${PHASE_LOG_DIR}/04_5_runtime_clippy.log" 2>&1; then
+    ok "cargo clippy runtime --locked --all-targets -D warnings PASS（profile=${LC_PROFILE}）"
+  else
+    # clippy 与 check/test 同性质:PASS-only step,FAIL 必进 ANY_FAIL=1
+    fail "cargo clippy runtime --locked --all-targets -D warnings FAIL（profile=${LC_PROFILE},详见 04_5_runtime_clippy.log）"
+    tail -n 20 "${PHASE_LOG_DIR}/04_5_runtime_clippy.log" || true
+    ANY_FAIL=1
+  fi
+else
+  nr "skip runtime cargo clippy（缺 manifest/lockfile 或 cargo-clippy 未装——rustup component add clippy）"
 fi
 
 # ---------- step 5: no_external_nuwax_workspace_path ----------

@@ -132,6 +132,13 @@ message ExplorationReadiness {
                         //      active_source, arbitration}
 }
 
+// === cmd_vel sink readiness === (rework17 跨进程写回闭环)
+// Python 网关的 `LcmMotionCommandBridge` 在 start/stop 时通过本 RPC
+// 把 sink ready 状态从 Python 推到 Rust handle.cmd_vel_sink_ready。
+// 该 RPC 是 `compute_readiness` 拒绝 `SetNavigationGoal` 的关键反馈回路。
+message CmdVelSinkReadyRequest { bool ready = 1; }
+message CmdVelSinkReadyResponse { bool success = 1; }
+
 // === 探索 ===
 message Frontier {
   Pose pose = 1;
@@ -220,6 +227,11 @@ service GeometryRuntime {
   // 详见 `mapping_adapter::MappingReadiness` / `explore_runtime::ExplorationReadinessDetail`。
   rpc GetMappingReadiness(Empty) returns (MappingReadiness);
   rpc GetExplorationReadiness(Empty) returns (ExplorationReadiness);
+
+  // cmd_vel sink readiness 写回(control plane):Python LcmMotionCommandBridge
+  // 在 start/stop 时调本接口把 sink ready 状态同步到 Rust handle,
+  // 让 `SetNavigationGoal` 的 readiness 拒绝链路读到真实状态。
+  rpc SetCmdVelSinkReady(CmdVelSinkReadyRequest) returns (CmdVelSinkReadyResponse);
 
   // 探索（与 nuwax-exploration LCM channel 接口对应）
   rpc GetFrontiers(Empty) returns (FrontierList);

@@ -177,50 +177,62 @@ fn subscription_to_stream(
     // 解决方案:用 `futures::stream::unfold` 把 async 步骤展开成 stream 状态机。
     // `unfold` 的 state 是 (subscription, msg_type_filter, topic);
     // 每轮 .next_future() 调 receiver.recv(),拿到 Ok(payload) 转 frame。
+    //
+    // 注意:async block 自身是 `!Unpin`,会通过 `Fut` 参数传染给 `Unfold<...>`,
+    // 让 `Unfold` 整体 `!Unpin`,不能直接 `Box::pin(unfold(...))`。
+    // 修复:把 closure 返回的 future 显式 `Box::pin` 成 `BoxFuture<'_, _>`,
+    // `BoxFuture` 是 `Unpin`,于是 `Unfold<T, F, BoxFuture<...>>` 是 `Unpin`,
+    // `Box::pin(unfold(...))` 即可 coerce 成 `Pin<Box<dyn Stream + Send + Unpin>>`。
     use futures::stream::unfold;
-    Box::pin(unfold(
+    let stream = unfold(
         (sub, msg_type_filter, topic_for_fallback),
-        move |(mut sub, msg_type_filter, topic_for_fallback)| async move {
-            loop {
-                match sub.receiver.recv().await {
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(
-                            "real-lcm subscribe lagged ({} 条) — channel={}",
-                            n,
-                            topic_for_fallback.channel()
-                        );
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return None;
-                    }
-                    Ok(payload) => {
-                        // typed suffix 过滤:caller 提供 → 用 caller 提供的;
-                        // 没提供 → fallback `unknown/Unknown`。
-                        let fqn = msg_type_filter
-                            .clone()
-                            .unwrap_or_else(|| "unknown/Unknown".into());
-                        if let Some(want) = msg_type_filter.as_ref() {
-                            if want != &fqn {
-                                continue;
-                            }
+        move |(mut sub, msg_type_filter, topic_for_fallback)| {
+            // 把 async block 显式 pin 成 `BoxFuture<'static, _>`,
+            // 满足 unfold 的 Fut bound。`BoxFuture` 是 `Pin<Box<dyn Future + Send>>`,
+            // 本身 `Unpin`,所以 `Unfold<T, F, BoxFuture>` 也是 `Unpin`。
+            Box::pin(async move {
+                loop {
+                    match sub.receiver.recv().await {
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                "real-lcm subscribe lagged ({} 条) — channel={}",
+                                n,
+                                topic_for_fallback.channel()
+                            );
+                            continue;
                         }
-                        let msg_type = match LcmMessageType::new(fqn) {
-                            Ok(m) => m,
-                            Err(_) => continue, // 不应发生
-                        };
-                        let frame = RawLcmFrameBuilder::new(
-                            topic_for_fallback.clone(),
-                            msg_type,
-                        )
-                        .payload(payload.to_vec())
-                        .build();
-                        return Some((Ok(frame), (sub, msg_type_filter, topic_for_fallback)));
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return None;
+                        }
+                        Ok(payload) => {
+                            // typed suffix 过滤:caller 提供 → 用 caller 提供的;
+                            // 没提供 → fallback `unknown/Unknown`。
+                            let fqn = msg_type_filter
+                                .clone()
+                                .unwrap_or_else(|| "unknown/Unknown".into());
+                            if let Some(want) = msg_type_filter.as_ref() {
+                                if want != &fqn {
+                                    continue;
+                                }
+                            }
+                            let msg_type = match LcmMessageType::new(&fqn) {
+                                Ok(m) => m,
+                                Err(_) => continue, // 不应发生
+                            };
+                            let frame = RawLcmFrameBuilder::new(
+                                topic_for_fallback.clone(),
+                                msg_type,
+                            )
+                            .payload(payload.to_vec())
+                            .build();
+                            return Some((Ok(frame), (sub, msg_type_filter, topic_for_fallback)));
+                        }
                     }
                 }
-            }
+            })
         },
-    ))
+    );
+    Box::pin(stream)
 }
 
 // =============================================================================

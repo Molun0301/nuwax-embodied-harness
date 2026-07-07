@@ -176,9 +176,10 @@ pub struct GeometryRuntimeHandle {
     pub lcm_backend_available: bool,
     /// Phase 6 / Rework-9: Python `LcmMotionCommandBridge` 注入的 cmd_vel sink ready 信号。
     /// - `true`  — Python 侧 LcmMotionCommandBridge 已订阅 `/cmd_vel`,
-    ///             watchdog 存活,sink 可写。
+    ///   watchdog 存活,sink 可写。
     /// - `false` — bridge 未启动 / sink 未注入 / watchdog 失败 /
-    ///             providers 不实现 MotionControl / bridge.start() 抛异常。
+    ///   providers 不实现 MotionControl / bridge.start() 抛异常。
+    ///
     /// **生产 spawn 路径默认 `false`** —— 必须由 Python
     /// `LcmMotionCommandBridge.start()` 成功后通过 gateway 写回 `true`,
     /// 否则 `SetNavigationGoal` 在 `compute_readiness` 因
@@ -216,7 +217,7 @@ impl GeometryRuntimeHandle {
     /// 由 Python `LcmMotionCommandBridge` 注入:
     /// - bridge 启动 + sink 已注入 + watchdog 存活 → `true`
     /// - bridge 未启动 / sink 未注入 / watchdog 失败 → `false`
-    /// 默认构造时为 `true` 以兼容旧 fake-lcm 单测路径。
+    ///   默认构造时为 `true` 以兼容旧 fake-lcm 单测路径。
     pub fn cmd_vel_sink_ready(&self) -> bool {
         self.cmd_vel_sink_ready
             .load(std::sync::atomic::Ordering::Acquire)
@@ -515,9 +516,9 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<(Vec<u8>, u32)> {
 /// readiness 字段由 `mapping_adapter::MappingReadiness`
 /// + `nav_runtime::NavigationReadinessDetail`
 /// + `explore_runtime::ExplorationReadinessDetail` 三个 layer 各自独立暴露
-/// counters + active backend,供 Python `GeometryRuntimeProvider` diagnostics
-/// 聚合。详见 `docs/开发文档/建图导航探索重构/2026-07-07_建图导航探索库真接入与real-lcm通信实施方案/11_readiness_收敛.md`
-/// + `00_最终执行方案.md` §5 Phase 7。
+///   counters + active backend,供 Python `GeometryRuntimeProvider` diagnostics
+///   聚合。详见 `docs/开发文档/建图导航探索重构/2026-07-07_建图导航探索库真接入与real-lcm通信实施方案/11_readiness_收敛.md`
+///   + `00_最终执行方案.md` §5 Phase 7。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LcmBackendKind {
     /// 内存 fake backend（CI/开发机默认）

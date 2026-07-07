@@ -23,7 +23,7 @@
 //!   之前 Phase 2 baseline 恒 `false`,本次实装后改 true (有数据时)
 //! - `readiness()` 暴露 odom_count / pointcloud_count / last_occupancy_revision
 //!   + `mapping_ready` 综合判定;参考 `00_最终执行方案.md` §5 Phase 7 任务 1。
-//!   缺 pointcloud (count==0) → mapping_ready=false,即便 odom_count > 0 也不算 ready。
+//!     缺 pointcloud (count==0) → mapping_ready=false,即便 odom_count > 0 也不算 ready。
 //!
 //! ## 为什么不用 XyzAccumulator
 //! - `nuwax_mapping::pointclouds::accumulators::XyzAccumulator::into_points(self)`
@@ -611,7 +611,7 @@ mod tests {
         let r = MappingReadiness::compute(None, true);
         assert!(!r.ready);
         assert!(!r.adapter_present);
-        assert!(!r.lcm_backend || r.lcm_backend);  // 仅覆盖字段本身
+        assert!(r.lcm_backend);  // 仅覆盖字段本身,期望 backend true
         assert_eq!(r.odom_count, 0);
         assert_eq!(r.pointcloud_count, 0);
         assert!(r.last_error.is_some());

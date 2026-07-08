@@ -5,12 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "nuwax real-LCM 系统的 liblcm C FFI 绑定(Phase 3,2026-07-07)。默认由 nuwax-transport/real-lcm feature gate 启用。"
+description = "nuwax real-LCM 系统的 liblcm C FFI 绑定(Phase 3,2026-07-07)。由 nuwax-transport 唯一启用(2026-07-08 fake-lcm 根除后无 fake 旁路)。"
 
 [features]
-# 默认 feature:仅在用户显式开启 `link-liblcm` 时,build.rs 才探测
-# 系统 liblcm 并链接。这保证 fake-only CI / dev 镜像可以 `cargo check`
-# workspace 而不依赖 liblcm-dev 安装。
+# 2026-07-08 fake-lcm 根除后,build.rs 默认就会探测系统 liblcm 并 fail-fast。
+# 镜像必须装 liblcm-dev 1.3~1.5(版本锁 build.rs `MAX_LCM_VERSION` = "1.6")。
 link-liblcm = []
 
 [dependencies]
@@ -22,5 +21,6 @@ thiserror = { workspace = true }
 # 这样 offline mirror 缺失 `pkg-config` crate 时 build.rs 仍可工作。
 
 # 重要:本 crate **不** 通过 cargo:rustc-link-lib 强加 liblcm 依赖;
-# build.rs 用 pkg-config 探测,失败 → 标准错误 + std::process::exit(2)。
-# 当前 P0/P1 阶段,fake backend 已够用,real-lcm feature 仍为 opt-in。
+# build.rs 用 pkg-config 探测,失败 → 标准错误 + std::process::exit(2) + `LCM_VERSION_UNSUPPORTED`。
+# 2026-07-08 fake-lcm 根除后:版本锁 `>= 1.3, < 1.6`(MAX_LCM_VERSION),1.6+ wire format
+# 破坏兼容,镜像必须升级前 keep current 1.3~1.5。fake-lcm backend 已物理删除。

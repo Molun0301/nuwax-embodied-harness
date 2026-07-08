@@ -15,9 +15,8 @@
 模块位置:`services/navigation/`(与 §5 Phase 6 任务 1 一致)。
 禁止嵌入 `geometry provider` —— provider 跟 gRPC server 一起可能挂掉。
 
-real LCM Python binding 不可用时:fallback 到 `MockLcmBackend`
-(单元测试与 CI dry-run 使用),并在 `last_error` 写入
-"NUWAX_LCM_PYTHON_AVAILABLE=false"。
+real LCM Python binding 不可用时:返回 `_UnavailableBackend` 并设
+`last_error = "NUWAX_LCM_PYTHON_AVAILABLE=false"`(严禁静默 fallback)。
 """
 from __future__ import annotations
 
@@ -105,55 +104,31 @@ def clamp_twist(linear, angular, clamp: MotionClampConfig):
 
 
 # ============================================================
-# mock backend —— 不依赖 lcm Python 包,用于单测 + CI dry-run
+# 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
+# - `MockLcmBackend` 类整段物理删除
+# - `mock://` URL 强制走 `_UnavailableBackend`(no-op + last_error)
 # ============================================================
-class MockLcmBackend:
-    """进程内的 mock LCM:publish 后 subscriber 立刻从 in-memory queue 收到。"""
-
-    def __init__(self, url: str = "mock://"):
-        self.url = url
-        self._lock = threading.Lock()
-        self._next_handle = 1
-        self._subs: dict[int, Callable[[bytes], None]] = {}
-
-    def publish(self, channel: str, payload: bytes) -> None:
-        with self._lock:
-            subs = list(self._subs.items())
-        for _handle, cb in subs:
-            try:
-                cb(payload)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("MockLcmBackend 回调异常 channel=%s err=%s", channel, exc)
-
-    def subscribe(self, channel: str, callback: Callable[[bytes], None]) -> int:
-        with self._lock:
-            handle = self._next_handle
-            self._next_handle += 1
-            self._subs[handle] = callback
-        return handle
-
-    def unsubscribe(self, handle: int) -> None:
-        with self._lock:
-            self._subs.pop(handle, None)
-
-
 def _resolve_backend(url: str):
-    """根据 url 选择 backend。'mock://' 强制 mock;其它 url 尝试 import lcm。
+    """2026-07-08 fake-lcm 根除后:仅支持真实 python-lcm binding。
 
-    真实 LCM 后端要求目标机安装 `python3-lcm` 或等价本仓 binding。
-    Phase 6 阶段本仓只提供 mock backend;后续 Phase 8 installer 加
-    `python3-lcm` 后,这里返回真实 LCM binding。
+    - `mock://` URL → 立即 `_UnavailableBackend` + 错误信息(无 mock fallback)
+    - 其它 url → 尝试 `import lcm`;失败时返回 `_UnavailableBackend` 并设
+      last_error(严禁静默 fallback)
     """
     if url.startswith("mock://"):
-        return MockLcmBackend(url), True
+        return (
+            _UnavailableBackend(
+                url=url,
+                reason=(
+                    "LCM_BACKEND_UNSUPPORTED: mock:// URL 已在 2026-07-08 物理删除。"
+                    "fake-lcm backend 整体移除(v3 F2 决策);请改用 udpm://...",
+                ),
+            ),
+            False,
+        )
     try:
         import lcm as _lcm_mod  # type: ignore
     except ImportError as exc:
-        logger.warning(
-            "real LCM binding (python 'lcm' module) 不可用: %s;回退 mock backend。"
-            "目标机安装 python3-lcm 或运行 scripts/installer/phases/system.py 后将切换。",
-            exc,
-        )
         return (
             _UnavailableBackend(
                 url=url,
@@ -439,10 +414,12 @@ class LcmMotionCommandBridge:
             )
 
     def is_sink_ready(self) -> bool:
-        """cmd_vel_sink_ready = (sink 已注入) AND (backend real 或 mock 显式) AND (last_error 非致命)。"""
-        return self._twist_sink_available() and (
-            self._backend_real or isinstance(self._backend, MockLcmBackend)
-        )
+        """cmd_vel_sink_ready = (sink 已注入) AND (backend 真 real) AND (last_error 非致命)。
+
+        2026-07-08 fake-lcm 物理删除后,`MockLcmBackend` 分支已删,
+        `is_sink_ready` 仅看 `self._backend_real`(python lcm binding 装好)。
+        """
+        return self._twist_sink_available() and self._backend_real
 
     # --------------------------------------------------------
     # 内部:receiver + watchdog loop
@@ -600,7 +577,6 @@ __all__ = [
     "DEFAULT_MAX_LINEAR_M_S",
     "Go2TwistSinkAdapter",
     "LcmMotionCommandBridge",
-    "MockLcmBackend",
     "MotionClampConfig",
     "WATCHDOG_TIMEOUT_S",
     "WATCHDOG_TICK_S",

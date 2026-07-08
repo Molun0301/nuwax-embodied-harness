@@ -166,6 +166,13 @@ mod tests {
     /// 这里只验证 symbol **名字** 存在(取函数指针)。函数指针不为 null
     /// 即代表 extern 块正确链接了 libc / liblcm 符号(运行期调用的安全性
     /// 由 `nuwax-lcm` crate 负责)。
+    ///
+    /// 2026-07-08 rework21 修复:本测试裸取 liblcm 符号 `lcm_destroy` /
+    /// `lcm_handle_timeout`,必须链 liblcm 才能编过。加 `cfg(feature = "link-liblcm")`
+    /// 守护,跟 `build.rs` 的 `CARGO_FEATURE_LINK_LIBLCM` 门控对称——
+    /// 默认 features 不开 → 测试不参与 → 默认 build / `--all-targets` 都过;
+    /// 启用 `link-liblcm` → 编译时链 liblcm → 测试也编过 → 真正验证符号。
+    #[cfg(feature = "link-liblcm")]
     #[test]
     fn ffi_symbols_linked() {
         // 取地址 ≠ null 即视为 extern "C" 链接通过

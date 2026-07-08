@@ -248,12 +248,14 @@ mod tests {
 
     #[test]
     fn name_is_real_lcm() {
-        // 仅检查 trait method 的返回值(不构造 backend)
+        // 2026-07-08 fake-lcm 物理删除后:`FakeLcmBackend` 已不存在。
+        // 守恒测试:backend name 字符串必须为 "real-lcm",防止 future 重构回滚。
         fn check_name(b: &dyn LcmBackend) -> &str {
             b.name()
         }
-        // 模拟 fake backend 的 name,验证 backend trait 一致性
-        assert_eq!(check_name(&crate::FakeLcmBackend::new()), "fake-lcm");
+        let real = crate::LcmTransport::new_real("udpm://239.255.76.67:7667?ttl=1")
+            .expect("real-lcm backend 启动需 liblcm-dev 1.3~1.5");
+        assert_eq!(check_name(&real), "real-lcm");
     }
 
     /// 验证 subscription_error_stream 立即产出一条 error,然后 None

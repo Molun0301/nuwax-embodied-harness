@@ -699,7 +699,6 @@ pub fn spawn_geometry_runtime(
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
 
     let state = Arc::new(RwLock::new(SharedState::default()));
-    eprintln!("[rework17-trace] lcm_runtime: state created, before backend select");
 
     // 按 NUWAX_LCM_BACKEND 选择 backend。
     // Phase 1 fail-fast:real-lcm 请求启动期直接拒绝；不允许 fallback fake-lcm。
@@ -894,9 +893,7 @@ pub fn spawn_geometry_runtime(
         None => None,
     };
 
-    eprintln!("[rework17-trace] lcm_runtime: backend ok, before channel parse");
     let occ_msg_type = LcmMessageType::new("nav_msgs/OccupancyGrid").expect("typed");
-    eprintln!("[rework17-trace] lcm_runtime: occ_msg_type ok");
     let tf_msg_type = LcmMessageType::new("geometry_msgs/Transform").expect("typed");
     let cm_msg_type = LcmMessageType::new("sensor_msgs/PointCloud2").expect("typed");
     let nav_msg_type = LcmMessageType::new("nuwax_msgs/NavigationState").expect("typed");
@@ -931,7 +928,6 @@ pub fn spawn_geometry_runtime(
         std::env::var("NUWAX_CLOUDMAP_SHM_PATH")
             .unwrap_or_else(|_| "/tmp/nuwax_cloudmap.mmap".into())
     );
-    eprintln!("[rework17-trace] lcm_runtime: msg types created, before CloudMapShmWriter");
     let cm_writer = match CloudMapShmWriter::new(&cm_shm_path) {
         Ok(w) => Some(w),
         Err(e) => {
@@ -941,7 +937,6 @@ pub fn spawn_geometry_runtime(
     };
     // 用 parking_lot::Mutex 避免 std::sync::MutexGuard 不 Send 的问题。
     let cm_writer = Arc::new(parking_lot::Mutex::new(cm_writer));
-    eprintln!("[rework17-trace] lcm_runtime: cm_writer ok, before tf task spawn");
 
     // ---- 订阅 /tf：动态更新 transforms，按 TTL 裁剪陈旧边，合成 base→map 位姿 ----
     let map_frame = std::env::var("NUWAX_MAP_FRAME").unwrap_or_else(|_| "map".into());
@@ -959,14 +954,8 @@ pub fn spawn_geometry_runtime(
     let map_frame_owned = map_frame.clone();
     let base_candidates_owned = base_candidates.clone();
     tokio::spawn(async move {
-        eprintln!("[rework17-trace] tf task: spawned, before subscribe call");
         let mut stream = tf_transport.subscribe(tf_topic_clone, Some(tf_msg_type_clone)).await;
-        eprintln!("[rework17-trace] tf task: subscribe returned, before StreamExt");
         use futures::StreamExt;
-        eprintln!("[rework17-trace] tf task: StreamExt imported, before while loop");
-        eprintln!("[rework17-trace] tf task: calling stream.next() first time");
-        let first = stream.next().await;
-        eprintln!("[rework17-trace] tf task: first stream.next() returned: is_some={}", first.is_some());
         while let Some(frame_result) = stream.next().await {
             let frame = match frame_result {
                 Ok(f) => f,
@@ -1015,7 +1004,6 @@ pub fn spawn_geometry_runtime(
     let odom_transport = transport.clone();
     // Phase 4: 改走 channel_registry::channel_for(Odom) —— 禁止再硬编码 /odom。
     let odom_topic = channel_registry::channel_for(ChannelKey::Odom);
-    eprintln!("[rework17-trace] lcm_runtime: odom topic ok, before odom task spawn");
     let odom_msg_type = LcmMessageType::new("nav_msgs/Odometry").expect("typed");
     tokio::spawn(async move {
         let mut stream = odom_transport.subscribe(odom_topic, Some(odom_msg_type)).await;
@@ -1037,7 +1025,6 @@ pub fn spawn_geometry_runtime(
     let occ_transport = transport.clone();
     let occ_topic_clone = occ_topic.clone();
     let occ_msg_type_clone = occ_msg_type.clone();
-    eprintln!("[rework17-trace] lcm_runtime: before occ task spawn");
     tokio::spawn(async move {
         let mut stream = occ_transport.subscribe(occ_topic_clone, Some(occ_msg_type_clone)).await;
         use futures::StreamExt;
@@ -1063,7 +1050,6 @@ pub fn spawn_geometry_runtime(
         let cm_writer = cm_writer.clone();
         let cm_transport = transport.clone();
         let cm_msg_type_clone = cm_msg_type.clone();
-        eprintln!("[rework17-trace] lcm_runtime: before cm task spawn");
         tokio::spawn(async move {
             let mut stream = cm_transport.subscribe(cm_topic, Some(cm_msg_type_clone)).await;
             use futures::StreamExt;

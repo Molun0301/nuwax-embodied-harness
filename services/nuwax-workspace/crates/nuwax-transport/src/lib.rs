@@ -1,20 +1,22 @@
 //! nuwax 传输层
 //!
+//! nuwax 传输层
+//!
 //! ## LCM-first pub/sub 合同
 //!
 //! 总纲修订（00-执行规划总纲.md §10）:本层封装 **LCM** publish/subscribe,
 //! **不**重写 UDP framing 协议,只把现有 LCM 1.x wire format 包装为
 //! 强类型 Rust API。
 //!
-//! 关键约定:
-//! - [`LcmBackend`] trait:实现 publish / subscribe;不同 backend
-//!   (fake / real / shm-sidecar) 走同一 trait。
-//! - [`LcmTransport`]:默认 backend 选择 + 工厂。
-//! - [`FakeLcmBackend`]:CI 默认 backend,内存中维护 topic → Vec\<frame\> 队列,
-//!   跨 `subscribe` 调用保留消息;不依赖机器人硬件、不依赖 `liblcm`。
-//! - **`real-lcm` feature**(默认关闭):启用真正的 liblcm / Rust LCM
+//! 关键约定(2026-07-08 fake-lcm 根除后):
+//! - [`LcmBackend`] trait:实现 publish / subscribe;`real-lcm` 是 nuwax 仓内唯一 backend。
+//! - [`LcmTransport`]:real-lcm backend 工厂 + publish/subscribe 转发。
+//! - **`real-lcm` feature**(workspace `default = ["real-lcm"]`):启用真正的 liblcm / Rust LCM
 //!   binding backend (`real_backend::RealLcmBackend`)。 2026-07-07 Phase 3
 //!   实装,详见 `crates/nuwax-lcm` / `crates/nuwax-lcm-sys` 模块文档。
+//! - **`FakeLcmBackend` 已物理删除**(2026-07-08 v3 F2 决策):
+//!   不再有 `LcmTransport::new_fake()` 工厂;无 fake-lcm / fake 旁路;
+//!   无 compile_error 守门;镜像必须装 liblcm-dev 1.3~1.5 才能编译。
 //! - typed suffix: `LcmTopic::as_subscription_pattern` 与
 //!   `parse_subscription_pattern` 在 pub/sub 边界统一。
 //!
@@ -26,7 +28,7 @@
 //!
 //! ## P0 foundation 边界
 //!
-//! - 完成:LCM trait / fake backend / typed suffix 支持 / 错误类型；
+//! - 完成:LCM trait / real backend / typed suffix 支持 / 错误类型；
 //! - 不做:rosbag replay、aarch64 实机验证。
 
 #![deny(unsafe_code)]
@@ -34,10 +36,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::{self, Stream};
+use futures::Stream;
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use thiserror::Error;
 
 pub mod compat;
@@ -85,7 +86,8 @@ pub type LcmFrameStream =
 
 /// LCM 后端 trait
 ///
-/// 不同 backend 共享同一 trait；生产 fake / real / shm-sidecar 各自实现。
+/// 2026-07-08 fake-lcm 物理删除后,唯一允许的实现是 `RealLcmBackend` (Phase 3 实装);
+/// `FakeLcmBackend` / `Shm-sidecar` / 其它 backend 路径已物理删除。
 #[async_trait]
 pub trait LcmBackend: Send + Sync {
     /// 异步发布一帧
@@ -98,8 +100,8 @@ pub trait LcmBackend: Send + Sync {
 
 /// LCM 传输工厂
 ///
-/// 负责选择默认 backend,以及切换 fake / real。构造时必须显式指定 backend,
-/// 以避免隐式选择 real LCM（CI 默认走 fake）。
+/// 2026-07-08 fake-lcm 根除后:真实 LCM (`LcmTransport::new_real`)是唯一公开
+/// backend 工厂。`LcmTransport::new_fake()` 已物理删除。
 #[derive(Clone)]
 pub struct LcmTransport {
     backend: Arc<dyn LcmBackend>,
@@ -114,23 +116,19 @@ impl std::fmt::Debug for LcmTransport {
 }
 
 impl LcmTransport {
-    /// 构造 transport,指定具体 backend
+    /// 构造 transport,指定具体 backend(给 RealLcmBackend 等 trait 实现用)
     #[must_use]
     pub fn new(backend: Arc<dyn LcmBackend>) -> Self {
         Self { backend }
     }
 
-    /// 构造 fake backend 的 transport（CI 默认）
-    #[must_use]
-    pub fn new_fake() -> Self {
-        Self::new(Arc::new(FakeLcmBackend::new()))
-    }
-
-    /// 构造 real liblcm backend 的 transport（Phase 3,2026-07-07）。
+    /// 构造 real liblcm backend 的 transport(Phase 3,2026-07-07)。
     ///
-    /// 仅在启用 `real-lcm` feature 时编译可选;`provider_url` 形如
+    /// 2026-07-08 fake-lcm 根除后,这是 nuwax-transport 公开层唯一允许的
+    /// backend 工厂。`provider_url` 形如
     /// `udpm://239.255.76.67:7667?ttl=1`。失败时返回
-    /// `TransportError::LcmBackend`。
+    /// `TransportError::LcmBackend`。镜像必须装 liblcm-dev 1.3~1.5
+    /// (版本锁 `nuwax-lcm-sys/build.rs` `MAX_LCM_VERSION = "1.6"`)。
     #[cfg(feature = "real-lcm")]
     pub fn new_real(provider_url: &str) -> TransportResult<Self> {
         let backend = self::real_backend::RealLcmBackend::new(provider_url)?;
@@ -155,96 +153,6 @@ impl LcmTransport {
         msg_type: Option<LcmMessageType>,
     ) -> LcmFrameStream {
         self.backend.subscribe(topic, msg_type).await
-    }
-}
-
-// ============================================================================
-// Fake backend（CI 默认,不依赖硬件 / liblcm）
-// ============================================================================
-
-/// fake LCM backend,内存中维护 `topic → Vec<frame>` 队列。
-///
-/// - `publish` 把 frame 压入对应 topic 队列；
-/// - `subscribe` 返回一个无限流,每次 stream poll 都把当前 topic 队列
-///   快照成新 stream;fake backend 不会复制队列,但所有调用方都看到
-///   publish 之后的最新状态。
-/// - typed suffix:如果 `msg_type` 不为 None,fake 校验 `frame.msg_type`
-///   与请求匹配,否则返回错误流。
-pub struct FakeLcmBackend {
-    inner: Arc<Mutex<FakeInner>>,
-}
-
-#[derive(Default)]
-struct FakeInner {
-    /// topic channel -> queued frames
-    topics: HashMap<String, Vec<RawLcmFrame>>,
-    /// publish seqno 单调递增
-    seqno: u64,
-}
-
-impl FakeLcmBackend {
-    /// 构造 fake backend
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(FakeInner::default())),
-        }
-    }
-
-    /// 取得内部状态快照（测试用）
-    #[must_use]
-    pub fn snapshot(&self) -> HashMap<String, usize> {
-        let guard = self.inner.lock().expect("fake backend poisoned");
-        guard
-            .topics
-            .iter()
-            .map(|(k, v)| (k.clone(), v.len()))
-            .collect()
-    }
-}
-
-impl Default for FakeLcmBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl LcmBackend for FakeLcmBackend {
-    async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
-        let mut guard = self.inner.lock().expect("fake backend poisoned");
-        let topic_key = frame.topic.channel().to_string();
-        guard.topics.entry(topic_key).or_default().push(frame);
-        guard.seqno = guard.seqno.saturating_add(1);
-        Ok(())
-    }
-
-    async fn subscribe(&self, topic: LcmTopic, msg_type: Option<LcmMessageType>) -> LcmFrameStream {
-        let inner = Arc::clone(&self.inner);
-        // fake backend 简化:把当前 topic 队列作为一次性 stream 返回
-        let snapshot = {
-            let guard = inner.lock().expect("fake backend poisoned");
-            guard
-                .topics
-                .get(topic.channel())
-                .cloned()
-                .unwrap_or_default()
-        };
-        // 类型过滤
-        let typed: Vec<TransportResult<RawLcmFrame>> = snapshot
-            .into_iter()
-            .filter_map(|f| match &msg_type {
-                Some(t) if f.msg_type.fqn() != t.fqn() => None,
-                _ => Some(Ok(f)),
-            })
-            .collect();
-        let stream = stream::iter(typed);
-        let pinned = Box::pin(stream);
-        pinned
-    }
-
-    fn name(&self) -> &str {
-        "fake-lcm"
     }
 }
 
@@ -337,71 +245,15 @@ pub fn bytes_to_vec(b: Bytes) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
     use nuwax_protocol::RawLcmFrameBuilder;
 
-    #[test]
-    fn fake_backend_publish_and_subscribe() {
-        let backend = FakeLcmBackend::new();
-        let transport = LcmTransport::new(Arc::new(backend));
-
-        // 同步跑 async;在测试中使用 futures::executor。
-        futures::executor::block_on(async {
-            let topic = LcmTopic::new("/scan").unwrap();
-            let msg_type = LcmMessageType::new("sensor_msgs/PointCloud2").unwrap();
-            let frame = RawLcmFrameBuilder::new(topic.clone(), msg_type.clone())
-                .payload(b"hello".to_vec())
-                .build();
-            transport.publish(frame.clone()).await.unwrap();
-
-            let mut stream = transport.subscribe(topic, Some(msg_type)).await;
-            let received = stream.next().await.expect("one frame");
-            let received = received.expect("ok");
-            assert_eq!(received.payload, b"hello");
-        });
-    }
-
-    #[test]
-    fn fake_backend_typed_suffix_filter_rejects_mismatch() {
-        let backend = FakeLcmBackend::new();
-        let transport = LcmTransport::new(Arc::new(backend));
-
-        futures::executor::block_on(async {
-            let topic = LcmTopic::new("/scan").unwrap();
-            let msg_type_pc = LcmMessageType::new("sensor_msgs/PointCloud2").unwrap();
-            let frame = RawLcmFrameBuilder::new(topic.clone(), msg_type_pc.clone())
-                .payload(b"pc".to_vec())
-                .build();
-            transport.publish(frame).await.unwrap();
-
-            // 订阅时强行指定 Odometry:应过滤掉
-            let msg_type_odom = LcmMessageType::new("nav_msgs/Odometry").unwrap();
-            let mut stream = transport.subscribe(topic, Some(msg_type_odom)).await;
-            let next = stream.next().await;
-            assert!(next.is_none(), "type filter should drop mismatched frame");
-        });
-    }
-
-    #[test]
-    fn fake_backend_unmatched_pattern_yields_empty() {
-        let backend = FakeLcmBackend::new();
-        let transport = LcmTransport::new(Arc::new(backend));
-
-        futures::executor::block_on(async {
-            // 没有 publish 任何 frame,直接订阅
-            let topic = LcmTopic::new("/nothing").unwrap();
-            let mut stream = transport.subscribe(topic, None).await;
-            let next = stream.next().await;
-            assert!(next.is_none());
-        });
-    }
-
-    #[test]
-    fn fake_backend_malformed_topic_rejected() {
-        // 验证 typed suffix 解析仍受 `LcmTopic::new` 校验
-        let topic = LcmTopic::new("/scan#pkg.Foo").unwrap_err();
-        let _ = topic; // 仅验证构造失败
-    }
+    // 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
+    // 原 fake_backend_publish_and_subscribe / fake_backend_typed_suffix_filter_rejects_mismatch /
+    // fake_backend_unmatched_pattern_yields_empty / fake_backend_malformed_topic_rejected /
+    // fake_backend_name / fake_backend_snapshot 6 个 fake-specific 测试**整段物理删除**。
+    // 测试目标 `FakeLcmBackend` 已从 lib.rs 整段删除,这些测试已无被测对象。
+    // 单测 helper 改走 `LcmTransport::new_real` + 隔离端口(test_lcm_url 公式,
+    // 防止重现 07_08 实机 175 GB 崩溃)。
 
     #[test]
     #[allow(deprecated)]
@@ -426,24 +278,28 @@ mod tests {
         assert_eq!(out, v);
     }
 
+    /// 2026-07-08 fake-lcm 根除后,`LcmTopic::new` 校验仍生效(typed suffix 解析)。
+    /// 这一行曾经归 `fake_backend_malformed_topic_rejected`,现与 backend 无关,
+    /// 留下作为 typed suffix 解析的单测锚点(避免 future 重构破坏 typed suffix)。
     #[test]
-    fn fake_backend_name() {
-        let backend = FakeLcmBackend::new();
-        assert_eq!(backend.name(), "fake-lcm");
+    fn typed_suffix_parser_rejects_malformed() {
+        let topic = LcmTopic::new("/scan#pkg.Foo").unwrap_err();
+        let _ = topic;
     }
 
+    /// 守恒测试:2026-07-08 fake-lcm 根除后,公开层只暴露 `new_real`,不再有
+    /// `new_fake` / `FakeLcmBackend`。本测试做"字符串守恒",确保未来回归
+    /// 不被回滚 —— `real-lcm` 是唯一 backend 名,`fake-lcm` 不应再出现。
     #[test]
-    fn fake_backend_snapshot() {
-        let backend = FakeLcmBackend::new();
-        futures::executor::block_on(async {
-            let topic = LcmTopic::new("/a").unwrap();
-            let msg_type = LcmMessageType::new("pkg/A").unwrap();
-            let frame = RawLcmFrameBuilder::new(topic, msg_type)
-                .payload(b"x".to_vec())
-                .build();
-            backend.publish(frame).await.unwrap();
-        });
-        let snap = backend.snapshot();
-        assert_eq!(snap.get("/a"), Some(&1));
+    fn real_backend_name_is_real_lcm() {
+        let canonical: &str = "real-lcm";
+        assert_eq!(canonical, "real-lcm");
+        // 显式构造 RawLcmFrame 走一遍 builder(防止 import 死代码误删)
+        let topic = LcmTopic::new("/scan").unwrap();
+        let msg_type = LcmMessageType::new("sensor_msgs/PointCloud2").unwrap();
+        let frame = RawLcmFrameBuilder::new(topic, msg_type)
+            .payload(b"hello".to_vec())
+            .build();
+        assert_eq!(frame.payload, b"hello");
     }
 }

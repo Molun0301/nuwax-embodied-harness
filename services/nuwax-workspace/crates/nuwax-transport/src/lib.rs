@@ -220,6 +220,7 @@ impl LcmBackend for FakeLcmBackend {
     }
 
     async fn subscribe(&self, topic: LcmTopic, msg_type: Option<LcmMessageType>) -> LcmFrameStream {
+        eprintln!("[rework17-trace-fake] FakeLcmBackend::subscribe: topic={} msg_type={:?}", topic.channel(), msg_type.as_ref().map(|t| t.fqn()));
         let inner = Arc::clone(&self.inner);
         // fake backend 简化:把当前 topic 队列作为一次性 stream 返回
         let snapshot = {
@@ -230,6 +231,7 @@ impl LcmBackend for FakeLcmBackend {
                 .cloned()
                 .unwrap_or_default()
         };
+        eprintln!("[rework17-trace-fake] FakeLcmBackend::subscribe: snapshot len={}", snapshot.len());
         // 类型过滤
         let typed: Vec<TransportResult<RawLcmFrame>> = snapshot
             .into_iter()
@@ -238,8 +240,11 @@ impl LcmBackend for FakeLcmBackend {
                 _ => Some(Ok(f)),
             })
             .collect();
+        eprintln!("[rework17-trace-fake] FakeLcmBackend::subscribe: typed len={}", typed.len());
         let stream = stream::iter(typed);
-        Box::pin(stream)
+        let pinned = Box::pin(stream);
+        eprintln!("[rework17-trace-fake] FakeLcmBackend::subscribe: returning Pin<Box<dyn Stream>>");
+        pinned
     }
 
     fn name(&self) -> &str {

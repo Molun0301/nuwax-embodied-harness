@@ -959,10 +959,14 @@ pub fn spawn_geometry_runtime(
     let map_frame_owned = map_frame.clone();
     let base_candidates_owned = base_candidates.clone();
     tokio::spawn(async move {
-        eprintln!("[rework17-trace] tf task: spawned");
+        eprintln!("[rework17-trace] tf task: spawned, before subscribe call");
         let mut stream = tf_transport.subscribe(tf_topic_clone, Some(tf_msg_type_clone)).await;
-        eprintln!("[rework17-trace] tf task: subscribe returned");
+        eprintln!("[rework17-trace] tf task: subscribe returned, before StreamExt");
         use futures::StreamExt;
+        eprintln!("[rework17-trace] tf task: StreamExt imported, before while loop");
+        eprintln!("[rework17-trace] tf task: calling stream.next() first time");
+        let first = stream.next().await;
+        eprintln!("[rework17-trace] tf task: first stream.next() returned: is_some={}", first.is_some());
         while let Some(frame_result) = stream.next().await {
             let frame = match frame_result {
                 Ok(f) => f,

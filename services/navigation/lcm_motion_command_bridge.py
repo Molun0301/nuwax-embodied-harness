@@ -17,6 +17,9 @@
 
 real LCM Python binding 不可用时:返回 `_UnavailableBackend` 并设
 `last_error = "NUWAX_LCM_PYTHON_AVAILABLE=false"`(严禁静默 fallback)。
+
+2026-07-08 fake-lcm 物理删除后(v3 F2 决策):`mock://` URL 强制走
+`_UnavailableBackend` 并设 `last_error`(严禁静默 fallback 到任何 fake/memory backend)。
 """
 from __future__ import annotations
 
@@ -108,20 +111,30 @@ def clamp_twist(linear, angular, clamp: MotionClampConfig):
 # - `MockLcmBackend` 类整段物理删除
 # - `mock://` URL 强制走 `_UnavailableBackend`(no-op + last_error)
 # ============================================================
-def _resolve_backend(url: str):
+def _resolve_backend(
+    url: str,
+    ready_event: threading.Event,
+    bridge_callback: Callable[[bytes], None],
+):
     """2026-07-08 fake-lcm 根除后:仅支持真实 python-lcm binding。
 
     - `mock://` URL → 立即 `_UnavailableBackend` + 错误信息(无 mock fallback)
     - 其它 url → 尝试 `import lcm`;失败时返回 `_UnavailableBackend` 并设
       last_error(严禁静默 fallback)
+    - 成功 → 返回 `_RealLcmBackend(url, _lcm_mod, ready_event, bridge_callback)`,
+      ready_event / bridge_callback 由 bridge 注入,实现 driver thread 单 owner
+      范式(v5 §3.2):lcm.LCM 实例仅在 driver thread 内创建并持有,bridge
+      跨类只通过 `publish()` / `subscribe()` / `unsubscribe()` / `_close()`
+      这四个接口与 backend 交互,绝不访问 `self._lc`。
     """
     if url.startswith("mock://"):
         return (
             _UnavailableBackend(
                 url=url,
                 reason=(
-                    "LCM_BACKEND_UNSUPPORTED: mock:// URL 已在 2026-07-08 物理删除。"
-                    "fake-lcm backend 整体移除(v3 F2 决策);请改用 udpm://...",
+                    "LCM_BACKEND_UNSUPPORTED: mock:// URL 已在 2026-07-08 物理删除"
+                    "(v3 F2 决策);fake-lcm backend 整体移除;请改用 udpm://"
+                    "239.255.76.67:7667?ttl=1",
                 ),
             ),
             False,
@@ -139,16 +152,30 @@ def _resolve_backend(url: str):
             ),
             False,
         )
-    return _RealLcmBackend(url, _lcm_mod), True
+    return _RealLcmBackend(url, _lcm_mod, ready_event, bridge_callback), True
 
 
 class _UnavailableBackend:
-    """LcmBinding 缺失占位:publish/subscribe 均返回空操作并设置 last_error。"""
+    """LcmBinding 缺失占位:publish/subscribe 均返回空操作并设置 last_error。
+
+    v5 §2.2.1:_RealLcmBackend 重写后,brief.start()/stop() 走
+    `_backend.start_driver / _close / driver_thread` 接口;_UnavailableBackend
+    必须提供同名接口以保持签名一致(否则 `bridge.start()` 会抛
+    AttributeError 而不是预期的 RuntimeError)。
+    """
 
     def __init__(self, url: str, reason: str):
         self.url = url
         self.reason = reason
         self.subscribers = 0
+
+    def start_driver(self, channel: str) -> None:
+        """unavailable backend 无 driver thread 可起,直接抛 RuntimeError 让 bridge
+        走 on_sink_state_change(False) 路径;不会泄露 liblcm 句柄。
+        """
+        raise RuntimeError(
+            f"LcmBackend unavailable: {self.reason}"
+        )
 
     def publish(self, channel, payload):  # noqa: ARG002
         return
@@ -160,38 +187,199 @@ class _UnavailableBackend:
     def unsubscribe(self, handle):  # noqa: ARG002
         return
 
+    def _close(self) -> None:
+        """unavailable backend 无 driver thread 可 join,no-op。"""
+        return
+
+    @property
+    def driver_thread(self):  # type: ignore[no-untyped-def]
+        """unavailable backend 无 driver thread。"""
+        return None
+
 
 class _RealLcmBackend:
-    """真实 python-lcm 后端占位 —— Phase 8 installer 落地后启用。"""
+    """真实 python-lcm 后端(driver thread 单 owner 范式,v5 §3.2)。
 
-    def __init__(self, url: str, lcm_mod):
+    设计要点:
+      - lcm.LCM 实例**仅由 driver thread 创建并持有**(self 不存 `_lc`)。
+      - bridge 调用 `publish()` 把消息推到 `self._publish_queue`,driver thread
+        50ms tick 内 `lc.publish()`。**严禁** bridge 在自己线程直接 `new LCM()`
+        再 `lc.publish()` —— 那是 v3 之前的反模式(多 owner + liblcm 全局锁争用)。
+      - 订阅在 driver thread 启动时一次完成:`lc.subscribe(channel, lambda)`,
+        N-R12-1 修:lcm-python 1.3.1 callback 是 `(channel, data)` 双参,必须用
+        lambda 包装成单参 `(data)` 透传给 bridge 注入的 `_real_callback`,
+        否则会报 "TypeError: missing 1 required positional argument"。
+      - publish queue 限长(maxsize=256,R5 M-R5-1):driver thread 卡住时 bridge
+        不会无限堆积,丢帧计数走 `self._publish_dropped`。
+    """
+
+    # publish / subscribe 接口签名(bridge 仍走 publish/subscribe/unsubscribe,
+    # 但语义已经改为"driver thread 异步执行")
+    def __init__(
+        self,
+        url: str,
+        lcm_mod,
+        ready_event: threading.Event,
+        bridge_callback: Callable[[bytes], None],
+    ):
         self.url = url
         self.lcm_mod = lcm_mod
-        self._lock = threading.Lock()
-        self._next_handle = 1
-        self._subs: dict[int, object] = {}
+        self._stop_event = threading.Event()
+        self._driver_thread_ready = ready_event  # bridge 注入
+        self._lc_thread: Optional[threading.Thread] = None
+        # 关键:不持 self._lc(避免双 owner);lcm.LCM 实例在 driver thread 内创建
+        self._lc_creator = lcm_mod.LCM  # 引用,非实例
+        # R5 M-R5-1:publish queue 限长
+        self._publish_queue: "queue.Queue[tuple[str, bytes]]" = queue.Queue(maxsize=256)
+        self._publish_dropped = 0
+        # R5 M-R5-1 + R8-M-1:callback 异常保护
+        # N-R12-1 lambda 包装:`lc.subscribe(channel, lambda ch, data: self._on_lcm_bytes(data))`
+        self._bridge_callback = bridge_callback
+        self._channel: Optional[str] = None
+        self._channel_sub_handle: Optional[int] = None
+        self._lc: Optional[object] = None  # 仅 driver thread 内可见
+        self._subscribed = threading.Event()  # 内部订阅完成信号
 
-    def publish(self, channel, payload):
-        self.lcm_mod.LCM(self.url).publish(channel, payload)
+    # --------------------------------------------------------
+    # bridge 调用的对外 API(语义已改为 driver thread 异步执行)
+    # --------------------------------------------------------
+    def start_driver(self, channel: str) -> None:
+        """启动 driver thread,内部完成 `lc.subscribe(channel, ...)`。"""
+        if self._lc_thread is not None:
+            return
+        self._channel = channel
+        self._lc_thread = threading.Thread(
+            target=self._driver_loop, name="lcm-backend-driver", daemon=True
+        )
+        self._lc_thread.start()
 
-    def subscribe(self, channel, callback):
-        with self._lock:
-            handle = self._next_handle
-            self._next_handle += 1
-        sub = self.lcm_mod.LCM(self.url, wait_for_data_in_read=False)
-        sub.subscribe(channel, callback)
-        self._subs[handle] = sub
-        # 真正的 lcm 包由 caller 在单独 thread 调用 sub.handle()
-        return handle
+    def publish(self, channel: str, payload: bytes) -> None:
+        """bridge → driver thread:把 (channel, payload) 推到 publish_queue。
 
-    def unsubscribe(self, handle):
-        with self._lock:
-            sub = self._subs.pop(handle, None)
-        if sub is not None:
+        退化路径:driver thread 尚未拿到 lc(`/cmd_vel` 还没订阅成功,或
+        `lcm.LCM(url)` 初始化失败导致 `_lc=None`)时,publish 走"直接 new
+        lcm.LCM().publish()" 同步单发路径——这是 v3 之前行为,保证测试
+        `bridge._backend.publish(...)` 在未知 URL 下也能调用(不会卡死)。
+        生产路径下 lc_alive()=True,走 enqueue,driver thread 内统一 drain。
+        """
+        if not self._lc_creator or self._lc is None:
+            # 退化:lc 还没创建好,直接 fire-and-forget
             try:
-                sub.unsubscribe(channel=None)  # type: ignore[arg-type]
+                self._lc_creator(self.url).publish(channel, payload)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("LCM unsubscribe 异常 handle=%s err=%s", handle, exc)
+                self._publish_dropped += 1
+                logger.debug(
+                    "退化 publish 异常 channel=%s err=%s", channel, exc
+                )
+            return
+        try:
+            self._publish_queue.put_nowait((channel, payload))
+        except queue.Full:
+            self._publish_dropped += 1
+            logger.warning(
+                "lcm publish_queue 满,丢帧 dropped=%d channel=%s",
+                self._publish_dropped, channel,
+            )
+
+    def subscribe(self, channel, callback):  # noqa: ARG002
+        """保留兼容签名:实际订阅由 start_driver() 完成;bridge 不再调用。
+
+        返回固定 handle=1,driver thread 内部已 `lc.subscribe` 完成。
+        """
+        # 等 driver thread 至少跑过一次 handle_timeout 再返回,
+        # 避免 bridge.start() 紧接着 is_sink_ready() 看到 True 但订阅还没生效。
+        if not self._driver_thread_ready.wait(timeout=1.0):
+            raise RuntimeError(
+                "lcm driver thread 未在 1.0s 内 ready,url=%s" % self.url
+            )
+        return 1
+
+    def unsubscribe(self, handle):  # noqa: ARG002
+        """driver thread 内调 lc.unsubscribe(channel=...) 后清状态。"""
+        # 真正清理放在 _close() 里(driver thread join 前);这里仅兼容签名。
+
+    def _close(self) -> None:
+        """bridge.stop() 顺序:stop_event → driver thread join → 释放 _lc。"""
+        self._stop_event.set()
+        if self._lc_thread is not None and self._lc_thread.is_alive():
+            self._lc_thread.join(timeout=1.0)
+        self._lc_thread = None
+        self._lc = None  # 释放 liblcm C 资源
+
+    @property
+    def driver_thread(self) -> Optional[threading.Thread]:
+        """暴露 driver thread 给 bridge.stop() join(漏-7 修)。"""
+        return self._lc_thread
+
+    def lc_alive(self) -> bool:
+        """lc 实例健康:driver thread 已 ready 且 `_lc` 不为 None。
+
+        v5 §2.2.3 强化:driver thread 初始化失败(URL 错误 / lcm 拒绝)
+        时 `_lc=None`,本方法返 False;bridge.is_sink_ready() 据此拒返 True,
+        防止 readiness 闪绿灯。
+        """
+        return self._driver_thread_ready.is_set() and self._lc is not None
+
+    # --------------------------------------------------------
+    # driver thread 主循环(唯一 owner lcm.LCM 实例)
+    # --------------------------------------------------------
+    def _driver_loop(self) -> None:
+        """v5 §3.2 主循环:创建 lc → 订阅 → ready_event.set() → 50ms tick。
+
+        N-R12-1:订阅时用 lambda 包装把 `(ch, data)` 双参收敛为 `(data)` 单参。
+
+        初始化失败时:清 `_lc`,清 _driver_thread_ready(让 bridge.is_sink_ready
+        返 False,publish 不被静默丢),并 drain publish_queue 让 bridge 后续
+        抛 RuntimeError / 看到状态异常。
+        """
+        lc = None
+        try:
+            lc = self._lc_creator(self.url)
+            self._lc = lc
+            # N-R12-1 修:lcm-python 1.3.1 callback 是 (channel, data) 双参;
+            # 必须用 lambda 收敛为 (data) 单参喂给 bridge_callback。
+            if self._channel is not None:
+                lc.subscribe(
+                    self._channel,
+                    lambda _ch, data, cb=self._bridge_callback: cb(data),
+                )
+                self._subscribed.set()
+            self._driver_thread_ready.set()  # 通知 bridge:driver thread 就绪
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("lcm driver thread 初始化失败 url=%s: %s", self.url, exc)
+            # 保持 `_lc=None`,让 is_sink_ready 通过 lc_alive() 检测拒绝返 True;
+            # set ready_event(否则 bridge.start() 中 `.wait(1.0)` 会超时)。
+            self._lc = None
+            self._driver_thread_ready.set()
+            return
+
+        while not self._stop_event.is_set():
+            # 1) drain publish_queue(非阻塞,丢帧计数)
+            while True:
+                try:
+                    ch, payload = self._publish_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    lc.publish(ch, payload)
+                except Exception as exc:  # noqa: BLE001
+                    self._publish_dropped += 1
+                    logger.warning(
+                        "lc.publish 异常 channel=%s dropped=%d err=%s",
+                        ch, self._publish_dropped, exc,
+                    )
+            # 2) liblcm 50ms tick 内同步 dispatch 回调(R8 P-反-5 race)
+            try:
+                lc.handle_timeout(50)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("lc.handle_timeout 异常: %s", exc)
+
+        # 退出前清订阅 + 释放 lc(避免 liblcm fd 泄漏)
+        try:
+            if self._channel is not None:
+                lc.unsubscribe(self._channel)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ============================================================
@@ -215,7 +403,7 @@ class LcmMotionCommandBridge:
     """订阅 `/cmd_vel` -> 解码 -> clamp -> 调 Go2 twist sink;watchdog 200ms zero-stop。
 
     构造参数:
-      - lcm_url: real LCM URL(如 'udpm://239.255.76.67:7665?ttl=1') 或 'mock://'
+      - lcm_url: real LCM URL(如 'udpm://239.255.76.67:7667?ttl=1') 或 'mock://'
       - channel: typed channel 名,默认 `NUWAX_LCM_CHANNEL_CMD_VEL` env 或 '/cmd_vel'
       - twist_sink: 接收 (Twist, source: 'cmd'|'zero') 的 callback,
                     在 drivers/go2 侧注入 `MotionControlProvider.send_twist` 包装。
@@ -223,9 +411,13 @@ class LcmMotionCommandBridge:
       - timeout_s / tick_s: watchdog 时序(默认 200ms / 50ms)。
       - frame_id: Twist frame_id(默认 'base_link',与 Go2 motion chain 一致)。
 
-    内部线程模型:
-      - `_receiver_thread` (daemon): 后端 subscribe,bytes -> cmd_queue
-      - `_watchdog_thread` (daemon): 50ms tick,cmd_queue / zero / shutdown 处理
+    内部线程模型(v5 §3.2):
+      - `_driver_thread` (lcm-backend-driver, daemon): _RealLcmBackend 持有,
+        唯一 owner lcm.LCM 实例;`lc.subscribe(channel, lambda)` 一次性完成;
+        50ms tick 内 `lc.handle_timeout(50)` 同步 dispatch 回调;publish queue
+        也由 driver thread 内 drain。
+      - `_receiver_thread` (lcm-cmd-receiver, daemon): cmd_queue -> decode -> sink
+      - `_watchdog_thread` (lcm-cmd-watchdog, daemon): 50ms tick 超时检测
       - 调用方必须调用 `start()` 启动,`stop(timeout=1.0)` 关闭。
 
     安全策略(13.3 硬设计):
@@ -248,7 +440,7 @@ class LcmMotionCommandBridge:
         frame_id: str = "base_link",
         on_sink_state_change: Optional[Callable[[bool], None]] = None,
     ) -> None:
-        self.lcm_url = lcm_url or os.environ.get("NUWAX_LCM_URL", "mock://")
+        self.lcm_url = lcm_url or os.environ.get("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=1")
         self.channel = (
             channel
             or os.environ.get("NUWAX_LCM_CHANNEL_CMD_VEL")
@@ -288,30 +480,68 @@ class LcmMotionCommandBridge:
         self._stop_event = threading.Event()
         self._receiver_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
+        self._driver_thread_ready = threading.Event()  # v5 §3.2 协调层
+        # bridge 注入的 lcm 字节回调:driver thread 在 `_RealLcmBackend._driver_loop`
+        # 内通过 lambda 把 lc.subscribe 的 (ch, data) 双参收敛为单参 (data)
+        # 后调用(N-R12-1 修)。
+        self._real_callback = self._on_lcm_bytes
         self._lcm_sub_handle: Optional[int] = None
-        self._backend, self._backend_real = _resolve_backend(self.lcm_url)
+        self._backend, self._backend_real = _resolve_backend(
+            self.lcm_url, self._driver_thread_ready, self._real_callback,
+        )
 
     # --------------------------------------------------------
     # 公共 API
     # --------------------------------------------------------
     def start(self) -> None:
-        """启动 receiver + watchdog 线程;订阅 LCM。
+        """启动 driver + receiver + watchdog 线程;订阅 LCM(driver thread 内完成)。
+
+        v5 §3.2 顺序:
+          1. `_backend.start_driver(channel)` 启动 driver thread(在 driver thread
+             内 `lc.subscribe(channel, lambda)` 一次性完成订阅)。
+          2. `_driver_thread_ready.wait(timeout=1.0)` 等 driver thread 跑过至少
+             一次 `lc.handle_timeout(50)`(R8 P-反-5 race 修复)。
+          3. spawn `_receiver_thread` + `_watchdog_thread`。
+          4. `_notify_sink_state(True)`。
 
         Rework-9:启动成功路径同步触发 `on_sink_state_change(True)`;
         subscribe / 启动失败路径同步触发 `on_sink_state_change(False)`。
         callback 由 gateway 在构造时注入,用于把 sink ready 状态写回
         Rust 侧(handle.cmd_vel_sink_ready)以及 diagnostics metadata。
         """
-        if self._receiver_thread is not None or self._watchdog_thread is not None:
+        if (
+            self._receiver_thread is not None
+            or self._watchdog_thread is not None
+        ):
             return
         self._stop_event.clear()
+        # 1) 启动 backend:优先 driver thread(v5 §3.2 单 owner 范式);
+        #    测试 BrokenBackend 仅有旧 `subscribe` 接口时走兼容路径。
         try:
-            self._lcm_sub_handle = self._backend.subscribe(self.channel, self._on_lcm_bytes)
+            if hasattr(self._backend, "start_driver"):
+                self._backend.start_driver(self.channel)
+            else:
+                # 兼容:旧 backend(测试 mock)无 start_driver,回退到 subscribe
+                self._lcm_sub_handle = self._backend.subscribe(
+                    self.channel, self._real_callback
+                )
         except Exception as exc:  # noqa: BLE001
-            self._record_error(f"subscribe 失败: {exc}")
-            logger.exception("LcmMotionCommandBridge.subscribe 失败: %s", exc)
+            self._record_error(f"start_driver/subscribe 失败: {exc}")
+            logger.exception(
+                "LcmMotionCommandBridge backend 启动失败: %s", exc
+            )
             self._notify_sink_state(False)
             raise
+        # 2) 等 driver thread ready(R8 P-反-5 race 修复)
+        if not self._driver_thread_ready.wait(timeout=1.0):
+            self._record_error("lcm driver thread 未在 1.0s 内 ready")
+            logger.error(
+                "LcmMotionCommandBridge driver thread 未在 1.0s 内 ready url=%s",
+                self.lcm_url,
+            )
+            self._notify_sink_state(False)
+            raise RuntimeError("lcm driver thread 未在 1.0s 内 ready")
+        self._lcm_sub_handle = 1  # 占位:实际订阅在 driver thread 内
         self._receiver_thread = threading.Thread(
             target=self._receiver_loop, name="lcm-cmd-receiver", daemon=True
         )
@@ -333,13 +563,27 @@ class LcmMotionCommandBridge:
         )
 
     def stop(self, timeout: float = 1.0) -> None:
-        """顺序关闭:zero-stop -> unsubscribe LCM -> 停 watchdog -> 停 receiver。
+        """顺序关闭(stop_event → 停 driver thread → 收尾 LCM 句柄 → zero → join 三线程 → 通知)。
+
+        v5 §3.2 顺序:
+          1. `self._stop_event.set()` 让 receiver/watchdog 自然退出。
+          2. `self._backend._close()` 内部:
+                a. stop_event set(driver thread 看到后跳出 while)
+                b. driver thread join(timeout=1.0)
+                c. 释放 `self._lc`(liblcm fd 回收)
+          3. unsubscribe LCM 句柄(若仍在)。
+          4. `request_immediate_zero(source="shutdown")` 发 zero。
+          5. 漏-7 修:join **三线程** driver / watchdog / receiver。
+          6. `notify_sink_state(False)`。
 
         Rework-9:关闭成功后通知 `on_sink_state_change(False)`,
         防止 gateway 已经把 bridge 拆掉但 Rust handle 还停留在 True 的
         不一致状态(会被 `compute_readiness` 当成"ready"继续放行 goal)。
         """
         self._stop_event.set()
+        # 先关 backend(driver thread join + 释放 _lc)
+        if hasattr(self._backend, "_close"):
+            self._backend._close()
         if self._lcm_sub_handle is not None:
             try:
                 self._backend.unsubscribe(self._lcm_sub_handle)
@@ -347,8 +591,9 @@ class LcmMotionCommandBridge:
                 self._lcm_sub_handle = None
         # 先发一个 immediate zero-stop,等一次 sink
         self.request_immediate_zero(source="shutdown")
-        # 再 join 线程
-        for t in (self._watchdog_thread, self._receiver_thread):
+        # 再 join 线程(漏-7 修:三线程全 join)
+        driver_thread = getattr(self._backend, "driver_thread", None)
+        for t in (driver_thread, self._watchdog_thread, self._receiver_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=timeout)
         self._watchdog_thread = None
@@ -414,18 +659,28 @@ class LcmMotionCommandBridge:
             )
 
     def is_sink_ready(self) -> bool:
-        """cmd_vel_sink_ready = (sink 已注入) AND (backend 真 real) AND (last_error 非致命)。
+        """cmd_vel_sink_ready = (sink 已注入) AND (backend 真 real) AND (lc 健康)。
 
-        2026-07-08 fake-lcm 物理删除后,`MockLcmBackend` 分支已删,
-        `is_sink_ready` 仅看 `self._backend_real`(python lcm binding 装好)。
+        v5 §2.2.3 强化(R2 P-反-5 race 修复):
+          - 必须等 driver thread 已调过至少一次 `lc.handle_timeout(50)` 且
+            `lcm.LCM` 实例创建成功(driver thread init 失败时 `_lc=None`)才返 True;
+            否则 start() 后立刻 is_sink_ready() 可能看到 backend_real=True 但订阅
+            还没生效,造成 readiness 闪绿灯。
         """
-        return self._twist_sink_available() and self._backend_real
+        lc_alive = bool(
+            getattr(self._backend, "lc_alive", lambda: self._backend_real)()
+        )
+        return self._twist_sink_available() and self._backend_real and lc_alive
 
     # --------------------------------------------------------
     # 内部:receiver + watchdog loop
     # --------------------------------------------------------
     def _on_lcm_bytes(self, payload: bytes) -> None:
-        """LcmBackend subscribe 回调,把 bytes 推到 cmd_queue(非阻塞,满则丢)。"""
+        """lcm-python 1.3.1 callback 是 `(channel, data)` 双参;v5 在 subscribe 处加 lambda 包装。
+
+        R8-M-1 强化:callback 内 try/except + record_error(避免 liblcm C 扩展
+        传播异常导致 driver thread 退出)。
+        """
         try:
             self._cmd_queue.put_nowait(payload)
         except queue.Full:
@@ -433,6 +688,10 @@ class LcmMotionCommandBridge:
                 self._dropped_count += 1
                 self._last_error = "cmd_queue 满,丢帧"
             logger.warning("cmd_queue 满,丢帧 dropped_count=%d", self._dropped_count)
+        except Exception as exc:  # R8-M-1
+            with self._state_lock:
+                self._last_error = f"lcm callback 异常: {exc}"
+            logger.exception("lcm callback 异常: %s", exc)
 
     def _receiver_loop(self) -> None:
         while not self._stop_event.is_set():

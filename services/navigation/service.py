@@ -1039,14 +1039,41 @@ class NavigationService:
                 self._exploration_update_subscription_id = None
 
     def _get_exploration_provider(self) -> ExplorationProvider:
+        # v1.1 改造：GatewayError 追加 details={"capability", ...} hint，
+        # 让前端 / debug_panel / start_gateway.sh log scrubber 能直接拿到
+        # runtime_status（或 provider_available / exploration_available）而无需
+        # 再翻 runtime context；上游错误体字段兼容（details dict 可增 key）。
+        runtime_status: Dict[str, object] = {}
+        owner = getattr(self, "_provider_owner", None)
+        if owner is not None:
+            getter = getattr(owner, "get_runtime_status", None)
+            if callable(getter):
+                try:
+                    runtime_status = dict(getter() or {})
+                except Exception:
+                    # runtime_status 取不到不影响主错误抛出；降级为空 dict 即可
+                    runtime_status = {}
         provider = self._find_exploration_provider()
         if provider is None:
-            raise GatewayError("当前平台几何运行时未提供探索后端。")
+            raise GatewayError(
+                "当前平台几何运行时未提供探索后端（runtime phase=%s, message=%s）。"
+                % (
+                    runtime_status.get("phase") or "unknown",
+                    runtime_status.get("message") or "<none>",
+                ),
+                details={"capability": "exploration", "runtime_status": runtime_status},
+            )
         if not provider.is_available():
-            raise GatewayError("当前探索后端暂不可用。")
+            raise GatewayError(
+                "当前探索后端暂不可用。",
+                details={"capability": "exploration", "provider_available": False},
+            )
         availability_checker = getattr(provider, "is_exploration_available", None)
         if callable(availability_checker) and not availability_checker():
-            raise GatewayError("当前探索后端暂不可用。")
+            raise GatewayError(
+                "当前探索后端暂不可用。",
+                details={"capability": "exploration", "exploration_available": False},
+            )
         return provider
 
     def _find_exploration_provider(self) -> Optional[ExplorationProvider]:

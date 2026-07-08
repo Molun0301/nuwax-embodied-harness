@@ -15,7 +15,8 @@ members = [
     # - nuwax-lcm-sys: 纯 extern "C" 绑定 + pkg-config 探测系统 liblcm
     # - nuwax-lcm:    RAII + 单 owner 事件线程,把 liblcm 的 publish/subscribe
     #                 暴露为 `LcmContext` / `LcmHandle`
-    # 两个 crate 默认关闭(real-lcm feature gate);fake backend 仍为 CI 默认。
+    # 2026-07-08 fake-lcm 根除(v3 F2 决策):real-lcm 是唯一 LCM 链路;
+    # nuwax-lcm-sys 版本锁 `>= 1.3, < 1.6`(build.rs fail-fast)。
     "crates/nuwax-lcm-sys",
     "crates/nuwax-lcm",
     "crates/nuwax-core",

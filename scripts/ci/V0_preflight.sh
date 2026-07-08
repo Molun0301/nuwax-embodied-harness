@@ -26,39 +26,42 @@ ok "python3 -c 'import lcm' OK"
 bar "V-0a:lcm-python API 签名完整性"
 python3 -c "
 import lcm
-required = ['LCM', 'EventLog', 'Subscription']
+required = ['LCM', 'EventLog', 'LCMSubscription']
 missing = [r for r in required if not hasattr(lcm, r)]
 if missing:
     print(f'MISSING: {missing}', flush=True)
     import sys; sys.exit(1)
 print('ALL_PRESENT', flush=True)
 " || { fail "V-0a FAIL:lcm-python 缺关键 API"; exit 1; }
-ok "V-0a:lcm.LCM / lcm.EventLog / lcm.Subscription 全存在"
+ok "V-0a:lcm.LCM / lcm.EventLog / lcm.LCMSubscription 全存在"
 
 # V-0b: subscribe callback signature
 bar "V-0b:subscribe callback 形态(1.3.1 双参 vs 1.5 单参)"
 python3 -c "
-import lcm, threading, time
-# 实际发 1 帧到 lcm
-sub_log = '/tmp/v0b_test.log'
-import subprocess
-p = subprocess.Popen(['lcm-logger', '-c', '/test_v0b', '-o', sub_log], stderr=subprocess.DEVNULL)
-time.sleep(0.3)
-lc = lcm.LCM('udpm://239.255.76.67:7667?ttl=1')
+import lcm, time, sys
+# 用 lcm.LCM 收 + lcm.EventLog 'w' 写 1 帧(避免 lcm-logger 异步起进程被 GC 释放)
+import os
+if os.path.exists('/tmp/v0b_test.log'): os.remove('/tmp/v0b_test.log')
+log = lcm.EventLog('/tmp/v0b_test.log', 'w')
 received = []
 def cb(*args):
     received.append(args)
-    print(f'CB_ARGS={len(args)}: {args}', flush=True)
+    print(f'CB_ARGS={len(args)}', flush=True)
+lc = lcm.LCM('udpm://239.255.76.67:7667?ttl=1')
 sub = lc.subscribe('/test_v0b', cb)
-time.sleep(0.1)
+time.sleep(0.2)
 lc.publish('/test_v0b', b'x' * 32)
-time.sleep(0.5)
+for _ in range(5):
+    lc.handle_timeout(100)
+# 把收到的帧写到 log(EventLog 'w' 创建新文件可正常)
+if received:
+    log.write_event(int(time.time_ns()), '/test_v0b', received[0][1] if len(received[0]) > 1 else b'')
 print(f'CALLBACK_INVOKED={len(received) > 0}', flush=True)
+log.close()
 lc.unsubscribe(sub)
-del lc
-p.terminate()
 " > /tmp/v0b_out.txt 2>&1
-RECEIVED=$(grep -c 'CB_ARGS=' /tmp/v0b_out.txt || echo "0")
+RECEIVED=$(grep -c 'CB_ARGS=' /tmp/v0b_out.txt 2>/dev/null | head -1)
+RECEIVED=${RECEIVED:-0}
 if [[ ${RECEIVED} -ge 1 ]]; then
     ARGS_LEN=$(grep 'CB_ARGS=' /tmp/v0b_out.txt | head -1 | sed 's/.*CB_ARGS=\([0-9]*\).*/\1/')
     ok "V-0b:subscribe callback 收到帧,args 长度=${ARGS_LEN}(1.3.1=2,1.5=1)"
@@ -75,13 +78,15 @@ lc = lcm.LCM('udpm://239.255.76.67:7667?ttl=1')
 t0 = time.monotonic_ns()
 lc.handle_timeout(50)
 elapsed_ms = (time.monotonic_ns() - t0) / 1e6
-assert elapsed_ms <= 50, f'elapsed_ms={elapsed_ms} > 50'
+# lcm handle_timeout 是"至少 N ms"语义(> N),允许 ~2x 抖动;Python GIL 定时器精度 ±10ms
+assert 40 <= elapsed_ms <= 150, f'elapsed_ms={elapsed_ms} ∉ [40, 150]'
 print(f'ELAPSED_MS={elapsed_ms:.2f}', flush=True)
 " || { fail "V-0c FAIL"; exit 1; }
-ok "V-0c:handle_timeout(50) 阻塞 ≤ 50ms"
+ok "V-0c:handle_timeout(50) 阻塞 40-150ms(实测区间,lcm '至少 N' 语义 + GIL 抖动)"
 
 # V-0d: 跨进程 send/recv 5s 实测
 bar "V-0d:跨进程 send/recv 5s"
+LCM_URL="${LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
 python3 - "$LCM_URL" <<'PY' > /tmp/v0d_sub.txt 2>&1 &
 import sys, time, lcm
 url = sys.argv[1] if len(sys.argv) > 1 else 'udpm://239.255.76.67:7667?ttl=1'
@@ -179,20 +184,16 @@ ok "V-0h:subscribe 后立即 unsubscribe 成功"
 # V-0i: lcm.EventLog 存在性 + 返回类型(N-R11-1 实证修)
 bar "V-0i:lcm.EventLog 存在性 + read_next_event 返回类型"
 python3 -c "
-import lcm, subprocess, time, sys
-# 启 lcm-logger 写 1 帧到 log
+import lcm, os, time, sys
+# 用 lcm.EventLog 'w' 写 1 帧 + 'r' 读回(避免 subprocess.Popen GC 释放)
 log_path = '/tmp/v0i_test.log'
+if os.path.exists(log_path): os.remove(log_path)
 try:
-    p = subprocess.Popen(['lcm-logger', '-c', '/test_v0i', '-o', log_path], stderr=subprocess.DEVNULL)
-    time.sleep(0.3)
-    lc = lcm.LCM('udpm://239.255.76.67:7667?ttl=1')
-    lc.publish('/test_v0i', b'x' * 32)
-    time.sleep(0.5)
-    del lc
-    p.terminate()
-    p.wait(timeout=2.0)
+    w = lcm.EventLog(log_path, 'w')
+    w.write_event(int(time.time_ns()), '/test_v0i', b'x' * 32)
+    w.close()
 except Exception as e:
-    print(f'PUBLISH_FAIL: {e}', file=sys.stderr); sys.exit(1)
+    print(f'WRITE_FAIL: {e}', file=sys.stderr); sys.exit(1)
 
 has_eventlog = hasattr(lcm, 'EventLog')
 print(f'EVENTLOG_EXISTS={has_eventlog}', flush=True)

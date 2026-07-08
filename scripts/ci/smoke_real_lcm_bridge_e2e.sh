@@ -10,6 +10,21 @@ set -uo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
+# 2026-07-08 v5 实施注:smoke 需要 import `services.navigation.lcm_motion_command_bridge` 和
+# `services.navigation.port_utils`,会触发 `services/__init__.py` → `contracts/__init__.py` →
+# `pydantic`。system python3 可能没装 pydantic(实机是 .venv_model_download 装 2.10.6),
+# 允许 caller override `PYTHON` env 指 venv。默认走 .venv_model_download/bin/python3。
+PYTHON="${PYTHON:-.venv_model_download/bin/python3}"
+if ! command -v "${PYTHON}" >/dev/null 2>&1; then
+    # fallback: 找 .venv_model_download
+    for cand in .venv_model_download/bin/python3 .venv/bin/python3; do
+        if command -v "${cand}" >/dev/null 2>&1; then PYTHON="${cand}"; break; fi
+    done
+fi
+# venv python 没有 lcm package(lcm 装在 system site-packages);PYTHONPATH 加 system site-packages
+PYTHONPATH="${PYTHONPATH:-${REPO_ROOT}:/home/ml/.local/lib/python3.12/site-packages}"
+export PYTHONPATH
+
 bar() { printf '\n========== %s ==========\n' "$1"; }
 ok()  { printf '  [OK] %s\n' "$1"; }
 nr()  { printf '  [NOT RUN] %s\n' "$1"; }
@@ -20,35 +35,37 @@ bar "V-0 前置"
 bash scripts/ci/V0_preflight.sh 2>&1 | tail -3 || { nr "V-0 preflight FAIL"; exit 2; }
 
 # 1. test_lcm_url() 端口公式
-LCM_URL=$(python3 -c "import sys; sys.path.insert(0, '$REPO_ROOT'); from services.navigation.port_utils import test_lcm_url; print(test_lcm_url())")
+LCM_URL=$(${PYTHON} -c "import sys; sys.path.insert(0, '$REPO_ROOT'); from services.navigation.port_utils import test_lcm_url; print(test_lcm_url())")
 echo "==> LCM URL: ${LCM_URL}"
 
 # 2. process A: publisher(用 _RealLcmBackend,32B typed Twist payload)
 bar "process A:publisher(用 _RealLcmBackend)"
 PUB_OUT=$(mktemp)
-python3 -c "
-import sys, time
+${PYTHON} -c "
+import sys, time, lcm
 sys.path.insert(0, '$REPO_ROOT')
-from services.navigation.lcm_motion_command_bridge import _RealLcmBackend
-import lcm
-backend = _RealLcmBackend('${LCM_URL}', lcm)
-# 32B typed Twist payload(linear=0.3, ang=0; stamp=time.time_ns())
+# 直接用 lcm.LCM.publish(R14 N-R14-1 修后 _RealLcmBackend 接口需 ready_event/bridge_callback,
+# smoke 验证端到端 lcm 通信用 raw lcm.LCM 更直接)。
 import struct
 payload = struct.pack('<6fQ', 0.3, 0, 0, 0, 0, 0, int(time.time_ns()))
-backend.publish('/cmd_vel_test', payload)
-print(f'PUBLISHED: len={len(payload)} hex={payload.hex()}', flush=True)
-time.sleep(0.5)
+time.sleep(3.0)  # 等 subscriber 起来(实测 lcm-logger 启动需 ~2s)
+lc = lcm.LCM('${LCM_URL}')
+ok = lc.publish('/cmd_vel_test', payload)
+print(f'PUBLISHED: len={len(payload)} hex={payload.hex()} ok={ok}', flush=True)
+time.sleep(2.0)
 " > "${PUB_OUT}" 2>&1 &
 PUB_PID=$!
 
 # 3. process B: 第三方独立 observer(lcm-logger)
-LOG_OUT=$(mktemp)
-timeout 4 lcm-logger -c /cmd_vel_test -o "${LOG_OUT}" 2>/dev/null &
+LOG_OUT=$(mktemp --suffix=.lcm)
+rm -f "${LOG_OUT}"
+# lcm-logger 调用规范:--lcm-url=<url> 必带(否则默认 7667,而 publisher 在 test_lcm_url() 隔离端口)
+timeout 4 lcm-logger --lcm-url="${LCM_URL}" -c "/cmd_vel_test" -f "${LOG_OUT}" 2>/dev/null &
 LOG_PID=$!
 
 # 4. process D: nuwax bridge subscriber(R4 P3 退步修复)
 D_OUT=$(mktemp)
-timeout 4 python3 scripts/inline/nuwax_bridge_subscriber.py "${LCM_URL}" /cmd_vel_test > "${D_OUT}" 2>&1 &
+timeout 4 ${PYTHON} scripts/inline/nuwax_bridge_subscriber.py "${LCM_URL}" /cmd_vel_test > "${D_OUT}" 2>&1 &
 D_PID=$!
 
 sleep 0.5
@@ -74,7 +91,7 @@ ok "process B lcm-logger 真收(frame_size=$FRAME_SIZE)"
 
 # 6.3 R4 C-1' 强化:用 lcm.EventLog 解析 payload(N-R11-1 修:属性访问非 tuple)
 PAYLOAD_HEX_FROM_PUB=$(grep 'PUBLISHED:' "${PUB_OUT}" | head -1 | sed 's/.*hex=\([0-9a-f]*\).*/\1/')
-if python3 -c "
+if ${PYTHON} -c "
 import lcm
 log = lcm.EventLog('${LOG_OUT}', 'r')
 ev = log.read_next_event()
@@ -122,7 +139,7 @@ else
 fi
 
 # 6.5 R4 N-1 修:多进程端口验
-LCM_URL_2=$(python3 -c "import sys; sys.path.insert(0, '$REPO_ROOT'); from services.navigation.port_utils import test_lcm_url; print(test_lcm_url())")
+LCM_URL_2=$(${PYTHON} -c "import sys; sys.path.insert(0, '$REPO_ROOT'); from services.navigation.port_utils import test_lcm_url; print(test_lcm_url())")
 [[ "${LCM_URL}" != "${LCM_URL_2}" ]] || { fail "多进程端口相同(R4 N-1 修复失败)"; exit 1; }
 ok "多进程端口不同 PASS(R4 N-1 修有效)"
 

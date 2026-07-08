@@ -869,7 +869,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         lcm_url=_cfg_str("NUWAX_LCM_URL", build_default_lcm_url()),
         # Phase 0 收敛：LCM backend canonical 命名只允许 real-lcm / fake-lcm；
         # 历史 alias (real/fake) 在 _normalize_lcm_backend 归一化并打 warning。
-        lcm_backend=_normalize_lcm_backend(_cfg_str("NUWAX_LCM_BACKEND", "fake-lcm")),
+        lcm_backend=_normalize_lcm_backend(_cfg_str("NUWAX_LCM_BACKEND", "real-lcm")),
         nuwax_workspace_dir=_cfg_str(
             "NUWAX_NUWAX_WORKSPACE_DIR",
             build_default_nuwax_workspace_dir(),

@@ -19,9 +19,13 @@ use std::process::{Command, ExitCode, Stdio};
 
 /// 期望的 liblcm 最低版本(major.minor)。
 ///
-/// 上游 liblcm 1.x 系列 ABI 在 1.4 之后稳定;早于 1.4 的罕见私有 fork 可能
-/// struct layout 不兼容,直接拒绝。
-const REQUIRED_LCM_VERSION: &str = "1.4";
+/// 2026-07-08 修订:从 "1.4" 降到 "1.3"。
+/// 原因:实机(Go2 Jetson / Ubuntu 20.04 focal)apt 仓库最高只提供 liblcm 1.3.1,
+/// 按"实机配置是 SSOT"原则不能动实机;liblcm 1.x 系列协议与 7 个 FFI 函数
+/// (lcm_create/destroy/publish/subscribe/unsubscribe/handle_timeout/get_fileno)
+/// 自 1.0 起签名未变,1.3 与 1.4 ABI 实际兼容;原先的"1.4 之前 ABI 不稳定"
+/// 描述是误判——focal 仓库的 1.3.1 是上游 vanilla,不是私有 fork。
+const REQUIRED_LCM_VERSION: &str = "1.3";
 
 fn main() -> ExitCode {
     // Phase 3 设计:

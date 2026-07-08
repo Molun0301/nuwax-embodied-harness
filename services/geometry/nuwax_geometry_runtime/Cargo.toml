@@ -11,41 +11,22 @@ description = "nuwax 平台几何 LCM/nuwax native runtime 子进程（独立于
 [dependencies]
 # nuwax-workspace path deps（LCM-first）。
 #
-# Phase 5 (2026-07-07) 修订 — codex rework lane-11 (fake-only 构建路径真接通):
-# - `nuwax-transport/real-lcm` 已实装(本仓 `services/nuwax-workspace/crates/nuwax-lcm*`)
-# - **Runtime binary 生产默认启 real-lcm** —— 由下方 `default = ["real-lcm-bridge"]`
-#   走 `real-lcm-bridge = ["nuwax-transport/real-lcm"]` 显式拉入,
-#   使 lcm_runtime.rs `Real` 分支(`cfg(feature = "real-lcm-bridge")`)
-#   真起 liblcm / `LcmTransport::new_real(url)`。
-# - **去掉 dependency 行上的 `features = ["real-lcm"]`** —— 那是无条件 union,
-#   cargo 不允许下游 feature 关闭,导致 fake-lcm-test 路径仍强制链 liblcm;
-#   改为 `default-features = false`(nuwax-transport 无 default feature),
-#   把"启不启 real-lcm"的决定权完全交给本 binary 自己的 feature 块。
-# - CI 镜像编译 fake-only 二进制(无 liblcm-dev)用
-#   `cargo build --no-default-features --features fake-lcm-test`;
-#   走 fake-lcm-test 时 `real-lcm-bridge` **不被 default 拉入**,
-#   `nuwax-transport/real-lcm` 因此也**不被拉入** → fake-only 二进制成立。
+# 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
+# - `nuwax-transport/real-lcm` 是唯一 backend(workspace `default = ["real-lcm"]`),
+#   镜像必须装 liblcm-dev 1.3~1.5
+# - 本 binary 仍用 `real-lcm-bridge` 二次断言 feature 门,生产默认启用,
+#   取消 `--no-default-features --features fake-lcm-test` 旁路
+# - 取消 upstream `nuwax-transport` 行的 `default-features = false` 旁路,
+#   工作区默认已拉入 real-lcm
 #
 # 上游 dimos 路径仍保留 Phase 1 baseline — Phase 8/9 再替换为本仓相对路径。
 nuwax-protocol = { path = "../../nuwax-workspace/crates/nuwax-protocol" }
-# 见上方 Phase 5 注释 ——
-# 之前 `features = ["real-lcm"]` 把 upstream feature 钉死,
-# 现改 `default-features = false`,由下方 `[features]` 块决定是否启用。
-nuwax-transport = { path = "../../nuwax-workspace/crates/nuwax-transport", default-features = false }
+nuwax-transport = { path = "../../nuwax-workspace/crates/nuwax-transport" }
 nuwax-codec = { path = "../../nuwax-workspace/crates/nuwax-codec" }
 nuwax-tf = { path = "../../nuwax-workspace/crates/nuwax-tf" }
 
-# Phase 4:real-lcm bridge feature gate —— runtime binary 默认启用
-# (Phase 5 rework lane-11 后,upstream `nuwax-transport/real-lcm` 由本 binary
-# 的 `default = ["real-lcm-bridge"]` + `real-lcm-bridge = ["nuwax-transport/real-lcm"]`
-# 二次断言链路拉入,而非 dependency 行无条件 union),
-# 下方 `real-lcm-bridge` 是 nuwax_geometry_runtime 本地的二次断言开关,
-# 仅用于显式 `--features real-lcm-bridge` 触发代码内 cfg 编译期门;
-# 未开 feature 时 `lcm_runtime.rs` Real 分支仍走 fail-fast
-# 路径(`RealLcmBackendUnavailable` / 进程硬退出)。这样 CI/dev 机编译
-# fake-only 二进制仍可通过(走 `--no-default-features --features fake-lcm-test`),
-# 生产/集成镜像(installer 装 liblcm-dev 后)默认 `--release` 启停脚本已
-# 隐式启用 real-lcm。
+# 2026-07-08 fake-lcm 根除后:本 binary 走 `default = ["real-lcm-bridge"]`,
+# 镜像必须装 liblcm-dev 1.3~1.5,无 fake / fake-lcm-test 旁路。
 
 # Phase 2:建图 / 导航 / 探索功能 crate 接入。
 # feature 名以 dimos 实际 Cargo.toml 为准(见 Phase 2 执行方案 / feedback_phase2.md)。
@@ -99,28 +80,16 @@ nalgebra = { version = "0.33", features = ["serde-serialize"] }
 #     同时关闭本 binary 的 `real-lcm-bridge` 默认门,
 #     强制编译期 fake-only 二进制。
 #
-# Phase 5 (2026-07-07 codex rework lane-11) 修订:
-#   - dependency 行不再钉死 `features = ["real-lcm"]`(见上方注释);
-#   - `real-lcm-bridge` 现在是**唯一**拉入 upstream `nuwax-transport/real-lcm`
-#     的入口 —— `fake-lcm-test` 显式**不**拉,实现 fake-only 路径。
-#   - `default = ["real-lcm-bridge"]` 保持不变 —— 生产/集成镜像(installer 装
-#     liblcm-dev 后)默认 `--release` 启停脚本仍隐式启用 real-lcm。
+# 2026-07-08 fake-lcm 物理删除(v3 F2 决策):`fake-lcm-test` feature 整段物理删除。
+# - 无 fake-lcm-test / fake-lcm 旁路,镜像必须装 liblcm-dev 1.3 ~ 1.5
+# - 无 cfg gate / compile_error 守门 / 兼容分支
+# - cargo build/test 强制要求 liblcm 可用,否则 fail-fast
 #
 # 该块必须位于所有 `[dependencies]` 之后 —— cargo 解析遇到 `[features]`
 # 会把后续行当作 features 序列,不是依赖 map。
 [features]
 default = ["real-lcm-bridge"]
 real-lcm-bridge = ["nuwax-transport/real-lcm"]
-# CI / dev 镜像专用:与 real-lcm-bridge 互斥,
-# 同时通过 `--no-default-features` 把本 binary 的 default(real-lcm-bridge)关掉,
-# `nuwax-transport/real-lcm` 因此也**不被拉入** —— 真 fake-only 二进制成立。
-# `cargo build --no-default-features --features fake-lcm-test`。
-#
-# body 显式为空(`= []` 而不是省略)以表明意图:fake-lcm-test 是 fake-only
-# 编译期标识符,无需拉入额外 upstream feature,因为 upstream 已被 default
-# 路径未启用时自然进入 fake-only 分支(`LcmTransport::Fake` 始终可用,
-# 不依赖任何 cargo feature)。
-fake-lcm-test = []
 
 [build-dependencies]
 tonic-build = "0.12"

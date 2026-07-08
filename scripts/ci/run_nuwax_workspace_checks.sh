@@ -68,7 +68,7 @@ PHASE_LOG_DIR="${REPO_ROOT}/runtime_data/ci_phase8"
 mkdir -p "${PHASE_LOG_DIR}"
 
 # ---------- step 1: workspace metadata ----------
-bar "Step 1/7: cargo metadata --locked on services/nuwax-workspace"
+bar "Step 1/8: cargo metadata --locked on services/nuwax-workspace"
 if [[ ! -f "${WS_MANIFEST}" ]]; then
   fail "workspace manifest missing: ${WS_MANIFEST}"
   ANY_FAIL=1
@@ -87,7 +87,7 @@ else
 fi
 
 # ---------- step 2: runtime metadata ----------
-bar "Step 2/7: cargo metadata --locked on services/geometry/nuwax_geometry_runtime"
+bar "Step 2/8: cargo metadata --locked on services/geometry/nuwax_geometry_runtime"
 if [[ ! -f "${RUNTIME_MANIFEST}" ]]; then
   nr "runtime manifest missing: ${RUNTIME_MANIFEST}（Phase 1 lane 未提交,等 lane-1 收尾）"
 else
@@ -110,19 +110,22 @@ else
 fi
 
 # ---------- step 3: runtime cargo check ----------
-bar "Step 3/7: cargo check --locked on nuwax_geometry_runtime"
-# rework16(codex round-3 blocker-1): liblcm 可用性探测
-# - liblcm 可用:走 default features(生产路径,需 real-lcm-bridge 链 liblcm)
-# - liblcm 不可用:fallback 到 fake-only 路径(--no-default-features --features fake-lcm-test)
-# 探测方式:pkg-config lcm;若探测失败且已装则 ok,若可执行结果 true/false
+bar "Step 3/8: cargo check --locked on nuwax_geometry_runtime"
+# 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
+# - **liblcm 必须可用**(>=1.3, <1.6);无 fake-only fallback 路径
+# - 探测方式:`pkg-config lcm`;若探测失败立即 fail,而不是降级 fake
+# - 镜像必须装 liblcm-dev 1.3~1.5(版本锁 `nuwax-lcm-sys/build.rs`)
 if [[ -f "${RUNTIME_MANIFEST}" && -f "${RUNTIME_LOCK}" ]]; then
   if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists lcm 2>/dev/null; then
     CARGO_FEAT_ARGS=()
     LC_PROFILE="default(real-lcm-bridge)"
   else
-    # fake-only:不依赖 liblcm,可在 dev/CI 镜像无 liblcm-dev 时通过
-    CARGO_FEAT_ARGS=(--no-default-features --features fake-lcm-test)
-    LC_PROFILE="fake-only(--no-default-features --features fake-lcm-test)"
+    # 2026-07-08 fake-lcm 物理删除后:无 fake-only fallback;
+    # liblcm 缺失必须立即 fail,不允许降级。
+    fail "liblcm 不可用 (pkg-config --exists lcm 失败)。2026-07-08 fake-lcm 物理删除后,镜像必须装 liblcm-dev 1.3~1.5;无 fallback 路径。"
+    ANY_FAIL=1
+    CARGO_FEAT_ARGS=()
+    LC_PROFILE="FORCED-FAIL(liblcm-missing)"
   fi
   if "${CARGO[@]}" check --manifest-path "${RUNTIME_MANIFEST}" --locked --all-targets "${CARGO_FEAT_ARGS[@]}" \
       >"${PHASE_LOG_DIR}/03_runtime_check.log" 2>&1; then
@@ -138,7 +141,7 @@ else
 fi
 
 # ---------- step 4: runtime cargo test ----------
-bar "Step 4/7: cargo test --locked on nuwax_geometry_runtime"
+bar "Step 4/8: cargo test --locked on nuwax_geometry_runtime"
 if [[ -f "${RUNTIME_MANIFEST}" && -f "${RUNTIME_LOCK}" ]]; then
   if "${CARGO[@]}" test --manifest-path "${RUNTIME_MANIFEST}" --locked "${CARGO_FEAT_ARGS[@]}" \
       >"${PHASE_LOG_DIR}/04_runtime_test.log" 2>&1; then
@@ -154,9 +157,10 @@ else
 fi
 
 # ---------- step 4.5: cargo clippy --locked (rework16:补 codex round-3 blocker-5 clippy step) ----------
-bar "Step 4.5/7: cargo clippy --locked --all-targets -D warnings on nuwax_geometry_runtime"
-# 复用 step 3/4 的 CARGO_FEAT_ARGS:liblcm 可用走 default,否则 fake-only
-# clippy 是 cargo 子命令,探测 `cargo-clippy` 可执行文件是否存在(rustup component)
+bar "Step 4.5/8: cargo clippy --locked --all-targets -D warnings on nuwax_geometry_runtime"
+# 2026-07-08 fake-lcm 物理删除后:clippy 走与 step 3 同一条 CARGO_FEAT_ARGS 链路,
+# liblcm 缺失直接 fail。clippy 是 cargo 子命令,探测 `cargo-clippy` 可执行文件
+# 是否存在(rustup component)
 #
 # rework17 升级:clippy 升级为 PASS-only step,与 cargo check/test 同等性质
 # (任何 error / -D warnings 失败必进 ANY_FAIL=1)。
@@ -178,8 +182,23 @@ else
   nr "skip runtime cargo clippy（缺 manifest/lockfile 或 cargo-clippy 未装——rustup component add clippy）"
 fi
 
+# ---------- step 4.6: no_fake_lcm_in_code (2026-07-08 fake-lcm 物理删除硬门) ----------
+bar "Step 4.6/8: no_fake_lcm_in_code gate"
+GATE="${REPO_ROOT}/scripts/ci/no_fake_lcm_in_code.sh"
+if [[ ! -x "${GATE}" ]]; then
+  fail "gate script missing or not executable: ${GATE}"
+  ANY_FAIL=1
+else
+  if bash "${GATE}" 2>&1 | tee "${PHASE_LOG_DIR}/046_no_fake_lcm_in_code.log"; then
+    ok "no_fake_lcm_in_code PASS"
+  else
+    fail "no_fake_lcm_in_code FAIL（代码层仍含 FakeLcmBackend / new_fake() / MockLcmBackend / LcmBackendKind::Fake / fake-lcm-test,需物理删除 v3 F2 决策）"
+    ANY_FAIL=1
+  fi
+fi
+
 # ---------- step 5: no_external_nuwax_workspace_path ----------
-bar "Step 5/7: no_external_nuwax_workspace_path gate"
+bar "Step 5/8: no_external_nuwax_workspace_path gate"
 GATE="${REPO_ROOT}/scripts/ci/no_external_nuwax_workspace_path.sh"
 if [[ ! -x "${GATE}" ]]; then
   fail "gate script missing or not executable: ${GATE}"
@@ -194,7 +213,7 @@ else
 fi
 
 # ---------- step 6: no_fake_lcm_completion_claim ----------
-bar "Step 6/7: no_fake_lcm_completion_claim gate"
+bar "Step 6/8: no_fake_lcm_completion_claim gate"
 GATE="${REPO_ROOT}/scripts/ci/no_fake_lcm_completion_claim.sh"
 if [[ ! -x "${GATE}" ]]; then
   fail "gate script missing or not executable: ${GATE}"
@@ -209,7 +228,7 @@ else
 fi
 
 # ---------- step 7: smoke_real_lcm_roundtrip ----------
-bar "Step 7/7: smoke_real_lcm_roundtrip"
+bar "Step 7/8: smoke_real_lcm_roundtrip"
 SMOKE="${REPO_ROOT}/scripts/ci/smoke_real_lcm_roundtrip.sh"
 if [[ ! -x "${SMOKE}" ]]; then
   nr "smoke_real_lcm_roundtrip missing: ${SMOKE}（lane-3 收尾后会创建）"

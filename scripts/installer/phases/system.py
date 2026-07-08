@@ -90,18 +90,42 @@ def _apt_install(packages: Tuple[str, ...]) -> int:
 def _verify_pkg_config_lcm() -> bool:
     """验证 ``pkg-config --modversion lcm`` 在系统上能返回非空版本。
 
-    返回 True 当：
-    - pkg-config 可用且 ``pkg-config --modversion lcm`` exit 0
-    - 否则 False
+    2026-07-08 fake-lcm 物理删除后(v3 F2 决策):
+    - 仅校验 liblcm 实际安装情况;不再有 fake / fake-lcm-test 旁路
+    - 版本范围 `[1.3, 1.6)`:`nuwax-lcm-sys/build.rs` 同步锁;
+      镜像必须装 liblcm-dev 1.3~1.5,1.6+ 触发 `LCM_VERSION_UNSUPPORTED`
+    - 失败信息以 `LCM_VERSION_UNSUPPORTED` 关键字(供 CI grep 识别)
     """
     if shutil.which("pkg-config") is None:
         return False
     rc, out, _ = _run_capture(("pkg-config", "--modversion", "lcm"), timeout=3)
-    return rc == 0 and bool(out.strip())
+    if rc != 0:
+        return False
+    version = out.strip()
+    # 简单 major.minor 比较:接受 1.3 ~ 1.5.x;1.6+ / 1.2.x 拒绝
+    try:
+        parts = version.split(".")
+        if len(parts) < 2:
+            return False
+        major = int(parts[0])
+        minor = int(parts[1].split("-")[0].split("+")[0])
+        if major != 1:
+            return False
+        if minor < 3:
+            return False
+        if minor >= 6:
+            return False
+    except (ValueError, IndexError):
+        return False
+    return True
 
 
 def _verify_python_lcm() -> bool:
-    """验证 ``import lcm`` 在当前 Python 解释器下可用（python3-lcm 或 pip fallback）。"""
+    """验证 ``import lcm`` 在当前 Python 解释器下可用（python3-lcm 或 pip fallback）。
+
+    2026-07-08 fake-lcm 物理删除后:无 mock `MockLcmBackend` fallback,Python LCM
+    binding 装不上 → fail-fast(LCM_PYTHON_BINDING_UNAVAILABLE)。
+    """
     rc, _, _ = _run_capture(("python3", "-c", "import lcm; print(getattr(lcm, '__version__', 'ok'))"), timeout=5)
     return rc == 0
 
@@ -188,19 +212,22 @@ class SystemPhase(Phase):
         else:
             ctx.info(f"  [system] python3-lcm 可用（apt rc={py_apt_rc}）")
         # 4. aarch64 目标机 profile 二次校验（§12.6 / §13.2 硬约束）
+        # 2026-07-08 fake-lcm 物理删除后:LCM 验证失败信息含
+        # LCM_VERSION_UNSUPPORTED 关键字,供 CI / smoke test grep 识别。
         if _is_aarch64_target():
             if not _verify_pkg_config_lcm():
                 raise PhaseError(
                     phase=self.name,
                     message=(
-                        "aarch64 目标机 profile 下 ``pkg-config --modversion lcm`` "
-                        "二次校验失败；installer 必须 fail-fast"
+                        "LCM_VERSION_UNSUPPORTED: aarch64 目标机 profile 下 "
+                        "``pkg-config --modversion lcm`` 二次校验失败;"
+                        "fake-lcm-test 已物理删除(2026-07-08 v3 F2 决策),无 fallback。"
                     ),
                     file_path=__file__,
                     code=InstallerErrorCode.PHASE_FAILED,
                     remediation=(
-                        "在目标机执行 'sudo apt-get install -y liblcm-dev pkg-config' 后重试；"
-                        "CI 镜像必须预装这两个包。"
+                        "在目标机执行 'sudo apt-get install -y liblcm-dev pkg-config' 后重试;"
+                        "CI 镜像必须预装这两个包,版本锁 1.3~1.5。"
                     ),
                 )
             ctx.info("  [system] aarch64 profile 下 pkg-config --modversion lcm 二次校验 PASS")

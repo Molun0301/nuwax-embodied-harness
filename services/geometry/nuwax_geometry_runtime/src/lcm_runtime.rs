@@ -431,10 +431,40 @@ fn parse_odom_payload(payload: &[u8]) -> Option<PoseState> {
     Some(PoseState { x, y, z, qx, qy, qz, qw, frame_id, timestamp_ns: stamp })
 }
 
+/// 单次 /map/occupancy frame 允许的 width/height 上限(防御性)。
+///
+/// 2000×2000 = 4M cells = 4 MiB(0.05m/cell 覆盖 100×100 m),已是物理合理
+/// 上限。超过则上游 occupancy 帧字段异常,直接拒绝。width * height
+/// 决定后续 `data` 字节数,这一项炸掉会直接 175 GB。
+const OCCUPANCY_MAX_DIMENSION: u32 = 8192;
+
+/// 单次 /explore/frontiers frame 允许的最大 frontier 条目数(防御性上限)。
+///
+/// 与 `TF_MAX_ENTRIES_PER_FRAME` 同源:防止异常帧的 count 字段触发
+/// Vec::with_capacity 申请上百 GB。
+const FRONTIERS_MAX_ENTRIES_PER_FRAME: usize = 16384;
+
+/// 单次 /tf frame 允许的最大 transform 条目数(防御性上限)。
+///
+/// 理论合法值取决于上游 SLAM 输出,但物理合理范围是 < 1e4;一旦上游帧
+/// 因 uninit memory / 协议异常把 count 字段解析成大数,`Vec::with_capacity`
+/// 会触发数百 GB 的 mmap/alloc,直接炸掉 7 GiB 内存的 Jetson/Go2 实机。
+/// 这里把上限钉死在 65536,既覆盖任何现实 SLAM 节点,又让异常帧
+/// 仅触发 warn + 跳过(不阻塞其它 channel)。
+const TF_MAX_ENTRIES_PER_FRAME: usize = 65536;
+
 fn parse_tf_payload(payload: &[u8]) -> Option<Vec<TransformEntry>> {
     // count(u32) + repeat[parent_len(u16)+parent+child_len(u16)+child+7×f64+stamp(u64)]
     if payload.len() < 4 { return None; }
     let count = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
+    // 防御性 sanity cap:见 TF_MAX_ENTRIES_PER_FRAME 注释。
+    if count > TF_MAX_ENTRIES_PER_FRAME {
+        warn!(
+            "/tf payload count={} 超过 sanity cap={};按异常帧跳过",
+            count, TF_MAX_ENTRIES_PER_FRAME
+        );
+        return None;
+    }
     let mut cursor = 4usize;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
@@ -476,6 +506,14 @@ fn parse_occupancy_payload(payload: &[u8]) -> Option<MapState> {
     if payload.len() < 30 { return None; }
     let width = u32::from_le_bytes(payload[0..4].try_into().ok()?);
     let height = u32::from_le_bytes(payload[4..8].try_into().ok()?);
+    // 防御性 sanity cap:见 OCCUPANCY_MAX_DIMENSION 注释。
+    if width == 0 || height == 0 || width > OCCUPANCY_MAX_DIMENSION || height > OCCUPANCY_MAX_DIMENSION {
+        warn!(
+            "/map/occupancy payload width={} height={} 超过 sanity cap={};按异常帧跳过",
+            width, height, OCCUPANCY_MAX_DIMENSION
+        );
+        return None;
+    }
     let resolution = f32::from_le_bytes(payload[8..12].try_into().ok()?);
     let origin_x = f64::from_le_bytes(payload[12..20].try_into().ok()?);
     let origin_y = f64::from_le_bytes(payload[20..28].try_into().ok()?);
@@ -488,6 +526,16 @@ fn parse_occupancy_payload(payload: &[u8]) -> Option<MapState> {
     let data_len = u32::from_le_bytes(payload[cur..cur+4].try_into().ok()?) as usize;
     cur += 4;
     if cur + data_len > payload.len() { return None; }
+    // data_len 必须等于 width*height;否则说明上游帧截断/异常,拒绝
+    // 防止后续 Vec<i8> 申请非预期容量。
+    let expected_len = (width as usize).saturating_mul(height as usize);
+    if data_len != expected_len {
+        warn!(
+            "/map/occupancy payload data_len={} 与 width*height={} 不一致;按异常帧跳过",
+            data_len, expected_len
+        );
+        return None;
+    }
     let raw = payload[cur..cur+data_len].to_vec();
     let data: Vec<i8> = raw.into_iter().map(|b| b as i8).collect();
     Some(MapState {
@@ -651,6 +699,7 @@ pub fn spawn_geometry_runtime(
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
 
     let state = Arc::new(RwLock::new(SharedState::default()));
+    eprintln!("[rework17-trace] lcm_runtime: state created, before backend select");
 
     // 按 NUWAX_LCM_BACKEND 选择 backend。
     // Phase 1 fail-fast:real-lcm 请求启动期直接拒绝；不允许 fallback fake-lcm。
@@ -845,7 +894,9 @@ pub fn spawn_geometry_runtime(
         None => None,
     };
 
+    eprintln!("[rework17-trace] lcm_runtime: backend ok, before channel parse");
     let occ_msg_type = LcmMessageType::new("nav_msgs/OccupancyGrid").expect("typed");
+    eprintln!("[rework17-trace] lcm_runtime: occ_msg_type ok");
     let tf_msg_type = LcmMessageType::new("geometry_msgs/Transform").expect("typed");
     let cm_msg_type = LcmMessageType::new("sensor_msgs/PointCloud2").expect("typed");
     let nav_msg_type = LcmMessageType::new("nuwax_msgs/NavigationState").expect("typed");
@@ -880,6 +931,7 @@ pub fn spawn_geometry_runtime(
         std::env::var("NUWAX_CLOUDMAP_SHM_PATH")
             .unwrap_or_else(|_| "/tmp/nuwax_cloudmap.mmap".into())
     );
+    eprintln!("[rework17-trace] lcm_runtime: msg types created, before CloudMapShmWriter");
     let cm_writer = match CloudMapShmWriter::new(&cm_shm_path) {
         Ok(w) => Some(w),
         Err(e) => {
@@ -889,6 +941,7 @@ pub fn spawn_geometry_runtime(
     };
     // 用 parking_lot::Mutex 避免 std::sync::MutexGuard 不 Send 的问题。
     let cm_writer = Arc::new(parking_lot::Mutex::new(cm_writer));
+    eprintln!("[rework17-trace] lcm_runtime: cm_writer ok, before tf task spawn");
 
     // ---- 订阅 /tf：动态更新 transforms，按 TTL 裁剪陈旧边，合成 base→map 位姿 ----
     let map_frame = std::env::var("NUWAX_MAP_FRAME").unwrap_or_else(|_| "map".into());
@@ -906,7 +959,9 @@ pub fn spawn_geometry_runtime(
     let map_frame_owned = map_frame.clone();
     let base_candidates_owned = base_candidates.clone();
     tokio::spawn(async move {
+        eprintln!("[rework17-trace] tf task: spawned");
         let mut stream = tf_transport.subscribe(tf_topic_clone, Some(tf_msg_type_clone)).await;
+        eprintln!("[rework17-trace] tf task: subscribe returned");
         use futures::StreamExt;
         while let Some(frame_result) = stream.next().await {
             let frame = match frame_result {
@@ -956,6 +1011,7 @@ pub fn spawn_geometry_runtime(
     let odom_transport = transport.clone();
     // Phase 4: 改走 channel_registry::channel_for(Odom) —— 禁止再硬编码 /odom。
     let odom_topic = channel_registry::channel_for(ChannelKey::Odom);
+    eprintln!("[rework17-trace] lcm_runtime: odom topic ok, before odom task spawn");
     let odom_msg_type = LcmMessageType::new("nav_msgs/Odometry").expect("typed");
     tokio::spawn(async move {
         let mut stream = odom_transport.subscribe(odom_topic, Some(odom_msg_type)).await;
@@ -977,6 +1033,7 @@ pub fn spawn_geometry_runtime(
     let occ_transport = transport.clone();
     let occ_topic_clone = occ_topic.clone();
     let occ_msg_type_clone = occ_msg_type.clone();
+    eprintln!("[rework17-trace] lcm_runtime: before occ task spawn");
     tokio::spawn(async move {
         let mut stream = occ_transport.subscribe(occ_topic_clone, Some(occ_msg_type_clone)).await;
         use futures::StreamExt;
@@ -1002,6 +1059,7 @@ pub fn spawn_geometry_runtime(
         let cm_writer = cm_writer.clone();
         let cm_transport = transport.clone();
         let cm_msg_type_clone = cm_msg_type.clone();
+        eprintln!("[rework17-trace] lcm_runtime: before cm task spawn");
         tokio::spawn(async move {
             let mut stream = cm_transport.subscribe(cm_topic, Some(cm_msg_type_clone)).await;
             use futures::StreamExt;
@@ -1096,6 +1154,14 @@ pub fn spawn_geometry_runtime(
                 // payload: count(u32) + repeat[x,y,z(f64×3)+qx..qw(f64×4)+frame_len(u16)+frame+size(u32)+heading(f32)]
                 if frame.payload.len() < 4 { continue; }
                 let count = u32::from_le_bytes(frame.payload[0..4].try_into().unwrap_or([0;4])) as usize;
+                // 防御性 sanity cap:见 FRONTIERS_MAX_ENTRIES_PER_FRAME 注释。
+                if count > FRONTIERS_MAX_ENTRIES_PER_FRAME {
+                    warn!(
+                        "/explore/frontiers payload count={} 超过 sanity cap={};按异常帧跳过",
+                        count, FRONTIERS_MAX_ENTRIES_PER_FRAME
+                    );
+                    continue;
+                }
                 let mut cursor = 4usize;
                 let mut entries = Vec::with_capacity(count);
                 let mut ok = true;
@@ -1199,6 +1265,7 @@ pub fn spawn_geometry_runtime(
         occupancy_shm,
     })
 }
+
 
 /// Phase 3: 把 LCM `/odom` 与 `/go2/lidar/points` typed channel 喂给 mapping adapter。
 ///
@@ -1372,4 +1439,84 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
         mapping_adapter,
         occupancy_shm,
     })
+}
+
+#[cfg(test)]
+mod payload_sanity_tests {
+    //! 防御性 sanity cap 测试(2026-07-08 rework17 修复后)。
+    //!
+    //! 真实机 175 GB alloc 失败的根因推测:上游 LCM 帧 `count` 字段因 uninit
+    //! memory 或协议异常被解析成 `usize::MAX` 级别,触发 `Vec::with_capacity`
+    //! 申请上百 GB。本模块给 `parse_tf_payload` / `parse_occupancy_payload` /
+    //! frontiers 路径加了 sanity cap,本测试用直接构造异常 payload 的方式
+    //! 验证 cap 生效,异常帧返回 None 而不分配。
+
+    use super::{
+        parse_occupancy_payload, parse_tf_payload, FRONTIERS_MAX_ENTRIES_PER_FRAME,
+        OCCUPANCY_MAX_DIMENSION, TF_MAX_ENTRIES_PER_FRAME,
+    };
+
+    /// count 字段填 0xFFFF_FFFF(usize 等价 ~ 18 EB)→ 必须被 sanity cap 拒绝
+    #[test]
+    fn parse_tf_payload_rejects_huge_count() {
+        let mut payload = vec![0xFFu8, 0xFF, 0xFF, 0xFF];
+        payload.extend_from_slice(&[0u8; 8]);
+        assert!(
+            parse_tf_payload(&payload).is_none(),
+            "parse_tf_payload 应该拒绝 count > TF_MAX_ENTRIES_PER_FRAME 的异常帧"
+        );
+    }
+
+    /// count 字段填 0 → 应正常解析为空 vec
+    #[test]
+    fn parse_tf_payload_accepts_zero_count() {
+        let payload = vec![0u8, 0, 0, 0];
+        let result = parse_tf_payload(&payload).expect("count=0 应可解析");
+        assert!(result.is_empty());
+    }
+
+    /// width = u32::MAX → 应被 OCCUPANCY_MAX_DIMENSION 拒绝
+    #[test]
+    fn parse_occupancy_payload_rejects_huge_dimension() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // width
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // height
+        payload.extend_from_slice(&[0u8; 30]); // padding
+        assert!(
+            parse_occupancy_payload(&payload).is_none(),
+            "parse_occupancy_payload 应该拒绝 width/height > OCCUPANCY_MAX_DIMENSION 的异常帧"
+        );
+    }
+
+    /// 合法 width*height=16 + data_len=16 happy path
+    #[test]
+    fn parse_occupancy_payload_accepts_well_formed() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&0.05f32.to_le_bytes());
+        payload.extend_from_slice(&0.0f64.to_le_bytes());
+        payload.extend_from_slice(&0.0f64.to_le_bytes());
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(b"map");
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&16u32.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 16]);
+        let result = parse_occupancy_payload(&payload).expect("happy path 应解析成功");
+        assert_eq!(result.width, 4);
+        assert_eq!(result.height, 4);
+        assert_eq!(result.data.len(), 16);
+    }
+
+    /// cap 常量本身在物理合理范围内(const-eval 不会触发 lint)
+    #[test]
+    fn sanity_caps_are_in_physically_reasonable_range() {
+        // 这些都是编译期常量,clippy 会把 assert!(const_expr) 警告为可优化;
+        // 这里改用 const_assertions 风格:`const _: () = assert!(...);` 是
+        // 编译期验证,运行时无开销。
+        const _: () = assert!(TF_MAX_ENTRIES_PER_FRAME > 0 && TF_MAX_ENTRIES_PER_FRAME < 1_000_000);
+        const _: () = assert!(FRONTIERS_MAX_ENTRIES_PER_FRAME > 0 && FRONTIERS_MAX_ENTRIES_PER_FRAME < 1_000_000);
+        const _: () = assert!(OCCUPANCY_MAX_DIMENSION > 0 && OCCUPANCY_MAX_DIMENSION < 100_000);
+        const _: () = assert!((OCCUPANCY_MAX_DIMENSION as usize).saturating_pow(2) < 100 * 1024 * 1024);
+    }
 }

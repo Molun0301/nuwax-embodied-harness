@@ -127,6 +127,7 @@ async fn main() -> ExitCode {
     };
 
     info!("启动 nuwax-geometry-runtime, addr: {}", addr);
+    eprintln!("[rework17-trace] main: addr parsed, before video_relay");
 
     // ----------------------------------------------------------------------
     // video relay（保留——视频中转不属于 LCM/ROS2 范畴）
@@ -141,6 +142,7 @@ async fn main() -> ExitCode {
     // LCM runtime state loop
     // ----------------------------------------------------------------------
     let cm_chan_for_runtime = cloud_map_channel.clone();
+    eprintln!("[rework17-trace] main: before spawn_geometry_runtime");
     let bridge = match lcm_runtime::spawn_geometry_runtime(
         &occupancy_channel,
         &tf_channel,

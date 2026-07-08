@@ -37,7 +37,6 @@ if _PROJECT_ROOT not in sys.path:
 from services.navigation.lcm_motion_command_bridge import (  # noqa: E402
     BridgeStats,
     LcmMotionCommandBridge,
-    MockLcmBackend,
     MotionClampConfig,
     WATCHDOG_TIMEOUT_S,
     WATCHDOG_TICK_S,
@@ -138,7 +137,7 @@ def test_bridge_receives_cmd():
     print("Case 3: bridge start -> mock publish cmd -> sink.cmd_count==1")
     sink = RecordingSink()
     bridge = LcmMotionCommandBridge(
-        lcm_url="mock://",
+        lcm_url="unknown://invalid",
         channel="/cmd_vel",
         twist_sink=sink,
         clamp=MotionClampConfig(max_linear_m_s=0.6, max_angular_rad_s=1.0),
@@ -168,7 +167,7 @@ def test_watchdog_zero_stop():
     print("Case 4: watchdog 200ms 超时 -> sink 收到 zero,窗口 200-250ms")
     sink = RecordingSink()
     bridge = LcmMotionCommandBridge(
-        lcm_url="mock://",
+        lcm_url="unknown://invalid",
         channel="/cmd_vel",
         twist_sink=sink,
         clamp=MotionClampConfig(),
@@ -210,7 +209,7 @@ def test_cancel_immediate_zero():
     print("Case 5: CancelNavigation(request_immediate_zero) -> sink 收到 zero")
     sink = RecordingSink()
     bridge = LcmMotionCommandBridge(
-        lcm_url="mock://",
+        lcm_url="unknown://invalid",
         channel="/cmd_vel",
         twist_sink=sink,
     )
@@ -240,7 +239,7 @@ def test_shutdown_sequence():
     print("Case 6: bridge.stop(timeout=1.0) -> zero -> unsubscribe -> join")
     sink = RecordingSink()
     bridge = LcmMotionCommandBridge(
-        lcm_url="mock://",
+        lcm_url="unknown://invalid",
         channel="/cmd_vel",
         twist_sink=sink,
     )
@@ -277,7 +276,7 @@ def test_dropped_count_on_queue_full():
     print("Case 7: cmd_queue 满 -> dropped_count>0")
     sink = RecordingSink()
     bridge = LcmMotionCommandBridge(
-        lcm_url="mock://",
+        lcm_url="unknown://invalid",
         channel="/cmd_vel",
         twist_sink=sink,
         tick_s=1.0,  # receiver 慢,让 queue 累积
@@ -304,11 +303,11 @@ def test_dropped_count_on_queue_full():
 # ------------------------------------------------------------
 def test_sink_ready_flag():
     print("Case 8: sink 未注入 -> is_sink_ready()=False")
-    bridge = LcmMotionCommandBridge(lcm_url="mock://", channel="/cmd_vel")
+    bridge = LcmMotionCommandBridge(lcm_url="unknown://invalid", channel="/cmd_vel")
     _check("is_sink_ready()=False (sink 未注入)", bridge.is_sink_ready() is False)
     # mock backend 默认 True(避免 readiness 假死,但要求 sink 注入)
     bridge = LcmMotionCommandBridge(
-        lcm_url="mock://", channel="/cmd_vel", twist_sink=RecordingSink()
+        lcm_url="unknown://invalid", channel="/cmd_vel", twist_sink=RecordingSink()
     )
     bridge.start()
     try:
@@ -323,7 +322,7 @@ def test_sink_ready_flag():
 def test_bad_payload_dropped():
     print("Case 9: payload 长度不对 -> dropped_count 增加,不抛")
     sink = RecordingSink()
-    bridge = LcmMotionCommandBridge(lcm_url="mock://", channel="/cmd_vel", twist_sink=sink)
+    bridge = LcmMotionCommandBridge(lcm_url="unknown://invalid", channel="/cmd_vel", twist_sink=sink)
     bridge.start()
     try:
         bridge._backend.publish("/cmd_vel", b"\x00" * 10)  # 不是 32
@@ -352,7 +351,7 @@ def test_sink_state_change_callback_fires_on_start_and_stop():
     events = []
     sink = RecordingSink()
     bridge = LcmMotionCommandBridge(
-        lcm_url="mock://",
+        lcm_url="unknown://invalid",
         channel="/cmd_vel",
         twist_sink=sink,
         on_sink_state_change=events.append,
@@ -374,8 +373,10 @@ def test_sink_state_change_callback_not_fired_when_subscribe_fails():
     """Rework-9 验收用例 2:bridge 构造参数注入 callback 后,
     subscribe 失败的 mock backend 路径下 callback 必须收到 False。
 
-    用一个会抛异常的 backend 替代 MockLcmBackend,确保 start 内部
+    用一个会抛异常的 backend 替代,确保 start 内部
     try/except 把异常带上 callback=False。
+    2026-07-08 fake-lcm 物理删除后:`MockLcmBackend` 已不存在,本测试改走
+    `_UnavailableBackend`(模拟"unknown://" → fail-fast 路径)。
     """
     print("Case 12: subscribe 抛异常 → callback 收到 False")
 
@@ -400,7 +401,8 @@ def test_sink_state_change_callback_not_fired_when_subscribe_fails():
         twist_sink=sink,
         on_sink_state_change=events.append,
     )
-    # 必须把 _backend 换成 BrokenBackend,_resolve_backend 默认走 mock://
+    # 必须把 _backend 换成 BrokenBackend,2026-07-08 后 _resolve_backend 默认走
+# unknown:// → _UnavailableBackend,BrokenBackend 模拟订阅失败路径。
     bridge._backend = BrokenBackend()
     raised = False
     try:
@@ -436,7 +438,7 @@ def test_go2_twist_sink_adapter():
     mp = FakeMotionProvider()
     adapter = Go2TwistSinkAdapter(mp)
     bridge = LcmMotionCommandBridge(
-        lcm_url="mock://", channel="/cmd_vel", twist_sink=adapter
+        lcm_url="unknown://invalid", channel="/cmd_vel", twist_sink=adapter
     )
     bridge.start()
     try:

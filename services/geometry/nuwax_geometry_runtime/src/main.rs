@@ -155,13 +155,13 @@ async fn main() -> ExitCode {
     ) {
         Ok(b) => b,
         Err(e) => {
-            // Phase 1 fail-fast:real-lcm 请求启动期直接拒绝;
-            // 不在 Real 失败路径 fallback fake-lcm。
+            // 2026-07-08 fake-lcm 物理删除后:real-lcm 启动失败无 fake fallback,
+            // 启动期直接 fail-fast(exit code = 4)。
             // 错误信息在 stderr 输出 "LCM_BACKEND_UNAVAILABLE" 关键字,
             // 供 start 脚本与 smoke test grep 识别。
             error!("{}", e);
-            eprintln!("LCM_BACKEND_UNAVAILABLE: real-lcm backend requested but upstream dimos \
-                       nuwax-transport/real-lcm feature is still a stub. Process will exit.");
+            eprintln!("LCM_BACKEND_UNAVAILABLE: real-lcm backend requested but liblcm 1.3~1.5 \
+                       missing (apt-get install liblcm-dev). Process will exit.");
             return ExitCode::from(4);
         }
     };

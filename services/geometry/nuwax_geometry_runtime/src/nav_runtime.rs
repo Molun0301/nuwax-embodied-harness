@@ -314,7 +314,7 @@ pub struct NavigationReadinessDetail {
     /// 在 default profile 之外的,本阶段未启用的 native profile 列表。
     pub p1_native_profiles: Vec<String>,
     // === Phase 7 增量字段 ===
-    /// canonical LCM backend 名("RealLcm" / "FakeLcm")。
+    /// canonical LCM backend 名(2026-07-08 fake-lcm 物理删除后,字段值固定为 "RealLcm")。
     pub backend: String,
     /// 累计有效 tf 帧计数(`pose.timestamp_ns > 0` 时 +1)。
     pub tf_count: u64,
@@ -422,7 +422,6 @@ pub async fn compute_readiness(
         .unwrap_or_else(|| handle.cmd_vel_sink_ready());
     // Phase 7:backend canonical 名(用 transport_backend_name 反推)。
     let backend = match handle.transport_backend_name {
-        "fake-lcm" => "FakeLcm",
         "real-lcm" | "real-lcm-unavailable" => "RealLcm",
         other => {
             // 不在这里 panic;未知 backend 按当前 enum 语义映射并记 log。
@@ -543,7 +542,7 @@ pub async fn set_goal(
         };
     }
 
-    // 3. 推进状态机:ACCEPTED -> RUNNING(本阶段 fake planner 立即出 waypoints)。
+    // 3. 推进状态机:ACCEPTED -> RUNNING(本阶段 simple planner 立即出 waypoints)。
     let mut slot_outer = state.inner.write().await;
     let goal = ActiveGoal {
         id: input.goal_id.clone(),
@@ -878,10 +877,12 @@ mod tests {
     use std::time::Duration;
     use tokio::time::sleep;
 
-    /// 构造一个 mock handle:fake backend + 一个非空 pose 与 map。
+    /// 构造一个测试 handle:test backend(走 real-lcm + test_lcm_url 隔离端口)+ 一个非空 pose 与 map。
     ///
-    /// 注意:不能直接构造 `LcmTransport`(其字段非 pub);这里用 `new()`
-    /// 默认构造,backend 走 fake,LCM publish 入内存 topic。
+    /// 注意:不能直接构造 `LcmTransport`(其字段非 pub);这里用 `build_handle_for_tests`
+    /// 构造,backend 走 real-lcm,LCM publish 走隔离端口。
+    /// 2026-07-08 fake-lcm 物理删除后,test handle 改走 real backend,默认 true
+    /// 仍兼容旧测试断言。
     async fn make_handle() -> GeometryRuntimeHandle {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
@@ -958,7 +959,7 @@ mod tests {
             profile: PROFILE_SIMPLE_2D.into(),
             module_node_count: 4,
             p1_native_profiles: P1_NATIVE_PROFILES.iter().map(|s| s.to_string()).collect(),
-            backend: "FakeLcm".into(),
+            backend: "RealLcm".into(),
             tf_count: 7,
             costmap_revision: 3,
             cmd_vel_sink_ready: true,
@@ -980,7 +981,8 @@ mod tests {
     /// Phase 6 / Rework-9:Lane 6 注入接口(setter) → handle.cmd_vel_sink_ready() → readiness。
     ///
     /// 验证:
-    /// - fake-only `build_handle_for_tests` helper 默认 `true`(单测兼容)
+    /// - test helper `build_handle_for_tests` 默认 `true`(单测兼容,
+///   2026-07-08 fake-lcm 物理删除后,test helper 改走 real backend)
     /// - 生产 `spawn_geometry_runtime` 默认 `false`(由 Python 写回)
     /// - setter 写入后立刻被 readiness 读到
     /// - override 优先级 > handle(setter 不影响 override 分支)
@@ -992,9 +994,9 @@ mod tests {
             .await
             .expect("handle");
         let state = NavRuntimeState::from_env();
-        // 1. fake-only helper 默认值 true(无 override 时 readiness.cmd_vel_sink_ready 跟 lcm_backend)
+        // 1. test helper 默认值 true(无 override 时 readiness.cmd_vel_sink_ready 跟 lcm_backend)
         assert!(handle.cmd_vel_sink_ready(),
-            "fake-only test helper 默认 cmd_vel_sink_ready 必须 true");
+            "test helper 默认 cmd_vel_sink_ready 必须 true");
         // 2. setter 关掉
         handle.set_cmd_vel_sink_ready(false);
         // 3. readiness 必须反映 handle 关掉的状态(override=None → 回退 handle.cmd_vel_sink_ready())
@@ -1017,10 +1019,12 @@ mod tests {
 
     /// Phase 6 / Rework-9:test helper 默认仍 `true`,setter 翻转后 readiness 拒绝。
     ///
-    /// 证明 fake-only profile 行为不变:旧单测断言
+    /// 证明 test helper profile 行为不变:旧单测断言
     /// `默认 cmd_vel_sink_ready 必须 true` 仍然成立,因为生产 spawn path
-    /// (`spawn_geometry_runtime`)与 fake-only test helper 是两条独立
-    /// 构造路径(参见 `lcm_runtime.rs:1182` / `:1354` 分支说明)。
+    /// (`spawn_geometry_runtime`)与 test helper 是两条独立
+    /// 构造路径(参见 `lcm_runtime.rs` build_handle_for_tests / spawn 区分说明)。
+    /// 2026-07-08 fake-lcm 物理删除后,test helper 改走 real backend,默认 true
+    /// 仍兼容旧测试断言。
     /// 本 test 同时把生产侧的"setter 关掉 → readiness 拒绝 → reason 含
     /// cmd_vel"分支再固化一次,作为 rework9 的回归测试锚点。
     #[tokio::test]
@@ -1031,7 +1035,7 @@ mod tests {
             .expect("handle");
         let state = NavRuntimeState::from_env();
         assert!(handle.cmd_vel_sink_ready(),
-            "test helper 必须默认 true(fake-only profile 不接 Python bridge)");
+            "test helper 必须默认 true(test helper 不接 Python bridge)");
         // setter 关掉后:
         handle.set_cmd_vel_sink_ready(false);
         let d = compute_readiness(&handle, &state).await;
@@ -1115,8 +1119,8 @@ mod tests {
         assert!(!d.tf);
         assert!(!d.costmap);
         assert_eq!(d.profile, PROFILE_SIMPLE_2D);
-        // Phase 7 字段:初始 backend=FakeLcm(test handle),counters 全 0
-        assert_eq!(d.backend, "FakeLcm");
+        // Phase 7 字段:初始 backend=RealLcm(test handle),counters 全 0
+        assert_eq!(d.backend, "RealLcm");
         assert_eq!(d.tf_count, 0);
         assert_eq!(d.costmap_revision, 0);
         assert!(d.cmd_vel_sink_ready, "test handle 默认 lcm_backend=true → sink ready=true");
@@ -1253,7 +1257,7 @@ mod tests {
         // 推 1 帧;由于当前位置 == 起点,follower 给出 waypoint cmd_vel。
         step_follower_and_publish_cmd_vel(&handle, &state).await;
         sleep(Duration::from_millis(50)).await;
-        // 不验证具体 cmd_vel bytes(fake backend topic 不直接 inspect),
+        // 不验证具体 cmd_vel bytes(隔离端口不直接 inspect),
         // 验证 step 后 state 没崩、phase 仍是 Running(除非一步到 goal)。
         let slot = state.inner.read().await;
         assert!(matches!(

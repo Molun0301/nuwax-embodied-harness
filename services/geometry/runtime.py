@@ -56,11 +56,13 @@ from services.navigation.exploration_runtime import PlatformExplorationRuntime
 from services.navigation.frontier import FrontierExplorer
 from services.navigation.runtime import GridNavigationPlanner
 
-# 单一事实来源（v1.1 治本）：_CANONICAL_LCM_BACKENDS 是仓内唯一
-# {"real-lcm", "fake-lcm"} 字面量定义点；本模块其它位置禁止再写此字面量。
-# 权威源 = core/settings.py::_normalize_lcm_backend（line 162-186）。
-# AC7 grep 互斥设计：grep 必须排除本模块前 60 行（常量定义区）。
-_CANONICAL_LCM_BACKENDS: frozenset[str] = frozenset({"real-lcm", "fake-lcm"})
+# 单一事实来源(v1.1 治本 + 2026-07-08 fake-lcm 物理删除):
+# _CANONICAL_LCM_BACKENDS 是仓内唯一 LCM canonical 字面量定义点。
+# 2026-07-08 后,`fake-lcm` 已从该 frozenset 物理删除 —— fake backend 整体移除(v3 F2 决策)。
+# 本模块其它位置禁止再写"fake-lcm"字面量(注释除外,做"已物理删除"标记用)。
+# 权威源 = core/settings.py::_normalize_lcm_backend(2026-07-08 重写为 20 行仅接受 real-lcm/real/空)。
+# AC7 grep 互斥设计:grep 必须排除本模块前 60 行(常量定义区)。
+_CANONICAL_LCM_BACKENDS: frozenset[str] = frozenset({"real-lcm"})
 
 if TYPE_CHECKING:
     from core.event_bus import EventBus
@@ -1007,7 +1009,7 @@ class PlatformGeometryRuntime:
             errors.append("缺少 LCM url 配置 NUWAX_LCM_URL（nuwax-geometry-runtime 启动依赖）")
         if lcm_backend and lcm_backend not in _CANONICAL_LCM_BACKENDS:
             errors.append(
-                "LCM backend 配置 %s 非法；canonical 取值只允许 real-lcm / fake-lcm。" % lcm_backend
+                "LCM backend 配置 %s 非法；canonical 取值只允许 real-lcm (fake-lcm 已在 2026-07-08 物理删除)。" % lcm_backend
             )
         required_frames = {
             "map_frame": self.config.frames.map_frame,

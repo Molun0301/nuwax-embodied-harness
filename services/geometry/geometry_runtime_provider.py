@@ -555,7 +555,10 @@ class GeometryRuntimeProvider:
         return True
 
     def get_lcm_backend_name(self) -> str:
-        """Phase 3: 取 canonical LCM backend 名(real-lcm / fake-lcm / real-lcm-unavailable)。"""
+        """Phase 3: 取 canonical LCM backend 名。
+
+2026-07-08 fake-lcm 物理删除后:返回值固定为 `RealLcm` 或
+`real-lcm-unavailable`(liblcm 不可用时);fake-lcm 已物理删除(v3 F2 决策)。"""
         if not self._connected or not self._stub:
             return "<disconnected>"
         try:
@@ -657,7 +660,8 @@ class GeometryRuntimeProvider:
              module_node_count/p1_native_profiles)
           - ``profile`` / ``active_profile`` (str|None): 当前 nav profile
             (Phase 7 兼容旧 `profile` + 新 `active_profile`)
-          - ``backend`` (str|None): "RealLcm" / "FakeLcm" / "Unknown"
+          - ``backend`` (str|None): 2026-07-08 fake-lcm 物理删除后字段值固定为
+            "RealLcm" 或 "Unknown"(未启动时);fake-lcm 已物理删除(v3 F2 决策),无分支
           - ``tf_count`` (int|None): 累计 tf 帧数
           - ``costmap_revision`` (int|None): 当前 occupancy revision
           - ``cmd_vel_sink_ready`` (bool|None): cmd_vel consumer + watchdog 状态

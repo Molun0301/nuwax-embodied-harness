@@ -42,10 +42,12 @@ export NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TI
 # LCM URL/backend 兜底（与 settings.py::build_default_lcm_url 对齐）
 # Phase 4 硬约束：必须 `udpm://...`；`udp://` 是非法（liblcm 不支持），start 脚本拒绝并退出。
 #
-# Production profile 必须走 real-lcm(plan §12.3 第 2 项 + §13.2 第 4 项):
-#   - 默认值由 `fake-lcm` 改为 `real-lcm`,与 systemd service / Cargo.toml
+# 2026-07-08 fake-lcm 物理删除后(v3 F2 决策):
+#   - 默认值固定 `real-lcm`,与 systemd service / Cargo.toml
 #     `[features].default = ["real-lcm-bridge"]` 对齐
-#   - 显式 export `NUWAX_LCM_BACKEND=fake-lcm` 才走 fake(dev/CI 专用)
+#   - 显式 export `NUWAX_LCM_BACKEND=fake-lcm` / `fake` / 其它未知值
+#     在 binary 端立即 `process::exit(1)` + LCM_BACKEND_UNSUPPORTED
+#     (lcm_runtime.rs from_env 守门)
 export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
 export NUWAX_LCM_BACKEND="${NUWAX_LCM_BACKEND:-real-lcm}"
 

@@ -160,84 +160,27 @@ def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
 
 
 def _normalize_lcm_backend(value: str) -> str:
-    """Phase 0 收敛 + Phase 6 fake-lcm profile 校验。
+    """v3 重写(2026-07-08 fake-lcm 物理删除):
 
-    canonical 取值：`real-lcm` / `fake-lcm`。
-    历史/兼容 alias：`real` → `real-lcm`、`fake` → `fake-lcm`。
-    其他值（空 / 未知）→ `fake-lcm`（CI/开发机默认），并在首次归一化时 warning。
+    仅接受 `real-lcm` / `real` / 空(默认 `real-lcm`)。
+    其它值(包括旧 `fake-lcm` / `fake` / 未知字符串)→ `ValueError`
+    (上游 load_config 在 import 阶段 fail-fast,fake backend 已物理删除,
+    无兼容分支)。
 
-    Phase 6 增项：fake-lcm 仅允许在显式 `NUWAX_RUNTIME_PROFILE` ∈ {ci, ci-test,
-    contract-test, unit-test} 或单元测试场景使用；非允许 profile 设 fake-lcm
-    会输出 warning 但仍归一化为 fake-lcm。
-
-    fake-lcm 是否被 Rust 启动期拒收，**取决于 `NUWAX_REAL_LCM_REQUIRED`，与
-    `NUWAX_RUNTIME_PROFILE` 无关**：
-    - `REAL_LCM_REQUIRED=true` + fake-lcm → 启动期因 LCM_BACKEND_CONFIG_MISMATCH
-      退出，Python load_config 同步抛 ValueError。
-    - `REAL_LCM_REQUIRED=false`（默认） + fake-lcm → fake-lcm 可正常启动，
-      不会拒收。
+    Returns:
+        "real-lcm"(canonical)
+    Raises:
+        ValueError: NUWAX_LCM_BACKEND 是 `fake-lcm`/`fake`/未知值时
     """
     raw = (value or "").strip().lower()
-    if raw in ("", "fake-lcm", "fake"):
-        canonical = "fake-lcm"
-    elif raw in ("real-lcm", "real"):
-        canonical = "real-lcm"
-    else:
-        canonical = "fake-lcm"
-    if raw not in ("", "fake-lcm", "real-lcm", "fake", "real"):
-        if "NUWAX_LCM_BACKEND_unknown" not in _DEPRECATED_ENV_NOTIFIED:
-            _DEPRECATION_LOGGER.warning(
-                "NUWAX_LCM_BACKEND=%r 无法识别，归一化为 %r。"
-                " canonical 取值只允许 real-lcm / fake-lcm；real/fake 为迁移 alias。",
-                value,
-                canonical,
-            )
-            _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_unknown")
-    elif raw in ("real", "fake"):
-        if "NUWAX_LCM_BACKEND_alias" not in _DEPRECATED_ENV_NOTIFIED:
-            _DEPRECATION_LOGGER.warning(
-                "NUWAX_LCM_BACKEND=%r 是历史 alias；已归一化为 %r。"
-                " 后续请直接传 canonical 名 real-lcm / fake-lcm。",
-                raw,
-                canonical,
-            )
-            _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_alias")
-    elif raw in ("fake-lcm", "fake"):
-        # Phase 6:fake-lcm 仅允许 CI profile;非允许 profile 设 fake-lcm 时打 warning。
-        profile = (
-            (os.environ.get("NUWAX_RUNTIME_PROFILE", "") or "").strip().lower()
-        )
-        if not profile:
-            # 默认不强制;只在用户显式设 fake-lcm 时警告(避免首次启动刷屏)。
-            #
-            # Phase 6 (codex-round3 R3-5)：fake-lcm 是否被 Rust 拒收要看
-            # NUWAX_REAL_LCM_REQUIRED,与是否设了 NUWAX_RUNTIME_PROFILE 无关。
-            # 当前未设 NUWAX_RUNTIME_PROFILE,且 NUWAX_REAL_LCM_REQUIRED=true
-            # 时,fake-lcm 在 Rust 启动期会因 LCM_BACKEND_CONFIG_MISMATCH 退出。
-            # `REAL_LCM_REQUIRED=false`(默认)时 fake-lcm 可正常启动,不会拒绝。
-            if "NUWAX_LCM_BACKEND_fake_non_ci" not in _DEPRECATED_ENV_NOTIFIED:
-                _DEPRECATION_LOGGER.warning(
-                    "NUWAX_LCM_BACKEND=fake-lcm 仅允许 CI/contract-test profile;"
-                    " 当前未设 NUWAX_RUNTIME_PROFILE。"
-                    " fake-lcm 是否被 Rust 拒收取决于 NUWAX_REAL_LCM_REQUIRED:"
-                    " =true 时启动期因 LCM_BACKEND_CONFIG_MISMATCH 退出；"
-                    " =false(默认)时 fake-lcm 可正常启动。"
-                    " 生产/开发若要连真实 lcmd,请 NUWAX_LCM_BACKEND=real-lcm +"
-                    " NUWAX_REAL_LCM_REQUIRED=true。"
-                )
-                _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_fake_non_ci")
-        elif profile not in _FAKE_LCM_ALLOWED_PROFILES:
-            if "NUWAX_LCM_BACKEND_fake_non_ci" not in _DEPRECATED_ENV_NOTIFIED:
-                _DEPRECATION_LOGGER.warning(
-                    "NUWAX_LCM_BACKEND=fake-lcm 但 NUWAX_RUNTIME_PROFILE=%r 不在允许列表 %r;"
-                    " fake-lcm 是否被 Rust 拒收取决于 NUWAX_REAL_LCM_REQUIRED:"
-                    " =true 时启动期因 LCM_BACKEND_CONFIG_MISMATCH 退出；"
-                    " =false(默认)时 fake-lcm 可正常启动。",
-                    profile,
-                    sorted(_FAKE_LCM_ALLOWED_PROFILES),
-                )
-                _DEPRECATED_ENV_NOTIFIED.add("NUWAX_LCM_BACKEND_fake_non_ci")
-    return canonical
+    if raw in ("", "real-lcm", "real"):
+        return "real-lcm"
+    # fake-lcm / fake / 其它非 canonical 值 → 立即拒绝
+    raise ValueError(
+        f"NUWAX_LCM_BACKEND={value!r} 已被 2026-07-08 v3 F2 决策移除。"
+        "fake-lcm backend 已物理删除;canonical 取值只允许 'real-lcm' / 'real' / 空。"
+        "本 binary 仅支持 real-lcm(必须装 liblcm-dev 1.3~1.5)。"
+    )
 
 
 _DEPRECATION_LOGGER = logging.getLogger("nuwax_robot_bridge.settings.deprecation")
@@ -275,13 +218,10 @@ NAV_PROXY_PENDING_QUEUE_MAX_SIZE: int = max(
 # - NUWAX_EXPLORE_ARBITRATION → Rust `explore_runtime.rs` 读取,选择
 #                          PreferWavefront / PreferTare / HighestScore / FirstAvailable;
 #                          默认 prefer_wavefront,与 nuwax-explore-wavefront 对齐。
-# - NUWAX_REAL_LCM_REQUIRED → true 时强制要求 real-lcm backend；real-lcm
-#                          上游不可用时进程 exit 1 + LCM_BACKEND_UNAVAILABLE,
-#                          不允许 fallback 到 fake-lcm。**与 fake-lcm backend
-#                          互斥**：若同时设置 `NUWAX_LCM_BACKEND=fake-lcm`
-#                          （显式 / 别名 / 空值），进程启动时直接 exit 1 并打
-#                          LCM_BACKEND_CONFIG_MISMATCH 错误（Python 端
-#                          load_config 同步抛 ValueError）。
+# - NUWAX_REAL_LCM_REQUIRED → true 时强制要求 real-lcm backend(2026-07-08
+#                          fake-lcm 物理删除后是**唯一** backend);上游不可用时
+#                          进程 exit 1 + LCM_BACKEND_UNAVAILABLE。fake-lcm 已
+#                          物理删除,无 fallback,无互斥检查(因为 fake 已不存在)。
 #                          默认 false 由环境侧决策。
 NAV_PROFILE: str = _cfg_str("NUWAX_NAV_PROFILE", "simple-2d").strip() or "simple-2d"
 EXPLORE_ARBITRATION: str = (
@@ -289,20 +229,9 @@ EXPLORE_ARBITRATION: str = (
 )
 REAL_LCM_REQUIRED: bool = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
 
-# NUWAX_LCM_BACKEND=fake-lcm 仅允许 CI / contract test profile。
-# `NUWAX_LCM_BACKEND=fake` (历史 alias) 会被 _normalize_lcm_backend 归一化为
-# `fake-lcm` 并 warning。
-# **与 `NUWAX_REAL_LCM_REQUIRED` 无关**：当 `REAL_LCM_REQUIRED=true` 时 fake-lcm
-# 才被禁（启动期因 LCM_BACKEND_CONFIG_MISMATCH 退出）；
-# `REAL_LCM_REQUIRED=false`（默认）时 fake-lcm 可正常启动，不做归一化。
-_FAKE_LCM_ALLOWED_PROFILES: frozenset[str] = frozenset(
-    {
-        "ci",
-        "ci-test",
-        "contract-test",
-        "unit-test",
-    }
-)
+# 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
+# `_FAKE_LCM_ALLOWED_PROFILES` 整段物理删除 —— fake backend 不存在,
+# CI profile 白名单概念已无意义。`_normalize_lcm_backend` 见上面 v3 重写版本。
 
 
 def _notify_deprecated_env(legacy_name: str, preferred_name: str) -> None:
@@ -694,22 +623,18 @@ def _build_deferred_projection_config() -> DeferredProjectionConfig:
 def load_config() -> NuwaxRobotBridgeConfig:
     """统一加载配置。"""
 
-    # Phase 6 (codex-round2 M2) mismatch 校验：
-    # `NUWAX_REAL_LCM_REQUIRED=true` 与 `NUWAX_LCM_BACKEND=fake-lcm` 是自相矛盾
-    # 配置（fake backend 不存在 real-lcm 上游可用性问题）。Python 端 load_config
-    # 必须先抛 ValueError，让上游调用方（gateway / start_gateway.sh /
-    # nuwax-geometry-runtime 启动链路）尽快暴露误配。Rust 端 lcm_runtime.rs
-    # 也独立做了同样的校验并以 `LCM_BACKEND_CONFIG_MISMATCH` 关键字退出。
+    # 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
+    # 旧 Phase 6 (codex-round2 M2) mismatch 校验(fake × real-required)
+    # 整段已物理删除 —— fake backend 不存在,`_normalize_lcm_backend`
+    # 见到 fake-lcm / fake / 未知值会立即 raise ValueError,与上游链路对齐。
+    # Rust 端 lcm_runtime.rs 的 `LCM_BACKEND_UNSUPPORTED` 守门同步生效。
     _real_lcm_required = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
-    _lcm_backend_raw = _cfg_str("NUWAX_LCM_BACKEND", "fake-lcm").strip().lower()
-    if _real_lcm_required and _lcm_backend_raw in ("fake-lcm", "fake", ""):
-        raise ValueError(
-            "LCM_BACKEND_CONFIG_MISMATCH: NUWAX_REAL_LCM_REQUIRED=true 与 "
-            "NUWAX_LCM_BACKEND={!r} 互斥（fake backend 不存在 real-lcm 上游可用性问题）。"
-            "请改 NUWAX_LCM_BACKEND=real-lcm 或取消 NUWAX_REAL_LCM_REQUIRED=true。".format(
-                _lcm_backend_raw or "<empty>"
-            )
-        )
+    # 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
+    #   - `_lcm_backend_raw` 默认值改为 ""(空),不再默认 "fake-lcm"
+    #   - 旧 mismatch 校验(fake × real-required)整段删除 —— fake backend 不存在,
+    #     `_normalize_lcm_backend` 见到 fake-lcm / fake / 未知值会立即 raise ValueError
+    #   - `_real_lcm_required` 仍保留,但语义变为"real-lcm 启动期失败就 exit"
+    _lcm_backend_raw = _cfg_str("NUWAX_LCM_BACKEND", "").strip().lower()
 
     log_dir = _cfg_str("NUWAX_LOG_DIR", _cfg_str("GO2_PROXY_LOG_DIR", str(BASE_DIR)))
     log_file = _cfg_str(

@@ -503,6 +503,16 @@ class BootstrapPlanner:
                 }
             )
 
+        # R-N11 守门:合并 .env 已存在键(用户已设值),跳过空值 / null / 超长 / 注释行
+        # 拒绝把空 / 纯空白 / 包含 NUL / > 4096 字符的值注入子进程环境。
+        for key, value in self.root_existing.items():
+            if key.startswith("#"):
+                continue
+            if not value or value.isspace() or "\0" in value or len(value) > 4096:
+                continue  # R-N11 守门:跳过空值 / null / 超长
+            if key not in values:
+                values[key] = value
+
         return values
 
     def robot_env_overrides(self) -> Dict[str, str]:

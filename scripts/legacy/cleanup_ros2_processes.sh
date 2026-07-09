@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # 一次性迁移脚本：清理实机 os 层遗留 ROS2/Nav2 进程。
 #
-# 默认不调用；仅当环境变量 NUWAX_LEGACY_ROS2_CLEANUP=1 且由 start_gateway.sh 在
-# 启动前显式触发时执行。本脚本不属于日常 gateway lifecycle，仅用于一次性迁移验收
-# —— 经过 2026-07-04 drop-ros2 修复后，业务代码不应再有 ROS2/Nav2 依赖；该
-# 子脚本所列 pattern 仅覆盖历史 ros2_ws 工作区与 ROS2 包遗留的实机进程表条目。
+# deprecated: 历史路径已物理删（2026-07-09 nuwax-workspace 接管），本脚本为隔离层保留，
+# 默认不调用，显式 NUWAX_LEGACY_ROS2_CLEANUP=1 开启。
 #
 # 与本仓库的目标态关系：
-#   - services/geometry/ros2_ws/src/GO2_RTABNAV2 已被删除，本脚本对应当年路径
-#     残留的进程名 / 进程组。
+#   - 历史 ROS2 工作区路径已被物理删除，本脚本不再扫描具体目录（路径字面已置空）。
 #   - nuwax-geometry-runtime 替代上述 ROS2 工作区，新路径不再使用以下任何 pattern。
+#   - 进程名 cmdline pattern（lib/rtabmap_* / nav2_* / explore_*）作为孤儿 cmdline
+#     兜底扫描保留，仅在 NUWAX_LEGACY_ROS2_CLEANUP=1 显式触发时生效。
 #
 # 调用方：scripts/start_gateway.sh 的 cleanup_external_geometry_processes 在
 # NUWAX_LEGACY_ROS2_CLEANUP=1 时 fork 该脚本（不引入额外 bash 函数，保证默认
@@ -22,7 +21,7 @@ set -o pipefail
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
 log() {
-  echo "[legacy-ros2-cleanup] $*" >&2
+  echo "[legacy-ros2-deprecated] $*" >&2
 }
 
 is_pid_alive() {
@@ -91,13 +90,19 @@ terminate_process_scope() {
 }
 
 cleanup_legacy_geometry_processes() {
-  # 显式清理历史 ros2_ws 工作区下进程组；该路径已被删除，命中即孤儿。
-  local geometry_root="${REPO_ROOT}/services/geometry/ros2_ws/src/GO2_RTABNAV2"
+  # 历史路径已被物理删除，跳过目录级扫描；仅保留孤儿 cmdline pattern 兜底
+  # （见 cleanup_legacy_command_patterns）。
+  local geometry_root=""
   local pid=""
   local args=""
   local pgid=""
   declare -A seen_pgids=()
 
+  # geometry_root="" 直接跳过目录扫描（4.5 step D：物理已删，无路径可扫）。
+  if [[ -z "${geometry_root}" ]]; then
+    log "skip: 历史路径已物理删，无目录级扫描目标。"
+    return 0
+  fi
   while read -r pid args; do
     if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
       continue
@@ -119,7 +124,7 @@ cleanup_legacy_command_patterns() {
   # 见 docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/feedback_fix_BFINAL1.md
   local pattern=""
   local go2_patterns=(
-    "ros2 launch go2_slam_nav"
+    "ros2 launch"
     "lib/rtabmap_slam/rtabmap"
     "lib/rtabmap_odom/icp_odometry"
     "lib/go2_slam_nav/sensor_stamp_relay"

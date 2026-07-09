@@ -891,7 +891,6 @@ pub fn spawn_geometry_runtime(
     };
     // 用 parking_lot::Mutex 避免 std::sync::MutexGuard 不 Send 的问题。
     let cm_writer = Arc::new(parking_lot::Mutex::new(cm_writer));
-    eprintln!("[rework18-trace] lcm_runtime: cm_writer ok, before env vars for tf task");
 
     // ---- 订阅 /tf：动态更新 transforms，按 TTL 裁剪陈旧边，合成 base→map 位姿 ----
     let map_frame = std::env::var("NUWAX_MAP_FRAME").unwrap_or_else(|_| "map".into());
@@ -908,11 +907,8 @@ pub fn spawn_geometry_runtime(
     let tf_msg_type_clone = tf_msg_type.clone();
     let map_frame_owned = map_frame.clone();
     let base_candidates_owned = base_candidates.clone();
-    eprintln!("[rework18-trace] lcm_runtime: before tf task spawn");
     tokio::spawn(async move {
-        eprintln!("[rework18-trace] tf task: spawned, before subscribe");
         let mut stream = tf_transport.subscribe(tf_topic_clone, Some(tf_msg_type_clone)).await;
-        eprintln!("[rework18-trace] tf task: subscribe returned");
         use futures::StreamExt;
         while let Some(frame_result) = stream.next().await {
             let frame = match frame_result {

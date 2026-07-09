@@ -746,7 +746,10 @@ class PlatformGeometryRuntime:
         return f"nuwax-{safe or 'geometry'}", "项目几何进程"
 
     def _external_script_path(self) -> Path:
-        return Path(str(getattr(self.config.external, "script_path", "") or "")).expanduser()
+        # R-N13 修复:从 `script_path`(ExternalGeometryStackConfig 中不存在)
+        # 改为 `binary_path`(实存在,settings.py:887),9 处调用面全获正确路径
+        # 与 `_launch_runtime_binary()` 行为对齐。
+        return Path(str(getattr(self.config.external, "binary_path", "") or "")).expanduser()
 
     def _external_args(self) -> List[str]:
         raw_args = getattr(self.config.external, "args", ())

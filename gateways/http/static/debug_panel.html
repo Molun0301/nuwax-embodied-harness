@@ -4685,7 +4685,7 @@ button{font-family:inherit;cursor:pointer}
           const advanced = fields.filter((f) => f.advanced);
           const block = document.createElement("div");
           block.className = "config-section-block";
-          const blockId = "cfgsec-" + sectionIndex++;
+          const blockId = "section-" + (section.section_id || ("cfgsec-" + sectionIndex++)).replace(/_/g, "-");
           block.id = blockId;
           const title = document.createElement("div");
           title.className = "config-section-title";

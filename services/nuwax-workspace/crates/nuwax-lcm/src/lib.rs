@@ -191,9 +191,12 @@ impl OwnerThread {
         pattern: CString,
         sender: broadcast::Sender<Bytes>,
     ) -> Result<(), LcmError> {
+        eprintln!("[rework18-trace] OwnerThread::subscribe: enter, before Box::new(sender)");
         let chan_str = channel.to_string_lossy().into_owned();
         let sender_box = Box::new(sender);
+        eprintln!("[rework18-trace] OwnerThread::subscribe: Box::new(sender) ok");
         let sender_ptr = Box::into_raw(sender_box);
+        eprintln!("[rework18-trace] OwnerThread::subscribe: before lcm_subscribe call");
         let rc = unsafe {
             lcm_subscribe(
                 self.lcm,
@@ -202,12 +205,14 @@ impl OwnerThread {
                 sender_ptr as *mut c_void,
             )
         };
+        eprintln!("[rework18-trace] OwnerThread::subscribe: lcm_subscribe returned rc={}", rc);
         if rc != 0 {
             // 失败 → 回收 sender
             let _ = unsafe { Box::from_raw(sender_ptr) };
             return Err(LcmError::Subscribe { channel: chan_str });
         }
         self.subscriptions.insert(channel, unsafe { *Box::from_raw(sender_ptr) });
+        eprintln!("[rework18-trace] OwnerThread::subscribe: subscriptions.insert ok");
         Ok(())
     }
 
@@ -432,6 +437,7 @@ impl LcmContext {
             })?;
         eprintln!("[rework18-trace] LcmContext::subscribe: reply received");
         resp?;
+        eprintln!("[rework18-trace] LcmContext::subscribe: resp? ok, returning Ok");
 
         Ok(LcmSubscription {
             channel: Arc::new(chan_c),

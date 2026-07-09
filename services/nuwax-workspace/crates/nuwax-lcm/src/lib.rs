@@ -408,14 +408,10 @@ impl LcmContext {
     ///
     /// 返回一个 [`LcmSubscription`],caller 通过其 `receiver` 拉消息。
     pub async fn subscribe(&self, channel: &str) -> Result<LcmSubscription, LcmError> {
-        eprintln!("[rework18-trace] LcmContext::subscribe: enter");
         let chan_c = to_cstring(channel).map_err(|_| LcmError::NulByte(channel.to_owned()))?;
-        eprintln!("[rework18-trace] LcmContext::subscribe: to_cstring ok");
         let pattern_c = chan_c.clone();
         let (tx, rx) = broadcast::channel::<Bytes>(8);
-        eprintln!("[rework18-trace] LcmContext::subscribe: broadcast::channel(8) created");
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<Result<(), LcmError>>(1);
-        eprintln!("[rework18-trace] LcmContext::subscribe: mpsc::sync_channel(1) created");
 
         self.cmd_tx
             .send(Command::Subscribe {
@@ -428,14 +424,12 @@ impl LcmContext {
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: e.to_string(),
             })?;
-        eprintln!("[rework18-trace] LcmContext::subscribe: cmd_tx.send ok");
 
         let resp = reply_rx
             .recv_timeout(Duration::from_secs(1))
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: format!("subscribe reply 超时/失败: {}", e),
             })?;
-        eprintln!("[rework18-trace] LcmContext::subscribe: reply received");
         resp?;
         eprintln!("[rework18-trace] LcmContext::subscribe: resp? ok, returning Ok");
 

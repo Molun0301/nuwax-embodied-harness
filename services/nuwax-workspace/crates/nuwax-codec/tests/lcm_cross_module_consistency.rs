@@ -22,16 +22,19 @@ use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrameBuilder};
 /// 构造 payload 与 `golden_pose_stamped` 内部保持一致
 ///
 /// payload 总 68 字节:12 bytes marker + 7 个 f64 (= 56 字节)。
+///
+/// orientation 顺序 w 在前 (qw, qx, qy, qz),与 lcm-gen 生成的
+/// `geometry_msgs__PoseStamped.c` encode_array 一致。
 fn pose_payload() -> Vec<u8> {
     let mut p = Vec::with_capacity(68);
     p.extend_from_slice(b"PoseStamped!");
-    p.extend_from_slice(&1.0f64.to_le_bytes());
-    p.extend_from_slice(&2.0f64.to_le_bytes());
-    p.extend_from_slice(&0.0f64.to_le_bytes());
-    p.extend_from_slice(&0.0f64.to_le_bytes());
-    p.extend_from_slice(&0.0f64.to_le_bytes());
-    p.extend_from_slice(&0.0f64.to_le_bytes());
-    p.extend_from_slice(&1.0f64.to_le_bytes());
+    p.extend_from_slice(&1.0f64.to_le_bytes()); // position_x
+    p.extend_from_slice(&2.0f64.to_le_bytes()); // position_y
+    p.extend_from_slice(&0.0f64.to_le_bytes()); // position_z
+    p.extend_from_slice(&1.0f64.to_le_bytes()); // orientation_w (w 在前)
+    p.extend_from_slice(&0.0f64.to_le_bytes()); // orientation_x
+    p.extend_from_slice(&0.0f64.to_le_bytes()); // orientation_y
+    p.extend_from_slice(&0.0f64.to_le_bytes()); // orientation_z
     p
 }
 

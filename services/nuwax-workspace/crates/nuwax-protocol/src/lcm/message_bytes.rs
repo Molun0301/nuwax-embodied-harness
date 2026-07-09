@@ -5,8 +5,9 @@
 //! `docs/开发文档/建图导航探索重构/2026-07-07_建图导航探索库真接入与real-lcm通信实施方案/00_最终执行方案.md §5 Phase 2`:
 //!
 //! LCM 1.x `lcm_publish(channel, data, datalen)` 需要的 `data` 是 **结构化消息
-//! payload bytes**,**不**是内部 [`RawLcmFrame`] 那种 "LC02 + fingerprint + seqno +
-//! payload_len + payload" envelope。
+//! payload bytes**,**不**是内部 [`RawLcmFrame`] 那种 "8 字节 preamble +
+//! payload" envelope —— 2026-07-09 B3 修正后,real LCM wire format = 8 字节
+//! preamble(`magic BE(4) + seqno BE(4)`)+ payload。
 //!
 //! [`LcmMessageBytes`] 把 "channel / fingerprint / sequence / payload" 四件
 //! 套打包成单一类型,作为 Phase 3 `real-lcm` backend 的 wire-format
@@ -19,8 +20,8 @@
 //!
 //! ## 与 RawLcmFrame 的区别
 //!
-//! - [`RawLcmFrame`]:包含 28-byte LC02 envelope,适合 fake backend 内部测试与
-//!   raw log 回放;
+//! - [`RawLcmFrame`]:包含 8-byte preamble + payload,适合 fake backend 内部测试与
+//!   raw log 回放(2026-07-09 B3 修正:由 28-byte envelope 缩为 8-byte preamble);
 //! - [`LcmMessageBytes`]:只持有消息体 + 元信息,**不**预先拼装 envelope。
 //!   真实 `lcm_publish` 收到 LcmMessageBytes 后由 liblcm 自行加 envelope。
 //!

@@ -208,9 +208,11 @@ mod tests {
             "map",
             "odom",
         );
-        // 同时设置 odom -> base_link（外部来源；这里直接构造）
+        // 同时设置 odom -> base_link（外部来源；这里直接构造）。
+        // `make_transform` 采用 XYZW 顺序，与 `orientation_xyzw` 字段约定一致；
+        // 故此处使用 xyzw 单位四元数 `[0, 0, 0, 1]`。
         let base_link =
-            nuwax_tf::make_transform("odom", "base_link", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
+            nuwax_tf::make_transform("odom", "base_link", [1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]);
         tree.set(base_link);
 
         // 从 map -> base_link 的链应当包含两次平移

@@ -94,23 +94,28 @@ impl LcmBackend for RealLcmBackend {
 
         // 2. 包装成 `LcmMessageBytes`(Phase 2 lane-2 强类型合约)。
         //    `build_lcm_message_bytes` 用 STRUCT_SEEDS 计算 upstream lcm-gen 兼容
-        //    fingerprint;它**不**拼装 28 字节 LC02 envelope —— 那是 fake
-        //    backend 用的内部表达。seqno 由 caller 在 builder 上设定,这里直接透传。
+        //    fingerprint;它**不**拼装 envelope —— envelope 由 liblcm 自己
+        //    在 wire 上加。seqno 由 caller 在 builder 上设定,这里直接透传。
         //    任何一步失败都按 `TransportError::Protocol` 抛出(例如 msg_type 未在
         //    STRUCT_SEEDS 注册时,这里就 fail-fast,绝不悄悄降级)。
+        //
+        // 2026-07-09 B3 修正:`frame.header.seqno` 已由 u64 收紧到 u32(wire format),
+        // `build_lcm_message_bytes` 仍接 u64(进程内 sequence metadata,不对应 wire
+        // envelope),这里显式 cast 出去。
         let msg_bytes = build_lcm_message_bytes(
             frame.topic.channel(),
             frame.msg_type.fqn(),
             &frame.payload,
-            frame.header.seqno,
+            u64::from(frame.header.seqno),
         )
         .map_err(|e| TransportError::Protocol(nuwax_protocol::ProtocolError::LcmEncode(e.to_string())))?;
 
         // 3. 通过 owner thread 调 liblcm `lcm_publish(channel, payload_bytes)`。
-        //    liblcm 会在 wire 上**自己**加 8+8+8+4=28 字节 envelope,所以我们
-        //    只能传 **payload 部分** —— 也就是 `LcmMessageBytes::as_slice()`。
+        //    liblcm 会在 wire 上**自己**加 8 字节 preamble(magic BE 4 + seqno BE 4)
+        //    —— 2026-07-09 B3 修正后,real LCM wire format 不再是 28 字节 envelope。
+        //    所以我们只能传 **payload 部分** —— 也就是 `LcmMessageBytes::as_slice()`。
         //    绝对不能传 `frame.encode()` 的产物,否则 liblcm 会再叠一层 envelope,
-        //    receiver 端 callback 拿到 28+N+28+N 字节垃圾(§12.2 第 2 项硬约束)。
+        //    receiver 端 callback 拿到 N+8+N+8 字节垃圾(§12.2 第 2 项硬约束)。
         let wire_payload: &[u8] = msg_bytes.as_slice();
         ctx.publish(frame.topic.channel(), Bytes::copy_from_slice(wire_payload))
             .await
@@ -285,10 +290,13 @@ mod tests {
 
     // -----------------------------------------------------------------
     // codex rework-1 (2026-07-07): 验证 real_backend publish 路径产出的
-    // wire payload **不**含 28 字节 LC02 envelope(避免 §12.2 第 2 项
-    // double-framing 硬约束)。此 test 不真起 liblcm context;只走
+    // wire payload **不**含 envelope(避免 §12.2 第 2 项 double-framing
+    // 硬约束)。此 test 不真起 liblcm context;只走
     // `build_lcm_message_bytes` + `LcmMessageBytes::as_slice()` 这两段
     // 真实路径,断言最终喂给 `lcm_publish` 的 bytes == frame.payload。
+    //
+    // 2026-07-09 B3 修正:envelope 由 28 字节缩为 8 字节 preamble,但 real
+    // backend publish 路径仍只送 payload 部分(double-framing 硬约束不变)。
     // -----------------------------------------------------------------
     #[test]
     fn real_backend_publish_payload_strips_envelope() {
@@ -306,34 +314,42 @@ mod tests {
         // 走 real_backend publish 路径的**纯函数**部分:把 frame 喂给
         // build_lcm_message_bytes(channel, fqn, payload, seqno),拿到的
         // LcmMessageBytes 调 as_slice() —— 这就是要送给 lcm_publish 的 bytes。
+        // 2026-07-09 B3 修正:`frame.header.seqno` 由 u64 收紧为 u32,
+        // build_lcm_message_bytes 仍接 u64(进程内 metadata),这里显式 cast。
         let msg_bytes = build_lcm_message_bytes(
             frame.topic.channel(),
             frame.msg_type.fqn(),
             &frame.payload,
-            frame.header.seqno,
+            u64::from(frame.header.seqno),
         )
         .expect("build_lcm_message_bytes must succeed for registered msg_type");
 
         let wire_payload = msg_bytes.as_slice();
 
-        // 断言 1:lcm_publish 收到的 bytes 长度 == payload 长度,不是 28 + payload。
+        // 断言 1:lcm_publish 收到的 bytes 长度 == payload 长度,不带 envelope。
         // 这是 §12.2 第 2 项硬约束的直接证明 —— 没 envelope,就没 double-framing。
         assert_eq!(
             wire_payload.len(),
             user_payload.len(),
-            "real backend lcm_publish payload 长度不应增加 28 字节 envelope;got len={}, expect={}",
+            "real backend lcm_publish payload 长度不应增加 envelope;got len={}, expect={}",
             wire_payload.len(),
             user_payload.len(),
         );
         assert_eq!(wire_payload, user_payload.as_slice());
 
-        // 断言 2:对比例,RawLcmFrame::encode() 仍然产出 28+payload(fake backend
-        // 用的内部表达)。这是验证我们**没有**误用 frame.encode()。
+        // 断言 2:对比例,RawLcmFrame::encode() 仍产出 preamble+payload(2026-07-09
+        // B3 修正后是 8 字节 preamble + payload)。这是验证我们**没有**误用
+        // frame.encode() 走 real backend publish 路径。
         let encoded = frame.encode();
         assert_eq!(
             encoded.len(),
             LcmFrameHeader::HEADER_BYTES + user_payload.len(),
-            "RawLcmFrame::encode() 仍应拼 28 字节 envelope(fake backend 表达不变)"
+            "RawLcmFrame::encode() 应拼 8 字节 preamble(magic BE 4 + seqno BE 4)"
+        );
+        assert_eq!(
+            LcmFrameHeader::HEADER_BYTES,
+            8,
+            "preamble 必须为 8 字节(B3 修正:由 28 字节缩为 8 字节)"
         );
         // 真正的 wire bytes 是 header(28) + payload —— 不应被 real backend 使用。
         // 反向验证:如果 real backend 误用 frame.encode(),wire_payload.len()

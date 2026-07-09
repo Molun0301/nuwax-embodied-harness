@@ -20,6 +20,17 @@
 //! - 未注册的 FQN 在 [`validate_fqn_registered`] 入口 fail-fast,**禁止**
 //!   fallback 到内部 fake hash。
 //!
+//! ## 字节布局与 [`nuwax_protocol::RawLcmFrame::encode`] 的关系
+//!
+//! 历史口径(2026-07-09 之前)曾写 **28 字节 envelope**:`magic(8)+fingerprint(8)+
+//! seqno(8)+payload_len(4)` —— B3 audit 已标记为 BLOCKING,与 liblcm 1.x UDP
+//! multicast 真实 wire format 不兼容。
+//!
+//! 修正后(`nuwax-protocol/src/lcm/frame.rs`,2026-07-09)真实 wire format =
+//! **8 字节 preamble**(`magic BE(4) + seqno BE(4)`)+ payload。fingerprint
+//! 不在 wire 上 —— 类型识别由 LCM channel typed suffix(`/topic#pkg.Msg`)
+//! 在订阅端承担。
+//!
 //! ## P1 接入 system LCM 的入口
 //!
 //! `expected_lcm_bytes` 函数专门留给 P1 验证:它返回 `None` 表示当前
@@ -39,22 +50,17 @@ use crate::CodecResult;
 
 use crate::hash::{fingerprint as compute_real_lcm_fingerprint, lookup_seed};
 
-/// LCM 1.x frame magic on wire = `"LC02"` (little-endian u32)
+/// LCM 1.x frame magic on wire = `"LC02"` (big-endian u32,2026-07-09 B3 修正)
 ///
-/// 当 magic u32 值 = `0x3230_434c`,以 `to_le_bytes()` 写入 wire 还原为
+/// 当 magic u32 值 = `0x4c43_3032`,以 `to_be_bytes()` 写入 wire 还原为
 /// 字节序列 `[L, C, 0, 2]`。
-const LCM_MAGIC_LE: u32 = 0x3230_434c;
-/// magic 字段在 frame header 中占 8 字节
-const LCM_MAGIC_BYTES: usize = 8;
-/// fingerprint 字段 8 字节
-const LCM_FINGERPRINT_BYTES: usize = 8;
-/// sequence number 字段 8 字节
-const LCM_SEQNO_BYTES: usize = 8;
-/// payload length 字段 4 字节
-const LCM_PAYLOAD_LEN_BYTES: usize = 4;
-/// header 总字节数(不含 payload)
-const LCM_HEADER_BYTES: usize =
-    LCM_MAGIC_BYTES + LCM_FINGERPRINT_BYTES + LCM_SEQNO_BYTES + LCM_PAYLOAD_LEN_BYTES;
+const LCM_MAGIC_BE: u32 = 0x4c43_3032;
+/// magic 字段在 frame header 中占 4 字节(2026-07-09 B3 修正:由 8 缩为 4)
+const LCM_MAGIC_BYTES: usize = 4;
+/// sequence number 字段 4 字节(2026-07-09 B3 修正:由 8 缩为 4)
+const LCM_SEQNO_BYTES: usize = 4;
+/// header 总字节数(不含 payload)= 8 字节(2026-07-09 B3 修正:由 28 缩为 8)
+const LCM_HEADER_BYTES: usize = LCM_MAGIC_BYTES + LCM_SEQNO_BYTES;
 
 /// 消息 FQN 错误
 #[derive(Debug, Error)]
@@ -126,6 +132,16 @@ pub fn compute_hash(fqn: &str) -> [u8; 8] {
 /// 字节布局与 `nuwax_protocol::RawLcmFrame::encode` 完全等价,作为
 /// golden helper 在 codec 层独立提供。允许 topic / msg_type 仅作为
 /// FQN 字符串传入,避免对 `nuwax-protocol` 类型的循环依赖。
+///
+/// ## 2026-07-09 B3 修正
+///
+/// 修正前(28 字节 envelope):`magic LE(8) + fingerprint BE(8) + seqno LE(8)
+/// + payload_len LE(4)` —— 与 liblcm 1.x UDP multicast 真实 wire format
+/// 不兼容,被 B3 audit 标记为 BLOCKING。
+///
+/// 修正后(8 字节 preamble):`magic BE(4) + seqno BE(4)`(u32,网络大端)。
+/// `fingerprint` **不**写入 wire —— 由 LCM channel typed suffix 在订阅端
+/// 承担类型识别。`payload_len` 字段被移除,接收端用 `rbuf.data_size` 推算。
 pub fn golden_lcm_message(
     topic: &str,
     msg_type: &str,
@@ -143,20 +159,16 @@ pub fn golden_lcm_message(
         )));
     }
     validate_fqn(msg_type).map_err(|e| crate::CodecError::LcmEncode(e.to_string()))?;
-    let payload_len = u32::try_from(payload.len())
-        .map_err(|_| crate::CodecError::LcmEncode("payload too large".into()))?;
-    let fingerprint = compute_lcm_hash(msg_type);
+    // seqno 在 wire 上是 u32 BE(2026-07-09 B3 修正);原 u64 → 截断为 u32。
+    let seqno_u32 = u32::try_from(seqno)
+        .map_err(|_| crate::CodecError::LcmEncode("seqno 超过 u32 范围".into()))?;
     let mut out = Vec::with_capacity(LCM_HEADER_BYTES + payload.len());
-    // magic 8 字节:高 4 字节为 magic LE,低 4 字节为 0
-    out.extend_from_slice(&LCM_MAGIC_LE.to_le_bytes());
-    out.extend_from_slice(&[0u8; 4]);
-    // fingerprint 8 字节大端
-    out.extend_from_slice(&fingerprint);
-    // seqno 8 字节 LE
-    out.extend_from_slice(&seqno.to_le_bytes());
-    // payload length 4 字节 LE
-    out.extend_from_slice(&payload_len.to_le_bytes());
-    // payload
+    // magic 4 字节 BE(B3 修正:由 8 字节 LE+padding 缩为 4 字节 BE)
+    out.extend_from_slice(&LCM_MAGIC_BE.to_be_bytes());
+    // seqno 4 字节 BE(B3 修正:由 8 字节 LE 缩为 4 字节 BE)
+    out.extend_from_slice(&seqno_u32.to_be_bytes());
+    // payload 直接紧随 preamble —— wire 上没有 payload_len 字段,
+    // 接收端用 rbuf.data_size 推算。
     out.extend_from_slice(payload);
     Ok(Bytes::from(out))
 }
@@ -169,16 +181,21 @@ pub fn golden_lcm_message(
 /// 字节由 Rust encoder 确定性生成;校验时调用 [`golden_lcm_message`] 即可。
 ///
 /// payload 总 68 字节:12 bytes marker + 7 个 f64 (= 56 字节)。
+///
+/// orientation 字段顺序: w 在前 (qw, qx, qy, qz) —— 由 lcm-gen 生成的
+/// `geometry_msgs__PoseStamped.c` 中 `__geometry_msgs__PoseStamped_encode_array`
+/// (lines 75-85) 与 `.lcm` schema (orientation_w/orientation_x/...) 共同决定。
+/// 不得改为 ROS geometry_msgs 习惯的 xyzw 顺序。
 pub fn golden_pose_stamped() -> CodecResult<Bytes> {
     let mut payload = Vec::with_capacity(68);
     payload.extend_from_slice(b"PoseStamped!"); // 12 bytes marker
-    payload.extend_from_slice(&1.0f64.to_le_bytes()); // x
-    payload.extend_from_slice(&2.0f64.to_le_bytes()); // y
-    payload.extend_from_slice(&0.0f64.to_le_bytes()); // z
-    payload.extend_from_slice(&0.0f64.to_le_bytes()); // qx
-    payload.extend_from_slice(&0.0f64.to_le_bytes()); // qy
-    payload.extend_from_slice(&0.0f64.to_le_bytes()); // qz
-    payload.extend_from_slice(&1.0f64.to_le_bytes()); // qw
+    payload.extend_from_slice(&1.0f64.to_le_bytes()); // position_x
+    payload.extend_from_slice(&2.0f64.to_le_bytes()); // position_y
+    payload.extend_from_slice(&0.0f64.to_le_bytes()); // position_z
+    payload.extend_from_slice(&1.0f64.to_le_bytes()); // orientation_w (w 在前)
+    payload.extend_from_slice(&0.0f64.to_le_bytes()); // orientation_x
+    payload.extend_from_slice(&0.0f64.to_le_bytes()); // orientation_y
+    payload.extend_from_slice(&0.0f64.to_le_bytes()); // orientation_z
     debug_assert_eq!(payload.len(), 68);
     golden_lcm_message("/pose_stamped", "geometry_msgs/PoseStamped", &payload, 1)
 }
@@ -242,26 +259,32 @@ mod tests {
     #[test]
     fn golden_pose_stamped_header_size() {
         let bytes = golden_pose_stamped().unwrap();
-        // header 28 字节 + 68 bytes payload = 96 bytes
+        // 2026-07-09 B3 修正:header 8 字节 + 68 bytes payload = 76 bytes
         assert_eq!(bytes.len(), LCM_HEADER_BYTES + 68);
+        assert_eq!(LCM_HEADER_BYTES, 8, "preamble 必须为 8 字节(magic BE 4 + seqno BE 4)");
     }
 
     #[test]
     fn golden_pose_stamped_magic() {
         let bytes = golden_pose_stamped().unwrap();
-        let mut magic_bytes = [0u8; 4];
-        magic_bytes.copy_from_slice(&bytes[0..4]);
-        let magic = u32::from_le_bytes(magic_bytes);
-        assert_eq!(magic, LCM_MAGIC_LE);
+        // 2026-07-09 B3 修正:magic 4 字节 BE(B3 修正:由 LE+padding 缩为 BE)
+        let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(magic, LCM_MAGIC_BE);
+        assert_eq!(&bytes[0..4], b"LC02", "magic 字节序必须为 ASCII \"LC02\" 大端网络序");
     }
 
     #[test]
-    fn golden_pose_stamped_payload_length() {
+    fn golden_pose_stamped_no_payload_len_on_wire() {
+        // 2026-07-09 B3 修正:wire 上**没有** payload_len 字段。
+        // 接收端从 rbuf.data_size 拿长度;此处断言 bytes[8..] 直接是 payload,
+        // bytes[4..8] 是 seqno。
         let bytes = golden_pose_stamped().unwrap();
-        let mut len_bytes = [0u8; 4];
-        len_bytes.copy_from_slice(&bytes[24..28]);
-        let len = u32::from_le_bytes(len_bytes) as usize;
-        assert_eq!(len, 68);
+        // seqno = 1,大端 4 字节 = [0, 0, 0, 1]
+        let seqno = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(seqno, 1);
+        // payload 紧随 preamble,长度由 buffer 自身决定。
+        let payload = &bytes[LCM_HEADER_BYTES..];
+        assert_eq!(payload.len(), 68);
     }
 
     #[test]

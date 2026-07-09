@@ -14,7 +14,8 @@
 //!
 //! ## 与 `RawLcmFrame` 的关系
 //!
-//! - [`RawLcmFrame`] = 28-byte LC02 envelope + payload(fake backend 用);
+//! - [`RawLcmFrame`] = 8-byte preamble + payload(fake backend 用,2026-07-09 B3
+//!   修正:由 28-byte LC02 envelope 缩为 8-byte preamble);
 //! - [`LcmMessageBytes`] = 字段强类型(供 real-lcm `lcm_publish` 调用)。
 //!
 //! 两者**不**可互转 —— `encode_for_real_lcm_publish` 显式返回 payload 切片,

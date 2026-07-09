@@ -10,19 +10,28 @@
 //! ## Wire format（参考 [`RawLcmFrame`]）
 //!
 //! ```text
-//! +---------+--------------------+--------+--------+----------------+
-//! | magic   | message fingerprint| seqno  | payload| payload        |
-//! | 8B "LC02"|  8B  lcm_hash      | 8B LE  | length | bytes          |
-//! +---------+--------------------+--------+--------+----------------+
+//! +---------+--------+----------------+
+//! |  magic  | seqno  |     payload    |
+//! | 4B BE   | 4B BE  |     bytes      |
+//! +---------+--------+----------------+
 //! ```
 //!
-//! - **magic** 固定 0x4c433032 (8 字节，"LC02" + padding),与上游 LCM 1.x 一致。
-//! - **message fingerprint** = 8 字节 `lcm_hash`,由 LCM message type
-//!   字符串(`pkg::Type`)经 `lcm-gen` MurmurHash / cityhash64 计算;
-//!   Rust 侧通过 [`LcmMessageType::fingerprint`] 提供常量构造与解析。
-//! - **seqno** = 8 字节 little-endian channel sequence,生产端递增;消费端可忽略。
-//! - **payload length** = 4 字节 little-endian。
-//! - **payload** = 字节流。
+//! - **magic** 固定 0x4c433032 (4 字节大端 BE = `"LC02"` ASCII),与上游 LCM 1.x
+//!   一致。**禁止**再以 little-endian 解析 —— 2026-07-09 B3 修正。
+//! - **seqno** = 4 字节大端 BE channel sequence,生产端递增;消费端可忽略。
+//! - **payload** = 字节流;长度由 wire buffer 自身边界决定,**不**写入
+//!   `payload_len` 字段。
+//!
+//! ## 历史(2026-07-09 之前)
+//!
+//! 旧实现曾用 **28-byte envelope**:`magic(8) + fingerprint(8) + seqno(8) +
+//! payload_len(4)`。该结构与 liblcm 1.x 真实 UDP multicast wire format 不兼容,
+//! 已被 B3 audit 标记为 BLOCKING 并替换:
+//! - `fingerprint` **不**出现在 wire 上 —— 类型识别由 LCM channel typed
+//!   suffix(`/topic#pkg.Msg`)在订阅端承担(见 [`LcmTopic::as_subscription_pattern`])。
+//! - `payload_len` 字段移除 —— 接收端用 `rbuf.data_size` 推算长度。
+//! - fingerprint 数值仍由 [`LcmMessageType::fingerprint`] 给出(8 字节大端
+//!   进程内表示),仅供进程内强类型契约,不写入 wire。
 //!
 //! ## Topic typed suffix
 //!

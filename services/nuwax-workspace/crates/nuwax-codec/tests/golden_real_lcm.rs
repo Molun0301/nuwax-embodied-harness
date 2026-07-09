@@ -33,7 +33,7 @@ const UPSTREAM_FINGERPRINTS: &[(&str, u64)] = &[
     ("nuwax_msgs/NavigationState", 0xbfd9_7ea1_913d_0280),
     ("nuwax_msgs/CancelNavigation", 0xafbb_c90f_61b5_2506),
     ("nuwax_msgs/Frontier", 0x1abf_83ea_0ced_9c44),
-    ("nuwax_msgs/FrontierList", 0x213d_b68f_b817_1f76),
+    ("nuwax_msgs/FrontierList", 0xebbe_aebb_9e3b_e6ef),
 ];
 
 /// `compute_hash(fqn)` 与 upstream fingerprint 一一对应
@@ -110,7 +110,7 @@ fn test_golden_lcm_message_uses_upstream_fingerprint() {
         );
         // 同时确认 magic 字段确实是 LC02
         assert_eq!(
-            u32::from_le_bytes([codec_bytes[0], codec_bytes[1], codec_bytes[2], codec_bytes[3]]),
+            u32::from_be_bytes([codec_bytes[0], codec_bytes[1], codec_bytes[2], codec_bytes[3]]),
             LCM_MAGIC
         );
     }

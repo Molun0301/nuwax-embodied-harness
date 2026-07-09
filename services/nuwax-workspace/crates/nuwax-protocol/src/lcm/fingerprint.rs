@@ -95,7 +95,7 @@ mod tests {
             ("nuwax_msgs/NavigationState", 0xbfd9_7ea1_913d_0280),
             ("nuwax_msgs/CancelNavigation", 0xafbb_c90f_61b5_2506),
             ("nuwax_msgs/Frontier", 0x1abf_83ea_0ced_9c44),
-            ("nuwax_msgs/FrontierList", 0x213d_b68f_b817_1f76),
+            ("nuwax_msgs/FrontierList", 0xebbe_aebb_9e3b_e6ef),
         ];
         assert_eq!(STRUCT_SEEDS.len(), expected.len());
         for (fqn, upstream_fp) in expected {

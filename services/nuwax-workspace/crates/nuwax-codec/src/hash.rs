@@ -226,7 +226,7 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
     ("nuwax_msgs/NavigationState", 0x5fecbf50c89e8140u64),
     ("nuwax_msgs/CancelNavigation", 0x57dde487b0da9283u64),
     ("nuwax_msgs/Frontier", 0x0d5fc1f50676ce22u64),
-    ("nuwax_msgs/FrontierList", 0x109edb47dc0b8fbbu64),
+    ("nuwax_msgs/FrontierList", 0xf5df575dcf1df377u64),
 ];
 
 /// 按 FQN 查 per-type seed(线性搜索,固定表小)。`None` 表示未在 STRUCT_SEEDS

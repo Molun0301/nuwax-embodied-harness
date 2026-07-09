@@ -50,18 +50,49 @@ pub struct lcm_t {
     _private: [u8; 0],
 }
 
-/// LCM 消息回调签名 (liblcm 原生约定)。
+/// Opaque liblcm subscription handle。liblcm 1.x 在 `lcm_subscribe` 返
+/// 内部的 subscription 对象;`lcm_t` 拥有它的 lifetime。
+#[repr(C)]
+pub struct lcm_subscription_t {
+    /// 私有字段占位
+    _private: [u8; 0],
+}
+
+/// liblcm 1.x 真实 C 结构(字段顺序来自 `<lcm/lcm.h>` 第 62-80 行)。
+///
+/// ```c
+/// struct _lcm_recv_buf_t {
+///     void     *data;        // 接收到的 payload 字节
+///     uint32_t  data_size;   // payload 长度
+///     int64_t   recv_utime;  // 接收时间戳(微秒)
+///     lcm_t    *lcm;         // 拥有此 buffer 的 lcm_t
+/// };
+/// ```
+///
+/// 必须用 `#[repr(C)]` 保证布局与 C 一致;`data` 与 `lcm` 是 raw pointer
+/// (liblcm 内部用 `g_realloc` 复用,生命周期由 lcm_t 持有)。
+#[repr(C)]
+pub struct lcm_recv_buf_t {
+    /// 接收到的 payload 字节 buffer
+    pub data: *mut c_void,
+    /// payload 长度(字节)
+    pub data_size: u32,
+    /// 接收时间戳(微秒自 epoch)
+    pub recv_utime: i64,
+    /// 拥有此 buffer 的 lcm_t(为方便 callback 访问 lcm 内部状态)
+    pub lcm: *mut lcm_t,
+}
+
+/// LCM 消息回调签名 (liblcm 原生约定,见 `<lcm/lcm.h>` 第 91 行)。
 ///
 /// 形参:
-/// - `rbuf`     — receive buffer,payload 字节
-/// - `rbuf_len` — payload 长度
-/// - `channel`  — NUL-terminated C string,channel 名
-/// - `user`     — 注册订阅时传入的 user pointer
+/// - `rbuf`    — receive buffer(含 payload + timestamp + 拥有方 lcm)
+/// - `channel` — NUL-terminated C string,channel 名
+/// - `user`    — 注册订阅时传入的 user pointer
 #[allow(non_camel_case_types)]
 pub type lcm_msg_handler_t = Option<
     unsafe extern "C" fn(
-        rbuf: *const c_void,
-        rbuf_len: c_int,
+        rbuf: *const lcm_recv_buf_t,
         channel: *const c_char,
         user: *mut c_void,
     ),
@@ -96,16 +127,31 @@ extern "C" {
 
     /// 注册一个 typed subscription,handler 在 event loop 内被回调。
     ///
-    /// 返回 0 = 成功;非 0 = 错误。
+    /// 返回指向内部 `lcm_subscription_t` 的指针(归 lcm_t 拥有,
+    /// **不要** 手动 free);NULL = 失败(channel 名为 NULL / OOM)。
+    /// 后续 `lcm_unsubscribe` 须以该指针为 key。
     pub fn lcm_subscribe(
         lcm: *mut lcm_t,
         channel: *const c_char,
         handler: lcm_msg_handler_t,
         user: *mut c_void,
-    ) -> c_int;
+    ) -> *mut lcm_subscription_t;
 
     /// 取消一个订阅。
-    pub fn lcm_unsubscribe(lcm: *mut lcm_t, channel: *const c_char) -> c_int;
+    ///
+    /// 形参:`sub` 必须由 `lcm_subscribe` 在同一 `lcm_t` 上返回。
+    /// 返回 0 = 成功;非 0 = 找不到该 sub / 已取消。
+    pub fn lcm_unsubscribe(lcm: *mut lcm_t, sub: *mut lcm_subscription_t) -> c_int;
+
+    /// 设置 subscription 内部消息队列容量(消息堆积上限)。
+    ///
+    /// 2026-07-09 暴露:liblcm 1.5.2 头文件第 344 行存在;在高频 channel
+    /// 上把 num_messages 调高可避免 producer 快于 consumer 时丢帧。
+    /// liblcm 1.3 / 1.4 也兼容(API 自 1.3 引入,见 changelog)。
+    pub fn lcm_subscription_set_queue_capacity(
+        sub: *mut lcm_subscription_t,
+        num_messages: c_int,
+    ) -> c_int;
 
     /// 在 event loop 中处理一次消息,带超时。
     ///

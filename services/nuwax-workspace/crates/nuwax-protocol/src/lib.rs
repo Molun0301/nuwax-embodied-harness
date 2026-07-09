@@ -6,10 +6,12 @@
 //!   (Python/C++/Rust) 保持 byte-for-byte 兼容。
 //! - `protobuf / prost / tonic / gRPC` **不**作为默认协议层；它们仅在
 //!   "确有上游 protobuf 兼容需求"的边界被显式启用（见 `compat` 模块）。
-//! - LCM 消息以 8 字节 magic `0x4c433032` ("LC02") + 8 字节 message-type
-//!   fingerprint(下称 `lcm_hash`)+ `u32` payload length(Little-Endian)
-//!   + payload 组成。Fingerprint 沿用上游 `lcm-gen` 的
-//!     `cityhash64 / MurmurHash64A` 协议(以 8 字节大端网络序写入 framer)。
+//! - LCM 消息以 **8 字节 preamble**(4 字节 magic `0x4c433032` = `"LC02"` 大端
+//!   网络序 + 4 字节 seqno 大端)+ payload 组成。Fingerprint **不**写入
+//!   wire —— 由 LCM channel typed suffix(`/topic#pkg.Msg`)在订阅端承担
+//!   类型识别(见 [`LcmTopic::as_subscription_pattern`])。Fingerprint 数值
+//!   沿用上游 `lcm-gen` 的 `cityhash64 / MurmurHash64A` 协议(以 8 字节
+//!   大端网络序在进程内传递,如 [`LcmMessageType::fingerprint`])。
 //!
 //! ## P0 边界（本文件声明的 foundation milestone）
 //!
@@ -29,6 +31,8 @@
 //!     .payload(b"hello".to_vec())
 //!     .build();
 //! assert_eq!(frame.header.magic, RawLcmFrame::LCM_MAGIC);
+//! // wire = 8 字节 preamble + payload (no fingerprint / payload_len on wire)
+//! assert_eq!(frame.encode().len(), 8 + frame.payload.len());
 //! ```
 
 #![deny(unsafe_code)]
@@ -159,8 +163,8 @@ mod tests {
 
     #[test]
     fn lcm_magic_is_lc02() {
-        // LCM 1.x magic = ASCII "LC02" = 0x4c433032 (little-endian on wire)
-        assert_eq!(RawLcmFrame::LCM_MAGIC, u32::from_le_bytes(*b"LC02"));
+        // LCM 1.x magic = ASCII "LC02" = 0x4c433032(big-endian on wire,2026-07-09 B3 修正)
+        assert_eq!(RawLcmFrame::LCM_MAGIC, u32::from_be_bytes(*b"LC02"));
         assert_eq!(LCM_MAGIC, RawLcmFrame::LCM_MAGIC);
     }
 
@@ -173,10 +177,8 @@ mod tests {
             .build();
         assert_eq!(frame.payload.as_slice(), b"hello");
         assert_eq!(frame.header.magic, LCM_MAGIC);
-        assert_eq!(
-            frame.header.protocol_major,
-            LCMProtocolVersion::CURRENT.major
-        );
+        // 8 字节 preamble(LC02 magic BE + seqno BE)+ payload —— B3 audit 修正后
+        assert_eq!(frame.encode().len(), 8 + frame.payload.len());
     }
 }
 

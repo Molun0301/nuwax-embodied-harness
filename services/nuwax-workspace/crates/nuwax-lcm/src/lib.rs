@@ -34,14 +34,15 @@
 #![warn(missing_docs)]
 
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_void};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use nuwax_lcm_sys::{
     lcm_create, lcm_destroy, lcm_get_fileno, lcm_handle_timeout,
-    lcm_publish, lcm_subscribe, lcm_unsubscribe, lcm_t, to_cstring,
+    lcm_publish, lcm_recv_buf_t, lcm_subscribe, lcm_subscription_t, lcm_unsubscribe,
+    lcm_t, to_cstring,
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
@@ -165,10 +166,15 @@ enum Command {
 struct OwnerThread {
     lcm: *mut lcm_t,
     cmd_rx: mpsc::Receiver<Command>,
-    /// 已注册的 subscription:`channel CString → broadcast::Sender`
-    /// user_data 是个 boxed `broadcast::Sender`,liblcm 回调里
+    /// 已注册的 subscription:`channel CString → (subscription handle, broadcast::Sender)`
+    ///
+    /// 2026-07-09 B2 修复后,`lcm_subscribe` 返回 `*mut lcm_subscription_t`
+    /// (liblcm 1.x 真实签名),后续 `lcm_unsubscribe` 须以该 handle 为 key,
+    /// 而**不是** channel 字符串。所以必须把 handle 存下来。
+    /// user_data 仍是个 boxed `broadcast::Sender`,liblcm 回调里通过
     /// `(*const broadcast::Sender<Bytes>)` 当 user pointer 找回。
-    subscriptions: std::collections::HashMap<CString, broadcast::Sender<Bytes>>,
+    subscriptions:
+        std::collections::HashMap<CString, (*mut lcm_subscription_t, broadcast::Sender<Bytes>)>,
 }
 
 // SAFETY: `OwnerThread` 只在 `std::thread::spawn` 的那一刻被 move 一次;
@@ -185,6 +191,9 @@ impl OwnerThread {
     ///
     /// 关键:user pointer 是 raw pointer,必须 `'static`,所以我们用
     /// `Box::into_raw` + 自定义 free 流程;owner thread drop 时统一释放。
+    ///
+    /// 2026-07-09 B2 修复:`lcm_subscribe` 现在返 `*mut lcm_subscription_t`
+    /// (NULL on failure),存进 self.subscriptions 供后续 `lcm_unsubscribe` 用。
     fn subscribe(
         &mut self,
         channel: CString,
@@ -194,7 +203,9 @@ impl OwnerThread {
         let chan_str = channel.to_string_lossy().into_owned();
         let sender_box = Box::new(sender);
         let sender_ptr = Box::into_raw(sender_box);
-        let rc = unsafe {
+        // SAFETY: liblcm 接管 sender_ptr 的 lifetime,回调里再
+        // `&mut *(user as *mut broadcast::Sender<Bytes>)` 取回。
+        let sub = unsafe {
             lcm_subscribe(
                 self.lcm,
                 pattern.as_ptr(),
@@ -202,25 +213,41 @@ impl OwnerThread {
                 sender_ptr as *mut c_void,
             )
         };
-        if rc != 0 {
+        if sub.is_null() {
             // 失败 → 回收 sender
             let _ = unsafe { Box::from_raw(sender_ptr) };
             return Err(LcmError::Subscribe { channel: chan_str });
         }
-        self.subscriptions.insert(channel, unsafe { *Box::from_raw(sender_ptr) });
+        // 成功:把 sub handle 与 sender 一并存入 subscriptions,
+        // 以便 unsubscribe 时拿 sub handle 调 liblcm。
+        let sender_back = unsafe { *Box::from_raw(sender_ptr) };
+        self.subscriptions.insert(channel, (sub, sender_back));
         Ok(())
     }
 
     fn unsubscribe(&mut self, channel: &CString) {
-        let rc = unsafe { lcm_unsubscribe(self.lcm, channel.as_ptr()) };
+        // 2026-07-09 B2 修复:从 subscriptions 取 sub handle 调 liblcm
+        // (原先错用 channel 字符串 — liblcm 1.x 的 lcm_unsubscribe 不接受
+        //  channel 字符串,会直接返回错误或 UB)。
+        let sub = match self.subscriptions.remove(channel) {
+            Some((sub, sender)) => {
+                drop(sender);
+                sub
+            }
+            None => {
+                warn!(
+                    "lcm_unsubscribe: 未找到 channel={} 的 subscription handle",
+                    channel.to_string_lossy()
+                );
+                return;
+            }
+        };
+        let rc = unsafe { lcm_unsubscribe(self.lcm, sub) };
         if rc != 0 {
             warn!(
                 "lcm_unsubscribe 返回非 0 (channel={})",
                 channel.to_string_lossy()
             );
-        }
-        if let Some(sender) = self.subscriptions.remove(channel) {
-            drop(sender);
         }
     }
 
@@ -281,8 +308,10 @@ impl OwnerThread {
             let _ = unsafe { lcm_handle_timeout(self.lcm, 50) };
         }
 
-        // 收尾:销毁所有 subscriptions + destroy
-        for (ch, sender) in self.subscriptions.drain() {
+        // 收尾:drop 所有 subscriptions(sender 析构;subscription handle
+        // 归 lcm_t 拥有,lcm_destroy 时 liblcm 内部统一释放,不需手动 free)
+        for (ch, (sub, sender)) in self.subscriptions.drain() {
+            let _ = sub;
             drop(sender);
             let _ = ch;
         }
@@ -291,23 +320,31 @@ impl OwnerThread {
 }
 
 /// liblcm 静态回调。
+///
+/// 2026-07-09 B1 修复:liblcm 1.x 真实签名是
+/// `void (*)(const lcm_recv_buf_t *rbuf, const char *channel, void *user_data)`。
+/// payload 长度 / 字节来自 `rbuf->data_size` / `rbuf->data`(不是直接传 rbuf+rbuf_len)。
 unsafe extern "C" fn lcm_msg_callback(
-    rbuf: *const c_void,
-    rbuf_len: c_int,
+    rbuf: *const lcm_recv_buf_t,
     channel: *const c_char,
     user: *mut c_void,
 ) {
     if user.is_null() || rbuf.is_null() {
         return;
     }
-    let sender = &mut *(user as *mut broadcast::Sender<Bytes>);
-    let len = rbuf_len as usize;
-    let slice = std::slice::from_raw_parts(rbuf as *const u8, len);
+    // SAFETY: rbuf 由 liblcm 持有,本回调期间有效;data_size 来自 C 头,
+    // data 指针按 data_size 字节数有效。
+    let (data_ptr, len) = unsafe { ((*rbuf).data, (*rbuf).data_size as usize) };
+    if data_ptr.is_null() || len == 0 {
+        return;
+    }
+    let sender = unsafe { &mut *(user as *mut broadcast::Sender<Bytes>) };
+    let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, len) };
     let bytes = Bytes::copy_from_slice(slice);
     let _ = sender.send(bytes);
 
     if !channel.is_null() {
-        let cstr = std::ffi::CStr::from_ptr(channel);
+        let cstr = unsafe { std::ffi::CStr::from_ptr(channel) };
         debug!("lcm_msg_callback: channel={:?} len={}", cstr, len);
     }
 }

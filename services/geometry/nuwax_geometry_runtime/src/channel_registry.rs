@@ -84,13 +84,19 @@ const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
     (ChannelKey::OccTopic,     "",                                       "NUWAX_LCM_CHANNEL_OCC_TOPIC",     "/map/occupancy",         "nav_msgs.OccupancyGrid"),
 ];
 
-/// 按 `ChannelKey` 查表，返回 `(env_runtime, env_platform, default_channel, default_msg_type)`。
-fn lookup(key: ChannelKey) -> &'static (&'static str, &'static str, &'static str, &'static str) {
-    // linear scan 是 acceptable：仅 12 个 key，编译期为 `static` 数据
+/// 按 `ChannelKey` 查表,返回 `(env_runtime, env_platform, default_channel, default_msg_type)`。
+///
+/// rework19 fix(2026-07-09): 旧的 unsafe `&*(row as *const _ as *const (4-tuple))` 错误
+/// — row 是 5 元组 `(ChannelKey, &str, &str, &str, &str)`,cast 写成了 4 元组,
+/// 导致重新解释内存布局时偏移错位 + default_type 落到 ChannelKey/padding 字节,
+/// `*const u8 = 0x0` + `len = 0xaaaa_...` → `format!("/odom#{}")` 内部 alloc 一个
+/// 长度 ~187GB 的 String → `__rust_alloc` 触发 OOM abort。
+///
+/// 修复:直接解构 row,免去 unsafe cast 的偏移错位风险。
+fn lookup(key: ChannelKey) -> (ChannelKey, &'static str, &'static str, &'static str, &'static str) {
     for row in CHANNEL_KEY_TABLE {
         if row.0 == key {
-            // 通过指针 cast 抽离四元组；稳定 rust 与 clippy 都接受。
-            return unsafe { &*(row as *const _ as *const (&'static str, &'static str, &'static str, &'static str)) };
+            return *row;
         }
     }
     unreachable!("ChannelKey table is exhaustive; key={:?} not found", key)
@@ -99,7 +105,7 @@ fn lookup(key: ChannelKey) -> &'static (&'static str, &'static str, &'static str
 /// 解析 env：env_runtime > env_platform > default；返回 typed pattern 字符串
 /// （自动补 msg_type）。
 fn resolve_typed(key: ChannelKey) -> String {
-    let (env_runtime, env_platform, default_ch, default_type) = lookup(key);
+    let (_key, env_runtime, env_platform, default_ch, default_type) = lookup(key);
     let raw = if !env_runtime.is_empty() {
         std::env::var(env_runtime).ok()
     } else {

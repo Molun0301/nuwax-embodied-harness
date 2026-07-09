@@ -9,8 +9,8 @@
 //!   已有 attempt 且当前位置距 `attempt_pos >= reset_distance` 时清零 attempt 并刷新 `attempt_pos`。
 //! - `can_retry` 返回 `attempt + 1 <= max_attempts`。
 //! - `will_retry()` 把 `attempt` 加一。
-//! - `reset()` 清 attempt。Rust 实现**同时清 position**（与 Python 仅清 attempt 略有差异，
-//!   详见 feadback.md 漂移说明）。
+//! - `reset()` 只清 attempt，保留 `attempt_pos`（与 Python `replan_limiter.py:62-64` 一致；
+//!   修复 rework20 H-19 — 历史 Rust 实现误多清 `attempt_pos`，导致跨 goal 状态被错误隔断）。
 //!
 //! 重要：**本类型不是 D* Lite**。D* Lite 是后续算法增强，不属本轮验收。
 
@@ -85,10 +85,10 @@ impl ReplanLimiter {
         self.attempt += 1;
     }
 
-    /// 清零 attempt（Rust 同时清 attempt_pos，便于跨 goal 隔离；与 Python 略有漂移）
+    /// 清零 attempt（保留 `attempt_pos`，与 Python `replan_limiter.py:62-64` 一致；
+    /// 修复 rework20 H-19 — 历史实现误多清 `attempt_pos`）
     pub fn reset(&mut self) {
         self.attempt = 0;
-        self.attempt_pos = None;
     }
 
     /// 当前 attempt 计数
@@ -174,14 +174,15 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_attempt_and_position() {
+    fn reset_clears_attempt_keeps_position() {
+        // 修复 rework20 H-19:reset() 只清 attempt，保留 attempt_pos（对齐 Python 语义）
         let mut l = ReplanLimiter::default();
         let _ = l.can_retry(p(0.0, 0.0));
         l.will_retry();
         l.will_retry();
         l.reset();
         assert_eq!(l.attempt(), 0);
-        assert_eq!(l.attempt_pos(), None);
+        assert_eq!(l.attempt_pos(), Some(p(0.0, 0.0)), "reset must keep attempt_pos (Python 语义对齐)");
     }
 
     #[test]

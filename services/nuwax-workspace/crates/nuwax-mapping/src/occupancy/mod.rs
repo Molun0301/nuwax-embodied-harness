@@ -19,4 +19,6 @@ pub use operations::OccupancyOps;
 pub use path_map::PathMap;
 pub use path_mask::PathMask;
 pub use path_resampling::PathResampling;
-pub use types::{CostValues, OccupancyGrid, OccupancyValue};
+pub use types::{MapMetaData, OccupancyGrid, OccupancyValue, Pose};
+// `CostValues` bitflags 已删除（dimos wire format 仅三态）。
+// 历史引用方应在迁移期间改用 `OccupancyValue`。

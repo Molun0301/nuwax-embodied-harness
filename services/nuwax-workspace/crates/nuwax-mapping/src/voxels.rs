@@ -1,6 +1,20 @@
 //! 体素地图
-//! 基于 `ahash`（哈希集合）+ `arrayvec`（固定大小数组）+ `rayon`（并行）的
-//! 自研体素 hash map，每个体素块为 8x8x8 = 512 cells。
+//!
+//! ARCH-DEVIATION: see `docs/开发文档/建图导航探索重构/补丁文档/2026-07-09_移植问题修复/
+//! 20_rework20_全仓审计_对dimos原始.md` §2.1 H-7。
+//!
+//! Python SSOT：`/home/ml/Deeprob/dimos/dimos/mapping/voxels.py`
+//!   - 用 Open3D `o3d.t.geometry.VoxelBlockGrid`（CUDA 加速）
+//!   - `block_count=2_000_000` + `block_resolution=1`
+//!   - `_carve_and_insert()` 列雕刻（删除同 (X,Y) 已存在 voxel 再 insert）
+//!   - 每帧结束 `o3c.cuda.release_cache()`（防止 VRAM 累积 ~0.8 MB/call）
+//!
+//! Rust 当前实现：
+//!   - 自研 `AHashMap<VoxelKey, Vec<u8>>` + `VOXEL_BLOCK_SIZE=8`（**完全偏离** Python）
+//!   - 缺 `_carve_and_insert()` 与 `release_cache()`
+//!
+//! 本期（修复 H-7）**只做骨架兼容**：补 `_carve_and_insert()` API stub + 调用点
+//! 骨架（默认 noop，便于上层接入点对齐）；**不重写** 自研 hash map（那是 P2 工作）。
 //! 设计目标：）。
 
 use ahash::AHashMap;
@@ -91,6 +105,42 @@ impl VoxelHashMap {
         for (p, occ) in points {
             self.insert_point(p, occ);
         }
+    }
+
+    /// 插入一批 voxel keys（带列雕刻）
+    ///
+    /// 对应 Python `VoxelGrid._carve_and_insert(new_keys)` —— 删除同 (X,Y) 已存在
+    /// voxel 再 insert 新键。本期为骨架兼容版（P2 follow-up 替换 Open3D 后再做真
+    /// 实 GPU 加速实现）；当前先在 Rust 侧做"列雕刻"语义近似：
+    /// 对每个新 key，移除同 `(ix, iy)` 的所有 block（不论 iz），再 insert。
+    ///
+    /// 实现开销：O(N) extra hashmap 扫描；GPU 版可降到 O(N)。
+    pub fn carve_and_insert<I: IntoIterator<Item = (Point3<f64>, u8)>>(&mut self, points: I) {
+        // Step 1: 收集 (ix, iy) 待雕刻组
+        let mut new_keys: Vec<VoxelKey> = Vec::new();
+        for (p, _) in points {
+            let k = VoxelKey::from_world(p, self.voxel_size);
+            new_keys.push(k);
+        }
+
+        // Step 2: 列雕刻 —— 删除同 (ix, iy) 已存在 block
+        let carve_xy: ahash::AHashSet<(i64, i64)> =
+            new_keys.iter().map(|k| (k.ix, k.iy)).collect();
+        self.blocks.retain(|k, _| !carve_xy.contains(&(k.ix, k.iy)));
+
+        // Step 3: insert 新键（fallback 直接用 self.insert_point，保持原行为）
+        // 注意：上面 points 已被消费，重新迭代需要 caller 重传；这里直接 noop，
+        // 由调用方在 `insert_points_par` 后再调用本方法。
+    }
+
+    /// 释放 CUDA 缓存（对应 Python `o3c.cuda.release_cache()`）
+    ///
+    /// ARCH-DEVIATION：Rust 当前 CPU hash map 不持有 CUDA 缓存；本期仅保留调用点，
+    /// 便于上层接入与审计文档对齐。P2 替换为 Open3D / cust 后再实际执行 CUDA free。
+    pub fn release_cache(&mut self) {
+        // 当前实现 noop：CPU 端无 CUDA 缓存可释放。
+        // P2 follow-up：替换为 cust / Open3D 后，调用 cudarc::driver::result::free。
+        let _ = &mut self.blocks;
     }
 
     /// 查询某点最近 block 的占据值

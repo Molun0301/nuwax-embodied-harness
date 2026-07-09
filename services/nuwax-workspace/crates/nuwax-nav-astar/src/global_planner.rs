@@ -56,6 +56,19 @@ pub struct GlobalPlannerConfig {
     pub max_replan_attempts: u32,
     /// Replan limiter reset distance（米）
     pub replan_reset_distance: f64,
+    // ============================================================
+    // H-14:nerf_speed / simulation / navigation_costmap_interval
+    // ============================================================
+    /// nerf_speed 缩放因子(对应 Python `global_config.nerf_speed`;< 1.0 时减速,
+    /// 当 `local_planner` controller 速度乘以该因子)。
+    pub nerf_speed: f64,
+    /// 是否仿真模式(对应 Python `global_config.simulation`)。
+    ///
+    /// 影响 1:`LocalPlanner.controller.set_simulation(true)`(小角速度 boost 到 0.8)。
+    /// 影响 2:`stuck_threshold` 在 simulation 下切到 1.0(Python 实现)。
+    pub simulation: bool,
+    /// navigation_costmap 发布间隔(秒);0=关闭。直接传入 `LocalPlannerConfig`。
+    pub navigation_costmap_interval: f64,
 }
 
 impl Default for GlobalPlannerConfig {
@@ -76,6 +89,10 @@ impl Default for GlobalPlannerConfig {
             robot_rotation_diameter,
             max_replan_attempts: 6,
             replan_reset_distance: 2.0,
+            // H-14 默认值
+            nerf_speed: 1.0,
+            simulation: false,
+            navigation_costmap_interval: 0.0,
         }
     }
 }
@@ -130,8 +147,28 @@ impl GlobalPlanner {
     /// 构造
     #[must_use]
     pub fn new(cfg: GlobalPlannerConfig) -> Self {
-        let local = LocalPlanner::new(cfg.speed, cfg.control_frequency, cfg.goal_tolerance);
-        let position_tracker = PositionTracker::new(cfg.stuck_time_window, cfg.stuck_threshold);
+        // H-14:simulation 模式下 stuck_threshold 切到 1.0(对应 Python
+        // `global_planner.py:86-91` `if global_config.simulation: stuck_threshold = 1.0`)。
+        let stuck_threshold = if cfg.simulation {
+            1.0
+        } else {
+            cfg.stuck_threshold
+        };
+
+        // H-14:用 LocalPlannerConfig 全量构造,把 nerf_speed / simulation /
+        // navigation_costmap_interval 三个新字段传给 LocalPlanner。
+        let local_cfg = crate::local_planner::LocalPlannerConfig {
+            speed: cfg.speed,
+            control_frequency: cfg.control_frequency,
+            goal_tolerance: cfg.goal_tolerance,
+            orientation_tolerance: 0.35,
+            nerf_speed: cfg.nerf_speed,
+            simulation: cfg.simulation,
+            navigation_costmap_interval: cfg.navigation_costmap_interval,
+        };
+        let local = LocalPlanner::with_config(local_cfg);
+
+        let position_tracker = PositionTracker::new(cfg.stuck_time_window, stuck_threshold);
         let replan_limiter = ReplanLimiter::new(cfg.max_replan_attempts, cfg.replan_reset_distance);
 
         Self {
@@ -150,6 +187,14 @@ impl GlobalPlanner {
             last_stuck_check: std::time::Instant::now(),
             last_published_path: None,
         }
+    }
+
+    /// 注册 navigation_costmap 订阅者(H-14 Out publisher pass-through)。
+    pub fn subscribe_navigation_costmap(
+        &mut self,
+        sub: crate::local_planner::NavCostmapSubscriber,
+    ) {
+        self.local_planner.subscribe_navigation_costmap(sub);
     }
 
     /// 启停 replanning
@@ -376,6 +421,9 @@ impl GlobalPlanner {
 
     fn _plan_path(&mut self) {
         self.cancel_goal_inner_keep_goal();
+        // 修复 rework20 H-18:每次 _plan_path 入口重置 safe_goal_clearance 回默认值，
+        // 避免外部临时调小后长任务运行 goal 不可达。
+        self.reset_safe_goal_clearance();
         let odom = match self.current_odom.as_ref() {
             Some(o) => o.clone(),
             None => {

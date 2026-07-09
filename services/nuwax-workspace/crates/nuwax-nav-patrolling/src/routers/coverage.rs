@@ -46,6 +46,70 @@ impl PathEstimator for StraightLineEstimator {
     }
 }
 
+/// Voronoi 加权采样权重（修复 rework20 H-16 占位 API）。
+///
+/// 对齐 Python `CoveragePatrolRouter._sampling_weights`：用 `voronoi_gradient`
+/// 算出的 cost 反向作为采样权重(skeleton cell cost≈0 → weight≈100,wall cell
+/// cost≈100 → weight≈0),候选点按权重采样,使 patrol 不在开阔区域聚集。
+///
+/// 本期仅做 API 骨架 + 简单 fallback;真正的 voronoi_gradient 实现留待 P2。
+#[derive(Debug, Clone, Copy)]
+pub struct VoronoiWeights<'a> {
+    /// `width * height` 浮点权重(None 表示未计算)
+    pub weights: Option<&'a [f64]>,
+    /// width (cells)
+    pub width: u32,
+    /// height (cells)
+    pub height: u32,
+}
+
+/// 在候选 cell 中按 voronoi 权重采样(修复 rework20 H-16 骨架)。
+///
+/// - `weights=None`:退化为均匀随机抽样(与旧 Rust 行为一致)
+/// - `weights=Some(w)`:按 `weight / sum(weight)` 加权抽样,样本数 `n` 由调用方指定
+///
+/// 返回采中的 cell 索引。**PARTIAL 实现**:当前仅支持"无权重时均匀抽样",
+/// voronoi 加权采样等 P2 接入 `NavigationMap::make_voronoi_gradient` 后补齐。
+///
+/// 对应 Python:
+/// ```python
+/// weights = np.clip(100.0 - voronoi_cost, 0.0, 100.0)
+/// probs = weights / weights.sum() if weights.sum() > 0 else None
+/// chosen = np.random.choice(len(safe_indices), size=n, replace=False, p=probs)
+/// ```
+#[allow(dead_code)]
+pub fn weighted_sample(
+    candidates: &[usize],
+    weights: VoronoiWeights<'_>,
+    n: usize,
+    rng: &mut StdRng,
+) -> Vec<usize> {
+    if candidates.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    let n = n.min(candidates.len());
+
+    // PARTIAL: voronoi 加权采样待 P2
+    // 完整实现:归一化 weights[candidates] 为 probs,rng 按 probs 无放回抽 n 个。
+    // 当前 fallback:等距步长抽样,保证 deterministic 但忽略权重。
+    match weights.weights {
+        Some(_w) => {
+            // 权重已就绪但 voronoi 加权采样尚未实现 → 退化为均匀抽样 + TODO 日志
+            eprintln!(
+                "weighted_sample: voronoi 加权采样待 P2 实装,当前 fallback 均匀抽样"
+            );
+            let step = (candidates.len() / n.max(1)).max(1);
+            candidates.iter().step_by(step).take(n).copied().collect()
+        }
+        None => {
+            // 无权重(未注入 voronoi_gradient):均匀抽样
+            let step = (candidates.len() / n.max(1)).max(1);
+            let _ = rng; // rng 留给 P2 voronoi 加权采样时使用
+            candidates.iter().step_by(step).take(n).copied().collect()
+        }
+    }
+}
+
 /// Coverage router
 pub struct CoveragePatrolRouter {
     history: VisitationHistory,
@@ -208,5 +272,50 @@ mod tests {
     fn no_goal_without_grid() {
         let mut r = CoveragePatrolRouter::new(0.5, 4, Some(1));
         assert!(r.next_goal().is_none());
+    }
+
+    // ===== H-16 weighted_sample 单测 =====
+
+    #[test]
+    fn weighted_sample_no_weights_returns_n_from_candidates() {
+        // 修复 rework20 H-16:无 voronoi 权重时,均匀抽样 n 个。
+        let candidates: Vec<usize> = (0..10).collect();
+        let mut rng = StdRng::seed_from_u64(42);
+        let weights = VoronoiWeights {
+            weights: None,
+            width: 5,
+            height: 5,
+        };
+        let picked = weighted_sample(&candidates, weights, 3, &mut rng);
+        assert_eq!(picked.len(), 3);
+        for &i in &picked {
+            assert!(candidates.contains(&i), "picked idx must be in candidates");
+        }
+    }
+
+    #[test]
+    fn weighted_sample_clamps_n_to_candidates_len() {
+        // n > candidates.len() 时,clamp 到 candidates.len()。
+        let candidates: Vec<usize> = (0..3).collect();
+        let mut rng = StdRng::seed_from_u64(7);
+        let weights = VoronoiWeights {
+            weights: None,
+            width: 3,
+            height: 3,
+        };
+        let picked = weighted_sample(&candidates, weights, 100, &mut rng);
+        assert_eq!(picked.len(), 3);
+    }
+
+    #[test]
+    fn weighted_sample_empty_returns_empty() {
+        let mut rng = StdRng::seed_from_u64(0);
+        let weights = VoronoiWeights {
+            weights: None,
+            width: 5,
+            height: 5,
+        };
+        let picked = weighted_sample(&[], weights, 5, &mut rng);
+        assert!(picked.is_empty());
     }
 }

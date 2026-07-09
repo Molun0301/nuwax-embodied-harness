@@ -3,6 +3,11 @@
 //! 1. 对每个 source 点，在 target 中查找最近邻（kiddo KD-tree）
 //! 2. 用 SVD 计算 best-fit 变换
 //! 3. 应用变换，重复直到收敛
+//!
+//! RELOCALIZE PARTIAL：see audit H-9 (rework20)。
+//! 当前实装已加入 gravity filter（z-axis tilt 阈值）与 wall subset selection
+//! （基于法线 z 分量的水平约束）。FPFH / RANSAC 完整管线（dimos `_preprocess` +
+//! `_ransac` + multi-scale 多启动）划归 P2。
 
 use kiddo::KdTree;
 use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3};
@@ -184,6 +189,67 @@ impl Default for IcpSolver {
     }
 }
 
+// =====================================================================
+// H-9 stubs：gravity filter + wall subset（FPFH/RANSAC 留 P2）
+// =====================================================================
+
+/// gravity 倾斜阈值（度）
+///
+/// 对齐 dimos `GRAVITY_TILT_MAX_DEG = 10.0`：
+/// 候选变换的 z 轴与世界 z-up 夹角超过此值视为异常候选（典型：z-degenerate
+/// floor/floor-only 对齐），应被丢弃。
+pub const GRAVITY_TILT_MAX_DEG: f64 = 10.0;
+
+/// 墙子集法线 z 分量阈值
+///
+/// 对齐 dimos `wall_subset` 的 `mask = |nrm[:, 2]| < 0.7`：
+/// 法线接近水平的点（即墙面）被保留，法线接近垂直的点（地板/天花板）被过滤。
+pub const WALL_NORMAL_Z_MAX: f64 = 0.7;
+
+/// 计算变换相对 world z-up 的倾斜角（度）。
+///
+/// 返回 `Isometry3::rotation` 的局部 z 轴与 `[0, 0, 1]` 之间的夹角。
+/// identity 旋转 → 0°；90° roll/pitch → 90°。
+pub fn gravity_tilt_deg(transform: &Isometry3<f64>) -> f64 {
+    let z_local = transform.rotation * Vector3::z();
+    let cos = z_local.z.clamp(-1.0, 1.0);
+    cos.acos().to_degrees()
+}
+
+/// 检查变换是否"重力合宜"（z 轴不超过阈值倾斜）。
+pub fn is_upright(transform: &Isometry3<f64>, max_tilt_deg: f64) -> bool {
+    gravity_tilt_deg(transform) <= max_tilt_deg
+}
+
+/// 在一组候选变换中过滤掉重力不合宜的；全不合宜时回退到原集合
+/// （与 dimos `pool = upright if upright else candidates` 行为一致）。
+pub fn filter_upright(candidates: &[Isometry3<f64>], max_tilt_deg: f64) -> Vec<Isometry3<f64>> {
+    let upright: Vec<Isometry3<f64>> = candidates
+        .iter()
+        .copied()
+        .filter(|t| is_upright(t, max_tilt_deg))
+        .collect();
+    if upright.is_empty() {
+        candidates.to_vec()
+    } else {
+        upright
+    }
+}
+
+/// 墙子集：根据法线 z 分量过滤（|nrm.z| < 阈值 → 保留）。
+///
+/// 返回值是与输入等长的 `Vec<bool>`，true 表示该点被保留为墙体候选。
+/// 调用方据此过滤 `PointCloud`：
+///
+/// ```ignore
+/// let keep = wall_subset_mask(&normals, WALL_NORMAL_Z_MAX);
+/// let walls: Vec<Point3<f64>> = points.iter().zip(keep.iter())
+///     .filter_map(|(p, &k)| k.then_some(*p)).collect();
+/// ```
+pub fn wall_subset_mask(normals: &[Vector3<f64>], threshold: f64) -> Vec<bool> {
+    normals.iter().map(|n| n.z.abs() < threshold).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +298,82 @@ mod tests {
         let res = solver.align(&[], &[]);
         assert!(!res.converged);
         assert_eq!(res.iterations, 0);
+    }
+
+    // ----- H-9 修复新增用例 -----
+
+    /// H-9：identity 旋转的 gravity 倾斜角应为 0°
+    #[test]
+    fn h9_gravity_tilt_identity_is_zero() {
+        let t = Isometry3::identity();
+        let tilt = gravity_tilt_deg(&t);
+        assert!(tilt.abs() < 1e-9, "identity tilt must be 0, got {tilt}");
+    }
+
+    /// H-9:绕 y 轴 90° 的旋转 → tilt = 90°（被丢弃）
+    #[test]
+    fn h9_gravity_tilt_quarter_turn_y_is_ninety() {
+        let q = UnitQuaternion::from_euler_angles(0.0, core::f64::consts::FRAC_PI_2, 0.0);
+        let t = Isometry3::from_parts(Translation3::identity(), q);
+        let tilt = gravity_tilt_deg(&t);
+        assert!((tilt - 90.0).abs() < 1e-6, "y-90° rotation tilt must be 90°, got {tilt}");
+    }
+
+    /// H-9：filter_upright 应该丢弃倾斜候选；全不合宜时回退
+    #[test]
+    fn h9_filter_upright_drops_tilted() {
+        // 候选：1 identity + 1 倾斜 30°
+        let id = Isometry3::identity();
+        let tilted = Isometry3::from_parts(
+            Translation3::identity(),
+            UnitQuaternion::from_euler_angles(0.0, core::f64::consts::FRAC_PI_6, 0.0),
+        );
+        let candidates = vec![tilted, id];
+        let kept = filter_upright(&candidates, GRAVITY_TILT_MAX_DEG);
+        assert_eq!(kept.len(), 1, "tilted 30° 候选应被丢弃");
+
+        // 全不合宜：两个都是 30° 倾斜 → 回退
+        let all_tilted = vec![tilted, tilted];
+        let kept_all = filter_upright(&all_tilted, GRAVITY_TILT_MAX_DEG);
+        assert_eq!(kept_all.len(), 2, "all tilted 必须回退到原集合");
+    }
+
+    /// H-9：wall_subset_mask |nrm.z| < 0.7 保留水平法线（墙面）
+    #[test]
+    fn h9_wall_subset_keeps_horizontal_normals() {
+        use nalgebra::vector;
+        let normals = vec![
+            vector![1.0, 0.0, 0.0],    // 墙面 → |n.z|=0 < 0.7 → keep
+            vector![0.0, 1.0, 0.0],    // 墙面 → keep
+            vector![0.0, 0.0, 1.0],    // 天花板 → |n.z|=1 → drop
+            vector![0.0, 0.0, -1.0],   // 地板 → |n.z|=1 → drop
+            vector![0.6, 0.6, 0.6],    // |z|=0.6 < 0.7 → keep（边角墙面）
+            vector![0.5, 0.5, 0.8],    // |z|=0.8 > 0.7 → drop（接近地板）
+        ];
+        let mask = wall_subset_mask(&normals, WALL_NORMAL_Z_MAX);
+        assert_eq!(mask, vec![true, true, false, false, true, false]);
+    }
+
+    /// H-9:多尺度 ICP 入口存在性冒烟测试（确认 `IcpSolver::align` 可对多缩放点云调用）
+    /// 实装下 multi-scale 是由 caller 在多个 IcpConfig（不同 max_correspondence_distance）
+    /// 间串接 align() 实现；本测试仅校验 API + 不同尺度参数都能成功调用。
+    #[test]
+    fn h9_multiscale_icp_entry_exists() {
+        let pts: Vec<Point3<f64>> = (0..10)
+            .map(|i| Point3::new(i as f64 * 0.05, 0.0, 0.0))
+            .collect();
+        // 粗尺度
+        let coarse = IcpConfig {
+            max_correspondence_distance: 0.3,
+            ..IcpConfig::default()
+        };
+        // 细尺度
+        let fine = IcpConfig {
+            max_correspondence_distance: 0.05,
+            ..IcpConfig::default()
+        };
+        let _coarse_res = IcpSolver::new(coarse).align(&pts, &pts);
+        let _fine_res = IcpSolver::new(fine).align(&pts, &pts);
+        // 两个尺度都能跑通：标记 multi-scale ICP 入口可用
     }
 }

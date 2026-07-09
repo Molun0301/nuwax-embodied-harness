@@ -207,11 +207,12 @@ pub const TYPED_CHANNELS: &[(&str, &str, &str)] = &[
         "NUWAX_LCM_CHANNEL_TF",
         "/tf#geometry_msgs.Transform",
     ),
-    // cloud map (cumulative point cloud)
+    // cloud map (cumulative point cloud) —— R-N5a 修复:默认与 start.sh + .env.example
+    // 对齐 `/cloud_map`(累积点云地图),与 POINTCLOUD 实时流 `/go2/lidar/points` 区分。
     (
         "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
         "NUWAX_LCM_CHANNEL_CLOUD_MAP",
-        "/go2/lidar/points#sensor_msgs.PointCloud2",
+        "/cloud_map#sensor_msgs.PointCloud2",
     ),
     // navigation state
     // Phase 4 修复：platform alias 由 `NUWAX_LCM_CHANNEL_GOAL_POSE` 改为

@@ -298,6 +298,67 @@ class LowLevelControlConfig:
     control_interval_sec: float = 0.002
 
 
+# ============================================================
+# R-N2:nuwax-workspace runtime 配置 dataclass(Round 5 §4.2 / §12.4 落地)
+# ============================================================
+# 这些 dataclass 是 .env.example 14 键(LCM typed) + 10 键(runtime alias) +
+# 6 键(mapping adapter) + 1 键(LCM backend 复合) 的 Python 端结构化入口。
+# 注意:`occ_topic` 不在本表(Rust `channel_registry.rs OccTopic` 内部别名,
+# platform 不消费),由 .env 直读走;`LcmChannelConfig` 字段保持 13 字段与
+# 现有 `contracts/geometry_runtime.py:LcmChannelConfig` 对齐。
+@dataclass(frozen=True)
+class LcmBackendConfig:
+    """LCM 后端 + 共享内存路径配置(对齐 lcm_runtime.rs + server.rs)。
+
+    2026-07-08 fake-lcm 物理删除(v3 F2)后,`backend` 实际值域收敛到
+    `real-lcm`(FAIL-FAST 默认)与 `real-lcm` 显式覆盖;`real_required`
+    字段保留以让运维显式声明上游依赖不可用时的 fail-fast 行为。
+    """
+
+    backend: str = _cfg_str("NUWAX_LCM_BACKEND", "real-lcm")
+    url: str = _cfg_str("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=1")
+    real_required: bool = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
+    cloudmap_shm_path: str = _cfg_str("NUWAX_CLOUDMAP_SHM_PATH", "/tmp/nuwax_cloudmap.mmap")
+    occupancy_shm_path: str = _cfg_str("NUWAX_OCCUPANCY_SHM_PATH", "/tmp/nuwax_occupancy.mmap")
+
+
+@dataclass(frozen=True)
+class RuntimeChannelAliasConfig:
+    """Runtime 进程内 channel alias(对齐 `channel_registry.rs` 10 个 `*_CHANNEL` 表项)。
+
+    这些字段是 platform 视角下的"内层 alias"——Rust runtime 启动时优先
+    探测该 env,缺省时 fallback 到对应 `NUWAX_LCM_CHANNEL_*` 平台键。
+    """
+
+    odom: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL", "/odom")
+    tf: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL", "/tf")
+    cloudmap: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL", "/go2/lidar/points")
+    occupancy: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL", "/map/occupancy")
+    cmd_vel: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL", "/cmd_vel")
+    nav_goal: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL", "/nav/goal")
+    nav_state: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL", "/nav/state")
+    frontiers: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL", "/explore/frontiers")
+    pose: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL", "/pose_stamped")
+    nav_cancel: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL", "/nav/cancel")
+
+
+@dataclass(frozen=True)
+class MappingAdapterConfig:
+    """Rust `nuwax-mapping-*` 适配器配置(对齐 `nuwax-workspace` 6 键)。
+
+    这些键是 Rust 端 `nuwax-mapping-cloud` / `nuwax-mapping-ros` /
+    `nuwax-mapping-rtabmap` / `nuwax-mapping-slam` 各自 crate 启动期探测
+    的 env;Python 端仅作为 .env SSOT 镜像存在。
+    """
+
+    cloud_enabled: bool = _cfg_bool("NUWAX_MAPPING_CLOUD_ENABLED", False)
+    cloud_provider: str = _cfg_str("NUWAX_MAPPING_CLOUD_PROVIDER", "google_maps")
+    cloud_cache_dir: str = _cfg_str("NUWAX_MAPPING_CLOUD_CACHE_DIR", "/tmp/nuwax_mapping_cloud")
+    ros_compat_enabled: bool = _cfg_bool("NUWAX_MAPPING_ROS_COMPAT_ENABLED", False)
+    rtabmap_database_dir: str = _cfg_str("NUWAX_MAPPING_RTABMAP_DATABASE_DIR", "/tmp/nuwax_rtabmap")
+    slam_provider: str = _cfg_str("NUWAX_MAPPING_SLAM_PROVIDER", "rtabmap")
+
+
 
 @dataclass
 class VolumeControlConfig:
@@ -900,7 +961,8 @@ def load_config() -> NuwaxRobotBridgeConfig:
             process_name=_cfg_str("NUWAX_GEOMETRY_RUNTIME_PROCESS_NAME", "nuwax-geometry-runtime"),
             log_name=_cfg_str("NUWAX_GEOMETRY_RUNTIME_LOG_NAME", "nuwax_geometry_runtime.log"),
             provides_map=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_MAP", True),
-            provides_navigation=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAVIGATION", True),
+            # R-N2 重命名:`..._PROVIDES_NAVIGATION` → `..._PROVIDES_NAV`,与 .env.example 对齐
+            provides_navigation=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAV", True),
             provides_tf=_cfg_bool("NUWAX_GEOMETRY_EXTERNAL_PROVIDES_TF", True),
             frontier_channel=_cfg_str(
                 "NUWAX_LCM_CHANNEL_FRONTIER",

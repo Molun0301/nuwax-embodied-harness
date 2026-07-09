@@ -63,7 +63,7 @@ L1_PATTERNS='(^|[[:space:]])import[[:space:]]+rclpy($|[[:space:]]|\.)|(^|[[:spac
 # 2026-07-04 修正：移除 `_nav2_action_provider` — 该字段作为兼容占位保留（HIGH-3 修复后保留，
 # 不再实例化 Nav2 action client），运行时永远为 None。getattr fallback 是死路径，但不是 import。
 # 如果未来需要真正切换，可以借 git history 找回这条 keyword。
-PATTERNS='rclpy|r2r|nav2_msgs|tf2_ros|ros2_ws|colcon|rosdep|/opt/ros|ROS_DISTRO|RMW_IMPLEMENTATION|CYCLONEDDS|nav2_action_proxy|RosBridge|ros_bridge|nuwax_ros_bridge'
+PATTERNS='rclpy|r2r|nav2_msgs|tf2_ros|ros2_ws|colcon|rosdep|/opt/ros|ROS_DISTRO|RMW_IMPLEMENTATION|CYCLONEDDS|nav2_action_proxy|RosBridge|ros_bridge|nuwax_ros_bridge|NUWAX_GEOMETRY_EXTERNAL_SCRIPT|NUWAX_GEOMETRY_EXTERNAL_ARGS|NUWAX_GEOMETRY_REQUIRE_ROS2|NUWAX_GEOMETRY_SETUP_SCRIPT|NUWAX_GEOMETRY_GO2SLAM_SETUP_SCRIPT|NUWAX_ROS_SETUP_SCRIPT|NUWAX_ROS_BRIDGE_ENV_SCRIPT|NUWAX_NAV2_MODE|NUWAX_GEOMETRY_CYCLONEDDS_LIB_DIR'
 
 # allowlist 文件路径
 ALLOWLIST_FILE="${REPO_ROOT}/scripts/ci/no_ros2_residual.allowlist"
@@ -204,6 +204,20 @@ if [ -n "$HITS_L2" ]; then
   if [ -n "$L2_BLOCKED" ]; then
     echo "[no_ros2_residual] FAIL: L2 命中未在 allowlist 中登记" >&2
     echo "$L2_BLOCKED" >&2
+    echo "" >&2
+    # matched_key 诊断行:从 PATTERNS 提取每个 key,标注哪条命中了,便于定位
+    while IFS= read -r hit; do
+      [[ -z "$hit" ]] && continue
+      matched_key=""
+      IFS='|' read -ra _keys <<< "$PATTERNS"
+      for key in "${_keys[@]}"; do
+        if [[ "$hit" == *"$key"* ]]; then
+          matched_key="$key"
+          break
+        fi
+      done
+      echo "       matched_key: ${matched_key:-UNKNOWN}" >&2
+    done <<< "$L2_BLOCKED"
     echo "" >&2
     echo "如需放行，请追加 file:line 到 ${ALLOWLIST_FILE} 并在 docs/ 留根因备忘。" >&2
     exit 1

@@ -153,16 +153,6 @@
   category: migration_doc_block
   reason: "Phase 0+4 修复（commit f991346）：build_workspaces no-op 函数 docstring。"
 
-- file: scripts/check_layering.sh
-  line: 5
-  category: check_layering_prune
-  reason: "B1 修复（commit d619629）：check_layering.sh 的 PRUNE 模式说明，ros2_ws/ 已物理删除但脚本仍保留作为防御性排除。"
-
-- file: scripts/check_layering.sh
-  line: 17
-  category: check_layering_prune
-  reason: "B1 修复：PRUNE 正则包含 ros2_ws/，同样属防御性排除。"
-
 - file: scripts/installer/phases/__init__.py
   line: 10
   category: phase_docstring
@@ -299,24 +289,9 @@
   reason: "新启动脚本 header 注释续行：不依赖 colcon/rosdep/libddsc.so/CycloneDDS。"
 
 - file: scripts/legacy/cleanup_ros2_processes.sh
-  line: 7
-  category: legacy_isolated_script
-  reason: "M2 修复（fix-H1-H4-M1-M2 lane）：legacy 迁移脚本 header 注释，明确说明子脚本仅覆盖历史 ros2_ws/ + ROS2 包残留的进程表条目，属隔离层代码。"
-
-- file: scripts/legacy/cleanup_ros2_processes.sh
-  line: 10
-  category: legacy_isolated_script
-  reason: "M2 修复：legacy 迁移脚本 header 注释续行，说明 services/geometry/ros2_ws/src/GO2_RTABNAV2 已被删除的迁移背景。"
-
-- file: scripts/legacy/cleanup_ros2_processes.sh
-  line: 94
-  category: legacy_isolated_script
-  reason: "M2 修复：cleanup_legacy_geometry_processes 函数注释，明确显式清理历史 ros2_ws 工作区下进程组；该路径已删除，命中即孤儿。"
-
-- file: scripts/legacy/cleanup_ros2_processes.sh
   line: 95
   category: legacy_isolated_script
-  reason: "M2 修复：local geometry_root 变量定义，指向已被删除的 services/geometry/ros2_ws/src/GO2_RTABNAV2 路径；属隔离层代码，触发即被 NUWAX_LEGACY_ROS2_CLEANUP=1 显式开关控制。"
+  reason: "M2 修复：local geometry_root 变量定义，指向已被删除的 services/geometry/ros2_ws/src/GO2_RTABNAV2 路径；属隔离层代码，触发即被 NUWAX_LEGACY_ROS2_CLEANUP=1 显式开关控制。注：4.5 step D 已将 header（L7/10）与函数注释（L94）物理删 ros2 字面字符串，该字段因变量值已置空不再构成残留扫描目标，allowlist 同步移除 3 条 entry 闭环。"
 
 - file: services/geometry/runtime.py
   line: 4427
@@ -367,3 +342,94 @@
   line: 382
   category: migration_doc_block
   reason: "建图导航探索库接入 Phase 6 _ZH_NAMES 注册段注释：明确说明 NUWAX_NAV_PROFILE/EXPLORE_ARBITRATION/REAL_LCM_REQUIRED 对接 nuwax-geometry-runtime (Rust) 装配面,不再走旧 rclpy/Nav2。该注释是迁移背景说明,不调用任何 nav2/rclpy。属反向锚点文档。"
+
+# 4.5 step B 增量:PATTERNS 新增 9 个 NUWAX_* 死键后,历史迁移注释/docstring 中的字面字符串需要 allowlist 放行
+- file: core/config_registry.py
+  line: 392
+  category: migration_doc_block
+  reason: "4.5 step B 增量：_ZH_NAMES 注册段上方注释行，提及不再走旧 rclpy/Nav2。纯迁移背景说明。"
+
+- file: scripts/bootstrap.py
+  line: 587
+  category: migration_doc_block
+  reason: "4.5 step B 增量：drop-ros2 阶段说明注释,提及原 6+ 项 ROS2/colcon/rosdep/CycloneDDS。"
+
+- file: scripts/bootstrap.py
+  line: 589
+  category: migration_doc_block
+  reason: "4.5 step B 增量：上一条注释续行,提及平台侧不再要求 ROS2/colcon/rosdep/libddsc.so。"
+
+- file: scripts/bootstrap.py
+  line: 669
+  category: migration_doc_block
+  reason: "4.5 step B 增量：install_geometry_system_dependencies 阶段 docstring 续行,提及 rosdep/Go2SLAM/ROS2 工作区。"
+
+- file: scripts/bootstrap.py
+  line: 671
+  category: migration_doc_block
+  reason: "4.5 step B 增量：install_geometry_system_dependencies docstring 续行,提及 colcon build/install 校验下线。"
+
+- file: scripts/bootstrap.py
+  line: 672
+  category: migration_doc_block
+  reason: "4.5 step B 增量：build_workspaces 阶段 docstring,提及原 build_ros2_workspace.sh/colcon build 删除。"
+
+- file: scripts/bootstrap.py
+  line: 680
+  category: migration_doc_block
+  reason: "4.5 step B 增量：install_geometry_system_dependencies no-op 占位 docstring,提及 ROS2 apt/rosdep/Go2SLAM。"
+
+- file: scripts/bootstrap.py
+  line: 686
+  category: migration_doc_block
+  reason: "4.5 step B 增量：build_workspaces no-op 占位 docstring,提及原 build_ros2_workspace.sh/colcon build。"
+
+- file: scripts/installer/phases/geometry_runtime_deps.py
+  line: 11
+  category: phase_docstring
+  reason: "4.5 step B 增量：geometry_runtime_deps phase docstring,提及原 geometry_deps 阶段(RTAB-Map/Nav2/colcon/rosdep)已物理删。"
+
+- file: scripts/installer/phases/system.py
+  line: 13
+  category: phase_docstring
+  reason: "4.5 step B 增量：system phase docstring,列出已物理删的 ROS apt 包名(python3-colcon-common-extensions/rosdep/ros-*-navigation2)。"
+
+- file: scripts/installer/phases/system.py
+  line: 14
+  category: phase_docstring
+  reason: "4.5 step B 增量：system phase docstring 续行,提及 ros-*-rtabmap-ros 已物理删。"
+
+- file: scripts/start_gateway.sh
+  line: 530
+  category: migration_doc_block
+  reason: "4.5 step B 增量：start_gateway.sh 主流程注释,提及原 NUWAX_GEOMETRY_REQUIRE_ROS2 / NUWAX_GEOMETRY_RUNTIME_SOURCE_ROS_ENV 移除项。"
+
+- file: services/geometry/geometry_runtime_client.py
+  line: 404
+  category: pending_4_2_step
+  reason: "4.5 step B 增量：该行是 plan §10.2/4.2 承诺要改的 _external_script_path 9 处波及面中唯一直接读 env 的位置,worker-5 范围外(plan §4.2 步骤 5)。临时 allowlist,等 4.2 步改 _external_script_path 内部后自动失效。"
+
+- file: services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs
+  line: 17
+  category: rust_module_doc
+  reason: "4.5 step B 增量：lcm_runtime.rs module 注释续行,声明不允许回退 ROS2/r2r/DDS/RMW。属强约束反向锚点。"
+
+- file: services/geometry/runtime.py
+  line: 1047
+  category: migration_doc_block
+  reason: "4.5 step B 增量：runtime.py 注释,提及 launch_ros2_stack.sh + bash 前缀已下线。"
+
+- file: services/geometry/runtime.py
+  line: 4694
+  category: migration_doc_block
+  reason: "4.5 step B 增量：runtime.py 注释,警告 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 污染 Unitree SDK ChannelFactory。属强约束反向锚点。"
+
+- file: services/nuwax-workspace/Cargo.toml
+  line: 146
+  category: rust_toml_header
+  reason: "4.5 step B 增量：Cargo workspace header 注释,提及 C11 硬约束 nuwax_ros_bridge 协议对齐。属强约束反向锚点。"
+
+- file: services/nuwax-workspace/Cargo.toml
+  line: 226
+  category: rust_toml_header
+  reason: "4.5 step B 增量：Cargo workspace header 注释,提及 C7 硬约束 rmw_*/cyclonedds/libddsc*/r2r 禁入。属强约束反向锚点。"

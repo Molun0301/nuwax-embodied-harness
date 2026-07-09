@@ -123,9 +123,7 @@ impl LcmBackend for RealLcmBackend {
         topic: LcmTopic,
         msg_type: Option<LcmMessageType>,
     ) -> LcmFrameStream {
-        eprintln!("[rework18-trace] real_backend::subscribe: enter, before lock().await");
         let guard = self.inner.lock().await;
-        eprintln!("[rework18-trace] real_backend::subscribe: lock acquired");
         let ctx = match guard.as_ref() {
             Some(c) => c,
             None => {
@@ -133,7 +131,6 @@ impl LcmBackend for RealLcmBackend {
                 return subscription_error_stream(err);
             }
         };
-        eprintln!("[rework18-trace] real_backend::subscribe: ctx ok, before ctx.subscribe().await");
         let sub_result: Result<LcmSubscription, LcmError> = ctx.subscribe(topic.channel()).await;
         drop(guard); // 释放 lock,让后续 .recv() 不抱 lock
         let sub = match sub_result {

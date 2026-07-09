@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Tuple
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CORE_SETTINGS = _REPO_ROOT / "core" / "settings.py"
+# R-N12 跨层 import(下期 R-N6 范畴):本期不修,本文件 L25 与 core/config_io.py:193
+# 两处引用 drivers/go2/settings.py,后续统一改 importlib 路径
 _GO2_SETTINGS = _REPO_ROOT / "drivers" / "go2" / "settings.py"
 _DESCRIPTIONS_JSON = _REPO_ROOT / "core" / "config_descriptions.json"
 
@@ -162,6 +164,10 @@ SECTIONS: Tuple[Tuple[str, str], ...] = (
     ("go2_official", "Go2 数据面·官方控制"),
     ("go2_video", "Go2 数据面·视频推流"),
     ("relay", "容器内 Relay 转发"),
+    ("lcm_typed_channel", "LCM typed channel 与 typed 协议"),
+    ("runtime_channel", "几何 runtime·进程内 channel alias"),
+    ("nuwax_mapping", "nuwax-workspace·mapping 适配器"),
+    ("shm_uds", "共享内存 / Unix socket 路径"),
     ("misc", "其它"),
 )
 _SECTION_TITLES = dict(SECTIONS)
@@ -193,6 +199,10 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("go2_official", ("GO2_OFFICIAL",)),
     ("go2_input", ("GO2_DATA_PLANE", "GO2_DIRECT_DDS", "GO2_DDS")),
     ("robot", ("NUWAX_ACTIVE_ROBOT", "GO2_SDK", "GO2_LOW_LEVEL", "GO2_NETWORK", "GO2_")),
+    ("lcm_typed_channel", ("NUWAX_LCM_CHANNEL_",)),
+    ("runtime_channel",   ("NUWAX_GEOMETRY_RUNTIME_", "NUWAX_GEOMETRY_RUNTIME_PROCESS", "NUWAX_GEOMETRY_RUNTIME_LOG")),
+    ("nuwax_mapping",     ("NUWAX_MAPPING_", "NUWAX_GOOGLE_MAPS")),
+    ("shm_uds",           ("NUWAX_CLOUDMAP_SHM_PATH", "NUWAX_OCCUPANCY_SHM_PATH", "NUWAX_VIDEO_")),
 )
 
 # 敏感键（脱敏不回显）。鉴权已移除，故仅余各类外部服务密钥/令牌。

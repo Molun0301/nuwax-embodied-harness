@@ -48,6 +48,11 @@ export NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TI
 #   - 显式 export `NUWAX_LCM_BACKEND=fake-lcm` / `fake` / 其它未知值
 #     在 binary 端立即 `process::exit(1)` + LCM_BACKEND_UNSUPPORTED
 #     (lcm_runtime.rs from_env 守门)
+# === Production .env-injected ===
+# 以下 14 个 LCM_CHANNEL 与 8 个 RUNTIME_*_CHANNEL 默认值是"应对 .env 未配场景"的兜底。
+# 生产环境必须 .env.example 显式注入(commit 532d255 起);若运维未注入,fallback 仍生效,
+# 但可能与 .env.example 默认值漂移 — 上线前必须 git diff .env.example 实机 .env。
+# === Production .env-injected ===
 export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
 export NUWAX_LCM_BACKEND="${NUWAX_LCM_BACKEND:-real-lcm}"
 

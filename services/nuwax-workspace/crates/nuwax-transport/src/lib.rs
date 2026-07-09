@@ -157,6 +157,37 @@ impl LcmTransport {
 }
 
 // ============================================================================
+// LcmTransport 自身实现 LcmBackend (newtype 转发)
+// ============================================================================
+//
+// 2026-07-08 fake-lcm 物理删除(v3 F2)后,本 crate 唯一 backend 是
+// `RealLcmBackend`。`LcmTransport` 作为持有 `Arc<dyn LcmBackend>` 的
+// 薄包装,本身实现 `LcmBackend` trait 是 newtype-转发模式 —— 所有方法
+// 直接转给内部 backend。
+//
+// 这一转发让:
+// - 下游 crate 可以写 `&transport: &dyn LcmBackend` 统一接口,
+//   不需要 `.backend().publish()` 这种内部逃逸
+// - `real_backend.rs` 测试 `name_is_real_lcm` 可以直接断言
+//   `check_name(&transport) == "real-lcm"`
+//
+// 注意:`LcmTransport::new(Arc<dyn LcmBackend>)` 的 `LcmBackend` 参数
+// 不会引发 trait impl 循环(`LcmTransport` 不再可作为内部 backend,只
+// 是 wrapper)。
+#[async_trait]
+impl LcmBackend for LcmTransport {
+    async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
+        self.backend.publish(frame).await
+    }
+    async fn subscribe(&self, topic: LcmTopic, msg_type: Option<LcmMessageType>) -> LcmFrameStream {
+        self.backend.subscribe(topic, msg_type).await
+    }
+    fn name(&self) -> &str {
+        self.backend.name()
+    }
+}
+
+// ============================================================================
 // 兼容层（历史 UDP/SHM 抽象 + MessageEnvelope 旧 API）
 // ============================================================================
 //

@@ -2,7 +2,7 @@
 # 分层依赖治理静态检查（01 §3.2 规则 R1-R9 的可机器检查 grep 版）。
 #
 # 用途：锁住 01-P0-1/P0-2/P0-3 解环成果，防止反向/越层依赖回退。
-# 范围排除：__pycache__、*/ros2_ws/*、vendor、.claude/worktrees。
+# 范围排除：__pycache__、vendor、.claude/worktrees。
 # 退出码：0=全部通过；1=存在违规（逐条打印命中行）。
 set -uo pipefail
 
@@ -14,7 +14,7 @@ VIOLATIONS=0
 
 # 统一排除噪声路径。
 EXCLUDES='--include=*.py'
-PRUNE='ros2_ws|/vendor/|__pycache__|\.claude/worktrees'
+PRUNE='/vendor/|__pycache__|\.claude/worktrees'
 
 # scan <规则号> <说明> <目录> <ERE 模式>
 # 命中即违规：打印命中行并计数。

@@ -2,9 +2,31 @@ use std::collections::HashMap;
 use std::sync::atomic::{fence, Ordering};
 
 use memmap2::MmapMut;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 
 pub const VOXEL_SIZE: f32 = 0.05;
+
+/// 单次 cloud_map 帧允许的 raw point 上限(防御性 sanity cap)。
+///
+/// 单帧 LIDAR(PointCloud2)原始点云合理上限 ~30k(Unitree Go2 雷达规格);
+/// 100k 已远超物理合理范围。设 8_000_000 是为了在防御性同时不丢真帧的极端
+/// 边界(8M × 12 bytes = 96 MB,与 16 MB 双缓冲约束由 `voxel_downsample`
+/// 路径里的二次 voxel 放大保护,见 `CM_SINGLE_BUFFER_SIZE`)。
+///
+/// 超过此上限说明上游 LCM 帧 `point_step` 或 `data` 长度异常,直接拒绝
+/// 该帧;否则 `Vec::with_capacity(raw_count)` 会按异常大的 raw_count 申请
+/// 数百 GB alloc(2026-07-08 实机 187GB abort 模式)。
+pub const POINTCLOUD_MAX_RAW_POINTS: usize = 8_000_000;
+
+/// 单次 cloud_map 帧允许的 point_step 字节数上限(防御性 sanity cap)。
+///
+/// PointCloud2 协议字段 `point_step` 描述每个点的字节宽度;`sensor_msgs`
+/// 实际值在 12~48 bytes 之间(xyz=f32×3=12,xyz+intensity=16,xyz+rgb=32 等)。
+/// 设 256 字节作为宽松上界,覆盖任何扩展字段。
+///
+/// 超过此上限或低于 12 字节 → 拒绝该帧,防止 `bytes.len()/point_step`
+/// 推算 raw_count 时产生巨大值。
+pub const POINTCLOUD_MAX_POINT_STEP_BYTES: u32 = 256;
 
 // ─── 累积地图双缓冲共享内存写入器 ───
 
@@ -36,8 +58,22 @@ impl CloudMapShmWriter {
 
     pub fn write_cloud_map(&mut self, data: &[u8], point_step: u32) -> Option<(u64, u32, f32)> {
         let ps = point_step as usize;
-        if ps < 12 || data.is_empty() { return None; }
+        if ps < 12 || point_step > POINTCLOUD_MAX_POINT_STEP_BYTES || data.is_empty() {
+            return None;
+        }
         let raw_count = data.len() / ps;
+        // 防御性 sanity cap:见 POINTCLOUD_MAX_RAW_POINTS 注释。
+        // `raw_count` 由 untrusted `data.len()` / `point_step` 推得,sender
+        // 可伪造 point_step 让 raw_count 巨大。saturating_min 把初始
+        // with_capacity 限制在 POINTCLOUD_MAX_RAW_POINTS,后续 push 若真超过
+        // 则 Vec 自动 grow(amortized),但初始 alloc 不再是数百 GB。
+        if raw_count > POINTCLOUD_MAX_RAW_POINTS {
+            warn!(
+                "cloud_map pointcloud raw_count={} 超过 sanity cap={};按异常帧跳过",
+                raw_count, POINTCLOUD_MAX_RAW_POINTS
+            );
+            return None;
+        }
         let mut points: Vec<[f32; 3]> = Vec::with_capacity(raw_count);
         for i in 0..raw_count {
             let off = i * ps;

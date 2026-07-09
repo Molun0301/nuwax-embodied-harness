@@ -548,6 +548,27 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<(Vec<u8>, u32)> {
     // point_step(u32) + raw PointCloud2 bytes
     if payload.len() < 4 { return None; }
     let point_step = u32::from_le_bytes(payload[0..4].try_into().ok()?);
+    // 防御性 sanity cap:见 POINTCLOUD_MAX_POINT_STEP_BYTES 注释。
+    // point_step 来自 untrusted LCM frame,sender 可伪造极端值(0/1/u32::MAX)
+    // 让后续 `bytes.len() / point_step` 推算 raw_count 时产生巨大值,触发
+    // `Vec::with_capacity(raw_count)` 申请数百 GB alloc(2026-07-08 实机
+    // 187GB abort 模式)。
+    if point_step < 12 || point_step > crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES {
+        warn!(
+            "/go2/lidar/points payload point_step={} 超过 sanity cap [12, {}];按异常帧跳过",
+            point_step, crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES
+        );
+        return None;
+    }
+    // 防御性 sanity cap:payload 总长 4 MB 上限,远超物理合理点云单帧
+    // (Go2 单帧 ~30k 点 ≈ 360 KB);超过则 upstream LCM 帧异常,拒绝。
+    if payload.len() > 4 * 1024 * 1024 {
+        warn!(
+            "/go2/lidar/points payload len={} 超过 4 MiB sanity cap;按异常帧跳过",
+            payload.len()
+        );
+        return None;
+    }
     Some((payload[4..].to_vec(), point_step))
 }
 
@@ -1282,6 +1303,18 @@ fn spawn_mapping_feed_tasks(
                 continue;
             }
             let raw_count = bytes.len() / ps;
+            // 防御性 sanity cap:见 POINTCLOUD_MAX_RAW_POINTS 注释。
+            // raw_count 由 untrusted bytes.len()/point_step 推得,point_step
+            // 已在 parse_pointcloud_payload 入口校验过 [12, 256],但 raw_count
+            // 仍可能因 bytes.len() 巨大而超 cap(>8M 点);此处直接 saturating
+            // 掉,拒绝异常帧。
+            if raw_count > crate::pointcloud::POINTCLOUD_MAX_RAW_POINTS {
+                warn!(
+                    "mapping_feed /go2/lidar/points raw_count={} 超过 sanity cap={};按异常帧跳过",
+                    raw_count, crate::pointcloud::POINTCLOUD_MAX_RAW_POINTS
+                );
+                continue;
+            }
             let mut points: Vec<Point3<f64>> = Vec::with_capacity(raw_count);
             for i in 0..raw_count {
                 let off = i * ps;
@@ -1402,8 +1435,9 @@ mod payload_sanity_tests {
     //! 验证 cap 生效,异常帧返回 None 而不分配。
 
     use super::{
-        parse_occupancy_payload, parse_tf_payload, FRONTIERS_MAX_ENTRIES_PER_FRAME,
-        OCCUPANCY_MAX_DIMENSION, TF_MAX_ENTRIES_PER_FRAME,
+        parse_occupancy_payload, parse_pointcloud_payload, parse_tf_payload,
+        FRONTIERS_MAX_ENTRIES_PER_FRAME, OCCUPANCY_MAX_DIMENSION,
+        TF_MAX_ENTRIES_PER_FRAME,
     };
 
     /// count 字段填 0xFFFF_FFFF(usize 等价 ~ 18 EB)→ 必须被 sanity cap 拒绝
@@ -1468,5 +1502,43 @@ mod payload_sanity_tests {
         const _: () = assert!(FRONTIERS_MAX_ENTRIES_PER_FRAME > 0 && FRONTIERS_MAX_ENTRIES_PER_FRAME < 1_000_000);
         const _: () = assert!(OCCUPANCY_MAX_DIMENSION > 0 && OCCUPANCY_MAX_DIMENSION < 100_000);
         const _: () = assert!((OCCUPANCY_MAX_DIMENSION as usize).saturating_pow(2) < 100 * 1024 * 1024);
+        const _: () = assert!(crate::pointcloud::POINTCLOUD_MAX_RAW_POINTS > 0 && crate::pointcloud::POINTCLOUD_MAX_RAW_POINTS < 100_000_000);
+        const _: () = assert!(crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES >= 12 && crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES < 4_096);
+    }
+
+    /// point_step = 1 (untrusted 上游 frame 异常)→ 必须被 sanity cap 拒绝
+    /// (point_step < 12 触发)
+    #[test]
+    fn parse_pointcloud_payload_rejects_tiny_point_step() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // point_step = 1 < 12
+        payload.extend_from_slice(&[0u8; 16]);
+        assert!(
+            parse_pointcloud_payload(&payload).is_none(),
+            "parse_pointcloud_payload 应该拒绝 point_step < 12 的异常帧"
+        );
+    }
+
+    /// point_step = u32::MAX → 必须被 POINTCLOUD_MAX_POINT_STEP_BYTES 拒绝
+    #[test]
+    fn parse_pointcloud_payload_rejects_huge_point_step() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // point_step = u32::MAX > 256
+        payload.extend_from_slice(&[0u8; 16]);
+        assert!(
+            parse_pointcloud_payload(&payload).is_none(),
+            "parse_pointcloud_payload 应该拒绝 point_step > POINTCLOUD_MAX_POINT_STEP_BYTES 的异常帧"
+        );
+    }
+
+    /// point_step = 12 + 24 bytes raw → 应正常解析 (happy path)
+    #[test]
+    fn parse_pointcloud_payload_accepts_well_formed() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&12u32.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 24]);
+        let (bytes, ps) = parse_pointcloud_payload(&payload).expect("happy path 应解析成功");
+        assert_eq!(ps, 12);
+        assert_eq!(bytes.len(), 24);
     }
 }

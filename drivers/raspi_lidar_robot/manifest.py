@@ -51,9 +51,9 @@ def build_raspi_lidar_robot_manifest(config: Optional["NuwaxRobotBridgeConfig"] 
         ),
         optional_components=(
             ComponentBinding(
-                name="raspi_rtabmap_script",
-                path="services.geometry.external_script_runner.RaspiRtabMapScript",
-                description="2D 激光雷达 native SLAM launcher（nuwax-geometry-runtime 2D 后端）。",
+                name="raspi_mapping_script",
+                path="services.geometry.external_script_runner.Go2ShSlamScript",
+                description="2D 激光雷达 native mapping 后端 launcher（树莓派共享 nuwax-mapping 板块;无 RaspiRtabMapScript 类,改走 Go2ShSlamScript generic,Phase 6 已 no-op 化）。",
                 required=False,
             ),
             ComponentBinding(

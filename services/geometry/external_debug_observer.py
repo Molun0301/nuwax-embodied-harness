@@ -23,18 +23,8 @@ from services.geometry.loop_closure_state import (
 # external_debug_observer.py 历史上使用 ROS2 订阅 /map_obstacles、/frontier 等话题，
 # 目标态下由 nuwax-geometry-runtime 通过 LCM typed channel 暴露等价状态流，
 # 平台层只观察 runtime gRPC 推送。
-# 保留以下函数签名（no-op）以兼容现有调用方。
-def acquire_ros2_context():
-    LOGGER.debug("acquire_ros2_context 已下线：ROS2 接触面删除，平台层由 nuwax-geometry-runtime 接管。")
-    return None
-
-
-def release_ros2_context() -> None:
-    LOGGER.debug("release_ros2_context 已下线：ROS2 接触面删除。")
-
-
-def ensure_go2_slam_overlay_python_paths() -> bool:
-    return False
+# Phase R-N14-5:acquire_ros2_context / release_ros2_context / ensure_go2_slam_overlay_python_paths
+# 三个 no-op 函数全仓无调用方，物理删除。
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.external_debug_observer")
 
@@ -51,7 +41,6 @@ _POSE_MAP_TF_DIVERGE_M = 0.2
 # 闭环检测配置（fallback 默认值；运行时优先从 core.settings 读取，参见 _resolve_loop_closure_threshold）
 _LOOP_CLOSURE_DEFAULT_THRESHOLD = 3
 _LOOP_CLOSURE_DEFAULT_POLL_INTERVAL_SEC = 5.0
-_RTABMAP_INFO_TOPIC = "/rtabmap/info"
 
 # boundary 多线段几何外扩默认参数（与 spec exploration-boundary 对齐）
 _BOUNDARY_DEFAULT_EXTEND_RADIUS_M = 3.0
@@ -80,15 +69,7 @@ class ExternalGeometryDebugObserver:
         self._pose_callback = pose_callback
         self._lock = threading.RLock()
         self._started = False
-        self._has_ros2_context = False
-        self._node = None
-        self._executor = None
         self._thread: Optional[threading.Thread] = None
-        # Phase 3 目标态：_rclpy 字段已下线（无任何调用方），不再保留赋值。
-        self._subscriptions: List[Any] = []
-        self._pose_timer = None
-        self._tf_buffer = None
-        self._tf_listener = None
         self._last_error: Optional[str] = None
         self._pose_sequence = 0
         self._last_pose_emit_at = 0.0
@@ -123,8 +104,6 @@ class ExternalGeometryDebugObserver:
         )
         self._last_loop_closure_emit_monotonic = 0.0
         self._last_loop_closure_observed_count: Optional[int] = None
-        self._rtabmap_info_topic = _RTABMAP_INFO_TOPIC
-        self._rtabmap_info_subscription: Optional[Any] = None
         # boundary 外扩：最近一次成功的多线段→polygon 结果缓存，供 _start_external_mapping 写入 /tmp/go2_boundary.json
         self._latest_boundary_polygon: List[Tuple[float, float]] = []
         self._latest_boundary_polygon_at_monotonic = 0.0
@@ -320,37 +299,13 @@ class ExternalGeometryDebugObserver:
             self._cleanup_locked()
 
     def _cleanup_locked(self) -> None:
-        executor = self._executor
-        node = self._node
         self._started = False
-        if executor is not None:
-            try:
-                executor.shutdown(timeout_sec=0.0)
-            except TypeError:
-                executor.shutdown()
-            except Exception:
-                LOGGER.debug("停止 GO2 debug observer executor 失败。", exc_info=True)
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=1.0)
-        if node is not None:
-            try:
-                node.destroy_node()
-            except Exception:
-                LOGGER.debug("销毁 GO2 debug observer 节点失败。", exc_info=True)
-        if self._has_ros2_context:
-            try:
-                release_ros2_context()
-            except Exception:
-                LOGGER.debug("释放 GO2 debug observer ROS2 上下文失败。", exc_info=True)
-        self._node = None
-        self._executor = None
         self._thread = None
-        self._subscriptions = []
-        self._pose_timer = None
-        self._tf_buffer = None
-        self._tf_listener = None
-        self._has_ros2_context = False
-        # Phase 3 目标态：_rclpy 字段已下线（无任何调用方），不再保留赋值。
+        # Phase R-N14-5:ROS2 接触面(executor / node / _has_ros2_context /
+        # release_ros2_context / _subscriptions / _pose_timer / _tf_buffer /
+        # _tf_listener)已全部物理删除。
 
     def _base_frame_candidates(self) -> Tuple[str, ...]:
         configured = self._normalize_frame_id(self.config.frames.base_frame or "", "")
@@ -374,25 +329,8 @@ class ExternalGeometryDebugObserver:
         return self._pose_planar_distance(previous, pose) <= _POSE_MAP_POSITION_EPS
 
     def _lookup_tf_pose(self) -> Optional[Pose]:
-        if self._tf_buffer is None:
-            return None
-        map_frame = self._normalize_frame_id(self.config.frames.map_frame, DEFAULT_MAP_FRAME)
         # Phase 3 目标态：位姿查询改走 GeometryRuntimeProvider.get_current_pose。
         # 保留 None 返回以兼容旧调用方，但实际生效路径已切到 runtime。
-        return None
-        for base_frame in self._base_frame_candidates():
-            try:
-                transform = self._tf_buffer.lookup_transform(map_frame, base_frame, Time())
-            except TransformException:
-                continue
-            except Exception:
-                LOGGER.debug("GO2 debug observer TF 查询失败 frame=%s", base_frame, exc_info=True)
-                continue
-            try:
-                return self._pose_from_transform(transform, map_frame)
-            except Exception:
-                LOGGER.debug("GO2 debug observer 位姿转换失败 frame=%s", base_frame, exc_info=True)
-                continue
         return None
 
     def _on_pose_map(self, msg: Any) -> None:
@@ -423,7 +361,9 @@ class ExternalGeometryDebugObserver:
         )
 
     def _on_pose_timer(self) -> None:
-        if self._pose_callback is None or self._tf_buffer is None:
+        # Phase R-N14-5:_tf_buffer 字段已物理删除,_lookup_tf_pose() 永远返回 None。
+        # 保留方法签名以兼容外部 timer 调度回调,但实际 no-op。
+        if self._pose_callback is None:
             return
         pose_map_recent = time.monotonic() - self._last_pose_map_at <= 0.5
         pose_map_frozen = self._pose_map_unchanged_count >= _POSE_MAP_UNCHANGED_FREEZE_COUNT
@@ -986,38 +926,6 @@ class ExternalGeometryDebugObserver:
     # ------------------------------------------------------------------
     # 闭环检测（spec exploration-completion-criteria 第 8 条主路径）
     # ------------------------------------------------------------------
-
-    def _on_rtabmap_info(self, msg: Any) -> None:
-        """RTAB-Map /rtabmap/info 回调（5s 节流）。
-
-        信号源：
-        - `loop_closure_id`：累计闭环事件 id，>=1 表示发生一次闭环；
-        - 我们以 `loop_closure_id` 的最新值作为 count 快照（rtabmap_msgs/Info 文档明确
-          该字段为单调递增 id）。
-        """
-
-        try:
-            loop_closure_id = getattr(msg, "loop_closure_id", None)
-        except Exception:
-            loop_closure_id = None
-        if loop_closure_id is None:
-            return
-        try:
-            observed = int(loop_closure_id)
-        except (TypeError, ValueError):
-            LOGGER.debug("loop_closure_id 解析失败 type=%s value=%s", type(loop_closure_id), loop_closure_id)
-            return
-        with self._lock:
-            previous = self._last_loop_closure_observed_count
-            now = time.monotonic()
-            poll_interval = self._resolve_loop_closure_poll_interval_sec()
-            if previous is not None and observed == previous:
-                # count 未变化，但若超过节流间隔仍允许刷新一次（保证 last_check_at 不陈旧）
-                if now - self._last_loop_closure_emit_monotonic < poll_interval:
-                    return
-            self._last_loop_closure_observed_count = observed
-            self._last_loop_closure_emit_monotonic = now
-        self._compute_loop_closure()
 
     def _compute_loop_closure(self) -> None:
         """基于最近观测的 loop_closure_id 更新 state buffer。

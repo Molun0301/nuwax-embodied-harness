@@ -453,23 +453,23 @@
   reason: "4.5 step B 增量：Cargo workspace header 注释,提及 C7 硬约束 rmw_*/cyclonedds/libddsc*/r2r 禁入。属强约束反向锚点。"
 
 # R-N14-8.0 stub 增量:5 个 Phase 8.0 stub 脚本,文件名/字符串含 nav/explore/api 等保留字,可能触发守门误报
-- file: scripts/ci/smoke_explore_lcm_channels.sh
+- file: tests/manual/smoke_explore_lcm_channels.sh
   line: 7
   category: phase_stub_script
   reason: "Phase R-N14-8.0 stub：smoke_explore_lcm_channels.sh stub 内容,仅 echo 输出 EXPECTED_CHANNELS 列表,不调用任何 rclpy/Nav2。"
-- file: scripts/ci/smoke_navigation_goal_lifecycle.sh
+- file: tests/manual/smoke_navigation_goal_lifecycle.sh
   line: 5
   category: phase_stub_script
   reason: "Phase R-N14-8.0 stub：smoke_navigation_goal_lifecycle.sh stub 内容,仅 echo 输出 EXPECTED_ENDPOINTS 列表(/api/navigation/*),不调用任何 rclpy/Nav2。"
-- file: scripts/ci/smoke_api_health_full.sh
+- file: tests/manual/smoke_api_health_full.sh
   line: 4
   category: phase_stub_script
   reason: "Phase R-N14-8.0 stub：smoke_api_health_full.sh stub 内容,仅 echo 输出 schema 字段名,不调用任何 ROS2/cyclonedds。"
-- file: scripts/ci/check_pointcloud_payload_size.sh
+- file: tests/manual/check_pointcloud_payload_size.sh
   line: 5
   category: phase_stub_script
   reason: "Phase R-N14-8.0 stub：check_pointcloud_payload_size.sh stub 内容,仅 echo 输出 VmRSS cap 常量,不订阅任何 ROS topic。"
-- file: scripts/ci/check_alias_telemetry.sh
+- file: tests/manual/check_alias_telemetry.sh
   line: 5
   category: phase_stub_script
   reason: "Phase R-N14-8.0 stub：check_alias_telemetry.sh stub 内容,仅 echo 输出 COUNTER_FILE 路径,不读 telemetry 真实数据。"

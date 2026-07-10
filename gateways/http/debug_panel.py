@@ -298,7 +298,8 @@ def _build_map_diagnostics(snapshot: Any, *, refresh_error: Optional[str] = None
     live_mapping = metadata.get("live_mapping_diagnostics") if isinstance(metadata.get("live_mapping_diagnostics"), dict) else {}
     provider_status = metadata.get("provider_status") if isinstance(metadata.get("provider_status"), dict) else {}
     live_provider = live_mapping.get("live_map_provider") if isinstance(live_mapping.get("live_map_provider"), dict) else {}
-    map_stream = live_mapping.get("rtabmap_readiness", {}).get("map_stream") if isinstance(live_mapping.get("rtabmap_readiness"), dict) else {}
+    # R-N14 v4 Phase 2:metadata key 读新 key + fallback 老 key（LEGACY_VERSIONJSON_VALUES 计数由平台 runtime 接管）。
+    map_stream = (live_mapping.get("mapping_readiness") or live_mapping.get("rtabmap_readiness") or {}).get("map_stream") if isinstance((live_mapping.get("mapping_readiness") or live_mapping.get("rtabmap_readiness") or {}), dict) else {}
     if not isinstance(map_stream, dict):
         map_stream = {}
     status = {**dict(live_provider), **dict(provider_status)}

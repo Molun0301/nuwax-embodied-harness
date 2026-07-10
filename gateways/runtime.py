@@ -1322,8 +1322,8 @@ class GatewayRuntime:
             "source": "pointcloud_map_cache",
             "source_kind": pointcloud_map.source_kind,
             "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "rtabmap_database_path": source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
-            "rtabmap_db_path": source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
+            "mapping_database_path": source_summary.get("mapping_database_path") or source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
+            "mapping_db_path": source_summary.get("mapping_db_path") or source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
             "pcd_path": pointcloud_map.path,
             "point_count": pointcloud_map.point_count,
             "fields": [
@@ -1415,8 +1415,8 @@ class GatewayRuntime:
             "source": "pointcloud_map_cache",
             "source_kind": source_summary.get("source_kind") or "configured_pcd_root",
             "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "rtabmap_database_path": source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
-            "rtabmap_db_path": source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
+            "mapping_database_path": source_summary.get("mapping_database_path") or source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
+            "mapping_db_path": source_summary.get("mapping_db_path") or source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
             "pcd_path": source_summary.get("pcd_path") or source_summary.get("path"),
             "point_count": 0,
             "fields": [],
@@ -2292,7 +2292,7 @@ class GatewayRuntime:
             _descriptor(
                 "explore_area",
                 "探索区域",
-                "自主前沿探索：启动 GO2_RTABNAV2/go2.sh --explore，由 explore_lite 自动导航建图。"
+                "自主前沿探索：启动 GO2 几何栈 /go2.sh --explore，由 explore_lite 自动导航建图。"
                 "非遥控建图；用户手动遥控建图必须用 start_mapping，不要用 explore_area。"
                 "用户要求结束探索时请调用 stop_exploration。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
@@ -3331,7 +3331,7 @@ class GatewayRuntime:
         perception_runtime = self.perception_video_runtime.get_status()
         active_workspace = self.map_workspace_service.get_active_workspace()
         artifact_summary = self.artifact_service.get_summary()
-        profile = self._runtime_rtabmap_profile_summary(map_snapshot)
+        profile = self._runtime_mapping_profile_summary(map_snapshot)
         geometry_asset = self._runtime_geometry_asset_summary(map_snapshot, localization_session)
         last_relocalization = self._runtime_last_relocalization_summary(localization_session, localization_snapshot)
         navigation_policy = self._runtime_navigation_control_policy_summary(navigation_context)
@@ -3511,7 +3511,7 @@ class GatewayRuntime:
             "frame_id": getattr(workspace, "frame_id", None),
         }
 
-    def _runtime_rtabmap_profile_summary(self, map_snapshot: Any) -> MetadataDict:
+    def _runtime_mapping_profile_summary(self, map_snapshot: Any) -> MetadataDict:
         metadata = dict(getattr(map_snapshot, "metadata", {}) or {}) if map_snapshot is not None else {}
         profile = metadata.get("profile_summary") or metadata.get("profile")
         if not isinstance(profile, dict):
@@ -3536,6 +3536,9 @@ class GatewayRuntime:
             "require_ros2": bool(getattr(self.platform_geometry_runtime.config, "require_ros2", False)),
             "source": "map_snapshot.metadata" if metadata else "geometry_runtime.config",
         }
+
+    # R-N14 v4 Phase 2 B 类 alias:函数旧名 1 版本周期内保留,后续 telemetry 触发清理。
+    _runtime_rtabmap_profile_summary = _runtime_mapping_profile_summary
 
     def _runtime_geometry_asset_summary(self, map_snapshot: Any, localization_session: Any) -> MetadataDict:
         metadata = dict(getattr(map_snapshot, "metadata", {}) or {}) if map_snapshot is not None else {}
@@ -3564,15 +3567,19 @@ class GatewayRuntime:
             "available": bool(summary),
             "geometry_stack": summary.get("geometry_stack") or metadata.get("geometry_stack") or self.platform_geometry_runtime.config.stack,
             "frame_id": summary.get("frame_id") or getattr(map_snapshot, "frame_id", None),
-            "rtabmap_database_path": (
-                summary.get("rtabmap_database_path")
+            "mapping_database_path": (
+                summary.get("mapping_database_path")
+                or summary.get("rtabmap_database_path")
                 or summary.get("rtabmap_db_path")
+                or metadata.get("mapping_database_path")
                 or metadata.get("rtabmap_database_path")
                 or metadata.get("rtabmap_db_path")
             ),
-            "rtabmap_db_path": (
-                summary.get("rtabmap_database_path")
+            "mapping_db_path": (
+                summary.get("mapping_db_path")
+                or summary.get("rtabmap_database_path")
                 or summary.get("rtabmap_db_path")
+                or metadata.get("mapping_db_path")
                 or metadata.get("rtabmap_database_path")
                 or metadata.get("rtabmap_db_path")
             ),
@@ -4317,8 +4324,8 @@ class GatewayRuntime:
                     "map_snapshot_kind",
                     "live_streaming_ready",
                     "checkpoint_ready",
-                    "rtabmap_database_path",
-                    "rtabmap_db_path",
+                    "mapping_database_path",
+                    "mapping_db_path",
                     "update_sequence",
                     "content_revision",
                 )
@@ -4348,7 +4355,7 @@ class GatewayRuntime:
         return {
             "geometry_stack": data.get("geometry_stack"),
             "frame_id": data.get("frame_id"),
-            "rtabmap_database_path": data.get("rtabmap_database_path") or data.get("rtabmap_db_path"),
+            "mapping_database_path": data.get("mapping_database_path") or data.get("rtabmap_database_path") or data.get("rtabmap_db_path"),
             "pcd_path": data.get("pcd_path"),
             "built_at": data.get("built_at"),
             "occupancy_projection": data.get("occupancy_projection"),
@@ -4394,8 +4401,8 @@ class GatewayRuntime:
                 "snapshot_kind",
                 "live_streaming_ready",
                 "checkpoint_ready",
-                "rtabmap_database_path",
-                "rtabmap_db_path",
+                "mapping_database_path",
+                "mapping_db_path",
                 "backend_session_id",
                 "backend_run_id",
                 "exploration_pinned_version_id",
@@ -4647,17 +4654,17 @@ class GatewayRuntime:
     @staticmethod
     def _summarize_mapping_chain_diagnostics(diagnostics: Dict[str, Any]) -> Dict[str, Any]:
         runtime_status = diagnostics.get("runtime_status") if isinstance(diagnostics.get("runtime_status"), dict) else {}
-        rtabmap_readiness = diagnostics.get("rtabmap_readiness") if isinstance(diagnostics.get("rtabmap_readiness"), dict) else {}
-        map_stream = rtabmap_readiness.get("map_stream") if isinstance(rtabmap_readiness.get("map_stream"), dict) else {}
+        mapping_readiness = diagnostics.get("mapping_readiness") if isinstance(diagnostics.get("mapping_readiness"), dict) else {}
+        map_stream = mapping_readiness.get("map_stream") if isinstance(mapping_readiness.get("map_stream"), dict) else {}
         return {
             "ready": diagnostics.get("ready"),
             "waiting_for": diagnostics.get("waiting_for"),
             "message": diagnostics.get("message"),
             "runtime_phase": runtime_status.get("phase"),
             "runtime_message": runtime_status.get("message"),
-            "localization_ready": rtabmap_readiness.get("localization_ready"),
-            "first_frame_ready": rtabmap_readiness.get("first_frame_ready"),
-            "streaming_ready": rtabmap_readiness.get("streaming_ready"),
+            "localization_ready": mapping_readiness.get("localization_ready"),
+            "first_frame_ready": mapping_readiness.get("first_frame_ready"),
+            "streaming_ready": mapping_readiness.get("streaming_ready"),
             "known_cell_count": map_stream.get("known_cell_count"),
             "occupancy_revision": map_stream.get("occupancy_revision"),
             "occupancy_message_count": map_stream.get("occupancy_message_count"),
@@ -8884,6 +8891,7 @@ class GatewayRuntime:
             metadata.get("map_snapshot_kind") == "live_streaming"
             or metadata.get("source_kind") == "platform_live_map_provider"
             or metadata.get("live_streaming_ready")
+            or metadata.get("mapping_live_streaming_ready")
             or metadata.get("rtabmap_live_streaming_ready")
         )
         if not live_snapshot:

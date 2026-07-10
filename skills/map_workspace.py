@@ -816,7 +816,8 @@ class MapWorkspaceService:
             return {}
         if not isinstance(diagnostics, dict):
             return {}
-        readiness = diagnostics.get("rtabmap_readiness")
+        # R-N14 v4 Phase 2:读取新 key,fallback 老 key（LEGACY_METADATA_KEY_ALIAS 计数语义保留）。
+        readiness = diagnostics.get("mapping_readiness") or diagnostics.get("rtabmap_readiness")
         if not isinstance(readiness, dict):
             readiness = {}
         runtime_status = diagnostics.get("runtime_status")
@@ -908,17 +909,18 @@ class MapWorkspaceService:
         return {
             "geometry_stack": latest_map_snapshot.metadata.get("geometry_stack"),
             "frame_id": self._resolve_map_frame_id(latest_map_snapshot),
-            "rtabmap_db_path": latest_map_snapshot.metadata.get("rtabmap_db_path"),
+            # R-N14 v4 Phase 2:wire key 保留 rtabmap_db_path（前端兼容）;读时优先新 key,fallback 老 key。
+            "rtabmap_db_path": latest_map_snapshot.metadata.get("mapping_db_path") or latest_map_snapshot.metadata.get("rtabmap_db_path"),
             "pcd_path": latest_map_snapshot.metadata.get("pcd_path"),
             "assets": asset_refs,
             "quality_metrics": quality_metrics,
             "diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
             "snapshot_kind": latest_map_snapshot.metadata.get("map_snapshot_kind"),
             "source_mode": latest_map_snapshot.metadata.get("source_mode") or latest_map_snapshot.metadata.get("map_version_source_mode"),
-            "live_streaming_ready": latest_map_snapshot.metadata.get("rtabmap_live_streaming_ready") or latest_map_snapshot.metadata.get("live_streaming_ready"),
+            "live_streaming_ready": latest_map_snapshot.metadata.get("mapping_live_streaming_ready") or latest_map_snapshot.metadata.get("rtabmap_live_streaming_ready") or latest_map_snapshot.metadata.get("live_streaming_ready"),
             "checkpoint_ready": latest_map_snapshot.metadata.get("checkpoint_ready"),
-            "session_id": latest_map_snapshot.metadata.get("rtabmap_session_id") or latest_map_snapshot.metadata.get("session_id"),
-            "run_id": latest_map_snapshot.metadata.get("rtabmap_run_id") or latest_map_snapshot.metadata.get("run_id"),
+            "session_id": latest_map_snapshot.metadata.get("mapping_session_id") or latest_map_snapshot.metadata.get("rtabmap_session_id") or latest_map_snapshot.metadata.get("session_id"),
+            "run_id": latest_map_snapshot.metadata.get("mapping_run_id") or latest_map_snapshot.metadata.get("rtabmap_run_id") or latest_map_snapshot.metadata.get("run_id"),
             "database": latest_map_snapshot.metadata.get("database"),
             "pcd": latest_map_snapshot.metadata.get("pcd"),
         }
@@ -1064,6 +1066,8 @@ class MapWorkspaceService:
             or runtime_metadata.get("live_streaming_ready")
             or runtime_metadata.get("backend_streaming_ready")
             # 兼容老 metadata key（旧 version.json）。
+            or runtime_metadata.get("mapping_live_streaming_ready")
+            # 兼容老 metadata key（旧 version.json）。
             or runtime_metadata.get("rtabmap_live_streaming_ready")
         )
         ingest_kwargs = {
@@ -1147,7 +1151,8 @@ class MapWorkspaceService:
                 "backend_checkpoint_ready": metrics.get("backend_checkpoint_ready"),
                 "platform_snapshot_only": metrics.get("platform_snapshot_only"),
                 "database_present": database_metrics.get("present"),
-                "rtabmap_db_path": runtime_metadata.get("rtabmap_db_path"),
+                # R-N14 v4 Phase 2:wire key 保留 rtabmap_db_path（前端兼容）;读时优先新 key,fallback 老 key。
+                "rtabmap_db_path": runtime_metadata.get("mapping_db_path") or runtime_metadata.get("rtabmap_db_path"),
                 "geometry_activation": activation_result,
             },
         )
@@ -1168,6 +1173,7 @@ class MapWorkspaceService:
             metadata.get("map_snapshot_kind") == "live_streaming"
             or metadata.get("source_kind") == "platform_live_map_provider"
             or metadata.get("live_streaming_ready")
+            or metadata.get("mapping_live_streaming_ready")
             or metadata.get("rtabmap_live_streaming_ready")
         )
         if not live_snapshot or version.snapshot.occupancy_grid is None:
@@ -1274,6 +1280,7 @@ class MapWorkspaceService:
             or metadata.get("map_snapshot_kind") == "live_streaming"
             or metadata.get("source_kind") == "platform_live_map_provider"
             or metadata.get("live_streaming_ready")
+            or metadata.get("mapping_live_streaming_ready")
             or metadata.get("rtabmap_live_streaming_ready")
         )
 

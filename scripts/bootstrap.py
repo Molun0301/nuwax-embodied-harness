@@ -669,7 +669,7 @@ def install_python_dependencies(planner: BootstrapPlanner) -> None:
 #   / rosdep install / Go2SLAM 工作区校验；ROS2 工作空间已物理删除，故无对象可装。
 # - assert_go2slam_workspace_ready / assert_go2slam_runtime_ready: Go2SLAM 工作区已
 #   物理删除，对应 colcon build / install 校验流程整体下线。
-# - build_workspaces: 原负责 build_ros2_workspace.sh / colcon build；删除后无
+# - build_workspaces: 原负责 ROS2 工作空间脚本 / colcon build；删除后无
 #   任何 ROS2 工作空间可构建。
 # 替换说明：geometry runtime 由 ``nuwax-geometry-runtime`` Rust 二进制承载，
 # 平台侧 ``phases/system.py`` 不再调这些函数；保留同名 ``_no_op`` 仅为防止
@@ -683,7 +683,7 @@ def install_geometry_system_dependencies(planner: BootstrapPlanner) -> None:  # 
 
 
 def build_workspaces(planner: BootstrapPlanner) -> None:  # noqa: ARG001
-    """no-op 占位：原 build_ros2_workspace.sh / colcon build 已下线。"""
+    """no-op 占位：原 ROS2 工作空间脚本 / colcon build 已下线。"""
     print("跳过 ROS2 工作空间构建（去 ROS2 化：geometry runtime 由 nuwax-geometry-runtime 承载）。")
     return
 

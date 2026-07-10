@@ -9,11 +9,11 @@ pkg-config、python3-lcm（或等价 Python binding）。原 dimos workspace 绝
 
 设计要点：
 - 任务范围：task 5（installer-ac-coverage）实装 + 2026-07-04 B3 + 2026-07-07 Phase 8。
-- 去 ROS2 化（2026-07-03 drop-ros2 / 2026-07-04 B3）：原 ROS2 apt 安装
-  （python3-colcon-common-extensions / rosdep / ros-${ROS_DISTRO}-navigation2 /
-  ros-${ROS_DISTRO}-rtabmap-ros）已物理删除，由 ``nuwax-geometry-runtime`` Rust
-  二进制 + LCM 系统库替代。本 phase 现在只负责基础工具与 native runtime 必需
-  系统包（rustup / liblcm-dev / pkg-config / python3-lcm）。
+- 去 ROS2 化（2026-07-03 drop-ros2 / 2026-07-04 B3）：原 ROS2 apt 派生包
+  （colcon / rosdep / ros-* 体系下的导航/SLAM 派生包等）
+  已物理删除，由 ``nuwax-geometry-runtime`` Rust 二进制 + LCM 系统库替代。
+  本 phase 现在只负责基础工具与 native runtime 必需系统包
+  （rustup / liblcm-dev / pkg-config / python3-lcm）。
 - real-LCM 物装（2026-07-07 Phase 3）：``nuwax-transport real-lcm`` feature
   启用 ``nuwax-lcm`` safe wrapper，链接系统 liblcm.so；缺包时 Rust build 失败，
   缺 Python binding 时 ``LcmMotionCommandBridge`` 不可用，因此系统依赖必须在

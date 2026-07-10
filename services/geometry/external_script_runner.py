@@ -1,15 +1,13 @@
-"""外部 SLAM/Nav2 后端抽象（cross-robot-generalization-foundations G3）。
+"""外部 mapping（nuwax-mapping 板块） 后端抽象（cross-robot-generalization-foundations G3）。
 
 把 `services/geometry/runtime.py` 中 go2.sh 业务分流段抽到本模块的
-`ExternalSlamNav2Script` 接口。具体实现由 manifest.robot_profile.external_slam_script
+`ExternalMappingScript` 接口。具体实现由 manifest.robot_profile.external_slam_script
 选择。Go2 仍走 `Go2ShSlamScript`（封装原 go2.sh）；G1 走 `G1WebRtcSlamScript`
-（Unitree WebRTC 内部点云）；raspi_lidar_robot 走 `RaspiRtabMapScript`（RTAB-Map 2D 模式复用 rtabmap_ros，
-不引入 SLAM Toolbox，按 memory `feedback_prefer_rtabmap_over_slam_toolbox.md`）。
+（Unitree WebRTC 内部点云）。raspi_lidar_robot 共享 nuwax-geometry-runtime
+（`RaspiRtabMapScript` 已 R-N14-6 删除）。
 
-Nav2 action 仍是平台唯一正式导航执行链（建图定位导航规范第 6.1 节）；
-已废弃的 platform_grid 必须保持 `selection=removed_platform_grid` 状态。
-
-本模块提供两类工厂：
+历史类名 `ExternalSlamNav2Script` 保留作 B 类 alias；Nav2/rtabmap_ros 时代代码已 drop-ros2
+阶段物理删除。本模块提供两类工厂：
 - `_resolve_external_script(profile)`：按 external_slam_script 字段选择实现类。
 - `build_external_script(profile)`：同上，但要求 profile 不为空；否则抛 RuntimeError。
 """
@@ -32,11 +30,12 @@ class ExternalSlamState:
     metadata: Dict[str, str] = field(default_factory=dict)
 
 
-class ExternalSlamNav2Script(ABC):
-    """外部 SLAM/Nav2 后端抽象类契约。
+class ExternalMappingScript(ABC):
+    """外部 mapping（nuwax-mapping 板块） 后端抽象类契约。
 
-    所有 SLAM 后端必须实现此接口；上游 `services/geometry/runtime.py` 通过
-    `_resolve_external_script()` 工厂获取具体实例。
+    所有 mapping 后端必须实现此接口；上游 `services/geometry/runtime.py` 通过
+    `_resolve_external_script()` 工厂获取具体实例。历史 ABC 名 `ExternalSlamNav2Script`
+    保留作 B 类 alias，见末尾。
     """
 
     @abstractmethod
@@ -54,7 +53,11 @@ class ExternalSlamNav2Script(ABC):
 
     @abstractmethod
     def is_ready(self) -> bool:
-        """断言后端已就绪（驱动客户端连上 / ROS 节点 ACTIVE / launch 跑通）。"""
+        """断言后端已就绪（驱动客户端连上 / 节点 ACTIVE / launch 跑通）。"""
+
+
+# B 类 alias 保留（1 版本周期 + telemetry 触发清理）
+ExternalSlamNav2Script = ExternalMappingScript
 
 
 # ---------------------------------------------------------------------------
@@ -62,10 +65,11 @@ class ExternalSlamNav2Script(ABC):
 # ---------------------------------------------------------------------------
 
 
-class Go2ShSlamScript(ExternalSlamNav2Script):
+class Go2ShSlamScript(ExternalMappingScript):
     """Go2 走 go2.sh 模式分流（explore/localization/mapping）。
 
     行为与本变更前一致；外部事件 `external_go2_*_started/stopped` 仍按原语义发布。
+    SlamScript 命名是产品语义层，保留以兼容历史 manifest 字段（robot_profile.external_slam_script）。
     """
 
     def __init__(self, runtime_state_provider=None) -> None:
@@ -102,8 +106,8 @@ class Go2ShSlamScript(ExternalSlamNav2Script):
 # ---------------------------------------------------------------------------
 
 
-class G1WebRtcSlamScript(ExternalSlamNav2Script):
-    """G1 走 Unitree WebRTC 内部点云；Nav2 action 仍是执行链。"""
+class G1WebRtcSlamScript(ExternalMappingScript):
+    """G1 走 Unitree WebRTC 内部点云；平台映射后端（nuwax-mapping / nuwax-nav-stack）执行链。"""
 
     def __init__(self, webrtc_client=None) -> None:
         self._client = webrtc_client
@@ -131,52 +135,14 @@ class G1WebRtcSlamScript(ExternalSlamNav2Script):
 
 
 # ---------------------------------------------------------------------------
-# 树莓派实现：复用 RTAB-Map 2D 模式（不引入 slam_toolbox）
+# 树莓派实现已 R-N14-6 物理删除
 # ---------------------------------------------------------------------------
 #
-# 依据：memory `feedback_prefer_rtabmap_over_slam_toolbox.md` —— 平台几何栈已选定
-# RTAB-Map 作为 SLAM 主线，**不**平行引入职责重叠的 SLAM Toolbox。
-#
-# Phase 3 目标态：树莓派 2D 场景不再启子进程脚本，沿用 nuwax-geometry-runtime
-# 共享运行时（与 Go2/G1 同一栈），详见 feedback_verification §2.2 残留 1。
-# 类保留以兼容旧 manifest.robot_profile.external_slam_script 字段，但所有方法
-# no-op，避免 100% 启动失败。
-
-
-class RaspiRtabMapScript(ExternalSlamNav2Script):
-    """树莓派走共享 nuwax-geometry-runtime（不再启独立脚本）。
-
-    Phase 3 之前曾在 ROS2 包路径下启 rtabmap_ros 2D + Nav2；目标态下该路径
-    已删除，整类 no-op 化，保留入口仅为兼容旧 manifest 字段解析。
-    """
-
-    def __init__(self, process_supervisor=None) -> None:
-        self._supervisor = process_supervisor
-        self._launched: bool = False
-        LOGGER.warning(
-            "RaspiRtabMapScript 已 no-op 化（Phase 3 目标态）："
-            "ros2_ws/.../raspi_rtabmap_2d_nav2.launch.py 已不存在，"
-            "树莓派与 Go2/G1 共用 nuwax-geometry-runtime。"
-        )
-
-    def start(self, mode: str = "") -> None:
-        # Phase 3 目标态：不再启子进程，外部 SLAM 共享 nuwax-geometry-runtime。
-        self._launched = False
-        return
-
-    def stop(self) -> None:
-        self._launched = False
-
-    def get_state(self) -> ExternalSlamState:
-        return ExternalSlamState(
-            name="RaspiRtabMapScript",
-            is_ready=False,
-            detail="Phase 3 目标态：共享 nuwax-geometry-runtime，原 ros2_ws 启动路径已下线",
-        )
-
-    def is_ready(self) -> bool:
-        # Phase 3 目标态：不再独立 Ready，由 nuwax-geometry-runtime HealthCheck 表达。
-        return False
+# 树莓派共享 nuwax-geometry-runtime（与 Go2/G1 同一栈），不再启独立脚本。
+# 历史类 `RaspiRtabMapScript` 物理删除；旧 manifest.robot_profile.external_slam_script
+# 字段名保留但未注册到 `_REGISTRY`，工厂回退到 Go2 默认实现以避免破坏现有部署。
+# drivers/raspi_lidar_robot/manifest.py:55 残留 `RaspiRtabMapScript` Python 路径
+# 留待后续 Phase 处理（本任务范围仅 external_script_runner.py）。
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +153,11 @@ class RaspiRtabMapScript(ExternalSlamNav2Script):
 _REGISTRY = {
     "Go2ShSlamScript": Go2ShSlamScript,
     "G1WebRtcSlamScript": G1WebRtcSlamScript,
-    "RaspiRtabMapScript": RaspiRtabMapScript,
+    # RaspiRtabMapScript 已 R-N14-6 删除（R-N14 v4 §R-N14-6 决策）
 }
 
 
-def _resolve_external_script(profile, **deps) -> ExternalSlamNav2Script:
+def _resolve_external_script(profile, **deps) -> "ExternalMappingScript":
     """按 profile.external_slam_script 选实现类，未注册返回 Go2 默认。"""
 
     if profile is None:
@@ -204,7 +170,7 @@ def _resolve_external_script(profile, **deps) -> ExternalSlamNav2Script:
     return cls(**deps)
 
 
-def build_external_script(profile, **deps) -> ExternalSlamNav2Script:
+def build_external_script(profile, **deps) -> "ExternalMappingScript":
     """工厂入口；profile 必传。"""
 
     if profile is None:
@@ -216,11 +182,11 @@ def build_external_script(profile, **deps) -> ExternalSlamNav2Script:
 
 
 __all__ = [
-    "ExternalSlamNav2Script",
+    "ExternalMappingScript",  # 新名
+    "ExternalSlamNav2Script",  # B 类 alias
     "ExternalSlamState",
     "Go2ShSlamScript",
     "G1WebRtcSlamScript",
-    "RaspiRtabMapScript",
     "build_external_script",
     "_resolve_external_script",
 ]

@@ -269,7 +269,7 @@ cleanup_stale_go2_video_streamer() {
 
 cleanup_external_geometry_processes() {
   # 去 ROS2 化（2026-07-04 drop-ros2 B4 修复）：默认清理对象改为 nuwax-geometry-runtime
-  # 与 LCM runtime 进程；不再扫描 services/geometry/ros2_ws/src/GO2_RTABNAV2 这条已删除
+  # 与 LCM runtime 进程；不再扫描 services/geometry/ 已删除的旧栈入口
   # 路径，也不 pkill 任何 ROS2 / Nav2 进程模式（pattern 名/字符串迁移到
   # scripts/legacy/cleanup_ros2_processes.sh，默认无 ROS2 字符串暴露）。
   # 历史 ROS2 进程清理（如旧 ws/旧 binary 仍以孤立进程残留）隔离到显式开关

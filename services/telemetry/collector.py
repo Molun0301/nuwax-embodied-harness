@@ -12,11 +12,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from contracts.debug_views import (
@@ -358,3 +361,36 @@ class SystemMetricsCollector:
         # 按 CPU 占用降序，便于面板优先展示重载进程。
         results.sort(key=lambda p: p.cpu_percent, reverse=True)
         return results
+
+    def _write_legacy_alias_counters(self, *, output_path: Optional[str] = None) -> Path:
+        """每 6 小时由 dispatcher 调用,把 LEGACY_ENV_HIT_COUNT / LEGACY_VERSIONJSON_VALUES
+        计数器落地为 runtime_data/.legacy_alias_counters.json,供 telemetry 季度回顾会议
+        触发 alias 清理决策(详见 R-N14 v4 §3.1.3)。
+
+        stub 阶段:仅写空 Counter(无消费者时为空 dict),文件存在即可。
+        实测阶段:从 core.settings 导入 LEGACY_ENV_HIT_COUNT / LEGACY_VERSIONJSON_VALUES。
+        """
+
+        try:
+            from core.settings import LEGACY_ENV_HIT_COUNT, LEGACY_VERSIONJSON_VALUES  # type: ignore
+        except Exception:
+            env_counter: Dict[str, int] = {}
+            versionjson_counter: Dict[str, int] = {}
+        else:
+            env_counter = dict(LEGACY_ENV_HIT_COUNT) if hasattr(LEGACY_ENV_HIT_COUNT, "items") else {}
+            versionjson_counter = dict(LEGACY_VERSIONJSON_VALUES) if hasattr(LEGACY_VERSIONJSON_VALUES, "items") else {}
+
+        if output_path is None:
+            target = Path("runtime_data") / ".legacy_alias_counters.json"
+        else:
+            target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "written_at": datetime.now(tz=timezone.utc).isoformat(),
+            "env_hits": env_counter,
+            "versionjson_values": versionjson_counter,
+            "stub": True,  # R-N14-1 阶段:标记 stub 化
+        }
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        TELEMETRY_LOGGER.debug("legacy_alias_counters 已写 path=%s", target)
+        return target

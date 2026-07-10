@@ -12,6 +12,7 @@ from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus, LocalizationSnapshot, RelocalizationCandidate
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
+from core.settings import LEGACY_BACKEND_TYPE_ALIAS, LEGACY_VERSIONJSON_VALUES  # v4 R-N14 Phase 1 §3.1.4:enum alias 反查
 from providers import LocalizationProvider
 from typing import Deque, Dict, Optional, Tuple
 
@@ -772,19 +773,27 @@ class LocalizationService:
     def _resolve_backend_type(self, provider: LocalizationProvider) -> str:
         """解析后端类型。
 
-        当前定位主线为 RTAB-Map + Nav2 action。
+        v4 R-N14 Phase 1 §3.1.5:枚举值归一为 `mapping_backend` (替代旧 `rtabmap`),
+        旧值走 `LEGACY_BACKEND_TYPE_ALIAS` 反查并打 `LEGACY_VERSIONJSON_VALUES` 计数。
+        当前定位主线为 nuwax-mapping + nuwax-nav-stack(替代旧 RTAB-Map + Nav2 action)。
         """
+
+        def _alias_resolve(raw: str) -> str:
+            if raw in LEGACY_BACKEND_TYPE_ALIAS:
+                LEGACY_VERSIONJSON_VALUES[f"backend_type:{raw}"] += 1
+                return LEGACY_BACKEND_TYPE_ALIAS[raw]
+            return raw
 
         backend_type = getattr(provider, "backend_type", None)
         if backend_type:
             normalized = str(backend_type).strip().lower()
             if normalized == "rtabmap":
-                return "rtabmap"
-            return str(backend_type)
+                return _alias_resolve("rtabmap")
+            return _alias_resolve(normalized) if normalized in LEGACY_BACKEND_TYPE_ALIAS else str(backend_type)
 
         provider_name = str(getattr(provider, "provider_name", "") or "").lower()
         if "rtabmap" in provider_name:
-            return "rtabmap"
+            return _alias_resolve("rtabmap")
         if "go2" in provider_name:
             return "go2_sdk"
         if "nav2" in provider_name:

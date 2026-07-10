@@ -9,6 +9,8 @@ from services.geometry.config import (
     GeometryTopicsConfig,
     GeometryTraversabilityFilterConfig,
     LcmChannelConfig,
+    MappingBackendConfig,
+    MappingOutputConfig,
     NavigationBackendConfig,
     PlatformGeometryConfig,
     RtabmapConfig,
@@ -41,6 +43,8 @@ __all__ = [
     "GeometryTopicsConfig",
     "GeometryTraversabilityFilterConfig",
     "LcmChannelConfig",
+    "MappingBackendConfig",
+    "MappingOutputConfig",
     "NavigationBackendConfig",
     "PlatformGeometryConfig",
     "PlatformGeometryRuntime",
@@ -61,3 +65,6 @@ __all__ = [
     "build_default_rtabmap_pcd_root",
     "read_pcd_xyz",
 ]
+
+# v4 rename (R-N14 Phase 1):B 类保留——alias 已在 services/geometry/config.py 声明,
+# 此处不再重复 `=` 赋值（避免 from-import 与 import 间的循环依赖）。

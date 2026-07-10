@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 from contracts.geometry import Pose, Vector3
 from core.logging_utils import StreamBusLogHandler
+from core.settings import _resolve_legacy_metadata_key  # R-N14 v4 §3.1.3 归位 (Phase 7 P2)
 from contracts.map_workspace import MapGeometryAssetBinding, MapGeometryAssetRef, MapGeometryAssetType, MapVersion
 from contracts.navigation import (
     ExplorationState,
@@ -77,12 +78,13 @@ _GEOMETRY_SIDE_CAR_RESTART_LIMIT = 2
 _GEOMETRY_MONITOR_INTERVAL_SEC = 1.0
 _GEOMETRY_STREAMING_WINDOW_SEC = 3.0
 # 目标态：平台几何运行时由 Rust nuwax-geometry-runtime 子进程 + gRPC + LCM 驱动。
-# 旧 GO2_RTABNAV2 (external_slam_nav2) 单链路已下线，手动建图/探索/定位仍以脚本形式受
+# 旧 external_slam_nav2 单链路已下线，手动建图/探索/定位仍以脚本形式受
 # `start_external_mapping` / `_start_external_script_exploration` / `_launch_external_localization`
 # 拉起，保留常量作为兼容锚点（参见 contracts/geometry_runtime.py GEOMETRY_STACK_NAME）。
 _GEOMETRY_STACK_NAME = "nuwax_geometry_runtime"
 # 兼容旧 rtabmap 数据库资产名（保留以支持历史 checkpoint 探测，新数据走 <map_name>.db）
-_EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME = "external_slam_nav2_state.db"
+# R-N14 v4 Phase 2:变量名 rename,但字面量 "external_slam_nav2_state.db" 保留以兼容历史 .db 资产。
+_EXTERNAL_MAPPING_STATE_ASSET_NAME = "external_slam_nav2_state.db"
 _MAIN_LOG_APPEND_LOCK = threading.Lock()
 _GO2_SH_MAIN_LOG_LOGGER = "nuwax_robot_bridge.geometry.go2.sh"
 _SUBPROCESS_LOG_LEVEL_NAMES = frozenset(
@@ -509,7 +511,7 @@ class PlatformGeometryRuntime:
         # 外部 /map 观察器（ExternalGeometryDebugObserver）才是 /map 占据栅格的真实来源；
         # Rust bridge 的 get_status 只返回 {phase,message,rss_kb}，不含占据状态。
         # 此处缓存观察器最近一帧的就绪元数据，供 _geometry_runtime_status_stub("live_map_provider")
-        # 合并，从而让 _build_rtabmap_readiness / _classify_live_mapping_wait /
+        # 合并，从而让 _build_mapping_readiness / _classify_live_mapping_wait /
         # _update_stream_tracker 读到真实的 occupancy 状态。
         self._observer_occupancy_snapshot: Dict[str, object] = {}
         self._observer_occupancy_lock = threading.Lock()
@@ -710,7 +712,7 @@ class PlatformGeometryRuntime:
 
     def _geometry_stack(self) -> str:
         # 目标态固定返回 nuwax_geometry_runtime（与 contracts/geometry_runtime.py GEOMETRY_STACK_NAME 对齐）。
-        # 旧 external_slam_nav2 字符串保留在 _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME / 兼容 checkpoint 探测中。
+        # 旧 external_slam_nav2 字符串保留在 _EXTERNAL_MAPPING_STATE_ASSET_NAME / 兼容 checkpoint 探测中。
         return _GEOMETRY_STACK_NAME
 
     def _uses_external_geometry_stack(self) -> bool:
@@ -796,7 +798,7 @@ class PlatformGeometryRuntime:
         map_name = str(getattr(request, "map_name", "") or "").strip() if request is not None else ""
         if map_name:
             version_id = self._next_exploration_map_version_id(map_name)
-            path = self._version_rtabmap_database_path(map_name, version_id)
+            path = self._version_mapping_database_path(map_name, version_id)
             path.parent.mkdir(parents=True, exist_ok=True)
             with self._exploration_loop_lock:
                 self._external_exploration_version_id = version_id
@@ -866,7 +868,7 @@ class PlatformGeometryRuntime:
         if raw_path:
             path = Path(raw_path).expanduser()
         else:
-            root = os.environ.get("NUWAX_RTABMAP_DATABASE_ROOT") or self.config.rtabmap.database_root
+            root = os.environ.get("NUWAX_RTABMAP_DATABASE_ROOT") or self.config.mapping.database_root
             path = Path(str(root)).expanduser() / "live_rtabmap.db"
         if not path.is_absolute():
             path = self._repo_root() / path
@@ -884,7 +886,7 @@ class PlatformGeometryRuntime:
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _external_localization_uses_static_map_yaml(self) -> bool:
-        # GO2_RTABNAV2 uses localize_only/restart_map/slam_mode; legacy GO2_NAV_* keys are deprecated.
+        # GO2 几何栈 localize_only/restart_map/slam_mode 模式已下线；legacy GO2_NAV_* keys are deprecated.
         return self._env_truthy("NUWAX_NAV2_USE_STATIC_MAP_YAML")
 
     @staticmethod
@@ -1044,7 +1046,7 @@ class PlatformGeometryRuntime:
         self._runtime_monitor_thread.start()
 
     def _build_launch_prefix(self) -> List[str]:
-        # 目标态：launch_ros2_stack.sh + bash 前缀已下线（不再有 /opt/ros 探测）。
+        # 目标态：ROS2 bash 前置脚本已下线（共享 nuwax-geometry-runtime 子进程内置 LCM 通道，无需环境探测）。
         # 保留方法为 no-op shim 以兼容历史 caller；platform 启动走 _start_geometry_runtime_subprocess。
         return []
 
@@ -1302,7 +1304,7 @@ class PlatformGeometryRuntime:
         live_map_status = self._clone_metadata(self._geometry_runtime_status_stub("live_map_provider"))
         tf_localization_status = self._clone_metadata(self._geometry_runtime_status_stub("tf_localization_provider"))
         self._update_stream_tracker(live_map_status)
-        readiness = self._build_rtabmap_readiness(
+        readiness = self._build_mapping_readiness(
             live_map_status=live_map_status,
             tf_localization_status=tf_localization_status,
         )
@@ -1375,7 +1377,7 @@ class PlatformGeometryRuntime:
                 return "%s 进程已退出，exit_code=%s。" % (name, exit_code)
         return None
 
-    def _build_rtabmap_readiness(
+    def _build_mapping_readiness(
         self,
         *,
         live_map_status: Optional[Dict[str, object]] = None,
@@ -1710,7 +1712,7 @@ class PlatformGeometryRuntime:
         first_growth_at = _parse_iso_timestamp(self._map_stream_tracker.get("first_growth_at"))
         last_growth_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_growth_at"))
         last_content_change_at = _parse_iso_timestamp(self._map_stream_tracker.get("last_content_change_at"))
-        map_fresh_window_sec = max(10.0, float(self.config.rtabmap.timestamp_quality.max_tf_age_sec) * 20.0, _GEOMETRY_STREAMING_WINDOW_SEC * 3.0)
+        map_fresh_window_sec = max(10.0, float(self.config.mapping.timestamp_quality.max_tf_age_sec) * 20.0, _GEOMETRY_STREAMING_WINDOW_SEC * 3.0)
         source_fresh = latest_age_sec is not None and latest_age_sec <= map_fresh_window_sec
         count_recent = last_growth_at is not None and (now - last_growth_at).total_seconds() <= map_fresh_window_sec
         content_recent = last_content_change_at is not None and (now - last_content_change_at).total_seconds() <= _GEOMETRY_STREAMING_WINDOW_SEC * 2.0
@@ -1854,16 +1856,16 @@ class PlatformGeometryRuntime:
             "processes": {name: process.status() for name, process in self._managed_processes.items()},
             "navigation_backend_policy": self._navigation_backend_policy(),
             "map_stream": dict(self._map_stream_tracker),
-            "rtabmap_readiness": self._build_rtabmap_readiness(),
+            "mapping_readiness": self._build_mapping_readiness(),
             "navigation": self._build_navigation_status(),
             "external_geometry": self.config.build_metadata().get("external_geometry"),
             "external_debug_observer": self._external_debug_observer_status(),
             "tf_localization_provider": self._geometry_runtime_status_stub("tf_localization_provider"),
             "diagnostics": diagnostics,
-            "launch_ros2_stack": {
-                "script": str(self._geometry_script("launch_ros2_stack.sh")),
+            "mapping_stack": {
+                "script": str(self._geometry_script("start_nuwax_geometry_runtime.sh")),
                 "starts_rtabmap_or_nav2_by_default": False,
-                "message": "launch_ros2_stack.sh 只用于可选 ROS2 桥环境；旧 RTAB-Map/Nav2 内置启动链路已删除。",
+                "message": "GO2 几何栈由共享 nuwax-geometry-runtime 承载；旧 ROS2/RTAB-Map/Nav2 启动脚本链路已删除。",
             },
         }
 
@@ -1897,9 +1899,9 @@ class PlatformGeometryRuntime:
         *,
         base_stub: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        """合成 GO2_RTABNAV2 外部栈 TF 就绪状态。
+        """合成 GO2 几何栈外部 TF 就绪状态。
 
-        Rust bridge GetStatus 不含 pose_ready/map_to_base_ready；探索/建图时 RTAB-Map
+        Rust bridge GetStatus 不含 pose_ready/map_to_base_ready；探索/建图时 nuwax-geometry-runtime
         通过 /go2/pose_map 与 /tf 提供 map 系位姿，须合并 debug observer 与 gRPC 信号。
         """
         status = dict(base_stub or {})
@@ -2262,13 +2264,13 @@ class PlatformGeometryRuntime:
         if has_external_request and done:
             terminal_status = str(metadata.get("terminal_status") or "succeeded").lower()
             status = ExplorationStatus.SUCCEEDED if terminal_status == "succeeded" else ExplorationStatus.FAILED
-            message = "GO2_RTABNAV2 原生探索已完成。"
+            message = "GO2 几何栈原生探索已完成。"
             if reasons:
                 # 第 8 条：闭环 / NO FRONTIERS 信号优先体现在 message 中
-                message = "GO2_RTABNAV2 原生探索已完成：%s" % ", ".join(reasons)
+                message = "GO2 几何栈原生探索已完成：%s" % ", ".join(reasons)
             status_text = str(metadata.get("status_text") or "").strip()
             if status_text and not reasons:
-                message = "GO2_RTABNAV2 原生探索已完成：%s" % status_text
+                message = "GO2 几何栈原生探索已完成：%s" % status_text
             terminal_state = self._finish_external_script_exploration(
                 status=status,
                 reason="external_explorer_terminal_status",
@@ -2396,9 +2398,9 @@ class PlatformGeometryRuntime:
             "message": message,
             "live_geometry_start_attempted": self._live_geometry_start_attempted,
             "geometry_enabled": self.config.enabled,
-            "rtabmap_profile_enabled": self.config.rtabmap.profile_enabled,
+            "mapping_profile_enabled": self.config.mapping.profile_enabled,
             "runtime_status": self.get_runtime_status(),
-            "rtabmap_readiness": self._build_rtabmap_readiness(
+            "mapping_readiness": self._build_mapping_readiness(
                 live_map_status=live_map_status,
                 tf_localization_status=tf_localization_status,
                 odometry_status=odometry_status,
@@ -2428,7 +2430,7 @@ class PlatformGeometryRuntime:
             "odom_frame": self.config.frames.odom_frame,
             "base_frame": self.config.frames.base_frame,
             "lidar_frame": self.config.frames.lidar_frame,
-            "geometry_profile_name": self.config.rtabmap.profile_name,
+            "geometry_profile_name": self.config.mapping.profile_name,
             "rtabmap_launch_removed": True,
             "go2_direct_dds_point_cloud_topic": getattr(direct_dds, "point_cloud_topic", None),
             "go2_direct_dds_enabled": getattr(direct_dds, "enabled", None),
@@ -2610,7 +2612,7 @@ class PlatformGeometryRuntime:
             return None
         upper = cleaned.upper()
         if "DONE (EXPLORATION FINISHED)" in upper:
-            return "GO2_RTABNAV2 原生探索已完成：%s" % cleaned
+            return "GO2 几何栈原生探索已完成：%s" % cleaned
         if upper.startswith("STRATEGY:"):
             return "探索换策略中：%s" % cleaned
         if frontier_count is not None and frontier_count > 0:
@@ -2705,12 +2707,12 @@ class PlatformGeometryRuntime:
         previous_asset = version.geometry_asset
         parameter_summary = self._build_parameter_summary()
         profile_summary = self._clone_metadata(parameter_summary.get("profile") or {})
-        rtabmap_database_path = self._version_rtabmap_database_path(version.map_name, version.version_id)
+        mapping_database_path = self._version_mapping_database_path(version.map_name, version.version_id)
         pcd_path = self._version_pcd_asset_path(version.map_name, version.version_id)
         built_at = previous_asset.built_at if previous_asset is not None else version.timestamp
-        backend_run = self._build_rtabmap_run_metadata()
-        database_metadata = self._materialize_backend_state(rtabmap_database_path)
-        database_for_pcd = rtabmap_database_path if rtabmap_database_path.exists() and rtabmap_database_path.is_file() else None
+        backend_run = self._build_mapping_run_metadata()
+        database_metadata = self._materialize_backend_state(mapping_database_path)
+        database_for_pcd = mapping_database_path if mapping_database_path.exists() and mapping_database_path.is_file() else None
         # Nav2 归档来自 version 快照，不依赖 PCD 导出；PCD 失败不应阻塞 yaml/geometry_asset 落盘。
         nav2_map_metadata = self._materialize_nav2_map_assets(version)
         if skip_pcd_export:
@@ -2724,7 +2726,7 @@ class PlatformGeometryRuntime:
         quality_metrics = self._build_geometry_quality_metrics(
             database_metadata=database_metadata,
             pcd_metadata=pcd_metadata,
-            rtabmap_run=backend_run,
+            mapping_run=backend_run,
             nav2_map_metadata=nav2_map_metadata,
         )
         database_quality = dict(quality_metrics.get("database") or {})
@@ -2737,7 +2739,7 @@ class PlatformGeometryRuntime:
             asset_refs.append(
                 MapGeometryAssetRef(
                     asset_type=database_asset_type,
-                    path=str(rtabmap_database_path),
+                    path=str(mapping_database_path),
                     frame_id=version.frame_id,
                     profile_summary=profile_summary,
                     built_at=built_at,
@@ -2831,11 +2833,11 @@ class PlatformGeometryRuntime:
             version_id=version.version_id,
             geometry_stack=self.config.stack,
             frame_id=version.frame_id,
-            rtabmap_database_path=str(rtabmap_database_path),
-            # 老 version.json 兼容：rtabmap_db_path 与 rtabmap_database_path 同步写。
-            rtabmap_db_path=str(rtabmap_database_path),
+            mapping_database_path=str(mapping_database_path),
+            # 老 version.json 兼容：rtabmap_db_path 与 mapping_database_path 同步写。
+            rtabmap_db_path=str(mapping_database_path),
             pcd_path=str(pcd_path),
-            occupancy_projection=self.config.rtabmap.occupancy_projection,
+            occupancy_projection=self.config.mapping.occupancy_projection,
             costmap_source=(getattr(getattr(self.config, "nav2", None), "costmap_source", "nav2_global") if getattr(self.config, "nav2", None) else "nav2_global"),
             parameter_summary=parameter_summary,
             profile_summary=profile_summary,
@@ -2851,15 +2853,15 @@ class PlatformGeometryRuntime:
                 "input_contract": parameter_summary.get("input_contract"),
                 "output_contract": parameter_summary.get("output_contract"),
                 "preprocessing": parameter_summary.get("preprocessing"),
-                "navigable_layer": self.config.rtabmap.occupancy_projection,
-                "traversability_layer": self.config.rtabmap.outputs.traversability_layer,
-                "localization_status_contract": self.config.rtabmap.outputs.localization_status,
-                "relocalization_diagnostics_contract": self.config.rtabmap.outputs.relocalization_diagnostics,
+                "navigable_layer": self.config.mapping.occupancy_projection,
+                "traversability_layer": self.config.mapping.outputs.traversability_layer,
+                "localization_status_contract": self.config.mapping.outputs.localization_status,
+                "relocalization_diagnostics_contract": self.config.mapping.outputs.relocalization_diagnostics,
                 "source_mode": quality_metrics.get("source_mode"),
                 "streaming_readiness": self._clone_metadata(quality_metrics.get("streaming_readiness")),
                 "backend_run": backend_run,
-                # 兼容老消费方继续读 rtabmap_run。
-                "rtabmap_run": backend_run,
+                # R-N14 v4 Phase 2:统一写新 key,旧 key 由 LEGACY_METADATA_KEY_ALIAS 接管(读路径 fallback)。
+                "mapping_run": backend_run,
                 "session_id": backend_run.get("session_id"),
                 "run_id": backend_run.get("run_id"),
                 "database": database_metadata,
@@ -2881,12 +2883,12 @@ class PlatformGeometryRuntime:
                     "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset),
                     "backend_session_id": backend_run.get("session_id"),
                     "backend_run_id": backend_run.get("run_id"),
-                    "rtabmap_database_path": database_metadata.get("database_source_path") or database_metadata.get("database_target_path"),
+                    "mapping_database_path": database_metadata.get("database_source_path") or database_metadata.get("database_target_path"),
                     "backend_streaming_ready": quality_metrics.get("live_streaming_ready"),
-                    # 老消费方读老 metadata key 时仍能解析（迁移期保留 alias）。
-                    "rtabmap_session_id": backend_run.get("session_id"),
-                    "rtabmap_run_id": backend_run.get("run_id"),
-                    "rtabmap_live_streaming_ready": quality_metrics.get("live_streaming_ready"),
+                    # R-N14 v4 Phase 2:metadata key 统一写新 key;老 key 读取由 LEGACY_METADATA_KEY_ALIAS 接管。
+                    "mapping_session_id": backend_run.get("session_id"),
+                    "mapping_run_id": backend_run.get("run_id"),
+                    "mapping_live_streaming_ready": quality_metrics.get("live_streaming_ready"),
                     "map_version_source_mode": quality_metrics.get("source_mode"),
                     "checkpoint_ready": quality_metrics.get("checkpoint_ready"),
                     "nav2_map_yaml_path": nav2_map_metadata.get("yaml_path"),
@@ -2897,8 +2899,8 @@ class PlatformGeometryRuntime:
         )
 
     def _version_db_ready_for_activation(self, version: MapVersion) -> bool:
-        db_path = self._resolve_existing_rtabmap_db_for_version(version)
-        return db_path is not None and self._is_usable_rtabmap_db_file(db_path)
+        db_path = self._resolve_existing_mapping_db_for_version(version)
+        return db_path is not None and self._is_usable_mapping_db_file(db_path)
 
     def activate_map_version(
         self,
@@ -3158,7 +3160,7 @@ class PlatformGeometryRuntime:
             "source_kind": "platform_live_map_provider",
             "map_snapshot_kind": "live_streaming",
             "live_streaming_ready": True,
-            "rtabmap_live_streaming_ready": True,
+            "mapping_live_streaming_ready": True,
             "source_name": live_status.get("provider_name") or "geometry_runtime",
             "update_sequence": update_sequence,
             "occupancy_sequence": occupancy_sequence,
@@ -3192,7 +3194,7 @@ class PlatformGeometryRuntime:
         else:
             metadata.update({
                 "geometry_stack": self.config.stack,
-                "occupancy_projection": self.config.rtabmap.occupancy_projection,
+                "occupancy_projection": self.config.mapping.occupancy_projection,
                 "costmap_source": (getattr(getattr(self.config, "nav2", None), "costmap_source", "nav2_global") if getattr(self.config, "nav2", None) else "nav2_global"),
                 "parameter_summary": self._build_parameter_summary(),
                 "profile": self._clone_metadata(self.config.build_metadata().get("profile")),
@@ -3236,12 +3238,12 @@ class PlatformGeometryRuntime:
         metadata = {
             "source_kind": source_kind,
             "map_snapshot_kind": map_snapshot_kind,
-            "rtabmap_live_streaming_ready": bool(live_available),
+            "mapping_live_streaming_ready": bool(live_available),
             **version_metadata,
             "geometry_stack": geometry_asset.geometry_stack if geometry_asset is not None else self.config.stack,
-            "rtabmap_db_path": geometry_asset.rtabmap_db_path if geometry_asset is not None else None,
+            "mapping_db_path": geometry_asset.rtabmap_db_path if geometry_asset is not None else None,
             "pcd_path": geometry_asset.pcd_path if geometry_asset is not None else None,
-            "occupancy_projection": geometry_asset.occupancy_projection if geometry_asset is not None else self.config.rtabmap.occupancy_projection,
+            "occupancy_projection": geometry_asset.occupancy_projection if geometry_asset is not None else self.config.mapping.occupancy_projection,
             "costmap_source": geometry_asset.costmap_source if geometry_asset is not None else (getattr(getattr(self.config, "nav2", None), "costmap_source", "nav2_global") if getattr(self.config, "nav2", None) else "nav2_global"),
             "parameter_summary": self._clone_metadata(
                 geometry_asset.parameter_summary if geometry_asset is not None else self._build_parameter_summary()
@@ -3285,12 +3287,12 @@ class PlatformGeometryRuntime:
             metadata.update(dict(geometry_asset.metadata))
         metadata["source_kind"] = source_kind
         metadata["map_snapshot_kind"] = map_snapshot_kind
-        metadata["rtabmap_live_streaming_ready"] = bool(live_available)
+        metadata["mapping_live_streaming_ready"] = bool(live_available)
         metadata.update(version_metadata)
         return metadata
 
     def _is_geometry_profile_enabled(self) -> bool:
-        return bool(self.config.enabled and self.config.rtabmap.profile_enabled)
+        return bool(self.config.enabled and self.config.mapping.profile_enabled)
 
     def _resolve_backend(self, data_plane_protocol, provider_protocol):
         if not self._is_geometry_profile_enabled():
@@ -3420,19 +3422,19 @@ class PlatformGeometryRuntime:
         safe_name = build_safe_dir_segment(map_name) or "map"
         return "%s.db" % safe_name
 
-    def _version_rtabmap_database_path(self, map_name: str, version_id: str) -> Path:
+    def _version_mapping_database_path(self, map_name: str, version_id: str) -> Path:
         """返回该地图版本的 RTAB-Map .db 状态文件路径。"""
 
         return self._version_geometry_root(map_name, version_id) / "rtabmap" / self._map_named_backend_db_filename(map_name)
 
-    def _candidate_version_rtabmap_database_paths(self, map_name: str, version_id: str) -> List[Path]:
+    def _candidate_version_mapping_database_paths(self, map_name: str, version_id: str) -> List[Path]:
         """主路径为 <map_name>.db，兼容旧版 external_slam_nav2_state.db。"""
 
         rtabmap_dir = self._version_geometry_root(map_name, version_id) / "rtabmap"
         candidates = [
             rtabmap_dir / self._map_named_backend_db_filename(map_name),
-            rtabmap_dir / self._external_slam_nav2_state_asset_name(),
-            rtabmap_dir / _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME,
+            rtabmap_dir / self._external_mapping_state_asset_name(),
+            rtabmap_dir / _EXTERNAL_MAPPING_STATE_ASSET_NAME,
         ]
         seen: set[str] = set()
         ordered: List[Path] = []
@@ -3444,14 +3446,14 @@ class PlatformGeometryRuntime:
             ordered.append(candidate)
         return ordered
 
-    def _external_slam_nav2_state_asset_name(self) -> str:
-        configured_name = str(getattr(self.config.rtabmap.outputs, "database_asset_name", "") or "").strip()
+    def _external_mapping_state_asset_name(self) -> str:
+        configured_name = str(getattr(self.config.mapping.outputs, "database_asset_name", "") or "").strip()
         if not configured_name or configured_name == "rtabmap.db":
-            return _EXTERNAL_SLAM_NAV2_STATE_ASSET_NAME
+            return _EXTERNAL_MAPPING_STATE_ASSET_NAME
         return configured_name
 
     def _version_pcd_asset_path(self, map_name: str, version_id: str) -> Path:
-        return self._version_geometry_root(map_name, version_id) / "pcd" / self.config.rtabmap.outputs.pcd_asset_name
+        return self._version_geometry_root(map_name, version_id) / "pcd" / self.config.mapping.outputs.pcd_asset_name
 
     def _version_nav2_map_yaml_path(self, map_name: str, version_id: str) -> Path:
         return self._version_geometry_root(map_name, version_id) / "nav2" / "map.yaml"
@@ -3527,7 +3529,7 @@ class PlatformGeometryRuntime:
     def _build_parameter_summary(self) -> Dict[str, object]:
         return self._clone_metadata(self.config.build_metadata())
 
-    def _materialize_rtabmap_database(self, target_path: Path) -> Dict[str, object]:
+    def _materialize_mapping_database(self, target_path: Path) -> Dict[str, object]:
         """Deprecated alias —— 转向 _materialize_backend_state。"""
 
         return self._materialize_backend_state(target_path)
@@ -3535,9 +3537,9 @@ class PlatformGeometryRuntime:
     def _materialize_backend_state(self, target_path: Path) -> Dict[str, object]:
         """持久化 RTAB-Map .db 状态到版本目录（sqlite3 .backup 安全拷贝）。"""
 
-        return self._materialize_rtabmap_db(target_path)
+        return self._materialize_mapping_db(target_path)
 
-    def _is_usable_rtabmap_db_file(self, path: Path) -> bool:
+    def _is_usable_mapping_db_file(self, path: Path) -> bool:
         resolved = path.expanduser().resolve(strict=False)
         if not resolved.is_file():
             return False
@@ -3557,12 +3559,12 @@ class PlatformGeometryRuntime:
                 candidate = Path(str(getter() or "").strip()).expanduser()
                 if (
                     candidate.suffix == ".db"
-                    and self._is_usable_rtabmap_db_file(candidate)
+                    and self._is_usable_mapping_db_file(candidate)
                     and candidate.resolve(strict=False) != resolved_target
                 ):
                     return candidate
 
-        configured_root = Path(str(self.config.rtabmap.database_root or "").strip()).expanduser()
+        configured_root = Path(str(self.config.mapping.database_root or "").strip()).expanduser()
         candidates: List[Path] = []
         if configured_root.suffix == ".db":
             candidates.append(configured_root)
@@ -3575,7 +3577,7 @@ class PlatformGeometryRuntime:
             )
         for candidate in candidates:
             if (
-                self._is_usable_rtabmap_db_file(candidate)
+                self._is_usable_mapping_db_file(candidate)
                 and candidate.resolve(strict=False) != resolved_target
             ):
                 return candidate
@@ -3591,7 +3593,7 @@ class PlatformGeometryRuntime:
         candidate = Path(str(raw_path)).expanduser()
         if not candidate.is_absolute():
             candidate = self._repo_root() / candidate
-        if candidate.suffix == ".db" and self._is_usable_rtabmap_db_file(candidate):
+        if candidate.suffix == ".db" and self._is_usable_mapping_db_file(candidate):
             return candidate
         return None
 
@@ -3616,7 +3618,7 @@ class PlatformGeometryRuntime:
                 return active_exploration_source, "exploration_runtime"
             return active_exploration_source, "exploration_target"
 
-        if self._is_usable_rtabmap_db_file(resolved_target):
+        if self._is_usable_mapping_db_file(resolved_target):
             return resolved_target, "persisted_target"
 
         runtime_source = self._locate_runtime_backend_state_for_materialize(resolved_target)
@@ -3630,7 +3632,7 @@ class PlatformGeometryRuntime:
             return active_exploration_source, "exploration_runtime"
         return None, "unavailable"
 
-    def _materialize_rtabmap_db(self, target_path: Path) -> Dict[str, object]:
+    def _materialize_mapping_db(self, target_path: Path) -> Dict[str, object]:
         """持久化 RTAB-Map .db 到版本目录，优先使用 sqlite3 .backup 保证写入安全。"""
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3662,7 +3664,7 @@ class PlatformGeometryRuntime:
             }
         if (
             source_kind_hint == "live_runtime"
-            and self._is_usable_rtabmap_db_file(resolved_target)
+            and self._is_usable_mapping_db_file(resolved_target)
             and self._db_file_size_bytes(resolved_target)
             > max(self._db_file_size_bytes(resolved_source), 4096) * 12 // 10
         ):
@@ -3826,7 +3828,7 @@ class PlatformGeometryRuntime:
         *,
         database_metadata: Dict[str, object],
         pcd_metadata: Dict[str, object],
-        rtabmap_run: Dict[str, object],
+        mapping_run: Dict[str, object],
         nav2_map_metadata: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         diagnostics = []
@@ -3836,7 +3838,7 @@ class PlatformGeometryRuntime:
         nav2_map_present = bool(nav2_map_metadata.get("present", False))
         database_required = not external_stack
         pcd_present = bool(pcd_metadata.get("pcd_present", False))
-        readiness = self._build_rtabmap_readiness()
+        readiness = self._build_mapping_readiness()
         live_source = database_metadata.get("database_source_kind") == "live_runtime"
         live_db_stat = database_metadata.get("database_source_after")
         live_db_mtime_age_sec = None
@@ -3901,7 +3903,7 @@ class PlatformGeometryRuntime:
                     "message": "地图版本缺少 PCD 点云资产，ICP 质量指标为 unknown。",
                 }
             )
-        if not rtabmap_run.get("run_id"):
+        if not mapping_run.get("run_id"):
             diagnostics.append(
                 {
                     "level": "warning",
@@ -3939,7 +3941,7 @@ class PlatformGeometryRuntime:
                 else "offline_checkpoint"
             ),
             "streaming_readiness": readiness,
-            "rtabmap_run": rtabmap_run,
+            "mapping_run": mapping_run,
             "database": {
                 "present": database_present,
                 "required": database_required,
@@ -3969,7 +3971,7 @@ class PlatformGeometryRuntime:
         return {
             "geometry_stack": geometry_asset.geometry_stack,
             "frame_id": geometry_asset.frame_id,
-            "rtabmap_db_path": geometry_asset.rtabmap_db_path,
+            "mapping_db_path": geometry_asset.rtabmap_db_path,
             "pcd_path": geometry_asset.pcd_path,
             "asset_types": [item.asset_type.value for item in geometry_asset.assets],
             "assets": self._clone_metadata(geometry_asset.assets),
@@ -4036,10 +4038,10 @@ class PlatformGeometryRuntime:
             )
             return "<unknown>"
 
-    def _build_rtabmap_run_metadata(self) -> Dict[str, object]:
+    def _build_mapping_run_metadata(self) -> Dict[str, object]:
         process_name = self._external_process_name()
         process = self._managed_processes.get(process_name)
-        db_path = self._locate_live_rtabmap_database()
+        db_path = self._locate_live_mapping_database()
         started_at = process.started_at_iso if process is not None else None
         pid = process.process.pid if process is not None and process.process is not None and process.is_running() else None
         source = str(db_path.resolve()) if db_path is not None else None
@@ -4126,14 +4128,14 @@ class PlatformGeometryRuntime:
         }
 
     def _configured_pcd_asset_candidates(self) -> List[Path]:
-        configured_value = str(self.config.rtabmap.pcd_root or "").strip()
+        configured_value = str(self.config.mapping.pcd_root or "").strip()
         if not configured_value:
             return []
         configured_root = Path(configured_value).expanduser()
         if configured_root.suffix == ".pcd":
             return [configured_root]
         return [
-            configured_root / self.config.rtabmap.outputs.pcd_asset_name,
+            configured_root / self.config.mapping.outputs.pcd_asset_name,
             configured_root / "cloud_map.pcd",
             configured_root / "map.pcd",
             configured_root / "current.pcd",
@@ -4165,7 +4167,7 @@ class PlatformGeometryRuntime:
             "map_version_id": map_version_id,
             "frame_id": frame_id or self.config.frames.map_frame,
             "geometry_stack": geometry_stack or self.config.stack,
-            "rtabmap_db_path": rtabmap_db_path,
+            "mapping_db_path": rtabmap_db_path,
             "not_fallback_to_sensor_scan": True,
             "expected_candidates": [str(item.expanduser().resolve(strict=False)) for item in (expected_candidates or [path])],
         }
@@ -4201,7 +4203,7 @@ class PlatformGeometryRuntime:
                 return candidate
         return None
 
-    def _locate_live_rtabmap_database(self) -> Optional[Path]:
+    def _locate_live_mapping_database(self) -> Optional[Path]:
         """Deprecated alias —— 转向 _locate_live_backend_state。"""
 
         return self._locate_live_backend_state()
@@ -4225,7 +4227,7 @@ class PlatformGeometryRuntime:
                     if candidate_path.suffix == ".db" and candidate_path.exists() and candidate_path.is_file():
                         return candidate_path
 
-        configured_root = Path(str(self.config.rtabmap.database_root or "").strip()).expanduser()
+        configured_root = Path(str(self.config.mapping.database_root or "").strip()).expanduser()
         candidates: List[Path] = []
         if configured_root.suffix == ".db":
             candidates.append(configured_root)
@@ -4243,7 +4245,7 @@ class PlatformGeometryRuntime:
                 return candidate
         return None
 
-    def _resolve_existing_rtabmap_db_for_version(self, version: MapVersion) -> Optional[Path]:
+    def _resolve_existing_mapping_db_for_version(self, version: MapVersion) -> Optional[Path]:
         """Find the .db file for a specific map version."""
         geometry_asset = version.geometry_asset
         candidates: List[Path] = []
@@ -4257,8 +4259,8 @@ class PlatformGeometryRuntime:
                     MapGeometryAssetType.EXTERNAL_SLAM_NAV2_STATE,
                 ):
                     candidates.append(Path(asset_ref.path).expanduser())
-        candidates.append(self._version_rtabmap_database_path(version.map_name, version.version_id))
-        for candidate in self._candidate_version_rtabmap_database_paths(version.map_name, version.version_id):
+        candidates.append(self._version_mapping_database_path(version.map_name, version.version_id))
+        for candidate in self._candidate_version_mapping_database_paths(version.map_name, version.version_id):
             if candidate.suffix == ".db" and candidate.exists() and candidate.is_file():
                 return candidate
         for candidate in candidates:
@@ -4288,9 +4290,9 @@ class PlatformGeometryRuntime:
             "map_name": version.map_name,
             "version_id": version.version_id,
             "geometry_stack": self.config.stack,
-            "rtabmap_database_path": backend_state,
-            # 老消费方兼容：保持 rtabmap_db_path 字段读得到。
-            "rtabmap_db_path": backend_state,
+            "mapping_database_path": backend_state,
+            # R-N14 v4 Phase 2:统一写新 key,旧 key 由 LEGACY_METADATA_KEY_ALIAS 接管(读路径 fallback)。
+            "mapping_db_path": backend_state,
             "pcd_path": geometry_asset.pcd_path if geometry_asset is not None else None,
             "frame_id": version.frame_id,
             "geometry_asset_summary": self._summarize_geometry_asset(geometry_asset) if geometry_asset is not None else None,
@@ -4356,7 +4358,7 @@ class PlatformGeometryRuntime:
     ) -> Dict[str, object]:
         # RTAB-Map activation: restart the managed process with the version's .db
         # Use mapping mode for empty/new DBs, localization mode for populated DBs.
-        db_path = self._resolve_existing_rtabmap_db_for_version(version)
+        db_path = self._resolve_existing_mapping_db_for_version(version)
         nav2_map_metadata = self._resolve_nav2_map_metadata(version)
         nav2_yaml_path = self._resolve_existing_nav2_map_yaml_path(version, nav2_map_metadata)
         if nav2_yaml_path is None:
@@ -4454,7 +4456,7 @@ class PlatformGeometryRuntime:
             command = [str(self._external_script_path()), "--localization", str(db_path)]
             if static_map_yaml_path is not None:
                 command.extend(["--map-yaml", str(static_map_yaml_path)])
-            # GO2_RTABNAV2 localization reads the passed .db directly (localize_only:=true).
+            # GO2 几何栈 localization reads the passed .db directly (localize_only:=true).
             # Static map_server is opt-in via NUWAX_NAV2_USE_STATIC_MAP_YAML=true (legacy GO2_NAV_* deprecated).
             self._start_managed_process(process_name, command, self._external_log_name(), restart=restart)
             process = self._managed_processes.get(process_name)
@@ -4690,8 +4692,8 @@ class PlatformGeometryRuntime:
             return None
         self._pending_localization_callbacks.append(callback)
         # 外部栈位姿由 ExternalGeometryDebugObserver 在 robot.start() 之后启动
-        # （见 GatewayRuntime._start_data_frame_stream_sources），此处不能提前启动 observer：
-        # 它会设置 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp，导致 Unitree SDK ChannelFactory 初始化失败。
+        # （见 GatewayRuntime._start_data_frame_stream_sources），此处不能提前启动 observer，
+        # 否则它会污染 Unitree SDK ChannelFactory 的 DDS 上下文，导致初始化失败。
         if self._uses_external_geometry_stack():
             return 0
         if self._remote_provider is not None and self._remote_provider.is_connected:
@@ -4863,7 +4865,7 @@ class PlatformGeometryRuntime:
         return stopped
 
     @staticmethod
-    def _remove_rtabmap_database_files(db_path: Path) -> None:
+    def _remove_mapping_database_files(db_path: Path) -> None:
         resolved = db_path.expanduser()
         for candidate in (
             resolved,
@@ -4890,7 +4892,7 @@ class PlatformGeometryRuntime:
         command = self._build_external_exploration_command(request)
         db_path = self._extract_external_exploration_database_path(command)
         if db_path:
-            self._remove_rtabmap_database_files(Path(str(db_path)))
+            self._remove_mapping_database_files(Path(str(db_path)))
         duration_limit = self._external_exploration_duration_limit_sec(request)
         now = time.monotonic()
         with self._exploration_loop_lock:
@@ -4932,7 +4934,7 @@ class PlatformGeometryRuntime:
             self._finish_external_script_exploration(
                 status=ExplorationStatus.FAILED,
                 reason="external_explore_start_failed",
-                message="GO2_RTABNAV2 原生探索脚本启动失败。",
+                message="GO2 几何栈原生探索脚本启动失败。",
                 notify_compat=False,
                 process_status=process.status() if process is not None else None,
                 kill_geometry_process=True,
@@ -4940,7 +4942,7 @@ class PlatformGeometryRuntime:
             return False
         self._record_runtime_diagnostic(
             "external_go2_exploration_started",
-            "explore_area 已委托 GO2_RTABNAV2 脚本执行：%s" % process.command_display(),
+            "explore_area 已委托 GO2 几何栈脚本执行：%s" % process.command_display(),
         )
         return True
 
@@ -4957,7 +4959,7 @@ class PlatformGeometryRuntime:
         self._finish_external_script_exploration(
             status=ExplorationStatus.CANCELLED,
             reason="manual_cancel",
-            message="GO2_RTABNAV2 原生探索任务已取消；RTAB-Map/Nav2 仍保持运行，请使用 stop_mapping 结束几何栈。",
+            message="GO2 几何栈原生探索任务已取消；共享 nuwax-geometry-runtime 仍保持运行，请使用 stop_mapping 结束几何栈。",
             notify_compat=notify_compat,
             kill_geometry_process=False,
         )
@@ -5070,7 +5072,7 @@ class PlatformGeometryRuntime:
         command = self._build_external_mapping_command(map_name=map_name)
         db_path = self._extract_external_exploration_database_path(command)
         if db_path:
-            self._remove_rtabmap_database_files(Path(str(db_path)))
+            self._remove_mapping_database_files(Path(str(db_path)))
         with self._exploration_loop_lock:
             self._external_geometry_session_mode = "mapping"
             self._external_exploration_terminal_state = None
@@ -5095,10 +5097,10 @@ class PlatformGeometryRuntime:
         if process is None or not process.is_running():
             with self._exploration_loop_lock:
                 self._external_geometry_session_mode = None
-            raise RuntimeError("GO2_RTABNAV2 手动建图脚本启动失败。")
+            raise RuntimeError("GO2 几何栈手动建图脚本启动失败。")
         self._record_runtime_diagnostic(
             "external_go2_mapping_started",
-            "start_mapping 已委托 GO2_RTABNAV2 脚本执行：%s" % process.command_display(),
+            "start_mapping 已委托 GO2 几何栈脚本执行：%s" % process.command_display(),
         )
         return {
             "mapping_launch_mode": "mapping",
@@ -5180,7 +5182,7 @@ class PlatformGeometryRuntime:
             exploration_state = self._finish_external_script_exploration(
                 status=ExplorationStatus.CANCELLED,
                 reason=str(reason or "stop_mapping"),
-                message="GO2_RTABNAV2 几何栈已通过 stop_mapping 停止。",
+                message="GO2 几何栈已通过 stop_mapping 停止。",
                 notify_compat=True,
                 kill_geometry_process=True,
             )
@@ -5202,11 +5204,11 @@ class PlatformGeometryRuntime:
                 self._notify_exploration_update(exploration_state)
         stopped = not self._external_geometry_stack_is_running()
         if not stopped and process_was_running:
-            raise RuntimeError("GO2_RTABNAV2 几何栈停止失败，外部进程仍在运行。")
+            raise RuntimeError("GO2 几何栈停止失败，外部进程仍在运行。")
         self._on_external_geometry_session_mode_changed(None)
         self._record_runtime_diagnostic(
             "external_go2_mapping_stopped",
-            "stop_mapping 已停止 GO2_RTABNAV2 几何栈 reason=%s session_mode=%s" % (reason, session_mode),
+            "stop_mapping 已停止 GO2 几何栈 reason=%s session_mode=%s" % (reason, session_mode),
         )
         with self._exploration_loop_lock:
             mapping_database_path = self._external_exploration_database_path
@@ -5992,11 +5994,11 @@ class PlatformGeometryRuntime:
         terminal_status = str(payload_metadata.get("terminal_status") or "succeeded").lower()
         status = ExplorationStatus.SUCCEEDED if terminal_status == "succeeded" else ExplorationStatus.FAILED
         status_text = str(payload_metadata.get("status_text") or "").strip()
-        message = "GO2_RTABNAV2 原生探索已完成。"
+        message = "GO2 几何栈原生探索已完成。"
         if reasons:
-            message = "GO2_RTABNAV2 原生探索已完成：%s" % ", ".join(reasons)
+            message = "GO2 几何栈原生探索已完成：%s" % ", ".join(reasons)
         elif status_text:
-            message = "GO2_RTABNAV2 原生探索已完成：%s" % status_text
+            message = "GO2 几何栈原生探索已完成：%s" % status_text
         process = self._managed_processes.get(self._external_process_name())
         process_status = process.status() if process is not None else None
         return self._finish_external_script_exploration(
@@ -6035,7 +6037,7 @@ class PlatformGeometryRuntime:
         process = self._managed_processes.get(self._external_process_name())
         process_status = process.status() if process is not None else None
         waiting_for = None
-        message = explorer_message or "GO2_RTABNAV2 原生 frontier 探索运行中。"
+        message = explorer_message or "GO2 几何栈原生 frontier 探索运行中。"
         metadata = self._build_external_exploration_metadata(
             request=request,
             process_status=process_status,
@@ -6076,7 +6078,7 @@ class PlatformGeometryRuntime:
             state = self._finish_external_script_exploration(
                 status=ExplorationStatus.SUCCEEDED,
                 reason="max_duration_sec",
-                message="GO2_RTABNAV2 原生探索已达到最大时长，任务已结束。",
+                message="GO2 几何栈原生探索已达到最大时长，任务已结束。",
                 notify_compat=False,
                 process_status=process_status,
                 kill_geometry_process=False,
@@ -6089,7 +6091,7 @@ class PlatformGeometryRuntime:
                 state = self._finish_external_script_exploration(
                     status=ExplorationStatus.SUCCEEDED,
                     reason="external_process_completed",
-                    message="GO2_RTABNAV2 原生探索脚本已正常退出。",
+                    message="GO2 几何栈原生探索脚本已正常退出。",
                     notify_compat=False,
                     process_status=process_status,
                     kill_geometry_process=False,
@@ -6098,7 +6100,7 @@ class PlatformGeometryRuntime:
             state = self._finish_external_script_exploration(
                 status=ExplorationStatus.FAILED,
                 reason="external_process_exited",
-                message="GO2_RTABNAV2 原生探索脚本已退出，exit_code=%s。" % exit_code,
+                message="GO2 几何栈原生探索脚本已退出，exit_code=%s。" % exit_code,
                 notify_compat=False,
                 process_status=process_status,
                 kill_geometry_process=False,
@@ -6127,14 +6129,18 @@ class PlatformGeometryRuntime:
 
         diagnostics = self.get_live_mapping_diagnostics()
         runtime_status = diagnostics.get("runtime_status") if isinstance(diagnostics.get("runtime_status"), dict) else {}
-        rtabmap_readiness = diagnostics.get("rtabmap_readiness") if isinstance(diagnostics.get("rtabmap_readiness"), dict) else {}
+        # R-N14 v4 Phase 2:metadata key 优先读新 key,fallback 旧 key（LEGACY_VERSIONJSON_VALUES 计数由 _resolve_legacy_metadata_key 接管）。
+        mapping_readiness = diagnostics.get("mapping_readiness")
+        if not isinstance(mapping_readiness, dict):
+            _legacy_rtabmap_readiness_key = _resolve_legacy_metadata_key("rtabmap_readiness")
+            mapping_readiness = diagnostics.get(_legacy_rtabmap_readiness_key) if isinstance(diagnostics.get(_legacy_rtabmap_readiness_key), dict) else {}
         navigation_status = (
             runtime_status.get("navigation")
             if isinstance(runtime_status.get("navigation"), dict)
             else self._build_navigation_status()
         )
         waiting_for = None
-        message = "GO2_RTABNAV2 原生 frontier 探索运行中。"
+        message = "GO2 几何栈原生 frontier 探索运行中。"
         exploration_signals_active = bool(
             explorer_message is not None
             or (frontier_count is not None and frontier_count > 0)
@@ -6144,10 +6150,10 @@ class PlatformGeometryRuntime:
             message = explorer_message or message
         elif diagnostics.get("waiting_for"):
             waiting_for = str(diagnostics.get("waiting_for"))
-            message = str(diagnostics.get("message") or "等待 GO2_RTABNAV2 探索输入链路 ready。")
-        elif not bool(rtabmap_readiness.get("localization_ready")):
-            waiting_for = str(rtabmap_readiness.get("waiting_for") or "external_slam_nav2")
-            message = str(rtabmap_readiness.get("message") or "等待 GO2_RTABNAV2 SLAM/TF ready。")
+            message = str(diagnostics.get("message") or "等待 GO2 几何栈探索输入链路 ready。")
+        elif not bool(mapping_readiness.get("localization_ready")):
+            waiting_for = str(mapping_readiness.get("waiting_for") or "external_slam_nav2")
+            message = str(mapping_readiness.get("message") or "等待 GO2 几何栈 SLAM/TF ready。")
         elif not bool(navigation_status.get("ready")):
             waiting_for = self._normalize_exploration_waiting_for(
                 navigation_status.get("waiting_for") or "nuwax_navigation_runtime"
@@ -6164,7 +6170,7 @@ class PlatformGeometryRuntime:
             terminal=False,
         )
         metadata["mapping_chain_diagnostics"] = diagnostics
-        metadata["rtabmap_readiness"] = self._clone_metadata(rtabmap_readiness)
+        metadata["mapping_readiness"] = self._clone_metadata(mapping_readiness)
         metadata["navigation_readiness"] = self._clone_metadata(navigation_status)
         metadata["elapsed_time_sec"] = elapsed
         if waiting_for:
@@ -6276,7 +6282,7 @@ class PlatformGeometryRuntime:
             return {
                 "status": ExplorationStatus.SUCCEEDED,
                 "reason": "external_explorer_log_complete",
-                "message": "GO2_RTABNAV2 原生探索已完成。",
+                "message": "GO2 几何栈原生探索已完成。",
             }
         return None
 
@@ -6297,7 +6303,11 @@ class PlatformGeometryRuntime:
 
     def _build_exploration_runtime_metadata(self, *, snapshot, current_pose, occupancy_grid, cost_map) -> Dict[str, object]:
         live_diagnostics = self.get_live_mapping_diagnostics()
-        rtabmap_readiness = live_diagnostics.get("rtabmap_readiness") if isinstance(live_diagnostics.get("rtabmap_readiness"), dict) else {}
+        # R-N14 v4 Phase 2:metadata key 优先读新 key,fallback 旧 key（LEGACY_VERSIONJSON_VALUES 计数由 _resolve_legacy_metadata_key 接管）。
+        mapping_readiness = live_diagnostics.get("mapping_readiness")
+        if not isinstance(mapping_readiness, dict):
+            _legacy_rtabmap_readiness_key = _resolve_legacy_metadata_key("rtabmap_readiness")
+            mapping_readiness = live_diagnostics.get(_legacy_rtabmap_readiness_key) if isinstance(live_diagnostics.get(_legacy_rtabmap_readiness_key), dict) else {}
         navigation_status = self._build_navigation_status()
         navigation_backend_policy = self._navigation_backend_policy()
         navigation_backend = self._resolve_navigation_backend()
@@ -6327,7 +6337,7 @@ class PlatformGeometryRuntime:
                         navigation_status.get("message")
                         or "等待 nuwax-geometry-runtime nav_runtime lifecycle/costmap ready。"
                     )
-        map_stream = rtabmap_readiness.get("map_stream") if isinstance(rtabmap_readiness.get("map_stream"), dict) else {}
+        map_stream = mapping_readiness.get("map_stream") if isinstance(mapping_readiness.get("map_stream"), dict) else {}
         map_revision = self._exploration_map_revision(snapshot, occupancy_grid, map_stream)
         costmap_revision = self._exploration_costmap_revision(snapshot, cost_map, map_stream, navigation_status)
         pose_revision = self._exploration_pose_revision(current_pose)
@@ -6336,7 +6346,7 @@ class PlatformGeometryRuntime:
             "costmap_revision": costmap_revision,
             "pose_revision": pose_revision,
             "map_stream": self._clone_metadata(map_stream),
-            "rtabmap_readiness": self._clone_metadata(rtabmap_readiness),
+            "mapping_readiness": self._clone_metadata(mapping_readiness),
             "navigation_readiness": self._clone_metadata(navigation_status),
             "navigation_backend": {
                 "provider_name": navigation_backend_name,
@@ -6346,7 +6356,7 @@ class PlatformGeometryRuntime:
                 "policy": self._clone_metadata(navigation_backend_policy),
             },
             "navigation_backend_policy": self._clone_metadata(navigation_backend_policy),
-            "live_map_streaming_ready": bool(rtabmap_readiness.get("streaming_ready")),
+            "live_map_streaming_ready": bool(mapping_readiness.get("streaming_ready")),
             "navigation_ready": bool(navigation_status.get("ready")),
             "navigation_backend_ready": navigation_backend_ready,
             "frontier_freshness": {
@@ -6364,11 +6374,11 @@ class PlatformGeometryRuntime:
             waiting_for = "map"
             message = "等待外部 SLAM/Nav2 /map_obstacles 首帧。"
             failure_code = "map_unavailable"
-        elif not bool(rtabmap_readiness.get("streaming_ready")):
+        elif not bool(mapping_readiness.get("streaming_ready")):
             waiting_for = "live_map_streaming"
-            message = str(rtabmap_readiness.get("message") or live_diagnostics.get("message") or "等待 live map streaming。")
+            message = str(mapping_readiness.get("message") or live_diagnostics.get("message") or "等待 live map streaming。")
             failure_code = "live_map_streaming_unavailable"
-        elif not bool(rtabmap_readiness.get("tf_chain", {}).get("ready")):
+        elif not bool(mapping_readiness.get("tf_chain", {}).get("ready")):
             waiting_for = "tf"
             message = "等待外部 SLAM/Nav2 所需 TF 链 ready。"
             failure_code = "tf_unavailable"

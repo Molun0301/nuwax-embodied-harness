@@ -13,7 +13,7 @@ nuwax_robot_bridge 统一配置解析层。
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import logging
@@ -43,10 +43,10 @@ from contracts.geometry_runtime import (
     GeometryTopicsConfig,
     GeometryTraversabilityFilterConfig,
     LcmChannelConfig,
+    MappingBackendConfig,
+    MappingOutputConfig,
     NavigationBackendConfig,
     PlatformGeometryConfig,
-    RtabmapConfig,
-    RtabmapOutputConfig,
     build_default_geometry_runtime_binary,
     build_default_geometry_runtime_port,
     build_default_geometry_runtime_ready_file,
@@ -264,6 +264,110 @@ def _cfg_str_alias(preferred_name: str, legacy_name: str, default: str = "") -> 
         return default
     value = raw.strip()
     return value if value else default
+
+
+# ============================================================
+# R-N14 v4 Phase 1 §3.1.3 / §3.1.4:legacy env / version.json 字面值的 telemetry 计数。
+# 由 dispatcher 周期性(6h)读取并写 runtime_data/telemetry/legacy_alias.json。
+# - LEGACY_ENV_HIT_COUNT:17 键 NUWAX_RTABMAP_* 老 env 命中次数。
+# - LEGACY_VERSIONJSON_VALUES:version.json / 其它外部字面值(rtabmap_localization /
+#   rtabmap_icp / backend_type="rtabmap")的命中次数,key 为 `bucket:raw_value`。
+# 季度 telemetry 报告触发清理:连续 3 季度零命中才可移除 alias。
+# ============================================================
+
+LEGACY_ENV_HIT_COUNT: Counter[str] = Counter()
+LEGACY_VERSIONJSON_VALUES: Counter[str] = Counter()
+
+
+def record_legacy_env_hit(name: str) -> None:
+    """R-N14 §3.1.3 telemetry 落地:记录 17 键老 env 命中次数,供 dispatcher 周期写 legacy_alias.json。"""
+    LEGACY_ENV_HIT_COUNT[str(name)] += 1
+
+
+def _resolve_alias_env_value_with_hit(
+    preferred_name: str,
+    legacy_name: str,
+    default: str = "",
+) -> str:
+    """带 telemetry 计数的 alias 解析,旧键命中时调 record_legacy_env_hit。"""
+    value = _resolve_alias_env_value(preferred_name, legacy_name)
+    if value is None:
+        return default
+    resolved = value.strip()
+    if not resolved:
+        return default
+    # 旧键命中(且新键未设):计数 +1。
+    if (
+        str(os.environ.get(legacy_name, "")).strip()
+        and not str(os.environ.get(preferred_name, "")).strip()
+    ):
+        record_legacy_env_hit(legacy_name)
+    return resolved
+
+
+# v4 Phase 1 §3.1.4:version.json / outputs.localization_status 字段的反查表。
+# 旧 `rtabmap_localization` / `rtabmap_icp` 字面值仍可能出现在 version.json 等历史制品中,
+# 走 telemetry 计数清理。
+LEGACY_LOCALIZATION_STATUS_ALIAS: Dict[str, str] = {
+    "rtabmap_localization": "mapping_localization",
+}
+
+# v4 Phase 1 §3.1.4 / §3.1.5:`backend_type="rtabmap"` enum 反查表。
+# 历史 `version.json` / `BackendLocalizationState.backend_type` 字面值仍可能持有
+# `rtabmap`,走 `LEGACY_VERSIONJSON_VALUES["backend_type:rtabmap"]` 计数清理。
+# 命中后归一为 `mapping_backend`(R-N14 v4 命名决定)。
+LEGACY_BACKEND_TYPE_ALIAS: Dict[str, str] = {
+    "rtabmap": "mapping_backend",
+}
+LEGACY_RELOCALIZATION_DIAGNOSTICS_ALIAS: Dict[str, str] = {
+    "rtabmap_icp": "mapping_icp",
+}
+
+
+def _resolve_legacy_localization_status(raw: str) -> str:
+    """version.json / outputs.localization_status 反查:旧值映射到新值并打 telemetry 计数。"""
+    if raw in LEGACY_LOCALIZATION_STATUS_ALIAS:
+        LEGACY_VERSIONJSON_VALUES[f"localization_status:{raw}"] += 1
+        return LEGACY_LOCALIZATION_STATUS_ALIAS[raw]
+    return raw
+
+
+def _resolve_legacy_relocalization_diagnostics(raw: str) -> str:
+    """version.json / outputs.relocalization_diagnostics 反查:旧值映射到新值并打 telemetry 计数。"""
+    if raw in LEGACY_RELOCALIZATION_DIAGNOSTICS_ALIAS:
+        LEGACY_VERSIONJSON_VALUES[f"relocalization_diagnostics:{raw}"] += 1
+        return LEGACY_RELOCALIZATION_DIAGNOSTICS_ALIAS[raw]
+    return raw
+
+
+# R-N14 v4 Phase 2 §3.1.4:metadata key 旧→新 反查表。读 disk version.json 时命中旧 key,
+# 归一为新 key 并打 LEGACY_VERSIONJSON_VALUES 计数,季度 telemetry 报告触发清理。
+# 季度零命中连续 3 季度后即可移除 alias(参见 LEGACY_*_ALIAS 注释约定)。
+LEGACY_METADATA_KEY_ALIAS: Dict[str, str] = {
+    "rtabmap_database_path": "mapping_database_path",
+    "rtabmap_db_path": "mapping_db_path",
+    "rtabmap_session_id": "mapping_session_id",
+    "rtabmap_run_id": "mapping_run_id",
+    "rtabmap_live_streaming_ready": "mapping_live_streaming_ready",
+    "rtabmap_readiness": "mapping_readiness",
+    "rtabmap_profile_enabled": "mapping_profile_enabled",
+    "rtabmap_profile": "mapping_profile",
+}
+
+
+def _resolve_legacy_metadata_key(raw: str) -> str:
+    """alias metadata key 反查(R-N14 v4 §3.1.3),旧键命中时打 `LEGACY_VERSIONJSON_VALUES["metadata_key:<old>"] += 1` 给 telemetry 计数清理。
+
+    与 LEGACY_LOCALIZATION_STATUS_ALIAS / LEGACY_RELOCALIZATION_DIAGNOSTICS_ALIAS / LEGACY_BACKEND_TYPE_ALIAS 同源,
+    用于序列化兼容(version.json 历史 snapshot 读 fallback)。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return text
+    if text in LEGACY_METADATA_KEY_ALIAS:
+        LEGACY_VERSIONJSON_VALUES[f"metadata_key:{text}"] += 1
+        return LEGACY_METADATA_KEY_ALIAS[text]
+    return text
 
 
 
@@ -882,16 +986,30 @@ def load_config() -> NuwaxRobotBridgeConfig:
             lidar_frame=_cfg_str("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),
             imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
-        rtabmap=RtabmapConfig(
-            profile_name=_cfg_str("NUWAX_RTABMAP_PROFILE_NAME", DEFAULT_GEOMETRY_STACK_NAME),
-            profile_enabled=_cfg_bool("NUWAX_RTABMAP_PROFILE_ENABLED", True),
-            default_profile=_cfg_bool("NUWAX_RTABMAP_DEFAULT_PROFILE", True),
-            database_root=_cfg_str("NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()),
-            pcd_root=_cfg_str("NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()),
-            mapping_crate=_cfg_str("NUWAX_RTABMAP_MAPPING_CRATE", "nuwax-mapping"),
-            occupancy_projection=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"),
-            input_contract=_cfg_str("NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"),
-            output_contract=_cfg_str("NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
+        mapping=MappingBackendConfig(
+            profile_name=_resolve_alias_env_value_with_hit(
+                "NUWAX_MAPPING_PROFILE_NAME", "NUWAX_RTABMAP_PROFILE_NAME", DEFAULT_GEOMETRY_STACK_NAME
+            ),
+            profile_enabled=_cfg_bool("NUWAX_MAPPING_PROFILE_ENABLED", True),
+            default_profile=_cfg_bool("NUWAX_MAPPING_DEFAULT_PROFILE", True),
+            database_root=_resolve_alias_env_value_with_hit(
+                "NUWAX_MAPPING_DATABASE_ROOT", "NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()
+            ),
+            pcd_root=_resolve_alias_env_value_with_hit(
+                "NUWAX_MAPPING_PCD_ROOT", "NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()
+            ),
+            mapping_crate=_resolve_alias_env_value_with_hit(
+                "NUWAX_MAPPING_CRATE", "NUWAX_RTABMAP_MAPPING_CRATE", "nuwax-mapping"
+            ),
+            occupancy_projection=_resolve_alias_env_value_with_hit(
+                "NUWAX_MAPPING_OCCUPANCY_PROJECTION", "NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"
+            ),
+            input_contract=_resolve_alias_env_value_with_hit(
+                "NUWAX_MAPPING_INPUT_CONTRACT", "NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"
+            ),
+            output_contract=_resolve_alias_env_value_with_hit(
+                "NUWAX_MAPPING_OUTPUT_CONTRACT", "NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"
+            ),
             timestamp_quality=GeometryTimestampQualityConfig(
                 source=_cfg_str("NUWAX_GEOMETRY_TIMESTAMP_SOURCE", "sensor_header"),
                 max_point_cloud_age_sec=max(0.0, _cfg_float("NUWAX_GEOMETRY_POINT_CLOUD_MAX_AGE_SEC", 0.5)),
@@ -925,14 +1043,32 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 min_traversability_score=max(0.0, min(1.0, _cfg_float("NUWAX_GEOMETRY_MIN_TRAVERSABILITY_SCORE", 0.5))),
                 output_layer=_cfg_str("NUWAX_GEOMETRY_TRAVERSABILITY_OUTPUT_LAYER", "traversability"),
             ),
-            outputs=RtabmapOutputConfig(
-                database_asset_name=_cfg_str("NUWAX_RTABMAP_DATABASE_ASSET_NAME", "nuwax_mapping_state.db"),
-                pcd_asset_name=_cfg_str("NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"),
-                occupancy_layer=_cfg_str("NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"),
-                costmap_layer=_cfg_str("NUWAX_RTABMAP_COSTMAP_LAYER", "nuwax_global_costmap"),
-                traversability_layer=_cfg_str("NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"),
-                localization_status=_cfg_str("NUWAX_RTABMAP_LOCALIZATION_STATUS", "rtabmap_localization"),
-                relocalization_diagnostics=_cfg_str("NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "rtabmap_icp"),
+            outputs=MappingOutputConfig(
+                database_asset_name=_resolve_alias_env_value_with_hit(
+                    "NUWAX_MAPPING_DATABASE_ASSET_NAME", "NUWAX_RTABMAP_DATABASE_ASSET_NAME", "nuwax_mapping_state.db"
+                ),
+                pcd_asset_name=_resolve_alias_env_value_with_hit(
+                    "NUWAX_MAPPING_PCD_ASSET_NAME", "NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"
+                ),
+                occupancy_layer=_resolve_alias_env_value_with_hit(
+                    "NUWAX_MAPPING_OCCUPANCY_LAYER", "NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"
+                ),
+                costmap_layer=_resolve_alias_env_value_with_hit(
+                    "NUWAX_MAPPING_COSTMAP_LAYER", "NUWAX_RTABMAP_COSTMAP_LAYER", "nuwax_global_costmap"
+                ),
+                traversability_layer=_resolve_alias_env_value_with_hit(
+                    "NUWAX_MAPPING_TRAVERSABILITY_LAYER", "NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"
+                ),
+                localization_status=_resolve_legacy_localization_status(
+                    _resolve_alias_env_value_with_hit(
+                        "NUWAX_MAPPING_LOCALIZATION_STATUS", "NUWAX_RTABMAP_LOCALIZATION_STATUS", "mapping_localization"
+                    )
+                ),
+                relocalization_diagnostics=_resolve_legacy_relocalization_diagnostics(
+                    _resolve_alias_env_value_with_hit(
+                        "NUWAX_MAPPING_RELOCALIZATION_DIAGNOSTICS", "NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "mapping_icp"
+                    )
+                ),
             ),
         ),
         navigation=NavigationBackendConfig(

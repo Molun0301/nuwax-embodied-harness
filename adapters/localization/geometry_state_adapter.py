@@ -1,6 +1,9 @@
 """几何后端定位状态适配器。
 
-将 RTAB-Map、Nav2 或 Go2 SDK 的定位状态映射到平台 LocalizationSessionStatus。
+将 mapping_backend（nuwax-mapping 板块）/ robot_localization / Go2 SDK 的定位状态
+映射到平台 LocalizationSessionStatus。Nav2/RTAB-Map 时代的 enum 值已 drop-ros2
+阶段 0 物理删除；旧 `rtabmap` 字面值走 `services/localization/service.py`
+的 `LEGACY_BACKEND_TYPE_ALIAS` 反查。
 """
 from __future__ import annotations
 
@@ -14,10 +17,16 @@ from contracts.runtime_views import LocalizationSessionStatus
 
 
 class BackendLocalizationState(ContractModel):
-    """后端定位状态原始数据。"""
+    """后端定位状态原始数据。
+
+    v4 R-N14 Phase 1 §3.1.5:`backend_type` 枚举值归一为 `mapping_backend` /
+    `go2_sdk` / `robot_localization`;旧 `rtabmap` 字面值走
+    `LEGACY_BACKEND_TYPE_ALIAS` 反查并打 telemetry 计数(详见
+    `services/localization/service.py:_resolve_backend_type`)。
+    """
 
     backend_name: str = ""
-    backend_type: str = "unknown"  # rtabmap, nav2, go2_sdk, robot_localization
+    backend_type: str = "unknown"  # mapping_backend, robot_localization, go2_sdk (legacy: rtabmap → mapping_backend via LEGACY_BACKEND_TYPE_ALIAS)
     pose_available: bool = False
     tracking_state: str = "unknown"  # tracking, lost, relocalizing, initialization
     map_loaded: bool = False
@@ -56,7 +65,7 @@ class GeometryLocalizationStateMapping:
             return self._map_rtabmap_state(backend_state)
         elif self.backend_type == "go2_sdk":
             return self._map_go2_sdk_state(backend_state)
-        elif self.backend_type in ("nav2", "robot_localization"):
+        elif self.backend_type == "robot_localization":
             return self._map_generic_odom_state(backend_state)
         else:
             return self._map_generic_state(backend_state)
@@ -124,7 +133,7 @@ class GeometryLocalizationStateMapping:
         self,
         backend_state: BackendLocalizationState,
     ) -> LocalizationSessionStatus:
-        """映射通用里程计状态（Nav2/robot_localization）。"""
+        """映射通用里程计状态（robot_localization;旧 Nav2 链路已 drop-ros2）。"""
 
         if backend_state.pose_available:
             return LocalizationSessionStatus.READY
@@ -156,11 +165,20 @@ class GeometryLocalizationStateMapping:
         return LocalizationSessionStatus.READY
 
 
-def create_rtabmap_state_mapping() -> GeometryLocalizationStateMapping:
-    """创建 RTAB-Map 状态映射规则。"""
+def create_mapping_state_mapping() -> GeometryLocalizationStateMapping:
+    """创建 mapping_backend 后端状态映射规则。
+
+    v4 R-N14 Phase 1 §3.1.5:返回的 `backend_type` 为 canonical `mapping_backend`
+    (替代旧 `rtabmap` 字面值);旧 `rtabmap` 走
+    `services/localization/service.py:_resolve_backend_type` 的
+    `LEGACY_BACKEND_TYPE_ALIAS` 反查。
+
+    历史函数名 `create_rtabmap_state_mapping` 保留作 B 类 alias,见底部 re-export
+    (1 个版本周期 + telemetry 触发清理)。
+    """
 
     return GeometryLocalizationStateMapping(
-        backend_type="rtabmap",
+        backend_type="mapping_backend",
         tracking_state_mappings={
             "initialization": LocalizationSessionStatus.LOCALIZING,
             "relocalizing": LocalizationSessionStatus.LOCALIZING,
@@ -169,6 +187,11 @@ def create_rtabmap_state_mapping() -> GeometryLocalizationStateMapping:
             "map_not_loaded": LocalizationSessionStatus.FAILED,
         },
     )
+
+
+# v4 R-N14 Phase 4 §3.1.5 B 类保留:旧函数名 alias re-export 1 个版本周期,
+# 触发 telemetry 后清理(`LEGACY_VERSIONJSON_VALUES[backend_type:rtabmap]` 计数)。
+create_rtabmap_state_mapping = create_mapping_state_mapping
 
 
 def create_go2_sdk_state_mapping() -> GeometryLocalizationStateMapping:
@@ -204,8 +227,10 @@ def map_backend_state_to_platform_status(
     """将任意后端定位状态映射到平台状态。"""
 
     # 根据后端类型选择映射规则
-    if backend_state.backend_type == "rtabmap":
-        mapping = create_rtabmap_state_mapping()
+    # v4 R-N14 Phase 4:旧 `rtabmap` 字面值由 service.py:_resolve_backend_type 的
+    # LEGACY_BACKEND_TYPE_ALIAS 在上游反查为 `mapping_backend`,此处只接 canonical 名。
+    if backend_state.backend_type == "mapping_backend":
+        mapping = create_mapping_state_mapping()
     elif backend_state.backend_type == "go2_sdk":
         mapping = create_go2_sdk_state_mapping()
     else:

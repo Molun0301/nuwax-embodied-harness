@@ -167,21 +167,30 @@ class GeometryTraversabilityFilterConfig:
 
 
 @dataclass
-class RtabmapOutputConfig:
-    """RTAB-Map 输出资产与诊断摘要配置。"""
+class MappingOutputConfig:
+    """nuwax-mapping 输出资产与诊断摘要配置。
+
+    v4 rename (R-N14 Phase 1):从 `RtabmapOutputConfig` 平移为 `MappingOutputConfig`。
+    旧类名作为 alias 保留 1 个版本周期,详见 `services/geometry/config.py`。
+    """
 
     database_asset_name: str = "nuwax_mapping_state.db"
     pcd_asset_name: str = "cloud_map.pcd"
     occupancy_layer: str = "occupancy_grid"
     costmap_layer: str = "nav_global_costmap"
     traversability_layer: str = "traversability"
-    localization_status: str = "rtabmap_localization"
-    relocalization_diagnostics: str = "rtabmap_icp"
+    localization_status: str = "mapping_localization"
+    relocalization_diagnostics: str = "mapping_icp"
 
 
 @dataclass
-class RtabmapConfig:
-    """RTAB-Map 状态与输出配置（由 nuwax-mapping crate 提供底层能力）。"""
+class MappingBackendConfig:
+    """nuwax-mapping 后端状态与输出配置（由 nuwax-mapping crate 提供底层能力）。
+
+    v4 rename (R-N14 Phase 1):从 `RtabmapConfig` 平移为 `MappingBackendConfig`,
+    字段一一对齐 nuwax-mapping crate wire-format 命名。旧类名作为 alias 保留
+    1 个版本周期,详见 `services/geometry/config.py`。
+    """
 
     profile_name: str = "nuwax_mapping"
     profile_enabled: bool = True
@@ -196,7 +205,7 @@ class RtabmapConfig:
     point_cloud_preprocess: GeometryPointCloudPreprocessConfig = field(default_factory=GeometryPointCloudPreprocessConfig)
     odometry_quality: GeometryOdometryQualityConfig = field(default_factory=GeometryOdometryQualityConfig)
     traversability_filter: GeometryTraversabilityFilterConfig = field(default_factory=GeometryTraversabilityFilterConfig)
-    outputs: RtabmapOutputConfig = field(default_factory=RtabmapOutputConfig)
+    outputs: MappingOutputConfig = field(default_factory=MappingOutputConfig)
 
 
 @dataclass
@@ -365,7 +374,7 @@ class PlatformGeometryConfig:
     nuwax_workspace_dir: str = field(default_factory=build_default_nuwax_workspace_dir)
     topics: GeometryTopicsConfig = field(default_factory=GeometryTopicsConfig)
     frames: GeometryFrameConfig = field(default_factory=GeometryFrameConfig)
-    rtabmap: RtabmapConfig = field(default_factory=RtabmapConfig)
+    mapping: MappingBackendConfig = field(default_factory=MappingBackendConfig)
     navigation: NavigationBackendConfig = field(default_factory=NavigationBackendConfig)
     external: ExternalGeometryStackConfig = field(default_factory=ExternalGeometryStackConfig)
     lcm_channels: LcmChannelConfig = field(default_factory=LcmChannelConfig)
@@ -383,9 +392,9 @@ class PlatformGeometryConfig:
             "lcm_backend": self.lcm_backend,
             "nuwax_workspace_dir": self.nuwax_workspace_dir,
             "profile": {
-                "name": self.rtabmap.profile_name,
-                "enabled": self.rtabmap.profile_enabled,
-                "default": self.rtabmap.default_profile,
+                "name": self.mapping.profile_name,
+                "enabled": self.mapping.profile_enabled,
+                "default": self.mapping.default_profile,
                 "provider": NAVIGATION_BACKEND_NAME,
                 "stack": self.stack,
             },
@@ -407,35 +416,35 @@ class PlatformGeometryConfig:
                 "imu_frame": self.frames.imu_frame,
             },
             "input_contract": {
-                "name": self.rtabmap.input_contract,
+                "name": self.mapping.input_contract,
                 "point_cloud": {
                     "topic": self.topics.point_cloud_topic,
                     "frame": self.frames.lidar_frame,
-                    "timestamp_source": self.rtabmap.timestamp_quality.source,
-                    "max_age_sec": self.rtabmap.timestamp_quality.max_point_cloud_age_sec,
+                    "timestamp_source": self.mapping.timestamp_quality.source,
+                    "max_age_sec": self.mapping.timestamp_quality.max_point_cloud_age_sec,
                     "preprocess": {
-                        "enabled": self.rtabmap.point_cloud_preprocess.enabled,
-                        "voxel_size_m": self.rtabmap.point_cloud_preprocess.voxel_size_m,
-                        "min_range_m": self.rtabmap.point_cloud_preprocess.min_range_m,
-                        "max_range_m": self.rtabmap.point_cloud_preprocess.max_range_m,
-                        "max_points_per_scan": self.rtabmap.point_cloud_preprocess.max_points_per_scan,
-                        "crop_min_z_m": self.rtabmap.point_cloud_preprocess.crop_min_z_m,
-                        "crop_max_z_m": self.rtabmap.point_cloud_preprocess.crop_max_z_m,
-                        "crop_forward_min_m": self.rtabmap.point_cloud_preprocess.crop_forward_min_m,
-                        "crop_forward_max_m": self.rtabmap.point_cloud_preprocess.crop_forward_max_m,
-                        "crop_lateral_m": self.rtabmap.point_cloud_preprocess.crop_lateral_m,
+                        "enabled": self.mapping.point_cloud_preprocess.enabled,
+                        "voxel_size_m": self.mapping.point_cloud_preprocess.voxel_size_m,
+                        "min_range_m": self.mapping.point_cloud_preprocess.min_range_m,
+                        "max_range_m": self.mapping.point_cloud_preprocess.max_range_m,
+                        "max_points_per_scan": self.mapping.point_cloud_preprocess.max_points_per_scan,
+                        "crop_min_z_m": self.mapping.point_cloud_preprocess.crop_min_z_m,
+                        "crop_max_z_m": self.mapping.point_cloud_preprocess.crop_max_z_m,
+                        "crop_forward_min_m": self.mapping.point_cloud_preprocess.crop_forward_min_m,
+                        "crop_forward_max_m": self.mapping.point_cloud_preprocess.crop_forward_max_m,
+                        "crop_lateral_m": self.mapping.point_cloud_preprocess.crop_lateral_m,
                     },
                 },
                 "odometry": {
                     "primary_topic": self.topics.odom_topic,
                     "secondary_topics": self.topics.secondary_odom_topics,
                     "frame": self.frames.odom_frame,
-                    "max_age_sec": self.rtabmap.timestamp_quality.max_odom_age_sec,
+                    "max_age_sec": self.mapping.timestamp_quality.max_odom_age_sec,
                     "quality": {
-                        "source": self.rtabmap.odometry_quality.source,
-                        "require_covariance": self.rtabmap.odometry_quality.require_covariance,
-                        "max_linear_covariance": self.rtabmap.odometry_quality.max_linear_covariance,
-                        "max_angular_covariance": self.rtabmap.odometry_quality.max_angular_covariance,
+                        "source": self.mapping.odometry_quality.source,
+                        "require_covariance": self.mapping.odometry_quality.require_covariance,
+                        "max_linear_covariance": self.mapping.odometry_quality.max_linear_covariance,
+                        "max_angular_covariance": self.mapping.odometry_quality.max_angular_covariance,
                     },
                 },
                 "tf": {
@@ -445,41 +454,41 @@ class PlatformGeometryConfig:
                     "odom_frame": self.frames.odom_frame,
                     "base_frame": self.frames.base_frame,
                     "lidar_frame": self.frames.lidar_frame,
-                    "max_age_sec": self.rtabmap.timestamp_quality.max_tf_age_sec,
-                    "max_sensor_skew_sec": self.rtabmap.timestamp_quality.max_sensor_skew_sec,
-                    "require_monotonic": self.rtabmap.timestamp_quality.require_monotonic,
+                    "max_age_sec": self.mapping.timestamp_quality.max_tf_age_sec,
+                    "max_sensor_skew_sec": self.mapping.timestamp_quality.max_sensor_skew_sec,
+                    "require_monotonic": self.mapping.timestamp_quality.require_monotonic,
                 },
             },
             "preprocessing": {
                 "point_cloud": {
-                    "enabled": self.rtabmap.point_cloud_preprocess.enabled,
-                    "voxel_size_m": self.rtabmap.point_cloud_preprocess.voxel_size_m,
+                    "enabled": self.mapping.point_cloud_preprocess.enabled,
+                    "voxel_size_m": self.mapping.point_cloud_preprocess.voxel_size_m,
                     "crop_z_m": (
-                        self.rtabmap.point_cloud_preprocess.crop_min_z_m,
-                        self.rtabmap.point_cloud_preprocess.crop_max_z_m,
+                        self.mapping.point_cloud_preprocess.crop_min_z_m,
+                        self.mapping.point_cloud_preprocess.crop_max_z_m,
                     ),
                     "crop_forward_m": (
-                        self.rtabmap.point_cloud_preprocess.crop_forward_min_m,
-                        self.rtabmap.point_cloud_preprocess.crop_forward_max_m,
+                        self.mapping.point_cloud_preprocess.crop_forward_min_m,
+                        self.mapping.point_cloud_preprocess.crop_forward_max_m,
                     ),
-                    "crop_lateral_m": self.rtabmap.point_cloud_preprocess.crop_lateral_m,
+                    "crop_lateral_m": self.mapping.point_cloud_preprocess.crop_lateral_m,
                 },
                 "traversability_filter": {
-                    "enabled": self.rtabmap.traversability_filter.enabled,
-                    "max_slope_deg": self.rtabmap.traversability_filter.max_slope_deg,
-                    "max_step_height_m": self.rtabmap.traversability_filter.max_step_height_m,
-                    "min_traversability_score": self.rtabmap.traversability_filter.min_traversability_score,
-                    "output_layer": self.rtabmap.traversability_filter.output_layer,
+                    "enabled": self.mapping.traversability_filter.enabled,
+                    "max_slope_deg": self.mapping.traversability_filter.max_slope_deg,
+                    "max_step_height_m": self.mapping.traversability_filter.max_step_height_m,
+                    "min_traversability_score": self.mapping.traversability_filter.min_traversability_score,
+                    "output_layer": self.mapping.traversability_filter.output_layer,
                 },
             },
-            "rtabmap": {
-                "profile_name": self.rtabmap.profile_name,
-                "profile_enabled": self.rtabmap.profile_enabled,
-                "default_profile": self.rtabmap.default_profile,
-                "database_root": self.rtabmap.database_root,
-                "pcd_root": self.rtabmap.pcd_root,
-                "mapping_crate": self.rtabmap.mapping_crate,
-                "occupancy_projection": self.rtabmap.occupancy_projection,
+            "mapping": {
+                "profile_name": self.mapping.profile_name,
+                "profile_enabled": self.mapping.profile_enabled,
+                "default_profile": self.mapping.default_profile,
+                "database_root": self.mapping.database_root,
+                "pcd_root": self.mapping.pcd_root,
+                "mapping_crate": self.mapping.mapping_crate,
+                "occupancy_projection": self.mapping.occupancy_projection,
             },
             "external_geometry": {
                 "enabled": self.external.enabled,
@@ -507,15 +516,15 @@ class PlatformGeometryConfig:
                 "cloud_map": self.lcm_channels.cloud_map,
             },
             "output_contract": {
-                "name": self.rtabmap.output_contract,
-                "database_asset_name": self.rtabmap.outputs.database_asset_name,
-                "pcd_asset_name": self.rtabmap.outputs.pcd_asset_name,
-                "occupancy_layer": self.rtabmap.outputs.occupancy_layer,
-                "costmap_layer": self.rtabmap.outputs.costmap_layer,
-                "traversability_layer": self.rtabmap.outputs.traversability_layer,
-                "localization_status": self.rtabmap.outputs.localization_status,
-                "relocalization_diagnostics": self.rtabmap.outputs.relocalization_diagnostics,
-                "navigable_layer": self.rtabmap.occupancy_projection,
+                "name": self.mapping.output_contract,
+                "database_asset_name": self.mapping.outputs.database_asset_name,
+                "pcd_asset_name": self.mapping.outputs.pcd_asset_name,
+                "occupancy_layer": self.mapping.outputs.occupancy_layer,
+                "costmap_layer": self.mapping.outputs.costmap_layer,
+                "traversability_layer": self.mapping.outputs.traversability_layer,
+                "localization_status": self.mapping.outputs.localization_status,
+                "relocalization_diagnostics": self.mapping.outputs.relocalization_diagnostics,
+                "navigable_layer": self.mapping.occupancy_projection,
             },
             "navigation": {
                 "goal_channel": self.navigation.goal_channel,

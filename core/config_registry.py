@@ -105,6 +105,31 @@ def _parse_settings_keys(path: Path, target_file: str) -> Dict[str, _RawKey]:
                         default_repr = _node_source(args[2], source)
                 raw.setdefault(key, _RawKey(key, "str", default_repr, None, target_file))
             continue
+        if fn == "_resolve_alias_env_value_with_hit":
+            # v4 R-N14 Phase 1 §3.1.3:解析 `NUWAX_MAPPING_X` 17 键裸名。
+            # 形参:_resolve_alias_env_value_with_hit("PREFERRED", "LEGACY", default)
+            # 注册表使用 `PREFERRED`(新名),alias_of = LEGACY 旧名。
+            args = node.args
+            if (
+                len(args) >= 2
+                and isinstance(args[0], ast.Constant)
+                and isinstance(args[0].value, str)
+                and isinstance(args[1], ast.Constant)
+                and isinstance(args[1].value, str)
+            ):
+                key = args[0].value
+                legacy_key = args[1].value
+                default_repr = ""
+                if len(args) >= 3:
+                    try:
+                        default_repr = repr(ast.literal_eval(args[2]))
+                    except Exception:
+                        default_repr = _node_source(args[2], source)
+                raw.setdefault(
+                    key,
+                    _RawKey(key, "str", default_repr, legacy_key, target_file),
+                )
+            continue
         if not fn.startswith("_cfg_"):
             continue
         typ = fn.replace("_cfg_", "").replace("_alias", "")
@@ -152,7 +177,7 @@ SECTIONS: Tuple[Tuple[str, str], ...] = (
     ("geometry_runtime", "几何引擎·运行时与 LCM"),
     ("geometry_topics", "几何引擎·话题与坐标系"),
     ("geometry_quality", "几何引擎·点云与质量"),
-    ("rtabmap", "建图（RTAB-Map）"),
+    ("mapping", "建图（nuwax-mapping 板块）"),
     ("nav_stack", "导航（nuwax-nav-stack）"),
     ("lcm", "LCM channel 与 workspace 路径"),
     ("external_geometry", "外部几何栈与桥接"),
@@ -178,7 +203,7 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("gateway", ("NUWAX_GATEWAY",)),
     ("relay", ("NUWAX_RELAY",)),
     ("logging", ("NUWAX_LOG", "GO2_PROXY_LOG")),
-    ("rtabmap", ("NUWAX_RTABMAP",)),
+    ("mapping", ("NUWAX_MAPPING",)),
     ("nav_stack", ("NUWAX_NAV_",)),
     ("geometry_runtime", ("NUWAX_GEOMETRY_RUNTIME",)),
     ("lcm", ("NUWAX_LCM", "NUWAX_NUWAX_WORKSPACE_DIR")),
@@ -224,7 +249,7 @@ _REGULAR_KEYS = frozenset({
     "NUWAX_GATEWAY_TELEMETRY_ENABLED", "NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC",
     "NUWAX_LOG_LEVEL",
     "NUWAX_GEOMETRY_ENABLED",
-    "NUWAX_RTABMAP_PROFILE_NAME", "NUWAX_RTABMAP_PROFILE_ENABLED",
+    "NUWAX_MAPPING_PROFILE_NAME", "NUWAX_MAPPING_PROFILE_ENABLED",
     "NUWAX_GEOMETRY_EXTERNAL_ENABLED",
     "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED", "NUWAX_PERCEPTION_YOLO_WORLD_CONFIDENCE",
     "NUWAX_PERCEPTION_STREAM_AUTO_START",
@@ -357,23 +382,23 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M": "可通行最大台阶高度（米）",
     "NUWAX_GEOMETRY_TRAVERSABILITY_OUTPUT_LAYER": "可通行性输出图层",
 
-    # 建图（RTAB-Map / nuwax-mapping）
-    "NUWAX_RTABMAP_PROFILE_NAME": "RTAB-Map 配置名称",
-    "NUWAX_RTABMAP_PROFILE_ENABLED": "启用 RTAB-Map 建图",
-    "NUWAX_RTABMAP_DEFAULT_PROFILE": "使用默认 RTAB-Map 配置",
-    "NUWAX_RTABMAP_DATABASE_ROOT": "RTAB-Map 数据库目录",
-    "NUWAX_RTABMAP_PCD_ROOT": "RTAB-Map 点云地图目录",
-    "NUWAX_RTABMAP_MAPPING_CRATE": "RTAB-Map 映射 crate 名",
-    "NUWAX_RTABMAP_OCCUPANCY_PROJECTION": "RTAB-Map 占据投影名称",
-    "NUWAX_RTABMAP_INPUT_CONTRACT": "RTAB-Map 输入契约",
-    "NUWAX_RTABMAP_OUTPUT_CONTRACT": "RTAB-Map 输出契约",
-    "NUWAX_RTABMAP_DATABASE_ASSET_NAME": "RTAB-Map 数据库制品名称",
-    "NUWAX_RTABMAP_PCD_ASSET_NAME": "RTAB-Map 点云地图制品名称",
-    "NUWAX_RTABMAP_OCCUPANCY_LAYER": "RTAB-Map 占据栅格图层",
-    "NUWAX_RTABMAP_COSTMAP_LAYER": "RTAB-Map 代价地图图层",
-    "NUWAX_RTABMAP_TRAVERSABILITY_LAYER": "RTAB-Map 可通行性图层",
-    "NUWAX_RTABMAP_LOCALIZATION_STATUS": "RTAB-Map 定位状态字段名",
-    "NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS": "RTAB-Map 重定位诊断字段名",
+    # 建图（nuwax-mapping 板块,替代旧 RTAB-Map / 17 键 NUWAX_RTABMAP_* 全部已迁移至 NUWAX_MAPPING_*）
+    "NUWAX_MAPPING_PROFILE_NAME": "nuwax-mapping 配置名称",
+    "NUWAX_MAPPING_PROFILE_ENABLED": "启用 nuwax-mapping 建图",
+    "NUWAX_MAPPING_DEFAULT_PROFILE": "使用默认 nuwax-mapping 配置",
+    "NUWAX_MAPPING_DATABASE_ROOT": "nuwax-mapping 数据库目录",
+    "NUWAX_MAPPING_PCD_ROOT": "nuwax-mapping 点云地图目录",
+    "NUWAX_MAPPING_CRATE": "nuwax-mapping crate 名",
+    "NUWAX_MAPPING_OCCUPANCY_PROJECTION": "nuwax-mapping 占据投影名称",
+    "NUWAX_MAPPING_INPUT_CONTRACT": "nuwax-mapping 输入契约",
+    "NUWAX_MAPPING_OUTPUT_CONTRACT": "nuwax-mapping 输出契约",
+    "NUWAX_MAPPING_DATABASE_ASSET_NAME": "nuwax-mapping 数据库制品名称",
+    "NUWAX_MAPPING_PCD_ASSET_NAME": "nuwax-mapping 点云地图制品名称",
+    "NUWAX_MAPPING_OCCUPANCY_LAYER": "nuwax-mapping 占据栅格图层",
+    "NUWAX_MAPPING_COSTMAP_LAYER": "nuwax-mapping 代价地图图层",
+    "NUWAX_MAPPING_TRAVERSABILITY_LAYER": "nuwax-mapping 可通行性图层",
+    "NUWAX_MAPPING_LOCALIZATION_STATUS": "nuwax-mapping 定位状态字段名",
+    "NUWAX_MAPPING_RELOCALIZATION_DIAGNOSTICS": "nuwax-mapping 重定位诊断字段名",
 
     # 导航（nuwax-nav-stack，替代旧 Nav2 action provider）
     "NUWAX_NAV_AUTOSTART": "自动启动导航后端",

@@ -1,10 +1,12 @@
 """闭环检测状态（LoopClosureState）。
 
 用途：
-- 持久化 RTAB-Map 闭环检测信号，供 `_metadata_indicates_exploration_done` 第 8 条判据使用；
-- 在 `/rtabmap/info` topic 不可用（HIL 验证后）时降级到 SQLite DB 查询；
-- 严格遵循 services 层不订阅 ROS topic、不引入 services 层硬依赖 rclpy 的边界（参照
-  memory `nuwax-layering-governance-boundaries.md`）。
+- 持久化 mapping（nuwax-mapping 板块，RTAB-Map 算法 Rust 移植）闭环检测信号，
+  供 `_metadata_indicates_exploration_done` 第 8 条判据使用；
+- 主路径 LCM `/explore/loop_closure` channel（由 nuwax-geometry-runtime 推送）；
+  HIL fallback 路径走 SQLite DB 查询（SQLite RTAB-Map 兼容格式）；
+- 严格遵循 services 层不订阅 ROS topic、不引入 services 层硬依赖 ROS2 Python 客户端库
+  的边界（参照 memory `nuwax-layering-governance-boundaries.md`）。
 
 约定：
 - `confidence = min(loop_closure_count / threshold, 1.0)`，单调上升但不放大；

@@ -349,6 +349,24 @@
   category: migration_doc_block
   reason: "4.5 step B 增量：_ZH_NAMES 注册段上方注释行，提及不再走旧 rclpy/Nav2。纯迁移背景说明。"
 
+# R-N14-3 增量:R-N14 v4 Phase 3 新增的 nav profile / explore arbitration / real-lcm 硬约束注释
+- file: core/config_registry.py
+  line: 417
+  category: migration_doc_block
+  reason: "R-N14-3 增量:_ZH_NAMES 注册段 _ZH_NAMES Phase 6 注释续行（行号从 392 漂移到 417），仍说明对接 nuwax-geometry-runtime (Rust) 装配面,不再走旧 rclpy/Nav2。属反向锚点文档。"
+
+# R-N14-3 增量:_build_launch_prefix 注释改写后含 /opt/ros 字面,作 B 类保留
+- file: services/geometry/runtime.py
+  line: 1081
+  category: migration_doc_block
+  reason: "R-N14-3 增量:_build_launch_prefix 注释,说明 ROS2 bash 前置脚本已下线。提及 /opt/ros 探测历史字面。属反向锚点文档。"
+
+# R-N14-3 增量:subscribe_localization_updates 注释改写后 RMW_IMPLEMENTATION 漂移(原 line 4400 / 4427 已登记)
+- file: services/geometry/runtime.py
+  line: 4728
+  category: migration_doc_block
+  reason: "R-N14-3 增量:subscribe_localization_updates 注释,RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 风险说明（line 4400/4427 已登记,本条因重构行号漂移到 4728）。属反向锚点文档。"
+
 - file: scripts/bootstrap.py
   line: 587
   category: migration_doc_block
@@ -433,3 +451,25 @@
   line: 226
   category: rust_toml_header
   reason: "4.5 step B 增量：Cargo workspace header 注释,提及 C7 硬约束 rmw_*/cyclonedds/libddsc*/r2r 禁入。属强约束反向锚点。"
+
+# R-N14-8.0 stub 增量:5 个 Phase 8.0 stub 脚本,文件名/字符串含 nav/explore/api 等保留字,可能触发守门误报
+- file: scripts/ci/smoke_explore_lcm_channels.sh
+  line: 7
+  category: phase_stub_script
+  reason: "Phase R-N14-8.0 stub：smoke_explore_lcm_channels.sh stub 内容,仅 echo 输出 EXPECTED_CHANNELS 列表,不调用任何 rclpy/Nav2。"
+- file: scripts/ci/smoke_navigation_goal_lifecycle.sh
+  line: 5
+  category: phase_stub_script
+  reason: "Phase R-N14-8.0 stub：smoke_navigation_goal_lifecycle.sh stub 内容,仅 echo 输出 EXPECTED_ENDPOINTS 列表(/api/navigation/*),不调用任何 rclpy/Nav2。"
+- file: scripts/ci/smoke_api_health_full.sh
+  line: 4
+  category: phase_stub_script
+  reason: "Phase R-N14-8.0 stub：smoke_api_health_full.sh stub 内容,仅 echo 输出 schema 字段名,不调用任何 ROS2/cyclonedds。"
+- file: scripts/ci/check_pointcloud_payload_size.sh
+  line: 5
+  category: phase_stub_script
+  reason: "Phase R-N14-8.0 stub：check_pointcloud_payload_size.sh stub 内容,仅 echo 输出 VmRSS cap 常量,不订阅任何 ROS topic。"
+- file: scripts/ci/check_alias_telemetry.sh
+  line: 5
+  category: phase_stub_script
+  reason: "Phase R-N14-8.0 stub：check_alias_telemetry.sh stub 内容,仅 echo 输出 COUNTER_FILE 路径,不读 telemetry 真实数据。"

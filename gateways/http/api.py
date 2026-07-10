@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
+import json
 from typing import Dict, Optional, Any
 
 from fastapi import APIRouter
@@ -8,6 +11,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
 from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from gateways.auth import GatewayAccessManager
@@ -24,6 +28,35 @@ class CapabilityInvokeRequest(BaseModel):
     """能力调用请求体。"""
 
     arguments: Dict[str, Any] = Field(default_factory=dict, description="调用参数。")
+
+
+class NavigationGoalStub(BaseModel):
+    """导航目标点请求(R-N14 stub)。"""
+
+    model_config = {"extra": "forbid"}
+
+    goal_id: str = Field(..., description="客户端生成的 goal 标识。")
+    pose: Dict[str, Any] = Field(default_factory=dict, description="stub:简化的位姿字典。")
+    frame_id: str = Field(default="map", description="位姿所在的坐标系。")
+
+
+class NavigationState(BaseModel):
+    """导航状态(R-N14 stub)。"""
+
+    model_config = {"extra": "forbid"}
+
+    state: str = Field(default="ACCEPTED", description="ACCEPTED / EXECUTING / SUCCEEDED / CANCELED / FAILED。")
+    goal_id: str = Field(..., description="关联的 goal 标识。")
+    message: str = Field(default="", description="附加状态说明。")
+    timestamp: Optional[str] = Field(default=None, description="状态时间戳 ISO-8601。")
+
+
+class NavigationCancelRequest(BaseModel):
+    """导航取消请求(R-N14 stub)。"""
+
+    model_config = {"extra": "forbid"}
+
+    goal_id: str = Field(..., description="待取消的 goal 标识。")
 
 
 def _stream_migration_response(*topics: str) -> JSONResponse:
@@ -261,6 +294,27 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_health(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         return await run_in_threadpool(lambda: to_jsonable(runtime.get_health_summary()))
+
+    @router.get("/api/health/full")
+    async def api_health_full(request: Request) -> Dict[str, Any]:
+        """R-N14 stub:聚合 geometry_runtime / nuwax_nav_stack / lcm / connected_channels。
+
+        阶段:stub。返回固定数据,不依赖 nuwax-geometry-runtime gRPC 客户端。
+        """
+        access_manager.authenticate_http(request)
+        return {
+            "geometry_runtime": {"healthy": True, "binary": "nuwax-geometry-runtime"},
+            "lcm_backend": "real-lcm",
+            "connected_channels": [
+                "odom",
+                "tf",
+                "pointcloud",
+                "occupancy",
+                "frontier",
+            ],
+            "nuwax_nav_stack": {"healthy": True},
+            "version": "stub-R-N14-1",
+        }
 
     @router.get("/api/capabilities")
     async def api_capabilities(
@@ -684,6 +738,43 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access_manager.authenticate_http(request)
         return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
+    @router.post("/api/navigation/goal")
+    async def api_navigation_goal(request: Request, goal: NavigationGoalStub) -> Dict[str, Any]:
+        """R-N14 stub:接收 NavigationGoal,立即返回 ACCEPTED 状态。
+
+        阶段:stub。不调用 nuwax-nav-stack FFI,不订阅 LCM channel。
+        """
+        access_manager.authenticate_http(request)
+        return NavigationState(
+            state="ACCEPTED",
+            goal_id=goal.goal_id,
+            message="R-N14 stub:导航目标已接收,等待升级版 FFI 接入。",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ).model_dump(mode="json")
+
+    @router.get("/api/navigation/state")
+    async def api_navigation_state(request: Request) -> StreamingResponse:
+        """R-N14 stub SSE:每 1s 推送一帧 ACCEPTED 状态。
+
+        阶段:stub。不订阅 nuwax-nav-stack SubscribeNavigationState。
+        """
+
+        async def _stub_event_generator():
+            while True:
+                if await request.is_disconnected():
+                    break
+                payload = NavigationState(
+                    state="ACCEPTED",
+                    goal_id="stub-R-N14-1",
+                    message="R-N14 stub SSE 心跳。",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                ).model_dump(mode="json")
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(1.0)
+
+        access_manager.authenticate_http(request)
+        return StreamingResponse(_stub_event_generator(), media_type="text/event-stream")
+
     @router.get("/api/navigation/semantic_context")
     async def api_navigation_semantic_context(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
@@ -702,6 +793,22 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_navigation_history(request: Request, limit: int = 20) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
+
+    @router.post("/api/navigation/cancel")
+    async def api_navigation_cancel(
+        request: Request, body: NavigationCancelRequest
+    ) -> Dict[str, Any]:
+        """R-N14 stub:接收 goal_id,立即返回 CANCELED。
+
+        阶段:stub。不调用 nuwax-nav-stack FFI CancelNavigation。
+        """
+        access_manager.authenticate_http(request)
+        return {
+            "state": "CANCELED",
+            "goal_id": body.goal_id,
+            "message": "R-N14 stub:导航目标已标记 CANCELED,等待升级版 FFI 接入。",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     @router.get("/api/memory/summary")
     async def api_memory_summary(request: Request) -> Dict[str, Any]:

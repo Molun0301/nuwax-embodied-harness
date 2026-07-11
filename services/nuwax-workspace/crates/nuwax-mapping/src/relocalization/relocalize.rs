@@ -244,10 +244,122 @@ pub fn filter_upright(candidates: &[Isometry3<f64>], max_tilt_deg: f64) -> Vec<I
 /// ```ignore
 /// let keep = wall_subset_mask(&normals, WALL_NORMAL_Z_MAX);
 /// let walls: Vec<Point3<f64>> = points.iter().zip(keep.iter())
-///     .filter_map(|(p, &k)| k.then_some(*p)).collect();
+/// .filter_map(|(p, &k)| k.then_some(*p)).collect();
 /// ```
 pub fn wall_subset_mask(normals: &[Vector3<f64>], threshold: f64) -> Vec<bool> {
     normals.iter().map(|n| n.z.abs() < threshold).collect()
+}
+
+// =====================================================================
+// H-9 stubs：FPFH 描述子 + RANSAC + 多阶段 ICP 入口（完整实装留 P2）
+// =====================================================================
+
+/// FPFH（Fast Point Feature Histogram）描述子 — 占位
+///
+/// 对齐 dimos `_preprocess` 中 FPFH 计算。本期仅返回 `Vec<f32>` 占位（长度 0）；
+/// 真实 FPFH（33 维直方图）实装需 normals + kd-tree + 角度 binning，留 P2。
+///
+/// TODO(audit H-9): 接 Open3D `compute_fpfh_feature` 或自研 33-bin hist
+#[must_use]
+pub fn compute_fpfh_stub(_points: &[Point3<f64>], _normals: &[Vector3<f64>]) -> Vec<f32> {
+    Vec::new()
+}
+
+/// RANSAC 单次拟合：随机采样 3 对对应点 + SVD best-fit → 刚体变换（占位）
+///
+/// 完整 RANSAC 含：
+/// 1. 随机采样 3 对（最小刚体拟合样本）
+/// 2. SVD best-fit 求变换
+/// 3. 评估 inlier 数（残差 < inlier_threshold）
+/// 4. 迭代 max_iters 次或 best_inlier_count 稳定
+///
+/// 本期只暴露入口签名为 caller 接入对齐，实装用 `IcpSolver::align` 的单次 best-fit
+/// 近似（用所有点而非 RANSAC 子集），正确率会偏低但语义对齐。
+///
+/// TODO(audit H-9): 真 RANSAC 留 P2
+#[must_use]
+pub fn ransac_align_stub(
+    source: &[Point3<f64>],
+    target: &[Point3<f64>],
+    max_iters: usize,
+    inlier_threshold: f64,
+) -> Isometry3<f64> {
+    let _ = (max_iters, inlier_threshold);
+    let solver = IcpSolver::default();
+    let result = solver.align(source, target);
+    result.transformation
+}
+
+/// 多阶段 ICP（粗→细）— 占位入口
+///
+/// 完整 multi-scale：粗尺度（max_corr 大）→ 细尺度（max_corr 小）串接，
+/// 每阶段用上一阶段结果初始化下一阶段。
+///
+/// 本期实装：两次串接（粗 1.0m → 细 0.1m），符合 dimos `multi_scale_icp` 入口语义。
+///
+/// TODO(audit H-9): 全阶段实装 + scale-aware 接受阈值留 P2
+#[must_use]
+pub fn multiscale_icp(
+    source: &[Point3<f64>],
+    target: &[Point3<f64>],
+    coarse_distance: f64,
+    fine_distance: f64,
+) -> IcpResult {
+    // 阶段 1：粗尺度（max_corr = coarse_distance）
+    let coarse_cfg = IcpConfig {
+        max_correspondence_distance: coarse_distance,
+        ..IcpConfig::default()
+    };
+    let coarse = IcpSolver::new(coarse_cfg).align(source, target);
+
+    // 阶段 2：用粗变换初始化 + 细尺度（max_corr = fine_distance）
+    let fine_cfg = IcpConfig {
+        max_correspondence_distance: fine_distance,
+        ..IcpConfig::default()
+    };
+    let transformed: Vec<Point3<f64>> = source
+        .iter()
+        .map(|p| coarse.transformation * p)
+        .collect();
+    let fine = IcpSolver::new(fine_cfg).align(&transformed, target);
+
+    // 合并：total = fine * coarse
+    IcpResult {
+        transformation: fine.transformation * coarse.transformation,
+        mse: fine.mse,
+        iterations: coarse.iterations + fine.iterations,
+        converged: fine.converged,
+    }
+}
+
+/// 完整 relocation pipeline（FPFH + RANSAC + multi-scale ICP）— stub
+///
+/// 对应 dimos `RelocalizationModule._preprocess` + `_ransac` + `multi_scale_icp` 全链路。
+/// 本期骨架版只走 multi-scale ICP + gravity filter；FPFH/RANSAC 留 P2。
+///
+/// TODO(audit H-9): 接 FPFH 描述子 + 真 RANSAC 留 P2（不影响本期 compile/run）
+#[must_use]
+pub fn relocation_pipeline(
+    source: &[Point3<f64>],
+    target: &[Point3<f64>],
+) -> IcpResult {
+    // 步骤 1：FPFH stub（暂时返回空 → 后续 RANSAC 直接走 ICP）
+    let _fpfh = compute_fpfh_stub(source, &[]);
+
+    // 步骤 2：multi-scale ICP（粗 1.0m → 细 0.1m）
+    let result = multiscale_icp(source, target, 1.0, 0.1);
+
+    // 步骤 3：gravity filter（z-tilt > 10° 视为异常 → 回退 identity）
+    if !is_upright(&result.transformation, GRAVITY_TILT_MAX_DEG) {
+        return IcpResult {
+            transformation: Isometry3::identity(),
+            mse: f64::INFINITY,
+            iterations: result.iterations,
+            converged: false,
+        };
+    }
+
+    result
 }
 
 #[cfg(test)]

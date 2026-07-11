@@ -25,6 +25,9 @@
 //! 6. **replay/smoke**:`--replay <rosbag>` 与 fixture 驱动 stack smoke test。
 //! 7. **依赖隔离**:默认 features 为空,所有 planner / bridge / visual / explore 都走可选 feature,
 //!    避免 stack 默认强依赖探索或其他板块。
+//! 8. **进程 owner(rework22 / P0-07)**:`StackRunner` 持有 `tokio::process::Child`
+//!    句柄,负责把所有 `NativeBridge` 节点 spawn 成真实 OS 进程并提供 SIGTERM
+//!    → 5s → SIGKILL 的优雅关闭链。算法实现仍归上游 crate,stack 不持有算法。
 //!
 //! ## 平台约束
 //!
@@ -42,6 +45,7 @@
 //! pub struct ModuleGraph         { nodes: Vec<ModuleNode> }
 //! pub struct ModuleNode          { id, kind, feature_gate, binary, inputs, outputs, depends_on }
 //! pub enum ModuleKind            { NativeBridge, RustAlgorithm, Visualizer, Recorder, GoalSource, Explorer }
+//! pub struct StackRunner         { graph, handles }  // P0-07 process owner
 //! ```
 //!
 //! ## 用法
@@ -49,7 +53,10 @@
 //! 1. 选择 profile 与 features,构建 `NavStackBuilder`。
 //! 2. 调用 `builder.build()` 得到 `ModuleGraph`,可在不启动真实进程的情况下检查拓扑。
 //! 3. 调用 `builder.dry_run()` 把 module graph 打印到 stdout。
-//! 4. 调用 `nav_stack_bin::run()` 启动 CLI,支持 `--dry-run` / `--replay <path>` / `--list-features`。
+//! 4. 调用 `builder.build_runner()` 得到 `StackRunner`(P0-07),
+//!    `.spawn_all().await` 拉起所有 native bridge 子进程,
+//!    `.shutdown().await` 优雅关闭。
+//! 5. 调用 `nav_stack_bin::run()` 启动 CLI,支持 `--dry-run` / `--replay <path>` / `--list-features`。
 //!
 //! ## 错误类型
 //!
@@ -67,6 +74,7 @@ pub mod graph;
 pub mod profile;
 pub mod profiles;
 pub mod replay;
+pub mod runner;
 pub mod topics;
 
 pub use builder::{NavStackBuilder, NavStackHandle};
@@ -74,6 +82,7 @@ pub use error::{NavStackError, NavStackResult};
 pub use features::{NavFeatureFlags, NavStackPreset};
 pub use graph::{ModuleGraph, ModuleKind, ModuleNode};
 pub use profile::NavStackProfile;
+pub use runner::StackRunner;
 pub use topics::{NavTopicConfig, TopicName};
 
 /// crate 版本,方便 dry-run 输出时报告。

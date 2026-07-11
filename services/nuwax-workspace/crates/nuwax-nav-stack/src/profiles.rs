@@ -19,6 +19,10 @@
 //!   即便对应 Cargo feature 未启用,dry-run 仍可输出。
 //! - 每个 profile 输出一份 module graph,代表方案 §0 / §3 中的 pipeline。
 //! - bridge 节点标注 `feature_gate` 与 native binary 路径,不启动真实进程。
+//!
+//! P0-08 修订:6 个 native bridge 的 typed `*Topics` 字段不再使用 `::default()`,
+//! 改为 `topic_map_for_node(...)` 从 `NavTopicConfig.topics` 复制真实 topic 名,
+//! 使 `native_spec.topics` / `bridge.argv()` 含 `--port topic` 参数。
 
 use crate::features::NavFeatureFlags;
 use crate::graph::{GraphEdge, ModuleGraph, ModuleKind, ModuleNode, NavFeatureFlagsMirror};
@@ -56,6 +60,95 @@ fn mirror_from_flags(f: &NavFeatureFlags) -> NavFeatureFlagsMirror {
     NavFeatureFlagsMirror::from_names(names)
 }
 
+// ---------- P0-08 NavTopicConfig -> typed *Topics helper ----------
+//
+// 旧实现直接 `*Topics::default()` (字段全 `Option::None`),导致
+// `to_topic_map()` 返回空 map,native bridge argv 不含 `--port topic`。
+// 新实现按节点 id 索引到 `NavTopicConfig.topics` 中对应的 port 名,
+// 显式 `Some(...)` 后传入 typed spec builder,保证 port->topic 进入 argv。
+
+/// 按 `node_id` 在 `NavTopicConfig.topics` 中查找一个 port 对应的 topic 字符串。
+///
+/// 找不到时回退到 `fallback`,便于 dry-run / 单测在 topics 缺失时仍能工作。
+#[allow(dead_code)] // 公开的 helper,部分测试可调用
+pub fn topic_for(topics: &NavTopicConfig, port: &str, fallback: &str) -> Option<String> {
+    let name = topics.get_or(port, fallback);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// 把 `NavTopicConfig` 中与指定 `node_id` 相关的几个 port 抽成 `(port, topic)` 列表。
+///
+/// 该函数是 P0-08 测试钩子:`topic_map_for_node("far_planner", &cfg)` 必须返回非空。
+#[must_use]
+pub fn topic_map_for_node(node_id: &str, topics: &NavTopicConfig) -> Vec<(String, String)> {
+    let ports: &[&str] = match node_id {
+        "terrain_analysis" => &["registered_scan", "odometry", "terrain_map"],
+        "pgo" => &[
+            "registered_scan",
+            "odometry",
+            "corrected_odometry",
+            "global_map",
+            "pgo_tf",
+        ],
+        "far_planner" => &[
+            "terrain_map_ext",
+            "terrain_map",
+            "registered_scan",
+            "odometry",
+            "goal",
+            "stop_movement",
+            "way_point",
+            "goal_path",
+            "graph_nodes",
+            "graph_edges",
+            "contour_polygons",
+            "nav_boundary",
+        ],
+        "local_planner" => &[
+            "registered_scan",
+            "odometry",
+            "terrain_map",
+            "joy_cmd",
+            "way_point",
+            "goal",
+            "speed",
+            "added_obstacles",
+            "check_obstacle",
+            "cancel_goal",
+            "path",
+            "effective_cmd_vel",
+            "free_paths",
+            "slow_down",
+            "goal_reached",
+        ],
+        "path_follower" => &[
+            "path",
+            "odometry",
+            "speed",
+            "slow_down",
+            "safety_stop",
+            "cmd_vel",
+        ],
+        "tare_planner" => &["registered_scan", "odometry", "way_point"],
+        _ => &[],
+    };
+    ports
+        .iter()
+        .filter_map(|p| {
+            let name = topics.get_or(p, p);
+            if name.is_empty() {
+                None
+            } else {
+                Some(((*p).to_string(), name.to_string()))
+            }
+        })
+        .collect()
+}
+
 // ---------- Native spec wiring (Phase E6 / R6 补全) ----------
 //
 // Phase E6 设计目标:
@@ -74,6 +167,11 @@ fn mirror_from_flags(f: &NavFeatureFlags) -> NavFeatureFlagsMirror {
 // 展开 typed `from_native_specs` 入口与 legacy 字符串路径,避免在 helper
 // 签名中硬编码 `nuwax_nav_native_runner::...` 类型,这样在 native-runner
 // feature 关闭时整个文件仍能编译。
+//
+// P0-08 修订:`*Topics::default()` 不再使用,改为 `topic_map_for_node(id, topics)`
+// 从 `NavTopicConfig.topics` 取真实 topic 名,然后通过 `XxxTopics { field: Some(...) }`
+// 构造 typed struct,确保 `to_topic_map()` 过滤后非空、`bridge.argv()` 含
+// `--port topic`。
 
 // ---------- Simple2D ----------
 
@@ -257,19 +355,26 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
     )
     .with_feature("native-terrain");
     #[cfg(all(feature = "native-runner", feature = "native-terrain"))]
-    let terrain_node = match nuwax_explore_terrain_bridge::build_specs(
-        nuwax_explore_terrain_bridge::TerrainAnalysisBridgeConfig::default(),
-        &nuwax_explore_terrain_bridge::TerrainAnalysisTopics::default(),
-    ) {
-        Ok((spec, build)) => ModuleNode::from_native_specs(
-            "terrain_analysis",
-            "Terrain Analysis",
-            ModuleKind::NativeBridge,
-            spec,
-            Some(build),
-        )
-        .with_feature("native-terrain"),
-        Err(_) => terrain_node.with_binary("result/bin/terrain_analysis"),
+    let terrain_node = {
+        let terrain_topics = nuwax_explore_terrain_bridge::TerrainAnalysisTopics {
+            registered_scan: topic_for(topics, "registered_scan", "registered_scan"),
+            odometry: topic_for(topics, "odometry", "odometry"),
+            terrain_map: topic_for(topics, "terrain_map", "terrain_map"),
+        };
+        match nuwax_explore_terrain_bridge::build_specs(
+            nuwax_explore_terrain_bridge::TerrainAnalysisBridgeConfig::default(),
+            &terrain_topics,
+        ) {
+            Ok((spec, build)) => ModuleNode::from_native_specs(
+                "terrain_analysis",
+                "Terrain Analysis",
+                ModuleKind::NativeBridge,
+                spec,
+                Some(build),
+            )
+            .with_feature("native-terrain"),
+            Err(_) => terrain_node.with_binary("result/bin/terrain_analysis"),
+        }
     };
     #[cfg(not(all(feature = "native-runner", feature = "native-terrain")))]
     let terrain_node = terrain_node.with_binary("result/bin/terrain_analysis");
@@ -296,17 +401,26 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
 
     // ---- pgo ----
     #[cfg(all(feature = "native-runner", feature = "native-pgo"))]
-    let pgo_node = ModuleNode::from_native_specs(
-        "pgo",
-        "PGO",
-        ModuleKind::NativeBridge,
-        nuwax_nav_pgo_bridge::build_spec(
-            nuwax_nav_pgo_bridge::PgoBridgeConfig::default(),
-            &nuwax_nav_pgo_bridge::PgoTopics::default(),
-        ),
-        None,
-    )
-    .with_feature("native-pgo");
+    let pgo_node = {
+        let pgo_topics = nuwax_nav_pgo_bridge::PgoTopics {
+            registered_scan: topic_for(topics, "registered_scan", "registered_scan"),
+            odometry: topic_for(topics, "odometry", "odometry"),
+            corrected_odometry: topic_for(topics, "corrected_odometry", "corrected_odometry"),
+            global_map: topic_for(topics, "global_map", "global_map"),
+            pgo_tf: topic_for(topics, "pgo_tf", "pgo_tf"),
+        };
+        ModuleNode::from_native_specs(
+            "pgo",
+            "PGO",
+            ModuleKind::NativeBridge,
+            nuwax_nav_pgo_bridge::build_spec(
+                nuwax_nav_pgo_bridge::PgoBridgeConfig::default(),
+                &pgo_topics,
+            ),
+            None,
+        )
+        .with_feature("native-pgo")
+    };
     #[cfg(not(all(feature = "native-runner", feature = "native-pgo")))]
     let pgo_node =
         ModuleNode::new("pgo", "PGO", ModuleKind::NativeBridge).with_binary("result/bin/pgo");
@@ -323,17 +437,33 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
 
     // ---- far_planner ----
     #[cfg(all(feature = "native-runner", feature = "native-far"))]
-    let far_node = ModuleNode::from_native_specs(
-        "far_planner",
-        "FAR Planner",
-        ModuleKind::NativeBridge,
-        nuwax_nav_far_planner_bridge::build_spec(
-            nuwax_nav_far_planner_bridge::FarPlannerBridgeConfig::default(),
-            &nuwax_nav_far_planner_bridge::FarPlannerTopics::default(),
-        ),
-        None,
-    )
-    .with_feature("native-far");
+    let far_node = {
+        let far_topics = nuwax_nav_far_planner_bridge::FarPlannerTopics {
+            terrain_map_ext: topic_for(topics, "terrain_map_ext", "terrain_map_ext"),
+            terrain_map: topic_for(topics, "terrain_map", "terrain_map"),
+            registered_scan: topic_for(topics, "registered_scan", "registered_scan"),
+            odometry: topic_for(topics, "odometry", "odometry"),
+            goal: topic_for(topics, "goal", "goal"),
+            stop_movement: topic_for(topics, "stop_movement", "stop_movement"),
+            way_point: topic_for(topics, "way_point", "way_point"),
+            goal_path: topic_for(topics, "goal_path", "goal_path"),
+            graph_nodes: topic_for(topics, "graph_nodes", "graph_nodes"),
+            graph_edges: topic_for(topics, "graph_edges", "graph_edges"),
+            contour_polygons: topic_for(topics, "contour_polygons", "contour_polygons"),
+            nav_boundary: topic_for(topics, "nav_boundary", "nav_boundary"),
+        };
+        ModuleNode::from_native_specs(
+            "far_planner",
+            "FAR Planner",
+            ModuleKind::NativeBridge,
+            nuwax_nav_far_planner_bridge::build_spec(
+                nuwax_nav_far_planner_bridge::FarPlannerBridgeConfig::default(),
+                &far_topics,
+            ),
+            None,
+        )
+        .with_feature("native-far")
+    };
     #[cfg(not(all(feature = "native-runner", feature = "native-far")))]
     let far_node = ModuleNode::new("far_planner", "FAR Planner", ModuleKind::NativeBridge)
         .with_binary("result/bin/far_planner_native");
@@ -359,17 +489,37 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
 
     // ---- local_planner ----
     #[cfg(all(feature = "native-runner", feature = "native-local"))]
-    let local_node = ModuleNode::from_native_specs(
-        "local_planner",
-        "Local Planner",
-        ModuleKind::NativeBridge,
-        nuwax_nav_local_planner_bridge::build_spec(
-            nuwax_nav_local_planner_bridge::LocalPlannerBridgeConfig::default(),
-            &nuwax_nav_local_planner_bridge::LocalPlannerTopics::default(),
-        ),
-        None,
-    )
-    .with_feature("native-local");
+    let local_node = {
+        let local_topics = nuwax_nav_local_planner_bridge::LocalPlannerTopics {
+            registered_scan: topic_for(topics, "registered_scan", "registered_scan"),
+            odometry: topic_for(topics, "odometry", "odometry"),
+            terrain_map: topic_for(topics, "terrain_map", "terrain_map"),
+            joy_cmd: topic_for(topics, "joy_cmd", "joy_cmd"),
+            way_point: topic_for(topics, "way_point", "way_point"),
+            goal_pose: topic_for(topics, "goal", "goal"),
+            speed: topic_for(topics, "speed", "speed"),
+            navigation_boundary: topic_for(topics, "nav_boundary", "nav_boundary"),
+            added_obstacles: topic_for(topics, "added_obstacles", "added_obstacles"),
+            check_obstacle: topic_for(topics, "check_obstacle", "check_obstacle"),
+            cancel_goal: topic_for(topics, "cancel_goal", "cancel_goal"),
+            path: topic_for(topics, "path", "path"),
+            effective_cmd_vel: topic_for(topics, "effective_cmd_vel", "effective_cmd_vel"),
+            free_paths: topic_for(topics, "free_paths", "free_paths"),
+            slow_down: topic_for(topics, "slow_down", "slow_down"),
+            goal_reached: topic_for(topics, "goal_reached", "goal_reached"),
+        };
+        ModuleNode::from_native_specs(
+            "local_planner",
+            "Local Planner",
+            ModuleKind::NativeBridge,
+            nuwax_nav_local_planner_bridge::build_spec(
+                nuwax_nav_local_planner_bridge::LocalPlannerBridgeConfig::default(),
+                &local_topics,
+            ),
+            None,
+        )
+        .with_feature("native-local")
+    };
     #[cfg(not(all(feature = "native-runner", feature = "native-local")))]
     let local_node = ModuleNode::new("local_planner", "Local Planner", ModuleKind::NativeBridge)
         .with_binary("result/bin/local_planner");
@@ -396,17 +546,27 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
 
     // ---- path_follower ----
     #[cfg(all(feature = "native-runner", feature = "native-path-follower"))]
-    let pf_node = ModuleNode::from_native_specs(
-        "path_follower",
-        "Path Follower",
-        ModuleKind::NativeBridge,
-        nuwax_nav_path_follower_bridge::build_spec(
-            nuwax_nav_path_follower_bridge::PathFollowerBridgeConfig::default(),
-            &nuwax_nav_path_follower_bridge::PathFollowerTopics::default(),
-        ),
-        None,
-    )
-    .with_feature("native-path-follower");
+    let pf_node = {
+        let pf_topics = nuwax_nav_path_follower_bridge::PathFollowerTopics {
+            path: topic_for(topics, "path", "path"),
+            odometry: topic_for(topics, "odometry", "odometry"),
+            speed: topic_for(topics, "speed", "speed"),
+            slow_down: topic_for(topics, "slow_down", "slow_down"),
+            safety_stop: topic_for(topics, "safety_stop", "safety_stop"),
+            cmd_vel: topic_for(topics, "cmd_vel", "cmd_vel"),
+        };
+        ModuleNode::from_native_specs(
+            "path_follower",
+            "Path Follower",
+            ModuleKind::NativeBridge,
+            nuwax_nav_path_follower_bridge::build_spec(
+                nuwax_nav_path_follower_bridge::PathFollowerBridgeConfig::default(),
+                &pf_topics,
+            ),
+            None,
+        )
+        .with_feature("native-path-follower")
+    };
     #[cfg(not(all(feature = "native-runner", feature = "native-path-follower")))]
     let pf_node = ModuleNode::new("path_follower", "Path Follower", ModuleKind::NativeBridge)
         .with_binary("result/bin/path_follower");
@@ -464,20 +624,27 @@ fn build_exploration_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
 
     // ---- tare_planner ----
     #[cfg(all(feature = "native-runner", feature = "native-tare"))]
-    let tare_node = match nuwax_explore_tare_bridge::build_specs(
-        nuwax_explore_tare_bridge::TarePlannerBridgeConfig::default(),
-        &nuwax_explore_tare_bridge::TarePlannerTopics::default(),
-    ) {
-        Ok((spec, build)) => ModuleNode::from_native_specs(
-            "tare_planner",
-            "TARE Planner",
-            ModuleKind::NativeBridge,
-            spec,
-            Some(build),
-        )
-        .with_feature("native-tare"),
-        Err(_) => ModuleNode::new("tare_planner", "TARE Planner", ModuleKind::NativeBridge)
-            .with_binary("result/bin/tare_planner"),
+    let tare_node = {
+        let tare_topics = nuwax_explore_tare_bridge::TarePlannerTopics {
+            registered_scan: topic_for(topics, "registered_scan", "registered_scan"),
+            odometry: topic_for(topics, "odometry", "odometry"),
+            way_point: topic_for(topics, "way_point", "way_point"),
+        };
+        match nuwax_explore_tare_bridge::build_specs(
+            nuwax_explore_tare_bridge::TarePlannerBridgeConfig::default(),
+            &tare_topics,
+        ) {
+            Ok((spec, build)) => ModuleNode::from_native_specs(
+                "tare_planner",
+                "TARE Planner",
+                ModuleKind::NativeBridge,
+                spec,
+                Some(build),
+            )
+            .with_feature("native-tare"),
+            Err(_) => ModuleNode::new("tare_planner", "TARE Planner", ModuleKind::NativeBridge)
+                .with_binary("result/bin/tare_planner"),
+        }
     };
     #[cfg(not(all(feature = "native-runner", feature = "native-tare")))]
     let tare_node = ModuleNode::new("tare_planner", "TARE Planner", ModuleKind::NativeBridge)

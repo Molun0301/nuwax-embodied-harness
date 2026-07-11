@@ -53,6 +53,16 @@ pub enum NavStackError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// P0-07 StackRunner:启动 native bridge 子进程失败。
+    #[error("failed to spawn native bridge `{node}`: {source}")]
+    SpawnFailed {
+        /// 节点 id(`ModuleNode.id`)。
+        node: String,
+        /// 底层 std::io::Error。
+        #[source]
+        source: std::io::Error,
+    },
+
     /// 任意内部错误(不应当发生,如果发生请报告)。
     #[error("internal nav-stack error: {0}")]
     Internal(String),

@@ -183,6 +183,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 bitflags = { workspace = true }
+# P0-07 StackRunner 使用 tokio process / time / rt;只引入 process + time + rt,
+# 不引入 net / signal / fs,避免 nav-stack 默认拖入完整 tokio runtime。
+tokio = { workspace = true, features = ["rt", "time", "macros", "process", "io-util"] }
 
 [dev-dependencies]
 # 单元测试可读 fixture / JSON

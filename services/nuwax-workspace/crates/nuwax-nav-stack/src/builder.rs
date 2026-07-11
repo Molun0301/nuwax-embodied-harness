@@ -24,18 +24,33 @@
 //! let text = nuwax_nav_stack::dry_run::render(&graph);
 //! println!("{text}");
 //! ```
+//!
+//! ## rework22 / P0-07:`StackRunner` 扩展
+//!
+//! 方案 §6.8 约束「stack 不持有算法」,rework22 边界澄清:
+//!
+//! - **算法实现**仍然在 upstream crate(`nuwax-nav-far-planner-bridge` 等);
+//!   stack 不实现 A*、FAR、Local、PathFollower、PGO、Terrain 任何算法。
+//! - **进程管理**(`StackRunner`)归 stack:负责把 `ModuleGraph` 翻译成真实 OS
+//!   进程,持有 `tokio::process::Child` 句柄,提供 SIGTERM → 5s → SIGKILL 的
+//!   优雅关闭链。这不是「算法」,是编排者的运行时职责,类比 launch system 的
+//!   process supervisor。
+//!
+//! 调用方通过 `builder.build_runner()` 拿到 `StackRunner`,然后
+//! `runner.spawn_all().await` 拉起所有 `NativeBridge` 子进程。
 
 use crate::error::NavStackResult;
 use crate::features::{NavFeatureFlags, NavStackPreset};
 use crate::graph::ModuleGraph;
 use crate::profile::NavStackProfile;
 use crate::profiles;
+use crate::runner::StackRunner;
 use crate::topics::NavTopicConfig;
 
 /// Stack builder。
 ///
 /// 通过 `with_topics` / `with_features` / `with_preset` 累积配置,
-/// 然后调用 `build()` 得到 `ModuleGraph`。
+/// 然后调用 `build()` 得到 `ModuleGraph` 或 `build_runner()` 得到 process owner。
 #[derive(Debug, Clone)]
 pub struct NavStackBuilder {
     profile: NavStackProfile,
@@ -100,6 +115,20 @@ impl NavStackBuilder {
             .validate()
             .map_err(crate::error::NavStackError::invalid)?;
         Ok(graph)
+    }
+
+    /// 构建 `StackRunner`(process owner,rework22 / P0-07)。
+    ///
+    /// 与 `build()` 不同的关键点:
+    /// - 内部先调用 `build()` 生成 `ModuleGraph`,并 `validate`。
+    /// - 把 graph 包装成 `StackRunner { graph, handles: empty }`,**不立即**拉起进程。
+    /// - 调用方随后 `.spawn_all().await` 才真正 fork 子进程。
+    ///
+    /// 这把「拓扑生成」与「进程生命周期」显式分开,便于上层(CLI / integration
+    /// test)在 `spawn_all` 之前对 argv / 拓扑做断言或修改。
+    pub fn build_runner(&self) -> NavStackResult<StackRunner> {
+        let graph = self.build()?;
+        Ok(StackRunner::from_graph(graph))
     }
 
     /// 便捷 dry-run:返回渲染好的纯文本。

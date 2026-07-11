@@ -14,3 +14,47 @@ pub use eval::EvalLoopClosure;
 pub use optimizer::{GaussNewtonOptimizer, LevenbergMarquardt, OptimizerConfig};
 pub use pgo::{PoseEdge, PoseGraph, PoseNode};
 pub use pgo_auto::AutoLoopDetector;
+
+/// PGO 优化器门面（rework22 P0-09.3）
+///
+/// 对外暴露统一名字 `PgoOptimizer`，内部默认是 `GaussNewtonOptimizer`；
+/// 提供 `optimize(&mut PoseGraph)` API，把代价归一化后回 caller。
+pub struct PgoOptimizer {
+    inner: GaussNewtonOptimizer,
+}
+
+impl PgoOptimizer {
+    /// 默认配置构造
+    #[must_use]
+    pub fn default() -> Self {
+        Self {
+            inner: GaussNewtonOptimizer::new(OptimizerConfig::default()),
+        }
+    }
+
+    /// 自定义配置构造
+    #[must_use]
+    pub fn with_config(config: OptimizerConfig) -> Self {
+        Self {
+            inner: GaussNewtonOptimizer::new(config),
+        }
+    }
+
+    /// 优化位姿图，返回最终代价
+    #[must_use]
+    pub fn optimize(&self, graph: &mut PoseGraph) -> f64 {
+        self.inner.optimize(graph)
+    }
+
+    /// 内部 GN 求解器引用
+    #[must_use]
+    pub fn gauss_newton(&self) -> &GaussNewtonOptimizer {
+        &self.inner
+    }
+}
+
+impl Default for PgoOptimizer {
+    fn default() -> Self {
+        Self::default()
+    }
+}

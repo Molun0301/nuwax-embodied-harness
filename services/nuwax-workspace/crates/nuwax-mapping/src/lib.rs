@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 pub mod cost_mapper;
+pub mod loop_closure;
 pub mod models;
 pub mod occupancy;
 pub mod pointclouds;
@@ -19,6 +20,7 @@ pub mod voxels;
 
 // 重导出最常用类型
 pub use cost_mapper::CostMapper;
+pub use loop_closure::PgoOptimizer;
 pub use models::{Costmap, MapMeta};
 pub use occupancy::OccupancyGrid;
 pub use pointclouds::PointCloudAccumulator;

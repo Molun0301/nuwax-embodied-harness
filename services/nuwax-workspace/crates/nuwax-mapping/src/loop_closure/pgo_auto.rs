@@ -6,7 +6,7 @@
 
 use super::pgo::{transform_utils, PoseEdge, PoseGraph};
 use kiddo::KdTree;
-use nalgebra::{Isometry3, Point3, Vector3};
+use nalgebra::{Isometry3, Point3};
 
 /// 自动回环检测器
 pub struct AutoLoopDetector {
@@ -50,24 +50,25 @@ impl AutoLoopDetector {
             .map(|(id, n)| (*id, n.stamp_secs, n.pose.translation.vector.into()))
             .collect();
 
-        // 构建 KD-tree（key = position, value = node index）
+        // 构建 KD-tree（key = position, value = node index；kiddo 4.x 类型为 u64）
         let mut tree: KdTree<f64, 3> = KdTree::new();
         for (idx, &(_, _, p)) in nodes.iter().enumerate() {
-            tree.add([p.x, p.y, p.z], idx);
+            tree.add(&[p.x, p.y, p.z], idx as u64);
         }
 
         let mut added = 0;
 
         // 对每个新节点，查询最近邻
         for (idx, &(id_i, stamp_i, pos_i)) in nodes.iter().enumerate() {
-            // 在半径 min_distance 内的所有近邻
-            let neighbors: Vec<(usize, f64)> = tree
-                .within::<[f64; 3]>(&[pos_i.x, pos_i.y, pos_i.z], self.min_distance)
+            // 在半径 min_distance 内的所有近邻（kiddo 4.x metric 类型参数）
+            let neighbors: Vec<(u64, f64)> = tree
+                .within::<kiddo::SquaredEuclidean>(&[pos_i.x, pos_i.y, pos_i.z], self.min_distance)
                 .iter()
                 .map(|n| (n.item, n.distance))
                 .collect();
 
-            for (jdx, dist_sq) in neighbors {
+            for (jdx_u64, dist_sq) in neighbors {
+                let jdx = jdx_u64 as usize;
                 if jdx <= idx {
                     continue; // 仅向后查询（j > i）
                 }

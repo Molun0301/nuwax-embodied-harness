@@ -35,6 +35,12 @@ pub enum RpcError {
         /// 超时秒数
         secs: u64,
     },
+    /// 后端不可用(例如 `serve()` 调用时 `link-liblcm` feature 未启用)
+    #[error("rpc backend unavailable: {0}")]
+    BackendUnavailable(String),
+    /// handler 异常
+    #[error("rpc handler error: {0}")]
+    Handler(String),
     /// Module 错误
     #[error("module error: {0}")]
     Module(#[from] ModuleError),
@@ -99,6 +105,37 @@ impl RpcResponse {
     }
 }
 
+/// `serve()` 返回的 server handle —— 用于 stop / inspect
+///
+/// 当前是占位(handle 内部仅有 task handle 与名称),后续 link-liblcm 实现后扩展。
+#[derive(Debug)]
+pub struct RpcServerHandle {
+    /// 服务名(LCM channel 前缀)
+    pub service_name: String,
+    /// 后端实现 tag("in-memory" / "lcm")
+    pub backend: &'static str,
+}
+
+impl RpcServerHandle {
+    /// 构造 in-memory 占位 handle(只在 in-memory broker 场景使用)
+    #[must_use]
+    pub fn in_memory(service_name: impl Into<String>) -> Self {
+        Self {
+            service_name: service_name.into(),
+            backend: "in-memory",
+        }
+    }
+
+    /// 构造 LCM backend 占位 handle
+    #[must_use]
+    pub fn lcm(service_name: impl Into<String>) -> Self {
+        Self {
+            service_name: service_name.into(),
+            backend: "lcm",
+        }
+    }
+}
+
 /// RPC handler trait
 #[async_trait]
 pub trait RpcHandler: Send + Sync + 'static {
@@ -144,6 +181,70 @@ impl RpcBroker {
             Some(h) => Ok(h.handle(req).await),
             None => Err(RpcError::MethodNotFound(req.name)),
         }
+    }
+
+    /// 进程内直接调用(不走 LCM transport)
+    ///
+    /// 便捷重载,内部用 `call(RpcRequest)` 实现;若 method 不存在返回 `RpcError::MethodNotFound`,
+    /// 若 handler 返回异常响应,返回 `RpcError::Handler(异常 message)`。
+    ///
+    /// # Errors
+    /// - `RpcError::MethodNotFound` —— 方法未注册
+    /// - `RpcError::Handler` —— handler 返回 `RpcResponse.exception`
+    pub async fn call_method(
+        &self,
+        method: &str,
+        args: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, RpcError> {
+        let req = RpcRequest {
+            name: method.into(),
+            args: (args, HashMap::new()),
+            id: None,
+        };
+        let resp = self.call(req).await?;
+        if let Some(exception) = resp.exception {
+            let msg = exception
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("handler returned exception")
+                .to_string();
+            return Err(RpcError::Handler(msg));
+        }
+        Ok(resp.res.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// 真实 LCM Req/Res 服务端
+    ///
+    /// 默认 feature off(无 `link-liblcm`)时,**返 `RpcError::BackendUnavailable` 而非编译失败**,
+    /// 以便 dev / 静态验证场景不依赖 liblcm 也能跑通。
+    ///
+    /// 启用 `link-liblcm` feature 后,`serve()` 才真正注册到 LCM transport;
+    /// 当前实现为占位(`unimplemented!`),后续 follow-up 接 nuwax-lcm LCM Req/Res 通道。
+    ///
+    /// # Errors
+    /// - 默认 feature off 时永远返 `RpcError::BackendUnavailable`
+    /// - 启用 `link-liblcm` 时当前 `unimplemented!`
+    #[cfg(feature = "link-liblcm")]
+    pub async fn serve(
+        &self,
+        _transport: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        _service_name: &str,
+    ) -> Result<RpcServerHandle, RpcError> {
+        // rework22 P0-06:LCM transport 集成留待 follow-up。
+        // 当前 dev 不链 liblcm,默认 feature off 路径已覆盖。
+        unimplemented!("rework22 P0-06:LCM transport integration 待 follow-up")
+    }
+
+    /// 默认 feature off 路径 —— `serve()` 立即返错,确保 cargo check 在无 liblcm 时也能通过
+    #[cfg(not(feature = "link-liblcm"))]
+    pub async fn serve(
+        &self,
+        _transport: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        _service_name: &str,
+    ) -> Result<RpcServerHandle, RpcError> {
+        Err(RpcError::BackendUnavailable(
+            "RpcBroker::serve() 需要启用 link-liblcm feature".into(),
+        ))
     }
 }
 

@@ -16,6 +16,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+# link-liblcm 默认关闭:dev / 静态验证场景不链 liblcm。
+# 启用后,RpcBroker::serve() 才真正注册到 LCM transport;否则返 BackendUnavailable。
+link-liblcm = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
 pretty_assertions = { workspace = true }

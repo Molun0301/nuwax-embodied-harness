@@ -13,6 +13,10 @@ name = "nuwax_nav_mls_planner"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 
+[[bin]]
+name = "mls_planner_native"
+path = "src/bin/mls_planner_native.rs"
+
 [dependencies]
 # 注意:MLS core 不引入 nuwax-nav-types-messages / nuwax-nav-base 以保持独立编译
 # Foundation lane 正在修复类型收敛;本 crate 沿用原 dimos-mls-planner 的纯类型策略
@@ -24,6 +28,10 @@ validator = { workspace = true, features = ["derive"] }
 image = { workspace = true }
 imageproc = { workspace = true }
 rayon = { workspace = true }
+# P0-16: stamp_pair + bin 需要 thiserror/serde/serde_json
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }

@@ -42,5 +42,6 @@ pub mod edges;
 pub mod mls_planner;
 pub mod nodes;
 pub mod planner;
+pub mod stamp_pair;
 pub mod surfaces;
 pub mod voxel;

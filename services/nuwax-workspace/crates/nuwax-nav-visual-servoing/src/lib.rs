@@ -31,7 +31,11 @@ pub use nuwax_nav_types_messages::Twist3 as FoundationTwist3;
 pub mod detection3d;
 pub mod servo2d;
 
-pub use detection3d::{DetectionNavigation, DetectionNavigationConfig, NavTwist3D, TargetPoint3D};
+pub use detection3d::{
+    CameraIntrinsics, DetectionNavigation, DetectionNavigationConfig,
+    DetectionNavigationModule, NavTwist3D, PointCloud2Like, SimplePointCloud,
+    TargetPoint3D, TfLike, extract_3d_from_detection,
+};
 pub use servo2d::{VisualServoing2D, VisualServoing2DConfig};
 
 /// 通用错误

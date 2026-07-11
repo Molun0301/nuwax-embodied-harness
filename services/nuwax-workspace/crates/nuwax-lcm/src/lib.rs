@@ -33,8 +33,10 @@
 // —— 所有 unsafe 都封装在 extern "C" 调用处,其它逻辑都用 safe Rust。
 #![warn(missing_docs)]
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +47,7 @@ use nuwax_lcm_sys::{
     lcm_t, to_cstring,
 };
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 // =============================================================================
@@ -132,6 +134,8 @@ enum Command {
         channel: CString,
         /// payload bytes
         payload: Bytes,
+        /// reply:成功 / 失败 via oneshot(rework22 P0-04:让 caller 拿到 publish 真错误)
+        reply: oneshot::Sender<Result<(), LcmError>>,
     },
     /// 注册一条订阅。owner thread 调 lcm_subscribe + 装一个 broadcast sender
     Subscribe {
@@ -166,15 +170,36 @@ enum Command {
 struct OwnerThread {
     lcm: *mut lcm_t,
     cmd_rx: mpsc::Receiver<Command>,
-    /// 已注册的 subscription:`channel CString → (subscription handle, broadcast::Sender)`
+    /// 已注册的 subscription:`channel CString → SubscriptionHandle`
     ///
     /// 2026-07-09 B2 修复后,`lcm_subscribe` 返回 `*mut lcm_subscription_t`
     /// (liblcm 1.x 真实签名),后续 `lcm_unsubscribe` 须以该 handle 为 key,
     /// 而**不是** channel 字符串。所以必须把 handle 存下来。
-    /// user_data 仍是个 boxed `broadcast::Sender`,liblcm 回调里通过
-    /// `(*const broadcast::Sender<Bytes>)` 当 user pointer 找回。
-    subscriptions:
-        std::collections::HashMap<CString, (*mut lcm_subscription_t, broadcast::Sender<Bytes>)>,
+    ///
+    /// 2026-07-11 rework22 P0-01:`SubscriptionEntry` 是 leaked box(`*mut`),
+    /// 内含 broadcast sender + alive flag。callback 期间 `(*entry).alive`
+    /// 决定是否真把 bytes 推到 sender;`unsubscribe`/`run` 收尾时先
+    /// 设 false、调用 `lcm_unsubscribe`、再 `Box::from_raw` 释放。
+    subscriptions: HashMap<CString, SubscriptionHandle>,
+}
+
+/// SubscriptionHandle —— owner thread 内部:`sub` 是 liblcm handle;
+/// `entry` 是 leaked `Box<SubscriptionEntry>`,由 callback 通过 user_data
+/// 取回。`unsubscribe` / `run` 收尾统一释放。
+struct SubscriptionHandle {
+    sub: *mut lcm_subscription_t,
+    entry: *mut SubscriptionEntry,
+}
+
+/// SubscriptionEntry —— leaked 留在 liblcm user_data 里。
+///
+/// - `sender`:callback 把收到的 bytes broadcast 出去
+/// - `alive` :`unsubscribe` / owner thread 退出时先设 false;callback
+///   acquire-load,看到 false 直接 return(防 use-after-free:
+///   unsubscribe 后 liblcm 仍可能在超时窗口里再投一次)
+struct SubscriptionEntry {
+    sender: broadcast::Sender<Bytes>,
+    alive: AtomicBool,
 }
 
 // SAFETY: `OwnerThread` 只在 `std::thread::spawn` 的那一刻被 move 一次;
@@ -201,27 +226,34 @@ impl OwnerThread {
         sender: broadcast::Sender<Bytes>,
     ) -> Result<(), LcmError> {
         let chan_str = channel.to_string_lossy().into_owned();
-        let sender_box = Box::new(sender);
-        let sender_ptr = Box::into_raw(sender_box);
-        // SAFETY: liblcm 接管 sender_ptr 的 lifetime,回调里再
-        // `&mut *(user as *mut broadcast::Sender<Bytes>)` 取回。
+        // rework22 P0-01:把 sender 装进 leaked `SubscriptionEntry`,
+        // callback 通过 user_data 取 `&(*entry).sender` 的引用
+        // (不 move out —— 旧实现 `*Box::from_raw(sender_ptr)` 把
+        //  allocation 释放后立刻 move 出值,导致 HashMap insert 时
+        // 旧 entry 内存已 free,这里直接泄漏整块 entry 一次)
+        let entry = Box::new(SubscriptionEntry {
+            sender,
+            alive: AtomicBool::new(true),
+        });
+        let entry_ptr = Box::into_raw(entry);
+        // SAFETY: liblcm 接管 entry_ptr 的 lifetime,回调里再
+        // `&(*entry_ptr)` 取回 sender 引用 + alive flag。
         let sub = unsafe {
             lcm_subscribe(
                 self.lcm,
                 pattern.as_ptr(),
                 Some(lcm_msg_callback),
-                sender_ptr as *mut c_void,
+                entry_ptr as *mut c_void,
             )
         };
         if sub.is_null() {
-            // 失败 → 回收 sender
-            let _ = unsafe { Box::from_raw(sender_ptr) };
+            // 失败 → 回收 entry(把 sender 一起 drop,broadcast sender
+            // 析构时所有 receiver 收到关闭信号)
+            let _ = unsafe { Box::from_raw(entry_ptr) };
             return Err(LcmError::Subscribe { channel: chan_str });
         }
-        // 成功:把 sub handle 与 sender 一并存入 subscriptions,
-        // 以便 unsubscribe 时拿 sub handle 调 liblcm。
-        let sender_back = unsafe { *Box::from_raw(sender_ptr) };
-        self.subscriptions.insert(channel, (sub, sender_back));
+        self.subscriptions
+            .insert(channel, SubscriptionHandle { sub, entry: entry_ptr });
         Ok(())
     }
 
@@ -229,11 +261,12 @@ impl OwnerThread {
         // 2026-07-09 B2 修复:从 subscriptions 取 sub handle 调 liblcm
         // (原先错用 channel 字符串 — liblcm 1.x 的 lcm_unsubscribe 不接受
         //  channel 字符串,会直接返回错误或 UB)。
-        let sub = match self.subscriptions.remove(channel) {
-            Some((sub, sender)) => {
-                drop(sender);
-                sub
-            }
+        //
+        // 2026-07-11 rework22 P0-01:先设 `entry.alive = false`,这样
+        // 接下来 unsubscribed 的 sub 在 race window 内被 liblcm 二次投
+        // 也不会再 push bytes 走 dangling sender。
+        let handle = match self.subscriptions.remove(channel) {
+            Some(h) => h,
             None => {
                 warn!(
                     "lcm_unsubscribe: 未找到 channel={} 的 subscription handle",
@@ -242,13 +275,17 @@ impl OwnerThread {
                 return;
             }
         };
-        let rc = unsafe { lcm_unsubscribe(self.lcm, sub) };
+        unsafe { (*handle.entry).alive.store(false, Ordering::Release) };
+        let rc = unsafe { lcm_unsubscribe(self.lcm, handle.sub) };
         if rc != 0 {
             warn!(
                 "lcm_unsubscribe 返回非 0 (channel={})",
                 channel.to_string_lossy()
             );
         }
+        // 释放 leaked entry(注:即使 `unsubscribe` 返回非 0 也要 release,
+        // 否则 HashMap remove 之后我们不再持有该指针,泄漏)
+        unsafe { drop(Box::from_raw(handle.entry)) };
     }
 
     fn publish(&self, channel: &CString, payload: &Bytes) -> Result<(), LcmError> {
@@ -273,46 +310,57 @@ impl OwnerThread {
         info!("nuwax-lcm owner thread 启动");
         let _fd = unsafe { lcm_get_fileno(self.lcm) };
 
-        loop {
-            match self.cmd_rx.try_recv() {
-                Ok(Command::Shutdown) => {
-                    info!("nuwax-lcm owner thread 收到 Shutdown,退出");
-                    break;
-                }
-                Ok(Command::Publish { channel, payload }) => {
-                    if let Err(e) = self.publish(&channel, &payload) {
-                        error!("publish 失败: {}", e);
+        // rework22 P0-04:每个 tick 内把所有 queued commands 处理完再
+        // 让出时间片给 liblcm(原实现一次只 drain 一条,在 50ms 吞吐
+        // 有限;高负载 publish 风暴会塞满 mpsc → caller backpressure)
+        let mut shutdown = false;
+        while !shutdown {
+            loop {
+                match self.cmd_rx.try_recv() {
+                    Ok(Command::Shutdown) => {
+                        info!("nuwax-lcm owner thread 收到 Shutdown,退出");
+                        shutdown = true;
+                        break;
                     }
-                }
-                Ok(Command::Subscribe {
-                    channel,
-                    pattern,
-                    reply,
-                    sender,
-                }) => {
-                    let r = self.subscribe(channel, pattern, sender);
-                    let _ = reply.send(r);
-                }
-                Ok(Command::Unsubscribe { channel }) => {
-                    self.unsubscribe(&channel);
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    // 没命令 → 把时间让给 liblcm
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    error!("nuwax-lcm owner thread 的 mpsc sender 全 dropped;退出");
-                    break;
+                    Ok(Command::Publish {
+                        channel,
+                        payload,
+                        reply,
+                    }) => {
+                        let r = self.publish(&channel, &payload);
+                        let _ = reply.send(r);
+                    }
+                    Ok(Command::Subscribe {
+                        channel,
+                        pattern,
+                        reply,
+                        sender,
+                    }) => {
+                        let r = self.subscribe(channel, pattern, sender);
+                        let _ = reply.send(r);
+                    }
+                    Ok(Command::Unsubscribe { channel }) => {
+                        self.unsubscribe(&channel);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        error!("nuwax-lcm owner thread 的 mpsc sender 全 dropped;退出");
+                        shutdown = true;
+                        break;
+                    }
                 }
             }
             // 50 ms 轮询
             let _ = unsafe { lcm_handle_timeout(self.lcm, 50) };
         }
 
-        // 收尾:drop 所有 subscriptions(sender 析构;subscription handle
-        // 归 lcm_t 拥有,lcm_destroy 时 liblcm 内部统一释放,不需手动 free)
-        for (ch, (sub, sender)) in self.subscriptions.drain() {
-            let _ = sub;
-            drop(sender);
+        // 收尾:drain 所有 subscriptions(2026-07-11 rework22 P0-01:
+        // 先把 entry.alive 设为 false,再 lcm_unsubscribe,最后释放
+        // leaked entry —— 与 `unsubscribe` 同序,避免 callback race)
+        for (ch, handle) in self.subscriptions.drain() {
+            unsafe { (*handle.entry).alive.store(false, Ordering::Release) };
+            unsafe { lcm_unsubscribe(self.lcm, handle.sub) };
+            unsafe { drop(Box::from_raw(handle.entry)) };
             let _ = ch;
         }
         unsafe { lcm_destroy(self.lcm) };
@@ -334,11 +382,20 @@ unsafe extern "C" fn lcm_msg_callback(
     }
     // SAFETY: rbuf 由 liblcm 持有,本回调期间有效;data_size 来自 C 头,
     // data 指针按 data_size 字节数有效。
+    let entry = user as *const SubscriptionEntry;
+    // rework22 P0-01:check alive flag first。若 unsubscribe / owner
+    // shutdown drain 已发生,entry 内存可能已被 Box::from_raw 释放,
+    // 此时 acquire-load 看到 false 直接 return,绝对不要碰 sender。
+    if unsafe { !(*entry).alive.load(Ordering::Acquire) } {
+        return;
+    }
     let (data_ptr, len) = unsafe { ((*rbuf).data, (*rbuf).data_size as usize) };
     if data_ptr.is_null() || len == 0 {
         return;
     }
-    let sender = unsafe { &mut *(user as *mut broadcast::Sender<Bytes>) };
+    // SAFETY: alive=true 时 entry 仍 leaked & valid;只借用 sender
+    // 的引用,不 move,不释放 allocation。
+    let sender = unsafe { &(*entry).sender };
     let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, len) };
     let bytes = Bytes::copy_from_slice(slice);
     let _ = sender.send(bytes);
@@ -391,7 +448,7 @@ impl LcmContext {
             });
         }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(10_000);
 
         let owner = OwnerThread {
             lcm,
@@ -422,18 +479,27 @@ impl LcmContext {
     }
 
     /// 异步发布一条消息。owner thread 真正调 `lcm_publish`。
+    ///
+    /// rework22 P0-04:返回真错误。命令队列入队失败 → `OwnerThreadDown`;
+    /// owner 执行结果 → 通过 oneshot reply 透传回 caller。
     pub async fn publish(&self, channel: &str, payload: Bytes) -> Result<(), LcmError> {
         let c = to_cstring(channel).map_err(|_| LcmError::NulByte(channel.to_owned()))?;
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Publish {
                 channel: c,
                 payload,
+                reply: reply_tx,
             })
             .await
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: e.to_string(),
             })?;
-        Ok(())
+        reply_rx
+            .await
+            .map_err(|e| LcmError::OwnerThreadDown {
+                detail: e.to_string(),
+            })?
     }
 
     /// 注册一个 subscription。

@@ -124,6 +124,46 @@ impl<T: Clone + Send + 'static> Subject<T> {
             inner: BroadcastStream::new(rx),
         }
     }
+
+    /// 内部订阅 —— 直接返回底层 `broadcast::Receiver<T>`,供 `Subject::connect` 合流用
+    #[must_use]
+    pub fn subscribe_internal(&self) -> broadcast::Receiver<T> {
+        self.tx.subscribe()
+    }
+
+    /// `Subject::connect` 内部使用 —— 直接向底 `broadcast::Sender` 推一条
+    ///
+    /// # Errors
+    /// 当无活跃订阅者时返回 `StreamError::NoSubscribers`
+    pub(crate) fn push_internal(&self, value: T) -> Result<(), StreamError> {
+        self.push(value)
+    }
+
+    /// 把多个 `Subject` 合并到一个新 `Subject`(订阅新 Subject 收所有 source 的消息)
+    ///
+    /// rework22 P0-06: 对齐 RxPy 的 `ConnectableObservable` / `publish().refCount()` 合流模式,
+    /// 以及 dimos 内部把多路 sensor stream merge 到统一 inbox 的用法。
+    ///
+    /// # Arguments
+    /// * `sources` - 要合并的 source subjects(每个 source 必须仍有至少 1 个活跃 receiver,
+    ///   否则 `push` 路径会 `NoSubscribers`)
+    /// * `merged_capacity` - 合并目标 subject 的 broadcast 容量
+    #[must_use]
+    pub fn connect(sources: Vec<Subject<T>>, merged_capacity: usize) -> Subject<T> {
+        let merged = Subject::<T>::new(merged_capacity);
+        for src in sources {
+            let mut rx = src.subscribe_internal();
+            let merged_inner = merged.clone();
+            tokio::spawn(async move {
+                while let Ok(v) = rx.recv().await {
+                    // merged 接收端通过后续 .subscribe() 接入;若 merged 暂时无活跃接收者,
+                    // push_internal 会失败但不影响 source 继续推送(下一次 recv.await 会丢)
+                    let _ = merged_inner.push_internal(v);
+                }
+            });
+        }
+        merged
+    }
 }
 
 impl<U: Clone + Send + 'static> Subject<SubjectEvent<U>> {
@@ -196,6 +236,15 @@ impl<T: Clone + Send + 'static> Stream for SubscriberStream<T> {
 
 /// 共享 Subject 的便捷 alias
 pub type SharedSubject<T> = std::sync::Arc<Subject<T>>;
+
+/// Subject 持有 `broadcast::Sender<T>`,本身可 Clone:多个 owner 推同一组订阅者
+impl<T: Clone + Send + 'static> Clone for Subject<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

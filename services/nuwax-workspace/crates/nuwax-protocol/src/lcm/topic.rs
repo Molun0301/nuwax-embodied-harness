@@ -77,6 +77,43 @@ impl LcmTopic {
             Ok((Self::new(pattern)?, None))
         }
     }
+
+    /// 拼装 typed channel 全限定字符串 `/<channel>#<msg_type>`。
+    ///
+    /// 对齐 Python 侧 `lcmpubsub.py:36-72` 的 publish/subscribe channel 形式:
+    /// 上游 liblcm 1.x 允许 `lcm.subscribe("/topic#pkg.Msg")` 一并指定 channel
+    /// 与类型标签。本函数只负责字符串拼装,**不**做 STRUCT_SEEDS 校验
+    /// (校验由 [`LcmMessageType::new`] 在 msg_type 上承担)。
+    ///
+    /// # Arguments
+    ///
+    /// * `msg_type` — message FQN(如 `nav_msgs/Odometry`)。
+    #[must_use]
+    pub fn fqn(&self, msg_type: &str) -> String {
+        self.as_subscription_pattern(msg_type)
+    }
+
+    /// 判定 `actual_channel` 是否匹配本 topic 期望的 typed-channel pattern。
+    ///
+    /// 匹配语义(对齐 Python `lcmpubsub.py:36-72` subscribe 端):
+    /// - `actual == "/<channel>#<msg_type>"` -> 完全匹配(channel + suffix 都需命中);
+    /// - `actual == "/<channel>"` (无 typed suffix) -> pattern 匹配
+    ///   (即 `(#.*)?` 后缀可省略);
+    /// - 其它情况 -> 不匹配。
+    ///
+    /// 该函数**不**做 msg_type 等价校验 —— typed suffix 部分仅作为
+    /// "存在性" 过滤;`msg_type` 由 [`LcmMessageType`] 在更上层校验。
+    #[must_use]
+    pub fn matches(&self, actual: &str) -> bool {
+        // 拆出 channel 部分 + 可选 typed suffix
+        let (actual_channel, _actual_suffix) = match actual.find(LCM_TOPIC_TYPED_SUFFIX_SEP) {
+            Some(idx) => (&actual[..idx], Some(&actual[idx + 1..])),
+            None => (actual, None),
+        };
+        // 永远只比较 channel 部分 —— typed suffix 仅作可选项存在,
+        // 匹配语义与 Python lcmpubsub.subscribe("(/topic)(#.*)?") 等价。
+        actual_channel == self.0
+    }
 }
 
 impl fmt::Display for LcmTopic {

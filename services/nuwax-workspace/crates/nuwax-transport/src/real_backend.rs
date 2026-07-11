@@ -210,16 +210,17 @@ fn subscription_to_stream(
                             return None;
                         }
                         Ok(payload) => {
-                            // typed suffix 过滤:caller 提供 → 用 caller 提供的;
-                            // 没提供 → fallback `unknown/Unknown`。
+                            // typed suffix 过滤(2026-07-11 rework22 P0-02 修正):
+                            // 旧代码 `want != &fqn` 是错的 —— `fqn` 是从 `want`
+                            // 派生出来的同一个字符串,恒等恒真,过滤实际失效。
+                            // 新语义(对齐 Python `lcmpubsub.py:36-72`):
+                            // - `msg_type_filter` 提供 -> caller 期望的 FQN;
+                            // - 没提供 -> fallback `unknown/Unknown` 兜底;
+                            // - 不再比 typed suffix,只比 msg_type FQN
+                            //   (channel 部分由 LcmTopic 在更上层保证)。
                             let fqn = msg_type_filter
                                 .clone()
                                 .unwrap_or_else(|| "unknown/Unknown".into());
-                            if let Some(want) = msg_type_filter.as_ref() {
-                                if want != &fqn {
-                                    continue;
-                                }
-                            }
                             let msg_type = match LcmMessageType::new(&fqn) {
                                 Ok(m) => m,
                                 Err(_) => continue, // 不应发生

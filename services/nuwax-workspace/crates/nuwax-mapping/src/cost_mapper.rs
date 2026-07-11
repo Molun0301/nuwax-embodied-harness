@@ -15,8 +15,10 @@
 //!   （height_cost / probability / probabilistic），而不是 u8 数值映射。
 
 use crate::models::{Costmap, MapMeta};
+use crate::occupancy::inflation::{simple_inflate, InflationConfig};
 use crate::occupancy::types::{MapMetaData, OccupancyGrid, OccupancyValue};
-use nalgebra::Isometry3;
+use crate::pointclouds::PointCloudOccupancyBuilder;
+use nalgebra::{Isometry3, Point3};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -149,6 +151,142 @@ impl CostMapper {
         &self.config
     }
 }
+
+// =====================================================================
+// PointCloud2 接 CostMapper 适配层（P0-09 修复 H-5/H-6）
+// =====================================================================
+
+/// PointCloud2 抽象（不依赖 ROS message 类型）
+///
+/// 对齐 `sensor_msgs/PointCloud2` 的最小字段集：xyz 浮点字段 + sensor origin。
+/// 测试 / 上层（Lcm/ros-bridge）可实现此 trait 把任意输入投影到 cost_mapper。
+/// 本期不引入 `sensor-msgs` 依赖以避免 cleaves ROS 协议进 mapping 接口。
+pub trait PointCloud2Like {
+    /// 点列表（已变换到世界坐标系）
+    fn points(&self) -> &[Point3<f64>];
+    /// 传感器 origin（用于 ray-cast 标记 free cell）
+    fn sensor_origin(&self) -> Point3<f64>;
+}
+
+/// 内置简单实现：内存中的 xyz + sensor origin
+#[derive(Debug, Clone)]
+pub struct SimplePointCloud2 {
+    /// xyz 点列表
+    pub points: Vec<Point3<f64>>,
+    /// 传感器 origin
+    pub sensor_origin: Point3<f64>,
+}
+
+impl SimplePointCloud2 {
+    /// 构造
+    #[must_use]
+    pub fn new(points: Vec<Point3<f64>>, sensor_origin: Point3<f64>) -> Self {
+        Self {
+            points,
+            sensor_origin,
+        }
+    }
+}
+
+impl PointCloud2Like for SimplePointCloud2 {
+    fn points(&self) -> &[Point3<f64>] {
+        &self.points
+    }
+    fn sensor_origin(&self) -> Point3<f64> {
+        self.sensor_origin
+    }
+}
+
+impl CostMapper {
+    /// 从 PointCloud2 + OccupancyConfig 构造 CostMapper（完整 pipeline）
+    ///
+    /// 流程：
+    /// 1. `PointCloudOccupancyBuilder::build` → OccupancyGrid（ray-cast + occupied/free）
+    /// 2. 依据 `OccupancyConfig.algo` 套用算法（HeightCost / Probability / Probabilistic）
+    ///    —— 当前实现：三种算法统一返回"原始 OccupancyGrid 转 Costmap"语义；
+    ///    真算法表接 `pointclouds.occupancy.OCCUPANCY_ALGOS` 留 P2。
+    /// 3. 依据 `initial_safe_radius_meters` 做 obstacle 膨胀（BFS-8）。
+    ///
+    /// 返回：(CostMapper, Costmap) —— caller 同时拿到 CostMapper 实例
+    /// （便于后续 in-place 更新）和最终 Costmap。
+    #[must_use]
+    pub fn from_pointcloud<P: PointCloud2Like>(
+        cloud: &P,
+        occupancy_cfg: &OccupancyConfig,
+        width: u32,
+        height: u32,
+        resolution: f64,
+        origin_xy: (f64, f64),
+    ) -> (Self, Costmap) {
+        // 阶段 1：pointcloud → OccupancyGrid
+        let builder = PointCloudOccupancyBuilder::new(
+            cloud.sensor_origin(),
+            resolution,
+            width,
+            height,
+            origin_xy,
+        );
+        let grid = builder.build(cloud.points());
+
+        // 阶段 2：选算法（统一占用语义；真算法表 P2）
+        let _ = match occupancy_cfg.algo {
+            CostAlgoSelector::HeightCost
+            | CostAlgoSelector::Probability
+            | CostAlgoSelector::Probabilistic => {
+                // 当前：所有算法统一输出"原始 occupancy → costmap"语义；
+                // P2 接 OCCUPANCY_ALGOS dict 后这里改为真算法调用。
+            }
+        };
+
+        // 阶段 3：safe radius 膨胀（cells = meters / resolution）
+        let inflated = if occupancy_cfg.initial_safe_radius_meters > 0.0 {
+            let radius_cells = (f64::from(occupancy_cfg.initial_safe_radius_meters) / resolution)
+                .ceil() as u32;
+            simple_inflate(
+                &grid,
+                InflationConfig {
+                    radius: radius_cells.max(1),
+                    diagonal: true,
+                },
+            )
+        } else {
+            grid
+        };
+
+        // 阶段 4：OccGrid → Costmap（走现有 convert）
+        let mapper = Self::new(CostMapperConfig {
+            config: occupancy_cfg.clone(),
+        });
+        let costmap = mapper.convert(&inflated);
+        (mapper, costmap)
+    }
+}
+
+/// 从 OccupancyConfig 推断的算法名（dimos Python `Config.algo`）
+impl CostAlgoSelector {
+    /// dimos Python 字符串（如 `"height_cost"`）
+    #[must_use]
+    pub fn as_dimos_str(&self) -> &'static str {
+        match self {
+            Self::HeightCost => "height_cost",
+            Self::Probability => "probability",
+            Self::Probabilistic => "probabilistic",
+        }
+    }
+
+    /// 从 dimos 字符串解析（未知值 fallback 到 HeightCost）
+    #[must_use]
+    pub fn from_dimos_str(s: &str) -> Self {
+        match s {
+            "height_cost" => Self::HeightCost,
+            "probability" => Self::Probability,
+            "probabilistic" => Self::Probabilistic,
+            _ => Self::HeightCost,
+        }
+    }
+}
+
+// 平移 vector 单元测试辅助
 
 impl Default for CostMapper {
     fn default() -> Self {

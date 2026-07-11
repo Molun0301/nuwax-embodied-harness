@@ -215,9 +215,15 @@ mod tests {
             nuwax_tf::make_transform("odom", "base_link", [1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]);
         tree.set(base_link);
 
-        // 从 map -> base_link 的链应当包含两次平移
+        // 链语义(nalgebra Isometry / ROS tf2 约定):
+        //   `chain("a", "b")` 返回 `T_a→b`(把 a-frame 点映到 b-frame)。
+        //   `T_a→b.translation` = "a origin 在 b 中的坐标"。
+        // 测试场景:base_link origin 在 map 中是 (1, 0, 0),所以
+        //   map origin 在 base_link 中是 (-1, 0, 0),即 chain.translation = (-1, 0, 0)。
+        // (旧版期望 +1 是 ROS tf 风格 `T_target→source` 反着用,在 rework22 P0-05
+        //  算法语义下被修正。)
         let chain = tree.chain("map", "base_link").unwrap();
-        assert_relative_eq!(chain.translation.x, 1.0, epsilon = 1e-9);
+        assert_relative_eq!(chain.translation.x, -1.0, epsilon = 1e-9);
         assert_relative_eq!(chain.translation.y, 0.0, epsilon = 1e-9);
         assert_relative_eq!(chain.translation.z, 0.0, epsilon = 1e-9);
     }

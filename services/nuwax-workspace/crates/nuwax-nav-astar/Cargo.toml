@@ -23,11 +23,16 @@ nalgebra = { workspace = true }
 glam = { workspace = true }
 tracing = { workspace = true }
 
+# rework22 P0-11:module feature 下启用 nuwax-core 以提供 In/Out 端口工厂
+nuwax-core = { path = "../nuwax-core", optional = true }
+
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 proptest = { workspace = true }
 approx = { workspace = true }
 criterion = { workspace = true }
+# rework22 P0-11:dev test 需要 module feature 下的 nuwax-core
+nuwax-core = { path = "../nuwax-core" }
 
 [[bench]]
 name = "astar_bench"
@@ -36,5 +41,6 @@ required-features = ["bench"]
 
 [features]
 default = []
-module = []                # stream/RPC 适配层（待 Foundation types-messages 完成后启用）
+# rework22 P0-11:stream/RPC 适配层(module.rs) + nuwax-core In/Out 端口
+module = ["dep:nuwax-core"]
 bench = []                 # 启用 benchmark

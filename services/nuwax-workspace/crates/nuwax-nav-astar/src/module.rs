@@ -7,11 +7,13 @@
 //! - RPC：`set_goal / cancel_goal / get_state / is_goal_reached / set_replanning_enabled / set_safe_goal_clearance`。
 //!
 //! 与 Python `dimos/navigation/replanning_a_star/module.py` 行为对齐，但不引入 LCM/DDS。
-
-// 当前 Foundation 未交付，本模块保留 trait 占位，避免编译错误
-// Foundation 完成后切换为：
-//   use nuwax_nav_types_messages::*;
-//   use nuwax_nav_base::{NavigationInterface, NavError};
+//!
+//! ## rework22 P0-11
+//!
+//! 新增 `Module` trait(对外契约的 10Hz lifecycle + 三个 `on_*` 输入),
+//! 与既有 `NavigationInterface` 共存(后者为 RPC 旧名,前者为新版契约)。
+//! `ModuleOutput` 表示本 tick 产生的主要输出;端口用 `nuwax-core::channel`
+//! mpsc 实现 in-memory mock,不做 LCM/DDS 接线。
 
 use crate::global_planner::{GlobalPlanner, GlobalPlannerConfig};
 use crate::helpers::{NavError, PoseStamped, Twist2};
@@ -103,6 +105,63 @@ impl NavigationInterface for ReplanningAStarPlannerModule {
 /// 一次性 cmd_vel 推算 helper（供 Phase 1 测试或上层 stream 适配层使用）
 pub fn twist_to_proto(t: Twist2) -> (f64, f64) {
     (t.linear.x, t.angular_z)
+}
+
+// ===== rework22 P0-11:Module trait + ModuleOutput + 端口工厂 =====
+
+/// rework22 P0-11 `Module` trait。
+///
+/// 三个输入(`on_odom / on_costmap / on_goal`)和 lifecycle (`start / stop`)。
+/// 单一 trait 避免和上面 `NavigationInterface` 重复;`NavigationInterface`
+/// 继续保留作 RPC 旧名。
+pub trait Module: Send + Sync + 'static {
+    /// 启动模块(幂等)
+    fn start(&mut self) -> Result<(), NavError>;
+    /// 停止模块(幂等)
+    fn stop(&mut self) -> Result<(), NavError>;
+    /// 收到 odom 输入
+    fn on_odom(&mut self, odom: PoseStamped);
+    /// 收到 costmap 输入
+    fn on_costmap(&mut self, grid: crate::navigation_map::CostMap2D);
+    /// 主动 goal(RPC `set_goal` 等价入口)
+    fn on_goal(&mut self, goal: PoseStamped) -> Result<ModuleOutput, NavError>;
+}
+
+/// 模块单次输出(rework22 P0-11)
+#[derive(Debug, Clone)]
+pub enum ModuleOutput {
+    /// 产生一条 Path2D
+    Path(crate::helpers::Path2D),
+    /// 产生一条 Twist2 cmd_vel
+    Twist(Twist2),
+    /// 报告 goal_reached(true / false)
+    GoalReached(bool),
+    /// 无输出(idle / 等待输入)
+    None,
+}
+
+impl Module for ReplanningAStarPlannerModule {
+    fn start(&mut self) -> Result<(), NavError> {
+        NavigationInterface::start(self)
+    }
+
+    fn stop(&mut self) -> Result<(), NavError> {
+        NavigationInterface::stop(self)
+    }
+
+    fn on_odom(&mut self, odom: PoseStamped) {
+        self.planner.handle_odom(odom);
+    }
+
+    fn on_costmap(&mut self, _grid: crate::navigation_map::CostMap2D) {
+        // Phase 1 占位:costmap 输入留 hook 给后续 PR 接到 NavigationMap。
+    }
+
+    fn on_goal(&mut self, goal: PoseStamped) -> Result<ModuleOutput, NavError> {
+        self.planner.handle_goal_request(goal);
+        // Phase 1 立即返回 None;Phase 2 包成 Path2D 输出
+        Ok(ModuleOutput::None)
+    }
 }
 
 #[cfg(test)]

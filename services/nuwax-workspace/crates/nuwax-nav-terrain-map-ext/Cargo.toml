@@ -10,6 +10,7 @@ publish.workspace = true
 description = "Pure-Rust extended terrain map processor with voxel rolling grid, decay and connectivity (Phase 3 migration of terrain_map_ext.py)."
 
 [features]
+default = ["module"]
 module = []
 
 [dependencies]

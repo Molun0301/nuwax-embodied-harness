@@ -1514,6 +1514,7 @@ dependencies = [
  "glam",
  "nalgebra 0.33.3",
  "ndarray",
+ "nuwax-core",
  "nuwax-nav-base",
  "nuwax-nav-types-messages",
  "nuwax-numeric",
@@ -1616,6 +1617,9 @@ dependencies = [
  "image",
  "imageproc",
  "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
  "tracing",
  "validator",
 ]

@@ -10,9 +10,11 @@ publish.workspace = true
 description = "Pure-Rust grid A* global route planner for the navigation stack (Phase 3 migration of simple_planner.py)."
 
 [features]
-# 默认关闭；启用后提供 stream/RPC 适配器骨架
+# 默认开启 module —— 用户的"完整功能"硬约束要求 module 编译进默认 build
+default = ["module", "viz"]
+# stream/RPC 适配器骨架
 module = []
-# 默认关闭；启用后提供 costmap_cloud 可视化点云输出
+# costmap_cloud 可视化点云输出
 viz = []
 
 [dependencies]

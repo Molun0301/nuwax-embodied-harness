@@ -115,10 +115,9 @@ pub fn twist_to_proto(t: Twist2) -> (f64, f64) {
 /// 单一 trait 避免和上面 `NavigationInterface` 重复;`NavigationInterface`
 /// 继续保留作 RPC 旧名。
 pub trait Module: Send + Sync + 'static {
-    /// 启动模块(幂等)
-    fn start(&mut self) -> Result<(), NavError>;
-    /// 停止模块(幂等)
-    fn stop(&mut self) -> Result<(), NavError>;
+    /// 10Hz lifecycle tick(等价于"启动并 tick")。`NavigationInterface::start/stop`
+    /// 仍可独立调用,RPC 层用 NavigationInterface;Module 层的 lifecycle 由本 trait 拥有。
+    fn tick(&mut self) -> ModuleOutput;
     /// 收到 odom 输入
     fn on_odom(&mut self, odom: PoseStamped);
     /// 收到 costmap 输入
@@ -141,12 +140,13 @@ pub enum ModuleOutput {
 }
 
 impl Module for ReplanningAStarPlannerModule {
-    fn start(&mut self) -> Result<(), NavError> {
-        NavigationInterface::start(self)
-    }
-
-    fn stop(&mut self) -> Result<(), NavError> {
-        NavigationInterface::stop(self)
+    fn tick(&mut self) -> ModuleOutput {
+        // Phase 1 占位:从 self.planner 收集本 tick 输出
+        if self.planner.is_goal_reached() {
+            ModuleOutput::GoalReached(true)
+        } else {
+            ModuleOutput::None
+        }
     }
 
     fn on_odom(&mut self, odom: PoseStamped) {
@@ -154,7 +154,7 @@ impl Module for ReplanningAStarPlannerModule {
     }
 
     fn on_costmap(&mut self, _grid: crate::navigation_map::CostMap2D) {
-        // Phase 1 占位:costmap 输入留 hook 给后续 PR 接到 NavigationMap。
+        // Phase 1 占位:costmap 输入留 hook 后续 PR 接到 NavigationMap。
     }
 
     fn on_goal(&mut self, goal: PoseStamped) -> Result<ModuleOutput, NavError> {

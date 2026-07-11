@@ -40,7 +40,7 @@ harness = false
 required-features = ["bench"]
 
 [features]
-default = []
+default = ["module"]
 # rework22 P0-11:stream/RPC 适配层(module.rs) + nuwax-core In/Out 端口
 module = ["dep:nuwax-core"]
 bench = []                 # 启用 benchmark

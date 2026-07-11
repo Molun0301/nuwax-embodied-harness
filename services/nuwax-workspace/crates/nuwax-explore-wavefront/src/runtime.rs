@@ -114,6 +114,39 @@ pub trait WavefrontGoalSink {
     fn publish(&mut self, goal: FrontierGoal);
 }
 
+/// 单次发布的 active goal 状态机(rework22 P0-10)。
+///
+/// `InFlight` 表示已发布但尚未收到 reached / failed / timeout 反馈;
+/// 在该状态下 `tick()` 不会重复发布新 goal,直到下游上报终止信号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalStatus {
+    /// 已发布,等待下游反馈
+    InFlight,
+    /// 下游报告已到达
+    Reached,
+    /// 下游报告失败(导航链路 / 路径 / 校验等)
+    Failed,
+    /// 超过 `cfg.goal_timeout_ms` 未收到反馈,被 runtime 自身视作超时
+    Timeout,
+    /// 上层主动取消(例如 user cancel / stop_movement)
+    Cancelled,
+}
+
+/// 当前已发布但未终结的 active goal(rework22 P0-10 active-goal gate)。
+///
+/// `pending_goal` 字段保留该信息,直到 runtime 收到 `Reached / Failed /
+/// Timeout / Cancelled` 终结信号。`tick()` 在 `pending_goal.status == InFlight`
+/// 时跳过重新选 goal + publish 步骤,避免在下游尚未处理完旧 goal 时堆积新目标。
+#[derive(Debug, Clone)]
+pub struct PendingGoal {
+    /// 最近一次发布的 goal
+    pub target: FrontierGoal,
+    /// 发布时刻(runtime `Timestamp`)
+    pub published_at: Timestamp,
+    /// 当前状态
+    pub status: GoalStatus,
+}
+
 /// Runtime diagnostics(测试可断言)
 #[derive(Debug, Clone)]
 pub struct RuntimeDiagnostics {
@@ -208,6 +241,9 @@ where
     goal_reached_flag: bool,
     last_goal_published_at: Option<Timestamp>,
     timeout_failure_count: u32,
+    /// rework22 P0-10:最近一次发布但未终结的 active goal。
+    /// 字段存在表示"已有 active goal",runtime 在 `InFlight` 状态不会重复发布。
+    pending_goal: Option<PendingGoal>,
     last_outcome: Option<String>,
     last_no_input_wait: Option<MissingInput>,
     ticks_processed: u64,
@@ -254,6 +290,7 @@ where
             goal_reached_flag: false,
             last_goal_published_at: None,
             timeout_failure_count: 0,
+            pending_goal: None,
             last_outcome: None,
             last_no_input_wait: None,
             ticks_processed: 0,
@@ -305,6 +342,7 @@ where
         self.goal_reached_flag = false;
         self.last_goal_published_at = None;
         self.timeout_failure_count = 0;
+        self.pending_goal = None;
         self.active = true;
         self.movement_held = true;
         self.phase = RuntimePhase::Active;
@@ -341,6 +379,10 @@ where
     /// 方案 §4.11 行为:`goal_reached` 输入入口;`nuwax-exploration` runtime adapter
     /// 收到 navigation 反馈后调用本方法。
     /// 非 active 视为 no-op。
+    ///
+    /// rework22 P0-10:active-goal gate:同步将 `pending_goal` 从 `InFlight` 推到
+    /// `Reached` / `Failed`,下一 tick 即可重新选 goal(rework22 P0-11 之前的
+    /// `goal_reached_flag` 兼容路径同时保留,新代码以 `pending_goal.status` 为主)。
     pub fn report_goal_reached(&mut self, reached: bool) {
         if self.phase != RuntimePhase::Active {
             return;
@@ -350,6 +392,19 @@ where
             // 重置 timeout 计数(成功路径)
             self.timeout_failure_count = 0;
             self.last_goal_published_at = None;
+            // 推进 pending_goal 状态机(若存在)
+            if let Some(pg) = self.pending_goal.as_mut() {
+                if pg.status == GoalStatus::InFlight {
+                    pg.status = GoalStatus::Reached;
+                }
+            }
+        } else {
+            // 失败反馈:同样终结 pending_goal,让下一 tick 重新选
+            if let Some(pg) = self.pending_goal.as_mut() {
+                if pg.status == GoalStatus::InFlight {
+                    pg.status = GoalStatus::Failed;
+                }
+            }
         }
     }
 
@@ -363,6 +418,12 @@ where
     #[must_use]
     pub fn timeout_failure_count(&self) -> u32 {
         self.timeout_failure_count
+    }
+
+    /// 当前 pending goal(若有)——测试可断言
+    #[must_use]
+    pub fn pending_goal(&self) -> Option<&PendingGoal> {
+        self.pending_goal.as_ref()
     }
 
     /// 单次 tick(同步;测试用):调 selector,发布 frontier goal。
@@ -389,6 +450,12 @@ where
         // 用户 stop_movement(MEDIUM-2 修正:不复用 NoInformationGain)
         if self.stop_movement_flag {
             self.stop_movement_flag = false;
+            // rework22 P0-10:取消任何 active pending_goal
+            if let Some(pg) = self.pending_goal.as_mut() {
+                if pg.status == GoalStatus::InFlight {
+                    pg.status = GoalStatus::Cancelled;
+                }
+            }
             self.release_guards();
             self.phase = RuntimePhase::Stopped;
             self.stop_count = self.stop_count.saturating_add(1);
@@ -402,6 +469,10 @@ where
         if self.goal_reached_flag {
             self.goal_reached_flag = false;
             self.last_outcome = Some("goal_reached".to_string());
+            // rework22 P0-10:同时清掉 pending_goal(若仍为 InFlight)
+            // report_goal_reached 已把它推到 Reached,这里直接清。
+            self.pending_goal = None;
+            self.last_goal_published_at = None;
             // 不返回任何 goal;下一 tick 重新走选择
             return Ok(RuntimeTickOutcome::Idle);
         }
@@ -415,24 +486,66 @@ where
             });
         }
 
-        // goal_timeout 检查(方案 §4.11):最近一次 publish 时间距 now 超过 goal_timeout_ms
-        if let Some(published_at) = self.last_goal_published_at {
-            let elapsed_ns = inputs.now.diff_nanos(published_at);
-            let elapsed_ms = (elapsed_ns / 1_000_000) as u64;
-            if elapsed_ms > self.config.goal_timeout_ms {
-                self.timeout_failure_count = self.timeout_failure_count.saturating_add(1);
-                self.last_outcome = Some("goal_timeout".to_string());
-                if self.timeout_failure_count >= self.config.max_consecutive_failures {
-                    // 连续 timeout 超过 max_consecutive_failures:Stop
-                    self.stop_count = self.stop_count.saturating_add(1);
-                    self.release_guards();
-                    self.phase = RuntimePhase::Stopped;
-                    return Ok(RuntimeTickOutcome::Stop {
-                        reason: StopReason::ConsecutiveFailuresExceeded,
-                    });
+        // rework22 P0-10 active-goal gate:有 pending_goal 且状态为 InFlight
+        // 时跳过重新选 goal + publish,避免在下游尚未处理完旧 goal 时堆积。
+        if let Some(pg) = self.pending_goal.as_ref() {
+            if pg.status == GoalStatus::InFlight {
+                // 仍可能 timeout:沿用既有 goal_timeout 判定
+                let elapsed_ns = inputs.now.diff_nanos(pg.published_at);
+                let elapsed_ms = (elapsed_ns / 1_000_000) as u64;
+                if elapsed_ms > self.config.goal_timeout_ms {
+                    // 推进 pending_goal 为 Timeout,清零发布时刻,继续选下一个
+                    if let Some(pg_mut) = self.pending_goal.as_mut() {
+                        pg_mut.status = GoalStatus::Timeout;
+                    }
+                    self.timeout_failure_count =
+                        self.timeout_failure_count.saturating_add(1);
+                    self.last_outcome = Some("goal_timeout".to_string());
+                    if self.timeout_failure_count >= self.config.max_consecutive_failures {
+                        self.stop_count = self.stop_count.saturating_add(1);
+                        self.release_guards();
+                        self.phase = RuntimePhase::Stopped;
+                        return Ok(RuntimeTickOutcome::Stop {
+                            reason: StopReason::ConsecutiveFailuresExceeded,
+                        });
+                    }
+                    self.last_goal_published_at = None;
+                    // 清 pending_goal(本 tick 不再视为 active)
+                    self.pending_goal = None;
+                } else {
+                    // 仍在等待下游反馈,不发布新 goal
+                    self.last_outcome = Some("goal_in_flight".to_string());
+                    return Ok(RuntimeTickOutcome::Idle);
                 }
-                // 单次 timeout:把已发布 goal 视为已"放弃",继续选下一个
+            } else {
+                // 已终结(Reached / Failed / Cancelled / Timeout),本 tick
+                // 重新选 goal 之前先清掉旧 pending_goal。
+                self.pending_goal = None;
                 self.last_goal_published_at = None;
+            }
+        }
+
+        // goal_timeout 检查(方案 §4.11):最近一次 publish 时间距 now 超过 goal_timeout_ms
+        // (兼容旧路径;当 pending_goal 为 None 时仍走原逻辑。)
+        if self.pending_goal.is_none() {
+            if let Some(published_at) = self.last_goal_published_at {
+                let elapsed_ns = inputs.now.diff_nanos(published_at);
+                let elapsed_ms = (elapsed_ns / 1_000_000) as u64;
+                if elapsed_ms > self.config.goal_timeout_ms {
+                    self.timeout_failure_count = self.timeout_failure_count.saturating_add(1);
+                    self.last_outcome = Some("goal_timeout".to_string());
+                    if self.timeout_failure_count >= self.config.max_consecutive_failures {
+                        // 连续 timeout 超过 max_consecutive_failures:Stop
+                        self.stop_count = self.stop_count.saturating_add(1);
+                        self.release_guards();
+                        self.phase = RuntimePhase::Stopped;
+                        return Ok(RuntimeTickOutcome::Stop {
+                            reason: StopReason::ConsecutiveFailuresExceeded,
+                        });
+                    }
+                    // 单次 timeout:把已发布 goal 视为已"放弃",继续选下一个
+                    self.last_goal_published_at = None;
+                }
             }
         }
 
@@ -460,6 +573,12 @@ where
                     .mark_explored_goal(goal.pose.pose.position.to_2d());
                 self.goals_published = self.goals_published.saturating_add(1);
                 self.last_goal_published_at = Some(inputs.now);
+                // rework22 P0-10:记录 active goal,后续 tick 不会重复 publish
+                self.pending_goal = Some(PendingGoal {
+                    target: goal.clone(),
+                    published_at: inputs.now,
+                    status: GoalStatus::InFlight,
+                });
                 self.last_outcome = Some("goal".to_string());
                 Ok(RuntimeTickOutcome::Goal(goal))
             }
@@ -541,6 +660,10 @@ where
     fn release_guards(&mut self) {
         self.active = false;
         self.movement_held = false;
+        // rework22 P0-10:释放 guard 时一并清理 pending_goal,避免下次 begin
+        // 误读到 stale active goal。
+        self.pending_goal = None;
+        self.last_goal_published_at = None;
     }
 
     /// 连续失败次数超限时自动 stop

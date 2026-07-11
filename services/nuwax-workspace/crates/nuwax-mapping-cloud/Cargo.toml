@@ -20,3 +20,10 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+
+# P1 #5 (rework22 Lane D): cloud 依赖 Google Maps API key,
+# Go2 单机部署不需要,一律默认禁用。开启 `cloud-enabled` 时可显式打开
+# (例如开发 / 调试阶段)。`Disabled` 错误码会在 feature off 时返给调用方。
+[features]
+default = []
+cloud-enabled = []

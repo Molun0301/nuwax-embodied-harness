@@ -47,6 +47,100 @@ pub enum OccupancyValue {
     Occupied = 100,
 }
 
+/// 单元（保留原始 int8 + 可选概率，rework22 P1 #1）
+///
+/// 用途：当 OccupancyGrid.data 中存在 1..99 概率值（dimos Python `_preprocess`
+/// `ProbabilityCost` / `ProbabilisticOccupancy` 算法产物），`OccupancyValue::from_i8`
+/// 只能识别三态（0/100/-1），中间概率全部映射为 Unknown，丢失信息。
+///
+/// `OccupancyCell` 同时保留：
+/// - `value: i8` —— 原始 int8（与 wire format 兼容，1..99 是概率，100=致死）
+/// - `prob: Option<f32>` —— 可选显式概率（0.0~1.0），上层有需要时设置
+///
+/// 兼容策略：
+/// - `OccupancyValue` enum 不变（API 兼容）
+/// - `OccupancyCell::to_value()` 按">=100 → Occupied, ==0 → Free, 其他 → Unknown"
+///   转 enum（保留 from_i8 语义）
+/// - `OccupancyCell::from_value()` 反向
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OccupancyCell {
+    /// 原始 int8（-1=Unknown, 0=Free, 1..99=概率, 100=致死）
+    pub value: i8,
+    /// 可选概率（0.0~1.0）。None 表示未设置概率值
+    pub prob: Option<f32>,
+}
+
+impl OccupancyCell {
+    /// 从 i8 构造（无显式概率）
+    #[must_use]
+    pub fn from_i8(v: i8) -> Self {
+        Self { value: v, prob: None }
+    }
+
+    /// 从 i8 + 概率构造
+    #[must_use]
+    pub fn from_i8_with_prob(v: i8, prob: f32) -> Self {
+        Self {
+            value: v,
+            prob: Some(prob.clamp(0.0, 1.0)),
+        }
+    }
+
+    /// 转 OccupancyValue enum（三态语义）
+    #[must_use]
+    pub fn to_value(&self) -> OccupancyValue {
+        match self.value {
+            0 => OccupancyValue::Free,
+            100 => OccupancyValue::Occupied,
+            _ => OccupancyValue::Unknown,
+        }
+    }
+
+    /// 从 OccupancyValue 构造（概率 = None）
+    #[must_use]
+    pub fn from_value(v: OccupancyValue) -> Self {
+        Self {
+            value: v as i8,
+            prob: None,
+        }
+    }
+
+    /// 是否为致死占据
+    #[must_use]
+    pub fn is_lethal(&self) -> bool {
+        self.value >= 100
+    }
+
+    /// 是否存在概率值（1..99 或 prob 显式设置）
+    #[must_use]
+    pub fn has_probability(&self) -> bool {
+        self.prob.is_some() || (1..100).contains(&self.value)
+    }
+
+    /// 取概率值：若 prob 显式设置则用之，否则从 value 推断（100 → 1.0, 0 → 0.0）
+    #[must_use]
+    pub fn probability(&self) -> f32 {
+        if let Some(p) = self.prob {
+            return p;
+        }
+        match self.value {
+            v if v >= 100 => 1.0,
+            0 => 0.0,
+            v if v > 0 => f32::from(v) / 100.0,
+            _ => -1.0, // Unknown: 特殊标记（caller 应解读为"未观测"）
+        }
+    }
+}
+
+impl Default for OccupancyCell {
+    fn default() -> Self {
+        Self {
+            value: -1,
+            prob: None,
+        }
+    }
+}
+
 impl OccupancyValue {
     /// 从原始 i8 转换（Python OccupancyGrid.lcm_encode 直接 `flatten().tolist()`）
     ///

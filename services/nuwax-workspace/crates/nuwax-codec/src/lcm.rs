@@ -213,48 +213,98 @@ pub fn golden_point_cloud2() -> CodecResult<Bytes> {
 }
 
 // ============================================================================
-// P1 入口:Python/C++ LCM wire-format golden bytes
+// 2026-07-11 rework22 P0-03:Pose/Odometry/PointCloud2 wire-format encoders
 // ============================================================================
 //
-// 当前环境无 system `lcm` / `lcm-gen`,且 `lcm_msgs.tar.gz` 是 LFS pointer。
-// P0-B 阶段:`expected_lcm_bytes` 一律返回 `None`,表示 reference bytes
-// 不可用。P1 阶段由 `nuwax-codec` 接入 `lcm` crate 后,在该函数实现内
-// 拉起一个真 LCM publish channel,生成 reference bytes 并返回 `Some(...)`。
-// `tests/lcm_cross_module_consistency.rs` 新增 `[ignore = "requires system LCM"]`
-// 的端到端 test 会消费这些 bytes。
+// 用户决策(rework22 P0-03):不做双向 golden(不与 Python/C++ LCM 字节级
+// 对齐),只保证 LCM 1.x 标准 wire-format 字节序正确(全部 f64 / u32 大端,
+// 字段顺序与 `lcm-gen` 输出 schema 一致)。
+//
+// 这些 encoder 是 codec 层的 **纯函数** —— 输入是 7 个 f64 / 字符串 + u32 组合,
+// 输出是 LCM 字节序 payload,**不**拼装 envelope(由 liblcm 在 wire 上加)。
 
-/// 拉取 (topic, msg_type) 对应的 system LCM reference bytes。
+/// Pose wire-format encoder(LCM 1.x 大端)
+/// 字段顺序(x, y, z, qw, qx, qy, qz)与 `lcm-gen` 生成的
+/// `geometry_msgs/Pose.c` __encode_array 一致:
+/// `lcm-gen` 把 quaternion 按 (w,x,y,z) 输出,这点与 ROS geometry_msgs
+/// 习惯 (x,y,z,w) **不同**,必须保留。
 ///
-/// P0-B 阶段永远返回 `None`。P1 阶段当 environment 满足
-/// (system `lcm` / `lcm-gen` 可用,`lcm_msgs.tar.gz` 已 LFS-fetch) 时,
-/// 该函数会被填实。
-///
-/// # Args
-///
-/// * `topic` — LCM channel,如 `/pose_stamped`
-/// * `msg_type` — message type FQN,如 `geometry_msgs/PoseStamped`
-///
-/// # Returns
-///
-/// - `Some(bytes)` — system LCM publish 输出的 wire-format bytes
-/// - `None` — 当前不可用,P1 占位
+/// 输出字节数 = 7 × 8 = 56 字节(全为 f64 BE)。
 #[must_use]
-pub fn expected_lcm_bytes(topic: &str, msg_type: &str) -> Option<Bytes> {
-    let _ = (topic, msg_type);
-    None
+pub fn encode_pose(position: [f64; 3], orientation_wxyz: [f64; 4]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(56);
+    for v in &position {
+        buf.extend_from_slice(&v.to_be_bytes());
+    }
+    for v in &orientation_wxyz {
+        buf.extend_from_slice(&v.to_be_bytes());
+    }
+    debug_assert_eq!(buf.len(), 56, "Pose wire-format 必须为 56 字节");
+    buf
+}
+
+/// Odometry wire-format encoder(LCM 1.x 大端,简化版)
+///
+/// P0 阶段只覆盖最小字段:
+/// - `pose.position` (3 × f64 BE) + `pose.orientation` (4 × f64 BE) = 56 字节
+/// - `twist.linear` (3 × f64 BE) + `twist.angular` (3 × f64 BE) = 48 字节
+///
+/// 总计 104 字节。不覆盖 covariance(36 × f64 BE = 288 字节)与 timestamp /
+/// frame_id —— 上游 Python 链路如需完整 ROS nav_msgs/Odometry 兼容,
+/// 由 transport 层负责 `Odometry <-> Odometry` 字段对齐,本 encoder 只
+/// 保证 LCM 字节序正确。
+#[must_use]
+pub fn encode_odom_minimal(
+    pose_position: [f64; 3],
+    pose_orientation_wxyz: [f64; 4],
+    twist_linear: [f64; 3],
+    twist_angular: [f64; 3],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(104);
+    for v in pose_position.iter().chain(pose_orientation_wxyz.iter()) {
+        buf.extend_from_slice(&v.to_be_bytes());
+    }
+    for v in twist_linear.iter().chain(twist_angular.iter()) {
+        buf.extend_from_slice(&v.to_be_bytes());
+    }
+    debug_assert_eq!(buf.len(), 104, "Odometry minimal wire-format 必须为 104 字节");
+    buf
+}
+
+/// PointCloud2 wire-format stub(LCM 1.x 大端,最小骨架)
+///
+/// P0 阶段只覆盖:
+/// - `frame_id` (len-prefixed string: u32 BE 长度 + UTF-8 bytes)
+/// - `width` (u32 BE)
+/// - `height` (u32 BE)
+/// - `point_step` (u32 BE)
+///
+/// 不覆盖 `data[]` / `fields[]` / `is_bigendian` / `is_dense` —— 上游
+/// Python 链路如需完整 ROS sensor_msgs/PointCloud2 兼容,由 transport 层
+/// 负责 `PointCloud2 <-> PointCloud` 字段对齐。本 stub 只保证 LCM
+/// 字节序正确 + 字段顺序对齐 `lcm-gen` 生成的 `sensor_msgs/PointCloud2.c`。
+#[must_use]
+pub fn encode_pointcloud2_stub(
+    frame_id: &str,
+    width: u32,
+    height: u32,
+    point_step: u32,
+) -> Vec<u8> {
+    let frame_bytes = frame_id.as_bytes();
+    // u32 BE 长度字段 + frame_id bytes + 3 个 u32 BE = 4 + len(frame) + 12
+    let mut buf = Vec::with_capacity(4 + frame_bytes.len() + 12);
+    let len = u32::try_from(frame_bytes.len()).expect("frame_id 长度超过 u32");
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(frame_bytes);
+    buf.extend_from_slice(&width.to_be_bytes());
+    buf.extend_from_slice(&height.to_be_bytes());
+    buf.extend_from_slice(&point_step.to_be_bytes());
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn expected_lcm_bytes_returns_none_in_p0() {
-        // P0 阶段 system LCM 不可用;P1 接入后该测试会被替换为对 Some 字节的断言。
-        assert!(expected_lcm_bytes("/pose_stamped", "geometry_msgs/PoseStamped").is_none());
-        assert!(expected_lcm_bytes("/odom", "nav_msgs/Odometry").is_none());
-        assert!(expected_lcm_bytes("/points", "sensor_msgs/PointCloud2").is_none());
-    }
 
     #[test]
     fn golden_pose_stamped_header_size() {

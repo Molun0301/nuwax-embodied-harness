@@ -7,9 +7,9 @@
 //!   这是 P0-B "LCM adapter foundation + Rust 内部 stable contract" 的
 //!   最低可验收条件。
 //! - **不在 P0 范围**:与 system LCM(Python / C++)的真实 wire-format 对账
-//!   — 依赖 `lcm_msgs.tar.gz` 已 LFS-fetch + system `lcm` / `lcm-gen`
-//!   可用。P1 阶段新增 `[ignore = "requires system LCM"]` 的端到端 test,
-//!   由 `nuwax_codec::lcm::expected_lcm_bytes` 提供 reference bytes。
+//!   — 用户决策(rework22 P0-03)**不**做双向 golden。`expected_lcm_bytes`
+//!   已物理删除,byte-level 与 Python lcmpubsub 的一致性由 P1 阶段
+//!   实机对接测试覆盖。
 //!
 //! 该测试作为 integration test 存在,以强制 codec + protocol 同时被构建,
 //! 而不是仅靠各自 crate 的 unit test。

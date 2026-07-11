@@ -109,28 +109,32 @@ impl VoxelHashMap {
 
     /// 插入一批 voxel keys（带列雕刻）
     ///
-    /// 对应 Python `VoxelGrid._carve_and_insert(new_keys)` —— 删除同 (X,Y) 已存在
-    /// voxel 再 insert 新键。本期为骨架兼容版（P2 follow-up 替换 Open3D 后再做真
-    /// 实 GPU 加速实现）；当前先在 Rust 侧做"列雕刻"语义近似：
-    /// 对每个新 key，移除同 `(ix, iy)` 的所有 block（不论 iz），再 insert。
+    /// 对应 Python `VoxelGrid._carve_and_insert(new_keys)`（dimos/mapping/voxels.py:120-153）：
+    ///   1. 删除同 `(ix, iy)` 已存在 block（不论 iz）—— "列雕刻"
+    ///   2. 真正 insert 新键对应的 occupancy（每点写回原 occupancy 值）
     ///
-    /// 实现开销：O(N) extra hashmap 扫描；GPU 版可降到 O(N)。
+    /// 本期（rework22 P0-09.2）**真激活**新 voxel keys：原骨架版只删不 insert，
+    /// 调用方需自己重传 points 再调 `insert_points_par`，实际使用中容易漏。
+    /// 现在 `carve_and_insert` 自己消费 points 并完整执行两步。
+    ///
+    /// 实现开销：O(N) extra hashmap 扫描 + O(N) insert；GPU 版可降到 O(N)（P2）。
     pub fn carve_and_insert<I: IntoIterator<Item = (Point3<f64>, u8)>>(&mut self, points: I) {
-        // Step 1: 收集 (ix, iy) 待雕刻组
-        let mut new_keys: Vec<VoxelKey> = Vec::new();
-        for (p, _) in points {
-            let k = VoxelKey::from_world(p, self.voxel_size);
-            new_keys.push(k);
-        }
+        // Step 1：物化 points + 收集新 key（points 是 IntoIterator，可能是一次性的）
+        let points: Vec<(Point3<f64>, u8)> = points.into_iter().collect();
+        let new_keys: Vec<VoxelKey> = points
+            .iter()
+            .map(|(p, _)| VoxelKey::from_world(*p, self.voxel_size))
+            .collect();
 
-        // Step 2: 列雕刻 —— 删除同 (ix, iy) 已存在 block
+        // Step 2：列雕刻 —— 删除同 (ix, iy) 已存在 block
         let carve_xy: ahash::AHashSet<(i64, i64)> =
             new_keys.iter().map(|k| (k.ix, k.iy)).collect();
         self.blocks.retain(|k, _| !carve_xy.contains(&(k.ix, k.iy)));
 
-        // Step 3: insert 新键（fallback 直接用 self.insert_point，保持原行为）
-        // 注意：上面 points 已被消费，重新迭代需要 caller 重传；这里直接 noop，
-        // 由调用方在 `insert_points_par` 后再调用本方法。
+        // Step 3：真正 insert 新键（直接走 insert_point 路径，保证 (ix,iy,iz) 落点正确）
+        for (p, occ) in points {
+            self.insert_point(p, occ);
+        }
     }
 
     /// 释放 CUDA 缓存（对应 Python `o3c.cuda.release_cache()`）

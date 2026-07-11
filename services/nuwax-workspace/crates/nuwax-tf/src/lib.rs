@@ -96,6 +96,17 @@ impl TfTree {
 
     /// 链式查询：从 `from` 到 `to` 的总变换（向上回溯到共同祖先再向下）
     ///
+    /// 语义：返回变换 `T`，使得 `T · p_in_from == p_in_to`，即
+    /// 把 `from` 坐标系下的点变换到 `to` 坐标系。
+    ///
+    /// 算法：
+    /// 1. 沿 `from` 向上回溯到 root，记录每一级 `(frame, child→parent)`。
+    /// 2. 沿 `to` 向上回溯到 root，记录每一级 `(frame, child→parent)`。
+    /// 3. 找最近共同祖先 `a`。
+    /// 4. `from → a` 用向上链的反向（即对每条 child→parent 取 inverse 累乘）。
+    /// 5. `a → to` 用向下链（即对每条 child→parent 取 inverse 累乘），方向相反。
+    /// 6. 总变换 = `(from→a) * (a→to)`。
+    ///
     /// # Errors
     /// 当链路不可达时返回 `TfError::Disconnected`
     pub fn chain(&self, from: &str, to: &str) -> TfResult<Isometry3<f64>> {
@@ -104,9 +115,9 @@ impl TfTree {
         }
 
         // 沿 from 向上走到 root，记录每一级 (frame, child→parent transform)
-        // up_from[0] = (from, transform from → parent(from))
-        // up_from[i] = (frame_i, transform frame_i → parent(frame_i))
-        // 最后一级是 root（root 没有父变换，用 identity 兜底）
+        // up_from[0] = (from, T: from → parent(from))
+        // up_from[i] = (frame_i, T: frame_i → parent(frame_i))
+        // 最后一级是 root（root 没有父变换，用 identity 兜底）。
         let mut up_from: Vec<(String, Isometry3<f64>)> = Vec::new();
         let mut cursor = from.to_string();
         loop {
@@ -127,7 +138,7 @@ impl TfTree {
             }
         }
 
-        // 沿 to 向上走到 root，同样记录每一级
+        // 沿 to 向上走到 root，同样记录每一级 (frame, child→parent)。
         let mut up_to: Vec<(String, Isometry3<f64>)> = Vec::new();
         cursor = to.to_string();
         loop {
@@ -148,7 +159,7 @@ impl TfTree {
             }
         }
 
-        // 找最近共同祖先：在 up_from 中找到最后一个（最深的）frame 出现在 up_to 集合里。
+        // 找最近共同祖先：up_from 中最深的（rposition）也出现在 up_to 集合里。
         let to_frames: HashSet<&String> = up_to.iter().map(|(f, _)| f).collect();
         let ancestor_idx = match up_from.iter().rposition(|(f, _)| to_frames.contains(f)) {
             Some(i) => i,
@@ -161,15 +172,26 @@ impl TfTree {
         };
         let ancestor = up_from[ancestor_idx].0.clone();
 
-        // 累乘 from → ancestor：每一级 tr 是 child→parent，从 from 开始逐级向上。
-        // 但 ancestor 这一级本身不需要应用（ancestor 是目标，不是中间节点）。
-        // 所以只取 up_from[..ancestor_idx]。
-        let mut t = Isometry3::identity();
-        for (_, tr) in up_from.iter().take(ancestor_idx) {
-            t = *tr * t;
-        }
+        // 累乘 from → ancestor：
+        // `Isometry3::from_parts(trans, q)` 是 body→parent 的方向（即把 child-frame 的
+        // 点映到 parent-frame），其 translation 是 body 在 parent 中的位置。
+        // 因此树上存的 tr 直接就是把 child-frame 点映到 parent-frame 的变换。
+        // 沿 up_from 向上走时，每一级 tr 正是我们要的方向（child→parent），直接累乘即可。
+        let from_to_ancestor = up_from
+            .iter()
+            .take(ancestor_idx)
+            .fold(Isometry3::identity(), |acc, (_, tr)| tr * acc);
 
-        // 累乘 ancestor → to：从 ancestor 向下到 to，需要找到 to_frames 中 ancestor 的位置。
+        // 累乘 ancestor → to：
+        // 现在我们要从 ancestor（parent）下到 to（child），方向与存储的 tr 相反，
+        // 因此每级取 inverse。
+        // up_to[0] = (to, tr: to→parent(to))，
+        // up_to[k] = (frame_k, tr: frame_k→parent(frame_k))。
+        // up_to[to_ancestor_idx] = (ancestor, identity)；to 自身在 up_to[0]。
+        // 路径 ancestor → to 依次经过 ancestor 的 child → ... → to 的父 → to 自身。
+        // 在 up_to 中按从 to 到 ancestor 的顺序：up_to[0]=to, ..., up_to[to_ancestor_idx]=ancestor。
+        // 反向遍历：up_to[to_ancestor_idx - 1]（ancestor 的 child）→ ... → up_to[0]（to 本身），
+        // 每级 tr 是 child→parent 方向（向上），取 inverse 才是 ancestor→child 方向（向下）。
         let to_ancestor_idx = match up_to.iter().position(|(f, _)| f == &ancestor) {
             Some(i) => i,
             None => {
@@ -179,65 +201,15 @@ impl TfTree {
                 });
             }
         };
-        // up_to[0] = (to, tr_to→parent(to))
-        // up_to[to_ancestor_idx] = (ancestor, identity)
-        // 向下走：从 ancestor 到 to 的方向是 up_to[to_ancestor_idx - 1], ..., up_to[0]
-        // 每级 tr 是 child→parent，但我们向下走要的是 parent→child 的方向……不对。
-        // 重新思考：
-        //   up_to[k] = (frame_k, tr_k: child=frame_k, parent=parent(frame_k))
-        //   所以 frame_k = to, parent(to), grandparent(to), ..., ancestor
-        // 向下走 ancestor → to：先到 parent(ancestor)，再到 parent(parent(ancestor))，... 直到 to
-        // 即 ancestor 的孩子，ancestor 的孙子，... 直到 to
-        // 在 up_to 里：从 up_to[to_ancestor_idx - 1] 开始（这是 ancestor 的孩子），
-        // 反向遍历到 up_to[0]（这是 to 本身）。但 up_to[0] = (to, tr: to→parent(to))。
-        // 应用 tr：把 point_in_to 映射到 point_in_parent(to)。我们要的是把
-        // point_in_parent(to) 映射到 point_in_to，即 inverse。
-        // 所以向下走的累乘顺序：从上到下，每个 transform 取 inverse（除了最后一帧是 to 本身……）。
-        //
-        // 让我们换个思路：up_to[k].tr 是 "frame_k → parent(frame_k)" 的变换。
-        // 要从 ancestor 走到 to，等价于依次穿过 ancestor 的 child, grandchild, ..., to。
-        // 在 up_to 里这些 child 按 from-child-to-root 的顺序是 up_to[to_ancestor_idx-1], ..., up_to[1]（to 的父）。
-        // 但 up_to[0] 是 to 本身，没有"to 的父"这条信息作为 child?不，
-        // up_to[0] = (to, tr_to_parent) 表示 "to 帧里的点 映射到 parent(to) 帧"。
-        // 所以如果 ancestor 走到 to，要从 ancestor 出发，先 apply 一次 child_ancestor → ancestor 的 inverse，
-        // 再 apply 一次 grandchild → child_ancestor 的 inverse，... 直到 to 的父 → to 的 inverse。
-        //
-        // 等等更简单：在 up_to 中，up_to[k].tr 是 child→parent。等价于
-        // `transform that maps a point in frame_k frame to its parent frame`。
-        // 我们要 compose 一个变换 T，使得：给定点 p 在 to 帧的坐标，T·p 给出 p 在 ancestor 帧的坐标。
-        // p 在 ancestor = T · p 在 to
-        //   = (T_{child→parent} 的 inverse) · p 在 child     // 第一次：把 to 的点映到 parent(to)
-        //   = (T_{grandchild→child} 的 inverse) · ...        // 第二次：把 parent(to) 的点映到 grandparent
-        //   ...
-        //   = (T_{ancestor→child(ancestor)} 的 inverse) · p 在 child(ancestor)
-        //
-        // 嗯，那 up_to 里的每一帧 tr_k = (frame_k → parent(frame_k))。
-        // 也就是说 frame_k 的子帧的"父变换"是把子帧点映到 frame_k 的点（即 inverse）。
-        //
-        // 简化思考：up_to[0]=(to, T_to_parent). T_to_parent 把 to-点映到 parent(to)-点。
-        //          up_to[1]=(parent(to), T_parent_to_grandparent). ...
-        //          up_to[k]=(frame_k, T_frame_k_to_parent).
-        // 要 compose 出一个 T_total：把 to-点映到 ancestor-点。
-        //   p_in_parent(to) = T_to_parent · p_in_to
-        //   p_in_grandparent = T_parent_to_grandparent · p_in_parent(to)
-        //   ...
-        //   p_in_ancestor = T_child(ancestor)_to_ancestor · ... · p_in_to
-        //
-        // 所以从 up_to[0] 开始，到 up_to[to_ancestor_idx - 1] 结束：
-        //   T_total = T_child(ancestor)_to_ancestor · ... · T_parent(to)_to_grandparent · T_to_parent
-        // 注意：up_to[to_ancestor_idx - 1].tr 是 child(ancestor) → ancestor 的变换，
-        //       up_to[to_ancestor_idx].tr 是 ancestor → parent(ancestor) 的变换（identity，因为 ancestor 是 root）
-        //
-        // 因此 down-chain 累乘顺序是 up_to[0], up_to[1], ..., up_to[to_ancestor_idx - 1]
-        // 每次累乘 `t = t * tr_k`（左乘），因为 tr_k 把当前点映到上一级。
-        // 实际上更精确：设 T_total_so_far = T_k · ... · T_0（已经能把 to-点映到 frame_k-点）。
-        // 现在乘上 T_{k+1}：新 T_total = T_{k+1} · T_k · ... · T_0。代码里 t = tr * t。
+        let ancestor_to_to = (0..to_ancestor_idx)
+            .rev()
+            .fold(Isometry3::identity(), |acc, k| {
+                let tr = up_to[k].1;
+                tr.inverse() * acc
+            });
 
-        for (_, tr) in up_to.iter().take(to_ancestor_idx) {
-            t = *tr * t;
-        }
-
-        Ok(t)
+        // 总变换：from → ancestor → to
+        Ok(from_to_ancestor * ancestor_to_to)
     }
 }
 

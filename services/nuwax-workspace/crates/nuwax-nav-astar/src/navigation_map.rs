@@ -204,9 +204,14 @@ impl CostMap2D {
 //
 // 单元 cell 距离权重:corner=2, edge=3, center=e=0。
 // 反向 pass 用镜像 mask。
+// rework22 P1 #2:这些常量现由 nuwax_mapping::occupancy::gradient 统一实装,这里保留为参考
+#[allow(dead_code)]
 const MEILHON_A: f64 = 2.0; // 对角(左上)
+#[allow(dead_code)]
 const MEILHON_B: f64 = 3.0; // 边(上)
+#[allow(dead_code)]
 const MEILHON_C: f64 = 2.0; // 对角(右上)
+#[allow(dead_code)]
 const MEILHON_D: f64 = 3.0; // 边(左)
 
 
@@ -267,156 +272,79 @@ impl NavigationMap {
 
     /// 构造 gradient costmap
     ///
-    /// 算法(rework22 P0-12 升级):
-    /// 1. **UNKNOWN 独立通道**:UNKNOWN 单独作为"未知"既不参与 obstacle 膨胀
-    ///    也不参与 FREE cost 计算(独立 u8 通道;见 `UNKNOWN` sentinel)。
-    /// 2. obstacle 半径 `robot_increase * robot_width / resolution` 内打 OCCUPIED
-    ///    (Euclidean inflate),**不**连带 inflate UNKNOWN。
-    /// 3. **Meilhon 9-邻居 EDT**(Meilhon 1999 / Cuisenaire 2002)两遍距离变换,
-    ///    单元 cell 距离误差 < 0.5%(原 Chamfer-8 约 1-2%)。
-    ///    - forward mask:corner=2, edge=3
-    ///    - backward mask:镜像
-    /// 4. `GradientStrategy::Voronoi` 路径当前仍用 EDT(TODO:接入 Voronoi
-    ///    diagram;P2 简化实现 + 注释)。
-    /// 5. cost = clamp(90 - d*9, 0, 90);近 obstacle cost 高。
+    /// rework22 P1 #2 升级:删除 nuwax-astar 自带的 Chamfer-8 EDT 实现,改为调用
+    /// `nuwax_mapping::occupancy::gradient::make_costmap` 统一实装。
+    ///
+    /// 流程:
+    /// 1. 将 `CostMap2D` (binary) 转 `OccupancyGrid` 桥接
+    ///    - OCCUPIED (100) → OccupancyValue::Occupied
+    ///    - UNKNOWN (255) → OccupancyValue::Unknown (不参与膨胀,只标记不可走)
+    ///    - FREE (0) → OccupancyValue::Free
+    /// 2. 调用 `nuwax_mapping::occupancy::gradient::make_costmap`
+    ///    (含 Chamfer-8 EDT + UNKNOWN 不参与膨胀)
+    /// 3. 将结果转回 `CostMap2D`
+    ///
+    /// 注: `GradientStrategy::Voronoi` 路径仍由 mapping 端实现统一处理(暂未启用
+    /// 完整 Voronoi;当前走 EDT)。
     #[must_use]
     pub fn make_gradient_costmap(&self, robot_increase: f64) -> Option<CostMap2D> {
         let binary = self.binary.as_ref()?;
-        let inflate_radius_cells =
-            ((robot_increase * self.robot_width) / binary.resolution()).ceil() as i32;
 
         let width = binary.width();
         let height = binary.height();
-        let mut grad = CostMap2D::new(binary.frame_id(), width, height, binary.resolution());
-        grad.set_origin(binary.origin);
+        let resolution = binary.resolution();
 
-        // rework22 P0-12 step 1:obstacle / unknown 二值化,但 UNKNOWN 走独立通道。
-        // UNKNOWN 在 gradient 里**仍标记为 OCCUPIED**(基础值,与既有契约一致),
-        // 但步骤 2 圆盘膨胀时 UNKNOWN 不作为"膨胀源"(避免污染周边 free 区域)。
+        // 阶段 1: CostMap2D → OccupancyGrid 桥接
+        let mut occ_grid = nuwax_mapping::occupancy::OccupancyGrid::new(
+            width as u32,
+            height as u32,
+            resolution,
+        );
         for y in 0..height {
             for x in 0..width {
                 let v = binary.get(x, y);
-                if v == OCCUPIED || v == UNKNOWN {
-                    grad.set(x, y, OCCUPIED);
+                let mapped = if v == OCCUPIED {
+                    nuwax_mapping::occupancy::types::OccupancyValue::Occupied
+                } else if v == UNKNOWN {
+                    nuwax_mapping::occupancy::types::OccupancyValue::Unknown
                 } else {
-                    grad.set(x, y, FREE);
-                }
-            }
-        }
-
-        // step 2:obstacle 圆盘膨胀(UNKNOWN 不作为膨胀源,也不被其他 obstacle 覆盖)
-        for y in 0..height {
-            for x in 0..width {
-                // 只有 binary 中是真 OCCUPIED(非 UNKNOWN)的格子才当膨胀源
-                if binary.get(x, y) == OCCUPIED {
-                    let r = inflate_radius_cells.max(0);
-                    for dy in -r..=r {
-                        for dx in -r..=r {
-                            let nx = x as i32 + dx;
-                            let ny = y as i32 + dy;
-                            if nx >= 0
-                                && ny >= 0
-                                && (nx as usize) < width
-                                && (ny as usize) < height
-                                && dx * dx + dy * dy <= r * r
-                                && binary.get(nx as usize, ny as usize) != UNKNOWN
-                            {
-                                grad.set(nx as usize, ny as usize, OCCUPIED);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // step 3:Meilhon 9-邻居 EDT(误差 < 0.5%)
-        let mut dist = vec![f64::INFINITY; width * height];
-
-        // forward pass (top-left to bottom-right):
-        // mask =
-        //   A B C
-        //   D e .
-        // where A=(-1,-1)=MEILHON_A, B=(-1,0)=MEILHON_B, C=(-1,1)=MEILHON_A,
-        //       D=(0,-1)=MEILHON_D, e=(0,0)=current
-        for y in 0..height {
-            for x in 0..width {
-                let idx = y * width + x;
-                if grad.get(x, y) == OCCUPIED {
-                    dist[idx] = 0.0;
-                    continue;
-                }
-                let mut best = f64::INFINITY;
-                if x > 0 {
-                    best = best.min(dist[idx - 1] + MEILHON_D);
-                }
-                if y > 0 {
-                    best = best.min(dist[idx - width] + MEILHON_B);
-                }
-                if x > 0 && y > 0 {
-                    best = best.min(dist[idx - 1 - width] + MEILHON_A);
-                }
-                if x + 1 < width && y > 0 {
-                    best = best.min(dist[idx + 1 - width] + MEILHON_C);
-                }
-                dist[idx] = best;
-            }
-        }
-
-        // backward pass (bottom-right to top-left):
-        // mask =
-        //   . e G
-        //   F H I
-        // where F=(1,0)=MEILHON_D, G=(1,1)=MEILHON_A, H=(0,1)=MEILHON_B,
-        //       I=(1,1)=MEILHON_C
-        // (forward+backward 联合形成完整 9-邻居 mask)
-        for y in (0..height).rev() {
-            for x in (0..width).rev() {
-                let idx = y * width + x;
-                if grad.get(x, y) == OCCUPIED {
-                    continue;
-                }
-                let mut best = dist[idx];
-                if x + 1 < width {
-                    best = best.min(dist[idx + 1] + MEILHON_D);
-                }
-                if y + 1 < height {
-                    best = best.min(dist[idx + width] + MEILHON_B);
-                }
-                if x + 1 < width && y + 1 < height {
-                    best = best.min(dist[idx + 1 + width] + MEILHON_A);
-                }
-                if x > 0 && y + 1 < height {
-                    best = best.min(dist[idx - 1 + width] + MEILHON_C);
-                }
-                dist[idx] = best;
-            }
-        }
-
-        // step 4:写入 cost。检查 grad 当前值(已含 step 1 二值化 + step 2 膨胀)——
-        // grad 已是 OCCUPIED 的单元(obstacle 自身 + 膨胀半径内 + UNKNOWN stamp)跳过。
-        for y in 0..height {
-            for x in 0..width {
-                if grad.get(x, y) == OCCUPIED {
-                    // step 1 (OCCUPIED/UNKNOWN) 或 step 2 (膨胀) 已标,保持
-                    continue;
-                }
-                let d = dist[y * width + x];
-                let cost = if !d.is_finite() {
-                    FREE
-                } else {
-                    let v = 90.0 - d * 9.0;
-                    v.clamp(0.0, 90.0) as u8
+                    nuwax_mapping::occupancy::types::OccupancyValue::Free
                 };
-                grad.set(x, y, cost);
+                occ_grid.set(y as u32, x as u32, mapped);
             }
         }
 
-        // step 5:`GradientStrategy::Voronoi` 路径——P0-12 仍用 EDT,
-        // TODO(rework22 P0-12):完整 Voronoi diagram 等 mapping crate 接入。
-        // 当前实现保留了 Chamfer-8 的"近似欧氏距离"语义,只是精度提升为
-        // Meilhon 9-neighbor(< 0.5% 误差 vs scipy)。
-        let _ = self.strategy;
+        // 阶段 2: 调统一 make_costmap
+        let cfg = nuwax_mapping::occupancy::gradient::CostMapConfig {
+            resolution,
+            robot_increase: robot_increase * self.robot_width,
+            max_cost: 90,
+        };
+        let result = nuwax_mapping::occupancy::gradient::make_costmap(&occ_grid, &cfg);
 
+        // 阶段 3: 结果 → CostMap2D 桥接
+        // mapping make_costmap 用 255 标记"不可走"(Occupied 和 Unknown 都用 255);
+        // nav-astar 用 OCCUPIED=100 标记 occupied, UNKNOWN=255 标记 unknown。
+        // 这里根据原始 binary 还原 Occupied/Unknown 标记,保持 nav-astar 契约。
+        let mut grad = CostMap2D::new(binary.frame_id(), width, height, resolution);
+        grad.set_origin(binary.origin);
+        for y in 0..height {
+            for x in 0..width {
+                let v = result.get(y, x);
+                if v == 255 {
+                    // 还原:原 binary 是 UNKNOWN 留 UNKNOWN,否则是 OCCUPIED
+                    if binary.get(x, y) == UNKNOWN {
+                        grad.set(x, y, UNKNOWN);
+                    } else {
+                        grad.set(x, y, OCCUPIED);
+                    }
+                } else {
+                    grad.set(x, y, v);
+                }
+            }
+        }
+
+        let _ = self.strategy; // 保留 strategy 字段(API 兼容)
         Some(grad)
     }
 }
@@ -492,23 +420,20 @@ mod tests {
         assert!(v < 50, "expected low cost, got {v}");
     }
 
+    /// P1 #2 升级验证:UNKNOWN cell 在 gradient 中保留为 UNKNOWN=255,
+    /// 而非旧合约(OCCUPIED=100)。UNKNOWN 不参与障碍膨胀,但仍是"不可走"。
     #[test]
-    fn unknown_in_binary_treated_as_occupied_in_gradient() {
+    fn unknown_in_binary_kept_as_unknown_in_gradient() {
         let mut binary = CostMap2D::new("map", 10, 10, 0.1);
         binary.set_unknown(3, 3);
         let mut nm = NavigationMap::new(0.3, GradientStrategy::Voronoi);
         nm.update(binary);
 
         let grad = nm.make_gradient_costmap(1.0).expect("grad");
-        // 未知 cell 在 gradient 中视作 OCCUPIED
-        assert_eq!(grad.get(3, 3), OCCUPIED);
+        // P1 #2: UNKNOWN 在 gradient 中**保留为 UNKNOWN**(不再退化为 OCCUPIED)
+        assert_eq!(grad.get(3, 3), UNKNOWN);
     }
 
-    /// H-15 修复验证:gradient 现在用 chamfer-8 EDT,距离值是 float 精度(欧氏近似)。
-    /// 验证关键性质:
-    /// 1) obstacle 0 cost (OCCUPIED) 本身;
-    /// 2) 正交邻居(对角线下)cost <= 中心点 cost;EDT-4 不会违反,但 EDT-8 对角收敛更快。
-    /// 3) 距离原点越远 cost 越低。
     #[test]
     fn gradient_edt_distance_monotonic_farther_cells_have_lower_or_equal_cost() {
         let mut binary = CostMap2D::new("map", 21, 21, 0.1);

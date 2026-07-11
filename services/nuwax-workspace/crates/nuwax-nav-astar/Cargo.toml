@@ -11,6 +11,9 @@ description = "nuwax 纯 Rust replanning A* 导航核心（min-cost 8 邻接 A*�
 # 共享数值与栅格基础
 nuwax-numeric = { path = "../nuwax-numeric" }
 
+# rework22 P1 #2:gradient 统一,使用 mapping::occupancy::gradient::make_costmap
+nuwax-mapping = { path = "../nuwax-mapping" }
+
 # Foundation 类型与基础(Phase7 type-convergence 收敛)
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 nuwax-nav-base = { path = "../nuwax-nav-base" }

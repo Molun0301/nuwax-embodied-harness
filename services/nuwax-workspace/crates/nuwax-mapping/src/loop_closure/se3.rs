@@ -287,34 +287,6 @@ mod tests {
 
     /// Adjoint 群性质：Ad(T1·T2) = Ad(T1)·Ad(T2)
     #[test]
-    #[ignore = "DEBUG"]
-    fn debug_adjoint_upper_right() {
-        let m = Isometry3::from_parts(
-            Translation3::new(0.4, -0.3, 0.2),
-            UnitQuaternion::from_euler_angles(0.3, -0.2, 0.5),
-        );
-        let adj = se3_adjoint(&m);
-        let adj_inv = se3_adjoint(&m.inverse());
-        eprintln!("m.translation = {:?}", m.translation.vector);
-        eprintln!("m.inverse().translation = {:?}", m.inverse().translation.vector);
-        eprintln!("Ad(m):");
-        for i in 0..6 {
-            eprintln!(
-                "  {:?}",
-                (0..6).map(|j| adj[(i, j)]).collect::<Vec<_>>()
-            );
-        }
-        eprintln!("Ad(m^-1):");
-        for i in 0..6 {
-            eprintln!(
-                "  {:?}",
-                (0..6).map(|j| adj_inv[(i, j)]).collect::<Vec<_>>()
-            );
-        }
-    }
-
-    /// Adjoint 群性质：Ad(T1·T2) = Ad(T1)·Ad(T2)
-    #[test]
     fn se3_adjoint_homomorphism() {
         let t1 = Isometry3::from_parts(
             Translation3::new(0.3, -0.1, 0.2),

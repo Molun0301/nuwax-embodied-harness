@@ -11,7 +11,7 @@ use nuwax_mapping::loop_closure::{
     AutoLoopDetector, GaussNewtonOptimizer, LevenbergMarquardt, OptimizerConfig, PgoOptimizer,
     PoseEdge, PoseGraph,
 };
-use nuwax_mapping::loop_closure::optimizer::se3_log_to_vector6;
+use nuwax_mapping::loop_closure::se3::se3_log_to_vector6;
 
 #[test]
 fn loop_closure_module_exports_accessible() {

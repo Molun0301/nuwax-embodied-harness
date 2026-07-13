@@ -23,6 +23,12 @@ pub use nuwax_nav_types_messages::PointStamped;
 pub use nuwax_nav_types_messages::Twist2 as FoundationTwist2;
 pub use nuwax_nav_types_messages::Twist3 as Twist;
 
+// P0-13 Module 副作用层:把 `cancel_navigation()` 的 CancelNavigation event
+// 真副作用化 -- 直接通过 broadcast port 发 `MovementCommand::Stop` 和 NaN goal,
+// 而不只是返回 event 让 caller 自己转发。
+pub mod module;
+pub use module::*;
+
 /// 默认 click 水平范围（米）
 pub const DEFAULT_MAX_CLICK_HORIZONTAL_M: f64 = 500.0;
 /// 默认 click 垂直范围（米）

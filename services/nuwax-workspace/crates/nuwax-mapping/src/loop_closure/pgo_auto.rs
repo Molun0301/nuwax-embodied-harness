@@ -99,18 +99,24 @@ mod tests {
     #[test]
     fn detect_simple_loop() {
         let mut g = PoseGraph::new();
-        // 创建回环：node 0 和 node 3 在同一位置
+        // 创建回环：node id0 和 node id3 在同一位置
         let id0 = g.add_node(0, Isometry3::identity());
         let _id1 = g.add_node(10, Isometry3::translation(1.0, 0.0, 0.0));
         let _id2 = g.add_node(20, Isometry3::translation(2.0, 0.0, 0.0));
-        let _id3 = g.add_node(60, Isometry3::identity()); // 回到起点
+        let id3 = g.add_node(60, Isometry3::identity()); // 回到起点
         assert_eq!(g.num_nodes(), 4);
 
         let detector = AutoLoopDetector::new(0.5, 30);
         let added = detector.detect_and_add(&mut g);
         assert_eq!(added, 1, "should detect 1 loop closure");
         assert_eq!(g.num_edges(), 1);
-        assert_eq!(g.edges[0].from, id0);
+        // 回环边应在 id0 和 id3 之间(顺序由 HashMap iteration 决定,不指定 from/to 顺序)
+        let edge = &g.edges[0];
+        assert!(
+            (edge.from == id0 && edge.to == id3) || (edge.from == id3 && edge.to == id0),
+            "loop edge must connect id0={} and id3={} (got from={} to={})",
+            id0, id3, edge.from, edge.to
+        );
     }
 
     #[test]

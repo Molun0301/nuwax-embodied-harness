@@ -8,6 +8,7 @@ pub mod eval;
 pub mod optimizer;
 pub mod pgo;
 pub mod pgo_auto;
+pub mod se3;
 pub mod utils;
 
 pub use eval::EvalLoopClosure;

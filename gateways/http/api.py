@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime, timezone
 import json
 from typing import Dict, Optional, Any
@@ -297,9 +298,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/health/full")
     async def api_health_full(request: Request) -> Dict[str, Any]:
-        """R-N14 stub:聚合 geometry_runtime / nuwax_nav_stack / lcm / connected_channels。
+        """聚合 geometry_runtime / nuwax_nav_stack / lcm / connected_channels 分层 readiness。
 
-        阶段:stub。返回固定数据,不依赖 nuwax-geometry-runtime gRPC 客户端。
+        B-C1 落地:`aggregation_version` 表示 readiness schema 版本(纯整数),
+        任何字段重命名/弃用时 +1;`generated_at_utc` 表达该次聚合时间。
+        返回固定 demo 数据,不依赖 nuwax-geometry-runtime gRPC 客户端。
         """
         access_manager.authenticate_http(request)
         return {
@@ -313,7 +316,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                 "frontier",
             ],
             "nuwax_nav_stack": {"healthy": True},
-            "version": "stub-R-N14-1",
+            "aggregation_version": 1,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         }
 
     @router.get("/api/capabilities")
@@ -765,7 +769,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                     break
                 payload = NavigationState(
                     state="ACCEPTED",
-                    goal_id="stub-R-N14-1",
+                    goal_id=uuid.uuid4().hex[:16],
                     message="R-N14 stub SSE 心跳。",
                     timestamp=datetime.now(timezone.utc).isoformat(),
                 ).model_dump(mode="json")

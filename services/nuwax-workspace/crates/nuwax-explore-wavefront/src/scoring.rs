@@ -48,9 +48,16 @@ impl FrontierScorer {
         let robot_distance = candidate.centroid.distance(robot);
         let distance_score = 1.0 / (1.0 + (robot_distance - cfg.lookahead_distance_m).abs());
 
-        let max_expected = (cfg.min_frontier_perimeter_m / grid.resolution.max(1e-6)) * 10.0;
-        let max_expected = max_expected.max(1.0);
-        let information_gain_score = (candidate.area_m2 / max_expected).min(1.0) as f32;
+        // rework22 P1.9:information_gain 分母统一为 cell count(避免 area_m2 与
+        // cell count 混用导致分母尺度与分子不匹配)。
+        // TODO:此处与 Python frontier_goal.py 的 information_gain 行为对齐;
+        // 历史实现用 area_m2 / max_expected_frontier_size(m² 尺度),会因 grid
+        // resolution 变化导致分数整体偏移。这里固定按 cell count 归一化。
+        let max_expected_cells = ((cfg.min_frontier_perimeter_m / grid.resolution.max(1e-6))
+            * 10.0)
+            .max(1.0);
+        let information_gain_score =
+            (candidate.cell_count as f64 / max_expected_cells).min(1.0) as f32;
 
         let nearest_explored_distance: f64 = if session_explored.is_empty() {
             5.0

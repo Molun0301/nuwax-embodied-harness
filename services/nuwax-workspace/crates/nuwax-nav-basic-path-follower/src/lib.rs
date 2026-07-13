@@ -23,6 +23,12 @@ pub use nuwax_nav_types_messages::{
 
 pub use nuwax_numeric::Point2;
 
+// P0-13 Module 副作用层:lifecycle + 端口 + tick 调度。
+// 真副作用(spawn 任务/广播端口)由 `module` 子模块承担,
+// 公式核心 `BasicPathFollowerCore` 保持纯函数 + 单步 step()。
+pub mod module;
+pub use module::*;
+
 /// 2D 位置（保持 xyxy 语义）
 pub type Position2 = Point2;
 

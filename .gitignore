@@ -24,7 +24,12 @@ artifacts/
 .venv/
 memory_models_20260402.tar.zst
 runtime_data/
-/tests/
+# 所有层级测试目录与仓库 CI 校验脚本仅供本地验证，不入库。
+tests/
+scripts/ci/
+# 本轮本地 release gate 与格式说明不入库。
+.github/workflows/release-gates.yml
+services/nuwax-workspace/crates/nuwax-mapping-cli/FORMAT.md
 .vscode/
 .pytest_cache
 .playwright-mcp
@@ -83,11 +88,9 @@ tests/manual/__pycache__/
 runtime_data/installer_state.json
 runtime_data/.venv-installer/
 
-# === 测试 fixture + mock + integration 全部本地验证不入仓 (2026-06-27) ===
-# 与 spec ci-guardrails spec.md 对齐：CI grep 守门 `! git ls-files tests/fixtures/ tests/mocks/ tests/integration/`
+# === 测试 fixture + mock 默认本地验证不入仓 (2026-06-27) ===
 tests/fixtures/
 tests/mocks/
-tests/integration/
 
 # === dimos crates 本地 vendor（vendor_dimos_crates.sh 产物，不入 git） ===
 # Phase 1 (2026-07-07) 起弃用：vendor_dimos_crates.sh 已被

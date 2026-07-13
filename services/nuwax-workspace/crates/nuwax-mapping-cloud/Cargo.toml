@@ -21,9 +21,10 @@ tokio = { workspace = true }
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 
-# P1 #5 (rework22 Lane D): cloud 依赖 Google Maps API key,
-# Go2 单机部署不需要,一律默认禁用。开启 `cloud-enabled` 时可显式打开
-# (例如开发 / 调试阶段)。`Disabled` 错误码会在 feature off 时返给调用方。
+# P1 #5 (rework22 Lane D) 升级：cloud 必须能工作（mock 算法实装）。
+# 默认启用 `cloud-enabled`：调用方拿到真实算法接口（geocode/places/nominatim/
+# tile download/stitch/coords）。Live HTTP 路径仅在显式注入 API key 时使用，
+# 否则 mock 数据保证 dev/CI 可用。禁用特性仅作 SSOT 兜底（仓库内当前无 caller）。
 [features]
-default = []
+default = ["cloud-enabled"]
 cloud-enabled = []

@@ -1551,6 +1551,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -1636,6 +1637,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -1680,6 +1682,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

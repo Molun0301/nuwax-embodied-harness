@@ -14,7 +14,7 @@ pub mod utils;
 pub use eval::EvalLoopClosure;
 pub use optimizer::{GaussNewtonOptimizer, LevenbergMarquardt, OptimizerConfig};
 pub use pgo::{PoseEdge, PoseGraph, PoseNode};
-pub use pgo_auto::AutoLoopDetector;
+pub use pgo_auto::{AutoLoopDetector, LoopConstraint};
 
 /// PGO 优化器门面（rework22 P0-09.3）
 ///
@@ -31,7 +31,7 @@ pub struct PgoOptimizer {
 impl PgoOptimizer {
     /// 默认配置构造
     #[must_use]
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: GaussNewtonOptimizer::new(OptimizerConfig::default()),
         }
@@ -60,6 +60,6 @@ impl PgoOptimizer {
 
 impl Default for PgoOptimizer {
     fn default() -> Self {
-        Self::default()
+        Self::new()
     }
 }

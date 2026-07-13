@@ -214,7 +214,6 @@ const MEILHON_C: f64 = 2.0; // 对角(右上)
 #[allow(dead_code)]
 const MEILHON_D: f64 = 3.0; // 边(左)
 
-
 /// 梯度策略（与 Python `GradientStrategy` 对应）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GradientStrategy {
@@ -272,20 +271,15 @@ impl NavigationMap {
 
     /// 构造 gradient costmap
     ///
-    /// rework22 P1 #2 升级:删除 nuwax-astar 自带的 Chamfer-8 EDT 实现,改为调用
-    /// `nuwax_mapping::occupancy::gradient::make_costmap` 统一实装。
+    /// 使用 mapping crate 的精确 EDT/Voronoi 实现生成原版 path map。
     ///
     /// 流程:
     /// 1. 将 `CostMap2D` (binary) 转 `OccupancyGrid` 桥接
-    ///    - OCCUPIED (100) → OccupancyValue::Occupied
-    ///    - UNKNOWN (255) → OccupancyValue::Unknown (不参与膨胀,只标记不可走)
-    ///    - FREE (0) → OccupancyValue::Free
-    /// 2. 调用 `nuwax_mapping::occupancy::gradient::make_costmap`
-    ///    (含 Chamfer-8 EDT + UNKNOWN 不参与膨胀)
-    /// 3. 将结果转回 `CostMap2D`
-    ///
-    /// 注: `GradientStrategy::Voronoi` 路径仍由 mapping 端实现统一处理(暂未启用
-    /// 完整 Voronoi;当前走 EDT)。
+    ///    - `0..=100` 保留原 cost，确保 `50..99` 仍是 gradient obstacle source
+    ///    - UNKNOWN (255) → -1 (不参与膨胀,只标记不可走)
+    /// 2. 按原版 `robot_width / 2 * robot_increase` 做圆形 inflation；
+    /// 3. 根据 `GradientStrategy` 调用普通 EDT 或 Voronoi cost；
+    /// 4. UNKNOWN 不作为距离源，但保持 UNKNOWN（被 inflation 覆盖时除外）。
     #[must_use]
     pub fn make_gradient_costmap(&self, robot_increase: f64) -> Option<CostMap2D> {
         let binary = self.binary.as_ref()?;
@@ -295,56 +289,54 @@ impl NavigationMap {
         let resolution = binary.resolution();
 
         // 阶段 1: CostMap2D → OccupancyGrid 桥接
-        let mut occ_grid = nuwax_mapping::occupancy::OccupancyGrid::new(
-            width as u32,
-            height as u32,
-            resolution,
-        );
+        let mut occ_grid =
+            nuwax_mapping::occupancy::OccupancyGrid::new(width as u32, height as u32, resolution);
         for y in 0..height {
             for x in 0..width {
                 let v = binary.get(x, y);
-                let mapped = if v == OCCUPIED {
-                    nuwax_mapping::occupancy::types::OccupancyValue::Occupied
-                } else if v == UNKNOWN {
-                    nuwax_mapping::occupancy::types::OccupancyValue::Unknown
+                let mapped = if v == UNKNOWN {
+                    -1
                 } else {
-                    nuwax_mapping::occupancy::types::OccupancyValue::Free
+                    v.min(OCCUPIED) as i8
                 };
-                occ_grid.set(y as u32, x as u32, mapped);
+                let index = occ_grid.index(y as u32, x as u32);
+                occ_grid.data[index] = mapped;
             }
         }
 
         // 阶段 2: 调统一 make_costmap
         let cfg = nuwax_mapping::occupancy::gradient::CostMapConfig {
             resolution,
-            robot_increase: robot_increase * self.robot_width,
-            max_cost: 90,
+            robot_increase: robot_increase.max(0.0) * self.robot_width / 2.0,
+            max_cost: 99,
         };
-        let result = nuwax_mapping::occupancy::gradient::make_costmap(&occ_grid, &cfg);
+        let strategy = match self.strategy {
+            GradientStrategy::Gradient => {
+                nuwax_mapping::occupancy::gradient::DistanceCostStrategy::Gradient
+            }
+            GradientStrategy::Voronoi => {
+                nuwax_mapping::occupancy::gradient::DistanceCostStrategy::Voronoi
+            }
+        };
+        let result = nuwax_mapping::occupancy::gradient::make_costmap_with_strategy(
+            &occ_grid, &cfg, strategy, 1.5,
+        );
 
-        // 阶段 3: 结果 → CostMap2D 桥接
-        // mapping make_costmap 用 255 标记"不可走"(Occupied 和 Unknown 都用 255);
-        // nav-astar 用 OCCUPIED=100 标记 occupied, UNKNOWN=255 标记 unknown。
-        // 这里根据原始 binary 还原 Occupied/Unknown 标记,保持 nav-astar 契约。
+        // 阶段 3: 结果 → CostMap2D 桥接。
         let mut grad = CostMap2D::new(binary.frame_id(), width, height, resolution);
         grad.set_origin(binary.origin);
         for y in 0..height {
             for x in 0..width {
                 let v = result.get(y, x);
-                if v == 255 {
-                    // 还原:原 binary 是 UNKNOWN 留 UNKNOWN,否则是 OCCUPIED
-                    if binary.get(x, y) == UNKNOWN {
-                        grad.set(x, y, UNKNOWN);
-                    } else {
-                        grad.set(x, y, OCCUPIED);
-                    }
-                } else {
-                    grad.set(x, y, v);
-                }
+                let mapped = match v {
+                    255 => UNKNOWN,
+                    100..=254 => OCCUPIED,
+                    _ => v,
+                };
+                grad.set(x, y, mapped);
             }
         }
 
-        let _ = self.strategy; // 保留 strategy 字段(API 兼容)
         Some(grad)
     }
 }
@@ -396,15 +388,15 @@ mod tests {
         nm.update(binary);
 
         let grad = nm.make_gradient_costmap(1.0).expect("grad");
-        // 距离 (5,5) 在 5 cells 内（robot_width=0.5, resolution=0.1, inflate=5 cells）应被 inflate 阻断
+        // 原版使用 half width:ceil((0.5 / 2) / 0.1)=3 cells。
         // cell (5,5) 自身: OCCUPIED
         assert_eq!(grad.get(5, 5), OCCUPIED);
         // cell (6,5) 距离 1 -> OCCUPIED
         assert_eq!(grad.get(6, 5), OCCUPIED);
-        // cell (10,5) 距离 5 -> 仍在半径内 -> OCCUPIED(grid 扩大到 12x12 容纳 5 cells 半径)
-        assert_eq!(grad.get(10, 5), OCCUPIED);
-        // cell (11,5) 距离 6 -> 超出半径,应为 EDT cost(< 100)
-        assert!(grad.get(11, 5) < OCCUPIED);
+        // cell (8,5) 距离 3 -> 仍在圆形 inflation 内。
+        assert_eq!(grad.get(8, 5), OCCUPIED);
+        // cell (9,5) 距离 4 -> 超出 half-width radius,进入 gradient。
+        assert!(grad.get(9, 5) < OCCUPIED);
     }
 
     #[test]
@@ -438,26 +430,23 @@ mod tests {
     fn gradient_edt_distance_monotonic_farther_cells_have_lower_or_equal_cost() {
         let mut binary = CostMap2D::new("map", 21, 21, 0.1);
         binary.set(10, 10, OCCUPIED);
-        let mut nm = NavigationMap::new(0.5, GradientStrategy::Voronoi);
+        let mut nm = NavigationMap::new(0.0, GradientStrategy::Gradient);
         nm.update(binary);
         let grad = nm.make_gradient_costmap(1.0).expect("grad");
 
         // (10,10) = OCCUPIED
         assert_eq!(grad.get(10, 10), OCCUPIED);
         // 对角 (11,11) 距 obstacle sqrt(2) cell,正交 (10,11) 距 obstacle 1 cell
-        // 应满足 cost(11,11) >= cost(10,11) - tolerance(chamfer-8 与 EDT 近似一致)
+        // 精确 EDT 下,对角 cell 更远,所以 cost 更低。
         let c_orth = grad.get(10, 11);
         let c_diag = grad.get(11, 11);
-        assert!(c_diag >= c_orth, "diag {c_diag} should be >= orth {c_orth}");
+        assert!(c_diag < c_orth, "diag {c_diag} should be < orth {c_orth}");
         // 远处 cell cost 更低
         let c_far = grad.get(0, 0);
         assert!(c_far <= c_orth, "far {c_far} should be <= orth {c_orth}");
     }
 
-    /// H-15 验证:voronoi 性质——两 obstacle 之间的"最远点"应在中间或附近。
-    /// 对 chamfer EDT 而言,中点 cell 应该是局部最大值(cost 最高表示距 obstacle 最远)。
-    /// 注意:由于 cost 编码 `90 - d*9`(距 obstacle 越远 cost 越低),这里的断言反过来:
-    /// 中点 cost 应该 ≥ 远离两侧的中点外 cell 的 cost(因为更靠近 obstacle)。
+    /// Voronoi 性质：两个独立障碍簇之间的中线 cost 为 0。
     #[test]
     fn gradient_voronoi_midpoint_is_local_max_distance() {
         // 两个 obstacle 在 (2,10) 和 (18,10),中间 cell (10,10) 应是局部距 obstacle 最远点
@@ -474,6 +463,44 @@ mod tests {
         // distance encoding cost(10,10) ≤ cost(9,10)
         let mid = grad.get(10, 10);
         let near_mid = grad.get(11, 10);
+        assert_eq!(mid, 0, "Voronoi edge must have zero cost");
         assert!(mid <= near_mid, "mid cost {mid} ≤ near-mid cost {near_mid}");
+    }
+
+    #[test]
+    fn original_python_navigation_map_fixture_matches_every_cell() {
+        let mut binary = CostMap2D::new("map", 9, 7, 0.5);
+        for (x, y, value) in [
+            (4, 0, UNKNOWN),
+            (4, 1, 50),
+            (1, 3, OCCUPIED),
+            (2, 3, UNKNOWN),
+            (7, 3, OCCUPIED),
+        ] {
+            binary.set(x, y, value);
+        }
+
+        let expected_gradient = vec![
+            25, 33, 25, 52, 255, 52, 25, 33, 25, 52, 66, 52, 66, 100, 66, 52, 66, 52, 66, 100, 66,
+            52, 66, 52, 66, 100, 66, 100, 100, 100, 66, 33, 66, 100, 100, 100, 66, 100, 66, 52, 25,
+            52, 66, 100, 66, 52, 66, 52, 25, 5, 25, 52, 66, 52, 25, 33, 25, 5, 0, 5, 25, 33, 25,
+        ];
+        let expected_voronoi = vec![
+            46, 33, 0, 0, 255, 0, 0, 0, 30, 57, 49, 0, 0, 100, 0, 0, 0, 41, 66, 100, 0, 0, 0, 0, 0,
+            100, 57, 100, 100, 100, 0, 0, 0, 100, 100, 100, 73, 100, 57, 41, 0, 0, 49, 100, 73, 71,
+            73, 57, 30, 0, 0, 41, 66, 67, 63, 59, 46, 25, 0, 0, 30, 49, 56,
+        ];
+
+        for (strategy, expected) in [
+            (GradientStrategy::Gradient, expected_gradient),
+            (GradientStrategy::Voronoi, expected_voronoi),
+        ] {
+            let mut navigation_map = NavigationMap::new(1.0, strategy);
+            navigation_map.update(binary.clone());
+            let result = navigation_map
+                .make_gradient_costmap(1.0)
+                .expect("gradient map");
+            assert_eq!(result.cells, expected);
+        }
     }
 }

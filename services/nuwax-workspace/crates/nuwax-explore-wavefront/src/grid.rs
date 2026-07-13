@@ -1,6 +1,19 @@
 //! GridPoint + ClassificationGrid(扁平 Vec,行优先;无 HashMap 分配)。
 
+use nuwax_nav_types_messages::grid::OccupancyCell;
+
 use crate::classification::PointClassification;
+
+/// Convert the typed cell representation back to the numeric occupancy value
+/// used by the Python implementation.
+pub(crate) const fn occupancy_value(cell: OccupancyCell) -> i16 {
+    match cell {
+        OccupancyCell::Unknown => -1,
+        OccupancyCell::Free => 0,
+        OccupancyCell::Occupied | OccupancyCell::Inflated => 100,
+        OccupancyCell::Cost(value) => value as i16,
+    }
+}
 
 /// 栅格内 2D 坐标(行优先索引 `y * width + x`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -7,9 +7,16 @@
 #![warn(missing_docs)]
 
 use nalgebra::{Isometry3, Matrix4, Translation3, UnitQuaternion};
-use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use parking_lot::{Condvar, Mutex};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::time::{Duration, Instant};
 use thiserror::Error;
+
+const DEFAULT_BUFFER_SIZE_SECS: f64 = 10.0;
+
+/// Real-LCM `/tf` publisher/subscriber adapter.
+#[cfg(feature = "link-liblcm")]
+pub mod lcm;
 
 /// TF 错误
 #[derive(Debug, Error)]
@@ -20,6 +27,38 @@ pub enum TfError {
     /// 链式变换不连通
     #[error("no transform path between '{from}' and '{to}'")]
     Disconnected {
+        /// 来源坐标系
+        from: String,
+        /// 目标坐标系
+        to: String,
+    },
+    /// 指定时间附近没有落在容差内的变换
+    #[error(
+        "no transform for frame '{child}' near {requested_secs:.9}s within {tolerance_secs:.9}s; closest stamp is {closest_stamp_secs}.{closest_stamp_nanos:09}s"
+    )]
+    OutsideTolerance {
+        /// 查询的 child frame
+        child: String,
+        /// 查询时间（epoch 秒）
+        requested_secs: f64,
+        /// 最大允许时间差（秒）
+        tolerance_secs: f64,
+        /// 实际最接近的 transform 时间戳
+        closest_stamp_secs: i64,
+        /// 实际最接近的 transform 纳秒部分
+        closest_stamp_nanos: u32,
+    },
+    /// 时间查询参数非法
+    #[error("invalid transform time query: time={time_secs}, tolerance={tolerance_secs}")]
+    InvalidTimeQuery {
+        /// 查询时间（epoch 秒）
+        time_secs: f64,
+        /// 时间容差（秒）
+        tolerance_secs: f64,
+    },
+    /// 等待 transform 链补齐超时
+    #[error("timed out waiting for transform path between '{from}' and '{to}'")]
+    WaitTimeout {
         /// 来源坐标系
         from: String,
         /// 目标坐标系
@@ -39,6 +78,8 @@ pub struct TransformStamped {
     pub child: String,
     /// 时间戳（epoch 秒）
     pub stamp_secs: i64,
+    /// 时间戳纳秒部分
+    pub stamp_nanos: u32,
     /// 平移 + 旋转（SE3）
     pub transform: Isometry3<f64>,
 }
@@ -51,6 +92,7 @@ impl TransformStamped {
             parent: parent.into(),
             child: child.into(),
             stamp_secs: 0,
+            stamp_nanos: 0,
             transform: Isometry3::identity(),
         }
     }
@@ -58,8 +100,10 @@ impl TransformStamped {
 
 /// TF tree（线程安全，parking_lot RwLock）
 pub struct TfTree {
-    /// 变换存储（key = child frame）
-    transforms: RwLock<HashMap<String, TransformStamped>>,
+    /// 按时间升序保存的变换历史（key = child frame）
+    transforms: Mutex<HashMap<String, Vec<TransformStamped>>>,
+    buffer_size_secs: f64,
+    updated: Condvar,
 }
 
 impl Default for TfTree {
@@ -72,15 +116,44 @@ impl TfTree {
     /// 构造空 TF tree
     #[must_use]
     pub fn new() -> Self {
+        Self::with_buffer_size(DEFAULT_BUFFER_SIZE_SECS)
+    }
+
+    /// 构造带指定历史窗口的 TF tree。
+    ///
+    /// 非有限或负数配置回退到原版默认的 10 秒窗口。
+    #[must_use]
+    pub fn with_buffer_size(buffer_size_secs: f64) -> Self {
         Self {
-            transforms: RwLock::new(HashMap::new()),
+            transforms: Mutex::new(HashMap::new()),
+            buffer_size_secs: if buffer_size_secs.is_finite() && buffer_size_secs >= 0.0 {
+                buffer_size_secs
+            } else {
+                DEFAULT_BUFFER_SIZE_SECS
+            },
+            updated: Condvar::new(),
         }
     }
 
-    /// 注册一条父→子变换（覆盖）
+    /// 注册一条父→子变换并保留历史窗口。
     pub fn set(&self, t: TransformStamped) {
-        let mut g = self.transforms.write();
-        g.insert(t.child.clone(), t);
+        let mut g = self.transforms.lock();
+        let history = g.entry(t.child.clone()).or_default();
+        match history.binary_search_by_key(&(t.stamp_secs, t.stamp_nanos), |item| {
+            (item.stamp_secs, item.stamp_nanos)
+        }) {
+            Ok(index) => history[index] = t,
+            Err(index) => history.insert(index, t),
+        }
+
+        let newest_stamp = history.last().map_or(0.0, timestamp_secs);
+        let oldest_retained = newest_stamp - self.buffer_size_secs;
+        let first_retained = history.partition_point(|item| timestamp_secs(item) < oldest_retained);
+        if first_retained > 0 {
+            history.drain(..first_retained);
+        }
+        drop(g);
+        self.updated.notify_all();
     }
 
     /// 查询某个子 frame 的直接父变换
@@ -88,10 +161,45 @@ impl TfTree {
     /// # Errors
     /// 当 frame 不存在时返回 `TfError::FrameNotFound`
     pub fn lookup(&self, child: &str) -> TfResult<TransformStamped> {
-        let g = self.transforms.read();
-        g.get(child)
-            .cloned()
-            .ok_or_else(|| TfError::FrameNotFound(child.to_string()))
+        let g = self.transforms.lock();
+        lookup_in(&g, child, None)
+    }
+
+    /// 查询指定时间附近最接近的一条直接父变换。
+    ///
+    /// 等距时选择较晚的时间戳，与原版 `InMemoryStore.find_closest` 一致。
+    ///
+    /// # Errors
+    /// frame 不存在、参数非法或最接近帧超出容差时返回 typed error。
+    pub fn lookup_at(
+        &self,
+        child: &str,
+        time_secs: f64,
+        tolerance_secs: f64,
+    ) -> TfResult<TransformStamped> {
+        validate_time_query(time_secs, tolerance_secs)?;
+        let g = self.transforms.lock();
+        lookup_in(&g, child, Some((time_secs, tolerance_secs)))
+    }
+
+    /// 返回某个 child frame 当前保留的历史帧数。
+    #[must_use]
+    pub fn history_len(&self, child: &str) -> usize {
+        self.transforms.lock().get(child).map_or(0, Vec::len)
+    }
+
+    /// 返回已知的 parent/child frame 集合。
+    #[must_use]
+    pub fn frames(&self) -> BTreeSet<String> {
+        let g = self.transforms.lock();
+        let mut frames = BTreeSet::new();
+        for (child, history) in g.iter() {
+            frames.insert(child.clone());
+            if let Some(latest) = history.last() {
+                frames.insert(latest.parent.clone());
+            }
+        }
+        frames
     }
 
     /// 链式查询：从 `from` 到 `to` 的总变换（向上回溯到共同祖先再向下）
@@ -103,114 +211,204 @@ impl TfTree {
     /// 1. 沿 `from` 向上回溯到 root，记录每一级 `(frame, child→parent)`。
     /// 2. 沿 `to` 向上回溯到 root，记录每一级 `(frame, child→parent)`。
     /// 3. 找最近共同祖先 `a`。
-    /// 4. `from → a` 用向上链的反向（即对每条 child→parent 取 inverse 累乘）。
-    /// 5. `a → to` 用向下链（即对每条 child→parent 取 inverse 累乘），方向相反。
-    /// 6. 总变换 = `(from→a) * (a→to)`。
+    /// 4. `from → a` 沿向上链直接累乘每条 child→parent 变换。
+    /// 5. `a → to` 反向遍历向上链，并对每条 child→parent 变换取 inverse。
+    /// 6. 总变换 = `(a→to) * (from→a)`（矩阵作用顺序从右到左）。
     ///
     /// # Errors
     /// 当链路不可达时返回 `TfError::Disconnected`
     pub fn chain(&self, from: &str, to: &str) -> TfResult<Isometry3<f64>> {
-        if from == to {
-            return Ok(Isometry3::identity());
-        }
-
-        // 沿 from 向上走到 root，记录每一级 (frame, child→parent transform)
-        // up_from[0] = (from, T: from → parent(from))
-        // up_from[i] = (frame_i, T: frame_i → parent(frame_i))
-        // 最后一级是 root（root 没有父变换，用 identity 兜底）。
-        let mut up_from: Vec<(String, Isometry3<f64>)> = Vec::new();
-        let mut cursor = from.to_string();
-        loop {
-            match self.lookup(&cursor) {
-                Ok(t) => {
-                    let parent = t.parent.clone();
-                    up_from.push((cursor.clone(), t.transform));
-                    if parent == cursor {
-                        break;
-                    }
-                    cursor = parent;
-                }
-                Err(TfError::FrameNotFound(_)) => {
-                    up_from.push((cursor.clone(), Isometry3::identity()));
-                    break;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // 沿 to 向上走到 root，同样记录每一级 (frame, child→parent)。
-        let mut up_to: Vec<(String, Isometry3<f64>)> = Vec::new();
-        cursor = to.to_string();
-        loop {
-            match self.lookup(&cursor) {
-                Ok(t) => {
-                    let parent = t.parent.clone();
-                    up_to.push((cursor.clone(), t.transform));
-                    if parent == cursor {
-                        break;
-                    }
-                    cursor = parent;
-                }
-                Err(TfError::FrameNotFound(_)) => {
-                    up_to.push((cursor.clone(), Isometry3::identity()));
-                    break;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // 找最近共同祖先：up_from 中最深的（rposition）也出现在 up_to 集合里。
-        let to_frames: HashSet<&String> = up_to.iter().map(|(f, _)| f).collect();
-        let ancestor_idx = match up_from.iter().rposition(|(f, _)| to_frames.contains(f)) {
-            Some(i) => i,
-            None => {
-                return Err(TfError::Disconnected {
-                    from: from.to_string(),
-                    to: to.to_string(),
-                });
-            }
-        };
-        let ancestor = up_from[ancestor_idx].0.clone();
-
-        // 累乘 from → ancestor：
-        // `Isometry3::from_parts(trans, q)` 是 body→parent 的方向（即把 child-frame 的
-        // 点映到 parent-frame），其 translation 是 body 在 parent 中的位置。
-        // 因此树上存的 tr 直接就是把 child-frame 点映到 parent-frame 的变换。
-        // 沿 up_from 向上走时，每一级 tr 正是我们要的方向（child→parent），直接累乘即可。
-        let from_to_ancestor = up_from
-            .iter()
-            .take(ancestor_idx)
-            .fold(Isometry3::identity(), |acc, (_, tr)| tr * acc);
-
-        // 累乘 ancestor → to：
-        // 现在我们要从 ancestor（parent）下到 to（child），方向与存储的 tr 相反，
-        // 因此每级取 inverse。
-        // up_to[0] = (to, tr: to→parent(to))，
-        // up_to[k] = (frame_k, tr: frame_k→parent(frame_k))。
-        // up_to[to_ancestor_idx] = (ancestor, identity)；to 自身在 up_to[0]。
-        // 路径 ancestor → to 依次经过 ancestor 的 child → ... → to 的父 → to 自身。
-        // 在 up_to 中按从 to 到 ancestor 的顺序：up_to[0]=to, ..., up_to[to_ancestor_idx]=ancestor。
-        // 反向遍历：up_to[to_ancestor_idx - 1]（ancestor 的 child）→ ... → up_to[0]（to 本身），
-        // 每级 tr 是 child→parent 方向（向上），取 inverse 才是 ancestor→child 方向（向下）。
-        let to_ancestor_idx = match up_to.iter().position(|(f, _)| f == &ancestor) {
-            Some(i) => i,
-            None => {
-                return Err(TfError::Disconnected {
-                    from: from.to_string(),
-                    to: to.to_string(),
-                });
-            }
-        };
-        let ancestor_to_to = (0..to_ancestor_idx)
-            .rev()
-            .fold(Isometry3::identity(), |acc, k| {
-                let tr = up_to[k].1;
-                tr.inverse() * acc
-            });
-
-        // 总变换：from → ancestor → to
-        Ok(from_to_ancestor * ancestor_to_to)
+        let g = self.transforms.lock();
+        chain_in(&g, from, to, None)
     }
+
+    /// 在指定时间点查询整条 transform 链。
+    ///
+    /// 每条边都使用相同的 `time_secs` 和 `tolerance_secs` 选择历史帧。
+    ///
+    /// # Errors
+    /// 参数非法、任一边超出时间容差或链路不可达时返回 typed error。
+    pub fn chain_at(
+        &self,
+        from: &str,
+        to: &str,
+        time_secs: f64,
+        tolerance_secs: f64,
+    ) -> TfResult<Isometry3<f64>> {
+        validate_time_query(time_secs, tolerance_secs)?;
+        let g = self.transforms.lock();
+        chain_in(&g, from, to, Some((time_secs, tolerance_secs)))
+    }
+
+    /// 等待指定时间的 transform 链在 `forward_tolerance` 内补齐。
+    ///
+    /// `set` 会唤醒所有 waiter；查询与等待共享同一互斥区，避免错过通知。
+    ///
+    /// # Errors
+    /// 参数非法，或到期时链仍不可用，返回 typed error。
+    pub fn wait_chain_at(
+        &self,
+        from: &str,
+        to: &str,
+        time_secs: f64,
+        tolerance_secs: f64,
+        forward_tolerance: Duration,
+    ) -> TfResult<Isometry3<f64>> {
+        validate_time_query(time_secs, tolerance_secs)?;
+        let deadline = Instant::now() + forward_tolerance;
+        let mut g = self.transforms.lock();
+        loop {
+            if let Ok(transform) = chain_in(&g, from, to, Some((time_secs, tolerance_secs))) {
+                return Ok(transform);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(TfError::WaitTimeout {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                });
+            };
+            if remaining.is_zero() {
+                return Err(TfError::WaitTimeout {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                });
+            }
+            self.updated.wait_for(&mut g, remaining);
+        }
+    }
+}
+
+fn validate_time_query(time_secs: f64, tolerance_secs: f64) -> TfResult<()> {
+    if time_secs.is_finite() && tolerance_secs.is_finite() && tolerance_secs >= 0.0 {
+        Ok(())
+    } else {
+        Err(TfError::InvalidTimeQuery {
+            time_secs,
+            tolerance_secs,
+        })
+    }
+}
+
+fn timestamp_secs(transform: &TransformStamped) -> f64 {
+    transform.stamp_secs as f64 + f64::from(transform.stamp_nanos) * 1e-9
+}
+
+fn lookup_in(
+    transforms: &HashMap<String, Vec<TransformStamped>>,
+    child: &str,
+    query: Option<(f64, f64)>,
+) -> TfResult<TransformStamped> {
+    let history = transforms
+        .get(child)
+        .filter(|history| !history.is_empty())
+        .ok_or_else(|| TfError::FrameNotFound(child.to_string()))?;
+    let Some((time_secs, tolerance_secs)) = query else {
+        return history
+            .last()
+            .cloned()
+            .ok_or_else(|| TfError::FrameNotFound(child.to_string()));
+    };
+
+    let next_index = history.partition_point(|item| timestamp_secs(item) < time_secs);
+    let closest = match (next_index.checked_sub(1), history.get(next_index)) {
+        (Some(previous_index), Some(next)) => {
+            let previous = &history[previous_index];
+            let previous_delta = (timestamp_secs(previous) - time_secs).abs();
+            let next_delta = (timestamp_secs(next) - time_secs).abs();
+            if previous_delta < next_delta {
+                previous
+            } else {
+                next
+            }
+        }
+        (Some(previous_index), None) => &history[previous_index],
+        (None, Some(next)) => next,
+        (None, None) => return Err(TfError::FrameNotFound(child.to_string())),
+    };
+    if (timestamp_secs(closest) - time_secs).abs() > tolerance_secs {
+        return Err(TfError::OutsideTolerance {
+            child: child.to_string(),
+            requested_secs: time_secs,
+            tolerance_secs,
+            closest_stamp_secs: closest.stamp_secs,
+            closest_stamp_nanos: closest.stamp_nanos,
+        });
+    }
+    Ok(closest.clone())
+}
+
+fn chain_in(
+    transforms: &HashMap<String, Vec<TransformStamped>>,
+    from: &str,
+    to: &str,
+    query: Option<(f64, f64)>,
+) -> TfResult<Isometry3<f64>> {
+    if from == to {
+        return Ok(Isometry3::identity());
+    }
+
+    let up_from = upward_chain(transforms, from, query)?;
+    let up_to = upward_chain(transforms, to, query)?;
+    let to_frames: HashSet<&String> = up_to.iter().map(|(frame, _)| frame).collect();
+    let ancestor_idx = up_from
+        .iter()
+        .rposition(|(frame, _)| to_frames.contains(frame))
+        .ok_or_else(|| TfError::Disconnected {
+            from: from.to_string(),
+            to: to.to_string(),
+        })?;
+    let ancestor = &up_from[ancestor_idx].0;
+    let from_to_ancestor = up_from
+        .iter()
+        .take(ancestor_idx)
+        .fold(Isometry3::identity(), |acc, (_, transform)| transform * acc);
+    let to_ancestor_idx = up_to
+        .iter()
+        .position(|(frame, _)| frame == ancestor)
+        .ok_or_else(|| TfError::Disconnected {
+            from: from.to_string(),
+            to: to.to_string(),
+        })?;
+    let ancestor_to_to = (0..to_ancestor_idx)
+        .rev()
+        .fold(Isometry3::identity(), |acc, index| {
+            up_to[index].1.inverse() * acc
+        });
+    Ok(ancestor_to_to * from_to_ancestor)
+}
+
+fn upward_chain(
+    transforms: &HashMap<String, Vec<TransformStamped>>,
+    start: &str,
+    query: Option<(f64, f64)>,
+) -> TfResult<Vec<(String, Isometry3<f64>)>> {
+    let mut chain = Vec::new();
+    let mut cursor = start.to_string();
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(cursor.clone()) {
+            return Err(TfError::Disconnected {
+                from: start.to_string(),
+                to: cursor,
+            });
+        }
+        match lookup_in(transforms, &cursor, query) {
+            Ok(transform) => {
+                let parent = transform.parent.clone();
+                chain.push((cursor.clone(), transform.transform));
+                if parent == cursor {
+                    break;
+                }
+                cursor = parent;
+            }
+            Err(TfError::FrameNotFound(_)) => {
+                chain.push((cursor, Isometry3::identity()));
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(chain)
 }
 
 /// 便捷构造：从平移 + 四元数构造 TransformStamped
@@ -237,6 +435,7 @@ pub fn make_transform(
         parent: parent.into(),
         child: child.into(),
         stamp_secs: 0,
+        stamp_nanos: 0,
         transform: Isometry3::from_parts(trans, q),
     }
 }
@@ -334,11 +533,9 @@ mod tests {
         let q_wxyz_unit = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
             q[0], q[1], q[2], q[3],
         ));
-        let m_wxyz = nalgebra::Isometry3::from_parts(
-            nalgebra::Translation3::identity(),
-            q_wxyz_unit,
-        )
-        .to_matrix();
+        let m_wxyz =
+            nalgebra::Isometry3::from_parts(nalgebra::Translation3::identity(), q_wxyz_unit)
+                .to_matrix();
         // Manhattan 距离判定两种解释产生显著不同的旋转矩阵
         let mut diff = 0.0;
         for i in 0..3 {
@@ -350,5 +547,36 @@ mod tests {
             diff > 0.1,
             "WXYZ 与 XYZW 解释应当产生显著不同的旋转矩阵；diff={diff}，疑似顺序混淆"
         );
+    }
+
+    /// 对齐 dimos `test_tf_ros_example`：旋转后的父子平移不交换。
+    #[test]
+    fn chain_composes_rotated_translation_in_path_order() {
+        let tree = TfTree::new();
+        let half_angle = core::f64::consts::FRAC_PI_6 / 2.0;
+        tree.set(make_transform(
+            "base_link",
+            "arm",
+            [1.0, -1.0, 0.0],
+            [0.0, 0.0, half_angle.sin(), half_angle.cos()],
+        ));
+        tree.set(make_transform(
+            "arm",
+            "end_effector",
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+
+        // TransformStamped stores child -> parent. This is the same physical pose returned by
+        // dimos `get("base_link", "end_effector")`, expressed as a point transform end -> base.
+        let end_to_base = tree.chain("end_effector", "base_link").unwrap();
+        assert_relative_eq!(end_to_base.translation.x, 1.366_025_403_784, epsilon = 1e-9);
+        assert_relative_eq!(end_to_base.translation.y, 0.366_025_403_784, epsilon = 1e-9);
+        assert_relative_eq!(end_to_base.translation.z, 0.0, epsilon = 1e-9);
+
+        let base_to_end = tree.chain("base_link", "end_effector").unwrap();
+        let roundtrip = end_to_base * base_to_end;
+        assert_relative_eq!(roundtrip.translation.vector.norm(), 0.0, epsilon = 1e-9);
+        assert_relative_eq!(roundtrip.rotation.angle(), 0.0, epsilon = 1e-9);
     }
 }

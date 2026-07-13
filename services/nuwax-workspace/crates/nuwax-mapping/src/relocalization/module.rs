@@ -1,9 +1,11 @@
 //! 重定位 Module
-//! 基于 nuwax-core Module trait 包装 ICP 求解器。
+//! 基于 nuwax-core Module trait 包装全局特征重定位管线。
 
-use super::relocalize::{IcpConfig, IcpResult, IcpSolver};
+use super::relocalize::{
+    relocation_pipeline_with_config, IcpConfig, IcpResult, RelocalizationConfig,
+};
 use async_trait::async_trait;
-use nalgebra::Point3;
+use nalgebra::{Isometry3, Point3};
 use nuwax_core::{Module, ModuleResult};
 
 /// 重定位 Module
@@ -18,10 +20,21 @@ impl RelocalizationModule {
         Self { config }
     }
 
-    /// 一次性调用 ICP
+    /// 一次性调用 FPFH + RANSAC + seeded ICP 重定位管线。
     #[must_use]
     pub fn relocalize(&self, source: &[Point3<f64>], target: &[Point3<f64>]) -> IcpResult {
-        IcpSolver::new(self.config).align(source, target)
+        let mut config = RelocalizationConfig::default();
+        config.icp = self.config;
+        relocation_pipeline_with_config(source, target, config).registration
+    }
+
+    /// Convert an accepted local-to-map registration into the world-to-map
+    /// correction published by the original DimOS module.
+    #[must_use]
+    pub fn corrected_world_to_map(&self, registration: &IcpResult) -> Option<Isometry3<f64>> {
+        registration
+            .converged
+            .then(|| registration.transformation.inverse())
     }
 }
 
@@ -56,11 +69,19 @@ mod tests {
     #[tokio::test]
     async fn module_relocalize_call() {
         let m = RelocalizationModule::default();
-        let target = vec![
-            nalgebra::point![0.0, 0.0, 0.0],
-            nalgebra::point![1.0, 0.0, 0.0],
-            nalgebra::point![0.0, 1.0, 0.0],
-        ];
+        let target: Vec<Point3<f64>> = (0..4)
+            .flat_map(|x| {
+                (0..3).flat_map(move |y| {
+                    (0..2).map(move |z| {
+                        Point3::new(
+                            x as f64 * 0.41 + (y * y + z) as f64 * 0.013,
+                            y as f64 * 0.43 + (x * z + z * z) as f64 * 0.017,
+                            z as f64 * 0.37 + (x * x + y) as f64 * 0.011,
+                        )
+                    })
+                })
+            })
+            .collect();
         let source = target.clone();
         let res = m.relocalize(&source, &target);
         assert!(res.converged);

@@ -2,7 +2,7 @@
 //!
 //! **compat-only** —— 总纲修订后,protobuf 不再作为默认协议层。
 //! 本模块仅承载 frame 长度前缀工具,集中 `nuwax-codec` 旧 API;
-//! 业务层应使用 [`crate::lcm`] 与 [`nuwax_protocol::RawLcmFrame`] 替代。
+//! 业务层应使用 [`crate::lcm`] 与 `nuwax_protocol::RawLcmFrame` 替代。
 //!
 //! `nuwax-codec::write_protobuf_frame` / `nuwax-codec::read_protobuf_frame`
 //! 重新从这里 re-export,作为 compat path 入口。

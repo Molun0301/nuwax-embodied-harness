@@ -40,6 +40,10 @@ class GatewayError(RuntimeError):
         }
 
 
+class MotionGuardFacadeError(RuntimeError):
+    """Neutral boundary error raised by an injected motion-guard facade."""
+
+
 class AuthenticationRequiredError(GatewayError):
     """缺少认证信息。"""
 

@@ -1,58 +1,150 @@
-//! Stream / RPC adapter
+//! Synchronous module boundary for the replanning A* navigation stack.
 //!
-//! Phase 1 仅占位。Foundation `nuwax-stream` 与 `nuwax-nav-types-messages` 完成后，
-//! 在此模块内实现：
-//! - `ReplanningAStarPlannerModule`：暴露输入端口 `odom / goal / costmap / stop_movement`、
-//!   输出端口 `path / cmd_vel / goal_reached / navigation_state`。
-//! - RPC：`set_goal / cancel_goal / get_state / is_goal_reached / set_replanning_enabled / set_safe_goal_clearance`。
-//!
-//! 与 Python `dimos/navigation/replanning_a_star/module.py` 行为对齐，但不引入 LCM/DDS。
-//!
-//! ## rework22 P0-11
-//!
-//! 新增 `Module` trait(对外契约的 10Hz lifecycle + 三个 `on_*` 输入),
-//! 与既有 `NavigationInterface` 共存(后者为 RPC 旧名,前者为新版契约)。
-//! `ModuleOutput` 表示本 tick 产生的主要输出;端口用 `nuwax-core::channel`
-//! mpsc 实现 in-memory mock,不做 LCM/DDS 接线。
+//! The runtime owns transport and scheduling. This adapter validates typed
+//! odometry/costmap/goal inputs, drives [`GlobalPlanner`], and exposes every
+//! control tick as one coherent navigation update.
 
-use crate::global_planner::{GlobalPlanner, GlobalPlannerConfig};
-use crate::helpers::{NavError, PoseStamped, Twist2};
+use crate::global_planner::{
+    GlobalPlanner, GlobalPlannerConfig, GlobalPlannerEvent, GlobalPlannerOutput,
+};
+use crate::helpers::{
+    make_path2d_empty, make_twist2_zero, NavError, NavigationStatus, Path2D, PoseStamped, Twist2,
+};
+use crate::navigation_map::CostMap2D;
 
-/// 模块 trait 占位（Foundation 完成后切换到 `nuwax-nav-base::NavigationInterface`）
+/// RPC-compatible navigation lifecycle.
 pub trait NavigationInterface {
-    /// 启动模块
+    /// Start the module. Repeated calls while running are idempotent.
     fn start(&mut self) -> Result<(), NavError>;
-    /// 停止模块
+    /// Stop the planner and queue a zero-velocity safety update.
     fn stop(&mut self) -> Result<(), NavError>;
-    /// 设置 goal
+    /// Set or replace the active goal.
     fn set_goal(&mut self, goal: PoseStamped) -> Result<bool, NavError>;
-    /// 取消 goal
+    /// Cancel the active goal and queue a zero-velocity safety update.
     fn cancel_goal(&mut self) -> Result<bool, NavError>;
-    /// 当前状态（string）
+    /// Current navigation state.
     fn get_state(&self) -> &'static str;
-    /// 是否到达
+    /// Whether the current goal was reached.
     fn is_goal_reached(&self) -> bool;
+    /// Enable or disable automatic replanning.
+    fn set_replanning_enabled(&mut self, enabled: bool) -> Result<(), NavError>;
+    /// Override the safe-goal clearance in metres.
+    fn set_safe_goal_clearance(&mut self, clearance: f64) -> Result<(), NavError>;
+    /// Restore the safe-goal clearance derived from robot geometry.
+    fn reset_safe_goal_clearance(&mut self) -> Result<(), NavError>;
 }
 
-/// ReplanningAStar 模块包装
+/// One complete navigation-cycle result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NavigationUpdate {
+    /// Current navigation state.
+    pub status: NavigationStatus,
+    /// Most recently published global path, if any.
+    pub path: Option<Path2D>,
+    /// Velocity command for this cycle.
+    pub twist: Twist2,
+    /// Whether the goal has been reached.
+    pub goal_reached: bool,
+    /// Planner event emitted by this cycle, including terminal failure pulses.
+    pub event: Option<GlobalPlannerEvent>,
+}
+
+/// A single lifecycle output.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModuleOutput {
+    /// Normal planner/control update.
+    Navigation(NavigationUpdate),
+    /// Explicit zero-velocity update produced by cancel or lifecycle stop.
+    SafetyHold(NavigationUpdate),
+}
+
+/// Typed lifecycle input contract.
+pub trait Module: Send + Sync + 'static {
+    /// Advance the global and local planners by one control cycle.
+    fn tick(&mut self) -> Result<ModuleOutput, NavError>;
+    /// Update robot odometry.
+    fn on_odom(&mut self, odom: PoseStamped) -> Result<(), NavError>;
+    /// Replace the global occupancy costmap.
+    fn on_costmap(&mut self, grid: CostMap2D) -> Result<(), NavError>;
+    /// Set or replace the active goal.
+    fn on_goal(&mut self, goal: PoseStamped) -> Result<(), NavError>;
+    /// Cancel navigation when `stop` is true.
+    fn on_stop_movement(&mut self, stop: bool) -> Result<(), NavError>;
+}
+
+/// Lifecycle wrapper around [`GlobalPlanner`].
 pub struct ReplanningAStarPlannerModule {
+    config: GlobalPlannerConfig,
     planner: GlobalPlanner,
     running: bool,
+    has_odom: bool,
+    costmap: Option<CostMap2D>,
+    pending_hold: Option<NavigationStatus>,
 }
 
 impl ReplanningAStarPlannerModule {
-    /// 构造
+    /// Construct an inactive module.
     #[must_use]
     pub fn new(config: GlobalPlannerConfig) -> Self {
         Self {
-            planner: GlobalPlanner::new(config),
+            planner: GlobalPlanner::new(config.clone()),
+            config,
             running: false,
+            has_odom: false,
+            costmap: None,
+            pending_hold: None,
         }
     }
 
-    /// 访问内部 GlobalPlanner（供测试 / Phase 1 调用）
+    /// Access the underlying planner for diagnostics and advanced configuration.
     pub fn planner_mut(&mut self) -> &mut GlobalPlanner {
         &mut self.planner
+    }
+
+    /// Whether the module is accepting typed inputs and normal ticks.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    fn ensure_running(&self) -> Result<(), NavError> {
+        if self.running {
+            Ok(())
+        } else {
+            Err(NavError::InvalidInput {
+                field: "module",
+                reason: "replanning A* module is not running".into(),
+            })
+        }
+    }
+
+    fn accept_goal(&mut self, goal: PoseStamped) -> Result<(), NavError> {
+        self.ensure_running()?;
+        validate_pose(&goal, "goal")?;
+        if !self.has_odom {
+            return Err(NavError::InvalidInput {
+                field: "odometry",
+                reason: "goal received before odometry".into(),
+            });
+        }
+        let costmap = self.costmap.as_ref().ok_or(NavError::MapUnavailable)?;
+        let (cell_x, cell_y) = costmap.world_to_cell(goal.pose.position.to_2d());
+        if !costmap.in_bounds(cell_x, cell_y) {
+            return Err(NavError::GoalOutOfBounds);
+        }
+        self.planner.handle_goal_request(goal);
+        self.pending_hold = None;
+        Ok(())
+    }
+
+    fn safety_hold(&self, status: NavigationStatus) -> ModuleOutput {
+        ModuleOutput::SafetyHold(NavigationUpdate {
+            status,
+            path: Some(make_path2d_empty()),
+            twist: make_twist2_zero(),
+            goal_reached: self.planner.is_goal_reached(),
+            event: None,
+        })
     }
 }
 
@@ -61,6 +153,10 @@ impl NavigationInterface for ReplanningAStarPlannerModule {
         if self.running {
             return Ok(());
         }
+        self.planner = GlobalPlanner::new(self.config.clone());
+        self.has_odom = false;
+        self.costmap = None;
+        self.pending_hold = None;
         self.planner.start();
         self.running = true;
         Ok(())
@@ -71,128 +167,151 @@ impl NavigationInterface for ReplanningAStarPlannerModule {
             return Ok(());
         }
         self.planner.stop();
+        self.pending_hold = Some(NavigationStatus::Cancelled);
         self.running = false;
         Ok(())
     }
 
     fn set_goal(&mut self, goal: PoseStamped) -> Result<bool, NavError> {
-        self.planner.handle_goal_request(goal);
+        self.accept_goal(goal)?;
         Ok(true)
     }
 
     fn cancel_goal(&mut self) -> Result<bool, NavError> {
+        self.ensure_running()?;
         self.planner.cancel_goal(false);
+        self.pending_hold = Some(NavigationStatus::Cancelled);
         Ok(true)
     }
 
     fn get_state(&self) -> &'static str {
         match self.planner.status() {
-            crate::helpers::NavigationStatus::Idle => "idle",
-            crate::helpers::NavigationStatus::Planning => "planning",
-            crate::helpers::NavigationStatus::Moving => "moving",
-            crate::helpers::NavigationStatus::Reached => "reached",
-            crate::helpers::NavigationStatus::Blocked => "blocked",
-            crate::helpers::NavigationStatus::Cancelled => "cancelled",
-            crate::helpers::NavigationStatus::Error => "error",
+            NavigationStatus::Idle => "idle",
+            NavigationStatus::Planning => "planning",
+            NavigationStatus::Moving => "moving",
+            NavigationStatus::Reached => "reached",
+            NavigationStatus::Blocked => "blocked",
+            NavigationStatus::Cancelled => "cancelled",
+            NavigationStatus::Error => "error",
         }
     }
 
     fn is_goal_reached(&self) -> bool {
         self.planner.is_goal_reached()
     }
-}
 
-/// 一次性 cmd_vel 推算 helper（供 Phase 1 测试或上层 stream 适配层使用）
-pub fn twist_to_proto(t: Twist2) -> (f64, f64) {
-    (t.linear.x, t.angular_z)
-}
+    fn set_replanning_enabled(&mut self, enabled: bool) -> Result<(), NavError> {
+        self.ensure_running()?;
+        self.planner.set_replanning_enabled(enabled);
+        Ok(())
+    }
 
-// ===== rework22 P0-11:Module trait + ModuleOutput + 端口工厂 =====
+    fn set_safe_goal_clearance(&mut self, clearance: f64) -> Result<(), NavError> {
+        self.ensure_running()?;
+        if !clearance.is_finite() || clearance < 0.0 {
+            return Err(NavError::InvalidInput {
+                field: "safe_goal_clearance",
+                reason: "must be finite and non-negative".into(),
+            });
+        }
+        self.config.safe_goal_clearance = clearance;
+        self.planner.set_safe_goal_clearance(clearance);
+        Ok(())
+    }
 
-/// rework22 P0-11 `Module` trait。
-///
-/// 三个输入(`on_odom / on_costmap / on_goal`)和 lifecycle (`start / stop`)。
-/// 单一 trait 避免和上面 `NavigationInterface` 重复;`NavigationInterface`
-/// 继续保留作 RPC 旧名。
-pub trait Module: Send + Sync + 'static {
-    /// 10Hz lifecycle tick(等价于"启动并 tick")。`NavigationInterface::start/stop`
-    /// 仍可独立调用,RPC 层用 NavigationInterface;Module 层的 lifecycle 由本 trait 拥有。
-    fn tick(&mut self) -> ModuleOutput;
-    /// 收到 odom 输入
-    fn on_odom(&mut self, odom: PoseStamped);
-    /// 收到 costmap 输入
-    fn on_costmap(&mut self, grid: crate::navigation_map::CostMap2D);
-    /// 主动 goal(RPC `set_goal` 等价入口)
-    fn on_goal(&mut self, goal: PoseStamped) -> Result<ModuleOutput, NavError>;
-}
-
-/// 模块单次输出(rework22 P0-11)
-#[derive(Debug, Clone)]
-pub enum ModuleOutput {
-    /// 产生一条 Path2D
-    Path(crate::helpers::Path2D),
-    /// 产生一条 Twist2 cmd_vel
-    Twist(Twist2),
-    /// 报告 goal_reached(true / false)
-    GoalReached(bool),
-    /// 无输出(idle / 等待输入)
-    None,
+    fn reset_safe_goal_clearance(&mut self) -> Result<(), NavError> {
+        self.ensure_running()?;
+        self.config.safe_goal_clearance = self.config.robot_rotation_diameter / 2.0;
+        self.planner.reset_safe_goal_clearance();
+        Ok(())
+    }
 }
 
 impl Module for ReplanningAStarPlannerModule {
-    fn tick(&mut self) -> ModuleOutput {
-        // Phase 1 占位:从 self.planner 收集本 tick 输出
-        if self.planner.is_goal_reached() {
-            ModuleOutput::GoalReached(true)
-        } else {
-            ModuleOutput::None
+    fn tick(&mut self) -> Result<ModuleOutput, NavError> {
+        if let Some(status) = self.pending_hold.take() {
+            return Ok(self.safety_hold(status));
         }
+        self.ensure_running()?;
+        let costmap = self.costmap.clone().ok_or(NavError::MapUnavailable)?;
+        let output = self.planner.tick(&costmap);
+        Ok(ModuleOutput::Navigation(navigation_update(
+            output,
+            self.planner.is_goal_reached(),
+        )))
     }
 
-    fn on_odom(&mut self, odom: PoseStamped) {
+    fn on_odom(&mut self, odom: PoseStamped) -> Result<(), NavError> {
+        self.ensure_running()?;
+        validate_pose(&odom, "odometry")?;
         self.planner.handle_odom(odom);
+        self.has_odom = true;
+        Ok(())
     }
 
-    fn on_costmap(&mut self, _grid: crate::navigation_map::CostMap2D) {
-        // Phase 1 占位:costmap 输入留 hook 后续 PR 接到 NavigationMap。
+    fn on_costmap(&mut self, grid: CostMap2D) -> Result<(), NavError> {
+        self.ensure_running()?;
+        if grid.width() == 0
+            || grid.height() == 0
+            || !grid.resolution().is_finite()
+            || grid.resolution() <= 0.0
+        {
+            return Err(NavError::InvalidInput {
+                field: "global_costmap",
+                reason: "width, height, and resolution must be positive".into(),
+            });
+        }
+        self.planner.handle_global_costmap(grid.clone());
+        self.costmap = Some(grid);
+        Ok(())
     }
 
-    fn on_goal(&mut self, goal: PoseStamped) -> Result<ModuleOutput, NavError> {
-        self.planner.handle_goal_request(goal);
-        // Phase 1 立即返回 None;Phase 2 包成 Path2D 输出
-        Ok(ModuleOutput::None)
+    fn on_goal(&mut self, goal: PoseStamped) -> Result<(), NavError> {
+        self.accept_goal(goal)
+    }
+
+    fn on_stop_movement(&mut self, stop: bool) -> Result<(), NavError> {
+        self.ensure_running()?;
+        if stop {
+            self.planner.cancel_goal(false);
+            self.pending_hold = Some(NavigationStatus::Cancelled);
+        }
+        Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::helpers::{make_pose_stamped, make_twist2};
+/// Convert a planar twist into the two fields used by lightweight transports.
+#[must_use]
+pub fn twist_to_proto(twist: Twist2) -> (f64, f64) {
+    (twist.linear.x, twist.angular_z)
+}
 
-    #[test]
-    fn module_lifecycle() {
-        let mut m = ReplanningAStarPlannerModule::new(GlobalPlannerConfig::default());
-        assert!(m.start().is_ok());
-        assert!(m.start().is_ok()); // 重复 start 不报错
-        assert_eq!(m.get_state(), "idle");
-        let _ = m.stop();
+fn navigation_update(output: GlobalPlannerOutput, goal_reached: bool) -> NavigationUpdate {
+    NavigationUpdate {
+        status: output.status,
+        path: output.path,
+        twist: output.twist,
+        goal_reached,
+        event: output.event,
     }
+}
 
-    #[test]
-    fn module_set_and_cancel_goal() {
-        let mut m = ReplanningAStarPlannerModule::new(GlobalPlannerConfig::default());
-        let _ = m.start();
-        let goal = make_pose_stamped("map", 1.0, 1.0, 0.0);
-        assert!(m.set_goal(goal).unwrap());
-        let _ = m.cancel_goal().unwrap();
-        assert!(!m.is_goal_reached());
-    }
-
-    #[test]
-    fn twist_to_proto_roundtrip() {
-        let t = make_twist2(0.5, 0.1);
-        let (l, a) = twist_to_proto(t);
-        assert!((l - 0.5).abs() < 1e-9);
-        assert!((a - 0.1).abs() < 1e-9);
+fn validate_pose(pose: &PoseStamped, field: &'static str) -> Result<(), NavError> {
+    let position = pose.pose.position;
+    let orientation = pose.pose.orientation;
+    if position.x.is_finite()
+        && position.y.is_finite()
+        && position.z.is_finite()
+        && orientation.w.is_finite()
+        && orientation.x.is_finite()
+        && orientation.y.is_finite()
+        && orientation.z.is_finite()
+    {
+        Ok(())
+    } else {
+        Err(NavError::InvalidInput {
+            field,
+            reason: "pose contains a non-finite value".into(),
+        })
     }
 }

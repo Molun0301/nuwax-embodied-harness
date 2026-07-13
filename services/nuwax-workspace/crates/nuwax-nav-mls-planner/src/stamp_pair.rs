@@ -40,8 +40,12 @@ pub fn stamp_pair_latest_only(odom_stamp: u64, map_stamp: u64) -> Option<()> {
 ///
 /// 任意一个值为 NaN / Infinity 则返 `Err(NaN)`；有限值返 `Ok(())`。
 pub fn nan_cancel_goal(goal: (f32, f32, f32)) -> Result<(), NaNCancelError> {
-    if goal.0.is_nan() || goal.1.is_nan() || goal.2.is_nan()
-        || !goal.0.is_finite() || !goal.1.is_finite() || !goal.2.is_finite()
+    if goal.0.is_nan()
+        || goal.1.is_nan()
+        || goal.2.is_nan()
+        || !goal.0.is_finite()
+        || !goal.1.is_finite()
+        || !goal.2.is_finite()
     {
         return Err(NaNCancelError::NaN);
     }

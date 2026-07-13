@@ -91,11 +91,7 @@ pub struct lcm_recv_buf_t {
 /// - `user`    — 注册订阅时传入的 user pointer
 #[allow(non_camel_case_types)]
 pub type lcm_msg_handler_t = Option<
-    unsafe extern "C" fn(
-        rbuf: *const lcm_recv_buf_t,
-        channel: *const c_char,
-        user: *mut c_void,
-    ),
+    unsafe extern "C" fn(rbuf: *const lcm_recv_buf_t, channel: *const c_char, user: *mut c_void),
 >;
 
 // =============================================================================
@@ -176,7 +172,9 @@ extern "C" {
 /// NUL-terminated;`CString::new` 在含 NUL 字节时会 panic —— 我们选择显式
 /// 返回 `Result` 把决定权交给上层。
 pub fn to_cstring(s: &str) -> Result<std::ffi::CString, NulByteError> {
-    std::ffi::CString::new(s).map_err(|_| NulByteError { input: s.to_owned() })
+    std::ffi::CString::new(s).map_err(|_| NulByteError {
+        input: s.to_owned(),
+    })
 }
 
 /// `&str` 含 NUL 字节

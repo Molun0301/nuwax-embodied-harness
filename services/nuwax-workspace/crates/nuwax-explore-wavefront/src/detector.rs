@@ -14,7 +14,7 @@ use nuwax_nav_types_messages::grid::{OccupancyCell, OccupancyGrid2D};
 use crate::classification::PointClassification;
 use crate::config::WavefrontConfig;
 use crate::diagnostics::WavefrontDiagnostics;
-use crate::grid::{ClassificationGrid, GridPoint};
+use crate::grid::{occupancy_value, ClassificationGrid, GridPoint};
 
 /// Wavefront detector 错误(公共 API:`select_goal_at` 必须能返回 typed error)。
 #[derive(Debug, Error, PartialEq)]
@@ -329,11 +329,11 @@ pub(crate) fn is_frontier_point(
     let mut has_free = false;
     for n in neighbors8(p, grid).iter() {
         let nc = cell_at(grid, n.x, n.y);
-        match nc {
-            OccupancyCell::Free => has_free = true,
-            OccupancyCell::Occupied | OccupancyCell::Inflated => return false,
-            OccupancyCell::Cost(v) if (v as i16) > cfg.occupancy_threshold => return false,
-            _ => {}
+        if nc == OccupancyCell::Free {
+            has_free = true;
+        }
+        if occupancy_value(nc) > cfg.occupancy_threshold {
+            return false;
         }
     }
     has_free
@@ -386,9 +386,10 @@ fn build_cluster(cells: &[GridPoint], grid: &OccupancyGrid2D) -> FrontierCluster
     let mut sx = 0.0_f64;
     let mut sy = 0.0_f64;
     for p in cells {
-        let c = grid.cell_center(p.x, p.y).unwrap_or(grid.origin);
-        sx += c.x;
-        sy += c.y;
+        // Python OccupancyGrid.grid_to_world uses the grid index itself, not
+        // the cell center: origin + index * resolution.
+        sx += grid.origin.x + f64::from(p.x) * grid.resolution;
+        sy += grid.origin.y + f64::from(p.y) * grid.resolution;
     }
     let n = cell_count.max(1) as f64;
     let centroid = Point2 {
@@ -486,6 +487,18 @@ mod tests {
         grid.cells[1] = OccupancyCell::Occupied;
         let cfg = WavefrontConfig::default();
         assert!(!is_frontier_point(GridPoint::new(0, 0), &grid, &cfg));
+    }
+
+    #[test]
+    fn is_frontier_point_uses_python_strict_threshold_for_occupied_variant() {
+        let mut grid = grid_free();
+        grid.cells[0] = OccupancyCell::Unknown;
+        grid.cells[1] = OccupancyCell::Occupied;
+        let cfg = WavefrontConfig {
+            occupancy_threshold: 100,
+            ..WavefrontConfig::default()
+        };
+        assert!(is_frontier_point(GridPoint::new(0, 0), &grid, &cfg));
     }
 
     /// v18 HIGH-2 反例:两块 free 区域被墙隔开,只有起点所在区域能 reach;

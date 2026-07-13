@@ -1,26 +1,52 @@
 [Unit]
 Description=nuwax_robot_bridge 宿主机网关
-After=network-online.target
+Requires=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service nuwax-person-follow.service
+After=network-online.target nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service nuwax-person-follow.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=unitree
-Group=unitree
+User=nuwax-gateway
+Group=nuwax-gateway
+SupplementaryGroups=nuwax-motion-clients
 WorkingDirectory=/home/unitree/nuwax-robot-bridge
+RuntimeDirectory=nuwax/gateway
+RuntimeDirectoryMode=0750
+StateDirectory=nuwax/gateway
+StateDirectoryMode=0750
+LogsDirectory=nuwax/gateway
+LogsDirectoryMode=0750
+UMask=0007
 # 默认会读取 WorkingDirectory 下的 .env。
 # 如果你想把配置独立放到 /etc，再取消下一行注释并准备对应文件。
 # EnvironmentFile=/etc/nuwax_robot_bridge/gateway.env
 # 统一启动入口会按 .env 中的 NUWAX_ACTIVE_ROBOT 与 NUWAX_GEOMETRY_ENABLED 加载运行环境。
 # 平台文件日志路径由 .env 中的 NUWAX_LOG_* 控制。
 Environment=PYTHONUNBUFFERED=1
+Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
+Environment=NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true
+Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
+Environment=NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true
+Environment=NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready
+Environment=NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true
+Environment=NUWAX_PERSON_FOLLOW_TARGET_CHANNEL=/person_follow_target
+Environment=NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL=/global_map
+Environment=NUWAX_PERSON_FOLLOW_TF_CHANNEL=/tf
+Environment=NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL=/gateway/person_follow_cmd_vel
+Environment=NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY=false
+Environment=NUWAX_GATEWAY_RESTART=never
+Environment=NUWAX_GATEWAY_PID_FILE=/run/nuwax/gateway/gateway.pid
+Environment=NUWAX_GATEWAY_LOCK_FILE=/run/nuwax/gateway/start_gateway.lock
+Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
+ExecStartPre=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/systemd/wait_for_motion_guard_socket.sh check
 ExecStart=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/start_gateway.sh
-Restart=always
+Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
+SuccessExitStatus=0
 
 # 建议通过宿主机目录持久化日志和制品
-ReadWritePaths=/var/log/nuwax_robot_bridge /var/lib/nuwax_robot_bridge
+ReadWritePaths=/run/nuwax/gateway /var/log/nuwax/gateway /var/lib/nuwax/gateway /var/lib/nuwax_robot_bridge
 
 [Install]
 WantedBy=multi-user.target

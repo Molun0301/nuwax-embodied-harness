@@ -4,11 +4,11 @@
 //! - 缺 TF 或 frame 不匹配返回 typed error（`MissingTf` / `FrameMismatch`），**不**用 zero 掩盖。
 //! - 单元测试用 fake TF trait 实现。
 //!
-//! `extract_3d_from_detection`：从 2D bbox + 相机坐标系 PointCloud2 中提取目标 3D 点。
-//! 算法：取 bbox 中心点对应 pointcloud 索引处的 x,y,z,经 TF 转 world frame。
+//! `extract_3d_from_detection`：把世界坐标系 PointCloud2 投影到图像，收集 bbox
+//! 内点，并用距离机器人最近 25% 点的质心作为前表面目标。
 //!
-//! `DetectionNavigationModule`：dev mock module I/O 层,封装三路输入(暂用同步 mock)
-//! 调用 `DetectionNavigation` 产出 twist。
+//! `DetectionNavigationModule`：同步 I/O 适配层，封装 image / bbox / pointcloud
+//! 输入，并调用持有同一 TF provider 的 `DetectionNavigation` 产出 twist。
 
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +16,22 @@ use crate::{BBox, ImageView, PoseStamped, VisualServoingError};
 
 /// TF trait（由调用方注入；测试用 fake）
 pub trait TfLike: Send + Sync {
-    /// 查询 `target_frame -> source_frame` 的变换，缺失返回 None
+    /// 查询 `target_frame <- source_frame` 的变换，缺失返回 None。
     fn lookup(&self, target_frame: &str, source_frame: &str) -> Option<PoseStamped>;
+
+    /// 按时间查询 `target_frame <- source_frame` 的变换。
+    ///
+    /// 旧实现只需实现 [`Self::lookup`]；需要时间同步的生产适配器可覆盖本方法。
+    fn lookup_at(
+        &self,
+        target_frame: &str,
+        source_frame: &str,
+        time_point: Option<f64>,
+        time_tolerance: f64,
+    ) -> Option<PoseStamped> {
+        let _ = (time_point, time_tolerance);
+        self.lookup(target_frame, source_frame)
+    }
 }
 
 /// 3D 目标点（世界 frame）
@@ -97,18 +111,72 @@ impl DetectionNavigation {
         target_world: TargetPoint3D,
         world_frame: &str,
     ) -> Result<NavTwist3D, VisualServoingError> {
-        // 取 world -> robot_frame 变换
         let robot_tf = self
             .tf
             .lookup(world_frame, &self.config.robot_frame)
             .ok_or_else(|| VisualServoingError::MissingTf(self.config.robot_frame.clone()))?;
+        self.compute_twist_with_robot_transform(target_world, world_frame, robot_tf)
+    }
+
+    /// Project a 2D detection and compute a twist with the controller-owned TF source.
+    pub fn compute_twist_for_detection_3d<P: PointCloud2Like + ?Sized>(
+        &self,
+        bbox: BBox,
+        image: &ImageView<'_>,
+        pointcloud: &P,
+        camera_intrinsics: &CameraIntrinsics,
+        camera_frame: &str,
+        world_frame: &str,
+    ) -> Result<NavTwist3D, VisualServoingError> {
+        self.compute_twist_for_detection_3d_at(
+            bbox,
+            image,
+            pointcloud,
+            camera_intrinsics,
+            camera_frame,
+            world_frame,
+            None,
+        )
+    }
+
+    /// Timestamp-aware form of [`Self::compute_twist_for_detection_3d`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_twist_for_detection_3d_at<P: PointCloud2Like + ?Sized>(
+        &self,
+        bbox: BBox,
+        image: &ImageView<'_>,
+        pointcloud: &P,
+        camera_intrinsics: &CameraIntrinsics,
+        camera_frame: &str,
+        world_frame: &str,
+        image_timestamp: Option<f64>,
+    ) -> Result<NavTwist3D, VisualServoingError> {
+        let (target_world, robot_tf) = extract_target_and_robot_at(
+            bbox,
+            image,
+            pointcloud,
+            camera_intrinsics,
+            self.tf.as_ref(),
+            camera_frame,
+            world_frame,
+            &self.config.robot_frame,
+            image_timestamp,
+        )?;
+        self.compute_twist_with_robot_transform(target_world, world_frame, robot_tf)
+    }
+
+    fn compute_twist_with_robot_transform(
+        &self,
+        target_world: TargetPoint3D,
+        world_frame: &str,
+        robot_tf: PoseStamped,
+    ) -> Result<NavTwist3D, VisualServoingError> {
         if robot_tf.frame_id != world_frame {
             return Err(VisualServoingError::FrameMismatch {
                 expected: world_frame.into(),
                 actual: robot_tf.frame_id,
             });
         }
-        // robot 在 world 中的位置
         let rx = robot_tf.position[0];
         let ry = robot_tf.position[1];
         let dx = target_world.x - rx;
@@ -153,16 +221,19 @@ pub fn yaw_from_quat(q: &[f64; 4]) -> f64 {
     siny_cosp.atan2(cosy_cosp)
 }
 
-/// PointCloud2 like trait（dev mock 用）
+/// PointCloud2-like projection input.
 ///
-/// 描述 PointCloud2 风格接口：x/y/z 顺序的平铺 xyz 数据。
-/// 真实 ROS2 sensor_msgs/PointCloud2 字段更多,dev 自测只需要 x/y/z,
-/// 因此以最小 trait 形式暴露。
+/// Production adapters expose decoded little-endian XYZ values and the header
+/// frame through this minimal interface; tests use [`SimplePointCloud`].
 pub trait PointCloud2Like: Send + Sync {
     /// xyz flat bytes（小端 f32 x,y,z 顺序）,长度 = N * 12
     fn xyz_bytes(&self) -> &[u8];
     /// 是否 dense（无 NaN / 无 invalid 点）
     fn is_dense(&self) -> bool;
+    /// 点云坐标系。旧 mock 未携带 header 时返回 None。
+    fn frame_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// 简易 PointCloud2 mock：持有 `Vec<(f32,f32,f32)>` + dense flag + bytes cache。
@@ -174,6 +245,8 @@ pub struct SimplePointCloud {
     pub points: Vec<(f32, f32, f32)>,
     /// xyz flat bytes cache
     bytes_cache: Vec<u8>,
+    /// Optional PointCloud2 header frame.
+    frame_id: Option<String>,
 }
 
 impl SimplePointCloud {
@@ -185,7 +258,15 @@ impl SimplePointCloud {
             is_dense: true,
             points,
             bytes_cache,
+            frame_id: None,
         }
+    }
+
+    /// Attach the PointCloud2 header frame used by TF projection.
+    #[must_use]
+    pub fn in_frame(mut self, frame_id: impl Into<String>) -> Self {
+        self.frame_id = Some(frame_id.into());
+        self
     }
 
     fn encode(points: &[(f32, f32, f32)]) -> Vec<u8> {
@@ -206,11 +287,13 @@ impl PointCloud2Like for SimplePointCloud {
     fn is_dense(&self) -> bool {
         self.is_dense
     }
+
+    fn frame_id(&self) -> Option<&str> {
+        self.frame_id.as_deref()
+    }
 }
 
-/// 相机内参（pinhole,无畸变）
-///
-/// 仅 dev 自测使用；实装由相机标定 driver 注入。
+/// 相机内参（pinhole,无畸变）；生产值由共享 `CameraInfo.K` 注入。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CameraIntrinsics {
     /// fx (px)
@@ -240,6 +323,31 @@ impl CameraIntrinsics {
             height,
         }
     }
+
+    /// Construct from the shared ROS `CameraInfo.K` subset.
+    #[must_use]
+    pub fn from_camera_info(info: nuwax_nav_types_messages::CameraInfo) -> Self {
+        Self::new(info.fx, info.fy, info.cx, info.cy, info.width, info.height)
+    }
+
+    /// Whether the pinhole model can produce finite image coordinates.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.fx.is_finite()
+            && self.fy.is_finite()
+            && self.cx.is_finite()
+            && self.cy.is_finite()
+            && self.fx > 0.0
+            && self.fy > 0.0
+    }
+}
+
+impl From<nuwax_nav_types_messages::CameraInfo> for CameraIntrinsics {
+    fn from(info: nuwax_nav_types_messages::CameraInfo) -> Self {
+        Self::from_camera_info(info)
+    }
 }
 
 impl Default for CameraIntrinsics {
@@ -248,16 +356,16 @@ impl Default for CameraIntrinsics {
     }
 }
 
-/// 从 2D bbox + 相机坐标系 PointCloud2 + TF 提取目标 3D 点
+const TF_TIME_TOLERANCE_SECONDS: f64 = 1.0;
+const BBOX_MARGIN_PIXELS: f64 = 5.0;
+
+/// 从 2D bbox + 世界坐标系 PointCloud2 + TF 提取目标 3D 点
 ///
-/// 算法(简化版,dev 自测够用)：
-/// 1. bbox 中心 -> 图像坐标 (cx_pixel, cy_pixel)
-/// 2. 1:1 简化：索引 = cy_pixel * width + cx_pixel,从 bytes 取 x,y,z
-/// 3. 已知 x,y,z 在 camera frame,直接用
-/// 4. 用 TF 把 camera_optical -> world_frame
-///
-/// **TODO(real-machine)**:实机需把 pointcloud 投影到图像平面或做外参对齐；
-/// 此处 dev 简化版本假定 pointcloud 与 image 像素 1:1 对应（mock 测试约束）。
+/// 算法与原版 `Detection3DPC.from_2d` + robust target 对齐：
+/// 1. 查询 `camera_frame <- world_frame`，把每个 world-frame 点投影到 image；
+/// 2. 先裁剪图像边界，再选择 bbox 周围 5px margin 内的点；选中点仍保持 world 坐标；
+/// 3. 至少需要 10 点，优先过滤 world z <= 0.3 m 的地面点；
+/// 4. 取相对 robot XY 距离的 25th percentile 前表面点并求质心。
 pub fn extract_3d_from_detection<P: PointCloud2Like + ?Sized>(
     bbox: BBox,
     image: &ImageView<'_>,
@@ -267,11 +375,71 @@ pub fn extract_3d_from_detection<P: PointCloud2Like + ?Sized>(
     camera_frame: &str,
     world_frame: &str,
 ) -> Result<TargetPoint3D, VisualServoingError> {
+    extract_3d_from_detection_at(
+        bbox,
+        image,
+        pointcloud,
+        camera_intrinsics,
+        tf,
+        camera_frame,
+        world_frame,
+        None,
+    )
+}
+
+/// Timestamp-aware form of [`extract_3d_from_detection`].
+///
+/// `image_timestamp` is used for the optical transform, matching the original
+/// `LCMTF.get(..., image.ts, time_tolerance=1.0)` contract. Robot pose uses the
+/// latest transform with the same tolerance.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_3d_from_detection_at<P: PointCloud2Like + ?Sized>(
+    bbox: BBox,
+    image: &ImageView<'_>,
+    pointcloud: &P,
+    camera_intrinsics: &CameraIntrinsics,
+    tf: &dyn TfLike,
+    camera_frame: &str,
+    world_frame: &str,
+    image_timestamp: Option<f64>,
+) -> Result<TargetPoint3D, VisualServoingError> {
+    extract_target_and_robot_at(
+        bbox,
+        image,
+        pointcloud,
+        camera_intrinsics,
+        tf,
+        camera_frame,
+        world_frame,
+        "base_link",
+        image_timestamp,
+    )
+    .map(|(target, _)| target)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_target_and_robot_at<P: PointCloud2Like + ?Sized>(
+    bbox: BBox,
+    image: &ImageView<'_>,
+    pointcloud: &P,
+    camera_intrinsics: &CameraIntrinsics,
+    tf: &dyn TfLike,
+    camera_frame: &str,
+    world_frame: &str,
+    robot_frame: &str,
+    image_timestamp: Option<f64>,
+) -> Result<(TargetPoint3D, PoseStamped), VisualServoingError> {
     if !bbox.is_valid() {
         return Err(VisualServoingError::InvalidBbox(format!(
             "bbox non-positive area: ({},{},{},{})",
             bbox.x1, bbox.y1, bbox.x2, bbox.y2
         )));
+    }
+    if !camera_intrinsics.is_valid() {
+        return Err(VisualServoingError::ProjectionFailed(
+            "camera intrinsics must have finite positive focal lengths and non-zero dimensions"
+                .into(),
+        ));
     }
     if !image.matches(camera_intrinsics.width, camera_intrinsics.height) {
         return Err(VisualServoingError::InvalidBbox(format!(
@@ -279,8 +447,12 @@ pub fn extract_3d_from_detection<P: PointCloud2Like + ?Sized>(
             image.width, image.height, camera_intrinsics.width, camera_intrinsics.height
         )));
     }
-    let (cx_pixel, cy_pixel) = bbox.center();
-    let idx = (cy_pixel as usize) * (camera_intrinsics.width as usize) + (cx_pixel as usize);
+    if let Some(actual) = pointcloud.frame_id().filter(|frame| *frame != world_frame) {
+        return Err(VisualServoingError::FrameMismatch {
+            expected: world_frame.into(),
+            actual: actual.into(),
+        });
+    }
     let bytes = pointcloud.xyz_bytes();
     if bytes.len() % 12 != 0 {
         return Err(VisualServoingError::ProjectionFailed(format!(
@@ -288,67 +460,169 @@ pub fn extract_3d_from_detection<P: PointCloud2Like + ?Sized>(
             bytes.len()
         )));
     }
-    let n_points = bytes.len() / 12;
-    if idx >= n_points {
-        return Err(VisualServoingError::ProjectionFailed(format!(
-            "bbox center pixel index {} >= pointcloud n_points {}",
-            idx, n_points
-        )));
-    }
-    let base = idx * 12;
-    let x = f32::from_le_bytes([
-        bytes[base],
-        bytes[base + 1],
-        bytes[base + 2],
-        bytes[base + 3],
-    ]);
-    let y = f32::from_le_bytes([
-        bytes[base + 4],
-        bytes[base + 5],
-        bytes[base + 6],
-        bytes[base + 7],
-    ]);
-    let z = f32::from_le_bytes([
-        bytes[base + 8],
-        bytes[base + 9],
-        bytes[base + 10],
-        bytes[base + 11],
-    ]);
-    if !z.is_finite() || z <= 0.0 {
-        return Err(VisualServoingError::ProjectionFailed(format!(
-            "invalid depth z={} at pixel ({}, {})",
-            z, cx_pixel, cy_pixel
-        )));
-    }
-    let cam_target = TargetPoint3D {
-        x: f64::from(x),
-        y: f64::from(y),
-        z: f64::from(z),
-    };
-    let tf_wc = tf
-        .lookup(world_frame, camera_frame)
-        .ok_or_else(|| VisualServoingError::MissingTf(format!("{}->{}", world_frame, camera_frame)))?;
-    if tf_wc.frame_id != world_frame {
+    let optical_from_world = tf
+        .lookup_at(
+            camera_frame,
+            world_frame,
+            image_timestamp,
+            TF_TIME_TOLERANCE_SECONDS,
+        )
+        .ok_or_else(|| VisualServoingError::MissingTf(format!("{camera_frame}<-{world_frame}")))?;
+    if optical_from_world.frame_id != camera_frame {
         return Err(VisualServoingError::FrameMismatch {
-            expected: world_frame.into(),
-            actual: tf_wc.frame_id,
+            expected: camera_frame.into(),
+            actual: optical_from_world.frame_id,
         });
     }
-    let yaw = yaw_from_quat(&tf_wc.orientation);
-    let (cos_y, sin_y) = (yaw.cos(), yaw.sin());
-    let wx = tf_wc.position[0] + cos_y * cam_target.x - sin_y * cam_target.y;
-    let wy = tf_wc.position[1] + sin_y * cam_target.x + cos_y * cam_target.y;
-    let wz = tf_wc.position[2] + cam_target.z;
-    Ok(TargetPoint3D {
-        x: wx,
-        y: wy,
-        z: wz,
+
+    let mut world_points = Vec::new();
+    for point in bytes.chunks_exact(12) {
+        let x = f64::from(f32::from_le_bytes(point[0..4].try_into().expect("4 bytes")));
+        let y = f64::from(f32::from_le_bytes(point[4..8].try_into().expect("4 bytes")));
+        let z = f64::from(f32::from_le_bytes(
+            point[8..12].try_into().expect("4 bytes"),
+        ));
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            continue;
+        }
+        let point_world = [x, y, z];
+        let rotated = rotate_vector(&optical_from_world.orientation, point_world);
+        let point_optical = [
+            optical_from_world.position[0] + rotated[0],
+            optical_from_world.position[1] + rotated[1],
+            optical_from_world.position[2] + rotated[2],
+        ];
+        if !point_optical
+            .iter()
+            .all(|coordinate| coordinate.is_finite())
+            || point_optical[2] <= 0.0
+        {
+            continue;
+        }
+        let pixel_x =
+            camera_intrinsics.fx * point_optical[0] / point_optical[2] + camera_intrinsics.cx;
+        let pixel_y =
+            camera_intrinsics.fy * point_optical[1] / point_optical[2] + camera_intrinsics.cy;
+        if pixel_x < 0.0
+            || pixel_x >= f64::from(camera_intrinsics.width)
+            || pixel_y < 0.0
+            || pixel_y >= f64::from(camera_intrinsics.height)
+        {
+            continue;
+        }
+        if pixel_x < bbox.x1 - BBOX_MARGIN_PIXELS
+            || pixel_x > bbox.x2 + BBOX_MARGIN_PIXELS
+            || pixel_y < bbox.y1 - BBOX_MARGIN_PIXELS
+            || pixel_y > bbox.y2 + BBOX_MARGIN_PIXELS
+        {
+            continue;
+        }
+        world_points.push(TargetPoint3D { x, y, z });
+    }
+
+    if world_points.is_empty() {
+        return Err(VisualServoingError::ProjectionFailed(
+            "no world points projected into the detection bbox".into(),
+        ));
+    }
+
+    let robot_tf = tf
+        .lookup_at(world_frame, robot_frame, None, TF_TIME_TOLERANCE_SECONDS)
+        .ok_or_else(|| VisualServoingError::MissingTf(format!("{world_frame}<-{robot_frame}")))?;
+    if robot_tf.frame_id != world_frame {
+        return Err(VisualServoingError::FrameMismatch {
+            expected: world_frame.into(),
+            actual: robot_tf.frame_id,
+        });
+    }
+
+    let target = robust_front_target(&world_points, robot_tf.position).ok_or_else(|| {
+        VisualServoingError::ProjectionFailed(format!(
+            "bbox projection produced {} usable points; need at least 10",
+            world_points.len()
+        ))
+    })?;
+    Ok((target, robot_tf))
+}
+
+fn rotate_vector(q: &[f64; 4], v: [f64; 3]) -> [f64; 3] {
+    let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if norm <= f64::EPSILON {
+        return v;
+    }
+    let qv = [q[0] / norm, q[1] / norm, q[2] / norm];
+    let qw = q[3] / norm;
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let uv = cross(qv, v);
+    let uuv = cross(qv, uv);
+    [
+        v[0] + 2.0 * (qw * uv[0] + uuv[0]),
+        v[1] + 2.0 * (qw * uv[1] + uuv[1]),
+        v[2] + 2.0 * (qw * uv[2] + uuv[2]),
+    ]
+}
+
+fn robust_front_target(points: &[TargetPoint3D], robot: [f64; 3]) -> Option<TargetPoint3D> {
+    if points.len() < 10 {
+        return None;
+    }
+    let above_floor: Vec<TargetPoint3D> = points.iter().copied().filter(|p| p.z > 0.3).collect();
+    let candidates = if above_floor.len() >= 10 {
+        above_floor
+    } else {
+        points.to_vec()
+    };
+    let mut distances: Vec<f64> = candidates
+        .iter()
+        .map(|p| ((p.x - robot[0]).powi(2) + (p.y - robot[1]).powi(2)).sqrt())
+        .collect();
+    distances.sort_by(f64::total_cmp);
+    let percentile_position = 0.25 * (distances.len() - 1) as f64;
+    let lower = percentile_position.floor() as usize;
+    let upper = percentile_position.ceil() as usize;
+    let fraction = percentile_position - lower as f64;
+    let threshold = distances[lower] * (1.0 - fraction) + distances[upper] * fraction;
+    let mut front: Vec<TargetPoint3D> = candidates
+        .iter()
+        .copied()
+        .filter(|p| ((p.x - robot[0]).powi(2) + (p.y - robot[1]).powi(2)).sqrt() <= threshold)
+        .collect();
+    if front.len() < 3 {
+        let middle = distances.len() / 2;
+        let median = if distances.len() % 2 == 0 {
+            (distances[middle - 1] + distances[middle]) * 0.5
+        } else {
+            distances[middle]
+        };
+        front = candidates
+            .iter()
+            .copied()
+            .filter(|p| {
+                (((p.x - robot[0]).powi(2) + (p.y - robot[1]).powi(2)).sqrt() - median).abs() < 0.3
+            })
+            .collect();
+    }
+    if front.len() < 3 {
+        return None;
+    }
+    let count = front.len() as f64;
+    Some(TargetPoint3D {
+        x: front.iter().map(|p| p.x).sum::<f64>() / count,
+        y: front.iter().map(|p| p.y).sum::<f64>() / count,
+        z: front.iter().map(|p| p.z).sum::<f64>() / count,
     })
 }
 
-/// DetectionNavigationModule:dev mock module I/O 层
+/// DetectionNavigation synchronous module I/O adapter.
 ///
-/// 同步 mock 三路输入(image / bbox / pointcloud),调用 DetectionNavigation 产出 twist。
+/// The timestamped path uses the controller-owned TF source for both projection
+/// and twist computation. [`Self::step`] retains the legacy injected-TF API.
 pub struct DetectionNavigationModule {
     nav: DetectionNavigation,
     intrinsics: CameraIntrinsics,
@@ -381,7 +655,41 @@ impl DetectionNavigationModule {
         pointcloud: &P,
         tf: &dyn TfLike,
     ) -> Result<crate::Twist, VisualServoingError> {
-        let target_world = extract_3d_from_detection(
+        self.step_with_tf_at(image, bbox, pointcloud, tf, None)
+    }
+
+    /// Timestamp-aware single step using the module-owned TF source.
+    pub fn step_at<P: PointCloud2Like + ?Sized>(
+        &self,
+        image: &ImageView<'_>,
+        bbox: BBox,
+        pointcloud: &P,
+        image_timestamp: Option<f64>,
+    ) -> Result<crate::Twist, VisualServoingError> {
+        let nav_twist = self.nav.compute_twist_for_detection_3d_at(
+            bbox,
+            image,
+            pointcloud,
+            &self.intrinsics,
+            &self.camera_frame,
+            &self.world_frame,
+            image_timestamp,
+        )?;
+        Ok(crate::Twist {
+            linear: nav_twist.linear,
+            angular: nav_twist.angular,
+        })
+    }
+
+    fn step_with_tf_at<P: PointCloud2Like + ?Sized>(
+        &self,
+        image: &ImageView<'_>,
+        bbox: BBox,
+        pointcloud: &P,
+        tf: &dyn TfLike,
+        image_timestamp: Option<f64>,
+    ) -> Result<crate::Twist, VisualServoingError> {
+        let target_world = extract_3d_from_detection_at(
             bbox,
             image,
             pointcloud,
@@ -389,6 +697,7 @@ impl DetectionNavigationModule {
             tf,
             &self.camera_frame,
             &self.world_frame,
+            image_timestamp,
         )?;
         let nav_twist = self.nav.compute_twist(target_world, &self.world_frame)?;
         Ok(crate::Twist {

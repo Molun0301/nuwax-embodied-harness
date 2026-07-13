@@ -39,6 +39,7 @@
 pub mod adjacency;
 pub mod dijkstra;
 pub mod edges;
+pub mod lcm_worker;
 pub mod mls_planner;
 pub mod nodes;
 pub mod planner;

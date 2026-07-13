@@ -65,9 +65,7 @@ fn main() -> ExitCode {
         .output();
 
     let version = match ver_out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_owned()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             return fail_fast(&stderr);

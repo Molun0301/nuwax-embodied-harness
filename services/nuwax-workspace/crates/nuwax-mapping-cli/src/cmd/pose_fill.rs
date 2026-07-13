@@ -1,162 +1,190 @@
-//! `pose-fill` 子命令
-//!
-//! 真做行为：读 trajectory CSV (stamp, x, y, z, qx, qy, qz, qw)，按目标采样率插值，
-//! 输出新 CSV。每两行间用线性插值（位置）+ SLERP（旋转四元数）生成中间帧。
-//!
-//! CSV 格式：`stamp_sec,x,y,z,qx,qy,qz,qw` （一行一条轨迹）
+//! Attach nearest-in-time pose observations to point-cloud records.
 
 use clap::Args;
 use std::path::PathBuf;
 
+use crate::dataset::{read_dataset, write_dataset, Dataset, PoseData, RecordPayload};
+use crate::native::{
+    input_format, pose_fill_memory2, read_command_dataset, InputFormat, Memory2PoseFillOptions,
+};
+
+/// Arguments for `pose-fill`.
 #[derive(Debug, Args)]
 pub struct PoseFillArgs {
-    /// 输入轨迹 CSV 路径
+    /// Input JSONL or DimOS memory2 `.db` dataset.
     #[arg(long)]
     pub input: PathBuf,
-    /// 输出路径
+    /// New output dataset. Existing files are never overwritten.
     #[arg(long)]
     pub output: PathBuf,
-    /// 采样率（Hz）
-    #[arg(long, default_value_t = 100.0)]
-    pub rate: f64,
+    /// Point-cloud stream to receive pose metadata.
+    #[arg(long, default_value = "lidar")]
+    pub target: String,
+    /// Pose record stream used as the nearest-time source.
+    #[arg(long, default_value = "odom")]
+    pub pose_source: String,
+    /// Maximum timestamp difference in seconds.
+    #[arg(long, default_value_t = 0.1)]
+    pub tolerance: f64,
+    /// Comma-separated memory2 streams to copy. Defaults to all streams.
+    #[arg(long)]
+    pub streams: Option<String>,
+    /// Skip the first N seconds of every selected memory2 stream.
+    #[arg(long, default_value_t = 0.0)]
+    pub seek: f64,
+    /// Keep this many seconds after each selected memory2 stream starts.
+    #[arg(long)]
+    pub duration: Option<f64>,
 }
 
+/// Execute the `pose-fill` command.
+///
+/// Target records without a pose inside the tolerance are dropped, matching
+/// the source DimOS stream-alignment behavior. All non-target records are
+/// copied verbatim.
+///
+/// # Errors
+/// Returns input schema, missing-stream, unsupported-target, output collision,
+/// validation, or I/O errors.
 pub async fn run(args: PoseFillArgs) -> anyhow::Result<()> {
-    if args.rate <= 0.0 {
-        anyhow::bail!("rate must be positive, got {}", args.rate);
+    if !args.tolerance.is_finite() || args.tolerance < 0.0 {
+        anyhow::bail!("tolerance must be finite and non-negative");
     }
-
-    // 阶段 1：读输入 CSV
-    let content = std::fs::read_to_string(&args.input)
-        .map_err(|e| anyhow::anyhow!("read input {} failed: {}", args.input.display(), e))?;
-    let poses = parse_trajectory_csv(&content)?;
+    let streams = parse_streams(args.streams.as_deref())?;
+    match input_format(&args.input)? {
+        InputFormat::Memory2Sqlite => {
+            let (filled_records, target_records) = pose_fill_memory2(
+                &args.input,
+                &args.output,
+                Memory2PoseFillOptions {
+                    target: &args.target,
+                    pose_source: &args.pose_source,
+                    tolerance: args.tolerance,
+                    streams: streams.as_deref(),
+                    seek: args.seek,
+                    duration: args.duration,
+                },
+            )?;
+            println!(
+                "[pose-fill] input={} target={} pose_source={} matched={}/{} output={}",
+                args.input.display(),
+                args.target,
+                args.pose_source,
+                filled_records,
+                target_records,
+                args.output.display()
+            );
+            return Ok(());
+        }
+        InputFormat::JsonLines => {
+            if streams.is_some() || args.seek != 0.0 || args.duration.is_some() {
+                anyhow::bail!("--streams/--seek/--duration are native memory2 options; JSONL pose-fill copies its complete typed dataset");
+            }
+        }
+        InputFormat::Rosbag2Sqlite | InputFormat::Mcap | InputFormat::Ros1Bag => {
+            return read_command_dataset(&args.input).map(|_| ());
+        }
+    }
+    let source = read_dataset(&args.input)?;
+    let mut poses: Vec<(f64, PoseData)> = source
+        .records
+        .iter()
+        .filter_map(|record| {
+            if record.stream != args.pose_source {
+                return None;
+            }
+            match record.payload {
+                RecordPayload::Pose { pose } => Some((record.timestamp, pose)),
+                _ => None,
+            }
+        })
+        .collect();
     if poses.is_empty() {
-        anyhow::bail!("input CSV has no valid rows");
+        anyhow::bail!(
+            "pose source stream {:?} has no pose records",
+            args.pose_source
+        );
     }
+    poses.sort_by(|left, right| left.0.total_cmp(&right.0));
 
-    // 阶段 2：按 target rate 插值
-    let dt = 1.0 / args.rate;
-    let mut out_lines = Vec::new();
-    out_lines.push("stamp_sec,x,y,z,qx,qy,qz,qw".to_string());
-    let mut out_count = 0usize;
-
-    for window in poses.windows(2) {
-        let (a, b) = (&window[0], &window[1]);
-        if b.stamp <= a.stamp {
+    let mut target_records = 0usize;
+    let mut filled_records = 0usize;
+    let mut records = Vec::with_capacity(source.records.len());
+    for mut record in source.records {
+        if record.stream != args.target {
+            records.push(record);
             continue;
         }
-        let span = b.stamp - a.stamp;
-        let n_steps = ((span / dt).ceil() as usize).max(1);
-
-        for i in 0..n_steps {
-            let t_frac = (i as f64 * dt) / span;
-            let t_frac = t_frac.clamp(0.0, 1.0);
-            let interp = slerp_pose(a, b, t_frac);
-            let line = format!(
-                "{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-                a.stamp + i as f64 * dt, interp.x, interp.y, interp.z, interp.qx, interp.qy, interp.qz, interp.qw
+        target_records += 1;
+        let RecordPayload::PointCloud { pose, .. } = &mut record.payload else {
+            anyhow::bail!(
+                "target stream {:?} contains unsupported {} records; pose-fill currently supports point_cloud targets",
+                args.target,
+                record.payload.kind()
             );
-            out_lines.push(line);
-            out_count += 1;
+        };
+        if let Some(value) = nearest_pose(&poses, record.timestamp, args.tolerance) {
+            *pose = Some(value);
+            records.push(record);
+            filled_records += 1;
         }
     }
-    // 加上最后一个 pose
-    if let Some(last) = poses.last() {
-        out_lines.push(format!(
-            "{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-            last.stamp, last.x, last.y, last.z, last.qx, last.qy, last.qz, last.qw
-        ));
-        out_count += 1;
+    if target_records == 0 {
+        anyhow::bail!("target stream {:?} was not found", args.target);
+    }
+    if filled_records == 0 {
+        anyhow::bail!(
+            "no {:?} records matched {:?} within {} seconds",
+            args.target,
+            args.pose_source,
+            args.tolerance
+        );
     }
 
-    // 阶段 3：写输出
-    std::fs::write(&args.output, out_lines.join("\n") + "\n")?;
+    let output = Dataset {
+        header: source.header,
+        records,
+    };
+    write_dataset(&args.output, &output)?;
     println!(
-        "[pose-fill] input={} ({} poses) rate={}Hz → output={} ({} poses)",
+        "[pose-fill] input={} target={} pose_source={} matched={}/{} output={}",
         args.input.display(),
-        poses.len(),
-        args.rate,
-        args.output.display(),
-        out_count
+        args.target,
+        args.pose_source,
+        filled_records,
+        target_records,
+        args.output.display()
     );
-    tracing::info!("pose-fill done");
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct Pose {
-    stamp: f64,
-    x: f64,
-    y: f64,
-    z: f64,
-    qx: f64,
-    qy: f64,
-    qz: f64,
-    qw: f64,
+fn parse_streams(value: Option<&str>) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let streams: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .map(str::to_string)
+        .collect();
+    if streams.is_empty() || streams.iter().any(String::is_empty) {
+        anyhow::bail!("--streams must contain non-empty comma-separated stream names");
+    }
+    Ok(Some(streams))
 }
 
-fn parse_trajectory_csv(content: &str) -> anyhow::Result<Vec<Pose>> {
-    let mut out = Vec::new();
-    for (i, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // 跳过表头
-        if i == 0 && trimmed.starts_with("stamp") {
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.split(',').map(|s| s.trim()).collect();
-        if parts.len() < 8 {
-            continue;
-        }
-        let parse_f = |s: &str| -> anyhow::Result<f64> {
-            s.parse::<f64>()
-                .map_err(|e| anyhow::anyhow!("parse '{s}' failed: {e}"))
-        };
-        let pose = Pose {
-            stamp: parse_f(parts[0])?,
-            x: parse_f(parts[1])?,
-            y: parse_f(parts[2])?,
-            z: parse_f(parts[3])?,
-            qx: parse_f(parts[4])?,
-            qy: parse_f(parts[5])?,
-            qz: parse_f(parts[6])?,
-            qw: parse_f(parts[7])?,
-        };
-        out.push(pose);
-    }
-    Ok(out)
-}
-
-/// SLERP 插值（位置 lerp + 四元数 slerp）
-fn slerp_pose(a: &Pose, b: &Pose, t: f64) -> Pose {
-    // 位置线性插值
-    let x = a.x + (b.x - a.x) * t;
-    let y = a.y + (b.y - a.y) * t;
-    let z = a.z + (b.z - a.z) * t;
-
-    // 四元数 SLERP（简化：nlerp，对小角度足够；本期不上完整 SLERP）
-    let mut qx = a.qx + (b.qx - a.qx) * t;
-    let mut qy = a.qy + (b.qy - a.qy) * t;
-    let mut qz = a.qz + (b.qz - a.qz) * t;
-    let mut qw = a.qw + (b.qw - a.qw) * t;
-    let norm = (qx * qx + qy * qy + qz * qz + qw * qw).sqrt();
-    if norm > 1e-9 {
-        qx /= norm;
-        qy /= norm;
-        qz /= norm;
-        qw /= norm;
-    }
-
-    Pose {
-        stamp: 0.0, // caller 重写
-        x,
-        y,
-        z,
-        qx,
-        qy,
-        qz,
-        qw,
-    }
+fn nearest_pose(poses: &[(f64, PoseData)], timestamp: f64, tolerance: f64) -> Option<PoseData> {
+    let insertion = poses.partition_point(|(candidate, _)| *candidate < timestamp);
+    let before = insertion.checked_sub(1).and_then(|index| poses.get(index));
+    let after = poses.get(insertion);
+    [before, after]
+        .into_iter()
+        .flatten()
+        .min_by(|left, right| {
+            (left.0 - timestamp)
+                .abs()
+                .total_cmp(&(right.0 - timestamp).abs())
+        })
+        .filter(|(candidate, _)| (*candidate - timestamp).abs() <= tolerance)
+        .map(|(_, pose)| *pose)
 }

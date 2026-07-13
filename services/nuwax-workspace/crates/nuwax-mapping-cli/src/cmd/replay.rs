@@ -1,105 +1,143 @@
-//! `replay` 子命令
-//!
-//! 真做行为：从 bag 读取 PointCloud2（用 fixture 模拟），调
-//! `nuwax_mapping::CostMapper::from_pointcloud` 处理成 costmap，写 PGM 文件。
-//! start_offset 跳过前 N 秒；rate 调节处理速率。
-//!
-//! 注：完整 rosbag2 解析留 P2；本期用 fixture PointCloud2。
+//! Build a deterministic replay schedule from persisted records.
 
-use clap::Args;
-use nalgebra::{point, Point3};
-use nuwax_mapping::cost_mapper::{CostMapper, OccupancyConfig, SimplePointCloud2};
+use std::io::Write;
 use std::path::PathBuf;
 
+use clap::Args;
+use serde::{Deserialize, Serialize};
+
+use crate::dataset::DatasetRecord;
+use crate::native::read_command_dataset;
+
+/// Arguments for `replay`.
 #[derive(Debug, Args)]
 pub struct ReplayArgs {
-    /// 输入 bag 路径
+    /// Input JSONL or DimOS memory2 `.db` dataset.
     #[arg(long)]
     pub bag: PathBuf,
-    /// 起始时间偏移（秒）
+    /// Output replay manifest. Defaults to `<input>.replay.json`.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// Skip this many seconds from the first dataset timestamp.
     #[arg(long, default_value_t = 0.0)]
     pub start_offset: f64,
-    /// 倍速
+    /// Playback speed multiplier.
     #[arg(long, default_value_t = 1.0)]
     pub rate: f64,
-    /// dry-run（仅打印参数）
+    /// Parse and schedule records without writing the manifest.
     #[arg(long)]
     pub dry_run: bool,
 }
 
+/// Versioned replay manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayManifest {
+    /// Format identifier.
+    pub format: String,
+    /// Format version.
+    pub version: u32,
+    /// Source dataset path.
+    pub source: String,
+    /// Playback rate.
+    pub rate: f64,
+    /// Source timestamp used as replay time zero.
+    pub source_start_timestamp: f64,
+    /// Scheduled records.
+    pub events: Vec<ReplayEvent>,
+}
+
+/// One replay event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayEvent {
+    /// Seconds on the rate-adjusted replay timeline.
+    pub replay_time: f64,
+    /// Original persisted record.
+    pub record: DatasetRecord,
+}
+
+/// Execute the `replay` command.
+///
+/// # Errors
+/// Returns errors for invalid rates/offsets, unsupported or empty input,
+/// filters that select no records, output collisions, serialization, or I/O.
 pub async fn run(args: ReplayArgs) -> anyhow::Result<()> {
-    if args.bag.exists() {
-        tracing::info!("replay: bag exists check passed: {}", args.bag.display());
-    } else {
-        tracing::warn!("replay: bag path does not exist: {}", args.bag.display());
+    if !args.start_offset.is_finite() || args.start_offset < 0.0 {
+        anyhow::bail!("start_offset must be finite and non-negative");
     }
-
-    if args.dry_run {
-        println!(
-            "[replay] (dry-run) bag={} start_offset={} rate={}",
-            args.bag.display(),
-            args.start_offset,
-            args.rate
+    if !args.rate.is_finite() || args.rate <= 0.0 {
+        anyhow::bail!("rate must be finite and positive");
+    }
+    let decoded = read_command_dataset(&args.bag)?;
+    if !decoded.skipped_streams.is_empty() {
+        eprintln!(
+            "[replay] skipped unsupported memory2 streams: {}",
+            decoded.skipped_streams.join(",")
         );
-        return Ok(());
     }
-
-    // 阶段 1：构造 fixture PointCloud2（真实 rosbag2 解析留 P2）
-    let cloud = fixture_pointcloud();
-
-    // 阶段 2：调 nuwax_mapping 真实 API
-    let cfg = OccupancyConfig {
-        algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
-        initial_safe_radius_meters: 0.2,
+    let dataset = decoded.dataset;
+    let first_timestamp = dataset
+        .records
+        .iter()
+        .map(|record| record.timestamp)
+        .min_by(f64::total_cmp)
+        .ok_or_else(|| anyhow::anyhow!("dataset contains no records"))?;
+    let source_start_timestamp = first_timestamp + args.start_offset;
+    let mut selected: Vec<DatasetRecord> = dataset
+        .records
+        .into_iter()
+        .filter(|record| record.timestamp >= source_start_timestamp)
+        .collect();
+    selected.sort_by(|left, right| left.timestamp.total_cmp(&right.timestamp));
+    if selected.is_empty() {
+        anyhow::bail!(
+            "start_offset {} selects no records from {}",
+            args.start_offset,
+            args.bag.display()
+        );
+    }
+    let manifest = ReplayManifest {
+        format: "nuwax-mapping-replay".to_string(),
+        version: 1,
+        source: args.bag.display().to_string(),
+        rate: args.rate,
+        source_start_timestamp,
+        events: selected
+            .into_iter()
+            .map(|record| ReplayEvent {
+                replay_time: (record.timestamp - source_start_timestamp) / args.rate,
+                record,
+            })
+            .collect(),
     };
-    let (_mapper, costmap) = CostMapper::from_pointcloud(&cloud, &cfg, 20, 20, 0.1, (0.0, 0.0));
 
-    // 阶段 3：应用 start_offset / rate（统计跳过帧数 + 倍速调节）
-    let effective_rate = args.rate;
-    let skip_frames = (args.start_offset * effective_rate).round() as usize;
-
-    // 阶段 4：输出 PGM（与 map.rs 类似）
-    let mut out_path = args.bag.clone();
-    out_path.set_extension("pgm");
-    write_pgm(&out_path, &costmap)?;
-
+    let output = args.output.clone().unwrap_or_else(|| {
+        let file_name = args
+            .bag
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("dataset");
+        args.bag.with_file_name(format!("{file_name}.replay.json"))
+    });
+    if !args.dry_run {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .map_err(|error| {
+                anyhow::anyhow!("create replay output {} failed: {error}", output.display())
+            })?;
+        serde_json::to_writer_pretty(&mut file, &manifest)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
     println!(
-        "[replay] bag={} start_offset={}s rate={}x skip={}frames → {}",
+        "[replay] dataset={} start_offset={} rate={} events={} output={} dry_run={}",
         args.bag.display(),
         args.start_offset,
-        effective_rate,
-        skip_frames,
-        out_path.display()
+        args.rate,
+        manifest.events.len(),
+        output.display(),
+        args.dry_run
     );
-    tracing::info!("replay done");
-    Ok(())
-}
-
-fn fixture_pointcloud() -> SimplePointCloud2 {
-    // 构造 4×4 障碍栅格的点云（与 map.rs 演示同构）
-    let mut pts: Vec<Point3<f64>> = Vec::new();
-    for x in 0..4 {
-        for y in 0..4 {
-            pts.push(point![0.5 + x as f64 * 0.1, 0.5 + y as f64 * 0.1, 0.0]);
-        }
-    }
-    SimplePointCloud2::new(pts, point![0.0, 0.0, 0.0])
-}
-
-fn write_pgm(path: &PathBuf, costmap: &nuwax_mapping::Costmap) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    let w = costmap.width() as u32;
-    let h = costmap.height() as u32;
-    writeln!(f, "P5")?;
-    writeln!(f, "{w} {h}")?;
-    writeln!(f, "255")?;
-    for r in 0..h {
-        for c in 0..w {
-            let v = costmap.get(r, c).unwrap_or(0);
-            let gray = 255 - v;
-            f.write_all(&[gray])?;
-        }
-    }
     Ok(())
 }

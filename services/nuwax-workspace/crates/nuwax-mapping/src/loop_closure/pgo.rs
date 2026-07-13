@@ -1,7 +1,7 @@
 //! 位姿图数据结构
 //! PoseGraph + PoseNode + PoseEdge 三层抽象。
 
-use nalgebra::{Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3, Vector6};
+use nalgebra::{Isometry3, Matrix6, Translation3, UnitQuaternion, Vector6};
 use serde::{Deserialize, Serialize};
 
 /// 单节点（位姿 + 时间戳）
@@ -96,8 +96,11 @@ impl PoseGraph {
 
     /// 固定第一个节点（避免 GAUGE 自由度问题）
     pub fn fix_first_node(&mut self) {
-        if let Some((_, node)) = self.nodes.iter_mut().next() {
-            node.fixed = true;
+        if let Some(first_id) = self.nodes.keys().min().copied() {
+            self.nodes
+                .get_mut(&first_id)
+                .expect("minimum key came from the same map")
+                .fixed = true;
         }
     }
 
@@ -145,8 +148,7 @@ pub mod transform_utils {
             pose.translation.y + delta[1],
             pose.translation.z + delta[2],
         );
-        let r = pose.rotation
-            * UnitQuaternion::from_euler_angles(delta[3], delta[4], delta[5]);
+        let r = pose.rotation * UnitQuaternion::from_euler_angles(delta[3], delta[4], delta[5]);
         Isometry3::from_parts(t, r)
     }
 
@@ -197,6 +199,20 @@ mod tests {
         let id = g.add_node(0, Isometry3::identity());
         g.fix_first_node();
         assert!(g.nodes[&id].fixed);
+    }
+
+    #[test]
+    fn fix_first_node_anchors_smallest_id_independent_of_hash_iteration() {
+        let mut graph = PoseGraph::new();
+        for id in [7, 2, 9] {
+            graph
+                .nodes
+                .insert(id, PoseNode::new(id, id as i64, Isometry3::identity()));
+        }
+        graph.fix_first_node();
+        assert!(graph.nodes[&2].fixed);
+        assert!(!graph.nodes[&7].fixed);
+        assert!(!graph.nodes[&9].fixed);
     }
 
     #[test]

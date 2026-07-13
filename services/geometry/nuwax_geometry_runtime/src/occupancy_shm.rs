@@ -4,7 +4,7 @@
 
 //! Phase 3: OccupancyGrid SHM sidecar
 //!
-//! 把 `MapState.data` (Vec<i8>) 与 meta 序列化成 stable 字节布局,写入
+//! 把 `MapState.data` (`Vec<i8>`) 与 meta 序列化成 stable 字节布局,写入
 //! `/tmp/nuwax_occupancy.mmap` SHM 文件(可被 Python 端 mmap 读)。
 //!
 //! ## 字节布局
@@ -93,7 +93,9 @@ impl OccupancyGridShmWriter {
         if required > self.capacity {
             let new_cap = std::cmp::max(
                 required,
-                self.capacity.checked_mul(OCC_GROW_FACTOR).unwrap_or(required),
+                self.capacity
+                    .checked_mul(OCC_GROW_FACTOR)
+                    .unwrap_or(required),
             );
             self.grow(new_cap)?;
         }

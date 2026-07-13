@@ -21,7 +21,6 @@ from .state_machine import (
     NavigationStateMachine,
     NavigationDiagnostics,
     create_navigation_state_machine,
-    map_nav2_status_to_platform,
 )
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.navigation.service")
@@ -286,9 +285,17 @@ class NavigationService:
         """取消当前导航目标，使用平台状态机管理取消流程。"""
 
         provider = self._get_navigation_provider()
-        with self._lock:
-            self._state_machine.cancel("平台导航目标已取消。")
-        provider.cancel_goal()
+        accepted = provider.cancel_goal()
+        if not accepted:
+            message = self._navigation_provider_error_message(
+                provider,
+                default="导航后端拒绝取消当前目标。",
+            )
+            raise GatewayError(
+                message,
+                error_code="navigation_cancel_rejected",
+                http_status=409,
+            )
         context = self.refresh_navigation()
         if context.navigation_state.status == NavigationStatus.IDLE and self._current_goal is not None:
             context = context.model_copy(

@@ -63,6 +63,52 @@ pub enum NavStackError {
         source: std::io::Error,
     },
 
+    /// One or more graph nodes have no concrete runtime owner.
+    #[error("runtime owners are missing for graph nodes: {nodes:?}")]
+    MissingRuntimeOwners {
+        /// Node ids and kinds collected during the all-or-nothing preflight.
+        nodes: Vec<String>,
+    },
+
+    /// A concrete in-process owner could not be created or started.
+    #[error("failed to start in-process node `{node}`: {reason}")]
+    NodeStartFailed {
+        /// Graph node id.
+        node: String,
+        /// Factory or lifecycle error.
+        reason: String,
+    },
+
+    /// Startup was requested for a runner that already owns live nodes.
+    #[error("navigation stack runner is already running")]
+    AlreadyRunning,
+
+    /// A child process could not be inspected.
+    #[error("failed to inspect runtime node `{node}`: {source}")]
+    ProcessInspectionFailed {
+        /// Graph node id.
+        node: String,
+        /// Underlying process error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A runtime node exited before the requested stack shutdown.
+    #[error("runtime node `{node}` exited before stack shutdown")]
+    RuntimeNodeExited {
+        /// Graph node id.
+        node: String,
+    },
+
+    /// A node could not be stopped or reaped during shutdown.
+    #[error("failed to shut down runtime node `{node}`: {reason}")]
+    ShutdownFailed {
+        /// Graph node id.
+        node: String,
+        /// Shutdown error details.
+        reason: String,
+    },
+
     /// 任意内部错误(不应当发生,如果发生请报告)。
     #[error("internal nav-stack error: {0}")]
     Internal(String),

@@ -13,9 +13,9 @@
 //! ## 实现分工
 //!
 //! - [`nuwax_codec::hash::lcm_hash_64`] 提供 `rotate_left_1(a + b)` 旋转;
-//! - [`nuwax_codec::hash::STRUCT_SEEDS`] 固化了 10 个 .lcm schema 的
-//!   per-type seed(由 `lcm-gen -c` 在 2026-07-07 反推得出);
-//! - [`nuwax_codec::hash::compute_real_lcm_fingerprint`] 组合两者,得到
+//! - [`nuwax_codec::hash::STRUCT_SEEDS`] 固化了锁定 schema 的
+//!   effective fingerprint preimage(由锁定 Python/C generated artifacts 反推);
+//! - [`nuwax_codec::hash::fingerprint`] 组合两者,得到
 //!   upstream LCM 1.x 兼容 fingerprint。
 //!
 //! 旧 FNV-1a 64-bit 实现已从 `nuwax-codec::lcm::fnv1a_64` 与本文件
@@ -29,12 +29,12 @@ pub const LCM_HASH_SIZE: usize = 8;
 
 /// 计算 LCM fingerprint（8 字节,大端网络序写入 framer 时使用 `to_be_bytes()`）。
 ///
-/// **2026-07-07 起**:调用 [`nuwax_codec::hash::compute_real_lcm_fingerprint`],
+/// **2026-07-07 起**:调用 [`nuwax_codec::hash::fingerprint`],
 /// 与上游 LCM 1.x `lcm-gen` 的 `__Type_get_hash()` 等价(对全 primitive
 /// 字段 schema)。
 ///
 /// 未在 [`nuwax_codec::hash::STRUCT_SEEDS`] 注册的 FQN 一律返回全 0,
-/// 并触发 fail-fast 错误(由 codec 层 [`LcmMessageType::fingerprint`]
+/// 并触发 fail-fast 错误(由 codec 层 [`crate::LcmMessageType::fingerprint`]
 /// 调用约定保护)。
 #[must_use]
 pub fn compute_lcm_fingerprint(fqn: &str) -> [u8; 8] {
@@ -70,32 +70,35 @@ mod tests {
     fn fingerprint_uses_big_endian_byte_order() {
         // fingerprint 写入 framer 时应使用大端(网络序),即
         // 高位字节先出现在字节流中 —— 上游 LCM 的 byte layout。
-        let fp = compute_lcm_fingerprint("foo/Bar");
-        // 因为 `foo/Bar` 不在 STRUCT_SEEDS,本测试改用已注册类型。
-        let fp = compute_lcm_fingerprint("geometry_msgs/Twist");
-        // 上游 lcm-gen `geometry_msgs__Twist_get_hash` = 0xbbca3b0d2c22f384
-        let expected = 0xbbca_3b0d_2c22_f384u64.to_be_bytes();
-        assert_eq!(fp, expected, "fingerprint must equal upstream lcm-gen value");
+        let fp = compute_lcm_fingerprint("geometry_msgs.Twist");
+        let expected = 0x2e7c_07d7_cdf7_e027_u64.to_be_bytes();
+        assert_eq!(
+            fp, expected,
+            "fingerprint must equal upstream lcm-gen value"
+        );
     }
 
     /// Phase 2 端到端一致性:协议层 fingerprint 等于上游 lcm-gen __Type_get_hash
     #[test]
-    fn fingerprint_matches_upstream_lcm_gen_for_all_ten_types() {
+    fn fingerprint_matches_locked_generated_schemas() {
         use nuwax_codec::hash::STRUCT_SEEDS;
-        // 上游 lcm-gen 在 2026-07-07 编译 10 个 .lcm schema 后输出的
-        // `__Type_get_hash()` 值,由 `scripts/ci/regen_lcm_goldens.sh` 反推
-        // STRUCT_SEEDS 后落地。
+        // Values come from the locked generated DimOS packages.
         let expected: &[(&str, u64)] = &[
-            ("geometry_msgs/PoseStamped", 0x2573_8ae5_7ec5_4e84),
-            ("geometry_msgs/Transform", 0x2afa_3e8c_ba35_7ed0),
-            ("geometry_msgs/Twist", 0xbbca_3b0d_2c22_f384),
-            ("nav_msgs/Odometry", 0x1e49_cc4e_3b85_2955),
-            ("nav_msgs/OccupancyGrid", 0x6594_8fd9_608c_95bc),
-            ("sensor_msgs/PointCloud2", 0x9ceb_8cd9_8f7d_5f48),
-            ("nuwax_msgs/NavigationState", 0xbfd9_7ea1_913d_0280),
-            ("nuwax_msgs/CancelNavigation", 0xafbb_c90f_61b5_2506),
-            ("nuwax_msgs/Frontier", 0x1abf_83ea_0ced_9c44),
-            ("nuwax_msgs/FrontierList", 0xebbe_aebb_9e3b_e6ef),
+            ("geometry_msgs.PoseStamped", 0x6a82_6964_58c2_79a0),
+            ("geometry_msgs.PointStamped", 0x9cd7_6473_8ea6_29af),
+            ("geometry_msgs.Transform", 0x2afa_3e8c_ba35_7ed0),
+            ("geometry_msgs.Twist", 0x2e7c_07d7_cdf7_e027),
+            ("nav_msgs.Path", 0xc3ae_62ac_b357_93e2),
+            ("nav_msgs.Odometry", 0x94e1_7f94_648c_f0e4),
+            ("nav_msgs.OccupancyGrid", 0xe7df_d179_cdfc_3b65),
+            ("sensor_msgs.PointCloud2", 0xf5eb_3da1_c285_3175),
+            ("std_msgs.Bool", 0x1ebe_f06a_5095_0e3e),
+            ("tf2_msgs.TFMessage", 0xc2b8_a1c3_3a89_23ec),
+            ("nuwax_msgs.NavigationState", 0xbfd9_7ea1_913d_0280),
+            ("nuwax_msgs.CancelNavigation", 0xafbb_c90f_61b5_2506),
+            ("nuwax_msgs.Frontier", 0x1abf_83ea_0ced_9c44),
+            ("nuwax_msgs.FrontierList", 0x213d_b68f_b817_1f76),
+            ("nuwax_msgs.PersonFollowTarget", 0xe627_c308_2965_e18d),
         ];
         assert_eq!(STRUCT_SEEDS.len(), expected.len());
         for (fqn, upstream_fp) in expected {

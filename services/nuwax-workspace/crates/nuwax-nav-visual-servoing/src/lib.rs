@@ -29,12 +29,18 @@ pub use nuwax_nav_types_messages::Twist2 as FoundationTwist2;
 pub use nuwax_nav_types_messages::Twist3 as FoundationTwist3;
 
 pub mod detection3d;
+/// Original `PersonFollowSkillContainer` lifecycle and production input adapter.
+pub mod person_follow;
 pub mod servo2d;
 
+/// Real-LCM production owner for [`person_follow`].
+#[cfg(feature = "link-liblcm")]
+pub mod lcm_owner;
+
 pub use detection3d::{
-    CameraIntrinsics, DetectionNavigation, DetectionNavigationConfig,
-    DetectionNavigationModule, NavTwist3D, PointCloud2Like, SimplePointCloud,
-    TargetPoint3D, TfLike, extract_3d_from_detection,
+    extract_3d_from_detection, extract_3d_from_detection_at, CameraIntrinsics, DetectionNavigation,
+    DetectionNavigationConfig, DetectionNavigationModule, NavTwist3D, PointCloud2Like,
+    SimplePointCloud, TargetPoint3D, TfLike,
 };
 pub use servo2d::{VisualServoing2D, VisualServoing2DConfig};
 

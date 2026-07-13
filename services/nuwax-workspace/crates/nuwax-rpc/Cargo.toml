@@ -15,11 +15,12 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+nuwax-lcm = { path = "../nuwax-lcm", optional = true }
 
 [features]
-# link-liblcm 默认关闭:dev / 静态验证场景不链 liblcm。
-# 启用后,RpcBroker::serve() 才真正注册到 LCM transport;否则返 BackendUnavailable。
-link-liblcm = []
+# 默认构建不链接系统 liblcm；RPC 核心仍可通过 RpcTransport 使用其它真实 transport。
+# 启用后提供 LcmRpcTransport，它直接复用 nuwax-lcm 的单 owner 安全接口。
+link-liblcm = ["dep:nuwax-lcm", "nuwax-lcm/link-liblcm"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }

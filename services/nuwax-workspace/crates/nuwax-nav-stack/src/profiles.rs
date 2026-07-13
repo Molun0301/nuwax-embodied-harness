@@ -85,6 +85,22 @@ pub fn topic_for(topics: &NavTopicConfig, port: &str, fallback: &str) -> Option<
 /// 该函数是 P0-08 测试钩子:`topic_map_for_node("far_planner", &cfg)` 必须返回非空。
 #[must_use]
 pub fn topic_map_for_node(node_id: &str, topics: &NavTopicConfig) -> Vec<(String, String)> {
+    if node_id == "mls_planner" {
+        return [
+            ("global_map", "global_map", "global_map"),
+            ("local_map", "local_map", "local_map"),
+            ("region_bounds", "region_bounds", "region_bounds"),
+            ("start_pose", "start_pose", "start_pose"),
+            ("goal_pose", "goal_pose", "goal_pose"),
+            ("path", "goal_path", "goal_path"),
+            ("surface_map", "surface_map", "mls_surface"),
+            ("nodes", "nodes", "mls_nodes"),
+            ("node_edges", "node_edges", "mls_node_edges"),
+        ]
+        .into_iter()
+        .map(|(port, key, fallback)| (port.to_string(), topics.get_or(key, fallback).to_string()))
+        .collect();
+    }
     let ports: &[&str] = match node_id {
         "terrain_analysis" => &["registered_scan", "odometry", "terrain_map"],
         "pgo" => &[
@@ -139,7 +155,11 @@ pub fn topic_map_for_node(node_id: &str, topics: &NavTopicConfig) -> Vec<(String
     ports
         .iter()
         .filter_map(|p| {
-            let name = topics.get_or(p, p);
+            let name = match (node_id, *p) {
+                ("path_follower", "cmd_vel") => topics.get_or("nav_cmd_vel", "nav_cmd_vel"),
+                ("far_planner" | "local_planner", "goal") => navigation_goal_topic(topics),
+                (_, port) => topics.get_or(port, port),
+            };
             if name.is_empty() {
                 None
             } else {
@@ -147,6 +167,14 @@ pub fn topic_map_for_node(node_id: &str, topics: &NavTopicConfig) -> Vec<(String
             }
         })
         .collect()
+}
+
+fn navigation_goal_topic(topics: &NavTopicConfig) -> &str {
+    topics
+        .topics
+        .get("goal_pose")
+        .or_else(|| topics.topics.get("goal"))
+        .map_or("goal_pose", |topic| topic.as_str())
 }
 
 // ---------- Native spec wiring (Phase E6 / R6 补全) ----------
@@ -185,8 +213,8 @@ fn build_simple2d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         )
         .with_feature("click-goal")
         .add_input(topics.get_or("clicked_point", "clicked_point"))
-        .add_output("start_pose")
-        .add_output("goal_pose"),
+        .add_output(topics.get_or("start_pose", "start_pose"))
+        .add_output(topics.get_or("goal_pose", "goal_pose")),
     );
 
     // 2. Simple planner:terrain + goal -> waypoint / goal_path
@@ -200,8 +228,9 @@ fn build_simple2d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         .add_input(topics.get_or("terrain_map", "terrain_map"))
         .add_input(topics.get_or("terrain_map_ext", "terrain_map_ext"))
         .add_input(topics.get_or("odometry", "odometry"))
-        .add_input("start_pose")
-        .add_input("goal_pose")
+        .add_input(topics.get_or("start_pose", "start_pose"))
+        .add_input(topics.get_or("goal_pose", "goal_pose"))
+        .add_input(topics.get_or("stop_movement", "stop_movement"))
         .add_output(topics.get_or("way_point", "way_point"))
         .add_output(topics.get_or("goal_path", "goal_path"))
         .depends_on_node("click_goal_router"),
@@ -215,7 +244,7 @@ fn build_simple2d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             ModuleKind::RustAlgorithm,
         )
         .with_feature("basic-path-follower")
-        .add_input(topics.get_or("way_point", "way_point"))
+        .add_input(topics.get_or("goal_path", "goal_path"))
         .add_input(topics.get_or("odometry", "odometry"))
         .add_input(topics.get_or("stop_movement", "stop_movement"))
         .add_output(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
@@ -242,21 +271,23 @@ fn build_simple2d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         .depends_on_node("click_goal_router"),
     );
 
+    g.push_node(navigation_state_reporter(topics));
+
     // edges
     g.push_edge(GraphEdge {
         from: "click_goal_router".into(),
         to: "simple_planner".into(),
-        topic: "goal_pose".into(),
+        topic: topics.get_or("goal_pose", "goal_pose").into(),
     });
     g.push_edge(GraphEdge {
         from: "simple_planner".into(),
         to: "basic_path_follower".into(),
-        topic: "way_point".into(),
+        topic: topics.get_or("goal_path", "goal_path").into(),
     });
     g.push_edge(GraphEdge {
         from: "basic_path_follower".into(),
         to: "movement_manager".into(),
-        topic: "nav_cmd_vel".into(),
+        topic: topics.get_or("nav_cmd_vel", "nav_cmd_vel").into(),
     });
 }
 
@@ -271,7 +302,25 @@ fn build_replanning_astar(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         )
         .with_feature("click-goal")
         .add_input(topics.get_or("clicked_point", "clicked_point"))
-        .add_output("goal_pose"),
+        .add_output(topics.get_or("goal_pose", "goal_pose")),
+    );
+
+    g.push_node(
+        ModuleNode::new("patrolling", "Patrolling", ModuleKind::GoalSource)
+            .with_feature("patrolling")
+            .add_input(topics.get_or("odometry", "odometry"))
+            .add_input(topics.get_or("registered_scan", "registered_scan"))
+            .add_input(topics.get_or("goal_reached", "goal_reached"))
+            .add_input(topics.get_or("patrol_enabled", "patrol_enabled"))
+            .add_input(topics.get_or("goal_failed", "goal_failed"))
+            .add_input(topics.get_or("patrol_planner_control_ack", "patrol_planner_control_ack"))
+            .add_output(topics.get_or("goal_pose", "goal_pose"))
+            .add_output(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
+            .add_output(topics.get_or("stop_movement", "stop_movement"))
+            .add_output(topics.get_or("patrol_planner_control", "patrol_planner_control"))
+            .with_notes(
+                "patrol_enabled=true starts coverage patrol; false publishes hold and stops",
+            ),
     );
 
     g.push_node(
@@ -283,10 +332,14 @@ fn build_replanning_astar(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         .with_feature("astar")
         .add_input(topics.get_or("odometry", "odometry"))
         .add_input(topics.get_or("registered_scan", "registered_scan"))
-        .add_input("goal_pose")
+        .add_input(topics.get_or("goal_pose", "goal_pose"))
+        .add_input(topics.get_or("stop_movement", "stop_movement"))
+        .add_input(topics.get_or("patrol_planner_control", "patrol_planner_control"))
         .add_output(topics.get_or("way_point", "way_point"))
         .add_output(topics.get_or("goal_path", "goal_path"))
         .add_output(topics.get_or("goal_reached", "goal_reached"))
+        .add_output(topics.get_or("goal_failed", "goal_failed"))
+        .add_output(topics.get_or("patrol_planner_control_ack", "patrol_planner_control_ack"))
         .depends_on_node("click_goal_router"),
     );
 
@@ -297,7 +350,7 @@ fn build_replanning_astar(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             ModuleKind::RustAlgorithm,
         )
         .with_feature("basic-path-follower")
-        .add_input(topics.get_or("way_point", "way_point"))
+        .add_input(topics.get_or("goal_path", "goal_path"))
         .add_input(topics.get_or("odometry", "odometry"))
         .add_input(topics.get_or("stop_movement", "stop_movement"))
         .add_output(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
@@ -318,21 +371,82 @@ fn build_replanning_astar(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         .depends_on_node("basic_path_follower"),
     );
 
+    g.push_node(navigation_state_reporter(topics));
+
     g.push_edge(GraphEdge {
         from: "click_goal_router".into(),
         to: "astar_planner".into(),
-        topic: "goal_pose".into(),
+        topic: topics.get_or("goal_pose", "goal_pose").into(),
+    });
+    g.push_edge(GraphEdge {
+        from: "patrolling".into(),
+        to: "astar_planner".into(),
+        topic: topics.get_or("goal_pose", "goal_pose").into(),
+    });
+    g.push_edge(GraphEdge {
+        from: "astar_planner".into(),
+        to: "patrolling".into(),
+        topic: topics.get_or("goal_reached", "goal_reached").into(),
+    });
+    g.push_edge(GraphEdge {
+        from: "astar_planner".into(),
+        to: "patrolling".into(),
+        topic: topics.get_or("goal_failed", "goal_failed").into(),
+    });
+    g.push_edge(GraphEdge {
+        from: "patrolling".into(),
+        to: "astar_planner".into(),
+        topic: topics
+            .get_or("patrol_planner_control", "patrol_planner_control")
+            .into(),
+    });
+    g.push_edge(GraphEdge {
+        from: "astar_planner".into(),
+        to: "patrolling".into(),
+        topic: topics
+            .get_or("patrol_planner_control_ack", "patrol_planner_control_ack")
+            .into(),
     });
     g.push_edge(GraphEdge {
         from: "astar_planner".into(),
         to: "basic_path_follower".into(),
-        topic: "way_point".into(),
+        topic: topics.get_or("goal_path", "goal_path").into(),
     });
     g.push_edge(GraphEdge {
         from: "basic_path_follower".into(),
         to: "movement_manager".into(),
-        topic: "nav_cmd_vel".into(),
+        topic: topics.get_or("nav_cmd_vel", "nav_cmd_vel").into(),
     });
+    g.push_edge(GraphEdge {
+        from: "patrolling".into(),
+        to: "movement_manager".into(),
+        topic: topics.get_or("nav_cmd_vel", "nav_cmd_vel").into(),
+    });
+    for target in ["astar_planner", "basic_path_follower"] {
+        g.push_edge(GraphEdge {
+            from: "patrolling".into(),
+            to: target.into(),
+            topic: topics.get_or("stop_movement", "stop_movement").into(),
+        });
+    }
+}
+
+fn navigation_state_reporter(topics: &NavTopicConfig) -> ModuleNode {
+    ModuleNode::new(
+        "navigation_state_reporter",
+        "Navigation State Reporter",
+        ModuleKind::Coordinator,
+    )
+    .with_feature("lcm-runtime")
+    .add_input(topics.get_or("goal_pose", "goal_pose"))
+    .add_input(topics.get_or("odometry", "odometry"))
+    .add_input(topics.get_or("goal_path", "goal_path"))
+    .add_input(topics.get_or("goal_reached", "goal_reached"))
+    .add_input(topics.get_or("nav_cancel", "/nav/cancel"))
+    .add_output(topics.get_or("nav_state", "/nav/state"))
+    .add_output(topics.get_or("stop_movement", "stop_movement"))
+    .add_output(topics.get_or("cmd_vel", "cmd_vel"))
+    .depends_on_node("movement_manager")
 }
 
 // ---------- CmuNative ----------
@@ -443,7 +557,7 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             terrain_map: topic_for(topics, "terrain_map", "terrain_map"),
             registered_scan: topic_for(topics, "registered_scan", "registered_scan"),
             odometry: topic_for(topics, "odometry", "odometry"),
-            goal: topic_for(topics, "goal", "goal"),
+            goal: Some(navigation_goal_topic(topics).to_string()),
             stop_movement: topic_for(topics, "stop_movement", "stop_movement"),
             way_point: topic_for(topics, "way_point", "way_point"),
             goal_path: topic_for(topics, "goal_path", "goal_path"),
@@ -474,7 +588,7 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             .add_input(topics.get_or("terrain_map_ext", "terrain_map_ext"))
             .add_input(topics.get_or("registered_scan", "registered_scan"))
             .add_input(topics.get_or("odometry", "odometry"))
-            .add_input(topics.get_or("goal", "goal"))
+            .add_input(navigation_goal_topic(topics))
             .add_input(topics.get_or("stop_movement", "stop_movement"))
             .add_output(topics.get_or("way_point", "way_point"))
             .add_output(topics.get_or("goal_path", "goal_path"))
@@ -496,7 +610,7 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             terrain_map: topic_for(topics, "terrain_map", "terrain_map"),
             joy_cmd: topic_for(topics, "joy_cmd", "joy_cmd"),
             way_point: topic_for(topics, "way_point", "way_point"),
-            goal_pose: topic_for(topics, "goal", "goal"),
+            goal_pose: Some(navigation_goal_topic(topics).to_string()),
             speed: topic_for(topics, "speed", "speed"),
             navigation_boundary: topic_for(topics, "nav_boundary", "nav_boundary"),
             added_obstacles: topic_for(topics, "added_obstacles", "added_obstacles"),
@@ -531,7 +645,7 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             .add_input(topics.get_or("terrain_map", "terrain_map"))
             .add_input(topics.get_or("joy_cmd", "joy_cmd"))
             .add_input(topics.get_or("way_point", "way_point"))
-            .add_input(topics.get_or("goal", "goal"))
+            .add_input(navigation_goal_topic(topics))
             .add_input(topics.get_or("speed", "speed"))
             .add_input(topics.get_or("added_obstacles", "added_obstacles"))
             .add_input(topics.get_or("check_obstacle", "check_obstacle"))
@@ -553,7 +667,7 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             speed: topic_for(topics, "speed", "speed"),
             slow_down: topic_for(topics, "slow_down", "slow_down"),
             safety_stop: topic_for(topics, "safety_stop", "safety_stop"),
-            cmd_vel: topic_for(topics, "cmd_vel", "cmd_vel"),
+            cmd_vel: topic_for(topics, "nav_cmd_vel", "nav_cmd_vel"),
         };
         ModuleNode::from_native_specs(
             "path_follower",
@@ -578,8 +692,22 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             .add_input(topics.get_or("speed", "speed"))
             .add_input(topics.get_or("slow_down", "slow_down"))
             .add_input(topics.get_or("safety_stop", "safety_stop"))
-            .add_output(topics.get_or("cmd_vel", "cmd_vel"))
+            .add_output(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
             .depends_on_node("local_planner"),
+    );
+
+    g.push_node(
+        ModuleNode::new(
+            "movement_manager",
+            "Movement Manager",
+            ModuleKind::Coordinator,
+        )
+        .with_feature("movement-manager")
+        .add_input(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
+        .add_input(topics.get_or("joy_cmd", "joy_cmd"))
+        .add_output(topics.get_or("cmd_vel", "cmd_vel"))
+        .add_output(topics.get_or("stop_movement", "stop_movement"))
+        .depends_on_node("path_follower"),
     );
 
     g.push_edge(GraphEdge {
@@ -602,6 +730,11 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         to: "path_follower".into(),
         topic: "path".into(),
     });
+    g.push_edge(GraphEdge {
+        from: "path_follower".into(),
+        to: "movement_manager".into(),
+        topic: topics.get_or("nav_cmd_vel", "nav_cmd_vel").into(),
+    });
 }
 
 // ---------- ExplorationNative ----------
@@ -617,9 +750,13 @@ fn build_exploration_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             ModuleKind::Explorer,
         )
         .with_feature("explore")
-        .add_input(topics.get_or("terrain_map", "terrain_map"))
+        .add_input(topics.get_or("registered_scan", "registered_scan"))
         .add_input(topics.get_or("corrected_odometry", "corrected_odometry"))
-        .add_output("frontier_goal"),
+        .add_input(topics.get_or("goal_reached", "goal_reached"))
+        .add_input(topics.get_or("goal_failed", "goal_failed"))
+        .add_input(topics.get_or("stop_movement", "stop_movement"))
+        .add_output(navigation_goal_topic(topics))
+        .depends_on_node("pgo"),
     );
 
     // ---- tare_planner ----
@@ -661,7 +798,7 @@ fn build_exploration_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
     g.push_edge(GraphEdge {
         from: "wavefront_explorer".into(),
         to: "far_planner".into(),
-        topic: "frontier_goal".into(),
+        topic: navigation_goal_topic(topics).into(),
     });
     g.push_edge(GraphEdge {
         from: "tare_planner".into(),
@@ -673,25 +810,66 @@ fn build_exploration_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
 // ---------- Mls3D ----------
 
 fn build_mls3d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
-    g.push_node(
-        ModuleNode::new(
-            "mls_transformer",
-            "MLS Transformer",
-            ModuleKind::Coordinator,
+    #[cfg(feature = "native-runner")]
+    let planner_node = {
+        use nuwax_nav_native_runner::prelude::RestartPolicy;
+        use nuwax_nav_native_runner::{NativeBuildPolicy, NativeBuildSpec, NativeProgramSpec};
+
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("nuwax-nav-stack must live under <workspace>/crates/<crate>")
+            .to_path_buf();
+        let target_dir = workspace_root.join("target");
+        let executable = target_dir.join("release").join("mls_planner_native");
+
+        let spec = NativeProgramSpec {
+            name: "mls_planner".into(),
+            executable,
+            topics: topic_map_for_node("mls_planner", topics)
+                .into_iter()
+                .map(|(port, topic)| (port, absolute_lcm_topic(topic)))
+                .collect(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: Some(workspace_root.clone()),
+            restart: RestartPolicy::Never,
+        };
+        let build = NativeBuildSpec {
+            build_command: Some(
+                "cargo build --release -p nuwax-nav-mls-planner --bin mls_planner_native".into(),
+            ),
+            policy: NativeBuildPolicy::IfMissing,
+            cwd: Some(workspace_root),
+            env: std::collections::BTreeMap::from([(
+                "CARGO_TARGET_DIR".into(),
+                target_dir.to_string_lossy().into_owned(),
+            )]),
+        };
+        ModuleNode::from_native_specs(
+            "mls_planner",
+            "MLS Planner",
+            ModuleKind::NativeBridge,
+            spec,
+            Some(build),
         )
-        .with_feature("mls")
-        .add_input(topics.get_or("registered_scan", "registered_scan"))
-        .add_input(topics.get_or("odometry", "odometry"))
-        .add_output("mls_request"),
-    );
+    };
+    #[cfg(not(feature = "native-runner"))]
+    let planner_node = ModuleNode::new("mls_planner", "MLS Planner", ModuleKind::NativeBridge)
+        .with_binary("services/nuwax-workspace/target/release/mls_planner_native");
 
     g.push_node(
-        ModuleNode::new("mls_planner", "MLS Planner", ModuleKind::RustAlgorithm)
+        planner_node
             .with_feature("mls")
-            .add_input("mls_request")
+            .add_input(topics.get_or("global_map", "global_map"))
+            .add_input(topics.get_or("local_map", "local_map"))
+            .add_input(topics.get_or("region_bounds", "region_bounds"))
+            .add_input(topics.get_or("start_pose", "start_pose"))
+            .add_input(topics.get_or("goal_pose", "goal_pose"))
             .add_output(topics.get_or("goal_path", "goal_path"))
-            .add_output("mls_surface")
-            .depends_on_node("mls_transformer"),
+            .add_output(topics.get_or("surface_map", "mls_surface"))
+            .add_output(topics.get_or("nodes", "mls_nodes"))
+            .add_output(topics.get_or("node_edges", "mls_node_edges")),
     );
 
     g.push_node(
@@ -723,15 +901,19 @@ fn build_mls3d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
     );
 
     g.push_edge(GraphEdge {
-        from: "mls_transformer".into(),
-        to: "mls_planner".into(),
-        topic: "mls_request".into(),
-    });
-    g.push_edge(GraphEdge {
         from: "mls_planner".into(),
         to: "basic_path_follower".into(),
-        topic: "goal_path".into(),
+        topic: topics.get_or("goal_path", "goal_path").into(),
     });
+}
+
+#[cfg(feature = "native-runner")]
+fn absolute_lcm_topic(topic: String) -> String {
+    if topic.starts_with('/') {
+        topic
+    } else {
+        format!("/{topic}")
+    }
 }
 
 #[cfg(test)]
@@ -753,6 +935,7 @@ mod tests {
         g.validate().expect("validate");
         assert!(g.find("simple_planner").is_some());
         assert!(g.find("basic_path_follower").is_some());
+        assert!(g.find("navigation_state_reporter").is_some());
     }
 
     #[test]
@@ -776,7 +959,9 @@ mod tests {
             NavStackPreset::Explore.to_flags(),
         );
         g.validate().expect("validate");
-        assert!(g.find("wavefront_explorer").is_some());
+        let wavefront = g.find("wavefront_explorer").expect("wavefront node");
+        assert_eq!(wavefront.inputs.len(), 5);
+        assert_eq!(wavefront.outputs, vec!["goal_pose"]);
         assert!(g.find("far_planner").is_some());
     }
 
@@ -789,6 +974,7 @@ mod tests {
         );
         g.validate().expect("validate");
         assert!(g.find("astar_planner").is_some());
+        assert!(g.find("navigation_state_reporter").is_some());
     }
 
     #[test]
@@ -801,6 +987,22 @@ mod tests {
         g.validate().expect("validate");
         assert!(g.find("mls_planner").is_some());
         assert!(g.find("basic_path_follower").is_some());
+        assert_eq!(
+            g.find("mls_planner").unwrap().kind,
+            ModuleKind::NativeBridge
+        );
+        #[cfg(feature = "native-runner")]
+        assert_eq!(
+            g.find("mls_planner")
+                .unwrap()
+                .native_spec
+                .as_ref()
+                .unwrap()
+                .spec
+                .topics
+                .len(),
+            9
+        );
     }
 
     /// R6 验收测试:在 `native-runner` feature 启用 + 对应 bridge feature 启用时,

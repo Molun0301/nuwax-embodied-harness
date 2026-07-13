@@ -528,31 +528,16 @@ class GeometryRuntimeProvider:
     def is_mapping_ready(self) -> bool:
         """Phase 3: mapping 板块 readiness。
 
-        走 gRPC `HealthCheck`,解析 `lcm_backend` 字段 + 调用本地
-        `_parse_mapping_blockers` 判定 `MAPPING_NOT_READY` blocker
-        是否存在。该方法只读 metadata,不阻塞,且与
+        走 gRPC `GetMappingReadiness`，不把进程级 `HealthCheck.healthy`
+        误当作 mapping capability ready。该方法与
         `runtime_diagnostics.rs::mapping_readiness` 对账。
 
         返回 True —— runtime 健康 + mapping adapter 已就绪(有点云数据)。
         返回 False —— 未连接 / backend 不可用 / mapping adapter 未实装 /
                       无点云数据。
         """
-        if not self._connected or not self._stub:
-            return False
-        try:
-            resp = self._stub.HealthCheck(
-                pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
-            )
-        except grpc.RpcError as e:
-            _log_rpc_error("HealthCheck(is_mapping_ready)", e)
-            return False
-        if not getattr(resp, "healthy", False):
-            return False
-        # Phase 3 blocker 关键字包含 MAPPING_NOT_READY 时,mapping 板块
-        # 尚未就绪(无点云 / adapter 未实装)。
-        # HealthCheckResponse 当前不带 blockers 字段;预留位置通过
-        # lcm_backend 关键字 + 健康判定,等 Phase 6 扩展字段后调整。
-        return True
+        diagnostics = self.get_mapping_diagnostics()
+        return bool(diagnostics and diagnostics.get("ready", False))
 
     def get_lcm_backend_name(self) -> str:
         """Phase 3: 取 canonical LCM backend 名。
@@ -605,7 +590,7 @@ class GeometryRuntimeProvider:
             resp = self._stub.GetMappingReadiness(
                 pb2.Empty(), timeout=_read_deadline_sec()
             )
-            payload = self._parse_readiness_message(getattr(resp, "message", "") or "{}")
+            payload = _parse_readiness_message(getattr(resp, "message", "") or "{}")
             payload["ready"] = bool(getattr(resp, "ready", False))
             payload["error"] = None
             # fallback 字段名兼容旧调用方。
@@ -830,7 +815,11 @@ class GeometryRuntimeProvider:
         try:
             req = pb2.CancelNavigationRequest(goal_id=goal_id)
             resp = self._stub.CancelNavigation(req, timeout=_read_deadline_sec())
-            return _status_means_accepted(resp.status) or _status_means_succeeded(resp.status)
+            return (
+                _status_means_cancelled(resp.status)
+                or _status_means_accepted(resp.status)
+                or _status_means_succeeded(resp.status)
+            )
         except grpc.RpcError as e:
             _log_rpc_error("CancelNavigation", e)
             return False
@@ -934,11 +923,16 @@ class GeometryRuntimeProvider:
         mapping = {
             "idle": NavigationStatus.IDLE,
             "accepted": NavigationStatus.ACCEPTED,
+            "pending": NavigationStatus.ACCEPTED,
+            "queued": NavigationStatus.ACCEPTED,
             "planning": NavigationStatus.PLANNING,
             "running": NavigationStatus.RUNNING,
+            "moving": NavigationStatus.RUNNING,
             "succeeded": NavigationStatus.SUCCEEDED,
             "success": NavigationStatus.SUCCEEDED,
             "completed": NavigationStatus.SUCCEEDED,
+            "arrived": NavigationStatus.SUCCEEDED,
+            "reached": NavigationStatus.SUCCEEDED,
             "failed": NavigationStatus.FAILED,
             "failure": NavigationStatus.FAILED,
             "cancelled": NavigationStatus.CANCELLED,
@@ -1083,12 +1077,17 @@ class GeometryRuntimeProvider:
         try:
             req = pb2.CancelNavigationRequest(goal_id=request_id or "")
             resp = self._stub.CancelNavigation(req, timeout=_read_deadline_sec())
-            # Rust CancelNavigation 返回 NavigationState，status 含义反映取消结果
-            success = _status_means_cancelled(getattr(resp, "status", "")) or _status_means_accepted(getattr(resp, "status", ""))
+            raw_status = getattr(resp, "status", "") or ""
+            terminal = _status_means_cancelled(raw_status)
+            success = terminal or _status_means_accepted(raw_status)
             cancel_message = getattr(resp, "message", "") or None
             with self._nav_state_lock:
-                if success:
+                if terminal:
                     self._last_nav_status = "cancelled"
+                    if cancel_message:
+                        self._last_nav_message = cancel_message
+                elif success:
+                    self._last_nav_status = raw_status.strip().lower() or "pending"
                     if cancel_message:
                         self._last_nav_message = cancel_message
             return success
@@ -1261,7 +1260,7 @@ class GeometryRuntimeProvider:
     def publish_odom(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float,
                      lvx: float = 0, lvy: float = 0, lvz: float = 0,
                      avx: float = 0, avy: float = 0, avz: float = 0,
-                     frame_id: str = "odom") -> bool:
+                     frame_id: str = "odom", timestamp_ns: int = 0) -> bool:
         del lvx, lvy, lvz, avx, avy, avz  # round-4 HIGH 3：Rust 端不再接收 velocity 字段
         self._raise_if_stopping("publish_odom")
         if not self._stub:
@@ -1272,12 +1271,64 @@ class GeometryRuntimeProvider:
                     position=pb2.Vec3(x=x, y=y, z=z),
                     orientation=pb2.Quat(x=qx, y=qy, z=qz, w=qw),
                     frame_id=frame_id,
+                    timestamp_ns=max(0, int(timestamp_ns)),
                 ),
             )
             resp = self._stub.PublishOdom(msg, timeout=_read_deadline_sec())
             return bool(getattr(resp, "success", False))
         except grpc.RpcError as e:
             _log_rpc_error("PublishOdom", e)
+            return False
+
+    def publish_point_cloud(
+        self,
+        payload: bytes,
+        point_step: int,
+        *,
+        frame_id: str = "map",
+        timestamp_ns: int = 0,
+        fields: Optional[List[Dict[str, Any]]] = None,
+        point_count: int = 0,
+        is_dense: bool = True,
+    ) -> bool:
+        """Publish normalized PointCloud2 data through the Rust gRPC facade.
+
+        ``payload`` and ``point_step`` remain positional for compatibility with the
+        original bridge call shape. Metadata is keyword-only so older direct callers
+        can continue to publish while the runtime applies its legacy defaults.
+        """
+        self._raise_if_stopping("publish_point_cloud")
+        if not self._stub:
+            return False
+
+        proto_fields = []
+        for point_field in fields or []:
+            proto_fields.append(
+                pb2.PointCloudField(
+                    name=str(point_field.get("name", "")),
+                    offset=max(0, int(point_field.get("offset", 0))),
+                    datatype=max(0, int(point_field.get("datatype", 0))),
+                    count=max(0, int(point_field.get("count", 0))),
+                )
+            )
+
+        try:
+            request = pb2.PublishPointCloudRequest(
+                points=bytes(payload),
+                point_step=max(0, int(point_step)),
+                frame_id=str(frame_id or "map"),
+                timestamp_ns=max(0, int(timestamp_ns)),
+                fields=proto_fields,
+                point_count=max(0, int(point_count)),
+                is_dense=bool(is_dense),
+            )
+            response = self._stub.PublishPointCloud(
+                request,
+                timeout=_heavy_deadline_sec(),
+            )
+            return bool(getattr(response, "success", False))
+        except grpc.RpcError as e:
+            _log_rpc_error("PublishPointCloud", e)
             return False
 
     def get_status(self) -> Dict[str, Any]:

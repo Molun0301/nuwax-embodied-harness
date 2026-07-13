@@ -5,7 +5,7 @@
 //! `docs/开发文档/建图导航探索重构/2026-07-07_建图导航探索库真接入与real-lcm通信实施方案/00_最终执行方案.md §5 Phase 2`:
 //!
 //! LCM 1.x `lcm_publish(channel, data, datalen)` 需要的 `data` 是 **结构化消息
-//! payload bytes**,**不**是内部 [`RawLcmFrame`] 那种 "8 字节 preamble +
+//! payload bytes**,**不**是内部 [`crate::RawLcmFrame`] 那种 "8 字节 preamble +
 //! payload" envelope —— 2026-07-09 B3 修正后,real LCM wire format = 8 字节
 //! preamble(`magic BE(4) + seqno BE(4)`)+ payload。
 //!
@@ -20,7 +20,7 @@
 //!
 //! ## 与 RawLcmFrame 的区别
 //!
-//! - [`RawLcmFrame`]:包含 8-byte preamble + payload,适合 fake backend 内部测试与
+//! - [`crate::RawLcmFrame`]:包含 8-byte preamble + payload,适合 fake backend 内部测试与
 //!   raw log 回放(2026-07-09 B3 修正:由 28-byte envelope 缩为 8-byte preamble);
 //! - [`LcmMessageBytes`]:只持有消息体 + 元信息,**不**预先拼装 envelope。
 //!   真实 `lcm_publish` 收到 LcmMessageBytes 后由 liblcm 自行加 envelope。
@@ -45,7 +45,7 @@ pub struct LcmMessageBytes {
     pub fingerprint: [u8; 8],
     /// 8 字节递增 sequence(写 liblcm metadata;`lcm_publish` 不消费)
     pub sequence: u64,
-    /// payload 字节流(`lcm-gen` encoder 写入的真实消息体)
+    /// Complete generated message bytes: fingerprint followed by schema body.
     pub payload: Vec<u8>,
 }
 
@@ -59,8 +59,11 @@ impl LcmMessageBytes {
         channel: impl Into<String>,
         fingerprint: [u8; 8],
         sequence: u64,
-        payload: Vec<u8>,
+        body: Vec<u8>,
     ) -> Self {
+        let mut payload = Vec::with_capacity(8 + body.len());
+        payload.extend_from_slice(&fingerprint);
+        payload.extend_from_slice(&body);
         Self {
             channel: channel.into(),
             fingerprint,
@@ -71,10 +74,9 @@ impl LcmMessageBytes {
 
     /// 编码供 `lcm_publish(channel, data, datalen)` 使用的 slice
     ///
-    /// 注意:**仅返回 `payload`**。`lcm_publish` 不会消费 channel / fingerprint /
-    /// sequence —— channel 是它的第一个参数,fingerprint / sequence 由 liblcm
-    /// 内部写入 envelope。该函数返回的 slice 是"消息体"部分,可以直接喂给
-    /// 上游 C `lcm_publish(...)`。
+    /// The generated LCM fingerprint is part of the published message bytes;
+    /// liblcm only adds its transport envelope. Omitting these first eight
+    /// bytes makes generated Python/C++ decoders reject the message.
     #[must_use]
     pub fn encode_for_real_lcm_publish(&self) -> &[u8] {
         &self.payload
@@ -86,6 +88,12 @@ impl LcmMessageBytes {
         &self.payload
     }
 
+    /// Return the generated schema body without its fingerprint.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.payload[8..]
+    }
+
     /// 长度(字节)
     #[must_use]
     pub fn len(&self) -> usize {
@@ -95,7 +103,7 @@ impl LcmMessageBytes {
     /// 是否为空 payload
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.payload.is_empty()
+        self.body().is_empty()
     }
 }
 
@@ -114,9 +122,10 @@ mod tests {
         assert_eq!(bytes.channel, "/odom");
         assert_eq!(bytes.fingerprint[0], 0xbb);
         assert_eq!(bytes.sequence, 1);
-        assert_eq!(bytes.encode_for_real_lcm_publish(), &[1, 2, 3, 4]);
-        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
-        assert_eq!(bytes.len(), 4);
+        assert_eq!(bytes.encode_for_real_lcm_publish()[..8], bytes.fingerprint);
+        assert_eq!(bytes.body(), &[1, 2, 3, 4]);
+        assert_eq!(bytes.as_slice(), bytes.encode_for_real_lcm_publish());
+        assert_eq!(bytes.len(), 12);
         assert!(!bytes.is_empty());
     }
 
@@ -124,7 +133,7 @@ mod tests {
     fn empty_payload_is_empty() {
         let bytes = LcmMessageBytes::new("/x", [0u8; 8], 0, vec![]);
         assert!(bytes.is_empty());
-        assert_eq!(bytes.encode_for_real_lcm_publish(), &[] as &[u8]);
+        assert_eq!(bytes.encode_for_real_lcm_publish(), &[0u8; 8]);
     }
 
     #[test]

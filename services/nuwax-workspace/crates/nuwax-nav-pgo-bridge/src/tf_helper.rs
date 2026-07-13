@@ -44,6 +44,7 @@ pub fn pgo_tf_to_transform_stamped(
         parent: parent.to_string(),
         child: child.to_string(),
         stamp_secs: msg.stamp_secs,
+        stamp_nanos: 0,
         transform,
     }
 }

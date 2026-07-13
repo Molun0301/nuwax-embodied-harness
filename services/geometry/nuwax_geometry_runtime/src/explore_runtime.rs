@@ -45,7 +45,9 @@ use nuwax_exploration::{
 };
 use nuwax_explore_wavefront::WavefrontConfig;
 use nuwax_nav_types_messages::frames::NavFrameId;
-use nuwax_nav_types_messages::geometry::{ClockKind, Point3, Pose3, PoseStamped, Quaternion, Timestamp};
+use nuwax_nav_types_messages::geometry::{
+    ClockKind, Point3, Pose3, PoseStamped, Quaternion, Timestamp,
+};
 use nuwax_nav_types_messages::visual::FrontierGoal;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -208,10 +210,8 @@ impl ExploreRuntimeHandle {
         // Phase 5 默认 source = wavefront。
         // 即便 controller 暂未 begin,先把 source 装好;start 时再 begin。
         let mut ctrl = ExplorationController::new(inner.arbitration);
-        let adapter = WavefrontGoalSourceAdapter::with_default_id(
-            "wavefront",
-            WavefrontConfig::default(),
-        );
+        let adapter =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         ctrl.add_source(adapter);
         inner.controller = Some(ctrl);
 
@@ -244,19 +244,13 @@ impl ExploreRuntimeHandle {
     /// 当前实现只接受 arbitration policy 命名。
     ///
     /// 返回 `ExploreRuntimeSnapshot`,无论 controller begin 成功或失败都填充。
-    pub async fn start(
-        &self,
-        request_id: &str,
-        arbitration_str: &str,
-    ) -> ExploreRuntimeSnapshot {
+    pub async fn start(&self, request_id: &str, arbitration_str: &str) -> ExploreRuntimeSnapshot {
         let mut g = self.inner.lock().await;
         let policy = parse_arbitration_policy(arbitration_str);
         g.arbitration = policy;
         let mut ctrl = ExplorationController::new(policy);
-        let adapter = WavefrontGoalSourceAdapter::with_default_id(
-            "wavefront",
-            WavefrontConfig::default(),
-        );
+        let adapter =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         ctrl.add_source(adapter);
         let begin_msg: Result<(), String> = ctrl.begin_exploration().map_err(|e| e.to_string());
         g.last_request_id = request_id.to_string();
@@ -352,10 +346,13 @@ impl ExploreRuntimeHandle {
                 revision: 0,
             };
         };
-        let mut snapshot = ExplorationStateSnapshot::from_xy(robot_xy, Timestamp {
-            nanos: now_unix_nanos() as i64,
-            clock: ClockKind::Unix,
-        });
+        let mut snapshot = ExplorationStateSnapshot::from_xy(
+            robot_xy,
+            Timestamp {
+                nanos: now_unix_nanos() as i64,
+                clock: ClockKind::Unix,
+            },
+        );
         snapshot.global_costmap = costmap_owned.as_ref();
         let poll_result = ctrl.poll_next_goal(&snapshot);
         let diags = ctrl.diagnostics();
@@ -368,10 +365,7 @@ impl ExploreRuntimeHandle {
             status,
             message: String::new(),
             request_id: g.last_request_id.clone(),
-            selected_source: diags
-                .selected_source
-                .clone()
-                .unwrap_or_default(),
+            selected_source: diags.selected_source.clone().unwrap_or_default(),
             last_stop_reason: diags
                 .last_stop_reason
                 .map(stop_reason_str)
@@ -427,7 +421,10 @@ impl ExploreRuntimeHandle {
             (
                 d.active,
                 d.selected_source.clone().unwrap_or_default(),
-                d.last_stop_reason.map(stop_reason_str).unwrap_or("").to_string(),
+                d.last_stop_reason
+                    .map(stop_reason_str)
+                    .unwrap_or("")
+                    .to_string(),
                 d.sources
                     .into_iter()
                     .map(|s| SourceDiagView {
@@ -754,10 +751,8 @@ mod tests {
     #[test]
     fn wavefront_adapter_source_name_is_wavefront() {
         // 确认 dimos source_name 与 adapter 创建参数一致。
-        let ad = WavefrontGoalSourceAdapter::with_default_id(
-            "wavefront",
-            WavefrontConfig::default(),
-        );
+        let ad =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         assert_eq!(ad.source_name(), Cow::Borrowed("wavefront"));
         assert!(ad.cached_costmap().is_none());
     }
@@ -855,6 +850,9 @@ mod tests {
         // sync 版本不 await,直接 try_lock;若能拿到应与 async 一致。
         let sync_r = h.readiness_sync(true);
         assert_eq!(async_r.ready, sync_r.ready);
-        assert_eq!(async_r.costmap_input_revision, sync_r.costmap_input_revision);
+        assert_eq!(
+            async_r.costmap_input_revision,
+            sync_r.costmap_input_revision
+        );
     }
 }

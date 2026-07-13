@@ -62,6 +62,11 @@ message OccupancyGridMeta {
 message MapUpdateNotification {
   OccupancyGridMeta meta = 1;
   ShmRef shm_ref = 2;
+  bytes data = 3;
+  uint64 size = 4;
+  uint32 schema_version = 5;
+  string checksum = 6;
+  int64 last_seen_ms = 7;
 }
 message OccupancyGridData {
   OccupancyGridMeta meta = 1;
@@ -189,9 +194,20 @@ message ExplorationDiagnostics {
 
 // === 输入发布兼容（用于调试/自检/preview，区别于 nav2_action_provider）===
 message PublishOdomRequest { Pose pose = 1; }
+message PointCloudField {
+  string name = 1;
+  uint32 offset = 2;
+  uint32 datatype = 3;      // sensor_msgs/PointField numeric datatype
+  uint32 count = 4;
+}
 message PublishPointCloudRequest {
-  bytes points = 1;          // PointCloud2 字节（LCM codec 编码后 payload）
+  bytes points = 1;          // canonical PointCloud2 data bytes（保留 field tag 兼容旧 client）
   uint32 point_step = 2;
+  string frame_id = 3;
+  uint64 timestamp_ns = 4;
+  repeated PointCloudField fields = 5;
+  uint32 point_count = 6;
+  bool is_dense = 7;
 }
 message PublishResult { bool success = 1; string message = 2; }
 

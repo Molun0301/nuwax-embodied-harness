@@ -141,6 +141,7 @@ pub struct GlobalPlanner {
     last_state_unique_id: (LocalPlannerState, u32),
     last_stuck_check: std::time::Instant,
     last_published_path: Option<Path2D>,
+    pending_event: Option<GlobalPlannerEvent>,
 }
 
 impl GlobalPlanner {
@@ -186,6 +187,7 @@ impl GlobalPlanner {
             last_state_unique_id: (LocalPlannerState::Idle, 0),
             last_stuck_check: std::time::Instant::now(),
             last_published_path: None,
+            pending_event: None,
         }
     }
 
@@ -249,11 +251,12 @@ impl GlobalPlanner {
         self.current_goal = Some(goal);
         self.goal_reached = false;
         self.replan_limiter.reset();
-        self._plan_path();
+        self.pending_event = (!self._plan_path()).then_some(GlobalPlannerEvent::PlanningFailed);
     }
 
     /// 取消当前 goal（`arrived=true` 表示到达，其他为 cancel）
     pub fn cancel_goal(&mut self, arrived: bool) {
+        self.pending_event = None;
         if self.current_goal.is_none()
             && matches!(self.local_planner.state(), LocalPlannerState::Idle)
         {
@@ -289,6 +292,15 @@ impl GlobalPlanner {
     pub fn tick(&mut self, costmap: &CostMap2D) -> GlobalPlannerOutput {
         // 更新 local planner costmap
         self.local_planner.update_costmap(costmap.clone());
+
+        if let Some(event) = self.pending_event.take() {
+            return GlobalPlannerOutput {
+                status: self.status,
+                twist: make_twist2_zero(),
+                path: self.last_published_path.clone(),
+                event: Some(event),
+            };
+        }
 
         // close-to-goal 检查
         if let (Some(goal), Some(odom)) = (self.current_goal.as_ref(), self.current_odom.as_ref()) {
@@ -415,25 +427,25 @@ impl GlobalPlanner {
             return Some(GlobalPlannerEvent::Blocked);
         }
         self.replan_limiter.will_retry();
-        self._plan_path();
-        Some(GlobalPlannerEvent::Replanning)
+        if self._plan_path() {
+            Some(GlobalPlannerEvent::Replanning)
+        } else {
+            Some(GlobalPlannerEvent::PlanningFailed)
+        }
     }
 
-    fn _plan_path(&mut self) {
+    fn _plan_path(&mut self) -> bool {
         self.cancel_goal_inner_keep_goal();
-        // 修复 rework20 H-18:每次 _plan_path 入口重置 safe_goal_clearance 回默认值，
-        // 避免外部临时调小后长任务运行 goal 不可达。
-        self.reset_safe_goal_clearance();
         let odom = match self.current_odom.as_ref() {
             Some(o) => o.clone(),
             None => {
                 tracing::warn!("plan_path: missing odom");
-                return;
+                return false;
             }
         };
         let goal = match self.current_goal.as_ref() {
             Some(g) => g.clone(),
-            None => return,
+            None => return false,
         };
 
         let (gx, gy, _) = pose_xy_yaw(&goal);
@@ -444,7 +456,7 @@ impl GlobalPlanner {
                 tracing::warn!("no safe goal");
                 self.cancel_goal(false);
                 self.status = NavigationStatus::Blocked;
-                return;
+                return false;
             }
         };
 
@@ -454,13 +466,14 @@ impl GlobalPlanner {
                 tracing::warn!("no path to safe goal");
                 self.cancel_goal(false);
                 self.status = NavigationStatus::Blocked;
-                return;
+                return false;
             }
         };
 
         self.last_published_path = Some(path.clone());
         self.local_planner.start_planning(path);
         self.status = NavigationStatus::Planning;
+        true
     }
 
     /// 内部 cancel：保留 current_goal 但停止 local planner（用于 planning 时清掉旧 path）

@@ -1,8 +1,8 @@
 //! 占据栅格基础类型
 //!
 //! SSOT：`/home/ml/Deeprob/dimos/dimos/msgs/nav_msgs/OccupancyGrid.py`
-//! + lcm `/home/ml/Deeprob/dimos/rust重写与移植/lcmtypes/nav_msgs/OccupancyGrid.lcm`
-//! （若存在）。本模块为 Rust 端结构化表达，必须保持 wire format 兼容。
+//!   + lcm `/home/ml/Deeprob/dimos/rust重写与移植/lcmtypes/nav_msgs/OccupancyGrid.lcm`
+//!     （若存在）。本模块为 Rust 端结构化表达，必须保持 wire format 兼容。
 //!
 //! 修复要点（见 docs/.../20_rework20_全仓审计_对dimos原始.md §2.1）：
 //! - H-1：`OccupancyValue::from_i8` 对齐 Python `IntEnum {UNKNOWN=-1, FREE=0, OCCUPIED=100}`，
@@ -74,7 +74,10 @@ impl OccupancyCell {
     /// 从 i8 构造（无显式概率）
     #[must_use]
     pub fn from_i8(v: i8) -> Self {
-        Self { value: v, prob: None }
+        Self {
+            value: v,
+            prob: None,
+        }
     }
 
     /// 从 i8 + 概率构造
@@ -237,7 +240,12 @@ impl OccupancyGrid {
 
     /// 完整构造（含 frame_id）
     #[must_use]
-    pub fn with_frame(width: u32, height: u32, resolution: f64, frame_id: impl Into<String>) -> Self {
+    pub fn with_frame(
+        width: u32,
+        height: u32,
+        resolution: f64,
+        frame_id: impl Into<String>,
+    ) -> Self {
         let mut g = Self::new(width, height, resolution);
         g.frame_id = frame_id.into();
         g
@@ -289,7 +297,10 @@ impl OccupancyGrid {
     #[must_use]
     pub fn to_meta(&self) -> MapMetaData {
         MapMetaData {
-            map_load_time: nuwax_types::Timestamp { sec: self.ts as i64, nsec: 0 },
+            map_load_time: nuwax_types::Timestamp {
+                sec: self.ts as i64,
+                nsec: 0,
+            },
             resolution: self.resolution,
             width: self.width,
             height: self.height,

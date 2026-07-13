@@ -30,31 +30,19 @@
 //! 计算从 `LcmMessageType::fingerprint` 切到 `nuwax_codec::compute_hash`;
 //! 调用方接口不变。
 
+use nuwax_codec::lcm::schema;
+use nuwax_codec::{CodecError, CodecResult};
 use nuwax_protocol::{LcmFrameHeader, LcmMessageType, LcmTopic, RawLcmFrame, LCM_MAGIC};
 
-use crate::lcm_runtime::{
-    FrontierEntry, NavState, PoseState, TransformEntry,
-};
+use crate::lcm_runtime::{FrontierEntry, NavState, PoseState, TransformEntry};
 
 // ============================================================================
 // typed payload layout 常量(必须与 lcm_runtime.rs parse_*_payload 一致)
 // ============================================================================
 
-/// Pose/Odometry typed payload 布局(共享):
-/// `7×f64` (pos+quat) + `u64` stamp + `u16` frame_len + `frame` bytes
-/// 总固定 66 字节 + frame。
-pub const ODOMETRY_PAYLOAD_HEADER_BYTES: usize = 66;
-
 /// `/cmd_vel` typed payload 布局:
-/// `6×f32` (linear xyz + angular xyz) + `u64` stamp
-pub const CMD_VEL_PAYLOAD_BYTES: usize = 32;
-
-/// `/pose_stamped` typed payload 布局:复用 odom 布局
-pub const POSE_STAMPED_PAYLOAD_HEADER_BYTES: usize = ODOMETRY_PAYLOAD_HEADER_BYTES;
-
-/// `/nav/cancel` typed payload 布局:
-/// `u16` goal_id_len + `goal_id` bytes + `u64` stamp
-pub const NAV_CANCEL_HEADER_BYTES: usize = 2 + 8;
+/// `6×f64` (linear xyz + angular xyz)，与生成的 `geometry_msgs.Twist` 一致。
+pub const CMD_VEL_PAYLOAD_BYTES: usize = 48;
 
 // ============================================================================
 // encode 端
@@ -70,55 +58,104 @@ pub const NAV_CANCEL_HEADER_BYTES: usize = 2 + 8;
 ///
 /// 字节布局与 `lcm_runtime::parse_odom_payload` 完全镜像:
 /// `7×f64 + u64 stamp + u16 frame_len + frame bytes`。
-pub fn encode_odometry_payload(pose: &PoseState) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(ODOMETRY_PAYLOAD_HEADER_BYTES + pose.frame_id.len());
-    buf.extend_from_slice(&pose.x.to_le_bytes());
-    buf.extend_from_slice(&pose.y.to_le_bytes());
-    buf.extend_from_slice(&pose.z.to_le_bytes());
-    buf.extend_from_slice(&pose.qx.to_le_bytes());
-    buf.extend_from_slice(&pose.qy.to_le_bytes());
-    buf.extend_from_slice(&pose.qz.to_le_bytes());
-    buf.extend_from_slice(&pose.qw.to_le_bytes());
-    buf.extend_from_slice(&pose.timestamp_ns.to_le_bytes());
-    let frame_len = u16::try_from(pose.frame_id.len()).unwrap_or(u16::MAX);
-    buf.extend_from_slice(&frame_len.to_le_bytes());
-    buf.extend_from_slice(pose.frame_id.as_bytes());
-    buf
+pub fn encode_odometry_payload(pose: &PoseState) -> CodecResult<Vec<u8>> {
+    schema::encode_odometry_body(&schema::Odometry {
+        header: header_from_pose(pose)?,
+        child_frame_id: "base_link".to_string(),
+        pose: schema_pose(pose),
+        ..schema::Odometry::default()
+    })
 }
 
 /// 把 PointCloud2 raw bytes + point_step 编码成 typed payload。
 ///
 /// 字节布局:`u32 point_step + raw_point_cloud_bytes`。
-pub fn encode_pointcloud_payload(points: &[u8], point_step: u32) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + points.len());
-    buf.extend_from_slice(&point_step.to_le_bytes());
-    buf.extend_from_slice(points);
-    buf
+pub fn encode_pointcloud_payload(points: &[u8], point_step: u32) -> CodecResult<Vec<u8>> {
+    if point_step < 12 || points.len() % point_step as usize != 0 {
+        return Err(CodecError::LcmEncode(format!(
+            "point cloud data length {} is not aligned to point_step {}",
+            points.len(),
+            point_step
+        )));
+    }
+    let width = i32::try_from(points.len() / point_step as usize)
+        .map_err(|_| CodecError::LcmEncode("point cloud width exceeds int32".into()))?;
+    schema::encode_point_cloud2_body(&schema::PointCloud2 {
+        header: schema::Header {
+            frame_id: "map".to_string(),
+            ..schema::Header::default()
+        },
+        height: 1,
+        width,
+        fields: vec![
+            schema::PointField {
+                name: "x".to_string(),
+                offset: 0,
+                datatype: 7,
+                count: 1,
+            },
+            schema::PointField {
+                name: "y".to_string(),
+                offset: 4,
+                datatype: 7,
+                count: 1,
+            },
+            schema::PointField {
+                name: "z".to_string(),
+                offset: 8,
+                datatype: 7,
+                count: 1,
+            },
+        ],
+        is_bigendian: false,
+        point_step: point_step as i32,
+        row_step: i32::try_from(points.len())
+            .map_err(|_| CodecError::LcmEncode("point cloud row_step exceeds int32".into()))?,
+        data: points.to_vec(),
+        is_dense: true,
+    })
 }
 
 /// 把 `geometry_msgs/Twist` 编码成 typed payload bytes。
-pub fn encode_cmd_vel_payload(linear: [f32; 3], angular: [f32; 3], stamp_ns: u64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(CMD_VEL_PAYLOAD_BYTES);
-    for v in linear.iter().chain(angular.iter()) {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    buf.extend_from_slice(&stamp_ns.to_le_bytes());
-    buf
+pub fn encode_cmd_vel_payload(linear: [f32; 3], angular: [f32; 3], _stamp_ns: u64) -> Vec<u8> {
+    schema::encode_twist_body(&schema::Twist {
+        linear: linear.map(f64::from),
+        angular: angular.map(f64::from),
+    })
 }
 
-/// 把 `nuwax_msgs/CancelNavigation` 编码成 typed payload bytes。
-pub fn encode_nav_cancel_payload(goal_id: &str, stamp_ns: u64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(NAV_CANCEL_HEADER_BYTES + goal_id.len());
-    let goal_id_len = u16::try_from(goal_id.len()).unwrap_or(u16::MAX);
-    buf.extend_from_slice(&goal_id_len.to_le_bytes());
-    buf.extend_from_slice(goal_id.as_bytes());
-    buf.extend_from_slice(&stamp_ns.to_le_bytes());
-    buf
+/// 把用户触发的 `nuwax_msgs/CancelNavigation` 编码成 generated-C body。
+pub fn encode_nav_cancel_payload(session_id: &str, reason: i32) -> CodecResult<Vec<u8>> {
+    schema::encode_cancel_navigation_body(&schema::CancelNavigation {
+        session_id: session_id.to_string(),
+        reason,
+    })
 }
 
 /// 把 `geometry_msgs/PoseStamped` 编码成 typed payload bytes(复用 odom 布局)。
-pub fn encode_pose_stamped_payload(pose: &PoseState) -> Vec<u8> {
-    encode_odometry_payload(pose)
+pub fn encode_pose_stamped_payload(pose: &PoseState) -> CodecResult<Vec<u8>> {
+    schema::encode_pose_stamped_body(&schema::PoseStamped {
+        header: header_from_pose(pose)?,
+        pose: schema_pose(pose),
+    })
+}
+
+fn header_from_pose(pose: &PoseState) -> CodecResult<schema::Header> {
+    let stamp_sec = i32::try_from(pose.timestamp_ns / 1_000_000_000)
+        .map_err(|_| CodecError::LcmEncode("pose timestamp seconds exceed int32".into()))?;
+    Ok(schema::Header {
+        seq: 0,
+        stamp_sec,
+        stamp_nsec: (pose.timestamp_ns % 1_000_000_000) as i32,
+        frame_id: pose.frame_id.clone(),
+    })
+}
+
+fn schema_pose(pose: &PoseState) -> schema::Pose {
+    schema::Pose {
+        position: [pose.x, pose.y, pose.z],
+        orientation_xyzw: [pose.qx, pose.qy, pose.qz, pose.qw],
+    }
 }
 
 /// 用 typed payload + 强类型 topic / msg_type 构造 `RawLcmFrame`。
@@ -132,13 +169,19 @@ pub fn build_typed_frame(
     payload: Vec<u8>,
     seqno: u64,
 ) -> RawLcmFrame {
+    // W41 (Bug #1): `LcmFrameHeader` 当前定义仅含 `magic + seqno`(8 字节
+    // preamble,严格对齐 liblcm 1.x UDP multicast wire format,见
+    // `nuwax-protocol/src/lcm/frame.rs:44-54`);旧实现里多余的
+    // `fingerprint` / `payload_len` / `protocol_major` / `protocol_minor`
+    // 字段全部删除。
+    // - `fingerprint`:不进 wire,改由 `LcmTopic` typed suffix 表达
+    //   (见 `LcmTopic::as_subscription_pattern`);进程内仍可在
+    //   `RawLcmFrame.msg_type` 上访问,无需经 header
+    // - `payload_len`:不写入 wire,接收端用 `rbuf.data_size` 推出
+    // - `protocol_*`:real LCM 1.x wire 无此字段,本期不引入
     let header = LcmFrameHeader {
         magic: LCM_MAGIC,
-        fingerprint: msg_type.fingerprint(),
-        seqno,
-        payload_len: payload.len() as u32,
-        protocol_major: 0,
-        protocol_minor: 0,
+        seqno: seqno as u32,
     };
     RawLcmFrame {
         topic,
@@ -158,47 +201,44 @@ pub fn build_typed_frame(
 /// 本函数后,`lcm_runtime::parse_odom_payload` 可在 P3 标注 `pub(super)`
 /// 收敛。
 pub fn decode_odometry_payload(payload: &[u8]) -> Option<PoseState> {
-    if payload.len() < ODOMETRY_PAYLOAD_HEADER_BYTES {
+    let mut encoded = Vec::with_capacity(8 + payload.len());
+    encoded.extend_from_slice(&schema::ODOMETRY_FINGERPRINT);
+    encoded.extend_from_slice(payload);
+    let message = schema::decode_odometry(&encoded).ok()?;
+    if message.header.stamp_sec < 0 || message.header.stamp_nsec < 0 {
         return None;
     }
-    let x = f64::from_le_bytes(payload[0..8].try_into().ok()?);
-    let y = f64::from_le_bytes(payload[8..16].try_into().ok()?);
-    let z = f64::from_le_bytes(payload[16..24].try_into().ok()?);
-    let qx = f64::from_le_bytes(payload[24..32].try_into().ok()?);
-    let qy = f64::from_le_bytes(payload[32..40].try_into().ok()?);
-    let qz = f64::from_le_bytes(payload[40..48].try_into().ok()?);
-    let qw = f64::from_le_bytes(payload[48..56].try_into().ok()?);
-    let stamp = u64::from_le_bytes(payload[56..64].try_into().ok()?);
-    let frame_len = u16::from_le_bytes(payload[64..66].try_into().ok()?) as usize;
-    if payload.len() < ODOMETRY_PAYLOAD_HEADER_BYTES + frame_len {
-        return None;
-    }
-    let frame_id = String::from_utf8_lossy(
-        &payload[ODOMETRY_PAYLOAD_HEADER_BYTES..ODOMETRY_PAYLOAD_HEADER_BYTES + frame_len],
-    )
-    .to_string();
     Some(PoseState {
-        x,
-        y,
-        z,
-        qx,
-        qy,
-        qz,
-        qw,
-        frame_id,
-        timestamp_ns: stamp,
+        x: message.pose.position[0],
+        y: message.pose.position[1],
+        z: message.pose.position[2],
+        qx: message.pose.orientation_xyzw[0],
+        qy: message.pose.orientation_xyzw[1],
+        qz: message.pose.orientation_xyzw[2],
+        qw: message.pose.orientation_xyzw[3],
+        frame_id: message.header.frame_id,
+        timestamp_ns: message.header.stamp_sec as u64 * 1_000_000_000
+            + message.header.stamp_nsec as u64,
     })
 }
 
 /// 把 raw bytes 解析成 `NavState`(P4 接入后给 `nav_state` 解析路径用)。
 pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavState> {
-    // 至少 66 字节 + 2 字节 status_len + ...(见 lcm_runtime::parse_nav_state 注释)
-    if payload.len() < 66 {
+    let message = schema::decode_navigation_state_body(payload).ok()?;
+    let timestamp_ns = native_stamp_ns(message.stamp_sec, message.stamp_nsec)?;
+    let dx = message.goal[0] - message.current[0];
+    let dy = message.goal[1] - message.current[1];
+    let distance_remaining = dx.hypot(dy);
+    if !distance_remaining.is_finite() || !message.progress.is_finite() {
         return None;
     }
-    // 当前 lcm_runtime::subscribe nav_state 的复杂 layout 与 odom 同源
-    // 字段复用;这里只导出 baseline stub,P4 接入后做完整镜像。
-    Some(NavState::default())
+    Some(NavState {
+        status: navigation_state_name(message.state, &message.message),
+        message: message.message,
+        goal_id: message.session_id,
+        distance_remaining: distance_remaining as f32,
+        timestamp_ns,
+    })
 }
 
 /// 把 raw bytes 解析成 `Vec<TransformEntry>`(给 /tf typed channel 用)。
@@ -206,117 +246,81 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavState> {
 /// 镜像 `lcm_runtime::parse_tf_payload` 完整字段;P3 接入后
 /// `lcm_runtime::parse_tf_payload` 改 `pub(super)`。
 pub fn decode_tf_payload(payload: &[u8]) -> Option<Vec<TransformEntry>> {
-    if payload.len() < 4 {
-        return None;
-    }
-    let count = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
-    let mut cursor = 4usize;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        if cursor + 2 > payload.len() {
-            return None;
-        }
-        let p_len = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().ok()?) as usize;
-        cursor += 2;
-        if cursor + p_len > payload.len() {
-            return None;
-        }
-        let parent = String::from_utf8_lossy(&payload[cursor..cursor + p_len]).to_string();
-        cursor += p_len;
-        if cursor + 2 > payload.len() {
-            return None;
-        }
-        let c_len = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().ok()?) as usize;
-        cursor += 2;
-        if cursor + c_len > payload.len() {
-            return None;
-        }
-        let child = String::from_utf8_lossy(&payload[cursor..cursor + c_len]).to_string();
-        cursor += c_len;
-        if cursor + 56 > payload.len() {
-            return None;
-        }
-        let tx = f64::from_le_bytes(payload[cursor..cursor + 8].try_into().ok()?);
-        let ty = f64::from_le_bytes(payload[cursor + 8..cursor + 16].try_into().ok()?);
-        let tz = f64::from_le_bytes(payload[cursor + 16..cursor + 24].try_into().ok()?);
-        let rx = f64::from_le_bytes(payload[cursor + 24..cursor + 32].try_into().ok()?);
-        let ry = f64::from_le_bytes(payload[cursor + 32..cursor + 40].try_into().ok()?);
-        let rz = f64::from_le_bytes(payload[cursor + 40..cursor + 48].try_into().ok()?);
-        let rw = f64::from_le_bytes(payload[cursor + 48..cursor + 56].try_into().ok()?);
-        cursor += 56;
-        if cursor + 8 > payload.len() {
-            return None;
-        }
-        let stamp = u64::from_le_bytes(payload[cursor..cursor + 8].try_into().ok()?);
-        cursor += 8;
-        out.push(TransformEntry {
-            parent,
-            child,
-            tx,
-            ty,
-            tz,
-            rx,
-            ry,
-            rz,
-            rw,
-            stamp_ns: stamp,
-        });
-    }
-    Some(out)
+    schema::decode_tf_message_body(payload)
+        .ok()?
+        .transforms
+        .into_iter()
+        .map(|transform| {
+            Some(TransformEntry {
+                parent: transform.header.frame_id,
+                child: transform.child_frame_id,
+                tx: transform.transform.translation[0],
+                ty: transform.transform.translation[1],
+                tz: transform.transform.translation[2],
+                rx: transform.transform.rotation_xyzw[0],
+                ry: transform.transform.rotation_xyzw[1],
+                rz: transform.transform.rotation_xyzw[2],
+                rw: transform.transform.rotation_xyzw[3],
+                stamp_ns: native_stamp_ns(
+                    i64::from(transform.header.stamp_sec),
+                    transform.header.stamp_nsec,
+                )?,
+            })
+        })
+        .collect()
 }
 
 /// 把 raw bytes 解析成 `Vec<FrontierEntry>`(给 /explore/frontiers typed channel 用)。
 pub fn decode_frontiers_payload(payload: &[u8]) -> Option<Vec<FrontierEntry>> {
-    if payload.len() < 4 {
+    let message = schema::decode_frontier_list_body(payload).ok()?;
+    message
+        .frontiers
+        .into_iter()
+        .take(message.frontiers_length)
+        .map(|frontier| {
+            Some(FrontierEntry {
+                x: frontier.center[0],
+                y: frontier.center[1],
+                z: 0.0,
+                qx: 0.0,
+                qy: 0.0,
+                qz: 0.0,
+                qw: 1.0,
+                frame_id: message.frame_id.clone(),
+                size_cells: u32::try_from(frontier.cell_count).ok()?,
+                heading: 0.0,
+            })
+        })
+        .collect()
+}
+
+fn native_stamp_ns(stamp_sec: i64, stamp_nsec: i32) -> Option<u64> {
+    if stamp_sec < 0 || !(0..1_000_000_000).contains(&stamp_nsec) {
         return None;
     }
-    let count = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
-    let mut cursor = 4usize;
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        if cursor + 56 + 2 > payload.len() {
-            return None;
-        }
-        let x = f64::from_le_bytes(payload[cursor..cursor + 8].try_into().ok()?);
-        let y = f64::from_le_bytes(payload[cursor + 8..cursor + 16].try_into().ok()?);
-        let z = f64::from_le_bytes(payload[cursor + 16..cursor + 24].try_into().ok()?);
-        let qx = f64::from_le_bytes(payload[cursor + 24..cursor + 32].try_into().ok()?);
-        let qy = f64::from_le_bytes(payload[cursor + 32..cursor + 40].try_into().ok()?);
-        let qz = f64::from_le_bytes(payload[cursor + 40..cursor + 48].try_into().ok()?);
-        let qw = f64::from_le_bytes(payload[cursor + 48..cursor + 56].try_into().ok()?);
-        cursor += 56;
-        let f_len = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().ok()?) as usize;
-        cursor += 2;
-        if cursor + f_len + 4 + 4 > payload.len() {
-            return None;
-        }
-        let frame_id =
-            String::from_utf8_lossy(&payload[cursor..cursor + f_len]).to_string();
-        cursor += f_len;
-        let size_cells =
-            u32::from_le_bytes(payload[cursor..cursor + 4].try_into().ok()?);
-        cursor += 4;
-        let heading = f32::from_le_bytes(payload[cursor..cursor + 4].try_into().ok()?);
-        cursor += 4;
-        entries.push(FrontierEntry {
-            x,
-            y,
-            z,
-            qx,
-            qy,
-            qz,
-            qw,
-            frame_id,
-            size_cells,
-            heading,
-        });
+    (stamp_sec as u64)
+        .checked_mul(1_000_000_000)?
+        .checked_add(stamp_nsec as u64)
+}
+
+fn navigation_state_name(state: i32, message: &str) -> String {
+    match state {
+        0 if message.trim_start().starts_with("CANCELLED:") => "CANCELLED".into(),
+        0 => "IDLE".into(),
+        1 => "PLANNING".into(),
+        2 => "RUNNING".into(),
+        3 => "SUCCEEDED".into(),
+        4 => "FAILED".into(),
+        value => format!("UNKNOWN({value})"),
     }
-    Some(entries)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    const UV: &str = "/home/ml/.local/bin/uv";
 
     fn sample_pose() -> PoseState {
         PoseState {
@@ -335,7 +339,7 @@ mod tests {
     #[test]
     fn encode_decode_odometry_roundtrip() {
         let pose = sample_pose();
-        let bytes = encode_odometry_payload(&pose);
+        let bytes = encode_odometry_payload(&pose).expect("encode");
         let decoded = decode_odometry_payload(&bytes).expect("decode");
         assert_eq!(decoded.x, pose.x);
         assert_eq!(decoded.y, pose.y);
@@ -347,20 +351,120 @@ mod tests {
 
     #[test]
     fn encode_pointcloud_layout() {
-        let bytes = encode_pointcloud_payload(&[0xab; 12], 16);
-        assert_eq!(bytes.len(), 4 + 12);
-        let step = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_eq!(step, 16);
-        assert_eq!(&bytes[4..], &[0xab; 12]);
+        let bytes = encode_pointcloud_payload(&[0xab; 16], 16).expect("encode");
+        let mut encoded = schema::POINT_CLOUD2_FINGERPRINT.to_vec();
+        encoded.extend_from_slice(&bytes);
+        let decoded = schema::decode_point_cloud2(&encoded).expect("decode");
+        assert_eq!(decoded.width, 1);
+        assert_eq!(decoded.height, 1);
+        assert_eq!(decoded.point_step, 16);
+        assert_eq!(decoded.data, vec![0xab; 16]);
+        assert_eq!(decoded.fields.len(), 3);
     }
 
     #[test]
     fn encode_cmd_vel_layout() {
         let bytes = encode_cmd_vel_payload([1.0, 2.0, 3.0], [0.1, 0.2, 0.3], 999);
         assert_eq!(bytes.len(), CMD_VEL_PAYLOAD_BYTES);
-        // 前 24 字节 = 6×f32 linear + angular
-        let linear_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert!((linear_x - 1.0).abs() < f32::EPSILON);
+        let mut encoded = schema::TWIST_FINGERPRINT.to_vec();
+        encoded.extend_from_slice(&bytes);
+        let decoded = schema::decode_twist(&encoded).expect("decode");
+        assert_eq!(decoded.linear, [1.0, 2.0, 3.0]);
+        assert!((decoded.angular[0] - 0.1_f32 as f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn native_bridge_payloads_use_generated_layouts() {
+        let cancel = encode_nav_cancel_payload("goal-7", 2).expect("encode cancellation");
+        assert_eq!(
+            schema::decode_cancel_navigation_body(&cancel).unwrap(),
+            schema::CancelNavigation {
+                session_id: "goal-7".into(),
+                reason: 2,
+            }
+        );
+
+        let nav = schema::encode_navigation_state_body(&schema::NavigationState {
+            session_id: "goal-7".into(),
+            robot_frame: "base_link".into(),
+            stamp_sec: 4,
+            stamp_nsec: 5,
+            state: 2,
+            goal: [3.0, 4.0, 0.0],
+            current: [0.0, 0.0, 0.0],
+            progress: 0.5,
+            message: "moving".into(),
+        })
+        .unwrap();
+        let nav = decode_nav_state_payload(&nav).expect("decode navigation state");
+        assert_eq!(nav.status, "RUNNING");
+        assert_eq!(nav.goal_id, "goal-7");
+        assert_eq!(nav.distance_remaining, 5.0);
+        assert_eq!(nav.timestamp_ns, 4_000_000_005);
+
+        let tf = schema::encode_tf_message_body(&schema::TfMessage {
+            transforms: vec![schema::TransformStamped {
+                header: schema::Header {
+                    stamp_sec: 6,
+                    stamp_nsec: 7,
+                    frame_id: "map".into(),
+                    ..schema::Header::default()
+                },
+                child_frame_id: "base_link".into(),
+                transform: schema::Transform {
+                    translation: [1.0, 2.0, 3.0],
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                },
+            }],
+        })
+        .unwrap();
+        let transforms = decode_tf_payload(&tf).expect("decode TFMessage");
+        assert_eq!(transforms.len(), 1);
+        assert_eq!(transforms[0].parent, "map");
+        assert_eq!(transforms[0].child, "base_link");
+        assert_eq!(transforms[0].stamp_ns, 6_000_000_007);
+
+        let mut frontier_list = schema::FrontierList {
+            frame_id: "map".into(),
+            frontiers_length: 1,
+            ..schema::FrontierList::default()
+        };
+        frontier_list.frontiers[0] = schema::Frontier {
+            id: 9,
+            center: [2.0, 3.0],
+            radius: 1.5,
+            score: 4.0,
+            cell_count: 12,
+            note: "candidate".into(),
+        };
+        let frontier_body = schema::encode_frontier_list_body(&frontier_list).unwrap();
+        let frontiers = decode_frontiers_payload(&frontier_body).expect("decode frontier list");
+        assert_eq!(frontiers.len(), 1);
+        assert_eq!(frontiers[0].x, 2.0);
+        assert_eq!(frontiers[0].y, 3.0);
+        assert_eq!(frontiers[0].frame_id, "map");
+        assert_eq!(frontiers[0].size_cells, 12);
+        assert_eq!(frontiers[0].qw, 1.0);
+    }
+
+    #[test]
+    fn stack_cancel_ack_decodes_as_terminal_cancelled_state() {
+        let payload = schema::encode_navigation_state_body(&schema::NavigationState {
+            session_id: "goal-cancelled".into(),
+            robot_frame: "base_link".into(),
+            stamp_sec: 8,
+            stamp_nsec: 9,
+            state: 0,
+            goal: [1.0, 2.0, 0.0],
+            current: [1.0, 2.0, 0.0],
+            progress: 0.0,
+            message: "CANCELLED: stop and zero command published".into(),
+        })
+        .expect("encode stack cancel ack");
+
+        let nav = decode_nav_state_payload(&payload).expect("decode stack cancel ack");
+        assert_eq!(nav.status, "CANCELLED");
+        assert_eq!(nav.goal_id, "goal-cancelled");
     }
 
     #[test]
@@ -369,12 +473,88 @@ mod tests {
         let topic = LcmTopic::new("/odom").expect("typed /odom");
         let msg_type = LcmMessageType::new("nav_msgs/Odometry").expect("typed");
         let pose = sample_pose();
-        let payload = encode_odometry_payload(&pose);
+        let payload = encode_odometry_payload(&pose).expect("encode");
         let frame = build_typed_frame(topic, msg_type, payload.clone(), 1);
         // header + payload 一致
         assert_eq!(frame.payload, payload);
-        assert_eq!(frame.header.payload_len, payload.len() as u32);
-        // fingerprint 非 0(FNV-1a hash)
-        assert_ne!(frame.header.fingerprint, [0u8; 8]);
+        // W41 (Bug #1 fix): `LcmFrameHeader` 已收紧为 `magic + seqno`,
+        // `payload_len` 不写入 wire(由 `rbuf.data_size` 推出),
+        // `fingerprint` 移至 `LcmTopic` typed suffix,不进 header。
+        // 这里只校验 magic 正确 + seqno 截断正确(1 → 1)。
+        assert_eq!(frame.header.magic, LCM_MAGIC);
+        assert_eq!(frame.header.seqno, 1);
+    }
+
+    #[test]
+    #[ignore = "requires uv and dimos-lcm==0.1.3"]
+    fn geometry_publish_payloads_decode_with_locked_python_schemas() {
+        assert_eq!(
+            std::env::var("NUWAX_RUN_DIMOS_LCM_CROSS_LANG").as_deref(),
+            Ok("1"),
+            "set NUWAX_RUN_DIMOS_LCM_CROSS_LANG=1 to run the differential test"
+        );
+
+        fn wire_bytes(message_type: &str, body: Vec<u8>) -> String {
+            let message = nuwax_protocol::build_lcm_message_bytes(
+                "/geometry-differential",
+                message_type,
+                &body,
+                0,
+            )
+            .expect("build generated LCM bytes");
+            message
+                .as_slice()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+
+        let pose = sample_pose();
+        let pose_bytes = wire_bytes(
+            "geometry_msgs.PoseStamped",
+            encode_pose_stamped_payload(&pose).expect("encode PoseStamped"),
+        );
+        let twist_bytes = wire_bytes(
+            "geometry_msgs.Twist",
+            encode_cmd_vel_payload([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 0),
+        );
+        let odom_bytes = wire_bytes(
+            "nav_msgs.Odometry",
+            encode_odometry_payload(&pose).expect("encode Odometry"),
+        );
+        let pointcloud_bytes = wire_bytes(
+            "sensor_msgs.PointCloud2",
+            encode_pointcloud_payload(&[0; 16], 16).expect("encode PointCloud2"),
+        );
+
+        let output = Command::new(UV)
+            .args([
+                "run",
+                "--isolated",
+                "--no-project",
+                "--no-config",
+                "--with",
+                "dimos-lcm==0.1.3",
+                "python",
+                "-c",
+                "import sys\nfrom dimos_lcm.geometry_msgs.PoseStamped import PoseStamped\nfrom dimos_lcm.geometry_msgs.Twist import Twist\nfrom dimos_lcm.nav_msgs.Odometry import Odometry\nfrom dimos_lcm.sensor_msgs.PointCloud2 import PointCloud2\np=PoseStamped.lcm_decode(bytes.fromhex(sys.argv[1]))\nt=Twist.lcm_decode(bytes.fromhex(sys.argv[2]))\no=Odometry.lcm_decode(bytes.fromhex(sys.argv[3]))\nc=PointCloud2.lcm_decode(bytes.fromhex(sys.argv[4]))\nprint(p.header.frame_id,p.pose.position.x,p.pose.orientation.w,t.linear.y,t.angular.z,o.child_frame_id,o.pose.pose.position.y,c.width,c.point_step,c.fields[0].name,len(c.data),sep='|')",
+                &pose_bytes,
+                &twist_bytes,
+                &odom_bytes,
+                &pointcloud_bytes,
+            ])
+            .output()
+            .expect("launch Python differential decoder");
+        assert!(
+            output.status.success(),
+            "Python differential failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .expect("Python output is UTF-8")
+                .trim(),
+            "map|1.0|1.0|2.0|6.0|base_link|2.0|1|16|x|16"
+        );
     }
 }

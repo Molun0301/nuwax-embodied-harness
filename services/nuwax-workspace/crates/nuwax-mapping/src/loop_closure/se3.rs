@@ -6,12 +6,12 @@
 //! - `se3_adjoint`：SE(3) Adjoint 6x6 矩阵
 //! - `linearize_edge`：对单边 `e_ij = log(measured^{-1} * from^{-1} * to)`
 //!   给出残差 `e` 与关于 `from`、`to` 节点 tangent 坐标的雅可比
-//!   `J_from = -Ad_{measured * predicted}^{-1}`、`J_to = +Ad_{measured * predicted}^{-1}`
+//!   给出包含 `Log` 微分的 right-perturbation 雅可比
 //!
 //! 约定：
 //! - twist 顺序 = `[tx, ty, tz, rx, ry, rz]`（平移在前，旋转在后）
 //! - rotation 用 axis-angle 向量表示（与 nalgebra UnitQuaternion 一致）
-//! - 用 right perturbation 约定：`T_new = T * exp(δ)`，对应 `Ad^{-1}` 出现在雅可比里
+//! - 用 right perturbation 约定：`T_new = T * exp(δ)`
 
 use nalgebra::{Isometry3, Matrix3, Matrix6, Translation3, UnitQuaternion, Vector3, Vector6};
 
@@ -26,30 +26,9 @@ use nalgebra::{Isometry3, Matrix3, Matrix6, Translation3, UnitQuaternion, Vector
 pub fn se3_log_to_vector6(pose: &Isometry3<f64>) -> Vector6<f64> {
     let t = pose.translation.vector;
 
-    // 四元数 → 轴-角：UnitQuaternion::coords 是 Vector4<f64>，直接索引起 (x, y, z, w)
-    let q = pose.rotation;
-    let v = q.coords; // Vector4<f64> ∈ {-1..1}^3 × {-1..1}
-    let x = v[0];
-    let y = v[1];
-    let z = v[2];
-    let w = v[3];
-    // 选择数值稳定的分支：|w| 接近 1 → 小角度
-    let sin_half_theta_sq = x * x + y * y + z * z;
-    let rotation = if sin_half_theta_sq < 1e-12 {
-        // 小角度：theta ≈ 2 * v.xyz
-        Vector3::new(2.0 * x, 2.0 * y, 2.0 * z)
-    } else {
-        let sin_half_theta = sin_half_theta_sq.sqrt();
-        let cos_half_theta = w.clamp(-1.0, 1.0);
-        let theta = 2.0 * sin_half_theta.atan2(cos_half_theta);
-        // 推回 axis 坐标：rotation_vec = 2 * axis * atan2(sin_half, cos_half)
-        let scale = if sin_half_theta > 1e-9 {
-            theta / sin_half_theta
-        } else {
-            2.0
-        };
-        Vector3::new(x * scale, y * scale, z * scale)
-    };
+    // nalgebra canonicalizes the quaternion hemisphere here, so q and -q
+    // produce the same principal log with rotation norm <= pi.
+    let rotation = pose.rotation.scaled_axis();
 
     // 平移部分：v = V^{-1} · t
     // V^{-1} = I - 0.5 [ω]× + (1/θ² - (1 + cos θ)/(2 θ sin θ)) [ω]×²
@@ -63,8 +42,7 @@ pub fn se3_log_to_vector6(pose: &Isometry3<f64>) -> Vector6<f64> {
         let a = 0.5;
         let b = (1.0 / theta_sq) - (1.0 + theta.cos()) / (2.0 * theta * theta.sin());
         let omega_skew = skew3(&rotation);
-        let v_part = t - a * omega_skew * t + b * omega_skew * (omega_skew * t);
-        v_part
+        t - a * omega_skew * t + b * omega_skew * (omega_skew * t)
     };
 
     Vector6::new(
@@ -118,8 +96,7 @@ pub fn se3_exp_from_vector6(twist: &Vector6<f64>) -> Isometry3<f64> {
         let a = (1.0 - theta.cos()) / theta2;
         let b = (theta - theta.sin()) / theta3;
         let omega_skew = skew3(&omega);
-        let v_part = v + a * omega_skew * v + b * omega_skew * (omega_skew * v);
-        v_part
+        v + a * omega_skew * v + b * omega_skew * (omega_skew * v)
     };
 
     Isometry3::from_parts(Translation3::from(translation), rotation)
@@ -127,11 +104,7 @@ pub fn se3_exp_from_vector6(twist: &Vector6<f64>) -> Isometry3<f64> {
 
 /// 反对称矩阵（so(3) 元素 → so(3) 生成元）
 fn skew3(v: &Vector3<f64>) -> Matrix3<f64> {
-    Matrix3::new(
-        0.0, -v.z, v.y,
-        v.z, 0.0, -v.x,
-        -v.y, v.x, 0.0,
-    )
+    Matrix3::new(0.0, -v.z, v.y, v.z, 0.0, -v.x, -v.y, v.x, 0.0)
 }
 
 /// SE(3) Adjoint 6×6 矩阵
@@ -169,6 +142,53 @@ pub fn se3_adjoint(pose: &Isometry3<f64>) -> Matrix6<f64> {
     out
 }
 
+/// se(3) 的小 adjoint：`ad_[v,w] = [[w^, v^], [0, w^]]`。
+fn se3_little_adjoint(twist: &Vector6<f64>) -> Matrix6<f64> {
+    let v = Vector3::new(twist[0], twist[1], twist[2]);
+    let omega = Vector3::new(twist[3], twist[4], twist[5]);
+    let omega_skew = skew3(&omega);
+    let v_skew = skew3(&v);
+    let mut out = Matrix6::zeros();
+    for row in 0..3 {
+        for col in 0..3 {
+            out[(row, col)] = omega_skew[(row, col)];
+            out[(row, col + 3)] = v_skew[(row, col)];
+            out[(row + 3, col + 3)] = omega_skew[(row, col)];
+        }
+    }
+    out
+}
+
+/// `Log(T * Exp(delta))` 对 `delta` 的微分，即 SE(3) 右雅可比的逆。
+///
+/// 使用 Bernoulli 级数
+/// `J_r^{-1}(xi) = I + 1/2 ad_xi + sum B_2n/(2n)! ad_xi^(2n)`。
+/// `Log` 返回主值（旋转角不超过 pi），因此该级数处于收敛域内；保留到 20 次项，
+/// 并由接近 pi 的数值微分回归约束其误差。
+fn se3_right_jacobian_inverse(twist: &Vector6<f64>) -> Matrix6<f64> {
+    let ad = se3_little_adjoint(twist);
+    let ad_squared = ad * ad;
+    let mut result = Matrix6::identity() + 0.5 * ad;
+    let mut power = ad_squared;
+    let coefficients = [
+        1.0 / 12.0,
+        -1.0 / 720.0,
+        1.0 / 30_240.0,
+        -1.0 / 1_209_600.0,
+        1.0 / 47_900_160.0,
+        -691.0 / 1_307_674_368_000.0,
+        7.0 / 523_069_747_200.0,
+        -3_617.0 / 10_670_622_842_880_000.0,
+        43_867.0 / 5_109_094_217_170_944_000.0,
+        -174_611.0 / 802_857_662_698_291_200_000.0,
+    ];
+    for coefficient in coefficients {
+        result += coefficient * power;
+        power *= ad_squared;
+    }
+    result
+}
+
 /// 对单边做线性化，返回残差与关于 from / to 节点 tangent 坐标的雅可比。
 ///
 /// 残差约定：
@@ -176,16 +196,12 @@ pub fn se3_adjoint(pose: &Isometry3<f64>) -> Matrix6<f64> {
 ///   `err_pose  = measurement^{-1} * predicted`
 ///   `e         = log(err_pose) ∈ ℝ⁶`
 ///
-/// 雅可比约定（right perturbation，`T ← T · exp(δξ)`）：
-///   对于 `e = log(measurement^{-1} · from^{-1} · to)`，扰动 `from` 时
-///   `T_error_new = T_error · exp(-Ad_{predicted}^{-1} · ε)`，
-///   所以 `J_from = -Ad_{err_pose}^{-1} · Ad_{predicted}^{-1}`。
-///   扰动 `to` 时 `T_error_new = T_error · exp(Ad_{predicted}^{-1} · ε)`，
-///   所以 `J_to = +Ad_{err_pose}^{-1} · Ad_{predicted}^{-1}`。
-///   当 `from = to = I` 时 `predicted = I`，化简为 `J = ±Ad_{err_pose}^{-1}`。
+/// 雅可比约定（right perturbation，`T <- T * exp(delta)`）：
+/// - `from` 扰动使 `err_pose` 右乘 `Exp(-Ad(predicted^-1) * delta_from)`；
+/// - `to` 扰动使 `err_pose` 右乘 `Exp(delta_to)`；
+/// - `Log(err_pose * Exp(eta))` 的微分为 `J_r^-1(e) * eta`。
 ///
-/// 当 err_pose ≈ I（小残差）时 `Ad^{-1} ≈ I`，与原 ±I 占位一致；
-/// 大残差时正确捕获 SO(3) 几何，LM 才能真正优化旋转。
+/// 因而 `J_from = -J_r^-1(e) * Ad(predicted^-1)`，`J_to = J_r^-1(e)`。
 #[must_use]
 pub fn linearize_edge(
     measurement: &Isometry3<f64>,
@@ -196,12 +212,11 @@ pub fn linearize_edge(
     let err_pose = measurement.inverse() * predicted;
     let e = se3_log_to_vector6(&err_pose);
 
-    // Ad_{err_pose}^{-1} = Ad(err_pose.inverse())；Ad_{predicted}^{-1} = Ad(predicted.inverse())
-    let adj_err_inv = se3_adjoint(&err_pose.inverse());
+    let log_jacobian = se3_right_jacobian_inverse(&e);
     let adj_pred_inv = se3_adjoint(&predicted.inverse());
 
-    let j_from = -&(adj_err_inv.clone() * adj_pred_inv.clone());
-    let j_to = adj_err_inv * adj_pred_inv;
+    let j_from = -(log_jacobian * adj_pred_inv);
+    let j_to = log_jacobian;
     (e, j_from, j_to)
 }
 
@@ -264,12 +279,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn se3_log_uses_principal_rotation_for_negative_quaternion_w() {
+        let pose = Isometry3::from_parts(
+            Translation3::identity(),
+            UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 3.5),
+        );
+        assert!(pose.rotation.w < 0.0, "fixture must exercise w < 0");
+        let log = se3_log_to_vector6(&pose);
+        let rotation = Vector3::new(log[3], log[4], log[5]);
+        assert!(rotation.norm() <= core::f64::consts::PI);
+        assert_relative_eq!(rotation.z, 3.5 - core::f64::consts::TAU, epsilon = 1e-12);
+    }
+
     /// exp(0) = identity
     #[test]
     fn se3_exp_zero_is_identity() {
         let t = se3_exp_from_vector6(&Vector6::zeros());
         assert!(t.translation.vector.norm() < 1e-12);
-        let dot = (t.rotation.coords.dot(&Isometry3::identity().rotation.coords)).abs();
+        let dot = (t
+            .rotation
+            .coords
+            .dot(&Isometry3::identity().rotation.coords))
+        .abs();
         assert!((1.0 - dot).abs() < 1e-12);
     }
 
@@ -311,7 +343,7 @@ mod tests {
         let from = Isometry3::identity();
         let to = Isometry3::identity();
         let (e, j_from, j_to) = linearize_edge(&m, &from, &to);
-        assert!(e.norm() < 1e-12, "residual should be zero, got {}", e);
+        assert!(e.norm() < 1e-12, "residual should be zero, got {e}");
         for i in 0..6 {
             for j in 0..6 {
                 let exp_from = if i == j { -1.0 } else { 0.0 };
@@ -322,13 +354,10 @@ mod tests {
         }
     }
 
-    /// 当 from = to = measurement = m ≠ I,err_pose = I 但 predicted = m,
-    /// 雅可比不退化为 ±I 而包含 Ad(m^{-1}) 的旋转耦合。
+    /// 非零残差的 Log 微分包含平移/旋转耦合。
     #[test]
     fn linearize_edge_jacobian_includes_adjoint_coupling() {
-        // from = to = measurement = m: 残差 err_pose = m^{-1}, 非零,雅可比应包含 Ad 耦合。
-        // 关键:若让 predicted = m^{-1},则 err_pose = m^{-1} * m^{-1} ≠ I。
-        // 改成 from = to = I 但 measurement = m:predicted = I, err_pose = m^{-1},非平凡残差 + 非平凡雅可比。
+        // from = to = I, measurement = m: predicted = I, err_pose = m^-1。
         let m = Isometry3::from_parts(
             Translation3::new(1.0, 0.0, 0.0),
             UnitQuaternion::from_euler_angles(0.0, 0.0, 0.5),
@@ -336,8 +365,11 @@ mod tests {
         let (e, j_from, _j_to) = linearize_edge(&m, &Isometry3::identity(), &Isometry3::identity());
         // 残差 log(m^{-1}) 非零 = [tx, ty, tz, rx, ry, rz] 全非零(平移+旋转)
         assert!(e.norm() > 0.1, "nontrivial residual expected, got {e:?}");
-        // 雅可比不应是 ±I,因为 err_pose 有非平凡 [t]×R 顶部块
-        assert!(j_from[(0, 0)].abs() < 1.0, "雅可比顶部块应被 Ad 耦合,不是 ±1");
+        // J_r^-1(log(m^-1)) 应区别于零残差处的 -I。
+        assert!(
+            (j_from + Matrix6::identity()).norm() > 1e-3,
+            "非零残差雅可比不应退化成 -I"
+        );
     }
 
     /// 对非零残差：linearize_edge 雅可比非平凡（区别于 ±I 占位）
@@ -355,7 +387,7 @@ mod tests {
             rot_norm > 0.5,
             "expected rotation residual ~ π/4, got {rot_norm}"
         );
-        // Ad^{-1} 的右上块 = -[t]× R (非零)，区别于 ±I 占位
+        // Log 微分的右上块非零，区别于 ±I 占位。
         let mut has_offdiag = false;
         for i in 0..3 {
             for j in 3..6 {
@@ -370,17 +402,22 @@ mod tests {
         );
     }
 
-    /// 雅可比一致性：扰动数值微分 vs 解析 adjoint（right perturbation 约定）
+    /// 雅可比一致性：扰动数值微分 vs 解析右雅可比（right perturbation 约定）
     #[test]
-    #[ignore = "DEBUG"]
     fn linearize_edge_matches_numerical_derivative() {
-        // 用一个非平凡边：from=I, to=I, measurement = rotation+translation
+        // from/to/measurement 全都非平凡，以覆盖 J_from 中的 Ad(predicted^-1)。
         let m = Isometry3::from_parts(
             Translation3::new(0.4, -0.3, 0.2),
             UnitQuaternion::from_euler_angles(0.3, -0.2, 0.5),
         );
-        let from = Isometry3::identity();
-        let to = Isometry3::identity();
+        let from = Isometry3::from_parts(
+            Translation3::new(-0.2, 0.1, 0.35),
+            UnitQuaternion::from_euler_angles(0.1, -0.25, 0.2),
+        );
+        let to = Isometry3::from_parts(
+            Translation3::new(0.8, 0.45, -0.15),
+            UnitQuaternion::from_euler_angles(-0.15, 0.2, 0.55),
+        );
         let (e0, j_from, j_to) = linearize_edge(&m, &from, &to);
 
         // 数值验证：right perturbation  T_new = T · exp(δξ)
@@ -418,6 +455,43 @@ mod tests {
             assert!(
                 diff_to < 1e-4,
                 "J_to[{axis}] numerical mismatch: analytic={col_to:?}, numeric={expected_to:?}, diff={diff_to}"
+            );
+        }
+    }
+
+    /// Bernoulli 级数在主值 Log 的边界附近仍需匹配数值微分。
+    #[test]
+    fn linearize_edge_matches_numerical_derivative_near_pi() {
+        let axis = nalgebra::Unit::new_normalize(Vector3::new(0.3, -0.4, 0.5));
+        let measurement = Isometry3::from_parts(
+            Translation3::new(0.7, -0.4, 0.2),
+            UnitQuaternion::from_axis_angle(&axis, 3.0),
+        );
+        let from = Isometry3::identity();
+        let to = Isometry3::identity();
+        let (e0, j_from, j_to) = linearize_edge(&measurement, &from, &to);
+
+        let epsilon = 1e-7;
+        for axis_index in 0..6 {
+            let mut delta = Vector6::zeros();
+            delta[axis_index] = epsilon;
+
+            let perturbed_from = from * se3_exp_from_vector6(&delta);
+            let from_error = measurement.inverse() * perturbed_from.inverse() * to;
+            let numerical_from = (se3_log_to_vector6(&from_error) - e0) / epsilon;
+            let analytic_from = j_from.column(axis_index).into_owned();
+            assert!(
+                (analytic_from - numerical_from).norm() < 1e-4,
+                "near-pi J_from[{axis_index}] mismatch"
+            );
+
+            let perturbed_to = to * se3_exp_from_vector6(&delta);
+            let to_error = measurement.inverse() * from.inverse() * perturbed_to;
+            let numerical_to = (se3_log_to_vector6(&to_error) - e0) / epsilon;
+            let analytic_to = j_to.column(axis_index).into_owned();
+            assert!(
+                (analytic_to - numerical_to).norm() < 1e-4,
+                "near-pi J_to[{axis_index}] mismatch"
             );
         }
     }

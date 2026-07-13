@@ -40,14 +40,31 @@ foundation = [
     "dep:nuwax-nav-base",
 ]
 
+# Typed in-process composition over the repository's only production
+# transport: real liblcm with generated-schema payloads.
+lcm-runtime = [
+    "foundation",
+    "dep:nuwax-codec",
+    "dep:nuwax-protocol",
+    "dep:nuwax-transport",
+    "dep:futures",
+]
+
 # ---- Pure Rust 算法类(可选)----
 simple-2d = [
+    "lcm-runtime",
     "dep:nuwax-nav-simple-planner",
-    "dep:nuwax-nav-basic-path-follower",
+    "basic-path-follower",
+    "movement-manager",
+    "click-goal",
 ]
 replanning-astar = [
+    "lcm-runtime",
     "dep:nuwax-nav-astar",
-    "dep:nuwax-nav-basic-path-follower",
+    "basic-path-follower",
+    "movement-manager",
+    "click-goal",
+    "patrolling",
 ]
 
 # ---- Native C++ bridge(可选,均不默认启用)----
@@ -56,42 +73,47 @@ replanning-astar = [
 # 仍由 `dep:nuwax-nav-native-runner` 显式打开。
 native-runner = ["dep:nuwax-nav-native-runner", "dep:nuwax-exploration"]
 native-far = [
+    "native-runner",
     "dep:nuwax-nav-far-planner-bridge",
-    "dep:nuwax-nav-native-runner",
 ]
 native-local = [
+    "native-runner",
     "dep:nuwax-nav-local-planner-bridge",
-    "dep:nuwax-nav-native-runner",
 ]
 native-path-follower = [
+    "native-runner",
     "dep:nuwax-nav-path-follower-bridge",
-    "dep:nuwax-nav-native-runner",
 ]
 native-pgo = [
+    "native-runner",
     "dep:nuwax-nav-pgo-bridge",
-    "dep:nuwax-nav-native-runner",
 ]
 native-terrain = [
+    "native-runner",
     "dep:nuwax-explore-terrain-bridge",
-    "dep:nuwax-nav-native-runner",
 ]
 native-tare = [
+    "native-runner",
     "dep:nuwax-explore-tare-bridge",
-    "dep:nuwax-nav-native-runner",
 ]
 
 # ---- 行为层 crate(可选)----
-basic-path-follower = ["dep:nuwax-nav-basic-path-follower"]
-movement-manager = ["dep:nuwax-nav-movement-manager"]
-patrolling = ["dep:nuwax-nav-patrolling"]
+basic-path-follower = ["lcm-runtime", "dep:nuwax-nav-basic-path-follower"]
+movement-manager = ["lcm-runtime", "dep:nuwax-nav-movement-manager"]
+patrolling = ["lcm-runtime", "dep:nuwax-nav-patrolling"]
 visual-servoing = ["dep:nuwax-nav-visual-servoing"]
 visual-query = ["dep:nuwax-nav-visual-query"]
 bbox-tracker = ["dep:nuwax-nav-bbox-tracker"]
-click-goal = ["dep:nuwax-nav-click-goal-bridge"]
+click-goal = ["lcm-runtime", "dep:nuwax-nav-click-goal-bridge"]
 record = ["dep:nuwax-nav-record"]
 
 # ---- 3D / 探索(可选,本 crate 默认不引入 explore)----
-mls = ["dep:nuwax-nav-mls-planner"]
+mls = [
+    "native-runner",
+    "dep:nuwax-nav-mls-planner",
+    "basic-path-follower",
+    "movement-manager",
+]
 explore = [
     "native-far",
     "native-local",
@@ -99,7 +121,9 @@ explore = [
     "native-pgo",
     "native-terrain",
     "native-tare",
+    "movement-manager",
     "dep:nuwax-nav-terrain-map-ext",
+    "dep:nuwax-explore-wavefront",
 ]
 cmu-native = [
     "native-far",
@@ -107,6 +131,7 @@ cmu-native = [
     "native-path-follower",
     "native-pgo",
     "native-terrain",
+    "movement-manager",
     "dep:nuwax-nav-terrain-map-ext",
 ]
 
@@ -134,6 +159,7 @@ full = [
     "click-goal",
     "record",
     "mls",
+    "cmu-native",
 ]
 
 [dependencies]
@@ -142,6 +168,9 @@ full = [
 # 因此保持 optional + 不强制打开,foundation 修复后再按需启用
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages", optional = true }
 nuwax-nav-base = { path = "../nuwax-nav-base", optional = true }
+nuwax-codec = { path = "../nuwax-codec", optional = true }
+nuwax-protocol = { path = "../nuwax-protocol", optional = true }
+nuwax-transport = { path = "../nuwax-transport", optional = true }
 
 # ---- Native spec 类型(Phase E6 typed wiring 需要)----
 # 暴露 `NativeProgramSpec` / `NativeBuildSpec`,使 `ModuleNode::from_native_specs`
@@ -149,6 +178,7 @@ nuwax-nav-base = { path = "../nuwax-nav-base", optional = true }
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner", optional = true }
 # `NativeSpecSummary` 聚合类型(板块 3 探索 facade 整合点)
 nuwax-exploration = { path = "../nuwax-exploration", optional = true, features = ["spec-summary"] }
+nuwax-explore-wavefront = { path = "../nuwax-explore-wavefront", optional = true, features = ["runtime"] }
 
 # ---- Pure Rust 算法类(可选)----
 nuwax-nav-astar = { path = "../nuwax-nav-astar", optional = true }
@@ -183,9 +213,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 bitflags = { workspace = true }
-# P0-07 StackRunner 使用 tokio process / time / rt;只引入 process + time + rt,
-# 不引入 net / signal / fs,避免 nav-stack 默认拖入完整 tokio runtime。
-tokio = { workspace = true, features = ["rt", "time", "macros", "process", "io-util"] }
+futures = { workspace = true, optional = true }
+# P0-07 StackRunner 使用 process / time / rt,CLI 通过 signal 等待 Ctrl-C。
+tokio = { workspace = true, features = ["rt", "time", "macros", "process", "io-util", "signal"] }
 
 [dev-dependencies]
 # 单元测试可读 fixture / JSON

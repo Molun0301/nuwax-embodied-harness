@@ -32,6 +32,11 @@ rayon = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+nuwax-codec = { path = "../nuwax-codec" }
+nuwax-protocol = { path = "../nuwax-protocol" }
+nuwax-transport = { path = "../nuwax-transport", features = ["real-lcm"] }
 
 [dev-dependencies]
 approx = { workspace = true }

@@ -1,10 +1,9 @@
 //! nuwax 地图云服务
 //!
-//! **P1 #5 (rework22 Lane D)**：cloud 服务算法实装。
-//!
-//! 默认开启 `cloud-enabled` feature（产品决策：cloud 必须能工作）。Live HTTPS
-//! 路径需显式注入 `NUWAX_GOOGLE_MAPS_API_KEY`，否则走 Mock 分支（本地 fixture
-//! + parser）保证 dev/CI 可用。
+//! The default `cloud-enabled` feature exposes explicit live HTTP clients and
+//! offline raster utilities. Google requests require `GOOGLE_MAPS_API_KEY`;
+//! OSM endpoints and user-agent values can be overridden with `NUWAX_OSM_*`
+//! environment variables. Offline mode never fabricates network results.
 //!
 //! 模块：
 //! - `google_maps`: `geocode` / `places_nearby` / `GoogleMapsClient`
@@ -13,8 +12,8 @@
 //!
 //! 错误类型：
 //! - `CloudError`: 统一 cloud 错误（含 `ApiKeyMissing` / `Http` / `Parse` / `Disabled`）
-//! - `CloudMode`: `Mock` / `Live` 切换开关
-//! - `CloudMapError`: 兼容旧 API 的轻量错误（仅 `Disabled` / `NotImplemented`）
+//! - `CloudMode`: explicit offline/live network policy
+//! - `CloudMapError`: feature-off compatibility error (`Disabled`)
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -32,12 +31,12 @@ pub mod osm;
 pub use coords::{web_mercator_to_wgs84, wgs84_to_tile, wgs84_to_web_mercator};
 #[cfg(feature = "cloud-enabled")]
 pub use google_maps::{
-    CloudError, CloudMode, GeocodeComponents, GeocodeResult, GoogleMapsClient, LatLng, Place,
-    geocode, places_nearby,
+    geocode, places_nearby, CloudError, CloudMode, GeocodeComponents, GeocodeResult,
+    GoogleMapsClient, LatLng, Place,
 };
 #[cfg(feature = "cloud-enabled")]
 pub use osm::{
-    OsmClient, OsmPlace, OsmTile, OsmTileServer, download_tile, nominatim_search, stitch_tiles,
+    download_tile, nominatim_search, stitch_tiles, OsmClient, OsmPlace, OsmTile, OsmTileServer,
 };
 
 /// Cloud map 错误（始终可用，feature off 时返 `Disabled`）
@@ -46,19 +45,16 @@ pub enum CloudMapError {
     /// Feature 关闭时所有 cloud map 操作返此错误
     #[error("cloud map disabled (compile with --features cloud-enabled)")]
     Disabled,
-    /// 占位：底层 client 调用未实装（仅占位 stub）
-    #[error("not implemented: {0}")]
-    NotImplemented(&'static str),
 }
 
 /// 返回 `Err(CloudMapError::Disabled)`（feature off 时）
-#[must_use]
+#[cfg(not(feature = "cloud-enabled"))]
 pub fn google_maps_search(_query: &str) -> Result<(), CloudMapError> {
     Err(CloudMapError::Disabled)
 }
 
 /// 返回 `Err(CloudMapError::Disabled)`（feature off 时）
-#[must_use]
+#[cfg(not(feature = "cloud-enabled"))]
 pub fn osm_fetch_tile(_z: u8, _x: u32, _y: u32) -> Result<(), CloudMapError> {
     Err(CloudMapError::Disabled)
 }

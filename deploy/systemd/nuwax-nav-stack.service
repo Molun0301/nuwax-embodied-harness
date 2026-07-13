@@ -1,0 +1,29 @@
+[Unit]
+Description=nuwax navigation stack (typed LCM runtime owner)
+Requires=nuwax-motion-safety-guard.service
+After=network-online.target nuwax-motion-safety-guard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nuwax-navigation
+Group=nuwax-navigation
+WorkingDirectory=/home/unitree/nuwax-robot-bridge
+RuntimeDirectory=nuwax/navigation
+RuntimeDirectoryMode=0750
+UMask=0027
+EnvironmentFile=-/home/unitree/nuwax-robot-bridge/.env
+Environment=NUWAX_REAL_LCM_REQUIRED=true
+Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
+ExecStartPre=/usr/bin/rm -f /run/nuwax/navigation/nuwax_nav_stack.ready
+ExecStart=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/systemd/start_nav_stack.sh
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+SuccessExitStatus=0
+ReadWritePaths=/run/nuwax/navigation /tmp
+
+[Install]
+WantedBy=multi-user.target

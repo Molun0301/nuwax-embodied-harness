@@ -40,30 +40,21 @@ from contracts.image import ImageFrame
 from contracts.streams import StreamPayloadKind
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, StreamBus, TaskManager
 from drivers.entry import load_active_robot_private_capability_specs
-from drivers.common import (
-    ObstacleAvoidanceControlDataPlane,
-    RobotAssemblyBase,
-)
+from drivers.common import RobotAssemblyBase
 from drivers.common.private_capabilities import PrivateCapabilitySpec
 from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
+from gateways.motion_guard import GatewayMotionGuard, GatewayMotionGuardError
 from gateways.request_context import categorize_gateway_error
 from gateways.serialization import to_jsonable
-from providers import ImageProvider, MotionControl, SafetyProvider, StateProvider
+from providers import ImageProvider, StateProvider
 from providers import StreamingLocalizationProvider, StreamingPointCloudProvider
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
-# Phase 5/6 lifecycle 接线（lane-5）：
-#   - RuntimeInputBridge 把 Go2 sensor producer -> GeometryRuntimeProvider gRPC publisher
-#   - LcmMotionCommandBridge 把 real LCM /cmd_vel -> Go2 MotionControl
-# 两个 bridge 仅在此处 import 与 start/stop 装配，不修改桥内部实现（lane-5/lane-6 占用）。
+# Sensor producer -> GeometryRuntimeProvider gRPC publisher lifecycle wiring.
 from services.geometry.runtime_input_bridge import (
     RuntimeInputBridge,
     build_default_runtime_input_bridge,
-)
-from services.navigation.lcm_motion_command_bridge import (
-    Go2TwistSinkAdapter,
-    LcmMotionCommandBridge,
 )
 from services.geometry import (
     CloudMapMmapReader,
@@ -77,6 +68,8 @@ from services.mapping import MappingService
 from skills.map_workspace import MapWorkspaceService
 from services.memory import MemoryService
 from services.navigation import NavigationService
+from services.navigation.motion_guard_client import MotionGuardError
+from services.navigation.proto_gen import motion_guard_pb2 as motion_guard_pb
 from services.observation_service import ObservationService
 from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
 from services.robot_state_service import RobotStateService
@@ -476,6 +469,7 @@ class GatewayRuntime:
         state_store: Optional[StateStore] = None,
         task_manager: Optional[TaskManager] = None,
         artifact_store: Optional[LocalArtifactStore] = None,
+        motion_guard: Optional[GatewayMotionGuard] = None,
         register_default_capabilities: bool = True,
     ) -> None:
         self.config = config
@@ -498,6 +492,7 @@ class GatewayRuntime:
             event_bus=self.event_bus,
             resource_lock_manager=self.resource_lock_manager,
         )
+        self.motion_guard = motion_guard or GatewayMotionGuard()
         self.artifact_store = artifact_store or LocalArtifactStore(
             config.gateway.artifact_dir,
             config.gateway.public_base_url,
@@ -650,6 +645,7 @@ class GatewayRuntime:
         self._skill_ctx = SkillContext(
             capability_registry=self.capability_registry,
             robot=self.robot,
+            motion_guard=self.motion_guard,
             robot_state_service=self.robot_state_service,
             observation_service=self.observation_service,
             perception_service=self.perception_service,
@@ -728,14 +724,8 @@ class GatewayRuntime:
             self.register_default_capabilities()
             self.register_default_skills()
 
-        # === Phase 5/6 lifecycle 接线字段（lane-5）===
-        # ``_input_bridge`` 在 ``_ensure_geometry_runtime_started`` 完成（即
-        # ``platform_geometry_runtime.start()`` + Rust gRPC 已连）后才构造并启动；
-        # 之前保持 None，避免拿到未连的 ``_remote_provider``。
-        # ``_motion_bridge`` 在 ``start()`` 末尾构造并启动，不依赖 geometry runtime。
+        # The input bridge starts only after the Rust geometry gRPC endpoint is ready.
         self._input_bridge: Optional[RuntimeInputBridge] = None
-        self._motion_bridge: Optional[LcmMotionCommandBridge] = None
-        self._motion_bridge_errors: List[str] = []
 
     def start(self) -> None:
         """启动宿主机运行时。"""
@@ -749,6 +739,13 @@ class GatewayRuntime:
                 self.robot.manifest.robot_name,
                 self.robot.manifest.robot_model,
             )
+            readiness = self.motion_guard.start()
+            if not readiness.ready:
+                RUNTIME_LOGGER.warning(
+                    "motion guard transport ready but motion gate closed: %s",
+                    readiness.reason,
+                )
+            self._mark_geometry_cmd_vel_sink_unavailable()
             self.robot.start()
             self._started = True
         try:
@@ -770,12 +767,6 @@ class GatewayRuntime:
             )
         self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
         self._refresh_dynamic_capability_matrix()
-
-        # Phase 6 lifecycle 接线（lane-5）：在 sensor producer / perception_video_runtime 之后启动
-        # ``LcmMotionCommandBridge``，使 ``/cmd_vel`` consumer 早于任何导航 goal 准备就绪。
-        # plan §13.3.5：startup 顺序 = sensor producer → real LCM → bridge.start() → 接受 goal。
-        # 这里不依赖 geometry runtime（motion bridge 不调 gRPC），独立启停。
-        self._start_motion_command_bridge()
 
         self.event_bus.publish(
             self.event_bus.build_event(
@@ -802,20 +793,20 @@ class GatewayRuntime:
         顺序不可颠倒：颠倒会让 in-flight task 拿陈旧 stub 继续打 RPC 全 UNAVAILABLE。
         """
 
+        stop_error: Exception | None = None
         with self._lock:
             if not self._started:
                 RUNTIME_LOGGER.info("宿主机运行时未启动，忽略停止请求。")
                 return
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
             self._stop_safety_watchdog_loop()
-            self.safety_guard.stop_all_motion("宿主机网关关闭。")
-            # plan §13.3.5 shutdown 顺序（lane-5 接线）：
-            #   1) motion_bridge.stop() —— zero-stop → unsubscribe LCM → join threads
-            #   2) input_bridge.stop()  —— 注销 provider callbacks（不调 gRPC）
-            #   3) 再走原有 grpc-unavailable 安全顺序（geometry → task_manager → ...）
-            # 这两步不调 gRPC，因此放在 platform_geometry_runtime.stop() 之前无副作用，
-            # 同时让 motion watchdog 的 zero-stop 在 navigation 链路彻底下线前完成。
-            self._stop_motion_command_bridge()
+            try:
+                self.safety_guard.stop_all_motion("宿主机网关关闭。")
+            except Exception as exc:
+                stop_error = exc
+                RUNTIME_LOGGER.exception(
+                    "motion guard safety latch failed during gateway shutdown"
+                )
             self._stop_runtime_input_bridge()
             # 顺序：先关 geometry 子进程与 gRPC 通道，
             # 再让 task_manager 失活并等待 task 退出。
@@ -825,6 +816,14 @@ class GatewayRuntime:
             self._stop_data_frame_stream_sources()
             self.perception_video_runtime.stop()
             self.robot.stop()
+            try:
+                self.motion_guard.close()
+            except Exception as exc:
+                if stop_error is None:
+                    stop_error = exc
+                RUNTIME_LOGGER.exception(
+                    "motion guard client failed to close with a verified fence"
+                )
             self._started = False
 
         self.event_bus.publish(
@@ -835,6 +834,8 @@ class GatewayRuntime:
                 message="宿主机网关运行时已停止。",
             )
         )
+        if stop_error is not None:
+            raise stop_error
 
     def get_live_map_stream_status(self) -> Dict[str, object]:
         return {
@@ -6208,7 +6209,6 @@ class GatewayRuntime:
         lost_timeout_sec = self._float(arguments, "lost_timeout_sec", 0.8)
         timeout_sec = self._resolve_async_timeout("follow_target", arguments, minimum_sec=0.1)
         descriptor = self.capability_registry.get_descriptor("follow_target")
-        motion_control = self._get_provider(MotionControl, "运动控制提供器")
         if duration_sec <= 0 or interval_sec <= 0 or lost_timeout_sec <= 0:
             raise GatewayError(
                 "duration_sec、interval_sec、lost_timeout_sec 必须大于 0。",
@@ -6218,50 +6218,64 @@ class GatewayRuntime:
             )
 
         def runner(context) -> Dict[str, Any]:
-            start_time = time.monotonic()
-            last_seen_time = 0.0
-            last_detection = None
             try:
-                while True:
-                    context.ensure_active()
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= duration_sec:
-                        break
-                    perception_context = self.perception_service.perceive_current_scene(
-                        camera_id=camera_id,
-                        requested_by=requested_by,
-                        detector_backend_name=detector_backend,
-                        store_artifact=False,
-                    )
-                    detection = self._find_best_detection(query, perception_context)
-                    if detection is None:
-                        if last_seen_time and time.monotonic() - last_seen_time > lost_timeout_sec:
-                            raise GatewayError(f"目标 {query} 已丢失。")
-                        motion_control.stop_motion()
+                session = self.motion_guard.acquire_follow_session()
+                start_time = time.monotonic()
+                last_seen_time = 0.0
+                last_detection = None
+                try:
+                    while True:
+                        context.ensure_active()
+                        elapsed = time.monotonic() - start_time
+                        if elapsed >= duration_sec:
+                            break
+                        perception_context = self.perception_service.perceive_current_scene(
+                            camera_id=camera_id,
+                            requested_by=requested_by,
+                            detector_backend_name=detector_backend,
+                            store_artifact=False,
+                        )
+                        detection = self._find_best_detection(query, perception_context)
+                        if detection is None:
+                            if (
+                                last_seen_time
+                                and time.monotonic() - last_seen_time > lost_timeout_sec
+                            ):
+                                raise GatewayError(f"目标 {query} 已丢失。")
+                            session.stop()
+                            context.update(
+                                progress=min(0.95, elapsed / duration_sec),
+                                stage="follow_searching",
+                                message=f"正在搜索目标 {query}。",
+                            )
+                            time.sleep(interval_sec)
+                            continue
+
+                        last_seen_time = time.monotonic()
+                        last_detection = detection
+                        follow_command = self._build_follow_twist(
+                            perception_context,
+                            detection,
+                        )
+                        session.twist(
+                            follow_command.linear.x,
+                            follow_command.linear.y,
+                            follow_command.angular.z,
+                        )
                         context.update(
-                            progress=min(0.95, elapsed / duration_sec),
-                            stage="follow_searching",
-                            message=f"正在搜索目标 {query}。",
+                            progress=min(0.99, elapsed / duration_sec),
+                            stage="follow_tracking",
+                            message=f"正在跟随目标 {query}。",
+                            payload={
+                                "label": detection.label,
+                                "score": detection.score,
+                            },
                         )
                         time.sleep(interval_sec)
-                        continue
-
-                    last_seen_time = time.monotonic()
-                    last_detection = detection
-                    follow_command = self._build_follow_twist(perception_context, detection)
-                    motion_control.send_twist(follow_command)
-                    context.update(
-                        progress=min(0.99, elapsed / duration_sec),
-                        stage="follow_tracking",
-                        message=f"正在跟随目标 {query}。",
-                        payload={
-                            "label": detection.label,
-                            "score": detection.score,
-                        },
-                    )
-                    time.sleep(interval_sec)
-            finally:
-                motion_control.stop_motion()
+                finally:
+                    self.motion_guard.stop_and_fence(session)
+            except (GatewayMotionGuardError, MotionGuardError) as exc:
+                raise self._motion_guard_gateway_error("follow_target", exc) from exc
 
             context.update(progress=1.0, stage="completed", message="目标跟随完成。")
             return {
@@ -6297,7 +6311,6 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        motion_control = self._get_provider(MotionControl, "运动控制提供器")
         descriptor = self.capability_registry.get_descriptor("relative_move")
         vx = self._require_float(arguments, "vx")
         vy = self._float(arguments, "vy", 0.0)
@@ -6317,30 +6330,28 @@ class GatewayRuntime:
         timeout_sec = max(timeout_override, duration_sec + 2.0, float(descriptor.timeout_sec or 0))
 
         def runner(context) -> Dict[str, float]:
-            start_time = time.monotonic()
             try:
-                while True:
-                    context.ensure_active()
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= duration_sec:
-                        break
-                    motion_control.send_twist(
-                        Twist(
-                            frame_id=self.robot.defaults.frame_ids.get("base", "world/base"),
-                            linear=Vector3(x=vx, y=vy, z=0.0),
-                            angular=Vector3(x=0.0, y=0.0, z=vyaw),
+                session = self.motion_guard.acquire_relative_session()
+                start_time = time.monotonic()
+                try:
+                    while True:
+                        context.ensure_active()
+                        elapsed = time.monotonic() - start_time
+                        if elapsed >= duration_sec:
+                            break
+                        session.twist(vx, vy, vyaw)
+                        progress = min(0.99, elapsed / duration_sec)
+                        context.update(
+                            progress=progress,
+                            stage="moving",
+                            message="机器人正在执行相对移动。",
+                            payload={"elapsed_sec": round(elapsed, 3)},
                         )
-                    )
-                    progress = min(0.99, elapsed / duration_sec)
-                    context.update(
-                        progress=progress,
-                        stage="moving",
-                        message="机器人正在执行相对移动。",
-                        payload={"elapsed_sec": round(elapsed, 3)},
-                    )
-                    time.sleep(interval_sec)
-            finally:
-                motion_control.stop_motion()
+                        time.sleep(interval_sec)
+                finally:
+                    self.motion_guard.stop_and_fence(session)
+            except (GatewayMotionGuardError, MotionGuardError) as exc:
+                raise self._motion_guard_gateway_error("relative_move", exc) from exc
 
             context.update(progress=1.0, stage="completed", message="机器人已完成相对移动。")
             return {
@@ -6399,15 +6410,6 @@ class GatewayRuntime:
             return {"code": code, "result": result or {}, "action": action_name}
 
         return handler
-
-    def _is_obstacle_avoidance_control_available(self) -> bool:
-        data_plane = getattr(self.robot, "data_plane", None)
-        if data_plane is None or not isinstance(data_plane, ObstacleAvoidanceControlDataPlane):
-            return False
-        try:
-            return bool(data_plane.is_obstacle_avoidance_control_available())
-        except Exception:
-            return False
 
     def _resolve_map_workspace_for_request(
         self,
@@ -8087,15 +8089,7 @@ class GatewayRuntime:
         )
 
     # ------------------------------------------------------------------
-    # Phase 5/6 lifecycle 接线（lane-5）：
-    # 在 GatewayRuntime 启动/停止链中装配 RuntimeInputBridge 与 LcmMotionCommandBridge。
-    # 严格遵守 plan §13.3.5：
-    #   startup:  sensor producer → gRPC 远程 provider 就绪 → input_bridge.start()
-    #             → motion_bridge.start() → 接受 SetNavigationGoal
-    #   shutdown: motion_bridge.stop()（zero → unsubscribe → join）→
-    #             input_bridge.stop()（注销 provider callback）→
-    #             platform_geometry_runtime.stop()（gRPC stop）→
-    #             原 grpc-unavailable 收尾链
+    # Sensor input bridge lifecycle. Motion actuation is owned by the external guard.
     # ------------------------------------------------------------------
 
     def _start_runtime_input_bridge(self) -> None:
@@ -8149,137 +8143,42 @@ class GatewayRuntime:
         finally:
             self._input_bridge = None
 
-    def _start_motion_command_bridge(self) -> None:
-        """构造并启动 LcmMotionCommandBridge；与 geometry runtime 解耦。
+    def _mark_geometry_cmd_vel_sink_unavailable(self) -> None:
+        """Keep Rust navigation readiness false: Gateway owns no LCM actuator sink."""
 
-        Rework-9:在每条 return / 失败路径前**必须**调用
-        ``_notify_geometry_cmd_vel_sink_ready(False)``,把"bridge 未就绪"
-        真实写回 Rust handle,否则 Rust 端 `cmd_vel_sink_ready` 保持
-        默认 `false`(生产 spawn 路径),`SetNavigationGoal` 会因 readiness
-        拒绝分支被拒；成功路径必须同步调 `(True)`,防止 Python 侧 sink
-        已就绪但 Rust 仍认为 sink down 的状态漂移。
-        """
-
-        if self._motion_bridge is not None:
-            return
-        providers = getattr(self.robot, "providers", None)
-        if not isinstance(providers, MotionControl):
-            RUNTIME_LOGGER.info(
-                "LcmMotionCommandBridge 跳过：当前 robot.providers 不实现 MotionControl。",
-            )
-            # Rework-9:providers 不实现 MotionControl 时,sink 永不可用。
-            self._motion_bridge_errors.append(
-                "providers 不实现 MotionControl,cmd_vel sink 永不可用",
-            )
-            self._notify_geometry_cmd_vel_sink_ready(False)
-            return
-        sink_adapter = Go2TwistSinkAdapter(providers)
-        bridge = LcmMotionCommandBridge(
-            twist_sink=sink_adapter,
-            # 立即注入 callback,失败路径不依赖 bridge 自身是否构造完整。
-            on_sink_state_change=self._on_bridge_sink_state_change,
-        )
-        try:
-            bridge.start()
-        except Exception as exc:
-            self._motion_bridge_errors.append(f"start failed: {exc}")
-            RUNTIME_LOGGER.exception("LcmMotionCommandBridge.start 失败：%s", exc)
-            # Rework-9:start 抛异常路径,bridge 内部已 callback(False),
-            # 这里再显式调一次以覆盖 callback 未注入的边界情况。
-            self._notify_geometry_cmd_vel_sink_ready(False)
-            return
-        # Rework-9:start 成功路径:bridge 内部已 callback(True),这里
-        # 再显式调一次确保 bridge.start() 早期 callback 触发的 race
-        # 窗口被关上。
-        self._motion_bridge = bridge
-        self._notify_geometry_cmd_vel_sink_ready(True)
-        RUNTIME_LOGGER.info(
-            "LcmMotionCommandBridge 已接入 gateway lifecycle channel=%s url=%s。",
-            bridge.channel,
-            bridge.lcm_url,
-        )
-
-    def _stop_motion_command_bridge(self) -> None:
-        """按 plan §13.3.5 顺序：zero-stop → unsubscribe LCM → join threads。
-
-        Rework-9:bridge.stop() 内部已 callback(False),这里再显式调一次
-        以确保即使 bridge 早于 callback 注入前被 stop,也会把 sink down
-        状态同步到 Rust。
-        """
-
-        bridge = self._motion_bridge
-        if bridge is None:
-            return
-        try:
-            bridge.stop(timeout=1.0)
-        except Exception:
-            RUNTIME_LOGGER.exception("LcmMotionCommandBridge.stop 异常。")
-        finally:
-            self._motion_bridge = None
-            self._notify_geometry_cmd_vel_sink_ready(False)
-
-    def _on_bridge_sink_state_change(self, ready: bool) -> None:
-        """Rework-9:LcmMotionCommandBridge 在 start/stop 触发时回调本方法。
-
-        把 sink ready 状态从 bridge 推到 Rust handle(通过
-        `_notify_geometry_cmd_vel_sink_ready`),保持 diagnostics 与
-        readiness 一致。
-        """
-        self._notify_geometry_cmd_vel_sink_ready(bool(ready))
-
-    def _notify_geometry_cmd_vel_sink_ready(self, ready: bool) -> None:
-        """Rework-9 + Rework-17:把 sink ready 状态通过 gRPC 跨进程写回 Rust handle。
-
-        跨进程链路(commit `90b839f` 实装):
-            `_notify_geometry_cmd_vel_sink_ready(ready)` →
-            `PlatformGeometryRuntime.notify_cmd_vel_sink_ready(ready)` →
-            `GeometryRuntimeProvider.notify_cmd_vel_sink_ready(ready)` →
-            gRPC stub `SetCmdVelSinkReady(pb2.CmdVelSinkReadyRequest(ready=...))` →
-            `[over network]` →
-            `server.rs::set_cmd_vel_sink_ready` →
-            `self.bridge.set_cmd_vel_sink_ready(ready)` →
-            `Arc<AtomicBool>::store(...)` →
-            `compute_readiness` 立即反映。
-
-        调用方对所有失败 / 跳过 / 异常路径**都必须**调用本方法(ready=False);
-        成功启动路径**必须**调用本方法(ready=True)。bridge.stop() 内部
-        也会同步触发一次(False)作为最后兜底。
-        """
-        ready = bool(ready)
-        # 路径 1:跨进程 gRPC SetCmdVelSinkReady RPC(rework17 端到端打通)。
-        # 该路径在 platform_geometry_runtime 未启动 / 子进程未连时为 noop,
-        # 但会更新 in-process diagnostics,避免 Rust 端与 Python 端
-        # cmd_vel_sink_ready 状态漂移。
         runtime = getattr(self, "platform_geometry_runtime", None)
         if runtime is not None:
             notifier = getattr(runtime, "notify_cmd_vel_sink_ready", None)
             if callable(notifier):
                 try:
-                    notifier(ready)
+                    notifier(False)
                 except Exception:  # noqa: BLE001
                     RUNTIME_LOGGER.exception(
                         "platform_geometry_runtime.notify_cmd_vel_sink_ready 异常。",
                     )
                 return
-        # 路径 2:platform_geometry_runtime 不可用时 fallback——更新
-        # `_motion_bridge_errors` 与日志。这种情况仅在子进程未连时发生,
-        # Rust 端 cmd_vel_sink_ready 仍是 spawn-time 默认 false,
-        # rejection 分支结构上必然触发(参见 nav_runtime.rs:
-        # REJECT_REASON_CMD_VEL_SINK_DOWN)。
-        if not ready:
-            # 仅在 ready=False 时记 log;成功路径已在 _start_motion_command_bridge
-            # 末尾记 INFO log,这里再记一次会重复。
-            RUNTIME_LOGGER.info(
-                "cmd_vel sink 不可用 → Rust handle.cmd_vel_sink_ready 保持 false,SetNavigationGoal 会被拒绝。",
-            )
+        RUNTIME_LOGGER.info(
+            "Gateway has no LCM actuator sink; Rust cmd_vel_sink_ready remains false."
+        )
+
+    @staticmethod
+    def _motion_guard_gateway_error(
+        capability_name: str,
+        error: BaseException,
+    ) -> GatewayError:
+        return GatewayError(
+            f"motion guard rejected {capability_name}: {error}",
+            error_code="motion_guard_unavailable",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={
+                "capability_name": capability_name,
+                "guard_error_type": type(error).__name__,
+            },
+        )
 
     def _safe_stop_robot(self, reason: Optional[str]) -> None:
-        providers = getattr(self.robot, "providers", None)
-        if isinstance(providers, SafetyProvider):
-            providers.request_safe_stop(reason)
-            return
-        if isinstance(providers, MotionControl):
-            providers.stop_motion()
+        self.motion_guard.latch_safety_stop(reason or "gateway safety stop")
 
     def _get_provider(self, provider_type: type, provider_label: str):
         providers = getattr(self.robot, "providers", None)
@@ -8741,6 +8640,7 @@ class GatewayRuntime:
                     jsonrpc_code=-32010,
                     details={"capability_name": capability_name},
                 ) from exc
+            self._mark_geometry_cmd_vel_sink_unavailable()
             # Phase 5 lifecycle 接线（lane-5）：platform_geometry_runtime.start() 完成后，
             # Rust gRPC 远程 provider 已就绪；此刻才构造并启动 RuntimeInputBridge，把
             # sensor producer 的 localization/pointcloud 回调真正转译为 PublishOdom /
@@ -9135,24 +9035,35 @@ class GatewayRuntime:
                 "当前机器人入口未提供图像采集提供器。",
             ),
             "follow_target": (
-                lambda: self._has_provider(ImageProvider) and self._has_provider(MotionControl),
-                "当前机器人入口未同时提供图像采集与运动控制提供器。",
+                lambda: self._has_provider(ImageProvider)
+                and self.motion_guard.is_ready(
+                    motion_guard_pb.GUARD_SOURCE_GATEWAY_FOLLOW
+                ),
+                "当前机器人入口未提供图像采集，或 motion guard 未就绪。",
             ),
             "relative_move": (
-                lambda: self._has_provider(MotionControl),
-                "当前机器人入口未提供运动控制提供器。",
+                lambda: self.motion_guard.is_ready(
+                    motion_guard_pb.GUARD_SOURCE_GATEWAY_RELATIVE
+                ),
+                "motion guard 未就绪。",
             ),
             "execute_sport_command": (
-                lambda: hasattr(self.robot, "execute_action"),
-                "当前机器人入口未实现 execute_action。",
+                lambda: self.motion_guard.is_ready(
+                    motion_guard_pb.GUARD_SOURCE_GATEWAY_SPORT
+                ),
+                "motion guard 的 GATEWAY_SPORT source 未就绪。",
             ),
             "set_body_pose": (
-                lambda: hasattr(self.robot, "execute_action"),
-                "当前机器人入口未实现 execute_action。",
+                lambda: self.motion_guard.is_ready(
+                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
+                ),
+                "motion guard 的 GATEWAY_MANUAL source 未就绪。",
             ),
             "set_speed_level": (
-                lambda: hasattr(self.robot, "execute_action"),
-                "当前机器人入口未实现 execute_action。",
+                lambda: self.motion_guard.is_ready(
+                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
+                ),
+                "motion guard 的 GATEWAY_MANUAL source 未就绪。",
             ),
             "get_joint_state": (
                 lambda: self._has_provider(StateProvider),
@@ -9171,16 +9082,22 @@ class GatewayRuntime:
                 "当前机器人入口未提供机器人音量控制，仅保留软件音量。",
             ),
             "stop_all_motion": (
-                lambda: self._has_provider(SafetyProvider) or self._has_provider(MotionControl),
-                "当前机器人入口未提供安全停止或运动控制提供器。",
+                lambda: self.motion_guard.is_reachable(
+                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
+                ),
+                "motion guard 不可达。",
             ),
             "switch_control_mode": (
-                lambda: hasattr(self.robot, "switch_mode"),
-                "当前机器人入口未实现 switch_mode。",
+                lambda: self.motion_guard.is_ready(
+                    motion_guard_pb.GUARD_SOURCE_GATEWAY_SPORT
+                ),
+                "motion guard 的 GATEWAY_SPORT source 未就绪。",
             ),
             "set_obstacle_avoidance": (
-                lambda: self._is_obstacle_avoidance_control_available(),
-                "当前 Go2 官方 obstacles_avoid 服务未就绪，暂不能切换实时避障。",
+                lambda: self.motion_guard.is_ready(
+                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
+                ),
+                "motion guard 的 GATEWAY_MANUAL source 未就绪。",
             ),
             "get_robot_status": (
                 lambda: self._has_provider(StateProvider),
@@ -9360,7 +9277,9 @@ class GatewayRuntime:
 def create_default_gateway_runtime(
     config: NuwaxRobotBridgeConfig,
     robot: RobotAssemblyBase,
+    *,
+    motion_guard: Optional[GatewayMotionGuard] = None,
 ) -> GatewayRuntime:
     """创建默认宿主机运行时。"""
 
-    return GatewayRuntime(config=config, robot=robot)
+    return GatewayRuntime(config=config, robot=robot, motion_guard=motion_guard)

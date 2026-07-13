@@ -18,7 +18,7 @@ pub struct CameraIntrinsics {
 }
 
 impl CameraIntrinsics {
-    /// K[0,2,4,5,2,5]
+    /// Read `fx`, `fy`, `cx`, and `cy` from row-major `K` indices 0, 4, 2, and 5.
     #[must_use]
     pub fn from_k_row(k: &[f64; 9]) -> Self {
         Self {

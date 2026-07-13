@@ -24,6 +24,7 @@ nuwax-protocol = { path = "../../nuwax-workspace/crates/nuwax-protocol" }
 nuwax-transport = { path = "../../nuwax-workspace/crates/nuwax-transport" }
 nuwax-codec = { path = "../../nuwax-workspace/crates/nuwax-codec" }
 nuwax-tf = { path = "../../nuwax-workspace/crates/nuwax-tf" }
+nuwax-rpc = { path = "../../nuwax-workspace/crates/nuwax-rpc", features = ["link-liblcm"] }
 
 # 2026-07-08 fake-lcm 根除后:本 binary 走 `default = ["real-lcm-bridge"]`,
 # 镜像必须装 liblcm-dev 1.3~1.5,无 fake / fake-lcm-test 旁路。
@@ -38,8 +39,6 @@ nuwax-nav-types-messages = { path = "../../nuwax-workspace/crates/nuwax-nav-type
 nuwax-nav-simple-planner = { path = "../../nuwax-workspace/crates/nuwax-nav-simple-planner" }
 nuwax-nav-astar = { path = "../../nuwax-workspace/crates/nuwax-nav-astar" }
 nuwax-nav-terrain-map-ext = { path = "../../nuwax-workspace/crates/nuwax-nav-terrain-map-ext" }
-# Phase 4 nav_runtime:基本路径跟随器(simple-2d / astar profile 的 cmd_vel 生成)
-nuwax-nav-basic-path-follower = { path = "../../nuwax-workspace/crates/nuwax-nav-basic-path-follower" }
 # Phase 4 nav_runtime:serde 用于 NavigationReadinessDetail JSON 序列化
 uuid = { version = "1", features = ["v4"] }
 nuwax-exploration = { path = "../../nuwax-workspace/crates/nuwax-exploration", default-features = false, features = ["wavefront", "runtime"] }
@@ -60,6 +59,7 @@ thiserror = "1"
 nix = { version = "0.29", features = ["fs", "mman"] }
 futures = "0.3"
 parking_lot = "0.12"
+async-trait = "0.1"
 
 # Phase 3 mapping_adapter 需要 nalgebra 复用 nuwax-mapping 的 Point3/Isometry3
 # 类型(workspace 已经使用 0.33 + serde-serialize)。固定到同一版本以避免

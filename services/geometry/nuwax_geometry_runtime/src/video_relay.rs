@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tracing::{info, error};
+use tracing::{error, info};
 
 const SHM_MAGIC: u64 = 0x4E55_5741_5856_4944; // "NUWAXVID"
 const SHM_VERSION: u32 = 1;
@@ -41,10 +41,7 @@ pub struct VideoRelayHandle {
     pub notify: Arc<Notify>,
 }
 
-pub fn spawn_video_relay(
-    shm_path: &Path,
-    uds_path: &Path,
-) -> std::io::Result<VideoRelayHandle> {
+pub fn spawn_video_relay(shm_path: &Path, uds_path: &Path) -> std::io::Result<VideoRelayHandle> {
     let sequence = Arc::new(AtomicU64::new(0));
     let notify = Arc::new(Notify::new());
 
@@ -55,9 +52,8 @@ pub fn spawn_video_relay(
 
     // PLACEHOLDER_SPAWN_THREAD
     std::thread::spawn(move || {
-        if let Err(e) = video_relay_loop(
-            &shm_path_owned, &uds_path_owned, seq_clone, notify_clone,
-        ) {
+        if let Err(e) = video_relay_loop(&shm_path_owned, &uds_path_owned, seq_clone, notify_clone)
+        {
             error!("视频中转线程退出: {}", e);
         }
     });
@@ -72,7 +68,10 @@ pub fn spawn_video_relay(
 
 fn init_shm(path: &Path) -> std::io::Result<MmapMut> {
     let file = OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true)
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
         .open(path)?;
     file.set_len(BUFFER_SIZE as u64)?;
     let mut mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -102,9 +101,7 @@ fn video_relay_loop(
         match stream {
             Ok(mut conn) => {
                 info!("视频推流器已连接");
-                if let Err(e) = handle_video_connection(
-                    &mut conn, &mut mmap, &sequence, &notify,
-                ) {
+                if let Err(e) = handle_video_connection(&mut conn, &mut mmap, &sequence, &notify) {
                     info!("视频连接断开: {}", e);
                 }
             }

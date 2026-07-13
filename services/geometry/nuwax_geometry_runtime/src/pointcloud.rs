@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{fence, Ordering};
 
 use memmap2::MmapMut;
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
 pub const VOXEL_SIZE: f32 = 0.05;
 
@@ -45,15 +45,25 @@ pub struct CloudMapShmWriter {
 impl CloudMapShmWriter {
     pub fn new(shm_path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
-            .read(true).write(true).create(true).truncate(true)
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
             .open(shm_path)?;
         file.set_len(CM_TOTAL_SIZE as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         mmap[0..8].copy_from_slice(&CM_SHM_MAGIC.to_le_bytes());
         mmap[8..12].copy_from_slice(&CM_SHM_VERSION.to_le_bytes());
         mmap[12..CM_HEADER_SIZE].fill(0);
-        info!("累积地图双缓冲 mmap 已创建: {:?} ({} bytes)", shm_path, CM_TOTAL_SIZE);
-        Ok(Self { mmap, revision: 0, voxel_size: VOXEL_SIZE })
+        info!(
+            "累积地图双缓冲 mmap 已创建: {:?} ({} bytes)",
+            shm_path, CM_TOTAL_SIZE
+        );
+        Ok(Self {
+            mmap,
+            revision: 0,
+            voxel_size: VOXEL_SIZE,
+        })
     }
 
     pub fn write_cloud_map(&mut self, data: &[u8], point_step: u32) -> Option<(u64, u32, f32)> {
@@ -77,19 +87,27 @@ impl CloudMapShmWriter {
         let mut points: Vec<[f32; 3]> = Vec::with_capacity(raw_count);
         for i in 0..raw_count {
             let off = i * ps;
-            if off + 12 > data.len() { break; }
-            let x = f32::from_le_bytes(data[off..off+4].try_into().unwrap());
-            let y = f32::from_le_bytes(data[off+4..off+8].try_into().unwrap());
-            let z = f32::from_le_bytes(data[off+8..off+12].try_into().unwrap());
-            if x.is_nan() || y.is_nan() || z.is_nan() { continue; }
+            if off + 12 > data.len() {
+                break;
+            }
+            let x = f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            let y = f32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+            let z = f32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap());
+            if x.is_nan() || y.is_nan() || z.is_nan() {
+                continue;
+            }
             points.push([x, y, z]);
         }
-        if points.is_empty() { return None; }
+        if points.is_empty() {
+            return None;
+        }
         let mut vs = self.voxel_size;
         let downsampled = loop {
             let ds = voxel_downsample(&points, vs);
             let byte_size = ds.len() * 12;
-            if byte_size <= CM_SINGLE_BUFFER_SIZE || vs > 2.0 { break ds; }
+            if byte_size <= CM_SINGLE_BUFFER_SIZE || vs > 2.0 {
+                break ds;
+            }
             vs *= 2.0;
         };
         self.voxel_size = vs;
@@ -101,12 +119,14 @@ impl CloudMapShmWriter {
         let buf_offset = CM_HEADER_SIZE + active_buf * CM_SINGLE_BUFFER_SIZE;
         for (i, p) in downsampled.iter().enumerate() {
             let off = buf_offset + i * 12;
-            self.mmap[off..off+4].copy_from_slice(&p[0].to_le_bytes());
-            self.mmap[off+4..off+8].copy_from_slice(&p[1].to_le_bytes());
-            self.mmap[off+8..off+12].copy_from_slice(&p[2].to_le_bytes());
+            self.mmap[off..off + 4].copy_from_slice(&p[0].to_le_bytes());
+            self.mmap[off + 4..off + 8].copy_from_slice(&p[1].to_le_bytes());
+            self.mmap[off + 8..off + 12].copy_from_slice(&p[2].to_le_bytes());
         }
         let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         self.mmap[12..16].copy_from_slice(&(active_buf as u32).to_le_bytes());
         self.mmap[16..20].copy_from_slice(&point_count.to_le_bytes());
         self.mmap[20..28].copy_from_slice(&now_ns.to_le_bytes());

@@ -249,8 +249,8 @@ class LcmChannelConfig:
     """
 
     odom: str = "/odom#nav_msgs.Odometry"
-    tf: str = "/tf#geometry_msgs.Transform"
-    tf_static: str = "/tf_static#geometry_msgs.Transform"
+    tf: str = "/tf#tf2_msgs.TFMessage"
+    tf_static: str = "/tf_static#tf2_msgs.TFMessage"
     point_cloud: str = "/go2/lidar/points#sensor_msgs.PointCloud2"
     occupancy: str = "/map/occupancy#nav_msgs.OccupancyGrid"
     cmd_vel: str = "/cmd_vel#geometry_msgs.Twist"
@@ -270,8 +270,8 @@ class LcmChannelConfig:
     # 与 Rust `channel_registry::CHANNEL_KEY_TABLE` 的 msg_type 默认值对齐。
     _MSG_TYPE_DEFAULTS: Dict[str, str] = field(default_factory=lambda: {
         "odom": "nav_msgs.Odometry",
-        "tf": "geometry_msgs.Transform",
-        "tf_static": "geometry_msgs.Transform",
+        "tf": "tf2_msgs.TFMessage",
+        "tf_static": "tf2_msgs.TFMessage",
         "point_cloud": "sensor_msgs.PointCloud2",
         "occupancy": "nav_msgs.OccupancyGrid",
         "cmd_vel": "geometry_msgs.Twist",
@@ -291,8 +291,8 @@ class LcmChannelConfig:
         # `__post_init__` 之前未初始化的细节。
         defaults = {
             "odom": "nav_msgs.Odometry",
-            "tf": "geometry_msgs.Transform",
-            "tf_static": "geometry_msgs.Transform",
+            "tf": "tf2_msgs.TFMessage",
+            "tf_static": "tf2_msgs.TFMessage",
             "point_cloud": "sensor_msgs.PointCloud2",
             "occupancy": "nav_msgs.OccupancyGrid",
             "cmd_vel": "geometry_msgs.Twist",

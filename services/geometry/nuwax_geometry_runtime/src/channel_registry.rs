@@ -70,18 +70,90 @@ pub enum ChannelKey {
 /// `default_msg_type` 在 default_channel 或 env 值缺 `#msg_type` 时自动补。
 const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
     // env_runtime                          env_platform                  default                              msg_type
-    (ChannelKey::Odom,         "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL", "NUWAX_LCM_CHANNEL_ODOM",          "/odom",                  "nav_msgs.Odometry"),
-    (ChannelKey::Tf,           "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL",       "NUWAX_LCM_CHANNEL_TF",            "/tf",                    "geometry_msgs.Transform"),
-    (ChannelKey::TfStatic,     "",                                       "NUWAX_LCM_CHANNEL_TF_STATIC",     "/tf_static",             "geometry_msgs.Transform"),
-    (ChannelKey::PointCloud,   "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL", "NUWAX_LCM_CHANNEL_POINTCLOUD",    "/go2/lidar/points",      "sensor_msgs.PointCloud2"),
-    (ChannelKey::Occupancy,    "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL","NUWAX_LCM_CHANNEL_OCCUPANCY",     "/map/occupancy",         "nav_msgs.OccupancyGrid"),
-    (ChannelKey::CmdVel,       "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",  "NUWAX_LCM_CHANNEL_CMD_VEL",       "/cmd_vel",               "geometry_msgs.Twist"),
-    (ChannelKey::InitialPose,  "",                                       "NUWAX_LCM_CHANNEL_INITIAL_POSE",  "/localization/initial_pose", "geometry_msgs.PoseWithCovarianceStamped"),
-    (ChannelKey::GoalPose,     "",                                       "NUWAX_LCM_CHANNEL_GOAL_POSE",     "/nav/goal",              "geometry_msgs.PoseStamped"),
-    (ChannelKey::NavState,     "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL","NUWAX_LCM_CHANNEL_NAV_STATE",     "/nav/state",             "nuwax_msgs.NavigationState"),
-    (ChannelKey::Frontiers,    "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL","NUWAX_LCM_CHANNEL_FRONTIER",      "/explore/frontiers",     "nuwax_msgs.FrontierList"),
-    (ChannelKey::Cancel,       "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL","NUWAX_LCM_CHANNEL_NAV_CANCEL",   "/nav/cancel",            "nuwax_msgs.CancelNavigation"),
-    (ChannelKey::OccTopic,     "",                                       "NUWAX_LCM_CHANNEL_OCC_TOPIC",     "/map/occupancy",         "nav_msgs.OccupancyGrid"),
+    (
+        ChannelKey::Odom,
+        "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL",
+        "NUWAX_LCM_CHANNEL_ODOM",
+        "/odom",
+        "nav_msgs.Odometry",
+    ),
+    (
+        ChannelKey::Tf,
+        "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL",
+        "NUWAX_LCM_CHANNEL_TF",
+        "/tf",
+        "tf2_msgs.TFMessage",
+    ),
+    (
+        ChannelKey::TfStatic,
+        "",
+        "NUWAX_LCM_CHANNEL_TF_STATIC",
+        "/tf_static",
+        "tf2_msgs.TFMessage",
+    ),
+    (
+        ChannelKey::PointCloud,
+        "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+        "NUWAX_LCM_CHANNEL_POINTCLOUD",
+        "/go2/lidar/points",
+        "sensor_msgs.PointCloud2",
+    ),
+    (
+        ChannelKey::Occupancy,
+        "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL",
+        "NUWAX_LCM_CHANNEL_OCCUPANCY",
+        "/map/occupancy",
+        "nav_msgs.OccupancyGrid",
+    ),
+    (
+        ChannelKey::CmdVel,
+        "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
+        "NUWAX_LCM_CHANNEL_CMD_VEL",
+        "/cmd_vel",
+        "geometry_msgs.Twist",
+    ),
+    (
+        ChannelKey::InitialPose,
+        "",
+        "NUWAX_LCM_CHANNEL_INITIAL_POSE",
+        "/localization/initial_pose",
+        "geometry_msgs.PoseWithCovarianceStamped",
+    ),
+    (
+        ChannelKey::GoalPose,
+        "",
+        "NUWAX_LCM_CHANNEL_GOAL_POSE",
+        "/nav/goal",
+        "geometry_msgs.PoseStamped",
+    ),
+    (
+        ChannelKey::NavState,
+        "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL",
+        "NUWAX_LCM_CHANNEL_NAV_STATE",
+        "/nav/state",
+        "nuwax_msgs.NavigationState",
+    ),
+    (
+        ChannelKey::Frontiers,
+        "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL",
+        "NUWAX_LCM_CHANNEL_FRONTIER",
+        "/explore/frontiers",
+        "nuwax_msgs.FrontierList",
+    ),
+    (
+        ChannelKey::Cancel,
+        "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
+        "NUWAX_LCM_CHANNEL_NAV_CANCEL",
+        "/nav/cancel",
+        "nuwax_msgs.CancelNavigation",
+    ),
+    (
+        ChannelKey::OccTopic,
+        "",
+        "NUWAX_LCM_CHANNEL_OCC_TOPIC",
+        "/map/occupancy",
+        "nav_msgs.OccupancyGrid",
+    ),
 ];
 
 /// 按 `ChannelKey` 查表,返回 `(env_runtime, env_platform, default_channel, default_msg_type)`。
@@ -93,7 +165,15 @@ const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
 /// 长度 ~187GB 的 String → `__rust_alloc` 触发 OOM abort。
 ///
 /// 修复:直接解构 row,免去 unsafe cast 的偏移错位风险。
-fn lookup(key: ChannelKey) -> (ChannelKey, &'static str, &'static str, &'static str, &'static str) {
+fn lookup(
+    key: ChannelKey,
+) -> (
+    ChannelKey,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
     for row in CHANNEL_KEY_TABLE {
         if row.0 == key {
             return *row;
@@ -177,17 +257,14 @@ pub fn channel_for(key: ChannelKey) -> nuwax_protocol::LcmTopic {
 ///
 /// 返回 tuple 的第二个元素 `Option<String>`：当 raw pattern 含 `#msg_type`
 /// 后缀时为 `Some`，否则为 `None`（与 `parse_subscription_pattern` 行为一致）。
-pub fn channel_for_with_suffix(
-    key: ChannelKey,
-) -> (nuwax_protocol::LcmTopic, Option<String>) {
+pub fn channel_for_with_suffix(key: ChannelKey) -> (nuwax_protocol::LcmTopic, Option<String>) {
     let typed = resolve_typed(key);
-    nuwax_protocol::LcmTopic::parse_subscription_pattern(&typed)
-        .unwrap_or_else(|e| {
-            panic!(
-                "channel_for_with_suffix({:?}) parse 失败: raw={} err={}",
-                key, typed, e
-            )
-        })
+    nuwax_protocol::LcmTopic::parse_subscription_pattern(&typed).unwrap_or_else(|e| {
+        panic!(
+            "channel_for_with_suffix({:?}) parse 失败: raw={} err={}",
+            key, typed, e
+        )
+    })
 }
 
 /// 标准 typed channel 集合(Phase 1 + Phase 2 收敛版)。
@@ -205,7 +282,7 @@ pub const TYPED_CHANNELS: &[(&str, &str, &str)] = &[
     (
         "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL",
         "NUWAX_LCM_CHANNEL_TF",
-        "/tf#geometry_msgs.Transform",
+        "/tf#tf2_msgs.TFMessage",
     ),
     // cloud map (cumulative point cloud) —— R-N5a 修复:默认与 start.sh + .env.example
     // 对齐 `/cloud_map`(累积点云地图),与 POINTCLOUD 实时流 `/go2/lidar/points` 区分。
@@ -276,10 +353,7 @@ pub fn resolve_channel(runtime_alias: &str, platform_alias: &str, default: &str)
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
-        warn!(
-            "{} 设置为空字符串；回退到 default",
-            platform_alias
-        );
+        warn!("{} 设置为空字符串；回退到 default", platform_alias);
     }
     default.to_string()
 }
@@ -335,11 +409,7 @@ mod tests {
         // 用临时 env 验证优先级
         std::env::set_var("TEST_RUNTIME_X", "/rt#x.Rt");
         std::env::set_var("TEST_PLATFORM_X", "/pf#x.Pf");
-        let got = resolve_channel(
-            "TEST_RUNTIME_X",
-            "TEST_PLATFORM_X",
-            "/df#x.Df",
-        );
+        let got = resolve_channel("TEST_RUNTIME_X", "TEST_PLATFORM_X", "/df#x.Df");
         assert_eq!(got, "/rt#x.Rt");
         std::env::remove_var("TEST_RUNTIME_X");
         std::env::remove_var("TEST_PLATFORM_X");
@@ -349,11 +419,7 @@ mod tests {
     fn resolve_channel_platform_used_when_runtime_empty() {
         std::env::remove_var("TEST_RUNTIME_Y");
         std::env::set_var("TEST_PLATFORM_Y", "/pf#y.Pf");
-        let got = resolve_channel(
-            "TEST_RUNTIME_Y",
-            "TEST_PLATFORM_Y",
-            "/df#y.Df",
-        );
+        let got = resolve_channel("TEST_RUNTIME_Y", "TEST_PLATFORM_Y", "/df#y.Df");
         assert_eq!(got, "/pf#y.Pf");
         std::env::remove_var("TEST_PLATFORM_Y");
     }

@@ -1,0 +1,22 @@
+[package]
+name = "nuwax-nav-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "nuwax 导航运行时 Tokio 调度器与 controller 流水线(20Hz tick + cancel epoch + guard client)"
+
+[dependencies]
+# Foundation 类型与安全边界
+nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
+
+# A* + LocalPlanner(compute_control_for_plan 复用)
+nuwax-nav-astar = { path = "../nuwax-nav-astar" }
+nuwax-motion-safety-guard = { path = "../nuwax-motion-safety-guard" }
+
+# 运行时
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+thiserror = { workspace = true }

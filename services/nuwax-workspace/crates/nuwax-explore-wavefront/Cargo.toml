@@ -52,6 +52,7 @@ nuwax-explore-wavefront = { path = ".", features = ["test-internals"] }
 
 [[test]]
 name = "frontier_detection"
+
 [[test]]
 name = "scoring"
 

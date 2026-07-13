@@ -1,16 +1,12 @@
-//! ICP（Iterative Closest Point）算法
-//! 算法：
-//! 1. 对每个 source 点，在 target 中查找最近邻（kiddo KD-tree）
-//! 2. 用 SVD 计算 best-fit 变换
-//! 3. 应用变换，重复直到收敛
-//!
-//! RELOCALIZE PARTIAL：see audit H-9 (rework20)。
-//! 当前实装已加入 gravity filter（z-axis tilt 阈值）与 wall subset selection
-//! （基于法线 z 分量的水平约束）。FPFH / RANSAC 完整管线（dimos `_preprocess` +
-//! `_ransac` + multi-scale 多启动）划归 P2。
+//! Feature-based global relocalization followed by local ICP refinement.
 
 use kiddo::KdTree;
 use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3};
+
+use super::features::{
+    compute_fpfh, match_fpfh, preprocess, voxel_downsample, FeatureConfig, FeatureMatch,
+};
+use super::ransac::{evaluate_alignment, ransac_align, AlignmentScore, RansacConfig};
 
 /// ICP 配置
 #[derive(Debug, Clone, Copy)]
@@ -189,9 +185,7 @@ impl Default for IcpSolver {
     }
 }
 
-// =====================================================================
-// H-9 stubs：gravity filter + wall subset（FPFH/RANSAC 留 P2）
-// =====================================================================
+// Gravity and wall-selection helpers retained from the original pipeline.
 
 /// gravity 倾斜阈值（度）
 ///
@@ -250,33 +244,25 @@ pub fn wall_subset_mask(normals: &[Vector3<f64>], threshold: f64) -> Vec<bool> {
     normals.iter().map(|n| n.z.abs() < threshold).collect()
 }
 
-// =====================================================================
-// H-9 stubs：FPFH 描述子 + RANSAC + 多阶段 ICP 入口（完整实装留 P2）
-// =====================================================================
-
-/// FPFH（Fast Point Feature Histogram）描述子 — 占位
+/// Compatibility entry point returning flattened 33-component FPFH descriptors.
 ///
-/// 对齐 dimos `_preprocess` 中 FPFH 计算。本期仅返回 `Vec<f32>` 占位（长度 0）；
-/// 真实 FPFH（33 维直方图）实装需 normals + kd-tree + 角度 binning，留 P2。
-///
-/// TODO(audit H-9): 接 Open3D `compute_fpfh_feature` 或自研 33-bin hist
+/// New code should prefer [`compute_fpfh`], which preserves descriptor boundaries.
 #[must_use]
-pub fn compute_fpfh_stub(_points: &[Point3<f64>], _normals: &[Vector3<f64>]) -> Vec<f32> {
-    Vec::new()
+pub fn compute_fpfh_stub(points: &[Point3<f64>], normals: &[Vector3<f64>]) -> Vec<f32> {
+    compute_fpfh(
+        points,
+        normals,
+        FeatureConfig::default().feature_radius,
+        100,
+    )
+    .into_iter()
+    .flat_map(|descriptor| descriptor.into_iter().map(|component| component as f32))
+    .collect()
 }
 
-/// RANSAC 单次拟合：随机采样 3 对对应点 + SVD best-fit → 刚体变换（占位）
+/// Compatibility entry point for index-corresponded deterministic geometric RANSAC.
 ///
-/// 完整 RANSAC 含：
-/// 1. 随机采样 3 对（最小刚体拟合样本）
-/// 2. SVD best-fit 求变换
-/// 3. 评估 inlier 数（残差 < inlier_threshold）
-/// 4. 迭代 max_iters 次或 best_inlier_count 稳定
-///
-/// 本期只暴露入口签名为 caller 接入对齐，实装用 `IcpSolver::align` 的单次 best-fit
-/// 近似（用所有点而非 RANSAC 子集），正确率会偏低但语义对齐。
-///
-/// TODO(audit H-9): 真 RANSAC 留 P2
+/// New code should prefer [`ransac_align`] with FPFH-derived correspondences.
 #[must_use]
 pub fn ransac_align_stub(
     source: &[Point3<f64>],
@@ -284,20 +270,34 @@ pub fn ransac_align_stub(
     max_iters: usize,
     inlier_threshold: f64,
 ) -> Isometry3<f64> {
-    let _ = (max_iters, inlier_threshold);
-    let solver = IcpSolver::default();
-    let result = solver.align(source, target);
-    result.transformation
+    let matches: Vec<FeatureMatch> = (0..source.len().min(target.len()))
+        .map(|index| FeatureMatch {
+            source_index: index,
+            target_index: index,
+            descriptor_distance: 0.0,
+        })
+        .collect();
+    ransac_align(
+        source,
+        target,
+        &matches,
+        RansacConfig {
+            max_iterations: max_iters,
+            inlier_threshold,
+            min_inliers: 3,
+            min_inlier_ratio: 0.2,
+            ..RansacConfig::default()
+        },
+    )
+    .transformation
 }
 
-/// 多阶段 ICP（粗→细）— 占位入口
+/// Legacy two-stage ICP compatibility entry point.
 ///
 /// 完整 multi-scale：粗尺度（max_corr 大）→ 细尺度（max_corr 小）串接，
 /// 每阶段用上一阶段结果初始化下一阶段。
 ///
-/// 本期实装：两次串接（粗 1.0m → 细 0.1m），符合 dimos `multi_scale_icp` 入口语义。
-///
-/// TODO(audit H-9): 全阶段实装 + scale-aware 接受阈值留 P2
+/// Two local refinement passes are composed from coarse to fine correspondence radii.
 #[must_use]
 pub fn multiscale_icp(
     source: &[Point3<f64>],
@@ -317,10 +317,7 @@ pub fn multiscale_icp(
         max_correspondence_distance: fine_distance,
         ..IcpConfig::default()
     };
-    let transformed: Vec<Point3<f64>> = source
-        .iter()
-        .map(|p| coarse.transformation * p)
-        .collect();
+    let transformed: Vec<Point3<f64>> = source.iter().map(|p| coarse.transformation * p).collect();
     let fine = IcpSolver::new(fine_cfg).align(&transformed, target);
 
     // 合并：total = fine * coarse
@@ -332,34 +329,267 @@ pub fn multiscale_icp(
     }
 }
 
-/// 完整 relocation pipeline（FPFH + RANSAC + multi-scale ICP）— stub
-///
-/// 对应 dimos `RelocalizationModule._preprocess` + `_ransac` + `multi_scale_icp` 全链路。
-/// 本期骨架版只走 multi-scale ICP + gravity filter；FPFH/RANSAC 留 P2。
-///
-/// TODO(audit H-9): 接 FPFH 描述子 + 真 RANSAC 留 P2（不影响本期 compile/run）
+/// Configuration for the complete feature/RANSAC/ICP relocalization pipeline.
+#[derive(Debug, Clone, Copy)]
+pub struct RelocalizationConfig {
+    /// Voxel sizes used to generate independent global-registration candidates.
+    pub voxel_sizes: [f64; 3],
+    /// Maximum neighbours used for normal estimation and FPFH.
+    pub max_feature_neighbors: usize,
+    /// RANSAC sample budget at each voxel scale.
+    pub ransac_iterations: usize,
+    /// Minimum reciprocal feature matches required at a scale.
+    pub min_feature_matches: usize,
+    /// Voxel edge length used for final candidate scoring and ICP in metres.
+    pub fine_voxel_size: f64,
+    /// Maximum residual used for final candidate scoring and ICP in metres.
+    pub fine_correspondence_distance: f64,
+    /// Minimum final source-cloud inlier count.
+    pub min_final_inliers: usize,
+    /// Minimum final source-cloud inlier ratio.
+    pub min_final_fitness: f64,
+    /// ICP settings used for the final seeded local refinement.
+    pub icp: IcpConfig,
+}
+
+impl Default for RelocalizationConfig {
+    fn default() -> Self {
+        let fine_voxel_size = 0.1;
+        let fine_correspondence_distance = fine_voxel_size * 1.5;
+        Self {
+            voxel_sizes: [0.2, 0.3, 0.8],
+            max_feature_neighbors: 100,
+            ransac_iterations: 4_096,
+            min_feature_matches: 3,
+            fine_voxel_size,
+            fine_correspondence_distance,
+            min_final_inliers: 3,
+            min_final_fitness: 0.45,
+            icp: IcpConfig {
+                max_correspondence_distance: fine_correspondence_distance,
+                ..IcpConfig::default()
+            },
+        }
+    }
+}
+
+/// Stage diagnostics and accepted registration produced by relocalization.
+#[derive(Debug, Clone, Copy)]
+pub struct RelocalizationResult {
+    /// Accepted source-to-target registration, or a non-converged identity on rejection.
+    pub registration: IcpResult,
+    /// Largest reciprocal FPFH match set observed at any configured scale.
+    pub feature_matches: usize,
+    /// Largest RANSAC geometric consensus observed at any configured scale.
+    pub ransac_inliers: usize,
+    /// Final fine-scale inlier ratio.
+    pub fitness: f64,
+}
+
+/// Run the complete multi-scale FPFH, deterministic RANSAC, and seeded ICP pipeline.
 #[must_use]
-pub fn relocation_pipeline(
+pub fn relocation_pipeline_with_config(
     source: &[Point3<f64>],
     target: &[Point3<f64>],
-) -> IcpResult {
-    // 步骤 1：FPFH stub（暂时返回空 → 后续 RANSAC 直接走 ICP）
-    let _fpfh = compute_fpfh_stub(source, &[]);
-
-    // 步骤 2：multi-scale ICP（粗 1.0m → 细 0.1m）
-    let result = multiscale_icp(source, target, 1.0, 0.1);
-
-    // 步骤 3：gravity filter（z-tilt > 10° 视为异常 → 回退 identity）
-    if !is_upright(&result.transformation, GRAVITY_TILT_MAX_DEG) {
-        return IcpResult {
-            transformation: Isometry3::identity(),
-            mse: f64::INFINITY,
-            iterations: result.iterations,
-            converged: false,
-        };
+    config: RelocalizationConfig,
+) -> RelocalizationResult {
+    if !valid_relocalization_config(config) || source.len() < 3 || target.len() < 3 {
+        return rejected_relocalization(0, 0, 0);
+    }
+    let fine_source = voxel_downsample(source, config.fine_voxel_size);
+    let fine_target = voxel_downsample(target, config.fine_voxel_size);
+    if fine_source.len() < 3 || fine_target.len() < 3 {
+        return rejected_relocalization(0, 0, 0);
     }
 
-    result
+    let mut maximum_feature_matches = 0;
+    let mut maximum_ransac_inliers = 0;
+    let mut ransac_iterations = 0;
+    let mut best_candidate: Option<(Isometry3<f64>, AlignmentScore)> = None;
+
+    for voxel_size in config.voxel_sizes {
+        let feature_config = FeatureConfig::for_voxel(voxel_size, config.max_feature_neighbors);
+        let source_features = preprocess(source, feature_config);
+        let target_features = preprocess(target, feature_config);
+        if source_features.descriptors.len() != source_features.points.len()
+            || target_features.descriptors.len() != target_features.points.len()
+        {
+            continue;
+        }
+
+        let feature_matches =
+            match_fpfh(&source_features.descriptors, &target_features.descriptors);
+        maximum_feature_matches = maximum_feature_matches.max(feature_matches.len());
+        if feature_matches.len() < config.min_feature_matches {
+            continue;
+        }
+
+        let ransac = ransac_align(
+            &source_features.points,
+            &target_features.points,
+            &feature_matches,
+            RansacConfig {
+                max_iterations: config.ransac_iterations,
+                inlier_threshold: voxel_size * 1.5,
+                min_inliers: config.min_final_inliers.min(source_features.points.len()),
+                min_inlier_ratio: config.min_final_fitness.min(0.5),
+                ..RansacConfig::default()
+            },
+        );
+        ransac_iterations += ransac.iterations;
+        maximum_ransac_inliers = maximum_ransac_inliers.max(ransac.inlier_count);
+        if !ransac.converged || !is_upright(&ransac.transformation, GRAVITY_TILT_MAX_DEG) {
+            continue;
+        }
+
+        consider_candidate(
+            &fine_source,
+            &fine_target,
+            ransac.transformation,
+            config.fine_correspondence_distance,
+            &mut best_candidate,
+        );
+        consider_candidate(
+            &fine_source,
+            &fine_target,
+            ransac.transformation * centroid_yaw_flip(&fine_source),
+            config.fine_correspondence_distance,
+            &mut best_candidate,
+        );
+    }
+
+    let Some((candidate, candidate_score)) = best_candidate else {
+        return rejected_relocalization(
+            maximum_feature_matches,
+            maximum_ransac_inliers,
+            ransac_iterations,
+        );
+    };
+
+    let seeded_source: Vec<Point3<f64>> =
+        fine_source.iter().map(|point| candidate * point).collect();
+    let mut icp_config = config.icp;
+    icp_config.max_correspondence_distance = icp_config
+        .max_correspondence_distance
+        .min(config.fine_correspondence_distance);
+    let refinement = IcpSolver::new(icp_config).align(&seeded_source, &fine_target);
+    let refined_transform = refinement.transformation * candidate;
+    let refined_score = evaluate_alignment(
+        &fine_source,
+        &fine_target,
+        refined_transform,
+        config.fine_correspondence_distance,
+    );
+    let (transformation, score) = if score_is_better(refined_score, candidate_score) {
+        (refined_transform, refined_score)
+    } else {
+        (candidate, candidate_score)
+    };
+
+    let accepted = score.inlier_count >= config.min_final_inliers
+        && score.fitness >= config.min_final_fitness
+        && score.rmse.is_finite()
+        && is_upright(&transformation, GRAVITY_TILT_MAX_DEG);
+    if !accepted {
+        return rejected_relocalization(
+            maximum_feature_matches,
+            maximum_ransac_inliers,
+            ransac_iterations + refinement.iterations,
+        );
+    }
+
+    RelocalizationResult {
+        registration: IcpResult {
+            transformation,
+            mse: score.rmse * score.rmse,
+            iterations: ransac_iterations + refinement.iterations,
+            converged: true,
+        },
+        feature_matches: maximum_feature_matches,
+        ransac_inliers: maximum_ransac_inliers,
+        fitness: score.fitness,
+    }
+}
+
+/// Run relocalization with parity-oriented defaults.
+#[must_use]
+pub fn relocation_pipeline(source: &[Point3<f64>], target: &[Point3<f64>]) -> IcpResult {
+    relocation_pipeline_with_config(source, target, RelocalizationConfig::default()).registration
+}
+
+fn valid_relocalization_config(config: RelocalizationConfig) -> bool {
+    config
+        .voxel_sizes
+        .iter()
+        .all(|size| size.is_finite() && *size > 0.0)
+        && config.max_feature_neighbors >= 3
+        && config.ransac_iterations > 0
+        && config.min_feature_matches >= 3
+        && config.fine_voxel_size.is_finite()
+        && config.fine_voxel_size > 0.0
+        && config.fine_correspondence_distance.is_finite()
+        && config.fine_correspondence_distance > 0.0
+        && config.min_final_inliers >= 3
+        && config.min_final_fitness.is_finite()
+        && (0.0..=1.0).contains(&config.min_final_fitness)
+        && config.icp.max_iterations > 0
+        && config.icp.mse_tolerance.is_finite()
+        && config.icp.mse_tolerance >= 0.0
+        && config.icp.max_correspondence_distance.is_finite()
+        && config.icp.max_correspondence_distance > 0.0
+}
+
+fn consider_candidate(
+    source: &[Point3<f64>],
+    target: &[Point3<f64>],
+    transformation: Isometry3<f64>,
+    threshold: f64,
+    best: &mut Option<(Isometry3<f64>, AlignmentScore)>,
+) {
+    if !is_upright(&transformation, GRAVITY_TILT_MAX_DEG) {
+        return;
+    }
+    let score = evaluate_alignment(source, target, transformation, threshold);
+    if best
+        .as_ref()
+        .is_none_or(|(_, current)| score_is_better(score, *current))
+    {
+        *best = Some((transformation, score));
+    }
+}
+
+fn score_is_better(candidate: AlignmentScore, current: AlignmentScore) -> bool {
+    candidate.inlier_count > current.inlier_count
+        || (candidate.inlier_count == current.inlier_count && candidate.rmse < current.rmse)
+}
+
+fn centroid_yaw_flip(source: &[Point3<f64>]) -> Isometry3<f64> {
+    let centroid = source
+        .iter()
+        .fold(Vector3::zeros(), |sum, point| sum + point.coords)
+        / source.len() as f64;
+    let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), core::f64::consts::PI);
+    let flat_centroid = Vector3::new(centroid.x, centroid.y, 0.0);
+    let translation = flat_centroid - rotation * flat_centroid;
+    Isometry3::from_parts(Translation3::from(translation), rotation)
+}
+
+fn rejected_relocalization(
+    feature_matches: usize,
+    ransac_inliers: usize,
+    iterations: usize,
+) -> RelocalizationResult {
+    RelocalizationResult {
+        registration: IcpResult {
+            transformation: Isometry3::identity(),
+            mse: f64::INFINITY,
+            iterations,
+            converged: false,
+        },
+        feature_matches,
+        ransac_inliers,
+        fitness: 0.0,
+    }
 }
 
 #[cfg(test)]
@@ -428,7 +658,10 @@ mod tests {
         let q = UnitQuaternion::from_euler_angles(0.0, core::f64::consts::FRAC_PI_2, 0.0);
         let t = Isometry3::from_parts(Translation3::identity(), q);
         let tilt = gravity_tilt_deg(&t);
-        assert!((tilt - 90.0).abs() < 1e-6, "y-90° rotation tilt must be 90°, got {tilt}");
+        assert!(
+            (tilt - 90.0).abs() < 1e-6,
+            "y-90° rotation tilt must be 90°, got {tilt}"
+        );
     }
 
     /// H-9：filter_upright 应该丢弃倾斜候选；全不合宜时回退
@@ -455,12 +688,12 @@ mod tests {
     fn h9_wall_subset_keeps_horizontal_normals() {
         use nalgebra::vector;
         let normals = vec![
-            vector![1.0, 0.0, 0.0],    // 墙面 → |n.z|=0 < 0.7 → keep
-            vector![0.0, 1.0, 0.0],    // 墙面 → keep
-            vector![0.0, 0.0, 1.0],    // 天花板 → |n.z|=1 → drop
-            vector![0.0, 0.0, -1.0],   // 地板 → |n.z|=1 → drop
-            vector![0.6, 0.6, 0.6],    // |z|=0.6 < 0.7 → keep（边角墙面）
-            vector![0.5, 0.5, 0.8],    // |z|=0.8 > 0.7 → drop（接近地板）
+            vector![1.0, 0.0, 0.0],  // 墙面 → |n.z|=0 < 0.7 → keep
+            vector![0.0, 1.0, 0.0],  // 墙面 → keep
+            vector![0.0, 0.0, 1.0],  // 天花板 → |n.z|=1 → drop
+            vector![0.0, 0.0, -1.0], // 地板 → |n.z|=1 → drop
+            vector![0.6, 0.6, 0.6],  // |z|=0.6 < 0.7 → keep（边角墙面）
+            vector![0.5, 0.5, 0.8],  // |z|=0.8 > 0.7 → drop（接近地板）
         ];
         let mask = wall_subset_mask(&normals, WALL_NORMAL_Z_MAX);
         assert_eq!(mask, vec![true, true, false, false, true, false]);

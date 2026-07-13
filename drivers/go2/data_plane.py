@@ -2,41 +2,33 @@
 
 平台地图、定位、导航和探索主链由 services.geometry / services.mapping /
 services.localization / services.navigation 承载；本模块只保留 Go2 官方 DDS 输入、
-IMU/点云观测、运动命令和实时避障控制。
+IMU/点云观测与只读 RobotState 服务状态。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import importlib
 import logging
-import os
 from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 import numpy as np
 
 from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
-from contracts.pointcloud import PointCloudFrame, PointField, PointFieldDataType
+from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState
-from core.logging_utils import LogRateLimiter
+from core.logging_utils import SamplingLogFilter as _SamplingLogFilter
 
 if TYPE_CHECKING:
     from drivers.go2.settings import Go2DataPlaneConfig
 
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane")
-
-from core.logging_utils import SamplingLogFilter as _SamplingLogFilter
 LOGGER.addFilter(_SamplingLogFilter(sample_rate=0.01))
-_GO2_INFO_LOG_RATE_LIMIT_SEC = 30.0
-_GO2_MOTION_ERROR_LOG_RATE_LIMIT_SEC = 5.0
-_GO2_OBSTACLE_STATUS_REFRESH_INTERVAL_SEC = 5.0
-_GO2_OBSTACLE_BEST_EFFORT_ERROR_CODES = {3102, 3104}
 
 
 
@@ -82,17 +74,9 @@ def _load_go2_official_sdk_modules(
                 importlib.import_module("unitree_sdk2py.core.channel"),
                 "ChannelFactoryInitialize",
             ),
-            "SportClient": getattr(
-                importlib.import_module("unitree_sdk2py.go2.sport.sport_client"),
-                "SportClient",
-            ),
             "RobotStateClient": getattr(
                 importlib.import_module("unitree_sdk2py.go2.robot_state.robot_state_client"),
                 "RobotStateClient",
-            ),
-            "ObstaclesAvoidClient": getattr(
-                importlib.import_module("unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client"),
-                "ObstaclesAvoidClient",
             ),
         }
         if include_dds_topics:
@@ -546,23 +530,10 @@ class Go2DataPlaneRuntime:
     def __post_init__(self) -> None:
         self.bridge = self.bridge or Go2DirectDdsBridge(self.config)
         self._started = False
-        self._official_sport_client = None
         self._official_robot_state_client = None
-        self._official_obstacles_avoid_client = None
-        self._official_sport_ready = False
         self._official_robot_state_ready = False
-        self._official_obstacles_avoid_ready = False
-        self._official_obstacles_avoid_switch_state: Optional[bool] = None
-        self._official_obstacles_avoid_switch_state_last_attempt_at: Optional[float] = None
-        self._official_obstacles_avoid_switch_state_observed_at: Optional[float] = None
-        self._official_obstacles_avoid_switch_state_error: Optional[str] = None
-        self._official_obstacles_avoid_switch_state_error_code: Optional[int] = None
-        self._official_obstacles_avoid_remote_control = False
-        self._obstacle_avoidance_enabled = bool(self.config.official.obstacle_avoidance_default_enabled)
         self._official_service_states: Dict[str, Dict[str, object]] = {}
         self._startup_diagnostics: List[str] = []
-        self._last_motion_command_route: Optional[str] = None
-        self._info_log_limiter = LogRateLimiter()
 
     def start(self) -> None:
         if not self.config.enabled:
@@ -577,7 +548,6 @@ class Go2DataPlaneRuntime:
     def stop(self) -> None:
         if not self._started:
             return
-        self.stop_motion_command()
         if self.bridge is not None:
             self.bridge.stop()
         self._started = False
@@ -637,73 +607,14 @@ class Go2DataPlaneRuntime:
             return
         self.bridge.unsubscribe_local_point_cloud(callback_id)
 
-    def can_accept_motion_command(self) -> bool:
-        return self._uses_official_backend() and self._official_sport_ready
-
-    def send_motion_command(self, vx: float, vy: float, vyaw: float) -> int:
-        if not self.can_accept_motion_command():
-            raise RuntimeError("当前 Go2 数据面未就绪，不能直接下发运动命令。")
-        return self._send_official_motion_command(vx, vy, vyaw)
-
-    def stop_motion_command(self) -> None:
-        if not self._uses_official_backend():
-            return
-        self._stop_official_motion()
-
-    def is_obstacle_avoidance_control_available(self) -> bool:
-        return self._official_obstacles_avoid_client is not None and self._official_obstacles_avoid_ready
-
-    def set_obstacle_avoidance_enabled(self, enabled: bool) -> Dict[str, Any]:
-        previous_enabled = self._obstacle_avoidance_enabled
-        self._obstacle_avoidance_enabled = bool(enabled)
-        try:
-            self._ensure_official_services_enabled(service_names=("obstacles_avoid",), reason="set_obstacle_avoidance")
-            switch_enabled = self._set_obstacle_avoidance_switch(bool(enabled))
-            if not enabled and self._official_obstacles_avoid_remote_control:
-                self._require_obstacle_avoidance_client().Move(0.0, 0.0, 0.0)
-                self._set_obstacle_avoidance_remote_command(False)
-        except Exception:
-            self._obstacle_avoidance_enabled = previous_enabled
-            raise
-        LOGGER.debug("官方避障已%s。", "启用" if switch_enabled else "禁用")
-        return self.get_obstacle_avoidance_status()
-
-    def is_obstacle_avoidance_enabled(self) -> bool:
-        return self._obstacle_avoidance_enabled
-
-    def get_obstacle_avoidance_status(self) -> Dict[str, Any]:
-        backend_ready = self.is_obstacle_avoidance_control_available()
-        if backend_ready:
-            self._refresh_obstacle_avoidance_switch_state_for_status()
-        switch_enabled = (
-            bool(self._official_obstacles_avoid_switch_state)
-            if self._official_obstacles_avoid_switch_state is not None
-            else False
-        )
-        return {
-            "obstacle_avoidance_enabled": self._obstacle_avoidance_enabled,
-            "default_enabled": bool(getattr(getattr(self.config, "official", None), "obstacle_avoidance_default_enabled", True)),
-            "backend_ready": backend_ready,
-            "switch_enabled": switch_enabled,
-            "switch_state_cached": self._official_obstacles_avoid_switch_state is not None,
-            "switch_state_observed": self._official_obstacles_avoid_switch_state_observed_at is not None,
-            "switch_state_error": self._official_obstacles_avoid_switch_state_error,
-            "switch_state_error_code": self._official_obstacles_avoid_switch_state_error_code,
-            "remote_command_enabled": self._official_obstacles_avoid_remote_control,
-            "control_path": "obstacles_avoid" if backend_ready and self._obstacle_avoidance_enabled else "sport",
-        }
-
     def get_status(self) -> Dict[str, Any]:
         bridge_status = self.bridge.get_status() if self.bridge is not None else {}
         return {
             "started": self._started,
             "enabled": bool(self.config.enabled),
             "official_backend_enabled": self._uses_official_backend(),
-            "official_sport_ready": self._official_sport_ready,
             "official_robot_state_ready": self._official_robot_state_ready,
-            "official_obstacles_avoid_ready": self._official_obstacles_avoid_ready,
             "official_service_states": dict(self._official_service_states),
-            "obstacle_avoidance": self.get_obstacle_avoidance_status(),
             "startup_diagnostics": list(self._startup_diagnostics),
             "bridge": bridge_status,
         }
@@ -734,16 +645,6 @@ class Go2DataPlaneRuntime:
             return
 
         try:
-            self._official_sport_client = modules["SportClient"]()
-            self._official_sport_client.SetTimeout(self.config.official.client_timeout_sec)
-            self._official_sport_client.Init()
-            self._official_sport_ready = True
-        except Exception as exc:
-            message = f"初始化 Go2 官方 sport 客户端失败：{exc}"
-            self._startup_diagnostics.append(message)
-            LOGGER.warning(message)
-
-        try:
             self._official_robot_state_client = modules["RobotStateClient"]()
             self._official_robot_state_client.SetTimeout(self.config.official.client_timeout_sec)
             self._official_robot_state_client.Init()
@@ -753,29 +654,6 @@ class Go2DataPlaneRuntime:
             message = f"初始化 Go2 官方 robot_state 客户端失败：{exc}"
             self._startup_diagnostics.append(message)
             LOGGER.warning(message)
-
-        try:
-            self._official_obstacles_avoid_client = modules["ObstaclesAvoidClient"]()
-            self._official_obstacles_avoid_client.SetTimeout(self.config.official.client_timeout_sec)
-            self._official_obstacles_avoid_client.Init()
-            if hasattr(self._official_obstacles_avoid_client, "GetServerApiVersion"):
-                self._official_obstacles_avoid_client.GetServerApiVersion()
-            self._official_obstacles_avoid_ready = True
-            self._read_obstacle_avoidance_switch_state()
-        except Exception as exc:
-            message = f"初始化 Go2 官方 obstacles_avoid 客户端失败：{exc}"
-            self._startup_diagnostics.append(message)
-            LOGGER.warning(message)
-
-        if self._official_robot_state_ready and self.config.official.auto_start_services:
-            self._ensure_official_services_enabled(service_names=self.config.official.service_names, reason="startup_auto_start")
-        if self._official_obstacles_avoid_ready:
-            try:
-                self.set_obstacle_avoidance_enabled(self._obstacle_avoidance_enabled)
-            except Exception as exc:
-                message = f"同步 Go2 官方避障默认状态失败：{exc}"
-                self._startup_diagnostics.append(message)
-                LOGGER.warning(message)
 
     def _load_official_sdk_modules(self) -> Optional[Dict[str, object]]:
         modules = _load_go2_official_sdk_modules(self.config, include_dds_topics=False)
@@ -802,271 +680,6 @@ class Go2DataPlaneRuntime:
                 "protect": bool(getattr(item, "protect", False)),
             }
         self._official_service_states = service_states
-
-    def _ensure_official_service_enabled(self, service_name: str) -> None:
-        normalized = str(service_name or "").strip()
-        if not normalized or self._official_robot_state_client is None:
-            return
-        try:
-            code = self._official_robot_state_client.ServiceSwitch(normalized, True)
-        except Exception:
-            LOGGER.debug("切换 Go2 官方服务失败 service=%s", normalized, exc_info=True)
-            return
-        if code != 0:
-            message = f"启用 Go2 官方服务失败 service={normalized} code={code}"
-            if code in {3102, 3104}:
-                self._info_log_limiter.log(
-                    LOGGER,
-                    logging.INFO,
-                    "Go2 官方服务当前未就绪，按最佳努力模式继续",
-                    key=("go2_service_best_effort", normalized, code),
-                    interval_sec=_GO2_INFO_LOG_RATE_LIMIT_SEC,
-                    extra={"event": "go2.service.best_effort", "service_name": normalized, "code": code},
-                )
-                return
-            self._startup_diagnostics.append(message)
-            LOGGER.warning(message)
-
-    def _ensure_official_services_enabled(self, *, service_names: Sequence[str], reason: str) -> None:
-        if not self.config.enabled or not self._uses_official_backend():
-            return
-        if not self._official_robot_state_ready or self._official_robot_state_client is None:
-            return
-        normalized_names = tuple(str(item or "").strip() for item in service_names if str(item or "").strip())
-        if not normalized_names:
-            return
-        self._info_log_limiter.log(
-            LOGGER,
-            logging.INFO,
-            "按需检查 Go2 官方服务",
-            key=("go2_service_ensure_batch", reason, normalized_names),
-            interval_sec=_GO2_INFO_LOG_RATE_LIMIT_SEC,
-            extra={"event": "go2.service.ensure", "reason": reason, "services": list(normalized_names)},
-        )
-        self._refresh_official_service_states()
-        for service_name in normalized_names:
-            self._ensure_official_service_enabled(service_name)
-        self._refresh_official_service_states()
-
-    def _require_obstacle_avoidance_client(self):
-        client = self._official_obstacles_avoid_client
-        if client is None or not self._official_obstacles_avoid_ready:
-            raise RuntimeError("Go2 官方 obstacles_avoid 服务未就绪。")
-        return client
-
-    def _read_obstacle_avoidance_switch_state(self) -> bool:
-        client = self._require_obstacle_avoidance_client()
-        now = time.monotonic()
-        self._official_obstacles_avoid_switch_state_last_attempt_at = now
-        code, enabled = client.SwitchGet()
-        if code != 0:
-            self._remember_obstacle_avoidance_switch_state_error(
-                f"读取 Go2 官方 obstacles_avoid 状态失败 code={code}",
-                code=code,
-            )
-            raise RuntimeError(f"读取 Go2 官方 obstacles_avoid 状态失败 code={code}")
-        self._official_obstacles_avoid_switch_state = bool(enabled)
-        self._official_obstacles_avoid_switch_state_observed_at = now
-        self._official_obstacles_avoid_switch_state_error = None
-        self._official_obstacles_avoid_switch_state_error_code = None
-        return bool(enabled)
-
-    def _refresh_obstacle_avoidance_switch_state_for_status(self) -> None:
-        now = time.monotonic()
-        last_attempt_at = self._official_obstacles_avoid_switch_state_last_attempt_at
-        if (
-            last_attempt_at is not None
-            and now - last_attempt_at < _GO2_OBSTACLE_STATUS_REFRESH_INTERVAL_SEC
-        ):
-            return
-        try:
-            self._read_obstacle_avoidance_switch_state()
-        except Exception as exc:
-            if self._official_obstacles_avoid_switch_state_error != str(exc):
-                self._remember_obstacle_avoidance_switch_state_error(
-                    str(exc),
-                    code=self._extract_obstacle_avoidance_error_code(exc),
-                )
-            if self._is_obstacle_avoidance_best_effort_error(exc):
-                self._info_log_limiter.log(
-                    LOGGER,
-                    logging.INFO,
-                    "读取 Go2 官方避障开关状态暂不可用，沿用缓存状态",
-                    key=("go2_obstacles_avoid_status_read_best_effort", str(exc)),
-                    interval_sec=_GO2_INFO_LOG_RATE_LIMIT_SEC,
-                    extra={
-                        "event": "go2.obstacles_avoid.status_read_best_effort",
-                        "error": str(exc),
-                        "error_code": self._official_obstacles_avoid_switch_state_error_code,
-                    },
-                )
-                return
-            self._info_log_limiter.log(
-                LOGGER,
-                logging.WARNING,
-                "读取官方避障开关状态失败: %s",
-                exc,
-                key=("go2_obstacles_avoid_status_read_error", str(exc)),
-                interval_sec=_GO2_INFO_LOG_RATE_LIMIT_SEC,
-                extra={
-                    "event": "go2.obstacles_avoid.status_read_error",
-                    "error": str(exc),
-                    "error_code": self._official_obstacles_avoid_switch_state_error_code,
-                },
-            )
-
-    def _set_obstacle_avoidance_switch(self, enabled: bool) -> bool:
-        client = self._require_obstacle_avoidance_client()
-        code = client.SwitchSet(bool(enabled))
-        if code != 0:
-            self._remember_obstacle_avoidance_switch_state_error(
-                f"切换 Go2 官方 obstacles_avoid 开关失败 code={code}",
-                code=code,
-            )
-            raise RuntimeError(f"切换 Go2 官方 obstacles_avoid 开关失败 code={code}")
-        try:
-            return self._read_obstacle_avoidance_switch_state()
-        except Exception:
-            self._official_obstacles_avoid_switch_state = bool(enabled)
-            return bool(enabled)
-
-    def _set_obstacle_avoidance_remote_command(self, enabled: bool) -> None:
-        if not enabled and not self._official_obstacles_avoid_remote_control:
-            return
-        client = self._require_obstacle_avoidance_client()
-        code = client.UseRemoteCommandFromApi(bool(enabled))
-        if code != 0:
-            raise RuntimeError(f"切换 Go2 官方 obstacles_avoid 远程命令模式失败 code={code}")
-        self._official_obstacles_avoid_remote_control = bool(enabled)
-        LOGGER.debug("Go2 官方避障远程命令模式已%s。", "启用" if enabled else "关闭")
-
-    def _ensure_obstacle_avoidance_active(self) -> bool:
-        if not self._obstacle_avoidance_enabled:
-            return False
-        if not self.is_obstacle_avoidance_control_available():
-            return False
-        try:
-            switch_enabled = self._set_obstacle_avoidance_switch(True)
-            if not switch_enabled:
-                raise RuntimeError("Go2 官方 obstacles_avoid 已请求开启，但返回状态仍为关闭。")
-            if not self._official_obstacles_avoid_remote_control:
-                self._set_obstacle_avoidance_remote_command(True)
-            return True
-        except Exception as exc:
-            if not self._is_obstacle_avoidance_best_effort_error(exc):
-                raise
-            self._official_obstacles_avoid_switch_state = False
-            self._info_log_limiter.log(
-                LOGGER,
-                logging.INFO,
-                "Go2 官方避障当前未就绪，当前帧改走 sport 控制链",
-                key=("go2_obstacles_avoid_best_effort", str(exc)),
-                interval_sec=_GO2_INFO_LOG_RATE_LIMIT_SEC,
-                extra={"event": "go2.obstacles_avoid.best_effort", "error": str(exc)},
-            )
-            try:
-                self._release_obstacle_avoidance_remote_command()
-            except Exception:
-                LOGGER.debug("回收 Go2 官方避障远程命令模式失败。", exc_info=True)
-            return False
-
-    def _is_obstacle_avoidance_best_effort_error(self, error: Exception) -> bool:
-        code = self._extract_obstacle_avoidance_error_code(error)
-        return code in _GO2_OBSTACLE_BEST_EFFORT_ERROR_CODES
-
-    def _extract_obstacle_avoidance_error_code(self, error: Exception) -> Optional[int]:
-        message = str(error)
-        marker = "code="
-        if marker not in message:
-            return None
-        tail = message.split(marker, 1)[1].strip()
-        digits = []
-        for char in tail:
-            if char.isdigit() or (char == "-" and not digits):
-                digits.append(char)
-                continue
-            break
-        if not digits:
-            return None
-        try:
-            return int("".join(digits))
-        except ValueError:
-            return None
-
-    def _remember_obstacle_avoidance_switch_state_error(self, message: str, *, code: object = None) -> None:
-        self._official_obstacles_avoid_switch_state_error = str(message)
-        try:
-            self._official_obstacles_avoid_switch_state_error_code = int(code) if code is not None else None
-        except (TypeError, ValueError):
-            self._official_obstacles_avoid_switch_state_error_code = None
-
-    def _release_obstacle_avoidance_remote_command(self) -> None:
-        if not self._official_obstacles_avoid_remote_control:
-            return
-        if not self.is_obstacle_avoidance_control_available():
-            self._official_obstacles_avoid_remote_control = False
-            return
-        self._set_obstacle_avoidance_remote_command(False)
-
-    def _send_official_motion_command(self, vx: float, vy: float, vyaw: float) -> int:
-        if self._ensure_obstacle_avoidance_active():
-            route = "obstacles_avoid"
-            code = self._require_obstacle_avoidance_client().Move(float(vx), float(vy), float(vyaw))
-            self._log_motion_command_route(route, vx, vy, vyaw, code)
-            return code
-        if self._official_sport_client is None:
-            return -1
-        self._release_obstacle_avoidance_remote_command()
-        route = "sport"
-        code = self._official_sport_client.Move(float(vx), float(vy), float(vyaw))
-        self._log_motion_command_route(route, vx, vy, vyaw, code)
-        return code
-
-    def _log_motion_command_route(self, route: str, vx: float, vy: float, vyaw: float, code: int) -> None:
-        should_log = code != 0 or route != self._last_motion_command_route
-        self._last_motion_command_route = route if code == 0 else None
-        if not should_log:
-            return
-        extra = {
-            "event": "go2.motion.command_route",
-            "route": route,
-            "vx": float(vx),
-            "vy": float(vy),
-            "vyaw": float(vyaw),
-            "code": code,
-            "obstacle_avoidance_enabled": self._obstacle_avoidance_enabled,
-            "remote_command_enabled": self._official_obstacles_avoid_remote_control,
-        }
-        if code != 0:
-            self._info_log_limiter.log(
-                LOGGER,
-                logging.WARNING,
-                "Go2 运动命令下发异常",
-                key=("go2_motion_command_error", route, code),
-                interval_sec=_GO2_MOTION_ERROR_LOG_RATE_LIMIT_SEC,
-                extra=extra,
-            )
-            return
-        LOGGER.debug("Go2 运动命令链路已切换", extra=extra)
-
-    def _stop_official_motion(self) -> None:
-        self._last_motion_command_route = None
-        if self.is_obstacle_avoidance_control_available() and self._official_obstacles_avoid_remote_control:
-            try:
-                self._require_obstacle_avoidance_client().Move(0.0, 0.0, 0.0)
-            except Exception:
-                LOGGER.debug("停止 Go2 官方避障运动失败。", exc_info=True)
-            try:
-                self._release_obstacle_avoidance_remote_command()
-            except Exception:
-                LOGGER.debug("释放 Go2 官方避障远程命令模式失败。", exc_info=True)
-        if self._official_sport_client is None:
-            return
-        try:
-            self._official_sport_client.StopMove()
-        except Exception:
-            LOGGER.debug("停止 Go2 官方运动失败。", exc_info=True)
-
 
 @dataclass
 class Go2DeviceDataPlane:
@@ -1112,18 +725,3 @@ class Go2DeviceDataPlane:
 
     def unsubscribe_local_point_cloud(self, callback_id: Optional[int]) -> None:
         self.runtime.unsubscribe_local_point_cloud(callback_id)
-
-    def can_accept_motion_command(self) -> bool:
-        return self.runtime.can_accept_motion_command()
-
-    def send_motion_command(self, vx: float, vy: float, vyaw: float) -> int:
-        return self.runtime.send_motion_command(vx, vy, vyaw)
-
-    def stop_motion_command(self) -> None:
-        self.runtime.stop_motion_command()
-
-    def is_obstacle_avoidance_control_available(self) -> bool:
-        return self.runtime.is_obstacle_avoidance_control_available()
-
-    def set_obstacle_avoidance_enabled(self, enabled: bool) -> Dict[str, Any]:
-        return self.runtime.set_obstacle_avoidance_enabled(enabled)

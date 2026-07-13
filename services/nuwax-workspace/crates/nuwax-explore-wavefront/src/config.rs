@@ -25,7 +25,7 @@ pub struct WavefrontConfig {
     pub goal_timeout_ms: u64,
     /// 最大连续失败次数
     pub max_consecutive_failures: u32,
-    /// 启用 no-gain 判定前需发布的最小 goal 数(方案 §4.10,替代历史硬编码 5)
+    /// no-gain 检查的历史边界；已探索 goal 数严格大于该值时才启用
     pub min_goals_before_no_gain_check: u32,
 }
 

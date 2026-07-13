@@ -127,8 +127,7 @@ impl VoxelHashMap {
             .collect();
 
         // Step 2：列雕刻 —— 删除同 (ix, iy) 已存在 block
-        let carve_xy: ahash::AHashSet<(i64, i64)> =
-            new_keys.iter().map(|k| (k.ix, k.iy)).collect();
+        let carve_xy: ahash::AHashSet<(i64, i64)> = new_keys.iter().map(|k| (k.ix, k.iy)).collect();
         self.blocks.retain(|k, _| !carve_xy.contains(&(k.ix, k.iy)));
 
         // Step 3：真正 insert 新键（直接走 insert_point 路径，保证 (ix,iy,iz) 落点正确）

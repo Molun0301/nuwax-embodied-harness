@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
-from datetime import datetime, timezone
 import json
+import math
 from typing import Dict, Optional, Any
 
 from fastapi import APIRouter
@@ -15,8 +14,10 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.navigation import NavigationGoal
 from gateways.auth import GatewayAccessManager
-from gateways.errors import AccessDeniedError, as_gateway_error
+from gateways.errors import GatewayError, as_gateway_error
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable
 from gateways.tcp_legacy.policy import build_tcp_legacy_policy
@@ -31,33 +32,172 @@ class CapabilityInvokeRequest(BaseModel):
     arguments: Dict[str, Any] = Field(default_factory=dict, description="调用参数。")
 
 
-class NavigationGoalStub(BaseModel):
-    """导航目标点请求(R-N14 stub)。"""
+class NavigationGoalRequest(BaseModel):
+    """公共导航目标请求。"""
 
     model_config = {"extra": "forbid"}
 
-    goal_id: str = Field(..., description="客户端生成的 goal 标识。")
-    pose: Dict[str, Any] = Field(default_factory=dict, description="stub:简化的位姿字典。")
+    goal_id: str = Field(..., min_length=1, description="客户端生成的 goal 标识。")
+    pose: Dict[str, Any] = Field(default_factory=dict, description="目标位姿字典。")
     frame_id: str = Field(default="map", description="位姿所在的坐标系。")
 
 
-class NavigationState(BaseModel):
-    """导航状态(R-N14 stub)。"""
-
-    model_config = {"extra": "forbid"}
-
-    state: str = Field(default="ACCEPTED", description="ACCEPTED / EXECUTING / SUCCEEDED / CANCELED / FAILED。")
-    goal_id: str = Field(..., description="关联的 goal 标识。")
-    message: str = Field(default="", description="附加状态说明。")
-    timestamp: Optional[str] = Field(default=None, description="状态时间戳 ISO-8601。")
-
-
 class NavigationCancelRequest(BaseModel):
-    """导航取消请求(R-N14 stub)。"""
+    """公共导航取消请求。"""
 
     model_config = {"extra": "forbid"}
 
-    goal_id: str = Field(..., description="待取消的 goal 标识。")
+    goal_id: str = Field(..., min_length=1, description="待取消的 goal 标识。")
+
+
+def _build_navigation_goal(goal: NavigationGoalRequest) -> NavigationGoal:
+    pose_payload = dict(goal.pose or {})
+    if not pose_payload:
+        raise ValueError("pose 不能为空。")
+
+    if "position" in pose_payload or "orientation" in pose_payload:
+        pose_payload.setdefault("frame_id", goal.frame_id)
+        target_pose = Pose.model_validate(pose_payload)
+    else:
+        if "x" not in pose_payload or "y" not in pose_payload:
+            raise ValueError("pose 至少需要 x 和 y。")
+        yaw_rad = float(pose_payload.get("yaw_rad", pose_payload.get("yaw", 0.0)))
+        half_yaw = yaw_rad / 2.0
+        target_pose = Pose(
+            frame_id=goal.frame_id,
+            position=Vector3(
+                x=float(pose_payload["x"]),
+                y=float(pose_payload["y"]),
+                z=float(pose_payload.get("z", 0.0)),
+            ),
+            orientation=Quaternion(z=math.sin(half_yaw), w=math.cos(half_yaw)),
+        )
+
+    return NavigationGoal(
+        goal_id=goal.goal_id,
+        target_pose=target_pose,
+        metadata={"requested_by": "http_api", "source": "api_navigation_goal"},
+    )
+
+
+def _payload_value(payload: Any, key: str, default: Any = None) -> Any:
+    if isinstance(payload, dict):
+        return payload.get(key, default)
+    return getattr(payload, key, default)
+
+
+def _zero_ack_observed(value: Any) -> bool:
+    """Only explicit actuator-zero evidence permits a public cancelled terminal."""
+
+    context_metadata = _payload_value(value, "metadata", {}) or {}
+    navigation_state = _payload_value(value, "navigation_state", value)
+    state_metadata = _payload_value(navigation_state, "metadata", {}) or {}
+    for metadata in (context_metadata, state_metadata):
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("zero_applied") is True:
+            return True
+        ack = metadata.get("actuator_zero_ack")
+        if ack is True:
+            return True
+        if isinstance(ack, dict) and (
+            ack.get("zero_applied") is True or ack.get("zeroed") is True
+        ):
+            return True
+        terminal = metadata.get("nav_terminal") or metadata.get("terminal")
+        if isinstance(terminal, dict) and terminal.get("zero_applied") is True:
+            return True
+    return False
+
+
+def _navigation_state_payload(
+    value: Any,
+    *,
+    fallback_goal_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    stream_payload = _payload_value(value, "payload", value)
+    navigation_state = _payload_value(stream_payload, "navigation_state", stream_payload)
+    current_goal = _payload_value(stream_payload, "current_goal")
+
+    raw_status = _payload_value(
+        navigation_state,
+        "status",
+        _payload_value(navigation_state, "state", "unknown"),
+    )
+    raw_status = str(getattr(raw_status, "value", raw_status) or "unknown").lower()
+    public_state = raw_status.upper()
+    zero_ack_observed = _zero_ack_observed(stream_payload)
+    if raw_status in {"cancelled", "canceled"}:
+        if zero_ack_observed:
+            public_state = "CANCELED"
+        else:
+            public_state = "CANCELLING"
+    message = _payload_value(navigation_state, "message", "") or ""
+    if public_state == "CANCELLING" and not zero_ack_observed:
+        message = "取消请求已下发，正在等待执行器零速确认。"
+
+    state_goal_id = _payload_value(
+        navigation_state,
+        "current_goal_id",
+        _payload_value(navigation_state, "goal_id"),
+    )
+    current_goal_id = _payload_value(current_goal, "goal_id")
+    goal_id = state_goal_id or current_goal_id or fallback_goal_id
+    timestamp = _payload_value(
+        navigation_state,
+        "updated_at",
+        _payload_value(navigation_state, "timestamp"),
+    )
+    return {
+        "state": public_state,
+        "status": public_state.lower(),
+        "goal_id": goal_id,
+        "message": message,
+        "timestamp": to_jsonable(timestamp),
+        "remaining_distance_m": _payload_value(navigation_state, "remaining_distance_m"),
+        "goal_reached": bool(_payload_value(navigation_state, "goal_reached", False)),
+        "backend_name": _payload_value(stream_payload, "backend_name"),
+        "cancel_zero_ack_observed": zero_ack_observed,
+    }
+
+
+def _full_health_payload(summary: Dict[str, Any]) -> Dict[str, Any]:
+    service_health = dict(summary.get("service_health") or {})
+    entries = list(service_health.get("entries") or [])
+    components = {
+        str(entry.get("service_id")): entry
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("service_id")
+    }
+    raw_status = str(service_health.get("status") or "unknown").lower()
+    if raw_status in {"available", "ready", "idle"}:
+        overall = "healthy"
+    elif raw_status in {"degraded", "stale"}:
+        overall = "degraded"
+    elif raw_status in {"missing", "error"}:
+        overall = "unhealthy"
+    else:
+        overall = "unknown"
+
+    return {
+        "overall": overall,
+        "ready": overall == "healthy",
+        "readiness": {
+            "aggregation_version": 1,
+            "authoritative": bool(service_health.get("authoritative", False)),
+            "status": raw_status,
+            "components": components,
+            "metadata": dict(service_health.get("metadata") or {}),
+        },
+        "sensors": {
+            "robot": summary.get("latest_robot_snapshot"),
+            "localization": summary.get("latest_localization"),
+            "map": summary.get("latest_map"),
+            "navigation": summary.get("latest_navigation"),
+        },
+        "aggregation_version": 1,
+        "generated_at_utc": service_health.get("generated_at"),
+    }
 
 
 def _stream_migration_response(*topics: str) -> JSONResponse:
@@ -298,27 +438,14 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/health/full")
     async def api_health_full(request: Request) -> Dict[str, Any]:
-        """聚合 geometry_runtime / nuwax_nav_stack / lcm / connected_channels 分层 readiness。
+        """Return the authoritative runtime service-health aggregation."""
 
-        B-C1 落地:`aggregation_version` 表示 readiness schema 版本(纯整数),
-        任何字段重命名/弃用时 +1;`generated_at_utc` 表达该次聚合时间。
-        返回固定 demo 数据,不依赖 nuwax-geometry-runtime gRPC 客户端。
-        """
         access_manager.authenticate_http(request)
-        return {
-            "geometry_runtime": {"healthy": True, "binary": "nuwax-geometry-runtime"},
-            "lcm_backend": "real-lcm",
-            "connected_channels": [
-                "odom",
-                "tf",
-                "pointcloud",
-                "occupancy",
-                "frontier",
-            ],
-            "nuwax_nav_stack": {"healthy": True},
-            "aggregation_version": 1,
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        }
+        try:
+            summary = await run_in_threadpool(runtime.get_health_summary)
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+        return _full_health_payload(to_jsonable(summary))
 
     @router.get("/api/capabilities")
     async def api_capabilities(
@@ -743,41 +870,69 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
     @router.post("/api/navigation/goal")
-    async def api_navigation_goal(request: Request, goal: NavigationGoalStub) -> Dict[str, Any]:
-        """R-N14 stub:接收 NavigationGoal,立即返回 ACCEPTED 状态。
+    async def api_navigation_goal(request: Request, goal: NavigationGoalRequest) -> Dict[str, Any]:
+        """Submit a goal through the singleton production navigation service."""
 
-        阶段:stub。不调用 nuwax-nav-stack FFI,不订阅 LCM channel。
-        """
         access_manager.authenticate_http(request)
-        return NavigationState(
-            state="ACCEPTED",
-            goal_id=goal.goal_id,
-            message="R-N14 stub:导航目标已接收,等待升级版 FFI 接入。",
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        ).model_dump(mode="json")
+        try:
+            navigation_goal = _build_navigation_goal(goal)
+            context = await run_in_threadpool(
+                lambda: runtime.navigation_service.set_goal(navigation_goal)
+            )
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+        return _navigation_state_payload(context, fallback_goal_id=goal.goal_id)
 
     @router.get("/api/navigation/state")
     async def api_navigation_state(request: Request) -> StreamingResponse:
-        """R-N14 stub SSE:每 1s 推送一帧 ACCEPTED 状态。
-
-        阶段:stub。不订阅 nuwax-nav-stack SubscribeNavigationState。
-        """
-
-        async def _stub_event_generator():
-            while True:
-                if await request.is_disconnected():
-                    break
-                payload = NavigationState(
-                    state="ACCEPTED",
-                    goal_id=uuid.uuid4().hex[:16],
-                    message="R-N14 stub SSE 心跳。",
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                ).model_dump(mode="json")
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(1.0)
+        """Stream authoritative ``navigation.state`` frames over SSE."""
 
         access_manager.authenticate_http(request)
-        return StreamingResponse(_stub_event_generator(), media_type="text/event-stream")
+        try:
+            initial_context = await run_in_threadpool(
+                runtime.navigation_service.refresh_navigation
+            )
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+
+        async def _event_generator():
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=64)
+
+            def _enqueue(frame: Any) -> None:
+                def _push() -> None:
+                    if queue.full():
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    queue.put_nowait(frame)
+
+                loop.call_soon_threadsafe(_push)
+
+            subscription_id = runtime.stream_bus.subscribe(
+                _enqueue,
+                topics=("navigation.state",),
+            )
+            try:
+                payload = _navigation_state_payload(initial_context)
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                keepalive_sec = max(
+                    0.1,
+                    float(getattr(runtime.config.gateway, "sse_keepalive_sec", 15.0)),
+                )
+                while not await request.is_disconnected():
+                    try:
+                        frame = await asyncio.wait_for(queue.get(), timeout=keepalive_sec)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    payload = _navigation_state_payload(frame)
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            finally:
+                runtime.stream_bus.unsubscribe(subscription_id)
+
+        return StreamingResponse(_event_generator(), media_type="text/event-stream")
 
     @router.get("/api/navigation/semantic_context")
     async def api_navigation_semantic_context(request: Request) -> Dict[str, Any]:
@@ -802,17 +957,49 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_navigation_cancel(
         request: Request, body: NavigationCancelRequest
     ) -> Dict[str, Any]:
-        """R-N14 stub:接收 goal_id,立即返回 CANCELED。
+        """Request cancellation without claiming terminal before actuator zero ack."""
 
-        阶段:stub。不调用 nuwax-nav-stack FFI CancelNavigation。
-        """
         access_manager.authenticate_http(request)
-        return {
-            "state": "CANCELED",
-            "goal_id": body.goal_id,
-            "message": "R-N14 stub:导航目标已标记 CANCELED,等待升级版 FFI 接入。",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        try:
+            current_context = await run_in_threadpool(
+                runtime.navigation_service.refresh_navigation
+            )
+            current = _navigation_state_payload(current_context)
+            current_goal_id = current.get("goal_id")
+            if not current_goal_id:
+                raise GatewayError(
+                    "导航后端未提供活动 goal_id，无法安全执行定向取消。",
+                    error_code="navigation_goal_identity_unavailable",
+                    http_status=503,
+                    details={"requested_goal_id": body.goal_id},
+                )
+            if current_goal_id != body.goal_id:
+                raise GatewayError(
+                    "当前活动导航目标与取消请求不匹配。",
+                    error_code="navigation_goal_mismatch",
+                    http_status=409,
+                    details={
+                        "requested_goal_id": body.goal_id,
+                        "active_goal_id": current_goal_id,
+                    },
+                )
+            if str(current.get("status") or "").lower() not in {
+                "accepted",
+                "planning",
+                "running",
+                "cancelling",
+                "cancel_requested",
+            }:
+                raise GatewayError(
+                    "当前没有可取消的活动导航目标。",
+                    error_code="navigation_goal_not_active",
+                    http_status=409,
+                    details={"goal_id": body.goal_id, "state": current.get("state")},
+                )
+            context = await run_in_threadpool(runtime.navigation_service.cancel_goal)
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+        return _navigation_state_payload(context, fallback_goal_id=body.goal_id)
 
     @router.get("/api/memory/summary")
     async def api_memory_summary(request: Request) -> Dict[str, Any]:

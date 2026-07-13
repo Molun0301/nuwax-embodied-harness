@@ -1,43 +1,30 @@
 //! 点云 → 占据栅格
 //!
-//! rework22 P1 #3 修复：替换自创 ray-cast 算法为三套高度分区算法
-//! （HeightCost / General / Simple），对齐 dimos Python
-//! `dimos/mapping/pointcloud_occupancy.py` 三套 kernel 语义。
-//!
-//! 替换要点：
-//! - 旧的 `build()` 走自创 3D ray cast（不与 dimos 对齐）
-//! - 新增 `project_to_occupancy()` 走 `PointCloudOccConfig.algo`
-//!   指定 kernel，按点 z 值（相对 `ground_height_m` / `max_obstacle_height_m` /
-//!   `robot_height_m` / `voxel_size_m`）决策三态（UNKNOWN/FREE/OCCUPIED）
-//! - `PointCloudOccupancyBuilder::build()` 也删除 ray cast 调用，
-//!   只保留"点本身 → height-zone 判定"语义，保证上层 `cost_mapper.rs`
-//!   仍能 compile
+//! The three kernels mirror
+//! `/home/ml/Deeprob/dimos/dimos/mapping/pointclouds/occupancy.py`:
+//! terrain-gradient `HeightCost`, dilated-ground `General`, and rounded-cell
+//! `Simple`. All public entry points dispatch through the same kernels.
 
-use crate::cost_mapper::{PointCloud2Like, SimplePointCloud2};
+use crate::cost_mapper::PointCloud2Like;
 use crate::models::{Costmap, MapMeta};
-use crate::occupancy::types::OccupancyValue;
 use nalgebra::geometry::Translation;
 use nalgebra::{Isometry3, Point3};
-use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 // =====================================================================
 // 三套算法枚举 + 配置（rework22 P1 #3）
 // =====================================================================
 
-/// 点云占据算法选择（对齐 dimos Python `pointcloud_occupancy.py`）
-///
-/// - `HeightCost`：把高度区间解析为 `voxel_size_m` 半格阈值
-///   （默认 kernel，对齐 dimos `height_cost`）
-/// - `General`：粗粒度（仅 ground + max obstacle 两道阈值）
-/// - `Simple`：按 robot_height 切"低/中/高"三段
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Point-cloud occupancy algorithm from the original DimOS registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PointCloudOccAlgo {
-    /// 等价 dimos `height_cost`：每点 z 与 ground/voxel_size 比较细分
+    /// Terrain cost derived from the Sobel magnitude of a smoothed height map.
     HeightCost,
-    /// 等价 dimos `general`：ground / max 两道阈值
+    /// Ground/obstacle projection followed by circular free-space dilation.
     General,
-    /// 等价 dimos `simple`：以 robot_height 为分界
+    /// Two-pass rounded-cell ground/obstacle projection.
     Simple,
 }
 
@@ -48,46 +35,101 @@ impl Default for PointCloudOccAlgo {
     }
 }
 
-/// 点云占据配置（rework22 P1 #3）
-///
-/// 字段：
-/// - `algo` — 算法 kernel
-/// - `ground_height_m` — 地面高度（m），低于此的点视作 UNKNOWN
-/// - `max_obstacle_height_m` — 障碍上限（m），高于此的点视作 OCCUPIED
-/// - `robot_height_m` — 机器人身高（m），`Simple` 算法用
-/// - `voxel_size_m` — 栅格分辨率（m/cell），`HeightCost` 用来做半格阈值
-#[derive(Debug, Clone, Copy)]
+/// Algorithm parameters from the original occupancy config dataclasses.
+/// Resolution and map metadata remain properties of the builder/output grid.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PointCloudOccConfig {
-    /// 算法
+    /// Selected kernel.
     pub algo: PointCloudOccAlgo,
-    /// 地面高度（m）
-    pub ground_height_m: f64,
-    /// 障碍上限（m）
-    pub max_obstacle_height_m: f64,
-    /// 机器人身高（m），仅 `Simple` 使用
-    pub robot_height_m: f64,
-    /// 栅格分辨率（m/cell），仅 `HeightCost` 用作半格阈值
-    pub voxel_size_m: f64,
+    /// Ground points are strictly below this height (`General`/`Simple`).
+    #[serde(rename = "min_height", alias = "min_height_m")]
+    pub min_height_m: f64,
+    /// Obstacle points are at or below this height (`General`/`Simple`).
+    #[serde(rename = "max_height", alias = "max_height_m")]
+    pub max_height_m: f64,
+    /// A vertical gap above this value selects the lower surface (`HeightCost`).
+    #[serde(rename = "can_pass_under", alias = "can_pass_under_m")]
+    pub can_pass_under_m: f64,
+    /// Height change per cell that maps to cost 100 (`HeightCost`).
+    #[serde(rename = "can_climb", alias = "can_climb_m")]
+    pub can_climb_m: f64,
+    /// Height changes below this value are treated as noise (`HeightCost`).
+    #[serde(rename = "ignore_noise", alias = "ignore_noise_m")]
+    pub ignore_noise_m: f64,
+    /// Gaussian sigma in cells; zero disables interpolation (`HeightCost`).
+    #[serde(rename = "smoothing", alias = "smoothing_sigma")]
+    pub smoothing_sigma: f64,
+    /// Circular free-space dilation radius (`General`).
+    #[serde(rename = "mark_free_radius", alias = "mark_free_radius_m")]
+    pub mark_free_radius_m: f64,
+    /// Retained from `SimpleOccupancyConfig`; the original kernel does not use it.
+    pub closing_iterations: u32,
+    /// Retained from `SimpleOccupancyConfig`; the original kernel does not use it.
+    pub closing_connectivity: u8,
 }
 
 impl Default for PointCloudOccConfig {
     fn default() -> Self {
         Self {
             algo: PointCloudOccAlgo::HeightCost,
-            ground_height_m: 0.0,
-            max_obstacle_height_m: 1.5,
-            robot_height_m: 0.5,
-            voxel_size_m: 0.05,
+            min_height_m: 0.1,
+            max_height_m: 2.0,
+            can_pass_under_m: 0.6,
+            can_climb_m: 0.15,
+            ignore_noise_m: 0.05,
+            smoothing_sigma: 1.0,
+            mark_free_radius_m: 0.4,
+            closing_iterations: 1,
+            closing_connectivity: 2,
         }
+    }
+}
+
+impl PointCloudOccConfig {
+    fn validate(&self, resolution: f64) -> Result<(), MappingError> {
+        if !resolution.is_finite() || resolution <= 0.0 {
+            return Err(MappingError::InvalidConfig(
+                "resolution must be finite and positive",
+            ));
+        }
+        let finite = [
+            self.min_height_m,
+            self.max_height_m,
+            self.can_pass_under_m,
+            self.can_climb_m,
+            self.ignore_noise_m,
+            self.smoothing_sigma,
+            self.mark_free_radius_m,
+        ]
+        .into_iter()
+        .all(f64::is_finite);
+        if !finite {
+            return Err(MappingError::InvalidConfig(
+                "occupancy parameters must be finite",
+            ));
+        }
+        if self.max_height_m < self.min_height_m {
+            return Err(MappingError::InvalidConfig(
+                "max_height_m must be at least min_height_m",
+            ));
+        }
+        if self.can_pass_under_m < 0.0
+            || self.can_climb_m <= 0.0
+            || self.ignore_noise_m < 0.0
+            || self.smoothing_sigma < 0.0
+        {
+            return Err(MappingError::InvalidConfig(
+                "height-cost parameters are outside their valid ranges",
+            ));
+        }
+        Ok(())
     }
 }
 
 /// Pointcloud occupancy mapping 错误类型
 #[derive(Debug, Error)]
 pub enum MappingError {
-    /// 算法未实现（占位，未来 P2 ray-tracing dropout 等扩展）
-    #[error("algorithm not implemented: {0}")]
-    AlgoNotImplemented(&'static str),
     /// 配置参数无效
     #[error("invalid config: {0}")]
     InvalidConfig(&'static str),
@@ -122,66 +164,6 @@ pub fn make_costmap2d(width: u32, height: u32, resolution: f64) -> CostMap2D {
 }
 
 // =====================================================================
-// 三套 kernel（纯函数）
-// =====================================================================
-
-/// 高度 → 占据三态（公共判定）
-#[inline]
-fn classify_height(z: f64, cfg: &PointCloudOccConfig) -> OccupancyValue {
-    match cfg.algo {
-        PointCloudOccAlgo::HeightCost => {
-            // 半格阈值：
-            //  z < ground + voxel_size → UNKNOWN
-            //  z > max_obstacle_height → OCCUPIED
-            //  中间 → FREE
-            if z < cfg.ground_height_m + cfg.voxel_size_m {
-                OccupancyValue::Unknown
-            } else if z > cfg.max_obstacle_height_m {
-                OccupancyValue::Occupied
-            } else {
-                OccupancyValue::Free
-            }
-        }
-        PointCloudOccAlgo::General => {
-            // 粗粒度：
-            //  z < ground_height_m → UNKNOWN
-            //  z > max_obstacle_height → OCCUPIED
-            //  中间 → FREE
-            if z < cfg.ground_height_m {
-                OccupancyValue::Unknown
-            } else if z > cfg.max_obstacle_height_m {
-                OccupancyValue::Occupied
-            } else {
-                OccupancyValue::Free
-            }
-        }
-        PointCloudOccAlgo::Simple => {
-            // 机器人身高切三段：
-            //  z > robot_height_m → OCCUPIED
-            //  z < ground_height_m → UNKNOWN
-            //  中间 → FREE
-            if z > cfg.robot_height_m {
-                OccupancyValue::Occupied
-            } else if z < cfg.ground_height_m {
-                OccupancyValue::Unknown
-            } else {
-                OccupancyValue::Free
-            }
-        }
-    }
-}
-
-/// 把占据值映射到 costmap u8（与 nuwax-nav-astar `CostMap2D` 一致）
-#[inline]
-fn occ_to_cost(v: OccupancyValue) -> u8 {
-    match v {
-        OccupancyValue::Free => 0,
-        OccupancyValue::Occupied => 100,
-        OccupancyValue::Unknown => 255,
-    }
-}
-
-// =====================================================================
 // `project_to_occupancy` — 三套算法统一入口
 // =====================================================================
 
@@ -192,13 +174,8 @@ fn occ_to_cost(v: OccupancyValue) -> u8 {
 /// - `grid` — `CostMap2D`（按需 mutate；cell 坐标 < grid 尺寸才会写入）
 /// - `cfg` — 算法 + 阈值配置
 ///
-/// 行为：每个点取其 XY 用 `grid.metadata.origin` 平移到 grid 坐标，
-/// 按 `classify_height(z, cfg)` 决定 FREE/UNKNOWN/OCCUPIED，
-/// 写入对应 cell。**没有 ray-cast**（自创 3D ray cast 已被移除）。
-///
-/// TODO(P2): 完整 ray-tracing dropout（dimos `pointcloud_occupancy.py`
-/// 中每点沿 sensor ray 标记 FREE 的部分）留 P2；当前实现与
-/// `PointCloudOccupancyBuilder::build()` 的"height-only occupied"语义对齐。
+/// The caller owns the fixed grid metadata. Cell generation itself is exactly
+/// the same implementation used by [`PointCloudOccupancyBuilder`].
 pub fn project_to_occupancy<P: PointCloud2Like + ?Sized>(
     cloud: &P,
     grid: &mut CostMap2D,
@@ -212,38 +189,181 @@ pub fn project_to_occupancy<P: PointCloud2Like + ?Sized>(
             "costmap data length does not match metadata",
         ));
     }
+    cfg.validate(grid.metadata.resolution)?;
 
-    let origin = grid.metadata.origin;
-    let res = grid.metadata.resolution;
-    let w = grid.metadata.width;
-    let h = grid.metadata.height;
-
-    for &p in cloud.points() {
-        // 把 world (x, y, z) 通过 origin.isometry 平移到 grid 坐标系。
-        // 这里仅用平移分量（dimos grid origin 默认纯位移）。
-        let wx = origin.translation.x;
-        let wy = origin.translation.y;
-        let col = ((p.x - wx) / res).floor() as i32;
-        let row = ((p.y - wy) / res).floor() as i32;
-        if row < 0 || col < 0 || row >= h as i32 || col >= w as i32 {
-            continue;
-        }
-        let occ = classify_height(p.z, cfg);
-        grid.set(row as u32, col as u32, occ_to_cost(occ));
+    let builder = PointCloudOccupancyBuilder::new(
+        cloud.sensor_origin(),
+        grid.metadata.resolution,
+        grid.metadata.width,
+        grid.metadata.height,
+        (
+            grid.metadata.origin.translation.x,
+            grid.metadata.origin.translation.y,
+        ),
+    );
+    let projected = builder.build_with_config(cloud.points(), cfg);
+    for (target, source) in grid.data.iter_mut().zip(projected.data) {
+        *target = if source < 0 { 255 } else { source as u8 };
     }
 
     Ok(())
 }
 
-// =====================================================================
-// 旧 `PointCloudOccupancyBuilder`（保留 API，移除 ray-cast）
-// =====================================================================
-//
-// cost_mapper.rs 仍依赖此 builder，但旧 ray-cast 已被移除。
-// 现在 `build()` 走与 `project_to_occupancy` 相同的 height-zone 滤波
-// （默认 HeightCost kernel），保留 `OccupancyGrid` 输出形式。
+/// Build an occupancy grid using the original DimOS automatic map bounds.
+///
+/// Finite XYZ points define the XY extent. The function adds 1 m padding on
+/// every side, rounds each dimension up with `ceil`, and propagates the cloud
+/// frame and timestamp into the returned occupancy grid. When no finite point
+/// remains, it returns the original-compatible 1x1 unknown grid.
+///
+/// # Errors
+/// Returns [`MappingError`] for invalid configuration or unrepresentable grid
+/// dimensions.
+pub fn build_occupancy_auto<P: PointCloud2Like + ?Sized>(
+    cloud: &P,
+    resolution: f64,
+    cfg: &PointCloudOccConfig,
+) -> Result<crate::occupancy::types::OccupancyGrid, MappingError> {
+    cfg.validate(resolution)?;
+    let points: Vec<Point3<f64>> = cloud
+        .points()
+        .iter()
+        .copied()
+        .filter(|point| point.x.is_finite() && point.y.is_finite() && point.z.is_finite())
+        .collect();
 
-/// 点云占据栅格构建器（rework22 P1 #3 之后：移除 ray cast）
+    if points.is_empty() {
+        let mut grid = crate::occupancy::types::OccupancyGrid::new(1, 1, resolution);
+        grid.frame_id = cloud.frame_id().to_string();
+        grid.ts = cloud.timestamp();
+        return Ok(grid);
+    }
+
+    let min_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::INFINITY, f64::min);
+    let max_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let origin_x = min_x - 1.0;
+    let origin_y = min_y - 1.0;
+    let padded_max_x = max_x + 1.0;
+    let padded_max_y = max_y + 1.0;
+    let width = auto_grid_dimension(origin_x, padded_max_x, resolution)?;
+    let height = auto_grid_dimension(origin_y, padded_max_y, resolution)?;
+    if u64::from(width) * u64::from(height) > u64::from(u32::MAX) {
+        return Err(MappingError::InvalidConfig(
+            "auto-bounds grid exceeds occupancy storage capacity",
+        ));
+    }
+
+    let builder = PointCloudOccupancyBuilder::new(
+        cloud.sensor_origin(),
+        resolution,
+        width,
+        height,
+        (origin_x, origin_y),
+    );
+    let mut grid = builder.build_with_config(&points, cfg);
+    grid.frame_id = cloud.frame_id().to_string();
+    grid.ts = cloud.timestamp();
+    Ok(grid)
+}
+
+fn auto_grid_dimension(minimum: f64, maximum: f64, resolution: f64) -> Result<u32, MappingError> {
+    let cells = ((maximum - minimum) / resolution).ceil();
+    if !minimum.is_finite()
+        || !maximum.is_finite()
+        || !cells.is_finite()
+        || cells < 1.0
+        || cells > f64::from(u32::MAX)
+    {
+        return Err(MappingError::InvalidConfig(
+            "auto-bounds dimension is not representable",
+        ));
+    }
+    Ok(cells as u32)
+}
+
+fn reflect_index(mut index: i32, length: usize) -> usize {
+    debug_assert!(length > 0);
+    let length = length as i32;
+    while index < 0 || index >= length {
+        index = if index < 0 {
+            -index - 1
+        } else {
+            2 * length - index - 1
+        };
+    }
+    index as usize
+}
+
+fn correlate_axis(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    axis: usize,
+    weights: &[f64],
+) -> Vec<f32> {
+    let radius = (weights.len() / 2) as i32;
+    let mut output = vec![0.0_f32; input.len()];
+    for row in 0..height {
+        for column in 0..width {
+            let mut value = 0.0_f64;
+            for (kernel_index, weight) in weights.iter().enumerate() {
+                let offset = kernel_index as i32 - radius;
+                let (source_row, source_column) = if axis == 0 {
+                    (reflect_index(row as i32 + offset, height), column)
+                } else {
+                    (row, reflect_index(column as i32 + offset, width))
+                };
+                value += f64::from(input[source_row * width + source_column]) * weight;
+            }
+            output[row * width + column] = value as f32;
+        }
+    }
+    output
+}
+
+fn gaussian_filter_reflect(input: &[f32], width: usize, height: usize, sigma: f64) -> Vec<f32> {
+    if sigma <= 1.0e-15 {
+        return input.to_vec();
+    }
+    let radius = (4.0 * sigma + 0.5).floor() as i32;
+    let mut weights: Vec<f64> = (-radius..=radius)
+        .map(|offset| (-(f64::from(offset * offset)) / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let sum: f64 = weights.iter().sum();
+    for weight in &mut weights {
+        *weight /= sum;
+    }
+
+    // scipy.ndimage.gaussian_filter processes axis 0 before axis 1 and
+    // stores each intermediate back into the input dtype (float32 here).
+    let vertical = correlate_axis(input, width, height, 0, &weights);
+    correlate_axis(&vertical, width, height, 1, &weights)
+}
+
+fn sobel_axis(input: &[f32], width: usize, height: usize, axis: usize) -> Vec<f32> {
+    let derivative = correlate_axis(input, width, height, axis, &[-1.0, 0.0, 1.0]);
+    correlate_axis(&derivative, width, height, 1 - axis, &[1.0, 2.0, 1.0])
+}
+
+// =====================================================================
+// `PointCloudOccupancyBuilder`
+// =====================================================================
+
+/// Fixed-metadata adapter around the original DimOS occupancy kernels.
 pub struct PointCloudOccupancyBuilder {
     /// 传感器 origin
     pub sensor_origin: Point3<f64>,
@@ -276,58 +396,233 @@ impl PointCloudOccupancyBuilder {
         }
     }
 
-    /// 并行构建占据栅格（**移除 ray cast**：rework22 P1 #3）
-    ///
-    /// 现在仅做"点本身 → Occupied"语义，遵循默认 `PointCloudOccConfig`
-    /// （`HeightCost` 算法）：低于地面的点视作 UNKNOWN，主体高度内的点
-    /// 视作 OCCUPIED。
-    ///
-    /// 新代码请直接用 [`project_to_occupancy`] + [`PointCloudOccConfig`]。
+    /// Build an occupancy grid with the original default `HeightCost` kernel.
     #[must_use]
     pub fn build(&self, points: &[Point3<f64>]) -> crate::occupancy::types::OccupancyGrid {
-        use crate::occupancy::types::{OccupancyGrid, OccupancyValue};
+        self.build_with_config(points, &PointCloudOccConfig::default())
+    }
 
-        let mut grid = OccupancyGrid::new(self.width, self.height, self.resolution);
-        let cfg = PointCloudOccConfig::default();
+    /// 使用显式算法配置构建固定边界的占据栅格。
+    #[must_use]
+    pub fn build_with_config(
+        &self,
+        points: &[Point3<f64>],
+        cfg: &PointCloudOccConfig,
+    ) -> crate::occupancy::types::OccupancyGrid {
+        match cfg.algo {
+            PointCloudOccAlgo::HeightCost => self.build_height_cost(points, cfg),
+            PointCloudOccAlgo::General => self.build_general(points, cfg),
+            PointCloudOccAlgo::Simple => self.build_simple(points, cfg),
+        }
+    }
 
-        // 阶段 1：按 height-zone 标记（默认 HeightCost）
-        let local_grids: Vec<OccupancyGrid> = points
-            .par_chunks(1024)
-            .map(|chunk| {
-                let mut lg = OccupancyGrid::new(self.width, self.height, self.resolution);
-                for &p in chunk {
-                    if let Some((r, c)) = self.world_to_cell(p) {
-                        let occ = classify_height(p.z, &cfg);
-                        lg.set(r, c, occ);
-                    }
+    fn empty_grid(&self) -> crate::occupancy::types::OccupancyGrid {
+        let mut grid =
+            crate::occupancy::types::OccupancyGrid::new(self.width, self.height, self.resolution);
+        grid.origin = [self.origin_xy.0, self.origin_xy.1, 0.0];
+        grid
+    }
+
+    fn build_general(
+        &self,
+        points: &[Point3<f64>],
+        cfg: &PointCloudOccConfig,
+    ) -> crate::occupancy::types::OccupancyGrid {
+        use crate::occupancy::types::OccupancyValue;
+        let mut grid = self.empty_grid();
+
+        for &point in points {
+            if point.z < cfg.min_height_m {
+                if let Some((row, col)) = self.world_to_cell(point) {
+                    grid.set(row, col, OccupancyValue::Free);
                 }
-                lg
-            })
-            .collect();
-
-        for lg in &local_grids {
-            for r in 0..self.height {
-                for c in 0..self.width {
-                    if let Some(v) = lg.get(r, c) {
-                        if matches!(v, OccupancyValue::Occupied) {
-                            grid.set(r, c, OccupancyValue::Occupied);
-                        }
-                    }
+            }
+        }
+        for &point in points {
+            if point.z >= cfg.min_height_m && point.z <= cfg.max_height_m {
+                if let Some((row, col)) = self.world_to_cell(point) {
+                    grid.set(row, col, OccupancyValue::Occupied);
                 }
             }
         }
 
-        // 阶段 2：ray cast 已删除（rework22 P1 #3）
-        // 见 [`project_to_occupancy`] 注释中 TODO(P2) ray-tracing dropout
-        let _ = self.sensor_origin; // 显式标注保留字段（暂未使用）
+        if cfg.mark_free_radius_m <= 0.0 {
+            return grid;
+        }
+        let free_sources: Vec<(u32, u32)> = (0..self.height)
+            .flat_map(|row| (0..self.width).map(move |col| (row, col)))
+            .filter(|(row, col)| matches!(grid.get(*row, *col), Some(OccupancyValue::Free)))
+            .collect();
+        let radius = (cfg.mark_free_radius_m / self.resolution).ceil() as i32;
+        for (row, col) in free_sources {
+            for dr in -radius..=radius {
+                for dc in -radius..=radius {
+                    if dr * dr + dc * dc > radius * radius {
+                        continue;
+                    }
+                    let nr = row as i32 + dr;
+                    let nc = col as i32 + dc;
+                    if nr < 0 || nc < 0 || nr >= self.height as i32 || nc >= self.width as i32 {
+                        continue;
+                    }
+                    if !matches!(
+                        grid.get(nr as u32, nc as u32),
+                        Some(OccupancyValue::Occupied)
+                    ) {
+                        grid.set(nr as u32, nc as u32, OccupancyValue::Free);
+                    }
+                }
+            }
+        }
+        grid
+    }
 
+    fn build_simple(
+        &self,
+        points: &[Point3<f64>],
+        cfg: &PointCloudOccConfig,
+    ) -> crate::occupancy::types::OccupancyGrid {
+        use crate::occupancy::types::OccupancyValue;
+        let mut grid = self.empty_grid();
+        for &point in points {
+            if point.z < cfg.min_height_m {
+                if let Some((row, col)) = self.world_to_cell_rounded(point) {
+                    grid.set(row, col, OccupancyValue::Free);
+                }
+            }
+        }
+        for &point in points {
+            if point.z >= cfg.min_height_m && point.z <= cfg.max_height_m {
+                if let Some((row, col)) = self.world_to_cell_rounded(point) {
+                    grid.set(row, col, OccupancyValue::Occupied);
+                }
+            }
+        }
+        grid
+    }
+
+    fn build_height_cost(
+        &self,
+        points: &[Point3<f64>],
+        cfg: &PointCloudOccConfig,
+    ) -> crate::occupancy::types::OccupancyGrid {
+        let mut grid = self.empty_grid();
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let len = width * height;
+        let mut min_height = vec![f32::NAN; len];
+        let mut max_height = vec![f32::NAN; len];
+        for &point in points {
+            let Some((row, col)) = self.world_to_cell_rounded(point) else {
+                continue;
+            };
+            let idx = (row * self.width + col) as usize;
+            let point_height = point.z as f32;
+            if min_height[idx].is_nan() || point_height < min_height[idx] {
+                min_height[idx] = point_height;
+            }
+            if max_height[idx].is_nan() || point_height > max_height[idx] {
+                max_height[idx] = point_height;
+            }
+        }
+
+        let mut heights = vec![f32::NAN; len];
+        let mut observed = vec![false; len];
+        for idx in 0..len {
+            if min_height[idx].is_nan() {
+                continue;
+            }
+            heights[idx] = if max_height[idx] - min_height[idx] > cfg.can_pass_under_m as f32 {
+                min_height[idx]
+            } else {
+                max_height[idx]
+            };
+            observed[idx] = true;
+        }
+
+        if cfg.smoothing_sigma > 0.0 && observed.iter().any(|value| *value) {
+            let weights: Vec<f32> = observed
+                .iter()
+                .map(|value| if *value { 1.0 } else { 0.0 })
+                .collect();
+            let height_map_filled: Vec<f32> = heights
+                .iter()
+                .zip(&observed)
+                .map(|(value, is_observed)| if *is_observed { *value } else { 0.0 })
+                .collect();
+            let smoothed_heights =
+                gaussian_filter_reflect(&height_map_filled, width, height, cfg.smoothing_sigma);
+            let smoothed_weights =
+                gaussian_filter_reflect(&weights, width, height, cfg.smoothing_sigma);
+            for idx in 0..len {
+                if !observed[idx] && smoothed_weights[idx] > 0.01 {
+                    heights[idx] = smoothed_heights[idx] / smoothed_weights[idx];
+                    observed[idx] = true;
+                }
+            }
+        }
+
+        if !observed.iter().any(|value| *value) {
+            return grid;
+        }
+        let height_for_gradient: Vec<f32> = heights
+            .iter()
+            .zip(&observed)
+            .map(|(value, is_observed)| if *is_observed { *value } else { 0.0 })
+            .collect();
+        let sobel_x = sobel_axis(&height_for_gradient, width, height, 1);
+        let sobel_y = sobel_axis(&height_for_gradient, width, height, 0);
+        let resolution = self.resolution as f32;
+        let gradient_scale = 8.0 * resolution;
+
+        for row in 1..self.height.saturating_sub(1) {
+            for col in 1..self.width.saturating_sub(1) {
+                let idx = (row * self.width + col) as usize;
+                let valid = [
+                    (row, col),
+                    (row - 1, col),
+                    (row + 1, col),
+                    (row, col - 1),
+                    (row, col + 1),
+                ]
+                .iter()
+                .all(|(r, c)| observed[(*r * self.width + *c) as usize]);
+                if !valid {
+                    continue;
+                }
+                let gradient_x = sobel_x[idx] / gradient_scale;
+                let gradient_y = sobel_y[idx] / gradient_scale;
+                let height_change =
+                    (gradient_x * gradient_x + gradient_y * gradient_y).sqrt() * resolution;
+                let filtered = if height_change < cfg.ignore_noise_m as f32 {
+                    0.0
+                } else {
+                    height_change
+                };
+                let cost = ((filtered / cfg.can_climb_m as f32) * 100.0).clamp(0.0, 100.0) as i8;
+                grid.data[idx] = cost;
+            }
+        }
         grid
     }
 
     /// World → cell (row, col)
     fn world_to_cell(&self, p: Point3<f64>) -> Option<(u32, u32)> {
-        let c = ((p.x - self.origin_xy.0) / self.resolution).floor() as i32;
-        let r = ((p.y - self.origin_xy.1) / self.resolution).floor() as i32;
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let column = ((p.x - self.origin_xy.0) / self.resolution) as i32;
+        let row = ((p.y - self.origin_xy.1) / self.resolution) as i32;
+        Some((
+            row.clamp(0, self.height as i32 - 1) as u32,
+            column.clamp(0, self.width as i32 - 1) as u32,
+        ))
+    }
+
+    fn world_to_cell_rounded(&self, p: Point3<f64>) -> Option<(u32, u32)> {
+        let inverse_resolution = 1.0 / self.resolution;
+        let c = ((p.x - self.origin_xy.0) * inverse_resolution + 0.5) as i32;
+        let r = ((p.y - self.origin_xy.1) * inverse_resolution + 0.5) as i32;
         if r < 0 || c < 0 || r >= self.height as i32 || c >= self.width as i32 {
             return None;
         }
@@ -354,62 +649,6 @@ mod tests {
     }
 
     #[test]
-    fn height_cost_marks_above_ground_as_free() {
-        // z = 0.5m, ground = 0.0, voxel = 0.05 → ground + voxel = 0.05
-        // 0.5 > 0.05 且 0.5 ≤ 1.5 → FREE
-        assert_eq!(
-            classify_height(0.5, &PointCloudOccConfig::default()),
-            OccupancyValue::Free
-        );
-    }
-
-    #[test]
-    fn height_cost_marks_below_ground_as_unknown() {
-        // z = -0.5m, ground = 0.0, voxel = 0.05 → -0.5 < 0.05 → UNKNOWN
-        assert_eq!(
-            classify_height(-0.5, &PointCloudOccConfig::default()),
-            OccupancyValue::Unknown
-        );
-    }
-
-    #[test]
-    fn height_cost_marks_high_as_occupied() {
-        // z = 2.0m, max = 1.5 → 2.0 > 1.5 → OCCUPIED
-        assert_eq!(
-            classify_height(2.0, &PointCloudOccConfig::default()),
-            OccupancyValue::Occupied
-        );
-    }
-
-    #[test]
-    fn general_classifies_three_zones() {
-        let cfg = PointCloudOccConfig {
-            algo: PointCloudOccAlgo::General,
-            ground_height_m: 0.0,
-            max_obstacle_height_m: 1.5,
-            robot_height_m: 0.5,
-            voxel_size_m: 0.05,
-        };
-        assert_eq!(classify_height(-0.5, &cfg), OccupancyValue::Unknown);
-        assert_eq!(classify_height(0.5, &cfg), OccupancyValue::Free);
-        assert_eq!(classify_height(2.0, &cfg), OccupancyValue::Occupied);
-    }
-
-    #[test]
-    fn simple_classifies_three_zones() {
-        let cfg = PointCloudOccConfig {
-            algo: PointCloudOccAlgo::Simple,
-            ground_height_m: 0.0,
-            max_obstacle_height_m: 1.5,
-            robot_height_m: 0.5,
-            voxel_size_m: 0.05,
-        };
-        assert_eq!(classify_height(-0.5, &cfg), OccupancyValue::Unknown);
-        assert_eq!(classify_height(0.3, &cfg), OccupancyValue::Free);
-        assert_eq!(classify_height(0.6, &cfg), OccupancyValue::Occupied);
-    }
-
-    #[test]
     fn small_grid_constructor() {
         let g = small_grid();
         assert_eq!(g.metadata.width, 11);
@@ -417,11 +656,4 @@ mod tests {
         // make_costmap2d 默认全 255（UNKNOWN）
         assert_eq!(g.get(0, 0), Some(255));
     }
-}
-
-// 让 lib.rs 的 `use crate::cost_mapper::SimplePointCloud2` 仍指向此处
-// （防止 dead_code 警告，如果某些路径不直接引用）
-#[allow(dead_code)]
-fn _re_export_simple_point_cloud2() -> SimplePointCloud2 {
-    SimplePointCloud2::new(Vec::new(), Point3::origin())
 }

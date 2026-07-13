@@ -35,19 +35,21 @@ Lifecycle
     * 默认阈值 ``MAX_POINTS_BEFORE_DOWNSAMPLE = 100_000``；
     * 大于阈值时使用 ``points_xyz_array`` 降采样到 ``MAX_POINTS_AFTER_DOWNSAMPLE``；
     * 若 ndarray 不可用，使用 ``points`` 列表并发出 ``downsampled=True`` metadata。
-    * 大 payload 走 SHM ref：当前 gRPC 接口 (PublishPointCloudRequest) 仅接收
-      ``bytes + point_step``；若 ``point_count * point_step`` 超过
+    * ``PublishPointCloudRequest`` 携带规范化 XYZ bytes、字段布局、frame 与时间戳；
+      若 ``point_count * point_step`` 超过
       ``SHM_PAYLOAD_THRESHOLD_BYTES`` (默认 8 MiB)，调用方应在外层把 bytes
       落到 SHM 并以 ref 形式 publish（本桥仅记录意图，不替换上游实现）。
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -65,6 +67,26 @@ SHM_PAYLOAD_THRESHOLD_BYTES = 8 * 1024 * 1024  # 8 MiB
 
 # 默认 frame_id 兜底：odom 维度。真实 frame_id 应来自 provider。
 _DEFAULT_ODOM_FRAME = "odom"
+
+# sensor_msgs/PointField constants for the normalized XYZ float32 payload emitted below.
+_CANONICAL_XYZ_FIELDS = (
+    {"name": "x", "offset": 0, "datatype": 7, "count": 1},
+    {"name": "y", "offset": 4, "datatype": 7, "count": 1},
+    {"name": "z", "offset": 8, "datatype": 7, "count": 1},
+)
+
+
+def _datetime_to_unix_ns(value: datetime) -> int:
+    """Convert a contract timestamp exactly at Python's microsecond precision."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    utc_value = value.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = utc_value - epoch
+    return (
+        (delta.days * 86_400 + delta.seconds) * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
 
 
 @dataclass
@@ -148,21 +170,26 @@ class RuntimeInputBridge:
         与 start() 的硬顺序：必须先连 runtime，再订 provider；否则 callback 内
         publish_odom 会因为 stub 未建立而 silently drop，破坏 readiness 收敛。
         """
-        getter = getattr(self.runtime_provider, "is_connected", None)
-        if not callable(getter):
+        connected_attr = getattr(self.runtime_provider, "is_connected", None)
+        if connected_attr is None:
             self._record_error("runtime_provider.is_connected 不存在")
             with self._lock:
                 self._runtime_unavailable = True
             return False
+
+        def is_connected() -> bool:
+            current = getattr(self.runtime_provider, "is_connected", False)
+            return bool(current() if callable(current) else current)
+
         # 第一次立即检查：connected=True 时不需要任何 sleep。
-        if bool(getter()):
+        if is_connected():
             with self._lock:
                 self._runtime_unavailable = False
             return True
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
         while time.monotonic() < deadline:
             time.sleep(max(0.0, float(poll_interval_sec)))
-            if bool(getter()):
+            if is_connected():
                 with self._lock:
                     self._runtime_unavailable = False
                 return True
@@ -317,21 +344,23 @@ class RuntimeInputBridge:
         qy = float(getattr(orientation, "y", 0.0))
         qz = float(getattr(orientation, "z", 0.0))
         qw = float(getattr(orientation, "w", 1.0))
+        timestamp = getattr(pose, "timestamp", None)
+        timestamp_ns = (
+            _datetime_to_unix_ns(timestamp)
+            if isinstance(timestamp, datetime)
+            else 0
+        )
 
         start = time.monotonic()
         try:
-            success = bool(
-                publisher(
-                    pos_x,
-                    pos_y,
-                    pos_z,
-                    qx,
-                    qy,
-                    qz,
-                    qw,
-                    frame_id=frame_id,
-                )
-            )
+            args = (pos_x, pos_y, pos_z, qx, qy, qz, qw)
+            metadata = {"frame_id": frame_id, "timestamp_ns": timestamp_ns}
+            try:
+                inspect.signature(publisher).bind(*args, **metadata)
+            except (TypeError, ValueError):
+                success = bool(publisher(*args, frame_id=frame_id))
+            else:
+                success = bool(publisher(*args, **metadata))
         except Exception as exc:
             self.counters.dropped_odom_count += 1
             self._record_error(f"publish_odom 抛异常：{exc}")
@@ -385,7 +414,28 @@ class RuntimeInputBridge:
 
         start = time.monotonic()
         try:
-            result = publisher(bytes_payload, point_step)
+            timestamp = getattr(payload, "timestamp", None)
+            timestamp_ns = (
+                _datetime_to_unix_ns(timestamp)
+                if isinstance(timestamp, datetime)
+                else 0
+            )
+            metadata = {
+                "frame_id": str(getattr(payload, "frame_id", "") or "map"),
+                "timestamp_ns": timestamp_ns,
+                "fields": _CANONICAL_XYZ_FIELDS,
+                "point_count": len(bytes_payload) // point_step,
+                "is_dense": bool(getattr(payload, "is_dense", True)),
+            }
+            try:
+                inspect.signature(publisher).bind(bytes_payload, point_step, **metadata)
+            except (TypeError, ValueError):
+                # Compatibility for pre-extension provider implementations. The real
+                # GeometryRuntimeProvider accepts metadata; legacy test/extension
+                # providers still receive the original two positional arguments.
+                result = publisher(bytes_payload, point_step)
+            else:
+                result = publisher(bytes_payload, point_step, **metadata)
         except Exception as exc:
             self.counters.dropped_pointcloud_count += 1
             self._record_error(f"publish_point_cloud 抛异常：{exc}")

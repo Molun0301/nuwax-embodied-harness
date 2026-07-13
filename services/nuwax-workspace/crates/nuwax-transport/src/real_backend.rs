@@ -26,28 +26,25 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::{Stream, StreamExt};
-use nuwax_lcm::{LcmContext, LcmError, LcmSubscription};
+use futures::stream::Stream;
+use nuwax_lcm::{LcmContext, LcmError, LcmReceivedMessage, LcmSubscription};
 use nuwax_protocol::{
     build_lcm_message_bytes, LcmMessageType, LcmTopic, RawLcmFrame, RawLcmFrameBuilder,
 };
-use tokio::sync::Mutex;
 
 use crate::{LcmBackend, LcmFrameStream, TransportError, TransportResult};
 
 /// `real-lcm` backend。
 ///
-/// 内部包一个 `Arc<Mutex<Option<LcmContext>>>`:
-/// - 创建时 `Some(LcmContext)`
-/// - `LcmContext` 在 backend 销毁时 Drop,owner thread 自动退出
-/// - publish/subscribe 调用时拿 mutex 短暂 guard,然后调 `LcmContext::*`
+/// The backend owns one `Arc<LcmContext>` shared by typed transport users and
+/// raw protocols such as LCM RPC. The final `Arc` drop shuts down and joins the
+/// single owner thread.
 pub struct RealLcmBackend {
-    /// liblcm context owner;`None` 等价于 backend 不可用
-    inner: Arc<Mutex<Option<LcmContext>>>,
+    /// Shared process-wide liblcm context owner.
+    context: Arc<LcmContext>,
     /// provider URL(诊断)
     provider_url: Arc<String>,
 }
@@ -66,13 +63,10 @@ impl RealLcmBackend {
     /// 失败时返回 `TransportError::LcmBackend` —— 包含 `LcmError` 详情。
     pub fn new(provider_url: &str) -> TransportResult<Self> {
         let ctx = LcmContext::new(provider_url).map_err(|e| {
-            TransportError::LcmBackend(format!(
-                "LcmContext::new({:?}) 失败: {}",
-                provider_url, e
-            ))
+            TransportError::LcmBackend(format!("LcmContext::new({provider_url:?}) 失败: {e}"))
         })?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(Some(ctx))),
+            context: Arc::new(ctx),
             provider_url: Arc::new(provider_url.to_owned()),
         })
     }
@@ -86,13 +80,7 @@ impl RealLcmBackend {
 #[async_trait]
 impl LcmBackend for RealLcmBackend {
     async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
-        // 1. 拿 mutex guard(短)
-        let guard = self.inner.lock().await;
-        let ctx = guard.as_ref().ok_or_else(|| {
-            TransportError::LcmBackend("real-lcm backend 已 drop / 无效".into())
-        })?;
-
-        // 2. 包装成 `LcmMessageBytes`(Phase 2 lane-2 强类型合约)。
+        // 1. 包装成 `LcmMessageBytes`(Phase 2 lane-2 强类型合约)。
         //    `build_lcm_message_bytes` 用 STRUCT_SEEDS 计算 upstream lcm-gen 兼容
         //    fingerprint;它**不**拼装 envelope —— envelope 由 liblcm 自己
         //    在 wire 上加。seqno 由 caller 在 builder 上设定,这里直接透传。
@@ -108,53 +96,51 @@ impl LcmBackend for RealLcmBackend {
             &frame.payload,
             u64::from(frame.header.seqno),
         )
-        .map_err(|e| TransportError::Protocol(nuwax_protocol::ProtocolError::LcmEncode(e.to_string())))?;
+        .map_err(|e| {
+            TransportError::Protocol(nuwax_protocol::ProtocolError::LcmEncode(e.to_string()))
+        })?;
 
-        // 3. 通过 owner thread 调 liblcm `lcm_publish(channel, payload_bytes)`。
+        // 2. 通过 owner thread 调 liblcm `lcm_publish(channel, payload_bytes)`。
         //    liblcm 会在 wire 上**自己**加 8 字节 preamble(magic BE 4 + seqno BE 4)
         //    —— 2026-07-09 B3 修正后,real LCM wire format 不再是 28 字节 envelope。
         //    所以我们只能传 **payload 部分** —— 也就是 `LcmMessageBytes::as_slice()`。
         //    绝对不能传 `frame.encode()` 的产物,否则 liblcm 会再叠一层 envelope,
         //    receiver 端 callback 拿到 N+8+N+8 字节垃圾(§12.2 第 2 项硬约束)。
         let wire_payload: &[u8] = msg_bytes.as_slice();
-        ctx.publish(frame.topic.channel(), Bytes::copy_from_slice(wire_payload))
+        let typed_channel = frame.topic.fqn(frame.msg_type.fqn());
+        self.context
+            .publish(&typed_channel, Bytes::copy_from_slice(wire_payload))
             .await
-            .map_err(|e| TransportError::LcmBackend(format!("lcm_publish 失败: {}", e)))?;
+            .map_err(|e| TransportError::LcmBackend(format!("lcm_publish 失败: {e}")))?;
         Ok(())
     }
 
-    async fn subscribe(
-        &self,
-        topic: LcmTopic,
-        msg_type: Option<LcmMessageType>,
-    ) -> LcmFrameStream {
-        let guard = self.inner.lock().await;
-        let ctx = match guard.as_ref() {
-            Some(c) => c,
-            None => {
-                let err = TransportError::LcmBackend("real-lcm backend 已 drop".into());
-                return subscription_error_stream(err);
-            }
-        };
-        let sub_result: Result<LcmSubscription, LcmError> = ctx.subscribe(topic.channel()).await;
-        drop(guard); // 释放 lock,让后续 .recv() 不抱 lock
+    async fn subscribe(&self, topic: LcmTopic, msg_type: Option<LcmMessageType>) -> LcmFrameStream {
+        let subscription_pattern = msg_type
+            .as_ref()
+            .map_or_else(|| topic.channel().to_owned(), |kind| topic.fqn(kind.fqn()));
+        let sub_result: Result<LcmSubscription, LcmError> =
+            self.context.subscribe(&subscription_pattern).await;
         let sub = match sub_result {
             Ok(s) => s,
             Err(e) => {
-                let err = TransportError::LcmBackend(format!("subscribe 失败: {}", e));
+                let err = TransportError::LcmBackend(format!("subscribe 失败: {e}"));
                 return subscription_error_stream(err);
             }
         };
 
         // typed suffix 过滤:用 caller 提供的 msg_type.fqn() 过滤 callback payload
-        let msg_type_filter = msg_type.map(|m| m.fqn().to_owned());
         let topic_clone = topic.clone();
-        let s = subscription_to_stream(sub, msg_type_filter, topic_clone);
+        let s = subscription_to_stream(sub, msg_type, topic_clone);
         Box::pin(s)
     }
 
     fn name(&self) -> &str {
         "real-lcm"
+    }
+
+    fn shared_lcm_context(&self) -> Option<Arc<LcmContext>> {
+        Some(Arc::clone(&self.context))
     }
 }
 
@@ -172,8 +158,8 @@ fn subscription_error_stream(err: TransportError) -> LcmFrameStream {
 /// magic + fingerprint + seqno + payload_len),所以我们这里直接用
 /// payload bytes + caller 提供的 topic / msg_type 构造 `RawLcmFrame`。
 fn subscription_to_stream(
-    mut sub: LcmSubscription,
-    msg_type_filter: Option<String>,
+    sub: LcmSubscription,
+    msg_type_filter: Option<LcmMessageType>,
     topic_for_fallback: LcmTopic,
 ) -> Pin<Box<dyn Stream<Item = TransportResult<RawLcmFrame>> + Send + Unpin>> {
     // 我们把 receiver 留在原位置,通过 `&mut sub` 在 poll 中访问;
@@ -209,29 +195,13 @@ fn subscription_to_stream(
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             return None;
                         }
-                        Ok(payload) => {
-                            // typed suffix 过滤(2026-07-11 rework22 P0-02 修正):
-                            // 旧代码 `want != &fqn` 是错的 —— `fqn` 是从 `want`
-                            // 派生出来的同一个字符串,恒等恒真,过滤实际失效。
-                            // 新语义(对齐 Python `lcmpubsub.py:36-72`):
-                            // - `msg_type_filter` 提供 -> caller 期望的 FQN;
-                            // - 没提供 -> fallback `unknown/Unknown` 兜底;
-                            // - 不再比 typed suffix,只比 msg_type FQN
-                            //   (channel 部分由 LcmTopic 在更上层保证)。
-                            let fqn = msg_type_filter
-                                .clone()
-                                .unwrap_or_else(|| "unknown/Unknown".into());
-                            let msg_type = match LcmMessageType::new(&fqn) {
-                                Ok(m) => m,
-                                Err(_) => continue, // 不应发生
-                            };
-                            let frame = RawLcmFrameBuilder::new(
-                                topic_for_fallback.clone(),
-                                msg_type,
-                            )
-                            .payload(payload.to_vec())
-                            .build();
-                            return Some((Ok(frame), (sub, msg_type_filter, topic_for_fallback)));
+                        Ok(message) => {
+                            let result = decode_subscription_message(
+                                message,
+                                &topic_for_fallback,
+                                msg_type_filter.as_ref(),
+                            );
+                            return Some((result, (sub, msg_type_filter, topic_for_fallback)));
                         }
                     }
                 }
@@ -239,6 +209,79 @@ fn subscription_to_stream(
         },
     );
     Box::pin(stream)
+}
+
+fn decode_subscription_message(
+    message: LcmReceivedMessage,
+    expected_topic: &LcmTopic,
+    expected_type: Option<&LcmMessageType>,
+) -> TransportResult<RawLcmFrame> {
+    let (actual_topic, actual_suffix) = LcmTopic::parse_subscription_pattern(&message.channel)
+        .map_err(|e| TransportError::Topic(format!("invalid callback channel: {e}")))?;
+    if actual_topic != *expected_topic {
+        return Err(TransportError::Topic(format!(
+            "callback channel mismatch: got {}, expected {}",
+            actual_topic.channel(),
+            expected_topic.channel()
+        )));
+    }
+
+    let actual_type = actual_suffix
+        .as_deref()
+        .map(LcmMessageType::new)
+        .transpose()
+        .map_err(|e| TransportError::MessageType(e.to_string()))?;
+    let message_type = match (expected_type, actual_type) {
+        (Some(expected), Some(actual)) if expected == &actual => expected.clone(),
+        (Some(expected), Some(actual)) => {
+            return Err(TransportError::MessageType(format!(
+                "callback type mismatch: got {}, expected {}",
+                actual.fqn(),
+                expected.fqn()
+            )));
+        }
+        (Some(expected), None) => {
+            return Err(TransportError::MessageType(format!(
+                "typed subscription {} received untyped channel {}",
+                expected.fqn(),
+                message.channel
+            )));
+        }
+        (None, Some(actual)) => actual,
+        (None, None) => LcmMessageType::new("unknown.Unknown")
+            .expect("static fallback message type must be valid"),
+    };
+
+    if message.payload.len() < 8 {
+        return Err(TransportError::Protocol(
+            nuwax_protocol::ProtocolError::Incomplete {
+                need: 8,
+                got: message.payload.len(),
+            },
+        ));
+    }
+    let expected_fingerprint = message_type.fingerprint();
+    if expected_fingerprint == [0; 8] {
+        return Err(TransportError::MessageType(format!(
+            "no locked LCM schema fingerprint for {}",
+            message_type.fqn()
+        )));
+    }
+    if message.payload[..8] != expected_fingerprint {
+        return Err(TransportError::Protocol(
+            nuwax_protocol::ProtocolError::LcmDecode(format!(
+                "fingerprint mismatch on {} for {}",
+                message.channel,
+                message_type.fqn()
+            )),
+        ));
+    }
+
+    Ok(
+        RawLcmFrameBuilder::new(expected_topic.clone(), message_type)
+            .payload(message.payload[8..].to_vec())
+            .build(),
+    )
 }
 
 // =============================================================================
@@ -284,11 +327,6 @@ mod tests {
         });
     }
 
-    #[allow(dead_code)]
-    fn _suppress_unused_waker(_cx: &mut Context<'_>) -> Poll<()> {
-        Poll::Ready(())
-    }
-
     // -----------------------------------------------------------------
     // codex rework-1 (2026-07-07): 验证 real_backend publish 路径产出的
     // wire payload **不**含 envelope(避免 §12.2 第 2 项 double-framing
@@ -300,7 +338,7 @@ mod tests {
     // backend publish 路径仍只送 payload 部分(double-framing 硬约束不变)。
     // -----------------------------------------------------------------
     #[test]
-    fn real_backend_publish_payload_strips_envelope() {
+    fn real_backend_publish_payload_contains_schema_fingerprint_without_transport_envelope() {
         use nuwax_protocol::{LcmFrameHeader, LcmMessageType, LcmTopic, RawLcmFrameBuilder};
 
         // 准备一个真实 frame(走 RawLcmFrameBuilder,seqno=42)
@@ -327,16 +365,17 @@ mod tests {
 
         let wire_payload = msg_bytes.as_slice();
 
-        // 断言 1:lcm_publish 收到的 bytes 长度 == payload 长度,不带 envelope。
-        // 这是 §12.2 第 2 项硬约束的直接证明 —— 没 envelope,就没 double-framing。
+        // lcm_publish receives the generated fingerprint and body, but not the
+        // LC02 transport preamble (liblcm adds that itself).
         assert_eq!(
             wire_payload.len(),
-            user_payload.len(),
-            "real backend lcm_publish payload 长度不应增加 envelope;got len={}, expect={}",
+            8 + user_payload.len(),
+            "real backend lcm_publish payload must be fingerprint + body; got len={}, expect={}",
             wire_payload.len(),
-            user_payload.len(),
+            8 + user_payload.len(),
         );
-        assert_eq!(wire_payload, user_payload.as_slice());
+        assert_eq!(&wire_payload[..8], &msg_bytes.fingerprint);
+        assert_eq!(&wire_payload[8..], user_payload.as_slice());
 
         // 断言 2:对比例,RawLcmFrame::encode() 仍产出 preamble+payload(2026-07-09
         // B3 修正后是 8 字节 preamble + payload)。这是验证我们**没有**误用
@@ -352,8 +391,53 @@ mod tests {
             8,
             "preamble 必须为 8 字节(B3 修正:由 28 字节缩为 8 字节)"
         );
-        // 真正的 wire bytes 是 header(28) + payload —— 不应被 real backend 使用。
-        // 反向验证:如果 real backend 误用 frame.encode(),wire_payload.len()
-        // 会等于 encoded.len() = 28+payload,上面的断言 1 必失败。
+        assert_ne!(wire_payload, encoded.as_slice());
+    }
+
+    #[test]
+    fn callback_validation_uses_actual_dot_typed_channel_and_fingerprint() {
+        let topic = LcmTopic::new("/pose").unwrap();
+        let msg_type = LcmMessageType::new("geometry_msgs/PoseStamped").unwrap();
+        let mut encoded = msg_type.fingerprint().to_vec();
+        encoded.extend_from_slice(b"generated-body");
+        let frame = decode_subscription_message(
+            LcmReceivedMessage {
+                channel: "/pose#geometry_msgs.PoseStamped".into(),
+                payload: Bytes::from(encoded),
+            },
+            &topic,
+            Some(&msg_type),
+        )
+        .unwrap();
+        assert_eq!(frame.msg_type.fqn(), "geometry_msgs.PoseStamped");
+        assert_eq!(frame.payload, b"generated-body");
+    }
+
+    #[test]
+    fn callback_validation_rejects_actual_type_or_fingerprint_mismatch() {
+        let topic = LcmTopic::new("/pose").unwrap();
+        let msg_type = LcmMessageType::new("geometry_msgs.PoseStamped").unwrap();
+        let wrong_type = decode_subscription_message(
+            LcmReceivedMessage {
+                channel: "/pose#nav_msgs.Odometry".into(),
+                payload: Bytes::from_static(&[0; 8]),
+            },
+            &topic,
+            Some(&msg_type),
+        );
+        assert!(matches!(wrong_type, Err(TransportError::MessageType(_))));
+
+        let wrong_fingerprint = decode_subscription_message(
+            LcmReceivedMessage {
+                channel: "/pose#geometry_msgs.PoseStamped".into(),
+                payload: Bytes::from_static(&[0; 8]),
+            },
+            &topic,
+            Some(&msg_type),
+        );
+        assert!(matches!(
+            wrong_fingerprint,
+            Err(TransportError::Protocol(_))
+        ));
     }
 }

@@ -16,9 +16,9 @@
 //!
 //! `LcmContext` 不是 `Clone`。每个进程持**一个**实例(`Arc` 在外层如需共享),
 //! Drop 时:
-/*! 1. 推送 `Command::Shutdown` 进 owner mpsc
-   2. owner thread 在下个 50 ms tick 收到 → 调 `lcm_destroy` → 退出
-   3. std::thread 不 join(daemon thread 自然结束)
+/*! 1. 通过无界 control channel 推送 `Command::Shutdown`
+   2. owner thread 调 `lcm_destroy` 并释放 callback storage
+   3. 析构方 join owner thread，确保进程内不残留 LCM 生命周期
 */
 //!
 //! ## 2026-07-08 fake-lcm 根除(v3 F2 决策)
@@ -37,18 +37,27 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use bytes::Bytes;
 use nuwax_lcm_sys::{
-    lcm_create, lcm_destroy, lcm_get_fileno, lcm_handle_timeout,
-    lcm_publish, lcm_recv_buf_t, lcm_subscribe, lcm_subscription_t, lcm_unsubscribe,
-    lcm_t, to_cstring,
+    lcm_create, lcm_destroy, lcm_get_fileno, lcm_handle_timeout, lcm_publish, lcm_recv_buf_t,
+    lcm_subscribe, lcm_subscription_set_queue_capacity, lcm_subscription_t, lcm_t, lcm_unsubscribe,
+    to_cstring,
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
+
+/// Capacity used by the caller-to-owner command queue.
+pub const LCM_COMMAND_QUEUE_CAPACITY: usize = 10_000;
+/// Capacity used by both liblcm and the Rust subscription broadcast queue.
+pub const LCM_SUBSCRIPTION_QUEUE_CAPACITY: usize = 10_000;
+
+const MAX_COMMANDS_PER_TICK: usize = 64;
+const MAX_RECEIVES_PER_TICK: usize = 64;
+const IDLE_HANDLE_TIMEOUT_MS: i32 = 50;
 
 // =============================================================================
 // 错误类型
@@ -76,6 +85,12 @@ pub enum LcmError {
     /// subscribe 失败
     #[error("lcm_subscribe 失败 (channel={channel})")]
     Subscribe {
+        /// 出错的 channel 名
+        channel: String,
+    },
+    /// unsubscribe 失败
+    #[error("lcm_unsubscribe 失败 (channel={channel})")]
+    Unsubscribe {
         /// 出错的 channel 名
         channel: String,
     },
@@ -108,10 +123,21 @@ pub enum LcmError {
 /// `LcmContext::subscribe` 多次注册同一 channel(每条通道独立 receiver,
 /// 但都共享同一 liblcm subscription —— liblcm 内部按 channel 名去重)。
 pub struct LcmSubscription {
+    subscription_id: Option<u64>,
     /// channel 名(用作 unsubscribe key)
     pub channel: Arc<CString>,
     /// broadcast receiver
-    pub receiver: broadcast::Receiver<Bytes>,
+    pub receiver: broadcast::Receiver<LcmReceivedMessage>,
+    control_tx: std::sync::mpsc::Sender<Command>,
+}
+
+/// Message delivered by liblcm, including the actual callback channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LcmReceivedMessage {
+    /// Actual channel passed to the C callback.
+    pub channel: String,
+    /// Complete generated LCM message bytes.
+    pub payload: Bytes,
 }
 
 impl std::fmt::Debug for LcmSubscription {
@@ -119,6 +145,38 @@ impl std::fmt::Debug for LcmSubscription {
         f.debug_struct("LcmSubscription")
             .field("channel", &self.channel.to_string_lossy().into_owned())
             .finish_non_exhaustive()
+    }
+}
+
+impl LcmSubscription {
+    /// Explicitly unsubscribe and wait until the owner has called `lcm_unsubscribe`.
+    pub async fn unsubscribe(&mut self) -> Result<(), LcmError> {
+        let Some(subscription_id) = self.subscription_id.take() else {
+            return Ok(());
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.control_tx
+            .send(Command::Unsubscribe {
+                subscription_id,
+                reply: Some(reply_tx),
+            })
+            .map_err(|error| LcmError::OwnerThreadDown {
+                detail: error.to_string(),
+            })?;
+        reply_rx.await.map_err(|error| LcmError::OwnerThreadDown {
+            detail: error.to_string(),
+        })?
+    }
+}
+
+impl Drop for LcmSubscription {
+    fn drop(&mut self) {
+        if let Some(subscription_id) = self.subscription_id.take() {
+            let _ = self.control_tx.send(Command::Unsubscribe {
+                subscription_id,
+                reply: None,
+            });
+        }
     }
 }
 
@@ -144,17 +202,29 @@ enum Command {
         /// 回调形式 channel 名(通常等于 channel;typed suffix 由 `LcmSubscription` 自行记)
         pattern: CString,
         /// reply:成功 / 失败 via oneshot
-        reply: std::sync::mpsc::SyncSender<Result<(), LcmError>>,
+        reply: oneshot::Sender<Result<u64, LcmError>>,
         /// 注册后用于后续 push bytes 的 broadcast sender
-        sender: broadcast::Sender<Bytes>,
+        sender: broadcast::Sender<LcmReceivedMessage>,
     },
     /// 取消订阅
     Unsubscribe {
-        /// channel
+        /// Owner-local subscription identifier.
+        subscription_id: u64,
+        /// Optional processing acknowledgement.
+        reply: Option<oneshot::Sender<Result<(), LcmError>>>,
+    },
+    /// Cancel every subscription registered for one channel.
+    UnsubscribeChannel {
+        /// Channel.
         channel: CString,
+        /// Processing acknowledgement.
+        reply: oneshot::Sender<Result<(), LcmError>>,
     },
     /// 关闭 owner thread
-    Shutdown,
+    Shutdown {
+        /// Optional completion acknowledgement used by explicit shutdown.
+        reply: Option<oneshot::Sender<()>>,
+    },
 }
 
 // =============================================================================
@@ -170,6 +240,8 @@ enum Command {
 struct OwnerThread {
     lcm: *mut lcm_t,
     cmd_rx: mpsc::Receiver<Command>,
+    /// Non-droppable lifecycle/control commands, independent of publish backpressure.
+    control_rx: std::sync::mpsc::Receiver<Command>,
     /// 已注册的 subscription:`channel CString → SubscriptionHandle`
     ///
     /// 2026-07-09 B2 修复后,`lcm_subscribe` 返回 `*mut lcm_subscription_t`
@@ -180,13 +252,16 @@ struct OwnerThread {
     /// 内含 broadcast sender + alive flag。callback 期间 `(*entry).alive`
     /// 决定是否真把 bytes 推到 sender;`unsubscribe`/`run` 收尾时先
     /// 设 false、调用 `lcm_unsubscribe`、再 `Box::from_raw` 释放。
-    subscriptions: HashMap<CString, SubscriptionHandle>,
+    subscriptions: HashMap<u64, SubscriptionHandle>,
+    next_subscription_id: u64,
+    retired_entries: Vec<*mut SubscriptionEntry>,
 }
 
 /// SubscriptionHandle —— owner thread 内部:`sub` 是 liblcm handle;
 /// `entry` 是 leaked `Box<SubscriptionEntry>`,由 callback 通过 user_data
 /// 取回。`unsubscribe` / `run` 收尾统一释放。
 struct SubscriptionHandle {
+    channel: CString,
     sub: *mut lcm_subscription_t,
     entry: *mut SubscriptionEntry,
 }
@@ -198,7 +273,7 @@ struct SubscriptionHandle {
 ///   acquire-load,看到 false 直接 return(防 use-after-free:
 ///   unsubscribe 后 liblcm 仍可能在超时窗口里再投一次)
 struct SubscriptionEntry {
-    sender: broadcast::Sender<Bytes>,
+    sender: broadcast::Sender<LcmReceivedMessage>,
     alive: AtomicBool,
 }
 
@@ -223,8 +298,8 @@ impl OwnerThread {
         &mut self,
         channel: CString,
         pattern: CString,
-        sender: broadcast::Sender<Bytes>,
-    ) -> Result<(), LcmError> {
+        sender: broadcast::Sender<LcmReceivedMessage>,
+    ) -> Result<u64, LcmError> {
         let chan_str = channel.to_string_lossy().into_owned();
         // rework22 P0-01:把 sender 装进 leaked `SubscriptionEntry`,
         // callback 通过 user_data 取 `&(*entry).sender` 的引用
@@ -252,12 +327,34 @@ impl OwnerThread {
             let _ = unsafe { Box::from_raw(entry_ptr) };
             return Err(LcmError::Subscribe { channel: chan_str });
         }
-        self.subscriptions
-            .insert(channel, SubscriptionHandle { sub, entry: entry_ptr });
-        Ok(())
+        let capacity_rc = unsafe {
+            lcm_subscription_set_queue_capacity(sub, LCM_SUBSCRIPTION_QUEUE_CAPACITY as i32)
+        };
+        if capacity_rc != 0 {
+            unsafe { (*entry_ptr).alive.store(false, Ordering::Release) };
+            let unsubscribe_rc = unsafe { lcm_unsubscribe(self.lcm, sub) };
+            if unsubscribe_rc == 0 {
+                unsafe { drop(Box::from_raw(entry_ptr)) };
+            } else {
+                self.retired_entries.push(entry_ptr);
+            }
+            return Err(LcmError::Subscribe { channel: chan_str });
+        }
+
+        let subscription_id = self.next_subscription_id;
+        self.next_subscription_id = self.next_subscription_id.wrapping_add(1);
+        self.subscriptions.insert(
+            subscription_id,
+            SubscriptionHandle {
+                channel,
+                sub,
+                entry: entry_ptr,
+            },
+        );
+        Ok(subscription_id)
     }
 
-    fn unsubscribe(&mut self, channel: &CString) {
+    fn unsubscribe(&mut self, subscription_id: u64) -> Result<(), LcmError> {
         // 2026-07-09 B2 修复:从 subscriptions 取 sub handle 调 liblcm
         // (原先错用 channel 字符串 — liblcm 1.x 的 lcm_unsubscribe 不接受
         //  channel 字符串,会直接返回错误或 UB)。
@@ -265,27 +362,47 @@ impl OwnerThread {
         // 2026-07-11 rework22 P0-01:先设 `entry.alive = false`,这样
         // 接下来 unsubscribed 的 sub 在 race window 内被 liblcm 二次投
         // 也不会再 push bytes 走 dangling sender。
-        let handle = match self.subscriptions.remove(channel) {
+        let handle = match self.subscriptions.remove(&subscription_id) {
             Some(h) => h,
             None => {
                 warn!(
-                    "lcm_unsubscribe: 未找到 channel={} 的 subscription handle",
-                    channel.to_string_lossy()
+                    "lcm_unsubscribe: 未找到 id={} 的 subscription handle",
+                    subscription_id
                 );
-                return;
+                return Ok(());
             }
         };
         unsafe { (*handle.entry).alive.store(false, Ordering::Release) };
         let rc = unsafe { lcm_unsubscribe(self.lcm, handle.sub) };
         if rc != 0 {
-            warn!(
-                "lcm_unsubscribe 返回非 0 (channel={})",
-                channel.to_string_lossy()
-            );
+            let channel = handle.channel.to_string_lossy().into_owned();
+            self.retired_entries.push(handle.entry);
+            return Err(LcmError::Unsubscribe { channel });
         }
-        // 释放 leaked entry(注:即使 `unsubscribe` 返回非 0 也要 release,
-        // 否则 HashMap remove 之后我们不再持有该指针,泄漏)
+        // liblcm guarantees that, after a successful `lcm_unsubscribe`, the
+        // handler is no longer valid and will not be invoked again. Since all
+        // calls are serialized on this owner thread, callback userdata can be
+        // reclaimed here instead of growing until context shutdown.
         unsafe { drop(Box::from_raw(handle.entry)) };
+        Ok(())
+    }
+
+    fn unsubscribe_channel(&mut self, channel: &CString) -> Result<(), LcmError> {
+        let ids: Vec<u64> = self
+            .subscriptions
+            .iter()
+            .filter_map(|(id, handle)| (handle.channel == *channel).then_some(*id))
+            .collect();
+        let mut first_error = None;
+        for id in ids {
+            if let Err(error) = self.unsubscribe(id) {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn publish(&self, channel: &CString, payload: &Bytes) -> Result<(), LcmError> {
@@ -305,6 +422,49 @@ impl OwnerThread {
         Ok(())
     }
 
+    fn handle_command(&mut self, command: Command) -> (bool, Option<oneshot::Sender<()>>) {
+        match command {
+            Command::Shutdown { reply } => {
+                info!("nuwax-lcm owner thread 收到 Shutdown,退出");
+                (true, reply)
+            }
+            Command::Publish {
+                channel,
+                payload,
+                reply,
+            } => {
+                let result = self.publish(&channel, &payload);
+                let _ = reply.send(result);
+                (false, None)
+            }
+            Command::Subscribe {
+                channel,
+                pattern,
+                reply,
+                sender,
+            } => {
+                let result = self.subscribe(channel, pattern, sender);
+                let _ = reply.send(result);
+                (false, None)
+            }
+            Command::Unsubscribe {
+                subscription_id,
+                reply,
+            } => {
+                let result = self.unsubscribe(subscription_id);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+                (false, None)
+            }
+            Command::UnsubscribeChannel { channel, reply } => {
+                let result = self.unsubscribe_channel(&channel);
+                let _ = reply.send(result);
+                (false, None)
+            }
+        }
+    }
+
     /// event loop 主循环:处理 commands + lcm_handle_timeout。
     fn run(mut self) {
         info!("nuwax-lcm owner thread 启动");
@@ -314,56 +474,89 @@ impl OwnerThread {
         // 让出时间片给 liblcm(原实现一次只 drain 一条,在 50ms 吞吐
         // 有限;高负载 publish 风暴会塞满 mpsc → caller backpressure)
         let mut shutdown = false;
+        let mut shutdown_reply = None;
         while !shutdown {
-            loop {
-                match self.cmd_rx.try_recv() {
-                    Ok(Command::Shutdown) => {
-                        info!("nuwax-lcm owner thread 收到 Shutdown,退出");
-                        shutdown = true;
-                        break;
+            let mut control_count = 0;
+            while control_count < MAX_COMMANDS_PER_TICK {
+                match self.control_rx.try_recv() {
+                    Ok(command) => {
+                        let (should_shutdown, reply) = self.handle_command(command);
+                        if should_shutdown {
+                            shutdown = true;
+                            shutdown_reply = reply;
+                            break;
+                        }
                     }
-                    Ok(Command::Publish {
-                        channel,
-                        payload,
-                        reply,
-                    }) => {
-                        let r = self.publish(&channel, &payload);
-                        let _ = reply.send(r);
-                    }
-                    Ok(Command::Subscribe {
-                        channel,
-                        pattern,
-                        reply,
-                        sender,
-                    }) => {
-                        let r = self.subscribe(channel, pattern, sender);
-                        let _ = reply.send(r);
-                    }
-                    Ok(Command::Unsubscribe { channel }) => {
-                        self.unsubscribe(&channel);
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        error!("nuwax-lcm owner thread 的 mpsc sender 全 dropped;退出");
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        error!("nuwax-lcm owner thread 的 control sender 全 dropped;退出");
                         shutdown = true;
                         break;
                     }
                 }
+                control_count += 1;
             }
-            // 50 ms 轮询
-            let _ = unsafe { lcm_handle_timeout(self.lcm, 50) };
+            if shutdown {
+                break;
+            }
+
+            let mut command_count = 0;
+            while command_count < MAX_COMMANDS_PER_TICK {
+                match self.cmd_rx.try_recv() {
+                    Ok(command) => {
+                        let (should_shutdown, reply) = self.handle_command(command);
+                        if should_shutdown {
+                            shutdown = true;
+                            shutdown_reply = reply;
+                            break;
+                        }
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        debug!("nuwax-lcm owner thread 的 publish sender 已关闭");
+                        break;
+                    }
+                }
+                command_count += 1;
+            }
+            if shutdown {
+                break;
+            }
+
+            // Both sides are bounded. A command storm cannot starve receive,
+            // and an inbound storm cannot starve publish/subscribe commands.
+            for receive_index in 0..MAX_RECEIVES_PER_TICK {
+                let timeout_ms = if command_count == 0 && control_count == 0 && receive_index == 0 {
+                    IDLE_HANDLE_TIMEOUT_MS
+                } else {
+                    0
+                };
+                let handled = unsafe { lcm_handle_timeout(self.lcm, timeout_ms) };
+                if handled <= 0 {
+                    break;
+                }
+            }
         }
 
         // 收尾:drain 所有 subscriptions(2026-07-11 rework22 P0-01:
         // 先把 entry.alive 设为 false,再 lcm_unsubscribe,最后释放
         // leaked entry —— 与 `unsubscribe` 同序,避免 callback race)
-        for (ch, handle) in self.subscriptions.drain() {
+        for (_, handle) in self.subscriptions.drain() {
             unsafe { (*handle.entry).alive.store(false, Ordering::Release) };
-            unsafe { lcm_unsubscribe(self.lcm, handle.sub) };
-            unsafe { drop(Box::from_raw(handle.entry)) };
-            let _ = ch;
+            let rc = unsafe { lcm_unsubscribe(self.lcm, handle.sub) };
+            if rc == 0 {
+                unsafe { drop(Box::from_raw(handle.entry)) };
+            } else {
+                self.retired_entries.push(handle.entry);
+            }
         }
         unsafe { lcm_destroy(self.lcm) };
+        for entry in self.retired_entries.drain(..) {
+            unsafe { drop(Box::from_raw(entry)) };
+        }
+        if let Some(reply) = shutdown_reply {
+            let _ = reply.send(());
+        }
     }
 }
 
@@ -377,7 +570,7 @@ unsafe extern "C" fn lcm_msg_callback(
     channel: *const c_char,
     user: *mut c_void,
 ) {
-    if user.is_null() || rbuf.is_null() {
+    if user.is_null() || rbuf.is_null() || channel.is_null() {
         return;
     }
     // SAFETY: rbuf 由 liblcm 持有,本回调期间有效;data_size 来自 C 头,
@@ -390,20 +583,25 @@ unsafe extern "C" fn lcm_msg_callback(
         return;
     }
     let (data_ptr, len) = unsafe { ((*rbuf).data, (*rbuf).data_size as usize) };
-    if data_ptr.is_null() || len == 0 {
+    if data_ptr.is_null() && len != 0 {
         return;
     }
     // SAFETY: alive=true 时 entry 仍 leaked & valid;只借用 sender
     // 的引用,不 move,不释放 allocation。
     let sender = unsafe { &(*entry).sender };
-    let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, len) };
-    let bytes = Bytes::copy_from_slice(slice);
-    let _ = sender.send(bytes);
-
-    if !channel.is_null() {
-        let cstr = unsafe { std::ffi::CStr::from_ptr(channel) };
-        debug!("lcm_msg_callback: channel={:?} len={}", cstr, len);
-    }
+    let bytes = if len == 0 {
+        Bytes::new()
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, len) };
+        Bytes::copy_from_slice(slice)
+    };
+    let cstr = unsafe { std::ffi::CStr::from_ptr(channel) };
+    let actual_channel = cstr.to_string_lossy().into_owned();
+    let _ = sender.send(LcmReceivedMessage {
+        channel: actual_channel,
+        payload: bytes,
+    });
+    debug!("lcm_msg_callback: channel={:?} len={}", cstr, len);
 }
 
 // =============================================================================
@@ -418,8 +616,12 @@ unsafe extern "C" fn lcm_msg_callback(
 pub struct LcmContext {
     /// tokio mpsc — caller 用 `.send(...).await` 推命令
     cmd_tx: mpsc::Sender<Command>,
+    /// Unbounded lifecycle channel so unsubscribe/shutdown cannot be dropped by data backpressure.
+    control_tx: std::sync::mpsc::Sender<Command>,
     /// provider URL —— Debug 用
     provider: Arc<String>,
+    owner_thread: Mutex<Option<JoinHandle<()>>>,
+    owner_alive: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for LcmContext {
@@ -427,6 +629,7 @@ impl std::fmt::Debug for LcmContext {
         f.debug_struct("LcmContext")
             .field("provider", &self.provider)
             .field("cmd_tx_open", &!self.cmd_tx.is_closed())
+            .field("owner_alive", &self.owner_alive.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -448,28 +651,35 @@ impl LcmContext {
             });
         }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(10_000);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(LCM_COMMAND_QUEUE_CAPACITY);
+        let (control_tx, control_rx) = std::sync::mpsc::channel::<Command>();
 
         let owner = OwnerThread {
             lcm,
             cmd_rx,
+            control_rx,
             subscriptions: std::collections::HashMap::new(),
+            next_subscription_id: 1,
+            retired_entries: Vec::new(),
         };
         let provider_owned = Arc::new(provider.to_owned());
+        let owner_alive = Arc::new(AtomicBool::new(true));
+        let thread_alive = Arc::clone(&owner_alive);
 
-        std::thread::Builder::new()
+        let owner_thread = std::thread::Builder::new()
             .name("nuwax-lcm-owner".into())
             .spawn(move || {
                 owner.run();
+                thread_alive.store(false, Ordering::Release);
             })
-            .map_err(|e| LcmError::BackendUnavailable(format!(
-                "spawn owner thread 失败: {}",
-                e
-            )))?;
+            .map_err(|e| LcmError::BackendUnavailable(format!("spawn owner thread 失败: {e}")))?;
 
         Ok(Self {
             cmd_tx,
+            control_tx,
             provider: provider_owned,
+            owner_thread: Mutex::new(Some(owner_thread)),
+            owner_alive,
         })
     }
 
@@ -495,11 +705,9 @@ impl LcmContext {
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: e.to_string(),
             })?;
-        reply_rx
-            .await
-            .map_err(|e| LcmError::OwnerThreadDown {
-                detail: e.to_string(),
-            })?
+        reply_rx.await.map_err(|e| LcmError::OwnerThreadDown {
+            detail: e.to_string(),
+        })?
     }
 
     /// 注册一个 subscription。
@@ -508,64 +716,92 @@ impl LcmContext {
     pub async fn subscribe(&self, channel: &str) -> Result<LcmSubscription, LcmError> {
         let chan_c = to_cstring(channel).map_err(|_| LcmError::NulByte(channel.to_owned()))?;
         let pattern_c = chan_c.clone();
-        let (tx, rx) = broadcast::channel::<Bytes>(8);
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<Result<(), LcmError>>(1);
+        let (tx, rx) = broadcast::channel::<LcmReceivedMessage>(LCM_SUBSCRIPTION_QUEUE_CAPACITY);
+        let (reply_tx, reply_rx) = oneshot::channel();
 
-        self.cmd_tx
+        self.control_tx
             .send(Command::Subscribe {
                 channel: chan_c.clone(),
                 pattern: pattern_c,
                 sender: tx,
                 reply: reply_tx,
             })
-            .await
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: e.to_string(),
             })?;
 
-        let resp = reply_rx
-            .recv_timeout(Duration::from_secs(1))
-            .map_err(|e| LcmError::OwnerThreadDown {
-                detail: format!("subscribe reply 超时/失败: {}", e),
-            })?;
-        resp?;
+        let resp = reply_rx.await.map_err(|e| LcmError::OwnerThreadDown {
+            detail: format!("subscribe reply 失败: {e}"),
+        })?;
+        let subscription_id = resp?;
 
         Ok(LcmSubscription {
+            subscription_id: Some(subscription_id),
             channel: Arc::new(chan_c),
             receiver: rx,
+            control_tx: self.control_tx.clone(),
         })
     }
 
     /// 取消订阅(可选;Drop 时也会自动 unsubscribe)
     pub async fn unsubscribe(&self, channel: &str) -> Result<(), LcmError> {
         let c = to_cstring(channel).map_err(|_| LcmError::NulByte(channel.to_owned()))?;
-        self.cmd_tx
-            .send(Command::Unsubscribe { channel: c })
-            .await
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.control_tx
+            .send(Command::UnsubscribeChannel {
+                channel: c,
+                reply: reply_tx,
+            })
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: e.to_string(),
             })?;
-        Ok(())
+        reply_rx.await.map_err(|e| LcmError::OwnerThreadDown {
+            detail: e.to_string(),
+        })?
     }
 
     /// 主动关闭 owner thread。一般用不到(Drop 会自动关)。
     pub async fn shutdown(&self) -> Result<(), LcmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .send(Command::Shutdown)
+            .send(Command::Shutdown {
+                reply: Some(reply_tx),
+            })
             .await
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: e.to_string(),
             })?;
+        reply_rx.await.map_err(|e| LcmError::OwnerThreadDown {
+            detail: e.to_string(),
+        })?;
+        self.join_owner_thread()
+    }
+
+    fn join_owner_thread(&self) -> Result<(), LcmError> {
+        let owner = self
+            .owner_thread
+            .lock()
+            .map_err(|_| LcmError::OwnerThreadDown {
+                detail: "owner join mutex poisoned".into(),
+            })?
+            .take();
+        if let Some(owner) = owner {
+            owner.join().map_err(|_| LcmError::OwnerThreadDown {
+                detail: "owner thread panicked".into(),
+            })?;
+        }
         Ok(())
     }
 }
 
 impl Drop for LcmContext {
     fn drop(&mut self) {
-        // 尽力通知 owner thread 退出(若 cmd_tx 已 close,吞掉错误)
-        let _ = self.cmd_tx.try_send(Command::Shutdown);
-        // 不 join thread —— owner thread 自身会在收到 Shutdown 后
-        // 调用 lcm_destroy(持有 lcm_t raw ptr)。
+        let _ = self.control_tx.send(Command::Shutdown { reply: None });
+        if let Ok(owner) = self.owner_thread.get_mut() {
+            if let Some(owner) = owner.take() {
+                let _ = owner.join();
+            }
+        }
     }
 }
 
@@ -603,5 +839,131 @@ mod tests {
     fn lcm_error_backend_unavailable() {
         let e = LcmError::BackendUnavailable("missing liblcm".into());
         assert!(e.to_string().contains("missing liblcm"));
+    }
+
+    #[test]
+    fn context_drop_joins_owner_thread() {
+        let context = LcmContext::new("memq://").expect("create in-memory LCM context");
+        let alive = Arc::clone(&context.owner_alive);
+        assert!(alive.load(Ordering::Acquire));
+        drop(context);
+        assert!(!alive.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "link-liblcm")]
+    #[test]
+    fn successful_unsubscribe_reclaims_callback_entry_immediately() {
+        let provider = to_cstring("memq://").expect("provider CString");
+        let lcm = unsafe { lcm_create(provider.as_ptr()) };
+        assert!(!lcm.is_null(), "create memq provider");
+
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut owner = OwnerThread {
+            lcm,
+            cmd_rx,
+            control_rx,
+            subscriptions: HashMap::new(),
+            next_subscription_id: 1,
+            retired_entries: Vec::new(),
+        };
+        let channel = to_cstring("/nuwax/churn").expect("channel CString");
+        let (sender, _receiver) = broadcast::channel(1);
+        let subscription_id = owner
+            .subscribe(channel.clone(), channel, sender)
+            .expect("subscribe");
+
+        owner.unsubscribe(subscription_id).expect("unsubscribe");
+        let retired_after_success = owner.retired_entries.len();
+
+        unsafe { lcm_destroy(owner.lcm) };
+        for entry in owner.retired_entries.drain(..) {
+            unsafe { drop(Box::from_raw(entry)) };
+        }
+
+        assert_eq!(
+            retired_after_success, 0,
+            "successful lcm_unsubscribe guarantees handler quiescence, so userdata must not accumulate"
+        );
+    }
+
+    #[cfg(feature = "link-liblcm")]
+    #[test]
+    fn repeated_subscribe_unsubscribe_churn_does_not_retain_userdata() {
+        let provider = to_cstring("memq://").expect("provider CString");
+        let lcm = unsafe { lcm_create(provider.as_ptr()) };
+        assert!(!lcm.is_null(), "create memq provider");
+
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut owner = OwnerThread {
+            lcm,
+            cmd_rx,
+            control_rx,
+            subscriptions: HashMap::new(),
+            next_subscription_id: 1,
+            retired_entries: Vec::new(),
+        };
+
+        for sequence in 0..10_000_u64 {
+            let channel = to_cstring(&format!("/nuwax/churn/{sequence}")).expect("channel CString");
+            let (sender, _receiver) = broadcast::channel(1);
+            let subscription_id = owner
+                .subscribe(channel.clone(), channel, sender)
+                .expect("subscribe");
+            owner.unsubscribe(subscription_id).expect("unsubscribe");
+            assert!(owner.subscriptions.is_empty());
+            assert!(owner.retired_entries.is_empty());
+        }
+
+        unsafe { lcm_destroy(owner.lcm) };
+    }
+
+    #[cfg(feature = "link-liblcm")]
+    #[test]
+    fn callback_delivery_unsubscribe_churn_is_asan_clean() {
+        let provider = to_cstring("memq://").expect("provider CString");
+        let lcm = unsafe { lcm_create(provider.as_ptr()) };
+        assert!(!lcm.is_null(), "create memq provider");
+
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut owner = OwnerThread {
+            lcm,
+            cmd_rx,
+            control_rx,
+            subscriptions: HashMap::new(),
+            next_subscription_id: 1,
+            retired_entries: Vec::new(),
+        };
+
+        for sequence in 0..5_000_u64 {
+            let channel =
+                to_cstring(&format!("/nuwax/callback-churn/{sequence}")).expect("channel CString");
+            let (sender, mut receiver) = broadcast::channel(1);
+            let subscription_id = owner
+                .subscribe(channel.clone(), channel.clone(), sender)
+                .expect("subscribe");
+            owner
+                .publish(&channel, &Bytes::copy_from_slice(&sequence.to_be_bytes()))
+                .expect("publish before unsubscribe");
+            assert!(unsafe { lcm_handle_timeout(owner.lcm, 0) } > 0);
+            let delivered = receiver.try_recv().expect("callback delivery");
+            assert_eq!(delivered.payload.as_ref(), sequence.to_be_bytes());
+
+            owner.unsubscribe(subscription_id).expect("unsubscribe");
+            owner
+                .publish(&channel, &Bytes::from_static(b"after-unsubscribe"))
+                .expect("publish after unsubscribe");
+            let _ = unsafe { lcm_handle_timeout(owner.lcm, 0) };
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+                    | Err(broadcast::error::TryRecvError::Closed)
+            ));
+            assert!(owner.retired_entries.is_empty());
+        }
+
+        unsafe { lcm_destroy(owner.lcm) };
     }
 }

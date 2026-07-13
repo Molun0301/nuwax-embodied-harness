@@ -2,9 +2,10 @@
 //! + tie-break 稳定排序。
 
 use nuwax_nav_types_messages::geometry::Point2;
-use nuwax_nav_types_messages::grid::{OccupancyCell, OccupancyGrid2D};
+use nuwax_nav_types_messages::grid::OccupancyGrid2D;
 
 use crate::config::WavefrontConfig;
+use crate::grid::occupancy_value;
 use crate::session::Direction2;
 use crate::FrontierScoreBreakdown;
 
@@ -53,9 +54,8 @@ impl FrontierScorer {
         // TODO:此处与 Python frontier_goal.py 的 information_gain 行为对齐;
         // 历史实现用 area_m2 / max_expected_frontier_size(m² 尺度),会因 grid
         // resolution 变化导致分数整体偏移。这里固定按 cell count 归一化。
-        let max_expected_cells = ((cfg.min_frontier_perimeter_m / grid.resolution.max(1e-6))
-            * 10.0)
-            .max(1.0);
+        let max_expected_cells =
+            ((cfg.min_frontier_perimeter_m / grid.resolution.max(1e-6)) * 10.0).max(1.0);
         let information_gain_score =
             (candidate.cell_count as f64 / max_expected_cells).min(1.0) as f32;
 
@@ -163,11 +163,11 @@ fn compute_obstacle_distance(
                 continue;
             }
             let idx = (ny as u32 * grid.width + nx as u32) as usize;
-            if let OccupancyCell::Occupied | OccupancyCell::Inflated = grid.cells[idx] {
-                let world = grid.cell_center(nx as u32, ny as u32).unwrap_or(centroid);
-                let ddx = world.x - centroid.x;
-                let ddy = world.y - centroid.y;
-                let d2 = ddx * ddx + ddy * ddy;
+            let occupied = occupancy_value(grid.cells[idx]) >= cfg.occupancy_threshold;
+            if occupied {
+                // Python measures from the frontier's integer grid cell using
+                // the search offsets, rather than between world cell centers.
+                let d2 = f64::from(dx * dx + dy * dy) * grid.resolution * grid.resolution;
                 if d2 < best_d2 {
                     best_d2 = d2;
                 }
@@ -222,6 +222,16 @@ mod tests {
         let cfg = WavefrontConfig::default();
         let d = compute_obstacle_distance(Point2 { x: 1.0, y: 1.0 }, &g, &cfg);
         assert!((d - cfg.safe_distance_m).abs() < 1e-9);
+    }
+
+    #[test]
+    fn obstacle_distance_matches_python_grid_offsets_and_inclusive_threshold() {
+        let mut g =
+            OccupancyGrid2D::filled(Point2 { x: 0.0, y: 0.0 }, 0.1, 10, 10, OccupancyCell::Free);
+        g.set(4, 2, OccupancyCell::Cost(99));
+        let cfg = WavefrontConfig::default();
+        let d = compute_obstacle_distance(Point2 { x: 0.2, y: 0.2 }, &g, &cfg);
+        assert!((d - 0.2).abs() < 1e-9, "distance={d}");
     }
 
     #[test]

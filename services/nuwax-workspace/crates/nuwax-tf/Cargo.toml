@@ -15,6 +15,20 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
+nuwax-codec = { path = "../nuwax-codec", optional = true }
+nuwax-lcm = { path = "../nuwax-lcm", optional = true }
+bytes = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["macros", "rt", "sync", "time"] }
+
+[features]
+default = []
+link-liblcm = [
+    "dep:bytes",
+    "dep:nuwax-codec",
+    "dep:nuwax-lcm",
+    "dep:tokio",
+    "nuwax-lcm/link-liblcm",
+]
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

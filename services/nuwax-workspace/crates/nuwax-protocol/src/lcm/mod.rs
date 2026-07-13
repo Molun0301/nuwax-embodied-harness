@@ -36,7 +36,7 @@
 //! ## Topic typed suffix
 //!
 //! LCM 1.x 的 `lcm.subscribe("regex")` 接受 typed suffix 形式
-//! `/topic#pkg.Msg`。本 crate 在 [`LcmTopic::new_with_typed_suffix`] 提供
+//! `/topic#pkg.Msg`。本 crate 在 [`LcmTopic::parse_subscription_pattern`] 提供
 //! 显式解析能力,在 [`LcmTopic::as_subscription_pattern`] 中输出
 //! 标准 `regex` 模式以匹配上游 LCM。
 
@@ -51,6 +51,8 @@ pub use fingerprint::{compute_lcm_fingerprint, LCM_HASH_SIZE};
 pub use frame::{LcmFrameHeader, RawLcmFrame, RawLcmFrameBuilder, LCM_MAGIC};
 pub use message_bytes::LcmMessageBytes;
 pub use message_type::{LcmMessageType, LcmMessageTypeError};
+/// Generated DimOS LCM schema codecs already carried by `nuwax-protocol`.
+pub use nuwax_codec::lcm::schema;
 pub use topic::{LcmTopic, LcmTopicParseError, LCM_TOPIC_TYPED_SUFFIX_SEP};
 pub use typed_codec::{
     build_lcm_message_bytes, parse_lcm_message_bytes, upstream_fingerprint_registered,

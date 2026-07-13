@@ -108,7 +108,7 @@ pub mod prelude {
 /// 通用消息信封（protobuf 兼容路径）。
 ///
 /// **DEPRECATED**:默认协议层已迁移到 LCM。请改用
-/// [`RawLcmFrame`](crate::RawLcmFrame) / [`LcmTopic`](crate::LcmTopic)。
+/// [`RawLcmFrame`] / [`LcmTopic`]。
 /// 该类型仅在"确有上游 protobuf 兼容需求"的边界被启用。
 #[deprecated(
     since = "0.2.0",

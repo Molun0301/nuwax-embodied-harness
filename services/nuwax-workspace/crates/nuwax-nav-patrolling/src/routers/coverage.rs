@@ -3,7 +3,9 @@
 //! 不复制 A*：通过外部注入的 `PathEstimator` trait 调用 A*，避免依赖具体算法 crate。
 //! 默认实现：`StraightLineEstimator` 仅作占位/测试，真实 production 应注入 `nuwax-nav-astar`。
 
+use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 
 use rand::rngs::StdRng;
@@ -44,6 +46,122 @@ impl PathEstimator for StraightLineEstimator {
         }
         octile as i32
     }
+}
+
+/// Obstacle-aware 8-connected A* estimator matching the original Python grid search.
+#[derive(Default)]
+pub struct GridAStarEstimator;
+
+impl PathEstimator for GridAStarEstimator {
+    fn estimate_cell_path(
+        &self,
+        grid: &GridSnapshot,
+        from: (usize, usize),
+        to: (usize, usize),
+    ) -> i32 {
+        astar_cell_count(grid, from, to).map_or(-1, |count| count as i32)
+    }
+}
+
+fn astar_cell_count(
+    grid: &GridSnapshot,
+    from: (usize, usize),
+    to: (usize, usize),
+) -> Option<usize> {
+    let width = grid.width as usize;
+    let height = grid.height as usize;
+    let total = width.checked_mul(height)?;
+    if width == 0
+        || height == 0
+        || grid.data.len() < total
+        || from.0 >= width
+        || from.1 >= height
+        || to.0 >= width
+        || to.1 >= height
+    {
+        return None;
+    }
+    if from == to {
+        return Some(1);
+    }
+
+    const DIRECTIONS: [(isize, isize, u32); 8] = [
+        (0, 1, 100),
+        (1, 0, 100),
+        (0, -1, 100),
+        (-1, 0, 100),
+        (1, 1, 142),
+        (1, -1, 142),
+        (-1, 1, 142),
+        (-1, -1, 142),
+    ];
+
+    let start = from.1 * width + from.0;
+    let goal = to.1 * width + to.0;
+    let mut scores = vec![None; total];
+    let mut parents = vec![None; total];
+    let mut closed = vec![false; total];
+    let mut open = BinaryHeap::new();
+    scores[start] = Some((0_u32, 0_u32));
+    open.push(Reverse((0_u32, octile_cost(from, to), start)));
+
+    while let Some(Reverse((_priority_cost, _priority_distance, current))) = open.pop() {
+        if closed[current] {
+            continue;
+        }
+        if current == goal {
+            let mut count = 1;
+            let mut cursor = current;
+            while let Some(parent) = parents[cursor] {
+                count += 1;
+                cursor = parent;
+            }
+            return Some(count);
+        }
+        closed[current] = true;
+        let current_xy = (current % width, current / width);
+        let (current_cost, current_distance) = scores[current]?;
+
+        for (dx, dy, movement_cost) in DIRECTIONS {
+            let next_x = current_xy.0 as isize + dx;
+            let next_y = current_xy.1 as isize + dy;
+            if next_x < 0 || next_y < 0 || next_x >= width as isize || next_y >= height as isize {
+                continue;
+            }
+            let next = next_y as usize * width + next_x as usize;
+            if closed[next] {
+                continue;
+            }
+            let cell = grid.data[next];
+            if !(0..100).contains(&cell) {
+                continue;
+            }
+            let candidate = (
+                current_cost.saturating_add(cell as u32),
+                current_distance.saturating_add(movement_cost),
+            );
+            if scores[next].is_some_and(|score| candidate >= score) {
+                continue;
+            }
+            scores[next] = Some(candidate);
+            parents[next] = Some(current);
+            let next_xy = (next_x as usize, next_y as usize);
+            open.push(Reverse((
+                candidate.0,
+                candidate.1.saturating_add(octile_cost(next_xy, to)),
+                next,
+            )));
+        }
+    }
+    None
+}
+
+fn octile_cost(from: (usize, usize), to: (usize, usize)) -> u32 {
+    let dx = from.0.abs_diff(to.0) as u32;
+    let dy = from.1.abs_diff(to.1) as u32;
+    (dx + dy)
+        .saturating_mul(100)
+        .saturating_sub(dx.min(dy).saturating_mul(58))
 }
 
 /// Voronoi 加权采样权重（修复 rework20 H-16 占位 API）。
@@ -95,9 +213,7 @@ pub fn weighted_sample(
     match weights.weights {
         Some(_w) => {
             // 权重已就绪但 voronoi 加权采样尚未实现 → 退化为均匀抽样 + TODO 日志
-            eprintln!(
-                "weighted_sample: voronoi 加权采样待 P2 实装,当前 fallback 均匀抽样"
-            );
+            eprintln!("weighted_sample: voronoi 加权采样待 P2 实装,当前 fallback 均匀抽样");
             let step = (candidates.len() / n.max(1)).max(1);
             candidates.iter().step_by(step).take(n).copied().collect()
         }
@@ -113,6 +229,7 @@ pub fn weighted_sample(
 /// Coverage router
 pub struct CoveragePatrolRouter {
     history: VisitationHistory,
+    grid: Option<GridSnapshot>,
     /// 保留 rng 用于 future tie-breaking（候选分数相同时随机选）；当前 deterministic。
     #[allow(dead_code)]
     rng: StdRng,
@@ -133,9 +250,10 @@ impl CoveragePatrolRouter {
         };
         Self {
             history: VisitationHistory::new(clearance_radius_m),
+            grid: None,
             rng,
             candidates_to_consider,
-            estimator: Box::new(StraightLineEstimator),
+            estimator: Box::new(GridAStarEstimator),
         }
     }
 
@@ -154,6 +272,7 @@ impl PatrolRouter for CoveragePatrolRouter {
             grid.origin_x,
             grid.origin_y,
         );
+        self.grid = Some(grid);
     }
 
     fn update_pose(&mut self, pose: (f64, f64, f64)) {
@@ -186,9 +305,11 @@ impl PatrolRouter for CoveragePatrolRouter {
             let row = idx / vw;
             let col = idx % vw;
             let from = (vw / 2, vh / 2);
-            let path =
-                self.estimator
-                    .estimate_cell_path(&self.snapshot_for_estimate(vw, vh), from, (col, row));
+            let path = self.estimator.estimate_cell_path(
+                &self.snapshot_for_estimate(vw, vh),
+                from,
+                (col, row),
+            );
             if path < 0 {
                 continue;
             }
@@ -244,9 +365,7 @@ impl PatrolRouter for CoveragePatrolRouter {
             let idx = candidates[i];
             let row = idx / vw;
             let col = idx % vw;
-            let path = self
-                .estimator
-                .estimate_cell_path(&snap, from, (col, row));
+            let path = self.estimator.estimate_cell_path(&snap, from, (col, row));
             if path < 0 {
                 continue;
             }
@@ -266,13 +385,19 @@ impl PatrolRouter for CoveragePatrolRouter {
 
     fn reset(&mut self) {
         self.history.reset();
+        self.grid = None;
     }
 }
 
 impl CoveragePatrolRouter {
     fn snapshot_for_estimate(&self, vw: usize, vh: usize) -> GridSnapshot {
-        // 构造 free mask 全 true 作为简化 path 估算上下文
-        // 修复 P0-14:用 history 真实 origin_x/y,不再硬编码 0.0
+        if let Some(grid) = self
+            .grid
+            .as_ref()
+            .filter(|grid| grid.width as usize == vw && grid.height as usize == vh)
+        {
+            return grid.clone();
+        }
         if vw == 0 || vh == 0 {
             return GridSnapshot {
                 width: 0,
@@ -300,7 +425,15 @@ impl CoveragePatrolRouter {
         vh: usize,
         ctx: &PatrollingContext,
     ) -> GridSnapshot {
-        // 修复 P0-14:用 ctx 真实 origin
+        if let Some(grid) = self.grid.as_ref().filter(|grid| {
+            grid.width as usize == vw
+                && grid.height as usize == vh
+                && (grid.resolution - ctx.resolution).abs() < f64::EPSILON
+                && (grid.origin_x - ctx.grid_origin.x).abs() < f64::EPSILON
+                && (grid.origin_y - ctx.grid_origin.y).abs() < f64::EPSILON
+        }) {
+            return grid.clone();
+        }
         if vw == 0 || vh == 0 {
             return GridSnapshot {
                 width: 0,
@@ -311,13 +444,19 @@ impl CoveragePatrolRouter {
                 data: vec![],
             };
         }
+        let mut data = vec![100; vw * vh];
+        for &index in &ctx.free_cells {
+            if let Some(cell) = data.get_mut(index) {
+                *cell = 0;
+            }
+        }
         GridSnapshot {
             width: vw as u32,
             height: vh as u32,
             resolution: ctx.resolution,
             origin_x: ctx.grid_origin.x,
             origin_y: ctx.grid_origin.y,
-            data: vec![0; vw * vh],
+            data,
         }
     }
 }

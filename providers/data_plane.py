@@ -141,14 +141,12 @@ class ManagedRobotDeviceDataPlane(
     DataPlaneLifecycle,
     RobotStateSensorDataPlane,
     DataPlaneStatusReporter,
-    MotionCommandDataPlane,
-    ObstacleAvoidanceControlDataPlane,
     Protocol,
 ):
     """机器人入口默认保留的窄数据面协议。
 
-    仅包含设备服务、输入流辅助状态与运动安全开关，
-    不再要求机器人数据面承载平台 map/nav/exploration 主链。
+    仅包含生命周期、输入流辅助状态与 IMU 观测；运动命令与安全
+    开关不属于默认设备数据面，也不承载平台 map/nav/exploration 主链。
     """
 
 

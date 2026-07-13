@@ -17,10 +17,15 @@
 //! 把 CLI 参数解析、profile / preset 选择、输出格式与 main 拆分,
 //! 便于测试与后续扩展。
 
+use std::future::Future;
+use std::time::Duration;
+
 use crate::builder::NavStackBuilder;
 use crate::error::NavStackResult;
 use crate::features::NavStackPreset;
 use crate::profile::NavStackProfile;
+use crate::runner::StackRunner;
+use crate::topics::NavTopicConfig;
 
 /// CLI 选项的内部表示。
 #[derive(Debug, Clone)]
@@ -188,16 +193,36 @@ fn print_help() {
     );
 }
 
-/// 执行 CLI。
+/// Execute the CLI until Ctrl-C requests stack shutdown.
 ///
-/// 设计为 `Result<(), NavStackError>` 而非 `process::exit`,便于 lib 调用方测试。
+/// Dry-run and feature-list modes remain synchronous. Every other invocation
+/// builds a [`StackRunner`], starts it, monitors owned nodes, and reaps them
+/// before returning.
 pub fn run(opts: CliOptions) -> NavStackResult<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_until_shutdown(opts, async {
+        tokio::signal::ctrl_c().await.map_err(Into::into)
+    }))
+}
+
+/// Execute CLI behavior with an injectable shutdown future.
+///
+/// The future is awaited only after every graph node has passed ownership
+/// preflight and started successfully. This is the deterministic test seam for
+/// lifecycle supervision; production passes `tokio::signal::ctrl_c()`.
+pub async fn run_until_shutdown<F>(opts: CliOptions, shutdown: F) -> NavStackResult<()>
+where
+    F: Future<Output = NavStackResult<()>> + Send,
+{
     if opts.list_features {
         list_features();
         return Ok(());
     }
 
-    let mut builder = NavStackBuilder::new(opts.profile);
+    let mut builder =
+        NavStackBuilder::new(opts.profile).topics(NavTopicConfig::geometry_runtime_defaults());
     if let Some(preset) = opts.preset {
         builder = builder.preset(preset);
     }
@@ -208,13 +233,13 @@ pub fn run(opts: CliOptions) -> NavStackResult<()> {
         return Ok(());
     }
 
-    // 完整 build 后选择输出形式
-    let graph = builder.build()?;
+    let mut runner = builder.build_runner()?;
     if opts.json {
-        let s = serde_json::to_string_pretty(&graph).map_err(crate::error::NavStackError::Serde)?;
+        let s = serde_json::to_string_pretty(runner.graph())
+            .map_err(crate::error::NavStackError::Serde)?;
         println!("{s}");
     } else {
-        println!("{}", crate::dry_run::render(&graph));
+        println!("{}", crate::dry_run::render(runner.graph()));
     }
 
     // 真实 replay:仅在显式指定 fixture 时执行,fixture 缺失立即报错
@@ -222,7 +247,41 @@ pub fn run(opts: CliOptions) -> NavStackResult<()> {
         crate::replay::run_smoke(std::path::PathBuf::from(path))?;
     }
 
-    Ok(())
+    supervise_runner_until(&mut runner, shutdown).await
+}
+
+/// Start a configured runner, monitor it until shutdown, then clean it up.
+///
+/// Callers that own concrete Rust modules register their
+/// [`crate::runner::InProcessNodeFactory`] implementations on `runner` before
+/// calling this function.
+pub async fn supervise_runner_until<F>(runner: &mut StackRunner, shutdown: F) -> NavStackResult<()>
+where
+    F: Future<Output = NavStackResult<()>> + Send,
+{
+    runner.spawn_all().await?;
+
+    let mut health = tokio::time::interval(Duration::from_millis(100));
+    health.tick().await;
+    tokio::pin!(shutdown);
+
+    let supervision = loop {
+        tokio::select! {
+            result = &mut shutdown => break result,
+            _ = health.tick() => {
+                if let Err(error) = runner.ensure_healthy() {
+                    break Err(error);
+                }
+            }
+        }
+    };
+    let cleanup = runner.shutdown().await;
+
+    match (supervision, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// 列出所有 Cargo feature,便于 `--list-features` 输出。
@@ -280,6 +339,7 @@ pub fn list_features() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{ModuleGraph, ModuleKind, ModuleNode};
 
     #[test]
     fn parse_default_profile_is_simple2d() {
@@ -322,5 +382,36 @@ mod tests {
     fn parse_unknown_preset_errors() {
         let err = CliOptions::parse(&["--preset=banana".into()]).unwrap_err();
         assert!(err.to_string().contains("unknown preset"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "simple-2d"))]
+    async fn non_dry_cli_rejects_unowned_profile_instead_of_reporting_success() {
+        let opts = CliOptions::parse(&[]).expect("default CLI options");
+        let error = run_until_shutdown(opts, async { Ok(()) })
+            .await
+            .expect_err("Simple2D has no registered runtime owners");
+        assert!(matches!(
+            error,
+            crate::error::NavStackError::MissingRuntimeOwners { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn supervision_owns_native_process_until_shutdown_future_resolves() {
+        let mut graph = ModuleGraph::new("supervision-test");
+        graph.push_node(
+            ModuleNode::new("persistent", "Persistent", ModuleKind::NativeBridge)
+                .with_binary("/usr/bin/yes"),
+        );
+        let mut runner = StackRunner::from_graph(graph);
+
+        supervise_runner_until(&mut runner, async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(())
+        })
+        .await
+        .expect("supervise and reap persistent native process");
+        assert!(runner.running_nodes().is_empty());
     }
 }

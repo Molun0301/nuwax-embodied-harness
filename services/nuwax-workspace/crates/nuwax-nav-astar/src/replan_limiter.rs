@@ -182,7 +182,11 @@ mod tests {
         l.will_retry();
         l.reset();
         assert_eq!(l.attempt(), 0);
-        assert_eq!(l.attempt_pos(), Some(p(0.0, 0.0)), "reset must keep attempt_pos (Python 语义对齐)");
+        assert_eq!(
+            l.attempt_pos(),
+            Some(p(0.0, 0.0)),
+            "reset must keep attempt_pos (Python 语义对齐)"
+        );
     }
 
     #[test]

@@ -10,13 +10,14 @@
 //!   协议，不属于 mapping 接口；本期保留为 `Nav2CostLayer`（独立类型）以避免
 //!   误用，但 CostMapperConfig 改为 selector 风格。
 //!
-//! 已知 P2 follow-up（见审计文档）：
-//! - 真接 `dimos.mapping.pointclouds.occupancy.OCCUPANCY_ALGOS` dict 算法表
-//!   （height_cost / probability / probabilistic），而不是 u8 数值映射。
+//! Point-cloud inputs dispatch to the original `height_cost`, `general`, and
+//! `simple` occupancy kernels through [`PointCloudOccConfig`].
 
 use crate::models::{Costmap, MapMeta};
-use crate::occupancy::inflation::{simple_inflate, InflationConfig};
 use crate::occupancy::types::{MapMetaData, OccupancyGrid, OccupancyValue};
+use crate::pointclouds::occupancy::{
+    build_occupancy_auto, MappingError, PointCloudOccAlgo, PointCloudOccConfig,
+};
 use crate::pointclouds::PointCloudOccupancyBuilder;
 use nalgebra::{Isometry3, Point3};
 use serde::{Deserialize, Serialize};
@@ -27,26 +28,29 @@ use crate::occupancy::types::Pose;
 /// 算法 selector（Python `Config.algo` 取值）
 ///
 /// 对应 `dimos.mapping.pointclouds.occupancy.OCCUPANCY_ALGOS` 的 key。
-/// 当前仅声明枚举；真实算法实现留 P2。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum CostAlgoSelector {
     /// 高度切片成本（Python `HeightCostConfig`，默认）
     #[default]
     HeightCost,
-    /// 占据概率（Python `ProbabilityCostConfig`）
+    /// 原版通用 obstacle/ground occupancy。
+    General,
+    /// 原版 morphology-closing simple occupancy。
+    Simple,
+    /// 旧配置别名；运行时映射到 [`Self::General`]。
     Probability,
-    /// 概率式占据（Python `ProbabilisticOccupancyConfig`）
+    /// 旧配置别名；运行时映射到 [`Self::Simple`]。
     Probabilistic,
 }
 
-/// 算法参数占位（对应 Python `OccupancyConfig` 子类）
-///
-/// Python 各 algo 字段不同（height_min/height_max/...），本期仅保留算法名 +
-/// 公共 initial_safe_radius_meters；具体字段迁移留 P2。
+/// CostMapper selector, exact point-cloud kernel parameters, and safe radius.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OccupancyConfig {
     /// 选中算法
     pub algo: CostAlgoSelector,
+    /// Original algorithm-specific point-cloud parameters.
+    #[serde(default)]
+    pub pointcloud: PointCloudOccConfig,
     /// 初始安全半径（m），对应 Python `initial_safe_radius_meters`
     pub initial_safe_radius_meters: f32,
 }
@@ -55,6 +59,7 @@ impl Default for OccupancyConfig {
     fn default() -> Self {
         Self {
             algo: CostAlgoSelector::default(),
+            pointcloud: PointCloudOccConfig::default(),
             initial_safe_radius_meters: 0.0,
         }
     }
@@ -128,16 +133,11 @@ impl CostMapper {
         let meta = MapMeta::from(grid.to_meta());
         let mut costmap = Costmap::new(meta);
 
-        // dimos OccupancyGrid 用 IntEnum 三态；Costmap (Nav2 u8) 直接映射。
-        // 这里只做 protocol-level 1:1 转换（不在 mapping 接口硬编 Nav2 cost）。
+        // 保留原始 int8 cost：-1 → 255，0..=100 原样进入 Costmap。
         for r in 0..grid.height {
             for c in 0..grid.width {
-                let val = grid.get(r, c).unwrap_or(OccupancyValue::Unknown);
-                let cost: u8 = match val {
-                    OccupancyValue::Free => 0,
-                    OccupancyValue::Occupied => 100,
-                    OccupancyValue::Unknown => 255,
-                };
+                let raw = grid.data[(r * grid.width + c) as usize];
+                let cost = if raw < 0 { 255 } else { raw as u8 };
                 costmap.set(r, c, cost);
             }
         }
@@ -164,8 +164,16 @@ impl CostMapper {
 pub trait PointCloud2Like {
     /// 点列表（已变换到世界坐标系）
     fn points(&self) -> &[Point3<f64>];
-    /// 传感器 origin（用于 ray-cast 标记 free cell）
+    /// Sensor origin retained for adapters that need the acquisition pose.
     fn sensor_origin(&self) -> Point3<f64>;
+    /// Point-cloud coordinate frame. Legacy adapters default to `world`.
+    fn frame_id(&self) -> &str {
+        "world"
+    }
+    /// Point-cloud timestamp in seconds. Legacy adapters default to zero.
+    fn timestamp(&self) -> f64 {
+        0.0
+    }
 }
 
 /// 内置简单实现：内存中的 xyz + sensor origin
@@ -175,6 +183,10 @@ pub struct SimplePointCloud2 {
     pub points: Vec<Point3<f64>>,
     /// 传感器 origin
     pub sensor_origin: Point3<f64>,
+    /// Coordinate frame propagated by auto-bounds occupancy conversion.
+    pub frame_id: String,
+    /// Timestamp in seconds propagated by auto-bounds occupancy conversion.
+    pub timestamp: f64,
 }
 
 impl SimplePointCloud2 {
@@ -184,6 +196,24 @@ impl SimplePointCloud2 {
         Self {
             points,
             sensor_origin,
+            frame_id: "world".to_string(),
+            timestamp: 0.0,
+        }
+    }
+
+    /// Construct an in-memory cloud with frame and timestamp metadata.
+    #[must_use]
+    pub fn with_metadata(
+        points: Vec<Point3<f64>>,
+        sensor_origin: Point3<f64>,
+        frame_id: impl Into<String>,
+        timestamp: f64,
+    ) -> Self {
+        Self {
+            points,
+            sensor_origin,
+            frame_id: frame_id.into(),
+            timestamp,
         }
     }
 }
@@ -195,17 +225,49 @@ impl PointCloud2Like for SimplePointCloud2 {
     fn sensor_origin(&self) -> Point3<f64> {
         self.sensor_origin
     }
+    fn frame_id(&self) -> &str {
+        &self.frame_id
+    }
+    fn timestamp(&self) -> f64 {
+        self.timestamp
+    }
+}
+
+fn selected_pointcloud_config(occupancy_cfg: &OccupancyConfig) -> PointCloudOccConfig {
+    let mut pointcloud_config = occupancy_cfg.pointcloud;
+    pointcloud_config.algo = match occupancy_cfg.algo {
+        CostAlgoSelector::HeightCost => PointCloudOccAlgo::HeightCost,
+        CostAlgoSelector::General | CostAlgoSelector::Probability => PointCloudOccAlgo::General,
+        CostAlgoSelector::Simple | CostAlgoSelector::Probabilistic => PointCloudOccAlgo::Simple,
+    };
+    pointcloud_config
+}
+
+fn apply_initial_safe_radius(grid: &mut OccupancyGrid, radius_meters: f32) {
+    let radius_m = f64::from(radius_meters.max(0.0));
+    if radius_m <= 0.0 || grid.data.is_empty() {
+        return;
+    }
+    let effective_radius = radius_m + grid.resolution * 0.5;
+    let radius2 = effective_radius * effective_radius;
+    for row in 0..grid.height {
+        for col in 0..grid.width {
+            let world_x = f64::from(col) * grid.resolution + grid.origin[0];
+            let world_y = f64::from(row) * grid.resolution + grid.origin[1];
+            if world_x * world_x + world_y * world_y <= radius2 {
+                grid.set(row, col, OccupancyValue::Free);
+            }
+        }
+    }
 }
 
 impl CostMapper {
     /// 从 PointCloud2 + OccupancyConfig 构造 CostMapper（完整 pipeline）
     ///
     /// 流程：
-    /// 1. `PointCloudOccupancyBuilder::build` → OccupancyGrid（ray-cast + occupied/free）
-    /// 2. 依据 `OccupancyConfig.algo` 套用算法（HeightCost / Probability / Probabilistic）
-    ///    —— 当前实现：三种算法统一返回"原始 OccupancyGrid 转 Costmap"语义；
-    ///    真算法表接 `pointclouds.occupancy.OCCUPANCY_ALGOS` 留 P2。
-    /// 3. 依据 `initial_safe_radius_meters` 做 obstacle 膨胀（BFS-8）。
+    /// 1. `PointCloudOccupancyBuilder` projects points into an `OccupancyGrid`;
+    /// 2. 依据 `OccupancyConfig.algo` 分派 HeightCost / General / Simple；
+    /// 3. 按原版 CostMapper 语义，把机器人世界原点附近的 cell 清成 FREE。
     ///
     /// 返回：(CostMapper, Costmap) —— caller 同时拿到 CostMapper 实例
     /// （便于后续 in-place 更新）和最终 Costmap。
@@ -226,39 +288,45 @@ impl CostMapper {
             height,
             origin_xy,
         );
-        let grid = builder.build(cloud.points());
-
-        // 阶段 2：选算法（统一占用语义；真算法表 P2）
-        let _ = match occupancy_cfg.algo {
-            CostAlgoSelector::HeightCost
-            | CostAlgoSelector::Probability
-            | CostAlgoSelector::Probabilistic => {
-                // 当前：所有算法统一输出"原始 occupancy → costmap"语义；
-                // P2 接 OCCUPANCY_ALGOS dict 后这里改为真算法调用。
-            }
-        };
-
-        // 阶段 3：safe radius 膨胀（cells = meters / resolution）
-        let inflated = if occupancy_cfg.initial_safe_radius_meters > 0.0 {
-            let radius_cells = (f64::from(occupancy_cfg.initial_safe_radius_meters) / resolution)
-                .ceil() as u32;
-            simple_inflate(
-                &grid,
-                InflationConfig {
-                    radius: radius_cells.max(1),
-                    diagonal: true,
-                },
-            )
-        } else {
-            grid
-        };
+        let pointcloud_config = selected_pointcloud_config(occupancy_cfg);
+        let mut grid = builder.build_with_config(cloud.points(), &pointcloud_config);
+        apply_initial_safe_radius(&mut grid, occupancy_cfg.initial_safe_radius_meters);
 
         // 阶段 4：OccGrid → Costmap（走现有 convert）
+        let mut normalized_config = occupancy_cfg.clone();
+        normalized_config.pointcloud = pointcloud_config;
         let mapper = Self::new(CostMapperConfig {
-            config: occupancy_cfg.clone(),
+            config: normalized_config,
         });
-        let costmap = mapper.convert(&inflated);
+        let costmap = mapper.convert(&grid);
         (mapper, costmap)
+    }
+
+    /// Build original 1 m padded bounds and preserve cloud metadata.
+    ///
+    /// The returned occupancy grid retains `frame_id` and timestamp, while the
+    /// costmap carries the same resolution, dimensions, and origin. Existing
+    /// fixed-bounds callers can continue using [`Self::from_pointcloud`].
+    ///
+    /// # Errors
+    /// Returns [`MappingError`] for invalid resolution/configuration or bounds
+    /// that cannot be represented by the Rust grid container.
+    pub fn from_pointcloud_auto<P: PointCloud2Like + ?Sized>(
+        cloud: &P,
+        occupancy_cfg: &OccupancyConfig,
+        resolution: f64,
+    ) -> Result<(Self, OccupancyGrid, Costmap), MappingError> {
+        let pointcloud_config = selected_pointcloud_config(occupancy_cfg);
+        let mut grid = build_occupancy_auto(cloud, resolution, &pointcloud_config)?;
+        apply_initial_safe_radius(&mut grid, occupancy_cfg.initial_safe_radius_meters);
+
+        let mut normalized_config = occupancy_cfg.clone();
+        normalized_config.pointcloud = pointcloud_config;
+        let mapper = Self::new(CostMapperConfig {
+            config: normalized_config,
+        });
+        let costmap = mapper.convert(&grid);
+        Ok((mapper, grid, costmap))
     }
 }
 
@@ -269,6 +337,8 @@ impl CostAlgoSelector {
     pub fn as_dimos_str(&self) -> &'static str {
         match self {
             Self::HeightCost => "height_cost",
+            Self::General => "general",
+            Self::Simple => "simple",
             Self::Probability => "probability",
             Self::Probabilistic => "probabilistic",
         }
@@ -279,6 +349,8 @@ impl CostAlgoSelector {
     pub fn from_dimos_str(s: &str) -> Self {
         match s {
             "height_cost" => Self::HeightCost,
+            "general" => Self::General,
+            "simple" => Self::Simple,
             "probability" => Self::Probability,
             "probabilistic" => Self::Probabilistic,
             _ => Self::HeightCost,

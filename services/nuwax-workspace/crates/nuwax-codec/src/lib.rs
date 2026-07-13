@@ -25,7 +25,7 @@ pub mod lcm;
 pub mod protobuf;
 
 pub use hash::{
-    fingerprint as compute_real_lcm_fingerprint, lookup_seed, lcm_hash_64, murmur_hash64a,
+    fingerprint as compute_real_lcm_fingerprint, lcm_hash_64, lookup_seed, murmur_hash64a,
     STRUCT_SEEDS,
 };
 

@@ -1171,6 +1171,7 @@ dependencies = [
 name = "nuwax-geometry-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "memmap2",
  "nalgebra",
@@ -1180,12 +1181,12 @@ dependencies = [
  "nuwax-explore-wavefront",
  "nuwax-mapping",
  "nuwax-nav-astar",
- "nuwax-nav-basic-path-follower",
  "nuwax-nav-simple-planner",
  "nuwax-nav-stack",
  "nuwax-nav-terrain-map-ext",
  "nuwax-nav-types-messages",
  "nuwax-protocol",
+ "nuwax-rpc",
  "nuwax-tf",
  "nuwax-transport",
  "parking_lot",
@@ -1255,6 +1256,8 @@ dependencies = [
  "glam",
  "nalgebra",
  "ndarray",
+ "nuwax-core",
+ "nuwax-mapping",
  "nuwax-nav-base",
  "nuwax-nav-types-messages",
  "nuwax-numeric",
@@ -1284,6 +1287,43 @@ dependencies = [
  "nuwax-numeric",
  "serde",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "nuwax-nav-click-goal-bridge"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-base",
+ "nuwax-nav-types-messages",
+ "nuwax-numeric",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "nuwax-nav-movement-manager"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-base",
+ "nuwax-nav-types-messages",
+ "nuwax-numeric",
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "nuwax-nav-patrolling"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-base",
+ "nuwax-nav-types-messages",
+ "nuwax-numeric",
+ "rand",
+ "serde",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1302,14 +1342,22 @@ name = "nuwax-nav-stack"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "futures",
+ "nuwax-codec",
  "nuwax-nav-astar",
  "nuwax-nav-base",
  "nuwax-nav-basic-path-follower",
+ "nuwax-nav-click-goal-bridge",
+ "nuwax-nav-movement-manager",
+ "nuwax-nav-patrolling",
  "nuwax-nav-simple-planner",
  "nuwax-nav-types-messages",
+ "nuwax-protocol",
+ "nuwax-transport",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1360,6 +1408,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "nuwax-rpc"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nuwax-core",
+ "nuwax-lcm",
+ "nuwax-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

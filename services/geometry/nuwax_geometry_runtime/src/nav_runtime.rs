@@ -17,12 +17,10 @@
 //! 2. 用 `nuwax_nav_stack::NavStackBuilder` 构造 `ModuleGraph`,把节点列表
 //!    写入 diagnostics / nav state message 的 `message` 字段(便于 health
 //!    check / 日志 / CI 守门观测)。
-//! 3. `simple-2d` profile 的真实执行链:用 `nuwax-nav-basic-path-follower`
-//!    在内存里推进到下一段 cmd_vel(goal pose + 当前 pose 通过
-//!    `MovementManager` 风格的简单路径)并 publish 到 `/cmd_vel` typed channel。
-//! 4. `replanning-astar` profile:同 simple-2d,只把 module graph 里 planner
-//!    节点 ID 改成 `astar_planner`,因为该 profile 的核心算法 crate
-//!    `nuwax-nav-astar` 与 simple-2d 走同一 basic path follower。
+//! 3. goal/cancel 仅提交到真实 `nuwax-nav-stack` LCM 输入；本 facade 不持有
+//!    planner/follower,也不在 set-goal 路径发布 `/cmd_vel`。
+//! 4. `/nav/state` heartbeat/state 是 planner health、goal lifecycle 与 terminal
+//!    状态的唯一权威来源；未观测到新鲜状态时 readiness 必须失败。
 //!
 //! ## 边界
 //!
@@ -32,19 +30,16 @@
 //! - 不持有 LCM 订阅线程,所有数据流都通过 `GeometryRuntimeHandle` 的
 //!   `state.pose` / `state.map` 读取;这样可以与 `lcm_runtime.rs` 的
 //!   typed codec 路径保持一致。
-//! - 状态机:`IDLE` -> `ACCEPTED` -> `PLANNING` -> `RUNNING` -> (`SUCCEEDED` |
-//!   `CANCELLED` | `FAILED`);通过 `NavRuntimeState` 的 `RwLock<NavRuntimeSlot>`
-//!   串行化,避免多个 `set_goal` 抢占。
+//! - facade 只维护提交中的 `ACCEPTED/PENDING`；`PLANNING/RUNNING/SUCCEEDED/
+//!   CANCELLED/FAILED` 均由观测到的 stack state 推进。
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
-use nuwax_nav_basic_path_follower::{
-    BasicPathFollowerConfig, BasicPathFollowerCore, ControllerCommand, StepOutput,
-};
 use nuwax_nav_stack::{
     graph::ModuleNode, NavStackBuilder, NavStackHandle, NavStackPreset, NavStackProfile,
 };
@@ -105,6 +100,8 @@ pub enum NavPhase {
     Succeeded,
     /// 用户取消(走 /nav/cancel + zero cmd_vel 路径)。
     Cancelled,
+    /// cancel 已提交，等待 stack state 确认终态。
+    CancelPending,
     /// 失败(readiness 不通过 / 路径无法生成 / 等)。
     Failed,
 }
@@ -119,8 +116,26 @@ impl NavPhase {
             NavPhase::Running => "RUNNING",
             NavPhase::Succeeded => "SUCCEEDED",
             NavPhase::Cancelled => "CANCELLED",
+            NavPhase::CancelPending => "PENDING",
             NavPhase::Failed => "FAILED",
         }
+    }
+
+    fn from_stack_status(status: &str) -> Option<Self> {
+        match status.trim().to_ascii_uppercase().as_str() {
+            "IDLE" => Some(Self::Idle),
+            "ACCEPTED" => Some(Self::Accepted),
+            "PLANNING" => Some(Self::Planning),
+            "MOVING" | "RUNNING" => Some(Self::Running),
+            "ARRIVED" | "SUCCEEDED" => Some(Self::Succeeded),
+            "CANCELLED" | "CANCELED" => Some(Self::Cancelled),
+            "FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Cancelled | Self::Failed)
     }
 }
 
@@ -137,10 +152,10 @@ pub struct ActiveGoal {
     pub accepted_at_ns: u64,
 }
 
-/// `NavRuntime` 的内部 slot:phase + active goal + follower。
+/// `NavRuntime` 的内部 slot:facade submission phase + active goal。
 ///
-/// 一次只允许一个 active goal,新 `set_goal` 会把现有 in-flight 目标标记为
-/// `Cancelled`(并 publish /nav/cancel + zero cmd_vel)再接新目标。
+/// 一次只记录一个 active goal；新 `set_goal` 覆盖 facade 记录并由真实 stack
+/// 决定 preemption，facade 不在本地运行第二套 follower。
 pub struct NavRuntimeSlot {
     /// 当前阶段。
     pub phase: NavPhase,
@@ -148,8 +163,6 @@ pub struct NavRuntimeSlot {
     pub message: String,
     /// 当前 active goal。
     pub goal: Option<ActiveGoal>,
-    /// simple-2d / astar profile 的 path follower;其它 profile 时为 `None`。
-    pub follower: Option<BasicPathFollowerCore>,
     /// module graph 模块节点 ID 列表(diagnostics 暴露)。
     pub module_nodes: Vec<String>,
     /// 当前 profile 字符串(env 解析后)。
@@ -163,7 +176,6 @@ impl NavRuntimeSlot {
             phase: NavPhase::Idle,
             message: "空闲".into(),
             goal: None,
-            follower: None,
             module_nodes: Vec::new(),
             profile,
         }
@@ -175,7 +187,16 @@ impl NavRuntimeSlot {
 #[derive(Clone)]
 pub struct NavRuntimeState {
     inner: Arc<RwLock<NavRuntimeSlot>>,
+    stack_observation: Arc<StdMutex<StackObservation>>,
 }
+
+#[derive(Clone, Default)]
+struct StackObservation {
+    observed_at: Option<Instant>,
+    state: Option<NavState>,
+}
+
+const DEFAULT_STACK_STATE_TTL: Duration = Duration::from_secs(2);
 
 impl NavRuntimeState {
     /// 新建 nav runtime:读 env profile、build module graph、把节点 ID
@@ -205,6 +226,7 @@ impl NavRuntimeState {
         slot.module_nodes = module_nodes;
         Self {
             inner: Arc::new(RwLock::new(slot)),
+            stack_observation: Arc::new(StdMutex::new(StackObservation::default())),
         }
     }
 
@@ -234,6 +256,92 @@ impl NavRuntimeState {
             timestamp_ns: now_ns(),
         }
     }
+
+    /// Record one state emitted by the real stack and normalize an omitted
+    /// session id to the facade's currently active goal.
+    pub async fn observe_stack_state(&self, mut observed: NavState) -> NavState {
+        let previous_state = self
+            .stack_observation
+            .lock()
+            .ok()
+            .and_then(|stack| stack.state.clone());
+        {
+            let mut slot = self.inner.write().await;
+            if observed.goal_id.is_empty() {
+                if let Some(goal) = slot.goal.as_ref() {
+                    observed.goal_id = goal.id.clone();
+                } else if let Some(previous) = previous_state.as_ref().filter(|previous| {
+                    !previous.goal_id.is_empty()
+                        && previous.status.eq_ignore_ascii_case(&observed.status)
+                }) {
+                    observed.goal_id = previous.goal_id.clone();
+                }
+            }
+            if let Some(phase) = NavPhase::from_stack_status(&observed.status) {
+                slot.phase = phase;
+                slot.message = observed.message.clone();
+                if phase.is_terminal() {
+                    slot.goal = None;
+                }
+            }
+        }
+        if let Ok(mut stack) = self.stack_observation.lock() {
+            stack.observed_at = Some(Instant::now());
+            stack.state = Some(observed.clone());
+        }
+        observed
+    }
+
+    fn stack_health_snapshot(&self) -> StackHealthSnapshot {
+        let Ok(stack) = self.stack_observation.lock() else {
+            return StackHealthSnapshot::default();
+        };
+        let Some(observed_at) = stack.observed_at else {
+            return StackHealthSnapshot::default();
+        };
+        let age = observed_at.elapsed();
+        let status = stack
+            .state
+            .as_ref()
+            .map(|state| state.status.clone())
+            .unwrap_or_default();
+        StackHealthSnapshot {
+            observed: true,
+            fresh: age <= stack_state_ttl(),
+            age_ms: age.as_millis().min(u64::MAX as u128) as u64,
+            status,
+        }
+    }
+
+    /// Synchronous liveness poll used by process-level diagnostics.
+    pub fn stack_is_live(&self) -> bool {
+        self.stack_health_snapshot().fresh
+    }
+
+    #[cfg(test)]
+    fn expire_stack_observation_for_test(&self) {
+        if let Ok(mut stack) = self.stack_observation.lock() {
+            stack.observed_at =
+                Instant::now().checked_sub(stack_state_ttl() + Duration::from_millis(1));
+        }
+    }
+}
+
+#[derive(Default)]
+struct StackHealthSnapshot {
+    observed: bool,
+    fresh: bool,
+    age_ms: u64,
+    status: String,
+}
+
+fn stack_state_ttl() -> Duration {
+    std::env::var("NUWAX_NAV_STACK_STATE_TTL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_STACK_STATE_TTL)
 }
 
 /// 解析 `NUWAX_NAV_PROFILE` env 值,失败时回退到 default。
@@ -303,7 +411,7 @@ pub struct NavigationReadinessDetail {
     pub tf: bool,
     /// /map/occupancy 是否有 occupancy grid(检查 `state.map.revision > 0`)。
     pub costmap: bool,
-    /// profile 是否在 default 集合内(simple-2d / replanning-astar)。
+    /// profile 受支持，且最近收到真实 stack heartbeat/state。
     pub planner: bool,
     /// /cmd_vel channel 是否可写(transport 存在即 true)。
     pub cmd_vel_sink: bool,
@@ -328,6 +436,18 @@ pub struct NavigationReadinessDetail {
     pub cmd_vel_sink_ready: bool,
     /// 当前 profile canonical 名字(给 Python diagnostics operator 用)。
     pub active_profile: String,
+    /// 是否至少收到过一帧真实 stack state/heartbeat。
+    #[serde(default)]
+    pub stack_state_observed: bool,
+    /// 最近 stack state 是否仍在 heartbeat TTL 内。
+    #[serde(default)]
+    pub stack_state_fresh: bool,
+    /// 最近 stack state 距当前的本地单调时钟年龄。
+    #[serde(default)]
+    pub stack_last_seen_age_ms: u64,
+    /// 最近观测到的 stack 状态字符串。
+    #[serde(default)]
+    pub stack_last_status: String,
 }
 
 /// cmd_vel sink ready override(Lane 6 unit test 注入通道)。
@@ -338,7 +458,6 @@ pub struct NavigationReadinessDetail {
 /// 用 `set_cmd_vel_sink_ready_override(Some(true/false))`。
 ///
 /// 默认(`None`)时 `compute_readiness` 按 `lcm_backend_available` 估算。
-use std::sync::Mutex as StdMutex;
 static CMD_VEL_SINK_READY_OVERRIDE: StdMutex<Option<bool>> = StdMutex::new(None);
 
 /// 单元测试 / Lane 6 注入接口。传 `None` 解除 override,恢复按 backend 估算。
@@ -411,15 +530,17 @@ pub async fn compute_readiness(
     let tf_count = TF_COUNT.load(AtomicOrdering::Relaxed);
     drop(s);
     let profile = state.profile().await;
-    let planner = matches!(profile, PROFILE_SIMPLE_2D | PROFILE_REPLANNING_ASTAR);
+    let profile_supported = matches!(profile, PROFILE_SIMPLE_2D | PROFILE_REPLANNING_ASTAR);
+    let stack_health = state.stack_health_snapshot();
+    let planner = profile_supported && stack_health.fresh;
     let lcm_backend = handle.lcm_backend_available;
     // Phase 7:cmd_vel_sink_ready 由 override 控制,缺省按 lcm_backend 估算。
     // Phase 6:Lane 6 注入接口(set_cmd_vel_sink_ready_override)与 handle 上
     // 的 cmd_vel_sink_ready atomic bool 都参与决策;override > handle,
     // handle 缺省时回退 lcm_backend。
     let cmd_vel_sink = lcm_backend; // backward-compatible 字段
-    let cmd_vel_sink_ready = cmd_vel_sink_ready_override()
-        .unwrap_or_else(|| handle.cmd_vel_sink_ready());
+    let cmd_vel_sink_ready =
+        cmd_vel_sink_ready_override().unwrap_or_else(|| handle.cmd_vel_sink_ready());
     // Phase 7:backend canonical 名(用 transport_backend_name 反推)。
     let backend = match handle.transport_backend_name {
         "real-lcm" | "real-lcm-unavailable" => "RealLcm",
@@ -435,11 +556,15 @@ pub async fn compute_readiness(
         "LCM backend 不可用,nav runtime 无法发布 typed channel"
     } else if !cmd_vel_sink_ready {
         "/cmd_vel consumer + watchdog 未就绪,nav runtime 拒绝接目标"
+    } else if !stack_health.observed {
+        "尚未观测到 nuwax-nav-stack /nav/state heartbeat"
+    } else if !stack_health.fresh {
+        "nuwax-nav-stack /nav/state heartbeat 已过期"
     } else if !tf {
         "/tf 尚无有效位姿,等待 SLAM/定位 first frame"
     } else if !costmap {
         "/map/occupancy 尚未生成,nav runtime 拒绝接目标"
-    } else if !planner {
+    } else if !profile_supported {
         "current profile 不是 simple-2d / replanning-astar,P1 native profile 默认禁用"
     } else {
         "nuwax-nav-stack 已就绪"
@@ -462,6 +587,10 @@ pub async fn compute_readiness(
         costmap_revision,
         cmd_vel_sink_ready,
         active_profile: profile.to_string(),
+        stack_state_observed: stack_health.observed,
+        stack_state_fresh: stack_health.fresh,
+        stack_last_seen_age_ms: stack_health.age_ms,
+        stack_last_status: stack_health.status,
     }
 }
 
@@ -471,7 +600,8 @@ pub async fn compute_readiness(
 /// tf / costmap / planner 都齐,set_goal 也立即返回 FAILED + 该 reason,
 /// 让上层 / 前端能在日志 / NavState.message 里看到 `cmd_vel_sink=down`
 /// 阻塞原因,而不是被泛化的"未就绪"吞掉。
-pub const REJECT_REASON_CMD_VEL_SINK_DOWN: &str = "cmd_vel_sink 未就绪,SetNavigationGoal 被拒绝 (Phase 7 gate)";
+pub const REJECT_REASON_CMD_VEL_SINK_DOWN: &str =
+    "cmd_vel_sink 未就绪,SetNavigationGoal 被拒绝 (Phase 7 gate)";
 
 /// `set_goal` 的输入(已从 gRPC `NavigationGoal` 提取并归一化)。
 pub struct SetGoalInput {
@@ -483,7 +613,7 @@ pub struct SetGoalInput {
     pub target: PoseState,
 }
 
-/// `set_goal` 的输出:成功时返回 `NavigationState(ACCEPTED|RUNNING)`,
+/// `set_goal` 的输出:成功时返回 `NavigationState(ACCEPTED)`,
 /// 失败时返回带 reason 的 `Failed` state。
 pub struct SetGoalOutcome {
     /// 新的 NavState(status + message + goal_id + distance_remaining)。
@@ -496,17 +626,16 @@ pub struct CancelOutcome {
     pub state: NavState,
 }
 
-/// 真实的 `set_goal` 实现 —— 在 default profile 上用 basic path follower
-/// 推进一帧、publish `/nav/goal` + `/cmd_vel`、写 active goal、状态机
-/// 推进到 `ACCEPTED` -> `RUNNING`。
+/// Submit one goal to the real stack.
 ///
 /// 失败时返回带 `status=FAILED` 的 NavState(但 `goal_id` 保留),
 /// 不写入 active goal 也不 publish `/nav/goal`。
 pub async fn set_goal(
     handle: &GeometryRuntimeHandle,
     state: &NavRuntimeState,
-    input: SetGoalInput,
+    mut input: SetGoalInput,
 ) -> SetGoalOutcome {
+    input.target.frame_id = input.frame_id.clone();
     // 1. readiness 校验。
     let detail = compute_readiness(handle, state).await;
     if !detail.ready {
@@ -521,7 +650,10 @@ pub async fn set_goal(
         return SetGoalOutcome {
             state: NavState {
                 status: NavPhase::Failed.as_str().to_string(),
-                message: format!("SetNavigationGoal 失败:nav_runtime 未就绪 ({})", reason_label),
+                message: format!(
+                    "SetNavigationGoal 失败:nav_runtime 未就绪 ({})",
+                    reason_label
+                ),
                 goal_id: input.goal_id.clone(),
                 distance_remaining: distance_to_target(handle, &input.target).await,
                 timestamp_ns: now_ns(),
@@ -529,8 +661,34 @@ pub async fn set_goal(
         };
     }
 
-    // 2. publish /nav/goal typed frame。
+    let distance_remaining = distance_to_target(handle, &input.target).await;
+    {
+        let mut slot = state.inner.write().await;
+        slot.phase = NavPhase::Accepted;
+        slot.message = format!(
+            "导航目标已提交到真实 stack,等待 /nav/state (profile={})",
+            slot.profile
+        );
+        slot.goal = Some(ActiveGoal {
+            id: input.goal_id.clone(),
+            frame_id: input.frame_id.clone(),
+            target: input.target.clone(),
+            accepted_at_ns: now_ns(),
+        });
+    }
+
+    // 2. publish /nav/goal typed frame。Facade 不创建 follower,也不发布 cmd_vel。
     if let Err(e) = publish_goal_frame(handle, &input).await {
+        let mut slot = state.inner.write().await;
+        if slot
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.id == input.goal_id)
+        {
+            slot.goal = None;
+            slot.phase = NavPhase::Failed;
+            slot.message = format!("SetNavigationGoal 失败:publish /nav/goal 错误: {e}");
+        }
         return SetGoalOutcome {
             state: NavState {
                 status: NavPhase::Failed.as_str().to_string(),
@@ -542,158 +700,85 @@ pub async fn set_goal(
         };
     }
 
-    // 3. 推进状态机:ACCEPTED -> RUNNING(本阶段 simple planner 立即出 waypoints)。
-    let mut slot_outer = state.inner.write().await;
-    let goal = ActiveGoal {
-        id: input.goal_id.clone(),
-        frame_id: input.frame_id.clone(),
-        target: input.target.clone(),
-        accepted_at_ns: now_ns(),
-    };
-    // basic path follower:把 goal 当成单点 waypoint(2D);实际 multi-waypoint
-    // 由 simple-2d / astar planner 提供,本阶段只演示通道打通。
-    let goal_pos_2d = (input.target.x, input.target.y);
-    let cfg = BasicPathFollowerConfig::default();
-    let mut follower = match BasicPathFollowerCore::new(cfg) {
-        Ok(f) => f,
-        Err(e) => {
-            return SetGoalOutcome {
-                state: NavState {
-                    status: NavPhase::Failed.as_str().to_string(),
-                    message: format!("SetNavigationGoal 失败:构造 basic path follower 错误: {}", e),
-                    goal_id: input.goal_id.clone(),
-                    distance_remaining: distance_to_target(handle, &input.target).await,
-                    timestamp_ns: now_ns(),
-                },
-            };
-        }
-    };
-    follower.set_path(vec![point2_from_tuple(goal_pos_2d)]);
-    slot_outer.phase = NavPhase::Running;
-    slot_outer.message = format!(
-        "导航目标已接受,profile={}, module_nodes={}",
-        slot_outer.profile,
-        slot_outer.module_nodes.len()
-    );
-    slot_outer.goal = Some(goal);
-    slot_outer.follower = Some(follower);
-    let distance_remaining = distance_to_target(handle, &input.target).await;
-    drop(slot_outer);
-
-    // 4. 推进一帧(刚 set_path 后 follower 已经在 path 上,step 输出
-    //    `ControllerCommand` 并 publish 到 /cmd_vel)。
-    step_follower_and_publish_cmd_vel(handle, state).await;
-
-    let nav = state.snapshot(input.goal_id.clone(), distance_remaining).await;
-    SetGoalOutcome { state: nav }
+    SetGoalOutcome {
+        state: NavState {
+            status: NavPhase::Accepted.as_str().to_string(),
+            message: "导航目标已接受,等待真实 stack 状态".into(),
+            goal_id: input.goal_id,
+            distance_remaining,
+            timestamp_ns: now_ns(),
+        },
+    }
 }
 
-/// 取消当前 active goal:publish /nav/cancel、zero cmd_vel、状态机
-/// 切到 `Cancelled`。
+/// 请求取消当前 active goal。
 ///
-/// 即使当前没有 active goal 也不报错(返回 status=CANCELLED + reason 提示)。
+/// facade 的 publish 结果不是 terminal ack；无论成功或失败都保持 `PENDING`,
+/// 直到 `/nav/state` 明确报告 terminal cancellation。
 pub async fn cancel(
     handle: &GeometryRuntimeHandle,
     state: &NavRuntimeState,
     goal_id: String,
 ) -> CancelOutcome {
-    // 1. publish /nav/cancel typed frame。
-    if let Err(e) = publish_cancel_frame(handle, &goal_id).await {
-        warn!("publish /nav/cancel 失败: {};继续 zero cmd_vel", e);
-    }
-    // 2. zero cmd_vel:Twist 全 0,publish 到 /cmd_vel。
-    if let Err(e) = publish_zero_cmd_vel(handle).await {
-        warn!("publish zero cmd_vel 失败: {};状态机仍切到 cancelled", e);
-    }
-    // 3. 状态机切到 Cancelled。
-    let prev_goal_id;
-    let status_after;
-    let message_after;
-    {
-        let mut slot = state.inner.write().await;
-        prev_goal_id = slot.goal.as_ref().map(|g| g.id.clone());
-        slot.phase = NavPhase::Cancelled;
-        slot.goal = None;
-        slot.follower = None;
-        slot.message = format!(
-            "导航已取消(goal_id={:?} requested={:?})",
-            prev_goal_id, goal_id,
-        );
-        status_after = slot.phase.as_str().to_string();
-        message_after = slot.message.clone();
-        // slot 在 block 结束时 drop,锁随之释放。
-    }
-    // 不调 state.snapshot():cargo test 的 current_thread runtime 下,
-    // 紧跟 write 释放的 read().await 会出现 hanging(已 root cause 在
-    // phase3-5 fixup 反馈文档),改成直接构造 NavState 返回。
-    let nav = NavState {
-        status: status_after,
-        message: message_after,
-        goal_id,
-        distance_remaining: 0.0,
-        timestamp_ns: now_ns(),
+    let goal_id = if goal_id.trim().is_empty() {
+        state
+            .inner
+            .read()
+            .await
+            .goal
+            .as_ref()
+            .map(|goal| goal.id.clone())
+            .unwrap_or_default()
+    } else {
+        goal_id.trim().to_string()
     };
-    CancelOutcome { state: nav }
+    let cancel_result = publish_cancel_frame(handle, &goal_id).await;
+    let zero_result = publish_zero_cmd_vel(handle).await;
+    finish_cancel_request(state, goal_id, cancel_result, zero_result).await
 }
 
-/// 推进 follower 一帧(如有 active goal),把 cmd_vel publish 到 LCM。
-/// 如果当前位置已到达目标(距离 < arrival_tolerance),状态机切到
-/// `Succeeded` + zero cmd_vel。
-pub async fn step_follower_and_publish_cmd_vel(
-    handle: &GeometryRuntimeHandle,
+async fn finish_cancel_request(
     state: &NavRuntimeState,
-) {
+    goal_id: String,
+    cancel_result: Result<(), String>,
+    zero_result: Result<(), String>,
+) -> CancelOutcome {
     let mut slot = state.inner.write().await;
-    // 先看 active goal 是不是存在(避免下面同时持 follower mut borrow +
-    // goal imm borrow 触发 borrow checker)。
-    let goal_id = match slot.goal.as_ref() {
-        Some(g) => g.id.clone(),
-        None => return,
-    };
-    let Some(follower) = slot.follower.as_mut() else {
-        return;
-    };
-    let cur = handle.state.read().await;
-    let pos = (cur.pose.x, cur.pose.y);
-    let yaw = quat_to_yaw(cur.pose.qx, cur.pose.qy, cur.pose.qz, cur.pose.qw);
-    drop(cur);
-
-    let out: StepOutput = follower.step(point2_from_tuple(pos), yaw);
-    // follower mut borrow 已经结束,下面用 goal_id 即可。
-    // 旧 `drop(follower)` 在 clippy dropping_references 提示下改为 `let _ = ...`，
-    // 语义保持"显式结束该 borrow scope"；后续 Phase 6 收口若改用
-    // `take()` / `replace()` 模式可一并清理。
-    let _ = follower;
-    if out.no_path {
-        slot.phase = NavPhase::Failed;
-        slot.message = "basic path follower: 无路径".into();
-        slot.goal = None;
-        slot.follower = None;
-        return;
+    if slot.phase == NavPhase::Cancelled {
+        return CancelOutcome {
+            state: NavState {
+                status: slot.phase.as_str().to_string(),
+                message: slot.message.clone(),
+                goal_id,
+                distance_remaining: 0.0,
+                timestamp_ns: now_ns(),
+            },
+        };
     }
-    if out.goal_reached {
-        slot.phase = NavPhase::Succeeded;
-        slot.message = format!("已到达目标 (goal_id={})", goal_id);
-        slot.goal = None;
-        slot.follower = None;
-        // reached 后 cmd_vel 必须 zero。
-        let h = handle.clone();
-        tokio::spawn(async move {
-            if let Err(e) = publish_zero_cmd_vel(&h).await {
-                warn!("zero cmd_vel publish 失败(succeeded 后): {}", e);
-            }
-        });
-        return;
+    let mut failures = Vec::new();
+    if let Err(error) = cancel_result {
+        warn!("publish /nav/cancel 失败: {}", error);
+        failures.push(error);
     }
-    // normal moving:publish /cmd_vel typed frame。
-    let linear = [out.command.linear as f32, 0.0, 0.0];
-    let angular = [0.0, 0.0, out.command.angular as f32];
-    let h = handle.clone();
-    tokio::spawn(async move {
-        if let Err(e) = publish_cmd_vel(&h, linear, angular).await {
-            warn!("publish cmd_vel 失败: {}", e);
-        }
-    });
+    if let Err(error) = zero_result {
+        warn!("publish zero cmd_vel 失败: {}", error);
+        failures.push(error);
+    }
+    slot.phase = NavPhase::CancelPending;
+    slot.message = if failures.is_empty() {
+        "取消请求已提交,等待真实 stack terminal state".into()
+    } else {
+        format!("取消请求尚未确认: {}", failures.join("; "))
+    };
+    CancelOutcome {
+        state: NavState {
+            status: slot.phase.as_str().to_string(),
+            message: slot.message.clone(),
+            goal_id,
+            distance_remaining: 0.0,
+            timestamp_ns: now_ns(),
+        },
+    }
 }
 
 /// 计算当前位置到 target 的欧氏距离(2D 平面),给 `distance_remaining` 用。
@@ -737,22 +822,8 @@ pub fn readiness_from_reason(reason: &str) -> Option<NavigationReadinessDetail> 
 fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-    .unwrap_or_default()
-    .as_nanos() as u64
-}
-
-/// `BasicPathFollowerCore` 需要的 `Point2`。`Point2` 在 nalgebra 是
-/// `OPoint<f64, Const<2>>`,通过 `Point2::new` 构造。
-fn point2_from_tuple(t: (f64, f64)) -> nuwax_nav_basic_path_follower::Point2 {
-    nuwax_nav_basic_path_follower::Point2::new(t.0, t.1)
-}
-
-/// 把 quaternion 转 yaw(z 轴旋转角),用于 follower 输入。
-fn quat_to_yaw(qx: f64, qy: f64, qz: f64, qw: f64) -> f64 {
-    // 标准 yaw from quaternion:atan2(2(wz + xy), 1 - 2(y² + z²))
-    let siny_cosp = 2.0 * (qw * qz + qx * qy);
-    let cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz);
-    siny_cosp.atan2(cosy_cosp)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }
 
 /// Phase 4:把 `/topic#pkg.Msg` typed pattern 解析成 `LcmTopic` 与 suffix。
@@ -764,8 +835,12 @@ fn quat_to_yaw(qx: f64, qy: f64, qz: f64, qw: f64) -> f64 {
 /// **Phase 4 提升为 `pub fn`**：lcm_runtime.rs / server.rs 等模块也用此
 /// helper 解析 typed channel；原 `fn` 仅在 nav_runtime.rs 内部使用。
 pub fn parse_channel_with_suffix(channel: &str) -> Result<(LcmTopic, Option<String>), String> {
-    LcmTopic::parse_subscription_pattern(channel)
-        .map_err(|e| format!("LcmTopic::parse_subscription_pattern({}) 失败: {}", channel, e))
+    LcmTopic::parse_subscription_pattern(channel).map_err(|e| {
+        format!(
+            "LcmTopic::parse_subscription_pattern({}) 失败: {}",
+            channel, e
+        )
+    })
 }
 
 /// publish `/nav/goal` typed frame。
@@ -779,13 +854,10 @@ async fn publish_goal_frame(
         GOAL_CHANNEL_DEFAULT,
     );
     let (topic, _suffix) = parse_channel_with_suffix(&channel)?;
-    let payload = typed_codec::encode_pose_stamped_payload(&input.target);
-    let frame: RawLcmFrame = typed_codec::build_typed_frame(
-        topic,
-        goal_msg_type(),
-        payload,
-        seqno_for(handle).await,
-    );
+    let payload = typed_codec::encode_pose_stamped_payload(&input.target)
+        .map_err(|e| format!("PoseStamped LCM 编码失败: {e}"))?;
+    let frame: RawLcmFrame =
+        typed_codec::build_typed_frame(topic, goal_msg_type(), payload, seqno_for(handle).await);
     handle
         .transport
         .publish(frame)
@@ -794,17 +866,15 @@ async fn publish_goal_frame(
 }
 
 /// publish `/nav/cancel` typed frame。
-async fn publish_cancel_frame(
-    handle: &GeometryRuntimeHandle,
-    goal_id: &str,
-) -> Result<(), String> {
+async fn publish_cancel_frame(handle: &GeometryRuntimeHandle, goal_id: &str) -> Result<(), String> {
     let channel = channel_registry::resolve_channel(
         "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
         "NUWAX_LCM_CHANNEL_NAV_CANCEL",
         "/nav/cancel#nuwax_msgs.CancelNavigation",
     );
     let (topic, _suffix) = parse_channel_with_suffix(&channel)?;
-    let payload = typed_codec::encode_nav_cancel_payload(goal_id, now_ns());
+    let payload = typed_codec::encode_nav_cancel_payload(goal_id, 0)
+        .map_err(|error| format!("CancelNavigation LCM 编码失败: {error}"))?;
     let msg_type = LcmMessageType::new("nuwax_msgs/CancelNavigation")
         .map_err(|e| format!("LcmMessageType::new 失败: {}", e))?;
     let frame: RawLcmFrame =
@@ -854,18 +924,6 @@ async fn seqno_for(_handle: &GeometryRuntimeHandle) -> u64 {
     now_ns() & 0x0000_FFFF_FFFF_FFFF
 }
 
-/// ControllerCommand -> [f32;3] linear/angular 转换(给 publish_cmd_vel 用)。
-/// `ControllerCommand` 在 `nuwax-nav-basic-path-follower` 中是
-/// `linear: f64, angular: f64` 标量,不是 Vec3;所以这里把 f64 cast 到
-/// [f32; 3] 的 x 通道。
-#[allow(dead_code)]
-fn controller_to_arrays(cmd: &ControllerCommand) -> ([f32; 3], [f32; 3]) {
-    (
-        [cmd.linear as f32, 0.0, 0.0],
-        [0.0, 0.0, cmd.angular as f32],
-    )
-}
-
 // ============================================================================
 // 单元测试
 // ============================================================================
@@ -874,8 +932,32 @@ fn controller_to_arrays(cmd: &ControllerCommand) -> ([f32; 3], [f32; 3]) {
 mod tests {
     use super::*;
     use crate::lcm_runtime::{MapState, SharedState};
+    use std::ffi::OsString;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::time::sleep;
+
+    static NAV_PROFILE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct NavProfileEnvRestore(Option<OsString>);
+
+    impl Drop for NavProfileEnvRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("NUWAX_NAV_PROFILE", value),
+                None => std::env::remove_var("NUWAX_NAV_PROFILE"),
+            }
+        }
+    }
+
+    fn set_nav_profile_for_test(value: Option<&str>) -> NavProfileEnvRestore {
+        let previous = std::env::var_os("NUWAX_NAV_PROFILE");
+        match value {
+            Some(value) => std::env::set_var("NUWAX_NAV_PROFILE", value),
+            None => std::env::remove_var("NUWAX_NAV_PROFILE"),
+        }
+        NavProfileEnvRestore(previous)
+    }
 
     /// 构造一个测试 handle:test backend(走 real-lcm + test_lcm_url 隔离端口)+ 一个非空 pose 与 map。
     ///
@@ -916,22 +998,29 @@ mod tests {
 
     #[test]
     fn resolve_profile_uses_default_when_unset() {
-        std::env::remove_var("NUWAX_NAV_PROFILE");
+        let _lock = NAV_PROFILE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = set_nav_profile_for_test(None);
         assert_eq!(resolve_profile_from_env(), PROFILE_SIMPLE_2D);
     }
 
     #[test]
     fn resolve_profile_uses_set_value() {
-        std::env::set_var("NUWAX_NAV_PROFILE", "replanning-astar");
+        let _lock = NAV_PROFILE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = set_nav_profile_for_test(Some("replanning-astar"));
         assert_eq!(resolve_profile_from_env(), PROFILE_REPLANNING_ASTAR);
-        std::env::remove_var("NUWAX_NAV_PROFILE");
     }
 
     #[test]
     fn resolve_profile_falls_back_on_unknown() {
-        std::env::set_var("NUWAX_NAV_PROFILE", "hologram");
+        let _lock = NAV_PROFILE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = set_nav_profile_for_test(Some("hologram"));
         assert_eq!(resolve_profile_from_env(), DEFAULT_PROFILE);
-        std::env::remove_var("NUWAX_NAV_PROFILE");
     }
 
     #[test]
@@ -943,6 +1032,7 @@ mod tests {
         assert_eq!(NavPhase::Running.as_str(), "RUNNING");
         assert_eq!(NavPhase::Succeeded.as_str(), "SUCCEEDED");
         assert_eq!(NavPhase::Cancelled.as_str(), "CANCELLED");
+        assert_eq!(NavPhase::CancelPending.as_str(), "PENDING");
         assert_eq!(NavPhase::Failed.as_str(), "FAILED");
     }
 
@@ -964,6 +1054,10 @@ mod tests {
             costmap_revision: 3,
             cmd_vel_sink_ready: true,
             active_profile: PROFILE_SIMPLE_2D.into(),
+            stack_state_observed: true,
+            stack_state_fresh: true,
+            stack_last_seen_age_ms: 10,
+            stack_last_status: "IDLE".into(),
         };
         let s = readiness_to_reason(&d);
         let back = readiness_from_reason(&s).expect("parse");
@@ -976,13 +1070,15 @@ mod tests {
         assert_eq!(back.costmap_revision, d.costmap_revision);
         assert_eq!(back.cmd_vel_sink_ready, d.cmd_vel_sink_ready);
         assert_eq!(back.active_profile, d.active_profile);
+        assert_eq!(back.stack_state_observed, d.stack_state_observed);
+        assert_eq!(back.stack_state_fresh, d.stack_state_fresh);
     }
 
     /// Phase 6 / Rework-9:Lane 6 注入接口(setter) → handle.cmd_vel_sink_ready() → readiness。
     ///
     /// 验证:
     /// - test helper `build_handle_for_tests` 默认 `true`(单测兼容,
-///   2026-07-08 fake-lcm 物理删除后,test helper 改走 real backend)
+    ///   2026-07-08 fake-lcm 物理删除后,test helper 改走 real backend)
     /// - 生产 `spawn_geometry_runtime` 默认 `false`(由 Python 写回)
     /// - setter 写入后立刻被 readiness 读到
     /// - override 优先级 > handle(setter 不影响 override 分支)
@@ -995,23 +1091,31 @@ mod tests {
             .expect("handle");
         let state = NavRuntimeState::from_env();
         // 1. test helper 默认值 true(无 override 时 readiness.cmd_vel_sink_ready 跟 lcm_backend)
-        assert!(handle.cmd_vel_sink_ready(),
-            "test helper 默认 cmd_vel_sink_ready 必须 true");
+        assert!(
+            handle.cmd_vel_sink_ready(),
+            "test helper 默认 cmd_vel_sink_ready 必须 true"
+        );
         // 2. setter 关掉
         handle.set_cmd_vel_sink_ready(false);
         // 3. readiness 必须反映 handle 关掉的状态(override=None → 回退 handle.cmd_vel_sink_ready())
         let d = compute_readiness(&handle, &state).await;
-        assert!(!d.cmd_vel_sink_ready,
-            "setter 写入 false 后,readiness.cmd_vel_sink_ready 必须 false");
-        assert!(!d.ready,
-            "cmd_vel_sink_ready=false 时 readiness.ready 必须 false");
-        assert!(d.reason.contains("cmd_vel"),
-            "readiness.reason 必须含 cmd_vel 提示,实际={}", d.reason);
+        assert!(
+            !d.cmd_vel_sink_ready,
+            "setter 写入 false 后,readiness.cmd_vel_sink_ready 必须 false"
+        );
+        assert!(
+            !d.ready,
+            "cmd_vel_sink_ready=false 时 readiness.ready 必须 false"
+        );
+        assert!(
+            d.reason.contains("cmd_vel"),
+            "readiness.reason 必须含 cmd_vel 提示,实际={}",
+            d.reason
+        );
         // 4. override 优先级 > handle:override=true 覆盖 handle=false
         set_cmd_vel_sink_ready_override(Some(true));
         let d2 = compute_readiness(&handle, &state).await;
-        assert!(d2.cmd_vel_sink_ready,
-            "override=true 应覆盖 handle=false");
+        assert!(d2.cmd_vel_sink_ready, "override=true 应覆盖 handle=false");
         set_cmd_vel_sink_ready_override(None);
         // 5. 清理
         handle.set_cmd_vel_sink_ready(true);
@@ -1034,17 +1138,22 @@ mod tests {
             .await
             .expect("handle");
         let state = NavRuntimeState::from_env();
-        assert!(handle.cmd_vel_sink_ready(),
-            "test helper 必须默认 true(test helper 不接 Python bridge)");
+        assert!(
+            handle.cmd_vel_sink_ready(),
+            "test helper 必须默认 true(test helper 不接 Python bridge)"
+        );
         // setter 关掉后:
         handle.set_cmd_vel_sink_ready(false);
         let d = compute_readiness(&handle, &state).await;
         assert!(!d.ready, "setter=false 后 readiness 必须 false");
         assert!(!d.cmd_vel_sink_ready);
-        let reason_contains = d.reason.contains("cmd_vel")
-            || d.reason.contains(REJECT_REASON_CMD_VEL_SINK_DOWN);
-        assert!(reason_contains,
-            "reason 必须指向 cmd_vel sink 未就绪,实际={}", d.reason);
+        let reason_contains =
+            d.reason.contains("cmd_vel") || d.reason.contains(REJECT_REASON_CMD_VEL_SINK_DOWN);
+        assert!(
+            reason_contains,
+            "reason 必须指向 cmd_vel sink 未就绪,实际={}",
+            d.reason
+        );
         // 清理
         handle.set_cmd_vel_sink_ready(true);
     }
@@ -1123,7 +1232,10 @@ mod tests {
         assert_eq!(d.backend, "RealLcm");
         assert_eq!(d.tf_count, 0);
         assert_eq!(d.costmap_revision, 0);
-        assert!(d.cmd_vel_sink_ready, "test handle 默认 lcm_backend=true → sink ready=true");
+        assert!(
+            d.cmd_vel_sink_ready,
+            "test handle 默认 lcm_backend=true → sink ready=true"
+        );
         assert_eq!(d.active_profile, PROFILE_SIMPLE_2D);
     }
 
@@ -1139,33 +1251,6 @@ mod tests {
     fn ensure_goal_id_trims_and_preserves() {
         assert_eq!(ensure_goal_id("  abc  "), "abc");
         assert_eq!(ensure_goal_id("xyz-1"), "xyz-1");
-    }
-
-    #[tokio::test]
-    async fn set_goal_running_with_path_follower() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let input = SetGoalInput {
-            goal_id: "g1".into(),
-            frame_id: "map".into(),
-            target: PoseState {
-                x: 1.0,
-                y: 0.0,
-                z: 0.0,
-                qx: 0.0,
-                qy: 0.0,
-                qz: 0.0,
-                qw: 1.0,
-                frame_id: "map".into(),
-                timestamp_ns: 0,
-            },
-        };
-        let outcome = set_goal(&handle, &state, input).await;
-        assert_eq!(outcome.state.status, "RUNNING");
-        assert_eq!(outcome.state.goal_id, "g1");
-        let slot = state.inner.read().await;
-        assert_eq!(slot.phase, NavPhase::Running);
-        assert!(slot.follower.is_some());
     }
 
     #[tokio::test]
@@ -1199,6 +1284,7 @@ mod tests {
     async fn cancel_clears_active_goal() {
         let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
+        observe_healthy_stack(&state).await;
         let input = SetGoalInput {
             goal_id: "g3".into(),
             frame_id: "map".into(),
@@ -1215,11 +1301,12 @@ mod tests {
             },
         };
         let _ = set_goal(&handle, &state, input).await;
-        let outcome = cancel(&handle, &state, "g3".into()).await;
-        assert_eq!(outcome.state.status, "CANCELLED");
+        let outcome = cancel(&handle, &state, String::new()).await;
+        assert_eq!(outcome.state.status, "PENDING");
+        assert_eq!(outcome.state.goal_id, "g3");
         let slot = state.inner.read().await;
-        assert_eq!(slot.phase, NavPhase::Cancelled);
-        assert!(slot.follower.is_none());
+        assert_eq!(slot.phase, NavPhase::CancelPending);
+        assert!(slot.goal.is_some());
     }
 
     #[tokio::test]
@@ -1227,43 +1314,7 @@ mod tests {
         let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
         let outcome = cancel(&handle, &state, "".into()).await;
-        assert_eq!(outcome.state.status, "CANCELLED");
-    }
-
-    #[tokio::test]
-    async fn step_follower_publishes_cmd_vel() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let _ = set_goal(
-            &handle,
-            &state,
-            SetGoalInput {
-                goal_id: "g4".into(),
-                frame_id: "map".into(),
-                target: PoseState {
-                    x: 1.0,
-                    y: 0.0,
-                    z: 0.0,
-                    qx: 0.0,
-                    qy: 0.0,
-                    qz: 0.0,
-                    qw: 1.0,
-                    frame_id: "map".into(),
-                    timestamp_ns: 0,
-                },
-            },
-        )
-        .await;
-        // 推 1 帧;由于当前位置 == 起点,follower 给出 waypoint cmd_vel。
-        step_follower_and_publish_cmd_vel(&handle, &state).await;
-        sleep(Duration::from_millis(50)).await;
-        // 不验证具体 cmd_vel bytes(隔离端口不直接 inspect),
-        // 验证 step 后 state 没崩、phase 仍是 Running(除非一步到 goal)。
-        let slot = state.inner.read().await;
-        assert!(matches!(
-            slot.phase,
-            NavPhase::Running | NavPhase::Succeeded | NavPhase::Failed
-        ));
+        assert_eq!(outcome.state.status, "PENDING");
     }
 
     #[tokio::test]
@@ -1280,7 +1331,9 @@ mod tests {
         assert!(!d.costmap);
         assert_eq!(d.profile, PROFILE_SIMPLE_2D);
         // p1 profile 列表必须包含 cmu-native / exploration-native / mls3d
-        assert!(d.p1_native_profiles.contains(&PROFILE_CMU_NATIVE.to_string()));
+        assert!(d
+            .p1_native_profiles
+            .contains(&PROFILE_CMU_NATIVE.to_string()));
         assert!(d
             .p1_native_profiles
             .contains(&PROFILE_EXPLORATION_NATIVE.to_string()));
@@ -1311,5 +1364,165 @@ mod tests {
         // 但留 regression test)。
         let s = SharedState::default();
         assert_eq!(s.nav_state.status, "IDLE");
+    }
+
+    async fn observe_healthy_stack(state: &NavRuntimeState) {
+        state
+            .observe_stack_state(NavState {
+                status: "IDLE".into(),
+                message: "nav-stack healthy".into(),
+                goal_id: String::new(),
+                distance_remaining: 0.0,
+                timestamp_ns: now_ns(),
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_fresh_stack_state_observation() {
+        let handle = make_handle().await;
+        let state = NavRuntimeState::from_env();
+
+        let missing = compute_readiness(&handle, &state).await;
+        assert!(!missing.ready);
+        assert!(!missing.planner);
+        assert!(!missing.stack_state_observed);
+
+        observe_healthy_stack(&state).await;
+        let live = compute_readiness(&handle, &state).await;
+        assert!(live.ready, "{}", live.reason);
+        assert!(live.planner);
+        assert!(live.stack_state_observed);
+        assert!(live.stack_state_fresh);
+
+        state.expire_stack_observation_for_test();
+        let stale = compute_readiness(&handle, &state).await;
+        assert!(!stale.ready);
+        assert!(!stale.planner);
+        assert!(stale.stack_state_observed);
+        assert!(!stale.stack_state_fresh);
+    }
+
+    #[tokio::test]
+    async fn set_goal_only_publishes_goal_and_returns_accepted() {
+        use futures::StreamExt;
+
+        let handle = make_handle().await;
+        let state = NavRuntimeState::from_env();
+        observe_healthy_stack(&state).await;
+        let cmd_channel = channel_registry::resolve_channel(
+            "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
+            "NUWAX_LCM_CHANNEL_CMD_VEL",
+            "/cmd_vel#geometry_msgs.Twist",
+        );
+        let (cmd_topic, _) = parse_channel_with_suffix(&cmd_channel).expect("cmd topic");
+        let mut commands = handle
+            .transport
+            .subscribe(
+                cmd_topic,
+                Some(LcmMessageType::new("geometry_msgs/Twist").expect("Twist type")),
+            )
+            .await;
+        let goal_channel = channel_registry::resolve_channel(
+            GOAL_CHANNEL_RUNTIME,
+            GOAL_CHANNEL_PLATFORM,
+            GOAL_CHANNEL_DEFAULT,
+        );
+        let (goal_topic, _) = parse_channel_with_suffix(&goal_channel).expect("goal topic");
+        let mut goals = handle
+            .transport
+            .subscribe(goal_topic, Some(goal_msg_type()))
+            .await;
+        sleep(Duration::from_millis(30)).await;
+
+        let outcome = set_goal(
+            &handle,
+            &state,
+            SetGoalInput {
+                goal_id: "stack-owned-goal".into(),
+                frame_id: "map".into(),
+                target: PoseState {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                    qx: 0.0,
+                    qy: 0.0,
+                    qz: 0.0,
+                    qw: 1.0,
+                    frame_id: String::new(),
+                    timestamp_ns: now_ns(),
+                },
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.state.status, "ACCEPTED");
+        assert_eq!(outcome.state.goal_id, "stack-owned-goal");
+        let goal = tokio::time::timeout(Duration::from_secs(1), goals.next())
+            .await
+            .expect("goal was not published")
+            .expect("goal stream closed")
+            .expect("goal transport error");
+        let mut encoded_goal = nuwax_codec::lcm::schema::POSE_STAMPED_FINGERPRINT.to_vec();
+        encoded_goal.extend_from_slice(&goal.payload);
+        let goal = nuwax_codec::lcm::schema::decode_pose_stamped(&encoded_goal)
+            .expect("decode submitted goal");
+        assert_eq!(goal.header.frame_id, "map");
+        assert_eq!(goal.pose.position[0], 1.0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), commands.next())
+                .await
+                .is_err(),
+            "geometry facade must not publish an immediate /cmd_vel"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_publish_failures_remain_nonterminal_until_stack_state() {
+        let state = NavRuntimeState::from_env();
+        {
+            let mut slot = state.inner.write().await;
+            slot.goal = Some(ActiveGoal {
+                id: "cancel-me".into(),
+                frame_id: "map".into(),
+                target: PoseState::default(),
+                accepted_at_ns: now_ns(),
+            });
+        }
+
+        let outcome = finish_cancel_request(
+            &state,
+            "cancel-me".into(),
+            Err("cancel publish failed".into()),
+            Err("zero publish failed".into()),
+        )
+        .await;
+        assert_eq!(outcome.state.status, "PENDING");
+        assert!(outcome.state.message.contains("cancel publish failed"));
+        assert!(outcome.state.message.contains("zero publish failed"));
+        assert!(state.inner.read().await.goal.is_some());
+
+        let observed = state
+            .observe_stack_state(NavState {
+                status: "CANCELLED".into(),
+                message: "stack acknowledged cancellation".into(),
+                goal_id: "cancel-me".into(),
+                distance_remaining: 0.0,
+                timestamp_ns: now_ns(),
+            })
+            .await;
+        assert_eq!(observed.status, "CANCELLED");
+        assert!(state.inner.read().await.goal.is_none());
+
+        let repeated = state
+            .observe_stack_state(NavState {
+                status: "CANCELLED".into(),
+                message: "stack acknowledged cancellation".into(),
+                goal_id: String::new(),
+                distance_remaining: 0.0,
+                timestamp_ns: now_ns(),
+            })
+            .await;
+        assert_eq!(repeated.goal_id, "cancel-me");
     }
 }

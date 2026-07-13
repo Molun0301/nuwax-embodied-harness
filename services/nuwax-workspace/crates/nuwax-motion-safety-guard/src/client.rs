@@ -1,0 +1,934 @@
+//! Persistent fail-closed client for the private motion-guard Unix socket.
+//!
+//! The client owns one persistent connection and one NAV-scoped lease. It does
+//! not reconnect after an ambiguous transport or protocol failure and it does
+//! not spawn a renewal task; the NAV runtime remains the only scheduler owner.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use prost::Message;
+use rustix::time::{clock_gettime, ClockId};
+use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::time::timeout;
+use uuid::Uuid;
+
+use crate::constants::{
+    COMMAND_DEADLINE_MS, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_UDS_PATH, MAX_FRAME_BYTES,
+    RENEW_INTERVAL_MS,
+};
+use crate::crypto::sha256;
+use crate::wire::{
+    motion_guard_request, motion_guard_response, submit_motion_command_request, AckCode,
+    AcquireLeaseRequest, AcquireLeaseResponse, GetReadinessRequest, GuardAction, GuardResult,
+    GuardSource, LeaseState, LeaseTuple, MotionGuardRequest, MotionGuardResponse,
+    RenewLeaseRequest, RenewLeaseResponse, RequestEnvelope, RevokeAndZeroRequest, SafetyGate,
+    StopCommand, SubmitMotionCommandRequest, TwistCommand, ZeroAck, API_VERSION,
+};
+
+const BOOT_NONCE_BYTES: usize = 16;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+const NANOS_PER_MILLISECOND: u64 = 1_000_000;
+
+/// Connection and framing settings for [`MotionGuardClient`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientConfig {
+    /// Private motion-guard Unix socket path.
+    pub socket_path: PathBuf,
+    /// Maximum duration of one write plus its correlated response read.
+    pub request_timeout: Duration,
+    /// Maximum protobuf body size, excluding the four-byte prefix.
+    pub max_frame_bytes: usize,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: PathBuf::from(DEFAULT_UDS_PATH),
+            request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
+            max_frame_bytes: MAX_FRAME_BYTES,
+        }
+    }
+}
+
+/// Typed NAV readiness returned by the guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessStatus {
+    /// Whether a NAV lease may be acquired now.
+    pub ready: bool,
+    /// Whether the production actuator was configured.
+    pub actuator_configured: bool,
+    /// Whether this boot epoch is durable.
+    pub epoch_durable: bool,
+    /// Guard-provided diagnostic reason.
+    pub reason: String,
+    /// Durable boot generation.
+    pub generation: u64,
+    /// Sixteen-byte boot nonce.
+    pub boot_nonce: Vec<u8>,
+}
+
+/// Lease acquisition result and the required renewal cadence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeaseMetadata {
+    /// Authoritative epoch and lease tuple.
+    pub lease_tuple: LeaseTuple,
+    /// Absolute lease deadline on Linux `CLOCK_MONOTONIC`.
+    pub lease_deadline_monotonic_ns: u64,
+    /// Current owner watchdog deadline on Linux `CLOCK_MONOTONIC`.
+    pub owner_deadline_monotonic_ns: u64,
+    /// Frozen interval at which the NAV scheduler must call `renew_lease`.
+    pub renew_interval: Duration,
+}
+
+/// Metadata returned after one correlated lease renewal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewalMetadata {
+    /// Absolute lease deadline, which renew does not extend.
+    pub lease_deadline_monotonic_ns: u64,
+    /// Updated owner watchdog deadline.
+    pub owner_deadline_monotonic_ns: u64,
+    /// Frozen interval for the next scheduler-owned renewal.
+    pub renew_interval: Duration,
+}
+
+/// Correlated terminal confirmation for an applied motion command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandConfirmation {
+    /// Caller-provided idempotency key.
+    pub operation_id: String,
+    /// Guard-side monotonic time sampled after actuator application.
+    pub applied_monotonic_ns: u64,
+}
+
+/// Correlated proof that the actuator accepted a zero command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZeroConfirmation {
+    /// Non-empty guard-generated zero acknowledgement id.
+    pub zero_ack_id: String,
+    /// Guard-side monotonic time sampled after zero application.
+    pub applied_monotonic_ns: u64,
+}
+
+/// Observable client failures.
+#[derive(Debug, Error)]
+pub enum MotionGuardClientError {
+    /// Local configuration or caller input violates the wire contract.
+    #[error("invalid motion-guard client input: {0}")]
+    InvalidInput(String),
+    /// Initial connection or an established stream failed.
+    #[error("motion-guard transport failed: {0}")]
+    Transport(String),
+    /// A request exceeded its configured write/read deadline.
+    #[error("motion-guard request timed out; outcome for `{operation_id}` is unknown")]
+    Timeout {
+        /// Mutation operation id, or an empty string for readiness.
+        operation_id: String,
+    },
+    /// The peer returned bytes that violate correlation or protobuf semantics.
+    #[error("motion-guard protocol violation: {0}")]
+    Protocol(String),
+    /// The guard returned a typed application error.
+    #[error("motion guard rejected `{operation_id}` with {code}: {message}")]
+    Remote {
+        /// Stable guard error code.
+        code: String,
+        /// Guard diagnostic message.
+        message: String,
+        /// Whether the guard classifies the failure as retryable.
+        retryable: bool,
+        /// Mutation operation id, or an empty string for readiness.
+        operation_id: String,
+    },
+    /// Readiness was correlated but did not permit lease acquisition.
+    #[error("motion guard is not ready: {reason}")]
+    NotReady {
+        /// Guard diagnostic reason.
+        reason: String,
+    },
+    /// A prior timeout, EOF, framing error, or protocol mismatch poisoned the stream.
+    #[error("motion-guard client is poisoned after: {reason}")]
+    Poisoned {
+        /// First failure that made the connection unusable.
+        reason: String,
+    },
+}
+
+/// Persistent NAV-scoped private-UDS client.
+///
+/// All methods take `&mut self`, so requests, renewals, commands, and fencing
+/// have one strict order on the single connection. A timeout or protocol
+/// mismatch closes the connection and permanently poisons this value.
+pub struct MotionGuardClient {
+    stream: Option<UnixStream>,
+    config: ClientConfig,
+    lease_tuple: Option<LeaseTuple>,
+    sequence: u64,
+    poison_reason: Option<String>,
+}
+
+impl MotionGuardClient {
+    /// Connects one persistent NAV client to `socket_path`.
+    pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, MotionGuardClientError> {
+        let config = ClientConfig {
+            socket_path: socket_path.as_ref().to_path_buf(),
+            ..ClientConfig::default()
+        };
+        Self::connect_with_config(config).await
+    }
+
+    /// Connects one persistent NAV client using explicit bounds.
+    pub async fn connect_with_config(config: ClientConfig) -> Result<Self, MotionGuardClientError> {
+        validate_config(&config)?;
+        let stream = timeout(
+            config.request_timeout,
+            UnixStream::connect(&config.socket_path),
+        )
+        .await
+        .map_err(|_| MotionGuardClientError::Transport("Unix socket connect timed out".into()))?
+        .map_err(|error| MotionGuardClientError::Transport(error.to_string()))?;
+        Ok(Self {
+            stream: Some(stream),
+            config,
+            lease_tuple: None,
+            sequence: 0,
+            poison_reason: None,
+        })
+    }
+
+    /// Returns the source identity fixed for every request from this client.
+    #[must_use]
+    pub const fn source(&self) -> GuardSource {
+        GuardSource::Nav
+    }
+
+    /// Returns the frozen scheduler-owned renewal interval (250 ms).
+    #[must_use]
+    pub const fn renew_interval(&self) -> Duration {
+        Duration::from_millis(RENEW_INTERVAL_MS)
+    }
+
+    /// Returns whether this connection was permanently poisoned.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poison_reason.is_some()
+    }
+
+    /// Returns the active lease tuple, if acquisition succeeded and fencing has not.
+    #[must_use]
+    pub fn active_lease(&self) -> Option<&LeaseTuple> {
+        self.lease_tuple.as_ref()
+    }
+
+    /// Queries and strictly validates NAV readiness on the persistent stream.
+    pub async fn get_readiness(&mut self) -> Result<ReadinessStatus, MotionGuardClientError> {
+        let request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::GetReadiness(
+                GetReadinessRequest {
+                    source: GuardSource::Nav as i32,
+                },
+            )),
+        };
+        let outcome = self
+            .exchange(request, OutcomeKind::GetReadiness, AckCode::Received)
+            .await?;
+        let motion_guard_response::Outcome::GetReadiness(response) = outcome else {
+            unreachable!("exchange already correlated the outcome")
+        };
+        validate_epoch(response.generation, &response.boot_nonce)
+            .or_else(|message| self.protocol_error(message))?;
+        Ok(ReadinessStatus {
+            ready: response.ready,
+            actuator_configured: response.actuator_configured,
+            epoch_durable: response.epoch_durable,
+            reason: response.reason,
+            generation: response.generation,
+            boot_nonce: response.boot_nonce,
+        })
+    }
+
+    /// Checks NAV readiness and acquires a source-scoped lease at sequence zero.
+    pub async fn acquire_lease(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<LeaseMetadata, MotionGuardClientError> {
+        self.ensure_usable()?;
+        if self.lease_tuple.is_some() {
+            return Err(MotionGuardClientError::InvalidInput(
+                "a NAV lease is already active".into(),
+            ));
+        }
+        let operation_id = validate_operation_id(operation_id)?;
+        let readiness = self.get_readiness().await?;
+        if !readiness.ready || !readiness.actuator_configured || !readiness.epoch_durable {
+            return Err(MotionGuardClientError::NotReady {
+                reason: readiness.reason,
+            });
+        }
+        let epoch_tuple = LeaseTuple {
+            generation: readiness.generation,
+            boot_nonce: readiness.boot_nonce.clone(),
+            lease_id: 0,
+        };
+        let envelope =
+            self.new_envelope(epoch_tuple, GuardAction::Unspecified, &operation_id, 0)?;
+        let mut request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::AcquireLease(
+                AcquireLeaseRequest {
+                    envelope: Some(envelope),
+                },
+            )),
+        };
+        seal_request(&mut request)?;
+        let outcome = self
+            .exchange(request, OutcomeKind::AcquireLease, AckCode::Received)
+            .await?;
+        let motion_guard_response::Outcome::AcquireLease(response) = outcome else {
+            unreachable!("exchange already correlated the outcome")
+        };
+        let metadata = self.validate_acquire(response, &readiness)?;
+        self.sequence = 0;
+        self.lease_tuple = Some(metadata.lease_tuple.clone());
+        Ok(metadata)
+    }
+
+    /// Renews the active NAV lease using the next strict sequence number.
+    pub async fn renew_lease(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<RenewalMetadata, MotionGuardClientError> {
+        let operation_id = validate_operation_id(operation_id)?;
+        let envelope = self.next_envelope(GuardAction::Unspecified, &operation_id)?;
+        let mut request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::RenewLease(
+                RenewLeaseRequest {
+                    envelope: Some(envelope),
+                },
+            )),
+        };
+        seal_request(&mut request)?;
+        let outcome = self
+            .exchange(request, OutcomeKind::RenewLease, AckCode::Received)
+            .await?;
+        let motion_guard_response::Outcome::RenewLease(response) = outcome else {
+            unreachable!("exchange already correlated the outcome")
+        };
+        self.validate_renewal(response)
+    }
+
+    /// Submits a typed twist and waits for a correlated `APPLIED` acknowledgement.
+    pub async fn submit_twist(
+        &mut self,
+        operation_id: &str,
+        twist: TwistCommand,
+    ) -> Result<CommandConfirmation, MotionGuardClientError> {
+        validate_twist(&twist)?;
+        let operation_id = validate_operation_id(operation_id)?;
+        let envelope = self.next_envelope(GuardAction::Twist, &operation_id)?;
+        let mut request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::SubmitMotionCommand(
+                SubmitMotionCommandRequest {
+                    envelope: Some(envelope),
+                    command: Some(submit_motion_command_request::Command::Twist(twist)),
+                },
+            )),
+        };
+        seal_request(&mut request)?;
+        let outcome = self
+            .exchange(request, OutcomeKind::SubmitMotionCommand, AckCode::Applied)
+            .await?;
+        let motion_guard_response::Outcome::SubmitMotionCommand(response) = outcome else {
+            unreachable!("exchange already correlated the outcome")
+        };
+        if response.applied_monotonic_ns == 0 {
+            return self.protocol_error("APPLIED response has no application timestamp");
+        }
+        if response.zero_ack.is_some() {
+            return self.protocol_error("twist APPLIED response unexpectedly contains ZeroAck");
+        }
+        Ok(CommandConfirmation {
+            operation_id,
+            applied_monotonic_ns: response.applied_monotonic_ns,
+        })
+    }
+
+    /// Submits a typed stop and waits for its non-empty `ZEROED` acknowledgement.
+    pub async fn submit_stop(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<ZeroConfirmation, MotionGuardClientError> {
+        let operation_id = validate_operation_id(operation_id)?;
+        let envelope = self.next_envelope(GuardAction::Stop, &operation_id)?;
+        let mut request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::SubmitMotionCommand(
+                SubmitMotionCommandRequest {
+                    envelope: Some(envelope),
+                    command: Some(submit_motion_command_request::Command::Stop(StopCommand {})),
+                },
+            )),
+        };
+        seal_request(&mut request)?;
+        let outcome = self
+            .exchange(request, OutcomeKind::SubmitMotionCommand, AckCode::Zeroed)
+            .await?;
+        let motion_guard_response::Outcome::SubmitMotionCommand(response) = outcome else {
+            unreachable!("exchange already correlated the outcome")
+        };
+        let zero = response
+            .zero_ack
+            .ok_or_else(|| "ZEROED stop response has no ZeroAck".to_string())
+            .and_then(validate_zero_ack)
+            .or_else(|message| self.protocol_error(message))?;
+        if response.applied_monotonic_ns == 0 {
+            return self.protocol_error("ZEROED stop response has no application timestamp");
+        }
+        Ok(zero)
+    }
+
+    /// Atomically revokes the active lease, applies zero, and waits for fencing proof.
+    ///
+    /// The lease is cleared only after `RESOURCE_FENCED` and a non-empty `ZeroAck`
+    /// correlate on the same request. Any timeout or mismatch poisons the client.
+    pub async fn revoke_and_zero(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<ZeroConfirmation, MotionGuardClientError> {
+        let operation_id = validate_operation_id(operation_id)?;
+        let envelope = self.next_envelope(GuardAction::Stop, &operation_id)?;
+        let mut request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::RevokeAndZero(
+                RevokeAndZeroRequest {
+                    envelope: Some(envelope),
+                },
+            )),
+        };
+        seal_request(&mut request)?;
+        let outcome = self
+            .exchange(request, OutcomeKind::RevokeAndZero, AckCode::ResourceFenced)
+            .await?;
+        let motion_guard_response::Outcome::RevokeAndZero(response) = outcome else {
+            unreachable!("exchange already correlated the outcome")
+        };
+        let zero = response
+            .zero_ack
+            .ok_or_else(|| "RESOURCE_FENCED response has no ZeroAck".to_string())
+            .and_then(validate_zero_ack)
+            .or_else(|message| self.protocol_error(message))?;
+        self.lease_tuple = None;
+        self.sequence = 0;
+        Ok(zero)
+    }
+
+    fn validate_acquire(
+        &mut self,
+        response: AcquireLeaseResponse,
+        readiness: &ReadinessStatus,
+    ) -> Result<LeaseMetadata, MotionGuardClientError> {
+        let tuple = response
+            .lease_tuple
+            .ok_or_else(|| "AcquireLease response has no lease tuple".to_string())
+            .or_else(|message| self.protocol_error(message))?;
+        if tuple.generation != readiness.generation
+            || tuple.boot_nonce != readiness.boot_nonce
+            || tuple.lease_id == 0
+        {
+            return self.protocol_error("AcquireLease response has an invalid lease tuple");
+        }
+        validate_deadlines(
+            response.lease_deadline_monotonic_ns,
+            response.owner_deadline_monotonic_ns,
+        )
+        .or_else(|message| self.protocol_error(message))?;
+        Ok(LeaseMetadata {
+            lease_tuple: tuple,
+            lease_deadline_monotonic_ns: response.lease_deadline_monotonic_ns,
+            owner_deadline_monotonic_ns: response.owner_deadline_monotonic_ns,
+            renew_interval: self.renew_interval(),
+        })
+    }
+
+    fn validate_renewal(
+        &mut self,
+        response: RenewLeaseResponse,
+    ) -> Result<RenewalMetadata, MotionGuardClientError> {
+        validate_deadlines(
+            response.lease_deadline_monotonic_ns,
+            response.owner_deadline_monotonic_ns,
+        )
+        .or_else(|message| self.protocol_error(message))?;
+        Ok(RenewalMetadata {
+            lease_deadline_monotonic_ns: response.lease_deadline_monotonic_ns,
+            owner_deadline_monotonic_ns: response.owner_deadline_monotonic_ns,
+            renew_interval: self.renew_interval(),
+        })
+    }
+
+    fn next_envelope(
+        &mut self,
+        action: GuardAction,
+        operation_id: &str,
+    ) -> Result<RequestEnvelope, MotionGuardClientError> {
+        self.ensure_usable()?;
+        let tuple = self
+            .lease_tuple
+            .clone()
+            .ok_or_else(|| MotionGuardClientError::InvalidInput("no active NAV lease".into()))?;
+        self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
+            MotionGuardClientError::InvalidInput("lease sequence exhausted u64".into())
+        })?;
+        self.new_envelope(tuple, action, operation_id, self.sequence)
+    }
+
+    fn new_envelope(
+        &self,
+        tuple: LeaseTuple,
+        action: GuardAction,
+        operation_id: &str,
+        sequence: u64,
+    ) -> Result<RequestEnvelope, MotionGuardClientError> {
+        let issued = monotonic_ns()?;
+        let deadline = issued
+            .checked_add(u64::from(COMMAND_DEADLINE_MS) * NANOS_PER_MILLISECOND)
+            .ok_or_else(|| {
+                MotionGuardClientError::InvalidInput("monotonic deadline overflow".into())
+            })?;
+        Ok(RequestEnvelope {
+            tuple: Some(tuple),
+            source: GuardSource::Nav as i32,
+            action: action as i32,
+            operation_id: operation_id.to_string(),
+            payload_sha256: Vec::new(),
+            sequence,
+            issued_monotonic_ns: issued,
+            deadline_monotonic_ns: deadline,
+        })
+    }
+
+    async fn exchange(
+        &mut self,
+        request: MotionGuardRequest,
+        expected_outcome: OutcomeKind,
+        expected_ack: AckCode,
+    ) -> Result<motion_guard_response::Outcome, MotionGuardClientError> {
+        self.ensure_usable()?;
+        if request.api_version != API_VERSION || request.request_id.is_empty() {
+            return Err(MotionGuardClientError::InvalidInput(
+                "request api_version and request_id must be set".into(),
+            ));
+        }
+        if OutcomeKind::from_request(&request) != Some(expected_outcome) {
+            return Err(MotionGuardClientError::InvalidInput(
+                "request operation does not match expected outcome".into(),
+            ));
+        }
+        let operation_id = request_operation_id(&request).unwrap_or_default();
+        let request_id = request.request_id.clone();
+        let payload = request.encode_to_vec();
+        if payload.is_empty() || payload.len() > self.config.max_frame_bytes {
+            return Err(MotionGuardClientError::InvalidInput(format!(
+                "request protobuf size {} is outside frame bounds",
+                payload.len()
+            )));
+        }
+
+        let exchange_result = {
+            let stream = self
+                .stream
+                .as_mut()
+                .expect("ensure_usable verified the stream");
+            timeout(
+                self.config.request_timeout,
+                exchange_frame(stream, &payload, self.config.max_frame_bytes),
+            )
+            .await
+        };
+        let response_payload = match exchange_result {
+            Err(_) => {
+                let error = MotionGuardClientError::Timeout {
+                    operation_id: operation_id.clone(),
+                };
+                self.poison(error.to_string());
+                return Err(error);
+            }
+            Ok(Err(message)) => {
+                let error = MotionGuardClientError::Transport(message);
+                self.poison(error.to_string());
+                return Err(error);
+            }
+            Ok(Ok(payload)) => payload,
+        };
+
+        let response =
+            MotionGuardResponse::decode(response_payload.as_slice()).map_err(|error| {
+                let message = format!("invalid response protobuf: {error}");
+                self.poison(message.clone());
+                MotionGuardClientError::Protocol(message)
+            })?;
+        if response.api_version != API_VERSION {
+            return self.protocol_error(format!(
+                "response api_version {} does not match {}",
+                response.api_version, API_VERSION
+            ));
+        }
+        if response.request_id != request_id {
+            return self.protocol_error("response request_id does not correlate to request");
+        }
+        let outcome = response
+            .outcome
+            .ok_or_else(|| "response outcome is missing".to_string())
+            .or_else(|message| self.protocol_error(message))?;
+        if OutcomeKind::from_response(&outcome) != Some(expected_outcome) {
+            return self.protocol_error("response outcome does not correlate to request operation");
+        }
+        let result = outcome_result(&outcome)
+            .ok_or_else(|| "response outcome has no GuardResult".to_string())
+            .or_else(|message| self.protocol_error(message))?;
+        let ack = AckCode::try_from(result.ack).map_err(|_| {
+            let message = format!("response contains unknown ack value {}", result.ack);
+            self.poison(message.clone());
+            MotionGuardClientError::Protocol(message)
+        })?;
+        if let Some(remote) = result.error.as_ref() {
+            if remote.code.trim().is_empty() {
+                return self.protocol_error("GuardResult error has an empty code");
+            }
+            return Err(MotionGuardClientError::Remote {
+                code: remote.code.clone(),
+                message: remote.message.clone(),
+                retryable: remote.retryable,
+                operation_id,
+            });
+        }
+        if ack != expected_ack {
+            return self.protocol_error(format!(
+                "response ack {ack:?} does not match {expected_ack:?}"
+            ));
+        }
+        validate_success_state(expected_outcome, result)
+            .or_else(|message| self.protocol_error(message))?;
+        Ok(outcome)
+    }
+
+    fn ensure_usable(&self) -> Result<(), MotionGuardClientError> {
+        if let Some(reason) = self.poison_reason.as_ref() {
+            return Err(MotionGuardClientError::Poisoned {
+                reason: reason.clone(),
+            });
+        }
+        if self.stream.is_none() {
+            return Err(MotionGuardClientError::Poisoned {
+                reason: "connection is closed".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn protocol_error<T>(
+        &mut self,
+        message: impl Into<String>,
+    ) -> Result<T, MotionGuardClientError> {
+        let message = message.into();
+        self.poison(message.clone());
+        Err(MotionGuardClientError::Protocol(message))
+    }
+
+    fn poison(&mut self, reason: String) {
+        if self.poison_reason.is_none() {
+            self.poison_reason = Some(reason);
+        }
+        self.stream.take();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutcomeKind {
+    AcquireLease,
+    RenewLease,
+    SubmitMotionCommand,
+    RevokeAndZero,
+    GetReadiness,
+}
+
+impl OutcomeKind {
+    fn from_request(request: &MotionGuardRequest) -> Option<Self> {
+        match request.operation.as_ref()? {
+            motion_guard_request::Operation::AcquireLease(_) => Some(Self::AcquireLease),
+            motion_guard_request::Operation::RenewLease(_) => Some(Self::RenewLease),
+            motion_guard_request::Operation::SubmitMotionCommand(_) => {
+                Some(Self::SubmitMotionCommand)
+            }
+            motion_guard_request::Operation::RevokeAndZero(_) => Some(Self::RevokeAndZero),
+            motion_guard_request::Operation::GetReadiness(_) => Some(Self::GetReadiness),
+            _ => None,
+        }
+    }
+
+    fn from_response(outcome: &motion_guard_response::Outcome) -> Option<Self> {
+        match outcome {
+            motion_guard_response::Outcome::AcquireLease(_) => Some(Self::AcquireLease),
+            motion_guard_response::Outcome::RenewLease(_) => Some(Self::RenewLease),
+            motion_guard_response::Outcome::SubmitMotionCommand(_) => {
+                Some(Self::SubmitMotionCommand)
+            }
+            motion_guard_response::Outcome::RevokeAndZero(_) => Some(Self::RevokeAndZero),
+            motion_guard_response::Outcome::GetReadiness(_) => Some(Self::GetReadiness),
+            _ => None,
+        }
+    }
+}
+
+fn validate_config(config: &ClientConfig) -> Result<(), MotionGuardClientError> {
+    if config.socket_path.as_os_str().is_empty() {
+        return Err(MotionGuardClientError::InvalidInput(
+            "socket_path must not be empty".into(),
+        ));
+    }
+    if config.request_timeout.is_zero() {
+        return Err(MotionGuardClientError::InvalidInput(
+            "request_timeout must be positive".into(),
+        ));
+    }
+    if config.max_frame_bytes == 0 || config.max_frame_bytes > u32::MAX as usize {
+        return Err(MotionGuardClientError::InvalidInput(
+            "max_frame_bytes must fit a non-zero u32".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_operation_id(operation_id: &str) -> Result<String, MotionGuardClientError> {
+    let operation_id = operation_id.trim();
+    if operation_id.is_empty() {
+        return Err(MotionGuardClientError::InvalidInput(
+            "operation_id must not be empty".into(),
+        ));
+    }
+    Ok(operation_id.to_string())
+}
+
+fn validate_epoch(generation: u64, boot_nonce: &[u8]) -> Result<(), String> {
+    if generation == 0 || boot_nonce.len() != BOOT_NONCE_BYTES {
+        return Err("readiness response contains an invalid boot epoch".into());
+    }
+    Ok(())
+}
+
+fn validate_deadlines(lease_deadline: u64, owner_deadline: u64) -> Result<(), String> {
+    let now = monotonic_ns().map_err(|error| error.to_string())?;
+    if owner_deadline <= now || lease_deadline < owner_deadline {
+        return Err("response contains invalid lease deadlines".into());
+    }
+    Ok(())
+}
+
+fn validate_twist(twist: &TwistCommand) -> Result<(), MotionGuardClientError> {
+    if !twist.linear_x_mps.is_finite()
+        || !twist.linear_y_mps.is_finite()
+        || !twist.angular_z_rps.is_finite()
+    {
+        return Err(MotionGuardClientError::InvalidInput(
+            "twist components must be finite".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_zero_ack(zero: ZeroAck) -> Result<ZeroConfirmation, String> {
+    if zero.zero_ack_id.trim().is_empty() || zero.applied_monotonic_ns == 0 {
+        return Err("terminal ZeroAck is incomplete".into());
+    }
+    Ok(ZeroConfirmation {
+        zero_ack_id: zero.zero_ack_id,
+        applied_monotonic_ns: zero.applied_monotonic_ns,
+    })
+}
+
+fn validate_success_state(kind: OutcomeKind, result: &GuardResult) -> Result<(), String> {
+    let gate = SafetyGate::try_from(result.gate)
+        .map_err(|_| format!("response contains unknown safety gate {}", result.gate))?;
+    let lease = LeaseState::try_from(result.lease)
+        .map_err(|_| format!("response contains unknown lease state {}", result.lease))?;
+    let expected = match kind {
+        OutcomeKind::AcquireLease | OutcomeKind::RenewLease | OutcomeKind::SubmitMotionCommand => {
+            Some((SafetyGate::Armed, LeaseState::Active))
+        }
+        OutcomeKind::RevokeAndZero => Some((SafetyGate::Armed, LeaseState::Idle)),
+        OutcomeKind::GetReadiness => None,
+    };
+    if let Some((expected_gate, expected_lease)) = expected {
+        if gate != expected_gate || lease != expected_lease {
+            return Err(format!(
+                "response terminal state {gate:?}+{lease:?} does not match {expected_gate:?}+{expected_lease:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn monotonic_ns() -> Result<u64, MotionGuardClientError> {
+    let now = clock_gettime(ClockId::Monotonic);
+    let seconds = u64::try_from(now.tv_sec).map_err(|_| {
+        MotionGuardClientError::InvalidInput("CLOCK_MONOTONIC returned negative seconds".into())
+    })?;
+    let nanoseconds = u64::try_from(now.tv_nsec).map_err(|_| {
+        MotionGuardClientError::InvalidInput("CLOCK_MONOTONIC returned negative nanos".into())
+    })?;
+    seconds
+        .checked_mul(NANOS_PER_SECOND)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .ok_or_else(|| MotionGuardClientError::InvalidInput("monotonic clock overflow".into()))
+}
+
+fn new_request_id() -> String {
+    format!("request:{}", Uuid::new_v4())
+}
+
+async fn exchange_frame(
+    stream: &mut UnixStream,
+    request: &[u8],
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let length = u32::try_from(request.len())
+        .map_err(|_| "request frame length does not fit u32".to_string())?;
+    stream
+        .write_all(&length.to_be_bytes())
+        .await
+        .map_err(|error| format!("failed to write frame prefix: {error}"))?;
+    stream
+        .write_all(request)
+        .await
+        .map_err(|error| format!("failed to write frame body: {error}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| format!("failed to flush frame: {error}"))?;
+
+    let mut prefix = [0_u8; 4];
+    stream
+        .read_exact(&mut prefix)
+        .await
+        .map_err(|error| format!("failed to read response prefix: {error}"))?;
+    let response_length = u32::from_be_bytes(prefix) as usize;
+    if response_length == 0 {
+        return Err("zero-length protobuf response frame".into());
+    }
+    if response_length > max_frame_bytes {
+        return Err(format!(
+            "response frame length {response_length} exceeds {max_frame_bytes}"
+        ));
+    }
+    let mut response = vec![0_u8; response_length];
+    stream
+        .read_exact(&mut response)
+        .await
+        .map_err(|error| format!("failed to read response body: {error}"))?;
+    Ok(response)
+}
+
+fn request_operation_id(request: &MotionGuardRequest) -> Option<String> {
+    let envelope = match request.operation.as_ref()? {
+        motion_guard_request::Operation::AcquireLease(body) => body.envelope.as_ref(),
+        motion_guard_request::Operation::RenewLease(body) => body.envelope.as_ref(),
+        motion_guard_request::Operation::SubmitMotionCommand(body) => body.envelope.as_ref(),
+        motion_guard_request::Operation::RevokeAndZero(body) => body.envelope.as_ref(),
+        _ => None,
+    }?;
+    Some(envelope.operation_id.clone())
+}
+
+fn outcome_result(outcome: &motion_guard_response::Outcome) -> Option<&GuardResult> {
+    match outcome {
+        motion_guard_response::Outcome::AcquireLease(body) => body.result.as_ref(),
+        motion_guard_response::Outcome::RenewLease(body) => body.result.as_ref(),
+        motion_guard_response::Outcome::SubmitMotionCommand(body) => body.result.as_ref(),
+        motion_guard_response::Outcome::RevokeAndZero(body) => body.result.as_ref(),
+        motion_guard_response::Outcome::GetReadiness(body) => body.result.as_ref(),
+        _ => None,
+    }
+}
+
+fn seal_request(request: &mut MotionGuardRequest) -> Result<(), MotionGuardClientError> {
+    let payload = canonical_payload(request)?;
+    let envelope = operation_envelope_mut(request).ok_or_else(|| {
+        MotionGuardClientError::InvalidInput("mutation request has no envelope".into())
+    })?;
+    envelope.payload_sha256 = sha256(&payload).to_vec();
+    Ok(())
+}
+
+fn canonical_payload(request: &MotionGuardRequest) -> Result<Vec<u8>, MotionGuardClientError> {
+    match request.operation.as_ref() {
+        Some(motion_guard_request::Operation::AcquireLease(body)) => {
+            Ok(encode_without_envelope(body.clone()))
+        }
+        Some(motion_guard_request::Operation::RenewLease(body)) => {
+            Ok(encode_without_envelope(body.clone()))
+        }
+        Some(motion_guard_request::Operation::SubmitMotionCommand(body)) => {
+            Ok(encode_without_envelope(body.clone()))
+        }
+        Some(motion_guard_request::Operation::RevokeAndZero(body)) => {
+            Ok(encode_without_envelope(body.clone()))
+        }
+        _ => Err(MotionGuardClientError::InvalidInput(
+            "operation has no canonical mutation payload".into(),
+        )),
+    }
+}
+
+trait EnvelopeMessage: Message {
+    fn clear_envelope(&mut self);
+}
+
+impl EnvelopeMessage for AcquireLeaseRequest {
+    fn clear_envelope(&mut self) {
+        self.envelope = None;
+    }
+}
+
+impl EnvelopeMessage for RenewLeaseRequest {
+    fn clear_envelope(&mut self) {
+        self.envelope = None;
+    }
+}
+
+impl EnvelopeMessage for SubmitMotionCommandRequest {
+    fn clear_envelope(&mut self) {
+        self.envelope = None;
+    }
+}
+
+impl EnvelopeMessage for RevokeAndZeroRequest {
+    fn clear_envelope(&mut self) {
+        self.envelope = None;
+    }
+}
+
+fn encode_without_envelope<T: EnvelopeMessage>(mut message: T) -> Vec<u8> {
+    message.clear_envelope();
+    message.encode_to_vec()
+}
+
+fn operation_envelope_mut(request: &mut MotionGuardRequest) -> Option<&mut RequestEnvelope> {
+    match request.operation.as_mut()? {
+        motion_guard_request::Operation::AcquireLease(body) => body.envelope.as_mut(),
+        motion_guard_request::Operation::RenewLease(body) => body.envelope.as_mut(),
+        motion_guard_request::Operation::SubmitMotionCommand(body) => body.envelope.as_mut(),
+        motion_guard_request::Operation::RevokeAndZero(body) => body.envelope.as_mut(),
+        _ => None,
+    }
+}

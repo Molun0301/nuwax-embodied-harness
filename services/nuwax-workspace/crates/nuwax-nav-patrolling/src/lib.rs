@@ -12,6 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Additional safe-goal clearance applied while coverage patrol is active.
+pub const EXTRA_CLEARANCE: f64 = 0.2;
+
 // Foundation 协议面 re-export — 跨 crate FrontierGoal / OccupancyGrid2D 协议语义对齐
 pub use nuwax_nav_base::NavError as FoundationNavError;
 pub use nuwax_nav_types_messages::{
@@ -26,8 +29,8 @@ pub mod visitation_history;
 
 pub use module::{Module, PatrollingModule, PatrollingModuleConfig};
 pub use routers::{
-    CoveragePatrolRouter, FrontierGoalInput, FrontierPatrolRouter, PatrolRouter,
-    PatrollingContext, RandomPatrolRouter,
+    CoveragePatrolRouter, FrontierGoalInput, FrontierPatrolRouter, PatrolRouter, PatrollingContext,
+    RandomPatrolRouter,
 };
 
 pub use visitation_history::VisitationHistory;

@@ -31,13 +31,12 @@
 //!
 //! - **算法实现**仍然在 upstream crate(`nuwax-nav-far-planner-bridge` 等);
 //!   stack 不实现 A*、FAR、Local、PathFollower、PGO、Terrain 任何算法。
-//! - **进程管理**(`StackRunner`)归 stack:负责把 `ModuleGraph` 翻译成真实 OS
-//!   进程,持有 `tokio::process::Child` 句柄,提供 SIGTERM → 5s → SIGKILL 的
-//!   优雅关闭链。这不是「算法」,是编排者的运行时职责,类比 launch system 的
-//!   process supervisor。
+//! - **运行时管理**(`StackRunner`)归 stack:NativeBridge 由真实 OS 进程持有,
+//!   Rust / Coordinator 等节点必须注册明确的 in-process owner。未注册节点会在
+//!   任何副作用发生前令启动失败。
 //!
 //! 调用方通过 `builder.build_runner()` 拿到 `StackRunner`,然后
-//! `runner.spawn_all().await` 拉起所有 `NativeBridge` 子进程。
+//! `runner.spawn_all().await` 拉起所有已配置并已注册的 graph 节点。
 
 use crate::error::NavStackResult;
 use crate::features::{NavFeatureFlags, NavStackPreset};
@@ -121,14 +120,16 @@ impl NavStackBuilder {
     ///
     /// 与 `build()` 不同的关键点:
     /// - 内部先调用 `build()` 生成 `ModuleGraph`,并 `validate`。
-    /// - 把 graph 包装成 `StackRunner { graph, handles: empty }`,**不立即**拉起进程。
-    /// - 调用方随后 `.spawn_all().await` 才真正 fork 子进程。
+    /// - 把 graph 包装成尚未启动的 `StackRunner`。
+    /// - 调用方先注册 in-process owner,随后 `.spawn_all().await` 启动全部节点。
     ///
     /// 这把「拓扑生成」与「进程生命周期」显式分开,便于上层(CLI / integration
     /// test)在 `spawn_all` 之前对 argv / 拓扑做断言或修改。
     pub fn build_runner(&self) -> NavStackResult<StackRunner> {
         let graph = self.build()?;
-        Ok(StackRunner::from_graph(graph))
+        let mut runner = StackRunner::from_graph(graph);
+        crate::runtime_owners::register_compiled_owners(&mut runner);
+        Ok(runner)
     }
 
     /// 便捷 dry-run:返回渲染好的纯文本。

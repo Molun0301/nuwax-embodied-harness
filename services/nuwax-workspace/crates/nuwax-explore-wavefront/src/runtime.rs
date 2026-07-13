@@ -445,6 +445,12 @@ where
         self.last_direction
     }
 
+    /// scorer 实际读取的 session momentum 方向。
+    #[must_use]
+    pub fn scoring_direction(&self) -> Option<Direction2> {
+        self.state.exploration_direction()
+    }
+
     /// rework22 P1.11:累计已发布目标数(测试可断言)。
     #[must_use]
     pub fn explored_goals_count(&self) -> u32 {
@@ -529,8 +535,7 @@ where
                     if let Some(pg_mut) = self.pending_goal.as_mut() {
                         pg_mut.status = GoalStatus::Timeout;
                     }
-                    self.timeout_failure_count =
-                        self.timeout_failure_count.saturating_add(1);
+                    self.timeout_failure_count = self.timeout_failure_count.saturating_add(1);
                     self.last_outcome = Some("goal_timeout".to_string());
                     if self.timeout_failure_count >= self.config.max_consecutive_failures {
                         self.stop_count = self.stop_count.saturating_add(1);
@@ -614,9 +619,8 @@ where
                 // 历史实现只定义 `direction update` 但 publish 后没调用,
                 // 导致 last_direction 永远是 None,momentum_score 恒为 0。
                 let goal_pos = goal.pose.pose.position.to_2d();
-                let dx = goal_pos.x - robot_pose.x;
-                let dy = goal_pos.y - robot_pose.y;
-                self.last_direction = Direction2::from_delta(dx, dy);
+                self.state.update_direction_from_goal(robot_pose, goal_pos);
+                self.last_direction = self.state.exploration_direction();
                 // rework22 P1.11:成功发布即重置 no_frontier_streak 并累加 explored_goals_count。
                 self.no_frontier_streak = 0;
                 self.explored_goals_count = self.explored_goals_count.saturating_add(1);
@@ -624,6 +628,12 @@ where
                 Ok(RuntimeTickOutcome::Goal(goal))
             }
             Ok(GoalSelection::NoFrontier) => {
+                // Python get_exploration_goal resets goal history, momentum,
+                // information seed, and the no-gain counter when detection
+                // returns no frontier. Runtime publication, no-frontier, and
+                // timeout counters remain outside that session and survive.
+                self.state.reset();
+                self.last_direction = None;
                 // rework22 P1.11:连续 10 次无 frontier 且已发布 ≥ 2 goal → Stop。
                 // 找到 frontier 的分支会清零 streak,此处只负责累加。
                 self.no_frontier_streak = self.no_frontier_streak.saturating_add(1);
@@ -722,7 +732,7 @@ where
     /// 连续失败次数超限时自动 stop
     fn maybe_stop_on_failures(&mut self) -> Result<(), RuntimeError> {
         let max_fail = self.config.max_consecutive_failures;
-        let published = self.state.goals_published();
+        let published = self.explored_goals_count;
         if self.state.consecutive_failures() >= max_fail && published >= 2 {
             self.stop_count = self.stop_count.saturating_add(1);
             self.release_guards();

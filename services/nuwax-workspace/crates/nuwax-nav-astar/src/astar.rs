@@ -142,8 +142,8 @@ impl Ord for HeapItem {
                     .partial_cmp(&self.priority_dist)
                     .unwrap_or(Ordering::Equal)
             })
-            .then_with(|| self.y.cmp(&other.y))
-            .then_with(|| self.x.cmp(&other.x))
+            .then_with(|| other.x.cmp(&self.x))
+            .then_with(|| other.y.cmp(&self.y))
     }
 }
 impl PartialOrd for HeapItem {
@@ -178,8 +178,7 @@ pub fn min_cost_astar(
         return Err(NavError::GoalOutOfBounds);
     }
 
-    let (sx_usize, _sy_usize) = (sx, sy);
-    if !costmap.in_bounds(sx_usize, gy) {
+    if !costmap.in_bounds(sx, sy) {
         // start 越界：Python 行为是直接返回 None（costmap.world_to_grid 然后 int cast
         // 然后 if not (0 <= ... < width) return None）。这里保留一致性。
         return Ok(AStarResult {
@@ -376,6 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn start_outside_each_boundary_returns_no_path_without_panicking() {
+        let cm = empty_costmap(10, 10);
+        let goal = Point2::new(0.55, 0.55);
+        let opts = AStarOptions::default();
+        for start in [
+            Point2::new(-0.05, 0.55),
+            Point2::new(1.05, 0.55),
+            Point2::new(0.55, -0.05),
+            Point2::new(0.55, 1.05),
+        ] {
+            let result = min_cost_astar(&cm, start, goal, &opts).expect("start OOB is no-path");
+            assert!(result.path.is_none(), "unexpected path for start {start:?}");
+        }
+    }
+
+    #[test]
     fn same_cell_returns_single_point_path() {
         let cm = empty_costmap(10, 10);
         let pos = Point2::new(0.55, 0.55); // cell (5,5)
@@ -454,6 +469,27 @@ mod tests {
             .path
             .expect("path");
         assert_eq!(r1.points.len(), r2.points.len());
+    }
+
+    #[test]
+    fn tie_break_matches_python_full_cell_sequence() {
+        let mut cm = CostMap2D::new_all_free("map", 7, 7, 1.0);
+        cm.set(3, 3, 100);
+        let path = min_cost_astar(
+            &cm,
+            Point2::new(1.5, 3.5),
+            Point2::new(5.5, 3.5),
+            &AStarOptions::default(),
+        )
+        .expect("in bounds")
+        .path
+        .expect("path around obstacle");
+        let cells: Vec<(i32, i32)> = path
+            .points
+            .iter()
+            .map(|point| cm.world_to_cell(*point))
+            .collect();
+        assert_eq!(cells, vec![(1, 3), (2, 3), (3, 2), (4, 2), (5, 3)]);
     }
 
     #[test]

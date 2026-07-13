@@ -5,11 +5,20 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::geometry::{Point2, PoseStamped, Twist2, Twist3};
+use crate::{
+    frames::NavFrameId,
+    geometry::{Point2, PoseStamped, Timestamp, Twist2, Twist3},
+};
 
 /// 2D 路径(世界坐标点列)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Path2D {
+    /// Path coordinate frame.
+    #[serde(default)]
+    pub frame_id: NavFrameId,
+    /// Path production timestamp.
+    #[serde(default)]
+    pub stamp: Timestamp,
     /// 点列(按通过顺序)
     pub points: Vec<Point2>,
 }
@@ -18,7 +27,7 @@ impl Path2D {
     /// 空路径
     #[must_use]
     pub fn empty() -> Self {
-        Self { points: Vec::new() }
+        Self::default()
     }
 
     /// 是否为空(0 点)
@@ -51,7 +60,20 @@ impl Path2D {
     /// 由点列构造
     #[must_use]
     pub fn from_points(points: Vec<Point2>) -> Self {
-        Self { points }
+        Self {
+            points,
+            ..Self::default()
+        }
+    }
+
+    /// Construct a path while preserving its transport frame and timestamp.
+    #[must_use]
+    pub fn stamped(frame_id: NavFrameId, stamp: Timestamp, points: Vec<Point2>) -> Self {
+        Self {
+            frame_id,
+            stamp,
+            points,
+        }
     }
 }
 
@@ -224,5 +246,12 @@ mod tests {
         let s = serde_json::to_string(&p).unwrap();
         let back: Path2D = serde_json::from_str(&s).unwrap();
         assert_eq!(back.points.len(), 2);
+    }
+
+    #[test]
+    fn path2d_legacy_json_defaults_to_map_and_zero_stamp() {
+        let path: Path2D = serde_json::from_str(r#"{"points":[{"x":1.0,"y":2.0}]}"#).unwrap();
+        assert_eq!(path.frame_id, NavFrameId::Map);
+        assert_eq!(path.stamp, Timestamp::default());
     }
 }

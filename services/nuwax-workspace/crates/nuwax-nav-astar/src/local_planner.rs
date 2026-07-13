@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// 同步 navigation_costmap subscriber 回调。
 ///
 /// LocalPlanner 设计为确定性 tick、不阻塞、不引入 async runtime,使用回调列表
-/// (Vec<Arc<dyn Fn>>) 同步发布最近一次 gradient costmap 给订阅者。
+/// (`Vec<Arc<dyn Fn>>`) 同步发布最近一次 gradient costmap 给订阅者。
 /// 与 Python `LocalPlanner.navigation_costmap: Subject[OccupancyGrid]` 在语义上
 /// 对应(每次有订阅者就拿到最新一帧);差异:Python 用 reactivex Subject,这里用
 /// 函数回调。
@@ -610,10 +610,7 @@ mod tests {
         // H-17:顶点距离(不是段投影)。query (0.5, 0.5) 距 (1.0,0.0) = sqrt(0.5)≈0.7071
         // 旧实现段投影到 (0.5, 0.0) 距离 0.5,新实现改用顶点,数值改变。
         let expected = (0.5_f64 * 0.5 + 0.5_f64 * 0.5).sqrt();
-        assert!(
-            (d - expected).abs() < 1e-9,
-            "expected {expected}, got {d}"
-        );
+        assert!((d - expected).abs() < 1e-9, "expected {expected}, got {d}");
     }
 
     // ============================================================

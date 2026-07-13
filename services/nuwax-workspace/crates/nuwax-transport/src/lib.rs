@@ -96,6 +96,16 @@ pub trait LcmBackend: Send + Sync {
     async fn subscribe(&self, topic: LcmTopic, msg_type: Option<LcmMessageType>) -> LcmFrameStream;
     /// 后端名称（诊断 / 日志用）
     fn name(&self) -> &str;
+
+    /// Return the process-wide real LCM context when this backend owns one.
+    ///
+    /// Raw protocols such as DimOS pickle RPC do not use generated message
+    /// fingerprints, so they must share the owner context without going through
+    /// the typed [`RawLcmFrame`] path.
+    #[cfg(feature = "real-lcm")]
+    fn shared_lcm_context(&self) -> Option<Arc<nuwax_lcm::LcmContext>> {
+        None
+    }
 }
 
 /// LCM 传输工厂
@@ -141,6 +151,16 @@ impl LcmTransport {
         self.backend.name()
     }
 
+    /// Clone the process-wide real LCM context owned by this transport.
+    ///
+    /// The returned [`Arc`] keeps the existing single owner thread alive; it
+    /// does not create a second liblcm context.
+    #[cfg(feature = "real-lcm")]
+    #[must_use]
+    pub fn shared_lcm_context(&self) -> Option<Arc<nuwax_lcm::LcmContext>> {
+        self.backend.shared_lcm_context()
+    }
+
     /// 发布一帧
     pub async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
         self.backend.publish(frame).await
@@ -184,6 +204,11 @@ impl LcmBackend for LcmTransport {
     }
     fn name(&self) -> &str {
         self.backend.name()
+    }
+
+    #[cfg(feature = "real-lcm")]
+    fn shared_lcm_context(&self) -> Option<Arc<nuwax_lcm::LcmContext>> {
+        self.backend.shared_lcm_context()
     }
 }
 
@@ -332,5 +357,20 @@ mod tests {
             .payload(b"hello".to_vec())
             .build();
         assert_eq!(frame.payload, b"hello");
+    }
+
+    #[cfg(feature = "real-lcm")]
+    #[test]
+    fn raw_protocols_clone_the_existing_owner_context() {
+        let transport = LcmTransport::new_real("memq://").expect("real LCM memq transport");
+        let first = transport
+            .shared_lcm_context()
+            .expect("real backend context");
+        let second = transport
+            .shared_lcm_context()
+            .expect("real backend context");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.provider(), "memq://");
     }
 }

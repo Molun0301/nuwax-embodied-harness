@@ -14,9 +14,9 @@
 //!
 //! ## 与 `RawLcmFrame` 的关系
 //!
-//! - [`RawLcmFrame`] = 8-byte preamble + payload(fake backend 用,2026-07-09 B3
+//! - [`crate::RawLcmFrame`] = 8-byte preamble + payload(fake backend 用,2026-07-09 B3
 //!   修正:由 28-byte LC02 envelope 缩为 8-byte preamble);
-//! - [`LcmMessageBytes`] = 字段强类型(供 real-lcm `lcm_publish` 调用)。
+//! - [`crate::LcmMessageBytes`] = 字段强类型(供 real-lcm `lcm_publish` 调用)。
 //!
 //! 两者**不**可互转 —— `encode_for_real_lcm_publish` 显式返回 payload 切片,
 //! `RawLcmFrame::encode` 拼装 envelope,以避免 double framing 误用。
@@ -94,7 +94,9 @@ pub fn build_lcm_message_bytes(
 ///
 /// 上游 liblcm `lcm_recv_message` 输出的 wire bytes 由 Phase 3 `nuwax-lcm-sys`
 /// 单独处理,**不**走该函数。
-pub fn parse_lcm_message_bytes(bytes: &[u8]) -> Result<(String, [u8; 8], Vec<u8>), TypedCodecError> {
+pub fn parse_lcm_message_bytes(
+    bytes: &[u8],
+) -> Result<(String, [u8; 8], Vec<u8>), TypedCodecError> {
     if bytes.len() < 4 {
         return Err(TypedCodecError::LcmDecode(format!(
             "envelope too short: need 4 bytes channel_len, got {}",
@@ -138,8 +140,7 @@ mod tests {
 
     #[test]
     fn build_and_parse_roundtrip() {
-        let msg = build_lcm_message_bytes("/odom", "nav_msgs/Odometry", b"hello", 7)
-            .expect("ok");
+        let msg = build_lcm_message_bytes("/odom", "nav_msgs/Odometry", b"hello", 7).expect("ok");
         let envelope = encode_custom_envelope(&msg);
         let (channel, fp, payload) = parse_lcm_message_bytes(&envelope).expect("parse ok");
         assert_eq!(channel, "/odom");
@@ -178,7 +179,6 @@ mod tests {
         let mut out = Vec::new();
         out.extend_from_slice(&(msg.channel.len() as u32).to_le_bytes());
         out.extend_from_slice(msg.channel.as_bytes());
-        out.extend_from_slice(&msg.fingerprint);
         out.extend_from_slice(&msg.payload);
         out
     }

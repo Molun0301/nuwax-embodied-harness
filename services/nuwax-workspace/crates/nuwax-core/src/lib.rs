@@ -1,5 +1,5 @@
-//! nuwax Module 基类与 In[T]/Out[T] 类型化流
-//! - `In[T]` / `Out[T]` 类型化流
+//! nuwax Module 基类与 `In<T>`/`Out<T>` 类型化流
+//! - `In<T>` / `Out<T>` 类型化流
 //!
 //! SSOT: 对齐 dimos Python `In` / `Out` 类型化流,见
 //! `/home/ml/Deeprob/dimos/dimos/stream/core/inout.py`。
@@ -14,6 +14,14 @@ use nuwax_types::Header;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
+
+mod runtime;
+
+pub use runtime::{
+    autoconnect, ConnectionSet, InputPort, LifecycleState, LocalTransport, ManagedModule,
+    ModuleInfo, ModulePorts, OutputPort, PortDirection, PortError, PortInfo, PortTransport,
+    PublishReport, RemoteStream, StopHandle,
+};
 
 /// Module 生命周期错误
 #[derive(Debug, Error)]
@@ -41,7 +49,7 @@ pub trait Module: Send + Sync + 'static {
     async fn stop(&self) -> ModuleResult<()>;
 }
 
-/// In[T]——输入流（消费者）
+/// `In<T>`——输入流（消费者）
 pub struct In<T> {
     rx: mpsc::UnboundedReceiver<T>,
 }
@@ -53,7 +61,7 @@ impl<T> In<T> {
     }
 }
 
-/// Out[T]——输出流（生产者）
+/// `Out<T>`——输出流（生产者）
 ///
 /// 内含一个 mpsc Sender（单消费者）或一个共享 broadcast Sender（多订阅者）。
 /// 选择策略：
@@ -92,9 +100,7 @@ impl<T> Out<T> {
                 // Broadcast 路径要求 T: Clone,但 trait impl 在此处不施加 bound。
                 // 由 broadcast 自身的 T: Clone 约束负责;调用方通过 Out::broadcast 构造。
                 // 若用户手工构造 Broadcast(Arc<...>) 但 T 不满足 Clone,会在 tx.send 处报错。
-                tx.send(msg)
-                    .map(|_| ())
-                    .map_err(|_| OutError::ReceiverGone)
+                tx.send(msg).map(|_| ()).map_err(|_| OutError::ReceiverGone)
             }
         }
     }

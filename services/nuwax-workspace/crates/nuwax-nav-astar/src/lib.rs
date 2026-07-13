@@ -102,7 +102,10 @@ pub use global_planner::{GlobalPlanner, GlobalPlannerConfig, GlobalPlannerOutput
 pub use goal_validator::{
     find_safe_goal, find_safe_goal_bfs, find_safe_goal_bfs_contiguous, GoalValidatorOptions,
 };
-pub use local_planner::{GoalReached, LocalPlanner, LocalPlannerConfig, LocalPlannerState, NavCostmapSubscriber, StopMessage};
+pub use local_planner::{
+    GoalReached, LocalPlanner, LocalPlannerConfig, LocalPlannerState, NavCostmapSubscriber,
+    StopMessage,
+};
 pub use navigation_map::{GradientStrategy, NavigationMap};
 pub use path_clearance::PathClearance;
 pub use path_distancer::PathDistancer;

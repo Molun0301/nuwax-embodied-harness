@@ -10,33 +10,123 @@
 //! 启动顺序：
 //! 1. tracing 初始化
 //! 2. 解析 env：port、LCM channel 名、video shm/uds 路径、ready file 路径
-//! 3. 启动 video_relay（HTTP/UDS→SHM，与 LCM 无关的视频中转）
-//! 4. 启动 `lcm_runtime::spawn_geometry_runtime`（fake backend 默认;
-//!    real-lcm 启动期 fail-fast 返回 `LCM_BACKEND_UNAVAILABLE`）
-//! 5. 写 ready file（通知父进程 / systemd）
-//! 6. tonic gRPC server 监听
+//! 3. 预绑定 gRPC listener（端口占用立即 fail-fast）
+//! 4. 启动 video_relay（HTTP/UDS→SHM，与 LCM 无关的视频中转）
+//! 5. 启动 `lcm_runtime::spawn_geometry_runtime`（real-lcm 启动失败立即退出）
+//! 6. 在同一 LCM owner context 上注册 module-style RPC，再启动 tonic server
+//! 7. 自检 HealthCheck 后写 ready file
+//! 8. Stop RPC 关闭 listener，确认 LCM unsubscribe 后退出进程
 
 // Phase 4: `pub` 而非私有 —— 兄弟模块(lcm_runtime/server)需要 `crate::channel_registry::*`。
 pub mod channel_registry;
 mod explore_runtime;
 mod lcm_runtime;
+// W41 (Bug #2 fix): `map_checksum` 模块是 W37 (RALPLAN §Phase M #3) 新增
+// 的 SHA-256 helper,供 `mapping_adapter::build_and_publish` 算 checksum
+// 并通过 `MapRevisionEvent.checksum` 广播;untracked 状态下 main.rs 漏
+// 声明,补回 `mod map_checksum;`。
+mod map_checksum;
 mod mapping_adapter;
 mod nav_runtime;
 mod occupancy_shm;
 mod pointcloud;
+mod rpc_runtime;
 mod runtime_diagnostics;
 mod server;
 mod typed_codec;
 mod video_relay;
 
+use futures::stream;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
 use tonic::transport::Server;
 use tracing::{error, info};
 
 pub mod proto {
     tonic::include_proto!("nuwax.geometry");
+}
+
+fn incoming_until_shutdown(
+    listener: TcpListener,
+    shutdown: server::ShutdownListener,
+) -> (
+    impl futures::Stream<Item = Result<TcpStream, io::Error>> + Send + 'static,
+    tokio::sync::watch::Receiver<bool>,
+) {
+    let (request_rx, listener_closed_tx, graceful_rx) = shutdown.into_parts();
+    let incoming = stream::unfold(
+        Some((listener, request_rx, listener_closed_tx)),
+        |state| async move {
+            let (listener, mut request_rx, listener_closed_tx) = state?;
+            if *request_rx.borrow() {
+                drop(listener);
+                listener_closed_tx.send_replace(true);
+                return std::future::pending().await;
+            }
+
+            tokio::select! {
+                biased;
+                changed = request_rx.changed() => {
+                    if changed.is_err() || *request_rx.borrow() {
+                        drop(listener);
+                        listener_closed_tx.send_replace(true);
+                        std::future::pending().await
+                    } else {
+                        Some((
+                            Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "spurious shutdown channel update",
+                            )),
+                            Some((listener, request_rx, listener_closed_tx)),
+                        ))
+                    }
+                }
+                accepted = listener.accept() => {
+                    let item = accepted.map(|(stream, _peer)| stream);
+                    Some((item, Some((listener, request_rx, listener_closed_tx))))
+                }
+            }
+        },
+    );
+    (incoming, graceful_rx)
+}
+
+async fn wait_for_grpc_health(addr: SocketAddr) -> Result<(), String> {
+    let endpoint = format!("http://{addr}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(mut client) =
+                proto::geometry_runtime_client::GeometryRuntimeClient::connect(endpoint.clone())
+                    .await
+            {
+                if let Ok(response) = client
+                    .health_check(proto::HealthCheckRequest {})
+                    .await
+                    .map(tonic::Response::into_inner)
+                {
+                    if response.healthy && response.phase == "running" {
+                        return Ok(());
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("gRPC HealthCheck 在 {addr} 上 5s 内未就绪"))?
+}
+
+fn remove_ready_file(path: &str) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[tokio::main]
@@ -65,7 +155,7 @@ async fn main() -> ExitCode {
     let tf_channel = channel_registry::resolve_channel(
         "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL",
         "NUWAX_LCM_CHANNEL_TF",
-        "/tf#geometry_msgs.Transform",
+        "/tf#tf2_msgs.TFMessage",
     );
     let cloud_map_channel = channel_registry::resolve_channel(
         "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
@@ -107,16 +197,19 @@ async fn main() -> ExitCode {
     );
 
     let video_shm_path = PathBuf::from(
-        std::env::var("NUWAX_VIDEO_SHM_PATH")
-            .unwrap_or_else(|_| "/tmp/nuwax_video.shm".into())
+        std::env::var("NUWAX_VIDEO_SHM_PATH").unwrap_or_else(|_| "/tmp/nuwax_video.shm".into()),
     );
     let video_uds_path = PathBuf::from(
-        std::env::var("NUWAX_VIDEO_UDS_PATH")
-            .unwrap_or_else(|_| "/tmp/nuwax_video.sock".into())
+        std::env::var("NUWAX_VIDEO_UDS_PATH").unwrap_or_else(|_| "/tmp/nuwax_video.sock".into()),
     );
 
     let ready_path = std::env::var("NUWAX_GEOMETRY_RUNTIME_READY_FILE")
         .unwrap_or_else(|_| format!("/tmp/nuwax_geometry_runtime_{}.ready", std::process::id()));
+
+    if let Err(e) = remove_ready_file(&ready_path) {
+        error!("清理旧 ready file 失败: {:?}", e);
+        return ExitCode::from(5);
+    }
 
     let addr: SocketAddr = match format!("127.0.0.1:{}", port).parse() {
         Ok(a) => a,
@@ -128,6 +221,14 @@ async fn main() -> ExitCode {
 
     info!("启动 nuwax-geometry-runtime, addr: {}", addr);
 
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("gRPC bind 失败 {}: {}", addr, e);
+            return ExitCode::from(6);
+        }
+    };
+
     // ----------------------------------------------------------------------
     // video relay（保留——视频中转不属于 LCM/ROS2 范畴）
     // ----------------------------------------------------------------------
@@ -135,7 +236,10 @@ async fn main() -> ExitCode {
         error!("视频中转启动失败: {}", e);
         return ExitCode::from(3);
     }
-    info!("视频中转已启动: shm={:?}, uds={:?}", video_shm_path, video_uds_path);
+    info!(
+        "视频中转已启动: shm={:?}, uds={:?}",
+        video_shm_path, video_uds_path
+    );
 
     // ----------------------------------------------------------------------
     // LCM runtime state loop
@@ -160,32 +264,106 @@ async fn main() -> ExitCode {
             // 错误信息在 stderr 输出 "LCM_BACKEND_UNAVAILABLE" 关键字,
             // 供 start 脚本与 smoke test grep 识别。
             error!("{}", e);
-            eprintln!("LCM_BACKEND_UNAVAILABLE: real-lcm backend requested but liblcm 1.3~1.5 \
-                       missing (apt-get install liblcm-dev). Process will exit.");
+            eprintln!(
+                "LCM_BACKEND_UNAVAILABLE: real-lcm backend requested but liblcm 1.3~1.5 \
+                       missing (apt-get install liblcm-dev). Process will exit."
+            );
             return ExitCode::from(4);
         }
     };
 
-    let service = server::GeometryRuntimeService::new(bridge);
+    let (shutdown, shutdown_listener) = server::shutdown_channel();
+    let rpc_context = match bridge.transport.shared_lcm_context() {
+        Some(context) => context,
+        None => {
+            error!("Geometry LCM transport 未暴露真实 owner context，RPC 无法启动");
+            return ExitCode::from(7);
+        }
+    };
+    let service = server::GeometryRuntimeService::new_with_shutdown(bridge, shutdown.clone());
+    let rpc_transport: Arc<dyn nuwax_rpc::RpcTransport> =
+        Arc::new(nuwax_rpc::LcmRpcTransport::from_context(rpc_context));
+    let rpc_servers = match rpc_runtime::serve_geometry_rpc(service.clone(), rpc_transport).await {
+        Ok(servers) => servers,
+        Err(e) => {
+            error!("Geometry LCM RPC server 启动失败: {}", e);
+            return ExitCode::from(7);
+        }
+    };
+    info!(
+        "Geometry LCM RPC 已启动: backend={}, methods={}",
+        rpc_servers.backend(),
+        rpc_servers.len()
+    );
+    let (incoming, mut graceful_rx) = incoming_until_shutdown(listener, shutdown_listener);
+    let graceful_shutdown = async move {
+        if !*graceful_rx.borrow() {
+            let _ = graceful_rx.wait_for(|requested| *requested).await;
+        }
+    };
+    let mut server_task = tokio::spawn(async move {
+        Server::builder()
+            .add_service(proto::geometry_runtime_server::GeometryRuntimeServer::new(
+                service,
+            ))
+            .serve_with_incoming_shutdown(incoming, graceful_shutdown)
+            .await
+    });
 
-    // ----------------------------------------------------------------------
-    // ready file
-    // ----------------------------------------------------------------------
+    let startup_check = wait_for_grpc_health(addr);
+    tokio::pin!(startup_check);
+    tokio::select! {
+        check = &mut startup_check => {
+            if let Err(e) = check {
+                error!("{}", e);
+                shutdown.request_shutdown();
+                server_task.abort();
+                let _ = (&mut server_task).await;
+                if let Err(error) = rpc_servers.stop().await {
+                    error!("Geometry LCM RPC shutdown 失败: {}", error);
+                }
+                return ExitCode::from(6);
+            }
+        }
+        result = &mut server_task => {
+            error!("gRPC server 在 startup health 前退出: {:?}", result);
+            if let Err(error) = rpc_servers.stop().await {
+                error!("Geometry LCM RPC shutdown 失败: {}", error);
+            }
+            return ExitCode::from(6);
+        }
+    }
+
     if let Err(e) = std::fs::write(&ready_path, format!("{}", port)) {
         error!("ready file 写入失败: {:?}", e);
+        shutdown.request_shutdown();
+        server_task.abort();
+        let _ = (&mut server_task).await;
+        if let Err(error) = rpc_servers.stop().await {
+            error!("Geometry LCM RPC shutdown 失败: {}", error);
+        }
         return ExitCode::from(5);
     }
-    info!("ready file 写入: {:?}", ready_path);
+    info!("gRPC HealthCheck 已通过, ready file 写入: {:?}", ready_path);
 
-    info!("gRPC server 就绪，等待连接...");
-
-    if let Err(e) = Server::builder()
-        .add_service(proto::geometry_runtime_server::GeometryRuntimeServer::new(service))
-        .serve(addr)
-        .await
-    {
-        error!("gRPC server 退出: {}", e);
-        return ExitCode::from(6);
+    let mut exit_code = match server_task.await {
+        Ok(Ok(())) => ExitCode::from(0),
+        Ok(Err(e)) => {
+            error!("gRPC server 退出: {}", e);
+            ExitCode::from(6)
+        }
+        Err(e) => {
+            error!("gRPC server task 失败: {}", e);
+            ExitCode::from(6)
+        }
+    };
+    if let Err(error) = rpc_servers.stop().await {
+        error!("Geometry LCM RPC shutdown 失败: {}", error);
+        exit_code = ExitCode::from(7);
     }
-    ExitCode::from(0)
+    if let Err(e) = remove_ready_file(&ready_path) {
+        error!("删除 ready file 失败: {:?}", e);
+        return ExitCode::from(5);
+    }
+    exit_code
 }

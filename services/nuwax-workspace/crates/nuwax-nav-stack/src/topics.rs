@@ -108,6 +108,16 @@ impl NavTopicConfig {
         topics.insert("check_obstacle".into(), TopicName::new("check_obstacle"));
         topics.insert("cancel_goal".into(), TopicName::new("cancel_goal"));
         topics.insert("goal".into(), TopicName::new("goal"));
+        topics.insert("patrol_enabled".into(), TopicName::new("patrol_enabled"));
+        topics.insert("goal_failed".into(), TopicName::new("goal_failed"));
+        topics.insert(
+            "patrol_planner_control".into(),
+            TopicName::new("patrol_planner_control"),
+        );
+        topics.insert(
+            "patrol_planner_control_ack".into(),
+            TopicName::new("patrol_planner_control_ack"),
+        );
         topics.insert("stop_movement".into(), TopicName::new("stop_movement"));
         topics.insert("path".into(), TopicName::new("path"));
         // 输出
@@ -154,6 +164,100 @@ impl NavTopicConfig {
         }
     }
 
+    /// Platform channel defaults shared with `nuwax-geometry-runtime`.
+    /// Typed `#message.Type` suffixes are stripped because the stack binds the
+    /// generated message type separately at subscription time.
+    pub fn geometry_runtime_defaults() -> Self {
+        let mut config = Self::cmu_defaults();
+        for (port, keys, fallback) in [
+            (
+                "goal_pose",
+                &[
+                    "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL",
+                    "NUWAX_LCM_CHANNEL_GOAL_POSE",
+                ][..],
+                "/nav/goal",
+            ),
+            (
+                "nav_cancel",
+                &[
+                    "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
+                    "NUWAX_LCM_CHANNEL_NAV_CANCEL",
+                ][..],
+                "/nav/cancel",
+            ),
+            (
+                "nav_state",
+                &[
+                    "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL",
+                    "NUWAX_LCM_CHANNEL_NAV_STATE",
+                ][..],
+                "/nav/state",
+            ),
+            (
+                "odometry",
+                &[
+                    "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL",
+                    "NUWAX_LCM_CHANNEL_ODOM",
+                ][..],
+                "/odom",
+            ),
+            (
+                "registered_scan",
+                &[
+                    "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL",
+                    "NUWAX_LCM_CHANNEL_OCCUPANCY",
+                ][..],
+                "/map/occupancy",
+            ),
+            (
+                "terrain_map",
+                &[
+                    "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+                    "NUWAX_LCM_CHANNEL_CLOUD_MAP",
+                ][..],
+                "/cloud_map",
+            ),
+            (
+                "terrain_map_ext",
+                &[
+                    "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+                    "NUWAX_LCM_CHANNEL_CLOUD_MAP",
+                ][..],
+                "/cloud_map",
+            ),
+            (
+                "cmd_vel",
+                &[
+                    "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
+                    "NUWAX_LCM_CHANNEL_CMD_VEL",
+                ][..],
+                "/cmd_vel",
+            ),
+        ] {
+            config.set(port, configured_channel(keys, fallback));
+        }
+        for (port, channel) in [
+            ("start_pose", "/pose_stamped"),
+            ("clicked_point", "/clicked_point"),
+            ("joy_cmd", "/teleop/cmd_vel"),
+            ("nav_cmd_vel", "/nav/cmd_vel"),
+            ("goal_path", "/nav/path"),
+            ("goal_reached", "/nav/goal_reached"),
+            ("goal_failed", "/nav/goal_failed"),
+            ("patrol_enabled", "/nav/patrol_enabled"),
+            ("patrol_planner_control", "/nav/patrol_planner_control"),
+            (
+                "patrol_planner_control_ack",
+                "/nav/patrol_planner_control_ack",
+            ),
+            ("stop_movement", "/nav/stop_movement"),
+        ] {
+            config.set(port, channel);
+        }
+        config
+    }
+
     /// 取出某个 topic 名,缺失时回落到 `fallback`。
     pub fn get_or<'a>(&'a self, port: &str, fallback: &'a str) -> &'a str {
         self.topics
@@ -166,6 +270,17 @@ impl NavTopicConfig {
     pub fn set(&mut self, port: impl Into<String>, topic: impl Into<String>) {
         self.topics.insert(port.into(), TopicName::new(topic));
     }
+}
+
+fn configured_channel(keys: &[&str], fallback: &str) -> String {
+    let configured = keys
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string());
+    configured
+        .split_once('#')
+        .map_or(configured.clone(), |(channel, _)| channel.to_string())
 }
 
 impl Default for NavTopicConfig {
@@ -205,5 +320,13 @@ mod tests {
         let s = serde_json::to_string(&cfg).expect("ser");
         let back: NavTopicConfig = serde_json::from_str(&s).expect("de");
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn geometry_runtime_channel_strips_typed_suffix() {
+        assert_eq!(
+            configured_channel(&[], "/nav/goal#geometry_msgs.PoseStamped"),
+            "/nav/goal"
+        );
     }
 }

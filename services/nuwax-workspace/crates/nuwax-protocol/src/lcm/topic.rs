@@ -83,7 +83,7 @@ impl LcmTopic {
     /// 对齐 Python 侧 `lcmpubsub.py:36-72` 的 publish/subscribe channel 形式:
     /// 上游 liblcm 1.x 允许 `lcm.subscribe("/topic#pkg.Msg")` 一并指定 channel
     /// 与类型标签。本函数只负责字符串拼装,**不**做 STRUCT_SEEDS 校验
-    /// (校验由 [`LcmMessageType::new`] 在 msg_type 上承担)。
+    /// (校验由 [`crate::LcmMessageType::new`] 在 msg_type 上承担)。
     ///
     /// # Arguments
     ///
@@ -102,7 +102,7 @@ impl LcmTopic {
     /// - 其它情况 -> 不匹配。
     ///
     /// 该函数**不**做 msg_type 等价校验 —— typed suffix 部分仅作为
-    /// "存在性" 过滤;`msg_type` 由 [`LcmMessageType`] 在更上层校验。
+    /// "存在性" 过滤;`msg_type` 由 [`crate::LcmMessageType`] 在更上层校验。
     #[must_use]
     pub fn matches(&self, actual: &str) -> bool {
         // 拆出 channel 部分 + 可选 typed suffix

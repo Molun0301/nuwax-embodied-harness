@@ -8,14 +8,122 @@
 //!
 //! PGO PARTIAL: see audit H-8 (rework20)。
 //! H-8 已修复 SE(3) log map 维度（rotation 非零）。
-//! P2 实装：替换 ±I 占位 Jacobian 为 SE(3) adjoint 解析雅可比
-//!   `J_from = -Ad_{err}^{-1}, J_to = +Ad_{err}^{-1}`，
-//!   更新步骤改用 `pose * se3_exp(delta)` (right perturbation)。
+//! P2 实装：使用包含 `Log` 微分的 SE(3) right-perturbation 雅可比，
+//! 信息矩阵一致进入 cost、Hessian 与 gradient，更新为 `pose * se3_exp(delta)`。
 //! ISAM2 / gtsam 完整集成因 aarch64 无 prebuilt 留待 P3。
 
-use super::pgo::{transform_utils, PoseEdge, PoseGraph, PoseNode};
+use super::pgo::{PoseEdge, PoseGraph, PoseNode};
 use super::se3::{linearize_edge, se3_exp_from_vector6, se3_log_to_vector6};
 use nalgebra::{DMatrix, DVector, Isometry3, Matrix6, Vector6};
+
+/// 构造加权正规方程 `H = J^T Omega J`、`g = J^T Omega e`。
+fn linearize_graph(graph: &PoseGraph) -> (f64, DMatrix<f64>, DVector<f64>) {
+    let n_vars = graph.num_nodes() * 6;
+    let mut normal = DMatrix::zeros(n_vars, n_vars);
+    let mut gradient = DVector::zeros(n_vars);
+    let mut cost = 0.0;
+
+    for edge in &graph.edges {
+        let Some(from_node) = graph.nodes.get(&edge.from) else {
+            continue;
+        };
+        let Some(to_node) = graph.nodes.get(&edge.to) else {
+            continue;
+        };
+
+        let (error, j_from, j_to) =
+            linearize_edge(&edge.measurement, &from_node.pose, &to_node.pose);
+        let weighted_error = edge.information * error;
+        cost += 0.5 * error.dot(&weighted_error);
+
+        let from_offset = edge.from as usize * 6;
+        let to_offset = edge.to as usize * 6;
+        if !from_node.fixed {
+            add_vector6_block(
+                &mut gradient,
+                from_offset,
+                &(j_from.transpose() * weighted_error),
+            );
+            add_matrix6_block(
+                &mut normal,
+                from_offset,
+                from_offset,
+                &(j_from.transpose() * edge.information * j_from),
+            );
+        }
+        if !to_node.fixed {
+            add_vector6_block(
+                &mut gradient,
+                to_offset,
+                &(j_to.transpose() * weighted_error),
+            );
+            add_matrix6_block(
+                &mut normal,
+                to_offset,
+                to_offset,
+                &(j_to.transpose() * edge.information * j_to),
+            );
+        }
+        if !from_node.fixed && !to_node.fixed {
+            add_matrix6_block(
+                &mut normal,
+                from_offset,
+                to_offset,
+                &(j_from.transpose() * edge.information * j_to),
+            );
+            add_matrix6_block(
+                &mut normal,
+                to_offset,
+                from_offset,
+                &(j_to.transpose() * edge.information * j_from),
+            );
+        }
+    }
+
+    // Fixed variables have no edge contribution. An identity block keeps the full-size system
+    // nonsingular while preserving an exactly zero update for those variables.
+    for node in graph.nodes.values().filter(|node| node.fixed) {
+        let offset = node.id as usize * 6;
+        for axis in 0..6 {
+            normal[(offset + axis, offset + axis)] = 1.0;
+        }
+    }
+
+    (cost, normal, gradient)
+}
+
+fn add_matrix6_block(
+    destination: &mut DMatrix<f64>,
+    row_offset: usize,
+    col_offset: usize,
+    block: &Matrix6<f64>,
+) {
+    for row in 0..6 {
+        for col in 0..6 {
+            destination[(row_offset + row, col_offset + col)] += block[(row, col)];
+        }
+    }
+}
+
+fn add_vector6_block(destination: &mut DVector<f64>, offset: usize, block: &Vector6<f64>) {
+    for row in 0..6 {
+        destination[offset + row] += block[row];
+    }
+}
+
+fn graph_cost(graph: &PoseGraph) -> f64 {
+    graph
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let from = graph.nodes.get(&edge.from)?;
+            let to = graph.nodes.get(&edge.to)?;
+            let error_pose = edge.measurement.inverse() * from.pose.inverse() * to.pose;
+            let error = se3_log_to_vector6(&error_pose);
+            Some(0.5 * error.dot(&(edge.information * error)))
+        })
+        .sum()
+}
 
 /// 优化器配置
 #[derive(Debug, Clone, Copy)]
@@ -62,29 +170,16 @@ impl GaussNewtonOptimizer {
             return 0.0;
         }
 
-        let mut prev_cost = f64::INFINITY;
         for _ in 0..self.config.max_iterations {
-            let (cost, jacobian, residual) = self.linearize(graph);
+            let (cost, normal, gradient) = self.linearize(graph);
 
-            if (prev_cost - cost).abs() < self.config.gradient_tolerance {
-                return cost;
-            }
-            prev_cost = cost;
-
-            // 求解 normal equations: (J^T J) delta = -J^T r
-            let jtj = jacobian.transpose() * &jacobian;
-            let jtr = jacobian.transpose() * &residual;
-            let n_vars = jtr.len();
-            let n_dofs = n_vars - 6; // 减去固定节点
-
-            if n_dofs <= 0 {
+            if gradient.norm() < self.config.gradient_tolerance {
                 return cost;
             }
 
-            // 简化：使用全部变量（未排除固定节点）；实装可加 fixed mask
-            // 求解 (J^T J) delta = -J^T r（标准 Gauss-Newton 公式）
-            let neg_jtr: DVector<f64> = -&jtr;
-            let delta = match Self::solve_linear(&jtj, &neg_jtr) {
+            // 求解加权 normal equations: (J^T Omega J) delta = -J^T Omega e
+            let neg_gradient: DVector<f64> = -&gradient;
+            let delta = match Self::solve_linear(&normal, &neg_gradient) {
                 Some(d) => d,
                 None => return cost, // 奇异 → 终止
             };
@@ -105,74 +200,21 @@ impl GaussNewtonOptimizer {
                     delta[id * 6 + 4],
                     delta[id * 6 + 5],
                 );
-                node.pose = node.pose * se3_exp_from_vector6(&d);
+                node.pose *= se3_exp_from_vector6(&d);
             }
         }
-        prev_cost
+        graph_cost(graph)
     }
 
-    /// 线性化：返回 (cost, J, r)
-    /// J: (n_edges * 6) × (n_nodes * 6) — H-8 修复后维度匹配 6D SE(3) 残差
-    /// r: (n_edges * 6,) — 含 translation + rotation 残差（H-8 修复）
-    /// J: P2 实装 SE(3) adjoint 解析雅可比（替换 ±I 占位）
+    /// 线性化：返回 `(cost, J^T Omega J, J^T Omega e)`。
     fn linearize(&self, graph: &PoseGraph) -> (f64, DMatrix<f64>, DVector<f64>) {
-        let n_edges = graph.num_edges();
-        let n_nodes = graph.num_nodes();
-        let n_residuals = n_edges * 6;
-        let n_vars = n_nodes * 6;
-
-        let mut jacobian = DMatrix::zeros(n_residuals, n_vars);
-        let mut residual = DVector::zeros(n_residuals);
-        let mut cost = 0.0;
-
-        for (edge_idx, edge) in graph.edges.iter().enumerate() {
-            let from_node = match graph.nodes.get(&edge.from) {
-                Some(n) => n,
-                None => continue,
-            };
-            let to_node = match graph.nodes.get(&edge.to) {
-                Some(n) => n,
-                None => continue,
-            };
-
-            // P2 修复：用 SE(3) adjoint 解析雅可比（替换 ±I 占位）
-            //   predicted = from^{-1} * to
-            //   err_pose  = measurement^{-1} * predicted
-            //   e         = log(err_pose)
-            //   J_from    = -Ad_{err_pose}^{-1},  J_to = +Ad_{err_pose}^{-1}
-            let (e_vec, j_from, j_to) =
-                linearize_edge(&edge.measurement, &from_node.pose, &to_node.pose);
-
-            // 填充残差
-            for k in 0..6 {
-                residual[edge_idx * 6 + k] = e_vec[k];
-            }
-
-            // 残差平方（加权）
-            let weighted = edge.information * e_vec;
-            cost += 0.5 * e_vec.dot(&weighted);
-
-            // 雅可比块：6×6 from + 6×6 to
-            // 固定节点的雅可比列置 0，对应 delta 分量也为 0
-            for k in 0..6 {
-                for l in 0..6 {
-                    if !from_node.fixed {
-                        jacobian[(edge_idx * 6 + k, edge.from as usize * 6 + l)] = j_from[(k, l)];
-                    }
-                    if !to_node.fixed {
-                        jacobian[(edge_idx * 6 + k, edge.to as usize * 6 + l)] = j_to[(k, l)];
-                    }
-                }
-            }
-        }
-
-        (cost, jacobian, residual)
+        linearize_graph(graph)
     }
 
-    /// 求解线性方程 J^T J delta = J^T r
-    fn solve_linear(jtj: &DMatrix<f64>, jtr: &DVector<f64>) -> Option<DVector<f64>> {
+    /// 求解线性方程 `H delta = -g`。
+    fn solve_linear(normal: &DMatrix<f64>, neg_gradient: &DVector<f64>) -> Option<DVector<f64>> {
         // 尝试 Cholesky 分解；若失败则用 LU
-        jtj.clone().cholesky().map(|c| c.solve(jtr))
+        normal.clone().cholesky().map(|c| c.solve(neg_gradient))
     }
 }
 
@@ -197,29 +239,21 @@ impl LevenbergMarquardt {
     /// 优化（与 Gauss-Newton 类似但带阻尼项 lambda * I）
     pub fn optimize(&self, graph: &mut PoseGraph) -> f64 {
         let mut lambda = self.config.initial_lambda;
-        let mut prev_cost = f64::INFINITY;
-
         for _ in 0..self.config.max_iterations {
-            let (cost, jacobian, residual) = self.linearize(graph);
+            let (cost, mut normal, gradient) = self.linearize(graph);
 
-            if (prev_cost - cost).abs() < self.config.gradient_tolerance {
+            if gradient.norm() < self.config.gradient_tolerance {
                 return cost;
             }
-            prev_cost = cost;
 
-            let jtj = jacobian.transpose() * &jacobian;
-            let jtr = jacobian.transpose() * &residual;
-            let n = jtr.len();
-
-            // (J^T J + lambda * I) delta = -J^T r
-            let mut normal = jtj;
+            // (J^T Omega J + lambda * I) delta = -J^T Omega e
+            let n = gradient.len();
             for i in 0..n {
                 normal[(i, i)] += lambda;
             }
 
-            // 关键：求解时用 -J^T r（标准 LM 公式）
-            let neg_jtr: DVector<f64> = -&jtr;
-            let delta = match normal.clone().cholesky().map(|c| c.solve(&neg_jtr)) {
+            let neg_gradient: DVector<f64> = -&gradient;
+            let delta = match normal.cholesky().map(|factor| factor.solve(&neg_gradient)) {
                 Some(d) => d,
                 None => {
                     lambda *= self.config.lambda_scale;
@@ -229,8 +263,11 @@ impl LevenbergMarquardt {
 
             // 试探更新（P2: SE(3) right perturbation）
             // 用 node.id 索引 delta，与 linearize() 对齐（避免 HashMap 迭代顺序错位）
-            let backup: Vec<(u64, Isometry3<f64>)> =
-                graph.nodes.iter().map(|(_, n)| (n.id, n.pose)).collect();
+            let backup: Vec<(u64, Isometry3<f64>)> = graph
+                .nodes
+                .values()
+                .map(|node| (node.id, node.pose))
+                .collect();
             for (_, node) in graph.nodes.iter_mut() {
                 if node.fixed {
                     continue;
@@ -244,11 +281,14 @@ impl LevenbergMarquardt {
                     delta[id * 6 + 4],
                     delta[id * 6 + 5],
                 );
-                node.pose = node.pose * se3_exp_from_vector6(&d);
+                node.pose *= se3_exp_from_vector6(&d);
             }
 
             let new_cost = self.compute_cost(graph);
             if new_cost < cost {
+                if cost - new_cost < self.config.gradient_tolerance {
+                    return new_cost;
+                }
                 lambda /= self.config.lambda_scale;
             } else {
                 // 回滚（按 node.id 恢复，避免 HashMap 迭代顺序错位）
@@ -260,68 +300,15 @@ impl LevenbergMarquardt {
                 lambda *= self.config.lambda_scale;
             }
         }
-        prev_cost
+        self.compute_cost(graph)
     }
 
     fn linearize(&self, graph: &PoseGraph) -> (f64, DMatrix<f64>, DVector<f64>) {
-        let n_edges = graph.num_edges();
-        let n_nodes = graph.num_nodes();
-        let n_residuals = n_edges * 6;
-        let n_vars = n_nodes * 6;
-        let mut jacobian = DMatrix::zeros(n_residuals, n_vars);
-        let mut residual = DVector::zeros(n_residuals);
-        let mut cost = 0.0;
-
-        for (edge_idx, edge) in graph.edges.iter().enumerate() {
-            let from_node = match graph.nodes.get(&edge.from) {
-                Some(n) => n,
-                None => continue,
-            };
-            let to_node = match graph.nodes.get(&edge.to) {
-                Some(n) => n,
-                None => continue,
-            };
-            // P2 修复：SE(3) adjoint 解析雅可比（替换 ±I 占位）
-            let (e, j_from, j_to) =
-                linearize_edge(&edge.measurement, &from_node.pose, &to_node.pose);
-
-            for k in 0..6 {
-                residual[edge_idx * 6 + k] = e[k];
-                for l in 0..6 {
-                    if !from_node.fixed {
-                        jacobian[(edge_idx * 6 + k, edge.from as usize * 6 + l)] = j_from[(k, l)];
-                    }
-                    if !to_node.fixed {
-                        jacobian[(edge_idx * 6 + k, edge.to as usize * 6 + l)] = j_to[(k, l)];
-                    }
-                }
-            }
-            let weighted = edge.information * e;
-            cost += 0.5 * e.dot(&weighted);
-        }
-
-        (cost, jacobian, residual)
+        linearize_graph(graph)
     }
 
     fn compute_cost(&self, graph: &PoseGraph) -> f64 {
-        let mut cost = 0.0;
-        for edge in &graph.edges {
-            let from = match graph.nodes.get(&edge.from) {
-                Some(n) => n,
-                None => continue,
-            };
-            let to = match graph.nodes.get(&edge.to) {
-                Some(n) => n,
-                None => continue,
-            };
-            let predicted = transform_utils::relative_pose(&from.pose, &to.pose);
-            // H-8 修复：与 linearize() 一致使用 6D SE(3) 残差
-            let err_pose = edge.measurement.inverse() * predicted;
-            let e = se3_log_to_vector6(&err_pose);
-            let w = edge.information * e;
-            cost += 0.5 * e.dot(&w);
-        }
-        cost
+        graph_cost(graph)
     }
 }
 
@@ -346,12 +333,16 @@ mod tests {
         let mut g = PoseGraph::new();
         let id1 = g.add_node(0, Isometry3::identity());
         let id2 = g.add_node(1, Isometry3::translation(1.0, 0.0, 0.0));
-        g.add_edge(PoseEdge::new(id1, id2, Isometry3::translation(1.0, 0.0, 0.0)));
+        g.add_edge(PoseEdge::new(
+            id1,
+            id2,
+            Isometry3::translation(1.0, 0.0, 0.0),
+        ));
 
         let opt = GaussNewtonOptimizer::default();
         let cost = opt.optimize(&mut g);
         // 残差应该很小（测量与当前 pose 一致）
-        assert!(cost < 1.0, "cost too high: {}", cost);
+        assert!(cost < 1.0, "cost too high: {cost}");
     }
 
     #[test]
@@ -360,13 +351,17 @@ mod tests {
         let mut prev = g.add_node(0, Isometry3::identity());
         for i in 1..5 {
             let cur = g.add_node(i as i64, Isometry3::translation(i as f64, 0.0, 0.0));
-            g.add_edge(PoseEdge::new(prev, cur, Isometry3::translation(1.0, 0.0, 0.0)));
+            g.add_edge(PoseEdge::new(
+                prev,
+                cur,
+                Isometry3::translation(1.0, 0.0, 0.0),
+            ));
             prev = cur;
         }
 
         let opt = LevenbergMarquardt::default();
         let cost = opt.optimize(&mut g);
-        assert!(cost < 1.0, "cost too high: {}", cost);
+        assert!(cost < 1.0, "cost too high: {cost}");
     }
 
     #[test]
@@ -414,7 +409,7 @@ mod tests {
         );
     }
 
-    /// H-8: 雅可比维度必须是 6·E × 6·N（H-8 维度修复）
+    /// H-8/P2: 正规方程维度必须覆盖每个节点的 6 个自由度。
     #[test]
     fn h8_jacobian_shape_is_six_n_by_six_m() {
         // 构造 3 节点 + 2 边的图
@@ -422,14 +417,26 @@ mod tests {
         let id0 = g.add_node(0, Isometry3::identity());
         let id1 = g.add_node(1, Isometry3::translation(1.0, 0.0, 0.0));
         let id2 = g.add_node(2, Isometry3::translation(2.0, 0.0, 0.0));
-        g.add_edge(PoseEdge::new(id0, id1, Isometry3::translation(1.0, 0.0, 0.0)));
-        g.add_edge(PoseEdge::new(id1, id2, Isometry3::translation(1.0, 0.0, 0.0)));
+        g.add_edge(PoseEdge::new(
+            id0,
+            id1,
+            Isometry3::translation(1.0, 0.0, 0.0),
+        ));
+        g.add_edge(PoseEdge::new(
+            id1,
+            id2,
+            Isometry3::translation(1.0, 0.0, 0.0),
+        ));
 
-        // H-8 维度修复：LM 优化 6D residual 后必须收敛（cost < 1.0）；
-        // 若 Jacobian 维度错位，cost 不会下降（H-8 旧 bug 表现）
         let lm = LevenbergMarquardt::default();
+        let (_, normal, gradient) = lm.linearize(&g);
+        assert_eq!(normal.shape(), (18, 18));
+        assert_eq!(gradient.len(), 18);
         let cost = lm.optimize(&mut g);
-        assert!(cost < 1.0, "LM residual must converge on chain (H-8), got {cost}");
+        assert!(
+            cost < 1.0,
+            "LM residual must converge on chain (H-8), got {cost}"
+        );
         let _ = id2;
     }
 
@@ -457,7 +464,7 @@ mod tests {
             initial_lambda: 1e-4,
             lambda_scale: 10.0,
         });
-        // P2 实装后：SE(3) adjoint Jacobian 让 LM 真正优化 rotation
+        // 完整的 SE(3) Jacobian 让 LM 真正优化 rotation。
         let final_cost = lm.optimize(&mut g);
         assert!(
             final_cost < 1e-3,
@@ -470,24 +477,16 @@ mod tests {
         let z_component_sq = q_after.coords[2] * q_after.coords[2];
         assert!(
             z_component_sq > 0.1,
-            "rotation z component should be large after optimize (P2), got {}",
-            z_component_sq
+            "rotation z component should be large after optimize (P2), got {z_component_sq}"
         );
         let _ = id0;
         let _ = final_cost;
     }
 
-    // ----- P2 SE(3) adjoint 新增用例 -----
+    // ----- P2 SE(3) Jacobian 新增用例 -----
 
-    /// P2: 节点起始 identity，measurement π/4 绕 z，
-    /// LM optimize 后 node1.quat.z 应 > 0.35（即旋转被正确恢复）
-    ///
-    /// TODO(P3):LM 步长调节 + gain ratio 算法未完整对齐 RANSAC/gtsam。
-    /// 当前实装的 SE(3) adjoint Jacobian 让 cost 下降 + quat 偏移正确方向,
-    /// 但 100 iter + λ=1e-4 不足以收敛到 <1e-2。P3 任务:调优 λ 调度 + 步长裁剪,
-    /// 或接 gtsam/isam2。
+    /// P2: 节点起始 identity，measurement π/4 绕 z，LM 应恢复该旋转。
     #[test]
-    #[ignore = "P3:LM 步长调节待实现,启用时间由 P3 lambda 调度 PR 决定"]
     fn p2_lm_optimizes_rotation_node_to_match_measurement() {
         let mut g = PoseGraph::new();
         let id0 = g.add_node(0, Isometry3::identity());
@@ -521,19 +520,15 @@ mod tests {
         );
     }
 
-    /// P2: 节点起始 (1, 0, 0) translation + π/8 旋转，measurement = identity，
-    /// LM 应能把节点拉回到接近 measurement（即 → identity）
-    ///
-    /// TODO(P3):同 p2_lm_optimizes_rotation_node_to_match_measurement
+    /// P2: 同时含三轴平移与三轴旋转的初值应收敛到 identity measurement。
     #[test]
-    #[ignore = "P3:LM 步长调节待实现"]
     fn p2_lm_recovers_from_perturbed_initial_pose() {
         let mut g = PoseGraph::new();
         let id0 = g.add_node(0, Isometry3::identity());
-        // node1 起始 = (1, 0, 0) 平移 + π/8 旋转
+        // 非交换的完整 SE(3) 扰动，避免只验证平移或单轴旋转。
         let initial_pose = Isometry3::from_parts(
-            nalgebra::Translation3::new(1.0, 0.0, 0.0),
-            UnitQuaternion::from_euler_angles(0.0, 0.0, core::f64::consts::FRAC_PI_8),
+            nalgebra::Translation3::new(1.0, -0.5, 0.25),
+            UnitQuaternion::from_euler_angles(0.2, -0.1, core::f64::consts::FRAC_PI_8),
         );
         let id1 = g.add_node(1, initial_pose);
         // measurement = identity（即 from→to 应当 = I）
@@ -549,21 +544,108 @@ mod tests {
         });
         let final_cost = lm.optimize(&mut g);
         let final_pose = g.nodes[&id1].pose;
-        // 旋转应回到接近 identity：quat.z 应接近 0
+        let final_error = se3_log_to_vector6(&final_pose);
         assert!(
-            final_pose.rotation.coords[2].abs() < 0.05,
-            "expected quat.z ~ 0 after recovery, got {}",
-            final_pose.rotation.coords[2]
-        );
-        // 平移应回到接近 (0, 0, 0)
-        assert!(
-            final_pose.translation.vector.norm() < 0.05,
-            "expected translation ~ 0 after recovery, got {:?}",
-            final_pose.translation.vector
+            final_error.norm() < 1e-5,
+            "final SE(3) error = {final_error:?}"
         );
         assert!(
             final_cost < 1e-4,
             "expected near-zero cost, got {final_cost}"
         );
+    }
+
+    /// 非对角信息矩阵必须同时进入 Hessian 和 gradient，而不只是 reported cost。
+    #[test]
+    fn p2_normal_equations_apply_non_diagonal_information() {
+        let mut graph = PoseGraph::new();
+        let fixed = graph.add_node(0, Isometry3::identity());
+        let moving_pose = Isometry3::from_parts(
+            nalgebra::Translation3::new(0.4, -0.2, 0.3),
+            UnitQuaternion::from_euler_angles(0.2, -0.15, 0.25),
+        );
+        let moving = graph.add_node(1, moving_pose);
+        graph.nodes.get_mut(&fixed).unwrap().fixed = true;
+
+        let mut information = Matrix6::from_diagonal(&Vector6::new(4.0, 3.0, 2.0, 5.0, 4.0, 3.0));
+        information[(0, 3)] = 0.4;
+        information[(3, 0)] = 0.4;
+        information[(1, 5)] = -0.3;
+        information[(5, 1)] = -0.3;
+        graph.add_edge(
+            PoseEdge::new(fixed, moving, Isometry3::identity()).with_information(information),
+        );
+
+        let optimizer = LevenbergMarquardt::default();
+        let (cost, normal, gradient) = optimizer.linearize(&graph);
+        let (error, _, j_to) =
+            linearize_edge(&Isometry3::identity(), &Isometry3::identity(), &moving_pose);
+        let expected_normal = j_to.transpose() * information * j_to;
+        let expected_gradient = j_to.transpose() * information * error;
+        let expected_cost = 0.5 * error.dot(&(information * error));
+
+        assert_relative_eq!(cost, expected_cost, epsilon = 1e-12);
+        for row in 0..6 {
+            assert_relative_eq!(gradient[6 + row], expected_gradient[row], epsilon = 1e-12);
+            for col in 0..6 {
+                assert_relative_eq!(
+                    normal[(6 + row, 6 + col)],
+                    expected_normal[(row, col)],
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
+    /// 多条独立 loop constraints 下同时恢复旋转和平移。
+    #[test]
+    fn p2_lm_converges_on_multi_loop_se3_graph() {
+        let truth = [
+            Isometry3::identity(),
+            Isometry3::from_parts(
+                nalgebra::Translation3::new(1.0, 0.2, 0.1),
+                UnitQuaternion::from_euler_angles(0.05, -0.08, 0.2),
+            ),
+            Isometry3::from_parts(
+                nalgebra::Translation3::new(2.0, 1.0, 0.2),
+                UnitQuaternion::from_euler_angles(-0.1, 0.12, 0.45),
+            ),
+            Isometry3::from_parts(
+                nalgebra::Translation3::new(0.8, 2.0, -0.1),
+                UnitQuaternion::from_euler_angles(0.15, 0.05, 0.8),
+            ),
+        ];
+        let perturbations = [
+            Vector6::zeros(),
+            Vector6::new(0.25, -0.15, 0.08, 0.08, -0.04, 0.12),
+            Vector6::new(-0.2, 0.18, -0.1, -0.06, 0.09, -0.1),
+            Vector6::new(0.15, 0.2, 0.12, 0.1, -0.08, 0.07),
+        ];
+        let mut graph = PoseGraph::new();
+        for (index, pose) in truth.iter().enumerate() {
+            let initial = *pose * se3_exp_from_vector6(&perturbations[index]);
+            let id = graph.add_node(index as i64, initial);
+            assert_eq!(id as usize, index);
+        }
+        graph.nodes.get_mut(&0).unwrap().fixed = true;
+
+        for (from, to) in [(0_u64, 1_u64), (1, 2), (2, 3), (3, 0), (0, 2), (1, 3)] {
+            let measurement = truth[from as usize].inverse() * truth[to as usize];
+            graph.add_edge(PoseEdge::new(from, to, measurement));
+        }
+
+        let optimizer = LevenbergMarquardt::new(OptimizerConfig {
+            max_iterations: 100,
+            gradient_tolerance: 1e-12,
+            initial_lambda: 1e-3,
+            lambda_scale: 10.0,
+        });
+        let final_cost = optimizer.optimize(&mut graph);
+        assert!(final_cost < 1e-10, "multi-loop final cost = {final_cost}");
+        for (id, expected) in truth.iter().enumerate() {
+            let error_pose = expected.inverse() * graph.nodes[&(id as u64)].pose;
+            let error = se3_log_to_vector6(&error_pose);
+            assert!(error.norm() < 1e-5, "node {id} SE(3) error = {error:?}");
+        }
     }
 }

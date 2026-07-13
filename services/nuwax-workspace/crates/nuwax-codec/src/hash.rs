@@ -174,7 +174,6 @@ pub fn murmur_hash64a(key: &[u8]) -> u64 {
     h1 = fmix64(h1);
     h2 = fmix64(h2);
     h1 = h1.wrapping_add(h2);
-    h2 = h2.wrapping_add(h1);
     h1
 }
 
@@ -199,7 +198,7 @@ fn fmix64(mut k: u64) -> u64 {
 // lcm-gen 生成 per-type seed 字典
 // ============================================================================
 
-/// lcm-gen 输出的 per-type seed 表
+/// Effective fingerprint preimages for the locked generated schemas.
 ///
 /// 由 `scripts/ci/regen_lcm_goldens.sh` 重生成,以避免手工转录漂移。
 /// 字典基于 `services/nuwax-workspace/lcmtypes/` 下经 `lcm-gen -c` 编译
@@ -207,43 +206,51 @@ fn fmix64(mut k: u64) -> u64 {
 ///
 /// **写入日期**:2026-07-07
 /// **上游版本**:lcm 1.5.2 (lcm-gen 1.5.2)
-/// LCM 上游 `__lcm_hash_64` rotate-left 1 种子常量(per-type seed)
+/// `fingerprint(fqn, 0)` rotates each value left once to obtain the exact
+/// top-level generated fingerprint. For schemas with nested structs, this is
+/// the generated seed plus its recursive child hashes, not the bare seed.
 ///
-/// 每个 seed 是 `lcm-gen` 在 code-gen 时由包路径 + 类型名经过 MurmurHash3_x64
-/// 滚动一次得到。对全 primitive 子类型的结构体(seed + Σ child,Σ child = 0),
-/// 计算公式 = `seed = rotate_right(fingerprint, 1)`。
+/// Primitive-only types store the raw generated seed. Nested types store
+/// `seed + sum(child fingerprints)` so callers that only know the FQN can
+/// still obtain the locked top-level fingerprint with a zero second argument.
 ///
-/// **生成日期**:2026-07-07,由上游 lcm 1.5.2 + lcm-gen 1.5.2 编译 10 个 .lcm
-/// schema 后反推填写。fixture 在
+/// **生成日期**:2026-07-13,由锁定的 DimOS Python 包和 lcm-gen 1.5.2
+/// generated C 反推填写。fixture 在
 /// `tests/golden_real_lcm.rs::test_per_type_seeds_match_upstream_lcm_gen`。
 pub const STRUCT_SEEDS: &[(&str, u64)] = &[
-    ("geometry_msgs/PoseStamped", 0x12b9c572bf62a742u64),
-    ("geometry_msgs/Transform", 0x157d1f465d1abf68u64),
-    ("geometry_msgs/Twist", 0x5de51d86961179c2u64),
-    ("nav_msgs/Odometry", 0x8f24e6271dc294aau64),
-    ("nav_msgs/OccupancyGrid", 0x32ca47ecb0464adeu64),
-    ("sensor_msgs/PointCloud2", 0x4e75c66cc7beafa4u64),
-    ("nuwax_msgs/NavigationState", 0x5fecbf50c89e8140u64),
-    ("nuwax_msgs/CancelNavigation", 0x57dde487b0da9283u64),
-    ("nuwax_msgs/Frontier", 0x0d5fc1f50676ce22u64),
-    ("nuwax_msgs/FrontierList", 0xf5df575dcf1df377u64),
+    ("geometry_msgs.PoseStamped", 0x3541_34b2_2c61_3cd0_u64),
+    ("geometry_msgs.PointStamped", 0xce6b_b239_c753_14d7_u64),
+    ("geometry_msgs.Transform", 0x157d_1f46_5d1a_bf68_u64),
+    ("geometry_msgs.Twist", 0x973e_03eb_e6fb_f013_u64),
+    ("nav_msgs.Path", 0x61d7_3156_59ab_c9f1_u64),
+    ("nav_msgs.Odometry", 0x4a70_bfca_3246_7872_u64),
+    ("nav_msgs.OccupancyGrid", 0xf3ef_e8bc_e6fe_1db2_u64),
+    ("sensor_msgs.PointCloud2", 0xfaf5_9ed0_e142_98ba_u64),
+    ("std_msgs.Bool", 0x0f5f_7835_284a_871f_u64),
+    ("tf2_msgs.TFMessage", 0x615c_50e1_9d44_91f6_u64),
+    ("nuwax_msgs.NavigationState", 0x5fec_bf50_c89e_8140_u64),
+    ("nuwax_msgs.CancelNavigation", 0x57dd_e487_b0da_9283_u64),
+    ("nuwax_msgs.Frontier", 0x0d5f_c1f5_0676_ce22_u64),
+    ("nuwax_msgs.FrontierList", 0x109e_db47_dc0b_8fbb_u64),
+    ("nuwax_msgs.PersonFollowTarget", 0xf313_e184_14b2_f0c6_u64),
 ];
 
 /// 按 FQN 查 per-type seed(线性搜索,固定表小)。`None` 表示未在 STRUCT_SEEDS
 /// 中注册 —— 调用方应 fail-fast,而不是 fallback 到 fake hash。
 #[must_use]
 pub fn lookup_seed(fqn: &str) -> Option<u64> {
+    let canonical = fqn.replace("::", ".").replace('/', ".");
     STRUCT_SEEDS
         .iter()
-        .find(|(name, _)| *name == fqn)
+        .find(|(name, _)| *name == canonical)
         .map(|(_, seed)| *seed)
 }
 
-/// 给定 FQN + 子类型 hash 贡献之和,计算 upstream LCM 1.x 兼容 fingerprint
+/// Compute a locked LCM fingerprint from its registered effective preimage.
 ///
-/// 对全 primitive 字段的 struct,`sum_of_child_hashes = 0`;
-/// 对含子 struct 的类型,递归调用 `lcm_hash_64` 把每个子 fingerprint
-/// 累计进去(本 crate 暂未用到,因为 10 个 schema 都是全 primitive)。
+/// Normal top-level callers pass `0`: nested-child contributions are already
+/// folded into [`STRUCT_SEEDS`]. A nonzero value is reserved for callers that
+/// intentionally append another recursive hash contribution.
 #[must_use]
 pub fn fingerprint(fqn: &str, sum_of_child_hashes: u64) -> Option<[u8; 8]> {
     let seed = lookup_seed(fqn)?;
@@ -259,9 +266,9 @@ mod tests {
     /// 这里 SEED 是 canonical `LCM_DEFAULT_HASH_SEED = 0xee60937a86bd6213`。
     #[test]
     fn lcm_hash_64_seed_zero_children() {
-        let seed = 0xee60937a_86bd_6213u64;
+        let seed = 0xee60_937a_86bd_6213_u64;
         let r = lcm_hash_64(seed, 0);
-        assert_eq!(r, 0xdcc126f5_0d7a_c427);
+        assert_eq!(r, 0xdcc1_26f5_0d7a_c427);
     }
 
     /// `rotate_left^-1(r) = sum - seed` 逆向正确性

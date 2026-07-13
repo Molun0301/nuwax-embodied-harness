@@ -2,8 +2,13 @@
 //!
 //! binary `nuwax-mapping-cli` 在 `main.rs` 调本 crate 的 `run()`。
 //! 集成测试（`tests/*.rs`）可直接用 `nuwax_mapping_cli::cmd::*`。
+//!
+//! The supported persisted input schema is documented in the crate-local
+//! `FORMAT.md` and implemented by [`dataset`].
 
 pub mod cmd;
+pub mod dataset;
+pub mod native;
 
 use clap::Parser;
 
@@ -16,17 +21,17 @@ pub struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// 生成地图（PGM + ASCII art）
+    /// Build a PGM map from persisted grid or point-cloud records
     Map(cmd::map::MapArgs),
-    /// pose 插值
+    /// Attach nearest persisted poses to a target stream
     PoseFill(cmd::pose_fill::PoseFillArgs),
-    /// 重命名 bag 文件
+    /// Persist logical stream renames and drops
     Rename(cmd::rename::RenameArgs),
-    /// 回放 PointCloud2 → costmap
+    /// Build a deterministic replay schedule
     Replay(cmd::replay::ReplayArgs),
-    /// 回放 marker → loop closure
+    /// Export persisted marker observations
     ReplayMarker(cmd::replay_marker::ReplayMarkerArgs),
-    /// bag 目录摘要
+    /// Print exact dataset counts and time ranges
     Summary(cmd::summary::SummaryArgs),
 }
 

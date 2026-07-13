@@ -51,30 +51,15 @@ impl EvalLoopClosure {
     ///
     /// `predicted` 与 `ground_truth` 都是 `(from_id, to_id)` 元组列表（无向，回环天然对称）。
     #[must_use]
-    pub fn evaluate(
-        predicted: &[(u64, u64)],
-        ground_truth: &[(u64, u64)],
-    ) -> EvalResult {
+    pub fn evaluate(predicted: &[(u64, u64)], ground_truth: &[(u64, u64)]) -> EvalResult {
         let pred_set: std::collections::HashSet<(u64, u64)> = predicted
             .iter()
-            .map(|&(a, b)| {
-                if a < b {
-                    (a, b)
-                } else {
-                    (b, a)
-                }
-            })
+            .map(|&(a, b)| if a < b { (a, b) } else { (b, a) })
             .collect();
 
         let truth_set: std::collections::HashSet<(u64, u64)> = ground_truth
             .iter()
-            .map(|&(a, b)| {
-                if a < b {
-                    (a, b)
-                } else {
-                    (b, a)
-                }
-            })
+            .map(|&(a, b)| if a < b { (a, b) } else { (b, a) })
             .collect();
 
         let tp = pred_set.intersection(&truth_set).count();

@@ -1,0 +1,35 @@
+[package]
+name = "nuwax-motion-safety-guard"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Motion guard authoritative protobuf and durable fail-closed state reference"
+publish = false
+
+# The production UDS/SDK owner is Python because the repository's official Go2
+# integration is unitree_sdk2py. This crate generates the Rust wire contract and
+# provides durable epoch/state reference logic; it intentionally has no binary.
+
+[dependencies]
+chrono = { workspace = true }
+prost = { workspace = true }
+rustix = { version = "1.1.4", features = ["time"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "macros", "sync", "net", "io-util"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3"
+
+# 默认 features 为空;真 LCM/UDS 接入由后续 lane 启用
+[features]
+default = []

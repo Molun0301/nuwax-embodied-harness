@@ -1,39 +1,36 @@
-//! P0-13 MovementManagerModule 副作用层。
+//! Typed lifecycle and publication layer for [`crate::MovementManager`].
 //!
-//! 把 `MovementManager::cancel_navigation()`(只返 `Vec<MovementEvent>`,由 caller 转发)
-//! 包成真副作用 Module:直接通过 `tokio::sync::broadcast` 端口发
-//! `MovementCommand::Stop` 和 NaN `PoseStamped` 给下游订阅者。
-//!
-//! 端口语义:
-//! - `stop_out`:`broadcast::Sender<MovementCommand>`,发 `Stop` 取消运动
-//! - `nan_goal_out`:`broadcast::Sender<PoseStamped>`,发 NaN pose 给 nav stack
-//!   表示"无目标"
-//!
-//! 行为对账源:`dimos/navigation/movement_manager/movement_manager.py`
-//! 的 `cancel_navigation` 路径(原 Python 在 cancel 时直接发布 stop_movement=true
-//! 与 NaN goal,我们把这条 publish 链路下沉到 Module 里)。
+//! The module consumes click, navigation velocity, teleoperation velocity, and
+//! cancellation inputs on typed ports. Core events are published to typed goal,
+//! waypoint, command velocity, and stop outputs. Transport binding remains the
+//! responsibility of the process composition layer.
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 use nuwax_nav_base::NavError;
-use nuwax_nav_types_messages::PoseStamped;
+use nuwax_nav_types_messages::{
+    NavFrameId, Point3, PointStamped, Pose3, PoseStamped, Quaternion, Timestamp,
+};
 
-use crate::{CancelGoalPolicy, MovementManager, MovementManagerConfig};
+use crate::{CancelGoalPolicy, MovementEvent, MovementManager, MovementManagerConfig, Twist};
 
-/// 广播端口默认容量(broadcast channel size)
+/// Default capacity for every typed port.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 16;
 
-/// Module 配置
+/// Module configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovementManagerModuleConfig {
-    /// 底层 MovementManager 配置
+    /// Core movement-manager configuration.
     pub manager_config: MovementManagerConfig,
-    /// broadcast 端口容量(默认 16)
+    /// Capacity of each broadcast port.
     pub broadcast_capacity: usize,
-    /// robot_id(用于日志区分)
+    /// Robot identifier used by process composition.
     pub robot_id: String,
 }
 
@@ -47,118 +44,194 @@ impl Default for MovementManagerModuleConfig {
     }
 }
 
-/// MovementManager 对外发出的高层命令
-///
-/// 设计:`Stop` 是 typed 命令(可扩展到 `Pause / Resume / SetGoal` 等);
-/// NaN goal 走单独的 `PoseStamped` 通道,语义清晰。
+/// High-level movement commands retained for typed-stop consumers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MovementCommand {
-    /// 立即停止运动(twist=0 + stop 标记)
+    /// Stop immediately.
     Stop,
-    /// 暂停当前 nav 动作(stop 但保留当前 goal)
+    /// Stop while retaining a resumable goal.
     Pause,
-    /// 恢复被 pause 的 nav 动作
+    /// Resume a paused command.
     Resume,
 }
 
 impl MovementCommand {
-    /// 是否为 stop 类(Stop / Pause 都属于"现在不要往前走")
+    /// Return whether this command prevents motion.
     #[must_use]
     pub fn is_stop_like(&self) -> bool {
         matches!(self, Self::Stop | Self::Pause)
     }
 }
 
-/// `MovementManagerModule` 真副作用对象。
-///
-/// 字段:
-/// - `manager`:MovementManager 核心(纯函数式 cancel/click/cmd_vel 处理);
-/// - `running`:lifecycle 状态(lifecycle 任务 spawn,本期保留字段);
-/// - `stop_out`:广播 stop 命令端口;
-/// - `nan_goal_out`:广播 NaN goal 端口。
+#[derive(Clone)]
+struct OutputPorts {
+    stop_command: broadcast::Sender<MovementCommand>,
+    stop_movement: broadcast::Sender<bool>,
+    legacy_nan_pose: broadcast::Sender<PoseStamped>,
+    nan_goal_point: broadcast::Sender<PointStamped>,
+    goal: broadcast::Sender<PointStamped>,
+    way_point: broadcast::Sender<PointStamped>,
+    cmd_vel: broadcast::Sender<Twist>,
+}
+
+/// Movement manager with typed input and output ports.
 pub struct MovementManagerModule {
-    manager: MovementManager,
+    manager: Arc<Mutex<MovementManager>>,
     config: MovementManagerModuleConfig,
     running: bool,
-    stop_out: broadcast::Sender<MovementCommand>,
-    nan_goal_out: broadcast::Sender<PoseStamped>,
+    clicked_point_in: broadcast::Sender<PointStamped>,
+    nav_cmd_vel_in: broadcast::Sender<Twist>,
+    tele_cmd_vel_in: broadcast::Sender<Twist>,
+    cancel_in: broadcast::Sender<bool>,
+    outputs: OutputPorts,
+    lifecycle_shutdown: Option<oneshot::Sender<()>>,
+    lifecycle_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MovementManagerModule {
-    /// 构造
+    /// Construct and validate a module.
     pub fn new(config: MovementManagerModuleConfig) -> Result<Self, NavError> {
-        let manager = MovementManager::new(config.manager_config.clone()).map_err(|e| {
+        let manager = MovementManager::new(config.manager_config.clone()).map_err(|error| {
             NavError::InvalidInput {
                 field: "manager_config",
-                reason: e.to_string(),
+                reason: error.to_string(),
             }
         })?;
-        let cap = if config.broadcast_capacity == 0 {
-            DEFAULT_BROADCAST_CAPACITY
-        } else {
-            config.broadcast_capacity
-        };
-        let (stop_out, _) = broadcast::channel::<MovementCommand>(cap);
-        let (nan_goal_out, _) = broadcast::channel::<PoseStamped>(cap);
+        let capacity = config.broadcast_capacity.max(1);
+        let (clicked_point_in, _) = broadcast::channel(capacity);
+        let (nav_cmd_vel_in, _) = broadcast::channel(capacity);
+        let (tele_cmd_vel_in, _) = broadcast::channel(capacity);
+        let (cancel_in, _) = broadcast::channel(capacity);
+        let (stop_command, _) = broadcast::channel(capacity);
+        let (stop_movement, _) = broadcast::channel(capacity);
+        let (legacy_nan_pose, _) = broadcast::channel(capacity);
+        let (nan_goal_point, _) = broadcast::channel(capacity);
+        let (goal, _) = broadcast::channel(capacity);
+        let (way_point, _) = broadcast::channel(capacity);
+        let (cmd_vel, _) = broadcast::channel(capacity);
+
         Ok(Self {
-            manager,
+            manager: Arc::new(Mutex::new(manager)),
             config,
             running: false,
-            stop_out,
-            nan_goal_out,
+            clicked_point_in,
+            nav_cmd_vel_in,
+            tele_cmd_vel_in,
+            cancel_in,
+            outputs: OutputPorts {
+                stop_command,
+                stop_movement,
+                legacy_nan_pose,
+                nan_goal_point,
+                goal,
+                way_point,
+                cmd_vel,
+            },
+            lifecycle_shutdown: None,
+            lifecycle_thread: None,
         })
     }
 
-    /// robot_id
+    /// Robot identifier.
     #[must_use]
     pub fn robot_id(&self) -> &str {
         &self.config.robot_id
     }
 
-    /// 暴露 stop_out 广播 sender(给外部订阅用)
+    /// Clone the typed clicked-point input port.
+    #[must_use]
+    pub fn clicked_point_input(&self) -> broadcast::Sender<PointStamped> {
+        self.clicked_point_in.clone()
+    }
+
+    /// Clone the typed navigation-velocity input port.
+    #[must_use]
+    pub fn nav_cmd_vel_input(&self) -> broadcast::Sender<Twist> {
+        self.nav_cmd_vel_in.clone()
+    }
+
+    /// Clone the typed teleoperation-velocity input port.
+    #[must_use]
+    pub fn tele_cmd_vel_input(&self) -> broadcast::Sender<Twist> {
+        self.tele_cmd_vel_in.clone()
+    }
+
+    /// Clone the cancellation input port. Only `true` requests cancellation.
+    #[must_use]
+    pub fn cancel_input(&self) -> broadcast::Sender<bool> {
+        self.cancel_in.clone()
+    }
+
+    /// Clone the legacy typed-stop sender.
     #[must_use]
     pub fn stop_out(&self) -> broadcast::Sender<MovementCommand> {
-        self.stop_out.clone()
+        self.outputs.stop_command.clone()
     }
 
-    /// 暴露 nan_goal_out 广播 sender
+    /// Clone the legacy NaN pose sender.
     #[must_use]
     pub fn nan_goal_out(&self) -> broadcast::Sender<PoseStamped> {
-        self.nan_goal_out.clone()
+        self.outputs.legacy_nan_pose.clone()
     }
 
-    /// 订阅 stop 命令(返回新 receiver)
+    /// Subscribe to typed-stop commands.
+    #[must_use]
     pub fn subscribe_stop(&self) -> broadcast::Receiver<MovementCommand> {
-        self.stop_out.subscribe()
+        self.outputs.stop_command.subscribe()
     }
 
-    /// 订阅 NaN goal
+    /// Subscribe to legacy NaN pose cancellation messages.
+    #[must_use]
     pub fn subscribe_nan_goal(&self) -> broadcast::Receiver<PoseStamped> {
-        self.nan_goal_out.subscribe()
+        self.outputs.legacy_nan_pose.subscribe()
     }
 
-    /// 当前 cancel policy
+    /// Subscribe to boolean stop-movement messages.
+    #[must_use]
+    pub fn subscribe_stop_movement(&self) -> broadcast::Receiver<bool> {
+        self.outputs.stop_movement.subscribe()
+    }
+
+    /// Subscribe to PointStamped cancellation messages.
+    #[must_use]
+    pub fn subscribe_nan_goal_point(&self) -> broadcast::Receiver<PointStamped> {
+        self.outputs.nan_goal_point.subscribe()
+    }
+
+    /// Subscribe to goal publications.
+    #[must_use]
+    pub fn subscribe_goal(&self) -> broadcast::Receiver<PointStamped> {
+        self.outputs.goal.subscribe()
+    }
+
+    /// Subscribe to waypoint publications.
+    #[must_use]
+    pub fn subscribe_way_point(&self) -> broadcast::Receiver<PointStamped> {
+        self.outputs.way_point.subscribe()
+    }
+
+    /// Subscribe to command-velocity publications.
+    #[must_use]
+    pub fn subscribe_cmd_vel(&self) -> broadcast::Receiver<Twist> {
+        self.outputs.cmd_vel.subscribe()
+    }
+
+    /// Return the configured cancellation policy.
     #[must_use]
     pub fn cancel_policy(&self) -> CancelGoalPolicy {
-        self.manager.config().cancel_goal_policy
+        self.manager
+            .lock()
+            .map(|manager| manager.config().cancel_goal_policy)
+            .unwrap_or(self.config.manager_config.cancel_goal_policy)
     }
 
-    /// 构造一个 NaN-filled `PoseStamped`(无目标信号)。
-    ///
-    /// Foundation `Pose3` 各字段默认 0;为表达"NaN goal",position 与
-    /// orientation 全部置 NaN,这样下游订阅者可凭 `is_nan()` 识别。
     fn build_nan_goal_stamped() -> PoseStamped {
-        // 通过 `PoseStamped::default()` + 字段 patch 的方式构造。
-        // 注意:`PoseStamped` 字段为 `frame_id / stamp / pose`,
-        // frame_id 与 stamp 在 Foundation 中是 enum + Timestamp,不便写 NaN;
-        // 这里只把 pose 部分写 NaN(position + orientation 全 NaN)。
-        use nuwax_nav_types_messages::{NavFrameId, Pose3, Quaternion, Timestamp};
         let nan = f64::NAN;
         PoseStamped {
             frame_id: NavFrameId::Map,
-            stamp: Timestamp::default(),
+            stamp: unix_timestamp_now(),
             pose: Pose3 {
-                position: nuwax_nav_types_messages::Point3 {
+                position: Point3 {
                     x: nan,
                     y: nan,
                     z: nan,
@@ -173,48 +246,94 @@ impl MovementManagerModule {
         }
     }
 
-    /// 主动触发 cancel:依 `publish_stop` / `publish_nan_goal` 真副作用发布。
-    ///
-    /// - `publish_stop=true` -> `stop_out.broadcast(MovementCommand::Stop)`
-    /// - `publish_nan_goal=true` -> `nan_goal_out.broadcast(build_nan_goal_stamped())`
-    ///
-    /// 即使 `running=false` 也允许 publish(端口与 lifecycle 解耦)。
-    /// 重复调用幂等(每次都会 broadcast,下游 consumer 各自 dedupe)。
+    /// Publish an explicit cancellation request.
     pub fn trigger_cancel(
         &mut self,
         publish_stop: bool,
         publish_nan_goal: bool,
     ) -> Result<(), NavError> {
-        // 同步推进 manager 内部 cooldown 状态(影响后续 nav_cmd_vel 抑制),
-        // 即使外部没有 teleop 信号,也允许显式 cancel。
-        let _events = self.manager.cancel_navigation();
-
-        if publish_stop {
-            // broadcast 失败(0 receivers)不算 error -- 仍属正常路径。
-            let _ = self.stop_out.send(MovementCommand::Stop);
+        if let Ok(mut manager) = self.manager.lock() {
+            let _ = manager.cancel_navigation();
         }
-        if publish_nan_goal {
-            let _ = self.nan_goal_out.send(Self::build_nan_goal_stamped());
-        }
+        publish_cancel(&self.outputs, publish_stop, publish_nan_goal);
         Ok(())
     }
 
-    /// 启动 lifecycle(本期留 stub -- MovementManager 本身是事件驱动的,
-    /// 不需要后台 ticker;但保留 API 兼容 BasicPathFollower 的对称性)。
-    ///
-    /// 幂等。
+    /// Bind input receivers and start the event lifecycle.
     pub fn start(&mut self) -> Result<(), NavError> {
+        if self.running {
+            return Ok(());
+        }
+
+        let click_rx = self.clicked_point_in.subscribe();
+        let nav_rx = self.nav_cmd_vel_in.subscribe();
+        let teleop_rx = self.tele_cmd_vel_in.subscribe();
+        let cancel_rx = self.cancel_in.subscribe();
+        let manager = Arc::clone(&self.manager);
+        let outputs = self.outputs.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                NavError::Internal(format!(
+                    "failed to build MovementManager lifecycle runtime: {error}"
+                ))
+            })?;
+        let thread = std::thread::Builder::new()
+            .name("movement-manager".to_string())
+            .spawn(move || {
+                runtime.block_on(run_input_loop(
+                    manager,
+                    outputs,
+                    click_rx,
+                    nav_rx,
+                    teleop_rx,
+                    cancel_rx,
+                    shutdown_rx,
+                ));
+            })
+            .map_err(|error| {
+                NavError::Internal(format!(
+                    "failed to spawn MovementManager lifecycle: {error}"
+                ))
+            })?;
+
+        self.lifecycle_shutdown = Some(shutdown_tx);
+        self.lifecycle_thread = Some(thread);
         self.running = true;
         Ok(())
     }
 
-    /// 停止 lifecycle(幂等)
+    /// Stop the lifecycle and clear teleoperation takeover state.
     pub fn stop(&mut self) -> Result<(), NavError> {
+        if let Some(shutdown) = self.lifecycle_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let lifecycle_panicked = self
+            .lifecycle_thread
+            .take()
+            .is_some_and(|thread| thread.join().is_err());
+        if self.running {
+            let reset =
+                MovementManager::new(self.config.manager_config.clone()).map_err(|error| {
+                    NavError::Internal(format!("failed to reset MovementManager: {error}"))
+                })?;
+            if let Ok(mut manager) = self.manager.lock() {
+                *manager = reset;
+            }
+        }
         self.running = false;
-        Ok(())
+        if lifecycle_panicked {
+            Err(NavError::Internal(
+                "MovementManager lifecycle panicked".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
-    /// 是否 running
+    /// Return whether the lifecycle is running.
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.running
@@ -223,7 +342,126 @@ impl MovementManagerModule {
 
 impl Drop for MovementManagerModule {
     fn drop(&mut self) {
-        // broadcast Sender 在 drop 时自动关闭 channel;receiver 端会收到 RecvError::Closed。
-        // 不需要额外清理。
+        if let Some(shutdown) = self.lifecycle_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.lifecycle_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_input_loop(
+    manager: Arc<Mutex<MovementManager>>,
+    outputs: OutputPorts,
+    mut click_rx: broadcast::Receiver<PointStamped>,
+    mut nav_rx: broadcast::Receiver<Twist>,
+    mut teleop_rx: broadcast::Receiver<Twist>,
+    mut cancel_rx: broadcast::Receiver<bool>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => break,
+            received = click_rx.recv() => match received {
+                Ok(point) => {
+                    let events = manager.lock()
+                        .map(|mut manager| manager.handle_click(&point))
+                        .unwrap_or_default();
+                    publish_events(&outputs, events);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {},
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            received = nav_rx.recv() => match received {
+                Ok(command) => {
+                    let events = manager.lock()
+                        .map(|mut manager| manager.handle_nav_cmd_vel(command))
+                        .unwrap_or_default();
+                    publish_events(&outputs, events);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {},
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            received = teleop_rx.recv() => match received {
+                Ok(command) => {
+                    let events = manager.lock()
+                        .map(|mut manager| manager.handle_tele_cmd_vel(command))
+                        .unwrap_or_default();
+                    publish_events(&outputs, events);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {},
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            received = cancel_rx.recv() => match received {
+                Ok(true) => {
+                    let events = manager.lock()
+                        .map(|mut manager| manager.cancel_navigation())
+                        .unwrap_or_default();
+                    publish_events(&outputs, events);
+                }
+                Ok(false) | Err(broadcast::error::RecvError::Lagged(_)) => {},
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        }
+    }
+}
+
+fn publish_events(outputs: &OutputPorts, events: Vec<MovementEvent>) {
+    for event in events {
+        match event {
+            MovementEvent::ClickAccepted(point) => {
+                let _ = outputs.way_point.send(point.clone());
+                let _ = outputs.goal.send(point);
+            }
+            MovementEvent::ClickRejected { .. } => {}
+            MovementEvent::CancelNavigation {
+                publish_stop,
+                publish_nan_goal,
+            } => publish_cancel(outputs, publish_stop, publish_nan_goal),
+            MovementEvent::CmdVel(command) => {
+                let _ = outputs.cmd_vel.send(command);
+            }
+        }
+    }
+}
+
+fn publish_cancel(outputs: &OutputPorts, publish_stop: bool, publish_nan_goal: bool) {
+    if publish_stop {
+        let _ = outputs.stop_command.send(MovementCommand::Stop);
+        let _ = outputs.stop_movement.send(true);
+    }
+    if publish_nan_goal {
+        let point = build_nan_goal_point();
+        let _ = outputs.nan_goal_point.send(point.clone());
+        let _ = outputs.way_point.send(point.clone());
+        let _ = outputs.goal.send(point);
+        let _ = outputs
+            .legacy_nan_pose
+            .send(MovementManagerModule::build_nan_goal_stamped());
+    }
+}
+
+fn build_nan_goal_point() -> PointStamped {
+    PointStamped::new(
+        NavFrameId::Map,
+        unix_timestamp_now(),
+        Point3 {
+            x: f64::NAN,
+            y: f64::NAN,
+            z: f64::NAN,
+        },
+    )
+}
+
+fn unix_timestamp_now() -> Timestamp {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let nanos = duration.as_nanos().min(i64::MAX as u128) as i64;
+    Timestamp {
+        nanos,
+        clock: nuwax_nav_types_messages::ClockKind::Unix,
     }
 }

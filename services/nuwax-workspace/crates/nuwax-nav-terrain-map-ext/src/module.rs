@@ -1,86 +1,109 @@
-//! Stream / RPC adapter (rework22 P0-11)
+//! Synchronous module boundary for the extended terrain-map processor.
 //!
-//! `Module` trait + `TerrainMapExtModule` 实现:
-//! - 3 输入 (registered_scan / odometry / merge_request)
-//! - 1 输出 (terrain_map_ext_out)
-//! - 10Hz lifecycle;不接 LCM transport,用 in-memory mpsc。
+//! The runtime owns scheduling and transport. This adapter owns typed input
+//! validation, lifecycle state, and exactly-once processing of each scan.
 
-use crate::{NavError, Point3, Pose3};
+use crate::{
+    NavError, Odometry, PointCloud, TerrainMapExtConfig, TerrainMapExtProcessor, TimedPointCloud,
+    Timestamp,
+};
 
-/// Tick 周期(rework22 P0-11:10Hz)
+/// Recommended lifecycle period (10 Hz).
 pub const TICK_PERIOD_MS: u64 = 100;
 
-/// 模块单次输出
-#[derive(Debug, Clone)]
+/// A single lifecycle output.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModuleOutput {
-    /// 输出扩展地形图(点云 + robot pose)
-    TerrainMap {
-        /// 点云
-        points: Vec<Point3>,
-        /// robot pose
-        pose: Pose3,
-    },
-    /// 无输出(idle)
-    None,
+    /// A processed persistent terrain-map snapshot.
+    TerrainMap(PointCloud),
+    /// No scan is waiting to be processed, or the processed scan was empty.
+    Idle,
 }
 
-/// 模块输入种类
-#[derive(Debug, Clone)]
+/// Typed module input.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModuleInput {
-    /// 已注册的 scan(点云 + intensity)
-    RegisteredScan {
-        /// points
-        points: Vec<Point3>,
-        /// intensities
-        intensities: Vec<f64>,
-    },
-    /// 里程计
-    Odometry(Pose3),
-    /// 合并请求(空闲时可处理其他积压)
-    MergeRequest,
+    /// Registered scan in the world frame.
+    RegisteredScan(PointCloud),
+    /// Robot odometry used to centre and roll the terrain grid.
+    Odometry(Odometry),
+    /// Fast local terrain used to fill the near-field output.
+    LocalTerrain(PointCloud),
+    /// Clear accumulated points inside the configured clearing distance.
+    Clear,
 }
 
-/// rework22 P0-11 `Module` trait:统一接口。
+/// Lifecycle and typed input contract.
 pub trait Module: Send + Sync + 'static {
-    /// 启动
+    /// Start processing. Repeated calls while running are idempotent.
     fn start(&mut self) -> Result<(), NavError>;
-    /// 停止
+    /// Stop processing and discard pending work.
     fn stop(&mut self) -> Result<(), NavError>;
-    /// 处理 registered_scan
-    fn on_registered_scan(&mut self, points: Vec<Point3>, intensities: Vec<f64>) -> Result<(), NavError>;
-    /// 处理 odometry
-    fn on_odometry(&mut self, pose: Pose3) -> Result<(), NavError>;
-    /// 当前输出(供 lifecycle tick 调用)
-    fn tick(&mut self) -> ModuleOutput;
+    /// Consume a registered scan.
+    fn on_registered_scan(&mut self, cloud: PointCloud) -> Result<(), NavError>;
+    /// Update robot odometry.
+    fn on_odometry(&mut self, odometry: Odometry) -> Result<(), NavError>;
+    /// Update the local near-field terrain snapshot.
+    fn on_local_terrain(&mut self, cloud: PointCloud) -> Result<(), NavError>;
+    /// Request a clearing pass on the next processed scan.
+    fn request_clearing(&mut self) -> Result<(), NavError>;
+    /// Process at most one pending scan.
+    fn tick(&mut self) -> Result<ModuleOutput, NavError>;
 }
 
-/// `TerrainMapExtModule`:扩展地形图模块包装。
-///
-/// Phase 1 仅缓存最近一次输入并产出最近一次合并结果(占位)。
+/// Lifecycle wrapper around [`TerrainMapExtProcessor`].
 pub struct TerrainMapExtModule {
+    config: TerrainMapExtConfig,
+    processor: TerrainMapExtProcessor,
     running: bool,
-    last_scan: Option<(Vec<Point3>, Vec<f64>)>,
-    last_pose: Option<Pose3>,
-    /// 输出缓冲(由 tick 消费)
-    output: ModuleOutput,
+    scan_pending: bool,
+    pending_stamp: Timestamp,
 }
 
 impl TerrainMapExtModule {
-    /// 构造
+    /// Construct with the default terrain-map configuration.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_config(TerrainMapExtConfig::default())
+    }
+
+    /// Construct with an explicit terrain-map configuration.
+    #[must_use]
+    pub fn with_config(config: TerrainMapExtConfig) -> Self {
         Self {
+            processor: TerrainMapExtProcessor::new(config.clone()),
+            config,
             running: false,
-            last_scan: None,
-            last_pose: None,
-            output: ModuleOutput::None,
+            scan_pending: false,
+            pending_stamp: Timestamp::default(),
         }
     }
 
-    /// 是否运行
+    /// Whether the module is accepting input and ticks.
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// Dispatch a typed input through the same validated handlers used by a runtime.
+    pub fn handle_input(&mut self, input: ModuleInput) -> Result<(), NavError> {
+        match input {
+            ModuleInput::RegisteredScan(cloud) => self.on_registered_scan(cloud),
+            ModuleInput::Odometry(odometry) => self.on_odometry(odometry),
+            ModuleInput::LocalTerrain(cloud) => self.on_local_terrain(cloud),
+            ModuleInput::Clear => self.request_clearing(),
+        }
+    }
+
+    fn ensure_running(&self) -> Result<(), NavError> {
+        if self.running {
+            Ok(())
+        } else {
+            Err(NavError::InvalidInput {
+                field: "module",
+                reason: "terrain-map module is not running".into(),
+            })
+        }
     }
 }
 
@@ -92,133 +115,91 @@ impl Default for TerrainMapExtModule {
 
 impl Module for TerrainMapExtModule {
     fn start(&mut self) -> Result<(), NavError> {
+        if self.running {
+            return Ok(());
+        }
+        self.processor = TerrainMapExtProcessor::new(self.config.clone());
+        self.scan_pending = false;
+        self.pending_stamp = Timestamp::default();
         self.running = true;
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), NavError> {
         self.running = false;
+        self.scan_pending = false;
         Ok(())
     }
 
-    fn on_registered_scan(
-        &mut self,
-        points: Vec<Point3>,
-        intensities: Vec<f64>,
-    ) -> Result<(), NavError> {
-        if !self.running {
-            return Err(NavError::Internal("module not running".into()));
+    fn on_registered_scan(&mut self, cloud: PointCloud) -> Result<(), NavError> {
+        self.ensure_running()?;
+        validate_cloud(&cloud, "registered_scan")?;
+        if cloud.is_empty() {
+            return Ok(());
         }
-        self.last_scan = Some((points, intensities));
+
+        let seconds = cloud.stamp.nanos as f64 / 1_000_000_000.0;
+        let times = vec![seconds; cloud.points.len()];
+        self.processor.ingest_registered_scan(TimedPointCloud {
+            points: &cloud.points,
+            times: &times,
+        })?;
+        self.pending_stamp = cloud.stamp;
+        self.scan_pending = true;
         Ok(())
     }
 
-    fn on_odometry(&mut self, pose: Pose3) -> Result<(), NavError> {
-        if !self.running {
-            return Err(NavError::Internal("module not running".into()));
+    fn on_odometry(&mut self, odometry: Odometry) -> Result<(), NavError> {
+        self.ensure_running()?;
+        if !odometry.is_finite() {
+            return Err(NavError::InvalidInput {
+                field: "odometry",
+                reason: "pose or twist contains a non-finite value".into(),
+            });
         }
-        self.last_pose = Some(pose);
+        self.processor.update_odometry(odometry.pose);
         Ok(())
     }
 
-    fn tick(&mut self) -> ModuleOutput {
-        if !self.running {
-            return ModuleOutput::None;
+    fn on_local_terrain(&mut self, cloud: PointCloud) -> Result<(), NavError> {
+        self.ensure_running()?;
+        validate_cloud(&cloud, "terrain_map")?;
+        self.processor.update_local_terrain(&cloud.points);
+        Ok(())
+    }
+
+    fn request_clearing(&mut self) -> Result<(), NavError> {
+        self.ensure_running()?;
+        self.processor.request_clearing();
+        Ok(())
+    }
+
+    fn tick(&mut self) -> Result<ModuleOutput, NavError> {
+        self.ensure_running()?;
+        if !self.scan_pending {
+            return Ok(ModuleOutput::Idle);
         }
-        match (&self.last_scan, &self.last_pose) {
-            (Some((pts, _)), Some(pose)) => {
-                let out = ModuleOutput::TerrainMap {
-                    points: pts.clone(),
-                    pose: *pose,
-                };
-                // Phase 1:消费掉,避免重复输出同一帧
-                self.output = out.clone();
-                self.last_scan = None;
-                out
-            }
-            _ => ModuleOutput::None,
-        }
+
+        let output = self.processor.process_tick(self.pending_stamp)?;
+        self.scan_pending = false;
+        Ok(output.map_or(ModuleOutput::Idle, ModuleOutput::TerrainMap))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_pose() -> Pose3 {
-        Pose3 {
-            position: Point3 {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            },
-            orientation: crate::Pose3::default().orientation,
-        }
+fn validate_cloud(cloud: &PointCloud, field: &'static str) -> Result<(), NavError> {
+    cloud.validate().map_err(|reason| NavError::InvalidInput {
+        field,
+        reason: reason.into(),
+    })?;
+    if cloud
+        .points
+        .iter()
+        .any(|point| !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite())
+    {
+        return Err(NavError::InvalidInput {
+            field,
+            reason: "point cloud contains a non-finite coordinate".into(),
+        });
     }
-
-    #[test]
-    fn module_lifecycle_idempotent() {
-        let mut m = TerrainMapExtModule::new();
-        assert!(m.start().is_ok());
-        assert!(m.start().is_ok());
-        assert!(m.is_running());
-        assert!(m.stop().is_ok());
-        assert!(m.stop().is_ok());
-        assert!(!m.is_running());
-    }
-
-    #[test]
-    fn on_inputs_require_running() {
-        let mut m = TerrainMapExtModule::new();
-        assert!(m
-            .on_registered_scan(vec![], vec![])
-            .is_err());
-        assert!(m.on_odometry(make_pose()).is_err());
-        m.start().unwrap();
-        assert!(m
-            .on_registered_scan(vec![Point3 { x: 1.0, y: 2.0, z: 3.0 }], vec![1.0])
-            .is_ok());
-        assert!(m.on_odometry(make_pose()).is_ok());
-    }
-
-    #[test]
-    fn tick_emits_terrain_map_when_both_inputs_present() {
-        let mut m = TerrainMapExtModule::new();
-        m.start().unwrap();
-        m.on_odometry(make_pose()).unwrap();
-        m.on_registered_scan(vec![Point3 { x: 1.0, y: 2.0, z: 3.0 }], vec![0.5])
-            .unwrap();
-        match m.tick() {
-            ModuleOutput::TerrainMap { points, .. } => {
-                assert_eq!(points.len(), 1);
-            }
-            other => panic!("expected TerrainMap, got {other:?}"),
-        }
-        // 已被消费 → tick 返回 None
-        assert!(matches!(m.tick(), ModuleOutput::None));
-    }
-}
-
-/// 兼容历史命名(外部代码可能仍调 `subscribe_registered_scan`)
-/// 现在直接 forward 到 module trait 入口的 adapter。
-pub fn subscribe_registered_scan<F>(callback: F) -> Result<(), NavError>
-where
-    F: Fn(Vec<Point3>, Vec<f64>) + Send + Sync + 'static,
-{
-    // Phase 1 占位:Foundation 接入后切换为 nuwax-stream
-    let _ = callback;
-    Err(NavError::Internal(
-        "subscribe_registered_scan:待 Foundation 接入 transport,改用 TerrainMapExtModule.on_registered_scan".into(),
-    ))
-}
-
-/// 兼容历史命名
-pub fn subscribe_odometry<F>(callback: F) -> Result<(), NavError>
-where
-    F: Fn(Pose3) + Send + Sync + 'static,
-{
-    let _ = callback;
-    Err(NavError::Internal(
-        "subscribe_odometry:待 Foundation 接入 transport,改用 TerrainMapExtModule.on_odometry".into(),
-    ))
+    Ok(())
 }

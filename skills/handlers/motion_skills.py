@@ -7,20 +7,104 @@ SkillContext，函数体内原 self.xxx 重写为 ctx.xxx，原 self._require_*/
 本批下放（分析文档 §3.A，5 个全 A 类）：
     handle_execute_sport_command、handle_set_body_pose、handle_set_speed_level、
     handle_switch_control_mode、handle_set_obstacle_avoidance。
-均同步非任务化，签名 (ctx, payload, *, requested_by)，仅依赖 ctx.robot
-（execute_action/switch_mode/data_plane）+ 参数校验，无网关可变状态写入、无私有方法。
+均同步非任务化，签名 (ctx, payload, *, requested_by)，仅依赖注入的
+ctx.motion_guard facade + 参数校验，不持有独立 client 或 driver SDK 句柄。
 
 留网关（C 类，导航编排）：navigate_*/find_target/explore_*/inspect/follow（任务化生命周期）。
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-from core.errors import GatewayError
-from providers.data_plane import ObstacleAvoidanceControlDataPlane
+from core.errors import GatewayError, MotionGuardFacadeError
+from services.navigation.motion_guard_client import ModeSwitchConfirmation
+from services.navigation.proto_gen import motion_guard_pb2 as pb
 from skills.common import params
 from skills.common.context import SkillContext
+
+
+_SPORT_ACTIONS = {
+    "damp": pb.SPORT_ACTION_DAMP,
+    "balance_stand": pb.SPORT_ACTION_BALANCE_STAND,
+    "stop_move": pb.SPORT_ACTION_STOP_MOVE,
+    "stand_up": pb.SPORT_ACTION_STAND_UP,
+    "stand_down": pb.SPORT_ACTION_STAND_DOWN,
+    "recovery_stand": pb.SPORT_ACTION_RECOVERY_STAND,
+    "sit": pb.SPORT_ACTION_SIT,
+    "rise_sit": pb.SPORT_ACTION_RISE_SIT,
+    "hello": pb.SPORT_ACTION_HELLO,
+    "stretch": pb.SPORT_ACTION_STRETCH,
+    "dance1": pb.SPORT_ACTION_DANCE_1,
+    "dance2": pb.SPORT_ACTION_DANCE_2,
+    "front_flip": pb.SPORT_ACTION_FRONT_FLIP,
+    "front_jump": pb.SPORT_ACTION_FRONT_JUMP,
+    "front_pounce": pb.SPORT_ACTION_FRONT_POUNCE,
+    "left_flip": pb.SPORT_ACTION_LEFT_FLIP,
+    "back_flip": pb.SPORT_ACTION_BACK_FLIP,
+    "free_walk": pb.SPORT_ACTION_FREE_WALK,
+    "hand_stand": pb.SPORT_ACTION_HAND_STAND,
+    "free_jump": pb.SPORT_ACTION_FREE_JUMP,
+    "free_bound": pb.SPORT_ACTION_FREE_BOUND,
+    "walk_upright": pb.SPORT_ACTION_WALK_UPRIGHT,
+    "cross_step": pb.SPORT_ACTION_CROSS_STEP,
+    "switch_joystick": pb.SPORT_ACTION_SWITCH_JOYSTICK,
+    "pose": pb.SPORT_ACTION_POSE,
+    "classic_walk": pb.SPORT_ACTION_CLASSIC_WALK,
+}
+
+_CONTROL_MODES = {
+    "high": pb.CONTROL_MODE_HIGH_LEVEL,
+    "low": pb.CONTROL_MODE_LOW_LEVEL,
+}
+
+
+def _guard_error(capability_name: str, error: MotionGuardFacadeError) -> GatewayError:
+    return GatewayError(
+        f"motion guard rejected {capability_name}: {error}",
+        error_code="motion_guard_unavailable",
+        http_status=503,
+        jsonrpc_code=-32010,
+        details={
+            "capability_name": capability_name,
+            "guard_error_type": type(error).__name__,
+        },
+    )
+
+
+def _command_result(confirmation: Any) -> Dict[str, Any]:
+    command = confirmation.command
+    result = command.result
+    payload: Dict[str, Any] = {
+        "operation_id": command.operation_id,
+        "ack": pb.AckCode.Name(result.ack),
+        "ack_code": result.ack,
+        "gate": pb.SafetyGate.Name(result.gate),
+        "lease": pb.LeaseState.Name(result.lease),
+        "applied_monotonic_ns": command.applied_monotonic_ns,
+        "zero_ack_id": confirmation.zero.zero_ack_id,
+        "zero_applied_monotonic_ns": confirmation.zero.applied_monotonic_ns,
+    }
+    if command.zero is not None:
+        payload["command_zero_ack_id"] = command.zero.zero_ack_id
+        payload["command_zero_applied_monotonic_ns"] = (
+            command.zero.applied_monotonic_ns
+        )
+    return payload
+
+
+def _mode_result(confirmation: ModeSwitchConfirmation) -> Dict[str, Any]:
+    result = confirmation.result
+    return {
+        "operation_id": confirmation.operation_id,
+        "ack": pb.AckCode.Name(result.ack),
+        "ack_code": result.ack,
+        "gate": pb.SafetyGate.Name(result.gate),
+        "lease": pb.LeaseState.Name(result.lease),
+        "zero_ack_id": confirmation.zero.zero_ack_id,
+        "zero_applied_monotonic_ns": confirmation.zero.applied_monotonic_ns,
+        "active_mode": pb.ControlMode.Name(confirmation.active_mode),
+    }
 
 
 def handle_execute_sport_command(
@@ -31,19 +115,13 @@ def handle_execute_sport_command(
 ) -> Dict[str, Any]:
     """执行已公开的高层机身动作命令。
 
-    迁移自 GatewayRuntime._handle_execute_sport_command；self.robot→ctx.robot，
-    self._require_str→params.require_str。支持动作集从机器人能力矩阵 metadata 泛化读取。
+    动作名稳定映射到 authoritative SportAction protobuf enum。
     """
 
     del requested_by
-    if not hasattr(ctx.robot, "execute_action"):
-        raise GatewayError("当前机器人入口未实现 execute_action。")
     action = params.require_str(payload, "action")
-    # 平台侧零 import driver：从机器人能力矩阵 metadata 泛化读取私有动作集，
-    # 新机器人在自己的 capability_matrix.metadata 声明 sport_command_names 即可。
-    metadata = getattr(ctx.robot.manifest.capability_matrix, "metadata", None) or {}
-    supported_actions: Tuple[str, ...] = tuple(metadata.get("sport_command_names", ()) or ())
-    if action not in supported_actions:
+    action_value = _SPORT_ACTIONS.get(action)
+    if action_value is None:
         raise GatewayError(
             "execute_sport_command 当前只支持已公开的 Go2 高层机身动作命令。",
             error_code="invalid_action",
@@ -51,7 +129,7 @@ def handle_execute_sport_command(
             jsonrpc_code=-32602,
             details={
                 "action": action,
-                "supported_actions": list(supported_actions),
+                "supported_actions": list(_SPORT_ACTIONS),
                 "hint": "姿态、速度档位、控制模式和低层关节控制请使用专用工具。",
             },
         )
@@ -63,10 +141,22 @@ def handle_execute_sport_command(
             http_status=422,
             jsonrpc_code=-32602,
         )
-    code, result = ctx.robot.execute_action(action, command_params)
-    if code is None:
-        raise GatewayError(str(result or f"动作 {action} 执行失败。"))
-    return {"code": code, "result": result or {}, "action": action}
+    enabled = command_params.get("flag", command_params.get("on", True))
+    if not isinstance(enabled, bool):
+        raise GatewayError(
+            "sport command flag/on 必须为布尔值。",
+            error_code="invalid_params",
+            http_status=422,
+            jsonrpc_code=-32602,
+        )
+    try:
+        confirmation = ctx.motion_guard.execute_sport(
+            action_value,
+            enabled=enabled,
+        )
+    except MotionGuardFacadeError as exc:
+        raise _guard_error("execute_sport_command", exc) from exc
+    return {"code": 0, "result": _command_result(confirmation), "action": action}
 
 
 def handle_set_body_pose(
@@ -77,27 +167,18 @@ def handle_set_body_pose(
 ) -> Dict[str, Any]:
     """设置机身姿态（roll/pitch/yaw）。
 
-    迁移自 GatewayRuntime._handle_set_body_pose；self.robot→ctx.robot，
-    self._float→params.optional_float。
+    参数经 facade 进入 GATEWAY_MANUAL lease。
     """
 
     del requested_by
-    if not hasattr(ctx.robot, "execute_action"):
-        raise GatewayError("当前机器人入口未实现 execute_action。")
-    code, result = ctx.robot.execute_action(
-        # "euler" 为 go2 SDK 的机身姿态动作名，此处为网关侧覆盖实现。
-        # 长期应迁回驱动侧（go2 private_capabilities 声明 action_name），
-        # 由通用私有能力分发器处理，网关不再保留机型专属动作名。
-        "euler",
-        {
-            "roll": params.optional_float(payload, "roll", 0.0),
-            "pitch": params.optional_float(payload, "pitch", 0.0),
-            "yaw": params.optional_float(payload, "yaw", 0.0),
-        },
-    )
-    if code is None:
-        raise GatewayError(str(result or "机身姿态设置失败。"))
-    return {"code": code, "result": result or {}}
+    roll = params.optional_float(payload, "roll", 0.0)
+    pitch = params.optional_float(payload, "pitch", 0.0)
+    yaw = params.optional_float(payload, "yaw", 0.0)
+    try:
+        confirmation = ctx.motion_guard.set_body_pose(roll, pitch, yaw)
+    except MotionGuardFacadeError as exc:
+        raise _guard_error("set_body_pose", exc) from exc
+    return {"code": 0, "result": _command_result(confirmation)}
 
 
 def handle_set_speed_level(
@@ -108,18 +189,27 @@ def handle_set_speed_level(
 ) -> Dict[str, Any]:
     """设置速度档位。
 
-    迁移自 GatewayRuntime._handle_set_speed_level；self.robot→ctx.robot，
-    self._int→params.optional_int。
+    参数经 facade 进入 GATEWAY_MANUAL lease。
     """
 
     del requested_by
-    if not hasattr(ctx.robot, "execute_action"):
-        raise GatewayError("当前机器人入口未实现 execute_action。")
     level = params.optional_int(payload, "level", 1)
-    code, result = ctx.robot.execute_action("speed_level", {"level": level})
-    if code is None:
-        raise GatewayError(str(result or "速度档位设置失败。"))
-    return {"code": code, "result": result or {}, "level": level}
+    if not 1 <= level <= 3:
+        raise GatewayError(
+            "level 仅支持 1 到 3。",
+            error_code="invalid_params",
+            http_status=422,
+            jsonrpc_code=-32602,
+        )
+    try:
+        confirmation = ctx.motion_guard.set_speed_level(level)
+    except MotionGuardFacadeError as exc:
+        raise _guard_error("set_speed_level", exc) from exc
+    return {
+        "code": 0,
+        "result": _command_result(confirmation),
+        "level": level,
+    }
 
 
 def handle_switch_control_mode(
@@ -130,23 +220,24 @@ def handle_switch_control_mode(
 ) -> Dict[str, Any]:
     """切换控制模式（high/low）。
 
-    迁移自 GatewayRuntime._handle_switch_control_mode；self.robot→ctx.robot，
-    self._require_str→params.require_str。
+    high/low 稳定映射到 authoritative ControlMode protobuf enum。
     """
 
     del requested_by
-    if not hasattr(ctx.robot, "switch_mode"):
-        raise GatewayError("当前机器人入口未实现 switch_mode。")
     mode = params.require_str(payload, "mode")
-    if mode not in {"high", "low"}:
+    mode_value = _CONTROL_MODES.get(mode)
+    if mode_value is None:
         raise GatewayError(
             "mode 仅支持 high 或 low。",
             error_code="invalid_params",
             http_status=422,
             jsonrpc_code=-32602,
         )
-    code, result = ctx.robot.switch_mode(mode)
-    return {"code": code, "result": result or {}, "mode": mode}
+    try:
+        confirmation = ctx.motion_guard.switch_mode(mode_value)
+    except MotionGuardFacadeError as exc:
+        raise _guard_error("switch_control_mode", exc) from exc
+    return {"code": 0, "result": _mode_result(confirmation), "mode": mode}
 
 
 def handle_set_obstacle_avoidance(
@@ -157,22 +248,24 @@ def handle_set_obstacle_avoidance(
 ) -> Dict[str, Any]:
     """开关实时避障。
 
-    迁移自 GatewayRuntime._handle_set_obstacle_avoidance；self.robot→ctx.robot。
-    ObstacleAvoidanceControlDataPlane Protocol 取自 providers.data_plane（其定义源头，
-    drivers.common 仅再导出），守 R4b：skills 不依赖 gateways。
+    参数经 facade 进入 GATEWAY_MANUAL lease。
     """
 
     del requested_by
-    enabled = bool(payload.get("enabled", True))
-    data_plane = getattr(ctx.robot, "data_plane", None)
-    if data_plane is None or not isinstance(data_plane, ObstacleAvoidanceControlDataPlane):
-        raise GatewayError("当前机器人入口不支持避障开关控制。")
-    if not data_plane.is_obstacle_avoidance_control_available():
-        raise GatewayError("Go2 官方 obstacles_avoid 服务未就绪，当前不能切换实时避障。")
+    enabled = payload.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise GatewayError(
+            "enabled 必须为布尔值。",
+            error_code="invalid_params",
+            http_status=422,
+            jsonrpc_code=-32602,
+        )
     try:
-        result = data_plane.set_obstacle_avoidance_enabled(enabled)
-    except Exception as exc:
-        raise GatewayError(f"设置实时避障失败：{exc}") from exc
-    if isinstance(result, dict):
-        return result
-    return {"obstacle_avoidance_enabled": enabled}
+        confirmation = ctx.motion_guard.set_obstacle_policy(enabled)
+    except MotionGuardFacadeError as exc:
+        raise _guard_error("set_obstacle_avoidance", exc) from exc
+    return {
+        "code": 0,
+        "result": _command_result(confirmation),
+        "obstacle_avoidance_enabled": enabled,
+    }

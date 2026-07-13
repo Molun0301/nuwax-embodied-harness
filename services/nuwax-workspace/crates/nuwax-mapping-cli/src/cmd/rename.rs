@@ -1,79 +1,159 @@
-//! `rename` 子命令
-//!
-//! 真做行为：把 bag 目录中的 .mcap / .db3 / .bag 文件按 prefix 重命名。
-//! dry-run 模式只打印不执行；正式模式真改文件名。
+//! Rename or drop logical streams in a persisted dataset.
 
-use clap::Args;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use clap::Args;
+
+use crate::dataset::{read_dataset, write_dataset, Dataset};
+use crate::native::{input_format, read_command_dataset, rename_memory2, InputFormat};
+
+/// Arguments for `rename`.
 #[derive(Debug, Args)]
 pub struct RenameArgs {
-    /// 输入 bag 路径（文件或目录）
+    /// Input JSONL or DimOS memory2 `.db` dataset.
     #[arg(long)]
     pub bag: PathBuf,
-    /// 新名称前缀
+    /// New output dataset. Existing files are never overwritten.
     #[arg(long)]
-    pub prefix: String,
-    /// dry-run（只打印不改名）
+    pub output: PathBuf,
+    /// Stream rename in `OLD=NEW` form. Repeat for multiple streams.
+    #[arg(long = "rename", value_name = "OLD=NEW")]
+    pub renames: Vec<String>,
+    /// Stream to omit from the output. Repeat for multiple streams.
+    #[arg(long = "drop", value_name = "STREAM")]
+    pub drops: Vec<String>,
+    /// Skip the first N seconds of every native memory2 stream.
+    #[arg(long, default_value_t = 0.0)]
+    pub seek: f64,
+    /// Keep this many seconds after each native stream's selected start.
+    #[arg(long)]
+    pub duration: Option<f64>,
+    /// Parse and validate the operation without writing the output.
     #[arg(long)]
     pub dry_run: bool,
 }
 
+/// Execute the `rename` command.
+///
+/// # Errors
+/// Returns errors for malformed rename pairs, missing streams, destination
+/// collisions, unsupported input, output collisions, validation, or I/O.
 pub async fn run(args: RenameArgs) -> anyhow::Result<()> {
-    if !args.bag.exists() {
-        anyhow::bail!("bag path does not exist: {}", args.bag.display());
+    if args.renames.is_empty() && args.drops.is_empty() {
+        anyhow::bail!("at least one --rename OLD=NEW or --drop STREAM is required");
     }
-
-    let files = if args.bag.is_file() {
-        vec![args.bag.clone()]
-    } else {
-        collect_bag_files(&args.bag)?
-    };
-
-    let mut renamed = 0usize;
-    for (i, f) in files.iter().enumerate() {
-        // 新名字 = {prefix}_{idx:04}.{ext}
-        let ext = f
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("mcap");
-        let new_name = format!("{}_{:04}.{}", args.prefix, i, ext);
-        let new_path = f.with_file_name(new_name);
-
-        if args.dry_run {
-            println!("[rename] (dry-run) {} → {}", f.display(), new_path.display());
-        } else {
-            std::fs::rename(f, &new_path)?;
-            println!("[rename] {} → {}", f.display(), new_path.display());
-            renamed += 1;
+    let renames = parse_renames(&args.renames)?;
+    let drops: BTreeSet<String> = args.drops.iter().cloned().collect();
+    match input_format(&args.bag)? {
+        InputFormat::Memory2Sqlite => {
+            rename_memory2(
+                &args.bag,
+                &args.output,
+                &renames,
+                &drops,
+                args.seek,
+                args.duration,
+                args.dry_run,
+            )?;
+            println!(
+                "[rename] input={} output={} renames={} drops={} seek={} duration={:?} dry_run={}",
+                args.bag.display(),
+                args.output.display(),
+                renames.len(),
+                drops.len(),
+                args.seek,
+                args.duration,
+                args.dry_run
+            );
+            return Ok(());
         }
-    }
-
-    if !args.dry_run {
-        tracing::info!("rename: {} files renamed under {}", renamed, args.bag.display());
-    }
-    Ok(())
-}
-
-fn collect_bag_files(root: &PathBuf) -> anyhow::Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    visit(root, &mut out)?;
-    // 按文件名排序以保证确定性
-    out.sort();
-    Ok(out)
-}
-
-fn visit(p: &PathBuf, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    if p.is_file() {
-        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-            if matches!(ext, "mcap" | "db3" | "bag") {
-                out.push(p.clone());
+        InputFormat::JsonLines => {
+            if args.seek != 0.0 || args.duration.is_some() {
+                anyhow::bail!("--seek/--duration are native memory2 options; JSONL rename has no implicit per-stream timeline window");
             }
         }
-    } else if p.is_dir() {
-        for entry in std::fs::read_dir(p)? {
-            visit(&entry?.path(), out)?;
+        InputFormat::Rosbag2Sqlite | InputFormat::Mcap | InputFormat::Ros1Bag => {
+            return read_command_dataset(&args.bag).map(|_| ());
         }
     }
+    let mut dataset = read_dataset(&args.bag)?;
+    let streams: BTreeSet<String> = dataset
+        .records
+        .iter()
+        .map(|record| record.stream.clone())
+        .collect();
+
+    for source in renames.keys().chain(drops.iter()) {
+        if !streams.contains(source) {
+            anyhow::bail!(
+                "stream {:?} does not exist in {}",
+                source,
+                args.bag.display()
+            );
+        }
+    }
+    let mut destinations = BTreeMap::<String, String>::new();
+    for source in &streams {
+        if drops.contains(source) {
+            continue;
+        }
+        let destination = renames.get(source).unwrap_or(source);
+        if let Some(previous) = destinations.insert(destination.clone(), source.clone()) {
+            anyhow::bail!(
+                "renaming would merge streams {previous:?} and {source:?} into {destination:?}"
+            );
+        }
+    }
+
+    let before = dataset.records.len();
+    dataset.records.retain_mut(|record| {
+        if drops.contains(&record.stream) {
+            return false;
+        }
+        if let Some(destination) = renames.get(&record.stream) {
+            record.stream.clone_from(destination);
+        }
+        true
+    });
+    let dropped = before - dataset.records.len();
+    if !args.dry_run {
+        write_dataset(
+            &args.output,
+            &Dataset {
+                header: dataset.header,
+                records: dataset.records,
+            },
+        )?;
+    }
+    println!(
+        "[rename] input={} output={} renames={} dropped_records={} dry_run={}",
+        args.bag.display(),
+        args.output.display(),
+        renames.len(),
+        dropped,
+        args.dry_run
+    );
     Ok(())
+}
+
+fn parse_renames(values: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut output = BTreeMap::new();
+    for value in values {
+        let (source, destination) = value
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid rename {value:?}; expected OLD=NEW"))?;
+        let source = source.trim();
+        let destination = destination.trim();
+        if source.is_empty() || destination.is_empty() {
+            anyhow::bail!("invalid rename {value:?}; stream names must not be empty");
+        }
+        if output
+            .insert(source.to_string(), destination.to_string())
+            .is_some()
+        {
+            anyhow::bail!("source stream {source:?} is renamed more than once");
+        }
+    }
+    Ok(output)
 }

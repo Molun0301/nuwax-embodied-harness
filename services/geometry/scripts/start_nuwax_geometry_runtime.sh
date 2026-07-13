@@ -59,8 +59,8 @@ export NUWAX_LCM_BACKEND="${NUWAX_LCM_BACKEND:-real-lcm}"
 # Phase 4 typed channel 兜底（与 channel_registry::TYPED_CHANNELS 默认值一致；
 # 必须带 typed suffix `#<msg_type>`，与 lcm_runtime 默认 channel registry 对齐）。
 export NUWAX_LCM_CHANNEL_ODOM="${NUWAX_LCM_CHANNEL_ODOM:-/odom#nav_msgs.Odometry}"
-export NUWAX_LCM_CHANNEL_TF="${NUWAX_LCM_CHANNEL_TF:-/tf#geometry_msgs.Transform}"
-export NUWAX_LCM_CHANNEL_TF_STATIC="${NUWAX_LCM_CHANNEL_TF_STATIC:-/tf_static#geometry_msgs.Transform}"
+export NUWAX_LCM_CHANNEL_TF="${NUWAX_LCM_CHANNEL_TF:-/tf#tf2_msgs.TFMessage}"
+export NUWAX_LCM_CHANNEL_TF_STATIC="${NUWAX_LCM_CHANNEL_TF_STATIC:-/tf_static#tf2_msgs.TFMessage}"
 export NUWAX_LCM_CHANNEL_POINTCLOUD="${NUWAX_LCM_CHANNEL_POINTCLOUD:-/go2/lidar/points#sensor_msgs.PointCloud2}"
 export NUWAX_LCM_CHANNEL_OCCUPANCY="${NUWAX_LCM_CHANNEL_OCCUPANCY:-/map/occupancy#nav_msgs.OccupancyGrid}"
 export NUWAX_LCM_CHANNEL_CMD_VEL="${NUWAX_LCM_CHANNEL_CMD_VEL:-/cmd_vel#geometry_msgs.Twist}"
@@ -147,15 +147,42 @@ RUNTIME_PID=$!
 echo "==> runtime PID=${RUNTIME_PID}, 日志=${LOG_FILE}"
 
 # --- 4. 等待 HealthCheck ready ---
+grpc_health_check() {
+  PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${NUWAX_GEOMETRY_RUNTIME_PORT}" <<'PY'
+import sys
+
+import grpc
+
+from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
+from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
+
+channel = grpc.insecure_channel("127.0.0.1:%s" % sys.argv[1])
+try:
+    grpc.channel_ready_future(channel).result(timeout=0.4)
+    response = pb2_grpc.GeometryRuntimeStub(channel).HealthCheck(
+        pb2.HealthCheckRequest(), timeout=0.4
+    )
+    if not response.healthy or response.phase != "running":
+        raise SystemExit(1)
+except Exception:
+    raise SystemExit(1)
+finally:
+    channel.close()
+PY
+}
+
 deadline=$(( $(date +%s) + NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT ))
 while [[ $(date +%s) -lt ${deadline} ]]; do
-  if [[ -f "${NUWAX_GEOMETRY_RUNTIME_READY_FILE}" ]]; then
-    echo "==> nuwax-geometry-runtime ready (pid=${RUNTIME_PID})"
+  if [[ -f "${NUWAX_GEOMETRY_RUNTIME_READY_FILE}" ]] \
+    && [[ "$(<"${NUWAX_GEOMETRY_RUNTIME_READY_FILE}")" == "${NUWAX_GEOMETRY_RUNTIME_PORT}" ]] \
+    && grpc_health_check; then
+    echo "==> nuwax-geometry-runtime gRPC healthy (pid=${RUNTIME_PID})"
     exit 0
   fi
   if ! kill -0 "${RUNTIME_PID}" 2>/dev/null; then
     echo "ERROR: nuwax-geometry-runtime 进程已退出，请查日志 ${LOG_FILE}" >&2
     tail -n 50 "${LOG_FILE}" >&2 || true
+    rm -f "${NUWAX_GEOMETRY_RUNTIME_READY_FILE}"
     exit 1
   fi
   sleep 0.5
@@ -164,4 +191,6 @@ done
 echo "ERROR: nuwax-geometry-runtime 在 ${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT}s 内未 ready" >&2
 tail -n 50 "${LOG_FILE}" >&2 || true
 kill "${RUNTIME_PID}" 2>/dev/null || true
+wait "${RUNTIME_PID}" 2>/dev/null || true
+rm -f "${NUWAX_GEOMETRY_RUNTIME_READY_FILE}"
 exit 1

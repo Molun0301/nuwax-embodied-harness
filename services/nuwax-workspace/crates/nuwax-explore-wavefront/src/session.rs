@@ -4,6 +4,7 @@
 use nuwax_nav_types_messages::geometry::Point2;
 
 use crate::config::WavefrontConfig;
+use crate::grid::occupancy_value;
 
 /// 2D 单位方向(可为零;`from_delta` 拒绝零长度 / NaN)。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,10 +63,13 @@ impl ExplorationSession {
         self.explored_goals.push(goal);
     }
 
-    /// 由最新 goal 更新探索方向(若 delta 非法则保持不变)
+    /// 由最新 goal 更新探索方向(距离不超过 0.1 m 或 delta 非法时保持不变)
     pub fn update_direction_from_goal(&mut self, previous: Point2, latest: Point2) {
         let dx = latest.x - previous.x;
         let dy = latest.y - previous.y;
+        if dx.hypot(dy) <= 0.1 {
+            return;
+        }
         if let Some(d) = Direction2::from_delta(dx, dy) {
             self.exploration_direction = Some(d);
         }
@@ -113,9 +117,11 @@ impl ExplorationSession {
         for cell in &grid.cells {
             match cell {
                 OccupancyCell::Free => count += 1,
-                OccupancyCell::Occupied | OccupancyCell::Inflated => count += 1,
-                OccupancyCell::Cost(v) if (*v as i16) > cfg.occupancy_threshold => count += 1,
-                OccupancyCell::Cost(_) | OccupancyCell::Unknown => {}
+                cell if occupancy_value(*cell) >= cfg.occupancy_threshold => count += 1,
+                OccupancyCell::Cost(_)
+                | OccupancyCell::Occupied
+                | OccupancyCell::Inflated
+                | OccupancyCell::Unknown => {}
             }
         }
         count
@@ -126,7 +132,8 @@ impl ExplorationSession {
     /// 顺序固定(方案 §4.10):
     /// 1. 计算 `current_info`
     /// 2. 若 `last_information_count` 为 `None`,只 seed 为 `Some(current_info)` 并返回 None
-    /// 3. 否则当 `explored_goals.len() >= cfg.min_goals_before_no_gain_check` 时启用 no-gain 判定;
+    /// 3. 否则当 `explored_goals.len() > cfg.min_goals_before_no_gain_check` 且上次信息量大于 0 时
+    ///    启用 no-gain 判定;
     ///    增长比例低于 `cfg.info_gain_threshold_ratio` 时递增 counter;
     ///    `no_gain_counter >= cfg.num_no_gain_attempts` 返回 `Some(StopReason::NoInformationGain)` 并清零
     /// 4. 函数结束前更新 `last_information_count = Some(current_info)`
@@ -143,28 +150,24 @@ impl ExplorationSession {
             return None;
         }
         let last = last.expect("checked is_some above");
-        let stop_reason = if self.explored_goals.len() as u32 >= cfg.min_goals_before_no_gain_check
-        {
-            let gain_ratio = if last == 0 {
-                0.0
-            } else {
-                (current_info as f64 - last as f64) / (last as f64)
-            };
-            if gain_ratio < cfg.info_gain_threshold_ratio {
-                self.no_gain_counter = self.no_gain_counter.saturating_add(1);
-                if self.no_gain_counter >= cfg.num_no_gain_attempts {
-                    self.no_gain_counter = 0;
-                    Some(crate::frontier_goal::StopReason::NoInformationGain)
+        let stop_reason =
+            if self.explored_goals.len() as u32 > cfg.min_goals_before_no_gain_check && last > 0 {
+                let gain_ratio = (current_info as f64 - last as f64) / (last as f64);
+                if gain_ratio < cfg.info_gain_threshold_ratio {
+                    self.no_gain_counter = self.no_gain_counter.saturating_add(1);
+                    if self.no_gain_counter >= cfg.num_no_gain_attempts {
+                        self.no_gain_counter = 0;
+                        Some(crate::frontier_goal::StopReason::NoInformationGain)
+                    } else {
+                        None
+                    }
                 } else {
+                    self.no_gain_counter = 0;
                     None
                 }
             } else {
-                self.no_gain_counter = 0;
                 None
-            }
-        } else {
-            None
-        };
+            };
         self.last_information_count = Some(current_info);
         stop_reason
     }
@@ -211,6 +214,15 @@ mod tests {
     }
 
     #[test]
+    fn direction_update_keeps_previous_value_for_python_close_goal_boundary() {
+        let mut session = ExplorationSession::new();
+        session.update_direction_from_goal(Point2 { x: 0.0, y: 0.0 }, Point2 { x: 1.0, y: 0.0 });
+        let previous = session.exploration_direction();
+        session.update_direction_from_goal(Point2 { x: 0.0, y: 0.0 }, Point2 { x: 0.0, y: 0.1 });
+        assert_eq!(session.exploration_direction(), previous);
+    }
+
+    #[test]
     fn first_call_seeds_last_info() {
         let mut s = ExplorationSession::new();
         let cfg = WavefrontConfig::default();
@@ -234,14 +246,67 @@ mod tests {
     }
 
     #[test]
-    fn no_gain_triggers_stop_after_threshold() {
+    fn information_count_uses_python_inclusive_occupied_threshold() {
+        let s = ExplorationSession::new();
+        let cfg = WavefrontConfig::default();
+        let g = OccupancyGrid2D {
+            origin: Point2 { x: 0.0, y: 0.0 },
+            resolution: 0.1,
+            width: 7,
+            height: 1,
+            cells: vec![
+                OccupancyCell::Unknown,
+                OccupancyCell::Free,
+                OccupancyCell::Cost(98),
+                OccupancyCell::Cost(99),
+                OccupancyCell::Cost(100),
+                OccupancyCell::Occupied,
+                OccupancyCell::Inflated,
+            ],
+        };
+        assert_eq!(s.information_count(&g, &cfg), 5);
+    }
+
+    #[test]
+    fn exactly_five_goals_do_not_enable_python_no_gain_check() {
         let mut s = ExplorationSession::new();
         let cfg = WavefrontConfig::default();
         let g = empty_grid(4, 4);
+        assert!(s.check_information_gain(&g, &cfg).is_none());
+        for _ in 0..5 {
+            s.mark_explored_goal(Point2 { x: 0.0, y: 0.0 });
+        }
+        for _ in 0..cfg.num_no_gain_attempts + 1 {
+            assert!(s.check_information_gain(&g, &cfg).is_none());
+        }
+        assert_eq!(s.no_gain_counter, 0);
+    }
+
+    #[test]
+    fn zero_previous_information_skips_python_no_gain_check() {
+        let mut s = ExplorationSession::new();
+        let cfg = WavefrontConfig::default();
+        let g = empty_grid(4, 4);
+        assert!(s.check_information_gain(&g, &cfg).is_none());
+        for _ in 0..=cfg.min_goals_before_no_gain_check {
+            s.mark_explored_goal(Point2 { x: 0.0, y: 0.0 });
+        }
+        for _ in 0..cfg.num_no_gain_attempts + 1 {
+            assert!(s.check_information_gain(&g, &cfg).is_none());
+        }
+        assert_eq!(s.no_gain_counter, 0);
+    }
+
+    #[test]
+    fn no_gain_triggers_stop_after_threshold() {
+        let mut s = ExplorationSession::new();
+        let cfg = WavefrontConfig::default();
+        let mut g = empty_grid(4, 4);
+        g.cells.fill(OccupancyCell::Free);
         // seed
         let _ = s.check_information_gain(&g, &cfg);
-        // 推到 min_goals_before_no_gain_check
-        for _ in 0..cfg.min_goals_before_no_gain_check {
+        // Python enables the check only when len(explored_goals) > 5.
+        for _ in 0..=cfg.min_goals_before_no_gain_check {
             s.mark_explored_goal(Point2 { x: 0.0, y: 0.0 });
         }
         // 连续 num_no_gain_attempts 次相同 map -> 触发 NoInformationGain

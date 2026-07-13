@@ -11,7 +11,8 @@
 #
 # 输出段:
 #   1. 守门 — no_ros2_residual
-#   2. 二进制 — nuwax-geometry-runtime 可执行/未执行
+#   2. motion guard — production module / UDS / durable record permissions
+#   3. 二进制 — nuwax-geometry-runtime 可执行/未执行
 #   3. 端口 — 50051 监听状态
 #   4. ready file — runtime_data/geometry/nuwax_geometry_runtime.ready
 #   5. SHM refs — /tmp/nuwax_video.{sock,shm} /tmp/nuwax_pointcloud.shm
@@ -52,7 +53,64 @@ else
   tail -n 20 /tmp/check_nuwax_runtime.gate.log
 fi
 
-bar "2. 二进制:nuwax-geometry-runtime"
+bar "2. motion guard:module / UDS / durable records"
+GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
+GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
+GUARD_LOCK="${NUWAX_MOTION_GUARD_LOCK:-/run/nuwax/motion-guard.lock}"
+GUARD_STATE_DIR="${NUWAX_MOTION_GUARD_STATE_DIR:-/var/lib/nuwax/motion-guard}"
+ACTUATOR_SYMBOLS_FILE="${NUWAX_ACTUATOR_SYMBOLS_FILE:-/usr/share/nuwax/actuator-symbols.json}"
+if [[ -f "${GUARD_MODULE}" ]]; then
+  ok "production module: services.navigation.motion_safety_guard"
+else
+  miss "production module missing: ${GUARD_MODULE}"
+fi
+if [[ -S "${GUARD_SOCKET}" ]]; then
+  socket_meta="$(stat -c '%U:%G %a' "${GUARD_SOCKET}" 2>/dev/null || echo '<stat-failed>')"
+  if [[ "${socket_meta}" == "nuwax-motion-guard:nuwax-motion-clients 660" ]]; then
+    ok "guard UDS secured: ${GUARD_SOCKET} (${socket_meta})"
+  else
+    miss "guard UDS metadata drift: ${GUARD_SOCKET} (${socket_meta})"
+  fi
+else
+  nr "guard UDS absent: ${GUARD_SOCKET}"
+fi
+if [[ -f "${GUARD_LOCK}" && ! -L "${GUARD_LOCK}" ]]; then
+  lock_meta="$(stat -c '%U:%G %a' "${GUARD_LOCK}" 2>/dev/null || echo '<stat-failed>')"
+  if [[ "${lock_meta}" == "nuwax-motion-guard:nuwax-motion-guard 600" ]]; then
+    ok "guard lock secured: ${GUARD_LOCK} (${lock_meta})"
+  else
+    miss "guard lock metadata drift: ${GUARD_LOCK} (${lock_meta})"
+  fi
+else
+  nr "guard lock absent/non-regular/symlink: ${GUARD_LOCK}"
+fi
+for record_spec in "provisioned.json:400" "epoch.json:600"; do
+  record_name="${record_spec%%:*}"
+  expected_mode="${record_spec##*:}"
+  record_path="${GUARD_STATE_DIR}/${record_name}"
+  if [[ -s "${record_path}" ]]; then
+    record_meta="$(stat -c '%U:%G %a' "${record_path}" 2>/dev/null || echo '<stat-failed>')"
+    if [[ "${record_meta}" == "nuwax-motion-guard:nuwax-motion-guard ${expected_mode}" ]]; then
+      ok "durable record: ${record_path} (${record_meta})"
+    else
+      miss "durable record metadata drift: ${record_path} (${record_meta})"
+    fi
+  else
+    miss "durable record missing or empty: ${record_path}"
+  fi
+done
+if [[ -s "${ACTUATOR_SYMBOLS_FILE}" ]]; then
+  manifest_meta="$(stat -c '%U:%G %a' "${ACTUATOR_SYMBOLS_FILE}" 2>/dev/null || echo '<stat-failed>')"
+  if [[ "${manifest_meta}" == "root:root 444" ]]; then
+    ok "actuator symbols manifest: ${ACTUATOR_SYMBOLS_FILE} (${manifest_meta})"
+  else
+    miss "actuator symbols manifest metadata drift: ${ACTUATOR_SYMBOLS_FILE} (${manifest_meta})"
+  fi
+else
+  miss "actuator symbols manifest missing or empty: ${ACTUATOR_SYMBOLS_FILE}"
+fi
+
+bar "3. 二进制:nuwax-geometry-runtime"
 RUNTIME_BIN="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
 if [[ -x "${RUNTIME_BIN}" ]]; then
   ok "executable: ${RUNTIME_BIN}"
@@ -204,8 +262,29 @@ else
   nr "日志不存在,跳过 channel counters"
 fi
 
-bar "11. systemd unit (production env)"
+bar "11. systemd units (production env + guard ordering)"
 SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-geometry-runtime.service"
+GUARD_SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-motion-safety-guard.service"
+GATEWAY_SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-host-gateway.service"
+if [[ -f "${GUARD_SERVICE_FILE}" ]]; then
+  if grep -qF 'ExecStart=/usr/bin/python3 -m services.navigation.motion_safety_guard' "${GUARD_SERVICE_FILE}"; then
+    ok "guard unit references production Python owner"
+  else
+    miss "guard unit production ExecStart drift"
+  fi
+  if grep -qF 'Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock' "${GUARD_SERVICE_FILE}"; then
+    ok "guard unit UDS path frozen"
+  else
+    miss "guard unit UDS path drift"
+  fi
+  if grep -qF 'Environment=NUWAX_ACTUATOR_SYMBOLS_FILE=/usr/share/nuwax/actuator-symbols.json' "${GUARD_SERVICE_FILE}"; then
+    ok "guard unit actuator manifest path frozen"
+  else
+    miss "guard unit actuator manifest path drift"
+  fi
+else
+  miss "guard service file missing: ${GUARD_SERVICE_FILE}"
+fi
 if [[ -f "${SERVICE_FILE}" ]]; then
   if grep -qE '^Environment=NUWAX_LCM_BACKEND=real-lcm' "${SERVICE_FILE}"; then
     ok "service hardcode NUWAX_LCM_BACKEND=real-lcm"
@@ -222,8 +301,19 @@ if [[ -f "${SERVICE_FILE}" ]]; then
   else
     ok "service SuccessExitStatus 仅 0"
   fi
+  if grep -qF 'Requires=nuwax-motion-safety-guard.service' "${SERVICE_FILE}"; then
+    ok "geometry runtime requires motion guard"
+  else
+    miss "geometry runtime does not require motion guard"
+  fi
 else
   nr "service 文件不存在: ${SERVICE_FILE}"
+fi
+if [[ -f "${GATEWAY_SERVICE_FILE}" ]] \
+  && grep -qF 'Requires=nuwax-motion-safety-guard.service nuwax-geometry-runtime.service' "${GATEWAY_SERVICE_FILE}"; then
+  ok "Gateway requires guard and geometry runtime"
+else
+  miss "Gateway systemd dependency chain drift"
 fi
 
 echo

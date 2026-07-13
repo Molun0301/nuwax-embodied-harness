@@ -14,9 +14,32 @@ nuwax-nav-base = { path = "../nuwax-nav-base" }
 
 nuwax-numeric = { path = "../nuwax-numeric" }
 nuwax-tf = { path = "../nuwax-tf" }
+nuwax-codec = { path = "../nuwax-codec" }
+nuwax-protocol = { path = "../nuwax-protocol", optional = true }
+nuwax-transport = { path = "../nuwax-transport", default-features = false, optional = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+default = []
+link-liblcm = [
+    "dep:futures",
+    "dep:nuwax-protocol",
+    "dep:nuwax-transport",
+    "dep:tokio",
+    "dep:tracing",
+    "nuwax-tf/link-liblcm",
+    "nuwax-transport/real-lcm",
+]
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 approx = { workspace = true }
+
+[[bin]]
+name = "nuwax-person-follow"
+path = "src/bin/nuwax-person-follow.rs"
+required-features = ["link-liblcm"]

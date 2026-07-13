@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// LCM message type (`pkg::Type` 或 `pkg/Type` 皆允许)
+/// LCM message type in the canonical DimOS `package.Type` form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LcmMessageType(
@@ -22,9 +22,8 @@ pub struct LcmMessageType(
 impl LcmMessageType {
     /// 构造 new message type。
     ///
-    /// 接受 `pkg::Type` 或 `pkg/Type` 两种风格；contract 阶段允许任意
-    /// 非空字符串,foundation milestone 仅做最宽松校验:必须为非空,且
-    /// 不能含有 `#`/`\0`(避免与 typed suffix / 字节 framing 冲突)。
+    /// Slash and Rust-style aliases are accepted at the API boundary and
+    /// normalized to the original DimOS `package.Type` channel contract.
     pub fn new(fqn: &str) -> Result<Self, LcmMessageTypeError> {
         if fqn.is_empty() {
             return Err(LcmMessageTypeError::Empty);
@@ -32,7 +31,15 @@ impl LcmMessageType {
         if fqn.contains('#') || fqn.contains('\0') {
             return Err(LcmMessageTypeError::Invalid(fqn.to_string()));
         }
-        Ok(Self(fqn.to_string()))
+        let canonical = fqn.replace("::", ".").replace('/', ".");
+        if canonical.starts_with('.')
+            || canonical.ends_with('.')
+            || !canonical.contains('.')
+            || canonical.split('.').any(str::is_empty)
+        {
+            return Err(LcmMessageTypeError::Invalid(fqn.to_string()));
+        }
+        Ok(Self(canonical))
     }
 
     /// 取得 FQN 字符串
@@ -87,7 +94,7 @@ mod tests {
     #[test]
     fn valid_message_type() {
         let t = LcmMessageType::new("geometry_msgs/PoseStamped").unwrap();
-        assert_eq!(t.fqn(), "geometry_msgs/PoseStamped");
+        assert_eq!(t.fqn(), "geometry_msgs.PoseStamped");
     }
 
     #[test]

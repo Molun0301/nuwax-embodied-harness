@@ -19,8 +19,18 @@ LOCK_FILE=""
 LOCK_FD=""
 GATEWAY_PID=""
 VIDEO_STREAMER_PID=""
+NAV_STACK_PID=""
 GEOMETRY_RUNTIME_PID=""
+PERSON_FOLLOW_PID=""
+NAV_STACK_MONITOR_PID=""
+GEOMETRY_MONITOR_PID=""
+PERSON_FOLLOW_MONITOR_PID=""
 STOP_REQUESTED=0
+
+PERSON_FOLLOW_TARGET_CHANNEL="/person_follow_target"
+PERSON_FOLLOW_POINTCLOUD_CHANNEL="/global_map"
+PERSON_FOLLOW_TF_CHANNEL="/tf"
+PERSON_FOLLOW_COMMAND_CHANNEL="/gateway/person_follow_cmd_vel"
 
 trim_whitespace() {
   local value="$1"
@@ -72,6 +82,101 @@ source_runtime_script() {
     # shellcheck disable=SC1090
     source "${target}"
   fi
+}
+
+geometry_runtime_managed_by_systemd() {
+  is_truthy "${NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD:-false}"
+}
+
+nav_stack_managed_by_systemd() {
+  is_truthy "${NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD:-false}"
+}
+
+person_follow_managed_by_systemd() {
+  is_truthy "${NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD:-false}"
+}
+
+person_follow_autostart_enabled() {
+  is_truthy "${NUWAX_PERSON_FOLLOW_AUTOSTART:-true}"
+}
+
+validate_person_follow_monitor_interval() {
+  local interval="${NUWAX_PERSON_FOLLOW_MONITOR_INTERVAL_SEC:-0.5}"
+  if [[ ! "${interval}" =~ ^[0-9]+([.][0-9]+)?$ || "${interval}" =~ ^0+([.]0+)?$ ]]; then
+    echo "invalid NUWAX_PERSON_FOLLOW_MONITOR_INTERVAL_SEC=${interval}" >&2
+    return 1
+  fi
+}
+
+person_follow_binary() {
+  printf '%s' "${NUWAX_PERSON_FOLLOW_BINARY:-${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-person-follow}"
+}
+
+person_follow_is_alive() {
+  local pid="$1"
+  local state=""
+  if ! is_pid_alive "${pid}"; then
+    return 1
+  fi
+  state="$(ps -o stat= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ -n "${state}" && "${state:0:1}" != "Z" ]]
+}
+
+wait_for_motion_guard_transport() {
+  local helper="${REPO_ROOT}/scripts/systemd/wait_for_motion_guard_socket.sh"
+  local timeout_sec="${NUWAX_MOTION_GUARD_START_TIMEOUT_SEC:-15}"
+  local attempts=0
+  case "${timeout_sec}" in
+    ''|*[!0-9]*)
+      echo "invalid NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=${timeout_sec}" >&2
+      return 1
+      ;;
+  esac
+  attempts=$((timeout_sec * 10 + 1))
+
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    if bash "${helper}" check >/dev/null 2>&1; then
+      echo "motion guard transport ready: ${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  bash "${helper}" check
+  echo "refusing to start geometry runtime or Gateway without motion guard transport" >&2
+  return 1
+}
+
+wait_for_geometry_runtime_ready() {
+  local ready_file="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
+  local timeout_sec="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT:-30}"
+  local attempts=0
+  case "${timeout_sec}" in
+    ''|*[!0-9]*)
+      echo "invalid NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=${timeout_sec}" >&2
+      return 1
+      ;;
+  esac
+  attempts=$((timeout_sec * 10 + 1))
+
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    if [[ -f "${ready_file}" ]]; then
+      echo "nuwax-geometry-runtime ready: ${ready_file}"
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  echo "nuwax-geometry-runtime ready file missing after ${timeout_sec}s: ${ready_file}" >&2
+  return 1
+}
+
+wait_for_nav_stack_ready() {
+  local helper="${REPO_ROOT}/scripts/systemd/wait_for_nav_stack_ready.sh"
+  local ready_file="${NUWAX_NAV_STACK_READY_FILE:-${REPO_ROOT}/runtime_data/navigation/nuwax_nav_stack.ready}"
+  NUWAX_NAV_STACK_READY_FILE="${ready_file}" \
+    bash "${helper}" wait
+  echo "nuwax-nav-stack ready: ${ready_file}"
 }
 
 run_with_title() {
@@ -191,6 +296,34 @@ terminate_process_scope() {
   wait_for_pid_exit "${pid}" "${kill_timeout}" || true
 }
 
+terminate_person_follow_scope() {
+  local pid="$1"
+  local stop_timeout="${NUWAX_GATEWAY_STOP_TIMEOUT_SEC:-20}"
+  local kill_timeout="${NUWAX_GATEWAY_KILL_TIMEOUT_SEC:-5}"
+
+  if ! person_follow_is_alive "${pid}"; then
+    return 0
+  fi
+
+  echo "stopping nuwax-person-follow pid ${pid}..."
+  # The Rust owner handles SIGINT and publishes a final typed zero during teardown.
+  send_signal_to_process_scope INT "${pid}"
+  send_signal_to_process_scope CONT "${pid}"
+  if wait_for_pid_exit "${pid}" "${stop_timeout}"; then
+    return 0
+  fi
+
+  echo "nuwax-person-follow pid ${pid} did not stop after ${stop_timeout}s; sending SIGTERM." >&2
+  send_signal_to_process_scope TERM "${pid}"
+  if wait_for_pid_exit "${pid}" "${kill_timeout}"; then
+    return 0
+  fi
+
+  echo "nuwax-person-follow pid ${pid} ignored SIGTERM; sending SIGKILL." >&2
+  send_signal_to_process_scope KILL "${pid}"
+  wait_for_pid_exit "${pid}" "${kill_timeout}" || true
+}
+
 cleanup_stale_gateway_processes() {
   local pid=""
   local args=""
@@ -209,6 +342,10 @@ cleanup_stale_geometry_runtime_processes() {
   # 去 ROS2 化（2026-07-03 drop-ros2）：原 cleanup_stale_geometry_runtime_processes 改为
   # cleanup_stale_geometry_runtime_processes；清理对象改为 nuwax-geometry-runtime，
   # 端口 50051（gRPC 控制面兼容边界）复用同名变量。
+  if geometry_runtime_managed_by_systemd; then
+    return 0
+  fi
+
   local binary="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
   local pid=""
   local args=""
@@ -249,6 +386,23 @@ cleanup_stale_geometry_runtime_processes() {
   fi
 
   rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+}
+
+cleanup_stale_person_follow_processes() {
+  if person_follow_managed_by_systemd; then
+    return 0
+  fi
+
+  local pid=""
+  local args=""
+  while read -r pid args; do
+    if [[ -z "${pid}" || "${pid}" == "$$" || "${pid}" == "${BASHPID}" ]]; then
+      continue
+    fi
+    if [[ "${args}" == *"nuwax-person-follow"* ]]; then
+      terminate_person_follow_scope "${pid}"
+    fi
+  done < <(ps -eo pid=,args=)
 }
 
 cleanup_stale_go2_video_streamer() {
@@ -331,6 +485,7 @@ stop_existing_gateway() {
   if [[ -z "${pid}" ]]; then
     echo "gateway pid file not found: ${PID_FILE}"
     cleanup_stale_gateway_processes
+    cleanup_stale_person_follow_processes
     cleanup_stale_geometry_runtime_processes
     cleanup_stale_go2_video_streamer
     cleanup_external_geometry_processes
@@ -341,6 +496,7 @@ stop_existing_gateway() {
     echo "gateway pid ${pid} is not running; removing stale pid file."
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
+    cleanup_stale_person_follow_processes
     cleanup_stale_geometry_runtime_processes
     cleanup_stale_go2_video_streamer
     cleanup_external_geometry_processes
@@ -353,6 +509,7 @@ stop_existing_gateway() {
   # 再停 ros-bridge（避免重启窗口期 GetFrameTree 抛 UNAVAILABLE 刷日志）→
   # 最后清理外部几何进程。
   cleanup_stale_gateway_processes
+  cleanup_stale_person_follow_processes
   cleanup_stale_geometry_runtime_processes
   cleanup_external_geometry_processes
 }
@@ -373,10 +530,55 @@ should_start_geometry_runtime() {
   [[ -x "${binary}" ]] && is_truthy "${NUWAX_GEOMETRY_RUNTIME_ENABLED:-true}"
 }
 
+should_start_nav_stack() {
+  local binary="${NUWAX_NAV_STACK_BINARY:-${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-nav-stack}"
+  [[ -x "${binary}" ]] && is_truthy "${NUWAX_NAV_AUTOSTART:-true}"
+}
+
+should_start_person_follow() {
+  local binary=""
+  binary="$(person_follow_binary)"
+  [[ -x "${binary}" ]] && person_follow_autostart_enabled
+}
+
 should_start_go2_video_streamer() {
   is_truthy "${GO2_VIDEO_STREAM_ENABLED:-true}" \
     && is_truthy "${GO2_DATA_PLANE_ENABLED:-false}" \
     && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "go2" ]]
+}
+
+start_nav_stack() {
+  if [[ -n "${NAV_STACK_PID}" ]] && is_pid_alive "${NAV_STACK_PID}"; then
+    return 0
+  fi
+  if nav_stack_managed_by_systemd; then
+    wait_for_nav_stack_ready
+    return
+  fi
+  if ! is_truthy "${NUWAX_NAV_AUTOSTART:-true}"; then
+    echo "nuwax-nav-stack disabled by NUWAX_NAV_AUTOSTART"
+    return 0
+  fi
+  if ! should_start_nav_stack; then
+    echo "nuwax-nav-stack is enabled but its production binary is not executable; run scripts/build_nav_stack.sh" >&2
+    return 1
+  fi
+
+  local launcher="${REPO_ROOT}/scripts/systemd/start_nav_stack.sh"
+  export NUWAX_NAV_STACK_READY_FILE="${NUWAX_NAV_STACK_READY_FILE:-${REPO_ROOT}/runtime_data/navigation/nuwax_nav_stack.ready}"
+  export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
+  echo "starting nuwax-nav-stack profile=${NUWAX_NAV_PROFILE:-simple-2d}"
+  (run_with_title "nuwax-nav-stack-launcher" bash "${launcher}") &
+  NAV_STACK_PID="$!"
+
+  if wait_for_nav_stack_ready; then
+    echo "nuwax-nav-stack healthy (launcher pid ${NAV_STACK_PID})"
+    return 0
+  fi
+  terminate_process_scope "${NAV_STACK_PID}" "unready nuwax-nav-stack"
+  wait "${NAV_STACK_PID}" >/dev/null 2>&1 || true
+  NAV_STACK_PID=""
+  return 1
 }
 
 start_geometry_runtime() {
@@ -386,8 +588,17 @@ start_geometry_runtime() {
   if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
     return 0
   fi
-  if ! should_start_geometry_runtime; then
+  if geometry_runtime_managed_by_systemd; then
+    wait_for_geometry_runtime_ready
+    return
+  fi
+  if ! is_truthy "${NUWAX_GEOMETRY_RUNTIME_ENABLED:-true}"; then
+    echo "nuwax-geometry-runtime disabled by NUWAX_GEOMETRY_RUNTIME_ENABLED"
     return 0
+  fi
+  if ! should_start_geometry_runtime; then
+    echo "nuwax-geometry-runtime is enabled but its binary is not executable" >&2
+    return 1
   fi
   local binary="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
   echo "starting nuwax-geometry-runtime: ${binary}"
@@ -411,8 +622,89 @@ start_geometry_runtime() {
   if [[ -f "${ready_file}" ]]; then
     echo "nuwax-geometry-runtime ready (pid ${GEOMETRY_RUNTIME_PID})"
   else
-    echo "WARNING: nuwax-geometry-runtime ready file 未在 10s 内出现" >&2
+    echo "nuwax-geometry-runtime ready file 未在 10s 内出现" >&2
+    terminate_process_scope "${GEOMETRY_RUNTIME_PID}" "unready nuwax-geometry-runtime"
+    GEOMETRY_RUNTIME_PID=""
+    return 1
   fi
+}
+
+start_person_follow() {
+  local binary=""
+  local status=1
+  local warmup_steps="${NUWAX_PERSON_FOLLOW_WARMUP_STEPS:-10}"
+
+  if [[ -n "${PERSON_FOLLOW_PID}" ]] && person_follow_is_alive "${PERSON_FOLLOW_PID}"; then
+    return 0
+  fi
+  if person_follow_managed_by_systemd; then
+    return 0
+  fi
+  if ! person_follow_autostart_enabled; then
+    echo "nuwax-person-follow disabled by NUWAX_PERSON_FOLLOW_AUTOSTART"
+    return 0
+  fi
+  if ! should_start_person_follow; then
+    echo "nuwax-person-follow is enabled but its production binary is not executable: $(person_follow_binary)" >&2
+    return 1
+  fi
+  if ! validate_person_follow_monitor_interval; then
+    return 1
+  fi
+  case "${warmup_steps}" in
+    ''|*[!0-9]*)
+      echo "invalid NUWAX_PERSON_FOLLOW_WARMUP_STEPS=${warmup_steps}" >&2
+      return 1
+      ;;
+  esac
+  if [[ "${warmup_steps}" -le 0 ]]; then
+    echo "NUWAX_PERSON_FOLLOW_WARMUP_STEPS must be greater than zero" >&2
+    return 1
+  fi
+
+  binary="$(person_follow_binary)"
+  echo "starting nuwax-person-follow: ${binary}"
+  (
+    # These unsuffixed channels are frozen. The Rust transport appends the LCM type.
+    export NUWAX_PERSON_FOLLOW_TARGET_CHANNEL="${PERSON_FOLLOW_TARGET_CHANNEL}"
+    export NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL="${PERSON_FOLLOW_POINTCLOUD_CHANNEL}"
+    export NUWAX_PERSON_FOLLOW_TF_CHANNEL="${PERSON_FOLLOW_TF_CHANNEL}"
+    export NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL="${PERSON_FOLLOW_COMMAND_CHANNEL}"
+    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
+    run_with_title "nuwax-person-follow" "${binary}"
+  ) &
+  PERSON_FOLLOW_PID="$!"
+
+  for ((step = 0; step < warmup_steps; step++)); do
+    if ! person_follow_is_alive "${PERSON_FOLLOW_PID}"; then
+      break
+    fi
+    sleep 0.1
+  done
+  if person_follow_is_alive "${PERSON_FOLLOW_PID}"; then
+    echo "nuwax-person-follow healthy (pid ${PERSON_FOLLOW_PID})"
+    return 0
+  fi
+
+  if wait "${PERSON_FOLLOW_PID}"; then
+    status=0
+  else
+    status="$?"
+  fi
+  echo "nuwax-person-follow exited during startup warmup with status ${status}" >&2
+  PERSON_FOLLOW_PID=""
+  return 1
+}
+
+abort_person_follow_startup() {
+  echo "nuwax-person-follow failed to start; refusing to start Gateway" >&2
+  STOP_REQUESTED=1
+  stop_person_follow_monitor
+  stop_runtime_monitors
+  stop_person_follow
+  stop_geometry_runtime
+  stop_nav_stack
+  exit 1
 }
 
 start_go2_video_streamer() {
@@ -428,6 +720,9 @@ start_go2_video_streamer() {
 }
 
 stop_geometry_runtime() {
+  if geometry_runtime_managed_by_systemd; then
+    return 0
+  fi
   if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
     terminate_process_scope "${GEOMETRY_RUNTIME_PID}" "nuwax-geometry-runtime"
     wait "${GEOMETRY_RUNTIME_PID}" >/dev/null 2>&1 || true
@@ -437,7 +732,35 @@ stop_geometry_runtime() {
   rm -f "${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}" 2>/dev/null || true
 }
 
+stop_nav_stack() {
+  if nav_stack_managed_by_systemd; then
+    return 0
+  fi
+  if [[ -n "${NAV_STACK_PID}" ]] && is_pid_alive "${NAV_STACK_PID}"; then
+    terminate_process_scope "${NAV_STACK_PID}" "nuwax-nav-stack"
+    wait "${NAV_STACK_PID}" >/dev/null 2>&1 || true
+  fi
+  NAV_STACK_PID=""
+  rm -f "${NUWAX_NAV_STACK_READY_FILE:-${REPO_ROOT}/runtime_data/navigation/nuwax_nav_stack.ready}" 2>/dev/null || true
+}
+
+stop_person_follow() {
+  if person_follow_managed_by_systemd; then
+    return 0
+  fi
+  if [[ -n "${PERSON_FOLLOW_PID}" ]]; then
+    if person_follow_is_alive "${PERSON_FOLLOW_PID}"; then
+      terminate_person_follow_scope "${PERSON_FOLLOW_PID}"
+    fi
+    wait "${PERSON_FOLLOW_PID}" >/dev/null 2>&1 || true
+  fi
+  PERSON_FOLLOW_PID=""
+}
+
 monitor_geometry_runtime() {
+  if geometry_runtime_managed_by_systemd; then
+    return 0
+  fi
   while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
     sleep 5
     if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && ! is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
@@ -447,6 +770,92 @@ monitor_geometry_runtime() {
       start_geometry_runtime
     fi
   done
+}
+
+monitor_nav_stack() {
+  if nav_stack_managed_by_systemd || ! is_truthy "${NUWAX_NAV_AUTOSTART:-true}"; then
+    return 0
+  fi
+  while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
+    sleep 5
+    if [[ -n "${NAV_STACK_PID}" ]] && ! is_pid_alive "${NAV_STACK_PID}"; then
+      echo "nuwax-nav-stack launcher (pid ${NAV_STACK_PID}) crashed, restarting..." >&2
+      wait "${NAV_STACK_PID}" >/dev/null 2>&1 || true
+      NAV_STACK_PID=""
+      if ! start_nav_stack; then
+        echo "nuwax-nav-stack restart failed; stopping gateway worker" >&2
+        if [[ -n "${GATEWAY_PID}" ]] && is_pid_alive "${GATEWAY_PID}"; then
+          send_signal_to_process_scope TERM "${GATEWAY_PID}"
+        fi
+        return 1
+      fi
+    fi
+  done
+}
+
+monitor_person_follow() {
+  local watched_person_follow_pid="${PERSON_FOLLOW_PID}"
+  local watched_gateway_pid="${GATEWAY_PID}"
+  local interval="${NUWAX_PERSON_FOLLOW_MONITOR_INTERVAL_SEC:-0.5}"
+
+  if person_follow_managed_by_systemd || ! person_follow_autostart_enabled; then
+    return 0
+  fi
+  if [[ -z "${watched_person_follow_pid}" ]]; then
+    return 0
+  fi
+
+  while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
+    sleep "${interval}"
+    if ! person_follow_is_alive "${watched_person_follow_pid}"; then
+      echo "nuwax-person-follow (pid ${watched_person_follow_pid}) crashed; stopping gateway worker" >&2
+      if [[ -n "${watched_gateway_pid}" ]] && is_pid_alive "${watched_gateway_pid}"; then
+        send_signal_to_process_scope TERM "${watched_gateway_pid}"
+      fi
+      return 1
+    fi
+  done
+}
+
+start_person_follow_monitor() {
+  if [[ -n "${PERSON_FOLLOW_MONITOR_PID}" ]] && is_pid_alive "${PERSON_FOLLOW_MONITOR_PID}"; then
+    return 0
+  fi
+  monitor_person_follow &
+  PERSON_FOLLOW_MONITOR_PID="$!"
+}
+
+stop_person_follow_monitor() {
+  if [[ -n "${PERSON_FOLLOW_MONITOR_PID}" ]] && is_pid_alive "${PERSON_FOLLOW_MONITOR_PID}"; then
+    kill -TERM "${PERSON_FOLLOW_MONITOR_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${PERSON_FOLLOW_MONITOR_PID}" ]]; then
+    wait "${PERSON_FOLLOW_MONITOR_PID}" >/dev/null 2>&1 || true
+  fi
+  PERSON_FOLLOW_MONITOR_PID=""
+}
+
+start_runtime_monitors() {
+  if [[ -z "${NAV_STACK_MONITOR_PID}" ]] || ! is_pid_alive "${NAV_STACK_MONITOR_PID}"; then
+    monitor_nav_stack &
+    NAV_STACK_MONITOR_PID="$!"
+  fi
+  if [[ -z "${GEOMETRY_MONITOR_PID}" ]] || ! is_pid_alive "${GEOMETRY_MONITOR_PID}"; then
+    monitor_geometry_runtime &
+    GEOMETRY_MONITOR_PID="$!"
+  fi
+}
+
+stop_runtime_monitors() {
+  local monitor_pid=""
+  for monitor_pid in "${NAV_STACK_MONITOR_PID}" "${GEOMETRY_MONITOR_PID}"; do
+    if [[ -n "${monitor_pid}" ]] && is_pid_alive "${monitor_pid}"; then
+      kill -TERM "${monitor_pid}" >/dev/null 2>&1 || true
+      wait "${monitor_pid}" >/dev/null 2>&1 || true
+    fi
+  done
+  NAV_STACK_MONITOR_PID=""
+  GEOMETRY_MONITOR_PID=""
 }
 
 stop_go2_video_streamer() {
@@ -462,7 +871,7 @@ stop_go2_video_streamer() {
 
 stop_gateway() {
   STOP_REQUESTED=1
-  # 顺序：先杀网关 worker → 再停 geometry runtime → 最后停 video streamer。
+  # 顺序：先杀网关 worker → person-follow → geometry runtime → nav-stack → video streamer。
   # 关键是先切断网关（geometry / perception 客户端），否则 geometry runtime 一停，
   # 客户端在重启窗口期 GetFrameTree 立即抛 UNAVAILABLE，日志刷一长串
   # "failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:50051"。
@@ -470,7 +879,11 @@ stop_gateway() {
     terminate_process_scope "${GATEWAY_PID}" "gateway worker"
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
   fi
+  stop_person_follow_monitor
+  stop_runtime_monitors
+  stop_person_follow
   stop_geometry_runtime
+  stop_nav_stack
   stop_go2_video_streamer
   cleanup_external_geometry_processes
   exit 0
@@ -505,6 +918,7 @@ case "${ACTION}" in
     fi
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
+    cleanup_stale_person_follow_processes
     cleanup_stale_geometry_runtime_processes
     cleanup_stale_go2_video_streamer
     cleanup_external_geometry_processes
@@ -533,6 +947,10 @@ if is_truthy "${NUWAX_GEOMETRY_ENABLED:-true}"; then
 fi
 
 export PYTHONUNBUFFERED=1
+export NUWAX_PERSON_FOLLOW_TARGET_CHANNEL="${PERSON_FOLLOW_TARGET_CHANNEL}"
+export NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL="${PERSON_FOLLOW_POINTCLOUD_CHANNEL}"
+export NUWAX_PERSON_FOLLOW_TF_CHANNEL="${PERSON_FOLLOW_TF_CHANNEL}"
+export NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL="${PERSON_FOLLOW_COMMAND_CHANNEL}"
 export GO2_VIDEO_STREAM_GATEWAY_URL="${GO2_VIDEO_STREAM_GATEWAY_URL:-ws://127.0.0.1:${PORT}/streams/video.ingest}"
 # 个人机器狗：网关不鉴权，视频推流令牌默认留空（如需可单独设置 GO2_VIDEO_STREAM_ACCESS_TOKEN）。
 export GO2_VIDEO_STREAM_ACCESS_TOKEN="${GO2_VIDEO_STREAM_ACCESS_TOKEN:-}"
@@ -543,40 +961,64 @@ trap remove_pid_file EXIT
 trap stop_gateway INT TERM
 
 if ! is_restart_enabled "${RESTART_POLICY}"; then
+  wait_for_motion_guard_transport
+  start_nav_stack
+  start_geometry_runtime
+  start_person_follow || abort_person_follow_startup
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
-  start_geometry_runtime
   start_go2_video_streamer
-  monitor_geometry_runtime &
+  start_runtime_monitors
+  start_person_follow_monitor
   wait "${GATEWAY_PID}"
   exit_code="$?"
+  STOP_REQUESTED=1
+  stop_person_follow_monitor
+  stop_runtime_monitors
+  stop_person_follow
   stop_go2_video_streamer
   stop_geometry_runtime
+  stop_nav_stack
   exit "${exit_code}"
 fi
 
 attempt=0
 while true; do
+  wait_for_motion_guard_transport
+  start_nav_stack
+  start_geometry_runtime
+  start_person_follow || abort_person_follow_startup
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
-  start_geometry_runtime
   start_go2_video_streamer
-  monitor_geometry_runtime &
+  start_runtime_monitors
+  start_person_follow_monitor
   wait "${GATEWAY_PID}"
   exit_code="$?"
   stop_go2_video_streamer
+  stop_person_follow_monitor
   GATEWAY_PID=""
   set -e
 
   if ! should_restart "${exit_code}"; then
+    STOP_REQUESTED=1
+    stop_runtime_monitors
+    stop_person_follow
+    stop_geometry_runtime
+    stop_nav_stack
     exit "${exit_code}"
   fi
 
   attempt=$((attempt + 1))
   if [[ "${RESTART_MAX_ATTEMPTS}" != "0" && "${attempt}" -ge "${RESTART_MAX_ATTEMPTS}" ]]; then
     echo "gateway exited with code ${exit_code}; restart attempts exhausted (${attempt})." >&2
+    STOP_REQUESTED=1
+    stop_runtime_monitors
+    stop_person_follow
+    stop_geometry_runtime
+    stop_nav_stack
     exit "${exit_code}"
   fi
 

@@ -7,12 +7,13 @@
 use nuwax_nav_types_messages::frames::NavFrameId;
 use nuwax_nav_types_messages::geometry::Point2;
 use nuwax_nav_types_messages::geometry::Timestamp;
-use nuwax_nav_types_messages::grid::OccupancyGrid2D;
+use nuwax_nav_types_messages::grid::{OccupancyCell, OccupancyGrid2D};
 use nuwax_nav_types_messages::visual::FrontierGoal;
 
 use crate::config::WavefrontConfig;
 use crate::detector::{DetectionOutcome, WavefrontDetector, WavefrontError};
 use crate::frontier_goal::{FrontierGoalIdSeed, FrontierGoalIdSource, GoalSelection, StopReason};
+use crate::grid::occupancy_value;
 use crate::scoring::{CandidateGeometry, FrontierScorer};
 
 /// 唯一选择器(组合 detector + scorer,管理 id_source 与 session 消费顺序)。
@@ -61,6 +62,8 @@ impl WavefrontGoalSelector {
         id_source: &mut dyn FrontierGoalIdSource,
     ) -> Result<GoalSelection, WavefrontError> {
         let cfg = self.detector.config().clone();
+        let inflated_costmap = inflate_obstacles(costmap, cfg.obstacle_inflation_radius_m);
+        let costmap = &inflated_costmap;
 
         // 1. no-gain 检查
         if let Some(reason) = session.check_information_gain(costmap, &cfg) {
@@ -143,6 +146,48 @@ impl WavefrontGoalSelector {
             frontier_candidate_to_goal(cand, id, now, breakdown.total, cand.cluster.area_m2 as f32);
         Ok(GoalSelection::Goal(goal))
     }
+}
+
+fn inflate_obstacles(costmap: &OccupancyGrid2D, radius_m: f64) -> OccupancyGrid2D {
+    if radius_m <= 0.0 || costmap.resolution <= 0.0 || costmap.cells.is_empty() {
+        return costmap.clone();
+    }
+    let radius_cells = (radius_m / costmap.resolution).ceil() as i32;
+    if radius_cells <= 0 {
+        return costmap.clone();
+    }
+    let sources: Vec<(u32, u32)> = (0..costmap.height)
+        .flat_map(|y| (0..costmap.width).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+            costmap
+                .get(*x, *y)
+                .is_some_and(|cell| occupancy_value(cell) >= 100)
+        })
+        .collect();
+    if sources.is_empty() {
+        return costmap.clone();
+    }
+
+    let mut inflated = costmap.clone();
+    for (source_x, source_y) in sources {
+        for dy in -radius_cells..=radius_cells {
+            for dx in -radius_cells..=radius_cells {
+                if dx * dx + dy * dy > radius_cells * radius_cells {
+                    continue;
+                }
+                let x = source_x as i32 + dx;
+                let y = source_y as i32 + dy;
+                if x < 0 || y < 0 || x >= costmap.width as i32 || y >= costmap.height as i32 {
+                    continue;
+                }
+                let index = inflated.index(x as u32, y as u32);
+                if !matches!(inflated.cells[index], OccupancyCell::Occupied) {
+                    inflated.cells[index] = OccupancyCell::Inflated;
+                }
+            }
+        }
+    }
+    inflated
 }
 
 /// crate-private 转换:`FrontierCandidate` -> `FrontierGoal`(不在 public API 暴露)。
@@ -259,5 +304,38 @@ mod tests {
             r,
             GoalSelection::Stop(StopReason::NoReachableFreeSpace)
         ));
+    }
+
+    #[test]
+    fn obstacle_inflation_uses_meter_radius_and_circular_kernel() {
+        let mut grid =
+            OccupancyGrid2D::filled(Point2 { x: 0.0, y: 0.0 }, 0.1, 9, 9, OccupancyCell::Free);
+        grid.set(4, 4, OccupancyCell::Occupied);
+        grid.set(6, 4, OccupancyCell::Unknown);
+
+        let inflated = inflate_obstacles(&grid, 0.25);
+        assert_eq!(inflated.get(7, 4), Some(OccupancyCell::Inflated));
+        assert_eq!(inflated.get(6, 4), Some(OccupancyCell::Inflated));
+        assert_eq!(inflated.get(7, 7), Some(OccupancyCell::Free));
+        assert_eq!(inflated.get(4, 4), Some(OccupancyCell::Occupied));
+    }
+
+    #[test]
+    fn obstacle_inflation_matches_python_source_and_unknown_semantics() {
+        let mut grid =
+            OccupancyGrid2D::filled(Point2 { x: 0.0, y: 0.0 }, 0.1, 15, 5, OccupancyCell::Free);
+        grid.set(2, 2, OccupancyCell::Cost(99));
+        grid.set(10, 2, OccupancyCell::Cost(100));
+        grid.set(12, 2, OccupancyCell::Unknown);
+
+        // Python `simple_inflate` sources only values >= CostValues.OCCUPIED
+        // (100), independent of Wavefront's configurable frontier threshold.
+        let inflated = inflate_obstacles(&grid, 0.15);
+        assert_eq!(inflated.get(2, 2), Some(OccupancyCell::Cost(99)));
+        assert_eq!(inflated.get(2, 1), Some(OccupancyCell::Free));
+        assert_eq!(inflated.get(10, 2), Some(OccupancyCell::Inflated));
+        // Binary dilation overwrites unknown cells in its circular footprint.
+        assert_eq!(inflated.get(12, 2), Some(OccupancyCell::Inflated));
+        assert_eq!(inflated.get(12, 1), Some(OccupancyCell::Free));
     }
 }

@@ -12,29 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! P0-07:`StackRunner` —— Stack 的 process owner。
+//! Runtime ownership for a navigation stack graph.
 //!
-//! ## 设计边界(rework22)
-//!
-//! 方案 §6.8 约束「stack 不持有算法」,本模块严格遵守:
-//!
-//! - **不实现任何算法**(A* / FAR / Local / PathFollower / PGO / Terrain 全部走上游 crate / native binary)。
-//! - **持有进程**:负责把 `ModuleGraph` 翻译为真实 OS 进程,把每个
-//!   `NativeBridge` / `RustAlgorithm` 节点 spawn 成 child process。
-//! - **可观测**:`running_nodes()` / `nodes_with_native_spec()` 让上层(CLI /
-//!   integration test)能立即知道哪些节点真的被拉起。
-//!
-//! ## argv 构造规则
-//!
-//! - 若节点有 `native_spec`(typed wiring,cfg-gated `native-runner` feature 开启),
-//!   argv = `[executable, --{port} {topic} 字典序, ...config_args]`,与各 bridge
-//!   `bridge.argv()` 行为一致。
-//! - 否则回退到 `binary` 字符串 + 空 argv(legacy path / dry-run 模式)。
-//! - 完全无 `binary` 的节点(如 `RustAlgorithm` 或 `Coordinator`)不出现在本 runner 视野内,
-//!   由 stack 上一层 `BridgeSupervisor` 或 in-process 调用管理。
+//! A graph node is not considered started merely because it appears in a
+//! [`ModuleGraph`]. Native bridges are owned as child processes. Every other
+//! node must have an explicit [`InProcessNodeFactory`] registration before
+//! startup. This prevents Rust algorithms and coordinators from being silently
+//! skipped while the CLI reports a successful stack launch.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -42,145 +33,468 @@ use tokio::process::{Child, Command};
 use crate::error::{NavStackError, NavStackResult};
 use crate::graph::{ModuleGraph, ModuleKind, ModuleNode};
 
-/// Stack 的 process owner:持有 `ModuleGraph` + 真实子进程 `Child` 句柄。
+/// Boxed future returned by an asynchronously managed child process.
+pub type ProcessFuture<'a> = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>>;
+
+/// Fully rendered request passed to a [`ProcessFactory`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessLaunch {
+    /// Graph node that owns the process.
+    pub node_id: String,
+    /// Executable path.
+    pub program: PathBuf,
+    /// Command-line arguments, excluding the executable.
+    pub args: Vec<String>,
+    /// Environment overrides from the typed native spec.
+    pub env: BTreeMap<String, String>,
+    /// Optional working directory from the typed native spec.
+    pub cwd: Option<PathBuf>,
+}
+
+/// Process handle abstraction used by [`StackRunner`].
+///
+/// The abstraction keeps lifecycle tests deterministic without weakening the
+/// production path, which uses [`tokio::process::Child`].
+pub trait ManagedProcess: Send {
+    /// Return `true` once the child has exited.
+    fn has_exited(&mut self) -> std::io::Result<bool>;
+
+    /// Request termination without blocking for process reaping.
+    fn request_shutdown(&mut self) -> std::io::Result<()>;
+
+    /// Force termination after the configured grace period.
+    fn force_kill(&mut self) -> ProcessFuture<'_>;
+
+    /// Wait for and reap the process.
+    fn wait(&mut self) -> ProcessFuture<'_>;
+}
+
+/// Injectable child-process factory.
+pub trait ProcessFactory: Send + Sync {
+    /// Spawn one rendered native process.
+    fn spawn(&self, launch: &ProcessLaunch) -> std::io::Result<Box<dyn ManagedProcess>>;
+}
+
+/// Production process factory backed by Tokio.
+#[derive(Debug, Default)]
+pub struct TokioProcessFactory;
+
+impl ProcessFactory for TokioProcessFactory {
+    fn spawn(&self, launch: &ProcessLaunch) -> std::io::Result<Box<dyn ManagedProcess>> {
+        let mut command = Command::new(&launch.program);
+        command.args(&launch.args);
+        command.envs(&launch.env);
+        if let Some(cwd) = &launch.cwd {
+            command.current_dir(cwd);
+        }
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        command.kill_on_drop(true);
+        let child = command.spawn()?;
+        Ok(Box::new(TokioManagedProcess { child }))
+    }
+}
+
+struct TokioManagedProcess {
+    child: Child,
+}
+
+impl ManagedProcess for TokioManagedProcess {
+    fn has_exited(&mut self) -> std::io::Result<bool> {
+        self.child.try_wait().map(|status| status.is_some())
+    }
+
+    fn request_shutdown(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            let status = std::process::Command::new("/bin/kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if matches!(status, Ok(status) if status.success()) {
+                return Ok(());
+            }
+        }
+
+        self.child.start_kill()
+    }
+
+    fn force_kill(&mut self) -> ProcessFuture<'_> {
+        Box::pin(async move { self.child.kill().await })
+    }
+
+    fn wait(&mut self) -> ProcessFuture<'_> {
+        Box::pin(async move { self.child.wait().await.map(|_| ()) })
+    }
+}
+
+/// Lifecycle owned by the stack for a non-native graph node.
+pub trait InProcessNode: Send {
+    /// Start the concrete node lifecycle.
+    fn start(&mut self) -> NavStackResult<()>;
+
+    /// Return whether the owned lifecycle is still running.
+    fn is_running(&mut self) -> NavStackResult<bool>;
+
+    /// Stop the lifecycle and release its resources.
+    fn shutdown(&mut self) -> NavStackResult<()>;
+}
+
+/// Factory for one concrete in-process graph node owner.
+pub trait InProcessNodeFactory: Send + Sync {
+    /// Create the owner for the supplied graph node.
+    fn create(&self, node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>>;
+}
+
+impl<F> InProcessNodeFactory for F
+where
+    F: Fn(&ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> + Send + Sync,
+{
+    fn create(&self, node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> {
+        self(node)
+    }
+}
+
+/// Stack runtime owner for native processes and registered in-process nodes.
 pub struct StackRunner {
     graph: ModuleGraph,
-    /// 已启动的 native bridge 节点 id -> child 句柄。
-    ///
-    /// 只持有 `ModuleKind::NativeBridge` 节点;`RustAlgorithm` /
-    /// `Coordinator` 等不通过 OS 进程表达的节点不在此映射中。
-    handles: HashMap<String, Child>,
+    process_factory: Arc<dyn ProcessFactory>,
+    in_process_factories: HashMap<String, Arc<dyn InProcessNodeFactory>>,
+    processes: HashMap<String, Box<dyn ManagedProcess>>,
+    in_process_nodes: HashMap<String, Box<dyn InProcessNode>>,
 }
 
 impl StackRunner {
-    /// 从 `ModuleGraph` 构造 runner,不启动任何进程。
+    /// Construct a runner without starting any node.
     pub fn from_graph(graph: ModuleGraph) -> Self {
         Self {
             graph,
-            handles: HashMap::new(),
+            process_factory: Arc::new(TokioProcessFactory),
+            in_process_factories: HashMap::new(),
+            processes: HashMap::new(),
+            in_process_nodes: HashMap::new(),
         }
     }
 
-    /// 当前持有的 module graph 引用。
+    /// Replace the child-process factory before startup.
+    pub fn set_process_factory<F>(&mut self, factory: F)
+    where
+        F: ProcessFactory + 'static,
+    {
+        self.process_factory = Arc::new(factory);
+    }
+
+    /// Register a concrete owner factory for one non-native graph node id.
+    ///
+    /// Registering the same id again replaces the previous factory. The
+    /// factory is retained after shutdown, so a runner can be started again.
+    pub fn register_in_process_factory<F>(&mut self, node_id: impl Into<String>, factory: F)
+    where
+        F: InProcessNodeFactory + 'static,
+    {
+        self.in_process_factories
+            .insert(node_id.into(), Arc::new(factory));
+    }
+
+    /// Current module graph.
     pub fn graph(&self) -> &ModuleGraph {
         &self.graph
     }
 
-    /// 取出当前已启动(尚未 wait)的节点 id 列表。
+    /// Sorted ids of all currently owned process and in-process lifecycles.
     pub fn running_nodes(&self) -> Vec<String> {
-        self.handles.keys().cloned().collect()
+        let mut ids: Vec<String> = self
+            .processes
+            .keys()
+            .chain(self.in_process_nodes.keys())
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
     }
 
-    /// 列出 **应当** spawn 成子进程但当前还没拉的 native bridge 节点 id。
-    ///
-    /// 含 `ModuleKind::NativeBridge` 且 `binary` 非空 的节点;
-    /// 已存在于 `handles` 的也会列出来(用于「判断预期 vs 实际」的对比)。
+    /// Native bridge ids with a renderable executable.
     pub fn native_bridge_ids(&self) -> Vec<String> {
         self.graph
             .nodes()
             .iter()
-            .filter(|n| matches!(n.kind, ModuleKind::NativeBridge) && n.binary.is_some())
-            .map(|n| n.id.clone())
+            .filter(|node| launch_for(node).is_some())
+            .map(|node| node.id.clone())
             .collect()
     }
 
-    /// 启动所有 `NativeBridge` 节点为真实子进程。
+    /// Nodes that cannot be started with the current registrations.
+    pub fn unowned_nodes(&self) -> Vec<String> {
+        self.graph
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind {
+                ModuleKind::NativeBridge if launch_for(node).is_none() => {
+                    Some(format!("{} (native bridge has no executable)", node.id))
+                }
+                ModuleKind::NativeBridge => None,
+                _ if self.in_process_factories.contains_key(&node.id) => None,
+                _ => Some(format!("{} ({:?})", node.id, node.kind)),
+            })
+            .collect()
+    }
+
+    /// Start every graph node after an all-or-nothing ownership preflight.
     ///
-    /// 对每个有 `binary` 的 `NativeBridge` 节点:
-    /// 1. 构造 argv(executable + topic args;若 typed native_spec 存在则按
-    ///    native-runner 渲染顺序追加 config args,否则仅 binary);
-    /// 2. `Command::new` + `args` + `kill_on_drop(true)`;
-    /// 3. `spawn()` 拿到 `Child` 句柄存到 `handles`。
-    ///
-    /// 出错时立即返回 `SpawnFailed { node, source }`,已 spawn 的子进程
-    /// 不会被自动回收(调用方可继续 `shutdown()` 收尾)。
+    /// Native bridges are spawned through the configured [`ProcessFactory`].
+    /// Other node kinds must have an explicit in-process factory. If any node
+    /// is unowned, no process or task is started. A later startup failure
+    /// triggers cleanup of every node that was already started.
     pub async fn spawn_all(&mut self) -> NavStackResult<()> {
-        for node in self.graph.nodes() {
-            if !matches!(node.kind, ModuleKind::NativeBridge) {
+        if !self.processes.is_empty() || !self.in_process_nodes.is_empty() {
+            return Err(NavStackError::AlreadyRunning);
+        }
+
+        let unowned = self.unowned_nodes();
+        if !unowned.is_empty() {
+            return Err(NavStackError::MissingRuntimeOwners { nodes: unowned });
+        }
+
+        let nodes = self.graph.nodes().to_vec();
+        let result = self.spawn_preflighted(nodes).await;
+        if result.is_err() {
+            let _ = self.shutdown_with(Duration::ZERO).await;
+        }
+        result
+    }
+
+    async fn spawn_preflighted(&mut self, nodes: Vec<ModuleNode>) -> NavStackResult<()> {
+        for node in nodes {
+            if matches!(node.kind, ModuleKind::NativeBridge) {
+                provision_native_node(&node).await.map_err(|reason| {
+                    NavStackError::NodeStartFailed {
+                        node: node.id.clone(),
+                        reason,
+                    }
+                })?;
+                let launch =
+                    launch_for(&node).ok_or_else(|| NavStackError::MissingRuntimeOwners {
+                        nodes: vec![format!("{} (native bridge has no executable)", node.id)],
+                    })?;
+                let process = self.process_factory.spawn(&launch).map_err(|source| {
+                    NavStackError::SpawnFailed {
+                        node: node.id.clone(),
+                        source,
+                    }
+                })?;
+                self.processes.insert(node.id, process);
                 continue;
             }
-            let Some(argv) = argv_for(node) else {
-                continue;
-            };
-            // 首项是 executable,后面全是 args
-            let (program, args) = argv.split_first().expect("argv non-empty");
-            let mut cmd = Command::new(program);
-            cmd.args(args);
-            cmd.stdout(Stdio::null());
-            cmd.stderr(Stdio::null());
-            cmd.kill_on_drop(true);
-            let child = cmd.spawn().map_err(|source| NavStackError::SpawnFailed {
-                node: node.id.clone(),
-                source,
-            })?;
-            self.handles.insert(node.id.clone(), child);
+
+            let factory = self
+                .in_process_factories
+                .get(&node.id)
+                .expect("ownership preflight guarantees a factory");
+            let mut owner =
+                factory
+                    .create(&node)
+                    .map_err(|source| NavStackError::NodeStartFailed {
+                        node: node.id.clone(),
+                        reason: source.to_string(),
+                    })?;
+            owner
+                .start()
+                .map_err(|source| NavStackError::NodeStartFailed {
+                    node: node.id.clone(),
+                    reason: source.to_string(),
+                })?;
+            self.in_process_nodes.insert(node.id, owner);
         }
         Ok(())
     }
 
-    /// 优雅关闭:SIGTERM(平台上是 `start_kill`,Windows 上等价 `TerminateProcess`)→
-    /// 5 秒等待 → 仍未退出的 SIGKILL(`kill().await`)。
-    ///
-    /// 等待时间可通过参数覆盖,便于测试。
+    /// Fail if any owned process or in-process node has stopped unexpectedly.
+    pub fn ensure_healthy(&mut self) -> NavStackResult<()> {
+        for (node, process) in &mut self.processes {
+            if process
+                .has_exited()
+                .map_err(|source| NavStackError::ProcessInspectionFailed {
+                    node: node.clone(),
+                    source,
+                })?
+            {
+                return Err(NavStackError::RuntimeNodeExited { node: node.clone() });
+            }
+        }
+        for (node, owner) in &mut self.in_process_nodes {
+            if !owner.is_running()? {
+                return Err(NavStackError::RuntimeNodeExited { node: node.clone() });
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop all in-process owners, terminate all children, and reap them.
     pub async fn shutdown_with(&mut self, grace: Duration) -> NavStackResult<()> {
-        // Phase 1:对每个 child 发 start_kill(best-effort,忽略单点错误)
-        for (_id, child) in self.handles.iter_mut() {
-            let _ = child.start_kill();
-        }
-        // Phase 2:等待 grace,期间 child 可能自然退出
-        tokio::time::sleep(grace).await;
-        // Phase 3:仍在跑的强制 kill
-        for (_id, child) in self.handles.iter_mut() {
-            if let Ok(None) = child.try_wait() {
-                let _ = child.kill().await;
+        let mut first_error = None;
+
+        for (node, mut owner) in self.in_process_nodes.drain() {
+            if let Err(source) = owner.shutdown() {
+                first_error.get_or_insert_with(|| NavStackError::ShutdownFailed {
+                    node,
+                    reason: source.to_string(),
+                });
             }
         }
-        Ok(())
+
+        let mut joins = tokio::task::JoinSet::new();
+        for (node, process) in self.processes.drain() {
+            joins.spawn(async move {
+                stop_process(process, grace)
+                    .await
+                    .map_err(|source| NavStackError::ShutdownFailed {
+                        node,
+                        reason: source.to_string(),
+                    })
+            });
+        }
+
+        while let Some(result) = joins.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| NavStackError::ShutdownFailed {
+                        node: "process-supervisor".to_string(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
-    /// 5 秒 grace 期 默认关闭。
+    /// Stop every owned node with a five-second grace period.
     pub async fn shutdown(&mut self) -> NavStackResult<()> {
         self.shutdown_with(Duration::from_secs(5)).await
     }
 }
 
-/// 计算单个 `ModuleNode` 的 argv(executable 首项 + 后续 args)。
-///
-/// 返回 `None` 表示本节点不需要 spawn(无 binary / 非 NativeBridge)。
+#[cfg(feature = "native-runner")]
+async fn provision_native_node(node: &ModuleNode) -> Result<(), String> {
+    let Some(summary) = node.native_spec.as_ref() else {
+        return Ok(());
+    };
+    summary
+        .spec
+        .validate()
+        .map_err(|error| format!("invalid native program spec: {error}"))?;
+    let Some(build) = summary.build.as_ref() else {
+        return Ok(());
+    };
+    let diagnostics = Arc::new(std::sync::Mutex::new(
+        nuwax_nav_native_runner::prelude::NativeProcessDiagnostics::new(node.id.clone()),
+    ));
+    nuwax_nav_native_runner::ensure_built(&summary.spec, build, &diagnostics)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "native-runner"))]
+async fn provision_native_node(_node: &ModuleNode) -> Result<(), String> {
+    Ok(())
+}
+
+async fn stop_process(
+    mut process: Box<dyn ManagedProcess>,
+    grace: Duration,
+) -> std::io::Result<()> {
+    if process.has_exited()? {
+        return Ok(());
+    }
+
+    if let Err(source) = process.request_shutdown() {
+        if !process.has_exited()? {
+            return Err(source);
+        }
+        return Ok(());
+    }
+
+    match tokio::time::timeout(grace, process.wait()).await {
+        Ok(result) => result,
+        Err(_) => {
+            if process.has_exited()? {
+                return Ok(());
+            }
+            if let Err(source) = process.force_kill().await {
+                if !process.has_exited()? {
+                    return Err(source);
+                }
+                return Ok(());
+            }
+            if process.has_exited()? {
+                Ok(())
+            } else {
+                process.wait().await
+            }
+        }
+    }
+}
+
+/// Render the executable, argv, environment, and cwd for a native graph node.
 #[must_use]
-pub fn argv_for(node: &ModuleNode) -> Option<Vec<String>> {
+pub fn launch_for(node: &ModuleNode) -> Option<ProcessLaunch> {
     if !matches!(node.kind, ModuleKind::NativeBridge) {
         return None;
     }
 
-    // typed native_spec 路径(cfg-gated `native-runner` feature 启用):
-    // argv = [executable, --port topic 字典序, ...config_args],与各 bridge
-    // `bridge.argv()` 完全一致。
     #[cfg(feature = "native-runner")]
-    {
-        if let Some(summary) = &node.native_spec {
-            let mut v = vec![summary.spec.executable.display().to_string()];
-            for (port, topic) in &summary.spec.topics {
-                v.push(format!("--{port}"));
-                v.push(topic.clone());
-            }
-            v.extend(summary.spec.args.iter().cloned());
-            return Some(v);
+    if let Some(summary) = &node.native_spec {
+        let mut args = Vec::with_capacity(summary.spec.topics.len() * 2 + summary.spec.args.len());
+        for (port, topic) in &summary.spec.topics {
+            args.push(format!("--{port}"));
+            args.push(topic.clone());
         }
+        args.extend(summary.spec.args.iter().cloned());
+        return Some(ProcessLaunch {
+            node_id: node.id.clone(),
+            program: summary.spec.executable.clone(),
+            args,
+            env: summary.spec.env.clone(),
+            cwd: summary.spec.cwd.clone(),
+        });
     }
 
-    // legacy 路径:仅有 binary 字符串,argv = [binary]
-    let binary = node.binary.as_deref()?;
-    Some(vec![binary.to_string()])
+    Some(ProcessLaunch {
+        node_id: node.id.clone(),
+        program: PathBuf::from(node.binary.as_deref()?),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        cwd: None,
+    })
+}
+
+/// Render a native node as `[executable, args...]`.
+#[must_use]
+pub fn argv_for(node: &ModuleNode) -> Option<Vec<String>> {
+    let launch = launch_for(node)?;
+    let mut argv = Vec::with_capacity(launch.args.len() + 1);
+    argv.push(launch.program.display().to_string());
+    argv.extend(launch.args);
+    Some(argv)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::ModuleGraph;
 
     #[test]
-    fn argv_for_returns_none_when_no_binary() {
+    fn argv_for_returns_none_for_non_native_node() {
         let node = ModuleNode::new("rust_only", "Rust", ModuleKind::RustAlgorithm);
         assert!(argv_for(&node).is_none());
     }
@@ -194,10 +508,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_from_empty_graph_has_no_native_bridges() {
+    async fn runner_from_empty_graph_has_no_owned_nodes() {
         let graph = ModuleGraph::new("simple-2d");
         let runner = StackRunner::from_graph(graph);
         assert!(runner.running_nodes().is_empty());
         assert!(runner.native_bridge_ids().is_empty());
+        assert!(runner.unowned_nodes().is_empty());
     }
 }

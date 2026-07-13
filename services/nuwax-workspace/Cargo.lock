@@ -465,6 +465,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "fdeflate"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
+dependencies = [
+ "simd-adler32",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -482,6 +491,12 @@ dependencies = [
  "num-traits",
  "typenum",
 ]
+
+[[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "flate2"
@@ -923,6 +938,7 @@ dependencies = [
  "byteorder-lite",
  "moxcms",
  "num-traits",
+ "png",
 ]
 
 [[package]]
@@ -1169,6 +1185,12 @@ dependencies = [
  "num-traits",
  "pxfm",
 ]
+
+[[package]]
+name = "multimap"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "nalgebra"
@@ -1507,6 +1529,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-motion-safety-guard"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pretty_assertions",
+ "prost",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic-build",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "nuwax-nav-astar"
 version = "0.1.0"
 dependencies = [
@@ -1617,12 +1657,17 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "approx",
+ "futures",
  "image",
  "imageproc",
+ "nuwax-codec",
+ "nuwax-protocol",
+ "nuwax-transport",
  "rayon",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "validator",
 ]
@@ -1716,6 +1761,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-nav-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nuwax-motion-safety-guard",
+ "nuwax-nav-astar",
+ "nuwax-nav-types-messages",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "nuwax-nav-simple-planner"
 version = "0.1.0"
 dependencies = [
@@ -1732,9 +1789,12 @@ name = "nuwax-nav-stack"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.0",
+ "futures",
+ "nuwax-codec",
  "nuwax-exploration",
  "nuwax-explore-tare-bridge",
  "nuwax-explore-terrain-bridge",
+ "nuwax-explore-wavefront",
  "nuwax-nav-astar",
  "nuwax-nav-base",
  "nuwax-nav-basic-path-follower",
@@ -1754,6 +1814,8 @@ dependencies = [
  "nuwax-nav-types-messages",
  "nuwax-nav-visual-query",
  "nuwax-nav-visual-servoing",
+ "nuwax-protocol",
+ "nuwax-transport",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -1826,13 +1888,19 @@ name = "nuwax-nav-visual-servoing"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "futures",
+ "nuwax-codec",
  "nuwax-nav-base",
  "nuwax-nav-types-messages",
  "nuwax-numeric",
+ "nuwax-protocol",
  "nuwax-tf",
+ "nuwax-transport",
  "pretty_assertions",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1868,6 +1936,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "nuwax-core",
+ "nuwax-lcm",
  "nuwax-types",
  "pretty_assertions",
  "serde",
@@ -1895,14 +1964,18 @@ name = "nuwax-tf"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "bytes",
  "chrono",
  "nalgebra 0.33.3",
+ "nuwax-codec",
+ "nuwax-lcm",
  "nuwax-numeric",
  "nuwax-types",
  "parking_lot",
  "pretty_assertions",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -2025,6 +2098,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "petgraph"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
+dependencies = [
+ "fixedbitset",
+ "indexmap",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2059,6 +2142,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "png"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
+dependencies = [
+ "bitflags 2.13.0",
+ "crc32fast",
+ "fdeflate",
+ "flate2",
+ "miniz_oxide",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2084,6 +2180,16 @@ checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
 dependencies = [
  "diff",
  "yansi",
+]
+
+[[package]]
+name = "prettyplease"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -2158,6 +2264,58 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-build"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
+dependencies = [
+ "heck",
+ "itertools 0.12.1",
+ "log",
+ "multimap",
+ "once_cell",
+ "petgraph",
+ "prettyplease",
+ "prost",
+ "prost-types",
+ "regex",
+ "syn 2.0.118",
+ "tempfile",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.12.1",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "prost-types"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
+dependencies = [
+ "prost",
 ]
 
 [[package]]
@@ -2936,6 +3094,20 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tonic-build"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9557ce109ea773b399c9b9e5dca39294110b74f1f342cb347a80d1fce8c26a11"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "prost-build",
+ "prost-types",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]

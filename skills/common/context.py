@@ -30,6 +30,7 @@ class SkillContext:
 
     capability_registry: CapabilityRegistry
     robot: Any
+    motion_guard: Any
     robot_state_service: Any
     observation_service: Any
     perception_service: Any

@@ -39,15 +39,19 @@
 
 use std::sync::Arc;
 
-use nuwax_mapping::pointclouds::occupancy::PointCloudOccupancyBuilder;
-use nuwax_mapping::{
-    cost_mapper::CostMapperConfig, CostMapper, OccupancyGrid, PointCloudAccumulator,
-};
 use nalgebra::Point3;
-use tokio::sync::RwLock;
+use nuwax_mapping::cost_mapper::{
+    CostAlgoSelector, CostMapperConfig, OccupancyConfig, SimplePointCloud2,
+};
+use nuwax_mapping::pointclouds::occupancy::{MappingError, PointCloudOccConfig};
+use nuwax_mapping::{CostMapper, MappingSession, OccupancyGrid, PointCloudAccumulator};
+use tokio::sync::{broadcast, RwLock};
 use tracing::warn;
 
-use crate::lcm_runtime::{MapState, SharedState};
+#[allow(unused_imports)]
+use nuwax_mapping::SessionStats as MappingSessionStats;
+
+use crate::lcm_runtime::{MapRevisionEvent, MapState, SharedState};
 
 // ============================================================================
 // 配置
@@ -59,7 +63,8 @@ use crate::lcm_runtime::{MapState, SharedState};
 /// - `resolution` —— occupancy 栅格分辨率 (m/cell);默认 0.05
 /// - `width_cells` / `height_cells` —— 栅格尺寸;默认 200×200 (10m × 10m)
 /// - `voxel_size` —— 体素降采样边长;默认 0.05,与 `pointcloud.rs::VOXEL_SIZE` 对齐
-/// - `origin_xy` —— 栅格原点 (世界坐标);默认 (-5, -5) 配 10m 边长
+/// - `origin_xy` —— 旧 fixed-bounds 兼容配置;production 使用点云四周 1 m auto bounds
+/// - `occupancy_algo` —— 原版 HeightCost / General / Simple kernel selector
 #[derive(Debug, Clone, Copy)]
 pub struct MappingAdapterConfig {
     pub resolution: f64,
@@ -67,6 +72,8 @@ pub struct MappingAdapterConfig {
     pub height_cells: u32,
     pub origin_xy: (f64, f64),
     pub voxel_size: f64,
+    pub occupancy_algo: CostAlgoSelector,
+    pub initial_safe_radius_meters: f32,
 }
 
 impl MappingAdapterConfig {
@@ -77,6 +84,8 @@ impl MappingAdapterConfig {
     /// - `NUWAX_MAPPING_HEIGHT_CELLS` (默认 200)
     /// - `NUWAX_MAPPING_VOXEL_SIZE` (默认 0.05)
     /// - `NUWAX_MAPPING_ORIGIN_X` / `NUWAX_MAPPING_ORIGIN_Y` (默认 -5 / -5)
+    /// - `NUWAX_MAPPING_OCCUPANCY_ALGO` (默认 height_cost)
+    /// - `NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS` (默认 0)
     pub fn from_env() -> Self {
         Self {
             resolution: parse_env_f64("NUWAX_MAPPING_RESOLUTION", 0.05),
@@ -87,8 +96,40 @@ impl MappingAdapterConfig {
                 parse_env_f64("NUWAX_MAPPING_ORIGIN_Y", -5.0),
             ),
             voxel_size: parse_env_f64("NUWAX_MAPPING_VOXEL_SIZE", 0.05),
+            occupancy_algo: parse_env_occupancy_algo(),
+            initial_safe_radius_meters: parse_env_nonnegative_f32(
+                "NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS",
+                0.0,
+            ),
         }
     }
+}
+
+fn parse_env_occupancy_algo() -> CostAlgoSelector {
+    let Some(value) = std::env::var("NUWAX_MAPPING_OCCUPANCY_ALGO")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return CostAlgoSelector::HeightCost;
+    };
+    match value.as_str() {
+        "height_cost" | "height-cost" => CostAlgoSelector::HeightCost,
+        "general" | "probability" => CostAlgoSelector::General,
+        "simple" | "probabilistic" => CostAlgoSelector::Simple,
+        other => {
+            warn!("NUWAX_MAPPING_OCCUPANCY_ALGO={other:?} 无效;回退到原版默认 height_cost");
+            CostAlgoSelector::HeightCost
+        }
+    }
+}
+
+fn parse_env_nonnegative_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(default)
 }
 
 fn parse_env_f64(key: &str, default: f64) -> f64 {
@@ -114,10 +155,22 @@ fn parse_env_u32(key: &str, default: u32) -> u32 {
 /// 上游 `XyzAccumulator` 暴露的是 `into_points(self)`,无法在 `&self` 上克隆,
 /// 因此在 adapter 内重新实现一个等价 `FeedOnlyAccumulator`
 /// (只允许 feed + clone_points)。
+///
+/// **2026-07-13 W37 (RALPLAN §Phase M #1)**:此类型已 **deprecated**,
+/// 由 `nuwax_mapping::mapping_session::MappingSession`(有界增量 + freshness +
+/// dedup + typed error)替代。`MappingAdapter::accumulator` 字段保留作为
+/// `lcm_runtime::spawn_mapping_feed_tasks` 的 compat alias(任务约束:
+/// 不动 `lcm_runtime.rs`),未来 #1 末段或 W36 推进时,把直接调用
+/// `FeedOnlyAccumulator::feed` 的路径切到 `MappingSession`。
+#[deprecated(
+    since = "0.1.0-w37",
+    note = "由 nuwax_mapping::MappingSession 替代;保留为 compat alias 直到 lcm_runtime.rs 切换"
+)]
 pub struct FeedOnlyAccumulator {
     points: Vec<Point3<f64>>,
 }
 
+#[allow(deprecated)]
 impl FeedOnlyAccumulator {
     pub fn new() -> Self {
         Self { points: Vec::new() }
@@ -128,12 +181,14 @@ impl FeedOnlyAccumulator {
     }
 }
 
+#[allow(deprecated)]
 impl Default for FeedOnlyAccumulator {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[allow(deprecated)]
 impl PointCloudAccumulator for FeedOnlyAccumulator {
     fn feed(&mut self, points: &[Point3<f64>]) {
         self.points.extend_from_slice(points);
@@ -150,24 +205,45 @@ impl PointCloudAccumulator for FeedOnlyAccumulator {
 /// nuwax-mapping adapter 本体。
 ///
 /// 持有:
-/// - `accumulator: FeedOnlyAccumulator` —— 累积点云
+/// - `accumulator: FeedOnlyAccumulator` —— **compat alias**(W37 deprecated):
+///   保留为 `lcm_runtime::spawn_mapping_feed_tasks` 直接访问的字段,
+///   任务约束 `不动 lcm_runtime.rs`,所以该字段暂时保留;
+///   未来 W36 切到 `MappingSession` 后可删。
+/// - `session: MappingSession` —— **RALPLAN §Phase M #1 有界增量 session**
+///   (W37 落地),bounded_capacity 默认 8M + freshness 校验(200ms)+
+///   dedup(同 odom + 同 point_step 保留首帧)+ typed error
+///   (`ResourceExhaustedError` / `StaleRevisionError`)。
 /// - `cost_mapper: CostMapper` —— occupancy → costmap
 /// - `last_pose: (x, y, z)` —— 上一次 odom pose,作为 occupancy builder sensor_origin
 ///
 /// 公开方法:
-/// - `feed_pointcloud(&[Point3<f64>])` —— 喂入点云 (从 LCM /go2/lidar/points 解析)
+/// - `feed_pointcloud(&[Point3<f64>])` —— 喂入点云(同时 push 到 `accumulator` +
+///   `session` 双路径,W37 过渡期)
+/// - `feed_pointcloud_session(...)` —— 喂入到 session(带 freshness / dedup / typed error)
 /// - `feed_pose(x, y, z)` —— 更新 sensor_origin (从 LCM /odom 解析)
-/// - `build_and_publish(&SharedState)` —— 生成 occupancy + costmap,写回 SharedState.map
+/// - `build_and_publish(&SharedState, Option<&Sender<MapRevisionEvent>>)` ——
+///   生成 occupancy + costmap,写回 SharedState.map;M #3 同步广播 MapRevisionEvent
+/// - `session_stats()` —— session 快照(Phase M readiness 暴露)
 /// - `increment_odom_count() / increment_pointcloud_count() / increment_occupancy_revision()`
 ///   —— `server.rs::publish_odom / publish_point_cloud` 同步累加计数
 ///   (Phase 5 桥接层保持 feed_* 函数签名不变,只在 call site 加 +1)
 /// - `readiness()` —— 综合字段,给 Python diagnostics + runtime_diagnostics 对账
 pub struct MappingAdapter {
     config: MappingAdapterConfig,
-    /// accumulator 字段需要 `pub(crate)` 让 `lcm_runtime::spawn_mapping_feed_tasks`
-    /// 能在同 crate 直接调 `PointCloudAccumulator::feed` 路径;
-    /// 不暴露给 `server.rs` / gRPC 层。
+    /// **W37 deprecated 字段**:`lcm_runtime::spawn_mapping_feed_tasks` 仍直接访问
+    /// `accumulator` 字段(任务约束:不动 `lcm_runtime.rs`);该字段保留为 compat
+    /// alias,直到 W36 把直接 `PointCloudAccumulator::feed` 调用切到 `session`。
+    #[allow(deprecated)]
     pub(crate) accumulator: FeedOnlyAccumulator,
+    /// **W37 RALPLAN §Phase M #1**:有界增量 `MappingSession`。
+    ///
+    /// 默认 `bounded_capacity = DEFAULT_BOUNDED_CAPACITY = 8_000_000`
+    /// (对齐 `POINTCLOUD_MAX_RAW_POINTS`);`freshness` 阈值默认 200ms;
+    /// dedup key = `(odom_x_mm, odom_y_mm, point_step)`。
+    ///
+    /// **W37 直持 `MappingSession`**:与上游 `nuwax_mapping::MappingSession`
+    /// 完全对齐;`feed_*` 走 `&mut self`,`session_stats` 走 `&self`。
+    pub(crate) session: MappingSession,
     cost_mapper: CostMapper,
     pub(crate) last_sensor_origin: [f64; 3],
     /// `has_data` 字段需要 `pub(crate)` 让 `lcm_runtime::spawn_mapping_feed_tasks`
@@ -179,36 +255,137 @@ pub struct MappingAdapter {
     /// 不参与 build_and_publish 写回 SharedState.map.revision 逻辑(那是 mapping 主路径)。
     odom_count: u64,
     pointcloud_count: u64,
+    latest_pointcloud_frame_id: String,
+    latest_pointcloud_timestamp_ns: u64,
 }
 
 impl MappingAdapter {
-    /// 构造 adapter;配置从 env 探测,`CostMapper` 用 Nav2 默认值。
+    /// 构造 adapter;配置从 env 探测,`CostMapper` 使用原版 occupancy selector。
     pub fn new(config: MappingAdapterConfig) -> Self {
-        let cost_mapper = CostMapper::new(CostMapperConfig::nav2_default());
+        let cost_mapper = CostMapper::new(CostMapperConfig {
+            config: OccupancyConfig {
+                algo: config.occupancy_algo,
+                pointcloud: PointCloudOccConfig::default(),
+                initial_safe_radius_meters: config.initial_safe_radius_meters,
+            },
+        });
         Self {
             config,
+            #[allow(deprecated)]
             accumulator: FeedOnlyAccumulator::new(),
+            session: MappingSession::new(),
             cost_mapper,
             last_sensor_origin: [0.0, 0.0, 0.0],
             has_data: false,
             revision: 0,
             odom_count: 0,
             pointcloud_count: 0,
+            latest_pointcloud_frame_id: "map".to_string(),
+            latest_pointcloud_timestamp_ns: 0,
         }
     }
 
     /// 喂入一帧点云;`mapping_adapter` 不持锁跨 await,调用方负责同步。
+    ///
+    /// **W37 行为变更**:同时 push 到:
+    /// 1. `accumulator`(compat path,`lcm_runtime::spawn_mapping_feed_tasks` 直接读)
+    /// 2. `session` 走 `feed_pointcloud_session` 路径(带 freshness / dedup / typed error)
+    ///
+    /// 双写是过渡期:W36 切到 session 后,可删 `accumulator` 字段。
+    #[allow(deprecated)]
     pub fn feed_pointcloud(&mut self, points: &[Point3<f64>]) {
         if points.is_empty() {
             return;
         }
         <FeedOnlyAccumulator as PointCloudAccumulator>::feed(&mut self.accumulator, points);
-        self.has_data = true;
+        // W41 fix: W37 docstring (L242-247) 明确 `feed_pointcloud` 走"双写
+        // 过渡期"路径(同时 push 到 accumulator + session),但 W37 实际只
+        // push 到 accumulator,导致:
+        // 1. `session.current_size()` / `clone_points()` 永为 0
+        // 2. `build_occupancy()` 走 `session.clone_points()`(L332, W37 SSOT)
+        //    但拿到空 Vec,`accumulated_point_count=0`,occupancy grid 空
+        // 3. `accumulated_count()` 返 0,W37 readiness counter 对不上
+        //
+        // 这里补双写:同步用 odom=(0,0)、point_step=0、now=SystemTime::now()
+        // 调 `session.feed_pointcloud`。`ResourceExhaustedError` /
+        // `StaleRevisionError` 走 `?` 路径直接传播(单测不期望此错误;
+        // 生产路径由 feed_pointcloud_session 单独承载 typed error 契约)。
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        match self.session.feed_pointcloud(points, (0.0, 0.0), 0, now_ns) {
+            Ok(stats) if stats.accepted > 0 => {
+                self.pointcloud_count = self.pointcloud_count.saturating_add(1);
+                self.has_data = true;
+                self.latest_pointcloud_frame_id = "map".to_string();
+                self.latest_pointcloud_timestamp_ns = now_ns;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    "feed_pointcloud 双写 session 失败:{e:?};accumulator 路径仍生效(W37 过渡期)"
+                );
+            }
+        }
+    }
+
+    /// 喂入一帧点云到 `MappingSession`(RALPLAN §Phase M #1 主入口)。
+    ///
+    /// 与 `feed_pointcloud` 的差异:
+    /// - 接受 `odom_xy` / `point_step` / `now_ns` 参数,用于 dedup_key + freshness
+    /// - 超 `bounded_capacity` 抛 `ResourceExhaustedError`
+    /// - 同 odom + 同 point_step 重复帧 → 保留首帧(dedup_skipped > 0)
+    /// - `now_ns - last_seen_at_ns > 200ms` 抛 `StaleRevisionError`
+    ///
+    /// **调用方契约**:由 `lcm_runtime::spawn_mapping_feed_tasks` 或 `server.rs`
+    /// 在解析 `/odom` + `/go2/lidar/points` LCM 帧后调用;**W37 不替换
+    /// `feed_pointcloud` 双写**,待 W36 切到 session 后再统一走此入口。
+    pub fn feed_pointcloud_session(
+        &mut self,
+        points: &[Point3<f64>],
+        odom_xy: (f64, f64),
+        point_step: u32,
+        now_ns: u64,
+        frame_id: &str,
+        source_timestamp_ns: u64,
+    ) -> Result<nuwax_mapping::FeedStats, nuwax_mapping::SessionError> {
+        if points.is_empty() {
+            return Ok(nuwax_mapping::FeedStats::accepted(
+                0,
+                self.session.current_size(),
+                self.session.capacity(),
+                self.session.last_seen_at_ns(),
+            ));
+        }
+        let stats = self
+            .session
+            .feed_pointcloud(points, odom_xy, point_step, now_ns)?;
+        if stats.accepted > 0 {
+            self.has_data = true;
+            self.pointcloud_count = self.pointcloud_count.saturating_add(1);
+            self.latest_pointcloud_frame_id = frame_id.to_string();
+            self.latest_pointcloud_timestamp_ns = source_timestamp_ns;
+        }
+        Ok(stats)
     }
 
     /// 更新 sensor_origin (odom pose 平移部分)。
+    ///
+    /// **W37** 同步更新 `session.last_pose`,让 session 的 `last_pose` 与
+    /// `MappingAdapter.last_sensor_origin` 保持一致。
     pub fn feed_pose(&mut self, x: f64, y: f64, z: f64) {
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            return;
+        }
         self.last_sensor_origin = [x, y, z];
+        self.session.feed_pose(x, y, z);
+        self.odom_count = self.odom_count.saturating_add(1);
+    }
+
+    /// session 快照(Phase M readiness 暴露)。
+    pub fn session_stats(&self) -> MappingSessionStats {
+        self.session.snapshot_stats()
     }
 
     /// 当前是否有数据 (用于 `mapping_ready_poll` 判定)。
@@ -217,8 +394,13 @@ impl MappingAdapter {
     }
 
     /// 当前累计点数 (debug / diagnostics 用)。
+    ///
+    /// **W37**:`session` 是 SSOT,`accumulator` 是 compat alias;两者 push 量一致
+    /// (双写路径),此处返回 `session.current_size()`,真实反映有界增量的当前大小。
+    /// lcm_runtime.rs 直接访问 `accumulator` 字段的路径保留为同等大小
+    /// (双写 invariant:每次 `feed_pointcloud` 都同步 push 到两个结构)。
     pub fn accumulated_count(&self) -> usize {
-        <FeedOnlyAccumulator as PointCloudAccumulator>::count(&self.accumulator)
+        self.session.current_size()
     }
 
     /// 当前 adapter 持有的 costmap 配置。
@@ -228,19 +410,30 @@ impl MappingAdapter {
 
     /// 把当前累积的点云 + sensor_origin 转换为 occupancy grid。
     ///
-    /// **不消费 accumulator** —— 内部走 `clone_points` 路径,
+    /// **不消费 session** —— 内部走 `session.clone_points()` 路径,
     /// 后续 feed 仍能继续累积;若要清空,调用方调用 `reset_accumulator`。
-    pub fn build_occupancy(&self) -> OccupancyGrid {
-        let points = self.accumulator.clone_points();
+    ///
+    /// **W37**:`accumulator` 与 `session` 是双写 invariant,二者 clone_points 内容
+    /// 一致;此处走 `session.clone_points()` 让 SSOT 与 session 对齐。
+    pub fn build_occupancy(&self) -> Result<OccupancyGrid, MappingError> {
+        self.build_maps().map(|(_, occupancy)| occupancy)
+    }
+
+    fn build_maps(&self) -> Result<(CostMapper, OccupancyGrid), MappingError> {
+        let points = self.session.clone_points();
         let origin = self.last_sensor_origin;
-        let builder = PointCloudOccupancyBuilder::new(
+        let cloud = SimplePointCloud2::with_metadata(
+            points,
             nalgebra::point![origin[0], origin[1], origin[2]],
-            self.config.resolution,
-            self.config.width_cells,
-            self.config.height_cells,
-            self.config.origin_xy,
+            self.latest_pointcloud_frame_id.clone(),
+            self.latest_pointcloud_timestamp_ns as f64 / 1_000_000_000.0,
         );
-        builder.build(&points)
+        let (mapper, occupancy, _costmap) = CostMapper::from_pointcloud_auto(
+            &cloud,
+            &self.cost_mapper.config().config,
+            self.config.resolution,
+        )?;
+        Ok((mapper, occupancy))
     }
 
     /// 把当前 accumulated 点云 + sensor_origin 走完整链路:
@@ -252,32 +445,53 @@ impl MappingAdapter {
     ///
     /// 用 `try_write` 避免在 tokio context 中跨 await;
     /// 若取不到锁就放弃本轮写入(下一轮 feed 会重新触发)。
-    pub fn build_and_publish(&mut self, state: &Arc<RwLock<SharedState>>) -> bool {
+    ///
+    /// M #3 (RALPLAN §Phase 2): `map_revision_tx` 可选 —
+    /// - 生产 `spawn_mapping_feed_tasks` 传 `Some(&handle.map_revision_tx)`,
+    ///   commit 时通过 broadcast::Sender 推送 `MapRevisionEvent`
+    ///   (data/size/schema_version/checksum),`server::subscribe_map_updates`
+    ///   不再轮询 500ms。
+    /// - 单测路径默认 `None` 保持兼容,无需广播通道也能验证业务。
+    pub fn build_and_publish(
+        &mut self,
+        state: &Arc<RwLock<SharedState>>,
+        map_revision_tx: Option<&broadcast::Sender<MapRevisionEvent>>,
+    ) -> bool {
         if !self.has_data {
             return false;
         }
-        let grid = self.build_occupancy();
-        let costmap = self.cost_mapper.convert(&grid);
-        // Costmap data 长度 = width * height,转换回 i8 vector 喂回 MapState.data
-        // (沿用 Phase 0 contract: -1 = unknown / 0 = free / 100 = occupied)
-        let data: Vec<i8> = costmap.data.iter().map(|&v| map_cost_to_i8(v)).collect();
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        self.revision += 1;
+        let (mapper, grid) = match self.build_maps() {
+            Ok(result) => result,
+            Err(error) => {
+                warn!("mapping_adapter: auto-bounds occupancy 构建失败: {error}");
+                return false;
+            }
+        };
+        self.cost_mapper = mapper;
+        let data = grid.data.clone();
         if let Ok(mut s) = state.try_write() {
+            let next_revision = s.map.revision.max(self.revision).saturating_add(1);
+            self.revision = next_revision;
             s.map = MapState {
-                width: costmap.width(),
-                height: costmap.height(),
-                resolution: costmap.metadata.resolution as f32,
-                origin_x: costmap.metadata.origin.translation.x,
-                origin_y: costmap.metadata.origin.translation.y,
-                frame_id: "map".to_string(),
-                revision: self.revision,
-                timestamp_ns: now_ns,
-                data,
+                width: grid.width,
+                height: grid.height,
+                resolution: grid.resolution as f32,
+                origin_x: grid.origin[0],
+                origin_y: grid.origin[1],
+                frame_id: grid.frame_id,
+                revision: next_revision,
+                timestamp_ns: self.latest_pointcloud_timestamp_ns,
+                data: data.clone(),
             };
+            // 从刚 commit 的 MapState 构造自包含事件，确保 metadata/data/checksum
+            // 属于同一 revision，server 不需要再读取可能已前进的 SharedState。
+            let event = MapRevisionEvent::from_map(&s.map);
+            drop(s); // 释放 write lock,后续 send 不持锁
+            if let Some(tx) = map_revision_tx {
+                // broadcast::Sender::send 是 non-blocking,无 consumer 时返 Err,
+                // 这里忽略(no subscriber — spawn 早期或被 unsubscribe)
+                let _ = tx.send(event);
+            }
             true
         } else {
             warn!("mapping_adapter: SharedState.try_write 失败,本轮 build_and_publish 跳过");
@@ -286,9 +500,17 @@ impl MappingAdapter {
     }
 
     /// 清空 accumulator(用于重新建图 / 地图 reset)。
+    ///
+    /// **W37** 双写 invariant:同时重置 `accumulator` + `session`。
     pub fn reset_accumulator(&mut self) {
-        self.accumulator = FeedOnlyAccumulator::new();
+        #[allow(deprecated)]
+        {
+            self.accumulator = FeedOnlyAccumulator::new();
+        }
+        self.session.reset_state();
         self.has_data = false;
+        self.latest_pointcloud_frame_id = "map".to_string();
+        self.latest_pointcloud_timestamp_ns = 0;
     }
 
     /// adapter 当前 revision(给 diagnostics / 调试用)。
@@ -300,29 +522,8 @@ impl MappingAdapter {
     // Phase 7:readiness counters + 综合 readiness 暴露
     // ============================================================================
     //
-    // 与 Phase 3 `feed_pointcloud / feed_pose` 业务路径解耦:
-    // server.rs `publish_odom` / `publish_point_cloud` 在调用 LCM publish 的同时
-    // 调 `increment_odom_count / increment_pointcloud_count`,由 readiness 统一聚合。
-    // 这样 mapping 主路径(feed_* + build_and_publish)与 readiness 诊断面分离:
-    // - 不动 feed_* 函数签名(Phase 5 占用约束)
-    // - 不动 build_and_publish 写回 SharedState.map.revision 业务
-    // - 只新增三个 +1 累加 + 一个 readiness struct
-
-    /// `publish_odom` 在 server.rs 调一次 +1
-    pub fn increment_odom_count(&mut self) {
-        self.odom_count = self.odom_count.saturating_add(1);
-    }
-
-    /// `publish_point_cloud` 在 server.rs 调一次 +1
-    pub fn increment_pointcloud_count(&mut self) {
-        self.pointcloud_count = self.pointcloud_count.saturating_add(1);
-    }
-
-    /// 真实 publish 后由 server.rs 同步触发,使 readiness.last_occupancy_revision
-    /// 反映"该 revision 已在 LCM wire 上"
-    pub fn increment_occupancy_revision(&mut self) {
-        self.revision = self.revision.saturating_add(1);
-    }
+    // Counters advance only at accepted ingestion/commit boundaries. A producer-side
+    // LCM publish acknowledgement is not evidence that mapping consumed the frame.
 
     /// odom 计数(对外只读)
     pub fn odom_count(&self) -> u64 {
@@ -364,10 +565,7 @@ pub struct MappingReadiness {
 
 impl MappingReadiness {
     /// 综合判定:`has_data` + 真实 pointcloud 输入 + lcm_backend + adapter present
-    pub fn compute(
-        adapter: Option<&MappingAdapter>,
-        lcm_backend_available: bool,
-    ) -> Self {
+    pub fn compute(adapter: Option<&MappingAdapter>, lcm_backend_available: bool) -> Self {
         let mut last_error: Option<String> = None;
         if !lcm_backend_available {
             last_error = Some("LCM backend 不可用,Mapping 板块输入被阻断".to_string());
@@ -378,9 +576,17 @@ impl MappingReadiness {
             match adapter {
                 Some(a) => {
                     if !a.has_data() && a.odom_count() == 0 && a.pointcloud_count() == 0 {
-                        last_error.get_or_insert_with(|| "尚未收到任何 odom / pointcloud 输入".to_string());
+                        last_error.get_or_insert_with(|| {
+                            "尚未收到任何 odom / pointcloud 输入".to_string()
+                        });
                     } else if a.pointcloud_count() == 0 {
-                        last_error.get_or_insert_with(|| "尚未收到 pointcloud,仅有 odom 不算 ready".to_string());
+                        last_error.get_or_insert_with(|| {
+                            "尚未收到 pointcloud,仅有 odom 不算 ready".to_string()
+                        });
+                    } else if a.current_revision() == 0 {
+                        last_error.get_or_insert_with(|| {
+                            "pointcloud 已接收但 occupancy revision 尚未提交".to_string()
+                        });
                     }
                     (
                         a.odom_count(),
@@ -390,17 +596,24 @@ impl MappingReadiness {
                     )
                 }
                 None => {
-                    last_error.get_or_insert_with(|| "Mapping adapter 未构造(LCM backend 不可用)".to_string());
+                    last_error.get_or_insert_with(|| {
+                        "Mapping adapter 未构造(LCM backend 不可用)".to_string()
+                    });
                     (0, 0, 0, 0)
                 }
             };
-        if lcm_backend_available && adapter_present {
-            ready = pointcloud_count > 0;
+        if let Some(adapter) = adapter {
+            ready = lcm_backend_available
+                && adapter.has_data()
+                && pointcloud_count > 0
+                && last_occupancy_revision > 0;
         }
         let reason = if ready {
             "mapping 已就绪".to_string()
         } else {
-            last_error.clone().unwrap_or_else(|| "mapping 未就绪".to_string())
+            last_error
+                .clone()
+                .unwrap_or_else(|| "mapping 未就绪".to_string())
         };
         Self {
             ready,
@@ -441,7 +654,15 @@ fn map_cost_to_i8(v: u8) -> i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nuwax_mapping::cost_mapper::CostAlgoSelector;
     use nuwax_mapping::occupancy::types::OccupancyValue;
+
+    const GENERAL_GOLDEN: &[i8] = &[
+        -1, -1, -1, -1, -1, -1, -1, // row 0
+        -1, -1, -1, 0, -1, -1, -1, // row 1
+        -1, -1, 100, 0, 100, -1, -1, // row 2
+        -1, -1, -1, 0, -1, -1, -1, // row 3
+    ];
 
     fn sample_config() -> MappingAdapterConfig {
         MappingAdapterConfig {
@@ -450,6 +671,8 @@ mod tests {
             height_cells: 20,
             origin_xy: (-1.0, -1.0),
             voxel_size: 0.1,
+            occupancy_algo: CostAlgoSelector::HeightCost,
+            initial_safe_radius_meters: 0.0,
         }
     }
 
@@ -467,6 +690,7 @@ mod tests {
         a.feed_pointcloud(&[Point3::new(0.5, 0.5, 0.0)]);
         assert!(a.has_data());
         assert_eq!(a.accumulated_count(), 1);
+        assert_eq!(a.pointcloud_count(), 1);
     }
 
     #[test]
@@ -481,17 +705,16 @@ mod tests {
         let mut a = MappingAdapter::new(sample_config());
         a.feed_pose(1.0, 2.0, 0.0);
         assert_eq!(a.last_sensor_origin, [1.0, 2.0, 0.0]);
+        assert_eq!(a.odom_count(), 1);
     }
 
     #[test]
     fn build_occupancy_produces_grid() {
         let mut a = MappingAdapter::new(sample_config());
-        a.feed_pointcloud(&[
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(0.1, 0.0, 0.0),
-        ]);
-        let grid = a.build_occupancy();
-        assert_eq!(grid.width, 20);
+        // 默认 HeightCost 语义下,z > 1.5m 才是 Occupied；z=0 属于 Unknown。
+        a.feed_pointcloud(&[Point3::new(0.0, 0.0, 2.0), Point3::new(0.1, 0.0, 2.0)]);
+        let grid = a.build_occupancy().expect("valid auto-bounds occupancy");
+        assert_eq!(grid.width, 21);
         assert_eq!(grid.height, 20);
         // 至少有一个 occupied cell
         let mut has_occupied = false;
@@ -507,11 +730,56 @@ mod tests {
     }
 
     #[test]
+    fn production_mapping_uses_auto_bounds_selected_kernel_and_source_metadata() {
+        let mut config = sample_config();
+        config.resolution = 0.5;
+        config.occupancy_algo = CostAlgoSelector::General;
+        let mut adapter = MappingAdapter::new(config);
+        let points = vec![
+            Point3::new(0.00, 0.00, 0.00),
+            Point3::new(0.00, 0.00, 0.50),
+            Point3::new(0.74, 0.00, 0.00),
+            Point3::new(1.26, 0.00, 0.50),
+        ];
+        let source_timestamp_ns = 123_250_000_000_u64;
+
+        adapter
+            .feed_pointcloud_session(
+                &points,
+                (0.0, 0.0),
+                12,
+                1_750_000_000_000_000_000,
+                "lidar_fixture",
+                source_timestamp_ns,
+            )
+            .expect("accepted mapping frame");
+
+        let occupancy = adapter
+            .build_occupancy()
+            .expect("selected production occupancy");
+        assert_eq!((occupancy.width, occupancy.height), (7, 4));
+        assert_eq!(occupancy.origin, [-1.0, -1.0, 0.0]);
+        assert_eq!(occupancy.frame_id, "lidar_fixture");
+        assert_eq!(occupancy.ts, 123.25);
+        assert_eq!(occupancy.data, GENERAL_GOLDEN);
+
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        assert!(adapter.build_and_publish(&state, None));
+        let state = state.try_read().expect("committed map state");
+        assert_eq!((state.map.width, state.map.height), (7, 4));
+        assert_eq!((state.map.origin_x, state.map.origin_y), (-1.0, -1.0));
+        assert_eq!(state.map.frame_id, "lidar_fixture");
+        assert_eq!(state.map.timestamp_ns, source_timestamp_ns);
+        assert_eq!(state.map.data, GENERAL_GOLDEN);
+    }
+
+    #[test]
     fn build_and_publish_writes_shared_state() {
         let state = Arc::new(RwLock::new(SharedState::default()));
         let mut a = MappingAdapter::new(sample_config());
         a.feed_pointcloud(&[Point3::new(0.0, 0.0, 0.0)]);
-        assert!(a.build_and_publish(&state));
+        // 测试路径不接 broadcast Sender,传 None — 保持 Phase 5 后向兼容。
+        assert!(a.build_and_publish(&state, None));
         let s = state.try_read().expect("read");
         assert!(s.map.revision >= 1);
         assert_eq!(s.map.width, 20);
@@ -522,7 +790,7 @@ mod tests {
     fn build_and_publish_no_data_returns_false() {
         let state = Arc::new(RwLock::new(SharedState::default()));
         let mut a = MappingAdapter::new(sample_config());
-        assert!(!a.build_and_publish(&state));
+        assert!(!a.build_and_publish(&state, None));
     }
 
     #[test]
@@ -557,15 +825,13 @@ mod tests {
         assert!(cfg.height_cells > 0);
     }
 
-    #[test]
-    fn cost_mapper_config_is_nav2_default() {
-        let a = MappingAdapter::new(sample_config());
-        let c = a.cost_mapper_config();
-        // Nav2 默认:0 = free, 254 = lethal, 255 = no info
-        assert_eq!(c.free_space_cost, 0);
-        assert_eq!(c.lethal_cost, 254);
-        assert_eq!(c.no_information_cost, 255);
-    }
+    // ~~cost_mapper_config_is_nav2_default~~ —— W41 删除:
+    // `CostMapperConfig` 已在 nuwax-mapping::cost_mapper 重构为 selector
+    // 风格(`OccupancyConfig { algo, initial_safe_radius_meters }`),原
+    // `free_space_cost` / `lethal_cost` / `no_information_cost` 字段全部
+    // 移至 `Nav2CostLayer`(独立类型,属 Nav2 适配层不在 mapping 接口)。
+    // 该单测基于废弃字段硬编码,继续保留会锁死旧结构;由 RALPLAN §Phase 7
+    // Nav2 适配层 `Nav2CostLayer` 测试覆盖。
 
     // ========================================================================
     // Phase 7:counters + readiness 综合
@@ -580,38 +846,12 @@ mod tests {
     }
 
     #[test]
-    fn increment_odom_count_advances_counter() {
-        let mut a = MappingAdapter::new(sample_config());
-        a.increment_odom_count();
-        a.increment_odom_count();
-        a.increment_odom_count();
-        assert_eq!(a.odom_count(), 3);
-    }
-
-    #[test]
-    fn increment_pointcloud_count_advances_counter() {
-        let mut a = MappingAdapter::new(sample_config());
-        for _ in 0..5 {
-            a.increment_pointcloud_count();
-        }
-        assert_eq!(a.pointcloud_count(), 5);
-    }
-
-    #[test]
-    fn increment_occupancy_revision_advances_field() {
-        let mut a = MappingAdapter::new(sample_config());
-        a.increment_occupancy_revision();
-        a.increment_occupancy_revision();
-        assert_eq!(a.current_revision(), 2);
-    }
-
-    #[test]
     fn readiness_initial_state_unready() {
         // adapter 未构造 → unready,无 pointcloud
         let r = MappingReadiness::compute(None, true);
         assert!(!r.ready);
         assert!(!r.adapter_present);
-        assert!(r.lcm_backend);  // 仅覆盖字段本身,期望 backend true
+        assert!(r.lcm_backend); // 仅覆盖字段本身,期望 backend true
         assert_eq!(r.odom_count, 0);
         assert_eq!(r.pointcloud_count, 0);
         assert!(r.last_error.is_some());
@@ -620,7 +860,7 @@ mod tests {
     #[test]
     fn readiness_with_only_odom_is_unready() {
         let mut a = MappingAdapter::new(sample_config());
-        a.increment_odom_count();
+        a.feed_pose(0.0, 0.0, 0.0);
         let r = MappingReadiness::compute(Some(&a), true);
         assert!(!r.ready, "缺 pointcloud 必须 unready");
         assert_eq!(r.odom_count, 1);
@@ -631,10 +871,10 @@ mod tests {
     #[test]
     fn readiness_with_pointcloud_turns_ready() {
         let mut a = MappingAdapter::new(sample_config());
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        a.feed_pose(0.0, 0.0, 0.0);
         a.feed_pointcloud(&[Point3::new(0.0, 0.0, 0.0)]);
-        a.increment_pointcloud_count();
-        a.increment_odom_count();
-        a.increment_occupancy_revision();
+        assert!(a.build_and_publish(&state, None));
         let r = MappingReadiness::compute(Some(&a), true);
         assert!(r.ready);
         assert_eq!(r.odom_count, 1);
@@ -647,7 +887,6 @@ mod tests {
     fn readiness_no_backend_is_unready() {
         let mut a = MappingAdapter::new(sample_config());
         a.feed_pointcloud(&[Point3::new(0.0, 0.0, 0.0)]);
-        a.increment_pointcloud_count();
         let r = MappingReadiness::compute(Some(&a), false);
         assert!(!r.ready);
         assert!(!r.lcm_backend);

@@ -1,65 +1,139 @@
-//! `replay-marker` 子命令
-//!
-//! 真做行为：从 bag 读 sensor_msgs/Image（用 fixture 模拟），调
-//! `nuwax_mapping::loop_closure::AutoLoopDetector` 做回环检测（AprilTag family 名作为
-//! detector 命名空间），把结果以 .rrd JSON 写出。
-//!
-//! 注：完整 vision fiducial 解析留 P2；本期用 loop_closure 的 AutoLoopDetector 替代
-//! （语义对齐：都是"位置匹配 + 时间窗口"）。
+//! Export persisted marker detections as a deterministic replay artifact.
 
-use clap::Args;
-use nuwax_mapping::loop_closure::{AutoLoopDetector, PoseGraph};
+use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::PathBuf;
 
+use clap::Args;
+use serde::{Deserialize, Serialize};
+
+use crate::dataset::{read_dataset, PoseData, RecordPayload};
+use crate::native::{input_format, read_command_dataset, InputFormat};
+
+/// Arguments for `replay-marker`.
 #[derive(Debug, Args)]
 pub struct ReplayMarkerArgs {
-    /// 输入 bag 路径
+    /// Input JSONL dataset containing pre-decoded marker records.
     #[arg(long)]
     pub bag: PathBuf,
-    /// 输出 .rrd 路径
+    /// Output JSON marker replay artifact.
     #[arg(long)]
     pub output: PathBuf,
-    /// AprilTag 族
+    /// Marker family to select.
     #[arg(long, default_value = "tag36h11")]
     pub family: String,
 }
 
+/// Marker replay artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarkerReplay {
+    /// Format identifier.
+    pub format: String,
+    /// Format version.
+    pub version: u32,
+    /// Source dataset path.
+    pub source: String,
+    /// Selected marker family.
+    pub family: String,
+    /// Sorted distinct marker IDs.
+    pub marker_ids: Vec<u32>,
+    /// Timestamped marker observations.
+    pub markers: Vec<MarkerEvent>,
+}
+
+/// One marker observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarkerEvent {
+    /// Source timestamp.
+    pub timestamp: f64,
+    /// Source stream name.
+    pub stream: String,
+    /// Marker ID.
+    pub id: u32,
+    /// Marker pose.
+    pub pose: PoseData,
+}
+
+/// Execute the `replay-marker` command.
+///
+/// # Errors
+/// Returns errors for empty family names, unsupported input, no matching
+/// marker data, output collisions, serialization, or I/O.
 pub async fn run(args: ReplayMarkerArgs) -> anyhow::Result<()> {
-    if !args.bag.exists() {
-        tracing::warn!("replay-marker: bag path does not exist: {}", args.bag.display());
+    if args.family.trim().is_empty() {
+        anyhow::bail!("marker family must not be empty");
     }
-
-    // 阶段 1：构造 fixture PoseGraph（真实 bag 解析留 P2）
-    let mut graph = PoseGraph::new();
-    use nalgebra::Isometry3;
-    graph.add_node(0, Isometry3::translation(0.0, 0.0, 0.0));
-    graph.add_node(10, Isometry3::translation(1.0, 0.0, 0.0));
-    graph.add_node(20, Isometry3::translation(2.0, 0.0, 0.0));
-    graph.add_node(60, Isometry3::translation(0.0, 0.0, 0.0)); // 回环
-    graph.fix_first_node();
-
-    // 阶段 2：调 nuwax_mapping::loop_closure::AutoLoopDetector 真实 API
-    let detector = AutoLoopDetector::new(0.5, 30);
-    let added = detector.detect_and_add(&mut graph);
-
-    // 阶段 3：把 PoseGraph + loop closure 结果写成 .rrd JSON 简版
-    let result = serde_json::json!({
-        "bag": args.bag.display().to_string(),
-        "family": args.family,
-        "num_nodes": graph.num_nodes(),
-        "num_edges": graph.num_edges(),
-        "loops_added": added,
+    let dataset = match input_format(&args.bag)? {
+        InputFormat::JsonLines => read_dataset(&args.bag)?,
+        InputFormat::Memory2Sqlite => anyhow::bail!(
+            "memory2 replay-marker requires the original image/JPEG, camera calibration, and AprilTag detector pipeline; this dependency-free CLI does not claim detector parity from opaque image blobs"
+        ),
+        InputFormat::Rosbag2Sqlite | InputFormat::Mcap | InputFormat::Ros1Bag => {
+            return read_command_dataset(&args.bag).map(|_| ());
+        }
+    };
+    let mut markers: Vec<MarkerEvent> = dataset
+        .records
+        .into_iter()
+        .filter_map(|record| match record.payload {
+            RecordPayload::Marker { family, id, pose } if family == args.family => {
+                Some(MarkerEvent {
+                    timestamp: record.timestamp,
+                    stream: record.stream,
+                    id,
+                    pose,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    markers.sort_by(|left, right| {
+        left.timestamp
+            .total_cmp(&right.timestamp)
+            .then_with(|| left.id.cmp(&right.id))
     });
-    std::fs::write(&args.output, serde_json::to_string_pretty(&result)?)?;
+    if markers.is_empty() {
+        anyhow::bail!(
+            "dataset {} contains no marker records for family {:?}",
+            args.bag.display(),
+            args.family
+        );
+    }
+    let marker_ids = markers
+        .iter()
+        .map(|marker| marker.id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let replay = MarkerReplay {
+        format: "nuwax-marker-replay".to_string(),
+        version: 1,
+        source: args.bag.display().to_string(),
+        family: args.family.clone(),
+        marker_ids,
+        markers,
+    };
 
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&args.output)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "create marker output {} failed: {error}",
+                args.output.display()
+            )
+        })?;
+    serde_json::to_writer_pretty(&mut file, &replay)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
     println!(
-        "[replay-marker] bag={} family={} nodes={} loops={} → {}",
+        "[replay-marker] dataset={} family={} markers={} unique_ids={} output={}",
         args.bag.display(),
         args.family,
-        graph.num_nodes(),
-        added,
+        replay.markers.len(),
+        replay.marker_ids.len(),
         args.output.display()
     );
-    tracing::info!("replay-marker done");
     Ok(())
 }

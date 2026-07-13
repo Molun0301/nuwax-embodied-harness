@@ -12,8 +12,8 @@
 //! 字段,不再各自写 ad-hoc Status / 错误码。
 //!
 //! ## 字段语义
-//! - `healthy` —— 进程级 OK;`false` 表示 LCM backend 不可用 / 启动期
-//!   硬 blocker 命中
+//! - `healthy` —— 进程级 liveness/serviceability;仅由进程生命周期与 LCM
+//!   backend 决定,不与 mapping/nav/explore capability readiness 混用
 //! - `phase` —— 进程生命周期 phase;默认 `running`,Phase 7 installer
 //!   会扩展 `starting / draining / stopped`
 //! - `mapping_ready` / `nav_ready` / `explore_ready` —— 板块级 readiness,
@@ -43,7 +43,7 @@ pub const BLOCKER_EXPLORATION_NOT_READY: &str = "EXPLORATION_NOT_READY";
 /// 进程级 runtime 状态聚合
 #[derive(Clone, Debug)]
 pub struct RuntimeDiagnostics {
-    /// 进程级 health;`false` = 启动期 fail-fast / LCM backend 不可用
+    /// 进程级 health;`false` = 非 running 生命周期 / LCM backend 不可用
     pub healthy: bool,
     /// 进程 phase(默认 `running`)
     pub phase: String,
@@ -64,7 +64,8 @@ pub struct RuntimeDiagnostics {
     pub nav_ready: bool,
     /// exploration 板块 readiness(Phase 5 接 `nuwax-exploration` 后改 true)
     pub explore_ready: bool,
-    /// blocker 字符串列表;health gate 必看
+    /// backend 与 capability readiness blocker 字符串列表。能力 blocker 不改变
+    /// 进程 health，调用方应结合对应 readiness RPC 判断是否可接受板块请求。
     pub blockers: Vec<String>,
 }
 
@@ -74,11 +75,7 @@ impl RuntimeDiagnostics {
     /// `started_at_ns` 来自 `server.rs::ServiceState`,用于 uptime 计算;
     /// `mapping_ready / nav_ready / explore_ready` 在 Phase 3/4/5 接入前
     /// 一律为 `false` —— 升级期间允许 `blockers` 暴露。
-    pub fn from_handle(
-        handle: &GeometryRuntimeHandle,
-        phase: &str,
-        started_at_ns: u64,
-    ) -> Self {
+    pub fn from_handle(handle: &GeometryRuntimeHandle, phase: &str, started_at_ns: u64) -> Self {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -101,8 +98,7 @@ impl RuntimeDiagnostics {
             blockers.push(BLOCKER_EXPLORATION_NOT_READY.to_string());
         }
 
-        let healthy = handle.lcm_backend_available
-            && blockers.is_empty();
+        let healthy = handle.lcm_backend_available && phase == "running";
         // schema hash version:Phase 2 收敛到 1(fingerprint 仍 FNV-1a)
         let schema_hash_version = 1u32;
 
@@ -172,7 +168,7 @@ pub fn navigation_readiness(handle: &GeometryRuntimeHandle) -> ComponentReadines
     }
     if !handle.nav_ready_poll() {
         return ComponentReadiness::not_ready(
-            "nuwax-nav-stack LCM channel /nav/goal + /nav/cancel + /nav/state 尚未接通 (Phase 4 待办)",
+            "未收到新鲜的 nuwax-nav-stack /nav/state heartbeat",
             vec![BLOCKER_NAV_STACK_NOT_READY.to_string()],
         );
     }
@@ -253,7 +249,7 @@ impl ServiceState {
     }
 }
 
-/// Arc<RwLock<ServiceState>> 类型别名(给 server.rs 复用)
+/// `Arc<RwLock<ServiceState>>` 类型别名(给 server.rs 复用)
 pub type SharedServiceState = Arc<RwLock<ServiceState>>;
 
 #[cfg(test)]
@@ -289,5 +285,29 @@ mod tests {
             blockers: Vec::new(),
         };
         assert_eq!(format_blockers(&diag), "no_blockers");
+    }
+
+    #[tokio::test]
+    async fn running_process_health_is_independent_of_capability_readiness() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+
+        let diag = RuntimeDiagnostics::from_handle(&handle, "running", 0);
+
+        assert!(
+            diag.healthy,
+            "a running process with a live real-LCM backend must stay healthy: {:?}",
+            diag.blockers
+        );
+        assert!(!diag.mapping_ready);
+        assert!(!diag.nav_ready);
+        assert!(!diag.explore_ready);
+        assert!(
+            diag.blockers
+                .iter()
+                .any(|blocker| blocker == BLOCKER_MAPPING_NOT_READY),
+            "capability readiness must remain observable"
+        );
     }
 }

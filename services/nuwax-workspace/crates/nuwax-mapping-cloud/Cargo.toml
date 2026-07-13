@@ -13,7 +13,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 osmpbf = { workspace = true }
-image = { workspace = true }
+image = { workspace = true, features = ["png"] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
@@ -21,10 +21,8 @@ tokio = { workspace = true }
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 
-# P1 #5 (rework22 Lane D) 升级：cloud 必须能工作（mock 算法实装）。
-# 默认启用 `cloud-enabled`：调用方拿到真实算法接口（geocode/places/nominatim/
-# tile download/stitch/coords）。Live HTTP 路径仅在显式注入 API key 时使用，
-# 否则 mock 数据保证 dev/CI 可用。禁用特性仅作 SSOT 兜底（仓库内当前无 caller）。
+# The default exposes real HTTP clients plus offline coordinate/raster helpers.
+# Disabling the feature leaves only explicit `CloudMapError::Disabled` fallbacks.
 [features]
 default = ["cloud-enabled"]
 cloud-enabled = []

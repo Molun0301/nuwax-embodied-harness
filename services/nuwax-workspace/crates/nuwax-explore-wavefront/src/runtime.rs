@@ -30,7 +30,7 @@ use crate::config::WavefrontConfig;
 use crate::detector::WavefrontError;
 use crate::frontier_goal::{FrontierGoalIdSource, GoalSelection, StopReason};
 use crate::selector::WavefrontGoalSelector;
-use crate::session::ExplorationSession;
+use crate::session::{Direction2, ExplorationSession};
 
 /// Runtime 公开状态(测试用)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +249,13 @@ where
     ticks_processed: u64,
     goals_published: u64,
     stop_count: u64,
+    /// rework22 P1.10:最近一次发布目标后 robot->goal 方向(用于 momentum)。
+    /// 发布目标时由 `(goal.position - robot.position).normalize()` 更新。
+    last_direction: Option<Direction2>,
+    /// rework22 P1.11:已发布的 goal 数(用于 NoFrontier 状态机阈值判定)。
+    explored_goals_count: u32,
+    /// rework22 P1.11:连续 no-frontier tick 数(达到 10 且已发布 ≥ 2 goal → Stop)。
+    no_frontier_streak: u32,
 }
 
 /// `Drop` guard:无论 panic / early return,必须释放 active / movement hold。
@@ -296,6 +303,9 @@ where
             ticks_processed: 0,
             goals_published: 0,
             stop_count: 0,
+            last_direction: None,
+            explored_goals_count: 0,
+            no_frontier_streak: 0,
         }
     }
 
@@ -343,6 +353,9 @@ where
         self.last_goal_published_at = None;
         self.timeout_failure_count = 0;
         self.pending_goal = None;
+        self.last_direction = None;
+        self.explored_goals_count = 0;
+        self.no_frontier_streak = 0;
         self.active = true;
         self.movement_held = true;
         self.phase = RuntimePhase::Active;
@@ -424,6 +437,24 @@ where
     #[must_use]
     pub fn pending_goal(&self) -> Option<&PendingGoal> {
         self.pending_goal.as_ref()
+    }
+
+    /// rework22 P1.10:最近一次发布目标后 robot->goal 方向(测试可断言)。
+    #[must_use]
+    pub fn last_direction(&self) -> Option<Direction2> {
+        self.last_direction
+    }
+
+    /// rework22 P1.11:累计已发布目标数(测试可断言)。
+    #[must_use]
+    pub fn explored_goals_count(&self) -> u32 {
+        self.explored_goals_count
+    }
+
+    /// rework22 P1.11:当前连续 no-frontier tick 数(测试可断言)。
+    #[must_use]
+    pub fn no_frontier_streak(&self) -> u32 {
+        self.no_frontier_streak
     }
 
     /// 单次 tick(同步;测试用):调 selector,发布 frontier goal。
@@ -579,10 +610,32 @@ where
                     published_at: inputs.now,
                     status: GoalStatus::InFlight,
                 });
+                // rework22 P1.10:更新 robot -> goal 方向(用于 momentum)。
+                // 历史实现只定义 `direction update` 但 publish 后没调用,
+                // 导致 last_direction 永远是 None,momentum_score 恒为 0。
+                let goal_pos = goal.pose.pose.position.to_2d();
+                let dx = goal_pos.x - robot_pose.x;
+                let dy = goal_pos.y - robot_pose.y;
+                self.last_direction = Direction2::from_delta(dx, dy);
+                // rework22 P1.11:成功发布即重置 no_frontier_streak 并累加 explored_goals_count。
+                self.no_frontier_streak = 0;
+                self.explored_goals_count = self.explored_goals_count.saturating_add(1);
                 self.last_outcome = Some("goal".to_string());
                 Ok(RuntimeTickOutcome::Goal(goal))
             }
             Ok(GoalSelection::NoFrontier) => {
+                // rework22 P1.11:连续 10 次无 frontier 且已发布 ≥ 2 goal → Stop。
+                // 找到 frontier 的分支会清零 streak,此处只负责累加。
+                self.no_frontier_streak = self.no_frontier_streak.saturating_add(1);
+                if self.explored_goals_count >= 2 && self.no_frontier_streak >= 10 {
+                    self.stop_count = self.stop_count.saturating_add(1);
+                    self.last_outcome = Some("no_frontier_stop".to_string());
+                    self.release_guards();
+                    self.phase = RuntimePhase::Stopped;
+                    return Ok(RuntimeTickOutcome::Stop {
+                        reason: StopReason::NoInformationGain,
+                    });
+                }
                 self.last_outcome = Some("no_frontier".to_string());
                 Ok(RuntimeTickOutcome::Idle)
             }

@@ -19,6 +19,10 @@ pub use pgo_auto::AutoLoopDetector;
 ///
 /// 对外暴露统一名字 `PgoOptimizer`，内部默认是 `GaussNewtonOptimizer`；
 /// 提供 `optimize(&mut PoseGraph)` API，把代价归一化后回 caller。
+///
+/// 选择 GN 作为默认而非 LM 的原因：
+/// - GN 在残差较小时收敛更快（典型场景：回环边初次加入，残差已经较小）
+/// - LM 在残差较大时更稳健；当 GN 收敛失败时 caller 可 fallback 到 LM。
 pub struct PgoOptimizer {
     inner: GaussNewtonOptimizer,
 }
@@ -40,13 +44,13 @@ impl PgoOptimizer {
         }
     }
 
-    /// 优化位姿图，返回最终代价
+    /// 优化位姿图，返回最终代价（caller 用于判定收敛 / fallback）
     #[must_use]
     pub fn optimize(&self, graph: &mut PoseGraph) -> f64 {
         self.inner.optimize(graph)
     }
 
-    /// 内部 GN 求解器引用
+    /// 内部 GN 求解器（caller 想直接调 optimize 时用）
     #[must_use]
     pub fn gauss_newton(&self) -> &GaussNewtonOptimizer {
         &self.inner

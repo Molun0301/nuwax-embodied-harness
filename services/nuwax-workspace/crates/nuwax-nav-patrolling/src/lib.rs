@@ -20,11 +20,14 @@ pub use nuwax_nav_types_messages::{
     PoseStamped as FoundationPoseStamped,
 };
 
+pub mod module;
 pub mod routers;
 pub mod visitation_history;
 
+pub use module::{Module, PatrollingModule, PatrollingModuleConfig};
 pub use routers::{
-    CoveragePatrolRouter, FrontierGoalInput, FrontierPatrolRouter, PatrolRouter, RandomPatrolRouter,
+    CoveragePatrolRouter, FrontierGoalInput, FrontierPatrolRouter, PatrolRouter,
+    PatrollingContext, RandomPatrolRouter,
 };
 
 pub use visitation_history::VisitationHistory;

@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::routers::{GridSnapshot, PatrolRouter};
+use crate::routers::{GridSnapshot, PatrolRouter, PatrollingContext};
 use crate::visitation_history::VisitationHistory;
 
 /// Random router
@@ -28,6 +28,34 @@ impl RandomPatrolRouter {
             rng,
         }
     }
+
+    /// 内部：检查 cell 周围 clearance 圆盘是否都在 free_cells 内。
+    /// 修复 P0-14：候选必须满足 `cell == FREE && !visited && clearance_ok`。
+    fn clearance_ok(&self, idx: usize, ctx: &PatrollingContext) -> bool {
+        let vw = ctx.width as usize;
+        let vh = ctx.height as usize;
+        if vw == 0 || vh == 0 {
+            return false;
+        }
+        let r = self.history.clearance_radius_cells();
+        let row = idx / vw;
+        let col = idx % vw;
+        let r_min = row.saturating_sub(r);
+        let r_max = (row + r + 1).min(vh);
+        let c_min = col.saturating_sub(r);
+        let c_max = (col + r + 1).min(vw);
+        // 把 free_cells 转成 HashSet 一次性建表，避免 O(r^2) 线性扫描
+        // （调用频次 = 每 tick 一次，开销可接受）
+        for ri in r_min..r_max {
+            for ci in c_min..c_max {
+                let n = ri * vw + ci;
+                if !ctx.free_cells.contains(&n) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 impl PatrolRouter for RandomPatrolRouter {
@@ -46,28 +74,20 @@ impl PatrolRouter for RandomPatrolRouter {
     }
 
     fn next_goal(&mut self) -> Option<(f64, f64, f64)> {
-        // 安全 mask：free + 足够 clearance + (unvisited 优先)
-        // 这里用历史构造的 clearance_disk + visited，但需要 grid
-        // Random router 不持有 grid；外部通过 update_grid 已写入 origin/resolution
-        // 通过 visitor 上的 width/height 再获取 grid info
-        let _ = self.rng.gen::<u32>();
-        // 由 Random router 我们假定外部已通过 update_grid 设置 history grid 大小，
-        // 并调用 update_pose 写 visited。这里走最简路径：从 history 拿 visited / total
-        // 然后从 total 中随机一个未 visit 的 cell（如果存在）；否则全部 free 中随机。
+        // 无 ctx 路径：保留旧兼容，回退到 history-only 抽取。
+        // 修复 P0-14:从 history 内部读取真实 origin_x/y,不再硬编码 0.0。
         let vw = self.history.width();
         let vh = self.history.height();
         if vw == 0 || vh == 0 {
             return None;
         }
         let res = self.history.resolution();
-        let ox = 0.0_f64; // origin 已经在 history 内部保存，外部不需要再访问
-        let oy = 0.0_f64;
-        // 安全 cell 集合
+        let ox = self.history.origin_x();
+        let oy = self.history.origin_y();
         let visited = self.history.visited().unwrap_or(&[]);
         let total = vw * vh;
         let mut candidates: Vec<usize> = Vec::with_capacity(total);
         for i in 0..total {
-            // visited[i] == false 表示该 cell 未 visit
             if visited.is_empty() || !visited[i] {
                 candidates.push(i);
             }
@@ -78,7 +98,44 @@ impl PatrolRouter for RandomPatrolRouter {
         let idx = candidates[self.rng.gen_range(0..candidates.len())];
         let row = idx / vw;
         let col = idx % vw;
-        let (x, y) = (ox + (col as f64 + 0.5) * res, oy + (row as f64 + 0.5) * res);
+        let x = ox + (col as f64 + 0.5) * res;
+        let y = oy + (row as f64 + 0.5) * res;
+        Some((x, y, 0.0))
+    }
+
+    fn next_goal_with(&mut self, ctx: &PatrollingContext) -> Option<(f64, f64, f64)> {
+        // 修复 P0-14:用真实 grid_origin + odom + free_cells + clearance。
+        let vw = ctx.width as usize;
+        let vh = ctx.height as usize;
+        if vw == 0 || vh == 0 || ctx.resolution <= 0.0 || ctx.free_cells.is_empty() {
+            return None;
+        }
+        // 把 visited 转成 cell-visited 视图(通过 history.is_visited 反查)
+        let visited = self.history.visited().unwrap_or(&[]);
+        let mut candidates: Vec<usize> = Vec::with_capacity(ctx.free_cells.len());
+        for &idx in &ctx.free_cells {
+            if idx >= vw * vh {
+                continue;
+            }
+            let is_visited = visited.get(idx).copied().unwrap_or(false);
+            if is_visited {
+                continue;
+            }
+            if !self.clearance_ok(idx, ctx) {
+                continue;
+            }
+            candidates.push(idx);
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let idx = candidates[self.rng.gen_range(0..candidates.len())];
+        let row = idx / vw;
+        let col = idx % vw;
+        // 真实世界坐标:grid_origin + (col + 0.5, row + 0.5) * resolution
+        let x = ctx.grid_origin.x + (col as f64 + 0.5) * ctx.resolution;
+        let y = ctx.grid_origin.y + (row as f64 + 0.5) * ctx.resolution;
+        let _ = (self.history.width(), self.history.height()); // ensure init
         Some((x, y, 0.0))
     }
 
@@ -89,8 +146,6 @@ impl PatrolRouter for RandomPatrolRouter {
     fn reset(&mut self) {
         self.history.reset();
     }
-
-    // helpers
 }
 
 #[allow(dead_code)]

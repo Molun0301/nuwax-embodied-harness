@@ -13,10 +13,15 @@ use nuwax_mapping::cost_mapper::{
 
 fn make_cloud_with_obstacle() -> SimplePointCloud2 {
     // sensor 在原点，10x10 栅格 / resolution=0.1 / origin=(0,0)
-    // 在 (0.5, 0.5, 0) 放一个障碍点；其余空
+    // 在 (0.5, 0.5, z=2.0) 放一个障碍点（z > max_obstacle_height=1.5 → OCCUPIED）；
+    // 其余空。
+    //
+    // 注意：rework22 P1 #3 之后，障碍点必须 z > max_obstacle_height_m 才能在
+    // HeightCost kernel 下被标 OCCUPIED；旧的 z=0 占位不再代表障碍（会被 height-zone
+    // 判为 UNKNOWN）。
     let pts = vec![
-        point![0.5, 0.5, 0.0],
-        point![0.55, 0.5, 0.0],
+        point![0.5, 0.5, 2.0],
+        point![0.55, 0.5, 2.0],
     ];
     SimplePointCloud2::new(pts, point![0.0, 0.0, 0.0])
 }

@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use crate::routers::{GridSnapshot, GridSnapshotExt, PatrolRouter};
+use crate::routers::{GridSnapshot, GridSnapshotExt, PatrolRouter, PatrollingContext};
 use crate::visitation_history::VisitationHistory;
 
 /// 路径估算 trait（由调用方注入，避免依赖具体算法 crate）
@@ -161,8 +161,7 @@ impl PatrolRouter for CoveragePatrolRouter {
     }
 
     fn next_goal(&mut self) -> Option<(f64, f64, f64)> {
-        // 简化的 coverage：从未 visit 的 free cell 中随机抽样 N 个候选，
-        // 由 PathEstimator 估算 path 长度，挑选最短路径候选。
+        // 无 ctx 路径:历史/中心点近似。保留向后兼容。
         let vw = self.history.width();
         let vh = self.history.height();
         if vw == 0 || vh == 0 {
@@ -186,11 +185,10 @@ impl PatrolRouter for CoveragePatrolRouter {
             let idx = candidates[i];
             let row = idx / vw;
             let col = idx % vw;
-            // 估算：从当前 visited 中心点（粗近似：网格中心）出发
             let from = (vw / 2, vh / 2);
             let path =
                 self.estimator
-                    .estimate_cell_path(&self.snapshot_for_estimate(), from, (col, row));
+                    .estimate_cell_path(&self.snapshot_for_estimate(vw, vh), from, (col, row));
             if path < 0 {
                 continue;
             }
@@ -200,8 +198,65 @@ impl PatrolRouter for CoveragePatrolRouter {
         }
         let ((col_f, row_f), _) = best?;
         let res = self.history.resolution();
-        let x = col_f * res;
-        let y = row_f * res;
+        // 修复 P0-14:用真实 origin,不再硬编码 0.0
+        let ox = self.history.origin_x();
+        let oy = self.history.origin_y();
+        let x = ox + col_f * res;
+        let y = oy + row_f * res;
+        Some((x, y, 0.0))
+    }
+
+    fn next_goal_with(&mut self, ctx: &PatrollingContext) -> Option<(f64, f64, f64)> {
+        // 修复 P0-14:用真实 grid_origin + odom (转 grid 坐标) + free_cells + clearance
+        let vw = ctx.width as usize;
+        let vh = ctx.height as usize;
+        if vw == 0 || vh == 0 || ctx.resolution <= 0.0 || ctx.free_cells.is_empty() {
+            return None;
+        }
+        let visited = self.history.visited().unwrap_or(&[]);
+        let mut candidates: Vec<usize> = Vec::with_capacity(ctx.free_cells.len());
+        for &idx in &ctx.free_cells {
+            if idx >= vw * vh {
+                continue;
+            }
+            let is_visited = visited.get(idx).copied().unwrap_or(false);
+            if is_visited {
+                continue;
+            }
+            candidates.push(idx);
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let n = self.candidates_to_consider.min(candidates.len());
+        let step = candidates.len() / n.max(1).max(1);
+        // from = odom 在 grid 中的栅格坐标 (col, row)
+        let odom_x = ctx.odom.pose.position.x;
+        let odom_y = ctx.odom.pose.position.y;
+        let from_col = ((odom_x - ctx.grid_origin.x) / ctx.resolution).floor() as isize;
+        let from_row = ((odom_y - ctx.grid_origin.y) / ctx.resolution).floor() as isize;
+        let from_col = from_col.clamp(0, (vw as isize) - 1) as usize;
+        let from_row = from_row.clamp(0, (vh as isize) - 1) as usize;
+        let from = (from_col, from_row);
+        let snap = self.snapshot_for_estimate_with_origin(vw, vh, ctx);
+        let mut best: Option<((f64, f64), i32)> = None;
+        for i in (0..candidates.len()).step_by(step.max(1)) {
+            let idx = candidates[i];
+            let row = idx / vw;
+            let col = idx % vw;
+            let path = self
+                .estimator
+                .estimate_cell_path(&snap, from, (col, row));
+            if path < 0 {
+                continue;
+            }
+            if best.is_none_or(|(_, p)| path < p) {
+                best = Some(((col as f64, row as f64), path));
+            }
+        }
+        let ((col_f, row_f), _) = best?;
+        let x = ctx.grid_origin.x + col_f * ctx.resolution;
+        let y = ctx.grid_origin.y + row_f * ctx.resolution;
         Some((x, y, 0.0))
     }
 
@@ -215,10 +270,9 @@ impl PatrolRouter for CoveragePatrolRouter {
 }
 
 impl CoveragePatrolRouter {
-    fn snapshot_for_estimate(&self) -> GridSnapshot {
+    fn snapshot_for_estimate(&self, vw: usize, vh: usize) -> GridSnapshot {
         // 构造 free mask 全 true 作为简化 path 估算上下文
-        let vw = self.history.width();
-        let vh = self.history.height();
+        // 修复 P0-14:用 history 真实 origin_x/y,不再硬编码 0.0
         if vw == 0 || vh == 0 {
             return GridSnapshot {
                 width: 0,
@@ -234,8 +288,35 @@ impl CoveragePatrolRouter {
             width: vw as u32,
             height: vh as u32,
             resolution: res,
-            origin_x: 0.0,
-            origin_y: 0.0,
+            origin_x: self.history.origin_x(),
+            origin_y: self.history.origin_y(),
+            data: vec![0; vw * vh],
+        }
+    }
+
+    fn snapshot_for_estimate_with_origin(
+        &self,
+        vw: usize,
+        vh: usize,
+        ctx: &PatrollingContext,
+    ) -> GridSnapshot {
+        // 修复 P0-14:用 ctx 真实 origin
+        if vw == 0 || vh == 0 {
+            return GridSnapshot {
+                width: 0,
+                height: 0,
+                resolution: 0.0,
+                origin_x: 0.0,
+                origin_y: 0.0,
+                data: vec![],
+            };
+        }
+        GridSnapshot {
+            width: vw as u32,
+            height: vh as u32,
+            resolution: ctx.resolution,
+            origin_x: ctx.grid_origin.x,
+            origin_y: ctx.grid_origin.y,
             data: vec![0; vw * vh],
         }
     }

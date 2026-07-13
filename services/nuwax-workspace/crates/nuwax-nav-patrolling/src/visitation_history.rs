@@ -245,6 +245,18 @@ impl VisitationHistory {
     pub fn resolution(&self) -> f64 {
         self.resolution
     }
+
+    /// origin x（米）
+    #[must_use]
+    pub fn origin_x(&self) -> f64 {
+        self.origin_x
+    }
+
+    /// origin y（米）
+    #[must_use]
+    pub fn origin_y(&self) -> f64 {
+        self.origin_y
+    }
 }
 
 /// 构造圆盘 mask（(2r+1) x (2r+1)）

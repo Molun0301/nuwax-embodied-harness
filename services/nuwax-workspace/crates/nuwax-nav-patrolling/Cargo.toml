@@ -16,6 +16,7 @@ nuwax-numeric = { path = "../nuwax-numeric" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 rand = "0.8"
+tokio = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

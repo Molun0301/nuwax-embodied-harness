@@ -68,6 +68,64 @@
   ],
   "in_members_but_not_on_disk": [],
   "deferred": [],
+  "w1_ledger_reconciliation": {
+    "revised_at_utc": "2026-07-11T00:00:00Z",
+    "ledger_source": ".omx/plans/inventory_workspace_disposition.json",
+    "totals": {
+      "verified_on_disk": 41,
+      "verified_removed": 9,
+      "disposition_required_now": 22,
+      "disposition_qualified": 13,
+      "disposition_unsupported_gated": 4,
+      "disposition_intentional_change": 2,
+      "disposition_removed": 9
+    },
+    "removed_crates_physically_absent": [
+      "nuwax-slam-fastlio2-bridge",
+      "nuwax-vision-clip",
+      "nuwax-vision-detect-2d",
+      "nuwax-vision-detect-3d",
+      "nuwax-vision-embedding",
+      "nuwax-vision-fiducial",
+      "nuwax-vision-reid",
+      "nuwax-vision-spatial",
+      "nuwax-vision-tracker"
+    ],
+    "removed_note": "RTAB-Map is active SLAM (replaces FastLIO2); nuwax-vision-* board not implemented (model deferred).",
+    "intentional_change_crates": [
+      {
+        "crate": "nuwax-mapping-raytracing",
+        "notes": "Standalone crate; Cargo.toml declares own [workspace] block. 1320 lines voxel_ray_tracer.rs + migration/ holds stage-0 shim assets. Awaiting dimos-module shim (post-M) before member re-entry."
+      },
+      {
+        "crate": "nuwax-nav-visual-servoing",
+        "notes": "2D bbox visual servoing + 3D detection navigation (TF trait). 11 pub fns but no vision model - pure transform math. Awaiting vision crate re-introduction (post-N1)."
+      }
+    ],
+    "unsupported_gated_crates": [
+      {
+        "crate": "nuwax-nav-far-planner-bridge",
+        "notes": "C++ far_planner_native wrapper; default features=[]. PreferWavefront policy binds disabled-at-runtime. Wavefront is first-release explorer."
+      },
+      {
+        "crate": "nuwax-nav-local-planner-bridge",
+        "notes": "C++ local planner wrapper; gated behind native-local feature. Wavefront-priority path uses no separate local planner at first release."
+      },
+      {
+        "crate": "nuwax-nav-path-follower-bridge",
+        "notes": "C++ pure pursuit path_follower; gated behind native-path-follower feature. First-release uses pure-Rust nuwax-nav-basic-path-follower fallback."
+      },
+      {
+        "crate": "nuwax-nav-pgo-bridge",
+        "notes": "C++ PGO + map->odom TF helper; gated behind native-pgo feature. Wavefront path does not require PGO at first release."
+      }
+    ],
+    "first_release_priority": {
+      "explorer": "wavefront",
+      "planner": "simple-2d",
+      "path_follower": "nuwax-nav-basic-path-follower (pure Rust fallback)"
+    }
+  },
   "lockfile_sha256": {
     "Cargo.toml": "f44730585c703cb783441c9ec647bb1f2a95b3139554c257a5686a6d472c625a",
     "Cargo.lock": "454e0fdd18f42ca5e49db328f1a47c370e0c0f0376b8c9b1700d578b364d7d96"

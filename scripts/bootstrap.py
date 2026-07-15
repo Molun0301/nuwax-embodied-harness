@@ -28,7 +28,7 @@ ROOT_ENV_TEMPLATE = PROJECT_ROOT / ".env.example"
 ROOT_ENV_TARGET = PROJECT_ROOT / ".env"
 START_SCRIPT = PROJECT_ROOT / "scripts" / "start_gateway.sh"
 DEFAULT_SYSTEMD_TEMPLATE = PROJECT_ROOT / "deploy" / "systemd" / "nuwax-host-gateway.service.example"
-DEFAULT_SYSTEMD_OUTPUT = PROJECT_ROOT / "deploy" / "systemd" / "nuwax-host-gateway.service"
+DEFAULT_SYSTEMD_OUTPUT = PROJECT_ROOT / "runtime_data" / "systemd" / "nuwax-host-gateway.service"
 DEFAULT_SYSTEMD_USER = os.environ.get("SUDO_USER") or os.environ.get("USER") or "unitree"
 DEFAULT_EXTERNAL_MCP_TEMPLATE = PROJECT_ROOT / "deploy" / "nuwaclaw" / "external_mcp_servers.host_gateway.example.json"
 DEFAULT_PROXY_MCP_TEMPLATE = PROJECT_ROOT / "deploy" / "nuwaclaw" / "mcp_proxy_config.host_gateway.example.json"
@@ -403,13 +403,19 @@ class BootstrapPlanner:
             "NUWAX_GEOMETRY_RUNTIME_BINARY": str(PROJECT_ROOT / "services" / "geometry" / "nuwax_geometry_runtime" / "target" / "release" / "nuwax-geometry-runtime"),
             "NUWAX_GEOMETRY_RUNTIME_PORT": "50051",
             "NUWAX_GEOMETRY_RUNTIME_READY_FILE": str(PROJECT_ROOT / "runtime_data" / "geometry" / "nuwax_geometry_runtime.ready"),
-            "NUWAX_LCM_URL": "udpm://239.255.76.67:7667?ttl=0",
+            "NUWAX_LCM_URL": "udpm://239.255.76.67:7667?ttl=1",
             "NUWAX_LCM_BACKEND": "real-lcm",
             "NUWAX_LCM_CHANNEL_ODOM": "/odom",
             "NUWAX_LCM_CHANNEL_TF": "/tf",
             "NUWAX_LCM_CHANNEL_POINTCLOUD": "/go2/lidar/points",
             "NUWAX_LCM_CHANNEL_OCCUPANCY": "/map/occupancy",
             "NUWAX_LCM_CHANNEL_CMD_VEL": "/cmd_vel",
+            "NUWAX_LCM_CHANNEL_GOAL_POSE": "/nav/goal#nuwax_msgs.GoalEnvelope",
+            "NUWAX_LCM_CHANNEL_NAV_PATH": "/nav/path#nuwax_msgs.PathEnvelope",
+            "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL": "/go2/lidar/points#sensor_msgs.PointCloud2",
+            "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL": "/cloud_map#sensor_msgs.PointCloud2",
+            "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL": "/nav/goal#nuwax_msgs.GoalEnvelope",
+            "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL": "/nav/path#nuwax_msgs.PathEnvelope",
             # Phase 1 (2026-07-07):nuwax-workspace 已并入本仓 services/nuwax-workspace,
             # 不再写入绝对路径,默认走 build_default_nuwax_workspace_dir() 计算 repo-local。
             "NUWAX_NUWAX_WORKSPACE_DIR": str(PROJECT_ROOT / "services" / "nuwax-workspace"),
@@ -417,7 +423,7 @@ class BootstrapPlanner:
             "NUWAX_LOG_FILE": str(PROJECT_ROOT / "nuwax_robot_bridge.log"),
             "NUWAX_GATEWAY_ARTIFACT_DIR": str(PROJECT_ROOT / "artifacts"),
             "NUWAX_MAP_CATALOG_ROOT": str(PROJECT_ROOT / "runtime_data" / "maps"),
-            "NUWAX_RTABMAP_DATABASE_ROOT": str(PROJECT_ROOT / "runtime_data" / "geometry" / "rtabmap"),
+            "NUWAX_MAPPING_DATABASE_ROOT": str(PROJECT_ROOT / "runtime_data" / "geometry" / "rtabmap"),
             "NUWAX_MEMORY_DB_PATH": str(PROJECT_ROOT / "runtime_data" / "memory" / "vector_memory.db"),
             "NUWAX_RELAY_ENABLED": _bool_text(self.relay_enabled),
         }
@@ -878,8 +884,10 @@ def write_systemd_example(planner: BootstrapPlanner) -> Path:
         f"""\
         [Unit]
         Description=nuwax_robot_bridge 宿主机网关
-        Requires=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service nuwax-person-follow.service
-        After=network-online.target nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service nuwax-person-follow.service
+        Requires=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
+        BindsTo=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
+        PartOf=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
+        After=network-online.target nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
         Wants=network-online.target
 
         [Service]
@@ -896,23 +904,30 @@ def write_systemd_example(planner: BootstrapPlanner) -> Path:
         LogsDirectoryMode=0750
         UMask=0007
         Environment=PYTHONUNBUFFERED=1
+        EnvironmentFile=-{PROJECT_ROOT}/.env
         Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
         Environment=NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true
         Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
         Environment=NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true
         Environment=NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready
+        Environment=NUWAX_GEOMETRY_RUNTIME_PORT=50051
+        Environment=NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30
         Environment=NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true
         Environment=NUWAX_PERSON_FOLLOW_TARGET_CHANNEL=/person_follow_target
         Environment=NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL=/global_map
         Environment=NUWAX_PERSON_FOLLOW_TF_CHANNEL=/tf
         Environment=NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL=/gateway/person_follow_cmd_vel
+        Environment="NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope"
+        Environment="NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope"
+        Environment="NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope"
+        Environment="NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope"
         Environment=NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY=false
         Environment=NUWAX_GATEWAY_RESTART=never
         Environment=NUWAX_GATEWAY_PID_FILE=/run/nuwax/gateway/gateway.pid
         Environment=NUWAX_GATEWAY_LOCK_FILE=/run/nuwax/gateway/start_gateway.lock
         Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
-        ExecStartPre=/bin/bash {PROJECT_ROOT}/scripts/systemd/wait_for_motion_guard_socket.sh check
-        ExecStart=/bin/bash {START_SCRIPT}
+        ExecStartPre=/usr/bin/env NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 /bin/bash {PROJECT_ROOT}/scripts/systemd/wait_for_motion_guard_socket.sh check
+        ExecStart=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope" "NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope" /bin/bash {START_SCRIPT}
         Restart=on-failure
         RestartSec=3
         TimeoutStopSec=20
@@ -926,6 +941,13 @@ def write_systemd_example(planner: BootstrapPlanner) -> Path:
     _write_text(planner.systemd_output, service_content)
     print(f"已生成 systemd 示例: {planner.systemd_output}")
     return planner.systemd_output
+
+
+def install_systemd_deployment() -> None:
+    """安装 identities、tmpfiles 和按当前 repo root 渲染的 production units。"""
+
+    installer = PROJECT_ROOT / "scripts" / "install_motion_guard_deployment.sh"
+    _run((*_sudo_prefix(), "bash", str(installer), "install"), cwd=PROJECT_ROOT)
 
 
 def validate_requested_actions(planner: BootstrapPlanner) -> None:
@@ -948,7 +970,7 @@ def run_bootstrap_actions(planner: BootstrapPlanner) -> None:
     install_nuwaclaw_client(planner)
     configure_mcp(planner)
     if planner.systemd_enabled:
-        write_systemd_example(planner)
+        install_systemd_deployment()
     start_gateway(planner)
     run_healthcheck(planner)
 

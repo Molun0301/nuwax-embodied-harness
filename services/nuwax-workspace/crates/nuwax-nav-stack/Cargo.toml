@@ -49,20 +49,21 @@ lcm-runtime = [
     "dep:nuwax-transport",
     "dep:futures",
 ]
+guard-runtime = [
+    "lcm-runtime",
+    "dep:nuwax-nav-runtime",
+    "dep:nuwax-nav-astar",
+]
 
 # ---- Pure Rust 算法类(可选)----
 simple-2d = [
-    "lcm-runtime",
+    "guard-runtime",
     "dep:nuwax-nav-simple-planner",
-    "basic-path-follower",
-    "movement-manager",
     "click-goal",
 ]
 replanning-astar = [
-    "lcm-runtime",
+    "guard-runtime",
     "dep:nuwax-nav-astar",
-    "basic-path-follower",
-    "movement-manager",
     "click-goal",
     "patrolling",
 ]
@@ -182,6 +183,7 @@ nuwax-explore-wavefront = { path = "../nuwax-explore-wavefront", optional = true
 
 # ---- Pure Rust 算法类(可选)----
 nuwax-nav-astar = { path = "../nuwax-nav-astar", optional = true }
+nuwax-nav-runtime = { path = "../nuwax-nav-runtime", optional = true }
 nuwax-nav-simple-planner = { path = "../nuwax-nav-simple-planner", optional = true }
 nuwax-nav-terrain-map-ext = { path = "../nuwax-nav-terrain-map-ext", optional = true }
 

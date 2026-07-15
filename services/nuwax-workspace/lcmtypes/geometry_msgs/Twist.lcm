@@ -1,14 +1,6 @@
-// LCM IDL — geometry_msgs.Twist
-//
-// 来源：lcm-gen 标准 .lcm 语法。空结构体 fingerprint = rotate_left(SEED)。
-// 实测上游 fingerprint(`geometry_msgs::Twist`) = 0xdcc126f50d7ac427，
-// 已固化到 `nuwax-codec/tests/golden_real_lcm.rs`。
-struct geometry_msgs__Twist
-{
-    double linear_x;
-    double linear_y;
-    double linear_z;
-    double angular_x;
-    double angular_y;
-    double angular_z;
+package geometry_msgs;
+
+struct Twist {
+    Vector3 linear;
+    Vector3 angular;
 }

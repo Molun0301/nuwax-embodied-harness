@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import queue
 import threading
+from typing import Optional, Union
 
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 
@@ -16,14 +17,14 @@ class _ActorCall:
     request: pb.MotionGuardRequest
     peer: PeerCredentials
     completed: threading.Event = field(default_factory=threading.Event)
-    response: pb.MotionGuardResponse | None = None
-    error: BaseException | None = None
+    response: Optional[pb.MotionGuardResponse] = None
+    error: Optional[BaseException] = None
 
 
 @dataclass
 class _FenceCall:
     completed: threading.Event = field(default_factory=threading.Event)
-    error: BaseException | None = None
+    error: Optional[BaseException] = None
 
 
 _STOP = object()
@@ -34,10 +35,10 @@ class GuardActor:
 
     def __init__(self, core: MotionGuardCore) -> None:
         self._core = core
-        self._queue: queue.Queue[_ActorCall | _FenceCall | object] = queue.Queue()
-        self._thread: threading.Thread | None = None
+        self._queue: queue.Queue[Union[_ActorCall, _FenceCall, object]] = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
         self._started = threading.Event()
-        self.thread_id: int | None = None
+        self.thread_id: Optional[int] = None
 
     def start(self) -> None:
         if self._thread is not None:

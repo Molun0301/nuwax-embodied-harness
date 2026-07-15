@@ -317,6 +317,21 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             )
         pinned_version_id = version_id_override or self._geometry_runtime.get_exploration_pinned_version_id()
+        snapshot_map_version_id = str(
+            snapshot.metadata.get("map_version_id") or ""
+        ).strip()
+        if (
+            pinned_version_id
+            and snapshot_map_version_id
+            and snapshot_map_version_id != pinned_version_id
+        ):
+            raise GatewayError(
+                "当前地图流属于版本 %s，与 ACTIVE 建图会话版本 %s 不一致。"
+                % (snapshot_map_version_id, pinned_version_id),
+                error_code="mapping_session_version_mismatch",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
         version = self._version_repository.save_map_version(
             map_name=resolved_name,
             snapshot=snapshot,
@@ -336,6 +351,12 @@ class MapWorkspaceService:
                 "content_revision": snapshot.metadata.get("content_revision"),
                 "seed_map_version_id": snapshot.metadata.get("seed_map_version_id"),
                 "exploration_pinned_version_id": pinned_version_id,
+                "mapping_session_id": snapshot.metadata.get("mapping_session_id")
+                or snapshot.metadata.get("session_id"),
+                "mapping_session_generation": snapshot.metadata.get(
+                    "session_generation"
+                ),
+                "mapping_map_version_id": snapshot_map_version_id or pinned_version_id,
                 **dict(metadata or {}),
             },
         )

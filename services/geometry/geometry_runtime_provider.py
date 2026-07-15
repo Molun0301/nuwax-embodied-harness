@@ -5,22 +5,202 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
 import threading
-from typing import Any, Callable, Dict, List, Optional
+import time
+import uuid
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import grpc
 
 from contracts.frame_semantics import infer_frame_role
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
-from contracts.navigation import NavigationState, NavigationStatus
+from contracts.maps import OccupancyGrid
+from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
 from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_provider")
+
+_DEFAULT_GRPC_MESSAGE_LIMIT_BYTES = 128 * 1024 * 1024
+_OCCUPANCY_SCHEMA_VERSION = 1
+
+_MappingIdentity = Tuple[str, str, int]
+_NavigationStreamToken = Tuple[int, int, int]
+_NavigationLease = Tuple[str, int, str, int, int]
+_NavigationCommandToken = Tuple[str, _NavigationLease, int, int]
+_NavigationRequestIdentity = Tuple[str, int, str]
+_NavigationSetPrecommitKey = Tuple[
+    int,
+    _NavigationStreamToken,
+    _NavigationCommandToken,
+    _NavigationRequestIdentity,
+    _NavigationLease,
+]
+_NavigationDeliveryToken = Tuple[
+    int,
+    Optional[_NavigationStreamToken],
+    int,
+]
+_PUBLIC_NAV_OWNER_KIND = int(pb2.NAVIGATION_OWNER_KIND_PUBLIC_NAV)
+
+
+class _NavigationNotificationTicket:
+    """One immutable navigation event plus its commit-time delivery fence."""
+
+    __slots__ = (
+        "ticket_id",
+        "state",
+        "delivery_token",
+        "subscribers",
+        "cancelled",
+    )
+
+    def __init__(
+        self,
+        *,
+        ticket_id: int,
+        state: NavigationState,
+        delivery_token: _NavigationDeliveryToken,
+        subscribers: Tuple[
+            Tuple[int, Callable[[NavigationState], None]],
+            ...,
+        ],
+    ) -> None:
+        self.ticket_id = int(ticket_id)
+        self.state = state.model_copy(deep=True)
+        self.delivery_token = delivery_token
+        self.subscribers = subscribers
+        self.cancelled = False
+
+
+def _cancel_stream_call(call, *, context: str) -> bool:
+    cancel = getattr(call, "cancel", None)
+    if not callable(cancel):
+        return True
+    try:
+        cancel()
+        return True
+    except Exception:
+        LOGGER.exception("取消 %s stream call 失败。", context)
+        return False
+
+
+class _CancellableStreamHandle:
+    """Own one reconnecting streaming worker and its current gRPC call."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        worker: Callable[["_CancellableStreamHandle"], None],
+        on_finish: Callable[["_CancellableStreamHandle"], None],
+    ) -> None:
+        self.stop_event = threading.Event()
+        self._call_lock = threading.Lock()
+        self._current_call = None
+        self._worker = worker
+        self._on_finish = on_finish
+        self._thread = threading.Thread(
+            target=self._run,
+            name=name,
+            daemon=True,
+        )
+
+    def start(self) -> "_CancellableStreamHandle":
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        try:
+            self._worker(self)
+        except Exception:
+            LOGGER.exception("geometry stream worker 异常退出: %s", self._thread.name)
+        finally:
+            with self._call_lock:
+                call = self._current_call
+            if call is not None:
+                _cancel_stream_call(call, context=self._thread.name)
+            with self._call_lock:
+                if self._current_call is call:
+                    self._current_call = None
+            self._on_finish(self)
+
+    def bind_call(self, call) -> bool:
+        with self._call_lock:
+            if not self.stop_event.is_set():
+                self._current_call = call
+                return True
+        _cancel_stream_call(call, context="尚未绑定的 geometry")
+        return False
+
+    def clear_call(self, call, *, cancel: bool = False) -> None:
+        if cancel:
+            _cancel_stream_call(call, context=self._thread.name)
+        with self._call_lock:
+            if self._current_call is call:
+                self._current_call = None
+
+    def cancel(self) -> bool:
+        self.stop_event.set()
+        with self._call_lock:
+            call = self._current_call
+        if call is not None:
+            _cancel_stream_call(call, context="geometry")
+        if self._thread is threading.current_thread():
+            return True
+        if self._thread.is_alive():
+            self._thread.join(timeout=_read_deadline_sec() + 0.5)
+        if self._thread.is_alive():
+            LOGGER.warning(
+                "geometry stream worker 未在取消 deadline 内退出: %s",
+                self._thread.name,
+            )
+            return False
+        return True
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        self._thread.join(timeout=timeout)
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+
+class _MapUpdatePayload(dict):
+    """Dict-compatible payload carrying a non-serialized delivery fence."""
+
+    def __init__(self, *args, delivery_token, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.delivery_token = delivery_token
+
+
+class _MapDeliveryTicket:
+    """One claimed map callback, drained by mapping/connection transitions."""
+
+    __slots__ = (
+        "ticket_id",
+        "delivery_token",
+        "owner_thread_id",
+        "invalidated",
+    )
+
+    def __init__(
+        self,
+        *,
+        ticket_id: int,
+        delivery_token,
+        owner_thread_id: int,
+    ) -> None:
+        self.ticket_id = int(ticket_id)
+        self.delivery_token = delivery_token
+        self.owner_thread_id = int(owner_thread_id)
+        self.invalidated = False
+
 
 _STATIC_EDGE_SKIP_LOG_INTERVAL_SEC = 30.0
 _last_static_edge_skip_log_at = 0.0
@@ -84,6 +264,66 @@ def _heavy_deadline_sec() -> float:
         return 10.0
 
 
+def _grpc_message_limit_bytes() -> int:
+    """返回大地图 RPC 的收发上限，至少覆盖 Rust 8192x8192 栅格。"""
+
+    try:
+        configured = int(
+            os.environ.get(
+                "NUWAX_GEOMETRY_GRPC_MAX_MESSAGE_BYTES",
+                str(_DEFAULT_GRPC_MESSAGE_LIMIT_BYTES),
+            )
+        )
+    except (TypeError, ValueError):
+        configured = _DEFAULT_GRPC_MESSAGE_LIMIT_BYTES
+    return max(_DEFAULT_GRPC_MESSAGE_LIMIT_BYTES, configured)
+
+
+def _grpc_stream_retry_sec() -> float:
+    try:
+        return max(
+            0.01,
+            float(os.environ.get("NUWAX_GEOMETRY_GRPC_STREAM_RETRY_SEC", "1.0")),
+        )
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _grpc_stream_retry_max_sec() -> float:
+    try:
+        return max(
+            _grpc_stream_retry_sec(),
+            float(
+                os.environ.get(
+                    "NUWAX_GEOMETRY_GRPC_STREAM_RETRY_MAX_SEC",
+                    "8.0",
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        return 8.0
+
+
+def _exploration_poll_sec() -> float:
+    try:
+        return max(
+            0.01,
+            float(os.environ.get("NUWAX_GEOMETRY_EXPLORATION_POLL_SEC", "0.5")),
+        )
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _datetime_to_timestamp_ns(value: object) -> int:
+    timestamp = getattr(value, "timestamp", None)
+    if callable(timestamp):
+        try:
+            return max(0, int(timestamp() * 1_000_000_000))
+        except (OverflowError, OSError, TypeError, ValueError):
+            pass
+    return time.time_ns()
+
+
 def _log_rpc_error(rpc_name: str, exc: grpc.RpcError) -> None:
     """统一记录 unary gRPC 失败；区分 DEADLINE_EXCEEDED 以便排障检索。
 
@@ -101,29 +341,33 @@ def _log_rpc_error(rpc_name: str, exc: grpc.RpcError) -> None:
 # Rust proto SetNavigationGoal / CancelNavigation / SubscribeNavigationState
 # 全部返回/推送 NavigationState，没有 Rust 端 NavigationAck.accepted / CancelResult.success
 # 之类的布尔字段；accepted / success 语义由 status 字符串反推。
-_NAV_ACCEPTED_STATUS = frozenset({
-    "",                # 空 status 也视作"服务端接受但尚未分类"，避免误判为失败
-    "accepted",
-    "queued",
-    "pending",
-    "planning",
-    "running",
-    "active",
-    "executing",
-    "in_progress",
-})
+_NAV_ACCEPTED_STATUS = frozenset({"accepted", "pending"})
 _NAV_SUCCEEDED_STATUS = frozenset({
     "succeeded",
     "success",
     "completed",
     "reached",
 })
-_NAV_CANCELLED_STATUS = frozenset({
+_NAV_CANCELLED_STATUS = frozenset({"cancelled"})
+_NAV_CANCEL_SUCCESS_STATUS = frozenset({"pending", "cancelled"})
+_NAV_STREAM_STATUS = frozenset({
+    "idle",
+    "accepted",
+    "pending",
+    "planning",
+    "running",
+    "succeeded",
+    "failed",
     "cancelled",
-    "canceled",
-    "aborted",
-    "stopped",
 })
+_NAV_TERMINAL_STATUS = frozenset({"succeeded", "failed", "cancelled"})
+_NAV_STATUS_PROGRESS = {
+    "idle": 0,
+    "accepted": 1,
+    "pending": 1,
+    "planning": 2,
+    "running": 3,
+}
 
 
 def _status_means_accepted(status: str) -> bool:
@@ -141,17 +385,56 @@ def _status_means_cancelled(status: str) -> bool:
     return str(status or "").strip().lower() in _NAV_CANCELLED_STATUS
 
 
+def _status_means_cancel_success(status: str) -> bool:
+    """Accept only the two statuses emitted by Rust CancelNavigation."""
+
+    return str(status or "").strip().lower() in _NAV_CANCEL_SUCCESS_STATUS
+
+
+def _navigation_status_can_follow(current: str, incoming: str) -> bool:
+    """Return whether one exact lease may advance to ``incoming``."""
+
+    current_status = str(current or "").strip().lower()
+    incoming_status = str(incoming or "").strip().lower()
+    if current_status in _NAV_TERMINAL_STATUS:
+        return False
+    if incoming_status in _NAV_TERMINAL_STATUS:
+        return True
+    return _NAV_STATUS_PROGRESS.get(incoming_status, -1) >= (
+        _NAV_STATUS_PROGRESS.get(current_status, -1)
+    )
+
+
+def _navigation_status_is_ahead(current: str, incoming: str) -> bool:
+    """Return whether ``incoming`` carries more progress than ``current``."""
+
+    current_status = str(current or "").strip().lower()
+    incoming_status = str(incoming or "").strip().lower()
+    if incoming_status in _NAV_TERMINAL_STATUS:
+        return current_status not in _NAV_TERMINAL_STATUS
+    if current_status in _NAV_TERMINAL_STATUS:
+        return False
+    return _NAV_STATUS_PROGRESS.get(incoming_status, -1) > (
+        _NAV_STATUS_PROGRESS.get(current_status, -1)
+    )
+
+
+def _navigation_update_has_complete_zero_proof(update) -> bool:
+    return bool(
+        getattr(update, "actuator_zeroed", False)
+        and str(getattr(update, "zero_ack_id", "") or "").strip()
+        and int(getattr(update, "zero_applied_monotonic_ns", 0) or 0) > 0
+    )
+
+
 def _is_shutdown_guard_enabled() -> bool:
     """NUWAX_GEOMETRY_SHUTDOWN_GUARD=0 时关闭（紧急回滚）。"""
     value = os.environ.get("NUWAX_GEOMETRY_SHUTDOWN_GUARD", "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
 
-# Phase 4 nav_runtime:`get_navigation_readiness` 把细分 readiness 子项
-# JSON 序列化塞到 `reason` 字段尾部。本模块把该 dict 在 Python 侧解析出来。
-# Phase 7 在此基础上新增 `backend` / `tf_count` / `costmap_revision` /
-# `cmd_vel_sink_ready` / `active_profile` 五个字段,下游 diagnostics
-# 调用方可逐一读取,不必 break 旧字段。
+# Legacy readiness 子项仍可从 `reason` 尾部 JSON 读取；冻结 proto 的 typed
+# reason code、blockers、generation 与 frame 字段在 RPC 方法内直接消费。
 _NAV_READINESS_FIELDS = (
     "lcm_backend",
     "tf",
@@ -167,6 +450,68 @@ _NAV_READINESS_FIELDS = (
     "cmd_vel_sink_ready",
     "active_profile",
 )
+
+
+def _navigation_state_typed_metadata(update) -> Dict[str, Any]:
+    """Project frozen NavigationState fields 6..17 without parsing message text."""
+
+    return {
+        "raw_status": str(getattr(update, "status", "") or ""),
+        "observed_goal_id": str(getattr(update, "goal_id", "") or ""),
+        "owner_kind": int(getattr(update, "owner_kind", 0) or 0),
+        "parent_request_id": str(
+            getattr(update, "parent_request_id", "") or ""
+        ),
+        "goal_generation": int(
+            getattr(update, "goal_generation", 0) or 0
+        ),
+        "producer_runtime_generation": int(
+            getattr(update, "producer_runtime_generation", 0) or 0
+        ),
+        "cancel_phase": str(getattr(update, "cancel_phase", "") or ""),
+        "cancel_generation": int(getattr(update, "cancel_generation", 0) or 0),
+        "actuator_zeroed": bool(getattr(update, "actuator_zeroed", False)),
+        "reason_code": str(getattr(update, "reason_code", "") or ""),
+        "runtime_generation": int(getattr(update, "runtime_generation", 0) or 0),
+        "guard_generation": int(getattr(update, "guard_generation", 0) or 0),
+        "sink_ready": bool(getattr(update, "sink_ready", False)),
+        "planner_map_revision": int(getattr(update, "planner_map_revision", 0) or 0),
+        "planner_map_frame": str(getattr(update, "planner_map_frame", "") or ""),
+        "planner_pose_frame": str(getattr(update, "planner_pose_frame", "") or ""),
+        "zero_ack_id": str(getattr(update, "zero_ack_id", "") or ""),
+        "zero_applied_monotonic_ns": int(
+            getattr(update, "zero_applied_monotonic_ns", 0) or 0
+        ),
+    }
+
+
+def _navigation_lease_from_message(update) -> _NavigationLease:
+    return (
+        str(getattr(update, "goal_id", "") or "").strip(),
+        int(getattr(update, "owner_kind", 0) or 0),
+        str(getattr(update, "parent_request_id", "") or "").strip(),
+        int(getattr(update, "goal_generation", 0) or 0),
+        int(getattr(update, "producer_runtime_generation", 0) or 0),
+    )
+
+
+def _is_canonical_public_navigation_lease(
+    lease: _NavigationLease,
+) -> bool:
+    (
+        goal_id,
+        owner_kind,
+        parent_request_id,
+        goal_generation,
+        producer_runtime_generation,
+    ) = lease
+    return bool(
+        goal_id
+        and owner_kind == _PUBLIC_NAV_OWNER_KIND
+        and parent_request_id == goal_id
+        and goal_generation > 0
+        and producer_runtime_generation > 0
+    )
 
 
 def _parse_navigation_readiness_reason(ready: bool, reason: str) -> Dict[str, Any]:
@@ -226,6 +571,14 @@ def _nav_readiness_disconnected_dict(message: str = "未连接") -> Dict[str, An
         "costmap_revision": None,
         "cmd_vel_sink_ready": None,
         "active_profile": None,
+        # Frozen typed NavigationReadiness fields 3..9.
+        "reason_code": None,
+        "blockers": [],
+        "tf_generation": None,
+        "planner_generation": None,
+        "motion_sink_generation": None,
+        "map_frame": None,
+        "pose_frame": None,
     }
 
 
@@ -270,6 +623,9 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
         "frontier_count": int(resp.frontier_count),
         "revision": int(resp.revision),
         "timestamp_ns": int(resp.timestamp_ns),
+        "child_task_id": str(getattr(resp, "child_task_id", "") or ""),
+        "map_version_id": str(getattr(resp, "map_version_id", "") or ""),
+        "map_revision": int(getattr(resp, "map_revision", 0) or 0),
     }
 
 
@@ -419,14 +775,89 @@ class GeometryRuntimeProvider:
         # NavigationProvider 协议 shim 的本地状态缓存：SubscribeNavigationState 流最近一帧
         # + 上一次 set_goal/cancel_goal 触发的目标 id；get_navigation_state() 据此合成
         # contracts.NavigationState。lock 防后台订阅线程与 caller 并发改写。
+        self._nav_connection_transition_lock = threading.Lock()
+        self._nav_delivery_lock = threading.RLock()
+        self._nav_notification_condition = threading.Condition()
+        self._nav_connection_transition_inflight = False
+        self._nav_pending_notification_tickets: Dict[
+            int,
+            _NavigationNotificationTicket,
+        ] = {}
+        self._next_navigation_notification_ticket_id = 1
+        self._nav_active_notification_count = 0
+        self._nav_notification_threads: Dict[int, int] = {}
+        self._nav_active_notification_sequences: Dict[int, int] = {}
+        self._nav_notification_sequence_threads: Dict[
+            Tuple[int, int],
+            int,
+        ] = {}
+        self._nav_active_notification_subscriptions: Dict[int, int] = {}
+        self._nav_notification_subscription_threads: Dict[
+            Tuple[int, int],
+            int,
+        ] = {}
         self._nav_state_lock = threading.Lock()
+        self._nav_command_lock = threading.Lock()
+        # Serialize complete SetGoal transactions without blocking Cancel or
+        # holding delivery/command/state locks across the unary RPC.
+        self._nav_set_transaction_lock = threading.Lock()
+        self._nav_set_transaction_context = threading.local()
+        self._nav_command_generation = 0
+        self._nav_inflight_command_token: Optional[
+            _NavigationCommandToken
+        ] = None
+        self._nav_completed_cancel_command_token: Optional[
+            _NavigationCommandToken
+        ] = None
+        self._nav_set_precommit_candidates: Dict[
+            _NavigationSetPrecommitKey,
+            Any,
+        ] = {}
+        self._nav_connection_epoch = 0
+        self._nav_stream_epoch = 0
+        self._nav_active_stream_token: Optional[_NavigationStreamToken] = None
+        self._nav_stream_call = None
         self._last_nav_goal_id: Optional[str] = None
+        self._last_nav_owner_kind = 0
+        self._last_nav_parent_request_id = ""
+        self._last_nav_goal_generation = 0
+        self._last_nav_producer_runtime_generation = 0
+        self._last_nav_goal_command_generation = 0
         self._last_nav_status: str = ""  # 空串表示尚未收到流更新；视为 IDLE
         self._last_nav_message: Optional[str] = None
         self._last_nav_distance_remaining: Optional[float] = None
         self._last_nav_current_pose: Optional[Pose] = None
         self._last_nav_timestamp_ns: int = 0
+        self._last_nav_metadata: Dict[str, Any] = {}
         self._nav_stream_started = False
+        self._nav_stream_thread: Optional[threading.Thread] = None
+        self._navigation_update_subscribers: Dict[int, Callable[[NavigationState], None]] = {}
+        self._next_navigation_subscription_id = 1
+        self._exploration_state_lock = threading.RLock()
+        self._exploration_update_subscribers: Dict[
+            int,
+            Callable[[Dict[str, Any]], None],
+        ] = {}
+        self._next_exploration_subscription_id = 1
+        self._exploration_poll_thread: Optional[threading.Thread] = None
+        self._exploration_poll_stop_event: Optional[threading.Event] = None
+        self._last_exploration_signature = None
+        self._map_delivery_lock = threading.RLock()
+        self._map_state_lock = threading.Lock()
+        self._map_delivery_condition = threading.Condition()
+        self._map_delivery_tickets: Dict[int, _MapDeliveryTicket] = {}
+        self._next_map_delivery_ticket_id = 1
+        self._last_occupancy_grid: Optional[OccupancyGrid] = None
+        self._last_occupancy_grid_identity: Optional[_MappingIdentity] = None
+        self._mapping_identity: Optional[_MappingIdentity] = None
+        self._map_connection_epoch = 0
+        self._mapping_transition_epoch = 0
+        self._mapping_transition_inflight = False
+        self._map_delivery_owner_thread_id: Optional[int] = None
+        self._map_delivery_in_progress = False
+        self._stream_handle_lock = threading.Lock()
+        self._pose_stream_handles: Set[_CancellableStreamHandle] = set()
+        self._map_stream_handles: Set[_CancellableStreamHandle] = set()
 
     def set_static_extrinsics(self, edges: List[Transform]) -> None:
         """装配期由平台几何运行时注入静态外参边（来自 CalibrationProvider）。
@@ -437,15 +868,481 @@ class GeometryRuntimeProvider:
         self._static_extrinsic_edges = list(edges or [])
         LOGGER.info("已缓存 %d 条静态外参边用于 frame_tree 合并", len(self._static_extrinsic_edges))
 
+    def _current_navigation_lease_locked(self) -> _NavigationLease:
+        """Return the cached lease while `_nav_state_lock` is held."""
+
+        return (
+            str(self._last_nav_goal_id or "").strip(),
+            int(self._last_nav_owner_kind),
+            str(self._last_nav_parent_request_id or "").strip(),
+            int(self._last_nav_goal_generation),
+            int(self._last_nav_producer_runtime_generation),
+        )
+
+    def _clear_navigation_set_precommit_locked(
+        self,
+        command_token: Optional[_NavigationCommandToken] = None,
+    ) -> None:
+        """Discard staged SetGoal frames while `_nav_command_lock` is held."""
+
+        if command_token is None:
+            self._nav_set_precommit_candidates.clear()
+            return
+        stale_keys = tuple(
+            key
+            for key in self._nav_set_precommit_candidates
+            if key[2] == command_token
+        )
+        for key in stale_keys:
+            self._nav_set_precommit_candidates.pop(key, None)
+
+    def _stage_navigation_set_precommit_locked(
+        self,
+        update,
+        *,
+        incoming_lease: _NavigationLease,
+        stream_token: _NavigationStreamToken,
+    ) -> bool:
+        """Stage a current SetGoal frame without publishing it.
+
+        The full key freezes every authority boundary needed at unary commit:
+        connection, stream, command, canonical request identity and exact lease.
+        """
+
+        command_token = self._nav_inflight_command_token
+        if (
+            command_token is None
+            or command_token[0] != "set"
+            or command_token[2] != self._nav_command_generation
+            or command_token[3] != self._nav_connection_epoch
+        ):
+            return False
+        request_lease = command_token[1]
+        request_identity = (
+            request_lease[0],
+            request_lease[1],
+            request_lease[2],
+        )
+        incoming_identity = (
+            incoming_lease[0],
+            incoming_lease[1],
+            incoming_lease[2],
+        )
+        if (
+            incoming_identity != request_identity
+            or not _is_canonical_public_navigation_lease(incoming_lease)
+        ):
+            return False
+        key = (
+            self._nav_connection_epoch,
+            stream_token,
+            command_token,
+            request_identity,
+            incoming_lease,
+        )
+        previous = self._nav_set_precommit_candidates.get(key)
+        if previous is not None and not _navigation_status_can_follow(
+            getattr(previous, "status", ""),
+            getattr(update, "status", ""),
+        ):
+            LOGGER.info(
+                "丢弃回退的 SetGoal precommit frame: goal_id=%s generation=%s status=%s->%s",
+                incoming_lease[0],
+                incoming_lease[3],
+                getattr(previous, "status", ""),
+                getattr(update, "status", ""),
+            )
+            return True
+        staged = pb2.NavigationState()
+        staged.CopyFrom(update)
+        self._nav_set_precommit_candidates[key] = staged
+        return True
+
+    def _take_navigation_set_precommit_locked(
+        self,
+        *,
+        command_token: _NavigationCommandToken,
+        ack_lease: _NavigationLease,
+    ):
+        """Take the active stream's exact ack candidate, then clear the command."""
+
+        stream_token = self._nav_active_stream_token
+        request_lease = command_token[1]
+        request_identity = (
+            request_lease[0],
+            request_lease[1],
+            request_lease[2],
+        )
+        candidate = None
+        if stream_token is not None:
+            key = (
+                self._nav_connection_epoch,
+                stream_token,
+                command_token,
+                request_identity,
+                ack_lease,
+            )
+            candidate = self._nav_set_precommit_candidates.get(key)
+        self._clear_navigation_set_precommit_locked(command_token)
+        return candidate
+
+    def _cancel_pending_navigation_notifications_locked(self) -> None:
+        """Cancel tickets that have not started all snapshot callbacks."""
+
+        with self._nav_notification_condition:
+            tickets = tuple(self._nav_pending_notification_tickets.values())
+            self._nav_pending_notification_tickets.clear()
+            for ticket in tickets:
+                ticket.cancelled = True
+            self._nav_notification_condition.notify_all()
+
+    def _begin_navigation_notification(
+        self,
+        state: NavigationState,
+        *,
+        stream_token: Optional[_NavigationStreamToken] = None,
+    ) -> Optional[_NavigationNotificationTicket]:
+        """Freeze tokens and subscribers while `_nav_delivery_lock` is held."""
+
+        with self._nav_command_lock:
+            if (
+                self._nav_connection_transition_inflight
+                or not self._connected
+                or self._stopping
+                or (
+                    stream_token is not None
+                    and stream_token != self._nav_active_stream_token
+                )
+            ):
+                return None
+            delivery_token = (
+                self._nav_connection_epoch,
+                stream_token,
+                self._nav_command_generation,
+            )
+            with self._nav_state_lock:
+                subscribers = tuple(
+                    self._navigation_update_subscribers.items()
+                )
+        if not subscribers:
+            return None
+        with self._nav_notification_condition:
+            ticket_id = self._next_navigation_notification_ticket_id
+            self._next_navigation_notification_ticket_id += 1
+            ticket = _NavigationNotificationTicket(
+                ticket_id=ticket_id,
+                state=state,
+                delivery_token=delivery_token,
+                subscribers=subscribers,
+            )
+            self._nav_pending_notification_tickets[ticket_id] = ticket
+            return ticket
+
+    def _begin_navigation_notification_callback(
+        self,
+        ticket: _NavigationNotificationTicket,
+        subscription_id: int,
+        callback: Callable[[NavigationState], None],
+    ) -> bool:
+        """Linearize one callback start against transition and unsubscribe."""
+
+        thread_id = threading.get_ident()
+        with self._nav_notification_condition:
+            while True:
+                if (
+                    ticket.cancelled
+                    or self._nav_pending_notification_tickets.get(
+                        ticket.ticket_id
+                    )
+                    is not ticket
+                ):
+                    return False
+                older_active_count = sum(
+                    count
+                    for sequence, count in (
+                        self._nav_active_notification_sequences.items()
+                    )
+                    if sequence < ticket.ticket_id
+                )
+                older_owned_by_thread = sum(
+                    count
+                    for (owner_thread_id, sequence), count in (
+                        self._nav_notification_sequence_threads.items()
+                    )
+                    if owner_thread_id == thread_id
+                    and sequence < ticket.ticket_id
+                )
+                if older_active_count <= older_owned_by_thread:
+                    break
+                self._nav_notification_condition.wait()
+            if older_owned_by_thread > 0:
+                LOGGER.warning(
+                    "导航 callback 重入产生更新，丢弃无法单调投递的 ticket=%s",
+                    ticket.ticket_id,
+                )
+                return False
+        with self._nav_delivery_lock:
+            with self._nav_command_lock:
+                connection_epoch, stream_token, command_generation = (
+                    ticket.delivery_token
+                )
+                if (
+                    self._nav_connection_transition_inflight
+                    or not self._connected
+                    or self._stopping
+                    or connection_epoch != self._nav_connection_epoch
+                    or command_generation != self._nav_command_generation
+                    or (
+                        stream_token is not None
+                        and stream_token != self._nav_active_stream_token
+                    )
+                ):
+                    return False
+                with self._nav_state_lock:
+                    if (
+                        self._navigation_update_subscribers.get(subscription_id)
+                        is not callback
+                    ):
+                        return False
+                with self._nav_notification_condition:
+                    if (
+                        ticket.cancelled
+                        or self._nav_pending_notification_tickets.get(
+                            ticket.ticket_id
+                        )
+                        is not ticket
+                    ):
+                        return False
+                    self._nav_active_notification_count += 1
+                    self._nav_notification_threads[thread_id] = (
+                        self._nav_notification_threads.get(thread_id, 0) + 1
+                    )
+                    self._nav_active_notification_sequences[
+                        ticket.ticket_id
+                    ] = (
+                        self._nav_active_notification_sequences.get(
+                            ticket.ticket_id,
+                            0,
+                        )
+                        + 1
+                    )
+                    sequence_thread_key = (thread_id, ticket.ticket_id)
+                    self._nav_notification_sequence_threads[
+                        sequence_thread_key
+                    ] = (
+                        self._nav_notification_sequence_threads.get(
+                            sequence_thread_key,
+                            0,
+                        )
+                        + 1
+                    )
+                    self._nav_active_notification_subscriptions[
+                        subscription_id
+                    ] = (
+                        self._nav_active_notification_subscriptions.get(
+                            subscription_id,
+                            0,
+                        )
+                        + 1
+                    )
+                    subscription_thread_key = (thread_id, subscription_id)
+                    self._nav_notification_subscription_threads[
+                        subscription_thread_key
+                    ] = (
+                        self._nav_notification_subscription_threads.get(
+                            subscription_thread_key,
+                            0,
+                        )
+                        + 1
+                    )
+                    return True
+
+    def _finish_navigation_notification(
+        self,
+        ticket: _NavigationNotificationTicket,
+        subscription_id: int,
+    ) -> None:
+        thread_id = threading.get_ident()
+        with self._nav_notification_condition:
+            count = self._nav_notification_threads.get(thread_id, 0)
+            if count <= 1:
+                self._nav_notification_threads.pop(thread_id, None)
+            else:
+                self._nav_notification_threads[thread_id] = count - 1
+            self._nav_active_notification_count = max(
+                0,
+                self._nav_active_notification_count - 1,
+            )
+            sequence_count = self._nav_active_notification_sequences.get(
+                ticket.ticket_id,
+                0,
+            )
+            if sequence_count <= 1:
+                self._nav_active_notification_sequences.pop(
+                    ticket.ticket_id,
+                    None,
+                )
+            else:
+                self._nav_active_notification_sequences[
+                    ticket.ticket_id
+                ] = sequence_count - 1
+            sequence_thread_key = (thread_id, ticket.ticket_id)
+            sequence_thread_count = (
+                self._nav_notification_sequence_threads.get(
+                    sequence_thread_key,
+                    0,
+                )
+            )
+            if sequence_thread_count <= 1:
+                self._nav_notification_sequence_threads.pop(
+                    sequence_thread_key,
+                    None,
+                )
+            else:
+                self._nav_notification_sequence_threads[
+                    sequence_thread_key
+                ] = sequence_thread_count - 1
+            subscription_count = self._nav_active_notification_subscriptions.get(
+                subscription_id,
+                0,
+            )
+            if subscription_count <= 1:
+                self._nav_active_notification_subscriptions.pop(
+                    subscription_id,
+                    None,
+                )
+            else:
+                self._nav_active_notification_subscriptions[
+                    subscription_id
+                ] = subscription_count - 1
+            subscription_thread_key = (thread_id, subscription_id)
+            subscription_thread_count = (
+                self._nav_notification_subscription_threads.get(
+                    subscription_thread_key,
+                    0,
+                )
+            )
+            if subscription_thread_count <= 1:
+                self._nav_notification_subscription_threads.pop(
+                    subscription_thread_key,
+                    None,
+                )
+            else:
+                self._nav_notification_subscription_threads[
+                    subscription_thread_key
+                ] = subscription_thread_count - 1
+            self._nav_notification_condition.notify_all()
+
+    def _retire_navigation_notification(
+        self,
+        ticket: _NavigationNotificationTicket,
+    ) -> None:
+        with self._nav_notification_condition:
+            if (
+                self._nav_pending_notification_tickets.get(ticket.ticket_id)
+                is ticket
+            ):
+                self._nav_pending_notification_tickets.pop(ticket.ticket_id, None)
+            self._nav_notification_condition.notify_all()
+
+    def _wait_for_navigation_notifications(self) -> None:
+        with self._nav_notification_condition:
+            while self._nav_active_notification_count > 0:
+                self._nav_notification_condition.wait()
+
+    def _wait_for_navigation_subscription_callbacks(
+        self,
+        subscription_id: int,
+    ) -> None:
+        thread_id = threading.get_ident()
+        subscription_thread_key = (thread_id, subscription_id)
+        with self._nav_notification_condition:
+            while self._nav_active_notification_subscriptions.get(
+                subscription_id,
+                0,
+            ) > self._nav_notification_subscription_threads.get(
+                subscription_thread_key,
+                0,
+            ):
+                self._nav_notification_condition.wait()
+
+    def _raise_if_navigation_notification_reentry(
+        self,
+        operation: str,
+    ) -> None:
+        thread_id = threading.get_ident()
+        with self._nav_notification_condition:
+            if self._nav_notification_threads.get(thread_id, 0) > 0:
+                raise RuntimeError(
+                    "%s is not allowed from a navigation callback"
+                    % str(operation or "navigation connection transition")
+                )
+
+    def _transition_navigation_connection(
+        self,
+        *,
+        connected: bool,
+        message: Optional[str],
+    ) -> None:
+        """Gate delivery, drain started callbacks, then invalidate atomically."""
+
+        self._raise_if_navigation_notification_reentry(
+            "navigation connection transition"
+        )
+        with self._nav_connection_transition_lock:
+            with self._nav_delivery_lock:
+                with self._nav_command_lock:
+                    self._nav_connection_transition_inflight = True
+                self._cancel_pending_navigation_notifications_locked()
+
+            self._wait_for_navigation_notifications()
+
+            with self._nav_delivery_lock:
+                with self._nav_command_lock:
+                    self._nav_connection_epoch += 1
+                    self._nav_stream_epoch += 1
+                    self._nav_command_generation += 1
+                    self._nav_inflight_command_token = None
+                    self._nav_completed_cancel_command_token = None
+                    self._clear_navigation_set_precommit_locked()
+                    self._nav_active_stream_token = None
+                    stream_call = self._nav_stream_call
+                    self._connected = bool(connected)
+                    with self._nav_state_lock:
+                        self._nav_stream_started = False
+                        self._nav_stream_thread = None
+                        self._last_nav_goal_id = None
+                        self._last_nav_owner_kind = 0
+                        self._last_nav_parent_request_id = ""
+                        self._last_nav_goal_generation = 0
+                        self._last_nav_producer_runtime_generation = 0
+                        self._last_nav_goal_command_generation = 0
+                        self._last_nav_status = ""
+                        self._last_nav_message = message
+                        self._last_nav_distance_remaining = None
+                        self._last_nav_current_pose = None
+                        self._last_nav_timestamp_ns = 0
+                        self._last_nav_metadata = {}
+                    self._nav_connection_transition_inflight = False
+            if stream_call is not None:
+                _cancel_stream_call(
+                    stream_call,
+                    context="navigation connection transition",
+                )
+                with self._nav_command_lock:
+                    if self._nav_stream_call is stream_call:
+                        self._nav_stream_call = None
+
     def connect(self) -> bool:
         """连接到 Rust 子进程的 gRPC server。
 
         失败时必须清空 channel/stub 并调 `bridge.disconnect()`，让下一次
-        GeometryRuntimeSubprocess.start() 不再 short-circuit。attach 到僵尸进程时
+        attach 重新执行端口与 gRPC 双门验活。attach 到失联进程时
         `bridge.is_running` 在 attach 状态短暂为 True（端口刚关但状态未清），
         RPC 失败后必须 reset bridge 状态，否则会留下永久 `_started=True`
         假活锁（参见 grpc-attach-zombie-bridge-2026-06-27）。
         """
+        self._raise_if_navigation_notification_reentry("connect")
         # shutdown 后禁止重连——防止留下半连接 ghost channel。
         if self._stopping and _is_shutdown_guard_enabled():
             LOGGER.debug("shutdown 中，拒绝重新连接 gRPC")
@@ -454,50 +1351,144 @@ class GeometryRuntimeProvider:
             LOGGER.error("子进程未启动，无法连接")
             return False
         try:
-            self._channel = grpc.insecure_channel(self._bridge.grpc_target)
+            self._raise_if_map_delivery_reentry_locked("connect")
+            message_limit = _grpc_message_limit_bytes()
+            self._channel = grpc.insecure_channel(
+                self._bridge.grpc_target,
+                options=(
+                    ("grpc.max_receive_message_length", message_limit),
+                    ("grpc.max_send_message_length", message_limit),
+                ),
+            )
             self._stub = pb2_grpc.GeometryRuntimeStub(self._channel)
             resp = self._stub.GetStatus(pb2.Empty(), timeout=_read_deadline_sec())
             LOGGER.info("gRPC 连接成功: phase=%s, rss=%dKB", resp.phase, resp.rss_kb)
-            self._connected = True
+            with self._map_delivery_lock:
+                with self._map_state_lock:
+                    self._invalidate_map_connection_locked()
+                self._invalidate_map_delivery_tickets_locked()
+            self._wait_for_map_deliveries()
+            self._transition_navigation_connection(
+                connected=True,
+                message=None,
+            )
             return True
-        except grpc.RpcError as e:
-            LOGGER.error("gRPC 连接失败: %s", e)
-            self._cleanup_after_failed_connect()
+        except Exception as exc:
+            LOGGER.error("gRPC 连接失败: %s", exc)
+            try:
+                self._cleanup_after_failed_connect()
+            except Exception:
+                LOGGER.exception("gRPC connect cleanup 异常，执行强制清理。")
+                channel = self._channel
+                if channel is not None:
+                    try:
+                        channel.close()
+                    except Exception:
+                        LOGGER.exception("强制关闭失败的 gRPC channel 异常。")
+                self._channel = None
+                self._stub = None
+                self._connected = False
+                self._stopping = True
+                try:
+                    self._bridge.disconnect()
+                except Exception:
+                    LOGGER.exception("强制 reset geometry bridge 异常。")
             return False
 
     def _cleanup_after_failed_connect(self) -> None:
         """connect 失败时释放已建 channel/stub 并强制 bridge 进入未启动状态。"""
-        # 第一行置位 _stopping：竞态防护，确保后续清理时 guard 已生效。
-        self._stopping = True
-        # 先关 channel 让底层连接断开，再清 stub 防止后续误用。
-        if self._channel is not None:
+        self._raise_if_map_delivery_reentry_locked("failed-connect cleanup")
+        with self._map_delivery_lock:
+            self._stopping = True
+            channel = self._channel
+            self._channel = None
+            self._stub = None
+            with self._map_state_lock:
+                self._invalidate_map_connection_locked()
+            self._invalidate_map_delivery_tickets_locked()
+        if channel is not None:
             try:
-                self._channel.close()
+                channel.close()
             except Exception:  # pragma: no cover - 关 channel 失败不影响 reset 目标
                 pass
-        self._channel = None
-        self._stub = None
-        self._connected = False
-        # 关键：让 bridge 子进程对象也回到「未启动」状态，使下一次 start() 走完整 spawn。
-        # 注意只清状态不杀进程：调用方后续会走 _start_geometry_runtime_subprocess 的 zombie 自愈路径，
-        # 视情况 stop() 旧 bridge 或直接 spawn 新 bridge 取代。
+        self._cancel_data_stream_handles()
+        self._wait_for_map_deliveries()
+        self._transition_navigation_connection(
+            connected=False,
+            message="Geometry runtime 连接失败。",
+        )
+        # 关键：让 attach handle 回到未连接状态；进程仍由 canonical launcher 管理。
         try:
             self._bridge.disconnect()
         except Exception as exc:  # pragma: no cover - disconnect 失败不影响主流程
             LOGGER.warning("bridge.disconnect 失败（不影响主流程）: %s", exc)
 
     def disconnect(self) -> None:
-        # 第一行置位 _stopping：竞态防护，确保 guard 在 channel 关闭前生效。
-        self._stopping = True
-        if self._channel:
-            self._channel.close()
+        # RLock 同线程可重入，先做 owner 检查，避免 callback 内调用 disconnect
+        # 在触碰订阅或连接状态后才失败。
+        self._raise_if_navigation_notification_reentry("disconnect")
+        self._raise_if_map_delivery_reentry_locked("disconnect")
+        with self._exploration_state_lock:
+            exploration_stop_event = self._exploration_poll_stop_event
+            exploration_thread = self._exploration_poll_thread
+            self._exploration_update_subscribers.clear()
+            if exploration_stop_event is not None:
+                exploration_stop_event.set()
+        with self._map_delivery_lock:
+            self._stopping = True
+            channel = self._channel
             self._channel = None
             self._stub = None
-            self._connected = False
+            with self._map_state_lock:
+                self._invalidate_map_connection_locked()
+            self._invalidate_map_delivery_tickets_locked()
+        if channel is not None:
+            channel.close()
+        self._cancel_data_stream_handles()
+        self._wait_for_map_deliveries()
+        self._transition_navigation_connection(
+            connected=False,
+            message="Geometry runtime 已断开。",
+        )
+        if (
+            exploration_thread is not None
+            and exploration_thread.is_alive()
+            and exploration_thread is not threading.current_thread()
+        ):
+            exploration_thread.join(timeout=_read_deadline_sec() + 0.5)
+
+    def _discard_pose_stream_handle(
+        self,
+        handle: _CancellableStreamHandle,
+    ) -> None:
+        with self._stream_handle_lock:
+            self._pose_stream_handles.discard(handle)
+
+    def _discard_map_stream_handle(
+        self,
+        handle: _CancellableStreamHandle,
+    ) -> None:
+        with self._stream_handle_lock:
+            self._map_stream_handles.discard(handle)
+
+    def _cancel_data_stream_handles(self) -> None:
+        with self._stream_handle_lock:
+            handles = tuple(
+                self._pose_stream_handles | self._map_stream_handles
+            )
+        for handle in handles:
+            handle.cancel()
 
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def connection_generation(self) -> int:
+        """Return the generation used to reject stale in-flight RPC results."""
+
+        with self._map_state_lock:
+            return int(self._map_connection_epoch)
 
     def _raise_if_stopping(self, rpc_name: str) -> None:
         """shutdown 守卫：_stopping=True 且 guard 启用时，所有 RPC 入口抛 shutting_down。
@@ -525,6 +1516,252 @@ class GeometryRuntimeProvider:
         return self.is_available()
 
     # === Phase 3: mapping / lcm backend diagnostics ===
+    @staticmethod
+    def _mapping_state_payload(response) -> Dict[str, Any]:
+        return {
+            "success": bool(getattr(response, "success", False)),
+            "phase": str(getattr(response, "phase", "") or ""),
+            "message": str(getattr(response, "message", "") or ""),
+            "session_id": str(getattr(response, "session_id", "") or ""),
+            "map_name": str(getattr(response, "map_name", "") or ""),
+            "map_version_id": str(
+                getattr(response, "map_version_id", "") or ""
+            ),
+            "session_generation": int(
+                getattr(response, "session_generation", 0) or 0
+            ),
+            "revision": int(getattr(response, "revision", 0) or 0),
+            "active": bool(getattr(response, "active", False)),
+            "idempotent_replay": bool(
+                getattr(response, "idempotent_replay", False)
+            ),
+        }
+
+    @staticmethod
+    def _mapping_identity_from_payload(payload: Dict[str, Any]) -> _MappingIdentity:
+        identity = (
+            str(payload.get("session_id") or "").strip(),
+            str(payload.get("map_version_id") or "").strip(),
+            int(payload.get("session_generation") or 0),
+        )
+        if not identity[0] or not identity[1] or identity[2] <= 0:
+            raise ValueError("mapping identity is incomplete")
+        return identity
+
+    def _begin_mapping_transition(self) -> int:
+        with self._map_delivery_lock:
+            self._raise_if_map_delivery_reentry_locked("StartMapping")
+            with self._map_state_lock:
+                if self._stopping:
+                    raise RuntimeError("provider is disconnecting")
+                if self._mapping_transition_inflight:
+                    raise RuntimeError("another StartMapping transition is in flight")
+                self._mapping_transition_epoch += 1
+                self._mapping_transition_inflight = True
+                transition_epoch = self._mapping_transition_epoch
+            self._invalidate_map_delivery_tickets_locked()
+        self._wait_for_map_deliveries()
+        return transition_epoch
+
+    def _finish_mapping_transition(
+        self,
+        transition_epoch: int,
+        *,
+        identity: Optional[_MappingIdentity] = None,
+    ) -> bool:
+        with self._map_delivery_lock:
+            with self._map_state_lock:
+                if (
+                    self._stopping
+                    or transition_epoch != self._mapping_transition_epoch
+                    or not self._mapping_transition_inflight
+                ):
+                    return False
+                if identity is not None:
+                    if self._mapping_identity != identity:
+                        self._last_occupancy_grid = None
+                        self._last_occupancy_grid_identity = None
+                    self._mapping_identity = identity
+                self._mapping_transition_inflight = False
+                return True
+
+    def _invalidate_map_connection_locked(self) -> None:
+        self._map_connection_epoch += 1
+        self._mapping_transition_epoch += 1
+        self._mapping_transition_inflight = False
+        self._mapping_identity = None
+        self._last_occupancy_grid = None
+        self._last_occupancy_grid_identity = None
+
+    def _raise_if_map_delivery_reentry_locked(self, operation: str) -> None:
+        thread_id = threading.get_ident()
+        with self._map_delivery_condition:
+            if any(
+                ticket.owner_thread_id == thread_id
+                for ticket in self._map_delivery_tickets.values()
+            ):
+                raise RuntimeError(
+                    "%s is not allowed from the active map callback thread"
+                    % str(operation or "mapping identity transition")
+                )
+
+    def _claim_map_delivery(
+        self,
+        payload: Dict[str, Any],
+    ) -> Optional[_MapDeliveryTicket]:
+        with self._map_delivery_lock:
+            with self._map_state_lock:
+                if not self._map_payload_is_current_locked(payload):
+                    return None
+                delivery_token = self._map_delivery_token_locked()
+            with self._map_delivery_condition:
+                ticket_id = self._next_map_delivery_ticket_id
+                self._next_map_delivery_ticket_id += 1
+                ticket = _MapDeliveryTicket(
+                    ticket_id=ticket_id,
+                    delivery_token=delivery_token,
+                    owner_thread_id=threading.get_ident(),
+                )
+                self._map_delivery_tickets[ticket_id] = ticket
+                self._map_delivery_in_progress = True
+                self._map_delivery_owner_thread_id = ticket.owner_thread_id
+                return ticket
+
+    def _finish_map_delivery(self, ticket: _MapDeliveryTicket) -> None:
+        with self._map_delivery_condition:
+            if self._map_delivery_tickets.get(ticket.ticket_id) is ticket:
+                self._map_delivery_tickets.pop(ticket.ticket_id, None)
+            remaining = tuple(self._map_delivery_tickets.values())
+            self._map_delivery_in_progress = bool(remaining)
+            self._map_delivery_owner_thread_id = (
+                remaining[0].owner_thread_id if len(remaining) == 1 else None
+            )
+            self._map_delivery_condition.notify_all()
+
+    def _invalidate_map_delivery_tickets_locked(self) -> None:
+        with self._map_delivery_condition:
+            for ticket in self._map_delivery_tickets.values():
+                ticket.invalidated = True
+            self._map_delivery_condition.notify_all()
+
+    def _wait_for_map_deliveries(self) -> None:
+        thread_id = threading.get_ident()
+        with self._map_delivery_condition:
+            while any(
+                ticket.owner_thread_id != thread_id
+                for ticket in self._map_delivery_tickets.values()
+            ):
+                self._map_delivery_condition.wait()
+
+    def _map_delivery_token_locked(self):
+        return (
+            self._map_connection_epoch,
+            self._mapping_transition_epoch,
+            self._mapping_identity,
+        )
+
+    def _map_payload_is_current_locked(self, payload: Dict[str, Any]) -> bool:
+        return bool(
+            not self._stopping
+            and not self._mapping_transition_inflight
+            and isinstance(payload, _MapUpdatePayload)
+            and payload.delivery_token == self._map_delivery_token_locked()
+        )
+
+    def start_mapping(
+        self,
+        *,
+        session_id: str,
+        map_name: str,
+        map_version_id: str,
+    ) -> Dict[str, Any]:
+        self._raise_if_stopping("start_mapping")
+        if not self._connected or not self._stub:
+            raise RuntimeError("Geometry runtime 未连接。")
+        stub = self._stub
+        transition_epoch = self._begin_mapping_transition()
+        try:
+            response = stub.StartMapping(
+                pb2.StartMappingRequest(
+                    session_id=str(session_id or "").strip(),
+                    map_name=str(map_name or "").strip(),
+                    map_version_id=str(map_version_id or "").strip(),
+                ),
+                timeout=_read_deadline_sec(),
+            )
+            payload = self._mapping_state_payload(response)
+            if (
+                not payload["success"]
+                or payload["phase"] != "ACTIVE"
+                or not payload["active"]
+                or payload["session_id"] != str(session_id or "").strip()
+                or payload["map_name"] != str(map_name or "").strip()
+                or payload["map_version_id"] != str(map_version_id or "").strip()
+                or payload["session_generation"] <= 0
+            ):
+                raise RuntimeError("StartMapping 未返回匹配的 ACTIVE 会话。")
+            identity = self._mapping_identity_from_payload(payload)
+        except Exception:
+            self._finish_mapping_transition(transition_epoch)
+            raise
+        if not self._finish_mapping_transition(
+            transition_epoch,
+            identity=identity,
+        ):
+            raise RuntimeError(
+                "StartMapping 完成时 mapping transition 已被断连或新代际取代。"
+            )
+        return payload
+
+    def stop_mapping(self, *, session_id: str, reason: str = "") -> Dict[str, Any]:
+        self._raise_if_stopping("stop_mapping")
+        if not self._connected or not self._stub:
+            raise RuntimeError("Geometry runtime 未连接。")
+        with self._map_delivery_lock:
+            self._raise_if_map_delivery_reentry_locked("StopMapping")
+        self._wait_for_map_deliveries()
+        response = self._stub.StopMapping(
+            pb2.StopMappingRequest(
+                session_id=str(session_id or "").strip(),
+                reason=str(reason or "").strip(),
+            ),
+            timeout=_read_deadline_sec(),
+        )
+        payload = self._mapping_state_payload(response)
+        if (
+            not payload["success"]
+            or payload["phase"] != "STOPPED"
+            or payload["active"]
+            or payload["session_id"] != str(session_id or "").strip()
+        ):
+            raise RuntimeError("StopMapping 未返回匹配的 STOPPED 会话。")
+        stopped_identity = self._mapping_identity_from_payload(payload)
+        with self._map_delivery_lock:
+            with self._map_state_lock:
+                if self._stopping or self._mapping_transition_inflight:
+                    raise RuntimeError(
+                        "StopMapping 完成时 provider 正在断连或切换建图会话。"
+                    )
+                if (
+                    self._mapping_identity is not None
+                    and stopped_identity != self._mapping_identity
+                ):
+                    raise RuntimeError("StopMapping 返回了不同建图会话的终态。")
+                if self._mapping_identity != stopped_identity:
+                    self._mapping_transition_epoch += 1
+                # STOPPED 后保留同一身份的最终栅格，供 save-map 收尾读取。
+                self._mapping_identity = stopped_identity
+        return payload
+
+    def get_mapping_state(self) -> Dict[str, Any]:
+        self._raise_if_stopping("get_mapping_state")
+        if not self._connected or not self._stub:
+            raise RuntimeError("Geometry runtime 未连接。")
+        response = self._stub.GetMappingState(
+            pb2.Empty(), timeout=_read_deadline_sec()
+        )
+        return self._mapping_state_payload(response)
+
     def is_mapping_ready(self) -> bool:
         """Phase 3: mapping 板块 readiness。
 
@@ -770,11 +2007,239 @@ class GeometryRuntimeProvider:
                 "resolution": meta.resolution,
                 "origin_x": meta.origin_x, "origin_y": meta.origin_y,
                 "frame_id": meta.frame_id, "revision": meta.revision,
+                "timestamp_ns": meta.timestamp_ns,
                 "data": bytes(resp.data),
             }
         except grpc.RpcError as e:
             _log_rpc_error("GetOccupancyGridData", e)
             return None
+
+    @staticmethod
+    def _occupancy_grid_from_components(
+        *,
+        width: int,
+        height: int,
+        resolution: float,
+        origin_x: float,
+        origin_y: float,
+        frame_id: str,
+        revision: int,
+        timestamp_ns: int,
+        data: bytes,
+    ) -> OccupancyGrid:
+        width = int(width)
+        height = int(height)
+        resolution = float(resolution)
+        revision = int(revision)
+        timestamp_ns = int(timestamp_ns)
+        if width <= 0 or height <= 0:
+            raise ValueError("occupancy width/height must be positive")
+        if resolution <= 0.0:
+            raise ValueError("occupancy resolution must be positive")
+        expected_size = width * height
+        if len(data) != expected_size:
+            raise ValueError(
+                "occupancy data size mismatch: expected=%d actual=%d"
+                % (expected_size, len(data))
+            )
+        decoded = [value if value <= 100 else value - 256 for value in data]
+        if any(value < -1 or value > 100 for value in decoded):
+            raise ValueError("occupancy data contains values outside [-1, 100]")
+        frame_id = str(frame_id or "map").strip().lstrip("/") or "map"
+        timestamp = (
+            datetime.fromtimestamp(timestamp_ns / 1_000_000_000.0, tz=timezone.utc)
+            if timestamp_ns > 0
+            else datetime.now(timezone.utc)
+        )
+        return OccupancyGrid(
+            timestamp=timestamp,
+            map_id="geometry_runtime:%d" % max(0, revision),
+            frame_id=frame_id,
+            width=width,
+            height=height,
+            resolution_m=resolution,
+            origin=Pose(
+                timestamp=timestamp,
+                frame_id=frame_id,
+                position=Vector3(x=float(origin_x), y=float(origin_y), z=0.0),
+                orientation=Quaternion(),
+            ),
+            data=decoded,
+        )
+
+    def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
+        """通过全量 gRPC getter 返回 MapProvider 标准 OccupancyGrid。"""
+
+        with self._map_state_lock:
+            if self._stopping or self._mapping_transition_inflight:
+                return None
+            request_identity = self._mapping_identity
+            request_token = self._map_delivery_token_locked()
+        payload = self.get_occupancy_grid_data()
+        if payload is None:
+            with self._map_state_lock:
+                if (
+                    self._stopping
+                    or self._mapping_transition_inflight
+                    or self._map_delivery_token_locked() != request_token
+                    or request_identity is None
+                    or self._last_occupancy_grid_identity != request_identity
+                ):
+                    return None
+                cached = self._last_occupancy_grid
+                return cached.model_copy(deep=True) if cached is not None else None
+        try:
+            grid = self._occupancy_grid_from_components(
+                width=int(payload["width"]),
+                height=int(payload["height"]),
+                resolution=float(payload["resolution"]),
+                origin_x=float(payload["origin_x"]),
+                origin_y=float(payload["origin_y"]),
+                frame_id=str(payload["frame_id"]),
+                revision=int(payload["revision"]),
+                timestamp_ns=int(payload.get("timestamp_ns") or 0),
+                data=bytes(payload["data"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            LOGGER.exception("GetOccupancyGridData 返回了无效栅格。")
+            return None
+        with self._map_state_lock:
+            if (
+                self._stopping
+                or self._mapping_transition_inflight
+                or self._map_delivery_token_locked() != request_token
+            ):
+                LOGGER.warning(
+                    "GetOccupancyGridData 返回期间连接或建图 transition 已切换，"
+                    "丢弃无身份 unary 栅格。"
+                )
+                return None
+            if request_identity is not None:
+                self._last_occupancy_grid = grid.model_copy(deep=True)
+                self._last_occupancy_grid_identity = request_identity
+        return grid
+
+    def get_cost_map(self):
+        """Rust facade 当前没有独立 cost-map RPC。"""
+
+        return None
+
+    def get_semantic_map(self):
+        """Rust facade 当前没有独立 semantic-map RPC。"""
+
+        return None
+
+    def _map_update_to_payload(self, update) -> Dict[str, Any]:
+        """校验 MapUpdateNotification 并构造 MappingService 可消费 payload。"""
+
+        meta = update.meta
+        data = bytes(update.data)
+        declared_size = int(update.size)
+        schema_version = int(update.schema_version)
+        checksum = str(update.checksum or "").strip().lower()
+        session_id = str(update.session_id or "").strip()
+        map_version_id = str(update.map_version_id or "").strip()
+        session_generation = int(update.session_generation)
+        if not session_id or not map_version_id or session_generation <= 0:
+            raise ValueError("map update is missing mapping session identity")
+        expected_size = int(meta.width) * int(meta.height)
+        if declared_size != len(data) or declared_size != expected_size:
+            raise ValueError(
+                "map update size mismatch: declared=%d data=%d expected=%d"
+                % (declared_size, len(data), expected_size)
+            )
+        if schema_version != _OCCUPANCY_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported map schema_version=%d" % schema_version
+            )
+        actual_checksum = hashlib.sha256(data).hexdigest()
+        if not checksum or checksum != actual_checksum:
+            raise ValueError("map update checksum mismatch")
+        grid = self._occupancy_grid_from_components(
+            width=meta.width,
+            height=meta.height,
+            resolution=meta.resolution,
+            origin_x=meta.origin_x,
+            origin_y=meta.origin_y,
+            frame_id=meta.frame_id,
+            revision=meta.revision,
+            timestamp_ns=meta.timestamp_ns,
+            data=data,
+        )
+        known_cell_count = sum(1 for value in grid.data if value >= 0)
+        occupied_cell_count = sum(1 for value in grid.data if value >= 50)
+        revision = int(meta.revision)
+        metadata = {
+            "event_type": "content_update",
+            "source_kind": "platform_live_map_provider",
+            "source_name": "geometry_runtime",
+            "map_snapshot_kind": "live_streaming",
+            "live_streaming_ready": True,
+            "mapping_live_streaming_ready": True,
+            "source_alive": True,
+            "streaming": True,
+            "frame_id": grid.frame_id,
+            "revision": revision,
+            "update_sequence": revision,
+            "occupancy_sequence": revision,
+            "occupancy_message_count": revision,
+            "occupancy_content_revision": revision,
+            "content_revision": revision,
+            "checksum": actual_checksum,
+            "occupancy_content_hash": actual_checksum,
+            "content_hash": actual_checksum,
+            "schema_version": schema_version,
+            "size": declared_size,
+            "last_seen_ms": int(update.last_seen_ms),
+            "timestamp_ns": int(meta.timestamp_ns),
+            "mapping_session_id": session_id,
+            "session_id": session_id,
+            "map_version_id": map_version_id,
+            "session_generation": session_generation,
+            "known_cell_count": known_cell_count,
+            "occupied_cell_count": occupied_cell_count,
+            "occupancy_metrics": {
+                "content_hash": actual_checksum,
+                "content_revision": revision,
+                "known_cell_count": known_cell_count,
+                "occupied_cell_count": occupied_cell_count,
+            },
+        }
+        identity = (session_id, map_version_id, session_generation)
+        with self._map_state_lock:
+            if self._stopping or self._mapping_transition_inflight:
+                raise ValueError(
+                    "map update arrived during provider disconnect or mapping transition"
+                )
+            if self._mapping_identity is None:
+                self._mapping_identity = identity
+                self._mapping_transition_epoch += 1
+            elif self._mapping_identity != identity:
+                raise ValueError(
+                    "map update mapping identity mismatch: expected=%r actual=%r"
+                    % (self._mapping_identity, identity)
+                )
+            self._last_occupancy_grid = grid.model_copy(deep=True)
+            self._last_occupancy_grid_identity = identity
+            delivery_token = self._map_delivery_token_locked()
+        return _MapUpdatePayload(
+            {
+                "source_name": "geometry_runtime",
+                "occupancy_grid": grid,
+                "cost_map": None,
+                "semantic_map": None,
+                "width": grid.width,
+                "height": grid.height,
+                "resolution": grid.resolution_m,
+                "frame_id": grid.frame_id,
+                "revision": revision,
+                "session_id": session_id,
+                "map_version_id": map_version_id,
+                "session_generation": session_generation,
+                "metadata": metadata,
+            },
+            delivery_token=delivery_token,
+        )
 
     # === Navigation ===
     # Rust proto 字段映射（round-4 HIGH 3 同步）：
@@ -785,52 +2250,58 @@ class GeometryRuntimeProvider:
     # - NavigationReadiness 仅 ready + reason（去 Nav2 残留字段）
     def set_navigation_goal(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float,
                             frame_id: str = "map", goal_id: str = "") -> Dict[str, Any]:
-        self._raise_if_stopping("set_navigation_goal")
-        if not self._stub:
-            return {"accepted": False, "message": "未连接"}
-        try:
-            goal = pb2.NavigationGoal(
-                pose=pb2.Pose(
-                    position=pb2.Vec3(x=x, y=y, z=z),
-                    orientation=pb2.Quat(x=qx, y=qy, z=qz, w=qw),
-                    frame_id=frame_id,
+        """Compatibility facade routed through the canonical lease transaction."""
+
+        request_goal_id = str(goal_id or "").strip() or (
+            "debug-%s" % uuid.uuid4().hex
+        )
+        goal = NavigationGoal(
+            goal_id=request_goal_id,
+            target_pose=Pose(
+                frame_id=str(frame_id or "map"),
+                position=Vector3(x=float(x), y=float(y), z=float(z)),
+                orientation=Quaternion(
+                    x=float(qx),
+                    y=float(qy),
+                    z=float(qz),
+                    w=float(qw),
                 ),
-                frame_id=frame_id,
-                goal_id=goal_id,
-            )
-            resp = self._stub.SetNavigationGoal(goal, timeout=_read_deadline_sec())
-            return {
-                "accepted": _status_means_accepted(resp.status),
-                "goal_id": resp.goal_id,
-                "message": resp.message,
-            }
-        except grpc.RpcError as e:
-            _log_rpc_error("SetNavigationGoal", e)
-            return {"accepted": False, "message": str(e)}
+            ),
+        )
+        accepted = self.set_goal(goal)
+        transaction_result = getattr(
+            self._nav_set_transaction_context,
+            "result",
+            None,
+        )
+        message = ""
+        if (
+            isinstance(transaction_result, tuple)
+            and len(transaction_result) == 3
+            and transaction_result[0] == request_goal_id
+            and bool(transaction_result[1]) is accepted
+        ):
+            message = str(transaction_result[2] or "")
+        return {
+            "accepted": accepted,
+            "goal_id": request_goal_id if accepted else "",
+            "message": message or (
+                "SetNavigationGoal 已接纳"
+                if accepted
+                else "SetNavigationGoal 未被接纳"
+            ),
+        }
 
     def cancel_navigation(self, goal_id: str = "") -> bool:
-        self._raise_if_stopping("cancel_navigation")
-        if not self._stub:
-            return False
-        try:
-            req = pb2.CancelNavigationRequest(goal_id=goal_id)
-            resp = self._stub.CancelNavigation(req, timeout=_read_deadline_sec())
-            return (
-                _status_means_cancelled(resp.status)
-                or _status_means_accepted(resp.status)
-                or _status_means_succeeded(resp.status)
-            )
-        except grpc.RpcError as e:
-            _log_rpc_error("CancelNavigation", e)
-            return False
+        """兼容 facade；复用正式 provider 的 active exact-goal 栅栏。"""
+
+        return self.cancel_goal(goal_id)
 
     def get_navigation_readiness(self) -> Dict[str, Any]:
-        """Phase 4:从 gRPC `GetNavigationReadiness` 返回 dict。
+        """从 gRPC `GetNavigationReadiness` 返回结构化就绪度。
 
-        Rust 端把细分 readiness 子项(LCM backend / tf / costmap /
-        planner / cmd_vel sink)JSON 序列化塞到 `reason` 字段尾部,
-        形如 `"{top_reason}; details={...json...}"`,本函数解析
-        返回 dict。
+        冻结字段 3..9 直接从 protobuf 读取；`reason` 内嵌 JSON 只作为旧服务端
+        兼容投影，不参与 reason_code、blockers、generation 或 frame 的判定。
 
         返回 dict 字段:
         - ``ready`` (bool): 整体 ready
@@ -848,9 +2319,27 @@ class GeometryRuntimeProvider:
             resp = self._stub.GetNavigationReadiness(
                 pb2.Empty(), timeout=_read_deadline_sec()
             )
-            return _parse_navigation_readiness_reason(
+            readiness = _parse_navigation_readiness_reason(
                 bool(resp.ready), str(resp.reason)
             )
+            readiness.update(
+                {
+                    "reason_code": str(getattr(resp, "reason_code", "") or ""),
+                    "blockers": [
+                        str(item) for item in getattr(resp, "blockers", ())
+                    ],
+                    "tf_generation": int(getattr(resp, "tf_generation", 0) or 0),
+                    "planner_generation": int(
+                        getattr(resp, "planner_generation", 0) or 0
+                    ),
+                    "motion_sink_generation": int(
+                        getattr(resp, "motion_sink_generation", 0) or 0
+                    ),
+                    "map_frame": str(getattr(resp, "map_frame", "") or ""),
+                    "pose_frame": str(getattr(resp, "pose_frame", "") or ""),
+                }
+            )
+            return readiness
         except grpc.RpcError as e:
             _log_rpc_error("GetNavigationReadiness", e)
             return _nav_readiness_disconnected_dict(message="gRPC 错误")
@@ -864,54 +2353,396 @@ class GeometryRuntimeProvider:
     #   不假装成功——gRPC 失败或 backend 未就绪时，返回值如实反映（accepted=False / success=False / IDLE）。
     # - 等 nuwax-nav-stack crate 上线、Nav2 动作语义彻底废弃后，可删除整个 shim 段。
     def _ensure_nav_state_stream(self) -> None:
-        """懒启动 SubscribeNavigationState 后台线程；只起一次。"""
-        if self._nav_stream_started:
-            return
-        if not self._stub or self._stopping:
-            return
-        self._nav_stream_started = True
-        thread = threading.Thread(
-            target=self._nav_state_stream_worker,
-            name="geometry_runtime_nav_state_cache",
-            daemon=True,
-        )
-        thread.start()
-
-    def _nav_state_stream_worker(self) -> None:
-        """后台线程：拉 SubscribeNavigationState 流，把最近一帧写进本地缓存。
-
-        流断开时不重连（避免 hot loop），下次 set_goal/get_navigation_state 触发的 ensure
-        仍会 no-op 已启动标志；如确需重连，只能 disconnect+connect 重建 provider。
-        """
-        while self._stub and not self._stopping:
-            try:
-                for update in self._stub.SubscribeNavigationState(pb2.Empty()):
-                    # Rust SubscribeNavigationState 流推送 NavigationState
-                    # （非 NavigationStateUpdate，无 current_pose 字段；位姿由 SubscribePose 流补齐）
-                    goal_id = getattr(update, "goal_id", "") or None
-                    status = getattr(update, "status", "") or ""
-                    message = getattr(update, "message", "") or None
-                    distance = getattr(update, "distance_remaining", None)
-                    ts_ns = int(getattr(update, "timestamp_ns", 0) or 0)
-                    with self._nav_state_lock:
-                        self._last_nav_goal_id = goal_id
-                        self._last_nav_status = status
-                        self._last_nav_message = message
-                        self._last_nav_distance_remaining = (
-                            float(distance) if distance is not None else None
-                        )
-                        self._last_nav_current_pose = None  # 由 SubscribePose 流维护
-                        self._last_nav_timestamp_ns = ts_ns
-                    if not self._stub or self._stopping:
-                        return
-            except grpc.RpcError as exc:
-                LOGGER.warning(
-                    "SubscribeNavigationState 流断开（不影响主流程）: %s", exc
+        """懒启动可重连的 SubscribeNavigationState 后台线程。"""
+        with self._nav_command_lock:
+            with self._nav_state_lock:
+                if self._nav_stream_started:
+                    return
+                stream_stub = self._stub
+                if (
+                    stream_stub is None
+                    or self._stopping
+                    or not self._connected
+                    or self._nav_connection_transition_inflight
+                ):
+                    return
+                self._nav_stream_epoch += 1
+                stream_token = (
+                    self._nav_connection_epoch,
+                    self._nav_stream_epoch,
+                    id(stream_stub),
                 )
-                return  # 不重连，下次 ensure 也不再启动（按设计）
-            except Exception:  # pragma: no cover - 防御性兜底
-                LOGGER.exception("SubscribeNavigationState worker 异常退出。")
-                return
+                thread = threading.Thread(
+                    target=self._nav_state_stream_worker,
+                    args=(stream_token, stream_stub),
+                    name="geometry_runtime_nav_state_cache",
+                    daemon=True,
+                )
+                self._nav_active_stream_token = stream_token
+                self._nav_stream_started = True
+                self._nav_stream_thread = thread
+        try:
+            thread.start()
+        except Exception:
+            with self._nav_command_lock:
+                if self._nav_active_stream_token == stream_token:
+                    self._nav_active_stream_token = None
+                    with self._nav_state_lock:
+                        self._nav_stream_started = False
+                        self._nav_stream_thread = None
+            raise
+
+    def _navigation_stream_is_current_locked(
+        self,
+        stream_token: _NavigationStreamToken,
+        stream_stub,
+    ) -> bool:
+        """Validate a stream token while `_nav_command_lock` is held."""
+
+        return bool(
+            self._nav_active_stream_token == stream_token
+            and stream_token[0] == self._nav_connection_epoch
+            and stream_token[2] == id(stream_stub)
+            and self._stub is stream_stub
+            and self._connected
+            and not self._stopping
+            and not self._nav_connection_transition_inflight
+        )
+
+    def _nav_state_stream_worker(
+        self,
+        stream_token: _NavigationStreamToken,
+        stream_stub,
+    ) -> None:
+        """持续拉取导航状态；断流复位权威缓存并自动重连。"""
+
+        try:
+            while True:
+                with self._nav_command_lock:
+                    if not self._navigation_stream_is_current_locked(
+                        stream_token,
+                        stream_stub,
+                    ):
+                        return
+                call = None
+                try:
+                    call = stream_stub.SubscribeNavigationState(pb2.Empty())
+                    with self._nav_command_lock:
+                        stream_is_current = (
+                            self._navigation_stream_is_current_locked(
+                                stream_token,
+                                stream_stub,
+                            )
+                        )
+                        if stream_is_current:
+                            self._nav_stream_call = call
+                    if not stream_is_current:
+                        _cancel_stream_call(
+                            call,
+                            context="stale navigation",
+                        )
+                        return
+                    for update in call:
+                        notification = None
+                        with self._nav_delivery_lock:
+                            committed = self._cache_navigation_update(
+                                update,
+                                stream_token=stream_token,
+                                stream_stub=stream_stub,
+                            )
+                            if committed:
+                                self._cancel_pending_navigation_notifications_locked()
+                                state = (
+                                    self._build_navigation_state_snapshot(
+                                        include_readiness=False
+                                    )
+                                )
+                                notification = (
+                                    self._begin_navigation_notification(
+                                        state,
+                                        stream_token=stream_token,
+                                    )
+                                )
+                        if notification is not None:
+                            self._notify_navigation_subscribers(notification)
+                        with self._nav_command_lock:
+                            if not self._navigation_stream_is_current_locked(
+                                stream_token,
+                                stream_stub,
+                            ):
+                                return
+                except grpc.RpcError as exc:
+                    LOGGER.warning(
+                        "SubscribeNavigationState 流断开，准备重连: %s",
+                        exc,
+                    )
+                    notification = None
+                    with self._nav_delivery_lock:
+                        disconnected = self._mark_navigation_stream_disconnected(
+                            str(exc),
+                            stream_token=stream_token,
+                            stream_stub=stream_stub,
+                        )
+                        if disconnected:
+                            self._cancel_pending_navigation_notifications_locked()
+                            state = (
+                                self._build_navigation_state_snapshot(
+                                    include_readiness=False
+                                )
+                            )
+                            notification = self._begin_navigation_notification(
+                                state,
+                                stream_token=stream_token,
+                            )
+                    if notification is not None:
+                        self._notify_navigation_subscribers(notification)
+                except Exception as exc:
+                    LOGGER.exception(
+                        "SubscribeNavigationState worker 异常，准备重连。"
+                    )
+                    notification = None
+                    with self._nav_delivery_lock:
+                        disconnected = self._mark_navigation_stream_disconnected(
+                            str(exc),
+                            stream_token=stream_token,
+                            stream_stub=stream_stub,
+                        )
+                        if disconnected:
+                            self._cancel_pending_navigation_notifications_locked()
+                            state = (
+                                self._build_navigation_state_snapshot(
+                                    include_readiness=False
+                                )
+                            )
+                            notification = self._begin_navigation_notification(
+                                state,
+                                stream_token=stream_token,
+                            )
+                    if notification is not None:
+                        self._notify_navigation_subscribers(notification)
+                finally:
+                    if call is not None:
+                        _cancel_stream_call(
+                            call,
+                            context="navigation",
+                        )
+                        with self._nav_command_lock:
+                            if self._nav_stream_call is call:
+                                self._nav_stream_call = None
+                with self._nav_command_lock:
+                    if not self._navigation_stream_is_current_locked(
+                        stream_token,
+                        stream_stub,
+                    ):
+                        return
+                time.sleep(_grpc_stream_retry_sec())
+        finally:
+            with self._nav_command_lock:
+                call = (
+                    self._nav_stream_call
+                    if self._nav_active_stream_token == stream_token
+                    else None
+                )
+            if call is not None:
+                _cancel_stream_call(
+                    call,
+                    context="navigation worker exit",
+                )
+            with self._nav_command_lock:
+                if self._nav_active_stream_token == stream_token:
+                    if self._nav_stream_call is call:
+                        self._nav_stream_call = None
+                    self._nav_active_stream_token = None
+                    with self._nav_state_lock:
+                        self._nav_stream_started = False
+                        self._nav_stream_thread = None
+
+    def _cache_navigation_update(
+        self,
+        update,
+        *,
+        stream_token: _NavigationStreamToken,
+        stream_stub,
+    ) -> bool:
+        incoming_lease = _navigation_lease_from_message(update)
+        status = getattr(update, "status", "") or ""
+        normalized_status = str(status).strip().lower()
+        if normalized_status not in _NAV_STREAM_STATUS:
+            LOGGER.warning(
+                "丢弃未知 navigation stream status: %r",
+                status,
+            )
+            return False
+        if (
+            normalized_status == "cancelled"
+            and not _navigation_update_has_complete_zero_proof(update)
+        ):
+            LOGGER.warning(
+                "丢弃缺少完整 ZERO proof 的 CANCELLED navigation stream frame"
+            )
+            return False
+        message = getattr(update, "message", "") or None
+        distance = getattr(update, "distance_remaining", None)
+        ts_ns = int(getattr(update, "timestamp_ns", 0) or 0)
+        with self._nav_command_lock:
+            if not self._navigation_stream_is_current_locked(
+                stream_token,
+                stream_stub,
+            ) or self._nav_connection_transition_inflight:
+                return False
+            if self._stage_navigation_set_precommit_locked(
+                update,
+                incoming_lease=incoming_lease,
+                stream_token=stream_token,
+            ):
+                return False
+            with self._nav_state_lock:
+                current_lease = self._current_navigation_lease_locked()
+                current_goal_id = current_lease[0] or None
+                lease_is_exact = bool(
+                    incoming_lease == current_lease
+                    and (
+                        _is_canonical_public_navigation_lease(current_lease)
+                        or current_lease == ("", 0, "", 0, 0)
+                    )
+                )
+                current_status = self._nav_status_to_enum(
+                    self._last_nav_status
+                )
+                incoming_status = self._nav_status_to_enum(status)
+                terminal_statuses = {
+                    NavigationStatus.SUCCEEDED,
+                    NavigationStatus.FAILED,
+                    NavigationStatus.CANCELLED,
+                }
+                stream_disconnected_placeholder = bool(
+                    self._last_nav_metadata.get("reason_code")
+                    == "NAVIGATION_STREAM_DISCONNECTED"
+                )
+                inflight_token = self._nav_inflight_command_token
+                inflight_cancel_terminal = bool(
+                    inflight_token is not None
+                    and inflight_token[0] == "cancel"
+                    and inflight_token[1] == current_lease
+                    and inflight_token[1] == incoming_lease
+                    and inflight_token[2] == self._nav_command_generation
+                    and inflight_token[3] == self._nav_connection_epoch
+                    and incoming_status == NavigationStatus.CANCELLED
+                    and _navigation_update_has_complete_zero_proof(update)
+                )
+                command_generation_is_current = bool(
+                    self._last_nav_goal_command_generation
+                    == self._nav_command_generation
+                )
+                status_is_monotonic = bool(
+                    stream_disconnected_placeholder
+                    or _navigation_status_can_follow(
+                        self._last_nav_status,
+                        status,
+                    )
+                )
+                if (
+                    not lease_is_exact
+                    or not (
+                        command_generation_is_current
+                        or inflight_cancel_terminal
+                    )
+                    or not status_is_monotonic
+                    or (
+                        current_status in terminal_statuses
+                        and not stream_disconnected_placeholder
+                    )
+                ):
+                    LOGGER.info(
+                        "丢弃 stale navigation stream frame: incoming_goal=%s/%s current_goal=%s/%s command=%s/%s status=%s->%s",
+                        incoming_lease[0] or None,
+                        incoming_lease[3],
+                        current_goal_id,
+                        current_lease[3],
+                        self._last_nav_goal_command_generation,
+                        self._nav_command_generation,
+                        current_status.value,
+                        incoming_status.value,
+                    )
+                    return False
+                self._last_nav_goal_id = incoming_lease[0] or None
+                self._last_nav_owner_kind = incoming_lease[1]
+                self._last_nav_parent_request_id = incoming_lease[2]
+                self._last_nav_goal_generation = incoming_lease[3]
+                self._last_nav_producer_runtime_generation = incoming_lease[4]
+                self._last_nav_status = status
+                self._last_nav_message = message
+                self._last_nav_distance_remaining = (
+                    float(distance) if distance is not None else None
+                )
+                self._last_nav_current_pose = None
+                self._last_nav_timestamp_ns = ts_ns
+                self._last_nav_metadata = _navigation_state_typed_metadata(
+                    update
+                )
+                if inflight_cancel_terminal:
+                    self._last_nav_goal_command_generation = inflight_token[2]
+                    self._nav_inflight_command_token = None
+                    self._nav_completed_cancel_command_token = inflight_token
+                return True
+
+    def _mark_navigation_stream_disconnected(
+        self,
+        error: str,
+        *,
+        stream_token: _NavigationStreamToken,
+        stream_stub,
+    ) -> bool:
+        with self._nav_command_lock:
+            if not self._navigation_stream_is_current_locked(
+                stream_token,
+                stream_stub,
+            ):
+                return False
+            with self._nav_state_lock:
+                current_status = self._nav_status_to_enum(
+                    self._last_nav_status
+                )
+                terminal_statuses = {
+                    NavigationStatus.SUCCEEDED,
+                    NavigationStatus.FAILED,
+                    NavigationStatus.CANCELLED,
+                }
+                current_lease = self._current_navigation_lease_locked()
+                if (
+                    current_status in terminal_statuses
+                    or self._last_nav_goal_command_generation
+                    != self._nav_command_generation
+                    or (
+                        current_lease[0]
+                        and not _is_canonical_public_navigation_lease(
+                            current_lease
+                        )
+                    )
+                ):
+                    return False
+                has_goal = bool(self._last_nav_goal_id)
+                self._last_nav_status = "failed" if has_goal else "idle"
+                self._last_nav_message = (
+                    "导航状态流断开，正在重连：%s"
+                    % (error or "unknown")
+                )
+                self._last_nav_distance_remaining = None
+                self._last_nav_timestamp_ns = time.time_ns()
+                self._last_nav_metadata = {
+                    "raw_status": self._last_nav_status,
+                    "reason_code": "NAVIGATION_STREAM_DISCONNECTED",
+                    "observed_goal_id": self._last_nav_goal_id or "",
+                    "owner_kind": self._last_nav_owner_kind,
+                    "parent_request_id": (
+                        self._last_nav_parent_request_id
+                    ),
+                    "goal_generation": self._last_nav_goal_generation,
+                    "producer_runtime_generation": (
+                        self._last_nav_producer_runtime_generation
+                    ),
+                }
+                return True
 
     @staticmethod
     def _nav_status_to_enum(raw_status: str) -> NavigationStatus:
@@ -940,7 +2771,7 @@ class GeometryRuntimeProvider:
         }
         return mapping.get(normalized, NavigationStatus.IDLE)
 
-    def _build_navigation_state_snapshot(self) -> NavigationState:
+    def _build_navigation_state_snapshot(self, *, include_readiness: bool = True) -> NavigationState:
         """合成 NavigationState 契约（按本地缓存 + readiness，不假装 ready）。
 
         - 未收到任何 SubscribeNavigationState 帧：返回 IDLE；
@@ -954,11 +2785,21 @@ class GeometryRuntimeProvider:
             message = self._last_nav_message
             distance = self._last_nav_distance_remaining
             pose = self._last_nav_current_pose
+            timestamp_ns = self._last_nav_timestamp_ns
+            typed_metadata = dict(self._last_nav_metadata)
+
+        timestamp = (
+            datetime.fromtimestamp(timestamp_ns / 1_000_000_000.0, tz=timezone.utc)
+            if timestamp_ns > 0
+            else datetime.now(timezone.utc)
+        )
 
         status_enum = self._nav_status_to_enum(raw_status)
         # 没有任何流帧 → IDLE，goal_id 留空，绝不假装有 current goal
         if not raw_status:
             return NavigationState(
+                timestamp=timestamp,
+                updated_at=timestamp,
                 status=NavigationStatus.IDLE,
                 current_goal_id=None,
                 goal_reached=False,
@@ -967,23 +2808,31 @@ class GeometryRuntimeProvider:
             )
 
         # readiness 兜底：未就绪时在 message 上补 waiting_for 提示（不伪造状态）
-        metadata: Dict[str, Any] = {"provider": "geometry_runtime", "shim": True}
-        try:
-            readiness = self.get_navigation_readiness()
-            if readiness:
-                metadata["nav2_readiness"] = dict(readiness)
-                if not bool(readiness.get("ready")):
-                    hint = readiness.get("message") or readiness.get("waiting_for") or "导航后端未就绪"
-                    if message:
-                        message = "%s | %s" % (message, hint)
-                    else:
-                        message = str(hint)
-        except Exception:  # pragma: no cover - readiness 失败不影响主流程
-            pass
+        metadata: Dict[str, Any] = {
+            "provider": "geometry_runtime",
+            "shim": True,
+            **typed_metadata,
+        }
+        metadata.setdefault("raw_status", raw_status)
+        if include_readiness:
+            try:
+                readiness = self.get_navigation_readiness()
+                if readiness:
+                    metadata["readiness"] = dict(readiness)
+                    if not bool(readiness.get("ready")):
+                        hint = readiness.get("message") or readiness.get("waiting_for") or "导航后端未就绪"
+                        if message:
+                            message = "%s | %s" % (message, hint)
+                        else:
+                            message = str(hint)
+            except Exception:  # pragma: no cover - readiness 失败不影响主流程
+                pass
 
         goal_reached = status_enum == NavigationStatus.SUCCEEDED
 
         return NavigationState(
+            timestamp=timestamp,
+            updated_at=timestamp,
             status=status_enum,
             current_goal_id=goal_id,
             current_pose=pose,
@@ -1006,6 +2855,60 @@ class GeometryRuntimeProvider:
             planning/running → True；failed/cancelled → False）；调用失败 / stub 不可用
             返回 False，绝不假装成功。
         """
+        transaction_context = self._nav_set_transaction_context
+        if getattr(transaction_context, "active", False):
+            raise RuntimeError("reentrant_set_goal")
+        with self._nav_notification_condition:
+            if (
+                self._nav_pending_notification_tickets
+                or self._nav_active_notification_count > 0
+            ):
+                raise RuntimeError("navigation_notification_in_progress")
+
+        request_goal_id = str(getattr(goal, "goal_id", "") or "").strip()
+        transaction_context.result = (request_goal_id, False, "")
+        transaction_context.notification = None
+        transaction_context.active = True
+        try:
+            with self._nav_set_transaction_lock:
+                # A caller may have waited behind a Set that just committed a
+                # synchronous callback ticket. Do not enter a callback cycle.
+                with self._nav_notification_condition:
+                    if (
+                        self._nav_pending_notification_tickets
+                        or self._nav_active_notification_count > 0
+                    ):
+                        raise RuntimeError(
+                            "navigation_notification_in_progress"
+                        )
+                accepted = self._set_goal_transaction(goal)
+                notification = transaction_context.notification
+
+            if notification is not None:
+                try:
+                    self._notify_navigation_subscribers(notification)
+                except Exception:  # pragma: no cover - defensive fanout fence
+                    with self._nav_notification_condition:
+                        notification.cancelled = True
+                    self._retire_navigation_notification(notification)
+                    LOGGER.exception(
+                        "SetNavigationGoal 已提交，但通知投递异常。"
+                    )
+            if accepted:
+                try:
+                    self._ensure_nav_state_stream()
+                except Exception:
+                    LOGGER.exception(
+                        "SetNavigationGoal 已提交，但导航状态流启动异常。"
+                    )
+            return accepted
+        finally:
+            transaction_context.notification = None
+            transaction_context.active = False
+
+    def _set_goal_transaction(self, goal) -> bool:
+        """Execute one SetGoal transaction while the Set-only gate is held."""
+
         self._raise_if_stopping("set_goal")
         if not self._stub:
             LOGGER.warning("GeometryRuntimeProvider.set_goal stub 不可用，返回 False。")
@@ -1017,6 +2920,9 @@ class GeometryRuntimeProvider:
                 getattr(goal, "goal_id", None),
             )
             return False
+        command_generation = None
+        command_token = None
+        command_stub = None
         try:
             proto_pose = pb2.Pose(
                 position=pb2.Vec3(
@@ -1031,72 +2937,551 @@ class GeometryRuntimeProvider:
                     w=float(target_pose.orientation.w),
                 ),
                 frame_id=str(getattr(target_pose, "frame_id", "") or ""),
+                timestamp_ns=_datetime_to_timestamp_ns(
+                    getattr(target_pose, "timestamp", None)
+                ),
             )
-            request_goal_id = str(getattr(goal, "goal_id", "") or "")
+            request_goal_id = str(
+                getattr(goal, "goal_id", "") or ""
+            ).strip()
+            if not request_goal_id:
+                LOGGER.warning("GeometryRuntimeProvider 拒绝空 goal_id。")
+                return False
+            canonical_parent_request_id = request_goal_id
             target_frame_id = str(getattr(target_pose, "frame_id", "") or "") or "map"
             proto_goal = pb2.NavigationGoal(
                 pose=proto_pose,
                 frame_id=target_frame_id,
-                goal_id=request_goal_id or "",
+                goal_id=request_goal_id,
+                owner_kind=_PUBLIC_NAV_OWNER_KIND,
+                parent_request_id=canonical_parent_request_id,
+                goal_generation=0,
             )
-            resp = self._stub.SetNavigationGoal(proto_goal, timeout=_read_deadline_sec())
+            request_lease = (
+                request_goal_id,
+                _PUBLIC_NAV_OWNER_KIND,
+                canonical_parent_request_id,
+                0,
+                0,
+            )
+            with self._nav_delivery_lock:
+                with self._nav_command_lock:
+                    if (
+                        self._nav_connection_transition_inflight
+                        or not self._connected
+                        or self._stub is None
+                    ):
+                        return False
+                    command_stub = self._stub
+                    self._clear_navigation_set_precommit_locked()
+                    self._nav_command_generation += 1
+                    command_generation = self._nav_command_generation
+                    command_token = (
+                        "set",
+                        request_lease,
+                        command_generation,
+                        self._nav_connection_epoch,
+                    )
+                    self._nav_inflight_command_token = command_token
+                    self._nav_completed_cancel_command_token = None
+                self._cancel_pending_navigation_notifications_locked()
+            resp = command_stub.SetNavigationGoal(
+                proto_goal,
+                timeout=_read_deadline_sec(),
+            )
             # Rust SetNavigationGoal 返回 NavigationState（非 NavigationAck）；
             # accepted 语义由 status 字符串反推（accepted/planning/running → True）
-            accepted = _status_means_accepted(getattr(resp, "status", ""))
-            ack_goal_id = getattr(resp, "goal_id", "") or request_goal_id or None
-            ack_message = getattr(resp, "message", "") or None
-            # 同步本地缓存：accepted 时把状态置为 ACCEPTED，等待 SubscribeNavigationState 流覆盖
-            with self._nav_state_lock:
+            ack_lease = _navigation_lease_from_message(resp)
+            accepted = bool(
+                _status_means_accepted(getattr(resp, "status", ""))
+                and _is_canonical_public_navigation_lease(ack_lease)
+                and ack_lease[0] == request_goal_id
+                and ack_lease[2] == canonical_parent_request_id
+            )
+            # RPC 不持命令锁；仅当前最新命令可提交响应，迟到响应 fail-closed。
+            notification = None
+            with self._nav_delivery_lock:
+                with self._nav_command_lock:
+                    command_is_current = bool(
+                        command_token is not None
+                        and command_token == self._nav_inflight_command_token
+                        and command_generation == self._nav_command_generation
+                        and command_token[3] == self._nav_connection_epoch
+                        and self._stub is command_stub
+                        and self._connected
+                        and not self._nav_connection_transition_inflight
+                    )
+                    if not command_is_current:
+                        if command_token is not None:
+                            self._clear_navigation_set_precommit_locked(
+                                command_token
+                            )
+                        LOGGER.info(
+                            "忽略被后续导航命令取代的 SetNavigationGoal 响应: goal_id=%s generation=%s current=%s",
+                            request_goal_id or None,
+                            command_generation,
+                            self._nav_command_generation,
+                        )
+                        return False
+                    precommitted_update = None
+                    if command_token is not None:
+                        precommitted_update = (
+                            self._take_navigation_set_precommit_locked(
+                                command_token=command_token,
+                                ack_lease=ack_lease,
+                            )
+                        )
+                    self._nav_inflight_command_token = None
+                    committed_update = resp
+                    committed_from_stream = bool(
+                        accepted
+                        and precommitted_update is not None
+                        and _navigation_status_is_ahead(
+                            getattr(resp, "status", ""),
+                            getattr(precommitted_update, "status", ""),
+                        )
+                    )
+                    if committed_from_stream:
+                        committed_update = precommitted_update
+                    with self._nav_state_lock:
+                        # RPC 已结束；若目标被拒绝，恢复当前目标的流提交资格。
+                        self._last_nav_goal_command_generation = (
+                            command_generation
+                        )
+                        if accepted:
+                            self._last_nav_goal_id = ack_lease[0]
+                            self._last_nav_owner_kind = ack_lease[1]
+                            self._last_nav_parent_request_id = ack_lease[2]
+                            self._last_nav_goal_generation = ack_lease[3]
+                            self._last_nav_producer_runtime_generation = (
+                                ack_lease[4]
+                            )
+                            self._last_nav_status = (
+                                getattr(committed_update, "status", "")
+                                if committed_from_stream
+                                else "accepted"
+                            )
+                            self._last_nav_message = (
+                                getattr(committed_update, "message", "")
+                                or None
+                            )
+                            if committed_from_stream:
+                                distance = getattr(
+                                    committed_update,
+                                    "distance_remaining",
+                                    None,
+                                )
+                                self._last_nav_distance_remaining = (
+                                    float(distance)
+                                    if distance is not None
+                                    else None
+                                )
+                            else:
+                                self._last_nav_distance_remaining = None
+                            self._last_nav_current_pose = None
+                            self._last_nav_timestamp_ns = int(
+                                getattr(committed_update, "timestamp_ns", 0)
+                                if committed_from_stream
+                                else proto_pose.timestamp_ns
+                            )
+                            self._last_nav_metadata = (
+                                _navigation_state_typed_metadata(
+                                    committed_update
+                                )
+                            )
+                transaction_context = self._nav_set_transaction_context
+                transaction_context.result = (
+                    request_goal_id,
+                    accepted,
+                    str(getattr(committed_update, "message", "") or ""),
+                )
                 if accepted:
-                    self._last_nav_goal_id = ack_goal_id
-                    self._last_nav_status = "accepted"
-                    self._last_nav_message = ack_message
-                    self._last_nav_distance_remaining = None
-                    self._last_nav_current_pose = None
-                    self._last_nav_timestamp_ns = 0
-            # accepted 后再异步起流，避免 set_goal 同步路径被阻塞
-            self._ensure_nav_state_stream()
+                    with self._nav_notification_condition:
+                        ticket_ids_before = frozenset(
+                            self._nav_pending_notification_tickets
+                        )
+                    try:
+                        state = self._build_navigation_state_snapshot(
+                            include_readiness=False
+                        )
+                        notification = self._begin_navigation_notification(
+                            state
+                        )
+                    except Exception:
+                        with self._nav_notification_condition:
+                            for ticket_id, ticket in tuple(
+                                self._nav_pending_notification_tickets.items()
+                            ):
+                                if ticket_id in ticket_ids_before:
+                                    continue
+                                ticket.cancelled = True
+                                self._nav_pending_notification_tickets.pop(
+                                    ticket_id,
+                                    None,
+                                )
+                            self._nav_notification_condition.notify_all()
+                        LOGGER.exception(
+                            "SetNavigationGoal 已提交，但通知准备异常。"
+                        )
+                        notification = None
+            transaction_context.notification = notification
             return accepted
         except grpc.RpcError as exc:
+            if command_generation is not None:
+                with self._nav_delivery_lock:
+                    with self._nav_command_lock:
+                        if command_token is not None:
+                            self._clear_navigation_set_precommit_locked(
+                                command_token
+                            )
+                        if (
+                            command_token is not None
+                            and command_token
+                            == self._nav_inflight_command_token
+                            and command_generation
+                            == self._nav_command_generation
+                            and command_token[3]
+                            == self._nav_connection_epoch
+                            and self._stub is command_stub
+                        ):
+                            self._nav_inflight_command_token = None
+                            with self._nav_state_lock:
+                                self._last_nav_goal_command_generation = (
+                                    command_generation
+                                )
             _log_rpc_error("SetNavigationGoal", exc)
             return False
         except Exception:  # pragma: no cover - 防御性兜底
+            if command_generation is not None:
+                with self._nav_delivery_lock:
+                    with self._nav_command_lock:
+                        if command_token is not None:
+                            self._clear_navigation_set_precommit_locked(
+                                command_token
+                            )
+                        if (
+                            command_token is not None
+                            and command_token
+                            == self._nav_inflight_command_token
+                            and command_generation
+                            == self._nav_command_generation
+                            and command_token[3]
+                            == self._nav_connection_epoch
+                            and self._stub is command_stub
+                        ):
+                            self._nav_inflight_command_token = None
+                            with self._nav_state_lock:
+                                self._last_nav_goal_command_generation = (
+                                    command_generation
+                                )
             LOGGER.exception("GeometryRuntimeProvider.set_goal 异常。")
             return False
 
     def cancel_goal(self, request_id: Optional[str] = None) -> bool:
-        """NavigationProvider 协议 shim：取消当前导航目标。
-
-        request_id 参数在 Rust facade 当前实现下未消费（CancelNavigation 不接受参数），
-        保留以匹配 NavigationProvider 协议签名。
-        """
+        """NavigationProvider 协议 shim：定向取消当前 exact goal。"""
         self._raise_if_stopping("cancel_goal")
+        exact_goal_id = str(request_id or "").strip()
+        if not exact_goal_id:
+            LOGGER.warning("GeometryRuntimeProvider 拒绝缺少 exact goal_id 的取消请求。")
+            return False
         if not self._stub:
             LOGGER.warning("GeometryRuntimeProvider.cancel_goal stub 不可用，返回 False。")
             return False
+        command_stub = None
+        command_token = None
+        command_generation = None
+        with self._nav_delivery_lock:
+            with self._nav_command_lock:
+                if (
+                    self._nav_connection_transition_inflight
+                    or not self._connected
+                    or self._stub is None
+                ):
+                    return False
+                inflight_token = self._nav_inflight_command_token
+                if (
+                    inflight_token is not None
+                    and inflight_token[0] == "set"
+                    and inflight_token[2] == self._nav_command_generation
+                    and inflight_token[3] == self._nav_connection_epoch
+                ):
+                    LOGGER.warning(
+                        "GeometryRuntimeProvider 拒绝在 SetGoal 事务中取消旧缓存目标：requested_goal_id=%s set_goal_id=%s",
+                        exact_goal_id,
+                        inflight_token[1][0] or None,
+                    )
+                    return False
+                command_stub = self._stub
+                with self._nav_state_lock:
+                    active_lease = self._current_navigation_lease_locked()
+                    active_goal_id = active_lease[0]
+                    active_status = self._nav_status_to_enum(
+                        self._last_nav_status
+                    )
+                if (
+                    active_goal_id != exact_goal_id
+                    or not _is_canonical_public_navigation_lease(active_lease)
+                    or active_status
+                    in {
+                        NavigationStatus.IDLE,
+                        NavigationStatus.SUCCEEDED,
+                        NavigationStatus.FAILED,
+                        NavigationStatus.CANCELLED,
+                    }
+                ):
+                    LOGGER.warning(
+                        "GeometryRuntimeProvider 拒绝 stale 定向取消：requested_goal_id=%s active_goal_id=%s status=%s",
+                        exact_goal_id,
+                        active_goal_id or None,
+                        active_status.value,
+                    )
+                    return False
+                self._clear_navigation_set_precommit_locked()
+                self._nav_command_generation += 1
+                command_generation = self._nav_command_generation
+                command_token = (
+                    "cancel",
+                    active_lease,
+                    command_generation,
+                    self._nav_connection_epoch,
+                )
+                self._nav_inflight_command_token = command_token
+                self._nav_completed_cancel_command_token = None
+            self._cancel_pending_navigation_notifications_locked()
         try:
-            req = pb2.CancelNavigationRequest(goal_id=request_id or "")
-            resp = self._stub.CancelNavigation(req, timeout=_read_deadline_sec())
+            req = pb2.CancelNavigationRequest(
+                goal_id=active_lease[0],
+                owner_kind=active_lease[1],
+                parent_request_id=active_lease[2],
+                goal_generation=active_lease[3],
+                producer_runtime_generation=active_lease[4],
+            )
+            resp = command_stub.CancelNavigation(
+                req,
+                timeout=_read_deadline_sec(),
+            )
             raw_status = getattr(resp, "status", "") or ""
             terminal = _status_means_cancelled(raw_status)
-            success = terminal or _status_means_accepted(raw_status)
+            success = bool(
+                _status_means_cancel_success(raw_status)
+                and (
+                    not terminal
+                    or _navigation_update_has_complete_zero_proof(resp)
+                )
+            )
             cancel_message = getattr(resp, "message", "") or None
-            with self._nav_state_lock:
-                if terminal:
-                    self._last_nav_status = "cancelled"
-                    if cancel_message:
-                        self._last_nav_message = cancel_message
-                elif success:
-                    self._last_nav_status = raw_status.strip().lower() or "pending"
-                    if cancel_message:
-                        self._last_nav_message = cancel_message
+            response_lease = _navigation_lease_from_message(resp)
+            notification = None
+            with self._nav_delivery_lock:
+                with self._nav_command_lock:
+                    with self._nav_state_lock:
+                        current_lease = self._current_navigation_lease_locked()
+                        current_goal_id = current_lease[0]
+                        terminal_already_committed = bool(
+                            command_token is not None
+                            and command_token
+                            == self._nav_completed_cancel_command_token
+                            and command_token[2]
+                            == self._nav_command_generation
+                            and command_token[3]
+                            == self._nav_connection_epoch
+                            and current_lease == active_lease
+                            and self._nav_status_to_enum(
+                                self._last_nav_status
+                            )
+                            == NavigationStatus.CANCELLED
+                            and self._last_nav_metadata.get(
+                                "actuator_zeroed"
+                            )
+                            is True
+                            and bool(
+                                str(
+                                    self._last_nav_metadata.get(
+                                        "zero_ack_id",
+                                        "",
+                                    )
+                                    or ""
+                                ).strip()
+                            )
+                            and int(
+                                self._last_nav_metadata.get(
+                                    "zero_applied_monotonic_ns",
+                                    0,
+                                )
+                                or 0
+                            )
+                            > 0
+                        )
+                        command_is_current = bool(
+                            command_token is not None
+                            and command_token
+                            == self._nav_inflight_command_token
+                            and command_token[2]
+                            == self._nav_command_generation
+                            and command_token[3]
+                            == self._nav_connection_epoch
+                            and self._stub is command_stub
+                            and self._connected
+                            and not self._nav_connection_transition_inflight
+                        )
+                        response_is_current = bool(
+                            command_is_current
+                            and current_lease == active_lease
+                            and response_lease == active_lease
+                            and _is_canonical_public_navigation_lease(
+                                response_lease
+                            )
+                        )
+                        if terminal_already_committed:
+                            self._nav_completed_cancel_command_token = None
+                        elif command_is_current:
+                            self._nav_inflight_command_token = None
+                            self._last_nav_goal_command_generation = (
+                                command_generation
+                            )
+                        if response_is_current and success:
+                            self._last_nav_metadata = (
+                                _navigation_state_typed_metadata(resp)
+                            )
+                            if terminal:
+                                self._last_nav_status = "cancelled"
+                                if cancel_message:
+                                    self._last_nav_message = cancel_message
+                            else:
+                                self._last_nav_status = (
+                                    raw_status.strip().lower()
+                                )
+                                if cancel_message:
+                                    self._last_nav_message = cancel_message
+                    if terminal_already_committed:
+                        return True
+                    if not response_is_current:
+                        LOGGER.info(
+                            "忽略 stale CancelNavigation 响应: goal_id=%s/%s generation=%s/%s command=%s/%s active_goal_id=%s/%s",
+                            exact_goal_id,
+                            response_lease[0] or None,
+                            active_lease[3],
+                            response_lease[3],
+                            command_generation,
+                            self._nav_command_generation,
+                            current_goal_id or None,
+                            current_lease[3],
+                        )
+                        return False
+                if success:
+                    state = self._build_navigation_state_snapshot(
+                        include_readiness=False
+                    )
+                    notification = self._begin_navigation_notification(state)
+            if notification is not None:
+                self._notify_navigation_subscribers(notification)
             return success
         except grpc.RpcError as exc:
+            terminal_already_committed = False
+            with self._nav_delivery_lock:
+                with self._nav_command_lock:
+                    with self._nav_state_lock:
+                        terminal_already_committed = bool(
+                            command_token is not None
+                            and command_token
+                            == self._nav_completed_cancel_command_token
+                            and command_token[2]
+                            == self._nav_command_generation
+                            and command_token[3]
+                            == self._nav_connection_epoch
+                            and self._current_navigation_lease_locked()
+                            == active_lease
+                            and self._nav_status_to_enum(
+                                self._last_nav_status
+                            )
+                            == NavigationStatus.CANCELLED
+                            and self._last_nav_metadata.get(
+                                "actuator_zeroed"
+                            )
+                            is True
+                            and bool(
+                                self._last_nav_metadata.get("zero_ack_id")
+                            )
+                            and int(
+                                self._last_nav_metadata.get(
+                                    "zero_applied_monotonic_ns",
+                                    0,
+                                )
+                                or 0
+                            )
+                            > 0
+                        )
+                        if terminal_already_committed:
+                            self._nav_completed_cancel_command_token = None
+                        elif (
+                            command_token is not None
+                            and command_token
+                            == self._nav_inflight_command_token
+                            and command_token[2]
+                            == self._nav_command_generation
+                            and command_token[3]
+                            == self._nav_connection_epoch
+                            and self._stub is command_stub
+                        ):
+                            self._nav_inflight_command_token = None
+                            self._last_nav_goal_command_generation = (
+                                command_generation
+                            )
             _log_rpc_error("CancelNavigation", exc)
-            return False
+            return terminal_already_committed
         except Exception:  # pragma: no cover
+            terminal_already_committed = False
+            with self._nav_delivery_lock:
+                with self._nav_command_lock:
+                    with self._nav_state_lock:
+                        terminal_already_committed = bool(
+                            command_token is not None
+                            and command_token
+                            == self._nav_completed_cancel_command_token
+                            and command_token[2]
+                            == self._nav_command_generation
+                            and command_token[3]
+                            == self._nav_connection_epoch
+                            and self._current_navigation_lease_locked()
+                            == active_lease
+                            and self._nav_status_to_enum(
+                                self._last_nav_status
+                            )
+                            == NavigationStatus.CANCELLED
+                            and self._last_nav_metadata.get(
+                                "actuator_zeroed"
+                            )
+                            is True
+                            and bool(
+                                self._last_nav_metadata.get("zero_ack_id")
+                            )
+                            and int(
+                                self._last_nav_metadata.get(
+                                    "zero_applied_monotonic_ns",
+                                    0,
+                                )
+                                or 0
+                            )
+                            > 0
+                        )
+                        if terminal_already_committed:
+                            self._nav_completed_cancel_command_token = None
+                        elif (
+                            command_token is not None
+                            and command_token
+                            == self._nav_inflight_command_token
+                            and command_token[2]
+                            == self._nav_command_generation
+                            and command_token[3]
+                            == self._nav_connection_epoch
+                            and self._stub is command_stub
+                        ):
+                            self._nav_inflight_command_token = None
+                            self._last_nav_goal_command_generation = (
+                                command_generation
+                            )
             LOGGER.exception("GeometryRuntimeProvider.cancel_goal 异常。")
-            return False
+            return terminal_already_committed
 
     def is_goal_reached(self) -> bool:
         """NavigationProvider 协议 shim：当前目标是否已到达。
@@ -1104,7 +3489,7 @@ class GeometryRuntimeProvider:
         基于本地缓存（SubscribeNavigationState 最近一帧的 status）。
         """
         with self._nav_state_lock:
-            return self._last_nav_status == "succeeded"
+            return _status_means_succeeded(self._last_nav_status)
 
     def get_navigation_state(self) -> NavigationState:
         """NavigationProvider 协议 shim：返回 NavigationState 契约实例。
@@ -1115,6 +3500,83 @@ class GeometryRuntimeProvider:
         self._ensure_nav_state_stream()
         return self._build_navigation_state_snapshot()
 
+    def subscribe_navigation_updates(
+        self,
+        callback: Callable[[NavigationState], None],
+    ) -> Optional[int]:
+        if not callable(callback):
+            raise ValueError("navigation update callback must be callable")
+        with self._nav_delivery_lock:
+            with self._nav_command_lock:
+                if (
+                    self._stub is None
+                    or self._stopping
+                    or not self._connected
+                    or self._nav_connection_transition_inflight
+                ):
+                    return None
+                with self._nav_state_lock:
+                    subscription_id = self._next_navigation_subscription_id
+                    self._next_navigation_subscription_id += 1
+                    self._navigation_update_subscribers[
+                        subscription_id
+                    ] = callback
+        self._ensure_nav_state_stream()
+        return subscription_id
+
+    def unsubscribe_navigation_updates(self, subscription_id: int) -> bool:
+        subscription_id = int(subscription_id)
+        with self._nav_delivery_lock:
+            with self._nav_state_lock:
+                removed = self._navigation_update_subscribers.pop(
+                    subscription_id,
+                    None,
+                )
+        if removed is None:
+            return False
+        self._wait_for_navigation_subscription_callbacks(subscription_id)
+        return True
+
+    def _notify_navigation_subscribers(
+        self,
+        ticket: _NavigationNotificationTicket,
+    ) -> None:
+        try:
+            for subscription_id, callback in ticket.subscribers:
+                if not self._begin_navigation_notification_callback(
+                    ticket,
+                    subscription_id,
+                    callback,
+                ):
+                    continue
+                try:
+                    callback(ticket.state.model_copy(deep=True))
+                except Exception:
+                    LOGGER.exception("导航状态回调失败，其他订阅者继续。")
+                finally:
+                    self._finish_navigation_notification(
+                        ticket,
+                        subscription_id,
+                    )
+        finally:
+            self._retire_navigation_notification(ticket)
+
+    def navigate(self, goal, timeout_sec: Optional[int] = None) -> str:
+        del timeout_sec
+        return str(getattr(goal, "goal_id", "") or "") if self.set_goal(goal) else ""
+
+    def cancel(self, request_id: Optional[str] = None) -> bool:
+        return self.cancel_goal(request_id=request_id)
+
+    def get_state(self, request_id: Optional[str] = None) -> NavigationState:
+        state = self.get_navigation_state()
+        if request_id and state.current_goal_id not in {None, request_id}:
+            metadata = dict(state.metadata)
+            metadata["requested_goal_id"] = request_id
+            metadata["goal_id_mismatch"] = True
+            return state.model_copy(update={"metadata": metadata}, deep=True)
+        return state
+
     # === 探索 RPC（Phase 5 additive, 走 Rust explore_runtime） ===
     def start_exploration(
         self,
@@ -1123,23 +3585,76 @@ class GeometryRuntimeProvider:
         strategy: str = "wavefront",
         arbitration: str = "prefer_wavefront",
         map_version_id: str = "",
+        map_revision: int = 0,
+        boundary_line_segments=None,
+        stop_conditions: Optional[Dict[str, Any]] = None,
+        max_navigation_retries: int = 0,
+        blacklist_radius_m: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
         """启动探索(走 Rust `nuwax_exploration::ExplorationController`)。
 
-        返回 dict 表示 ExplorationState 字段(status/message/request_id/
-        selected_source/last_stop_reason/frontier_count/revision/timestamp_ns);
-        stub 未就绪或 RPC 异常时返回 None,绝不假装成功。
+        完整编码 map pin、顺序边界、typed stop conditions、重试与 blacklist
+        参数。stub 未就绪或 RPC 异常时返回 None,绝不假装成功。
         """
         self._raise_if_stopping("start_exploration")
         if not self._stub:
             return None
         try:
+            proto_segments = []
+            for start_pose, end_pose in boundary_line_segments or ():
+                proto_segments.append(
+                    pb2.ExplorationBoundarySegment(
+                        start_x=float(start_pose.position.x),
+                        start_y=float(start_pose.position.y),
+                        end_x=float(end_pose.position.x),
+                        end_y=float(end_pose.position.y),
+                    )
+                )
+
             req = pb2.ExploreRequest(
                 strategy=strategy,
                 arbitration=arbitration,
                 map_version_id=map_version_id,
                 request_id=request_id,
+                map_revision=max(0, int(map_revision)),
+                boundary_line_segments=proto_segments,
+                max_navigation_retries=max(0, int(max_navigation_retries)),
+                blacklist_radius_m=max(0.0, float(blacklist_radius_m)),
             )
+            raw_stop_conditions = dict(stop_conditions or {})
+            recognized_stop_keys = {
+                "max_coverage_pct",
+                "no_frontier_timeout_ms",
+                "max_duration_ms",
+                "max_goals",
+                "stop_on_map_revision_change",
+            }
+            if any(
+                key in raw_stop_conditions and raw_stop_conditions[key] is not None
+                for key in recognized_stop_keys
+            ):
+                proto_stop_conditions = pb2.ExplorationStopConditions()
+                if raw_stop_conditions.get("max_coverage_pct") is not None:
+                    proto_stop_conditions.max_coverage_pct = float(
+                        raw_stop_conditions["max_coverage_pct"]
+                    )
+                if raw_stop_conditions.get("no_frontier_timeout_ms") is not None:
+                    proto_stop_conditions.no_frontier_timeout_ms = max(
+                        0, int(raw_stop_conditions["no_frontier_timeout_ms"])
+                    )
+                if raw_stop_conditions.get("max_duration_ms") is not None:
+                    proto_stop_conditions.max_duration_ms = max(
+                        0, int(raw_stop_conditions["max_duration_ms"])
+                    )
+                if raw_stop_conditions.get("max_goals") is not None:
+                    proto_stop_conditions.max_goals = max(
+                        0, int(raw_stop_conditions["max_goals"])
+                    )
+                if "stop_on_map_revision_change" in raw_stop_conditions:
+                    proto_stop_conditions.stop_on_map_revision_change = bool(
+                        raw_stop_conditions["stop_on_map_revision_change"]
+                    )
+                req.stop_conditions.CopyFrom(proto_stop_conditions)
             resp = self._stub.StartExploration(req, timeout=_read_deadline_sec())
             return _exploration_state_to_dict(resp)
         except grpc.RpcError as e:
@@ -1178,6 +3693,164 @@ class GeometryRuntimeProvider:
         except grpc.RpcError as e:
             _log_rpc_error("GetExplorationState", e)
             return None
+
+    @staticmethod
+    def _exploration_state_signature(state: Dict[str, Any]):
+        """返回不含采样时间的状态身份，用于抑制轮询重复帧。"""
+
+        return (
+            state.get("status"),
+            state.get("message"),
+            state.get("request_id"),
+            state.get("selected_source"),
+            state.get("last_stop_reason"),
+            state.get("frontier_count"),
+            state.get("revision"),
+            state.get("child_task_id"),
+            state.get("map_version_id"),
+            state.get("map_revision"),
+        )
+
+    def _ensure_exploration_poll_worker(self) -> None:
+        """首个订阅者到来时启动唯一的 exploration 状态轮询线程。"""
+
+        with self._exploration_state_lock:
+            if (
+                not self._exploration_update_subscribers
+                or not self._stub
+                or self._stopping
+            ):
+                return
+            current = self._exploration_poll_thread
+            if current is not None and current.is_alive():
+                return
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=self._exploration_poll_worker,
+                args=(stop_event,),
+                name="geometry_runtime_exploration_state_poll",
+                daemon=True,
+            )
+            self._exploration_poll_stop_event = stop_event
+            self._exploration_poll_thread = thread
+            self._last_exploration_signature = None
+            thread.start()
+
+    def _exploration_poll_worker(self, stop_event: threading.Event) -> None:
+        """轮询 frozen unary RPC；失败指数退避，成功后按状态身份去重。"""
+
+        retry_base = _grpc_stream_retry_sec()
+        retry_max = _grpc_stream_retry_max_sec()
+        retry_delay = retry_base
+        try:
+            while not stop_event.is_set():
+                with self._exploration_state_lock:
+                    if not self._exploration_update_subscribers:
+                        return
+                    stub = self._stub
+                if stub is None or self._stopping:
+                    return
+                try:
+                    response = stub.GetExplorationState(
+                        pb2.Empty(),
+                        timeout=_read_deadline_sec(),
+                    )
+                    state = _exploration_state_to_dict(response)
+                except grpc.RpcError as exc:
+                    if stop_event.is_set() or self._stopping:
+                        return
+                    LOGGER.warning(
+                        "GetExplorationState 后台轮询失败，%.2fs 后重试: %s",
+                        retry_delay,
+                        exc,
+                    )
+                    if stop_event.wait(retry_delay):
+                        return
+                    retry_delay = min(retry_max, retry_delay * 2.0)
+                    continue
+                except Exception as exc:  # pragma: no cover - 防御第三方 stub
+                    if stop_event.is_set() or self._stopping:
+                        return
+                    LOGGER.warning(
+                        "GetExplorationState 后台轮询异常，%.2fs 后重试: %s",
+                        retry_delay,
+                        exc,
+                    )
+                    if stop_event.wait(retry_delay):
+                        return
+                    retry_delay = min(retry_max, retry_delay * 2.0)
+                    continue
+
+                retry_delay = retry_base
+                signature = self._exploration_state_signature(state)
+                with self._exploration_state_lock:
+                    if signature == self._last_exploration_signature:
+                        subscribers = ()
+                    else:
+                        self._last_exploration_signature = signature
+                        subscribers = tuple(
+                            self._exploration_update_subscribers.values()
+                        )
+                for callback in subscribers:
+                    try:
+                        callback(dict(state))
+                    except Exception:
+                        LOGGER.exception("探索状态回调失败，其他订阅者继续。")
+                if stop_event.wait(_exploration_poll_sec()):
+                    return
+        finally:
+            with self._exploration_state_lock:
+                if self._exploration_poll_thread is threading.current_thread():
+                    self._exploration_poll_thread = None
+                if self._exploration_poll_stop_event is stop_event:
+                    self._exploration_poll_stop_event = None
+                should_restart = bool(
+                    self._exploration_update_subscribers
+                    and self._stub is not None
+                    and not self._stopping
+                )
+            # 覆盖“最后一个订阅刚取消、另一线程立刻新订阅”的交错：旧 worker
+            # 已收到 stop，但新订阅不得因此永久失去后台状态源。
+            if should_restart:
+                self._ensure_exploration_poll_worker()
+
+    def subscribe_exploration_updates(
+        self,
+        callback: Callable[[Dict[str, Any]], None],
+    ) -> Optional[int]:
+        if not callable(callback):
+            raise ValueError("exploration update callback must be callable")
+        if not self._stub or self._stopping:
+            return None
+        with self._exploration_state_lock:
+            subscription_id = self._next_exploration_subscription_id
+            self._next_exploration_subscription_id += 1
+            self._exploration_update_subscribers[subscription_id] = callback
+        self._ensure_exploration_poll_worker()
+        return subscription_id
+
+    def unsubscribe_exploration_updates(self, subscription_id: int) -> bool:
+        with self._exploration_state_lock:
+            removed = self._exploration_update_subscribers.pop(
+                int(subscription_id),
+                None,
+            )
+            if removed is None:
+                return False
+            if self._exploration_update_subscribers:
+                return True
+            stop_event = self._exploration_poll_stop_event
+            thread = self._exploration_poll_thread
+            self._last_exploration_signature = None
+            if stop_event is not None:
+                stop_event.set()
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=_read_deadline_sec() + 0.5)
+        return True
 
     def get_exploration_diagnostics(self) -> Optional[Dict[str, Any]]:
         """读取探索 diagnostics(Phase 7:主路径走新增的 `GetExplorationReadiness`)。
@@ -1342,8 +4015,15 @@ class GeometryRuntimeProvider:
             _log_rpc_error("GetStatus", e)
             return {"phase": "error", "rss_kb": 0}
 
-    def notify_cmd_vel_sink_ready(self, ready: bool) -> bool:
-        """把 cmd_vel sink ready 状态跨进程写回到 Rust handle（rework17）。
+    def notify_cmd_vel_sink_ready(
+        self,
+        ready: bool,
+        generation: Optional[int] = None,
+    ) -> bool:
+        """把 cmd_vel sink ready 状态跨进程写回到 Rust handle（deprecated）。
+
+        `ready=true` 只有携带正数真实 generation 才允许发出；清除 ready 时
+        wire 仍携带非零 sentinel，服务端会忽略该 generation。
 
         Returns:
             True 当 RPC 调用成功；False 当 stub 未连 / RPC 失败。
@@ -1351,8 +4031,21 @@ class GeometryRuntimeProvider:
         self._raise_if_stopping("notify_cmd_vel_sink_ready")
         if not self._stub:
             return False
+        generation_value = int(generation or 0)
+        if ready and generation_value <= 0:
+            LOGGER.warning(
+                "拒绝 SetCmdVelSinkReady(ready=true)：缺少真实 motion sink generation。"
+            )
+            return False
+        if generation_value <= 0:
+            # Rust ignores generation while clearing ready, but the deprecated
+            # wire request still carries a nonzero fail-closed sentinel.
+            generation_value = 1
         try:
-            req = pb2.CmdVelSinkReadyRequest(ready=bool(ready))
+            req = pb2.CmdVelSinkReadyRequest(
+                ready=bool(ready),
+                generation=generation_value,
+            )
             resp = self._stub.SetCmdVelSinkReady(req, timeout=_read_deadline_sec())
             return bool(resp.success)
         except grpc.RpcError as e:
@@ -1360,25 +4053,41 @@ class GeometryRuntimeProvider:
             return False
 
     # === 流式订阅 ===
-    def subscribe_pose(self, callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]) -> Optional[threading.Thread]:
+    def subscribe_pose(
+        self,
+        callback: Callable[
+            [Pose, Optional[FrameTree], Dict[str, object]],
+            None,
+        ],
+    ) -> Optional[_CancellableStreamHandle]:
         """订阅位姿更新流。按 LocalizationProvider 协议回调 (Pose, Optional[FrameTree], metadata)。
 
         frame_id 为空（尚未定位）的更新会被跳过，避免下游收到非法 Pose。
         """
         if not self._stub:
             return None
-        import time
         # frame_tree 由 GetFrameTree 全量重建（_build_frame_tree + 静态边合并），代价较高。
         # pose 流频率可能远高于 tf 实际变化频率，逐帧重建是冗余。此处按时间节流缓存：
         # 同一帧位姿到来时复用最近 _FRAME_TREE_TTL_S 内的 frame_tree，超时才重新拉取。
         # tf 边自带 stamp/TTL，下游容忍亚秒级陈旧，正确性不受影响。
         _FRAME_TREE_TTL_S = 0.2
-        def _stream_worker():
+
+        def _stream_worker(handle: _CancellableStreamHandle) -> None:
             cached_tree: Optional[FrameTree] = None
             cached_at = 0.0
-            while self._stub:
+            while self._stub and not handle.stop_event.is_set():
+                call = None
+                call_failed = False
                 try:
-                    for update in self._stub.SubscribePose(pb2.PoseRequest()):
+                    stub = self._stub
+                    if stub is None:
+                        return
+                    call = stub.SubscribePose(pb2.PoseRequest())
+                    if not handle.bind_call(call):
+                        return
+                    for update in call:
+                        if handle.stop_event.is_set():
+                            return
                         pose = _build_pose(update.pose)
                         if pose is None:
                             continue
@@ -1386,40 +4095,115 @@ class GeometryRuntimeProvider:
                         if cached_tree is None or (now - cached_at) >= _FRAME_TREE_TTL_S:
                             cached_tree = self.get_frame_tree()
                             cached_at = now
-                        callback(pose, cached_tree, {"sequence": update.sequence})
-                except grpc.RpcError:
-                    pass
-                if not self._stub:
+                        if handle.stop_event.is_set():
+                            return
+                        try:
+                            callback(
+                                pose,
+                                cached_tree,
+                                {"sequence": update.sequence},
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "位姿流消费回调失败，当前订阅继续。"
+                            )
+                except grpc.RpcError as exc:
+                    call_failed = True
+                    if not handle.stop_event.is_set():
+                        LOGGER.warning(
+                            "SubscribePose 流断开，1 秒后重连: %s",
+                            exc,
+                        )
+                except Exception:
+                    call_failed = True
+                    if not handle.stop_event.is_set():
+                        LOGGER.exception(
+                            "SubscribePose 非 gRPC 异常，准备重连。"
+                        )
+                finally:
+                    if call is not None:
+                        handle.clear_call(call, cancel=call_failed)
+                if not self._stub or handle.stop_event.is_set():
                     break
-                time.sleep(1.0)
-        t = threading.Thread(target=_stream_worker, name="geometry_runtime_pose_stream", daemon=True)
-        t.start()
-        return t
+                handle.stop_event.wait(_grpc_stream_retry_sec())
 
-    def subscribe_map_updates(self, callback: Callable[[Dict[str, Any]], None]) -> Optional[threading.Thread]:
-        """订阅地图更新通知流，每次更新调用 callback(map_meta_dict)。"""
+        handle = _CancellableStreamHandle(
+            name="geometry_runtime_pose_stream",
+            worker=_stream_worker,
+            on_finish=self._discard_pose_stream_handle,
+        )
+        with self._stream_handle_lock:
+            self._pose_stream_handles.add(handle)
+        return handle.start()
+
+    def subscribe_map_updates(
+        self,
+        callback: Callable[[Dict[str, Any]], None],
+    ) -> Optional[_CancellableStreamHandle]:
+        """订阅完整地图流；单帧解析或回调失败不会终止订阅线程。"""
         if not self._stub:
             return None
-        import time
-        def _stream_worker():
-            while self._stub:
+
+        def _stream_worker(handle: _CancellableStreamHandle) -> None:
+            while self._stub and not handle.stop_event.is_set():
+                call = None
+                call_failed = False
                 try:
-                    for update in self._stub.SubscribeMapUpdates(pb2.Empty()):
-                        meta = update.meta
-                        callback({
-                            "width": meta.width, "height": meta.height,
-                            "resolution": meta.resolution,
-                            "origin_x": meta.origin_x, "origin_y": meta.origin_y,
-                            "frame_id": meta.frame_id, "revision": meta.revision,
-                        })
-                except grpc.RpcError:
-                    pass
-                if not self._stub:
+                    stub = self._stub
+                    if stub is None:
+                        return
+                    call = stub.SubscribeMapUpdates(pb2.Empty())
+                    if not handle.bind_call(call):
+                        return
+                    for update in call:
+                        if handle.stop_event.is_set():
+                            return
+                        try:
+                            payload = self._map_update_to_payload(update)
+                        except Exception:
+                            LOGGER.exception("丢弃无效 MapUpdateNotification，订阅继续。")
+                            continue
+                        try:
+                            ticket = self._claim_map_delivery(payload)
+                            if ticket is None:
+                                LOGGER.info(
+                                    "丢弃跨连接或跨建图 transition 的迟到地图 payload。"
+                                )
+                                continue
+                            try:
+                                callback(payload)
+                            finally:
+                                self._finish_map_delivery(ticket)
+                        except Exception:
+                            LOGGER.exception("地图流消费回调失败，订阅继续。")
+                except grpc.RpcError as exc:
+                    call_failed = True
+                    if not handle.stop_event.is_set():
+                        LOGGER.warning(
+                            "SubscribeMapUpdates 流断开，1 秒后重连: %s",
+                            exc,
+                        )
+                except Exception:
+                    call_failed = True
+                    if not handle.stop_event.is_set():
+                        LOGGER.exception(
+                            "SubscribeMapUpdates 非 gRPC 异常，准备重连。"
+                        )
+                finally:
+                    if call is not None:
+                        handle.clear_call(call, cancel=call_failed)
+                if not self._stub or handle.stop_event.is_set():
                     break
-                time.sleep(1.0)
-        t = threading.Thread(target=_stream_worker, name="geometry_runtime_map_stream", daemon=True)
-        t.start()
-        return t
+                handle.stop_event.wait(_grpc_stream_retry_sec())
+
+        handle = _CancellableStreamHandle(
+            name="geometry_runtime_map_stream",
+            worker=_stream_worker,
+            on_finish=self._discard_map_stream_handle,
+        )
+        with self._stream_handle_lock:
+            self._map_stream_handles.add(handle)
+        return handle.start()
 
     def subscribe_navigation_state(self, callback: Callable[[Dict[str, Any]], None]) -> Optional[threading.Thread]:
         """订阅导航状态流，每次更新调用 callback(nav_state_dict)。"""

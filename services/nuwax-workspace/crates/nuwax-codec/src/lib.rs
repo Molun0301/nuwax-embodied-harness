@@ -26,7 +26,7 @@ pub mod protobuf;
 
 pub use hash::{
     fingerprint as compute_real_lcm_fingerprint, lcm_hash_64, lookup_seed, murmur_hash64a,
-    STRUCT_SEEDS,
+    sha256_bytes, STRUCT_SEEDS,
 };
 
 /// 编解码错误

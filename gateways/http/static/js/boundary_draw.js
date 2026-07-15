@@ -301,8 +301,6 @@
           { x: seg.b.x, y: seg.b.y, yaw: 0.0, frame_id: FRAME_ID },
         ];
       }),
-      auto_loop_close: true,
-      extend_radius_m: 3.0,
     };
     fetch(EXPLORATION_API, {
       method: 'POST',

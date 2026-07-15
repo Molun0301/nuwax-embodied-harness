@@ -1,23 +1,8 @@
-// LCM IDL — nav_msgs.Odometry
-//
-// 来源：lcm-gen 标准 .lcm 语法。位姿 + frame 元数据 + 线速度/角速度。
-struct nav_msgs__Odometry
-{
-    int64_t  stamp_sec;
-    int32_t  stamp_nsec;
-    string   frame_id;
-    string   child_frame_id;
-    double   pose_position_x;
-    double   pose_position_y;
-    double   pose_position_z;
-    double   pose_orientation_w;
-    double   pose_orientation_x;
-    double   pose_orientation_y;
-    double   pose_orientation_z;
-    double   twist_linear_x;
-    double   twist_linear_y;
-    double   twist_linear_z;
-    double   twist_angular_x;
-    double   twist_angular_y;
-    double   twist_angular_z;
+package nav_msgs;
+
+struct Odometry {
+    std_msgs.Header header;
+    string child_frame_id;
+    geometry_msgs.PoseWithCovariance pose;
+    geometry_msgs.TwistWithCovariance twist;
 }

@@ -8,7 +8,7 @@
 - 把 ``StreamingLocalizationProvider`` / ``StreamingPointCloudProvider`` 的回调
   真正转译成 ``GeometryRuntimeProvider.publish_odom`` / ``publish_point_cloud``，
   让 mapping / nav / explore 真实 readiness 有数据来源。
-- 维护运行时 counters（``published_odom_count`` / ``published_tf_count`` /
+- 维护运行时 counters（``published_odom_count`` / ``observed_frame_tree_count`` /
   ``published_pointcloud_count`` / ``last_error`` / ``last_publish_latency_ms``），
   便于 Phase 7 mapping_ready_poll 收敛时核对。
 - 严格禁止隐性 fallback：
@@ -94,6 +94,8 @@ class BridgeCounters:
     """运行时计数器（counters），用于 readiness / 诊断。"""
 
     published_odom_count: int = 0
+    observed_frame_tree_count: int = 0
+    # 兼容旧诊断键。Python bridge 不拥有 TF publisher，因此该值恒为 0。
     published_tf_count: int = 0
     published_pointcloud_count: int = 0
     dropped_odom_count: int = 0
@@ -109,7 +111,10 @@ class BridgeCounters:
     def as_dict(self) -> Dict[str, Any]:
         return {
             "published_odom_count": self.published_odom_count,
+            "observed_frame_tree_count": self.observed_frame_tree_count,
             "published_tf_count": self.published_tf_count,
+            "tf_owner": "rust_canonical",
+            "tf_observation_semantics": "observed_not_published",
             "published_pointcloud_count": self.published_pointcloud_count,
             "dropped_odom_count": self.dropped_odom_count,
             "dropped_pointcloud_count": self.dropped_pointcloud_count,
@@ -328,6 +333,9 @@ class RuntimeInputBridge:
             self._record_error("localization callback 收到 None pose")
             return
 
+        if frame_tree is not None and getattr(frame_tree, "transforms", None):
+            self.counters.observed_frame_tree_count += 1
+
         publisher = getattr(self.runtime_provider, "publish_odom", None)
         if not callable(publisher):
             self.counters.dropped_odom_count += 1
@@ -375,10 +383,7 @@ class RuntimeInputBridge:
         self.counters.last_publish_latency_ms = latency_ms
         self.counters.last_publish_at_monotonic = time.monotonic()
 
-        # FrameTree 当前 gRPC facade 没有 PublishTf 接口；这里只记账，
-        # 真实 TF publish 走 Phase 4 启用的 lcm_runtime 内部订阅 + /tf channel。
-        if frame_tree is not None and getattr(frame_tree, "transforms", None):
-            self.counters.published_tf_count += 1
+        # TF 发布权属于 Rust canonical owner；Python 仅记录输入侧观测。
 
     def _on_point_cloud(self, point_cloud: PointCloudFrame) -> None:
         if not self.is_started():
@@ -387,6 +392,37 @@ class RuntimeInputBridge:
             self.counters.dropped_pointcloud_count += 1
             self._record_error("point_cloud callback 收到 None")
             return
+
+        point_cloud_metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+        is_go2_point_cloud = (
+            point_cloud_metadata.get("source") == "go2_direct_dds_pointcloud"
+        )
+        if is_go2_point_cloud:
+            source_frame = str(point_cloud_metadata.get("source_frame") or "").strip()
+            registered_frame = str(
+                point_cloud_metadata.get("registered_frame") or ""
+            ).strip()
+            frame_id = str(getattr(point_cloud, "frame_id", "") or "").strip()
+            registered_to_odom = (
+                point_cloud_metadata.get("point_cloud_xyz_registered_to_odom") is True
+            )
+            if not registered_to_odom:
+                self.counters.dropped_pointcloud_count += 1
+                self._record_error(
+                    "拒绝 Go2 未注册传感器帧点云："
+                    f"source_frame={source_frame or frame_id or '<empty>'}; "
+                    "需要可靠外参在上游完成 XYZ 注册并显式声明"
+                )
+                return
+            if not source_frame or not registered_frame or frame_id != registered_frame:
+                self.counters.dropped_pointcloud_count += 1
+                self._record_error(
+                    "拒绝 Go2 点云注册断言不一致："
+                    f"source_frame={source_frame or '<empty>'} "
+                    f"frame_id={frame_id or '<empty>'} "
+                    f"registered_frame={registered_frame or '<empty>'}"
+                )
+                return
 
         publisher = getattr(self.runtime_provider, "publish_point_cloud", None)
         if not callable(publisher):
@@ -415,11 +451,17 @@ class RuntimeInputBridge:
         start = time.monotonic()
         try:
             timestamp = getattr(payload, "timestamp", None)
-            timestamp_ns = (
-                _datetime_to_unix_ns(timestamp)
-                if isinstance(timestamp, datetime)
-                else 0
-            )
+            source_timestamp_ns = point_cloud_metadata.get("source_timestamp_ns")
+            if source_timestamp_ns is not None:
+                timestamp_ns = int(source_timestamp_ns)
+                if timestamp_ns < 0:
+                    raise ValueError("source_timestamp_ns 不能为负数")
+            else:
+                timestamp_ns = (
+                    _datetime_to_unix_ns(timestamp)
+                    if isinstance(timestamp, datetime)
+                    else 0
+                )
             metadata = {
                 "frame_id": str(getattr(payload, "frame_id", "") or "map"),
                 "timestamp_ns": timestamp_ns,
@@ -429,10 +471,15 @@ class RuntimeInputBridge:
             }
             try:
                 inspect.signature(publisher).bind(bytes_payload, point_step, **metadata)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
+                if is_go2_point_cloud:
+                    raise TypeError(
+                        "Go2 pointcloud publisher 必须接受 "
+                        "frame_id/timestamp_ns/fields/point_count/is_dense metadata"
+                    ) from exc
                 # Compatibility for pre-extension provider implementations. The real
-                # GeometryRuntimeProvider accepts metadata; legacy test/extension
-                # providers still receive the original two positional arguments.
+                # GeometryRuntimeProvider accepts metadata; only non-Go2 legacy
+                # providers may receive the original two positional arguments.
                 result = publisher(bytes_payload, point_step)
             else:
                 result = publisher(bytes_payload, point_step, **metadata)

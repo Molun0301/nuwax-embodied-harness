@@ -19,6 +19,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from contracts.geometry import Pose
+from contracts.navigation import NavigationGoal
 from services.geometry.geometry_runtime_provider import GeometryRuntimeProvider
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.runtime_navigation_client")
@@ -113,8 +114,8 @@ class RuntimeNavigationClient:
     """platform 侧 navigation 串行锁客户端。
 
     与旧版 ``NavigationProxyClient`` 接口形状保持兼容，但内部不再 stub nav2 proto：
-    - ``navigate()``：通过 ``GeometryRuntimeProvider.set_navigation_goal`` 发目标；
-    - ``cancel()``：通过 ``GeometryRuntimeProvider.cancel_navigation`` 取消；
+    - ``navigate()``：通过正式 ``GeometryRuntimeProvider.set_goal`` 发 exact goal；
+    - ``cancel()``：通过兼容入口转入正式 ``cancel_goal`` active-goal 栅栏；
     - ``subscribe_state()``：通过 ``GeometryRuntimeProvider.subscribe_navigation_state`` 拉流。
     """
 
@@ -167,7 +168,10 @@ class RuntimeNavigationClient:
         provider = self._provider
         if provider is None:
             return
-        provider.cancel_navigation(request_id)
+        exact_goal_id = str(request_id or "").strip()
+        if not exact_goal_id:
+            return
+        provider.cancel_navigation(exact_goal_id)
 
     async def shutdown(self) -> None:
         self._closed = True
@@ -208,12 +212,14 @@ class RuntimeNavigationClient:
         provider = self._provider
         if provider is None:
             raise _RuntimeUnavailable("GeometryRuntimeProvider 未绑定。")
-        ack = provider.set_navigation_goal(
-            request.pose,
-            frame_id=str(request.pose.frame_id or "map"),
+        accepted = provider.set_goal(
+            NavigationGoal(
+                goal_id=str(request.request_id or "").strip(),
+                target_pose=request.pose,
+            )
         )
-        if ack is None:
-            raise _RuntimeUnavailable("SetNavigationGoal 返回 None（gRPC 失败）。")
+        if not accepted:
+            raise _RuntimeUnavailable("SetNavigationGoal 被 geometry provider 拒绝。")
         return NavigationStateUpdate(
             state=_STATE_ACTIVE,
             request_id=request.request_id,

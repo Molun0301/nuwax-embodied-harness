@@ -1,0 +1,17 @@
+package nuwax_msgs;
+
+struct PathEnvelope {
+    int32_t schema_version;
+    string session_id;
+    int32_t owner_kind;
+    string parent_request_id;
+    int64_t goal_generation;
+    int64_t planner_runtime_generation;
+    string map_version_id;
+    int64_t map_revision;
+    int64_t path_revision;
+    int64_t source_timestamp_ns;
+    byte goal_payload_sha256[32];
+    byte path_payload_sha256[32];
+    nav_msgs.Path path;
+}

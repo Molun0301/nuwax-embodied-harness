@@ -22,7 +22,7 @@ use tokio::sync::{watch, RwLock};
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::lcm_runtime::{GeometryRuntimeHandle, MapRevisionEvent, PoseState};
+use crate::lcm_runtime::{GeometryRuntimeHandle, MapRevisionEvent, NavigationUpdate, PoseState};
 use crate::nav_runtime::{
     cancel as nav_cancel, compute_readiness, ensure_goal_id, readiness_to_reason, set_goal,
     CancelOutcome, SetGoalInput, SetGoalOutcome,
@@ -31,6 +31,8 @@ use crate::proto::geometry_runtime_server::GeometryRuntime;
 use crate::proto::*;
 use crate::runtime_diagnostics::{self, RuntimeDiagnostics, ServiceState, SharedServiceState};
 use crate::typed_codec;
+use nuwax_exploration::{BoundarySegment, ExplorationBoundary};
+use nuwax_nav_types_messages::geometry::Point2;
 
 #[derive(Clone)]
 pub struct GeometryRuntimeService {
@@ -158,12 +160,141 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
+fn mapping_session_state(
+    snapshot: crate::mapping_adapter::MappingSessionSnapshot,
+    message: impl Into<String>,
+) -> MappingSessionState {
+    MappingSessionState {
+        success: true,
+        phase: snapshot.phase.as_str().to_string(),
+        message: message.into(),
+        session_id: snapshot.session_id,
+        map_name: snapshot.map_name,
+        map_version_id: snapshot.map_version_id,
+        session_generation: snapshot.session_generation,
+        revision: snapshot.revision,
+        active: snapshot.active,
+        idempotent_replay: snapshot.idempotent_replay,
+    }
+}
+
+fn mapping_lifecycle_status(error: crate::mapping_adapter::MappingLifecycleError) -> Status {
+    use crate::mapping_adapter::MappingLifecycleError;
+    match error {
+        MappingLifecycleError::InvalidArgument(message) => Status::invalid_argument(message),
+        MappingLifecycleError::Conflict(message) => Status::already_exists(message),
+        MappingLifecycleError::StaleSession(message)
+        | MappingLifecycleError::TerminalSession(message) => Status::failed_precondition(message),
+        MappingLifecycleError::GenerationExhausted => {
+            Status::resource_exhausted("mapping session generation exhausted")
+        }
+    }
+}
+
+fn exploration_state_from_snapshot(
+    snapshot: crate::explore_runtime::ExploreRuntimeSnapshot,
+) -> ExplorationState {
+    ExplorationState {
+        status: snapshot.status.to_string(),
+        message: snapshot.message,
+        request_id: snapshot.request_id,
+        selected_source: snapshot.selected_source,
+        last_stop_reason: snapshot.last_stop_reason,
+        frontier_count: snapshot.frontier_count,
+        revision: snapshot.revision,
+        timestamp_ns: now_ns(),
+        child_task_id: snapshot.child_task_id,
+        map_version_id: snapshot.map_version_id,
+        map_revision: snapshot.map_revision,
+    }
+}
+
+fn explore_config_from_request(
+    request: &ExploreRequest,
+) -> Result<crate::explore_runtime::ExploreStartConfig, String> {
+    let boundary = if request.boundary_line_segments.is_empty() {
+        if !request.boundary_frame_id.trim().is_empty() {
+            return Err("empty exploration boundary must have an empty frame".to_string());
+        }
+        None
+    } else {
+        if request.boundary_frame_id.trim().trim_start_matches('/') != "map" {
+            return Err("exploration boundary_frame_id must be map".to_string());
+        }
+        let segments = request
+            .boundary_line_segments
+            .iter()
+            .map(|segment| BoundarySegment {
+                start: Point2 {
+                    x: segment.start_x,
+                    y: segment.start_y,
+                },
+                end: Point2 {
+                    x: segment.end_x,
+                    y: segment.end_y,
+                },
+            })
+            .collect();
+        Some(ExplorationBoundary::from_segments(segments).map_err(|error| error.to_string())?)
+    };
+    let stop_conditions = request
+        .stop_conditions
+        .as_ref()
+        .map(|conditions| crate::explore_runtime::ExploreStopConditions {
+            max_coverage_pct: conditions.max_coverage_pct,
+            no_frontier_timeout_ms: conditions.no_frontier_timeout_ms,
+            max_duration_ms: conditions.max_duration_ms,
+            max_goals: conditions.max_goals,
+            stop_on_map_revision_change: conditions.stop_on_map_revision_change,
+        })
+        .unwrap_or_default();
+    let arbitration = if request.arbitration.trim().is_empty() {
+        std::env::var("NUWAX_EXPLORE_ARBITRATION")
+            .unwrap_or_else(|_| "prefer_wavefront".to_string())
+    } else {
+        request.arbitration.clone()
+    };
+    Ok(crate::explore_runtime::ExploreStartConfig {
+        strategy: if request.strategy.trim().is_empty() {
+            "wavefront".to_string()
+        } else {
+            request.strategy.clone()
+        },
+        arbitration,
+        map_version_id: request.map_version_id.clone(),
+        map_revision: request.map_revision,
+        boundary,
+        stop_conditions,
+        max_navigation_retries: request.max_navigation_retries,
+        blacklist_radius_m: request.blacklist_radius_m,
+    })
+}
+
 async fn forward_map_revision(
     tx: &tokio::sync::mpsc::Sender<Result<MapUpdateNotification, Status>>,
     event: MapRevisionEvent,
-    occupancy_shm: Option<&Arc<parking_lot::Mutex<crate::occupancy_shm::OccupancyGridShmWriter>>>,
-    shm_path: Option<&str>,
+    occupancy_shm_current: &Arc<RwLock<Option<crate::lcm_runtime::OccupancyShmSnapshot>>>,
 ) -> bool {
+    if event.session_id.trim().is_empty()
+        || event.map_version_id.trim().is_empty()
+        || event.session_generation == 0
+    {
+        return tx
+            .send(Err(Status::failed_precondition(
+                "map revision is missing mapping session identity",
+            )))
+            .await
+            .is_ok();
+    }
+    if event.frame_id.trim().trim_start_matches('/') != "map" {
+        return tx
+            .send(Err(Status::failed_precondition(format!(
+                "global map subscriber requires frame=map, received {}",
+                event.frame_id
+            ))))
+            .await
+            .is_ok();
+    }
     if event.size != event.data.len() as u64 {
         return tx
             .send(Err(Status::data_loss(format!(
@@ -175,7 +306,7 @@ async fn forward_map_revision(
             .await
             .is_ok();
     }
-    if crate::map_checksum::sha256_hex(&event.data) != event.checksum {
+    if crate::map_checksum::sha256_hex(event.data.as_ref()) != event.checksum {
         return tx
             .send(Err(Status::data_loss(format!(
                 "map revision {} checksum mismatch",
@@ -185,34 +316,15 @@ async fn forward_map_revision(
             .is_ok();
     }
 
-    let shm_ref = match (occupancy_shm, shm_path) {
-        (Some(writer), Some(shm_path)) => {
-            let map = event.to_map_state();
-            let write_result = writer.lock().write_occupancy(&map);
-            if let Err(error) = write_result {
-                return tx
-                    .send(Err(Status::internal(format!(
-                        "map revision {} SHM write failed: {}",
-                        event.revision, error
-                    ))))
-                    .await
-                    .is_ok();
+    let shm_ref = match occupancy_shm_current.read().await.clone() {
+        Some(snapshot) if snapshot.revision == event.revision => {
+            match occupancy_shm_ref(snapshot) {
+                Ok(reference) => Some(reference),
+                Err(status) => return tx.send(Err(*status)).await.is_ok(),
             }
-            Some(ShmRef {
-                key: shm_path.to_owned(),
-                size: event.size,
-                revision: event.revision,
-            })
         }
-        (Some(_), None) => {
-            return tx
-                .send(Err(Status::internal(
-                    "occupancy SHM writer exists without its authoritative path",
-                )))
-                .await
-                .is_ok();
-        }
-        (None, _) => None,
+        Some(_) => None,
+        None => None,
     };
 
     tx.send(Ok(MapUpdateNotification {
@@ -227,14 +339,58 @@ async fn forward_map_revision(
             timestamp_ns: event.timestamp_ns,
         }),
         shm_ref,
-        data: event.data,
+        data: event.data.as_ref().to_vec(),
         size: event.size,
         schema_version: event.schema_version,
         checksum: event.checksum,
         last_seen_ms: event.last_seen_ms,
+        session_id: event.session_id,
+        map_version_id: event.map_version_id,
+        session_generation: event.session_generation,
     }))
     .await
     .is_ok()
+}
+
+fn occupancy_shm_ref(
+    snapshot: crate::lcm_runtime::OccupancyShmSnapshot,
+) -> Result<ShmRef, Box<Status>> {
+    if snapshot.key.trim().is_empty()
+        || snapshot.file_size == 0
+        || snapshot.revision == 0
+        || snapshot.layout_version != 2
+        || snapshot.payload_schema_version != 1
+        || snapshot.generation == 0
+        || snapshot.active_slot >= 2
+        || snapshot.payload_size == 0
+        || snapshot.payload_size >= snapshot.file_size
+    {
+        return Err(Box::new(Status::failed_precondition(format!(
+            "invalid occupancy SHM v2 reference: layout={} schema={} generation={} slot={} file_size={} payload_size={} revision={}",
+            snapshot.layout_version,
+            snapshot.payload_schema_version,
+            snapshot.generation,
+            snapshot.active_slot,
+            snapshot.file_size,
+            snapshot.payload_size,
+            snapshot.revision,
+        ))));
+    }
+    let active_slot = u32::try_from(snapshot.active_slot).map_err(|_| {
+        Box::new(Status::failed_precondition(
+            "occupancy SHM active slot exceeds uint32",
+        ))
+    })?;
+    Ok(ShmRef {
+        key: snapshot.key,
+        size: snapshot.file_size,
+        revision: snapshot.revision,
+        layout_version: snapshot.layout_version,
+        payload_schema_version: snapshot.payload_schema_version,
+        generation: snapshot.generation,
+        active_slot,
+        payload_size: snapshot.payload_size,
+    })
 }
 
 fn canonical_xyz_fields() -> Vec<schema::PointField> {
@@ -384,13 +540,38 @@ fn encode_pointcloud_request_payload(request: &PublishPointCloudRequest) -> Code
 
 /// 把内部 `NavState`(crate::lcm_runtime::NavState)转成 gRPC
 /// `proto::NavigationState`,避免 server.rs 直接依赖 internal type。
-fn nav_state_to_proto(nav: crate::lcm_runtime::NavState) -> NavigationState {
+fn nav_state_to_proto(update: NavigationUpdate) -> NavigationState {
+    let NavigationUpdate {
+        state: nav,
+        feedback,
+        producer_runtime_generation,
+    } = update;
     NavigationState {
         status: nav.status,
         message: nav.message,
         goal_id: nav.goal_id,
         distance_remaining: nav.distance_remaining,
         timestamp_ns: nav.timestamp_ns,
+        cancel_phase: feedback.cancel_phase,
+        cancel_generation: feedback.cancel_generation,
+        actuator_zeroed: feedback.actuator_zeroed,
+        reason_code: feedback.reason_code,
+        runtime_generation: feedback.runtime_generation,
+        guard_generation: feedback.guard_generation,
+        sink_ready: feedback.sink_ready,
+        planner_map_revision: feedback.planner_map_revision,
+        planner_map_frame: feedback.planner_map_frame,
+        planner_pose_frame: feedback.planner_pose_frame,
+        zero_ack_id: feedback.zero_ack_id,
+        zero_applied_monotonic_ns: feedback.zero_applied_monotonic_ns,
+        owner_kind: feedback.owner_kind,
+        parent_request_id: feedback.parent_request_id,
+        goal_generation: feedback.goal_generation,
+        path_revision: feedback.path_revision,
+        goal_payload_sha256: feedback.goal_payload_sha256.to_vec(),
+        path_payload_sha256: feedback.path_payload_sha256.to_vec(),
+        map_version_id: feedback.map_version_id,
+        producer_runtime_generation,
     }
 }
 
@@ -418,6 +599,10 @@ impl GeometryRuntime for GeometryRuntimeService {
             state.phase = "stopping".into();
             state.message = "正在关闭 gRPC listener".into();
         }
+
+        let request_id = self.bridge.explore.snapshot().request_id;
+        let _ = self.bridge.explore.stop(&request_id).await;
+        self.bridge.shutdown_explore_scheduler().await;
 
         if let Err(error) = shutdown.request_and_wait_for_listener().await {
             let mut state = self.state.write().await;
@@ -569,6 +754,136 @@ impl GeometryRuntime for GeometryRuntimeService {
     // 地图
     // ========================================================================
 
+    async fn start_mapping(
+        &self,
+        req: Request<StartMappingRequest>,
+    ) -> Result<Response<MappingSessionState>, Status> {
+        let request = req.into_inner();
+        if request.session_id.trim().is_empty()
+            || request.map_name.trim().is_empty()
+            || request.map_version_id.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "session_id, map_name and map_version_id must not be empty",
+            ));
+        }
+        if !self.bridge.lcm_backend_available {
+            return Err(Status::unavailable("mapping LCM backend is unavailable"));
+        }
+        let adapter = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
+            .clone();
+        let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
+
+        let current = adapter.lock().snapshot();
+        if current.active
+            || (current.phase == crate::mapping_adapter::MappingSessionPhase::Stopped
+                && current.session_id == request.session_id)
+        {
+            let snapshot = adapter
+                .lock()
+                .start_session(
+                    &request.session_id,
+                    &request.map_name,
+                    &request.map_version_id,
+                )
+                .map_err(mapping_lifecycle_status)?;
+            return Ok(Response::new(mapping_session_state(
+                snapshot,
+                "mapping session already active",
+            )));
+        }
+
+        {
+            let mut shared = self.bridge.state.write().await;
+            shared.map = crate::lcm_runtime::MapState::default();
+        }
+        self.bridge.map_revision_latest_tx.send_replace(None);
+        *self.bridge.occupancy_shm_current.write().await = None;
+
+        let snapshot = adapter
+            .lock()
+            .start_session(
+                &request.session_id,
+                &request.map_name,
+                &request.map_version_id,
+            )
+            .map_err(mapping_lifecycle_status)?;
+        if let Some(writer) = &self.bridge.occupancy_shm {
+            if let Err(error) = writer.lock().begin_session(snapshot.session_generation) {
+                let _ = adapter.lock().stop_session(&snapshot.session_id);
+                return Err(Status::internal(format!(
+                    "occupancy SHM session fence failed: {error}"
+                )));
+            }
+        }
+        Ok(Response::new(mapping_session_state(
+            snapshot,
+            "mapping session active",
+        )))
+    }
+
+    async fn stop_mapping(
+        &self,
+        req: Request<StopMappingRequest>,
+    ) -> Result<Response<MappingSessionState>, Status> {
+        let request = req.into_inner();
+        let exploration = self.bridge.explore.snapshot();
+        if !matches!(
+            exploration.status,
+            crate::explore_runtime::STATUS_IDLE
+                | crate::explore_runtime::STATUS_STOPPED
+                | crate::explore_runtime::STATUS_SUCCEEDED
+                | crate::explore_runtime::STATUS_CANCELLED
+        ) {
+            return Err(Status::failed_precondition(format!(
+                "StopExploration exact terminal required before StopMapping: status={} request_id={}",
+                exploration.status, exploration.request_id
+            )));
+        }
+        let adapter = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
+            .clone();
+        let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
+        let snapshot = adapter
+            .lock()
+            .stop_session(&request.session_id)
+            .map_err(mapping_lifecycle_status)?;
+        let reason = request.reason.trim();
+        Ok(Response::new(mapping_session_state(
+            snapshot,
+            if reason.is_empty() {
+                "mapping session stopped".to_string()
+            } else {
+                format!("mapping session stopped: {reason}")
+            },
+        )))
+    }
+
+    async fn get_mapping_state(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<MappingSessionState>, Status> {
+        let adapter = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
+            .clone();
+        let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
+        let snapshot = adapter.lock().snapshot();
+        Ok(Response::new(mapping_session_state(
+            snapshot,
+            "mapping session state",
+        )))
+    }
+
     async fn get_occupancy_grid(
         &self,
         _req: Request<Empty>,
@@ -616,46 +931,25 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<ShmRef>, Status> {
-        // Phase 3: 真实 SHM sidecar 写入(occupancy_shm::OccupancyGridShmWriter);
-        // 成功返回 ShmRef { key=shm_path, size=map.data.len(), revision=map.revision }
-        // 失败 / 无数据 / 写盘错误 → 返回 error message,不假装成功。
+        // SHM sidecar 只有 map-revision fanout task 可写。本 RPC 只返回最新一次
+        // 成功发布的不可变引用，size 是 mmap 文件长度而非 occupancy payload 长度。
         if self.bridge.occupancy_shm.is_none() {
             return Err(Status::unavailable(
                 "occupancy_shm 未初始化 (LCM backend 不可用,导致 SHM 写入被禁用)",
             ));
         }
-        let shm_path = self
+        let snapshot = self
             .bridge
-            .occupancy_shm_path
+            .occupancy_shm_current
+            .read()
+            .await
             .clone()
-            .ok_or_else(|| Status::unavailable("occupancy_shm 权威路径缺失"))?;
-        // 锁顺序:先 copy 关键字段(revision/size)再 drop read lock,最后持 writer lock;
-        // 避免 reader 与 writer 同时持锁导致自死锁。
-        let map_snapshot = {
-            let s = self.bridge.state.read().await;
-            if s.map.width == 0 || s.map.height == 0 {
-                return Err(Status::failed_precondition(
-                    "occupancy grid 尚未生成 (mapping adapter 无点云数据)",
-                ));
-            }
-            s.map.clone()
-        };
-        let size = map_snapshot.data.len();
-        let revision = map_snapshot.revision;
-        let mut writer = self
-            .bridge
-            .occupancy_shm
-            .as_ref()
-            .expect("checked above")
-            .lock();
-        if let Err(e) = writer.write_occupancy(&map_snapshot) {
-            return Err(Status::internal(format!("write_occupancy 失败: {}", e)));
-        }
-        Ok(Response::new(ShmRef {
-            key: shm_path,
-            size: size as u64,
-            revision,
-        }))
+            .ok_or_else(|| {
+                Status::failed_precondition("occupancy grid 尚未由 map-revision SHM writer 提交")
+            })?;
+        Ok(Response::new(
+            occupancy_shm_ref(snapshot).map_err(|status| *status)?,
+        ))
     }
 
     type SubscribeMapUpdatesStream =
@@ -666,40 +960,31 @@ impl GeometryRuntime for GeometryRuntimeService {
     ) -> Result<Response<Self::SubscribeMapUpdatesStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let mut map_revision_rx = self.bridge.subscribe_map_revisions();
-        let state = self.bridge.state.clone();
-        let occupancy_shm = self.bridge.occupancy_shm.clone();
-        let shm_path = self.bridge.occupancy_shm_path.clone();
+        let occupancy_shm_current = self.bridge.occupancy_shm_current.clone();
         tokio::spawn(async move {
+            let mut last_generation = 0u64;
             let mut last_rev = 0u64;
-            let initial = {
-                let state = state.read().await;
-                (state.map.revision > 0).then(|| MapRevisionEvent::from_map(&state.map))
-            };
+            let initial = map_revision_rx.borrow_and_update().clone();
             if let Some(event) = initial {
+                last_generation = event.session_generation;
                 last_rev = event.revision;
-                if !forward_map_revision(&tx, event, occupancy_shm.as_ref(), shm_path.as_deref())
-                    .await
-                {
+                if !forward_map_revision(&tx, event, &occupancy_shm_current).await {
                     return;
                 }
             }
 
-            loop {
-                let event = match map_revision_rx.recv().await {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let state = state.read().await;
-                        MapRevisionEvent::from_map(&state.map)
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            while map_revision_rx.changed().await.is_ok() {
+                let Some(event) = map_revision_rx.borrow_and_update().clone() else {
+                    continue;
                 };
-                if event.revision <= last_rev {
+                if event.session_generation < last_generation
+                    || (event.session_generation == last_generation && event.revision <= last_rev)
+                {
                     continue;
                 }
+                last_generation = event.session_generation;
                 last_rev = event.revision;
-                if !forward_map_revision(&tx, event, occupancy_shm.as_ref(), shm_path.as_deref())
-                    .await
-                {
+                if !forward_map_revision(&tx, event, &occupancy_shm_current).await {
                     break;
                 }
             }
@@ -725,6 +1010,11 @@ impl GeometryRuntime for GeometryRuntimeService {
                             .unwrap_or_else(|_| "/tmp/nuwax_cloudmap.mmap".into()),
                         size: 0,
                         revision: notif.revision,
+                        layout_version: 0,
+                        payload_schema_version: 0,
+                        generation: 0,
+                        active_slot: 0,
+                        payload_size: 0,
                     }),
                     point_count: notif.point_count,
                     voxel_size: notif.voxel_size,
@@ -780,6 +1070,24 @@ impl GeometryRuntime for GeometryRuntimeService {
             timestamp_ns: pose.map(|p| p.timestamp_ns).unwrap_or(now_ns()),
         };
         let goal_id = ensure_goal_id(&ng.goal_id);
+        let owner_kind = match ng.owner_kind {
+            0 | 1 => nuwax_codec::lcm::schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "public SetNavigationGoal cannot claim exploration ownership",
+                ));
+            }
+        };
+        let parent_request_id = if ng.parent_request_id.trim().is_empty() {
+            goal_id.clone()
+        } else {
+            ng.parent_request_id.trim().to_string()
+        };
+        let map_revision = if ng.map_revision == 0 {
+            self.bridge.state.read().await.map.revision
+        } else {
+            ng.map_revision
+        };
         let frame_id = if ng.frame_id.is_empty() {
             "map".to_string()
         } else {
@@ -787,17 +1095,24 @@ impl GeometryRuntime for GeometryRuntimeService {
         };
         let input = SetGoalInput {
             goal_id: goal_id.clone(),
+            owner_kind,
+            parent_request_id,
+            goal_generation: ng.goal_generation,
+            map_version_id: ng.map_version_id.clone(),
+            map_revision,
             frame_id,
             target,
         };
-        let SetGoalOutcome { state: nav } = set_goal(&self.bridge, &self.bridge.nav, input).await;
+        let SetGoalOutcome { state: nav, lease } =
+            set_goal(&self.bridge, &self.bridge.nav, input).await;
         // 同步到 SharedState.nav_state,供 SubscribeNavigationState 推送。
         {
             let mut s = self.bridge.state.write().await;
             s.nav_state = nav.clone();
         }
-        let _ = self.bridge.nav_state_tx.send(nav.clone());
-        Ok(Response::new(nav_state_to_proto(nav)))
+        let update = NavigationUpdate::from_local(nav, &self.bridge.nav, lease).await;
+        let _ = self.bridge.nav_state_tx.send(update.clone());
+        Ok(Response::new(nav_state_to_proto(update)))
     }
 
     async fn cancel_navigation(
@@ -808,15 +1123,26 @@ impl GeometryRuntime for GeometryRuntimeService {
         // 1) publish /nav/cancel typed frame
         // 2) best-effort publish zero cmd_vel
         // 3) 返回 PENDING；只有观测到 stack /nav/state 才进入 terminal CANCELLED
-        let goal_id = req.get_ref().goal_id.trim().to_string();
-        let CancelOutcome { state: nav } =
-            nav_cancel(&self.bridge, &self.bridge.nav, goal_id.clone()).await;
+        let request = req.get_ref();
+        let CancelOutcome { state: nav, lease } = nav_cancel(
+            &self.bridge,
+            &self.bridge.nav,
+            crate::nav_runtime::CancelGoalInput {
+                goal_id: request.goal_id.trim().to_string(),
+                owner_kind: request.owner_kind,
+                parent_request_id: request.parent_request_id.trim().to_string(),
+                goal_generation: request.goal_generation,
+                producer_runtime_generation: request.producer_runtime_generation,
+            },
+        )
+        .await;
         {
             let mut s = self.bridge.state.write().await;
             s.nav_state = nav.clone();
         }
-        let _ = self.bridge.nav_state_tx.send(nav.clone());
-        Ok(Response::new(nav_state_to_proto(nav)))
+        let update = NavigationUpdate::from_local(nav, &self.bridge.nav, lease).await;
+        let _ = self.bridge.nav_state_tx.send(update.clone());
+        Ok(Response::new(nav_state_to_proto(update)))
     }
 
     type SubscribeNavigationStateStream =
@@ -828,14 +1154,8 @@ impl GeometryRuntime for GeometryRuntimeService {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let mut broadcast_rx = self.bridge.nav_state_tx.subscribe();
         tokio::spawn(async move {
-            while let Ok(nav) = broadcast_rx.recv().await {
-                let state = NavigationState {
-                    status: nav.status.clone(),
-                    message: nav.message.clone(),
-                    goal_id: nav.goal_id.clone(),
-                    distance_remaining: nav.distance_remaining,
-                    timestamp_ns: nav.timestamp_ns,
-                };
+            while let Ok(update) = broadcast_rx.recv().await {
+                let state = nav_state_to_proto(update);
                 if tx.send(Ok(state)).await.is_err() {
                     break;
                 }
@@ -863,6 +1183,17 @@ impl GeometryRuntime for GeometryRuntimeService {
         Ok(Response::new(NavigationReadiness {
             ready: r.ready && detail.ready,
             reason: format!("{}; details={}", r.reason, json),
+            reason_code: detail.reason_code.as_str().to_string(),
+            blockers: detail
+                .blockers
+                .iter()
+                .map(|blocker| blocker.as_str().to_string())
+                .collect(),
+            tf_generation: detail.tf_generation,
+            planner_generation: detail.planner_generation,
+            motion_sink_generation: detail.motion_sink_generation,
+            map_frame: detail.map_frame,
+            pose_frame: detail.pose_frame,
         }))
     }
 
@@ -873,14 +1204,17 @@ impl GeometryRuntime for GeometryRuntimeService {
     ) -> Result<Response<MappingReadiness>, Status> {
         use crate::mapping_adapter::MappingReadiness as MappingReadinessDetail;
         // parking_lot Mutex guard 不能直接跨 await 持有,这里把锁解开再算。
-        let snapshot = {
+        let (snapshot, lifecycle) = {
             let lcm_backend = self.bridge.lcm_backend_available;
             match &self.bridge.mapping_adapter {
                 Some(arc) => {
                     let g = arc.lock();
-                    MappingReadinessDetail::compute(Some(&*g), lcm_backend)
+                    (
+                        MappingReadinessDetail::compute(Some(&*g), lcm_backend),
+                        Some(g.snapshot()),
+                    )
                 }
-                None => MappingReadinessDetail::compute(None, lcm_backend),
+                None => (MappingReadinessDetail::compute(None, lcm_backend), None),
             }
         };
         let message_json = serde_json::to_string(&serde_json::json!({
@@ -890,7 +1224,15 @@ impl GeometryRuntime for GeometryRuntimeService {
             "pointcloud_count": snapshot.pointcloud_count,
             "last_occupancy_revision": snapshot.last_occupancy_revision,
             "accumulated_point_count": snapshot.accumulated_point_count,
+            "global_consumer_ready": snapshot.global_consumer_ready,
+            "frame_generation": snapshot.frame_generation,
             "last_error": snapshot.last_error,
+            "mapping_phase": lifecycle.as_ref().map(|state| state.phase.as_str()),
+            "mapping_session_id": lifecycle.as_ref().map(|state| state.session_id.as_str()),
+            "map_name": lifecycle.as_ref().map(|state| state.map_name.as_str()),
+            "map_version_id": lifecycle.as_ref().map(|state| state.map_version_id.as_str()),
+            "session_generation": lifecycle.as_ref().map(|state| state.session_generation),
+            "mapping_active": lifecycle.as_ref().map(|state| state.active).unwrap_or(false),
         }))
         .unwrap_or_else(|e| format!("{{\"serialization_error\":\"{}\"}}", e));
         Ok(Response::new(MappingReadiness {
@@ -935,9 +1277,22 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self,
         request: Request<CmdVelSinkReadyRequest>,
     ) -> Result<Response<CmdVelSinkReadyResponse>, Status> {
-        let ready = request.into_inner().ready;
-        self.bridge.set_cmd_vel_sink_ready(ready);
-        Ok(Response::new(CmdVelSinkReadyResponse { success: true }))
+        let request = request.into_inner();
+        if !request.ready {
+            self.bridge.set_cmd_vel_sink_ready(false);
+            return Ok(Response::new(CmdVelSinkReadyResponse { success: true }));
+        }
+        if request.generation == 0 {
+            return Ok(Response::new(CmdVelSinkReadyResponse { success: false }));
+        }
+        let detail = compute_readiness(&self.bridge, &self.bridge.nav).await;
+        let accepted = detail.motion_sink_fresh
+            && detail.cmd_vel_sink_ready
+            && detail.motion_sink_generation == request.generation;
+        if accepted {
+            self.bridge.set_cmd_vel_sink_ready(true);
+        }
+        Ok(Response::new(CmdVelSinkReadyResponse { success: accepted }))
     }
 
     // ========================================================================
@@ -972,6 +1327,8 @@ impl GeometryRuntime for GeometryRuntimeService {
         Ok(Response::new(FrontierList {
             frontiers,
             revision: s.frontiers_revision,
+            map_revision: self.bridge.explore.frontier_snapshot().map_revision,
+            map_version_id: self.bridge.explore.snapshot().map_version_id,
         }))
     }
 
@@ -984,12 +1341,15 @@ impl GeometryRuntime for GeometryRuntimeService {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let mut broadcast_rx = self.bridge.frontiers_tx.subscribe();
         let state_handle = self.bridge.state.clone();
+        let explore = self.bridge.explore.clone();
         tokio::spawn(async move {
             while let Ok(entries) = broadcast_rx.recv().await {
                 let revision = {
                     let s = state_handle.read().await;
                     s.frontiers_revision
                 };
+                let frontier_snapshot = explore.frontier_snapshot();
+                let map_version_id = explore.snapshot().map_version_id;
                 let frontiers = entries
                     .iter()
                     .map(|f| Frontier {
@@ -1016,6 +1376,8 @@ impl GeometryRuntime for GeometryRuntimeService {
                     .send(Ok(FrontierList {
                         frontiers,
                         revision,
+                        map_revision: frontier_snapshot.map_revision,
+                        map_version_id,
                     }))
                     .await
                     .is_err()
@@ -1048,21 +1410,13 @@ impl GeometryRuntime for GeometryRuntimeService {
         req: Request<ExploreRequest>,
     ) -> Result<Response<ExplorationState>, Status> {
         let r = req.get_ref();
+        let config = explore_config_from_request(r).map_err(Status::invalid_argument)?;
         let snapshot = self
             .bridge
             .explore
-            .start(&r.request_id, &r.arbitration)
+            .start_with_config(&r.request_id, config)
             .await;
-        Ok(Response::new(ExplorationState {
-            status: snapshot.status.to_string(),
-            message: snapshot.message,
-            request_id: snapshot.request_id,
-            selected_source: snapshot.selected_source,
-            last_stop_reason: snapshot.last_stop_reason,
-            frontier_count: snapshot.frontier_count,
-            revision: snapshot.revision,
-            timestamp_ns: now_ns(),
-        }))
+        Ok(Response::new(exploration_state_from_snapshot(snapshot)))
     }
 
     async fn stop_exploration(
@@ -1071,39 +1425,15 @@ impl GeometryRuntime for GeometryRuntimeService {
     ) -> Result<Response<ExplorationState>, Status> {
         let r = req.get_ref();
         let snapshot = self.bridge.explore.stop(&r.request_id).await;
-        Ok(Response::new(ExplorationState {
-            status: snapshot.status.to_string(),
-            message: snapshot.message,
-            request_id: snapshot.request_id,
-            selected_source: snapshot.selected_source,
-            last_stop_reason: snapshot.last_stop_reason,
-            frontier_count: snapshot.frontier_count,
-            revision: snapshot.revision,
-            timestamp_ns: now_ns(),
-        }))
+        Ok(Response::new(exploration_state_from_snapshot(snapshot)))
     }
 
     async fn get_exploration_state(
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<ExplorationState>, Status> {
-        // 单次 tick 触发 controller poll;即便上游没有 costmap 输入,
-        // 也保证状态机能跑通而不假装成功。
-        let pose_xy = {
-            let s = self.bridge.state.read().await;
-            (s.pose.x, s.pose.y)
-        };
-        let snapshot = self.bridge.explore.tick(pose_xy).await;
-        Ok(Response::new(ExplorationState {
-            status: snapshot.status.to_string(),
-            message: snapshot.message,
-            request_id: snapshot.request_id,
-            selected_source: snapshot.selected_source,
-            last_stop_reason: snapshot.last_stop_reason,
-            frontier_count: snapshot.frontier_count,
-            revision: snapshot.revision,
-            timestamp_ns: now_ns(),
-        }))
+        let snapshot = self.bridge.explore.snapshot();
+        Ok(Response::new(exploration_state_from_snapshot(snapshot)))
     }
 
     async fn get_exploration_diagnostics(
@@ -1386,6 +1716,23 @@ mod pointcloud_request_tests {
         assert_eq!(adapter.current_revision(), 0);
         assert!(!MappingReadiness::compute(Some(&adapter), true).ready);
     }
+
+    #[tokio::test]
+    async fn mapping_readiness_exposes_global_frame_contract() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle);
+        let response = GeometryRuntime::get_mapping_readiness(&service, Request::new(Empty {}))
+            .await
+            .expect("GetMappingReadiness")
+            .into_inner();
+        let detail: serde_json::Value =
+            serde_json::from_str(&response.message).expect("mapping readiness JSON");
+        assert_eq!(detail["global_consumer_ready"], false);
+        assert_eq!(detail["frame_generation"], 0);
+        assert!(!response.ready);
+    }
 }
 
 #[cfg(test)]
@@ -1433,18 +1780,37 @@ mod map_update_tests {
     use crate::lcm_runtime::{MapRevisionEvent, MapState};
     use tokio_stream::StreamExt;
 
+    fn test_mapping_event(map: MapState) -> MapRevisionEvent {
+        let mut adapter = crate::mapping_adapter::MappingAdapter::new_with_frames(
+            crate::mapping_adapter::MappingAdapterConfig::from_env(),
+            "map",
+            "odom",
+        );
+        let session = adapter
+            .start_session("stream-session", "warehouse", "mapver_000001")
+            .expect("test mapping session");
+        MapRevisionEvent::from_map(&map, &session)
+    }
+
     #[tokio::test]
     async fn subscribe_map_updates_is_event_driven_and_carries_real_payload() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
+        handle
+            .mapping_adapter
+            .as_ref()
+            .expect("mapping adapter")
+            .lock()
+            .start_session("stream-session", "warehouse", "mapver_000001")
+            .expect("activate stream session");
         let service = GeometryRuntimeService::new(handle.clone());
         let response = GeometryRuntime::subscribe_map_updates(&service, Request::new(Empty {}))
             .await
             .expect("SubscribeMapUpdates RPC");
         let mut stream = response.into_inner();
 
-        let event = MapRevisionEvent::from_map(&MapState {
+        let event = test_mapping_event(MapState {
             width: 2,
             height: 2,
             resolution: 0.05,
@@ -1470,14 +1836,47 @@ mod map_update_tests {
         assert_eq!(meta.revision, event.revision);
         assert_eq!(meta.width, event.width);
         assert_eq!(meta.height, event.height);
-        assert_eq!(update.data, event.data);
+        assert_eq!(update.data.as_slice(), event.data.as_ref());
         assert_eq!(update.size, event.size);
         assert_eq!(update.schema_version, 1);
         assert_eq!(update.checksum, event.checksum);
         assert_eq!(update.last_seen_ms, event.last_seen_ms);
-        let shm_ref = update.shm_ref.expect("real SHM reference");
+        assert_eq!(update.session_id, "stream-session");
+        assert_eq!(update.map_version_id, "mapver_000001");
+        assert_eq!(update.session_generation, 1);
+        let shm_ref = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match GeometryRuntime::get_occupancy_grid_shm(&service, Request::new(Empty {}))
+                    .await
+                {
+                    Ok(response) => break response.into_inner(),
+                    Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    Err(status) => panic!("unexpected SHM status: {status}"),
+                }
+            }
+        })
+        .await
+        .expect("sole SHM writer must publish current reference");
         assert_eq!(shm_ref.revision, event.revision);
-        assert_eq!(shm_ref.size, event.size);
+        assert!(shm_ref.size > event.size, "ShmRef.size is mmap file size");
+        assert_eq!(shm_ref.layout_version, 2);
+        assert_eq!(shm_ref.payload_schema_version, 1);
+        assert!(shm_ref.generation > 0);
+        assert!(shm_ref.active_slot < 2);
+        assert_eq!(shm_ref.payload_size, event.size);
+        let internal = handle
+            .occupancy_shm_current
+            .read()
+            .await
+            .clone()
+            .expect("v2 SHM metadata");
+        assert_eq!(internal.layout_version, 2);
+        assert_eq!(internal.payload_schema_version, 1);
+        assert_eq!(internal.payload_size, event.size);
+        assert!(internal.generation > 0);
+        assert!(internal.active_slot < 2);
         assert_eq!(
             shm_ref.key,
             handle
@@ -1486,11 +1885,353 @@ mod map_update_tests {
                 .expect("authoritative SHM path")
         );
     }
+
+    #[tokio::test]
+    async fn map_update_omits_shm_when_current_revision_differs() {
+        let event = test_mapping_event(MapState {
+            width: 2,
+            height: 1,
+            resolution: 0.1,
+            frame_id: "map".to_string(),
+            revision: 41,
+            timestamp_ns: 41,
+            data: vec![0, 100],
+            ..MapState::default()
+        });
+        for current_revision in [40, 42] {
+            let current = Arc::new(RwLock::new(Some(
+                crate::lcm_runtime::OccupancyShmSnapshot {
+                    key: "/tmp/current-v2.mmap".to_string(),
+                    file_size: 8192,
+                    payload_size: event.size,
+                    revision: current_revision,
+                    layout_version: 2,
+                    payload_schema_version: 1,
+                    generation: 2,
+                    active_slot: 1,
+                },
+            )));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+            assert!(forward_map_revision(&tx, event.clone(), &current).await);
+            let update = rx
+                .recv()
+                .await
+                .expect("stream update")
+                .expect("no INTERNAL");
+            assert_eq!(update.meta.as_ref().unwrap().revision, event.revision);
+            assert_eq!(update.data.as_slice(), event.data.as_ref());
+            assert_eq!(update.size, event.size);
+            assert_eq!(update.checksum, event.checksum);
+            assert!(
+                update.shm_ref.is_none(),
+                "revision {current_revision} must not be attached to event revision {}",
+                event.revision
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn map_update_carries_shm_when_revision_matches() {
+        let event = test_mapping_event(MapState {
+            width: 2,
+            height: 1,
+            resolution: 0.1,
+            frame_id: "map".to_string(),
+            revision: 41,
+            timestamp_ns: 41,
+            data: vec![0, 100],
+            ..MapState::default()
+        });
+        let current = Arc::new(RwLock::new(Some(
+            crate::lcm_runtime::OccupancyShmSnapshot {
+                key: "/tmp/current-v2.mmap".to_string(),
+                file_size: 8192,
+                payload_size: event.size,
+                revision: event.revision,
+                layout_version: 2,
+                payload_schema_version: 1,
+                generation: 2,
+                active_slot: 1,
+            },
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        assert!(forward_map_revision(&tx, event.clone(), &current).await);
+        let update = rx
+            .recv()
+            .await
+            .expect("stream update")
+            .expect("no INTERNAL");
+        assert_eq!(update.meta.as_ref().unwrap().revision, event.revision);
+        assert_eq!(update.data.as_slice(), event.data.as_ref());
+        assert_eq!(update.size, event.size);
+        assert_eq!(update.checksum, event.checksum);
+        let shm_ref = update.shm_ref.expect("matching SHM reference");
+        assert_eq!(shm_ref.revision, event.revision);
+        assert_eq!(shm_ref.size, 8192);
+        assert_eq!(shm_ref.layout_version, 2);
+        assert_eq!(shm_ref.payload_schema_version, 1);
+        assert_eq!(shm_ref.generation, 2);
+        assert_eq!(shm_ref.active_slot, 1);
+        assert_eq!(shm_ref.payload_size, event.size);
+    }
+
+    #[test]
+    fn occupancy_shm_v2_projection_rejects_old_or_inconsistent_references() {
+        let valid = crate::lcm_runtime::OccupancyShmSnapshot {
+            key: "/tmp/occupancy-v2.mmap".to_string(),
+            file_size: 8192,
+            payload_size: 256,
+            revision: 7,
+            layout_version: 2,
+            payload_schema_version: 1,
+            generation: 3,
+            active_slot: 0,
+        };
+        assert!(occupancy_shm_ref(valid.clone()).is_ok());
+        for invalid in [
+            crate::lcm_runtime::OccupancyShmSnapshot {
+                layout_version: 0,
+                ..valid.clone()
+            },
+            crate::lcm_runtime::OccupancyShmSnapshot {
+                generation: 0,
+                ..valid.clone()
+            },
+            crate::lcm_runtime::OccupancyShmSnapshot {
+                active_slot: 2,
+                ..valid.clone()
+            },
+            crate::lcm_runtime::OccupancyShmSnapshot {
+                payload_size: 8192,
+                ..valid
+            },
+        ] {
+            assert_eq!(
+                occupancy_shm_ref(invalid).unwrap_err().code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use crate::lcm_runtime::{MapRevisionEvent, MapState};
+    use nalgebra::Point3;
+    use tokio_stream::StreamExt;
+
+    async fn start_mapping_session(
+        service: &GeometryRuntimeService,
+        session_id: &str,
+        map_version_id: &str,
+    ) -> MappingSessionState {
+        GeometryRuntime::start_mapping(
+            service,
+            Request::new(StartMappingRequest {
+                session_id: session_id.to_string(),
+                map_name: "warehouse".to_string(),
+                map_version_id: map_version_id.to_string(),
+            }),
+        )
+        .await
+        .expect("StartMapping")
+        .into_inner()
+    }
+
+    fn commit_test_map(handle: &GeometryRuntimeHandle, x: f64) -> u64 {
+        let mut adapter = handle
+            .mapping_adapter
+            .as_ref()
+            .expect("mapping adapter")
+            .lock();
+        adapter.feed_pointcloud(&[Point3::new(x, 0.0, 2.0)]);
+        assert!(adapter.build_and_publish(&handle.state, Some(&handle.map_revision_tx)));
+        adapter.current_revision()
+    }
+
+    #[tokio::test]
+    async fn mapping_rpc_fences_sessions_and_keeps_wire_revision_globally_monotonic() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle.clone());
+
+        let first = start_mapping_session(&service, "session-1", "mapver_000001").await;
+        assert_eq!(first.phase, "ACTIVE");
+        assert_eq!(first.session_generation, 1);
+        assert!(!first.idempotent_replay);
+        let replay = start_mapping_session(&service, "session-1", "mapver_000001").await;
+        assert!(replay.idempotent_replay);
+
+        let response = GeometryRuntime::subscribe_map_updates(&service, Request::new(Empty {}))
+            .await
+            .expect("SubscribeMapUpdates");
+        let mut stream = response.into_inner();
+        let first_revision = commit_test_map(&handle, 0.0);
+        assert_eq!(first_revision, 1);
+        let first_update = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("first session update timeout")
+            .expect("first session stream")
+            .expect("first session update");
+        assert_eq!(first_update.meta.as_ref().unwrap().revision, first_revision);
+        assert_eq!(first_update.session_generation, 1);
+
+        let stopped = GeometryRuntime::stop_mapping(
+            &service,
+            Request::new(StopMappingRequest {
+                session_id: "session-1".to_string(),
+                reason: "test".to_string(),
+            }),
+        )
+        .await
+        .expect("StopMapping")
+        .into_inner();
+        assert_eq!(stopped.phase, "STOPPED");
+        assert!(!stopped.active);
+        let stopped_snapshot = handle
+            .mapping_adapter
+            .as_ref()
+            .expect("mapping adapter")
+            .lock()
+            .snapshot();
+        handle
+            .map_revision_tx
+            .send(MapRevisionEvent::from_map(
+                &MapState {
+                    width: 1,
+                    height: 1,
+                    resolution: 0.1,
+                    frame_id: "map".to_string(),
+                    revision: first_revision + 1,
+                    timestamp_ns: first_revision + 1,
+                    data: vec![100],
+                    ..MapState::default()
+                },
+                &stopped_snapshot,
+            ))
+            .expect("coalescer remains registered");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next())
+                .await
+                .is_err(),
+            "stopped session must not publish queued map events"
+        );
+
+        {
+            let mut shared = handle.state.write().await;
+            shared.map.revision = 99;
+        }
+        *handle.occupancy_shm_current.write().await =
+            Some(crate::lcm_runtime::OccupancyShmSnapshot {
+                key: "/tmp/stale.mmap".to_string(),
+                file_size: 8192,
+                payload_size: 1,
+                revision: 99,
+                layout_version: 2,
+                payload_schema_version: 1,
+                generation: 1,
+                active_slot: 0,
+            });
+
+        let second = start_mapping_session(&service, "session-2", "mapver_000002").await;
+        assert_eq!(second.session_generation, 2);
+        assert_eq!(second.revision, 0);
+        assert_eq!(handle.state.read().await.map.revision, 0);
+        assert_eq!(
+            handle
+                .mapping_adapter
+                .as_ref()
+                .expect("mapping adapter")
+                .lock()
+                .global_revision(),
+            first_revision
+        );
+        assert!(handle.map_revision_latest_tx.borrow().is_none());
+        assert!(handle.occupancy_shm_current.read().await.is_none());
+
+        let stale_stop = GeometryRuntime::stop_mapping(
+            &service,
+            Request::new(StopMappingRequest {
+                session_id: "session-1".to_string(),
+                reason: "late retry".to_string(),
+            }),
+        )
+        .await
+        .expect_err("old session stop must fail closed");
+        assert_eq!(stale_stop.code(), tonic::Code::FailedPrecondition);
+        assert!(handle
+            .mapping_adapter
+            .as_ref()
+            .expect("mapping adapter")
+            .lock()
+            .is_active());
+
+        let second_revision = commit_test_map(&handle, 1.0);
+        assert!(second_revision > first_revision);
+        let second_update = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let update = stream
+                    .next()
+                    .await
+                    .expect("second session stream")
+                    .expect("second session update");
+                if update.session_generation == 2 {
+                    break update;
+                }
+            }
+        })
+        .await
+        .expect("new session globally newer revision must not be deduplicated");
+        assert_eq!(
+            second_update.meta.as_ref().unwrap().revision,
+            second_revision
+        );
+        assert_eq!(second_update.map_version_id, "mapver_000002");
+    }
+
+    #[tokio::test]
+    async fn stop_mapping_waits_for_inflight_fanout_barrier() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle.clone());
+        start_mapping_session(&service, "barrier-session", "mapver_000010").await;
+
+        // Fanout sinks hold this lock from lifecycle validation through their
+        // bounded sink operation. Holding it here deterministically pauses the
+        // same critical section and proves StopMapping cannot overtake it.
+        let fanout_guard = handle.mapping_lifecycle_lock.lock().await;
+        let stop_service = service.clone();
+        let stop_task = tokio::spawn(async move {
+            GeometryRuntime::stop_mapping(
+                &stop_service,
+                Request::new(StopMappingRequest {
+                    session_id: "barrier-session".to_string(),
+                    reason: "barrier-test".to_string(),
+                }),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !stop_task.is_finished(),
+            "StopMapping must wait for an in-flight fanout critical section"
+        );
+
+        drop(fanout_guard);
+        let stopped = tokio::time::timeout(Duration::from_secs(1), stop_task)
+            .await
+            .expect("StopMapping must finish after fanout barrier release")
+            .expect("StopMapping join")
+            .expect("StopMapping RPC")
+            .into_inner();
+        assert_eq!(stopped.phase, "STOPPED");
+        assert!(!stopped.active);
+    }
 
     #[tokio::test]
     async fn stop_waits_until_the_listener_is_closed_before_reporting_success() {
@@ -1519,5 +2260,310 @@ mod lifecycle_tests {
             .expect("repeated Stop RPC")
             .into_inner();
         assert!(repeated.success, "Stop must remain idempotent");
+    }
+}
+
+#[cfg(test)]
+mod exploration_contract_tests {
+    use super::*;
+
+    #[test]
+    fn start_request_parses_boundary_stop_conditions_and_map_pin() {
+        let request = ExploreRequest {
+            strategy: "wavefront".into(),
+            arbitration: "prefer_wavefront".into(),
+            map_version_id: "map-v7".into(),
+            request_id: "explore-1".into(),
+            map_revision: 7,
+            boundary_line_segments: vec![
+                ExplorationBoundarySegment {
+                    start_x: 0.0,
+                    start_y: 0.0,
+                    end_x: 2.0,
+                    end_y: 0.0,
+                },
+                ExplorationBoundarySegment {
+                    start_x: 2.0,
+                    start_y: 0.0,
+                    end_x: 0.0,
+                    end_y: 2.0,
+                },
+                ExplorationBoundarySegment {
+                    start_x: 0.0,
+                    start_y: 2.0,
+                    end_x: 0.0,
+                    end_y: 0.0,
+                },
+            ],
+            stop_conditions: Some(ExplorationStopConditions {
+                max_coverage_pct: Some(85.0),
+                no_frontier_timeout_ms: Some(4_000),
+                max_duration_ms: Some(60_000),
+                max_goals: Some(12),
+                stop_on_map_revision_change: true,
+            }),
+            max_navigation_retries: 3,
+            blacklist_radius_m: 0.75,
+            boundary_frame_id: "map".into(),
+        };
+
+        let config = explore_config_from_request(&request).expect("valid explore config");
+        assert_eq!(config.map_version_id, "map-v7");
+        assert_eq!(config.map_revision, 7);
+        assert_eq!(config.max_navigation_retries, 3);
+        assert_eq!(config.blacklist_radius_m, 0.75);
+        assert!(config.boundary.is_some());
+        assert_eq!(config.stop_conditions.max_goals, Some(12));
+        assert_eq!(config.stop_conditions.no_frontier_timeout_ms, Some(4_000));
+    }
+
+    #[test]
+    fn exploration_state_preserves_child_and_map_fields() {
+        let proto =
+            exploration_state_from_snapshot(crate::explore_runtime::ExploreRuntimeSnapshot {
+                status: crate::explore_runtime::STATUS_ACTIVE,
+                message: "moving".into(),
+                request_id: "parent".into(),
+                selected_source: "wavefront".into(),
+                last_stop_reason: String::new(),
+                frontier_count: 2,
+                revision: 8,
+                child_task_id: "child-3".into(),
+                map_version_id: "map-v7".into(),
+                map_revision: 7,
+            });
+        assert_eq!(proto.child_task_id, "child-3");
+        assert_eq!(proto.map_version_id, "map-v7");
+        assert_eq!(proto.map_revision, 7);
+    }
+}
+
+#[cfg(test)]
+mod navigation_feedback_contract_tests {
+    use super::*;
+    use crate::lcm_runtime::{NavigationFeedback, NavigationUpdate};
+
+    #[test]
+    fn navigation_proto_projection_preserves_typed_feedback() {
+        let proto = nav_state_to_proto(NavigationUpdate {
+            state: crate::lcm_runtime::NavState {
+                status: "CANCELLED".into(),
+                message: "motion guard zeroed".into(),
+                goal_id: "goal-7".into(),
+                distance_remaining: 0.0,
+                timestamp_ns: 99,
+            },
+            producer_runtime_generation: 41,
+            feedback: NavigationFeedback {
+                cancel_phase: "ZEROED".into(),
+                cancel_generation: 3,
+                actuator_zeroed: true,
+                reason_code: "CANCEL_ZEROED".into(),
+                runtime_generation: 7,
+                guard_generation: 11,
+                sink_ready: true,
+                planner_map_revision: 42,
+                planner_map_frame: "map".into(),
+                planner_pose_frame: "map".into(),
+                zero_ack_id: "zero-3".into(),
+                zero_applied_monotonic_ns: 123,
+                owner_kind: nuwax_codec::lcm::schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+                parent_request_id: "request-7".into(),
+                goal_generation: 5,
+                path_revision: 2,
+                goal_payload_sha256: [7; 32],
+                path_payload_sha256: [8; 32],
+                map_version_id: "map-v1".into(),
+            },
+        });
+
+        assert_eq!(proto.cancel_phase, "ZEROED");
+        assert_eq!(proto.cancel_generation, 3);
+        assert!(proto.actuator_zeroed);
+        assert_eq!(proto.reason_code, "CANCEL_ZEROED");
+        assert_eq!(proto.runtime_generation, 7);
+        assert_eq!(proto.guard_generation, 11);
+        assert!(proto.sink_ready);
+        assert_eq!(proto.planner_map_revision, 42);
+        assert_eq!(proto.planner_map_frame, "map");
+        assert_eq!(proto.planner_pose_frame, "map");
+        assert_eq!(proto.zero_ack_id, "zero-3");
+        assert_eq!(proto.zero_applied_monotonic_ns, 123);
+        assert_eq!(
+            proto.owner_kind,
+            nuwax_codec::lcm::schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
+        );
+        assert_eq!(proto.parent_request_id, "request-7");
+        assert_eq!(proto.goal_generation, 5);
+        assert_eq!(proto.path_revision, 2);
+        assert_eq!(proto.goal_payload_sha256, vec![7; 32]);
+        assert_eq!(proto.path_payload_sha256, vec![8; 32]);
+        assert_eq!(proto.map_version_id, "map-v1");
+        assert_eq!(proto.producer_runtime_generation, 41);
+    }
+
+    #[tokio::test]
+    async fn deprecated_sink_rpc_cannot_create_ready_without_generation() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        handle.set_cmd_vel_sink_ready(false);
+        let service = GeometryRuntimeService::new(handle.clone());
+
+        let response = GeometryRuntime::set_cmd_vel_sink_ready(
+            &service,
+            Request::new(CmdVelSinkReadyRequest {
+                ready: true,
+                generation: 0,
+            }),
+        )
+        .await
+        .expect("deprecated RPC response")
+        .into_inner();
+
+        assert!(!response.success);
+        assert!(!handle.cmd_vel_sink_ready());
+    }
+
+    #[tokio::test]
+    async fn public_goal_normalizes_once_and_cancel_preserves_complete_lease() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        {
+            let mut shared = handle.state.write().await;
+            shared.pose = PoseState {
+                frame_id: "map".to_string(),
+                timestamp_ns: now_ns(),
+                qw: 1.0,
+                ..PoseState::default()
+            };
+            shared.map.frame_id = "map".to_string();
+            shared.map.revision = 1;
+        }
+        handle
+            .nav
+            .observe_stack_state(crate::lcm_runtime::NavState {
+                status: "IDLE".to_string(),
+                timestamp_ns: now_ns(),
+                ..crate::lcm_runtime::NavState::default()
+            })
+            .await;
+        handle
+            .nav
+            .observe_tf_chain(crate::nav_runtime::TfChainObservation {
+                generation: 1,
+                map_frame: "map".to_string(),
+                odom_frame: "odom".to_string(),
+                base_frame: "base_link".to_string(),
+                map_to_odom: true,
+                odom_to_base: true,
+            })
+            .expect("TF observation");
+        handle
+            .nav
+            .observe_planner_input(crate::nav_runtime::PlannerInputObservation {
+                generation: 1,
+                map_revision: 1,
+                map_frame: "map".to_string(),
+                pose_frame: "map".to_string(),
+                ready: true,
+            })
+            .expect("planner observation");
+        handle
+            .nav
+            .observe_motion_sink(crate::nav_runtime::MotionSinkObservation {
+                generation: 1,
+                ready: true,
+            })
+            .expect("motion sink");
+        let service = GeometryRuntimeService::new(handle);
+        let goal = GeometryRuntime::set_navigation_goal(
+            &service,
+            Request::new(NavigationGoal {
+                pose: Some(Pose {
+                    orientation: Some(Quat {
+                        w: 1.0,
+                        ..Quat::default()
+                    }),
+                    frame_id: "map".to_string(),
+                    timestamp_ns: now_ns(),
+                    ..Pose::default()
+                }),
+                frame_id: "map".to_string(),
+                goal_id: "public-goal".to_string(),
+                map_version_id: "map-v1".to_string(),
+                ..NavigationGoal::default()
+            }),
+        )
+        .await
+        .expect("public goal")
+        .into_inner();
+        assert_eq!(goal.status, "ACCEPTED");
+        assert_eq!(
+            goal.owner_kind,
+            nuwax_codec::lcm::schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
+        );
+        assert_eq!(goal.parent_request_id, "public-goal");
+        assert!(goal.goal_generation > 0);
+        assert!(goal.producer_runtime_generation > 0);
+        assert_eq!(goal.goal_payload_sha256.len(), 32);
+        assert_eq!(goal.map_version_id, "map-v1");
+
+        let wrong_producer_runtime_generation = if goal.producer_runtime_generation == 1 {
+            2
+        } else {
+            goal.producer_runtime_generation - 1
+        };
+        let stale_cancel = GeometryRuntime::cancel_navigation(
+            &service,
+            Request::new(CancelNavigationRequest {
+                goal_id: goal.goal_id.clone(),
+                owner_kind: goal.owner_kind,
+                parent_request_id: goal.parent_request_id.clone(),
+                goal_generation: goal.goal_generation,
+                producer_runtime_generation: wrong_producer_runtime_generation,
+            }),
+        )
+        .await
+        .expect("stale producer cancel response")
+        .into_inner();
+        assert_eq!(stale_cancel.status, "FAILED");
+        assert!(stale_cancel.message.contains("GOAL_LEASE_MISMATCH"));
+        assert_eq!(service.bridge.nav.cancel_snapshot().generation, 0);
+
+        let cancelled = GeometryRuntime::cancel_navigation(
+            &service,
+            Request::new(CancelNavigationRequest {
+                goal_id: goal.goal_id.clone(),
+                owner_kind: goal.owner_kind,
+                parent_request_id: goal.parent_request_id.clone(),
+                goal_generation: goal.goal_generation,
+                producer_runtime_generation: goal.producer_runtime_generation,
+            }),
+        )
+        .await
+        .expect("correlated cancel")
+        .into_inner();
+        assert_eq!(cancelled.status, "PENDING");
+        assert_eq!(cancelled.owner_kind, goal.owner_kind);
+        assert_eq!(cancelled.parent_request_id, goal.parent_request_id);
+        assert_eq!(cancelled.goal_generation, goal.goal_generation);
+        assert_eq!(
+            cancelled.producer_runtime_generation,
+            goal.producer_runtime_generation
+        );
+        assert_eq!(cancelled.goal_payload_sha256, goal.goal_payload_sha256);
+
+        let rejected = GeometryRuntime::set_navigation_goal(
+            &service,
+            Request::new(NavigationGoal {
+                owner_kind: nuwax_codec::lcm::schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                ..NavigationGoal::default()
+            }),
+        )
+        .await
+        .expect_err("public RPC cannot forge exploration owner");
+        assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
     }
 }

@@ -7,6 +7,8 @@ from typing import Dict, Tuple
 
 GEOMETRY_STACK_NAME = "nuwax_geometry_runtime"
 NAVIGATION_BACKEND_NAME = "nuwax_navigation_stack"
+OCCUPANCY_SHM_LAYOUT_VERSION = 2
+OCCUPANCY_SHM_PAYLOAD_SCHEMA_VERSION = 1
 
 
 def build_default_geometry_runtime_binary() -> str:
@@ -26,13 +28,18 @@ def build_default_geometry_runtime_binary() -> str:
 def build_default_geometry_runtime_ready_file() -> str:
     """返回 nuwax-geometry-runtime ready 文件（健康检查就绪标记）。"""
 
-    return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "runtime.ready")
+    return str(
+        Path(__file__).resolve().parents[1]
+        / "runtime_data"
+        / "geometry"
+        / "nuwax_geometry_runtime.ready"
+    )
 
 
 def build_default_geometry_runtime_port() -> int:
     """返回 nuwax-geometry-runtime gRPC 控制面默认端口。"""
 
-    return 50061
+    return 50051
 
 
 def build_default_lcm_url() -> str:
@@ -70,14 +77,13 @@ def build_default_rtabmap_pcd_root() -> str:
 
 
 def build_default_geometry_runtime_start_script() -> str:
-    """返回 nuwax-geometry-runtime 启动脚本路径。"""
+    """返回 nuwax-geometry-runtime 受监督启动器路径。"""
 
     return str(
         Path(__file__).resolve().parents[1]
-        / "services"
-        / "geometry"
         / "scripts"
-        / "start_nuwax_geometry_runtime.sh"
+        / "systemd"
+        / "start_geometry_runtime.sh"
     )
 
 
@@ -244,7 +250,7 @@ class LcmChannelConfig:
     Phase 4 约束:
     - 所有字段强制 typed suffix `/topic#pkg.Msg`；构造时若缺 `#<msg_type>`
       会按本类 `_MSG_TYPE_DEFAULTS` 表自动补 msg_type。
-    - 新增 `nav_state` 字段（历史误用 goal_pose alias，Phase 4 拆开）。
+    - goal/path 使用带业务身份和 revision 的 versioned envelope。
     - `as_dict()` 输出供 gRPC facade / debug_panel 配置面板使用。
     """
 
@@ -255,7 +261,8 @@ class LcmChannelConfig:
     occupancy: str = "/map/occupancy#nav_msgs.OccupancyGrid"
     cmd_vel: str = "/cmd_vel#geometry_msgs.Twist"
     initial_pose: str = "/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped"
-    goal_pose: str = "/nav/goal#geometry_msgs.PoseStamped"
+    goal_pose: str = "/nav/goal#nuwax_msgs.GoalEnvelope"
+    nav_path: str = "/nav/path#nuwax_msgs.PathEnvelope"
     frontier: str = "/explore/frontiers#nuwax_msgs.FrontierList"
     cloud_map: str = "/cloud_map#sensor_msgs.PointCloud2"
     # Phase 1 channel registry 补齐 4 类 typed channel。
@@ -276,7 +283,8 @@ class LcmChannelConfig:
         "occupancy": "nav_msgs.OccupancyGrid",
         "cmd_vel": "geometry_msgs.Twist",
         "initial_pose": "geometry_msgs.PoseWithCovarianceStamped",
-        "goal_pose": "geometry_msgs.PoseStamped",
+        "goal_pose": "nuwax_msgs.GoalEnvelope",
+        "nav_path": "nuwax_msgs.PathEnvelope",
         "frontier": "nuwax_msgs.FrontierList",
         "cloud_map": "sensor_msgs.PointCloud2",
         "pose_stamped": "geometry_msgs.PoseStamped",
@@ -297,7 +305,8 @@ class LcmChannelConfig:
             "occupancy": "nav_msgs.OccupancyGrid",
             "cmd_vel": "geometry_msgs.Twist",
             "initial_pose": "geometry_msgs.PoseWithCovarianceStamped",
-            "goal_pose": "geometry_msgs.PoseStamped",
+            "goal_pose": "nuwax_msgs.GoalEnvelope",
+            "nav_path": "nuwax_msgs.PathEnvelope",
             "frontier": "nuwax_msgs.FrontierList",
             "cloud_map": "sensor_msgs.PointCloud2",
             "pose_stamped": "geometry_msgs.PoseStamped",
@@ -340,6 +349,7 @@ class LcmChannelConfig:
             "cmd_vel": self.cmd_vel,
             "initial_pose": self.initial_pose,
             "goal_pose": self.goal_pose,
+            "nav_path": self.nav_path,
             "frontier": self.frontier,
             "cloud_map": self.cloud_map,
             "pose_stamped": self.pose_stamped,
@@ -352,15 +362,9 @@ class LcmChannelConfig:
 class PlatformGeometryConfig:
     """平台几何引擎统一配置（目标态：LCM + nuwax-geometry-runtime，无 ROS2/Nav2）。
 
-    ## LCM backend 默认
-    `lcm_backend` 默认 = `"real-lcm"`（Phase 1 fail-fast 收敛版）。
-    - 设 `real-lcm` 时,nuwax-geometry-runtime 启动期直接 fail-fast(exit 4 +
-      stderr 输出 `LCM_BACKEND_UNAVAILABLE` 关键字),不允许 fallback fake-lcm;
-      上游 dimos `nuwax-transport/real-lcm` feature 仍为空桩 + fingerprint
-      仍 FNV-1a(非 lcm-gen MurmurHash64A),属于 dependency mismatch blocker。
-    - CI / contract test 显式覆盖:设 `NUWAX_LCM_BACKEND=fake-lcm` 走 fake。
-    - Phase 2 + 后续阶段保持 `real-lcm` 不变;P1 上游 blocker 命中后,本字段
-      自动生效,fail-fast 行为取消。
+    `lcm_backend` 只接受已实装的 `real-lcm` 后端。配置为已删除的
+    fake backend 或 real-LCM 初始化失败时，运行时必须 fail-closed，
+    不得回退到模拟传输。
     """
 
     enabled: bool = True
@@ -503,17 +507,21 @@ class PlatformGeometryConfig:
                 "provides_tf": self.external.provides_tf,
                 "frontier_channel": self.external.frontier_channel,
             },
-            "lcm_channels": {
-                "odom": self.lcm_channels.odom,
-                "tf": self.lcm_channels.tf,
-                "tf_static": self.lcm_channels.tf_static,
-                "point_cloud": self.lcm_channels.point_cloud,
-                "occupancy": self.lcm_channels.occupancy,
-                "cmd_vel": self.lcm_channels.cmd_vel,
-                "initial_pose": self.lcm_channels.initial_pose,
-                "goal_pose": self.lcm_channels.goal_pose,
-                "frontier": self.lcm_channels.frontier,
-                "cloud_map": self.lcm_channels.cloud_map,
+            "lcm_channels": self.lcm_channels.as_dict(),
+            "occupancy_shm": {
+                "layout_version": OCCUPANCY_SHM_LAYOUT_VERSION,
+                "payload_schema_version": OCCUPANCY_SHM_PAYLOAD_SCHEMA_VERSION,
+                "consistency_model": "double_buffer_active_slot",
+                "reference_fields": (
+                    "key",
+                    "size",
+                    "revision",
+                    "layout_version",
+                    "payload_schema_version",
+                    "generation",
+                    "active_slot",
+                    "payload_size",
+                ),
             },
             "output_contract": {
                 "name": self.mapping.output_contract,

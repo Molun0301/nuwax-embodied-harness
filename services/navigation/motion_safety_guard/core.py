@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import secrets
 import threading
 import time
-from typing import Callable
+from typing import Callable, Dict, List, Optional, Tuple
 import uuid
 
 from services.navigation.proto_gen import motion_guard_pb2 as pb
@@ -41,7 +41,7 @@ class GuardFailure(Exception):
 
 @dataclass(frozen=True)
 class OperationRecord:
-    key: tuple[object, ...]
+    key: Tuple[object, ...]
     operation_id: str
     payload_sha256: bytes
     peer_uid: int
@@ -114,7 +114,7 @@ class MotionGuardCore:
         actuator: ActuatorBackend,
         authorizer: PeerAuthorizer,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
-        lease_id_factory: Callable[[], int] | None = None,
+        lease_id_factory: Optional[Callable[[], int]] = None,
         dedup_capacity: int = DEDUP_CAPACITY_DEFAULT,
     ) -> None:
         if dedup_capacity < 4:
@@ -148,9 +148,9 @@ class MotionGuardCore:
         self._state_lock = threading.RLock()
         self._ordinary_capacity = dedup_capacity - max(1, dedup_capacity // 4)
         self._emergency_capacity = dedup_capacity - self._ordinary_capacity
-        self._ordinary_records: dict[tuple[object, ...], OperationRecord] = {}
-        self._emergency_records: dict[tuple[object, ...], OperationRecord] = {}
-        self._operation_index: dict[str, list[OperationRecord]] = {}
+        self._ordinary_records: Dict[Tuple[object, ...], OperationRecord] = {}
+        self._emergency_records: Dict[Tuple[object, ...], OperationRecord] = {}
+        self._operation_index: Dict[str, List[OperationRecord]] = {}
 
     @property
     def active_lease_id(self) -> int:
@@ -211,7 +211,7 @@ class MotionGuardCore:
                 str(exc),
             )
 
-    def tick(self, now_ns: int | None = None) -> pb.ZeroAck | None:
+    def tick(self, now_ns: Optional[int] = None) -> Optional[pb.ZeroAck]:
         with self._state_lock:
             if self.lease_state != pb.LEASE_STATE_ACTIVE:
                 return None
@@ -247,7 +247,7 @@ class MotionGuardCore:
         with self._state_lock:
             self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
             self.lease_state = pb.LEASE_STATE_REVOKING
-            precommit_error: EpochError | None = None
+            precommit_error: Optional[EpochError] = None
             try:
                 self._commit_epoch(
                     gate=pb.SAFETY_GATE_RESET_REQUIRED,
@@ -688,7 +688,7 @@ class MotionGuardCore:
         *,
         namespace: str,
         emergency: bool = False,
-    ) -> pb.MotionGuardResponse | None:
+    ) -> Optional[pb.MotionGuardResponse]:
         verify_payload_sha256(request)
         envelope = operation_envelope(request)
         if envelope is None:
@@ -877,15 +877,15 @@ class MotionGuardCore:
     def _commit_epoch(
         self,
         *,
-        gate: int | None = None,
-        lease: int | None = None,
-        fenced: bool | None = None,
-        last_zero_ack_id: str | None = None,
-        reset_generation: int | None = None,
+        gate: Optional[int] = None,
+        lease: Optional[int] = None,
+        fenced: Optional[bool] = None,
+        last_zero_ack_id: Optional[str] = None,
+        reset_generation: Optional[int] = None,
     ) -> None:
         next_gate = self.safety_gate if gate is None else gate
         next_lease = self.lease_state if lease is None else lease
-        updates: dict[str, object] = {
+        updates: Dict[str, object] = {
             "safety_gate": _GATE_TO_EPOCH[next_gate],
             "lease_state": _LEASE_TO_EPOCH[next_lease],
         }
@@ -929,7 +929,7 @@ class MotionGuardCore:
         peer: PeerCredentials,
         source: str,
         namespace: str,
-    ) -> tuple[object, ...]:
+    ) -> Tuple[object, ...]:
         if namespace == "acquire":
             return (
                 namespace,
@@ -963,7 +963,7 @@ class MotionGuardCore:
         peer: PeerCredentials,
         source: str,
         namespace: str,
-    ) -> OperationRecord | None:
+    ) -> Optional[OperationRecord]:
         envelope = operation_envelope(request)
         if envelope is None:
             return None

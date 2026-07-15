@@ -408,6 +408,8 @@ where
             // 推进 pending_goal 状态机(若存在)
             if let Some(pg) = self.pending_goal.as_mut() {
                 if pg.status == GoalStatus::InFlight {
+                    self.state
+                        .record_goal_reached(pg.target.pose.pose.position.to_2d());
                     pg.status = GoalStatus::Reached;
                 }
             }
@@ -415,6 +417,11 @@ where
             // 失败反馈:同样终结 pending_goal,让下一 tick 重新选
             if let Some(pg) = self.pending_goal.as_mut() {
                 if pg.status == GoalStatus::InFlight {
+                    self.state.record_goal_failed(
+                        pg.target.pose.pose.position.to_2d(),
+                        0,
+                        self.config.safe_distance_m,
+                    );
                     pg.status = GoalStatus::Failed;
                 }
             }
@@ -558,6 +565,17 @@ where
                 // 重新选 goal 之前先清掉旧 pending_goal。
                 self.pending_goal = None;
                 self.last_goal_published_at = None;
+                if self.state.consecutive_failures() >= self.config.max_consecutive_failures
+                    && self.explored_goals_count >= 2
+                {
+                    self.stop_count = self.stop_count.saturating_add(1);
+                    self.last_outcome = Some("consecutive_failures_stop".to_string());
+                    self.release_guards();
+                    self.phase = RuntimePhase::Stopped;
+                    return Ok(RuntimeTickOutcome::Stop {
+                        reason: StopReason::ConsecutiveFailuresExceeded,
+                    });
+                }
             }
         }
 
@@ -605,8 +623,6 @@ where
             Ok(GoalSelection::Goal(goal)) => {
                 self.goal_sink.publish(goal.clone());
                 self.state.record_goal_published();
-                self.state
-                    .mark_explored_goal(goal.pose.pose.position.to_2d());
                 self.goals_published = self.goals_published.saturating_add(1);
                 self.last_goal_published_at = Some(inputs.now);
                 // rework22 P0-10:记录 active goal,后续 tick 不会重复 publish
@@ -632,7 +648,7 @@ where
                 // information seed, and the no-gain counter when detection
                 // returns no frontier. Runtime publication, no-frontier, and
                 // timeout counters remain outside that session and survive.
-                self.state.reset();
+                self.state.reset_information_history();
                 self.last_direction = None;
                 // rework22 P1.11:连续 10 次无 frontier 且已发布 ≥ 2 goal → Stop。
                 // 找到 frontier 的分支会清零 streak,此处只负责累加。

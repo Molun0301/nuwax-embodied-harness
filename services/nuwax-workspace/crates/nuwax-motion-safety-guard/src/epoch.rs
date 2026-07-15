@@ -26,6 +26,14 @@ pub const PROVISIONED_PATH: &str = "/var/lib/nuwax/motion-guard/provisioned.json
 pub const EXPECTED_USERS: [&str; 4] = [
     "nuwax-motion-guard",
     "nuwax-motion-admin",
+    "nuwax-navigation",
+    "nuwax-gateway",
+];
+
+/// 仅供显式部署迁移器识别；运行时持久化校验绝不接受 legacy tuple。
+pub const LEGACY_EXPECTED_USERS: [&str; 4] = [
+    "nuwax-motion-guard",
+    "nuwax-motion-admin",
     "nuwax-geometry",
     "nuwax-gateway",
 ];
@@ -119,10 +127,13 @@ impl GuardEpochRecord {
                 self.actuator_symbols_sha256
             ));
         }
-        for uid in &self.peer_uid_allowlist {
-            if !EXPECTED_USERS.contains(&uid.as_str()) {
-                errs.push(format!("peer_uid_allowlist 含未授权 UID:{uid}"));
-            }
+        let actual_users: Vec<&str> = self.peer_uid_allowlist.iter().map(String::as_str).collect();
+        if actual_users.as_slice() == LEGACY_EXPECTED_USERS {
+            errs.push(
+                "legacy peer_uid_allowlist requires explicit deployment migration".to_string(),
+            );
+        } else if actual_users.as_slice() != EXPECTED_USERS {
+            errs.push("peer_uid_allowlist 必须精确匹配 current service identity tuple".to_string());
         }
         errs
     }
@@ -197,7 +208,7 @@ mod tests {
         for u in &[
             "nuwax-motion-guard",
             "nuwax-motion-admin",
-            "nuwax-geometry",
+            "nuwax-navigation",
             "nuwax-gateway",
         ] {
             assert!(EXPECTED_USERS.contains(u), "service UID 缺: {u}");
@@ -267,6 +278,28 @@ mod tests {
             errs.iter().any(|e| e.contains("peer_uid_allowlist")),
             "unauthorized UID 必须报: {errs:?}"
         );
+    }
+
+    #[test]
+    fn verify_rejects_legacy_or_incomplete_peer_tuple() {
+        let legacy = GuardEpochRecord {
+            peer_uid_allowlist: LEGACY_EXPECTED_USERS
+                .iter()
+                .map(|user| (*user).to_string())
+                .collect(),
+            ..GuardEpochRecord::default()
+        };
+        assert!(legacy
+            .verify()
+            .iter()
+            .any(|error| error.contains("explicit deployment migration")));
+
+        let mut incomplete = GuardEpochRecord::default();
+        incomplete.peer_uid_allowlist.pop();
+        assert!(incomplete
+            .verify()
+            .iter()
+            .any(|error| error.contains("精确匹配")));
     }
 
     /// §P0B #15 verify:缺 sha256: 前缀应被拒。

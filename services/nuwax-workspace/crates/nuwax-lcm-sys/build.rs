@@ -72,8 +72,7 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             return fail_fast(&format!(
-                "无法执行 pkg-config 命令(系统是否安装 pkg-config?): {}",
-                e
+                "无法执行 pkg-config 命令(系统是否安装 pkg-config?): {e}"
             ));
         }
     };
@@ -81,20 +80,18 @@ fn main() -> ExitCode {
     // 2. 校验版本 >= REQUIRED_LCM_VERSION
     if !version_at_least(&version, REQUIRED_LCM_VERSION) {
         return fail_fast(&format!(
-            "LCM_VERSION_UNSUPPORTED: liblcm version = {}, 本 crate 最低要求 {}。\
+            "LCM_VERSION_UNSUPPORTED: liblcm version = {version}, 本 crate 最低要求 {REQUIRED_LCM_VERSION}。\
              fake-lcm backend 已物理删除(2026-07-08 v3 F2 决策),无 fallback 路径。\
-             请升级 liblcm-dev 至 1.3~1.5 区间。",
-            version, REQUIRED_LCM_VERSION
+             请升级 liblcm-dev 至 1.3~1.5 区间。"
         ));
     }
     // 2b. 校验版本 < MAX_LCM_VERSION (2026-07-08 新增 — wire format 锁)
     if !version_at_most(&version, MAX_LCM_VERSION) {
         return fail_fast(&format!(
-            "LCM_VERSION_UNSUPPORTED: liblcm version = {}, 本 crate 上限为 {} (不含)。\
+            "LCM_VERSION_UNSUPPORTED: liblcm version = {version}, 本 crate 上限为 {MAX_LCM_VERSION} (不含)。\
              1.6+ 引入 MurmurHash64A-128 fingerprint 与本 crate 1.3~1.5 链路不兼容。\
              fake-lcm backend 已物理删除(2026-07-08 v3 F2 决策),无 fallback 路径。\
-             请降级 liblcm-dev 至 1.3~1.5 区间。",
-            version, MAX_LCM_VERSION
+             请降级 liblcm-dev 至 1.3~1.5 区间。"
         ));
     }
 
@@ -110,7 +107,7 @@ fn main() -> ExitCode {
             return fail_fast(&String::from_utf8_lossy(&o.stderr));
         }
         Err(e) => {
-            return fail_fast(&format!("pkg-config --cflags 失败: {}", e));
+            return fail_fast(&format!("pkg-config --cflags 失败: {e}"));
         }
     };
 
@@ -126,23 +123,23 @@ fn main() -> ExitCode {
             return fail_fast(&String::from_utf8_lossy(&o.stderr));
         }
         Err(e) => {
-            return fail_fast(&format!("pkg-config --libs 失败: {}", e));
+            return fail_fast(&format!("pkg-config --libs 失败: {e}"));
         }
     };
 
     // 5. 解析 cflags: -I/usr/include/lcm   -I...
     for token in cflags.split_whitespace() {
         if let Some(path) = token.strip_prefix("-I") {
-            println!("cargo:include={}", path);
+            println!("cargo:include={path}");
         }
     }
 
     // 6. 解析 libs: -L/usr/lib/x86_64-linux-gnu -llcm ...
     for token in libs_str.split_whitespace() {
         if let Some(path) = token.strip_prefix("-L") {
-            println!("cargo:rustc-link-search=native={}", path);
+            println!("cargo:rustc-link-search=native={path}");
         } else if let Some(lib) = token.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib={}", lib);
+            println!("cargo:rustc-link-lib={lib}");
         }
     }
 
@@ -150,8 +147,7 @@ fn main() -> ExitCode {
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
     println!("cargo:rerun-if-env-changed=LIBLCM_PKG_CONFIG_PATH");
     println!(
-        "cargo:warning=nuwax-lcm-sys: liblcm {} 链接 OK (cflags={:?}, libs={:?})",
-        version, cflags, libs_str
+        "cargo:warning=nuwax-lcm-sys: liblcm {version} 链接 OK (cflags={cflags:?}, libs={libs_str:?})"
     );
     ExitCode::SUCCESS
 }
@@ -215,7 +211,7 @@ fn fail_fast(detail: &str) -> ExitCode {
          2026-07-08 fake-lcm 物理删除后,本 crate 不再支持任何 fake backend 旁路;\
          镜像必须装 liblcm-dev 1.3~1.5 区间的真实 liblcm。\n\
          \n\
-         错误细节: {}\n\
+         错误细节: {detail}\n\
          \n\
          修复:\n\
          - Ubuntu/Debian:  sudo apt-get install liblcm-dev pkg-config\n\
@@ -224,8 +220,7 @@ fn fail_fast(detail: &str) -> ExitCode {
          \n\
          fake-lcm backend 已物理删除(v3 F2 决策),无 mock / fallback / 兼容分支。\n\
          \n\
-         退出码 2 供 start_gateway.sh / CI 区分 \"缺系统库\" 与 \"代码错误\"。",
-        detail
+         退出码 2 供 start_gateway.sh / CI 区分 \"缺系统库\" 与 \"代码错误\"。"
     );
     ExitCode::from(2)
 }

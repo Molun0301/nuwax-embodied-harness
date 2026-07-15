@@ -9,3 +9,7 @@
 # 业务代码（手写的 .py / .sh / .rs）继续走默认 diff.check=trailing-space 检测。
 # ----------------------------------------------------------------------------
 services/geometry/proto_gen/** whitespace=fix,-trailing-space,-indent-with-non-tab,-tab-in-indent,-cr-at-eol
+
+# lcm-gen 1.5.2 emits one intentional blank line after generated C sources.
+# Keep byte-for-byte regeneration checks while retaining other whitespace rules.
+services/nuwax-workspace/lcmtypes/generated/c/*.c whitespace=-blank-at-eof

@@ -84,9 +84,10 @@ mod tests {
         use nuwax_codec::hash::STRUCT_SEEDS;
         // Values come from the locked generated DimOS packages.
         let expected: &[(&str, u64)] = &[
+            ("geometry_msgs.Pose", 0x2456_34ae_2ab1_7b76),
             ("geometry_msgs.PoseStamped", 0x6a82_6964_58c2_79a0),
             ("geometry_msgs.PointStamped", 0x9cd7_6473_8ea6_29af),
-            ("geometry_msgs.Transform", 0x2afa_3e8c_ba35_7ed0),
+            ("geometry_msgs.Transform", 0xee5f_f426_47bf_3f91),
             ("geometry_msgs.Twist", 0x2e7c_07d7_cdf7_e027),
             ("nav_msgs.Path", 0xc3ae_62ac_b357_93e2),
             ("nav_msgs.Odometry", 0x94e1_7f94_648c_f0e4),
@@ -94,8 +95,10 @@ mod tests {
             ("sensor_msgs.PointCloud2", 0xf5eb_3da1_c285_3175),
             ("std_msgs.Bool", 0x1ebe_f06a_5095_0e3e),
             ("tf2_msgs.TFMessage", 0xc2b8_a1c3_3a89_23ec),
-            ("nuwax_msgs.NavigationState", 0xbfd9_7ea1_913d_0280),
-            ("nuwax_msgs.CancelNavigation", 0xafbb_c90f_61b5_2506),
+            ("nuwax_msgs.GoalEnvelope", 0x5e64_bd03_f1d8_bf1a),
+            ("nuwax_msgs.PathEnvelope", 0x7dee_e876_8eff_2144),
+            ("nuwax_msgs.NavigationState", 0xfb19_152f_0ef6_5612),
+            ("nuwax_msgs.CancelNavigation", 0x9704_4b28_e9c5_dd22),
             ("nuwax_msgs.Frontier", 0x1abf_83ea_0ced_9c44),
             ("nuwax_msgs.FrontierList", 0x213d_b68f_b817_1f76),
             ("nuwax_msgs.PersonFollowTarget", 0xe627_c308_2965_e18d),

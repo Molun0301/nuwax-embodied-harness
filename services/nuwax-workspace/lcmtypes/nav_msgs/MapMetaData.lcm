@@ -1,0 +1,9 @@
+package nav_msgs;
+
+struct MapMetaData {
+    std_msgs.Time map_load_time;
+    float resolution;
+    int32_t width;
+    int32_t height;
+    geometry_msgs.Pose origin;
+}

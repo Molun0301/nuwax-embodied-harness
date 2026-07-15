@@ -24,8 +24,8 @@ pub const DEFAULT_TARGET_CHANNEL: &str = "/person_follow_target";
 pub const DEFAULT_POINTCLOUD_CHANNEL: &str = "/global_map";
 /// Default typed TF input channel.
 pub const DEFAULT_TF_CHANNEL: &str = "/tf";
-/// Navigation command channel consumed by the movement manager.
-pub const DEFAULT_COMMAND_CHANNEL: &str = "/nav_cmd_vel";
+/// Gateway-owned person-follow command channel.
+pub const DEFAULT_COMMAND_CHANNEL: &str = "/gateway/person_follow_cmd_vel";
 
 const TARGET_TYPE: &str = "nuwax_msgs.PersonFollowTarget";
 const POINTCLOUD_TYPE: &str = "sensor_msgs.PointCloud2";
@@ -41,7 +41,7 @@ pub struct PersonFollowLcmConfig {
     pub pointcloud_channel: String,
     /// TF channel without its typed suffix.
     pub tf_channel: String,
-    /// Output channel consumed by movement manager.
+    /// Output channel consumed by the Gateway guard client.
     pub command_channel: String,
     /// TF history duration.
     pub tf_buffer_size_secs: f64,
@@ -119,6 +119,19 @@ impl PersonFollowLcmOwner {
     where
         F: Future<Output = ()> + Send,
     {
+        self.run_until_with_ready(shutdown, || Ok(())).await
+    }
+
+    /// Run until shutdown and signal readiness after every typed input is subscribed.
+    pub async fn run_until_with_ready<F, R>(
+        self,
+        shutdown: F,
+        ready: R,
+    ) -> PersonFollowLcmResult<()>
+    where
+        F: Future<Output = ()> + Send,
+        R: FnOnce() -> PersonFollowLcmResult<()> + Send,
+    {
         let context = self.transport.shared_lcm_context().ok_or_else(|| {
             PersonFollowLcmError::InvalidConfig("transport lost its real libLCM context".into())
         })?;
@@ -130,8 +143,22 @@ impl PersonFollowLcmOwner {
             self.config.navigation.clone(),
             self.config.controller,
         )?;
+        let targets =
+            typed_stream(&self.transport, &self.config.target_channel, TARGET_TYPE).await?;
+        let pointclouds = typed_stream(
+            &self.transport,
+            &self.config.pointcloud_channel,
+            POINTCLOUD_TYPE,
+        )
+        .await?;
 
-        let runtime_result = self.run_loop(controller, shutdown).await;
+        let runtime_result = match ready() {
+            Ok(()) => {
+                self.run_loop(controller, targets, pointclouds, shutdown)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         let zero_result = publish_zero(&self.transport, &self.config.command_channel).await;
         let tf_result = tf.stop().await.map_err(PersonFollowLcmError::from);
         runtime_result?;
@@ -142,19 +169,13 @@ impl PersonFollowLcmOwner {
     async fn run_loop<F>(
         &self,
         mut controller: PersonFollowController,
+        mut targets: LcmFrameStream,
+        mut pointclouds: LcmFrameStream,
         shutdown: F,
     ) -> PersonFollowLcmResult<()>
     where
         F: Future<Output = ()> + Send,
     {
-        let mut targets =
-            typed_stream(&self.transport, &self.config.target_channel, TARGET_TYPE).await?;
-        let mut pointclouds = typed_stream(
-            &self.transport,
-            &self.config.pointcloud_channel,
-            POINTCLOUD_TYPE,
-        )
-        .await?;
         let started = Instant::now();
         let mut control_tick = tokio::time::interval(controller.control_period());
         control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -198,9 +219,9 @@ fn validate_config(config: &PersonFollowLcmConfig) -> PersonFollowLcmResult<()> 
             PersonFollowLcmError::InvalidConfig(format!("{label} channel: {error}"))
         })?;
     }
-    if config.command_channel == "/cmd_vel" {
+    if matches!(config.command_channel.as_str(), "/cmd_vel" | "/nav_cmd_vel") {
         return Err(PersonFollowLcmError::InvalidConfig(
-            "person follow must publish nav_cmd_vel; movement manager is the sole cmd_vel owner"
+            "person follow must publish to the Gateway ingress; direct cmd_vel and legacy nav_cmd_vel are forbidden"
                 .into(),
         ));
     }
@@ -391,5 +412,56 @@ impl TfLike for TfTreeSource {
             source_frame,
             time_point.map(|time_point| (time_point, time_tolerance)),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_command_channel_is_gateway_guard_ingress() {
+        let config = PersonFollowLcmConfig::default();
+        assert_eq!(config.command_channel, "/gateway/person_follow_cmd_vel");
+        validate_config(&config).expect("default person-follow LCM config");
+    }
+
+    #[test]
+    fn direct_and_legacy_motion_channels_are_rejected() {
+        for forbidden in ["/cmd_vel", "/nav_cmd_vel"] {
+            let config = PersonFollowLcmConfig {
+                command_channel: forbidden.into(),
+                ..PersonFollowLcmConfig::default()
+            };
+            let error = validate_config(&config).expect_err("forbidden motion channel");
+            assert!(error.to_string().contains("forbidden"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_callback_runs_after_real_lcm_subscriptions() {
+        let transport = LcmTransport::new_real("memq://").expect("real LCM memq context");
+        let owner = PersonFollowLcmOwner::new(transport, PersonFollowLcmConfig::default())
+            .expect("person-follow owner");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(owner.run_until_with_ready(
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            move || {
+                let _ = ready_tx.send(());
+                Ok(())
+            },
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), ready_rx)
+            .await
+            .expect("ready callback timeout")
+            .expect("ready callback sender");
+        shutdown_tx.send(()).expect("request shutdown");
+        task.await
+            .expect("owner task joins")
+            .expect("owner stops cleanly");
     }
 }

@@ -39,12 +39,21 @@ from contracts.runtime_views import (
 from contracts.image import ImageFrame
 from contracts.streams import StreamPayloadKind
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, StreamBus, TaskManager
+from core.task_manager import (
+    TaskCancelledError,
+    TaskSafetyBarrierError,
+    TaskTimeoutError,
+)
 from drivers.entry import load_active_robot_private_capability_specs
 from drivers.common import RobotAssemblyBase
 from drivers.common.private_capabilities import PrivateCapabilitySpec
 from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
 from gateways.motion_guard import GatewayMotionGuard, GatewayMotionGuardError
+from gateways.person_follow import (
+    PersonFollowReadiness,
+    read_person_follow_readiness,
+)
 from gateways.request_context import categorize_gateway_error
 from gateways.serialization import to_jsonable
 from providers import ImageProvider, StateProvider
@@ -288,6 +297,7 @@ def _is_low_value_runtime_capability_event(event_type: str, event) -> bool:
 _NAVIGATION_STATUS_STREAM_REFRESH_INTERVAL_SEC = 0.5
 _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
 _DEFAULT_ASYNC_TASK_TIMEOUT_SEC = 15 * 60
+_EXPLORATION_STOP_BARRIER_TIMEOUT_SEC = 10.0
 _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
     "load_map_version": {
         "initial_wait_sec": 45.0,
@@ -307,14 +317,6 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
             "勿连续高频轮询。"
         ),
     },
-    "relocalize_active_map": {
-        "initial_wait_sec": 20.0,
-        "poll_interval_sec": 10.0,
-        "hint": (
-            "relocalize_active_map 为异步任务。提交后等待约 20 秒再 get_task_status，之后每 10 秒轮询一次。"
-            "勿连续高频轮询。"
-        ),
-    },
     "explore_area": {
         "initial_wait_sec": 30.0,
         "poll_interval_sec": 15.0,
@@ -322,7 +324,7 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
             "explore_area 提交后等待约 30 秒再 get_task_status，之后每 15 秒轮询直至 state=succeeded。"
             "进度看 frontier_count 与 message，不要查 TF 或触发 relocalize_active_map。"
             "探索进行中 localization_ready=false 属正常，勿误判卡住。"
-            "用户要求结束探索时请调用独立工具 stop_exploration（内部等同 stop_mapping，会停止 go2.sh）。"
+            "用户要求结束探索时请调用独立工具 stop_exploration；建图会话会继续运行。"
         ),
     },
 }
@@ -333,6 +335,7 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
         "navigate_to_named_location",
         "find_target",
         "explore_area",
+        "explore_area_v2",
         "explore_and_find_target",
         "relocalize_active_map",
         "load_map_version",
@@ -408,11 +411,11 @@ def _schema_object(
 def _exploration_stop_conditions_schema() -> Dict[str, object]:
     return _schema_object(
         {
-            "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
-            "max_completed_frontiers": {"type": "number", "exclusiveMinimum": 0.0},
-            "min_covered_ratio": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 1.0},
-            "max_no_gain_rounds": {"type": "number", "exclusiveMinimum": 0.0},
-            "min_known_cells": {"type": "number", "exclusiveMinimum": 0.0},
+            "max_coverage_pct": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 100.0},
+            "no_frontier_timeout_ms": {"type": "integer", "minimum": 1},
+            "max_duration_ms": {"type": "integer", "minimum": 1},
+            "max_goals": {"type": "integer", "minimum": 1},
+            "stop_on_map_revision_change": {"type": "boolean", "default": False},
         }
     )
 
@@ -684,6 +687,9 @@ class GatewayRuntime:
         self._event_log_subscription_id = self.event_bus.subscribe(self._log_runtime_event)
         self._geometry_runtime_lock = threading.RLock()
         self._geometry_runtime_start_event: Optional[threading.Event] = None
+        self._geometry_provider_identity_initialized = False
+        self._geometry_provider_identity: Any = None
+        self._geometry_provider_generation = 0
         self._safety_watchdog_stop = threading.Event()
         self._safety_watchdog_thread: Optional[threading.Thread] = None
         self._robot_state_stream_subscription_id: Optional[int] = None
@@ -785,15 +791,14 @@ class GatewayRuntime:
         """停止宿主机运行时。
 
         关闭顺序（关键约束，参见 grpc-unavailable-shutdown-rootcause-2026-06-28）：
-        1. geometry 子进程先停：杀 geometry_runtime 子进程 + 关 gRPC channel +
-           置 _stopping 标记，让 in-flight RPC 入口立即抛 shutting_down
-        2. task_manager 再 shutdown(wait=True)：先 cancel_all_active_tasks
-           让 runner 下次 ensure_active 抛 TaskCancelledError 优雅退出
+        1. task_manager 先 shutdown(wait=True)：deferred exploration runner 仍可通过
+           geometry gRPC 请求 correlated stop 并等待停车终态
+        2. runner 全部退出后再停止 input bridge、geometry 子进程与 gRPC channel
         3. perception / audio / robot 后续清理
-        顺序不可颠倒：颠倒会让 in-flight task 拿陈旧 stub 继续打 RPC 全 UNAVAILABLE。
+        顺序不可颠倒：先断 geometry 会使 exploration cancellation 无法证明停车。
         """
 
-        stop_error: Exception | None = None
+        stop_error: Optional[Exception] = None
         with self._lock:
             if not self._started:
                 RUNTIME_LOGGER.info("宿主机运行时未启动，忽略停止请求。")
@@ -807,11 +812,9 @@ class GatewayRuntime:
                 RUNTIME_LOGGER.exception(
                     "motion guard safety latch failed during gateway shutdown"
                 )
-            self._stop_runtime_input_bridge()
-            # 顺序：先关 geometry 子进程与 gRPC 通道，
-            # 再让 task_manager 失活并等待 task 退出。
-            self.platform_geometry_runtime.stop()
             self.task_manager.shutdown(wait=True)
+            self._stop_runtime_input_bridge()
+            self.platform_geometry_runtime.stop()
             self.audio_service.stop()
             self._stop_data_frame_stream_sources()
             self.perception_video_runtime.stop()
@@ -1688,7 +1691,7 @@ class GatewayRuntime:
             _descriptor(
                 "relocalize_active_map",
                 "重定位当前地图",
-                "仅在当前地图版本已经通过 load_map_version 加载且 active_workspace.map_loaded=true 后，执行一次平台重定位刷新。本能力为异步任务：立即返回 task_id；请等待约 20s 后再 get_task_status，之后每 10s 轮询，勿高频连刷。",
+                "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK；该能力保留为显式 unsupported。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -1847,7 +1850,8 @@ class GatewayRuntime:
             _descriptor(
                 "start_mapping",
                 "启动遥控建图",
-                "遥控/手动建图专用：启动 go2.sh --mapping（RTAB-Map+Nav2），不启动 frontier 探索、不下发探索点。"
+                "遥控/手动建图专用：启动 nuwax-geometry-runtime mapping 会话，"
+                "不启动 frontier 探索、不下发探索点。"
                 "典型流程：create_map → activate_map → start_mapping → 用户遥控移动 → save_active_map_version → stop_mapping。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.MEDIUM,
@@ -1869,13 +1873,14 @@ class GatewayRuntime:
             ),
             _descriptor(
                 "stop_mapping",
-                "停止几何建图栈",
-                "统一停止 go2.sh 托管的 RTAB-Map/Nav2 几何栈；自主探索结束不会自动调用，需显式 stop_mapping。",
+                "停止建图会话",
+                "停止 nuwax-geometry-runtime 建图会话；停止探索请使用 stop_exploration。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
                     {
                         "reason": {"type": "string"},
+                        "request_id": {"type": "string"},
                     },
                 ),
                 output_schema=_schema_object(
@@ -1891,25 +1896,31 @@ class GatewayRuntime:
             _descriptor(
                 "stop_exploration",
                 "停止自主探索",
-                "与 explore_area 配对：停止自主前沿探索并杀掉 go2.sh（RTAB-Map/Nav2）几何栈。"
-                "内部调用 stop_mapping；遥控建图结束仍用 stop_mapping。",
+                "与 explore_area/explore_area_v2 配对：停止探索 controller，取消在途 child navigation，"
+                "等待 guard ZEROED 终态并取消父任务；不会停止建图会话。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
                     {
                         "reason": {"type": "string"},
+                        "request_id": {"type": "string", "minLength": 1},
                     },
+                    required=("request_id",),
                 ),
                 output_schema=_schema_object(
                     {
                         "stopped": {"type": "boolean"},
-                        "geometry_stack_running": {"type": "boolean"},
-                        "mapping_database_path": {"type": "string"},
-                        "mapping_version_id": {"type": "string"},
-                        "alias_of": {"type": "string"},
+                        "exploration_context": {"type": "object"},
+                        "child_navigation_terminal": {"type": "string"},
+                        "child_navigation_zeroed": {"type": "boolean"},
+                        "cancelled_parent_task_ids": {"type": "array"},
+                        "mapping_stopped": {"type": "boolean"},
                     }
                 ),
-                required_resources=(RuntimeResource.NAVIGATION.value,),
+                required_resources=(
+                    RuntimeResource.BASE_MOTION.value,
+                    RuntimeResource.NAVIGATION.value,
+                ),
             ),
             _descriptor(
                 "load_map_version",
@@ -2293,9 +2304,9 @@ class GatewayRuntime:
             _descriptor(
                 "explore_area",
                 "探索区域",
-                "自主前沿探索：启动 GO2 几何栈 /go2.sh --explore，由 explore_lite 自动导航建图。"
-                "非遥控建图；用户手动遥控建图必须用 start_mapping，不要用 explore_area。"
-                "用户要求结束探索时请调用 stop_exploration。",
+                "通过 nuwax-geometry-runtime 启动 wavefront 前沿探索，持续使用最新地图 revision "
+                "并把 frontier 子目标交给 guard-backed 导航链。停止时调用 stop_exploration；"
+                "遥控建图仍使用 start_mapping。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -2307,9 +2318,61 @@ class GatewayRuntime:
                         "y": {"type": "number"},
                         "z": {"type": "number", "default": 0.0},
                         "radius_m": {"type": "number", "exclusiveMinimum": 0.0},
-                        "strategy": {"type": "string", "default": "frontier"},
+                        "strategy": {"type": "string", "default": "wavefront"},
                         "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
                         "stop_conditions": _exploration_stop_conditions_schema(),
+                        "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.2},
+                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
+                    }
+                ),
+                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
+                required_resources=(
+                    RuntimeResource.BASE_MOTION.value,
+                    RuntimeResource.NAVIGATION.value,
+                    RuntimeResource.CAMERA_OBSERVATION.value,
+                ),
+                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
+                cancel_supported=True,
+            ),
+            _descriptor(
+                "explore_area_v2",
+                "探索区域（边界约束）",
+                "通过 nuwax-geometry-runtime 启动带有手划边界、停止条件、子导航重试/黑名单"
+                "和地图 revision 约束的 wavefront 探索。",
+                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                        "frame_id": {"type": "string", "default": "map"},
+                        "strategy": {"type": "string", "default": "wavefront"},
+                        "arbitration": {"type": "string", "default": "prefer_wavefront"},
+                        "map_version_id": {"type": "string"},
+                        "map_revision": {"type": "integer", "minimum": 0},
+                        "boundary_line_segments": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "x": {"type": "number"},
+                                        "y": {"type": "number"},
+                                        "z": {"type": "number", "default": 0.0},
+                                        "yaw": {"type": "number", "default": 0.0},
+                                        "frame_id": {"type": "string"},
+                                    },
+                                    "required": ["x", "y"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "stop_conditions": _exploration_stop_conditions_schema(),
+                        "max_navigation_retries": {"type": "integer", "minimum": 0, "default": 1},
+                        "blacklist_radius_m": {"type": "number", "minimum": 0.0, "default": 0.75},
+                        "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
                         "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.2},
                         "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     }
@@ -2739,7 +2802,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="activate_map",
                 display_name="启用地图",
-                description="仅启用地图工作区，不启动 go2.sh。遥控建图后接 start_mapping；自主探索用 explore_area。",
+                description="仅启用地图工作区，不启动建图或探索会话。遥控建图后接 start_mapping；自主探索用 explore_area。",
                 category=SkillCategory.MEMORY,
                 capability_name="activate_map",
             ),
@@ -2777,14 +2840,14 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="start_mapping",
                 display_name="启动遥控建图",
-                description="遥控建图专用：go2.sh --mapping，无自主探索点。不要用 explore_area 代替遥控建图。",
+                description="遥控建图专用：启动 nuwax-geometry-runtime mapping 会话，不生成自主探索点。",
                 category=SkillCategory.TASK,
                 capability_name="start_mapping",
             ),
             SkillDescriptor(
                 name="stop_mapping",
-                display_name="停止几何建图栈",
-                description="停止 go2.sh（RTAB-Map/Nav2）；遥控建图结束用此工具。自主探索结束优先 stop_exploration。",
+                display_name="停止建图会话",
+                description="停止 nuwax-geometry-runtime 建图会话；自主探索结束使用 stop_exploration。",
                 category=SkillCategory.TASK,
                 capability_name="stop_mapping",
             ),
@@ -2792,8 +2855,8 @@ class GatewayRuntime:
                 name="stop_exploration",
                 display_name="停止自主探索",
                 description=(
-                    "与 explore_area 配对：用户说结束/停止探索时调用，会杀掉 go2.sh 几何栈。"
-                    "内部等同 stop_mapping，不要误用 stop_all_motion。"
+                    "与 explore_area/explore_area_v2 配对：停止探索、取消 child navigation 并等待零速终态；"
+                    "建图会话保持运行。"
                 ),
                 category=SkillCategory.TASK,
                 capability_name="stop_exploration",
@@ -2914,9 +2977,8 @@ class GatewayRuntime:
                 name="explore_area",
                 display_name="探索区域",
                 description=(
-                    "自主前沿探索（go2.sh --explore）。遥控建图请用 start_mapping，不要用 explore_area。"
-                    "运行中用 get_task_status 看 frontier_count，勿 relocalize_active_map 或查 TF。"
-                    "用户要求结束探索时调用 stop_exploration。"
+                    "通过 nuwax-geometry-runtime 执行 wavefront 前沿探索。"
+                    "运行中用 get_task_status 查看 frontier_count/revision；结束时调用 stop_exploration。"
                 ),
                 category=SkillCategory.TASK,
                 capability_name="explore_area",
@@ -2925,9 +2987,8 @@ class GatewayRuntime:
                 name="explore_area_v2",
                 display_name="探索区域（手划范围）",
                 description=(
-                    "V2 探索：支持手划多段线段范围（boundary_line_segments）+ 闭环判据（auto_loop_close）。"
-                    "范围通过 /tmp/go2_boundary.json 传给 go2.sh --boundary，"
-                    "闭环判据作为第 8 条完成路径（rtabmap:loop_closed 命名空间）。"
+                    "通过 geometry-runtime gRPC 下传 boundary_line_segments、停止条件、"
+                    "子导航重试/黑名单和 map revision 的 wavefront 探索。"
                 ),
                 category=SkillCategory.TASK,
                 capability_name="explore_area_v2",
@@ -3775,6 +3836,47 @@ class GatewayRuntime:
             metadata=dict(metadata or {}),
         )
 
+    def _build_person_follow_service_health_entry(self) -> ServiceHealthEntry:
+        person_follow = self._person_follow_readiness()
+        status = (
+            ServiceHealthStatus.AVAILABLE
+            if person_follow.ready
+            else ServiceHealthStatus.IDLE
+        )
+        return self._make_service_health_entry(
+            service_id="person_follow",
+            display_name="Person-follow 可选服务",
+            group="系统服务",
+            status=status,
+            summary=(
+                "Person-follow typed subscriptions 已就绪"
+                if person_follow.ready
+                else "Person-follow 可选服务未启用或未就绪"
+            ),
+            evidence=(
+                "ready marker 已通过 pid/boot_id/starttime/subscriptions_ready 校验"
+                if person_follow.ready
+                else "可选服务状态：%s" % person_follow.reason
+            ),
+            source="person_follow_ready_marker",
+            advice="需要跟随能力时检查 person-follow ready marker 与服务日志",
+            order=105,
+            updated_at=utc_now(),
+            reason=None if person_follow.ready else person_follow.reason,
+            expected_process_roles=("person_follow",)
+            if person_follow.enabled
+            else (),
+            metadata={
+                "enabled": person_follow.enabled,
+                "ready": person_follow.ready,
+                "ready_file": person_follow.ready_file,
+                "pid": person_follow.pid,
+                "boot_id": person_follow.boot_id,
+                "starttime": person_follow.starttime,
+                "subscriptions_ready": person_follow.subscriptions_ready,
+            },
+        )
+
     def _build_service_health_summary(
         self,
         *,
@@ -4056,6 +4158,8 @@ class GatewayRuntime:
                 metadata={"assembly_status": robot_status},
             )
         )
+
+        entries.append(self._build_person_follow_service_health_entry())
 
         geometry_runtime_roles = ("geometry_runtime",)
         geometry_runtime_processes = self._service_process_evidence(geometry_runtime_roles)
@@ -4869,14 +4973,19 @@ class GatewayRuntime:
         )
         self._ensure_geometry_runtime_for_capability("start_mapping")
         try:
-            launch_plan = self.platform_geometry_runtime.start_external_mapping(map_name=map_name)
+            launch_plan = self.platform_geometry_runtime.start_mapping(map_name=map_name)
         except RuntimeError as exc:
             raise GatewayError(str(exc), error_code="start_mapping_failed", http_status=503) from exc
+        launch_plan = dict(launch_plan or {})
+        launch_plan.setdefault("mapping_launch_mode", "nuwax_geometry_runtime")
+        launch_plan.setdefault("mapping_transport", "grpc_lcm")
+        launch_plan.setdefault("mapping_script", None)
+        launch_plan.setdefault("mapping_command", None)
         launch_plan["map_name"] = map_name
         launch_plan["requested_by"] = requested_by or "unknown"
         launch_plan["geometry_stack"] = self._geometry_stack_summary()
         launch_plan["next_step_hint"] = (
-            "go2.sh --mapping 已启动。请遥控机器狗移动建图；"
+            "nuwax-geometry-runtime 建图会话已启动。请遥控机器狗移动建图；"
             "完成后调用 save_active_map_version，再 stop_mapping。"
         )
         return launch_plan
@@ -4903,22 +5012,89 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        merged = dict(arguments or {})
-        if not str(merged.get("reason", "")).strip():
-            merged["reason"] = "stop_exploration"
-        result = self._handle_stop_mapping(merged, requested_by=requested_by)
-        if isinstance(result, dict):
-            enriched = dict(result)
-            enriched["alias_of"] = "stop_mapping"
-            enriched.setdefault(
-                "next_step_hint",
-                "自主探索与 go2.sh 几何栈已停止。如需保留地图可调用 save_active_map_version。",
+        reason = str((arguments or {}).get("reason") or "stop_exploration").strip()
+        request_id = str((arguments or {}).get("request_id") or "").strip()
+        if not request_id:
+            raise GatewayError(
+                "停止探索必须提供当前 exploration request_id。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+                details={"required_parameter": "request_id"},
             )
-            return enriched
+        self._ensure_geometry_runtime_for_capability("stop_exploration")
+        try:
+            context = self._stop_exploration_with_safety_barrier(
+                None,
+                request_id=request_id,
+                poll_interval_sec=0.05,
+                acknowledge_interrupt=False,
+            )
+        except Exception as exc:
+            if isinstance(exc, GatewayError):
+                raise
+            if isinstance(exc, TaskSafetyBarrierError):
+                raise GatewayError(
+                    str(exc),
+                    error_code="exploration_stop_not_zeroed",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                    details=dict(exc.details),
+                ) from exc
+            raise GatewayError(
+                str(exc) or "停止探索失败。",
+                error_code="stop_exploration_failed",
+                http_status=503,
+                jsonrpc_code=-32010,
+            ) from exc
+
+        exploration_state = getattr(context, "exploration_state", None)
+        raw_status = getattr(exploration_state, "status", "")
+        terminal_status = str(getattr(raw_status, "value", raw_status) or "").lower()
+
+        cancelled_parent_task_ids: List[str] = []
+        parent_capabilities = {
+            "explore_area",
+            "explore_area_v2",
+            "explore_and_find_target",
+        }
+        for task_status in self.task_manager.list_active_tasks():
+            task_id = str(getattr(task_status, "task_id", "") or "")
+            if not task_id:
+                continue
+            try:
+                task_spec = self.task_manager.get_task_spec(task_id)
+            except Exception:
+                continue
+            if str(getattr(task_spec, "capability_name", "")) not in parent_capabilities:
+                continue
+            input_payload = dict(
+                getattr(task_spec, "input_payload", {}) or {}
+            )
+            metadata = dict(getattr(task_spec, "metadata", {}) or {})
+            parent_request_id = str(
+                input_payload.get("request_id")
+                or metadata.get("request_id")
+                or ""
+            ).strip()
+            if parent_request_id != request_id:
+                continue
+            if self.task_manager.cancel_task(
+                task_id,
+                "%s 请求停止探索：%s"
+                % (requested_by or "unknown", reason),
+            ):
+                cancelled_parent_task_ids.append(task_id)
+
         return {
-            "result": result,
-            "alias_of": "stop_mapping",
-            "next_step_hint": "自主探索与 go2.sh 几何栈已停止。如需保留地图可调用 save_active_map_version。",
+            "stopped": True,
+            "reason": reason,
+            "exploration_context": context,
+            "child_navigation_terminal": terminal_status,
+            "child_navigation_zeroed": True,
+            "cancelled_parent_task_ids": cancelled_parent_task_ids,
+            "mapping_stopped": False,
+            "next_step_hint": "探索与其子导航已停止；建图会话保持运行。",
         }
 
     def dispatch_debug_navigation_goal(
@@ -5342,6 +5518,98 @@ class GatewayRuntime:
             },
         }
 
+    def _exploration_boundary_pose(
+        self,
+        value: Any,
+        *,
+        default_frame_id: str,
+    ) -> Pose:
+        if isinstance(value, Pose):
+            return value
+        if not isinstance(value, dict):
+            raise GatewayError(
+                "boundary_line_segments 的端点必须为位姿对象。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        frame_id = str(value.get("frame_id") or default_frame_id).strip().lstrip("/")
+        if not frame_id:
+            frame_id = DEFAULT_MAP_FRAME
+        if "position" in value or "orientation" in value:
+            payload = dict(value)
+            payload["frame_id"] = frame_id
+            try:
+                return Pose.model_validate(payload)
+            except Exception as exc:
+                raise GatewayError(
+                    "boundary_line_segments 包含无效位姿。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                ) from exc
+        try:
+            x = float(value["x"])
+            y = float(value["y"])
+            z = float(value.get("z", 0.0))
+            yaw = float(value.get("yaw_rad", value.get("yaw", 0.0)))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GatewayError(
+                "boundary_line_segments 的每个端点必须提供有限数值 x/y。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            ) from exc
+        if not all(math.isfinite(number) for number in (x, y, z, yaw)):
+            raise GatewayError(
+                "boundary_line_segments 的端点坐标必须为有限数值。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        half_yaw = yaw / 2.0
+        return Pose(
+            frame_id=frame_id,
+            position=Vector3(x=x, y=y, z=z),
+            orientation=Quaternion(z=math.sin(half_yaw), w=math.cos(half_yaw)),
+        )
+
+    def _exploration_boundary_segments(
+        self,
+        arguments: Dict[str, Any],
+    ) -> List[Tuple[Pose, Pose]]:
+        raw_segments = arguments.get("boundary_line_segments")
+        if raw_segments in (None, []):
+            return []
+        if not isinstance(raw_segments, (list, tuple)):
+            raise GatewayError(
+                "参数 boundary_line_segments 必须为线段数组。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        default_frame_id = str(arguments.get("frame_id") or DEFAULT_MAP_FRAME)
+        segments: List[Tuple[Pose, Pose]] = []
+        for segment in raw_segments:
+            if not isinstance(segment, (list, tuple)) or len(segment) != 2:
+                raise GatewayError(
+                    "boundary_line_segments 的每项必须恰好包含两个端点。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                )
+            segments.append(
+                (
+                    self._exploration_boundary_pose(
+                        segment[0], default_frame_id=default_frame_id
+                    ),
+                    self._exploration_boundary_pose(
+                        segment[1], default_frame_id=default_frame_id
+                    ),
+                )
+            )
+        return segments
+
     def _handle_explore_area_v2(
         self,
         arguments: Dict[str, Any],
@@ -5349,40 +5617,14 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        """V2 探索：手划多段线段 + 闭环判据。
+        """启动带边界与完整停止/重试约束的 geometry-runtime 探索。"""
 
-        数据流：boundary_line_segments → 后端几何外扩 → /tmp/go2_boundary.json →
-        go2.sh --explore --boundary /tmp/go2_boundary.json → frontier_explorer costmap keepout mask。
-        """
-        # 委托给 explore_area handler 主体，再附加 boundary_line_segments 透传。
-        # V1 _handle_explore_area 收 x/y/frame_id/radius_m；V2 额外收 boundary_line_segments
-        # 与 auto_loop_close，platform_geometry_runtime 在 worker-C 5.3 接入 _compute_boundary_polygon 后消费。
-        try:
-            primary = self._handle_explore_area(
-                arguments, requested_by=requested_by, request_context=request_context,
-            )
-        except Exception as exc:  # noqa: BLE001 — 透传 explore_area 的全部错误码
-            primary = {"ok": False, "error": str(exc)}
-        # 透传 V2 元数据（worker-C 5.3 / 5.4 尚未接入时仅记录 metadata，不阻断主流程）
-        v2_metadata = {
-            "v2_capability": "explore_area_v2",
-            "boundary_line_segments_provided": bool(arguments.get("boundary_line_segments")),
-            "auto_loop_close": bool(arguments.get("auto_loop_close", True)),
-            "extend_radius_m": float(arguments.get("extend_radius_m", 3.0) or 3.0),
-            "boundary_polygon_file": "/tmp/go2_boundary.json",
-            "boundary_dispatch_ready": False,
-        }
-        if isinstance(primary, dict):
-            enriched = dict(primary)
-            existing = enriched.get("metadata") or {}
-            if isinstance(existing, dict):
-                existing.update(v2_metadata)
-            else:
-                existing = v2_metadata
-            enriched["metadata"] = existing
-            enriched.setdefault("v2_capability", "explore_area_v2")
-            return enriched
-        return {"result": primary, "metadata": v2_metadata, "v2_capability": "explore_area_v2"}
+        return self._handle_explore_area(
+            arguments,
+            requested_by=requested_by,
+            request_context=request_context,
+            capability_name="explore_area_v2",
+        )
 
     def _handle_navigate_to_named_location(
         self,
@@ -5564,6 +5806,27 @@ class GatewayRuntime:
             context.update(progress=0.05, stage="search_prepare", message="准备查找目标。")
             finalized = False
             rejected_record_ids: Set[str] = set()
+            active_navigation_goal_id: Optional[str] = None
+
+            def track_navigation(goal_id: Optional[str]) -> None:
+                nonlocal active_navigation_goal_id
+                active_navigation_goal_id = (
+                    str(goal_id or "").strip() or None
+                )
+
+            def park_active_navigation(*, acknowledge_interrupt: bool) -> None:
+                nonlocal active_navigation_goal_id
+                goal_id = active_navigation_goal_id
+                if not goal_id:
+                    return
+                self._cancel_navigation_with_safety_barrier(
+                    context,
+                    goal_id=goal_id,
+                    poll_interval_sec=poll_interval_sec,
+                    acknowledge_interrupt=acknowledge_interrupt,
+                )
+                active_navigation_goal_id = None
+
             try:
                 perception_refresh = self._refresh_target_search_observation(
                     query=query,
@@ -5615,6 +5878,7 @@ class GatewayRuntime:
                     rejected_record_ids=rejected_record_ids,
                     allow_not_found=False,
                     timeout_sec=timeout_sec,
+                    navigation_state_callback=track_navigation,
                 )
                 result = {
                     "query": query,
@@ -5639,11 +5903,20 @@ class GatewayRuntime:
                         )
                     except Exception:
                         RUNTIME_LOGGER.exception("查找目标任务结束后刷新地图工作区失败 map_name=%s", map_name)
-                if context.is_cancel_requested() or context.is_timed_out():
-                    try:
-                        self.navigation_service.cancel_goal()
-                    except Exception:
-                        pass
+                interrupted = (
+                    context.is_cancel_requested() or context.is_timed_out()
+                )
+                if active_navigation_goal_id:
+                    park_active_navigation(
+                        acknowledge_interrupt=interrupted,
+                    )
+                elif interrupted:
+                    context.acknowledge_interrupt_barrier(
+                        {
+                            "backend_not_active": True,
+                            "parking_confirmed": True,
+                        }
+                    )
 
         return self.task_manager.submit(
             "find_target",
@@ -5662,6 +5935,7 @@ class GatewayRuntime:
                 requested_by=requested_by,
                 request_context=request_context,
             ),
+            deferred_interrupt=True,
         )
 
     def _handle_explore_area(
@@ -5670,10 +5944,22 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
+        capability_name: str = "explore_area",
     ):
+        removed_fields = sorted(
+            {"auto_loop_close", "extend_radius_m"}.intersection(arguments)
+        )
+        if removed_fields:
+            raise GatewayError(
+                "探索后端不支持参数：%s。" % ", ".join(removed_fields),
+                error_code="unsupported",
+                http_status=422,
+                jsonrpc_code=-32602,
+                details={"unsupported_parameters": removed_fields},
+            )
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
-            capability_name="explore_area",
+            capability_name=capability_name,
             requested_by=requested_by,
             create_if_missing=True,
         )
@@ -5682,8 +5968,11 @@ class GatewayRuntime:
         if "frame_id" in arguments or "x" in arguments or "y" in arguments:
             center_pose = self._build_pose_from_arguments(arguments)
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.2)
-        timeout_sec = self._resolve_async_timeout("explore_area", arguments, minimum_sec=0.1)
+        timeout_sec = self._resolve_async_timeout(
+            capability_name, arguments, minimum_sec=0.1
+        )
         stop_conditions = self._exploration_stop_conditions(arguments)
+        boundary_segments = self._exploration_boundary_segments(arguments)
         max_duration_sec = self._resolve_exploration_max_duration_sec(
             max_duration_sec=self._float(arguments, "max_duration_sec", 0.0) or None,
             stop_conditions=stop_conditions,
@@ -5696,25 +5985,119 @@ class GatewayRuntime:
             stop_conditions=stop_conditions,
             poll_interval_sec=poll_interval_sec,
         )
+        raw_map_revision = arguments.get("map_revision")
+        if raw_map_revision is None:
+            raw_map_revision = getattr(
+                getattr(workspace, "latest_map_snapshot", None), "revision", 0
+            )
+        try:
+            if isinstance(raw_map_revision, bool):
+                raise ValueError
+            map_revision = int(raw_map_revision or 0)
+        except (TypeError, ValueError) as exc:
+            raise GatewayError(
+                "参数 map_revision 必须为非负整数。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            ) from exc
+        if map_revision < 0:
+            raise GatewayError(
+                "参数 map_revision 必须为非负整数。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+
+        raw_retries = arguments.get("max_navigation_retries", 1)
+        try:
+            if isinstance(raw_retries, bool):
+                raise ValueError
+            max_navigation_retries = int(raw_retries)
+        except (TypeError, ValueError) as exc:
+            raise GatewayError(
+                "参数 max_navigation_retries 必须为非负整数。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            ) from exc
+        if max_navigation_retries < 0:
+            raise GatewayError(
+                "参数 max_navigation_retries 必须为非负整数。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+
+        try:
+            blacklist_radius_m = float(arguments.get("blacklist_radius_m", 0.75))
+        except (TypeError, ValueError) as exc:
+            raise GatewayError(
+                "blacklist_radius_m 必须为数值。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            ) from exc
+        if not math.isfinite(blacklist_radius_m) or blacklist_radius_m < 0.0:
+            raise GatewayError(
+                "参数 blacklist_radius_m 必须为非负有限数值。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        map_version_id = str(
+            arguments.get("map_version_id")
+            or getattr(getattr(workspace, "map_asset", None), "latest_version_id", "")
+            or ""
+        ).strip()
+        strategy = str(arguments.get("strategy") or "wavefront").strip()
+        request_metadata: MetadataDict = {
+            "requested_by": requested_by or "unknown",
+            "arbitration": str(
+                arguments.get("arbitration")
+                or stop_conditions.get("arbitration")
+                or "prefer_wavefront"
+            ).strip(),
+            "map_version_id": map_version_id,
+            "map_revision": map_revision,
+            "max_navigation_retries": max_navigation_retries,
+            "blacklist_radius_m": blacklist_radius_m,
+        }
         request = ExploreAreaRequest(
             request_id=self._build_runtime_request_id("explore"),
             map_name=map_name,
             center_pose=center_pose,
             target_name=target_name,
             radius_m=self._float(arguments, "radius_m", 0.0) or None,
-            strategy=str(arguments.get("strategy") or "frontier"),
+            strategy=strategy,
             max_duration_sec=max_duration_sec,
             stop_conditions=stop_conditions,
-            metadata={"requested_by": requested_by or "unknown"},
+            boundary_line_segments=boundary_segments,
+            metadata=request_metadata,
         )
-        self._ensure_geometry_runtime_for_capability("explore_area")
-        launch_plan = self.platform_geometry_runtime.plan_external_exploration(request)
+        self._ensure_geometry_runtime_for_capability(capability_name)
         task_metadata = self._build_task_request_metadata(
-            capability_name="explore_area",
+            capability_name=capability_name,
             requested_by=requested_by,
             request_context=request_context,
         )
-        task_metadata.update(launch_plan)
+        task_metadata.update(
+            {
+                "exploration_launch_mode": "nuwax_geometry_runtime",
+                "exploration_transport": "grpc",
+                "exploration_script": None,
+                "exploration_command": None,
+                "exploration_database_path": None,
+                "exploration_version_id": map_version_id or None,
+                "request_id": request.request_id,
+                "strategy": strategy,
+                "map_revision": map_revision,
+                "boundary_segment_count": len(boundary_segments),
+                "boundary_dispatch_ready": True,
+                "max_navigation_retries": max_navigation_retries,
+                "blacklist_radius_m": blacklist_radius_m,
+            }
+        )
         return self._submit_exploration_task(
             request=request,
             poll_interval_sec=poll_interval_sec,
@@ -5722,6 +6105,7 @@ class GatewayRuntime:
             requested_by=requested_by,
             request_context=request_context,
             task_metadata=task_metadata,
+            capability_name=capability_name,
         )
 
     def _handle_explore_and_find_target(
@@ -5783,7 +6167,98 @@ class GatewayRuntime:
             exploration_stop_context = None
             resume_round = 0
             last_search_refresh_at = 0.0
+            active_exploration_request_id: Optional[str] = None
+            active_navigation_goal_id: Optional[str] = None
+            interrupt_acknowledged = False
+            perception_attached = False
+
+            def track_navigation(goal_id: Optional[str]) -> None:
+                nonlocal active_navigation_goal_id
+                active_navigation_goal_id = str(goal_id or "").strip() or None
+
+            def park_exploration() -> Any:
+                nonlocal active_exploration_request_id
+                request_id = active_exploration_request_id
+                if not request_id:
+                    return None
+                try:
+                    terminal_context = self._stop_exploration_with_safety_barrier(
+                        context,
+                        request_id=request_id,
+                        poll_interval_sec=poll_interval_sec,
+                        acknowledge_interrupt=False,
+                    )
+                except Exception:
+                    active_exploration_request_id = None
+                    raise
+                active_exploration_request_id = None
+                return terminal_context
+
+            def park_navigation() -> Any:
+                nonlocal active_navigation_goal_id
+                goal_id = active_navigation_goal_id
+                if not goal_id:
+                    return None
+                try:
+                    terminal_context = self._cancel_navigation_with_safety_barrier(
+                        context,
+                        goal_id=goal_id,
+                        poll_interval_sec=poll_interval_sec,
+                        acknowledge_interrupt=False,
+                    )
+                except Exception:
+                    active_navigation_goal_id = None
+                    raise
+                active_navigation_goal_id = None
+                return terminal_context
+
+            def acknowledge_interrupted_parking() -> None:
+                nonlocal interrupt_acknowledged
+                if interrupt_acknowledged:
+                    return
+                proof: MetadataDict = {
+                    "request_id": request.request_id,
+                    "parking_confirmed": True,
+                }
+                if active_exploration_request_id:
+                    terminal_context = park_exploration()
+                    state = getattr(terminal_context, "exploration_state", None)
+                    proof["exploration"] = {
+                        "request_id": self._exploration_state_request_id(
+                            terminal_context
+                        ),
+                        "terminal_status": str(
+                            getattr(
+                                getattr(state, "status", None),
+                                "value",
+                                getattr(state, "status", None),
+                            )
+                            or ""
+                        ).lower(),
+                    }
+                if active_navigation_goal_id:
+                    goal_id = active_navigation_goal_id
+                    terminal_context = park_navigation()
+                    state = getattr(terminal_context, "navigation_state", None)
+                    proof["navigation"] = {
+                        "goal_id": goal_id,
+                        "terminal_status": str(
+                            getattr(
+                                getattr(state, "status", None),
+                                "value",
+                                getattr(state, "status", None),
+                            )
+                            or ""
+                        ).lower(),
+                        **self._navigation_zero_proof(terminal_context),
+                    }
+                if "exploration" not in proof and "navigation" not in proof:
+                    proof["backend_not_active"] = True
+                context.acknowledge_interrupt_barrier(proof)
+                interrupt_acknowledged = True
+
             try:
+                context.ensure_active()
                 precheck_refresh = self._refresh_target_search_observation(
                     query=query,
                     camera_id=camera_id,
@@ -5836,6 +6311,7 @@ class GatewayRuntime:
                     rejected_record_ids=rejected_record_ids,
                     allow_not_found=True,
                     timeout_sec=timeout_sec,
+                    navigation_state_callback=track_navigation,
                 )
                 if precheck_navigation is not None:
                     context.update(progress=1.0, stage="completed", message="已根据记忆候选找到目标。")
@@ -5859,7 +6335,9 @@ class GatewayRuntime:
                 active_request = request
                 context.update(progress=0.08, stage="exploration_accepted", message="开始探索并持续查找目标。")
                 exploration_context = self.navigation_service.start_exploration(active_request)
+                active_exploration_request_id = active_request.request_id
                 self._attach_perception_to_exploration()
+                perception_attached = True
                 while True:
                     context.ensure_active()
                     exploration_context = self.navigation_service.refresh_exploration()
@@ -5897,8 +6375,7 @@ class GatewayRuntime:
                         rejected_record_ids=rejected_record_ids,
                     )
                     if search_state["current_scene_verification"].verified:
-                        self._report_platform_exploration_hit_stop("current_scene_target_found")
-                        exploration_stop_context = self.navigation_service.stop_exploration()
+                        exploration_stop_context = park_exploration()
                         context.update(progress=1.0, stage="completed", message="探索中已找到目标。")
                         result = {
                             "query": query,
@@ -5922,7 +6399,7 @@ class GatewayRuntime:
                         return result
 
                     if search_state["memory_candidates"] or search_state["semantic_goal"] is not None:
-                        exploration_stop_context = self.navigation_service.stop_exploration()
+                        exploration_stop_context = park_exploration()
                         navigation_result = self._run_target_navigation_candidates(
                             task_context=context,
                             capability_name="explore_and_find_target",
@@ -5936,6 +6413,7 @@ class GatewayRuntime:
                             rejected_record_ids=rejected_record_ids,
                             allow_not_found=True,
                             timeout_sec=timeout_sec,
+                            navigation_state_callback=track_navigation,
                         )
                         if navigation_result is not None:
                             context.update(progress=1.0, stage="completed", message="探索中已找到目标。")
@@ -5960,9 +6438,11 @@ class GatewayRuntime:
                             deep=True,
                         )
                         exploration_context = self.navigation_service.start_exploration(active_request)
+                        active_exploration_request_id = active_request.request_id
                         continue
 
                     if status.value == "succeeded":
+                        exploration_stop_context = park_exploration()
                         self._refresh_target_search_observation(
                             query=query,
                             camera_id=camera_id,
@@ -5979,7 +6459,6 @@ class GatewayRuntime:
                             rejected_record_ids=rejected_record_ids,
                         )
                         if final_search_state["current_scene_verification"].verified:
-                            self._report_platform_exploration_hit_stop("current_scene_target_found")
                             context.update(progress=1.0, stage="completed", message="探索结束时已找到目标。")
                             result = {
                                 "query": query,
@@ -6014,6 +6493,7 @@ class GatewayRuntime:
                             rejected_record_ids=rejected_record_ids,
                             allow_not_found=True,
                             timeout_sec=timeout_sec,
+                            navigation_state_callback=track_navigation,
                         )
                         if final_navigation_result is not None:
                             context.update(progress=1.0, stage="completed", message="探索结束后已找到目标。")
@@ -6046,11 +6526,25 @@ class GatewayRuntime:
                         )
 
                     if status.value == "failed":
+                        park_exploration()
                         raise GatewayError(exploration_context.exploration_state.message or "探索执行失败。")
                     if status.value == "cancelled":
+                        park_exploration()
                         raise GatewayError(exploration_context.exploration_state.message or "探索已取消。")
                     time.sleep(max(0.05, poll_interval_sec))
+            except (TaskCancelledError, TaskTimeoutError):
+                acknowledge_interrupted_parking()
+                raise
             finally:
+                if (
+                    (context.is_cancel_requested() or context.is_timed_out())
+                    and not interrupt_acknowledged
+                ):
+                    acknowledge_interrupted_parking()
+                elif active_exploration_request_id:
+                    park_exploration()
+                elif active_navigation_goal_id:
+                    park_navigation()
                 if not finalized:
                     try:
                         self._finalize_workspace_assets_after_task(
@@ -6059,21 +6553,19 @@ class GatewayRuntime:
                         )
                     except Exception:
                         RUNTIME_LOGGER.exception("探索并查找目标任务结束后刷新地图工作区失败 map_name=%s", map_name)
-                if context.is_cancel_requested() or context.is_timed_out():
-                    try:
-                        self.navigation_service.stop_exploration()
-                    except Exception:
-                        pass
-                    try:
-                        self.navigation_service.cancel_goal()
-                    except Exception:
-                        pass
-                self._detach_perception_from_exploration()
+                if perception_attached:
+                    self._detach_perception_from_exploration()
+                if (
+                    (context.is_cancel_requested() or context.is_timed_out())
+                    and not interrupt_acknowledged
+                ):
+                    acknowledge_interrupted_parking()
 
         return self.task_manager.submit(
             "explore_and_find_target",
             runner,
             input_payload={
+                "request_id": request.request_id,
                 "map_name": map_name,
                 "query": query,
                 "camera_id": camera_id,
@@ -6087,11 +6579,15 @@ class GatewayRuntime:
             requested_by=requested_by,
             required_resources=list(descriptor.required_resources),
             timeout_sec=timeout_sec,
-            metadata=self._build_task_request_metadata(
-                capability_name="explore_and_find_target",
-                requested_by=requested_by,
-                request_context=request_context,
-            ),
+            metadata={
+                **self._build_task_request_metadata(
+                    capability_name="explore_and_find_target",
+                    requested_by=requested_by,
+                    request_context=request_context,
+                ),
+                "request_id": request.request_id,
+            },
+            deferred_interrupt=True,
         )
 
     def _handle_inspect_target(
@@ -6201,6 +6697,26 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
+        person_follow = self._person_follow_readiness()
+        guard_ready = self.motion_guard.is_ready(
+            motion_guard_pb.GUARD_SOURCE_GATEWAY_FOLLOW
+        )
+        image_ready = self._has_provider(ImageProvider)
+        if not (person_follow.ready and guard_ready and image_ready):
+            raise GatewayError(
+                "Person-follow 可选服务、图像提供器或 motion guard 未就绪。",
+                error_code="person_follow_unavailable",
+                http_status=503,
+                jsonrpc_code=-32010,
+                details={
+                    "person_follow_enabled": person_follow.enabled,
+                    "person_follow_ready": person_follow.ready,
+                    "person_follow_reason": person_follow.reason,
+                    "person_follow_ready_file": person_follow.ready_file,
+                    "image_provider_ready": image_ready,
+                    "motion_guard_ready": guard_ready,
+                },
+            )
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         detector_backend = str(arguments.get("detector_backend", "")).strip() or None
@@ -6653,37 +7169,20 @@ class GatewayRuntime:
         except GatewayError as exc:
             if exc.error_code != "localization_unavailable":
                 raise
-        self._ensure_geometry_runtime_for_capability("relocalize_active_map")
-        try:
-            session, workspace = self.map_workspace_service.relocalize_active_map(
-                map_name=map_name,
-                metadata={"requested_by": requested_by or "unknown", "source": capability_name},
-            )
-        except GatewayError:
-            raise
-        workspace = self.map_workspace_service.get_active_workspace() or workspace
-        try:
-            return self._ensure_localization_ready(
-                capability_name=capability_name,
-                map_name=map_name,
-                workspace=workspace,
-            )
-        except GatewayError as exc:
-            details = {
-                **dict(exc.details),
-                "auto_relocalize_attempted": True,
-                "relocalization_session_status": session.status.value,
-                "relocalization_session_id": session.session_id,
-                "relocalization_last_error": session.last_error,
-                "relocalization_map_version_id": session.map_version_id,
-            }
-            raise GatewayError(
-                "地图 %s 自动重定位后仍未完成定位，无法执行 %s。" % (map_name, capability_name),
-                error_code=exc.error_code,
-                http_status=exc.http_status,
-                jsonrpc_code=exc.jsonrpc_code,
-                details=details,
-            ) from exc
+        del workspace, requested_by
+        raise GatewayError(
+            "地图 %s 尚未完成定位，且 geometry-runtime proto 未提供 typed "
+            "Relocalize RPC/ACK，无法为 %s 自动重定位。"
+            % (map_name, capability_name),
+            error_code="unsupported",
+            http_status=501,
+            jsonrpc_code=-32601,
+            details={
+                "map_name": map_name,
+                "capability_name": capability_name,
+                "missing_contract": "typed Relocalize RPC/ACK",
+            },
+        )
 
     def _build_navigation_arrival_result(
         self,
@@ -7096,11 +7595,18 @@ class GatewayRuntime:
         )
         return evidence
 
-    def _report_platform_exploration_hit_stop(self, reason: str) -> None:
+    def _report_platform_exploration_hit_stop(self, reason: str):
         geometry_runtime = getattr(self, "platform_geometry_runtime", None)
         reporter = getattr(geometry_runtime, "report_platform_exploration_hit_stop", None)
         if callable(reporter):
             reporter(reason)
+            return self.navigation_service.refresh_exploration()
+        raise GatewayError(
+            "native geometry hit-stop reporter 不可用，拒绝非关联停止。",
+            error_code="exploration_stop_unavailable",
+            http_status=503,
+            jsonrpc_code=-32010,
+        )
 
     def _build_target_search_state(
         self,
@@ -7221,13 +7727,7 @@ class GatewayRuntime:
                 jsonrpc_code=-32602,
             )
 
-        validators = {
-            "max_duration_sec": (0.0, None),
-            "max_completed_frontiers": (0.0, None),
-            "min_covered_ratio": (0.0, 1.0),
-            "max_no_gain_rounds": (0.0, None),
-            "min_known_cells": (0.0, None),
-        }
+        validators = {"max_coverage_pct": (0.0, 100.0)}
         stop_conditions: MetadataDict = {}
         for key, (minimum, maximum) in validators.items():
             if key not in raw_conditions:
@@ -7267,7 +7767,52 @@ class GatewayRuntime:
                 )
             stop_conditions[key] = number
 
-        unsupported = sorted(str(key) for key in raw_conditions if key not in validators)
+        integer_validators = {
+            "no_frontier_timeout_ms": 1,
+            "max_duration_ms": 1,
+            "max_goals": 1,
+        }
+        for key, minimum in integer_validators.items():
+            if key not in raw_conditions:
+                continue
+            value = raw_conditions.get(key)
+            if isinstance(value, bool):
+                value = None
+            try:
+                number = int(value)
+            except (TypeError, ValueError) as exc:
+                raise GatewayError(
+                    f"参数 stop_conditions.{key} 必须为整数。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                ) from exc
+            if number < minimum:
+                raise GatewayError(
+                    f"参数 stop_conditions.{key} 必须大于等于 {minimum}。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                )
+            stop_conditions[key] = number
+
+        if "stop_on_map_revision_change" in raw_conditions:
+            value = raw_conditions.get("stop_on_map_revision_change")
+            if not isinstance(value, bool):
+                raise GatewayError(
+                    "参数 stop_conditions.stop_on_map_revision_change 必须为布尔值。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                )
+            stop_conditions["stop_on_map_revision_change"] = value
+
+        supported_keys = set(validators) | set(integer_validators) | {
+            "stop_on_map_revision_change"
+        }
+        unsupported = sorted(
+            str(key) for key in raw_conditions if key not in supported_keys
+        )
         if unsupported:
             raise GatewayError(
                 "参数 stop_conditions 包含不支持的条件：%s。" % ", ".join(unsupported),
@@ -7285,10 +7830,9 @@ class GatewayRuntime:
         timeout_sec: float,
         poll_interval_sec: float,
     ) -> Optional[float]:
+        del stop_conditions
         if max_duration_sec is not None:
             return max_duration_sec
-        if stop_conditions.get("max_duration_sec") is not None:
-            return None
         guard_sec = max(1.0, float(poll_interval_sec or 0.0) * 2.0)
         return max(0.1, float(timeout_sec) - guard_sec)
 
@@ -7300,7 +7844,8 @@ class GatewayRuntime:
         stop_conditions: MetadataDict,
         poll_interval_sec: float,
     ) -> float:
-        duration_candidates = [value for value in (max_duration_sec, stop_conditions.get("max_duration_sec")) if value]
+        del stop_conditions
+        duration_candidates = [value for value in (max_duration_sec,) if value]
         if not duration_candidates:
             return timeout_sec
         guard_sec = max(1.0, float(poll_interval_sec or 0.0) * 2.0)
@@ -7740,6 +8285,7 @@ class GatewayRuntime:
         rejected_record_ids: Set[str],
         allow_not_found: bool,
         timeout_sec: Optional[float] = None,
+        navigation_state_callback: Optional[Callable[[Optional[str]], None]] = None,
     ) -> Optional[Dict[str, Any]]:
         self._ensure_workspace_memory_library_ready(map_name=map_name)
         memory_candidates = list(search_state["memory_candidates"])
@@ -7804,6 +8350,63 @@ class GatewayRuntime:
         last_error: Optional[GatewayError] = None
         last_verification = None
         attempted_candidate_ids: List[str] = []
+
+        def clear_navigation_lifecycle() -> None:
+            if navigation_state_callback is not None:
+                navigation_state_callback(None)
+
+        def settle_navigation_error(goal_id: str) -> None:
+            terminal_context = None
+            try:
+                terminal_context = self.navigation_service.refresh_navigation()
+            except Exception:
+                terminal_context = None
+            terminal_proof = self._navigation_terminal_proof(
+                terminal_context,
+                goal_id=goal_id,
+                allowed_statuses={
+                    NavigationStatus.SUCCEEDED.value,
+                    NavigationStatus.FAILED.value,
+                    NavigationStatus.CANCELLED.value,
+                },
+            )
+            if not terminal_proof:
+                self._cancel_navigation_with_safety_barrier(
+                    task_context,
+                    goal_id=goal_id,
+                    poll_interval_sec=poll_interval_sec,
+                    acknowledge_interrupt=False,
+                )
+            clear_navigation_lifecycle()
+
+        def require_succeeded_terminal(
+            goal_id: str,
+            navigation_context: Any,
+            *,
+            message: str,
+        ) -> None:
+            terminal_proof = self._navigation_terminal_proof(
+                navigation_context,
+                goal_id=goal_id,
+                allowed_statuses={NavigationStatus.SUCCEEDED.value},
+            )
+            if not terminal_proof:
+                self._cancel_navigation_with_safety_barrier(
+                    task_context,
+                    goal_id=goal_id,
+                    poll_interval_sec=poll_interval_sec,
+                    acknowledge_interrupt=False,
+                )
+                clear_navigation_lifecycle()
+                raise GatewayError(
+                    message,
+                    error_code="navigation_terminal_unproven",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                    details={"goal_id": goal_id},
+                )
+            clear_navigation_lifecycle()
+
         for candidate in memory_candidates:
             candidate_record_id = str(candidate.record_id)
             attempted_candidate_ids.append(candidate_record_id)
@@ -7829,6 +8432,9 @@ class GatewayRuntime:
                 map_version_id=current_map_version_id,
                 localization_session_id=current_localization_session_id,
             )
+            task_context.ensure_active()
+            if navigation_state_callback is not None:
+                navigation_state_callback(goal.goal_id)
             try:
                 navigation_context = self.navigation_service.navigate_until_complete(
                     goal,
@@ -7848,7 +8454,12 @@ class GatewayRuntime:
                         ),
                     ),
                 )
+            except (TaskCancelledError, TaskTimeoutError):
+                raise
             except GatewayError as exc:
+                settle_navigation_error(goal.goal_id)
+                if exc.error_code == "navigation_timeout":
+                    raise
                 rejected_record_ids.add(candidate_record_id)
                 for item in candidate_diagnostics:
                     if str(item.get("record_id") or "") == candidate_record_id:
@@ -7857,6 +8468,15 @@ class GatewayRuntime:
                         break
                 last_error = exc
                 continue
+            except Exception:
+                settle_navigation_error(goal.goal_id)
+                raise
+            else:
+                require_succeeded_terminal(
+                    goal.goal_id,
+                    navigation_context,
+                    message="候选导航完成但缺少 exact terminal ZEROED 证明。",
+                )
             verification_payload = self._build_target_navigation_verification(
                 map_name=map_name,
                 query=query,
@@ -7895,6 +8515,9 @@ class GatewayRuntime:
                 message="正在前往语义区域目标。",
                 payload={"query": query, "goal_id": semantic_goal.goal_id},
             )
+            task_context.ensure_active()
+            if navigation_state_callback is not None:
+                navigation_state_callback(semantic_goal.goal_id)
             try:
                 navigation_context = self.navigation_service.navigate_until_complete(
                     semantic_goal,
@@ -7914,9 +8537,22 @@ class GatewayRuntime:
                         ),
                     ),
                 )
+            except (TaskCancelledError, TaskTimeoutError):
+                raise
             except GatewayError as exc:
+                settle_navigation_error(semantic_goal.goal_id)
+                if exc.error_code == "navigation_timeout":
+                    raise
                 last_error = exc
+            except Exception:
+                settle_navigation_error(semantic_goal.goal_id)
+                raise
             else:
+                require_succeeded_terminal(
+                    semantic_goal.goal_id,
+                    navigation_context,
+                    message="语义导航完成但缺少 exact terminal ZEROED 证明。",
+                )
                 verification_payload = self._build_target_navigation_verification(
                     map_name=map_name,
                     query=query,
@@ -8065,12 +8701,14 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        return self._submit_geometry_skill_task(
-            capability_name="relocalize_active_map",
-            skill_handler=partial(localization_skills.handle_relocalize_active_map, self._skill_ctx),
-            arguments=arguments,
-            requested_by=requested_by,
-            request_context=request_context,
+        del arguments, requested_by, request_context
+        raise GatewayError(
+            "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK，"
+            "relocalize_active_map 暂不支持。",
+            error_code="unsupported",
+            http_status=501,
+            jsonrpc_code=-32601,
+            details={"missing_contract": "typed Relocalize RPC/ACK"},
         )
 
     def _handle_load_map_version_async(
@@ -8188,6 +8826,152 @@ class GatewayRuntime:
             raise GatewayError(f"当前{provider_label}暂不可用。")
         return providers
 
+    def _geometry_provider_task_generation(self) -> int:
+        lock = getattr(self, "_geometry_runtime_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._geometry_runtime_lock = lock
+        geometry_runtime = getattr(self, "platform_geometry_runtime", None)
+        getter = getattr(
+            geometry_runtime,
+            "get_geometry_runtime_provider",
+            None,
+        )
+        provider = getter() if callable(getter) else None
+        with lock:
+            initialized = bool(
+                getattr(self, "_geometry_provider_identity_initialized", False)
+            )
+            previous = getattr(self, "_geometry_provider_identity", None)
+            if not initialized or provider is not previous:
+                self._geometry_provider_generation = int(
+                    getattr(self, "_geometry_provider_generation", 0)
+                ) + 1
+                self._geometry_provider_identity = provider
+                self._geometry_provider_identity_initialized = True
+            return int(self._geometry_provider_generation)
+
+    @staticmethod
+    def _navigation_runtime_generation(navigation_context: Any) -> Optional[int]:
+        state = getattr(navigation_context, "navigation_state", None)
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        value = metadata.get("runtime_generation")
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            generation = int(value)
+        except (TypeError, ValueError):
+            return None
+        return generation if generation >= 0 else None
+
+    def _capture_task_generation_snapshot(
+        self,
+        *,
+        navigation_context: Any = None,
+    ) -> MetadataDict:
+        if navigation_context is None:
+            refresh_navigation = getattr(
+                self.navigation_service,
+                "refresh_navigation",
+                None,
+            )
+            if callable(refresh_navigation):
+                try:
+                    navigation_context = refresh_navigation()
+                except Exception:
+                    navigation_context = None
+        try:
+            guard_generation = int(
+                self.motion_guard.readiness(
+                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
+                ).generation
+            )
+        except Exception:
+            guard_generation = None
+        return {
+            "motion_guard_generation": guard_generation,
+            "navigation_runtime_generation": self._navigation_runtime_generation(
+                navigation_context
+            ),
+            "geometry_provider_generation": self._geometry_provider_task_generation(),
+        }
+
+    @staticmethod
+    def _task_generation_rollovers(
+        expected: MetadataDict,
+        current: MetadataDict,
+    ) -> MetadataDict:
+        rollovers: MetadataDict = {}
+        for key in (
+            "motion_guard_generation",
+            "navigation_runtime_generation",
+            "geometry_provider_generation",
+        ):
+            expected_value = expected.get(key)
+            current_value = current.get(key)
+            if expected_value is not None and current_value != expected_value:
+                rollovers[key] = {
+                    "expected": expected_value,
+                    "current": current_value,
+                }
+        return rollovers
+
+    def _record_task_generation_snapshot(
+        self,
+        context,
+        snapshot: MetadataDict,
+    ) -> None:
+        context.update_metadata({"generation_snapshot": dict(snapshot)})
+
+    def _handle_navigation_generation_rollover(
+        self,
+        context,
+        *,
+        goal_id: str,
+        expected: MetadataDict,
+        current: MetadataDict,
+        rollovers: MetadataDict,
+    ) -> None:
+        details = {
+            "goal_id": goal_id,
+            "generation_snapshot": dict(expected),
+            "current_generations": dict(current),
+            "generation_rollovers": dict(rollovers),
+        }
+        context.publish_event(
+            "task.generation_rollover_detected",
+            message="导航任务检测到 runtime generation rollover。",
+            payload=details,
+        )
+        cancel_confirmed = False
+        latch_confirmed = False
+        try:
+            self.navigation_service.cancel_goal(request_id=goal_id)
+            cancel_confirmed = True
+        except Exception as exc:
+            details["cancel_error"] = str(exc)
+        try:
+            self.motion_guard.latch_safety_stop(
+                "navigation task generation rollover: %s" % goal_id
+            )
+            latch_confirmed = True
+        except Exception as exc:
+            details["safety_latch_error"] = str(exc)
+        details["cancel_confirmed"] = cancel_confirmed
+        details["safety_latch_confirmed"] = latch_confirmed
+        if not (cancel_confirmed and latch_confirmed):
+            raise TaskSafetyBarrierError(
+                "导航代际切换后无法确认 fail-safe 停车。",
+                details=details,
+            )
+        raise GatewayError(
+            "导航 runtime generation 已切换，旧任务已安全停止。",
+            error_code="task_generation_rollover",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details=details,
+        )
+
     def _submit_navigation_task(
         self,
         *,
@@ -8205,6 +8989,10 @@ class GatewayRuntime:
         def runner(context) -> Dict[str, Any]:
             self._ensure_geometry_runtime_for_capability(capability_name)
             last_context = self.navigation_service.set_goal(goal)
+            generation_snapshot = self._capture_task_generation_snapshot(
+                navigation_context=last_context
+            )
+            self._record_task_generation_snapshot(context, generation_snapshot)
             finalized = False
             context.update(
                 progress=0.05,
@@ -8216,6 +9004,21 @@ class GatewayRuntime:
                 while True:
                     context.ensure_active()
                     last_context = self.navigation_service.refresh_navigation()
+                    current_generations = self._capture_task_generation_snapshot(
+                        navigation_context=last_context
+                    )
+                    rollovers = self._task_generation_rollovers(
+                        generation_snapshot,
+                        current_generations,
+                    )
+                    if rollovers:
+                        self._handle_navigation_generation_rollover(
+                            context,
+                            goal_id=goal.goal_id,
+                            expected=generation_snapshot,
+                            current=current_generations,
+                            rollovers=rollovers,
+                        )
                     status = last_context.navigation_state.status
                     context.update(
                         progress=self._estimate_navigation_progress(last_context),
@@ -8295,7 +9098,7 @@ class GatewayRuntime:
                         )
                 if context.is_cancel_requested() or context.is_timed_out():
                     try:
-                        self.navigation_service.cancel_goal()
+                        self.navigation_service.cancel_goal(request_id=goal.goal_id)
                     except Exception:
                         pass
 
@@ -8319,6 +9122,363 @@ class GatewayRuntime:
             ),
         )
 
+    @staticmethod
+    def _exploration_state_request_id(exploration_context: Any) -> str:
+        state = getattr(exploration_context, "exploration_state", None)
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        return str(metadata.get("request_id") or "").strip()
+
+    @staticmethod
+    def _exploration_parking_error(
+        *,
+        request_id: str,
+        reason: str,
+        exploration_context: Any = None,
+    ) -> TaskSafetyBarrierError:
+        state = getattr(exploration_context, "exploration_state", None)
+        raw_status = getattr(state, "status", None)
+        status = str(getattr(raw_status, "value", raw_status) or "").lower()
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        return TaskSafetyBarrierError(
+            "探索中断无法确认后端安全停车：%s" % reason,
+            details={
+                "request_id": request_id,
+                "parking_unconfirmed": True,
+                "reason": reason,
+                "observed_request_id": GatewayRuntime._exploration_state_request_id(
+                    exploration_context
+                ),
+                "observed_status": status or None,
+                "exploration_terminal": metadata.get("exploration_terminal"),
+                "last_stop_reason": metadata.get("last_stop_reason"),
+            },
+        )
+
+    @staticmethod
+    def _navigation_state_goal_id(navigation_context: Any) -> str:
+        state = getattr(navigation_context, "navigation_state", None)
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        return str(metadata.get("observed_goal_id") or "").strip()
+
+    @staticmethod
+    def _navigation_zero_proof(navigation_context: Any) -> MetadataDict:
+        state = getattr(navigation_context, "navigation_state", None)
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        zero_ack_id = str(metadata.get("zero_ack_id") or "").strip()
+        try:
+            applied_ns = int(metadata.get("zero_applied_monotonic_ns") or 0)
+        except (TypeError, ValueError):
+            applied_ns = 0
+        actuator_zeroed = metadata.get("actuator_zeroed") is True
+        if not actuator_zeroed or not zero_ack_id or applied_ns <= 0:
+            return {}
+        return {
+            "actuator_zeroed": actuator_zeroed,
+            "zero_ack_id": zero_ack_id or None,
+            "zero_applied_monotonic_ns": applied_ns or None,
+        }
+
+    @classmethod
+    def _navigation_terminal_proof(
+        cls,
+        navigation_context: Any,
+        *,
+        goal_id: str,
+        allowed_statuses: Set[str],
+    ) -> MetadataDict:
+        state = getattr(navigation_context, "navigation_state", None)
+        raw_status = getattr(state, "status", None)
+        status = str(
+            getattr(raw_status, "value", raw_status) or ""
+        ).lower()
+        if (
+            status not in allowed_statuses
+            or cls._navigation_state_goal_id(navigation_context) != goal_id
+        ):
+            return {}
+        if (
+            status == NavigationStatus.SUCCEEDED.value
+            and not bool(getattr(navigation_context, "goal_reached", False))
+        ):
+            return {}
+        zero_proof = cls._navigation_zero_proof(navigation_context)
+        if not zero_proof:
+            return {}
+        return {
+            "goal_id": goal_id,
+            "terminal_status": status,
+            **zero_proof,
+        }
+
+    @classmethod
+    def _navigation_parking_error(
+        cls,
+        *,
+        goal_id: str,
+        reason: str,
+        navigation_context: Any = None,
+    ) -> TaskSafetyBarrierError:
+        state = getattr(navigation_context, "navigation_state", None)
+        raw_status = getattr(state, "status", None)
+        return TaskSafetyBarrierError(
+            "导航中断无法确认执行器安全停车：%s" % reason,
+            details={
+                "goal_id": goal_id,
+                "navigation_parking_unconfirmed": True,
+                "reason": reason,
+                "observed_goal_id": cls._navigation_state_goal_id(
+                    navigation_context
+                ),
+                "observed_status": str(
+                    getattr(raw_status, "value", raw_status) or ""
+                ).lower()
+                or None,
+                "zero_proof": cls._navigation_zero_proof(
+                    navigation_context
+                ),
+            },
+        )
+
+    def _cancel_navigation_with_safety_barrier(
+        self,
+        context,
+        *,
+        goal_id: str,
+        poll_interval_sec: float,
+        acknowledge_interrupt: bool = True,
+    ) -> Any:
+        exact_goal_id = str(goal_id or "").strip()
+        if not exact_goal_id:
+            raise self._navigation_parking_error(
+                goal_id="",
+                reason="CancelNavigation 缺少 exact goal_id",
+            )
+        goal_id = exact_goal_id
+        context.update(
+            stage="navigation_stopping",
+            message="正在等待导航后端确认执行器零速。",
+            payload={"goal_id": exact_goal_id},
+        )
+        try:
+            last_context = self.navigation_service.cancel_goal(
+                request_id=exact_goal_id
+            )
+        except Exception as exc:
+            raise self._navigation_parking_error(
+                goal_id=goal_id,
+                reason="CancelNavigation 被拒绝或调用失败: %s" % exc,
+            ) from exc
+
+        deadline = time.monotonic() + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC
+        sleep_sec = min(0.1, max(0.02, float(poll_interval_sec)))
+        while True:
+            state = getattr(last_context, "navigation_state", None)
+            raw_status = getattr(state, "status", None)
+            status = str(
+                getattr(raw_status, "value", raw_status) or ""
+            ).lower()
+            observed_goal_id = self._navigation_state_goal_id(last_context)
+            if observed_goal_id and observed_goal_id != goal_id:
+                raise self._navigation_parking_error(
+                    goal_id=goal_id,
+                    reason="CancelNavigation 终态 goal_id 不匹配",
+                    navigation_context=last_context,
+                )
+            if status == NavigationStatus.CANCELLED.value:
+                zero_proof = self._navigation_zero_proof(last_context)
+                if observed_goal_id != goal_id:
+                    raise self._navigation_parking_error(
+                        goal_id=goal_id,
+                        reason="CancelNavigation 终态缺少 goal_id 关联证明",
+                        navigation_context=last_context,
+                    )
+                if not zero_proof:
+                    raise self._navigation_parking_error(
+                        goal_id=goal_id,
+                        reason="typed CANCELLED 缺少执行器 ZEROED 证明",
+                        navigation_context=last_context,
+                    )
+                proof = {
+                    "goal_id": goal_id,
+                    "terminal_status": status,
+                    **zero_proof,
+                }
+                if acknowledge_interrupt:
+                    context.acknowledge_interrupt_barrier(proof)
+                return last_context
+            if status in {
+                NavigationStatus.SUCCEEDED.value,
+                NavigationStatus.FAILED.value,
+            }:
+                raise self._navigation_parking_error(
+                    goal_id=goal_id,
+                    reason="CancelNavigation 未返回 typed CANCELLED",
+                    navigation_context=last_context,
+                )
+            if status not in {
+                NavigationStatus.IDLE.value,
+                NavigationStatus.ACCEPTED.value,
+                NavigationStatus.PLANNING.value,
+                NavigationStatus.RUNNING.value,
+            }:
+                raise self._navigation_parking_error(
+                    goal_id=goal_id,
+                    reason="CancelNavigation 返回未知中间态",
+                    navigation_context=last_context,
+                )
+            if time.monotonic() >= deadline:
+                raise self._navigation_parking_error(
+                    goal_id=goal_id,
+                    reason="等待 CancelNavigation ZEROED 终态超时",
+                    navigation_context=last_context,
+                )
+            time.sleep(sleep_sec)
+            try:
+                last_context = self.navigation_service.refresh_navigation()
+            except Exception as exc:
+                raise self._navigation_parking_error(
+                    goal_id=goal_id,
+                    reason="轮询 CancelNavigation 终态失败: %s" % exc,
+                    navigation_context=last_context,
+                ) from exc
+
+    def _stop_exploration_with_safety_barrier(
+        self,
+        context,
+        *,
+        request_id: str,
+        poll_interval_sec: float,
+        acknowledge_interrupt: bool = True,
+    ) -> Any:
+        if context is not None:
+            context.update(
+                stage="exploration_stopping",
+                message="正在等待探索后端确认安全停车。",
+                payload={"request_id": request_id},
+            )
+        try:
+            last_context = self.navigation_service.stop_exploration(
+                request_id=request_id
+            )
+        except Exception as exc:
+            raise self._exploration_parking_error(
+                request_id=request_id,
+                reason="StopExploration 被拒绝或调用失败: %s" % exc,
+            ) from exc
+
+        deadline = time.monotonic() + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC
+        sleep_sec = min(0.1, max(0.02, float(poll_interval_sec)))
+        while True:
+            state = getattr(last_context, "exploration_state", None)
+            raw_status = getattr(state, "status", None)
+            status = str(
+                getattr(raw_status, "value", raw_status) or ""
+            ).lower()
+            metadata = dict(getattr(state, "metadata", {}) or {})
+            observed_request_id = self._exploration_state_request_id(last_context)
+            if observed_request_id and observed_request_id != request_id:
+                raise self._exploration_parking_error(
+                    request_id=request_id,
+                    reason="StopExploration 终态 request_id 不匹配",
+                    exploration_context=last_context,
+                )
+            if status in {
+                ExplorationStatus.SUCCEEDED.value,
+                ExplorationStatus.CANCELLED.value,
+            }:
+                if observed_request_id != request_id:
+                    raise self._exploration_parking_error(
+                        request_id=request_id,
+                        reason="StopExploration 终态缺少 request_id 关联证明",
+                        exploration_context=last_context,
+                    )
+                if metadata.get("exploration_terminal") is not True:
+                    raise self._exploration_parking_error(
+                        request_id=request_id,
+                        reason="StopExploration 未提供 exploration_terminal=true",
+                        exploration_context=last_context,
+                    )
+                proof = {
+                    "request_id": request_id,
+                    "terminal_status": status,
+                    "exploration_terminal": True,
+                    "last_stop_reason": metadata.get("last_stop_reason"),
+                }
+                if acknowledge_interrupt and context is not None:
+                    context.acknowledge_interrupt_barrier(proof)
+                return last_context
+            if status == ExplorationStatus.FAILED.value:
+                raise self._exploration_parking_error(
+                    request_id=request_id,
+                    reason=getattr(state, "message", None)
+                    or "StopExploration 返回 failed",
+                    exploration_context=last_context,
+                )
+            if status not in {
+                ExplorationStatus.ACCEPTED.value,
+                ExplorationStatus.RUNNING.value,
+            }:
+                raise self._exploration_parking_error(
+                    request_id=request_id,
+                    reason="StopExploration 返回非停车中间态",
+                    exploration_context=last_context,
+                )
+            if time.monotonic() >= deadline:
+                raise self._exploration_parking_error(
+                    request_id=request_id,
+                    reason="等待 StopExploration correlated terminal 超时",
+                    exploration_context=last_context,
+                )
+            time.sleep(sleep_sec)
+            try:
+                last_context = self.navigation_service.refresh_exploration()
+            except Exception as exc:
+                raise self._exploration_parking_error(
+                    request_id=request_id,
+                    reason="轮询 StopExploration 终态失败: %s" % exc,
+                    exploration_context=last_context,
+                ) from exc
+
+    def _handle_exploration_generation_rollover(
+        self,
+        context,
+        *,
+        request_id: str,
+        poll_interval_sec: float,
+        expected: MetadataDict,
+        current: MetadataDict,
+        rollovers: MetadataDict,
+    ) -> None:
+        details = {
+            "request_id": request_id,
+            "generation_snapshot": dict(expected),
+            "current_generations": dict(current),
+            "generation_rollovers": dict(rollovers),
+        }
+        context.publish_event(
+            "task.generation_rollover_detected",
+            message="探索任务检测到 runtime generation rollover。",
+            payload=details,
+        )
+        terminal_context = self._stop_exploration_with_safety_barrier(
+            context,
+            request_id=request_id,
+            poll_interval_sec=poll_interval_sec,
+            acknowledge_interrupt=False,
+        )
+        terminal_state = getattr(terminal_context, "exploration_state", None)
+        raw_status = getattr(terminal_state, "status", None)
+        details["safe_terminal_status"] = str(
+            getattr(raw_status, "value", raw_status) or ""
+        ).lower()
+        raise GatewayError(
+            "探索 runtime generation 已切换，旧任务已安全停止。",
+            error_code="task_generation_rollover",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details=details,
+        )
+
     def _submit_exploration_task(
         self,
         *,
@@ -8328,47 +9488,95 @@ class GatewayRuntime:
         requested_by: Optional[str],
         request_context: Optional[MetadataDict] = None,
         task_metadata: Optional[MetadataDict] = None,
+        capability_name: str = "explore_area",
     ):
-        descriptor = self.capability_registry.get_descriptor("explore_area")
+        descriptor = self.capability_registry.get_descriptor(capability_name)
         poll_interval_sec = max(0.05, poll_interval_sec)
 
         def runner(context) -> Dict[str, Any]:
-            context.update(progress=0.02, stage="prepare_exploration_runtime", message="检查并复用探索建图运行时。")
-            context.ensure_active()
-            self._refresh_workspace_snapshots()
-            workspace = self.map_workspace_service.get_active_workspace()
-            if self._workspace_requires_localization_before_explore(workspace):
-                self._ensure_localization_ready_or_relocalize(
-                    capability_name="explore_area",
-                    map_name=request.map_name,
-                    workspace=workspace,
-                    requested_by=requested_by,
-                )
-            self._ensure_workspace_memory_library_ready(map_name=request.map_name)
-            context.ensure_active()
-            self._ensure_geometry_runtime_for_capability("explore_area")
-            last_context = self.navigation_service.start_exploration(request)
-            self._attach_perception_to_exploration()
+            backend_started = False
+            perception_attached = False
             finalized = False
-            exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
-            context.update(
-                progress=0.05,
-                stage="accepted",
-                message=last_context.exploration_state.message or f"探索任务 {request.request_id} 已提交。",
-                payload={
-                    "request_id": request.request_id,
-                    "waiting_for": exploration_metadata.get("waiting_for"),
-                    "mapping_chain_diagnostics": exploration_metadata.get("mapping_chain_diagnostics"),
-                },
-            )
             try:
+                context.update(
+                    progress=0.02,
+                    stage="prepare_exploration_runtime",
+                    message="检查并复用探索建图运行时。",
+                )
+                context.ensure_active()
+                self._refresh_workspace_snapshots()
+                workspace = self.map_workspace_service.get_active_workspace()
+                if self._workspace_requires_localization_before_explore(workspace):
+                    self._ensure_localization_ready_or_relocalize(
+                        capability_name=capability_name,
+                        map_name=request.map_name,
+                        workspace=workspace,
+                        requested_by=requested_by,
+                    )
+                self._ensure_workspace_memory_library_ready(map_name=request.map_name)
+                context.ensure_active()
+                self._ensure_geometry_runtime_for_capability(capability_name)
+                context.ensure_active()
+                last_context = self.navigation_service.start_exploration(request)
+                backend_started = True
+                self._attach_perception_to_exploration()
+                perception_attached = True
+                generation_snapshot = self._capture_task_generation_snapshot()
+                self._record_task_generation_snapshot(
+                    context,
+                    generation_snapshot,
+                )
+                exploration_metadata = dict(
+                    getattr(last_context.exploration_state, "metadata", {}) or {}
+                )
+                context.update(
+                    progress=0.05,
+                    stage="accepted",
+                    message=last_context.exploration_state.message
+                    or f"探索任务 {request.request_id} 已提交。",
+                    payload={
+                        "request_id": request.request_id,
+                        "waiting_for": exploration_metadata.get("waiting_for"),
+                        "mapping_chain_diagnostics": exploration_metadata.get(
+                            "mapping_chain_diagnostics"
+                        ),
+                    },
+                )
                 while True:
                     context.ensure_active()
                     last_context = self.navigation_service.refresh_exploration()
+                    current_generations = self._capture_task_generation_snapshot()
+                    rollovers = self._task_generation_rollovers(
+                        generation_snapshot,
+                        current_generations,
+                    )
+                    if rollovers:
+                        self._handle_exploration_generation_rollover(
+                            context,
+                            request_id=request.request_id,
+                            poll_interval_sec=poll_interval_sec,
+                            expected=generation_snapshot,
+                            current=current_generations,
+                            rollovers=rollovers,
+                        )
                     status = last_context.exploration_state.status
                     exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
                     if self._exploration_metadata_indicates_done(exploration_metadata):
                         last_context = self.navigation_service.refresh_exploration()
+                        current_generations = self._capture_task_generation_snapshot()
+                        rollovers = self._task_generation_rollovers(
+                            generation_snapshot,
+                            current_generations,
+                        )
+                        if rollovers:
+                            self._handle_exploration_generation_rollover(
+                                context,
+                                request_id=request.request_id,
+                                poll_interval_sec=poll_interval_sec,
+                                expected=generation_snapshot,
+                                current=current_generations,
+                                rollovers=rollovers,
+                            )
                         status = last_context.exploration_state.status
                         exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
                     progress = self._estimate_exploration_progress(last_context)
@@ -8410,8 +9618,25 @@ class GatewayRuntime:
                     if status.value == "cancelled":
                         raise GatewayError(last_context.exploration_state.message or "探索已取消。")
                     time.sleep(poll_interval_sec)
+            except (TaskCancelledError, TaskTimeoutError):
+                if backend_started:
+                    self._stop_exploration_with_safety_barrier(
+                        context,
+                        request_id=request.request_id,
+                        poll_interval_sec=poll_interval_sec,
+                    )
+                else:
+                    context.acknowledge_interrupt_barrier(
+                        {
+                            "request_id": request.request_id,
+                            "backend_not_started": True,
+                            "exploration_terminal": True,
+                            "terminal_status": "not_started",
+                        }
+                    )
+                raise
             finally:
-                if not finalized:
+                if backend_started and not finalized:
                     try:
                         self._finalize_workspace_assets_after_task(
                             map_name=request.map_name,
@@ -8422,15 +9647,17 @@ class GatewayRuntime:
                             "探索任务结束后刷新地图工作区失败 map_name=%s",
                             request.map_name,
                         )
-                # 探索自然结束时仅同步平台态；go2.sh/RTAB-Map/Nav2 由 stop_mapping 统一结束。
-                try:
-                    self.navigation_service.sync_exploration_after_task()
-                except Exception:
-                    pass
-                self._detach_perception_from_exploration()
+                if backend_started:
+                    # 探索自然结束时只同步 controller 终态；mapping 会话保持运行。
+                    try:
+                        self.navigation_service.sync_exploration_after_task()
+                    except Exception:
+                        pass
+                if perception_attached:
+                    self._detach_perception_from_exploration()
 
         return self.task_manager.submit(
-            "explore_area",
+            capability_name,
             runner,
             input_payload={
                 "request_id": request.request_id,
@@ -8447,10 +9674,11 @@ class GatewayRuntime:
             timeout_sec=timeout_sec,
             metadata=task_metadata
             or self._build_task_request_metadata(
-                capability_name="explore_area",
+                capability_name=capability_name,
                 requested_by=requested_by,
                 request_context=request_context,
             ),
+            deferred_interrupt=True,
         )
 
     def _find_scene_object(self, query: str, perception_context):
@@ -8543,6 +9771,9 @@ class GatewayRuntime:
         if status.running:
             self.perception_video_runtime.stop()
 
+    def _person_follow_readiness(self) -> PersonFollowReadiness:
+        return read_person_follow_readiness()
+
     def _start_safety_watchdog_loop(self) -> None:
         if self._safety_watchdog_thread is not None:
             return
@@ -8579,11 +9810,20 @@ class GatewayRuntime:
         - ASYNC 类几何 capability：仅做禁用 / blocked 检查；启动留给 runner 内的 ensure 调用。
         """
 
+        if capability_name == "relocalize_active_map":
+            raise GatewayError(
+                "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK，"
+                "relocalize_active_map 暂不支持。",
+                error_code="unsupported",
+                http_status=501,
+                jsonrpc_code=-32601,
+                details={"missing_contract": "typed Relocalize RPC/ACK"},
+            )
         if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
             return
         geometry_config = self.config.geometry
         if not bool(getattr(geometry_config, "enabled", False)) or not bool(
-            getattr(getattr(geometry_config, "rtabmap", None), "profile_enabled", False)
+            getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
         ):
             raise GatewayError(
                 "平台几何运行时已禁用，无法执行 %s。" % capability_name,
@@ -8669,7 +9909,7 @@ class GatewayRuntime:
             return
         geometry_config = self.config.geometry
         if not bool(getattr(geometry_config, "enabled", False)) or not bool(
-            getattr(getattr(geometry_config, "rtabmap", None), "profile_enabled", False)
+            getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
         ):
             raise GatewayError(
                 "平台几何运行时已禁用，无法执行 %s。" % capability_name,
@@ -8844,7 +10084,7 @@ class GatewayRuntime:
 
         geometry_config = self.config.geometry
         geometry_config_enabled = bool(getattr(geometry_config, "enabled", False)) and bool(
-            getattr(getattr(geometry_config, "rtabmap", None), "profile_enabled", False)
+            getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
         )
 
         DynamicCheck = Tuple[Callable[[], bool], Optional[str]]
@@ -8890,8 +10130,8 @@ class GatewayRuntime:
                 None,
             ),
             "relocalize_active_map": (
-                lambda: geometry_config_enabled,
-                "平台几何运行时已禁用。",
+                lambda: False,
+                "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK。",
             ),
             "get_map_snapshot": (
                 lambda: True,
@@ -9026,6 +10266,10 @@ class GatewayRuntime:
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
             ),
+            "explore_area_v2": (
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
+            ),
             "explore_and_find_target": (
                 lambda: geometry_config_enabled and self._has_provider(ImageProvider),
                 "平台几何运行时已禁用，或当前机器人入口未提供图像采集提供器。",
@@ -9038,8 +10282,9 @@ class GatewayRuntime:
                 lambda: self._has_provider(ImageProvider)
                 and self.motion_guard.is_ready(
                     motion_guard_pb.GUARD_SOURCE_GATEWAY_FOLLOW
-                ),
-                "当前机器人入口未提供图像采集，或 motion guard 未就绪。",
+                )
+                and self._person_follow_readiness().ready,
+                "当前机器人入口未提供图像采集、motion guard 未就绪，或 person-follow ready marker 无效。",
             ),
             "relative_move": (
                 lambda: self.motion_guard.is_ready(
@@ -9153,8 +10398,6 @@ class GatewayRuntime:
         metadata = dict(getattr(context.exploration_state, "metadata", {}) or {})
         if self._exploration_metadata_indicates_done(metadata):
             return 1.0
-        if bool(metadata.get("exploration_terminal")):
-            return 1.0
         status_text = str(metadata.get("status_text") or metadata.get("explorer_status_text") or "").upper()
         if "DONE" in status_text or "COMPLETE" in status_text or "EXPLORATION FINISHED" in status_text:
             return 1.0
@@ -9210,10 +10453,32 @@ class GatewayRuntime:
 
     @staticmethod
     def _exploration_metadata_indicates_done(metadata: Dict[str, Any]) -> bool:
-        if bool(metadata.get("exploration_terminal")) or bool(metadata.get("terminal")):
+        terminal_status = str(
+            metadata.get("terminal_status") or metadata.get("status") or ""
+        ).strip().lower()
+        if terminal_status:
+            return terminal_status in {"succeeded", "success", "completed"}
+        stop_reason = str(metadata.get("last_stop_reason") or "").strip().lower()
+        if stop_reason in {
+            "no_information_gain",
+            "no_reachable_free_space",
+            "hit_stop",
+        }:
             return True
+        if stop_reason in {
+            "user_cancelled",
+            "consecutive_failures_exceeded",
+        }:
+            return False
         status_text = str(metadata.get("status_text") or metadata.get("explorer_status_text") or "").upper()
-        if "DONE" in status_text or "EXPLORATION FINISHED" in status_text:
+        if (
+            bool(metadata.get("exploration_terminal"))
+            or bool(metadata.get("terminal"))
+        ) and (
+            "DONE" in status_text
+            or "COMPLETE" in status_text
+            or "EXPLORATION FINISHED" in status_text
+        ):
             return True
         observer_meta = metadata.get("external_frontier_debug_observer")
         if isinstance(observer_meta, dict):

@@ -6,6 +6,18 @@ use nuwax_nav_types_messages::geometry::Point2;
 use crate::config::WavefrontConfig;
 use crate::grid::occupancy_value;
 
+#[derive(Debug, Clone)]
+struct GoalFailureRecord {
+    point: Point2,
+    failures: u32,
+}
+
+#[derive(Debug, Clone)]
+struct BlacklistedGoal {
+    point: Point2,
+    radius_m: f64,
+}
+
 /// 2D 单位方向(可为零;`from_delta` 拒绝零长度 / NaN)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Direction2 {
@@ -49,6 +61,10 @@ pub struct ExplorationSession {
     pub(crate) goals_published: u32,
     /// 连续失败数
     pub(crate) consecutive_failures: u32,
+    /// 按空间位置累计的导航失败次数。
+    failed_goals: Vec<GoalFailureRecord>,
+    /// 已耗尽重试预算的目标区域。
+    blacklisted_goals: Vec<BlacklistedGoal>,
 }
 
 impl ExplorationSession {
@@ -78,13 +94,93 @@ impl ExplorationSession {
     /// 记录 goal 发布成功
     pub fn record_goal_published(&mut self) {
         self.goals_published = self.goals_published.saturating_add(1);
-        // 成功发布后清零连续失败
-        self.consecutive_failures = 0;
     }
 
     /// 记录失败
     pub fn record_failure(&mut self) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+
+    /// 记录导航到达。只有收到真实到达反馈后，目标才进入已探索集合。
+    pub fn record_goal_reached(&mut self, goal: Point2) {
+        self.mark_explored_goal(goal);
+        self.consecutive_failures = 0;
+        self.failed_goals
+            .retain(|record| point_distance(record.point, goal) > 1.0e-6);
+        self.blacklisted_goals
+            .retain(|record| point_distance(record.point, goal) > record.radius_m);
+    }
+
+    /// 记录导航失败，并在失败次数超过重试预算后将目标区域加入 blacklist。
+    ///
+    /// 返回 `true` 表示本次反馈新触发了 blacklist。
+    pub fn record_goal_failed(
+        &mut self,
+        goal: Point2,
+        max_retries: u32,
+        blacklist_radius_m: f64,
+    ) -> bool {
+        self.record_failure();
+        let radius_m = blacklist_radius_m.max(0.0);
+        let match_radius = radius_m.max(1.0e-6);
+        let failures = if let Some(record) = self
+            .failed_goals
+            .iter_mut()
+            .find(|record| point_distance(record.point, goal) <= match_radius)
+        {
+            record.failures = record.failures.saturating_add(1);
+            record.failures
+        } else {
+            self.failed_goals.push(GoalFailureRecord {
+                point: goal,
+                failures: 1,
+            });
+            1
+        };
+
+        if failures <= max_retries
+            || self
+                .blacklisted_goals
+                .iter()
+                .any(|record| point_distance(record.point, goal) <= record.radius_m)
+        {
+            return false;
+        }
+        self.blacklisted_goals.push(BlacklistedGoal {
+            point: goal,
+            radius_m,
+        });
+        true
+    }
+
+    /// 主动把一个目标区域加入 blacklist，例如 boundary 拒绝的候选点。
+    pub fn blacklist_goal(&mut self, goal: Point2, radius_m: f64) {
+        let radius_m = radius_m.max(0.0);
+        if self
+            .blacklisted_goals
+            .iter()
+            .any(|record| point_distance(record.point, goal) <= record.radius_m.max(radius_m))
+        {
+            return;
+        }
+        self.blacklisted_goals.push(BlacklistedGoal {
+            point: goal,
+            radius_m,
+        });
+    }
+
+    /// 点是否落在任一 blacklist 区域内。
+    #[must_use]
+    pub fn is_blacklisted(&self, point: Point2) -> bool {
+        self.blacklisted_goals
+            .iter()
+            .any(|record| point_distance(record.point, point) <= record.radius_m)
+    }
+
+    /// 当前 blacklist 区域数量。
+    #[must_use]
+    pub fn blacklist_count(&self) -> usize {
+        self.blacklisted_goals.len()
     }
 
     /// 已发布 goal 数
@@ -172,6 +268,14 @@ impl ExplorationSession {
         stop_reason
     }
 
+    /// 清理 no-frontier 选择历史，但保留导航失败、retry 与 blacklist 状态。
+    pub fn reset_information_history(&mut self) {
+        self.explored_goals.clear();
+        self.exploration_direction = None;
+        self.last_information_count = None;
+        self.no_gain_counter = 0;
+    }
+
     /// 重置全部状态(explored goals、direction、no-gain、failure)
     pub fn reset(&mut self) {
         self.explored_goals.clear();
@@ -180,7 +284,13 @@ impl ExplorationSession {
         self.no_gain_counter = 0;
         self.goals_published = 0;
         self.consecutive_failures = 0;
+        self.failed_goals.clear();
+        self.blacklisted_goals.clear();
     }
+}
+
+fn point_distance(a: Point2, b: Point2) -> f64 {
+    (a.x - b.x).hypot(a.y - b.y)
 }
 
 #[cfg(test)]
@@ -337,5 +447,53 @@ mod tests {
         assert_eq!(s.no_gain_counter, 0);
         assert_eq!(s.goals_published, 0);
         assert_eq!(s.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn publishing_is_not_treated_as_reaching_the_goal() {
+        let mut s = ExplorationSession::new();
+        s.record_failure();
+        s.record_goal_published();
+
+        assert!(s.explored_goals.is_empty());
+        assert_eq!(s.goals_published(), 1);
+        assert_eq!(s.consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn reached_feedback_marks_goal_and_resets_consecutive_failures() {
+        let mut s = ExplorationSession::new();
+        let goal = Point2 { x: 1.5, y: -2.0 };
+        s.record_failure();
+        s.record_goal_reached(goal);
+
+        assert_eq!(s.explored_goals, vec![goal]);
+        assert_eq!(s.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn failed_goal_is_blacklisted_after_retry_budget_is_exhausted() {
+        let mut s = ExplorationSession::new();
+        let goal = Point2 { x: 2.0, y: 3.0 };
+
+        assert!(!s.record_goal_failed(goal, 1, 0.5));
+        assert!(s.record_goal_failed(goal, 1, 0.5));
+        assert!(s.is_blacklisted(Point2 { x: 2.2, y: 3.1 }));
+        assert!(!s.is_blacklisted(Point2 { x: 3.0, y: 3.0 }));
+        assert_eq!(s.consecutive_failures(), 2);
+    }
+
+    #[test]
+    fn no_frontier_history_reset_preserves_retry_blacklist() {
+        let mut s = ExplorationSession::new();
+        let goal = Point2 { x: 2.0, y: 3.0 };
+        s.record_goal_failed(goal, 0, 0.5);
+        s.mark_explored_goal(Point2 { x: 1.0, y: 1.0 });
+
+        s.reset_information_history();
+
+        assert!(s.explored_goals.is_empty());
+        assert!(s.is_blacklisted(goal));
+        assert_eq!(s.consecutive_failures(), 1);
     }
 }

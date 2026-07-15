@@ -15,7 +15,8 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING, runtime_checkable
+import uuid
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Protocol, Set, Tuple, TYPE_CHECKING, runtime_checkable
 from urllib.parse import quote
 
 from contracts.geometry import Pose, Vector3
@@ -63,7 +64,7 @@ from services.navigation.runtime import GridNavigationPlanner
 # 本模块其它位置禁止再写"fake-lcm"字面量(注释除外,做"已物理删除"标记用)。
 # 权威源 = core/settings.py::_normalize_lcm_backend(2026-07-08 重写为 20 行仅接受 real-lcm/real/空)。
 # AC7 grep 互斥设计:grep 必须排除本模块前 60 行(常量定义区)。
-_CANONICAL_LCM_BACKENDS: frozenset[str] = frozenset({"real-lcm"})
+_CANONICAL_LCM_BACKENDS: FrozenSet[str] = frozenset({"real-lcm"})
 
 if TYPE_CHECKING:
     from core.event_bus import EventBus
@@ -121,6 +122,195 @@ def _is_exploration_legacy_enabled() -> bool:
     """
     raw = os.environ.get("NUWAX_EXPLORATION_LEGACY", "")
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_RemoteOperationToken = Tuple[object, Optional[int]]
+_ANY_DELIVERY_OWNER = object()
+
+
+@dataclass(eq=False)
+class _SubscriptionDeliveryTicket:
+    """One runtime callback fence shared by all subscription kinds."""
+
+    ticket_id: int
+    kind: str
+    subscription_id: Optional[int]
+    callback: Callable[..., object]
+    provider: Optional[object]
+    provider_generation: Optional[int]
+    published: bool = False
+    invalidated: bool = False
+    active_count: int = 0
+    active_threads: Dict[int, int] = field(default_factory=dict)
+
+
+def _remote_is_connected(remote: object) -> bool:
+    try:
+        connected = getattr(remote, "is_connected", False)
+        if callable(connected):
+            connected = connected()
+        return bool(connected)
+    except Exception:
+        return False
+
+
+def _remote_connection_generation(remote: object) -> Optional[int]:
+    try:
+        generation = getattr(remote, "connection_generation", None)
+        if callable(generation):
+            generation = generation()
+        return int(generation) if generation is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _cancel_remote_stream_handle(handle, *, stream_name: str) -> bool:
+    if handle is None:
+        return True
+    cancel = getattr(handle, "cancel", None)
+    if not callable(cancel):
+        return True
+    try:
+        result = cancel()
+        return result is not False
+    except Exception:
+        LOGGER.exception("取消远端 %s stream handle 失败。", stream_name)
+        return False
+
+
+def _capture_remote_operation_token_locked(
+    runtime: object,
+    remote: object,
+) -> Optional[_RemoteOperationToken]:
+    if hasattr(runtime, "_remote_provider"):
+        if getattr(runtime, "_remote_provider", None) is not remote:
+            return None
+    if not _remote_is_connected(remote):
+        return None
+    return remote, _remote_connection_generation(remote)
+
+
+def _remote_operation_token_is_current_locked(
+    runtime: object,
+    token: Optional[_RemoteOperationToken],
+) -> bool:
+    if token is None:
+        return False
+    remote, generation = token
+    if hasattr(runtime, "_remote_provider"):
+        if getattr(runtime, "_remote_provider", None) is not remote:
+            return False
+    return bool(
+        _remote_is_connected(remote)
+        and _remote_connection_generation(remote) == generation
+    )
+
+
+def _exploration_state_request_id(state: object) -> str:
+    return str(getattr(state, "current_request_id", "") or "").strip()
+
+
+def _is_complete_exploration_terminal(
+    state: object,
+    *,
+    request_id: str,
+    safe_stop_only: bool = False,
+) -> bool:
+    status = getattr(state, "status", None)
+    terminal_statuses = {
+        ExplorationStatus.SUCCEEDED,
+        ExplorationStatus.FAILED,
+        ExplorationStatus.CANCELLED,
+    }
+    if safe_stop_only:
+        terminal_statuses.discard(ExplorationStatus.FAILED)
+    metadata = dict(getattr(state, "metadata", {}) or {})
+    return bool(
+        _exploration_state_request_id(state) == str(request_id or "").strip()
+        and status in terminal_statuses
+        and metadata.get("exploration_terminal") is True
+    )
+
+
+def _restore_mapping_session_mode_locked(runtime: object) -> None:
+    mapping_context = None
+    context_known = hasattr(runtime, "_mapping_session_context")
+    reader = getattr(runtime, "get_mapping_session_context", None)
+    if callable(reader):
+        context_known = True
+        try:
+            mapping_context = reader()
+        except Exception:
+            LOGGER.exception(
+                "读取 mapping session context 失败；保留当前 session mode。"
+            )
+            return
+    elif context_known:
+        mapping_context = getattr(runtime, "_mapping_session_context", None)
+    if context_known:
+        setattr(
+            runtime,
+            "_external_geometry_session_mode",
+            "mapping"
+            if isinstance(mapping_context, dict) and mapping_context.get("active")
+            else None,
+        )
+
+
+def _commit_remote_exploration_state_locked(
+    runtime: object,
+    state: ExplorationState,
+    *,
+    request_id: str,
+    request: Optional[ExploreAreaRequest] = None,
+    map_version_id: Optional[str] = None,
+) -> bool:
+    expected_id = str(request_id or "").strip()
+    if not expected_id or _exploration_state_request_id(state) != expected_id:
+        return False
+    status = state.status
+    terminal = status in {
+        ExplorationStatus.SUCCEEDED,
+        ExplorationStatus.FAILED,
+        ExplorationStatus.CANCELLED,
+    }
+    metadata = dict(state.metadata or {})
+    if terminal and metadata.get("exploration_terminal") is not True:
+        return False
+
+    current = getattr(runtime, "_external_exploration_request", None)
+    current_id = str(getattr(current, "request_id", "") or "").strip()
+    if request is None:
+        if current_id != expected_id:
+            return False
+    elif current_id and current_id != expected_id:
+        return False
+
+    state_copy = state.model_copy(deep=True)
+    if terminal:
+        setattr(runtime, "_external_exploration_request", None)
+        setattr(runtime, "_external_exploration_terminal_state", state_copy)
+        setattr(runtime, "_remote_exploration_terminal_override", state_copy)
+        _restore_mapping_session_mode_locked(runtime)
+    else:
+        if request is not None:
+            active_request = (
+                request.model_copy(deep=True)
+                if hasattr(request, "model_copy")
+                else request
+            )
+            setattr(runtime, "_external_exploration_request", active_request)
+        setattr(runtime, "_external_exploration_terminal_state", None)
+        setattr(runtime, "_remote_exploration_terminal_override", None)
+        setattr(runtime, "_external_geometry_session_mode", "explore")
+        if map_version_id is not None:
+            setattr(
+                runtime,
+                "_external_exploration_version_id",
+                str(map_version_id or "").strip() or None,
+            )
+
+    return True
 
 
 def _canonical_main_log_level(level: str) -> str:
@@ -498,23 +688,36 @@ class PlatformGeometryRuntime:
         self._live_geometry_start_attempted = False
         self._pending_localization_callbacks = []
         self._pending_map_callbacks = []
+        self._localization_update_subscribers: Dict[int, Callable[..., None]] = {}
+        self._map_update_subscribers: Dict[int, Callable[..., None]] = {}
+        self._remote_localization_subscription_handles: Dict[int, object] = {}
+        self._remote_map_subscription_handles: Dict[int, object] = {}
+        self._next_localization_subscription_id = 1
+        self._next_map_subscription_id = 1
+        self._navigation_update_subscribers: Dict[int, Callable[[object], None]] = {}
+        self._remote_navigation_subscription_ids: Dict[int, int] = {}
+        self._next_navigation_subscription_id = 1
         self._runtime_state_lock = threading.RLock()
+        self._mapping_lifecycle_lock = threading.RLock()
+        self._mapping_session_context: Optional[Dict[str, object]] = None
         self._runtime_phase = "disabled" if not self._is_geometry_profile_enabled() else "preflight"
         self._runtime_message = "平台几何运行时尚未启动。"
         self._runtime_blocked = False
         self._runtime_started = False
+        self._provider_attach_lock = threading.RLock()
+        self._provider_attach_epoch = 0
+        self._provider_attach_stopping = False
+        self._subscription_delivery_condition = threading.Condition()
+        self._subscription_delivery_tickets: Dict[
+            int,
+            _SubscriptionDeliveryTicket,
+        ] = {}
+        self._next_subscription_delivery_ticket_id = 1
         self._runtime_stop_event = threading.Event()
         self._runtime_monitor_thread: Optional[threading.Thread] = None
         self._managed_processes: Dict[str, _ManagedProcess] = {}
         self._runtime_diagnostics: List[Dict[str, object]] = []
         self._map_stream_tracker: Dict[str, object] = {}
-        # 外部 /map 观察器（ExternalGeometryDebugObserver）才是 /map 占据栅格的真实来源；
-        # Rust bridge 的 get_status 只返回 {phase,message,rss_kb}，不含占据状态。
-        # 此处缓存观察器最近一帧的就绪元数据，供 _geometry_runtime_status_stub("live_map_provider")
-        # 合并，从而让 _build_mapping_readiness / _classify_live_mapping_wait /
-        # _update_stream_tracker 读到真实的 occupancy 状态。
-        self._observer_occupancy_snapshot: Dict[str, object] = {}
-        self._observer_occupancy_lock = threading.Lock()
         self._external_live_pose: Optional[Pose] = None
         self._external_live_pose_at_monotonic = 0.0
         self._external_live_pose_lock = threading.Lock()
@@ -555,6 +758,7 @@ class PlatformGeometryRuntime:
             config=self._platform_exploration_config,
         )
         self._exploration_loop_lock = threading.RLock()
+        self._exploration_delivery_context = threading.local()
         self._exploration_loop_stop_event = threading.Event()
         self._exploration_loop_thread: Optional[threading.Thread] = None
         self._exploration_loop_generation = 0
@@ -564,6 +768,7 @@ class PlatformGeometryRuntime:
         self._exploration_last_tick_monotonic: Optional[float] = None
         self._exploration_last_tick_source: Optional[str] = None
         self._exploration_update_subscribers: Dict[int, Callable[[ExplorationState], None]] = {}
+        self._remote_exploration_subscription_id: Optional[int] = None
         self._next_exploration_subscription_id = 1
         self._external_exploration_request: Optional[ExploreAreaRequest] = None
         self._external_exploration_started_at_monotonic: Optional[float] = None
@@ -579,20 +784,285 @@ class PlatformGeometryRuntime:
         self._external_geometry_session_mode: Optional[str] = None
         self.providers = PlatformGeometryProviderBundle(self)
 
+    def _ensure_subscription_delivery_state(self) -> threading.Condition:
+        """Lazily support tests and compatibility shims built via object.__new__."""
+
+        condition = getattr(self, "_subscription_delivery_condition", None)
+        if condition is not None:
+            return condition
+        bootstrap_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            getattr(self, "_runtime_state_lock", threading.RLock()),
+        )
+        with bootstrap_lock:
+            condition = getattr(
+                self,
+                "_subscription_delivery_condition",
+                None,
+            )
+            if condition is None:
+                condition = threading.Condition()
+                self._subscription_delivery_condition = condition
+                self._subscription_delivery_tickets = {}
+                self._next_subscription_delivery_ticket_id = 1
+        return condition
+
+    def _new_subscription_delivery_ticket(
+        self,
+        *,
+        kind: str,
+        subscription_id: Optional[int],
+        callback: Callable[..., object],
+        provider: Optional[object],
+        provider_generation: Optional[int] = None,
+    ) -> _SubscriptionDeliveryTicket:
+        condition = self._ensure_subscription_delivery_state()
+        with condition:
+            ticket_id = int(self._next_subscription_delivery_ticket_id)
+            self._next_subscription_delivery_ticket_id = ticket_id + 1
+            ticket = _SubscriptionDeliveryTicket(
+                ticket_id=ticket_id,
+                kind=str(kind),
+                subscription_id=(
+                    int(subscription_id)
+                    if subscription_id is not None
+                    else None
+                ),
+                callback=callback,
+                provider=provider,
+                provider_generation=(
+                    provider_generation
+                    if provider_generation is not None
+                    else (
+                        _remote_connection_generation(provider)
+                        if provider is not None
+                        else None
+                    )
+                ),
+            )
+            self._subscription_delivery_tickets[ticket_id] = ticket
+            return ticket
+
+    def _publish_subscription_delivery_ticket(
+        self,
+        ticket: _SubscriptionDeliveryTicket,
+        *,
+        subscription_id: Optional[int] = None,
+    ) -> bool:
+        condition = self._ensure_subscription_delivery_state()
+        with condition:
+            if (
+                ticket.invalidated
+                or self._subscription_delivery_tickets.get(ticket.ticket_id)
+                is not ticket
+            ):
+                return False
+            if subscription_id is not None:
+                ticket.subscription_id = int(subscription_id)
+            ticket.published = True
+            condition.notify_all()
+            return True
+
+    def _invalidate_subscription_delivery_tickets_locked(
+        self,
+        *,
+        kind: Optional[str] = None,
+        subscription_id: Optional[int] = None,
+        provider: object = _ANY_DELIVERY_OWNER,
+    ) -> Tuple[_SubscriptionDeliveryTicket, ...]:
+        """Invalidate matching tickets while the caller owns runtime locks."""
+
+        condition = self._ensure_subscription_delivery_state()
+        invalidated = []
+        with condition:
+            for ticket_id, ticket in tuple(
+                self._subscription_delivery_tickets.items()
+            ):
+                if kind is not None and ticket.kind != kind:
+                    continue
+                if (
+                    subscription_id is not None
+                    and ticket.subscription_id != int(subscription_id)
+                ):
+                    continue
+                if provider is not _ANY_DELIVERY_OWNER and ticket.provider is not provider:
+                    continue
+                ticket.invalidated = True
+                ticket.published = False
+                self._subscription_delivery_tickets.pop(ticket_id, None)
+                invalidated.append(ticket)
+            condition.notify_all()
+        return tuple(invalidated)
+
+    def _subscription_delivery_identity_is_current_locked(
+        self,
+        ticket: _SubscriptionDeliveryTicket,
+    ) -> bool:
+        if bool(getattr(self, "_provider_attach_stopping", False)):
+            return False
+        if (
+            ticket.provider is not None
+            and getattr(self, "_remote_provider", None) is not ticket.provider
+        ):
+            return False
+        if (
+            ticket.provider is not None
+            and _remote_connection_generation(ticket.provider)
+            != ticket.provider_generation
+        ):
+            return False
+        subscription_id = ticket.subscription_id
+        if ticket.kind == "navigation":
+            if subscription_id is None:
+                return True
+            with self._runtime_state_lock:
+                return bool(
+                    self._navigation_update_subscribers.get(subscription_id)
+                    is ticket.callback
+                )
+        if ticket.kind == "exploration":
+            if subscription_id is None:
+                return True
+            with self._exploration_loop_lock:
+                return bool(
+                    self._exploration_update_subscribers.get(subscription_id)
+                    is ticket.callback
+                )
+        if ticket.kind == "exploration_source":
+            if subscription_id is None:
+                return False
+            with self._exploration_loop_lock:
+                return bool(
+                    self._remote_exploration_subscription_id
+                    == subscription_id
+                    and self._exploration_update_subscribers
+                )
+        if subscription_id is None:
+            return True
+        if ticket.kind == "localization":
+            return bool(
+                self._localization_update_subscribers.get(subscription_id)
+                is ticket.callback
+            )
+        if ticket.kind == "map":
+            return bool(
+                self._map_update_subscribers.get(subscription_id)
+                is ticket.callback
+            )
+        return False
+
+    def _begin_subscription_delivery(
+        self,
+        ticket: _SubscriptionDeliveryTicket,
+    ) -> bool:
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        condition = self._ensure_subscription_delivery_state()
+        with provider_attach_lock:
+            if not self._subscription_delivery_identity_is_current_locked(
+                ticket
+            ):
+                return False
+            with condition:
+                if (
+                    ticket.invalidated
+                    or not ticket.published
+                    or self._subscription_delivery_tickets.get(
+                        ticket.ticket_id
+                    )
+                    is not ticket
+                ):
+                    return False
+                thread_id = threading.get_ident()
+                ticket.active_count += 1
+                ticket.active_threads[thread_id] = (
+                    ticket.active_threads.get(thread_id, 0) + 1
+                )
+                return True
+
+    def _finish_subscription_delivery(
+        self,
+        ticket: _SubscriptionDeliveryTicket,
+    ) -> None:
+        condition = self._ensure_subscription_delivery_state()
+        thread_id = threading.get_ident()
+        with condition:
+            ticket.active_count = max(0, ticket.active_count - 1)
+            thread_count = ticket.active_threads.get(thread_id, 0)
+            if thread_count <= 1:
+                ticket.active_threads.pop(thread_id, None)
+            else:
+                ticket.active_threads[thread_id] = thread_count - 1
+            condition.notify_all()
+
+    def _retire_subscription_delivery_ticket(
+        self,
+        ticket: _SubscriptionDeliveryTicket,
+    ) -> None:
+        condition = self._ensure_subscription_delivery_state()
+        with condition:
+            ticket.invalidated = True
+            ticket.published = False
+            if (
+                self._subscription_delivery_tickets.get(ticket.ticket_id)
+                is ticket
+            ):
+                self._subscription_delivery_tickets.pop(ticket.ticket_id, None)
+            condition.notify_all()
+
+    def _invoke_subscription_delivery(
+        self,
+        ticket: _SubscriptionDeliveryTicket,
+        *args,
+        retire: bool = False,
+        **kwargs,
+    ):
+        started = self._begin_subscription_delivery(ticket)
+        if not started:
+            if retire:
+                self._retire_subscription_delivery_ticket(ticket)
+            return None
+        try:
+            return ticket.callback(*args, **kwargs)
+        finally:
+            self._finish_subscription_delivery(ticket)
+            if retire:
+                self._retire_subscription_delivery_ticket(ticket)
+
+    def _wait_for_subscription_deliveries(
+        self,
+        tickets: Tuple[_SubscriptionDeliveryTicket, ...],
+    ) -> None:
+        if not tickets:
+            return
+        condition = self._ensure_subscription_delivery_state()
+        current_thread_id = threading.get_ident()
+        with condition:
+            while any(
+                ticket.active_count
+                > ticket.active_threads.get(current_thread_id, 0)
+                for ticket in tickets
+            ):
+                condition.wait()
+
     def start(self) -> None:
         """启动平台几何运行时。"""
 
         with self._runtime_state_lock:
             if self._runtime_started:
                 return
+            self._provider_attach_epoch += 1
+            self._provider_attach_stopping = False
             self._runtime_started = True
             self._runtime_stop_event.clear()
             self._runtime_diagnostics = []
             self._managed_processes = {}
             self._nav2_launch_attempted = False
             self._map_stream_tracker = {}
-            with self._observer_occupancy_lock:
-                self._observer_occupancy_snapshot = {}
         if not self._is_geometry_profile_enabled():
             self._set_runtime_state("disabled", "平台几何运行时或几何 profile 已禁用。")
             return
@@ -604,12 +1074,12 @@ class PlatformGeometryRuntime:
                 self._set_runtime_state("failed", message, blocked=True)
                 # Phase 3 目标态：不再 raise，平台几何运行时失败交由 monitor 与 web 仪表呈现。
                 return
-            self._set_runtime_state("starting_external", "正在启动 nuwax-geometry-runtime 子进程并建立 gRPC 连接。")
+            self._set_runtime_state("starting_external", "正在挂接 canonical nuwax-geometry-runtime 并建立 gRPC 连接。")
             self._start_geometry_runtime_subprocess()
             self._ensure_external_geometry_observers_started()
             self._set_runtime_state(
                 "starting_external",
-                "nuwax-geometry-runtime 子进程已启动，等待 gRPC HealthCheck/READY 与 LCM 通道。",
+                "已挂接 canonical nuwax-geometry-runtime，等待 gRPC HealthCheck/READY 与 LCM 通道。",
             )
             self._start_monitor_thread()
         except Exception as exc:
@@ -639,11 +1109,17 @@ class PlatformGeometryRuntime:
         if provider is None:
             return None
         connected = getattr(provider, "is_connected", None)
-        if callable(connected) and not bool(connected()):
+        if callable(connected):
+            connected = connected()
+        if not bool(connected):
             return None
         return provider
 
-    def notify_cmd_vel_sink_ready(self, ready: bool) -> None:
+    def notify_cmd_vel_sink_ready(
+        self,
+        ready: bool,
+        generation: Optional[int] = None,
+    ) -> None:
         """Rework-17:把 sink ready 状态跨进程写回 Rust handle（best-effort）。
 
         内部通过当前 `_remote_provider` 调 `SetCmdVelSinkReady` gRPC RPC。
@@ -654,14 +1130,39 @@ class PlatformGeometryRuntime:
         provider = self.get_geometry_runtime_provider()
         if provider is None:
             return
+        generation_value = int(generation or 0)
+        if ready and generation_value <= 0:
+            self._record_runtime_diagnostic(
+                "geometry_cmd_vel_sink_ready",
+                ValueError("ready=true requires a positive motion sink generation"),
+            )
+            return
+        if generation_value <= 0:
+            generation_value = 1
         try:
-            provider.notify_cmd_vel_sink_ready(bool(ready))
+            provider.notify_cmd_vel_sink_ready(
+                bool(ready),
+                generation=generation_value,
+            )
         except Exception as exc:  # noqa: BLE001
             self._record_runtime_diagnostic("geometry_cmd_vel_sink_ready", exc)
 
     def stop(self) -> None:
         """停止平台几何运行时。"""
 
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        delivery_tickets = ()
+        with provider_attach_lock:
+            with self._runtime_state_lock:
+                self._provider_attach_epoch += 1
+                self._provider_attach_stopping = True
+                delivery_tickets = (
+                    self._invalidate_subscription_delivery_tickets_locked()
+                )
         self._set_runtime_state("stopping", "正在停止平台几何侧车进程。")
         self._runtime_stop_event.set()
         # Phase 3 目标态：cmd_vel 桥已下线，平台内建速度桥不再启动/停止
@@ -676,6 +1177,7 @@ class PlatformGeometryRuntime:
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         self._stop_managed_processes()
+        self._wait_for_subscription_deliveries(delivery_tickets)
         self._live_geometry_start_attempted = False
         with self._runtime_state_lock:
             self._runtime_started = False
@@ -806,24 +1308,49 @@ class PlatformGeometryRuntime:
         return self._default_external_exploration_database_path()
 
     def plan_external_exploration(self, request: ExploreAreaRequest) -> Dict[str, object]:
-        """返回即将执行的 launch_rtabmap.sh --explore 命令与版本目录下的 .db 路径。"""
+        """返回无副作用的 geometry-runtime gRPC 探索计划。"""
 
-        command = self._build_external_exploration_command(request)
-        db_path = self._extract_external_exploration_database_path(command)
-        version_id = self.get_exploration_pinned_version_id()
+        stop_conditions = dict(request.stop_conditions or {})
+        request_metadata = dict(request.metadata or {})
+        active_version = getattr(self, "_active_map_version", None)
+        version_id = str(
+            request_metadata.get("map_version_id")
+            or (active_version.version_id if active_version is not None else "")
+        ).strip() or None
         return {
-            "exploration_launch_mode": "explore",
-            "exploration_script": str(self._external_script_path()),
-            "exploration_command": command,
-            "exploration_database_path": db_path,
+            "exploration_launch_mode": "nuwax_geometry_runtime",
+            "exploration_transport": "grpc",
+            "exploration_script": None,
+            "exploration_command": None,
+            "exploration_database_path": None,
             "exploration_version_id": version_id,
+            "request_id": request.request_id,
+            "strategy": str(request.strategy or "wavefront"),
+            "arbitration": str(
+                request_metadata.get("arbitration")
+                or stop_conditions.get("arbitration")
+                or "prefer_wavefront"
+            ),
         }
 
     def get_exploration_pinned_version_id(self) -> Optional[str]:
         """返回当前探索会话绑定的 mapver_*，保存版本时应写入同一路径。"""
 
+        context = getattr(self, "_mapping_session_context", None)
+        if isinstance(context, dict):
+            version_id = str(context.get("map_version_id") or "").strip()
+            if version_id:
+                return version_id
         with self._exploration_loop_lock:
             return str(self._external_exploration_version_id or "").strip() or None
+
+    def get_mapping_session_context(self) -> Optional[Dict[str, object]]:
+        lock = getattr(self, "_mapping_lifecycle_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            context = getattr(self, "_mapping_session_context", None)
+            return self._clone_metadata(context) if isinstance(context, dict) else None
 
     def clear_exploration_pinned_version_context(self) -> None:
         with self._exploration_loop_lock:
@@ -977,15 +1504,15 @@ class PlatformGeometryRuntime:
                 errors.append("nuwax-geometry-runtime 二进制不可执行 %s" % binary_path)
         else:
             LOGGER.info(
-                "nuwax-geometry-runtime binary 未配置（NUWAX_GEOMETRY_RUNTIME_BINARY），"
-                "依赖 GeometryRuntimeSubprocess 默认路径解析。"
+                "nuwax-geometry-runtime binary 未配置（NUWAX_GEOMETRY_RUNTIME_BINARY）；"
+                "Python 只挂接由 scripts/systemd/start_geometry_runtime.sh 管理的进程。"
             )
         runtime_port = int(
             getattr(self.config, "runtime_port", 0)
             or getattr(self.config.external, "port", 0)
             or 0
         )
-        # 仅当显式配置了非零端口时主动探测端口空闲；attach 模式下 Subprocess 自行处理端口复用。
+        # 仅当显式配置了非零端口时探测；Python 后续只 attach，不拥有端口进程。
         if runtime_port > 0:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -993,8 +1520,8 @@ class PlatformGeometryRuntime:
                     connect_result = sock.connect_ex(("127.0.0.1", runtime_port))
                     if connect_result == 0:
                         LOGGER.info(
-                            "nuwax-geometry-runtime gRPC 端口 %s 已被占用，"
-                            "尝试 attach 现有子进程；attach 失败将自动 spawn 新实例。",
+                            "nuwax-geometry-runtime gRPC 端口 %s 已监听，"
+                            "将 attach canonical runtime；attach 失败时 fail-closed。",
                             runtime_port,
                         )
             except OSError as exc:
@@ -1122,62 +1649,535 @@ class PlatformGeometryRuntime:
         if self._geometry_runtime_subprocess is not None:
             self._geometry_runtime_subprocess.stop()
             self._geometry_runtime_subprocess = None
-        if self._remote_provider is not None:
-            self._remote_provider.disconnect()
-            self._remote_provider = None
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        delivery_tickets = ()
+        navigation_subscription_ids = ()
+        exploration_subscription_id = None
+        with provider_attach_lock:
+            with self._exploration_loop_lock:
+                remote_provider = self._remote_provider
+                if remote_provider is not None:
+                    delivery_tickets = (
+                        self._invalidate_subscription_delivery_tickets_locked(
+                            provider=remote_provider,
+                        )
+                    )
+                self._remote_provider = None
+                exploration_subscription_id = (
+                    self._remote_exploration_subscription_id
+                )
+                self._remote_exploration_subscription_id = None
+            with self._runtime_state_lock:
+                navigation_subscription_ids = tuple(
+                    self._remote_navigation_subscription_ids.values()
+                )
+                self._remote_navigation_subscription_ids = {}
+            stream_handles = tuple(
+                self._remote_localization_subscription_handles.values()
+            ) + tuple(self._remote_map_subscription_handles.values())
+            self._remote_localization_subscription_handles = {}
+            self._remote_map_subscription_handles = {}
+        if remote_provider is not None:
+            if exploration_subscription_id is not None:
+                try:
+                    remote_provider.unsubscribe_exploration_updates(
+                        exploration_subscription_id
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "停止 geometry exploration subscription 失败。"
+                    )
+            for subscription_id in reversed(navigation_subscription_ids):
+                try:
+                    remote_provider.unsubscribe_navigation_updates(
+                        subscription_id
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "停止 geometry navigation subscription=%s 失败。",
+                        subscription_id,
+                    )
+        for handle in stream_handles:
+            _cancel_remote_stream_handle(
+                handle,
+                stream_name="geometry data",
+            )
+        self._wait_for_subscription_deliveries(delivery_tickets)
+        if remote_provider is not None:
+            remote_provider.disconnect()
 
     def _start_geometry_runtime_subprocess(self) -> None:
-        """启动 Rust nuwax-ros-bridge 子进程并建立 gRPC 连接。
+        """挂接 canonical Rust geometry runtime 并建立 gRPC 连接。
 
-        zombie 自愈：
-        - 上一次启动可能在 attach 路径下成功，但端口/RPC 健康检查随后失败。
-        - 这种状态下 `bridge.is_running` 已为 False 但 `bridge._started` 仍为 True，
-          直接 `bridge.start()` 仍会 short-circuit；新一次启动会永远拉不起新 bridge，
-          客户端 GetFrameTree/GetCurrentPose 持续 UNAVAILABLE。
-        - 入口处先 zombie 检测：subprocess 存在但 is_running=False → 主动 stop+清空，
-          强制走完整 spawn 路径（参见 grpc-attach-zombie-bridge-2026-06-27）。
+        兼容旧方法名，但本方法不创建进程。进程唯一 owner 是
+        ``scripts/systemd/start_geometry_runtime.sh``；失联时清理本地 handle 并
+        fail-closed，等待外部 owner 恢复。
         """
         if self._geometry_runtime_subprocess is not None:
             if self._geometry_runtime_subprocess.is_running:
+                current_provider = self.get_geometry_runtime_provider()
+                if current_provider is not None:
+                    return
+                if self._attach_geometry_runtime_provider(
+                    self._geometry_runtime_subprocess
+                ):
+                    return
+                LOGGER.warning("已有 geometry sidecar 存活，但 gRPC provider 重新连接失败。")
                 return
-            LOGGER.warning(
-                "Rust ros-bridge 子进程状态僵死，主动 stop+清空以重新 spawn"
-            )
+            LOGGER.warning("canonical geometry runtime 已失联，清理 Python attach handle")
             try:
                 self._geometry_runtime_subprocess.stop()
             except Exception as exc:
                 LOGGER.warning("zombie bridge.stop 失败（不影响主流程）: %s", exc)
             self._geometry_runtime_subprocess = None
-        bridge = GeometryRuntimeSubprocess()
+        bridge = GeometryRuntimeSubprocess(
+            binary_path=str(getattr(self.config, "runtime_binary", "") or "") or None,
+            port=max(1, int(getattr(self.config, "runtime_port", 50051) or 50051)),
+        )
         if not bridge.start():
-            LOGGER.warning("Rust ros-bridge 子进程启动失败: %s", bridge.last_error)
-            self._record_runtime_diagnostic("geometry_runtime_start", bridge.last_error or "启动失败")
-            # attach 验活失败但 spawn 也失败的场景：bridge.start() 内部已清状态，这里
-            # 仅记录诊断；下一次 _start_geometry_runtime_subprocess 调用可再次尝试 spawn。
+            LOGGER.warning("canonical geometry runtime 挂接失败: %s", bridge.last_error)
+            self._record_runtime_diagnostic("geometry_runtime_attach", bridge.last_error or "挂接失败")
             if bridge.is_running is False and getattr(bridge, "_attached", False):
-                LOGGER.warning("bridge.attach 残留状态异常，主动清空避免下次 short-circuit")
+                LOGGER.warning("bridge.attach 残留状态异常，主动清空本地 handle")
                 try:
                     bridge.disconnect()
                 except Exception:  # pragma: no cover
                     pass
             return
         self._geometry_runtime_subprocess = bridge
-        provider = GeometryRuntimeProvider(bridge)
-        if provider.connect():
-            self._remote_provider = provider
-            LOGGER.info("Rust ros-bridge gRPC 连接已建立")
+        self._attach_geometry_runtime_provider(bridge)
+
+    def _rollback_geometry_runtime_provider_attach(
+        self,
+        provider,
+        *,
+        navigation_subscription_ids=(),
+        exploration_subscription_id=None,
+        stream_handles=(),
+    ) -> None:
+        """Best-effort rollback for a prepared or partially committed provider."""
+
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        delivery_tickets = ()
+        try:
+            with provider_attach_lock:
+                with self._exploration_loop_lock:
+                    delivery_tickets = (
+                        self._invalidate_subscription_delivery_tickets_locked(
+                            provider=provider,
+                        )
+                    )
+                    if self._remote_provider is provider:
+                        self._remote_provider = None
+                        self._remote_exploration_subscription_id = None
+                        self._remote_localization_subscription_handles = {}
+                        self._remote_map_subscription_handles = {}
+                        with self._runtime_state_lock:
+                            self._remote_navigation_subscription_ids = {}
+        except Exception:
+            LOGGER.exception("回滚 geometry provider owner 引用失败，继续强制断连。")
+
+        if exploration_subscription_id is not None:
+            try:
+                unsubscribe = getattr(
+                    provider,
+                    "unsubscribe_exploration_updates",
+                    None,
+                )
+                if callable(unsubscribe):
+                    unsubscribe(exploration_subscription_id)
+            except Exception:
+                LOGGER.exception("回滚 geometry exploration subscription 失败。")
+        for subscription_id in reversed(tuple(navigation_subscription_ids or ())):
+            try:
+                unsubscribe = getattr(
+                    provider,
+                    "unsubscribe_navigation_updates",
+                    None,
+                )
+                if callable(unsubscribe):
+                    unsubscribe(subscription_id)
+            except Exception:
+                LOGGER.exception(
+                    "回滚 geometry navigation subscription=%s 失败。",
+                    subscription_id,
+                )
+        for handle in reversed(tuple(stream_handles or ())):
+            _cancel_remote_stream_handle(
+                handle,
+                stream_name="geometry attach rollback",
+            )
+        self._wait_for_subscription_deliveries(delivery_tickets)
+
+        try:
+            provider.disconnect()
+            return
+        except Exception:
+            LOGGER.exception("geometry provider disconnect 回滚失败，强制清理 channel。")
+
+        channel = getattr(provider, "_channel", None)
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                LOGGER.exception("强制关闭 geometry provider channel 失败。")
+        for name, value in (
+            ("_channel", None),
+            ("_stub", None),
+            ("_connected", False),
+            ("_stopping", True),
+        ):
+            try:
+                setattr(provider, name, value)
+            except Exception:
+                LOGGER.exception("强制清理 geometry provider.%s 失败。", name)
+
+    def _attach_geometry_runtime_provider(
+        self,
+        bridge: GeometryRuntimeSubprocess,
+    ) -> bool:
+        """为已由 canonical owner 启动的 sidecar 建立 provider 与流订阅。"""
+
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        with provider_attach_lock:
+            with self._runtime_state_lock:
+                if (
+                    bool(getattr(self, "_provider_attach_stopping", False))
+                    or (
+                        hasattr(self, "_runtime_started")
+                        and not self._runtime_started
+                    )
+                ):
+                    return False
+                attach_epoch = int(
+                    getattr(self, "_provider_attach_epoch", 0)
+                ) + 1
+                self._provider_attach_epoch = attach_epoch
+                navigation_subscribers = tuple(
+                    self._navigation_update_subscribers.items()
+                )
+                previous_navigation_ids = tuple(
+                    self._remote_navigation_subscription_ids.values()
+                )
+                previous_stream_handles = tuple(
+                    getattr(
+                        self,
+                        "_remote_localization_subscription_handles",
+                        {},
+                    ).values()
+                ) + tuple(
+                    getattr(
+                        self,
+                        "_remote_map_subscription_handles",
+                        {},
+                    ).values()
+                )
+            with self._exploration_loop_lock:
+                previous_provider = self._remote_provider
+                previous_exploration_id = (
+                    self._remote_exploration_subscription_id
+                )
+                needs_exploration_subscription = bool(
+                    self._exploration_update_subscribers
+                )
+            localization_registry = getattr(
+                self,
+                "_localization_update_subscribers",
+                {},
+            )
+            map_registry = getattr(self, "_map_update_subscribers", {})
+            localization_subscribers = (
+                tuple(localization_registry.items())
+                if localization_registry
+                else tuple(
+                    (None, callback)
+                    for callback in self._pending_localization_callbacks
+                )
+            )
+            map_subscribers = (
+                tuple(map_registry.items())
+                if map_registry
+                else tuple(
+                    (None, callback)
+                    for callback in self._pending_map_callbacks
+                )
+            )
+
+        provider = None
+        committed = False
+        staged_navigation_ids = {}
+        staged_exploration_id = None
+        staged_localization_handles = {}
+        staged_map_handles = {}
+        staged_stream_handles = []
+
+        def attach_is_current() -> bool:
+            with self._runtime_state_lock:
+                return bool(
+                    int(getattr(self, "_provider_attach_epoch", 0))
+                    == attach_epoch
+                    and not bool(
+                        getattr(self, "_provider_attach_stopping", False)
+                    )
+                    and (
+                        not hasattr(self, "_runtime_started")
+                        or self._runtime_started
+                    )
+                )
+
+        def only_while_published(
+            callback,
+            *,
+            kind=None,
+            subscription_id=None,
+        ):
+            ticket = self._new_subscription_delivery_ticket(
+                kind=str(kind or ""),
+                subscription_id=subscription_id,
+                callback=callback,
+                provider=provider,
+            )
+
+            def guarded(*args, **kwargs):
+                return self._invoke_subscription_delivery(
+                    ticket,
+                    *args,
+                    **kwargs,
+                )
+
+            return guarded, ticket
+
+        try:
+            provider = GeometryRuntimeProvider(bridge)
+            if not provider.connect():
+                LOGGER.warning(
+                    "Rust geometry runtime gRPC 连接失败，等待 canonical owner 恢复"
+                )
+                if (
+                    self._geometry_runtime_subprocess is not None
+                    and not self._geometry_runtime_subprocess.is_running
+                ):
+                    LOGGER.warning("bridge 已被 disconnect 清空，下一次入口重新 attach")
+                    self._geometry_runtime_subprocess = None
+                return False
+
+            with provider_attach_lock:
+                if not attach_is_current():
+                    return False
+
             self._inject_static_extrinsics(provider)
-            for cb in self._pending_localization_callbacks:
-                self._remote_provider.subscribe_pose(cb)
-            for cb in self._pending_map_callbacks:
-                self._remote_provider.subscribe_map_updates(cb)
-        else:
-            LOGGER.warning("Rust ros-bridge gRPC 连接失败，子进程仍在运行")
-            # connect() 内部已调 bridge.disconnect() 清状态；下一次
-            # _start_geometry_runtime_subprocess 会 zombie 自愈重 spawn。
-            if self._geometry_runtime_subprocess is not None and not self._geometry_runtime_subprocess.is_running:
-                LOGGER.warning("bridge 已被 disconnect 清空，提前置 None 让下次入口重 spawn")
-                self._geometry_runtime_subprocess = None
+            for subscription_id, callback in localization_subscribers:
+                guarded, ticket = only_while_published(
+                    callback,
+                    kind="localization",
+                    subscription_id=subscription_id,
+                )
+                handle = provider.subscribe_pose(
+                    guarded
+                )
+                if handle is None:
+                    raise RuntimeError("pose subscription preparation failed")
+                self._publish_subscription_delivery_ticket(ticket)
+                staged_stream_handles.append(handle)
+                if subscription_id is not None:
+                    staged_localization_handles[subscription_id] = handle
+            for subscription_id, callback in map_subscribers:
+                guarded, ticket = only_while_published(
+                    callback,
+                    kind="map",
+                    subscription_id=subscription_id,
+                )
+                handle = provider.subscribe_map_updates(
+                    guarded
+                )
+                if handle is None:
+                    raise RuntimeError("map subscription preparation failed")
+                self._publish_subscription_delivery_ticket(ticket)
+                staged_stream_handles.append(handle)
+                if subscription_id is not None:
+                    staged_map_handles[subscription_id] = handle
+            for subscription_id, callback in navigation_subscribers:
+                guarded, ticket = only_while_published(
+                    callback,
+                    kind="navigation",
+                    subscription_id=subscription_id,
+                )
+                remote_subscription_id = provider.subscribe_navigation_updates(
+                    guarded
+                )
+                if remote_subscription_id is None:
+                    raise RuntimeError(
+                        "navigation subscription preparation failed"
+                    )
+                self._publish_subscription_delivery_ticket(ticket)
+                staged_navigation_ids[subscription_id] = int(
+                    remote_subscription_id
+                )
+            if needs_exploration_subscription:
+                remote_token = (
+                    provider,
+                    _remote_connection_generation(provider),
+                )
+                def deliver_exploration_source(
+                    payload,
+                    token=remote_token,
+                ):
+                    return self._handle_remote_exploration_update(
+                        payload,
+                        remote_token=token,
+                    )
+
+                source_ticket = self._new_subscription_delivery_ticket(
+                    kind="exploration_source",
+                    subscription_id=None,
+                    callback=deliver_exploration_source,
+                    provider=provider,
+                )
+                staged_exploration_id = provider.subscribe_exploration_updates(
+                    lambda payload: self._invoke_subscription_delivery(
+                        source_ticket,
+                        payload,
+                    )
+                )
+                if staged_exploration_id is None:
+                    raise RuntimeError(
+                        "exploration subscription preparation failed"
+                    )
+                staged_exploration_id = int(staged_exploration_id)
+                self._publish_subscription_delivery_ticket(
+                    source_ticket,
+                    subscription_id=staged_exploration_id,
+                )
+
+            with provider_attach_lock:
+                with self._runtime_state_lock:
+                    subscriptions_unchanged = tuple(
+                        self._navigation_update_subscribers.items()
+                    ) == navigation_subscribers
+                with self._exploration_loop_lock:
+                    owner_unchanged = self._remote_provider is previous_provider
+                    exploration_need_unchanged = bool(
+                        self._exploration_update_subscribers
+                    ) == needs_exploration_subscription
+                current_localization_registry = getattr(
+                    self,
+                    "_localization_update_subscribers",
+                    {},
+                )
+                current_map_registry = getattr(
+                    self,
+                    "_map_update_subscribers",
+                    {},
+                )
+                callbacks_unchanged = bool(
+                    (
+                        tuple(current_localization_registry.items())
+                        == localization_subscribers
+                        if localization_registry
+                        else tuple(self._pending_localization_callbacks)
+                        == tuple(
+                            callback
+                            for _, callback in localization_subscribers
+                        )
+                    )
+                    and (
+                        tuple(current_map_registry.items()) == map_subscribers
+                        if map_registry
+                        else tuple(self._pending_map_callbacks)
+                        == tuple(callback for _, callback in map_subscribers)
+                    )
+                )
+                if not (
+                    attach_is_current()
+                    and _remote_is_connected(provider)
+                    and owner_unchanged
+                    and subscriptions_unchanged
+                    and exploration_need_unchanged
+                    and callbacks_unchanged
+                ):
+                    return False
+
+                with self._exploration_loop_lock:
+                    self._remote_provider = provider
+                    self._remote_exploration_subscription_id = (
+                        staged_exploration_id
+                    )
+                    with self._runtime_state_lock:
+                        self._remote_navigation_subscription_ids = dict(
+                            staged_navigation_ids
+                        )
+                    self._remote_localization_subscription_handles = dict(
+                        staged_localization_handles
+                    )
+                    self._remote_map_subscription_handles = dict(
+                        staged_map_handles
+                    )
+                committed = True
+
+            if previous_provider is not None:
+                self._rollback_geometry_runtime_provider_attach(
+                    previous_provider,
+                    navigation_subscription_ids=previous_navigation_ids,
+                    exploration_subscription_id=previous_exploration_id,
+                    stream_handles=previous_stream_handles,
+                )
+            LOGGER.info("Rust ros-bridge gRPC 连接已建立")
+            return True
+        except Exception:
+            LOGGER.exception("geometry provider attach prepare/commit 失败。")
+            return False
+        finally:
+            if provider is not None and not committed:
+                try:
+                    self._rollback_geometry_runtime_provider_attach(
+                        provider,
+                        navigation_subscription_ids=tuple(
+                            staged_navigation_ids.values()
+                        ),
+                        exploration_subscription_id=staged_exploration_id,
+                        stream_handles=tuple(staged_stream_handles),
+                    )
+                except Exception:
+                    LOGGER.exception("geometry provider attach rollback helper 异常。")
+                    try:
+                        with provider_attach_lock:
+                            with self._exploration_loop_lock:
+                                if self._remote_provider is provider:
+                                    self._remote_provider = None
+                                    self._remote_exploration_subscription_id = None
+                                    self._remote_localization_subscription_handles = {}
+                                    self._remote_map_subscription_handles = {}
+                                    with self._runtime_state_lock:
+                                        self._remote_navigation_subscription_ids = {}
+                    except Exception:
+                        LOGGER.exception("强制清除半提交 geometry provider owner 失败。")
+                    channel = getattr(provider, "_channel", None)
+                    if channel is not None:
+                        try:
+                            channel.close()
+                        except Exception:
+                            pass
+                    for name, value in (
+                        ("_channel", None),
+                        ("_stub", None),
+                        ("_connected", False),
+                    ):
+                        try:
+                            setattr(provider, name, value)
+                        except Exception:
+                            pass
 
     def _inject_static_extrinsics(self, provider: "GeometryRuntimeProvider") -> None:
         """装配期：从机器人 CalibrationProvider 取静态外参拓扑，缓存进 GeometryRuntimeProvider。
@@ -1863,7 +2863,12 @@ class PlatformGeometryRuntime:
             "tf_localization_provider": self._geometry_runtime_status_stub("tf_localization_provider"),
             "diagnostics": diagnostics,
             "mapping_stack": {
-                "script": str(self._geometry_script("start_nuwax_geometry_runtime.sh")),
+                "script": str(
+                    self._repo_root()
+                    / "scripts"
+                    / "systemd"
+                    / "start_geometry_runtime.sh"
+                ),
                 "starts_rtabmap_or_nav2_by_default": False,
                 "message": "GO2 几何栈由共享 nuwax-geometry-runtime 承载；旧 ROS2/RTAB-Map/Nav2 启动脚本链路已删除。",
             },
@@ -1993,13 +2998,30 @@ class PlatformGeometryRuntime:
             "geometry_runtime_connected": self._geometry_runtime_handles_input_bridge(),
             **remote_status,
         }
-        # /map 占据栅格的真实状态由外部 observer 提供（Rust get_status 不含占据字段），
-        # 仅对 live_map_provider 合并 observer 快照，使其 occupancy 字段生效。
+        # live map readiness 读取 Rust mapping diagnostics；observer 不再承载地图真值。
         if provider_key == "live_map_provider":
-            with self._observer_occupancy_lock:
-                observer_snapshot = dict(self._observer_occupancy_snapshot)
-            if observer_snapshot:
-                stub.update(observer_snapshot)
+            mapping_diagnostics = None
+            if self._remote_provider is not None:
+                try:
+                    mapping_diagnostics = self._remote_provider.get_mapping_diagnostics()
+                except Exception:
+                    mapping_diagnostics = None
+            if isinstance(mapping_diagnostics, dict):
+                revision = int(
+                    mapping_diagnostics.get("last_occupancy_revision")
+                    or mapping_diagnostics.get("occupancy_revision")
+                    or 0
+                )
+                message_count = int(mapping_diagnostics.get("pointcloud_count") or 0)
+                stub.update({
+                    "occupancy_grid_ready": revision > 0,
+                    "occupancy_has_publisher": revision > 0,
+                    "occupancy_revision": revision,
+                    "occupancy_sequence": revision,
+                    "occupancy_message_count": message_count,
+                    "streaming": bool(mapping_diagnostics.get("ready")),
+                    "mapping_diagnostics": dict(mapping_diagnostics),
+                })
         if provider_key == "tf_localization_provider":
             stub = self._resolve_external_tf_localization_status(base_stub=stub)
         return stub
@@ -2044,7 +3066,6 @@ class PlatformGeometryRuntime:
         if observer is None:
             observer = ExternalGeometryDebugObserver(
                 config=self.config,
-                map_callback=self._handle_external_debug_map_update,
                 frontier_callback=self._handle_external_debug_frontier_update,
                 pose_callback=self._handle_external_debug_pose_update,
             )
@@ -2079,52 +3100,6 @@ class PlatformGeometryRuntime:
                 self._notify_exploration_update(self.get_platform_exploration_state())
             except Exception:
                 LOGGER.debug("清空非 explore 前沿缓存后通知失败。", exc_info=True)
-
-    def _handle_external_debug_map_update(self, payload: Dict[str, object]) -> None:
-        self._cache_observer_occupancy_snapshot(payload)
-        callbacks = list(self._pending_map_callbacks)
-        for callback in callbacks:
-            try:
-                callback(payload)
-            except Exception:
-                LOGGER.debug("投递外部 GO2 /map debug update 失败。", exc_info=True)
-
-    def _cache_observer_occupancy_snapshot(self, payload: Dict[str, object]) -> None:
-        """从外部 /map 观察器 payload 提取就绪元数据并缓存。
-
-        观察器 metadata 不含 `occupancy_grid_ready` / `occupancy_has_publisher`，
-        这里据 occupancy_message_count 显式合成，供 readiness 链路读取。
-        """
-        metadata = payload.get("metadata") if isinstance(payload, dict) else None
-        if not isinstance(metadata, dict):
-            return
-        message_count = int(metadata.get("occupancy_message_count") or metadata.get("message_count") or 0)
-        snapshot: Dict[str, object] = {
-            "occupancy_grid_ready": message_count > 0,
-            "occupancy_has_publisher": True,
-            "occupancy_message_count": message_count,
-            "occupancy_sequence": int(metadata.get("occupancy_sequence") or message_count),
-            "cost_map_message_count": int(metadata.get("cost_map_message_count") or 0),
-            "occupancy_topic": str(metadata.get("source_topic") or self.config.topics.occupancy_topic or "/map_obstacles"),
-            "streaming": bool(metadata.get("streaming")),
-            "known_cell_count": int(metadata.get("known_cell_count") or 0),
-        }
-        for key in (
-            "latest_occupancy_timestamp",
-            "latest_occupancy_received_at",
-            "latest_occupancy_source_timestamp",
-        ):
-            value = metadata.get(key)
-            if value is not None:
-                snapshot[key] = value
-        occupancy_metrics = metadata.get("occupancy_metrics")
-        if isinstance(occupancy_metrics, dict):
-            snapshot["occupancy_metrics"] = dict(occupancy_metrics)
-        cost_map_metrics = metadata.get("cost_map_metrics")
-        if isinstance(cost_map_metrics, dict):
-            snapshot["cost_map_metrics"] = dict(cost_map_metrics)
-        with self._observer_occupancy_lock:
-            self._observer_occupancy_snapshot = snapshot
 
     def get_external_live_pose(self, *, max_age_sec: float = 2.0) -> Optional[Pose]:
         """返回 GO2 debug observer /go2/pose_map 缓存的 map 系位姿，供 Nav2 下发目标。"""
@@ -2225,10 +3200,11 @@ class PlatformGeometryRuntime:
             "topic": "/initialpose",
             "message": (
                 "RViz 2D Pose Estimate 已下线（去 ROS2 目标态）："
-                "请通过 debug panel 或外部 debug observer 注入初始位姿，"
-                "或调用 activate_localization 走 GeometryRuntimeProvider.relocalize 路径。"
+                "当前 geometry runtime proto 未定义 relocalize/initial-pose RPC，"
+                "因此平台不会伪造已提交结果。"
             ),
             "deprecated": True,
+            "unsupported": True,
         }
 
     def _handle_external_debug_pose_update(
@@ -2243,11 +3219,34 @@ class PlatformGeometryRuntime:
             with self._external_live_pose_lock:
                 self._external_live_pose = resolved_pose.model_copy(deep=True)
                 self._external_live_pose_at_monotonic = time.monotonic()
-        callbacks = list(self._pending_localization_callbacks)
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        with provider_attach_lock:
+            deliveries = []
+            for subscription_id, callback in tuple(
+                self._localization_update_subscribers.items()
+            ):
+                ticket = self._new_subscription_delivery_ticket(
+                    kind="localization",
+                    subscription_id=subscription_id,
+                    callback=callback,
+                    provider=None,
+                )
+                self._publish_subscription_delivery_ticket(ticket)
+                deliveries.append(ticket)
         meta = dict(metadata or {})
-        for callback in callbacks:
+        for ticket in deliveries:
             try:
-                callback(resolved_pose, frame_tree, meta)
+                self._invoke_subscription_delivery(
+                    ticket,
+                    resolved_pose,
+                    frame_tree,
+                    meta,
+                    retire=True,
+                )
             except Exception:
                 LOGGER.debug("投递外部 GO2 位姿 debug update 失败。", exc_info=True)
 
@@ -2504,7 +3503,7 @@ class PlatformGeometryRuntime:
         point_cloud_status: Dict[str, object],
         point_cloud_source: Dict[str, object],
         data_plane_status: Dict[str, object],
-    ) -> tuple[Optional[str], str]:
+    ) -> Tuple[Optional[str], str]:
         live_map_error = str(live_map_status.get("last_error") or "").strip()
         if live_map_error:
             return "live_map_provider_error", "ROS2 实时地图订阅错误：%s" % live_map_error
@@ -2939,16 +3938,211 @@ class PlatformGeometryRuntime:
         return fallback_snapshot
 
     def subscribe_map_updates(self, callback) -> int:
+        if not callable(callback):
+            raise ValueError("map update callback must be callable")
+
         def wrapped_callback(payload):
             return callback(self._attach_active_map_version_to_live_map_payload(payload))
 
-        self._pending_map_callbacks.append(wrapped_callback)
-        if self._remote_provider is not None and self._remote_provider.is_connected:
-            self._remote_provider.subscribe_map_updates(wrapped_callback)
-        return 0
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        with provider_attach_lock:
+            subscription_id = self._next_map_subscription_id
+            self._next_map_subscription_id += 1
+            self._map_update_subscribers[subscription_id] = wrapped_callback
+            self._pending_map_callbacks.append(wrapped_callback)
+            provider = self._remote_provider
+            if provider is not None and bool(
+                getattr(provider, "is_connected", False)
+            ):
+                ticket = self._new_subscription_delivery_ticket(
+                    kind="map",
+                    subscription_id=subscription_id,
+                    callback=wrapped_callback,
+                    provider=provider,
+                )
+
+                def remote_callback(payload):
+                    return self._invoke_subscription_delivery(
+                        ticket,
+                        payload,
+                    )
+
+                try:
+                    handle = provider.subscribe_map_updates(remote_callback)
+                except Exception:
+                    with self._runtime_state_lock:
+                        if (
+                            self._map_update_subscribers.get(subscription_id)
+                            is wrapped_callback
+                        ):
+                            self._map_update_subscribers.pop(
+                                subscription_id,
+                                None,
+                            )
+                            self._remote_map_subscription_handles.pop(
+                                subscription_id,
+                                None,
+                            )
+                            for index in range(
+                                len(self._pending_map_callbacks) - 1,
+                                -1,
+                                -1,
+                            ):
+                                if (
+                                    self._pending_map_callbacks[index]
+                                    is wrapped_callback
+                                ):
+                                    del self._pending_map_callbacks[index]
+                                    break
+                    self._retire_subscription_delivery_ticket(ticket)
+                    raise
+                if handle is not None:
+                    self._remote_map_subscription_handles[
+                        subscription_id
+                    ] = handle
+                    self._publish_subscription_delivery_ticket(ticket)
+                else:
+                    self._retire_subscription_delivery_ticket(ticket)
+            return subscription_id
+
+    def subscribe_navigation_updates(self, callback) -> int:
+        """注册导航 push；sidecar 尚未连接时保留并在 attach 后重绑。"""
+
+        if not callable(callback):
+            raise ValueError("navigation update callback must be callable")
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        with provider_attach_lock:
+            with self._runtime_state_lock:
+                subscription_id = self._next_navigation_subscription_id
+                self._next_navigation_subscription_id += 1
+                self._navigation_update_subscribers[subscription_id] = callback
+                provider = self._remote_provider
+            if provider is not None and bool(
+                getattr(provider, "is_connected", False)
+            ):
+                ticket = self._new_subscription_delivery_ticket(
+                    kind="navigation",
+                    subscription_id=subscription_id,
+                    callback=callback,
+                    provider=provider,
+                )
+
+                def remote_callback(state):
+                    return self._invoke_subscription_delivery(
+                        ticket,
+                        state,
+                    )
+
+                try:
+                    remote_subscription_id = (
+                        provider.subscribe_navigation_updates(remote_callback)
+                    )
+                except Exception:
+                    with self._runtime_state_lock:
+                        if (
+                            self._navigation_update_subscribers.get(
+                                subscription_id
+                            )
+                            is callback
+                        ):
+                            self._navigation_update_subscribers.pop(
+                                subscription_id,
+                                None,
+                            )
+                            self._remote_navigation_subscription_ids.pop(
+                                subscription_id,
+                                None,
+                            )
+                    self._retire_subscription_delivery_ticket(ticket)
+                    raise
+                if remote_subscription_id is not None:
+                    with self._runtime_state_lock:
+                        self._remote_navigation_subscription_ids[subscription_id] = int(
+                            remote_subscription_id
+                        )
+                    self._publish_subscription_delivery_ticket(ticket)
+                else:
+                    self._retire_subscription_delivery_ticket(ticket)
+            return subscription_id
+
+    def unsubscribe_navigation_updates(self, subscription_id: int) -> bool:
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        delivery_tickets = ()
+        with provider_attach_lock:
+            with self._runtime_state_lock:
+                removed = self._navigation_update_subscribers.pop(
+                    int(subscription_id),
+                    None,
+                )
+                remote_subscription_id = self._remote_navigation_subscription_ids.pop(
+                    int(subscription_id),
+                    None,
+                )
+                provider = self._remote_provider
+                delivery_tickets = (
+                    self._invalidate_subscription_delivery_tickets_locked(
+                        kind="navigation",
+                        subscription_id=int(subscription_id),
+                    )
+                )
+        if (
+            remote_subscription_id is not None
+            and provider is not None
+            and bool(getattr(provider, "is_connected", False))
+        ):
+            try:
+                provider.unsubscribe_navigation_updates(remote_subscription_id)
+            except Exception:
+                LOGGER.exception(
+                    "取消远端 navigation subscription=%s 失败。",
+                    remote_subscription_id,
+                )
+        self._wait_for_subscription_deliveries(delivery_tickets)
+        return removed is not None
 
     def unsubscribe_map_updates(self, subscription_id: int) -> bool:
-        return True  # Rust bridge 管理订阅生命周期，无需手动注销
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        handle = None
+        delivery_tickets = ()
+        with provider_attach_lock:
+            handle = self._remote_map_subscription_handles.pop(
+                int(subscription_id),
+                None,
+            )
+            callback = self._map_update_subscribers.pop(
+                int(subscription_id),
+                None,
+            )
+            if callback is not None:
+                try:
+                    self._pending_map_callbacks.remove(callback)
+                except ValueError:
+                    pass
+            delivery_tickets = (
+                self._invalidate_subscription_delivery_tickets_locked(
+                    kind="map",
+                    subscription_id=int(subscription_id),
+                )
+            )
+        _cancel_remote_stream_handle(handle, stream_name="map update")
+        self._wait_for_subscription_deliveries(delivery_tickets)
+        return callback is not None
 
     def _attach_active_map_version_to_live_map_payload(self, payload):
         if not isinstance(payload, dict):
@@ -2964,7 +4158,11 @@ class PlatformGeometryRuntime:
             map_snapshot_kind="live_streaming",
             source_kind="platform_live_map_provider",
         ))
-        if self._legacy_exploration_placeholder_disabled.is_running:
+        mapping_context = getattr(self, "_mapping_session_context", None)
+        mapping_active = isinstance(mapping_context, dict) and bool(
+            mapping_context.get("active")
+        )
+        if self._legacy_exploration_placeholder_disabled.is_running or mapping_active:
             pass  # 探索模式下不抑制 live map（新建地图从小到大增长是正常的）
         elif (
             self._external_geometry_process_is_localization()
@@ -3436,7 +4634,7 @@ class PlatformGeometryRuntime:
             rtabmap_dir / self._external_mapping_state_asset_name(),
             rtabmap_dir / _EXTERNAL_MAPPING_STATE_ASSET_NAME,
         ]
-        seen: set[str] = set()
+        seen: Set[str] = set()
         ordered: List[Path] = []
         for candidate in candidates:
             key = str(candidate)
@@ -4395,8 +5593,6 @@ class PlatformGeometryRuntime:
                     time.sleep(3.0)
                     self._managed_processes.pop(process_name, None)
                 self._map_stream_tracker = {}
-                with self._observer_occupancy_lock:
-                    self._observer_occupancy_snapshot = {}
                 return {
                     **activation_payload,
                     "backend_switch_applied": True,
@@ -4451,8 +5647,6 @@ class PlatformGeometryRuntime:
                 )
                 time.sleep(3.0)
             self._map_stream_tracker = {}
-            with self._observer_occupancy_lock:
-                self._observer_occupancy_snapshot = {}
             command = [str(self._external_script_path()), "--localization", str(db_path)]
             if static_map_yaml_path is not None:
                 command.extend(["--map-yaml", str(static_map_yaml_path)])
@@ -4513,8 +5707,6 @@ class PlatformGeometryRuntime:
         if current_process is not None:
             current_process.stop()
         self._map_stream_tracker = {}
-        with self._observer_occupancy_lock:
-            self._observer_occupancy_snapshot = {}
         self._start_managed_process(process_name, command, self._external_log_name(), restart=restart)
         process = self._managed_processes.get(process_name)
         process_status = process.status() if process is not None else None
@@ -4641,26 +5833,14 @@ class PlatformGeometryRuntime:
         LOGGER.warning("AMCL 在 initialpose fallback 后仍未发布 TF，定位栈可能未就绪。")
 
     def _publish_initialpose_fallback(self) -> None:
-        """触发 AMCL 初始化的兜底。
+        """显式报告 relocalize 未接入，禁止把无调用方的 hasattr 分支当成功。"""
 
-        Phase 3 目标态：不再向 ROS2 ``/initialpose`` 话题发布；改由
-        ``nuwax-geometry-runtime`` 接受 relocalize 命令（LCM channel
-        ``/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped``
-        或 ``nuwax-rpc relocalize``），并写入定位栈。Python 平台层只暴露
-        ``publish_debug_initial_pose`` facade，不直接创建 ROS2 publisher。
-        """
-        provider = getattr(self, "_remote_provider", None)
-        if provider is not None and hasattr(provider, "relocalize"):
-            try:
-                provider.relocalize(pose=None, frame_id=str(self.config.frames.map_frame))
-                LOGGER.debug("已通过 GeometryRuntimeProvider.relocalize 触发 AMCL 初始化。")
-                return
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.debug("relocalize via runtime 失败，平台层不直接发 /initialpose：%s", exc)
-        LOGGER.debug(
-            "Phase 3 目标态：AMCL 初始化由 nuwax-geometry-runtime 接管，"
-            "Python 平台层不再向 /initialpose 话题发布。"
+        message = (
+            "geometry runtime proto 当前没有 Relocalize/PublishInitialPose RPC；"
+            "Python 不会用 PublishOdom 冒充初始位姿。"
         )
+        self._record_runtime_diagnostic("relocalize_unsupported", message)
+        LOGGER.warning(message)
 
     def _wait_for_geometry_snapshot(self, *, timeout_sec: float) -> Optional[MapSnapshot]:
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
@@ -4690,33 +5870,337 @@ class PlatformGeometryRuntime:
 
         if not self._is_geometry_profile_enabled():
             return None
-        self._pending_localization_callbacks.append(callback)
-        # 外部栈位姿由 ExternalGeometryDebugObserver 在 robot.start() 之后启动
-        # （见 GatewayRuntime._start_data_frame_stream_sources），此处不能提前启动 observer，
-        # 否则它会污染 Unitree SDK ChannelFactory 的 DDS 上下文，导致初始化失败。
-        if self._uses_external_geometry_stack():
-            return 0
-        if self._remote_provider is not None and self._remote_provider.is_connected:
-            self._remote_provider.subscribe_pose(callback)
-        return 0
+        if not callable(callback):
+            raise ValueError("localization update callback must be callable")
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        with provider_attach_lock:
+            subscription_id = self._next_localization_subscription_id
+            self._next_localization_subscription_id += 1
+            self._localization_update_subscribers[subscription_id] = callback
+            self._pending_localization_callbacks.append(callback)
+            # External observer owns delivery for the external stack.
+            if self._uses_external_geometry_stack():
+                return subscription_id
+            provider = self._remote_provider
+            if provider is not None and bool(
+                getattr(provider, "is_connected", False)
+            ):
+                ticket = self._new_subscription_delivery_ticket(
+                    kind="localization",
+                    subscription_id=subscription_id,
+                    callback=callback,
+                    provider=provider,
+                )
+
+                def remote_callback(*args, **kwargs):
+                    return self._invoke_subscription_delivery(
+                        ticket,
+                        *args,
+                        **kwargs,
+                    )
+
+                try:
+                    handle = provider.subscribe_pose(remote_callback)
+                except Exception:
+                    with self._runtime_state_lock:
+                        if (
+                            self._localization_update_subscribers.get(
+                                subscription_id
+                            )
+                            is callback
+                        ):
+                            self._localization_update_subscribers.pop(
+                                subscription_id,
+                                None,
+                            )
+                            self._remote_localization_subscription_handles.pop(
+                                subscription_id,
+                                None,
+                            )
+                            for index in range(
+                                len(self._pending_localization_callbacks) - 1,
+                                -1,
+                                -1,
+                            ):
+                                if (
+                                    self._pending_localization_callbacks[index]
+                                    is callback
+                                ):
+                                    del self._pending_localization_callbacks[
+                                        index
+                                    ]
+                                    break
+                    self._retire_subscription_delivery_ticket(ticket)
+                    raise
+                if handle is not None:
+                    self._remote_localization_subscription_handles[
+                        subscription_id
+                    ] = handle
+                    self._publish_subscription_delivery_ticket(ticket)
+                else:
+                    self._retire_subscription_delivery_ticket(ticket)
+            return subscription_id
 
     def unsubscribe_localization_updates(self, subscription_id: Optional[int]) -> None:
-        pass  # Rust bridge 管理订阅生命周期，无需手动注销
+        if subscription_id is None:
+            return
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        handle = None
+        delivery_tickets = ()
+        with provider_attach_lock:
+            handle = self._remote_localization_subscription_handles.pop(
+                int(subscription_id),
+                None,
+            )
+            callback = self._localization_update_subscribers.pop(
+                int(subscription_id),
+                None,
+            )
+            if callback is not None:
+                try:
+                    self._pending_localization_callbacks.remove(callback)
+                except ValueError:
+                    pass
+            delivery_tickets = (
+                self._invalidate_subscription_delivery_tickets_locked(
+                    kind="localization",
+                    subscription_id=int(subscription_id),
+                )
+            )
+        _cancel_remote_stream_handle(handle, stream_name="localization update")
+        self._wait_for_subscription_deliveries(delivery_tickets)
 
     def subscribe_exploration_updates(self, callback: Callable[[ExplorationState], None]) -> int:
-        """订阅平台探索后台 tick 产生的状态快照。"""
+        """订阅探索状态；sidecar 尚未连接时保留并在 attach 后重绑。"""
 
         if not callable(callback):
             raise ValueError("exploration update callback must be callable")
-        with self._exploration_loop_lock:
-            subscription_id = self._next_exploration_subscription_id
-            self._next_exploration_subscription_id += 1
-            self._exploration_update_subscribers[subscription_id] = callback
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        delivery_tickets = ()
+        remote_subscription_id = None
+        provider = None
+        with provider_attach_lock:
+            with self._exploration_loop_lock:
+                subscription_id = self._next_exploration_subscription_id
+                self._next_exploration_subscription_id += 1
+                self._exploration_update_subscribers[subscription_id] = callback
+                provider = self._remote_provider
+                remote_subscription_id_before = (
+                    self._remote_exploration_subscription_id
+                )
+            if provider is not None and bool(
+                getattr(provider, "is_connected", False)
+            ):
+                self._bind_remote_exploration_updates(
+                    provider,
+                    rollback_local=(
+                        subscription_id,
+                        callback,
+                        remote_subscription_id_before,
+                    ),
+                )
             return subscription_id
 
     def unsubscribe_exploration_updates(self, subscription_id: int) -> bool:
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        with provider_attach_lock:
+            with self._exploration_loop_lock:
+                removed = self._exploration_update_subscribers.pop(
+                    int(subscription_id),
+                    None,
+                )
+                if removed is None:
+                    return False
+                delivery_tickets = (
+                    self._invalidate_subscription_delivery_tickets_locked(
+                        kind="exploration",
+                        subscription_id=int(subscription_id),
+                    )
+                )
+                if self._exploration_update_subscribers:
+                    remote_subscription_id = None
+                    provider = None
+                else:
+                    remote_subscription_id = (
+                        self._remote_exploration_subscription_id
+                    )
+                    self._remote_exploration_subscription_id = None
+                    provider = self._remote_provider
+                    delivery_tickets += (
+                        self._invalidate_subscription_delivery_tickets_locked(
+                            kind="exploration_source",
+                            provider=provider,
+                        )
+                    )
+        if remote_subscription_id is not None and provider is not None:
+            try:
+                provider.unsubscribe_exploration_updates(remote_subscription_id)
+            except Exception:
+                LOGGER.exception(
+                    "取消远端 exploration subscription=%s 失败。",
+                    remote_subscription_id,
+                )
+        self._wait_for_subscription_deliveries(delivery_tickets)
+        return True
+
+    def _bind_remote_exploration_updates(
+        self,
+        provider,
+        *,
+        rollback_local=None,
+    ) -> bool:
+        """把本地 fanout 绑定到 provider 的唯一后台状态源。"""
+
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        with provider_attach_lock:
+            with self._exploration_loop_lock:
+                if (
+                    provider is not self._remote_provider
+                    or not self._exploration_update_subscribers
+                ):
+                    return False
+                if self._remote_exploration_subscription_id is not None:
+                    return True
+                remote_token = _capture_remote_operation_token_locked(
+                    self,
+                    provider,
+                )
+                if remote_token is None:
+                    return False
+                def deliver_exploration_source(
+                    payload,
+                    token=remote_token,
+                ):
+                    return self._handle_remote_exploration_update(
+                        payload,
+                        remote_token=token,
+                    )
+
+                source_ticket = self._new_subscription_delivery_ticket(
+                    kind="exploration_source",
+                    subscription_id=None,
+                    callback=deliver_exploration_source,
+                    provider=provider,
+                )
+
+                def remote_callback(payload):
+                    return self._invoke_subscription_delivery(
+                        source_ticket,
+                        payload,
+                    )
+
+                try:
+                    remote_subscription_id = (
+                        provider.subscribe_exploration_updates(remote_callback)
+                    )
+                except Exception:
+                    if rollback_local is not None:
+                        (
+                            rollback_subscription_id,
+                            rollback_callback,
+                            remote_subscription_id_before,
+                        ) = rollback_local
+                        if (
+                            self._exploration_update_subscribers.get(
+                                rollback_subscription_id
+                            )
+                            is rollback_callback
+                        ):
+                            self._exploration_update_subscribers.pop(
+                                rollback_subscription_id,
+                                None,
+                            )
+                        if (
+                            self._remote_exploration_subscription_id
+                            != remote_subscription_id_before
+                        ):
+                            self._remote_exploration_subscription_id = (
+                                remote_subscription_id_before
+                            )
+                    self._retire_subscription_delivery_ticket(source_ticket)
+                    raise
+                if remote_subscription_id is None:
+                    self._retire_subscription_delivery_ticket(source_ticket)
+                    return False
+                self._remote_exploration_subscription_id = int(
+                    remote_subscription_id
+                )
+                self._publish_subscription_delivery_ticket(
+                    source_ticket,
+                    subscription_id=int(remote_subscription_id),
+                )
+                return True
+
+    def _handle_remote_exploration_update(
+        self,
+        payload,
+        *,
+        remote_token: Optional[_RemoteOperationToken] = None,
+    ) -> None:
+        if not isinstance(payload, dict):
+            LOGGER.warning("忽略非 dict 的 geometry exploration 状态更新。")
+            return
+        try:
+            state = PlatformGeometryProviderBundle._wrap_remote_exploration_state(payload)
+        except Exception:
+            LOGGER.exception("geometry exploration 状态更新无法转换为平台契约。")
+            return
+        request_id = str(payload.get("request_id") or "").strip()
+        committed = False
         with self._exploration_loop_lock:
-            return self._exploration_update_subscribers.pop(int(subscription_id), None) is not None
+            if (
+                remote_token is not None
+                and not _remote_operation_token_is_current_locked(
+                    self,
+                    remote_token,
+                )
+            ):
+                LOGGER.info("忽略旧 geometry remote 代际的 exploration update。")
+                return
+            current = self._external_exploration_request
+            current_id = str(getattr(current, "request_id", "") or "").strip()
+            if not request_id or current_id != request_id:
+                LOGGER.info(
+                    "忽略跨 exploration request 的迟到状态 update_request_id=%s current_request_id=%s",
+                    request_id or None,
+                    current_id or None,
+                )
+                return
+            committed = _commit_remote_exploration_state_locked(
+                self,
+                state,
+                request_id=request_id,
+            )
+            if not committed:
+                LOGGER.info("忽略无法原子提交的 geometry exploration update。")
+        if committed:
+            if remote_token is not None:
+                self._notify_remote_exploration_update(
+                    state,
+                    remote_token=remote_token,
+                )
+            else:
+                self._notify_exploration_update(state)
 
     def start_platform_exploration(self, request) -> bool:
         if not self._is_geometry_profile_enabled():
@@ -4755,31 +6239,9 @@ class PlatformGeometryRuntime:
         *,
         goal: Optional[object] = None,
     ) -> bool:
-        """导航请求分发入口（5.4 task）。
+        """经当前 GeometryRuntimeProvider gRPC backend 提交导航目标。"""
 
-        完整实现路径（设计文档决策 D1/D3）：
-        1. 构造 NavigationGoal 契约对象；
-        2. 走 `NavigationProxyClient` gRPC + asyncio.Lock 串行化；
-        3. PENDING 队列上限 NAV_PROXY_PENDING_QUEUE_MAX_SIZE（默认 4）；
-        4. 状态机 PENDING → ACTIVE → (SUCCEEDED | FAILED | CANCELED)；
-        5. 并发 5 次 e2e ≤ 90s（spec §几何导航）。
-
-        临时状态（worker-B 未就绪）：
-        - 当前函数体降级到 `_resolve_navigation_backend().set_goal(goal)`；
-        - 等 worker-B 完成 `services/geometry/navigation_proxy_client.py` 后，
-          在此处替换为 gRPC client 串行锁调用；
-        - TODO:nav2_proxy_client_not_ready。
-
-        返回：
-        - True: 已接收（同步路径）/ 已入队（异步路径）；
-        - False: 几何 profile 关闭 / backend 未绑定 / 入参非法。
-        """
-
-        # TODO:nav2_proxy_client_not_ready —— worker-B 的
-        # services/geometry/navigation_proxy_client.py 完成前，此处保留为占位：
-        # 仍然调用现有 backend（Nav2ActionNavigationProvider）以保持功能不中断；
-        # worker-B 落地后切换到 NavigationProxyClient.submit() + asyncio.Lock。
-        from contracts.navigation import NavigationGoal, NavigationStatus
+        from contracts.navigation import NavigationGoal
 
         if not self._is_geometry_profile_enabled():
             return False
@@ -4808,7 +6270,7 @@ class PlatformGeometryRuntime:
             target_pose=target_pose,
             metadata={
                 "dispatch_source": "_dispatch_navigate",
-                "proxy_backend_pending": True,  # TODO:nav2_proxy_client_not_ready
+                "transport": "geometry_runtime_grpc",
             },
         )
         try:
@@ -4826,34 +6288,131 @@ class PlatformGeometryRuntime:
 
         if not self._is_geometry_profile_enabled():
             return False
+        terminal_state = None
         with self._exploration_loop_lock:
             if self._external_exploration_terminal_state is not None:
-                self._notify_exploration_update(self.get_platform_exploration_state())
-                return True
+                terminal_state = self.get_platform_exploration_state()
+        if terminal_state is not None:
+            self._notify_exploration_update(terminal_state)
+            return True
         return self._stop_platform_exploration_loop(cancel_navigation=False, notify=True)
 
-    def report_platform_exploration_hit_stop(self, reason: str) -> None:
+    def report_platform_exploration_hit_stop(self, reason: str):
+        """请求停止当前探索，但绝不合成后端尚未给出的终态。"""
+
         if not self._is_geometry_profile_enabled():
-            return
-        self._finish_external_script_exploration(
-            status=ExplorationStatus.SUCCEEDED,
-            reason="hit_stop",
-            message=str(reason or "").strip() or "探索命中停机。",
-            notify_compat=True,
-            kill_geometry_process=False,
+            return None
+        with self._exploration_loop_lock:
+            remote = getattr(self, "_remote_provider", None)
+            remote_token = (
+                _capture_remote_operation_token_locked(self, remote)
+                if remote is not None
+                else None
+            )
+            current = getattr(
+                self,
+                "_external_exploration_request",
+                None,
+            )
+        if remote_token is not None:
+            request_id = str(
+                getattr(current, "request_id", "") or ""
+            ).strip()
+            if not request_id:
+                raise RuntimeError(
+                    "hit-stop 缺少当前探索 request_id，拒绝非关联停止。"
+                )
+            result = remote.stop_exploration(request_id=request_id)
+            if not isinstance(result, dict):
+                raise RuntimeError("hit-stop 未收到 geometry runtime 停止确认。")
+            state = PlatformGeometryProviderBundle._wrap_remote_exploration_state(result)
+            terminal_id = str(state.current_request_id or "").strip()
+            with self._exploration_loop_lock:
+                if not _remote_operation_token_is_current_locked(
+                    self,
+                    remote_token,
+                ):
+                    raise RuntimeError(
+                        "hit-stop 返回期间 geometry remote 代际已切换。"
+                    )
+                current = getattr(
+                    self,
+                    "_external_exploration_request",
+                    None,
+                )
+                current_id = str(
+                    getattr(current, "request_id", "") or ""
+                ).strip()
+                if current_id != request_id:
+                    existing_terminal = getattr(
+                        self,
+                        "_external_exploration_terminal_state",
+                        None,
+                    )
+                    existing_id = str(
+                        getattr(existing_terminal, "current_request_id", "")
+                        or ""
+                    ).strip()
+                    existing_metadata = dict(
+                        getattr(existing_terminal, "metadata", {}) or {}
+                    )
+                    if (
+                        not current_id
+                        and _is_complete_exploration_terminal(
+                            existing_terminal,
+                            request_id=request_id,
+                            safe_stop_only=True,
+                        )
+                    ):
+                        return existing_terminal.model_copy(deep=True)
+                    raise RuntimeError(
+                        "hit-stop 返回期间 exploration request 已切换。"
+                    )
+                if terminal_id != request_id:
+                    raise RuntimeError(
+                        "hit-stop 返回的 request_id 与活动探索不匹配。"
+                    )
+                metadata = dict(state.metadata)
+                metadata.update({
+                    "hit_stop_requested": True,
+                    "hit_stop_reason": str(reason or "").strip()
+                    or "探索命中停机。",
+                })
+                state = state.model_copy(
+                    update={"metadata": metadata},
+                    deep=True,
+                )
+                if not _commit_remote_exploration_state_locked(
+                    self,
+                    state,
+                    request_id=request_id,
+                ):
+                    raise RuntimeError(
+                        "hit-stop 返回状态无法按 exact request 原子提交。"
+                    )
+            self._notify_exploration_update(state)
+            return state
+        raise RuntimeError(
+            "native geometry remote 已失联，hit-stop 拒绝回退 legacy 终态。"
         )
-        self._notify_exploration_update(self.get_platform_exploration_state())
 
     def _stop_platform_exploration_loop(self, *, cancel_navigation: bool, notify: bool) -> bool:
         thread = None
+        terminal_state = None
+        already_terminal = False
         with self._exploration_loop_lock:
             if self._external_exploration_terminal_state is not None:
+                already_terminal = True
                 if notify:
-                    self._notify_exploration_update(self.get_platform_exploration_state())
-                return True
-            self._exploration_loop_stop_event.set()
-            self._exploration_loop_generation += 1
-            thread = self._exploration_loop_thread
+                    terminal_state = self.get_platform_exploration_state()
+            else:
+                self._exploration_loop_stop_event.set()
+                self._exploration_loop_generation += 1
+                thread = self._exploration_loop_thread
+        if already_terminal:
+            if terminal_state is not None:
+                self._notify_exploration_update(terminal_state)
+            return True
         stopped = self._stop_external_script_exploration(
             cancel_navigation=cancel_navigation,
             notify_compat=cancel_navigation,
@@ -4923,8 +6482,6 @@ class PlatformGeometryRuntime:
             current_process.stop()
             time.sleep(3.0)
         self._map_stream_tracker = {}
-        with self._observer_occupancy_lock:
-            self._observer_occupancy_snapshot = {}
         self._start_managed_process(process_name, command, self._external_log_name(), restart=True)
         process = self._managed_processes.get(process_name)
         if process is not None:
@@ -5048,75 +6605,142 @@ class PlatformGeometryRuntime:
             self._notify_compat_exploration_stopped()
         return state
 
-    def start_external_mapping(self, *, map_name: Optional[str] = None) -> Dict[str, object]:
-        """【Phase 6 legacy/manual】启动 go2.sh --mapping，供遥控/手动建图。
+    def _ensure_mapping_lifecycle_fields(self) -> None:
+        if not hasattr(self, "_mapping_lifecycle_lock"):
+            self._mapping_lifecycle_lock = threading.RLock()
+        if not hasattr(self, "_mapping_session_context"):
+            self._mapping_session_context = None
 
-        平台默认 mapping 路径已切到 `_remote_provider` (GeometryRuntimeProvider) →
-        gRPC + nuwax-mapping adapter。本方法仅在显式 legacy/manual 入口（如
-        历史验收脚本、外部硬件桥接）时被 `_handle_start_mapping` 走 legacy 路径
-        时调用,不再作为新 mapping 默认 owner。
-        """
+    def start_mapping(
+        self,
+        *,
+        map_name: Optional[str] = None,
+        map_version_id: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """Start or idempotently confirm one native Rust mapping session."""
 
-        if not self._is_geometry_profile_enabled() or not self._uses_external_geometry_stack():
-            raise RuntimeError(self._removed_internal_stack_message())
-        self._ensure_external_geometry_observers_started()
-        process_name = self._external_process_name()
-        current_process = self._managed_processes.get(process_name)
-        # commit 2 §2.3：幂等校验——若 observer 当前 session_mode 已为 "mapping"，
-        # 跳过 set_session_mode 副作用（避免重复 reset loop_closure_state）。
-        _observer_for_idempotent = self._external_debug_observer
-        if _observer_for_idempotent is not None and _observer_for_idempotent.get_current_session_mode() == "mapping":
-            pass
-        else:
-            self._on_external_geometry_session_mode_changed("mapping")
-        command = self._build_external_mapping_command(map_name=map_name)
-        db_path = self._extract_external_exploration_database_path(command)
-        if db_path:
-            self._remove_mapping_database_files(Path(str(db_path)))
-        with self._exploration_loop_lock:
-            self._external_geometry_session_mode = "mapping"
-            self._external_exploration_terminal_state = None
-            self._external_exploration_request = None
-            self._external_exploration_started_at_monotonic = time.monotonic()
-            self._external_exploration_started_at_iso = _utc_now_iso()
-            self._external_exploration_deadline_monotonic = None
-            self._external_exploration_database_path = db_path
-        if current_process is not None:
-            self._managed_processes.pop(process_name, None)
-            current_process.stop(
-                timeout_sec=12.0,
-                graceful_launch_shutdown=True,
-                graceful_timeout_sec=15.0,
+        if not self._is_geometry_profile_enabled():
+            raise RuntimeError("平台几何运行时或 mapping profile 已禁用。")
+        if not self._runtime_started:
+            self.start()
+        provider = self._remote_provider
+        if provider is None or not bool(getattr(provider, "is_connected", False)):
+            self._start_geometry_runtime_subprocess()
+            provider = self._remote_provider
+        if provider is None or not bool(getattr(provider, "is_connected", False)):
+            raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法启动建图。")
+
+        active_version = getattr(self, "_active_map_version", None)
+        resolved_map_name = str(
+            map_name or (active_version.map_name if active_version is not None else "")
+        ).strip()
+        if not resolved_map_name:
+            raise RuntimeError("启动建图必须提供 map_name。")
+
+        self._ensure_mapping_lifecycle_fields()
+        with self._mapping_lifecycle_lock:
+            current = self._mapping_session_context
+            new_session_started = not (
+                isinstance(current, dict) and bool(current.get("active"))
             )
-            time.sleep(3.0)
-        self._map_stream_tracker = {}
-        with self._observer_occupancy_lock:
-            self._observer_occupancy_snapshot = {}
-        self._start_managed_process(process_name, command, self._external_log_name(), restart=True)
-        process = self._managed_processes.get(process_name)
-        if process is None or not process.is_running():
-            with self._exploration_loop_lock:
-                self._external_geometry_session_mode = None
-            raise RuntimeError("GO2 几何栈手动建图脚本启动失败。")
-        self._record_runtime_diagnostic(
-            "external_go2_mapping_started",
-            "start_mapping 已委托 GO2 几何栈脚本执行：%s" % process.command_display(),
-        )
+            requested_version = str(map_version_id or "").strip()
+            if isinstance(current, dict) and bool(current.get("active")):
+                if str(current.get("map_name") or "") != resolved_map_name:
+                    raise RuntimeError(
+                        "已有其它地图的建图会话处于 ACTIVE，拒绝隐式切换。"
+                    )
+                current_version = str(current.get("map_version_id") or "")
+                if requested_version and requested_version != current_version:
+                    raise RuntimeError(
+                        "探索/建图请求的 map_version_id 与 ACTIVE 建图会话不一致。"
+                    )
+                session_id = str(current.get("session_id") or "")
+                provisional_version = current_version
+            else:
+                session_id = "mapping:%s" % uuid.uuid4().hex
+                provisional_version = requested_version or self._next_exploration_map_version_id(
+                    resolved_map_name
+                )
+                if isinstance(current, dict) and not requested_version:
+                    previous_version = str(current.get("map_version_id") or "")
+                    if provisional_version == previous_version and provisional_version.startswith(
+                        "mapver_"
+                    ):
+                        try:
+                            provisional_version = "mapver_%06d" % (
+                                int(provisional_version.split("_", 1)[1]) + 1
+                            )
+                        except (IndexError, ValueError):
+                            pass
+
+            start_rpc = getattr(provider, "start_mapping", None)
+            if not callable(start_rpc):
+                raise RuntimeError("GeometryRuntimeProvider 未实现 StartMapping RPC。")
+            response = start_rpc(
+                session_id=session_id,
+                map_name=resolved_map_name,
+                map_version_id=provisional_version,
+            )
+            if (
+                not isinstance(response, dict)
+                or str(response.get("phase") or "") != "ACTIVE"
+                or not bool(response.get("active"))
+                or str(response.get("session_id") or "") != session_id
+                or str(response.get("map_version_id") or "") != provisional_version
+            ):
+                raise RuntimeError("StartMapping 未确认匹配的 ACTIVE Rust 会话。")
+            context = {
+                **dict(response),
+                "session_id": session_id,
+                "map_name": resolved_map_name,
+                "map_version_id": provisional_version,
+                "active": True,
+            }
+            # Local state is committed only after Rust confirms ACTIVE.
+            self._mapping_session_context = context
+
+        with self._exploration_loop_lock:
+            if new_session_started:
+                self._external_geometry_session_mode = "mapping"
+                self._external_exploration_terminal_state = None
+                self._external_exploration_request = None
+            self._external_exploration_version_id = provisional_version
+        if new_session_started:
+            self._map_stream_tracker = {}
+        diagnostics_reader = getattr(provider, "get_mapping_diagnostics", None)
+        diagnostics = diagnostics_reader() if callable(diagnostics_reader) else None
         return {
-            "mapping_launch_mode": "mapping",
-            "mapping_script": str(self._external_script_path()),
-            "mapping_command": command,
-            "mapping_database_path": db_path,
-            "mapping_version_id": self.get_exploration_pinned_version_id(),
+            "mapping_launch_mode": "nuwax_geometry_runtime",
+            "mapping_transport": "grpc_lcm",
+            "mapping_script": None,
+            "mapping_command": None,
+            "mapping_database_path": None,
+            "mapping_version_id": provisional_version,
+            "mapping_session_id": session_id,
+            "session_generation": int(context.get("session_generation") or 0),
+            "revision": int(context.get("revision") or 0),
+            "mapping_active": True,
+            "map_name": resolved_map_name,
             "geometry_stack_running": True,
+            "sidecar_kept_alive": True,
+            "mapping_diagnostics": diagnostics,
         }
+
+    def start_external_mapping(self, *, map_name: Optional[str] = None) -> Dict[str, object]:
+        """兼容旧 capability 名，实际委托 nuwax-geometry-runtime 建图链。"""
+
+        return self.start_mapping(map_name=map_name)
 
     def get_geometry_stack_status(self) -> Dict[str, object]:
         """返回 go2.sh 几何栈运行态，供 Agent 区分工作区 mapping 与真实 SLAM 进程。"""
 
         process = self._managed_processes.get(self._external_process_name())
         process_status = process.status() if process is not None else None
-        running = bool(process is not None and process.is_running())
+        provider = getattr(self, "_remote_provider", None)
+        sidecar_running = bool(
+            provider is not None and getattr(provider, "is_connected", False)
+        )
+        running = sidecar_running or bool(process is not None and process.is_running())
         command = list(process.command) if process is not None else []
         launch_mode = None
         if self._command_uses_external_exploration(command):
@@ -5131,6 +6755,20 @@ class PlatformGeometryRuntime:
             has_active_exploration = self._external_exploration_request is not None
             mapping_database_path = self._external_exploration_database_path
             mapping_version_id = self._external_exploration_version_id
+        mapping_context = self.get_mapping_session_context()
+        mapping_active = bool(mapping_context and mapping_context.get("active"))
+        exploration_active = bool(
+            has_active_exploration or session_mode == "explore"
+        )
+        if exploration_active:
+            launch_mode = "explore"
+            session_mode = "explore"
+        elif mapping_active:
+            launch_mode = "mapping"
+            session_mode = "mapping"
+            mapping_version_id = str(
+                mapping_context.get("map_version_id") or ""
+            ) or mapping_version_id
         guidance = None
         if not running:
             guidance = (
@@ -5145,7 +6783,7 @@ class PlatformGeometryRuntime:
                 "自主探索已结束，RTAB-Map/Nav2 仍在运行。"
                 "可继续手动导航/遥控，完成后 save_active_map_version，再 stop_mapping。"
             )
-        elif launch_mode == "explore" and has_active_exploration:
+        elif launch_mode == "explore" and exploration_active:
             guidance = (
                 "自主探索进行中；用 get_task_status 查看 frontier_count 与 message，"
                 "不要 relocalize_active_map，也不要因 localization_ready=false 误判卡住。"
@@ -5155,11 +6793,19 @@ class PlatformGeometryRuntime:
             "geometry_stack_running": running,
             "launch_mode": launch_mode,
             "session_mode": session_mode,
-            "process_running": running,
+            "process_running": bool(process is not None and process.is_running()),
+            "sidecar_running": sidecar_running,
+            "mapping_active": mapping_active,
+            "mapping_session_id": (
+                mapping_context.get("session_id") if mapping_context else None
+            ),
+            "mapping_session_generation": (
+                mapping_context.get("session_generation") if mapping_context else None
+            ),
             "process_status": process_status,
             "mapping_database_path": mapping_database_path,
             "mapping_version_id": mapping_version_id,
-            "exploration_active": has_active_exploration,
+            "exploration_active": exploration_active,
             "exploration_terminal": terminal_state is not None,
             "teleop_mapping_api": "start_mapping",
             "autonomous_explore_api": "explore_area",
@@ -5169,56 +6815,114 @@ class PlatformGeometryRuntime:
         }
 
     def stop_mapping(self, *, reason: str = "stop_mapping") -> Dict[str, object]:
-        """统一停止 go2.sh 几何栈（探索/遥控建图/定位均由该入口结束）。"""
+        """Stop the exact native mapping session without stopping the sidecar."""
+
+        provider = self._remote_provider
+        if provider is None or not bool(getattr(provider, "is_connected", False)):
+            raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法停止建图。")
+        self._ensure_mapping_lifecycle_fields()
+        with self._mapping_lifecycle_lock:
+            context = self._mapping_session_context
+            if not isinstance(context, dict) or not str(context.get("session_id") or ""):
+                state_reader = getattr(provider, "get_mapping_state", None)
+                context = state_reader() if callable(state_reader) else None
+            if not isinstance(context, dict) or not str(context.get("session_id") or ""):
+                raise RuntimeError("当前没有可关联的 Rust mapping session。")
+            session_id = str(context.get("session_id") or "")
+
+            exploration_reader = getattr(provider, "get_exploration_state", None)
+            if not callable(exploration_reader):
+                raise RuntimeError(
+                    "停止建图前无法读取 ExplorationState，拒绝让 child navigation 失去 costmap。"
+                )
+            exploration_state = exploration_reader()
+            if not isinstance(exploration_state, dict):
+                raise RuntimeError(
+                    "停止建图前未获得 ExplorationState，mapping adapter 保持 ACTIVE。"
+                )
+            exploration_status = str(
+                exploration_state.get("status") or ""
+            ).strip().upper()
+            safe_terminal_statuses = {
+                "IDLE",
+                "STOPPED",
+                "SUCCEEDED",
+                "CANCELLED",
+            }
+            parked_exploration = None
+            if exploration_status not in safe_terminal_statuses:
+                request_id = str(
+                    exploration_state.get("request_id") or ""
+                ).strip()
+                if not request_id:
+                    raise RuntimeError(
+                        "active exploration 缺少 exact request_id，拒绝停止 mapping。"
+                    )
+                exploration_stopper = getattr(provider, "stop_exploration", None)
+                if not callable(exploration_stopper):
+                    raise RuntimeError(
+                        "GeometryRuntimeProvider 未实现 correlated StopExploration。"
+                    )
+                parked_exploration = exploration_stopper(request_id=request_id)
+                if not isinstance(parked_exploration, dict):
+                    raise RuntimeError(
+                        "StopExploration 未返回 exact terminal，mapping adapter 保持 ACTIVE。"
+                    )
+                parked_status = str(
+                    parked_exploration.get("status") or ""
+                ).strip().upper()
+                parked_request_id = str(
+                    parked_exploration.get("request_id") or ""
+                ).strip()
+                if (
+                    parked_request_id != request_id
+                    or parked_status not in safe_terminal_statuses - {"IDLE"}
+                ):
+                    raise RuntimeError(
+                        "StopExploration 未返回 exact terminal，mapping adapter 保持 ACTIVE。"
+                    )
+
+            stop_rpc = getattr(provider, "stop_mapping", None)
+            if not callable(stop_rpc):
+                raise RuntimeError("GeometryRuntimeProvider 未实现 StopMapping RPC。")
+            response = stop_rpc(
+                session_id=session_id,
+                reason=str(reason or "stop_mapping"),
+            )
+            if (
+                not isinstance(response, dict)
+                or str(response.get("phase") or "") != "STOPPED"
+                or bool(response.get("active"))
+                or str(response.get("session_id") or "") != session_id
+            ):
+                raise RuntimeError("StopMapping 未确认匹配的 STOPPED Rust 会话。")
+            self._mapping_session_context = {
+                **dict(context),
+                **dict(response),
+                "active": False,
+            }
 
         with self._exploration_loop_lock:
-            has_request = self._external_exploration_request is not None
-            terminal_state = self._external_exploration_terminal_state
             session_mode = self._external_geometry_session_mode
-        process_was_running = self._external_geometry_stack_is_running()
-        exploration_state: Optional[ExplorationState] = None
-        if has_request:
-            self._cancel_platform_exploration_navigation()
-            exploration_state = self._finish_external_script_exploration(
-                status=ExplorationStatus.CANCELLED,
-                reason=str(reason or "stop_mapping"),
-                message="GO2 几何栈已通过 stop_mapping 停止。",
-                notify_compat=True,
-                kill_geometry_process=True,
-            )
-        else:
-            process_status = self._kill_external_geometry_process()
-            if terminal_state is not None and not process_was_running:
-                exploration_state = terminal_state.model_copy(deep=True)
-            elif terminal_state is not None:
-                metadata = dict(terminal_state.metadata or {})
-                metadata["geometry_stack_running"] = False
-                metadata["geometry_stack_stopped_via"] = str(reason or "stop_mapping")
-                exploration_state = terminal_state.model_copy(
-                    update={"metadata": metadata},
-                    deep=True,
-                )
-                with self._exploration_loop_lock:
-                    self._external_exploration_terminal_state = exploration_state
-            if exploration_state is not None:
-                self._notify_exploration_update(exploration_state)
-        stopped = not self._external_geometry_stack_is_running()
-        if not stopped and process_was_running:
-            raise RuntimeError("GO2 几何栈停止失败，外部进程仍在运行。")
-        self._on_external_geometry_session_mode_changed(None)
-        self._record_runtime_diagnostic(
-            "external_go2_mapping_stopped",
-            "stop_mapping 已停止 GO2 几何栈 reason=%s session_mode=%s" % (reason, session_mode),
-        )
-        with self._exploration_loop_lock:
             mapping_database_path = self._external_exploration_database_path
+            self._external_geometry_session_mode = None
+        self._record_runtime_diagnostic(
+            "native_mapping_stopped",
+            "StopMapping 已关闭 Rust adapter ingestion reason=%s session_id=%s"
+            % (reason, session_id),
+        )
         return {
-            "stopped": stopped,
+            "stopped": True,
             "reason": str(reason or "stop_mapping"),
             "session_mode": session_mode,
-            "geometry_stack_running": False,
-            "exploration_state": exploration_state.model_dump(mode="json") if exploration_state is not None else None,
-            "mapping_version_id": self.get_exploration_pinned_version_id(),
+            "mapping_session_id": session_id,
+            "mapping_active": False,
+            "idempotent_replay": bool(response.get("idempotent_replay")),
+            "geometry_stack_running": True,
+            "sidecar_kept_alive": True,
+            "exploration_state": None,
+            "parked_exploration": parked_exploration,
+            "mapping_version_id": str(response.get("map_version_id") or "") or None,
             "mapping_database_path": mapping_database_path,
         }
 
@@ -5457,12 +7161,73 @@ class PlatformGeometryRuntime:
                 },
             }
 
+    def _notify_remote_exploration_update(
+        self,
+        state: ExplorationState,
+        *,
+        remote_token: _RemoteOperationToken,
+    ) -> None:
+        context = getattr(self, "_exploration_delivery_context", None)
+        if context is None:
+            context = threading.local()
+            self._exploration_delivery_context = context
+        missing = object()
+        previous = getattr(context, "remote_token", missing)
+        context.remote_token = remote_token
+        try:
+            self._notify_exploration_update(state)
+        finally:
+            if previous is missing:
+                try:
+                    del context.remote_token
+                except AttributeError:
+                    pass
+            else:
+                context.remote_token = previous
+
     def _notify_exploration_update(self, state: ExplorationState) -> None:
-        with self._exploration_loop_lock:
-            subscribers = tuple(self._exploration_update_subscribers.values())
-        for callback in subscribers:
+        context = getattr(self, "_exploration_delivery_context", None)
+        remote_token = (
+            getattr(context, "remote_token", None)
+            if context is not None
+            else None
+        )
+        if context is not None and remote_token is not None:
             try:
-                callback(state.model_copy(deep=True))
+                del context.remote_token
+            except AttributeError:
+                pass
+        delivery_provider = None
+        delivery_generation = None
+        if remote_token is not None:
+            delivery_provider, delivery_generation = remote_token
+        provider_attach_lock = getattr(
+            self,
+            "_provider_attach_lock",
+            self._runtime_state_lock,
+        )
+        with provider_attach_lock:
+            with self._exploration_loop_lock:
+                deliveries = []
+                for subscription_id, callback in tuple(
+                    self._exploration_update_subscribers.items()
+                ):
+                    ticket = self._new_subscription_delivery_ticket(
+                        kind="exploration",
+                        subscription_id=subscription_id,
+                        callback=callback,
+                        provider=delivery_provider,
+                        provider_generation=delivery_generation,
+                    )
+                    self._publish_subscription_delivery_ticket(ticket)
+                    deliveries.append(ticket)
+        for ticket in deliveries:
+            try:
+                self._invoke_subscription_delivery(
+                    ticket,
+                    state.model_copy(deep=True),
+                    retire=True,
+                )
             except Exception:
                 pass
 
@@ -5635,7 +7400,9 @@ class PlatformGeometryRuntime:
                 NavigationStatus.CANCELLED,
             }:
                 try:
-                    navigation_backend.cancel_goal()
+                    navigation_backend.cancel_goal(
+                        request_id=navigation_state.current_goal_id
+                    )
                 except Exception:
                     return
             target_pose = current_goal.target_pose
@@ -5726,7 +7493,7 @@ class PlatformGeometryRuntime:
             update["frontier_count"] = len(latest_frontiers)
         return state.model_copy(update=update, deep=True)
 
-    def _external_debug_frontier_metadata(self) -> tuple[Dict[str, object], Optional[int]]:
+    def _external_debug_frontier_metadata(self) -> Tuple[Dict[str, object], Optional[int]]:
         with self._exploration_loop_lock:
             if self._external_geometry_session_mode != "explore":
                 return {}, None
@@ -5774,7 +7541,7 @@ class PlatformGeometryRuntime:
 
     def _metadata_indicates_exploration_done(
         self, metadata: Dict[str, object]
-    ) -> tuple[bool, List[str]]:
+    ) -> Tuple[bool, List[str]]:
         """判断探索任务是否已结束，并返回 reasons 命名空间前缀列表。
 
         原 7 条判据路径（marker DONE / explore.status exploration_complete /
@@ -5809,7 +7576,7 @@ class PlatformGeometryRuntime:
         # 辅助信号：observer._explore_status_done（explore/status == "exploration_complete"）
         return self._check_loop_closure_completion()
 
-    def _check_loop_closure_completion(self) -> tuple[bool, List[str]]:
+    def _check_loop_closure_completion(self) -> Tuple[bool, List[str]]:
         """第 8 条判据：双信号源检查（spec exploration-completion-criteria）。"""
 
         reasons: List[str] = []
@@ -6201,7 +7968,7 @@ class PlatformGeometryRuntime:
         except Exception:
             return texts
         deduped: List[str] = []
-        seen: set[str] = set()
+        seen: Set[str] = set()
         for text in texts:
             normalized = str(text or "")
             if not normalized or normalized in seen:
@@ -6479,7 +8246,10 @@ class PlatformGeometryRuntime:
         if not callable(canceller):
             return
         try:
-            canceller()
+            state = backend.get_navigation_state()
+            goal_id = str(getattr(state, "current_goal_id", "") or "").strip()
+            if goal_id:
+                canceller(request_id=goal_id)
         except Exception:
             pass
 
@@ -6497,7 +8267,7 @@ class PlatformGeometryRuntime:
             NavigationStatus.FAILED,
             NavigationStatus.CANCELLED,
         }:
-            navigation_backend.cancel_goal()
+            navigation_backend.cancel_goal(request_id=goal.goal_id)
 
     @staticmethod
     def _clone_contract(value):
@@ -6702,10 +8472,8 @@ class PlatformGeometryProviderBundle(
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.occupancy_grid
-        # GeometryRuntimeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
-        # 当前推送路径（subscribe_map_updates → _attach_active_map_version_to_live_map_payload）
-        # 仅 seed 来自 active map version 的 semantic_map，不携带 occupancy_grid/cost_map；
-        # snapshot 缺失时返回 None（push 路径在 Rust 桥当前实现下不会补齐 occupancy/cost）。
+        # runtime.get_map_snapshot 已通过远端标准 getter 执行可靠 pull；None 表示
+        # Rust 当前确实没有 occupancy revision，不能用空层伪造可用地图。
         return None
 
     def get_cost_map(self):
@@ -6714,10 +8482,7 @@ class PlatformGeometryProviderBundle(
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.cost_map
-        # GeometryRuntimeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
-        # 当前推送路径（subscribe_map_updates → _attach_active_map_version_to_live_map_payload）
-        # 仅 seed 来自 active map version 的 semantic_map，不携带 occupancy_grid/cost_map；
-        # snapshot 缺失时返回 None（push 路径在 Rust 桥当前实现下不会补齐 occupancy/cost）。
+        # Rust facade 暂无独立 cost-map RPC；只返回 snapshot 中实际存在的层。
         return None
 
     def get_semantic_map(self):
@@ -6726,10 +8491,7 @@ class PlatformGeometryProviderBundle(
         snapshot = self.runtime.get_map_snapshot()
         if snapshot is not None:
             return snapshot.semantic_map
-        # GeometryRuntimeProvider 仅暴露 gRPC 协议方法（meta/data）作为推送侧契约；
-        # 当前推送路径（subscribe_map_updates → _attach_active_map_version_to_live_map_payload）
-        # 仅 seed 来自 active map version 的 semantic_map，不携带 occupancy_grid/cost_map；
-        # snapshot 缺失时返回 None（push 路径在 Rust 桥当前实现下不会补齐 occupancy/cost）。
+        # semantic layer 仅来自已激活平台版本，不合成远端空层。
         return None
 
     def set_goal(self, goal):
@@ -6751,57 +8513,110 @@ class PlatformGeometryProviderBundle(
             )
         return self._call_navigation_backend(backend, "set_goal", goal)
 
-    def cancel_goal(self) -> bool:
+    def cancel_goal(self, request_id: Optional[str] = None) -> bool:
+        exact_goal_id = str(request_id or "").strip()
+        if not exact_goal_id:
+            LOGGER.warning("拒绝缺少 exact goal_id 的导航取消请求。")
+            return False
         if not self._is_geometry_profile_enabled():
             return False
         backend = self.runtime._resolve_navigation_backend()
         if backend is None:
             return False
-        return self._call_navigation_backend(backend, "cancel_goal")
+        state_getter = getattr(backend, "get_navigation_state", None)
+        if not callable(state_getter):
+            return False
+        try:
+            state = state_getter()
+        except Exception:
+            LOGGER.exception("导航取消前读取 backend exact goal 失败。")
+            return False
+        active_goal_id = str(
+            getattr(state, "current_goal_id", "") or ""
+        ).strip()
+        raw_status = getattr(state, "status", None)
+        active_status = str(
+            getattr(raw_status, "value", raw_status) or ""
+        ).strip().lower()
+        observed_goal_id = str(
+            dict(getattr(state, "metadata", {}) or {}).get("observed_goal_id") or ""
+        ).strip()
+        if (
+            active_goal_id != exact_goal_id
+            or (observed_goal_id and observed_goal_id != exact_goal_id)
+            or active_status
+            not in {
+                NavigationStatus.ACCEPTED.value,
+                NavigationStatus.PLANNING.value,
+                NavigationStatus.RUNNING.value,
+            }
+        ):
+            LOGGER.warning(
+                "拒绝导航定向取消：requested_goal_id=%s active_goal_id=%s observed_goal_id=%s status=%s",
+                exact_goal_id,
+                active_goal_id or None,
+                observed_goal_id or None,
+                active_status or None,
+            )
+            return False
+        return self._call_navigation_backend(
+            backend,
+            "cancel_goal",
+            request_id=exact_goal_id,
+        )
 
     def cancel_navigation(self, *, request_id: Optional[str] = None) -> bool:
         """扩展的导航取消入口（5.5 task）。
 
-        - 当 `request_id` 为 None 时等价于 `cancel_goal()`（取消当前 ACTIVE 目标）；
-        - 当 `request_id` 非空时调用 `_dispatch_cancel(request_id)` 走 NavigationProxyClient
-          （worker-B 未就绪前退化为 cancel_goal）。
+        `request_id` 必须是当前 ACTIVE 的 exact goal 标识；缺失或与后端状态不匹配时
+        fail-closed，不发出 CancelNavigation RPC。
 
         返回：是否成功发出取消请求。
         """
 
         if not self._is_geometry_profile_enabled():
             return False
-        if request_id is None or not str(request_id).strip():
-            return self.cancel_goal()
-        # TODO:nav2_proxy_client_not_ready —— worker-B 的
-        # services/geometry/navigation_proxy_client.py 完成前，此处退化为 cancel_goal。
-        return self.cancel_goal()
+        return self.cancel_goal(request_id=str(request_id or "").strip() or None)
+
+    def navigate(self, goal, timeout_sec: Optional[int] = None) -> str:
+        """V2 非阻塞提交；成功返回 request/goal id，拒绝返回空串。"""
+
+        del timeout_sec
+        return str(getattr(goal, "goal_id", "") or "") if self.set_goal(goal) else ""
+
+    def cancel(self, request_id: Optional[str] = None) -> bool:
+        """V2 定向取消。"""
+
+        return self.cancel_goal(request_id=request_id)
+
+    def get_state(self, request_id: Optional[str] = None):
+        """V2 状态读取；当前 Rust facade 仅维护单 active goal。"""
+
+        state = self.get_navigation_state()
+        if request_id and state.current_goal_id not in {None, request_id}:
+            metadata = dict(state.metadata)
+            metadata.update({
+                "requested_goal_id": request_id,
+                "goal_id_mismatch": True,
+            })
+            return state.model_copy(update={"metadata": metadata}, deep=True)
+        return state
 
     def subscribe_navigation_updates(self, callback) -> Optional[int]:
         if not self._is_geometry_profile_enabled():
             return None
-        backend = self.runtime._resolve_navigation_backend()
-        subscriber = getattr(backend, "subscribe_navigation_updates", None)
-        if not callable(subscriber):
-            return None
-        return subscriber(callback)
+        return self.runtime.subscribe_navigation_updates(callback)
 
     def unsubscribe_navigation_updates(self, subscription_id: int) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
-        backend = self.runtime._resolve_navigation_backend()
-        unsubscribe = getattr(backend, "unsubscribe_navigation_updates", None)
-        if not callable(unsubscribe):
-            return False
-        return bool(unsubscribe(subscription_id))
+        return self.runtime.unsubscribe_navigation_updates(subscription_id)
 
     def get_navigation_state(self):
         """扩展的导航状态读取入口（5.5 task）。
 
         - 优先走 backend.get_navigation_state()；
-        - 在 metadata 中补充 `proxy_dispatch_enabled` 与 `dispatch_via_proxy` 标记
-          （用于外部 agent 区分当前是否走 NavigationProxyClient 串行锁路径，
-          TODO:nav2_proxy_client_not_ready）。
+        - 在 metadata 中标记实际的 geometry runtime gRPC transport。
         """
 
         backend = self.runtime._resolve_navigation_backend()
@@ -6817,8 +8632,7 @@ class PlatformGeometryProviderBundle(
                     "navigation_backend_policy": self.runtime._clone_metadata(policy),
                     "active_navigation_backend": policy.get("active_backend_provider"),
                     "nav2_action_active": bool(policy.get("nav2_action_active")),
-                    "proxy_dispatch_enabled": False,
-                    "dispatch_via_proxy": False,
+                    "navigation_transport": "geometry_runtime_grpc",
                 },
             )
         getter = getattr(backend, "get_navigation_state", None)
@@ -6835,16 +8649,14 @@ class PlatformGeometryProviderBundle(
                     "navigation_backend_policy": self.runtime._clone_metadata(policy),
                     "active_navigation_backend": policy.get("active_backend_provider"),
                     "nav2_action_active": bool(policy.get("nav2_action_active")),
-                    "proxy_dispatch_enabled": False,
-                    "dispatch_via_proxy": False,
+                    "navigation_transport": "geometry_runtime_grpc",
                     "unimplemented": True,
                 },
             )
         state = getter()
-        # 复用现有 metadata，补充 proxy dispatch 标记；不破坏 schema。
+        # 复用现有 metadata，补充实际 transport 标记；不破坏 schema。
         metadata = dict(getattr(state, "metadata", {}) or {})
-        metadata.setdefault("proxy_dispatch_enabled", False)  # TODO:nav2_proxy_client_not_ready
-        metadata.setdefault("dispatch_via_proxy", False)
+        metadata.setdefault("navigation_transport", "geometry_runtime_grpc")
         return state.model_copy(update={"metadata": metadata}, deep=True)
 
     def is_goal_reached(self) -> bool:
@@ -6930,42 +8742,154 @@ class PlatformGeometryProviderBundle(
     def _start_exploration_via_remote(self, request, remote) -> bool:
         """把 request 翻译成 gRPC facade 的 start_exploration 调用。
 
-        request 是 platform 侧的 `ExploreAreaRequest` 契约（或 dict）；gRPC facade
-        期望 `request_id / strategy / arbitration / map_version_id`。translation
-        失败时返回 False，让 caller 走 fallback（不影响 Phase 0 现有 helpers）。
+        request 是 platform 侧的 `ExploreAreaRequest` 契约；gRPC facade 接收完整
+        map pin、边界、停止条件、重试和 blacklist 参数。translation 失败时返回
+        False，让 caller 走 fallback（不影响 Phase 0 现有 helpers）。
         """
         request_id = ""
         strategy = "wavefront"
         arbitration = "prefer_wavefront"
         map_version_id = ""
+        map_revision = 0
+        boundary_line_segments = []
+        stop_conditions = {}
+        max_navigation_retries = 0
+        blacklist_radius_m = 0.0
         if request is not None:
             request_id = str(getattr(request, "request_id", "") or "")
             if not request_id:
                 request_id = "platform_explore:%d" % int(time.time() * 1000)
-            try:
-                if getattr(request, "stop_conditions", None):
-                    strategy_hint = getattr(request.stop_conditions, "strategy", None)
-                    arbitration_hint = getattr(request.stop_conditions, "arbitration", None)
-                    if isinstance(strategy_hint, str) and strategy_hint.strip():
-                        strategy = strategy_hint.strip()
-                    if isinstance(arbitration_hint, str) and arbitration_hint.strip():
-                        arbitration = arbitration_hint.strip()
-            except Exception:
-                pass
-            map_name = getattr(request, "map_name", None)
-            if isinstance(map_name, str) and map_name.strip():
-                map_version_id = map_name.strip()
+            strategy = str(getattr(request, "strategy", "") or "wavefront").strip()
+            stop_conditions = dict(getattr(request, "stop_conditions", {}) or {})
+            request_metadata = dict(getattr(request, "metadata", {}) or {})
+            arbitration = str(
+                request_metadata.get("arbitration")
+                or stop_conditions.get("arbitration")
+                or "prefer_wavefront"
+            ).strip()
+            map_version_id = str(
+                request_metadata.get("map_version_id")
+                or stop_conditions.get("map_version_id")
+                or ""
+            ).strip()
+            map_revision = int(
+                getattr(request, "map_revision", None)
+                or request_metadata.get("map_revision")
+                or 0
+            )
+            boundary_line_segments = list(
+                getattr(request, "boundary_line_segments", ()) or ()
+            )
+            max_duration_sec = getattr(request, "max_duration_sec", None)
+            if (
+                max_duration_sec is not None
+                and "max_duration_ms" not in stop_conditions
+            ):
+                stop_conditions["max_duration_ms"] = max(
+                    0, int(round(float(max_duration_sec) * 1000.0))
+                )
+            max_navigation_retries = int(
+                getattr(request, "max_navigation_retries", None)
+                or request_metadata.get("max_navigation_retries")
+                or 0
+            )
+            blacklist_radius_m = float(
+                getattr(request, "blacklist_radius_m", None)
+                or request_metadata.get("blacklist_radius_m")
+                or 0.0
+            )
+        lock = getattr(self.runtime, "_exploration_loop_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            remote_token = _capture_remote_operation_token_locked(
+                self.runtime,
+                remote,
+            )
+            current = getattr(
+                self.runtime,
+                "_external_exploration_request",
+                None,
+            )
+            current_id = str(
+                getattr(current, "request_id", "") or ""
+            ).strip()
+            if remote_token is None or (
+                current_id and current_id != request_id
+            ):
+                return False
         try:
+            mapping_state = self.runtime.start_mapping(
+                map_name=(
+                    str(getattr(request, "map_name", "") or "").strip() or None
+                    if request is not None
+                    else None
+                ),
+                map_version_id=map_version_id or None,
+            )
+            map_version_id = str(
+                mapping_state.get("mapping_version_id") or ""
+            ).strip()
+            if not map_version_id:
+                raise RuntimeError("探索启动前未获得 ACTIVE mapping version。")
+            if map_revision <= 0:
+                map_revision = int(mapping_state.get("revision") or 0)
             result = remote.start_exploration(
                 request_id=request_id,
                 strategy=strategy,
                 arbitration=arbitration,
                 map_version_id=map_version_id,
+                map_revision=map_revision,
+                boundary_line_segments=boundary_line_segments,
+                stop_conditions=stop_conditions,
+                max_navigation_retries=max_navigation_retries,
+                blacklist_radius_m=blacklist_radius_m,
             )
         except Exception:
             LOGGER.exception("Bundle.start_exploration gRPC 失败，准备 fallback legacy。")
             return False
-        return bool(result)
+        if not isinstance(result, dict):
+            return False
+        state = self._wrap_remote_exploration_state(result)
+        raw_status = str(result.get("status") or "").strip().lower()
+        accepted = raw_status not in {
+            "",
+            "idle",
+            "rejected",
+            "failed",
+            "failure",
+            "unimplemented",
+        }
+        notify_state = False
+        with lock:
+            if not _remote_operation_token_is_current_locked(
+                self.runtime,
+                remote_token,
+            ):
+                return False
+            terminal = _is_complete_exploration_terminal(
+                state,
+                request_id=request_id,
+            )
+            if accepted or terminal:
+                if not _commit_remote_exploration_state_locked(
+                    self.runtime,
+                    state,
+                    request_id=request_id,
+                    request=request,
+                    map_version_id=map_version_id,
+                ):
+                    return False
+            notify_state = True
+        if notify_state:
+            notifier = getattr(
+                self.runtime,
+                "_notify_exploration_update",
+                None,
+            )
+            if callable(notifier):
+                notifier(state)
+        return accepted
 
     def start_exploration(self, request) -> bool:
         if not self._is_geometry_profile_enabled():
@@ -6993,60 +8917,196 @@ class PlatformGeometryProviderBundle(
         # legacy fallback：仅当显式 NUWAX_EXPLORATION_LEGACY=true 时才允许
         return self.runtime.start_platform_exploration(request)
 
-    def stop_exploration(self) -> bool:
+    def stop_exploration(self, request_id: Optional[str] = None) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
-        remote = self._resolve_remote_exploration_provider()
-        if remote is not None:
-            try:
-                result = remote.stop_exploration()
-                if result is not None:
-                    return bool(result)
-            except Exception:
-                LOGGER.exception("Bundle.stop_exploration gRPC 异常，准备 fallback legacy。")
-            if not self._is_legacy_exploration_fallback_allowed():
+        requested_id = str(request_id or "").strip()
+        lock = getattr(self.runtime, "_exploration_loop_lock", None)
+        if lock is None:
+            return False
+        committed = False
+        with lock:
+            current = getattr(
+                self.runtime,
+                "_external_exploration_request",
+                None,
+            )
+            expected_id = str(
+                getattr(current, "request_id", "") or ""
+            ).strip()
+            correlated_id = requested_id or expected_id
+            existing_terminal = getattr(
+                self.runtime,
+                "_external_exploration_terminal_state",
+                None,
+            )
+            if not correlated_id:
                 return False
-        # Phase 6 (codex-round2 M3)：remote is None 时也必须显式
-        # NUWAX_EXPLORATION_LEGACY guard，与 start_exploration 行为对齐。
-        if not self._is_legacy_exploration_fallback_allowed():
-            LOGGER.error(
-                "Bundle.stop_exploration remote=None 且 legacy 开关关闭，"
-                "返回 False。"
+            if not expected_id:
+                if _is_complete_exploration_terminal(
+                    existing_terminal,
+                    request_id=correlated_id,
+                    safe_stop_only=True,
+                ):
+                    setattr(
+                        self.runtime,
+                        "_remote_exploration_terminal_override",
+                        existing_terminal.model_copy(deep=True),
+                    )
+                    return True
+                return False
+            if requested_id and requested_id != expected_id:
+                return False
+            remote = self._resolve_remote_exploration_provider()
+            remote_token = (
+                _capture_remote_operation_token_locked(
+                    self.runtime,
+                    remote,
+                )
+                if remote is not None
+                else None
+            )
+        if remote_token is None:
+            LOGGER.error("native remote 不可用，拒绝 correlated StopExploration。")
+            return False
+        try:
+            result = remote.stop_exploration(request_id=correlated_id)
+        except Exception:
+            LOGGER.exception(
+                "Bundle.stop_exploration gRPC 异常；correlated stop 拒绝 legacy fallback。"
             )
             return False
-        return self.runtime.stop_platform_exploration()
+        if not isinstance(result, dict):
+            return False
+        state = self._wrap_remote_exploration_state(result)
+        raw_status = str(result.get("status") or "").strip().lower()
+        accepted = raw_status not in {
+            "",
+            "rejected",
+            "failed",
+            "failure",
+            "unimplemented",
+        }
+        with lock:
+            if not _remote_operation_token_is_current_locked(
+                self.runtime,
+                remote_token,
+            ):
+                return False
+            if not accepted or _exploration_state_request_id(state) != correlated_id:
+                return False
+            current = getattr(
+                self.runtime,
+                "_external_exploration_request",
+                None,
+            )
+            current_id = str(
+                getattr(current, "request_id", "") or ""
+            ).strip()
+            if current_id != expected_id:
+                existing_terminal = getattr(
+                    self.runtime,
+                    "_external_exploration_terminal_state",
+                    None,
+                )
+                return bool(
+                    not current_id
+                    and _is_complete_exploration_terminal(
+                        existing_terminal,
+                        request_id=correlated_id,
+                        safe_stop_only=True,
+                    )
+                )
+            committed = _commit_remote_exploration_state_locked(
+                self.runtime,
+                state,
+                request_id=correlated_id,
+            )
+        if committed:
+            self.runtime._notify_exploration_update(state)
+        return committed
 
     def sync_exploration_after_task(self) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
-        remote = self._resolve_remote_exploration_provider()
-        if remote is not None:
-            diagnostics = None
-            try:
-                diagnostics = remote.get_exploration_diagnostics()
-            except Exception:
-                LOGGER.exception("Bundle.sync_exploration_after_task gRPC 异常，准备 fallback legacy。")
-                diagnostics = None
-            if diagnostics is not None:
-                active = bool(diagnostics.get("active"))
-                status = str(diagnostics.get("selected_source") or "")
-                if not active or status in {"succeeded", "failed", "cancelled", "stopped"}:
-                    self._notify_exploration_update(self.get_exploration_state())
-                    return True
+        lock = getattr(self.runtime, "_exploration_loop_lock", None)
+        if lock is None:
+            return False
+        committed = False
+        terminal = False
+        with lock:
+            current = getattr(
+                self.runtime,
+                "_external_exploration_request",
+                None,
+            )
+            expected_id = str(
+                getattr(current, "request_id", "") or ""
+            ).strip()
+            existing_terminal = getattr(
+                self.runtime,
+                "_external_exploration_terminal_state",
+                None,
+            )
+            if not expected_id and existing_terminal is not None:
+                return _is_complete_exploration_terminal(
+                    existing_terminal,
+                    request_id=_exploration_state_request_id(existing_terminal),
+                )
+            if not expected_id:
                 return False
-            if not self._is_legacy_exploration_fallback_allowed():
-                return False
-        # Phase 6 (codex-round3 R3-1): remote is None 时也必须显式
-        # NUWAX_EXPLORATION_LEGACY guard，与 start_exploration / stop_exploration
-        # 行为对齐：默认（NUWAX_EXPLORATION_LEGACY=false）下不允许悄悄走 Python
-        # 旧状态机。Round2 只在 remote.gRPC 失败路径加了 guard，但 `remote is None`
-        # 这条主路径上 sync 仍直接走 legacy。补这一刀。
-        if not self._is_legacy_exploration_fallback_allowed():
-            LOGGER.info(
-                "Bundle.sync_exploration_after_task remote=None 且 legacy 关闭，返回 False。"
+            remote = self._resolve_remote_exploration_provider()
+            remote_token = (
+                _capture_remote_operation_token_locked(
+                    self.runtime,
+                    remote,
+                )
+                if remote is not None
+                else None
+            )
+        if remote_token is None:
+            return False
+        try:
+            remote_state = remote.get_exploration_state()
+        except Exception:
+            LOGGER.exception(
+                "Bundle.sync_exploration_after_task gRPC 异常；"
+                "terminal sync 拒绝 legacy fallback。"
             )
             return False
-        return self.runtime.sync_platform_exploration_after_task()
+        if not isinstance(remote_state, dict):
+            return False
+        state = self._wrap_remote_exploration_state(remote_state)
+        with lock:
+            if not _remote_operation_token_is_current_locked(
+                self.runtime,
+                remote_token,
+            ):
+                return False
+            current = getattr(
+                self.runtime,
+                "_external_exploration_request",
+                None,
+            )
+            current_id = str(
+                getattr(current, "request_id", "") or ""
+            ).strip()
+            if current_id != expected_id:
+                return False
+            committed = _commit_remote_exploration_state_locked(
+                self.runtime,
+                state,
+                request_id=expected_id,
+            )
+            if not committed:
+                return False
+            terminal = state.status in {
+                ExplorationStatus.SUCCEEDED,
+                ExplorationStatus.FAILED,
+                ExplorationStatus.CANCELLED,
+            }
+        self.runtime._notify_exploration_update(state)
+        return terminal
 
     def subscribe_exploration_updates(self, callback) -> Optional[int]:
         if not self._is_geometry_profile_enabled():
@@ -7077,6 +9137,13 @@ class PlatformGeometryProviderBundle(
                 message="platform_geometry profile 已禁用",
                 metadata={"provider": "platform_geometry_runtime", "shim": True},
             )
+        terminal_override = getattr(
+            self.runtime,
+            "_remote_exploration_terminal_override",
+            None,
+        )
+        if terminal_override is not None:
+            return terminal_override.model_copy(deep=True)
         remote = self._resolve_remote_exploration_provider()
         if remote is not None:
             try:
@@ -7085,7 +9152,9 @@ class PlatformGeometryProviderBundle(
                 LOGGER.exception("Bundle.get_exploration_state gRPC 异常，准备 fallback legacy。")
                 state = None
             if state is not None:
-                return self._wrap_remote_exploration_state(state)
+                wrapped = self._wrap_remote_exploration_state(state)
+                self.runtime._notify_exploration_update(wrapped)
+                return wrapped
             if not self._is_legacy_exploration_fallback_allowed():
                 from contracts.navigation import ExplorationState, ExplorationStatus
 
@@ -7125,14 +9194,17 @@ class PlatformGeometryProviderBundle(
         from contracts.navigation import ExplorationState, ExplorationStatus
 
         raw_status = str(state.get("status") or "").strip().lower()
+        stop_reason = str(state.get("last_stop_reason") or "").strip().lower()
         status_enum = {
             "idle": ExplorationStatus.IDLE,
-            "accepted": ExplorationStatus.RUNNING,
-            "queued": ExplorationStatus.RUNNING,
-            "pending": ExplorationStatus.RUNNING,
+            "accepted": ExplorationStatus.ACCEPTED,
+            "queued": ExplorationStatus.ACCEPTED,
+            "pending": ExplorationStatus.ACCEPTED,
             "active": ExplorationStatus.RUNNING,
             "running": ExplorationStatus.RUNNING,
             "in_progress": ExplorationStatus.RUNNING,
+            "stopping": ExplorationStatus.RUNNING,
+            "cancel_pending": ExplorationStatus.RUNNING,
             "succeeded": ExplorationStatus.SUCCEEDED,
             "success": ExplorationStatus.SUCCEEDED,
             "completed": ExplorationStatus.SUCCEEDED,
@@ -7141,9 +9213,17 @@ class PlatformGeometryProviderBundle(
             "cancelled": ExplorationStatus.CANCELLED,
             "canceled": ExplorationStatus.CANCELLED,
             "rejected": ExplorationStatus.FAILED,
-            "stopped": ExplorationStatus.CANCELLED,
             "unimplemented": ExplorationStatus.IDLE,
         }.get(raw_status, ExplorationStatus.IDLE)
+        if raw_status == "stopped":
+            if stop_reason in {"no_information_gain", "no_reachable_free_space", "hit_stop"}:
+                status_enum = ExplorationStatus.SUCCEEDED
+            elif stop_reason == "consecutive_failures_exceeded":
+                status_enum = ExplorationStatus.FAILED
+            elif stop_reason == "user_cancelled":
+                status_enum = ExplorationStatus.CANCELLED
+            else:
+                status_enum = ExplorationStatus.FAILED
         try:
             frontier_count = state.get("frontier_count")
             frontier_count = int(frontier_count) if frontier_count is not None else 0
@@ -7159,20 +9239,46 @@ class PlatformGeometryProviderBundle(
             timestamp_ns = int(timestamp_ns) if timestamp_ns is not None else 0
         except (TypeError, ValueError):
             timestamp_ns = 0
+        try:
+            map_revision = state.get("map_revision")
+            map_revision = int(map_revision) if map_revision is not None else 0
+        except (TypeError, ValueError):
+            map_revision = 0
         message = str(state.get("message") or "") or None
+        terminal = status_enum in {
+            ExplorationStatus.SUCCEEDED,
+            ExplorationStatus.FAILED,
+            ExplorationStatus.CANCELLED,
+        }
         metadata = {
             "provider": "geometry_runtime",
             "gRPC_facade": True,
+            "exploration_mode": "nuwax_geometry_runtime",
+            "geometry_session_mode": "explore" if raw_status != "idle" else "idle",
+            "status_text": message or raw_status.upper(),
+            "exploration_terminal": terminal,
+            "terminal_status": status_enum.value if terminal else None,
             "selected_source": state.get("selected_source") or None,
-            "last_stop_reason": state.get("last_stop_reason") or None,
+            "last_stop_reason": stop_reason or None,
             "request_id": state.get("request_id") or None,
+            "child_task_id": state.get("child_task_id") or None,
+            "map_version_id": state.get("map_version_id") or None,
+            "map_revision": map_revision,
             "revision": revision,
             "timestamp_ns": timestamp_ns,
         }
+        timestamp = (
+            datetime.fromtimestamp(timestamp_ns / 1_000_000_000.0, tz=timezone.utc)
+            if timestamp_ns > 0
+            else datetime.now(timezone.utc)
+        )
         return ExplorationState(
+            timestamp=timestamp,
+            updated_at=timestamp,
+            current_request_id=str(state.get("request_id") or "") or None,
             status=status_enum,
+            strategy=str(state.get("strategy") or "") or None,
             message=message,
             frontier_count=frontier_count,
-            revision=revision,
             metadata=metadata,
         )

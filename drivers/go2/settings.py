@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from contracts.geometry_runtime import PlatformGeometryConfig
 from drivers.go2.defaults import GO2_DEFAULT_FRAME_IDS
@@ -112,6 +112,7 @@ class Go2DirectDdsConfig:
     low_state_topic: str = "rt/lowstate"
     point_cloud_topic: str = "rt/utlidar/cloud"
     point_cloud_enabled: bool = False
+    point_cloud_xyz_registered_to_odom: bool = False
     read_timeout_sec: float = 0.5
     max_points_per_scan: int = 1200
 
@@ -143,7 +144,9 @@ class Go2DataPlaneConfig:
     video_stream: Go2VideoStreamConfig = field(default_factory=Go2VideoStreamConfig)
 
 
-def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None = None) -> Go2DataPlaneConfig:
+def load_go2_data_plane_config(
+    platform_geometry: Optional[PlatformGeometryConfig] = None,
+) -> Go2DataPlaneConfig:
     """加载 Go2 设备侧输入流与执行链配置。"""
 
     return Go2DataPlaneConfig(
@@ -164,6 +167,10 @@ def load_go2_data_plane_config(platform_geometry: PlatformGeometryConfig | None 
             low_state_topic=_cfg_str("GO2_DIRECT_DDS_LOW_STATE_TOPIC", "rt/lowstate"),
             point_cloud_topic=_cfg_str("GO2_DIRECT_DDS_POINT_CLOUD_TOPIC", "rt/utlidar/cloud"),
             point_cloud_enabled=_cfg_bool("GO2_DIRECT_DDS_POINT_CLOUD_ENABLED", False),
+            point_cloud_xyz_registered_to_odom=_cfg_bool(
+                "GO2_DIRECT_DDS_POINT_CLOUD_XYZ_REGISTERED_TO_ODOM",
+                False,
+            ),
             read_timeout_sec=max(0.05, _cfg_float("GO2_DIRECT_DDS_READ_TIMEOUT_SEC", 0.5)),
             max_points_per_scan=max(50, _cfg_int("GO2_DIRECT_DDS_MAX_POINTS_PER_SCAN", 1200)),
         ),

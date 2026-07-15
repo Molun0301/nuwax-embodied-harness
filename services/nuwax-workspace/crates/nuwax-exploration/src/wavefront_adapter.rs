@@ -17,8 +17,8 @@ use nuwax_nav_types_messages::grid::OccupancyGrid2D;
 
 use crate::runtime::WavefrontInputReceiver;
 use crate::{
-    ExplorationGoalSource, ExplorationPoll, ExplorationSourceDiagnostics, ExplorationStateSnapshot,
-    ExploreError, ExploreResult,
+    ExplorationBoundary, ExplorationGoalFeedback, ExplorationGoalSource, ExplorationPoll,
+    ExplorationSourceDiagnostics, ExplorationStateSnapshot, ExploreError, ExploreResult,
 };
 
 /// 简单 deterministic id source(用于测试 / 生产 uuid 替代)
@@ -47,7 +47,13 @@ pub struct WavefrontGoalSourceAdapter {
     cached_odom: RefCell<Option<nuwax_nav_types_messages::geometry::PoseStamped>>,
     is_active: bool,
     last_goal_id: Option<String>,
+    last_goal: Option<nuwax_nav_types_messages::visual::FrontierGoal>,
+    last_frontiers: Vec<nuwax_nav_types_messages::visual::FrontierGoal>,
     last_error: Option<String>,
+    boundary: Option<ExplorationBoundary>,
+    max_navigation_retries: u32,
+    blacklist_radius_m: f64,
+    max_consecutive_failures: u32,
 }
 
 impl WavefrontGoalSourceAdapter {
@@ -59,6 +65,8 @@ impl WavefrontGoalSourceAdapter {
         id_source: Box<dyn FrontierGoalIdSource + Send>,
     ) -> Self {
         let name = name.into();
+        let blacklist_radius_m = config.safe_distance_m;
+        let max_consecutive_failures = config.max_consecutive_failures;
         Self {
             name,
             selector: WavefrontGoalSelector::new(config),
@@ -68,7 +76,13 @@ impl WavefrontGoalSourceAdapter {
             cached_odom: RefCell::new(None),
             is_active: false,
             last_goal_id: None,
+            last_goal: None,
+            last_frontiers: Vec::new(),
             last_error: None,
+            boundary: None,
+            max_navigation_retries: 1,
+            blacklist_radius_m,
+            max_consecutive_failures,
         }
     }
 
@@ -87,6 +101,18 @@ impl WavefrontGoalSourceAdapter {
     #[must_use]
     pub fn cached_costmap(&self) -> Option<OccupancyGrid2D> {
         self.cached_costmap.borrow().clone()
+    }
+
+    /// 设置会话 boundary 和 child navigation retry/blacklist 策略。
+    pub fn configure_constraints(
+        &mut self,
+        boundary: Option<ExplorationBoundary>,
+        max_navigation_retries: u32,
+        blacklist_radius_m: f64,
+    ) {
+        self.boundary = boundary;
+        self.max_navigation_retries = max_navigation_retries;
+        self.blacklist_radius_m = blacklist_radius_m.max(0.0);
     }
 }
 
@@ -122,6 +148,8 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
         self.is_active = true;
         self.session = ExplorationSession::new();
         self.last_goal_id = None;
+        self.last_goal = None;
+        self.last_frontiers.clear();
         self.last_error = None;
         Ok(())
     }
@@ -135,6 +163,21 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
         &mut self,
         state: &ExplorationStateSnapshot<'_>,
     ) -> ExploreResult<ExplorationPoll> {
+        if !self.is_active {
+            return Ok(ExplorationPoll::SourceUnavailable(
+                "wavefront source not active".to_string(),
+            ));
+        }
+        if self.last_goal.is_some() {
+            return Ok(ExplorationPoll::Pending);
+        }
+        if self.session.consecutive_failures() >= self.max_consecutive_failures
+            && self.max_consecutive_failures > 0
+        {
+            return Ok(ExplorationPoll::Stop(
+                crate::ExplorationStopReason::ConsecutiveFailuresExceeded,
+            ));
+        }
         // 优先用 snapshot 中的 costmap,否则用缓存
         let costmap_opt: Option<OccupancyGrid2D> = state
             .global_costmap
@@ -160,13 +203,32 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
             &mut *self.id_source,
         ) {
             Ok(GoalSelection::Goal(goal)) => {
+                let goal_point = goal.pose.pose.position.to_2d();
+                if self
+                    .boundary
+                    .as_ref()
+                    .is_some_and(|boundary| !boundary.contains(goal_point))
+                {
+                    self.session
+                        .blacklist_goal(goal_point, self.blacklist_radius_m);
+                    self.last_frontiers.clear();
+                    self.last_error = Some(format!(
+                        "frontier {} rejected: outside exploration boundary",
+                        goal.id
+                    ));
+                    return Ok(ExplorationPoll::Pending);
+                }
                 let id = goal.id.clone();
+                self.session.record_goal_published();
+                self.last_frontiers = vec![goal.clone()];
+                self.last_goal = Some(goal.clone());
                 let polled = ExplorationPoll::Goal(goal);
                 self.last_goal_id = Some(id);
                 self.last_error = None;
                 Ok(polled)
             }
             Ok(GoalSelection::NoFrontier) => {
+                self.last_frontiers.clear();
                 self.last_error = None;
                 Ok(ExplorationPoll::Pending)
             }
@@ -184,6 +246,8 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
                     // MEDIUM-2 修正:用户 stop_movement 走独立 reason
                     StopReason::UserCancelled => crate::ExplorationStopReason::UserCancelled,
                 };
+                self.last_goal = None;
+                self.last_frontiers.clear();
                 Ok(ExplorationPoll::Stop(facade_stop))
             }
             Err(e) => {
@@ -192,6 +256,49 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
                 Err(ExploreError::SourceError(msg))
             }
         }
+    }
+
+    fn report_goal_feedback(
+        &mut self,
+        goal_id: &str,
+        feedback: ExplorationGoalFeedback,
+    ) -> ExploreResult<()> {
+        let Some(goal) = self.last_goal.as_ref() else {
+            return Ok(());
+        };
+        if goal.id != goal_id {
+            return Ok(());
+        }
+        let point = goal.pose.pose.position.to_2d();
+        match feedback {
+            ExplorationGoalFeedback::Reached => {
+                self.session.record_goal_reached(point);
+                self.last_error = None;
+            }
+            ExplorationGoalFeedback::Failed(reason) => {
+                let blacklisted = self.session.record_goal_failed(
+                    point,
+                    self.max_navigation_retries,
+                    self.blacklist_radius_m,
+                );
+                self.last_error = Some(if blacklisted {
+                    format!("navigation failed and frontier blacklisted: {reason}")
+                } else {
+                    format!("navigation failed; retry remains available: {reason}")
+                });
+            }
+            ExplorationGoalFeedback::Cancelled => {
+                self.last_error = Some("navigation goal cancelled".to_string());
+            }
+        }
+        self.last_goal = None;
+        self.last_goal_id = None;
+        self.last_frontiers.clear();
+        Ok(())
+    }
+
+    fn frontier_snapshot(&self) -> Vec<nuwax_nav_types_messages::visual::FrontierGoal> {
+        self.last_frontiers.clone()
     }
 
     fn diagnostics(&self) -> ExplorationSourceDiagnostics {
@@ -234,6 +341,22 @@ mod tests {
             latest_frontier_goal: None,
             now,
         }
+    }
+
+    fn frontier_grid() -> OccupancyGrid2D {
+        let mut grid = OccupancyGrid2D {
+            origin: Point2 { x: 0.0, y: 0.0 },
+            resolution: 0.5,
+            width: 12,
+            height: 12,
+            cells: vec![OccupancyCell::Unknown; 144],
+        };
+        for y in 2..=7 {
+            for x in 2..=7 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        grid
     }
 
     #[test]
@@ -313,5 +436,62 @@ mod tests {
         };
         let s = sample_state(Some(&grid), Timestamp::default());
         let _ = ad.poll_goal(&s).unwrap();
+    }
+
+    #[test]
+    fn selected_goal_stays_in_flight_until_navigation_feedback() {
+        let mut ad =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        ad.begin().unwrap();
+        let grid = frontier_grid();
+        let s = sample_state(Some(&grid), Timestamp::default());
+
+        let first = ad.poll_goal(&s).unwrap();
+        let goal = match first {
+            ExplorationPoll::Goal(goal) => goal,
+            other => panic!("expected frontier goal, got {other:?}"),
+        };
+        assert_eq!(ad.frontier_snapshot().len(), 1);
+        assert!(matches!(
+            ad.poll_goal(&s).unwrap(),
+            ExplorationPoll::Pending
+        ));
+
+        ad.report_goal_feedback(&goal.id, ExplorationGoalFeedback::Reached)
+            .unwrap();
+        assert!(ad.frontier_snapshot().is_empty());
+        assert!(ad.last_goal.is_none());
+    }
+
+    #[test]
+    fn boundary_rejects_out_of_area_frontier() {
+        let mut ad =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        ad.configure_constraints(
+            Some(
+                ExplorationBoundary::from_vertices(vec![
+                    Point2 { x: 0.0, y: 0.0 },
+                    Point2 { x: 0.9, y: 0.0 },
+                    Point2 { x: 0.9, y: 0.9 },
+                    Point2 { x: 0.0, y: 0.9 },
+                ])
+                .unwrap(),
+            ),
+            0,
+            0.5,
+        );
+        ad.begin().unwrap();
+        let grid = frontier_grid();
+        let s = sample_state(Some(&grid), Timestamp::default());
+
+        assert!(matches!(
+            ad.poll_goal(&s).unwrap(),
+            ExplorationPoll::Pending
+        ));
+        assert!(ad.frontier_snapshot().is_empty());
+        assert!(ad
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("outside exploration boundary")));
     }
 }

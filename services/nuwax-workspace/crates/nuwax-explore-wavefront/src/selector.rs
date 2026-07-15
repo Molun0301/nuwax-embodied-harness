@@ -89,6 +89,9 @@ impl WavefrontGoalSelector {
             &crate::detector::FrontierCandidate,
         )> = Vec::with_capacity(candidates.len());
         for cand in &candidates {
+            if session.is_blacklisted(cand.cluster.centroid) {
+                continue;
+            }
             let geom = CandidateGeometry {
                 centroid: cand.cluster.centroid,
                 cell_count: cand.cluster.cell_count,

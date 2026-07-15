@@ -15,7 +15,7 @@ import struct
 import time
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 LOGGER = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ LOGGER = logging.getLogger(__name__)
 class VideoUdsSender:
     """通过 Unix Domain Socket 发送视频帧到 Rust 中转进程。"""
 
-    def __init__(self, uds_path: str | Path, reconnect_interval: float = 2.0):
+    def __init__(self, uds_path: Union[str, Path], reconnect_interval: float = 2.0):
         self._path = str(uds_path)
         self._sock: Optional[socket.socket] = None
         self._reconnect_interval = reconnect_interval

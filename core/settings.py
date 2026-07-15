@@ -50,7 +50,6 @@ from contracts.geometry_runtime import (
     build_default_geometry_runtime_binary,
     build_default_geometry_runtime_port,
     build_default_geometry_runtime_ready_file,
-    build_default_geometry_runtime_start_script,
     build_default_lcm_url,
     build_default_nuwax_workspace_dir,
     build_default_rtabmap_database_root,
@@ -183,6 +182,18 @@ def _normalize_lcm_backend(value: str) -> str:
     )
 
 
+def _normalize_explore_arbitration(value: str) -> str:
+    """只允许当前生产构建实际提供的 wavefront source。"""
+
+    raw = (value or "").strip().lower()
+    if raw in ("", "prefer_wavefront"):
+        return "prefer_wavefront"
+    raise ValueError(
+        f"NUWAX_EXPLORE_ARBITRATION={value!r} 当前不受支持；"
+        "生产构建只 qualification 了 'prefer_wavefront'。"
+    )
+
+
 _DEPRECATION_LOGGER = logging.getLogger("nuwax_robot_bridge.settings.deprecation")
 _DEPRECATED_ENV_NOTIFIED: set[str] = set()
 
@@ -215,9 +226,8 @@ NAV_PROXY_PENDING_QUEUE_MAX_SIZE: int = max(
 # - NUWAX_NAV_PROFILE    → Rust `nav_runtime.rs` 读取,选择 simple-2d /
 #                          replanning-astar / cmu-native / mls3d / exploration-native;
 #                          默认 simple-2d,与 nuwax-nav-stack foundation 组合对齐。
-# - NUWAX_EXPLORE_ARBITRATION → Rust `explore_runtime.rs` 读取,选择
-#                          PreferWavefront / PreferTare / HighestScore / FirstAvailable;
-#                          默认 prefer_wavefront,与 nuwax-explore-wavefront 对齐。
+# - NUWAX_EXPLORE_ARBITRATION → 当前只允许 prefer_wavefront；未 qualification
+#                          的 native source 会在配置加载期显式拒绝，禁止静默降级。
 # - NUWAX_REAL_LCM_REQUIRED → true 时强制要求 real-lcm backend(2026-07-08
 #                          fake-lcm 物理删除后是**唯一** backend);上游不可用时
 #                          进程 exit 1 + LCM_BACKEND_UNAVAILABLE。fake-lcm 已
@@ -225,7 +235,7 @@ NAV_PROXY_PENDING_QUEUE_MAX_SIZE: int = max(
 #                          默认 false 由环境侧决策。
 NAV_PROFILE: str = _cfg_str("NUWAX_NAV_PROFILE", "simple-2d").strip() or "simple-2d"
 EXPLORE_ARBITRATION: str = (
-    _cfg_str("NUWAX_EXPLORE_ARBITRATION", "prefer_wavefront").strip() or "prefer_wavefront"
+    _normalize_explore_arbitration(_cfg_str("NUWAX_EXPLORE_ARBITRATION", "prefer_wavefront"))
 )
 REAL_LCM_REQUIRED: bool = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
 
@@ -405,11 +415,10 @@ class LowLevelControlConfig:
 # ============================================================
 # R-N2:nuwax-workspace runtime 配置 dataclass(Round 5 §4.2 / §12.4 落地)
 # ============================================================
-# 这些 dataclass 是 .env.example 14 键(LCM typed) + 10 键(runtime alias) +
-# 6 键(mapping adapter) + 1 键(LCM backend 复合) 的 Python 端结构化入口。
-# 注意:`occ_topic` 不在本表(Rust `channel_registry.rs OccTopic` 内部别名,
-# platform 不消费),由 .env 直读走;`LcmChannelConfig` 字段保持 13 字段与
-# 现有 `contracts/geometry_runtime.py:LcmChannelConfig` 对齐。
+# 这些 dataclass 是 .env.example 12 键(LCM typed) + 12 键(runtime alias) +
+# 1 键(LCM backend 复合) 的 Python 端结构化入口。
+# `LcmChannelConfig` 仍保留历史消息字段的固定默认值，但 platform 不再暴露
+# 无 runtime consumer 的 tf_static / initial_pose / occ_topic 环境入口。
 @dataclass(frozen=True)
 class LcmBackendConfig:
     """LCM 后端 + 共享内存路径配置(对齐 lcm_runtime.rs + server.rs)。
@@ -428,7 +437,7 @@ class LcmBackendConfig:
 
 @dataclass(frozen=True)
 class RuntimeChannelAliasConfig:
-    """Runtime 进程内 channel alias(对齐 `channel_registry.rs` 10 个 `*_CHANNEL` 表项)。
+    """Runtime 进程内 channel alias(对齐 `channel_registry.rs` 12 个 `*_CHANNEL` 表项)。
 
     这些字段是 platform 视角下的"内层 alias"——Rust runtime 启动时优先
     探测该 env,缺省时 fallback 到对应 `NUWAX_LCM_CHANNEL_*` 平台键。
@@ -436,32 +445,28 @@ class RuntimeChannelAliasConfig:
 
     odom: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL", "/odom")
     tf: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL", "/tf")
-    cloudmap: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL", "/go2/lidar/points")
+    pointcloud: str = _cfg_str(
+        "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL",
+        "/go2/lidar/points#sensor_msgs.PointCloud2",
+    )
+    cloudmap: str = _cfg_str(
+        "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+        "/cloud_map#sensor_msgs.PointCloud2",
+    )
     occupancy: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL", "/map/occupancy")
     cmd_vel: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL", "/cmd_vel")
-    nav_goal: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL", "/nav/goal")
+    nav_goal: str = _cfg_str(
+        "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL",
+        "/nav/goal#nuwax_msgs.GoalEnvelope",
+    )
+    nav_path: str = _cfg_str(
+        "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL",
+        "/nav/path#nuwax_msgs.PathEnvelope",
+    )
     nav_state: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL", "/nav/state")
     frontiers: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL", "/explore/frontiers")
     pose: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL", "/pose_stamped")
     nav_cancel: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL", "/nav/cancel")
-
-
-@dataclass(frozen=True)
-class MappingAdapterConfig:
-    """Rust `nuwax-mapping-*` 适配器配置(对齐 `nuwax-workspace` 6 键)。
-
-    这些键是 Rust 端 `nuwax-mapping-cloud` / `nuwax-mapping-ros` /
-    `nuwax-mapping-rtabmap` / `nuwax-mapping-slam` 各自 crate 启动期探测
-    的 env;Python 端仅作为 .env SSOT 镜像存在。
-    """
-
-    cloud_enabled: bool = _cfg_bool("NUWAX_MAPPING_CLOUD_ENABLED", False)
-    cloud_provider: str = _cfg_str("NUWAX_MAPPING_CLOUD_PROVIDER", "google_maps")
-    cloud_cache_dir: str = _cfg_str("NUWAX_MAPPING_CLOUD_CACHE_DIR", "/tmp/nuwax_mapping_cloud")
-    ros_compat_enabled: bool = _cfg_bool("NUWAX_MAPPING_ROS_COMPAT_ENABLED", False)
-    rtabmap_database_dir: str = _cfg_str("NUWAX_MAPPING_RTABMAP_DATABASE_DIR", "/tmp/nuwax_rtabmap")
-    slam_provider: str = _cfg_str("NUWAX_MAPPING_SLAM_PROVIDER", "rtabmap")
-
 
 
 @dataclass
@@ -952,10 +957,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
             "NUWAX_GEOMETRY_RUNTIME_READY_FILE",
             build_default_geometry_runtime_ready_file(),
         ),
-        runtime_start_script=_cfg_str(
-            "NUWAX_GEOMETRY_RUNTIME_START_SCRIPT",
-            build_default_geometry_runtime_start_script(),
-        ),
         lcm_url=_cfg_str("NUWAX_LCM_URL", build_default_lcm_url()),
         # Phase 0 收敛：LCM backend canonical 命名只允许 real-lcm / fake-lcm；
         # 历史 alias (real/fake) 在 _normalize_lcm_backend 归一化并打 warning。
@@ -980,9 +981,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
             cost_map_topic=_cfg_str("NUWAX_GEOMETRY_COST_MAP_TOPIC", "/nav/costmap"),
         ),
         frames=GeometryFrameConfig(
-            map_frame=_cfg_str("NUWAX_GEOMETRY_MAP_FRAME", "map"),
+            map_frame=_cfg_str_alias("NUWAX_MAP_FRAME", "NUWAX_GEOMETRY_MAP_FRAME", "map"),
             odom_frame=_cfg_str("NUWAX_GEOMETRY_ODOM_FRAME", "odom"),
-            base_frame=_cfg_str("NUWAX_GEOMETRY_BASE_FRAME", "base_link"),
+            base_frame=_cfg_str_alias("NUWAX_BASE_FRAME", "NUWAX_GEOMETRY_BASE_FRAME", "base_link"),
             lidar_frame=_cfg_str("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),
             imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
@@ -1108,7 +1109,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
         lcm_channels=LcmChannelConfig(
             odom=_cfg_str("NUWAX_LCM_CHANNEL_ODOM", "/odom#nav_msgs.Odometry"),
             tf=_cfg_str("NUWAX_LCM_CHANNEL_TF", "/tf#tf2_msgs.TFMessage"),
-            tf_static=_cfg_str("NUWAX_LCM_CHANNEL_TF_STATIC", "/tf_static#tf2_msgs.TFMessage"),
             point_cloud=_cfg_str(
                 "NUWAX_LCM_CHANNEL_POINTCLOUD",
                 "/go2/lidar/points#sensor_msgs.PointCloud2",
@@ -1118,11 +1118,14 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "/map/occupancy#nav_msgs.OccupancyGrid",
             ),
             cmd_vel=_cfg_str("NUWAX_LCM_CHANNEL_CMD_VEL", "/cmd_vel#geometry_msgs.Twist"),
-            initial_pose=_cfg_str(
-                "NUWAX_LCM_CHANNEL_INITIAL_POSE",
-                "/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped",
+            goal_pose=_cfg_str(
+                "NUWAX_LCM_CHANNEL_GOAL_POSE",
+                "/nav/goal#nuwax_msgs.GoalEnvelope",
             ),
-            goal_pose=_cfg_str("NUWAX_LCM_CHANNEL_GOAL_POSE", "/nav/goal#geometry_msgs.PoseStamped"),
+            nav_path=_cfg_str(
+                "NUWAX_LCM_CHANNEL_NAV_PATH",
+                "/nav/path#nuwax_msgs.PathEnvelope",
+            ),
             frontier=_cfg_str(
                 "NUWAX_LCM_CHANNEL_FRONTIER",
                 "/explore/frontiers#nuwax_msgs.FrontierList",

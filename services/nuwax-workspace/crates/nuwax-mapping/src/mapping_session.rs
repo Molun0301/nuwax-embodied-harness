@@ -2,21 +2,10 @@
 //!
 //! 替换 `nuwax-geometry-runtime/src/mapping_adapter.rs::FeedOnlyAccumulator`:
 //! - 默认 `bounded_capacity = 8_000_000`(`POINTCLOUD_MAX_RAW_POINTS` 默认值)
-//! - `freshness` 校验:`now_ns - last_seen_at_ns > STALE_THRESHOLD_NS` 抛 `StaleRevisionError`
-//! - `dedup_key`:`(odom_x_mm, odom_y_mm, point_step)` 同量化坐标 + 同 step → 保留首帧
-//! - `accumulator`:`BoundedRing<Point3<f64>>` 写满 capacity 抛 `ResourceExhaustedError`
-//! - 4 method:`feed_pointcloud` / `feed_pose` / `build_and_publish` / `snapshot_stats`
-//!
-//! 字段命名/语义对齐 W12 Python `tools/mapping/w8_mapping_session.py`
-//! (RALPLAN §Phase M #1 + W2 §B.1,2026-07-12 W12 落地)。
-//!
-//! 与 `XyzAccumulator::into_points(self)` 不同,`MappingSession` 提供 `clone_points(&self)`
-//! 只读视图,occupancy builder 可在 `&self` 上工作 —— 与 adapter 的 `build_occupancy`
-//! 语义一致(不消费 session,后续 feed 仍能继续累积)。
-//!
-//! ## 与 `FeedOnlyAccumulator` 的差异
-//! - `FeedOnlyAccumulator`:无限追加,只暴露 `feed/count/clone_points`
-//! - `MappingSession`:bounded + freshness + dedup + typed error + stats
+//! - 点预算满时滚动淘汰最旧点，持续接收新数据
+//! - freshness 只拒绝比消息时间水位倒退超过容差的旧帧
+//! - dedup 只过滤同时间戳、同内容、同采集位姿的消息重放，历史固定为 4096 帧
+//! - `make_contiguous_points` 为同步 occupancy builder 提供零拷贝切片
 //!
 //! ## typed error 与 W12 Python 对应
 //! - `ResourceExhaustedError` ↔ Python `ResourceExhaustedError`
@@ -24,13 +13,12 @@
 //! - 与 P0B #4 的 stable errors 一致(`RESOURCE_EXHAUSTED` / `STALE_REVISION`)
 //!
 //! ## 实现注意
-//! - 不持有外部时钟;`now_ns` 由调用方传入(LCM 调度帧自带 timestamp,跨 crate 传单调时钟)
-//! - `BoundedRing` 用 `VecDeque` + 显式 capacity check(显式抛错而非 silent evict,
-//!   与 W2 §B.1 "超 capacity 返 RESOURCE_EXHAUSTED typed error" 一致)
-//! - `dedup_set` 容量与 capacity 同阶;此处只校验重复坐标,允许后续 GC 策略扩展
+//! - 不持有外部时钟；消息时间戳由调用方从 PointCloud2 header 传入
+//! - `VecDeque` 维护点预算，`HashSet + VecDeque` 维护固定长度的重放身份历史
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashSet, VecDeque};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use nalgebra::Point3;
 
@@ -46,23 +34,17 @@ use crate::pointclouds::PointCloudAccumulator;
 /// 防止恶意 / 异常上游 LCM 帧把 adapter 撑爆。
 pub const DEFAULT_BOUNDED_CAPACITY: usize = 8_000_000;
 
-/// `freshness` 阈值 —— 200ms。超过该阈值视为 `StaleRevisionError`。
-///
-/// 与 W12 Python `STALE_THRESHOLD_MS = 200` 1:1 对齐;LCM /odom + /go2/lidar/points
-/// 在 100Hz 下相邻帧间隔约 10ms,200ms 已能覆盖网络抖动与 GC stall。
+/// 消息时间允许的逆序容差。比最高水位落后超过 200ms 才视为 stale。
 pub const DEFAULT_STALE_THRESHOLD_NS: u64 = 200 * 1_000_000;
+
+/// 最近重放帧的去重历史上限。该上限只按帧计数，与点预算相互独立。
+pub const DEFAULT_DEDUP_HISTORY_FRAMES: usize = 4_096;
 
 /// odom 坐标量化精度 —— 1mm。对齐 W12 Python `_odom_key` 的 `* 1000.0`。
 ///
 /// 用于 dedup_key 的 mm 量化;同 mm 网格内的 odom 视为同一坐标,避免浮点误差导致
 /// dedup miss。
 pub const ODOM_QUANTIZE_MM: i64 = 1000;
-
-fn batch_fits_capacity(current_size: usize, attempted_points: usize, capacity: usize) -> bool {
-    current_size
-        .checked_add(attempted_points)
-        .is_some_and(|next_size| next_size <= capacity)
-}
 
 // ============================================================================
 // typed error
@@ -71,7 +53,7 @@ fn batch_fits_capacity(current_size: usize, attempted_points: usize, capacity: u
 /// `MappingSession` 错误基类(对应 W12 Python `SessionError`)。
 #[derive(Debug)]
 pub enum SessionError {
-    /// bounded_capacity 已满,本次 feed 无法入环
+    /// 配置为零容量，无法保留任何输入点。
     ResourceExhausted {
         /// 配置的最大点数。
         capacity: usize,
@@ -80,14 +62,23 @@ pub enum SessionError {
         /// 本次批次尝试写入的点数。
         attempted_points: usize,
     },
-    /// odom_pose 时间戳陈旧(`now_ns - last_seen_at_ns > STALE_THRESHOLD_NS`)
+    /// 消息时间戳比已接收最高水位倒退超过容差。
     StaleRevision {
-        /// 检测到间隔前的 freshness 水位。
+        /// 已接收消息时间戳的最高水位。
         last_seen_at_ns: u64,
         /// 被判定为 stale 的当前帧时间。
         now_ns: u64,
-        /// 允许的最大帧间隔。
+        /// 允许的最大逆序幅度。
         threshold_ns: u64,
+    },
+    /// 输入 frame 无法通过已建立的刚体变换进入目标 map frame。
+    FrameTransformUnavailable {
+        /// 当前输入声明的源 frame。
+        source_frame_id: String,
+        /// mapping session 的全局输出 frame。
+        target_frame_id: String,
+        /// 稳定、可诊断的拒绝原因。
+        reason: String,
     },
 }
 
@@ -109,6 +100,14 @@ impl fmt::Display for SessionError {
             } => write!(
                 f,
                 "MappingSession revision 陈旧:last={last_seen_at_ns}ns now={now_ns}ns threshold={threshold_ns}ns"
+            ),
+            Self::FrameTransformUnavailable {
+                source_frame_id,
+                target_frame_id,
+                reason,
+            } => write!(
+                f,
+                "MappingSession frame transform 不可用:source={source_frame_id} target={target_frame_id} reason={reason}"
             ),
         }
     }
@@ -142,6 +141,8 @@ pub struct FeedStats {
     pub accepted: usize,
     /// 本次因 dedup 跳过的点数。
     pub dedup_skipped: usize,
+    /// 为给新点腾出预算而移除的旧点，以及超大批次中未保留的最旧输入点。
+    pub evicted: usize,
     /// feed 完成后的累积点数。
     pub current_size: usize,
     /// session 配置的最大点数。
@@ -163,6 +164,7 @@ impl FeedStats {
         Self {
             accepted: 0,
             dedup_skipped: skipped,
+            evicted: 0,
             current_size,
             capacity,
             last_seen_at_ns,
@@ -180,6 +182,26 @@ impl FeedStats {
         Self {
             accepted,
             dedup_skipped: 0,
+            evicted: 0,
+            current_size,
+            capacity,
+            last_seen_at_ns,
+            published: false,
+        }
+    }
+
+    /// 接收新点并滚动淘汰旧点时的结果。
+    pub fn accepted_with_eviction(
+        accepted: usize,
+        evicted: usize,
+        current_size: usize,
+        capacity: usize,
+        last_seen_at_ns: u64,
+    ) -> Self {
+        Self {
+            accepted,
+            dedup_skipped: 0,
+            evicted,
             current_size,
             capacity,
             last_seen_at_ns,
@@ -205,7 +227,13 @@ pub struct SessionStats {
     pub last_pose: [f64; 3],
     /// 当前 dedup key 数量。
     pub dedup_set_size: usize,
+    /// 成功接收点数据的单调代次，供上层避免重复全量重建。
+    pub generation: u64,
+    /// session 生命周期内累计滚动淘汰的点数。
+    pub evicted_point_count: u64,
 }
+
+type FrameDedupKey = (i64, i64, u32, u64, u64);
 
 // ============================================================================
 // MappingSession —— 核心有界增量 session
@@ -213,45 +241,27 @@ pub struct SessionStats {
 
 /// 有界增量 mapping session(Phase M #1 #1)。
 ///
-/// 替换 `services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs::FeedOnlyAccumulator`:
-/// - `bounded_capacity`:`VecDeque` 上限,显式抛错(非 silent evict)
-/// - `current_window`:`VecDeque<Point3<f64>>` 当前累积点云
-/// - `dedup_key`:HashSet<(odom_x_mm, odom_y_mm, point_step)>
-/// - `accumulator`:`VecDeque<Point3<f64>>`(即 current_window 的别名,字段语义)
-/// - `freshness`:`u64` 纳秒单调时间戳(`0` 表示未初始化,跳过 freshness 校验)
-///
-/// 与 `XyzAccumulator` 不同:
-/// - 显式 capacity 边界 → typed `ResourceExhaustedError`
-/// - freshness 窗口 → typed `StaleRevisionError`
-/// - 同 odom_pose + 同 point_step dedup → 保留首帧
-///
-/// 与 `FeedOnlyAccumulator` 对比:
-/// - `FeedOnlyAccumulator`:无限追加,只暴露 `feed/count/clone_points`
-/// - `MappingSession`:bounded + freshness + dedup + typed error + stats + clone_points
-///
-/// **`Clone`**:`Arc::make_mut` 需要内部类型实现 `Clone`,W37 给 session 加
-/// `#[derive(Clone)]` 以让 `MappingAdapter.session: Arc<MappingSession>` 路径
-/// 在多 strong ref 时能 clone 数据(单 ref 路径零拷贝)。Clone 成本与
-/// `current_window` + `dedup_set` 大小成正比,实机 8M 点时是几 MB 量级,
-/// 在 `feed_pointcloud_session` 高频路径不构成瓶颈(每次只 clone 一次,
-/// 且只在 ref 计数 > 1 时触发)。
+/// `current_window` 是唯一点数据容器；容量压力滚动淘汰旧点。freshness 使用消息
+/// 时间最高水位，dedup 使用固定长度的完整帧身份历史。
 #[derive(Clone)]
 pub struct MappingSession {
     /// `bounded_capacity` —— 与 `POINTCLOUD_MAX_RAW_POINTS` 默认对齐 8M
     pub(crate) bounded_capacity: usize,
     /// `current_window` —— 当前累积的 `Point3<f64>`(顺序保留,支持 clone_points)
     pub(crate) current_window: VecDeque<Point3<f64>>,
-    /// `dedup_key` —— `(odom_x_mm, odom_y_mm, point_step)`,同量化坐标 + 同 step 视为重复
-    pub(crate) dedup_set: HashSet<(i64, i64, u32)>,
-    /// `accumulator` —— 与 `current_window` 同义,字段名沿用 W2 §B.1 设计草案
-    /// (避免 W12 报告里"accumulator"与"current_window"双名混淆)
-    pub(crate) accumulator: VecDeque<Point3<f64>>,
-    /// `freshness` —— 最近一次观察到的非零 `now_ns`(单调时钟,调用方传入)
+    /// 最近接收的帧身份集合，只用于识别消息重放。
+    pub(crate) dedup_set: HashSet<FrameDedupKey>,
+    /// 与 `dedup_set` 同步的 FIFO，用于执行固定上限淘汰。
+    pub(crate) dedup_order: VecDeque<FrameDedupKey>,
+    pub(crate) dedup_history_capacity: usize,
+    /// `freshness` —— 已接收消息时间戳的最高水位。
     pub(crate) freshness: u64,
     /// 当前 sensor_origin (从 odom 平移部分)
     pub(crate) last_pose: [f64; 3],
     /// freshness 阈值(纳秒),默认 200ms
     pub(crate) stale_threshold_ns: u64,
+    generation: u64,
+    evicted_point_count: u64,
 }
 
 impl MappingSession {
@@ -269,16 +279,26 @@ impl MappingSession {
             bounded_capacity,
             current_window: VecDeque::with_capacity(bounded_capacity.min(1024)),
             dedup_set: HashSet::new(),
-            accumulator: VecDeque::with_capacity(bounded_capacity.min(1024)),
+            dedup_order: VecDeque::with_capacity(DEFAULT_DEDUP_HISTORY_FRAMES),
+            dedup_history_capacity: DEFAULT_DEDUP_HISTORY_FRAMES,
             freshness: 0,
             last_pose: [0.0, 0.0, 0.0],
             stale_threshold_ns: DEFAULT_STALE_THRESHOLD_NS,
+            generation: 0,
+            evicted_point_count: 0,
         }
     }
 
     /// 显式指定 freshness 阈值(覆盖 `DEFAULT_STALE_THRESHOLD_NS = 200ms`)。
     pub fn with_stale_threshold_ns(mut self, stale_threshold_ns: u64) -> Self {
         self.stale_threshold_ns = stale_threshold_ns;
+        self
+    }
+
+    /// 覆盖按帧计数的重放去重历史上限。
+    pub fn with_dedup_history_capacity(mut self, capacity: usize) -> Self {
+        self.dedup_history_capacity = capacity;
+        self.dedup_order = VecDeque::with_capacity(capacity.min(1024));
         self
     }
 
@@ -307,11 +327,21 @@ impl MappingSession {
         self.dedup_set.len()
     }
 
+    /// 成功接收点数据的单调代次。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// 当前累积点的克隆(供 occupancy builder 输入;`&self` 上 read-only)。
     ///
     /// 与 `FeedOnlyAccumulator::clone_points` 同语义,不消费 session。
     pub fn clone_points(&self) -> Vec<Point3<f64>> {
         self.current_window.iter().copied().collect()
+    }
+
+    /// 返回连续内存中的当前滚动窗口，供同步构建器零拷贝读取。
+    pub fn make_contiguous_points(&mut self) -> &[Point3<f64>] {
+        self.current_window.make_contiguous()
     }
 
     /// 构造 dedup_key —— 量化 odom_x/odom_y 到 mm,point_step 原值。
@@ -323,24 +353,90 @@ impl MappingSession {
         (x_mm, y_mm, point_step)
     }
 
+    fn points_fingerprint(points: &[Point3<f64>]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        points.len().hash(&mut hasher);
+        for point in points {
+            point.x.to_bits().hash(&mut hasher);
+            point.y.to_bits().hash(&mut hasher);
+            point.z.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn frame_dedup_key(
+        points: &[Point3<f64>],
+        odom_xy: (f64, f64),
+        point_step: u32,
+        message_timestamp_ns: u64,
+    ) -> FrameDedupKey {
+        let (x_mm, y_mm, point_step) = Self::dedup_key(odom_xy, point_step);
+        (
+            x_mm,
+            y_mm,
+            point_step,
+            message_timestamp_ns,
+            Self::points_fingerprint(points),
+        )
+    }
+
+    fn remember_dedup_key(&mut self, key: FrameDedupKey) {
+        if self.dedup_history_capacity == 0 || !self.dedup_set.insert(key) {
+            return;
+        }
+        self.dedup_order.push_back(key);
+        while self.dedup_order.len() > self.dedup_history_capacity {
+            if let Some(expired) = self.dedup_order.pop_front() {
+                self.dedup_set.remove(&expired);
+            }
+        }
+    }
+
+    fn append_with_rolling_capacity(&mut self, points: &[Point3<f64>]) -> (usize, usize) {
+        if points.is_empty() || self.bounded_capacity == 0 {
+            return (0, points.len());
+        }
+
+        let accepted = points.len().min(self.bounded_capacity);
+        let dropped_from_batch = points.len() - accepted;
+        let retained_start = points.len() - accepted;
+        let existing_budget = self.bounded_capacity - accepted;
+        let evicted_existing = self.current_window.len().saturating_sub(existing_budget);
+        self.current_window.drain(..evicted_existing);
+        self.current_window
+            .extend(points[retained_start..].iter().copied());
+        let evicted = evicted_existing.saturating_add(dropped_from_batch);
+        self.evicted_point_count = self
+            .evicted_point_count
+            .saturating_add(u64::try_from(evicted).unwrap_or(u64::MAX));
+        self.generation = self.generation.saturating_add(1);
+        (accepted, evicted)
+    }
+
+    /// 无消息时间戳的兼容入口。它不做重放去重，但仍执行滚动点预算。
+    pub fn feed_unstamped(&mut self, points: &[Point3<f64>]) -> FeedStats {
+        let (accepted, evicted) = self.append_with_rolling_capacity(points);
+        FeedStats::accepted_with_eviction(
+            accepted,
+            evicted,
+            self.current_window.len(),
+            self.bounded_capacity,
+            self.freshness,
+        )
+    }
+
     /// feed 一帧点云。
     ///
-    /// 语义(对齐 W12 Python `feed_pointcloud`):
-    /// 1. `freshness` 校验:`now_ns > 0 && freshness > 0 && now_ns - freshness > threshold`
-    ///    抛 `StaleRevisionError`,并把 freshness 水位推进到 `now_ns`,避免长间隔后
-    ///    所有后续帧都相对旧水位持续 stale
-    /// 2. dedup:`dedup_key(odom_xy, point_step)` 已存在于 `dedup_set` → 返回
-    ///    `FeedStats::dedup_only(...)`,不修改 `current_window`
-    /// 3. capacity 校验:`current_window.len() + points.len() > bounded_capacity` → 抛
-    ///    `ResourceExhaustedError`(checked arithmetic,整批原子拒绝而非 partial push)
-    /// 4. push + 更新 `freshness` / `dedup_set`
-    /// 5. 返回 `FeedStats::accepted(...)`
+    /// 1. 拒绝比消息时间最高水位倒退超过容差的旧帧。
+    /// 2. 过滤同时间戳、同内容、同位姿的消息重放。
+    /// 3. 滚动淘汰最旧点，为新批次腾出预算。
+    /// 4. 更新消息时间水位和有界 dedup 历史。
     ///
     /// 参数:
     /// - `points`:点云切片
     /// - `odom_xy`:(odom_x, odom_y) 元组,用于 dedup_key
     /// - `point_step`:ROS PointCloud2 `point_step` 字段,用于 dedup_key
-    /// - `now_ns`:单调时钟(ns);`0` 表示未提供,跳过 freshness 校验
+    /// - `now_ns`:消息源时间戳(ns)；`0` 表示未提供，跳过 freshness 校验
     pub fn feed_pointcloud(
         &mut self,
         points: &[Point3<f64>],
@@ -348,22 +444,20 @@ impl MappingSession {
         point_step: u32,
         now_ns: u64,
     ) -> Result<FeedStats, SessionError> {
-        // 1. freshness 校验
-        if now_ns > 0 && self.freshness > 0 && now_ns > self.freshness {
-            let delta = now_ns - self.freshness;
-            if delta > self.stale_threshold_ns {
-                let last_seen_at_ns = self.freshness;
-                self.freshness = now_ns;
-                return Err(SessionError::StaleRevision {
-                    last_seen_at_ns,
-                    now_ns,
-                    threshold_ns: self.stale_threshold_ns,
-                });
-            }
+        // freshness 衡量消息时间是否倒退，而不是相邻到达间隔。
+        if now_ns > 0
+            && self.freshness > now_ns
+            && self.freshness - now_ns > self.stale_threshold_ns
+        {
+            return Err(SessionError::StaleRevision {
+                last_seen_at_ns: self.freshness,
+                now_ns,
+                threshold_ns: self.stale_threshold_ns,
+            });
         }
 
-        // 2. dedup
-        let key = Self::dedup_key(odom_xy, point_step);
+        // dedup 只拒绝同一消息时间、同一内容和同一采集位姿的重放。
+        let key = Self::frame_dedup_key(points, odom_xy, point_step, now_ns);
         if self.dedup_set.contains(&key) {
             return Ok(FeedStats::dedup_only(
                 points.len(),
@@ -373,12 +467,7 @@ impl MappingSession {
             ));
         }
 
-        // 3. capacity 校验
-        if !batch_fits_capacity(
-            self.current_window.len(),
-            points.len(),
-            self.bounded_capacity,
-        ) {
+        if self.bounded_capacity == 0 && !points.is_empty() {
             return Err(SessionError::ResourceExhausted {
                 capacity: self.bounded_capacity,
                 current_size: self.current_window.len(),
@@ -386,18 +475,15 @@ impl MappingSession {
             });
         }
 
-        // 4. push
-        for p in points {
-            self.current_window.push_back(*p);
-            self.accumulator.push_back(*p);
-        }
-        self.dedup_set.insert(key);
+        let (accepted, evicted) = self.append_with_rolling_capacity(points);
+        self.remember_dedup_key(key);
         if now_ns > 0 {
-            self.freshness = now_ns;
+            self.freshness = self.freshness.max(now_ns);
         }
 
-        Ok(FeedStats::accepted(
-            points.len(),
+        Ok(FeedStats::accepted_with_eviction(
+            accepted,
+            evicted,
             self.current_window.len(),
             self.bounded_capacity,
             self.freshness,
@@ -418,7 +504,7 @@ impl MappingSession {
     /// 才是真正的 publish 入口。Phase M #1 不在本接口重复实现 publish。
     pub fn build_and_publish(&mut self) -> Result<bool, SessionError> {
         // 当前实现无 publish 动作 —— real publish 在 MappingAdapter::build_and_publish
-        // (基于 `clone_points` + nuwax_mapping::CostMapper)。
+        // (基于 MappingSession 连续切片 + nuwax_mapping::CostMapper)。
         Ok(false)
     }
 
@@ -430,6 +516,8 @@ impl MappingSession {
             last_seen_at_ns: self.freshness,
             last_pose: self.last_pose,
             dedup_set_size: self.dedup_set.len(),
+            generation: self.generation,
+            evicted_point_count: self.evicted_point_count,
         }
     }
 
@@ -439,10 +527,12 @@ impl MappingSession {
     /// `bounded_capacity` / `stale_threshold_ns` 保留(配置类字段)。
     pub fn reset_state(&mut self) {
         self.current_window.clear();
-        self.accumulator.clear();
         self.dedup_set.clear();
+        self.dedup_order.clear();
         self.freshness = 0;
         self.last_pose = [0.0, 0.0, 0.0];
+        self.generation = 0;
+        self.evicted_point_count = 0;
     }
 }
 
@@ -468,10 +558,7 @@ impl Default for MappingSession {
 
 impl PointCloudAccumulator for MappingSession {
     fn feed(&mut self, points: &[Point3<f64>]) {
-        // trait 默认行为:无 freshness / 无 dedup / 静默 push / 超 capacity 截断。
-        // 该入口主要给 `nuwax-mapping` 内部测试用;
-        // real-lcm 路径应走 `feed_pointcloud(...)` 显式版本。
-        let _ = self.feed_pointcloud(points, (0.0, 0.0), 0, 0);
+        let _ = self.feed_unstamped(points);
     }
 
     fn count(&self) -> usize {
@@ -491,67 +578,44 @@ mod tests {
         Point3::new(x, y, z)
     }
 
-    // ---- Test 1:capacity 满后 feed 抛 ResourceExhaustedError ----
+    // ---- Test 1:capacity 是滚动预算，零容量才不可接收 ----
 
     #[test]
-    fn feed_pointcloud_exceeds_capacity_raises_resource_exhausted() {
+    fn feed_pointcloud_rolls_when_capacity_is_full() {
         let mut s = MappingSession::with_capacity(3);
-        // capacity = 3 时,3 个不同 odom pose 各 push 1 点 → 第 4 个 feed 必抛 ResourceExhausted
         s.feed_pointcloud(&[pt(0.0, 0.0, 0.0)], (0.0, 0.0), 32, 1_000_000_000)
             .expect("first push ok");
         s.feed_pointcloud(&[pt(1.0, 0.0, 0.0)], (1.0, 0.0), 32, 1_001_000_000)
             .expect("second push ok");
         s.feed_pointcloud(&[pt(2.0, 0.0, 0.0)], (2.0, 0.0), 32, 1_002_000_000)
             .expect("third push ok");
-        assert_eq!(s.current_size(), 3);
-        let err = s
+        let stats = s
             .feed_pointcloud(&[pt(3.0, 0.0, 0.0)], (3.0, 0.0), 32, 1_003_000_000)
-            .expect_err("第 4 个 feed 应当抛 ResourceExhausted");
-        match err {
-            SessionError::ResourceExhausted {
-                capacity,
-                current_size,
-                attempted_points,
-            } => {
-                assert_eq!(capacity, 3);
-                assert_eq!(current_size, 3);
-                assert_eq!(attempted_points, 1);
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
+            .expect("full sessions must roll forward");
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.evicted, 1);
+        assert_eq!(s.current_size(), 3);
+        assert_eq!(s.clone_points()[0], pt(1.0, 0.0, 0.0));
     }
 
     #[test]
-    fn feed_pointcloud_rejects_overflowing_batch_atomically() {
-        let mut s = MappingSession::with_capacity(3);
-        s.feed_pointcloud(
-            &[pt(0.0, 0.0, 0.0), pt(1.0, 0.0, 0.0)],
-            (0.0, 0.0),
-            32,
-            1_000_000_000,
-        )
-        .expect("first batch fits");
-
+    fn zero_capacity_returns_resource_exhausted_without_mutation() {
+        let mut s = MappingSession::with_capacity(0);
         let err = s
-            .feed_pointcloud(
-                &[pt(2.0, 0.0, 0.0), pt(3.0, 0.0, 0.0)],
-                (1.0, 0.0),
-                32,
-                1_001_000_000,
-            )
-            .expect_err("2 + 2 points must not fit into capacity 3");
+            .feed_pointcloud(&[pt(0.0, 0.0, 0.0)], (0.0, 0.0), 32, 1_000_000_000)
+            .expect_err("zero capacity cannot retain a point");
 
         assert!(matches!(
             err,
             SessionError::ResourceExhausted {
-                capacity: 3,
-                current_size: 2,
-                attempted_points: 2,
+                capacity: 0,
+                current_size: 0,
+                attempted_points: 1,
             }
         ));
-        assert_eq!(s.current_size(), 2, "rejected batches must be atomic");
-        assert_eq!(s.dedup_set_size(), 1, "rejected key must not be retained");
-        assert_eq!(s.last_seen_at_ns(), 1_000_000_000);
+        assert_eq!(s.current_size(), 0);
+        assert_eq!(s.dedup_set_size(), 0);
+        assert_eq!(s.last_seen_at_ns(), 0);
     }
 
     #[test]
@@ -573,65 +637,37 @@ mod tests {
         assert_eq!(s.current_size(), s.capacity());
     }
 
-    #[test]
-    fn batch_capacity_arithmetic_rejects_usize_overflow() {
-        assert!(batch_fits_capacity(usize::MAX, 0, usize::MAX));
-        assert!(!batch_fits_capacity(usize::MAX, 1, usize::MAX));
-    }
-
-    // ---- Test 2:stale > 200ms 抛 StaleRevisionError ----
+    // ---- Test 2:只拒绝落后消息水位超过 200ms 的旧帧 ----
 
     #[test]
-    fn feed_pointcloud_stale_revision_raises_error() {
+    fn feed_pointcloud_new_revision_after_long_gap_is_accepted() {
         let mut s = MappingSession::new();
         s.feed_pointcloud(&[pt(0.0, 0.0, 0.0)], (0.0, 0.0), 32, 1_000_000_000)
             .expect("first feed ok");
-        // +300ms > 200ms threshold → 抛 StaleRevision
-        let stale_now = 1_000_000_000 + 300_000_000;
-        let err = s
-            .feed_pointcloud(&[pt(0.5, 0.0, 0.0)], (0.5, 0.0), 48, stale_now)
-            .expect_err("stale > 200ms 应当抛 StaleRevision");
-        match err {
-            SessionError::StaleRevision {
-                last_seen_at_ns,
-                now_ns,
-                threshold_ns,
-            } => {
-                assert_eq!(last_seen_at_ns, 1_000_000_000);
-                assert_eq!(now_ns, stale_now);
-                assert_eq!(threshold_ns, DEFAULT_STALE_THRESHOLD_NS);
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
+        let new_now = 1_000_000_000 + 300_000_000;
+        let stats = s
+            .feed_pointcloud(&[pt(0.5, 0.0, 0.0)], (0.5, 0.0), 48, new_now)
+            .expect("a newer message cannot become stale merely because input is low-rate");
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(s.last_seen_at_ns(), new_now);
     }
 
     #[test]
-    fn stale_gap_rebases_freshness_and_next_frame_recovers() {
+    fn stale_out_of_order_frame_does_not_move_freshness_watermark() {
         let mut s = MappingSession::new();
-        let first_now = 1_000_000_000;
-        let stale_now = first_now + DEFAULT_STALE_THRESHOLD_NS + 1;
-        let recovered_now = stale_now + 10_000_000;
+        let newest = 1_000_000_000;
+        let stale = newest - DEFAULT_STALE_THRESHOLD_NS - 1;
 
-        s.feed_pointcloud(&[pt(0.0, 0.0, 0.0)], (0.0, 0.0), 32, first_now)
+        s.feed_pointcloud(&[pt(0.0, 0.0, 0.0)], (0.0, 0.0), 32, newest)
             .expect("first frame accepted");
-        s.feed_pointcloud(&[pt(1.0, 0.0, 0.0)], (1.0, 0.0), 32, stale_now)
-            .expect_err("the first frame after a long gap remains stale");
+        s.feed_pointcloud(&[pt(1.0, 0.0, 0.0)], (1.0, 0.0), 32, stale)
+            .expect_err("old replay must be rejected");
 
-        assert_eq!(
-            s.last_seen_at_ns(),
-            stale_now,
-            "a rejected stale frame must rebase the freshness watermark"
-        );
-        let stats = s
-            .feed_pointcloud(&[pt(2.0, 0.0, 0.0)], (2.0, 0.0), 32, recovered_now)
-            .expect("a subsequent frame inside the freshness window must recover");
-
-        assert_eq!(stats.accepted, 1);
-        assert_eq!(stats.current_size, 2);
-        assert_eq!(stats.last_seen_at_ns, recovered_now);
+        assert_eq!(s.last_seen_at_ns(), newest);
+        assert_eq!(s.current_size(), 1);
     }
 
-    // ---- Test 3:dedup 同 odom + 同 point_step 保留首帧 ----
+    // ---- Test 3:完整消息重放去重 ----
 
     #[test]
     fn feed_pointcloud_dedup_same_odom_step_keeps_first() {
@@ -644,9 +680,9 @@ mod tests {
         assert_eq!(stats_a.dedup_skipped, 0);
         assert_eq!(stats_a.current_size, 2);
 
-        // 同 odom + 同 point_step → dedup,跳过
+        // 同时间戳、同内容、同 odom + 同 point_step → 判定消息重放。
         let stats_b = s
-            .feed_pointcloud(&pts, (1.0, 2.0), 32, 1_001_000_000)
+            .feed_pointcloud(&pts, (1.0, 2.0), 32, 1_000_000_000)
             .expect("second feed should not error (dedup returns ok)");
         assert_eq!(stats_b.accepted, 0);
         assert_eq!(stats_b.dedup_skipped, 2);
@@ -742,5 +778,102 @@ mod tests {
         );
         assert_eq!(s.count(), 2);
         assert_eq!(s.current_size(), 2);
+    }
+
+    #[test]
+    fn low_frequency_new_frames_are_not_stale() {
+        let mut s = MappingSession::new();
+        s.feed_pointcloud(&[pt(0.0, 0.0, 0.0)], (0.0, 0.0), 32, 1_000_000_000)
+            .expect("first frame accepted");
+
+        let stats = s
+            .feed_pointcloud(&[pt(1.0, 0.0, 0.0)], (1.0, 0.0), 32, 1_500_000_000)
+            .expect("a newer frame remains fresh even after a 500ms input gap");
+
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(s.last_seen_at_ns(), 1_500_000_000);
+    }
+
+    #[test]
+    fn out_of_order_message_older_than_tolerance_is_rejected() {
+        let mut s = MappingSession::new();
+        s.feed_pointcloud(&[pt(0.0, 0.0, 0.0)], (0.0, 0.0), 32, 1_000_000_000)
+            .expect("first frame accepted");
+
+        let err = s
+            .feed_pointcloud(&[pt(1.0, 0.0, 0.0)], (1.0, 0.0), 32, 700_000_000)
+            .expect_err("a frame 300ms behind the message-time watermark is stale");
+
+        assert!(matches!(
+            err,
+            SessionError::StaleRevision {
+                last_seen_at_ns: 1_000_000_000,
+                now_ns: 700_000_000,
+                threshold_ns: DEFAULT_STALE_THRESHOLD_NS,
+            }
+        ));
+        assert_eq!(s.current_size(), 1);
+        assert_eq!(s.last_seen_at_ns(), 1_000_000_000);
+    }
+
+    #[test]
+    fn stationary_robot_accepts_new_samples_with_new_message_timestamps() {
+        let mut s = MappingSession::new();
+        let first = s
+            .feed_pointcloud(&[pt(0.0, 0.0, 0.0)], (2.0, 3.0), 32, 1_000_000_000)
+            .expect("first frame accepted");
+        let second = s
+            .feed_pointcloud(&[pt(1.0, 0.0, 0.0)], (2.0, 3.0), 32, 1_100_000_000)
+            .expect("new sample at a stationary pose must not be deduplicated forever");
+
+        assert_eq!(first.accepted, 1);
+        assert_eq!(second.accepted, 1);
+        assert_eq!(second.dedup_skipped, 0);
+        assert_eq!(s.current_size(), 2);
+    }
+
+    #[test]
+    fn dedup_history_is_bounded_and_expired_replays_can_be_reprocessed() {
+        let mut s = MappingSession::new().with_dedup_history_capacity(2);
+        let frame = [pt(0.0, 0.0, 0.0)];
+        for (x, timestamp) in [(0.0, 1_000), (1.0, 2_000), (2.0, 3_000)] {
+            s.feed_pointcloud(&frame, (x, 0.0), 32, timestamp)
+                .expect("unique frame accepted");
+        }
+        assert_eq!(s.dedup_set_size(), 2);
+
+        let replay = s
+            .feed_pointcloud(&frame, (0.0, 0.0), 32, 1_000)
+            .expect("expired replay identity may be processed again");
+        assert_eq!(replay.accepted, 1);
+        assert_eq!(s.dedup_set_size(), 2);
+    }
+
+    #[test]
+    fn capacity_rolls_forward_and_keeps_newest_points() {
+        let mut s = MappingSession::with_capacity(3);
+        s.feed_pointcloud(
+            &[pt(0.0, 0.0, 0.0), pt(1.0, 0.0, 0.0)],
+            (0.0, 0.0),
+            32,
+            1_000_000_000,
+        )
+        .expect("initial batch accepted");
+
+        let stats = s
+            .feed_pointcloud(
+                &[pt(2.0, 0.0, 0.0), pt(3.0, 0.0, 0.0)],
+                (1.0, 0.0),
+                32,
+                1_100_000_000,
+            )
+            .expect("capacity pressure must evict old points instead of wedging the session");
+
+        assert_eq!(stats.accepted, 2);
+        assert_eq!(stats.current_size, 3);
+        assert_eq!(
+            s.clone_points(),
+            vec![pt(1.0, 0.0, 0.0), pt(2.0, 0.0, 0.0), pt(3.0, 0.0, 0.0)]
+        );
     }
 }

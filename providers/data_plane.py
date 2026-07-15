@@ -8,7 +8,7 @@ providers 以解开 services ⇄ drivers 包级循环（services 改依赖此处
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple, runtime_checkable
 
 from contracts.geometry import FrameTree, Pose
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap
@@ -84,14 +84,28 @@ class NavigationDataPlane(Protocol):
     def set_goal(self, goal: NavigationGoal) -> bool:
         """提交导航目标。"""
 
-    def cancel_goal(self) -> bool:
-        """取消导航目标。"""
+    def cancel_goal(self, request_id: Optional[str] = None) -> bool:
+        """取消指定 exact goal；缺少标识时必须 fail-closed。"""
 
     def get_navigation_state(self) -> NavigationState:
         """返回导航状态。"""
 
     def is_goal_reached(self) -> bool:
         """返回当前目标是否到达。"""
+
+
+@runtime_checkable
+class NavigationUpdateDataPlane(Protocol):
+    """可选的导航状态 push 数据面。"""
+
+    def subscribe_navigation_updates(
+        self,
+        callback: Callable[[NavigationState], None],
+    ) -> Optional[int]:
+        """订阅导航状态变化。"""
+
+    def unsubscribe_navigation_updates(self, subscription_id: int) -> bool:
+        """取消导航状态订阅。"""
 
 
 @runtime_checkable
@@ -109,6 +123,20 @@ class ExplorationDataPlane(Protocol):
 
     def get_exploration_state(self) -> ExplorationState:
         """返回探索状态。"""
+
+
+@runtime_checkable
+class ExplorationUpdateDataPlane(Protocol):
+    """可选的探索状态 push 数据面。"""
+
+    def subscribe_exploration_updates(
+        self,
+        callback: Callable[[ExplorationState], None],
+    ) -> Optional[int]:
+        """订阅探索状态变化。"""
+
+    def unsubscribe_exploration_updates(self, subscription_id: int) -> bool:
+        """取消探索状态订阅。"""
 
 
 @runtime_checkable
@@ -185,7 +213,9 @@ __all__ = [
     "LocalizationDataPlane",
     "MappingDataPlane",
     "NavigationDataPlane",
+    "NavigationUpdateDataPlane",
     "ExplorationDataPlane",
+    "ExplorationUpdateDataPlane",
     "MotionCommandDataPlane",
     "ObstacleAvoidanceControlDataPlane",
     "ManagedRobotDeviceDataPlane",

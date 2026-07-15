@@ -32,6 +32,7 @@ mod occupancy_shm;
 mod pointcloud;
 mod rpc_runtime;
 mod runtime_diagnostics;
+mod sequence_state;
 mod server;
 mod typed_codec;
 mod video_relay;
@@ -160,7 +161,7 @@ async fn main() -> ExitCode {
     let cloud_map_channel = channel_registry::resolve_channel(
         "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
         "NUWAX_LCM_CHANNEL_CLOUD_MAP",
-        "/go2/lidar/points#sensor_msgs.PointCloud2",
+        "/cloud_map#sensor_msgs.PointCloud2",
     );
     let nav_state_channel = channel_registry::resolve_channel(
         "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL",
@@ -175,27 +176,11 @@ async fn main() -> ExitCode {
         "NUWAX_LCM_CHANNEL_FRONTIER",
         "/explore/frontiers#nuwax_msgs.FrontierList",
     );
-    let pose_channel = channel_registry::resolve_channel(
-        "NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL",
-        "NUWAX_LCM_CHANNEL_POSE_STAMPED",
-        "/pose_stamped#geometry_msgs.PoseStamped",
-    );
     let odometry_channel = channel_registry::resolve_channel(
         "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL",
         "NUWAX_LCM_CHANNEL_ODOM",
         "/odom#nav_msgs.Odometry",
     );
-    let cmd_vel_channel = channel_registry::resolve_channel(
-        "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
-        "NUWAX_LCM_CHANNEL_CMD_VEL",
-        "/cmd_vel#geometry_msgs.Twist",
-    );
-    let nav_cancel_channel = channel_registry::resolve_channel(
-        "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
-        "NUWAX_LCM_CHANNEL_NAV_CANCEL",
-        "/nav/cancel#nuwax_msgs.CancelNavigation",
-    );
-
     let video_shm_path = PathBuf::from(
         std::env::var("NUWAX_VIDEO_SHM_PATH").unwrap_or_else(|_| "/tmp/nuwax_video.shm".into()),
     );
@@ -203,8 +188,11 @@ async fn main() -> ExitCode {
         std::env::var("NUWAX_VIDEO_UDS_PATH").unwrap_or_else(|_| "/tmp/nuwax_video.sock".into()),
     );
 
-    let ready_path = std::env::var("NUWAX_GEOMETRY_RUNTIME_READY_FILE")
-        .unwrap_or_else(|_| format!("/tmp/nuwax_geometry_runtime_{}.ready", std::process::id()));
+    let ready_path = std::env::var("NUWAX_GEOMETRY_RUNTIME_READY_FILE").unwrap_or_else(|_| {
+        let runtime_dir =
+            std::env::var("NUWAX_RUNTIME_DATA_DIR").unwrap_or_else(|_| "runtime_data".into());
+        format!("{runtime_dir}/geometry/nuwax_geometry_runtime.ready")
+    });
 
     if let Err(e) = remove_ready_file(&ready_path) {
         error!("清理旧 ready file 失败: {:?}", e);
@@ -252,10 +240,7 @@ async fn main() -> ExitCode {
         Some(&cm_chan_for_runtime),
         Some(&nav_state_channel),
         Some(&frontiers_channel),
-        Some(&pose_channel),
         Some(&odometry_channel),
-        Some(&cmd_vel_channel),
-        Some(&nav_cancel_channel),
     ) {
         Ok(b) => b,
         Err(e) => {
@@ -334,6 +319,18 @@ async fn main() -> ExitCode {
         }
     }
 
+    if let Some(parent) = std::path::Path::new(&ready_path).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            error!("ready file 父目录创建失败: {:?}", e);
+            shutdown.request_shutdown();
+            server_task.abort();
+            let _ = (&mut server_task).await;
+            if let Err(error) = rpc_servers.stop().await {
+                error!("Geometry LCM RPC shutdown 失败: {}", error);
+            }
+            return ExitCode::from(5);
+        }
+    }
     if let Err(e) = std::fs::write(&ready_path, format!("{}", port)) {
         error!("ready file 写入失败: {:?}", e);
         shutdown.request_shutdown();

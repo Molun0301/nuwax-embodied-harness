@@ -30,18 +30,25 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use nuwax_codec::lcm::schema;
+use nuwax_nav_types_messages::geometry::Point2;
+use nuwax_nav_types_messages::grid::{OccupancyCell, OccupancyGrid2D};
 use nuwax_protocol::{LcmMessageType, LcmTopic};
 use nuwax_tf::{make_transform, TfTree, TransformStamped};
 use nuwax_transport::LcmTransport;
 use thiserror::Error;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 use tracing::{error, info, warn};
 
 use crate::mapping_adapter::{MappingAdapter, MappingAdapterConfig};
 use crate::occupancy_shm::OccupancyGridShmWriter;
 use crate::pointcloud::CloudMapShmWriter;
+use crate::sequence_state::{sequence_state_path_from_env, SequenceStateStore};
+
+const MAP_FANOUT_SINK_TIMEOUT: Duration = Duration::from_secs(2);
 
 // Phase 4 (channel registry) + Phase 7 (readiness cache): 统一在这里导入,
 // 避免每个函数 body 内部重复 `use crate::channel_registry::...`。
@@ -122,6 +129,100 @@ pub struct NavState {
     pub timestamp_ns: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct NavigationFeedback {
+    pub cancel_phase: String,
+    pub cancel_generation: u64,
+    pub actuator_zeroed: bool,
+    pub reason_code: String,
+    pub runtime_generation: u64,
+    pub guard_generation: u64,
+    pub sink_ready: bool,
+    pub planner_map_revision: u64,
+    pub planner_map_frame: String,
+    pub planner_pose_frame: String,
+    pub zero_ack_id: String,
+    pub zero_applied_monotonic_ns: u64,
+    pub owner_kind: i32,
+    pub parent_request_id: String,
+    pub goal_generation: u64,
+    pub path_revision: u64,
+    pub goal_payload_sha256: [u8; 32],
+    pub path_payload_sha256: [u8; 32],
+    pub map_version_id: String,
+}
+
+#[derive(Clone)]
+pub struct NavigationUpdate {
+    pub state: NavState,
+    pub feedback: NavigationFeedback,
+    pub producer_runtime_generation: u64,
+}
+
+impl NavigationUpdate {
+    pub async fn from_local(
+        state: NavState,
+        nav: &crate::nav_runtime::NavRuntimeState,
+        lease: Option<crate::nav_runtime::GoalLease>,
+    ) -> Self {
+        let cancel = nav.cancel_snapshot();
+        let cancel_phase = match cancel.phase {
+            crate::nav_runtime::CancelPhase::Idle => "IDLE",
+            crate::nav_runtime::CancelPhase::Pending => "PENDING",
+            crate::nav_runtime::CancelPhase::Zeroed => "ZEROED",
+            crate::nav_runtime::CancelPhase::Failed => "FAILED",
+            crate::nav_runtime::CancelPhase::TimedOut => "TIMED_OUT",
+        };
+        let actuator_zeroed = cancel.phase == crate::nav_runtime::CancelPhase::Zeroed;
+        let reason_code = navigation_reason_code(&state, cancel_phase);
+        Self {
+            state,
+            producer_runtime_generation: lease
+                .as_ref()
+                .map_or(0, |lease| lease.producer_runtime_generation),
+            feedback: NavigationFeedback {
+                cancel_phase: cancel_phase.to_string(),
+                cancel_generation: cancel.generation,
+                actuator_zeroed,
+                reason_code,
+                owner_kind: lease.as_ref().map_or(0, |lease| lease.owner_kind),
+                parent_request_id: lease
+                    .as_ref()
+                    .map_or_else(String::new, |lease| lease.parent_request_id.clone()),
+                goal_generation: lease.as_ref().map_or(0, |lease| lease.goal_generation),
+                planner_map_revision: lease.as_ref().map_or(0, |lease| lease.map_revision),
+                path_revision: lease.as_ref().map_or(0, |lease| lease.path_revision),
+                goal_payload_sha256: lease
+                    .as_ref()
+                    .map_or([0; 32], |lease| lease.goal_payload_sha256),
+                path_payload_sha256: lease
+                    .as_ref()
+                    .map_or([0; 32], |lease| lease.path_payload_sha256),
+                map_version_id: lease
+                    .as_ref()
+                    .map_or_else(String::new, |lease| lease.map_version_id.clone()),
+                ..NavigationFeedback::default()
+            },
+        }
+    }
+}
+
+fn navigation_reason_code(state: &NavState, cancel_phase: &str) -> String {
+    if cancel_phase == "ZEROED" {
+        return "CANCEL_ZEROED".to_string();
+    }
+    if cancel_phase == "TIMED_OUT" {
+        return "CANCEL_ZERO_ACK_TIMEOUT".to_string();
+    }
+    let message = state.message.as_str();
+    if let Some(start) = message.find('[') {
+        if let Some(end) = message[start + 1..].find(']') {
+            return message[start + 1..start + 1 + end].to_string();
+        }
+    }
+    state.status.clone()
+}
+
 #[derive(Clone, Default)]
 pub struct FrontierEntry {
     pub x: f64,
@@ -190,12 +291,12 @@ pub struct CloudMapNotification {
 /// RALPLAN §Phase M #3: occupancy grid revision 事件。
 ///
 /// `mapping_adapter::MappingAdapter::build_and_publish` 在 commit 新 revision
-/// 后构造本结构并通过 `broadcast::Sender<MapRevisionEvent>` 广播;
-/// `server::subscribe_map_updates` 接收后替代旧的 500ms 轮询,真正事件驱动
-/// 推送 `MapRevisionEvent` 给 Python 端 / WS-SSE 消费者。
+/// 后构造本结构并通过 `broadcast::Sender<MapRevisionEvent>` 写入兼容入口；
+/// coalescer 将其收敛为 latest-only `watch`，SHM/LCM/explore/gRPC 分别消费，
+/// 避免慢下游阻塞其它链路。`data` 使用 `Arc<[u8]>`，跨下游 clone 不复制地图。
 ///
 /// 字段对齐 W29 `MapStreamEventBroker.StreamSnapshot.parsed` schema:
-/// - `revision` —— occupancy grid 累计 revision(u64,单调递增)
+/// - `revision` —— geometry 进程级 occupancy revision(u64,跨 mapping session 单调递增)
 /// - `data`     —— costmap 字节(`i8 as u8`,长度 = `width * height`)
 /// - `size`     —— `data.len()`(u64,等价于 wire 上 rbuf.data_size)
 /// - `schema_version` —— `NativeMapManifest` schema 版本(当前 v1)
@@ -203,6 +304,9 @@ pub struct CloudMapNotification {
 /// - `last_seen_ms` —— commit 时 `now_ns / 1_000_000`(i64,毫秒,给前端排序)
 #[derive(Clone, Debug)]
 pub struct MapRevisionEvent {
+    pub session_id: String,
+    pub map_version_id: String,
+    pub session_generation: u64,
     pub revision: u64,
     pub width: u32,
     pub height: u32,
@@ -211,7 +315,7 @@ pub struct MapRevisionEvent {
     pub origin_y: f64,
     pub frame_id: String,
     pub timestamp_ns: u64,
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
     pub size: u64,
     pub schema_version: u32,
     pub checksum: String,
@@ -219,9 +323,20 @@ pub struct MapRevisionEvent {
 }
 
 impl MapRevisionEvent {
-    pub fn from_map(map: &MapState) -> Self {
-        let data: Vec<u8> = map.data.iter().map(|&value| value as u8).collect();
+    pub fn from_map(
+        map: &MapState,
+        session: &crate::mapping_adapter::MappingSessionSnapshot,
+    ) -> Self {
+        let data: Arc<[u8]> = map
+            .data
+            .iter()
+            .map(|&value| value as u8)
+            .collect::<Vec<_>>()
+            .into();
         Self {
+            session_id: session.session_id.clone(),
+            map_version_id: session.map_version_id.clone(),
+            session_generation: session.session_generation,
             revision: map.revision,
             width: map.width,
             height: map.height,
@@ -231,7 +346,7 @@ impl MapRevisionEvent {
             frame_id: map.frame_id.clone(),
             timestamp_ns: map.timestamp_ns,
             size: data.len() as u64,
-            checksum: crate::map_checksum::sha256_hex(&data),
+            checksum: crate::map_checksum::sha256_hex(data.as_ref()),
             last_seen_ms: (map.timestamp_ns / 1_000_000) as i64,
             schema_version: 1,
             data,
@@ -253,15 +368,167 @@ impl MapRevisionEvent {
     }
 }
 
+/// Latest successfully written occupancy SHM reference.
+///
+/// Only the map-revision SHM sink may advance this snapshot. gRPC readers use
+/// it as an immutable reference and never replay an older map into the mmap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OccupancyShmSnapshot {
+    pub key: String,
+    pub file_size: u64,
+    pub payload_size: u64,
+    pub revision: u64,
+    pub layout_version: u32,
+    pub payload_schema_version: u32,
+    pub generation: u64,
+    pub active_slot: usize,
+}
+
+fn is_global_map_frame(frame_id: &str) -> bool {
+    normalize_frame(frame_id) == "map"
+}
+
+fn encode_occupancy_revision(event: &MapRevisionEvent) -> Result<Vec<u8>, String> {
+    if !is_global_map_frame(&event.frame_id) {
+        return Err(format!(
+            "global occupancy fanout requires frame=map, received {}",
+            event.frame_id
+        ));
+    }
+    let expected_len = usize::try_from(event.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(event.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| "occupancy dimensions overflow usize".to_string())?;
+    if expected_len != event.data.len() || event.size != event.data.len() as u64 {
+        return Err(format!(
+            "occupancy revision {} dimensions/size mismatch: {}x{}, size={}, data={}",
+            event.revision,
+            event.width,
+            event.height,
+            event.size,
+            event.data.len()
+        ));
+    }
+    if crate::map_checksum::sha256_hex(event.data.as_ref()) != event.checksum {
+        return Err(format!(
+            "occupancy revision {} checksum mismatch",
+            event.revision
+        ));
+    }
+    let wire_revision = i32::try_from(event.revision).map_err(|_| {
+        format!(
+            "occupancy revision {} exceeds positive LCM i32 domain",
+            event.revision
+        )
+    })?;
+    if wire_revision <= 0 {
+        return Err(format!(
+            "occupancy revision {} must be positive",
+            event.revision
+        ));
+    }
+    let stamp_sec = i32::try_from(event.timestamp_ns / 1_000_000_000)
+        .map_err(|_| "occupancy timestamp seconds exceed int32".to_string())?;
+    let width = i32::try_from(event.width).map_err(|_| "occupancy width exceeds int32")?;
+    let height = i32::try_from(event.height).map_err(|_| "occupancy height exceeds int32")?;
+    schema::encode_occupancy_grid_body(&schema::OccupancyGrid {
+        header: schema::Header {
+            seq: wire_revision,
+            stamp_sec,
+            stamp_nsec: (event.timestamp_ns % 1_000_000_000) as i32,
+            frame_id: "map".to_string(),
+        },
+        info: schema::MapMetaData {
+            map_load_time_sec: stamp_sec,
+            map_load_time_nsec: (event.timestamp_ns % 1_000_000_000) as i32,
+            resolution: event.resolution,
+            width,
+            height,
+            origin: schema::Pose {
+                position: [event.origin_x, event.origin_y, 0.0],
+                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+        },
+        data: event.data.iter().map(|value| *value as i8).collect(),
+    })
+    .map_err(|error| format!("encode occupancy revision failed: {error}"))
+}
+
+fn exploration_costmap_from_revision(
+    event: &MapRevisionEvent,
+) -> Result<crate::explore_runtime::ExploreCostmapSnapshot, String> {
+    if !is_global_map_frame(&event.frame_id) {
+        return Err(format!(
+            "global exploration requires frame=map, received {}",
+            event.frame_id
+        ));
+    }
+    let expected_len = usize::try_from(event.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(event.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| "exploration costmap dimensions overflow usize".to_string())?;
+    if expected_len != event.data.len() {
+        return Err("exploration costmap cells length does not match dimensions".to_string());
+    }
+    let cells = event
+        .data
+        .iter()
+        .map(|value| match *value as i8 {
+            value if value < 0 => OccupancyCell::Unknown,
+            0 => OccupancyCell::Free,
+            value if value >= 100 => OccupancyCell::Occupied,
+            value => OccupancyCell::Cost(value as u8),
+        })
+        .collect();
+    Ok(crate::explore_runtime::ExploreCostmapSnapshot {
+        grid: OccupancyGrid2D::new(
+            Point2 {
+                x: event.origin_x,
+                y: event.origin_y,
+            },
+            f64::from(event.resolution),
+            event.width,
+            event.height,
+            cells,
+        ),
+        frame_id: "map".to_string(),
+        map_version_id: event.map_version_id.clone(),
+        map_revision: event.revision,
+    })
+}
+
+fn map_event_matches_current_session(
+    event: &MapRevisionEvent,
+    mapping_adapter: &Arc<parking_lot::Mutex<MappingAdapter>>,
+) -> bool {
+    let snapshot = mapping_adapter.lock().snapshot();
+    snapshot.active
+        && event.session_generation > 0
+        && event.session_generation == snapshot.session_generation
+        && event.session_id == snapshot.session_id
+        && event.map_version_id == snapshot.map_version_id
+}
+
 /// 几何 runtime 句柄。`server.rs` 通过此句柄读 SharedState、订阅 cloud_map_tx
 /// 以及通过 transport.publish 推送 odom / point cloud(real backend 直透 liblcm)。
 #[derive(Clone)]
 pub struct GeometryRuntimeHandle {
     pub state: Arc<RwLock<SharedState>>,
     pub cloud_map_tx: broadcast::Sender<CloudMapNotification>,
-    pub nav_state_tx: broadcast::Sender<NavState>,
+    pub nav_state_tx: broadcast::Sender<NavigationUpdate>,
     pub frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
     pub map_revision_tx: broadcast::Sender<MapRevisionEvent>,
+    /// Latest-only revision stream. The broadcast sender above remains the
+    /// adapter ingress ABI; one coalescer owns the broadcast -> watch bridge.
+    pub map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
     pub transport: LcmTransport,
     /// canonical LCM backend 名（HealthCheck / 日志 / diagnostics 用）：
     /// 2026-07-08 fake-lcm 物理删除后,字段值固定为 `real-lcm`;
@@ -272,20 +539,10 @@ pub struct GeometryRuntimeHandle {
     /// 返回 `healthy=false` + `LCM_BACKEND_UNAVAILABLE` message；
     /// 该 flag 当前唯一触发源是 `LcmBackendKind::Real`（fail-fast 设计）。
     pub lcm_backend_available: bool,
-    /// Phase 6 / Rework-9: Python `LcmMotionCommandBridge` 注入的 cmd_vel sink ready 信号。
-    /// - `true`  — Python 侧 LcmMotionCommandBridge 已订阅 `/cmd_vel`,
-    ///   watchdog 存活,sink 可写。
-    /// - `false` — bridge 未启动 / sink 未注入 / watchdog 失败 /
-    ///   providers 不实现 MotionControl / bridge.start() 抛异常。
-    ///
-    /// **生产 spawn 路径默认 `false`** —— 必须由 Python
-    /// `LcmMotionCommandBridge.start()` 成功后通过 gateway 写回 `true`,
-    /// 否则 `SetNavigationGoal` 在 `compute_readiness` 因
-    /// `cmd_vel_sink_ready=false` 被拒绝(参见
-    /// `REJECT_REASON_CMD_VEL_SINK_DOWN`)。test helper 路径保留默认 `true`
-    /// 以兼容旧测试用例(显式 `set_cmd_vel_sink_ready(false)`
-    /// 验证 readiness 拒绝分支;2026-07-08 fake-lcm 物理删除后 test helper
-    /// 已改走 `LcmTransport::new_real`,见 `build_handle_for_tests`)。
+    /// Deprecated compatibility bit exposed by the old gRPC facade. Navigation
+    /// readiness no longer consumes it: only typed feedback from the private
+    /// motion-guard UDS owner may mark the actuator sink ready. `/cmd_vel` is
+    /// telemetry and is never an actuator ingress.
     pub cmd_vel_sink_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Phase 5: 探索 runtime 句柄(由 `spawn_geometry_runtime` 注入)。
     /// 负责 start / stop / state / diagnostics 四类 RPC。
@@ -304,6 +561,9 @@ pub struct GeometryRuntimeHandle {
     ///   - `Arc` 允许多订阅任务共享
     ///   - `parking_lot::Mutex` 走同步路径,避免 async 持锁跨 await
     pub mapping_adapter: Option<Arc<parking_lot::Mutex<MappingAdapter>>>,
+    /// Serializes StartMapping/StopMapping/GetMappingState control-plane
+    /// transitions and downstream reset boundaries.
+    pub mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     /// Phase 3: occupancy grid SHM sidecar 写入器。
     ///
     /// - `None` —— backend 不可用 / LCM fail-fast 路径不构造
@@ -312,44 +572,64 @@ pub struct GeometryRuntimeHandle {
     /// 与 `occupancy_shm` 同时创建的权威路径；gRPC 返回的 `ShmRef.key`
     /// 必须使用该值，不能在请求时重新读取可能已变化的环境变量。
     pub occupancy_shm_path: Option<String>,
+    /// Reference to the latest revision successfully committed by the sole
+    /// occupancy SHM writer task.
+    pub occupancy_shm_current: Arc<RwLock<Option<OccupancyShmSnapshot>>>,
+    /// Exactly one background exploration scheduler belongs to the process.
+    pub explore_scheduler:
+        Arc<tokio::sync::Mutex<Option<crate::explore_runtime::ExploreSchedulerHandle>>>,
+    /// Monotonic generation assigned to typed runtime observations received by
+    /// the gRPC facade (for example guard-backed motion-sink health).
+    pub runtime_observation_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl GeometryRuntimeHandle {
-    pub fn subscribe_map_revisions(&self) -> broadcast::Receiver<MapRevisionEvent> {
-        self.map_revision_tx.subscribe()
+    pub fn subscribe_map_revisions(&self) -> watch::Receiver<Option<MapRevisionEvent>> {
+        self.map_revision_latest_tx.subscribe()
     }
 
-    /// Phase 6: 读 cmd_vel sink ready flag。
-    /// 由 Python `LcmMotionCommandBridge` 注入:
-    /// - bridge 启动 + sink 已注入 + watchdog 存活 → `true`
-    /// - bridge 未启动 / sink 未注入 / watchdog 失败 → `false`
-    ///   2026-07-08 fake-lcm 物理删除后 test helper 改走 real backend,
-    ///   默认 `true` 仍保留以兼容旧测试断言(显式 `set_cmd_vel_sink_ready(false)`
-    ///   验证 readiness 拒绝分支)。
+    /// Read the deprecated compatibility bit. This value is diagnostic only.
     pub fn cmd_vel_sink_ready(&self) -> bool {
         self.cmd_vel_sink_ready
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Phase 6: Python LcmMotionCommandBridge 调用的 setter,
-    /// 用于把外部 cmd_vel sink ready 状态写到 handle。
+    /// Preserve the legacy setter ABI without promoting it to typed readiness.
     pub fn set_cmd_vel_sink_ready(&self, ready: bool) {
         self.cmd_vel_sink_ready
             .store(ready, std::sync::atomic::Ordering::Release);
     }
 
+    pub fn next_runtime_observation_generation(&self) -> u64 {
+        self.runtime_observation_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    pub async fn shutdown_explore_scheduler(&self) {
+        if let Some(scheduler) = self.explore_scheduler.lock().await.take() {
+            scheduler.shutdown().await;
+        }
+    }
+
     /// mapping 板块 readiness。
     /// - backend 不可用 → false
     /// - adapter 未构造 → false
-    /// - adapter 已构造 + 有点云数据 → true
-    /// - adapter 已构造 + 无数据 → false (等待 LCM 输入)
+    /// - adapter 已构造 + occupancy revision + global frame/anchor ready → true
+    /// - 缺点云、revision 或 frame contract 任一项 → false
     pub fn mapping_ready_poll(&self) -> bool {
-        if !self.lcm_backend_available {
-            return false;
-        }
         match &self.mapping_adapter {
-            Some(a) => a.lock().has_data(),
-            None => false,
+            Some(adapter) => {
+                crate::mapping_adapter::MappingReadiness::compute(
+                    Some(&*adapter.lock()),
+                    self.lcm_backend_available,
+                )
+                .ready
+            }
+            None => {
+                crate::mapping_adapter::MappingReadiness::compute(None, self.lcm_backend_available)
+                    .ready
+            }
         }
     }
 
@@ -682,6 +962,180 @@ fn parse_odom_payload(payload: &[u8]) -> Option<PoseState> {
     crate::typed_codec::decode_odometry_payload(payload)
 }
 
+fn parse_pose_stamped_payload(payload: &[u8]) -> Option<PoseState> {
+    let message = decode_generated(
+        schema::POSE_STAMPED_FINGERPRINT,
+        payload,
+        schema::decode_pose_stamped,
+    )?;
+    let timestamp_ns = header_stamp_ns(&message.header)?;
+    let frame_id = normalize_frame(&message.header.frame_id);
+    if frame_id.is_empty() {
+        return None;
+    }
+    Some(PoseState {
+        x: message.pose.position[0],
+        y: message.pose.position[1],
+        z: message.pose.position[2],
+        qx: message.pose.orientation_xyzw[0],
+        qy: message.pose.orientation_xyzw[1],
+        qz: message.pose.orientation_xyzw[2],
+        qw: message.pose.orientation_xyzw[3],
+        frame_id,
+        timestamp_ns,
+    })
+}
+
+struct CanonicalMappingObservation {
+    map_pose: PoseState,
+    transforms: [TransformEntry; 2],
+    tf_payload: Vec<u8>,
+}
+
+fn normalized_quaternion_and_yaw(pose: &PoseState) -> Result<([f64; 4], f64), String> {
+    let values = [pose.qx, pose.qy, pose.qz, pose.qw];
+    if !values.into_iter().all(f64::is_finite) {
+        return Err("odometry quaternion contains a non-finite component".to_string());
+    }
+    let norm_sq = pose.qx * pose.qx + pose.qy * pose.qy + pose.qz * pose.qz + pose.qw * pose.qw;
+    if norm_sq <= f64::EPSILON {
+        return Err("odometry quaternion has zero norm".to_string());
+    }
+    let inverse_norm = norm_sq.sqrt().recip();
+    let quaternion = [
+        pose.qx * inverse_norm,
+        pose.qy * inverse_norm,
+        pose.qz * inverse_norm,
+        pose.qw * inverse_norm,
+    ];
+    let [x, y, z, w] = quaternion;
+    let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
+    if !yaw.is_finite() {
+        return Err("odometry quaternion produced a non-finite yaw".to_string());
+    }
+    Ok((quaternion, yaw))
+}
+
+fn yaw_quaternion(yaw_radians: f64) -> [f64; 4] {
+    let half_yaw = yaw_radians * 0.5;
+    [0.0, 0.0, half_yaw.sin(), half_yaw.cos()]
+}
+
+fn canonical_mapping_observation(
+    transform: &crate::mapping_adapter::MapOdomTransformSnapshot,
+    odom_pose: &PoseState,
+    base_frame: &str,
+) -> Result<CanonicalMappingObservation, String> {
+    let map_frame = normalize_frame(&transform.map_frame_id);
+    let odom_frame = normalize_frame(&transform.odom_frame_id);
+    let source_frame = normalize_frame(&odom_pose.frame_id);
+    let base_frame = normalize_frame(base_frame);
+    if map_frame.is_empty() || odom_frame.is_empty() || base_frame.is_empty() {
+        return Err("canonical mapping frames must be non-empty".to_string());
+    }
+    if source_frame != odom_frame {
+        return Err(format!(
+            "odometry frame {} does not match configured frame {}",
+            source_frame, odom_frame
+        ));
+    }
+    let (odom_quaternion, _) = normalized_quaternion_and_yaw(odom_pose)?;
+    let stamp_sec = i32::try_from(odom_pose.timestamp_ns / 1_000_000_000)
+        .map_err(|_| "odometry timestamp seconds exceed int32".to_string())?;
+    let stamp_nsec = (odom_pose.timestamp_ns % 1_000_000_000) as i32;
+    let map_odom_quaternion = yaw_quaternion(transform.yaw_radians);
+    let map_pose_quaternion = yaw_quaternion(transform.latest_map_pose.yaw_radians);
+    let transforms = [
+        TransformEntry {
+            parent: map_frame.clone(),
+            child: odom_frame.clone(),
+            tx: transform.translation[0],
+            ty: transform.translation[1],
+            tz: transform.translation[2],
+            rx: map_odom_quaternion[0],
+            ry: map_odom_quaternion[1],
+            rz: map_odom_quaternion[2],
+            rw: map_odom_quaternion[3],
+            stamp_ns: odom_pose.timestamp_ns,
+        },
+        TransformEntry {
+            parent: odom_frame.clone(),
+            child: base_frame.clone(),
+            tx: odom_pose.x,
+            ty: odom_pose.y,
+            tz: odom_pose.z,
+            rx: odom_quaternion[0],
+            ry: odom_quaternion[1],
+            rz: odom_quaternion[2],
+            rw: odom_quaternion[3],
+            stamp_ns: odom_pose.timestamp_ns,
+        },
+    ];
+    let header = |frame_id: String| schema::Header {
+        seq: i32::try_from(transform.generation).unwrap_or(i32::MAX),
+        stamp_sec,
+        stamp_nsec,
+        frame_id,
+    };
+    let tf_payload = schema::encode_tf_message_body(&schema::TfMessage {
+        transforms: vec![
+            schema::TransformStamped {
+                header: header(map_frame.clone()),
+                child_frame_id: odom_frame,
+                transform: schema::Transform {
+                    translation: transform.translation,
+                    rotation_xyzw: map_odom_quaternion,
+                },
+            },
+            schema::TransformStamped {
+                header: header(source_frame),
+                child_frame_id: base_frame,
+                transform: schema::Transform {
+                    translation: [odom_pose.x, odom_pose.y, odom_pose.z],
+                    rotation_xyzw: odom_quaternion,
+                },
+            },
+        ],
+    })
+    .map_err(|error| format!("canonical TF encode failed: {error}"))?;
+    Ok(CanonicalMappingObservation {
+        map_pose: PoseState {
+            x: transform.latest_map_pose.position[0],
+            y: transform.latest_map_pose.position[1],
+            z: transform.latest_map_pose.position[2],
+            qx: map_pose_quaternion[0],
+            qy: map_pose_quaternion[1],
+            qz: map_pose_quaternion[2],
+            qw: map_pose_quaternion[3],
+            frame_id: map_frame,
+            timestamp_ns: odom_pose.timestamp_ns,
+        },
+        transforms,
+        tf_payload,
+    })
+}
+
+async fn apply_canonical_mapping_observation(
+    state: &Arc<RwLock<SharedState>>,
+    observation: &CanonicalMappingObservation,
+) {
+    let mut state = state.write().await;
+    state.pose = observation.map_pose.clone();
+    for entry in &observation.transforms {
+        if let Some(transform) = entry_to_transform(entry) {
+            state.tf_tree.set(transform);
+        }
+        if let Some(existing) = state.transforms.iter_mut().find(|existing| {
+            normalize_frame(&existing.parent) == entry.parent
+                && normalize_frame(&existing.child) == entry.child
+        }) {
+            *existing = entry.clone();
+        } else {
+            state.transforms.push(entry.clone());
+        }
+    }
+}
+
 /// 单次 /map/occupancy frame 允许的 width/height 上限(防御性)。
 ///
 /// 2000×2000 = 4M cells = 4 MiB(0.05m/cell 覆盖 100×100 m),已是物理合理
@@ -962,6 +1416,852 @@ fn binding_for_key(
     parse_expected_typed_channel(&format!("{}#{suffix}", topic.channel()), expected_type)
 }
 
+#[derive(Clone)]
+struct SharedStatePoseProvider {
+    state: Arc<RwLock<SharedState>>,
+    freshness: Arc<parking_lot::Mutex<PoseFreshnessTracker>>,
+    max_receipt_age: Duration,
+}
+
+#[derive(Default)]
+struct PoseFreshnessTracker {
+    source_timestamp_ns: u64,
+    received_at: Option<std::time::Instant>,
+    received_monotonic_ns: u64,
+}
+
+#[async_trait]
+impl crate::explore_runtime::ExplorePoseProvider for SharedStatePoseProvider {
+    async fn current_pose(&self) -> Result<crate::explore_runtime::ExploreRobotPose, String> {
+        let pose = self.state.read().await.pose.clone();
+        if !is_global_map_frame(&pose.frame_id) || pose.timestamp_ns == 0 {
+            return Err(format!(
+                "map-frame pose unavailable (frame={}, timestamp_ns={})",
+                pose.frame_id, pose.timestamp_ns
+            ));
+        }
+        let source_age_ns =
+            crate::explore_runtime::now_unix_nanos().saturating_sub(pose.timestamp_ns);
+        if source_age_ns > self.max_receipt_age.as_nanos() as u64 {
+            return Err(format!(
+                "map-frame pose source timestamp is stale (source_timestamp_ns={}, source_age_ms={})",
+                pose.timestamp_ns,
+                source_age_ns / 1_000_000
+            ));
+        }
+        let (received_monotonic_ns, receipt_age) = {
+            let mut freshness = self.freshness.lock();
+            if freshness.source_timestamp_ns != pose.timestamp_ns {
+                freshness.source_timestamp_ns = pose.timestamp_ns;
+                freshness.received_at = Some(std::time::Instant::now());
+                freshness.received_monotonic_ns = crate::explore_runtime::now_monotonic_nanos();
+            }
+            let received_at = freshness
+                .received_at
+                .ok_or_else(|| "map-frame pose freshness observation is unavailable".to_string())?;
+            (freshness.received_monotonic_ns, received_at.elapsed())
+        };
+        if receipt_age > self.max_receipt_age {
+            return Err(format!(
+                "map-frame pose is stale (source_timestamp_ns={}, receipt_age_ms={})",
+                pose.timestamp_ns,
+                receipt_age.as_millis()
+            ));
+        }
+        Ok(crate::explore_runtime::ExploreRobotPose {
+            x: pose.x,
+            y: pose.y,
+            frame_id: "map".to_string(),
+            source_timestamp_ns: pose.timestamp_ns,
+            received_monotonic_ns,
+        })
+    }
+}
+
+fn exploration_child_lease(
+    lease: &crate::nav_runtime::GoalLease,
+) -> crate::explore_runtime::ChildNavigationLease {
+    crate::explore_runtime::ChildNavigationLease {
+        session_id: lease.session_id.clone(),
+        owner_kind: lease.owner_kind,
+        parent_request_id: lease.parent_request_id.clone(),
+        goal_generation: lease.goal_generation,
+        map_version_id: lease.map_version_id.clone(),
+        map_revision: lease.map_revision,
+        goal_payload_sha256: lease.goal_payload_sha256,
+    }
+}
+
+#[derive(Clone)]
+struct ExploreNavigationBridge {
+    state: Arc<RwLock<SharedState>>,
+    cloud_map_tx: broadcast::Sender<CloudMapNotification>,
+    nav_state_tx: broadcast::Sender<NavigationUpdate>,
+    frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
+    map_revision_tx: broadcast::Sender<MapRevisionEvent>,
+    map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    transport: LcmTransport,
+    transport_backend_name: &'static str,
+    lcm_backend_available: bool,
+    cmd_vel_sink_ready: Arc<std::sync::atomic::AtomicBool>,
+    nav: crate::nav_runtime::NavRuntimeState,
+    runtime_observation_generation: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ExploreNavigationBridge {
+    fn facade_handle(&self) -> GeometryRuntimeHandle {
+        GeometryRuntimeHandle {
+            state: self.state.clone(),
+            cloud_map_tx: self.cloud_map_tx.clone(),
+            nav_state_tx: self.nav_state_tx.clone(),
+            frontiers_tx: self.frontiers_tx.clone(),
+            map_revision_tx: self.map_revision_tx.clone(),
+            map_revision_latest_tx: self.map_revision_latest_tx.clone(),
+            transport: self.transport.clone(),
+            transport_backend_name: self.transport_backend_name,
+            lcm_backend_available: self.lcm_backend_available,
+            cmd_vel_sink_ready: self.cmd_vel_sink_ready.clone(),
+            explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
+            nav: self.nav.clone(),
+            mapping_adapter: None,
+            mapping_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            occupancy_shm: None,
+            occupancy_shm_path: None,
+            occupancy_shm_current: Arc::new(RwLock::new(None)),
+            explore_scheduler: Arc::new(tokio::sync::Mutex::new(None)),
+            runtime_observation_generation: self.runtime_observation_generation.clone(),
+        }
+    }
+
+    async fn publish_state(&self, state: NavState, lease: Option<crate::nav_runtime::GoalLease>) {
+        self.state.write().await.nav_state = state.clone();
+        let update = NavigationUpdate::from_local(state, &self.nav, lease).await;
+        let _ = self.nav_state_tx.send(update);
+    }
+}
+
+#[async_trait]
+impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
+    async fn submit(
+        &self,
+        request: crate::explore_runtime::ChildNavigationRequest,
+    ) -> Result<crate::explore_runtime::ChildNavigationTicket, String> {
+        let child_request_id = request.request_id.clone();
+        let parent_request_id = request.parent_request_id.clone();
+        let map_version_id = request.map_version_id.clone();
+        let map_revision = request.map_revision;
+        let target = request.goal.target;
+        let frame_id = target.frame_id.as_str().to_string();
+        let pose = target.pose;
+        let target = PoseState {
+            x: pose.position.x,
+            y: pose.position.y,
+            z: pose.position.z,
+            qx: pose.orientation.x,
+            qy: pose.orientation.y,
+            qz: pose.orientation.z,
+            qw: pose.orientation.w,
+            frame_id: frame_id.clone(),
+            timestamp_ns: target.stamp.nanos.max(0) as u64,
+        };
+        let facade = self.facade_handle();
+        let boundary =
+            request
+                .boundary
+                .as_ref()
+                .map(|boundary| crate::nav_runtime::GoalBoundaryConstraint {
+                    frame_id: "map".to_string(),
+                    points: boundary
+                        .vertices()
+                        .iter()
+                        .map(|point| [point.x, point.y, 0.0])
+                        .collect(),
+                });
+        let outcome = crate::nav_runtime::set_goal_with_boundary(
+            &facade,
+            &self.nav,
+            crate::nav_runtime::SetGoalInput {
+                goal_id: child_request_id.clone(),
+                owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                parent_request_id,
+                goal_generation: 0,
+                map_version_id,
+                map_revision,
+                frame_id,
+                target,
+            },
+            boundary,
+        )
+        .await;
+        let accepted = matches!(
+            outcome.state.status.to_ascii_uppercase().as_str(),
+            "ACCEPTED" | "PLANNING" | "RUNNING"
+        );
+        let message = outcome.state.message.clone();
+        let lease = outcome.lease.clone();
+        self.publish_state(outcome.state, outcome.lease).await;
+        if !accepted {
+            return Err(message);
+        }
+        let lease = lease
+            .as_ref()
+            .map(exploration_child_lease)
+            .ok_or_else(|| "accepted exploration child is missing its goal lease".to_string())?;
+        Ok(crate::explore_runtime::ChildNavigationTicket { lease })
+    }
+
+    async fn cancel(
+        &self,
+        expected: &crate::explore_runtime::ChildNavigationLease,
+    ) -> Result<crate::explore_runtime::ChildNavigationCancelTicket, String> {
+        let facade = self.facade_handle();
+        let lease = self
+            .nav
+            .active_goal_lease()
+            .await
+            .filter(|lease| {
+                exploration_child_lease(lease) == *expected
+                    && lease.owner_kind == schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+            })
+            .ok_or_else(|| "exploration child does not own the active goal lease".to_string())?;
+        let outcome = crate::nav_runtime::cancel(
+            &facade,
+            &self.nav,
+            crate::nav_runtime::CancelGoalInput {
+                goal_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+            },
+        )
+        .await;
+        let failed = outcome.state.status.eq_ignore_ascii_case("FAILED");
+        let message = outcome.state.message.clone();
+        let cancel = self.nav.cancel_snapshot();
+        self.publish_state(outcome.state, outcome.lease).await;
+        if failed {
+            Err(message)
+        } else {
+            let cancel_lease = cancel
+                .lease
+                .as_ref()
+                .map(exploration_child_lease)
+                .ok_or_else(|| "navigation cancel tracker lost the child lease".to_string())?;
+            if cancel.generation == 0 || cancel_lease != *expected {
+                return Err("navigation cancel tracker returned a mismatched ticket".to_string());
+            }
+            Ok(crate::explore_runtime::ChildNavigationCancelTicket {
+                lease: cancel_lease,
+                cancel_generation: cancel.generation,
+            })
+        }
+    }
+}
+
+fn cancel_phase_name(phase: crate::nav_runtime::CancelPhase) -> &'static str {
+    match phase {
+        crate::nav_runtime::CancelPhase::Idle => "IDLE",
+        crate::nav_runtime::CancelPhase::Pending => "PENDING",
+        crate::nav_runtime::CancelPhase::Zeroed => "ZEROED",
+        crate::nav_runtime::CancelPhase::Failed => "FAILED",
+        crate::nav_runtime::CancelPhase::TimedOut => "TIMED_OUT",
+    }
+}
+
+async fn apply_typed_navigation_feedback(
+    nav: &crate::nav_runtime::NavRuntimeState,
+    mut update: NavigationUpdate,
+) -> Option<NavigationUpdate> {
+    let correlated_lease = match nav
+        .correlate_navigation_state(
+            &update.state.goal_id,
+            update.feedback.owner_kind,
+            &update.feedback.parent_request_id,
+            update.feedback.goal_generation,
+            update.feedback.planner_map_revision,
+            update.feedback.path_revision,
+            update.feedback.goal_payload_sha256,
+            update.feedback.path_payload_sha256,
+        )
+        .await
+    {
+        Ok(Some(lease)) => {
+            update.feedback.map_version_id = lease.map_version_id.clone();
+            update.producer_runtime_generation = lease.producer_runtime_generation;
+            Some(lease)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            warn!(%error, session_id = %update.state.goal_id, "typed navigation state rejected");
+            return None;
+        }
+    };
+    let planner_observation = if update.feedback.runtime_generation > 0 {
+        let map_frame = normalize_frame(&update.feedback.planner_map_frame);
+        let pose_frame = normalize_frame(&update.feedback.planner_pose_frame);
+        let ready = update.feedback.planner_map_revision > 0
+            && !map_frame.is_empty()
+            && map_frame == pose_frame;
+        Some(crate::nav_runtime::PlannerInputObservation {
+            generation: update.feedback.runtime_generation,
+            map_revision: update.feedback.planner_map_revision,
+            map_frame,
+            pose_frame,
+            ready,
+        })
+    } else if update.feedback.planner_map_revision > 0
+        || !update.feedback.planner_map_frame.is_empty()
+        || !update.feedback.planner_pose_frame.is_empty()
+    {
+        warn!("planner feedback missing positive runtime_generation; fail closed");
+        None
+    } else {
+        None
+    };
+
+    let motion_sink_observation = if update.feedback.guard_generation > 0 {
+        Some(crate::nav_runtime::MotionSinkObservation {
+            generation: update.feedback.guard_generation,
+            ready: update.feedback.sink_ready,
+        })
+    } else if update.feedback.sink_ready {
+        warn!("sink_ready=true missing positive guard_generation; fail closed");
+        None
+    } else {
+        None
+    };
+
+    update.state = if let Some(lease) = correlated_lease.as_ref() {
+        match nav
+            .observe_correlated_navigation_state(
+                update.state.clone(),
+                lease,
+                planner_observation,
+                motion_sink_observation,
+            )
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(%error, session_id = %update.state.goal_id, "superseded navigation state rejected");
+                return None;
+            }
+        }
+    } else {
+        if let Some(observation) = planner_observation {
+            if let Err(error) = nav.observe_planner_input(observation) {
+                warn!(?error, "typed planner observation rejected");
+            }
+        }
+        if let Some(observation) = motion_sink_observation {
+            if let Err(error) = nav.observe_motion_sink(observation) {
+                warn!(?error, "typed motion-sink observation rejected");
+            }
+        }
+        nav.observe_unowned_stack_heartbeat(update.state)
+    };
+    let has_zero_proof = update.feedback.cancel_generation > 0
+        || !update.feedback.zero_ack_id.is_empty()
+        || update.feedback.zero_applied_monotonic_ns > 0;
+    let complete_zero_proof = update.feedback.cancel_generation > 0
+        && !update.feedback.zero_ack_id.trim().is_empty()
+        && update.feedback.zero_applied_monotonic_ns > 0;
+    let cancel_snapshot = nav.cancel_snapshot();
+    let correlated = complete_zero_proof
+        && cancel_snapshot.phase == crate::nav_runtime::CancelPhase::Pending
+        && cancel_snapshot.generation == update.feedback.cancel_generation
+        && cancel_snapshot.goal_id == update.state.goal_id
+        && cancel_snapshot.lease.as_ref().is_some_and(|lease| {
+            lease.owner_kind == update.feedback.owner_kind
+                && lease.parent_request_id == update.feedback.parent_request_id
+                && lease.goal_generation == update.feedback.goal_generation
+        });
+
+    if correlated {
+        let outcome = nav
+            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
+                cancel_generation: update.feedback.cancel_generation,
+                goal_id: update.state.goal_id.clone(),
+                owner_kind: update.feedback.owner_kind,
+                parent_request_id: update.feedback.parent_request_id.clone(),
+                goal_generation: update.feedback.goal_generation,
+                status: crate::nav_runtime::MotionSinkCancelAckStatus::Zeroed,
+                message: format!(
+                    "motion guard ZEROED ack={} applied_monotonic_ns={}",
+                    update.feedback.zero_ack_id, update.feedback.zero_applied_monotonic_ns
+                ),
+            })
+            .await;
+        update.state = outcome.state;
+        update.feedback.cancel_phase = "ZEROED".to_string();
+        update.feedback.actuator_zeroed = true;
+        update.feedback.reason_code = "CANCEL_ZEROED".to_string();
+    } else {
+        if has_zero_proof {
+            warn!(
+                received_generation = update.feedback.cancel_generation,
+                expected_generation = cancel_snapshot.generation,
+                received_goal = %update.state.goal_id,
+                expected_goal = %cancel_snapshot.goal_id,
+                "incomplete or uncorrelated zero acknowledgement rejected"
+            );
+            update.feedback.zero_ack_id.clear();
+            update.feedback.zero_applied_monotonic_ns = 0;
+        }
+        let current = nav.cancel_snapshot();
+        update.feedback.cancel_phase = cancel_phase_name(current.phase).to_string();
+        update.feedback.actuator_zeroed = current.phase == crate::nav_runtime::CancelPhase::Zeroed;
+        update.feedback.reason_code =
+            navigation_reason_code(&update.state, update.feedback.cancel_phase.as_str());
+    }
+    Some(update)
+}
+
+async fn report_exploration_navigation_terminal(
+    explore: &crate::explore_runtime::ExploreRuntimeHandle,
+    update: &NavigationUpdate,
+) {
+    let snapshot = explore.snapshot();
+    let child_task_id = snapshot.child_task_id;
+    if child_task_id.is_empty()
+        || child_task_id != update.state.goal_id
+        || update.feedback.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+        || update.feedback.parent_request_id != snapshot.request_id
+    {
+        return;
+    }
+    if let Some(result) = exploration_navigation_terminal_result(update) {
+        if let Err(error) = explore
+            .report_navigation_result(&child_task_id, result)
+            .await
+        {
+            warn!(child_task_id, %error, "exploration child feedback rejected");
+        }
+    }
+}
+
+fn exploration_navigation_terminal_result(
+    update: &NavigationUpdate,
+) -> Option<crate::explore_runtime::ChildNavigationResult> {
+    let proof = crate::explore_runtime::ChildNavigationTerminalProof {
+        lease: crate::explore_runtime::ChildNavigationLease {
+            session_id: update.state.goal_id.clone(),
+            owner_kind: update.feedback.owner_kind,
+            parent_request_id: update.feedback.parent_request_id.clone(),
+            goal_generation: update.feedback.goal_generation,
+            map_version_id: update.feedback.map_version_id.clone(),
+            map_revision: update.feedback.planner_map_revision,
+            goal_payload_sha256: update.feedback.goal_payload_sha256,
+        },
+    };
+    match update.state.status.as_str() {
+        "SUCCEEDED" => Some(crate::explore_runtime::ChildNavigationResult::Reached(
+            proof,
+        )),
+        "FAILED"
+            if matches!(
+                update.feedback.cancel_phase.as_str(),
+                "FAILED" | "TIMED_OUT"
+            ) =>
+        {
+            Some(
+                crate::explore_runtime::ChildNavigationResult::CancelFailed {
+                    proof,
+                    cancel_generation: update.feedback.cancel_generation,
+                    reason: update.state.message.clone(),
+                },
+            )
+        }
+        "FAILED" => Some(crate::explore_runtime::ChildNavigationResult::Failed {
+            proof,
+            reason: update.state.message.clone(),
+        }),
+        "CANCELLED"
+            if update.feedback.actuator_zeroed
+                && update.feedback.cancel_generation > 0
+                && !update.feedback.zero_ack_id.trim().is_empty()
+                && update.feedback.zero_applied_monotonic_ns > 0 =>
+        {
+            Some(crate::explore_runtime::ChildNavigationResult::Cancelled(
+                crate::explore_runtime::ChildNavigationZeroProof {
+                    lease: proof.lease,
+                    cancel_generation: update.feedback.cancel_generation,
+                    zero_ack_id: update.feedback.zero_ack_id.clone(),
+                    zero_applied_monotonic_ns: update.feedback.zero_applied_monotonic_ns,
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn spawn_cancel_timeout_task(
+    nav: crate::nav_runtime::NavRuntimeState,
+    state: Arc<RwLock<SharedState>>,
+    nav_state_tx: broadcast::Sender<NavigationUpdate>,
+    explore: crate::explore_runtime::ExploreRuntimeHandle,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let Some(outcome) = nav.poll_cancel_timeout().await else {
+                continue;
+            };
+            let update = NavigationUpdate::from_local(outcome.state, &nav, outcome.lease).await;
+            state.write().await.nav_state = update.state.clone();
+            let _ = nav_state_tx.send(update.clone());
+            report_exploration_navigation_terminal(&explore, &update).await;
+        }
+    });
+}
+
+fn spawn_path_envelope_consumer(
+    transport: LcmTransport,
+    nav: crate::nav_runtime::NavRuntimeState,
+    path_binding: (LcmTopic, LcmMessageType),
+) {
+    let (path_topic, path_msg_type) = path_binding;
+    tokio::spawn(async move {
+        let mut stream = transport.subscribe(path_topic, Some(path_msg_type)).await;
+        use futures::StreamExt;
+        while let Some(frame_result) = stream.next().await {
+            let frame = match frame_result {
+                Ok(frame) => frame,
+                Err(error) => {
+                    error!(%error, "PathEnvelope LCM subscription failed");
+                    continue;
+                }
+            };
+            let path = match crate::typed_codec::decode_path_envelope_payload(&frame.payload) {
+                Ok(path) => path,
+                Err(error) => {
+                    warn!(%error, "PathEnvelope payload rejected");
+                    continue;
+                }
+            };
+            if let Err(error) = nav.observe_path_envelope(&path).await {
+                warn!(%error, session_id = %path.session_id, "PathEnvelope lease rejected");
+            }
+        }
+    });
+}
+
+fn frontier_entry(frontier: &nuwax_nav_types_messages::visual::FrontierGoal) -> FrontierEntry {
+    let pose = frontier.pose.pose;
+    FrontierEntry {
+        x: pose.position.x,
+        y: pose.position.y,
+        z: pose.position.z,
+        qx: pose.orientation.x,
+        qy: pose.orientation.y,
+        qz: pose.orientation.z,
+        qw: pose.orientation.w,
+        frame_id: frontier.pose.frame_id.as_str().to_string(),
+        size_cells: frontier
+            .metadata
+            .get("cell_count")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        heading: pose.orientation.yaw() as f32,
+    }
+}
+
+fn stable_frontier_id(value: &str) -> i64 {
+    let hash = value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    hash as i64
+}
+
+fn encode_frontier_snapshot(
+    snapshot: &crate::explore_runtime::FrontierSnapshot,
+) -> Result<Vec<u8>, String> {
+    if snapshot.frontiers.len() > schema::FRONTIER_LIST_CAPACITY {
+        return Err(format!(
+            "frontier count {} exceeds LCM capacity {}",
+            snapshot.frontiers.len(),
+            schema::FRONTIER_LIST_CAPACITY
+        ));
+    }
+    if snapshot.frontiers.iter().any(|frontier| {
+        !matches!(
+            frontier.pose.frame_id,
+            nuwax_nav_types_messages::frames::NavFrameId::Map
+        )
+    }) {
+        return Err("frontier snapshot contains a non-map-frame goal".to_string());
+    }
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut frontiers = vec![schema::Frontier::default(); schema::FRONTIER_LIST_CAPACITY];
+    for (slot, frontier) in frontiers.iter_mut().zip(snapshot.frontiers.iter()) {
+        *slot = schema::Frontier {
+            id: stable_frontier_id(&frontier.id),
+            center: [frontier.pose.pose.position.x, frontier.pose.pose.position.y],
+            radius: frontier
+                .frontier_area_m2
+                .map(|area| (f64::from(area) / std::f64::consts::PI).sqrt())
+                .unwrap_or(0.0),
+            score: f64::from(frontier.score),
+            cell_count: frontier
+                .metadata
+                .get("cell_count")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            note: frontier.producer.clone(),
+        };
+    }
+    schema::encode_frontier_list_body(&schema::FrontierList {
+        stamp_sec: (now_ns / 1_000_000_000) as i64,
+        stamp_nsec: (now_ns % 1_000_000_000) as i32,
+        frame_id: "map".to_string(),
+        frontiers_length: snapshot.frontiers.len(),
+        frontiers,
+    })
+    .map_err(|error| format!("encode frontier snapshot failed: {error}"))
+}
+
+fn spawn_map_revision_coalescer(
+    mut map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
+    map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+    mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match map_revision_rx.recv().await {
+                Ok(event) => {
+                    let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
+                    if !map_event_matches_current_session(&event, &mapping_adapter) {
+                        warn!(
+                            session_id = %event.session_id,
+                            session_generation = event.session_generation,
+                            revision = event.revision,
+                            "stale map revision rejected by lifecycle fence"
+                        );
+                        continue;
+                    }
+                    map_revision_latest_tx.send_replace(Some(event));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        skipped,
+                        "map revision ingress lagged; coalescer will publish the latest retained revision"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn spawn_map_revision_fanout(
+    map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
+    map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    transport: LcmTransport,
+    occupancy_topic: LcmTopic,
+    occupancy_msg_type: LcmMessageType,
+    occupancy_shm: Option<Arc<parking_lot::Mutex<OccupancyGridShmWriter>>>,
+    occupancy_shm_path: Option<String>,
+    occupancy_shm_current: Arc<RwLock<Option<OccupancyShmSnapshot>>>,
+    explore: crate::explore_runtime::ExploreRuntimeHandle,
+    mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+    mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+) {
+    let mut shm_rx = map_revision_latest_tx.subscribe();
+    let mut lcm_rx = map_revision_latest_tx.subscribe();
+    let mut explore_rx = map_revision_latest_tx.subscribe();
+
+    match (occupancy_shm, occupancy_shm_path) {
+        (Some(writer), Some(path)) => {
+            let current = occupancy_shm_current;
+            let mapping_adapter = mapping_adapter.clone();
+            let lifecycle_lock = mapping_lifecycle_lock.clone();
+            tokio::spawn(async move {
+                while shm_rx.changed().await.is_ok() {
+                    let Some(event) = shm_rx.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    let _lifecycle_guard = lifecycle_lock.lock().await;
+                    if !map_event_matches_current_session(&event, &mapping_adapter) {
+                        continue;
+                    }
+                    let map = event.to_map_state();
+                    let write_result = {
+                        let mut writer = writer.lock();
+                        writer
+                            .begin_session(event.session_generation)
+                            .and_then(|_| writer.write_occupancy(&map))
+                            .and_then(|_| {
+                                let file_size = std::fs::metadata(writer.shm_path())?.len();
+                                let active_slot = writer.active_slot().ok_or_else(|| {
+                                    std::io::Error::other(
+                                        "occupancy SHM write completed without an active slot",
+                                    )
+                                })?;
+                                Ok(OccupancyShmSnapshot {
+                                    key: path.clone(),
+                                    file_size,
+                                    payload_size: event.size,
+                                    revision: event.revision,
+                                    layout_version: writer.layout_version(),
+                                    payload_schema_version: event.schema_version,
+                                    generation: writer.published_generation(),
+                                    active_slot,
+                                })
+                            })
+                    };
+                    match write_result {
+                        Ok(snapshot) => {
+                            *current.write().await = Some(snapshot);
+                        }
+                        Err(error) => {
+                            warn!(revision = event.revision, %error, "occupancy SHM fanout failed");
+                        }
+                    }
+                }
+            });
+        }
+        (Some(_), None) => {
+            warn!("occupancy SHM writer exists without its authoritative path; SHM sink disabled");
+        }
+        (None, _) => {}
+    }
+
+    let lcm_mapping_adapter = mapping_adapter.clone();
+    let lcm_lifecycle_lock = mapping_lifecycle_lock.clone();
+    tokio::spawn(async move {
+        while lcm_rx.changed().await.is_ok() {
+            let Some(event) = lcm_rx.borrow_and_update().clone() else {
+                continue;
+            };
+            let _lifecycle_guard = lcm_lifecycle_lock.lock().await;
+            if !map_event_matches_current_session(&event, &lcm_mapping_adapter) {
+                continue;
+            }
+            let payload = match encode_occupancy_revision(&event) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warn!(revision = event.revision, %error, "map revision rejected at global fanout boundary");
+                    continue;
+                }
+            };
+            let frame = crate::typed_codec::build_typed_frame(
+                occupancy_topic.clone(),
+                occupancy_msg_type.clone(),
+                payload,
+                event.revision,
+            );
+            match tokio::time::timeout(MAP_FANOUT_SINK_TIMEOUT, transport.publish(frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(revision = event.revision, %error, "occupancy LCM fanout failed");
+                }
+                Err(_) => {
+                    warn!(revision = event.revision, "occupancy LCM fanout timed out");
+                }
+            }
+        }
+    });
+
+    let explore_mapping_adapter = mapping_adapter.clone();
+    let explore_lifecycle_lock = mapping_lifecycle_lock.clone();
+    tokio::spawn(async move {
+        while explore_rx.changed().await.is_ok() {
+            let Some(event) = explore_rx.borrow_and_update().clone() else {
+                continue;
+            };
+            let _lifecycle_guard = explore_lifecycle_lock.lock().await;
+            if !map_event_matches_current_session(&event, &explore_mapping_adapter) {
+                continue;
+            }
+            match exploration_costmap_from_revision(&event) {
+                Ok(snapshot) => {
+                    match tokio::time::timeout(
+                        MAP_FANOUT_SINK_TIMEOUT,
+                        explore.ingest_costmap_snapshot(snapshot),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            warn!(revision = event.revision, %error, "exploration costmap fanout failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                revision = event.revision,
+                                "exploration costmap fanout timed out"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(revision = event.revision, %error, "exploration costmap conversion failed");
+                }
+            }
+        }
+    });
+
+    spawn_map_revision_coalescer(
+        map_revision_rx,
+        map_revision_latest_tx,
+        mapping_adapter,
+        mapping_lifecycle_lock,
+    );
+}
+
+fn spawn_frontier_fanout(
+    explore: crate::explore_runtime::ExploreRuntimeHandle,
+    state: Arc<RwLock<SharedState>>,
+    frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
+    transport: LcmTransport,
+    frontier_binding: Option<(LcmTopic, LcmMessageType)>,
+) {
+    let mut frontier_rx = explore.subscribe_frontiers();
+    tokio::spawn(async move {
+        loop {
+            if frontier_rx.changed().await.is_err() {
+                break;
+            }
+            let snapshot = frontier_rx.borrow_and_update().clone();
+            let entries: Vec<_> = snapshot.frontiers.iter().map(frontier_entry).collect();
+            {
+                let mut shared = state.write().await;
+                shared.frontiers = entries.clone();
+                shared.frontiers_revision = snapshot.revision;
+            }
+            let _ = frontiers_tx.send(entries);
+            let Some((topic, msg_type)) = frontier_binding.as_ref() else {
+                continue;
+            };
+            let payload = match encode_frontier_snapshot(&snapshot) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warn!(revision = snapshot.revision, %error, "frontier LCM fanout rejected");
+                    continue;
+                }
+            };
+            let frame = crate::typed_codec::build_typed_frame(
+                topic.clone(),
+                msg_type.clone(),
+                payload,
+                snapshot.revision,
+            );
+            if let Err(error) = transport.publish(frame).await {
+                warn!(revision = snapshot.revision, %error, "frontier LCM fanout failed");
+            }
+        }
+    });
+}
+
 /// 启动 geometry runtime 异步循环（LCM-first）。
 ///
 /// 2026-07-08 fake-lcm 物理删除后:backend 固定为 `LcmBackendKind::Real`,
@@ -971,10 +2271,7 @@ fn binding_for_key(
 ///
 /// # Args
 ///
-/// * `pose_channel` — Phase 1 新增；`geometry_msgs/PoseStamped` typed channel
 /// * `odometry_channel` — Phase 1 新增；`nav_msgs/Odometry` typed channel
-/// * `cmd_vel_channel` — Phase 1 新增；`geometry_msgs/Twist` typed channel
-/// * `nav_cancel_channel` — Phase 1 新增；`nuwax_msgs/CancelNavigation` typed channel
 /// * 其余形参来自 Phase 0 默认 channel registry
 pub fn spawn_geometry_runtime(
     occupancy_channel: &str,
@@ -982,18 +2279,37 @@ pub fn spawn_geometry_runtime(
     cloud_map_channel: Option<&str>,
     nav_state_channel: Option<&str>,
     frontiers_channel: Option<&str>,
-    pose_channel: Option<&str>,
     odometry_channel: Option<&str>,
-    cmd_vel_channel: Option<&str>,
-    nav_cancel_channel: Option<&str>,
 ) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
-    let (nav_state_tx, _) = broadcast::channel::<NavState>(8);
+    let (nav_state_tx, _) = broadcast::channel::<NavigationUpdate>(8);
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
     let (map_revision_tx, _) = broadcast::channel::<MapRevisionEvent>(16);
+    let (map_revision_latest_tx, _) = watch::channel::<Option<MapRevisionEvent>>(None);
+    // Register the production fanout receiver before mapping can commit. A
+    // tokio broadcast sender drops events when it has no receivers.
+    let map_revision_fanout_rx = map_revision_tx.subscribe();
 
+    let sequence_state_path = sequence_state_path_from_env();
+    let sequence_store = match SequenceStateStore::open(&sequence_state_path) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            error!(path = %sequence_state_path.display(), %error, "geometry sequence state startup failed closed");
+            return Err(RealLcmBackendUnavailable);
+        }
+    };
     let state = Arc::new(RwLock::new(SharedState::default()));
-    let nav_runtime = crate::nav_runtime::NavRuntimeState::from_env();
+    let nav_runtime = match crate::nav_runtime::NavRuntimeState::try_from_sequence_store(
+        sequence_store.as_ref(),
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            error!(path = %sequence_state_path.display(), %error, "GoalEnvelope producer epoch reservation failed closed");
+            return Err(RealLcmBackendUnavailable);
+        }
+    };
+    let explore_runtime = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+    let runtime_observation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 按 NUWAX_LCM_BACKEND 选择 backend。
     // 2026-07-08 fake-lcm 物理删除后,`LcmBackendKind::from_env()` 仅返回 `Real`。
@@ -1110,21 +2426,8 @@ pub fn spawn_geometry_runtime(
         },
         None => None,
     };
-    // Phase 1 channel registry 补齐:解析 4 类 typed channel。
+    // Phase 1 channel registry 补齐:解析 typed odometry channel。
     // Phase 4: 改走 `parse_channel_with_suffix`,强制 typed suffix;不再 untyped 兜底。
-    let pose_binding = match pose_channel {
-        Some(c) => match parse_expected_typed_channel(c, "geometry_msgs.PoseStamped") {
-            Ok(binding) => Some(binding),
-            Err(e) => {
-                warn!(
-                    "lcm_runtime::spawn: pose channel 解析失败 ({}): 降级无 /pose_stamped 订阅",
-                    e
-                );
-                None
-            }
-        },
-        None => None,
-    };
     let odom_binding = match odometry_channel {
         Some(c) => match parse_expected_typed_channel(c, "nav_msgs.Odometry") {
             Ok(binding) => Some(binding),
@@ -1138,57 +2441,60 @@ pub fn spawn_geometry_runtime(
         },
         None => None,
     };
-    let cmd_vel_binding = match cmd_vel_channel {
-        Some(c) => match parse_expected_typed_channel(c, "geometry_msgs.Twist") {
-            Ok(binding) => Some(binding),
-            Err(e) => {
-                warn!(
-                    "lcm_runtime::spawn: cmd_vel channel 解析失败 ({}): 降级无 /cmd_vel 订阅",
-                    e
-                );
-                None
-            }
-        },
-        None => None,
+    if let Err(error) = crate::nav_runtime::goal_envelope_binding() {
+        error!(%error, "versioned goal channel binding rejected");
+        return Err(RealLcmBackendUnavailable);
+    }
+    let path_binding = match crate::nav_runtime::path_envelope_binding() {
+        Ok(binding) => binding,
+        Err(error) => {
+            error!(%error, "versioned path channel binding rejected");
+            return Err(RealLcmBackendUnavailable);
+        }
     };
-    let nav_cancel_binding = match nav_cancel_channel {
-        Some(c) => match parse_expected_typed_channel(c, "nuwax_msgs.CancelNavigation") {
-            Ok(binding) => Some(binding),
-            Err(e) => {
-                warn!(
-                    "lcm_runtime::spawn: nav_cancel channel 解析失败 ({}): 降级无 /nav/cancel 订阅",
-                    e
-                );
-                None
-            }
-        },
-        None => None,
-    };
-
     // Phase 1:打印 channel registry 让运维和 healthcheck 都能看到本进程
     // 注册的全部 typed channel;Phase 2+ 将在此基础上挂接订阅任务。
     info!(
-        "LCM channel registry: occupancy={} tf={} cloud_map={} nav_state={} frontiers={} pose={} odom={} cmd_vel={} nav_cancel={}",
+        "LCM channel registry: occupancy={} tf={} cloud_map={} nav_state={} frontiers={} odom={}",
         occ_topic.channel(),
         tf_topic.channel(),
-        cm_binding.as_ref().map(|(topic, _)| topic.channel()).unwrap_or("<none>"),
-        nav_binding.as_ref().map(|(topic, _)| topic.channel()).unwrap_or("<none>"),
-        fr_binding.as_ref().map(|(topic, _)| topic.channel()).unwrap_or("<none>"),
-        pose_binding.as_ref().map(|(topic, _)| topic.channel()).unwrap_or("<none>"),
-        odom_binding.as_ref().map(|(topic, _)| topic.channel()).unwrap_or("<none>"),
-        cmd_vel_binding.as_ref().map(|(topic, _)| topic.channel()).unwrap_or("<none>"),
-        nav_cancel_binding.as_ref().map(|(topic, _)| topic.channel()).unwrap_or("<none>"),
+        cm_binding
+            .as_ref()
+            .map(|(topic, _)| topic.channel())
+            .unwrap_or("<none>"),
+        nav_binding
+            .as_ref()
+            .map(|(topic, _)| topic.channel())
+            .unwrap_or("<none>"),
+        fr_binding
+            .as_ref()
+            .map(|(topic, _)| topic.channel())
+            .unwrap_or("<none>"),
+        odom_binding
+            .as_ref()
+            .map(|(topic, _)| topic.channel())
+            .unwrap_or("<none>"),
     );
     info!(
-        "LCM msg-type registry: occupancy={} tf={} cloud_map={} nav_state={} frontiers={} pose={} odom={} cmd_vel={} nav_cancel={}",
-        occ_msg_type.fqn(), tf_msg_type.fqn(),
-        cm_binding.as_ref().map(|(_, kind)| kind.fqn()).unwrap_or("<none>"),
-        nav_binding.as_ref().map(|(_, kind)| kind.fqn()).unwrap_or("<none>"),
-        fr_binding.as_ref().map(|(_, kind)| kind.fqn()).unwrap_or("<none>"),
-        pose_binding.as_ref().map(|(_, kind)| kind.fqn()).unwrap_or("<none>"),
-        odom_binding.as_ref().map(|(_, kind)| kind.fqn()).unwrap_or("<none>"),
-        cmd_vel_binding.as_ref().map(|(_, kind)| kind.fqn()).unwrap_or("<none>"),
-        nav_cancel_binding.as_ref().map(|(_, kind)| kind.fqn()).unwrap_or("<none>"),
+        "LCM msg-type registry: occupancy={} tf={} cloud_map={} nav_state={} frontiers={} odom={}",
+        occ_msg_type.fqn(),
+        tf_msg_type.fqn(),
+        cm_binding
+            .as_ref()
+            .map(|(_, kind)| kind.fqn())
+            .unwrap_or("<none>"),
+        nav_binding
+            .as_ref()
+            .map(|(_, kind)| kind.fqn())
+            .unwrap_or("<none>"),
+        fr_binding
+            .as_ref()
+            .map(|(_, kind)| kind.fqn())
+            .unwrap_or("<none>"),
+        odom_binding
+            .as_ref()
+            .map(|(_, kind)| kind.fqn())
+            .unwrap_or("<none>"),
     );
 
     // 累积地图 mmap 初始化（降级允许）
@@ -1207,8 +2513,15 @@ pub fn spawn_geometry_runtime(
     let cm_writer = Arc::new(parking_lot::Mutex::new(cm_writer));
 
     // ---- 订阅 /tf：写入 canonical TfTree 历史并合成 base→map 位姿 ----
-    let map_frame = std::env::var("NUWAX_MAP_FRAME").unwrap_or_else(|_| "map".into());
-    let base_frame = std::env::var("NUWAX_BASE_FRAME").unwrap_or_else(|_| "base_link".into());
+    let map_frame = std::env::var("NUWAX_GEOMETRY_MAP_FRAME")
+        .or_else(|_| std::env::var("NUWAX_MAP_FRAME"))
+        .unwrap_or_else(|_| "map".into());
+    let odom_frame = std::env::var("NUWAX_GEOMETRY_ODOM_FRAME")
+        .or_else(|_| std::env::var("NUWAX_ODOM_FRAME"))
+        .unwrap_or_else(|_| "odom".into());
+    let base_frame = std::env::var("NUWAX_GEOMETRY_BASE_FRAME")
+        .or_else(|_| std::env::var("NUWAX_BASE_FRAME"))
+        .unwrap_or_else(|_| "base_link".into());
     let base_candidates: Vec<String> =
         if base_frame == "base_link" || base_frame == "base_footprint" {
             vec!["base_link".into(), "base_footprint".into()]
@@ -1220,13 +2533,37 @@ pub fn spawn_geometry_runtime(
             ]
         };
 
+    // Mapping exists for the process lifetime but starts inactive. The
+    // StartMapping RPC is the only production transition that opens ingestion.
+    let mapping_adapter = if backend_available {
+        let cfg = MappingAdapterConfig::from_env();
+        info!(
+            "mapping_adapter 已构造且等待 StartMapping: resolution={}m auto_bounds_padding=1m occupancy_algo={}",
+            cfg.resolution,
+            cfg.occupancy_algo.as_dimos_str()
+        );
+        Some(Arc::new(parking_lot::Mutex::new(
+            MappingAdapter::new_with_frames_and_sequence_store(
+                cfg,
+                map_frame.clone(),
+                odom_frame.clone(),
+                sequence_store.clone(),
+            ),
+        )))
+    } else {
+        None
+    };
+
     let tf_state = state.clone();
     let tf_transport = transport.clone();
     let tf_topic_clone = tf_topic.clone();
     let tf_msg_type_clone = tf_msg_type.clone();
     let map_frame_owned = map_frame.clone();
+    let odom_frame_owned = odom_frame.clone();
     let base_candidates_owned = base_candidates.clone();
+    let tf_nav_runtime = nav_runtime.clone();
     tokio::spawn(async move {
+        let mut tf_generation = 0_u64;
         let mut stream = tf_transport
             .subscribe(tf_topic_clone, Some(tf_msg_type_clone))
             .await;
@@ -1248,6 +2585,7 @@ pub fn spawn_geometry_runtime(
             };
             let mut s = tf_state.write().await;
             let mut max_stamp_ns: u64 = 0;
+            let mut accepted_entries = 0_u64;
             for entry in new_entries {
                 let Some(transform) = entry_to_transform(&entry) else {
                     warn!(
@@ -1259,6 +2597,7 @@ pub fn spawn_geometry_runtime(
                 };
                 let stamp = entry.stamp_ns;
                 s.tf_tree.set(transform);
+                accepted_entries = accepted_entries.saturating_add(1);
                 if let Some(existing) = s
                     .transforms
                     .iter_mut()
@@ -1293,55 +2632,26 @@ pub fn spawn_geometry_runtime(
                     s.pose.timestamp_ns = max_stamp_ns;
                 }
             }
-        }
-    });
-
-    // ---- 订阅 /odom：若上游 SLAM/odometry 节点直接发 odom，覆盖 pose ----
-    if let Some((odom_topic, odom_msg_type)) = odom_binding {
-        let odom_state = state.clone();
-        let odom_transport = transport.clone();
-        tokio::spawn(async move {
-            let mut stream = odom_transport
-                .subscribe(odom_topic, Some(odom_msg_type))
-                .await;
-            use futures::StreamExt;
-            while let Some(frame_result) = stream.next().await {
-                let frame = match frame_result {
-                    Ok(f) => f,
-                    Err(e) => {
-                        error!("/odom LCM 订阅错误: {}", e);
-                        continue;
-                    }
-                };
-                if let Some(pose) = parse_odom_payload(&frame.payload) {
-                    let mut s = odom_state.write().await;
-                    s.pose = pose;
+            let map_to_odom =
+                resolve_transform(&s.transforms, &odom_frame_owned, &map_frame_owned).is_some();
+            let odom_to_base = base_candidates_owned
+                .iter()
+                .any(|base| resolve_transform(&s.transforms, base, &odom_frame_owned).is_some());
+            drop(s);
+            if accepted_entries > 0 {
+                tf_generation = tf_generation.saturating_add(1);
+                if let Err(error) =
+                    tf_nav_runtime.observe_tf_chain(crate::nav_runtime::TfChainObservation {
+                        generation: tf_generation,
+                        map_frame: normalize_frame(&map_frame_owned),
+                        odom_frame: normalize_frame(&odom_frame_owned),
+                        base_frame: normalize_frame(&base_candidates_owned[0]),
+                        map_to_odom,
+                        odom_to_base,
+                    })
+                {
+                    warn!(?error, "nav TF observation rejected");
                 }
-            }
-        });
-    }
-
-    // ---- 订阅 /map/occupancy ----
-    let occ_state = state.clone();
-    let occ_transport = transport.clone();
-    let occ_topic_clone = occ_topic.clone();
-    let occ_msg_type_clone = occ_msg_type.clone();
-    let occ_revision_tx = map_revision_tx.clone();
-    tokio::spawn(async move {
-        let mut stream = occ_transport
-            .subscribe(occ_topic_clone, Some(occ_msg_type_clone))
-            .await;
-        use futures::StreamExt;
-        while let Some(frame_result) = stream.next().await {
-            let frame = match frame_result {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("/map/occupancy LCM 订阅错误: {}", e);
-                    continue;
-                }
-            };
-            if let Some(map) = parse_occupancy_payload(&frame.payload) {
-                commit_occupancy_map(&occ_state, map, &occ_revision_tx).await;
             }
         }
     });
@@ -1392,6 +2702,9 @@ pub fn spawn_geometry_runtime(
         });
     }
 
+    // ---- Consume only versioned PathEnvelope planner output. ----
+    spawn_path_envelope_consumer(transport.clone(), nav_runtime.clone(), path_binding);
+
     // ---- 订阅 nav_state（navigation state 推送）----
     if let Some((nav_topic, nav_msg_type)) = nav_binding {
         let nav_state = state.clone();
@@ -1399,6 +2712,7 @@ pub fn spawn_geometry_runtime(
         let nav_transport = transport.clone();
         let nav_msg_type_clone = nav_msg_type;
         let nav_runtime_state = nav_runtime.clone();
+        let nav_explore = explore_runtime.clone();
         tokio::spawn(async move {
             let mut stream = nav_transport
                 .subscribe(nav_topic, Some(nav_msg_type_clone))
@@ -1412,90 +2726,46 @@ pub fn spawn_geometry_runtime(
                         continue;
                     }
                 };
-                let Some(nav) = crate::typed_codec::decode_nav_state_payload(&frame.payload) else {
+                let Some(update) = crate::typed_codec::decode_nav_state_payload(&frame.payload)
+                else {
                     warn!(
                         "nav_state generated payload 解析失败 ({} 字节)",
                         frame.payload.len()
                     );
                     continue;
                 };
-                let nav = nav_runtime_state.observe_stack_state(nav).await;
-                let mut s = nav_state.write().await;
-                s.nav_state = nav.clone();
-                let _ = nav_tx.send(nav);
-            }
-        });
-    }
-
-    // ---- 订阅 frontiers ----
-    if let Some((fr_topic, fr_msg_type)) = fr_binding {
-        let fr_state = state.clone();
-        let fr_tx = frontiers_tx.clone();
-        let fr_transport = transport.clone();
-        let fr_msg_type_clone = fr_msg_type;
-        tokio::spawn(async move {
-            let mut stream = fr_transport
-                .subscribe(fr_topic, Some(fr_msg_type_clone))
-                .await;
-            use futures::StreamExt;
-            while let Some(frame_result) = stream.next().await {
-                let frame = match frame_result {
-                    Ok(f) => f,
-                    Err(e) => {
-                        error!("frontiers LCM 订阅错误: {}", e);
-                        continue;
-                    }
-                };
-                let Some(entries) = crate::typed_codec::decode_frontiers_payload(&frame.payload)
+                let Some(update) =
+                    apply_typed_navigation_feedback(&nav_runtime_state, update).await
                 else {
-                    warn!(
-                        "frontiers generated payload 解析失败 ({} 字节)",
-                        frame.payload.len()
-                    );
                     continue;
                 };
-                if entries.len() > FRONTIERS_MAX_ENTRIES_PER_FRAME {
-                    warn!(
-                        "/explore/frontiers payload count={} 超过 sanity cap={};按异常帧跳过",
-                        entries.len(),
-                        FRONTIERS_MAX_ENTRIES_PER_FRAME
-                    );
-                    continue;
-                }
-                let mut s = fr_state.write().await;
-                s.frontiers = entries.clone();
-                s.frontiers_revision += 1;
-                let _ = fr_tx.send(entries);
+                nav_state.write().await.nav_state = update.state.clone();
+                let _ = nav_tx.send(update.clone());
+                report_exploration_navigation_terminal(&nav_explore, &update).await;
             }
         });
     }
 
-    // Phase 3: 构造 mapping adapter。backend 不可用时为 None;
-    // 配置从 env 探测(NUWAX_MAPPING_*);默认 200×200 @ 0.05m/cell。
-    let mapping_adapter = if backend_available {
-        let cfg = MappingAdapterConfig::from_env();
-        info!(
-            "mapping_adapter 启动: resolution={}m auto_bounds_padding=1m occupancy_algo={}",
-            cfg.resolution,
-            cfg.occupancy_algo.as_dimos_str()
-        );
-        Some(Arc::new(parking_lot::Mutex::new(MappingAdapter::new(cfg))))
-    } else {
-        None
-    };
+    spawn_cancel_timeout_task(
+        nav_runtime.clone(),
+        state.clone(),
+        nav_state_tx.clone(),
+        explore_runtime.clone(),
+    );
+
+    // ExploreRuntime is the sole frontier owner. Its watch stream updates the
+    // process cache, gRPC broadcast, and typed LCM channel from one revision.
+    spawn_frontier_fanout(
+        explore_runtime.clone(),
+        state.clone(),
+        frontiers_tx.clone(),
+        transport.clone(),
+        fr_binding,
+    );
 
     // Phase 3 增强:订阅 /odom 和 /go2/lidar/points 时同步把数据喂给 mapping
     // adapter。`feed_pose` / `feed_pointcloud` 内部持 parking_lot 锁同步,
     // 不会跨 await。
-    if let Some(mapping_arc) = mapping_adapter.clone() {
-        spawn_mapping_feed_tasks(
-            transport.clone(),
-            state.clone(),
-            mapping_arc,
-            map_revision_tx.clone(),
-        );
-    }
-
     // Phase 3: 构造 occupancy grid SHM sidecar(默认 /tmp/nuwax_occupancy.mmap)。
     // 与 cloud_map SHM 区分:occupancy 走 grid layout(Phase 3 新增);
     // cloud_map 仍走 lcm_runtime 既有 `cm_writer`(Phase 0 已实装)。
@@ -1520,14 +2790,19 @@ pub fn spawn_geometry_runtime(
     let occupancy_shm_path = occupancy_shm
         .as_ref()
         .map(|_| occ_shm_path.to_string_lossy().into_owned());
+    let occupancy_shm_current = Arc::new(RwLock::new(None));
 
-    Ok(GeometryRuntimeHandle {
-        state,
-        cloud_map_tx,
-        nav_state_tx,
-        frontiers_tx,
-        map_revision_tx,
-        transport,
+    let cmd_vel_sink_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let explore_scheduler = Arc::new(tokio::sync::Mutex::new(None));
+    let mapping_lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let handle = GeometryRuntimeHandle {
+        state: state.clone(),
+        cloud_map_tx: cloud_map_tx.clone(),
+        nav_state_tx: nav_state_tx.clone(),
+        frontiers_tx: frontiers_tx.clone(),
+        map_revision_tx: map_revision_tx.clone(),
+        map_revision_latest_tx: map_revision_latest_tx.clone(),
+        transport: transport.clone(),
         transport_backend_name: backend_name,
         lcm_backend_available: backend_available,
         // Phase 6 / Rework-9: 默认 `false` —— 这是**生产 spawn 路径**,
@@ -1540,13 +2815,84 @@ pub fn spawn_geometry_runtime(
         // 注意:`build_handle_for_tests`(第 1354 行 test helper profile)
         // 仍保留默认 `true` —— 单测直接调 `set_cmd_vel_sink_ready(false)`
         // 验证 readiness 拒绝分支(参照 `phase6_handle_cmd_vel_sink_ready_setter_propagates_to_readiness`)。
-        cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cmd_vel_sink_ready: cmd_vel_sink_ready.clone(),
         nav: nav_runtime,
-        explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
-        mapping_adapter,
+        explore: explore_runtime.clone(),
+        mapping_adapter: mapping_adapter.clone(),
+        mapping_lifecycle_lock: mapping_lifecycle_lock.clone(),
+        occupancy_shm: occupancy_shm.clone(),
+        occupancy_shm_path: occupancy_shm_path.clone(),
+        occupancy_shm_current: occupancy_shm_current.clone(),
+        explore_scheduler: explore_scheduler.clone(),
+        runtime_observation_generation: runtime_observation_generation.clone(),
+    };
+
+    explore_runtime.set_navigation_sink(Arc::new(ExploreNavigationBridge {
+        state: state.clone(),
+        cloud_map_tx,
+        nav_state_tx,
+        frontiers_tx,
+        map_revision_tx: map_revision_tx.clone(),
+        map_revision_latest_tx: map_revision_latest_tx.clone(),
+        transport: transport.clone(),
+        transport_backend_name: backend_name,
+        lcm_backend_available: backend_available,
+        cmd_vel_sink_ready,
+        nav: handle.nav.clone(),
+        runtime_observation_generation,
+    }));
+    let scheduler_period_ms = std::env::var("NUWAX_EXPLORE_SCHEDULER_PERIOD_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(200);
+    let pose_ttl_ms = std::env::var("NUWAX_EXPLORE_POSE_TTL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1_000);
+    let scheduler = explore_runtime.spawn_scheduler(
+        Arc::new(SharedStatePoseProvider {
+            state: state.clone(),
+            freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
+            max_receipt_age: Duration::from_millis(pose_ttl_ms),
+        }),
+        Duration::from_millis(scheduler_period_ms),
+    );
+    *explore_scheduler
+        .try_lock()
+        .expect("new exploration scheduler lock must be uncontended") = Some(scheduler);
+
+    let fanout_mapping_adapter = mapping_adapter
+        .as_ref()
+        .expect("available LCM backend must construct mapping adapter")
+        .clone();
+    spawn_map_revision_fanout(
+        map_revision_fanout_rx,
+        map_revision_latest_tx,
+        transport.clone(),
+        occ_topic,
+        occ_msg_type,
         occupancy_shm,
         occupancy_shm_path,
-    })
+        occupancy_shm_current,
+        explore_runtime,
+        fanout_mapping_adapter,
+        mapping_lifecycle_lock,
+    );
+    if let Some(mapping_arc) = mapping_adapter {
+        spawn_mapping_feed_tasks(
+            transport,
+            state,
+            mapping_arc,
+            map_revision_tx,
+            odom_binding,
+            (tf_topic, tf_msg_type),
+            base_frame,
+        );
+    }
+
+    Ok(handle)
 }
 
 fn ingest_mapping_points(
@@ -1574,72 +2920,100 @@ fn ingest_mapping_points(
     Ok(adapter.build_and_publish(state, Some(map_revision_tx)))
 }
 
-async fn commit_occupancy_map(
-    state: &Arc<RwLock<SharedState>>,
-    mut map: MapState,
-    map_revision_tx: &broadcast::Sender<MapRevisionEvent>,
-) {
-    let event = {
-        let mut state = state.write().await;
-        map.revision = state.map.revision.saturating_add(1);
-        state.map = map;
-        MapRevisionEvent::from_map(&state.map)
-    };
-    let _ = map_revision_tx.send(event);
-}
-
 /// Phase 3: 把 LCM `/odom` 与 `/go2/lidar/points` typed channel 喂给 mapping adapter。
 ///
-/// 不替换 `spawn_geometry_runtime` 中已有的 odom/occupancy 订阅路径(那些驱动
-/// `SharedState`);mapping feed 是 **附加** 的数据通道,用于累积点云 +
-/// 维护 `last_sensor_origin`,然后调用 `build_and_publish` 写回 `SharedState.map`。
+/// MappingAdapter 是 occupancy revision 的唯一 writer；`/map/occupancy` 仅为
+/// 输出 fanout，不作为输入回灌。mapping feed 累积点云、维护
+/// `last_sensor_origin`，然后调用 `build_and_publish` 写回 `SharedState.map`。
 ///
-/// - `/odom` payload 走 `parse_odom_payload` → 提取 x/y/z → `feed_pose`
+/// - `/odom` payload 走 `parse_odom_payload` → 归一化 quaternion/yaw →
+///   `feed_pose_in_frame`，并从固定 anchor 发布 map→odom→base canonical TF
 /// - `/go2/lidar/points` payload 走 `parse_pointcloud_payload` → 转 Point3 →
 ///   `feed_pointcloud` + `build_and_publish`
 ///
-/// feed 路径持 parking_lot Mutex(同步,不跨 await);build_and_publish
-/// 内部走 `SharedState.try_write`(同步)。
+/// feed 路径持 parking_lot Mutex(同步,不跨 await);canonical pose/TF 在解锁后
+/// 写入 SharedState 并发布，`/pose_stamped` 不再具有全局位姿写权限。
 fn spawn_mapping_feed_tasks(
     transport: LcmTransport,
     state: Arc<RwLock<SharedState>>,
     mapping_arc: Arc<parking_lot::Mutex<MappingAdapter>>,
     map_revision_tx: broadcast::Sender<MapRevisionEvent>,
+    odom_binding: Option<(LcmTopic, LcmMessageType)>,
+    tf_binding: (LcmTopic, LcmMessageType),
+    base_frame: String,
 ) {
     use futures::StreamExt;
     use nalgebra::Point3;
 
     // ---- /odom → feed_pose ----
-    let (odom_topic, odom_msg_type) = match binding_for_key(ChannelKey::Odom, "nav_msgs.Odometry") {
-        Ok(binding) => binding,
-        Err(e) => {
-            error!(
-                "spawn_mapping_feed_tasks: odometry typed channel 无效: {}",
-                e
-            );
-            return;
-        }
-    };
-    let transport_odom = transport.clone();
-    let mapping_odom = mapping_arc.clone();
-    tokio::spawn(async move {
-        let mut stream = transport_odom
-            .subscribe(odom_topic, Some(odom_msg_type))
-            .await;
-        while let Some(frame_result) = stream.next().await {
-            let frame = match frame_result {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("mapping_feed /odom LCM 订阅错误: {}", e);
+    if let Some((odom_topic, odom_msg_type)) = odom_binding {
+        let transport_odom = transport.clone();
+        let mapping_odom = mapping_arc.clone();
+        let state_odom = state.clone();
+        let (tf_topic, tf_msg_type) = tf_binding;
+        tokio::spawn(async move {
+            let mut stream = transport_odom
+                .subscribe(odom_topic, Some(odom_msg_type))
+                .await;
+            while let Some(frame_result) = stream.next().await {
+                let frame = match frame_result {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("mapping_feed /odom LCM 订阅错误: {}", e);
+                        continue;
+                    }
+                };
+                let Some(pose) = parse_odom_payload(&frame.payload) else {
+                    warn!("mapping_feed /odom payload decode failed");
                     continue;
+                };
+                let (_, yaw_radians) = match normalized_quaternion_and_yaw(&pose) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        warn!(%error, "mapping_feed /odom quaternion rejected");
+                        continue;
+                    }
+                };
+                let observation = {
+                    let mut adapter = mapping_odom.lock();
+                    match adapter.feed_pose_in_frame(
+                        pose.x,
+                        pose.y,
+                        pose.z,
+                        yaw_radians,
+                        &pose.frame_id,
+                    ) {
+                        Ok(_) => adapter
+                            .map_odom_transform_snapshot()
+                            .ok_or_else(|| "odom pose did not establish T_map_odom".to_string())
+                            .and_then(|transform| {
+                                canonical_mapping_observation(&transform, &pose, &base_frame)
+                            }),
+                        Err(error) => Err(error.to_string()),
+                    }
+                };
+                let observation = match observation {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        warn!(%error, frame = %pose.frame_id, "mapping_feed /odom rejected");
+                        continue;
+                    }
+                };
+                apply_canonical_mapping_observation(&state_odom, &observation).await;
+                let tf_frame = crate::typed_codec::build_typed_frame(
+                    tf_topic.clone(),
+                    tf_msg_type.clone(),
+                    observation.tf_payload,
+                    pose.timestamp_ns,
+                );
+                if let Err(error) = transport_odom.publish(tf_frame).await {
+                    warn!(%error, "canonical mapping TF publish failed");
                 }
-            };
-            if let Some(pose) = parse_odom_payload(&frame.payload) {
-                let mut adapter = mapping_odom.lock();
-                adapter.feed_pose(pose.x, pose.y, pose.z);
             }
-        }
-    });
+        });
+    } else {
+        warn!("mapping_feed: odometry binding unavailable; odom anchor/TF feed disabled");
+    }
 
     // ---- /go2/lidar/points → feed_pointcloud + build_and_publish ----
     let (lidar_topic, lidar_msg_type) =
@@ -1772,19 +3146,38 @@ pub fn test_lcm_url() -> String {
 /// - 立即返回,适合 `#[tokio::test]` async 测试
 pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
-    let (nav_state_tx, _) = broadcast::channel::<NavState>(8);
+    let (nav_state_tx, _) = broadcast::channel::<NavigationUpdate>(8);
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
     let (map_revision_tx, _) = broadcast::channel::<MapRevisionEvent>(16);
+    let map_revision_fanout_rx = map_revision_tx.subscribe();
+    let (map_revision_latest_tx, _) = watch::channel::<Option<MapRevisionEvent>>(None);
     let state = Arc::new(RwLock::new(SharedState::default()));
+    static SEQUENCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence_state_path = std::env::temp_dir()
+        .join(format!(
+            "nuwax-geometry-sequence-test-{}-{}",
+            std::process::id(),
+            SEQUENCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ))
+        .join("sequence_state.json");
+    let sequence_store = Arc::new(
+        SequenceStateStore::open(&sequence_state_path)
+            .expect("test sequence state must be writable and exclusively lockable"),
+    );
     // 2026-07-08 fake-lcm 物理删除(v3 F2 决策):build_handle_for_tests 改走
     // RealLcmBackend;test_lcm_url() 端口公式防 cargo test 并行端口冲突
     // (Architect R1:直接重现 07_08 实机 175 GB 崩溃)。
     let transport = LcmTransport::new_real(&crate::lcm_runtime::test_lcm_url())
         .expect("test real LCM 启动失败,需先 apt-get install -y liblcm-dev 1.3~1.5");
     // Phase 3: 测试 helper 也构造 mapping_adapter,便于 unit test 走完整链路。
-    let mapping_adapter = Some(Arc::new(parking_lot::Mutex::new(MappingAdapter::new(
-        MappingAdapterConfig::from_env(),
-    ))));
+    let mapping_adapter = Some(Arc::new(parking_lot::Mutex::new(
+        MappingAdapter::new_with_frames_and_sequence_store(
+            MappingAdapterConfig::from_env(),
+            "map",
+            "odom",
+            sequence_store.clone(),
+        ),
+    )));
     // Phase 3: 测试 helper 也构造 occupancy_shm(走 /tmp 测试路径)
     // 注意:必须包含 per-call 唯一后缀(monotonic counter),否则并行
     // cargo test 跑多次 build_handle_for_tests 时,多个
@@ -1803,12 +3196,36 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
     let occupancy_shm_path = occupancy_shm
         .as_ref()
         .map(|_| occ_test_path.to_string_lossy().into_owned());
+    let occupancy_shm_current = Arc::new(RwLock::new(None));
+    let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+    let mapping_lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+    spawn_map_revision_fanout(
+        map_revision_fanout_rx,
+        map_revision_latest_tx.clone(),
+        transport.clone(),
+        LcmTopic::new(&format!(
+            "/test/geometry/occupancy/helper/{}",
+            std::process::id()
+        ))
+        .expect("test occupancy topic"),
+        LcmMessageType::new("nav_msgs.OccupancyGrid").expect("test occupancy type"),
+        occupancy_shm.clone(),
+        occupancy_shm_path.clone(),
+        occupancy_shm_current.clone(),
+        explore.clone(),
+        mapping_adapter
+            .as_ref()
+            .expect("test mapping adapter")
+            .clone(),
+        mapping_lifecycle_lock.clone(),
+    );
     Ok(GeometryRuntimeHandle {
         state,
         cloud_map_tx,
         nav_state_tx,
         frontiers_tx,
         map_revision_tx,
+        map_revision_latest_tx,
         transport,
         transport_backend_name: "real-lcm",
         lcm_backend_available: true,
@@ -1817,11 +3234,16 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
         // 配套测试用 `set_cmd_vel_sink_ready(false)` 验证 readiness 拒绝分支。
         // 生产 spawn 路径(`spawn_geometry_runtime`)默认 `false`。
         cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        nav: crate::nav_runtime::NavRuntimeState::from_env(),
-        explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
+        nav: crate::nav_runtime::NavRuntimeState::try_from_sequence_store(sequence_store.as_ref())
+            .expect("test producer generation reservation"),
+        explore,
         mapping_adapter,
+        mapping_lifecycle_lock,
         occupancy_shm,
         occupancy_shm_path,
+        occupancy_shm_current,
+        explore_scheduler: Arc::new(tokio::sync::Mutex::new(None)),
+        runtime_observation_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
 }
 
@@ -1889,9 +3311,8 @@ mod mapping_feed_tests {
     use crate::mapping_adapter::MappingReadiness;
     use nalgebra::Point3;
 
-    #[test]
-    fn production_ingest_uses_mapping_session_and_broadcasts_revision() {
-        let config = MappingAdapterConfig {
+    fn mapping_config() -> MappingAdapterConfig {
+        MappingAdapterConfig {
             resolution: 0.5,
             width_cells: 20,
             height_cells: 20,
@@ -1899,21 +3320,42 @@ mod mapping_feed_tests {
             voxel_size: 0.05,
             occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::General,
             initial_safe_radius_meters: 0.0,
-        };
-        let mut adapter = MappingAdapter::new(config);
-        adapter.feed_pose(1.0, 2.0, 0.0);
-        let mut initial_state = SharedState::default();
-        initial_state.map.revision = 9;
-        let state = Arc::new(RwLock::new(initial_state));
+        }
+    }
+
+    fn active_mapping_adapter() -> MappingAdapter {
+        let mut adapter = MappingAdapter::new_with_frames(mapping_config(), "map", "odom");
+        adapter
+            .start_session("test-session", "test-map", "mapver_000001")
+            .expect("active mapping test session");
+        adapter
+    }
+
+    fn shared_active_mapping_adapter() -> Arc<parking_lot::Mutex<MappingAdapter>> {
+        Arc::new(parking_lot::Mutex::new(active_mapping_adapter()))
+    }
+
+    fn map_revision_event(map: MapState) -> MapRevisionEvent {
+        let adapter = active_mapping_adapter();
+        MapRevisionEvent::from_map(&map, &adapter.snapshot())
+    }
+
+    #[test]
+    fn production_ingest_uses_mapping_session_and_broadcasts_revision() {
+        let mut adapter = active_mapping_adapter();
+        adapter
+            .feed_pose_in_frame(1.0, 2.0, 0.0, std::f64::consts::FRAC_PI_2, "odom")
+            .expect("establish odom anchor");
+        let state = Arc::new(RwLock::new(SharedState::default()));
         let (map_revision_tx, mut map_revision_rx) = broadcast::channel(4);
-        let points = vec![Point3::new(1.0, 2.0, 0.0), Point3::new(1.5, 2.0, 0.0)];
+        let points = vec![Point3::new(1.0, 2.0, 0.0), Point3::new(1.0, 3.0, 0.0)];
 
         assert!(ingest_mapping_points(
             &mut adapter,
             &points,
             12,
             1_750_000_000_000_000_000,
-            "mapping_lidar",
+            "odom",
             1_234_567_890_123_456_789,
             &state,
             &map_revision_tx,
@@ -1923,18 +3365,29 @@ mod mapping_feed_tests {
         assert_eq!(adapter.accumulated_count(), points.len());
         assert_eq!(adapter.odom_count(), 1);
         assert_eq!(adapter.pointcloud_count(), 1);
-        assert_eq!(adapter.current_revision(), 10);
+        assert_eq!(adapter.current_revision(), 1);
+        let frame_contract = adapter.frame_contract("map");
+        assert_eq!(frame_contract.source_frame_id, "odom");
+        assert_eq!(frame_contract.output_frame_id, "map");
+        assert!(frame_contract.transform_applied);
+        assert!(frame_contract.ready_for_global_consumers());
         #[allow(deprecated)]
         {
             assert!(adapter.accumulator.clone_points().is_empty());
         }
         let event = map_revision_rx.try_recv().expect("map revision event");
-        assert_eq!(event.revision, 10);
-        assert_eq!(event.size, 20);
+        assert_eq!(event.revision, 1);
+        assert_eq!(event.session_id, "test-session");
+        assert_eq!(event.map_version_id, "mapver_000001");
+        assert_eq!(event.session_generation, 1);
+        assert!(event.size > 0);
         assert_eq!(event.data.len() as u64, event.size);
-        assert_eq!(event.checksum, crate::map_checksum::sha256_hex(&event.data));
+        assert_eq!(
+            event.checksum,
+            crate::map_checksum::sha256_hex(event.data.as_ref())
+        );
         let committed = state.try_read().expect("committed mapping state");
-        assert_eq!(committed.map.frame_id, "mapping_lidar");
+        assert_eq!(committed.map.frame_id, "map");
         assert_eq!(committed.map.timestamp_ns, 1_234_567_890_123_456_789);
         assert_eq!(committed.map.revision, event.revision);
         assert_eq!(committed.map.data.len(), event.data.len());
@@ -1942,34 +3395,987 @@ mod mapping_feed_tests {
         assert!(readiness.ready);
     }
 
+    #[test]
+    fn mapping_feed_rejects_unknown_pose_and_cloud_frames() {
+        let mut adapter = active_mapping_adapter();
+        assert!(adapter
+            .feed_pose_in_frame(0.0, 0.0, 0.0, 0.0, "base_link")
+            .is_err());
+        assert_eq!(adapter.odom_count(), 0);
+        let points = [Point3::new(0.0, 0.0, 0.0)];
+        assert!(adapter
+            .feed_pointcloud_session(&points, (0.0, 0.0), 12, 10, "laser", 10)
+            .is_err());
+        assert_eq!(adapter.pointcloud_count(), 0);
+    }
+
+    #[test]
+    fn canonical_tf_uses_anchor_math_and_odometry_source_timestamp() {
+        let mut adapter = active_mapping_adapter();
+        adapter
+            .feed_pose_in_frame(2.0, 3.0, 0.0, std::f64::consts::FRAC_PI_2, "odom")
+            .expect("anchor");
+        adapter
+            .feed_pose_in_frame(2.0, 4.0, 0.0, std::f64::consts::FRAC_PI_2, "odom")
+            .expect("latest pose");
+        let pose = PoseState {
+            x: 2.0,
+            y: 4.0,
+            z: 0.0,
+            qx: 0.0,
+            qy: 0.0,
+            qz: 2.0 * std::f64::consts::FRAC_PI_4.sin(),
+            qw: 2.0 * std::f64::consts::FRAC_PI_4.cos(),
+            frame_id: "odom".to_string(),
+            timestamp_ns: 12_345_678_901,
+        };
+        let snapshot = adapter
+            .map_odom_transform_snapshot()
+            .expect("anchored transform");
+        let observation = canonical_mapping_observation(&snapshot, &pose, "base_link")
+            .expect("canonical observation");
+
+        assert!((observation.map_pose.x - 1.0).abs() < 1e-9);
+        assert!(observation.map_pose.y.abs() < 1e-9);
+        assert_eq!(observation.map_pose.frame_id, "map");
+        assert_eq!(observation.map_pose.timestamp_ns, pose.timestamp_ns);
+        assert!((observation.transforms[0].tx + 3.0).abs() < 1e-9);
+        assert!((observation.transforms[0].ty - 2.0).abs() < 1e-9);
+        assert_eq!(observation.transforms[0].stamp_ns, pose.timestamp_ns);
+        assert_eq!(observation.transforms[1].stamp_ns, pose.timestamp_ns);
+
+        let decoded = parse_tf_payload(&observation.tf_payload).expect("decode canonical TF");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            (decoded[0].parent.as_str(), decoded[0].child.as_str()),
+            ("map", "odom")
+        );
+        assert_eq!(
+            (decoded[1].parent.as_str(), decoded[1].child.as_str()),
+            ("odom", "base_link")
+        );
+        assert!(decoded
+            .iter()
+            .all(|entry| entry.stamp_ns == pose.timestamp_ns));
+    }
+
     #[tokio::test]
-    async fn occupancy_lcm_commit_also_broadcasts_the_committed_revision() {
-        let mut initial_state = SharedState::default();
-        initial_state.map.revision = 5;
-        let state = Arc::new(RwLock::new(initial_state));
-        let (map_revision_tx, mut map_revision_rx) = broadcast::channel(4);
-        let map = MapState {
+    async fn canonical_tf_is_observable_over_real_lcm() {
+        use futures::StreamExt;
+
+        let mut adapter = active_mapping_adapter();
+        adapter
+            .feed_pose_in_frame(1.0, 2.0, 0.0, 0.25, "odom")
+            .expect("anchor");
+        let pose = PoseState {
+            x: 1.5,
+            y: 2.5,
+            z: 0.0,
+            qz: (0.25_f64 * 0.5).sin(),
+            qw: (0.25_f64 * 0.5).cos(),
+            frame_id: "odom".to_string(),
+            timestamp_ns: 8_000_000_009,
+            ..PoseState::default()
+        };
+        adapter
+            .feed_pose_in_frame(pose.x, pose.y, pose.z, 0.25, "odom")
+            .expect("latest pose");
+        let observation = canonical_mapping_observation(
+            &adapter
+                .map_odom_transform_snapshot()
+                .expect("anchor snapshot"),
+            &pose,
+            "base_link",
+        )
+        .expect("canonical TF");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        apply_canonical_mapping_observation(&state, &observation).await;
+        {
+            let state = state.read().await;
+            assert_eq!(state.pose.frame_id, "map");
+            assert_eq!(state.pose.timestamp_ns, pose.timestamp_ns);
+            assert_eq!(state.latest_transform_entries().len(), 2);
+        }
+        let transport = LcmTransport::new_real(&test_lcm_url()).expect("real LCM transport");
+        let topic =
+            LcmTopic::new(&format!("/test/geometry/tf/{}", std::process::id())).expect("TF topic");
+        let message_type = LcmMessageType::new("tf2_msgs.TFMessage").expect("TF message type");
+        let mut stream = transport
+            .subscribe(topic.clone(), Some(message_type.clone()))
+            .await;
+        transport
+            .publish(crate::typed_codec::build_typed_frame(
+                topic,
+                message_type,
+                observation.tf_payload,
+                pose.timestamp_ns,
+            ))
+            .await
+            .expect("publish canonical TF");
+        let frame = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("real LCM TF timeout")
+            .expect("TF stream open")
+            .expect("TF frame");
+        let decoded = parse_tf_payload(&frame.payload).expect("decode TF body");
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded
+            .iter()
+            .all(|entry| entry.stamp_ns == pose.timestamp_ns));
+    }
+
+    #[test]
+    fn map_revision_clone_shares_large_payload_allocation() {
+        let event = map_revision_event(MapState {
+            width: 2 * 1024 * 1024,
+            height: 1,
+            frame_id: "map".to_string(),
+            data: vec![42; 2 * 1024 * 1024],
+            ..MapState::default()
+        });
+        let clone = event.clone();
+        assert!(Arc::ptr_eq(&event.data, &clone.data));
+        assert_eq!(clone.data.len(), 2 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn map_revision_watch_coalesces_bursts_to_latest_revision() {
+        let (ingress_tx, ingress_rx) = broadcast::channel(8);
+        let (latest_tx, mut latest_rx) = watch::channel(None);
+        let mapping_adapter = shared_active_mapping_adapter();
+        spawn_map_revision_coalescer(
+            ingress_rx,
+            latest_tx,
+            mapping_adapter,
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        for revision in 1..=64 {
+            ingress_tx
+                .send(map_revision_event(MapState {
+                    width: 1,
+                    height: 1,
+                    frame_id: "map".to_string(),
+                    revision,
+                    data: vec![revision as i8],
+                    ..MapState::default()
+                }))
+                .expect("coalescer receiver");
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                latest_rx.changed().await.expect("coalescer open");
+                let latest = latest_rx.borrow_and_update().clone();
+                if latest.as_ref().map(|event| event.revision) == Some(64) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("latest revision must be observable");
+        assert_eq!(
+            latest_rx.borrow().as_ref().map(|event| event.revision),
+            Some(64)
+        );
+    }
+
+    #[tokio::test]
+    async fn external_occupancy_lcm_cannot_advance_native_mapping_revision() {
+        let handle = build_handle_for_tests().await.expect("test handle");
+        handle
+            .mapping_adapter
+            .as_ref()
+            .expect("mapping adapter")
+            .lock()
+            .start_session("external-test", "warehouse", "mapver_000001")
+            .expect("active mapping session");
+        let mut map_revision_rx = handle.map_revision_tx.subscribe();
+        let event = map_revision_event(MapState {
             width: 2,
             height: 1,
             resolution: 0.1,
             origin_x: 0.0,
             origin_y: 0.0,
             frame_id: "map".into(),
-            revision: 0,
+            revision: 1,
             timestamp_ns: 123_000_000,
             data: vec![0, 100],
+        });
+        let topic = LcmTopic::new(&format!(
+            "/test/geometry/occupancy/helper/{}",
+            std::process::id()
+        ))
+        .expect("test occupancy topic");
+        let message_type =
+            LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy message type");
+        handle
+            .transport
+            .publish(crate::typed_codec::build_typed_frame(
+                topic,
+                message_type,
+                encode_occupancy_revision(&event).expect("encode external occupancy"),
+                1,
+            ))
+            .await
+            .expect("publish external occupancy");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(handle.state.read().await.map.revision, 0);
+        assert_eq!(
+            handle
+                .mapping_adapter
+                .as_ref()
+                .expect("mapping adapter")
+                .lock()
+                .current_revision(),
+            0
+        );
+        assert!(map_revision_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn map_revision_fanout_uses_canonical_occupancy_and_exploration_cells() {
+        let event = map_revision_event(MapState {
+            width: 4,
+            height: 1,
+            resolution: 0.25,
+            origin_x: -1.0,
+            origin_y: 2.0,
+            frame_id: "map".into(),
+            revision: 9,
+            timestamp_ns: 5_000_000_006,
+            data: vec![-1, 0, 42, 100],
+        });
+
+        let payload = encode_occupancy_revision(&event).expect("canonical occupancy payload");
+        let decoded = schema::decode_occupancy_grid_body(&payload).expect("decode occupancy");
+        assert_eq!(decoded.header.frame_id, "map");
+        assert_eq!(decoded.info.width, 4);
+        assert_eq!(decoded.info.height, 1);
+        assert_eq!(decoded.data, vec![-1, 0, 42, 100]);
+
+        let costmap =
+            exploration_costmap_from_revision(&event).expect("map-frame exploration snapshot");
+        assert_eq!(costmap.map_revision, 9);
+        assert_eq!(costmap.map_version_id, "mapver_000001");
+        assert_eq!(
+            costmap.grid.cells[0],
+            nuwax_nav_types_messages::grid::OccupancyCell::Unknown
+        );
+        assert_eq!(
+            costmap.grid.cells[1],
+            nuwax_nav_types_messages::grid::OccupancyCell::Free
+        );
+        assert_eq!(
+            costmap.grid.cells[2],
+            nuwax_nav_types_messages::grid::OccupancyCell::Cost(42)
+        );
+        assert_eq!(
+            costmap.grid.cells[3],
+            nuwax_nav_types_messages::grid::OccupancyCell::Occupied
+        );
+    }
+
+    #[test]
+    fn non_map_revision_is_rejected_for_global_consumers() {
+        let event = map_revision_event(MapState {
+            width: 1,
+            height: 1,
+            resolution: 0.25,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            frame_id: "odom".into(),
+            revision: 1,
+            timestamp_ns: 1,
+            data: vec![0],
+        });
+        assert!(encode_occupancy_revision(&event).is_err());
+        assert!(exploration_costmap_from_revision(&event).is_err());
+    }
+
+    #[test]
+    fn occupancy_revision_wire_domain_is_positive_i32_without_truncation() {
+        let event = |revision| {
+            map_revision_event(MapState {
+                width: 1,
+                height: 1,
+                resolution: 0.25,
+                frame_id: "map".into(),
+                revision,
+                timestamp_ns: 1,
+                data: vec![0],
+                ..MapState::default()
+            })
         };
 
-        commit_occupancy_map(&state, map, &map_revision_tx).await;
+        assert!(encode_occupancy_revision(&event(0)).is_err());
+        let max_payload =
+            encode_occupancy_revision(&event(i32::MAX as u64)).expect("final positive i32");
+        let decoded =
+            schema::decode_occupancy_grid_body(&max_payload).expect("decode max revision");
+        assert_eq!(decoded.header.seq, i32::MAX);
+        assert!(encode_occupancy_revision(&event(i32::MAX as u64 + 1)).is_err());
+        assert!(encode_occupancy_revision(&event(u64::MAX)).is_err());
+    }
 
-        let event = map_revision_rx
-            .recv()
+    #[tokio::test]
+    async fn map_revision_fanout_is_observable_over_real_lcm() {
+        use futures::StreamExt;
+
+        let transport = LcmTransport::new_real(&test_lcm_url()).expect("real LCM transport");
+        let topic_name = format!("/test/geometry/occupancy/{}", std::process::id());
+        let topic = LcmTopic::new(&topic_name).expect("test topic");
+        let message_type =
+            LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy message type");
+        let mut stream = transport
+            .subscribe(topic.clone(), Some(message_type.clone()))
+            .await;
+        let (tx, rx) = broadcast::channel(4);
+        let (latest_tx, _) = watch::channel(None);
+        let mapping_adapter = shared_active_mapping_adapter();
+        spawn_map_revision_fanout(
+            rx,
+            latest_tx,
+            transport,
+            topic,
+            message_type,
+            None,
+            None,
+            Arc::new(RwLock::new(None)),
+            crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
+            mapping_adapter,
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        let event = map_revision_event(MapState {
+            width: 2,
+            height: 1,
+            resolution: 0.1,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            frame_id: "map".into(),
+            revision: 1,
+            timestamp_ns: 9_000_000_010,
+            data: vec![0, 100],
+        });
+        tx.send(event).expect("fanout receiver registered");
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
-            .expect("occupancy revision event");
-        assert_eq!(event.revision, 6);
-        assert_eq!(event.data, vec![0, 100]);
-        assert_eq!(event.checksum, crate::map_checksum::sha256_hex(&event.data));
-        assert_eq!(state.read().await.map.revision, event.revision);
+            .expect("real LCM receive timeout")
+            .expect("real LCM stream closed")
+            .expect("real LCM frame");
+        let decoded = schema::decode_occupancy_grid_body(&frame.payload)
+            .expect("decode real LCM occupancy body");
+        assert_eq!(decoded.header.frame_id, "map");
+        assert_eq!(decoded.data, vec![0, 100]);
+    }
+}
+
+#[cfg(test)]
+mod exploration_adapter_tests {
+    use super::*;
+    use crate::explore_runtime::ExplorePoseProvider;
+
+    fn pose_provider(
+        timestamp_ns: u64,
+        ttl: Duration,
+    ) -> (SharedStatePoseProvider, Arc<RwLock<SharedState>>) {
+        let state = SharedState {
+            pose: PoseState {
+                frame_id: "map".to_string(),
+                timestamp_ns,
+                qw: 1.0,
+                ..PoseState::default()
+            },
+            ..SharedState::default()
+        };
+        let state = Arc::new(RwLock::new(state));
+        (
+            SharedStatePoseProvider {
+                state: state.clone(),
+                freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
+                max_receipt_age: ttl,
+            },
+            state,
+        )
+    }
+
+    #[tokio::test]
+    async fn pose_provider_requires_fresh_source_and_monotonic_receipt() {
+        let (provider, state) = pose_provider(
+            crate::explore_runtime::now_unix_nanos(),
+            Duration::from_millis(20),
+        );
+        let first = provider.current_pose().await.expect("fresh pose");
+        assert!(first.source_timestamp_ns > 0);
+        assert!(first.received_monotonic_ns > 0);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(provider.current_pose().await.unwrap_err().contains("stale"));
+
+        state.write().await.pose.timestamp_ns = crate::explore_runtime::now_unix_nanos();
+        let refreshed = provider.current_pose().await.expect("refreshed pose");
+        assert!(refreshed.received_monotonic_ns >= first.received_monotonic_ns);
+
+        let (stale_source, _) = pose_provider(
+            crate::explore_runtime::now_unix_nanos().saturating_sub(100_000_000),
+            Duration::from_millis(20),
+        );
+        assert!(stale_source
+            .current_pose()
+            .await
+            .unwrap_err()
+            .contains("source timestamp is stale"));
+    }
+
+    fn exploration_update(status: &str) -> NavigationUpdate {
+        NavigationUpdate {
+            producer_runtime_generation: 0,
+            state: NavState {
+                status: status.to_string(),
+                goal_id: "explore-1.nav.1".to_string(),
+                message: "terminal".to_string(),
+                ..NavState::default()
+            },
+            feedback: NavigationFeedback {
+                owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                parent_request_id: "explore-1".to_string(),
+                goal_generation: 7,
+                planner_map_revision: 3,
+                map_version_id: "map-v1".to_string(),
+                goal_payload_sha256: [9; 32],
+                ..NavigationFeedback::default()
+            },
+        }
+    }
+
+    #[test]
+    fn exploration_terminal_adapter_preserves_zeroed_and_failure_proof() {
+        let mut cancelled = exploration_update("CANCELLED");
+        cancelled.feedback.actuator_zeroed = true;
+        cancelled.feedback.cancel_generation = 11;
+        assert!(exploration_navigation_terminal_result(&cancelled).is_none());
+        cancelled.feedback.zero_ack_id = "zero-11".to_string();
+        cancelled.feedback.zero_applied_monotonic_ns = 123;
+        let result = exploration_navigation_terminal_result(&cancelled).expect("complete zero");
+        let crate::explore_runtime::ChildNavigationResult::Cancelled(proof) = result else {
+            panic!("expected cancelled proof");
+        };
+        assert_eq!(proof.cancel_generation, 11);
+        assert_eq!(proof.zero_ack_id, "zero-11");
+        assert_eq!(proof.lease.parent_request_id, "explore-1");
+        assert_eq!(proof.lease.map_revision, 3);
+
+        let mut timed_out = exploration_update("FAILED");
+        timed_out.feedback.cancel_phase = "TIMED_OUT".to_string();
+        timed_out.feedback.cancel_generation = 11;
+        assert!(matches!(
+            exploration_navigation_terminal_result(&timed_out),
+            Some(
+                crate::explore_runtime::ChildNavigationResult::CancelFailed {
+                    cancel_generation: 11,
+                    ..
+                }
+            )
+        ));
+    }
+}
+
+#[cfg(test)]
+mod typed_navigation_feedback_tests {
+    use super::*;
+
+    fn test_lease(goal_id: &str) -> crate::nav_runtime::GoalLease {
+        crate::nav_runtime::GoalLease {
+            session_id: goal_id.to_string(),
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: format!("request-{goal_id}"),
+            goal_generation: 1,
+            producer_runtime_generation: 1,
+            map_version_id: "map-v1".to_string(),
+            map_revision: 42,
+            goal_payload_sha256: [7; 32],
+            path_revision: 0,
+            path_payload_sha256: [0; 32],
+        }
+    }
+
+    fn feedback_update(goal_id: &str) -> NavigationUpdate {
+        let lease = (!goal_id.is_empty()).then(|| test_lease(goal_id));
+        NavigationUpdate {
+            producer_runtime_generation: lease
+                .as_ref()
+                .map_or(0, |lease| lease.producer_runtime_generation),
+            state: NavState {
+                status: "IDLE".into(),
+                message: "guard-backed scheduler heartbeat".into(),
+                goal_id: goal_id.into(),
+                distance_remaining: 0.0,
+                timestamp_ns: 10,
+            },
+            feedback: NavigationFeedback {
+                runtime_generation: 7,
+                guard_generation: 11,
+                sink_ready: true,
+                planner_map_revision: 42,
+                planner_map_frame: "map".into(),
+                planner_pose_frame: "map".into(),
+                owner_kind: lease.as_ref().map_or(0, |lease| lease.owner_kind),
+                parent_request_id: lease
+                    .as_ref()
+                    .map_or_else(String::new, |lease| lease.parent_request_id.clone()),
+                goal_generation: lease.as_ref().map_or(0, |lease| lease.goal_generation),
+                goal_payload_sha256: lease
+                    .as_ref()
+                    .map_or([0; 32], |lease| lease.goal_payload_sha256),
+                map_version_id: lease
+                    .as_ref()
+                    .map_or_else(String::new, |lease| lease.map_version_id.clone()),
+                ..NavigationFeedback::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_feedback_drives_real_planner_and_motion_observations() {
+        let handle = build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        handle
+            .nav
+            .observe_tf_chain(crate::nav_runtime::TfChainObservation {
+                generation: 3,
+                map_frame: "map".into(),
+                odom_frame: "odom".into(),
+                base_frame: "base_link".into(),
+                map_to_odom: true,
+                odom_to_base: true,
+            })
+            .expect("TF observation");
+
+        let update = apply_typed_navigation_feedback(&handle.nav, feedback_update(""))
+            .await
+            .expect("unowned heartbeat");
+        assert_eq!(update.state.status, "IDLE");
+        let readiness = crate::nav_runtime::compute_readiness(&handle, &handle.nav).await;
+        assert!(readiness.ready, "{}", readiness.reason);
+        assert_eq!(readiness.planner_generation, 7);
+        assert_eq!(readiness.motion_sink_generation, 11);
+        assert_eq!(readiness.costmap_revision, 42);
+    }
+
+    #[tokio::test]
+    async fn unowned_heartbeat_cannot_mutate_or_impersonate_an_active_goal() {
+        for status in ["IDLE", "FAILED", "CANCELLED", "SUCCEEDED"] {
+            let handle = build_handle_for_tests()
+                .await
+                .expect("real-lcm test handle");
+            let lease_b = test_lease("unowned-active-b");
+            {
+                let inner = handle.nav.inner();
+                let mut slot = inner.write().await;
+                slot.phase = crate::nav_runtime::NavPhase::Running;
+                slot.message = "B remains active".into();
+                slot.goal = Some(crate::nav_runtime::ActiveGoal {
+                    id: lease_b.session_id.clone(),
+                    frame_id: "map".to_string(),
+                    target: PoseState::default(),
+                    accepted_at_ns: 1,
+                    lease: lease_b.clone(),
+                });
+            }
+            let before_cancel = handle.nav.cancel_snapshot();
+            let mut heartbeat = feedback_update("");
+            heartbeat.state.status = status.into();
+            heartbeat.state.message = "unowned scheduler heartbeat".into();
+
+            let applied = apply_typed_navigation_feedback(&handle.nav, heartbeat)
+                .await
+                .expect("unowned heartbeat remains valid for liveness");
+            assert!(
+                applied.state.goal_id.is_empty(),
+                "an unowned heartbeat must not impersonate B"
+            );
+            assert_eq!(handle.nav.cancel_snapshot(), before_cancel);
+            let inner = handle.nav.inner();
+            let slot = inner.read().await;
+            assert_eq!(slot.phase, crate::nav_runtime::NavPhase::Running);
+            assert_eq!(slot.message, "B remains active");
+            assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease_b));
+        }
+    }
+
+    #[tokio::test]
+    async fn unowned_heartbeat_cannot_change_a_pending_cancel_transaction() {
+        for status in ["IDLE", "FAILED"] {
+            let handle = build_handle_for_tests()
+                .await
+                .expect("real-lcm test handle");
+            let lease_b = test_lease("unowned-pending-b");
+            {
+                let inner = handle.nav.inner();
+                let mut slot = inner.write().await;
+                slot.phase = crate::nav_runtime::NavPhase::Running;
+                slot.goal = Some(crate::nav_runtime::ActiveGoal {
+                    id: lease_b.session_id.clone(),
+                    frame_id: "map".to_string(),
+                    target: PoseState::default(),
+                    accepted_at_ns: 1,
+                    lease: lease_b.clone(),
+                });
+            }
+            let pending = crate::nav_runtime::cancel(
+                &handle,
+                &handle.nav,
+                crate::nav_runtime::CancelGoalInput {
+                    goal_id: lease_b.session_id.clone(),
+                    owner_kind: lease_b.owner_kind,
+                    parent_request_id: lease_b.parent_request_id.clone(),
+                    goal_generation: lease_b.goal_generation,
+                    producer_runtime_generation: lease_b.producer_runtime_generation,
+                },
+            )
+            .await;
+            assert_eq!(pending.state.status, "PENDING");
+            let before_cancel = handle.nav.cancel_snapshot();
+            let inner = handle.nav.inner();
+            let before_phase = inner.read().await.phase;
+
+            let mut heartbeat = feedback_update("");
+            heartbeat.state.status = status.into();
+            heartbeat.state.message = "unowned scheduler heartbeat".into();
+            let applied = apply_typed_navigation_feedback(&handle.nav, heartbeat)
+                .await
+                .expect("unowned heartbeat remains valid for liveness");
+
+            assert!(applied.state.goal_id.is_empty());
+            assert_eq!(handle.nav.cancel_snapshot(), before_cancel);
+            let slot = inner.read().await;
+            assert_eq!(slot.phase, before_phase);
+            assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease_b));
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_ack_requires_goal_and_cancel_generation_correlation() {
+        let handle = build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let lease = test_lease("goal-zero");
+        {
+            let inner = handle.nav.inner();
+            let mut slot = inner.write().await;
+            slot.phase = crate::nav_runtime::NavPhase::Running;
+            slot.goal = Some(crate::nav_runtime::ActiveGoal {
+                id: lease.session_id.clone(),
+                frame_id: "map".to_string(),
+                target: PoseState::default(),
+                accepted_at_ns: 1,
+                lease: lease.clone(),
+            });
+        }
+        let pending = crate::nav_runtime::cancel(
+            &handle,
+            &handle.nav,
+            crate::nav_runtime::CancelGoalInput {
+                goal_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+            },
+        )
+        .await;
+        assert_eq!(pending.state.status, "PENDING");
+        let cancel = handle.nav.cancel_snapshot();
+
+        let mut stale = feedback_update("goal-zero");
+        stale.state.status = "CANCELLED".into();
+        stale.state.message = "planner stopped".into();
+        stale.feedback.cancel_generation = cancel.generation.saturating_add(1);
+        stale.feedback.zero_ack_id = "wrong-generation".into();
+        stale.feedback.zero_applied_monotonic_ns = 20;
+        let stale = apply_typed_navigation_feedback(&handle.nav, stale)
+            .await
+            .expect("correlated lease");
+        assert_eq!(stale.state.status, "PENDING");
+        assert!(!stale.feedback.actuator_zeroed);
+        assert!(stale.feedback.zero_ack_id.is_empty());
+
+        let mut correlated = feedback_update("goal-zero");
+        correlated.state.status = "CANCELLED".into();
+        correlated.state.message = "planner stopped".into();
+        correlated.feedback.cancel_generation = cancel.generation;
+        correlated.feedback.zero_ack_id = "zero-ok".into();
+        correlated.feedback.zero_applied_monotonic_ns = 21;
+        let correlated = apply_typed_navigation_feedback(&handle.nav, correlated)
+            .await
+            .expect("correlated zero ack");
+        assert_eq!(correlated.state.status, "CANCELLED");
+        assert_eq!(correlated.feedback.cancel_phase, "ZEROED");
+        assert!(correlated.feedback.actuator_zeroed);
+        assert_eq!(
+            handle.nav.cancel_snapshot().phase,
+            crate::nav_runtime::CancelPhase::Zeroed
+        );
+    }
+
+    #[tokio::test]
+    async fn navigation_state_with_wrong_lease_or_hash_is_rejected_before_observation() {
+        let handle = build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let lease = test_lease("goal-correlated");
+        {
+            let inner = handle.nav.inner();
+            let mut slot = inner.write().await;
+            slot.phase = crate::nav_runtime::NavPhase::Running;
+            slot.goal = Some(crate::nav_runtime::ActiveGoal {
+                id: lease.session_id.clone(),
+                frame_id: "map".to_string(),
+                target: PoseState::default(),
+                accepted_at_ns: 1,
+                lease,
+            });
+        }
+        let mut wrong_owner = feedback_update("goal-correlated");
+        wrong_owner.feedback.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
+        assert!(apply_typed_navigation_feedback(&handle.nav, wrong_owner)
+            .await
+            .is_none());
+        let mut wrong_hash = feedback_update("goal-correlated");
+        wrong_hash.feedback.goal_payload_sha256 = [9; 32];
+        assert!(apply_typed_navigation_feedback(&handle.nav, wrong_hash)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn correlated_a_terminal_cannot_mutate_replacement_b_incarnation() {
+        let handle = build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        handle
+            .nav
+            .observe_planner_input(crate::nav_runtime::PlannerInputObservation {
+                generation: 7,
+                map_revision: 42,
+                map_frame: "map".into(),
+                pose_frame: "map".into(),
+                ready: true,
+            })
+            .expect("baseline planner observation");
+        handle
+            .nav
+            .observe_motion_sink(crate::nav_runtime::MotionSinkObservation {
+                generation: 11,
+                ready: true,
+            })
+            .expect("baseline sink observation");
+        let baseline = crate::nav_runtime::compute_readiness(&handle, &handle.nav).await;
+        let lease_a = test_lease("same-feedback-goal");
+        {
+            let inner = handle.nav.inner();
+            let mut slot = inner.write().await;
+            slot.phase = crate::nav_runtime::NavPhase::Running;
+            slot.goal = Some(crate::nav_runtime::ActiveGoal {
+                id: lease_a.session_id.clone(),
+                frame_id: "map".to_string(),
+                target: PoseState::default(),
+                accepted_at_ns: 1,
+                lease: lease_a.clone(),
+            });
+        }
+
+        let mut stale_a = feedback_update("same-feedback-goal");
+        stale_a.state.status = "FAILED".into();
+        stale_a.state.message = "late A terminal".into();
+        stale_a.feedback.runtime_generation = 99;
+        stale_a.feedback.planner_map_frame = "map".into();
+        stale_a.feedback.planner_pose_frame = "odom".into();
+        stale_a.feedback.guard_generation = 99;
+        stale_a.feedback.sink_ready = false;
+        let correlated_a = handle
+            .nav
+            .correlate_navigation_state(
+                &stale_a.state.goal_id,
+                stale_a.feedback.owner_kind,
+                &stale_a.feedback.parent_request_id,
+                stale_a.feedback.goal_generation,
+                stale_a.feedback.planner_map_revision,
+                stale_a.feedback.path_revision,
+                stale_a.feedback.goal_payload_sha256,
+                stale_a.feedback.path_payload_sha256,
+            )
+            .await
+            .expect("A feedback must correlate before the pause")
+            .expect("A lease");
+        assert_eq!(correlated_a, lease_a);
+
+        let mut lease_b = lease_a.clone();
+        lease_b.path_revision = 1;
+        lease_b.path_payload_sha256 = [8; 32];
+        {
+            let inner = handle.nav.inner();
+            let mut slot = inner.write().await;
+            slot.phase = crate::nav_runtime::NavPhase::Running;
+            slot.goal = Some(crate::nav_runtime::ActiveGoal {
+                id: lease_b.session_id.clone(),
+                frame_id: "map".to_string(),
+                target: PoseState::default(),
+                accepted_at_ns: 2,
+                lease: lease_b.clone(),
+            });
+        }
+
+        let stale_planner = crate::nav_runtime::PlannerInputObservation {
+            generation: stale_a.feedback.runtime_generation,
+            map_revision: stale_a.feedback.planner_map_revision,
+            map_frame: stale_a.feedback.planner_map_frame.clone(),
+            pose_frame: stale_a.feedback.planner_pose_frame.clone(),
+            ready: false,
+        };
+        let stale_sink = crate::nav_runtime::MotionSinkObservation {
+            generation: stale_a.feedback.guard_generation,
+            ready: stale_a.feedback.sink_ready,
+        };
+        let rejected = handle
+            .nav
+            .observe_correlated_navigation_state(
+                stale_a.state,
+                &correlated_a,
+                Some(stale_planner),
+                Some(stale_sink),
+            )
+            .await;
+        assert!(
+            rejected.is_err(),
+            "the stale A terminal must fail its final active-incarnation CAS"
+        );
+        let inner = handle.nav.inner();
+        let slot = inner.read().await;
+        assert_eq!(slot.phase, crate::nav_runtime::NavPhase::Running);
+        assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease_b));
+        drop(slot);
+        let after = crate::nav_runtime::compute_readiness(&handle, &handle.nav).await;
+        assert_eq!(after.planner_generation, baseline.planner_generation);
+        assert_eq!(after.map_frame, baseline.map_frame);
+        assert_eq!(after.pose_frame, baseline.pose_frame);
+        assert_eq!(
+            after.motion_sink_generation,
+            baseline.motion_sink_generation
+        );
+        assert_eq!(after.cmd_vel_sink_ready, baseline.cmd_vel_sink_ready);
+    }
+
+    #[tokio::test]
+    async fn geometry_consumes_only_correlated_path_envelopes_over_real_lcm() {
+        let transport = LcmTransport::new_real(&test_lcm_url()).expect("real LCM transport");
+        let nav = crate::nav_runtime::NavRuntimeState::from_env();
+        let lease = test_lease("path-lcm");
+        {
+            let inner = nav.inner();
+            let mut slot = inner.write().await;
+            slot.phase = crate::nav_runtime::NavPhase::Planning;
+            slot.goal = Some(crate::nav_runtime::ActiveGoal {
+                id: lease.session_id.clone(),
+                frame_id: "map".to_string(),
+                target: PoseState::default(),
+                accepted_at_ns: 1,
+                lease: lease.clone(),
+            });
+        }
+        let topic = LcmTopic::new(&format!("/test/geometry/path/{}", std::process::id()))
+            .expect("path topic");
+        let envelope_type =
+            LcmMessageType::new("nuwax_msgs.PathEnvelope").expect("PathEnvelope type");
+        spawn_path_envelope_consumer(
+            transport.clone(),
+            nav.clone(),
+            (topic.clone(), envelope_type.clone()),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let raw_path = schema::encode_path_body(&schema::Path {
+            header: schema::Header {
+                frame_id: "map".to_string(),
+                ..schema::Header::default()
+            },
+            poses: vec![schema::PoseStamped {
+                header: schema::Header {
+                    frame_id: "map".to_string(),
+                    ..schema::Header::default()
+                },
+                ..schema::PoseStamped::default()
+            }],
+        })
+        .expect("raw path");
+        transport
+            .publish(crate::typed_codec::build_typed_frame(
+                topic.clone(),
+                LcmMessageType::new("nav_msgs.Path").expect("raw Path type"),
+                raw_path,
+                1,
+            ))
+            .await
+            .expect("publish raw path");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(nav.active_goal_lease().await.unwrap().path_revision, 0);
+
+        let mut path = schema::PathEnvelope {
+            schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            session_id: lease.session_id.clone(),
+            owner_kind: lease.owner_kind,
+            parent_request_id: lease.parent_request_id.clone(),
+            goal_generation: lease.goal_generation as i64,
+            planner_runtime_generation: 1,
+            map_version_id: lease.map_version_id.clone(),
+            map_revision: lease.map_revision as i64,
+            path_revision: 1,
+            source_timestamp_ns: 10,
+            goal_payload_sha256: lease.goal_payload_sha256,
+            path: schema::Path {
+                header: schema::Header {
+                    frame_id: "map".to_string(),
+                    ..schema::Header::default()
+                },
+                poses: vec![schema::PoseStamped {
+                    header: schema::Header {
+                        frame_id: "map".to_string(),
+                        ..schema::Header::default()
+                    },
+                    pose: schema::Pose {
+                        orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                        ..schema::Pose::default()
+                    },
+                }],
+            },
+            ..schema::PathEnvelope::default()
+        };
+        schema::seal_path_envelope(&mut path).expect("seal path envelope");
+        transport
+            .publish(crate::typed_codec::build_typed_frame(
+                topic,
+                envelope_type,
+                schema::encode_path_envelope_body(&path).expect("encode PathEnvelope"),
+                2,
+            ))
+            .await
+            .expect("publish PathEnvelope");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if nav.active_goal_lease().await.unwrap().path_revision == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("PathEnvelope consumer must update the lease");
+        assert_eq!(
+            nav.active_goal_lease().await.unwrap().path_payload_sha256,
+            path.path_payload_sha256
+        );
     }
 }
 
@@ -2186,5 +4592,303 @@ mod payload_sanity_tests {
             ..schema::PointCloud2::default()
         })
         .expect("encode PointCloud2")
+    }
+}
+
+#[cfg(test)]
+mod exploration_lcm_smoke_tests {
+    use super::*;
+    use crate::explore_runtime::{ExploreCostmapSnapshot, ExploreStartConfig};
+    use crate::nav_runtime::{MotionSinkObservation, PlannerInputObservation, TfChainObservation};
+    use futures::StreamExt;
+    use nuwax_exploration::ExplorationBoundary;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    fn smoke_costmap(map_revision: u64) -> ExploreCostmapSnapshot {
+        let mut grid = OccupancyGrid2D {
+            resolution: 0.5,
+            origin: Point2 { x: 0.0, y: 0.0 },
+            width: 12,
+            height: 12,
+            cells: vec![OccupancyCell::Unknown; 144],
+        };
+        for y in 2..=7 {
+            for x in 2..=7 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        ExploreCostmapSnapshot {
+            grid,
+            frame_id: "map".to_string(),
+            map_version_id: "smoke-map-v41".to_string(),
+            map_revision,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_exploration_channels_round_trip_over_real_lcm() {
+        const MAP_REVISION: u64 = 41;
+        const PARENT_REQUEST: &str = "smoke-explore";
+
+        let provider = test_lcm_url();
+        assert!(provider.starts_with("udpm://239.255.76.67:"));
+        assert!(provider.ends_with("?ttl=1"));
+        let publisher = LcmTransport::new_real(&provider)
+            .expect("real LCM publisher context; install liblcm-dev to run this smoke");
+        let subscriber =
+            LcmTransport::new_real(&provider).expect("independent real LCM subscriber context");
+
+        let frontier_topic = LcmTopic::new("/explore/frontiers").expect("frontier topic");
+        let frontier_type =
+            LcmMessageType::new("nuwax_msgs.FrontierList").expect("FrontierList type");
+        let (goal_topic, goal_type) =
+            crate::nav_runtime::goal_envelope_binding().expect("canonical goal binding");
+        assert_eq!(goal_topic.channel(), "/nav/goal");
+        assert_eq!(goal_type.fqn(), "nuwax_msgs.GoalEnvelope");
+        assert_eq!(
+            frontier_type.fingerprint(),
+            schema::FRONTIER_LIST_FINGERPRINT
+        );
+        assert_eq!(goal_type.fingerprint(), schema::GOAL_ENVELOPE_FINGERPRINT);
+
+        let mut frontier_frames = subscriber
+            .subscribe(frontier_topic.clone(), Some(frontier_type.clone()))
+            .await;
+        let mut goal_frames = subscriber
+            .subscribe(goal_topic.clone(), Some(goal_type.clone()))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        publisher
+            .publish(crate::typed_codec::build_typed_frame(
+                frontier_topic.clone(),
+                LcmMessageType::new("std_msgs.Bool").expect("registered wrong type"),
+                schema::encode_bool_body(&schema::Bool { data: true }),
+                1,
+            ))
+            .await
+            .expect("publish wrong-type control frame");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), frontier_frames.next())
+                .await
+                .is_err(),
+            "FrontierList typed subscriber accepted a std_msgs.Bool frame"
+        );
+
+        let state = Arc::new(RwLock::new(SharedState {
+            pose: PoseState {
+                x: 2.0,
+                y: 2.0,
+                qw: 1.0,
+                frame_id: "map".to_string(),
+                timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                ..PoseState::default()
+            },
+            map: MapState {
+                width: 12,
+                height: 12,
+                resolution: 0.5,
+                frame_id: "map".to_string(),
+                revision: MAP_REVISION,
+                timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                ..MapState::default()
+            },
+            ..SharedState::default()
+        }));
+        let nav = crate::nav_runtime::NavRuntimeState::from_env();
+        nav.observe_stack_state(NavState {
+            status: "IDLE".to_string(),
+            message: "real nav-stack heartbeat".to_string(),
+            timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+            ..NavState::default()
+        })
+        .await;
+        nav.observe_tf_chain(TfChainObservation {
+            generation: 1,
+            map_frame: "map".to_string(),
+            odom_frame: "odom".to_string(),
+            base_frame: "base_link".to_string(),
+            map_to_odom: true,
+            odom_to_base: true,
+        })
+        .expect("TF observation");
+        nav.observe_planner_input(PlannerInputObservation {
+            generation: 1,
+            map_revision: MAP_REVISION,
+            map_frame: "map".to_string(),
+            pose_frame: "map".to_string(),
+            ready: true,
+        })
+        .expect("planner observation");
+        nav.observe_motion_sink(MotionSinkObservation {
+            generation: 1,
+            ready: true,
+        })
+        .expect("guard-backed motion sink observation");
+
+        let (cloud_map_tx, _) = broadcast::channel(4);
+        let (nav_state_tx, _) = broadcast::channel(8);
+        let (frontiers_tx, _) = broadcast::channel(4);
+        let (map_revision_tx, _) = broadcast::channel(4);
+        let (map_revision_latest_tx, _) = watch::channel(None);
+        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+        explore.set_navigation_sink(Arc::new(ExploreNavigationBridge {
+            state: state.clone(),
+            cloud_map_tx,
+            nav_state_tx,
+            frontiers_tx: frontiers_tx.clone(),
+            map_revision_tx,
+            map_revision_latest_tx,
+            transport: publisher.clone(),
+            transport_backend_name: "real-lcm",
+            lcm_backend_available: true,
+            cmd_vel_sink_ready: Arc::new(AtomicBool::new(true)),
+            nav: nav.clone(),
+            runtime_observation_generation: Arc::new(AtomicU64::new(1)),
+        }));
+        spawn_frontier_fanout(
+            explore.clone(),
+            state.clone(),
+            frontiers_tx,
+            publisher.clone(),
+            Some((frontier_topic.clone(), frontier_type.clone())),
+        );
+
+        assert!(explore
+            .ingest_costmap_snapshot(smoke_costmap(MAP_REVISION))
+            .await
+            .expect("ingest smoke costmap"));
+        let boundary = ExplorationBoundary::from_vertices(vec![
+            Point2 { x: 0.0, y: 0.0 },
+            Point2 { x: 5.0, y: 0.0 },
+            Point2 { x: 5.0, y: 5.0 },
+            Point2 { x: 0.0, y: 5.0 },
+        ])
+        .expect("valid exploration boundary");
+        let started = explore
+            .start_with_config(
+                PARENT_REQUEST,
+                ExploreStartConfig {
+                    map_version_id: "smoke-map-v41".to_string(),
+                    map_revision: MAP_REVISION,
+                    boundary: Some(boundary),
+                    ..ExploreStartConfig::default()
+                },
+            )
+            .await;
+        assert_eq!(started.status, "ACCEPTED", "{}", started.message);
+        let active = explore.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, "ACTIVE", "{}", active.message);
+        let frontier_snapshot = explore.frontier_snapshot();
+        assert_eq!(frontier_snapshot.map_revision, MAP_REVISION);
+        assert!(!frontier_snapshot.frontiers.is_empty());
+
+        let frontier_frame = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let frame = frontier_frames
+                    .next()
+                    .await
+                    .expect("frontier stream closed")
+                    .expect("frontier transport error");
+                let mut generated_message = frontier_type.fingerprint().to_vec();
+                generated_message.extend_from_slice(&frame.payload);
+                let decoded = schema::decode_frontier_list(&generated_message)
+                    .expect("decode generated FrontierList with fingerprint");
+                if decoded.frontiers_length > 0 {
+                    break (frame, decoded);
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for non-empty canonical FrontierList");
+        assert_eq!(frontier_frame.0.topic, frontier_topic);
+        assert_eq!(frontier_frame.0.msg_type, frontier_type);
+        assert_eq!(frontier_frame.1.frame_id, "map");
+        assert_eq!(
+            frontier_frame.1.frontiers.len(),
+            schema::FRONTIER_LIST_CAPACITY
+        );
+        assert_eq!(
+            frontier_frame.1.frontiers_length,
+            frontier_snapshot.frontiers.len()
+        );
+        assert!(frontier_frame.1.stamp_sec > 0);
+        assert!((0..1_000_000_000).contains(&frontier_frame.1.stamp_nsec));
+        for (wire, source) in frontier_frame
+            .1
+            .frontiers
+            .iter()
+            .take(frontier_frame.1.frontiers_length)
+            .zip(frontier_snapshot.frontiers.iter())
+        {
+            assert_eq!(wire.id, stable_frontier_id(&source.id));
+            assert_eq!(
+                wire.center,
+                [source.pose.pose.position.x, source.pose.pose.position.y]
+            );
+            assert_eq!(
+                wire.cell_count,
+                source
+                    .metadata
+                    .get("cell_count")
+                    .expect("frontier cell_count metadata")
+                    .parse::<i32>()
+                    .expect("numeric frontier cell_count")
+            );
+            assert_eq!(wire.note, source.producer);
+        }
+
+        let goal_frame = tokio::time::timeout(Duration::from_secs(3), goal_frames.next())
+            .await
+            .expect("timed out waiting for canonical GoalEnvelope")
+            .expect("goal stream closed")
+            .expect("goal transport error");
+        let mut generated_goal = goal_type.fingerprint().to_vec();
+        generated_goal.extend_from_slice(&goal_frame.payload);
+        let goal = schema::decode_goal_envelope(&generated_goal)
+            .expect("decode generated GoalEnvelope with fingerprint");
+        let lease = nav
+            .active_goal_lease()
+            .await
+            .expect("active exploration lease");
+        assert_eq!(goal_frame.topic, goal_topic);
+        assert_eq!(goal_frame.msg_type, goal_type);
+        assert_eq!(
+            goal.owner_kind,
+            schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+        );
+        assert_eq!(goal.parent_request_id, PARENT_REQUEST);
+        assert_eq!(goal.session_id, lease.session_id);
+        assert_eq!(goal.goal_generation, lease.goal_generation as i64);
+        assert!(goal.goal_generation > 0);
+        assert_eq!(goal.map_version_id, "smoke-map-v41");
+        assert_eq!(goal.map_revision, MAP_REVISION as i64);
+        assert_eq!(goal.payload_sha256, lease.goal_payload_sha256);
+        assert_eq!(
+            goal.payload_sha256,
+            schema::goal_envelope_payload_sha256(&goal).expect("recompute goal hash")
+        );
+        assert_eq!(goal.boundary_frame_id, "map");
+        assert_eq!(
+            goal.boundary_points,
+            vec![
+                [0.0, 0.0, 0.0],
+                [5.0, 0.0, 0.0],
+                [5.0, 5.0, 0.0],
+                [0.0, 5.0, 0.0],
+            ]
+        );
+
+        let shared = state.read().await;
+        assert_eq!(shared.frontiers_revision, frontier_snapshot.revision);
+        assert_eq!(shared.frontiers.len(), frontier_snapshot.frontiers.len());
+        drop(shared);
+
+        drop(frontier_frames);
+        drop(goal_frames);
+        drop(explore);
+        drop(subscriber);
+        drop(publisher);
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

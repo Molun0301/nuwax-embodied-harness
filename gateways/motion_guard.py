@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import threading
-from typing import Callable
+from typing import Callable, Optional, Union
 
 from core.errors import MotionGuardFacadeError
 from services.navigation.motion_guard_client import (
@@ -39,14 +39,14 @@ class GatewayMotionGuard:
     def __init__(
         self,
         *,
-        socket_path: str | os.PathLike[str] = DEFAULT_SOCKET_PATH,
+        socket_path: Union[str, os.PathLike[str]] = DEFAULT_SOCKET_PATH,
         client_factory: Callable[..., MotionGuardClient] = MotionGuardClient,
     ) -> None:
         self.socket_path = os.fspath(socket_path)
         self._client_factory = client_factory
         self._lock = threading.RLock()
-        self._client: MotionGuardClient | None = None
-        self._last_error: BaseException | None = None
+        self._client: Optional[MotionGuardClient] = None
+        self._last_error: Optional[BaseException] = None
 
     @property
     def started(self) -> bool:
@@ -54,7 +54,7 @@ class GatewayMotionGuard:
             return self._client is not None
 
     @property
-    def last_error(self) -> BaseException | None:
+    def last_error(self) -> Optional[BaseException]:
         with self._lock:
             return self._last_error
 
@@ -62,7 +62,7 @@ class GatewayMotionGuard:
         with self._lock:
             if self._client is not None:
                 return self._client.get_readiness(pb.GUARD_SOURCE_GATEWAY_MANUAL)
-            client: MotionGuardClient | None = None
+            client: Optional[MotionGuardClient] = None
             try:
                 client = self._client_factory(self.socket_path)
                 readiness = client.get_readiness(pb.GUARD_SOURCE_GATEWAY_MANUAL)
@@ -124,7 +124,7 @@ class GatewayMotionGuard:
         return self._acquire(pb.GUARD_SOURCE_GATEWAY_RELATIVE)
 
     def stop_and_fence(self, session: MotionGuardSession) -> ZeroConfirmation:
-        stop_error: Exception | None = None
+        stop_error: Optional[Exception] = None
         try:
             session.stop()
         except Exception as exc:

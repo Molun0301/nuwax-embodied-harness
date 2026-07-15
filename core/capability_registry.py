@@ -42,6 +42,7 @@ PLATFORM_GEOMETRY_CAPABILITIES = frozenset(
         "navigate_to_pose",
         "navigate_to_named_location",
         "explore_area",
+        "explore_area_v2",
         "explore_and_find_target",
         "start_mapping",
         "stop_mapping",

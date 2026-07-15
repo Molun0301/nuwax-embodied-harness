@@ -259,9 +259,7 @@ impl Module for SimplePlannerModule {
     fn on_terrain_map_ext(&mut self, cloud: PointCloud) -> Result<(), NavError> {
         self.ensure_running()?;
         validate_cloud(&cloud, "terrain_map_ext")?;
-        if !cloud.is_empty() {
-            self.planner.ingest_world_terrain(&cloud.points);
-        }
+        self.planner.ingest_world_terrain(&cloud.points);
         Ok(())
     }
 
@@ -353,5 +351,34 @@ fn validate_point(point: Point3, field: &'static str) -> Result<(), NavError> {
             field,
             reason: "contains a non-finite coordinate".into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cloud(points: Vec<Point3>) -> PointCloud {
+        PointCloud {
+            stamp: Timestamp::default(),
+            frame_id: NavFrameId::Map,
+            points,
+            intensities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_persistent_snapshot_clears_previous_obstacles() {
+        let mut module = SimplePlannerModule::new();
+        module.start().expect("start");
+        module
+            .on_terrain_map_ext(cloud(vec![Point3::new(1.0, 1.0, 1.0)]))
+            .expect("occupied snapshot");
+        assert!(!module.planner.costmap().heights().is_empty());
+
+        module
+            .on_terrain_map_ext(cloud(Vec::new()))
+            .expect("all-free snapshot");
+        assert!(module.planner.costmap().heights().is_empty());
     }
 }

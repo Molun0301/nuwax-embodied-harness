@@ -11,7 +11,7 @@ from pathlib import Path
 import secrets
 import stat
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Dict, Mapping, Optional, Tuple
 import uuid
 
 from .constants import EPOCH_SCHEMA_VERSION, MAX_GENERATION, PROVISION_SCHEMA_VERSION
@@ -42,12 +42,18 @@ EPOCH_FIELDS = (
 EXPECTED_USERS = (
     "nuwax-motion-guard",
     "nuwax-motion-admin",
+    "nuwax-navigation",
+    "nuwax-gateway",
+)
+LEGACY_EXPECTED_USERS = (
+    "nuwax-motion-guard",
+    "nuwax-motion-admin",
     "nuwax-geometry",
     "nuwax-gateway",
 )
 
 
-def _canonical_bytes(document: Mapping[str, Any], fields: tuple[str, ...]) -> bytes:
+def _canonical_bytes(document: Mapping[str, Any], fields: Tuple[str, ...]) -> bytes:
     try:
         body = {field: document[field] for field in fields}
     except KeyError as exc:
@@ -59,14 +65,14 @@ def _canonical_bytes(document: Mapping[str, Any], fields: tuple[str, ...]) -> by
     ).encode("ascii")
 
 
-def _checksum(document: Mapping[str, Any], fields: tuple[str, ...]) -> str:
+def _checksum(document: Mapping[str, Any], fields: Tuple[str, ...]) -> str:
     return "sha256:" + hashlib.sha256(_canonical_bytes(document, fields)).hexdigest()
 
 
 def _verify_checksum(
     document: Mapping[str, Any],
     *,
-    fields: tuple[str, ...],
+    fields: Tuple[str, ...],
     label: str,
 ) -> None:
     if set(document) != {*fields, "checksum"}:
@@ -118,7 +124,7 @@ class ProvisionRecord:
             raise EpochError("provision instance_id must be a canonical UUIDv4")
         return record
 
-    def to_document(self) -> dict[str, Any]:
+    def to_document(self) -> Dict[str, Any]:
         return {
             "instance_id": self.instance_id,
             "schema_version": self.schema_version,
@@ -135,7 +141,7 @@ class EpochRecord:
     lease_state: str
     reset_generation: int
     last_zero_ack_id: str
-    peer_uid_allowlist: tuple[str, ...]
+    peer_uid_allowlist: Tuple[str, ...]
     actuator_symbols_sha256: str
     fenced: bool
     created_at: str
@@ -218,7 +224,13 @@ class EpochRecord:
             raise EpochError("invalid safety_gate")
         if raw["lease_state"] not in {"Idle", "Active", "Pausing", "Revoking"}:
             raise EpochError("invalid lease_state")
-        if tuple(raw["peer_uid_allowlist"]) != EXPECTED_USERS:
+        peer_uid_allowlist = tuple(raw["peer_uid_allowlist"])
+        if peer_uid_allowlist == LEGACY_EXPECTED_USERS:
+            raise EpochError(
+                "legacy peer_uid_allowlist requires explicit migration; "
+                "run install_motion_guard_deployment.sh migrate-peer-allowlist"
+            )
+        if peer_uid_allowlist != EXPECTED_USERS:
             raise EpochError("peer_uid_allowlist drift")
         digest = str(raw["actuator_symbols_sha256"])
         if not digest.startswith("sha256:") or len(digest) != 71:
@@ -240,7 +252,7 @@ class EpochRecord:
     def boot_nonce_bytes(self) -> bytes:
         return bytes.fromhex(self.boot_nonce_hex)
 
-    def to_document(self) -> dict[str, Any]:
+    def to_document(self) -> Dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "generation": self.generation,
@@ -260,11 +272,8 @@ class EpochRecord:
 def atomic_write_record(path: Path, document: Mapping[str, Any], *, mode: int) -> None:
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    encoded = (
-        json.dumps(document, ensure_ascii=True, separators=(",", ":"))
-        + "\n"
-    ).encode("ascii")
-    temp_path: str | None = None
+    encoded = (json.dumps(document, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+    temp_path: Optional[str] = None
     try:
         fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
@@ -300,7 +309,7 @@ class EpochStore:
         self.epoch_path = Path(epoch_path)
 
     @staticmethod
-    def _load_document(path: Path, *, expected_mode: int, label: str) -> dict[str, Any]:
+    def _load_document(path: Path, *, expected_mode: int, label: str) -> Dict[str, Any]:
         flags = os.O_RDONLY | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -311,14 +320,10 @@ class EpochStore:
             if not stat.S_ISREG(metadata.st_mode):
                 raise EpochError(f"{label} record is not a regular file")
             if metadata.st_uid != os.geteuid():
-                raise EpochError(
-                    f"{label} record owner UID {metadata.st_uid} does not match guard UID {os.geteuid()}"
-                )
+                raise EpochError(f"{label} record owner UID {metadata.st_uid} does not match guard UID {os.geteuid()}")
             actual_mode = stat.S_IMODE(metadata.st_mode)
             if actual_mode != expected_mode:
-                raise EpochError(
-                    f"{label} record mode is {actual_mode:04o}, expected {expected_mode:04o}"
-                )
+                raise EpochError(f"{label} record mode is {actual_mode:04o}, expected {expected_mode:04o}")
             stream = os.fdopen(fd, "r", encoding="ascii", closefd=True)
             fd = -1
             with stream:
@@ -327,9 +332,7 @@ class EpochStore:
             raise EpochError(f"{label} record is missing: {path}") from exc
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                raise EpochError(
-                    f"{label} record must be a non-symlink regular file"
-                ) from exc
+                raise EpochError(f"{label} record must be a non-symlink regular file") from exc
             raise EpochError(f"cannot read {label} record") from exc
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise EpochError(f"invalid {label} JSON") from exc
@@ -371,9 +374,7 @@ class EpochStore:
             safety_gate="ResetRequired",
             lease_state="Idle",
             fenced=True,
-            created_at=datetime.now(timezone.utc)
-            .isoformat(timespec="milliseconds")
-            .replace("+00:00", "Z"),
+            created_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         )
         self.persist(advanced)
         return advanced
@@ -382,7 +383,7 @@ class EpochStore:
 class SingleInstanceLock:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self._fd: int | None = None
+        self._fd: Optional[int] = None
 
     def acquire(self) -> None:
         if self._fd is not None:
@@ -395,26 +396,18 @@ class SingleInstanceLock:
             fd = os.open(self.path, flags, 0o600)
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                raise SingleInstanceError(
-                    f"lock path must be a non-symlink regular file: {self.path}"
-                ) from exc
+                raise SingleInstanceError(f"lock path must be a non-symlink regular file: {self.path}") from exc
             raise SingleInstanceError(f"cannot open guard lock {self.path}") from exc
         try:
             metadata = os.fstat(fd)
             if not stat.S_ISREG(metadata.st_mode):
-                raise SingleInstanceError(
-                    f"lock path is not a regular file: {self.path}"
-                )
+                raise SingleInstanceError(f"lock path is not a regular file: {self.path}")
             if metadata.st_uid != os.geteuid():
-                raise SingleInstanceError(
-                    f"lock owner UID {metadata.st_uid} does not match guard UID {os.geteuid()}"
-                )
+                raise SingleInstanceError(f"lock owner UID {metadata.st_uid} does not match guard UID {os.geteuid()}")
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             os.close(fd)
-            raise SingleInstanceError(
-                f"another motion guard owns {self.path}"
-            ) from exc
+            raise SingleInstanceError(f"another motion guard owns {self.path}") from exc
         except BaseException:
             os.close(fd)
             raise

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Sequence
+from typing import Optional, Sequence
 
 from services.navigation.motion_guard_client import MotionGuardClient, MotionGuardError
 from services.navigation.motion_safety_guard.constants import DEFAULT_SOCKET_PATH
@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         with MotionGuardClient(args.socket) as client:

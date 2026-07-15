@@ -1,9 +1,11 @@
-// LCM IDL — nuwax_msgs.CancelNavigation
-//
-// Phase 2 自有类型：取消当前导航会话。无字段以外的状态,空 payload 情形
-// 等价 fingerprint = rotate_left(SEED),与上游 LCM 1.x 习惯一致。
-struct nuwax_msgs__CancelNavigation
-{
-    string   session_id;
-    int32_t  reason;           // 0=User 1=Safety 2=Stuck 3=Error
+package nuwax_msgs;
+
+struct CancelNavigation {
+    string session_id;
+    int32_t reason;
+    int64_t cancel_generation;
+    int32_t owner_kind;
+    string parent_request_id;
+    int64_t goal_generation;
+    int64_t producer_runtime_generation;
 }

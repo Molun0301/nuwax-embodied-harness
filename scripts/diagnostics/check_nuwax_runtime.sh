@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # scripts/diagnostics/check_nuwax_runtime.sh
 #
-# 一页 evidence bundle —— 不依赖 grpcurl / lcm-logger / 外网,但 Phase 8 起
-# 必须主动跑 lcm roundtrip + 抓 channel counters,不再用"不依赖 lcm-logger"
-# 作为完成证据（§5 Phase 8 任务 4 + §12.6）。
+# 一页 evidence bundle —— 不依赖 grpcurl / lcm-logger / 外网；通过 multicast
+# route/interface 预检与真实跨进程 roundtrip 证明 transport 可用。
 #
 # 用法:
 #   bash scripts/diagnostics/check_nuwax_runtime.sh                # 默认 127.0.0.1:50051
@@ -15,14 +14,13 @@
 #   3. 二进制 — nuwax-geometry-runtime 可执行/未执行
 #   3. 端口 — 50051 监听状态
 #   4. ready file — runtime_data/geometry/nuwax_geometry_runtime.ready
-#   5. SHM refs — /tmp/nuwax_video.{sock,shm} /tmp/nuwax_pointcloud.shm
+#   5. SHM refs — video + cloudmap + occupancy 的真实生产路径
 #   6. gRPC status — python3 + grpc 调用 GetStatus / HealthCheck /
 #                    GetNavigationReadiness / GetExplorationState(grpc 缺失则 NOT RUN)
 #   7. env canonical — 抓 backend/profile 关键 env
 #   8. 日志尾部 — nuwax_geometry_runtime.log 最近 20 行
 #   9. LCM roundtrip — Python publisher+subscriber 跨进程互通（liblcm/udpm 不可用 → NOT RUN）
-#  10. Channel counters — 解析 nuwax_geometry_runtime.log 中 typed channel pub/sub 计数
-#  11. systemd unit — 检查 production unit 是否 hardcode NUWAX_LCM_BACKEND=real-lcm
+#  10. systemd unit — 检查 production unit 是否 hardcode NUWAX_LCM_BACKEND=real-lcm
 #
 # 退出码:0  evidence 全部产出(允许若干段 NOT READY)
 #
@@ -111,7 +109,7 @@ else
 fi
 
 bar "3. 二进制:nuwax-geometry-runtime"
-RUNTIME_BIN="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
+RUNTIME_BIN="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
 if [[ -x "${RUNTIME_BIN}" ]]; then
   ok "executable: ${RUNTIME_BIN}"
 else
@@ -144,7 +142,8 @@ else
 fi
 
 bar "5. SHM refs"
-for f in /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm; do
+for f in /tmp/nuwax_video.sock /tmp/nuwax_video.shm \
+         /tmp/nuwax_cloudmap.mmap /tmp/nuwax_occupancy.mmap; do
   if [[ -e "${f}" ]]; then
     ok "存在: ${f}"
   else
@@ -154,13 +153,13 @@ done
 
 bar "6. gRPC status (python3 + grpcio)"
 GRPC_OUT="$(
-  PYTHONPATH="${REPO_ROOT}/services/geometry/proto_gen" \
+  PYTHONPATH="${REPO_ROOT}" \
     "${PYTHON_BIN}" - <<'PY' 2>/dev/null
 import sys, os
 try:
     import grpc  # noqa: F401
-    import geometry_runtime_pb2 as pb
-    import geometry_runtime_pb2_grpc as pbg
+    from services.geometry.proto_gen import geometry_runtime_pb2 as pb
+    from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pbg
 except Exception as e:
     print(f"GRPC_NOT_AVAILABLE: {e} (无需 grpcio 系统 python3,装: pip install grpcio+protobuf)")
     sys.exit(0)
@@ -197,9 +196,12 @@ fi
 
 bar "7. env canonical"
 for k in NUWAX_LCM_BACKEND NUWAX_LCM_URL NUWAX_NAV_PROFILE \
-         NUWAX_EXPLORATION_LEGACY NUWAX_EXPLORE_ARBITRATION \
+         NUWAX_EXPLORE_ARBITRATION NUWAX_NAV_STACK_READY_FILE \
          NUWAX_REAL_LCM_REQUIRED NUWAX_GEOMETRY_RUNTIME_PORT \
-         NUWAX_GEOMETRY_RUNTIME_ENABLED; do
+         NUWAX_GEOMETRY_RUNTIME_READY_FILE NUWAX_GEOMETRY_EXTERNAL_ENABLED \
+         NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD \
+         NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD \
+         NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD; do
   v="${!k:-<unset>}"
   printf '  %-32s = %s\n' "${k}" "${v}"
 done
@@ -212,7 +214,10 @@ else
 fi
 
 bar "9. LCM roundtrip (Phase 8 §12.6 硬约束)"
-if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --modversion lcm >/dev/null 2>&1; then
+if ! bash "${REPO_ROOT}/scripts/systemd/check_lcm_multicast.sh" \
+    "${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"; then
+  nr "multicast route/interface 未就绪"
+elif ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --modversion lcm >/dev/null 2>&1; then
   nr "liblcm-dev 不可用,跳过 roundtrip（CI 镜像需 apt install -y liblcm-dev pkg-config python3-lcm）"
 elif ! python3 -c 'import lcm' >/dev/null 2>&1; then
   nr "python3-lcm 不可用,跳过 roundtrip（CI 镜像需 apt install -y python3-lcm）"
@@ -232,37 +237,7 @@ else
   rm -f "${RT_LOG}"
 fi
 
-bar "10. Channel counters (Phase 8 §12.6 / §13.5 关键 evidence)"
-if [[ -f "${GATEWAY_LOG_FILE}" ]]; then
-  # 解析最近 5000 行日志中 typed channel pub/sub 计数（不依赖 lcm-logger）
-  declare -A CHAN_PUB_COUNT=() CHAN_SUB_COUNT=()
-  recent_lines="$(wc -l < "${GATEWAY_LOG_FILE}")"
-  scan_start=$(( recent_lines > 5000 ? recent_lines - 5000 : 0 ))
-  while IFS= read -r line; do
-    if [[ "${line}" =~ publish[[:space:]]+channel=([A-Za-z0-9_/.\\-]+) ]]; then
-      ch="${BASH_REMATCH[1]}"
-      CHAN_PUB_COUNT[$ch]=$(( ${CHAN_PUB_COUNT[$ch]:-0} + 1 ))
-    fi
-    if [[ "${line}" =~ subscribe[[:space:]]+channel=([A-Za-z0-9_/.\\-]+) ]]; then
-      ch="${BASH_REMATCH[1]}"
-      CHAN_SUB_COUNT[$ch]=$(( ${CHAN_SUB_COUNT[$ch]:-0} + 1 ))
-    fi
-  done < <(tail -n +"$((scan_start+1))" "${GATEWAY_LOG_FILE}" 2>/dev/null)
-  if [[ ${#CHAN_PUB_COUNT[@]} -eq 0 && ${#CHAN_SUB_COUNT[@]} -eq 0 ]]; then
-    nr "日志中无 typed channel pub/sub 事件（runtime 未启动 / 走 fake backend / 未运行 Phase 5/6 bridge）"
-  else
-    printf '  %-40s %10s %10s\n' "channel" "publish" "subscribe"
-    all_channels="$(printf '%s\n' "${!CHAN_PUB_COUNT[@]}" "${!CHAN_SUB_COUNT[@]}" | sort -u)"
-    while IFS= read -r ch; do
-      [[ -z "${ch}" ]] && continue
-      printf '  %-40s %10s %10s\n' "${ch}" "${CHAN_PUB_COUNT[$ch]:-0}" "${CHAN_SUB_COUNT[$ch]:-0}"
-    done <<< "${all_channels}"
-  fi
-else
-  nr "日志不存在,跳过 channel counters"
-fi
-
-bar "11. systemd units (production env + guard ordering)"
+bar "10. systemd units (production env + guard ordering)"
 SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-geometry-runtime.service"
 GUARD_SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-motion-safety-guard.service"
 GATEWAY_SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-host-gateway.service"
@@ -309,11 +284,21 @@ if [[ -f "${SERVICE_FILE}" ]]; then
 else
   nr "service 文件不存在: ${SERVICE_FILE}"
 fi
-if [[ -f "${GATEWAY_SERVICE_FILE}" ]] \
-  && grep -qF 'Requires=nuwax-motion-safety-guard.service nuwax-geometry-runtime.service' "${GATEWAY_SERVICE_FILE}"; then
-  ok "Gateway requires guard and geometry runtime"
+if [[ -f "${GATEWAY_SERVICE_FILE}" ]]; then
+  gateway_dependencies_ready=true
+  for dependency in nuwax-motion-safety-guard.service nuwax-nav-stack.service \
+                    nuwax-geometry-runtime.service nuwax-person-follow.service; do
+    if ! grep -qE "^Requires=.*${dependency}([[:space:]]|$)" \
+        "${GATEWAY_SERVICE_FILE}"; then
+      gateway_dependencies_ready=false
+      miss "Gateway missing required unit: ${dependency}"
+    fi
+  done
+  if [[ "${gateway_dependencies_ready}" == "true" ]]; then
+    ok "Gateway systemd dependency chain complete"
+  fi
 else
-  miss "Gateway systemd dependency chain drift"
+  miss "Gateway service file missing: ${GATEWAY_SERVICE_FILE}"
 fi
 
 echo

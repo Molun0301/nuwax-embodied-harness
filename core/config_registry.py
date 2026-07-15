@@ -61,6 +61,63 @@ class _RawKey:
     target_file: str
 
 
+# Shell/Rust 直接消费而不经过 core.settings 的部署键。它们仍需进入配置面板
+# 与 .env 完整性校验，避免跨语言配置再次成为隐形旁路。
+_RUNTIME_ONLY_CORE_KEYS: Tuple[_RawKey, ...] = (
+    _RawKey("NUWAX_PERSON_FOLLOW_AUTOSTART", "bool", "True", None, TARGET_CORE),
+    _RawKey(
+        "NUWAX_PERSON_FOLLOW_READY_FILE",
+        "str",
+        repr("runtime_data/person-follow/nuwax_person_follow.ready"),
+        None,
+        TARGET_CORE,
+    ),
+    _RawKey("NUWAX_PERSON_FOLLOW_START_TIMEOUT_SEC", "int", "15", None, TARGET_CORE),
+    _RawKey("NUWAX_PERSON_FOLLOW_WARMUP_STEPS", "int", "150", None, TARGET_CORE),
+    _RawKey("GO2_OBSTACLE_GRID_LIVE_CLOUD_ENABLED", "bool", "False", None, TARGET_CORE),
+    _RawKey("GO2_OBSTACLE_GRID_PUBLISH_ON_CLOUD", "bool", "False", None, TARGET_CORE),
+    _RawKey("NUWAX_GEOMETRY_PLATFORM_BRIDGE_CMD_VEL_ENABLED", "bool", "False", None, TARGET_CORE),
+    _RawKey("NUWAX_GEOMETRY_PLATFORM_ODOM_TF_BRIDGE_ENABLED", "bool", "False", None, TARGET_CORE),
+    _RawKey("NUWAX_GEOMETRY_POSE_TOPIC", "str", repr("/go2/pose_map"), None, TARGET_CORE),
+    _RawKey("NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT", "int", "30", None, TARGET_CORE),
+    _RawKey("NUWAX_MAPPING_HEIGHT_CELLS", "int", "200", None, TARGET_CORE),
+    _RawKey("NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS", "float", "0.0", None, TARGET_CORE),
+    _RawKey("NUWAX_MAPPING_OCCUPANCY_ALGO", "str", repr("height_cost"), None, TARGET_CORE),
+    _RawKey("NUWAX_MAPPING_ORIGIN_X", "float", "-5.0", None, TARGET_CORE),
+    _RawKey("NUWAX_MAPPING_ORIGIN_Y", "float", "-5.0", None, TARGET_CORE),
+    _RawKey("NUWAX_MAPPING_RESOLUTION", "float", "0.05", None, TARGET_CORE),
+    _RawKey("NUWAX_MAPPING_VOXEL_SIZE", "float", "0.05", None, TARGET_CORE),
+    _RawKey("NUWAX_MAPPING_WIDTH_CELLS", "int", "200", None, TARGET_CORE),
+    _RawKey("NUWAX_NAV_REQUIRE_CMD_VEL_SINK", "bool", "False", None, TARGET_CORE),
+    _RawKey(
+        "NUWAX_NAV_STACK_READY_FILE",
+        "str",
+        repr("runtime_data/navigation/nuwax_nav_stack.ready"),
+        None,
+        TARGET_CORE,
+    ),
+    _RawKey("NUWAX_NAV_STACK_START_TIMEOUT_SEC", "int", "15", None, TARGET_CORE),
+    _RawKey("NUWAX_VIDEO_SHM_PATH", "str", repr("/tmp/nuwax_video.shm"), None, TARGET_CORE),
+    _RawKey("NUWAX_VIDEO_UDS_PATH", "str", repr("/tmp/nuwax_video.sock"), None, TARGET_CORE),
+    _RawKey(
+        "NUWAX_OSM_TILE_URL_TEMPLATE",
+        "str",
+        repr("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+        None,
+        TARGET_CORE,
+    ),
+    _RawKey(
+        "NUWAX_NOMINATIM_URL",
+        "str",
+        repr("https://nominatim.openstreetmap.org/search"),
+        None,
+        TARGET_CORE,
+    ),
+    _RawKey("NUWAX_OSM_USER_AGENT", "str", repr("nuwax-mapping-cloud/0.1"), None, TARGET_CORE),
+    _RawKey("NUWAX_GOOGLE_MAPS_API_KEY", "str", repr(""), None, TARGET_CORE),
+)
+
+
 def _node_source(node: ast.AST, source: str) -> str:
     """取 AST 节点对应的源码文本，Python 3.8 兼容。
 
@@ -165,6 +222,8 @@ def _all_raw_keys() -> Dict[str, _RawKey]:
     merged.update(_parse_settings_keys(_CORE_SETTINGS, TARGET_CORE))
     for key, rk in _parse_settings_keys(_GO2_SETTINGS, TARGET_GO2).items():
         merged.setdefault(key, rk)
+    for rk in _RUNTIME_ONLY_CORE_KEYS:
+        merged.setdefault(rk.key, rk)
     return merged
 
 
@@ -203,15 +262,15 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("gateway", ("NUWAX_GATEWAY",)),
     ("relay", ("NUWAX_RELAY",)),
     ("logging", ("NUWAX_LOG", "GO2_PROXY_LOG")),
-    ("mapping", ("NUWAX_MAPPING",)),
-    ("nav_stack", ("NUWAX_NAV_",)),
+    ("mapping", ("NUWAX_MAPPING", "NUWAX_OSM_", "NUWAX_NOMINATIM_", "NUWAX_GOOGLE_MAPS_")),
+    ("nav_stack", ("NUWAX_NAV_", "NUWAX_PERSON_FOLLOW_", "NUWAX_EXPLORE_")),
     ("geometry_runtime", ("NUWAX_GEOMETRY_RUNTIME",)),
-    ("lcm", ("NUWAX_LCM", "NUWAX_NUWAX_WORKSPACE_DIR")),
+    ("lcm", ("NUWAX_LCM", "NUWAX_REAL_LCM_", "NUWAX_NUWAX_WORKSPACE_DIR")),
     ("external_geometry", ("NUWAX_GEOMETRY_EXTERNAL_PROVIDES",)),
     ("geometry_quality", ("NUWAX_GEOMETRY_VOXEL", "NUWAX_GEOMETRY_CROP", "NUWAX_GEOMETRY_MAX_RANGE",
                            "NUWAX_GEOMETRY_TRAVERSABILITY", "NUWAX_GEOMETRY_MAX_", "NUWAX_GEOMETRY_ODOM_COV",
                            "NUWAX_GEOMETRY_TIMESTAMP", "NUWAX_GEOMETRY_POINTCLOUD")),
-    ("geometry_topics", ("NUWAX_GEOMETRY_",)),
+    ("geometry_topics", ("NUWAX_GEOMETRY_", "NUWAX_MAP_FRAME", "NUWAX_BASE_FRAME")),
     ("perception_detect", ("NUWAX_PERCEPTION_YOLO", "NUWAX_PERCEPTION_BYTETRACK", "NUWAX_PERCEPTION_TRACKER")),
     ("perception_vision", ("NUWAX_PERCEPTION_OPENAI", "NUWAX_PERCEPTION_SEGMENTATION", "NUWAX_PERCEPTION_DEFERRED",
                             "OPENAI_", "ARK_")),
@@ -240,6 +299,7 @@ _SENSITIVE_KEYS = frozenset({
     "NUWAX_MEMORY_EMBEDDING_API_KEY",
     "DASHSCOPE_API_KEY",
     "GO2_VIDEO_STREAM_ACCESS_TOKEN",
+    "NUWAX_GOOGLE_MAPS_API_KEY",
 })
 
 # 常规项（高频，默认展开）。来自实施计划 §二「常规项」列；其余一律高级（默认折叠）。
@@ -265,6 +325,8 @@ _REGULAR_KEYS = frozenset({
 # 枚举型键的可选值（用于前端下拉）。
 _CHOICES: Dict[str, Tuple[str, ...]] = {
     "NUWAX_LOG_LEVEL": ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+    "NUWAX_NAV_PROFILE": ("simple-2d", "replanning-astar"),
+    "NUWAX_EXPLORE_ARBITRATION": ("prefer_wavefront",),
 }
 
 
@@ -340,6 +402,11 @@ _ZH_NAMES: Dict[str, str] = {
 
     # 几何引擎·话题与坐标系
     "NUWAX_GEOMETRY_ENABLED": "启用几何引擎",
+    "NUWAX_BASE_FRAME": "机器人基座坐标系",
+    "NUWAX_MAP_FRAME": "地图坐标系",
+    "NUWAX_GEOMETRY_PLATFORM_BRIDGE_CMD_VEL_ENABLED": "启用平台 cmd_vel 桥",
+    "NUWAX_GEOMETRY_PLATFORM_ODOM_TF_BRIDGE_ENABLED": "启用平台 odom/TF 桥",
+    "NUWAX_GEOMETRY_POSE_TOPIC": "几何位姿话题",
     "NUWAX_GEOMETRY_BASE_FRAME": "机器人基座坐标系",
     "NUWAX_GEOMETRY_CLOUD_MAP_TOPIC": "点云地图话题",
     "NUWAX_GEOMETRY_COST_MAP_TOPIC": "代价地图话题",
@@ -399,6 +466,18 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_MAPPING_TRAVERSABILITY_LAYER": "nuwax-mapping 可通行性图层",
     "NUWAX_MAPPING_LOCALIZATION_STATUS": "nuwax-mapping 定位状态字段名",
     "NUWAX_MAPPING_RELOCALIZATION_DIAGNOSTICS": "nuwax-mapping 重定位诊断字段名",
+    "NUWAX_MAPPING_HEIGHT_CELLS": "栅格高度（格）",
+    "NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS": "初始安全半径（米）",
+    "NUWAX_MAPPING_OCCUPANCY_ALGO": "占据栅格算法",
+    "NUWAX_MAPPING_ORIGIN_X": "栅格原点 X（米）",
+    "NUWAX_MAPPING_ORIGIN_Y": "栅格原点 Y（米）",
+    "NUWAX_MAPPING_RESOLUTION": "栅格分辨率（米）",
+    "NUWAX_MAPPING_VOXEL_SIZE": "建图体素大小（米）",
+    "NUWAX_MAPPING_WIDTH_CELLS": "栅格宽度（格）",
+    "NUWAX_OSM_TILE_URL_TEMPLATE": "OpenStreetMap 瓦片地址模板",
+    "NUWAX_NOMINATIM_URL": "Nominatim 检索地址",
+    "NUWAX_OSM_USER_AGENT": "OpenStreetMap 请求 User-Agent",
+    "NUWAX_GOOGLE_MAPS_API_KEY": "Google Maps API 密钥",
 
     # 导航（nuwax-nav-stack，替代旧 Nav2 action provider）
     "NUWAX_NAV_AUTOSTART": "自动启动导航后端",
@@ -415,15 +494,22 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_NAV_PROXY_PENDING_QUEUE_MAX_SIZE": "导航代理 PENDING 队列上限",
     # Phase 6:新增 nav profile / explore arbitration / real-lcm 硬约束。
     # 三者均对接 nuwax-geometry-runtime (Rust) 装配面,不再走旧 rclpy/Nav2.
-    "NUWAX_NAV_PROFILE": "导航 profile（simple-2d / replanning-astar / cmu-native / mls3d / exploration-native；默认 simple-2d）",
-    "NUWAX_EXPLORE_ARBITRATION": "探索 source arbitration（prefer_wavefront / prefer_tare / highest_score / first_available；默认 prefer_wavefront）",
-    "NUWAX_REAL_LCM_REQUIRED": "real-lcm 启动失败 fail-fast 开关（true 时强制要求 real-lcm backend；real-lcm 不可用时进程 exit 1。与 fake-lcm backend 互斥：若同时设置 NUWAX_LCM_BACKEND=fake-lcm（显式/别名/空值），进程启动时直接 exit 1 并打 LCM_BACKEND_CONFIG_MISMATCH 错误，Python load_config 同步抛 ValueError）",
+    "NUWAX_NAV_PROFILE": "导航 profile（simple-2d / replanning-astar；默认 simple-2d）",
+    "NUWAX_EXPLORE_ARBITRATION": "探索 source arbitration（当前只支持 prefer_wavefront）",
+    "NUWAX_PERSON_FOLLOW_AUTOSTART": "自动启动 person-follow",
+    "NUWAX_PERSON_FOLLOW_READY_FILE": "person-follow ready 文件",
+    "NUWAX_PERSON_FOLLOW_START_TIMEOUT_SEC": "person-follow 启动超时（秒）",
+    "NUWAX_PERSON_FOLLOW_WARMUP_STEPS": "person-follow subscription-ready 检查次数",
+    "NUWAX_NAV_REQUIRE_CMD_VEL_SINK": "要求 cmd_vel 执行端就绪",
+    "NUWAX_NAV_STACK_READY_FILE": "导航栈 ready 文件",
+    "NUWAX_NAV_STACK_START_TIMEOUT_SEC": "导航栈启动超时（秒）",
+    "NUWAX_REAL_LCM_REQUIRED": "real-lcm 启动失败 fail-fast 开关（true 时 liblcm 或 multicast 不可用会令进程启动失败）",
 
     # 几何运行时与 LCM
     "NUWAX_GEOMETRY_RUNTIME_BINARY": "nuwax-geometry-runtime 二进制路径",
     "NUWAX_GEOMETRY_RUNTIME_PORT": "nuwax-geometry-runtime gRPC 端口",
     "NUWAX_GEOMETRY_RUNTIME_READY_FILE": "nuwax-geometry-runtime ready 文件",
-    "NUWAX_GEOMETRY_RUNTIME_START_SCRIPT": "nuwax-geometry-runtime 启动脚本",
+    "NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT": "nuwax-geometry-runtime 健康超时（秒）",
     "NUWAX_GEOMETRY_RUNTIME_PROCESS_NAME": "nuwax-geometry-runtime 进程名",
     "NUWAX_GEOMETRY_RUNTIME_LOG_NAME": "nuwax-geometry-runtime 日志名",
     "NUWAX_GEOMETRY_EXTERNAL_ENABLED": "启用 nuwax-geometry-runtime",
@@ -432,16 +518,15 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_TF": "runtime 提供 TF（odom→base_link 等坐标变换）",
     "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAV": "runtime 提供导航能力（settings.py:903 旧名 NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAVIGATION 改名）",
     "NUWAX_LCM_URL": "LCM UDP multicast URL",
-    "NUWAX_LCM_BACKEND": "LCM backend（canonical: real-lcm/fake-lcm；real/fake 为迁移 alias，settings 加载时归一化）",
+    "NUWAX_LCM_BACKEND": "LCM backend（唯一支持 real-lcm；real 为迁移 alias）",
     "NUWAX_NUWAX_WORKSPACE_DIR": "nuwax-workspace 路径依赖目录",
     "NUWAX_LCM_CHANNEL_ODOM": "odom LCM channel",
     "NUWAX_LCM_CHANNEL_TF": "tf LCM channel",
-    "NUWAX_LCM_CHANNEL_TF_STATIC": "tf_static LCM channel",
     "NUWAX_LCM_CHANNEL_POINTCLOUD": "pointcloud LCM channel",
     "NUWAX_LCM_CHANNEL_OCCUPANCY": "occupancy LCM channel",
     "NUWAX_LCM_CHANNEL_CMD_VEL": "cmd_vel LCM channel",
-    "NUWAX_LCM_CHANNEL_INITIAL_POSE": "initial_pose LCM channel",
-    "NUWAX_LCM_CHANNEL_GOAL_POSE": "goal_pose LCM channel",
+    "NUWAX_LCM_CHANNEL_GOAL_POSE": "goal envelope LCM channel",
+    "NUWAX_LCM_CHANNEL_NAV_PATH": "path envelope LCM channel",
     "NUWAX_LCM_CHANNEL_FRONTIER": "frontier LCM channel",
     "NUWAX_LCM_CHANNEL_CLOUD_MAP": "cloud_map LCM channel",
     # Phase 1 channel registry 补齐:typed channel for PoseStamped 和 CancelNavigation。
@@ -453,20 +538,17 @@ _ZH_NAMES: Dict[str, str] = {
     # 不通过 contracts/geometry_runtime.py 间接消费)。
     "NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL": "runtime pose_stamped typed channel",
     "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL": "runtime tf typed channel（与 NUWAX_LCM_CHANNEL_TF 等价别名,Rust main.rs 进程内 alias）",
+    "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL": "runtime raw pointcloud typed channel（与 NUWAX_LCM_CHANNEL_POINTCLOUD 等价别名）",
     "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL": "runtime cloud_map typed channel（与 NUWAX_LCM_CHANNEL_CLOUD_MAP 等价别名）",
     "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL": "runtime occupancy typed channel（与 NUWAX_LCM_CHANNEL_OCCUPANCY 等价别名）",
     "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL": "runtime frontiers typed channel（与 NUWAX_LCM_CHANNEL_FRONTIER 等价别名）",
     "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL": "runtime nav_goal typed channel（§13.1 保留 NAV_GOAL_CHANNEL,与 NUWAX_LCM_CHANNEL_GOAL_POSE 等价别名）",
+    "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL": "runtime nav_path typed channel（与 NUWAX_LCM_CHANNEL_NAV_PATH 等价别名）",
     # 共享内存 / Unix socket 路径
     "NUWAX_CLOUDMAP_SHM_PATH": "cloud_map 共享内存映射文件路径（services/geometry/runtime.py 默认 /tmp/nuwax_cloudmap.mmap）",
     "NUWAX_OCCUPANCY_SHM_PATH": "occupancy 共享内存映射文件路径（services/geometry/runtime.py 默认 /tmp/nuwax_occupancy.mmap）",
-    # nuwax-workspace mapping cloud 板块
-    "NUWAX_MAPPING_CLOUD_ENABLED": "启用 nuwax-mapping-cloud（云端瓦片/POI 拉取）",
-    "NUWAX_MAPPING_CLOUD_PROVIDER": "nuwax-mapping-cloud provider（google_maps / osm / disabled）",
-    "NUWAX_MAPPING_CLOUD_CACHE_DIR": "nuwax-mapping-cloud 缓存目录（默认 ./runtime_data/mapping_cloud_cache）",
-    "NUWAX_MAPPING_ROS_COMPAT_ENABLED": "启用 nuwax-mapping ROS 兼容层（默认 false,ROS2 已下线）",
-    "NUWAX_MAPPING_RTABMAP_DATABASE_DIR": "nuwax-mapping rtabmap 数据库目录（与 NUWAX_BACKEND_DATABASE_ROOT 同源）",
-    "NUWAX_MAPPING_SLAM_PROVIDER": "nuwax-mapping SLAM provider（rtabmap / fast_lio / disabled）",
+    "NUWAX_VIDEO_SHM_PATH": "视频共享内存路径",
+    "NUWAX_VIDEO_UDS_PATH": "视频 Unix socket 路径",
     "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL": "runtime odom typed channel（与 NUWAX_LCM_CHANNEL_ODOM 等价别名）",
     "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL": "runtime cmd_vel typed channel",
     "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL": "runtime nav_cancel typed channel",
@@ -596,6 +678,7 @@ _ZH_NAMES: Dict[str, str] = {
     "GO2_DIRECT_DDS_LOW_STATE_TOPIC": "Go2 低状态 DDS 话题",
     "GO2_DIRECT_DDS_MAX_POINTS_PER_SCAN": "Go2 单次扫描最大点数",
     "GO2_DIRECT_DDS_POINT_CLOUD_ENABLED": "启用 Go2 DDS 点云",
+    "GO2_DIRECT_DDS_POINT_CLOUD_XYZ_REGISTERED_TO_ODOM": "Go2 点云 XYZ 已注册到 odom",
     "GO2_DIRECT_DDS_POINT_CLOUD_TOPIC": "Go2 DDS 点云话题",
     "GO2_DIRECT_DDS_POSE_TOPIC": "Go2 姿态 DDS 话题",
     "GO2_DIRECT_DDS_READ_TIMEOUT_SEC": "Go2 DDS 读取超时（秒）",
@@ -608,6 +691,8 @@ _ZH_NAMES: Dict[str, str] = {
     "GO2_OFFICIAL_MAX_YAW_RATE_RPS": "Go2 官方最大偏航角速度（弧度/秒）",
     "GO2_OFFICIAL_SERVICES_AUTO_START": "自动启动 Go2 官方服务",
     "GO2_OFFICIAL_SERVICE_NAMES": "Go2 官方服务名称",
+    "GO2_OBSTACLE_GRID_LIVE_CLOUD_ENABLED": "启用 Go2 实时障碍点云栅格",
+    "GO2_OBSTACLE_GRID_PUBLISH_ON_CLOUD": "点云到达时发布 Go2 障碍栅格",
 
     # Go2 数据面·视频推流
     "GO2_VIDEO_STREAM_ENABLED": "启用视频推流",

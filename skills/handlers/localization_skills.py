@@ -61,16 +61,15 @@ def handle_relocalize_active_map(
     *,
     requested_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    ctx.ensure_geometry_runtime_for_capability("relocalize_active_map")
-    localization_session, active_workspace = ctx.map_workspace_service.relocalize_active_map(
-        map_name=str(payload.get("map_name", "")).strip() or None,
-        metadata={"requested_by": requested_by or "unknown", "source": "relocalize_active_map"},
+    del ctx, payload, requested_by
+    raise GatewayError(
+        "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK，"
+        "relocalize_active_map 暂不支持。",
+        error_code="unsupported",
+        http_status=501,
+        jsonrpc_code=-32601,
+        details={"missing_contract": "typed Relocalize RPC/ACK"},
     )
-    return {
-        "localization_session": localization_session,
-        "localization_snapshot": ctx.localization_service.get_latest_snapshot(),
-        "active_workspace": active_workspace,
-    }
 
 
 def handle_get_map_snapshot(

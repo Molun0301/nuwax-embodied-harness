@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import signal
 import sys
+from typing import Optional
 import threading
 
 from .actor import GuardActor
@@ -48,7 +49,7 @@ def run() -> None:
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
     lock = SingleInstanceLock(lock_path)
-    server: MotionGuardUnixServer | None = None
+    server: Optional[MotionGuardUnixServer] = None
     try:
         lock.acquire()
         epoch_store = EpochStore(

@@ -43,7 +43,7 @@ _MCP_COLLECTIONS = {
 #
 # V2 扩展（navigation-and-exploration-boundary §6.3）：从 3 扩到 7 个 tool：
 #   start_mapping / stop_mapping / stop_exploration / navigate_to_pose /
-#   cancel_navigation / get_navigation_state / start_exploration（v2 带 boundary + loop_close）。
+#   cancel_navigation / get_navigation_state / start_exploration（v2 带 boundary + typed stop conditions）。
 _MCP_STANDALONE_PLATFORM_TOOLS: Tuple[str, ...] = (
     "start_mapping",
     "stop_mapping",
@@ -53,6 +53,11 @@ _MCP_STANDALONE_PLATFORM_TOOLS: Tuple[str, ...] = (
     "get_navigation_state",
     "start_exploration",
 )
+
+_MCP_STANDALONE_TOOL_TARGETS: Dict[str, str] = {
+    tool_name: tool_name for tool_name in _MCP_STANDALONE_PLATFORM_TOOLS
+}
+_MCP_STANDALONE_TOOL_TARGETS["start_exploration"] = "explore_area_v2"
 
 
 # V2 新增 tool 的 input_schema（spec mcp-end-to-end §MCP 工具四件套 + §错误码契约统一）。
@@ -120,21 +125,52 @@ _MCP_STANDALONE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
                 },
                 "minItems": 1,
             },
-            "auto_loop_close": {
-                "type": "boolean",
-                "default": True,
-                "description": "启用闭环判据作为第 8 条完成路径（rtabmap:loop_closed 命名空间）。",
-            },
-            "extend_radius_m": {
-                "type": "number",
-                "default": 3.0,
-                "minimum": 0.0,
-                "maximum": 8.0,
-                "description": "边界外扩半径硬上限 8m，默认 3m。",
-            },
             "map_name": {
                 "type": "string",
                 "description": "目标地图名称（可选；缺省走当前激活地图）。",
+            },
+            "frame_id": {"type": "string", "default": "map"},
+            "strategy": {"type": "string", "default": "wavefront"},
+            "arbitration": {"type": "string", "default": "prefer_wavefront"},
+            "map_version_id": {"type": "string"},
+            "map_revision": {"type": "integer", "minimum": 0},
+            "stop_conditions": {
+                "type": "object",
+                "properties": {
+                    "max_coverage_pct": {
+                        "type": "number",
+                        "exclusiveMinimum": 0.0,
+                        "maximum": 100.0,
+                    },
+                    "no_frontier_timeout_ms": {"type": "integer", "minimum": 1},
+                    "max_duration_ms": {"type": "integer", "minimum": 1},
+                    "max_goals": {"type": "integer", "minimum": 1},
+                    "stop_on_map_revision_change": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            },
+            "max_navigation_retries": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 1,
+            },
+            "blacklist_radius_m": {
+                "type": "number",
+                "minimum": 0.0,
+                "default": 0.75,
+            },
+            "max_duration_sec": {
+                "type": "number",
+                "exclusiveMinimum": 0.0,
+            },
+            "poll_interval_sec": {
+                "type": "number",
+                "exclusiveMinimum": 0.0,
+                "default": 0.2,
+            },
+            "timeout_sec": {
+                "type": "number",
+                "exclusiveMinimum": 0.0,
             },
         },
         "additionalProperties": False,
@@ -162,6 +198,9 @@ def _tool_catalog_item(runtime: GatewayRuntime, descriptor: SkillDescriptor, lay
 
 def _build_collection_catalogs(runtime: GatewayRuntime) -> Dict[str, Dict[str, Dict[str, Any]]]:
     catalogs: Dict[str, Dict[str, Dict[str, Any]]] = {name: {} for name in _MCP_COLLECTIONS}
+    refresh_availability = getattr(runtime, "_refresh_dynamic_capability_matrix", None)
+    if callable(refresh_availability):
+        refresh_availability()
     descriptors = runtime.skill_registry.list_descriptors()
     for descriptor in descriptors:
         try:
@@ -170,6 +209,22 @@ def _build_collection_catalogs(runtime: GatewayRuntime) -> Dict[str, Dict[str, D
             continue
         if not registration.runnable:
             continue
+        get_availability = getattr(runtime.capability_registry, "get_availability", None)
+        if callable(get_availability):
+            robot_model = getattr(
+                getattr(getattr(runtime, "robot", None), "manifest", None),
+                "robot_model",
+                None,
+            )
+            try:
+                availability = get_availability(
+                    descriptor.capability_name,
+                    robot_model=robot_model,
+                )
+            except Exception:
+                continue
+            if not availability.supported:
+                continue
         layer = _tool_layer(descriptor)
         for collection_name, config in _MCP_COLLECTIONS.items():
             if layer in config["layers"]:
@@ -215,24 +270,12 @@ def _build_collection_input_schema(catalog: Dict[str, Dict[str, Any]]) -> Dict[s
 def _build_standalone_platform_tools(platform_catalog: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     tools: List[Dict[str, Any]] = []
     for tool_name in _MCP_STANDALONE_PLATFORM_TOOLS:
-        item = platform_catalog.get(tool_name)
-        # V2：4 个新 tool（navigate_to_pose/cancel_navigation/get_navigation_state/start_exploration）
-        # 优先从平台目录取 display_name/description/input_schema；缺则回退到本地 V2 schema 表。
+        target_name = _MCP_STANDALONE_TOOL_TARGETS[tool_name]
+        item = platform_catalog.get(target_name)
         fallback_schema = _MCP_STANDALONE_TOOL_SCHEMAS.get(tool_name)
-        if item is None and fallback_schema is None:
-            continue
+        # tools/list 与 tools/call 共享同一个 runnable catalog。Schema fallback
+        # 只能补充已存在目标的参数描述，不能凭空广告不可调用工具。
         if item is None:
-            # 缺平台目录条目时使用 V2 schema 占位（display_name/description 走默认文案）
-            tools.append(
-                {
-                    "name": tool_name,
-                    "description": (
-                        f"{tool_name}（V2 navigation-and-exploration-boundary）。"
-                        "独立 MCP 工具，直接传参调用。"
-                    ),
-                    "inputSchema": fallback_schema,
-                }
-            )
             continue
         tools.append(
             {
@@ -278,6 +321,10 @@ def _resolve_tool_invocation(
         return _resolve_collection_call(runtime, tool_name, arguments)
 
     catalogs = _build_collection_catalogs(runtime)
+    target_name = _MCP_STANDALONE_TOOL_TARGETS.get(tool_name)
+    if target_name is not None and target_name in catalogs["platform"]:
+        parameters = arguments if isinstance(arguments, dict) else {}
+        return target_name, parameters
     for catalog in catalogs.values():
         if tool_name in catalog:
             parameters = arguments if isinstance(arguments, dict) else {}

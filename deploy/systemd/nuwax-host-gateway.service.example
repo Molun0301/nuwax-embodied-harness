@@ -1,7 +1,10 @@
 [Unit]
+# Template: install with scripts/install_motion_guard_deployment.sh.
 Description=nuwax_robot_bridge 宿主机网关
-Requires=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service nuwax-person-follow.service
-After=network-online.target nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service nuwax-person-follow.service
+Requires=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
+BindsTo=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
+PartOf=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
+After=network-online.target nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
 Wants=network-online.target
 
 [Service]
@@ -9,7 +12,7 @@ Type=simple
 User=nuwax-gateway
 Group=nuwax-gateway
 SupplementaryGroups=nuwax-motion-clients
-WorkingDirectory=/home/unitree/nuwax-robot-bridge
+WorkingDirectory=@NUWAX_REPO_ROOT@
 RuntimeDirectory=nuwax/gateway
 RuntimeDirectoryMode=0750
 StateDirectory=nuwax/gateway
@@ -17,29 +20,37 @@ StateDirectoryMode=0750
 LogsDirectory=nuwax/gateway
 LogsDirectoryMode=0750
 UMask=0007
-# 默认会读取 WorkingDirectory 下的 .env。
-# 如果你想把配置独立放到 /etc，再取消下一行注释并准备对应文件。
-# EnvironmentFile=/etc/nuwax_robot_bridge/gateway.env
+EnvironmentFile=-@NUWAX_REPO_ROOT@/.env
+# EnvironmentFile wins over Environment; Exec* /usr/bin/env assignments below are authoritative.
 # 统一启动入口会按 .env 中的 NUWAX_ACTIVE_ROBOT 与 NUWAX_GEOMETRY_ENABLED 加载运行环境。
 # 平台文件日志路径由 .env 中的 NUWAX_LOG_* 控制。
 Environment=PYTHONUNBUFFERED=1
+Environment=NUWAX_LCM_BACKEND=real-lcm
+Environment=NUWAX_REAL_LCM_REQUIRED=true
+Environment=NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1
 Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
 Environment=NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true
 Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
 Environment=NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true
 Environment=NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready
+Environment=NUWAX_GEOMETRY_RUNTIME_PORT=50051
+Environment=NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30
 Environment=NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true
 Environment=NUWAX_PERSON_FOLLOW_TARGET_CHANNEL=/person_follow_target
 Environment=NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL=/global_map
 Environment=NUWAX_PERSON_FOLLOW_TF_CHANNEL=/tf
 Environment=NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL=/gateway/person_follow_cmd_vel
+Environment="NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope"
+Environment="NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope"
+Environment="NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope"
+Environment="NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope"
 Environment=NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY=false
 Environment=NUWAX_GATEWAY_RESTART=never
 Environment=NUWAX_GATEWAY_PID_FILE=/run/nuwax/gateway/gateway.pid
 Environment=NUWAX_GATEWAY_LOCK_FILE=/run/nuwax/gateway/start_gateway.lock
 Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
-ExecStartPre=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/systemd/wait_for_motion_guard_socket.sh check
-ExecStart=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/start_gateway.sh
+ExecStartPre=/usr/bin/env NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_motion_guard_socket.sh check
+ExecStart=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true NUWAX_PERSON_FOLLOW_TARGET_CHANNEL=/person_follow_target NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL=/global_map NUWAX_PERSON_FOLLOW_TF_CHANNEL=/tf NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL=/gateway/person_follow_cmd_vel "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope" "NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope" NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY=false NUWAX_GATEWAY_RESTART=never NUWAX_GATEWAY_PID_FILE=/run/nuwax/gateway/gateway.pid NUWAX_GATEWAY_LOCK_FILE=/run/nuwax/gateway/start_gateway.lock NUWAX_LOG_DIR=/var/log/nuwax/gateway /bin/bash @NUWAX_REPO_ROOT@/scripts/start_gateway.sh
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20

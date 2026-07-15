@@ -572,7 +572,7 @@ mod tests {
         };
         assert_eq!(
             epoch_checksum(&epoch).unwrap(),
-            "sha256:5bf8e194dbe0331190de04f857f8e4bb69d616cc203f7bc2bd4eba2d2f75ad47"
+            "sha256:45fc4d3040276e09d8b9176009ccae8c499e7a6cd44cc06c52074f14142f683c"
         );
     }
 }

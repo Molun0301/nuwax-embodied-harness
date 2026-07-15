@@ -13,7 +13,9 @@ use nuwax_nav_types_messages::goal::NavigationGoal;
 use nuwax_nav_types_messages::grid::OccupancyGrid2D;
 use nuwax_nav_types_messages::visual::FrontierGoal;
 
-use crate::{ExplorationController, ExplorationStateSnapshot, ExploreError, ExploreResult};
+#[cfg(feature = "tare")]
+use crate::ExploreError;
+use crate::{ExplorationController, ExplorationStateSnapshot, ExploreResult};
 
 /// 接收 wavefront 输入(costmap / odom)
 pub trait WavefrontInputReceiver {

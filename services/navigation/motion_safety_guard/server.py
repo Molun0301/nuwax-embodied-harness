@@ -6,6 +6,7 @@ import socket
 import socketserver
 import stat
 import threading
+from typing import Optional, Tuple
 
 from google.protobuf.message import DecodeError
 
@@ -123,9 +124,9 @@ class MotionGuardUnixServer:
         self._connection_timeout_seconds = connection_timeout_seconds
         self._actor_timeout_seconds = actor_timeout_seconds
         self._max_connections = max_connections
-        self._server: _BoundMotionGuardServer | None = None
-        self._thread: threading.Thread | None = None
-        self._bound_identity: tuple[int, int] | None = None
+        self._server: Optional[_BoundMotionGuardServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self._bound_identity: Optional[Tuple[int, int]] = None
 
     def start(self) -> None:
         if self._server is not None:
@@ -182,7 +183,7 @@ class MotionGuardUnixServer:
             thread.join(timeout=2.0)
             if thread.is_alive():
                 raise RuntimeError("motion guard UDS server did not stop")
-        fence_error: BaseException | None = None
+        fence_error: Optional[BaseException] = None
         if server is not None:
             try:
                 self._actor.fence()

@@ -39,9 +39,10 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 # 默认扫描根：README.md（仓库根）+ docs/公开文档/ 整目录
-DEFAULT_TARGETS: tuple[Path, ...] = (
+DEFAULT_TARGETS: Tuple[Path, ...] = (
     Path("README.md"),
     Path("docs/公开文档"),
 )
@@ -53,17 +54,17 @@ DEPRECATED_TOKEN_PATTERN = re.compile(
 )
 
 # 待扫描的文件后缀
-SCAN_SUFFIXES: tuple[str, ...] = (".md", ".rst", ".txt")
+SCAN_SUFFIXES: Tuple[str, ...] = (".md", ".rst", ".txt")
 
 
-def iter_target_files(targets: list[Path]) -> list[Path]:
+def iter_target_files(targets: List[Path]) -> List[Path]:
     """把传入的 target 列表展开为待扫描文件清单。
 
     - 若是文件路径：直接加入
     - 若是目录路径：递归收集所有匹配 SCAN_SUFFIXES 的文件
     - 路径不存在：跳过（不抛错，便于 CI 在缺失目录时也能跑过）
     """
-    collected: list[Path] = []
+    collected: List[Path] = []
     for target in targets:
         if not target.exists():
             # 路径不存在直接跳过（README.md / docs/公开文档/ 可能在 sub-shell 路径下）
@@ -78,12 +79,12 @@ def iter_target_files(targets: list[Path]) -> list[Path]:
     return sorted(set(collected))
 
 
-def scan_file(path: Path) -> list[tuple[int, str]]:
+def scan_file(path: Path) -> List[Tuple[int, str]]:
     """扫描单个文件，返回命中 (行号, 行内容) 列表。
 
     使用 utf-8 编码容错读取；遇到二进制 / 解码错误时返回空列表（不抛错）。
     """
-    hits: list[tuple[int, str]] = []
+    hits: List[Tuple[int, str]] = []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -94,7 +95,7 @@ def scan_file(path: Path) -> list[tuple[int, str]]:
     return hits
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     """CLI 入口。返回进程退出码。"""
     parser = argparse.ArgumentParser(
         prog="docs_guard",
@@ -117,14 +118,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # 合并默认 target + 用户 --paths（用户在项目根运行时）
     extra_paths = [Path(p) for p in args.paths]
-    targets: list[Path] = list(DEFAULT_TARGETS) + extra_paths
+    targets: List[Path] = list(DEFAULT_TARGETS) + extra_paths
 
     files = iter_target_files(targets)
     if not files:
         # 没有可扫描文件 = 静默通过（不输出，避免污染 CI 日志）
         return 0
 
-    all_hits: list[tuple[Path, int, str]] = []
+    all_hits: List[Tuple[Path, int, str]] = []
     for f in files:
         for lineno, line in scan_file(f):
             all_hits.append((f, lineno, line))

@@ -96,6 +96,7 @@ impl NavTopicConfig {
         let mut topics = BTreeMap::new();
         // 输入
         topics.insert("registered_scan".into(), TopicName::new("registered_scan"));
+        topics.insert("occupancy".into(), TopicName::new("occupancy"));
         topics.insert("terrain_map".into(), TopicName::new("terrain_map"));
         topics.insert("terrain_map_ext".into(), TopicName::new("terrain_map_ext"));
         topics.insert("odometry".into(), TopicName::new("odometry"));
@@ -121,7 +122,7 @@ impl NavTopicConfig {
         topics.insert("stop_movement".into(), TopicName::new("stop_movement"));
         topics.insert("path".into(), TopicName::new("path"));
         // 输出
-        topics.insert("nav_cmd_vel".into(), TopicName::new("nav_cmd_vel"));
+        topics.insert("nav_cmd_vel".into(), TopicName::new("/nav/cmd_vel"));
         topics.insert("cmd_vel".into(), TopicName::new("cmd_vel"));
         topics.insert("way_point".into(), TopicName::new("way_point"));
         topics.insert("goal_path".into(), TopicName::new("goal_path"));
@@ -203,7 +204,12 @@ impl NavTopicConfig {
                 "/odom",
             ),
             (
-                "registered_scan",
+                "tf",
+                &["NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL", "NUWAX_LCM_CHANNEL_TF"][..],
+                "/tf",
+            ),
+            (
+                "occupancy",
                 &[
                     "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL",
                     "NUWAX_LCM_CHANNEL_OCCUPANCY",
@@ -238,7 +244,7 @@ impl NavTopicConfig {
             config.set(port, configured_channel(keys, fallback));
         }
         for (port, channel) in [
-            ("start_pose", "/pose_stamped"),
+            ("map_pose", "/nav/map_pose"),
             ("clicked_point", "/clicked_point"),
             ("joy_cmd", "/teleop/cmd_vel"),
             ("nav_cmd_vel", "/nav/cmd_vel"),
@@ -325,8 +331,24 @@ mod tests {
     #[test]
     fn geometry_runtime_channel_strips_typed_suffix() {
         assert_eq!(
-            configured_channel(&[], "/nav/goal#geometry_msgs.PoseStamped"),
+            configured_channel(&[], "/nav/goal#nuwax_msgs.GoalEnvelope"),
             "/nav/goal"
         );
+    }
+
+    #[test]
+    fn occupancy_and_registered_scan_remain_type_distinct() {
+        let config = NavTopicConfig::geometry_runtime_defaults();
+        assert_eq!(config.get_or("occupancy", "missing"), "/map/occupancy");
+        assert_eq!(
+            config.get_or("registered_scan", "missing"),
+            "registered_scan"
+        );
+        assert_ne!(
+            config.get_or("occupancy", "missing"),
+            config.get_or("registered_scan", "missing")
+        );
+        assert_eq!(config.get_or("nav_cmd_vel", "missing"), "/nav/cmd_vel");
+        assert!(!config.topics.contains_key("start_pose"));
     }
 }

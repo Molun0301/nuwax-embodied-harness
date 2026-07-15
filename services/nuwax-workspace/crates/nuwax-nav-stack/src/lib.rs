@@ -73,6 +73,8 @@ pub mod features;
 pub mod graph;
 #[cfg(feature = "lcm-runtime")]
 mod lcm_dataflow;
+#[cfg(feature = "lcm-runtime")]
+mod map_pose;
 pub mod profile;
 pub mod profiles;
 pub mod replay;

@@ -34,7 +34,9 @@ use nuwax_codec::lcm::schema;
 use nuwax_codec::{CodecError, CodecResult};
 use nuwax_protocol::{LcmFrameHeader, LcmMessageType, LcmTopic, RawLcmFrame, LCM_MAGIC};
 
-use crate::lcm_runtime::{FrontierEntry, NavState, PoseState, TransformEntry};
+use crate::lcm_runtime::{
+    FrontierEntry, NavState, NavigationFeedback, NavigationUpdate, PoseState, TransformEntry,
+};
 
 // ============================================================================
 // typed payload layout 常量(必须与 lcm_runtime.rs parse_*_payload 一致)
@@ -125,11 +127,71 @@ pub fn encode_cmd_vel_payload(linear: [f32; 3], angular: [f32; 3], _stamp_ns: u6
 }
 
 /// 把用户触发的 `nuwax_msgs/CancelNavigation` 编码成 generated-C body。
-pub fn encode_nav_cancel_payload(session_id: &str, reason: i32) -> CodecResult<Vec<u8>> {
+pub fn encode_nav_cancel_payload(
+    session_id: &str,
+    reason: i32,
+    cancel_generation: u64,
+    owner_kind: i32,
+    parent_request_id: &str,
+    goal_generation: u64,
+    producer_runtime_generation: u64,
+) -> CodecResult<Vec<u8>> {
+    let cancel_generation = i64::try_from(cancel_generation).map_err(|_| {
+        CodecError::LcmEncode("cancel_generation exceeds positive int64 range".into())
+    })?;
+    if cancel_generation == 0 {
+        return Err(CodecError::LcmEncode(
+            "cancel_generation must be positive".into(),
+        ));
+    }
+    let goal_generation = i64::try_from(goal_generation).map_err(|_| {
+        CodecError::LcmEncode("goal_generation exceeds positive int64 range".into())
+    })?;
+    let producer_runtime_generation = i64::try_from(producer_runtime_generation).map_err(|_| {
+        CodecError::LcmEncode("producer_runtime_generation exceeds positive int64 range".into())
+    })?;
+    if producer_runtime_generation == 0 {
+        return Err(CodecError::LcmEncode(
+            "producer_runtime_generation must be positive".into(),
+        ));
+    }
+    if session_id.trim().is_empty()
+        || parent_request_id.trim().is_empty()
+        || goal_generation == 0
+        || !matches!(
+            owner_kind,
+            schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
+                | schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+        )
+    {
+        return Err(CodecError::LcmEncode(
+            "CancelNavigation requires a complete goal lease identity".into(),
+        ));
+    }
     schema::encode_cancel_navigation_body(&schema::CancelNavigation {
         session_id: session_id.to_string(),
         reason,
+        cancel_generation,
+        owner_kind,
+        parent_request_id: parent_request_id.to_string(),
+        goal_generation,
+        producer_runtime_generation,
     })
+}
+
+/// Encode one validated, sealed `nuwax_msgs.GoalEnvelope` generated-C body.
+pub fn encode_goal_envelope_payload(message: &schema::GoalEnvelope) -> CodecResult<Vec<u8>> {
+    schema::encode_goal_envelope_body(message)
+}
+
+/// Decode and validate a `nuwax_msgs.GoalEnvelope` generated-C body.
+pub fn decode_goal_envelope_payload(payload: &[u8]) -> CodecResult<schema::GoalEnvelope> {
+    schema::decode_goal_envelope_body(payload)
+}
+
+/// Decode and validate a `nuwax_msgs.PathEnvelope` generated-C body.
+pub fn decode_path_envelope_payload(payload: &[u8]) -> CodecResult<schema::PathEnvelope> {
+    schema::decode_path_envelope_body(payload)
 }
 
 /// 把 `geometry_msgs/PoseStamped` 编码成 typed payload bytes(复用 odom 布局)。
@@ -223,7 +285,7 @@ pub fn decode_odometry_payload(payload: &[u8]) -> Option<PoseState> {
 }
 
 /// 把 raw bytes 解析成 `NavState`(P4 接入后给 `nav_state` 解析路径用)。
-pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavState> {
+pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
     let message = schema::decode_navigation_state_body(payload).ok()?;
     let timestamp_ns = native_stamp_ns(message.stamp_sec, message.stamp_nsec)?;
     let dx = message.goal[0] - message.current[0];
@@ -232,12 +294,73 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavState> {
     if !distance_remaining.is_finite() || !message.progress.is_finite() {
         return None;
     }
-    Some(NavState {
+    let runtime_generation = u64::try_from(message.runtime_generation).ok()?;
+    let guard_generation = u64::try_from(message.guard_generation).ok()?;
+    let planner_map_revision = u64::try_from(message.planner_map_revision).ok()?;
+    let cancel_generation = u64::try_from(message.cancel_generation).ok()?;
+    let zero_applied_monotonic_ns = u64::try_from(message.zero_applied_monotonic_ns).ok()?;
+    let goal_generation = u64::try_from(message.goal_generation).ok()?;
+    let path_revision = u64::try_from(message.path_revision).ok()?;
+    let sink_ready = match message.sink_ready {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    if sink_ready && guard_generation == 0 {
+        return None;
+    }
+    let has_session = !message.session_id.trim().is_empty();
+    if has_session {
+        if !matches!(
+            message.owner_kind,
+            schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
+                | schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+        ) || message.parent_request_id.trim().is_empty()
+            || goal_generation == 0
+            || message.goal_payload_sha256 == [0; 32]
+            || (path_revision == 0 && message.path_payload_sha256 != [0; 32])
+            || (path_revision > 0 && message.path_payload_sha256 == [0; 32])
+        {
+            return None;
+        }
+    } else if message.owner_kind != 0
+        || !message.parent_request_id.is_empty()
+        || goal_generation != 0
+        || path_revision != 0
+        || message.goal_payload_sha256 != [0; 32]
+        || message.path_payload_sha256 != [0; 32]
+    {
+        return None;
+    }
+    let state = NavState {
         status: navigation_state_name(message.state, &message.message),
         message: message.message,
         goal_id: message.session_id,
         distance_remaining: distance_remaining as f32,
         timestamp_ns,
+    };
+    Some(NavigationUpdate {
+        producer_runtime_generation: 0,
+        feedback: NavigationFeedback {
+            reason_code: navigation_state_name(message.state, &state.message),
+            runtime_generation,
+            guard_generation,
+            sink_ready,
+            planner_map_revision,
+            planner_map_frame: message.planner_map_frame,
+            planner_pose_frame: message.planner_pose_frame,
+            cancel_generation,
+            zero_ack_id: message.zero_ack_id,
+            zero_applied_monotonic_ns,
+            owner_kind: message.owner_kind,
+            parent_request_id: message.parent_request_id,
+            goal_generation,
+            path_revision,
+            goal_payload_sha256: message.goal_payload_sha256,
+            path_payload_sha256: message.path_payload_sha256,
+            ..NavigationFeedback::default()
+        },
+        state,
     })
 }
 
@@ -375,12 +498,26 @@ mod tests {
 
     #[test]
     fn native_bridge_payloads_use_generated_layouts() {
-        let cancel = encode_nav_cancel_payload("goal-7", 2).expect("encode cancellation");
+        let cancel = encode_nav_cancel_payload(
+            "goal-7",
+            2,
+            17,
+            schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            "request-7",
+            5,
+            9,
+        )
+        .expect("encode cancellation");
         assert_eq!(
             schema::decode_cancel_navigation_body(&cancel).unwrap(),
             schema::CancelNavigation {
                 session_id: "goal-7".into(),
                 reason: 2,
+                cancel_generation: 17,
+                owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+                parent_request_id: "request-7".into(),
+                goal_generation: 5,
+                producer_runtime_generation: 9,
             }
         );
 
@@ -394,13 +531,41 @@ mod tests {
             current: [0.0, 0.0, 0.0],
             progress: 0.5,
             message: "moving".into(),
+            runtime_generation: 7,
+            guard_generation: 11,
+            sink_ready: 1,
+            planner_map_revision: 42,
+            planner_map_frame: "map".into(),
+            planner_pose_frame: "map".into(),
+            cancel_generation: 0,
+            zero_ack_id: String::new(),
+            zero_applied_monotonic_ns: 0,
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: "request-7".into(),
+            goal_generation: 5,
+            path_revision: 0,
+            goal_payload_sha256: [7; 32],
+            path_payload_sha256: [0; 32],
         })
         .unwrap();
         let nav = decode_nav_state_payload(&nav).expect("decode navigation state");
-        assert_eq!(nav.status, "RUNNING");
-        assert_eq!(nav.goal_id, "goal-7");
-        assert_eq!(nav.distance_remaining, 5.0);
-        assert_eq!(nav.timestamp_ns, 4_000_000_005);
+        assert_eq!(nav.state.status, "RUNNING");
+        assert_eq!(nav.state.goal_id, "goal-7");
+        assert_eq!(nav.state.distance_remaining, 5.0);
+        assert_eq!(nav.state.timestamp_ns, 4_000_000_005);
+        assert_eq!(nav.feedback.runtime_generation, 7);
+        assert_eq!(nav.feedback.guard_generation, 11);
+        assert!(nav.feedback.sink_ready);
+        assert_eq!(nav.feedback.planner_map_revision, 42);
+        assert_eq!(nav.feedback.planner_map_frame, "map");
+        assert_eq!(nav.feedback.planner_pose_frame, "map");
+        assert_eq!(
+            nav.feedback.owner_kind,
+            schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
+        );
+        assert_eq!(nav.feedback.parent_request_id, "request-7");
+        assert_eq!(nav.feedback.goal_generation, 5);
+        assert_eq!(nav.feedback.goal_payload_sha256, [7; 32]);
 
         let tf = schema::encode_tf_message_body(&schema::TfMessage {
             transforms: vec![schema::TransformStamped {
@@ -459,12 +624,86 @@ mod tests {
             current: [1.0, 2.0, 0.0],
             progress: 0.0,
             message: "CANCELLED: stop and zero command published".into(),
+            runtime_generation: 9,
+            guard_generation: 12,
+            sink_ready: 1,
+            planner_map_revision: 5,
+            planner_map_frame: "map".into(),
+            planner_pose_frame: "map".into(),
+            cancel_generation: 3,
+            zero_ack_id: "zero-3".into(),
+            zero_applied_monotonic_ns: 55,
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: "request-cancelled".into(),
+            goal_generation: 3,
+            path_revision: 1,
+            goal_payload_sha256: [3; 32],
+            path_payload_sha256: [4; 32],
         })
         .expect("encode stack cancel ack");
 
         let nav = decode_nav_state_payload(&payload).expect("decode stack cancel ack");
-        assert_eq!(nav.status, "CANCELLED");
-        assert_eq!(nav.goal_id, "goal-cancelled");
+        assert_eq!(nav.state.status, "CANCELLED");
+        assert_eq!(nav.state.goal_id, "goal-cancelled");
+        assert_eq!(nav.feedback.cancel_generation, 3);
+        assert_eq!(nav.feedback.zero_ack_id, "zero-3");
+        assert_eq!(nav.feedback.zero_applied_monotonic_ns, 55);
+    }
+
+    #[test]
+    fn cancel_encoder_rejects_missing_generation() {
+        let error = encode_nav_cancel_payload(
+            "goal-7",
+            0,
+            0,
+            schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            "request-7",
+            1,
+            1,
+        )
+        .expect_err("zero must fail");
+        assert!(error.to_string().contains("cancel_generation"));
+
+        let error = encode_nav_cancel_payload(
+            "goal-7",
+            0,
+            1,
+            schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            "request-7",
+            1,
+            0,
+        )
+        .expect_err("zero producer generation must fail");
+        assert!(error.to_string().contains("producer_runtime_generation"));
+    }
+
+    #[test]
+    fn versioned_envelope_decoders_reject_legacy_raw_goal_and_path_bodies() {
+        let raw_goal = schema::encode_pose_stamped_body(&schema::PoseStamped {
+            header: schema::Header {
+                frame_id: "map".into(),
+                ..schema::Header::default()
+            },
+            ..schema::PoseStamped::default()
+        })
+        .expect("raw PoseStamped");
+        assert!(decode_goal_envelope_payload(&raw_goal).is_err());
+
+        let raw_path = schema::encode_path_body(&schema::Path {
+            header: schema::Header {
+                frame_id: "map".into(),
+                ..schema::Header::default()
+            },
+            poses: vec![schema::PoseStamped {
+                header: schema::Header {
+                    frame_id: "map".into(),
+                    ..schema::Header::default()
+                },
+                ..schema::PoseStamped::default()
+            }],
+        })
+        .expect("raw Path");
+        assert!(decode_path_envelope_payload(&raw_path).is_err());
     }
 
     #[test]

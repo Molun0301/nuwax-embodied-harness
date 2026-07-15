@@ -67,6 +67,29 @@ class TaskTimeoutError(TimeoutError):
     """任务超时异常。"""
 
 
+class TaskSafetyBarrierError(RuntimeError):
+    """任务无法确认安全停车/资源交接时的失败异常。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: Optional[MetadataDict] = None,
+        code: str = "parking_unconfirmed",
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = str(code or "parking_unconfirmed")
+        self.details = dict(details or {})
+
+    def to_payload(self) -> MetadataDict:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "details": dict(self.details),
+        }
+
+
 @dataclass
 class TaskRecord:
     """任务记录。"""
@@ -81,6 +104,10 @@ class TaskRecord:
     error_payload: Optional[MetadataDict] = None
     cancel_requested: bool = False
     timeout_triggered: bool = False
+    deferred_interrupt: bool = False
+    interrupt_barrier_acknowledged: bool = False
+    interrupt_barrier_proof: Optional[MetadataDict] = None
+    resource_quarantined: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,6 +152,16 @@ class TaskExecutionContext:
 
         return self.manager.publish_task_event(self.task_id, event_type, message=message, payload=payload)
 
+    def update_metadata(self, updates: MetadataDict) -> TaskSpec:
+        """合并任务元数据。"""
+
+        return self.manager.update_task_metadata(self.task_id, updates)
+
+    def acknowledge_interrupt_barrier(self, proof: MetadataDict) -> MetadataDict:
+        """确认 deferred 中断已完成后端安全停车，并记录证明。"""
+
+        return self.manager.acknowledge_interrupt_barrier(self.task_id, proof)
+
 
 class TaskManager:
     """长时任务管理器。"""
@@ -156,6 +193,7 @@ class TaskManager:
         required_resources: Optional[List[str]] = None,
         timeout_sec: Optional[float] = None,
         metadata: Optional[MetadataDict] = None,
+        deferred_interrupt: bool = False,
     ) -> TaskSpec:
         """提交一个异步任务。"""
 
@@ -182,7 +220,11 @@ class TaskManager:
             stage="accepted",
             message="任务已接受。",
         )
-        record = TaskRecord(spec=spec, status=status)
+        record = TaskRecord(
+            spec=spec,
+            status=status,
+            deferred_interrupt=bool(deferred_interrupt),
+        )
         acquired_resources = False
         future: Optional[Future[Any]] = None
         timer: Optional[Timer] = None
@@ -274,6 +316,70 @@ class TaskManager:
             payload = self._records[task_id].error_payload
             return dict(payload) if payload is not None else None
 
+    def update_task_metadata(
+        self,
+        task_id: str,
+        updates: MetadataDict,
+    ) -> TaskSpec:
+        """合并任务元数据，并留下可审计事件。"""
+
+        metadata_updates = dict(updates or {})
+        with self._lock:
+            record = self._records[task_id]
+            merged = dict(record.spec.metadata)
+            merged.update(metadata_updates)
+            record.spec = record.spec.model_copy(
+                update={"metadata": merged},
+                deep=True,
+            )
+            spec = record.spec
+            state = record.status.state
+        self._append_task_event(
+            task_id,
+            "task.metadata_updated",
+            state=state,
+            message="任务元数据已更新。",
+            payload={"metadata_updates": metadata_updates},
+        )
+        return spec
+
+    def acknowledge_interrupt_barrier(
+        self,
+        task_id: str,
+        proof: MetadataDict,
+    ) -> MetadataDict:
+        """记录 deferred interrupt 的后端安全终态证明。"""
+
+        barrier_proof = dict(proof or {})
+        if not barrier_proof:
+            raise ValueError("interrupt barrier proof 不能为空。")
+        with self._lock:
+            record = self._records[task_id]
+            if not record.deferred_interrupt:
+                raise RuntimeError("普通任务不接受 interrupt barrier ack。")
+            if not (record.cancel_requested or record.timeout_triggered):
+                raise RuntimeError("任务尚未收到取消或超时请求。")
+            if record.status.state in _TERMINAL_STATES:
+                raise RuntimeError("终态任务不能补写 interrupt barrier ack。")
+            record.interrupt_barrier_acknowledged = True
+            record.interrupt_barrier_proof = barrier_proof
+            record.status = record.status.model_copy(
+                update={
+                    "stage": "interrupt_barrier_acknowledged",
+                    "message": "后端安全停止已确认。",
+                    "updated_at": utc_now(),
+                }
+            )
+            state = record.status.state
+        self._append_task_event(
+            task_id,
+            "task.interrupt_barrier_acknowledged",
+            state=state,
+            message="后端安全停止已确认。",
+            payload={"interrupt_barrier_proof": barrier_proof},
+        )
+        return dict(barrier_proof)
+
     def list_active_tasks(self) -> Tuple[TaskStatus, ...]:
         """列出活动任务。"""
 
@@ -355,8 +461,25 @@ class TaskManager:
                 return False
             record.cancel_requested = True
             future = record.future
+            deferred_interrupt = record.deferred_interrupt
 
-        can_release_resources = future is None or future.cancel() or future.done()
+        cancelled_before_start = future is None or future.cancel()
+        if (
+            deferred_interrupt
+            and future is not None
+            and not cancelled_before_start
+            and not future.done()
+        ):
+            requested_message = message or "已请求取消，等待任务确认安全停止。"
+            self._set_interrupt_requested(
+                task_id,
+                stage="cancel_requested",
+                message=requested_message,
+                event_type="task.cancel_requested",
+            )
+            return True
+
+        can_release_resources = cancelled_before_start or bool(future and future.done())
         self._set_terminal_state(
             task_id,
             TaskState.CANCELLED,
@@ -374,19 +497,9 @@ class TaskManager:
                 for task_id, record in self._records.items()
                 if record.status.state not in _TERMINAL_STATES
             )
-            futures = {task_id: self._records[task_id].future for task_id in task_ids}
-            for task_id in task_ids:
-                self._records[task_id].cancel_requested = True
 
         for task_id in task_ids:
-            future = futures.get(task_id)
-            can_release_resources = future is None or future.cancel() or future.done()
-            self._set_terminal_state(
-                task_id,
-                TaskState.CANCELLED,
-                message or "任务已取消。",
-                release_resources=can_release_resources,
-            )
+            self.cancel_task(task_id, message=message or "任务已取消。")
         return task_ids
 
     def wait_for_task(self, task_id: str, timeout: Optional[float] = None) -> Any:
@@ -409,8 +522,20 @@ class TaskManager:
             overflow = len(self._history_order) - retain
             if overflow <= 0:
                 return
-            expired = self._history_order[:overflow]
-            self._history_order = self._history_order[overflow:]
+            expired: List[str] = []
+            retained_order: List[str] = []
+            for task_id in self._history_order:
+                record = self._records.get(task_id)
+                if (
+                    overflow > 0
+                    and record is not None
+                    and not record.resource_quarantined
+                ):
+                    expired.append(task_id)
+                    overflow -= 1
+                else:
+                    retained_order.append(task_id)
+            self._history_order = retained_order
             for task_id in expired:
                 self._records.pop(task_id, None)
 
@@ -429,6 +554,25 @@ class TaskManager:
         for timer in timers:
             timer.cancel()
         self._executor.shutdown(wait=wait)
+        if wait:
+            with self._lock:
+                quarantined_task_ids = tuple(
+                    task_id
+                    for task_id, record in self._records.items()
+                    if record.resource_quarantined
+                )
+            for task_id in quarantined_task_ids:
+                self._release_resources(task_id)
+                with self._lock:
+                    record = self._records.get(task_id)
+                    if record is not None:
+                        record.resource_quarantined = False
+                self._append_task_event(
+                    task_id,
+                    "task.resource_quarantine_released",
+                    state=TaskState.FAILED,
+                    message="TaskManager shutdown 已释放隔离资源。",
+                )
 
     def _build_task_metadata(
         self,
@@ -496,24 +640,71 @@ class TaskManager:
         context = TaskExecutionContext(manager=self, task_id=task_id)
         result: Any = None
         try:
-            context.ensure_active()
+            with self._lock:
+                deferred_interrupt = self._records[task_id].deferred_interrupt
+            if not deferred_interrupt:
+                context.ensure_active()
             result = runner(context)
             with self._lock:
                 record = self._records[task_id]
                 terminal_state = record.status.state
+                cancel_requested = record.cancel_requested
+                timeout_triggered = record.timeout_triggered
+                deferred_interrupt = record.deferred_interrupt
+                barrier_acknowledged = record.interrupt_barrier_acknowledged
             if terminal_state == TaskState.CANCELLED:
                 return result
             if terminal_state == TaskState.TIMEOUT:
                 return result
+            if timeout_triggered:
+                if deferred_interrupt and not barrier_acknowledged:
+                    raise self._build_parking_unconfirmed_error(
+                        task_id,
+                        "deferred 任务在超时后返回，但未确认后端安全停止。",
+                    )
+                self._set_terminal_state(task_id, TaskState.TIMEOUT, "任务执行超时。")
+                return result
+            if cancel_requested:
+                if deferred_interrupt and not barrier_acknowledged:
+                    raise self._build_parking_unconfirmed_error(
+                        task_id,
+                        "deferred 任务在取消后返回，但未确认后端安全停止。",
+                    )
+                self._set_terminal_state(task_id, TaskState.CANCELLED, "任务已取消。")
+                return result
             self._set_terminal_state(task_id, TaskState.SUCCEEDED, "任务执行成功。", result=result)
             return result
+        except TaskSafetyBarrierError as exc:
+            self._fail_safety_barrier(task_id, exc)
+            raise
         except TaskCancelledError as exc:
+            barrier_error = self._unacknowledged_interrupt_error(
+                task_id,
+                "deferred 任务抛出取消异常，但未确认后端安全停止。",
+            )
+            if barrier_error is not None:
+                self._fail_safety_barrier(task_id, barrier_error)
+                raise barrier_error from exc
             self._set_terminal_state(task_id, TaskState.CANCELLED, str(exc))
             return None
         except TaskTimeoutError as exc:
+            barrier_error = self._unacknowledged_interrupt_error(
+                task_id,
+                "deferred 任务抛出超时异常，但未确认后端安全停止。",
+            )
+            if barrier_error is not None:
+                self._fail_safety_barrier(task_id, barrier_error)
+                raise barrier_error from exc
             self._set_terminal_state(task_id, TaskState.TIMEOUT, str(exc))
             return None
         except Exception as exc:
+            barrier_error = self._unacknowledged_interrupt_error(
+                task_id,
+                "deferred 任务异常退出，但未确认后端安全停止。",
+            )
+            if barrier_error is not None:
+                self._fail_safety_barrier(task_id, barrier_error)
+                raise barrier_error from exc
             if self.is_timed_out(task_id):
                 self._set_terminal_state(task_id, TaskState.TIMEOUT, f"任务执行超时: {exc}")
                 return None
@@ -529,8 +720,67 @@ class TaskManager:
             )
             raise
         finally:
-            self._release_resources(task_id)
+            with self._lock:
+                resource_quarantined = self._records[task_id].resource_quarantined
+            if not resource_quarantined:
+                self._release_resources(task_id)
             self._cancel_timer(task_id)
+
+    def _fail_safety_barrier(
+        self,
+        task_id: str,
+        error: TaskSafetyBarrierError,
+    ) -> None:
+        with self._lock:
+            record = self._records[task_id]
+            record.resource_quarantined = True
+        error.details.setdefault("parking_unconfirmed", True)
+        error.details["resource_quarantined"] = True
+        self._set_terminal_state(
+            task_id,
+            TaskState.FAILED,
+            str(error),
+            error=str(error),
+            error_payload=error.to_payload(),
+            release_resources=False,
+        )
+
+    def _unacknowledged_interrupt_error(
+        self,
+        task_id: str,
+        message: str,
+    ) -> Optional[TaskSafetyBarrierError]:
+        with self._lock:
+            record = self._records[task_id]
+            requires_ack = (
+                record.deferred_interrupt
+                and (record.cancel_requested or record.timeout_triggered)
+                and not record.interrupt_barrier_acknowledged
+            )
+        if not requires_ack:
+            return None
+        return self._build_parking_unconfirmed_error(task_id, message)
+
+    def _build_parking_unconfirmed_error(
+        self,
+        task_id: str,
+        message: str,
+    ) -> TaskSafetyBarrierError:
+        with self._lock:
+            record = self._records[task_id]
+            details: MetadataDict = {
+                "task_id": task_id,
+                "cancel_requested": record.cancel_requested,
+                "timeout_triggered": record.timeout_triggered,
+                "deferred_interrupt": record.deferred_interrupt,
+                "interrupt_barrier_acknowledged": record.interrupt_barrier_acknowledged,
+                "parking_unconfirmed": True,
+            }
+            if record.interrupt_barrier_proof is not None:
+                details["interrupt_barrier_proof"] = dict(
+                    record.interrupt_barrier_proof
+                )
+        return TaskSafetyBarrierError(message, details=details)
 
     def _set_running(self, task_id: str) -> None:
         with self._lock:
@@ -548,6 +798,33 @@ class TaskManager:
                 }
             )
         self._append_task_event(task_id, "task.started", state=TaskState.RUNNING, message="任务开始执行。")
+
+    def _set_interrupt_requested(
+        self,
+        task_id: str,
+        *,
+        stage: str,
+        message: str,
+        event_type: str,
+    ) -> None:
+        with self._lock:
+            record = self._records[task_id]
+            if record.status.state in _TERMINAL_STATES:
+                return
+            record.status = record.status.model_copy(
+                update={
+                    "stage": stage,
+                    "message": message,
+                    "updated_at": utc_now(),
+                }
+            )
+            state = record.status.state
+        self._append_task_event(
+            task_id,
+            event_type,
+            state=state,
+            message=message,
+        )
 
     def _set_terminal_state(
         self,
@@ -659,7 +936,22 @@ class TaskManager:
                 return
             record.timeout_triggered = True
             future = record.future
-        can_release_resources = future is None or future.cancel() or future.done()
+            deferred_interrupt = record.deferred_interrupt
+        cancelled_before_start = future is None or future.cancel()
+        if (
+            deferred_interrupt
+            and future is not None
+            and not cancelled_before_start
+            and not future.done()
+        ):
+            self._set_interrupt_requested(
+                task_id,
+                stage="timeout_pending_stop",
+                message="任务已超时，等待任务确认安全停止。",
+                event_type="task.timeout_requested",
+            )
+            return
+        can_release_resources = cancelled_before_start or bool(future and future.done())
         self._set_terminal_state(
             task_id,
             TaskState.TIMEOUT,

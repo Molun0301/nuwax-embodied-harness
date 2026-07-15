@@ -72,6 +72,9 @@ pub enum ExploreError {
     /// 导航 / patrolling 侧错误(写入 sink 时透传)
     #[error("exploration nav error: {0}")]
     Nav(String),
+    /// boundary 几何无效或不闭合
+    #[error("invalid exploration boundary: {0}")]
+    InvalidBoundary(String),
 }
 
 impl From<ExploreError> for NavResult<()> {
@@ -94,6 +97,226 @@ pub enum ExplorationStopReason {
     ConsecutiveFailuresExceeded,
     /// 主动取消(用户 / stack / 用户命令)
     UserCancelled,
+    /// 已达到请求的覆盖率阈值
+    CoverageReached,
+    /// 连续无 frontier 超过请求阈值
+    NoFrontierTimeout,
+    /// 探索总时长超过请求阈值
+    DurationExceeded,
+    /// 已派发目标数达到请求上限
+    MaxGoalsReached,
+    /// 被 pin 的地图 revision 在会话中发生变化
+    MapRevisionChanged,
+}
+
+/// 探索终态类别，避免把自然完成、用户取消和故障压成同一个 STOPPED。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExplorationTerminalKind {
+    /// 自然完成，调用方应映射为 succeeded。
+    Succeeded,
+    /// 用户或上层主动取消。
+    Cancelled,
+    /// 运行失败或安全条件触发。
+    Failed,
+}
+
+impl ExplorationStopReason {
+    /// 将停止原因分类为稳定的跨层终态。
+    #[must_use]
+    pub fn terminal_kind(self) -> ExplorationTerminalKind {
+        match self {
+            Self::NoInformationGain
+            | Self::NoReachableFreeSpace
+            | Self::CoverageReached
+            | Self::NoFrontierTimeout
+            | Self::MaxGoalsReached => ExplorationTerminalKind::Succeeded,
+            Self::UserCancelled => ExplorationTerminalKind::Cancelled,
+            Self::ConsecutiveFailuresExceeded
+            | Self::DurationExceeded
+            | Self::MapRevisionChanged => ExplorationTerminalKind::Failed,
+        }
+    }
+}
+
+/// child navigation 对 exploration source 的终态反馈。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplorationGoalFeedback {
+    /// child navigation 已到达。
+    Reached,
+    /// child navigation 失败，保留原始原因用于诊断和 retry/blacklist。
+    Failed(String),
+    /// child navigation 被取消。
+    Cancelled,
+}
+
+/// boundary 的一条有向线段。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoundarySegment {
+    /// 起点。
+    pub start: Point2,
+    /// 终点。
+    pub end: Point2,
+}
+
+/// 闭合探索边界。边界上的点视为范围内。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplorationBoundary {
+    vertices: Vec<Point2>,
+}
+
+impl ExplorationBoundary {
+    /// 从按顺序排列的顶点构造闭合 polygon，末点无需重复首点。
+    pub fn from_vertices(vertices: Vec<Point2>) -> ExploreResult<Self> {
+        if vertices.len() < 3 {
+            return Err(ExploreError::InvalidBoundary(
+                "at least three vertices are required".to_string(),
+            ));
+        }
+        if vertices
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+        {
+            return Err(ExploreError::InvalidBoundary(
+                "vertices must be finite".to_string(),
+            ));
+        }
+        for index in 0..vertices.len() {
+            let next = (index + 1) % vertices.len();
+            if point_distance(vertices[index], vertices[next]) <= 1.0e-9 {
+                return Err(ExploreError::InvalidBoundary(
+                    "zero-length boundary segment".to_string(),
+                ));
+            }
+        }
+        let (min_x, max_x, min_y, max_y) = vertices.iter().fold(
+            (
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ),
+            |(min_x, max_x, min_y, max_y), point| {
+                (
+                    min_x.min(point.x),
+                    max_x.max(point.x),
+                    min_y.min(point.y),
+                    max_y.max(point.y),
+                )
+            },
+        );
+        let scale = (max_x - min_x).max(max_y - min_y).max(1.0);
+        for first in 0..vertices.len() {
+            let first_next = (first + 1) % vertices.len();
+            for second in (first + 1)..vertices.len() {
+                let second_next = (second + 1) % vertices.len();
+                if first == second_next || first_next == second {
+                    continue;
+                }
+                if segments_intersect(
+                    vertices[first],
+                    vertices[first_next],
+                    vertices[second],
+                    vertices[second_next],
+                ) {
+                    return Err(ExploreError::InvalidBoundary(
+                        "boundary polygon must not self-intersect".to_string(),
+                    ));
+                }
+            }
+        }
+        let twice_area = vertices
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let next = vertices[(index + 1) % vertices.len()];
+                point.x * next.y - next.x * point.y
+            })
+            .sum::<f64>();
+        if twice_area.abs() <= 1.0e-9 * scale * scale {
+            return Err(ExploreError::InvalidBoundary(
+                "boundary polygon area is zero or numerically degenerate".to_string(),
+            ));
+        }
+        Ok(Self { vertices })
+    }
+
+    /// 从连续且闭合的线段构造 polygon。
+    pub fn from_segments(segments: Vec<BoundarySegment>) -> ExploreResult<Self> {
+        if segments.len() < 3 {
+            return Err(ExploreError::InvalidBoundary(
+                "at least three segments are required".to_string(),
+            ));
+        }
+        for index in 0..segments.len() {
+            let next = (index + 1) % segments.len();
+            if point_distance(segments[index].end, segments[next].start) > 1.0e-6 {
+                return Err(ExploreError::InvalidBoundary(
+                    "segments must be ordered, contiguous, and closed".to_string(),
+                ));
+            }
+        }
+        Self::from_vertices(segments.into_iter().map(|segment| segment.start).collect())
+    }
+
+    /// polygon 顶点只读视图。
+    #[must_use]
+    pub fn vertices(&self) -> &[Point2] {
+        &self.vertices
+    }
+
+    /// 判断点是否在 polygon 内部或边界上。
+    #[must_use]
+    pub fn contains(&self, point: Point2) -> bool {
+        let mut inside = false;
+        let mut previous = self.vertices.len() - 1;
+        for current in 0..self.vertices.len() {
+            let a = self.vertices[previous];
+            let b = self.vertices[current];
+            if point_on_segment(point, a, b) {
+                return true;
+            }
+            let crosses = (a.y > point.y) != (b.y > point.y)
+                && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x;
+            if crosses {
+                inside = !inside;
+            }
+            previous = current;
+        }
+        inside
+    }
+}
+
+fn point_distance(a: Point2, b: Point2) -> f64 {
+    (a.x - b.x).hypot(a.y - b.y)
+}
+
+fn point_on_segment(point: Point2, a: Point2, b: Point2) -> bool {
+    let cross = (point.y - a.y) * (b.x - a.x) - (point.x - a.x) * (b.y - a.y);
+    if cross.abs() > 1.0e-8 {
+        return false;
+    }
+    let dot = (point.x - a.x) * (b.x - a.x) + (point.y - a.y) * (b.y - a.y);
+    dot >= -1.0e-8 && dot <= point_distance(a, b).powi(2) + 1.0e-8
+}
+
+fn segments_intersect(a: Point2, b: Point2, c: Point2, d: Point2) -> bool {
+    let orientation =
+        |p: Point2, q: Point2, r: Point2| (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+    let ab_c = orientation(a, b, c);
+    let ab_d = orientation(a, b, d);
+    let cd_a = orientation(c, d, a);
+    let cd_b = orientation(c, d, b);
+    let epsilon = 1.0e-9 * point_distance(a, b).max(point_distance(c, d)).max(1.0);
+
+    if ((ab_c > epsilon && ab_d < -epsilon) || (ab_c < -epsilon && ab_d > epsilon))
+        && ((cd_a > epsilon && cd_b < -epsilon) || (cd_a < -epsilon && cd_b > epsilon))
+    {
+        return true;
+    }
+    (ab_c.abs() <= epsilon && point_on_segment(c, a, b))
+        || (ab_d.abs() <= epsilon && point_on_segment(d, a, b))
+        || (cd_a.abs() <= epsilon && point_on_segment(a, c, d))
+        || (cd_b.abs() <= epsilon && point_on_segment(b, c, d))
 }
 
 /// controller 单次 `poll_next_goal` 输出
@@ -220,6 +443,20 @@ pub trait ExplorationGoalSource: Send {
     fn poll_goal(&mut self, state: &ExplorationStateSnapshot<'_>)
         -> ExploreResult<ExplorationPoll>;
 
+    /// 将 child navigation 终态反馈回 source。无状态 source 可使用默认 no-op。
+    fn report_goal_feedback(
+        &mut self,
+        _goal_id: &str,
+        _feedback: ExplorationGoalFeedback,
+    ) -> ExploreResult<()> {
+        Ok(())
+    }
+
+    /// source 当前可发布的 frontier 快照。默认 source 没有 frontier 视图。
+    fn frontier_snapshot(&self) -> Vec<FrontierGoal> {
+        Vec::new()
+    }
+
     /// 当前 source diagnostics(只读)
     fn diagnostics(&self) -> ExplorationSourceDiagnostics;
 }
@@ -339,16 +576,18 @@ impl ExplorationController {
     /// 结束 exploration;`active == false` 时是 no-op(返回 `Ok(())`),
     /// 但同时记录 `last_stop_reason = Some(UserCancelled)`,便于 diagnostics。
     pub fn end_exploration(&mut self) -> ExploreResult<()> {
-        if !self.active {
-            self.last_stop_reason = Some(ExplorationStopReason::UserCancelled);
-            return Ok(());
+        self.stop_with_reason(ExplorationStopReason::UserCancelled)
+    }
+
+    /// 以明确原因结束 exploration，并按 reverse order 释放全部 source。
+    pub fn stop_with_reason(&mut self, reason: ExplorationStopReason) -> ExploreResult<()> {
+        if self.active {
+            for source in self.sources.iter_mut().rev() {
+                let _ = source.end();
+            }
+            self.active = false;
         }
-        // close in reverse order to mirror begin order symmetry
-        for source in self.sources.iter_mut().rev() {
-            let _ = source.end();
-        }
-        self.active = false;
-        self.last_stop_reason = Some(ExplorationStopReason::UserCancelled);
+        self.last_stop_reason = Some(reason);
         Ok(())
     }
 
@@ -383,6 +622,8 @@ impl ExplorationController {
                 "controller not active".to_string(),
             ));
         }
+
+        self.last_source_diag.clear();
 
         let order = self.arbitration_order();
         let mut best_goal: Option<(f32, usize, FrontierGoal)> = None;
@@ -454,8 +695,9 @@ impl ExplorationController {
                     // Stop 立即结束,不 fallback
                     self.last_selected = Some(source_name.to_string());
                     self.last_stop_reason = Some(reason);
-                    // 仅释放本 source 的 end;其它 source 由上层显式 shutdown。
-                    let _ = self.sources[idx].end();
+                    for source in self.sources.iter_mut().rev() {
+                        let _ = source.end();
+                    }
                     self.active = false;
                     return Ok(ExplorationPoll::Stop(reason));
                 }
@@ -482,6 +724,27 @@ impl ExplorationController {
             // 没有任何 source 被询问(空 sources 情况下 begin 已被 NoSources 截断;此处兜底)
             Ok(ExplorationPoll::Pending)
         }
+    }
+
+    /// 将 child navigation 反馈广播到 source；各 source 按 goal id 自行过滤。
+    pub fn report_goal_feedback(
+        &mut self,
+        goal_id: &str,
+        feedback: ExplorationGoalFeedback,
+    ) -> ExploreResult<()> {
+        for source in &mut self.sources {
+            source.report_goal_feedback(goal_id, feedback.clone())?;
+        }
+        Ok(())
+    }
+
+    /// 合并所有 source 当前 frontier 快照。
+    #[must_use]
+    pub fn frontier_snapshot(&self) -> Vec<FrontierGoal> {
+        self.sources
+            .iter()
+            .flat_map(|source| source.frontier_snapshot())
+            .collect()
     }
 
     /// controller diagnostics
@@ -581,6 +844,7 @@ fn _facade_stop_marker() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
     struct DummySource {
@@ -672,6 +936,141 @@ mod tests {
         assert_eq!(
             ctrl.diagnostics().last_stop_reason,
             Some(ExplorationStopReason::UserCancelled)
+        );
+    }
+
+    #[test]
+    fn stop_reasons_preserve_success_cancel_and_failure_semantics() {
+        assert_eq!(
+            ExplorationStopReason::NoInformationGain.terminal_kind(),
+            ExplorationTerminalKind::Succeeded
+        );
+        assert_eq!(
+            ExplorationStopReason::UserCancelled.terminal_kind(),
+            ExplorationTerminalKind::Cancelled
+        );
+        assert_eq!(
+            ExplorationStopReason::ConsecutiveFailuresExceeded.terminal_kind(),
+            ExplorationTerminalKind::Failed
+        );
+    }
+
+    #[test]
+    fn closed_boundary_contains_inside_and_edge_but_not_outside() {
+        let boundary = ExplorationBoundary::from_vertices(vec![
+            Point2 { x: 0.0, y: 0.0 },
+            Point2 { x: 4.0, y: 0.0 },
+            Point2 { x: 4.0, y: 4.0 },
+            Point2 { x: 0.0, y: 4.0 },
+        ])
+        .unwrap();
+
+        assert!(boundary.contains(Point2 { x: 2.0, y: 2.0 }));
+        assert!(boundary.contains(Point2 { x: 4.0, y: 2.0 }));
+        assert!(!boundary.contains(Point2 { x: 5.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn boundary_rejects_self_intersection_and_zero_area() {
+        let bow_tie = ExplorationBoundary::from_vertices(vec![
+            Point2 { x: 0.0, y: 0.0 },
+            Point2 { x: 2.0, y: 2.0 },
+            Point2 { x: 0.0, y: 2.0 },
+            Point2 { x: 2.0, y: 0.0 },
+        ])
+        .unwrap_err();
+        assert!(bow_tie.to_string().contains("self-intersect"));
+
+        let collinear = ExplorationBoundary::from_vertices(vec![
+            Point2 { x: 0.0, y: 0.0 },
+            Point2 { x: 1.0, y: 0.0 },
+            Point2 { x: 2.0, y: 0.0 },
+        ])
+        .unwrap_err();
+        assert!(collinear.to_string().contains("area is zero"));
+    }
+
+    #[test]
+    fn boundary_segments_still_require_contiguous_closed_order() {
+        let error = ExplorationBoundary::from_segments(vec![
+            BoundarySegment {
+                start: Point2 { x: 0.0, y: 0.0 },
+                end: Point2 { x: 2.0, y: 0.0 },
+            },
+            BoundarySegment {
+                start: Point2 { x: 2.0, y: 1.0 },
+                end: Point2 { x: 1.0, y: 2.0 },
+            },
+            BoundarySegment {
+                start: Point2 { x: 1.0, y: 2.0 },
+                end: Point2 { x: 0.0, y: 0.0 },
+            },
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("contiguous"));
+    }
+
+    struct FeedbackSource {
+        feedback: Arc<Mutex<Vec<(String, ExplorationGoalFeedback)>>>,
+    }
+
+    impl ExplorationGoalSource for FeedbackSource {
+        fn source_name(&self) -> Cow<'static, str> {
+            Cow::Borrowed("wavefront")
+        }
+
+        fn begin(&mut self) -> ExploreResult<()> {
+            Ok(())
+        }
+
+        fn end(&mut self) -> ExploreResult<()> {
+            Ok(())
+        }
+
+        fn poll_goal(
+            &mut self,
+            _state: &ExplorationStateSnapshot<'_>,
+        ) -> ExploreResult<ExplorationPoll> {
+            Ok(ExplorationPoll::Pending)
+        }
+
+        fn report_goal_feedback(
+            &mut self,
+            goal_id: &str,
+            feedback: ExplorationGoalFeedback,
+        ) -> ExploreResult<()> {
+            self.feedback
+                .lock()
+                .unwrap()
+                .push((goal_id.to_string(), feedback));
+            Ok(())
+        }
+
+        fn diagnostics(&self) -> ExplorationSourceDiagnostics {
+            ExplorationSourceDiagnostics {
+                source_name: "wavefront".to_string(),
+                is_active: true,
+                last_goal_id: None,
+                last_error: None,
+            }
+        }
+    }
+
+    #[test]
+    fn controller_routes_child_navigation_feedback_to_sources() {
+        let feedback = Arc::new(Mutex::new(Vec::new()));
+        let mut ctrl = ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
+        ctrl.add_source(FeedbackSource {
+            feedback: feedback.clone(),
+        });
+        ctrl.begin_exploration().unwrap();
+
+        ctrl.report_goal_feedback("child-1", ExplorationGoalFeedback::Reached)
+            .unwrap();
+
+        assert_eq!(
+            feedback.lock().unwrap().as_slice(),
+            &[("child-1".to_string(), ExplorationGoalFeedback::Reached)]
         );
     }
 }

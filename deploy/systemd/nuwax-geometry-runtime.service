@@ -1,20 +1,31 @@
 [Unit]
+# Template: install with scripts/install_motion_guard_deployment.sh.
 Description=nuwax-geometry-runtime（LCM-first geometry native runtime）
 # 独立进程顺序固定为 guard -> nav-stack -> geometry runtime -> Gateway。
 Requires=nuwax-motion-safety-guard.service nuwax-nav-stack.service
+BindsTo=nuwax-motion-safety-guard.service nuwax-nav-stack.service
+PartOf=nuwax-motion-safety-guard.service nuwax-nav-stack.service
 After=network-online.target nuwax-motion-safety-guard.service nuwax-nav-stack.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=nuwax-geometry
-Group=nuwax-geometry
+Group=nuwax-motion-clients
 SupplementaryGroups=nuwax-motion-clients
-WorkingDirectory=/home/unitree/nuwax-robot-bridge
+WorkingDirectory=@NUWAX_REPO_ROOT@
 RuntimeDirectory=nuwax/geometry
 RuntimeDirectoryMode=0750
 UMask=0007
 Environment=PYTHONUNBUFFERED=1
+Environment="NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL=/go2/lidar/points#sensor_msgs.PointCloud2"
+Environment="NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL=/cloud_map#sensor_msgs.PointCloud2"
+Environment="NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope"
+Environment="NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope"
+Environment="NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope"
+Environment="NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope"
+EnvironmentFile=-@NUWAX_REPO_ROOT@/.env
+# EnvironmentFile wins over Environment; Exec* /usr/bin/env assignments below are authoritative.
 # Phase 8 §13.2 / §13.5:production profile 必须显式启用 real-lcm 并打开
 # fail-fast 硬约束,避免 Rust runtime 静默回退 fake-lcm 或启动期 placeholder 退出。
 # 缺 liblcm / 缺 udpm multicast 应当作真实失败,由 systemd 触发 Restart=on-failure。
@@ -23,10 +34,15 @@ Environment=NUWAX_REAL_LCM_REQUIRED=true
 Environment=NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1
 Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
 Environment=NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready
-ExecStartPre=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/systemd/wait_for_motion_guard_socket.sh check
-ExecStartPre=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/systemd/wait_for_nav_stack_ready.sh wait
-ExecStartPre=/usr/bin/rm -f /run/nuwax/geometry/nuwax_geometry_runtime.ready
-ExecStart=/home/unitree/nuwax-robot-bridge/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime
+Environment=NUWAX_GEOMETRY_RUNTIME_PORT=50051
+Environment=NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30
+ExecStartPre=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/check_lcm_multicast.sh
+ExecStartPre=/usr/bin/env NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_motion_guard_socket.sh check
+ExecStartPre=/usr/bin/env NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_NAV_STACK_START_TIMEOUT_SEC=15 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_nav_stack_ready.sh wait
+ExecStartPre=/usr/bin/rm -f /run/nuwax/geometry/nuwax_geometry_runtime.ready /run/nuwax/geometry/nuwax_geometry_runtime.ready.runtime
+ExecStart=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL=/go2/lidar/points#sensor_msgs.PointCloud2" "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL=/cloud_map#sensor_msgs.PointCloud2" "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope" "NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope" NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_REPO_ROOT@/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/start_geometry_runtime.sh
+ExecStartPost=/usr/bin/env NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_geometry_runtime_ready.sh wait
+ExecStopPost=/usr/bin/rm -f /run/nuwax/geometry/nuwax_geometry_runtime.ready /run/nuwax/geometry/nuwax_geometry_runtime.ready.runtime
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure

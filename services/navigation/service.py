@@ -145,8 +145,12 @@ class NavigationService:
                 )
                 current_machine_state = self._state_machine.current_status
                 if current_machine_state != navigation_state.status:
+                    state_summary = self._state_machine.get_state_summary()
                     navigation_state = navigation_state.model_copy(
-                        update={"status": current_machine_state, "message": self._state_machine._status_message},
+                        update={
+                            "status": current_machine_state,
+                            "message": state_summary.get("message"),
+                        },
                         deep=True,
                     )
                 if current_goal is not None and navigation_state.current_goal_id is None:
@@ -281,11 +285,66 @@ class NavigationService:
         self._publish_navigation_event("navigation.goal_set", f"导航目标 {goal.goal_id} 已提交。", goal_id=goal.goal_id)
         return context
 
-    def cancel_goal(self) -> NavigationContext:
-        """取消当前导航目标，使用平台状态机管理取消流程。"""
+    def cancel_goal(self, request_id: Optional[str] = None) -> NavigationContext:
+        """仅取消与后端当前 ACTIVE 状态匹配的 exact goal。"""
 
+        exact_goal_id = str(request_id or "").strip()
+        if not exact_goal_id:
+            raise GatewayError(
+                "导航取消缺少 exact goal_id。",
+                error_code="navigation_goal_identity_unavailable",
+                http_status=409,
+            )
         provider = self._get_navigation_provider()
-        accepted = provider.cancel_goal()
+        try:
+            provider_state = provider.get_navigation_state()
+        except Exception as exc:
+            raise GatewayError(
+                "导航取消前无法读取后端 exact goal 状态。",
+                error_code="navigation_goal_identity_unavailable",
+                http_status=503,
+            ) from exc
+        backend_goal_id = str(
+            getattr(provider_state, "current_goal_id", "") or ""
+        ).strip()
+        raw_status = getattr(provider_state, "status", None)
+        backend_status = str(
+            getattr(raw_status, "value", raw_status) or ""
+        ).strip().lower()
+        observed_goal_id = str(
+            dict(getattr(provider_state, "metadata", {}) or {}).get(
+                "observed_goal_id"
+            )
+            or ""
+        ).strip()
+        with self._lock:
+            local_goal_id = str(
+                getattr(self._current_goal, "goal_id", "") or ""
+            ).strip()
+        if (
+            backend_goal_id != exact_goal_id
+            or (observed_goal_id and observed_goal_id != exact_goal_id)
+            or (local_goal_id and local_goal_id != exact_goal_id)
+            or backend_status
+            not in {
+                NavigationStatus.ACCEPTED.value,
+                NavigationStatus.PLANNING.value,
+                NavigationStatus.RUNNING.value,
+            }
+        ):
+            raise GatewayError(
+                "导航取消 goal_id 与当前活动 exact goal 不匹配。",
+                error_code="navigation_goal_mismatch",
+                http_status=409,
+                details={
+                    "requested_goal_id": exact_goal_id,
+                    "active_goal_id": backend_goal_id or None,
+                    "observed_goal_id": observed_goal_id or None,
+                    "local_goal_id": local_goal_id or None,
+                    "active_status": backend_status or None,
+                },
+            )
+        accepted = provider.cancel_goal(request_id=exact_goal_id)
         if not accepted:
             message = self._navigation_provider_error_message(
                 provider,
@@ -312,7 +371,11 @@ class NavigationService:
                 deep=True,
             )
             self._latest_navigation_context = context
-        self._publish_navigation_event("navigation.goal_cancelled", "导航目标已取消。")
+        self._publish_navigation_event(
+            "navigation.goal_cancelled",
+            "导航目标已取消。",
+            goal_id=exact_goal_id,
+        )
         return context
 
     def get_navigation_diagnostics(self) -> Optional[NavigationDiagnostics]:
@@ -360,7 +423,7 @@ class NavigationService:
                 raise GatewayError(context.navigation_state.message or "导航已取消。")
             if deadline is not None and time.monotonic() >= deadline:
                 try:
-                    self.cancel_goal()
+                    self.cancel_goal(request_id=goal.goal_id)
                 except Exception:
                     LOGGER.exception("导航超时取消失败 goal_id=%s", goal.goal_id)
                 raise GatewayError(
@@ -587,14 +650,47 @@ class NavigationService:
             self._latest_exploration_context = context
         return context
 
-    def stop_exploration(self) -> ExplorationContext:
+    def stop_exploration(
+        self,
+        request_id: Optional[str] = None,
+    ) -> ExplorationContext:
         """停止当前探索任务。"""
 
         provider = self._get_exploration_provider()
+        correlated_request_id = str(request_id or "").strip()
         previous_request = self._current_explore_request
         if previous_request is None and self._latest_exploration_context is not None:
             previous_request = self._latest_exploration_context.current_request
-        provider.stop_exploration()
+        if (
+            correlated_request_id
+            and previous_request is not None
+            and previous_request.request_id != correlated_request_id
+        ):
+            raise GatewayError(
+                "停止探索 request_id 与当前会话不匹配。",
+                error_code="exploration_request_mismatch",
+                http_status=409,
+                details={
+                    "request_id": correlated_request_id,
+                    "active_request_id": previous_request.request_id,
+                },
+            )
+        if correlated_request_id:
+            try:
+                accepted = provider.stop_exploration(
+                    request_id=correlated_request_id
+                )
+            except TypeError as exc:
+                raise GatewayError(
+                    "探索后端不支持 correlated StopExploration request_id。",
+                    error_code="stop_exploration_request_id_unsupported",
+                    http_status=501,
+                    details={"request_id": correlated_request_id},
+                ) from exc
+        else:
+            accepted = provider.stop_exploration()
+        if not accepted:
+            raise GatewayError("探索后端拒绝停止当前任务。")
         context = self.refresh_exploration()
 
         terminal_statuses = {
@@ -602,43 +698,28 @@ class NavigationService:
             ExplorationStatus.FAILED,
             ExplorationStatus.CANCELLED,
         }
-        if context.exploration_state.status in terminal_statuses:
-            if previous_request is not None and context.current_request is None:
-                state_updates = {}
-                if context.exploration_state.current_request_id is None:
-                    state_updates["current_request_id"] = previous_request.request_id
-                if context.exploration_state.strategy is None:
-                    state_updates["strategy"] = previous_request.strategy
-                exploration_state = context.exploration_state
-                if state_updates:
-                    exploration_state = exploration_state.model_copy(update=state_updates, deep=True)
-                context = context.model_copy(
-                    update={
-                        "current_request": previous_request,
-                        "exploration_state": exploration_state,
-                    },
+        if previous_request is not None and context.current_request is None:
+            state_updates = {}
+            if context.exploration_state.current_request_id is None:
+                state_updates["current_request_id"] = previous_request.request_id
+            if context.exploration_state.strategy is None:
+                state_updates["strategy"] = previous_request.strategy
+            exploration_state = context.exploration_state
+            if state_updates:
+                exploration_state = exploration_state.model_copy(
+                    update=state_updates,
                     deep=True,
                 )
-                self._latest_exploration_context = context
-            self._current_explore_request = None
-            return context
-
-        if previous_request is not None:
             context = context.model_copy(
                 update={
                     "current_request": previous_request,
-                    "exploration_state": context.exploration_state.model_copy(
-                        update={
-                            "current_request_id": previous_request.request_id,
-                            "status": ExplorationStatus.CANCELLED,
-                            "message": "探索任务已取消。",
-                        },
-                        deep=True,
-                    ),
+                    "exploration_state": exploration_state,
                 },
                 deep=True,
             )
             self._latest_exploration_context = context
+
+        if context.exploration_state.status in terminal_statuses:
             self._current_explore_request = None
         return context
 
@@ -1096,6 +1177,8 @@ class NavigationService:
     ) -> NavigationDiagnostics:
         """构建平台导航诊断信息。"""
 
+        state_summary = self._state_machine.get_state_summary()
+        recovery_attempts = int(state_summary.get("recovery_attempts") or 0)
         return NavigationDiagnostics(
             backend_name=provider.provider_name,
             backend_status=navigation_state.status.value,
@@ -1103,13 +1186,13 @@ class NavigationService:
             goal_id=self._state_machine.current_goal_id,
             remaining_distance_m=navigation_state.remaining_distance_m,
             remaining_yaw_rad=navigation_state.remaining_yaw_rad,
-            recovery_in_progress=self._state_machine._recovery_attempts > 0,
-            last_error=self._state_machine._last_error,
+            recovery_in_progress=recovery_attempts > 0,
+            last_error=state_summary.get("last_error"),
             metadata={
                 "is_running": self._state_machine.is_running,
                 "is_terminal": self._state_machine.is_terminal,
                 "elapsed_time_sec": self._state_machine.elapsed_time_sec,
-                "recovery_attempts": self._state_machine._recovery_attempts,
+                "recovery_attempts": recovery_attempts,
             },
         )
 

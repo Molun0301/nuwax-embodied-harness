@@ -21,7 +21,7 @@ import mmap
 import struct
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 SHM_MAGIC = 0x4E55_5741_5856_4944
 HEADER_SIZE = 64
@@ -34,7 +34,7 @@ _HEADER_STRUCT = struct.Struct(_HEADER_FMT)
 class VideoShmReader:
     """零拷贝共享内存视频帧读取器。"""
 
-    def __init__(self, shm_path: str | Path):
+    def __init__(self, shm_path: Union[str, Path]):
         self._path = Path(shm_path)
         self._mm: Optional[mmap.mmap] = None
         self._last_seq: int = 0

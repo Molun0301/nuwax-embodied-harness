@@ -1768,6 +1768,7 @@ dependencies = [
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
  "nuwax-nav-types-messages",
+ "prost",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -1809,6 +1810,7 @@ dependencies = [
  "nuwax-nav-patrolling",
  "nuwax-nav-pgo-bridge",
  "nuwax-nav-record",
+ "nuwax-nav-runtime",
  "nuwax-nav-simple-planner",
  "nuwax-nav-terrain-map-ext",
  "nuwax-nav-types-messages",

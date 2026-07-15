@@ -7,7 +7,7 @@ import math
 import os
 from pathlib import Path
 import sys
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, List, Optional, Protocol
 
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 
@@ -42,7 +42,7 @@ class Go2Factories:
     channel_initialize: Callable[..., Any]
     sport_client: Callable[[], Any]
     obstacle_client: Callable[[], Any]
-    low_level_controller: Callable[[str | None], Any]
+    low_level_controller: Callable[[Optional[str]], Any]
 
 
 _ONE_SHOT_SPORT_METHODS = {
@@ -150,7 +150,7 @@ class Go2Actuator:
         *,
         factories: Go2Factories,
         actuator_symbols_sha256: str,
-        dds_iface: str | None,
+        dds_iface: Optional[str],
         timeout_seconds: float,
         max_linear_velocity_mps: float = 0.35,
         max_yaw_rate_rps: float = 0.8,
@@ -181,7 +181,7 @@ class Go2Actuator:
         self._max_body_pose_rad = max_body_pose_rad
         self._obstacle_remote_enabled = False
         self._obstacle_policy_enabled = False
-        self._low_level_controller: Any | None = None
+        self._low_level_controller: Optional[Any] = None
         self._active_mode = pb.CONTROL_MODE_HIGH_LEVEL
 
         if self._dds_iface:
@@ -361,7 +361,7 @@ class Go2Actuator:
         raise ActuatorError("INVALID_ARGUMENT", "sport action is unspecified or unsupported")
 
     def zero(self) -> None:
-        errors: list[str] = []
+        errors: List[str] = []
         try:
             _require_success(
                 self._emergency_obstacle.Move(0.0, 0.0, 0.0),

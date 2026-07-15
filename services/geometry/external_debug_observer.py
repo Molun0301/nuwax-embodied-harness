@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import hashlib
 import logging
 import math
 import os
@@ -11,7 +10,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
-from contracts.maps import OccupancyGrid
 from contracts.navigation import NavigationGoal
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.loop_closure_state import (
@@ -28,8 +26,6 @@ from services.geometry.loop_closure_state import (
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.external_debug_observer")
 
-_DUPLICATE_MAP_SUPPRESS_SEC = 0.2
-_MAP_MAPPING_THROTTLE_SEC = 1.2
 _SESSION_FRONTIER_MODES = frozenset({"explore"})
 _GOAL_FRESH_SEC = 10.0
 _POSE_EMIT_MIN_INTERVAL_SEC = 0.08
@@ -59,12 +55,10 @@ class ExternalGeometryDebugObserver:
         self,
         *,
         config: PlatformGeometryConfig,
-        map_callback: Callable[[Dict[str, object]], None],
         frontier_callback: Callable[[Dict[str, object]], None],
         pose_callback: Optional[Callable[[Pose, Optional[object], Dict[str, object]], None]] = None,
     ) -> None:
         self.config = config
-        self._map_callback = map_callback
         self._frontier_callback = frontier_callback
         self._pose_callback = pose_callback
         self._lock = threading.RLock()
@@ -79,9 +73,6 @@ class ExternalGeometryDebugObserver:
         self._pose_map_topic = str(
             os.environ.get("NUWAX_GEOMETRY_POSE_TOPIC", "/go2/pose_map") or "/go2/pose_map"
         ).strip() or "/go2/pose_map"
-        self._map_message_count = 0
-        self._last_map_signature: Optional[Tuple[object, ...]] = None
-        self._last_map_signature_at = 0.0
         self._frontier_sequence = 0
         self._last_goal: Optional[Dict[str, object]] = None
         self._last_goal_at = 0.0
@@ -94,9 +85,6 @@ class ExternalGeometryDebugObserver:
         self._explore_status_topic = "explore/status"
         self._latest_frontier_markers: List[Dict[str, object]] = []
         self._session_mode: Optional[str] = None
-        self._last_map_emit_monotonic = 0.0
-        self._last_map_emit_content_hash: Optional[str] = None
-        self._last_map_emit_geometry_signature: Optional[Tuple[object, ...]] = None
         # 闭环检测状态（仅由本 observer 单点更新，供 runtime.py 第 8 条判据读取）
         # _loop_closure_state_buffer 始终非 None；threshold 在 _resolve_loop_closure_threshold 中解析。
         self._loop_closure_state_buffer = LoopClosureStateBuffer(
@@ -464,150 +452,6 @@ class ExternalGeometryDebugObserver:
             ),
         )
 
-    @staticmethod
-    def _map_content_hash(msg: Any) -> str:
-        data = list(getattr(msg, "data", []) or [])
-        if not data:
-            return "empty"
-        return hashlib.blake2s(
-            bytes((int(value) + 1) & 0xFF for value in data),
-            digest_size=8,
-        ).hexdigest()
-
-    def _on_map(self, msg: Any) -> None:
-        now_monotonic = time.monotonic()
-        signature = self._map_signature(msg)
-        content_hash = self._map_content_hash(msg)
-        geometry_signature = signature[3:]
-        with self._lock:
-            if (
-                signature == self._last_map_signature
-                and now_monotonic - self._last_map_signature_at <= _DUPLICATE_MAP_SUPPRESS_SEC
-            ):
-                return
-            if self._session_mode in {"mapping", "explore"}:
-                if (
-                    self._last_map_emit_geometry_signature == geometry_signature
-                    and self._last_map_emit_content_hash == content_hash
-                ):
-                    return
-                if (
-                    self._last_map_emit_geometry_signature == geometry_signature
-                    and now_monotonic - self._last_map_emit_monotonic < _MAP_MAPPING_THROTTLE_SEC
-                ):
-                    return
-                self._last_map_emit_monotonic = now_monotonic
-                self._last_map_emit_content_hash = content_hash
-                self._last_map_emit_geometry_signature = geometry_signature
-            self._last_map_signature = signature
-            self._last_map_signature_at = now_monotonic
-            self._map_message_count += 1
-            message_count = self._map_message_count
-        try:
-            payload = self._map_payload_from_msg(msg, message_count=message_count)
-        except Exception:
-            LOGGER.debug("转换 GO2 占据栅格 debug 帧失败。", exc_info=True)
-            return
-        try:
-            self._map_callback(payload)
-        except Exception:
-            LOGGER.debug("投递 GO2 占据栅格 debug 帧失败。", exc_info=True)
-
-    def _map_payload_from_msg(self, msg: Any, *, message_count: int) -> Dict[str, object]:
-        header = getattr(msg, "header", None)
-        info = getattr(msg, "info", None)
-        if info is None:
-            raise ValueError("OccupancyGrid.info missing")
-        width = int(getattr(info, "width", 0) or 0)
-        height = int(getattr(info, "height", 0) or 0)
-        resolution = float(getattr(info, "resolution", 0.0) or 0.0)
-        data = [int(value) for value in list(getattr(msg, "data", []) or [])]
-        if width <= 0 or height <= 0 or resolution <= 0.0 or len(data) != width * height:
-            raise ValueError("invalid occupancy grid dimensions")
-        frame_id = self._normalize_frame_id(
-            str(getattr(header, "frame_id", "") or self.config.frames.map_frame or DEFAULT_MAP_FRAME),
-            DEFAULT_MAP_FRAME,
-        )
-        origin_msg = getattr(info, "origin", None)
-        position_msg = getattr(origin_msg, "position", None)
-        orientation_msg = getattr(origin_msg, "orientation", None)
-        source_timestamp = self._timestamp_from_header(header)
-        received_at = datetime.now(timezone.utc)
-        known_count = sum(1 for value in data if value >= 0)
-        occupied_count = sum(1 for value in data if value >= 50)
-        content_hash = hashlib.blake2s(bytes((value + 1) & 0xFF for value in data), digest_size=8).hexdigest()
-        occupancy_grid = OccupancyGrid(
-            timestamp=source_timestamp or received_at,
-            map_id="go2_rtabnav2:%s:%d" % (self.config.topics.occupancy_topic or "/map_obstacles", message_count),
-            frame_id=frame_id,
-            width=width,
-            height=height,
-            resolution_m=resolution,
-            origin=Pose(
-                timestamp=source_timestamp or received_at,
-                frame_id=frame_id,
-                position=Vector3(
-                    x=float(getattr(position_msg, "x", 0.0) or 0.0),
-                    y=float(getattr(position_msg, "y", 0.0) or 0.0),
-                    z=float(getattr(position_msg, "z", 0.0) or 0.0),
-                ),
-                orientation=Quaternion(
-                    x=float(getattr(orientation_msg, "x", 0.0) or 0.0),
-                    y=float(getattr(orientation_msg, "y", 0.0) or 0.0),
-                    z=float(getattr(orientation_msg, "z", 0.0) or 0.0),
-                    w=float(getattr(orientation_msg, "w", 1.0) or 1.0),
-                ),
-            ),
-            data=data,
-        )
-        metadata = {
-            "event_type": "content_update",
-            "source_kind": "platform_live_map_provider",
-            "source_name": "go2_rtabnav2_debug_observer",
-            "source_topic": str(self.config.topics.occupancy_topic or "/map_obstacles"),
-            "map_composition": "rtabmap_map_plus_cloud_obstacles",
-            "map_excludes_live_scan": True,
-            "map_display_note": "Debug 仅展示 /map_obstacles 静态图层，不叠加 live 雷达扇形",
-            "map_snapshot_kind": "live_streaming",
-            "live_streaming_ready": True,
-            "rtabmap_live_streaming_ready": True,
-            "source_alive": True,
-            "streaming": True,
-            "frame_id": frame_id,
-            "message_count": message_count,
-            "occupancy_message_count": message_count,
-            "occupancy_sequence": message_count,
-            "update_sequence": message_count,
-            "occupancy_content_revision": message_count,
-            "content_revision": message_count,
-            "occupancy_content_hash": content_hash,
-            "content_hash": content_hash,
-            "known_cell_count": known_count,
-            "occupied_cell_count": occupied_count,
-            "last_message_at": received_at.isoformat(),
-            "latest_occupancy_received_at": received_at.isoformat(),
-            "latest_occupancy_timestamp": (source_timestamp or received_at).isoformat(),
-            "latest_occupancy_source_timestamp": (source_timestamp or received_at).isoformat(),
-            "occupancy_metrics": {
-                "content_hash": content_hash,
-                "content_revision": message_count,
-                "known_cell_count": known_count,
-                "occupied_cell_count": occupied_count,
-            },
-        }
-        return {
-            "source_name": "go2_rtabnav2_debug_observer",
-            "occupancy_grid": occupancy_grid,
-            "cost_map": None,
-            "semantic_map": None,
-            "width": width,
-            "height": height,
-            "resolution": resolution,
-            "frame_id": frame_id,
-            "revision": message_count,
-            "metadata": metadata,
-        }
-
     def _on_frontiers(self, msg: Any) -> None:
         status = self._status_from_marker_array(msg)
         goal = self._goal_from_marker_array(msg)
@@ -906,23 +750,6 @@ class ExternalGeometryDebugObserver:
             return None
         return datetime.fromtimestamp(sec + nanosec / 1_000_000_000.0, tz=timezone.utc)
 
-    def _map_signature(self, msg: Any) -> Tuple[object, ...]:
-        header = getattr(msg, "header", None)
-        info = getattr(msg, "info", None)
-        stamp = getattr(header, "stamp", None)
-        origin = getattr(info, "origin", None)
-        position = getattr(origin, "position", None)
-        return (
-            str(getattr(header, "frame_id", "") or ""),
-            int(getattr(stamp, "sec", 0) or 0),
-            int(getattr(stamp, "nanosec", 0) or 0),
-            int(getattr(info, "width", 0) or 0),
-            int(getattr(info, "height", 0) or 0),
-            float(getattr(info, "resolution", 0.0) or 0.0),
-            float(getattr(position, "x", 0.0) or 0.0),
-            float(getattr(position, "y", 0.0) or 0.0),
-        )
-
     # ------------------------------------------------------------------
     # 闭环检测（spec exploration-completion-criteria 第 8 条主路径）
     # ------------------------------------------------------------------
@@ -962,7 +789,7 @@ class ExternalGeometryDebugObserver:
 
     # ------------------------------------------------------------------
     # 手划探索范围几何外扩（spec exploration-boundary）
-    # 单订阅者约束：复用 _on_map 回调订阅的 OccupancyGrid 快照，不另起订阅。
+    # OccupancyGrid 必须由调用方从 geometry runtime gRPC 快照显式注入。
     # ------------------------------------------------------------------
 
     def compute_boundary_polygon(
@@ -1052,12 +879,10 @@ class ExternalGeometryDebugObserver:
         return self._close_polygon(merged)
 
     def _resolve_occupancy_grid_snapshot(self, explicit: Optional[Any]) -> Optional[Any]:
-        """优先使用调用方注入的 grid；否则使用 _on_map 回调最近一次缓存。"""
+        """只使用调用方从 geometry runtime 注入的权威 grid。"""
 
         if explicit is not None:
             return explicit
-        # _on_map 已经把 msg 暂存在 _map_signature/_map_message_count；
-        # 没有缓存时返回 None，调用方降级到"无 occupancy grid 的纯几何外扩"。
         return None
 
     @staticmethod

@@ -16,7 +16,7 @@
 //!   + rotate_left_1(seed + Σ child));
 //! - per-type seed 由 `lcm-gen -c` 在 code-gen 时生成,落地在
 //!   [`crate::hash::STRUCT_SEEDS`];
-//! - 10 个 schema 的 seed 已由本 commit 同步落地;
+//! - repository IDL 与 Rust codec 的 fingerprint 由 cross-language gate 锁定;
 //! - 未注册的 FQN 在 `validate_fqn_registered` 入口 fail-fast,**禁止**
 //!   fallback 到内部 fake hash。
 //!
@@ -183,10 +183,8 @@ pub fn golden_lcm_message(
 ///
 /// payload 总 68 字节:12 bytes marker + 7 个 f64 (= 56 字节)。
 ///
-/// orientation 字段顺序: w 在前 (qw, qx, qy, qz) —— 由 lcm-gen 生成的
-/// `geometry_msgs__PoseStamped.c` 中 `__geometry_msgs__PoseStamped_encode_array`
-/// (lines 75-85) 与 `.lcm` schema (orientation_w/orientation_x/...) 共同决定。
-/// 不得改为 ROS geometry_msgs 习惯的 xyzw 顺序。
+/// orientation 字段顺序为 ROS `geometry_msgs.Quaternion` 的 `(x, y, z, w)`,
+/// 由 repository `PoseStamped.lcm` 与 `lcm-gen 1.5.2` 共同锁定。
 pub fn golden_pose_stamped() -> CodecResult<Bytes> {
     let message = schema::PoseStamped {
         header: schema::Header {

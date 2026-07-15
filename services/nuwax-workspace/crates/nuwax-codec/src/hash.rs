@@ -177,6 +177,91 @@ pub fn murmur_hash64a(key: &[u8]) -> u64 {
     h1
 }
 
+/// Compute a FIPS 180-4 SHA-256 digest without adding a crypto dependency.
+///
+/// Navigation envelopes use this digest as an immutable payload identity, not
+/// as an authentication primitive. Authenticity remains the transport and
+/// process-identity layer's responsibility.
+#[must_use]
+pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    const H_INIT: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut h = H_INIT;
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0_u32; 64];
+        for (index, word) in w.iter_mut().take(16).enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes(chunk[offset..offset + 4].try_into().expect("four bytes"));
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for (word, constant) in w.iter().zip(K) {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(choose)
+                .wrapping_add(constant)
+                .wrapping_add(*word);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(majority);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (target, value) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *target = target.wrapping_add(value);
+        }
+    }
+
+    let mut digest = [0_u8; 32];
+    for (index, value) in h.iter().enumerate() {
+        digest[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    digest
+}
+
 #[inline]
 fn read_le_u64(buf: &[u8], off: usize) -> u64 {
     let mut b = [0u8; 8];
@@ -218,9 +303,10 @@ fn fmix64(mut k: u64) -> u64 {
 /// generated C 反推填写。fixture 在
 /// `tests/golden_real_lcm.rs::test_per_type_seeds_match_upstream_lcm_gen`。
 pub const STRUCT_SEEDS: &[(&str, u64)] = &[
+    ("geometry_msgs.Pose", 0x122b_1a57_1558_bdbb_u64),
     ("geometry_msgs.PoseStamped", 0x3541_34b2_2c61_3cd0_u64),
     ("geometry_msgs.PointStamped", 0xce6b_b239_c753_14d7_u64),
-    ("geometry_msgs.Transform", 0x157d_1f46_5d1a_bf68_u64),
+    ("geometry_msgs.Transform", 0xf72f_fa13_23df_9fc8_u64),
     ("geometry_msgs.Twist", 0x973e_03eb_e6fb_f013_u64),
     ("nav_msgs.Path", 0x61d7_3156_59ab_c9f1_u64),
     ("nav_msgs.Odometry", 0x4a70_bfca_3246_7872_u64),
@@ -228,8 +314,10 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
     ("sensor_msgs.PointCloud2", 0xfaf5_9ed0_e142_98ba_u64),
     ("std_msgs.Bool", 0x0f5f_7835_284a_871f_u64),
     ("tf2_msgs.TFMessage", 0x615c_50e1_9d44_91f6_u64),
-    ("nuwax_msgs.NavigationState", 0x5fec_bf50_c89e_8140_u64),
-    ("nuwax_msgs.CancelNavigation", 0x57dd_e487_b0da_9283_u64),
+    ("nuwax_msgs.GoalEnvelope", 0x2f32_5e81_f8ec_5f8d_u64),
+    ("nuwax_msgs.PathEnvelope", 0x3ef7_743b_477f_90a2_u64),
+    ("nuwax_msgs.NavigationState", 0x7d8c_8a97_877b_2b09_u64),
+    ("nuwax_msgs.CancelNavigation", 0x4b82_2594_74e2_ee91_u64),
     ("nuwax_msgs.Frontier", 0x0d5f_c1f5_0676_ce22_u64),
     ("nuwax_msgs.FrontierList", 0x109e_db47_dc0b_8fbb_u64),
     ("nuwax_msgs.PersonFollowTarget", 0xf313_e184_14b2_f0c6_u64),
@@ -296,5 +384,25 @@ mod tests {
         let a = murmur_hash64a(b"geometry_msgs/Twist");
         let b = murmur_hash64a(b"nav_msgs/Odometry");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sha256_matches_nist_vectors() {
+        assert_eq!(
+            sha256_bytes(b""),
+            [
+                0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+                0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+                0x78, 0x52, 0xb8, 0x55,
+            ]
+        );
+        assert_eq!(
+            sha256_bytes(b"abc"),
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
     }
 }

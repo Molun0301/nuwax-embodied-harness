@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 import os
+from pathlib import Path
 import queue
+import re
 import struct
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Optional, Tuple
 
 
 PERSON_FOLLOW_TARGET_FINGERPRINT = bytes.fromhex("e627c3082965e18d")
@@ -23,9 +25,18 @@ DEFAULT_PERSON_FOLLOW_COMMAND_CHANNEL = "/gateway/person_follow_cmd_vel"
 
 _TARGET_TYPE = "nuwax_msgs.PersonFollowTarget"
 _TWIST_TYPE = "geometry_msgs.Twist"
-_FORBIDDEN_COMMAND_CHANNELS = frozenset({"/cmd_vel", "/nav_cmd_vel"})
+_FORBIDDEN_COMMAND_CHANNELS = frozenset(
+    {"/cmd_vel", "/nav_cmd_vel", "/nav/cmd_vel"}
+)
 _TWIST_SIZE = 8 + 6 * 8
 _ZERO_EPSILON = 1e-12
+_READY_KEYS = frozenset({"pid", "boot_id", "starttime", "subscriptions_ready"})
+_BOOT_ID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
 class PersonFollowBridgeError(RuntimeError):
@@ -38,6 +49,167 @@ class PersonFollowBridgeUnavailable(PersonFollowBridgeError):
 
 class PersonFollowBridgeTimeout(PersonFollowBridgeError):
     pass
+
+
+@dataclass(frozen=True)
+class PersonFollowReadiness:
+    enabled: bool
+    ready: bool
+    ready_file: str
+    reason: str
+    pid: Optional[int] = None
+    boot_id: Optional[str] = None
+    starttime: Optional[str] = None
+    subscriptions_ready: bool = False
+
+
+def _parse_enabled(value: Optional[str]) -> Optional[bool]:
+    normalized = str(value or "true").strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    return None
+
+
+def _resolve_person_follow_ready_file(
+    environ: Mapping[str, str],
+    repo_root: Optional[Path],
+) -> Path:
+    configured = str(environ.get("NUWAX_PERSON_FOLLOW_READY_FILE") or "").strip()
+    if configured:
+        return Path(configured)
+    managed = _parse_enabled(
+        environ.get("NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD", "false")
+    )
+    if managed:
+        return Path("/run/nuwax/person-follow/nuwax_person_follow.ready")
+    root = repo_root or Path(__file__).resolve().parent.parent
+    return root / "runtime_data/person-follow/nuwax_person_follow.ready"
+
+
+def _read_process_starttime(proc_root: Path, pid: int) -> Optional[str]:
+    try:
+        stat_line = (proc_root / str(pid) / "stat").read_text(
+            encoding="utf-8"
+        ).strip()
+    except (OSError, UnicodeError):
+        return None
+    if ") " not in stat_line:
+        return None
+    fields = stat_line.rsplit(") ", 1)[1].split()
+    if len(fields) <= 19:
+        return None
+    starttime = fields[19]
+    if not starttime.isdigit() or int(starttime) <= 0:
+        return None
+    return starttime
+
+
+def read_person_follow_readiness(
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    repo_root: Optional[Path] = None,
+    proc_root: Path = Path("/proc"),
+) -> PersonFollowReadiness:
+    """严格验证 person-follow ready marker 与当前进程身份。"""
+
+    source = os.environ if environ is None else environ
+    enabled = _parse_enabled(source.get("NUWAX_PERSON_FOLLOW_AUTOSTART"))
+    ready_file = _resolve_person_follow_ready_file(source, repo_root)
+    if enabled is False:
+        return PersonFollowReadiness(
+            enabled=False,
+            ready=False,
+            ready_file=str(ready_file),
+            reason="disabled",
+        )
+    if enabled is None:
+        return PersonFollowReadiness(
+            enabled=True,
+            ready=False,
+            ready_file=str(ready_file),
+            reason="invalid_autostart_config",
+        )
+    if ready_file.is_symlink() or not ready_file.is_file():
+        return PersonFollowReadiness(
+            enabled=True,
+            ready=False,
+            ready_file=str(ready_file),
+            reason="ready_file_missing",
+        )
+    try:
+        lines = ready_file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return PersonFollowReadiness(
+            enabled=True,
+            ready=False,
+            ready_file=str(ready_file),
+            reason="ready_file_unreadable",
+        )
+    values = {}
+    for line in lines:
+        if "=" not in line:
+            values = {}
+            break
+        key, value = line.split("=", 1)
+        if key not in _READY_KEYS or key in values:
+            values = {}
+            break
+        values[key] = value
+    if set(values) != set(_READY_KEYS):
+        return PersonFollowReadiness(
+            enabled=True,
+            ready=False,
+            ready_file=str(ready_file),
+            reason="invalid_ready_marker",
+        )
+    pid_text = values["pid"]
+    starttime = values["starttime"]
+    boot_id = values["boot_id"].lower()
+    if (
+        not pid_text.isdigit()
+        or int(pid_text) <= 0
+        or not starttime.isdigit()
+        or int(starttime) <= 0
+        or values["subscriptions_ready"] != "1"
+        or _BOOT_ID_PATTERN.fullmatch(boot_id) is None
+    ):
+        return PersonFollowReadiness(
+            enabled=True,
+            ready=False,
+            ready_file=str(ready_file),
+            reason="invalid_ready_marker",
+        )
+    pid = int(pid_text)
+    try:
+        current_boot_id = (
+            proc_root / "sys/kernel/random/boot_id"
+        ).read_text(encoding="utf-8").strip().lower()
+    except (OSError, UnicodeError):
+        current_boot_id = ""
+    current_starttime = _read_process_starttime(proc_root, pid)
+    if boot_id != current_boot_id or starttime != current_starttime:
+        return PersonFollowReadiness(
+            enabled=True,
+            ready=False,
+            ready_file=str(ready_file),
+            reason="stale_process_identity",
+            pid=pid,
+            boot_id=boot_id,
+            starttime=starttime,
+            subscriptions_ready=True,
+        )
+    return PersonFollowReadiness(
+        enabled=True,
+        ready=True,
+        ready_file=str(ready_file),
+        reason="ready",
+        pid=pid,
+        boot_id=boot_id,
+        starttime=starttime,
+        subscriptions_ready=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -65,8 +237,8 @@ class PersonFollowTarget:
 
 @dataclass(frozen=True)
 class TwistCommand:
-    linear: tuple[float, float, float]
-    angular: tuple[float, float, float]
+    linear: Tuple[float, float, float]
+    angular: Tuple[float, float, float]
 
     @property
     def is_zero(self) -> bool:
@@ -78,7 +250,7 @@ class _ControlRequest:
     operation: Callable[[], Any]
     completed: threading.Event
     result: Any = None
-    error: BaseException | None = None
+    error: Optional[BaseException] = None
 
 
 @dataclass
@@ -93,7 +265,7 @@ class _SessionBinding:
     fence_session: Callable[[Any], Any]
     target_timeout_sec: float
     last_target_at: float
-    last_target: PersonFollowTarget | None = None
+    last_target: Optional[PersonFollowTarget] = None
 
 
 def _typed_channel(channel: str, message_type: str) -> str:
@@ -221,7 +393,7 @@ def build_person_follow_target(
     session_id: str,
     query: str,
     perception_context: Any,
-    detection: Any | None,
+    detection: Optional[Any],
     tracking_state: int,
 ) -> PersonFollowTarget:
     camera_info = getattr(perception_context, "camera_info", None)
@@ -276,9 +448,9 @@ class GatewayPersonFollowBridge:
     def __init__(
         self,
         *,
-        lcm_url: str | None = None,
-        target_channel: str | None = None,
-        command_channel: str | None = None,
+        lcm_url: Optional[str] = None,
+        target_channel: Optional[str] = None,
+        command_channel: Optional[str] = None,
         lcm_factory: Callable[[str], Any] = _default_lcm_factory,
         monotonic: Callable[[], float] = time.monotonic,
         operation_timeout_sec: float = 1.0,
@@ -298,7 +470,8 @@ class GatewayPersonFollowBridge:
         )
         if self.command_channel in _FORBIDDEN_COMMAND_CHANNELS:
             raise PersonFollowBridgeError(
-                "PersonFollow command output must not use /cmd_vel or /nav_cmd_vel"
+                "PersonFollow command output requires a dedicated channel; "
+                "/cmd_vel, /nav_cmd_vel, and /nav/cmd_vel are forbidden"
             )
         self._typed_target_channel = _typed_channel(self.target_channel, _TARGET_TYPE)
         self._typed_command_channel = _typed_channel(self.command_channel, _TWIST_TYPE)
@@ -319,16 +492,16 @@ class GatewayPersonFollowBridge:
         self._ready = threading.Event()
         self._stop_requested = threading.Event()
         self._state_lock = threading.RLock()
-        self._thread: threading.Thread | None = None
-        self._owner_thread_id: int | None = None
+        self._thread: Optional[threading.Thread] = None
+        self._owner_thread_id: Optional[int] = None
         self._started = False
         self._closing = False
-        self._fatal_error: PersonFollowBridgeError | None = None
+        self._fatal_error: Optional[PersonFollowBridgeError] = None
         self._lcm = None
         self._subscription = None
-        self._barrier: _ZeroBarrier | None = None
-        self._binding: _SessionBinding | None = None
-        self._session_error: tuple[str, PersonFollowBridgeError] | None = None
+        self._barrier: Optional[_ZeroBarrier] = None
+        self._binding: Optional[_SessionBinding] = None
+        self._session_error: Optional[Tuple[str, PersonFollowBridgeError]] = None
 
     @property
     def started(self) -> bool:
@@ -371,7 +544,7 @@ class GatewayPersonFollowBridge:
             if thread is None:
                 return
             self._closing = True
-        close_error: BaseException | None = None
+        close_error: Optional[BaseException] = None
         if started and thread.is_alive():
             try:
                 self._call(self._shutdown)
@@ -395,7 +568,7 @@ class GatewayPersonFollowBridge:
         self,
         stop_target: PersonFollowTarget,
         *,
-        timeout_sec: float | None = None,
+        timeout_sec: Optional[float] = None,
     ) -> None:
         if stop_target.tracking_state != PERSON_FOLLOW_STOP:
             raise PersonFollowBridgeError("session barrier requires a STOP target")
@@ -619,12 +792,12 @@ class GatewayPersonFollowBridge:
         payload: bytes,
         reason: str,
     ) -> None:
-        publish_error: BaseException | None = None
+        publish_error: Optional[BaseException] = None
         try:
             self._lcm.publish(self._typed_target_channel, payload)
         except BaseException as exc:
             publish_error = exc
-        fence_error: BaseException | None = None
+        fence_error: Optional[BaseException] = None
         try:
             self._fence_active(reason)
         except BaseException as exc:
@@ -685,7 +858,7 @@ class GatewayPersonFollowBridge:
         self,
         error: PersonFollowBridgeError,
         *,
-        cause: BaseException | None = None,
+        cause: Optional[BaseException] = None,
     ) -> None:
         binding = self._binding
         if binding is None:
@@ -712,7 +885,7 @@ class GatewayPersonFollowBridge:
 
     def _shutdown(self) -> None:
         binding = self._binding
-        publish_error: BaseException | None = None
+        publish_error: Optional[BaseException] = None
         if binding is not None and binding.last_target is not None:
             try:
                 self._lcm.publish(
@@ -741,9 +914,11 @@ __all__ = [
     "PersonFollowBridgeError",
     "PersonFollowBridgeTimeout",
     "PersonFollowBridgeUnavailable",
+    "PersonFollowReadiness",
     "PersonFollowTarget",
     "TwistCommand",
     "build_person_follow_target",
     "decode_twist_command",
     "encode_person_follow_target",
+    "read_person_follow_readiness",
 ]

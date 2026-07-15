@@ -30,6 +30,7 @@ import errno
 import fcntl
 import os
 from pathlib import Path
+from typing import Optional
 
 # 锁文件路径硬编码 —— 与 scripts/start_gateway.sh:484 默认值不同
 # （bash 端默认 ``runtime_data/gateway/start_gateway.lock``），
@@ -48,7 +49,7 @@ class LockBusy(RuntimeError):
     渲染中文 remediation。``acquire_lock(timeout=0)`` 唯一抛出场景。
     """
 
-    def __init__(self, lock_path: Path, holder_pid: int | None = None) -> None:
+    def __init__(self, lock_path: Path, holder_pid: Optional[int] = None) -> None:
         self.lock_path = lock_path
         self.holder_pid = holder_pid
         super().__init__(
@@ -57,7 +58,7 @@ class LockBusy(RuntimeError):
 
 
 # 模块级 FD，避免 acquire/release 跨调用句柄漂移
-_fd: int | None = None
+_fd: Optional[int] = None
 
 
 def _ensure_lockfile(lock_path: Path) -> None:
@@ -150,7 +151,7 @@ def is_held() -> bool:
     return _fd is not None
 
 
-def current_holder_pid() -> int | None:
+def current_holder_pid() -> Optional[int]:
     """读锁文件首行解析持有者 PID（供 health phase 比对）。
 
     与 ``acquire_lock`` 写入的 PID 同源；其他进程（bash 端）持锁时
@@ -159,7 +160,7 @@ def current_holder_pid() -> int | None:
     return _try_read_pid(LOCK_FILE)
 
 
-def _try_read_pid(lock_path: Path) -> int | None:
+def _try_read_pid(lock_path: Path) -> Optional[int]:
     """从锁文件首行尝试解析 PID；解析失败返回 None。"""
     try:
         with open(lock_path, "r", encoding="utf-8") as fp:

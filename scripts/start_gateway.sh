@@ -100,6 +100,14 @@ person_follow_autostart_enabled() {
   is_truthy "${NUWAX_PERSON_FOLLOW_AUTOSTART:-true}"
 }
 
+default_gateway_lock_file() {
+  if [[ -d /run/nuwax/gateway ]]; then
+    printf '%s' /run/nuwax/gateway/start_gateway.lock
+    return
+  fi
+  printf '%s' "${REPO_ROOT}/runtime_data/gateway/start_gateway.lock"
+}
+
 validate_person_follow_monitor_interval() {
   local interval="${NUWAX_PERSON_FOLLOW_MONITOR_INTERVAL_SEC:-0.5}"
   if [[ ! "${interval}" =~ ^[0-9]+([.][0-9]+)?$ || "${interval}" =~ ^0+([.]0+)?$ ]]; then
@@ -149,26 +157,9 @@ wait_for_motion_guard_transport() {
 
 wait_for_geometry_runtime_ready() {
   local ready_file="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
-  local timeout_sec="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT:-30}"
-  local attempts=0
-  case "${timeout_sec}" in
-    ''|*[!0-9]*)
-      echo "invalid NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=${timeout_sec}" >&2
-      return 1
-      ;;
-  esac
-  attempts=$((timeout_sec * 10 + 1))
-
-  for ((attempt = 0; attempt < attempts; attempt++)); do
-    if [[ -f "${ready_file}" ]]; then
-      echo "nuwax-geometry-runtime ready: ${ready_file}"
-      return 0
-    fi
-    sleep 0.1
-  done
-
-  echo "nuwax-geometry-runtime ready file missing after ${timeout_sec}s: ${ready_file}" >&2
-  return 1
+  NUWAX_GEOMETRY_RUNTIME_READY_FILE="${ready_file}" \
+    bash "${REPO_ROOT}/scripts/systemd/wait_for_geometry_runtime_ready.sh" wait
+  echo "nuwax-geometry-runtime ready: ${ready_file}"
 }
 
 wait_for_nav_stack_ready() {
@@ -177,6 +168,13 @@ wait_for_nav_stack_ready() {
   NUWAX_NAV_STACK_READY_FILE="${ready_file}" \
     bash "${helper}" wait
   echo "nuwax-nav-stack ready: ${ready_file}"
+}
+
+wait_for_person_follow_ready() {
+  local ready_file="${NUWAX_PERSON_FOLLOW_READY_FILE:-${REPO_ROOT}/runtime_data/person-follow/nuwax_person_follow.ready}"
+  NUWAX_PERSON_FOLLOW_READY_FILE="${ready_file}" \
+    bash "${REPO_ROOT}/scripts/systemd/wait_for_person_follow_ready.sh" wait
+  echo "nuwax-person-follow ready: ${ready_file}"
 }
 
 run_with_title() {
@@ -385,7 +383,7 @@ cleanup_stale_geometry_runtime_processes() {
     fi
   fi
 
-  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm 2>/dev/null || true
 }
 
 cleanup_stale_person_follow_processes() {
@@ -526,8 +524,8 @@ status_gateway() {
 }
 
 should_start_geometry_runtime() {
-  local binary="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
-  [[ -x "${binary}" ]] && is_truthy "${NUWAX_GEOMETRY_RUNTIME_ENABLED:-true}"
+  local binary="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
+  [[ -x "${binary}" ]] && is_truthy "${NUWAX_GEOMETRY_EXTERNAL_ENABLED:-true}"
 }
 
 should_start_nav_stack() {
@@ -566,7 +564,7 @@ start_nav_stack() {
 
   local launcher="${REPO_ROOT}/scripts/systemd/start_nav_stack.sh"
   export NUWAX_NAV_STACK_READY_FILE="${NUWAX_NAV_STACK_READY_FILE:-${REPO_ROOT}/runtime_data/navigation/nuwax_nav_stack.ready}"
-  export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
+  export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
   echo "starting nuwax-nav-stack profile=${NUWAX_NAV_PROFILE:-simple-2d}"
   (run_with_title "nuwax-nav-stack-launcher" bash "${launcher}") &
   NAV_STACK_PID="$!"
@@ -592,15 +590,16 @@ start_geometry_runtime() {
     wait_for_geometry_runtime_ready
     return
   fi
-  if ! is_truthy "${NUWAX_GEOMETRY_RUNTIME_ENABLED:-true}"; then
-    echo "nuwax-geometry-runtime disabled by NUWAX_GEOMETRY_RUNTIME_ENABLED"
+  if ! is_truthy "${NUWAX_GEOMETRY_EXTERNAL_ENABLED:-true}"; then
+    echo "nuwax-geometry-runtime disabled by NUWAX_GEOMETRY_EXTERNAL_ENABLED"
     return 0
   fi
   if ! should_start_geometry_runtime; then
     echo "nuwax-geometry-runtime is enabled but its binary is not executable" >&2
     return 1
   fi
-  local binary="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
+  local binary="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
+  local launcher="${REPO_ROOT}/scripts/systemd/start_geometry_runtime.sh"
   echo "starting nuwax-geometry-runtime: ${binary}"
   (
     set +u
@@ -608,31 +607,31 @@ start_geometry_runtime() {
     source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
     export NUWAX_GEOMETRY_RUNTIME_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
     export NUWAX_GEOMETRY_RUNTIME_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
-    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
-    run_with_title "nuwax-geometry-runtime" "${binary}"
+    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
+    export NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL:-${NUWAX_LCM_CHANNEL_POINTCLOUD:-/go2/lidar/points#sensor_msgs.PointCloud2}}"
+    export NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL:-${NUWAX_LCM_CHANNEL_CLOUD_MAP:-/cloud_map#sensor_msgs.PointCloud2}}"
+    export NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL="/nav/goal#nuwax_msgs.GoalEnvelope"
+    export NUWAX_LCM_CHANNEL_GOAL_POSE="/nav/goal#nuwax_msgs.GoalEnvelope"
+    export NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL="/nav/path#nuwax_msgs.PathEnvelope"
+    export NUWAX_LCM_CHANNEL_NAV_PATH="/nav/path#nuwax_msgs.PathEnvelope"
+    export NUWAX_GEOMETRY_RUNTIME_BINARY="${binary}"
+    run_with_title "nuwax-geometry-runtime-launcher" bash "${launcher}"
   ) &
   GEOMETRY_RUNTIME_PID="$!"
-  # 等待 ready file
-  local waited=0
-  local ready_file="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
-  while [[ ! -f "${ready_file}" ]] && [[ "${waited}" -lt 10 ]]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-  if [[ -f "${ready_file}" ]]; then
-    echo "nuwax-geometry-runtime ready (pid ${GEOMETRY_RUNTIME_PID})"
-  else
-    echo "nuwax-geometry-runtime ready file 未在 10s 内出现" >&2
-    terminate_process_scope "${GEOMETRY_RUNTIME_PID}" "unready nuwax-geometry-runtime"
-    GEOMETRY_RUNTIME_PID=""
-    return 1
+  if wait_for_geometry_runtime_ready; then
+    echo "nuwax-geometry-runtime healthy (launcher pid ${GEOMETRY_RUNTIME_PID})"
+    return 0
   fi
+  terminate_process_scope "${GEOMETRY_RUNTIME_PID}" "unready nuwax-geometry-runtime"
+  wait "${GEOMETRY_RUNTIME_PID}" >/dev/null 2>&1 || true
+  GEOMETRY_RUNTIME_PID=""
+  return 1
 }
 
 start_person_follow() {
   local binary=""
   local status=1
-  local warmup_steps="${NUWAX_PERSON_FOLLOW_WARMUP_STEPS:-10}"
+  local launcher="${REPO_ROOT}/scripts/systemd/start_person_follow.sh"
 
   if [[ -n "${PERSON_FOLLOW_PID}" ]] && person_follow_is_alive "${PERSON_FOLLOW_PID}"; then
     return 0
@@ -651,17 +650,6 @@ start_person_follow() {
   if ! validate_person_follow_monitor_interval; then
     return 1
   fi
-  case "${warmup_steps}" in
-    ''|*[!0-9]*)
-      echo "invalid NUWAX_PERSON_FOLLOW_WARMUP_STEPS=${warmup_steps}" >&2
-      return 1
-      ;;
-  esac
-  if [[ "${warmup_steps}" -le 0 ]]; then
-    echo "NUWAX_PERSON_FOLLOW_WARMUP_STEPS must be greater than zero" >&2
-    return 1
-  fi
-
   binary="$(person_follow_binary)"
   echo "starting nuwax-person-follow: ${binary}"
   (
@@ -670,28 +658,25 @@ start_person_follow() {
     export NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL="${PERSON_FOLLOW_POINTCLOUD_CHANNEL}"
     export NUWAX_PERSON_FOLLOW_TF_CHANNEL="${PERSON_FOLLOW_TF_CHANNEL}"
     export NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL="${PERSON_FOLLOW_COMMAND_CHANNEL}"
-    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
-    run_with_title "nuwax-person-follow" "${binary}"
+    export NUWAX_PERSON_FOLLOW_READY_FILE="${NUWAX_PERSON_FOLLOW_READY_FILE:-${REPO_ROOT}/runtime_data/person-follow/nuwax_person_follow.ready}"
+    export NUWAX_PERSON_FOLLOW_BINARY="${binary}"
+    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
+    run_with_title "nuwax-person-follow-launcher" bash "${launcher}"
   ) &
   PERSON_FOLLOW_PID="$!"
 
-  for ((step = 0; step < warmup_steps; step++)); do
-    if ! person_follow_is_alive "${PERSON_FOLLOW_PID}"; then
-      break
-    fi
-    sleep 0.1
-  done
-  if person_follow_is_alive "${PERSON_FOLLOW_PID}"; then
-    echo "nuwax-person-follow healthy (pid ${PERSON_FOLLOW_PID})"
+  if wait_for_person_follow_ready; then
+    echo "nuwax-person-follow healthy (launcher pid ${PERSON_FOLLOW_PID})"
     return 0
   fi
 
+  terminate_person_follow_scope "${PERSON_FOLLOW_PID}"
   if wait "${PERSON_FOLLOW_PID}"; then
     status=0
   else
     status="$?"
   fi
-  echo "nuwax-person-follow exited during startup warmup with status ${status}" >&2
+  echo "nuwax-person-follow failed subscription readiness with status ${status}" >&2
   PERSON_FOLLOW_PID=""
   return 1
 }
@@ -728,7 +713,7 @@ stop_geometry_runtime() {
     wait "${GEOMETRY_RUNTIME_PID}" >/dev/null 2>&1 || true
   fi
   GEOMETRY_RUNTIME_PID=""
-  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+  rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm 2>/dev/null || true
   rm -f "${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}" 2>/dev/null || true
 }
 
@@ -765,7 +750,7 @@ monitor_geometry_runtime() {
     sleep 5
     if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && ! is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
       echo "nuwax-geometry-runtime (pid ${GEOMETRY_RUNTIME_PID}) crashed, restarting..." >&2
-      rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm /tmp/nuwax_pointcloud.shm 2>/dev/null || true
+      rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm 2>/dev/null || true
       GEOMETRY_RUNTIME_PID=""
       start_geometry_runtime
     fi
@@ -905,7 +890,7 @@ fi
 
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
 PID_FILE="${NUWAX_GATEWAY_PID_FILE:-${REPO_ROOT}/runtime_data/gateway/gateway.pid}"
-LOCK_FILE="${NUWAX_GATEWAY_LOCK_FILE:-${REPO_ROOT}/runtime_data/gateway/start_gateway.lock}"
+LOCK_FILE="${NUWAX_GATEWAY_LOCK_FILE:-$(default_gateway_lock_file)}"
 HOST="${NUWAX_GATEWAY_HOST:-0.0.0.0}"
 PORT="${NUWAX_GATEWAY_PORT:-8766}"
 acquire_script_lock "${LOCK_FILE}"
@@ -951,6 +936,10 @@ export NUWAX_PERSON_FOLLOW_TARGET_CHANNEL="${PERSON_FOLLOW_TARGET_CHANNEL}"
 export NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL="${PERSON_FOLLOW_POINTCLOUD_CHANNEL}"
 export NUWAX_PERSON_FOLLOW_TF_CHANNEL="${PERSON_FOLLOW_TF_CHANNEL}"
 export NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL="${PERSON_FOLLOW_COMMAND_CHANNEL}"
+export NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL="/nav/goal#nuwax_msgs.GoalEnvelope"
+export NUWAX_LCM_CHANNEL_GOAL_POSE="/nav/goal#nuwax_msgs.GoalEnvelope"
+export NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL="/nav/path#nuwax_msgs.PathEnvelope"
+export NUWAX_LCM_CHANNEL_NAV_PATH="/nav/path#nuwax_msgs.PathEnvelope"
 export GO2_VIDEO_STREAM_GATEWAY_URL="${GO2_VIDEO_STREAM_GATEWAY_URL:-ws://127.0.0.1:${PORT}/streams/video.ingest}"
 # 个人机器狗：网关不鉴权，视频推流令牌默认留空（如需可单独设置 GO2_VIDEO_STREAM_ACCESS_TOKEN）。
 export GO2_VIDEO_STREAM_ACCESS_TOKEN="${GO2_VIDEO_STREAM_ACCESS_TOKEN:-}"

@@ -11,7 +11,7 @@
 //! (本进程内部 alias) 按优先级统一:
 //!
 //! 1. `NUWAX_GEOMETRY_RUNTIME_<NAME>_CHANNEL` —— 本进程内直读(Phase 1 channel
-//!    registry 补齐的 4 类 typed channel:pose/odom/cmd_vel/nav_cancel)
+//!    registry 补齐的 typed channel:odom/cmd_vel/nav_cancel 等)
 //! 2. `NUWAX_LCM_CHANNEL_<NAME>` —— 平台级 Python contract 默认
 //! 3. 内置 default(本文件固化,仅在 CI/contract test 改)
 //!
@@ -53,16 +53,14 @@ use tracing::warn;
 pub enum ChannelKey {
     Odom,
     Tf,
-    TfStatic,
     PointCloud,
+    CloudMap,
     Occupancy,
     CmdVel,
-    InitialPose,
     GoalPose,
     NavState,
     Frontiers,
     Cancel,
-    OccTopic,
 }
 
 /// `(env_runtime_key, env_platform_key, default_channel_without_suffix, default_msg_type)`
@@ -85,17 +83,17 @@ const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
         "tf2_msgs.TFMessage",
     ),
     (
-        ChannelKey::TfStatic,
-        "",
-        "NUWAX_LCM_CHANNEL_TF_STATIC",
-        "/tf_static",
-        "tf2_msgs.TFMessage",
-    ),
-    (
         ChannelKey::PointCloud,
-        "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+        "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL",
         "NUWAX_LCM_CHANNEL_POINTCLOUD",
         "/go2/lidar/points",
+        "sensor_msgs.PointCloud2",
+    ),
+    (
+        ChannelKey::CloudMap,
+        "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+        "NUWAX_LCM_CHANNEL_CLOUD_MAP",
+        "/cloud_map",
         "sensor_msgs.PointCloud2",
     ),
     (
@@ -111,13 +109,6 @@ const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
         "NUWAX_LCM_CHANNEL_CMD_VEL",
         "/cmd_vel",
         "geometry_msgs.Twist",
-    ),
-    (
-        ChannelKey::InitialPose,
-        "",
-        "NUWAX_LCM_CHANNEL_INITIAL_POSE",
-        "/localization/initial_pose",
-        "geometry_msgs.PoseWithCovarianceStamped",
     ),
     (
         ChannelKey::GoalPose,
@@ -146,13 +137,6 @@ const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
         "NUWAX_LCM_CHANNEL_NAV_CANCEL",
         "/nav/cancel",
         "nuwax_msgs.CancelNavigation",
-    ),
-    (
-        ChannelKey::OccTopic,
-        "",
-        "NUWAX_LCM_CHANNEL_OCC_TOPIC",
-        "/map/occupancy",
-        "nav_msgs.OccupancyGrid",
     ),
 ];
 
@@ -287,6 +271,11 @@ pub const TYPED_CHANNELS: &[(&str, &str, &str)] = &[
     // cloud map (cumulative point cloud) —— R-N5a 修复:默认与 start.sh + .env.example
     // 对齐 `/cloud_map`(累积点云地图),与 POINTCLOUD 实时流 `/go2/lidar/points` 区分。
     (
+        "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL",
+        "NUWAX_LCM_CHANNEL_POINTCLOUD",
+        "/go2/lidar/points#sensor_msgs.PointCloud2",
+    ),
+    (
         "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
         "NUWAX_LCM_CHANNEL_CLOUD_MAP",
         "/cloud_map#sensor_msgs.PointCloud2",
@@ -305,12 +294,6 @@ pub const TYPED_CHANNELS: &[(&str, &str, &str)] = &[
         "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL",
         "NUWAX_LCM_CHANNEL_FRONTIER",
         "/explore/frontiers#nuwax_msgs.FrontierList",
-    ),
-    // pose stamped (Phase 1)
-    (
-        "NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL",
-        "NUWAX_LCM_CHANNEL_POSE_STAMPED",
-        "/pose_stamped#geometry_msgs.PoseStamped",
     ),
     // odometry (Phase 1)
     (
@@ -422,5 +405,20 @@ mod tests {
         let got = resolve_channel("TEST_RUNTIME_Y", "TEST_PLATFORM_Y", "/df#y.Df");
         assert_eq!(got, "/pf#y.Pf");
         std::env::remove_var("TEST_PLATFORM_Y");
+    }
+
+    #[test]
+    fn raw_pointcloud_and_cloud_map_have_distinct_contracts() {
+        let (_, raw_runtime, raw_platform, raw_default, raw_type) = lookup(ChannelKey::PointCloud);
+        let (_, map_runtime, map_platform, map_default, map_type) = lookup(ChannelKey::CloudMap);
+
+        assert_eq!(raw_runtime, "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL");
+        assert_eq!(raw_platform, "NUWAX_LCM_CHANNEL_POINTCLOUD");
+        assert_eq!(raw_default, "/go2/lidar/points");
+        assert_eq!(map_runtime, "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL");
+        assert_eq!(map_platform, "NUWAX_LCM_CHANNEL_CLOUD_MAP");
+        assert_eq!(map_default, "/cloud_map");
+        assert_eq!(raw_type, "sensor_msgs.PointCloud2");
+        assert_eq!(map_type, "sensor_msgs.PointCloud2");
     }
 }

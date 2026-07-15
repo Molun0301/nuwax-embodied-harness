@@ -97,6 +97,21 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.CloudMapShmRef.FromString,
                 _registered_method=True)
+        self.StartMapping = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/StartMapping',
+                request_serializer=geometry__runtime__pb2.StartMappingRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.MappingSessionState.FromString,
+                _registered_method=True)
+        self.StopMapping = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/StopMapping',
+                request_serializer=geometry__runtime__pb2.StopMappingRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.MappingSessionState.FromString,
+                _registered_method=True)
+        self.GetMappingState = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetMappingState',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.MappingSessionState.FromString,
+                _registered_method=True)
         self.SetNavigationGoal = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/SetNavigationGoal',
                 request_serializer=geometry__runtime__pb2.NavigationGoal.SerializeToString,
@@ -255,6 +270,24 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StartMapping(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StopMapping(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetMappingState(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def SetNavigationGoal(self, request, context):
         """导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
         """
@@ -295,9 +328,8 @@ class GeometryRuntimeServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def SetCmdVelSinkReady(self, request, context):
-        """cmd_vel sink readiness 写回(control plane):Python LcmMotionCommandBridge
-        在 start/stop 时调本接口把 sink ready 状态同步到 Rust handle,
-        让 `SetNavigationGoal` 的 readiness 拒绝链路读到真实状态。
+        """Legacy compatibility only; authoritative readiness comes from the
+        generation-fenced motion guard owner.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -422,6 +454,21 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.SubscribeCloudMapUpdates,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.CloudMapShmRef.SerializeToString,
+            ),
+            'StartMapping': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartMapping,
+                    request_deserializer=geometry__runtime__pb2.StartMappingRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.MappingSessionState.SerializeToString,
+            ),
+            'StopMapping': grpc.unary_unary_rpc_method_handler(
+                    servicer.StopMapping,
+                    request_deserializer=geometry__runtime__pb2.StopMappingRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.MappingSessionState.SerializeToString,
+            ),
+            'GetMappingState': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMappingState,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.MappingSessionState.SerializeToString,
             ),
             'SetNavigationGoal': grpc.unary_unary_rpc_method_handler(
                     servicer.SetNavigationGoal,
@@ -826,6 +873,87 @@ class GeometryRuntime(object):
             '/nuwax.geometry.GeometryRuntime/SubscribeCloudMapUpdates',
             geometry__runtime__pb2.Empty.SerializeToString,
             geometry__runtime__pb2.CloudMapShmRef.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StartMapping(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/StartMapping',
+            geometry__runtime__pb2.StartMappingRequest.SerializeToString,
+            geometry__runtime__pb2.MappingSessionState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StopMapping(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/StopMapping',
+            geometry__runtime__pb2.StopMappingRequest.SerializeToString,
+            geometry__runtime__pb2.MappingSessionState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMappingState(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetMappingState',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.MappingSessionState.FromString,
             options,
             channel_credentials,
             insecure,

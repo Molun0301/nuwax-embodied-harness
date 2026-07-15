@@ -18,6 +18,7 @@
 //! 便于测试与后续扩展。
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::builder::NavStackBuilder;
@@ -26,6 +27,8 @@ use crate::features::NavStackPreset;
 use crate::profile::NavStackProfile;
 use crate::runner::StackRunner;
 use crate::topics::NavTopicConfig;
+
+const INTERNAL_READY_FILE_ENV: &str = "NUWAX_NAV_STACK_INTERNAL_READY_FILE";
 
 /// CLI 选项的内部表示。
 #[derive(Debug, Clone)]
@@ -233,6 +236,16 @@ where
         return Ok(());
     }
 
+    if !matches!(
+        opts.profile,
+        NavStackProfile::Simple2D | NavStackProfile::ReplanningAStar
+    ) {
+        return Err(crate::error::NavStackError::invalid(format!(
+            "profile `{}` is not connected to the production guard-backed execution path; use --dry-run for graph inspection",
+            opts.profile.as_str()
+        )));
+    }
+
     let mut runner = builder.build_runner()?;
     if opts.json {
         let s = serde_json::to_string_pretty(runner.graph())
@@ -261,6 +274,14 @@ where
 {
     runner.spawn_all().await?;
 
+    let ready_marker = match RuntimeReadyMarker::publish_from_env() {
+        Ok(marker) => marker,
+        Err(error) => {
+            let _ = runner.shutdown().await;
+            return Err(error);
+        }
+    };
+
     let mut health = tokio::time::interval(Duration::from_millis(100));
     health.tick().await;
     tokio::pin!(shutdown);
@@ -276,12 +297,58 @@ where
         }
     };
     let cleanup = runner.shutdown().await;
+    drop(ready_marker);
 
     match (supervision, cleanup) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+struct RuntimeReadyMarker {
+    path: Option<PathBuf>,
+}
+
+impl RuntimeReadyMarker {
+    fn publish_from_env() -> NavStackResult<Self> {
+        let Some(path) = std::env::var_os(INTERNAL_READY_FILE_ENV) else {
+            return Ok(Self { path: None });
+        };
+        Self::publish(PathBuf::from(path))
+    }
+
+    fn publish(path: PathBuf) -> NavStackResult<Self> {
+        if path.as_os_str().is_empty() {
+            return Err(crate::error::NavStackError::invalid(format!(
+                "{INTERNAL_READY_FILE_ENV} must not be empty"
+            )));
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = ready_temporary_path(&path);
+        std::fs::write(&temporary, format!("pid={}\nready=1\n", std::process::id()))?;
+        std::fs::rename(&temporary, &path)?;
+        Ok(Self { path: Some(path) })
+    }
+}
+
+impl Drop for RuntimeReadyMarker {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn ready_temporary_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".tmp.{}", std::process::id()));
+    PathBuf::from(name)
 }
 
 /// 列出所有 Cargo feature,便于 `--list-features` 输出。
@@ -413,5 +480,41 @@ mod tests {
         .await
         .expect("supervise and reap persistent native process");
         assert!(runner.running_nodes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_rejects_profiles_without_guarded_execution_owner() {
+        for profile in [
+            NavStackProfile::CmuNative,
+            NavStackProfile::ExplorationNative,
+            NavStackProfile::Mls3D,
+        ] {
+            let opts = CliOptions {
+                profile,
+                preset: None,
+                dry_run: false,
+                replay: None,
+                list_features: false,
+                json: false,
+            };
+            let error = run_until_shutdown(opts, async { Ok(()) })
+                .await
+                .expect_err("unqualified production profile");
+            assert!(error.to_string().contains("guard-backed execution path"));
+        }
+    }
+
+    #[test]
+    fn runtime_ready_marker_is_atomic_and_removed_on_drop() {
+        let path = std::env::temp_dir().join(format!(
+            "nuwax-nav-stack-ready-{}.marker",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let marker = RuntimeReadyMarker::publish(path.clone()).expect("publish ready marker");
+        let content = std::fs::read_to_string(&path).expect("read ready marker");
+        assert!(content.contains("ready=1"));
+        drop(marker);
+        assert!(!path.exists());
     }
 }

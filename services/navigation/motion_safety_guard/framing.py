@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import struct
+from typing import List
 
 from .constants import MAX_FRAME_BYTES
 
@@ -19,7 +20,7 @@ class TruncatedFrame(FramingError):
 
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
-    chunks: list[bytes] = []
+    chunks: List[bytes] = []
     remaining = size
     while remaining:
         chunk = sock.recv(remaining)

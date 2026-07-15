@@ -84,8 +84,6 @@ class ExploreAreaRequest(TimestampedContract):
     V2 扩展：
     - ``boundary_line_segments``: 多段线段，每段 ``(Pose2D, Pose2D)``。
       旧字段 ``boundary_line_segment`` 标记 deprecated 1 个 release，自动包成单元素 list 兼容。
-    - ``auto_loop_close``: 启用闭环判据作为第 8 条完成路径（与 rtabmap:loop_closed 配合）。
-    - ``extend_radius_m``: 后端几何外扩半径硬上限 3m，cap 8m。
     """
 
     request_id: str = Field(description="探索请求标识。")
@@ -100,16 +98,6 @@ class ExploreAreaRequest(TimestampedContract):
     boundary_line_segments: List[Tuple[Pose, Pose]] = Field(
         default_factory=list,
         description="手划多段线段，每段 (Pose2D, Pose2D)。空列表表示不限定范围。",
-    )
-    auto_loop_close: bool = Field(
-        default=True,
-        description="启用闭环判据作为第 8 条完成路径（rtabmap:loop_closed 命名空间）。",
-    )
-    extend_radius_m: float = Field(
-        default=3.0,
-        ge=0.0,
-        le=8.0,
-        description="边界外扩半径硬上限 8m，默认 3m。",
     )
     # —— V1 deprecated 字段（1 个 release 周期保留） ——
     boundary_line_segment: Optional[Tuple[Pose, Pose]] = Field(

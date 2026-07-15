@@ -55,7 +55,7 @@ impl Default for BasicPathFollowerModuleConfig {
         Self {
             robot_id: "default_robot".to_string(),
             control_rate_hz: DEFAULT_CONTROL_RATE_HZ,
-            cmd_vel_topic: "/nav_cmd_vel".to_string(),
+            cmd_vel_topic: "/nav/cmd_vel".to_string(),
             path_topic: "/plan_path".to_string(),
             odom_topic: "/odom".to_string(),
             stop_topic: "/stop_movement".to_string(),

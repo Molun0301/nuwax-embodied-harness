@@ -112,6 +112,12 @@ pub struct ZeroConfirmation {
     pub applied_monotonic_ns: u64,
 }
 
+/// One sealed emergency fence request that may be replayed byte-for-byte.
+#[derive(Debug, Clone)]
+pub struct EmergencyFenceRequest {
+    request: MotionGuardRequest,
+}
+
 /// Observable client failures.
 #[derive(Debug, Error)]
 pub enum MotionGuardClientError {
@@ -196,6 +202,87 @@ impl MotionGuardClient {
             sequence: 0,
             poison_reason: None,
         })
+    }
+
+    /// Fence one known NAV lease over a fresh, independent UDS connection.
+    ///
+    /// This is the emergency path used when the scheduler drops an in-flight
+    /// ordinary exchange. `u64::MAX` is reserved for this terminal operation,
+    /// so any delayed ordinary request is either ordered before the fence or
+    /// rejected as stale after it. The guard actor remains the single actuator
+    /// serialization owner.
+    pub async fn emergency_revoke_and_zero_with_lease(
+        config: ClientConfig,
+        lease_tuple: LeaseTuple,
+        operation_id: &str,
+    ) -> Result<ZeroConfirmation, MotionGuardClientError> {
+        let request = Self::prepare_emergency_revoke_and_zero(lease_tuple, operation_id)?;
+        Self::execute_emergency_revoke_and_zero(config, &request).await
+    }
+
+    /// Seal one terminal request for byte-identical retries on fresh streams.
+    pub fn prepare_emergency_revoke_and_zero(
+        lease_tuple: LeaseTuple,
+        operation_id: &str,
+    ) -> Result<EmergencyFenceRequest, MotionGuardClientError> {
+        validate_epoch(lease_tuple.generation, &lease_tuple.boot_nonce)
+            .map_err(MotionGuardClientError::InvalidInput)?;
+        if lease_tuple.lease_id == 0 {
+            return Err(MotionGuardClientError::InvalidInput(
+                "emergency fence requires a non-zero lease id".into(),
+            ));
+        }
+        let operation_id = validate_operation_id(operation_id)?;
+        let issued = monotonic_ns()?;
+        let deadline = issued
+            .checked_add(u64::from(COMMAND_DEADLINE_MS) * NANOS_PER_MILLISECOND)
+            .ok_or_else(|| {
+                MotionGuardClientError::InvalidInput("monotonic deadline overflow".into())
+            })?;
+        let envelope = RequestEnvelope {
+            tuple: Some(lease_tuple),
+            source: GuardSource::Nav as i32,
+            action: GuardAction::Stop as i32,
+            operation_id,
+            payload_sha256: Vec::new(),
+            sequence: u64::MAX,
+            issued_monotonic_ns: issued,
+            deadline_monotonic_ns: deadline,
+        };
+        let mut request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::RevokeAndZero(
+                RevokeAndZeroRequest {
+                    envelope: Some(envelope),
+                },
+            )),
+        };
+        seal_request(&mut request)?;
+        Ok(EmergencyFenceRequest { request })
+    }
+
+    /// Execute a previously sealed emergency fence over one fresh connection.
+    pub async fn execute_emergency_revoke_and_zero(
+        config: ClientConfig,
+        request: &EmergencyFenceRequest,
+    ) -> Result<ZeroConfirmation, MotionGuardClientError> {
+        let mut client = Self::connect_with_config(config).await?;
+        let outcome = client
+            .exchange(
+                request.request.clone(),
+                OutcomeKind::RevokeAndZero,
+                AckCode::ResourceFenced,
+            )
+            .await?;
+        let motion_guard_response::Outcome::RevokeAndZero(response) = outcome else {
+            unreachable!("exchange already correlated the outcome")
+        };
+        response
+            .zero_ack
+            .ok_or_else(|| "RESOURCE_FENCED response has no ZeroAck".to_string())
+            .and_then(validate_zero_ack)
+            .or_else(|message| client.protocol_error(message))
     }
 
     /// Returns the source identity fixed for every request from this client.

@@ -156,7 +156,7 @@ pub fn topic_map_for_node(node_id: &str, topics: &NavTopicConfig) -> Vec<(String
         .iter()
         .filter_map(|p| {
             let name = match (node_id, *p) {
-                ("path_follower", "cmd_vel") => topics.get_or("nav_cmd_vel", "nav_cmd_vel"),
+                ("path_follower", "cmd_vel") => topics.get_or("nav_cmd_vel", "/nav/cmd_vel"),
                 ("far_planner" | "local_planner", "goal") => navigation_goal_topic(topics),
                 (_, port) => topics.get_or(port, port),
             };
@@ -204,20 +204,11 @@ fn navigation_goal_topic(topics: &NavTopicConfig) -> &str {
 // ---------- Simple2D ----------
 
 fn build_simple2d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
-    // 1. Click router:把 clicked_point 转换为 start/goal
-    g.push_node(
-        ModuleNode::new(
-            "click_goal_router",
-            "Click Goal Router",
-            ModuleKind::Coordinator,
-        )
-        .with_feature("click-goal")
-        .add_input(topics.get_or("clicked_point", "clicked_point"))
-        .add_output(topics.get_or("start_pose", "start_pose"))
-        .add_output(topics.get_or("goal_pose", "goal_pose")),
-    );
+    g.push_node(map_pose_adapter(topics));
 
-    // 2. Simple planner:terrain + goal -> waypoint / goal_path
+    // Planner-consumed occupancy + real map pose -> versioned path. Public
+    // clicks must enter through the Geometry goal-lease owner; this process may
+    // not fabricate GoalEnvelope identity/generation fields.
     g.push_node(
         ModuleNode::new(
             "simple_planner",
@@ -225,103 +216,39 @@ fn build_simple2d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             ModuleKind::RustAlgorithm,
         )
         .with_feature("simple-planner")
-        .add_input(topics.get_or("terrain_map", "terrain_map"))
-        .add_input(topics.get_or("terrain_map_ext", "terrain_map_ext"))
-        .add_input(topics.get_or("odometry", "odometry"))
-        .add_input(topics.get_or("start_pose", "start_pose"))
+        .add_input(topics.get_or("occupancy", "/map/occupancy"))
+        .add_input(topics.get_or("map_pose", "map_pose"))
         .add_input(topics.get_or("goal_pose", "goal_pose"))
         .add_input(topics.get_or("stop_movement", "stop_movement"))
         .add_output(topics.get_or("way_point", "way_point"))
         .add_output(topics.get_or("goal_path", "goal_path"))
-        .depends_on_node("click_goal_router"),
+        .depends_on_node("map_pose_adapter"),
     );
 
-    // 3. Basic path follower:waypoint -> cmd_vel
-    g.push_node(
-        ModuleNode::new(
-            "basic_path_follower",
-            "Basic Path Follower",
-            ModuleKind::RustAlgorithm,
-        )
-        .with_feature("basic-path-follower")
-        .add_input(topics.get_or("goal_path", "goal_path"))
-        .add_input(topics.get_or("odometry", "odometry"))
-        .add_input(topics.get_or("stop_movement", "stop_movement"))
-        .add_output(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
-        .add_output(topics.get_or("goal_reached", "goal_reached"))
-        .depends_on_node("simple_planner"),
-    );
-
-    // 4. Movement manager:teleop mux + cmd_vel final
-    g.push_node(
-        ModuleNode::new(
-            "movement_manager",
-            "Movement Manager",
-            ModuleKind::Coordinator,
-        )
-        .with_feature("movement-manager")
-        .add_input(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
-        .add_input(topics.get_or("joy_cmd", "joy_cmd"))
-        .add_input(topics.get_or("clicked_point", "clicked_point"))
-        .add_output(topics.get_or("cmd_vel", "cmd_vel"))
-        .add_output(topics.get_or("goal", "goal"))
-        .add_output(topics.get_or("way_point", "way_point_out"))
-        .add_output(topics.get_or("stop_movement", "stop_movement"))
-        .depends_on_node("basic_path_follower")
-        .depends_on_node("click_goal_router"),
-    );
-
-    g.push_node(navigation_state_reporter(topics));
+    g.push_node(guarded_nav_scheduler(topics, "simple_planner"));
 
     // edges
     g.push_edge(GraphEdge {
-        from: "click_goal_router".into(),
-        to: "simple_planner".into(),
-        topic: topics.get_or("goal_pose", "goal_pose").into(),
-    });
-    g.push_edge(GraphEdge {
         from: "simple_planner".into(),
-        to: "basic_path_follower".into(),
+        to: "guarded_nav_scheduler".into(),
         topic: topics.get_or("goal_path", "goal_path").into(),
     });
     g.push_edge(GraphEdge {
-        from: "basic_path_follower".into(),
-        to: "movement_manager".into(),
-        topic: topics.get_or("nav_cmd_vel", "nav_cmd_vel").into(),
+        from: "map_pose_adapter".into(),
+        to: "simple_planner".into(),
+        topic: topics.get_or("map_pose", "map_pose").into(),
+    });
+    g.push_edge(GraphEdge {
+        from: "map_pose_adapter".into(),
+        to: "guarded_nav_scheduler".into(),
+        topic: topics.get_or("map_pose", "map_pose").into(),
     });
 }
 
 // ---------- ReplanningAStar ----------
 
 fn build_replanning_astar(g: &mut ModuleGraph, topics: &NavTopicConfig) {
-    g.push_node(
-        ModuleNode::new(
-            "click_goal_router",
-            "Click Goal Router",
-            ModuleKind::Coordinator,
-        )
-        .with_feature("click-goal")
-        .add_input(topics.get_or("clicked_point", "clicked_point"))
-        .add_output(topics.get_or("goal_pose", "goal_pose")),
-    );
-
-    g.push_node(
-        ModuleNode::new("patrolling", "Patrolling", ModuleKind::GoalSource)
-            .with_feature("patrolling")
-            .add_input(topics.get_or("odometry", "odometry"))
-            .add_input(topics.get_or("registered_scan", "registered_scan"))
-            .add_input(topics.get_or("goal_reached", "goal_reached"))
-            .add_input(topics.get_or("patrol_enabled", "patrol_enabled"))
-            .add_input(topics.get_or("goal_failed", "goal_failed"))
-            .add_input(topics.get_or("patrol_planner_control_ack", "patrol_planner_control_ack"))
-            .add_output(topics.get_or("goal_pose", "goal_pose"))
-            .add_output(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
-            .add_output(topics.get_or("stop_movement", "stop_movement"))
-            .add_output(topics.get_or("patrol_planner_control", "patrol_planner_control"))
-            .with_notes(
-                "patrol_enabled=true starts coverage patrol; false publishes hold and stops",
-            ),
-    );
+    g.push_node(map_pose_adapter(topics));
 
     g.push_node(
         ModuleNode::new(
@@ -330,123 +257,66 @@ fn build_replanning_astar(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             ModuleKind::RustAlgorithm,
         )
         .with_feature("astar")
-        .add_input(topics.get_or("odometry", "odometry"))
-        .add_input(topics.get_or("registered_scan", "registered_scan"))
+        .add_input(topics.get_or("map_pose", "map_pose"))
+        .add_input(topics.get_or("occupancy", "/map/occupancy"))
         .add_input(topics.get_or("goal_pose", "goal_pose"))
         .add_input(topics.get_or("stop_movement", "stop_movement"))
-        .add_input(topics.get_or("patrol_planner_control", "patrol_planner_control"))
         .add_output(topics.get_or("way_point", "way_point"))
         .add_output(topics.get_or("goal_path", "goal_path"))
         .add_output(topics.get_or("goal_reached", "goal_reached"))
         .add_output(topics.get_or("goal_failed", "goal_failed"))
-        .add_output(topics.get_or("patrol_planner_control_ack", "patrol_planner_control_ack"))
-        .depends_on_node("click_goal_router"),
+        .depends_on_node("map_pose_adapter"),
     );
 
-    g.push_node(
-        ModuleNode::new(
-            "basic_path_follower",
-            "Basic Path Follower",
-            ModuleKind::RustAlgorithm,
-        )
-        .with_feature("basic-path-follower")
-        .add_input(topics.get_or("goal_path", "goal_path"))
-        .add_input(topics.get_or("odometry", "odometry"))
-        .add_input(topics.get_or("stop_movement", "stop_movement"))
-        .add_output(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
-        .depends_on_node("astar_planner"),
-    );
-
-    g.push_node(
-        ModuleNode::new(
-            "movement_manager",
-            "Movement Manager",
-            ModuleKind::Coordinator,
-        )
-        .with_feature("movement-manager")
-        .add_input(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
-        .add_input(topics.get_or("joy_cmd", "joy_cmd"))
-        .add_output(topics.get_or("cmd_vel", "cmd_vel"))
-        .add_output(topics.get_or("stop_movement", "stop_movement"))
-        .depends_on_node("basic_path_follower"),
-    );
-
-    g.push_node(navigation_state_reporter(topics));
+    g.push_node(guarded_nav_scheduler(topics, "astar_planner"));
 
     g.push_edge(GraphEdge {
-        from: "click_goal_router".into(),
-        to: "astar_planner".into(),
-        topic: topics.get_or("goal_pose", "goal_pose").into(),
-    });
-    g.push_edge(GraphEdge {
-        from: "patrolling".into(),
-        to: "astar_planner".into(),
-        topic: topics.get_or("goal_pose", "goal_pose").into(),
-    });
-    g.push_edge(GraphEdge {
         from: "astar_planner".into(),
-        to: "patrolling".into(),
-        topic: topics.get_or("goal_reached", "goal_reached").into(),
-    });
-    g.push_edge(GraphEdge {
-        from: "astar_planner".into(),
-        to: "patrolling".into(),
-        topic: topics.get_or("goal_failed", "goal_failed").into(),
-    });
-    g.push_edge(GraphEdge {
-        from: "patrolling".into(),
-        to: "astar_planner".into(),
-        topic: topics
-            .get_or("patrol_planner_control", "patrol_planner_control")
-            .into(),
-    });
-    g.push_edge(GraphEdge {
-        from: "astar_planner".into(),
-        to: "patrolling".into(),
-        topic: topics
-            .get_or("patrol_planner_control_ack", "patrol_planner_control_ack")
-            .into(),
-    });
-    g.push_edge(GraphEdge {
-        from: "astar_planner".into(),
-        to: "basic_path_follower".into(),
+        to: "guarded_nav_scheduler".into(),
         topic: topics.get_or("goal_path", "goal_path").into(),
     });
     g.push_edge(GraphEdge {
-        from: "basic_path_follower".into(),
-        to: "movement_manager".into(),
-        topic: topics.get_or("nav_cmd_vel", "nav_cmd_vel").into(),
+        from: "map_pose_adapter".into(),
+        to: "astar_planner".into(),
+        topic: topics.get_or("map_pose", "map_pose").into(),
     });
     g.push_edge(GraphEdge {
-        from: "patrolling".into(),
-        to: "movement_manager".into(),
-        topic: topics.get_or("nav_cmd_vel", "nav_cmd_vel").into(),
+        from: "map_pose_adapter".into(),
+        to: "guarded_nav_scheduler".into(),
+        topic: topics.get_or("map_pose", "map_pose").into(),
     });
-    for target in ["astar_planner", "basic_path_follower"] {
-        g.push_edge(GraphEdge {
-            from: "patrolling".into(),
-            to: target.into(),
-            topic: topics.get_or("stop_movement", "stop_movement").into(),
-        });
-    }
 }
 
-fn navigation_state_reporter(topics: &NavTopicConfig) -> ModuleNode {
+fn map_pose_adapter(topics: &NavTopicConfig) -> ModuleNode {
     ModuleNode::new(
-        "navigation_state_reporter",
-        "Navigation State Reporter",
+        "map_pose_adapter",
+        "Map Pose Adapter",
         ModuleKind::Coordinator,
     )
     .with_feature("lcm-runtime")
-    .add_input(topics.get_or("goal_pose", "goal_pose"))
     .add_input(topics.get_or("odometry", "odometry"))
+    .add_input(topics.get_or("tf", "/tf"))
+    .add_output(topics.get_or("map_pose", "/nav/map_pose"))
+}
+
+fn guarded_nav_scheduler(topics: &NavTopicConfig, planner: &str) -> ModuleNode {
+    ModuleNode::new(
+        "guarded_nav_scheduler",
+        "Guard-backed Navigation Scheduler",
+        ModuleKind::Coordinator,
+    )
+    .with_feature("guard-runtime")
+    .add_input(topics.get_or("goal_pose", "goal_pose"))
+    .add_input(topics.get_or("map_pose", "/nav/map_pose"))
     .add_input(topics.get_or("goal_path", "goal_path"))
-    .add_input(topics.get_or("goal_reached", "goal_reached"))
+    .add_input(topics.get_or("occupancy", "/map/occupancy"))
     .add_input(topics.get_or("nav_cancel", "/nav/cancel"))
-    .add_output(topics.get_or("nav_state", "/nav/state"))
-    .add_output(topics.get_or("stop_movement", "stop_movement"))
     .add_output(topics.get_or("cmd_vel", "cmd_vel"))
-    .depends_on_node("movement_manager")
+    .add_output(topics.get_or("nav_state", "/nav/state"))
+    .add_output(topics.get_or("goal_reached", "goal_reached"))
+    .add_output(topics.get_or("stop_movement", "stop_movement"))
+    .depends_on_node(planner)
+    .depends_on_node("map_pose_adapter")
 }
 
 // ---------- CmuNative ----------
@@ -667,7 +537,7 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             speed: topic_for(topics, "speed", "speed"),
             slow_down: topic_for(topics, "slow_down", "slow_down"),
             safety_stop: topic_for(topics, "safety_stop", "safety_stop"),
-            cmd_vel: topic_for(topics, "nav_cmd_vel", "nav_cmd_vel"),
+            cmd_vel: topic_for(topics, "nav_cmd_vel", "/nav/cmd_vel"),
         };
         ModuleNode::from_native_specs(
             "path_follower",
@@ -692,7 +562,7 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             .add_input(topics.get_or("speed", "speed"))
             .add_input(topics.get_or("slow_down", "slow_down"))
             .add_input(topics.get_or("safety_stop", "safety_stop"))
-            .add_output(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
+            .add_output(topics.get_or("nav_cmd_vel", "/nav/cmd_vel"))
             .depends_on_node("local_planner"),
     );
 
@@ -703,7 +573,7 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             ModuleKind::Coordinator,
         )
         .with_feature("movement-manager")
-        .add_input(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
+        .add_input(topics.get_or("nav_cmd_vel", "/nav/cmd_vel"))
         .add_input(topics.get_or("joy_cmd", "joy_cmd"))
         .add_output(topics.get_or("cmd_vel", "cmd_vel"))
         .add_output(topics.get_or("stop_movement", "stop_movement"))
@@ -733,7 +603,7 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
     g.push_edge(GraphEdge {
         from: "path_follower".into(),
         to: "movement_manager".into(),
-        topic: topics.get_or("nav_cmd_vel", "nav_cmd_vel").into(),
+        topic: topics.get_or("nav_cmd_vel", "/nav/cmd_vel").into(),
     });
 }
 
@@ -750,7 +620,7 @@ fn build_exploration_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             ModuleKind::Explorer,
         )
         .with_feature("explore")
-        .add_input(topics.get_or("registered_scan", "registered_scan"))
+        .add_input(topics.get_or("occupancy", "/map/occupancy"))
         .add_input(topics.get_or("corrected_odometry", "corrected_odometry"))
         .add_input(topics.get_or("goal_reached", "goal_reached"))
         .add_input(topics.get_or("goal_failed", "goal_failed"))
@@ -882,7 +752,7 @@ fn build_mls3d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         .add_input(topics.get_or("goal_path", "goal_path"))
         .add_input(topics.get_or("odometry", "odometry"))
         .add_input(topics.get_or("stop_movement", "stop_movement"))
-        .add_output(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
+        .add_output(topics.get_or("nav_cmd_vel", "/nav/cmd_vel"))
         .depends_on_node("mls_planner"),
     );
 
@@ -893,7 +763,7 @@ fn build_mls3d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             ModuleKind::Coordinator,
         )
         .with_feature("movement-manager")
-        .add_input(topics.get_or("nav_cmd_vel", "nav_cmd_vel"))
+        .add_input(topics.get_or("nav_cmd_vel", "/nav/cmd_vel"))
         .add_input(topics.get_or("joy_cmd", "joy_cmd"))
         .add_output(topics.get_or("cmd_vel", "cmd_vel"))
         .add_output(topics.get_or("stop_movement", "stop_movement"))
@@ -934,8 +804,17 @@ mod tests {
         );
         g.validate().expect("validate");
         assert!(g.find("simple_planner").is_some());
-        assert!(g.find("basic_path_follower").is_some());
-        assert!(g.find("navigation_state_reporter").is_some());
+        assert!(g.find("map_pose_adapter").is_some());
+        assert!(g.find("guarded_nav_scheduler").is_some());
+        assert!(g.find("basic_path_follower").is_none());
+        assert!(g.find("movement_manager").is_none());
+        assert!(g.find("navigation_state_reporter").is_none());
+        let planner = g.find("simple_planner").expect("simple planner");
+        assert_eq!(planner.inputs[0], "/map/occupancy");
+        assert_eq!(planner.inputs.len(), 4);
+        assert!(!planner.inputs.iter().any(|input| input == "start_pose"));
+        assert!(g.find("click_goal_router").is_none());
+        assert!(!planner.inputs.iter().any(|input| input == "terrain_map"));
     }
 
     #[test]
@@ -961,12 +840,13 @@ mod tests {
         g.validate().expect("validate");
         let wavefront = g.find("wavefront_explorer").expect("wavefront node");
         assert_eq!(wavefront.inputs.len(), 5);
+        assert_eq!(wavefront.inputs[0], "/map/occupancy");
         assert_eq!(wavefront.outputs, vec!["goal_pose"]);
         assert!(g.find("far_planner").is_some());
     }
 
     #[test]
-    fn astar_profile_uses_simple_follower() {
+    fn astar_profile_uses_guarded_scheduler_owner() {
         let g = build_graph(
             NavStackProfile::ReplanningAStar,
             &empty_topics(),
@@ -974,7 +854,15 @@ mod tests {
         );
         g.validate().expect("validate");
         assert!(g.find("astar_planner").is_some());
-        assert!(g.find("navigation_state_reporter").is_some());
+        assert!(g.find("map_pose_adapter").is_some());
+        assert!(g.find("guarded_nav_scheduler").is_some());
+        assert!(g.find("basic_path_follower").is_none());
+        assert!(g.find("movement_manager").is_none());
+        assert!(g.find("navigation_state_reporter").is_none());
+        assert_eq!(g.find("astar_planner").unwrap().inputs[0], "map_pose");
+        assert_eq!(g.find("astar_planner").unwrap().inputs[1], "/map/occupancy");
+        assert!(g.find("click_goal_router").is_none());
+        assert!(g.find("patrolling").is_none());
     }
 
     #[test]

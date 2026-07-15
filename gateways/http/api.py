@@ -126,12 +126,20 @@ def _navigation_state_payload(
     )
     raw_status = str(getattr(raw_status, "value", raw_status) or "unknown").lower()
     public_state = raw_status.upper()
-    zero_ack_observed = _zero_ack_observed(stream_payload)
+    explicit_zero_ack = _zero_ack_observed(stream_payload)
+    typed_cancel_terminal = raw_status in {"cancelled", "canceled"}
+    zero_ack_observed = explicit_zero_ack or typed_cancel_terminal
+    cancel_terminal_source = None
+    if explicit_zero_ack:
+        cancel_terminal_source = "actuator_zero_ack"
+    elif typed_cancel_terminal:
+        # The production navigation contract only emits CANCELLED after the
+        # correlated motion-guard ZEROED acknowledgement has completed.
+        cancel_terminal_source = "typed_navigation_terminal"
     if raw_status in {"cancelled", "canceled"}:
-        if zero_ack_observed:
-            public_state = "CANCELED"
-        else:
-            public_state = "CANCELLING"
+        public_state = "CANCELED"
+    elif raw_status in {"cancelling", "cancel_pending", "cancel_requested"}:
+        public_state = "CANCELLING"
     message = _payload_value(navigation_state, "message", "") or ""
     if public_state == "CANCELLING" and not zero_ack_observed:
         message = "取消请求已下发，正在等待执行器零速确认。"
@@ -158,6 +166,7 @@ def _navigation_state_payload(
         "goal_reached": bool(_payload_value(navigation_state, "goal_reached", False)),
         "backend_name": _payload_value(stream_payload, "backend_name"),
         "cancel_zero_ack_observed": zero_ack_observed,
+        "cancel_terminal_source": cancel_terminal_source,
     }
 
 
@@ -876,6 +885,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access_manager.authenticate_http(request)
         try:
             navigation_goal = _build_navigation_goal(goal)
+            await run_in_threadpool(
+                lambda: runtime._ensure_geometry_runtime_for_capability(
+                    "navigate_to_pose"
+                )
+            )
             context = await run_in_threadpool(
                 lambda: runtime.navigation_service.set_goal(navigation_goal)
             )
@@ -996,7 +1010,10 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                     http_status=409,
                     details={"goal_id": body.goal_id, "state": current.get("state")},
                 )
-            context = await run_in_threadpool(runtime.navigation_service.cancel_goal)
+            context = await run_in_threadpool(
+                runtime.navigation_service.cancel_goal,
+                request_id=body.goal_id,
+            )
         except Exception as exc:
             raise as_gateway_error(exc) from exc
         return _navigation_state_payload(context, fallback_goal_id=body.goal_id)

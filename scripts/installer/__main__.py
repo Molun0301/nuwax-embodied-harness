@@ -13,10 +13,10 @@
 from __future__ import annotations
 
 import sys
-from typing import Sequence
+from typing import Optional, Sequence
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     """入口；``argv`` 为 None 时用 ``sys.argv[1:]``。"""
     from scripts.installer import cli
 

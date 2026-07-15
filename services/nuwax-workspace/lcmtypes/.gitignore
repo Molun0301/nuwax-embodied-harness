@@ -1,2 +1,7 @@
-# lcm-gen 输出(临时,不入仓)
-generated/
+# Only generated C is checked in as an auditable lcm-gen fixture. Other
+# language bindings remain local build artifacts.
+generated/*
+!generated/c/
+generated/c/*
+!generated/c/*.c
+!generated/c/*.h

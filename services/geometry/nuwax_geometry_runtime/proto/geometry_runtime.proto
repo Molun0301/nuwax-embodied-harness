@@ -29,6 +29,11 @@ message ShmRef {
   string key = 1;
   uint64 size = 2;
   uint64 revision = 3;
+  uint32 layout_version = 4;
+  uint32 payload_schema_version = 5;
+  uint64 generation = 6;
+  uint32 active_slot = 7;
+  uint64 payload_size = 8;
 }
 
 // === 控制面 ===
@@ -67,10 +72,37 @@ message MapUpdateNotification {
   uint32 schema_version = 5;
   string checksum = 6;
   int64 last_seen_ms = 7;
+  string session_id = 8;
+  string map_version_id = 9;
+  uint64 session_generation = 10;
 }
 message OccupancyGridData {
   OccupancyGridMeta meta = 1;
   bytes data = 2;
+}
+
+message StartMappingRequest {
+  string session_id = 1;
+  string map_name = 2;
+  string map_version_id = 3;
+}
+
+message StopMappingRequest {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message MappingSessionState {
+  bool success = 1;
+  string phase = 2;
+  string message = 3;
+  string session_id = 4;
+  string map_name = 5;
+  string map_version_id = 6;
+  uint64 session_generation = 7;
+  uint64 revision = 8;
+  bool active = 9;
+  bool idempotent_replay = 10;
 }
 
 // === 视频帧共享内存 ===
@@ -102,22 +134,66 @@ message CloudMapShmRef {
 }
 
 // === 导航兼容 ===
+enum NavigationOwnerKind {
+  NAVIGATION_OWNER_KIND_UNSPECIFIED = 0;
+  NAVIGATION_OWNER_KIND_PUBLIC_NAV = 1;
+  NAVIGATION_OWNER_KIND_EXPLORATION_CHILD = 2;
+}
+
 message NavigationGoal {
   Pose pose = 1;
   string frame_id = 2;
   string goal_id = 3;
+  uint64 map_revision = 4;
+  string map_version_id = 5;
+  string parent_request_id = 6;
+  uint64 goal_generation = 7;
+  NavigationOwnerKind owner_kind = 8;
 }
-message CancelNavigationRequest { string goal_id = 1; }
+message CancelNavigationRequest {
+  string goal_id = 1;
+  NavigationOwnerKind owner_kind = 2;
+  string parent_request_id = 3;
+  uint64 goal_generation = 4;
+  uint64 producer_runtime_generation = 5;
+}
 message NavigationState {
   string status = 1;
   string message = 2;
   string goal_id = 3;
   float distance_remaining = 4;
   uint64 timestamp_ns = 5;
+  string cancel_phase = 6;
+  uint64 cancel_generation = 7;
+  bool actuator_zeroed = 8;
+  string reason_code = 9;
+  uint64 runtime_generation = 10;
+  uint64 guard_generation = 11;
+  bool sink_ready = 12;
+  uint64 planner_map_revision = 13;
+  string planner_map_frame = 14;
+  string planner_pose_frame = 15;
+  string zero_ack_id = 16;
+  uint64 zero_applied_monotonic_ns = 17;
+  NavigationOwnerKind owner_kind = 18;
+  string parent_request_id = 19;
+  uint64 goal_generation = 20;
+  uint64 path_revision = 21;
+  bytes goal_payload_sha256 = 22;
+  bytes path_payload_sha256 = 23;
+  string map_version_id = 24;
+  uint64 producer_runtime_generation = 25;
 }
 message NavigationReadiness {
   bool ready = 1;
   string reason = 2;
+  string reason_code = 3;
+  repeated string blockers = 4;
+  uint64 tf_generation = 5;
+  uint64 planner_generation = 6;
+  uint64 motion_sink_generation = 7;
+  string map_frame = 8;
+  string pose_frame = 9;
 }
 
 // Phase 7: 三套 readiness 字段打包 message(JSON 字符串给 Python 解析)。
@@ -137,11 +213,15 @@ message ExplorationReadiness {
                         //      active_source, arbitration}
 }
 
-// === cmd_vel sink readiness === (rework17 跨进程写回闭环)
-// Python 网关的 `LcmMotionCommandBridge` 在 start/stop 时通过本 RPC
-// 把 sink ready 状态从 Python 推到 Rust handle.cmd_vel_sink_ready。
-// 该 RPC 是 `compute_readiness` 拒绝 `SetNavigationGoal` 的关键反馈回路。
-message CmdVelSinkReadyRequest { bool ready = 1; }
+// === legacy cmd_vel sink readiness compatibility ===
+// Motion guard UDS owner 的 typed generation/ack 是 authoritative source。
+// 本兼容请求的 ready=true 只有在 generation 非零且匹配当前 sink generation
+// 时才可接受；不得由无 generation 的旧调用方制造 ready。
+message CmdVelSinkReadyRequest {
+  option deprecated = true;
+  bool ready = 1;
+  uint64 generation = 2;
+}
 message CmdVelSinkReadyResponse { bool success = 1; }
 
 // === 探索 ===
@@ -150,7 +230,27 @@ message Frontier {
   uint32 size_cells = 2;
   float heading = 3;
 }
-message FrontierList { repeated Frontier frontiers = 1; uint64 revision = 2; }
+message FrontierList {
+  repeated Frontier frontiers = 1;
+  uint64 revision = 2;       // frontier snapshot revision
+  uint64 map_revision = 3;   // costmap revision used to produce this snapshot
+  string map_version_id = 4;
+}
+
+message ExplorationBoundarySegment {
+  double start_x = 1;
+  double start_y = 2;
+  double end_x = 3;
+  double end_y = 4;
+}
+
+message ExplorationStopConditions {
+  optional double max_coverage_pct = 1;
+  optional uint64 no_frontier_timeout_ms = 2;
+  optional uint64 max_duration_ms = 3;
+  optional uint32 max_goals = 4;
+  bool stop_on_map_revision_change = 5;
+}
 
 // 探索启动/停止/状态/诊断 — Phase 5 additive
 // 字段命名与执行方案 §3 Phase 5 + dimos `nuwax-exploration` facade 对齐。
@@ -161,6 +261,14 @@ message ExploreRequest {
   string arbitration = 2;
   string map_version_id = 3;
   string request_id = 4;
+  uint64 map_revision = 5;
+  // Ordered, continuous, closed polygon edges. The server validates topology.
+  repeated ExplorationBoundarySegment boundary_line_segments = 6;
+  ExplorationStopConditions stop_conditions = 7;
+  uint32 max_navigation_retries = 8;
+  double blacklist_radius_m = 9;
+  // A request has one authoritative boundary frame; production accepts map.
+  string boundary_frame_id = 10;
 }
 message StopExplorationRequest {
   string request_id = 1;
@@ -174,6 +282,9 @@ message ExplorationState {
   uint32 frontier_count = 6;
   uint64 revision = 7;
   uint64 timestamp_ns = 8;
+  string child_task_id = 9;
+  string map_version_id = 10;
+  uint64 map_revision = 11;
 }
 message ExplorationSourceDiag {
   string source_name = 1;
@@ -232,6 +343,9 @@ service GeometryRuntime {
   rpc GetOccupancyGridShm(Empty) returns (ShmRef);
   rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
   rpc SubscribeCloudMapUpdates(Empty) returns (stream CloudMapShmRef);
+  rpc StartMapping(StartMappingRequest) returns (MappingSessionState);
+  rpc StopMapping(StopMappingRequest) returns (MappingSessionState);
+  rpc GetMappingState(Empty) returns (MappingSessionState);
 
   // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
   rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);
@@ -244,10 +358,11 @@ service GeometryRuntime {
   rpc GetMappingReadiness(Empty) returns (MappingReadiness);
   rpc GetExplorationReadiness(Empty) returns (ExplorationReadiness);
 
-  // cmd_vel sink readiness 写回(control plane):Python LcmMotionCommandBridge
-  // 在 start/stop 时调本接口把 sink ready 状态同步到 Rust handle,
-  // 让 `SetNavigationGoal` 的 readiness 拒绝链路读到真实状态。
-  rpc SetCmdVelSinkReady(CmdVelSinkReadyRequest) returns (CmdVelSinkReadyResponse);
+  // Legacy compatibility only; authoritative readiness comes from the
+  // generation-fenced motion guard owner.
+  rpc SetCmdVelSinkReady(CmdVelSinkReadyRequest) returns (CmdVelSinkReadyResponse) {
+    option deprecated = true;
+  }
 
   // 探索（与 nuwax-exploration LCM channel 接口对应）
   rpc GetFrontiers(Empty) returns (FrontierList);

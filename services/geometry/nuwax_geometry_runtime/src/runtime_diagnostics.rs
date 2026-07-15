@@ -91,7 +91,8 @@ impl RuntimeDiagnostics {
         if !handle.mapping_ready_poll() {
             blockers.push(BLOCKER_MAPPING_NOT_READY.to_string());
         }
-        if !handle.nav_ready_poll() {
+        let nav_ready = handle.lcm_backend_available && handle.nav.execution_chain_is_live();
+        if !nav_ready {
             blockers.push(BLOCKER_NAV_STACK_NOT_READY.to_string());
         }
         if !handle.explore_ready_poll() {
@@ -110,7 +111,7 @@ impl RuntimeDiagnostics {
             lcm_backend,
             schema_hash_version,
             mapping_ready: handle.mapping_ready_poll(),
-            nav_ready: handle.nav_ready_poll(),
+            nav_ready,
             explore_ready: handle.explore_ready_poll(),
             blockers,
         }
@@ -132,27 +133,55 @@ pub fn read_rss_kb() -> u32 {
 
 /// 板块级 readiness 报告(给 `get_navigation_readiness` / 后续
 /// `get_exploration_readiness` 复用)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentReadinessCode {
+    /// The component is ready.
+    Ready,
+    /// Real LCM transport is unavailable.
+    LcmBackendUnavailable,
+    /// Guard, planner input, TF chain, or stack heartbeat is unavailable/stale.
+    NavExecutionChainUnavailable,
+    /// Mapping capability is unavailable.
+    MappingNotReady,
+    /// Exploration capability is unavailable.
+    ExplorationNotReady,
+}
+
+/// Component readiness with a stable typed code plus compatibility text.
 #[derive(Clone, Debug)]
 pub struct ComponentReadiness {
+    /// Whether the component can accept work.
     pub ready: bool,
+    /// Human-readable compatibility projection.
     pub reason: String,
+    /// Stable legacy blocker labels used by current health tooling.
     pub blockers: Vec<String>,
+    /// Typed machine-readable result.
+    pub code: ComponentReadinessCode,
 }
 
 impl ComponentReadiness {
-    pub fn not_ready(reason: impl Into<String>, blockers: Vec<String>) -> Self {
+    /// Build a typed not-ready result.
+    pub fn not_ready_with_code(
+        code: ComponentReadinessCode,
+        reason: impl Into<String>,
+        blockers: Vec<String>,
+    ) -> Self {
         Self {
             ready: false,
             reason: reason.into(),
             blockers,
+            code,
         }
     }
 
+    /// Build a ready result.
     pub fn ready(reason: impl Into<String>) -> Self {
         Self {
             ready: true,
             reason: reason.into(),
             blockers: Vec::new(),
+            code: ComponentReadinessCode::Ready,
         }
     }
 }
@@ -161,14 +190,16 @@ impl ComponentReadiness {
 /// 后改 `ready`)。
 pub fn navigation_readiness(handle: &GeometryRuntimeHandle) -> ComponentReadiness {
     if !handle.lcm_backend_available {
-        return ComponentReadiness::not_ready(
+        return ComponentReadiness::not_ready_with_code(
+            ComponentReadinessCode::LcmBackendUnavailable,
             "LCM backend 不可用,nav_stack 无法发布 typed channel",
             vec![BLOCKER_LCM_BACKEND.to_string()],
         );
     }
-    if !handle.nav_ready_poll() {
-        return ComponentReadiness::not_ready(
-            "未收到新鲜的 nuwax-nav-stack /nav/state heartbeat",
+    if !handle.nav.execution_chain_is_live() {
+        return ComponentReadiness::not_ready_with_code(
+            ComponentReadinessCode::NavExecutionChainUnavailable,
+            "导航执行链未就绪:需要新鲜 TF、planner-observed map/pose、nav-stack heartbeat 与 guard UDS sink",
             vec![BLOCKER_NAV_STACK_NOT_READY.to_string()],
         );
     }
@@ -178,14 +209,16 @@ pub fn navigation_readiness(handle: &GeometryRuntimeHandle) -> ComponentReadines
 /// Mapping 板块 readiness 报告(Phase 2 baseline;Phase 3 实装后改 `ready`)。
 pub fn mapping_readiness(handle: &GeometryRuntimeHandle) -> ComponentReadiness {
     if !handle.lcm_backend_available {
-        return ComponentReadiness::not_ready(
-            "LCM backend 不可用,mapping adapter 无法订阅 /map/occupancy 输入",
+        return ComponentReadiness::not_ready_with_code(
+            ComponentReadinessCode::LcmBackendUnavailable,
+            "LCM backend 不可用,mapping adapter 无法接收 odom/pointcloud typed 输入",
             vec![BLOCKER_LCM_BACKEND.to_string()],
         );
     }
     if !handle.mapping_ready_poll() {
-        return ComponentReadiness::not_ready(
-            "nuwax-mapping adapter 尚未实装 (Phase 3 待办)",
+        return ComponentReadiness::not_ready_with_code(
+            ComponentReadinessCode::MappingNotReady,
+            "nuwax-mapping 未就绪:需要 ACTIVE mapping session 与已提交 occupancy revision",
             vec![BLOCKER_MAPPING_NOT_READY.to_string()],
         );
     }
@@ -195,13 +228,15 @@ pub fn mapping_readiness(handle: &GeometryRuntimeHandle) -> ComponentReadiness {
 /// Exploration 板块 readiness 报告(Phase 2 baseline;Phase 5 实装后改 `ready`)。
 pub fn exploration_readiness(handle: &GeometryRuntimeHandle) -> ComponentReadiness {
     if !handle.lcm_backend_available {
-        return ComponentReadiness::not_ready(
+        return ComponentReadiness::not_ready_with_code(
+            ComponentReadinessCode::LcmBackendUnavailable,
             "LCM backend 不可用,explore controller 无法订阅 /explore/frontiers 输入",
             vec![BLOCKER_LCM_BACKEND.to_string()],
         );
     }
     if !handle.explore_ready_poll() {
-        return ComponentReadiness::not_ready(
+        return ComponentReadiness::not_ready_with_code(
+            ComponentReadinessCode::ExplorationNotReady,
             "nuwax-exploration controller 尚未实装 (Phase 5 待办)",
             vec![BLOCKER_EXPLORATION_NOT_READY.to_string()],
         );
@@ -264,10 +299,15 @@ mod tests {
 
     #[test]
     fn component_readiness_not_ready_has_blockers() {
-        let r = ComponentReadiness::not_ready("test", vec!["X".to_string()]);
+        let r = ComponentReadiness::not_ready_with_code(
+            ComponentReadinessCode::NavExecutionChainUnavailable,
+            "test",
+            vec!["X".to_string()],
+        );
         assert!(!r.ready);
         assert_eq!(r.reason, "test");
         assert_eq!(r.blockers, vec!["X".to_string()]);
+        assert_eq!(r.code, ComponentReadinessCode::NavExecutionChainUnavailable);
     }
 
     #[test]
@@ -309,5 +349,68 @@ mod tests {
                 .any(|blocker| blocker == BLOCKER_MAPPING_NOT_READY),
             "capability readiness must remain observable"
         );
+    }
+
+    #[tokio::test]
+    async fn navigation_readiness_requires_real_execution_chain_observations() {
+        use crate::lcm_runtime::NavState;
+        use crate::nav_runtime::{
+            MotionSinkObservation, PlannerInputObservation, TfChainObservation,
+        };
+
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        handle
+            .nav
+            .observe_stack_state(NavState {
+                status: "IDLE".into(),
+                message: "heartbeat".into(),
+                goal_id: String::new(),
+                distance_remaining: 0.0,
+                timestamp_ns: 1,
+            })
+            .await;
+        handle.set_cmd_vel_sink_ready(true);
+
+        let missing = navigation_readiness(&handle);
+        assert!(!missing.ready);
+        assert_eq!(
+            missing.code,
+            ComponentReadinessCode::NavExecutionChainUnavailable
+        );
+
+        handle
+            .nav
+            .observe_tf_chain(TfChainObservation {
+                generation: 1,
+                map_frame: "map".into(),
+                odom_frame: "odom".into(),
+                base_frame: "base_link".into(),
+                map_to_odom: true,
+                odom_to_base: true,
+            })
+            .expect("TF observation");
+        handle
+            .nav
+            .observe_planner_input(PlannerInputObservation {
+                generation: 1,
+                map_revision: 1,
+                map_frame: "map".into(),
+                pose_frame: "map".into(),
+                ready: true,
+            })
+            .expect("planner observation");
+        handle
+            .nav
+            .observe_motion_sink(MotionSinkObservation {
+                generation: 1,
+                ready: true,
+            })
+            .expect("motion sink observation");
+
+        let ready = navigation_readiness(&handle);
+        assert!(ready.ready, "{}", ready.reason);
+        assert_eq!(ready.code, ComponentReadinessCode::Ready);
     }
 }

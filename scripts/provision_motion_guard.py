@@ -8,10 +8,12 @@ import json
 import os
 from pathlib import Path
 import pwd
+import stat
+import subprocess
 import sys
 import tempfile
 import uuid
-from typing import Any, Iterable
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 PROVISION_FIELDS = ("instance_id", "schema_version")
@@ -31,25 +33,41 @@ EPOCH_FIELDS = (
 PEER_UID_ALLOWLIST = (
     "nuwax-motion-guard",
     "nuwax-motion-admin",
+    "nuwax-navigation",
+    "nuwax-gateway",
+)
+SERVICE_IDENTITY_USERS = (
+    "nuwax-motion-guard",
+    "nuwax-motion-admin",
+    "nuwax-navigation",
     "nuwax-geometry",
     "nuwax-gateway",
 )
+LEGACY_PEER_UID_ALLOWLIST = (
+    "nuwax-motion-guard",
+    "nuwax-motion-admin",
+    "nuwax-geometry",
+    "nuwax-gateway",
+)
+MAX_GENERATION = (1 << 64) - 1
+GUARD_SYSTEMD_UNIT = "nuwax-motion-safety-guard.service"
+MIGRATION_COMMAND = "scripts/install_motion_guard_deployment.sh migrate-peer-allowlist"
 
 
-def _compact_json(value: dict[str, Any]) -> str:
+def _compact_json(value: Dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
 
 
-def _checksum(body: dict[str, Any]) -> str:
+def _checksum(body: Dict[str, Any]) -> str:
     digest = hashlib.sha256(_compact_json(body).encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
 
 
-def _seal(body: dict[str, Any]) -> dict[str, Any]:
+def _seal(body: Dict[str, Any]) -> Dict[str, Any]:
     return {**body, "checksum": _checksum(body)}
 
 
-def build_provisioned_record(instance_id: str) -> dict[str, Any]:
+def build_provisioned_record(instance_id: str) -> Dict[str, Any]:
     parsed = uuid.UUID(instance_id)
     if parsed.version != 4 or str(parsed) != instance_id:
         raise ValueError("instance_id must be a lowercase hyphenated UUIDv4")
@@ -59,10 +77,10 @@ def build_provisioned_record(instance_id: str) -> dict[str, Any]:
 def build_initial_epoch_record(
     actuator_symbols_sha256: str,
     created_at: str,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     if not actuator_symbols_sha256.startswith("sha256:"):
         raise ValueError("actuator_symbols_sha256 must use sha256:<hex>")
-    digest = actuator_symbols_sha256.removeprefix("sha256:")
+    digest = actuator_symbols_sha256[len("sha256:") :]
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
         raise ValueError("actuator_symbols_sha256 must contain 64 lowercase hex chars")
     body = {
@@ -82,29 +100,25 @@ def build_initial_epoch_record(
 
 
 def _validate_record(
-    record: dict[str, Any],
+    record: Dict[str, Any],
     expected_fields: Iterable[str],
 ) -> None:
     fields = tuple(expected_fields)
     if tuple(record) != (*fields, "checksum"):
-        raise ValueError(
-            f"record fields/order drift: got={tuple(record)}, expected={(*fields, 'checksum')}"
-        )
+        raise ValueError(f"record fields/order drift: got={tuple(record)}, expected={(*fields, 'checksum')}")
     body = {field: record[field] for field in fields}
     expected_checksum = _checksum(body)
     if record["checksum"] != expected_checksum:
-        raise ValueError(
-            f"checksum mismatch: got={record['checksum']}, expected={expected_checksum}"
-        )
+        raise ValueError(f"checksum mismatch: got={record['checksum']}, expected={expected_checksum}")
 
 
-def _load_record(path: Path, fields: Iterable[str]) -> dict[str, Any]:
+def _load_record(path: Path, fields: Iterable[str]) -> Dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"record must be a non-symlink regular file: {path}")
     raw = path.read_text(encoding="utf-8")
 
-    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
+    def reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
         for key, value in pairs:
             if key in result:
                 raise ValueError(f"duplicate JSON field {key!r}: {path}")
@@ -120,7 +134,7 @@ def _load_record(path: Path, fields: Iterable[str]) -> dict[str, Any]:
 
 def _write_new_record(
     path: Path,
-    record: dict[str, Any],
+    record: Dict[str, Any],
     mode: int,
     uid: int,
     gid: int,
@@ -149,9 +163,65 @@ def _write_new_record(
         temporary_path.unlink(missing_ok=True)
 
 
-def _owner_ids(owner: str) -> tuple[int, int]:
+def _replace_record(
+    path: Path,
+    record: Dict[str, Any],
+    mode: int,
+    uid: int,
+    gid: int,
+) -> None:
+    payload = (_compact_json(record) + "\n").encode("utf-8")
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path: Optional[Path] = Path(temporary_name)
+    try:
+        os.fchmod(fd, mode)
+        os.fchown(fd, uid, gid)
+        with os.fdopen(fd, "wb", closefd=True) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        fd = -1
+        os.replace(str(temporary_path), path)
+        temporary_path = None
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _owner_ids(owner: str) -> Tuple[int, int]:
     account = pwd.getpwnam(owner)
     return account.pw_uid, account.pw_gid
+
+
+def validate_service_identity_uids() -> Dict[str, int]:
+    uid_by_user: Dict[str, int] = {}
+    missing: List[str] = []
+    for username in SERVICE_IDENTITY_USERS:
+        try:
+            uid_by_user[username] = int(pwd.getpwnam(username).pw_uid)
+        except KeyError:
+            missing.append(username)
+    # Unit/developer provisioning may run before systemd-sysusers. A partially
+    # provisioned production identity set is never accepted.
+    if len(missing) == len(SERVICE_IDENTITY_USERS):
+        return {}
+    if missing:
+        raise ValueError("required service identities are not provisioned: " + ", ".join(missing))
+    users_by_uid: Dict[int, List[str]] = {}
+    for username, uid in uid_by_user.items():
+        users_by_uid.setdefault(uid, []).append(username)
+    collisions = [names for names in users_by_uid.values() if len(names) > 1]
+    if collisions:
+        detail = "; ".join(", ".join(names) for names in collisions)
+        raise ValueError(f"service identity UID collision: {detail}")
+    return uid_by_user
 
 
 def _manifest_digest(path: Path) -> str:
@@ -167,7 +237,148 @@ def _ensure_state_dir(path: Path, uid: int, gid: int) -> None:
     os.chmod(path, 0o700)
 
 
+def _require_u64(record: Dict[str, Any], field: str) -> int:
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"epoch {field} must be an integer")
+    if value < 0 or value > MAX_GENERATION:
+        raise ValueError(f"epoch {field} is outside u64 range")
+    return value
+
+
+def _validate_epoch_semantics(
+    epoch: Dict[str, Any],
+    expected_peer_uid_allowlist: Tuple[str, ...],
+) -> None:
+    if epoch.get("schema_version") != 1:
+        raise ValueError("unsupported durable record schema version")
+    _require_u64(epoch, "generation")
+    _require_u64(epoch, "reset_generation")
+    boot_nonce_hex = epoch.get("boot_nonce_hex")
+    if not isinstance(boot_nonce_hex, str):
+        raise ValueError("epoch boot_nonce_hex must be a string")
+    if boot_nonce_hex:
+        try:
+            nonce = bytes.fromhex(boot_nonce_hex)
+        except ValueError as exc:
+            raise ValueError("epoch boot_nonce_hex is not hexadecimal") from exc
+        if len(nonce) != 16:
+            raise ValueError("epoch boot_nonce_hex must be exactly 128 bits")
+    if epoch.get("safety_gate") not in {"ResetRequired", "Armed"}:
+        raise ValueError("epoch safety_gate is invalid")
+    if epoch.get("lease_state") not in {"Idle", "Active", "Pausing", "Revoking"}:
+        raise ValueError("epoch lease_state is invalid")
+    if not isinstance(epoch.get("last_zero_ack_id"), str):
+        raise ValueError("epoch last_zero_ack_id must be a string")
+    if tuple(epoch.get("peer_uid_allowlist", ())) != expected_peer_uid_allowlist:
+        raise ValueError("epoch peer_uid_allowlist drift")
+    actuator_digest = epoch.get("actuator_symbols_sha256")
+    if not isinstance(actuator_digest, str) or not actuator_digest.startswith("sha256:"):
+        raise ValueError("epoch actuator_symbols_sha256 is invalid")
+    digest = actuator_digest[len("sha256:") :]
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("epoch actuator_symbols_sha256 is invalid")
+    if not isinstance(epoch.get("fenced"), bool):
+        raise ValueError("epoch fenced must be a boolean")
+    if not isinstance(epoch.get("created_at"), str) or not epoch["created_at"]:
+        raise ValueError("epoch created_at is required")
+
+
+def _require_current_peer_allowlist(epoch: Dict[str, Any]) -> None:
+    actual = tuple(epoch.get("peer_uid_allowlist", ()))
+    if actual == LEGACY_PEER_UID_ALLOWLIST:
+        raise ValueError(f"legacy epoch peer_uid_allowlist requires explicit migration; run {MIGRATION_COMMAND}")
+    if actual != PEER_UID_ALLOWLIST:
+        raise ValueError("epoch peer_uid_allowlist drift")
+
+
+def _verify_path_metadata(
+    path: Path,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+    directory: bool = False,
+) -> None:
+    metadata = path.lstat()
+    expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if path.is_symlink() or not expected_kind(metadata.st_mode):
+        kind = "directory" if directory else "record"
+        raise ValueError(f"{kind} must be a non-symlink {'directory' if directory else 'regular file'}: {path}")
+    if metadata.st_uid != uid or metadata.st_gid != gid:
+        raise ValueError(f"owner drift: {path}")
+    if stat.S_IMODE(metadata.st_mode) != mode:
+        raise ValueError(f"mode drift: {path}")
+
+
+def _load_verified_records(
+    state_dir: Path,
+    manifest: Optional[Path],
+    owner: str,
+) -> Tuple[int, int, Dict[str, Any], Dict[str, Any]]:
+    uid, gid = _owner_ids(owner)
+    provision_path = state_dir / "provisioned.json"
+    epoch_path = state_dir / "epoch.json"
+    provisioned = _load_record(provision_path, PROVISION_FIELDS)
+    epoch = _load_record(epoch_path, EPOCH_FIELDS)
+
+    instance_id = str(uuid.UUID(provisioned["instance_id"]))
+    if instance_id != provisioned["instance_id"] or uuid.UUID(instance_id).version != 4:
+        raise ValueError("provisioned.instance_id is not a canonical UUIDv4")
+    if provisioned["schema_version"] != 1 or epoch["schema_version"] != 1:
+        raise ValueError("unsupported durable record schema version")
+    if manifest is not None and epoch["actuator_symbols_sha256"] != _manifest_digest(manifest):
+        raise ValueError("epoch actuator hash does not match supplied manifest")
+
+    _verify_path_metadata(state_dir, uid=uid, gid=gid, mode=0o700, directory=True)
+    _verify_path_metadata(provision_path, uid=uid, gid=gid, mode=0o400)
+    _verify_path_metadata(epoch_path, uid=uid, gid=gid, mode=0o600)
+    return uid, gid, provisioned, epoch
+
+
+def _guard_systemd_state() -> Dict[str, str]:
+    result = subprocess.run(
+        [
+            "systemctl",
+            "show",
+            GUARD_SYSTEMD_UNIT,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=MainPID",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "systemctl show failed"
+        raise ValueError(f"cannot inspect {GUARD_SYSTEMD_UNIT}: {detail}")
+    state: Dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            state[key] = value
+    if set(state) != {"LoadState", "ActiveState", "MainPID"}:
+        raise ValueError(f"incomplete systemd state for {GUARD_SYSTEMD_UNIT}")
+    return state
+
+
+def _require_guard_stopped_for_migration() -> None:
+    state = _guard_systemd_state()
+    if state["LoadState"] != "loaded":
+        raise ValueError(f"{GUARD_SYSTEMD_UNIT} must be loaded before migration")
+    if state["ActiveState"] not in {"inactive", "failed"}:
+        raise ValueError(f"{GUARD_SYSTEMD_UNIT} must be inactive or failed before migration")
+    try:
+        main_pid = int(state["MainPID"])
+    except ValueError as exc:
+        raise ValueError(f"{GUARD_SYSTEMD_UNIT} MainPID is invalid") from exc
+    if main_pid != 0:
+        raise ValueError(f"{GUARD_SYSTEMD_UNIT} MainPID must be 0 before migration")
+
+
 def provision(state_dir: Path, manifest: Path, owner: str) -> None:
+    validate_service_identity_uids()
     uid, gid = _owner_ids(owner)
     _ensure_state_dir(state_dir, uid, gid)
     provision_path = state_dir / "provisioned.json"
@@ -182,55 +393,64 @@ def provision(state_dir: Path, manifest: Path, owner: str) -> None:
 
     if epoch_path.exists():
         epoch = _load_record(epoch_path, EPOCH_FIELDS)
+        _require_current_peer_allowlist(epoch)
+        _validate_epoch_semantics(epoch, PEER_UID_ALLOWLIST)
         if epoch["actuator_symbols_sha256"] != actuator_digest:
-            raise ValueError(
-                "existing epoch actuator_symbols_sha256 does not match supplied manifest"
-            )
+            raise ValueError("existing epoch actuator_symbols_sha256 does not match supplied manifest")
     else:
-        created_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-            "+00:00", "Z"
-        )
+        created_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         epoch = build_initial_epoch_record(actuator_digest, created_at)
         _write_new_record(epoch_path, epoch, 0o600, uid, gid)
 
     verify(state_dir, manifest, owner)
 
 
-def verify(state_dir: Path, manifest: Path | None, owner: str) -> None:
-    uid, gid = _owner_ids(owner)
-    provision_path = state_dir / "provisioned.json"
-    epoch_path = state_dir / "epoch.json"
-    provisioned = _load_record(provision_path, PROVISION_FIELDS)
-    epoch = _load_record(epoch_path, EPOCH_FIELDS)
+def verify(state_dir: Path, manifest: Optional[Path], owner: str) -> None:
+    validate_service_identity_uids()
+    _, _, _, epoch = _load_verified_records(state_dir, manifest, owner)
+    _require_current_peer_allowlist(epoch)
+    _validate_epoch_semantics(epoch, PEER_UID_ALLOWLIST)
 
-    instance_id = str(uuid.UUID(provisioned["instance_id"]))
-    if instance_id != provisioned["instance_id"] or uuid.UUID(instance_id).version != 4:
-        raise ValueError("provisioned.instance_id is not a canonical UUIDv4")
-    if provisioned["schema_version"] != 1 or epoch["schema_version"] != 1:
-        raise ValueError("unsupported durable record schema version")
-    if epoch["peer_uid_allowlist"] != list(PEER_UID_ALLOWLIST):
-        raise ValueError("epoch peer_uid_allowlist drift")
-    if manifest is not None and epoch["actuator_symbols_sha256"] != _manifest_digest(manifest):
-        raise ValueError("epoch actuator hash does not match supplied manifest")
 
-    state_stat = state_dir.stat()
-    if state_stat.st_uid != uid or state_stat.st_gid != gid:
-        raise ValueError(f"state directory owner drift: {state_dir}")
-    if state_stat.st_mode & 0o777 != 0o700:
-        raise ValueError(f"state directory mode drift: {state_dir}")
+def migrate_peer_allowlist(state_dir: Path, manifest: Path, owner: str) -> None:
+    validate_service_identity_uids()
+    uid, gid, _, epoch = _load_verified_records(state_dir, manifest, owner)
+    actual_allowlist = tuple(epoch.get("peer_uid_allowlist", ()))
+    if actual_allowlist == PEER_UID_ALLOWLIST:
+        raise ValueError("epoch peer_uid_allowlist is already current; migration refused")
+    if actual_allowlist != LEGACY_PEER_UID_ALLOWLIST:
+        raise ValueError("unexpected epoch peer_uid_allowlist; migration refused")
+    _validate_epoch_semantics(epoch, LEGACY_PEER_UID_ALLOWLIST)
+    _require_guard_stopped_for_migration()
+    if epoch["fenced"] is not True:
+        raise ValueError("epoch must be fenced before peer allowlist migration")
+    generation = _require_u64(epoch, "generation")
+    if generation == MAX_GENERATION:
+        raise ValueError("epoch generation overflow; migration refused")
 
-    for path, mode in ((provision_path, 0o400), (epoch_path, 0o600)):
-        stat_result = path.stat()
-        if stat_result.st_uid != uid or stat_result.st_gid != gid:
-            raise ValueError(f"record owner drift: {path}")
-        if stat_result.st_mode & 0o777 != mode:
-            raise ValueError(f"record mode drift: {path}")
+    migrated_body = {field: epoch[field] for field in EPOCH_FIELDS}
+    migrated_body.update(
+        {
+            "generation": generation + 1,
+            "boot_nonce_hex": "",
+            "safety_gate": "ResetRequired",
+            "lease_state": "Idle",
+            "peer_uid_allowlist": list(PEER_UID_ALLOWLIST),
+            "fenced": True,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        }
+    )
+    migrated = _seal(migrated_body)
+    _validate_record(migrated, EPOCH_FIELDS)
+    _validate_epoch_semantics(migrated, PEER_UID_ALLOWLIST)
+    _replace_record(state_dir / "epoch.json", migrated, 0o600, uid, gid)
+    verify(state_dir, manifest, owner)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Provision NuwaX motion guard durable records")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("provision", "verify"):
+    for command in ("provision", "verify", "migrate-peer-allowlist"):
         child = subparsers.add_parser(command)
         child.add_argument(
             "--state-dir",
@@ -242,13 +462,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command == "provision":
+        if args.command in {"provision", "migrate-peer-allowlist"}:
             if args.actuator_symbols_file is None:
-                raise ValueError("provision requires --actuator-symbols-file")
+                raise ValueError(f"{args.command} requires --actuator-symbols-file")
+        if args.command == "provision":
             provision(args.state_dir, args.actuator_symbols_file, args.owner)
+        elif args.command == "migrate-peer-allowlist":
+            migrate_peer_allowlist(
+                args.state_dir,
+                args.actuator_symbols_file,
+                args.owner,
+            )
         else:
             verify(args.state_dir, args.actuator_symbols_file, args.owner)
     except (KeyError, OSError, ValueError, json.JSONDecodeError) as error:

@@ -1,22 +1,35 @@
 [Unit]
+# Template: install with scripts/install_motion_guard_deployment.sh.
 Description=nuwax navigation stack (typed LCM runtime owner)
 Requires=nuwax-motion-safety-guard.service
+BindsTo=nuwax-motion-safety-guard.service
+PartOf=nuwax-motion-safety-guard.service
 After=network-online.target nuwax-motion-safety-guard.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=nuwax-navigation
-Group=nuwax-navigation
-WorkingDirectory=/home/unitree/nuwax-robot-bridge
+Group=nuwax-motion-clients
+WorkingDirectory=@NUWAX_REPO_ROOT@
 RuntimeDirectory=nuwax/navigation
 RuntimeDirectoryMode=0750
 UMask=0027
-EnvironmentFile=-/home/unitree/nuwax-robot-bridge/.env
+EnvironmentFile=-@NUWAX_REPO_ROOT@/.env
+# EnvironmentFile wins over Environment; Exec* /usr/bin/env assignments below are authoritative.
+Environment=NUWAX_LCM_BACKEND=real-lcm
 Environment=NUWAX_REAL_LCM_REQUIRED=true
+Environment=NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1
+Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
 Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
+Environment="NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope"
+Environment="NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope"
+Environment="NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope"
+Environment="NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope"
 ExecStartPre=/usr/bin/rm -f /run/nuwax/navigation/nuwax_nav_stack.ready
-ExecStart=/bin/bash /home/unitree/nuwax-robot-bridge/scripts/systemd/start_nav_stack.sh
+ExecStartPre=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/check_lcm_multicast.sh
+ExecStart=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_NAV_STACK_WARMUP_STEPS=150 NUWAX_NAV_STACK_BINARY=@NUWAX_REPO_ROOT@/services/nuwax-workspace/target/release/nuwax-nav-stack "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope" "NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope" /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/start_nav_stack.sh
+ExecStopPost=/usr/bin/rm -f /run/nuwax/navigation/nuwax_nav_stack.ready /run/nuwax/navigation/nuwax_nav_stack.ready.runtime
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure

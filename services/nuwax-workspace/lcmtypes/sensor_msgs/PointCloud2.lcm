@@ -1,20 +1,15 @@
-// LCM IDL — sensor_msgs.PointCloud2
-//
-// 来源：lcm-gen 标准 .lcm 语法。RTAB-Map / Unitree 雷达点云统一通过该
-// 类型传输。
-struct sensor_msgs__PointCloud2
-{
-    int64_t  stamp_sec;
-    int32_t  stamp_nsec;
-    string   frame_id;
-    int32_t  height;
-    int32_t  width;
-    byte     fields_length;
-    byte     fields[4096];
-    boolean  is_bigendian;
-    int32_t  point_step;
-    int32_t  row_step;
-    byte     data_length;
-    byte     data[16777216];   // 最大 16 MiB,8 MiB × 2 系数
-    boolean  is_dense;
+package sensor_msgs;
+
+struct PointCloud2 {
+    int32_t fields_length;
+    int32_t data_length;
+    std_msgs.Header header;
+    int32_t height;
+    int32_t width;
+    PointField fields[fields_length];
+    boolean is_bigendian;
+    int32_t point_step;
+    int32_t row_step;
+    byte data[data_length];
+    boolean is_dense;
 }

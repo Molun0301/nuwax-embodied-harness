@@ -5,7 +5,7 @@ import os
 import socket
 import threading
 import time
-from typing import Callable, Collection
+from typing import Callable, Collection, Dict, Optional, Set, Tuple, Type, Union
 import uuid
 
 from google.protobuf.message import DecodeError, Message
@@ -150,7 +150,7 @@ class MotionGuardInternalError(MotionGuardRemoteError):
     pass
 
 
-_REMOTE_ERRORS: dict[str, type[MotionGuardRemoteError]] = {
+_REMOTE_ERRORS: Dict[str, Type[MotionGuardRemoteError]] = {
     "INVALID_ARGUMENT": InvalidArgumentError,
     "PERMISSION_DENIED": PermissionDeniedError,
     "ACTION_NOT_ALLOWED": ActionNotAllowedError,
@@ -201,7 +201,7 @@ class CommandConfirmation:
     operation_id: str
     result: GuardResultSnapshot
     applied_monotonic_ns: int
-    zero: ZeroConfirmation | None = None
+    zero: Optional[ZeroConfirmation] = None
 
 
 @dataclass(frozen=True)
@@ -226,7 +226,7 @@ class OperationStatus:
     operation_id: str
     resolved: bool
     target_ack: int
-    zero: ZeroConfirmation | None
+    zero: Optional[ZeroConfirmation]
 
 
 class MotionGuardNotReadyError(MotionGuardError):
@@ -246,15 +246,15 @@ class MotionGuardFenceError(MotionGuardError):
         self,
         message: str,
         *,
-        cause: BaseException | None = None,
-        zero: ZeroConfirmation | None = None,
+        cause: Optional[BaseException] = None,
+        zero: Optional[ZeroConfirmation] = None,
     ) -> None:
         super().__init__(message)
         self.cause = cause
         self.zero = zero
 
 
-def normalize_source(source: int | str) -> int:
+def normalize_source(source: Union[int, str]) -> int:
     if isinstance(source, bool):
         raise MotionGuardUsageError("GuardSource must not be a boolean")
     if isinstance(source, str):
@@ -281,12 +281,12 @@ class MotionGuardClient:
 
     def __init__(
         self,
-        socket_path: str | os.PathLike[str] = DEFAULT_SOCKET_PATH,
+        socket_path: Union[str, os.PathLike[str]] = DEFAULT_SOCKET_PATH,
         *,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_frame_bytes: int = MAX_FRAME_BYTES,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
-        id_factory: Callable[[], str] | None = None,
+        id_factory: Optional[Callable[[], str]] = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise MotionGuardUsageError("timeout_seconds must be positive")
@@ -299,10 +299,10 @@ class MotionGuardClient:
         self._id_factory = id_factory or (lambda: str(uuid.uuid4()))
         self._io_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
-        self._sessions: set[MotionGuardSession] = set()
+        self._sessions: Set[MotionGuardSession] = set()
         self._closed = False
         self._closing = False
-        self._failure: BaseException | None = None
+        self._failure: Optional[BaseException] = None
         self._socket = self._connect()
 
     def _connect(self) -> socket.socket:
@@ -341,7 +341,7 @@ class MotionGuardClient:
                 return
             self._closing = True
             sessions = tuple(self._sessions)
-        first_error: MotionGuardError | None = None
+        first_error: Optional[MotionGuardError] = None
         for session in sessions:
             try:
                 session.close()
@@ -421,9 +421,9 @@ class MotionGuardClient:
         request: pb.MotionGuardRequest,
         *,
         expected_outcome: str,
-        expected_acks: Collection[int] | None,
+        expected_acks: Optional[Collection[int]],
         allow_remote_error: bool = False,
-    ) -> tuple[Message, GuardResultSnapshot]:
+    ) -> Tuple[Message, GuardResultSnapshot]:
         operation = request.WhichOneof("operation")
         if operation != expected_outcome:
             raise MotionGuardUsageError(
@@ -551,7 +551,7 @@ class MotionGuardClient:
             self._failure = error
         self._close_socket()
 
-    def get_readiness(self, source: int | str) -> ReadinessStatus:
+    def get_readiness(self, source: Union[int, str]) -> ReadinessStatus:
         source_value = normalize_source(source)
         request = pb.MotionGuardRequest(
             api_version=API_VERSION,
@@ -575,7 +575,7 @@ class MotionGuardClient:
             boot_nonce=boot_nonce,
         )
 
-    def get_safety_state(self, source: int | str) -> SafetyState:
+    def get_safety_state(self, source: Union[int, str]) -> SafetyState:
         source_value = normalize_source(source)
         request = pb.MotionGuardRequest(
             api_version=API_VERSION,
@@ -600,7 +600,7 @@ class MotionGuardClient:
 
     def get_operation_result(
         self,
-        source: int | str,
+        source: Union[int, str],
         operation_id: str,
     ) -> OperationStatus:
         source_value = normalize_source(source)
@@ -644,9 +644,9 @@ class MotionGuardClient:
 
     def acquire_session(
         self,
-        source: int | str,
+        source: Union[int, str],
         *,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
         renew_interval_seconds: float = RENEW_INTERVAL_NS / 1_000_000_000,
     ) -> MotionGuardSession:
         source_value = normalize_source(source)
@@ -719,7 +719,7 @@ class MotionGuardClient:
         physical_confirm: bool,
         reason: str,
         operator: str,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> ResetConfirmation:
         if physical_confirm is not True:
             raise MotionGuardUsageError("physical_confirm=True is required")
@@ -764,7 +764,7 @@ class MotionGuardClient:
         self,
         reason: str,
         *,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> ZeroConfirmation:
         reason_value = self._require_text(reason, "reason")
         readiness = self.get_readiness(pb.GUARD_SOURCE_GATEWAY_MANUAL)
@@ -795,7 +795,7 @@ class MotionGuardClient:
         )
         return self._zero_confirmation(outcome.zero_ack)
 
-    def _operation_id_value(self, value: str | None, label: str) -> str:
+    def _operation_id_value(self, value: Optional[str], label: str) -> str:
         if value is None:
             return self._new_id(label)
         return self._require_text(value, "operation_id")
@@ -839,17 +839,17 @@ class MotionGuardSession:
         self.renew_interval_seconds = float(renew_interval_seconds)
         self._lock = threading.RLock()
         self._stop_renewal = threading.Event()
-        self._renew_thread: threading.Thread | None = None
+        self._renew_thread: Optional[threading.Thread] = None
         self._sequence = 0
         self._active = True
         self._fenced = False
         self._registered = False
-        self._failure: BaseException | None = None
-        self._fence_error: MotionGuardFenceError | None = None
-        self._zero: ZeroConfirmation | None = None
+        self._failure: Optional[BaseException] = None
+        self._fence_error: Optional[MotionGuardFenceError] = None
+        self._zero: Optional[ZeroConfirmation] = None
 
     @property
-    def failure(self) -> BaseException | None:
+    def failure(self) -> Optional[BaseException]:
         with self._lock:
             return self._failure
 
@@ -915,8 +915,8 @@ class MotionGuardSession:
         *,
         action: int,
         label: str,
-        operation_id: str | None = None,
-    ) -> tuple[pb.RequestEnvelope, str]:
+        operation_id: Optional[str] = None,
+    ) -> Tuple[pb.RequestEnvelope, str]:
         self._sequence += 1
         operation = self._client._operation_id_value(operation_id, label)
         return (
@@ -945,7 +945,7 @@ class MotionGuardSession:
         field: str,
         command: Message,
         expected_acks: Collection[int],
-        operation_id: str | None,
+        operation_id: Optional[str],
     ) -> CommandConfirmation:
         with self._lock:
             self._assert_operational()
@@ -987,7 +987,7 @@ class MotionGuardSession:
         linear_y_mps: float = 0.0,
         angular_z_rps: float = 0.0,
         *,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> CommandConfirmation:
         return self._submit_motion(
             action=pb.GUARD_ACTION_TWIST,
@@ -1001,7 +1001,7 @@ class MotionGuardSession:
             operation_id=operation_id,
         )
 
-    def stop(self, *, operation_id: str | None = None) -> CommandConfirmation:
+    def stop(self, *, operation_id: Optional[str] = None) -> CommandConfirmation:
         return self._submit_motion(
             action=pb.GUARD_ACTION_STOP,
             field="stop",
@@ -1016,7 +1016,7 @@ class MotionGuardSession:
         pitch_rad: float,
         yaw_rad: float,
         *,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> CommandConfirmation:
         return self._submit_motion(
             action=pb.GUARD_ACTION_BODY_POSE,
@@ -1036,7 +1036,7 @@ class MotionGuardSession:
         self,
         level: int,
         *,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> CommandConfirmation:
         if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 3:
             raise MotionGuardUsageError("speed level must be an integer in [1, 3]")
@@ -1054,7 +1054,7 @@ class MotionGuardSession:
         self,
         enabled: bool,
         *,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> CommandConfirmation:
         if not isinstance(enabled, bool):
             raise MotionGuardUsageError("obstacle policy enabled must be a boolean")
@@ -1073,7 +1073,7 @@ class MotionGuardSession:
         action: int,
         *,
         enabled: bool = True,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> CommandConfirmation:
         if isinstance(action, bool) or not isinstance(action, int):
             raise MotionGuardUsageError("SportAction must be an integer enum value")
@@ -1133,7 +1133,7 @@ class MotionGuardSession:
         self,
         target_mode: int,
         *,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> ModeSwitchConfirmation:
         if isinstance(target_mode, bool) or not isinstance(target_mode, int):
             raise MotionGuardUsageError("ControlMode must be an integer enum value")
@@ -1195,7 +1195,7 @@ class MotionGuardSession:
         self,
         reason: str,
         *,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> ZeroConfirmation:
         reason_value = self._client._require_text(reason, "reason")
         self._stop_and_join_renewal()
@@ -1234,7 +1234,7 @@ class MotionGuardSession:
     def revoke_and_zero(
         self,
         *,
-        operation_id: str | None = None,
+        operation_id: Optional[str] = None,
     ) -> ZeroConfirmation:
         self._stop_and_join_renewal()
         with self._lock:

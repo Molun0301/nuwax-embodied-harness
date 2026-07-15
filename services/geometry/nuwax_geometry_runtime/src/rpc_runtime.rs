@@ -29,6 +29,9 @@ enum GeometryRpcMethod {
     GetOccupancyGrid,
     GetOccupancyGridData,
     GetOccupancyGridShm,
+    StartMapping,
+    StopMapping,
+    GetMappingState,
     SetNavigationGoal,
     CancelNavigation,
     GetNavigationReadiness,
@@ -54,6 +57,9 @@ const RPC_METHODS: &[GeometryRpcMethod] = &[
     GeometryRpcMethod::GetOccupancyGrid,
     GeometryRpcMethod::GetOccupancyGridData,
     GeometryRpcMethod::GetOccupancyGridShm,
+    GeometryRpcMethod::StartMapping,
+    GeometryRpcMethod::StopMapping,
+    GeometryRpcMethod::GetMappingState,
     GeometryRpcMethod::SetNavigationGoal,
     GeometryRpcMethod::CancelNavigation,
     GeometryRpcMethod::GetNavigationReadiness,
@@ -81,6 +87,9 @@ impl GeometryRpcMethod {
             Self::GetOccupancyGrid => "get_occupancy_grid",
             Self::GetOccupancyGridData => "get_occupancy_grid_data",
             Self::GetOccupancyGridShm => "get_occupancy_grid_shm",
+            Self::StartMapping => "start_mapping",
+            Self::StopMapping => "stop_mapping",
+            Self::GetMappingState => "get_mapping_state",
             Self::SetNavigationGoal => "set_navigation_goal",
             Self::CancelNavigation => "cancel_navigation",
             Self::GetNavigationReadiness => "get_navigation_readiness",
@@ -196,6 +205,15 @@ impl GeometryRpcHandler {
             GeometryRpcMethod::GetOccupancyGridShm => {
                 call_unary!(Empty, get_occupancy_grid_shm)
             }
+            GeometryRpcMethod::StartMapping => {
+                call_unary!(StartMappingRequest, start_mapping)
+            }
+            GeometryRpcMethod::StopMapping => {
+                call_unary!(StopMappingRequest, stop_mapping)
+            }
+            GeometryRpcMethod::GetMappingState => {
+                call_unary!(Empty, get_mapping_state)
+            }
             GeometryRpcMethod::SetNavigationGoal => {
                 call_unary!(NavigationGoal, set_navigation_goal)
             }
@@ -282,7 +300,7 @@ mod tests {
             .copied()
             .map(GeometryRpcMethod::rpc_name)
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 25);
         assert!(names.contains(&"GeometryRuntimeService/health_check".to_string()));
         assert!(names.contains(&"GeometryRuntimeService/stop".to_string()));
         assert!(names

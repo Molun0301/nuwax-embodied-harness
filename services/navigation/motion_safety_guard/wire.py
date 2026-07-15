@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from typing import Optional
 
 from google.protobuf.message import Message
 
@@ -19,7 +20,7 @@ def operation_message(request: pb.MotionGuardRequest) -> Message:
     return getattr(request, operation)
 
 
-def operation_envelope(request: pb.MotionGuardRequest) -> pb.RequestEnvelope | None:
+def operation_envelope(request: pb.MotionGuardRequest) -> Optional[pb.RequestEnvelope]:
     message = operation_message(request)
     if "envelope" not in message.DESCRIPTOR.fields_by_name:
         return None
@@ -64,7 +65,8 @@ def source_name(source: int) -> str:
         name = pb.GuardSource.Name(source)
     except ValueError as exc:
         raise WireContractError(f"unknown GuardSource value {source}") from exc
-    return name.removeprefix("GUARD_SOURCE_")
+    prefix = "GUARD_SOURCE_"
+    return name[len(prefix) :] if name.startswith(prefix) else name
 
 
 def request_source_name(request: pb.MotionGuardRequest) -> str:

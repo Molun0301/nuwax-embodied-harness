@@ -267,7 +267,7 @@ def build_scene_space_id(
 
 # 文件系统中不允许出现的字符（POSIX/常见 FS 取交集，再补常规危险符号），
 # 用单字符 `_` 替换；保留中文/Unicode 字母数字，避免 URL 编码导致的 sqlite 路径
-# 不可达问题（参见 docs/开发文档/ROS全链路修复-2026-05-13/worker2-rtabmap/feadback.md）。
+# 避免数据库路径不可达。
 _FORBIDDEN_DIR_CHARS = set('/\\\x00:*?"<>|')
 
 
@@ -281,7 +281,7 @@ def build_safe_dir_segment(raw_name: str) -> str:
     规则：
     - strip + NFC 归一化，避免 macOS NFD 与 Linux NFC 不一致；
     - 控制字符与文件系统保留符号 → `_`；
-    - 不做 URL/percent 编码，保留中文等 Unicode 字母数字，让 rtabmap、SQLite
+    - 不做 URL/percent 编码，保留中文等 Unicode 字母数字，让 SQLite
       在该路径上直接 open 而不会因为 `%XX` 解释歧义打不开数据库；
     - 整段去重连续 `_`，避免污染显示。
     """

@@ -64,14 +64,14 @@ def build_default_nuwax_workspace_dir() -> str:
     )
 
 
-def build_default_rtabmap_database_root() -> str:
-    """返回默认 RTAB-Map 数据库存储根目录。"""
+def build_default_mapping_database_root() -> str:
+    """返回默认建图数据库存储根目录。"""
 
-    return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "rtabmap")
+    return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "mapping")
 
 
-def build_default_rtabmap_pcd_root() -> str:
-    """返回默认 RTAB-Map PCD 资产存储根目录。"""
+def build_default_mapping_pcd_root() -> str:
+    """返回默认建图 PCD 资产存储根目录。"""
 
     return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "pcd")
 
@@ -174,11 +174,7 @@ class GeometryTraversabilityFilterConfig:
 
 @dataclass
 class MappingOutputConfig:
-    """nuwax-mapping 输出资产与诊断摘要配置。
-
-    v4 rename (R-N14 Phase 1):从 `RtabmapOutputConfig` 平移为 `MappingOutputConfig`。
-    旧类名作为 alias 保留 1 个版本周期,详见 `services/geometry/config.py`。
-    """
+    """nuwax-mapping 输出资产与诊断摘要配置。"""
 
     database_asset_name: str = "nuwax_mapping_state.db"
     pcd_asset_name: str = "cloud_map.pcd"
@@ -191,18 +187,13 @@ class MappingOutputConfig:
 
 @dataclass
 class MappingBackendConfig:
-    """nuwax-mapping 后端状态与输出配置（由 nuwax-mapping crate 提供底层能力）。
-
-    v4 rename (R-N14 Phase 1):从 `RtabmapConfig` 平移为 `MappingBackendConfig`,
-    字段一一对齐 nuwax-mapping crate wire-format 命名。旧类名作为 alias 保留
-    1 个版本周期,详见 `services/geometry/config.py`。
-    """
+    """nuwax-mapping 后端状态与输出配置。"""
 
     profile_name: str = "nuwax_mapping"
     profile_enabled: bool = True
     default_profile: bool = True
-    database_root: str = field(default_factory=build_default_rtabmap_database_root)
-    pcd_root: str = field(default_factory=build_default_rtabmap_pcd_root)
+    database_root: str = field(default_factory=build_default_mapping_database_root)
+    pcd_root: str = field(default_factory=build_default_mapping_pcd_root)
     mapping_crate: str = "nuwax-mapping"
     occupancy_projection: str = "projected_occupancy"
     input_contract: str = "platform_geometry_inputs"
@@ -216,7 +207,7 @@ class MappingBackendConfig:
 
 @dataclass
 class NavigationBackendConfig:
-    """nuwax-nav-stack 导航后端配置（替代旧 Nav2 action provider）。"""
+    """nuwax-nav-stack 导航后端配置。"""
 
     goal_channel: str = "/nav/goal"
     cancel_channel: str = "/nav/cancel"
@@ -228,7 +219,7 @@ class NavigationBackendConfig:
 
 @dataclass
 class ExternalGeometryStackConfig:
-    """nuwax-geometry-runtime 托管配置（替代旧 ROS2 外部栈）。"""
+    """nuwax-geometry-runtime 托管配置。"""
 
     enabled: bool = True
     binary_path: str = field(default_factory=build_default_geometry_runtime_binary)
@@ -360,7 +351,7 @@ class LcmChannelConfig:
 
 @dataclass
 class PlatformGeometryConfig:
-    """平台几何引擎统一配置（目标态：LCM + nuwax-geometry-runtime，无 ROS2/Nav2）。
+    """平台几何引擎统一配置（LCM + nuwax-geometry-runtime）。
 
     `lcm_backend` 只接受已实装的 `real-lcm` 后端。配置为已删除的
     fake backend 或 real-LCM 初始化失败时，运行时必须 fail-closed，

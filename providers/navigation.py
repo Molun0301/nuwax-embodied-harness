@@ -31,7 +31,7 @@ class NavigationProvider(BaseProvider, Protocol):
     nav_action_namespace: str = "/navigate_to_pose"
 
     def navigate(self, goal: NavigationGoal, timeout_sec: Optional[int] = None) -> str:
-        """提交导航目标（Nav2 action proxy gRPC），返回 request_id。"""
+        """提交导航目标并返回 request_id。"""
 
     def cancel(self, request_id: Optional[str] = None) -> bool:
         """取消指定 request_id 的导航；request_id 为空时取消当前 ACTIVE。"""

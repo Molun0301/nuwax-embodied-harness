@@ -146,8 +146,7 @@ def handle_list_maps(
     requested_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     del requested_by
-    # 只读目录查询：默认读缓存快照，不触发 live 定位重定位（避免把"读地图清单"
-    # 放大成"打 ROS2 重定位"导致 MCP 客户端超时，见超时根因 D2）。
+    # 只读目录查询默认读缓存快照，避免触发实时重定位导致 MCP 客户端超时。
     return {
         "maps": ctx.map_workspace_service.list_maps(refresh_localization=False),
         "active_workspace": ctx.map_workspace_service.get_active_workspace(refresh_localization=False),

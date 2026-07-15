@@ -31,7 +31,7 @@ class NavigationService:
 
     平台导航运行时核心：
     - 维护平台导航状态机，管理 NavigationGoal -> 当前导航后端 -> NavigationContext 的完整链路
-    - Nav2 action 是唯一正式导航执行器，目标生成、状态推进、失败语义、取消语义都沉淀在平台
+    - 原生导航运行时是唯一正式执行器，目标生成、状态推进、失败语义和取消语义都沉淀在平台
     - 已废弃的 platform_grid 自定义执行链不得作为正式后端或回退路径重新接入
     - 导航完成与否由平台状态机和到点验证共同决定
     """
@@ -98,7 +98,7 @@ class NavigationService:
         """刷新导航上下文，使用平台导航状态机管理状态转移。
 
         主链：NavigationGoal -> 平台当前导航后端 -> 平台 NavigationContext
-        Nav2 action 只负责执行反馈，不负责平台任务定义。
+        后端只负责执行反馈，不负责平台任务定义。
         """
 
         provider = self._find_navigation_provider()
@@ -403,7 +403,7 @@ class NavigationService:
 
         Args:
             timeout_sec: 任务级超时上限（秒）。超时后下发 cancel_goal 并抛 GatewayError，
-                避免后端永驻 RUNNING（如 Nav2 action 卡死）导致调用方线程永久阻塞。None 表示不限时。
+                避免后端永驻 RUNNING 导致调用方线程永久阻塞。None 表示不限时。
         """
 
         self.set_goal(goal)
@@ -572,6 +572,13 @@ class NavigationService:
                         "latest_frontiers": frontiers if isinstance(frontiers, list) else [],
                         "current_frontier": current_frontier if isinstance(current_frontier, dict) else None,
                         "frontier_count": context.exploration_state.frontier_count,
+                        "revision": exploration_metadata.get("revision"),
+                        "selected_source": exploration_metadata.get("selected_source"),
+                        "last_stop_reason": exploration_metadata.get("last_stop_reason"),
+                        "child_task_id": exploration_metadata.get("child_task_id"),
+                        "map_version_id": exploration_metadata.get("map_version_id"),
+                        "map_revision": exploration_metadata.get("map_revision"),
+                        "state_source": exploration_metadata.get("state_source"),
                         "geometry_session_mode": geometry_session_mode or "explore",
                         "status_text": exploration_metadata.get("status_text"),
                         "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
@@ -597,6 +604,8 @@ class NavigationService:
                             "backend_name": provider.provider_name,
                             "exploration_status": exploration_status,
                             "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
+                            "revision": exploration_metadata.get("revision"),
+                            "map_revision": exploration_metadata.get("map_revision"),
                         },
                     )
                 elif geometry_session_mode != "explore" and self._frontier_stream_has_active_geometry():
@@ -837,7 +846,7 @@ class NavigationService:
             return
         exploration_state = exploration_context.exploration_state
         metadata = dict(getattr(exploration_state, "metadata", {}) or {})
-        if metadata.get("exploration_mode") not in {"go2_rtabnav2_script", "go2_rtabmap_script"}:
+        if metadata.get("exploration_mode") != "external_geometry_script":
             return
         if exploration_state.status not in {
             ExplorationStatus.ACCEPTED,
@@ -867,10 +876,10 @@ class NavigationService:
             message = exploration_state.message or "外部前沿探索已结束。"
         elif any(token in upper for token in ("NAVIGATING", "FOLLOWING")):
             nav_status = NavigationStatus.RUNNING
-            message = "外部 Nav2 前沿探索导航中。"
+            message = "外部前沿探索导航中。"
         elif "DISPATCHING" in upper:
             nav_status = NavigationStatus.PLANNING
-            message = "外部 Nav2 正在派发前沿目标。"
+            message = "外部探索器正在派发前沿目标。"
         elif "WARMING UP" in upper:
             nav_status = NavigationStatus.PLANNING
             message = "探索器预热中，等待派发前沿目标。"
@@ -1078,7 +1087,7 @@ class NavigationService:
             return default
         message = str(getattr(state, "message", "") or "").strip()
         metadata = dict(getattr(state, "metadata", {}) or {})
-        readiness = metadata.get("readiness") or metadata.get("nav2_readiness")
+        readiness = metadata.get("readiness") or metadata.get("navigation_readiness")
         reasons = []
         if isinstance(readiness, dict):
             errors = readiness.get("errors")

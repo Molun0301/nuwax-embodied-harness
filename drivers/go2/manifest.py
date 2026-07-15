@@ -67,7 +67,12 @@ def build_go2_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Rob
             memory_mode_recommendation="cloud",
             perception_mode_recommendation="hybrid",
             telemetry_interval_sec=2.0,
-            telemetry_process_keywords=("gateway", "nuwax_geometry_runtime", "robot_bridge", "go2_video_streamer"),
+            telemetry_process_keywords=(
+                "gateway",
+                "nuwax_geometry_runtime",
+                "robot_bridge",
+                "nuwax-go2-video-streamer",
+            ),
         ),
     )
 

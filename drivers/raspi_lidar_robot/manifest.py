@@ -40,7 +40,7 @@ def build_raspi_lidar_robot_manifest(config: Optional["NuwaxRobotBridgeConfig"] 
         robot_name="raspi_lidar_robot",
         robot_model="raspi_lidar_robot",
         entrypoint="drivers/raspi_lidar_robot/assembly.py:create_raspi_lidar_robot_assembly",
-        description="树莓派 + 2D 激光雷达 + USB 摄像头小机器狗；tier=lite；2D SLAM 走 native runtime（nuwax-geometry-runtime），不再引入 ROS2 包。",
+        description="树莓派 + 2D 激光雷达 + USB 摄像头小机器狗；tier=lite；2D SLAM 走 nuwax-geometry-runtime。",
         capability_matrix=RASPI_LIDAR_CAPABILITY_MATRIX,
         required_components=(
             ComponentBinding(
@@ -53,7 +53,7 @@ def build_raspi_lidar_robot_manifest(config: Optional["NuwaxRobotBridgeConfig"] 
             ComponentBinding(
                 name="raspi_mapping_script",
                 path="services.geometry.external_script_runner.Go2ShSlamScript",
-                description="2D 激光雷达 native mapping 后端 launcher（树莓派共享 nuwax-mapping 板块;无 RaspiRtabMapScript 类,改走 Go2ShSlamScript generic,Phase 6 已 no-op 化）。",
+                description="2D 激光雷达 native mapping 后端 launcher。",
                 required=False,
             ),
             ComponentBinding(

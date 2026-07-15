@@ -21,13 +21,8 @@
    3. 析构方 join owner thread，确保进程内不残留 LCM 生命周期
 */
 //!
-//! ## 2026-07-08 fake-lcm 根除(v3 F2 决策)
-//!
-//! fake-lcm backend(`nuwax-transport::FakeLcmBackend` + `MockLcmBackend` Python
-//! 类)已物理删除。本 crate 是 nuwax 仓内 LCM 链路的**唯一**入口,镜像必须装
-//! `liblcm-dev` 1.3~1.5(版本锁 `>= 1.3, < 1.6` 由 nuwax-lcm-sys/build.rs 守门)。
-//!
-//! 不允许以 fake 假装真;fake-lcm 没有存在的意义(v3 用户硬约束)。
+//! 本 crate 是 nuwax 仓内 LCM 链路的唯一入口。镜像必须安装
+//! `liblcm-dev` 1.3~1.5（版本锁 `>= 1.3, < 1.6` 由 build.rs 守门）。
 
 // FFI binding 必然需要 unsafe;但我们**不允许**在自己写的新代码里用 unsafe
 // —— 所有 unsafe 都封装在 extern "C" 调用处,其它逻辑都用 safe Rust。
@@ -65,7 +60,7 @@ const IDLE_HANDLE_TIMEOUT_MS: i32 = 50;
 
 /// real-lcm 错误。
 ///
-/// 2026-07-08 fake-lcm 物理删除后,本 enum 是 nuwax 仓内 LCM 唯一错误源;
+/// 本 enum 是 nuwax 仓内 LCM 唯一错误源；
 /// 错误来自 liblcm 内部,所以必须可观测;上层 (`LcmTransport::publish`)
 /// 把该错误转成 `TransportError::LcmBackend`。
 #[derive(Debug, Error)]

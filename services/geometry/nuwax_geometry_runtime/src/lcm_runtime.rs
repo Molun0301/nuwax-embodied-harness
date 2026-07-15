@@ -5,16 +5,14 @@
 
 //! LCM-first geometry runtime state loop。
 //!
-//! 该模块替换原 `ros2_bridge.rs`：不再订阅 ROS2 topic，而是通过
-//! `nuwax_transport::LcmTransport` 订阅 LCM typed channel，将 typed frame
+//! 该模块通过 `nuwax_transport::LcmTransport` 订阅 LCM typed channel，将 typed frame
 //! 累积到 `SharedState`，供 gRPC facade（`server.rs`）查询/订阅。
 //!
-//! ## backend 策略(2026-07-08 fake-lcm 物理删除)
+//! ## backend 策略
 //! - 唯一 backend:`LcmTransport::new_real(&lcm_url)`,基于 `nuwax-transport/real-lcm` feature。
-//! - 通过 `NUWAX_LCM_BACKEND` 环境变量显式选择：仅接受 `real-lcm` / `real` / 空(默认 real-lcm);
-//!   其它值(包括 `fake-lcm` / `fake`)→ 启动期 `process::exit(1)` + `LCM_BACKEND_UNSUPPORTED`。
-//!   **严禁静默 fallback**(fake backend 已物理删除,v3 F2 决策)。
-//! - 不允许回退 ROS2 / r2r / DDS / RMW。
+//! - `NUWAX_LCM_BACKEND` 仅接受 `real-lcm` 或空值（默认 real-lcm）；
+//!   其它值在启动期以 `LCM_BACKEND_UNSUPPORTED` 退出。
+//! - 不允许降级到其它传输后端。
 //!
 //! ## channel 命名约定
 //! 与 `00_执行方案.md` §2.3 一致：
@@ -25,8 +23,7 @@
 //! - `/nav/state#nuwax_msgs.NavigationState`
 //! - `/explore/frontiers#nuwax_msgs.FrontierList`
 //!
-//! 这里的 `nav_msgs/Odometry` 等名称是 LCM typed message 命名空间字符串，
-//! 不引入 ROS2 package 依赖。
+//! 这里的 `nav_msgs/Odometry` 等名称仅是 LCM typed message 命名空间字符串。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -59,12 +56,12 @@ use crate::channel_registry;
 use crate::channel_registry::ChannelKey;
 
 // ============================================================================
-// 状态定义（与原 ros2_bridge.rs 同结构，便于 server.rs 不感知 backend 切换）
+// 状态定义
 // ============================================================================
 
 /// Phase 1 fail-fast 错误：上游 dimos `nuwax-lcm-sys`/`nuwax-lcm` 尚不存在
 ///（`nuwax-transport/real-lcm` feature 仍为空桩），所以 `real-lcm` backend
-/// 启动期直接拒绝；2026-07-08 fake-lcm 物理删除后无任何 fallback。错误码 `LCM_BACKEND_UNAVAILABLE`
+/// 启动期直接拒绝且不做降级。错误码 `LCM_BACKEND_UNAVAILABLE`
 /// 必须在 stderr 中可见供 start 脚本与运维 grep 识别。
 #[derive(Debug, Error)]
 #[error(
@@ -116,7 +113,7 @@ pub struct TransformEntry {
 }
 
 /// 动态 /tf 兼容镜像存活时长（纳秒）。stamp>0 且超过 TTL 的边在合成位姿前被裁剪，
-/// 避免老版本 RTAB-Map/LCM 重启遗留陈旧 map→odom 污染 BFS。stamp==0 不过期。
+/// 避免运行时重启遗留陈旧 map→odom 污染 BFS。stamp==0 不过期。
 /// 主查询路径使用 [`TfTree`] 的同一 10 秒历史窗口。
 const TF_ENTRY_TTL_NS: u64 = 10_000_000_000;
 
@@ -530,8 +527,8 @@ pub struct GeometryRuntimeHandle {
     /// adapter ingress ABI; one coalescer owns the broadcast -> watch bridge.
     pub map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
     pub transport: LcmTransport,
-    /// canonical LCM backend 名（HealthCheck / 日志 / diagnostics 用）：
-    /// 2026-07-08 fake-lcm 物理删除后,字段值固定为 `real-lcm`;
+    /// canonical LCM backend 名（HealthCheck / 日志 / diagnostics 用），
+    /// 字段值固定为 `real-lcm`；
     /// 用户请求 real-lcm 但 liblcm 不可用时由上层 `set transport_backend_name` 改写为
     /// `real-lcm-unavailable`。
     pub transport_backend_name: &'static str,
@@ -1295,66 +1292,53 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
 // 启动：构造 LcmTransport (real-lcm) + SharedState + 各订阅 task
 // ============================================================================
 
-/// LCM backend 选择。2026-07-08 fake-lcm 物理删除后,只剩 `Real`。
-/// `NUWAX_LCM_BACKEND` 仅接受 `real-lcm` / `real` / 空(默认 real);
-/// 其它值(fake-lcm / fake / 未知)→ 立即 `process::exit(1)` + `LCM_BACKEND_UNSUPPORTED`。
+/// LCM backend 选择，只提供 `Real`。
+/// `NUWAX_LCM_BACKEND` 仅接受 `real-lcm` 或空值；其它值返回
+/// [`LcmBackendUnsupported`]，由二进制入口在产生启动副作用前退出。
 ///
 /// Phase 7 readiness 字段仍由 `mapping_adapter::MappingReadiness`
 /// + `nav_runtime::NavigationReadinessDetail`
 /// + `explore_runtime::ExplorationReadinessDetail` 三个 layer 独立暴露
 ///   counters + active backend(backend 字段值固定为 "real-lcm")。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LcmBackendKind {
+pub(crate) enum LcmBackendKind {
     /// 真实 liblcm backend(2026-07-08 唯一 backend)
     Real,
 }
 
 impl LcmBackendKind {
-    fn from_env() -> Self {
-        // 2026-07-08 fake-lcm 根除(v3 F2 决策):
-        // - canonical = `real-lcm`(default),`real` 是迁移 alias
-        // - `fake-lcm` / `fake` / 其它非空值 → 立即 exit(1)+ LCM_BACKEND_UNSUPPORTED
-        //   严禁静默 fallback(fake backend 已物理删除)
-        // - 空值 → 默认 `real-lcm`
+    pub(crate) fn from_env() -> Result<Self, LcmBackendUnsupported> {
         let raw = std::env::var("NUWAX_LCM_BACKEND").unwrap_or_default();
         let normalized = raw.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "" => {
                 tracing::info!("NUWAX_LCM_BACKEND 未设置,默认 real-lcm");
-                Self::Real
+                Ok(Self::Real)
             }
-            "real-lcm" => Self::Real,
-            "real" => {
-                tracing::warn!(
-                    "NUWAX_LCM_BACKEND=real 是迁移 alias;已归一化为 real-lcm。后续请直接传 canonical 名。"
-                );
-                Self::Real
-            }
-            "fake-lcm" | "fake" => {
-                eprintln!(
-                    "LCM_BACKEND_UNSUPPORTED: NUWAX_LCM_BACKEND={:?} 已被 2026-07-08 移除。\
-                     fake-lcm backend 已物理删除(v3 F2 决策);本 binary 仅支持 real-lcm。退出。",
-                    normalized
-                );
-                std::process::exit(1);
-            }
-            other => {
-                eprintln!(
-                    "LCM_BACKEND_UNSUPPORTED: NUWAX_LCM_BACKEND={:?} 已被 2026-07-08 移除。\
-                     canonical 取值只允许 real-lcm / real / 空;本 binary 仅支持 real-lcm。退出。",
-                    other
-                );
-                std::process::exit(1);
-            }
+            "real-lcm" => Ok(Self::Real),
+            other => Err(LcmBackendUnsupported {
+                value: other.to_owned(),
+            }),
+        }
+    }
+
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Real => "real-lcm",
         }
     }
 }
 
+/// 非生产 LCM backend 被拒绝时的稳定启动错误。
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("LCM_BACKEND_UNSUPPORTED: NUWAX_LCM_BACKEND={value:?} 不受支持。只允许 real-lcm 或空值。")]
+pub(crate) struct LcmBackendUnsupported {
+    value: String,
+}
+
 /// 读 `NUWAX_REAL_LCM_REQUIRED`：true/false/1/0/yes/no/on/off (大小写不敏感)。
 ///
-/// 2026-07-08 fake-lcm 物理删除后(v3 F2 决策):
-/// - `true` + liblcm 不可用 → 启动期进程直接 exit 1 + `LCM_BACKEND_UNAVAILABLE`
-///   (不允许任何 fallback —— fake backend 已物理删除)。
+/// - `true` + liblcm 不可用 → 启动期进程直接 exit 1 + `LCM_BACKEND_UNAVAILABLE`。
 /// - `true` + liblcm OK → 启动 real-lcm backend 正常。
 /// - 默认 false；与 `core/settings.py::REAL_LCM_REQUIRED` 语义保持对齐。
 pub fn real_lcm_required_from_env() -> bool {
@@ -2264,16 +2248,17 @@ fn spawn_frontier_fanout(
 
 /// 启动 geometry runtime 异步循环（LCM-first）。
 ///
-/// 2026-07-08 fake-lcm 物理删除后:backend 固定为 `LcmBackendKind::Real`,
-/// 启动期调 `LcmTransport::new_real(&lcm_url)`;若 liblcm 不可用 / 启动失败
+/// backend 固定为 `LcmBackendKind::Real`。启动期调用
+/// `LcmTransport::new_real(&lcm_url)`；若 liblcm 不可用或启动失败，
 /// → fail-fast 返回 [`RealLcmBackendUnavailable`] 或 `process::exit(1)`
-/// (当 `NUWAX_REAL_LCM_REQUIRED=true` 时)。无 fake fallback。
+/// （当 `NUWAX_REAL_LCM_REQUIRED=true` 时）。
 ///
 /// # Args
 ///
 /// * `odometry_channel` — Phase 1 新增；`nav_msgs/Odometry` typed channel
 /// * 其余形参来自 Phase 0 默认 channel registry
 pub fn spawn_geometry_runtime(
+    backend: LcmBackendKind,
     occupancy_channel: &str,
     tf_channel: &str,
     cloud_map_channel: Option<&str>,
@@ -2281,6 +2266,7 @@ pub fn spawn_geometry_runtime(
     frontiers_channel: Option<&str>,
     odometry_channel: Option<&str>,
 ) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
+    let backend_name = backend.canonical_name();
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
     let (nav_state_tx, _) = broadcast::channel::<NavigationUpdate>(8);
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
@@ -2311,24 +2297,21 @@ pub fn spawn_geometry_runtime(
     let explore_runtime = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
     let runtime_observation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // 按 NUWAX_LCM_BACKEND 选择 backend。
-    // 2026-07-08 fake-lcm 物理删除后,`LcmBackendKind::from_env()` 仅返回 `Real`。
-    // Phase 5 (NUWAX_REAL_LCM_REQUIRED=true) 保持:启动失败时进程直接
-    // `process::exit(1)`,不允许静默 fallback(fake backend 已物理删除)。
+    // 按 NUWAX_LCM_BACKEND 选择真实 backend。强制模式下启动失败直接退出。
     let real_lcm_required = real_lcm_required_from_env();
-    let (transport, backend_name, backend_available): (LcmTransport, &'static str, bool) = {
+    let (transport, backend_available): (LcmTransport, bool) = {
         let lcm_url = std::env::var("NUWAX_LCM_URL")
             .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=1".to_owned());
         // real-lcm feature gate —— 二选一:
         //   1. binary --features real-lcm-bridge → 真起 liblcm
         //   2. binary 未启用 real-lcm-bridge feature → 保留 Phase 2 行为 (return Err)
-        //      2026-07-08 fake-lcm 物理删除后,该分支仅由 CI 误配触发,本意即"无 backend 可用"。
+        //   2. 未启用 feature → 返回 backend 不可用
         #[cfg(feature = "real-lcm-bridge")]
         {
             match attempt_real_lcm_startup(real_lcm_required, || LcmTransport::new_real(&lcm_url)) {
                 Ok(t) => {
                     info!("LCM backend 选择: real-lcm (provider={})", lcm_url);
-                    (t, "real-lcm", true)
+                    (t, true)
                 }
                 Err(RealLcmStartupError::Required(e)) => {
                     eprintln!(
@@ -2341,7 +2324,7 @@ pub fn spawn_geometry_runtime(
                     std::process::exit(1);
                 }
                 Err(RealLcmStartupError::Optional(e)) => {
-                    // 2026-07-08 fake-lcm 物理删除后:无 fake fallback,直接 fail-fast。
+                    // 不允许降级，直接 fail-fast。
                     eprintln!(
                         "LCM_BACKEND_UNAVAILABLE: LcmTransport::new_real({}) 失败: {} \
                          —— 请确认 liblcm-dev 已安装 (apt-get install liblcm-dev) \
@@ -2363,9 +2346,8 @@ pub fn spawn_geometry_runtime(
         backend_name, backend_available
     );
 
-    // Phase 4 startup health wire-up:在启动日志中暴露 backend 选择,供
-    // start 脚本 / smoke test / debug_panel 观测;2026-07-08 fake-lcm
-    // 物理删除后,字段值固定为 `real-lcm`。
+    // Phase 4 startup health wire-up:在启动日志中暴露 backend 选择，
+    // 供 start 脚本 / smoke test / debug_panel 观测。
     info!(
         "LCM backend status (Phase 4 startup wire-up): lcm_backend={} available={}",
         backend_name, backend_available
@@ -3118,8 +3100,8 @@ fn spawn_mapping_feed_tasks(
 /// `pid * 10000 + counter` 让 cargo test 的 N 个并行 test 进程分到不同端口,
 /// 避免互相 bind 失败 / udpm 重复收包导致 Rust 进程内存爆涨。
 ///
-/// 2026-07-08 fake-lcm 物理删除后,所有 `build_handle_for_tests` 走 real-lcm,
-/// 必须用隔离 URL 防 cargo test 撞端口(原 fake backend 无此约束)。
+/// 所有 `build_handle_for_tests` 走 real-lcm，必须用隔离 URL 防止
+/// cargo test 并发撞端口。
 ///
 /// 不加 `#[cfg(test)]`:函数本身只返回 String(无 test-only 依赖),
 /// 公开供 `build_handle_for_tests` 跨 #[cfg(test)] 模块引用,且允许 binary
@@ -3137,8 +3119,7 @@ pub fn test_lcm_url() -> String {
 ///
 /// 不会启动订阅任务,只提供 real-lcm backend(test_lcm_url 隔离端口) +
 /// 全新 `SharedState`,供 `nav_runtime` / `mapping_adapter` / 其它模块做集成测试。
-/// 2026-07-08 fake-lcm 物理删除后,test helper 改走 `LcmTransport::new_real` —— 单测
-/// 真实验证 liblcm 行为,不再有 fake-only 兼容路径。
+/// test helper 走 `LcmTransport::new_real`，真实验证 liblcm 行为。
 ///
 /// 与 `spawn_geometry_runtime` 的关键差异:
 /// - 不订阅任何 LCM typed channel
@@ -3164,9 +3145,7 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
         SequenceStateStore::open(&sequence_state_path)
             .expect("test sequence state must be writable and exclusively lockable"),
     );
-    // 2026-07-08 fake-lcm 物理删除(v3 F2 决策):build_handle_for_tests 改走
-    // RealLcmBackend;test_lcm_url() 端口公式防 cargo test 并行端口冲突
-    // (Architect R1:直接重现 07_08 实机 175 GB 崩溃)。
+    // test_lcm_url() 端口公式防止 cargo test 并发端口冲突。
     let transport = LcmTransport::new_real(&crate::lcm_runtime::test_lcm_url())
         .expect("test real LCM 启动失败,需先 apt-get install -y liblcm-dev 1.3~1.5");
     // Phase 3: 测试 helper 也构造 mapping_adapter,便于 unit test 走完整链路。
@@ -3229,8 +3208,7 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
         transport,
         transport_backend_name: "real-lcm",
         lcm_backend_available: true,
-        // Phase 6 / Rework-9:test helper **保留** 默认 `true`(2026-07-08 fake-lcm
-        // 物理删除后,test helper 改走 real backend,默认 true 仍兼容旧测试断言)。
+        // Phase 6 / Rework-9:test helper 默认保留 `true`。
         // 配套测试用 `set_cmd_vel_sink_ready(false)` 验证 readiness 拒绝分支。
         // 生产 spawn 路径(`spawn_geometry_runtime`)默认 `false`。
         cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),

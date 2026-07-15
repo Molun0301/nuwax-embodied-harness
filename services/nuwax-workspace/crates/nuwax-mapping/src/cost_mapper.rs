@@ -386,21 +386,6 @@ impl crate::models::MapMeta {
 
 // `OccupancyGrid.to_meta()` 返回 MapMetaData，给 cost_mapper 用；上面已声明。
 
-// 旧的 `CostMapperConfig::nav2_default()` 兼容垫片，标记 deprecated。
-// 旧消费方（nav stack 适配层）仍可调用；dimos-side 改用 `dimos_default()`。
-#[allow(deprecated)]
-impl CostMapperConfig {
-    /// 兼容垫片：返回 dimos 默认（已不再带 Nav2 数值常量）
-    #[deprecated(
-        since = "0.2.0",
-        note = "Nav2 数值常量不在 dimos 协议中；请用 `dimos_default()` + nav stack 适配层 `Nav2CostLayer`"
-    )]
-    #[must_use]
-    pub fn nav2_default() -> Self {
-        Self::dimos_default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

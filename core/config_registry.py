@@ -162,31 +162,6 @@ def _parse_settings_keys(path: Path, target_file: str) -> Dict[str, _RawKey]:
                         default_repr = _node_source(args[2], source)
                 raw.setdefault(key, _RawKey(key, "str", default_repr, None, target_file))
             continue
-        if fn == "_resolve_alias_env_value_with_hit":
-            # v4 R-N14 Phase 1 §3.1.3:解析 `NUWAX_MAPPING_X` 17 键裸名。
-            # 形参:_resolve_alias_env_value_with_hit("PREFERRED", "LEGACY", default)
-            # 注册表使用 `PREFERRED`(新名),alias_of = LEGACY 旧名。
-            args = node.args
-            if (
-                len(args) >= 2
-                and isinstance(args[0], ast.Constant)
-                and isinstance(args[0].value, str)
-                and isinstance(args[1], ast.Constant)
-                and isinstance(args[1].value, str)
-            ):
-                key = args[0].value
-                legacy_key = args[1].value
-                default_repr = ""
-                if len(args) >= 3:
-                    try:
-                        default_repr = repr(ast.literal_eval(args[2]))
-                    except Exception:
-                        default_repr = _node_source(args[2], source)
-                raw.setdefault(
-                    key,
-                    _RawKey(key, "str", default_repr, legacy_key, target_file),
-                )
-            continue
         if not fn.startswith("_cfg_"):
             continue
         typ = fn.replace("_cfg_", "").replace("_alias", "")
@@ -449,7 +424,7 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M": "可通行最大台阶高度（米）",
     "NUWAX_GEOMETRY_TRAVERSABILITY_OUTPUT_LAYER": "可通行性输出图层",
 
-    # 建图（nuwax-mapping 板块,替代旧 RTAB-Map / 17 键 NUWAX_RTABMAP_* 全部已迁移至 NUWAX_MAPPING_*）
+    # 建图（nuwax-mapping）
     "NUWAX_MAPPING_PROFILE_NAME": "nuwax-mapping 配置名称",
     "NUWAX_MAPPING_PROFILE_ENABLED": "启用 nuwax-mapping 建图",
     "NUWAX_MAPPING_DEFAULT_PROFILE": "使用默认 nuwax-mapping 配置",
@@ -479,7 +454,7 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_OSM_USER_AGENT": "OpenStreetMap 请求 User-Agent",
     "NUWAX_GOOGLE_MAPS_API_KEY": "Google Maps API 密钥",
 
-    # 导航（nuwax-nav-stack，替代旧 Nav2 action provider）
+    # 导航（nuwax-nav-stack）
     "NUWAX_NAV_AUTOSTART": "自动启动导航后端",
     "NUWAX_NAV_GOAL_CHANNEL": "导航目标 LCM channel",
     "NUWAX_NAV_CANCEL_CHANNEL": "导航取消 LCM channel",
@@ -489,11 +464,11 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_NAV_ACTION_NAMESPACE": "导航动作命名空间",
     "NUWAX_NAV_LOOP_CLOSURE_THRESHOLD": "闭环判据计数阈值",
     "NUWAX_NAV_LOOP_CLOSURE_POLL_INTERVAL_SEC": "闭环判据轮询间隔（秒）",
-    "NUWAX_NAV_DB_SQLITE_FALLBACK_ENABLED": "启用 RTAB-Map DB SQLite 闭环 fallback",
+    "NUWAX_NAV_DB_SQLITE_FALLBACK_ENABLED": "启用建图数据库闭环回退",
     "NUWAX_NAV_PROXY_GRPC_PORT": "导航代理 gRPC 端口",
     "NUWAX_NAV_PROXY_PENDING_QUEUE_MAX_SIZE": "导航代理 PENDING 队列上限",
     # Phase 6:新增 nav profile / explore arbitration / real-lcm 硬约束。
-    # 三者均对接 nuwax-geometry-runtime (Rust) 装配面,不再走旧 rclpy/Nav2.
+    # 三者均对接 nuwax-geometry-runtime（Rust）装配面。
     "NUWAX_NAV_PROFILE": "导航 profile（simple-2d / replanning-astar；默认 simple-2d）",
     "NUWAX_EXPLORE_ARBITRATION": "探索 source arbitration（当前只支持 prefer_wavefront）",
     "NUWAX_PERSON_FOLLOW_AUTOSTART": "自动启动 person-follow",
@@ -518,7 +493,7 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_TF": "runtime 提供 TF（odom→base_link 等坐标变换）",
     "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAV": "runtime 提供导航能力（settings.py:903 旧名 NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAVIGATION 改名）",
     "NUWAX_LCM_URL": "LCM UDP multicast URL",
-    "NUWAX_LCM_BACKEND": "LCM backend（唯一支持 real-lcm；real 为迁移 alias）",
+    "NUWAX_LCM_BACKEND": "LCM backend（唯一支持 real-lcm）",
     "NUWAX_NUWAX_WORKSPACE_DIR": "nuwax-workspace 路径依赖目录",
     "NUWAX_LCM_CHANNEL_ODOM": "odom LCM channel",
     "NUWAX_LCM_CHANNEL_TF": "tf LCM channel",
@@ -633,7 +608,7 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_PERCEPTION_STREAM_DETECTOR_BACKEND": "持续感知检测后端",
     "NUWAX_PERCEPTION_STREAM_FAILURE_BACKOFF_SEC": "持续感知失败退避（秒）",
     "NUWAX_PERCEPTION_STREAM_STORE_ARTIFACT": "保存持续感知制品",
-    "NUWAX_PERCEPTION_STREAM_SKIP_WHEN_LOCALIZATION": "定位模式（rtabmap_localization）下默认不联动后台感知线程；手动 start_perception_runtime MCP 绕过该门控",
+    "NUWAX_PERCEPTION_STREAM_SKIP_WHEN_LOCALIZATION": "定位模式（mapping_localization）下默认不联动后台感知线程；手动 start_perception_runtime MCP 绕过该门控",
     "NUWAX_PERCEPTION_TRIANGULATION_MAX_RESIDUAL_M": "三角化最大残差（米）",
     "NUWAX_PERCEPTION_TRIANGULATION_MIN_PARALLAX_DEG": "三角化最小视差角（度）",
     "NUWAX_PERCEPTION_TRIANGULATION_MIN_RAYS": "三角化最少射线数",

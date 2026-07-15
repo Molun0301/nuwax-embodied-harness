@@ -224,7 +224,7 @@ def _warn_static_edge_skip(message: str, *, signature: str) -> None:
 def _read_deadline_sec() -> float:
     """unary 轻量读类 gRPC 调用 deadline（秒）。
 
-    下游 Rust runtime / RTAB-Map 慢或未就绪时，无 deadline 的 unary 调用会无界阻塞，
+    下游 Rust runtime 慢或未就绪时，无 deadline 的 unary 调用会无界阻塞，
     单点挂死整条 MCP 请求（参见超时根因 D1）。轻量读类（GetStatus / GetOccupancyGrid 元数据 /
     GetNavigationReadiness / CancelNavigation / SetNavigationGoal / PublishOdom）统一施加该 deadline。
 
@@ -610,9 +610,9 @@ def _normalize_frame(frame_id: str) -> str:
 def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
     """把 proto `ExplorationState` 转成 dict(给 `GeometryRuntimeProvider` 对外契约用)。
 
-    Phase 5:与 dimos `nuwax_exploration::ExplorationController` 的 status 字符串
-    一一对应:ACCEPTED / REJECTED / PENDING / STOPPED / ACTIVE / UNIMPLEMENTED。
-    失败时上游 RPC 层已经处理,这里只做字段拷贝,不二次校验。
+    状态字符串由 native scheduler 直接给出：IDLE / ACCEPTED / REJECTED /
+    PENDING / STOPPING / ACTIVE / SUCCEEDED / CANCELLED / FAILED。失败时上游
+    RPC 层已经处理，这里只做字段拷贝，不二次推进状态。
     """
     return {
         "status": resp.status,
@@ -1777,10 +1777,7 @@ class GeometryRuntimeProvider:
         return bool(diagnostics and diagnostics.get("ready", False))
 
     def get_lcm_backend_name(self) -> str:
-        """Phase 3: 取 canonical LCM backend 名。
-
-2026-07-08 fake-lcm 物理删除后:返回值固定为 `RealLcm` 或
-`real-lcm-unavailable`(liblcm 不可用时);fake-lcm 已物理删除(v3 F2 决策)。"""
+        """返回真实 LCM 后端名称或不可用状态。"""
         if not self._connected or not self._stub:
             return "<disconnected>"
         try:
@@ -1793,8 +1790,8 @@ class GeometryRuntimeProvider:
             return "<unknown>"
 
     # === Phase 6: mapping / nav / explore diagnostics facade ===
-    # 阶段目标:让 Python gateway/service 只感知 provider 协议,不再依赖历史
-    # 外部脚本或 nav2 命名。provider 对外暴露三套统一 diagnostics dict:
+    # Python gateway/service 只感知 provider 协议。provider 对外暴露三套
+    # diagnostics dict:
     #   - get_mapping_diagnostics()    : 建图板块
     #   - get_navigation_diagnostics() : 导航板块
     #   - get_exploration_diagnostics(): 探索板块(已在 Phase 5 实装,本阶段保留入口)
@@ -1882,8 +1879,7 @@ class GeometryRuntimeProvider:
              module_node_count/p1_native_profiles)
           - ``profile`` / ``active_profile`` (str|None): 当前 nav profile
             (Phase 7 兼容旧 `profile` + 新 `active_profile`)
-          - ``backend`` (str|None): 2026-07-08 fake-lcm 物理删除后字段值固定为
-            "RealLcm" 或 "Unknown"(未启动时);fake-lcm 已物理删除(v3 F2 决策),无分支
+          - ``backend`` (str|None): "RealLcm" 或 "Unknown"（未启动时）
           - ``tf_count`` (int|None): 累计 tf 帧数
           - ``costmap_revision`` (int|None): 当前 occupancy revision
           - ``cmd_vel_sink_ready`` (bool|None): cmd_vel consumer + watchdog 状态
@@ -2247,7 +2243,7 @@ class GeometryRuntimeProvider:
     # - SetNavigationGoal 返回 NavigationState（非 NavigationAck）：
     #   accepted/goal_id/message → status/goal_id/message
     # - CancelNavigation 接受 CancelNavigationRequest（带 goal_id），返回 NavigationState
-    # - NavigationReadiness 仅 ready + reason（去 Nav2 残留字段）
+    # - NavigationReadiness 仅提供 ready + reason
     def set_navigation_goal(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float,
                             frame_id: str = "map", goal_id: str = "") -> Dict[str, Any]:
         """Compatibility facade routed through the canonical lease transaction."""
@@ -2345,13 +2341,12 @@ class GeometryRuntimeProvider:
             return _nav_readiness_disconnected_dict(message="gRPC 错误")
 
     # === NavigationProvider 协议 shim ===
-    # 去 ROS2 目标态（round-4 HIGH 3 修复）：
+    # provider bundle / runtime.py 使用 NavigationProvider 统一方法：
     # - provider bundle / runtime.py 直调 backend.set_goal/cancel_goal/get_navigation_state，
     #   而 GeometryRuntimeProvider gRPC facade 的真实方法名是 set_navigation_goal / cancel_navigation
     #   / (subscribe-driven 状态缓存)。
     # - 这里在 provider 侧补齐旧 NavigationProvider 协议方法名，全部委托到 gRPC facade；
     #   不假装成功——gRPC 失败或 backend 未就绪时，返回值如实反映（accepted=False / success=False / IDLE）。
-    # - 等 nuwax-nav-stack crate 上线、Nav2 动作语义彻底废弃后，可删除整个 shim 段。
     def _ensure_nav_state_stream(self) -> None:
         """懒启动可重连的 SubscribeNavigationState 后台线程。"""
         with self._nav_command_lock:
@@ -3678,7 +3673,7 @@ class GeometryRuntimeProvider:
             return None
 
     def get_exploration_state(self) -> Optional[Dict[str, Any]]:
-        """读取当前 exploration controller 状态(单次 tick)。
+        """读取当前 exploration scheduler 的只读快照。
 
         返回 ExplorationState 字典;失败时 None。
         """

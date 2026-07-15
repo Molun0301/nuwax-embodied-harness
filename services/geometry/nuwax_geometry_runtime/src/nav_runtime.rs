@@ -1405,7 +1405,7 @@ pub struct NavigationReadinessDetail {
     /// 在 default profile 之外的,本阶段未启用的 native profile 列表。
     pub p1_native_profiles: Vec<String>,
     // === Phase 7 增量字段 ===
-    /// canonical LCM backend 名(2026-07-08 fake-lcm 物理删除后,字段值固定为 "RealLcm")。
+    /// canonical LCM backend 名（字段值固定为 "RealLcm"）。
     pub backend: String,
     /// Number of accepted real TF consumer observations.
     pub tf_count: u64,
@@ -2443,8 +2443,7 @@ mod tests {
     ///
     /// 注意:不能直接构造 `LcmTransport`(其字段非 pub);这里用 `build_handle_for_tests`
     /// 构造,backend 走 real-lcm,LCM publish 走隔离端口。
-    /// 2026-07-08 fake-lcm 物理删除后,test handle 改走 real backend,默认 true
-    /// 仍兼容旧测试断言。
+    /// 测试 handle 走真实 backend，默认 true。
     async fn make_handle() -> GeometryRuntimeHandle {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await

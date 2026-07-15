@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, List, Optional
 
 from contracts.compat import StrEnum
-from pydantic import Field, model_validator
+from pydantic import Field
 
 from contracts.base import ContractModel, MetadataDict, utc_now
 
@@ -110,7 +110,7 @@ class DebugNavigationView(ContractModel):
     frontier_freshness: MetadataDict = Field(default_factory=dict)
     map_revision: Optional[str] = None
     costmap_revision: Optional[str] = None
-    nav2_readiness: MetadataDict = Field(default_factory=dict)
+    navigation_readiness: MetadataDict = Field(default_factory=dict)
     mapping_chain_diagnostics: MetadataDict = Field(default_factory=dict)
     frontiers: Optional[List[MetadataDict]] = None
 
@@ -143,8 +143,7 @@ class DebugPointCloudMapView(ContractModel):
     source: Optional[str] = None
     source_kind: Optional[str] = None
     geometry_stack: Optional[str] = None
-    rtabmap_database_path: Optional[str] = None
-    rtabmap_db_path: Optional[str] = None
+    mapping_database_path: Optional[str] = None
     pcd_path: Optional[str] = None
     point_count: int = 0
     fields: List[MetadataDict] = Field(default_factory=list)
@@ -154,17 +153,6 @@ class DebugPointCloudMapView(ContractModel):
     payload_bytes: Optional[int] = None
     metadata: MetadataDict = Field(default_factory=dict)
     metrics: MetadataDict = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def _sync_rtabmap_database_path_alias(self) -> "DebugPointCloudMapView":
-        """保持 rtabmap_database_path 与 rtabmap_db_path 双向兼容。"""
-
-        if self.rtabmap_database_path is None and self.rtabmap_db_path is not None:
-            object.__setattr__(self, "rtabmap_database_path", self.rtabmap_db_path)
-        elif self.rtabmap_db_path is None and self.rtabmap_database_path is not None:
-            object.__setattr__(self, "rtabmap_db_path", self.rtabmap_database_path)
-        return self
-
 
 class DebugVideoView(ContractModel):
     """视频调试视图。"""

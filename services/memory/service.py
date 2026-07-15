@@ -2845,6 +2845,7 @@ class MemoryService:
                 payload_filter=resolved_filter,
                 grounding_plan=grounding_plan,
                 include_non_direct_navigation_candidates=include_non_direct_navigation_candidates,
+                default_query_scope="scene_space",
             )
         spaces = [
             space
@@ -3068,9 +3069,14 @@ class MemoryService:
         payload_filter: Optional[MemoryPayloadFilter],
         grounding_plan: Optional[GroundingQueryPlan] = None,
         include_non_direct_navigation_candidates: bool = False,
+        default_query_scope: str = "mixed",
     ) -> MemoryQueryResult:
         normalized_query = self._normalize_text(query)
-        query_scope = str(((grounding_plan.metadata if grounding_plan is not None else {}) or {}).get("query_scope") or "mixed").strip() or "mixed"
+        query_scope = str(
+            ((grounding_plan.metadata if grounding_plan is not None else {}) or {}).get("query_scope")
+            or default_query_scope
+            or "mixed"
+        ).strip() or "mixed"
         if not normalized_query:
             raise GatewayError(
                 "查询文本不能为空。",
@@ -6003,13 +6009,17 @@ class MemoryService:
         self._upsert_vector_point_for_scene_space(updated)
         self._write_scene_space_state(updated)
         self._record_scene_space_graph(updated)
+        finalized = self._scene_spaces_by_id.get(updated.scene_space_id, updated)
         if publish_event:
             self._publish_memory_event(
                 "memory.scene_space_upserted",
-                "场景空间 %s 已写入。" % (updated.primary_label or updated.scene_space_id),
-                payload={"scene_space_id": updated.scene_space_id, "primary_label": updated.primary_label or ""},
+                "场景空间 %s 已写入。" % (finalized.primary_label or finalized.scene_space_id),
+                payload={
+                    "scene_space_id": finalized.scene_space_id,
+                    "primary_label": finalized.primary_label or "",
+                },
             )
-        return updated
+        return finalized
 
     def _cache_scene_space(self, scene_space: SceneSpace) -> None:
         self._scene_spaces_by_id[scene_space.scene_space_id] = scene_space

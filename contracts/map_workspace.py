@@ -85,15 +85,9 @@ class MapWorkspace(TimestampedContract):
 class MapGeometryAssetType(StrEnum):
     """平台地图版本几何资产类型。"""
 
-    EXTERNAL_SLAM_NAV2_STATE = "external_slam_nav2_state"
+    NAVIGATION_MAP = "navigation_map"
     PCD = "pcd"
-    # RTAB-Map SQLite .db 文件——当前主线生产资产类型。
-    RTABMAP_DATABASE = "rtabmap_database"
-    # Phase 3: nuwax-mapping (Rust native mapping adapter) 产出的资产。
-    # Phase 3 实装后,新地图版本默认 backend_mode="nuwax_mapping",并
-    # 把 occupancy grid / costmap / 累积点云 (cloud_map) 作为附加 asset refs;
-    # 旧的 `rtabmap_database` / `external_slam_nav2_state` 仅保留为
-    # 历史地图版本兼容读取,不作为新地图默认。
+    MAPPING_DATABASE = "mapping_database"
     NUWAX_MAPPING_OCCUPANCY_GRID = "nuwax_mapping_occupancy_grid"
     NUWAX_MAPPING_COSTMAP = "nuwax_mapping_costmap"
     NUWAX_MAPPING_CLOUD_MAP = "nuwax_mapping_cloud_map"
@@ -134,11 +128,9 @@ class MapGeometryAssetBinding(ContractModel):
 
     map_name: str = Field(description="所属地图名称。")
     version_id: str = Field(description="关联的平台地图版本标识。")
-    geometry_stack: str = Field(default="external_slam_nav2", description="当前绑定的几何栈标识。")
+    geometry_stack: str = Field(default="nuwax_geometry_runtime", description="当前绑定的几何栈标识。")
     frame_id: Optional[str] = Field(default=None, description="该版本几何主图层坐标系。")
-    rtabmap_database_path: str = Field(description="RTAB-Map 数据库文件路径。")
-    # 老命名兼容：旧 version.json 仍然写 rtabmap_db_path；构造时若只给该字段会被迁移到 rtabmap_database_path。
-    rtabmap_db_path: Optional[str] = Field(default=None, description="[DEPRECATED] 老版本 rtabmap_db_path 兼容字段，新代码请使用 rtabmap_database_path。")
+    mapping_database_path: str = Field(description="建图数据库文件路径。")
     pcd_path: Optional[str] = Field(default=None, description="PCD 点云地图资产路径。")
     occupancy_projection: str = Field(description="占据栅格投影来源说明。")
     costmap_source: str = Field(description="代价地图来源说明。")
@@ -149,21 +141,13 @@ class MapGeometryAssetBinding(ContractModel):
     built_at: datetime = Field(default_factory=utc_now, description="该几何资产构建时间。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
-    @field_validator("map_name", "version_id", "geometry_stack", "rtabmap_database_path", "occupancy_projection", "costmap_source")
+    @field_validator("map_name", "version_id", "geometry_stack", "mapping_database_path", "occupancy_projection", "costmap_source")
     @classmethod
     def _validate_required_geometry_text(cls, value: str) -> str:
         resolved = str(value or "").strip()
         if not resolved:
             raise ValueError("地图几何资产字段不能为空。")
         return resolved
-
-    @field_validator("rtabmap_db_path")
-    @classmethod
-    def _validate_legacy_rtabmap_db_path(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        resolved = str(value or "").strip()
-        return resolved or None
 
     @field_validator("pcd_path")
     @classmethod
@@ -183,44 +167,21 @@ class MapGeometryAssetBinding(ContractModel):
             return None
         return validate_frame_id(resolved)
 
-    @model_validator(mode="before")
-    @classmethod
-    def _migrate_legacy_rtabmap_database_path(cls, data):
-        """老 version.json 只有 rtabmap_db_path/旧后端状态路径时一次性迁移。
-
-        新代码统一写 rtabmap_database_path；rtabmap_db_path 保留 read-side 兼容。
-        """
-
-        if not isinstance(data, dict):
-            return data
-        legacy_backend_state_path = data.pop("backend_state_path", None)
-        if not data.get("rtabmap_database_path"):
-            legacy_path = data.get("rtabmap_db_path") or legacy_backend_state_path
-            if legacy_path:
-                data["rtabmap_database_path"] = legacy_path
-        # 双向回写：保证旧消费方读到的 rtabmap_db_path 仍然是合法路径。
-        if data.get("rtabmap_database_path") and not data.get("rtabmap_db_path"):
-            data["rtabmap_db_path"] = data["rtabmap_database_path"]
-        return data
-
     @model_validator(mode="after")
     def _derive_geometry_asset_refs(self) -> "MapGeometryAssetBinding":
         if self.assets:
             return self
         profile_summary = dict(self.profile_summary or self.parameter_summary.get("profile") or {})
-        stack_lower = str(self.geometry_stack or "").strip().lower()
-        is_external_stack = stack_lower == "external_slam_nav2"
-        # external_slam_nav2 当前默认后端是 RTAB-Map。
-        state_asset_type = MapGeometryAssetType.RTABMAP_DATABASE
+        state_asset_type = MapGeometryAssetType.MAPPING_DATABASE
         database_quality = dict(self.quality_metrics.get("database") or {})
-        database_required = bool(database_quality.get("required", not is_external_stack))
+        database_required = bool(database_quality.get("required", True))
         database_present = bool(database_quality.get("present", False))
         refs = []
         if database_required or database_present:
             refs.append(
                 MapGeometryAssetRef(
                     asset_type=state_asset_type,
-                    path=self.rtabmap_database_path,
+                    path=self.mapping_database_path,
                     frame_id=self.frame_id,
                     profile_summary=profile_summary,
                     built_at=self.built_at,

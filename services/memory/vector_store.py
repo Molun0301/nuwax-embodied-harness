@@ -91,7 +91,7 @@ class SQLiteNamedVectorStore:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path.strip() or ":memory:"
         self._lock = threading.RLock()
-        self._read_lock = threading.RLock()
+        self._read_lock = self._lock if self._db_path == ":memory:" else threading.RLock()
         if self._db_path != ":memory:":
             db_file = Path(self._db_path)
             db_file.parent.mkdir(parents=True, exist_ok=True)
@@ -101,10 +101,12 @@ class SQLiteNamedVectorStore:
             if self._db_path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
-        # 只读连接：WAL 模式下可与写入并发，消除检索被写入阻塞的问题
-        self._read_conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._read_conn.row_factory = sqlite3.Row
-        if self._db_path != ":memory:":
+        # 内存数据库只在创建它的连接内可见；文件数据库继续用独立读连接配合 WAL。
+        if self._db_path == ":memory:":
+            self._read_conn = self._conn
+        else:
+            self._read_conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            self._read_conn.row_factory = sqlite3.Row
             self._read_conn.execute("PRAGMA journal_mode=WAL")
             self._read_conn.execute("PRAGMA query_only=ON")
         # ANN（近似最近邻）批量计算缓存 —— 按 vector_name 分组增量维护
@@ -121,8 +123,9 @@ class SQLiteNamedVectorStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
-        with self._read_lock:
-            self._read_conn.close()
+        if self._read_conn is not self._conn:
+            with self._read_lock:
+                self._read_conn.close()
 
     def upsert_point(
         self,

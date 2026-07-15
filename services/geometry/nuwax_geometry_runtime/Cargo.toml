@@ -6,16 +6,14 @@ description = "nuwax 平台几何 LCM/nuwax native runtime 子进程（独立于
 
 # 依赖来源：nuwax-workspace LCM-first Rust 栈
 # 路径：本仓 repo-local `services/nuwax-workspace`（Phase 1,2026-07-07 已并入）
-# MSRV 1.88；目标机 aarch64 + Ubuntu 20.04；不允许引入 ROS2/r2r/DDS/RMW 依赖。
+# MSRV 1.88；目标机 aarch64 + Ubuntu 20.04；仅使用 LCM 数据面。
 
 [dependencies]
 # nuwax-workspace path deps（LCM-first）。
 #
-# 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
 # - `nuwax-transport/real-lcm` 是唯一 backend(workspace `default = ["real-lcm"]`),
 #   镜像必须装 liblcm-dev 1.3~1.5
-# - 本 binary 仍用 `real-lcm-bridge` 二次断言 feature 门,生产默认启用,
-#   取消 `--no-default-features --features fake-lcm-test` 旁路
+# - 本 binary 使用 `real-lcm-bridge` 二次断言 feature 门，生产默认启用
 # - 取消 upstream `nuwax-transport` 行的 `default-features = false` 旁路,
 #   工作区默认已拉入 real-lcm
 #
@@ -26,8 +24,8 @@ nuwax-codec = { path = "../../nuwax-workspace/crates/nuwax-codec" }
 nuwax-tf = { path = "../../nuwax-workspace/crates/nuwax-tf" }
 nuwax-rpc = { path = "../../nuwax-workspace/crates/nuwax-rpc", features = ["link-liblcm"] }
 
-# 2026-07-08 fake-lcm 根除后:本 binary 走 `default = ["real-lcm-bridge"]`,
-# 镜像必须装 liblcm-dev 1.3~1.5,无 fake / fake-lcm-test 旁路。
+# 本 binary 走 `default = ["real-lcm-bridge"]`，镜像必须安装
+# liblcm-dev 1.3~1.5。
 
 # Phase 2:建图 / 导航 / 探索功能 crate 接入。
 # feature 名以 dimos 实际 Cargo.toml 为准(见 Phase 2 执行方案 / feedback_phase2.md)。
@@ -75,14 +73,7 @@ nalgebra = { version = "0.33", features = ["serde-serialize"] }
 #     已经在 [dependencies] 显式拉入),但代码内 cfg 需要此 feature 才能开门,
 #     所以 real-lcm-bridge **默认应启用**(作为 default feature)以保证 runtime
 #     binary 默认走 real-lcm。
-#   - `fake-lcm-test`: CI / dev 机无 liblcm-dev 时用,会通过
-#     `nuwax-transport` 的 `default-features = false` 关闭 real-lcm,
-#     同时关闭本 binary 的 `real-lcm-bridge` 默认门,
-#     强制编译期 fake-only 二进制。
-#
-# 2026-07-08 fake-lcm 物理删除(v3 F2 决策):`fake-lcm-test` feature 整段物理删除。
-# - 无 fake-lcm-test / fake-lcm 旁路,镜像必须装 liblcm-dev 1.3 ~ 1.5
-# - 无 cfg gate / compile_error 守门 / 兼容分支
+# 不提供其它 backend feature；镜像必须安装 liblcm-dev 1.3 ~ 1.5。
 # - cargo build/test 强制要求 liblcm 可用,否则 fail-fast
 #
 # 该块必须位于所有 `[dependencies]` 之后 —— cargo 解析遇到 `[features]`

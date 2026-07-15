@@ -1,11 +1,10 @@
 name: lint
 
-# 平台分层守门 + Py3.8.10 兼容 + fixture 不入仓 + ROS2 残留守门。
+# 平台分层守门 + Py3.8.10 兼容 + fixture 不入仓 + 旧运行时残留守门。
 # 与 openspec/changes/navigation-and-exploration-boundary/specs/ci-guardrails/spec.md 对齐。
 #
-# 目标态：业务代码/配置零 ROS2 runtime 残留；守门脚本统一走 scripts/ci/no_ros2_residual.sh
-# 与 scripts/check_layering.sh。本 workflow 不再维护 ros2_ws / nav2_action_proxy / rclpy.action
-# 等历史 ROS2 例外分支。
+# 业务代码和配置的旧运行时残留统一由 scripts/ci/no_ros2_residual.sh
+# 与 scripts/check_layering.sh 检查。
 
 on:
   pull_request:
@@ -20,8 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # (a) ROS2 残留守门：业务代码与配置不应再含 ROS2 runtime 依赖 / 旧 Nav2 命名。
-      - name: 业务代码 ROS2 残留守门
+      # (a) 旧运行时残留守门
+      - name: 业务代码旧运行时残留守门
         run: bash scripts/ci/no_ros2_residual.sh
 
       # (b) 平台分层守门：services 顶层禁 import drivers（驱动实现与平台业务物理隔离）。

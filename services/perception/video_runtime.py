@@ -49,7 +49,7 @@ class PerceptionVideoRuntime:
         remember_keyframes: bool = True,
         burst_frame_count: int = 8,
         burst_interval_sec: float = 0.15,
-        # 定位模式（rtabmap_localization 后端激活态）下默认不联动后台感知线程；
+        # 定位模式（mapping_localization）下默认不联动后台感知线程；
         # 只影响 auto_start 时的宿主机启动联动决策，不影响手动 start_perception_runtime MCP。
         skip_when_localization: bool = True,
     ) -> None:
@@ -164,7 +164,7 @@ class PerceptionVideoRuntime:
         mode_getter = getattr(provider, "get_active_backend_mode", None)
         if callable(mode_getter):
             try:
-                if str(mode_getter() or "") == "rtabmap_localization":
+                if str(mode_getter() or "") == "mapping_localization":
                     return True
             except Exception:
                 pass
@@ -694,7 +694,7 @@ class PerceptionVideoRuntime:
 
         方案 B：除关键帧位姿判定所需的 current_pose 外，还返回 map_snapshot /
         localization_snapshot，供每 tick 的连续感知摄入（ingest_perception_observation）
-        使用。current_pose 优先实时位姿源（SLAM/Nav2 map→base 实时 TF），探索建图阶段
+        使用。current_pose 优先实时位姿源（map→base 实时变换），探索建图阶段
         定位会话尚未重定位就绪时回退定位会话快照 pose。
         """
         current_pose = self._read_live_pose()

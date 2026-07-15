@@ -880,7 +880,7 @@ class PlatformExplorationRuntime:
             if state.waiting_for in ("occupancy_grid", "map"):
                 return "当前 /map 占据栅格尚未就绪，等待 SLAM 首帧地图。"
             if state.waiting_for == "costmap":
-                return "Nav2 global costmap 尚未就绪，请检查 amcl 是否发布 map→odom TF 与 nav2 lifecycle 是否全部 active。"
+                return "全局代价地图尚未就绪，请检查定位与坐标变换是否持续更新。"
             if state.waiting_for == "frontier":
                 return "live map/costmap/pose 暂未产生可达 frontier；若持续如此，请检查 amcl 是否健康（map→odom TF 是否在更新）。"
             return "正在规划下一个 frontier。"

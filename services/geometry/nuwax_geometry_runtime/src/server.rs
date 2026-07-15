@@ -7,7 +7,7 @@
 //! gRPC facade — `GeometryRuntime` service.
 //!
 //! 所有状态来自 `GeometryRuntimeHandle`（持有 LCM runtime SharedState）；
-//! 与 backend（fake / real-lcm）解耦。本文件不引用任何 ROS2 / r2r / DDS 依赖。
+//! 与具体 backend 实现解耦。
 //!
 //! Phase 2 重构:
 //! - 状态聚合统一走 `runtime_diagnostics`（health / readiness / blockers）

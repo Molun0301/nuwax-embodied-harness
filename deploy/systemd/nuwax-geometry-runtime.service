@@ -26,8 +26,7 @@ Environment="NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEn
 Environment="NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope"
 EnvironmentFile=-@NUWAX_REPO_ROOT@/.env
 # EnvironmentFile wins over Environment; Exec* /usr/bin/env assignments below are authoritative.
-# Phase 8 §13.2 / §13.5:production profile 必须显式启用 real-lcm 并打开
-# fail-fast 硬约束,避免 Rust runtime 静默回退 fake-lcm 或启动期 placeholder 退出。
+# Production profile 必须显式启用 real-lcm 并打开 fail-fast 硬约束。
 # 缺 liblcm / 缺 udpm multicast 应当作真实失败,由 systemd 触发 Restart=on-failure。
 Environment=NUWAX_LCM_BACKEND=real-lcm
 Environment=NUWAX_REAL_LCM_REQUIRED=true

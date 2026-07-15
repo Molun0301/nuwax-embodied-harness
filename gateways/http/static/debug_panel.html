@@ -1959,7 +1959,7 @@ button{font-family:inherit;cursor:pointer}
           if (!matches) return;
           const remain = navState.remaining_distance_m;
           const remainLabel = remain === null || remain === undefined ? "" : ` · 剩余 ${Number(remain).toFixed(2)}m`;
-          updateGoalPickStatus(`Nav2 执行中 → ${formatMapPoint(pending)}${remainLabel}`, "ok");
+          updateGoalPickStatus(`导航执行中 → ${formatMapPoint(pending)}${remainLabel}`, "ok");
           pending.status = "accepted";
           return;
         }
@@ -1990,7 +1990,7 @@ button{font-family:inherit;cursor:pointer}
       }
       function mapGoalUsesOfflineGrid() {
         const diagnostics = state.mapStream && state.mapStream.diagnostics ? state.mapStream.diagnostics : {};
-        // 定位模式固定 checkpoint 仅作 Debug 底图；Nav2 仍用已加载静态图，允许 RViz 式 2D Goal。
+        // 定位模式固定 checkpoint 仅作 Debug 底图；导航仍使用已加载静态图。
         if (shouldPinLocalizationCheckpointDisplay(diagnostics)) return false;
         if (activeLocalizationSessionReason()) {
           const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
@@ -2094,8 +2094,8 @@ button{font-family:inherit;cursor:pointer}
         if (code === "navigation_not_ready") {
           const waitingFor = payload && payload.details && payload.details.waiting_for;
           return waitingFor
-            ? `Nav2 未就绪（等待 ${waitingFor}）。${message || ""}`
-            : (message || "Nav2 未就绪，无法导航。");
+            ? `导航未就绪（等待 ${waitingFor}）。${message || ""}`
+            : (message || "导航未就绪，无法导航。");
         }
         if (code === "goal_pose_publish_failed" || code === "goal_pose_publish_unsupported") {
           return message || "发布 /goal_pose 失败。";
@@ -2103,8 +2103,8 @@ button{font-family:inherit;cursor:pointer}
         if (code === "initial_pose_publish_failed" || code === "initial_pose_publish_unsupported") {
           return message || "发布 /initialpose 失败。";
         }
-        if (code === "nav2_provider_unavailable") {
-          return message || "Nav2 provider 未初始化。";
+        if (code === "runtime_provider_unavailable") {
+          return message || "导航运行时未初始化。";
         }
         return message || `HTTP ${status}`;
       }
@@ -2118,11 +2118,11 @@ button{font-family:inherit;cursor:pointer}
           return;
         }
         if (mapGoalUsesOfflineGrid()) {
-          updateGoalPickStatus("当前为离线/缓存地图，与 Nav2 实时 costmap 可能不一致，建议等待实时流后再发目标", "error");
+          updateGoalPickStatus("当前为离线/缓存地图，与实时代价地图可能不一致，建议等待实时流后再发目标", "error");
           return;
         }
         if (state.pendingNavGoal && state.pendingNavGoal.status === "sending") {
-          updateGoalPickStatus("上一条 Nav2 目标仍在下发，请稍候", "pending");
+          updateGoalPickStatus("上一条导航目标仍在下发，请稍候", "pending");
           return;
         }
         const frameId = navigationFrameId();
@@ -2394,9 +2394,9 @@ button{font-family:inherit;cursor:pointer}
       function backendSpatialProcessReason() {
         const geoRuntime = state.latestGovernance && state.latestGovernance.metadata && state.latestGovernance.metadata.geometry_runtime;
         const processes = geoRuntime && geoRuntime.processes;
-        const external = processes && processes.external_slam_nav2;
-        if (!external || external.running !== true) return null;
-        const cmd = String(external.command_display || (Array.isArray(external.command) ? external.command.join(" ") : external.command) || "").toLowerCase();
+        const runtimeProcess = processes && (processes["nuwax-geometry-runtime"] || processes.nuwax_geometry_runtime);
+        if (!runtimeProcess || runtimeProcess.running !== true) return null;
+        const cmd = String(runtimeProcess.command_display || (Array.isArray(runtimeProcess.command) ? runtimeProcess.command.join(" ") : runtimeProcess.command) || "").toLowerCase();
         if (cmd.includes("--explore") || cmd.includes("--exploration")) return "exploration";
         if (cmd.includes("--localization") || cmd.includes("--loc")) return "backend_localization";
         if (cmd.includes("--mapping") || cmd.includes("--new")) return "mapping";
@@ -2498,7 +2498,7 @@ button{font-family:inherit;cursor:pointer}
           || (diagnostics.geometry_activation && diagnostics.geometry_activation.backend_mode)
           || ""
         ).trim().toLowerCase();
-        return backendMode === "rtabmap_localization" && loadedMapVersionShouldDisplay(diagnostics);
+        return backendMode === "mapping_localization" && loadedMapVersionShouldDisplay(diagnostics);
       }
       function hasLiveMapFlag(diagnostics, streamBridge) {
         if (!diagnostics) return false;
@@ -2512,7 +2512,7 @@ button{font-family:inherit;cursor:pointer}
           diagnostics.source_alive === true ||
           diagnostics.streaming === true ||
           diagnostics.live_mapping_ready === true ||
-          diagnostics.rtabmap_live_streaming_ready === true ||
+          diagnostics.mapping_live_streaming_ready === true ||
           bridgeMode === "streaming" ||
           (streamBridge && streamBridge.streaming === true)
         );

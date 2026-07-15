@@ -84,12 +84,11 @@ class ModelsPhase(Phase):
             health_url=getattr(planner, "health_url", "http://127.0.0.1:8766/api/health"),
             nuwaclaw_saved_key="",
             nuwaclaw_host_mount=getattr(planner, "nuwaclaw_host_mount", "none"),
-            # 15 个 boolean flag 全部交给 BootstrapPlanner._resolve_bool 走默认
+            # 14 个 boolean flag 全部交给 BootstrapPlanner._resolve_bool 走默认
             install_python=None, geometry=None, data_plane=None, systemd=None, relay=None,
             install_nuwaclaw_docker=None, prepare_memory=None, prepare_yolo=None,
             export_yolo_engine=None, build_geometry=None, build_go2slam=None,
-            install_geometry_deps=None, repair_ros2_apt_source=None,
-            start_gateway=None, healthcheck=None,
+            install_geometry_deps=None, start_gateway=None, healthcheck=None,
             memory_mode=getattr(planner, "memory_mode", "cloud"),
             perception_mode=getattr(planner, "perception_mode", "hybrid"),
             mcp_mode=getattr(planner, "mcp_mode", "auto"),

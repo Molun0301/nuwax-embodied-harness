@@ -91,7 +91,7 @@
       "nuwax-vision-spatial",
       "nuwax-vision-tracker"
     ],
-    "removed_note": "RTAB-Map is active SLAM (replaces FastLIO2); nuwax-vision-* board not implemented (model deferred).",
+    "removed_note": "Native mapping is active; nuwax-vision-* board not implemented (model deferred).",
     "intentional_change_crates": [
       {
         "crate": "nuwax-mapping-raytracing",

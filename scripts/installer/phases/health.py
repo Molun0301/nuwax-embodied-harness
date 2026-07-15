@@ -3,9 +3,7 @@
 设计要点（openspec/changes/installer-redesign/specs/installer/spec.md
 Requirement "health phase 区分 gateway 来源" + RK13/RK19）：
 
-1. **禁止订阅 ROS 主题**：memory ``feedback_ros_bad_alloc_lightweight_sampling.md``
-   记录实机 ROS2 大节点查询会触发 ``bad_alloc``；health 只走 ``curl -sS -m 5``
-   HTTP 探测（5s timeout），不碰任何 ROS topic。
+1. **只做 HTTP 探测**：health 使用 ``curl -sS -m 5`` 请求 gateway，超时为 5 秒。
 2. **PID 来源区分**：
    * 持有者 PID ∈ ``state.json`` 启动列表 → installer 自己起的 → 走 curl
    * 持有者 PID ∉ 启动列表 → 外部启动 → 跳过 curl，打印

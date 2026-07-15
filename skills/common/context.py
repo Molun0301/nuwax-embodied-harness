@@ -57,7 +57,7 @@ class SkillContext:
     publish_runtime_governance_stream_frame: Callable[[], None]
     sync_perception_runtime_for_memory_state: Callable[..., None]
     map_delete_also_delete_library: Callable[[], bool]
-    # RTAB merge：activate_map / get_active_map 在 RTAB 侧返回 geometry_stack 摘要
+    # activate_map / get_active_map 返回 geometry_stack 摘要。
     # （+ next_step_hint），_geometry_stack_summary 仍留在网关运行时（start_mapping 等复用），
     # 以可调用句柄注入（与上方 ensure_geometry_runtime_* 同范式，守 R4b）。
     geometry_stack_summary: Callable[[], Any]

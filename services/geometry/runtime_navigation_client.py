@@ -1,7 +1,6 @@
 """runtime_navigation_client — platform 侧 navigation 串行锁 + 状态机。
 
-替代旧的 ``services/geometry/navigation_proxy_client.py``，命名收敛为 ``runtime_navigation_client``：
-- 不再依赖旧版 ROS2 action proxy proto stub。
+统一使用 ``runtime_navigation_client``：
 - 通过 ``GeometryRuntimeProvider`` 走 ``SetNavigationGoal`` / ``CancelNavigation`` /
   ``SubscribeNavigationState`` 等 gRPC facade。
 - 串行锁 / 状态机 / 错误码契约与 design.md 决策 D1 + D3 保持一致。
@@ -113,7 +112,7 @@ class _RuntimeUnavailable(Exception):
 class RuntimeNavigationClient:
     """platform 侧 navigation 串行锁客户端。
 
-    与旧版 ``NavigationProxyClient`` 接口形状保持兼容，但内部不再 stub nav2 proto：
+    通过正式 GeometryRuntimeProvider 接口完成导航事务：
     - ``navigate()``：通过正式 ``GeometryRuntimeProvider.set_goal`` 发 exact goal；
     - ``cancel()``：通过兼容入口转入正式 ``cancel_goal`` active-goal 栅栏；
     - ``subscribe_state()``：通过 ``GeometryRuntimeProvider.subscribe_navigation_state`` 拉流。

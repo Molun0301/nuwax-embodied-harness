@@ -51,7 +51,7 @@ class MappingService:
                             return latest_snapshot
                 metadata = dict(runtime_snapshot.metadata or {})
                 live_streaming = bool(
-                    metadata.get("rtabmap_live_streaming_ready")
+                    metadata.get("mapping_live_streaming_ready")
                     or metadata.get("live_streaming_ready")
                     or metadata.get("map_snapshot_kind") == "live_streaming"
                     or metadata.get("source_kind") == "platform_live_map_provider"
@@ -138,7 +138,7 @@ class MappingService:
         snapshot_metadata = {
             "available_layers": self._build_available_layers(occupancy_grid, cost_map, semantic_map),
             "map_snapshot_kind": source_metadata.get("map_snapshot_kind") or self._infer_snapshot_kind(source_metadata),
-            "live_streaming_ready": bool(source_metadata.get("rtabmap_live_streaming_ready") or source_metadata.get("live_streaming_ready")),
+            "live_streaming_ready": bool(source_metadata.get("mapping_live_streaming_ready") or source_metadata.get("live_streaming_ready")),
             "checkpoint_ready": bool(source_metadata.get("checkpoint_ready") or source_metadata.get("geometry_ready")),
             **source_metadata,
         }
@@ -250,7 +250,7 @@ class MappingService:
             "previous_revision": previous.revision if previous is not None else None,
             "source_alive": False,
             "live_streaming_ready": False,
-            "rtabmap_live_streaming_ready": False,
+            "mapping_live_streaming_ready": False,
         }
         if self._stream_bus is not None:
             # 用 status="cleared" + payload=None 的 map.frame 让前端 updateMap 走 grid 缺失分支。
@@ -335,7 +335,7 @@ class MappingService:
             "occupancy_sequence": metadata.get("occupancy_sequence"),
             "cost_map_sequence": metadata.get("cost_map_sequence"),
             "live_streaming_ready": metadata.get("live_streaming_ready"),
-            "rtabmap_live_streaming_ready": metadata.get("rtabmap_live_streaming_ready"),
+            "mapping_live_streaming_ready": metadata.get("mapping_live_streaming_ready"),
         }
         sequence = self._extract_stream_sequence(heartbeat)
         revision = None
@@ -379,7 +379,7 @@ class MappingService:
 
     def _infer_snapshot_kind(self, metadata: Dict[str, object]) -> str:
         source_mode = str(metadata.get("source_mode") or metadata.get("map_version_source_mode") or "").strip()
-        if source_mode == "live_streaming_checkpoint" or metadata.get("rtabmap_live_streaming_ready") is True:
+        if source_mode == "live_streaming_checkpoint" or metadata.get("mapping_live_streaming_ready") is True:
             return "live_streaming"
         if metadata.get("platform_map_version_id") or metadata.get("geometry_asset_summary"):
             return "offline_checkpoint"

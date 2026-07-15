@@ -4,10 +4,7 @@
 `ExternalMappingScript` 接口。具体实现由 manifest.robot_profile.external_slam_script
 选择。Go2 仍走 `Go2ShSlamScript`（封装原 go2.sh）；G1 走 `G1WebRtcSlamScript`
 （Unitree WebRTC 内部点云）。raspi_lidar_robot 共享 nuwax-geometry-runtime
-（`RaspiRtabMapScript` 已 R-N14-6 删除）。
-
-历史类名 `ExternalSlamNav2Script` 保留作 B 类 alias；Nav2/rtabmap_ros 时代代码已 drop-ros2
-阶段物理删除。本模块提供两类工厂：
+本模块提供两类工厂：
 - `_resolve_external_script(profile)`：按 external_slam_script 字段选择实现类。
 - `build_external_script(profile)`：同上，但要求 profile 不为空；否则抛 RuntimeError。
 """
@@ -34,8 +31,7 @@ class ExternalMappingScript(ABC):
     """外部 mapping（nuwax-mapping 板块） 后端抽象类契约。
 
     所有 mapping 后端必须实现此接口；上游 `services/geometry/runtime.py` 通过
-    `_resolve_external_script()` 工厂获取具体实例。历史 ABC 名 `ExternalSlamNav2Script`
-    保留作 B 类 alias，见末尾。
+    `_resolve_external_script()` 工厂获取具体实例。
     """
 
     @abstractmethod
@@ -54,10 +50,6 @@ class ExternalMappingScript(ABC):
     @abstractmethod
     def is_ready(self) -> bool:
         """断言后端已就绪（驱动客户端连上 / 节点 ACTIVE / launch 跑通）。"""
-
-
-# B 类 alias 保留（1 版本周期 + telemetry 触发清理）
-ExternalSlamNav2Script = ExternalMappingScript
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +118,7 @@ class G1WebRtcSlamScript(ExternalMappingScript):
         return ExternalSlamState(
             name="G1WebRtcSlamScript",
             is_ready=self.is_ready(),
-            detail="G1 WebRTC 内部点云 + Nav2 action",
+            detail="G1 WebRTC 内部点云 + 原生导航运行时",
         )
 
     def is_ready(self) -> bool:
@@ -139,10 +131,7 @@ class G1WebRtcSlamScript(ExternalMappingScript):
 # ---------------------------------------------------------------------------
 #
 # 树莓派共享 nuwax-geometry-runtime（与 Go2/G1 同一栈），不再启独立脚本。
-# 历史类 `RaspiRtabMapScript` 物理删除；旧 manifest.robot_profile.external_slam_script
-# 字段名保留但未注册到 `_REGISTRY`，工厂回退到 Go2 默认实现以避免破坏现有部署。
-# drivers/raspi_lidar_robot/manifest.py:55 残留 `RaspiRtabMapScript` Python 路径
-# 留待后续 Phase 处理（本任务范围仅 external_script_runner.py）。
+# 树莓派共享 nuwax-geometry-runtime，不注册独立脚本实现。
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +142,6 @@ class G1WebRtcSlamScript(ExternalMappingScript):
 _REGISTRY = {
     "Go2ShSlamScript": Go2ShSlamScript,
     "G1WebRtcSlamScript": G1WebRtcSlamScript,
-    # RaspiRtabMapScript 已 R-N14-6 删除（R-N14 v4 §R-N14-6 决策）
 }
 
 
@@ -183,7 +171,6 @@ def build_external_script(profile, **deps) -> "ExternalMappingScript":
 
 __all__ = [
     "ExternalMappingScript",  # 新名
-    "ExternalSlamNav2Script",  # B 类 alias
     "ExternalSlamState",
     "Go2ShSlamScript",
     "G1WebRtcSlamScript",

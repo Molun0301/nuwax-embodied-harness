@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# services/geometry/source_runtime_env.sh — 通用 env 文件加载器（去 ROS2 化）
-#
-# 2026-07-03 drop-ros2：原脚本负责 source ROS2 setup / CycloneDDS lib / Go2SLAM 工作区
-# setup，整体 ROS2 接触面已下线；本文件仅保留通用 env 文件加载能力，不再做任何 ROS2
-# 专用检查。
+# services/geometry/source_runtime_env.sh — 通用 env 文件加载器
 #
 # 用法：
 #   在启动 native geometry runtime 之前 source 本文件：

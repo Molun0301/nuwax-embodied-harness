@@ -4,18 +4,18 @@
 
 //! nuwax-geometry-runtime：LCM-first 几何 native runtime 子进程入口
 //!
-//! 替换旧 `nuwax-ros-bridge`：删除 ROS2 env/r2r/DDS 依赖；改为读
-//! `NUWAX_GEOMETRY_RUNTIME_*` env + nuwax-workspace LCM channel。
+//! 读取 `NUWAX_GEOMETRY_RUNTIME_*` env + nuwax-workspace LCM channel。
 //!
 //! 启动顺序：
-//! 1. tracing 初始化
-//! 2. 解析 env：port、LCM channel 名、video shm/uds 路径、ready file 路径
-//! 3. 预绑定 gRPC listener（端口占用立即 fail-fast）
-//! 4. 启动 video_relay（HTTP/UDS→SHM，与 LCM 无关的视频中转）
-//! 5. 启动 `lcm_runtime::spawn_geometry_runtime`（real-lcm 启动失败立即退出）
-//! 6. 在同一 LCM owner context 上注册 module-style RPC，再启动 tonic server
-//! 7. 自检 HealthCheck 后写 ready file
-//! 8. Stop RPC 关闭 listener，确认 LCM unsubscribe 后退出进程
+//! 1. 校验 `NUWAX_LCM_BACKEND`，非法值在任何启动副作用前退出
+//! 2. tracing 初始化
+//! 3. 解析 env：port、LCM channel 名、video shm/uds 路径、ready file 路径
+//! 4. 预绑定 gRPC listener（端口占用立即 fail-fast）
+//! 5. 启动 video_relay（HTTP/UDS→SHM，与 LCM 无关的视频中转）
+//! 6. 启动 `lcm_runtime::spawn_geometry_runtime`（real-lcm 启动失败立即退出）
+//! 7. 在同一 LCM owner context 上注册 module-style RPC，再启动 tonic server
+//! 8. 自检 HealthCheck 后写 ready file
+//! 9. Stop RPC 关闭 listener，确认 LCM unsubscribe 后退出进程
 
 // Phase 4: `pub` 而非私有 —— 兄弟模块(lcm_runtime/server)需要 `crate::channel_registry::*`。
 pub mod channel_registry;
@@ -130,8 +130,26 @@ fn remove_ready_file(path: &str) -> io::Result<()> {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let lcm_backend = match lcm_runtime::LcmBackendKind::from_env() {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("geometry runtime 初始化 Tokio 失败: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    runtime.block_on(run(lcm_backend))
+}
+
+async fn run(lcm_backend: lcm_runtime::LcmBackendKind) -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter("nuwax_geometry_runtime=info,nuwax_protocol=warn,nuwax_transport=warn,nuwax_codec=warn,nuwax_tf=warn")
         .with_target(false)
@@ -218,7 +236,7 @@ async fn main() -> ExitCode {
     };
 
     // ----------------------------------------------------------------------
-    // video relay（保留——视频中转不属于 LCM/ROS2 范畴）
+    // video relay
     // ----------------------------------------------------------------------
     if let Err(e) = video_relay::spawn_video_relay(&video_shm_path, &video_uds_path) {
         error!("视频中转启动失败: {}", e);
@@ -235,6 +253,7 @@ async fn main() -> ExitCode {
     let cm_chan_for_runtime = cloud_map_channel.clone();
     // ^ 保留这条 eprintln 不动 — main.rs:149 是上游异常分支,不属于崩溃链
     let bridge = match lcm_runtime::spawn_geometry_runtime(
+        lcm_backend,
         &occupancy_channel,
         &tf_channel,
         Some(&cm_chan_for_runtime),
@@ -244,8 +263,7 @@ async fn main() -> ExitCode {
     ) {
         Ok(b) => b,
         Err(e) => {
-            // 2026-07-08 fake-lcm 物理删除后:real-lcm 启动失败无 fake fallback,
-            // 启动期直接 fail-fast(exit code = 4)。
+            // real-lcm 启动失败时直接 fail-fast(exit code = 4)。
             // 错误信息在 stderr 输出 "LCM_BACKEND_UNAVAILABLE" 关键字,
             // 供 start 脚本与 smoke test grep 识别。
             error!("{}", e);

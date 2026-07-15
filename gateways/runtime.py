@@ -254,7 +254,7 @@ def _resolve_telemetry_process_roles(robot) -> Tuple[str, ...]:
     """从当前机器人 manifest 读 telemetry 进程角色白名单。
 
     顺序：manifest.robot_profile.telemetry_process_keywords（按 robot 真实值）→
-    fallback 原 Go2 默认 ("go2_video_streamer",)。返回 tuple 以保持下游不可变。
+    fallback 当前视频进程标题。返回 tuple 以保持下游不可变。
     """
 
     manifest = getattr(robot, "manifest", None)
@@ -262,7 +262,7 @@ def _resolve_telemetry_process_roles(robot) -> Tuple[str, ...]:
     keywords = getattr(profile, "telemetry_process_keywords", None)
     if keywords:
         return tuple(str(k) for k in keywords)
-    return ("go2_video_streamer",)
+    return ("nuwax-go2-video-streamer",)
 
 
 def _runtime_event_duration_ms(event) -> Optional[float]:
@@ -1326,8 +1326,7 @@ class GatewayRuntime:
             "source": "pointcloud_map_cache",
             "source_kind": pointcloud_map.source_kind,
             "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "mapping_database_path": source_summary.get("mapping_database_path") or source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
-            "mapping_db_path": source_summary.get("mapping_db_path") or source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
+            "mapping_database_path": source_summary.get("mapping_database_path"),
             "pcd_path": pointcloud_map.path,
             "point_count": pointcloud_map.point_count,
             "fields": [
@@ -1419,8 +1418,7 @@ class GatewayRuntime:
             "source": "pointcloud_map_cache",
             "source_kind": source_summary.get("source_kind") or "configured_pcd_root",
             "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "mapping_database_path": source_summary.get("mapping_database_path") or source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
-            "mapping_db_path": source_summary.get("mapping_db_path") or source_summary.get("rtabmap_database_path") or source_summary.get("rtabmap_db_path"),
+            "mapping_database_path": source_summary.get("mapping_database_path"),
             "pcd_path": source_summary.get("pcd_path") or source_summary.get("path"),
             "point_count": 0,
             "fields": [],
@@ -2545,7 +2543,7 @@ class GatewayRuntime:
             "get_active_map": partial(localization_skills.handle_get_active_map, self._skill_ctx),
             "list_map_versions": partial(localization_skills.handle_list_map_versions, self._skill_ctx),
             "save_active_map_version": partial(localization_skills.handle_save_active_map_version, self._skill_ctx),
-            # RTAB 新增建图能力（skills 未下放），保留 runtime 方法派发：
+            # 建图能力尚未下放到 skills，保留 runtime 方法派发。
             "start_mapping": self._handle_start_mapping,
             "stop_mapping": self._handle_stop_mapping,
             "stop_exploration": self._handle_stop_exploration,
@@ -3411,7 +3409,7 @@ class GatewayRuntime:
             geometry_runtime_status=geometry_runtime_status,
         )
         return RuntimeGovernanceSummary(
-            rtabmap_profile=profile,
+            mapping_profile=profile,
             geometry_asset=geometry_asset,
             localization_session=self._runtime_localization_session_summary(localization_session, localization_snapshot),
             last_relocalization=last_relocalization,
@@ -3586,7 +3584,6 @@ class GatewayRuntime:
             "route": (
                 profile.get("route")
                 or metadata.get("route")
-                or getattr(getattr(self.platform_geometry_runtime.config, "nav2", None), "mode", None)
                 or profile.get("stack")
                 or metadata.get("geometry_stack")
                 or self.platform_geometry_runtime.config.stack
@@ -3595,12 +3592,8 @@ class GatewayRuntime:
             "stack": profile.get("stack") or metadata.get("geometry_stack") or self.platform_geometry_runtime.config.stack,
             "status": "configured" if profile else "missing",
             "geometry_enabled": bool(self.platform_geometry_runtime.config.enabled),
-            "require_ros2": bool(getattr(self.platform_geometry_runtime.config, "require_ros2", False)),
             "source": "map_snapshot.metadata" if metadata else "geometry_runtime.config",
         }
-
-    # R-N14 v4 Phase 2 B 类 alias:函数旧名 1 版本周期内保留,后续 telemetry 触发清理。
-    _runtime_rtabmap_profile_summary = _runtime_mapping_profile_summary
 
     def _runtime_geometry_asset_summary(self, map_snapshot: Any, localization_session: Any) -> MetadataDict:
         metadata = dict(getattr(map_snapshot, "metadata", {}) or {}) if map_snapshot is not None else {}
@@ -3629,22 +3622,7 @@ class GatewayRuntime:
             "available": bool(summary),
             "geometry_stack": summary.get("geometry_stack") or metadata.get("geometry_stack") or self.platform_geometry_runtime.config.stack,
             "frame_id": summary.get("frame_id") or getattr(map_snapshot, "frame_id", None),
-            "mapping_database_path": (
-                summary.get("mapping_database_path")
-                or summary.get("rtabmap_database_path")
-                or summary.get("rtabmap_db_path")
-                or metadata.get("mapping_database_path")
-                or metadata.get("rtabmap_database_path")
-                or metadata.get("rtabmap_db_path")
-            ),
-            "mapping_db_path": (
-                summary.get("mapping_db_path")
-                or summary.get("rtabmap_database_path")
-                or summary.get("rtabmap_db_path")
-                or metadata.get("mapping_db_path")
-                or metadata.get("rtabmap_database_path")
-                or metadata.get("rtabmap_db_path")
-            ),
+            "mapping_database_path": summary.get("mapping_database_path") or metadata.get("mapping_database_path"),
             "pcd_path": summary.get("pcd_path") or metadata.get("pcd_path"),
             "asset_types": summary.get("asset_types") or [],
             "quality_status": quality_status,
@@ -4129,7 +4107,7 @@ class GatewayRuntime:
                 order=90,
                 updated_at=utc_now(),
                 related_streams=("runtime.governance", "pointcloud_map.meta"),
-                expected_process_roles=("geometry_external", "rtabmap_live", "nav2"),
+                expected_process_roles=("geometry_runtime", "geometry_external", "nav_stack"),
                 metadata={"geometry_runtime": geometry_runtime_status, "geometry_asset": geometry_asset},
             )
         )
@@ -4430,7 +4408,6 @@ class GatewayRuntime:
                     "live_streaming_ready",
                     "checkpoint_ready",
                     "mapping_database_path",
-                    "mapping_db_path",
                     "update_sequence",
                     "content_revision",
                 )
@@ -4460,14 +4437,14 @@ class GatewayRuntime:
         return {
             "geometry_stack": data.get("geometry_stack"),
             "frame_id": data.get("frame_id"),
-            "mapping_database_path": data.get("mapping_database_path") or data.get("rtabmap_database_path") or data.get("rtabmap_db_path"),
+            "mapping_database_path": data.get("mapping_database_path"),
             "pcd_path": data.get("pcd_path"),
             "built_at": data.get("built_at"),
             "occupancy_projection": data.get("occupancy_projection"),
             "costmap_source": data.get("costmap_source"),
             "quality_metrics": {
                 key: quality[key]
-                for key in ("database", "nav2_map", "pcd", "diagnostics")
+                for key in ("database", "navigation_map", "pcd", "diagnostics")
                 if key in quality
             },
             "asset_types": asset_types,
@@ -4507,7 +4484,6 @@ class GatewayRuntime:
                 "live_streaming_ready",
                 "checkpoint_ready",
                 "mapping_database_path",
-                "mapping_db_path",
                 "backend_session_id",
                 "backend_run_id",
                 "exploration_pinned_version_id",
@@ -4792,6 +4768,14 @@ class GatewayRuntime:
                 "status_text",
                 "exploration_terminal",
                 "terminal_status",
+                "revision",
+                "selected_source",
+                "last_stop_reason",
+                "child_task_id",
+                "map_version_id",
+                "map_revision",
+                "state_source",
+                "runtime_ready",
                 "elapsed_time_sec",
                 "max_duration_sec",
                 "explorer_status_text",
@@ -4916,7 +4900,7 @@ class GatewayRuntime:
     def _attach_perception_to_exploration(self) -> None:
         """探索任务启动时确保感知运行，并标记探索耦合（无论是否已运行）。
 
-        定位模式（rtabmap_localization 后端激活态）下不联动拉起后台感知线程：
+        定位模式（mapping_localization 后端激活态）下不联动拉起后台感知线程：
         此时地图/定位已就绪，常态任务态由按需 MCP 触发，7×24 后台线程会反复撞
         refresh() 的 GatewayError。手动 start_perception_runtime MCP 仍可绕过本门控。
         """
@@ -5103,11 +5087,7 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Debug 面板 RViz 2D Goal 直通 → nuwax-geometry-runtime SetNavigationGoal。
-
-        Phase 0 收敛（去 ROS2 目标态）：直接调 nuwax-geometry-runtime。
-        Nav2/ROS2 链已删除，错误码统一为 `runtime_provider_unavailable`。
-        """
+        """Debug 面板 RViz 2D Goal 直通 nuwax-geometry-runtime。"""
 
         pose = self._build_pose_from_arguments(arguments)
         provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
@@ -5121,8 +5101,7 @@ class GatewayRuntime:
             self.platform_geometry_runtime._cancel_platform_exploration_navigation()
         except Exception:
             RUNTIME_LOGGER.debug("debug_navigation_goal 取消平台探索在途目标失败。", exc_info=True)
-        # Phase 3 目标态：RViz /goal_pose 直通改走 nuwax-geometry-runtime.SetNavigationGoal。
-        # 不再依赖被删除的 nav2_action_provider.publish_rviz_goal_pose（该路径发布 ROS2 /goal_pose 话题）。
+        # RViz /goal_pose 直通 nuwax-geometry-runtime.SetNavigationGoal。
         if provider is None:
             raise GatewayError(
                 "platform_geometry_runtime._remote_provider 未初始化；RViz /goal_pose 直通不可用。",
@@ -5203,8 +5182,8 @@ class GatewayRuntime:
         provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
-                "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
-                error_code="nav2_provider_unavailable",
+                "GeometryRuntimeProvider 未初始化；请确认几何运行时已启动且 profile 已启用。",
+                error_code="runtime_provider_unavailable",
                 http_status=503,
             )
         # Phase 3 目标态：/clicked_point RViz Publish Point 已被映射成 nuwax-geometry-runtime.SetNavigationGoal。
@@ -5261,18 +5240,17 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Debug 面板 RViz 2D Pose Estimate 直通：发布 /initialpose → RTAB-Map 重定位。"""
+        """Debug 面板 RViz 2D Pose Estimate 直通重定位接口。"""
 
         pose = self._build_pose_from_arguments(arguments)
         provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
-                "Nav2 action provider 未初始化；请确认 go2.sh 已启动且平台几何 profile 已启用。",
-                error_code="nav2_provider_unavailable",
+                "GeometryRuntimeProvider 未初始化；请确认几何运行时已启动且 profile 已启用。",
+                error_code="runtime_provider_unavailable",
                 http_status=503,
             )
-        # Phase 3 目标态：RViz /initialpose 改走 nuwax-localization._publish_initialpose
-        # （之前在 nav2_action_provider.publish_rviz_initial_pose 实现的 ROS2 publish 已下线）。
+        # RViz /initialpose 走 nuwax-localization._publish_initialpose。
         if provider is None:
             raise GatewayError(
                 "platform_geometry_runtime._remote_provider 未初始化。",
@@ -5384,7 +5362,7 @@ class GatewayRuntime:
         )
         pose = self._build_pose_from_arguments(arguments)
         goal_metadata = {"requested_by": requested_by or "unknown"}
-        # Phase 0 收敛（去 ROS2 目标态）：仅保留 `force_runtime_goal` 单一 key。
+        # 导航强制执行只使用 `force_runtime_goal` 单一 key。
         force_runtime_goal = bool(
             arguments.get("force_runtime_goal", False)
         )
@@ -7033,10 +7011,7 @@ class GatewayRuntime:
         map_name: str,
         force_runtime_goal: bool = False,
     ):
-        """在实时位姿与 nuwax-geometry-runtime 可用时，允许直接下发导航目标。
-
-        Phase 0 收敛（去 ROS2 目标态）：仅保留 `force_runtime_goal` 形参。
-        """
+        """在实时位姿与 nuwax-geometry-runtime 可用时直接下发导航目标。"""
 
         localization_snapshot = self.localization_service.get_latest_snapshot()
         if localization_snapshot is None or localization_snapshot.current_pose is None:
@@ -7047,9 +7022,9 @@ class GatewayRuntime:
                 jsonrpc_code=-32000,
                 details={"map_name": map_name, "capability_name": capability_name},
             )
-        nav2_runtime = getattr(self.platform_geometry_runtime, "_remote_provider", None)
-        if nav2_runtime is not None and force_runtime_goal:
-            readiness = nav2_runtime.get_navigation_readiness()
+        runtime_provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
+        if runtime_provider is not None and force_runtime_goal:
+            readiness = runtime_provider.get_navigation_readiness()
             if readiness is not None:
                 if bool(readiness.get("ready")):
                     RUNTIME_LOGGER.info(
@@ -7103,7 +7078,7 @@ class GatewayRuntime:
     ):
         force_runtime_goal = bool(arguments.get("force_runtime_goal", False))
         trust_live_navigation = bool(arguments.get("trust_live_navigation", False))
-        # Phase 0 收敛（去 ROS2 目标态）：仅保留 `force_runtime_goal` 单一 key。
+        # 导航强制执行只使用 `force_runtime_goal` 单一 key。
         effective_force = force_runtime_goal
         if trust_live_navigation or effective_force:
             try:
@@ -8633,7 +8608,7 @@ class GatewayRuntime:
         """把重型几何 skill handler 包进后台 task runner（超时根因 D3）。
 
         activate_map / relocalize_active_map / load_map_version 原为 SYNC，其 handler 内
-        会同步启动 RTAB-Map 栈 + 重定位/后端切换（数十秒），在 MCP 单次请求线程内执行会
+        会同步启动建图与定位后端（数十秒），在 MCP 单次请求线程内执行会
         超过客户端 ~60s 超时（-32001）。此处复用既有 ASYNC_TASK 机制（参照
         _submit_navigation_task）：立即返回 task_id，handler 整体在后台线程执行。
 
@@ -9956,10 +9931,23 @@ class GatewayRuntime:
         last_context,
         exploration_metadata: Dict[str, Any],
     ) -> Dict[str, Any]:
+        exploration_state = last_context.exploration_state
+        status = getattr(exploration_state.status, "value", exploration_state.status)
         return {
             "request_id": request.request_id,
-            "covered_ratio": last_context.exploration_state.covered_ratio,
-            "frontier_count": last_context.exploration_state.frontier_count,
+            "current_request_id": exploration_state.current_request_id,
+            "status": status,
+            "message": exploration_state.message,
+            "covered_ratio": exploration_state.covered_ratio,
+            "frontier_count": exploration_state.frontier_count,
+            "revision": exploration_metadata.get("revision"),
+            "selected_source": exploration_metadata.get("selected_source"),
+            "last_stop_reason": exploration_metadata.get("last_stop_reason"),
+            "child_task_id": exploration_metadata.get("child_task_id"),
+            "map_version_id": exploration_metadata.get("map_version_id"),
+            "map_revision": exploration_metadata.get("map_revision"),
+            "state_source": exploration_metadata.get("state_source"),
+            "runtime_ready": exploration_metadata.get("runtime_ready"),
             "waiting_for": exploration_metadata.get("waiting_for"),
             "explorer_status_text": exploration_metadata.get("status_text") or exploration_metadata.get("explorer_status_text"),
             "exploration_terminal": exploration_metadata.get("exploration_terminal"),
@@ -10032,7 +10020,6 @@ class GatewayRuntime:
             or metadata.get("source_kind") == "platform_live_map_provider"
             or metadata.get("live_streaming_ready")
             or metadata.get("mapping_live_streaming_ready")
-            or metadata.get("rtabmap_live_streaming_ready")
         )
         if not live_snapshot:
             return True
@@ -10410,7 +10397,7 @@ class GatewayRuntime:
         frontier_count = context.exploration_state.frontier_count
         if frontier_count is not None and frontier_count > 0:
             return max(0.35, min(0.85, 1.0 / float(frontier_count + 1)))
-        if metadata.get("exploration_mode") in {"go2_rtabnav2_script", "go2_rtabmap_script"}:
+        if metadata.get("exploration_mode") == "external_geometry_script":
             if "NAVIGATING" in status_text:
                 open_paren = status_text.find("(")
                 close_paren = status_text.find(")", open_paren + 1) if open_paren >= 0 else -1
@@ -10436,7 +10423,7 @@ class GatewayRuntime:
             if "WARMING UP" in status_text:
                 return 0.15
             waiting_for = str(metadata.get("waiting_for") or "")
-            if waiting_for in {"external_map_streaming", "external_slam_nav2", "nav2_lifecycle", "nav2_action"}:
+            if waiting_for == "external_map_streaming":
                 return 0.18
             if waiting_for:
                 return 0.25

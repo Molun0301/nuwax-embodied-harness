@@ -42,7 +42,7 @@ ROBOT_DRIVER_REGISTRY: Dict[str, RobotDriverRegistration] = {
         package="drivers.raspi_lidar_robot",
         factory_name="create_raspi_lidar_robot_assembly",
         private_capabilities_module="drivers.raspi_lidar_robot.private_capabilities",
-        description="树莓派 + 2D 激光雷达 + USB 摄像头小机器狗；tier=lite；RTAB-Map 2D 模式。",
+        description="树莓派 + 2D 激光雷达 + USB 摄像头小机器狗；tier=lite；原生 2D 建图模式。",
     ),
 }
 

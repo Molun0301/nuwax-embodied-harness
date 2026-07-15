@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 """preflight phase：阶段 0 — OS / 架构 / Python / 磁盘 / 网络 + native runtime 探测。
 
-设计要点（plan 4.1 L110 + 2026-07-03 drop-ros2 + 2026-07-07 Phase 8）：
+设计要点（plan 4.1 L110 + 2026-07-07 Phase 8）：
 - 仅探测 + 打印，**不**改系统（plan "check" 语义）。
 - 探测目标态 runtime 必需：rustc / cargo + 本仓 repo-local
   ``services/nuwax-workspace`` 路径 + LCM 系统库可用 + 48 crates 成员齐全 +
@@ -242,7 +242,7 @@ class PreflightPhase(Phase):
         else:
             ctx.warn("  curl=missing（health 阶段将失败）")
 
-        # Rust 工具链（plan 2026-07-03 drop-ros2 目标态 runtime 必须）
+        # Rust 工具链是 native runtime 的必要条件。
         rustc_v = _check_rustc_version()
         cargo_v = _check_cargo_version()
         toolchains = _check_rustup_toolchains()

@@ -51,8 +51,7 @@ pub struct RuntimeDiagnostics {
     pub uptime_ms: u64,
     /// RSS(单位 KB;`/proc/self/status` VmRSS 读取)
     pub rss_kb: u32,
-    /// LCM backend canonical 名(2026-07-08 fake-lcm 物理删除后,字段值固定为
-    /// `real-lcm` 或 `real-lcm-unavailable`)
+    /// LCM backend canonical 名（`real-lcm` 或 `real-lcm-unavailable`）
     pub lcm_backend: String,
     /// schema 字节 layout 的 hash 版本号;Phase 2 当前 = 1(typed codec
     /// 收敛版);P1 切 MurmurHash64A 时升到 2;调用方可借此判断 wire

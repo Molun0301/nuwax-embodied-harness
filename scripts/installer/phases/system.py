@@ -9,18 +9,14 @@ pkg-config、python3-lcm（或等价 Python binding）。原 dimos workspace 绝
 
 设计要点：
 - 任务范围：task 5（installer-ac-coverage）实装 + 2026-07-04 B3 + 2026-07-07 Phase 8。
-- 去 ROS2 化（2026-07-03 drop-ros2 / 2026-07-04 B3）：原 ROS2 apt 派生包
-  （colcon / rosdep / ros-* 体系下的导航/SLAM 派生包等）
-  已物理删除，由 ``nuwax-geometry-runtime`` Rust 二进制 + LCM 系统库替代。
-  本 phase 现在只负责基础工具与 native runtime 必需系统包
+- 本 phase 只负责基础工具与 native runtime 必需系统包
   （rustup / liblcm-dev / pkg-config / python3-lcm）。
 - real-LCM 物装（2026-07-07 Phase 3）：``nuwax-transport real-lcm`` feature
   启用 ``nuwax-lcm`` safe wrapper，链接系统 liblcm.so；缺包时 Rust build 失败，
   缺 Python binding 时 ``LcmMotionCommandBridge`` 不可用，因此系统依赖必须在
   installer 阶段就位。
 - 错误注入（plan 6.11）：``--phase-override system=exit-100`` 触发 AC7 错误输出。
-- ``call_install_geometry_system_dependencies`` 在 ``scripts/installer/_legacy_bridge.py``
-  仍为 no-op 桥接（bootstrap.no-op 化），但本 phase 直接负责 LCM 系统包安装。
+- 系统依赖由本 phase 直接安装和验证。
 """
 from __future__ import annotations
 
@@ -90,8 +86,7 @@ def _apt_install(packages: Tuple[str, ...]) -> int:
 def _verify_pkg_config_lcm() -> bool:
     """验证 ``pkg-config --modversion lcm`` 在系统上能返回非空版本。
 
-    2026-07-08 fake-lcm 物理删除后(v3 F2 决策):
-    - 仅校验 liblcm 实际安装情况;不再有 fake / fake-lcm-test 旁路
+    - 仅校验 liblcm 实际安装情况。
     - 版本范围 `[1.3, 1.6)`:`nuwax-lcm-sys/build.rs` 同步锁;
       镜像必须装 liblcm-dev 1.3~1.5,1.6+ 触发 `LCM_VERSION_UNSUPPORTED`
     - 失败信息以 `LCM_VERSION_UNSUPPORTED` 关键字(供 CI grep 识别)
@@ -123,8 +118,7 @@ def _verify_pkg_config_lcm() -> bool:
 def _verify_python_lcm() -> bool:
     """验证 ``import lcm`` 在当前 Python 解释器下可用（python3-lcm 或 pip fallback）。
 
-    2026-07-08 fake-lcm 物理删除后:无 mock `MockLcmBackend` fallback,Python LCM
-    binding 装不上 → fail-fast(LCM_PYTHON_BINDING_UNAVAILABLE)。
+    Python LCM binding 不可用时必须 fail-fast。
     """
     rc, _, _ = _run_capture(("python3", "-c", "import lcm; print(getattr(lcm, '__version__', 'ok'))"), timeout=5)
     return rc == 0
@@ -172,9 +166,7 @@ class SystemPhase(Phase):
         )
         # 1. 基础工具 + native runtime 系统依赖（rustup / liblcm-dev / build-essential /
         #    pkg-config / python3-lcm）。
-        # 去 ROS2 化后 bootstrap.install_geometry_system_dependencies 是 no-op，
         # 本 phase 直接负责 LCM 系统包安装。
-        ctx.info(f"  [system] 调用 bootstrap.install_geometry_system_dependencies（no-op 桥接）")
         # 2. 安装 liblcm-dev + pkg-config（real-LCM FFI 必需）
         apt_rc = _apt_install(LCM_APT_PACKAGES)
         if apt_rc != 0:
@@ -212,16 +204,14 @@ class SystemPhase(Phase):
         else:
             ctx.info(f"  [system] python3-lcm 可用（apt rc={py_apt_rc}）")
         # 4. aarch64 目标机 profile 二次校验（§12.6 / §13.2 硬约束）
-        # 2026-07-08 fake-lcm 物理删除后:LCM 验证失败信息含
-        # LCM_VERSION_UNSUPPORTED 关键字,供 CI / smoke test grep 识别。
+        # LCM 验证失败信息含 LCM_VERSION_UNSUPPORTED，供 CI / smoke test 识别。
         if _is_aarch64_target():
             if not _verify_pkg_config_lcm():
                 raise PhaseError(
                     phase=self.name,
                     message=(
                         "LCM_VERSION_UNSUPPORTED: aarch64 目标机 profile 下 "
-                        "``pkg-config --modversion lcm`` 二次校验失败;"
-                        "fake-lcm-test 已物理删除(2026-07-08 v3 F2 决策),无 fallback。"
+                        "``pkg-config --modversion lcm`` 二次校验失败。"
                     ),
                     file_path=__file__,
                     code=InstallerErrorCode.PHASE_FAILED,

@@ -133,7 +133,7 @@ class LocalizationSessionStatus(StrEnum):
 
 
 class RelocalizationCandidate(TimestampedContract):
-    """RTAB-Map/ICP 重定位候选结果。"""
+    """地图匹配重定位候选结果。"""
 
     backend: str = Field(default="unknown", description="产生候选的重定位后端。")
     pose: Optional[Pose] = Field(default=None, description="候选位姿。")
@@ -159,7 +159,7 @@ class LocalizationSession(TimestampedContract):
     source_name: str = Field(default="platform_localization_runtime", description="定位会话来源名称。")
     pose_available: bool = Field(default=False, description="当前是否已有可用于平台定位的位姿。")
     geometry_asset: Optional[MetadataDict] = Field(default=None, description="当前定位会话绑定的几何资产摘要。")
-    relocalization_candidates: List[RelocalizationCandidate] = Field(default_factory=list, description="最近 RTAB-Map/ICP 重定位候选。")
+    relocalization_candidates: List[RelocalizationCandidate] = Field(default_factory=list, description="最近地图匹配重定位候选。")
     last_relocalization: Optional[RelocalizationCandidate] = Field(default=None, description="最近一次重定位结果。")
     last_localized_at: Optional[datetime] = Field(default=None, description="最近一次定位就绪时间。")
     last_error: Optional[str] = Field(default=None, description="最近一次定位失败或未就绪说明。")
@@ -286,10 +286,10 @@ class ServiceHealthSummary(TimestampedContract):
 class RuntimeGovernanceSummary(TimestampedContract):
     """运行时观察与治理摘要。"""
 
-    rtabmap_profile: MetadataDict = Field(default_factory=dict, description="RTAB-Map profile 摘要。")
+    mapping_profile: MetadataDict = Field(default_factory=dict, description="建图 profile 摘要。")
     geometry_asset: MetadataDict = Field(default_factory=dict, description="当前地图几何资产摘要。")
     localization_session: MetadataDict = Field(default_factory=dict, description="当前定位会话摘要。")
-    last_relocalization: MetadataDict = Field(default_factory=dict, description="最近一次 RTAB-Map/ICP 重定位摘要。")
+    last_relocalization: MetadataDict = Field(default_factory=dict, description="最近一次地图匹配重定位摘要。")
     navigation_control_policy: MetadataDict = Field(default_factory=dict, description="导航控制策略摘要。")
     service_health: ServiceHealthSummary = Field(default_factory=ServiceHealthSummary, description="Web 监控服务健康聚合快照。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加治理元数据。")
@@ -305,7 +305,7 @@ class ExplorationContext(TimestampedContract):
         default=None,
         description=(
             "闭环判据状态快照（worker-C 填充）；典型字段 loop_closure_count / confidence / last_check_at。"
-            "第 8 条完成路径 ``rtabmap:loop_closed`` 命名空间依赖此字段。"
+            "闭环完成路径 ``mapping:loop_closed`` 依赖此字段。"
         ),
     )
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")

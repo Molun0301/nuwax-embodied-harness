@@ -3,9 +3,9 @@ package nuwax.geometry;
 
 // ============================================================================
 // 目标态 GeometryRuntime gRPC facade
-// - 内部数据协议走 nuwax-workspace LCM typed channels（fake backend 默认）；
+// - 内部数据协议走 nuwax-workspace LCM typed channels；
 // - 该 proto 仅作为 Python 网关 ↔ Rust runtime 之间的 gRPC 控制面兼容边界；
-// - 旧 ROS2 / r2r / Nav2 action / CycloneDDS 依赖已删除；不允许恢复。
+// - 数据面依赖保持在 LCM 边界内。
 // ============================================================================
 
 message Empty {}

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "nuwax 传输层,LCM-first(2026-07-08 fake-lcm 物理删除后,real-lcm 是唯一 backend)"
+description = "nuwax 传输层，LCM-first，real-lcm 是唯一 backend"
 
 [dependencies]
 nuwax-protocol = { path = "../nuwax-protocol" }
@@ -20,17 +20,17 @@ futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# 2026-07-08 fake-lcm 根除后:real-lcm backend 依赖 nuwax-lcm(其内引 nuwax-lcm-sys)。
+# real-lcm backend 依赖 nuwax-lcm（其内引 nuwax-lcm-sys）。
 # 镜像必须装 liblcm-dev 1.3~1.5 才能编译通过(版本锁 build.rs MAX_LCM_VERSION = "1.6")。
-# 无 fake-lcm / fake 旁路;无 compile_error 守门;无 cfg gate。
+# 不提供其它 backend 旁路。
 nuwax-lcm = { path = "../nuwax-lcm", optional = true }
 
 [features]
-# 2026-07-08 fake-lcm 根除后(选项 B — 物理删):
+# 生产 backend 配置：
 #   - `default = ["real-lcm"]`:工作区默认编译就拉入 real-lcm 链路,
 #     不再让 fake backend 作为 CI / dev 默认。
 #   - 镜像必须装 liblcm-dev 1.3~1.5 才能 cargo build / cargo check。
-#   - 无 fake-lcm / fake 旁路,无 compile_error 守门。
+#   - 不提供其它 backend 旁路。
 default = ["real-lcm"]
 # 启用真正的 liblcm / Rust LCM binding backend;
 # Phase 3 (2026-07-07) 真正实现:RealLcmBackend + nuwax-lcm + nuwax-lcm-sys 链路。

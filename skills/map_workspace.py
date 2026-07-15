@@ -169,7 +169,7 @@ class MapWorkspaceService:
         if callable(clear_exploration_context):
             clear_exploration_context(reason="activate_map")
         if load_latest_version and synced_asset.latest_version_id:
-            # activate_map 与 load_map_version 一致：启动 launch_rtabmap.sh --localization {map}.db
+            # activate_map 与 load_map_version 使用同一定位加载入口。
             # load 失败时回滚 active map：set_active_map_name 已在前面改写，
             # 若不回滚会留下「active 指向尚未成功载入 runtime 的地图」的不一致状态。
             try:
@@ -341,12 +341,9 @@ class MapWorkspaceService:
                 "snapshot_kind": snapshot.metadata.get("map_snapshot_kind"),
                 "live_streaming_ready": snapshot.metadata.get("live_streaming_ready") or snapshot.metadata.get("backend_streaming_ready"),
                 "checkpoint_ready": snapshot.metadata.get("checkpoint_ready"),
-                "backend_session_id": snapshot.metadata.get("backend_session_id") or snapshot.metadata.get("rtabmap_session_id") or snapshot.metadata.get("session_id"),
-                "backend_run_id": snapshot.metadata.get("backend_run_id") or snapshot.metadata.get("rtabmap_run_id") or snapshot.metadata.get("run_id"),
-                "rtabmap_database_path": snapshot.metadata.get("rtabmap_database_path") or snapshot.metadata.get("rtabmap_db_path"),
-                # 老消费方继续兼容：保留 rtabmap_* 别名。
-                "rtabmap_session_id": snapshot.metadata.get("backend_session_id") or snapshot.metadata.get("rtabmap_session_id") or snapshot.metadata.get("session_id"),
-                "rtabmap_run_id": snapshot.metadata.get("backend_run_id") or snapshot.metadata.get("rtabmap_run_id") or snapshot.metadata.get("run_id"),
+                "backend_session_id": snapshot.metadata.get("backend_session_id") or snapshot.metadata.get("mapping_session_id") or snapshot.metadata.get("session_id"),
+                "backend_run_id": snapshot.metadata.get("backend_run_id") or snapshot.metadata.get("mapping_run_id") or snapshot.metadata.get("run_id"),
+                "mapping_database_path": snapshot.metadata.get("mapping_database_path"),
                 "update_sequence": snapshot.metadata.get("update_sequence"),
                 "content_revision": snapshot.metadata.get("content_revision"),
                 "seed_map_version_id": snapshot.metadata.get("seed_map_version_id"),
@@ -456,8 +453,7 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             )
         self._localization_service.clear_latest_snapshot()
-        # load_map_version 是 MCP 用户显式选择切到一个历史版本，
-        # 要求后端真正切换可定位状态；external_slam_nav2 暂未支持时应拒绝伪装成功。
+        # 显式加载历史版本时，后端必须确认已切换到对应的可定位状态。
         self._load_map_version_into_runtime(version, require_backend_switch=True)
         self._ensure_active_localization_session_binding(
             metadata={
@@ -820,7 +816,7 @@ class MapWorkspaceService:
         return updated_asset
 
     def _active_runtime_readiness(self) -> Dict[str, object]:
-        """Return live SLAM/Nav2 readiness for the active workspace.
+        """Return live geometry readiness for the active workspace.
 
         Map and localization services may retain the last good snapshot after
         exploration exits. The active workspace should expose live runtime
@@ -837,8 +833,7 @@ class MapWorkspaceService:
             return {}
         if not isinstance(diagnostics, dict):
             return {}
-        # R-N14 v4 Phase 2:读取新 key,fallback 老 key（LEGACY_METADATA_KEY_ALIAS 计数语义保留）。
-        readiness = diagnostics.get("mapping_readiness") or diagnostics.get("rtabmap_readiness")
+        readiness = diagnostics.get("mapping_readiness")
         if not isinstance(readiness, dict):
             readiness = {}
         runtime_status = diagnostics.get("runtime_status")
@@ -847,9 +842,9 @@ class MapWorkspaceService:
         process_running = False
         processes = runtime_status.get("processes")
         if isinstance(processes, dict):
-            external = processes.get("external_slam_nav2")
-            if isinstance(external, dict):
-                process_running = bool(external.get("running"))
+            geometry_process = processes.get("nuwax_geometry_runtime") or processes.get("nuwax-geometry-runtime")
+            if isinstance(geometry_process, dict):
+                process_running = bool(geometry_process.get("running"))
         geometry_stack_status: Dict[str, object] = {}
         stack_reader = getattr(self._geometry_runtime, "get_geometry_stack_status", None)
         if callable(stack_reader):
@@ -930,18 +925,17 @@ class MapWorkspaceService:
         return {
             "geometry_stack": latest_map_snapshot.metadata.get("geometry_stack"),
             "frame_id": self._resolve_map_frame_id(latest_map_snapshot),
-            # R-N14 v4 Phase 2:wire key 保留 rtabmap_db_path（前端兼容）;读时优先新 key,fallback 老 key。
-            "rtabmap_db_path": latest_map_snapshot.metadata.get("mapping_db_path") or latest_map_snapshot.metadata.get("rtabmap_db_path"),
+            "mapping_database_path": latest_map_snapshot.metadata.get("mapping_database_path"),
             "pcd_path": latest_map_snapshot.metadata.get("pcd_path"),
             "assets": asset_refs,
             "quality_metrics": quality_metrics,
             "diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
             "snapshot_kind": latest_map_snapshot.metadata.get("map_snapshot_kind"),
             "source_mode": latest_map_snapshot.metadata.get("source_mode") or latest_map_snapshot.metadata.get("map_version_source_mode"),
-            "live_streaming_ready": latest_map_snapshot.metadata.get("mapping_live_streaming_ready") or latest_map_snapshot.metadata.get("rtabmap_live_streaming_ready") or latest_map_snapshot.metadata.get("live_streaming_ready"),
+            "live_streaming_ready": latest_map_snapshot.metadata.get("mapping_live_streaming_ready") or latest_map_snapshot.metadata.get("live_streaming_ready"),
             "checkpoint_ready": latest_map_snapshot.metadata.get("checkpoint_ready"),
-            "session_id": latest_map_snapshot.metadata.get("mapping_session_id") or latest_map_snapshot.metadata.get("rtabmap_session_id") or latest_map_snapshot.metadata.get("session_id"),
-            "run_id": latest_map_snapshot.metadata.get("mapping_run_id") or latest_map_snapshot.metadata.get("rtabmap_run_id") or latest_map_snapshot.metadata.get("run_id"),
+            "session_id": latest_map_snapshot.metadata.get("mapping_session_id") or latest_map_snapshot.metadata.get("session_id"),
+            "run_id": latest_map_snapshot.metadata.get("mapping_run_id") or latest_map_snapshot.metadata.get("run_id"),
             "database": latest_map_snapshot.metadata.get("database"),
             "pcd": latest_map_snapshot.metadata.get("pcd"),
         }
@@ -1013,8 +1007,8 @@ class MapWorkspaceService:
             "continues_live_updates": True,
             "waiting_for_live_stream": True,
             "live_streaming_ready": False,
-            "rtabmap_live_streaming_ready": False,
-            "backend_mode": "rtabmap_localization",
+            "mapping_live_streaming_ready": False,
+            "backend_mode": "mapping_localization",
         }
         self._mapping_service.ingest_external_snapshot(
             source_name=(
@@ -1069,10 +1063,10 @@ class MapWorkspaceService:
         if (
             require_backend_switch
             and activation_result.get("backend_switch_applied") is True
-            and str(activation_result.get("backend_mode") or "") == "rtabmap_localization"
+            and str(activation_result.get("backend_mode") or "") == "mapping_localization"
         ):
-            nav2_map = activation_result.get("nav2_map") if isinstance(activation_result.get("nav2_map"), dict) else {}
-            if not bool(nav2_map.get("used_for_static_map")):
+            navigation_map = activation_result.get("navigation_map") if isinstance(activation_result.get("navigation_map"), dict) else {}
+            if not bool(navigation_map.get("used_for_static_map")):
                 # 定位模式 live /map_obstacles 可能数十秒后才首帧；先 ingest 版本 checkpoint 供 Debug/MCP 立即可见。
                 self._ingest_localization_checkpoint_snapshot(
                     prepared_version=prepared_version,
@@ -1086,10 +1080,7 @@ class MapWorkspaceService:
             or runtime_metadata.get("source_kind") == "platform_live_map_provider"
             or runtime_metadata.get("live_streaming_ready")
             or runtime_metadata.get("backend_streaming_ready")
-            # 兼容老 metadata key（旧 version.json）。
             or runtime_metadata.get("mapping_live_streaming_ready")
-            # 兼容老 metadata key（旧 version.json）。
-            or runtime_metadata.get("rtabmap_live_streaming_ready")
         )
         ingest_kwargs = {
             "source_name": runtime_snapshot.source_name,
@@ -1144,10 +1135,7 @@ class MapWorkspaceService:
         activation_result = activation if isinstance(activation, dict) else {}
         if activation_result.get("backend_switch_applied") is True:
             return
-        # require_backend_switch=False 时（恢复活跃工作区 / activate_map 默认路径），
-        # external_slam_nav2 实时栈不需要"切换底层 DB"——实时 /map 由 RTAB-Map 持续推送，
-        # 平台只需要把上次的种子图重新 ingest 给实时栈。这里允许放行，但不污染状态：
-        # 不清 active_map_version，让后续 ingest 与 frontier/costmap 链路正常继续。
+        # 恢复活跃工作区时只需重新注入种子图，不要求切换底层数据库。
         if not require_backend_switch:
             return
         quality_metrics = runtime_metadata.get("quality_metrics")
@@ -1156,7 +1144,7 @@ class MapWorkspaceService:
         database_metrics = database if isinstance(database, dict) else {}
         self._geometry_runtime.clear_active_map_version(reason="backend_switch_not_applied")
         raise GatewayError(
-            "平台地图版本 %s 只恢复了平台快照，当前 external_slam_nav2 后端不支持把该版本加载到底层 SLAM/Nav2 状态，拒绝伪装成已切换可定位。" % prepared_version.version_id,
+            "平台地图版本 %s 只恢复了平台快照，当前几何后端未确认版本切换，拒绝伪装成已切换可定位。" % prepared_version.version_id,
             error_code="map_version_backend_switch_unavailable",
             http_status=409,
             jsonrpc_code=-32000,
@@ -1172,8 +1160,7 @@ class MapWorkspaceService:
                 "backend_checkpoint_ready": metrics.get("backend_checkpoint_ready"),
                 "platform_snapshot_only": metrics.get("platform_snapshot_only"),
                 "database_present": database_metrics.get("present"),
-                # R-N14 v4 Phase 2:wire key 保留 rtabmap_db_path（前端兼容）;读时优先新 key,fallback 老 key。
-                "rtabmap_db_path": runtime_metadata.get("mapping_db_path") or runtime_metadata.get("rtabmap_db_path"),
+                "mapping_database_path": runtime_metadata.get("mapping_database_path"),
                 "geometry_activation": activation_result,
             },
         )
@@ -1195,7 +1182,6 @@ class MapWorkspaceService:
             or metadata.get("source_kind") == "platform_live_map_provider"
             or metadata.get("live_streaming_ready")
             or metadata.get("mapping_live_streaming_ready")
-            or metadata.get("rtabmap_live_streaming_ready")
         )
         if not live_snapshot or version.snapshot.occupancy_grid is None:
             return False
@@ -1297,12 +1283,10 @@ class MapWorkspaceService:
     def _is_live_streaming_snapshot(self, latest_map_snapshot) -> bool:
         metadata = dict(getattr(latest_map_snapshot, "metadata", {}) or {})
         return bool(
-            getattr(latest_map_snapshot, "source_name", None) == "platform_ros2_live_map"
-            or metadata.get("map_snapshot_kind") == "live_streaming"
+            metadata.get("map_snapshot_kind") == "live_streaming"
             or metadata.get("source_kind") == "platform_live_map_provider"
             or metadata.get("live_streaming_ready")
             or metadata.get("mapping_live_streaming_ready")
-            or metadata.get("rtabmap_live_streaming_ready")
         )
 
     def _localization_session_frame_matches(self, session_frame_id: Optional[str], frame_id: Optional[str]) -> bool:

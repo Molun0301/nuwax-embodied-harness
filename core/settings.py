@@ -13,7 +13,7 @@ nuwax_robot_bridge 统一配置解析层。
 
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import logging
@@ -52,8 +52,8 @@ from contracts.geometry_runtime import (
     build_default_geometry_runtime_ready_file,
     build_default_lcm_url,
     build_default_nuwax_workspace_dir,
-    build_default_rtabmap_database_root,
-    build_default_rtabmap_pcd_root,
+    build_default_mapping_database_root,
+    build_default_mapping_pcd_root,
 )
 
 
@@ -159,26 +159,22 @@ def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
 
 
 def _normalize_lcm_backend(value: str) -> str:
-    """v3 重写(2026-07-08 fake-lcm 物理删除):
+    """把 LCM 后端配置收敛到唯一生产值。
 
-    仅接受 `real-lcm` / `real` / 空(默认 `real-lcm`)。
-    其它值(包括旧 `fake-lcm` / `fake` / 未知字符串)→ `ValueError`
-    (上游 load_config 在 import 阶段 fail-fast,fake backend 已物理删除,
-    无兼容分支)。
+    仅接受 `real-lcm` 或空值（默认 `real-lcm`），其它值立即拒绝。
 
     Returns:
         "real-lcm"(canonical)
     Raises:
-        ValueError: NUWAX_LCM_BACKEND 是 `fake-lcm`/`fake`/未知值时
+        ValueError: NUWAX_LCM_BACKEND 不是生产后端时
     """
     raw = (value or "").strip().lower()
-    if raw in ("", "real-lcm", "real"):
+    if raw in ("", "real-lcm"):
         return "real-lcm"
-    # fake-lcm / fake / 其它非 canonical 值 → 立即拒绝
     raise ValueError(
-        f"NUWAX_LCM_BACKEND={value!r} 已被 2026-07-08 v3 F2 决策移除。"
-        "fake-lcm backend 已物理删除;canonical 取值只允许 'real-lcm' / 'real' / 空。"
-        "本 binary 仅支持 real-lcm(必须装 liblcm-dev 1.3~1.5)。"
+        f"NUWAX_LCM_BACKEND={value!r} 不受支持；"
+        "只允许 'real-lcm' 或空值。"
+        "运行环境必须安装 liblcm-dev 1.3~1.5。"
     )
 
 
@@ -228,21 +224,14 @@ NAV_PROXY_PENDING_QUEUE_MAX_SIZE: int = max(
 #                          默认 simple-2d,与 nuwax-nav-stack foundation 组合对齐。
 # - NUWAX_EXPLORE_ARBITRATION → 当前只允许 prefer_wavefront；未 qualification
 #                          的 native source 会在配置加载期显式拒绝，禁止静默降级。
-# - NUWAX_REAL_LCM_REQUIRED → true 时强制要求 real-lcm backend(2026-07-08
-#                          fake-lcm 物理删除后是**唯一** backend);上游不可用时
-#                          进程 exit 1 + LCM_BACKEND_UNAVAILABLE。fake-lcm 已
-#                          物理删除,无 fallback,无互斥检查(因为 fake 已不存在)。
+# - NUWAX_REAL_LCM_REQUIRED → true 时要求真实 LCM 可用；上游不可用时
+#                          进程 exit 1 + LCM_BACKEND_UNAVAILABLE。
 #                          默认 false 由环境侧决策。
 NAV_PROFILE: str = _cfg_str("NUWAX_NAV_PROFILE", "simple-2d").strip() or "simple-2d"
 EXPLORE_ARBITRATION: str = (
     _normalize_explore_arbitration(_cfg_str("NUWAX_EXPLORE_ARBITRATION", "prefer_wavefront"))
 )
 REAL_LCM_REQUIRED: bool = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
-
-# 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
-# `_FAKE_LCM_ALLOWED_PROFILES` 整段物理删除 —— fake backend 不存在,
-# CI profile 白名单概念已无意义。`_normalize_lcm_backend` 见上面 v3 重写版本。
-
 
 def _notify_deprecated_env(legacy_name: str, preferred_name: str) -> None:
     if legacy_name in _DEPRECATED_ENV_NOTIFIED:
@@ -274,110 +263,6 @@ def _cfg_str_alias(preferred_name: str, legacy_name: str, default: str = "") -> 
         return default
     value = raw.strip()
     return value if value else default
-
-
-# ============================================================
-# R-N14 v4 Phase 1 §3.1.3 / §3.1.4:legacy env / version.json 字面值的 telemetry 计数。
-# 由 dispatcher 周期性(6h)读取并写 runtime_data/telemetry/legacy_alias.json。
-# - LEGACY_ENV_HIT_COUNT:17 键 NUWAX_RTABMAP_* 老 env 命中次数。
-# - LEGACY_VERSIONJSON_VALUES:version.json / 其它外部字面值(rtabmap_localization /
-#   rtabmap_icp / backend_type="rtabmap")的命中次数,key 为 `bucket:raw_value`。
-# 季度 telemetry 报告触发清理:连续 3 季度零命中才可移除 alias。
-# ============================================================
-
-LEGACY_ENV_HIT_COUNT: Counter[str] = Counter()
-LEGACY_VERSIONJSON_VALUES: Counter[str] = Counter()
-
-
-def record_legacy_env_hit(name: str) -> None:
-    """R-N14 §3.1.3 telemetry 落地:记录 17 键老 env 命中次数,供 dispatcher 周期写 legacy_alias.json。"""
-    LEGACY_ENV_HIT_COUNT[str(name)] += 1
-
-
-def _resolve_alias_env_value_with_hit(
-    preferred_name: str,
-    legacy_name: str,
-    default: str = "",
-) -> str:
-    """带 telemetry 计数的 alias 解析,旧键命中时调 record_legacy_env_hit。"""
-    value = _resolve_alias_env_value(preferred_name, legacy_name)
-    if value is None:
-        return default
-    resolved = value.strip()
-    if not resolved:
-        return default
-    # 旧键命中(且新键未设):计数 +1。
-    if (
-        str(os.environ.get(legacy_name, "")).strip()
-        and not str(os.environ.get(preferred_name, "")).strip()
-    ):
-        record_legacy_env_hit(legacy_name)
-    return resolved
-
-
-# v4 Phase 1 §3.1.4:version.json / outputs.localization_status 字段的反查表。
-# 旧 `rtabmap_localization` / `rtabmap_icp` 字面值仍可能出现在 version.json 等历史制品中,
-# 走 telemetry 计数清理。
-LEGACY_LOCALIZATION_STATUS_ALIAS: Dict[str, str] = {
-    "rtabmap_localization": "mapping_localization",
-}
-
-# v4 Phase 1 §3.1.4 / §3.1.5:`backend_type="rtabmap"` enum 反查表。
-# 历史 `version.json` / `BackendLocalizationState.backend_type` 字面值仍可能持有
-# `rtabmap`,走 `LEGACY_VERSIONJSON_VALUES["backend_type:rtabmap"]` 计数清理。
-# 命中后归一为 `mapping_backend`(R-N14 v4 命名决定)。
-LEGACY_BACKEND_TYPE_ALIAS: Dict[str, str] = {
-    "rtabmap": "mapping_backend",
-}
-LEGACY_RELOCALIZATION_DIAGNOSTICS_ALIAS: Dict[str, str] = {
-    "rtabmap_icp": "mapping_icp",
-}
-
-
-def _resolve_legacy_localization_status(raw: str) -> str:
-    """version.json / outputs.localization_status 反查:旧值映射到新值并打 telemetry 计数。"""
-    if raw in LEGACY_LOCALIZATION_STATUS_ALIAS:
-        LEGACY_VERSIONJSON_VALUES[f"localization_status:{raw}"] += 1
-        return LEGACY_LOCALIZATION_STATUS_ALIAS[raw]
-    return raw
-
-
-def _resolve_legacy_relocalization_diagnostics(raw: str) -> str:
-    """version.json / outputs.relocalization_diagnostics 反查:旧值映射到新值并打 telemetry 计数。"""
-    if raw in LEGACY_RELOCALIZATION_DIAGNOSTICS_ALIAS:
-        LEGACY_VERSIONJSON_VALUES[f"relocalization_diagnostics:{raw}"] += 1
-        return LEGACY_RELOCALIZATION_DIAGNOSTICS_ALIAS[raw]
-    return raw
-
-
-# R-N14 v4 Phase 2 §3.1.4:metadata key 旧→新 反查表。读 disk version.json 时命中旧 key,
-# 归一为新 key 并打 LEGACY_VERSIONJSON_VALUES 计数,季度 telemetry 报告触发清理。
-# 季度零命中连续 3 季度后即可移除 alias(参见 LEGACY_*_ALIAS 注释约定)。
-LEGACY_METADATA_KEY_ALIAS: Dict[str, str] = {
-    "rtabmap_database_path": "mapping_database_path",
-    "rtabmap_db_path": "mapping_db_path",
-    "rtabmap_session_id": "mapping_session_id",
-    "rtabmap_run_id": "mapping_run_id",
-    "rtabmap_live_streaming_ready": "mapping_live_streaming_ready",
-    "rtabmap_readiness": "mapping_readiness",
-    "rtabmap_profile_enabled": "mapping_profile_enabled",
-    "rtabmap_profile": "mapping_profile",
-}
-
-
-def _resolve_legacy_metadata_key(raw: str) -> str:
-    """alias metadata key 反查(R-N14 v4 §3.1.3),旧键命中时打 `LEGACY_VERSIONJSON_VALUES["metadata_key:<old>"] += 1` 给 telemetry 计数清理。
-
-    与 LEGACY_LOCALIZATION_STATUS_ALIAS / LEGACY_RELOCALIZATION_DIAGNOSTICS_ALIAS / LEGACY_BACKEND_TYPE_ALIAS 同源,
-    用于序列化兼容(version.json 历史 snapshot 读 fallback)。
-    """
-    text = str(raw or "").strip()
-    if not text:
-        return text
-    if text in LEGACY_METADATA_KEY_ALIAS:
-        LEGACY_VERSIONJSON_VALUES[f"metadata_key:{text}"] += 1
-        return LEGACY_METADATA_KEY_ALIAS[text]
-    return text
 
 
 
@@ -423,9 +308,8 @@ class LowLevelControlConfig:
 class LcmBackendConfig:
     """LCM 后端 + 共享内存路径配置(对齐 lcm_runtime.rs + server.rs)。
 
-    2026-07-08 fake-lcm 物理删除(v3 F2)后,`backend` 实际值域收敛到
-    `real-lcm`(FAIL-FAST 默认)与 `real-lcm` 显式覆盖;`real_required`
-    字段保留以让运维显式声明上游依赖不可用时的 fail-fast 行为。
+    `backend` 仅允许 `real-lcm`；`real_required` 让运维显式声明
+    上游依赖不可用时的 fail-fast 行为。
     """
 
     backend: str = _cfg_str("NUWAX_LCM_BACKEND", "real-lcm")
@@ -606,7 +490,7 @@ class PerceptionStreamRuntimeConfig:
     remember_keyframes: bool = True
     burst_frame_count: int = 4
     burst_interval_sec: float = 0.08
-    # 定位模式(rtabmap_localization 后端激活)下默认不联动拉起后台感知线程。
+    # 定位模式(mapping_localization)下默认不联动拉起后台感知线程。
     # 手动 start_perception_runtime MCP 入口会绕过该门控。
     skip_when_localization: bool = True
 
@@ -746,7 +630,7 @@ class GatewayServerConfig:
         "nuwax-geometry-runtime",
         "nuwax-nav-stack",
         "nuwax-lcm-runtime",
-        "go2_video_streamer",
+        "nuwax-go2-video-streamer",
     )
     telemetry_include_process_tree: bool = True
 
@@ -793,17 +677,7 @@ def _build_deferred_projection_config() -> DeferredProjectionConfig:
 def load_config() -> NuwaxRobotBridgeConfig:
     """统一加载配置。"""
 
-    # 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
-    # 旧 Phase 6 (codex-round2 M2) mismatch 校验(fake × real-required)
-    # 整段已物理删除 —— fake backend 不存在,`_normalize_lcm_backend`
-    # 见到 fake-lcm / fake / 未知值会立即 raise ValueError,与上游链路对齐。
-    # Rust 端 lcm_runtime.rs 的 `LCM_BACKEND_UNSUPPORTED` 守门同步生效。
     _real_lcm_required = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
-    # 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
-    #   - `_lcm_backend_raw` 默认值改为 ""(空),不再默认 "fake-lcm"
-    #   - 旧 mismatch 校验(fake × real-required)整段删除 —— fake backend 不存在,
-    #     `_normalize_lcm_backend` 见到 fake-lcm / fake / 未知值会立即 raise ValueError
-    #   - `_real_lcm_required` 仍保留,但语义变为"real-lcm 启动期失败就 exit"
     _lcm_backend_raw = _cfg_str("NUWAX_LCM_BACKEND", "").strip().lower()
 
     log_dir = _cfg_str("NUWAX_LOG_DIR", _cfg_str("GO2_PROXY_LOG_DIR", str(BASE_DIR)))
@@ -933,7 +807,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             remember_keyframes=_cfg_bool("NUWAX_PERCEPTION_KEYFRAME_REMEMBER_ENABLED", True),
             burst_frame_count=max(1, _cfg_int("NUWAX_PERCEPTION_BURST_FRAME_COUNT", 4)),
             burst_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_BURST_INTERVAL_SEC", 0.08)),
-            # 定位模式(rtabmap_localization)下默认不联动后台感知；手动 start MCP 绕过该门控。
+            # 定位模式(mapping_localization)下默认不联动后台感知；手动 start MCP 绕过该门控。
             skip_when_localization=_cfg_bool(
                 "NUWAX_PERCEPTION_STREAM_SKIP_WHEN_LOCALIZATION", True
             ),
@@ -958,8 +832,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             build_default_geometry_runtime_ready_file(),
         ),
         lcm_url=_cfg_str("NUWAX_LCM_URL", build_default_lcm_url()),
-        # Phase 0 收敛：LCM backend canonical 命名只允许 real-lcm / fake-lcm；
-        # 历史 alias (real/fake) 在 _normalize_lcm_backend 归一化并打 warning。
+        # LCM backend 只允许生产值 real-lcm。
         lcm_backend=_normalize_lcm_backend(_cfg_str("NUWAX_LCM_BACKEND", "real-lcm")),
         nuwax_workspace_dir=_cfg_str(
             "NUWAX_NUWAX_WORKSPACE_DIR",
@@ -988,29 +861,15 @@ def load_config() -> NuwaxRobotBridgeConfig:
             imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
         mapping=MappingBackendConfig(
-            profile_name=_resolve_alias_env_value_with_hit(
-                "NUWAX_MAPPING_PROFILE_NAME", "NUWAX_RTABMAP_PROFILE_NAME", DEFAULT_GEOMETRY_STACK_NAME
-            ),
+            profile_name=_cfg_str("NUWAX_MAPPING_PROFILE_NAME", DEFAULT_GEOMETRY_STACK_NAME),
             profile_enabled=_cfg_bool("NUWAX_MAPPING_PROFILE_ENABLED", True),
             default_profile=_cfg_bool("NUWAX_MAPPING_DEFAULT_PROFILE", True),
-            database_root=_resolve_alias_env_value_with_hit(
-                "NUWAX_MAPPING_DATABASE_ROOT", "NUWAX_RTABMAP_DATABASE_ROOT", build_default_rtabmap_database_root()
-            ),
-            pcd_root=_resolve_alias_env_value_with_hit(
-                "NUWAX_MAPPING_PCD_ROOT", "NUWAX_RTABMAP_PCD_ROOT", build_default_rtabmap_pcd_root()
-            ),
-            mapping_crate=_resolve_alias_env_value_with_hit(
-                "NUWAX_MAPPING_CRATE", "NUWAX_RTABMAP_MAPPING_CRATE", "nuwax-mapping"
-            ),
-            occupancy_projection=_resolve_alias_env_value_with_hit(
-                "NUWAX_MAPPING_OCCUPANCY_PROJECTION", "NUWAX_RTABMAP_OCCUPANCY_PROJECTION", "projected_occupancy"
-            ),
-            input_contract=_resolve_alias_env_value_with_hit(
-                "NUWAX_MAPPING_INPUT_CONTRACT", "NUWAX_RTABMAP_INPUT_CONTRACT", "platform_geometry_inputs"
-            ),
-            output_contract=_resolve_alias_env_value_with_hit(
-                "NUWAX_MAPPING_OUTPUT_CONTRACT", "NUWAX_RTABMAP_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"
-            ),
+            database_root=_cfg_str("NUWAX_MAPPING_DATABASE_ROOT", build_default_mapping_database_root()),
+            pcd_root=_cfg_str("NUWAX_MAPPING_PCD_ROOT", build_default_mapping_pcd_root()),
+            mapping_crate=_cfg_str("NUWAX_MAPPING_CRATE", "nuwax-mapping"),
+            occupancy_projection=_cfg_str("NUWAX_MAPPING_OCCUPANCY_PROJECTION", "projected_occupancy"),
+            input_contract=_cfg_str("NUWAX_MAPPING_INPUT_CONTRACT", "platform_geometry_inputs"),
+            output_contract=_cfg_str("NUWAX_MAPPING_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
             timestamp_quality=GeometryTimestampQualityConfig(
                 source=_cfg_str("NUWAX_GEOMETRY_TIMESTAMP_SOURCE", "sensor_header"),
                 max_point_cloud_age_sec=max(0.0, _cfg_float("NUWAX_GEOMETRY_POINT_CLOUD_MAX_AGE_SEC", 0.5)),
@@ -1045,31 +904,13 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 output_layer=_cfg_str("NUWAX_GEOMETRY_TRAVERSABILITY_OUTPUT_LAYER", "traversability"),
             ),
             outputs=MappingOutputConfig(
-                database_asset_name=_resolve_alias_env_value_with_hit(
-                    "NUWAX_MAPPING_DATABASE_ASSET_NAME", "NUWAX_RTABMAP_DATABASE_ASSET_NAME", "nuwax_mapping_state.db"
-                ),
-                pcd_asset_name=_resolve_alias_env_value_with_hit(
-                    "NUWAX_MAPPING_PCD_ASSET_NAME", "NUWAX_RTABMAP_PCD_ASSET_NAME", "cloud_map.pcd"
-                ),
-                occupancy_layer=_resolve_alias_env_value_with_hit(
-                    "NUWAX_MAPPING_OCCUPANCY_LAYER", "NUWAX_RTABMAP_OCCUPANCY_LAYER", "occupancy_grid"
-                ),
-                costmap_layer=_resolve_alias_env_value_with_hit(
-                    "NUWAX_MAPPING_COSTMAP_LAYER", "NUWAX_RTABMAP_COSTMAP_LAYER", "nuwax_global_costmap"
-                ),
-                traversability_layer=_resolve_alias_env_value_with_hit(
-                    "NUWAX_MAPPING_TRAVERSABILITY_LAYER", "NUWAX_RTABMAP_TRAVERSABILITY_LAYER", "traversability"
-                ),
-                localization_status=_resolve_legacy_localization_status(
-                    _resolve_alias_env_value_with_hit(
-                        "NUWAX_MAPPING_LOCALIZATION_STATUS", "NUWAX_RTABMAP_LOCALIZATION_STATUS", "mapping_localization"
-                    )
-                ),
-                relocalization_diagnostics=_resolve_legacy_relocalization_diagnostics(
-                    _resolve_alias_env_value_with_hit(
-                        "NUWAX_MAPPING_RELOCALIZATION_DIAGNOSTICS", "NUWAX_RTABMAP_RELOCALIZATION_DIAGNOSTICS", "mapping_icp"
-                    )
-                ),
+                database_asset_name=_cfg_str("NUWAX_MAPPING_DATABASE_ASSET_NAME", "nuwax_mapping_state.db"),
+                pcd_asset_name=_cfg_str("NUWAX_MAPPING_PCD_ASSET_NAME", "cloud_map.pcd"),
+                occupancy_layer=_cfg_str("NUWAX_MAPPING_OCCUPANCY_LAYER", "occupancy_grid"),
+                costmap_layer=_cfg_str("NUWAX_MAPPING_COSTMAP_LAYER", "nuwax_global_costmap"),
+                traversability_layer=_cfg_str("NUWAX_MAPPING_TRAVERSABILITY_LAYER", "traversability"),
+                localization_status=_cfg_str("NUWAX_MAPPING_LOCALIZATION_STATUS", "mapping_localization"),
+                relocalization_diagnostics=_cfg_str("NUWAX_MAPPING_RELOCALIZATION_DIAGNOSTICS", "mapping_icp"),
             ),
         ),
         navigation=NavigationBackendConfig(
@@ -1188,7 +1029,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "nuwax-geometry-runtime",
                 "nuwax-nav-stack",
                 "nuwax-lcm-runtime",
-                "go2_video_streamer",
+                "nuwax-go2-video-streamer",
             ),
         ),
         telemetry_include_process_tree=_cfg_bool("NUWAX_GATEWAY_TELEMETRY_INCLUDE_PROCESS_TREE", True),
@@ -1428,10 +1269,6 @@ def _configure_third_party_logger_levels() -> None:
     access_logger.propagate = False
     access_logger.disabled = True
 
-    for ros2_logger_name in ("nuwax_robot_bridge.ros2", "ros2"):
-        logging.getLogger(ros2_logger_name).setLevel(logging.WARNING)
-
-
 _SUBSYSTEM_LOGGERS = {
     "geometry": "nuwax_robot_bridge.geometry",
     "navigation": "nuwax_robot_bridge.navigation",
@@ -1441,7 +1278,6 @@ _SUBSYSTEM_LOGGERS = {
     "config": "nuwax_robot_bridge.config_io",
     "settings": "nuwax_robot_bridge.settings",
     "skills": "nuwax_robot_bridge.skills",
-    "ros2": "nuwax_robot_bridge.ros2",
     "driver": "nuwax_robot_bridge.driver",
 }
 

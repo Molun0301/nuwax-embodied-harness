@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
-"""薄包装层：把 scripts/bootstrap.py 的 9 个纯函数包成 installer 内部 API。
+"""薄包装层：把 scripts/bootstrap.py 的 7 个纯函数包成 installer 内部 API。
 
 设计要点（plan 4.3 / 评审要点 3）：
 - 禁止修改 scripts/bootstrap.py 任何代码（保持向后兼容 100%）。
 - 禁止构造 argparse.Namespace 透传给 bootstrap.py（评审要点 3 强制约束）；
   本桥接层只 import 纯函数，再传入 ``BootstrapPlanner`` 实例。
 - ``BootstrapError`` 一律转 ``PhaseError``，错误码 1（PHASE_FAILED）。
-- 9 个被包装函数签名（scripts/bootstrap.py 实测行号）：
+- 被包装函数签名（scripts/bootstrap.py 实测行号）：
   * L983  ``write_root_env(planner) -> Path``
   * L990  ``write_robot_env(planner) -> Optional[Path]``
   * L1000 ``install_python_dependencies(planner) -> None``
-  * L1020 ``install_geometry_system_dependencies(planner) -> None``
-  * L1129 ``build_workspaces(planner) -> None``
   * L1151 ``prepare_assets(planner) -> None``
   * L1255 ``install_nuwaclaw_client(planner) -> None``
   * L1302 ``configure_mcp(planner) -> None``
@@ -78,7 +76,7 @@ def _wrap(phase: str, fn, planner, *, context: str = ""):
             code=InstallerErrorCode.PHASE_FAILED,
             context=context,
             remediation=(
-                "确认 prerequisites（apt 源 / ROS2 安装 / Python 解释器）后重试；"
+                "确认 prerequisites（apt 源 / Python 解释器）后重试；"
                 "或运行 'python3 install.py check' 复现前置检查。"
             ),
         ) from exc
@@ -100,14 +98,6 @@ def call_write_robot_env(planner):
 def call_install_python_dependencies(planner):
     """包装 bootstrap.install_python_dependencies（L1000）。"""
     return _wrap("python_env", _bootstrap().install_python_dependencies, planner, context="Python 依赖安装")
-
-
-def call_install_geometry_system_dependencies(planner):
-    """包装 bootstrap.install_geometry_system_dependencies（L1020）— 去 ROS2 化后保留为 no-op。"""
-    # 2026-07-03 drop-ros2：ROS2 apt 依赖安装已迁移至 native runtime 系统包，
-    # bootstrap.install_geometry_system_dependencies 自身成为 no-op；保留包装以稳定
-    # ``phases/system.py`` 调用点。
-    return 0
 
 
 def call_prepare_assets(planner):
@@ -135,7 +125,6 @@ __all__ = [
     "call_write_root_env",
     "call_write_robot_env",
     "call_install_python_dependencies",
-    "call_install_geometry_system_dependencies",
     "call_prepare_assets",
     "call_install_nuwaclaw_client",
     "call_configure_mcp",

@@ -13,16 +13,14 @@ from services.geometry.config import (
     MappingOutputConfig,
     NavigationBackendConfig,
     PlatformGeometryConfig,
-    RtabmapConfig,
-    RtabmapOutputConfig,
     build_default_geometry_runtime_binary,
     build_default_geometry_runtime_port,
     build_default_geometry_runtime_ready_file,
     build_default_geometry_runtime_start_script,
     build_default_lcm_url,
     build_default_nuwax_workspace_dir,
-    build_default_rtabmap_database_root,
-    build_default_rtabmap_pcd_root,
+    build_default_mapping_database_root,
+    build_default_mapping_pcd_root,
 )
 from services.geometry.runtime import PlatformGeometryRuntime
 from services.geometry.pointcloud_map import (
@@ -52,8 +50,6 @@ __all__ = [
     "PointCloudMap",
     "PointCloudMapCache",
     "PointCloudMapError",
-    "RtabmapConfig",
-    "RtabmapOutputConfig",
     "UnsupportedPointCloudMapError",
     "build_default_geometry_runtime_binary",
     "build_default_geometry_runtime_port",
@@ -61,10 +57,7 @@ __all__ = [
     "build_default_geometry_runtime_start_script",
     "build_default_lcm_url",
     "build_default_nuwax_workspace_dir",
-    "build_default_rtabmap_database_root",
-    "build_default_rtabmap_pcd_root",
+    "build_default_mapping_database_root",
+    "build_default_mapping_pcd_root",
     "read_pcd_xyz",
 ]
-
-# v4 rename (R-N14 Phase 1):B 类保留——alias 已在 services/geometry/config.py 声明,
-# 此处不再重复 `=` 赋值（避免 from-import 与 import 间的循环依赖）。

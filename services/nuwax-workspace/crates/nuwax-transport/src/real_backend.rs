@@ -297,8 +297,7 @@ mod tests {
 
     #[test]
     fn name_is_real_lcm() {
-        // 2026-07-08 fake-lcm 物理删除后:`FakeLcmBackend` 已不存在。
-        // 守恒测试:backend name 字符串必须为 "real-lcm",防止 future 重构回滚。
+        // 守恒测试：backend name 字符串必须为 "real-lcm"。
         fn check_name(b: &dyn LcmBackend) -> &str {
             b.name()
         }

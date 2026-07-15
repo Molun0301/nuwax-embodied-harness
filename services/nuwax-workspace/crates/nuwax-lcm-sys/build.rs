@@ -6,9 +6,8 @@
 //!   (用 std::process::Command 跑,不引入 pkg-config crate)
 //! - 成功:把 cflags / libs 通过 `cargo:rustc-link-*` 输出,让 `nuwax-lcm-sys`
 //!   的 extern "C" 函数能正常链接到 `liblcm.so`
-//! - 失败:fail-fast —— 把安装指令写到 stderr,然后 `std::process::exit(2)`。
-//!   错误信息含 `LCM_VERSION_UNSUPPORTED` 关键字,2026-07-08 fake-lcm 物理删除后
-//!   无任何 fallback(fake-lcm backend 已物理删除,v3 F2 决策)。
+//! - 失败:fail-fast —— 把安装指令写到 stderr，然后 `std::process::exit(2)`。
+//!   错误信息含 `LCM_VERSION_UNSUPPORTED` 关键字，不做后端降级。
 //!
 //! ## 为什么不用 `pkg-config` crate?
 //!
@@ -34,16 +33,14 @@ const REQUIRED_LCM_VERSION: &str = "1.3";
 /// 2026-07-08 引入:`MAX_LCM_VERSION = "1.6"`。
 /// 原因:liblcm 1.6+ 引入新的 wire format / fingerprint 算法(`lcm-gen` 改用
 /// MurmurHash64A-128),与 1.3~1.5 链路不兼容;镜像必须升级前 keep current
-/// 1.3~1.5。1.6+ 在启动 build.rs 时 fail-fast(`LCM_VERSION_UNSUPPORTED`),
-/// fake-lcm backend 已物理删除,无 fallback 路径。
+/// 1.3~1.5。1.6+ 在启动 build.rs 时 fail-fast（`LCM_VERSION_UNSUPPORTED`）。
 const MAX_LCM_VERSION: &str = "1.6";
 
 fn main() -> ExitCode {
-    // 2026-07-08 fake-lcm 根除后(f2 决策):本 build.rs 仅服务 real-lcm 链路。
+    // 本 build.rs 仅服务 real-lcm 链路。
     // 探测入口由 Cargo feature flag 控制:
     //   cargo build -p nuwax-transport --features real-lcm
     // 无 `link-liblcm` feature 时 build.rs 占位跳过(纯 Rust 源码 extern "C" 不链 .so);
-    // 2026-07-08 前 fake backend 走可选 feature 的旁路已物理删除。
     let want_link = std::env::var("CARGO_FEATURE_LINK_LIBLCM").is_ok()
         || std::env::var("NUWAX_FORCE_LIBLCM_LINK").is_ok();
     if !want_link {
@@ -81,7 +78,6 @@ fn main() -> ExitCode {
     if !version_at_least(&version, REQUIRED_LCM_VERSION) {
         return fail_fast(&format!(
             "LCM_VERSION_UNSUPPORTED: liblcm version = {version}, 本 crate 最低要求 {REQUIRED_LCM_VERSION}。\
-             fake-lcm backend 已物理删除(2026-07-08 v3 F2 决策),无 fallback 路径。\
              请升级 liblcm-dev 至 1.3~1.5 区间。"
         ));
     }
@@ -90,7 +86,6 @@ fn main() -> ExitCode {
         return fail_fast(&format!(
             "LCM_VERSION_UNSUPPORTED: liblcm version = {version}, 本 crate 上限为 {MAX_LCM_VERSION} (不含)。\
              1.6+ 引入 MurmurHash64A-128 fingerprint 与本 crate 1.3~1.5 链路不兼容。\
-             fake-lcm backend 已物理删除(2026-07-08 v3 F2 决策),无 fallback 路径。\
              请降级 liblcm-dev 至 1.3~1.5 区间。"
         ));
     }
@@ -208,8 +203,7 @@ fn fail_fast(detail: &str) -> ExitCode {
     eprintln!(
         "nuwax-lcm-sys build.rs: 探测系统 liblcm 失败 —— LCM_VERSION_UNSUPPORTED\n\
          \n\
-         2026-07-08 fake-lcm 物理删除后,本 crate 不再支持任何 fake backend 旁路;\
-         镜像必须装 liblcm-dev 1.3~1.5 区间的真实 liblcm。\n\
+         本 crate 只支持真实 LCM；镜像必须安装 liblcm-dev 1.3~1.5。\n\
          \n\
          错误细节: {detail}\n\
          \n\
@@ -217,8 +211,6 @@ fn fail_fast(detail: &str) -> ExitCode {
          - Ubuntu/Debian:  sudo apt-get install liblcm-dev pkg-config\n\
          - Fedora/RHEL:    sudo dnf install lcm-devel pkgconfig\n\
          - macOS (brew):   brew install lcm pkg-config\n\
-         \n\
-         fake-lcm backend 已物理删除(v3 F2 决策),无 mock / fallback / 兼容分支。\n\
          \n\
          退出码 2 供 start_gateway.sh / CI 区分 \"缺系统库\" 与 \"代码错误\"。"
     );
@@ -231,8 +223,7 @@ mod tests {
 
     #[test]
     fn version_compare_basic() {
-        // 2026-07-08 fake-lcm 根除后,floor 从 "1.4" 降到 "1.3",
-        // ceiling 设为 "1.6"(version_at_most 单独测)。
+        // floor 为 "1.3"，ceiling 为 "1.6"（version_at_most 单独测）。
         assert!(version_at_least("1.3.0", "1.3"));
         assert!(version_at_least("1.3.9", "1.3"));
         assert!(version_at_least("1.4.0", "1.3"));

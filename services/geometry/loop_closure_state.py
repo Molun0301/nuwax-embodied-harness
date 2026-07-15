@@ -1,12 +1,11 @@
 """闭环检测状态（LoopClosureState）。
 
 用途：
-- 持久化 mapping（nuwax-mapping 板块，RTAB-Map 算法 Rust 移植）闭环检测信号，
+- 持久化 nuwax-mapping 闭环检测信号，
   供 `_metadata_indicates_exploration_done` 第 8 条判据使用；
 - 主路径 LCM `/explore/loop_closure` channel（由 nuwax-geometry-runtime 推送）；
-  HIL fallback 路径走 SQLite DB 查询（SQLite RTAB-Map 兼容格式）；
-- 严格遵循 services 层不订阅 ROS topic、不引入 services 层硬依赖 ROS2 Python 客户端库
-  的边界（参照 memory `nuwax-layering-governance-boundaries.md`）。
+  HIL fallback 路径走 SQLite DB 查询；
+- services 层只读取 LCM 数据和数据库快照。
 
 约定：
 - `confidence = min(loop_closure_count / threshold, 1.0)`，单调上升但不放大；
@@ -28,7 +27,7 @@ from typing import Optional
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.loop_closure_state")
 
-# RTAB-Map Link 表 type 字段语义（参见 rtabmap/core/Link.h）：
+# 建图数据库 Link 表 type 字段语义：
 #   0 = Neighbor / 1 = Global scan-matching closure / 2 = User loop closure / 3 = Virtual / 4 = Recovery
 _LOOP_CLOSURE_LINK_TYPE = 2
 
@@ -123,11 +122,10 @@ def read_loop_closure_from_db(
     lookback_limit: int = DEFAULT_LOOKBACK_LIMIT,
     timeout_sec: float = _DEFAULT_SQLITE_TIMEOUT_SEC,
 ) -> int:
-    """查询 RTAB-Map SQLite DB 中最近 N 条 Link 记录里 type=2（loop closure）的数量。
+    """查询建图 SQLite DB 中最近 N 条 Link 记录里 type=2 的数量。
 
     参数：
-    - `db_path`: RTAB-Map 数据库路径
-      `runtime_data/maps/<map_name>/versions/mapver_NNNNNN/rtabmap.db`。
+    - `db_path`: 建图数据库路径。
     - `threshold`: 触发阈值（>=该值即视为闭环，仅用于语义记录，不影响返回值）。
     - `lookback_limit`: 最近 N 条 Link 记录中扫描的窗口大小，默认 100。
     - `timeout_sec`: SQLite 连接超时秒数，默认 0.5s 避免阻塞主循环。

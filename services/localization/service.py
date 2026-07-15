@@ -12,7 +12,6 @@ from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus, LocalizationSnapshot, RelocalizationCandidate
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
-from core.settings import LEGACY_BACKEND_TYPE_ALIAS, LEGACY_VERSIONJSON_VALUES  # v4 R-N14 Phase 1 §3.1.4:enum alias 反查
 from providers import LocalizationProvider
 from typing import Deque, Dict, Optional, Tuple
 
@@ -398,7 +397,7 @@ class LocalizationService:
 
         正式主链：
         1. 重置状态机到 LOCALIZING 状态
-        2. 根据 RTAB-Map/Nav2 单链路发布 /initialpose 重定位 hint
+        2. 向当前几何运行时发布重定位 hint
         3. 刷新会话并返回最新状态
 
         Returns:
@@ -409,8 +408,7 @@ class LocalizationService:
         with self._lock:
             self._state_machine.relocalize()
 
-        # 真接入：根据当前 session/asset 解析后端模式，向 SLAM/AMCL 发出真实重定位指令
-        # （含 ROS2 阻塞 IO，不持锁）
+        # 根据当前 session/asset 解析后端模式并发出重定位指令（锁外执行）。
         backend_dispatch = self._dispatch_backend_relocalize(
             geometry_asset=geometry_asset,
             metadata=metadata,
@@ -436,7 +434,7 @@ class LocalizationService:
         geometry_asset: Optional[Dict[str, object]],
         metadata: Optional[Dict[str, object]],
     ) -> Dict[str, object]:
-        """根据 RTAB-Map/Nav2 单链路向定位系统发出重定位 hint。"""
+        """向当前定位系统发出重定位 hint。"""
 
         backend_mode = self._resolve_backend_mode(
             geometry_asset=geometry_asset,
@@ -457,7 +455,12 @@ class LocalizationService:
             "actions": [],
             "errors": [],
         }
-        if backend_mode in {"rtabmap", "rtabmap_mapping", "rtabmap_localization", "amcl_localization_only"}:
+        if backend_mode in {
+            "mapping",
+            "mapping_backend",
+            "mapping_localization",
+            "amcl_localization_only",
+        }:
             self._publish_initialpose(hint_pose, result)
         else:
             result["errors"].append(
@@ -478,21 +481,15 @@ class LocalizationService:
             value = str(source.get("backend_mode") or "").strip().lower()
             if value:
                 return value
-        # 单链路兜底：external_slam_nav2 使用 RTAB-Map + Nav2 action。
-        stack = str((geometry_asset or {}).get("geometry_stack") or "").strip().lower()
-        if stack == "external_slam_nav2":
-            return "rtabmap"
         return "unknown"
 
     def _publish_initialpose(self, hint_pose: Optional[Pose], result: Dict[str, object]) -> None:
-        """向 AMCL 发送初始位姿。
+        """发送初始位姿。
 
-        Phase 3 目标态：不再向 ROS2 ``/initialpose`` 话题发布。
-        改由 ``nuwax-geometry-runtime`` 通过 LCM channel
+        ``nuwax-geometry-runtime`` 通过 LCM channel
         ``/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped``
         或 ``nuwax-rpc relocalize`` 触发定位栈初始化。
 
-        平台层本方法保留函数签名以兼容调用方，但不再 import ROS2 / geometry_msgs 接触面；
         实际生效路径是记录 actions 给上层（debug UI / console）观察，由 MCP/external 路径发起
         relocalize 调用，runtime 在收到命令后自行完成 PF 重置 / AMCL 启动。
         """
@@ -614,10 +611,9 @@ class LocalizationService:
         quality_metrics = geometry_asset.get("quality_metrics")
         if not isinstance(quality_metrics, dict):
             return None
-        is_external_stack = str(geometry_asset.get("geometry_stack") or "").strip().lower() == "external_slam_nav2"
         database = quality_metrics.get("database")
         database_missing = isinstance(database, dict) and database.get("present") is False
-        database_required = bool(database.get("required", not is_external_stack)) if isinstance(database, dict) else True
+        database_required = bool(database.get("required", True)) if isinstance(database, dict) else True
         optional_database_missing = bool(database_missing and not database_required)
         if quality_metrics.get("status") == "failed":
             for item in quality_metrics.get("diagnostics") or []:
@@ -630,7 +626,7 @@ class LocalizationService:
                 return None
             return "几何资产不可用。"
         if database_missing and database_required:
-            return "地图版本缺少 RTAB-Map database 资产。"
+            return "地图版本缺少建图数据库资产。"
         return None
 
     def _resolve_candidate_asset_refs(
@@ -645,13 +641,9 @@ class LocalizationService:
         assets = geometry_asset.get("assets")
         if isinstance(assets, list):
             return [self._clone_metadata(item) for item in assets if isinstance(item, dict)]
-        state_asset_type = "rtabmap_database"
+        state_asset_type = "mapping_database"
         refs = []
-        # 优先读 rtabmap_database_path（新命名），缺失时 fallback 到老 rtabmap_db_path（兼容老 version.json）。
-        backend_path = (
-            str(geometry_asset.get("rtabmap_database_path") or "").strip()
-            or str(geometry_asset.get("rtabmap_db_path") or "").strip()
-        )
+        backend_path = str(geometry_asset.get("mapping_database_path") or "").strip()
         if backend_path:
             refs.append({"asset_type": state_asset_type, "path": backend_path, "frame_id": geometry_asset.get("frame_id")})
         pcd_path = str(geometry_asset.get("pcd_path") or "").strip()
@@ -738,7 +730,7 @@ class LocalizationService:
         self,
         provider: LocalizationProvider,
     ) -> Dict[str, object]:
-        """捕获后端定位状态（RTAB-Map 或 Go2 SDK）。"""
+        """捕获建图后端或 Go2 SDK 定位状态。"""
 
         # 尝试获取后端状态方法
         get_state = getattr(provider, "get_localization_state", None)
@@ -771,33 +763,17 @@ class LocalizationService:
         }
 
     def _resolve_backend_type(self, provider: LocalizationProvider) -> str:
-        """解析后端类型。
-
-        v4 R-N14 Phase 1 §3.1.5:枚举值归一为 `mapping_backend` (替代旧 `rtabmap`),
-        旧值走 `LEGACY_BACKEND_TYPE_ALIAS` 反查并打 `LEGACY_VERSIONJSON_VALUES` 计数。
-        当前定位主线为 nuwax-mapping + nuwax-nav-stack(替代旧 RTAB-Map + Nav2 action)。
-        """
-
-        def _alias_resolve(raw: str) -> str:
-            if raw in LEGACY_BACKEND_TYPE_ALIAS:
-                LEGACY_VERSIONJSON_VALUES[f"backend_type:{raw}"] += 1
-                return LEGACY_BACKEND_TYPE_ALIAS[raw]
-            return raw
+        """解析当前后端类型。"""
 
         backend_type = getattr(provider, "backend_type", None)
         if backend_type:
-            normalized = str(backend_type).strip().lower()
-            if normalized == "rtabmap":
-                return _alias_resolve("rtabmap")
-            return _alias_resolve(normalized) if normalized in LEGACY_BACKEND_TYPE_ALIAS else str(backend_type)
+            return str(backend_type)
 
         provider_name = str(getattr(provider, "provider_name", "") or "").lower()
-        if "rtabmap" in provider_name:
-            return _alias_resolve("rtabmap")
+        if "mapping" in provider_name:
+            return "mapping_backend"
         if "go2" in provider_name:
             return "go2_sdk"
-        if "nav2" in provider_name:
-            return "nav2"
 
         return "unknown"
 

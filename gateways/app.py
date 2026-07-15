@@ -255,15 +255,6 @@ def create_gateway_app_from_env() -> FastAPI:
         config.gateway.artifact_dir,
         config.runtime_data.memory_db_path,
     )
-    # R-N14 §3.6:启动 6h 周期 alias counter dispatcher(daemon 线程,失败不影响网关启动)。
-    try:
-        from services.telemetry.dispatcher import LegacyAliasCounterDispatcher  # type: ignore
-
-        LEGACY_ALIAS_DISPATCHER = LegacyAliasCounterDispatcher()
-        LEGACY_ALIAS_DISPATCHER.start()
-    except Exception:
-        LEGACY_ALIAS_DISPATCHER = None
-        APP_LOGGER.warning("LegacyAliasCounterDispatcher 启动失败,alias telemetry 计数将不会周期落地。")
     return create_gateway_app(runtime, config)
 
 

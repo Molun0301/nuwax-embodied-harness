@@ -4,17 +4,12 @@
 ``scripts/start_gateway.sh`` 调用）。Python 只挂接并健康检查现有 gRPC runtime，
 不 spawn、不重启、也不终止外部进程。
 
-本文件替代旧的子进程生命周期管理模块，
-本仓库 Phase -0.5 选型后 nuwax-ros-bridge Rust crate 已改名为
-`nuwax-geometry-runtime`（同步仓库名、二进制名、ready file 命名空间）。
-调用方统一 import 本文件。
+调用方统一通过本文件连接 `nuwax-geometry-runtime`。
 
 设计要点（与原模块一致）：
 
 * attach 模式：端口探测 + gRPC 验活双门（参见 grpc-attach-zombie-bridge-2026-06-27）
-* ROS2 残留相关 env（RMW_IMPLEMENTATION / CYCLONEDDS_URI / NUWAX_ROS_BRIDGE_*）已删除：
-  本服务不再 spawn 任何 ROS2 节点 / DDS 话题订阅；所有 ROS2 接触面均已迁出
-  （见 docs/开发文档/建图导航探索重构/2026-07-01_彻底去ROS2化-执行方案/01_接触面详细盘点.md）。
+* 本服务只做 gRPC attach，不启动其它数据面进程。
 """
 from __future__ import annotations
 
@@ -23,7 +18,7 @@ import os
 import socket
 import threading
 import time
-from typing import Any, Optional
+from typing import Optional
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_client")
 
@@ -51,15 +46,7 @@ class GeometryRuntimeSubprocess:
         self,
         binary_path: Optional[str] = None,
         port: int = _DEFAULT_PORT,
-        **_legacy_kwargs: Any,
     ) -> None:
-        # 历史兼容：旧调用方可能传 ros_distro / 等 ROS2 概念参数；
-        # 现 nuwax-geometry-runtime 不再依赖 ROS2 distro，按 **_legacy_kwargs 吞掉即可。
-        if _legacy_kwargs:
-            LOGGER.debug(
-                "GeometryRuntimeSubprocess 已忽略历史参数: %s",
-                sorted(_legacy_kwargs.keys()),
-            )
         if binary_path:
             LOGGER.debug(
                 "attach-only client 忽略 binary_path=%s；进程由 %s 管理",

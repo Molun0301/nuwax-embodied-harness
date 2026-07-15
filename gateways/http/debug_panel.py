@@ -211,7 +211,7 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
     @router.post("/api/debug/map/initial_pose")
     async def debug_map_initial_pose(request: Request) -> JSONResponse:
-        """Debug 面板 RViz 2D Pose Estimate 直通：发布 /initialpose → RTAB-Map 重定位。"""
+        """Debug 面板 2D Pose Estimate 直通：发布初始位姿并触发重定位。"""
 
         access_manager.authenticate_http(request)
         body = await request.json()
@@ -298,8 +298,8 @@ def _build_map_diagnostics(snapshot: Any, *, refresh_error: Optional[str] = None
     live_mapping = metadata.get("live_mapping_diagnostics") if isinstance(metadata.get("live_mapping_diagnostics"), dict) else {}
     provider_status = metadata.get("provider_status") if isinstance(metadata.get("provider_status"), dict) else {}
     live_provider = live_mapping.get("live_map_provider") if isinstance(live_mapping.get("live_map_provider"), dict) else {}
-    # R-N14 v4 Phase 2:metadata key 读新 key + fallback 老 key（LEGACY_VERSIONJSON_VALUES 计数由平台 runtime 接管）。
-    map_stream = (live_mapping.get("mapping_readiness") or live_mapping.get("rtabmap_readiness") or {}).get("map_stream") if isinstance((live_mapping.get("mapping_readiness") or live_mapping.get("rtabmap_readiness") or {}), dict) else {}
+    mapping_readiness = live_mapping.get("mapping_readiness")
+    map_stream = mapping_readiness.get("map_stream") if isinstance(mapping_readiness, dict) else {}
     if not isinstance(map_stream, dict):
         map_stream = {}
     status = {**dict(live_provider), **dict(provider_status)}
@@ -360,7 +360,7 @@ def _build_map_diagnostics(snapshot: Any, *, refresh_error: Optional[str] = None
         "diagnostic_roles": {
             "pointcloud_map": "health_check_input",
             "pointcloud": "side_channel_not_map_source",
-            "map_source": "rtabmap_occupancy_grid",
+            "map_source": "mapping_occupancy_grid",
         },
     }
     if message_count is not None and message_count <= 0:
@@ -457,7 +457,7 @@ def _summary_from_payload(
 
 
 def _runtime_governance_message(summary: Any) -> str:
-    profile = dict(getattr(summary, "rtabmap_profile", {}) or {})
+    profile = dict(getattr(summary, "mapping_profile", {}) or {})
     asset = dict(getattr(summary, "geometry_asset", {}) or {})
     session = dict(getattr(summary, "localization_session", {}) or {})
     return "route=%s profile=%s asset=%s localization=%s" % (
@@ -469,7 +469,7 @@ def _runtime_governance_message(summary: Any) -> str:
 
 
 def _runtime_governance_metadata(summary: Any) -> Dict[str, Any]:
-    profile = dict(getattr(summary, "rtabmap_profile", {}) or {})
+    profile = dict(getattr(summary, "mapping_profile", {}) or {})
     asset = dict(getattr(summary, "geometry_asset", {}) or {})
     session = dict(getattr(summary, "localization_session", {}) or {})
     relocalization = dict(getattr(summary, "last_relocalization", {}) or {})
@@ -890,8 +890,8 @@ def _exploration_metadata(context: Any) -> Dict[str, Any]:
         "frontier_freshness": metadata.get("frontier_freshness"),
         "map_revision": metadata.get("map_revision"),
         "costmap_revision": metadata.get("costmap_revision"),
-        "nav2_ready": metadata.get("nav2_ready"),
-        "nav2_readiness": metadata.get("nav2_readiness"),
+        "navigation_ready": metadata.get("navigation_ready"),
+        "navigation_readiness": metadata.get("navigation_readiness"),
     }
 
 

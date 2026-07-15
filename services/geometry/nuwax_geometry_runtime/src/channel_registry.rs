@@ -43,7 +43,7 @@ use tracing::warn;
 //    内置 default。
 // 3. 向后兼容：旧硬编码 `/odom` 等若通过 env 传入（未带 #msg_type）会在
 //    stderr 打一行 deprecation-warning，但不阻断启动；后续会移除。
-// 4. real-lcm / fake-lcm backend 共用此 helper，与 LCM URL/backend 选择解耦。
+// 4. channel 解析与 LCM URL/backend 选择解耦。
 
 /// Phase 4：runtime 与 server.rs 共用的 channel 键枚举。
 ///

@@ -8,15 +8,13 @@
 //! **不**重写 UDP framing 协议,只把现有 LCM 1.x wire format 包装为
 //! 强类型 Rust API。
 //!
-//! 关键约定(2026-07-08 fake-lcm 根除后):
+//! 关键约定：
 //! - [`LcmBackend`] trait:实现 publish / subscribe;`real-lcm` 是 nuwax 仓内唯一 backend。
 //! - [`LcmTransport`]:real-lcm backend 工厂 + publish/subscribe 转发。
 //! - **`real-lcm` feature**(workspace `default = ["real-lcm"]`):启用真正的 liblcm / Rust LCM
 //!   binding backend (`real_backend::RealLcmBackend`)。 2026-07-07 Phase 3
 //!   实装,详见 `crates/nuwax-lcm` / `crates/nuwax-lcm-sys` 模块文档。
-//! - **`FakeLcmBackend` 已物理删除**(2026-07-08 v3 F2 决策):
-//!   不再有 `LcmTransport::new_fake()` 工厂;无 fake-lcm / fake 旁路;
-//!   无 compile_error 守门;镜像必须装 liblcm-dev 1.3~1.5 才能编译。
+//! - 只提供真实 LCM 工厂；镜像必须安装 liblcm-dev 1.3~1.5。
 //! - typed suffix: `LcmTopic::as_subscription_pattern` 与
 //!   `parse_subscription_pattern` 在 pub/sub 边界统一。
 //!
@@ -86,8 +84,7 @@ pub type LcmFrameStream =
 
 /// LCM 后端 trait
 ///
-/// 2026-07-08 fake-lcm 物理删除后,唯一允许的实现是 `RealLcmBackend` (Phase 3 实装);
-/// `FakeLcmBackend` / `Shm-sidecar` / 其它 backend 路径已物理删除。
+/// 唯一生产实现是 `RealLcmBackend`。
 #[async_trait]
 pub trait LcmBackend: Send + Sync {
     /// 异步发布一帧
@@ -110,8 +107,7 @@ pub trait LcmBackend: Send + Sync {
 
 /// LCM 传输工厂
 ///
-/// 2026-07-08 fake-lcm 根除后:真实 LCM (`LcmTransport::new_real`)是唯一公开
-/// backend 工厂。`LcmTransport::new_fake()` 已物理删除。
+/// `LcmTransport::new_real` 是唯一公开 backend 工厂。
 #[derive(Clone)]
 pub struct LcmTransport {
     backend: Arc<dyn LcmBackend>,
@@ -134,8 +130,7 @@ impl LcmTransport {
 
     /// 构造 real liblcm backend 的 transport(Phase 3,2026-07-07)。
     ///
-    /// 2026-07-08 fake-lcm 根除后,这是 nuwax-transport 公开层唯一允许的
-    /// backend 工厂。`provider_url` 形如
+    /// 这是 nuwax-transport 公开层唯一允许的 backend 工厂。`provider_url` 形如
     /// `udpm://239.255.76.67:7667?ttl=1`。失败时返回
     /// `TransportError::LcmBackend`。镜像必须装 liblcm-dev 1.3~1.5
     /// (版本锁 `nuwax-lcm-sys/build.rs` `MAX_LCM_VERSION = "1.6"`)。
@@ -180,8 +175,8 @@ impl LcmTransport {
 // LcmTransport 自身实现 LcmBackend (newtype 转发)
 // ============================================================================
 //
-// 2026-07-08 fake-lcm 物理删除(v3 F2)后,本 crate 唯一 backend 是
-// `RealLcmBackend`。`LcmTransport` 作为持有 `Arc<dyn LcmBackend>` 的
+// 本 crate 唯一 backend 是 `RealLcmBackend`。`LcmTransport` 作为持有
+// `Arc<dyn LcmBackend>` 的
 // 薄包装,本身实现 `LcmBackend` trait 是 newtype-转发模式 —— 所有方法
 // 直接转给内部 backend。
 //
@@ -303,14 +298,6 @@ mod tests {
     use super::*;
     use nuwax_protocol::RawLcmFrameBuilder;
 
-    // 2026-07-08 fake-lcm 物理删除(v3 F2 决策):
-    // 原 fake_backend_publish_and_subscribe / fake_backend_typed_suffix_filter_rejects_mismatch /
-    // fake_backend_unmatched_pattern_yields_empty / fake_backend_malformed_topic_rejected /
-    // fake_backend_name / fake_backend_snapshot 6 个 fake-specific 测试**整段物理删除**。
-    // 测试目标 `FakeLcmBackend` 已从 lib.rs 整段删除,这些测试已无被测对象。
-    // 单测 helper 改走 `LcmTransport::new_real` + 隔离端口(test_lcm_url 公式,
-    // 防止重现 07_08 实机 175 GB 崩溃)。
-
     #[test]
     #[allow(deprecated)]
     fn udp_transport_construct_compat() {
@@ -334,18 +321,14 @@ mod tests {
         assert_eq!(out, v);
     }
 
-    /// 2026-07-08 fake-lcm 根除后,`LcmTopic::new` 校验仍生效(typed suffix 解析)。
-    /// 这一行曾经归 `fake_backend_malformed_topic_rejected`,现与 backend 无关,
-    /// 留下作为 typed suffix 解析的单测锚点(避免 future 重构破坏 typed suffix)。
+    /// `LcmTopic::new` 校验 typed suffix 解析。
     #[test]
     fn typed_suffix_parser_rejects_malformed() {
         let topic = LcmTopic::new("/scan#pkg.Foo").unwrap_err();
         let _ = topic;
     }
 
-    /// 守恒测试:2026-07-08 fake-lcm 根除后,公开层只暴露 `new_real`,不再有
-    /// `new_fake` / `FakeLcmBackend`。本测试做"字符串守恒",确保未来回归
-    /// 不被回滚 —— `real-lcm` 是唯一 backend 名,`fake-lcm` 不应再出现。
+    /// 守恒测试：`real-lcm` 是唯一 backend 名。
     #[test]
     fn real_backend_name_is_real_lcm() {
         let canonical: &str = "real-lcm";

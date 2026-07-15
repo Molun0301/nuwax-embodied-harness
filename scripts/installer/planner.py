@@ -195,12 +195,12 @@ def load_profile(
         planner_cls: 目标 dataclass 类型（默认 ``InstallPlanner``，便于单测注入 mock）。
 
     Returns:
-        填充好字段的 ``InstallPlanner`` 实例。仅使用 ``_KNOWN_FLAGS`` 内字段，
-        header 三元组（``_schema_version`` / ``created_at`` / ``installer_version``）
-        与其他未知字段被忽略（schema 漂移数据隔离）。
+        填充好字段的 ``InstallPlanner`` 实例。header 三元组
+        （``_schema_version`` / ``created_at`` / ``installer_version``）不进入 planner；
+        未知业务字段由 ``Profile.load()`` 在构造 planner 前拒绝。
 
     Raises:
-        InstallerError(code=6): ``_schema_version`` 缺失或 major 不兼容。
+        InstallerError(code=6): ``_schema_version`` 缺失、major 不兼容或含未知业务字段。
         FileNotFoundError: 文件不存在。
     """
     if planner_cls is None:
@@ -295,7 +295,7 @@ class InstallPlanner:
     robot: str = "go2"
     tier: str = "full"
 
-    # === 15 个 boolean flag（bootstrap.py:1522-1536 add_boolean_flag）===
+    # === 14 个 boolean flag ===
     geometry: bool = True
     data_plane: bool = True
     systemd: bool = False
@@ -308,7 +308,6 @@ class InstallPlanner:
     build_geometry: bool = True
     build_go2slam: bool = True
     install_geometry_deps: bool = True
-    repair_ros2_apt_source: bool = True
     start_gateway: bool = False
     healthcheck: bool = False
 

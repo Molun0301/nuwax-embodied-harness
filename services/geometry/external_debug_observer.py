@@ -17,12 +17,7 @@ from services.geometry.loop_closure_state import (
     LoopClosureStateBuffer,
     update_loop_closure_state_from_count,
 )
-# Phase 3 目标态：删除 ROS2 相关运行时依赖。
-# external_debug_observer.py 历史上使用 ROS2 订阅 /map_obstacles、/frontier 等话题，
-# 目标态下由 nuwax-geometry-runtime 通过 LCM typed channel 暴露等价状态流，
-# 平台层只观察 runtime gRPC 推送。
-# Phase R-N14-5:acquire_ros2_context / release_ros2_context / ensure_go2_slam_overlay_python_paths
-# 三个 no-op 函数全仓无调用方，物理删除。
+# 地图、位姿和前沿状态由 nuwax-geometry-runtime 推送，平台层只观察 gRPC 状态流。
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.external_debug_observer")
 
@@ -45,11 +40,11 @@ _BOUNDARY_FALLBACK_L_CORNER_RADIUS_M = 0.5
 _BOUNDARY_DEFAULT_MAX_SEGMENTS = 64
 _BOUNDARY_OCCUPANCY_FREE = 0
 _BOUNDARY_OCCUPANCY_UNKNOWN = -1
-_BOUNDARY_OCCUPANCY_OCCUPIED_THRESHOLD = 50  # >= 50 视为占用（与 ROS OccupancyGrid 习惯一致）
+_BOUNDARY_OCCUPANCY_OCCUPIED_THRESHOLD = 50  # >= 50 视为占用
 
 
 class ExternalGeometryDebugObserver:
-    """Read-only ROS2 observer for externally launched GO2 RTABNAV2 debug data."""
+    """Read-only observer for externally launched geometry debug data."""
 
     def __init__(
         self,
@@ -106,11 +101,8 @@ class ExternalGeometryDebugObserver:
         commit 1 §1.4：早返回路径（with 锁内立即清零） MUST 把
         ``_explore_status_done`` 置零，避免上一会话 explore/status 终态
         信号串味到当前会话。
-        commit 3a §3.1：``localization`` 模式进入时 MUST 把
-        ``_pose_map_unchanged_count`` 置零，避免上一会话冻结计数把当前
-        /go2/pose_map 首帧误判为"持续未变"并触发外推（commit 3b cherry-pick
-        触发条件：实机 ``ros2 topic hz /tf`` < 0.5Hz 且 HIL 步骤 6 报
-        ExtrapolationError）。
+        ``localization`` 模式进入时必须把 ``_pose_map_unchanged_count`` 置零，
+        避免上一会话冻结计数把当前 /go2/pose_map 首帧误判为持续未变。
         """
         normalized = str(mode or "").strip().lower() or None
         with self._lock:
@@ -250,7 +242,7 @@ class ExternalGeometryDebugObserver:
 
     @staticmethod
     def _resolve_loop_closure_poll_interval_sec() -> float:
-        """从 core.settings 解析 /rtabmap/info 节流间隔；缺失或异常时 fallback 默认 5s。"""
+        """从 core.settings 解析闭环检查间隔；缺失或异常时使用默认 5s。"""
 
         try:
             from core.settings import (
@@ -267,20 +259,11 @@ class ExternalGeometryDebugObserver:
         with self._lock:
             if self._started:
                 return
-            try:
-                # Phase 3 目标态：ROS2 相关运行时依赖已删除。
-                # 该 start() 走 ROS2 订阅路径已被 nuwax-geometry-runtime 的 LCM/nuwax 路径取代。
-                # 保留 try-block 是为了兼容历史 stack 抓取与回滚；当前直接走 fallback。
-                LOGGER.info(
-                    "external_debug_observer.start: ROS2 接触面已删除，"
-                    "本 observer 不再独立订阅 /map_obstacles；"
-                    "地图/前沿数据由 nuwax-geometry-runtime 通过 gRPC SubscribeMapUpdates 推送。"
-                )
-                self._started = True
-            except Exception as exc:
-                self._last_error = str(exc)
-                self._cleanup_locked()
-                LOGGER.warning("GO2 外部几何 debug observer 启动失败：%s", exc)
+            LOGGER.info(
+                "external_debug_observer.start: 地图和前沿数据由 "
+                "nuwax-geometry-runtime 通过 gRPC SubscribeMapUpdates 推送。"
+            )
+            self._started = True
 
     def stop(self) -> None:
         with self._lock:
@@ -291,9 +274,6 @@ class ExternalGeometryDebugObserver:
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=1.0)
         self._thread = None
-        # Phase R-N14-5:ROS2 接触面(executor / node / _has_ros2_context /
-        # release_ros2_context / _subscriptions / _pose_timer / _tf_buffer /
-        # _tf_listener)已全部物理删除。
 
     def _base_frame_candidates(self) -> Tuple[str, ...]:
         configured = self._normalize_frame_id(self.config.frames.base_frame or "", "")
@@ -455,9 +435,7 @@ class ExternalGeometryDebugObserver:
     def _on_frontiers(self, msg: Any) -> None:
         status = self._status_from_marker_array(msg)
         goal = self._goal_from_marker_array(msg)
-        # Phase 3 目标态：explore_lite ROS2 marker 解析下线，nuwax-geometry-runtime
-        # 通过 LCM/nuwax typed channel 直接推送等价 frontier 列表；这里不再做 marker-array
-        # 解析以避免死代码与 no_ros2 守门命中。
+        # runtime 直接推送 frontier 列表；marker-array 不再作为前沿来源。
         frontier_markers: List[Dict[str, object]] = []
         with self._lock:
             terminal = bool(status and status.get("terminal"))
@@ -776,7 +754,7 @@ class ExternalGeometryDebugObserver:
         self._loop_closure_state_buffer.update(state)
 
     def force_loop_closure_state_from_db(self, db_count: int) -> None:
-        """DB SQLite fallback 写入：当 /rtabmap/info 不可用时由 runtime 注入。"""
+        """写入由 runtime 注入的 SQLite 闭环计数。"""
 
         threshold = self._resolve_loop_closure_threshold()
         state = update_loop_closure_state_from_count(

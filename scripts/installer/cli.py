@@ -160,7 +160,7 @@ def _add_parent_flags(parent: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help="wizard 完成后把配置保存到指定 profile JSON 路径。",
     )
-    # 15 个 bootstrap boolean flag（plan / bootstrap.py:1522-1536）的简化复刻；
+    # 14 个 bootstrap boolean flag 的简化复刻；
     # 每个 phase 实现读取 ``planner.<flag>``，不直接读 argparse。
     _add_bootstrap_boolean_flags(parent)
 
@@ -180,7 +180,6 @@ def _add_bootstrap_boolean_flags(parent: argparse.ArgumentParser) -> None:
         "build_geometry",
         "build_go2slam",
         "install_geometry_deps",
-        "repair_ros2_apt_source",
         "start_gateway",
         "healthcheck",
     )
@@ -319,7 +318,7 @@ def _run_wizard(args: argparse.Namespace, runtime: RuntimeOptions) -> int:
     # 5. geometry 平台侧车
     if not non_interactive:
         planner.geometry = _prompts.ask_confirm(
-            "启用 geometry 平台侧车（SLAM/Nav2）",
+            "启用 geometry 平台侧车",
             default=is_full,
         )
     else:
@@ -813,12 +812,12 @@ def _build_planner_from_args(args: argparse.Namespace, runtime: RuntimeOptions) 
     tier = getattr(args, "tier", None) or planner.tier
     planner.robot = robot
     planner.tier = tier
-    # 15 个 boolean flag：coerce_bool_flag 归一化；None 时保留 InstallPlanner 默认
+    # 14 个 boolean flag：coerce_bool_flag 归一化；None 时保留 InstallPlanner 默认
     flag_names = (
         "geometry", "data_plane", "systemd", "relay", "install_nuwaclaw_docker",
         "install_python", "prepare_memory", "prepare_yolo", "export_yolo_engine",
         "build_geometry", "build_go2slam", "install_geometry_deps",
-        "repair_ros2_apt_source", "start_gateway", "healthcheck",
+        "start_gateway", "healthcheck",
     )
     for name in flag_names:
         coerced = coerce_bool_flag(getattr(args, name, None), default=None)

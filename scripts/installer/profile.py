@@ -72,29 +72,19 @@ DEFAULT_PROFILE_FILENAME_TEMPLATE: str = "{robot}.json"
 # 2. **CI 守门**：CI 步骤 ``from scripts.installer.profile import _KNOWN_FLAGS`` 后比对
 #    ``set(BootstrapPlanner.__init__ 字段) == _KNOWN_FLAGS``，缺一个就 fail。
 #
-# 包含 18 个 boolean flag（bootstrap.py:1522-1536 add_boolean_flag 调用清单）+ 5 个 choice
-# （memory_mode / perception_mode / mcp_mode / nuwaclaw_host_mount / tier）+ 1 个 robot
-# + 1 个 health_url（拓扑路径，存为字符串）+ 1 个 export_yolo_engine（已在 boolean 中）；
-# 下面再列 *内部记录用* 字段（robot / tier / nuwaclaw_host_mount）以覆盖 wizard 关键参数。
-#
-# 注意：tuple 中 18 个 boolean flag 严格匹配 bootstrap.py:1522-1536 add_boolean_flag 调用：
+# 当前共 14 个 boolean flag：
 #   geometry / data_plane / systemd / relay / install_nuwaclaw_docker / install_python /
 #   prepare_memory / prepare_yolo / export_yolo_engine / build_geometry / build_go2slam /
-#   install_geometry_deps / repair_ros2_apt_source / start_gateway / healthcheck
-#   (= 15 个；plan L1522-L1536 写作"18 个"是含 3 个 choice 后的总数，复核时以源代码为准)。
-# 实测 ``add_boolean_flag`` 在 bootstrap.py:1522-1536 共 **15 个** boolean 调用：
-#   geometry / data_plane / systemd / relay / install_nuwaclaw_docker / install_python /
-#   prepare_memory / prepare_yolo / export_yolo_engine / build_geometry / build_go2slam /
-#   install_geometry_deps / repair_ros2_apt_source / start_gateway / healthcheck
+#   install_geometry_deps / start_gateway / healthcheck
 # 加上 memory_mode / perception_mode / mcp_mode / nuwaclaw_host_mount / tier / robot / health_url
-# 共 22 个；本集合按此 22 字段收敛。
+# 共 21 个；本集合按此 21 字段收敛。
 
 _KNOWN_FLAGS = frozenset(
     {
         # === robot / tier ===
         "robot",
         "tier",
-        # === 15 个 boolean flag（bootstrap.py:1522-1536 add_boolean_flag）===
+        # === 14 个 boolean flag ===
         "geometry",
         "data_plane",
         "systemd",
@@ -107,7 +97,6 @@ _KNOWN_FLAGS = frozenset(
         "build_geometry",
         "build_go2slam",
         "install_geometry_deps",
-        "repair_ros2_apt_source",
         "start_gateway",
         "healthcheck",
         # === 4 个 choice 字段 ===
@@ -118,6 +107,10 @@ _KNOWN_FLAGS = frozenset(
         # === 字符串 / 路径类（bootstrap.py:630-642 字段）===
         "health_url",
     }
+)
+
+_PROFILE_HEADER_FIELDS = frozenset(
+    {"_schema_version", "created_at", "installer_version"}
 )
 
 
@@ -219,6 +212,16 @@ def _validate_profile(data: Dict[str, Any]) -> None:
             remediation=(
                 "请重新运行 wizard 生成新 profile：python3 install.py wizard --save-profile <path>。"
                 "若需要降级到旧 installer，请用旧版本重建 profile。"
+            ),
+        )
+
+    unknown_keys = sorted(set(data) - _KNOWN_FLAGS - _PROFILE_HEADER_FIELDS)
+    if unknown_keys:
+        raise InstallerError(
+            code=InstallerErrorCode.PROFILE_SCHEMA_INCOMPATIBLE,
+            message=f"profile 包含未知业务字段 {unknown_keys}，拒绝静默忽略",
+            remediation=(
+                "删除失效字段后重试，或重新运行 wizard 生成当前 schema 的 profile"
             ),
         )
 

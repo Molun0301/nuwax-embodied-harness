@@ -6,11 +6,8 @@
 ``services/nuwax-workspace``。移除对 ``services/geometry/nuwax_geometry_runtime/vendor``
 与 ``vendor-config.json`` 的假设（vendor_dimos_crates.sh 已退役）。
 
-去 ROS2 化（2026-07-03 drop-ros2 / 2026-07-04 B3）：
-
-- 原 ``geometry_deps`` 阶段（RTAB-Map / Nav2 / colcon / rosdep）已物理删除；
-- ``nuwax-geometry-runtime`` Rust 二进制承担原 ROS2 运行时职责，平台侧依赖
-  收敛为 LCM 系统库 + Rust 工具链（preflight 已探测）。
+``nuwax-geometry-runtime`` 的平台侧依赖收敛为 LCM 系统库 + Rust 工具链
+（preflight 已探测）。
 - 本 phase 现在负责**校验** ``services/nuwax-workspace`` 完整性 + 提示用户重建命令，
   不直接执行 apt/cargo（避免重复 system 阶段动作）。
 
@@ -160,7 +157,7 @@ class GeometryRuntimeDepsPhase(Phase):
         if binary.is_file() and os.access(binary, os.X_OK):
             ctx.info(f"  nuwax_geometry_runtime_binary={binary}（executable）")
             ctx.success(
-                f"[phase: {self.name}] native runtime 产物已就位（plan 2026-07-03 drop-ros2 目标态）"
+                f"[phase: {self.name}] native runtime 产物已就位"
             )
             return 0
         ctx.warn(

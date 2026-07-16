@@ -62,6 +62,8 @@ use crate::runner::InProcessNode;
 
 const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=1";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "guard-runtime")]
+const MOTION_GUARD_READY_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(feature = "patrolling")]
 const PLANNER_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -732,7 +734,7 @@ async fn run_guarded_nav_scheduler(
     .await
     .map_err(|error| module_error("guarded_nav_scheduler.connect", error))?;
     let mut status = scheduler.subscribe_status();
-    tokio::time::timeout(STARTUP_TIMEOUT, async {
+    tokio::time::timeout(MOTION_GUARD_READY_TIMEOUT, async {
         loop {
             if status.borrow().motion_sink_ready {
                 return Ok::<(), NavStackError>(());
@@ -743,7 +745,13 @@ async fn run_guarded_nav_scheduler(
         }
     })
     .await
-    .map_err(|_| NavStackError::Internal("motion guard readiness timed out".into()))??;
+    .map_err(|_| {
+        let last_status = status.borrow();
+        NavStackError::Internal(format!(
+            "motion guard readiness timed out: {} (generation={}, observations={})",
+            last_status.message, last_status.guard_generation, last_status.motion_sink_observations,
+        ))
+    })??;
     signal_ready(ready)?;
 
     let loop_result = run_guarded_nav_loop(

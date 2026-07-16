@@ -179,7 +179,7 @@ def _full_health_payload(summary: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(entry, dict) and entry.get("service_id")
     }
     raw_status = str(service_health.get("status") or "unknown").lower()
-    if raw_status in {"available", "ready", "idle"}:
+    if raw_status in {"available", "ready", "idle", "disabled", "unsupported"}:
         overall = "healthy"
     elif raw_status in {"degraded", "stale"}:
         overall = "degraded"

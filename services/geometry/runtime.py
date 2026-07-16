@@ -1043,6 +1043,13 @@ class PlatformGeometryRuntime:
             return None
         return provider
 
+    def probe_geometry_runtime_health(self) -> Tuple[bool, str]:
+        """Run a live, side-effect-free GetStatus probe against the provider."""
+
+        if self.get_geometry_runtime_provider() is None:
+            return False, "GeometryRuntimeProvider 未连接"
+        return self._probe_geometry_runtime_health()
+
     def notify_cmd_vel_sink_ready(
         self,
         ready: bool,
@@ -2204,10 +2211,7 @@ class PlatformGeometryRuntime:
                 "等待 nuwax-geometry-runtime 子进程启动。",
             )
             return
-        provider_connected = bool(
-            self._remote_provider is not None
-            and getattr(self._remote_provider, "is_connected", lambda: False)()
-        )
+        provider_connected = _remote_is_connected(self._remote_provider)
         if not provider_connected:
             self._set_runtime_state(
                 "waiting_bridge",
@@ -2276,13 +2280,14 @@ class PlatformGeometryRuntime:
             return False, "GetStatus RPC 失败：%s" % exc
         if not isinstance(status, dict):
             return False, "GetStatus 返回非 dict：%r" % (status,)
-        phase = str(status.get("phase") or "").strip()
+        raw_phase = str(status.get("phase") or "").strip()
+        phase = raw_phase.upper()
         # target runtime state machine: BOOTING/STARTING/READY/FAILED
         if phase == "FAILED":
             message = str(status.get("message") or "nuwax-geometry-runtime 上报 FAILED")
             return False, message
         if phase and phase not in {"READY", "RUNNING", "STARTING", "BOOTING", ""}:
-            return False, "nuwax-geometry-runtime 未知状态 phase=%s" % phase
+            return False, "nuwax-geometry-runtime 未知状态 phase=%s" % raw_phase
         return True, str(status.get("message") or "")
 
     def _blocking_process_failure(self) -> Optional[str]:
@@ -3140,8 +3145,6 @@ class PlatformGeometryRuntime:
         """返回是否存在可供平台消费的几何后端。"""
 
         if not self._is_geometry_profile_enabled():
-            return False
-        if not self._uses_external_geometry_stack():
             return False
         navigation_backend = self._resolve_navigation_backend()
         exploration_backend = self._resolve_exploration_backend()
@@ -7649,7 +7652,7 @@ class PlatformGeometryProviderBundle(
             return False
         if isinstance(backend, ExplorationDataPlane):
             return bool(backend.is_exploration_available())
-        return bool(backend.is_available())
+        return _remote_is_connected(backend)
 
     def get_current_pose(self):
         if not self._is_geometry_profile_enabled():

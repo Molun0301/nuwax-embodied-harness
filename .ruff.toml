@@ -12,9 +12,13 @@
 target-version = "py38"
 line-length = 120
 
-# 自定义规则注册（NUX = Nuwax Robot Bridge）
-extend-select = [
-    "NUX001",  # reset_loop_closure_state 调用点必须在 session 边界白名单
+# NUX001 由 scripts/ci/check_reset_call_site.py 独立执行；Ruff 不支持项目自定义 selector。
+
+# 排除不参与 lint 的目录。
+extend-exclude = [
+    ".venv_model_download",
+    "build",
+    "dist",
 ]
 
 [lint.flake8-quotes]
@@ -23,11 +27,3 @@ docstring-quotes = "double"
 
 [lint.pydocstyle]
 convention = "google"
-
-# 排除不参与 lint 的目录（与 .gitignore tests/ 屏蔽对齐）
-extend-exclude = [
-    "tests",
-    ".venv_model_download",
-    "build",
-    "dist",
-]

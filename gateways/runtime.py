@@ -735,6 +735,63 @@ class GatewayRuntime:
         # The input bridge starts only after the Rust geometry gRPC endpoint is ready.
         self._input_bridge: Optional[RuntimeInputBridge] = None
 
+    def _attach_geometry_runtime_on_start(self) -> bool:
+        """Attach and probe the systemd-owned geometry sidecar at startup.
+
+        This path only establishes the gRPC provider and sensor input bridge. It
+        does not start mapping, navigation, exploration, or a motion sink.
+        Failure remains observable through service health without preventing the
+        Gateway HTTP surface from starting.
+        """
+
+        geometry_runtime = self.platform_geometry_runtime
+        geometry_config = getattr(geometry_runtime, "config", None)
+        mapping_config = getattr(geometry_config, "mapping", None)
+        if not bool(getattr(geometry_config, "enabled", False)) or not bool(
+            getattr(mapping_config, "profile_enabled", False)
+        ):
+            RUNTIME_LOGGER.info(
+                "平台几何运行时未启用，跳过 Gateway 启动期 gRPC 挂接。"
+            )
+            return False
+        try:
+            geometry_runtime.start()
+            provider = geometry_runtime.get_geometry_runtime_provider()
+            if provider is None:
+                runtime_status = geometry_runtime.get_runtime_status()
+                RUNTIME_LOGGER.warning(
+                    "Gateway 启动期未能挂接 GeometryRuntimeProvider: phase=%s message=%s",
+                    runtime_status.get("phase"),
+                    runtime_status.get("message"),
+                )
+                return False
+            probe = getattr(geometry_runtime, "probe_geometry_runtime_health", None)
+            if not callable(probe):
+                RUNTIME_LOGGER.warning(
+                    "Gateway 启动期 GeometryRuntimeProvider 缺少 live GetStatus 探测接口。"
+                )
+                return False
+            probe_ok, probe_message = probe()
+            if not probe_ok:
+                RUNTIME_LOGGER.warning(
+                    "Gateway 启动期 GeometryRuntimeProvider live GetStatus 探测失败: %s",
+                    probe_message,
+                )
+                return False
+            self._mark_geometry_cmd_vel_sink_unavailable()
+            # Sensor ingress readiness gates mapping capabilities, not the
+            # sidecar's idle health. Mapping remains inactive until StartMapping.
+            self._start_runtime_input_bridge()
+            RUNTIME_LOGGER.info(
+                "Gateway 启动期 GeometryRuntimeProvider gRPC 探测与挂接已完成。"
+            )
+            return True
+        except Exception:
+            RUNTIME_LOGGER.exception(
+                "Gateway 启动期 GeometryRuntimeProvider 挂接失败；健康检查将保持非就绪。"
+            )
+            return False
+
     def start(self) -> None:
         """启动宿主机运行时。"""
 
@@ -756,38 +813,39 @@ class GatewayRuntime:
             self._mark_geometry_cmd_vel_sink_unavailable()
             self.robot.start()
             self._started = True
-        try:
-            if self.perception_video_runtime.should_auto_start():
-                self.perception_video_runtime.start()
-        except Exception:
-            RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
-        self._start_safety_watchdog_loop()
-        self._start_data_frame_stream_sources()
-        # 地图工作区仅由 MCP（activate_map / load_map_version 等）显式切换，启动时不自动恢复。
-        if self.config.runtime_data.map_active_restore_on_start:
+            self._attach_geometry_runtime_on_start()
             try:
-                self.map_workspace_service.restore_active_workspace(load_memory_history=True)
+                if self.perception_video_runtime.should_auto_start():
+                    self.perception_video_runtime.start()
             except Exception:
-                RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
-        else:
-            RUNTIME_LOGGER.info(
-                "启动时跳过自动恢复地图工作区（NUWAX_ACTIVE_MAP_RESTORE_ON_START=false）。"
-            )
-        self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
-        self._refresh_dynamic_capability_matrix()
+                RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
+            self._start_safety_watchdog_loop()
+            self._start_data_frame_stream_sources()
+            # 地图工作区仅由 MCP（activate_map / load_map_version 等）显式切换，启动时不自动恢复。
+            if self.config.runtime_data.map_active_restore_on_start:
+                try:
+                    self.map_workspace_service.restore_active_workspace(load_memory_history=True)
+                except Exception:
+                    RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
+            else:
+                RUNTIME_LOGGER.info(
+                    "启动时跳过自动恢复地图工作区（NUWAX_ACTIVE_MAP_RESTORE_ON_START=false）。"
+                )
+            self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
+            self._refresh_dynamic_capability_matrix()
 
-        self.event_bus.publish(
-            self.event_bus.build_event(
-                "system.gateway_started",
-                category=RuntimeEventCategory.SYSTEM,
-                source="gateway_runtime",
-                message="宿主机网关运行时已启动。",
-                payload={
-                    "robot_name": self.robot.manifest.robot_name,
-                    "robot_model": self.robot.manifest.robot_model,
-                },
+            self.event_bus.publish(
+                self.event_bus.build_event(
+                    "system.gateway_started",
+                    category=RuntimeEventCategory.SYSTEM,
+                    source="gateway_runtime",
+                    message="宿主机网关运行时已启动。",
+                    payload={
+                        "robot_name": self.robot.manifest.robot_name,
+                        "robot_model": self.robot.manifest.robot_model,
+                    },
+                )
             )
-        )
 
     def stop(self) -> None:
         """停止宿主机运行时。
@@ -3874,6 +3932,59 @@ class GatewayRuntime:
         stream_status = self.stream_bus.status()
         geometry_runtime_status = dict(geometry_runtime_status or {})
         geometry_asset = dict(geometry_asset or {})
+        geometry_provider = None
+        provider_getter = getattr(
+            self.platform_geometry_runtime,
+            "get_geometry_runtime_provider",
+            None,
+        )
+        if callable(provider_getter):
+            try:
+                geometry_provider = provider_getter()
+            except Exception:
+                RUNTIME_LOGGER.debug(
+                    "读取 GeometryRuntimeProvider 健康证据失败。",
+                    exc_info=True,
+                )
+        geometry_provider_connected = geometry_provider is not None
+        geometry_provider_probe_ok = False
+        geometry_provider_probe_message = "GeometryRuntimeProvider 未连接"
+        if geometry_provider_connected:
+            live_probe = getattr(
+                self.platform_geometry_runtime,
+                "probe_geometry_runtime_health",
+                None,
+            )
+            if callable(live_probe):
+                try:
+                    (
+                        geometry_provider_probe_ok,
+                        geometry_provider_probe_message,
+                    ) = live_probe()
+                except Exception as exc:
+                    geometry_provider_probe_message = "GetStatus 探测异常：%s" % exc
+            else:
+                geometry_provider_probe_message = "缺少 live GetStatus 探测接口"
+        geometry_runtime_phase = str(
+            geometry_runtime_status.get("phase")
+            or geometry_runtime_status.get("state")
+            or ""
+        ).strip().lower()
+        geometry_runtime_wrapper_failed = bool(
+            geometry_runtime_status.get("blocked")
+            or geometry_runtime_phase in {"error", "failed", "failure"}
+        )
+        geometry_provider_probe_failed = bool(
+            geometry_provider_connected and not geometry_provider_probe_ok
+        )
+        geometry_runtime_failed = bool(
+            geometry_runtime_wrapper_failed or geometry_provider_probe_failed
+        )
+        geometry_provider_healthy = bool(
+            geometry_provider_connected
+            and geometry_provider_probe_ok
+            and not geometry_runtime_wrapper_failed
+        )
         entries: List[ServiceHealthEntry] = []
 
         entries.append(
@@ -4081,15 +4192,25 @@ class GatewayRuntime:
             )
         )
 
-        geometry_enabled = bool(self.platform_geometry_runtime.config.enabled)
+        geometry_config = self.platform_geometry_runtime.config
+        geometry_enabled = bool(
+            geometry_config.enabled
+            and getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
+        )
         geometry_started = bool(geometry_runtime_status.get("started") or geometry_runtime_status.get("running"))
         geometry_asset_available = bool(geometry_asset.get("available"))
         if not geometry_enabled:
             geometry_status = ServiceHealthStatus.DISABLED
             geometry_summary = "统一几何服务未启用"
-        elif geometry_started or geometry_asset_available:
+        elif geometry_runtime_failed:
+            geometry_status = ServiceHealthStatus.ERROR
+            geometry_summary = "统一几何服务运行失败"
+        elif geometry_provider_healthy or geometry_asset_available:
             geometry_status = ServiceHealthStatus.AVAILABLE
             geometry_summary = "统一几何服务可用"
+        elif geometry_started:
+            geometry_status = ServiceHealthStatus.DEGRADED
+            geometry_summary = "统一几何服务已启动但 gRPC provider 未挂接"
         else:
             geometry_status = ServiceHealthStatus.IDLE
             geometry_summary = "统一几何服务空闲"
@@ -4110,7 +4231,13 @@ class GatewayRuntime:
                 updated_at=utc_now(),
                 related_streams=("runtime.governance", "pointcloud_map.meta"),
                 expected_process_roles=("geometry_runtime", "geometry_external", "nav_stack"),
-                metadata={"geometry_runtime": geometry_runtime_status, "geometry_asset": geometry_asset},
+                metadata={
+                    "geometry_runtime": geometry_runtime_status,
+                    "geometry_asset": geometry_asset,
+                    "provider_connected": geometry_provider_connected,
+                    "provider_healthy": geometry_provider_healthy,
+                    "provider_probe_message": geometry_provider_probe_message,
+                },
             )
         )
 
@@ -4144,35 +4271,71 @@ class GatewayRuntime:
         geometry_runtime_roles = ("geometry_runtime",)
         geometry_runtime_processes = self._service_process_evidence(geometry_runtime_roles)
         if not geometry_enabled:
-            geometry_runtime_status = ServiceHealthStatus.DISABLED
+            geometry_process_status = ServiceHealthStatus.DISABLED
             geometry_runtime_summary = "Native geometry runtime 当前不需要"
             geometry_runtime_evidence = "统一几何配置未启用"
+            geometry_runtime_source = "platform_geometry_runtime"
+            geometry_runtime_reason = None
+        elif geometry_runtime_wrapper_failed:
+            geometry_process_status = ServiceHealthStatus.ERROR
+            geometry_runtime_summary = "Native geometry runtime 上报失败状态"
+            geometry_runtime_evidence = str(
+                geometry_runtime_status.get("message")
+                or "phase=%s" % (geometry_runtime_phase or "failed")
+            )
+            geometry_runtime_source = "platform_geometry_runtime"
+            geometry_runtime_reason = "runtime_failed"
+        elif geometry_provider_probe_failed:
+            geometry_process_status = ServiceHealthStatus.ERROR
+            geometry_runtime_summary = "Native geometry runtime live GetStatus 探测失败"
+            geometry_runtime_evidence = geometry_provider_probe_message
+            geometry_runtime_source = "platform_geometry_runtime"
+            geometry_runtime_reason = "provider_probe_failed"
+        elif geometry_provider_healthy:
+            geometry_process_status = ServiceHealthStatus.AVAILABLE
+            geometry_runtime_summary = "Native geometry runtime gRPC provider 已挂接"
+            geometry_runtime_evidence = (
+                "GeometryRuntimeProvider connect/GetStatus 探测已通过"
+            )
+            geometry_runtime_source = "platform_geometry_runtime"
+            geometry_runtime_reason = None
         elif geometry_runtime_processes:
-            geometry_runtime_status = ServiceHealthStatus.AVAILABLE
-            geometry_runtime_summary = "Native geometry runtime 进程已匹配"
+            geometry_process_status = ServiceHealthStatus.DEGRADED
+            geometry_runtime_summary = "Native geometry runtime 进程存在但 gRPC provider 未挂接"
             geometry_runtime_evidence = "；".join(
                 f"PID {item.get('pid')} {item.get('display_name') or item.get('role')}"
                 for item in geometry_runtime_processes
             )
+            geometry_runtime_source = "system.metrics"
+            geometry_runtime_reason = "grpc_provider_unattached"
         else:
-            geometry_runtime_status = ServiceHealthStatus.MISSING
+            geometry_process_status = ServiceHealthStatus.MISSING
             geometry_runtime_summary = "未发现 Native geometry runtime 进程"
             geometry_runtime_evidence = "进程矩阵未匹配 role=geometry_runtime"
+            geometry_runtime_source = "system.metrics"
+            geometry_runtime_reason = "expected_process_absent"
         entries.append(
             self._make_service_health_entry(
                 service_id="geometry_runtime",
                 display_name="Native geometry runtime/命令桥",
                 group="系统服务",
-                status=geometry_runtime_status,
+                status=geometry_process_status,
                 summary=geometry_runtime_summary,
                 evidence=geometry_runtime_evidence,
-                source="system.metrics",
+                source=geometry_runtime_source,
                 advice="检查 nuwax-geometry-runtime 启动日志和进程命名",
                 order=110,
                 updated_at=utc_now(),
-                reason=None if geometry_runtime_status != ServiceHealthStatus.MISSING else "expected_process_absent",
+                reason=geometry_runtime_reason,
                 expected_process_roles=geometry_runtime_roles,
                 related_streams=("system.metrics",),
+                metadata={
+                    "provider_connected": geometry_provider_connected,
+                    "provider_healthy": geometry_provider_healthy,
+                    "provider_probe_message": geometry_provider_probe_message,
+                    "runtime_phase": geometry_runtime_status.get("phase"),
+                    "process_evidence_count": len(geometry_runtime_processes),
+                },
             )
         )
 

@@ -50,12 +50,6 @@ serde_json = { workspace = true }
 # 因此 `default = []` 即可,R5-1 真正关闭 default test-internals leak。
 nuwax-explore-wavefront = { path = ".", features = ["test-internals"] }
 
-[[test]]
-name = "frontier_detection"
-
-[[test]]
-name = "scoring"
-
 [[bench]]
 name = "wavefront_500x500"
 harness = false

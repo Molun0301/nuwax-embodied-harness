@@ -380,6 +380,13 @@ class Go2Actuator:
                 errors.append(str(exc))
         try:
             _require_success(
+                self._emergency_sport.Move(0.0, 0.0, 0.0),
+                "EmergencySportClient.Move(zero)",
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+        try:
+            _require_success(
                 self._emergency_sport.StopMove(),
                 "EmergencySportClient.StopMove",
             )

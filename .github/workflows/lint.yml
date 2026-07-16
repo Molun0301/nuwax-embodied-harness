@@ -30,7 +30,7 @@ jobs:
       # (c) PEP 604 union ast 检测
       # 只扫本 change 新增 + 顶层 platform 代码；要求兼容实机 Py3.8.10，禁止 X | Y 写法。
       - name: PEP 604 union 检测（实机 Py3.8.10 兼容）
-        run: python3 scripts/ci/check_pep604.py services/geometry/__init__.py services/geometry/loop_closure_state.py services/geometry/runtime.py services/geometry/external_debug_observer.py gateways
+        run: python3 scripts/ci/check_pep604.py services/geometry/__init__.py services/geometry/loop_closure_state.py services/geometry/runtime.py services/geometry/external_debug_observer.py gateways scripts/deploy_installer install.py
 
       # (d) fixture / mock / integration 测试文件不入仓
       - name: 测试文件不入仓
@@ -40,3 +40,40 @@ jobs:
             git ls-files tests/fixtures/ tests/mocks/ tests/integration/
             exit 1
           fi
+
+  deployment-installer:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+
+      - name: 安装部署契约测试工具
+        run: python3 -m pip install 'pytest==8.3.5' 'ruff==0.9.10' 'pydantic==2.10.6'
+
+      - name: 安装 native build 前置依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends liblcm-dev pkg-config protobuf-compiler
+
+      - name: 安装 Rust 1.88.0
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: 一键部署契约
+        run: bash scripts/ci/check_deployment_installer.sh
+
+      - name: Rust production build contracts
+        run: |
+          cargo +1.88.0 check --locked --manifest-path services/nuwax-workspace/Cargo.toml \
+            --package nuwax-nav-stack --bin nuwax-nav-stack \
+            --features simple-2d,replanning-astar
+          cargo +1.88.0 check --locked --manifest-path services/nuwax-workspace/Cargo.toml \
+            --package nuwax-nav-visual-servoing --bin nuwax-person-follow \
+            --features link-liblcm
+          cargo +1.88.0 check --locked \
+            --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml \
+            --bin nuwax-geometry-runtime

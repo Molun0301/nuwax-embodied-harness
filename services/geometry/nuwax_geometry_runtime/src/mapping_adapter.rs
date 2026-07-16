@@ -439,6 +439,7 @@ pub struct MappingAdapter {
     global_frame_established: bool,
     transformed_points: Vec<Point3<f64>>,
     latest_accepted_map_points: Vec<Point3<f64>>,
+    checkpoint_grid: Option<OccupancyGrid>,
     last_built_generation: u64,
     last_built_point_count: usize,
     last_built_received_at_ns: u64,
@@ -533,6 +534,7 @@ impl MappingAdapter {
             global_frame_established: false,
             transformed_points: Vec::new(),
             latest_accepted_map_points: Vec::new(),
+            checkpoint_grid: None,
             last_built_generation: 0,
             last_built_point_count: 0,
             last_built_received_at_ns: 0,
@@ -652,6 +654,48 @@ impl MappingAdapter {
         self.lifecycle.phase = MappingSessionPhase::Stopped;
         self.lifecycle.active = false;
         Ok(self.snapshot())
+    }
+
+    pub fn install_checkpoint(
+        &mut self,
+        checkpoint: OccupancyGrid,
+        revision_floor: u64,
+    ) -> Result<(MapState, MapRevisionEvent), String> {
+        if !self.is_active() {
+            return Err("mapping session must be active before checkpoint install".to_string());
+        }
+        validate_checkpoint_grid(&checkpoint, &self.map_frame_id)?;
+        let next_revision = self
+            .reserve_next_revision(revision_floor.max(self.revision).max(self.global_revision))?;
+        let timestamp_ns = if checkpoint.ts.is_finite() && checkpoint.ts > 0.0 {
+            (checkpoint.ts * 1_000_000_000.0).round() as u64
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64
+        };
+        let map = MapState {
+            width: checkpoint.width,
+            height: checkpoint.height,
+            resolution: checkpoint.resolution as f32,
+            origin_x: checkpoint.origin[0],
+            origin_y: checkpoint.origin[1],
+            frame_id: checkpoint.frame_id.clone(),
+            revision: next_revision,
+            timestamp_ns,
+            data: checkpoint.data.clone(),
+        };
+        self.checkpoint_grid = Some(checkpoint);
+        self.global_revision = next_revision;
+        self.revision = next_revision;
+        self.lifecycle.revision = next_revision;
+        let event = MapRevisionEvent::from_map(&map, &self.lifecycle);
+        Ok((map, event))
+    }
+
+    pub fn has_checkpoint(&self) -> bool {
+        self.checkpoint_grid.is_some() && self.is_active() && self.current_revision() > 0
     }
 
     pub fn snapshot(&self) -> MappingSessionSnapshot {
@@ -1048,7 +1092,7 @@ impl MappingAdapter {
         let built_generation = self.session.generation();
         let built_point_count = self.session.current_size();
         let built_received_at_ns = self.latest_pointcloud_received_at_ns;
-        let (mapper, grid) = match self.build_maps_zero_copy() {
+        let (mapper, live_grid) = match self.build_maps_zero_copy() {
             Ok(result) => result,
             Err(error) => {
                 warn!("mapping_adapter: auto-bounds occupancy 构建失败: {error}");
@@ -1056,6 +1100,16 @@ impl MappingAdapter {
             }
         };
         self.cost_mapper = mapper;
+        let grid = match self.checkpoint_grid.as_ref() {
+            Some(checkpoint) => match merge_checkpoint_grid(checkpoint, &live_grid) {
+                Ok(merged) => merged,
+                Err(error) => {
+                    warn!("mapping_adapter: checkpoint/live occupancy 合并失败: {error}");
+                    return false;
+                }
+            },
+            None => live_grid,
+        };
         if let Ok(mut s) = state.try_write() {
             let revision_floor = s.map.revision.max(self.revision).max(self.global_revision);
             let next_revision = match self.reserve_next_revision(revision_floor) {
@@ -1120,6 +1174,7 @@ impl MappingAdapter {
         self.global_frame_established = false;
         self.transformed_points.clear();
         self.latest_accepted_map_points.clear();
+        self.checkpoint_grid = None;
         self.last_built_generation = 0;
         self.last_built_point_count = 0;
         self.last_built_received_at_ns = 0;
@@ -1216,10 +1271,13 @@ impl MappingReadiness {
                 let frame_ready = a
                     .frame_contract(&a.map_frame_id)
                     .ready_for_global_consumers();
+                let checkpoint_ready = a.has_checkpoint();
                 if !a.is_active() {
                     last_error.get_or_insert_with(|| {
                         "mapping session 未启动;调用 StartMapping 后才接收输入".to_string()
                     });
+                } else if checkpoint_ready {
+                    // A validated checkpoint is already a global map consumer input.
                 } else if !a.has_data && a.odom_count() == 0 && a.pointcloud_count() == 0 {
                     last_error
                         .get_or_insert_with(|| "尚未收到任何 odom / pointcloud 输入".to_string());
@@ -1241,7 +1299,7 @@ impl MappingReadiness {
                     a.pointcloud_count(),
                     a.current_revision(),
                     a.accumulated_count(),
-                    frame_ready,
+                    frame_ready || checkpoint_ready,
                     a.global_frame_generation(),
                 )
             }
@@ -1253,10 +1311,11 @@ impl MappingReadiness {
             }
         };
         if let Some(adapter) = adapter {
+            let checkpoint_ready = adapter.has_checkpoint();
             ready = lcm_backend_available
-                && adapter.has_data()
+                && (adapter.has_data() || checkpoint_ready)
                 && global_consumer_ready
-                && pointcloud_count > 0
+                && (pointcloud_count > 0 || checkpoint_ready)
                 && last_occupancy_revision > 0;
         }
         let reason = if ready {
@@ -1280,6 +1339,129 @@ impl MappingReadiness {
             last_error,
         }
     }
+}
+
+fn validate_checkpoint_grid(grid: &OccupancyGrid, expected_frame_id: &str) -> Result<(), String> {
+    if grid.width == 0 || grid.height == 0 {
+        return Err("checkpoint width/height must be positive".to_string());
+    }
+    let expected_len = (grid.width as usize)
+        .checked_mul(grid.height as usize)
+        .ok_or_else(|| "checkpoint dimensions overflow".to_string())?;
+    if grid.data.len() != expected_len {
+        return Err(format!(
+            "checkpoint data size mismatch: expected={expected_len} actual={}",
+            grid.data.len()
+        ));
+    }
+    if !grid.resolution.is_finite() || grid.resolution <= 0.0 {
+        return Err("checkpoint resolution must be finite and positive".to_string());
+    }
+    if grid.frame_id.trim().trim_start_matches('/') != expected_frame_id {
+        return Err(format!(
+            "checkpoint frame must be {expected_frame_id}, received {}",
+            grid.frame_id
+        ));
+    }
+    if grid
+        .origin
+        .iter()
+        .chain(grid.origin_orientation.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("checkpoint origin contains non-finite values".to_string());
+    }
+    if grid.data.iter().any(|value| !(-1..=100).contains(value)) {
+        return Err("checkpoint occupancy values must be within [-1, 100]".to_string());
+    }
+    Ok(())
+}
+
+fn merge_checkpoint_grid(
+    checkpoint: &OccupancyGrid,
+    live: &OccupancyGrid,
+) -> Result<OccupancyGrid, String> {
+    validate_checkpoint_grid(
+        checkpoint,
+        checkpoint.frame_id.trim().trim_start_matches('/'),
+    )?;
+    validate_checkpoint_grid(live, live.frame_id.trim().trim_start_matches('/'))?;
+    if checkpoint.frame_id.trim().trim_start_matches('/')
+        != live.frame_id.trim().trim_start_matches('/')
+    {
+        return Err("checkpoint/live frames differ".to_string());
+    }
+    let resolution = checkpoint.resolution;
+    let tolerance = resolution.abs().max(1.0) * 1e-6;
+    if (live.resolution - resolution).abs() > tolerance {
+        return Err("checkpoint/live resolutions differ".to_string());
+    }
+    if checkpoint.origin_orientation != live.origin_orientation {
+        return Err("checkpoint/live origin orientations differ".to_string());
+    }
+
+    let snap_near_integer = |value: f64| {
+        let rounded = value.round();
+        if (value - rounded).abs() <= 1e-6 {
+            rounded
+        } else {
+            value
+        }
+    };
+    let live_min_col = (live.origin[0] - checkpoint.origin[0]) / resolution;
+    let live_min_row = (live.origin[1] - checkpoint.origin[1]) / resolution;
+    let live_max_col =
+        (live.origin[0] + live.width as f64 * live.resolution - checkpoint.origin[0]) / resolution;
+    let live_max_row =
+        (live.origin[1] + live.height as f64 * live.resolution - checkpoint.origin[1]) / resolution;
+    let min_col = snap_near_integer(live_min_col.min(0.0)).floor() as i64;
+    let min_row = snap_near_integer(live_min_row.min(0.0)).floor() as i64;
+    let max_col = snap_near_integer(live_max_col.max(checkpoint.width as f64)).ceil() as i64;
+    let max_row = snap_near_integer(live_max_row.max(checkpoint.height as f64)).ceil() as i64;
+    let width = max_col.saturating_sub(min_col);
+    let height = max_row.saturating_sub(min_row);
+    if width <= 0 || height <= 0 || width > u32::MAX as i64 || height > u32::MAX as i64 {
+        return Err("merged checkpoint dimensions are invalid".to_string());
+    }
+    let mut merged = OccupancyGrid::with_frame(
+        width as u32,
+        height as u32,
+        resolution,
+        &checkpoint.frame_id,
+    );
+    merged.origin = [
+        checkpoint.origin[0] + min_col as f64 * resolution,
+        checkpoint.origin[1] + min_row as f64 * resolution,
+        checkpoint.origin[2],
+    ];
+    merged.origin_orientation = checkpoint.origin_orientation;
+    merged.ts = checkpoint.ts.max(live.ts);
+
+    for source in [checkpoint, live] {
+        for row in 0..source.height {
+            for col in 0..source.width {
+                let incoming = source.data[source.index(row, col)];
+                if incoming < 0 {
+                    continue;
+                }
+                let world_x = source.origin[0] + (col as f64 + 0.5) * source.resolution;
+                let world_y = source.origin[1] + (row as f64 + 0.5) * source.resolution;
+                let target_col = ((world_x - merged.origin[0]) / resolution).floor() as i64;
+                let target_row = ((world_y - merged.origin[1]) / resolution).floor() as i64;
+                if target_col < 0 || target_row < 0 || target_col >= width || target_row >= height {
+                    return Err("checkpoint/live cell projects outside merged grid".to_string());
+                }
+                let target_index = merged.index(target_row as u32, target_col as u32);
+                let existing = merged.data[target_index];
+                merged.data[target_index] = if existing < 0 {
+                    incoming
+                } else {
+                    existing.max(incoming)
+                };
+            }
+        }
+    }
+    Ok(merged)
 }
 
 /// nuwax-mapping CostMapper 输出的 u8 → MapState i8 转换。
@@ -2063,5 +2245,97 @@ mod tests {
         assert!(!r.ready);
         assert!(!r.lcm_backend);
         assert!(r.last_error.as_ref().unwrap().contains("backend"));
+    }
+
+    #[test]
+    fn installed_checkpoint_is_ready_without_fake_pointcloud_input() {
+        let mut adapter = MappingAdapter::new(sample_config());
+        adapter
+            .start_session("mapload:one", "warehouse", "mapver_000001")
+            .expect("start checkpoint session");
+        let mut checkpoint = OccupancyGrid::with_frame(2, 2, 0.05, "map");
+        checkpoint.origin = [-1.0, 2.0, 0.0];
+        checkpoint.data = vec![-1, 0, 100, 50];
+
+        let (map, event) = adapter
+            .install_checkpoint(checkpoint, 0)
+            .expect("install checkpoint");
+
+        assert_eq!(map.data, vec![-1, 0, 100, 50]);
+        assert_eq!(event.map_version_id, "mapver_000001");
+        assert_eq!(event.session_id, "mapload:one");
+        assert_eq!(event.revision, 1);
+        assert_eq!(adapter.pointcloud_count(), 0);
+        let readiness = MappingReadiness::compute(Some(&adapter), true);
+        assert!(readiness.ready);
+        assert!(readiness.global_consumer_ready);
+    }
+
+    #[test]
+    fn live_grid_merges_with_loaded_checkpoint_in_world_coordinates() {
+        let mut checkpoint = OccupancyGrid::with_frame(2, 2, 0.5, "map");
+        checkpoint.origin = [-0.5, -0.5, 0.0];
+        checkpoint.data = vec![100, 0, -1, 0];
+        let mut live = OccupancyGrid::with_frame(2, 2, 0.5, "map");
+        live.origin = [0.0, -0.5, 0.0];
+        live.data = vec![0, 100, 0, -1];
+
+        let merged = merge_checkpoint_grid(&checkpoint, &live).expect("merge aligned grids");
+
+        assert_eq!(merged.width, 3);
+        assert_eq!(merged.height, 2);
+        assert_eq!(merged.origin, [-0.5, -0.5, 0.0]);
+        assert_eq!(merged.data, vec![100, 0, 100, -1, 0, -1]);
+    }
+
+    #[test]
+    fn live_grid_with_non_aligned_origin_projects_onto_checkpoint_lattice() {
+        let checkpoint_resolution = 0.05000000074505806;
+        let mut checkpoint = OccupancyGrid::with_frame(2, 1, checkpoint_resolution, "map");
+        checkpoint.origin = [-0.0977304454380725, 0.0, 0.0];
+        checkpoint.data = vec![100, 0];
+        let mut live = OccupancyGrid::with_frame(1, 1, 0.05, "map");
+        live.origin = [0.0, 0.0, 0.0];
+        live.data = vec![100];
+
+        let merged = merge_checkpoint_grid(&checkpoint, &live)
+            .expect("fractional world origins must be projected onto one grid");
+
+        assert_eq!(merged.width, 3);
+        assert_eq!(merged.height, 1);
+        assert_eq!(merged.origin, checkpoint.origin);
+        assert_eq!(merged.data, vec![100, 0, 100]);
+    }
+
+    #[test]
+    fn loaded_checkpoint_commits_live_pointcloud_revision() {
+        let mut adapter = active_adapter(sample_config());
+        let mut checkpoint = OccupancyGrid::with_frame(2, 1, 0.1, "map");
+        checkpoint.origin = [-0.0977304454380725, 0.0, 0.0];
+        checkpoint.data = vec![100, 0];
+        let (checkpoint_map, _) = adapter
+            .install_checkpoint(checkpoint, 0)
+            .expect("install checkpoint");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        state.blocking_write().map = checkpoint_map;
+        let (map_revision_tx, mut map_revision_rx) = broadcast::channel(1);
+
+        adapter
+            .feed_pointcloud_session(
+                &[Point3::new(0.0, 0.0, 2.0)],
+                (0.0, 0.0),
+                16,
+                1_000_000_000,
+                "map",
+                1_000_000_000,
+            )
+            .expect("live pointcloud accepted");
+
+        assert!(adapter.build_and_publish(&state, Some(&map_revision_tx)));
+        let event = map_revision_rx
+            .try_recv()
+            .expect("live map revision broadcast");
+        assert!(event.revision > 1);
+        assert_eq!(state.blocking_read().map.revision, event.revision);
     }
 }

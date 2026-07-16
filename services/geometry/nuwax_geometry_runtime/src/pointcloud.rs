@@ -151,6 +151,40 @@ impl CloudMapShmWriter {
         self.publish_snapshot(true)
     }
 
+    pub(crate) fn validate_checkpoint(
+        &self,
+        voxel_size: f32,
+        point_count: u32,
+        xyz_f32_le: &[u8],
+    ) -> Result<(), String> {
+        decode_checkpoint_voxels(voxel_size, point_count, xyz_f32_le, self.max_points).map(|_| ())
+    }
+
+    /// Restore one persisted map-frame cloud checkpoint into the live voxel
+    /// accumulator and publish it as the first non-empty revision of the new
+    /// mapping generation. Subsequent lidar frames continue from these voxels.
+    pub(crate) fn install_checkpoint(
+        &mut self,
+        session_generation: u64,
+        voxel_size: f32,
+        point_count: u32,
+        xyz_f32_le: &[u8],
+    ) -> Result<(u64, u32, f32), String> {
+        if session_generation == 0 {
+            return Err("cloud-map checkpoint generation must be positive".to_string());
+        }
+        self.revision
+            .checked_add(1)
+            .ok_or_else(|| "cloud-map revision exhausted".to_string())?;
+        let voxels =
+            decode_checkpoint_voxels(voxel_size, point_count, xyz_f32_le, self.max_points)?;
+        self.session_generation = session_generation;
+        self.voxel_size = voxel_size;
+        self.voxels = voxels;
+        self.publish_snapshot(false)
+            .ok_or_else(|| "cloud-map checkpoint publication failed".to_string())
+    }
+
     fn publish_snapshot(&mut self, allow_empty: bool) -> Option<(u64, u32, f32)> {
         if self.session_generation == 0 || (!allow_empty && self.voxels.is_empty()) {
             return None;
@@ -265,6 +299,54 @@ impl CloudMapShmWriter {
         }
         !self.voxels.is_empty()
     }
+}
+
+fn decode_checkpoint_voxels(
+    voxel_size: f32,
+    point_count: u32,
+    xyz_f32_le: &[u8],
+    max_points: usize,
+) -> Result<HashSet<VoxelKey>, String> {
+    if !voxel_size.is_finite() || voxel_size <= 0.0 || voxel_size > MAX_VOXEL_SIZE {
+        return Err("cloud-map checkpoint voxel_size must be finite and positive".to_string());
+    }
+    let point_count = usize::try_from(point_count)
+        .map_err(|_| "cloud-map checkpoint point_count exceeds usize".to_string())?;
+    if point_count == 0 {
+        return Err("cloud-map checkpoint must contain at least one point".to_string());
+    }
+    if point_count > max_points || point_count > CM_MAX_POINTS {
+        return Err(format!(
+            "cloud-map checkpoint exceeds SHM capacity: points={point_count} max_points={}",
+            max_points.min(CM_MAX_POINTS)
+        ));
+    }
+    let expected_size = point_count
+        .checked_mul(CM_POINT_SIZE_BYTES)
+        .ok_or_else(|| "cloud-map checkpoint payload size overflow".to_string())?;
+    if xyz_f32_le.len() != expected_size {
+        return Err(format!(
+            "cloud-map checkpoint payload size mismatch: expected={expected_size} actual={}",
+            xyz_f32_le.len()
+        ));
+    }
+
+    let mut voxels = HashSet::with_capacity(point_count);
+    for (index, bytes) in xyz_f32_le.chunks_exact(CM_POINT_SIZE_BYTES).enumerate() {
+        let point = [
+            f32::from_le_bytes(bytes[0..4].try_into().unwrap()) as f64,
+            f32::from_le_bytes(bytes[4..8].try_into().unwrap()) as f64,
+            f32::from_le_bytes(bytes[8..12].try_into().unwrap()) as f64,
+        ];
+        let key = voxel_key(point, voxel_size).ok_or_else(|| {
+            format!("cloud-map checkpoint point {index} is non-finite or out of range")
+        })?;
+        voxels.insert(key);
+    }
+    if voxels.is_empty() {
+        return Err("cloud-map checkpoint contains no usable voxels".to_string());
+    }
+    Ok(voxels)
 }
 
 fn slot_metadata_offsets(slot: usize) -> Option<(usize, usize)> {
@@ -387,6 +469,34 @@ mod tests {
         assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 0);
         assert_eq!(read_u64(&writer.mmap, CM_SLOT0_REVISION_OFFSET), 3);
         assert_eq!(read_u32(&writer.mmap, CM_SLOT0_POINT_COUNT_OFFSET), 0);
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restored_checkpoint_accepts_later_live_frames() {
+        let path = test_path("checkpoint-restore");
+        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let checkpoint_points = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]];
+        let xyz_f32_le = checkpoint_points
+            .iter()
+            .flat_map(|point| point.iter())
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        let restored = writer
+            .install_checkpoint(7, VOXEL_SIZE, 2, &xyz_f32_le)
+            .expect("restore checkpoint");
+        assert_eq!(restored, (1, 2, VOXEL_SIZE));
+        assert_eq!(writer.session_generation, 7);
+        assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 2);
+
+        assert!(writer.accumulate_mapping_frame(7, &[Point3::new(2.025, 0.025, 0.025)]));
+        let continued = writer.commit_accumulated().expect("continued snapshot");
+        assert_eq!(continued, (2, 3, VOXEL_SIZE));
+        assert_eq!(read_u64(&writer.mmap, CM_GLOBAL_REVISION_OFFSET), 2);
+        assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 3);
 
         drop(writer);
         let _ = std::fs::remove_file(path);

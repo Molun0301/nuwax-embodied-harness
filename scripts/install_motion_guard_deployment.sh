@@ -371,6 +371,8 @@ check_systemd_owned_invariants() {
   grep -qF 'Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env' \
     "${GATEWAY_UNIT_SOURCE}" \
     || fail "Gateway unit does not pin the managed bootstrap environment"
+  ! grep -q '^RuntimeDirectory=' "${GUARD_UNIT_SOURCE}" \
+    || fail "motion guard must not own shared /run/nuwax as RuntimeDirectory"
   for assignment in \
       'NUWAX_CLOUDMAP_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap' \
       'NUWAX_OCCUPANCY_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap'; do

@@ -4724,7 +4724,7 @@ class PlatformGeometryRuntime:
         self,
         target_path: Path,
     ) -> Dict[str, object]:
-        """校验当前运行时已落盘的版本 PCD。"""
+        """将 live cloud-map mmap 原子导出为版本 PCD。"""
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         resolved_target = target_path.expanduser().resolve()
@@ -4743,12 +4743,88 @@ class PlatformGeometryRuntime:
             except Exception:
                 LOGGER.debug("删除无效版本 PCD 失败：%s", resolved_target, exc_info=True)
 
-        return {
-            "pcd_present": False,
-            "pcd_source_kind": "unavailable",
-            "pcd_source_path": None,
-            "pcd_target_path": str(resolved_target),
-        }
+        from services.geometry.pointcloud_map import (
+            CloudMapMmapReader,
+            write_pcd_binary_xyz,
+        )
+        import numpy as np
+
+        source_path = Path(
+            os.environ.get("NUWAX_CLOUDMAP_SHM_PATH", "/tmp/nuwax_cloudmap.mmap")
+        ).expanduser()
+        reader = CloudMapMmapReader(str(source_path))
+        temporary_path = resolved_target.with_name(
+            ".%s.%d.%d.tmp"
+            % (resolved_target.name, os.getpid(), time.time_ns())
+        )
+        try:
+            max_points = CloudMapMmapReader.SINGLE_BUFFER_SIZE // (3 * 4)
+            stable = None
+            voxel_size = None
+            for _ in range(3):
+                candidate = reader.read_stable(max_points=max_points)
+                header = reader.read_header()
+                if (
+                    candidate is not None
+                    and header is not None
+                    and int(header[5]) == int(candidate[0])
+                ):
+                    stable = candidate
+                    voxel_size = float(header[6])
+                    break
+            if stable is None:
+                raise RuntimeError("live cloud-map mmap 当前没有稳定 revision。")
+            revision, point_count, xyz_bytes = stable
+            if point_count < self._pcd_min_points():
+                raise RuntimeError(
+                    "live cloud-map 点数不足：%d < %d"
+                    % (point_count, self._pcd_min_points())
+                )
+            if len(xyz_bytes) != point_count * 12:
+                raise RuntimeError(
+                    "live cloud-map payload 大小不匹配：points=%d bytes=%d"
+                    % (point_count, len(xyz_bytes))
+                )
+            if voxel_size is None or not np.isfinite(voxel_size) or voxel_size <= 0.0:
+                raise RuntimeError("live cloud-map voxel_size 非法。")
+            points_xyz = np.frombuffer(xyz_bytes, dtype="<f4").reshape(point_count, 3)
+            if not bool(np.isfinite(points_xyz).all()):
+                raise RuntimeError("live cloud-map 包含非有限坐标。")
+
+            write_pcd_binary_xyz(temporary_path, points_xyz)
+            os.replace(temporary_path, resolved_target)
+            if not self._is_usable_pcd_file(resolved_target):
+                raise RuntimeError("导出的版本 PCD 未通过点数或文件完整性校验。")
+            target_metadata = self._file_metadata(resolved_target)
+            xyz_sha256 = hashlib.sha256(xyz_bytes).hexdigest()
+            pcd_sha256 = hashlib.sha256(resolved_target.read_bytes()).hexdigest()
+            return {
+                "pcd_present": True,
+                "pcd_source_kind": "live_cloud_map_mmap",
+                "pcd_source_path": str(source_path.resolve(strict=False)),
+                "pcd_target_path": str(resolved_target),
+                "pcd_target": target_metadata,
+                "cloud_revision": int(revision),
+                "point_count": int(point_count),
+                "voxel_size": float(voxel_size),
+                "xyz_sha256": xyz_sha256,
+                "pcd_sha256": pcd_sha256,
+            }
+        except Exception as exc:
+            LOGGER.warning("导出 live cloud-map PCD 失败：%s", exc)
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except Exception:
+                LOGGER.debug("清理临时 PCD 失败：%s", temporary_path, exc_info=True)
+            return {
+                "pcd_present": False,
+                "pcd_source_kind": "live_cloud_map_mmap_unavailable",
+                "pcd_source_path": str(source_path.resolve(strict=False)),
+                "pcd_target_path": str(resolved_target),
+                "error": str(exc),
+            }
+        finally:
+            reader.close()
 
     def _build_geometry_quality_metrics(
         self,
@@ -4763,7 +4839,19 @@ class PlatformGeometryRuntime:
         database_present = bool(database_metadata.get("database_present", False))
         external_stack = self._uses_external_geometry_stack()
         nav2_map_present = bool(nav2_map_metadata.get("present", False))
-        database_required = not external_stack
+        remote_provider = getattr(self, "_remote_provider", None)
+        native_checkpoint_switch_supported = bool(
+            not external_stack
+            and remote_provider is not None
+            and getattr(remote_provider, "is_connected", False)
+            and callable(
+                getattr(remote_provider, "activate_platform_map_version", None)
+            )
+        )
+        native_checkpoint_ready = bool(
+            native_checkpoint_switch_supported and nav2_map_present
+        )
+        database_required = not external_stack and not native_checkpoint_ready
         pcd_present = bool(pcd_metadata.get("pcd_present", False))
         readiness = self._build_mapping_readiness()
         live_source = database_metadata.get("database_source_kind") == "live_runtime"
@@ -4794,7 +4882,15 @@ class PlatformGeometryRuntime:
                     "message": "地图版本缺少导航地图资产，无法加载定位状态。",
                 }
             )
-        if not database_present and not database_required:
+        if native_checkpoint_ready and not database_present:
+            diagnostics.append(
+                {
+                    "level": "info",
+                    "code": "native_occupancy_checkpoint_ready",
+                    "message": "导航地图快照可由 native Geometry runtime 作为可恢复 checkpoint 激活。",
+                }
+            )
+        elif not database_present and not database_required:
             diagnostics.append(
                 {
                     "level": "info" if nav2_map_present else "warning",
@@ -4839,7 +4935,10 @@ class PlatformGeometryRuntime:
                 }
             )
         # status="ready" 必须 backend checkpoint 与导航地图同时就位。
-        if external_stack:
+        if native_checkpoint_ready:
+            backend_checkpoint_ready = True
+            status = "ready"
+        elif external_stack:
             backend_checkpoint_ready = bool(database_present)
             ready_for_load = backend_checkpoint_ready and nav2_map_present
             if ready_for_load:
@@ -4857,10 +4956,15 @@ class PlatformGeometryRuntime:
             "checkpoint_ready": backend_checkpoint_ready,
             "backend_checkpoint_ready": backend_checkpoint_ready,
             "navigation_map_present": nav2_map_present,
-            "platform_snapshot_only": bool(external_stack and not backend_checkpoint_ready),
-            "backend_switch_supported": True,
+            "platform_snapshot_only": bool(
+                nav2_map_present and not backend_checkpoint_ready
+            ),
+            "backend_switch_supported": bool(
+                native_checkpoint_switch_supported or external_stack
+            ),
             "source_mode": (
                 "live_streaming_checkpoint" if live_streaming_ready
+                else "native_occupancy_checkpoint" if native_checkpoint_ready
                 else "mapping_database_checkpoint" if external_stack and backend_checkpoint_ready
                 else "navigation_map_checkpoint" if external_stack and nav2_map_present
                 else "platform_snapshot_only" if external_stack
@@ -4883,6 +4987,11 @@ class PlatformGeometryRuntime:
                 "source_kind": pcd_metadata.get("pcd_source_kind"),
                 "source_path": pcd_metadata.get("pcd_source_path"),
                 "target_path": pcd_metadata.get("pcd_target_path"),
+                "cloud_revision": pcd_metadata.get("cloud_revision"),
+                "point_count": pcd_metadata.get("point_count"),
+                "voxel_size": pcd_metadata.get("voxel_size"),
+                "xyz_sha256": pcd_metadata.get("xyz_sha256"),
+                "pcd_sha256": pcd_metadata.get("pcd_sha256"),
                 "quality": "present" if pcd_present else "unknown",
             },
             "navigation_map": {
@@ -5214,26 +5323,53 @@ class PlatformGeometryRuntime:
                 "backend_mode": "live_streaming_only",
             }
         mapping_backend = self._resolve_mapping_backend()
-        if mapping_backend is not None and mapping_backend is not self._remote_provider:
+        if mapping_backend is not None:
             activator = getattr(mapping_backend, "activate_platform_map_version", None)
             if callable(activator):
-                result = activator(
-                    map_name=version.map_name,
-                    version_id=version.version_id,
-                    geometry_asset=geometry_asset.model_dump(mode="json") if geometry_asset is not None else None,
-                    metadata={
+                activation_kwargs = {
+                    "map_name": version.map_name,
+                    "version_id": version.version_id,
+                    "geometry_asset": geometry_asset.model_dump(mode="json") if geometry_asset is not None else None,
+                    "metadata": {
                         "source_name": version.source_name,
                         "source_version_id": version.source_version_id,
                     },
+                }
+                if mapping_backend is self._remote_provider:
+                    activation_kwargs["occupancy_grid"] = version.snapshot.occupancy_grid
+                result = activator(
+                    **activation_kwargs,
                 )
                 if isinstance(result, dict):
                     cloned_result = self._clone_metadata(result)
                     backend_switch_applied = bool(cloned_result.get("backend_switch_applied", True))
-                    return {
+                    activation_result = {
                         **activation_payload,
                         **cloned_result,
                         "backend_switch_applied": backend_switch_applied,
                     }
+                    if mapping_backend is self._remote_provider and backend_switch_applied:
+                        session_id = str(
+                            activation_result.get("mapping_session_id")
+                            or activation_result.get("session_id")
+                            or ""
+                        ).strip()
+                        if not session_id:
+                            return {
+                                **activation_result,
+                                "backend_switch_applied": False,
+                                "reason": "backend_activation_session_missing",
+                            }
+                        self._ensure_mapping_lifecycle_fields()
+                        with self._mapping_lifecycle_lock:
+                            self._mapping_session_context = {
+                                **dict(activation_result),
+                                "session_id": session_id,
+                                "map_name": version.map_name,
+                                "map_version_id": version.version_id,
+                                "active": True,
+                            }
+                    return activation_result
                 return {
                     **activation_payload,
                     "backend_switch_applied": True,

@@ -48,6 +48,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tonic::transport::Server;
 use tracing::{error, info};
 
+const GRPC_MESSAGE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+
 pub mod proto {
     tonic::include_proto!("nuwax.geometry");
 }
@@ -306,9 +308,11 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind) -> ExitCode {
     };
     let mut server_task = tokio::spawn(async move {
         Server::builder()
-            .add_service(proto::geometry_runtime_server::GeometryRuntimeServer::new(
-                service,
-            ))
+            .add_service(
+                proto::geometry_runtime_server::GeometryRuntimeServer::new(service)
+                    .max_decoding_message_size(GRPC_MESSAGE_LIMIT_BYTES)
+                    .max_encoding_message_size(GRPC_MESSAGE_LIMIT_BYTES),
+            )
             .serve_with_incoming_shutdown(incoming, graceful_shutdown)
             .await
     });

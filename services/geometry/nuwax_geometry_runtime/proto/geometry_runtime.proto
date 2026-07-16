@@ -105,6 +105,24 @@ message MappingSessionState {
   bool idempotent_replay = 10;
 }
 
+message CloudMapCheckpoint {
+  string frame_id = 1;
+  uint64 source_revision = 2;
+  uint32 point_count = 3;
+  float voxel_size = 4;
+  bytes xyz_f32_le = 5;
+  string xyz_sha256 = 6;
+  uint32 payload_schema_version = 7;
+}
+
+message ActivateMapVersionRequest {
+  string session_id = 1;
+  string map_name = 2;
+  string map_version_id = 3;
+  OccupancyGridData checkpoint = 4;
+  CloudMapCheckpoint cloud_checkpoint = 5;
+}
+
 // === 视频帧共享内存 ===
 message VideoFrameShmRef {
   string shm_path = 1;
@@ -346,6 +364,7 @@ service GeometryRuntime {
   rpc StartMapping(StartMappingRequest) returns (MappingSessionState);
   rpc StopMapping(StopMappingRequest) returns (MappingSessionState);
   rpc GetMappingState(Empty) returns (MappingSessionState);
+  rpc ActivateMapVersion(ActivateMapVersionRequest) returns (MappingSessionState);
 
   // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
   rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);

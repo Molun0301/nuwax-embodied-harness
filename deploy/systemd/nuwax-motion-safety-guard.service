@@ -12,9 +12,9 @@ User=nuwax-motion-guard
 Group=nuwax-motion-guard
 SupplementaryGroups=nuwax-motion-clients
 WorkingDirectory=@NUWAX_REPO_ROOT@
-RuntimeDirectory=nuwax
-RuntimeDirectoryMode=0750
-RuntimeDirectoryPreserve=restart
+# /run/nuwax is shared and provisioned by nuwax-motion.conf tmpfiles. This
+# unit must not claim the parent as RuntimeDirectory: systemd would recursively
+# chown it on start and remove every service's runtime subdirectory on stop.
 StateDirectory=nuwax/motion-guard
 StateDirectoryMode=0700
 UMask=0007

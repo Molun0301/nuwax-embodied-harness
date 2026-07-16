@@ -204,6 +204,80 @@ fn mapping_lifecycle_status(error: crate::mapping_adapter::MappingLifecycleError
     }
 }
 
+fn decode_checkpoint_grid(
+    checkpoint: OccupancyGridData,
+) -> Result<nuwax_mapping::OccupancyGrid, String> {
+    let meta = checkpoint
+        .meta
+        .ok_or_else(|| "checkpoint.meta is required".to_string())?;
+    if meta.width == 0 || meta.height == 0 {
+        return Err("checkpoint width/height must be positive".to_string());
+    }
+    let expected_size = (meta.width as usize)
+        .checked_mul(meta.height as usize)
+        .ok_or_else(|| "checkpoint dimensions overflow".to_string())?;
+    if checkpoint.data.len() != expected_size {
+        return Err(format!(
+            "checkpoint data size mismatch: expected={} actual={}",
+            expected_size,
+            checkpoint.data.len()
+        ));
+    }
+    if !meta.resolution.is_finite() || meta.resolution <= 0.0 {
+        return Err("checkpoint resolution must be finite and positive".to_string());
+    }
+    let frame_id = meta.frame_id.trim().trim_start_matches('/');
+    if frame_id != "map" {
+        return Err(format!(
+            "checkpoint frame must be map, received {}",
+            meta.frame_id
+        ));
+    }
+    let data = checkpoint
+        .data
+        .into_iter()
+        .map(|value| value as i8)
+        .collect::<Vec<_>>();
+    if data.iter().any(|value| !(-1..=100).contains(value)) {
+        return Err("checkpoint occupancy values must be within [-1, 100]".to_string());
+    }
+    let mut grid = nuwax_mapping::OccupancyGrid::with_frame(
+        meta.width,
+        meta.height,
+        f64::from(meta.resolution),
+        frame_id,
+    );
+    grid.origin = [meta.origin_x, meta.origin_y, 0.0];
+    grid.ts = meta.timestamp_ns as f64 / 1_000_000_000.0;
+    grid.data = data;
+    Ok(grid)
+}
+
+fn validate_cloud_checkpoint_metadata(checkpoint: &CloudMapCheckpoint) -> Result<(), String> {
+    let frame_id = checkpoint.frame_id.trim().trim_start_matches('/');
+    if frame_id != "map" {
+        return Err(format!(
+            "cloud-map checkpoint frame must be map, received {}",
+            checkpoint.frame_id
+        ));
+    }
+    if checkpoint.payload_schema_version != crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported cloud-map checkpoint schema: expected={} actual={}",
+            crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
+            checkpoint.payload_schema_version
+        ));
+    }
+    let checksum = checkpoint.xyz_sha256.trim();
+    if checksum.len() != 64
+        || !checksum.bytes().all(|value| value.is_ascii_hexdigit())
+        || crate::map_checksum::sha256_hex(&checkpoint.xyz_f32_le) != checksum.to_ascii_lowercase()
+    {
+        return Err("cloud-map checkpoint xyz_sha256 mismatch".to_string());
+    }
+    Ok(())
+}
+
 fn exploration_state_from_snapshot(
     snapshot: crate::explore_runtime::ExploreRuntimeSnapshot,
 ) -> ExplorationState {
@@ -941,6 +1015,163 @@ impl GeometryRuntime for GeometryRuntimeService {
         Ok(Response::new(mapping_session_state(
             snapshot,
             "mapping session state",
+        )))
+    }
+
+    async fn activate_map_version(
+        &self,
+        req: Request<ActivateMapVersionRequest>,
+    ) -> Result<Response<MappingSessionState>, Status> {
+        let mut request = req.into_inner();
+        if request.session_id.trim().is_empty()
+            || request.map_name.trim().is_empty()
+            || request.map_version_id.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "session_id, map_name and map_version_id must not be empty",
+            ));
+        }
+        if !self.bridge.lcm_backend_available {
+            return Err(Status::unavailable("mapping LCM backend is unavailable"));
+        }
+        let checkpoint = decode_checkpoint_grid(
+            request
+                .checkpoint
+                .take()
+                .ok_or_else(|| Status::invalid_argument("checkpoint is required"))?,
+        )
+        .map_err(Status::invalid_argument)?;
+        let cloud_checkpoint = request.cloud_checkpoint.take();
+        if let Some(checkpoint) = cloud_checkpoint.as_ref() {
+            validate_cloud_checkpoint_metadata(checkpoint).map_err(Status::invalid_argument)?;
+            let writer = self.bridge.cloud_map_writer.lock();
+            let writer = writer
+                .as_ref()
+                .ok_or_else(|| Status::unavailable("cloud-map SHM writer is unavailable"))?;
+            writer
+                .validate_checkpoint(
+                    checkpoint.voxel_size,
+                    checkpoint.point_count,
+                    &checkpoint.xyz_f32_le,
+                )
+                .map_err(Status::invalid_argument)?;
+        }
+        let exploration = self.bridge.explore.snapshot();
+        if !matches!(
+            exploration.status,
+            crate::explore_runtime::STATUS_IDLE
+                | crate::explore_runtime::STATUS_STOPPED
+                | crate::explore_runtime::STATUS_SUCCEEDED
+                | crate::explore_runtime::STATUS_CANCELLED
+        ) {
+            return Err(Status::failed_precondition(format!(
+                "StopExploration exact terminal required before ActivateMapVersion: status={} request_id={}",
+                exploration.status, exploration.request_id
+            )));
+        }
+        let adapter = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
+            .clone();
+        let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
+
+        let current = adapter.lock().snapshot();
+        if current.active
+            && current.session_id == request.session_id
+            && current.map_name == request.map_name
+            && current.map_version_id == request.map_version_id
+            && current.revision > 0
+        {
+            let mut replay = current;
+            replay.idempotent_replay = true;
+            return Ok(Response::new(mapping_session_state(
+                replay,
+                "map checkpoint already active",
+            )));
+        }
+
+        let started = adapter
+            .lock()
+            .start_session(
+                &request.session_id,
+                &request.map_name,
+                &request.map_version_id,
+            )
+            .map_err(mapping_lifecycle_status)?;
+        if let Some(writer) = &self.bridge.occupancy_shm {
+            if let Err(error) = writer.lock().begin_session(started.session_generation) {
+                let _ = adapter.lock().stop_session(&started.session_id);
+                return Err(Status::internal(format!(
+                    "occupancy SHM checkpoint fence failed: {error}"
+                )));
+            }
+        }
+        let revision_floor = self.bridge.state.read().await.map.revision;
+        let (map, event) = match adapter
+            .lock()
+            .install_checkpoint(checkpoint, revision_floor)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = adapter.lock().stop_session(&started.session_id);
+                return Err(Status::invalid_argument(error));
+            }
+        };
+        let cloud_update = if let Some(checkpoint) = cloud_checkpoint.as_ref() {
+            let installed = {
+                let mut writer = self.bridge.cloud_map_writer.lock();
+                let writer = writer.as_mut().ok_or_else(|| {
+                    Status::unavailable("cloud-map SHM writer became unavailable")
+                })?;
+                writer.install_checkpoint(
+                    started.session_generation,
+                    checkpoint.voxel_size,
+                    checkpoint.point_count,
+                    &checkpoint.xyz_f32_le,
+                )
+            };
+            let (revision, point_count, voxel_size) = match installed {
+                Ok(installed) => installed,
+                Err(error) => {
+                    let _ = adapter.lock().stop_session(&started.session_id);
+                    return Err(Status::internal(format!(
+                        "cloud-map checkpoint install failed after validation: {error}"
+                    )));
+                }
+            };
+            Some(CloudMapNotification {
+                revision,
+                point_count,
+                voxel_size,
+                session_generation: started.session_generation,
+            })
+        } else {
+            None
+        };
+        {
+            let mut shared = self.bridge.state.write().await;
+            shared.map = map;
+            if let Some(update) = cloud_update.as_ref() {
+                shared.cloud_map_revision = update.revision;
+            }
+        }
+        self.bridge.map_revision_latest_tx.send_replace(None);
+        *self.bridge.occupancy_shm_current.write().await = None;
+        if let Some(update) = cloud_update {
+            let _ = self.bridge.cloud_map_tx.send(update);
+        } else {
+            let _ = self
+                .bridge
+                .begin_cloud_map_session(started.session_generation)
+                .await;
+        }
+        let _ = self.bridge.map_revision_tx.send(event);
+        let snapshot = adapter.lock().snapshot();
+        Ok(Response::new(mapping_session_state(
+            snapshot,
+            "map checkpoint activated",
         )))
     }
 
@@ -2465,6 +2696,92 @@ mod lifecycle_tests {
             .into_inner();
         assert_eq!(stopped.phase, "STOPPED");
         assert!(!stopped.active);
+    }
+
+    #[tokio::test]
+    async fn activate_map_version_commits_checkpoint_and_start_mapping_reuses_session() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let cloud_path = std::env::temp_dir().join(format!(
+            "nuwax-activate-cloud-test-{}-{}.mmap",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        *handle.cloud_map_writer.lock() = Some(
+            crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("test cloud-map writer"),
+        );
+        let service = GeometryRuntimeService::new(handle.clone());
+        let mut revision_rx = handle.map_revision_tx.subscribe();
+        let mut cloud_revision_rx = handle.cloud_map_tx.subscribe();
+        let cloud_xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
+            .iter()
+            .flat_map(|point| point.iter())
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        let activated = GeometryRuntime::activate_map_version(
+            &service,
+            Request::new(ActivateMapVersionRequest {
+                session_id: "mapload:one".to_string(),
+                map_name: "warehouse".to_string(),
+                map_version_id: "mapver_000001".to_string(),
+                checkpoint: Some(OccupancyGridData {
+                    meta: Some(OccupancyGridMeta {
+                        width: 2,
+                        height: 2,
+                        resolution: 0.05,
+                        origin_x: -1.0,
+                        origin_y: 2.0,
+                        frame_id: "map".to_string(),
+                        revision: 119,
+                        timestamp_ns: 1_700_000_000_000_000_000,
+                    }),
+                    data: vec![u8::MAX, 0, 100, 50],
+                }),
+                cloud_checkpoint: Some(CloudMapCheckpoint {
+                    frame_id: "map".to_string(),
+                    source_revision: 119,
+                    point_count: 2,
+                    voxel_size: crate::pointcloud::VOXEL_SIZE,
+                    xyz_sha256: crate::map_checksum::sha256_hex(&cloud_xyz),
+                    xyz_f32_le: cloud_xyz,
+                    payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
+                }),
+            }),
+        )
+        .await
+        .expect("ActivateMapVersion")
+        .into_inner();
+
+        assert!(activated.success);
+        assert!(activated.active);
+        assert_eq!(activated.phase, "ACTIVE");
+        assert_eq!(activated.map_version_id, "mapver_000001");
+        assert!(activated.revision > 0);
+        let event = revision_rx.recv().await.expect("checkpoint revision event");
+        assert_eq!(event.session_id, "mapload:one");
+        assert_eq!(event.map_version_id, "mapver_000001");
+        assert_eq!(event.data.as_ref(), &[u8::MAX, 0, 100, 50]);
+        let cloud_event = cloud_revision_rx
+            .recv()
+            .await
+            .expect("cloud checkpoint revision event");
+        assert_eq!(cloud_event.point_count, 2);
+        assert_eq!(cloud_event.session_generation, activated.session_generation);
+        let shared = handle.state.read().await;
+        assert_eq!(shared.map.data, vec![-1, 0, 100, 50]);
+        assert_eq!(shared.cloud_map_revision, cloud_event.revision);
+        drop(shared);
+
+        let replay = start_mapping_session(&service, "mapload:one", "mapver_000001").await;
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.revision, activated.revision);
+        assert_eq!(handle.state.read().await.map.data, vec![-1, 0, 100, 50]);
+        let _ = std::fs::remove_file(cloud_path);
     }
 
     #[tokio::test]

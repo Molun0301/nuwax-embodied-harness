@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import math
 import os
+from pathlib import Path
 import threading
 import time
 import uuid
@@ -1712,6 +1714,186 @@ class GeometryRuntimeProvider:
                 "StartMapping 完成时 mapping transition 已被断连或新代际取代。"
             )
         return payload
+
+    def activate_platform_map_version(
+        self,
+        *,
+        map_name: str,
+        version_id: str,
+        geometry_asset=None,
+        metadata=None,
+        occupancy_grid: OccupancyGrid,
+    ) -> Dict[str, Any]:
+        del metadata
+        self._raise_if_stopping("activate_platform_map_version")
+        if not self._connected or not self._stub:
+            raise RuntimeError("Geometry runtime 未连接。")
+        if occupancy_grid is None:
+            raise RuntimeError("地图版本缺少可激活的 OccupancyGrid checkpoint。")
+        map_name = str(map_name or "").strip()
+        version_id = str(version_id or "").strip()
+        if not map_name or not version_id:
+            raise ValueError("map_name and version_id must not be empty")
+        frame_id = str(occupancy_grid.frame_id or "").strip().lstrip("/")
+        if frame_id != "map":
+            raise ValueError(
+                "native map checkpoint frame must be map, received %s" % frame_id
+            )
+        values = [int(value) for value in occupancy_grid.data]
+        if any(value < -1 or value > 100 for value in values):
+            raise ValueError("occupancy checkpoint values must be within [-1, 100]")
+        encoded = bytes(value if value >= 0 else value + 256 for value in values)
+        timestamp = getattr(occupancy_grid, "timestamp", None)
+        timestamp_ns = int(timestamp.timestamp() * 1_000_000_000) if timestamp else 0
+        origin = occupancy_grid.origin.position
+        asset_payload = geometry_asset
+        if asset_payload is not None and not isinstance(asset_payload, dict):
+            dumper = getattr(asset_payload, "model_dump", None)
+            asset_payload = dumper(mode="json") if callable(dumper) else None
+        asset_payload = dict(asset_payload or {})
+        pcd_path_value = str(asset_payload.get("pcd_path") or "").strip()
+        cloud_checkpoint = None
+        if pcd_path_value:
+            pcd_path = Path(pcd_path_value).expanduser()
+            if pcd_path.is_file():
+                import numpy as np
+
+                from services.geometry.pointcloud_map import read_pcd_xyz
+
+                try:
+                    _header, points_xyz = read_pcd_xyz(pcd_path)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "读取历史地图 3D PCD checkpoint 失败：%s" % exc
+                    ) from exc
+                points_xyz = np.asarray(points_xyz, dtype="<f4", order="C")
+                finite_mask = np.isfinite(points_xyz).all(axis=1)
+                if not bool(finite_mask.all()):
+                    points_xyz = np.asarray(
+                        points_xyz[finite_mask], dtype="<f4", order="C"
+                    )
+                if points_xyz.ndim != 2 or points_xyz.shape[1] != 3 or not points_xyz.size:
+                    raise RuntimeError("历史地图 3D PCD checkpoint 没有可用 XYZ 点。")
+                point_count = int(points_xyz.shape[0])
+                if point_count > 0xFFFF_FFFF:
+                    raise RuntimeError("历史地图 3D PCD checkpoint 点数超过 uint32。")
+                xyz_f32_le = points_xyz.tobytes(order="C")
+                xyz_sha256 = hashlib.sha256(xyz_f32_le).hexdigest()
+                quality_metrics = dict(asset_payload.get("quality_metrics") or {})
+                pcd_quality = dict(quality_metrics.get("pcd") or {})
+                expected_sha256 = str(pcd_quality.get("xyz_sha256") or "").strip()
+                if expected_sha256 and expected_sha256 != xyz_sha256:
+                    raise RuntimeError("历史地图 3D PCD checkpoint SHA256 校验失败。")
+                try:
+                    voxel_size = float(pcd_quality.get("voxel_size") or 0.05)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("历史地图 3D PCD voxel_size 非法。") from exc
+                if not math.isfinite(voxel_size) or voxel_size <= 0.0:
+                    raise RuntimeError("历史地图 3D PCD voxel_size 必须为正有限数。")
+                try:
+                    source_revision = max(
+                        0, int(pcd_quality.get("cloud_revision") or 0)
+                    )
+                except (TypeError, ValueError):
+                    source_revision = 0
+                cloud_frame_id = str(
+                    asset_payload.get("frame_id") or frame_id
+                ).strip().lstrip("/")
+                if cloud_frame_id != "map":
+                    raise ValueError(
+                        "native cloud checkpoint frame must be map, received %s"
+                        % cloud_frame_id
+                    )
+                cloud_checkpoint = pb2.CloudMapCheckpoint(
+                    frame_id=cloud_frame_id,
+                    source_revision=source_revision,
+                    point_count=point_count,
+                    voxel_size=voxel_size,
+                    xyz_f32_le=xyz_f32_le,
+                    xyz_sha256=xyz_sha256,
+                    payload_schema_version=1,
+                )
+        current_identity = self._mapping_identity
+        session_id = (
+            current_identity[0]
+            if current_identity is not None and current_identity[1] == version_id
+            else "mapload:%s" % uuid.uuid4().hex
+        )
+        request = pb2.ActivateMapVersionRequest(
+            session_id=session_id,
+            map_name=map_name,
+            map_version_id=version_id,
+            checkpoint=pb2.OccupancyGridData(
+                meta=pb2.OccupancyGridMeta(
+                    width=int(occupancy_grid.width),
+                    height=int(occupancy_grid.height),
+                    resolution=float(occupancy_grid.resolution_m),
+                    origin_x=float(origin.x),
+                    origin_y=float(origin.y),
+                    frame_id=frame_id,
+                    revision=0,
+                    timestamp_ns=max(0, timestamp_ns),
+                ),
+                data=encoded,
+            ),
+        )
+        if cloud_checkpoint is not None:
+            request.cloud_checkpoint.CopyFrom(cloud_checkpoint)
+        transition_epoch = self._begin_mapping_transition()
+        try:
+            response = self._stub.ActivateMapVersion(
+                request,
+                timeout=_heavy_deadline_sec(),
+            )
+            payload = self._mapping_state_payload(response)
+            if (
+                not payload["success"]
+                or payload["phase"] != "ACTIVE"
+                or not payload["active"]
+                or payload["session_id"] != session_id
+                or payload["map_name"] != map_name
+                or payload["map_version_id"] != version_id
+                or payload["session_generation"] <= 0
+                or payload["revision"] <= 0
+            ):
+                raise RuntimeError("ActivateMapVersion 未返回匹配的 ACTIVE checkpoint 会话。")
+            identity = self._mapping_identity_from_payload(payload)
+        except Exception:
+            self._finish_mapping_transition(transition_epoch)
+            raise
+        if not self._finish_mapping_transition(
+            transition_epoch,
+            identity=identity,
+        ):
+            raise RuntimeError(
+                "ActivateMapVersion 完成时 mapping transition 已被断连或新代际取代。"
+            )
+        return {
+            **payload,
+            "backend_switch_applied": True,
+            "backend_mode": (
+                "native_map_checkpoint"
+                if cloud_checkpoint is not None
+                else "native_occupancy_checkpoint"
+            ),
+            "checkpoint_kind": (
+                "occupancy_grid+cloud_map"
+                if cloud_checkpoint is not None
+                else "occupancy_grid"
+            ),
+            "cloud_checkpoint_present": cloud_checkpoint is not None,
+            "cloud_checkpoint_point_count": (
+                int(cloud_checkpoint.point_count)
+                if cloud_checkpoint is not None
+                else 0
+            ),
+            "cloud_source_revision": (
+                int(cloud_checkpoint.source_revision)
+                if cloud_checkpoint is not None
+                else 0
+            ),
+            "mapping_session_id": payload["session_id"],
+        }
 
     def stop_mapping(self, *, session_id: str, reason: str = "") -> Dict[str, Any]:
         self._raise_if_stopping("stop_mapping")

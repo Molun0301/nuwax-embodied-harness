@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
+import mmap
 from pathlib import Path
+import struct
 import threading
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -470,11 +472,6 @@ def _parse_positive_int(value: Optional[str], *, default: int) -> int:
         parsed = default
     return max(0, parsed)
 
-
-import mmap
-import struct
-
-
 class CloudMapMmapReader:
     """读取 Rust bridge 写入的累积地图双缓冲 mmap。"""
 
@@ -483,6 +480,10 @@ class CloudMapMmapReader:
     SINGLE_BUFFER_SIZE = 16 * 1024 * 1024  # 16MB
     HEADER_FMT = "<QIIIQQf"
     HEADER_STRUCT_SIZE = struct.calcsize(HEADER_FMT)  # 40 bytes
+    SLOT_METADATA_FMT = "<QI"
+    SLOT_METADATA_SIZE = struct.calcsize(SLOT_METADATA_FMT)  # 12 bytes
+    SLOT_METADATA_OFFSET = HEADER_STRUCT_SIZE
+    SLOT_METADATA_VERSION = 2
 
     def __init__(self, shm_path: str = "/tmp/nuwax_cloudmap.mmap"):
         self._path = Path(shm_path)
@@ -521,38 +522,52 @@ class CloudMapMmapReader:
             return None
         return vals
 
+    def _read_slot_metadata(self, slot: int) -> Optional[Tuple[int, int]]:
+        if slot not in (0, 1) or self._mm is None:
+            return None
+        offset = self.SLOT_METADATA_OFFSET + slot * self.SLOT_METADATA_SIZE
+        raw = self._mm[offset : offset + self.SLOT_METADATA_SIZE]
+        if len(raw) != self.SLOT_METADATA_SIZE:
+            return None
+        revision, point_count = struct.unpack(self.SLOT_METADATA_FMT, raw)
+        return int(revision), int(point_count)
+
     def read_stable(self, max_points: int = 60000) -> Optional[Tuple[int, int, bytes]]:
         """读取最新已发布的点云数据。返回 (revision, point_count, xyz_bytes) 或 None。
 
-        seqlock 读侧校验：读 header(rev1)→读推算 buffer 的数据→再读 header(rev2)，
-        若 revision 在读取期间变化则重试，上限 3 次。与 Rust 写侧 fence(Release) 后最后
-        发布 revision（pointcloud.rs write_cloud_map）配套，消除撕裂读。
-
-        关键（fix-mmap4）：buffer 选择**不读 header 的 active_buf 字段**，改用双读一致的
-        revision 自己推算 `read_buf = (revision - 1) % 2`（与写侧 active_buf=((rev-1)%2)
-        同一公式）。原因：active_buf/point_count 字段（pointcloud.rs:74-75）先于 revision
-        (:81) 写入，未被 fence(Release) 保护；一次 read_header 的非原子 unpack 可能读到
-        “新 active_buf + 旧 revision”交错态，用新 active_buf 去读 writer 正在写的当前帧
-        buffer，且双读 revision 仍见旧值（误判一致）→ 撕裂。改用 revision 推算后，buffer
-        选择与发布点严格同源：双读 revision 一致==R ⟹ 帧 R 已发布、其 buffer (R-1)%2 完整；
-        writer 当前写帧 R+1 的另一个 buffer R%2，不碰 (R-1)%2；要帧 R+2 才回头覆盖，届时
-        revision 已 advance，下方双读必捕获并重试。
-        point_count 偏差无害：双读 revision==R 时它至多取到 R 或抢跑的 R+1 帧值，二者下
-        reader 读的 (R-1)%2 buffer 均静默（帧 R+1 写另一 buffer），多读的字节是同 buffer
-        历史有效点（累积地图单调增长），且写侧保证单帧 count*12<=16MB 不会溢出到另一 buffer。
+        v2 使用 global revision 推算 slot，并在读数据前后验证该 slot 的
+        revision 与 global revision 相同。slot 自带 point_count，因此不会把
+        下一帧抢跑写入的全局 point_count 误用到已发布 buffer。v1 仍保留
+        原 global revision + point_count 双读逻辑。
         """
         for _ in range(3):
             header = self.read_header()
             if header is None:
                 return None
-            _, _, _active_buf, point_count, _, revision, _ = header
-            if revision == 0 or point_count == 0:
+            _, version, _active_buf, legacy_point_count, _, revision, _ = header
+            if revision == 0:
                 return None
-            # 用双读一致的 revision 推算 buffer(而非读 active_buf 字段,后者先于 revision 发布有交错窗口)
             read_buf = (revision - 1) % 2
+            slot_metadata = None
+            if version >= self.SLOT_METADATA_VERSION:
+                slot_metadata = self._read_slot_metadata(read_buf)
+                if slot_metadata is None or slot_metadata[0] != revision:
+                    continue
+                point_count = slot_metadata[1]
+            else:
+                point_count = legacy_point_count
+                if point_count == 0:
+                    return None
+
+            max_buffer_points = self.SINGLE_BUFFER_SIZE // (3 * 4)
+            if point_count > max_buffer_points:
+                return None
             buf_offset = self.HEADER_SIZE + read_buf * self.SINGLE_BUFFER_SIZE
             assert self._mm is not None
-            if point_count > max_points:
+            if point_count == 0:
+                actual_count = 0
+                xyz_bytes = b""
+            elif point_count > max_points:
                 stride = point_count // max_points
                 data = bytearray()
                 for i in range(0, point_count * 12, stride * 12):
@@ -566,12 +581,22 @@ class CloudMapMmapReader:
                 data_size = point_count * 12
                 xyz_bytes = bytes(self._mm[buf_offset:buf_offset + data_size])
                 actual_count = point_count
-            # 读后再校验 revision：未变则数据一致，已变说明读期间被写者翻转，重试。
+            slot_metadata_after = None
+            if version >= self.SLOT_METADATA_VERSION:
+                slot_metadata_after = self._read_slot_metadata(read_buf)
             header_after = self.read_header()
             if header_after is None:
                 return None
-            if header_after[5] == revision:
-                return (revision, actual_count, xyz_bytes)
+            if header_after[5] != revision:
+                continue
+            if version >= self.SLOT_METADATA_VERSION:
+                if (
+                    slot_metadata_after is None
+                    or slot_metadata_after[0] != header_after[5]
+                    or slot_metadata_after[1] != point_count
+                ):
+                    continue
+            return (revision, actual_count, xyz_bytes)
         # 连续 3 次都被写者抢占，放弃本轮（上层轮询下次重试）。
         return None
 

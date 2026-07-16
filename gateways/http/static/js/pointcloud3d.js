@@ -368,9 +368,13 @@ window.addEventListener('stream:pointcloud_map.binary', (e) => {
   const revision = header.getUint32(0, true);
   const pointCount = header.getUint32(4, true);
 
-  if (pointCount === 0) return;
+  if (pointCount === 0) {
+    window.pointcloud3d._replaceCloudMapBuffer(new Float32Array(0), revision);
+    return;
+  }
   if (revision <= (window.pointcloud3d._lastCloudMapRevision || 0)) return;
 
+  if (buf.byteLength < 8 + pointCount * 3 * Float32Array.BYTES_PER_ELEMENT) return;
   const xyz = new Float32Array(buf, 8, pointCount * 3);
   window.pointcloud3d._replaceCloudMapBuffer(xyz, revision);
 });

@@ -404,7 +404,7 @@ pub struct MappingAdapter {
     /// **W37 RALPLAN §Phase M #1**:有界增量 `MappingSession`。
     ///
     /// 默认 `bounded_capacity = DEFAULT_BOUNDED_CAPACITY = 8_000_000`
-    /// (对齐 `POINTCLOUD_MAX_RAW_POINTS`)；freshness 允许消息时间最多逆序 200ms；
+    /// 是跨帧滚动窗口，与单帧点数上限无关；freshness 允许消息时间最多逆序 200ms；
     /// dedup 只过滤同时间戳、同内容、同位姿的重放。
     ///
     /// **W37 直持 `MappingSession`**:与上游 `nuwax_mapping::MappingSession`
@@ -438,6 +438,7 @@ pub struct MappingAdapter {
     frame_generation: u64,
     global_frame_established: bool,
     transformed_points: Vec<Point3<f64>>,
+    latest_accepted_map_points: Vec<Point3<f64>>,
     last_built_generation: u64,
     last_built_point_count: usize,
     last_built_received_at_ns: u64,
@@ -531,6 +532,7 @@ impl MappingAdapter {
             frame_generation: 0,
             global_frame_established: false,
             transformed_points: Vec::new(),
+            latest_accepted_map_points: Vec::new(),
             last_built_generation: 0,
             last_built_point_count: 0,
             last_built_received_at_ns: 0,
@@ -708,6 +710,7 @@ impl MappingAdapter {
         frame_id: &str,
         source_timestamp_ns: u64,
     ) -> Result<nuwax_mapping::FeedStats, nuwax_mapping::SessionError> {
+        self.latest_accepted_map_points.clear();
         let source_frame_id = normalize_frame_id(frame_id);
         if !self.is_active() {
             return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
@@ -770,6 +773,9 @@ impl MappingAdapter {
             self.session
                 .feed_pointcloud(map_points, dedup_xy, point_step, message_timestamp_ns)?;
         if stats.accepted > 0 {
+            let accepted_start = map_points.len().saturating_sub(stats.accepted);
+            self.latest_accepted_map_points
+                .extend_from_slice(&map_points[accepted_start..]);
             self.has_data = true;
             self.pointcloud_count = self.pointcloud_count.saturating_add(1);
             self.latest_pointcloud_source_frame_id = source_frame_id;
@@ -895,6 +901,14 @@ impl MappingAdapter {
     /// `session` 是唯一生产 SSOT；返回滚动点窗口的当前大小。
     pub fn accumulated_count(&self) -> usize {
         self.session.current_size()
+    }
+
+    /// Move out the most recent accepted frame after it has been transformed
+    /// into the canonical map frame. Production consumes this once to update
+    /// the independent cloud-map voxel accumulator without cloning the full
+    /// MappingSession rolling window.
+    pub(crate) fn take_latest_accepted_map_points(&mut self) -> Vec<Point3<f64>> {
+        std::mem::take(&mut self.latest_accepted_map_points)
     }
 
     /// 描述最近一次已接收点云的源/output frame 与真实 transform 状态。
@@ -1105,6 +1119,7 @@ impl MappingAdapter {
         self.map_odom_transform = None;
         self.global_frame_established = false;
         self.transformed_points.clear();
+        self.latest_accepted_map_points.clear();
         self.last_built_generation = 0;
         self.last_built_point_count = 0;
         self.last_built_received_at_ns = 0;

@@ -283,6 +283,7 @@ pub struct CloudMapNotification {
     pub revision: u64,
     pub point_count: u32,
     pub voxel_size: f32,
+    pub session_generation: u64,
 }
 
 /// RALPLAN §Phase M #3: occupancy grid revision 事件。
@@ -520,6 +521,9 @@ fn map_event_matches_current_session(
 pub struct GeometryRuntimeHandle {
     pub state: Arc<RwLock<SharedState>>,
     pub cloud_map_tx: broadcast::Sender<CloudMapNotification>,
+    /// Sole 3D mapping SHM writer shared by lidar ingestion and mapping
+    /// lifecycle fencing. `None` is an allowed fail-soft runtime state.
+    pub(crate) cloud_map_writer: Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
     pub nav_state_tx: broadcast::Sender<NavigationUpdate>,
     pub frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
     pub map_revision_tx: broadcast::Sender<MapRevisionEvent>,
@@ -583,6 +587,32 @@ pub struct GeometryRuntimeHandle {
 impl GeometryRuntimeHandle {
     pub fn subscribe_map_revisions(&self) -> watch::Receiver<Option<MapRevisionEvent>> {
         self.map_revision_latest_tx.subscribe()
+    }
+
+    /// Publish a zero-point cloud-map revision for a newly started mapping
+    /// generation. Missing/failed cloud-map SHM is fail-soft and never blocks
+    /// the authoritative 2D MappingSession lifecycle.
+    pub(crate) async fn begin_cloud_map_session(
+        &self,
+        session_generation: u64,
+    ) -> Option<CloudMapNotification> {
+        let update = {
+            let mut guard = self.cloud_map_writer.lock();
+            let writer = guard.as_mut()?;
+            let (revision, point_count, voxel_size) = writer.begin_session(session_generation)?;
+            CloudMapNotification {
+                revision,
+                point_count,
+                voxel_size,
+                session_generation,
+            }
+        };
+        {
+            let mut shared = self.state.write().await;
+            shared.cloud_map_revision = update.revision;
+        }
+        let _ = self.cloud_map_tx.send(update.clone());
+        Some(update)
     }
 
     /// Read the deprecated compatibility bit. This value is diagnostic only.
@@ -1259,6 +1289,15 @@ fn parse_pointcloud_payload(payload: &[u8]) -> Option<ParsedPointCloudPayload> {
         usize::try_from(message.width).ok()?,
         usize::try_from(message.row_step).ok()?,
     );
+    let point_count = height.checked_mul(width)?;
+    if point_count > crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS {
+        warn!(
+            "/go2/lidar/points point_count={} 超过单帧上限={};按异常帧跳过",
+            point_count,
+            crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS
+        );
+        return None;
+    }
     let packed_row = width.checked_mul(point_step as usize)?;
     if height == 0
         || width == 0
@@ -1497,6 +1536,7 @@ impl ExploreNavigationBridge {
         GeometryRuntimeHandle {
             state: self.state.clone(),
             cloud_map_tx: self.cloud_map_tx.clone(),
+            cloud_map_writer: Arc::new(parking_lot::Mutex::new(None)),
             nav_state_tx: self.nav_state_tx.clone(),
             frontiers_tx: self.frontiers_tx.clone(),
             map_revision_tx: self.map_revision_tx.clone(),
@@ -2369,7 +2409,10 @@ pub fn spawn_geometry_runtime(
                 return Err(RealLcmBackendUnavailable);
             }
         };
-    let cm_binding = match cloud_map_channel {
+    // Legacy `/cloud_map` is diagnostics-only. MappingSession is the sole
+    // cloud-map writer; accepting both sources would interleave unrelated
+    // revisions in the same mmap.
+    let legacy_cm_binding = match cloud_map_channel {
         Some(c) => match parse_expected_typed_channel(c, "sensor_msgs.PointCloud2") {
             Ok(binding) => Some(binding),
             Err(e) => {
@@ -2440,7 +2483,7 @@ pub fn spawn_geometry_runtime(
         "LCM channel registry: occupancy={} tf={} cloud_map={} nav_state={} frontiers={} odom={}",
         occ_topic.channel(),
         tf_topic.channel(),
-        cm_binding
+        legacy_cm_binding
             .as_ref()
             .map(|(topic, _)| topic.channel())
             .unwrap_or("<none>"),
@@ -2461,7 +2504,7 @@ pub fn spawn_geometry_runtime(
         "LCM msg-type registry: occupancy={} tf={} cloud_map={} nav_state={} frontiers={} odom={}",
         occ_msg_type.fqn(),
         tf_msg_type.fqn(),
-        cm_binding
+        legacy_cm_binding
             .as_ref()
             .map(|(_, kind)| kind.fqn())
             .unwrap_or("<none>"),
@@ -2480,10 +2523,7 @@ pub fn spawn_geometry_runtime(
     );
 
     // 累积地图 mmap 初始化（降级允许）
-    let cm_shm_path = std::path::PathBuf::from(
-        std::env::var("NUWAX_CLOUDMAP_SHM_PATH")
-            .unwrap_or_else(|_| "/tmp/nuwax_cloudmap.mmap".into()),
-    );
+    let cm_shm_path = crate::pointcloud::cloud_map_shm_path();
     let cm_writer = match CloudMapShmWriter::new(&cm_shm_path) {
         Ok(w) => Some(w),
         Err(e) => {
@@ -2638,50 +2678,8 @@ pub fn spawn_geometry_runtime(
         }
     });
 
-    // ---- 订阅 cloud_map（累积点云）----
-    if let Some((cm_topic, cm_msg_type)) = cm_binding {
-        let cm_state = state.clone();
-        let cm_tx = cloud_map_tx.clone();
-        let cm_writer = cm_writer.clone();
-        let cm_transport = transport.clone();
-        let cm_msg_type_clone = cm_msg_type;
-        tokio::spawn(async move {
-            let mut stream = cm_transport
-                .subscribe(cm_topic, Some(cm_msg_type_clone))
-                .await;
-            use futures::StreamExt;
-            while let Some(frame_result) = stream.next().await {
-                let frame = match frame_result {
-                    Ok(f) => f,
-                    Err(e) => {
-                        error!("cloud_map LCM 订阅错误: {}", e);
-                        continue;
-                    }
-                };
-                if let Some(parsed) = parse_pointcloud_payload(&frame.payload) {
-                    // 在锁内完成 mmap 写（不持锁跨 await），拿到结果后再 await
-                    let write_result = {
-                        let mut guard = cm_writer.lock();
-                        if let Some(writer) = guard.as_mut() {
-                            writer.write_cloud_map(&parsed.data, parsed.point_step)
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some((rev, count, vs)) = write_result {
-                        {
-                            let mut s = cm_state.write().await;
-                            s.cloud_map_revision = rev;
-                        }
-                        let _ = cm_tx.send(CloudMapNotification {
-                            revision: rev,
-                            point_count: count,
-                            voxel_size: vs,
-                        });
-                    }
-                }
-            }
-        });
+    if legacy_cm_binding.is_some() {
+        info!("legacy /cloud_map input is ignored; MappingSession owns cloud-map SHM revisions");
     }
 
     // ---- Consume only versioned PathEnvelope planner output. ----
@@ -2749,8 +2747,8 @@ pub fn spawn_geometry_runtime(
     // adapter。`feed_pose` / `feed_pointcloud` 内部持 parking_lot 锁同步,
     // 不会跨 await。
     // Phase 3: 构造 occupancy grid SHM sidecar(默认 /tmp/nuwax_occupancy.mmap)。
-    // 与 cloud_map SHM 区分:occupancy 走 grid layout(Phase 3 新增);
-    // cloud_map 仍走 lcm_runtime 既有 `cm_writer`(Phase 0 已实装)。
+    // 与 cloud_map SHM 区分:occupancy 走 grid layout；cloud_map 由
+    // MappingSession 接受的 map-frame 新帧增量更新独立 voxel accumulator。
     let occ_shm_path = std::path::PathBuf::from(
         std::env::var("NUWAX_OCCUPANCY_SHM_PATH")
             .unwrap_or_else(|_| "/tmp/nuwax_occupancy.mmap".into()),
@@ -2780,6 +2778,7 @@ pub fn spawn_geometry_runtime(
     let handle = GeometryRuntimeHandle {
         state: state.clone(),
         cloud_map_tx: cloud_map_tx.clone(),
+        cloud_map_writer: cm_writer.clone(),
         nav_state_tx: nav_state_tx.clone(),
         frontiers_tx: frontiers_tx.clone(),
         map_revision_tx: map_revision_tx.clone(),
@@ -2871,10 +2870,20 @@ pub fn spawn_geometry_runtime(
             odom_binding,
             (tf_topic, tf_msg_type),
             base_frame,
+            handle.cloud_map_writer.clone(),
+            handle.cloud_map_tx.clone(),
+            handle.mapping_lifecycle_lock.clone(),
         );
     }
 
     Ok(handle)
+}
+
+#[derive(Debug)]
+struct MappingIngestOutcome {
+    accepted_map_points: Vec<nalgebra::Point3<f64>>,
+    occupancy_committed: bool,
+    session_generation: u64,
 }
 
 fn ingest_mapping_points(
@@ -2886,7 +2895,7 @@ fn ingest_mapping_points(
     source_timestamp_ns: u64,
     state: &Arc<RwLock<SharedState>>,
     map_revision_tx: &broadcast::Sender<MapRevisionEvent>,
-) -> Result<bool, nuwax_mapping::SessionError> {
+) -> Result<MappingIngestOutcome, nuwax_mapping::SessionError> {
     let odom_xy = (adapter.last_sensor_origin[0], adapter.last_sensor_origin[1]);
     let stats = adapter.feed_pointcloud_session(
         points,
@@ -2897,9 +2906,46 @@ fn ingest_mapping_points(
         source_timestamp_ns,
     )?;
     if stats.accepted == 0 {
-        return Ok(false);
+        return Ok(MappingIngestOutcome {
+            accepted_map_points: Vec::new(),
+            occupancy_committed: false,
+            session_generation: adapter.snapshot().session_generation,
+        });
     }
-    Ok(adapter.build_and_publish(state, Some(map_revision_tx)))
+    let accepted_map_points = adapter.take_latest_accepted_map_points();
+    let session_generation = adapter.snapshot().session_generation;
+    let occupancy_committed = adapter.build_and_publish(state, Some(map_revision_tx));
+    Ok(MappingIngestOutcome {
+        accepted_map_points,
+        occupancy_committed,
+        session_generation,
+    })
+}
+
+fn update_mapping_cloud_map_if_current(
+    outcome: &MappingIngestOutcome,
+    current_session: &crate::mapping_adapter::MappingSessionSnapshot,
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+) -> Option<CloudMapNotification> {
+    if !current_session.active || current_session.session_generation != outcome.session_generation {
+        return None;
+    }
+    let mut writer = writer.lock();
+    let writer = writer.as_mut()?;
+    if !writer.accumulate_mapping_frame(
+        outcome.session_generation,
+        outcome.accepted_map_points.as_slice(),
+    ) || !outcome.occupancy_committed
+    {
+        return None;
+    }
+    let (revision, point_count, voxel_size) = writer.commit_accumulated()?;
+    Some(CloudMapNotification {
+        revision,
+        point_count,
+        voxel_size,
+        session_generation: outcome.session_generation,
+    })
 }
 
 /// Phase 3: 把 LCM `/odom` 与 `/go2/lidar/points` typed channel 喂给 mapping adapter。
@@ -2911,7 +2957,7 @@ fn ingest_mapping_points(
 /// - `/odom` payload 走 `parse_odom_payload` → 归一化 quaternion/yaw →
 ///   `feed_pose_in_frame`，并从固定 anchor 发布 map→odom→base canonical TF
 /// - `/go2/lidar/points` payload 走 `parse_pointcloud_payload` → 转 Point3 →
-///   `feed_pointcloud` + `build_and_publish`
+///   `feed_pointcloud_session` + 增量 cloud-map voxel + `build_and_publish`
 ///
 /// feed 路径持 parking_lot Mutex(同步,不跨 await);canonical pose/TF 在解锁后
 /// 写入 SharedState 并发布，`/pose_stamped` 不再具有全局位姿写权限。
@@ -2923,6 +2969,9 @@ fn spawn_mapping_feed_tasks(
     odom_binding: Option<(LcmTopic, LcmMessageType)>,
     tf_binding: (LcmTopic, LcmMessageType),
     base_frame: String,
+    cloud_map_writer: Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    cloud_map_tx: broadcast::Sender<CloudMapNotification>,
+    mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     use futures::StreamExt;
     use nalgebra::Point3;
@@ -3034,16 +3083,15 @@ fn spawn_mapping_feed_tasks(
                 continue;
             }
             let raw_count = parsed.data.len() / ps;
-            // 防御性 sanity cap:见 POINTCLOUD_MAX_RAW_POINTS 注释。
+            // 防御性 sanity cap:见 POINTCLOUD_MAX_FRAME_POINTS 注释。
             // raw_count 由 untrusted bytes.len()/point_step 推得,point_step
-            // 已在 parse_pointcloud_payload 入口校验过 [12, 256],但 raw_count
-            // 仍可能因 bytes.len() 巨大而超 cap(>8M 点);此处直接 saturating
-            // 掉,拒绝异常帧。
-            if raw_count > crate::pointcloud::POINTCLOUD_MAX_RAW_POINTS {
+            // 已在 parse_pointcloud_payload 入口校验；此处保留二次校验，
+            // 防止后续解析调整绕过单帧上限。
+            if raw_count > crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS {
                 warn!(
                     "mapping_feed /go2/lidar/points raw_count={} 超过 sanity cap={};按异常帧跳过",
                     raw_count,
-                    crate::pointcloud::POINTCLOUD_MAX_RAW_POINTS
+                    crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS
                 );
                 continue;
             }
@@ -3071,22 +3119,41 @@ fn spawn_mapping_feed_tasks(
             }
             // MappingSession 是生产建图的唯一点云数据源。只有 session 接受了
             // 新点后才构建 revision，dedup/stale/resource-exhausted 帧不会发布假更新。
-            let mut adapter = mapping_lidar.lock();
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            match ingest_mapping_points(
-                &mut adapter,
-                &points,
-                parsed.point_step,
-                now_ns,
-                &parsed.frame_id,
-                parsed.timestamp_ns,
-                &state_lidar,
-                &map_revision_lidar,
-            ) {
-                Ok(_) => {}
+            let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
+            let (ingest_outcome, current_session) = {
+                let mut adapter = mapping_lidar.lock();
+                let outcome = ingest_mapping_points(
+                    &mut adapter,
+                    &points,
+                    parsed.point_step,
+                    now_ns,
+                    &parsed.frame_id,
+                    parsed.timestamp_ns,
+                    &state_lidar,
+                    &map_revision_lidar,
+                );
+                let snapshot = adapter.snapshot();
+                (outcome, snapshot)
+            };
+            match ingest_outcome {
+                Ok(outcome) => {
+                    let Some(update) = update_mapping_cloud_map_if_current(
+                        &outcome,
+                        &current_session,
+                        &cloud_map_writer,
+                    ) else {
+                        continue;
+                    };
+                    {
+                        let mut shared = state_lidar.write().await;
+                        shared.cloud_map_revision = update.revision;
+                    }
+                    let _ = cloud_map_tx.send(update);
+                }
                 Err(error) => {
                     warn!("mapping_feed: MappingSession 拒绝点云帧: {error}");
                 }
@@ -3201,6 +3268,7 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
     Ok(GeometryRuntimeHandle {
         state,
         cloud_map_tx,
+        cloud_map_writer: Arc::new(parking_lot::Mutex::new(None)),
         nav_state_tx,
         frontiers_tx,
         map_revision_tx,
@@ -3328,7 +3396,7 @@ mod mapping_feed_tests {
         let (map_revision_tx, mut map_revision_rx) = broadcast::channel(4);
         let points = vec![Point3::new(1.0, 2.0, 0.0), Point3::new(1.0, 3.0, 0.0)];
 
-        assert!(ingest_mapping_points(
+        let outcome = ingest_mapping_points(
             &mut adapter,
             &points,
             12,
@@ -3338,7 +3406,15 @@ mod mapping_feed_tests {
             &state,
             &map_revision_tx,
         )
-        .expect("MappingSession ingest"));
+        .expect("MappingSession ingest");
+        assert!(outcome.occupancy_committed);
+        assert_eq!(outcome.accepted_map_points.len(), points.len());
+        let mut cloud_map_points = outcome.accepted_map_points.clone();
+        cloud_map_points.sort_by(|left, right| left.x.total_cmp(&right.x));
+        assert!((cloud_map_points[0].x - 0.0).abs() < 1e-9);
+        assert!((cloud_map_points[0].y - 0.0).abs() < 1e-9);
+        assert!((cloud_map_points[1].x - 1.0).abs() < 1e-9);
+        assert!((cloud_map_points[1].y - 0.0).abs() < 1e-9);
 
         assert_eq!(adapter.accumulated_count(), points.len());
         assert_eq!(adapter.odom_count(), 1);
@@ -3371,6 +3447,88 @@ mod mapping_feed_tests {
         assert_eq!(committed.map.data.len(), event.data.len());
         let readiness = MappingReadiness::compute(Some(&adapter), true);
         assert!(readiness.ready);
+        let path = std::env::temp_dir().join(format!(
+            "nuwax-cloudmap-mapping-feed-{}-{}.mmap",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let writer = Arc::new(parking_lot::Mutex::new(Some(
+            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+        )));
+        let current_session = adapter.snapshot();
+        let update = update_mapping_cloud_map_if_current(&outcome, &current_session, &writer)
+            .expect("cloud map update from mapping session");
+        assert_eq!(update.revision, 1);
+        assert_eq!(update.point_count, 2);
+        let mut stale_session = current_session;
+        stale_session.session_generation += 1;
+        assert!(update_mapping_cloud_map_if_current(&outcome, &stale_session, &writer).is_none());
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cloud_map_handoff_is_new_frame_only_and_replay_safe() {
+        let mut adapter = active_mapping_adapter();
+        adapter
+            .feed_pose_in_frame(0.0, 0.0, 0.0, 0.0, "odom")
+            .expect("establish odom anchor");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let (map_revision_tx, _map_revision_rx) = broadcast::channel(4);
+        let first_points = (0..1_000)
+            .map(|index| Point3::new(f64::from(index) * 0.01, 0.0, 0.0))
+            .collect::<Vec<_>>();
+        let first = ingest_mapping_points(
+            &mut adapter,
+            &first_points,
+            12,
+            1_750_000_000_000_000_000,
+            "odom",
+            1_234_567_890_000_000_000,
+            &state,
+            &map_revision_tx,
+        )
+        .expect("first frame");
+        assert_eq!(first.accepted_map_points.len(), first_points.len());
+
+        let second_points = vec![Point3::new(20.0, 0.0, 0.0), Point3::new(21.0, 0.0, 0.0)];
+        let second = ingest_mapping_points(
+            &mut adapter,
+            &second_points,
+            12,
+            1_750_000_000_100_000_000,
+            "odom",
+            1_234_567_890_100_000_000,
+            &state,
+            &map_revision_tx,
+        )
+        .expect("second frame");
+        assert_eq!(
+            adapter.accumulated_count(),
+            first_points.len() + second_points.len()
+        );
+        assert_eq!(
+            second.accepted_map_points.len(),
+            second_points.len(),
+            "cloud-map handoff must stay O(new frame), not O(session window)"
+        );
+
+        let replay = ingest_mapping_points(
+            &mut adapter,
+            &second_points,
+            12,
+            1_750_000_000_100_000_100,
+            "odom",
+            1_234_567_890_100_000_000,
+            &state,
+            &map_revision_tx,
+        )
+        .expect("dedup replay");
+        assert!(replay.accepted_map_points.is_empty());
+        assert!(!replay.occupancy_committed);
     }
 
     #[test]
@@ -4491,8 +4649,8 @@ mod payload_sanity_tests {
         const _: () =
             assert!((OCCUPANCY_MAX_DIMENSION as usize).saturating_pow(2) < 100 * 1024 * 1024);
         const _: () = assert!(
-            crate::pointcloud::POINTCLOUD_MAX_RAW_POINTS > 0
-                && crate::pointcloud::POINTCLOUD_MAX_RAW_POINTS < 100_000_000
+            crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS > 0
+                && crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS < 1_000_000
         );
         const _: () = assert!(
             crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES >= 12
@@ -4530,6 +4688,16 @@ mod payload_sanity_tests {
         assert_eq!(parsed.data.len(), 24);
         assert_eq!(parsed.frame_id, "map");
         assert_eq!(parsed.timestamp_ns, 12_345_678_901);
+    }
+
+    #[test]
+    fn parse_pointcloud_payload_rejects_more_than_single_frame_cap() {
+        let data = vec![0; (crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS + 1) * 12];
+        let payload = pointcloud_body(12, data);
+        assert!(
+            parse_pointcloud_payload(&payload).is_none(),
+            "valid PointCloud2 layout above the physical single-frame cap must be rejected"
+        );
     }
 
     fn pointcloud_body(point_step: i32, data: Vec<u8>) -> Vec<u8> {

@@ -22,7 +22,9 @@ use tokio::sync::{watch, RwLock};
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::lcm_runtime::{GeometryRuntimeHandle, MapRevisionEvent, NavigationUpdate, PoseState};
+use crate::lcm_runtime::{
+    CloudMapNotification, GeometryRuntimeHandle, MapRevisionEvent, NavigationUpdate, PoseState,
+};
 use crate::nav_runtime::{
     cancel as nav_cancel, compute_readiness, ensure_goal_id, readiness_to_reason, set_goal,
     CancelOutcome, SetGoalInput, SetGoalOutcome,
@@ -390,6 +392,46 @@ fn occupancy_shm_ref(
         generation: snapshot.generation,
         active_slot,
         payload_size: snapshot.payload_size,
+    })
+}
+
+fn cloud_map_shm_ref(notification: &CloudMapNotification) -> Result<ShmRef, Box<Status>> {
+    if notification.revision == 0 || notification.session_generation == 0 {
+        return Err(Box::new(Status::failed_precondition(format!(
+            "invalid cloud-map SHM v2 reference: revision={} generation={}",
+            notification.revision, notification.session_generation
+        ))));
+    }
+    let file_size = u64::try_from(crate::pointcloud::CM_TOTAL_SIZE)
+        .map_err(|_| Box::new(Status::internal("cloud-map SHM size exceeds uint64")))?;
+    let payload_size = u64::from(notification.point_count)
+        .checked_mul(crate::pointcloud::CM_POINT_SIZE_BYTES as u64)
+        .ok_or_else(|| Box::new(Status::internal("cloud-map payload size overflow")))?;
+    let max_payload_size = u64::try_from(crate::pointcloud::CM_SINGLE_BUFFER_SIZE)
+        .map_err(|_| Box::new(Status::internal("cloud-map slot size exceeds uint64")))?;
+    if payload_size > max_payload_size {
+        return Err(Box::new(Status::failed_precondition(format!(
+            "cloud-map payload exceeds one SHM slot: payload_size={} max={}",
+            payload_size, max_payload_size
+        ))));
+    }
+    let active_slot =
+        crate::pointcloud::cloud_map_active_slot(notification.revision).ok_or_else(|| {
+            Box::new(Status::failed_precondition(
+                "cloud-map revision must be positive",
+            ))
+        })?;
+    Ok(ShmRef {
+        key: crate::pointcloud::cloud_map_shm_path()
+            .to_string_lossy()
+            .into_owned(),
+        size: file_size,
+        revision: notification.revision,
+        layout_version: crate::pointcloud::CM_SHM_VERSION,
+        payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
+        generation: notification.session_generation,
+        active_slot,
+        payload_size,
     })
 }
 
@@ -820,6 +862,13 @@ impl GeometryRuntime for GeometryRuntimeService {
                 )));
             }
         }
+        // 3D SHM is fail-soft: a missing writer must not roll back the
+        // authoritative 2D mapping session. When available, publish an empty
+        // revision immediately so readers cannot retain the prior session map.
+        let _ = self
+            .bridge
+            .begin_cloud_map_session(snapshot.session_generation)
+            .await;
         Ok(Response::new(mapping_session_state(
             snapshot,
             "mapping session active",
@@ -1004,18 +1053,15 @@ impl GeometryRuntime for GeometryRuntimeService {
         let mut broadcast_rx = self.bridge.cloud_map_tx.subscribe();
         tokio::spawn(async move {
             while let Ok(notif) = broadcast_rx.recv().await {
+                let shm_ref = match cloud_map_shm_ref(&notif) {
+                    Ok(reference) => reference,
+                    Err(status) => {
+                        let _ = tx.send(Err(*status)).await;
+                        break;
+                    }
+                };
                 let msg = CloudMapShmRef {
-                    shm_ref: Some(ShmRef {
-                        key: std::env::var("NUWAX_CLOUDMAP_SHM_PATH")
-                            .unwrap_or_else(|_| "/tmp/nuwax_cloudmap.mmap".into()),
-                        size: 0,
-                        revision: notif.revision,
-                        layout_version: 0,
-                        payload_schema_version: 0,
-                        generation: 0,
-                        active_slot: 0,
-                        payload_size: 0,
-                    }),
+                    shm_ref: Some(shm_ref),
                     point_count: notif.point_count,
                     voxel_size: notif.voxel_size,
                 };
@@ -2017,9 +2063,114 @@ mod map_update_tests {
 }
 
 #[cfg(test)]
+mod cloud_map_update_tests {
+    use super::*;
+    use crate::lcm_runtime::CloudMapNotification;
+    use tokio_stream::StreamExt;
+
+    async fn next_cloud_map_update(
+        service: &GeometryRuntimeService,
+        handle: &GeometryRuntimeHandle,
+        notification: CloudMapNotification,
+    ) -> CloudMapShmRef {
+        let response =
+            GeometryRuntime::subscribe_cloud_map_updates(service, Request::new(Empty {}))
+                .await
+                .expect("SubscribeCloudMapUpdates RPC");
+        let mut stream = response.into_inner();
+        handle
+            .cloud_map_tx
+            .send(notification)
+            .expect("cloud-map subscriber registered before RPC returns");
+        tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("cloud-map update timeout")
+            .expect("cloud-map stream item")
+            .expect("cloud-map update")
+    }
+
+    fn assert_common_v2_reference(reference: &ShmRef, revision: u64, generation: u64) {
+        assert_eq!(
+            reference.key,
+            crate::pointcloud::cloud_map_shm_path()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(
+            reference.size,
+            u64::try_from(crate::pointcloud::CM_TOTAL_SIZE).unwrap()
+        );
+        assert_eq!(reference.revision, revision);
+        assert_eq!(reference.layout_version, crate::pointcloud::CM_SHM_VERSION);
+        assert_eq!(
+            reference.payload_schema_version,
+            crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION
+        );
+        assert_eq!(reference.generation, generation);
+        assert_eq!(
+            reference.active_slot,
+            crate::pointcloud::cloud_map_active_slot(revision).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_map_clear_update_carries_complete_v2_shm_reference() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle.clone());
+        let update = next_cloud_map_update(
+            &service,
+            &handle,
+            CloudMapNotification {
+                revision: 1,
+                point_count: 0,
+                voxel_size: 0.05,
+                session_generation: 7,
+            },
+        )
+        .await;
+
+        assert_eq!(update.point_count, 0);
+        assert_eq!(update.voxel_size, 0.05);
+        let reference = update.shm_ref.expect("v2 SHM reference");
+        assert_common_v2_reference(&reference, 1, 7);
+        assert_eq!(reference.active_slot, 0);
+        assert_eq!(reference.payload_size, 0);
+    }
+
+    #[tokio::test]
+    async fn cloud_map_data_update_carries_payload_size_and_active_slot() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle.clone());
+        let update = next_cloud_map_update(
+            &service,
+            &handle,
+            CloudMapNotification {
+                revision: 2,
+                point_count: 3,
+                voxel_size: 0.10,
+                session_generation: 8,
+            },
+        )
+        .await;
+
+        assert_eq!(update.point_count, 3);
+        assert_eq!(update.voxel_size, 0.10);
+        let reference = update.shm_ref.expect("v2 SHM reference");
+        assert_common_v2_reference(&reference, 2, 8);
+        assert_eq!(reference.active_slot, 1);
+        assert_eq!(reference.payload_size, 36);
+    }
+}
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     use crate::lcm_runtime::{MapRevisionEvent, MapState};
+    use crate::pointcloud::CloudMapShmWriter;
     use nalgebra::Point3;
     use tokio_stream::StreamExt;
 
@@ -2050,6 +2201,78 @@ mod lifecycle_tests {
         adapter.feed_pointcloud(&[Point3::new(x, 0.0, 2.0)]);
         assert!(adapter.build_and_publish(&handle.state, Some(&handle.map_revision_tx)));
         adapter.current_revision()
+    }
+
+    #[tokio::test]
+    async fn start_mapping_publishes_one_monotonic_zero_cloud_frame_per_new_session() {
+        let mut handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let path = std::env::temp_dir().join(format!(
+            "nuwax-cloudmap-start-mapping-{}-{}.mmap",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
+            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+        )));
+        let mut cloud_updates = handle.cloud_map_tx.subscribe();
+        let service = GeometryRuntimeService::new(handle.clone());
+
+        let first = start_mapping_session(&service, "cloud-session-1", "mapver_000101").await;
+        assert_eq!(first.session_generation, 1);
+        let first_clear = tokio::time::timeout(Duration::from_secs(1), cloud_updates.recv())
+            .await
+            .expect("first clear timeout")
+            .expect("first clear notification");
+        assert_eq!(first_clear.point_count, 0);
+        assert!(first_clear.revision > 0);
+        assert_eq!(
+            handle.state.read().await.cloud_map_revision,
+            first_clear.revision
+        );
+
+        let replay = start_mapping_session(&service, "cloud-session-1", "mapver_000101").await;
+        assert!(replay.idempotent_replay);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cloud_updates.recv())
+                .await
+                .is_err(),
+            "idempotent StartMapping must not publish another clear revision"
+        );
+        assert_eq!(
+            handle.state.read().await.cloud_map_revision,
+            first_clear.revision
+        );
+
+        GeometryRuntime::stop_mapping(
+            &service,
+            Request::new(StopMappingRequest {
+                session_id: "cloud-session-1".to_string(),
+                reason: "new session test".to_string(),
+            }),
+        )
+        .await
+        .expect("StopMapping");
+        let second = start_mapping_session(&service, "cloud-session-2", "mapver_000102").await;
+        assert_eq!(second.session_generation, 2);
+        let second_clear = tokio::time::timeout(Duration::from_secs(1), cloud_updates.recv())
+            .await
+            .expect("second clear timeout")
+            .expect("second clear notification");
+        assert_eq!(second_clear.point_count, 0);
+        assert!(second_clear.revision > first_clear.revision);
+        assert_eq!(
+            handle.state.read().await.cloud_map_revision,
+            second_clear.revision
+        );
+
+        drop(service);
+        drop(handle);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

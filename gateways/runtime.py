@@ -701,7 +701,9 @@ class GatewayRuntime:
         self._navigation_status_refresh_thread: Optional[threading.Thread] = None
         self._pointcloud_map_cache = PointCloudMapCache()
         self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
-        self._cloud_map_mmap_reader = CloudMapMmapReader()
+        self._cloud_map_mmap_reader = CloudMapMmapReader(
+            os.environ.get("NUWAX_CLOUDMAP_SHM_PATH", "/tmp/nuwax_cloudmap.mmap")
+        )
         self._cloud_map_mmap_poll_stop = threading.Event()
         self._cloud_map_mmap_poll_thread: Optional[threading.Thread] = None
         self._cloud_map_last_revision: int = 0

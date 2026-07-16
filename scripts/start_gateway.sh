@@ -25,6 +25,9 @@ PERSON_FOLLOW_PID=""
 NAV_STACK_MONITOR_PID=""
 GEOMETRY_MONITOR_PID=""
 PERSON_FOLLOW_MONITOR_PID=""
+RUNTIME_ACTIVATION_MONITOR_PID=""
+RUNTIME_ACTIVATION_LEVEL=""
+RUNTIME_ACTIVATION_CAPABILITY=""
 STOP_REQUESTED=0
 
 PERSON_FOLLOW_TARGET_CHANNEL="/person_follow_target"
@@ -151,7 +154,7 @@ wait_for_motion_guard_transport() {
   done
 
   bash "${helper}" check
-  echo "refusing to start geometry runtime or Gateway without motion guard transport" >&2
+  echo "refusing to start the motion-capable navigation stack without motion guard transport" >&2
   return 1
 }
 
@@ -810,6 +813,124 @@ start_runtime_monitors() {
   fi
 }
 
+write_runtime_activation_result() {
+  local state="$1"
+  local stage="$2"
+  local message="$3"
+  local result_file="${NUWAX_RUNTIME_ACTIVATION_RESULT}"
+  local temporary="${result_file}.$$"
+  STATE="${state}" STAGE="${stage}" MESSAGE="${message}" \
+    ACTIVATION_LEVEL="${RUNTIME_ACTIVATION_LEVEL:-unknown}" \
+    CAPABILITY_NAME="${RUNTIME_ACTIVATION_CAPABILITY:-unknown}" \
+    "${PYTHON_BIN}" -c 'import json, os; print(json.dumps({"state": os.environ["STATE"], "stage": os.environ["STAGE"], "message": os.environ["MESSAGE"], "activation_level": os.environ["ACTIVATION_LEVEL"], "capability_name": os.environ["CAPABILITY_NAME"]}, ensure_ascii=True, sort_keys=True))' \
+    > "${temporary}"
+  chmod 0644 "${temporary}"
+  mv -f "${temporary}" "${result_file}"
+}
+
+read_runtime_activation_request() {
+  local request_file="$1"
+  local parsed=""
+  parsed="$("${PYTHON_BIN}" - "${request_file}" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+level = str(payload.get("activation_level") or "motion").strip().lower()
+if level not in {"guard", "geometry", "motion", "person_follow"}:
+    raise SystemExit("invalid activation_level: %s" % level)
+capability = str(payload.get("capability_name") or "unknown").strip() or "unknown"
+print("%s\t%s" % (level, capability))
+PY
+  )" || return 1
+  IFS=$'\t' read -r RUNTIME_ACTIVATION_LEVEL RUNTIME_ACTIVATION_CAPABILITY <<< "${parsed}"
+  [[ -n "${RUNTIME_ACTIVATION_LEVEL}" && -n "${RUNTIME_ACTIVATION_CAPABILITY}" ]]
+}
+
+monitor_runtime_activation_requests() {
+  local request_file="${NUWAX_RUNTIME_ACTIVATION_REQUEST}"
+  if geometry_runtime_managed_by_systemd && nav_stack_managed_by_systemd; then
+    return 0
+  fi
+  while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
+    if [[ ! -f "${request_file}" ]]; then
+      sleep 0.1
+      continue
+    fi
+    rm -f "${NUWAX_RUNTIME_ACTIVATION_RESULT}"
+    if ! read_runtime_activation_request "${request_file}"; then
+      RUNTIME_ACTIVATION_LEVEL="invalid"
+      RUNTIME_ACTIVATION_CAPABILITY="unknown"
+      write_runtime_activation_result failed request "invalid runtime activation request"
+      rm -f "${request_file}"
+      continue
+    fi
+    if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "guard" \
+      || "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
+      || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
+      write_runtime_activation_result activating motion_guard "waiting for motion guard component"
+      if ! wait_for_motion_guard_transport; then
+        write_runtime_activation_result failed motion_guard "motion guard is unavailable"
+        rm -f "${request_file}"
+        continue
+      fi
+    fi
+    if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
+      || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
+      write_runtime_activation_result activating navigation "starting navigation component"
+      if ! start_nav_stack; then
+        write_runtime_activation_result failed navigation "navigation stack failed to start"
+        rm -f "${request_file}"
+        continue
+      fi
+    fi
+    if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "geometry" \
+      || "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
+      || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
+      write_runtime_activation_result activating starting "starting geometry component"
+      if ! start_geometry_runtime; then
+        write_runtime_activation_result failed geometry "geometry runtime failed to start"
+        rm -f "${request_file}"
+        continue
+      fi
+      start_runtime_monitors
+    fi
+    if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
+      write_runtime_activation_result activating person_follow "starting person-follow component"
+      if ! start_person_follow; then
+        write_runtime_activation_result failed person_follow "person-follow failed to start"
+        rm -f "${request_file}"
+        continue
+      fi
+      if person_follow_managed_by_systemd && ! wait_for_person_follow_ready; then
+        write_runtime_activation_result failed person_follow "person-follow is not ready"
+        rm -f "${request_file}"
+        continue
+      fi
+      start_person_follow_monitor
+    fi
+    write_runtime_activation_result ready ready "requested runtime components are ready"
+    rm -f "${request_file}"
+  done
+}
+
+start_runtime_activation_monitor() {
+  if geometry_runtime_managed_by_systemd && nav_stack_managed_by_systemd; then
+    return 0
+  fi
+  monitor_runtime_activation_requests &
+  RUNTIME_ACTIVATION_MONITOR_PID="$!"
+}
+
+stop_runtime_activation_monitor() {
+  if [[ -n "${RUNTIME_ACTIVATION_MONITOR_PID}" ]] && is_pid_alive "${RUNTIME_ACTIVATION_MONITOR_PID}"; then
+    kill -TERM "${RUNTIME_ACTIVATION_MONITOR_PID}" >/dev/null 2>&1 || true
+    wait "${RUNTIME_ACTIVATION_MONITOR_PID}" >/dev/null 2>&1 || true
+  fi
+  RUNTIME_ACTIVATION_MONITOR_PID=""
+}
+
 stop_runtime_monitors() {
   local monitor_pid=""
   for monitor_pid in "${NAV_STACK_MONITOR_PID}" "${GEOMETRY_MONITOR_PID}"; do
@@ -843,6 +964,7 @@ stop_gateway() {
     terminate_process_scope "${GATEWAY_PID}" "gateway worker"
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
   fi
+  stop_runtime_activation_monitor
   stop_person_follow_monitor
   stop_runtime_monitors
   stop_person_follow
@@ -913,6 +1035,9 @@ export NUWAX_LCM_CHANNEL_GOAL_POSE="/nav/goal#nuwax_msgs.GoalEnvelope"
 export NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL="/nav/path#nuwax_msgs.PathEnvelope"
 export NUWAX_LCM_CHANNEL_NAV_PATH="/nav/path#nuwax_msgs.PathEnvelope"
 export GO2_VIDEO_STREAM_GATEWAY_URL="${GO2_VIDEO_STREAM_GATEWAY_URL:-ws://127.0.0.1:${PORT}/streams/video.ingest}"
+export NUWAX_RUNTIME_ACTIVATION_REQUEST="${NUWAX_RUNTIME_ACTIVATION_REQUEST:-${REPO_ROOT}/runtime_data/gateway/geometry.request}"
+export NUWAX_RUNTIME_ACTIVATION_RESULT="${NUWAX_RUNTIME_ACTIVATION_RESULT:-${REPO_ROOT}/runtime_data/gateway/geometry.result.json}"
+mkdir -p "$(dirname "${NUWAX_RUNTIME_ACTIVATION_REQUEST}")"
 # 个人机器狗：网关不鉴权，视频推流令牌默认留空（如需可单独设置 GO2_VIDEO_STREAM_ACCESS_TOKEN）。
 export GO2_VIDEO_STREAM_ACCESS_TOKEN="${GO2_VIDEO_STREAM_ACCESS_TOKEN:-}"
 
@@ -922,20 +1047,15 @@ trap remove_pid_file EXIT
 trap stop_gateway INT TERM
 
 if ! is_restart_enabled "${RESTART_POLICY}"; then
-  wait_for_motion_guard_transport
-  start_nav_stack
-  start_geometry_runtime
-  start_person_follow || abort_person_follow_startup
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
   start_go2_video_streamer
-  start_runtime_monitors
-  start_person_follow_monitor
+  start_runtime_activation_monitor
   wait "${GATEWAY_PID}"
   exit_code="$?"
   STOP_REQUESTED=1
-  stop_person_follow_monitor
+  stop_runtime_activation_monitor
   stop_runtime_monitors
   stop_person_follow
   stop_go2_video_streamer
@@ -946,20 +1066,15 @@ fi
 
 attempt=0
 while true; do
-  wait_for_motion_guard_transport
-  start_nav_stack
-  start_geometry_runtime
-  start_person_follow || abort_person_follow_startup
   set +e
   (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
   GATEWAY_PID="$!"
   start_go2_video_streamer
-  start_runtime_monitors
-  start_person_follow_monitor
+  start_runtime_activation_monitor
   wait "${GATEWAY_PID}"
   exit_code="$?"
   stop_go2_video_streamer
-  stop_person_follow_monitor
+  stop_runtime_activation_monitor
   GATEWAY_PID=""
   set -e
 

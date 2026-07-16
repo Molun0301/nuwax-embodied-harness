@@ -1,0 +1,9 @@
+[Unit]
+Description=NuwaX on-demand navigation and geometry activation request watcher
+
+[Path]
+PathExists=/run/nuwax/gateway/geometry.request
+Unit=nuwax-runtime-activation.service
+
+[Install]
+WantedBy=multi-user.target

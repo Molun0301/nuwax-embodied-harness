@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Dict, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Dict, FrozenSet, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from .config import atomic_write, fsync_directory, render_env
 from .profile import profile_sha256
@@ -3610,9 +3610,36 @@ def provision_safety(context: "ExecutionContext") -> None:
     )
 
 
+def _service_activation_contract(profile) -> Tuple[FrozenSet[str], FrozenSet[str]]:
+    services = frozenset(profile.services)
+    metadata = profile.metadata if isinstance(profile.metadata, Mapping) else {}
+    always_on_raw = metadata.get("always_on_services")
+    on_demand_raw = metadata.get("on_demand_services")
+    if always_on_raw is None and on_demand_raw is None:
+        return services, frozenset()
+    if not isinstance(always_on_raw, (list, tuple)) or not all(
+        isinstance(item, str) and item for item in always_on_raw
+    ):
+        raise DeploymentError("profile metadata always_on_services must be a list of unit names")
+    if not isinstance(on_demand_raw, (list, tuple)) or not all(
+        isinstance(item, str) and item for item in on_demand_raw
+    ):
+        raise DeploymentError("profile metadata on_demand_services must be a list of unit names")
+    always_on = frozenset(always_on_raw)
+    on_demand = frozenset(on_demand_raw)
+    if always_on & on_demand:
+        raise DeploymentError("profile service activation sets overlap")
+    if always_on | on_demand != services:
+        raise DeploymentError("profile service activation sets must cover profile.services exactly")
+    return always_on, on_demand
+
+
 def enable_and_start(context: "ExecutionContext") -> None:
     script = _require_file(_deployment_script(context), "release systemd installer")
     env = _deployment_env(context)
+    always_on_services, on_demand_services = _service_activation_contract(
+        context.profile
+    )
     if (
         context.notes.get("current_unchanged")
         and context.notes.get("config_unchanged")
@@ -3636,10 +3663,12 @@ def enable_and_start(context: "ExecutionContext") -> None:
                 ).returncode
                 == 0
             )
-            if service == "nuwax-person-follow.service":
-                all_ready = all_ready and (not enabled or active)
-            else:
+            if service in always_on_services:
                 all_ready = all_ready and enabled and active
+            elif service in on_demand_services:
+                all_ready = all_ready and not enabled
+            else:
+                all_ready = False
         if all_ready:
             context.notes["services_unchanged"] = True
             return

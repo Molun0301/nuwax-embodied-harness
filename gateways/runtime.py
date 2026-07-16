@@ -4,6 +4,7 @@ import base64
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from functools import partial
+import json
 import logging
 import math
 import os
@@ -329,7 +330,16 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
     },
 }
 _SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC = 1.5
-_ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
+_RUNTIME_ACTIVATION_TIMEOUT_SEC = 95.0
+_GEOMETRY_ONLY_CAPABILITY_NAMES = frozenset(
+    {
+        "relocalize_active_map",
+        "load_map_version",
+        "save_active_map_version",
+        "start_mapping",
+    }
+)
+_MOTION_STACK_CAPABILITY_NAMES = frozenset(
     {
         "navigate_to_pose",
         "navigate_to_named_location",
@@ -337,13 +347,24 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = frozenset(
         "explore_area",
         "explore_area_v2",
         "explore_and_find_target",
-        "relocalize_active_map",
-        "load_map_version",
-        "save_active_map_version",
-        "start_mapping",
-        "stop_mapping",
-        "stop_exploration",
     }
+)
+_GUARD_ONLY_CAPABILITY_NAMES = frozenset(
+    {
+        "relative_move",
+        "execute_sport_command",
+        "set_body_pose",
+        "set_speed_level",
+        "switch_control_mode",
+        "set_obstacle_avoidance",
+    }
+)
+_PERSON_FOLLOW_CAPABILITY_NAMES = frozenset({"follow_target"})
+_ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = (
+    _GEOMETRY_ONLY_CAPABILITY_NAMES
+    | _MOTION_STACK_CAPABILITY_NAMES
+    | _GUARD_ONLY_CAPABILITY_NAMES
+    | _PERSON_FOLLOW_CAPABILITY_NAMES
 )
 _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
     {
@@ -352,10 +373,22 @@ _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
         # 故从本集合移除，否则 _ensure_geometry_runtime_for_invoke 会在异步分派前同步等待。
         "save_active_map_version",
         "start_mapping",
-        "stop_mapping",
-        "stop_exploration",
+        *_GUARD_ONLY_CAPABILITY_NAMES,
+        *_PERSON_FOLLOW_CAPABILITY_NAMES,
     }
 )
+
+
+def _runtime_activation_level(capability_name: str) -> Optional[str]:
+    if capability_name in _GUARD_ONLY_CAPABILITY_NAMES:
+        return "guard"
+    if capability_name in _GEOMETRY_ONLY_CAPABILITY_NAMES:
+        return "geometry"
+    if capability_name in _MOTION_STACK_CAPABILITY_NAMES:
+        return "motion"
+    if capability_name in _PERSON_FOLLOW_CAPABILITY_NAMES:
+        return "person_follow"
+    return None
 
 
 def _has_observability_value(value: Any) -> bool:
@@ -804,16 +837,9 @@ class GatewayRuntime:
                 self.robot.manifest.robot_name,
                 self.robot.manifest.robot_model,
             )
-            readiness = self.motion_guard.start()
-            if not readiness.ready:
-                RUNTIME_LOGGER.warning(
-                    "motion guard transport ready but motion gate closed: %s",
-                    readiness.reason,
-                )
             self._mark_geometry_cmd_vel_sink_unavailable()
             self.robot.start()
             self._started = True
-            self._attach_geometry_runtime_on_start()
             try:
                 if self.perception_video_runtime.should_auto_start():
                     self.perception_video_runtime.start()
@@ -5146,7 +5172,6 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         del requested_by
-        self._ensure_geometry_runtime_for_capability("stop_mapping")
         reason = str(arguments.get("reason", "")).strip() or "stop_mapping"
         try:
             result = self.platform_geometry_runtime.stop_mapping(reason=reason)
@@ -5171,7 +5196,6 @@ class GatewayRuntime:
                 jsonrpc_code=-32602,
                 details={"required_parameter": "request_id"},
             )
-        self._ensure_geometry_runtime_for_capability("stop_exploration")
         try:
             context = self._stop_exploration_with_safety_barrier(
                 None,
@@ -8956,6 +8980,11 @@ class GatewayRuntime:
         )
 
     def _safe_stop_robot(self, reason: Optional[str]) -> None:
+        if not self.motion_guard.started:
+            RUNTIME_LOGGER.info(
+                "motion guard 尚未按需连接，Gateway 当前没有运动租约需要锁存。"
+            )
+            return
         self.motion_guard.latch_safety_stop(reason or "gateway safety stop")
 
     def _get_provider(self, provider_type: type, provider_label: str):
@@ -9961,85 +9990,308 @@ class GatewayRuntime:
             )
         if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
             return
-        geometry_config = self.config.geometry
-        if not bool(getattr(geometry_config, "enabled", False)) or not bool(
-            getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
-        ):
-            raise GatewayError(
-                "平台几何运行时已禁用，无法执行 %s。" % capability_name,
-                error_code="geometry_runtime_disabled",
-                http_status=409,
-                jsonrpc_code=-32000,
-                details={"capability_name": capability_name},
-            )
-        runtime_status = self.platform_geometry_runtime.get_runtime_status()
-        if runtime_status.get("started") and not runtime_status.get("blocked"):
+        activation_level = _runtime_activation_level(capability_name)
+        if activation_level != "guard":
+            geometry_config = self.config.geometry
+            if not bool(getattr(geometry_config, "enabled", False)) or not bool(
+                getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
+            ):
+                raise GatewayError(
+                    "平台几何运行时已禁用，无法执行 %s。" % capability_name,
+                    error_code="geometry_runtime_disabled",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={"capability_name": capability_name},
+                )
+        provider_ready = False
+        if activation_level in {"geometry", "motion", "person_follow"}:
+            provider_ready, _ = self._geometry_runtime_provider_ready()
+        if activation_level == "geometry" and provider_ready:
             return
         if capability_name in _SYNC_GEOMETRY_CAPABILITY_NAMES:
             self._ensure_geometry_runtime_started(capability_name)
             return
-        # ASYNC 类：runner 内会再次调用 ensure；此处只标记 pending 不阻塞
-        if str(runtime_status.get("phase") or "").lower() in {"failed", "disabled"}:
+        # ASYNC 类由 runner 内的 ensure 负责按需激活。上一次激活失败不能在
+        # 分派前永久封死后续重试；禁用配置已在上方单独处理。
+
+    def _geometry_runtime_provider_ready(self) -> Tuple[bool, str]:
+        getter = getattr(
+            self.platform_geometry_runtime,
+            "get_geometry_runtime_provider",
+            None,
+        )
+        provider = getter() if callable(getter) else None
+        if provider is None:
+            return False, "GeometryRuntimeProvider 未连接"
+        probe = getattr(
+            self.platform_geometry_runtime,
+            "probe_geometry_runtime_health",
+            None,
+        )
+        if not callable(probe):
+            return False, "GeometryRuntimeProvider 缺少 live GetStatus 探测"
+        try:
+            ok, message = probe()
+        except Exception as exc:
+            return False, "GeometryRuntimeProvider live GetStatus 失败：%s" % exc
+        return bool(ok), str(message or "ready")
+
+    def _request_geometry_runtime_activation(
+        self,
+        capability_name: str,
+        activation_level: str,
+    ) -> None:
+        if activation_level not in {
+            "guard",
+            "geometry",
+            "motion",
+            "person_follow",
+        }:
+            raise ValueError(
+                "unsupported runtime activation_level: %s" % activation_level
+            )
+        request_value = os.environ.get("NUWAX_RUNTIME_ACTIVATION_REQUEST", "").strip()
+        if not request_value:
+            return
+        request_path = Path(request_value)
+        result_path = Path(
+            os.environ.get(
+                "NUWAX_RUNTIME_ACTIVATION_RESULT",
+                str(request_path.with_suffix(".result.json")),
+            )
+        )
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            result_path.unlink(missing_ok=True)
+            temporary = request_path.with_name(
+                ".%s.%s.%s.tmp"
+                % (request_path.name, os.getpid(), threading.get_ident())
+            )
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "capability_name": capability_name,
+                        "activation_level": activation_level,
+                        "requested_at": utc_now().isoformat(),
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temporary, request_path)
+        except OSError as exc:
             raise GatewayError(
-                str(runtime_status.get("message") or "平台几何运行时未就绪。"),
-                error_code="geometry_runtime_unavailable",
+                "无法提交按需组件激活请求：%s" % exc,
+                error_code="runtime_activation_request_failed",
                 http_status=503,
                 jsonrpc_code=-32010,
-                details={"capability_name": capability_name, "runtime_status": runtime_status},
+                details={
+                    "capability_name": capability_name,
+                    "activation_level": activation_level,
+                    "request_path": str(request_path),
+                },
+            ) from exc
+
+        try:
+            timeout_sec = max(
+                1.0,
+                float(
+                    os.environ.get(
+                        "NUWAX_RUNTIME_ACTIVATION_TIMEOUT_SEC",
+                        str(_RUNTIME_ACTIVATION_TIMEOUT_SEC),
+                    )
+                ),
             )
+        except (TypeError, ValueError):
+            timeout_sec = _RUNTIME_ACTIVATION_TIMEOUT_SEC
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                time.sleep(0.1)
+                continue
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.1)
+                continue
+            state = str(payload.get("state") or "").strip().lower()
+            result_level = str(
+                payload.get("activation_level") or ""
+            ).strip().lower()
+            if result_level and result_level != activation_level:
+                time.sleep(0.1)
+                continue
+            if state == "ready":
+                return
+            if state == "failed":
+                raise GatewayError(
+                    str(payload.get("message") or "按需组件激活失败。"),
+                    error_code="runtime_activation_failed",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                    details={
+                        "capability_name": capability_name,
+                        "activation_level": activation_level,
+                        "activation": payload,
+                    },
+                )
+            time.sleep(0.1)
+        raise GatewayError(
+            "等待按需组件激活超时。",
+            error_code="runtime_activation_timeout",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={
+                "capability_name": capability_name,
+                "activation_level": activation_level,
+                "request_path": str(request_path),
+                "result_path": str(result_path),
+                "timeout_sec": timeout_sec,
+            },
+        )
+
+    def _ensure_motion_guard_connected(self, capability_name: str) -> None:
+        try:
+            readiness = self.motion_guard.start()
+        except GatewayMotionGuardError as exc:
+            raise self._motion_guard_gateway_error(capability_name, exc) from exc
+        if readiness.ready:
+            return
+        raise GatewayError(
+            "motion guard 尚未解除安全复位门禁：%s" % readiness.reason,
+            error_code="motion_guard_reset_required",
+            http_status=409,
+            jsonrpc_code=-32000,
+            details={
+                "capability_name": capability_name,
+                "reason": readiness.reason,
+                "generation": readiness.generation,
+            },
+        )
 
     def _ensure_geometry_runtime_started(self, capability_name: str) -> None:
         """同步等待平台几何运行时就绪；多个并发调用共享同一个启动事件。"""
 
-        with self._geometry_runtime_lock:
-            event = self._geometry_runtime_start_event
-        if event is not None and not event.is_set():
-            event.wait()
-        runtime_status = self.platform_geometry_runtime.get_runtime_status()
-        if runtime_status.get("started") and not runtime_status.get("blocked"):
-            return
-        with self._geometry_runtime_lock:
-            event = self._geometry_runtime_start_event
-            should_start = event is None
+        activation_level = _runtime_activation_level(capability_name) or "geometry"
+        requires_geometry = activation_level in {
+            "geometry",
+            "motion",
+            "person_follow",
+        }
+        requires_guard = activation_level in {
+            "guard",
+            "motion",
+            "person_follow",
+        }
+        while True:
+            provider_ready = False
+            if requires_geometry:
+                provider_ready, _ = self._geometry_runtime_provider_ready()
+            if activation_level == "geometry" and provider_ready:
+                return
+            if activation_level == "guard" and self.motion_guard.started:
+                self._ensure_motion_guard_connected(capability_name)
+                return
+            with self._geometry_runtime_lock:
+                event = self._geometry_runtime_start_event
+                should_start = event is None
+                if should_start:
+                    event = threading.Event()
+                    self._geometry_runtime_start_event = event
             if should_start:
-                event = threading.Event()
-                self._geometry_runtime_start_event = event
+                break
+            event.wait()
+            if activation_level in {"motion", "person_follow"}:
+                provider_ready, _ = self._geometry_runtime_provider_ready()
+                if provider_ready and self.motion_guard.started:
+                    self._ensure_motion_guard_connected(capability_name)
+                    if activation_level == "motion":
+                        return
+                    if self._person_follow_readiness().ready:
+                        return
         if should_start:
             try:
-                self.platform_geometry_runtime.start()
+                self._request_geometry_runtime_activation(
+                    capability_name,
+                    activation_level,
+                )
+                if requires_geometry:
+                    provider_ready, provider_message = (
+                        self._geometry_runtime_provider_ready()
+                    )
+                    if not provider_ready:
+                        runtime_status = self.platform_geometry_runtime.get_runtime_status()
+                        if runtime_status.get("started"):
+                            self._stop_runtime_input_bridge()
+                            self.platform_geometry_runtime.stop()
+                        self.platform_geometry_runtime.start()
+                        provider_ready, provider_message = (
+                            self._geometry_runtime_provider_ready()
+                        )
+                        if not provider_ready:
+                            raise GatewayError(
+                                provider_message,
+                                error_code="geometry_runtime_unavailable",
+                                http_status=503,
+                                jsonrpc_code=-32010,
+                                details={
+                                    "capability_name": capability_name,
+                                    "activation_level": activation_level,
+                                },
+                            )
+                        self._mark_geometry_cmd_vel_sink_unavailable()
+                        self._start_runtime_input_bridge()
+                if requires_guard:
+                    self._ensure_motion_guard_connected(capability_name)
+                if activation_level == "person_follow":
+                    readiness = self._person_follow_readiness()
+                    if not readiness.ready:
+                        raise GatewayError(
+                            "person-follow 按需启动后仍未就绪：%s" % readiness.reason,
+                            error_code="person_follow_unavailable",
+                            http_status=503,
+                            jsonrpc_code=-32010,
+                            details={
+                                "capability_name": capability_name,
+                                "activation_level": activation_level,
+                                "person_follow_reason": readiness.reason,
+                                "person_follow_ready_file": readiness.ready_file,
+                            },
+                        )
             except Exception as exc:
-                event.set()
-                with self._geometry_runtime_lock:
-                    self._geometry_runtime_start_event = None
                 if isinstance(exc, GatewayError):
                     raise
                 raise GatewayError(
-                    "按需启动平台几何运行时失败：%s" % exc,
-                    error_code="geometry_runtime_start_failed",
+                    "按需启动运行组件失败：%s" % exc,
+                    error_code="runtime_component_start_failed",
                     http_status=503,
                     jsonrpc_code=-32010,
-                    details={"capability_name": capability_name},
+                    details={
+                        "capability_name": capability_name,
+                        "activation_level": activation_level,
+                    },
                 ) from exc
-            self._mark_geometry_cmd_vel_sink_unavailable()
-            # Phase 5 lifecycle 接线（lane-5）：platform_geometry_runtime.start() 完成后，
-            # Rust gRPC 远程 provider 已就绪；此刻才构造并启动 RuntimeInputBridge，把
-            # sensor producer 的 localization/pointcloud 回调真正转译为 PublishOdom /
-            # PublishPointCloud。stop 时在 stop() 中早于 platform_geometry_runtime.stop()
-            # 先停，避免 callback 仍在运行而 gRPC 已下线。
-            self._start_runtime_input_bridge()
-            event.set()
-            with self._geometry_runtime_lock:
-                self._geometry_runtime_start_event = None
-        else:
-            event.wait()
-        runtime_status = self.platform_geometry_runtime.get_runtime_status()
-        if runtime_status.get("blocked") or str(runtime_status.get("phase") or "").lower() in {"failed", "disabled"}:
+            finally:
+                event.set()
+                with self._geometry_runtime_lock:
+                    self._geometry_runtime_start_event = None
+        if not requires_geometry:
+            return
+        provider_ready, provider_message = self._geometry_runtime_provider_ready()
+        if not provider_ready:
+            runtime_status = self.platform_geometry_runtime.get_runtime_status()
             raise GatewayError(
-                str(runtime_status.get("message") or "平台几何运行时未就绪。"),
+                provider_message
+                or str(runtime_status.get("message") or "平台几何运行时未就绪。"),
                 error_code="geometry_runtime_unavailable",
                 http_status=503,
                 jsonrpc_code=-32010,
-                details={"capability_name": capability_name, "runtime_status": runtime_status},
+                details={
+                    "capability_name": capability_name,
+                    "activation_level": activation_level,
+                    "runtime_status": runtime_status,
+                },
             )
 
     def _ensure_geometry_runtime_for_capability(self, capability_name: str) -> None:
@@ -10047,17 +10299,19 @@ class GatewayRuntime:
 
         if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
             return
-        geometry_config = self.config.geometry
-        if not bool(getattr(geometry_config, "enabled", False)) or not bool(
-            getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
-        ):
-            raise GatewayError(
-                "平台几何运行时已禁用，无法执行 %s。" % capability_name,
-                error_code="geometry_runtime_disabled",
-                http_status=409,
-                jsonrpc_code=-32000,
-                details={"capability_name": capability_name},
-            )
+        activation_level = _runtime_activation_level(capability_name)
+        if activation_level != "guard":
+            geometry_config = self.config.geometry
+            if not bool(getattr(geometry_config, "enabled", False)) or not bool(
+                getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
+            ):
+                raise GatewayError(
+                    "平台几何运行时已禁用，无法执行 %s。" % capability_name,
+                    error_code="geometry_runtime_disabled",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={"capability_name": capability_name},
+                )
         self._ensure_geometry_runtime_started(capability_name)
 
     def _schedule_exploration_workspace_finalize(self, *, map_name: str, trigger: str) -> None:
@@ -10432,35 +10686,24 @@ class GatewayRuntime:
             ),
             "follow_target": (
                 lambda: self._has_provider(ImageProvider)
-                and self.motion_guard.is_ready(
-                    motion_guard_pb.GUARD_SOURCE_GATEWAY_FOLLOW
-                )
-                and self._person_follow_readiness().ready,
-                "当前机器人入口未提供图像采集、motion guard 未就绪，或 person-follow ready marker 无效。",
+                and self._person_follow_readiness().enabled,
+                "当前机器人入口未提供图像采集，或 person-follow 已禁用。",
             ),
             "relative_move": (
-                lambda: self.motion_guard.is_ready(
-                    motion_guard_pb.GUARD_SOURCE_GATEWAY_RELATIVE
-                ),
-                "motion guard 未就绪。",
+                lambda: True,
+                None,
             ),
             "execute_sport_command": (
-                lambda: self.motion_guard.is_ready(
-                    motion_guard_pb.GUARD_SOURCE_GATEWAY_SPORT
-                ),
-                "motion guard 的 GATEWAY_SPORT source 未就绪。",
+                lambda: True,
+                None,
             ),
             "set_body_pose": (
-                lambda: self.motion_guard.is_ready(
-                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
-                ),
-                "motion guard 的 GATEWAY_MANUAL source 未就绪。",
+                lambda: True,
+                None,
             ),
             "set_speed_level": (
-                lambda: self.motion_guard.is_ready(
-                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
-                ),
-                "motion guard 的 GATEWAY_MANUAL source 未就绪。",
+                lambda: True,
+                None,
             ),
             "get_joint_state": (
                 lambda: self._has_provider(StateProvider),
@@ -10485,16 +10728,12 @@ class GatewayRuntime:
                 "motion guard 不可达。",
             ),
             "switch_control_mode": (
-                lambda: self.motion_guard.is_ready(
-                    motion_guard_pb.GUARD_SOURCE_GATEWAY_SPORT
-                ),
-                "motion guard 的 GATEWAY_SPORT source 未就绪。",
+                lambda: True,
+                None,
             ),
             "set_obstacle_avoidance": (
-                lambda: self.motion_guard.is_ready(
-                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
-                ),
-                "motion guard 的 GATEWAY_MANUAL source 未就绪。",
+                lambda: True,
+                None,
             ),
             "get_robot_status": (
                 lambda: self._has_provider(StateProvider),
@@ -10508,6 +10747,10 @@ class GatewayRuntime:
                 supported = bool(checker())
             except Exception:
                 supported = False
+        activation_level = _runtime_activation_level(capability_name)
+        if activation_level is not None:
+            metadata["on_demand_activation"] = True
+            metadata["runtime_activation_level"] = activation_level
         metadata["runtime_gateway"] = "enabled"
         metadata["dynamic_availability"] = capability_name in dynamic_support
         return CapabilityAvailability(

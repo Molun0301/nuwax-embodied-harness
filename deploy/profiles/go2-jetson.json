@@ -141,6 +141,8 @@
     "nuwax-nav-stack.service",
     "nuwax-geometry-runtime.service",
     "nuwax-person-follow.service",
+    "nuwax-runtime-activation.service",
+    "nuwax-runtime-activation.path",
     "nuwax-host-gateway.service"
   ],
   "models": {
@@ -153,6 +155,17 @@
     }
   },
   "metadata": {
+    "always_on_services": [
+      "nuwax-runtime-activation.path",
+      "nuwax-host-gateway.service"
+    ],
+    "on_demand_services": [
+      "nuwax-motion-safety-guard.service",
+      "nuwax-nav-stack.service",
+      "nuwax-geometry-runtime.service",
+      "nuwax-person-follow.service",
+      "nuwax-runtime-activation.service"
+    ],
     "minimum_free_gb": 40,
     "required_dds_interface": "eth0",
     "lock_status": "pending",

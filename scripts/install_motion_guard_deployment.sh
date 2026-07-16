@@ -28,6 +28,8 @@ GUARD_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-motion-safety-guard.service
 NAV_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-nav-stack.service"
 GEOMETRY_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-geometry-runtime.service"
 PERSON_FOLLOW_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-person-follow.service"
+RUNTIME_ACTIVATION_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-runtime-activation.service"
+RUNTIME_ACTIVATION_PATH_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-runtime-activation.path"
 GATEWAY_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-host-gateway.service"
 GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
 PROVISIONER="${REPO_ROOT}/scripts/provision_motion_guard.py"
@@ -67,11 +69,13 @@ GATEWAY_WRITE_DIRS=(
   /var/log/nuwax/gateway
 )
 DEPLOYMENT_UNITS=(
-  nuwax-motion-safety-guard
-  nuwax-nav-stack
-  nuwax-geometry-runtime
-  nuwax-person-follow
-  nuwax-host-gateway
+  nuwax-motion-safety-guard.service
+  nuwax-nav-stack.service
+  nuwax-geometry-runtime.service
+  nuwax-person-follow.service
+  nuwax-runtime-activation.service
+  nuwax-runtime-activation.path
+  nuwax-host-gateway.service
 )
 
 fail() {
@@ -265,14 +269,15 @@ check_unit_templates() {
   local unit_path=""
   rendered_dir="$(mktemp -d)"
   for source in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
-                "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+                "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
     render_unit_to "${source}" "${rendered_dir}/$(basename "${source}")"
   done
   # Unit syntax validation is independent from release binary availability;
   # install-time binary gates are conditional on person-follow autostart.
   unit_path="${rendered_dir}:/etc/systemd/system:/run/systemd/system:/usr/local/lib/systemd/system:/usr/lib/systemd/system:/lib/systemd/system"
   if ! SYSTEMD_UNIT_PATH="${unit_path}" systemd-analyze verify \
-      "${rendered_dir}"/*.service; then
+      "${rendered_dir}"/*.service "${rendered_dir}"/*.path; then
     rm -rf "${rendered_dir}"
     fail "rendered systemd unit verification failed"
   fi
@@ -283,7 +288,8 @@ check_systemd_owned_invariants() {
   local unit=""
   local command=""
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
-              "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+              "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+              "${GATEWAY_UNIT_SOURCE}"; do
     grep -q '^ExecStart=/usr/bin/env ' "${unit}" \
       || fail "ExecStart does not force systemd-owned invariants: ${unit}"
     while IFS= read -r command; do
@@ -348,31 +354,34 @@ check_systemd_owned_invariants() {
     || fail "person-follow must use bounded geometry readiness, not a one-shot file test"
   ! grep -Eq '^(Requires|Wants)=.*nuwax-person-follow\.service' "${GATEWAY_UNIT_SOURCE}" \
     || fail "Gateway must not pull the optional person-follow unit"
-  grep -q '^After=.*nuwax-geometry-runtime\.service.*nuwax-person-follow\.service' \
+  ! grep -Eq '^(Requires|BindsTo|PartOf)=.*nuwax-(motion-safety-guard|nav-stack|geometry-runtime|person-follow)\.service' \
     "${GATEWAY_UNIT_SOURCE}" \
-    || fail "Gateway must start after optional person-follow when both are scheduled"
+    || fail "Gateway must remain independent from optional runtime components"
+  grep -qx 'After=network-online.target' "${GATEWAY_UNIT_SOURCE}" \
+    || fail "Gateway must only order itself after the network"
+  grep -qF 'PathExists=/run/nuwax/gateway/geometry.request' \
+    "${RUNTIME_ACTIVATION_PATH_SOURCE}" \
+    || fail "runtime activation path does not watch the Gateway request file"
+  grep -qF 'activate_geometry_runtime.sh' "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+    || fail "runtime activation service does not call the canonical activator"
   grep -qx 'BindsTo=nuwax-motion-safety-guard.service' "${NAV_UNIT_SOURCE}" \
     || fail "nav unit does not fail-stop with motion guard"
   grep -qx 'PartOf=nuwax-motion-safety-guard.service' "${NAV_UNIT_SOURCE}" \
     || fail "nav restart lifecycle is not part of motion guard"
-  grep -qx 'BindsTo=nuwax-motion-safety-guard.service nuwax-nav-stack.service' \
+  ! grep -Eq '^(Requires|BindsTo|PartOf)=.*nuwax-(motion-safety-guard|nav-stack)\.service' \
     "${GEOMETRY_UNIT_SOURCE}" \
-    || fail "geometry unit does not fail-stop with guard/nav"
-  grep -qx 'PartOf=nuwax-motion-safety-guard.service nuwax-nav-stack.service' \
+    || fail "geometry unit must remain independently startable for mapping"
+  grep -qx 'After=network-online.target' "${GEOMETRY_UNIT_SOURCE}" \
+    || fail "geometry unit must only order itself after the network"
+  ! grep -Eq 'wait_for_(motion_guard_socket|nav_stack_ready)\.sh' \
     "${GEOMETRY_UNIT_SOURCE}" \
-    || fail "geometry restart lifecycle is not part of guard/nav"
+    || fail "geometry startup must not wait for motion-only components"
   grep -qx 'BindsTo=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service' \
     "${PERSON_FOLLOW_UNIT_SOURCE}" \
     || fail "person-follow unit does not fail-stop with mandatory dependencies"
   grep -qx 'PartOf=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service' \
     "${PERSON_FOLLOW_UNIT_SOURCE}" \
     || fail "person-follow restart lifecycle is not part of mandatory dependencies"
-  grep -qx 'BindsTo=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service' \
-    "${GATEWAY_UNIT_SOURCE}" \
-    || fail "Gateway unit does not fail-stop with mandatory dependencies"
-  grep -qx 'PartOf=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service' \
-    "${GATEWAY_UNIT_SOURCE}" \
-    || fail "Gateway restart lifecycle is not part of mandatory dependencies"
   for assignment in \
       'NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope' \
       'NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope' \
@@ -411,6 +420,8 @@ check_sources() {
   check_file "${NAV_UNIT_SOURCE}"
   check_file "${GEOMETRY_UNIT_SOURCE}"
   check_file "${PERSON_FOLLOW_UNIT_SOURCE}"
+  check_file "${RUNTIME_ACTIVATION_UNIT_SOURCE}"
+  check_file "${RUNTIME_ACTIVATION_PATH_SOURCE}"
   check_file "${GATEWAY_UNIT_SOURCE}"
   check_file "${GUARD_MODULE}"
   check_file "${PROVISIONER}"
@@ -420,6 +431,7 @@ check_sources() {
   check_file "${GEOMETRY_READY_HELPER}"
   check_file "${PERSON_FOLLOW_LAUNCHER}"
   check_file "${PERSON_FOLLOW_READY_HELPER}"
+  check_file "${REPO_ROOT}/scripts/systemd/activate_geometry_runtime.sh"
   validate_sysusers_source
   check_service_uid_collisions "${SYSUSERS_SOURCE}"
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
@@ -429,6 +441,8 @@ check_sources() {
     grep -qF '@NUWAX_CONFIG_DIR@' "${unit}" \
       || fail "systemd source is not a config-directory template: ${unit}"
   done
+  grep -qF '@NUWAX_REPO_ROOT@' "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+    || fail "runtime activation service is not a repository-root template"
   grep -qF '@NUWAX_PYTHON_BIN@' "${GUARD_UNIT_SOURCE}" \
     || fail "motion guard source is not a Python interpreter template"
   for unit in "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" "${PERSON_FOLLOW_UNIT_SOURCE}"; do
@@ -445,6 +459,7 @@ check_sources() {
     "${PROCESS_IDENTITY_HELPER}" \
     "${REPO_ROOT}/scripts/systemd/wait_for_nav_stack_ready.sh" \
     "${REPO_ROOT}/scripts/systemd/wait_for_motion_guard_socket.sh" \
+    "${REPO_ROOT}/scripts/systemd/activate_geometry_runtime.sh" \
     "${LCM_PREFLIGHT}" \
     "${REPO_ROOT}/scripts/build_nav_stack.sh" \
     "${REPO_ROOT}/scripts/start_gateway.sh"
@@ -573,18 +588,18 @@ snapshot_systemd_state() {
     "${SYSTEMD_BACKUP_DIR}/tmpfiles"
   : > "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
   for unit in "${DEPLOYMENT_UNITS[@]}"; do
-    base="/etc/systemd/system/${unit}.service"
+    base="/etc/systemd/system/${unit}"
     dropins="${base}.d"
-    enabled="$(systemctl is-enabled "${unit}.service" 2>/dev/null || true)"
-    active="$(systemctl is-active "${unit}.service" 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
+    active="$(systemctl is-active "${unit}" 2>/dev/null || true)"
     printf '%s\t%s\t%s\n' "${unit}" "${enabled:-disabled}" "${active:-inactive}" \
       >> "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
     [[ ! -L "${base}" ]] || fail "refusing systemd unit symlink: ${base}"
     if [[ -f "${base}" && ! -L "${base}" ]]; then
-      cp -a "${base}" "${SYSTEMD_BACKUP_DIR}/units/${unit}.service"
+      cp -a "${base}" "${SYSTEMD_BACKUP_DIR}/units/${unit}"
     fi
     if [[ -d "${dropins}" && ! -L "${dropins}" ]]; then
-      cp -a "${dropins}" "${SYSTEMD_BACKUP_DIR}/dropins/${unit}.service.d"
+      cp -a "${dropins}" "${SYSTEMD_BACKUP_DIR}/dropins/${unit}.d"
     elif [[ -L "${dropins}" ]]; then
       fail "refusing systemd drop-in symlink: ${dropins}"
     fi
@@ -609,7 +624,7 @@ remove_legacy_dropins() {
   local dropins=""
   snapshot_systemd_state
   for unit in "${DEPLOYMENT_UNITS[@]}"; do
-    dropins="/etc/systemd/system/${unit}.service.d"
+    dropins="/etc/systemd/system/${unit}.d"
     if [[ -d "${dropins}" && ! -L "${dropins}" ]]; then
       rm -rf "${dropins}"
     elif [[ -L "${dropins}" ]]; then
@@ -625,7 +640,8 @@ systemd_sources_changed() {
   local unit=""
   rendered_dir="$(mktemp -d)"
   for source in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
-                "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+                "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
     unit="$(basename "${source}")"
     render_unit_to "${source}" "${rendered_dir}/${unit}"
     installed="/etc/systemd/system/${unit}"
@@ -656,16 +672,16 @@ restore_systemd_state() {
   [[ -f "${SYSTEMD_BACKUP_DIR}/snapshot.complete" ]] \
     || fail "systemd rollback snapshot is missing: ${SYSTEMD_BACKUP_DIR}"
   for unit in "${DEPLOYMENT_UNITS[@]}"; do
-    base="/etc/systemd/system/${unit}.service"
-    saved="${SYSTEMD_BACKUP_DIR}/units/${unit}.service"
+    base="/etc/systemd/system/${unit}"
+    saved="${SYSTEMD_BACKUP_DIR}/units/${unit}"
     if [[ -f "${saved}" ]]; then
       install -D -m 0644 "${saved}" "${base}"
     else
       rm -f "${base}"
     fi
     rm -rf "${base}.d"
-    if [[ -d "${SYSTEMD_BACKUP_DIR}/dropins/${unit}.service.d" ]]; then
-      cp -a "${SYSTEMD_BACKUP_DIR}/dropins/${unit}.service.d" "${base}.d"
+    if [[ -d "${SYSTEMD_BACKUP_DIR}/dropins/${unit}.d" ]]; then
+      cp -a "${SYSTEMD_BACKUP_DIR}/dropins/${unit}.d" "${base}.d"
     fi
   done
   for kind in sysusers tmpfiles; do
@@ -679,15 +695,15 @@ restore_systemd_state() {
   systemctl daemon-reload
   while IFS=$'\t' read -r unit enabled active; do
     case "${enabled}" in
-      enabled|enabled-runtime|linked|linked-runtime|alias) systemctl enable "${unit}.service" ;;
-      *) systemctl disable "${unit}.service" || true ;;
+      enabled|enabled-runtime|linked|linked-runtime|alias) systemctl enable "${unit}" ;;
+      *) systemctl disable "${unit}" || true ;;
     esac
   done < "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
   while IFS=$'\t' read -r unit enabled active; do
     if [[ "${active}" == "active" ]]; then
-      systemctl restart "${unit}.service"
+      systemctl restart "${unit}"
     else
-      systemctl stop "${unit}.service" || true
+      systemctl stop "${unit}" || true
     fi
   done < "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
 }
@@ -787,6 +803,9 @@ check_record() {
 
 verify_installed() {
   local effective_unit=""
+  local installed_unit=""
+  local unit_file=""
+  local unit_name=""
   getent passwd nuwax-motion-guard >/dev/null || fail "missing user nuwax-motion-guard"
   getent passwd nuwax-motion-admin >/dev/null || fail "missing user nuwax-motion-admin"
   getent passwd nuwax-navigation >/dev/null || fail "missing user nuwax-navigation"
@@ -806,19 +825,20 @@ verify_installed() {
   check_runtime_config_permissions
   check_runtime_binaries
   check_service_access
-  for unit in nuwax-motion-safety-guard nuwax-nav-stack nuwax-geometry-runtime \
-              nuwax-person-follow nuwax-host-gateway; do
-    installed_unit="/etc/systemd/system/${unit}.service"
+  for unit_file in "${DEPLOYMENT_UNITS[@]}"; do
+    installed_unit="/etc/systemd/system/${unit_file}"
     [[ -f "${installed_unit}" ]] || fail "missing installed unit: ${installed_unit}"
     ! grep -Eq '@NUWAX_[A-Z0-9_]+@' "${installed_unit}" \
       || fail "unrendered deployment placeholder: ${installed_unit}"
-    grep -qF "WorkingDirectory=${RENDER_ROOT}" "${installed_unit}" \
-      || fail "installed unit does not target ${RENDER_ROOT}: ${installed_unit}"
-    effective_unit="$(systemctl cat --no-pager "${unit}.service")"
-    grep -qF "WorkingDirectory=${RENDER_ROOT}" <<< "${effective_unit}" \
-      || fail "effective systemd unit does not target ${RENDER_ROOT}: ${unit}"
-    ! grep -qF '.service.d/' <<< "${effective_unit}" \
-      || fail "unexpected systemd drop-in still overrides ${unit}.service"
+    effective_unit="$(systemctl cat --no-pager "${unit_file}")"
+    if [[ "${unit_file}" == *.service ]]; then
+      grep -qF "WorkingDirectory=${RENDER_ROOT}" "${installed_unit}" \
+        || fail "installed unit does not target ${RENDER_ROOT}: ${installed_unit}"
+      grep -qF "WorkingDirectory=${RENDER_ROOT}" <<< "${effective_unit}" \
+        || fail "effective systemd unit does not target ${RENDER_ROOT}: ${unit_file}"
+    fi
+    ! grep -qF "${unit_file}.d/" <<< "${effective_unit}" \
+      || fail "unexpected systemd drop-in still overrides ${unit_file}"
   done
   check_installed_actuator_manifest
   "${PROVISIONER}" verify \
@@ -826,55 +846,71 @@ verify_installed() {
     --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   check_record "${GUARD_STATE_DIR}/provisioned.json" 400
   check_record "${GUARD_STATE_DIR}/epoch.json" 600
-  [[ -S "${GUARD_SOCKET}" ]] || fail "motion guard socket is absent: ${GUARD_SOCKET}"
-  [[ -f "${GUARD_LOCK}" && ! -L "${GUARD_LOCK}" ]] \
-    || fail "motion guard lock is absent, non-regular, or a symlink: ${GUARD_LOCK}"
-  [[ "$(stat -c '%U:%G %a' "${GUARD_LOCK}")" == "nuwax-motion-guard:nuwax-motion-guard 600" ]] \
-    || fail "motion guard lock owner/mode drift: ${GUARD_LOCK}"
-  NUWAX_MOTION_GUARD_SOCKET="${GUARD_SOCKET}" \
-    bash "${REPO_ROOT}/scripts/systemd/wait_for_motion_guard_socket.sh" check
-  systemctl is-active --quiet nuwax-motion-safety-guard.service \
-    || fail "nuwax-motion-safety-guard.service is not active"
-  systemctl is-active --quiet nuwax-nav-stack.service \
-    || fail "nuwax-nav-stack.service is not active"
-  NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready \
-    bash "${REPO_ROOT}/scripts/systemd/wait_for_nav_stack_ready.sh" check \
-    || fail "nuwax-nav-stack ready state is absent or stale"
-  systemctl is-active --quiet nuwax-geometry-runtime.service \
-    || fail "nuwax-geometry-runtime.service is not active"
-  NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready \
-    NUWAX_GEOMETRY_RUNTIME_PORT=50051 \
-    bash "${GEOMETRY_READY_HELPER}" check \
-    || fail "nuwax-geometry-runtime ready state is absent or stale"
-  if person_follow_autostart_enabled; then
-    systemctl is-active --quiet nuwax-person-follow.service \
-      || fail "nuwax-person-follow.service is not active"
+  systemctl is-enabled --quiet nuwax-host-gateway.service \
+    || fail "nuwax-host-gateway.service is not enabled"
+  systemctl is-active --quiet nuwax-host-gateway.service \
+    || fail "nuwax-host-gateway.service is not active"
+  systemctl is-enabled --quiet nuwax-runtime-activation.path \
+    || fail "nuwax-runtime-activation.path is not enabled"
+  systemctl is-active --quiet nuwax-runtime-activation.path \
+    || fail "nuwax-runtime-activation.path is not active"
+  for unit_name in nuwax-motion-safety-guard.service nuwax-nav-stack.service \
+                   nuwax-geometry-runtime.service nuwax-person-follow.service \
+                   nuwax-runtime-activation.service; do
+    ! systemctl is-enabled --quiet "${unit_name}" \
+      || fail "${unit_name} must not be enabled for eager boot startup"
+  done
+
+  if systemctl is-active --quiet nuwax-motion-safety-guard.service; then
+    [[ -S "${GUARD_SOCKET}" ]] || fail "motion guard socket is absent: ${GUARD_SOCKET}"
+    [[ -f "${GUARD_LOCK}" && ! -L "${GUARD_LOCK}" ]] \
+      || fail "motion guard lock is absent, non-regular, or a symlink: ${GUARD_LOCK}"
+    [[ "$(stat -c '%U:%G %a' "${GUARD_LOCK}")" == "nuwax-motion-guard:nuwax-motion-guard 600" ]] \
+      || fail "motion guard lock owner/mode drift: ${GUARD_LOCK}"
+    NUWAX_MOTION_GUARD_SOCKET="${GUARD_SOCKET}" \
+      bash "${REPO_ROOT}/scripts/systemd/wait_for_motion_guard_socket.sh" check
+  fi
+  if systemctl is-active --quiet nuwax-nav-stack.service; then
+    systemctl is-active --quiet nuwax-motion-safety-guard.service \
+      || fail "active nav stack requires an active motion guard"
+    NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready \
+      bash "${REPO_ROOT}/scripts/systemd/wait_for_nav_stack_ready.sh" check \
+      || fail "nuwax-nav-stack ready state is absent or stale"
+  fi
+  if systemctl is-active --quiet nuwax-geometry-runtime.service; then
+    NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready \
+      NUWAX_GEOMETRY_RUNTIME_PORT=50051 \
+      bash "${GEOMETRY_READY_HELPER}" check \
+      || fail "nuwax-geometry-runtime ready state is absent or stale"
+    for path in \
+        /var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap \
+        /var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap; do
+      [[ -f "${path}" && ! -L "${path}" ]] \
+        || fail "geometry shared-memory file is missing or unsafe: ${path}"
+      [[ "$(stat -c '%U:%G %a' "${path}")" == "nuwax-geometry:nuwax-motion-clients 660" ]] \
+        || fail "geometry shared-memory owner/mode drift: ${path}"
+    done
+  fi
+  if systemctl is-active --quiet nuwax-person-follow.service; then
+    systemctl is-active --quiet nuwax-motion-safety-guard.service \
+      || fail "active person-follow requires an active motion guard"
+    systemctl is-active --quiet nuwax-nav-stack.service \
+      || fail "active person-follow requires an active nav stack"
+    systemctl is-active --quiet nuwax-geometry-runtime.service \
+      || fail "active person-follow requires an active geometry runtime"
     NUWAX_PERSON_FOLLOW_READY_FILE=/run/nuwax/person-follow/nuwax_person_follow.ready \
       bash "${PERSON_FOLLOW_READY_HELPER}" check \
       || fail "nuwax-person-follow ready state is absent or stale"
-  else
-    ! systemctl is-enabled --quiet nuwax-person-follow.service \
-      || fail "nuwax-person-follow.service is enabled while AUTOSTART=false"
   fi
-  systemctl is-active --quiet nuwax-host-gateway.service \
-    || fail "nuwax-host-gateway.service is not active"
-  for path in \
-      /var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap \
-      /var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap; do
-    [[ -f "${path}" && ! -L "${path}" ]] \
-      || fail "geometry shared-memory file is missing or unsafe: ${path}"
-    [[ "$(stat -c '%U:%G %a' "${path}")" == "nuwax-geometry:nuwax-motion-clients 660" ]] \
-      || fail "geometry shared-memory owner/mode drift: ${path}"
-  done
-  for unit in nuwax-motion-safety-guard nuwax-nav-stack nuwax-geometry-runtime \
-              nuwax-person-follow nuwax-host-gateway; do
-    if [[ "${unit}" == "nuwax-person-follow" ]] && ! person_follow_autostart_enabled; then
-      continue
+  for unit_name in nuwax-host-gateway.service nuwax-motion-safety-guard.service \
+                   nuwax-nav-stack.service nuwax-geometry-runtime.service \
+                   nuwax-person-follow.service; do
+    if systemctl is-active --quiet "${unit_name}"; then
+      [[ "$(systemctl show -p NRestarts --value "${unit_name}")" == "0" ]] \
+        || fail "${unit_name} restarted during deployment readiness observation"
     fi
-    [[ "$(systemctl show -p NRestarts --value "${unit}.service")" == "0" ]] \
-      || fail "${unit}.service restarted during deployment readiness observation"
   done
-  echo "motion guard deployment runtime: PASS"
+  echo "lazy runtime deployment: PASS"
 }
 
 install_sources() {
@@ -903,6 +939,8 @@ install_sources() {
     render_unit "${NAV_UNIT_SOURCE}" /etc/systemd/system/nuwax-nav-stack.service
     render_unit "${GEOMETRY_UNIT_SOURCE}" /etc/systemd/system/nuwax-geometry-runtime.service
     render_unit "${PERSON_FOLLOW_UNIT_SOURCE}" /etc/systemd/system/nuwax-person-follow.service
+    render_unit "${RUNTIME_ACTIVATION_UNIT_SOURCE}" /etc/systemd/system/nuwax-runtime-activation.service
+    render_unit "${RUNTIME_ACTIVATION_PATH_SOURCE}" /etc/systemd/system/nuwax-runtime-activation.path
     render_unit "${GATEWAY_UNIT_SOURCE}" /etc/systemd/system/nuwax-host-gateway.service
     systemctl daemon-reload
     : > "${SYSTEMD_BACKUP_DIR}/sources.changed"
@@ -918,16 +956,14 @@ enable_stack() {
   "${PROVISIONER}" verify \
     --state-dir "${GUARD_STATE_DIR}" \
     --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
-  systemctl enable nuwax-motion-safety-guard.service
-  systemctl enable nuwax-nav-stack.service
-  systemctl enable nuwax-geometry-runtime.service
-  if person_follow_autostart_enabled; then
-    systemctl enable nuwax-person-follow.service
-  else
-    systemctl disable nuwax-person-follow.service
-  fi
+  systemctl disable nuwax-motion-safety-guard.service
+  systemctl disable nuwax-nav-stack.service
+  systemctl disable nuwax-geometry-runtime.service
+  systemctl disable nuwax-person-follow.service
+  systemctl disable nuwax-runtime-activation.service
+  systemctl enable nuwax-runtime-activation.path
   systemctl enable nuwax-host-gateway.service
-  echo "enabled mandatory startup order: guard -> nav-stack -> geometry runtime -> Gateway; person-follow autostart=${PERSON_FOLLOW_AUTOSTART_MODE}"
+  echo "enabled base services: Gateway + runtime activation watcher; guarded components start on demand"
 }
 
 start_stack() {
@@ -942,27 +978,21 @@ start_stack() {
   check_service_uid_collisions system
   check_service_access
 
-  if person_follow_autostart_enabled; then
-    systemctl restart \
-      nuwax-motion-safety-guard.service \
-      nuwax-nav-stack.service \
-      nuwax-geometry-runtime.service \
-      nuwax-person-follow.service \
-      nuwax-host-gateway.service
-  else
-    systemctl stop nuwax-person-follow.service
-    systemctl restart \
-      nuwax-motion-safety-guard.service \
-      nuwax-nav-stack.service \
-      nuwax-geometry-runtime.service \
-      nuwax-host-gateway.service
-  fi
-  echo "started/restarted mandatory stack in order: guard -> nav-stack -> geometry runtime -> Gateway; person-follow autostart=${PERSON_FOLLOW_AUTOSTART_MODE}"
+  systemctl stop nuwax-person-follow.service
+  systemctl stop nuwax-geometry-runtime.service
+  systemctl stop nuwax-nav-stack.service
+  systemctl stop nuwax-motion-safety-guard.service
+  rm -f /run/nuwax/gateway/geometry.request /run/nuwax/gateway/geometry.result.json
+  systemctl restart nuwax-runtime-activation.path
+  systemctl restart nuwax-host-gateway.service
+  echo "started base services: Gateway + runtime activation watcher; guarded components remain idle"
 }
 
 stop_stack() {
   require_root
   systemctl stop nuwax-host-gateway.service
+  systemctl stop nuwax-runtime-activation.path
+  systemctl stop nuwax-runtime-activation.service
   systemctl stop nuwax-person-follow.service
   systemctl stop nuwax-geometry-runtime.service
   systemctl stop nuwax-nav-stack.service

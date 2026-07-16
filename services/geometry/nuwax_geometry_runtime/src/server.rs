@@ -40,10 +40,20 @@ use nuwax_nav_types_messages::geometry::Point2;
 pub struct GeometryRuntimeService {
     state: SharedServiceState,
     bridge: GeometryRuntimeHandle,
+    base_frame_id: String,
     shutdown: Option<ShutdownCoordinator>,
 }
 
 const STOP_LISTENER_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn configured_base_frame() -> String {
+    std::env::var("NUWAX_GEOMETRY_BASE_FRAME")
+        .or_else(|_| std::env::var("NUWAX_BASE_FRAME"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "base_link".to_string())
+}
 
 #[derive(Clone)]
 pub struct ShutdownCoordinator {
@@ -138,6 +148,7 @@ impl GeometryRuntimeService {
                 "Geometry LCM runtime 已启动",
             ))),
             bridge,
+            base_frame_id: configured_base_frame(),
             shutdown: None,
         }
     }
@@ -1557,7 +1568,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             frame_id,
             timestamp_ns: ts_ns,
         };
-        let payload = match typed_codec::encode_odometry_payload(&pose_state) {
+        let payload = match typed_codec::encode_odometry_payload(&pose_state, &self.base_frame_id) {
             Ok(payload) => payload,
             Err(error) => {
                 tracing::warn!("publish_odom: payload encode failed: {}", error);

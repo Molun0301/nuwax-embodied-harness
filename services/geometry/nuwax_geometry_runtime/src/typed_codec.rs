@@ -60,10 +60,16 @@ pub const CMD_VEL_PAYLOAD_BYTES: usize = 48;
 ///
 /// 字节布局与 `lcm_runtime::parse_odom_payload` 完全镜像:
 /// `7×f64 + u64 stamp + u16 frame_len + frame bytes`。
-pub fn encode_odometry_payload(pose: &PoseState) -> CodecResult<Vec<u8>> {
+pub fn encode_odometry_payload(pose: &PoseState, child_frame_id: &str) -> CodecResult<Vec<u8>> {
+    let child_frame_id = child_frame_id.trim();
+    if child_frame_id.is_empty() {
+        return Err(CodecError::LcmEncode(
+            "odometry child_frame_id must not be empty".into(),
+        ));
+    }
     schema::encode_odometry_body(&schema::Odometry {
         header: header_from_pose(pose)?,
-        child_frame_id: "base_link".to_string(),
+        child_frame_id: child_frame_id.to_string(),
         pose: schema_pose(pose),
         ..schema::Odometry::default()
     })
@@ -462,7 +468,7 @@ mod tests {
     #[test]
     fn encode_decode_odometry_roundtrip() {
         let pose = sample_pose();
-        let bytes = encode_odometry_payload(&pose).expect("encode");
+        let bytes = encode_odometry_payload(&pose, "go2_base_link").expect("encode");
         let decoded = decode_odometry_payload(&bytes).expect("decode");
         assert_eq!(decoded.x, pose.x);
         assert_eq!(decoded.y, pose.y);
@@ -470,6 +476,11 @@ mod tests {
         assert_eq!(decoded.qw, pose.qw);
         assert_eq!(decoded.frame_id, pose.frame_id);
         assert_eq!(decoded.timestamp_ns, pose.timestamp_ns);
+
+        let mut encoded = schema::ODOMETRY_FINGERPRINT.to_vec();
+        encoded.extend_from_slice(&bytes);
+        let typed = schema::decode_odometry(&encoded).expect("typed odometry");
+        assert_eq!(typed.child_frame_id, "go2_base_link");
     }
 
     #[test]
@@ -712,7 +723,7 @@ mod tests {
         let topic = LcmTopic::new("/odom").expect("typed /odom");
         let msg_type = LcmMessageType::new("nav_msgs/Odometry").expect("typed");
         let pose = sample_pose();
-        let payload = encode_odometry_payload(&pose).expect("encode");
+        let payload = encode_odometry_payload(&pose, "base_link").expect("encode");
         let frame = build_typed_frame(topic, msg_type, payload.clone(), 1);
         // header + payload 一致
         assert_eq!(frame.payload, payload);
@@ -759,7 +770,7 @@ mod tests {
         );
         let odom_bytes = wire_bytes(
             "nav_msgs.Odometry",
-            encode_odometry_payload(&pose).expect("encode Odometry"),
+            encode_odometry_payload(&pose, "base_link").expect("encode Odometry"),
         );
         let pointcloud_bytes = wire_bytes(
             "sensor_msgs.PointCloud2",

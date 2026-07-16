@@ -31,6 +31,7 @@ PERSON_FOLLOW_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-person-follow.servi
 RUNTIME_ACTIVATION_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-runtime-activation.service"
 RUNTIME_ACTIVATION_PATH_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-runtime-activation.path"
 GATEWAY_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-host-gateway.service"
+VIDEO_STREAMER_UNIT_SOURCE="${REPO_ROOT}/drivers/go2/systemd/nuwax-go2-video-streamer.service"
 GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
 PROVISIONER="${REPO_ROOT}/scripts/provision_motion_guard.py"
 LCM_PREFLIGHT="${REPO_ROOT}/scripts/systemd/check_lcm_multicast.sh"
@@ -76,6 +77,7 @@ DEPLOYMENT_UNITS=(
   nuwax-runtime-activation.service
   nuwax-runtime-activation.path
   nuwax-host-gateway.service
+  nuwax-go2-video-streamer.service
 )
 
 fail() {
@@ -270,7 +272,8 @@ check_unit_templates() {
   rendered_dir="$(mktemp -d)"
   for source in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
                 "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
-                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
+                "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     render_unit_to "${source}" "${rendered_dir}/$(basename "${source}")"
   done
   # Unit syntax validation is independent from release binary availability;
@@ -289,7 +292,21 @@ check_systemd_owned_invariants() {
   local command=""
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
               "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
-              "${GATEWAY_UNIT_SOURCE}"; do
+              "${GATEWAY_UNIT_SOURCE}" "${VIDEO_STREAMER_UNIT_SOURCE}"; do
+    grep -qx 'WorkingDirectory=@NUWAX_REPO_ROOT@' "${unit}" \
+      || fail "production service must start from the rendered repository root: ${unit}"
+    grep -qx 'ProtectHome=read-only' "${unit}" \
+      || fail "repository-backed production service must keep /home readable: ${unit}"
+    ! grep -qx 'ProtectHome=yes' "${unit}" \
+      || fail "repository-backed production service cannot hide its /home working directory: ${unit}"
+  done
+  grep -Eq '^ReadWritePaths=([^[:space:]]+[[:space:]])*/tmp([[:space:]]|$)' \
+    "${GATEWAY_UNIT_SOURCE}" \
+    || fail "Gateway unit must expose shared /tmp for CycloneDDS and video IPC"
+
+  for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
+              "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+              "${GATEWAY_UNIT_SOURCE}" "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     grep -q '^ExecStart=/usr/bin/env ' "${unit}" \
       || fail "ExecStart does not force systemd-owned invariants: ${unit}"
     while IFS= read -r command; do
@@ -325,16 +342,32 @@ check_systemd_owned_invariants() {
     "${GUARD_UNIT_SOURCE}" \
     || fail "motion guard ExecStart does not pin the rendered Python interpreter"
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
-              "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+              "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
+              "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     grep -qF 'EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env' "${unit}" \
       || fail "production unit does not use the managed config directory: ${unit}"
   done
-  for unit in "${GUARD_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+  for unit in "${GUARD_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
+              "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     grep -qF 'EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env' "${unit}" \
       || fail "Go2-facing service does not use the managed data-plane config: ${unit}"
   done
   grep -qF 'SupplementaryGroups=nuwax-motion-clients video render' "${GATEWAY_UNIT_SOURCE}" \
     || fail "Gateway unit must include Jetson video/render device groups"
+  grep -qF 'SupplementaryGroups=nuwax-motion-clients video render' "${VIDEO_STREAMER_UNIT_SOURCE}" \
+    || fail "Go2 video streamer unit must include Jetson video/render device groups"
+  grep -qx 'Wants=network-online.target nuwax-geometry-runtime.service' \
+    "${VIDEO_STREAMER_UNIT_SOURCE}" \
+    || fail "Go2 video streamer must start the geometry-owned video relay"
+  grep -qx 'After=network-online.target nuwax-geometry-runtime.service' \
+    "${VIDEO_STREAMER_UNIT_SOURCE}" \
+    || fail "Go2 video streamer must wait for the geometry-owned video relay"
+  grep -qF 'NUWAX_VIDEO_UDS_PATH=/tmp/nuwax_video.sock' \
+    "${VIDEO_STREAMER_UNIT_SOURCE}" \
+    || fail "Go2 video streamer does not pin the production video UDS"
+  grep -qF '@NUWAX_PYTHON_BIN@ -m drivers.go2.video_streamer' \
+    "${VIDEO_STREAMER_UNIT_SOURCE}" \
+    || fail "Go2 video streamer does not pin its production Python entrypoint"
   grep -qF 'Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env' \
     "${GATEWAY_UNIT_SOURCE}" \
     || fail "Gateway unit does not pin the managed bootstrap environment"
@@ -423,6 +456,7 @@ check_sources() {
   check_file "${RUNTIME_ACTIVATION_UNIT_SOURCE}"
   check_file "${RUNTIME_ACTIVATION_PATH_SOURCE}"
   check_file "${GATEWAY_UNIT_SOURCE}"
+  check_file "${VIDEO_STREAMER_UNIT_SOURCE}"
   check_file "${GUARD_MODULE}"
   check_file "${PROVISIONER}"
   check_file "${LCM_PREFLIGHT}"
@@ -435,7 +469,8 @@ check_sources() {
   validate_sysusers_source
   check_service_uid_collisions "${SYSUSERS_SOURCE}"
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
-              "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+              "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
+              "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     grep -qF '@NUWAX_REPO_ROOT@' "${unit}" \
       || fail "systemd source is not a repository-root template: ${unit}"
     grep -qF '@NUWAX_CONFIG_DIR@' "${unit}" \
@@ -445,6 +480,8 @@ check_sources() {
     || fail "runtime activation service is not a repository-root template"
   grep -qF '@NUWAX_PYTHON_BIN@' "${GUARD_UNIT_SOURCE}" \
     || fail "motion guard source is not a Python interpreter template"
+  grep -qF '@NUWAX_PYTHON_BIN@' "${VIDEO_STREAMER_UNIT_SOURCE}" \
+    || fail "Go2 video streamer source is not a Python interpreter template"
   for unit in "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" "${PERSON_FOLLOW_UNIT_SOURCE}"; do
     grep -qF '@NUWAX_BIN_DIR@' "${unit}" \
       || fail "Rust service source is not a release bin template: ${unit}"
@@ -641,7 +678,8 @@ systemd_sources_changed() {
   rendered_dir="$(mktemp -d)"
   for source in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
                 "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
-                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
+                "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     unit="$(basename "${source}")"
     render_unit_to "${source}" "${rendered_dir}/${unit}"
     installed="/etc/systemd/system/${unit}"
@@ -781,6 +819,8 @@ check_service_access() {
     || fail "nuwax-gateway cannot execute ${PYTHON_BIN}"
   runuser -u nuwax-gateway -- test -r "${REPO_ROOT}/scripts/start_gateway.sh" \
     || fail "nuwax-gateway cannot read start_gateway.sh"
+  runuser -u nuwax-gateway -- test -r "${REPO_ROOT}/drivers/go2/video_streamer.py" \
+    || fail "nuwax-gateway cannot read the Go2 video streamer"
   check_identity_write_access nuwax-geometry /var/lib/nuwax_robot_bridge
   for directory in "${GATEWAY_WRITE_DIRS[@]}"; do
     check_identity_write_access nuwax-gateway "${directory}"
@@ -854,6 +894,10 @@ verify_installed() {
     || fail "nuwax-runtime-activation.path is not enabled"
   systemctl is-active --quiet nuwax-runtime-activation.path \
     || fail "nuwax-runtime-activation.path is not active"
+  systemctl is-enabled --quiet nuwax-go2-video-streamer.service \
+    || fail "nuwax-go2-video-streamer.service is not enabled"
+  systemctl is-active --quiet nuwax-go2-video-streamer.service \
+    || fail "nuwax-go2-video-streamer.service is not active"
   for unit_name in nuwax-motion-safety-guard.service nuwax-nav-stack.service \
                    nuwax-geometry-runtime.service nuwax-person-follow.service \
                    nuwax-runtime-activation.service; do
@@ -904,7 +948,7 @@ verify_installed() {
   fi
   for unit_name in nuwax-host-gateway.service nuwax-motion-safety-guard.service \
                    nuwax-nav-stack.service nuwax-geometry-runtime.service \
-                   nuwax-person-follow.service; do
+                   nuwax-person-follow.service nuwax-go2-video-streamer.service; do
     if systemctl is-active --quiet "${unit_name}"; then
       [[ "$(systemctl show -p NRestarts --value "${unit_name}")" == "0" ]] \
         || fail "${unit_name} restarted during deployment readiness observation"
@@ -942,6 +986,7 @@ install_sources() {
     render_unit "${RUNTIME_ACTIVATION_UNIT_SOURCE}" /etc/systemd/system/nuwax-runtime-activation.service
     render_unit "${RUNTIME_ACTIVATION_PATH_SOURCE}" /etc/systemd/system/nuwax-runtime-activation.path
     render_unit "${GATEWAY_UNIT_SOURCE}" /etc/systemd/system/nuwax-host-gateway.service
+    render_unit "${VIDEO_STREAMER_UNIT_SOURCE}" /etc/systemd/system/nuwax-go2-video-streamer.service
     systemctl daemon-reload
     : > "${SYSTEMD_BACKUP_DIR}/sources.changed"
   else
@@ -963,7 +1008,8 @@ enable_stack() {
   systemctl disable nuwax-runtime-activation.service
   systemctl enable nuwax-runtime-activation.path
   systemctl enable nuwax-host-gateway.service
-  echo "enabled base services: Gateway + runtime activation watcher; guarded components start on demand"
+  systemctl enable nuwax-go2-video-streamer.service
+  echo "enabled base services: Gateway + Go2 video + runtime activation watcher; motion components start on demand"
 }
 
 start_stack() {
@@ -978,6 +1024,7 @@ start_stack() {
   check_service_uid_collisions system
   check_service_access
 
+  systemctl stop nuwax-go2-video-streamer.service
   systemctl stop nuwax-person-follow.service
   systemctl stop nuwax-geometry-runtime.service
   systemctl stop nuwax-nav-stack.service
@@ -985,11 +1032,13 @@ start_stack() {
   rm -f /run/nuwax/gateway/geometry.request /run/nuwax/gateway/geometry.result.json
   systemctl restart nuwax-runtime-activation.path
   systemctl restart nuwax-host-gateway.service
-  echo "started base services: Gateway + runtime activation watcher; guarded components remain idle"
+  systemctl restart nuwax-go2-video-streamer.service
+  echo "started base services: Gateway + Go2 video + runtime activation watcher; motion components remain idle"
 }
 
 stop_stack() {
   require_root
+  systemctl stop nuwax-go2-video-streamer.service
   systemctl stop nuwax-host-gateway.service
   systemctl stop nuwax-runtime-activation.path
   systemctl stop nuwax-runtime-activation.service

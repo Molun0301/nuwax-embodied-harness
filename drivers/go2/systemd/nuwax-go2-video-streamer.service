@@ -1,19 +1,32 @@
 [Unit]
-Description=nuwax_robot_bridge Go2 端侧实时视频推流
-After=network-online.target nuwax-host-gateway.service
-Wants=network-online.target
+# Template: install with scripts/install_motion_guard_deployment.sh.
+Description=nuwax_robot_bridge Go2 camera video streamer
+After=network-online.target nuwax-geometry-runtime.service
+Wants=network-online.target nuwax-geometry-runtime.service
 
 [Service]
 Type=simple
-User=unitree
-Group=unitree
-WorkingDirectory=/home/unitree/nuwax-robot-bridge
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+User=nuwax-gateway
+Group=nuwax-gateway
+SupplementaryGroups=nuwax-motion-clients video render
+WorkingDirectory=@NUWAX_REPO_ROOT@
+UMask=0007
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-/home/unitree/nuwax-robot-bridge/drivers/go2/data_plane.env
-ExecStart=/usr/bin/python3 -m drivers.go2.video_streamer
-Restart=always
+EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
+EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env
+# The video sender is independent from GO2_DATA_PLANE_ENABLED.  It only needs
+# the official SDK, the camera DDS interface, and the geometry-owned UDS relay.
+ExecStart=/usr/bin/env PYTHONUNBUFFERED=1 PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@ GO2_SDK_PATH=@NUWAX_GO2_SDK_PATH@ NUWAX_VIDEO_UDS_PATH=/tmp/nuwax_video.sock @NUWAX_PYTHON_BIN@ -m drivers.go2.video_streamer
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
 RestartSec=1
 TimeoutStopSec=10
+SuccessExitStatus=0
+ReadWritePaths=/tmp
 
 [Install]
 WantedBy=multi-user.target

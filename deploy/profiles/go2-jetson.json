@@ -143,7 +143,8 @@
     "nuwax-person-follow.service",
     "nuwax-runtime-activation.service",
     "nuwax-runtime-activation.path",
-    "nuwax-host-gateway.service"
+    "nuwax-host-gateway.service",
+    "nuwax-go2-video-streamer.service"
   ],
   "models": {
     "prepare_yolo": true,
@@ -157,7 +158,8 @@
   "metadata": {
     "always_on_services": [
       "nuwax-runtime-activation.path",
-      "nuwax-host-gateway.service"
+      "nuwax-host-gateway.service",
+      "nuwax-go2-video-streamer.service"
     ],
     "on_demand_services": [
       "nuwax-motion-safety-guard.service",

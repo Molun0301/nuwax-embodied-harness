@@ -99,6 +99,10 @@ person_follow_managed_by_systemd() {
   is_truthy "${NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD:-false}"
 }
 
+go2_video_streamer_managed_by_systemd() {
+  is_truthy "${NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD:-false}"
+}
+
 person_follow_autostart_enabled() {
   is_truthy "${NUWAX_PERSON_FOLLOW_AUTOSTART:-true}"
 }
@@ -404,6 +408,10 @@ cleanup_stale_person_follow_processes() {
 }
 
 cleanup_stale_go2_video_streamer() {
+  if go2_video_streamer_managed_by_systemd; then
+    return 0
+  fi
+
   # 终止任何残留的 go2 视频推流进程（无论由本脚本、systemd 还是手动启动），
   # 保证网关成为唯一管理者，避免"网关停了 streamer 还在"以及双拉起。
   local pid=""
@@ -525,7 +533,6 @@ should_start_person_follow() {
 
 should_start_go2_video_streamer() {
   is_truthy "${GO2_VIDEO_STREAM_ENABLED:-true}" \
-    && is_truthy "${GO2_DATA_PLANE_ENABLED:-false}" \
     && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "go2" ]]
 }
 
@@ -675,11 +682,17 @@ abort_person_follow_startup() {
 }
 
 start_go2_video_streamer() {
+  if go2_video_streamer_managed_by_systemd; then
+    return 0
+  fi
   if [[ -n "${VIDEO_STREAMER_PID}" ]] && is_pid_alive "${VIDEO_STREAMER_PID}"; then
     return 0
   fi
   if ! should_start_go2_video_streamer; then
     return 0
+  fi
+  if ! geometry_runtime_managed_by_systemd; then
+    start_geometry_runtime
   fi
   echo "starting Go2 side video streamer -> UDS /tmp/nuwax_video.sock"
   (run_with_title "nuwax-go2-video-streamer" "${PYTHON_BIN}" -m drivers.go2.video_streamer) &
@@ -944,6 +957,10 @@ stop_runtime_monitors() {
 }
 
 stop_go2_video_streamer() {
+  if go2_video_streamer_managed_by_systemd; then
+    VIDEO_STREAMER_PID=""
+    return 0
+  fi
   if [[ -n "${VIDEO_STREAMER_PID}" ]] && is_pid_alive "${VIDEO_STREAMER_PID}"; then
     terminate_process_scope "${VIDEO_STREAMER_PID}" "go2 video streamer"
     wait "${VIDEO_STREAMER_PID}" >/dev/null 2>&1 || true

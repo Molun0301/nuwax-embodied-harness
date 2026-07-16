@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+ProtectHome=read-only
 WorkingDirectory=@NUWAX_REPO_ROOT@
 Environment=NUWAX_RUNTIME_ACTIVATION_REQUEST=/run/nuwax/gateway/geometry.request
 Environment=NUWAX_RUNTIME_ACTIVATION_RESULT=/run/nuwax/gateway/geometry.result.json

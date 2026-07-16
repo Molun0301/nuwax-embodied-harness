@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
+import uuid
 
 from contracts.artifacts import ArtifactRetentionPolicy
 from contracts.capabilities import (
@@ -366,6 +367,29 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = (
     | _GUARD_ONLY_CAPABILITY_NAMES
     | _PERSON_FOLLOW_CAPABILITY_NAMES
 )
+_SAFE_STOP_BYPASS_CAPABILITY_NAMES = frozenset(
+    {
+        "stop_all_motion",
+        "cancel_task",
+        "cancel_navigation",
+        "stop_mapping",
+        "stop_exploration",
+    }
+)
+_SAFE_STOP_GATED_RESOURCE_NAMES = frozenset(
+    {
+        RuntimeResource.BASE_MOTION.value,
+        RuntimeResource.NAVIGATION.value,
+    }
+)
+_SAFE_STOP_GATED_CAPABILITY_NAMES = frozenset(
+    {
+        *_MOTION_STACK_CAPABILITY_NAMES,
+        *_GUARD_ONLY_CAPABILITY_NAMES,
+        *_PERSON_FOLLOW_CAPABILITY_NAMES,
+        "inspect_target",
+    }
+)
 _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
     {
         # relocalize_active_map / load_map_version 已改为 ASYNC_TASK（见超时根因 D3）：
@@ -393,6 +417,23 @@ def _runtime_activation_level(capability_name: str) -> Optional[str]:
 
 def _has_observability_value(value: Any) -> bool:
     return value is not None and value != ""
+
+
+def _write_json_file_atomically(path: Path, payload: Dict[str, Any]) -> None:
+    """Write a small cross-process protocol payload without exposing partial JSON."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        ".%s.%s.%s.tmp" % (path.name, os.getpid(), threading.get_ident())
+    )
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 _SERVICE_HEALTH_SEVERITY = {
@@ -3286,14 +3327,18 @@ class GatewayRuntime:
     ) -> Dict[str, Any]:
         """调用一个网关能力。"""
 
+        registration = self.capability_registry.get_registration(capability_name)
+        descriptor = registration.descriptor
+        self._ensure_safe_stop_allows_capability(descriptor)
         self._ensure_geometry_runtime_for_invoke(capability_name)
         self._refresh_dynamic_capability_matrix()
-        registration = self.capability_registry.get_registration(capability_name)
-        self.capability_registry.assert_supported(capability_name, robot_model=self.robot.manifest.robot_model)
+        self.capability_registry.assert_supported(
+            capability_name,
+            robot_model=self.robot.manifest.robot_model,
+        )
         if registration.handler is None:
             raise GatewayError(f"能力 {capability_name} 尚未绑定处理器。")
 
-        descriptor = registration.descriptor
         started_at = time.perf_counter()
         context = self._build_capability_request_context(
             request_context,
@@ -5970,6 +6015,7 @@ class GatewayRuntime:
         descriptor = self.capability_registry.get_descriptor("find_target")
 
         def runner(context) -> Dict[str, Any]:
+            self._ensure_safe_stop_allows_capability(descriptor)
             context.update(progress=0.05, stage="search_prepare", message="准备查找目标。")
             finalized = False
             rejected_record_ids: Set[str] = set()
@@ -6327,6 +6373,7 @@ class GatewayRuntime:
         descriptor = self.capability_registry.get_descriptor("explore_and_find_target")
 
         def runner(context) -> Dict[str, Any]:
+            self._ensure_safe_stop_allows_capability(descriptor)
             context.update(progress=0.03, stage="search_prepare", message="准备探索并查找目标。")
             finalized = False
             rejected_record_ids: Set[str] = set()
@@ -6501,6 +6548,9 @@ class GatewayRuntime:
 
                 active_request = request
                 context.update(progress=0.08, stage="exploration_accepted", message="开始探索并持续查找目标。")
+                self._ensure_motion_runtime_for_backend_call(
+                    "explore_and_find_target"
+                )
                 exploration_context = self.navigation_service.start_exploration(active_request)
                 active_exploration_request_id = active_request.request_id
                 self._attach_perception_to_exploration()
@@ -6603,6 +6653,9 @@ class GatewayRuntime:
                         active_request = active_request.model_copy(
                             update={"request_id": f"{request.request_id}_resume_{resume_round}"},
                             deep=True,
+                        )
+                        self._ensure_motion_runtime_for_backend_call(
+                            "explore_and_find_target"
                         )
                         exploration_context = self.navigation_service.start_exploration(active_request)
                         active_exploration_request_id = active_request.request_id
@@ -6773,6 +6826,7 @@ class GatewayRuntime:
         descriptor = self.capability_registry.get_descriptor("inspect_target")
 
         def runner(context) -> Dict[str, Any]:
+            self._ensure_safe_stop_allows_capability(descriptor)
             context.update(progress=0.05, stage="inspect_observe", message="开始检查目标。")
             perception_context = self.perception_service.describe_current_scene(
                 camera_id=camera_id,
@@ -6782,6 +6836,10 @@ class GatewayRuntime:
             )
             matched_object = self._find_scene_object(query, perception_context)
             if matched_object is None and auto_navigate:
+                self._ensure_safe_stop_allows_capability(descriptor)
+                self._ensure_motion_runtime_for_backend_call(
+                    "navigate_to_pose"
+                )
                 context.update(progress=0.3, stage="inspect_navigate", message="当前画面未找到目标，尝试导航到命名位置。")
                 tagged_location = self.memory_service.resolve_tagged_location(query)
                 if tagged_location is not None:
@@ -6793,6 +6851,8 @@ class GatewayRuntime:
                     )
                 else:
                     goal = self.navigation_service.resolve_named_goal(query)
+                context.ensure_active()
+                self._ensure_safe_stop_allows_capability(descriptor)
                 self.navigation_service.navigate_until_complete(
                     goal,
                     poll_interval_sec=max(0.02, poll_interval_sec),
@@ -6901,6 +6961,7 @@ class GatewayRuntime:
             )
 
         def runner(context) -> Dict[str, Any]:
+            self._ensure_safe_stop_allows_capability(descriptor)
             try:
                 session = self.motion_guard.acquire_follow_session()
                 start_time = time.monotonic()
@@ -7013,6 +7074,7 @@ class GatewayRuntime:
         timeout_sec = max(timeout_override, duration_sec + 2.0, float(descriptor.timeout_sec or 0))
 
         def runner(context) -> Dict[str, float]:
+            self._ensure_safe_stop_allows_capability(descriptor)
             try:
                 session = self.motion_guard.acquire_relative_session()
                 start_time = time.monotonic()
@@ -8451,6 +8513,7 @@ class GatewayRuntime:
         timeout_sec: Optional[float] = None,
         navigation_state_callback: Optional[Callable[[Optional[str]], None]] = None,
     ) -> Optional[Dict[str, Any]]:
+        self._ensure_safe_stop_allows_capability_name(capability_name)
         self._ensure_workspace_memory_library_ready(map_name=map_name)
         memory_candidates = list(search_state["memory_candidates"])
         semantic_goal = search_state["semantic_goal"]
@@ -8511,6 +8574,7 @@ class GatewayRuntime:
                 return None
             raise
 
+        self._ensure_motion_runtime_for_backend_call(capability_name)
         last_error: Optional[GatewayError] = None
         last_verification = None
         attempted_candidate_ids: List[str] = []
@@ -8597,6 +8661,7 @@ class GatewayRuntime:
                 localization_session_id=current_localization_session_id,
             )
             task_context.ensure_active()
+            self._ensure_safe_stop_allows_capability_name(capability_name)
             if navigation_state_callback is not None:
                 navigation_state_callback(goal.goal_id)
             try:
@@ -8680,6 +8745,7 @@ class GatewayRuntime:
                 payload={"query": query, "goal_id": semantic_goal.goal_id},
             )
             task_context.ensure_active()
+            self._ensure_safe_stop_allows_capability_name(capability_name)
             if navigation_state_callback is not None:
                 navigation_state_callback(semantic_goal.goal_id)
             try:
@@ -8979,13 +9045,275 @@ class GatewayRuntime:
             },
         )
 
+    def _runtime_activation_state_lock(self):
+        lock = getattr(self, "_geometry_runtime_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._geometry_runtime_lock = lock
+        return lock
+
+    @staticmethod
+    def _runtime_activation_marker_paths(
+        request_path: Path,
+    ) -> Tuple[Path, Path]:
+        cancel_path = Path(
+            os.environ.get(
+                "NUWAX_RUNTIME_ACTIVATION_CANCEL",
+                "%s.cancel.json" % request_path,
+            )
+        )
+        ack_path = Path(
+            os.environ.get(
+                "NUWAX_RUNTIME_ACTIVATION_ACK",
+                "%s.ack.json" % request_path,
+            )
+        )
+        return cancel_path, ack_path
+
+    def _runtime_activation_safe_stop_error(
+        self,
+        context: Dict[str, Any],
+    ) -> GatewayError:
+        safety_guard = getattr(self, "safety_guard", None)
+        safety_state = (
+            safety_guard.get_safe_stop_state()
+            if safety_guard is not None
+            else {"safe_stop_active": True}
+        )
+        return GatewayError(
+            "安全停止已使按需组件激活事务失效。",
+            error_code="safe_stop_active",
+            http_status=423,
+            jsonrpc_code=-32011,
+            details={
+                "capability_name": context["capability_name"],
+                "activation_level": context["activation_level"],
+                "request_id": context["request_id"],
+                "request_safety_epoch": context["safety_epoch"],
+                "current_safety_epoch": int(
+                    getattr(self, "_runtime_activation_safety_epoch", 0)
+                ),
+                "safety_state": safety_state,
+            },
+        )
+
+    def _cancel_runtime_activation_request(
+        self,
+        context: Dict[str, Any],
+        *,
+        reason: str,
+        error_code: str,
+    ) -> None:
+        lock = self._runtime_activation_state_lock()
+        with lock:
+            current_epoch = int(
+                getattr(self, "_runtime_activation_safety_epoch", 0)
+            )
+            ack_path = Path(context["ack_path"])
+            cancel_path = Path(context["cancel_path"])
+            try:
+                ack_path.unlink(missing_ok=True)
+                _write_json_file_atomically(
+                    cancel_path,
+                    {
+                        "request_id": context["request_id"],
+                        "state": "cancel_requested",
+                        "error_code": error_code,
+                        "reason": reason,
+                        "safety_epoch": current_epoch,
+                        "cancelled_at": utc_now().isoformat(),
+                    },
+                )
+            except OSError:
+                RUNTIME_LOGGER.exception(
+                    "写入按需组件激活取消标记失败 request_id=%s path=%s",
+                    context["request_id"],
+                    cancel_path,
+                )
+
+    def _ack_runtime_activation_request(
+        self,
+        context: Dict[str, Any],
+    ) -> None:
+        safety_guard = getattr(self, "safety_guard", None)
+        safety_lock = (
+            getattr(safety_guard, "_lock", None)
+            if context["safe_stop_sensitive"]
+            else None
+        )
+        if safety_lock is not None:
+            safety_lock.acquire()
+        try:
+            lock = self._runtime_activation_state_lock()
+            with lock:
+                current = getattr(self, "_runtime_activation_context", None)
+                current_epoch = int(
+                    getattr(self, "_runtime_activation_safety_epoch", 0)
+                )
+                invalidated = (
+                    current is None
+                    or current.get("request_id") != context["request_id"]
+                    or (
+                        context["safe_stop_sensitive"]
+                        and (
+                            bool(
+                                safety_guard is not None
+                                and safety_guard.safe_stop_active
+                            )
+                            or current_epoch != context["safety_epoch"]
+                        )
+                    )
+                )
+                if invalidated:
+                    self._cancel_runtime_activation_request(
+                        context,
+                        reason="safe stop invalidated activation before ACK",
+                        error_code="safe_stop_active",
+                    )
+                    raise self._runtime_activation_safe_stop_error(context)
+                _write_json_file_atomically(
+                    Path(context["ack_path"]),
+                    {
+                        "request_id": context["request_id"],
+                        "state": "acknowledged",
+                        "safety_epoch": context["safety_epoch"],
+                        "acknowledged_at": utc_now().isoformat(),
+                    },
+                )
+        finally:
+            if safety_lock is not None:
+                safety_lock.release()
+
+    def _commit_runtime_activation_request(
+        self,
+        context: Dict[str, Any],
+    ) -> None:
+        safety_guard = getattr(self, "safety_guard", None)
+        safety_lock = (
+            getattr(safety_guard, "_lock", None)
+            if context["safe_stop_sensitive"]
+            else None
+        )
+        if safety_lock is not None:
+            safety_lock.acquire()
+        try:
+            lock = self._runtime_activation_state_lock()
+            with lock:
+                current = getattr(self, "_runtime_activation_context", None)
+                current_epoch = int(
+                    getattr(self, "_runtime_activation_safety_epoch", 0)
+                )
+                invalidated = (
+                    current is None
+                    or current.get("request_id") != context["request_id"]
+                    or (
+                        context["safe_stop_sensitive"]
+                        and (
+                            bool(
+                                safety_guard is not None
+                                and safety_guard.safe_stop_active
+                            )
+                            or current_epoch != context["safety_epoch"]
+                        )
+                    )
+                )
+                if invalidated:
+                    self._cancel_runtime_activation_request(
+                        context,
+                        reason="safe stop invalidated activation before commit",
+                        error_code="safe_stop_active",
+                    )
+                    raise self._runtime_activation_safe_stop_error(context)
+                Path(context["request_path"]).unlink(missing_ok=True)
+                Path(context["ack_path"]).unlink(missing_ok=True)
+                Path(context["cancel_path"]).unlink(missing_ok=True)
+                self._runtime_activation_context = None
+        finally:
+            if safety_lock is not None:
+                safety_lock.release()
+
     def _safe_stop_robot(self, reason: Optional[str]) -> None:
+        lock = self._runtime_activation_state_lock()
+        with lock:
+            next_epoch = int(
+                getattr(self, "_runtime_activation_safety_epoch", 0)
+            ) + 1
+            self._runtime_activation_safety_epoch = next_epoch
+            activation_context = getattr(
+                self,
+                "_runtime_activation_context",
+                None,
+            )
+            if activation_context is not None and activation_context.get(
+                "safe_stop_sensitive"
+            ):
+                self._cancel_runtime_activation_request(
+                    activation_context,
+                    reason=reason or "gateway safety stop",
+                    error_code="safe_stop_active",
+                )
         if not self.motion_guard.started:
             RUNTIME_LOGGER.info(
-                "motion guard 尚未按需连接，Gateway 当前没有运动租约需要锁存。"
+                "motion guard 尚未按需连接；本地门禁已锁存，进行中的组件激活已请求取消。"
             )
             return
         self.motion_guard.latch_safety_stop(reason or "gateway safety stop")
+
+    @staticmethod
+    def _is_safe_stop_gated_capability(
+        descriptor: CapabilityDescriptor,
+    ) -> bool:
+        if descriptor.name in _SAFE_STOP_BYPASS_CAPABILITY_NAMES:
+            return False
+        if descriptor.name in _SAFE_STOP_GATED_CAPABILITY_NAMES:
+            return True
+        return any(
+            resource in _SAFE_STOP_GATED_RESOURCE_NAMES
+            for resource in descriptor.required_resources
+        )
+
+    def _ensure_safe_stop_allows_capability(
+        self,
+        descriptor: CapabilityDescriptor,
+    ) -> None:
+        safety_guard = getattr(self, "safety_guard", None)
+        if safety_guard is None or not safety_guard.safe_stop_active:
+            return
+        if not self._is_safe_stop_gated_capability(descriptor):
+            return
+        state = safety_guard.get_safe_stop_state()
+        raise GatewayError(
+            f"安全停止门禁处于激活状态，能力 {descriptor.name} 在完成受控安全恢复前禁止执行。",
+            error_code="safe_stop_active",
+            http_status=423,
+            jsonrpc_code=-32011,
+            details={
+                "capability_name": descriptor.name,
+                "required_resources": list(descriptor.required_resources),
+                "safety_state": state,
+            },
+        )
+
+    def _ensure_safe_stop_allows_capability_name(
+        self,
+        capability_name: str,
+    ) -> None:
+        safety_guard = getattr(self, "safety_guard", None)
+        if safety_guard is None or not safety_guard.safe_stop_active:
+            return
+        descriptor = self.capability_registry.get_descriptor(capability_name)
+        self._ensure_safe_stop_allows_capability(descriptor)
+
+    def _ensure_motion_runtime_for_backend_call(
+        self,
+        capability_name: str,
+    ) -> None:
+        """直接调用导航后端前执行安全门禁并按需激活运动栈。"""
+
+        self._ensure_safe_stop_allows_capability_name(capability_name)
+        if getattr(self, "config", None) is None:
+            return
+        self._ensure_geometry_runtime_for_capability(capability_name)
 
     def _get_provider(self, provider_type: type, provider_label: str):
         providers = getattr(self.robot, "providers", None)
@@ -9157,6 +9485,8 @@ class GatewayRuntime:
 
         def runner(context) -> Dict[str, Any]:
             self._ensure_geometry_runtime_for_capability(capability_name)
+            context.ensure_active()
+            self._ensure_safe_stop_allows_capability(descriptor)
             last_context = self.navigation_service.set_goal(goal)
             generation_snapshot = self._capture_task_generation_snapshot(
                 navigation_context=last_context
@@ -9686,6 +10016,7 @@ class GatewayRuntime:
                 context.ensure_active()
                 self._ensure_geometry_runtime_for_capability(capability_name)
                 context.ensure_active()
+                self._ensure_safe_stop_allows_capability(descriptor)
                 last_context = self.navigation_service.start_exploration(request)
                 backend_started = True
                 self._attach_perception_to_exploration()
@@ -10060,27 +10391,72 @@ class GatewayRuntime:
                 str(request_path.with_suffix(".result.json")),
             )
         )
-        request_path.parent.mkdir(parents=True, exist_ok=True)
+        cancel_path, ack_path = self._runtime_activation_marker_paths(request_path)
+        request_id = uuid.uuid4().hex
+        safe_stop_sensitive = activation_level in {
+            "guard",
+            "motion",
+            "person_follow",
+        }
+        state_lock = self._runtime_activation_state_lock()
+        safety_guard = getattr(self, "safety_guard", None)
+        safety_lock = (
+            getattr(safety_guard, "_lock", None)
+            if safe_stop_sensitive
+            else None
+        )
+        context: Dict[str, Any] = {
+            "request_id": request_id,
+            "capability_name": capability_name,
+            "activation_level": activation_level,
+            "request_path": str(request_path),
+            "result_path": str(result_path),
+            "cancel_path": str(cancel_path),
+            "ack_path": str(ack_path),
+            "safe_stop_sensitive": safe_stop_sensitive,
+            "safety_epoch": 0,
+        }
+        request_written = False
+        committed = False
+        terminal_received = False
+
+        if safety_lock is not None:
+            safety_lock.acquire()
         try:
-            result_path.unlink(missing_ok=True)
-            temporary = request_path.with_name(
-                ".%s.%s.%s.tmp"
-                % (request_path.name, os.getpid(), threading.get_ident())
-            )
-            temporary.write_text(
-                json.dumps(
+            with state_lock:
+                result_path.unlink(missing_ok=True)
+                cancel_path.unlink(missing_ok=True)
+                ack_path.unlink(missing_ok=True)
+                context["safety_epoch"] = int(
+                    getattr(self, "_runtime_activation_safety_epoch", 0)
+                )
+                if safe_stop_sensitive and bool(
+                    safety_guard is not None and safety_guard.safe_stop_active
+                ):
+                    raise self._runtime_activation_safe_stop_error(context)
+                self._runtime_activation_context = context
+                _write_json_file_atomically(
+                    request_path,
                     {
+                        "request_id": request_id,
                         "capability_name": capability_name,
                         "activation_level": activation_level,
+                        "safety_epoch": context["safety_epoch"],
                         "requested_at": utc_now().isoformat(),
                     },
-                    ensure_ascii=True,
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
-            os.replace(temporary, request_path)
+                )
+                request_written = True
+        except GatewayError:
+            with state_lock:
+                current = getattr(self, "_runtime_activation_context", None)
+                if current is not None and current.get("request_id") == request_id:
+                    self._runtime_activation_context = None
+            raise
         except OSError as exc:
+            with state_lock:
+                current = getattr(self, "_runtime_activation_context", None)
+                if current is not None and current.get("request_id") == request_id:
+                    self._runtime_activation_context = None
             raise GatewayError(
                 "无法提交按需组件激活请求：%s" % exc,
                 error_code="runtime_activation_request_failed",
@@ -10090,8 +10466,12 @@ class GatewayRuntime:
                     "capability_name": capability_name,
                     "activation_level": activation_level,
                     "request_path": str(request_path),
+                    "request_id": request_id,
                 },
             ) from exc
+        finally:
+            if safety_lock is not None:
+                safety_lock.release()
 
         try:
             timeout_sec = max(
@@ -10106,56 +10486,137 @@ class GatewayRuntime:
         except (TypeError, ValueError):
             timeout_sec = _RUNTIME_ACTIVATION_TIMEOUT_SEC
         deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            try:
-                payload = json.loads(result_path.read_text(encoding="utf-8"))
-            except FileNotFoundError:
+        ack_written = False
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    payload = json.loads(result_path.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    time.sleep(0.1)
+                    continue
+                except (OSError, json.JSONDecodeError):
+                    time.sleep(0.1)
+                    continue
+                result_request_id = str(
+                    payload.get("request_id") or ""
+                ).strip()
+                if result_request_id != request_id:
+                    time.sleep(0.1)
+                    continue
+                state = str(payload.get("state") or "").strip().lower()
+                result_level = str(
+                    payload.get("activation_level") or ""
+                ).strip().lower()
+                if result_level and result_level != activation_level:
+                    time.sleep(0.1)
+                    continue
+                if state == "prepared":
+                    if not ack_written:
+                        self._ack_runtime_activation_request(context)
+                        ack_written = True
+                    time.sleep(0.05)
+                    continue
+                if state == "ready":
+                    self._commit_runtime_activation_request(context)
+                    committed = True
+                    return
+                if state == "cancelled":
+                    terminal_received = True
+                    error_code = str(
+                        payload.get("error_code")
+                        or "runtime_activation_cancelled"
+                    )
+                    if error_code == "safe_stop_active":
+                        raise self._runtime_activation_safe_stop_error(context)
+                    raise GatewayError(
+                        str(payload.get("message") or "按需组件激活已取消。"),
+                        error_code=error_code,
+                        http_status=503,
+                        jsonrpc_code=-32010,
+                        details={
+                            "capability_name": capability_name,
+                            "activation_level": activation_level,
+                            "activation": payload,
+                        },
+                    )
+                if state == "failed":
+                    terminal_received = True
+                    raise GatewayError(
+                        str(payload.get("message") or "按需组件激活失败。"),
+                        error_code=str(
+                            payload.get("error_code")
+                            or "runtime_activation_failed"
+                        ),
+                        http_status=503,
+                        jsonrpc_code=-32010,
+                        details={
+                            "capability_name": capability_name,
+                            "activation_level": activation_level,
+                            "activation": payload,
+                        },
+                    )
                 time.sleep(0.1)
-                continue
-            except (OSError, json.JSONDecodeError):
-                time.sleep(0.1)
-                continue
-            state = str(payload.get("state") or "").strip().lower()
-            result_level = str(
-                payload.get("activation_level") or ""
-            ).strip().lower()
-            if result_level and result_level != activation_level:
-                time.sleep(0.1)
-                continue
-            if state == "ready":
-                return
-            if state == "failed":
-                raise GatewayError(
-                    str(payload.get("message") or "按需组件激活失败。"),
-                    error_code="runtime_activation_failed",
-                    http_status=503,
-                    jsonrpc_code=-32010,
-                    details={
-                        "capability_name": capability_name,
-                        "activation_level": activation_level,
-                        "activation": payload,
-                    },
+            raise GatewayError(
+                "等待按需组件激活超时。",
+                error_code="runtime_activation_timeout",
+                http_status=503,
+                jsonrpc_code=-32010,
+                details={
+                    "capability_name": capability_name,
+                    "activation_level": activation_level,
+                    "request_id": request_id,
+                    "request_path": str(request_path),
+                    "result_path": str(result_path),
+                    "timeout_sec": timeout_sec,
+                },
+            )
+        except Exception as exc:
+            if request_written and not committed and not terminal_received:
+                error_code = (
+                    "safe_stop_active"
+                    if isinstance(exc, GatewayError)
+                    and exc.error_code == "safe_stop_active"
+                    else "runtime_activation_cancelled"
                 )
-            time.sleep(0.1)
-        raise GatewayError(
-            "等待按需组件激活超时。",
-            error_code="runtime_activation_timeout",
-            http_status=503,
-            jsonrpc_code=-32010,
-            details={
-                "capability_name": capability_name,
-                "activation_level": activation_level,
-                "request_path": str(request_path),
-                "result_path": str(result_path),
-                "timeout_sec": timeout_sec,
-            },
-        )
+                self._cancel_runtime_activation_request(
+                    context,
+                    reason=str(exc),
+                    error_code=error_code,
+                )
+            raise
+        finally:
+            if not committed:
+                with state_lock:
+                    current = getattr(
+                        self,
+                        "_runtime_activation_context",
+                        None,
+                    )
+                    if (
+                        current is not None
+                        and current.get("request_id") == request_id
+                    ):
+                        self._runtime_activation_context = None
 
     def _ensure_motion_guard_connected(self, capability_name: str) -> None:
+        self._ensure_safe_stop_allows_capability_name(capability_name)
         try:
             readiness = self.motion_guard.start()
         except GatewayMotionGuardError as exc:
             raise self._motion_guard_gateway_error(capability_name, exc) from exc
+        if self.safety_guard.safe_stop_active:
+            latch = getattr(self.motion_guard, "latch_safety_stop", None)
+            if callable(latch):
+                try:
+                    latch(
+                        self.safety_guard.last_stop_reason
+                        or "gateway safety stop during motion guard activation"
+                    )
+                except Exception:
+                    RUNTIME_LOGGER.exception(
+                        "motion guard 连接期间检测到本地安全停止，但 native latch 失败。"
+                    )
+            self._ensure_safe_stop_allows_capability_name(capability_name)
         if readiness.ready:
             return
         raise GatewayError(
@@ -10212,10 +10673,18 @@ class GatewayRuntime:
                         return
         if should_start:
             try:
+                if requires_guard:
+                    self._ensure_safe_stop_allows_capability_name(
+                        capability_name
+                    )
                 self._request_geometry_runtime_activation(
                     capability_name,
                     activation_level,
                 )
+                if requires_guard:
+                    self._ensure_safe_stop_allows_capability_name(
+                        capability_name
+                    )
                 if requires_geometry:
                     provider_ready, provider_message = (
                         self._geometry_runtime_provider_ready()
@@ -10225,6 +10694,10 @@ class GatewayRuntime:
                         if runtime_status.get("started"):
                             self._stop_runtime_input_bridge()
                             self.platform_geometry_runtime.stop()
+                        if requires_guard:
+                            self._ensure_safe_stop_allows_capability_name(
+                                capability_name
+                            )
                         self.platform_geometry_runtime.start()
                         provider_ready, provider_message = (
                             self._geometry_runtime_provider_ready()
@@ -10297,6 +10770,7 @@ class GatewayRuntime:
     def _ensure_geometry_runtime_for_capability(self, capability_name: str) -> None:
         """runner 内部的几何运行时启动入口（保留原语义，被 _submit_*_task 复用）。"""
 
+        self._ensure_safe_stop_allows_capability_name(capability_name)
         if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
             return
         activation_level = _runtime_activation_level(capability_name)
@@ -10722,10 +11196,8 @@ class GatewayRuntime:
                 "当前机器人入口未提供机器人音量控制，仅保留软件音量。",
             ),
             "stop_all_motion": (
-                lambda: self.motion_guard.is_reachable(
-                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
-                ),
-                "motion guard 不可达。",
+                lambda: True,
+                None,
             ),
             "switch_control_mode": (
                 lambda: True,

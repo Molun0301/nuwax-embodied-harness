@@ -56,7 +56,7 @@ GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
 GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
 GUARD_LOCK="${NUWAX_MOTION_GUARD_LOCK:-/run/nuwax/motion-guard.lock}"
 GUARD_STATE_DIR="${NUWAX_MOTION_GUARD_STATE_DIR:-/var/lib/nuwax/motion-guard}"
-ACTUATOR_SYMBOLS_FILE="${NUWAX_ACTUATOR_SYMBOLS_FILE:-/usr/share/nuwax/actuator-symbols.json}"
+ACTUATOR_SYMBOLS_FILE="${NUWAX_ACTUATOR_SYMBOLS_FILE:-/etc/nuwax/actuator/actuator-symbols.json}"
 if [[ -f "${GUARD_MODULE}" ]]; then
   ok "production module: services.navigation.motion_safety_guard"
 else
@@ -252,7 +252,7 @@ if [[ -f "${GUARD_SERVICE_FILE}" ]]; then
   else
     miss "guard unit UDS path drift"
   fi
-  if grep -qF 'Environment=NUWAX_ACTUATOR_SYMBOLS_FILE=/usr/share/nuwax/actuator-symbols.json' "${GUARD_SERVICE_FILE}"; then
+  if grep -qE '^Environment=NUWAX_ACTUATOR_SYMBOLS_FILE=.*/actuator/actuator-symbols.json$' "${GUARD_SERVICE_FILE}"; then
     ok "guard unit actuator manifest path frozen"
   else
     miss "guard unit actuator manifest path drift"

@@ -1,0 +1,2 @@
+# Go2 SDK 和 CycloneDDS 只能从 third_party/python-source-artifacts.json 指定的
+# 已校验本地 wheel 安装，禁止公共 PyPI 回退和目标机临时源码构建。

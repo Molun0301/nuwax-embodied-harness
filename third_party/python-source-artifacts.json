@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "id": "ultralytics-clip",
+      "distribution": "clip",
+      "version": "1.0",
+      "import_modules": [
+        "clip"
+      ],
+      "status": "unresolved",
+      "fail_closed": true,
+      "reason": "The source commit is pinned, but reproducible source and aarch64 wheel hashes have not been approved.",
+      "source": {
+        "type": "git",
+        "repository": "https://github.com/ultralytics/CLIP.git",
+        "commit": "577b3cfa75f072c20a3f02b44ffde111d93eb3be"
+      },
+      "integrity": {
+        "source_sha256": null,
+        "wheel_sha256": null
+      },
+      "build": {
+        "python": "3.8",
+        "architecture": "aarch64",
+        "output": "wheel"
+      }
+    },
+    {
+      "id": "unitree-sdk2py-go2",
+      "distribution": "unitree-sdk2py",
+      "version": "1.0.1",
+      "import_modules": [
+        "unitree_sdk2py"
+      ],
+      "status": "unresolved",
+      "fail_closed": true,
+      "reason": "A clean working checkout was observed, but its production selection and reproducible aarch64 wheel hashes have not been approved.",
+      "source": {
+        "type": "git",
+        "repository": null,
+        "commit": null
+      },
+      "integrity": {
+        "source_sha256": null,
+        "wheel_sha256": null
+      },
+      "build": {
+        "python": "3.8",
+        "architecture": "aarch64",
+        "output": "wheel"
+      },
+      "observed": {
+        "repository": "https://github.com/unitreerobotics/unitree_sdk2_python.git",
+        "commit": "e4f6e669223c7b042244bd2c027fda45fcad3522",
+        "working_tree_clean": true
+      }
+    },
+    {
+      "id": "cyclonedds-python-go2",
+      "distribution": "cyclonedds",
+      "version": "0.10.2",
+      "import_modules": [
+        "cyclonedds"
+      ],
+      "status": "unresolved",
+      "fail_closed": true,
+      "reason": "The source commit, native CycloneDDS linkage and reproducible aarch64 wheel hashes have not been approved.",
+      "source": {
+        "type": "git",
+        "repository": null,
+        "commit": null
+      },
+      "integrity": {
+        "source_sha256": null,
+        "wheel_sha256": null
+      },
+      "build": {
+        "python": "3.8",
+        "architecture": "aarch64",
+        "output": "wheel"
+      },
+      "observed": {
+        "installed_version": "0.10.5"
+      }
+    }
+  ]
+}

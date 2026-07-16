@@ -1,0 +1,7 @@
+# 可选本地语义模型层。安装前必须已有平台认可的 torch；本文件不得触发
+# Jetson 上的通用 PyPI torch 替换 NVIDIA 构建。
+sentence-transformers==3.2.1
+transformers==4.46.3
+huggingface-hub==0.26.2
+sentencepiece==0.2.0
+safetensors==0.5.3

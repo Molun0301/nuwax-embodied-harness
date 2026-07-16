@@ -4,14 +4,17 @@ Description=nuwax_robot_bridge 宿主机网关
 Requires=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
 BindsTo=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
 PartOf=nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
-After=network-online.target nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service
+After=network-online.target nuwax-motion-safety-guard.service nuwax-nav-stack.service nuwax-geometry-runtime.service nuwax-person-follow.service
 Wants=network-online.target
 
 [Service]
 Type=simple
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
 User=nuwax-gateway
 Group=nuwax-gateway
-SupplementaryGroups=nuwax-motion-clients
+SupplementaryGroups=nuwax-motion-clients video render
 WorkingDirectory=@NUWAX_REPO_ROOT@
 RuntimeDirectory=nuwax/gateway
 RuntimeDirectoryMode=0750
@@ -21,8 +24,11 @@ LogsDirectory=nuwax/gateway
 LogsDirectoryMode=0750
 UMask=0007
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-@NUWAX_REPO_ROOT@/.env
+EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
+EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env
 # EnvironmentFile wins over Environment; Exec* /usr/bin/env assignments below are authoritative.
+Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env
+Environment=GO2_DATA_PLANE_ENV_FILE=@NUWAX_CONFIG_DIR@/go2-data-plane.env
 Environment=NUWAX_LCM_BACKEND=real-lcm
 Environment=NUWAX_REAL_LCM_REQUIRED=true
 Environment=NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1

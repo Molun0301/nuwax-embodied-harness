@@ -2,9 +2,25 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="${NUWAX_REPO_ROOT_OVERRIDE:-${DEFAULT_REPO_ROOT}}"
+[[ "${REPO_ROOT}" == "/" ]] || REPO_ROOT="${REPO_ROOT%/}"
+RENDER_ROOT="${NUWAX_RENDER_ROOT:-${REPO_ROOT}}"
+[[ "${RENDER_ROOT}" == "/" ]] || RENDER_ROOT="${RENDER_ROOT%/}"
 ACTION="${1:-check-sources}"
 ACTUATOR_SYMBOLS_FILE="${2:-${NUWAX_ACTUATOR_SYMBOLS_FILE:-}}"
+
+BIN_DIR="${NUWAX_BIN_DIR:-${REPO_ROOT}/bin}"
+RENDER_BIN_DIR="${NUWAX_RENDER_BIN_DIR:-${BIN_DIR}}"
+CONFIG_DIR="${NUWAX_CONFIG_DIR:-/etc/nuwax}"
+RENDER_CONFIG_DIR="${NUWAX_RENDER_CONFIG_DIR:-${CONFIG_DIR}}"
+NUWAX_ENV_FILE="${CONFIG_DIR}/nuwax.env"
+GO2_DATA_PLANE_ENV_FILE="${CONFIG_DIR}/go2-data-plane.env"
+PYTHON_BIN="${NUWAX_PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
+if [[ -z "${NUWAX_PYTHON_BIN:-}" && ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN=/usr/bin/python3
+fi
+RENDER_PYTHON_BIN="${NUWAX_RENDER_PYTHON_BIN:-${PYTHON_BIN}}"
 
 SYSUSERS_SOURCE="${NUWAX_MOTION_SYSUSERS_SOURCE:-${REPO_ROOT}/deploy/sysusers.d/nuwax-motion.conf}"
 TMPFILES_SOURCE="${REPO_ROOT}/deploy/tmpfiles.d/nuwax-motion.conf"
@@ -21,14 +37,16 @@ GEOMETRY_LAUNCHER="${REPO_ROOT}/scripts/systemd/start_geometry_runtime.sh"
 GEOMETRY_READY_HELPER="${REPO_ROOT}/scripts/systemd/wait_for_geometry_runtime_ready.sh"
 PERSON_FOLLOW_LAUNCHER="${REPO_ROOT}/scripts/systemd/start_person_follow.sh"
 PERSON_FOLLOW_READY_HELPER="${REPO_ROOT}/scripts/systemd/wait_for_person_follow_ready.sh"
-NAV_BINARY="${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-nav-stack"
-GEOMETRY_BINARY="${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
-PERSON_FOLLOW_BINARY="${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-person-follow"
+NAV_BINARY="${BIN_DIR}/nuwax-nav-stack"
+GEOMETRY_BINARY="${BIN_DIR}/nuwax-geometry-runtime"
+PERSON_FOLLOW_BINARY="${BIN_DIR}/nuwax-person-follow"
 GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
 GUARD_LOCK="${NUWAX_MOTION_GUARD_LOCK:-/run/nuwax/motion-guard.lock}"
 GUARD_STATE_DIR="${NUWAX_MOTION_GUARD_STATE_DIR:-/var/lib/nuwax/motion-guard}"
 SDK_PATH="${NUWAX_GO2_SDK_PATH:-${GO2_SDK_PATH:-/home/unitree/unitree_sdk2_python}}"
-INSTALLED_ACTUATOR_SYMBOLS_FILE="/usr/share/nuwax/actuator-symbols.json"
+RENDER_SDK_PATH="${NUWAX_RENDER_GO2_SDK_PATH:-${SDK_PATH}}"
+INSTALLED_ACTUATOR_SYMBOLS_FILE="${CONFIG_DIR}/actuator/actuator-symbols.json"
+SYSTEMD_BACKUP_DIR="${NUWAX_SYSTEMD_BACKUP_DIR:-}"
 PERSON_FOLLOW_AUTOSTART_MODE=""
 SERVICE_IDENTITY_USERS=(
   nuwax-motion-guard
@@ -36,6 +54,24 @@ SERVICE_IDENTITY_USERS=(
   nuwax-navigation
   nuwax-geometry
   nuwax-gateway
+)
+GATEWAY_WRITE_DIRS=(
+  /var/lib/nuwax/gateway/artifacts
+  /var/lib/nuwax/gateway/maps
+  /var/lib/nuwax/gateway/memory
+  /var/lib/nuwax/gateway/geometry/mapping
+  /var/lib/nuwax/gateway/geometry/pcd
+  /var/lib/nuwax/gateway/ultralytics
+  /var/lib/nuwax/gateway/config
+  /var/lib/nuwax/gateway/cache
+  /var/log/nuwax/gateway
+)
+DEPLOYMENT_UNITS=(
+  nuwax-motion-safety-guard
+  nuwax-nav-stack
+  nuwax-geometry-runtime
+  nuwax-person-follow
+  nuwax-host-gateway
 )
 
 fail() {
@@ -134,7 +170,7 @@ resolve_person_follow_autostart() {
 
   if [[ -n "${NUWAX_PERSON_FOLLOW_AUTOSTART+x}" ]]; then
     value="${NUWAX_PERSON_FOLLOW_AUTOSTART}"
-  elif [[ -f "${REPO_ROOT}/.env" ]]; then
+  elif [[ -f "${NUWAX_ENV_FILE}" ]]; then
     while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
       candidate="${raw_line#"${raw_line%%[![:space:]]*}"}"
       [[ -n "${candidate}" && "${candidate}" != \#* && "${candidate}" == *=* ]] \
@@ -144,7 +180,7 @@ resolve_person_follow_autostart() {
       if [[ "${key}" == "NUWAX_PERSON_FOLLOW_AUTOSTART" ]]; then
         value="${candidate#*=}"
       fi
-    done < "${REPO_ROOT}/.env"
+    done < "${NUWAX_ENV_FILE}"
   fi
   value="${value:-true}"
   value="${value%%#*}"
@@ -175,14 +211,42 @@ person_follow_autostart_enabled() {
   [[ "${PERSON_FOLLOW_AUTOSTART_MODE}" == "true" ]]
 }
 
+validate_template_path() {
+  local name="$1"
+  local value="$2"
+  [[ -n "${value}" && "${value}" == /* ]] \
+    || fail "${name} must be an absolute path: ${value:-<unset>}"
+  [[ "${value}" != *[[:space:]]* ]] \
+    || fail "${name} cannot contain whitespace in systemd templates: ${value}"
+}
+
 render_unit_to() {
   local source="$1"
   local destination="$2"
   local escaped_root=""
-  escaped_root="$(printf '%s' "${REPO_ROOT}" | sed 's/[&|\\]/\\&/g')"
-  sed "s|@NUWAX_REPO_ROOT@|${escaped_root}|g" "${source}" > "${destination}"
-  ! grep -qF '@NUWAX_REPO_ROOT@' "${destination}" \
-    || fail "unresolved repository placeholder in ${source}"
+  local escaped_sdk=""
+  local escaped_python=""
+  local escaped_bin=""
+  local escaped_config=""
+  validate_template_path NUWAX_RENDER_ROOT "${RENDER_ROOT}"
+  validate_template_path NUWAX_RENDER_GO2_SDK_PATH "${RENDER_SDK_PATH}"
+  validate_template_path NUWAX_RENDER_PYTHON_BIN "${RENDER_PYTHON_BIN}"
+  validate_template_path NUWAX_RENDER_BIN_DIR "${RENDER_BIN_DIR}"
+  validate_template_path NUWAX_RENDER_CONFIG_DIR "${RENDER_CONFIG_DIR}"
+  escaped_root="$(printf '%s' "${RENDER_ROOT}" | sed 's/[&|\\]/\\&/g')"
+  escaped_sdk="$(printf '%s' "${RENDER_SDK_PATH}" | sed 's/[&|\\]/\\&/g')"
+  escaped_python="$(printf '%s' "${RENDER_PYTHON_BIN}" | sed 's/[&|\\]/\\&/g')"
+  escaped_bin="$(printf '%s' "${RENDER_BIN_DIR}" | sed 's/[&|\\]/\\&/g')"
+  escaped_config="$(printf '%s' "${RENDER_CONFIG_DIR}" | sed 's/[&|\\]/\\&/g')"
+  sed \
+    -e "s|@NUWAX_REPO_ROOT@|${escaped_root}|g" \
+    -e "s|@NUWAX_GO2_SDK_PATH@|${escaped_sdk}|g" \
+    -e "s|@NUWAX_PYTHON_BIN@|${escaped_python}|g" \
+    -e "s|@NUWAX_BIN_DIR@|${escaped_bin}|g" \
+    -e "s|@NUWAX_CONFIG_DIR@|${escaped_config}|g" \
+    "${source}" > "${destination}"
+  ! grep -Eq '@NUWAX_[A-Z0-9_]+@' "${destination}" \
+    || fail "unresolved deployment placeholder in ${source}"
 }
 
 render_unit() {
@@ -232,14 +296,47 @@ check_systemd_owned_invariants() {
   grep -q 'ExecStart=/usr/bin/env .*NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready' \
     "${NAV_UNIT_SOURCE}" \
     || fail "nav ExecStart does not own the production ready path"
-  grep -qF 'NUWAX_NAV_STACK_BINARY=@NUWAX_REPO_ROOT@/services/nuwax-workspace/target/release/nuwax-nav-stack' \
+  grep -qF 'NUWAX_NAV_STACK_BINARY=@NUWAX_BIN_DIR@/nuwax-nav-stack' \
     "${NAV_UNIT_SOURCE}" \
-    || fail "nav ExecStart does not pin the repository release binary"
+    || fail "nav ExecStart does not pin the installed release binary"
+  grep -qF 'NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_BIN_DIR@/nuwax-geometry-runtime' \
+    "${GEOMETRY_UNIT_SOURCE}" \
+    || fail "geometry ExecStart does not pin the installed release binary"
+  grep -qF 'NUWAX_PERSON_FOLLOW_BINARY=@NUWAX_BIN_DIR@/nuwax-person-follow' \
+    "${PERSON_FOLLOW_UNIT_SOURCE}" \
+    || fail "person-follow ExecStart does not pin the installed release binary"
   for unit in "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
               "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
     grep -q 'ExecStart=/usr/bin/env .*NUWAX_LCM_BACKEND=real-lcm .*NUWAX_REAL_LCM_REQUIRED=true' \
       "${unit}" \
       || fail "production ExecStart does not force real-lcm: ${unit}"
+  done
+  [[ "$(grep -cF 'PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@' "${GUARD_UNIT_SOURCE}")" -eq 3 ]] \
+    || fail "motion guard must pin repository and SDK paths in every Python execution context"
+  grep -qF 'NUWAX_PYTHON_BIN=@NUWAX_PYTHON_BIN@' "${GUARD_UNIT_SOURCE}" \
+    || fail "motion guard preflight does not pin the rendered Python interpreter"
+  grep -qF '@NUWAX_PYTHON_BIN@ -m services.navigation.motion_safety_guard' \
+    "${GUARD_UNIT_SOURCE}" \
+    || fail "motion guard ExecStart does not pin the rendered Python interpreter"
+  for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
+              "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+    grep -qF 'EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env' "${unit}" \
+      || fail "production unit does not use the managed config directory: ${unit}"
+  done
+  for unit in "${GUARD_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+    grep -qF 'EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env' "${unit}" \
+      || fail "Go2-facing service does not use the managed data-plane config: ${unit}"
+  done
+  grep -qF 'SupplementaryGroups=nuwax-motion-clients video render' "${GATEWAY_UNIT_SOURCE}" \
+    || fail "Gateway unit must include Jetson video/render device groups"
+  grep -qF 'Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env' \
+    "${GATEWAY_UNIT_SOURCE}" \
+    || fail "Gateway unit does not pin the managed bootstrap environment"
+  for assignment in \
+      'NUWAX_CLOUDMAP_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap' \
+      'NUWAX_OCCUPANCY_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap'; do
+    grep -qF "${assignment}" "${GEOMETRY_UNIT_SOURCE}" \
+      || fail "geometry unit does not pin ${assignment}"
   done
   ! grep -q 'kill -0' "${REPO_ROOT}/scripts/systemd/wait_for_nav_stack_ready.sh" \
     || fail "nav ready consumer must not signal a cross-UID process"
@@ -251,6 +348,9 @@ check_systemd_owned_invariants() {
     || fail "person-follow must use bounded geometry readiness, not a one-shot file test"
   ! grep -Eq '^(Requires|Wants)=.*nuwax-person-follow\.service' "${GATEWAY_UNIT_SOURCE}" \
     || fail "Gateway must not pull the optional person-follow unit"
+  grep -q '^After=.*nuwax-geometry-runtime\.service.*nuwax-person-follow\.service' \
+    "${GATEWAY_UNIT_SOURCE}" \
+    || fail "Gateway must start after optional person-follow when both are scheduled"
   grep -qx 'BindsTo=nuwax-motion-safety-guard.service' "${NAV_UNIT_SOURCE}" \
     || fail "nav unit does not fail-stop with motion guard"
   grep -qx 'PartOf=nuwax-motion-safety-guard.service' "${NAV_UNIT_SOURCE}" \
@@ -285,6 +385,25 @@ check_systemd_owned_invariants() {
   done
 }
 
+validate_sysusers_source() {
+  local rendered_root=""
+
+  if systemd-sysusers --help 2>&1 | grep -q -- '--dry-run'; then
+    systemd-sysusers --dry-run "${SYSUSERS_SOURCE}" >/dev/null
+    return
+  fi
+
+  # systemd 245 (used by the Go2 image) has --root but no --dry-run.
+  # Render into an isolated root so validation never mutates host accounts.
+  rendered_root="$(mktemp -d)"
+  mkdir -p "${rendered_root}/etc"
+  if ! systemd-sysusers --root="${rendered_root}" "${SYSUSERS_SOURCE}" >/dev/null; then
+    rm -rf "${rendered_root}"
+    fail "cannot validate sysusers source: ${SYSUSERS_SOURCE}"
+  fi
+  rm -rf "${rendered_root}"
+}
+
 check_sources() {
   check_file "${SYSUSERS_SOURCE}"
   check_file "${TMPFILES_SOURCE}"
@@ -301,12 +420,20 @@ check_sources() {
   check_file "${GEOMETRY_READY_HELPER}"
   check_file "${PERSON_FOLLOW_LAUNCHER}"
   check_file "${PERSON_FOLLOW_READY_HELPER}"
-  systemd-sysusers --dry-run "${SYSUSERS_SOURCE}" >/dev/null
+  validate_sysusers_source
   check_service_uid_collisions "${SYSUSERS_SOURCE}"
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
               "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
     grep -qF '@NUWAX_REPO_ROOT@' "${unit}" \
       || fail "systemd source is not a repository-root template: ${unit}"
+    grep -qF '@NUWAX_CONFIG_DIR@' "${unit}" \
+      || fail "systemd source is not a config-directory template: ${unit}"
+  done
+  grep -qF '@NUWAX_PYTHON_BIN@' "${GUARD_UNIT_SOURCE}" \
+    || fail "motion guard source is not a Python interpreter template"
+  for unit in "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" "${PERSON_FOLLOW_UNIT_SOURCE}"; do
+    grep -qF '@NUWAX_BIN_DIR@' "${unit}" \
+      || fail "Rust service source is not a release bin template: ${unit}"
   done
   bash -n \
     "${REPO_ROOT}/scripts/systemd/check_motion_guard_python.sh" \
@@ -326,9 +453,39 @@ check_sources() {
   echo "motion guard deployment sources: PASS"
 }
 
+check_runtime_config() {
+  [[ -d "${CONFIG_DIR}" && ! -L "${CONFIG_DIR}" && -x "${CONFIG_DIR}" ]] \
+    || fail "runtime config directory is missing, inaccessible, or a symlink: ${CONFIG_DIR}"
+  [[ -f "${NUWAX_ENV_FILE}" && ! -L "${NUWAX_ENV_FILE}" && -r "${NUWAX_ENV_FILE}" ]] \
+    || fail "runtime config is missing, unreadable, non-regular, or a symlink: ${NUWAX_ENV_FILE}"
+  [[ -f "${GO2_DATA_PLANE_ENV_FILE}" && ! -L "${GO2_DATA_PLANE_ENV_FILE}" \
+    && -r "${GO2_DATA_PLANE_ENV_FILE}" ]] \
+    || fail "Go2 data-plane config is missing, unreadable, non-regular, or a symlink: ${GO2_DATA_PLANE_ENV_FILE}"
+}
+
+check_runtime_config_permissions() {
+  local path=""
+  for path in "${NUWAX_ENV_FILE}" "${GO2_DATA_PLANE_ENV_FILE}"; do
+    [[ "$(stat -c '%U:%G %a' "${path}")" == "root:nuwax-motion-clients 640" ]] \
+      || fail "runtime config must be root:nuwax-motion-clients 0640: ${path}"
+  done
+}
+
+secure_runtime_config_permissions() {
+  local path=""
+  check_runtime_config
+  for path in "${NUWAX_ENV_FILE}" "${GO2_DATA_PLANE_ENV_FILE}"; do
+    chown root:nuwax-motion-clients "${path}"
+    chmod 0640 "${path}"
+  done
+  check_runtime_config_permissions
+}
+
 check_runtime_binaries() {
+  [[ -x "${PYTHON_BIN}" ]] \
+    || fail "motion guard Python interpreter is not executable: ${PYTHON_BIN}"
   [[ -x "${NAV_BINARY}" ]] \
-    || fail "navigation stack is not executable: ${NAV_BINARY}; run scripts/build_nav_stack.sh"
+    || fail "navigation stack is not executable: ${NAV_BINARY}"
   [[ -x "${GEOMETRY_BINARY}" ]] \
     || fail "geometry runtime is not executable: ${GEOMETRY_BINARY}"
   if person_follow_autostart_enabled; then
@@ -349,8 +506,190 @@ check_installed_actuator_manifest() {
     && ! -L "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" \
     && -s "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" ]] \
     || fail "installed actuator symbols manifest is missing, empty, non-regular, or a symlink"
-  [[ "$(stat -c '%U:%G %a' "${INSTALLED_ACTUATOR_SYMBOLS_FILE}")" == "root:root 444" ]] \
-    || fail "installed actuator symbols manifest must be root:root 0444"
+  [[ "$(stat -c '%U:%G %a' "${INSTALLED_ACTUATOR_SYMBOLS_FILE}")" == "root:nuwax-motion-clients 640" ]] \
+    || fail "installed actuator symbols manifest must be root:nuwax-motion-clients 0640"
+}
+
+check_identity_write_access() {
+  local user="$1"
+  local directory="$2"
+  runuser -u "${user}" -- test -w "${directory}" \
+    || fail "${user} cannot write ${directory}"
+  runuser -u "${user}" -- sh -c '
+    set -eu
+    directory="$1"
+    probe="${directory}/.nuwax-access-$$"
+    trap '\''rm -f "${probe}"'\'' EXIT HUP INT TERM
+    umask 077
+    : > "${probe}"
+    rm -f "${probe}"
+    trap - EXIT HUP INT TERM
+  ' sh "${directory}" || fail "${user} failed the real write probe for ${directory}"
+}
+
+ensure_gateway_device_groups() {
+  local group=""
+  for group in video render; do
+    getent group "${group}" >/dev/null \
+      || fail "Jetson device group is missing: ${group}"
+    usermod -a -G "${group}" nuwax-gateway
+  done
+}
+
+secure_runtime_data_permissions() {
+  local directory=""
+  local unsafe=""
+  for directory in "${GATEWAY_WRITE_DIRS[@]}"; do
+    unsafe="$(find -P "${directory}" -xdev ! -type d ! -type f -print -quit)"
+    [[ -z "${unsafe}" ]] \
+      || fail "gateway writable tree contains a link or special file: ${unsafe}"
+    chown -hR nuwax-gateway:nuwax-gateway "${directory}"
+    find "${directory}" -xdev -type d -exec chmod 0750 {} +
+    find "${directory}" -xdev -type f -exec chmod 0640 {} +
+  done
+  chown nuwax-geometry:nuwax-motion-clients /var/lib/nuwax_robot_bridge
+  chmod 0770 /var/lib/nuwax_robot_bridge
+  [[ -f /tmp/cdds.LOG && ! -L /tmp/cdds.LOG ]] \
+    || fail "/tmp/cdds.LOG must be a regular non-symlink created by systemd-tmpfiles"
+  [[ "$(stat -c '%U:%G:%a' /tmp/cdds.LOG)" == "root:nuwax-motion-clients:660" ]] \
+    || fail "/tmp/cdds.LOG must be root:nuwax-motion-clients 0660"
+}
+
+snapshot_systemd_state() {
+  local unit=""
+  local base=""
+  local dropins=""
+  local enabled="disabled"
+  local active="inactive"
+  [[ -n "${SYSTEMD_BACKUP_DIR}" ]] \
+    || fail "NUWAX_SYSTEMD_BACKUP_DIR is required for transactional systemd changes"
+  if [[ -f "${SYSTEMD_BACKUP_DIR}/snapshot.complete" ]]; then
+    return 0
+  fi
+  mkdir -p \
+    "${SYSTEMD_BACKUP_DIR}/units" \
+    "${SYSTEMD_BACKUP_DIR}/dropins" \
+    "${SYSTEMD_BACKUP_DIR}/sysusers" \
+    "${SYSTEMD_BACKUP_DIR}/tmpfiles"
+  : > "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
+  for unit in "${DEPLOYMENT_UNITS[@]}"; do
+    base="/etc/systemd/system/${unit}.service"
+    dropins="${base}.d"
+    enabled="$(systemctl is-enabled "${unit}.service" 2>/dev/null || true)"
+    active="$(systemctl is-active "${unit}.service" 2>/dev/null || true)"
+    printf '%s\t%s\t%s\n' "${unit}" "${enabled:-disabled}" "${active:-inactive}" \
+      >> "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
+    [[ ! -L "${base}" ]] || fail "refusing systemd unit symlink: ${base}"
+    if [[ -f "${base}" && ! -L "${base}" ]]; then
+      cp -a "${base}" "${SYSTEMD_BACKUP_DIR}/units/${unit}.service"
+    fi
+    if [[ -d "${dropins}" && ! -L "${dropins}" ]]; then
+      cp -a "${dropins}" "${SYSTEMD_BACKUP_DIR}/dropins/${unit}.service.d"
+    elif [[ -L "${dropins}" ]]; then
+      fail "refusing systemd drop-in symlink: ${dropins}"
+    fi
+  done
+  for path in \
+      /usr/lib/sysusers.d/nuwax-motion.conf \
+      /usr/lib/tmpfiles.d/nuwax-motion.conf; do
+    [[ ! -L "${path}" ]] || fail "refusing systemd support-file symlink: ${path}"
+    if [[ -f "${path}" && ! -L "${path}" ]]; then
+      case "${path}" in
+        */sysusers.d/*) cp -a "${path}" "${SYSTEMD_BACKUP_DIR}/sysusers/" ;;
+        */tmpfiles.d/*) cp -a "${path}" "${SYSTEMD_BACKUP_DIR}/tmpfiles/" ;;
+      esac
+    fi
+  done
+  chmod -R go-rwx "${SYSTEMD_BACKUP_DIR}"
+  : > "${SYSTEMD_BACKUP_DIR}/snapshot.complete"
+}
+
+remove_legacy_dropins() {
+  local unit=""
+  local dropins=""
+  snapshot_systemd_state
+  for unit in "${DEPLOYMENT_UNITS[@]}"; do
+    dropins="/etc/systemd/system/${unit}.service.d"
+    if [[ -d "${dropins}" && ! -L "${dropins}" ]]; then
+      rm -rf "${dropins}"
+    elif [[ -L "${dropins}" ]]; then
+      fail "refusing systemd drop-in symlink: ${dropins}"
+    fi
+  done
+}
+
+systemd_sources_changed() {
+  local rendered_dir=""
+  local source=""
+  local installed=""
+  local unit=""
+  rendered_dir="$(mktemp -d)"
+  for source in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
+                "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
+    unit="$(basename "${source}")"
+    render_unit_to "${source}" "${rendered_dir}/${unit}"
+    installed="/etc/systemd/system/${unit}"
+    if [[ ! -f "${installed}" || -L "${installed}" ]] \
+        || ! cmp -s "${rendered_dir}/${unit}" "${installed}" \
+        || [[ -e "${installed}.d" ]]; then
+      rm -rf "${rendered_dir}"
+      return 0
+    fi
+  done
+  if [[ ! -f /usr/lib/sysusers.d/nuwax-motion.conf ]] \
+      || ! cmp -s "${SYSUSERS_SOURCE}" /usr/lib/sysusers.d/nuwax-motion.conf \
+      || [[ ! -f /usr/lib/tmpfiles.d/nuwax-motion.conf ]] \
+      || ! cmp -s "${TMPFILES_SOURCE}" /usr/lib/tmpfiles.d/nuwax-motion.conf; then
+    rm -rf "${rendered_dir}"
+    return 0
+  fi
+  rm -rf "${rendered_dir}"
+  return 1
+}
+
+restore_systemd_state() {
+  local unit=""
+  local enabled=""
+  local active=""
+  local base=""
+  local saved=""
+  [[ -f "${SYSTEMD_BACKUP_DIR}/snapshot.complete" ]] \
+    || fail "systemd rollback snapshot is missing: ${SYSTEMD_BACKUP_DIR}"
+  for unit in "${DEPLOYMENT_UNITS[@]}"; do
+    base="/etc/systemd/system/${unit}.service"
+    saved="${SYSTEMD_BACKUP_DIR}/units/${unit}.service"
+    if [[ -f "${saved}" ]]; then
+      install -D -m 0644 "${saved}" "${base}"
+    else
+      rm -f "${base}"
+    fi
+    rm -rf "${base}.d"
+    if [[ -d "${SYSTEMD_BACKUP_DIR}/dropins/${unit}.service.d" ]]; then
+      cp -a "${SYSTEMD_BACKUP_DIR}/dropins/${unit}.service.d" "${base}.d"
+    fi
+  done
+  for kind in sysusers tmpfiles; do
+    saved="${SYSTEMD_BACKUP_DIR}/${kind}/nuwax-motion.conf"
+    if [[ -f "${saved}" ]]; then
+      install -D -m 0644 "${saved}" "/usr/lib/${kind}.d/nuwax-motion.conf"
+    else
+      rm -f "/usr/lib/${kind}.d/nuwax-motion.conf"
+    fi
+  done
+  systemctl daemon-reload
+  while IFS=$'\t' read -r unit enabled active; do
+    case "${enabled}" in
+      enabled|enabled-runtime|linked|linked-runtime|alias) systemctl enable "${unit}.service" ;;
+      *) systemctl disable "${unit}.service" || true ;;
+    esac
+  done < "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
+  while IFS=$'\t' read -r unit enabled active; do
+    if [[ "${active}" == "active" ]]; then
+      systemctl restart "${unit}.service"
+    else
+      systemctl stop "${unit}.service" || true
+    fi
+  done < "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
 }
 
 install_actuator_manifest() {
@@ -361,19 +700,38 @@ install_actuator_manifest() {
     cmp -s "${ACTUATOR_SYMBOLS_FILE}" "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" \
       || fail "refusing to overwrite installed actuator symbols manifest with different content"
   else
-    install -D -o root -g root -m 0444 \
+    install -D -o root -g nuwax-motion-clients -m 0640 \
       "${ACTUATOR_SYMBOLS_FILE}" "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   fi
+  chown root:nuwax-motion-clients "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
+  chmod 0640 "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   check_installed_actuator_manifest
 }
 
 check_service_access() {
+  local user=""
+  for user in nuwax-motion-guard nuwax-navigation nuwax-geometry nuwax-gateway; do
+    runuser -u "${user}" -- test -x "${CONFIG_DIR}" \
+      || fail "${user} cannot traverse runtime config directory ${CONFIG_DIR}"
+    runuser -u "${user}" -- test -r "${NUWAX_ENV_FILE}" \
+      || fail "${user} cannot read runtime config ${NUWAX_ENV_FILE}"
+  done
+  runuser -u nuwax-motion-guard -- test -r "${GO2_DATA_PLANE_ENV_FILE}" \
+    || fail "nuwax-motion-guard cannot read ${GO2_DATA_PLANE_ENV_FILE}"
+  runuser -u nuwax-gateway -- test -r "${GO2_DATA_PLANE_ENV_FILE}" \
+    || fail "nuwax-gateway cannot read ${GO2_DATA_PLANE_ENV_FILE}"
   runuser -u nuwax-motion-guard -- test -x "${REPO_ROOT}" \
     || fail "nuwax-motion-guard cannot traverse ${REPO_ROOT}"
   runuser -u nuwax-motion-guard -- test -r "${GUARD_MODULE}" \
     || fail "nuwax-motion-guard cannot read ${GUARD_MODULE}"
+  runuser -u nuwax-motion-guard -- test -x "${PYTHON_BIN}" \
+    || fail "nuwax-motion-guard cannot execute ${PYTHON_BIN}"
+  runuser -u nuwax-motion-guard -- test -x "${SDK_PATH}" \
+    || fail "nuwax-motion-guard cannot traverse ${SDK_PATH}"
   runuser -u nuwax-motion-guard -- env \
-    GO2_SDK_PATH="${SDK_PATH}" \
+    NUWAX_REPO_ROOT_OVERRIDE="${REPO_ROOT}" \
+    NUWAX_GO2_SDK_PATH="${SDK_PATH}" \
+    NUWAX_PYTHON_BIN="${PYTHON_BIN}" \
     PYTHONPATH="${REPO_ROOT}:${SDK_PATH}" \
     bash "${REPO_ROOT}/scripts/systemd/check_motion_guard_python.sh" \
     || fail "nuwax-motion-guard cannot import protobuf/SDK/production module"
@@ -403,8 +761,16 @@ check_service_access() {
     || fail "nuwax-geometry cannot traverse/read/execute ${GEOMETRY_BINARY}"
   runuser -u nuwax-gateway -- test -x "${REPO_ROOT}" \
     || fail "nuwax-gateway cannot traverse ${REPO_ROOT}"
+  runuser -u nuwax-gateway -- test -x "${PYTHON_BIN}" \
+    || fail "nuwax-gateway cannot execute ${PYTHON_BIN}"
   runuser -u nuwax-gateway -- test -r "${REPO_ROOT}/scripts/start_gateway.sh" \
     || fail "nuwax-gateway cannot read start_gateway.sh"
+  check_identity_write_access nuwax-geometry /var/lib/nuwax_robot_bridge
+  for directory in "${GATEWAY_WRITE_DIRS[@]}"; do
+    check_identity_write_access nuwax-gateway "${directory}"
+  done
+  runuser -u nuwax-gateway -- test -w /tmp/cdds.LOG \
+    || fail "nuwax-gateway cannot write /tmp/cdds.LOG"
 }
 
 check_record() {
@@ -420,6 +786,7 @@ check_record() {
 }
 
 verify_installed() {
+  local effective_unit=""
   getent passwd nuwax-motion-guard >/dev/null || fail "missing user nuwax-motion-guard"
   getent passwd nuwax-motion-admin >/dev/null || fail "missing user nuwax-motion-admin"
   getent passwd nuwax-navigation >/dev/null || fail "missing user nuwax-navigation"
@@ -431,14 +798,27 @@ verify_installed() {
     id -nG "${user}" | tr ' ' '\n' | grep -qx nuwax-motion-clients \
       || fail "${user} is not a member of nuwax-motion-clients"
   done
+  for group in video render; do
+    id -nG nuwax-gateway | tr ' ' '\n' | grep -qx "${group}" \
+      || fail "nuwax-gateway is not a member of ${group}"
+  done
+  check_runtime_config
+  check_runtime_config_permissions
+  check_runtime_binaries
+  check_service_access
   for unit in nuwax-motion-safety-guard nuwax-nav-stack nuwax-geometry-runtime \
               nuwax-person-follow nuwax-host-gateway; do
     installed_unit="/etc/systemd/system/${unit}.service"
     [[ -f "${installed_unit}" ]] || fail "missing installed unit: ${installed_unit}"
-    ! grep -qF '@NUWAX_REPO_ROOT@' "${installed_unit}" \
-      || fail "unrendered repository placeholder: ${installed_unit}"
-    grep -qF "WorkingDirectory=${REPO_ROOT}" "${installed_unit}" \
-      || fail "installed unit does not target ${REPO_ROOT}: ${installed_unit}"
+    ! grep -Eq '@NUWAX_[A-Z0-9_]+@' "${installed_unit}" \
+      || fail "unrendered deployment placeholder: ${installed_unit}"
+    grep -qF "WorkingDirectory=${RENDER_ROOT}" "${installed_unit}" \
+      || fail "installed unit does not target ${RENDER_ROOT}: ${installed_unit}"
+    effective_unit="$(systemctl cat --no-pager "${unit}.service")"
+    grep -qF "WorkingDirectory=${RENDER_ROOT}" <<< "${effective_unit}" \
+      || fail "effective systemd unit does not target ${RENDER_ROOT}: ${unit}"
+    ! grep -qF '.service.d/' <<< "${effective_unit}" \
+      || fail "unexpected systemd drop-in still overrides ${unit}.service"
   done
   check_installed_actuator_manifest
   "${PROVISIONER}" verify \
@@ -478,26 +858,57 @@ verify_installed() {
   fi
   systemctl is-active --quiet nuwax-host-gateway.service \
     || fail "nuwax-host-gateway.service is not active"
+  for path in \
+      /var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap \
+      /var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap; do
+    [[ -f "${path}" && ! -L "${path}" ]] \
+      || fail "geometry shared-memory file is missing or unsafe: ${path}"
+    [[ "$(stat -c '%U:%G %a' "${path}")" == "nuwax-geometry:nuwax-motion-clients 660" ]] \
+      || fail "geometry shared-memory owner/mode drift: ${path}"
+  done
+  for unit in nuwax-motion-safety-guard nuwax-nav-stack nuwax-geometry-runtime \
+              nuwax-person-follow nuwax-host-gateway; do
+    if [[ "${unit}" == "nuwax-person-follow" ]] && ! person_follow_autostart_enabled; then
+      continue
+    fi
+    [[ "$(systemctl show -p NRestarts --value "${unit}.service")" == "0" ]] \
+      || fail "${unit}.service restarted during deployment readiness observation"
+  done
   echo "motion guard deployment runtime: PASS"
 }
 
 install_sources() {
+  local sources_changed="false"
   require_root
   check_sources
+  check_runtime_config
   check_runtime_binaries
-  install -D -m 0644 "${SYSUSERS_SOURCE}" /usr/lib/sysusers.d/nuwax-motion.conf
-  install -D -m 0644 "${TMPFILES_SOURCE}" /usr/lib/tmpfiles.d/nuwax-motion.conf
+  snapshot_systemd_state
+  if systemd_sources_changed; then
+    sources_changed="true"
+    install -D -m 0644 "${SYSUSERS_SOURCE}" /usr/lib/sysusers.d/nuwax-motion.conf
+    install -D -m 0644 "${TMPFILES_SOURCE}" /usr/lib/tmpfiles.d/nuwax-motion.conf
+  fi
   systemd-sysusers /usr/lib/sysusers.d/nuwax-motion.conf
   check_service_uid_collisions system
+  ensure_gateway_device_groups
+  secure_runtime_config_permissions
   systemd-tmpfiles --create /usr/lib/tmpfiles.d/nuwax-motion.conf
+  secure_runtime_data_permissions
   bash "${LCM_PREFLIGHT}"
   check_service_access
-  render_unit "${GUARD_UNIT_SOURCE}" /etc/systemd/system/nuwax-motion-safety-guard.service
-  render_unit "${NAV_UNIT_SOURCE}" /etc/systemd/system/nuwax-nav-stack.service
-  render_unit "${GEOMETRY_UNIT_SOURCE}" /etc/systemd/system/nuwax-geometry-runtime.service
-  render_unit "${PERSON_FOLLOW_UNIT_SOURCE}" /etc/systemd/system/nuwax-person-follow.service
-  render_unit "${GATEWAY_UNIT_SOURCE}" /etc/systemd/system/nuwax-host-gateway.service
-  systemctl daemon-reload
+  if [[ "${sources_changed}" == "true" ]]; then
+    remove_legacy_dropins
+    render_unit "${GUARD_UNIT_SOURCE}" /etc/systemd/system/nuwax-motion-safety-guard.service
+    render_unit "${NAV_UNIT_SOURCE}" /etc/systemd/system/nuwax-nav-stack.service
+    render_unit "${GEOMETRY_UNIT_SOURCE}" /etc/systemd/system/nuwax-geometry-runtime.service
+    render_unit "${PERSON_FOLLOW_UNIT_SOURCE}" /etc/systemd/system/nuwax-person-follow.service
+    render_unit "${GATEWAY_UNIT_SOURCE}" /etc/systemd/system/nuwax-host-gateway.service
+    systemctl daemon-reload
+    : > "${SYSTEMD_BACKUP_DIR}/sources.changed"
+  else
+    rm -f "${SYSTEMD_BACKUP_DIR}/sources.changed"
+  fi
   echo "deployment files installed; provision durable records before enabling the stack"
 }
 
@@ -519,6 +930,46 @@ enable_stack() {
   echo "enabled mandatory startup order: guard -> nav-stack -> geometry runtime -> Gateway; person-follow autostart=${PERSON_FOLLOW_AUTOSTART_MODE}"
 }
 
+start_stack() {
+  require_root
+  check_runtime_config
+  check_runtime_config_permissions
+  check_runtime_binaries
+  check_installed_actuator_manifest
+  "${PROVISIONER}" verify \
+    --state-dir "${GUARD_STATE_DIR}" \
+    --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
+  check_service_uid_collisions system
+  check_service_access
+
+  if person_follow_autostart_enabled; then
+    systemctl restart \
+      nuwax-motion-safety-guard.service \
+      nuwax-nav-stack.service \
+      nuwax-geometry-runtime.service \
+      nuwax-person-follow.service \
+      nuwax-host-gateway.service
+  else
+    systemctl stop nuwax-person-follow.service
+    systemctl restart \
+      nuwax-motion-safety-guard.service \
+      nuwax-nav-stack.service \
+      nuwax-geometry-runtime.service \
+      nuwax-host-gateway.service
+  fi
+  echo "started/restarted mandatory stack in order: guard -> nav-stack -> geometry runtime -> Gateway; person-follow autostart=${PERSON_FOLLOW_AUTOSTART_MODE}"
+}
+
+stop_stack() {
+  require_root
+  systemctl stop nuwax-host-gateway.service
+  systemctl stop nuwax-person-follow.service
+  systemctl stop nuwax-geometry-runtime.service
+  systemctl stop nuwax-nav-stack.service
+  systemctl stop nuwax-motion-safety-guard.service
+  echo "stopped stack in reverse dependency order"
+}
+
 provision_records() {
   require_root
   install_actuator_manifest
@@ -535,27 +986,47 @@ migrate_peer_allowlist_records() {
     --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
 }
 
-case "${ACTION}" in
-  check-sources)
-    check_sources
-    ;;
-  install)
-    install_sources
-    ;;
-  provision)
-    provision_records
-    ;;
-  migrate-peer-allowlist)
-    migrate_peer_allowlist_records
-    ;;
-  enable)
-    enable_stack
-    ;;
-  verify-runtime)
-    verify_installed
-    ;;
-  *)
-    echo "usage: $0 [check-sources|install|provision|migrate-peer-allowlist|enable|verify-runtime] [actuator-symbols.json]" >&2
-    exit 2
-    ;;
-esac
+main() {
+  case "${ACTION}" in
+    check-sources)
+      check_sources
+      ;;
+    snapshot-systemd)
+      require_root
+      snapshot_systemd_state
+      ;;
+    restore-systemd)
+      require_root
+      restore_systemd_state
+      ;;
+    install)
+      install_sources
+      ;;
+    provision)
+      provision_records
+      ;;
+    migrate-peer-allowlist)
+      migrate_peer_allowlist_records
+      ;;
+    enable)
+      enable_stack
+      ;;
+    start)
+      start_stack
+      ;;
+    stop)
+      stop_stack
+      ;;
+    verify-runtime)
+      verify_installed
+      ;;
+    *)
+      echo "usage: $0 [check-sources|snapshot-systemd|restore-systemd|install|provision|migrate-peer-allowlist|enable|start|stop|verify-runtime] [actuator-symbols.json]" >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main
+fi

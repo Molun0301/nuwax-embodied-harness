@@ -2,11 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="${NUWAX_REPO_ROOT_OVERRIDE:-${DEFAULT_REPO_ROOT}}"
 SDK_PATH="${NUWAX_GO2_SDK_PATH:-${GO2_SDK_PATH:-}}"
+PYTHON_BIN="${NUWAX_PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
-[[ -x /usr/bin/python3 ]] || {
-  echo "motion guard requires executable /usr/bin/python3" >&2
+if [[ -z "${NUWAX_PYTHON_BIN:-}" && ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN=/usr/bin/python3
+fi
+
+[[ -x "${PYTHON_BIN}" ]] || {
+  echo "motion guard requires executable Python interpreter: ${PYTHON_BIN}" >&2
   exit 1
 }
 [[ -x "${REPO_ROOT}" ]] || {
@@ -24,7 +30,7 @@ SDK_PATH="${NUWAX_GO2_SDK_PATH:-${GO2_SDK_PATH:-}}"
 
 export PYTHONPATH="${REPO_ROOT}:${SDK_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONNOUSERSITE=1
-exec /usr/bin/python3 -c '
+exec "${PYTHON_BIN}" -c '
 import google.protobuf
 import unitree_sdk2py.core.channel
 import unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client

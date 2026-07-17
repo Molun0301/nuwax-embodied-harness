@@ -1594,9 +1594,10 @@ fn evaluate_stop_conditions(
     }) {
         return Some(ExplorationStopReason::DurationExceeded);
     }
-    if conditions
-        .max_goals
-        .is_some_and(|max_goals| guard.dispatched_goals >= max_goals)
+    if guard.active_child.is_none()
+        && conditions
+            .max_goals
+            .is_some_and(|max_goals| guard.dispatched_goals >= max_goals)
     {
         return Some(ExplorationStopReason::MaxGoalsReached);
     }
@@ -2422,6 +2423,52 @@ mod tests {
         assert_eq!(next.status, STATUS_ACTIVE);
         assert_ne!(next.child_task_id, active.child_task_id);
         assert_eq!(active_child_lease(&handle).await.map_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn max_goals_waits_for_active_child_terminal_before_stopping() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        let accepted = handle
+            .start_with_config(
+                "req-max-goals",
+                ExploreStartConfig {
+                    stop_conditions: ExploreStopConditions {
+                        max_goals: Some(1),
+                        ..ExploreStopConditions::default()
+                    },
+                    ..ExploreStartConfig::default()
+                },
+            )
+            .await;
+        assert_eq!(accepted.status, STATUS_ACCEPTED);
+
+        let active = handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+        assert_eq!(active.status, STATUS_ACTIVE);
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+
+        let waiting = handle.tick((2.0, 2.0)).await;
+        assert_eq!(waiting.status, STATUS_ACTIVE);
+        assert_eq!(waiting.child_task_id, active.child_task_id);
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+
+        handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Reached(terminal_proof(&lease)),
+            )
+            .await
+            .unwrap();
+        let completed = handle.tick((2.0, 2.0)).await;
+        assert_eq!(completed.status, STATUS_SUCCEEDED);
+        assert_eq!(completed.last_stop_reason, "max_goals_reached");
+        assert!(completed.child_task_id.is_empty());
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        assert!(sink.cancelled.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

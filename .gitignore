@@ -111,5 +111,6 @@ services/nuwax-workspace/.omc/
 services/nuwax-workspace/.omx/
 services/nuwax-workspace/*.lock.tmp
 
-
+忽略构建产物
 */bin/*
+bin/*

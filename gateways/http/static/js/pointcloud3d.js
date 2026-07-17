@@ -171,6 +171,23 @@ class PointCloud3DViewer {
     }
   }
 
+  _removeLegacySceneHelpers() {
+    if (!this._scene) return 0;
+    const helpers = [];
+    this._scene.traverse((object) => {
+      if (object !== this._scene && (object.type === 'GridHelper' || object.type === 'AxesHelper')) {
+        helpers.push(object);
+      }
+    });
+    for (const helper of helpers) {
+      helper.parent?.remove(helper);
+      helper.geometry?.dispose?.();
+      if (Array.isArray(helper.material)) helper.material.forEach((material) => material.dispose?.());
+      else helper.material?.dispose?.();
+    }
+    return helpers.length;
+  }
+
   _renderLoop(timestamp) {
     this._rafId = null;
     const elapsed = timestamp - this._lastFrameTime;
@@ -183,6 +200,7 @@ class PointCloud3DViewer {
     this._lastFrameTime = timestamp;
     this._needsRender = false;
     const controlsChanged = Boolean(this._controls?.update());
+    this._removeLegacySceneHelpers();
     this._renderer.render(this._scene, this._camera);
     if (this._interactionActive || controlsChanged) {
       this._requestRender();

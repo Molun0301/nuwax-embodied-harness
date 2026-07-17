@@ -366,6 +366,7 @@ button{font-family:inherit;cursor:pointer}
   color:var(--strong);font-size:11.5px;font-weight:620;cursor:pointer}
 .map-layer-toggle:hover{background:var(--inset)}
 .map-layer-toggle input{margin:0;accent-color:var(--robot)}
+.map-overlay-panel{border-radius:var(--r)}
 .map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .map-goal-chip{position:absolute;left:14px;top:94px;z-index:5}
 .legend{position:absolute;left:14px;bottom:14px;z-index:5;max-width:52%}
@@ -510,7 +511,7 @@ button{font-family:inherit;cursor:pointer}
                 </div>
               </div>
               <span id="mapGoalStatus" class="mchip glass map-goal-chip" hidden></span>
-              <span id="mapStreamStatus" class="mchip glass map-stream-chip">等待地图首帧</span>
+              <span id="mapStreamStatus" class="mchip glass map-overlay-panel map-stream-chip">等待地图首帧</span>
               <div class="lgnd glass legend">
                 <span class="lg"><span class="sw" style="background:var(--grid-free)"></span>可通行</span>
                 <span class="lg"><span class="sw" style="background:var(--grid-occ)"></span>占据</span>
@@ -522,8 +523,8 @@ button{font-family:inherit;cursor:pointer}
                 <span id="mapRvizHint" class="lg" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
                 <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
               </div>
-              <div id="mapPoseHud" class="map-pose-hud glass" aria-live="polite">
-                <div class="map-pose-title">机器狗位姿</div>
+              <div id="mapPoseHud" class="map-pose-hud glass map-overlay-panel" aria-live="polite">
+                <div class="map-pose-title">位姿</div>
                 <div id="mapPoseMeta" class="kv map-pose-meta"></div>
               </div>
               <div id="mapStatus" class="pill missing map-status-chip">缺失</div>
@@ -5680,7 +5681,7 @@ button{font-family:inherit;cursor:pointer}
       updateMapPoseHud();
     })();
   </script>
-  <script type="module" src="/static/js/pointcloud3d.js"></script>
+  <script type="module" src="/static/js/pointcloud3d.js?v=20260717-no-grid-axes"></script>
   <!-- V2 navigation-and-exploration-boundary §9.3：容器 + 拆模块 script 引用（不堆业务） -->
   <!-- 默认隐藏，由 map-toolbar 的"导航"按钮 / "划线"按钮点击后展开 -->
   <div id="navigation-container" data-role="v2-navigation" hidden>

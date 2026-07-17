@@ -111,5 +111,5 @@ services/nuwax-workspace/.omc/
 services/nuwax-workspace/.omx/
 services/nuwax-workspace/*.lock.tmp
 
-# === nuwax-person-follow 本地产物（入仓 tracked snapshot，但产物忽略） ===
-bin/nuwax-person-follow
+
+*/bin/*

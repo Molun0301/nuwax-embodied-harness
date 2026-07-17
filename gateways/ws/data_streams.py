@@ -56,6 +56,15 @@ async def _run_blocking(callable_obj, *args, **kwargs):
 
 def _safe_enqueue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, frame: StreamFrame, runtime: GatewayRuntime) -> None:
     def _push() -> None:
+        if frame.payload_kind == StreamPayloadKind.BINARY:
+            retained = []
+            while not queue.empty():
+                queued = queue.get_nowait()
+                if queued.payload_kind == StreamPayloadKind.BINARY and queued.topic == frame.topic:
+                    continue
+                retained.append(queued)
+            for queued in retained:
+                queue.put_nowait(queued)
         if queue.full():
             try:
                 dropped = queue.get_nowait()

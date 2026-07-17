@@ -379,6 +379,18 @@ button{font-family:inherit;cursor:pointer}
 .workspace.swapped .legend{left:10px;bottom:10px;max-width:calc(100% - 80px);padding:5px 8px;gap:4px 8px;font-size:9.5px}
 
 @media(max-width:760px){
+  body{padding:8px;overflow-x:hidden}
+  .app,#view-host,.view-pane,.mission-layout,.mission-content,.workspace{width:100%;min-width:0}
+  .vitals{min-width:0;flex-wrap:wrap;gap:8px;padding:8px 10px}
+  .brand{min-width:0;flex:1 1 140px;padding-right:8px}
+  .brand>div{min-width:0}
+  .brand .nm,.brand .md{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .vstats{order:3;flex:1 0 100%;width:100%;flex-wrap:nowrap}
+  .vstat{flex:1 1 0;padding:2px 7px}
+  .vstat .v,.vstat .l{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dock.card{grid-template-columns:minmax(0,1fr);height:auto;overflow:visible}
+  .dcol{border-left:0;border-top:1px solid var(--line)}
+  .dcol:first-child{border-top:0}
   .map-toolbar{left:10px;right:10px;top:10px;max-width:none}
   .map-tool-row{gap:5px}
   .map-tool-group{max-width:100%;flex-wrap:wrap}
@@ -407,6 +419,9 @@ button{font-family:inherit;cursor:pointer}
 @media(max-width:1200px){
   .workspace{grid-template-columns:1fr;grid-template-rows:none;grid-template-areas:"hero" "mini" "rail" "dock"}
   .map-panel{min-height:480px}.workspace.swapped .map-panel{min-height:300px}
+}
+@media(max-width:760px){
+  .workspace{grid-template-columns:minmax(0,1fr)}
 }
 
 /* view-host occupies .app row 2; active pane fills it */
@@ -2439,7 +2454,8 @@ button{font-family:inherit;cursor:pointer}
       function localizationPoseStreamReason() {
         const envelope = state.lastLocalizationEnvelope;
         if (!envelope || statusOf(envelope) !== "available") return null;
-        return pointFromPose(state.pose) ? "localization_pose_stream" : null;
+        const data = envelope.data || {};
+        return pointFromPose(data.pose || data) ? "localization_pose_stream" : null;
       }
       function goalInteractionReason() {
         if (state.goalPickMode || state.publishPointMode || state.initialPosePickMode || state.pendingNavGoal) {

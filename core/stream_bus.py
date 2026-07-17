@@ -100,10 +100,11 @@ class StreamBus:
         with self._lock:
             stored_frame = frame.model_copy(update={"cursor": self._next_cursor})
             self._next_cursor += 1
-            self._frames.append(stored_frame)
-            if len(self._frames) > self._retention_limit:
-                self._frames = self._frames[-self._retention_limit :]
-            self._latest_by_topic[stored_frame.topic] = stored_frame
+            if stored_frame.payload_kind != StreamPayloadKind.BINARY:
+                self._frames.append(stored_frame)
+                if len(self._frames) > self._retention_limit:
+                    self._frames = self._frames[-self._retention_limit :]
+                self._latest_by_topic[stored_frame.topic] = stored_frame
             subscriptions = tuple(self._subscriptions.values())
 
         failures: List[Tuple[StreamSubscription, Exception]] = []

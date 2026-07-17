@@ -10,7 +10,6 @@ const COLORS = {
   navGoal: 0xa78bfa,
   semantic: 0xf59e0b,
   semanticFallback: 0x94a3b8,
-  grid: 0x334155,
 };
 
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
@@ -38,6 +37,7 @@ class PointCloud3DViewer {
     this._navGoalMesh = null;
     this._resizeObserver = null;
     this._interactionActive = false;
+    this._hasUserCameraInput = false;
     this._cameraMode = 'free';
     this._lastFollowTarget = null;
     this._pointCloudBounds = null;
@@ -98,12 +98,6 @@ class PointCloud3DViewer {
     this._camera.position.set(0, -10, 8);
     this._camera.up.set(0, 0, 1);
 
-    const grid = new THREE.GridHelper(40, 40, COLORS.grid, COLORS.grid);
-    grid.rotation.x = Math.PI / 2;
-    this._scene.add(grid);
-
-    this._scene.add(new THREE.AxesHelper(1));
-
     this._frontierGroup = new THREE.Group();
     this._scene.add(this._frontierGroup);
 
@@ -139,6 +133,7 @@ class PointCloud3DViewer {
     });
     this._controls.addEventListener('start', () => {
       this._interactionActive = true;
+      if (this._cameraMode === 'free') this._hasUserCameraInput = true;
       this._requestRender();
     });
     this._controls.addEventListener('end', () => {
@@ -327,27 +322,50 @@ class PointCloud3DViewer {
     return reset;
   }
 
-  _colorByHeight(positions) {
-    const count = positions.length / 3;
-    const colors = new Float32Array(count * 3);
-    if (count === 0) return colors;
-    let zMin = Infinity, zMax = -Infinity;
-    for (let i = 2; i < positions.length; i += 3) {
-      if (positions[i] < zMin) zMin = positions[i];
-      if (positions[i] > zMax) zMax = positions[i];
+  _measurePointCloud(positions) {
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < positions.length; i += 3) {
+      const x = positions[i];
+      const y = positions[i + 1];
+      const z = positions[i + 2];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
     }
+    const center = new THREE.Vector3(
+      (minX + maxX) / 2,
+      (minY + maxY) / 2,
+      (minZ + maxZ) / 2,
+    );
+    const radius = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2;
+    return {
+      zMin: minZ,
+      zMax: maxZ,
+      bounds: new THREE.Sphere(center, radius),
+    };
+  }
+
+  _colorByHeight(positions, zMin, zMax) {
+    const count = positions.length / 3;
+    const colors = new Uint8Array(count * 3);
+    if (count === 0) return colors;
     const range = zMax - zMin || 1;
-    const low = new THREE.Color(0x3b82f6);
-    const mid = new THREE.Color(0x22c55e);
-    const high = new THREE.Color(0xef4444);
-    const tmp = new THREE.Color();
+    const low = [59, 130, 246];
+    const mid = [34, 197, 94];
+    const high = [239, 68, 68];
     for (let i = 0; i < count; i++) {
-      const t = (positions[i * 3 + 2] - zMin) / range;
-      if (t < 0.5) tmp.lerpColors(low, mid, t * 2);
-      else tmp.lerpColors(mid, high, (t - 0.5) * 2);
-      colors[i * 3] = tmp.r;
-      colors[i * 3 + 1] = tmp.g;
-      colors[i * 3 + 2] = tmp.b;
+      const t = THREE.MathUtils.clamp((positions[i * 3 + 2] - zMin) / range, 0, 1);
+      const upperHalf = t >= 0.5;
+      const blend = upperHalf ? (t - 0.5) * 2 : t * 2;
+      const from = upperHalf ? mid : low;
+      const to = upperHalf ? high : mid;
+      colors[i * 3] = Math.round(from[0] + (to[0] - from[0]) * blend);
+      colors[i * 3 + 1] = Math.round(from[1] + (to[1] - from[1]) * blend);
+      colors[i * 3 + 2] = Math.round(from[2] + (to[2] - from[2]) * blend);
     }
     return colors;
   }
@@ -368,15 +386,22 @@ class PointCloud3DViewer {
       this._requestRender();
       return;
     }
+    const measurement = this._measurePointCloud(positions);
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geo.setAttribute('color', new THREE.BufferAttribute(this._colorByHeight(positions), 3));
-    geo.computeBoundingSphere();
-    this._pointCloudBounds = geo.boundingSphere?.clone() || null;
+    geo.setAttribute('color', new THREE.Uint8BufferAttribute(
+      this._colorByHeight(positions, measurement.zMin, measurement.zMax),
+      3,
+      true,
+    ));
+    geo.boundingSphere = measurement.bounds;
+    this._pointCloudBounds = measurement.bounds.clone();
     const mat = new THREE.PointsMaterial({ size: 0.05, vertexColors: true, sizeAttenuation: true });
     this._pointsMesh = new THREE.Points(geo, mat);
     this._scene.add(this._pointsMesh);
-    if (!this._hasFramedPointCloud && this._cameraMode === 'free') this._framePointCloud();
+    if (!this._hasFramedPointCloud && !this._hasUserCameraInput && this._cameraMode === 'free') {
+      this._framePointCloud();
+    }
     this._requestRender();
   }
 
@@ -439,17 +464,44 @@ class PointCloud3DViewer {
   _ensureRobotMesh() {
     if (this._robotMesh || !this._scene) return;
     const group = new THREE.Group();
-    const bodyGeometry = new THREE.BoxGeometry(0.56, 0.3, 0.2);
+    group.userData.kind = 'robot-dog';
+
+    const bodyGeometry = new THREE.BoxGeometry(0.64, 0.32, 0.22);
+    const headGeometry = new THREE.BoxGeometry(0.24, 0.26, 0.22);
+    const legGeometry = new THREE.BoxGeometry(0.1, 0.1, 0.3);
     const bodyMaterial = new THREE.MeshBasicMaterial({ color: COLORS.robot });
+    const accentMaterial = new THREE.MeshBasicMaterial({ color: COLORS.robotAccent });
     const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
-    body.position.z = 0.2;
+    body.name = 'robot-body';
+    body.userData.role = 'body';
+    body.position.z = 0.42;
     group.add(body);
+
+    const head = new THREE.Mesh(headGeometry, bodyMaterial);
+    head.name = 'robot-head';
+    head.userData.role = 'head';
+    head.position.set(0.43, 0, 0.46);
+    group.add(head);
+
+    for (const [name, x, y] of [
+      ['front-left', 0.22, 0.13],
+      ['front-right', 0.22, -0.13],
+      ['rear-left', -0.22, 0.13],
+      ['rear-right', -0.22, -0.13],
+    ]) {
+      const leg = new THREE.Mesh(legGeometry, accentMaterial);
+      leg.name = `robot-leg-${name}`;
+      leg.userData.role = `leg-${name}`;
+      leg.position.set(x, y, 0.16);
+      group.add(leg);
+    }
 
     const headingGeometry = new THREE.ConeGeometry(0.16, 0.34, 8);
     headingGeometry.rotateZ(-Math.PI / 2);
-    const headingMaterial = new THREE.MeshBasicMaterial({ color: COLORS.robotAccent });
-    const heading = new THREE.Mesh(headingGeometry, headingMaterial);
-    heading.position.set(0.42, 0, 0.2);
+    const heading = new THREE.Mesh(headingGeometry, accentMaterial);
+    heading.name = 'robot-heading';
+    heading.userData.role = 'heading';
+    heading.position.set(0.64, 0, 0.46);
     group.add(heading);
 
     const ringGeometry = new THREE.RingGeometry(0.25, 0.31, 24);
@@ -460,13 +512,17 @@ class PointCloud3DViewer {
       side: THREE.DoubleSide,
     });
     const ring = new THREE.Mesh(ringGeometry, ringMaterial);
-    ring.position.z = 0.025;
+    ring.name = 'robot-footprint';
+    ring.userData.role = 'footprint';
+    ring.position.z = 0.01;
     group.add(ring);
     group.userData.disposableResources = [
       bodyGeometry,
+      headGeometry,
+      legGeometry,
       bodyMaterial,
+      accentMaterial,
       headingGeometry,
-      headingMaterial,
       ringGeometry,
       ringMaterial,
     ];
@@ -783,6 +839,7 @@ class PointCloud3DViewer {
     this._navGoalMesh = null;
     this._rafId = null;
     this._hasFramedPointCloud = false;
+    this._hasUserCameraInput = false;
     this._initialized = false;
   }
 }

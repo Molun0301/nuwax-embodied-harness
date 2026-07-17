@@ -40,6 +40,7 @@ _LOW_VALUE_RELAY_PATHS = frozenset(
 _LOW_VALUE_RELAY_PREFIXES = ("/api/debug/", "/static/")
 _RELAY_REQUEST_LOG_RATE_LIMIT_SEC = 30.0
 _RELAY_SLOW_REQUEST_THRESHOLD_MS = 1000.0
+_STREAM_WEBSOCKET_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 
 
 def _resolve_client_host(request: Request) -> str:
@@ -319,7 +320,11 @@ async def _forward_websocket(app: FastAPI, websocket: WebSocket, path: str) -> N
     upstream_start_at = time.perf_counter()
 
     try:
-        async with websockets.connect(upstream_url, extra_headers=headers) as upstream:
+        async with websockets.connect(
+            upstream_url,
+            extra_headers=headers,
+            max_size=_STREAM_WEBSOCKET_MAX_MESSAGE_BYTES,
+        ) as upstream:
             _record_upstream_observation(websocket, 101, upstream_start_at)
             await websocket.accept()
 

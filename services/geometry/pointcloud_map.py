@@ -34,6 +34,7 @@ _LOD_LIMITS = {
     "medium": 180000,
     "full": None,
 }
+WEB_POINTCLOUD_MAX_POINTS = 1_000_000
 
 
 class PointCloudMapError(RuntimeError):
@@ -532,7 +533,10 @@ class CloudMapMmapReader:
         revision, point_count = struct.unpack(self.SLOT_METADATA_FMT, raw)
         return int(revision), int(point_count)
 
-    def read_stable(self, max_points: int = 60000) -> Optional[Tuple[int, int, bytes]]:
+    def read_stable(
+        self,
+        max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+    ) -> Optional[Tuple[int, int, bytes]]:
         """读取最新已发布的点云数据。返回 (revision, point_count, xyz_bytes) 或 None。
 
         v2 使用 global revision 推算 slot，并在读数据前后验证该 slot 的
@@ -562,21 +566,28 @@ class CloudMapMmapReader:
             max_buffer_points = self.SINGLE_BUFFER_SIZE // (3 * 4)
             if point_count > max_buffer_points:
                 return None
+            max_points = min(max(1, int(max_points)), max_buffer_points)
             buf_offset = self.HEADER_SIZE + read_buf * self.SINGLE_BUFFER_SIZE
             assert self._mm is not None
             if point_count == 0:
                 actual_count = 0
                 xyz_bytes = b""
             elif point_count > max_points:
-                stride = point_count // max_points
-                data = bytearray()
-                for i in range(0, point_count * 12, stride * 12):
-                    if len(data) >= max_points * 12:
-                        break
-                    off = buf_offset + i
-                    data.extend(self._mm[off:off + 12])
-                actual_count = len(data) // 12
-                xyz_bytes = bytes(data)
+                points = np.frombuffer(
+                    self._mm,
+                    dtype="<f4",
+                    count=point_count * 3,
+                    offset=buf_offset,
+                ).reshape(point_count, 3)
+                sample_indices = np.linspace(
+                    0,
+                    point_count - 1,
+                    num=max_points,
+                    dtype=np.intp,
+                )
+                sampled = np.ascontiguousarray(points[sample_indices], dtype="<f4")
+                actual_count = max_points
+                xyz_bytes = sampled.tobytes(order="C")
             else:
                 data_size = point_count * 12
                 xyz_bytes = bytes(self._mm[buf_offset:buf_offset + data_size])
@@ -600,7 +611,10 @@ class CloudMapMmapReader:
         # 连续 3 次都被写者抢占，放弃本轮（上层轮询下次重试）。
         return None
 
-    def build_binary_frame(self, max_points: int = 60000) -> Optional[bytes]:
+    def build_binary_frame(
+        self,
+        max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+    ) -> Optional[bytes]:
         """构建 Wire Format binary 帧: revision(u32) + point_count(u32) + XYZ data。"""
         result = self.read_stable(max_points)
         if result is None:

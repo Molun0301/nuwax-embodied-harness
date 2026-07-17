@@ -74,6 +74,7 @@ from services.geometry import (
     PointCloudMapError,
     UnsupportedPointCloudMapError,
 )
+from services.geometry.pointcloud_map import WEB_POINTCLOUD_MAX_POINTS
 from services.localization import LocalizationService
 from services.mapping import MappingService
 from skills.map_workspace import MapWorkspaceService
@@ -1217,6 +1218,7 @@ class GatewayRuntime:
 
 
     _CLOUD_MAP_MMAP_POLL_INTERVAL_SEC = 0.1
+    _CLOUD_MAP_MMAP_PUBLISH_INTERVAL_SEC = 1.0
 
     def _start_cloud_map_mmap_poll(self) -> None:
         if self._cloud_map_mmap_poll_thread is not None:
@@ -1247,6 +1249,7 @@ class GatewayRuntime:
 
     def _run_cloud_map_mmap_poll(self) -> None:
         ticks_since_publish = 0
+        last_publish_at: Optional[float] = None
         while not self._cloud_map_mmap_poll_stop.wait(self._CLOUD_MAP_MMAP_POLL_INTERVAL_SEC):
             try:
                 header = self._cloud_map_mmap_reader.read_header()
@@ -1258,13 +1261,21 @@ class GatewayRuntime:
                 ticks_since_publish += 1
                 changed = revision != self._cloud_map_last_revision
                 heartbeat_due = ticks_since_publish >= self._CLOUD_MAP_HEARTBEAT_TICKS
-                if not changed and not heartbeat_due:
+                now = time.monotonic()
+                change_publish_due = changed and (
+                    last_publish_at is None
+                    or now - last_publish_at >= self._CLOUD_MAP_MMAP_PUBLISH_INTERVAL_SEC
+                )
+                if not change_publish_due and not heartbeat_due:
                     continue
-                frame_bytes = self._cloud_map_mmap_reader.build_binary_frame()
+                frame_bytes = self._cloud_map_mmap_reader.build_binary_frame(
+                    max_points=WEB_POINTCLOUD_MAX_POINTS,
+                )
                 if frame_bytes is None:
                     continue
                 self._cloud_map_last_revision = revision
                 ticks_since_publish = 0
+                last_publish_at = now
                 from contracts.streams import StreamPayloadKind
                 self.stream_bus.publish(
                     "pointcloud_map.live_chunk",

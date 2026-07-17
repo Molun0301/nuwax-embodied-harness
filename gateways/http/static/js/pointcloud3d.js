@@ -39,6 +39,7 @@ class PointCloud3DViewer {
     this._interactionActive = false;
     this._hasUserCameraInput = false;
     this._cameraMode = 'free';
+    this._cameraReferenceDistance = null;
     this._lastFollowTarget = null;
     this._pointCloudBounds = null;
     this._hasFramedPointCloud = false;
@@ -58,6 +59,8 @@ class PointCloud3DViewer {
     this._rafId = null;
     this._lastFrameTime = 0;
     this._allPositions = new Float32Array(0);
+    this._hasPointCloudSnapshot = false;
+    this._displayedPointCount = 0;
     this._initialized = false;
   }
 
@@ -127,6 +130,7 @@ class PointCloud3DViewer {
     this._controls.minPolarAngle = 0.04;
     this._controls.maxPolarAngle = Math.PI / 2 - 0.02;
     if ('zoomToCursor' in this._controls) this._controls.zoomToCursor = this._cameraMode === 'free';
+    this._cameraReferenceDistance = this._camera.position.distanceTo(this._controls.target);
     this._controls.addEventListener('change', () => {
       this._requestRender();
       this._emitCameraState();
@@ -185,15 +189,32 @@ class PointCloud3DViewer {
     }
   }
 
-  _emitCameraState() {
+  _cameraDistance() {
     const target = this._controls?.target;
-    const distance = this._camera && target
+    return this._camera && target
       ? this._camera.position.distanceTo(target)
       : null;
+  }
+
+  _setCameraReferenceDistance(distance = this._cameraDistance()) {
+    if (Number.isFinite(distance) && distance > 0) this._cameraReferenceDistance = distance;
+  }
+
+  _zoomPercent(distance = this._cameraDistance()) {
+    if (!Number.isFinite(distance) || distance <= 0) return null;
+    if (!Number.isFinite(this._cameraReferenceDistance) || this._cameraReferenceDistance <= 0) {
+      this._setCameraReferenceDistance(distance);
+    }
+    return this._cameraReferenceDistance / distance * 100;
+  }
+
+  _emitCameraState() {
+    const distance = this._cameraDistance();
     window.dispatchEvent(new CustomEvent('pointcloud3d:camera-state', {
       detail: {
         mode: this._cameraMode,
         distance,
+        zoomPercent: this._zoomPercent(distance),
         robotAvailable: Boolean(this._robotPose),
         initialized: this._initialized,
       },
@@ -285,6 +306,7 @@ class PointCloud3DViewer {
       .add(new THREE.Vector3(0, 0, 4.2));
     this._lastFollowTarget = target.clone();
     this._controls.update();
+    this._setCameraReferenceDistance();
     this._requestRender();
     return true;
   }
@@ -303,6 +325,7 @@ class PointCloud3DViewer {
     this._controls.target.copy(center);
     this._camera.position.copy(center).add(DEFAULT_CAMERA_DIRECTION.clone().multiplyScalar(distance));
     this._controls.update();
+    this._setCameraReferenceDistance(distance);
     this._hasFramedPointCloud = true;
     this._requestRender();
     return true;
@@ -316,6 +339,7 @@ class PointCloud3DViewer {
       this._controls.target.set(0, 0, 0);
       this._camera.position.set(0, -10, 8);
       this._controls.update();
+      this._setCameraReferenceDistance();
       this._requestRender();
     }
     this._emitCameraState();
@@ -378,11 +402,23 @@ class PointCloud3DViewer {
     this._pointsMesh = null;
   }
 
+  _emitPointCount() {
+    window.dispatchEvent(new CustomEvent('pointcloud3d:point-count', {
+      detail: {
+        points: this._displayedPointCount,
+        sourcePoints: Math.floor(this._allPositions.length / 3),
+        lod: this._lod,
+      },
+    }));
+  }
+
   _renderPointCloudPositions(positions) {
     if (!this._scene) return;
     this._disposePointsMesh();
     if (!positions.length) {
+      this._displayedPointCount = 0;
       this._pointCloudBounds = null;
+      this._emitPointCount();
       this._requestRender();
       return;
     }
@@ -399,6 +435,8 @@ class PointCloud3DViewer {
     const mat = new THREE.PointsMaterial({ size: 0.05, vertexColors: true, sizeAttenuation: true });
     this._pointsMesh = new THREE.Points(geo, mat);
     this._scene.add(this._pointsMesh);
+    this._displayedPointCount = Math.floor(positions.length / 3);
+    this._emitPointCount();
     if (!this._hasFramedPointCloud && !this._hasUserCameraInput && this._cameraMode === 'free') {
       this._framePointCloud();
     }
@@ -431,6 +469,7 @@ class PointCloud3DViewer {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = await resp.arrayBuffer();
       this._allPositions = new Float32Array(buf);
+      this._hasPointCloudSnapshot = true;
       this._rebuildPointCloud();
       window.dispatchEvent(new CustomEvent('pointcloud3d:status', {
         detail: { state: 'loaded', points: this._allPositions.length / 3, lod }
@@ -445,11 +484,13 @@ class PointCloud3DViewer {
     merged.set(this._allPositions);
     merged.set(float32Array, this._allPositions.length);
     this._allPositions = merged;
+    this._hasPointCloudSnapshot = true;
     this._rebuildPointCloud();
   }
 
   _replaceCloudMapBuffer(xyzArray, revision) {
     this._lastCloudMapRevision = revision;
+    this._hasPointCloudSnapshot = true;
 
     // 32MB 上限检查
     if (xyzArray.byteLength > MAX_BUFFER_BYTES) {
@@ -738,8 +779,8 @@ class PointCloud3DViewer {
   }
 
   updateNavigationPath(path, goalPose) {
-    this._navigationPath = Array.isArray(path) ? path.slice() : [];
-    this._navigationGoal = goalPose || null;
+    if (Array.isArray(path)) this._navigationPath = path.slice();
+    if (goalPose !== undefined) this._navigationGoal = goalPose || null;
     if (!this._scene) return;
     if (this._navPathLine) {
       this._scene.remove(this._navPathLine);
@@ -779,7 +820,7 @@ class PointCloud3DViewer {
   }
 
   _applyCachedSceneState() {
-    if (this._allPositions.length) this._rebuildPointCloud();
+    if (this._hasPointCloudSnapshot) this._rebuildPointCloud();
     if (this._robotPose) {
       const { x, y, z, yaw } = this._robotPose;
       this.setRobotPose(x, y, z, yaw);
@@ -857,6 +898,20 @@ function pointFromValue(value) {
   };
 }
 
+function firstDefinedValue(...values) {
+  for (const value of values) {
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+function firstAvailableValue(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null) return value;
+  }
+  return values.some(value => value === null) ? null : undefined;
+}
+
 function yawFromValue(value) {
   const pose = value?.target_pose ?? value?.pose ?? value;
   if (pose?.yaw !== undefined) return Number(pose.yaw || 0);
@@ -873,6 +928,23 @@ window.addEventListener('stream:exploration.frontier', (e) => {
     : data?.latest_frontiers ?? data?.frontiers ?? [];
   const frontiers = rawFrontiers.map(pointFromValue).filter(Boolean);
   window.pointcloud3d.updateFrontiers(frontiers);
+  const rawPath = firstDefinedValue(data?.planned_path, data?.nav_path, data?.path);
+  const path = rawPath === null ? []
+    : Array.isArray(rawPath) ? rawPath.map(pointFromValue).filter(Boolean)
+      : undefined;
+  const rawGoal = firstAvailableValue(
+    data?.current_goal,
+    data?.selected_frontier,
+    data?.current_frontier,
+    data?.metadata?.current_frontier,
+  );
+  const goalPoint = pointFromValue(rawGoal);
+  const goal = rawGoal === undefined ? undefined
+    : goalPoint ? { ...goalPoint, yaw: yawFromValue(rawGoal) }
+      : null;
+  if (path !== undefined || goal !== undefined) {
+    window.pointcloud3d.updateNavigationPath(path, goal);
+  }
 });
 
 window.addEventListener('stream:localization.pose', (e) => {
@@ -897,15 +969,24 @@ window.addEventListener('stream:localization.trajectory', (e) => {
   if (traj) window.pointcloud3d.updateTrajectory(traj);
 });
 
-window.addEventListener('stream:navigation.state', (e) => {
+function updateNavigationOverlayFromEvent(e) {
   const d = e.detail;
-  const rawPath = d?.planned_path ?? d?.nav_path ?? d?.path ?? null;
-  const path = Array.isArray(rawPath) ? rawPath.map(pointFromValue).filter(Boolean) : null;
-  const rawGoal = d?.current_goal ?? d?.goal_pose ?? d?.goal ?? null;
+  const rawPath = firstDefinedValue(d?.planned_path, d?.nav_path, d?.path);
+  const path = rawPath === null ? []
+    : Array.isArray(rawPath) ? rawPath.map(pointFromValue).filter(Boolean)
+      : undefined;
+  const rawGoal = firstAvailableValue(d?.current_goal, d?.goal_pose, d?.goal);
   const goalPoint = pointFromValue(rawGoal);
-  const goal = goalPoint ? { ...goalPoint, yaw: yawFromValue(rawGoal) } : null;
-  window.pointcloud3d.updateNavigationPath(path, goal);
-});
+  const goal = rawGoal === undefined ? undefined
+    : goalPoint ? { ...goalPoint, yaw: yawFromValue(rawGoal) }
+      : null;
+  if (path !== undefined || goal !== undefined) {
+    window.pointcloud3d.updateNavigationPath(path, goal);
+  }
+}
+
+window.addEventListener('stream:navigation.state', updateNavigationOverlayFromEvent);
+window.addEventListener('stream:exploration.state', updateNavigationOverlayFromEvent);
 
 window.addEventListener('pointcloud3d:semantic-instances', (e) => {
   const detail = e.detail;

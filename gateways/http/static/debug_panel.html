@@ -368,10 +368,14 @@ button{font-family:inherit;cursor:pointer}
 .map-layer-toggle input{margin:0;accent-color:var(--robot)}
 .map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .map-goal-chip{position:absolute;left:14px;top:94px;z-index:5}
-.legend{position:absolute;left:14px;bottom:14px;z-index:5;max-width:62%}
+.legend{position:absolute;left:14px;bottom:14px;z-index:5;max-width:52%}
 #mapZoomValue{min-width:48px;justify-content:center;font-family:var(--mono);font-size:11px}
-#map3dZoomValue{min-width:58px;justify-content:center;font-family:var(--mono);font-size:11px}
+#map3dZoomValue{min-width:52px;justify-content:center;font-family:var(--mono);font-size:11px}
 #mapEmpty{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;max-width:70%}
+.map-pose-hud{position:absolute;right:14px;bottom:14px;z-index:5;min-width:174px;padding:8px 10px;pointer-events:none}
+.map-pose-title{margin-bottom:4px;color:var(--muted);font-size:9.5px;font-weight:700;text-transform:uppercase}
+.map-pose-meta{grid-template-columns:auto minmax(72px,auto);gap:2px 10px;font-size:10.5px;line-height:1.35}
+#mapStatus{position:absolute;right:14px;bottom:115px;z-index:5}
 .map-info-grid{display:none}
 .workspace.swapped .map-toolbar{left:10px;right:10px;top:10px;max-width:none}
 .workspace.swapped .map-tool-row{gap:5px}
@@ -394,9 +398,11 @@ button{font-family:inherit;cursor:pointer}
   .map-toolbar{left:10px;right:10px;top:10px;max-width:none}
   .map-tool-row{gap:5px}
   .map-tool-group{max-width:100%;flex-wrap:wrap}
-  .map-stream-chip{top:auto;right:10px;bottom:50px;max-width:58%}
-  .map-goal-chip{left:10px;top:auto;bottom:88px;max-width:calc(100% - 20px)}
-  .legend{left:10px;bottom:10px;max-width:68%}
+  .map-stream-chip{top:auto;right:10px;bottom:154px;max-width:58%}
+  .map-goal-chip{left:10px;top:auto;bottom:188px;max-width:calc(100% - 20px)}
+  .legend{left:10px;bottom:10px;max-width:48%}
+  .map-pose-hud{right:10px;bottom:10px;min-width:154px;padding:7px 9px}
+  #mapStatus{right:10px;bottom:109px}
 }
 
 /* media-swap buttons */
@@ -478,7 +484,7 @@ button{font-family:inherit;cursor:pointer}
                     <button id="map3dFollowView" class="tool" type="button" aria-pressed="false" title="相机轨道中心跟随机器狗">跟随机器狗</button>
                     <span class="map-tool-separator" aria-hidden="true"></span>
                     <button id="map3dZoomOut" class="tool" type="button" title="缩小 3D 地图">–</button>
-                    <span id="map3dZoomValue" class="tool" aria-live="polite">-- m</span>
+                    <span id="map3dZoomValue" class="tool" aria-live="polite">100%</span>
                     <button id="map3dZoomIn" class="tool" type="button" title="放大 3D 地图">+</button>
                     <button id="map3dResetView" class="tool" type="button" title="复位当前 3D 视角">复位视角</button>
                     <button id="map3dCenterRobot" class="tool" type="button" title="将 3D 视角定位到机器狗" disabled>定位机器狗</button>
@@ -516,7 +522,11 @@ button{font-family:inherit;cursor:pointer}
                 <span id="mapRvizHint" class="lg" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
                 <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
               </div>
-              <div id="mapStatus" class="pill missing" style="position:absolute;right:14px;bottom:14px;z-index:5">缺失</div>
+              <div id="mapPoseHud" class="map-pose-hud glass" aria-live="polite">
+                <div class="map-pose-title">机器狗位姿</div>
+                <div id="mapPoseMeta" class="kv map-pose-meta"></div>
+              </div>
+              <div id="mapStatus" class="pill missing map-status-chip">缺失</div>
               <div id="mapEmpty" class="empty">等待地图数据。</div>
             </div>
           </section>
@@ -541,22 +551,10 @@ button{font-family:inherit;cursor:pointer}
           </section>
           <section class="card panel rise merged-rail" style="animation-delay:.1s;overflow:auto">
             <div class="ph">
-              <div class="t"><div class="eyebrow">导航 / 位姿 / 地图</div><h2>导航 · 位姿 · 地图</h2></div>
-              <span id="missionStatus" class="pill missing">任务：预热</span>
+              <div class="t"><div class="eyebrow">Map</div><h2>地图摘要</h2></div>
+              <span id="mapSummaryMode" class="mchip">2D 栅格</span>
             </div>
-            <div class="rail-sub">
-              <div class="card-head" style="margin-bottom:8px"><h3>导航态势</h3><span id="navigationStatus" class="pill missing">缺失</span></div>
-              <div id="navigationMeta" class="kv"></div>
-              <div id="frontierNotice" class="notice panel-meta">等待探索前沿候选几何。</div>
-            </div>
-            <div class="rail-sub">
-              <div class="card-head" style="margin-bottom:8px"><h3>位姿定位</h3><span id="localizationStatus" class="pill missing">缺失</span></div>
-              <div id="localizationMeta" class="kv"></div>
-            </div>
-            <div class="rail-sub">
-              <div class="card-head" style="margin-bottom:8px"><h3>地图摘要</h3></div>
-              <div id="mapMeta" class="kv"></div>
-            </div>
+            <div id="mapMeta" class="kv"></div>
           </section>
           <section class="dock card rise" style="animation-delay:.2s">
             <div class="dcol">
@@ -678,11 +676,15 @@ button{font-family:inherit;cursor:pointer}
         mapViewMode: "2d",
         pointcloud3dCameraMode: "free",
         pointcloud3dDistance: null,
+        pointcloud3dZoomPercent: 100,
+        pointcloud3dVisiblePoints: 0,
+        pointcloud3dPointCountKnown: false,
         pointcloud3dReady: false,
         mapRvizView: { center: null, zoom: 1 },
         mapPanDrag: null,
         mapStream: null,
         pose: null,
+        latestPose: null,
         trajectory: [],
         frontiers: [],
         goalPose: null,
@@ -802,7 +804,9 @@ button{font-family:inherit;cursor:pointer}
         mapStreamStatus: document.getElementById("mapStreamStatus"),
         mapStatus: document.getElementById("mapStatus"),
         mapEmpty: document.getElementById("mapEmpty"),
+        mapPoseMeta: document.getElementById("mapPoseMeta"),
         mapMeta: document.getElementById("mapMeta"),
+        mapSummaryMode: document.getElementById("mapSummaryMode"),
         localizationStatus: document.getElementById("localizationStatus"),
         localizationMeta: document.getElementById("localizationMeta"),
         navigationStatus: document.getElementById("navigationStatus"),
@@ -1565,6 +1569,7 @@ button{font-family:inherit;cursor:pointer}
         } else {
           renderServiceStatus();
         }
+        renderMapSummary();
       }
       function normalizeTaskState(value) {
         const raw = value && typeof value === "object" && "value" in value ? value.value : value;
@@ -1781,10 +1786,14 @@ button{font-family:inherit;cursor:pointer}
       function planarYawFromPose(pose) {
         const q = pose && pose.orientation;
         if (!q) return yawFromPose(pose);
-        const x = Number(q.x) || 0;
-        const y = Number(q.y) || 0;
-        const z = Number(q.z) || 0;
-        const w = Number(q.w) || 1;
+        const rawX = Number(q.x);
+        const rawY = Number(q.y);
+        const rawZ = Number(q.z);
+        const rawW = Number(q.w);
+        const x = Number.isFinite(rawX) ? rawX : 0;
+        const y = Number.isFinite(rawY) ? rawY : 0;
+        const z = Number.isFinite(rawZ) ? rawZ : 0;
+        const w = Number.isFinite(rawW) ? rawW : 1;
         const forwardX = 1 - 2 * (y * y + z * z);
         const forwardY = 2 * (x * y + w * z);
         if (Math.hypot(forwardX, forwardY) < 1e-6) return yawFromPose(pose);
@@ -2094,16 +2103,93 @@ button{font-family:inherit;cursor:pointer}
           y: (event.clientY - rect.top) * scaleY,
         };
       }
+      function firstNonBlank(...values) {
+        for (const value of values) {
+          const text = String(value === null || value === undefined ? "" : value).trim();
+          if (text) return text;
+        }
+        return null;
+      }
+      function pointcloudMapSummary() {
+        const frame = state.latestStreamFrames["pointcloud_map.meta"] || {};
+        const payload = frame.payload && typeof frame.payload === "object" ? frame.payload : {};
+        const metadata = frame.metadata && typeof frame.metadata === "object" ? frame.metadata : {};
+        return { frame, payload, metadata };
+      }
       function activeMapName() {
         const diagnostics = state.mapStream && state.mapStream.diagnostics ? state.mapStream.diagnostics : {};
         const governance = state.latestGovernance || {};
-        const overview = state.latestOverview || {};
-        const overviewGovernance = overview.runtime_governance || {};
-        return diagnostics.active_map_name
-          || diagnostics.map_name
-          || governance.active_map_name
-          || overviewGovernance.active_map_name
-          || null;
+        const localizationSession = governance.localization_session || {};
+        const governanceMetadata = governance.metadata || {};
+        const liveDiagnostics = governanceMetadata.live_mapping_diagnostics || {};
+        const workspace = governance.active_workspace || {};
+        const healthWorkspace = state.latestHealth?.active_map_workspace || {};
+        const pointcloud = pointcloudMapSummary().payload;
+        const exploration = state.latestStreamFrames["exploration.state"]?.payload || {};
+        const explorationRequest = exploration.current_request || exploration.exploration_request || {};
+        const navigation = state.latestStreamFrames["navigation.state"]?.payload || {};
+        const navigationGoal = navigation.current_goal || {};
+        return firstNonBlank(
+          diagnostics.active_map_name,
+          diagnostics.map_name,
+          healthWorkspace.map_name,
+          pointcloud.map_name,
+          localizationSession.map_name,
+          liveDiagnostics.active_map_name,
+          liveDiagnostics.map_name,
+          workspace.active_map_name,
+          governance.active_map_name,
+          governance.map_name,
+          explorationRequest.map_name,
+          navigationGoal.map_name,
+        );
+      }
+      function formatPoseMetric(value) {
+        const number = Number(value);
+        return Number.isFinite(number) ? `${number.toFixed(2)} m` : "--";
+      }
+      function updateMapPoseHud() {
+        const point = pointFromPose(state.latestPose);
+        const yaw = planarYawFromPose(state.latestPose);
+        setKv(els.mapPoseMeta, [
+          ["X", point ? formatPoseMetric(point.x) : "--"],
+          ["Y", point ? formatPoseMetric(point.y) : "--"],
+          ["Z", point ? formatPoseMetric(point.z) : "--"],
+          ["偏航角", Number.isFinite(yaw) ? `${(yaw * 180 / Math.PI).toFixed(1)}°` : "--"],
+        ]);
+      }
+      function renderMapSummary(options) {
+        const detail = options || {};
+        const is3d = state.mapViewMode === "3d";
+        const grid = detail.grid !== undefined ? detail.grid : state.mapGrid;
+        const diagnostics = detail.diagnostics || (state.mapStream && state.mapStream.diagnostics) || {};
+        const envelope = detail.envelope || state.lastMapEnvelope || {};
+        const rows = [["地图名称", activeMapName() || "--"]];
+        if (is3d) {
+          const pointcloud = pointcloudMapSummary();
+          const pointCount = state.pointcloud3dPointCountKnown
+            ? Math.max(0, Math.floor(Number(state.pointcloud3dVisiblePoints) || 0))
+            : null;
+          rows.push(
+            ["点云总数", pointCount === null ? "--" : pointCount.toLocaleString("zh-CN")],
+            ["坐标系", pointcloud.payload.frame_id || pointcloud.frame.frame_id || pointcloud.metadata.frame_id || "--"],
+            ["显示状态", pointCount === null ? "等待点云" : pointCount > 0 ? "已显示" : "暂无点云"],
+          );
+        } else {
+          const width = Number(grid && grid.width);
+          const height = Number(grid && grid.height);
+          const hasGrid = Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0;
+          rows.push(
+            ["总栅格数", hasGrid ? (width * height).toLocaleString("zh-CN") : "--"],
+            ["坐标系", (grid && grid.frame_id) || envelope.frame_id || diagnostics.frame_id || "--"],
+            ["尺寸", hasGrid ? `${width} x ${height}` : "--"],
+            ["分辨率", hasGrid ? formatPoseMetric(gridResolution(grid)) : "--"],
+          );
+          if (detail.displayStatus) rows.push(["显示状态", detail.displayStatus]);
+          if (detail.message) rows.push(["原因", detail.message]);
+        }
+        if (els.mapSummaryMode) els.mapSummaryMode.textContent = is3d ? "3D 点云" : "2D 栅格";
+        setKv(els.mapMeta, rows);
       }
       function navigationFrameId() {
         const poseFrame = state.pose && state.pose.frame_id;
@@ -2650,6 +2736,7 @@ button{font-family:inherit;cursor:pointer}
       function clearLocalizationDisplay(message, status) {
         state.pose = null;
         state.trajectory = [];
+        updateMapPoseHud();
         setPill(els.localizationStatus, status || "missing");
         setKv(els.localizationMeta, [
           ["显示状态", "已隐藏"],
@@ -2706,18 +2793,13 @@ button{font-family:inherit;cursor:pointer}
         els.mapEmpty.textContent = message || MAP_DISPLAY_IDLE_MESSAGE;
         requestMapDraw(true);
         const displayDiagnostics = { ...(diagnostics || {}), display_suppressed_reason: message || MAP_DISPLAY_IDLE_MESSAGE };
-        setKv(els.mapMeta, [
-          ["地图名称", displayDiagnostics.active_map_name || displayDiagnostics.map_name || (envelope && envelope.frame_id) || (grid && grid.frame_id) || "--"],
-          ["总栅格数", grid ? `${grid.width * grid.height}` : "--"],
-          ["显示状态", "已隐藏"],
-          ["原因", message || MAP_DISPLAY_IDLE_MESSAGE],
-          ["数据时间", shortTime(envelope && envelope.source_timestamp)],
-          ["版本号", (envelope && envelope.revision) || displayDiagnostics.content_revision],
-          ["序号", (envelope && envelope.sequence) || displayDiagnostics.message_count],
-          ["推流状态", mapStreamLabel(status || "missing", displayDiagnostics, streamBridge || {})],
-          ["延迟", fmt(envelope && envelope.latency_ms, " ms")],
-          ["前端接收", shortTime(envelope && envelope.__receivedAt)],
-        ]);
+        renderMapSummary({
+          grid,
+          diagnostics: displayDiagnostics,
+          envelope,
+          displayStatus: "已隐藏",
+          message: message || MAP_DISPLAY_IDLE_MESSAGE,
+        });
         updateMapStreamChip(status || "missing", displayDiagnostics, streamBridge || {}, envelope && envelope.source_timestamp);
         reevaluateCachedLocalizationDisplay();
       }
@@ -2794,8 +2876,15 @@ button{font-family:inherit;cursor:pointer}
         const geometry = frontier && frontier.geometry ? frontier.geometry : frontier;
         if (!geometry) return null;
         if (Array.isArray(geometry.coordinates) && geometry.coordinates.length >= 2) return { x: Number(geometry.coordinates[0]), y: Number(geometry.coordinates[1]), z: Number(geometry.coordinates[2] || 0) };
-        if (geometry.position) return pointFromPose(geometry);
-        if (geometry.pose) return pointFromPose(geometry.pose);
+        if (geometry.position) {
+          const point = pointFromPose(geometry);
+          if (point) return point;
+        }
+        if (geometry.pose) {
+          const point = pointFromPose(geometry.pose);
+          if (point) return point;
+          return pointFromFrontier(geometry.pose);
+        }
         if (geometry.centroid) return pointFromFrontier(geometry.centroid);
         if (geometry.x !== undefined && geometry.y !== undefined) return { x: Number(geometry.x), y: Number(geometry.y), z: Number(geometry.z || 0) };
         return null;
@@ -3018,7 +3107,7 @@ button{font-family:inherit;cursor:pointer}
           });
       }
       function syncPointcloud3dState() {
-        window.dispatchEvent(new CustomEvent("stream:localization.pose", { detail: state.pose || null }));
+        window.dispatchEvent(new CustomEvent("stream:localization.pose", { detail: state.latestPose || null }));
         window.dispatchEvent(new CustomEvent("stream:localization.trajectory", {
           detail: { trajectory: state.trajectory || [] },
         }));
@@ -3497,16 +3586,7 @@ button{font-family:inherit;cursor:pointer}
           els.mapEmpty.textContent = "";
           requestMapDraw(false);
         }
-        setKv(els.mapMeta, [
-          ["地图名称", diagnostics.active_map_name || diagnostics.map_name || envelope.frame_id || (grid && grid.frame_id) || "--"],
-          ["总栅格数", grid ? `${grid.width * grid.height}` : "--"],
-          ["数据时间", shortTime(envelope.source_timestamp)],
-          ["版本号", envelope.revision || diagnostics.content_revision],
-          ["序号", envelope.sequence || diagnostics.message_count],
-          ["推流状态", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
-          ["延迟", fmt(envelope.latency_ms, " ms")],
-          ["前端接收", shortTime(envelope.__receivedAt)],
-        ]);
+        renderMapSummary({ grid, diagnostics, envelope });
         updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
       }
       function isMapClearedEnvelope(envelope, diagnostics, status) {
@@ -3566,18 +3646,12 @@ button{font-family:inherit;cursor:pointer}
           els.mapEmpty.hidden = false;
           els.mapEmpty.textContent = "地图源在线，等待内容更新帧。";
         }
-        setKv(els.mapMeta, [
-          ["坐标系", envelope.frame_id || diagnostics.frame_id || (grid && grid.frame_id)],
-          ["尺寸", grid ? `${grid.width} x ${grid.height}` : "--"],
-          ["分辨率", grid ? `${grid.resolution_m} m` : "--"],
-          ["数据时间", shortTime(envelope.source_timestamp)],
-          ["版本号", envelope.revision || diagnostics.content_revision],
-          ["序号", envelope.sequence || diagnostics.update_sequence || diagnostics.message_count],
-          ["推流状态", cleared ? "已清空" : mapStreamLabel(status, diagnostics, streamBridge)],
-          ["延迟", fmt(envelope.latency_ms, " ms")],
-          ["已过期", displayBool(envelope.stale === true)],
-          ["前端接收", shortTime(envelope.__receivedAt)],
-        ]);
+        renderMapSummary({
+          grid,
+          diagnostics,
+          envelope,
+          displayStatus: cleared ? "已清空" : undefined,
+        });
         updateMapStreamChip(status, diagnostics, streamBridge, envelope.source_timestamp);
       }
       function reevaluateCachedMapDisplay() {
@@ -3606,14 +3680,18 @@ button{font-family:inherit;cursor:pointer}
       function applyLocalizationDisplay(envelope, options) {
         const reevaluateMap = !options || options.reevaluateMap !== false;
         state.lastLocalizationEnvelope = envelope;
+        const data = envelope.data || {};
+        const incomingPose = data.pose || (pointFromPose(data) ? data : null);
+        if (pointFromPose(incomingPose)) state.latestPose = incomingPose;
+        else if (envelope.type === "localization.pose") state.latestPose = null;
+        updateMapPoseHud();
         if (!shouldDisplaySpatialPose()) {
           clearLocalizationDisplay(LOCALIZATION_DISPLAY_IDLE_MESSAGE, "missing");
           requestMapDraw(false);
           return;
         }
         const status = statusOf(envelope);
-        const data = envelope.data || {};
-        state.pose = data.pose || null;
+        state.pose = incomingPose;
         state.trajectory = Array.isArray(data.trajectory) ? data.trajectory : [];
         setPill(els.localizationStatus, status);
         const p = pointFromPose(state.pose);
@@ -3643,11 +3721,33 @@ button{font-family:inherit;cursor:pointer}
       function pathPointFromValue(value) {
         if (!value) return null;
         if (Array.isArray(value) && value.length >= 2) return { x: Number(value[0]), y: Number(value[1]), z: Number(value[2] || 0) };
-        if (value.pose) return pointFromPose(value.pose);
-        if (value.position) return pointFromPose(value);
-        if (value.target_pose) return pointFromPose(value.target_pose);
+        if (value.pose) {
+          const point = pointFromPose(value.pose);
+          if (point) return point;
+        }
+        if (value.position) {
+          const point = pointFromPose(value);
+          if (point) return point;
+        }
+        if (value.target_pose) {
+          const point = pointFromPose(value.target_pose);
+          if (point) return point;
+        }
         if (value.x !== undefined && value.y !== undefined) return { x: Number(value.x), y: Number(value.y), z: Number(value.z || 0) };
-        return null;
+        return pointFromFrontier(value);
+      }
+      function goalPoseFromValue(value) {
+        if (!value) return null;
+        const pose = value.target_pose || value.goal_pose || value.pose || value;
+        const point = pointFromPose(pose) || pathPointFromValue(value);
+        if (!point) return null;
+        if (pose.orientation) return pose;
+        const yaw = firstFiniteNumber(pose.yaw, pose.yaw_rad, value.yaw, value.yaw_rad);
+        if (yaw === null) return { position: point };
+        return {
+          position: point,
+          orientation: { x: 0, y: 0, z: Math.sin(yaw / 2), w: Math.cos(yaw / 2) },
+        };
       }
       function explorationStateMetadata(context) {
         if (!context) return {};
@@ -3682,13 +3782,27 @@ button{font-family:inherit;cursor:pointer}
         return raw.map(pathPointFromValue).filter(Boolean);
       }
       function extractNavigationGoal(context, explorationContext) {
-        const goal = context && context.current_goal ? context.current_goal : null;
-        if (goal && goal.target_pose) return goal.target_pose;
+        const metadata = context && context.metadata ? context.metadata : {};
+        const navigationState = context && context.navigation_state ? context.navigation_state : {};
+        const navigationMetadata = navigationState && navigationState.metadata ? navigationState.metadata : {};
         const explorationMetadata = explorationStateMetadata(explorationContext);
-        const explorationGoal = explorationContext && explorationContext.current_goal;
-        if (explorationGoal && explorationGoal.target_pose) return explorationGoal.target_pose;
-        const frontier = explorationMetadata.current_frontier;
-        if (frontier && frontier.pose) return frontier.pose;
+        for (const candidate of [
+          context && context.current_goal,
+          context && context.goal_pose,
+          navigationState.current_goal,
+          metadata.current_goal,
+          navigationMetadata.current_goal,
+          explorationContext && explorationContext.current_goal,
+          explorationContext && explorationContext.goal_pose,
+          explorationContext && explorationContext.selected_frontier,
+          explorationContext && explorationContext.current_frontier,
+          explorationMetadata.current_goal,
+          explorationMetadata.selected_frontier,
+          explorationMetadata.current_frontier,
+        ]) {
+          const pose = goalPoseFromValue(candidate);
+          if (pose) return pose;
+        }
         return null;
       }
       function normalizeExplorerStatusText(statusText) {
@@ -3728,6 +3842,7 @@ button{font-family:inherit;cursor:pointer}
           renderServiceStatus();
         }
         reevaluateCachedMapDisplay();
+        renderMapSummary();
       }
       function mergeLatestFrontierStream(data) {
         const fr = state.latestFrontierStream;
@@ -3752,6 +3867,8 @@ button{font-family:inherit;cursor:pointer}
           merged.planned_path = fr.planned_path;
         }
         if (!merged.current_goal && fr.current_goal) merged.current_goal = fr.current_goal;
+        if (!merged.current_frontier && fr.current_frontier) merged.current_frontier = fr.current_frontier;
+        if (!merged.selected_frontier && fr.selected_frontier) merged.selected_frontier = fr.selected_frontier;
         if (merged.exploration_terminal === undefined || merged.exploration_terminal === null) {
           merged.exploration_terminal = fr.exploration_terminal;
         }
@@ -3760,10 +3877,20 @@ button{font-family:inherit;cursor:pointer}
       function updateNavigation(envelope) {
         const status = statusOf(envelope);
         const data = mergeLatestFrontierStream(envelope.data || {});
+        const frontierCache = state.latestFrontierStream;
+        const explorationFrame = state.latestStreamFrames["exploration.state"];
+        const frontierClearSequence = Number(frontierCache && frontierCache.sequence);
+        const explorationSequence = Number(explorationFrame && (explorationFrame.sequence ?? explorationFrame.cursor));
+        const explorationIsNewerThanClear = Number.isFinite(frontierClearSequence)
+          && Number.isFinite(explorationSequence)
+          && explorationSequence > frontierClearSequence;
+        const explorationContext = frontierCache && frontierCache.frontier_cleared === true && !explorationIsNewerThanClear
+          ? null
+          : data.exploration_context;
         setPill(els.navigationStatus, status);
         const frontierCount = data.frontier_count;
         const waitingFor = data.waiting_for;
-        const explorationState = data.exploration_context && data.exploration_context.exploration_state;
+        const explorationState = explorationContext && explorationContext.exploration_state;
         const explorationMetadata = explorationState && explorationState.metadata ? explorationState.metadata : {};
         let explorerStatus = data.explorer_status_text
           || explorationMetadata.status_text
@@ -3778,13 +3905,13 @@ button{font-family:inherit;cursor:pointer}
         }
         const frontiers = Array.isArray(data.frontiers) ? data.frontiers : null;
         state.frontiers = frontiers || [];
-        state.goalPose = extractNavigationGoal(data.navigation_context, data.exploration_context);
-        state.navigationPath = extractNavigationPath(data.navigation_context, data.exploration_context);
+        state.goalPose = extractNavigationGoal(data.navigation_context, explorationContext)
+          || goalPoseFromValue(data.current_goal)
+          || goalPoseFromValue(data.current_frontier)
+          || goalPoseFromValue(data.selected_frontier);
+        state.navigationPath = extractNavigationPath(data.navigation_context, explorationContext);
         if (!state.navigationPath.length && Array.isArray(data.planned_path)) {
           state.navigationPath = data.planned_path.map(pathPointFromValue).filter(Boolean);
-        }
-        if (!state.goalPose && data.current_goal && data.current_goal.target_pose) {
-          state.goalPose = data.current_goal.target_pose;
         }
         syncDebugNavGoalFromStream(data.navigation_context || data);
         if (state.pendingNavGoal && state.pendingNavGoal.status === "accepted" && state.goalPose) {
@@ -3805,10 +3932,12 @@ button{font-family:inherit;cursor:pointer}
           ["已过期", displayBool(envelope.stale === true)],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
-        els.frontierNotice.hidden = Boolean(explorationTerminal || (frontiers && frontiers.length));
-        els.frontierNotice.textContent = explorationTerminal
-          ? "探索器已报告完成（DONE）。"
-          : (frontiers && frontiers.length ? "" : "当前探索上下文还没有 frontier 几何，请确认探索运行态已生成候选。");
+        if (els.frontierNotice) {
+          els.frontierNotice.hidden = Boolean(explorationTerminal || (frontiers && frontiers.length));
+          els.frontierNotice.textContent = explorationTerminal
+            ? "探索器已报告完成（DONE）。"
+            : (frontiers && frontiers.length ? "" : "当前探索上下文还没有 frontier 几何，请确认探索运行态已生成候选。");
+        }
         reevaluateCachedMapDisplay();
         requestMapDraw(false);
       }
@@ -4396,16 +4525,23 @@ button{font-family:inherit;cursor:pointer}
         "localization.pose",
         "localization.trajectory",
         "navigation.state",
+        "exploration.state",
         "exploration.frontier",
         "pointcloud_map.meta",
       ]);
       function pointcloud3dStreamDetail(frame) {
-        if (frame.topic === "localization.pose") return state.pose || null;
+        if (frame.topic === "localization.pose") return state.latestPose || null;
         if (frame.topic === "localization.trajectory") return { trajectory: state.trajectory || [] };
-        if (frame.topic === "navigation.state") {
+        if (frame.topic === "navigation.state" || frame.topic === "exploration.state") {
           return { planned_path: state.navigationPath || [], current_goal: state.goalPose || null };
         }
-        if (frame.topic === "exploration.frontier") return { frontiers: state.frontiers || [] };
+        if (frame.topic === "exploration.frontier") {
+          return {
+            frontiers: state.frontiers || [],
+            planned_path: state.navigationPath || [],
+            current_goal: state.goalPose || null,
+          };
+        }
         return frame.payload || {};
       }
       function envelopeFromFrame(frame, payloadOverride) {
@@ -4601,6 +4737,8 @@ button{font-family:inherit;cursor:pointer}
             latest_frontiers: [],
             planned_path: [],
             current_goal: null,
+            current_frontier: null,
+            selected_frontier: null,
             exploration_terminal: true,
             frontier_cleared: true,
             geometry_session_mode: sessionMode || "idle",
@@ -4617,6 +4755,8 @@ button{font-family:inherit;cursor:pointer}
             exploration_terminal: true,
             planned_path: [],
             current_goal: null,
+            current_frontier: null,
+            selected_frontier: null,
             geometry_session_mode: sessionMode || "idle",
           }));
           return;
@@ -4627,6 +4767,8 @@ button{font-family:inherit;cursor:pointer}
           latest_frontiers: Array.isArray(payload.latest_frontiers) ? payload.latest_frontiers : [],
           planned_path: Array.isArray(payload.planned_path) ? payload.planned_path : [],
           current_goal: payload.current_goal || null,
+          current_frontier: payload.current_frontier || null,
+          selected_frontier: payload.selected_frontier || null,
           exploration_terminal: payload.exploration_terminal,
           geometry_session_mode: sessionMode || "explore",
           sequence: frame.sequence,
@@ -4643,6 +4785,8 @@ button{font-family:inherit;cursor:pointer}
           exploration_terminal: payload.exploration_terminal,
           planned_path: payload.planned_path,
           current_goal: payload.current_goal,
+          current_frontier: payload.current_frontier,
+          selected_frontier: payload.selected_frontier,
         }));
       }
       function updatePointcloudMapFrame(frame) {
@@ -4650,6 +4794,7 @@ button{font-family:inherit;cursor:pointer}
         const envelope = envelopeFromFrame(frame, summary);
         const data = { pointcloud_map: { status: envelope.status, frame_id: envelope.frame_id, revision: envelope.revision, latency_ms: envelope.latency_ms, source_timestamp: envelope.source_timestamp, metadata: { source: envelope.source, source_kind: summary.source_kind || (frame.metadata && frame.metadata.source_kind), point_count: summary.point_count ?? (frame.metadata && frame.metadata.point_count), pcd_path: summary.pcd_path || (frame.metadata && frame.metadata.pcd_path) } } };
         updateSensorSummary({ ...(state.latestOverview || {}), ...data });
+        renderMapSummary();
       }
       function updatePointcloudFrame(frame) {
         const payload = frame.payload || {};
@@ -5423,14 +5568,19 @@ button{font-family:inherit;cursor:pointer}
           els.mapModeToggle.setAttribute("aria-pressed", is3d ? "true" : "false");
         }
         if (els.mapEmpty && is3d) els.mapEmpty.hidden = true;
+        renderMapSummary();
       }
       function updatePointcloud3dCameraControls(detail) {
         const cameraState = detail || {};
         const mode = cameraState.mode === "follow" ? "follow" : "free";
-        const robotAvailable = cameraState.robotAvailable === true || Boolean(pointFromPose(state.pose));
+        const robotAvailable = cameraState.robotAvailable === true || Boolean(pointFromPose(state.latestPose));
         const distance = Number(cameraState.distance);
+        const zoomPercent = Number(cameraState.zoomPercent);
         state.pointcloud3dCameraMode = mode;
         state.pointcloud3dDistance = Number.isFinite(distance) ? distance : null;
+        if (Number.isFinite(zoomPercent) && zoomPercent > 0) {
+          state.pointcloud3dZoomPercent = zoomPercent;
+        }
         if (els.map3dFreeView) {
           els.map3dFreeView.classList.toggle("active", mode === "free");
           els.map3dFreeView.setAttribute("aria-pressed", mode === "free" ? "true" : "false");
@@ -5450,7 +5600,7 @@ button{font-family:inherit;cursor:pointer}
             : "等待定位位姿后可定位机器狗";
         }
         if (els.map3dZoomValue) {
-          els.map3dZoomValue.textContent = Number.isFinite(distance) ? `${distance.toFixed(1)} m` : "-- m";
+          els.map3dZoomValue.textContent = `${Math.max(1, Math.round(state.pointcloud3dZoomPercent))}%`;
         }
       }
       function setMapViewMode(mode) {
@@ -5479,6 +5629,12 @@ button{font-family:inherit;cursor:pointer}
       });
       window.addEventListener("pointcloud3d:camera-state", (event) => {
         updatePointcloud3dCameraControls(event.detail || {});
+      });
+      window.addEventListener("pointcloud3d:point-count", (event) => {
+        const points = Number(event.detail && event.detail.points);
+        state.pointcloud3dVisiblePoints = Number.isFinite(points) ? Math.max(0, Math.floor(points)) : 0;
+        state.pointcloud3dPointCountKnown = Number.isFinite(points);
+        renderMapSummary();
       });
       els.logLevelFilter.addEventListener("change", () => {
         state.logFilter = els.logLevelFilter.value;
@@ -5520,7 +5676,8 @@ button{font-family:inherit;cursor:pointer}
       els.map3dResetView?.addEventListener("click", () => window.pointcloud3d?.resetView());
       els.map3dCenterRobot?.addEventListener("click", () => window.pointcloud3d?.centerOnRobot());
       syncMapViewControls();
-      updatePointcloud3dCameraControls({ mode: "free", robotAvailable: Boolean(pointFromPose(state.pose)) });
+      updatePointcloud3dCameraControls({ mode: "free", robotAvailable: Boolean(pointFromPose(state.latestPose)) });
+      updateMapPoseHud();
     })();
   </script>
   <script type="module" src="/static/js/pointcloud3d.js"></script>

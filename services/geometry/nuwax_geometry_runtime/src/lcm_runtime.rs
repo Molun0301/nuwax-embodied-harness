@@ -1693,10 +1693,47 @@ fn cancel_phase_name(phase: crate::nav_runtime::CancelPhase) -> &'static str {
     }
 }
 
+fn normalize_pending_cancel_zero_ack_path_identity(
+    nav: &crate::nav_runtime::NavRuntimeState,
+    update: &mut NavigationUpdate,
+) {
+    let feedback = &update.feedback;
+    let complete_zero_proof = feedback.cancel_generation > 0
+        && !feedback.zero_ack_id.trim().is_empty()
+        && feedback.zero_applied_monotonic_ns > 0;
+    let pre_path_sentinel = feedback.path_revision == 0 && feedback.path_payload_sha256 == [0; 32];
+    if !complete_zero_proof || !pre_path_sentinel {
+        return;
+    }
+
+    let cancel = nav.cancel_snapshot();
+    let Some(lease) = cancel.lease.as_ref() else {
+        return;
+    };
+    let authoritative_path_is_sealed =
+        lease.path_revision > 0 && lease.path_payload_sha256 != [0; 32];
+    let cancellation_identity_matches = cancel.phase == crate::nav_runtime::CancelPhase::Pending
+        && cancel.generation == feedback.cancel_generation
+        && cancel.goal_id == update.state.goal_id
+        && lease.session_id == update.state.goal_id
+        && lease.owner_kind == feedback.owner_kind
+        && lease.parent_request_id == feedback.parent_request_id
+        && lease.goal_generation == feedback.goal_generation
+        && lease.map_revision == feedback.planner_map_revision
+        && lease.goal_payload_sha256 == feedback.goal_payload_sha256;
+    if !authoritative_path_is_sealed || !cancellation_identity_matches {
+        return;
+    }
+
+    update.feedback.path_revision = lease.path_revision;
+    update.feedback.path_payload_sha256 = lease.path_payload_sha256;
+}
+
 async fn apply_typed_navigation_feedback(
     nav: &crate::nav_runtime::NavRuntimeState,
     mut update: NavigationUpdate,
 ) -> Option<NavigationUpdate> {
+    normalize_pending_cancel_zero_ack_path_identity(nav, &mut update);
     let correlated_lease = match nav
         .correlate_navigation_state(
             &update.state.goal_id,
@@ -1717,7 +1754,46 @@ async fn apply_typed_navigation_feedback(
         }
         Ok(None) => None,
         Err(error) => {
-            warn!(%error, session_id = %update.state.goal_id, "typed navigation state rejected");
+            let cancel = nav.cancel_snapshot();
+            let expected = cancel.lease.as_ref();
+            let zero_ack_present = !update.feedback.zero_ack_id.trim().is_empty();
+            let complete_zero_proof = update.feedback.cancel_generation > 0
+                && zero_ack_present
+                && update.feedback.zero_applied_monotonic_ns > 0;
+            warn!(
+                %error,
+                session_id = %update.state.goal_id,
+                received_path_revision = update.feedback.path_revision,
+                expected_path_revision = expected.map_or(0, |lease| lease.path_revision),
+                received_path_hash_zero = update.feedback.path_payload_sha256 == [0; 32],
+                expected_path_hash_zero = expected
+                    .is_none_or(|lease| lease.path_payload_sha256 == [0; 32]),
+                path_hash_matches = expected.is_some_and(|lease| {
+                    lease.path_payload_sha256 == update.feedback.path_payload_sha256
+                }),
+                received_cancel_generation = update.feedback.cancel_generation,
+                expected_cancel_generation = cancel.generation,
+                zero_ack_present,
+                zero_applied_monotonic_ns = update.feedback.zero_applied_monotonic_ns,
+                complete_zero_proof,
+                cancel_phase = ?cancel.phase,
+                cancel_goal_matches = cancel.goal_id == update.state.goal_id,
+                owner_matches = expected
+                    .is_some_and(|lease| lease.owner_kind == update.feedback.owner_kind),
+                parent_matches = expected.is_some_and(|lease| {
+                    lease.parent_request_id == update.feedback.parent_request_id
+                }),
+                goal_generation_matches = expected.is_some_and(|lease| {
+                    lease.goal_generation == update.feedback.goal_generation
+                }),
+                map_revision_matches = expected.is_some_and(|lease| {
+                    lease.map_revision == update.feedback.planner_map_revision
+                }),
+                goal_hash_matches = expected.is_some_and(|lease| {
+                    lease.goal_payload_sha256 == update.feedback.goal_payload_sha256
+                }),
+                "typed navigation state rejected"
+            );
             return None;
         }
     };
@@ -4072,6 +4148,50 @@ mod typed_navigation_feedback_tests {
         }
     }
 
+    async fn handle_with_active_path_lease(
+        goal_id: &str,
+    ) -> (GeometryRuntimeHandle, crate::nav_runtime::GoalLease) {
+        let handle = build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let mut lease = test_lease(goal_id);
+        lease.path_revision = 1;
+        lease.path_payload_sha256 = [8; 32];
+        {
+            let inner = handle.nav.inner();
+            let mut slot = inner.write().await;
+            slot.phase = crate::nav_runtime::NavPhase::Running;
+            slot.goal = Some(crate::nav_runtime::ActiveGoal {
+                id: lease.session_id.clone(),
+                frame_id: "map".to_string(),
+                target: PoseState::default(),
+                accepted_at_ns: 1,
+                lease: lease.clone(),
+            });
+        }
+        (handle, lease)
+    }
+
+    async fn begin_pending_cancel(
+        handle: &GeometryRuntimeHandle,
+        lease: &crate::nav_runtime::GoalLease,
+    ) -> crate::nav_runtime::CancelSnapshot {
+        let pending = crate::nav_runtime::cancel(
+            handle,
+            &handle.nav,
+            crate::nav_runtime::CancelGoalInput {
+                goal_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+            },
+        )
+        .await;
+        assert_eq!(pending.state.status, "PENDING");
+        handle.nav.cancel_snapshot()
+    }
+
     #[tokio::test]
     async fn typed_feedback_drives_real_planner_and_motion_observations() {
         let handle = build_handle_for_tests()
@@ -4253,6 +4373,82 @@ mod typed_navigation_feedback_tests {
         assert_eq!(
             handle.nav.cancel_snapshot().phase,
             crate::nav_runtime::CancelPhase::Zeroed
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_zero_ack_accepts_pre_path_sentinel_after_path_rollover() {
+        let (handle, lease) = handle_with_active_path_lease("goal-path-race").await;
+        let cancel = begin_pending_cancel(&handle, &lease).await;
+
+        let mut update = feedback_update(&lease.session_id);
+        update.state.status = "CANCELLED".into();
+        update.state.message = "planner stopped".into();
+        update.feedback.cancel_generation = cancel.generation;
+        update.feedback.zero_ack_id = "zero-path-race".into();
+        update.feedback.zero_applied_monotonic_ns = 21;
+
+        let applied = apply_typed_navigation_feedback(&handle.nav, update)
+            .await
+            .expect("correlated pre-path zero acknowledgement");
+        assert_eq!(applied.state.status, "CANCELLED");
+        assert_eq!(applied.feedback.path_revision, lease.path_revision);
+        assert_eq!(
+            applied.feedback.path_payload_sha256,
+            lease.path_payload_sha256
+        );
+        assert_eq!(applied.feedback.cancel_phase, "ZEROED");
+        assert!(applied.feedback.actuator_zeroed);
+        assert_eq!(
+            handle.nav.cancel_snapshot().phase,
+            crate::nav_runtime::CancelPhase::Zeroed
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_zero_ack_with_wrong_nonzero_path_identity_remains_rejected() {
+        let (handle, lease) = handle_with_active_path_lease("goal-wrong-path").await;
+        let cancel = begin_pending_cancel(&handle, &lease).await;
+
+        let mut update = feedback_update(&lease.session_id);
+        update.state.status = "CANCELLED".into();
+        update.feedback.path_revision = lease.path_revision.saturating_add(1);
+        update.feedback.path_payload_sha256 = [9; 32];
+        update.feedback.cancel_generation = cancel.generation;
+        update.feedback.zero_ack_id = "zero-wrong-path".into();
+        update.feedback.zero_applied_monotonic_ns = 22;
+
+        assert!(
+            apply_typed_navigation_feedback(&handle.nav, update)
+                .await
+                .is_none(),
+            "non-sentinel path mismatches must fail closed"
+        );
+        assert_eq!(
+            handle.nav.cancel_snapshot().phase,
+            crate::nav_runtime::CancelPhase::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_incomplete_zero_ack_with_path_sentinel_remains_rejected() {
+        let (handle, lease) = handle_with_active_path_lease("goal-incomplete-zero").await;
+        let cancel = begin_pending_cancel(&handle, &lease).await;
+
+        let mut update = feedback_update(&lease.session_id);
+        update.state.status = "CANCELLED".into();
+        update.feedback.cancel_generation = cancel.generation;
+        update.feedback.zero_applied_monotonic_ns = 23;
+
+        assert!(
+            apply_typed_navigation_feedback(&handle.nav, update)
+                .await
+                .is_none(),
+            "path sentinels require a complete correlated ZERO proof"
+        );
+        assert_eq!(
+            handle.nav.cancel_snapshot().phase,
+            crate::nav_runtime::CancelPhase::Pending
         );
     }
 

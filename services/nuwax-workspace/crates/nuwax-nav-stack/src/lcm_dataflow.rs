@@ -512,6 +512,7 @@ struct GuardedNavTelemetry {
     goal_generation: i64,
     cancel_generation: u64,
     map_revision: u64,
+    lease_map_revision: u64,
     map_frame: String,
     pose_frame: String,
     goal: [f64; 3],
@@ -921,19 +922,7 @@ async fn run_guarded_nav_loop(
                     .expect("validated OccupancyGrid revision fits i64");
                 pose_eligibility
                     .begin_revision(input.observation.map_revision, telemetry.map_revision);
-                goal_buffer.fence_applied_goal();
-                if active_session.is_some()
-                    && !preempt_guarded_active_session(
-                        node,
-                        transport,
-                        scheduler,
-                        &mut telemetry,
-                        &mut active_session,
-                    )
-                    .await?
-                {
-                    continue;
-                }
+                // 保留活动会话；只有显式替换目标才能抢占。
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_costmap_telemetry(&mut candidate_telemetry, &input);
                 if let Err(error) = scheduler.update_costmap(input.observation).await {
@@ -1102,7 +1091,7 @@ async fn run_guarded_nav_loop(
                         scheduler.status(),
                         &telemetry,
                         "path",
-                        "active goal lease is fenced by a newer goal or costmap",
+                        "active goal lease is fenced by a newer goal",
                     ).await?;
                     continue;
                 }
@@ -1296,6 +1285,7 @@ async fn fence_guarded_active_session(
     telemetry.parent_request_id.clear();
     telemetry.goal_generation = 0;
     telemetry.goal_payload_sha256 = [0; 32];
+    telemetry.lease_map_revision = 0;
     telemetry.path_revision = 0;
     telemetry.path_payload_sha256 = [0; 32];
     telemetry.initial_distance = 0.0;
@@ -1453,6 +1443,7 @@ async fn activate_guarded_goal(
     candidate_telemetry.parent_request_id = goal_envelope.parent_request_id.clone();
     candidate_telemetry.goal_generation = goal_envelope.goal_generation;
     candidate_telemetry.goal_payload_sha256 = goal_envelope.payload_sha256;
+    candidate_telemetry.lease_map_revision = envelope_map_revision;
     candidate_telemetry.path_revision = 0;
     candidate_telemetry.path_payload_sha256 = [0; 32];
     candidate_telemetry.initial_distance =
@@ -1587,6 +1578,20 @@ fn update_progress(telemetry: &mut GuardedNavTelemetry) {
 }
 
 #[cfg(feature = "guard-runtime")]
+fn published_planner_map_revision(
+    telemetry: &GuardedNavTelemetry,
+    include_planner_fields: bool,
+) -> i64 {
+    if !telemetry.public_session_id.is_empty() {
+        saturating_i64(telemetry.lease_map_revision)
+    } else if include_planner_fields {
+        saturating_i64(telemetry.map_revision)
+    } else {
+        0
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
 async fn publish_guarded_nav_state(
     transport: &LcmTransport,
     channel: &str,
@@ -1626,11 +1631,7 @@ async fn publish_guarded_nav_state(
             .map_or(0, |_| saturating_i64(telemetry.runtime_generation)),
         guard_generation: saturating_i64(status.guard_generation),
         sink_ready: i8::from(status.motion_sink_ready),
-        planner_map_revision: if include_planner_fields {
-            saturating_i64(telemetry.map_revision)
-        } else {
-            0
-        },
+        planner_map_revision: published_planner_map_revision(telemetry, include_planner_fields),
         planner_map_frame: if include_planner_fields {
             telemetry.map_frame.clone()
         } else {
@@ -2466,8 +2467,7 @@ impl PlannerGoalBuffer {
             }
             std::cmp::Ordering::Greater => self.latest_costmap_revision = revision,
         }
-        self.active_goal_sha256 = None;
-
+        // 代价图更新只刷新规划输入，不替换已应用目标。
         let mut ready_goal = None;
         let mut dropped_goal = None;
         if let Some(pending_revision) = self.pending_goal.as_ref().map(|goal| goal.map_revision) {
@@ -2533,10 +2533,6 @@ impl PlannerGoalBuffer {
         } else {
             None
         }
-    }
-
-    fn fence_applied_goal(&mut self) {
-        self.active_goal_sha256 = None;
     }
 
     fn has_applied_goal(&self) -> bool {
@@ -2941,11 +2937,6 @@ async fn run_simple_planner(
                         continue;
                     }
                 };
-                clear_planner_goal_for_costmap_advance(
-                    &mut active_goal,
-                    &mut active_boundary,
-                    &mut path_revision,
-                );
                 published_path_is_boundary_safe = false;
                 if let Some(reason) = dropped_goal {
                     diagnostics.reject(
@@ -2954,6 +2945,11 @@ async fn run_simple_planner(
                     );
                 }
                 if let Some(envelope) = ready_goal {
+                    clear_planner_goal_for_costmap_advance(
+                        &mut active_goal,
+                        &mut active_boundary,
+                        &mut path_revision,
+                    );
                     match apply_simple_planner_goal(&mut module, *envelope, &frame.payload)? {
                         OwnerInput::Accepted((envelope, boundary)) => {
                             if !goal_buffer.mark_applied(&envelope) {
@@ -3351,11 +3347,6 @@ async fn run_astar_planner(
                         continue;
                     }
                 };
-                clear_planner_goal_for_costmap_advance(
-                    &mut active_goal,
-                    &mut active_boundary,
-                    &mut path_revision,
-                );
                 if let Some(reason) = dropped_goal {
                     diagnostics.reject(
                         "astar_planner.goal",
@@ -3363,6 +3354,11 @@ async fn run_astar_planner(
                     );
                 }
                 if let Some(envelope) = ready_goal {
+                    clear_planner_goal_for_costmap_advance(
+                        &mut active_goal,
+                        &mut active_boundary,
+                        &mut path_revision,
+                    );
                     if !has_odometry {
                         let raw_resolution = raw_costmap.resolution();
                         Module::on_costmap(&mut module, raw_costmap)
@@ -4927,6 +4923,31 @@ mod planner_goal_buffer_tests {
     }
 
     #[test]
+    fn applied_goal_remains_active_when_only_the_costmap_advances() {
+        let mut buffer = PlannerGoalBuffer::default();
+        assert!(matches!(
+            buffer.observe_costmap_revision(20),
+            PlannerCostmapIngress::Accepted { .. }
+        ));
+        let goal = planner_test_goal("active-goal", 1, "map-a", 20);
+        let ready = match buffer.observe_goal(goal) {
+            PlannerGoalIngress::Ready(goal) => *goal,
+            outcome => panic!("goal must be ready: {outcome:?}"),
+        };
+        assert!(buffer.mark_applied(&ready));
+
+        assert!(matches!(
+            buffer.observe_costmap_revision(21),
+            PlannerCostmapIngress::Accepted {
+                ready_goal: None,
+                dropped_goal: None,
+            }
+        ));
+        assert!(buffer.has_applied_goal());
+        assert!(buffer.pending_goal.is_none());
+    }
+
+    #[test]
     fn module_internal_native_transport_timeout_and_all_tick_errors_are_fatal() {
         use nuwax_nav_base::{NativeProcessError, NavError};
 
@@ -6176,7 +6197,7 @@ mod guarded_tests {
     }
 
     #[tokio::test]
-    async fn guarded_costmap_first_rollover_fences_old_path_and_requires_new_pose() {
+    async fn guarded_costmap_update_keeps_the_active_session_and_path() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
         let path_a = sealed_path(&goal_a);
@@ -6190,23 +6211,19 @@ mod guarded_tests {
         .expect("map-a path was not accepted");
 
         harness.send_costmap(12);
-        harness.wait_for_zero().await;
         harness.wait_for_costmap(12).await;
-        harness.assert_no_session().await;
-        assert_eq!(harness.scheduler.status().path_revision, 0);
-        assert!(harness.scheduler.status().last_zero_ack_id.is_some());
-
-        harness.send_path(&path_a);
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(harness.scheduler.status().session_id.is_none());
-        assert_eq!(harness.scheduler.status().path_revision, 0);
-
-        let goal_b = rollover_goal(&goal_a, "session-b", "map-v2", 12, 8, 1);
-        harness.send_goal(&goal_b);
-        harness.assert_no_session().await;
-        harness.send_pose(2);
-        harness.wait_for_pose(2).await;
-        harness.wait_for_session("session-b").await;
+        assert_eq!(
+            harness.scheduler.status().session_id.as_deref(),
+            Some("session-a")
+        );
+        assert_eq!(harness.scheduler.status().path_revision, 1);
+        assert!(harness.scheduler.status().last_zero_ack_id.is_none());
+        assert!(!harness
+            .motion_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("zero:")));
         harness.shutdown().await;
     }
 
@@ -6273,6 +6290,26 @@ mod guarded_tests {
         let mut foreign_cancel = cancel;
         foreign_cancel.goal_generation += 1;
         assert!(validate_cancel_goal_correlation(&foreign_cancel, &goal).is_err());
+    }
+
+    #[test]
+    fn owned_status_updates_preserve_the_lease_map_revision() {
+        let owned = GuardedNavTelemetry {
+            public_session_id: "explore-parent.nav.2".into(),
+            map_revision: 62,
+            lease_map_revision: 41,
+            ..GuardedNavTelemetry::default()
+        };
+        assert_eq!(published_planner_map_revision(&owned, false), 41);
+        assert_eq!(published_planner_map_revision(&owned, true), 41);
+
+        let unowned = GuardedNavTelemetry {
+            map_revision: 62,
+            lease_map_revision: 41,
+            ..GuardedNavTelemetry::default()
+        };
+        assert_eq!(published_planner_map_revision(&unowned, false), 0);
+        assert_eq!(published_planner_map_revision(&unowned, true), 62);
     }
 
     #[test]
@@ -6568,6 +6605,7 @@ mod guarded_tests {
             owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
             goal_generation: 3,
             map_revision: 11,
+            lease_map_revision: 11,
             map_frame: "map".into(),
             pose_frame: "map".into(),
             path_revision: 1,
@@ -6579,6 +6617,7 @@ mod guarded_tests {
             .await
             .expect("pending map-b goal fences map-a");
         assert!(active_session.is_none());
+        assert_eq!(telemetry.lease_map_revision, 0);
         assert_eq!(telemetry.path_revision, 0);
         assert_eq!(telemetry.goal_payload_sha256, [0; 32]);
         assert_eq!(telemetry.path_payload_sha256, [0; 32]);

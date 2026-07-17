@@ -655,16 +655,36 @@ impl NavRuntimeState {
                 .and_then(|cancel| cancel.lease.clone())
                 .ok_or_else(|| "NAV_STATE_LEASE_REJECTED: no matching lease".to_string())?
         };
-        if session_id != lease.session_id
-            || owner_kind != lease.owner_kind
-            || parent_request_id != lease.parent_request_id
-            || goal_generation != lease.goal_generation
-            || planner_map_revision != lease.map_revision
-            || goal_payload_sha256 != lease.goal_payload_sha256
-            || path_revision != lease.path_revision
-            || path_payload_sha256 != lease.path_payload_sha256
-        {
-            return Err("NAV_STATE_LEASE_REJECTED: identity/map/path/hash mismatch".to_string());
+        let mut mismatched_fields = Vec::new();
+        if session_id != lease.session_id {
+            mismatched_fields.push("session_id");
+        }
+        if owner_kind != lease.owner_kind {
+            mismatched_fields.push("owner_kind");
+        }
+        if parent_request_id != lease.parent_request_id {
+            mismatched_fields.push("parent_request_id");
+        }
+        if goal_generation != lease.goal_generation {
+            mismatched_fields.push("goal_generation");
+        }
+        if planner_map_revision != lease.map_revision {
+            mismatched_fields.push("planner_map_revision");
+        }
+        if goal_payload_sha256 != lease.goal_payload_sha256 {
+            mismatched_fields.push("goal_payload_sha256");
+        }
+        if path_revision != lease.path_revision {
+            mismatched_fields.push("path_revision");
+        }
+        if path_payload_sha256 != lease.path_payload_sha256 {
+            mismatched_fields.push("path_payload_sha256");
+        }
+        if !mismatched_fields.is_empty() {
+            return Err(format!(
+                "NAV_STATE_LEASE_REJECTED: mismatched fields: {}",
+                mismatched_fields.join(",")
+            ));
         }
         Ok(Some(lease))
     }
@@ -3616,6 +3636,35 @@ mod tests {
         assert_eq!(zeroed.state.status, "CANCELLED");
         backend.release_one();
         assert_eq!(first.await.expect("first cancel").state.status, "CANCELLED");
+    }
+
+    #[tokio::test]
+    async fn navigation_state_rejection_names_the_mismatched_lease_field() {
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("diagnostic-goal", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+
+        let error = state
+            .correlate_navigation_state(
+                &lease.session_id,
+                lease.owner_kind,
+                &lease.parent_request_id,
+                lease.goal_generation,
+                0,
+                lease.path_revision,
+                lease.goal_payload_sha256,
+                lease.path_payload_sha256,
+            )
+            .await
+            .expect_err("zero map revision must not match an owned navigation state");
+        assert_eq!(
+            error,
+            "NAV_STATE_LEASE_REJECTED: mismatched fields: planner_map_revision"
+        );
     }
 
     #[tokio::test]

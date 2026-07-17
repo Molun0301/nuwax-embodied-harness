@@ -344,14 +344,9 @@ struct ActiveChildNavigation {
 }
 
 #[derive(Debug, Clone)]
-enum PendingChildAction {
-    Terminate {
-        reason: ExplorationStopReason,
-        message: String,
-    },
-    Replan {
-        target_map_revision: u64,
-    },
+struct PendingChildAction {
+    reason: ExplorationStopReason,
+    message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -739,11 +734,8 @@ impl ExploreRuntimeHandle {
         reason: ExplorationStopReason,
         message: String,
     ) -> ExploreRuntimeSnapshot {
-        self.begin_child_action(
-            request_id,
-            PendingChildAction::Terminate { reason, message },
-        )
-        .await
+        self.begin_child_action(request_id, PendingChildAction { reason, message })
+            .await
     }
 
     async fn begin_child_action(
@@ -753,48 +745,6 @@ impl ExploreRuntimeHandle {
     ) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
         if guard.pending_child_cancellation.is_some() {
-            let mut terminal_override = None;
-            let mut detail = None;
-            {
-                let pending = guard
-                    .pending_child_cancellation
-                    .as_mut()
-                    .expect("pending cancellation checked above");
-                match action {
-                    PendingChildAction::Terminate { reason, message }
-                        if matches!(pending.action, PendingChildAction::Replan { .. })
-                            && pending.failure.is_none() =>
-                    {
-                        pending.action = PendingChildAction::Terminate {
-                            reason,
-                            message: message.clone(),
-                        };
-                        terminal_override = Some(reason);
-                        detail = Some(message);
-                    }
-                    PendingChildAction::Replan {
-                        target_map_revision,
-                    } => {
-                        if let PendingChildAction::Replan {
-                            target_map_revision: pending_revision,
-                        } = &mut pending.action
-                        {
-                            *pending_revision = (*pending_revision).max(target_map_revision);
-                            detail = Some(format!(
-                                "CANCEL_PENDING: coalesced replan target map revision {}",
-                                *pending_revision
-                            ));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(reason) = terminal_override {
-                let _ = guard.controller.stop_with_reason(reason);
-                guard.last_stop = Some(reason);
-                guard.last_stop_reason = stop_reason_str(reason).to_string();
-                guard.last_poll = Some(ExplorationPoll::Stop(reason));
-            }
             let status = if guard
                 .pending_child_cancellation
                 .as_ref()
@@ -806,9 +756,7 @@ impl ExploreRuntimeHandle {
             };
             let snapshot = guard.snapshot(
                 status,
-                detail.unwrap_or_else(|| {
-                    "child navigation cancellation remains pending ZEROED proof".to_string()
-                }),
+                "child navigation cancellation remains pending ZEROED proof",
             );
             drop(guard);
             return self.store_snapshot(snapshot);
@@ -820,26 +768,14 @@ impl ExploreRuntimeHandle {
         }
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         guard.generation = generation;
-        if let PendingChildAction::Terminate { reason, .. } = &action {
-            let reason = *reason;
-            let _ = guard.controller.stop_with_reason(reason);
-            guard.last_stop = Some(reason);
-            guard.last_stop_reason = stop_reason_str(reason).to_string();
-            guard.last_poll = Some(ExplorationPoll::Stop(reason));
-        }
+        let _ = guard.controller.stop_with_reason(action.reason);
+        guard.last_stop = Some(action.reason);
+        guard.last_stop_reason = stop_reason_str(action.reason).to_string();
+        guard.last_poll = Some(ExplorationPoll::Stop(action.reason));
 
         let Some(child) = guard.active_child.clone() else {
-            let (status, message) = match action {
-                PendingChildAction::Terminate { reason, message } => {
-                    (status_for_stop_reason(reason), message)
-                }
-                PendingChildAction::Replan {
-                    target_map_revision,
-                } => (
-                    STATUS_PENDING,
-                    format!("map revision {target_map_revision} accepted; selecting next frontier"),
-                ),
-            };
+            let status = status_for_stop_reason(action.reason);
+            let message = action.message;
             let frontier_update = if matches!(status, STATUS_PENDING | STATUS_ACTIVE) {
                 None
             } else {
@@ -1354,7 +1290,7 @@ impl ExploreRuntimeHandle {
                 .pending_child_cancellation
                 .take()
                 .expect("pending child cancellation checked above");
-            let child = guard
+            guard
                 .active_child
                 .take()
                 .expect("active child checked above");
@@ -1371,43 +1307,11 @@ impl ExploreRuntimeHandle {
                     guard.update_frontiers(Vec::new()),
                 )
             } else {
-                match pending.action {
-                    PendingChildAction::Terminate { reason, message } => (
-                        status_for_stop_reason(reason),
-                        message,
-                        guard.update_frontiers(Vec::new()),
-                    ),
-                    PendingChildAction::Replan {
-                        target_map_revision,
-                    } => match guard.controller.report_goal_feedback(
-                        &child.frontier_goal_id,
-                        ExplorationGoalFeedback::Cancelled,
-                    ) {
-                        Ok(()) => {
-                            let frontiers = guard.controller.frontier_snapshot();
-                            (
-                                STATUS_PENDING,
-                                format!(
-                                    "child ZEROED; replanning on map revision {target_map_revision}"
-                                ),
-                                guard.update_frontiers(frontiers),
-                            )
-                        }
-                        Err(error) => {
-                            let _ = guard.controller.stop_with_reason(
-                                ExplorationStopReason::ConsecutiveFailuresExceeded,
-                            );
-                            guard.last_stop =
-                                Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
-                            guard.last_stop_reason = "replan_feedback_failed".to_string();
-                            (
-                                STATUS_FAILED,
-                                format!("child ZEROED but replan feedback failed: {error}"),
-                                guard.update_frontiers(Vec::new()),
-                            )
-                        }
-                    },
-                }
+                (
+                    status_for_stop_reason(pending.action.reason),
+                    pending.action.message,
+                    guard.update_frontiers(Vec::new()),
+                )
             };
             let snapshot = guard.snapshot(status, message);
             let backend_available = self.readiness_cache.lock().backend_available;
@@ -1504,23 +1408,13 @@ impl ExploreRuntimeHandle {
                 && config.map_revision > 0
                 && config.map_revision != snapshot.map_revision;
             if version_changed || explicit_revision_pin_changed {
-                pending_action = Some(PendingChildAction::Terminate {
+                pending_action = Some(PendingChildAction {
                     reason: ExplorationStopReason::MapRevisionChanged,
                     message: "pinned map version/revision changed during exploration".to_string(),
                 });
             }
         }
-        if pending_action.is_none()
-            && guard.controller.is_active()
-            && guard
-                .active_child
-                .as_ref()
-                .is_some_and(|child| child.lease.map_revision != snapshot.map_revision)
-        {
-            pending_action = Some(PendingChildAction::Replan {
-                target_map_revision: snapshot.map_revision,
-            });
-        }
+        // 实时地图只刷新下一轮探索输入，不取消当前目标。
         guard.costmap_input = Some(snapshot);
         let current_frontiers = guard.frontiers.clone();
         let frontier_update = guard.update_frontiers(current_frontiers);
@@ -2493,8 +2387,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_unpinned_session_replans_after_revision_change_and_zero() {
-        let (handle, _) = configured_handle();
+    async fn default_unpinned_session_keeps_active_child_across_revision_changes() {
+        let (handle, sink) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))
             .await
@@ -2506,20 +2400,22 @@ mod tests {
             .ingest_costmap_snapshot(frontier_costmap(2))
             .await
             .unwrap();
-        let snapshot = handle.snapshot();
-        assert_eq!(snapshot.status, STATUS_STOPPING);
+        let snapshot = handle.tick((2.0, 2.0)).await;
+        assert_eq!(snapshot.status, STATUS_ACTIVE);
         assert_eq!(snapshot.map_revision, 2);
         assert_eq!(snapshot.child_task_id, active.child_task_id);
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        assert_eq!(active_child_lease(&handle).await.map_revision, 1);
 
-        let replanning = handle
+        let completed = handle
             .report_navigation_result(
                 &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
+                ChildNavigationResult::Reached(terminal_proof(&lease)),
             )
             .await
             .unwrap();
-        assert_eq!(replanning.status, STATUS_PENDING);
-        assert!(replanning.child_task_id.is_empty());
+        assert_eq!(completed.status, STATUS_ACTIVE);
+        assert!(completed.child_task_id.is_empty());
         assert!(handle.is_active().await);
 
         let next = handle.tick((2.0, 2.0)).await;
@@ -2529,7 +2425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revision_change_cannot_bypass_child_lease_during_submit() {
+    async fn revision_change_during_submit_keeps_dispatched_child_active() {
         let (handle, sink) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))
@@ -2554,17 +2450,16 @@ mod tests {
         ingesting.await.unwrap().unwrap();
 
         assert_eq!(active.status, STATUS_ACTIVE);
-        let current = handle.snapshot();
-        assert_eq!(current.status, STATUS_STOPPING);
+        let current = handle.tick((2.0, 2.0)).await;
+        assert_eq!(current.status, STATUS_ACTIVE);
+        assert_eq!(current.map_revision, 2);
         assert_eq!(current.child_task_id, active.child_task_id);
-        assert_eq!(
-            sink.cancelled.lock().unwrap().as_slice(),
-            &[active.child_task_id]
-        );
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        assert_eq!(active_child_lease(&handle).await.map_revision, 1);
     }
 
     #[tokio::test]
-    async fn user_stop_escalates_pending_replan_to_cancelled_terminal() {
+    async fn user_stop_after_revision_update_cancels_active_child() {
         let (handle, _) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))
@@ -2577,7 +2472,7 @@ mod tests {
             .ingest_costmap_snapshot(frontier_costmap(2))
             .await
             .unwrap();
-        assert_eq!(handle.snapshot().status, STATUS_STOPPING);
+        assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
 
         let stopping = handle.stop("req-stop-replan").await;
         assert_eq!(stopping.status, STATUS_STOPPING);

@@ -351,13 +351,41 @@ button{font-family:inherit;cursor:pointer}
 .canvas-wrap{position:absolute;inset:0;border-radius:var(--r-xl);overflow:hidden;background:var(--grid-bg)}
 #mapCanvas{position:absolute;inset:0;width:100%;height:100%;display:block}
 #map3dContainer{position:absolute;inset:0;border-radius:var(--r-xl)}
-.map-toolbar{position:absolute;left:14px;top:14px;z-index:5;display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.map-toolbar{position:absolute;left:14px;top:14px;z-index:5;display:grid;gap:7px;
+  max-width:min(980px,calc(100% - 230px));pointer-events:none}
+.map-tool-row{display:flex;gap:7px;flex-wrap:wrap;align-items:center;pointer-events:none}
+.map-tool-group{display:inline-flex;align-items:center;gap:2px;padding:3px;border-radius:var(--r);pointer-events:auto}
+.map-tool-group[hidden],.map-tool-row[hidden]{display:none!important}
+.map-tool-group .tool{min-height:29px;padding:5px 9px;border:0;background:transparent;box-shadow:none;border-radius:var(--r-sm);
+  white-space:nowrap;flex:0 0 auto}
+.map-tool-group .tool:hover{background:var(--inset);transform:none;box-shadow:none}
+.map-tool-group .tool.active,.map-tool-group .tool[aria-pressed="true"]{background:var(--ink);color:var(--surface)}
+.map-tool-group .tool:disabled{cursor:not-allowed;opacity:.42;background:transparent;color:var(--faint)}
+.map-tool-separator{width:1px;height:20px;background:var(--line);margin:0 2px}
+.map-layer-toggle{min-height:29px;padding:5px 8px;border-radius:var(--r-sm);display:inline-flex;gap:6px;align-items:center;
+  color:var(--strong);font-size:11.5px;font-weight:620;cursor:pointer}
+.map-layer-toggle:hover{background:var(--inset)}
+.map-layer-toggle input{margin:0;accent-color:var(--robot)}
 .map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.map-goal-chip{position:absolute;left:14px;top:54px;z-index:5}
+.map-goal-chip{position:absolute;left:14px;top:94px;z-index:5}
 .legend{position:absolute;left:14px;bottom:14px;z-index:5;max-width:62%}
 #mapZoomValue{min-width:48px;justify-content:center;font-family:var(--mono);font-size:11px}
+#map3dZoomValue{min-width:58px;justify-content:center;font-family:var(--mono);font-size:11px}
 #mapEmpty{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;max-width:70%}
 .map-info-grid{display:none}
+.workspace.swapped .map-toolbar{left:10px;right:10px;top:10px;max-width:none}
+.workspace.swapped .map-tool-row{gap:5px}
+.workspace.swapped #map3dCameraControls{flex-wrap:wrap;max-width:252px}
+.workspace.swapped .legend{left:10px;bottom:10px;max-width:calc(100% - 80px);padding:5px 8px;gap:4px 8px;font-size:9.5px}
+
+@media(max-width:760px){
+  .map-toolbar{left:10px;right:10px;top:10px;max-width:none}
+  .map-tool-row{gap:5px}
+  .map-tool-group{max-width:100%;flex-wrap:wrap}
+  .map-stream-chip{top:auto;right:10px;bottom:50px;max-width:58%}
+  .map-goal-chip{left:10px;top:auto;bottom:88px;max-width:calc(100% - 20px)}
+  .legend{left:10px;bottom:10px;max-width:68%}
+}
 
 /* media-swap buttons */
 .media-swap{display:inline-flex;align-items:center;gap:5px}
@@ -417,21 +445,48 @@ button{font-family:inherit;cursor:pointer}
             <div class="canvas-wrap">
               <canvas id="mapCanvas" width="1400" height="900"></canvas>
               <div id="map3dContainer" style="display:none;"></div>
-              <div class="hud hud-tl map-toolbar" aria-label="地图缩放与导航控制">
-                <button id="mapZoomOut" class="tool glass" type="button">–</button>
-                <span id="mapZoomValue" class="tool glass zoomv">100%</span>
-                <button id="mapZoomIn" class="tool glass" type="button">+</button>
-                <button id="mapZoomReset" class="tool glass" type="button">reset</button>
-                <button id="mapCenterRobot" class="tool glass" type="button" title="视图居中到机器人" hidden>居中</button>
-                <span style="width:1px;height:22px;background:var(--line)"></span>
-                <button id="mapInitialPoseToggle" class="tool glass pose-tool" type="button" title="2D Pose Estimate：发布 /initialpose">2D Pose</button>
-                <button id="mapGoalToggle" class="tool glass" type="button" title="2D Goal：左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
-                <button id="mapPublishPointToggle" class="tool glass" type="button" title="Publish Point：发布 /clicked_point">选点</button>
-                <button id="mapModeToggle" class="tool glass" type="button">3D</button>
-                <button id="mediaSwapBtn" class="tool glass media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ 视频</button>
-                <span style="width:1px;height:22px;background:var(--line)"></span>
-                <button id="mapNavToggle" class="tool glass" type="button" title="进入导航模式：在地图上左键选点后提交 navigate_to_pose">导航</button>
-                <button id="mapBoundaryToggle" class="tool glass" type="button" title="进入手划探索范围模式：在地图上拖拽画线段后提交 explore_area_v2">划线</button>
+              <div class="hud map-toolbar" aria-label="地图视图与交互控制">
+                <div class="map-tool-row">
+                  <div id="mapViewControls" class="map-tool-group glass" aria-label="地图视图">
+                    <button id="mapModeToggle" class="tool" type="button" data-map-view="2d" aria-pressed="false" title="切换 2D / 3D 地图">切换 3D</button>
+                    <button id="mediaSwapBtn" class="tool media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ 视频</button>
+                  </div>
+                  <div id="map2dCameraControls" class="map-tool-group glass" data-map-view="2d" aria-label="2D 地图视角">
+                    <button id="mapZoomOut" class="tool" type="button" title="缩小 2D 地图">–</button>
+                    <span id="mapZoomValue" class="tool zoomv" aria-live="polite">100%</span>
+                    <button id="mapZoomIn" class="tool" type="button" title="放大 2D 地图">+</button>
+                    <button id="mapZoomReset" class="tool" type="button" title="复位 2D 地图视角">复位</button>
+                    <button id="mapCenterRobot" class="tool" type="button" title="2D 视图居中到机器狗" hidden>机器狗</button>
+                  </div>
+                  <div id="map3dCameraControls" class="map-tool-group glass" data-map-view="3d" aria-label="3D 地图视角" hidden>
+                    <button id="map3dFreeView" class="tool active" type="button" aria-pressed="true" title="自由旋转、平移和缩放">自由视角</button>
+                    <button id="map3dFollowView" class="tool" type="button" aria-pressed="false" title="相机轨道中心跟随机器狗">跟随机器狗</button>
+                    <span class="map-tool-separator" aria-hidden="true"></span>
+                    <button id="map3dZoomOut" class="tool" type="button" title="缩小 3D 地图">–</button>
+                    <span id="map3dZoomValue" class="tool" aria-live="polite">-- m</span>
+                    <button id="map3dZoomIn" class="tool" type="button" title="放大 3D 地图">+</button>
+                    <button id="map3dResetView" class="tool" type="button" title="复位当前 3D 视角">复位视角</button>
+                    <button id="map3dCenterRobot" class="tool" type="button" title="将 3D 视角定位到机器狗" disabled>定位机器狗</button>
+                  </div>
+                  <div id="mapLayerControls" class="map-tool-group glass" aria-label="地图图层">
+                    <label class="map-layer-toggle" title="在 2D 与 3D 地图显示当前记忆库物品">
+                      <input id="showSemanticInstances" type="checkbox" checked>
+                      <span class="sw" style="background:#f59e0b"></span>物品
+                    </label>
+                    <button id="semanticInstancesRefresh" class="tool" type="button" title="手动刷新当前记忆库物品标记">刷新物品</button>
+                  </div>
+                </div>
+                <div id="map2dActionControls" class="map-tool-row" data-map-view="2d" aria-label="2D 地图交互">
+                  <div class="map-tool-group glass">
+                    <button id="mapInitialPoseToggle" class="tool pose-tool" type="button" title="2D Pose Estimate：发布 /initialpose">2D Pose</button>
+                    <button id="mapGoalToggle" class="tool" type="button" title="2D Goal：左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
+                    <button id="mapPublishPointToggle" class="tool" type="button" title="Publish Point：发布 /clicked_point">选点</button>
+                  </div>
+                  <div class="map-tool-group glass">
+                    <button id="mapNavToggle" class="tool" type="button" title="进入导航模式：在地图上左键选点后提交 navigate_to_pose">导航</button>
+                    <button id="mapBoundaryToggle" class="tool" type="button" title="进入手划探索范围模式：在地图上拖拽画线段后提交 explore_area_v2">划线</button>
+                  </div>
+                </div>
               </div>
               <span id="mapGoalStatus" class="mchip glass map-goal-chip" hidden></span>
               <span id="mapStreamStatus" class="mchip glass map-stream-chip">等待地图首帧</span>
@@ -444,11 +499,7 @@ button{font-family:inherit;cursor:pointer}
                 <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
                 <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
                 <span id="mapRvizHint" class="lg" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
-                <label class="lg" style="display:flex;gap:4px;align-items:center;cursor:pointer">
-                  <input id="showSemanticInstances" type="checkbox" checked>
-                  <span class="sw" style="background:#f59e0b"></span>物品
-                </label>
-                <button id="semanticInstancesRefresh" class="tool glass" type="button" title="手动刷新物品标记">刷新</button>
+                <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
               </div>
               <div id="mapStatus" class="pill missing" style="position:absolute;right:14px;bottom:14px;z-index:5">缺失</div>
               <div id="mapEmpty" class="empty">等待地图数据。</div>
@@ -609,6 +660,10 @@ button{font-family:inherit;cursor:pointer}
         mapGrid: null,
         mapViewport: null,
         mapZoom: 1,
+        mapViewMode: "2d",
+        pointcloud3dCameraMode: "free",
+        pointcloud3dDistance: null,
+        pointcloud3dReady: false,
         mapRvizView: { center: null, zoom: 1 },
         mapPanDrag: null,
         mapStream: null,
@@ -707,6 +762,18 @@ button{font-family:inherit;cursor:pointer}
         lastReceive: document.getElementById("lastReceive"),
         overviewGrid: document.getElementById("overviewGrid"),
         mapCanvas: document.getElementById("mapCanvas"),
+        map3dContainer: document.getElementById("map3dContainer"),
+        mapModeToggle: document.getElementById("mapModeToggle"),
+        map2dCameraControls: document.getElementById("map2dCameraControls"),
+        map3dCameraControls: document.getElementById("map3dCameraControls"),
+        map2dActionControls: document.getElementById("map2dActionControls"),
+        map3dFreeView: document.getElementById("map3dFreeView"),
+        map3dFollowView: document.getElementById("map3dFollowView"),
+        map3dZoomOut: document.getElementById("map3dZoomOut"),
+        map3dZoomValue: document.getElementById("map3dZoomValue"),
+        map3dZoomIn: document.getElementById("map3dZoomIn"),
+        map3dResetView: document.getElementById("map3dResetView"),
+        map3dCenterRobot: document.getElementById("map3dCenterRobot"),
         mapZoomIn: document.getElementById("mapZoomIn"),
         mapZoomOut: document.getElementById("mapZoomOut"),
         mapZoomReset: document.getElementById("mapZoomReset"),
@@ -2896,7 +2963,11 @@ button{font-family:inherit;cursor:pointer}
       }
       // ── 语义实例 marker 层 ──────────────────────────────────────────────
       function loadSemanticInstances() {
-        fetch("/api/memory/instances")
+        if (els.semanticInstancesRefresh) {
+          els.semanticInstancesRefresh.disabled = true;
+          els.semanticInstancesRefresh.setAttribute("aria-busy", "true");
+        }
+        return fetch("/api/memory/instances")
           .then((r) => r.ok ? r.json() : Promise.reject(r.status))
           .then((body) => {
             // 兼容两种结构：契约 {instances:[...]} 或 capability 信封 {result:{instances:[...]}}
@@ -2905,9 +2976,57 @@ button{font-family:inherit;cursor:pointer}
               : null;
             const list = src ? src.instances : [];
             state.semanticInstances = list;
+            window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-instances", {
+              detail: { instances: list },
+            }));
+            if (els.semanticInstancesRefresh) {
+              els.semanticInstancesRefresh.textContent = "刷新物品";
+              els.semanticInstancesRefresh.title = list.length
+                ? `已加载 ${list.length} 个当前记忆库物品`
+                : "当前记忆库暂无物品";
+            }
             requestMapDraw(false);
           })
-          .catch((err) => console.warn("[semantic] 实例拉取失败", err));
+          .catch((err) => {
+            console.warn("[semantic] 实例拉取失败", err);
+            if (els.semanticInstancesRefresh) {
+              els.semanticInstancesRefresh.textContent = "刷新失败";
+              els.semanticInstancesRefresh.title = `物品刷新失败：${String(err)}`;
+            }
+          })
+          .finally(() => {
+            if (els.semanticInstancesRefresh) {
+              els.semanticInstancesRefresh.disabled = false;
+              els.semanticInstancesRefresh.removeAttribute("aria-busy");
+            }
+          });
+      }
+      function syncPointcloud3dState() {
+        window.dispatchEvent(new CustomEvent("stream:localization.pose", { detail: state.pose || null }));
+        window.dispatchEvent(new CustomEvent("stream:localization.trajectory", {
+          detail: { trajectory: state.trajectory || [] },
+        }));
+        window.dispatchEvent(new CustomEvent("stream:exploration.frontier", {
+          detail: { frontiers: state.frontiers || [] },
+        }));
+        window.dispatchEvent(new CustomEvent("stream:navigation.state", {
+          detail: {
+            planned_path: state.navigationPath || [],
+            current_goal: state.goalPose || null,
+          },
+        }));
+        window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-instances", {
+          detail: { instances: state.semanticInstances || [] },
+        }));
+        window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-visibility", {
+          detail: { visible: state.showSemanticInstances },
+        }));
+        const pointcloudMeta = state.latestStreamFrames["pointcloud_map.meta"];
+        if (pointcloudMeta && pointcloudMeta.payload) {
+          window.dispatchEvent(new CustomEvent("stream:pointcloud_map.meta", {
+            detail: pointcloudMeta.payload,
+          }));
+        }
       }
       function isFallbackInstance(inst) {
         if (inst.is_fallback) return true;
@@ -4257,6 +4376,22 @@ button{font-family:inherit;cursor:pointer}
         "tasks.state",
         "system.metrics"
       ];
+      const POINTCLOUD3D_STREAM_TOPICS = new Set([
+        "localization.pose",
+        "localization.trajectory",
+        "navigation.state",
+        "exploration.frontier",
+        "pointcloud_map.meta",
+      ]);
+      function pointcloud3dStreamDetail(frame) {
+        if (frame.topic === "localization.pose") return state.pose || null;
+        if (frame.topic === "localization.trajectory") return { trajectory: state.trajectory || [] };
+        if (frame.topic === "navigation.state") {
+          return { planned_path: state.navigationPath || [], current_goal: state.goalPose || null };
+        }
+        if (frame.topic === "exploration.frontier") return { frontiers: state.frontiers || [] };
+        return frame.payload || {};
+      }
       function envelopeFromFrame(frame, payloadOverride) {
         const receivedAt = new Date().toISOString();
         return {
@@ -4411,6 +4546,11 @@ button{font-family:inherit;cursor:pointer}
           updateOverviewForFrame = false;
         }
         if (updateOverviewForFrame) updateStreamOverview(frame);
+        if (POINTCLOUD3D_STREAM_TOPICS.has(frame.topic)) {
+          window.dispatchEvent(new CustomEvent(`stream:${frame.topic}`, {
+            detail: pointcloud3dStreamDetail(frame),
+          }));
+        }
       }
       function robotStateChangeKey(frame) {
         const metadata = frame.metadata || {};
@@ -5254,6 +5394,76 @@ button{font-family:inherit;cursor:pointer}
       window.__nuwaxCameraAnchor = function () {
         return cameraAnchor();
       };
+      function syncMapViewControls() {
+        const is3d = state.mapViewMode === "3d";
+        if (els.mapCanvas) els.mapCanvas.style.display = is3d ? "none" : "";
+        if (els.map3dContainer) els.map3dContainer.style.display = is3d ? "" : "none";
+        if (els.map2dCameraControls) els.map2dCameraControls.hidden = is3d;
+        if (els.map2dActionControls) els.map2dActionControls.hidden = is3d;
+        if (els.map3dCameraControls) els.map3dCameraControls.hidden = !is3d;
+        if (els.mapModeToggle) {
+          els.mapModeToggle.textContent = is3d ? "切换 2D" : "切换 3D";
+          els.mapModeToggle.dataset.mapView = is3d ? "3d" : "2d";
+          els.mapModeToggle.setAttribute("aria-pressed", is3d ? "true" : "false");
+        }
+        if (els.mapEmpty && is3d) els.mapEmpty.hidden = true;
+      }
+      function updatePointcloud3dCameraControls(detail) {
+        const cameraState = detail || {};
+        const mode = cameraState.mode === "follow" ? "follow" : "free";
+        const robotAvailable = cameraState.robotAvailable === true || Boolean(pointFromPose(state.pose));
+        const distance = Number(cameraState.distance);
+        state.pointcloud3dCameraMode = mode;
+        state.pointcloud3dDistance = Number.isFinite(distance) ? distance : null;
+        if (els.map3dFreeView) {
+          els.map3dFreeView.classList.toggle("active", mode === "free");
+          els.map3dFreeView.setAttribute("aria-pressed", mode === "free" ? "true" : "false");
+        }
+        if (els.map3dFollowView) {
+          els.map3dFollowView.classList.toggle("active", mode === "follow");
+          els.map3dFollowView.setAttribute("aria-pressed", mode === "follow" ? "true" : "false");
+          els.map3dFollowView.disabled = !robotAvailable;
+          els.map3dFollowView.title = robotAvailable
+            ? "相机轨道中心跟随机器狗"
+            : "等待定位位姿后可跟随机器狗";
+        }
+        if (els.map3dCenterRobot) {
+          els.map3dCenterRobot.disabled = !robotAvailable;
+          els.map3dCenterRobot.title = robotAvailable
+            ? "将 3D 视角定位到机器狗"
+            : "等待定位位姿后可定位机器狗";
+        }
+        if (els.map3dZoomValue) {
+          els.map3dZoomValue.textContent = Number.isFinite(distance) ? `${distance.toFixed(1)} m` : "-- m";
+        }
+      }
+      function setMapViewMode(mode) {
+        const nextMode = mode === "3d" ? "3d" : "2d";
+        state.mapViewMode = nextMode;
+        if (nextMode === "3d") disableMapTools(true);
+        syncMapViewControls();
+        if (nextMode === "3d") {
+          if (!window.pointcloud3d || !els.map3dContainer) {
+            setText(els.mapStreamStatus, "3D 模块加载中");
+            return;
+          }
+          window.pointcloud3d.init(els.map3dContainer);
+          window.pointcloud3d.setCameraMode(state.pointcloud3dCameraMode);
+          syncPointcloud3dState();
+          window.requestAnimationFrame(() => window.pointcloud3d?.resize());
+        } else {
+          reevaluateCachedMapDisplay();
+          requestMapDraw(false);
+        }
+      }
+      window.addEventListener("pointcloud3d:ready", () => {
+        state.pointcloud3dReady = true;
+        window.pointcloud3d?.setCameraMode(state.pointcloud3dCameraMode);
+        syncPointcloud3dState();
+      });
+      window.addEventListener("pointcloud3d:camera-state", (event) => {
+        updatePointcloud3dCameraControls(event.detail || {});
+      });
       els.logLevelFilter.addEventListener("change", () => {
         state.logFilter = els.logLevelFilter.value;
         renderLogs();
@@ -5265,6 +5475,9 @@ button{font-family:inherit;cursor:pointer}
       if (els.showSemanticInstances) {
         els.showSemanticInstances.addEventListener("change", () => {
           state.showSemanticInstances = Boolean(els.showSemanticInstances.checked);
+          window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-visibility", {
+            detail: { visible: state.showSemanticInstances },
+          }));
           requestMapDraw(false);
         });
       }
@@ -5274,19 +5487,24 @@ button{font-family:inherit;cursor:pointer}
       state._semanticPollTimer = window.setInterval(() => loadSemanticInstances(), 30000);
       loadSemanticInstances();
       connectStreams();
-      document.getElementById('mapModeToggle').addEventListener('click', () => {
-        const c = document.getElementById('mapCanvas');
-        const d = document.getElementById('map3dContainer');
-        const btn = document.getElementById('mapModeToggle');
-        const is3d = d.style.display !== 'none';
-        c.style.display = is3d ? '' : 'none';
-        d.style.display = is3d ? 'none' : '';
-        btn.textContent = is3d ? '3D' : '2D';
-        if (!is3d) {
-          disableMapTools(true);
-          if (window.pointcloud3d) window.pointcloud3d.init(d);
-        }
+      els.mapModeToggle?.addEventListener("click", () => {
+        setMapViewMode(state.mapViewMode === "3d" ? "2d" : "3d");
       });
+      els.map3dFreeView?.addEventListener("click", () => {
+        state.pointcloud3dCameraMode = "free";
+        window.pointcloud3d?.setCameraMode("free");
+      });
+      els.map3dFollowView?.addEventListener("click", () => {
+        if (els.map3dFollowView.disabled) return;
+        state.pointcloud3dCameraMode = "follow";
+        window.pointcloud3d?.setCameraMode("follow");
+      });
+      els.map3dZoomOut?.addEventListener("click", () => window.pointcloud3d?.zoomBy(1.25));
+      els.map3dZoomIn?.addEventListener("click", () => window.pointcloud3d?.zoomBy(0.8));
+      els.map3dResetView?.addEventListener("click", () => window.pointcloud3d?.resetView());
+      els.map3dCenterRobot?.addEventListener("click", () => window.pointcloud3d?.centerOnRobot());
+      syncMapViewControls();
+      updatePointcloud3dCameraControls({ mode: "free", robotAvailable: Boolean(pointFromPose(state.pose)) });
     })();
   </script>
   <script type="module" src="/static/js/pointcloud3d.js"></script>

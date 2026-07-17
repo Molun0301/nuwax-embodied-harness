@@ -1391,8 +1391,9 @@ impl GeometryRuntime for GeometryRuntimeService {
             frame_id,
             target,
         };
-        let SetGoalOutcome { state: nav, lease } =
-            set_goal(&self.bridge, &self.bridge.nav, input).await;
+        let SetGoalOutcome {
+            state: nav, lease, ..
+        } = set_goal(&self.bridge, &self.bridge.nav, input).await;
         // 同步到 SharedState.nav_state,供 SubscribeNavigationState 推送。
         {
             let mut s = self.bridge.state.write().await;

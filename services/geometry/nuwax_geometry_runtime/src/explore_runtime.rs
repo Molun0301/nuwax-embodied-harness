@@ -253,6 +253,27 @@ pub struct ChildNavigationTicket {
     pub lease: ChildNavigationLease,
 }
 
+/// Admission failure returned before a child navigation lease becomes active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildNavigationSubmitError {
+    /// Navigation is temporarily unable to accept the goal; retry without feedback.
+    RetryableReadiness(String),
+    /// The request is permanently rejected and must enter goal-failure policy.
+    Rejected(String),
+}
+
+impl ChildNavigationSubmitError {
+    fn reason(&self) -> &str {
+        match self {
+            Self::RetryableReadiness(reason) | Self::Rejected(reason) => reason,
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::RetryableReadiness(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildNavigationCancelTicket {
     pub lease: ChildNavigationLease,
@@ -292,7 +313,7 @@ pub trait ExploreNavigationSink: Send + Sync {
     async fn submit(
         &self,
         request: ChildNavigationRequest,
-    ) -> Result<ChildNavigationTicket, String>;
+    ) -> Result<ChildNavigationTicket, ChildNavigationSubmitError>;
 
     async fn cancel(
         &self,
@@ -368,6 +389,7 @@ pub struct ExploreRuntimeInner {
     costmap_input: Option<ExploreCostmapSnapshot>,
     active_config: Option<ExploreStartConfig>,
     active_child: Option<ActiveChildNavigation>,
+    pending_child_dispatch: Option<ChildNavigationRequest>,
     pending_child_cancellation: Option<PendingChildCancellation>,
     generation: u64,
     child_sequence: u64,
@@ -396,6 +418,7 @@ impl ExploreRuntimeInner {
             costmap_input: None,
             active_config: None,
             active_child: None,
+            pending_child_dispatch: None,
             pending_child_cancellation: None,
             generation: 0,
             child_sequence: 0,
@@ -692,6 +715,7 @@ impl ExploreRuntimeHandle {
         guard.last_poll = None;
         guard.active_config = Some(config.clone());
         guard.active_child = None;
+        guard.pending_child_dispatch = None;
         guard.pending_child_cancellation = None;
         guard.generation = generation;
         guard.child_sequence = 0;
@@ -772,6 +796,7 @@ impl ExploreRuntimeHandle {
         guard.last_stop = Some(action.reason);
         guard.last_stop_reason = stop_reason_str(action.reason).to_string();
         guard.last_poll = Some(ExplorationPoll::Stop(action.reason));
+        guard.pending_child_dispatch = None;
 
         let Some(child) = guard.active_child.clone() else {
             let status = status_for_stop_reason(action.reason);
@@ -1025,6 +1050,22 @@ impl ExploreRuntimeHandle {
             }
         }
 
+        if let Some(mut request) = guard.pending_child_dispatch.take() {
+            request.map_revision = costmap.map_revision;
+            if request.map_version_id.is_empty() {
+                request.map_version_id = costmap.map_version_id.clone();
+            }
+            let snapshot = guard.snapshot(
+                STATUS_PENDING,
+                format!(
+                    "retrying frontier {} after navigation readiness wait",
+                    request.frontier_goal_id
+                ),
+            );
+            self.store_snapshot(snapshot);
+            return self.dispatch_child(generation, request, guard).await;
+        }
+
         let mut state = ExplorationStateSnapshot::from_xy(
             (pose.x, pose.y),
             Timestamp {
@@ -1139,8 +1180,8 @@ impl ExploreRuntimeHandle {
             return self
                 .record_dispatch_failure(
                     generation,
-                    &request.frontier_goal_id,
-                    "navigation sink unavailable".to_string(),
+                    request,
+                    ChildNavigationSubmitError::Rejected("navigation sink unavailable".to_string()),
                 )
                 .await;
         };
@@ -1149,12 +1190,12 @@ impl ExploreRuntimeHandle {
         let expected_map_version_id = request.map_version_id.clone();
         let expected_map_revision = request.map_revision;
         let frontier_goal_id = request.frontier_goal_id.clone();
-        let ticket = match sink.submit(request).await {
+        let ticket = match sink.submit(request.clone()).await {
             Ok(ticket) => ticket,
             Err(error) => {
                 drop(guard);
                 return self
-                    .record_dispatch_failure(generation, &frontier_goal_id, error)
+                    .record_dispatch_failure(generation, request, error)
                     .await;
             }
         };
@@ -1170,11 +1211,14 @@ impl ExploreRuntimeHandle {
             return self
                 .record_dispatch_failure(
                     generation,
-                    &frontier_goal_id,
-                    "navigation sink returned a mismatched child goal lease".to_string(),
+                    request,
+                    ChildNavigationSubmitError::Rejected(
+                        "navigation sink returned a mismatched child goal lease".to_string(),
+                    ),
                 )
                 .await;
         }
+        guard.pending_child_dispatch = None;
         let child_request_id = ticket.lease.session_id.clone();
         guard.active_child = Some(ActiveChildNavigation {
             request_id: child_request_id.clone(),
@@ -1192,22 +1236,33 @@ impl ExploreRuntimeHandle {
     async fn record_dispatch_failure(
         &self,
         generation: u64,
-        frontier_goal_id: &str,
-        error: String,
+        request: ChildNavigationRequest,
+        error: ChildNavigationSubmitError,
     ) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
         if generation != guard.generation || !guard.controller.is_active() {
             return self.snapshot();
         }
+        let reason = error.reason().to_string();
+        if error.is_retryable() {
+            guard.pending_child_dispatch = Some(request);
+            let snapshot = guard.snapshot(
+                STATUS_PENDING,
+                format!("waiting for child navigation readiness: {reason}"),
+            );
+            drop(guard);
+            return self.store_snapshot(snapshot);
+        }
+        guard.pending_child_dispatch = None;
         let _ = guard.controller.report_goal_feedback(
-            frontier_goal_id,
-            ExplorationGoalFeedback::Failed(error.clone()),
+            &request.frontier_goal_id,
+            ExplorationGoalFeedback::Failed(reason.clone()),
         );
         let frontiers = guard.controller.frontier_snapshot();
         let frontier_update = guard.update_frontiers(frontiers);
         let snapshot = guard.snapshot(
             STATUS_PENDING,
-            format!("child navigation dispatch failed: {error}"),
+            format!("child navigation dispatch failed: {reason}"),
         );
         drop(guard);
         self.publish_frontiers(frontier_update);
@@ -1754,11 +1809,13 @@ pub struct ControllerDiagnosticsView {
 mod tests {
     use super::*;
     use std::borrow::Cow;
+    use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
 
     #[derive(Default)]
     struct RecordingNavSink {
         submitted: StdMutex<Vec<ChildNavigationRequest>>,
+        submit_errors: StdMutex<VecDeque<ChildNavigationSubmitError>>,
         cancelled: StdMutex<Vec<String>>,
         cancel_error: StdMutex<Option<String>>,
         next_goal_generation: AtomicU64,
@@ -1772,11 +1829,15 @@ mod tests {
         async fn submit(
             &self,
             request: ChildNavigationRequest,
-        ) -> Result<ChildNavigationTicket, String> {
+        ) -> Result<ChildNavigationTicket, ChildNavigationSubmitError> {
             let submit_release = { self.submit_release.lock().unwrap().clone() };
             if let Some(release) = submit_release {
                 self.submit_entered.notify_one();
                 release.notified().await;
+            }
+            self.submitted.lock().unwrap().push(request.clone());
+            if let Some(error) = self.submit_errors.lock().unwrap().pop_front() {
+                return Err(error);
             }
             let lease = ChildNavigationLease {
                 session_id: request.request_id.clone(),
@@ -1787,7 +1848,6 @@ mod tests {
                 map_revision: request.map_revision,
                 goal_payload_sha256: [7; 32],
             };
-            self.submitted.lock().unwrap().push(request);
             Ok(ChildNavigationTicket { lease })
         }
 
@@ -2033,6 +2093,82 @@ mod tests {
         assert!(after_feedback.child_task_id.is_empty());
         assert_eq!(after_feedback.frontier_count, 0);
         assert!(after_feedback.revision > active.revision);
+    }
+
+    #[tokio::test]
+    async fn retryable_readiness_wait_does_not_consume_navigation_failures() {
+        let (handle, sink) = configured_handle();
+        sink.submit_errors.lock().unwrap().extend((0..10).map(|_| {
+            ChildNavigationSubmitError::RetryableReadiness(
+                "MOTION_SINK_NOT_READY: test navigation chain is recovering".to_string(),
+            )
+        }));
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-readiness", "prefer_wavefront").await;
+
+        for attempt in 0..10 {
+            let waiting = handle.tick((2.0, 2.0)).await;
+            assert_eq!(waiting.status, STATUS_PENDING, "attempt={attempt}");
+            assert!(waiting
+                .message
+                .contains("waiting for child navigation readiness"));
+            assert!(waiting.child_task_id.is_empty());
+            if attempt == 0 {
+                handle
+                    .ingest_costmap_snapshot(frontier_costmap(2))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let active = handle.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        {
+            let submitted = sink.submitted.lock().unwrap();
+            assert_eq!(submitted.len(), 11);
+            assert!(submitted
+                .iter()
+                .all(|request| request.request_id == submitted[0].request_id));
+            assert_eq!(submitted[0].map_revision, 1);
+            assert!(submitted[1..]
+                .iter()
+                .all(|request| request.map_revision == 2));
+        }
+
+        let diagnostics = handle.diagnostics().await;
+        assert!(diagnostics.sources[0].last_error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn permanent_dispatch_rejection_still_applies_goal_failure_policy() {
+        let (handle, sink) = configured_handle();
+        sink.submit_errors
+            .lock()
+            .unwrap()
+            .push_back(ChildNavigationSubmitError::Rejected(
+                "GOAL_BOUNDARY_INVALID: test permanent rejection".to_string(),
+            ));
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-rejected", "prefer_wavefront").await;
+
+        let rejected = handle.tick((2.0, 2.0)).await;
+        assert_eq!(rejected.status, STATUS_PENDING);
+        assert!(rejected
+            .message
+            .contains("child navigation dispatch failed"));
+        assert_eq!(rejected.frontier_count, 0);
+
+        let active = handle.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        let submitted = sink.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 2);
+        assert_ne!(submitted[0].request_id, submitted[1].request_id);
     }
 
     #[tokio::test]

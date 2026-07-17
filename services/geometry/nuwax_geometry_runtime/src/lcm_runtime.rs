@@ -1599,12 +1599,48 @@ impl ExploreNavigationBridge {
     }
 }
 
+fn classify_exploration_submit_rejection(
+    retry_reason: Option<crate::nav_runtime::SetGoalRetryReason>,
+    message: String,
+) -> crate::explore_runtime::ChildNavigationSubmitError {
+    use crate::nav_runtime::{NavigationReadinessCode, SetGoalRetryReason};
+
+    let retryable = match retry_reason {
+        Some(SetGoalRetryReason::MapRevisionMismatch) => true,
+        Some(SetGoalRetryReason::NavigationNotReady(code)) => matches!(
+            code,
+            NavigationReadinessCode::MotionSinkUnobserved
+                | NavigationReadinessCode::MotionSinkStale
+                | NavigationReadinessCode::MotionSinkNotReady
+                | NavigationReadinessCode::StackStateUnobserved
+                | NavigationReadinessCode::StackStateStale
+                | NavigationReadinessCode::TfUnobserved
+                | NavigationReadinessCode::TfStale
+                | NavigationReadinessCode::TfIncomplete
+                | NavigationReadinessCode::PlannerInputUnobserved
+                | NavigationReadinessCode::PlannerInputStale
+                | NavigationReadinessCode::PlannerFrameMismatch
+                | NavigationReadinessCode::CostmapUnavailable
+                | NavigationReadinessCode::PlannerNotReady
+        ),
+        _ => false,
+    };
+    if retryable {
+        crate::explore_runtime::ChildNavigationSubmitError::RetryableReadiness(message)
+    } else {
+        crate::explore_runtime::ChildNavigationSubmitError::Rejected(message)
+    }
+}
+
 #[async_trait]
 impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
     async fn submit(
         &self,
         request: crate::explore_runtime::ChildNavigationRequest,
-    ) -> Result<crate::explore_runtime::ChildNavigationTicket, String> {
+    ) -> Result<
+        crate::explore_runtime::ChildNavigationTicket,
+        crate::explore_runtime::ChildNavigationSubmitError,
+    > {
         let child_request_id = request.request_id.clone();
         let parent_request_id = request.parent_request_id.clone();
         let map_version_id = request.map_version_id.clone();
@@ -1658,14 +1694,16 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
         );
         let message = outcome.state.message.clone();
         let lease = outcome.lease.clone();
+        let retry_reason = outcome.retry_reason;
         self.publish_state(outcome.state, outcome.lease).await;
         if !accepted {
-            return Err(message);
+            return Err(classify_exploration_submit_rejection(retry_reason, message));
         }
-        let lease = lease
-            .as_ref()
-            .map(exploration_child_lease)
-            .ok_or_else(|| "accepted exploration child is missing its goal lease".to_string())?;
+        let lease = lease.as_ref().map(exploration_child_lease).ok_or_else(|| {
+            crate::explore_runtime::ChildNavigationSubmitError::Rejected(
+                "accepted exploration child is missing its goal lease".to_string(),
+            )
+        })?;
         Ok(crate::explore_runtime::ChildNavigationTicket { lease })
     }
 
@@ -5020,6 +5058,42 @@ mod exploration_lcm_smoke_tests {
             map_version_id: "smoke-map-v41".to_string(),
             map_revision,
         }
+    }
+
+    #[test]
+    fn exploration_submit_rejection_classification_is_typed() {
+        use crate::explore_runtime::ChildNavigationSubmitError;
+        use crate::nav_runtime::{NavigationReadinessCode, SetGoalRetryReason};
+
+        assert!(matches!(
+            classify_exploration_submit_rejection(
+                Some(SetGoalRetryReason::NavigationNotReady(
+                    NavigationReadinessCode::MotionSinkNotReady,
+                )),
+                "motion sink unavailable".to_string(),
+            ),
+            ChildNavigationSubmitError::RetryableReadiness(_)
+        ));
+        assert!(matches!(
+            classify_exploration_submit_rejection(
+                Some(SetGoalRetryReason::MapRevisionMismatch),
+                "planner revision is catching up".to_string(),
+            ),
+            ChildNavigationSubmitError::RetryableReadiness(_)
+        ));
+        assert!(matches!(
+            classify_exploration_submit_rejection(None, "invalid boundary".to_string(),),
+            ChildNavigationSubmitError::Rejected(_)
+        ));
+        assert!(matches!(
+            classify_exploration_submit_rejection(
+                Some(SetGoalRetryReason::NavigationNotReady(
+                    NavigationReadinessCode::ProfileUnsupported,
+                )),
+                "unsupported profile".to_string(),
+            ),
+            ChildNavigationSubmitError::Rejected(_)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

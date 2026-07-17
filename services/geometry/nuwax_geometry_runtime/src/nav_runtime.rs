@@ -1674,6 +1674,15 @@ pub struct SetGoalInput {
     pub target: PoseState,
 }
 
+/// Machine-readable reason that allows a navigation admission to be retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetGoalRetryReason {
+    /// A typed navigation readiness blocker rejected admission.
+    NavigationNotReady(NavigationReadinessCode),
+    /// The exploration goal and planner have observed different map revisions.
+    MapRevisionMismatch,
+}
+
 /// `set_goal` 的输出:成功时返回 `NavigationState(ACCEPTED)`,
 /// 失败时返回带 reason 的 `Failed` state。
 pub struct SetGoalOutcome {
@@ -1681,6 +1690,8 @@ pub struct SetGoalOutcome {
     pub state: NavState,
     /// Sealed attempted/acquired lease for lossless response projection.
     pub lease: Option<GoalLease>,
+    /// Retryable admission cause; `None` means accepted or permanently rejected.
+    pub retry_reason: Option<SetGoalRetryReason>,
 }
 
 /// Complete CAS identity required to cancel one goal lease.
@@ -1760,6 +1771,7 @@ pub async fn set_goal_with_boundary(
                 timestamp_ns: now_ns(),
             },
             lease: None,
+            retry_reason: None,
         };
     }
     if input.goal_id.is_empty()
@@ -1784,6 +1796,7 @@ pub async fn set_goal_with_boundary(
                 timestamp_ns: now_ns(),
             },
             lease: None,
+            retry_reason: None,
         };
     }
     // 1. readiness 校验。
@@ -1802,6 +1815,7 @@ pub async fn set_goal_with_boundary(
                 timestamp_ns: now_ns(),
             },
             lease: None,
+            retry_reason: Some(SetGoalRetryReason::NavigationNotReady(detail.reason_code)),
         };
     }
     if input.frame_id != detail.map_frame {
@@ -1820,6 +1834,7 @@ pub async fn set_goal_with_boundary(
                 timestamp_ns: now_ns(),
             },
             lease: None,
+            retry_reason: None,
         };
     }
     if input.map_revision != detail.costmap_revision {
@@ -1835,6 +1850,7 @@ pub async fn set_goal_with_boundary(
                 timestamp_ns: now_ns(),
             },
             lease: None,
+            retry_reason: Some(SetGoalRetryReason::MapRevisionMismatch),
         };
     }
 
@@ -1850,6 +1866,7 @@ pub async fn set_goal_with_boundary(
                     timestamp_ns: now_ns(),
                 },
                 lease: None,
+                retry_reason: None,
             };
         }
     };
@@ -1868,6 +1885,7 @@ pub async fn set_goal_with_boundary(
                 timestamp_ns: now_ns(),
             },
             lease: None,
+            retry_reason: None,
         };
     }
     let stamp_sec = match i32::try_from(input.target.timestamp_ns / 1_000_000_000) {
@@ -1882,6 +1900,7 @@ pub async fn set_goal_with_boundary(
                     timestamp_ns: now_ns(),
                 },
                 lease: None,
+                retry_reason: None,
             };
         }
     };
@@ -1929,6 +1948,7 @@ pub async fn set_goal_with_boundary(
                 timestamp_ns: now_ns(),
             },
             lease: None,
+            retry_reason: None,
         };
     }
     let lease = GoalLease {
@@ -1961,6 +1981,7 @@ pub async fn set_goal_with_boundary(
                         timestamp_ns: now_ns(),
                     },
                     lease: Some(active.lease.clone()),
+                    retry_reason: None,
                 };
             }
             return SetGoalOutcome {
@@ -1978,6 +1999,7 @@ pub async fn set_goal_with_boundary(
                     timestamp_ns: now_ns(),
                 },
                 lease: Some(lease),
+                retry_reason: None,
             };
         }
         if goal_generation <= slot.last_goal_generation {
@@ -1993,6 +2015,7 @@ pub async fn set_goal_with_boundary(
                     timestamp_ns: now_ns(),
                 },
                 lease: Some(lease),
+                retry_reason: None,
             };
         }
         let Ok(mut cancel) = state.cancel.lock() else {
@@ -2005,6 +2028,7 @@ pub async fn set_goal_with_boundary(
                     timestamp_ns: now_ns(),
                 },
                 lease: Some(lease),
+                retry_reason: None,
             };
         };
         slot.last_goal_generation = goal_generation;
@@ -2040,6 +2064,7 @@ pub async fn set_goal_with_boundary(
                         timestamp_ns: now_ns(),
                     },
                     lease: Some(lease),
+                    retry_reason: None,
                 };
             };
             if cancel.lease.as_ref() == Some(&lease) {
@@ -2058,6 +2083,7 @@ pub async fn set_goal_with_boundary(
                 timestamp_ns: now_ns(),
             },
             lease: Some(lease),
+            retry_reason: None,
         };
     }
 
@@ -2070,6 +2096,7 @@ pub async fn set_goal_with_boundary(
             timestamp_ns: now_ns(),
         },
         lease: Some(lease),
+        retry_reason: None,
     }
 }
 
@@ -2859,6 +2886,10 @@ mod tests {
         let outcome = set_goal(&handle, &state, input).await;
         assert_eq!(outcome.state.status, "FAILED");
         assert!(outcome.state.message.contains("SET_GOAL_REJECTED"));
+        assert!(matches!(
+            outcome.retry_reason,
+            Some(SetGoalRetryReason::NavigationNotReady(_))
+        ));
     }
 
     #[tokio::test]
@@ -4369,6 +4400,7 @@ mod tests {
 
         assert_eq!(outcome.state.status, "FAILED");
         assert!(outcome.state.message.contains("GOAL_FRAME_MISMATCH"));
+        assert_eq!(outcome.retry_reason, None);
         assert!(state.inner.read().await.goal.is_none());
     }
 

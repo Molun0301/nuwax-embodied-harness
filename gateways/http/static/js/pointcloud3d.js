@@ -93,7 +93,7 @@ class PointCloud3DViewer {
     this._renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'low-power' });
     this._renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     this._renderer.setSize(w, h);
-    this._renderer.domElement.setAttribute('aria-label', '3D 点云地图，可点击物品查看详情');
+    this._renderer.domElement.setAttribute('aria-label', '3D 点云地图，可旋转、三轴平移、缩放并点击物品查看详情');
     this._renderer.domElement.setAttribute('tabindex', '0');
     this._container.appendChild(this._renderer.domElement);
 
@@ -157,7 +157,7 @@ class PointCloud3DViewer {
     this._controls.enableRotate = true;
     this._controls.enablePan = this._cameraMode === 'free';
     this._controls.enableZoom = true;
-    this._controls.screenSpacePanning = false;
+    this._controls.screenSpacePanning = true;
     this._controls.minDistance = CAMERA_MIN_DISTANCE;
     this._controls.maxDistance = CAMERA_MAX_DISTANCE;
     this._controls.minPolarAngle = 0.04;

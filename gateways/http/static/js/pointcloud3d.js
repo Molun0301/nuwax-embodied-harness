@@ -20,6 +20,8 @@ const CAMERA_MIN_DISTANCE = 1.5;
 const CAMERA_MAX_DISTANCE = 180;
 const FOLLOW_TARGET_HEIGHT = 0.25;
 const DEFAULT_CAMERA_DIRECTION = new THREE.Vector3(0, -1, 0.72).normalize();
+const SEMANTIC_HIDE_ZOOM_PERCENT = 35;
+const SEMANTIC_PICK_CLUSTER_PX = 28;
 
 class PointCloud3DViewer {
   constructor() {
@@ -91,7 +93,8 @@ class PointCloud3DViewer {
     this._renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'low-power' });
     this._renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     this._renderer.setSize(w, h);
-    this._renderer.domElement.setAttribute('aria-label', '3D 点云地图');
+    this._renderer.domElement.setAttribute('aria-label', '3D 点云地图，可点击物品查看详情');
+    this._renderer.domElement.setAttribute('tabindex', '0');
     this._container.appendChild(this._renderer.domElement);
 
     this._scene = new THREE.Scene();
@@ -107,7 +110,7 @@ class PointCloud3DViewer {
     this._semanticGroup = new THREE.Group();
     this._semanticGroup.visible = this._semanticInstancesVisible;
     this._scene.add(this._semanticGroup);
-    this._semanticMarkerGeometry = new THREE.OctahedronGeometry(0.16, 0);
+    this._semanticMarkerGeometry = new THREE.BoxGeometry(0.44, 0.28, 0.24);
     this._semanticPreciseMaterial = new THREE.MeshBasicMaterial({ color: COLORS.semantic });
     this._semanticFallbackMaterial = new THREE.MeshBasicMaterial({
       color: COLORS.semanticFallback,
@@ -115,6 +118,36 @@ class PointCloud3DViewer {
       opacity: 0.62,
       wireframe: true,
     });
+    this._setupSemanticInteraction();
+  }
+
+  _setupSemanticInteraction() {
+    const canvas = this._renderer?.domElement;
+    if (!canvas?.addEventListener) return;
+    this._semanticPointerDownHandler = (event) => {
+      if (event.isPrimary === false || (event.button ?? 0) !== 0) return;
+      this._semanticPointerDown = {
+        pointerId: event.pointerId,
+        x: Number(event.clientX),
+        y: Number(event.clientY),
+      };
+    };
+    this._semanticPointerUpHandler = (event) => {
+      const start = this._semanticPointerDown;
+      this._semanticPointerDown = null;
+      if (!start || event.isPrimary === false || (event.button ?? 0) !== 0) return;
+      if (start.pointerId !== undefined && event.pointerId !== undefined && start.pointerId !== event.pointerId) return;
+      const x = Number(event.clientX);
+      const y = Number(event.clientY);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || Math.hypot(x - start.x, y - start.y) > 6) return;
+      this._emitSemanticSelectionAtClientPoint(x, y);
+    };
+    this._semanticPointerCancelHandler = () => {
+      this._semanticPointerDown = null;
+    };
+    canvas.addEventListener('pointerdown', this._semanticPointerDownHandler);
+    canvas.addEventListener('pointerup', this._semanticPointerUpHandler);
+    canvas.addEventListener('pointercancel', this._semanticPointerCancelHandler);
   }
 
   _setupControls() {
@@ -201,6 +234,7 @@ class PointCloud3DViewer {
     this._needsRender = false;
     const controlsChanged = Boolean(this._controls?.update());
     this._removeLegacySceneHelpers();
+    this._syncSemanticGroupVisibility();
     this._renderer.render(this._scene, this._camera);
     if (this._interactionActive || controlsChanged) {
       this._requestRender();
@@ -648,6 +682,75 @@ class PointCloud3DViewer {
     this._semanticOwnedResources = [];
   }
 
+  _syncSemanticGroupVisibility(distance = this._cameraDistance()) {
+    const zoomPercent = this._zoomPercent(distance);
+    this._semanticZoomHidden = Number.isFinite(zoomPercent) && zoomPercent < SEMANTIC_HIDE_ZOOM_PERCENT;
+    const visible = Boolean(this._semanticInstancesVisible) && !this._semanticZoomHidden;
+    if (this._semanticGroup) this._semanticGroup.visible = visible;
+    return visible;
+  }
+
+  _semanticInstancesAtClientPoint(clientX, clientY) {
+    const canvas = this._renderer?.domElement;
+    if (!this._semanticGroup?.visible || !this._camera || !canvas?.getBoundingClientRect) return [];
+    const rect = canvas.getBoundingClientRect();
+    const width = Number(rect.width);
+    const height = Number(rect.height);
+    const x = Number(clientX);
+    const y = Number(clientY);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return [];
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return [];
+
+    this._semanticRaycaster ||= new THREE.Raycaster();
+    this._semanticPointer ||= new THREE.Vector2();
+    this._semanticPointer.set(
+      ((x - rect.left) / width) * 2 - 1,
+      -((y - rect.top) / height) * 2 + 1,
+    );
+    this._scene?.updateMatrixWorld(true);
+    this._camera.updateMatrixWorld(true);
+    this._semanticRaycaster.setFromCamera(this._semanticPointer, this._camera);
+    const selectables = [];
+    this._semanticGroup.traverse((object) => {
+      if (object.userData?.semanticSelectable && object.userData.semanticInstance) selectables.push(object);
+    });
+    const intersections = this._semanticRaycaster.intersectObjects(selectables, false);
+    if (!intersections.length) return [];
+
+    const primary = intersections[0].object.userData.semanticInstance;
+    const primaryObject = this._semanticGroup.children.find((object) => (
+      object.userData?.semanticMarker && object.userData.semanticInstance === primary
+    )) || intersections[0].object;
+    const projectedPrimary = primaryObject.getWorldPosition(new THREE.Vector3()).project(this._camera);
+    const primaryX = rect.left + (projectedPrimary.x + 1) * width / 2;
+    const primaryY = rect.top + (1 - projectedPrimary.y) * height / 2;
+    const instances = [primary];
+    const seen = new Set([primary.instance_id || primary]);
+    for (const marker of this._semanticGroup.children) {
+      const instance = marker.userData?.semanticMarker ? marker.userData.semanticInstance : null;
+      if (!instance) continue;
+      const key = instance.instance_id || instance;
+      if (seen.has(key)) continue;
+      const projected = marker.getWorldPosition(new THREE.Vector3()).project(this._camera);
+      if (projected.z < -1 || projected.z > 1) continue;
+      const screenX = rect.left + (projected.x + 1) * width / 2;
+      const screenY = rect.top + (1 - projected.y) * height / 2;
+      if (Math.hypot(screenX - primaryX, screenY - primaryY) > SEMANTIC_PICK_CLUSTER_PX) continue;
+      seen.add(key);
+      instances.push(instance);
+    }
+    return instances;
+  }
+
+  _emitSemanticSelectionAtClientPoint(clientX, clientY) {
+    const instances = this._semanticInstancesAtClientPoint(clientX, clientY);
+    if (!instances.length) return false;
+    window.dispatchEvent(new CustomEvent('pointcloud3d:semantic-select', {
+      detail: { instance: instances[0], instances, source: '3d' },
+    }));
+    return true;
+  }
+
   _drawRoundedRect(ctx, x, y, width, height, radius) {
     const r = Math.min(radius, width / 2, height / 2);
     ctx.beginPath();
@@ -704,7 +807,7 @@ class PointCloud3DViewer {
   _rebuildSemanticInstances() {
     if (!this._semanticGroup) return;
     this._clearSemanticInstances();
-    this._semanticGroup.visible = this._semanticInstancesVisible;
+    this._syncSemanticGroupVisibility();
     for (const instance of this._semanticInstances) {
       const pose = instance?.pose;
       const x = Number(pose?.x);
@@ -719,6 +822,8 @@ class PointCloud3DViewer {
       );
       marker.position.set(x, y, z + 0.16);
       marker.userData.semanticInstance = instance;
+      marker.userData.semanticMarker = true;
+      marker.userData.semanticSelectable = true;
       this._semanticGroup.add(marker);
 
       if (z > 0.05) {
@@ -739,6 +844,8 @@ class PointCloud3DViewer {
       const label = this._createSemanticLabelSprite(instance, fallback, z);
       if (label) {
         label.position.set(x, y, z + 0.48);
+        label.userData.semanticInstance = instance;
+        label.userData.semanticSelectable = true;
         this._semanticGroup.add(label);
       }
     }
@@ -752,7 +859,7 @@ class PointCloud3DViewer {
 
   setSemanticInstancesVisible(visible) {
     this._semanticInstancesVisible = Boolean(visible);
-    if (this._semanticGroup) this._semanticGroup.visible = this._semanticInstancesVisible;
+    this._syncSemanticGroupVisibility();
     this._requestRender();
   }
 
@@ -858,6 +965,10 @@ class PointCloud3DViewer {
 
   dispose() {
     if (this._rafId) cancelAnimationFrame(this._rafId);
+    const canvas = this._renderer?.domElement;
+    canvas?.removeEventListener?.('pointerdown', this._semanticPointerDownHandler);
+    canvas?.removeEventListener?.('pointerup', this._semanticPointerUpHandler);
+    canvas?.removeEventListener?.('pointercancel', this._semanticPointerCancelHandler);
     this._resizeObserver?.disconnect();
     this._resizeObserver = null;
     this._disposePointsMesh();
@@ -883,7 +994,6 @@ class PointCloud3DViewer {
     }
     this._controls?.dispose();
     this._renderer?.dispose();
-    const canvas = this._renderer?.domElement;
     if (canvas?.parentNode) canvas.parentNode.removeChild(canvas);
     this._scene?.clear();
     this._renderer = null;
@@ -896,6 +1006,13 @@ class PointCloud3DViewer {
     this._trajectoryLine = null;
     this._navPathLine = null;
     this._navGoalMesh = null;
+    this._semanticPointerDown = null;
+    this._semanticPointerDownHandler = null;
+    this._semanticPointerUpHandler = null;
+    this._semanticPointerCancelHandler = null;
+    this._semanticRaycaster = null;
+    this._semanticPointer = null;
+    this._semanticZoomHidden = false;
     this._rafId = null;
     this._hasFramedPointCloud = false;
     this._hasUserCameraInput = false;

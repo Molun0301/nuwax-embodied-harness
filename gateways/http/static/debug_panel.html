@@ -491,7 +491,7 @@ button{font-family:inherit;cursor:pointer}
                     <button id="map3dCenterRobot" class="tool" type="button" title="将 3D 视角定位到机器狗" disabled>定位机器狗</button>
                   </div>
                   <div id="mapLayerControls" class="map-tool-group glass" aria-label="地图图层">
-                    <label class="map-layer-toggle" title="在 2D 与 3D 地图显示当前记忆库物品">
+                    <label class="map-layer-toggle" title="在 2D 与 3D 地图显示当前记忆库物品；3D 远距缩小时自动隐藏">
                       <input id="showSemanticInstances" type="checkbox" checked>
                       <span class="sw" style="background:#f59e0b"></span>物品
                     </label>
@@ -3150,6 +3150,52 @@ button{font-family:inherit;cursor:pointer}
         return fid !== "" && fid !== "map";
       }
       const CLUSTER_PX_THRESHOLD = 28;
+      const SEMANTIC_MARKER_HEIGHT = 24;
+      const SEMANTIC_MARKER_MIN_WIDTH = 40;
+      const SEMANTIC_MARKER_MAX_WIDTH = 168;
+      const SEMANTIC_MARKER_PADDING_X = 10;
+      function semanticInstanceName(inst) {
+        return String(inst && (inst.display_name || inst.label || inst.instance_id) || "?").trim() || "?";
+      }
+      function fitSemanticMarkerLabel(ctx, label, maxWidth) {
+        if (ctx.measureText(label).width <= maxWidth) return label;
+        const characters = Array.from(label);
+        let fitted = "";
+        for (const character of characters) {
+          if (ctx.measureText(`${fitted}${character}…`).width > maxWidth) break;
+          fitted += character;
+        }
+        return fitted ? `${fitted}…` : "…";
+      }
+      function semanticMarkerMetrics(ctx, inst, highlighted) {
+        const height = highlighted ? SEMANTIC_MARKER_HEIGHT + 2 : SEMANTIC_MARKER_HEIGHT;
+        const font = highlighted ? "700 11px sans-serif" : "600 11px sans-serif";
+        ctx.font = font;
+        const maxTextWidth = SEMANTIC_MARKER_MAX_WIDTH - SEMANTIC_MARKER_PADDING_X * 2;
+        const label = fitSemanticMarkerLabel(ctx, semanticInstanceName(inst), maxTextWidth);
+        const width = Math.max(
+          SEMANTIC_MARKER_MIN_WIDTH,
+          Math.min(SEMANTIC_MARKER_MAX_WIDTH, Math.ceil(ctx.measureText(label).width) + SEMANTIC_MARKER_PADDING_X * 2),
+        );
+        return { width, height, radius: 4, label, font };
+      }
+      function semanticClusterMarkerMetrics(ctx, count, highlighted) {
+        return semanticMarkerMetrics(ctx, { display_name: `${count} 个物品` }, highlighted);
+      }
+      function drawCanvasRoundedRectPath(ctx, x, y, width, height, radius) {
+        const r = Math.min(radius, width / 2, height / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.lineTo(x + width - r, y);
+        ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+        ctx.lineTo(x + width, y + height - r);
+        ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+        ctx.lineTo(x + r, y + height);
+        ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+        ctx.lineTo(x, y + r);
+        ctx.quadraticCurveTo(x, y, x + r, y);
+        ctx.closePath();
+      }
       function clusterInstances(instances, anchor, scale) {
         // 视口裁剪：只处理可见区域 + margin
         const canvas = els.mapCanvas;
@@ -3304,16 +3350,17 @@ button{font-family:inherit;cursor:pointer}
         ctx.restore();
       }
       function drawSingleMarker(ctx, x, y, inst, fallback, unknownFrame, highlighted) {
-        const r = highlighted ? 10 : 8;
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
+        const marker = semanticMarkerMetrics(ctx, inst, highlighted);
+        const left = x - marker.width / 2;
+        const top = y - marker.height / 2;
+        drawCanvasRoundedRectPath(ctx, left, top, marker.width, marker.height, marker.radius);
         if (fallback || unknownFrame) {
           ctx.setLineDash([4, 3]);
           ctx.strokeStyle = highlighted ? "#fbbf24" : "#9ca3af";
           ctx.lineWidth = 1.8;
           ctx.stroke();
           ctx.setLineDash([]);
-          ctx.fillStyle = "rgba(156,163,175,0.18)";
+          ctx.fillStyle = "rgba(51,65,85,0.9)";
           ctx.fill();
         } else {
           ctx.fillStyle = highlighted ? "#fbbf24" : "#f59e0b";
@@ -3326,76 +3373,78 @@ button{font-family:inherit;cursor:pointer}
           ctx.strokeStyle = "#fbbf24";
           ctx.lineWidth = 2;
           ctx.setLineDash([]);
-          ctx.beginPath();
-          ctx.arc(x, y, r + 6, 0, Math.PI * 2);
+          drawCanvasRoundedRectPath(ctx, left - 5, top - 5, marker.width + 10, marker.height + 10, marker.radius + 2);
           ctx.stroke();
         }
-        const label = String(inst.display_name || inst.label || "?");
-        const tag = label.length > 6 ? label.slice(0, 5) + "…" : label;
-        ctx.font = "10px sans-serif";
-        ctx.fillStyle = fallback || unknownFrame ? "#9ca3af" : "#fff";
+        ctx.font = marker.font;
+        ctx.fillStyle = fallback || unknownFrame ? "#f8fafc" : "#111827";
         ctx.textAlign = "center";
-        ctx.fillText(tag, x, y - r - 3);
-        if (fallback) {
+        ctx.textBaseline = "middle";
+        ctx.fillText(marker.label, x, y + 0.5);
+        ctx.textBaseline = "alphabetic";
+        if (unknownFrame) {
           ctx.font = "9px sans-serif";
           ctx.fillStyle = "#6b7280";
-          ctx.fillText("粗略", x, y + r + 11);
-        } else if (unknownFrame) {
+          ctx.fillText("坐标系未知", x, top + marker.height + 11);
+        } else if (fallback) {
           ctx.font = "9px sans-serif";
           ctx.fillStyle = "#6b7280";
-          ctx.fillText("坐标系未知", x, y + r + 11);
+          ctx.fillText("粗略", x, top + marker.height + 11);
         }
       }
       function drawClusterMarker(ctx, x, y, cl, allFallback, fallbackCount, highlighted) {
-        const r = highlighted ? 14 : 12;
+        const marker = semanticClusterMarkerMetrics(ctx, cl.members.length, highlighted);
+        const left = x - marker.width / 2;
+        const top = y - marker.height / 2;
         const preciseCount = cl.members.length - fallbackCount;
         if (allFallback) {
           ctx.setLineDash([4, 3]);
           ctx.strokeStyle = highlighted ? "#fbbf24" : "#9ca3af";
           ctx.lineWidth = 2;
-          ctx.fillStyle = "rgba(156,163,175,0.18)";
+          ctx.fillStyle = "rgba(51,65,85,0.9)";
         } else {
           ctx.setLineDash([]);
-          ctx.fillStyle = highlighted ? "rgba(251,191,36,0.25)" : "rgba(245,158,11,0.22)";
+          ctx.fillStyle = highlighted ? "#fbbf24" : "#f59e0b";
           ctx.strokeStyle = highlighted ? "#fbbf24" : "#f59e0b";
           ctx.lineWidth = highlighted ? 2.5 : 2;
         }
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
+        drawCanvasRoundedRectPath(ctx, left, top, marker.width, marker.height, marker.radius);
         ctx.fill();
         ctx.stroke();
         ctx.setLineDash([]);
         if (!allFallback && fallbackCount > 0) {
-          // 分段环：精确占比 arc
           const ratio = preciseCount / cl.members.length;
+          const barY = top + marker.height + 4;
+          ctx.lineCap = "butt";
           ctx.beginPath();
           ctx.strokeStyle = "#f59e0b";
           ctx.lineWidth = 3;
-          ctx.arc(x, y, r + 3, -Math.PI / 2, -Math.PI / 2 + ratio * Math.PI * 2);
+          ctx.moveTo(left, barY);
+          ctx.lineTo(left + marker.width * ratio, barY);
           ctx.stroke();
           ctx.beginPath();
           ctx.strokeStyle = "#6b7280";
           ctx.lineWidth = 3;
-          ctx.arc(x, y, r + 3, -Math.PI / 2 + ratio * Math.PI * 2, -Math.PI / 2 + Math.PI * 2);
+          ctx.moveTo(left + marker.width * ratio, barY);
+          ctx.lineTo(left + marker.width, barY);
           ctx.stroke();
         }
         if (highlighted) {
           ctx.strokeStyle = "#fbbf24";
           ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(x, y, r + (allFallback ? 6 : 9), 0, Math.PI * 2);
+          drawCanvasRoundedRectPath(ctx, left - 5, top - 5, marker.width + 10, marker.height + 10, marker.radius + 2);
           ctx.stroke();
         }
-        ctx.font = "bold 11px sans-serif";
-        ctx.fillStyle = allFallback ? "#9ca3af" : (highlighted ? "#fbbf24" : "#fff");
+        ctx.font = marker.font;
+        ctx.fillStyle = allFallback ? "#f8fafc" : "#111827";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillText(String(cl.members.length), x, y);
+        ctx.fillText(marker.label, x, y + 0.5);
         ctx.textBaseline = "alphabetic";
         if (allFallback) {
           ctx.font = "9px sans-serif";
           ctx.fillStyle = "#6b7280";
-          ctx.fillText("粗略", x, y + r + 11);
+          ctx.fillText("粗略", x, top + marker.height + 11);
         }
       }
       function detectAndStartClusterAnim(newClusters, now) {
@@ -3433,18 +3482,27 @@ button{font-family:inherit;cursor:pointer}
         const anchor = cameraAnchor();
         const scale = cameraScale(anchor);
         const clusters = clusterInstances(state.semanticInstances, anchor, scale);
-        let bestDist = 20;
+        const highlightedKey = resolveHighlightCluster(clusters);
+        const ctx = els.mapCanvas.getContext("2d");
+        let bestDist = Number.POSITIVE_INFINITY;
         let bestHit = null;
+        ctx.save();
         for (const cl of clusters) {
+          const highlighted = cl.key === highlightedKey;
+          const marker = cl.members.length === 1
+            ? semanticMarkerMetrics(ctx, cl.members[0], highlighted)
+            : semanticClusterMarkerMetrics(ctx, cl.members.length, highlighted);
+          const withinX = Math.abs(px - cl.cx) <= marker.width / 2 + 4;
+          const withinY = Math.abs(py - cl.cy) <= marker.height / 2 + 4;
           const dist = Math.sqrt((px - cl.cx) ** 2 + (py - cl.cy) ** 2);
-          const r = cl.members.length === 1 ? 10 : 14;
-          if (dist <= r + 4 && dist < bestDist) {
+          if (withinX && withinY && dist < bestDist) {
             bestDist = dist;
             bestHit = cl.members.length === 1
               ? { type: "single", instance: cl.members[0] }
               : { type: "cluster", cluster: cl };
           }
         }
+        ctx.restore();
         return bestHit;
       }
       function closeSemanticOverlay() {
@@ -5627,6 +5685,15 @@ button{font-family:inherit;cursor:pointer}
         state.pointcloud3dReady = true;
         window.pointcloud3d?.setCameraMode(state.pointcloud3dCameraMode);
         syncPointcloud3dState();
+      });
+      window.addEventListener("pointcloud3d:semantic-select", (event) => {
+        const detail = event.detail || {};
+        const instances = Array.isArray(detail.instances)
+          ? detail.instances
+          : detail.instance ? [detail.instance] : [];
+        if (!instances.length) return;
+        if (instances.length > 1) showSemanticClusterList({ members: instances });
+        else showSemanticInstanceDetail(instances[0]);
       });
       window.addEventListener("pointcloud3d:camera-state", (event) => {
         updatePointcloud3dCameraControls(event.detail || {});

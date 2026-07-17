@@ -1066,12 +1066,18 @@ fn canonical_mapping_observation(
             source_frame, odom_frame
         ));
     }
-    let (odom_quaternion, _) = normalized_quaternion_and_yaw(odom_pose)?;
+    let (odom_quaternion, odom_yaw) = normalized_quaternion_and_yaw(odom_pose)?;
     let stamp_sec = i32::try_from(odom_pose.timestamp_ns / 1_000_000_000)
         .map_err(|_| "odometry timestamp seconds exceed int32".to_string())?;
     let stamp_nsec = (odom_pose.timestamp_ns % 1_000_000_000) as i32;
     let map_odom_quaternion = yaw_quaternion(transform.yaw_radians);
-    let map_pose_quaternion = yaw_quaternion(transform.latest_map_pose.yaw_radians);
+    let (sin_yaw, cos_yaw) = transform.yaw_radians.sin_cos();
+    let map_pose_position = [
+        cos_yaw * odom_pose.x - sin_yaw * odom_pose.y + transform.translation[0],
+        sin_yaw * odom_pose.x + cos_yaw * odom_pose.y + transform.translation[1],
+        odom_pose.z + transform.translation[2],
+    ];
+    let map_pose_quaternion = yaw_quaternion(transform.yaw_radians + odom_yaw);
     let transforms = [
         TransformEntry {
             parent: map_frame.clone(),
@@ -1127,9 +1133,9 @@ fn canonical_mapping_observation(
     .map_err(|error| format!("canonical TF encode failed: {error}"))?;
     Ok(CanonicalMappingObservation {
         map_pose: PoseState {
-            x: transform.latest_map_pose.position[0],
-            y: transform.latest_map_pose.position[1],
-            z: transform.latest_map_pose.position[2],
+            x: map_pose_position[0],
+            y: map_pose_position[1],
+            z: map_pose_position[2],
             qx: map_pose_quaternion[0],
             qy: map_pose_quaternion[1],
             qz: map_pose_quaternion[2],
@@ -1140,6 +1146,35 @@ fn canonical_mapping_observation(
         transforms,
         tf_payload,
     })
+}
+
+fn canonical_mapping_observation_for_odom(
+    mapping: &parking_lot::Mutex<MappingAdapter>,
+    transform_cache: &parking_lot::RwLock<Option<crate::mapping_adapter::MapOdomTransformSnapshot>>,
+    odom_pose: &PoseState,
+    base_frame: &str,
+) -> Result<CanonicalMappingObservation, String> {
+    let (_, yaw_radians) = normalized_quaternion_and_yaw(odom_pose)?;
+    let transform = if let Some(mut adapter) = mapping.try_lock() {
+        adapter
+            .feed_pose_in_frame(
+                odom_pose.x,
+                odom_pose.y,
+                odom_pose.z,
+                yaw_radians,
+                &odom_pose.frame_id,
+            )
+            .map_err(|error| error.to_string())?;
+        adapter
+            .map_odom_transform_snapshot()
+            .ok_or_else(|| "odom pose did not establish T_map_odom".to_string())?
+    } else {
+        transform_cache
+            .read()
+            .clone()
+            .ok_or_else(|| "mapping adapter busy before T_map_odom was established".to_string())?
+    };
+    canonical_mapping_observation(&transform, odom_pose, base_frame)
 }
 
 async fn apply_canonical_mapping_observation(
@@ -3035,8 +3070,9 @@ fn update_mapping_cloud_map_if_current(
 /// - `/go2/lidar/points` payload 走 `parse_pointcloud_payload` → 转 Point3 →
 ///   `feed_pointcloud_session` + 增量 cloud-map voxel + `build_and_publish`
 ///
-/// feed 路径持 parking_lot Mutex(同步,不跨 await);canonical pose/TF 在解锁后
-/// 写入 SharedState 并发布，`/pose_stamped` 不再具有全局位姿写权限。
+/// 点云 feed 仍持 parking_lot Mutex；里程计在锁繁忙时使用同会话的只读
+/// map<-odom 缓存继续发布 canonical pose/TF，避免栅格重建阻塞导航位姿心跳。
+/// `/pose_stamped` 不再具有全局位姿写权限。
 fn spawn_mapping_feed_tasks(
     transport: LcmTransport,
     state: Arc<RwLock<SharedState>>,
@@ -3056,6 +3092,7 @@ fn spawn_mapping_feed_tasks(
     if let Some((odom_topic, odom_msg_type)) = odom_binding {
         let transport_odom = transport.clone();
         let mapping_odom = mapping_arc.clone();
+        let transform_cache = mapping_odom.lock().map_odom_transform_cache();
         let state_odom = state.clone();
         let (tf_topic, tf_msg_type) = tf_binding;
         tokio::spawn(async move {
@@ -3074,31 +3111,12 @@ fn spawn_mapping_feed_tasks(
                     warn!("mapping_feed /odom payload decode failed");
                     continue;
                 };
-                let (_, yaw_radians) = match normalized_quaternion_and_yaw(&pose) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        warn!(%error, "mapping_feed /odom quaternion rejected");
-                        continue;
-                    }
-                };
-                let observation = {
-                    let mut adapter = mapping_odom.lock();
-                    match adapter.feed_pose_in_frame(
-                        pose.x,
-                        pose.y,
-                        pose.z,
-                        yaw_radians,
-                        &pose.frame_id,
-                    ) {
-                        Ok(_) => adapter
-                            .map_odom_transform_snapshot()
-                            .ok_or_else(|| "odom pose did not establish T_map_odom".to_string())
-                            .and_then(|transform| {
-                                canonical_mapping_observation(&transform, &pose, &base_frame)
-                            }),
-                        Err(error) => Err(error.to_string()),
-                    }
-                };
+                let observation = canonical_mapping_observation_for_odom(
+                    mapping_odom.as_ref(),
+                    transform_cache.as_ref(),
+                    &pose,
+                    &base_frame,
+                );
                 let observation = match observation {
                     Ok(observation) => observation,
                     Err(error) => {
@@ -3627,9 +3645,6 @@ mod mapping_feed_tests {
         adapter
             .feed_pose_in_frame(2.0, 3.0, 0.0, std::f64::consts::FRAC_PI_2, "odom")
             .expect("anchor");
-        adapter
-            .feed_pose_in_frame(2.0, 4.0, 0.0, std::f64::consts::FRAC_PI_2, "odom")
-            .expect("latest pose");
         let pose = PoseState {
             x: 2.0,
             y: 4.0,
@@ -3667,6 +3682,46 @@ mod mapping_feed_tests {
             ("odom", "base_link")
         );
         assert!(decoded
+            .iter()
+            .all(|entry| entry.stamp_ns == pose.timestamp_ns));
+    }
+
+    #[test]
+    fn canonical_tf_uses_cached_anchor_while_mapping_lock_is_busy() {
+        let mapping = shared_active_mapping_adapter();
+        let transform_cache = {
+            let mut adapter = mapping.lock();
+            adapter
+                .feed_pose_in_frame(2.0, 3.0, 0.0, std::f64::consts::FRAC_PI_2, "odom")
+                .expect("anchor");
+            adapter.map_odom_transform_cache()
+        };
+        let pose = PoseState {
+            x: 2.0,
+            y: 4.0,
+            z: 0.0,
+            qz: std::f64::consts::FRAC_PI_4.sin(),
+            qw: std::f64::consts::FRAC_PI_4.cos(),
+            frame_id: "odom".to_string(),
+            timestamp_ns: 12_345_678_902,
+            ..PoseState::default()
+        };
+
+        let adapter_guard = mapping.lock();
+        let observation = canonical_mapping_observation_for_odom(
+            mapping.as_ref(),
+            transform_cache.as_ref(),
+            &pose,
+            "base_link",
+        )
+        .expect("cached canonical observation");
+
+        assert_eq!(adapter_guard.odom_count(), 1);
+        assert!((observation.map_pose.x - 1.0).abs() < 1e-9);
+        assert!(observation.map_pose.y.abs() < 1e-9);
+        assert_eq!(observation.map_pose.timestamp_ns, pose.timestamp_ns);
+        assert!(observation
+            .transforms
             .iter()
             .all(|entry| entry.stamp_ns == pose.timestamp_ns));
     }

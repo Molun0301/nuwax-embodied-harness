@@ -76,6 +76,8 @@ _TOGGLE_SPORT_METHODS = {
     pb.SPORT_ACTION_CLASSIC_WALK: "ClassicWalk",
 }
 
+_ROBOT_NOT_STANDING_MESSAGE = "当前已进入阻尼状态或已趴下,请恢复到站立姿态"
+
 
 def _prepend_sdk_path(path_value: str) -> Path:
     path = Path(path_value).expanduser().resolve()
@@ -140,6 +142,12 @@ def _require_success(code: object, operation: str) -> None:
             "ACTUATOR_COMMAND_FAILED",
             f"{operation} returned non-success code {code!r}",
         )
+
+
+def _require_zero_success(code: object, operation: str) -> None:
+    if code == -1:
+        raise ActuatorError("ACTUATOR_COMMAND_FAILED", _ROBOT_NOT_STANDING_MESSAGE)
+    _require_success(code, operation)
 
 
 class Go2Actuator:
@@ -363,7 +371,7 @@ class Go2Actuator:
     def zero(self) -> None:
         errors: List[str] = []
         try:
-            _require_success(
+            _require_zero_success(
                 self._emergency_obstacle.Move(0.0, 0.0, 0.0),
                 "EmergencyObstaclesAvoidClient.Move(zero)",
             )
@@ -371,7 +379,7 @@ class Go2Actuator:
             errors.append(str(exc))
         if self._obstacle_remote_enabled:
             try:
-                _require_success(
+                _require_zero_success(
                     self._emergency_obstacle.UseRemoteCommandFromApi(False),
                     "EmergencyObstaclesAvoidClient.UseRemoteCommandFromApi(false)",
                 )
@@ -379,14 +387,14 @@ class Go2Actuator:
             except Exception as exc:
                 errors.append(str(exc))
         try:
-            _require_success(
+            _require_zero_success(
                 self._emergency_sport.Move(0.0, 0.0, 0.0),
                 "EmergencySportClient.Move(zero)",
             )
         except Exception as exc:
             errors.append(str(exc))
         try:
-            _require_success(
+            _require_zero_success(
                 self._emergency_sport.StopMove(),
                 "EmergencySportClient.StopMove",
             )
@@ -399,11 +407,11 @@ class Go2Actuator:
                     result = stop_motion()
                 else:
                     result = self._low_level_controller.stop()
-                _require_success(result, "LowLevelController.stop")
+                _require_zero_success(result, "LowLevelController.stop")
             except Exception as exc:
                 errors.append(str(exc))
         if errors:
-            raise ActuatorError("ZERO_FAILED", "; ".join(errors))
+            raise ActuatorError("ZERO_FAILED", "; ".join(dict.fromkeys(errors)))
 
     def switch_mode(self, command: pb.ModeSwitchCommand) -> int:
         target = command.target_mode

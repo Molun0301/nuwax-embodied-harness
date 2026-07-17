@@ -371,7 +371,7 @@ pub struct ExploreRuntimeInner {
     pending_child_cancellation: Option<PendingChildCancellation>,
     generation: u64,
     child_sequence: u64,
-    dispatched_goals: u32,
+    reached_goals: u32,
     started_at_ns: u64,
     no_frontier_since_ns: Option<u64>,
     frontiers: Vec<FrontierGoal>,
@@ -399,7 +399,7 @@ impl ExploreRuntimeInner {
             pending_child_cancellation: None,
             generation: 0,
             child_sequence: 0,
-            dispatched_goals: 0,
+            reached_goals: 0,
             started_at_ns: 0,
             no_frontier_since_ns: None,
             frontiers: Vec::new(),
@@ -695,7 +695,7 @@ impl ExploreRuntimeHandle {
         guard.pending_child_cancellation = None;
         guard.generation = generation;
         guard.child_sequence = 0;
-        guard.dispatched_goals = 0;
+        guard.reached_goals = 0;
         guard.started_at_ns = now_unix_nanos();
         guard.no_frontier_since_ns = None;
         let frontier_update = guard.update_frontiers(Vec::new());
@@ -1181,7 +1181,6 @@ impl ExploreRuntimeHandle {
             frontier_goal_id,
             lease: ticket.lease,
         });
-        guard.dispatched_goals = guard.dispatched_goals.saturating_add(1);
         let snapshot = guard.snapshot(
             STATUS_ACTIVE,
             format!("child navigation accepted: {child_request_id}"),
@@ -1340,6 +1339,9 @@ impl ExploreRuntimeHandle {
             .controller
             .report_goal_feedback(&frontier_goal_id, feedback)
             .map_err(|error| error.to_string())?;
+        if matches!(&result, ChildNavigationResult::Reached(_)) {
+            guard.reached_goals = guard.reached_goals.saturating_add(1);
+        }
         guard.active_child = None;
         guard.no_frontier_since_ns = None;
         let frontiers = guard.controller.frontier_snapshot();
@@ -1597,7 +1599,7 @@ fn evaluate_stop_conditions(
     if guard.active_child.is_none()
         && conditions
             .max_goals
-            .is_some_and(|max_goals| guard.dispatched_goals >= max_goals)
+            .is_some_and(|max_goals| guard.reached_goals >= max_goals)
     {
         return Some(ExplorationStopReason::MaxGoalsReached);
     }
@@ -2468,6 +2470,57 @@ mod tests {
         assert_eq!(completed.last_stop_reason, "max_goals_reached");
         assert!(completed.child_task_id.is_empty());
         assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn max_goals_does_not_count_failed_child_as_reached() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        let accepted = handle
+            .start_with_config(
+                "req-max-goals-failed",
+                ExploreStartConfig {
+                    stop_conditions: ExploreStopConditions {
+                        max_goals: Some(1),
+                        ..ExploreStopConditions::default()
+                    },
+                    max_navigation_retries: 0,
+                    ..ExploreStartConfig::default()
+                },
+            )
+            .await;
+        assert_eq!(accepted.status, STATUS_ACCEPTED);
+
+        let active = handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+        assert_eq!(active.status, STATUS_ACTIVE);
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+
+        let failed = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Failed {
+                    proof: terminal_proof(&lease),
+                    reason: "planner rejected test goal".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, STATUS_ACTIVE);
+        assert!(failed.child_task_id.is_empty());
+
+        let guard = handle.inner.lock().await;
+        assert_eq!(guard.reached_goals, 0);
+        assert_eq!(evaluate_stop_conditions(&guard, now_unix_nanos()), None);
+        drop(guard);
+
+        let next = handle.tick((2.0, 2.0)).await;
+        assert_ne!(next.last_stop_reason, "max_goals_reached");
+        assert_ne!(next.status, STATUS_SUCCEEDED);
         assert!(sink.cancelled.lock().unwrap().is_empty());
     }
 

@@ -435,6 +435,7 @@ pub struct MappingAdapter {
     latest_pointcloud_timestamp_ns: u64,
     latest_pointcloud_received_at_ns: u64,
     map_odom_transform: Option<MapOdomTransformSnapshot>,
+    map_odom_transform_cache: Arc<parking_lot::RwLock<Option<MapOdomTransformSnapshot>>>,
     frame_generation: u64,
     global_frame_established: bool,
     transformed_points: Vec<Point3<f64>>,
@@ -530,6 +531,7 @@ impl MappingAdapter {
             latest_pointcloud_timestamp_ns: 0,
             latest_pointcloud_received_at_ns: 0,
             map_odom_transform: None,
+            map_odom_transform_cache: Arc::new(parking_lot::RwLock::new(None)),
             frame_generation: 0,
             global_frame_established: false,
             transformed_points: Vec::new(),
@@ -916,6 +918,7 @@ impl MappingAdapter {
         if let Some(transform) = self.map_odom_transform.as_mut() {
             transform.latest_map_pose = map_pose;
         }
+        *self.map_odom_transform_cache.write() = self.map_odom_transform.clone();
         self.last_sensor_origin = map_pose.position;
         self.session.feed_pose(
             map_pose.position[0],
@@ -973,6 +976,14 @@ impl MappingAdapter {
     /// 返回当前固定 `map <- odom` 变换和最新 map pose 的只读快照。
     pub fn map_odom_transform_snapshot(&self) -> Option<MapOdomTransformSnapshot> {
         self.map_odom_transform.clone()
+    }
+
+    /// Shared read-only transform snapshot for high-rate pose publication.
+    /// The cache is updated with the adapter and cleared on every map reset.
+    pub(crate) fn map_odom_transform_cache(
+        &self,
+    ) -> Arc<parking_lot::RwLock<Option<MapOdomTransformSnapshot>>> {
+        Arc::clone(&self.map_odom_transform_cache)
     }
 
     /// 当前全局 frame/anchor 代次。reset 后下一次 anchor 会使用更大的代次。
@@ -1171,6 +1182,7 @@ impl MappingAdapter {
         self.latest_pointcloud_timestamp_ns = 0;
         self.latest_pointcloud_received_at_ns = 0;
         self.map_odom_transform = None;
+        *self.map_odom_transform_cache.write() = None;
         self.global_frame_established = false;
         self.transformed_points.clear();
         self.latest_accepted_map_points.clear();
@@ -2043,6 +2055,8 @@ mod tests {
         adapter
             .feed_pose_in_frame(4.0, 2.0, 0.0, 0.0, "odom")
             .expect("first anchor");
+        let transform_cache = adapter.map_odom_transform_cache();
+        assert!(transform_cache.read().is_some());
         let first_generation = adapter.global_frame_generation();
         adapter
             .feed_pointcloud_session(
@@ -2058,6 +2072,7 @@ mod tests {
 
         adapter.reset_accumulator();
         assert!(adapter.map_odom_transform_snapshot().is_none());
+        assert!(transform_cache.read().is_none());
         assert_eq!(adapter.accumulated_count(), 0);
         let error = adapter
             .feed_pointcloud_session(
@@ -2079,6 +2094,13 @@ mod tests {
             .expect("second anchor");
         let second_generation = adapter.global_frame_generation();
         assert!(second_generation > first_generation);
+        assert_eq!(
+            transform_cache
+                .read()
+                .as_ref()
+                .map(|transform| transform.generation),
+            Some(second_generation)
+        );
         adapter
             .feed_pointcloud_session(
                 &[Point3::new(-3.0, 5.0, 0.0)],

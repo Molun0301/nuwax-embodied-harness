@@ -32,6 +32,10 @@ use nuwax_nav_stack::bin_support::{self, CliOptions};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if bin_support::launcher_contract_requested(&args) {
+        println!("{}", bin_support::LAUNCHER_CONTRACT);
+        return;
+    }
     let opts = match CliOptions::parse(&args) {
         Ok(o) => o,
         Err(e) => {

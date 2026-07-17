@@ -714,6 +714,37 @@ fn schema_pose_is_finite_and_normalized(pose: &schema::Pose) -> bool {
 }
 
 #[cfg(feature = "guard-runtime")]
+async fn wait_for_guard_scheduler_readiness(
+    status: &mut tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
+    timeout: Duration,
+) -> NavStackResult<()> {
+    match tokio::time::timeout(timeout, async {
+        loop {
+            if status.borrow().guard_readiness_observed {
+                return Ok::<(), NavStackError>(());
+            }
+            status.changed().await.map_err(|_| {
+                NavStackError::Internal("guard scheduler stopped before readiness".into())
+            })?;
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let last_status = status.borrow();
+            Err(NavStackError::Internal(format!(
+                "motion guard readiness timed out: {} (observed={}, generation={}, observations={})",
+                last_status.message,
+                last_status.guard_readiness_observed,
+                last_status.guard_generation,
+                last_status.motion_sink_observations,
+            )))
+        }
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
 async fn run_guarded_nav_scheduler(
     node: ModuleNode,
     shutdown: oneshot::Receiver<()>,
@@ -734,24 +765,7 @@ async fn run_guarded_nav_scheduler(
     .await
     .map_err(|error| module_error("guarded_nav_scheduler.connect", error))?;
     let mut status = scheduler.subscribe_status();
-    tokio::time::timeout(MOTION_GUARD_READY_TIMEOUT, async {
-        loop {
-            if status.borrow().motion_sink_ready {
-                return Ok::<(), NavStackError>(());
-            }
-            status.changed().await.map_err(|_| {
-                NavStackError::Internal("guard scheduler stopped before readiness".into())
-            })?;
-        }
-    })
-    .await
-    .map_err(|_| {
-        let last_status = status.borrow();
-        NavStackError::Internal(format!(
-            "motion guard readiness timed out: {} (generation={}, observations={})",
-            last_status.message, last_status.guard_generation, last_status.motion_sink_observations,
-        ))
-    })??;
+    wait_for_guard_scheduler_readiness(&mut status, MOTION_GUARD_READY_TIMEOUT).await?;
     signal_ready(ready)?;
 
     let loop_result = run_guarded_nav_loop(
@@ -5313,6 +5327,37 @@ mod guarded_tests {
     use futures::channel::mpsc::{unbounded, UnboundedSender};
     use nuwax_nav_runtime::{NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
     use tokio::task::JoinHandle;
+
+    #[tokio::test]
+    async fn guarded_component_accepts_observed_reset_required() {
+        let (_status_tx, mut status_rx) =
+            tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus {
+                guard_readiness_observed: true,
+                motion_sink_ready: false,
+                guard_generation: 9,
+                motion_sink_observations: 1,
+                message: "motion guard responded but motion is blocked: RESET_REQUIRED".into(),
+                ..nuwax_nav_runtime::SchedulerStatus::default()
+            });
+
+        wait_for_guard_scheduler_readiness(&mut status_rx, Duration::from_millis(5))
+            .await
+            .expect("validated negative guard response makes the component available");
+    }
+
+    #[tokio::test]
+    async fn guarded_component_rejects_unobserved_guard_timeout() {
+        let (_status_tx, mut status_rx) =
+            tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus::default());
+
+        let error = wait_for_guard_scheduler_readiness(&mut status_rx, Duration::from_millis(1))
+            .await
+            .expect_err("unobserved guard must keep component startup fail closed");
+        let message = error.to_string();
+        assert!(message.contains("observed=false"));
+        assert!(message.contains("generation=0"));
+        assert!(message.contains("observations=0"));
+    }
 
     fn active_goal(session_id: &str) -> schema::GoalEnvelope {
         schema::GoalEnvelope {

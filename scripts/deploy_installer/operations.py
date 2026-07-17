@@ -2878,6 +2878,14 @@ def _validate_release_binary(path: Path) -> str:
     linkage = dynamic.stdout + dynamic.stderr
     if "not found" in linkage:
         raise DeploymentError(f"Rust release binary has unresolved shared libraries: {path.name}")
+    if path.name == "nuwax-nav-stack":
+        contract = _capture_as_build_user((str(path), "--launcher-contract"), timeout=5)
+        expected = "nuwax-nav-stack-internal-ready-v1"
+        if contract.returncode != 0 or contract.stdout.strip() != expected:
+            raise DeploymentError(
+                "Rust release binary does not support the nav launcher readiness contract: "
+                f"{path.name}"
+            )
     return description.stdout.strip()
 
 

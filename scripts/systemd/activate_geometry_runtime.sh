@@ -12,11 +12,16 @@ GEOMETRY_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-/run/nuwax/geometry/nu
 PERSON_FOLLOW_READY_FILE="${NUWAX_PERSON_FOLLOW_READY_FILE:-/run/nuwax/person-follow/nuwax_person_follow.ready}"
 GEOMETRY_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
 LAST_STAGE="starting"
+LAST_UNIT=""
 ACTIVATION_LEVEL="motion"
 CAPABILITY_NAME="unknown"
 REQUEST_ID=""
 SAFETY_EPOCH="0"
 STARTED_UNITS=()
+FAILURE_UNIT=""
+FAILURE_UNIT_RESULT=""
+FAILURE_UNIT_EXIT_STATUS=""
+FAILURE_DIAGNOSTIC=""
 
 write_result() {
   local state="$1"
@@ -26,8 +31,11 @@ write_result() {
   STATE="${state}" MESSAGE="${message}" STAGE="${LAST_STAGE}" \
     ERROR_CODE="${error_code}" REQUEST_ID="${REQUEST_ID}" \
     SAFETY_EPOCH="${SAFETY_EPOCH}" ACTIVATION_LEVEL="${ACTIVATION_LEVEL}" \
-    CAPABILITY_NAME="${CAPABILITY_NAME}" \
-    /usr/bin/python3 -c 'import json, os; payload = {"state": os.environ["STATE"], "stage": os.environ["STAGE"], "message": os.environ["MESSAGE"], "request_id": os.environ["REQUEST_ID"], "safety_epoch": int(os.environ["SAFETY_EPOCH"]), "activation_level": os.environ["ACTIVATION_LEVEL"], "capability_name": os.environ["CAPABILITY_NAME"]}; error_code = os.environ.get("ERROR_CODE", ""); payload.update({"error_code": error_code} if error_code else {}); print(json.dumps(payload, ensure_ascii=True, sort_keys=True))' \
+    CAPABILITY_NAME="${CAPABILITY_NAME}" FAILURE_UNIT="${FAILURE_UNIT}" \
+    FAILURE_UNIT_RESULT="${FAILURE_UNIT_RESULT}" \
+    FAILURE_UNIT_EXIT_STATUS="${FAILURE_UNIT_EXIT_STATUS}" \
+    FAILURE_DIAGNOSTIC="${FAILURE_DIAGNOSTIC}" \
+    /usr/bin/python3 -c 'import json, os; payload = {"state": os.environ["STATE"], "stage": os.environ["STAGE"], "message": os.environ["MESSAGE"], "request_id": os.environ["REQUEST_ID"], "safety_epoch": int(os.environ["SAFETY_EPOCH"]), "activation_level": os.environ["ACTIVATION_LEVEL"], "capability_name": os.environ["CAPABILITY_NAME"]}; optional = {"error_code": os.environ.get("ERROR_CODE", ""), "unit": os.environ.get("FAILURE_UNIT", ""), "unit_result": os.environ.get("FAILURE_UNIT_RESULT", ""), "unit_exit_status": os.environ.get("FAILURE_UNIT_EXIT_STATUS", ""), "diagnostic": os.environ.get("FAILURE_DIAGNOSTIC", "")}; payload.update({key: value for key, value in optional.items() if value}); print(json.dumps(payload, ensure_ascii=True, sort_keys=True))' \
     > "${temporary}"
   chmod 0644 "${temporary}"
   mv -f "${temporary}" "${RESULT_FILE}"
@@ -47,10 +55,31 @@ cleanup_protocol_files() {
   rm -f "${REQUEST_FILE}" "${ACK_FILE}" "${CANCEL_FILE}"
 }
 
+capture_unit_failure() {
+  local status_detail=""
+  local journal_detail=""
+  [[ -n "${LAST_UNIT}" ]] || return 0
+  FAILURE_UNIT="${LAST_UNIT}"
+  FAILURE_UNIT_RESULT="$(systemctl show --property=Result --value "${LAST_UNIT}" 2>/dev/null || true)"
+  FAILURE_UNIT_EXIT_STATUS="$(systemctl show --property=ExecMainStatus --value "${LAST_UNIT}" 2>/dev/null || true)"
+  status_detail="$(systemctl status --no-pager --full --lines=20 "${LAST_UNIT}" 2>&1 || true)"
+  journal_detail="$(journalctl --no-pager --quiet --lines=20 --unit "${LAST_UNIT}" 2>/dev/null || true)"
+  FAILURE_DIAGNOSTIC="${status_detail}"
+  if [[ -n "${journal_detail}" ]]; then
+    FAILURE_DIAGNOSTIC+=$'\n'"${journal_detail}"
+  fi
+  FAILURE_DIAGNOSTIC="${FAILURE_DIAGNOSTIC//$'\n'/ | }"
+  FAILURE_DIAGNOSTIC="${FAILURE_DIAGNOSTIC:0:4000}"
+}
+
 fail_activation() {
   local exit_code=$?
   trap - ERR INT TERM HUP
   local message="activation failed at ${LAST_STAGE} (exit=${exit_code})"
+  capture_unit_failure
+  if [[ -n "${FAILURE_DIAGNOSTIC}" ]]; then
+    message+=": ${FAILURE_DIAGNOSTIC}"
+  fi
   rollback_started_units
   write_result failed "${message}" runtime_activation_failed || true
   cleanup_protocol_files
@@ -213,6 +242,7 @@ if [[ "${ACTIVATION_LEVEL}" == "guard" \
   || "${ACTIVATION_LEVEL}" == "person_follow" ]]; then
   write_result activating "starting motion guard component"
   LAST_STAGE="motion_guard"
+  LAST_UNIT="nuwax-motion-safety-guard.service"
   start_unit_if_needed nuwax-motion-safety-guard.service
   NUWAX_MOTION_GUARD_SOCKET="${MOTION_SOCKET}" \
     NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 \
@@ -224,6 +254,7 @@ if [[ "${ACTIVATION_LEVEL}" == "motion" \
   || "${ACTIVATION_LEVEL}" == "person_follow" ]]; then
   write_result activating "starting navigation component"
   LAST_STAGE="navigation"
+  LAST_UNIT="nuwax-nav-stack.service"
   start_unit_if_needed nuwax-nav-stack.service
   NUWAX_NAV_STACK_READY_FILE="${NAV_READY_FILE}" \
     NUWAX_NAV_STACK_START_TIMEOUT_SEC=15 \
@@ -236,6 +267,7 @@ if [[ "${ACTIVATION_LEVEL}" == "geometry" \
   || "${ACTIVATION_LEVEL}" == "person_follow" ]]; then
   write_result activating "starting geometry component"
   LAST_STAGE="geometry"
+  LAST_UNIT="nuwax-geometry-runtime.service"
   start_unit_if_needed nuwax-geometry-runtime.service
   NUWAX_GEOMETRY_RUNTIME_READY_FILE="${GEOMETRY_READY_FILE}" \
     NUWAX_GEOMETRY_RUNTIME_PORT="${GEOMETRY_PORT}" \
@@ -247,6 +279,7 @@ fi
 if [[ "${ACTIVATION_LEVEL}" == "person_follow" ]]; then
   write_result activating "starting person-follow component"
   LAST_STAGE="person_follow"
+  LAST_UNIT="nuwax-person-follow.service"
   start_unit_if_needed nuwax-person-follow.service
   NUWAX_PERSON_FOLLOW_READY_FILE="${PERSON_FOLLOW_READY_FILE}" \
     NUWAX_PERSON_FOLLOW_START_TIMEOUT_SEC=15 \

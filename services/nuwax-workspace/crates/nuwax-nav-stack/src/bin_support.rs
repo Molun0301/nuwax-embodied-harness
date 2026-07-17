@@ -29,6 +29,14 @@ use crate::runner::StackRunner;
 use crate::topics::NavTopicConfig;
 
 const INTERNAL_READY_FILE_ENV: &str = "NUWAX_NAV_STACK_INTERNAL_READY_FILE";
+/// Exact token emitted by `--launcher-contract` for deployment compatibility checks.
+pub const LAUNCHER_CONTRACT: &str = "nuwax-nav-stack-internal-ready-v1";
+
+/// Return whether this invocation is the side-effect-free launcher contract probe.
+#[must_use]
+pub fn launcher_contract_requested(args: &[String]) -> bool {
+    args == ["--launcher-contract"]
+}
 
 /// CLI 选项的内部表示。
 #[derive(Debug, Clone)]
@@ -189,6 +197,7 @@ fn print_help() {
              --dry-run         render module graph and exit (no process spawn)\n\
              --replay <PATH>   run smoke replay using the given fixture manifest\n\
              --list-features   list available features and exit\n\
+             --launcher-contract  print the launcher readiness contract and exit\n\
              --json            emit module graph as JSON instead of YAML-like text\n\
          -h, --help             print this help\n\
          -V, --version          print version",
@@ -407,6 +416,16 @@ pub fn list_features() {
 mod tests {
     use super::*;
     use crate::graph::{ModuleGraph, ModuleKind, ModuleNode};
+
+    #[test]
+    fn launcher_contract_probe_is_exact_and_side_effect_free() {
+        assert_eq!(LAUNCHER_CONTRACT, "nuwax-nav-stack-internal-ready-v1");
+        assert!(launcher_contract_requested(&["--launcher-contract".into()]));
+        assert!(!launcher_contract_requested(&[
+            "--launcher-contract".into(),
+            "--profile=simple-2d".into(),
+        ]));
+    }
 
     #[test]
     fn parse_default_profile_is_simple2d() {

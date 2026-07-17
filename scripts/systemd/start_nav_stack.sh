@@ -10,6 +10,7 @@ READY_FILE="${NUWAX_NAV_STACK_READY_FILE:-${REPO_ROOT}/runtime_data/navigation/n
 INTERNAL_READY_FILE="${READY_FILE}.runtime"
 MOTION_GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
 WARMUP_STEPS="${NUWAX_NAV_STACK_WARMUP_STEPS:-150}"
+EXPECTED_LAUNCHER_CONTRACT="nuwax-nav-stack-internal-ready-v1"
 CHILD_PID=""
 
 [[ -r "${IDENTITY_HELPER}" ]] || {
@@ -114,6 +115,10 @@ case "${WARMUP_STEPS}" in
 esac
 [[ "${WARMUP_STEPS}" -gt 0 ]] || fail "NUWAX_NAV_STACK_WARMUP_STEPS must be greater than zero"
 [[ -x "${BINARY}" ]] || fail "binary is not executable: ${BINARY}"
+if ! ACTUAL_LAUNCHER_CONTRACT="$(timeout 2s "${BINARY}" --launcher-contract 2>/dev/null)" \
+  || [[ "${ACTUAL_LAUNCHER_CONTRACT}" != "${EXPECTED_LAUNCHER_CONTRACT}" ]]; then
+  fail "binary does not support the internal readiness protocol: ${BINARY}; rebuild it via scripts/build_nav_stack.sh"
+fi
 
 mkdir -p "$(dirname "${READY_FILE}")"
 cleanup_ready_files

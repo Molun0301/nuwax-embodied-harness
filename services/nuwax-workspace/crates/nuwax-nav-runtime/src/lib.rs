@@ -135,6 +135,8 @@ pub struct SchedulerStatus {
     pub last_applied_twist: Option<Twist2>,
     /// Whether the real guard readiness exchange is currently fresh and usable.
     pub motion_sink_ready: bool,
+    /// Whether the latest guard readiness exchange returned a validated response.
+    pub guard_readiness_observed: bool,
     /// Guard process generation from the last validated readiness/acquire exchange.
     pub guard_generation: u64,
     /// Count of validated guard readiness observations.
@@ -171,6 +173,7 @@ impl Default for SchedulerStatus {
             applied_commands: 0,
             last_applied_twist: None,
             motion_sink_ready: false,
+            guard_readiness_observed: false,
             guard_generation: 0,
             motion_sink_observations: 0,
             planner_inputs_fresh: false,
@@ -271,6 +274,8 @@ pub struct MotionPortError {
     pub message: String,
     /// Whether an ambiguous result may have created or retained a lease.
     pub lease_may_be_active: bool,
+    /// Validated guard metadata carried by a negative readiness response.
+    pub readiness_observation: Option<MotionReadinessProof>,
 }
 
 impl MotionPortError {
@@ -280,6 +285,7 @@ impl MotionPortError {
         Self {
             message: message.into(),
             lease_may_be_active: true,
+            readiness_observation: None,
         }
     }
 
@@ -289,6 +295,17 @@ impl MotionPortError {
         Self {
             message: message.into(),
             lease_may_be_active: false,
+            readiness_observation: None,
+        }
+    }
+
+    /// Construct a fail-closed error from a validated negative readiness response.
+    #[must_use]
+    pub fn observed_not_ready(message: impl Into<String>, generation: u64) -> Self {
+        Self {
+            message: message.into(),
+            lease_may_be_active: false,
+            readiness_observation: Some(MotionReadinessProof { generation }),
         }
     }
 }
@@ -308,7 +325,11 @@ pub struct LeaseProof {
     pub guard_generation: u64,
 }
 
-/// Validated idle guard readiness used to open the navigation acceptance gate.
+/// Metadata from a validated guard readiness response.
+///
+/// A positive response opens the navigation acceptance gate. A negative response
+/// may carry this proof in [`MotionPortError::readiness_observation`] so component
+/// health remains distinct from motion authorization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MotionReadinessProof {
     /// Durable guard process generation.
@@ -401,13 +422,16 @@ impl NavMotionPort for MotionGuardClient {
     async fn readiness(&mut self) -> Result<MotionReadinessProof, MotionPortError> {
         let readiness = self.get_readiness().await?;
         if !readiness.ready || !readiness.actuator_configured || !readiness.epoch_durable {
-            return Err(MotionPortError::definite_no_lease(format!(
-                "guard not ready: ready={} actuator_configured={} epoch_durable={} reason={}",
-                readiness.ready,
-                readiness.actuator_configured,
-                readiness.epoch_durable,
-                readiness.reason,
-            )));
+            return Err(MotionPortError::observed_not_ready(
+                format!(
+                    "guard not ready: ready={} actuator_configured={} epoch_durable={} reason={}",
+                    readiness.ready,
+                    readiness.actuator_configured,
+                    readiness.epoch_durable,
+                    readiness.reason,
+                ),
+                readiness.generation,
+            ));
         }
         Ok(MotionReadinessProof {
             generation: readiness.generation,
@@ -988,6 +1012,7 @@ where
             applied_commands: 0,
             last_applied_twist: None,
             motion_sink_ready: self.status.motion_sink_ready,
+            guard_readiness_observed: self.status.guard_readiness_observed,
             guard_generation: self.status.guard_generation,
             motion_sink_observations: self.status.motion_sink_observations,
             planner_inputs_fresh: self.status.planner_inputs_fresh,
@@ -1196,6 +1221,7 @@ where
         match self.motion.readiness().await {
             Ok(proof) if proof.generation != 0 => {
                 self.status.motion_sink_ready = true;
+                self.status.guard_readiness_observed = true;
                 self.status.guard_generation = proof.generation;
                 self.status.motion_sink_observations =
                     self.status.motion_sink_observations.saturating_add(1);
@@ -1203,13 +1229,29 @@ where
             }
             Ok(_) => {
                 self.status.motion_sink_ready = false;
+                self.status.guard_readiness_observed = false;
                 self.status.guard_generation = 0;
                 self.status.message = "motion guard returned generation=0".into();
             }
             Err(error) => {
                 self.status.motion_sink_ready = false;
-                self.status.guard_generation = 0;
-                self.status.message = format!("motion guard not ready: {}", error.message);
+                if let Some(observation) = error
+                    .readiness_observation
+                    .filter(|observation| observation.generation != 0)
+                {
+                    self.status.guard_readiness_observed = true;
+                    self.status.guard_generation = observation.generation;
+                    self.status.motion_sink_observations =
+                        self.status.motion_sink_observations.saturating_add(1);
+                    self.status.message = format!(
+                        "motion guard responded but motion is blocked: {}",
+                        error.message
+                    );
+                } else {
+                    self.status.guard_readiness_observed = false;
+                    self.status.guard_generation = 0;
+                    self.status.message = format!("motion guard not ready: {}", error.message);
+                }
             }
         }
         self.publish_status(status_tx);
@@ -1747,6 +1789,52 @@ mod tests {
             let _ = read_guard_request(&mut stream).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
             vec!["readiness-timeout"]
+        });
+        GuardFixture {
+            path,
+            task: Some(task),
+        }
+    }
+
+    async fn spawn_reset_required_guard(label: &str) -> GuardFixture {
+        let path = socket_path(label);
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind reset-required guard UDS");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept guard client");
+            let mut operations = Vec::new();
+            while let Some(request) = try_read_guard_request(&mut stream).await {
+                assert!(matches!(
+                    request.operation,
+                    Some(motion_guard_request::Operation::GetReadiness(_))
+                ));
+                operations.push("readiness-reset-required");
+                write_guard_response(
+                    &mut stream,
+                    MotionGuardResponse {
+                        api_version: API_VERSION,
+                        request_id: request.request_id,
+                        outcome: Some(motion_guard_response::Outcome::GetReadiness(
+                            GetReadinessResponse {
+                                result: Some(GuardResult {
+                                    ack: AckCode::Received as i32,
+                                    gate: SafetyGate::ResetRequired as i32,
+                                    lease: LeaseState::Idle as i32,
+                                    error: None,
+                                }),
+                                ready: false,
+                                actuator_configured: true,
+                                epoch_durable: true,
+                                reason: "RESET_REQUIRED".into(),
+                                generation: 9,
+                                boot_nonce: vec![7; 16],
+                            },
+                        )),
+                    },
+                )
+                .await;
+            }
+            operations
         });
         GuardFixture {
             path,
@@ -2775,6 +2863,7 @@ mod tests {
 
         tokio::time::sleep(MAX_NAV_REQUEST_TIMEOUT + Duration::from_millis(100)).await;
         let status = handle.status();
+        assert!(!status.guard_readiness_observed);
         assert!(!status.motion_sink_ready);
         assert_eq!(status.motion_sink_observations, 0);
         assert_eq!(status.guard_generation, 0);
@@ -2790,5 +2879,61 @@ mod tests {
             .expect("scheduler task join")
             .expect("scheduler task");
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn production_scheduler_observes_reset_required_without_opening_motion_gate() {
+        let guard = spawn_reset_required_guard("reset-required").await;
+        let (handle, task) = spawn_production_scheduler(
+            guard.path.clone(),
+            SchedulerConfig {
+                tick_interval: Duration::from_millis(5),
+                renew_interval: Duration::from_millis(20),
+                robot_width_m: 0.3,
+                pose_ttl: Duration::from_secs(1),
+                costmap_ttl: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("connect reset-required guard fixture UDS");
+
+        let mut updates = handle.subscribe_status();
+        let observed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let status = updates.borrow().clone();
+                if status.guard_readiness_observed {
+                    break status;
+                }
+                updates.changed().await.expect("scheduler status open");
+            }
+        })
+        .await
+        .expect("validated negative readiness response");
+        assert!(!observed.motion_sink_ready);
+        assert_eq!(observed.guard_generation, 9);
+        assert!(observed.motion_sink_observations >= 1);
+        assert!(observed.message.contains("RESET_REQUIRED"));
+
+        let error = handle
+            .start_session(session())
+            .await
+            .expect_err("RESET_REQUIRED must keep navigation fail closed");
+        assert_eq!(
+            error,
+            RuntimeError::Motion("motion guard readiness has not been validated".into())
+        );
+        assert_eq!(handle.status().phase, SchedulerPhase::Idle);
+        assert!(handle.status().session_id.is_none());
+        assert!(!task.is_finished());
+
+        handle.shutdown().await.expect("shutdown idle scheduler");
+        task.await
+            .expect("scheduler task join")
+            .expect("scheduler task");
+        let guard_operations = guard.finish().await;
+        assert!(!guard_operations.is_empty());
+        assert!(guard_operations
+            .iter()
+            .all(|operation| *operation == "readiness-reset-required"));
     }
 }

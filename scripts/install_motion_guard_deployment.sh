@@ -41,6 +41,7 @@ GEOMETRY_READY_HELPER="${REPO_ROOT}/scripts/systemd/wait_for_geometry_runtime_re
 PERSON_FOLLOW_LAUNCHER="${REPO_ROOT}/scripts/systemd/start_person_follow.sh"
 PERSON_FOLLOW_READY_HELPER="${REPO_ROOT}/scripts/systemd/wait_for_person_follow_ready.sh"
 NAV_BINARY="${BIN_DIR}/nuwax-nav-stack"
+NAV_LAUNCHER_CONTRACT="nuwax-nav-stack-internal-ready-v1"
 GEOMETRY_BINARY="${BIN_DIR}/nuwax-geometry-runtime"
 PERSON_FOLLOW_BINARY="${BIN_DIR}/nuwax-person-follow"
 GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
@@ -540,6 +541,10 @@ check_runtime_binaries() {
     || fail "motion guard Python interpreter is not executable: ${PYTHON_BIN}"
   [[ -x "${NAV_BINARY}" ]] \
     || fail "navigation stack is not executable: ${NAV_BINARY}"
+  local nav_contract=""
+  nav_contract="$(timeout 2s "${NAV_BINARY}" --launcher-contract 2>/dev/null || true)"
+  [[ "${nav_contract}" == "${NAV_LAUNCHER_CONTRACT}" ]] \
+    || fail "navigation stack does not support the internal readiness protocol: ${NAV_BINARY}; rebuild it via scripts/build_nav_stack.sh"
   [[ -x "${GEOMETRY_BINARY}" ]] \
     || fail "geometry runtime is not executable: ${GEOMETRY_BINARY}"
   if person_follow_autostart_enabled; then

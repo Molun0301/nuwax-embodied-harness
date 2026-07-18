@@ -366,6 +366,15 @@ button{font-family:inherit;cursor:pointer}
   color:var(--strong);font-size:11.5px;font-weight:620;cursor:pointer}
 .map-layer-toggle:hover{background:var(--inset)}
 .map-layer-toggle input{margin:0;accent-color:var(--robot)}
+.map-point-style{min-height:29px;padding:4px 7px;border-radius:var(--r-sm);display:inline-flex;align-items:center;gap:5px;
+  color:var(--strong);font-size:11.5px;font-weight:620}
+.map-point-style:hover{background:var(--inset)}
+.map-point-style select{min-width:48px;padding:0 15px 0 0;border:0;outline:0;background:transparent;color:inherit;
+  font:inherit;cursor:pointer}
+.map-point-style[data-point-style="clarity"] .sw{background:#38bdf8}
+.map-point-style[data-point-style="height"] .sw{background:#4ade80}
+.map-point-style[data-point-style="layers"] .sw{background:#f472b6}
+.map-point-style[data-point-style="mono"] .sw{background:#e2e8f0}
 .map-overlay-panel{border-radius:var(--r)}
 .map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .map-goal-chip{position:absolute;left:14px;top:94px;z-index:5}
@@ -483,6 +492,15 @@ button{font-family:inherit;cursor:pointer}
                   <div id="map3dCameraControls" class="map-tool-group glass" data-map-view="3d" aria-label="3D 地图视角" hidden>
                     <button id="map3dFreeView" class="tool active" type="button" aria-pressed="true" title="自由旋转、三轴平移和缩放">自由视角</button>
                     <button id="map3dFollowView" class="tool" type="button" aria-pressed="false" title="相机轨道中心跟随机器狗">跟随机器狗</button>
+                    <label class="map-point-style" data-point-style="clarity" title="切换 3D 点云显示样式">
+                      <span class="sw" aria-hidden="true"></span>
+                      <select id="map3dPointStyle" aria-label="3D 点云显示样式">
+                        <option value="clarity">清晰</option>
+                        <option value="height">高度</option>
+                        <option value="layers">分层</option>
+                        <option value="mono">单色</option>
+                      </select>
+                    </label>
                     <span class="map-tool-separator" aria-hidden="true"></span>
                     <button id="map3dZoomOut" class="tool" type="button" title="缩小 3D 地图">–</button>
                     <span id="map3dZoomValue" class="tool" aria-live="polite">100%</span>
@@ -787,6 +805,7 @@ button{font-family:inherit;cursor:pointer}
         map2dActionControls: document.getElementById("map2dActionControls"),
         map3dFreeView: document.getElementById("map3dFreeView"),
         map3dFollowView: document.getElementById("map3dFollowView"),
+        map3dPointStyle: document.getElementById("map3dPointStyle"),
         map3dZoomOut: document.getElementById("map3dZoomOut"),
         map3dZoomValue: document.getElementById("map3dZoomValue"),
         map3dZoomIn: document.getElementById("map3dZoomIn"),
@@ -5684,6 +5703,7 @@ button{font-family:inherit;cursor:pointer}
       window.addEventListener("pointcloud3d:ready", () => {
         state.pointcloud3dReady = true;
         window.pointcloud3d?.setCameraMode(state.pointcloud3dCameraMode);
+        window.pointcloud3d?.setPointStyle(els.map3dPointStyle?.value || "clarity");
         syncPointcloud3dState();
       });
       window.addEventListener("pointcloud3d:semantic-select", (event) => {
@@ -5697,6 +5717,12 @@ button{font-family:inherit;cursor:pointer}
       });
       window.addEventListener("pointcloud3d:camera-state", (event) => {
         updatePointcloud3dCameraControls(event.detail || {});
+      });
+      window.addEventListener("pointcloud3d:style-state", (event) => {
+        const style = String(event.detail?.style || "clarity");
+        if (!els.map3dPointStyle) return;
+        els.map3dPointStyle.value = style;
+        els.map3dPointStyle.closest(".map-point-style")?.setAttribute("data-point-style", style);
       });
       window.addEventListener("pointcloud3d:point-count", (event) => {
         const points = Number(event.detail && event.detail.points);
@@ -5739,6 +5765,11 @@ button{font-family:inherit;cursor:pointer}
         state.pointcloud3dCameraMode = "follow";
         window.pointcloud3d?.setCameraMode("follow");
       });
+      els.map3dPointStyle?.addEventListener("change", () => {
+        const style = els.map3dPointStyle.value;
+        els.map3dPointStyle.closest(".map-point-style")?.setAttribute("data-point-style", style);
+        window.pointcloud3d?.setPointStyle(style);
+      });
       els.map3dZoomOut?.addEventListener("click", () => window.pointcloud3d?.zoomBy(1.25));
       els.map3dZoomIn?.addEventListener("click", () => window.pointcloud3d?.zoomBy(0.8));
       els.map3dResetView?.addEventListener("click", () => window.pointcloud3d?.resetView());
@@ -5748,7 +5779,7 @@ button{font-family:inherit;cursor:pointer}
       updateMapPoseHud();
     })();
   </script>
-  <script type="module" src="/static/js/pointcloud3d.js?v=20260717-no-grid-axes"></script>
+  <script type="module" src="/static/js/pointcloud3d.js?v=20260718-point-styles"></script>
   <!-- V2 navigation-and-exploration-boundary §9.3：容器 + 拆模块 script 引用（不堆业务） -->
   <!-- 默认隐藏，由 map-toolbar 的"导航"按钮 / "划线"按钮点击后展开 -->
   <div id="navigation-container" data-role="v2-navigation" hidden>

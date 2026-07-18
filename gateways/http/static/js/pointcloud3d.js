@@ -13,6 +13,29 @@ const COLORS = {
 };
 
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
+const DEFAULT_POINT_STYLE = 'clarity';
+const POINT_STYLE_PRESETS = Object.freeze({
+  clarity: Object.freeze({ label: '清晰', sampleStride: 2, size: 1.35, sizeAttenuation: false, colorMode: 'position' }),
+  height: Object.freeze({ label: '高度', sampleStride: 1, size: 0.055, sizeAttenuation: true, colorMode: 'height' }),
+  layers: Object.freeze({ label: '分层', sampleStride: 2, size: 0.07, sizeAttenuation: true, colorMode: 'layers' }),
+  mono: Object.freeze({ label: '单色', sampleStride: 3, size: 1.1, sizeAttenuation: false, colorMode: 'mono' }),
+});
+const HEIGHT_COLOR_STOPS = Object.freeze([
+  [56, 189, 248],
+  [34, 211, 238],
+  [74, 222, 128],
+  [250, 204, 21],
+  [251, 113, 133],
+]);
+const LAYER_COLORS = Object.freeze([
+  [56, 189, 248],
+  [250, 204, 21],
+  [244, 114, 182],
+  [74, 222, 128],
+  [192, 132, 252],
+  [248, 250, 252],
+]);
+const POINT_SAMPLING_MIN_SOURCE_POINTS = 4096;
 const MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 const MAX_POINTS = Math.floor(MAX_BUFFER_BYTES / (3 * 4));
 const CAMERA_MODES = new Set(['free', 'follow']);
@@ -57,6 +80,7 @@ class PointCloud3DViewer {
     this._semanticPreciseMaterial = null;
     this._semanticFallbackMaterial = null;
     this._lod = 'preview';
+    this._pointStyle = DEFAULT_POINT_STYLE;
     this._needsRender = false;
     this._rafId = null;
     this._lastFrameTime = 0;
@@ -419,6 +443,10 @@ class PointCloud3DViewer {
     );
     const radius = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2;
     return {
+      xMin: minX,
+      xMax: maxX,
+      yMin: minY,
+      yMax: maxY,
       zMin: minZ,
       zMax: maxZ,
       bounds: new THREE.Sphere(center, radius),
@@ -430,18 +458,55 @@ class PointCloud3DViewer {
     const colors = new Uint8Array(count * 3);
     if (count === 0) return colors;
     const range = zMax - zMin || 1;
-    const low = [59, 130, 246];
-    const mid = [34, 197, 94];
-    const high = [239, 68, 68];
     for (let i = 0; i < count; i++) {
       const t = THREE.MathUtils.clamp((positions[i * 3 + 2] - zMin) / range, 0, 1);
-      const upperHalf = t >= 0.5;
-      const blend = upperHalf ? (t - 0.5) * 2 : t * 2;
-      const from = upperHalf ? mid : low;
-      const to = upperHalf ? high : mid;
+      const scaled = t * (HEIGHT_COLOR_STOPS.length - 1);
+      const lower = Math.min(Math.floor(scaled), HEIGHT_COLOR_STOPS.length - 2);
+      const blend = scaled - lower;
+      const from = HEIGHT_COLOR_STOPS[lower];
+      const to = HEIGHT_COLOR_STOPS[lower + 1];
       colors[i * 3] = Math.round(from[0] + (to[0] - from[0]) * blend);
       colors[i * 3 + 1] = Math.round(from[1] + (to[1] - from[1]) * blend);
       colors[i * 3 + 2] = Math.round(from[2] + (to[2] - from[2]) * blend);
+    }
+    return colors;
+  }
+
+  _pointCloudColors(positions, measurement) {
+    const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
+    if (preset.colorMode === 'height') {
+      return this._colorByHeight(positions, measurement.zMin, measurement.zMax);
+    }
+
+    const count = Math.floor(positions.length / 3);
+    const colors = new Uint8Array(count * 3);
+    const xRange = measurement.xMax - measurement.xMin || 1;
+    const yRange = measurement.yMax - measurement.yMin || 1;
+    const zRange = measurement.zMax - measurement.zMin || 1;
+    for (let i = 0; i < count; i++) {
+      const offset = i * 3;
+      if (preset.colorMode === 'mono') {
+        colors[offset] = 226;
+        colors[offset + 1] = 232;
+        colors[offset + 2] = 240;
+        continue;
+      }
+
+      const z = THREE.MathUtils.clamp((positions[offset + 2] - measurement.zMin) / zRange, 0, 1);
+      if (preset.colorMode === 'layers') {
+        const band = Math.min(Math.floor(z * LAYER_COLORS.length), LAYER_COLORS.length - 1);
+        const color = LAYER_COLORS[band];
+        colors[offset] = color[0];
+        colors[offset + 1] = color[1];
+        colors[offset + 2] = color[2];
+        continue;
+      }
+
+      const x = THREE.MathUtils.clamp((positions[offset] - measurement.xMin) / xRange, 0, 1);
+      const y = THREE.MathUtils.clamp((positions[offset + 1] - measurement.yMin) / yRange, 0, 1);
+      colors[offset] = Math.round(72 + x * 183);
+      colors[offset + 1] = Math.round(88 + y * 167);
+      colors[offset + 2] = Math.round(112 + z * 143);
     }
     return colors;
   }
@@ -464,7 +529,7 @@ class PointCloud3DViewer {
     }));
   }
 
-  _renderPointCloudPositions(positions) {
+  _renderPointCloudPositions(positions, sourceMeasurement = null) {
     if (!this._scene) return;
     this._disposePointsMesh();
     if (!positions.length) {
@@ -474,17 +539,22 @@ class PointCloud3DViewer {
       this._requestRender();
       return;
     }
-    const measurement = this._measurePointCloud(positions);
+    const measurement = sourceMeasurement || this._measurePointCloud(positions);
+    const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geo.setAttribute('color', new THREE.Uint8BufferAttribute(
-      this._colorByHeight(positions, measurement.zMin, measurement.zMax),
+      this._pointCloudColors(positions, measurement),
       3,
       true,
     ));
-    geo.boundingSphere = measurement.bounds;
+    geo.boundingSphere = measurement.bounds.clone();
     this._pointCloudBounds = measurement.bounds.clone();
-    const mat = new THREE.PointsMaterial({ size: 0.05, vertexColors: true, sizeAttenuation: true });
+    const mat = new THREE.PointsMaterial({
+      size: preset.size,
+      vertexColors: true,
+      sizeAttenuation: preset.sizeAttenuation,
+    });
     this._pointsMesh = new THREE.Points(geo, mat);
     this._scene.add(this._pointsMesh);
     this._displayedPointCount = Math.floor(positions.length / 3);
@@ -496,22 +566,25 @@ class PointCloud3DViewer {
   }
 
   _rebuildPointCloud() {
-    const stride = LOD_STRIDE[this._lod] || 1;
+    const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     const src = this._allPositions;
     const totalPts = Math.floor(src.length / 3);
+    const configuredStride = Math.max(1, Math.round((LOD_STRIDE[this._lod] || 1) * preset.sampleStride));
+    const stride = totalPts <= POINT_SAMPLING_MIN_SOURCE_POINTS ? 1 : configuredStride;
     const sampledCount = Math.min(Math.ceil(totalPts / stride), MAX_POINTS);
     if (sampledCount === 0) {
       this._renderPointCloudPositions(new Float32Array(0));
       return;
     }
 
+    const measurement = this._measurePointCloud(src);
     const pos = new Float32Array(sampledCount * 3);
     for (let i = 0, j = 0; i < sampledCount; i++, j += stride) {
       pos[i * 3] = src[j * 3];
       pos[i * 3 + 1] = src[j * 3 + 1];
       pos[i * 3 + 2] = src[j * 3 + 2];
     }
-    this._renderPointCloudPositions(pos);
+    this._renderPointCloudPositions(pos, measurement);
   }
 
   async loadPointCloud(url, lod = 'preview') {
@@ -551,7 +624,7 @@ class PointCloud3DViewer {
     }
 
     this._allPositions = xyzArray;
-    this._renderPointCloudPositions(xyzArray);
+    this._rebuildPointCloud();
   }
 
   _ensureRobotMesh() {
@@ -961,6 +1034,23 @@ class PointCloud3DViewer {
     if (!(level in LOD_STRIDE)) return;
     this._lod = level;
     this._rebuildPointCloud();
+  }
+
+  setPointStyle(style) {
+    if (!Object.prototype.hasOwnProperty.call(POINT_STYLE_PRESETS, style)) return false;
+    const changed = this._pointStyle !== style;
+    this._pointStyle = style;
+    if (changed && this._hasPointCloudSnapshot) this._rebuildPointCloud();
+    const preset = POINT_STYLE_PRESETS[style];
+    window.dispatchEvent(new CustomEvent('pointcloud3d:style-state', {
+      detail: {
+        style,
+        label: preset.label,
+        points: this._displayedPointCount,
+      },
+    }));
+    this._requestRender();
+    return true;
   }
 
   dispose() {

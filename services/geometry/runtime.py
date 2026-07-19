@@ -19,6 +19,8 @@ import uuid
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Protocol, Set, Tuple, TYPE_CHECKING, runtime_checkable
 from urllib.parse import quote
 
+import grpc
+
 from contracts.geometry import Pose
 from core.logging_utils import StreamBusLogHandler
 from contracts.map_workspace import MapGeometryAssetBinding, MapGeometryAssetRef, MapGeometryAssetType, MapVersion
@@ -46,7 +48,10 @@ from providers.pointcloud import PointCloudProvider
 from services.geometry.config import PlatformGeometryConfig
 from services.geometry.external_debug_observer import ExternalGeometryDebugObserver
 from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
-from services.geometry.geometry_runtime_provider import GeometryRuntimeProvider
+from services.geometry.geometry_runtime_provider import (
+    GeometryRuntimeProvider,
+    GeometryRuntimeRpcError,
+)
 from services.geometry.loop_closure_state import read_loop_closure_from_db
 
 from contracts.naming import build_safe_dir_segment
@@ -174,11 +179,15 @@ def _exploration_state_request_id(state: object) -> str:
     return str(getattr(state, "current_request_id", "") or "").strip()
 
 
+def _exploration_state_child_task_id(state: object) -> str:
+    metadata = dict(getattr(state, "metadata", {}) or {})
+    return str(metadata.get("child_task_id") or "").strip()
+
+
 def _is_complete_exploration_terminal(
     state: object,
     *,
     request_id: str,
-    safe_stop_only: bool = False,
 ) -> bool:
     status = getattr(state, "status", None)
     terminal_statuses = {
@@ -186,13 +195,12 @@ def _is_complete_exploration_terminal(
         ExplorationStatus.FAILED,
         ExplorationStatus.CANCELLED,
     }
-    if safe_stop_only:
-        terminal_statuses.discard(ExplorationStatus.FAILED)
     metadata = dict(getattr(state, "metadata", {}) or {})
     return bool(
         _exploration_state_request_id(state) == str(request_id or "").strip()
         and status in terminal_statuses
         and metadata.get("exploration_terminal") is True
+        and not _exploration_state_child_task_id(state)
     )
 
 
@@ -233,13 +241,17 @@ def _commit_remote_exploration_state_locked(
     if not expected_id or _exploration_state_request_id(state) != expected_id:
         return False
     status = state.status
-    terminal = status in {
+    has_terminal_status = status in {
         ExplorationStatus.SUCCEEDED,
         ExplorationStatus.FAILED,
         ExplorationStatus.CANCELLED,
     }
-    metadata = dict(state.metadata or {})
-    if terminal and metadata.get("exploration_terminal") is not True:
+    child_task_id = _exploration_state_child_task_id(state)
+    terminal = _is_complete_exploration_terminal(
+        state,
+        request_id=expected_id,
+    )
+    if has_terminal_status and not terminal and not child_task_id:
         return False
 
     current = getattr(runtime, "_external_exploration_request", None)
@@ -1973,11 +1985,20 @@ class PlatformGeometryRuntime:
                     callback=deliver_exploration_source,
                     provider=provider,
                 )
-                staged_exploration_id = provider.subscribe_exploration_updates(
-                    lambda payload: self._invoke_subscription_delivery(
+                def staged_remote_callback(payload):
+                    # A provider may emit while subscribe is still staging;
+                    # reject that frame so the poller retries it after the
+                    # source ticket has been published and ownership committed.
+                    if not source_ticket.published:
+                        return False
+                    result = self._invoke_subscription_delivery(
                         source_ticket,
                         payload,
                     )
+                    return False if result is None else result
+
+                staged_exploration_id = provider.subscribe_exploration_updates(
+                    staged_remote_callback
                 )
                 if staged_exploration_id is None:
                     raise RuntimeError(
@@ -5950,10 +5971,15 @@ class PlatformGeometryRuntime:
                 )
 
                 def remote_callback(payload):
-                    return self._invoke_subscription_delivery(
+                    # The provider's poll worker must retry a frame when the
+                    # source ticket has not reached the committed owner yet.
+                    if not source_ticket.published:
+                        return False
+                    result = self._invoke_subscription_delivery(
                         source_ticket,
                         payload,
                     )
+                    return False if result is None else result
 
                 try:
                     remote_subscription_id = (
@@ -6002,15 +6028,15 @@ class PlatformGeometryRuntime:
         payload,
         *,
         remote_token: Optional[_RemoteOperationToken] = None,
-    ) -> None:
+    ) -> bool:
         if not isinstance(payload, dict):
             LOGGER.warning("忽略非 dict 的 geometry exploration 状态更新。")
-            return
+            return False
         try:
             state = PlatformGeometryProviderBundle._wrap_remote_exploration_state(payload)
         except Exception:
             LOGGER.exception("geometry exploration 状态更新无法转换为平台契约。")
-            return
+            return False
         request_id = str(payload.get("request_id") or "").strip()
         committed = False
         with self._exploration_loop_lock:
@@ -6022,23 +6048,32 @@ class PlatformGeometryRuntime:
                 )
             ):
                 LOGGER.info("忽略旧 geometry remote 代际的 exploration update。")
-                return
+                return False
             current = self._external_exploration_request
             current_id = str(getattr(current, "request_id", "") or "").strip()
             if not request_id:
                 LOGGER.info("忽略缺少 request_id 的 geometry exploration update。")
-                return
+                return False
             recovered_request = None
-            if not current_id and state.status in {
-                ExplorationStatus.ACCEPTED,
-                ExplorationStatus.RUNNING,
-            }:
+            retained_failed_child = (
+                state.status is ExplorationStatus.FAILED
+                and bool(_exploration_state_child_task_id(state))
+            )
+            if not current_id and (
+                state.status
+                in {
+                    ExplorationStatus.ACCEPTED,
+                    ExplorationStatus.RUNNING,
+                }
+                or retained_failed_child
+            ):
                 recovered_request = ExploreAreaRequest(
                     request_id=request_id,
                     strategy="wavefront",
                     metadata={
                         "map_version_id": state.metadata.get("map_version_id"),
                         "map_revision": state.metadata.get("map_revision"),
+                        "child_task_id": state.metadata.get("child_task_id"),
                         "recovered_from_native_state": True,
                     },
                 )
@@ -6050,7 +6085,7 @@ class PlatformGeometryRuntime:
                     request_id or None,
                     current_id or None,
                 )
-                return
+                return False
             frontier_metadata, _ = self._external_debug_frontier_metadata()
             metadata = {**frontier_metadata, **dict(state.metadata)}
             strategy = state.strategy or str(
@@ -6076,13 +6111,17 @@ class PlatformGeometryRuntime:
             if not committed:
                 LOGGER.info("忽略无法原子提交的 geometry exploration update。")
         if committed:
-            if remote_token is not None:
-                self._notify_remote_exploration_update(
-                    state,
-                    remote_token=remote_token,
-                )
-            else:
-                self._notify_exploration_update(state)
+            try:
+                if remote_token is not None:
+                    self._notify_remote_exploration_update(
+                        state,
+                        remote_token=remote_token,
+                    )
+                else:
+                    self._notify_exploration_update(state)
+            except Exception:
+                LOGGER.exception("geometry exploration 状态已提交，但本地 fanout 失败。")
+        return committed
 
     def start_platform_exploration(self, request) -> bool:
         """兼容平台入口；实际启动统一委托 provider bundle。"""
@@ -6217,7 +6256,6 @@ class PlatformGeometryRuntime:
                         and _is_complete_exploration_terminal(
                             existing_terminal,
                             request_id=request_id,
-                            safe_stop_only=True,
                         )
                     ):
                         return existing_terminal.model_copy(deep=True)
@@ -6675,7 +6713,12 @@ class PlatformGeometryRuntime:
                 "CANCELLED",
             }
             parked_exploration = None
-            if exploration_status not in safe_terminal_statuses:
+            # FAILED may still retain a child navigation lease. Let Rust's
+            # StopMapping ownership gate decide whether mapping can stop.
+            if (
+                exploration_status != "FAILED"
+                and exploration_status not in safe_terminal_statuses
+            ):
                 request_id = str(
                     exploration_state.get("request_id") or ""
                 ).strip()
@@ -6965,7 +7008,62 @@ class PlatformGeometryRuntime:
         状态变化由 GeometryRuntimeProvider 的唯一轮询 worker 推送。
         """
 
-        def unavailable(message: str, reason: str) -> ExplorationState:
+        def active_request_id() -> str:
+            lock = getattr(self, "_exploration_loop_lock", None)
+            if lock is None:
+                current = getattr(self, "_external_exploration_request", None)
+            else:
+                with lock:
+                    current = getattr(self, "_external_exploration_request", None)
+            return str(getattr(current, "request_id", "") or "").strip()
+
+        def cached_complete_terminal() -> Optional[ExplorationState]:
+            lock = getattr(self, "_exploration_loop_lock", None)
+            if lock is None:
+                cached = getattr(self, "_external_exploration_terminal_state", None)
+            else:
+                with lock:
+                    cached = getattr(
+                        self,
+                        "_external_exploration_terminal_state",
+                        None,
+                    )
+            cached_request_id = _exploration_state_request_id(cached)
+            if not _is_complete_exploration_terminal(
+                cached,
+                request_id=cached_request_id,
+            ):
+                return None
+            return cached.model_copy(deep=True)
+
+        def unavailable(
+            message: str,
+            reason: str,
+            *,
+            grpc_code=grpc.StatusCode.UNAVAILABLE,
+            grpc_details: Optional[str] = None,
+        ) -> ExplorationState:
+            request_id = active_request_id()
+            if request_id:
+                raise GeometryRuntimeRpcError(
+                    rpc_name="GetExplorationState",
+                    grpc_code=grpc_code,
+                    grpc_details=grpc_details or message,
+                )
+            cached = cached_complete_terminal()
+            if cached is not None:
+                metadata = dict(cached.metadata)
+                metadata.update(
+                    {
+                        "runtime_ready": False,
+                        "state_snapshot_cached": True,
+                        "unavailable_reason": reason,
+                    }
+                )
+                return cached.model_copy(
+                    update={"metadata": metadata},
+                    deep=True,
+                )
             return ExplorationState(
                 status=ExplorationStatus.IDLE,
                 message=message,
@@ -7000,16 +7098,32 @@ class PlatformGeometryRuntime:
 
         try:
             payload = backend.get_exploration_state()
-        except Exception:
-            LOGGER.exception("读取 native exploration 状态失败。")
+        except GeometryRuntimeRpcError:
+            if active_request_id():
+                raise
+            LOGGER.warning(
+                "读取 native exploration 状态失败，但当前没有活跃 request。",
+                exc_info=True,
+            )
             return unavailable(
                 "读取 native exploration 状态失败。",
                 "state_rpc_failed",
             )
+        except Exception as exc:
+            LOGGER.exception("读取 native exploration 状态失败。")
+            if active_request_id():
+                error = GeometryRuntimeRpcError(
+                    rpc_name="GetExplorationState",
+                    grpc_code=grpc.StatusCode.UNKNOWN,
+                    grpc_details=str(exc) or "unexpected exploration state failure",
+                )
+                raise error from exc
+            return unavailable("读取 native exploration 状态失败。", "state_rpc_failed")
         if not isinstance(payload, dict):
             return unavailable(
                 "native exploration runtime 未返回有效状态。",
                 "state_payload_unavailable",
+                grpc_code=grpc.StatusCode.UNKNOWN,
             )
 
         state = PlatformGeometryProviderBundle._wrap_remote_exploration_state(payload)
@@ -8136,8 +8250,9 @@ class PlatformGeometryProviderBundle(
         """把 request 翻译成 gRPC facade 的 start_exploration 调用。
 
         request 是 platform 侧的 `ExploreAreaRequest` 契约；gRPC facade 接收完整
-        map pin、边界、停止条件、重试和 blacklist 参数。translation 或 RPC
-        失败时返回 False，不切换到第二套执行器。
+        map pin、边界、停止条件、重试和 blacklist 参数。确定性的 translation
+        失败返回 False；StartExploration RPC 结果不确定时保留 request ownership
+        并抛出 typed error，供上层执行 correlated stop barrier。
         """
         request_id = ""
         strategy = "wavefront"
@@ -8227,6 +8342,37 @@ class PlatformGeometryProviderBundle(
                 raise RuntimeError("探索启动前未获得 ACTIVE mapping version。")
             if map_revision <= 0:
                 map_revision = int(mapping_state.get("revision") or 0)
+        except Exception:
+            LOGGER.exception("Bundle.start_exploration 前置 mapping 准备失败。")
+            return False
+
+        def retain_uncertain_start(message: str) -> None:
+            uncertain_state = ExplorationState(
+                current_request_id=request_id,
+                status=ExplorationStatus.ACCEPTED,
+                strategy=strategy,
+                message=message,
+                metadata={
+                    "provider": "geometry_runtime",
+                    "state_source": "geometry_runtime_grpc",
+                    "runtime_ready": False,
+                    "backend_ownership_unknown": True,
+                    "exploration_terminal": False,
+                    "request_id": request_id,
+                    "map_version_id": map_version_id or None,
+                    "map_revision": map_revision,
+                },
+            )
+            with lock:
+                _commit_remote_exploration_state_locked(
+                    self.runtime,
+                    uncertain_state,
+                    request_id=request_id,
+                    request=request,
+                    map_version_id=map_version_id,
+                )
+
+        try:
             result = remote.start_exploration(
                 request_id=request_id,
                 strategy=strategy,
@@ -8238,13 +8384,26 @@ class PlatformGeometryProviderBundle(
                 max_navigation_retries=max_navigation_retries,
                 blacklist_radius_m=blacklist_radius_m,
             )
+        except GeometryRuntimeRpcError:
+            retain_uncertain_start(
+                "StartExploration RPC 结果不确定，等待 correlated stop 证明。"
+            )
+            raise
         except Exception:
             LOGGER.exception("Bundle.start_exploration gRPC 失败。")
             return False
         if not isinstance(result, dict):
-            return False
+            retain_uncertain_start(
+                "StartExploration 返回体无效，等待 correlated stop 证明。"
+            )
+            raise GeometryRuntimeRpcError(
+                rpc_name="StartExploration",
+                grpc_code=grpc.StatusCode.UNKNOWN,
+                grpc_details="StartExploration returned an invalid response payload",
+            )
         state = self._wrap_remote_exploration_state(result)
         raw_status = str(result.get("status") or "").strip().lower()
+        retained_child = bool(_exploration_state_child_task_id(state))
         accepted = raw_status not in {
             "",
             "idle",
@@ -8252,18 +8411,63 @@ class PlatformGeometryProviderBundle(
             "failed",
             "failure",
             "unimplemented",
-        }
+        } or (
+            retained_child and raw_status in {"failed", "failure"}
+        )
+        terminal = _is_complete_exploration_terminal(
+            state,
+            request_id=request_id,
+        )
+        ownership_pending = not terminal and accepted
+        if not raw_status and not retained_child:
+            retain_uncertain_start(
+                "StartExploration 缺少状态，等待 correlated stop 证明。"
+            )
+            raise GeometryRuntimeRpcError(
+                rpc_name="StartExploration",
+                grpc_code=grpc.StatusCode.UNKNOWN,
+                grpc_details="StartExploration response omitted status",
+            )
         notify_state = False
         with lock:
             if not _remote_operation_token_is_current_locked(
                 self.runtime,
                 remote_token,
             ):
-                return False
-            terminal = _is_complete_exploration_terminal(
-                state,
-                request_id=request_id,
-            )
+                if not ownership_pending:
+                    return False
+                _commit_remote_exploration_state_locked(
+                    self.runtime,
+                    ExplorationState(
+                        current_request_id=request_id,
+                        status=ExplorationStatus.ACCEPTED,
+                        strategy=strategy,
+                        message=(
+                            "StartExploration 返回后 provider generation 已切换，"
+                            "等待 correlated stop 证明。"
+                        ),
+                        metadata={
+                            "provider": "geometry_runtime",
+                            "state_source": "geometry_runtime_grpc",
+                            "runtime_ready": False,
+                            "backend_ownership_unknown": True,
+                            "exploration_terminal": False,
+                            "request_id": request_id,
+                            "map_version_id": map_version_id or None,
+                            "map_revision": map_revision,
+                        },
+                    ),
+                    request_id=request_id,
+                    request=request,
+                    map_version_id=map_version_id,
+                )
+                raise GeometryRuntimeRpcError(
+                    rpc_name="StartExploration",
+                    grpc_code=grpc.StatusCode.UNAVAILABLE,
+                    grpc_details=(
+                        "provider generation changed after StartExploration response"
+                    ),
+                )
             if accepted or terminal:
                 if not _commit_remote_exploration_state_locked(
                     self.runtime,
@@ -8272,6 +8476,15 @@ class PlatformGeometryProviderBundle(
                     request=request,
                     map_version_id=map_version_id,
                 ):
+                    if ownership_pending:
+                        raise GeometryRuntimeRpcError(
+                            rpc_name="StartExploration",
+                            grpc_code=grpc.StatusCode.UNKNOWN,
+                            grpc_details=(
+                                "StartExploration response could not be committed "
+                                "to the exact request"
+                            ),
+                        )
                     return False
             notify_state = True
         if notify_state:
@@ -8281,7 +8494,12 @@ class PlatformGeometryProviderBundle(
                 None,
             )
             if callable(notifier):
-                notifier(state)
+                try:
+                    notifier(state)
+                except Exception:
+                    LOGGER.exception(
+                        "StartExploration 状态已提交，但本地 fanout 失败。"
+                    )
         return accepted
 
     def start_exploration(self, request) -> bool:
@@ -8322,7 +8540,6 @@ class PlatformGeometryProviderBundle(
                 if _is_complete_exploration_terminal(
                     existing_terminal,
                     request_id=correlated_id,
-                    safe_stop_only=True,
                 ):
                     return True
                 return False
@@ -8342,6 +8559,11 @@ class PlatformGeometryProviderBundle(
             return False
         try:
             result = remote.stop_exploration(request_id=correlated_id)
+        except GeometryRuntimeRpcError:
+            LOGGER.exception(
+                "Bundle.stop_exploration gRPC 异常；correlated stop 结果不确定。"
+            )
+            raise
         except Exception:
             LOGGER.exception(
                 "Bundle.stop_exploration gRPC 异常；correlated stop 失败。"
@@ -8354,8 +8576,6 @@ class PlatformGeometryProviderBundle(
         accepted = raw_status not in {
             "",
             "rejected",
-            "failed",
-            "failure",
             "unimplemented",
         }
         with lock:
@@ -8385,7 +8605,6 @@ class PlatformGeometryProviderBundle(
                     and _is_complete_exploration_terminal(
                         existing_terminal,
                         request_id=correlated_id,
-                        safe_stop_only=True,
                     )
                 )
             committed = _commit_remote_exploration_state_locked(
@@ -8470,11 +8689,10 @@ class PlatformGeometryProviderBundle(
             )
             if not committed:
                 return False
-            terminal = state.status in {
-                ExplorationStatus.SUCCEEDED,
-                ExplorationStatus.FAILED,
-                ExplorationStatus.CANCELLED,
-            }
+            terminal = _is_complete_exploration_terminal(
+                state,
+                request_id=expected_id,
+            )
         self.runtime._notify_exploration_update(state)
         return terminal
 
@@ -8555,11 +8773,12 @@ class PlatformGeometryProviderBundle(
         except (TypeError, ValueError):
             map_revision = 0
         message = str(state.get("message") or "") or None
+        child_task_id = str(state.get("child_task_id") or "").strip()
         terminal = status_enum in {
             ExplorationStatus.SUCCEEDED,
             ExplorationStatus.FAILED,
             ExplorationStatus.CANCELLED,
-        }
+        } and not child_task_id
         metadata = {
             "provider": "geometry_runtime",
             "gRPC_facade": True,
@@ -8573,7 +8792,7 @@ class PlatformGeometryProviderBundle(
             "selected_source": state.get("selected_source") or None,
             "last_stop_reason": stop_reason or None,
             "request_id": state.get("request_id") or None,
-            "child_task_id": state.get("child_task_id") or None,
+            "child_task_id": child_task_id or None,
             "map_version_id": state.get("map_version_id") or None,
             "map_revision": map_revision,
             "revision": revision,

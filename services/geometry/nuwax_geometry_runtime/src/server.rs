@@ -45,6 +45,11 @@ pub struct GeometryRuntimeService {
 }
 
 const STOP_LISTENER_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const STOP_EXPLORATION_SAFETY_TIMEOUT: Duration = Duration::from_secs(6);
+#[cfg(test)]
+const STOP_EXPLORATION_SAFETY_TIMEOUT: Duration = Duration::from_millis(250);
+const STOP_EXPLORATION_SAFETY_POLL: Duration = Duration::from_millis(20);
 
 fn configured_base_frame() -> String {
     std::env::var("NUWAX_GEOMETRY_BASE_FRAME")
@@ -163,6 +168,16 @@ impl GeometryRuntimeService {
     async fn diagnostics(&self) -> RuntimeDiagnostics {
         let s = self.state.read().await;
         RuntimeDiagnostics::from_handle(&self.bridge, &s.phase, s.started_at_ns)
+    }
+
+    async fn ensure_running_admission(&self, operation: &str) -> Result<(), Status> {
+        let phase = self.state.read().await.phase.clone();
+        if phase != "running" {
+            return Err(Status::failed_precondition(format!(
+                "{operation} requires runtime phase=running, current={phase}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -721,15 +736,161 @@ impl GeometryRuntime for GeometryRuntimeService {
         let shutdown = self.shutdown.as_ref().ok_or_else(|| {
             Status::failed_precondition("runtime 未配置进程级 shutdown coordinator")
         })?;
+        let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
         {
             let mut state = self.state.write().await;
+            if state.phase == "stopped" {
+                return Ok(Response::new(StopResult { success: true }));
+            }
             state.phase = "stopping".into();
-            state.message = "正在关闭 gRPC listener".into();
+            state.message = "正在等待探索执行器安全停车".into();
         }
 
         let request_id = self.bridge.explore.snapshot().request_id;
-        let _ = self.bridge.explore.stop(&request_id).await;
+        let stop_snapshot = self.bridge.explore.stop(&request_id).await;
+        let safety_wait = tokio::time::timeout(STOP_EXPLORATION_SAFETY_TIMEOUT, async {
+            let mut snapshot = stop_snapshot;
+            loop {
+                if !self.bridge.explore.blocks_mapping_mutation().await {
+                    return Ok(snapshot);
+                }
+                if matches!(
+                    snapshot.status,
+                    crate::explore_runtime::STATUS_FAILED
+                        | crate::explore_runtime::STATUS_REJECTED
+                ) {
+                    return Err(Status::failed_precondition(format!(
+                        "exploration safety ownership retained: request_id={} child_task_id={} message={}",
+                        snapshot.request_id, snapshot.child_task_id, snapshot.message
+                    )));
+                }
+                tokio::time::sleep(STOP_EXPLORATION_SAFETY_POLL).await;
+                snapshot = self.bridge.explore.snapshot();
+            }
+        })
+        .await;
+        match safety_wait {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                let mut state = self.state.write().await;
+                state.phase = "failed".into();
+                state.message = error.message().to_string();
+                return Err(error);
+            }
+            Err(_) => {
+                if self.bridge.explore.blocks_mapping_mutation().await {
+                    let snapshot = self.bridge.explore.snapshot();
+                    let error = Status::deadline_exceeded(format!(
+                        "timed out waiting for exploration safety ownership release: request_id={} child_task_id={} status={}",
+                        snapshot.request_id, snapshot.child_task_id, snapshot.status
+                    ));
+                    let mut state = self.state.write().await;
+                    state.phase = "failed".into();
+                    state.message = error.message().to_string();
+                    return Err(error);
+                }
+            }
+        }
+
+        if let Some(active_lease) = self.bridge.nav.active_goal_lease().await {
+            {
+                let mut state = self.state.write().await;
+                state.message = "正在等待导航执行器安全停车".into();
+            }
+            let CancelOutcome { state: nav, lease } = nav_cancel(
+                &self.bridge,
+                &self.bridge.nav,
+                crate::nav_runtime::CancelGoalInput {
+                    goal_id: active_lease.session_id.clone(),
+                    owner_kind: active_lease.owner_kind,
+                    parent_request_id: active_lease.parent_request_id.clone(),
+                    goal_generation: active_lease.goal_generation,
+                    producer_runtime_generation: active_lease.producer_runtime_generation,
+                },
+            )
+            .await;
+            {
+                let mut shared = self.bridge.state.write().await;
+                shared.nav_state = nav.clone();
+            }
+            let update = NavigationUpdate::from_local(nav, &self.bridge.nav, lease).await;
+            let _ = self.bridge.nav_state_tx.send(update);
+
+            let cancel_after_dispatch = self.bridge.nav.cancel_snapshot();
+            let expected_cancel_lease = cancel_after_dispatch.lease.clone();
+            if expected_cancel_lease.is_none()
+                && self.bridge.nav.active_goal_lease().await.is_some()
+            {
+                let error = Status::failed_precondition(format!(
+                    "navigation cancel did not establish an exact safety ticket: goal_id={} phase={:?} message={}",
+                    active_lease.session_id,
+                    cancel_after_dispatch.phase,
+                    cancel_after_dispatch.message
+                ));
+                let mut state = self.state.write().await;
+                state.phase = "failed".into();
+                state.message = error.message().to_string();
+                return Err(error);
+            }
+
+            let navigation_wait =
+                tokio::time::timeout(STOP_EXPLORATION_SAFETY_TIMEOUT, async {
+                    loop {
+                        let cancel = self.bridge.nav.cancel_snapshot();
+                        let active = self.bridge.nav.active_goal_lease().await;
+                        if expected_cancel_lease.is_none() && active.is_none() {
+                            return Ok(());
+                        }
+                        if active.is_none()
+                            && cancel.phase == crate::nav_runtime::CancelPhase::Zeroed
+                            && cancel.lease == expected_cancel_lease
+                        {
+                            return Ok(());
+                        }
+                        if matches!(
+                            cancel.phase,
+                            crate::nav_runtime::CancelPhase::Failed
+                                | crate::nav_runtime::CancelPhase::TimedOut
+                        ) {
+                            return Err(Status::failed_precondition(format!(
+                                "navigation safety ownership retained: goal_id={} cancel_generation={} phase={:?} message={}",
+                                active_lease.session_id,
+                                cancel.generation,
+                                cancel.phase,
+                                cancel.message
+                            )));
+                        }
+                        tokio::time::sleep(STOP_EXPLORATION_SAFETY_POLL).await;
+                    }
+                })
+                .await;
+            match navigation_wait {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let mut state = self.state.write().await;
+                    state.phase = "failed".into();
+                    state.message = error.message().to_string();
+                    return Err(error);
+                }
+                Err(_) => {
+                    let cancel = self.bridge.nav.cancel_snapshot();
+                    let error = Status::deadline_exceeded(format!(
+                        "timed out waiting for navigation safety ownership release: goal_id={} cancel_generation={} phase={:?}",
+                        active_lease.session_id, cancel.generation, cancel.phase
+                    ));
+                    let mut state = self.state.write().await;
+                    state.phase = "failed".into();
+                    state.message = error.message().to_string();
+                    return Err(error);
+                }
+            }
+        }
         self.bridge.shutdown_explore_scheduler().await;
+
+        {
+            let mut state = self.state.write().await;
+            state.message = "正在关闭 gRPC listener".into();
+        }
 
         if let Err(error) = shutdown.request_and_wait_for_listener().await {
             let mut state = self.state.write().await;
@@ -904,6 +1065,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
             .clone();
         let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
+        self.ensure_running_admission("StartMapping").await?;
 
         let current = adapter.lock().snapshot();
         if current.active
@@ -921,6 +1083,14 @@ impl GeometryRuntime for GeometryRuntimeService {
             return Ok(Response::new(mapping_session_state(
                 snapshot,
                 "mapping session already active",
+            )));
+        }
+
+        if self.bridge.explore.blocks_mapping_mutation().await {
+            let exploration = self.bridge.explore.snapshot();
+            return Err(Status::failed_precondition(format!(
+                "exploration safety ownership must be released before starting a new mapping session: status={} request_id={} child_task_id={}",
+                exploration.status, exploration.request_id, exploration.child_task_id
             )));
         }
 
@@ -965,19 +1135,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         req: Request<StopMappingRequest>,
     ) -> Result<Response<MappingSessionState>, Status> {
         let request = req.into_inner();
-        let exploration = self.bridge.explore.snapshot();
-        if !matches!(
-            exploration.status,
-            crate::explore_runtime::STATUS_IDLE
-                | crate::explore_runtime::STATUS_STOPPED
-                | crate::explore_runtime::STATUS_SUCCEEDED
-                | crate::explore_runtime::STATUS_CANCELLED
-        ) {
-            return Err(Status::failed_precondition(format!(
-                "StopExploration exact terminal required before StopMapping: status={} request_id={}",
-                exploration.status, exploration.request_id
-            )));
-        }
         let adapter = self
             .bridge
             .mapping_adapter
@@ -985,6 +1142,14 @@ impl GeometryRuntime for GeometryRuntimeService {
             .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
             .clone();
         let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
+        self.ensure_running_admission("StopMapping").await?;
+        if self.bridge.explore.blocks_mapping_mutation().await {
+            let exploration = self.bridge.explore.snapshot();
+            return Err(Status::failed_precondition(format!(
+                "exploration safety ownership must be released before StopMapping: status={} request_id={} child_task_id={}",
+                exploration.status, exploration.request_id, exploration.child_task_id
+            )));
+        }
         let snapshot = adapter
             .lock()
             .stop_session(&request.session_id)
@@ -1056,19 +1221,6 @@ impl GeometryRuntime for GeometryRuntimeService {
                 )
                 .map_err(Status::invalid_argument)?;
         }
-        let exploration = self.bridge.explore.snapshot();
-        if !matches!(
-            exploration.status,
-            crate::explore_runtime::STATUS_IDLE
-                | crate::explore_runtime::STATUS_STOPPED
-                | crate::explore_runtime::STATUS_SUCCEEDED
-                | crate::explore_runtime::STATUS_CANCELLED
-        ) {
-            return Err(Status::failed_precondition(format!(
-                "StopExploration exact terminal required before ActivateMapVersion: status={} request_id={}",
-                exploration.status, exploration.request_id
-            )));
-        }
         let adapter = self
             .bridge
             .mapping_adapter
@@ -1076,6 +1228,14 @@ impl GeometryRuntime for GeometryRuntimeService {
             .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
             .clone();
         let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
+        self.ensure_running_admission("ActivateMapVersion").await?;
+        if self.bridge.explore.blocks_mapping_mutation().await {
+            let exploration = self.bridge.explore.snapshot();
+            return Err(Status::failed_precondition(format!(
+                "exploration safety ownership must be released before ActivateMapVersion: status={} request_id={} child_task_id={}",
+                exploration.status, exploration.request_id, exploration.child_task_id
+            )));
+        }
 
         let current = adapter.lock().snapshot();
         if current.active
@@ -1391,6 +1551,15 @@ impl GeometryRuntime for GeometryRuntimeService {
             frame_id,
             target,
         };
+        let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
+        self.ensure_running_admission("SetNavigationGoal").await?;
+        if self.bridge.explore.blocks_mapping_mutation().await {
+            let exploration = self.bridge.explore.snapshot();
+            return Err(Status::failed_precondition(format!(
+                "public navigation cannot start while exploration owns admission: status={} request_id={} child_task_id={}",
+                exploration.status, exploration.request_id, exploration.child_task_id
+            )));
+        }
         let SetGoalOutcome {
             state: nav, lease, ..
         } = set_goal(&self.bridge, &self.bridge.nav, input).await;
@@ -1699,7 +1868,46 @@ impl GeometryRuntime for GeometryRuntimeService {
         req: Request<ExploreRequest>,
     ) -> Result<Response<ExplorationState>, Status> {
         let r = req.get_ref();
-        let config = explore_config_from_request(r).map_err(Status::invalid_argument)?;
+        let mut config = explore_config_from_request(r).map_err(Status::invalid_argument)?;
+        let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
+        self.ensure_running_admission("StartExploration").await?;
+        let adapter = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
+            .clone();
+        let mapping = adapter.lock().snapshot();
+        if !mapping.active {
+            return Err(Status::failed_precondition(
+                "StartExploration requires an ACTIVE mapping session",
+            ));
+        }
+        let requested_version = config.map_version_id.trim();
+        if !requested_version.is_empty() && requested_version != mapping.map_version_id {
+            return Err(Status::failed_precondition(format!(
+                "StartExploration map_version_id mismatch: requested={} active={}",
+                requested_version, mapping.map_version_id
+            )));
+        }
+        config.map_version_id = mapping.map_version_id.clone();
+        if config.map_revision > mapping.revision
+            || (config.stop_conditions.stop_on_map_revision_change
+                && config.map_revision > 0
+                && config.map_revision != mapping.revision)
+        {
+            return Err(Status::failed_precondition(format!(
+                "StartExploration map_revision mismatch: requested={} active={}",
+                config.map_revision, mapping.revision
+            )));
+        }
+        config.map_revision = mapping.revision;
+        if let Some(active_navigation) = self.bridge.nav.active_goal_lease().await {
+            return Err(Status::failed_precondition(format!(
+                "StartExploration cannot replace active navigation ownership: goal_id={} parent_request_id={}",
+                active_navigation.session_id, active_navigation.parent_request_id
+            )));
+        }
         let snapshot = self
             .bridge
             .explore
@@ -2412,10 +2620,76 @@ mod cloud_map_update_tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use crate::explore_runtime::{
+        now_monotonic_nanos, now_unix_nanos, ChildNavigationCancelTicket, ChildNavigationLease,
+        ChildNavigationRequest, ChildNavigationResult, ChildNavigationSubmitError,
+        ChildNavigationTerminalProof, ChildNavigationTicket, ChildNavigationZeroProof,
+        ExploreCostmapSnapshot, ExploreNavigationSink, ExploreRobotPose, STATUS_ACCEPTED,
+        STATUS_ACTIVE, STATUS_FAILED, STATUS_STOPPING,
+    };
     use crate::lcm_runtime::{MapRevisionEvent, MapState};
     use crate::pointcloud::CloudMapShmWriter;
     use nalgebra::Point3;
+    use nuwax_nav_types_messages::grid::{OccupancyCell, OccupancyGrid2D};
+    use std::sync::Mutex as StdMutex;
     use tokio_stream::StreamExt;
+
+    #[derive(Default)]
+    struct LifecycleExploreSink {
+        last_lease: StdMutex<Option<ChildNavigationLease>>,
+        cancel_error: StdMutex<Option<String>>,
+    }
+
+    impl LifecycleExploreSink {
+        fn last_lease(&self) -> ChildNavigationLease {
+            self.last_lease
+                .lock()
+                .expect("lifecycle exploration sink lock")
+                .clone()
+                .expect("submitted child lease")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExploreNavigationSink for LifecycleExploreSink {
+        async fn submit(
+            &self,
+            request: ChildNavigationRequest,
+        ) -> Result<ChildNavigationTicket, ChildNavigationSubmitError> {
+            let lease = ChildNavigationLease {
+                session_id: request.request_id,
+                owner_kind: 2,
+                parent_request_id: request.parent_request_id,
+                goal_generation: 1,
+                map_version_id: request.map_version_id,
+                map_revision: request.map_revision,
+                goal_payload_sha256: [7; 32],
+            };
+            *self
+                .last_lease
+                .lock()
+                .expect("lifecycle exploration sink lock") = Some(lease.clone());
+            Ok(ChildNavigationTicket { lease })
+        }
+
+        async fn cancel(
+            &self,
+            lease: &ChildNavigationLease,
+        ) -> Result<ChildNavigationCancelTicket, String> {
+            if let Some(error) = self
+                .cancel_error
+                .lock()
+                .expect("lifecycle exploration sink lock")
+                .clone()
+            {
+                return Err(error);
+            }
+            Ok(ChildNavigationCancelTicket {
+                lease: lease.clone(),
+                cancel_generation: 1,
+            })
+        }
+    }
 
     async fn start_mapping_session(
         service: &GeometryRuntimeService,
@@ -2444,6 +2718,741 @@ mod lifecycle_tests {
         adapter.feed_pointcloud(&[Point3::new(x, 0.0, 2.0)]);
         assert!(adapter.build_and_publish(&handle.state, Some(&handle.map_revision_tx)));
         adapter.current_revision()
+    }
+
+    fn frontier_costmap(revision: u64) -> ExploreCostmapSnapshot {
+        let mut grid = OccupancyGrid2D {
+            resolution: 0.5,
+            origin: Point2 { x: 0.0, y: 0.0 },
+            width: 12,
+            height: 12,
+            cells: vec![OccupancyCell::Unknown; 144],
+        };
+        for y in 2..=7 {
+            for x in 2..=7 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        ExploreCostmapSnapshot {
+            grid,
+            frame_id: "map".to_string(),
+            map_version_id: "mapver_000201".to_string(),
+            map_revision: revision,
+        }
+    }
+
+    fn activation_request(session_id: &str, map_version_id: &str) -> ActivateMapVersionRequest {
+        ActivateMapVersionRequest {
+            session_id: session_id.to_string(),
+            map_name: "warehouse".to_string(),
+            map_version_id: map_version_id.to_string(),
+            checkpoint: Some(OccupancyGridData {
+                meta: Some(OccupancyGridMeta {
+                    width: 2,
+                    height: 2,
+                    resolution: 0.05,
+                    origin_x: -1.0,
+                    origin_y: 2.0,
+                    frame_id: "map".to_string(),
+                    revision: 1,
+                    timestamp_ns: 1_700_000_000_000_000_000,
+                }),
+                data: vec![u8::MAX, 0, 100, 50],
+            }),
+            cloud_checkpoint: None,
+        }
+    }
+
+    fn exploration_request(
+        request_id: &str,
+        map_version_id: &str,
+        map_revision: u64,
+    ) -> ExploreRequest {
+        ExploreRequest {
+            request_id: request_id.to_string(),
+            strategy: "wavefront".to_string(),
+            arbitration: "prefer_wavefront".to_string(),
+            map_version_id: map_version_id.to_string(),
+            map_revision,
+            ..ExploreRequest::default()
+        }
+    }
+
+    async fn start_public_navigation(
+        service: &GeometryRuntimeService,
+        handle: &GeometryRuntimeHandle,
+        goal_id: &str,
+    ) -> NavigationState {
+        {
+            let mut shared = handle.state.write().await;
+            shared.pose = PoseState {
+                frame_id: "map".to_string(),
+                timestamp_ns: now_ns(),
+                qw: 1.0,
+                ..PoseState::default()
+            };
+            shared.map.frame_id = "map".to_string();
+            shared.map.revision = 1;
+        }
+        handle
+            .nav
+            .observe_stack_state(crate::lcm_runtime::NavState {
+                status: "IDLE".to_string(),
+                timestamp_ns: now_ns(),
+                ..crate::lcm_runtime::NavState::default()
+            })
+            .await;
+        handle
+            .nav
+            .observe_tf_chain(crate::nav_runtime::TfChainObservation {
+                generation: 1,
+                map_frame: "map".to_string(),
+                odom_frame: "odom".to_string(),
+                base_frame: "base_link".to_string(),
+                map_to_odom: true,
+                odom_to_base: true,
+            })
+            .expect("TF observation");
+        handle
+            .nav
+            .observe_planner_input(crate::nav_runtime::PlannerInputObservation {
+                generation: 1,
+                map_revision: 1,
+                map_frame: "map".to_string(),
+                pose_frame: "map".to_string(),
+                ready: true,
+            })
+            .expect("planner observation");
+        handle
+            .nav
+            .observe_motion_sink(crate::nav_runtime::MotionSinkObservation {
+                generation: 1,
+                ready: true,
+            })
+            .expect("motion sink");
+        GeometryRuntime::set_navigation_goal(
+            service,
+            Request::new(NavigationGoal {
+                pose: Some(Pose {
+                    orientation: Some(Quat {
+                        w: 1.0,
+                        ..Quat::default()
+                    }),
+                    frame_id: "map".to_string(),
+                    timestamp_ns: now_ns(),
+                    ..Pose::default()
+                }),
+                frame_id: "map".to_string(),
+                goal_id: goal_id.to_string(),
+                map_version_id: "map-v1".to_string(),
+                ..NavigationGoal::default()
+            }),
+        )
+        .await
+        .expect("public navigation goal")
+        .into_inner()
+    }
+
+    async fn start_active_exploration(
+        handle: &GeometryRuntimeHandle,
+        sink: Arc<LifecycleExploreSink>,
+        request_id: &str,
+    ) -> (String, ChildNavigationLease) {
+        handle.explore.set_navigation_sink(sink.clone());
+        handle
+            .explore
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .expect("frontier costmap");
+        assert_eq!(
+            handle
+                .explore
+                .start(request_id, "prefer_wavefront")
+                .await
+                .status,
+            STATUS_ACCEPTED
+        );
+        let active = handle.explore.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, STATUS_ACTIVE);
+        let lease = sink.last_lease();
+        assert_eq!(active.child_task_id, lease.session_id);
+        (active.child_task_id, lease)
+    }
+
+    #[tokio::test]
+    async fn process_stop_waits_for_exploration_zero_before_listener_shutdown() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let sink = Arc::new(LifecycleExploreSink::default());
+        let (child_task_id, lease) =
+            start_active_exploration(&handle, sink, "process-stop-zero").await;
+        let (shutdown, mut listener) = crate::server::shutdown_channel();
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
+        let listener_requested = Arc::new(tokio::sync::Notify::new());
+        let listener_task = {
+            let listener_requested = listener_requested.clone();
+            tokio::spawn(async move {
+                listener.wait_for_request().await;
+                listener_requested.notify_one();
+                listener.mark_listener_closed();
+            })
+        };
+        let stop_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while handle.explore.snapshot().status != STATUS_STOPPING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process Stop must dispatch exploration cancellation");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
+                .await
+                .is_err(),
+            "listener shutdown must remain gated on ZEROED proof"
+        );
+
+        handle
+            .explore
+            .report_navigation_result(
+                &child_task_id,
+                ChildNavigationResult::Cancelled(ChildNavigationZeroProof {
+                    lease,
+                    cancel_generation: 1,
+                    zero_ack_id: "process-stop-zero-1".to_string(),
+                    zero_applied_monotonic_ns: now_monotonic_nanos(),
+                }),
+            )
+            .await
+            .expect("process Stop ZEROED proof");
+
+        let response = stop_task
+            .await
+            .expect("process Stop task")
+            .expect("process Stop response")
+            .into_inner();
+        assert!(response.success);
+        listener_task.await.expect("listener shutdown task");
+        assert!(!handle.explore.blocks_mapping_mutation().await);
+        assert_eq!(service.state.read().await.phase, "stopped");
+    }
+
+    #[tokio::test]
+    async fn process_stop_failure_keeps_scheduler_and_listener_alive() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let sink = Arc::new(LifecycleExploreSink::default());
+        start_active_exploration(&handle, sink.clone(), "process-stop-failed").await;
+        *sink
+            .cancel_error
+            .lock()
+            .expect("lifecycle exploration sink lock") = Some("guard unavailable".to_string());
+        let (shutdown, mut listener) = crate::server::shutdown_channel();
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
+
+        let error = GeometryRuntime::stop(&service, Request::new(StopRequest {}))
+            .await
+            .expect_err("retained ownership must reject process Stop");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("safety ownership retained"));
+        assert!(handle.explore.blocks_mapping_mutation().await);
+        assert_eq!(service.state.read().await.phase, "failed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
+                .await
+                .is_err(),
+            "failed process Stop must not request listener shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_stop_timeout_does_not_request_listener_shutdown() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let sink = Arc::new(LifecycleExploreSink::default());
+        start_active_exploration(&handle, sink, "process-stop-timeout").await;
+        let (shutdown, mut listener) = crate::server::shutdown_channel();
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
+
+        let error = GeometryRuntime::stop(&service, Request::new(StopRequest {}))
+            .await
+            .expect_err("missing ZEROED proof must time out process Stop");
+
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(error.message().contains("safety ownership release"));
+        assert!(handle.explore.blocks_mapping_mutation().await);
+        assert_eq!(service.state.read().await.phase, "failed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
+                .await
+                .is_err(),
+            "timed-out process Stop must not request listener shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_stop_waits_for_public_navigation_zero_before_listener_shutdown() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let (shutdown, mut listener) = crate::server::shutdown_channel();
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
+        let accepted = start_public_navigation(&service, &handle, "public-stop-zero").await;
+        assert_eq!(accepted.status, "ACCEPTED");
+        let active_lease = handle
+            .nav
+            .active_goal_lease()
+            .await
+            .expect("active public lease");
+        let listener_requested = Arc::new(tokio::sync::Notify::new());
+        let listener_task = {
+            let listener_requested = listener_requested.clone();
+            tokio::spawn(async move {
+                listener.wait_for_request().await;
+                listener_requested.notify_one();
+                listener.mark_listener_closed();
+            })
+        };
+        let stop_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.nav.cancel_snapshot().phase != crate::nav_runtime::CancelPhase::Pending {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process Stop must dispatch public navigation cancellation");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
+                .await
+                .is_err(),
+            "listener shutdown must wait for public navigation ZEROED proof"
+        );
+        let pending = handle.nav.cancel_snapshot();
+        assert_eq!(pending.lease.as_ref(), Some(&active_lease));
+        handle
+            .nav
+            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
+                cancel_generation: pending.generation,
+                goal_id: active_lease.session_id.clone(),
+                owner_kind: active_lease.owner_kind,
+                parent_request_id: active_lease.parent_request_id.clone(),
+                goal_generation: active_lease.goal_generation,
+                status: crate::nav_runtime::MotionSinkCancelAckStatus::Zeroed,
+                message: "process stop public zero".to_string(),
+            })
+            .await;
+
+        let stopped = stop_task
+            .await
+            .expect("process Stop join")
+            .expect("process Stop response")
+            .into_inner();
+        assert!(stopped.success);
+        listener_task.await.expect("listener shutdown task");
+        assert!(handle.nav.active_goal_lease().await.is_none());
+        assert_eq!(service.state.read().await.phase, "stopped");
+    }
+
+    #[tokio::test]
+    async fn process_stop_closes_exploration_and_public_navigation_admission_atomically() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let (shutdown, mut listener) = crate::server::shutdown_channel();
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
+        start_mapping_session(&service, "stop-admission", "mapver_stop_admission").await;
+        handle
+            .explore
+            .set_navigation_sink(Arc::new(LifecycleExploreSink::default()));
+        let admission_guard = handle.mapping_lifecycle_lock.lock().await;
+        let stop_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let explore_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::start_exploration(
+                    &service,
+                    Request::new(exploration_request(
+                        "queued-after-stop",
+                        "mapver_stop_admission",
+                        0,
+                    )),
+                )
+                .await
+            })
+        };
+        let navigation_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::set_navigation_goal(
+                    &service,
+                    Request::new(NavigationGoal {
+                        goal_id: "queued-public-after-stop".to_string(),
+                        ..NavigationGoal::default()
+                    }),
+                )
+                .await
+            })
+        };
+        let listener_task = tokio::spawn(async move {
+            listener.wait_for_request().await;
+            listener.mark_listener_closed();
+        });
+        drop(admission_guard);
+
+        assert!(stop_task.await.unwrap().unwrap().into_inner().success);
+        listener_task.await.unwrap();
+        let explore_error = explore_task
+            .await
+            .unwrap()
+            .expect_err("explore admission closed");
+        let navigation_error = navigation_task
+            .await
+            .unwrap()
+            .expect_err("public navigation admission closed");
+        assert_eq!(explore_error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(navigation_error.code(), tonic::Code::FailedPrecondition);
+        assert!(explore_error.message().contains("current=stopped"));
+        assert!(navigation_error.message().contains("current=stopped"));
+        assert!(!handle.explore.blocks_mapping_mutation().await);
+        assert!(handle.nav.active_goal_lease().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_exploration_requires_exact_active_mapping_identity() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle.clone());
+        handle
+            .explore
+            .set_navigation_sink(Arc::new(LifecycleExploreSink::default()));
+
+        let inactive = GeometryRuntime::start_exploration(
+            &service,
+            Request::new(exploration_request("inactive-map", "mapver_exact", 0)),
+        )
+        .await
+        .expect_err("inactive mapping must reject exploration");
+        assert_eq!(inactive.code(), tonic::Code::FailedPrecondition);
+
+        let activated = GeometryRuntime::activate_map_version(
+            &service,
+            Request::new(activation_request("exact-map", "mapver_exact")),
+        )
+        .await
+        .expect("activate exact test map")
+        .into_inner();
+        let current_revision = activated.revision;
+        let wrong_version = GeometryRuntime::start_exploration(
+            &service,
+            Request::new(exploration_request("wrong-version", "mapver_other", 0)),
+        )
+        .await
+        .expect_err("wrong map version must reject exploration");
+        assert_eq!(wrong_version.code(), tonic::Code::FailedPrecondition);
+
+        let mut wrong_revision =
+            exploration_request("wrong-revision", "mapver_exact", current_revision + 1);
+        wrong_revision.stop_conditions = Some(ExplorationStopConditions {
+            stop_on_map_revision_change: true,
+            ..ExplorationStopConditions::default()
+        });
+        let revision_error =
+            GeometryRuntime::start_exploration(&service, Request::new(wrong_revision))
+                .await
+                .expect_err("mismatched pinned revision must reject exploration");
+        assert_eq!(revision_error.code(), tonic::Code::FailedPrecondition);
+
+        let accepted = GeometryRuntime::start_exploration(
+            &service,
+            Request::new(exploration_request(
+                "exact-mapping",
+                "mapver_exact",
+                current_revision,
+            )),
+        )
+        .await
+        .expect("exact active mapping identity")
+        .into_inner();
+        assert_eq!(accepted.status, STATUS_ACCEPTED);
+        assert_eq!(accepted.request_id, "exact-mapping");
+    }
+
+    #[tokio::test]
+    async fn exploration_start_and_mapping_mutations_share_one_transition_barrier() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle.clone());
+        start_mapping_session(&service, "barrier-map", "mapver_barrier").await;
+        handle
+            .explore
+            .set_navigation_sink(Arc::new(LifecycleExploreSink::default()));
+        let lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
+        let start_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::start_exploration(
+                    &service,
+                    Request::new(exploration_request("barrier-explore", "mapver_barrier", 0)),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let stop_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::stop_mapping(
+                    &service,
+                    Request::new(StopMappingRequest {
+                        session_id: "barrier-map".to_string(),
+                        reason: "must not overtake start".to_string(),
+                    }),
+                )
+                .await
+            })
+        };
+        let activate_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::activate_map_version(
+                    &service,
+                    Request::new(activation_request(
+                        "barrier-activate",
+                        "mapver_after_barrier",
+                    )),
+                )
+                .await
+            })
+        };
+        drop(lifecycle_guard);
+
+        let started = start_task
+            .await
+            .unwrap()
+            .expect("queued exploration start")
+            .into_inner();
+        assert_eq!(started.status, STATUS_ACCEPTED);
+        let stop_error = stop_task
+            .await
+            .unwrap()
+            .expect_err("StopMapping must be fenced");
+        let activate_error = activate_task
+            .await
+            .unwrap()
+            .expect_err("ActivateMapVersion must be fenced");
+        assert_eq!(stop_error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(activate_error.code(), tonic::Code::FailedPrecondition);
+        let mapping = handle
+            .mapping_adapter
+            .as_ref()
+            .expect("mapping adapter")
+            .lock()
+            .snapshot();
+        assert!(mapping.active);
+        assert_eq!(mapping.map_version_id, "mapver_barrier");
+    }
+
+    #[tokio::test]
+    async fn mapping_mutation_allows_failed_exploration_without_safety_ownership() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle.clone());
+        start_mapping_session(&service, "failed-session", "mapver_000200").await;
+        handle
+            .explore
+            .set_navigation_sink(Arc::new(LifecycleExploreSink::default()));
+        assert_eq!(
+            handle
+                .explore
+                .start("failed-without-child", "prefer_wavefront")
+                .await
+                .status,
+            STATUS_ACCEPTED
+        );
+
+        let failed = handle
+            .explore
+            .tick_with_pose(ExploreRobotPose {
+                x: 0.0,
+                y: 0.0,
+                frame_id: "odom".to_string(),
+                source_timestamp_ns: now_unix_nanos(),
+                received_monotonic_ns: now_monotonic_nanos(),
+            })
+            .await;
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert!(failed.child_task_id.is_empty());
+        assert!(!handle.explore.blocks_mapping_mutation().await);
+
+        let stopped = GeometryRuntime::stop_mapping(
+            &service,
+            Request::new(StopMappingRequest {
+                session_id: "failed-session".to_string(),
+                reason: "terminal exploration failure".to_string(),
+            }),
+        )
+        .await
+        .expect("child-free FAILED must allow StopMapping")
+        .into_inner();
+        assert_eq!(stopped.phase, "STOPPED");
+        assert_eq!(handle.explore.snapshot().status, STATUS_FAILED);
+        assert_eq!(
+            handle.explore.snapshot().last_stop_reason,
+            failed.last_stop_reason
+        );
+
+        let activated = GeometryRuntime::activate_map_version(
+            &service,
+            Request::new(activation_request("mapload:failed", "mapver_000201")),
+        )
+        .await
+        .expect("child-free FAILED must allow ActivateMapVersion")
+        .into_inner();
+        assert_eq!(activated.phase, "ACTIVE");
+        assert_eq!(handle.explore.snapshot().status, STATUS_FAILED);
+        assert_eq!(
+            handle.explore.snapshot().last_stop_reason,
+            failed.last_stop_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn mapping_mutation_waits_for_late_zeroed_after_child_cancel_failure() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle.clone());
+        start_mapping_session(&service, "parked-session", "mapver_000201").await;
+        let sink = Arc::new(LifecycleExploreSink::default());
+        handle.explore.set_navigation_sink(sink.clone());
+        handle
+            .explore
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .expect("frontier costmap");
+        assert_eq!(
+            handle
+                .explore
+                .start("parked-exploration", "prefer_wavefront")
+                .await
+                .status,
+            STATUS_ACCEPTED
+        );
+        let active = handle.explore.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, STATUS_ACTIVE);
+        let lease = sink.last_lease();
+        assert_eq!(active.child_task_id, lease.session_id);
+        assert_eq!(
+            handle.explore.stop("parked-exploration").await.status,
+            STATUS_STOPPING
+        );
+
+        let failed = handle
+            .explore
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::CancelFailed {
+                    proof: ChildNavigationTerminalProof {
+                        lease: lease.clone(),
+                    },
+                    cancel_generation: 1,
+                    reason: "CANCEL_ZERO_ACK_TIMEOUT".to_string(),
+                },
+            )
+            .await
+            .expect("cancel failure terminal");
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert_eq!(failed.last_stop_reason, "child_cancel_failed");
+        assert_eq!(failed.child_task_id, active.child_task_id);
+        assert!(handle.explore.blocks_mapping_mutation().await);
+
+        let stop_error = GeometryRuntime::stop_mapping(
+            &service,
+            Request::new(StopMappingRequest {
+                session_id: "parked-session".to_string(),
+                reason: "must remain parked".to_string(),
+            }),
+        )
+        .await
+        .expect_err("retained child ownership must block StopMapping");
+        assert_eq!(stop_error.code(), tonic::Code::FailedPrecondition);
+        let activate_error = GeometryRuntime::activate_map_version(
+            &service,
+            Request::new(activation_request("mapload:blocked", "mapver_000202")),
+        )
+        .await
+        .expect_err("retained child ownership must block ActivateMapVersion");
+        assert_eq!(activate_error.code(), tonic::Code::FailedPrecondition);
+        assert!(handle
+            .mapping_adapter
+            .as_ref()
+            .expect("mapping adapter")
+            .lock()
+            .is_active());
+
+        let released = handle
+            .explore
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(ChildNavigationZeroProof {
+                    lease,
+                    cancel_generation: 1,
+                    zero_ack_id: "late-zero-1".to_string(),
+                    zero_applied_monotonic_ns: now_monotonic_nanos(),
+                }),
+            )
+            .await
+            .expect("late ZEROED proof");
+        assert_eq!(released.status, STATUS_FAILED);
+        assert_eq!(released.last_stop_reason, "child_cancel_failed");
+        assert!(released.child_task_id.is_empty());
+        assert!(!handle.explore.blocks_mapping_mutation().await);
+
+        GeometryRuntime::stop_mapping(
+            &service,
+            Request::new(StopMappingRequest {
+                session_id: "parked-session".to_string(),
+                reason: "late ZEROED released ownership".to_string(),
+            }),
+        )
+        .await
+        .expect("late ZEROED must release StopMapping");
+        let activated = GeometryRuntime::activate_map_version(
+            &service,
+            Request::new(activation_request("mapload:released", "mapver_000202")),
+        )
+        .await
+        .expect("late ZEROED must release ActivateMapVersion")
+        .into_inner();
+        assert_eq!(activated.phase, "ACTIVE");
+        let final_exploration = handle.explore.snapshot();
+        assert_eq!(final_exploration.status, STATUS_FAILED);
+        assert_eq!(final_exploration.last_stop_reason, "child_cancel_failed");
     }
 
     #[tokio::test]

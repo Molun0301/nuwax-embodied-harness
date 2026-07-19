@@ -1785,8 +1785,12 @@ fn normalize_pending_cancel_zero_ack_path_identity(
     };
     let authoritative_path_is_sealed =
         lease.path_revision > 0 && lease.path_payload_sha256 != [0; 32];
-    let cancellation_identity_matches = cancel.phase == crate::nav_runtime::CancelPhase::Pending
-        && cancel.generation == feedback.cancel_generation
+    let cancellation_identity_matches = matches!(
+        cancel.phase,
+        crate::nav_runtime::CancelPhase::Pending
+            | crate::nav_runtime::CancelPhase::Failed
+            | crate::nav_runtime::CancelPhase::TimedOut
+    ) && cancel.generation == feedback.cancel_generation
         && cancel.goal_id == update.state.goal_id
         && lease.session_id == update.state.goal_id
         && lease.owner_kind == feedback.owner_kind
@@ -1942,7 +1946,12 @@ async fn apply_typed_navigation_feedback(
         && update.feedback.zero_applied_monotonic_ns > 0;
     let cancel_snapshot = nav.cancel_snapshot();
     let correlated = complete_zero_proof
-        && cancel_snapshot.phase == crate::nav_runtime::CancelPhase::Pending
+        && matches!(
+            cancel_snapshot.phase,
+            crate::nav_runtime::CancelPhase::Pending
+                | crate::nav_runtime::CancelPhase::Failed
+                | crate::nav_runtime::CancelPhase::TimedOut
+        )
         && cancel_snapshot.generation == update.feedback.cancel_generation
         && cancel_snapshot.goal_id == update.state.goal_id
         && cancel_snapshot.lease.as_ref().is_some_and(|lease| {
@@ -4496,6 +4505,92 @@ mod typed_navigation_feedback_tests {
             handle.nav.cancel_snapshot().phase,
             crate::nav_runtime::CancelPhase::Zeroed
         );
+    }
+
+    #[tokio::test]
+    async fn exact_late_zero_recovers_failed_or_timed_out_cancel_with_pre_path_sentinel() {
+        for recover_from_failure in [true, false] {
+            let goal_id = if recover_from_failure {
+                "goal-late-zero-failed"
+            } else {
+                "goal-late-zero-timeout"
+            };
+            let (handle, lease) = handle_with_active_path_lease(goal_id).await;
+            let cancel = begin_pending_cancel(&handle, &lease).await;
+            if recover_from_failure {
+                let failed = handle
+                    .nav
+                    .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
+                        cancel_generation: cancel.generation,
+                        goal_id: lease.session_id.clone(),
+                        owner_kind: lease.owner_kind,
+                        parent_request_id: lease.parent_request_id.clone(),
+                        goal_generation: lease.goal_generation,
+                        status: crate::nav_runtime::MotionSinkCancelAckStatus::Failed,
+                        message: "guard reported cancellation failure".to_string(),
+                    })
+                    .await;
+                assert_eq!(failed.state.status, "FAILED");
+                assert_eq!(
+                    handle.nav.cancel_snapshot().phase,
+                    crate::nav_runtime::CancelPhase::Failed
+                );
+            } else {
+                handle.nav.expire_cancel_for_test();
+                assert!(handle.nav.poll_cancel_timeout().await.is_some());
+                assert_eq!(
+                    handle.nav.cancel_snapshot().phase,
+                    crate::nav_runtime::CancelPhase::TimedOut
+                );
+            }
+            let retained_phase = handle.nav.cancel_snapshot().phase;
+
+            let mut wrong_generation = feedback_update(&lease.session_id);
+            wrong_generation.state.status = "CANCELLED".into();
+            wrong_generation.feedback.cancel_generation = cancel.generation.saturating_add(1);
+            wrong_generation.feedback.zero_ack_id = "late-zero-wrong-generation".into();
+            wrong_generation.feedback.zero_applied_monotonic_ns = 31;
+            assert!(
+                apply_typed_navigation_feedback(&handle.nav, wrong_generation)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(handle.nav.cancel_snapshot().phase, retained_phase);
+
+            let mut wrong_lease = feedback_update(&lease.session_id);
+            wrong_lease.state.status = "CANCELLED".into();
+            wrong_lease.feedback.owner_kind += 1;
+            wrong_lease.feedback.cancel_generation = cancel.generation;
+            wrong_lease.feedback.zero_ack_id = "late-zero-wrong-lease".into();
+            wrong_lease.feedback.zero_applied_monotonic_ns = 32;
+            assert!(apply_typed_navigation_feedback(&handle.nav, wrong_lease)
+                .await
+                .is_none());
+            assert_eq!(handle.nav.cancel_snapshot().phase, retained_phase);
+
+            let mut exact = feedback_update(&lease.session_id);
+            exact.state.status = "CANCELLED".into();
+            exact.state.message = "late actuator ZEROED".into();
+            exact.feedback.cancel_generation = cancel.generation;
+            exact.feedback.zero_ack_id = "late-zero-exact".into();
+            exact.feedback.zero_applied_monotonic_ns = 33;
+            let exact = apply_typed_navigation_feedback(&handle.nav, exact)
+                .await
+                .expect("exact late ZEROED proof");
+
+            assert_eq!(exact.state.status, "CANCELLED");
+            assert_eq!(exact.feedback.cancel_phase, "ZEROED");
+            assert!(exact.feedback.actuator_zeroed);
+            assert_eq!(exact.feedback.path_revision, lease.path_revision);
+            assert_eq!(
+                exact.feedback.path_payload_sha256,
+                lease.path_payload_sha256
+            );
+            assert_eq!(
+                handle.nav.cancel_snapshot().phase,
+                crate::nav_runtime::CancelPhase::Zeroed
+            );
+        }
     }
 
     #[tokio::test]

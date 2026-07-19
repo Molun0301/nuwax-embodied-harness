@@ -998,7 +998,14 @@ impl NavRuntimeState {
                 .as_ref()
                 .is_some_and(|active| active.lease == *lease)
         });
-        let ack_matches = cancel.phase == CancelPhase::Pending
+        let phase_accepts_ack = match ack.status {
+            MotionSinkCancelAckStatus::Zeroed => matches!(
+                cancel.phase,
+                CancelPhase::Pending | CancelPhase::Failed | CancelPhase::TimedOut
+            ),
+            MotionSinkCancelAckStatus::Failed => cancel.phase == CancelPhase::Pending,
+        };
+        let ack_matches = phase_accepts_ack
             && cancel.generation == ack.cancel_generation
             && cancel.goal_id == ack.goal_id
             && lease.as_ref().is_some_and(|lease| {
@@ -1195,7 +1202,7 @@ impl NavRuntimeState {
     }
 
     #[cfg(test)]
-    fn expire_cancel_for_test(&self) {
+    pub(crate) fn expire_cancel_for_test(&self) {
         if let Ok(mut cancel) = self.cancel.lock() {
             cancel.requested_at =
                 Instant::now().checked_sub(cancel_timeout() + Duration::from_millis(1));
@@ -2681,6 +2688,22 @@ mod tests {
         }
     }
 
+    fn cancel_ack(
+        lease: &GoalLease,
+        cancel_generation: u64,
+        status: MotionSinkCancelAckStatus,
+    ) -> MotionSinkCancelAck {
+        MotionSinkCancelAck {
+            cancel_generation,
+            goal_id: lease.session_id.clone(),
+            owner_kind: lease.owner_kind,
+            parent_request_id: lease.parent_request_id.clone(),
+            goal_generation: lease.goal_generation,
+            status,
+            message: "test cancellation acknowledgement".to_string(),
+        }
+    }
+
     fn sealed_path(lease: &GoalLease, path_revision: u64, x: f64) -> schema::PathEnvelope {
         let mut path = schema::PathEnvelope {
             schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
@@ -3962,6 +3985,196 @@ mod tests {
         let slot = state.inner.read().await;
         assert_eq!(slot.phase, NavPhase::Failed);
         assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease));
+    }
+
+    #[tokio::test]
+    async fn exact_zero_recovers_failed_and_timed_out_cancel_without_weakening_identity() {
+        for recover_from_failure in [true, false] {
+            let handle = make_handle().await;
+            let state = NavRuntimeState::from_env();
+            let lease = test_lease(
+                if recover_from_failure {
+                    "late-zero-after-failure"
+                } else {
+                    "late-zero-after-timeout"
+                },
+                1,
+            );
+            {
+                let mut slot = state.inner.write().await;
+                slot.phase = NavPhase::Running;
+                slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+            }
+            assert_eq!(
+                cancel(&handle, &state, cancel_input(&lease))
+                    .await
+                    .state
+                    .status,
+                "PENDING"
+            );
+            let pending = state.cancel_snapshot();
+            if recover_from_failure {
+                let failed = state
+                    .observe_cancel_ack(cancel_ack(
+                        &lease,
+                        pending.generation,
+                        MotionSinkCancelAckStatus::Failed,
+                    ))
+                    .await;
+                assert_eq!(failed.state.status, "FAILED");
+                assert_eq!(state.cancel_snapshot().phase, CancelPhase::Failed);
+            } else {
+                state.expire_cancel_for_test();
+                assert!(state.poll_cancel_timeout().await.is_some());
+                assert_eq!(state.cancel_snapshot().phase, CancelPhase::TimedOut);
+            }
+
+            let mut wrong_generation = cancel_ack(
+                &lease,
+                pending.generation.saturating_add(1),
+                MotionSinkCancelAckStatus::Zeroed,
+            );
+            wrong_generation.message = "wrong generation".to_string();
+            assert_ne!(
+                state
+                    .observe_cancel_ack(wrong_generation)
+                    .await
+                    .state
+                    .status,
+                "CANCELLED"
+            );
+            let retained_phase = state.cancel_snapshot().phase;
+
+            let mut wrong_lease = cancel_ack(
+                &lease,
+                pending.generation,
+                MotionSinkCancelAckStatus::Zeroed,
+            );
+            wrong_lease.owner_kind += 1;
+            wrong_lease.message = "wrong lease".to_string();
+            assert_ne!(
+                state.observe_cancel_ack(wrong_lease).await.state.status,
+                "CANCELLED"
+            );
+            assert_eq!(state.cancel_snapshot().phase, retained_phase);
+
+            let zeroed = state
+                .observe_cancel_ack(cancel_ack(
+                    &lease,
+                    pending.generation,
+                    MotionSinkCancelAckStatus::Zeroed,
+                ))
+                .await;
+            assert_eq!(zeroed.state.status, "CANCELLED");
+            assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
+            assert!(state.active_goal_lease().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_ack_remains_rejected_after_cancel_timeout() {
+        let handle = make_handle().await;
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("failed-after-timeout", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+        cancel(&handle, &state, cancel_input(&lease)).await;
+        let pending = state.cancel_snapshot();
+        state.expire_cancel_for_test();
+        assert!(state.poll_cancel_timeout().await.is_some());
+
+        let rejected = state
+            .observe_cancel_ack(cancel_ack(
+                &lease,
+                pending.generation,
+                MotionSinkCancelAckStatus::Failed,
+            ))
+            .await;
+
+        assert_ne!(rejected.state.status, "CANCELLED");
+        assert_eq!(state.cancel_snapshot().phase, CancelPhase::TimedOut);
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
+    }
+
+    #[tokio::test]
+    async fn timeout_and_exact_zero_race_always_finishes_zeroed() {
+        let handle = make_handle().await;
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("timeout-zero-race", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+        cancel(&handle, &state, cancel_input(&lease)).await;
+        let pending = state.cancel_snapshot();
+        state.expire_cancel_for_test();
+
+        let (timeout_result, zeroed) = tokio::join!(
+            state.poll_cancel_timeout(),
+            state.observe_cancel_ack(cancel_ack(
+                &lease,
+                pending.generation,
+                MotionSinkCancelAckStatus::Zeroed,
+            )),
+        );
+
+        if let Some(timeout_result) = timeout_result {
+            assert_eq!(timeout_result.state.status, "FAILED");
+        }
+        assert_eq!(zeroed.state.status, "CANCELLED");
+        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
+        assert!(state.active_goal_lease().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_generation_rejects_the_old_zero_ack() {
+        let handle = make_handle().await;
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("retry-old-zero", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+        cancel(&handle, &state, cancel_input(&lease)).await;
+        let first = state.cancel_snapshot();
+        state.expire_cancel_for_test();
+        assert!(state.poll_cancel_timeout().await.is_some());
+
+        assert_eq!(
+            cancel(&handle, &state, cancel_input(&lease))
+                .await
+                .state
+                .status,
+            "PENDING"
+        );
+        let retry = state.cancel_snapshot();
+        assert!(retry.generation > first.generation);
+
+        let stale = state
+            .observe_cancel_ack(cancel_ack(
+                &lease,
+                first.generation,
+                MotionSinkCancelAckStatus::Zeroed,
+            ))
+            .await;
+        assert_ne!(stale.state.status, "CANCELLED");
+        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Pending);
+        assert_eq!(state.cancel_snapshot().generation, retry.generation);
+
+        let zeroed = state
+            .observe_cancel_ack(cancel_ack(
+                &lease,
+                retry.generation,
+                MotionSinkCancelAckStatus::Zeroed,
+            ))
+            .await;
+        assert_eq!(zeroed.state.status, "CANCELLED");
+        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
     }
 
     #[tokio::test]

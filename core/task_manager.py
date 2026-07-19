@@ -108,6 +108,7 @@ class TaskRecord:
     interrupt_barrier_acknowledged: bool = False
     interrupt_barrier_proof: Optional[MetadataDict] = None
     resource_quarantined: bool = False
+    resource_quarantine_release_proof: Optional[MetadataDict] = None
 
 
 @dataclass(frozen=True)
@@ -389,6 +390,97 @@ class TaskManager:
                 for record in self._records.values()
                 if record.status.state not in _TERMINAL_STATES
             )
+
+    def list_quarantined_tasks(self) -> Tuple[TaskStatus, ...]:
+        """列出仍持有隔离资源的终态任务。"""
+
+        with self._lock:
+            return tuple(
+                record.status
+                for record in self._records.values()
+                if record.resource_quarantined
+            )
+
+    def release_resource_quarantine(
+        self,
+        task_id: str,
+        *,
+        proof: MetadataDict,
+        correlation: MetadataDict,
+    ) -> bool:
+        """在后续精确证明到达后释放终态任务的隔离资源。"""
+
+        release_proof = dict(proof or {})
+        expected_correlation = dict(correlation or {})
+        if not release_proof or not expected_correlation:
+            raise ValueError("隔离资源释放必须提供 proof 与 correlation。")
+        with self._lock:
+            record = self._records[task_id]
+            if not record.resource_quarantined:
+                return False
+            if record.status.state not in _TERMINAL_STATES:
+                raise RuntimeError("仅终态隔离任务允许补充停车证明。")
+            error_payload = dict(record.error_payload or {})
+            error_details = dict(error_payload.get("details") or {})
+            quarantine_correlation = {
+                str(key): str(value or "").strip()
+                for key, value in dict(
+                    error_details.get("resource_quarantine_correlation") or {}
+                ).items()
+                if str(value or "").strip()
+            }
+            normalized_correlation = {
+                str(key): str(value or "").strip()
+                for key, value in expected_correlation.items()
+                if str(value or "").strip()
+            }
+            if not quarantine_correlation:
+                raise ValueError("隔离任务缺少可恢复的 ownership 关联。")
+            if normalized_correlation != quarantine_correlation:
+                raise ValueError("释放证明与原始隔离 ownership 关联不匹配。")
+            input_payload = dict(record.spec.input_payload or {})
+            metadata = dict(record.spec.metadata or {})
+            registered_correlations = []
+            for item in metadata.get("resource_ownership_correlations") or ():
+                if not isinstance(item, dict):
+                    continue
+                normalized_item = {
+                    str(key): str(value or "").strip()
+                    for key, value in item.items()
+                    if str(value or "").strip()
+                }
+                if normalized_item:
+                    registered_correlations.append(normalized_item)
+            for key, expected_value in quarantine_correlation.items():
+                proof_value = str(release_proof.get(key) or "").strip()
+                task_value = str(
+                    input_payload.get(key) or metadata.get(key) or ""
+                ).strip()
+                if not expected_value or proof_value != expected_value:
+                    raise ValueError(f"隔离资源释放证明缺少 exact {key} 关联。")
+                if (
+                    key != "ownership_domain"
+                    and task_value != expected_value
+                    and quarantine_correlation not in registered_correlations
+                ):
+                    raise ValueError(f"隔离任务与释放证明的 {key} 不匹配。")
+            state = record.status.state
+
+        self._release_resources(task_id)
+        with self._lock:
+            record = self._records[task_id]
+            if not record.resource_quarantined:
+                return False
+            record.resource_quarantined = False
+            record.resource_quarantine_release_proof = release_proof
+        self._append_task_event(
+            task_id,
+            "task.resource_quarantine_released",
+            state=state,
+            message="后续精确停车证明已释放隔离资源。",
+            payload={"release_proof": release_proof},
+        )
+        return True
 
     def list_history(self, limit: Optional[int] = None) -> Tuple[TaskStatus, ...]:
         """列出历史任务。"""
@@ -731,11 +823,27 @@ class TaskManager:
         task_id: str,
         error: TaskSafetyBarrierError,
     ) -> None:
+        goal_id = str(error.details.get("goal_id") or "").strip()
+        request_id = str(error.details.get("request_id") or "").strip()
+        if goal_id:
+            quarantine_correlation = {
+                "ownership_domain": "navigation",
+                "goal_id": goal_id,
+            }
+        elif request_id:
+            quarantine_correlation = {
+                "ownership_domain": "exploration",
+                "request_id": request_id,
+            }
+        else:
+            quarantine_correlation = {}
         with self._lock:
             record = self._records[task_id]
             record.resource_quarantined = True
         error.details.setdefault("parking_unconfirmed", True)
         error.details["resource_quarantined"] = True
+        if quarantine_correlation:
+            error.details["resource_quarantine_correlation"] = quarantine_correlation
         self._set_terminal_state(
             task_id,
             TaskState.FAILED,

@@ -74,6 +74,7 @@ from services.geometry import (
     PointCloudMapError,
     UnsupportedPointCloudMapError,
 )
+from services.geometry.geometry_runtime_provider import GeometryRuntimeRpcError
 from services.geometry.pointcloud_map import WEB_POINTCLOUD_MAX_POINTS
 from services.localization import LocalizationService
 from services.mapping import MappingService
@@ -331,6 +332,10 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
         ),
     },
 }
+# Keep v2 policy values aligned while preventing mutation through either entry.
+_ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE["explore_area_v2"] = dict(
+    _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE["explore_area"]
+)
 _SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC = 1.5
 _RUNTIME_ACTIVATION_TIMEOUT_SEC = 95.0
 _GEOMETRY_ONLY_CAPABILITY_NAMES = frozenset(
@@ -5280,13 +5285,84 @@ class GatewayRuntime:
         exploration_state = getattr(context, "exploration_state", None)
         raw_status = getattr(exploration_state, "status", "")
         terminal_status = str(getattr(raw_status, "value", raw_status) or "").lower()
+        exploration_metadata = dict(
+            getattr(exploration_state, "metadata", {}) or {}
+        )
+        recovery_proof = {
+            "ownership_domain": "exploration",
+            "request_id": request_id,
+            "terminal_status": terminal_status,
+            "exploration_terminal": True,
+            "child_task_id": None,
+            "last_stop_reason": exploration_metadata.get("last_stop_reason"),
+        }
 
         cancelled_parent_task_ids: List[str] = []
+        released_quarantined_task_ids: List[str] = []
         parent_capabilities = {
             "explore_area",
             "explore_area_v2",
             "explore_and_find_target",
         }
+        quarantined_reader = getattr(
+            self.task_manager,
+            "list_quarantined_tasks",
+            None,
+        )
+        quarantined_tasks = (
+            quarantined_reader() if callable(quarantined_reader) else ()
+        )
+        for task_status in quarantined_tasks:
+            task_id = str(getattr(task_status, "task_id", "") or "")
+            if not task_id:
+                continue
+            try:
+                task_spec = self.task_manager.get_task_spec(task_id)
+            except Exception:
+                continue
+            if str(getattr(task_spec, "capability_name", "")) not in parent_capabilities:
+                continue
+            capability_name = str(getattr(task_spec, "capability_name", ""))
+            input_payload = dict(getattr(task_spec, "input_payload", {}) or {})
+            metadata = dict(getattr(task_spec, "metadata", {}) or {})
+            parent_request_id = str(
+                input_payload.get("request_id")
+                or metadata.get("request_id")
+                or ""
+            ).strip()
+            if capability_name == "explore_and_find_target":
+                error_reader = getattr(
+                    self.task_manager,
+                    "get_task_error_payload",
+                    None,
+                )
+                if not callable(error_reader):
+                    continue
+                try:
+                    error_payload = dict(error_reader(task_id) or {})
+                except Exception:
+                    continue
+                error_details = dict(error_payload.get("details") or {})
+                quarantine_correlation = dict(
+                    error_details.get("resource_quarantine_correlation") or {}
+                )
+                if quarantine_correlation != {
+                    "ownership_domain": "exploration",
+                    "request_id": request_id,
+                }:
+                    continue
+            elif parent_request_id != request_id:
+                continue
+            if self.task_manager.release_resource_quarantine(
+                task_id,
+                proof=recovery_proof,
+                correlation={
+                    "ownership_domain": "exploration",
+                    "request_id": request_id,
+                },
+            ):
+                released_quarantined_task_ids.append(task_id)
+
         for task_status in self.task_manager.list_active_tasks():
             task_id = str(getattr(task_status, "task_id", "") or "")
             if not task_id:
@@ -5322,6 +5398,7 @@ class GatewayRuntime:
             "child_navigation_terminal": terminal_status,
             "child_navigation_zeroed": True,
             "cancelled_parent_task_ids": cancelled_parent_task_ids,
+            "released_quarantined_task_ids": released_quarantined_task_ids,
             "mapping_stopped": False,
             "next_step_hint": "探索与其子导航已停止；建图会话保持运行。",
         }
@@ -6394,12 +6471,42 @@ class GatewayRuntime:
             last_search_refresh_at = 0.0
             active_exploration_request_id: Optional[str] = None
             active_navigation_goal_id: Optional[str] = None
+            active_request = request
+            registered_resource_ownership: List[MetadataDict] = []
             interrupt_acknowledged = False
             perception_attached = False
+
+            def register_resource_ownership(
+                ownership_domain: str,
+                identity_key: str,
+                identity_value: Optional[str],
+            ) -> None:
+                exact_identity = str(identity_value or "").strip()
+                if not exact_identity:
+                    return
+                correlation: MetadataDict = {
+                    "ownership_domain": ownership_domain,
+                    identity_key: exact_identity,
+                }
+                if correlation in registered_resource_ownership:
+                    return
+                registered_resource_ownership.append(correlation)
+                context.update_metadata(
+                    {
+                        "resource_ownership_correlations": [
+                            dict(item) for item in registered_resource_ownership
+                        ]
+                    }
+                )
 
             def track_navigation(goal_id: Optional[str]) -> None:
                 nonlocal active_navigation_goal_id
                 active_navigation_goal_id = str(goal_id or "").strip() or None
+                register_resource_ownership(
+                    "navigation",
+                    "goal_id",
+                    active_navigation_goal_id,
+                )
 
             def park_exploration() -> Any:
                 nonlocal active_exploration_request_id
@@ -6557,10 +6664,14 @@ class GatewayRuntime:
                     finalized = True
                     return result
 
-                active_request = request
                 context.update(progress=0.08, stage="exploration_accepted", message="开始探索并持续查找目标。")
                 self._ensure_motion_runtime_for_backend_call(
                     "explore_and_find_target"
+                )
+                register_resource_ownership(
+                    "exploration",
+                    "request_id",
+                    active_request.request_id,
                 )
                 exploration_context = self.navigation_service.start_exploration(active_request)
                 active_exploration_request_id = active_request.request_id
@@ -6570,9 +6681,26 @@ class GatewayRuntime:
                     context.ensure_active()
                     exploration_context = self.navigation_service.refresh_exploration()
                     status = exploration_context.exploration_state.status
+                    complete_terminal = self._is_complete_exploration_terminal(
+                        exploration_context,
+                        request_id=active_request.request_id,
+                    )
+                    terminal_pending = bool(
+                        status
+                        in {
+                            ExplorationStatus.SUCCEEDED,
+                            ExplorationStatus.FAILED,
+                            ExplorationStatus.CANCELLED,
+                        }
+                        and not complete_terminal
+                    )
                     context.update(
                         progress=max(0.1, min(0.92, self._estimate_exploration_progress(exploration_context))),
-                        stage=f"explore_find_{status.value}",
+                        stage=(
+                            "explore_find_terminal_pending"
+                            if terminal_pending
+                            else f"explore_find_{status.value}"
+                        ),
                         message=exploration_context.exploration_state.message or "探索并查找目标中。",
                         payload={
                             "query": query,
@@ -6668,11 +6796,16 @@ class GatewayRuntime:
                         self._ensure_motion_runtime_for_backend_call(
                             "explore_and_find_target"
                         )
+                        register_resource_ownership(
+                            "exploration",
+                            "request_id",
+                            active_request.request_id,
+                        )
                         exploration_context = self.navigation_service.start_exploration(active_request)
                         active_exploration_request_id = active_request.request_id
                         continue
 
-                    if status.value == "succeeded":
+                    if complete_terminal and status.value == "succeeded":
                         exploration_stop_context = park_exploration()
                         self._refresh_target_search_observation(
                             query=query,
@@ -6756,15 +6889,30 @@ class GatewayRuntime:
                             },
                         )
 
-                    if status.value == "failed":
-                        park_exploration()
+                    if complete_terminal and status.value == "failed":
+                        active_exploration_request_id = None
                         raise GatewayError(exploration_context.exploration_state.message or "探索执行失败。")
-                    if status.value == "cancelled":
-                        park_exploration()
-                        raise GatewayError(exploration_context.exploration_state.message or "探索已取消。")
+                    if complete_terminal and status.value == "cancelled":
+                        active_exploration_request_id = None
+                        raise TaskCancelledError(
+                            exploration_context.exploration_state.message
+                            or "探索已取消。"
+                        )
                     time.sleep(max(0.05, poll_interval_sec))
+            except GeometryRuntimeRpcError as exc:
+                rpc_request_id = (
+                    active_exploration_request_id or active_request.request_id
+                )
+                active_exploration_request_id = None
+                self._raise_exploration_rpc_failure_after_barrier(
+                    context,
+                    error=exc,
+                    request_id=rpc_request_id,
+                    poll_interval_sec=poll_interval_sec,
+                )
             except (TaskCancelledError, TaskTimeoutError):
-                acknowledge_interrupted_parking()
+                if context.is_cancel_requested() or context.is_timed_out():
+                    acknowledge_interrupted_parking()
                 raise
             finally:
                 if (
@@ -8067,7 +8215,9 @@ class GatewayRuntime:
         timeout_sec: float,
         poll_interval_sec: float,
     ) -> Optional[float]:
-        del stop_conditions
+        typed_max_duration_ms = stop_conditions.get("max_duration_ms")
+        if typed_max_duration_ms is not None:
+            return float(typed_max_duration_ms) / 1000.0
         if max_duration_sec is not None:
             return max_duration_sec
         guard_sec = max(1.0, float(poll_interval_sec or 0.0) * 2.0)
@@ -9639,30 +9789,117 @@ class GatewayRuntime:
         return str(metadata.get("request_id") or "").strip()
 
     @staticmethod
+    def _is_complete_exploration_terminal(
+        exploration_context: Any,
+        *,
+        request_id: str,
+    ) -> bool:
+        state = getattr(exploration_context, "exploration_state", None)
+        raw_status = getattr(state, "status", None)
+        status = str(getattr(raw_status, "value", raw_status) or "").lower()
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        return bool(
+            GatewayRuntime._exploration_state_request_id(exploration_context)
+            == str(request_id or "").strip()
+            and status
+            in {
+                ExplorationStatus.SUCCEEDED.value,
+                ExplorationStatus.FAILED.value,
+                ExplorationStatus.CANCELLED.value,
+            }
+            and metadata.get("exploration_terminal") is True
+            and not str(metadata.get("child_task_id") or "").strip()
+        )
+
+    @staticmethod
+    def _geometry_runtime_rpc_details(
+        error: GeometryRuntimeRpcError,
+    ) -> MetadataDict:
+        grpc_code = getattr(error, "grpc_code", None)
+        grpc_code_name = str(getattr(grpc_code, "name", "") or "").strip()
+        if not grpc_code_name:
+            grpc_code_name = str(grpc_code or "UNKNOWN").rsplit(".", 1)[-1]
+        return {
+            "rpc_name": str(getattr(error, "rpc_name", "") or ""),
+            "grpc_code": grpc_code_name or "UNKNOWN",
+            "grpc_details": str(getattr(error, "grpc_details", "") or ""),
+        }
+
+    @staticmethod
     def _exploration_parking_error(
         *,
         request_id: str,
         reason: str,
         exploration_context: Any = None,
+        rpc_error: Optional[GeometryRuntimeRpcError] = None,
     ) -> TaskSafetyBarrierError:
         state = getattr(exploration_context, "exploration_state", None)
         raw_status = getattr(state, "status", None)
         status = str(getattr(raw_status, "value", raw_status) or "").lower()
         metadata = dict(getattr(state, "metadata", {}) or {})
+        details: MetadataDict = {
+            "request_id": request_id,
+            "parking_unconfirmed": True,
+            "reason": reason,
+            "observed_request_id": GatewayRuntime._exploration_state_request_id(
+                exploration_context
+            ),
+            "observed_status": status or None,
+            "exploration_terminal": metadata.get("exploration_terminal"),
+            "last_stop_reason": metadata.get("last_stop_reason"),
+        }
+        if rpc_error is not None:
+            details.update(GatewayRuntime._geometry_runtime_rpc_details(rpc_error))
         return TaskSafetyBarrierError(
             "探索中断无法确认后端安全停车：%s" % reason,
+            details=details,
+        )
+
+    def _raise_exploration_rpc_failure_after_barrier(
+        self,
+        context,
+        *,
+        error: GeometryRuntimeRpcError,
+        request_id: str,
+        poll_interval_sec: float,
+    ) -> None:
+        rpc_details = self._geometry_runtime_rpc_details(error)
+        try:
+            terminal_context = self._stop_exploration_with_safety_barrier(
+                context,
+                request_id=request_id,
+                poll_interval_sec=poll_interval_sec,
+                acknowledge_interrupt=False,
+            )
+        except TaskSafetyBarrierError as barrier_error:
+            parking_rpc_error = {
+                key: barrier_error.details.get(key)
+                for key in ("rpc_name", "grpc_code", "grpc_details")
+                if barrier_error.details.get(key) is not None
+            }
+            if parking_rpc_error and parking_rpc_error != rpc_details:
+                barrier_error.details["parking_rpc_error"] = parking_rpc_error
+            barrier_error.details.update(rpc_details)
+            barrier_error.details["backend_ownership_unknown"] = True
+            raise
+
+        state = getattr(terminal_context, "exploration_state", None)
+        raw_status = getattr(state, "status", None)
+        safe_terminal_status = str(
+            getattr(raw_status, "value", raw_status) or ""
+        ).lower()
+        raise GatewayError(
+            "探索 runtime RPC 失败，后端已通过 correlated stop 安全收口。",
+            error_code="exploration_runtime_rpc_failed",
+            http_status=503,
+            jsonrpc_code=-32010,
             details={
                 "request_id": request_id,
-                "parking_unconfirmed": True,
-                "reason": reason,
-                "observed_request_id": GatewayRuntime._exploration_state_request_id(
-                    exploration_context
-                ),
-                "observed_status": status or None,
-                "exploration_terminal": metadata.get("exploration_terminal"),
-                "last_stop_reason": metadata.get("last_stop_reason"),
+                "backend_ownership_unknown": False,
+                "safe_terminal_status": safe_terminal_status or None,
+                **rpc_details,
             },
-        )
+        ) from error
 
     @staticmethod
     def _navigation_state_goal_id(navigation_context: Any) -> str:
@@ -9870,6 +10107,12 @@ class GatewayRuntime:
             last_context = self.navigation_service.stop_exploration(
                 request_id=request_id
             )
+        except GeometryRuntimeRpcError as exc:
+            raise self._exploration_parking_error(
+                request_id=request_id,
+                reason="StopExploration RPC 结果不确定: %s" % exc,
+                rpc_error=exc,
+            ) from exc
         except Exception as exc:
             raise self._exploration_parking_error(
                 request_id=request_id,
@@ -9886,6 +10129,7 @@ class GatewayRuntime:
             ).lower()
             metadata = dict(getattr(state, "metadata", {}) or {})
             observed_request_id = self._exploration_state_request_id(last_context)
+            child_task_id = str(metadata.get("child_task_id") or "").strip()
             if observed_request_id and observed_request_id != request_id:
                 raise self._exploration_parking_error(
                     request_id=request_id,
@@ -9894,6 +10138,7 @@ class GatewayRuntime:
                 )
             if status in {
                 ExplorationStatus.SUCCEEDED.value,
+                ExplorationStatus.FAILED.value,
                 ExplorationStatus.CANCELLED.value,
             }:
                 if observed_request_id != request_id:
@@ -9902,22 +10147,35 @@ class GatewayRuntime:
                         reason="StopExploration 终态缺少 request_id 关联证明",
                         exploration_context=last_context,
                     )
-                if metadata.get("exploration_terminal") is not True:
+                retained_failed_child = bool(
+                    status == ExplorationStatus.FAILED.value and child_task_id
+                )
+                if (
+                    not retained_failed_child
+                    and metadata.get("exploration_terminal") is not True
+                ):
                     raise self._exploration_parking_error(
                         request_id=request_id,
                         reason="StopExploration 未提供 exploration_terminal=true",
                         exploration_context=last_context,
                     )
-                proof = {
-                    "request_id": request_id,
-                    "terminal_status": status,
-                    "exploration_terminal": True,
-                    "last_stop_reason": metadata.get("last_stop_reason"),
-                }
-                if acknowledge_interrupt and context is not None:
-                    context.acknowledge_interrupt_barrier(proof)
-                return last_context
-            if status == ExplorationStatus.FAILED.value:
+                if child_task_id and not retained_failed_child:
+                    raise self._exploration_parking_error(
+                        request_id=request_id,
+                        reason="StopExploration 仍保留 child navigation ownership",
+                        exploration_context=last_context,
+                    )
+                if not retained_failed_child:
+                    proof = {
+                        "request_id": request_id,
+                        "terminal_status": status,
+                        "exploration_terminal": True,
+                        "last_stop_reason": metadata.get("last_stop_reason"),
+                    }
+                    if acknowledge_interrupt and context is not None:
+                        context.acknowledge_interrupt_barrier(proof)
+                    return last_context
+            if status == ExplorationStatus.FAILED.value and not child_task_id:
                 raise self._exploration_parking_error(
                     request_id=request_id,
                     reason=getattr(state, "message", None)
@@ -9927,6 +10185,7 @@ class GatewayRuntime:
             if status not in {
                 ExplorationStatus.ACCEPTED.value,
                 ExplorationStatus.RUNNING.value,
+                ExplorationStatus.FAILED.value,
             }:
                 raise self._exploration_parking_error(
                     request_id=request_id,
@@ -10093,10 +10352,24 @@ class GatewayRuntime:
                     progress = self._estimate_exploration_progress(last_context)
                     stage = f"exploration_{status.value}"
                     message = last_context.exploration_state.message or "探索执行中。"
-                    if status.value == "succeeded" or self._exploration_metadata_indicates_done(exploration_metadata):
+                    complete_terminal = self._is_complete_exploration_terminal(
+                        last_context,
+                        request_id=request.request_id,
+                    )
+                    child_task_id = str(
+                        exploration_metadata.get("child_task_id") or ""
+                    ).strip()
+                    if complete_terminal and status.value == "succeeded":
                         progress = 1.0
                         stage = "exploration_completed"
                         message = last_context.exploration_state.message or "探索器已报告完成。"
+                    elif status.value in {"succeeded", "failed", "cancelled"}:
+                        stage = "exploration_terminal_pending"
+                        if child_task_id:
+                            message = (
+                                last_context.exploration_state.message
+                                or "探索终态仍保留子导航 ownership，等待停车证明。"
+                            )
                     context.update(
                         progress=progress,
                         stage=stage,
@@ -10107,7 +10380,7 @@ class GatewayRuntime:
                             exploration_metadata=exploration_metadata,
                         ),
                     )
-                    if status.value == "succeeded":
+                    if complete_terminal and status.value == "succeeded":
                         context.update(
                             progress=1.0,
                             stage="completed",
@@ -10124,27 +10397,39 @@ class GatewayRuntime:
                             trigger="explore_area_completed",
                         )
                         return result
-                    if status.value == "failed":
-                        raise GatewayError(last_context.exploration_state.message or "探索执行失败。")
-                    if status.value == "cancelled":
-                        raise GatewayError(last_context.exploration_state.message or "探索已取消。")
+                    if complete_terminal and status.value == "failed":
+                        raise GatewayError(
+                            last_context.exploration_state.message or "探索执行失败。"
+                        )
+                    if complete_terminal and status.value == "cancelled":
+                        raise TaskCancelledError(
+                            last_context.exploration_state.message or "探索已取消。"
+                        )
                     time.sleep(poll_interval_sec)
+            except GeometryRuntimeRpcError as exc:
+                self._raise_exploration_rpc_failure_after_barrier(
+                    context,
+                    error=exc,
+                    request_id=request.request_id,
+                    poll_interval_sec=poll_interval_sec,
+                )
             except (TaskCancelledError, TaskTimeoutError):
-                if backend_started:
-                    self._stop_exploration_with_safety_barrier(
-                        context,
-                        request_id=request.request_id,
-                        poll_interval_sec=poll_interval_sec,
-                    )
-                else:
-                    context.acknowledge_interrupt_barrier(
-                        {
-                            "request_id": request.request_id,
-                            "backend_not_started": True,
-                            "exploration_terminal": True,
-                            "terminal_status": "not_started",
-                        }
-                    )
+                if context.is_cancel_requested() or context.is_timed_out():
+                    if backend_started:
+                        self._stop_exploration_with_safety_barrier(
+                            context,
+                            request_id=request.request_id,
+                            poll_interval_sec=poll_interval_sec,
+                        )
+                    else:
+                        context.acknowledge_interrupt_barrier(
+                            {
+                                "request_id": request.request_id,
+                                "backend_not_started": True,
+                                "exploration_terminal": True,
+                                "terminal_status": "not_started",
+                            }
+                        )
                 raise
             finally:
                 if backend_started and not finalized:

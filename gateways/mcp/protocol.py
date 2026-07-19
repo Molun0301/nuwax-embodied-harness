@@ -317,26 +317,89 @@ def _resolve_tool_invocation(
     tool_name: str,
     arguments: Dict[str, Any],
 ) -> Tuple[str, Dict[str, Any]]:
+    if not isinstance(arguments, dict):
+        raise GatewayError(
+            "MCP tool arguments 必须是对象。",
+            error_code="invalid_params",
+            http_status=422,
+            jsonrpc_code=-32602,
+            details={"tool_name": tool_name},
+        )
     if tool_name in _MCP_COLLECTIONS:
         return _resolve_collection_call(runtime, tool_name, arguments)
 
     catalogs = _build_collection_catalogs(runtime)
     target_name = _MCP_STANDALONE_TOOL_TARGETS.get(tool_name)
     if target_name is not None and target_name in catalogs["platform"]:
-        parameters = arguments if isinstance(arguments, dict) else {}
+        item = catalogs["platform"][target_name]
+        schema = (
+            item.get("input_schema")
+            or _MCP_STANDALONE_TOOL_SCHEMAS.get(tool_name)
+            or {"type": "object", "properties": {}, "additionalProperties": False}
+        )
+        _validate_closed_schema(arguments, schema, path="arguments")
+        parameters = arguments
         return target_name, parameters
     for catalog in catalogs.values():
         if tool_name in catalog:
-            parameters = arguments if isinstance(arguments, dict) else {}
+            _validate_closed_schema(
+                arguments,
+                catalog[tool_name].get("input_schema") or {},
+                path="arguments",
+            )
+            parameters = arguments
             return tool_name, parameters
 
     raise GatewayError(
         f"未知 MCP 工具: {tool_name}。",
-        error_code="invalid_params",
-        http_status=422,
-        jsonrpc_code=-32602,
+        error_code="capability_not_registered",
+        http_status=404,
+        jsonrpc_code=-32601,
         details={"tool_name": tool_name},
     )
+
+
+def _validate_closed_schema(value: Any, schema: Dict[str, Any], *, path: str) -> None:
+    """Enforce the closed-object boundary advertised by MCP input schemas."""
+
+    if not isinstance(schema, dict):
+        return
+    schema_type = schema.get("type")
+    if schema_type == "object" or "properties" in schema:
+        if not isinstance(value, dict):
+            return
+        properties = schema.get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        if schema.get("additionalProperties") is False:
+            unexpected = sorted(str(key) for key in value if key not in properties)
+            if unexpected:
+                raise GatewayError(
+                    f"{path} 包含 schema 未声明的字段: {', '.join(unexpected)}。",
+                    error_code="invalid_params",
+                    http_status=422,
+                    jsonrpc_code=-32602,
+                    details={
+                        "path": path,
+                        "unexpected_properties": unexpected,
+                    },
+                )
+        for key, child_schema in properties.items():
+            if key in value:
+                _validate_closed_schema(
+                    value[key],
+                    child_schema,
+                    path=f"{path}.{key}",
+                )
+        return
+    if schema_type == "array" and isinstance(value, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                _validate_closed_schema(
+                    item,
+                    item_schema,
+                    path=f"{path}[{index}]",
+                )
 
 
 def _negotiate_protocol_version(params: Dict[str, Any]) -> str:
@@ -401,6 +464,12 @@ def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, argu
             http_status=422,
             jsonrpc_code=-32602,
         )
+    catalog = _build_collection_catalogs(runtime)[collection_name]
+    _validate_closed_schema(
+        arguments,
+        _build_collection_input_schema(catalog),
+        path="arguments",
+    )
     function_name = str(arguments.get("function", "")).strip()
     if not function_name:
         raise GatewayError(
@@ -419,7 +488,6 @@ def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, argu
             http_status=422,
             jsonrpc_code=-32602,
         )
-    catalog = _build_collection_catalogs(runtime)[collection_name]
     if function_name not in catalog:
         raise GatewayError(
             f"功能 {function_name} 不属于 {collection_name} 集合。",
@@ -432,6 +500,11 @@ def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, argu
                 "available_functions": sorted(catalog),
             },
         )
+    _validate_closed_schema(
+        parameters,
+        catalog[function_name].get("input_schema") or {},
+        path="arguments.parameters",
+    )
     return function_name, parameters
 
 
@@ -501,14 +574,20 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
             if method == "tools/call":
                 name = str(params.get("name", "")).strip()
                 arguments = params.get("arguments", {})
-                if arguments is None:
-                    arguments = {}
                 if not name:
                     raise GatewayError(
                         "tools/call 缺少 name。",
                         error_code="invalid_params",
                         http_status=422,
                         jsonrpc_code=-32602,
+                    )
+                if not isinstance(arguments, dict):
+                    raise GatewayError(
+                        "tools/call arguments 必须是对象。",
+                        error_code="invalid_params",
+                        http_status=422,
+                        jsonrpc_code=-32602,
+                        details={"tool_name": name},
                     )
                 function_name, function_arguments = _resolve_tool_invocation(runtime, name, arguments)
                 try:

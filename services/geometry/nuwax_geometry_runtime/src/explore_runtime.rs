@@ -308,6 +308,51 @@ pub enum ChildNavigationResult {
     },
 }
 
+const MAX_EARLY_CANCEL_TERMINALS: usize = 4;
+
+fn cancellation_result_generation(result: &ChildNavigationResult) -> Option<u64> {
+    match result {
+        ChildNavigationResult::Cancelled(proof) => Some(proof.cancel_generation),
+        ChildNavigationResult::CancelFailed {
+            cancel_generation, ..
+        } => Some(*cancel_generation),
+        ChildNavigationResult::Reached(_) | ChildNavigationResult::Failed { .. } => None,
+    }
+}
+
+fn retain_early_cancel_terminal(
+    pending: &mut PendingChildCancellation,
+    result: ChildNavigationResult,
+) {
+    if pending.early_terminals.contains(&result) {
+        return;
+    }
+    if pending.early_terminals.len() >= MAX_EARLY_CANCEL_TERMINALS {
+        pending.early_terminals.remove(0);
+    }
+    pending.early_terminals.push(result);
+}
+
+fn take_early_cancel_terminal(
+    pending: &mut PendingChildCancellation,
+    generation: u64,
+) -> Option<ChildNavigationResult> {
+    let position = pending
+        .early_terminals
+        .iter()
+        .position(|result| {
+            matches!(result, ChildNavigationResult::Cancelled(_))
+                && cancellation_result_generation(result) == Some(generation)
+        })
+        .or_else(|| {
+            pending.early_terminals.iter().position(|result| {
+                matches!(result, ChildNavigationResult::CancelFailed { .. })
+                    && cancellation_result_generation(result) == Some(generation)
+            })
+        })?;
+    Some(pending.early_terminals.remove(position))
+}
+
 #[async_trait]
 pub trait ExploreNavigationSink: Send + Sync {
     async fn submit(
@@ -375,6 +420,8 @@ struct PendingChildCancellation {
     action: PendingChildAction,
     ticket: Option<ChildNavigationCancelTicket>,
     failure: Option<String>,
+    dispatch_in_flight: bool,
+    early_terminals: Vec<ChildNavigationResult>,
 }
 
 pub struct ExploreRuntimeInner {
@@ -616,11 +663,7 @@ impl ExploreRuntimeHandle {
                     last_stop_reason: guard.last_stop_reason.clone(),
                     frontier_count: guard.frontiers.len() as u32,
                     revision: guard.frontier_revision,
-                    child_task_id: guard
-                        .active_child
-                        .as_ref()
-                        .map(|child| child.request_id.clone())
-                        .unwrap_or_default(),
+                    child_task_id: String::new(),
                     map_version_id: guard.map_version_id(),
                     map_revision: guard.map_revision(),
                 };
@@ -658,11 +701,7 @@ impl ExploreRuntimeHandle {
                 last_stop_reason: guard.last_stop_reason.clone(),
                 frontier_count: guard.frontiers.len() as u32,
                 revision: guard.frontier_revision,
-                child_task_id: guard
-                    .active_child
-                    .as_ref()
-                    .map(|child| child.request_id.clone())
-                    .unwrap_or_default(),
+                child_task_id: String::new(),
                 map_version_id: guard.map_version_id(),
                 map_revision: guard.map_revision(),
             };
@@ -768,22 +807,65 @@ impl ExploreRuntimeHandle {
         action: PendingChildAction,
     ) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
+        if let Some(requested_id) = request_id.map(str::trim) {
+            if requested_id.is_empty() || requested_id != guard.last_request_id {
+                let mut snapshot = guard.snapshot(
+                    STATUS_REJECTED,
+                    format!(
+                        "exploration stop request_id mismatch: active={} received={}",
+                        guard.last_request_id, requested_id
+                    ),
+                );
+                snapshot.request_id = requested_id.to_string();
+                return snapshot;
+            }
+        }
         if guard.pending_child_cancellation.is_some() {
-            let status = if guard
+            let (failure, dispatch_in_flight) = guard
                 .pending_child_cancellation
                 .as_ref()
-                .is_some_and(|pending| pending.failure.is_some())
-            {
-                STATUS_FAILED
-            } else {
-                STATUS_STOPPING
+                .map(|pending| (pending.failure.clone(), pending.dispatch_in_flight))
+                .expect("pending child cancellation checked above");
+            let retry_correlated = request_id.is_some() && failure.is_some() && !dispatch_in_flight;
+            if !retry_correlated {
+                let status = if failure.is_some() && !dispatch_in_flight {
+                    STATUS_FAILED
+                } else {
+                    STATUS_STOPPING
+                };
+                let message = if dispatch_in_flight && failure.is_some() {
+                    "child navigation cancellation retry is already in flight"
+                } else {
+                    "child navigation cancellation remains pending ZEROED proof"
+                };
+                let snapshot = guard.snapshot(status, message);
+                let snapshot = self.store_snapshot(snapshot);
+                drop(guard);
+                return snapshot;
+            }
+            let Some(child) = guard.active_child.clone() else {
+                let snapshot = guard.snapshot(
+                    STATUS_FAILED,
+                    "pending child cancellation lost its active safety lease",
+                );
+                drop(guard);
+                return self.store_snapshot(snapshot);
             };
+            guard
+                .pending_child_cancellation
+                .as_mut()
+                .expect("pending child cancellation checked above")
+                .dispatch_in_flight = true;
             let snapshot = guard.snapshot(
-                status,
-                "child navigation cancellation remains pending ZEROED proof",
+                STATUS_STOPPING,
+                format!(
+                    "CANCEL_RETRY_PENDING: re-dispatching child {} cancellation",
+                    child.request_id
+                ),
             );
+            self.store_snapshot(snapshot);
             drop(guard);
-            return self.store_snapshot(snapshot);
+            return self.dispatch_child_cancellation(child, true).await;
         }
         if guard.last_request_id.is_empty() {
             if let Some(request_id) = request_id.filter(|value| !value.trim().is_empty()) {
@@ -823,6 +905,8 @@ impl ExploreRuntimeHandle {
             action,
             ticket: None,
             failure: None,
+            dispatch_in_flight: true,
+            early_terminals: Vec::new(),
         });
         let snapshot = guard.snapshot(
             STATUS_STOPPING,
@@ -831,13 +915,21 @@ impl ExploreRuntimeHandle {
                 child.request_id
             ),
         );
-        drop(guard);
         self.store_snapshot(snapshot);
+        drop(guard);
 
+        self.dispatch_child_cancellation(child, false).await
+    }
+
+    async fn dispatch_child_cancellation(
+        &self,
+        child: ActiveChildNavigation,
+        retry: bool,
+    ) -> ExploreRuntimeSnapshot {
         let Some(sink) = self.navigation_sink.read().clone() else {
             return self
                 .record_child_cancel_failure(
-                    &child.request_id,
+                    &child.lease,
                     "navigation sink unavailable during child cancellation".to_string(),
                 )
                 .await;
@@ -849,15 +941,13 @@ impl ExploreRuntimeHandle {
             Ok(_) => {
                 return self
                     .record_child_cancel_failure(
-                        &child.request_id,
+                        &child.lease,
                         "navigation sink returned an invalid cancellation ticket".to_string(),
                     )
                     .await;
             }
             Err(error) => {
-                return self
-                    .record_child_cancel_failure(&child.request_id, error)
-                    .await;
+                return self.record_child_cancel_failure(&child.lease, error).await;
             }
         };
 
@@ -865,41 +955,61 @@ impl ExploreRuntimeHandle {
         if guard
             .active_child
             .as_ref()
-            .is_none_or(|active| active.request_id != child.request_id)
+            .is_none_or(|active| !active.lease.matches(&child.lease))
         {
             return self.snapshot();
         }
         let Some(pending) = guard.pending_child_cancellation.as_mut() else {
             return self.snapshot();
         };
+        if !pending.dispatch_in_flight {
+            return self.snapshot();
+        }
         pending.ticket = Some(ticket.clone());
+        pending.dispatch_in_flight = false;
+        let early_terminal = take_early_cancel_terminal(pending, ticket.cancel_generation);
         let snapshot = guard.snapshot(
             STATUS_STOPPING,
             format!(
-                "CANCEL_PENDING: child {} cancel_generation={} awaiting ZEROED",
-                child.request_id, ticket.cancel_generation
+                "{}: child {} cancel_generation={} awaiting ZEROED",
+                if retry {
+                    "CANCEL_RETRY_PENDING"
+                } else {
+                    "CANCEL_PENDING"
+                },
+                child.request_id,
+                ticket.cancel_generation
             ),
         );
+        let snapshot = self.store_snapshot(snapshot);
         drop(guard);
-        self.store_snapshot(snapshot)
+        if let Some(result) = early_terminal {
+            return self
+                .report_navigation_result(&child.request_id, result)
+                .await
+                .unwrap_or_else(|_| self.snapshot());
+        }
+        snapshot
     }
 
     async fn record_child_cancel_failure(
         &self,
-        child_request_id: &str,
+        child_lease: &ChildNavigationLease,
         error: String,
     ) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
         if guard
             .active_child
             .as_ref()
-            .is_none_or(|child| child.request_id != child_request_id)
+            .is_none_or(|child| !child.lease.matches(child_lease))
         {
             return self.snapshot();
         }
-        if let Some(pending) = guard.pending_child_cancellation.as_mut() {
-            pending.failure = Some(error.clone());
-        }
+        let Some(pending) = guard.pending_child_cancellation.as_mut() else {
+            return self.snapshot();
+        };
+        pending.dispatch_in_flight = false;
+        pending.failure = Some(error.clone());
         let _ = guard
             .controller
             .stop_with_reason(ExplorationStopReason::ConsecutiveFailuresExceeded);
@@ -919,10 +1029,11 @@ impl ExploreRuntimeHandle {
             backend_available,
             self.navigation_sink.read().is_some(),
         );
-        drop(guard);
         *self.readiness_cache.lock() = readiness;
+        let snapshot = self.store_snapshot(snapshot);
+        drop(guard);
         self.publish_frontiers(frontier_update);
-        self.store_snapshot(snapshot)
+        snapshot
     }
 
     pub async fn tick(&self, robot_xy: (f64, f64)) -> ExploreRuntimeSnapshot {
@@ -1296,41 +1407,110 @@ impl ExploreRuntimeHandle {
             );
         }
 
-        if let Some(pending) = guard.pending_child_cancellation.as_ref() {
+        if guard.pending_child_cancellation.is_some() {
             match &result {
                 ChildNavigationResult::CancelFailed {
                     cancel_generation,
                     reason,
                     ..
                 } => {
-                    let expected_generation = pending
-                        .ticket
+                    let (expected_generation, dispatch_in_flight) = guard
+                        .pending_child_cancellation
                         .as_ref()
-                        .map(|ticket| ticket.cancel_generation)
-                        .unwrap_or(0);
-                    if *cancel_generation == 0 || *cancel_generation != expected_generation {
+                        .map(|pending| {
+                            (
+                                pending
+                                    .ticket
+                                    .as_ref()
+                                    .map(|ticket| ticket.cancel_generation)
+                                    .unwrap_or(0),
+                                pending.dispatch_in_flight,
+                            )
+                        })
+                        .expect("pending child cancellation checked above");
+                    if *cancel_generation == 0 {
+                        return Err("cancel failure generation must be non-zero".to_string());
+                    }
+                    if *cancel_generation != expected_generation && dispatch_in_flight {
+                        let pending = guard
+                            .pending_child_cancellation
+                            .as_mut()
+                            .expect("pending child cancellation checked above");
+                        retain_early_cancel_terminal(pending, result.clone());
+                        let snapshot = guard.snapshot(
+                            STATUS_STOPPING,
+                            format!(
+                                "CANCEL_EARLY_TERMINAL_BUFFERED: generation={} awaiting ticket",
+                                cancel_generation
+                            ),
+                        );
+                        drop(guard);
+                        return Ok(self.store_snapshot(snapshot));
+                    }
+                    if dispatch_in_flight && *cancel_generation == expected_generation {
+                        let snapshot = guard.snapshot(
+                            STATUS_STOPPING,
+                            format!(
+                                "CANCEL_RETRY_OLD_FAILURE_IGNORED: generation={cancel_generation}"
+                            ),
+                        );
+                        drop(guard);
+                        return Ok(self.store_snapshot(snapshot));
+                    }
+                    if *cancel_generation != expected_generation {
                         return Err(format!(
                             "cancel failure generation mismatch: expected {expected_generation}, received {cancel_generation}"
                         ));
                     }
-                    let child_request_id = active_child.request_id.clone();
+                    let child_lease = active_child.lease.clone();
                     let reason = reason.clone();
                     drop(guard);
-                    return Ok(self
-                        .record_child_cancel_failure(&child_request_id, reason)
-                        .await);
+                    return Ok(self.record_child_cancel_failure(&child_lease, reason).await);
                 }
                 ChildNavigationResult::Cancelled(proof) => {
-                    let Some(ticket) = pending.ticket.as_ref() else {
-                        return Err("ZEROED proof arrived before a cancellation ticket".to_string());
-                    };
-                    if proof.cancel_generation != ticket.cancel_generation
+                    if proof.cancel_generation == 0
                         || proof.zero_ack_id.trim().is_empty()
                         || proof.zero_applied_monotonic_ns == 0
                     {
                         return Err(
                             "incomplete or mismatched child navigation ZEROED proof".to_string()
                         );
+                    }
+                    let (expected_generation, dispatch_in_flight) = guard
+                        .pending_child_cancellation
+                        .as_ref()
+                        .map(|pending| {
+                            (
+                                pending
+                                    .ticket
+                                    .as_ref()
+                                    .map(|ticket| ticket.cancel_generation)
+                                    .unwrap_or(0),
+                                pending.dispatch_in_flight,
+                            )
+                        })
+                        .expect("pending child cancellation checked above");
+                    if proof.cancel_generation != expected_generation && dispatch_in_flight {
+                        let pending = guard
+                            .pending_child_cancellation
+                            .as_mut()
+                            .expect("pending child cancellation checked above");
+                        retain_early_cancel_terminal(pending, result.clone());
+                        let snapshot = guard.snapshot(
+                            STATUS_STOPPING,
+                            format!(
+                                "ZEROED_EARLY_BUFFERED: generation={} awaiting ticket",
+                                proof.cancel_generation
+                            ),
+                        );
+                        drop(guard);
+                        return Ok(self.store_snapshot(snapshot));
+                    }
+                    if proof.cancel_generation != expected_generation {
+                        return Err(format!(
+                            "child navigation ZEROED generation mismatch: expected {expected_generation}, received {}",
+                            proof.cancel_generation
+                        ));
                     }
                 }
                 ChildNavigationResult::Reached(_) | ChildNavigationResult::Failed { .. } => {
@@ -1504,6 +1684,15 @@ impl ExploreRuntimeHandle {
 
     pub async fn is_active(&self) -> bool {
         self.inner.lock().await.session_in_progress()
+    }
+
+    /// Mapping must retain its costmap while exploration or child navigation
+    /// still owns motion-safety state, including a failed cancellation barrier.
+    pub async fn blocks_mapping_mutation(&self) -> bool {
+        let guard = self.inner.lock().await;
+        guard.controller.is_active()
+            || guard.active_child.is_some()
+            || guard.pending_child_cancellation.is_some()
     }
 
     pub async fn readiness(&self, backend_available: bool) -> ExplorationReadinessDetail {
@@ -1822,6 +2011,8 @@ mod tests {
         next_cancel_generation: AtomicU64,
         submit_entered: tokio::sync::Notify,
         submit_release: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+        cancel_entered: tokio::sync::Notify,
+        cancel_release: StdMutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     #[async_trait]
@@ -1855,6 +2046,11 @@ mod tests {
             &self,
             lease: &ChildNavigationLease,
         ) -> Result<ChildNavigationCancelTicket, String> {
+            let cancel_release = { self.cancel_release.lock().unwrap().clone() };
+            if let Some(release) = cancel_release {
+                self.cancel_entered.notify_one();
+                release.notified().await;
+            }
             self.cancelled
                 .lock()
                 .unwrap()
@@ -1989,6 +2185,10 @@ mod tests {
     fn stop_reason_statuses_are_not_collapsed() {
         assert_eq!(
             status_for_stop_reason(ExplorationStopReason::NoInformationGain),
+            STATUS_SUCCEEDED
+        );
+        assert_eq!(
+            status_for_stop_reason(ExplorationStopReason::DurationExceeded),
             STATUS_SUCCEEDED
         );
         assert_eq!(
@@ -2212,6 +2412,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_rejects_a_mismatched_parent_request_before_child_cancel() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-stop-owner", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+
+        let rejected = handle.stop("req-stop-other").await;
+
+        assert_eq!(rejected.status, STATUS_REJECTED);
+        assert_eq!(rejected.request_id, "req-stop-other");
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
+        assert_eq!(handle.snapshot().request_id, "req-stop-owner");
+        assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
+        assert!(handle.blocks_mapping_mutation().await);
+    }
+
+    #[tokio::test]
+    async fn rejected_start_does_not_attach_the_active_child_to_the_new_parent() {
+        let (handle, _) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-active-owner", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+        assert!(!active.child_task_id.is_empty());
+
+        let rejected = handle.start("req-rejected-new", "prefer_wavefront").await;
+
+        assert_eq!(rejected.status, STATUS_REJECTED);
+        assert_eq!(rejected.request_id, "req-rejected-new");
+        assert!(rejected.child_task_id.is_empty());
+        let authoritative = handle.snapshot();
+        assert_eq!(authoritative.status, STATUS_ACTIVE);
+        assert_eq!(authoritative.request_id, "req-active-owner");
+        assert_eq!(authoritative.child_task_id, active.child_task_id);
+    }
+
+    #[tokio::test]
     async fn zeroed_proof_requires_exact_lease_generation_ack_and_time() {
         let (handle, _) = configured_handle();
         handle
@@ -2284,6 +2527,244 @@ mod tests {
         assert_eq!(failed.last_stop_reason, "child_cancel_failed");
         assert_eq!(failed.child_task_id, active.child_task_id);
         assert!(handle.is_active().await);
+        assert!(handle.blocks_mapping_mutation().await);
+    }
+
+    #[tokio::test]
+    async fn failed_cancel_without_ticket_retries_only_for_the_exact_parent_request() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-cancel-retry", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+        *sink.cancel_error.lock().unwrap() = Some("guard unavailable".to_string());
+        assert_eq!(handle.stop("req-cancel-retry").await.status, STATUS_FAILED);
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
+
+        let rejected = handle.stop("other-request").await;
+        assert_eq!(rejected.status, STATUS_REJECTED);
+        assert_eq!(rejected.request_id, "other-request");
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
+        assert_eq!(handle.snapshot().request_id, "req-cancel-retry");
+        assert_eq!(handle.snapshot().status, STATUS_FAILED);
+
+        *sink.cancel_error.lock().unwrap() = None;
+        let retry = handle.stop("req-cancel-retry").await;
+        assert_eq!(retry.status, STATUS_STOPPING);
+        assert_eq!(retry.last_stop_reason, "child_cancel_failed");
+        assert!(retry.message.contains("CANCEL_RETRY_PENDING"));
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 2);
+
+        let released = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(released.status, STATUS_FAILED);
+        assert_eq!(released.last_stop_reason, "child_cancel_failed");
+        assert!(released.child_task_id.is_empty());
+        assert!(!handle.blocks_mapping_mutation().await);
+    }
+
+    #[tokio::test]
+    async fn failed_cancel_with_ticket_retries_with_a_new_generation() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-timeout-retry", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+        assert_eq!(
+            handle.stop("req-timeout-retry").await.status,
+            STATUS_STOPPING
+        );
+        let failed = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::CancelFailed {
+                    proof: terminal_proof(&lease),
+                    cancel_generation: 1,
+                    reason: "CANCEL_ZERO_ACK_TIMEOUT".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, STATUS_FAILED);
+
+        let retry = handle.stop("req-timeout-retry").await;
+        assert_eq!(retry.status, STATUS_STOPPING);
+        assert!(retry.message.contains("cancel_generation=2"));
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 2);
+
+        assert!(handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
+            )
+            .await
+            .is_err());
+        assert_eq!(handle.snapshot().status, STATUS_STOPPING);
+        assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
+
+        let released = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(released.status, STATUS_FAILED);
+        assert!(released.child_task_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_old_cancel_failure_cannot_supersede_an_inflight_retry() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle
+            .start("req-retry-old-failure", "prefer_wavefront")
+            .await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+        assert_eq!(
+            handle.stop("req-retry-old-failure").await.status,
+            STATUS_STOPPING
+        );
+        handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::CancelFailed {
+                    proof: terminal_proof(&lease),
+                    cancel_generation: 1,
+                    reason: "CANCEL_ZERO_ACK_TIMEOUT".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sink.cancel_release.lock().unwrap() = Some(release.clone());
+        let retry_task = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.stop("req-retry-old-failure").await })
+        };
+        sink.cancel_entered.notified().await;
+        let duplicate = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::CancelFailed {
+                    proof: terminal_proof(&lease),
+                    cancel_generation: 1,
+                    reason: "duplicate old timeout".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status, STATUS_STOPPING);
+        assert!(duplicate.message.contains("OLD_FAILURE_IGNORED"));
+
+        release.notify_one();
+        let retry = retry_task.await.unwrap();
+        assert!(retry.message.contains("cancel_generation=2"));
+        let released = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(released.status, STATUS_FAILED);
+        assert!(released.child_task_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_repeated_stop_dispatches_only_one_cancel_retry() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-single-retry", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+        *sink.cancel_error.lock().unwrap() = Some("guard unavailable".to_string());
+        assert_eq!(handle.stop("req-single-retry").await.status, STATUS_FAILED);
+
+        *sink.cancel_error.lock().unwrap() = None;
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sink.cancel_release.lock().unwrap() = Some(release.clone());
+        let retry_task = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.stop("req-single-retry").await })
+        };
+        sink.cancel_entered.notified().await;
+
+        let concurrent = handle.stop("req-single-retry").await;
+        assert_eq!(concurrent.status, STATUS_STOPPING);
+        assert!(concurrent.message.contains("already in flight"));
+
+        release.notify_one();
+        let retry = retry_task.await.unwrap();
+        assert_eq!(retry.status, STATUS_STOPPING);
+        assert!(retry.message.contains("cancel_generation=1"));
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 2);
+
+        let released = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(released.status, STATUS_FAILED);
+        assert!(released.child_task_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zeroed_before_cancel_ticket_is_replayed_after_ticket_commit() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-early-zero", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sink.cancel_release.lock().unwrap() = Some(release.clone());
+
+        let stop_task = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.stop("req-early-zero").await })
+        };
+        sink.cancel_entered.notified().await;
+
+        let buffered = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
+            )
+            .await
+            .expect("exact early ZEROED must be retained");
+        assert_eq!(buffered.status, STATUS_STOPPING);
+        assert!(buffered.message.contains("ZEROED_EARLY_BUFFERED"));
+        assert_eq!(buffered.child_task_id, active.child_task_id);
+
+        release.notify_one();
+        let terminal = stop_task.await.unwrap();
+        assert_eq!(terminal.status, STATUS_CANCELLED);
+        assert!(terminal.child_task_id.is_empty());
+        assert!(!handle.blocks_mapping_mutation().await);
     }
 
     #[tokio::test]
@@ -2317,6 +2798,21 @@ mod tests {
         assert_eq!(failed.last_stop_reason, "child_cancel_failed");
         assert_eq!(failed.child_task_id, active.child_task_id);
         assert!(handle.is_active().await);
+        assert!(handle.blocks_mapping_mutation().await);
+
+        let released = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(released.status, STATUS_FAILED);
+        assert_eq!(released.last_stop_reason, "child_cancel_failed");
+        assert!(released.child_task_id.is_empty());
+        assert!(!handle.is_active().await);
+        assert!(!handle.blocks_mapping_mutation().await);
     }
 
     #[tokio::test]
@@ -2508,6 +3004,7 @@ mod tests {
             .message
             .contains("pose source unavailable"));
         assert!(!handle.is_active().await);
+        assert!(!handle.blocks_mapping_mutation().await);
         scheduler.shutdown().await;
     }
 

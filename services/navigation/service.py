@@ -26,6 +26,30 @@ from .state_machine import (
 LOGGER = logging.getLogger("nuwax_robot_bridge.navigation.service")
 
 
+def _is_complete_exploration_terminal(
+    exploration_state,
+    *,
+    request_id: str,
+) -> bool:
+    expected_id = str(request_id or "").strip()
+    metadata = dict(getattr(exploration_state, "metadata", {}) or {})
+    return bool(
+        expected_id
+        and str(
+            getattr(exploration_state, "current_request_id", "") or ""
+        ).strip()
+        == expected_id
+        and getattr(exploration_state, "status", None)
+        in {
+            ExplorationStatus.SUCCEEDED,
+            ExplorationStatus.FAILED,
+            ExplorationStatus.CANCELLED,
+        }
+        and metadata.get("exploration_terminal") is True
+        and not str(metadata.get("child_task_id") or "").strip()
+    )
+
+
 class NavigationService:
     """统一导航与探索服务。
 
@@ -60,6 +84,7 @@ class NavigationService:
         self._latest_exploration_context: Optional[ExplorationContext] = None
         self._current_goal: Optional[NavigationGoal] = None
         self._current_explore_request: Optional[ExploreAreaRequest] = None
+        self._pending_explore_request_id: Optional[str] = None
         # 平台导航状态机
         self._state_machine: NavigationStateMachine = navigation_state_machine or create_navigation_state_machine()
         self._last_navigation_diagnostics: Optional[NavigationDiagnostics] = None
@@ -492,10 +517,25 @@ class NavigationService:
                 exploration_state.status == ExplorationStatus.IDLE
                 and current_request is None
             )
+            previous_request_id = str(
+                getattr(
+                    getattr(previous_context, "current_request", None),
+                    "request_id",
+                    "",
+                )
+                or getattr(
+                    getattr(previous_context, "exploration_state", None),
+                    "current_request_id",
+                    "",
+                )
+                or ""
+            ).strip()
             if (
                 previous_context is not None
-                and previous_context.exploration_state.status
-                in {ExplorationStatus.SUCCEEDED, ExplorationStatus.FAILED, ExplorationStatus.CANCELLED}
+                and _is_complete_exploration_terminal(
+                    previous_context.exploration_state,
+                    request_id=previous_request_id,
+                )
                 and exploration_state.status == ExplorationStatus.IDLE
                 and previous_context.exploration_state.current_request_id is not None
             ):
@@ -614,11 +654,13 @@ class NavigationService:
                         reason="geometry_session_not_explore",
                     )
                 self._publish_external_exploration_navigation_overlay(context)
-            if context.exploration_state.status in {
-                ExplorationStatus.SUCCEEDED,
-                ExplorationStatus.FAILED,
-                ExplorationStatus.CANCELLED,
-            }:
+            context_request_id = str(
+                getattr(context.current_request, "request_id", "") or ""
+            ).strip()
+            if _is_complete_exploration_terminal(
+                context.exploration_state,
+                request_id=context_request_id,
+            ):
                 self._current_explore_request = None
             return context
 
@@ -626,9 +668,24 @@ class NavigationService:
         """启动探索任务。"""
 
         provider = self._get_exploration_provider()
+        request_id = str(request.request_id or "").strip()
         with self._lock:
-            self._current_explore_request = request
-        accepted = provider.start_exploration(request)
+            current_id = str(
+                getattr(self._current_explore_request, "request_id", "") or ""
+            ).strip()
+            if (current_id and current_id != request_id) or (
+                self._pending_explore_request_id
+                and self._pending_explore_request_id != request_id
+            ):
+                raise GatewayError("已有其它探索请求正在启动或运行。")
+            self._pending_explore_request_id = request_id
+        try:
+            accepted = provider.start_exploration(request)
+        except Exception:
+            with self._lock:
+                if self._pending_explore_request_id == request_id:
+                    self._pending_explore_request_id = None
+            raise
         if not accepted:
             message = f"探索后端拒绝请求 {request.request_id}。"
             try:
@@ -638,8 +695,14 @@ class NavigationService:
             if exploration_state is not None and exploration_state.message:
                 message = exploration_state.message
             with self._lock:
-                self._current_explore_request = None
+                if self._pending_explore_request_id == request_id:
+                    self._pending_explore_request_id = None
             raise GatewayError(message)
+        with self._lock:
+            if self._pending_explore_request_id != request_id:
+                raise GatewayError("探索启动确认与本地 pending request 不匹配。")
+            self._pending_explore_request_id = None
+            self._current_explore_request = request
         context = self.refresh_exploration()
         if context.exploration_state.status == ExplorationStatus.IDLE:
             context = context.model_copy(
@@ -702,11 +765,6 @@ class NavigationService:
             raise GatewayError("探索后端拒绝停止当前任务。")
         context = self.refresh_exploration()
 
-        terminal_statuses = {
-            ExplorationStatus.SUCCEEDED,
-            ExplorationStatus.FAILED,
-            ExplorationStatus.CANCELLED,
-        }
         if previous_request is not None and context.current_request is None:
             state_updates = {}
             if context.exploration_state.current_request_id is None:
@@ -728,7 +786,10 @@ class NavigationService:
             )
             self._latest_exploration_context = context
 
-        if context.exploration_state.status in terminal_statuses:
+        if previous_request is not None and _is_complete_exploration_terminal(
+            context.exploration_state,
+            request_id=previous_request.request_id,
+        ):
             self._current_explore_request = None
         return context
 
@@ -765,12 +826,21 @@ class NavigationService:
             if callable(on_progress):
                 on_progress(context)
             state = context.exploration_state.status
-            if state == ExplorationStatus.SUCCEEDED:
-                return context
-            if state == ExplorationStatus.FAILED:
-                raise GatewayError(context.exploration_state.message or "探索执行失败。")
-            if state == ExplorationStatus.CANCELLED:
-                raise GatewayError(context.exploration_state.message or "探索已取消。")
+            terminal = _is_complete_exploration_terminal(
+                context.exploration_state,
+                request_id=request.request_id,
+            )
+            if terminal:
+                if state == ExplorationStatus.SUCCEEDED:
+                    return context
+                if state == ExplorationStatus.FAILED:
+                    raise GatewayError(
+                        context.exploration_state.message or "探索执行失败。"
+                    )
+                if state == ExplorationStatus.CANCELLED:
+                    raise GatewayError(
+                        context.exploration_state.message or "探索已取消。"
+                    )
             if deadline is not None and time.monotonic() >= deadline:
                 try:
                     self.stop_exploration()

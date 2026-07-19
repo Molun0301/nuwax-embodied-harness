@@ -52,6 +52,56 @@ _NavigationDeliveryToken = Tuple[
 _PUBLIC_NAV_OWNER_KIND = int(pb2.NAVIGATION_OWNER_KIND_PUBLIC_NAV)
 
 
+class GeometryRuntimeRpcError(RuntimeError):
+    """Typed unary RPC failure with stable diagnostic fields."""
+
+    def __init__(
+        self,
+        *,
+        rpc_name: str,
+        grpc_code: object,
+        grpc_details: str,
+    ) -> None:
+        self.rpc_name = str(rpc_name or "")
+        self.grpc_code = grpc_code
+        self.grpc_details = str(grpc_details or "")
+        code_name = str(getattr(grpc_code, "name", "") or "UNKNOWN")
+        super().__init__(
+            "%s failed (%s): %s"
+            % (self.rpc_name, code_name, self.grpc_details)
+        )
+
+    @classmethod
+    def from_rpc_error(
+        cls,
+        rpc_name: str,
+        exc: grpc.RpcError,
+    ) -> "GeometryRuntimeRpcError":
+        try:
+            code_reader = getattr(exc, "code", None)
+            grpc_code = code_reader() if callable(code_reader) else None
+        except Exception:
+            grpc_code = None
+        if grpc_code is None:
+            grpc_code = grpc.StatusCode.UNKNOWN
+
+        try:
+            details_reader = getattr(exc, "details", None)
+            details = details_reader() if callable(details_reader) else None
+        except Exception:
+            details = None
+        if not details:
+            try:
+                details = str(exc)
+            except Exception:
+                details = ""
+        return cls(
+            rpc_name=rpc_name,
+            grpc_code=grpc_code,
+            grpc_details=str(details or "gRPC call failed without details"),
+        )
+
+
 class _NavigationNotificationTicket:
     """One immutable navigation event plus its commit-time delivery fence."""
 
@@ -337,6 +387,33 @@ def _log_rpc_error(rpc_name: str, exc: grpc.RpcError) -> None:
         LOGGER.warning("gRPC %s 超过 deadline 被截断（DEADLINE_EXCEEDED），按降级返回", rpc_name)
     else:
         LOGGER.debug("gRPC %s 调用失败: %s", rpc_name, exc)
+
+
+def _exploration_rpc_error(
+    rpc_name: str,
+    exc: grpc.RpcError,
+) -> GeometryRuntimeRpcError:
+    error = GeometryRuntimeRpcError.from_rpc_error(rpc_name, exc)
+    try:
+        _log_rpc_error(rpc_name, exc)
+    except Exception:
+        LOGGER.debug(
+            "gRPC %s 调用失败，且读取原始错误元数据失败: %s",
+            rpc_name,
+            error.grpc_details,
+            exc_info=True,
+        )
+    return error
+
+
+def _missing_exploration_stub_error(rpc_name: str) -> GeometryRuntimeRpcError:
+    details = "geometry runtime gRPC stub is unavailable"
+    LOGGER.debug("gRPC %s 调用失败: %s", rpc_name, details)
+    return GeometryRuntimeRpcError(
+        rpc_name=rpc_name,
+        grpc_code=grpc.StatusCode.UNAVAILABLE,
+        grpc_details=details,
+    )
 
 
 # --- NavigationState.status 字符串语义映射（round-4 HIGH 3 同步） ---
@@ -3767,18 +3844,26 @@ class GeometryRuntimeProvider:
         stop_conditions: Optional[Dict[str, Any]] = None,
         max_navigation_retries: int = 0,
         blacklist_radius_m: float = 0.0,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """启动探索(走 Rust `nuwax_exploration::ExplorationController`)。
 
         完整编码 map pin、顺序边界、typed stop conditions、重试与 blacklist
-        参数。stub 未就绪或 RPC 异常时返回 None,绝不假装成功。
+        参数。stub 未就绪或 RPC 异常时抛出带 gRPC 细节的 typed error。
         """
         self._raise_if_stopping("start_exploration")
-        if not self._stub:
-            return None
+        stub = self._stub
+        if stub is None:
+            raise _missing_exploration_stub_error("StartExploration")
         try:
             proto_segments = []
             for start_pose, end_pose in boundary_line_segments or ():
+                for pose in (start_pose, end_pose):
+                    frame_id = str(pose.frame_id or "").strip().lstrip("/")
+                    if frame_id != "map":
+                        raise ValueError(
+                            "exploration boundary frame must be map, received %s"
+                            % (frame_id or "<empty>")
+                        )
                 proto_segments.append(
                     pb2.ExplorationBoundarySegment(
                         start_x=float(start_pose.position.x),
@@ -3795,6 +3880,7 @@ class GeometryRuntimeProvider:
                 request_id=request_id,
                 map_revision=max(0, int(map_revision)),
                 boundary_line_segments=proto_segments,
+                boundary_frame_id="map" if proto_segments else "",
                 max_navigation_retries=max(0, int(max_navigation_retries)),
                 blacklist_radius_m=max(0.0, float(blacklist_radius_m)),
             )
@@ -3832,44 +3918,43 @@ class GeometryRuntimeProvider:
                         raw_stop_conditions["stop_on_map_revision_change"]
                     )
                 req.stop_conditions.CopyFrom(proto_stop_conditions)
-            resp = self._stub.StartExploration(req, timeout=_read_deadline_sec())
+            resp = stub.StartExploration(req, timeout=_read_deadline_sec())
             return _exploration_state_to_dict(resp)
         except grpc.RpcError as e:
-            _log_rpc_error("StartExploration", e)
-            return None
+            raise _exploration_rpc_error("StartExploration", e) from e
 
-    def stop_exploration(self, *, request_id: str = "") -> Optional[Dict[str, Any]]:
+    def stop_exploration(self, *, request_id: str = "") -> Dict[str, Any]:
         """停止探索。
 
-        返回 ExplorationState 字典(同 `start_exploration`),失败时 None。
+        返回 ExplorationState 字典；失败时抛出带 gRPC 细节的 typed error。
         """
         self._raise_if_stopping("stop_exploration")
-        if not self._stub:
-            return None
+        stub = self._stub
+        if stub is None:
+            raise _missing_exploration_stub_error("StopExploration")
         try:
             req = pb2.StopExplorationRequest(request_id=request_id)
-            resp = self._stub.StopExploration(req, timeout=_read_deadline_sec())
+            resp = stub.StopExploration(req, timeout=_read_deadline_sec())
             return _exploration_state_to_dict(resp)
         except grpc.RpcError as e:
-            _log_rpc_error("StopExploration", e)
-            return None
+            raise _exploration_rpc_error("StopExploration", e) from e
 
-    def get_exploration_state(self) -> Optional[Dict[str, Any]]:
+    def get_exploration_state(self) -> Dict[str, Any]:
         """读取当前 exploration scheduler 的只读快照。
 
-        返回 ExplorationState 字典;失败时 None。
+        返回 ExplorationState 字典；失败时抛出带 gRPC 细节的 typed error。
         """
         self._raise_if_stopping("get_exploration_state")
-        if not self._stub:
-            return None
+        stub = self._stub
+        if stub is None:
+            raise _missing_exploration_stub_error("GetExplorationState")
         try:
-            resp = self._stub.GetExplorationState(
+            resp = stub.GetExplorationState(
                 pb2.Empty(), timeout=_read_deadline_sec()
             )
             return _exploration_state_to_dict(resp)
         except grpc.RpcError as e:
-            _log_rpc_error("GetExplorationState", e)
-            return None
+            raise _exploration_rpc_error("GetExplorationState", e) from e
 
     @staticmethod
     def _exploration_state_signature(state: Dict[str, Any]):
@@ -3964,15 +4049,21 @@ class GeometryRuntimeProvider:
                     if signature == self._last_exploration_signature:
                         subscribers = ()
                     else:
-                        self._last_exploration_signature = signature
                         subscribers = tuple(
                             self._exploration_update_subscribers.values()
                         )
+                accepted_delivery = False
                 for callback in subscribers:
                     try:
-                        callback(dict(state))
+                        # ``None`` is the long-standing callback success value;
+                        # only an explicit ``False`` rejects this snapshot.
+                        if callback(dict(state)) is not False:
+                            accepted_delivery = True
                     except Exception:
                         LOGGER.exception("探索状态回调失败，其他订阅者继续。")
+                if accepted_delivery:
+                    with self._exploration_state_lock:
+                        self._last_exploration_signature = signature
                 if stop_event.wait(_exploration_poll_sec()):
                     return
         finally:

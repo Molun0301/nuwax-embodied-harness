@@ -129,11 +129,12 @@ impl ExplorationStopReason {
             | Self::NoReachableFreeSpace
             | Self::CoverageReached
             | Self::NoFrontierTimeout
+            | Self::DurationExceeded
             | Self::MaxGoalsReached => ExplorationTerminalKind::Succeeded,
             Self::UserCancelled => ExplorationTerminalKind::Cancelled,
-            Self::ConsecutiveFailuresExceeded
-            | Self::DurationExceeded
-            | Self::MapRevisionChanged => ExplorationTerminalKind::Failed,
+            Self::ConsecutiveFailuresExceeded | Self::MapRevisionChanged => {
+                ExplorationTerminalKind::Failed
+            }
         }
     }
 }
@@ -943,6 +944,10 @@ mod tests {
     fn stop_reasons_preserve_success_cancel_and_failure_semantics() {
         assert_eq!(
             ExplorationStopReason::NoInformationGain.terminal_kind(),
+            ExplorationTerminalKind::Succeeded
+        );
+        assert_eq!(
+            ExplorationStopReason::DurationExceeded.terminal_kind(),
             ExplorationTerminalKind::Succeeded
         );
         assert_eq!(

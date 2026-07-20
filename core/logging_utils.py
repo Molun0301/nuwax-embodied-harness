@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import contextvars
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import logging
-import random
+import math
 import re
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Hashable, Iterable, Mapping, Optional
@@ -17,6 +18,17 @@ DEFAULT_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 DEFAULT_EXTRA_VALUE_MAX_LENGTH = 240
 DEFAULT_PREVIEW_MAX_LENGTH = 600
 DEFAULT_LOG_DETAILS_TOTAL_MAX_LENGTH = 2000
+DEFAULT_LOG_MESSAGE_MAX_LENGTH = 4000
+DEFAULT_FORMATTED_LOG_MAX_LENGTH = 20_000
+DEFAULT_JSON_LOG_MAX_LENGTH = 20_000
+DEFAULT_STREAM_LOG_MESSAGE_MAX_LENGTH = 800
+DEFAULT_JSON_EXTRA_MAX_FIELDS = 48
+DEFAULT_LOG_KEY_MAX_LENGTH = 120
+DEFAULT_LOGGER_NAME_MAX_LENGTH = 240
+DEFAULT_LOG_PROJECTION_MAX_NODES = 512
+DEFAULT_LOG_PROJECTION_MAX_CHARS = 12_000
+DEFAULT_LOG_REDACTION_SCAN_MAX_CHARS = 8_000
+DEFAULT_LOG_LEVEL_MAX_LENGTH = 24
 _REDACTED = "********"
 _EXTRA_FIELD_ORDER = (
     "event",
@@ -41,11 +53,27 @@ _EXTRA_FIELD_ORDER = (
     "rate_limit_window_sec",
 )
 _SENSITIVE_KEY_RE = re.compile(
-    r"(token|api[_-]?key|secret|password|access[_-]?key|authorization|cookie)",
+    r"(token|api[_-]?key|secret|password|access[_-]?key|authorization|cookie|credential)",
     re.IGNORECASE,
 )
 _SENSITIVE_VALUE_RE = re.compile(
-    r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+|\b(?:sk|ak)-[A-Za-z0-9._-]{8,}\b"
+    r"(?i)"
+    r"\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"
+    r"|\b(?:sk|ak)-[A-Za-z0-9._-]{8,}\b"
+    r"|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"
+    r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"
+)
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?ix)"
+    r"(?P<prefix>[\"']?(?:token|api[_-]?key|secret|password|access[_-]?key|authorization|cookie|credential)"
+    r"[\"']?\s*[:=]\s*)"
+    r"(?P<value>"
+    r"\"(?:\\.|[^\"\\])*\""
+    r"|'(?:\\.|[^'\\])*'"
+    r"|[^\r\n,;&}\]]*?"
+    r")"
+    r"(?=\s+[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]|[\r\n,;&}\]]|$)"
 )
 _DEFAULT_DROP_PATTERNS = (
     "Received message on data channel:",
@@ -64,6 +92,23 @@ LOW_VALUE_RUNTIME_EVENT_TYPES = frozenset(
         "robot.state_refreshed",
     }
 )
+_PROTECTED_JSON_LOG_FIELDS = frozenset(
+    {
+        "ts",
+        "level",
+        "logger",
+        "msg",
+        "request_id",
+        "correlation_id",
+        "exception",
+        "projection_truncated",
+        "truncated",
+        "_extra_fields_omitted",
+    }
+)
+_RESERVED_NORMALIZED_EXTRA_KEYS = _PROTECTED_JSON_LOG_FIELDS | frozenset(_EXTRA_FIELD_ORDER) | {
+    "correlation_id",
+}
 
 
 def _truncate_text(text: str, max_length: int) -> str:
@@ -77,51 +122,186 @@ def _truncate_text(text: str, max_length: int) -> str:
 
 
 def _is_sensitive_key(key: object) -> bool:
-    return bool(_SENSITIVE_KEY_RE.search(str(key or "")))
+    bounded = _truncate_text(str(key or ""), DEFAULT_LOG_KEY_MAX_LENGTH + 32)
+    return bool(_SENSITIVE_KEY_RE.search(bounded))
 
 
 def _redact_sensitive_text(text: str) -> str:
     redacted = _SENSITIVE_VALUE_RE.sub(_REDACTED, text)
+    redacted = _SENSITIVE_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{_REDACTED}", redacted)
     return redacted
 
 
-def _redact_and_compact_log_value(value: Any, *, key: object = "", max_depth: int = 2, max_items: int = 8) -> Any:
+def _bounded_redact_text(text: str, *, max_length: int) -> str:
+    limit = max(0, int(max_length))
+    scan_limit = max(limit + 64, min(DEFAULT_LOG_REDACTION_SCAN_MAX_CHARS, limit * 2 + 128))
+    bounded = _truncate_text(str(text or ""), scan_limit)
+    return _truncate_text(_redact_sensitive_text(bounded), limit)
+
+
+def _safe_log_key(key: object, *, max_length: int = DEFAULT_LOG_KEY_MAX_LENGTH) -> str:
+    bounded = _truncate_text(str(key or ""), max(0, int(max_length)) + 64)
+    rendered = _bounded_redact_text(bounded.strip(), max_length=max_length) or "field"
+    return rendered
+
+
+def _normalized_log_level(record: logging.LogRecord) -> str:
+    try:
+        levelno = int(getattr(record, "levelno", logging.NOTSET))
+    except (TypeError, ValueError, OverflowError):
+        levelno = logging.NOTSET
+    canonical = logging.getLevelName(levelno)
+    if isinstance(canonical, str) and not canonical.startswith("Level "):
+        return _truncate_text(canonical.upper(), DEFAULT_LOG_LEVEL_MAX_LENGTH)
+    return _bounded_redact_text(
+        str(getattr(record, "levelname", "UNKNOWN") or "UNKNOWN").upper(),
+        max_length=DEFAULT_LOG_LEVEL_MAX_LENGTH,
+    )
+
+
+@dataclass
+class _LogProjectionBudget:
+    remaining_nodes: int = DEFAULT_LOG_PROJECTION_MAX_NODES
+    remaining_chars: int = DEFAULT_LOG_PROJECTION_MAX_CHARS
+    seen_ids: set[int] = field(default_factory=set)
+    truncated: bool = False
+
+    def consume(self, *, nodes: int = 0, chars: int = 0) -> bool:
+        node_count = max(0, int(nodes))
+        char_count = max(0, int(chars))
+        if node_count > self.remaining_nodes or char_count > self.remaining_chars:
+            self.truncated = True
+            return False
+        self.remaining_nodes -= node_count
+        self.remaining_chars -= char_count
+        return True
+
+    def text(self, value: str, *, max_length: int) -> str:
+        if self.remaining_nodes <= 0 or self.remaining_chars <= 0:
+            self.truncated = True
+            return "<omitted>"
+        allowed = min(max(0, int(max_length)), self.remaining_chars)
+        rendered = _truncate_text(value, allowed)
+        if len(value) > allowed:
+            self.truncated = True
+        self.consume(nodes=1, chars=len(rendered))
+        return rendered
+
+
+def _redact_and_compact_log_value(
+    value: Any,
+    *,
+    key: object = "",
+    max_depth: int = 2,
+    max_items: int = 8,
+    max_string_length: int = DEFAULT_EXTRA_VALUE_MAX_LENGTH,
+    _budget: Optional[_LogProjectionBudget] = None,
+) -> Any:
+    budget = _budget or _LogProjectionBudget()
     if _is_sensitive_key(key):
-        return _REDACTED
+        return budget.text(_REDACTED, max_length=max_string_length)
     if value is None:
+        budget.consume(nodes=1)
         return None
     if isinstance(value, str):
-        return _redact_sensitive_text(value.strip())
-    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return budget.text(
+            _bounded_redact_text(value.strip(), max_length=max_string_length),
+            max_length=max_string_length,
+        )
+    if isinstance(value, bool) or isinstance(value, int):
+        if not budget.consume(nodes=1, chars=len(str(value))):
+            return "<omitted>"
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return budget.text("<non-finite float>", max_length=max_string_length)
+        if not budget.consume(nodes=1, chars=len(str(value))):
+            return "<omitted>"
         return value
     if isinstance(value, (bytes, bytearray, memoryview)):
-        return f"<bytes len={len(value)}>"
+        return budget.text(f"<bytes len={len(value)}>", max_length=max_string_length)
     if max_depth <= 0:
-        return f"<{type(value).__name__}>"
+        return budget.text(f"<{type(value).__name__} omitted>", max_length=max_string_length)
     if isinstance(value, Mapping):
-        items = list(value.items())
-        compacted = {
-            str(item_key): _redact_and_compact_log_value(
-                item,
-                key=item_key,
-                max_depth=max_depth - 1,
-                max_items=max_items,
-            )
-            for item_key, item in items[:max_items]
-        }
-        if len(items) > max_items:
-            compacted["..."] = f"+{len(items) - max_items} keys"
-        return compacted
+        identity = id(value)
+        if identity in budget.seen_ids:
+            return budget.text("<already-seen>", max_length=max_string_length)
+        if not budget.consume(nodes=1):
+            return "<omitted>"
+        budget.seen_ids.add(identity)
+        compacted: Dict[str, Any] = {}
+        processed = 0
+        try:
+            total_items = len(value) if hasattr(value, "__len__") else None
+        except Exception:
+            total_items = None
+        try:
+            for index, (item_key, item) in enumerate(value.items()):
+                if index >= max_items or budget.remaining_nodes <= 0 or budget.remaining_chars <= 0:
+                    budget.truncated = True
+                    break
+                bounded_key = _truncate_text(str(item_key or ""), DEFAULT_LOG_KEY_MAX_LENGTH + 64)
+                safe_key = _safe_log_key(bounded_key)
+                if not budget.consume(chars=len(safe_key)):
+                    break
+                compacted[safe_key] = _redact_and_compact_log_value(
+                    item,
+                    key=bounded_key,
+                    max_depth=max_depth - 1,
+                    max_items=max_items,
+                    max_string_length=max_string_length,
+                    _budget=budget,
+                )
+                processed += 1
+            if total_items is not None and total_items > processed:
+                compacted["..."] = f"+{total_items - processed} keys omitted"
+                budget.truncated = True
+            elif budget.truncated and not compacted:
+                compacted["..."] = "budget exhausted"
+            return compacted
+        except Exception as exc:
+            compacted["..."] = f"<{exc.__class__.__name__} while projecting>"
+            budget.truncated = True
+            return compacted
     if isinstance(value, (list, tuple, set, frozenset)):
-        items = list(value)
-        compacted_items = [
-            _redact_and_compact_log_value(item, key=key, max_depth=max_depth - 1, max_items=max_items)
-            for item in items[:max_items]
-        ]
-        if len(items) > max_items:
-            compacted_items.append(f"...(+{len(items) - max_items} items)")
-        return compacted_items
-    return _redact_sensitive_text(str(value))
+        identity = id(value)
+        if identity in budget.seen_ids:
+            return budget.text("<already-seen>", max_length=max_string_length)
+        if not budget.consume(nodes=1):
+            return "<omitted>"
+        budget.seen_ids.add(identity)
+        compacted_items = []
+        try:
+            total_items = len(value) if hasattr(value, "__len__") else None
+        except Exception:
+            total_items = None
+        try:
+            for index, item in enumerate(value):
+                if index >= max_items or budget.remaining_nodes <= 0 or budget.remaining_chars <= 0:
+                    budget.truncated = True
+                    break
+                compacted_items.append(
+                    _redact_and_compact_log_value(
+                        item,
+                        key=key,
+                        max_depth=max_depth - 1,
+                        max_items=max_items,
+                        max_string_length=max_string_length,
+                        _budget=budget,
+                    )
+                )
+            if total_items is not None and total_items > len(compacted_items):
+                compacted_items.append(f"...(+{total_items - len(compacted_items)} items omitted)")
+                budget.truncated = True
+            return compacted_items
+        except Exception as exc:
+            compacted_items.append(f"<{exc.__class__.__name__} while projecting>")
+            budget.truncated = True
+            return compacted_items
+    return budget.text(
+        _bounded_redact_text(str(value), max_length=max_string_length),
+        max_length=max_string_length,
+    )
 
 
 def _compact_log_value(value: Any, *, max_depth: int, max_items: int) -> Any:
@@ -175,8 +355,20 @@ def compact_log_value(
     return _truncate_text(rendered, max_length)
 
 
-def compact_log_detail_value(value: Any, *, key: object = "", max_length: int = DEFAULT_EXTRA_VALUE_MAX_LENGTH) -> str:
-    compacted = _redact_and_compact_log_value(value, key=key, max_depth=3, max_items=10)
+def compact_log_detail_value(
+    value: Any,
+    *,
+    key: object = "",
+    max_length: int = DEFAULT_EXTRA_VALUE_MAX_LENGTH,
+    _budget: Optional[_LogProjectionBudget] = None,
+) -> str:
+    compacted = _redact_and_compact_log_value(
+        value,
+        key=key,
+        max_depth=3,
+        max_items=10,
+        _budget=_budget,
+    )
     if compacted is None:
         return "-"
     if isinstance(compacted, str):
@@ -191,7 +383,7 @@ def compact_log_detail_value(value: Any, *, key: object = "", max_length: int = 
 def format_log_preview(value: Any, *, max_length: int = DEFAULT_PREVIEW_MAX_LENGTH) -> str:
     if not value:
         return "-"
-    return compact_log_value(value, max_length=max_length, max_depth=3, max_items=10)
+    return compact_log_detail_value(value, max_length=max_length)
 
 
 def is_low_value_runtime_event(event_type: str) -> bool:
@@ -199,34 +391,50 @@ def is_low_value_runtime_event(event_type: str) -> bool:
     return normalized in LOW_VALUE_RUNTIME_EVENT_TYPES or normalized.endswith(LOW_VALUE_RUNTIME_EVENT_SUFFIXES)
 
 
-def _stringify_log_value(value: Any) -> str:
+def _stringify_log_value(
+    value: Any,
+    *,
+    key: object = "",
+    _budget: Optional[_LogProjectionBudget] = None,
+) -> str:
     if value is None:
         return "-"
-    if isinstance(value, str):
-        text = compact_log_value(value)
-        if not text or text == "-":
-            return "-"
-        if any(char.isspace() for char in text) or "=" in text:
-            return json.dumps(text, ensure_ascii=False)
-        return text
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, float):
-        return ("%.3f" % value).rstrip("0").rstrip(".")
-    return compact_log_value(value)
+    text = compact_log_detail_value(value, key=key, _budget=_budget)
+    if not text or text == "-":
+        return "-"
+    if any(char.isspace() for char in text) or "=" in text:
+        return json.dumps(text, ensure_ascii=False)
+    return text
 
 
 def _iter_extra_items(record: logging.LogRecord) -> Iterable[tuple[str, Any]]:
-    extras = {
-        key: value
-        for key, value in record.__dict__.items()
-        if key not in _STANDARD_LOG_RECORD_FIELDS and not key.startswith("_")
-    }
+    extras = {}
+    for key, value in record.__dict__.items():
+        try:
+            raw_key = str(key)
+        except Exception:
+            raw_key = type(key).__name__
+        if key in _STANDARD_LOG_RECORD_FIELDS or raw_key.startswith("_"):
+            continue
+        extras[key] = value
+    emitted_keys: set[str] = set()
     for key in _EXTRA_FIELD_ORDER:
         if key in extras:
-            yield key, extras.pop(key)
-    for key in sorted(extras):
-        yield key, extras[key]
+            safe_key = _safe_log_key(key)
+            emitted_keys.add(safe_key)
+            yield safe_key, extras.pop(key)
+    for key in sorted(extras, key=lambda item: _safe_log_key(item)):
+        try:
+            raw_key = str(key)
+        except Exception:
+            raw_key = type(key).__name__
+        safe_key = _safe_log_key(raw_key)
+        if safe_key in emitted_keys:
+            continue
+        if raw_key != safe_key and safe_key in _RESERVED_NORMALIZED_EXTRA_KEYS:
+            continue
+        emitted_keys.add(safe_key)
+        yield safe_key, extras[key]
 
 
 def _format_record_time_text(record: logging.LogRecord) -> str:
@@ -237,8 +445,12 @@ def _format_record_time_text(record: logging.LogRecord) -> str:
 def _build_details_compact(record: logging.LogRecord) -> Dict[str, str]:
     details: Dict[str, str] = {}
     total = 0
+    budget = _LogProjectionBudget(
+        remaining_nodes=256,
+        remaining_chars=DEFAULT_LOG_DETAILS_TOTAL_MAX_LENGTH,
+    )
     for key, value in _iter_extra_items(record):
-        rendered = compact_log_detail_value(value, key=key)
+        rendered = compact_log_detail_value(value, key=key, _budget=budget)
         if rendered == "-":
             continue
         remaining = DEFAULT_LOG_DETAILS_TOTAL_MAX_LENGTH - total
@@ -249,18 +461,44 @@ def _build_details_compact(record: logging.LogRecord) -> Dict[str, str]:
             rendered = _truncate_text(rendered, remaining)
         details[key] = rendered
         total += len(key) + len(rendered)
+    if record.exc_info and record.exc_info[1] and "exception_type" not in details:
+        details["exception_type"] = record.exc_info[1].__class__.__name__
     return details
+
+
+def _safe_log_field(value: Any, *, max_length: int = DEFAULT_EXTRA_VALUE_MAX_LENGTH) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool) or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return _bounded_redact_text(str(value).strip(), max_length=max_length)
 
 
 class ContextAwareFormatter(logging.Formatter):
     """在标准日志后自动追加 extra（扩展）字段。"""
 
     def format(self, record: logging.LogRecord) -> str:
-        rendered = super().format(record)
-        extras = [f"{key}={_stringify_log_value(value)}" for key, value in _iter_extra_items(record)]
-        if not extras:
-            return rendered
-        return "%s %s" % (rendered, " ".join(extras))
+        rendered = _bounded_redact_text(
+            super().format(record),
+            max_length=DEFAULT_LOG_MESSAGE_MAX_LENGTH,
+        )
+        budget = _LogProjectionBudget(
+            remaining_nodes=256,
+            remaining_chars=DEFAULT_LOG_DETAILS_TOTAL_MAX_LENGTH,
+        )
+        extras = []
+        for key, value in _iter_extra_items(record):
+            if budget.remaining_nodes <= 0 or budget.remaining_chars <= 0:
+                extras.append("...=...(truncated)")
+                break
+            extras.append(f"{key}={_stringify_log_value(value, key=key, _budget=budget)}")
+        combined = rendered if not extras else "%s %s" % (rendered, " ".join(extras))
+        return _truncate_text(
+            _redact_sensitive_text(combined),
+            DEFAULT_FORMATTED_LOG_MAX_LENGTH,
+        )
 
 
 class DropPatternLogFilter(logging.Filter):
@@ -394,10 +632,16 @@ class CorrelationContextFilter(logging.Filter):
     """自动将 correlation context 注入每条 LogRecord。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if not getattr(record, "correlation_id", ""):
-            cid = _correlation_id.get("")
-            if cid:
-                record.correlation_id = cid
+        cid = _correlation_id.get("")
+        request_id = (
+            getattr(record, "request_id", "")
+            or getattr(record, "correlation_id", "")
+            or cid
+        )
+        if request_id and not getattr(record, "request_id", ""):
+            record.request_id = request_id
+        if request_id and not getattr(record, "correlation_id", ""):
+            record.correlation_id = request_id
         if not getattr(record, "capability_name", ""):
             cap = _capability_name_ctx.get("")
             if cap:
@@ -419,7 +663,7 @@ class SamplingLogFilter(logging.Filter):
         self._counter = 0
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.levelno >= logging.WARNING:
+        if record.levelno >= logging.INFO:
             return True
         self._counter += 1
         if self._sample_rate <= 0.0:
@@ -474,20 +718,139 @@ class JsonLineFormatter(logging.Formatter):
     """输出 JSON Lines 格式日志。"""
 
     def format(self, record: logging.LogRecord) -> str:
+        request_id = getattr(record, "request_id", "") or getattr(record, "correlation_id", "")
         payload: Dict[str, Any] = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
+            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
+            "level": _normalized_log_level(record),
+            "logger": _safe_log_field(record.name, max_length=DEFAULT_LOGGER_NAME_MAX_LENGTH) or "-",
+            "msg": _truncate_text(
+                _bounded_redact_text(
+                    record.getMessage(),
+                    max_length=DEFAULT_LOG_MESSAGE_MAX_LENGTH,
+                ),
+                DEFAULT_LOG_MESSAGE_MAX_LENGTH,
+            ),
         }
+        if request_id:
+            payload["request_id"] = _truncate_text(_redact_sensitive_text(str(request_id)), 160)
         cid = getattr(record, "correlation_id", "")
         if cid:
-            payload["correlation_id"] = cid
+            payload["correlation_id"] = _truncate_text(_redact_sensitive_text(str(cid)), 160)
+        budget = _LogProjectionBudget()
+        extra_count = 0
         for key, value in _iter_extra_items(record):
-            payload[key] = str(value) if not isinstance(value, (str, int, float, bool, type(None))) else value
+            if extra_count >= DEFAULT_JSON_EXTRA_MAX_FIELDS:
+                payload["_extra_fields_omitted"] = True
+                budget.truncated = True
+                break
+            if key in _PROTECTED_JSON_LOG_FIELDS or key in payload:
+                continue
+            payload[key] = _redact_and_compact_log_value(
+                value,
+                key=key,
+                max_depth=4,
+                max_items=12,
+                max_string_length=DEFAULT_EXTRA_VALUE_MAX_LENGTH,
+                _budget=budget,
+            )
+            extra_count += 1
+            if budget.remaining_nodes <= 0 or budget.remaining_chars <= 0:
+                payload["_extra_fields_omitted"] = True
+                budget.truncated = True
+                break
+        if budget.truncated:
+            payload["projection_truncated"] = True
         if record.exc_info and record.exc_info[1]:
-            payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False, default=str)
+            payload["exception"] = _truncate_text(
+                _redact_sensitive_text(self.formatException(record.exc_info)),
+                8_000,
+            )
+        rendered = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+            allow_nan=False,
+        )
+        if len(rendered.encode("utf-8")) <= DEFAULT_JSON_LOG_MAX_LENGTH:
+            return rendered
+
+        payload["truncated"] = True
+        if "exception" in payload:
+            payload["exception"] = _truncate_text(str(payload["exception"]), 3_000)
+        payload["msg"] = _truncate_text(str(payload["msg"]), 1_200)
+        protected = {
+            "ts",
+            "level",
+            "logger",
+            "msg",
+            "request_id",
+            "correlation_id",
+            "event",
+            "task_id",
+            "capability_name",
+            "duration_ms",
+            "error_category",
+            "exception",
+            "projection_truncated",
+            "truncated",
+        }
+        for key in reversed(tuple(payload)):
+            if key in protected:
+                continue
+            payload.pop(key, None)
+            rendered = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+                allow_nan=False,
+            )
+            if len(rendered.encode("utf-8")) <= DEFAULT_JSON_LOG_MAX_LENGTH:
+                return rendered
+        rendered = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+            allow_nan=False,
+        )
+        if len(rendered.encode("utf-8")) <= DEFAULT_JSON_LOG_MAX_LENGTH:
+            return rendered
+        fallback = {
+            "ts": payload["ts"],
+            "level": payload["level"],
+            "logger": _truncate_text(str(payload["logger"]), DEFAULT_LOGGER_NAME_MAX_LENGTH),
+            "msg": _truncate_text(str(payload["msg"]), 600),
+            "request_id": payload.get("request_id"),
+            "correlation_id": payload.get("correlation_id"),
+            "task_id": payload.get("task_id"),
+            "capability_name": payload.get("capability_name"),
+            "event": payload.get("event"),
+            "error_category": payload.get("error_category"),
+            "truncated": True,
+        }
+        rendered = json.dumps(
+            fallback,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+            allow_nan=False,
+        )
+        if len(rendered.encode("utf-8")) <= DEFAULT_JSON_LOG_MAX_LENGTH:
+            return rendered
+        return json.dumps(
+            {
+                "ts": _truncate_text(str(fallback.get("ts") or ""), 64),
+                "level": _truncate_text(str(fallback.get("level") or "UNKNOWN"), DEFAULT_LOG_LEVEL_MAX_LENGTH),
+                "logger": _truncate_text(str(fallback.get("logger") or "-"), 120),
+                "msg": _truncate_text(str(fallback.get("msg") or "-"), 240),
+                "truncated": True,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
 
 
 class StreamBusLogHandler(logging.Handler):
@@ -497,14 +860,22 @@ class StreamBusLogHandler(logging.Handler):
         super().__init__(level)
         self._stream_bus = stream_bus
         self._sequence = 0
+        self._emit_state = threading.local()
 
     def emit(self, record: logging.LogRecord) -> None:
+        if getattr(self._emit_state, "active", False):
+            return
+        self._emit_state.active = True
         try:
             self._sequence += 1
-            severity = record.levelname.lower()
+            severity = _normalized_log_level(record).lower()
             if severity == "warning":
                 severity = "warn"
-            message = self.format(record) if self.formatter else record.getMessage()
+            raw_message = record.getMessage()
+            message = _safe_log_field(
+                raw_message,
+                max_length=DEFAULT_STREAM_LOG_MESSAGE_MAX_LENGTH,
+            ) or "-"
             details = _build_details_compact(record)
             extra: Dict[str, Any] = {}
             for key in _EXTRA_FIELD_ORDER:
@@ -512,12 +883,25 @@ class StreamBusLogHandler(logging.Handler):
                 if value is not None:
                     extra[key] = value
             timestamp_iso = datetime.fromtimestamp(record.created, timezone.utc).isoformat()
-            runtime_message = extra.get("runtime_message")
-            runtime_event_type = extra.get("runtime_event_type")
-            display_message = runtime_message or (runtime_event_type if message == "运行时事件" else message)
+            request_id = extra.get("request_id") or getattr(record, "correlation_id", None)
+            runtime_message = _safe_log_field(
+                extra.get("runtime_message"),
+                max_length=DEFAULT_STREAM_LOG_MESSAGE_MAX_LENGTH,
+            )
+            runtime_event_type = _safe_log_field(extra.get("runtime_event_type"), max_length=160)
+            display_message = runtime_message or (
+                runtime_event_type if raw_message == "运行时事件" else message
+            )
+            event_type = _safe_log_field(extra.get("event"), max_length=160)
+            capability_name = _safe_log_field(extra.get("capability_name"), max_length=160)
+            error_category = _safe_log_field(extra.get("error_category"), max_length=80)
+            task_id = _safe_log_field(extra.get("task_id"), max_length=160)
+            category = _safe_log_field(extra.get("category"), max_length=120)
+            subject_id = _safe_log_field(extra.get("subject_id"), max_length=160)
+            source = _safe_log_field(record.name, max_length=DEFAULT_LOGGER_NAME_MAX_LENGTH) or "-"
             self._stream_bus.publish(
                 "logs.entry",
-                source=record.name,
+                source=source,
                 payload={
                     "timestamp": record.created,
                     "timestamp_unix_sec": record.created,
@@ -525,22 +909,39 @@ class StreamBusLogHandler(logging.Handler):
                     "timestamp_text": _format_record_time_text(record),
                     "severity": severity,
                     "level": severity,
-                    "source": record.name,
+                    "source": source,
                     "message": message,
                     "display_message": display_message,
-                    "event_type": extra.get("event"),
+                    "event_type": event_type,
                     "runtime_event_type": runtime_event_type,
                     "runtime_message": runtime_message,
                     "payload_preview": details.get("payload_preview"),
                     "metadata_preview": details.get("metadata_preview"),
                     "details_compact": details,
-                    "task_id": extra.get("task_id"),
-                    "category": extra.get("category"),
-                    "subject_id": extra.get("subject_id"),
+                    "request_id": _safe_log_field(request_id, max_length=160),
+                    "task_id": task_id,
+                    "capability_name": capability_name,
+                    "duration_ms": _safe_log_field(extra.get("duration_ms")),
+                    "error_category": error_category,
+                    "suppressed_count": _safe_log_field(extra.get("suppressed_count")),
+                    "category": category,
+                    "subject_id": subject_id,
                 },
                 sequence=self._sequence,
                 status="available",
-                metadata={"severity": severity},
+                metadata={
+                    "severity": severity,
+                    "request_id": _safe_log_field(request_id, max_length=160),
+                },
             )
-        except Exception:
-            self.handleError(record)
+        except Exception as exc:
+            if logging.raiseExceptions:
+                try:
+                    sys.stderr.write(
+                        "StreamBusLogHandler publish failed "
+                        f"({exc.__class__.__name__})\n"
+                    )
+                except Exception:
+                    pass
+        finally:
+            self._emit_state.active = False

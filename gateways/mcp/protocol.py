@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, Optional, Any, List, Tuple
 import json
+import logging
+import time
+from typing import Dict, Optional, Any, List, Mapping, Tuple
 
 from contracts.skills import SkillDescriptor
 from fastapi import APIRouter
@@ -14,8 +16,18 @@ from fastapi.responses import StreamingResponse
 
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
+from gateways.feedback import (
+    MCP_RESULT_MAX_BYTES,
+    build_mcp_tool_result,
+    build_public_error_payload,
+)
+from gateways.request_context import categorize_gateway_error
 from gateways.runtime import GatewayRuntime
-from gateways.serialization import to_json_text, to_jsonable
+
+
+MCP_LOGGER = logging.getLogger("nuwax_robot_bridge.gateway.mcp")
+MCP_JSONRPC_ID_MAX_BYTES = 512
+MCP_REQUEST_MAX_BYTES = 256 * 1024
 
 
 def _jsonrpc_result(request_id: Any, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -31,6 +43,84 @@ def _jsonrpc_error(request_id: Any, *, code: int, message: str, data: Optional[D
     if data:
         error["data"] = data
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+
+def _strict_json_constant(value: str) -> None:
+    raise ValueError(f"Non-standard JSON constant: {value}")
+
+
+def _validated_jsonrpc_id(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("JSON-RPC id must be a string, integer, or null")
+    if isinstance(value, str):
+        encoded_length = len(value.encode("utf-8"))
+    else:
+        encoded_length = len(str(value).encode("utf-8"))
+    if encoded_length > MCP_JSONRPC_ID_MAX_BYTES:
+        raise ValueError("JSON-RPC id exceeds the byte limit")
+    return value
+
+
+def _json_bytes(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+
+
+def _public_gateway_error_response(
+    request: Request,
+    error: GatewayError,
+    *,
+    rpc_request_id: Any = None,
+) -> JSONResponse:
+    error_category = categorize_gateway_error(error.error_code, error.http_status)
+    request_id = str(getattr(request.state, "request_id", None) or "").strip()
+    public_error = build_public_error_payload(
+        error,
+        request_id=request_id or None,
+        error_category=error_category,
+    )
+    return JSONResponse(
+        _jsonrpc_error(
+            rpc_request_id,
+            code=error.jsonrpc_code,
+            message=public_error["message"],
+            data=public_error,
+        ),
+        status_code=error.http_status,
+    )
+
+
+def _build_mcp_request_context(
+    request: Request,
+    *,
+    rpc_request_id: Any,
+    method: str,
+    tool_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    state_context = getattr(request.state, "request_context", None)
+    context = dict(state_context) if isinstance(state_context, Mapping) else {}
+    request_id = getattr(request.state, "request_id", None)
+    if request_id:
+        context["request_id"] = request_id
+    context.setdefault("method", request.method)
+    context.setdefault("path", request.url.path)
+    client = request.client
+    if client is not None:
+        context.setdefault("client_ip", client.host)
+    context["mcp_method"] = method
+    if rpc_request_id is not None:
+        context["rpc_request_id"] = rpc_request_id
+    if tool_name:
+        context["tool_name"] = tool_name
+    return {key: value for key, value in context.items() if value is not None and value != ""}
 
 
 _MCP_COLLECTIONS = {
@@ -237,13 +327,11 @@ def _build_collection_description(collection_name: str, catalog: Dict[str, Dict[
     display_name = _MCP_COLLECTIONS[collection_name]["display_name"]
     if not catalog:
         return f"{display_name}。当前没有可调用功能。"
-    lines = [f"{display_name}。通过 function 选择具体功能，通过 parameters 传入该功能参数。", "可用功能："]
-    for item in catalog.values():
-        lines.append(
-            f"- {item['name']}：{item['display_name']}。{item['description']} "
-            f"执行模式: {item['execution_mode']}；风险级别: {item['risk_level']}。"
-        )
-    return "\n".join(lines)
+    function_names = "、".join(sorted(catalog))
+    return (
+        f"{display_name}。通过 function 选择具体功能，通过 parameters 传入该功能参数。"
+        f"当前可用：{function_names}。参数不符合对应能力 schema 时会返回 invalid_params。"
+    )
 
 
 def _build_collection_input_schema(catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -258,12 +346,11 @@ def _build_collection_input_schema(catalog: Dict[str, Dict[str, Any]]) -> Dict[s
             },
             "parameters": {
                 "type": "object",
-                "description": "传给具体功能的参数，结构见 x-nuwax-function-catalog。",
+                "description": "传给具体功能的参数；服务端按所选能力 schema 严格校验。",
             },
         },
         "required": ["function"],
         "additionalProperties": False,
-        "x-nuwax-function-catalog": catalog,
     }
 
 
@@ -446,7 +533,10 @@ def _build_initialize_result(runtime: GatewayRuntime, protocol_version: str) -> 
 
 
 def _format_sse(event_name: str, payload: Dict[str, Any]) -> str:
-    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return (
+        f"event: {event_name}\n"
+        f"data: {json.dumps(payload, ensure_ascii=False, allow_nan=False)}\n\n"
+    )
 
 
 def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, arguments: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -518,7 +608,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
         try:
             access_manager.authenticate_http(request)
         except GatewayError as exc:
-            return JSONResponse(_jsonrpc_error(None, code=exc.jsonrpc_code, message=exc.message, data=exc.to_payload()), status_code=exc.http_status)
+            return _public_gateway_error_response(request, exc)
 
         async def event_generator():
             yield _format_sse("endpoint", {"endpoint": "/mcp", "protocol_versions": list(_SUPPORTED_PROTOCOL_VERSIONS)})
@@ -533,12 +623,31 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
         try:
             access = access_manager.authenticate_http(request)
         except GatewayError as exc:
-            return JSONResponse(_jsonrpc_error(None, code=exc.jsonrpc_code, message=exc.message, data=exc.to_payload()), status_code=exc.http_status)
+            return _public_gateway_error_response(request, exc)
+
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MCP_REQUEST_MAX_BYTES:
+                    return JSONResponse(
+                        _jsonrpc_error(None, code=-32600, message="Request body too large"),
+                        status_code=413,
+                    )
+            except ValueError:
+                return JSONResponse(
+                    _jsonrpc_error(None, code=-32600, message="Invalid Content-Length"),
+                    status_code=400,
+                )
 
         raw = await request.body()
+        if len(raw) > MCP_REQUEST_MAX_BYTES:
+            return JSONResponse(
+                _jsonrpc_error(None, code=-32600, message="Request body too large"),
+                status_code=413,
+            )
         try:
-            body = json.loads(raw)
-        except Exception:
+            body = json.loads(raw, parse_constant=_strict_json_constant)
+        except (TypeError, ValueError, json.JSONDecodeError):
             return JSONResponse(_jsonrpc_error(None, code=-32700, message="Parse error"), status_code=400)
 
         if not isinstance(body, dict):
@@ -546,10 +655,35 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
 
         has_request_id = "id" in body
         request_id = body.get("id")
-        method = str(body.get("method", ""))
+        response_request_id = request_id
+        if has_request_id:
+            try:
+                request_id = _validated_jsonrpc_id(request_id)
+                response_request_id = request_id
+            except ValueError:
+                return JSONResponse(
+                    _jsonrpc_error(None, code=-32600, message="Invalid Request"),
+                    status_code=400,
+                )
+        if body.get("jsonrpc") != "2.0":
+            return JSONResponse(
+                _jsonrpc_error(response_request_id, code=-32600, message="Invalid Request"),
+                status_code=400,
+            )
+        raw_method = body.get("method")
+        if not isinstance(raw_method, str) or not raw_method:
+            return JSONResponse(
+                _jsonrpc_error(response_request_id, code=-32600, message="Invalid Request"),
+                status_code=400,
+            )
+        method = raw_method
         params = body.get("params", {})
         if params is None:
             params = {}
+        http_request_id = str(getattr(request.state, "request_id", None) or "").strip()
+        tool_name = ""
+        function_name = ""
+        tool_call_failure_logged = False
 
         try:
             if not has_request_id:
@@ -569,10 +703,20 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
 
             if method == "tools/list":
                 tools = await run_in_threadpool(lambda: _build_collection_tools(runtime))
-                return JSONResponse(_jsonrpc_result(request_id, {"tools": tools}))
+                response_payload = _jsonrpc_result(request_id, {"tools": tools})
+                if _json_bytes(response_payload) > MCP_RESULT_MAX_BYTES:
+                    raise GatewayError(
+                        "MCP 工具目录响应超过安全大小限制。",
+                        error_code="mcp_response_too_large",
+                        http_status=500,
+                        jsonrpc_code=-32603,
+                        details={"tool_count": len(tools)},
+                    )
+                return JSONResponse(response_payload)
 
             if method == "tools/call":
                 name = str(params.get("name", "")).strip()
+                tool_name = name
                 arguments = params.get("arguments", {})
                 if not name:
                     raise GatewayError(
@@ -590,35 +734,125 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                         details={"tool_name": name},
                     )
                 function_name, function_arguments = _resolve_tool_invocation(runtime, name, arguments)
+                request_context = _build_mcp_request_context(
+                    request,
+                    rpc_request_id=request_id,
+                    method=method,
+                    tool_name=function_name,
+                )
+                started_at = time.perf_counter()
+                log_extra = {
+                    "event": "mcp.call.started",
+                    "request_id": http_request_id,
+                    "rpc_request_id": request_id,
+                    "mcp_method": method,
+                    "tool_name": name,
+                    "capability_name": function_name,
+                    "requested_by": access.principal,
+                }
+                MCP_LOGGER.debug("MCP 工具调用开始", extra=log_extra)
                 try:
                     result = await run_in_threadpool(
                         lambda: runtime.invoke_tool(
                             function_name,
                             function_arguments,
                             requested_by=access.principal,
+                            request_context=request_context,
                         )
                     )
-                    structured = to_jsonable(result)
-                except Exception as exc:
-                    raise as_gateway_error(exc) from exc
-                return JSONResponse(
-                    _jsonrpc_result(
-                        request_id,
-                        {
-                            "content": [{"type": "text", "text": to_json_text(structured)}],
-                            "structuredContent": structured,
+                    structured = result
+                except Exception as call_exc:
+                    duration_ms = (time.perf_counter() - started_at) * 1000.0
+                    call_error = as_gateway_error(call_exc)
+                    call_error_category = categorize_gateway_error(
+                        call_error.error_code,
+                        call_error.http_status,
+                    )
+                    tool_call_failure_logged = True
+                    MCP_LOGGER.exception(
+                        "MCP 工具调用失败",
+                        extra={
+                            **log_extra,
+                            "event": "mcp.call.failed",
+                            "duration_ms": duration_ms,
+                            "error_code": call_error.error_code,
+                            "error_category": call_error_category,
                         },
                     )
+                    raise
+                duration_ms = (time.perf_counter() - started_at) * 1000.0
+                completed_extra = {
+                    **log_extra,
+                    "event": "mcp.call.completed",
+                    "duration_ms": duration_ms,
+                }
+                MCP_LOGGER.log(
+                    logging.INFO if duration_ms >= 1_000.0 else logging.DEBUG,
+                    "MCP 工具调用完成",
+                    extra=completed_extra,
                 )
-            return JSONResponse(_jsonrpc_error(request_id, code=-32601, message=f"Unknown method: {method}"))
+                empty_result_envelope = _jsonrpc_result(request_id, None)
+                result_budget = max(
+                    256,
+                    MCP_RESULT_MAX_BYTES
+                    - (_json_bytes(empty_result_envelope) - _json_bytes(None)),
+                )
+                response_payload = _jsonrpc_result(
+                    request_id,
+                    build_mcp_tool_result(
+                        structured,
+                        max_total_bytes=result_budget,
+                    ),
+                )
+                if _json_bytes(response_payload) > MCP_RESULT_MAX_BYTES:
+                    raise GatewayError(
+                        "MCP 工具结果响应超过安全大小限制。",
+                        error_code="mcp_response_too_large",
+                        http_status=500,
+                        jsonrpc_code=-32603,
+                    )
+                return JSONResponse(response_payload)
+            raise GatewayError(
+                "不支持的 MCP 方法。",
+                error_code="unsupported_mcp_method",
+                http_status=400,
+                jsonrpc_code=-32601,
+                details={
+                    "supported_methods": ["initialize", "tools/list", "tools/call"],
+                },
+            )
         except Exception as exc:
             gateway_error = as_gateway_error(exc)
+            error_category = categorize_gateway_error(gateway_error.error_code, gateway_error.http_status)
+            request.state.error_category = error_category
+            if not tool_call_failure_logged:
+                rejected_extra = {
+                    "event": "mcp.request.rejected",
+                    "request_id": http_request_id,
+                    "rpc_request_id": request_id,
+                    "mcp_method": method,
+                    "tool_name": tool_name or None,
+                    "capability_name": function_name or None,
+                    "error_code": gateway_error.error_code,
+                    "error_category": error_category,
+                }
+                if isinstance(exc, GatewayError):
+                    MCP_LOGGER.warning("MCP 请求被拒绝", extra=rejected_extra)
+                else:
+                    MCP_LOGGER.exception("MCP 请求处理失败", extra=rejected_extra)
+            public_error = build_public_error_payload(
+                gateway_error,
+                request_id=http_request_id or None,
+                capability_name=function_name or tool_name or None,
+                task_id=str(gateway_error.details.get("task_id") or "").strip() or None,
+                error_category=error_category,
+            )
             return JSONResponse(
                 _jsonrpc_error(
                     request_id,
                     code=gateway_error.jsonrpc_code,
-                    message=gateway_error.message,
-                    data=gateway_error.to_payload(),
+                    message=public_error["message"],
+                    data=public_error,
                 )
             )
 

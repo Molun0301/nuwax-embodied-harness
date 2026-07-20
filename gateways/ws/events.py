@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter
 from fastapi import Request
@@ -13,8 +13,8 @@ from starlette.websockets import WebSocketDisconnect
 from contracts.events import RuntimeEventCategory
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
+from gateways.feedback import build_public_runtime_event
 from gateways.runtime import GatewayRuntime
-from gateways.serialization import to_jsonable
 
 
 def _parse_categories(values: Optional[str]) -> Optional[Tuple[RuntimeEventCategory, ...]]:
@@ -75,14 +75,14 @@ def build_event_router(runtime: GatewayRuntime, access_manager: GatewayAccessMan
                 categories=category_filter,
                 event_types=event_type_filter,
             ):
-                payload = to_jsonable(event)
+                payload = build_public_runtime_event(event)
                 yield _format_sse_payload("runtime.event", payload, cursor=event.cursor)
                 emitted += 1
                 if max_events is not None and emitted >= max_events:
                     return
 
             subscription_id = runtime.event_bus.subscribe(
-                lambda event: _safe_enqueue(loop, queue, to_jsonable(event)),
+                lambda event: _safe_enqueue(loop, queue, build_public_runtime_event(event)),
                 categories=category_filter,
                 event_types=event_type_filter,
             )
@@ -128,10 +128,10 @@ def build_event_router(runtime: GatewayRuntime, access_manager: GatewayAccessMan
             categories=category_filter,
             event_types=event_type_filter,
         ):
-            await websocket.send_json({"type": "event", "event": to_jsonable(event)})
+            await websocket.send_json({"type": "event", "event": build_public_runtime_event(event)})
 
         subscription_id = runtime.event_bus.subscribe(
-            lambda event: _safe_enqueue(loop, queue, to_jsonable(event)),
+            lambda event: _safe_enqueue(loop, queue, build_public_runtime_event(event)),
             categories=category_filter,
             event_types=event_type_filter,
         )
@@ -157,6 +157,6 @@ def _format_sse_payload(event_name: str, payload: Dict[str, object], *, cursor: 
     if cursor is not None:
         lines.append(f"id: {cursor}")
     lines.append(f"event: {event_name}")
-    lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}")
+    lines.append(f"data: {json.dumps(payload, ensure_ascii=False, allow_nan=False)}")
     lines.append("")
     return "\n".join(lines) + "\n"

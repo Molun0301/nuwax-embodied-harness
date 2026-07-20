@@ -75,6 +75,11 @@ message MapUpdateNotification {
   string session_id = 8;
   string map_version_id = 9;
   uint64 session_generation = 10;
+  // Physical occupancy from the same committed revision, before virtual
+  // forbidden zones are composed into `data`. Empty means byte-identical to
+  // `data` when raw_checksum equals checksum.
+  bytes raw_data = 11;
+  string raw_checksum = 12;
 }
 message OccupancyGridData {
   OccupancyGridMeta meta = 1;

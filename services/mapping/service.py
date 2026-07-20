@@ -32,6 +32,7 @@ class MappingService:
         self._history: Deque[MapSnapshot] = deque(maxlen=max(1, history_limit))
         self._latest_snapshot: Optional[MapSnapshot] = None
         self._revision_by_source: Dict[str, int] = {}
+        self._stream_occupancy_key_by_source: Dict[str, Tuple[object, ...]] = {}
         self._map_update_subscription_id: Optional[object] = None
         subscription = getattr(self._provider_owner, "subscribe_map_updates", None)
         if callable(subscription):
@@ -158,19 +159,29 @@ class MappingService:
             "checkpoint_ready": bool(source_metadata.get("checkpoint_ready") or source_metadata.get("geometry_ready")),
             **source_metadata,
         }
+        stream_occupancy_key = self._build_stream_occupancy_key(
+            stream_occupancy_grid,
+            stream_occupancy_metadata,
+        )
         with self._lock:
             if (
                 version_id_override is None
                 and revision_override is None
-                # fail-closed effective grids can stay byte-identical while the
-                # physical display grid advances and still needs a new Web frame.
-                and stream_occupancy_grid is None
                 and self._is_equivalent_to_latest_snapshot(
                     source_name=source_name,
                     occupancy_grid=occupancy_grid,
                     cost_map=cost_map,
                     semantic_map=semantic_map,
                     metadata=snapshot_metadata,
+                )
+                and (
+                    self._stream_bus is None
+                    or stream_occupancy_grid is None
+                    or (
+                        stream_occupancy_key is not None
+                        and self._stream_occupancy_key_by_source.get(source_name)
+                        == stream_occupancy_key
+                    )
                 )
             ):
                 return self._latest_snapshot  # type: ignore[return-value]
@@ -210,21 +221,18 @@ class MappingService:
             stream_event_payload = None
             stream_sequence = None
             if self._stream_bus is not None:
-                stream_snapshot = snapshot.model_copy(deep=True)
+                stream_snapshot = snapshot
                 stream_event_payload = dict(event_payload)
                 if stream_occupancy_grid is not None:
-                    effective_occupancy_hash = stream_snapshot.metadata.get(
+                    effective_occupancy_hash = snapshot.metadata.get(
                         "occupancy_content_hash"
                     )
-                    stream_grid_copy = getattr(
-                        stream_occupancy_grid,
-                        "model_copy",
-                        None,
-                    )
-                    stream_snapshot.occupancy_grid = (
-                        stream_grid_copy(deep=True)
-                        if callable(stream_grid_copy)
-                        else stream_occupancy_grid
+                    stream_snapshot = snapshot.model_copy(
+                        update={
+                            "occupancy_grid": stream_occupancy_grid,
+                            "metadata": dict(snapshot.metadata),
+                        },
+                        deep=False,
                     )
                     display_source = str(
                         stream_occupancy_source or "display_override"
@@ -256,6 +264,10 @@ class MappingService:
                 stream_sequence = self._extract_stream_sequence(
                     stream_snapshot.metadata
                 )
+                if stream_occupancy_key is not None:
+                    self._stream_occupancy_key_by_source[source_name] = (
+                        stream_occupancy_key
+                    )
 
         if self._event_bus is not None:
             self._event_bus.publish(
@@ -310,6 +322,7 @@ class MappingService:
         with self._lock:
             previous = self._latest_snapshot
             self._latest_snapshot = None
+            self._stream_occupancy_key_by_source.clear()
         # 即使之前没有 snapshot 也要发 clear 信号——前端可能在重连首帧拉到旧 cache。
         previous_source_name = (
             previous.source_name if previous is not None else "platform_live_map_provider"
@@ -448,6 +461,34 @@ class MappingService:
             "cost_map_content_revision": cost_map_revision,
             "content_revision": content_revision,
         }
+
+    def _build_stream_occupancy_key(
+        self,
+        occupancy_grid,
+        metadata: Optional[Dict[str, object]],
+    ) -> Optional[Tuple[object, ...]]:
+        if occupancy_grid is None:
+            return None
+        values = dict(metadata or {})
+        metrics = values.get("occupancy_metrics")
+        content_hash = values.get("occupancy_content_hash") or values.get(
+            "content_hash"
+        )
+        if not content_hash and isinstance(metrics, dict):
+            content_hash = metrics.get("content_hash")
+        if not content_hash:
+            return None
+        origin = getattr(occupancy_grid, "origin", None)
+        position = getattr(origin, "position", None)
+        return (
+            str(getattr(occupancy_grid, "frame_id", "") or ""),
+            int(getattr(occupancy_grid, "width", 0) or 0),
+            int(getattr(occupancy_grid, "height", 0) or 0),
+            float(getattr(occupancy_grid, "resolution_m", 0.0) or 0.0),
+            float(getattr(position, "x", 0.0) or 0.0),
+            float(getattr(position, "y", 0.0) or 0.0),
+            str(content_hash),
+        )
 
     def _infer_snapshot_kind(self, metadata: Dict[str, object]) -> str:
         source_mode = str(metadata.get("source_mode") or metadata.get("map_version_source_mode") or "").strip()

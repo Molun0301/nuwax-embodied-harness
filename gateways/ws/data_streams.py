@@ -41,6 +41,7 @@ _STREAM_JSON_MAX_TOTAL_STRING_CHARS = 64 * 1024
 _STREAM_JSON_MAX_BYTES = 16 * 1024
 _STREAM_JSON_MAX_INTEGER_BITS = 256
 _STREAM_JSON_MAX_OCCUPANCY_CELLS = 2_000_000
+_LATEST_ONLY_STREAM_TOPICS = frozenset({"map.frame"})
 _TERMINAL_TASK_EVENT_TYPES = frozenset(
     {
         "task.succeeded",
@@ -433,6 +434,7 @@ def _build_replay_batch(
     frames = retained_frames
     if gap_reason and not frames:
         frames = runtime.stream_bus.latest_frames(topics=topic_filter)
+    frames = _coalesce_latest_topic_frames(frames)
 
     frame_limit = max(1, int(limit))
     truncated = len(frames) > frame_limit
@@ -458,6 +460,23 @@ def _build_replay_batch(
         "frame_count": len(frames),
     }
     return status, frames
+
+
+def _coalesce_latest_topic_frames(
+    frames: Iterable[StreamFrame],
+) -> Tuple[StreamFrame, ...]:
+    frame_list = tuple(frames)
+    latest_index_by_topic = {
+        frame.topic: index
+        for index, frame in enumerate(frame_list)
+        if frame.topic in _LATEST_ONLY_STREAM_TOPICS
+    }
+    return tuple(
+        frame
+        for index, frame in enumerate(frame_list)
+        if frame.topic not in _LATEST_ONLY_STREAM_TOPICS
+        or latest_index_by_topic.get(frame.topic) == index
+    )
 
 
 async def _run_blocking(callable_obj, *args, **kwargs):
@@ -527,11 +546,17 @@ def _take_queue_gap_notice(queue: asyncio.Queue, runtime: GatewayRuntime) -> Opt
 
 def _safe_enqueue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, frame: StreamFrame, runtime: GatewayRuntime) -> None:
     def _push() -> None:
-        if frame.payload_kind == StreamPayloadKind.BINARY:
+        if (
+            frame.payload_kind == StreamPayloadKind.BINARY
+            or frame.topic in _LATEST_ONLY_STREAM_TOPICS
+        ):
             retained = []
             while not queue.empty():
                 queued = queue.get_nowait()
-                if queued.payload_kind == StreamPayloadKind.BINARY and queued.topic == frame.topic:
+                if queued.topic == frame.topic and (
+                    frame.topic in _LATEST_ONLY_STREAM_TOPICS
+                    or queued.payload_kind == StreamPayloadKind.BINARY
+                ):
                     continue
                 retained.append(queued)
             for queued in retained:

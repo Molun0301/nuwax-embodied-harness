@@ -422,6 +422,37 @@ async fn forward_map_revision(
             .await
             .is_ok();
     }
+    if event.raw_data.is_empty() && event.raw_checksum != event.checksum {
+        return tx
+            .send(Err(Status::data_loss(format!(
+                "raw map revision {} omitted data without an equivalent checksum",
+                event.revision
+            ))))
+            .await
+            .is_ok();
+    }
+    if !event.raw_data.is_empty() && event.raw_data.len() as u64 != event.size {
+        return tx
+            .send(Err(Status::data_loss(format!(
+                "raw map revision {} size mismatch: expected={}, actual={}",
+                event.revision,
+                event.size,
+                event.raw_data.len()
+            ))))
+            .await
+            .is_ok();
+    }
+    if !event.raw_data.is_empty()
+        && crate::map_checksum::sha256_hex(event.raw_data.as_ref()) != event.raw_checksum
+    {
+        return tx
+            .send(Err(Status::data_loss(format!(
+                "raw map revision {} checksum mismatch",
+                event.revision
+            ))))
+            .await
+            .is_ok();
+    }
 
     let shm_ref = match occupancy_shm_current.read().await.clone() {
         Some(snapshot) if snapshot.revision == event.revision => {
@@ -454,6 +485,8 @@ async fn forward_map_revision(
         session_id: event.session_id,
         map_version_id: event.map_version_id,
         session_generation: event.session_generation,
+        raw_data: event.raw_data.as_ref().to_vec(),
+        raw_checksum: event.raw_checksum,
     }))
     .await
     .is_ok()
@@ -2388,6 +2421,8 @@ mod map_update_tests {
         assert_eq!(update.size, event.size);
         assert_eq!(update.schema_version, 1);
         assert_eq!(update.checksum, event.checksum);
+        assert!(update.raw_data.is_empty());
+        assert_eq!(update.raw_checksum, event.checksum);
         assert_eq!(update.last_seen_ms, event.last_seen_ms);
         assert_eq!(update.session_id, "stream-session");
         assert_eq!(update.map_version_id, "mapver_000001");
@@ -2432,6 +2467,48 @@ mod map_update_tests {
                 .as_deref()
                 .expect("authoritative SHM path")
         );
+    }
+
+    #[tokio::test]
+    async fn map_update_carries_atomic_raw_grid_when_effective_cells_differ() {
+        let mut adapter = crate::mapping_adapter::MappingAdapter::new_with_frames(
+            crate::mapping_adapter::MappingAdapterConfig::from_env(),
+            "map",
+            "odom",
+        );
+        let session = adapter
+            .start_session("raw-stream-session", "warehouse", "mapver_000002")
+            .expect("test mapping session");
+        let raw = MapState {
+            width: 2,
+            height: 2,
+            resolution: 0.05,
+            frame_id: "map".into(),
+            revision: 8,
+            timestamp_ns: 8,
+            data: vec![-1, 0, 50, 100],
+            ..MapState::default()
+        };
+        let effective = MapState {
+            data: vec![100, 100, 50, 100],
+            ..raw.clone()
+        };
+        let event = MapRevisionEvent::from_effective_and_raw(&effective, &raw, &session);
+        let current = Arc::new(RwLock::new(None));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        assert!(forward_map_revision(&tx, event.clone(), &current).await);
+        let update = rx
+            .recv()
+            .await
+            .expect("stream update")
+            .expect("valid atomic map update");
+
+        assert_eq!(update.data, vec![100, 100, 50, 100]);
+        assert_eq!(update.raw_data, vec![255, 0, 50, 100]);
+        assert_eq!(update.checksum, event.checksum);
+        assert_eq!(update.raw_checksum, event.raw_checksum);
+        assert_ne!(update.raw_checksum, update.checksum);
     }
 
     #[tokio::test]

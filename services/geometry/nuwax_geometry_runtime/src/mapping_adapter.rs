@@ -740,12 +740,12 @@ impl MappingAdapter {
         let loaded = self.load_forbidden_zones();
         let map = self.compose_forbidden_zones(&raw_map, &loaded)?;
         self.checkpoint_grid = Some(checkpoint);
-        self.raw_map = Some(raw_map);
         self.record_forbidden_zone_application(&loaded, next_revision);
         self.global_revision = next_revision;
         self.revision = next_revision;
         self.lifecycle.revision = next_revision;
-        let event = MapRevisionEvent::from_map(&map, &self.lifecycle);
+        let event = MapRevisionEvent::from_effective_and_raw(&map, &raw_map, &self.lifecycle);
+        self.raw_map = Some(raw_map);
         Ok((map, event))
     }
 
@@ -872,13 +872,14 @@ impl MappingAdapter {
         raw_map.timestamp_ns = timestamp_ns;
         let effective_map = self.compose_forbidden_zones(&raw_map, &loaded)?;
 
-        self.raw_map = Some(raw_map);
         self.record_forbidden_zone_application(&loaded, next_revision);
         self.global_revision = next_revision;
         self.revision = next_revision;
         self.lifecycle.revision = next_revision;
         shared.map = effective_map;
-        let event = MapRevisionEvent::from_map(&shared.map, &self.lifecycle);
+        let event =
+            MapRevisionEvent::from_effective_and_raw(&shared.map, &raw_map, &self.lifecycle);
+        self.raw_map = Some(raw_map);
         drop(shared);
         let _ = map_revision_tx.send(event);
         Ok(true)
@@ -1324,7 +1325,6 @@ impl MappingAdapter {
                     return false;
                 }
             };
-            self.raw_map = Some(raw_map);
             self.record_forbidden_zone_application(&loaded, next_revision);
             self.global_revision = next_revision;
             self.revision = next_revision;
@@ -1335,7 +1335,8 @@ impl MappingAdapter {
             // 从刚 commit 的 MapState 构造自包含事件，确保 metadata/data/checksum
             // 属于同一 revision，server 不需要再读取可能已前进的 SharedState。
             self.lifecycle.revision = next_revision;
-            let event = MapRevisionEvent::from_map(&s.map, &self.lifecycle);
+            let event = MapRevisionEvent::from_effective_and_raw(&s.map, &raw_map, &self.lifecycle);
+            self.raw_map = Some(raw_map);
             drop(s); // 释放 write lock,后续 send 不持锁
             if let Some(tx) = map_revision_tx {
                 // broadcast::Sender::send 是 non-blocking,无 consumer 时返 Err,

@@ -291,7 +291,8 @@ pub struct CloudMapNotification {
 /// `mapping_adapter::MappingAdapter::build_and_publish` 在 commit 新 revision
 /// 后构造本结构并通过 `broadcast::Sender<MapRevisionEvent>` 写入兼容入口；
 /// coalescer 将其收敛为 latest-only `watch`，SHM/LCM/explore/gRPC 分别消费，
-/// 避免慢下游阻塞其它链路。`data` 使用 `Arc<[u8]>`，跨下游 clone 不复制地图。
+/// 避免慢下游阻塞其它链路。`data` / `raw_data` 使用 `Arc<[u8]>`，跨下游
+/// clone 不复制地图；二者属于同一 revision，避免 Web 再做一次有竞态的 unary 读取。
 ///
 /// 字段对齐 W29 `MapStreamEventBroker.StreamSnapshot.parsed` schema:
 /// - `revision` —— geometry 进程级 occupancy revision(u64,跨 mapping session 单调递增)
@@ -314,9 +315,11 @@ pub struct MapRevisionEvent {
     pub frame_id: String,
     pub timestamp_ns: u64,
     pub data: Arc<[u8]>,
+    pub raw_data: Arc<[u8]>,
     pub size: u64,
     pub schema_version: u32,
     pub checksum: String,
+    pub raw_checksum: String,
     pub last_seen_ms: i64,
 }
 
@@ -331,6 +334,7 @@ impl MapRevisionEvent {
             .map(|&value| value as u8)
             .collect::<Vec<_>>()
             .into();
+        let checksum = crate::map_checksum::sha256_hex(data.as_ref());
         Self {
             session_id: session.session_id.clone(),
             map_version_id: session.map_version_id.clone(),
@@ -344,11 +348,49 @@ impl MapRevisionEvent {
             frame_id: map.frame_id.clone(),
             timestamp_ns: map.timestamp_ns,
             size: data.len() as u64,
-            checksum: crate::map_checksum::sha256_hex(data.as_ref()),
+            checksum: checksum.clone(),
+            raw_checksum: checksum,
             last_seen_ms: (map.timestamp_ns / 1_000_000) as i64,
             schema_version: 1,
+            raw_data: Vec::<u8>::new().into(),
             data,
         }
+    }
+
+    pub fn from_effective_and_raw(
+        effective: &MapState,
+        raw: &MapState,
+        session: &crate::mapping_adapter::MappingSessionSnapshot,
+    ) -> Self {
+        let mut event = Self::from_map(effective, session);
+        let same_layout = raw.revision == effective.revision
+            && raw.width == effective.width
+            && raw.height == effective.height
+            && raw.resolution == effective.resolution
+            && raw.origin_x == effective.origin_x
+            && raw.origin_y == effective.origin_y
+            && raw.frame_id == effective.frame_id
+            && raw.timestamp_ns == effective.timestamp_ns;
+        if !same_layout {
+            warn!(
+                effective_revision = effective.revision,
+                raw_revision = raw.revision,
+                "raw occupancy layout differs from effective revision; stream falls back to effective data"
+            );
+            return event;
+        }
+
+        let raw_data: Arc<[u8]> = raw
+            .data
+            .iter()
+            .map(|&value| value as u8)
+            .collect::<Vec<_>>()
+            .into();
+        event.raw_checksum = crate::map_checksum::sha256_hex(raw_data.as_ref());
+        if event.raw_checksum != event.checksum {
+            event.raw_data = raw_data;
+        }
+        event
     }
 
     pub fn to_map_state(&self) -> MapState {

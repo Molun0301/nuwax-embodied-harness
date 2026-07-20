@@ -14,6 +14,7 @@ from starlette.requests import Request
 from drivers.entry import create_active_robot_assembly
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
+from gateways.feedback import build_public_error_payload
 from gateways.request_context import (
     REQUEST_ID_HEADER,
     categorize_gateway_error,
@@ -142,6 +143,8 @@ def create_gateway_app(
                         "message": "网关内部错误。",
                         "request_id": request_id_context.request_id,
                         "error_category": error_category,
+                        "retryable": False,
+                        "next_action": "使用 request_id 在详细日志中定位根因，修正条件后再调用。",
                     }
                 },
                 headers={REQUEST_ID_HEADER: request_id_context.request_id},
@@ -187,22 +190,35 @@ def create_gateway_app(
         request_id = getattr(request.state, "request_id", None) or normalize_request_id(None).request_id
         error_category = categorize_gateway_error(exc.error_code, exc.http_status)
         request.state.error_category = error_category
-        payload = exc.to_payload()
-        payload["request_id"] = request_id
-        payload["error_category"] = error_category
-        APP_LOGGER.warning(
-            "网关返回业务错误 code=%s status=%s message=%s",
-            exc.error_code,
-            exc.http_status,
-            exc.message,
-            extra={
-                "event": "gateway.error",
-                "request_id": request_id,
-                "error_code": exc.error_code,
-                "error_category": error_category,
-                "status_code": exc.http_status,
-            },
+        payload = build_public_error_payload(
+            exc,
+            request_id=request_id,
+            error_category=error_category,
         )
+        log_extra = {
+            "event": "gateway.error",
+            "request_id": request_id,
+            "error_code": exc.error_code,
+            "error_category": error_category,
+            "status_code": exc.http_status,
+        }
+        if exc.http_status >= 500:
+            APP_LOGGER.error(
+                "网关返回服务端错误 code=%s status=%s message=%s",
+                exc.error_code,
+                exc.http_status,
+                exc.message,
+                exc_info=(type(exc), exc, exc.__traceback__),
+                extra=log_extra,
+            )
+        else:
+            APP_LOGGER.warning(
+                "网关返回业务错误 code=%s status=%s message=%s",
+                exc.error_code,
+                exc.http_status,
+                exc.message,
+                extra=log_extra,
+            )
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": payload},

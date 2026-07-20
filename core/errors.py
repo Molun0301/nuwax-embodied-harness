@@ -112,10 +112,11 @@ def as_gateway_error(exc: Exception) -> GatewayError:
             jsonrpc_code=-32004,
         )
     return GatewayError(
-        f"网关执行失败: {exc}",
+        "工具执行失败，未完成请求。",
         error_code="execution_failed",
         http_status=500,
         jsonrpc_code=-32010,
+        details={"exception_type": exc.__class__.__name__},
     )
 
 

@@ -30,6 +30,9 @@ _REQUEST_CONTEXT_KEYS = (
     "status_code",
     "duration_ms",
     "error_category",
+    "rpc_request_id",
+    "mcp_method",
+    "tool_name",
     "map_version_id",
     "localization_session_id",
     "map_name",
@@ -528,7 +531,22 @@ class TaskManager:
             )
             status = record.status
 
-        self._append_task_event(task_id, "task.progress", state=status.state, message=message, payload=payload)
+        progress_payload: MetadataDict = dict(payload or {})
+        progress_payload.update(
+            {
+                "progress": status.progress,
+                "stage": status.stage,
+                "message": status.message,
+                "updated_at": status.updated_at.isoformat(),
+            }
+        )
+        self._append_task_event(
+            task_id,
+            "task.progress",
+            state=status.state,
+            message=status.message,
+            payload=progress_payload,
+        )
         return status
 
     def publish_task_event(
@@ -803,12 +821,32 @@ class TaskManager:
             if self.is_cancel_requested(task_id):
                 self._set_terminal_state(task_id, TaskState.CANCELLED, f"任务已取消: {exc}")
                 return None
+            with self._lock:
+                record = self._records[task_id]
+                task_context = dict(record.spec.metadata.get("request_context") or {})
+                capability_name = record.spec.capability_name
+            task_error_payload = self._extract_error_payload(exc) or {}
+            error_code = str(task_error_payload.get("code") or exc.__class__.__name__).strip()
+            error_category = _ERROR_CATEGORY_BY_CODE.get(error_code, "capability")
+            TASK_LOGGER.exception(
+                "任务执行异常",
+                extra={
+                    "event": "task.execution.failed",
+                    "request_id": task_context.get("request_id"),
+                    "task_id": task_id,
+                    "capability_name": capability_name,
+                    "requested_by": task_context.get("requested_by"),
+                    "error_code": error_code,
+                    "error_category": error_category,
+                    "exception_type": exc.__class__.__name__,
+                },
+            )
             self._set_terminal_state(
                 task_id,
                 TaskState.FAILED,
                 f"任务执行失败: {exc}",
                 error=str(exc),
-                error_payload=self._extract_error_payload(exc),
+                error_payload=task_error_payload,
             )
             raise
         finally:

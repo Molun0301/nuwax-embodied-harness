@@ -23,6 +23,9 @@ _REQUEST_CONTEXT_METADATA_KEYS = (
     "status_code",
     "duration_ms",
     "error_category",
+    "rpc_request_id",
+    "mcp_method",
+    "tool_name",
     "map_version_id",
     "localization_session_id",
     "map_name",
@@ -171,6 +174,12 @@ class EventBus:
         """把任务事件转换为统一运行时事件并发布。"""
 
         payload = dict(task_event.payload)
+        severity = {
+            "task.failed": RuntimeEventSeverity.ERROR,
+            "task.timeout": RuntimeEventSeverity.ERROR,
+            "task.cancelled": RuntimeEventSeverity.WARNING,
+            "task.resource_quarantined": RuntimeEventSeverity.ERROR,
+        }.get(task_event.event_type, RuntimeEventSeverity.INFO)
         if task_event.state is not None:
             payload["state"] = task_event.state.value
         metadata: MetadataDict = {"task_event_id": task_event.event_id}
@@ -190,6 +199,7 @@ class EventBus:
                 category=RuntimeEventCategory.TASK,
                 source=source,
                 task_id=task_event.task_id,
+                severity=severity,
                 message=task_event.message,
                 payload=payload,
                 metadata=metadata,

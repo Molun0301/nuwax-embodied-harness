@@ -237,6 +237,9 @@ _REQUEST_CONTEXT_KEYS = (
     "status_code",
     "duration_ms",
     "error_category",
+    "rpc_request_id",
+    "mcp_method",
+    "tool_name",
     "map_version_id",
     "localization_session_id",
     "map_name",
@@ -249,6 +252,9 @@ _RUNTIME_METADATA_LOG_KEYS = (
     "capability_name",
     "error_category",
     "duration_ms",
+    "rpc_request_id",
+    "mcp_method",
+    "tool_name",
     "map_version_id",
     "localization_session_id",
 )
@@ -3323,6 +3329,7 @@ class GatewayRuntime:
         arguments: Optional[Dict[str, Any]] = None,
         *,
         requested_by: Optional[str] = None,
+        request_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """按技能工具名调用运行时能力。"""
 
@@ -3331,6 +3338,7 @@ class GatewayRuntime:
             tool_descriptor.capability_name,
             arguments,
             requested_by=requested_by,
+            request_context=request_context,
         )
 
     def invoke_capability(

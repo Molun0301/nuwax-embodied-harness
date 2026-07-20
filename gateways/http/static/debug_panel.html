@@ -519,11 +519,11 @@ button{font-family:inherit;cursor:pointer}
                   <div id="map3dCameraControls" class="map-tool-group glass" data-map-view="3d" aria-label="3D 地图视角" hidden>
                     <button id="map3dFreeView" class="tool active" type="button" aria-pressed="true" title="自由旋转、三轴平移和缩放">自由视角</button>
                     <button id="map3dFollowView" class="tool" type="button" aria-pressed="false" title="相机轨道中心跟随机器狗">跟随机器狗</button>
-                    <label class="map-point-style" data-point-style="clarity" title="切换 3D 点云显示样式">
+                    <label class="map-point-style" data-point-style="height" title="切换 3D 点云显示样式">
                       <span class="sw" aria-hidden="true"></span>
                       <select id="map3dPointStyle" aria-label="3D 点云显示样式">
                         <option value="clarity">清晰</option>
-                        <option value="height">高度</option>
+                        <option value="height" selected>高度</option>
                         <option value="layers">分层</option>
                         <option value="mono">单色</option>
                       </select>
@@ -5918,7 +5918,7 @@ button{font-family:inherit;cursor:pointer}
       window.addEventListener("pointcloud3d:ready", () => {
         state.pointcloud3dReady = true;
         window.pointcloud3d?.setCameraMode(state.pointcloud3dCameraMode);
-        window.pointcloud3d?.setPointStyle(els.map3dPointStyle?.value || "clarity");
+        window.pointcloud3d?.setPointStyle(els.map3dPointStyle?.value || "height");
         syncPointcloud3dState();
       });
       window.addEventListener("pointcloud3d:semantic-select", (event) => {
@@ -5934,7 +5934,7 @@ button{font-family:inherit;cursor:pointer}
         updatePointcloud3dCameraControls(event.detail || {});
       });
       window.addEventListener("pointcloud3d:style-state", (event) => {
-        const style = String(event.detail?.style || "clarity");
+        const style = String(event.detail?.style || "height");
         if (!els.map3dPointStyle) return;
         els.map3dPointStyle.value = style;
         els.map3dPointStyle.closest(".map-point-style")?.setAttribute("data-point-style", style);
@@ -6001,7 +6001,7 @@ button{font-family:inherit;cursor:pointer}
       updateMapPoseHud();
     })();
   </script>
-  <script type="module" src="/static/js/pointcloud3d.js?v=20260720-map-grid-style"></script>
+  <script type="module" src="/static/js/pointcloud3d.js?v=20260720-height-default-blue40"></script>
   <!-- 地图导航工具模块：导航面板在页面尾部，禁行区面板常驻地图 HUD。 -->
   <div id="navigation-container" data-role="v2-navigation" hidden>
     <span data-role="nav-status">未选点</span>

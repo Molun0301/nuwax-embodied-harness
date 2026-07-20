@@ -16,10 +16,10 @@ const COLORS = {
 };
 
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
-const DEFAULT_POINT_STYLE = 'clarity';
+const DEFAULT_POINT_STYLE = 'height';
 const POINT_STYLE_PRESETS = Object.freeze({
   clarity: Object.freeze({ label: '清晰', sampleStride: 4, liveSpacingM: 0.1, size: 1.35, sizeAttenuation: false, colorMode: 'position' }),
-  height: Object.freeze({ label: '高度', sampleStride: 2, liveSpacingM: 0.1, heightGradientScale: 2, size: 1.35, sizeAttenuation: false, colorMode: 'height' }),
+  height: Object.freeze({ label: '高度', sampleStride: 2, liveSpacingM: 0.1, heightGradientScale: 2, blueBandHeightM: 0.4, size: 1.35, sizeAttenuation: false, colorMode: 'height' }),
   layers: Object.freeze({ label: '分层', sampleStride: 2, size: 0.07, sizeAttenuation: true, colorMode: 'layers' }),
   mono: Object.freeze({ label: '单色', sampleStride: 3, size: 1.1, sizeAttenuation: false, colorMode: 'mono' }),
 });
@@ -541,15 +541,21 @@ class PointCloud3DViewer {
     };
   }
 
-  _colorByHeight(positions, zMin, zMax, gradientScale = 1) {
+  _colorByHeight(positions, zMin, zMax, gradientScale = 1, blueBandHeightM = null) {
     const count = positions.length / 3;
     const colors = new Uint8Array(count * 3);
     if (count === 0) return colors;
     const range = zMax - zMin || 1;
     const scale = Number.isFinite(gradientScale) && gradientScale > 0 ? gradientScale : 1;
+    const gradientStart = Number.isFinite(blueBandHeightM) && blueBandHeightM >= 0
+      ? zMin + blueBandHeightM
+      : zMin + range * (0.5 - 0.5 / scale);
     for (let i = 0; i < count; i++) {
-      const normalized = (positions[i * 3 + 2] - zMin) / range;
-      const t = THREE.MathUtils.clamp((normalized - 0.5) * scale + 0.5, 0, 1);
+      const t = THREE.MathUtils.clamp(
+        (positions[i * 3 + 2] - gradientStart) * scale / range,
+        0,
+        1,
+      );
       const scaled = t * (HEIGHT_COLOR_STOPS.length - 1);
       const lower = Math.min(Math.floor(scaled), HEIGHT_COLOR_STOPS.length - 2);
       const blend = scaled - lower;
@@ -570,6 +576,7 @@ class PointCloud3DViewer {
         measurement.zMin,
         measurement.zMax,
         preset.heightGradientScale,
+        preset.blueBandHeightM,
       );
     }
 

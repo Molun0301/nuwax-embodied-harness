@@ -40,6 +40,7 @@ _STREAM_JSON_MAX_STRING_CHARS = 8192
 _STREAM_JSON_MAX_TOTAL_STRING_CHARS = 64 * 1024
 _STREAM_JSON_MAX_BYTES = 16 * 1024
 _STREAM_JSON_MAX_INTEGER_BITS = 256
+_STREAM_JSON_MAX_OCCUPANCY_CELLS = 2_000_000
 _TERMINAL_TASK_EVENT_TYPES = frozenset(
     {
         "task.succeeded",
@@ -145,6 +146,60 @@ def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
     return values
 
 
+def _complete_map_occupancy_data(frame: StreamFrame) -> Optional[object]:
+    """Return a validated map grid that must not be truncated in transport."""
+
+    if frame.topic != "map.frame":
+        return None
+    payload = frame.payload
+    occupancy_grid = (
+        payload.get("occupancy_grid")
+        if isinstance(payload, Mapping)
+        else getattr(payload, "occupancy_grid", None)
+    )
+    if occupancy_grid is None:
+        return None
+    width = (
+        occupancy_grid.get("width")
+        if isinstance(occupancy_grid, Mapping)
+        else getattr(occupancy_grid, "width", None)
+    )
+    height = (
+        occupancy_grid.get("height")
+        if isinstance(occupancy_grid, Mapping)
+        else getattr(occupancy_grid, "height", None)
+    )
+    data = (
+        occupancy_grid.get("data")
+        if isinstance(occupancy_grid, Mapping)
+        else getattr(occupancy_grid, "data", None)
+    )
+    if (
+        isinstance(width, bool)
+        or isinstance(height, bool)
+        or not isinstance(width, int)
+        or not isinstance(height, int)
+    ):
+        return None
+    cell_count = width * height
+    if (
+        cell_count <= 0
+        or cell_count > _STREAM_JSON_MAX_OCCUPANCY_CELLS
+        or not isinstance(data, (list, tuple))
+        or len(data) != cell_count
+    ):
+        return None
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < -1
+        or value > 100
+        for value in data
+    ):
+        return None
+    return data
+
+
 def _project_json_value(
     value: object,
     budget: _JsonProjectionBudget,
@@ -195,12 +250,20 @@ def _project_json_value(
     active_ids.add(value_id)
     try:
         if isinstance(value, StreamFrame):
-            return _project_json_value(
+            projected_frame = _project_json_value(
                 _stream_frame_values(value),
                 budget,
                 active_ids,
                 depth=depth + 1,
             )
+            occupancy_data = _complete_map_occupancy_data(value)
+            if occupancy_data is not None and isinstance(projected_frame, dict):
+                projected_payload = projected_frame.get("payload")
+                if isinstance(projected_payload, dict):
+                    projected_grid = projected_payload.get("occupancy_grid")
+                    if isinstance(projected_grid, dict):
+                        projected_grid["data"] = occupancy_data
+            return projected_frame
 
         if isinstance(value, Mapping):
             projected: Dict[str, object] = {}

@@ -18,8 +18,8 @@ const COLORS = {
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
 const DEFAULT_POINT_STYLE = 'clarity';
 const POINT_STYLE_PRESETS = Object.freeze({
-  clarity: Object.freeze({ label: '清晰', sampleStride: 2, size: 1.35, sizeAttenuation: false, colorMode: 'position' }),
-  height: Object.freeze({ label: '高度', sampleStride: 1, size: 0.055, sizeAttenuation: true, colorMode: 'height' }),
+  clarity: Object.freeze({ label: '清晰', sampleStride: 4, liveSpacingM: 0.1, size: 1.35, sizeAttenuation: false, colorMode: 'position' }),
+  height: Object.freeze({ label: '高度', sampleStride: 2, liveSpacingM: 0.1, heightGradientScale: 2, size: 1.35, sizeAttenuation: false, colorMode: 'height' }),
   layers: Object.freeze({ label: '分层', sampleStride: 2, size: 0.07, sizeAttenuation: true, colorMode: 'layers' }),
   mono: Object.freeze({ label: '单色', sampleStride: 3, size: 1.1, sizeAttenuation: false, colorMode: 'mono' }),
 });
@@ -541,13 +541,15 @@ class PointCloud3DViewer {
     };
   }
 
-  _colorByHeight(positions, zMin, zMax) {
+  _colorByHeight(positions, zMin, zMax, gradientScale = 1) {
     const count = positions.length / 3;
     const colors = new Uint8Array(count * 3);
     if (count === 0) return colors;
     const range = zMax - zMin || 1;
+    const scale = Number.isFinite(gradientScale) && gradientScale > 0 ? gradientScale : 1;
     for (let i = 0; i < count; i++) {
-      const t = THREE.MathUtils.clamp((positions[i * 3 + 2] - zMin) / range, 0, 1);
+      const normalized = (positions[i * 3 + 2] - zMin) / range;
+      const t = THREE.MathUtils.clamp((normalized - 0.5) * scale + 0.5, 0, 1);
       const scaled = t * (HEIGHT_COLOR_STOPS.length - 1);
       const lower = Math.min(Math.floor(scaled), HEIGHT_COLOR_STOPS.length - 2);
       const blend = scaled - lower;
@@ -563,7 +565,12 @@ class PointCloud3DViewer {
   _pointCloudColors(positions, measurement) {
     const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     if (preset.colorMode === 'height') {
-      return this._colorByHeight(positions, measurement.zMin, measurement.zMax);
+      return this._colorByHeight(
+        positions,
+        measurement.zMin,
+        measurement.zMax,
+        preset.heightGradientScale,
+      );
     }
 
     const count = Math.floor(positions.length / 3);
@@ -668,7 +675,11 @@ class PointCloud3DViewer {
     const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     const src = this._allPositions;
     if (this._isLiveCloudMapSnapshot) {
-      this._renderPointCloudPositions(src);
+      const measurement = src.length ? this._measurePointCloud(src) : null;
+      const positions = preset.liveSpacingM
+        ? this._spatiallySamplePointCloud(src, preset.liveSpacingM)
+        : src;
+      this._renderPointCloudPositions(positions, measurement);
       return;
     }
     const totalPts = Math.floor(src.length / 3);
@@ -688,6 +699,36 @@ class PointCloud3DViewer {
       pos[i * 3 + 2] = src[j * 3 + 2];
     }
     this._renderPointCloudPositions(pos, measurement);
+  }
+
+  _spatiallySamplePointCloud(positions, spacingM) {
+    const spacing = Number(spacingM);
+    if (!positions.length || !Number.isFinite(spacing) || spacing <= 0) return positions;
+    const inverseSpacing = 1 / spacing;
+    const occupied = new Set();
+    const sampled = new Float32Array(positions.length);
+    let writeOffset = 0;
+    for (let offset = 0; offset < positions.length; offset += 3) {
+      const x = positions[offset];
+      const y = positions[offset + 1];
+      const z = positions[offset + 2];
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      const gridX = Math.floor(x * inverseSpacing);
+      const gridY = Math.floor(y * inverseSpacing);
+      const gridZ = Math.floor(z * inverseSpacing);
+      const key = (
+        Math.imul(gridX, 73856093)
+        ^ Math.imul(gridY, 19349663)
+        ^ Math.imul(gridZ, 83492791)
+      ) >>> 0;
+      if (occupied.has(key)) continue;
+      occupied.add(key);
+      sampled[writeOffset] = (gridX + 0.5) * spacing;
+      sampled[writeOffset + 1] = (gridY + 0.5) * spacing;
+      sampled[writeOffset + 2] = (gridZ + 0.5) * spacing;
+      writeOffset += 3;
+    }
+    return sampled.slice(0, writeOffset);
   }
 
   async loadPointCloud(url, lod = 'preview') {
@@ -733,7 +774,7 @@ class PointCloud3DViewer {
     }
 
     this._allPositions = xyzArray;
-    this._renderPointCloudPositions(xyzArray);
+    this._rebuildPointCloud();
   }
 
   _ensureRobotMesh() {

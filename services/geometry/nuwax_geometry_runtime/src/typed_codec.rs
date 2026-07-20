@@ -312,16 +312,15 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
         1 => true,
         _ => return None,
     };
-    if sink_ready && guard_generation == 0 {
-        return None;
-    }
     let has_session = !message.session_id.trim().is_empty();
     if has_session {
-        if !matches!(
-            message.owner_kind,
-            schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
-                | schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
-        ) || message.parent_request_id.trim().is_empty()
+        if (sink_ready && guard_generation == 0)
+            || !matches!(
+                message.owner_kind,
+                schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
+                    | schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+            )
+            || message.parent_request_id.trim().is_empty()
             || goal_generation == 0
             || message.goal_payload_sha256 == [0; 32]
             || (path_revision == 0 && message.path_payload_sha256 != [0; 32])
@@ -659,6 +658,47 @@ mod tests {
         assert_eq!(nav.feedback.cancel_generation, 3);
         assert_eq!(nav.feedback.zero_ack_id, "zero-3");
         assert_eq!(nav.feedback.zero_applied_monotonic_ns, 55);
+    }
+
+    #[test]
+    fn idle_sink_ready_without_guard_generation_decodes() {
+        let payload = schema::encode_navigation_state_body(&schema::NavigationState {
+            robot_frame: "base_link".into(),
+            stamp_sec: 8,
+            state: 0,
+            message: "idle".into(),
+            runtime_generation: 9,
+            sink_ready: 1,
+            ..schema::NavigationState::default()
+        })
+        .expect("encode idle navigation state");
+
+        let nav = decode_nav_state_payload(&payload).expect("decode idle navigation state");
+        assert_eq!(nav.state.status, "IDLE");
+        assert!(nav.state.goal_id.is_empty());
+        assert!(nav.feedback.sink_ready);
+        assert_eq!(nav.feedback.guard_generation, 0);
+    }
+
+    #[test]
+    fn active_sink_ready_without_guard_generation_is_rejected() {
+        let payload = schema::encode_navigation_state_body(&schema::NavigationState {
+            session_id: "goal-without-guard".into(),
+            robot_frame: "base_link".into(),
+            stamp_sec: 8,
+            state: 2,
+            message: "moving".into(),
+            runtime_generation: 9,
+            sink_ready: 1,
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: "request-without-guard".into(),
+            goal_generation: 1,
+            goal_payload_sha256: [7; 32],
+            ..schema::NavigationState::default()
+        })
+        .expect("encode active navigation state");
+
+        assert!(decode_nav_state_payload(&payload).is_none());
     }
 
     #[test]

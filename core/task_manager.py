@@ -110,6 +110,8 @@ class TaskRecord:
     deferred_interrupt: bool = False
     interrupt_barrier_acknowledged: bool = False
     interrupt_barrier_proof: Optional[MetadataDict] = None
+    completion_committed: bool = False
+    completion_proof: Optional[MetadataDict] = None
     resource_quarantined: bool = False
     resource_quarantine_release_proof: Optional[MetadataDict] = None
 
@@ -165,6 +167,11 @@ class TaskExecutionContext:
         """确认 deferred 中断已完成后端安全停车，并记录证明。"""
 
         return self.manager.acknowledge_interrupt_barrier(self.task_id, proof)
+
+    def commit_success(self, proof: MetadataDict) -> bool:
+        """在 runner 清理前封存已经获得后端证明的成功结果。"""
+
+        return self.manager.commit_task_success(self.task_id, proof)
 
 
 class TaskManager:
@@ -384,6 +391,42 @@ class TaskManager:
         )
         return dict(barrier_proof)
 
+    def commit_task_success(
+        self,
+        task_id: str,
+        proof: MetadataDict,
+    ) -> bool:
+        """原子封存成功证明，避免清理阶段被 timeout/cancel 覆盖。"""
+
+        completion_proof = dict(proof or {})
+        if not completion_proof:
+            raise ValueError("completion proof 不能为空。")
+        with self._lock:
+            record = self._records[task_id]
+            if record.completion_committed:
+                return True
+            if (
+                record.status.state in _TERMINAL_STATES
+                or record.cancel_requested
+                or record.timeout_triggered
+            ):
+                return False
+            record.completion_committed = True
+            record.completion_proof = completion_proof
+            timer = record.timeout_timer
+            record.timeout_timer = None
+            state = record.status.state
+        if timer is not None:
+            timer.cancel()
+        self._append_task_event(
+            task_id,
+            "task.success_committed",
+            state=state,
+            message="后端成功终态已确认，等待本地清理完成。",
+            payload={"completion_proof": completion_proof},
+        )
+        return True
+
     def list_active_tasks(self) -> Tuple[TaskStatus, ...]:
         """列出活动任务。"""
 
@@ -567,7 +610,7 @@ class TaskManager:
 
         with self._lock:
             record = self._records[task_id]
-            if record.status.state in _TERMINAL_STATES:
+            if record.status.state in _TERMINAL_STATES or record.completion_committed:
                 return False
             record.cancel_requested = True
             future = record.future
@@ -754,7 +797,27 @@ class TaskManager:
                 deferred_interrupt = self._records[task_id].deferred_interrupt
             if not deferred_interrupt:
                 context.ensure_active()
-            result = runner(context)
+            try:
+                result = runner(context)
+            except Exception:
+                with self._lock:
+                    completion_committed = self._records[
+                        task_id
+                    ].completion_committed
+                if completion_committed:
+                    TASK_LOGGER.warning(
+                        "任务成功封存后的本地清理异常未覆盖后端成功终态",
+                        exc_info=True,
+                        extra={"task_id": task_id},
+                    )
+                    self._set_terminal_state(
+                        task_id,
+                        TaskState.SUCCEEDED,
+                        "任务执行成功。",
+                        result=result,
+                    )
+                    return result
+                raise
             with self._lock:
                 record = self._records[task_id]
                 terminal_state = record.status.state
@@ -762,6 +825,15 @@ class TaskManager:
                 timeout_triggered = record.timeout_triggered
                 deferred_interrupt = record.deferred_interrupt
                 barrier_acknowledged = record.interrupt_barrier_acknowledged
+                completion_committed = record.completion_committed
+            if completion_committed:
+                self._set_terminal_state(
+                    task_id,
+                    TaskState.SUCCEEDED,
+                    "任务执行成功。",
+                    result=result,
+                )
+                return result
             if terminal_state == TaskState.CANCELLED:
                 return result
             if terminal_state == TaskState.TIMEOUT:
@@ -914,6 +986,8 @@ class TaskManager:
     ) -> TaskSafetyBarrierError:
         with self._lock:
             record = self._records[task_id]
+            input_payload = dict(record.spec.input_payload or {})
+            metadata = dict(record.spec.metadata or {})
             details: MetadataDict = {
                 "task_id": task_id,
                 "cancel_requested": record.cancel_requested,
@@ -926,6 +1000,37 @@ class TaskManager:
                 details["interrupt_barrier_proof"] = dict(
                     record.interrupt_barrier_proof
                 )
+            ownership_correlation: MetadataDict = {}
+            for item in reversed(
+                list(metadata.get("resource_ownership_correlations") or ())
+            ):
+                if not isinstance(item, dict):
+                    continue
+                ownership_domain = str(
+                    item.get("ownership_domain") or ""
+                ).strip()
+                goal_id = str(item.get("goal_id") or "").strip()
+                request_id = str(item.get("request_id") or "").strip()
+                if ownership_domain == "navigation" and goal_id:
+                    ownership_correlation = {"goal_id": goal_id}
+                    break
+                if ownership_domain == "exploration" and request_id:
+                    ownership_correlation = {"request_id": request_id}
+                    break
+            if not ownership_correlation:
+                goal_id = str(
+                    input_payload.get("goal_id") or metadata.get("goal_id") or ""
+                ).strip()
+                request_id = str(
+                    input_payload.get("request_id")
+                    or metadata.get("request_id")
+                    or ""
+                ).strip()
+                if goal_id:
+                    ownership_correlation = {"goal_id": goal_id}
+                elif request_id:
+                    ownership_correlation = {"request_id": request_id}
+            details.update(ownership_correlation)
         return TaskSafetyBarrierError(message, details=details)
 
     def _set_running(self, task_id: str) -> None:
@@ -1078,7 +1183,7 @@ class TaskManager:
             record = self._records.get(task_id)
             if record is None:
                 return
-            if record.status.state in _TERMINAL_STATES:
+            if record.status.state in _TERMINAL_STATES or record.completion_committed:
                 return
             record.timeout_triggered = True
             future = record.future

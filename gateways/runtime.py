@@ -432,6 +432,21 @@ def _runtime_activation_level(capability_name: str) -> Optional[str]:
     return None
 
 
+def _runtime_activation_timeout_sec() -> float:
+    try:
+        return max(
+            1.0,
+            float(
+                os.environ.get(
+                    "NUWAX_RUNTIME_ACTIVATION_TIMEOUT_SEC",
+                    str(_RUNTIME_ACTIVATION_TIMEOUT_SEC),
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        return _RUNTIME_ACTIVATION_TIMEOUT_SEC
+
+
 def _has_observability_value(value: Any) -> bool:
     return value is not None and value != ""
 
@@ -8350,7 +8365,12 @@ class GatewayRuntime:
         if not duration_candidates:
             return timeout_sec
         guard_sec = max(1.0, float(poll_interval_sec or 0.0) * 2.0)
-        return max(float(timeout_sec), max(float(value) for value in duration_candidates) + guard_sec)
+        return max(
+            float(timeout_sec),
+            max(float(value) for value in duration_candidates)
+            + _runtime_activation_timeout_sec()
+            + guard_sec,
+        )
 
     def _coerce_optional_str_list(self, value: Any) -> List[str]:
         return skill_params.coerce_optional_str_list(value)
@@ -10683,6 +10703,17 @@ class GatewayRuntime:
                         ),
                     )
                     if complete_terminal and status.value == "succeeded":
+                        completion_proof = {
+                            "request_id": request.request_id,
+                            "terminal_status": status.value,
+                            "exploration_terminal": True,
+                            "child_task_id": None,
+                        }
+                        if not context.commit_success(completion_proof):
+                            context.ensure_active()
+                            raise RuntimeError(
+                                "探索成功终态无法在中断竞争后封存。"
+                            )
                         context.update(
                             progress=1.0,
                             stage="completed",
@@ -11061,18 +11092,7 @@ class GatewayRuntime:
                     "request_id": request_id,
                 },
             ) from exc
-        try:
-            timeout_sec = max(
-                1.0,
-                float(
-                    os.environ.get(
-                        "NUWAX_RUNTIME_ACTIVATION_TIMEOUT_SEC",
-                        str(_RUNTIME_ACTIVATION_TIMEOUT_SEC),
-                    )
-                ),
-            )
-        except (TypeError, ValueError):
-            timeout_sec = _RUNTIME_ACTIVATION_TIMEOUT_SEC
+        timeout_sec = _runtime_activation_timeout_sec()
         deadline = time.monotonic() + timeout_sec
         ack_written = False
         try:

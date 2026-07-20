@@ -409,21 +409,62 @@ fn ingest_map_pose_tf(
 }
 
 #[cfg(feature = "guard-runtime")]
+enum MapPoseOdometryIngress {
+    Accepted(crate::map_pose::MapPoseObservation),
+    AwaitingTransform(Box<schema::Odometry>, String),
+    Rejected(String),
+}
+
+#[cfg(feature = "guard-runtime")]
+fn transform_map_pose_odometry(
+    adapter: &crate::map_pose::MapPoseAdapter,
+    odometry: schema::Odometry,
+) -> NavStackResult<MapPoseOdometryIngress> {
+    match adapter.transform_odometry(&odometry) {
+        Ok(Some(observed)) => Ok(MapPoseOdometryIngress::Accepted(observed)),
+        Ok(None) => Ok(MapPoseOdometryIngress::AwaitingTransform(
+            Box::new(odometry),
+            "odometry is waiting for a canonical map->odom transform".into(),
+        )),
+        Err(
+            error @ (crate::map_pose::MapPoseError::StaleTransform { .. }
+            | crate::map_pose::MapPoseError::MisalignedTransform { .. }),
+        ) => Ok(MapPoseOdometryIngress::AwaitingTransform(
+            Box::new(odometry),
+            error.to_string(),
+        )),
+        Err(error @ crate::map_pose::MapPoseError::InvalidConfig(_)) => {
+            Err(module_error("map_pose_adapter.odometry", error))
+        }
+        Err(error) => Ok(MapPoseOdometryIngress::Rejected(error.to_string())),
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
 fn ingest_map_pose_odometry(
     adapter: &crate::map_pose::MapPoseAdapter,
     payload: &[u8],
-) -> OwnerInputResult<crate::map_pose::MapPoseObservation> {
+) -> NavStackResult<MapPoseOdometryIngress> {
     let odometry = match schema::decode_odometry(&prefixed(schema::ODOMETRY_FINGERPRINT, payload)) {
         Ok(odometry) => odometry,
-        Err(error) => return Ok(OwnerInput::Rejected(format!("Odometry decode: {error}"))),
+        Err(error) => {
+            return Ok(MapPoseOdometryIngress::Rejected(format!(
+                "Odometry decode: {error}"
+            )))
+        }
     };
-    match adapter.transform_odometry(&odometry) {
-        Ok(Some(observed)) => Ok(OwnerInput::Accepted(observed)),
-        Ok(None) => Ok(OwnerInput::Rejected(
-            "odometry is waiting for a canonical map->odom transform".into(),
-        )),
-        Err(error) => map_pose_input_error("map_pose_adapter.odometry", error),
-    }
+    transform_map_pose_odometry(adapter, odometry)
+}
+
+#[cfg(feature = "guard-runtime")]
+async fn publish_map_pose_observation(
+    transport: &LcmTransport,
+    channel: &str,
+    observed: crate::map_pose::MapPoseObservation,
+) -> NavStackResult<()> {
+    let body = schema::encode_pose_stamped_body(&observed.pose)
+        .map_err(|error| NavStackError::Internal(format!("map pose encode: {error}")))?;
+    publish_body(transport, channel, "geometry_msgs.PoseStamped", body).await
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -442,6 +483,7 @@ async fn run_map_pose_adapter(
     )
     .map_err(|error| module_error("map_pose_adapter", error))?;
     let mut diagnostics = InputDiagnosticLimiter::default();
+    let mut pending_odometry: Option<Box<schema::Odometry>> = None;
     signal_ready(ready)?;
 
     loop {
@@ -449,24 +491,49 @@ async fn run_map_pose_adapter(
             _ = &mut shutdown => return Ok(()),
             message = transforms.next() => {
                 let frame = required_frame(message, "map_pose_adapter.tf")?;
-                if let OwnerInput::Rejected(reason) = ingest_map_pose_tf(&mut adapter, &frame.payload)? {
-                    diagnostics.reject("map_pose_adapter.tf", &reason);
+                match ingest_map_pose_tf(&mut adapter, &frame.payload)? {
+                    OwnerInput::Accepted(()) => {
+                        if let Some(odometry) = pending_odometry.take() {
+                            match transform_map_pose_odometry(&adapter, *odometry)? {
+                                MapPoseOdometryIngress::Accepted(observed) => {
+                                    publish_map_pose_observation(
+                                        &transport,
+                                        &node.outputs[0],
+                                        observed,
+                                    ).await?;
+                                }
+                                MapPoseOdometryIngress::AwaitingTransform(odometry, reason) => {
+                                    pending_odometry = Some(odometry);
+                                    diagnostics.reject("map_pose_adapter.odometry", &reason);
+                                }
+                                MapPoseOdometryIngress::Rejected(reason) => {
+                                    diagnostics.reject("map_pose_adapter.odometry", &reason);
+                                }
+                            }
+                        }
+                    }
+                    OwnerInput::Rejected(reason) => {
+                        diagnostics.reject("map_pose_adapter.tf", &reason);
+                    }
                 }
             }
             message = odometry.next() => {
                 let frame = required_frame(message, "map_pose_adapter.odometry")?;
                 match ingest_map_pose_odometry(&adapter, &frame.payload)? {
-                    OwnerInput::Accepted(observed) => {
-                        let body = schema::encode_pose_stamped_body(&observed.pose)
-                            .map_err(|error| NavStackError::Internal(format!("map pose encode: {error}")))?;
-                        publish_body(
+                    MapPoseOdometryIngress::Accepted(observed) => {
+                        pending_odometry = None;
+                        publish_map_pose_observation(
                             &transport,
                             &node.outputs[0],
-                            "geometry_msgs.PoseStamped",
-                            body,
+                            observed,
                         ).await?;
                     }
-                    OwnerInput::Rejected(reason) => {
+                    MapPoseOdometryIngress::AwaitingTransform(odometry, reason) => {
+                        pending_odometry = Some(odometry);
+                        diagnostics.reject("map_pose_adapter.odometry", &reason);
+                    }
+                    MapPoseOdometryIngress::Rejected(reason) => {
+                        pending_odometry = None;
                         diagnostics.reject("map_pose_adapter.odometry", &reason);
                     }
                 }
@@ -6626,8 +6693,76 @@ mod guarded_tests {
         let observed = match ingest_map_pose_odometry(&adapter, &odometry_body)
             .expect("valid odometry after bad TF")
         {
-            OwnerInput::Accepted(observed) => observed,
-            OwnerInput::Rejected(reason) => panic!("valid odometry rejected: {reason}"),
+            MapPoseOdometryIngress::Accepted(observed) => observed,
+            MapPoseOdometryIngress::AwaitingTransform(_, reason) => {
+                panic!("valid odometry still waiting: {reason}")
+            }
+            MapPoseOdometryIngress::Rejected(reason) => {
+                panic!("valid odometry rejected: {reason}")
+            }
+        };
+        assert_eq!(observed.pose.header.frame_id, "map");
+        assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.0]);
+    }
+
+    #[test]
+    fn map_pose_owner_retries_pending_odometry_when_matching_tf_arrives() {
+        let mut adapter =
+            crate::map_pose::MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
+        let odometry = schema::Odometry {
+            header: schema::Header {
+                stamp_sec: 7,
+                frame_id: "odom".into(),
+                ..schema::Header::default()
+            },
+            child_frame_id: "base_link".into(),
+            pose: schema::Pose {
+                position: [3.0, 4.0, 0.0],
+                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+            ..schema::Odometry::default()
+        };
+        let odometry_body = schema::encode_odometry_body(&odometry).expect("encode odometry body");
+        let pending = match ingest_map_pose_odometry(&adapter, &odometry_body)
+            .expect("odometry before TF is retryable")
+        {
+            MapPoseOdometryIngress::AwaitingTransform(odometry, _) => odometry,
+            MapPoseOdometryIngress::Accepted(_) => panic!("odometry unexpectedly accepted"),
+            MapPoseOdometryIngress::Rejected(reason) => {
+                panic!("retryable odometry rejected: {reason}")
+            }
+        };
+
+        let tf_body = schema::encode_tf_message_body(&schema::TfMessage {
+            transforms: vec![schema::TransformStamped {
+                header: schema::Header {
+                    stamp_sec: 7,
+                    frame_id: "map".into(),
+                    ..schema::Header::default()
+                },
+                child_frame_id: "odom".into(),
+                transform: schema::Transform {
+                    translation: [1.0, 2.0, 0.0],
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                },
+            }],
+        })
+        .expect("encode TF");
+        assert!(matches!(
+            ingest_map_pose_tf(&mut adapter, &tf_body).expect("matching TF"),
+            OwnerInput::Accepted(())
+        ));
+
+        let observed = match transform_map_pose_odometry(&adapter, *pending)
+            .expect("retry pending odometry")
+        {
+            MapPoseOdometryIngress::Accepted(observed) => observed,
+            MapPoseOdometryIngress::AwaitingTransform(_, reason) => {
+                panic!("aligned odometry still waiting: {reason}")
+            }
+            MapPoseOdometryIngress::Rejected(reason) => {
+                panic!("aligned odometry rejected: {reason}")
+            }
         };
         assert_eq!(observed.pose.header.frame_id, "map");
         assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.0]);

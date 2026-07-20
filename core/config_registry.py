@@ -261,7 +261,7 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("lcm_typed_channel", ("NUWAX_LCM_CHANNEL_",)),
     ("runtime_channel",   ("NUWAX_GEOMETRY_RUNTIME_", "NUWAX_GEOMETRY_RUNTIME_PROCESS", "NUWAX_GEOMETRY_RUNTIME_LOG")),
     ("nuwax_mapping",     ("NUWAX_MAPPING_", "NUWAX_GOOGLE_MAPS")),
-    ("shm_uds",           ("NUWAX_CLOUDMAP_SHM_PATH", "NUWAX_OCCUPANCY_SHM_PATH", "NUWAX_VIDEO_")),
+    ("shm_uds",           ("NUWAX_CLOUDMAP_SHM_PATH", "NUWAX_OCCUPANCY_SHM_PATH", "NUWAX_FORBIDDEN_ZONES_PATH", "NUWAX_VIDEO_")),
 )
 
 # 敏感键（脱敏不回显）。鉴权已移除，故仅余各类外部服务密钥/令牌。
@@ -522,6 +522,7 @@ _ZH_NAMES: Dict[str, str] = {
     # 共享内存 / Unix socket 路径
     "NUWAX_CLOUDMAP_SHM_PATH": "cloud_map 共享内存映射文件路径（services/geometry/runtime.py 默认 /tmp/nuwax_cloudmap.mmap）",
     "NUWAX_OCCUPANCY_SHM_PATH": "occupancy 共享内存映射文件路径（services/geometry/runtime.py 默认 /tmp/nuwax_occupancy.mmap）",
+    "NUWAX_FORBIDDEN_ZONES_PATH": "地图版本级禁行区 JSON 文件路径（Gateway 原子写，Geometry Runtime 监听）",
     "NUWAX_VIDEO_SHM_PATH": "视频共享内存路径",
     "NUWAX_VIDEO_UDS_PATH": "视频 Unix socket 路径",
     "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL": "runtime odom typed channel（与 NUWAX_LCM_CHANNEL_ODOM 等价别名）",

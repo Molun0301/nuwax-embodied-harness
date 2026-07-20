@@ -10,6 +10,9 @@ const COLORS = {
   navGoal: 0xa78bfa,
   semantic: 0xf59e0b,
   semanticFallback: 0x94a3b8,
+  forbiddenInside: 0xef4444,
+  forbiddenOutside: 0xa855f7,
+  forbiddenDisabled: 0x94a3b8,
 };
 
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
@@ -45,6 +48,80 @@ const FOLLOW_TARGET_HEIGHT = 0.25;
 const DEFAULT_CAMERA_DIRECTION = new THREE.Vector3(0, -1, 0.72).normalize();
 const SEMANTIC_HIDE_ZOOM_PERCENT = 35;
 const SEMANTIC_PICK_CLUSTER_PX = 28;
+const FORBIDDEN_CIRCLE_SEGMENTS = 64;
+
+function normalizeForbiddenPoint(value) {
+  if (!value || typeof value !== 'object') return null;
+  const x = Number(value.x);
+  const y = Number(value.y);
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+}
+
+function normalizeForbiddenZone(value) {
+  if (!value || typeof value !== 'object') return null;
+  let shape = String(value.shape || '').toLowerCase();
+  if (shape === 'custom') shape = 'polygon';
+  if (!['line', 'rectangle', 'circle', 'polygon'].includes(shape)) return null;
+  const rawVertices = Array.isArray(value.vertices)
+    ? value.vertices
+    : Array.isArray(value.points) ? value.points : [];
+  let vertices = rawVertices.map(normalizeForbiddenPoint).filter(Boolean);
+  if (shape === 'rectangle' && vertices.length > 2) {
+    const xs = vertices.map((point) => point.x);
+    const ys = vertices.map((point) => point.y);
+    vertices = [
+      { x: Math.min(...xs), y: Math.min(...ys) },
+      { x: Math.max(...xs), y: Math.max(...ys) },
+    ];
+  }
+  const center = normalizeForbiddenPoint(value.center);
+  const radius = Number(value.radius_m);
+  const strokeWidth = Number(value.stroke_width_m ?? value.line_width_m ?? 0.25);
+  if (shape === 'line' && vertices.length !== 2) return null;
+  if (shape === 'rectangle' && vertices.length !== 2) return null;
+  if (shape === 'polygon' && vertices.length < 3) return null;
+  if (shape === 'circle' && (!center || !Number.isFinite(radius) || radius <= 0)) return null;
+  return {
+    id: String(value.id || value.zone_id || ''),
+    shape,
+    mode: shape === 'line' ? 'inside' : value.mode === 'outside' ? 'outside' : 'inside',
+    vertices: shape === 'circle' ? [] : vertices,
+    center: shape === 'circle' ? center : null,
+    radius_m: shape === 'circle' ? radius : null,
+    stroke_width_m: Number.isFinite(strokeWidth) && strokeWidth > 0 ? strokeWidth : 0.25,
+    enabled: value.enabled !== false,
+    metadata: value.metadata && typeof value.metadata === 'object' ? { ...value.metadata } : {},
+  };
+}
+
+function forbiddenZoneEntry(value, preferredMapVersionId = null) {
+  let root = value;
+  for (let index = 0; index < 3; index += 1) {
+    if (!root || typeof root !== 'object' || root.maps || root.zones || root.map_version_id) break;
+    const next = root.data || root.result || root.payload;
+    if (!next || next === root) break;
+    root = next;
+  }
+  if (!root || typeof root !== 'object') return null;
+  let entry = root;
+  let mapVersionId = String(root.map_version_id || '').trim() || null;
+  if (root.maps && typeof root.maps === 'object') {
+    const keys = Object.keys(root.maps);
+    const preferred = String(preferredMapVersionId || '').trim();
+    const key = preferred
+      ? Object.prototype.hasOwnProperty.call(root.maps, preferred) ? preferred : null
+      : keys.length === 1 ? keys[0] : null;
+    if (!key) return null;
+    entry = root.maps[key] || {};
+    mapVersionId = String(entry.map_version_id || key).trim() || null;
+  }
+  if (!Array.isArray(entry.zones)) return null;
+  return {
+    mapVersionId,
+    generation: Math.max(0, Number(entry.generation) || 0),
+    zones: entry.zones.map(normalizeForbiddenZone).filter(Boolean),
+  };
+}
 
 class PointCloud3DViewer {
   constructor() {
@@ -56,6 +133,7 @@ class PointCloud3DViewer {
     this._pointsMesh = null;
     this._robotMesh = null;
     this._frontierGroup = null;
+    this._forbiddenZoneGroup = null;
     this._semanticGroup = null;
     this._trajectoryLine = null;
     this._navPathLine = null;
@@ -70,6 +148,9 @@ class PointCloud3DViewer {
     this._hasFramedPointCloud = false;
     this._robotPose = null;
     this._frontiers = [];
+    this._forbiddenZones = [];
+    this._forbiddenZoneMapVersionId = null;
+    this._forbiddenZoneGeneration = 0;
     this._trajectory = [];
     this._navigationPath = [];
     this._navigationGoal = null;
@@ -130,6 +211,11 @@ class PointCloud3DViewer {
 
     this._frontierGroup = new THREE.Group();
     this._scene.add(this._frontierGroup);
+
+    this._forbiddenZoneGroup = new THREE.Group();
+    this._forbiddenZoneGroup.name = 'forbidden-zones';
+    this._forbiddenZoneGroup.renderOrder = 2;
+    this._scene.add(this._forbiddenZoneGroup);
 
     this._semanticGroup = new THREE.Group();
     this._semanticGroup.visible = this._semanticInstancesVisible;
@@ -531,11 +617,13 @@ class PointCloud3DViewer {
 
   _renderPointCloudPositions(positions, sourceMeasurement = null) {
     if (!this._scene) return;
+    const previousBounds = this._pointCloudBounds;
     this._disposePointsMesh();
     if (!positions.length) {
       this._displayedPointCount = 0;
       this._pointCloudBounds = null;
       this._emitPointCount();
+      if (previousBounds && this._forbiddenZones.length) this._rebuildForbiddenZones();
       this._requestRender();
       return;
     }
@@ -562,6 +650,10 @@ class PointCloud3DViewer {
     if (!this._hasFramedPointCloud && !this._hasUserCameraInput && this._cameraMode === 'free') {
       this._framePointCloud();
     }
+    const boundsChanged = !previousBounds
+      || previousBounds.center.distanceToSquared(this._pointCloudBounds.center) > 1e-12
+      || Math.abs(previousBounds.radius - this._pointCloudBounds.radius) > 1e-6;
+    if (boundsChanged && this._forbiddenZones.length) this._rebuildForbiddenZones();
     this._requestRender();
   }
 
@@ -1017,6 +1109,208 @@ class PointCloud3DViewer {
     this._requestRender();
   }
 
+  _clearForbiddenZones() {
+    if (!this._forbiddenZoneGroup) return;
+    const geometries = new Set();
+    const materials = new Set();
+    this._forbiddenZoneGroup.traverse((object) => {
+      if (object.geometry) geometries.add(object.geometry);
+      if (Array.isArray(object.material)) object.material.forEach((material) => materials.add(material));
+      else if (object.material) materials.add(object.material);
+    });
+    this._forbiddenZoneGroup.clear();
+    geometries.forEach((geometry) => geometry.dispose?.());
+    materials.forEach((material) => material.dispose?.());
+  }
+
+  _forbiddenVertices(zone) {
+    if (zone.shape === 'rectangle') {
+      const first = zone.vertices[0];
+      const second = zone.vertices[1];
+      return [
+        { x: first.x, y: first.y },
+        { x: second.x, y: first.y },
+        { x: second.x, y: second.y },
+        { x: first.x, y: second.y },
+      ];
+    }
+    if (zone.shape === 'circle') {
+      const vertices = [];
+      for (let index = 0; index < FORBIDDEN_CIRCLE_SEGMENTS; index += 1) {
+        const angle = Math.PI * 2 * index / FORBIDDEN_CIRCLE_SEGMENTS;
+        vertices.push({
+          x: zone.center.x + Math.cos(angle) * zone.radius_m,
+          y: zone.center.y + Math.sin(angle) * zone.radius_m,
+        });
+      }
+      return vertices;
+    }
+    return zone.vertices.slice();
+  }
+
+  _forbiddenMaskBounds(zones) {
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const zone of zones) {
+      for (const point of this._forbiddenVertices(zone)) {
+        minX = Math.min(minX, point.x);
+        maxX = Math.max(maxX, point.x);
+        minY = Math.min(minY, point.y);
+        maxY = Math.max(maxY, point.y);
+      }
+    }
+    const cloud = this._pointCloudBounds;
+    if (cloud && Number.isFinite(cloud.radius) && cloud.radius > 0) {
+      minX = Math.min(minX, cloud.center.x - cloud.radius);
+      maxX = Math.max(maxX, cloud.center.x + cloud.radius);
+      minY = Math.min(minY, cloud.center.y - cloud.radius);
+      maxY = Math.max(maxY, cloud.center.y + cloud.radius);
+    }
+    if (![minX, maxX, minY, maxY].every(Number.isFinite)) {
+      minX = -20;
+      maxX = 20;
+      minY = -20;
+      maxY = 20;
+    }
+    const span = Math.max(maxX - minX, maxY - minY, 10);
+    const padding = Math.max(30, span * 1.5);
+    return {
+      minX: minX - padding,
+      maxX: maxX + padding,
+      minY: minY - padding,
+      maxY: maxY + padding,
+    };
+  }
+
+  _forbiddenShapeFromVertices(vertices) {
+    const shape = new THREE.Shape();
+    shape.moveTo(vertices[0].x, vertices[0].y);
+    for (let index = 1; index < vertices.length; index += 1) {
+      shape.lineTo(vertices[index].x, vertices[index].y);
+    }
+    shape.closePath();
+    return shape;
+  }
+
+  _forbiddenHole(zone) {
+    const hole = new THREE.Path();
+    if (zone.shape === 'circle') {
+      hole.absarc(zone.center.x, zone.center.y, zone.radius_m, 0, Math.PI * 2, true);
+      return hole;
+    }
+    const vertices = this._forbiddenVertices(zone);
+    hole.moveTo(vertices[0].x, vertices[0].y);
+    for (let index = 1; index < vertices.length; index += 1) hole.lineTo(vertices[index].x, vertices[index].y);
+    hole.closePath();
+    return hole;
+  }
+
+  _addForbiddenSurface(zone, maskBounds) {
+    if (!this._forbiddenZoneGroup || zone.enabled === false || zone.shape === 'line') return;
+    const outside = zone.mode === 'outside';
+    let geometry;
+    let position = null;
+    if (outside) {
+      const outer = this._forbiddenShapeFromVertices([
+        { x: maskBounds.minX, y: maskBounds.minY },
+        { x: maskBounds.maxX, y: maskBounds.minY },
+        { x: maskBounds.maxX, y: maskBounds.maxY },
+        { x: maskBounds.minX, y: maskBounds.maxY },
+      ]);
+      outer.holes.push(this._forbiddenHole(zone));
+      geometry = new THREE.ShapeGeometry(outer);
+    } else if (zone.shape === 'circle') {
+      geometry = new THREE.CircleGeometry(zone.radius_m, FORBIDDEN_CIRCLE_SEGMENTS);
+      position = zone.center;
+    } else {
+      geometry = new THREE.ShapeGeometry(this._forbiddenShapeFromVertices(this._forbiddenVertices(zone)));
+    }
+    const material = new THREE.MeshBasicMaterial({
+      color: outside ? COLORS.forbiddenOutside : COLORS.forbiddenInside,
+      transparent: true,
+      opacity: outside ? 0.18 : 0.28,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = `forbidden-zone-surface-${zone.id || zone.shape}`;
+    mesh.userData.forbiddenZoneId = zone.id;
+    mesh.userData.forbiddenZoneMode = zone.mode;
+    mesh.position.set(position?.x || 0, position?.y || 0, outside ? 0.012 : 0.018);
+    mesh.renderOrder = outside ? 1 : 2;
+    this._forbiddenZoneGroup.add(mesh);
+  }
+
+  _addForbiddenBoundary(zone) {
+    if (!this._forbiddenZoneGroup) return;
+    const vertices = this._forbiddenVertices(zone);
+    const closed = zone.shape !== 'line';
+    const edgeCount = closed ? vertices.length : vertices.length - 1;
+    const width = THREE.MathUtils.clamp(Number(zone.stroke_width_m) || 0.25, 0.02, 5);
+    const height = Math.max(0.22, Math.min(0.7, width * 1.5));
+    const material = new THREE.MeshBasicMaterial({
+      color: zone.enabled === false
+        ? COLORS.forbiddenDisabled
+        : zone.mode === 'outside' ? COLORS.forbiddenOutside : COLORS.forbiddenInside,
+      transparent: true,
+      opacity: zone.enabled === false ? 0.38 : 0.82,
+      depthWrite: false,
+    });
+    for (let index = 0; index < edgeCount; index += 1) {
+      const start = vertices[index];
+      const end = vertices[(index + 1) % vertices.length];
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.hypot(dx, dy);
+      if (!Number.isFinite(length) || length <= 1e-6) continue;
+      const geometry = new THREE.BoxGeometry(length, width, height);
+      const wall = new THREE.Mesh(geometry, material);
+      wall.name = `forbidden-zone-boundary-${zone.id || zone.shape}-${index}`;
+      wall.userData.forbiddenZoneId = zone.id;
+      wall.position.set((start.x + end.x) / 2, (start.y + end.y) / 2, height / 2);
+      wall.rotation.z = Math.atan2(dy, dx);
+      wall.renderOrder = 3;
+      this._forbiddenZoneGroup.add(wall);
+    }
+  }
+
+  _rebuildForbiddenZones() {
+    if (!this._forbiddenZoneGroup) return;
+    this._clearForbiddenZones();
+    const zones = this._forbiddenZones;
+    const maskBounds = this._forbiddenMaskBounds(zones);
+    for (const zone of zones.filter((item) => item.mode === 'outside')) {
+      this._addForbiddenSurface(zone, maskBounds);
+      this._addForbiddenBoundary(zone);
+    }
+    for (const zone of zones.filter((item) => item.mode !== 'outside')) {
+      this._addForbiddenSurface(zone, maskBounds);
+      this._addForbiddenBoundary(zone);
+    }
+    this._requestRender();
+  }
+
+  updateForbiddenZones(envelope) {
+    const preferredMapVersionId = typeof window.__nuwaxMapVersionId === 'function'
+      ? window.__nuwaxMapVersionId()
+      : this._forbiddenZoneMapVersionId;
+    const entry = forbiddenZoneEntry(envelope, preferredMapVersionId);
+    if (!entry) return false;
+    const preferred = String(preferredMapVersionId || '').trim();
+    if (preferred && entry.mapVersionId && entry.mapVersionId !== preferred) return false;
+    if (
+      entry.mapVersionId === this._forbiddenZoneMapVersionId
+      && entry.generation <= this._forbiddenZoneGeneration
+    ) return false;
+    this._forbiddenZoneMapVersionId = entry.mapVersionId || preferred || null;
+    this._forbiddenZoneGeneration = entry.generation;
+    this._forbiddenZones = entry.zones.slice();
+    this._rebuildForbiddenZones();
+    return true;
+  }
+
   _applyCachedSceneState() {
     if (this._hasPointCloudSnapshot) this._rebuildPointCloud();
     if (this._robotPose) {
@@ -1026,6 +1320,7 @@ class PointCloud3DViewer {
     this.updateFrontiers(this._frontiers);
     this.updateTrajectory(this._trajectory);
     this.updateNavigationPath(this._navigationPath, this._navigationGoal);
+    this._rebuildForbiddenZones();
     this._rebuildSemanticInstances();
     this.setSemanticInstancesVisible(this._semanticInstancesVisible);
   }
@@ -1062,6 +1357,7 @@ class PointCloud3DViewer {
     this._resizeObserver?.disconnect();
     this._resizeObserver = null;
     this._disposePointsMesh();
+    this._clearForbiddenZones();
     this._clearSemanticInstances();
     this._semanticMarkerGeometry?.dispose();
     this._semanticPreciseMaterial?.dispose();
@@ -1092,6 +1388,10 @@ class PointCloud3DViewer {
     this._controls = null;
     this._robotMesh = null;
     this._frontierGroup = null;
+    this._forbiddenZoneGroup = null;
+    this._forbiddenZones = [];
+    this._forbiddenZoneMapVersionId = null;
+    this._forbiddenZoneGeneration = 0;
     this._semanticGroup = null;
     this._trajectoryLine = null;
     this._navPathLine = null;
@@ -1223,6 +1523,14 @@ window.addEventListener('pointcloud3d:semantic-visibility', (e) => {
   const detail = e.detail;
   const visible = typeof detail === 'boolean' ? detail : detail?.visible;
   window.pointcloud3d.setSemanticInstancesVisible(visible !== false);
+});
+
+window.addEventListener('forbidden-zones:updated', (e) => {
+  window.pointcloud3d.updateForbiddenZones(e.detail || {});
+});
+
+window.addEventListener('stream:navigation.forbidden_zones', (e) => {
+  window.pointcloud3d.updateForbiddenZones(e.detail || {});
 });
 
 window.addEventListener('stream:pointcloud_map.meta', (e) => {

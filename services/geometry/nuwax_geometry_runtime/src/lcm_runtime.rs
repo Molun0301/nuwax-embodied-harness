@@ -2400,6 +2400,35 @@ fn spawn_map_revision_fanout(
     );
 }
 
+fn spawn_forbidden_zone_watcher(
+    state: Arc<RwLock<SharedState>>,
+    mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+    map_revision_tx: broadcast::Sender<MapRevisionEvent>,
+    mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+) {
+    let poll_interval_ms = std::env::var("NUWAX_FORBIDDEN_ZONES_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value >= 50)
+        .unwrap_or(250);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
+            let result = mapping_adapter
+                .lock()
+                .refresh_forbidden_zones(&state, &map_revision_tx);
+            match result {
+                Ok(true) => info!("forbidden-zone update committed as canonical map revision"),
+                Ok(false) => {}
+                Err(error) => warn!(%error, "forbidden-zone watcher update failed; will retry"),
+            }
+        }
+    });
+}
+
 fn spawn_frontier_fanout(
     explore: crate::explore_runtime::ExploreRuntimeHandle,
     state: Arc<RwLock<SharedState>>,
@@ -2717,17 +2746,20 @@ pub fn spawn_geometry_runtime(
     // StartMapping RPC is the only production transition that opens ingestion.
     let mapping_adapter = if backend_available {
         let cfg = MappingAdapterConfig::from_env();
+        let forbidden_zones_path = crate::forbidden_zones::path_from_env();
         info!(
-            "mapping_adapter 已构造且等待 StartMapping: resolution={}m auto_bounds_padding=1m occupancy_algo={}",
+            "mapping_adapter 已构造且等待 StartMapping: resolution={}m auto_bounds_padding=1m occupancy_algo={} forbidden_zones_path={}",
             cfg.resolution,
-            cfg.occupancy_algo.as_dimos_str()
+            cfg.occupancy_algo.as_dimos_str(),
+            forbidden_zones_path.display()
         );
         Some(Arc::new(parking_lot::Mutex::new(
-            MappingAdapter::new_with_frames_and_sequence_store(
+            MappingAdapter::new_with_frames_sequence_store_and_forbidden_zones(
                 cfg,
                 map_frame.clone(),
                 odom_frame.clone(),
                 sequence_store.clone(),
+                forbidden_zones_path,
             ),
         )))
     } else {
@@ -3019,6 +3051,14 @@ pub fn spawn_geometry_runtime(
         fanout_mapping_adapter,
         mapping_lifecycle_lock,
     );
+    if let Some(mapping_arc) = handle.mapping_adapter.as_ref() {
+        spawn_forbidden_zone_watcher(
+            handle.state.clone(),
+            mapping_arc.clone(),
+            handle.map_revision_tx.clone(),
+            handle.mapping_lifecycle_lock.clone(),
+        );
+    }
     if let Some(mapping_arc) = mapping_adapter {
         spawn_mapping_feed_tasks(
             transport,

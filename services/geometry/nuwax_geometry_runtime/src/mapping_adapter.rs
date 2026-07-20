@@ -30,6 +30,7 @@
 //! - 该 adapter 是 `lcm_runtime.rs` 启动时调用的 `spawn_*` 之一,
 //!   接收的 channel 字符串由调用方决定,这里只在 missing 时回退到 default
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use nalgebra::Point3;
@@ -376,6 +377,19 @@ pub enum MappingLifecycleError {
     GenerationExhausted,
 }
 
+/// Exact forbidden-zone snapshot currently composed into the effective map.
+///
+/// `applied_revision` is the first canonical occupancy revision that contains
+/// `generation`/`signature`; later physical-map rebuilds may advance the map
+/// revision without changing this acknowledgement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ForbiddenZoneAck {
+    pub map_version_id: String,
+    pub generation: u64,
+    pub signature: String,
+    pub applied_revision: u64,
+}
+
 /// nuwax-mapping adapter 本体。
 ///
 /// 持有:
@@ -441,6 +455,16 @@ pub struct MappingAdapter {
     transformed_points: Vec<Point3<f64>>,
     latest_accepted_map_points: Vec<Point3<f64>>,
     checkpoint_grid: Option<OccupancyGrid>,
+    /// Optional production-only shared forbidden-zone document.
+    forbidden_zones_path: Option<PathBuf>,
+    /// Last physical occupancy grid before virtual forbidden zones are applied.
+    raw_map: Option<MapState>,
+    /// Signature of the zone set used to compose the current effective map.
+    forbidden_zone_signature: String,
+    /// Monotonic store generation represented by `forbidden_zone_signature`.
+    forbidden_zone_generation: u64,
+    /// First canonical occupancy revision composed with the current signature.
+    forbidden_zone_applied_revision: u64,
     last_built_generation: u64,
     last_built_point_count: usize,
     last_built_received_at_ns: u64,
@@ -480,6 +504,26 @@ impl MappingAdapter {
             odom_frame_id,
             Some(sequence_store),
         )
+    }
+
+    /// Construct the production adapter with a shared map-version-scoped
+    /// forbidden-zone document.  The existing constructor remains unchanged so
+    /// legacy/unit callers do not acquire filesystem behavior implicitly.
+    pub(crate) fn new_with_frames_sequence_store_and_forbidden_zones(
+        config: MappingAdapterConfig,
+        map_frame_id: impl Into<String>,
+        odom_frame_id: impl Into<String>,
+        sequence_store: Arc<SequenceStateStore>,
+        forbidden_zones_path: PathBuf,
+    ) -> Self {
+        let mut adapter = Self::new_with_frames_and_optional_sequence_store(
+            config,
+            map_frame_id,
+            odom_frame_id,
+            Some(sequence_store),
+        );
+        adapter.forbidden_zones_path = Some(forbidden_zones_path);
+        adapter
     }
 
     fn new_with_frames_and_optional_sequence_store(
@@ -537,6 +581,11 @@ impl MappingAdapter {
             transformed_points: Vec::new(),
             latest_accepted_map_points: Vec::new(),
             checkpoint_grid: None,
+            forbidden_zones_path: None,
+            raw_map: None,
+            forbidden_zone_signature: String::new(),
+            forbidden_zone_generation: 0,
+            forbidden_zone_applied_revision: 0,
             last_built_generation: 0,
             last_built_point_count: 0,
             last_built_received_at_ns: 0,
@@ -677,7 +726,7 @@ impl MappingAdapter {
                 .unwrap_or_default()
                 .as_nanos() as u64
         };
-        let map = MapState {
+        let raw_map = MapState {
             width: checkpoint.width,
             height: checkpoint.height,
             resolution: checkpoint.resolution as f32,
@@ -688,7 +737,11 @@ impl MappingAdapter {
             timestamp_ns,
             data: checkpoint.data.clone(),
         };
+        let loaded = self.load_forbidden_zones();
+        let map = self.compose_forbidden_zones(&raw_map, &loaded)?;
         self.checkpoint_grid = Some(checkpoint);
+        self.raw_map = Some(raw_map);
+        self.record_forbidden_zone_application(&loaded, next_revision);
         self.global_revision = next_revision;
         self.revision = next_revision;
         self.lifecycle.revision = next_revision;
@@ -709,6 +762,121 @@ impl MappingAdapter {
 
     pub fn is_active(&self) -> bool {
         self.lifecycle.active
+    }
+
+    /// Return the latest physical occupancy grid without virtual forbidden zones.
+    pub fn raw_map_snapshot(&self) -> Option<MapState> {
+        self.raw_map.clone()
+    }
+
+    fn load_forbidden_zones(&self) -> crate::forbidden_zones::LoadedForbiddenZones {
+        match self.forbidden_zones_path.as_deref() {
+            Some(path) => {
+                crate::forbidden_zones::load_for_map(path, &self.lifecycle.map_version_id)
+            }
+            None => crate::forbidden_zones::LoadedForbiddenZones {
+                signature: format!("disabled:{}", self.lifecycle.map_version_id),
+                generation: 0,
+                zones: Vec::new(),
+                status: crate::forbidden_zones::ZoneLoadStatus::Empty,
+            },
+        }
+    }
+
+    fn record_forbidden_zone_application(
+        &mut self,
+        loaded: &crate::forbidden_zones::LoadedForbiddenZones,
+        applied_revision: u64,
+    ) {
+        let signature_changed = loaded.signature != self.forbidden_zone_signature;
+        self.forbidden_zone_signature = loaded.signature.clone();
+        self.forbidden_zone_generation = loaded.generation;
+        if signature_changed || self.forbidden_zone_applied_revision == 0 {
+            self.forbidden_zone_applied_revision = applied_revision;
+        }
+    }
+
+    fn record_forbidden_zone_observation_without_map(
+        &mut self,
+        loaded: &crate::forbidden_zones::LoadedForbiddenZones,
+    ) {
+        self.forbidden_zone_signature = loaded.signature.clone();
+        self.forbidden_zone_generation = loaded.generation;
+        self.forbidden_zone_applied_revision = 0;
+    }
+
+    pub(crate) fn forbidden_zone_ack(&self) -> ForbiddenZoneAck {
+        ForbiddenZoneAck {
+            map_version_id: self.lifecycle.map_version_id.clone(),
+            generation: self.forbidden_zone_generation,
+            signature: self.forbidden_zone_signature.clone(),
+            applied_revision: self.forbidden_zone_applied_revision,
+        }
+    }
+
+    fn compose_forbidden_zones(
+        &self,
+        raw_map: &MapState,
+        loaded: &crate::forbidden_zones::LoadedForbiddenZones,
+    ) -> Result<MapState, String> {
+        if let crate::forbidden_zones::ZoneLoadStatus::FailClosed(reason) = &loaded.status {
+            warn!(
+                map_version_id = %self.lifecycle.map_version_id,
+                generation = loaded.generation,
+                %reason,
+                "forbidden-zone snapshot rejected; effective occupancy fails closed"
+            );
+        }
+        crate::forbidden_zones::compose_effective_map(raw_map, loaded)
+    }
+
+    /// Recompose the most recent physical grid after an atomic forbidden-zone
+    /// file replacement.  A successful update advances the canonical map
+    /// revision and therefore reaches SHM, LCM, planners, guard and exploration
+    /// through the existing fanout path.
+    pub fn refresh_forbidden_zones(
+        &mut self,
+        state: &Arc<RwLock<SharedState>>,
+        map_revision_tx: &broadcast::Sender<MapRevisionEvent>,
+    ) -> Result<bool, String> {
+        if !self.is_active() || self.forbidden_zones_path.is_none() {
+            return Ok(false);
+        }
+        let loaded = self.load_forbidden_zones();
+        if loaded.signature == self.forbidden_zone_signature {
+            return Ok(false);
+        }
+        let Some(mut raw_map) = self.raw_map.clone() else {
+            self.record_forbidden_zone_observation_without_map(&loaded);
+            return Ok(false);
+        };
+        let mut shared = state.try_write().map_err(|_| {
+            "SharedState.try_write failed during forbidden-zone refresh".to_string()
+        })?;
+        let revision_floor = shared
+            .map
+            .revision
+            .max(self.revision)
+            .max(self.global_revision);
+        let next_revision = self.reserve_next_revision(revision_floor)?;
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        raw_map.revision = next_revision;
+        raw_map.timestamp_ns = timestamp_ns;
+        let effective_map = self.compose_forbidden_zones(&raw_map, &loaded)?;
+
+        self.raw_map = Some(raw_map);
+        self.record_forbidden_zone_application(&loaded, next_revision);
+        self.global_revision = next_revision;
+        self.revision = next_revision;
+        self.lifecycle.revision = next_revision;
+        shared.map = effective_map;
+        let event = MapRevisionEvent::from_map(&shared.map, &self.lifecycle);
+        drop(shared);
+        let _ = map_revision_tx.send(event);
+        Ok(true)
     }
 
     /// 喂入一帧点云;`mapping_adapter` 不持锁跨 await,调用方负责同步。
@@ -1132,9 +1300,7 @@ impl MappingAdapter {
                     return false;
                 }
             };
-            self.global_revision = next_revision;
-            self.revision = next_revision;
-            s.map = MapState {
+            let raw_map = MapState {
                 width: grid.width,
                 height: grid.height,
                 resolution: grid.resolution as f32,
@@ -1145,6 +1311,19 @@ impl MappingAdapter {
                 timestamp_ns: self.latest_pointcloud_timestamp_ns,
                 data: grid.data,
             };
+            let loaded = self.load_forbidden_zones();
+            let effective_map = match self.compose_forbidden_zones(&raw_map, &loaded) {
+                Ok(map) => map,
+                Err(error) => {
+                    warn!(%error, "mapping_adapter: forbidden-zone composition failed closed before commit");
+                    return false;
+                }
+            };
+            self.raw_map = Some(raw_map);
+            self.record_forbidden_zone_application(&loaded, next_revision);
+            self.global_revision = next_revision;
+            self.revision = next_revision;
+            s.map = effective_map;
             self.last_built_generation = built_generation;
             self.last_built_point_count = built_point_count;
             self.last_built_received_at_ns = built_received_at_ns;
@@ -1187,6 +1366,10 @@ impl MappingAdapter {
         self.transformed_points.clear();
         self.latest_accepted_map_points.clear();
         self.checkpoint_grid = None;
+        self.raw_map = None;
+        self.forbidden_zone_signature.clear();
+        self.forbidden_zone_generation = 0;
+        self.forbidden_zone_applied_revision = 0;
         self.last_built_generation = 0;
         self.last_built_point_count = 0;
         self.last_built_received_at_ns = 0;
@@ -1693,6 +1876,95 @@ mod tests {
         assert!(s.map.revision >= 1);
         assert_eq!(s.map.width, 20);
         assert_eq!(s.map.height, 20);
+    }
+
+    #[test]
+    fn forbidden_zone_refresh_changes_effective_map_but_preserves_raw_checkpoint() {
+        let zone_path = std::env::temp_dir().join(format!(
+            "nuwax-forbidden-zone-adapter-{}-{}.json",
+            std::process::id(),
+            NEXT_SEQUENCE_TEST_PATH.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &zone_path,
+            br#"{"schema_version":1,"maps":{"mapver_000001":{"map_version_id":"mapver_000001","generation":1,"signature":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-07-19T00:00:00Z","zones":[{"id":"box","shape":"rectangle","mode":"inside","frame_id":"map","vertices":[{"x":2.0,"y":2.0},{"x":4.0,"y":4.0}],"center":null,"radius_m":null,"stroke_width_m":null,"enabled":true,"metadata":{}}]}}}"#,
+        )
+        .expect("write initial forbidden zones");
+
+        let mut adapter = active_adapter(sample_config());
+        adapter.forbidden_zones_path = Some(zone_path.clone());
+        let mut checkpoint = OccupancyGrid::with_frame(6, 6, 1.0, "map");
+        checkpoint.data.fill(0);
+        checkpoint.origin = [0.0, 0.0, 0.0];
+        checkpoint.ts = 10.0;
+        let (effective, _) = adapter
+            .install_checkpoint(checkpoint, 0)
+            .expect("install physical checkpoint with virtual zone");
+        let initial_ack = adapter.forbidden_zone_ack();
+        assert_eq!(initial_ack.map_version_id, "mapver_000001");
+        assert_eq!(initial_ack.generation, 1);
+        assert_eq!(initial_ack.signature, "a".repeat(64));
+        assert_eq!(initial_ack.applied_revision, effective.revision);
+        assert!(effective.data.iter().any(|value| *value == 100));
+        assert!(adapter
+            .raw_map_snapshot()
+            .expect("raw map")
+            .data
+            .iter()
+            .all(|value| *value == 0));
+
+        let state = Arc::new(RwLock::new(SharedState {
+            map: effective,
+            ..SharedState::default()
+        }));
+        let previous_revision = adapter.current_revision();
+        let (map_revision_tx, mut map_revision_rx) = broadcast::channel(2);
+        std::fs::write(
+            &zone_path,
+            br#"{"schema_version":1,"maps":{"mapver_000001":{"map_version_id":"mapver_000001","generation":2,"signature":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","updated_at":"2026-07-19T00:01:00Z","zones":[]}}}"#,
+        )
+        .expect("replace forbidden zones with explicit empty set");
+        assert!(adapter
+            .refresh_forbidden_zones(&state, &map_revision_tx)
+            .expect("refresh forbidden zones"));
+        assert!(adapter.current_revision() > previous_revision);
+        assert!(state
+            .try_read()
+            .expect("effective state")
+            .map
+            .data
+            .iter()
+            .all(|value| *value == 0));
+        let event = map_revision_rx.try_recv().expect("canonical refresh event");
+        assert_eq!(event.revision, adapter.current_revision());
+        assert!(event.data.iter().all(|value| *value == 0));
+        let refreshed_ack = adapter.forbidden_zone_ack();
+        assert_eq!(refreshed_ack.map_version_id, "mapver_000001");
+        assert_eq!(refreshed_ack.generation, 2);
+        assert_eq!(refreshed_ack.signature, "b".repeat(64));
+        assert_eq!(refreshed_ack.applied_revision, event.revision);
+        assert!(adapter
+            .raw_map_snapshot()
+            .expect("raw map after refresh")
+            .data
+            .iter()
+            .all(|value| *value == 0));
+
+        let mut replacement_checkpoint = OccupancyGrid::with_frame(6, 6, 1.0, "map");
+        replacement_checkpoint.data.fill(0);
+        replacement_checkpoint.origin = [0.0, 0.0, 0.0];
+        replacement_checkpoint.ts = 11.0;
+        adapter
+            .install_checkpoint(replacement_checkpoint, adapter.current_revision())
+            .expect("install later physical checkpoint with unchanged forbidden zones");
+        assert!(adapter.current_revision() > refreshed_ack.applied_revision);
+        let rebuilt_ack = adapter.forbidden_zone_ack();
+        assert_eq!(rebuilt_ack.generation, refreshed_ack.generation);
+        assert_eq!(
+            rebuilt_ack.applied_revision, refreshed_ack.applied_revision,
+            "unrelated physical-map revisions must not rewrite the causal acknowledgement"
+        );
+        let _ = std::fs::remove_file(zone_path);
     }
 
     #[test]

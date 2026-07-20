@@ -1,134 +1,578 @@
-// boundary_draw.js — V2 navigation-and-exploration-boundary §9.2
-// 手划多段线段前端模块（探索过程中实时划线）。
-//
-// 关键设计：
-// 1. SVG viewBox 跟随相机当前可见的世界米范围——线段用世界坐标画，
-//    探索中机器人移动 / 缩放 / 平移时线段自然跟随。
-// 2. SVG 默认 Y 朝下、世界坐标 Y 朝上——绘制前对线段端点做 y' = cy - y 镜像。
-// 3. 主 html 地图 IIFE 内部暴露 window.__nuwaxMapWorldViewport() 与
-//    window.__nuwaxMapDrawTick；本模块在 mount 时把 syncViewBox 注册为 tick 回调。
-// 4. 依赖主 html 暴露的钩子（必须在 boundary_draw.js 之前定义）：
-//    window.__nuwaxMapUnproject(screenX, screenY) -> {x, y, frame_id} | null
-//    window.__nuwaxMapWorldViewport() -> {cx, cy, halfX, halfY, scale, pixelWidth, pixelHeight} | null
-//    window.__nuwaxMapDrawTick（被本模块挂回调）
-//    window.__nuwaxMapToolV2.active() -> bool
-// 5. 激活时设 window.__nuwaxBoundaryActive=true，让 canvas pointerdown/move/up 提前 return。
-//
-// 探索过程中画线：
-// - canvas 每帧 requestAnimationFrame 重绘，主循环 drawMap() 末尾调 __nuwaxMapDrawTick()
-// - 本模块的 syncViewBox 被调用：拉最新 viewport → 算 viewBox 字符串 → SVG 自动重排
-// - 线段端点是世界米，跟 canvas 当前帧的世界坐标完全一致
-// - 用户拖拽时 onPointerDown/Move/Up 都调 __nuwaxMapUnproject 拿世界米，存入 segments
-// - segments 持久跨帧，redrawSegments() 在每帧 tick 里用最新 viewport 镜像 + 重画
+// Navigation forbidden-zone editor and persistent 2D overlay.
+// The backend owns the canonical document; this module only replaces the zone
+// list for the active map_version_id through /api/navigation/forbidden-zones.
 
 (function () {
   'use strict';
 
-  const EXPLORATION_API = '/api/capabilities/explore_area_v2/invoke';
+  const API_URL = '/api/navigation/forbidden-zones';
   const FRAME_ID = 'map';
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const OVERLAY_HOST_SELECTOR = '.canvas-wrap';
+  const MIN_GEOMETRY_METERS = 0.05;
+  const CIRCLE_SEGMENTS = 64;
+  const SHAPE_LABELS = Object.freeze({
+    line: '直线',
+    rectangle: '矩形',
+    circle: '圆形',
+    polygon: '自定义多边形',
+  });
+  const MODE_LABELS = Object.freeze({ inside: '内部禁行', outside: '外部禁行' });
 
   const state = {
     container: null,
-    btnToggle: null,
-    btnSubmit: null,
-    btnClear: null,
+    statusEl: null,
+    hintEl: null,
     listEl: null,
+    nameInput: null,
+    shapeSelect: null,
+    modeSelect: null,
+    widthInput: null,
+    enabledSelect: null,
+    btnToggle: null,
+    btnFinish: null,
+    btnUndo: null,
+    btnSubmit: null,
+    btnDraftClear: null,
+    btnClear: null,
     overlaySvg: null,
     overlayHost: null,
-    // 当前相机 viewport（世界米坐标系）；drawTick 每帧刷新
-    viewport: null, // {cx, cy, halfX, halfY, scale, pixelWidth, pixelHeight}
-    drawing: false,
+    overlayWidth: 0,
+    overlayHeight: 0,
+    overlayScale: 1,
+    editing: false,
+    busy: false,
     activePointerId: null,
-    currentStart: null, // world 坐标 {x, y}（Y 朝上）
-    currentEnd: null,   // 实时预览端点 {x, y}
-    segments: [],       // [{a:{x,y}, b:{x,y}}] 世界米
+    dragStart: null,
+    dragCurrent: null,
+    customVertices: [],
+    customHover: null,
+    draft: null,
+    zones: [],
+    mapVersionId: null,
+    observedMapVersionId: null,
+    mapVersionInitialized: false,
+    generation: 0,
+    signature: null,
+    updatedAt: null,
+    requestSerial: 0,
+    previousDrawTick: null,
+    resizeObserver: null,
   };
 
-  function setV2ActiveFlag(on) {
-    try { window.__nuwaxBoundaryActive = !!on; } catch (_) {}
+  function numberOrNull(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
   }
 
-  function worldFromEvent(ev) {
+  function clamp(value, minimum, maximum) {
+    return Math.min(maximum, Math.max(minimum, value));
+  }
+
+  function normalizedPoint(value) {
+    if (!value || typeof value !== 'object') return null;
+    const x = numberOrNull(value.x);
+    const y = numberOrNull(value.y);
+    return x === null || y === null ? null : { x, y };
+  }
+
+  function normalizedVertices(values) {
+    if (!Array.isArray(values)) return [];
+    return values.map(normalizedPoint).filter(Boolean);
+  }
+
+  function newZoneId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    return 'zone-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+  }
+
+  function metadataForZone(raw) {
+    const metadata = raw && raw.metadata && typeof raw.metadata === 'object'
+      ? { ...raw.metadata }
+      : {};
+    if (!metadata.name && raw && raw.name) metadata.name = String(raw.name);
+    return metadata;
+  }
+
+  function normalizeZone(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    let shape = String(raw.shape || '').trim().toLowerCase();
+    if (shape === 'custom') shape = 'polygon';
+    if (!Object.prototype.hasOwnProperty.call(SHAPE_LABELS, shape)) return null;
+
+    let vertices = normalizedVertices(raw.vertices || raw.points);
+    if (shape === 'rectangle' && vertices.length > 2) {
+      const xs = vertices.map((point) => point.x);
+      const ys = vertices.map((point) => point.y);
+      vertices = [
+        { x: Math.min(...xs), y: Math.min(...ys) },
+        { x: Math.max(...xs), y: Math.max(...ys) },
+      ];
+    }
+    const center = normalizedPoint(raw.center);
+    const radius = numberOrNull(raw.radius_m);
+    const strokeWidth = numberOrNull(raw.stroke_width_m ?? raw.line_width_m);
+    const mode = shape === 'line' ? 'inside' : raw.mode === 'outside' ? 'outside' : 'inside';
+
+    if (shape === 'line' && vertices.length !== 2) return null;
+    if (shape === 'rectangle' && vertices.length !== 2) return null;
+    if (shape === 'polygon' && vertices.length < 3) return null;
+    if (shape === 'circle' && (!center || radius === null || radius <= 0)) return null;
+
+    return {
+      id: String(raw.id || raw.zone_id || newZoneId()),
+      shape,
+      mode,
+      frame_id: String(raw.frame_id || FRAME_ID),
+      vertices: shape === 'circle' ? [] : vertices,
+      center: shape === 'circle' ? center : null,
+      radius_m: shape === 'circle' ? radius : null,
+      stroke_width_m: strokeWidth !== null && strokeWidth > 0 ? strokeWidth : 0.25,
+      enabled: raw.enabled !== false,
+      metadata: metadataForZone(raw),
+    };
+  }
+
+  function canonicalZone(zone) {
+    return {
+      id: zone.id,
+      shape: zone.shape,
+      mode: zone.shape === 'line' ? 'inside' : zone.mode,
+      frame_id: zone.frame_id || FRAME_ID,
+      vertices: (zone.vertices || []).map((point) => ({ x: point.x, y: point.y })),
+      center: zone.shape === 'circle' && zone.center
+        ? { x: zone.center.x, y: zone.center.y }
+        : null,
+      radius_m: zone.shape === 'circle' ? zone.radius_m : null,
+      stroke_width_m: zone.stroke_width_m,
+      enabled: zone.enabled !== false,
+      metadata: { ...(zone.metadata || {}) },
+    };
+  }
+
+  function unwrapEnvelope(raw) {
+    let current = raw;
+    for (let index = 0; index < 3; index += 1) {
+      if (!current || typeof current !== 'object') break;
+      if (current.maps || current.zones || current.map_version_id) break;
+      const next = current.data || current.result || current.payload;
+      if (!next || next === current) break;
+      current = next;
+    }
+    return current && typeof current === 'object' ? current : {};
+  }
+
+  function entryFromEnvelope(raw, preferredMapVersionId) {
+    const root = unwrapEnvelope(raw);
+    let entry = root;
+    let mapVersionId = String(root.map_version_id || '').trim() || null;
+    if (root.maps && typeof root.maps === 'object') {
+      const keys = Object.keys(root.maps);
+      const preferred = String(preferredMapVersionId || '').trim();
+      const selectedKey = preferred
+        ? Object.prototype.hasOwnProperty.call(root.maps, preferred) ? preferred : null
+        : keys.length === 1 ? keys[0] : null;
+      if (!selectedKey) return null;
+      entry = root.maps[selectedKey] || {};
+      mapVersionId = String(entry.map_version_id || selectedKey).trim() || null;
+    }
+    if (!entry || !Array.isArray(entry.zones)) return null;
+    return {
+      mapVersionId,
+      generation: Math.max(0, Number(entry.generation) || 0),
+      signature: String(entry.signature || '').trim() || null,
+      updatedAt: entry.updated_at || null,
+      zones: entry.zones.map(normalizeZone).filter(Boolean),
+    };
+  }
+
+  function currentEnvelope() {
+    const maps = {};
+    if (state.mapVersionId) {
+      maps[state.mapVersionId] = {
+        map_version_id: state.mapVersionId,
+        generation: state.generation,
+        signature: state.signature || '',
+        updated_at: state.updatedAt,
+        zones: state.zones.map(canonicalZone),
+      };
+    }
+    return { schema_version: 1, maps };
+  }
+
+  function currentMapVersionId() {
+    if (typeof window.__nuwaxMapVersionId !== 'function') return null;
+    const value = window.__nuwaxMapVersionId();
+    const resolved = String(value === null || value === undefined ? '' : value).trim();
+    return resolved || null;
+  }
+
+  function currentMapVersionConflict() {
+    const conflict = window.__nuwaxMapVersionConflict;
+    if (!conflict || typeof conflict !== 'object') return null;
+    const rendered = String(conflict.rendered || '').trim();
+    const active = String(conflict.active || '').trim();
+    return rendered && active && rendered !== active ? { rendered, active } : null;
+  }
+
+  function setStatus(message, stateName) {
+    if (!state.statusEl) return;
+    state.statusEl.textContent = message;
+    state.statusEl.dataset.state = stateName || '';
+    if (state.listEl) {
+      if (stateName === 'error') state.listEl.dataset.lastError = message;
+      else delete state.listEl.dataset.lastError;
+    }
+  }
+
+  function refreshStatus() {
+    if (state.busy) return;
+    const version = state.mapVersionId || '未绑定地图';
+    setStatus(version + ' · ' + state.zones.length + ' 个 · G' + state.generation, state.mapVersionId ? 'ready' : 'warning');
+  }
+
+  function setBusy(busy, message) {
+    state.busy = Boolean(busy);
+    for (const button of [state.btnToggle, state.btnFinish, state.btnUndo, state.btnSubmit, state.btnDraftClear, state.btnClear]) {
+      if (button) button.disabled = state.busy;
+    }
+    if (state.busy && message) setStatus(message, 'busy');
+    renderList();
+    syncDraftButtons();
+  }
+
+  function emitZonesUpdated() {
+    window.dispatchEvent(new CustomEvent('forbidden-zones:updated', {
+      detail: currentEnvelope(),
+    }));
+  }
+
+  function applyEntry(entry) {
+    if (!entry) return false;
+    state.mapVersionId = entry.mapVersionId || state.mapVersionId;
+    state.generation = entry.generation;
+    state.signature = entry.signature;
+    state.updatedAt = entry.updatedAt;
+    state.zones = entry.zones.slice();
+    renderList();
+    redrawOverlay();
+    refreshStatus();
+    emitZonesUpdated();
+    return true;
+  }
+
+  function errorMessage(error, fallback) {
+    if (error && error.message) return error.message;
+    return fallback;
+  }
+
+  async function fetchJson(url, options) {
+    const authenticatedUrl = typeof window.__nuwaxWithAccessToken === 'function'
+      ? window.__nuwaxWithAccessToken(url)
+      : url;
+    const response = await fetch(authenticatedUrl, options);
+    let body = null;
+    try { body = await response.json(); } catch (_) {}
+    if (!response.ok) {
+      const detail = body && (body.detail || body.error || body.message);
+      const message = typeof detail === 'string'
+        ? detail
+        : detail && detail.message ? detail.message : 'HTTP ' + response.status;
+      const error = new Error(message);
+      error.status = response.status;
+      error.body = body;
+      throw error;
+    }
+    return body || {};
+  }
+
+  async function loadZones(mapVersionId) {
+    const serial = ++state.requestSerial;
+    const requestedMapVersionId = String(mapVersionId || '').trim() || null;
+    const preservingCurrentSnapshot = requestedMapVersionId === state.mapVersionId;
+    state.mapVersionId = requestedMapVersionId;
+    if (!preservingCurrentSnapshot) {
+      state.generation = 0;
+      state.signature = null;
+      state.updatedAt = null;
+      state.zones = [];
+    }
+    clearDraft();
+    renderList();
+    redrawOverlay();
+    if (!preservingCurrentSnapshot) emitZonesUpdated();
+    setBusy(true, requestedMapVersionId ? '加载 ' + requestedMapVersionId : '解析当前地图版本');
+    const url = requestedMapVersionId
+      ? API_URL + '?map_version_id=' + encodeURIComponent(requestedMapVersionId)
+      : API_URL;
+    try {
+      const raw = await fetchJson(url, { headers: { Accept: 'application/json' } });
+      if (serial !== state.requestSerial) return;
+      const entry = entryFromEnvelope(raw, requestedMapVersionId);
+      if (!entry) throw new Error('服务端未返回禁行区地图条目');
+      if (requestedMapVersionId && entry.mapVersionId !== requestedMapVersionId) {
+        throw new Error('服务端返回了错误的 map_version_id');
+      }
+      applyEntry(entry);
+      setStatus(entry.mapVersionId + ' · ' + entry.zones.length + ' 个 · G' + entry.generation, 'ready');
+    } catch (error) {
+      if (serial !== state.requestSerial) return;
+      const suffix = preservingCurrentSnapshot
+        ? '；继续显示上次成功快照'
+        : '；当前地图禁行区状态未知';
+      setStatus(errorMessage(error, '禁行区加载失败') + suffix, 'error');
+    } finally {
+      if (serial === state.requestSerial) setBusy(false);
+    }
+  }
+
+  async function replaceZones(nextZones, successMessage) {
+    if (!state.mapVersionId) {
+      setStatus('当前没有可写入的 map_version_id', 'error');
+      return false;
+    }
+    const serial = ++state.requestSerial;
+    const mapVersionId = state.mapVersionId;
+    setBusy(true, '保存 ' + nextZones.length + ' 个禁行区');
+    try {
+      const raw = await fetchJson(API_URL, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          map_version_id: mapVersionId,
+          expected_generation: state.generation,
+          zones: nextZones.map(canonicalZone),
+        }),
+      });
+      if (serial !== state.requestSerial || state.mapVersionId !== mapVersionId) return false;
+      const entry = entryFromEnvelope(raw, mapVersionId);
+      if (!entry || entry.mapVersionId !== mapVersionId) {
+        throw new Error('服务端保存响应缺少当前地图的禁行区条目');
+      }
+      if (entry.generation < state.generation) {
+        setStatus('保存完成；已保留更新的服务端禁行区快照', 'ready');
+        return true;
+      }
+      applyEntry(entry);
+      setStatus(successMessage || '已保存', 'ready');
+      return true;
+    } catch (error) {
+      if (serial === state.requestSerial) {
+        if (error && error.status === 409 && state.mapVersionId === mapVersionId) {
+          setStatus('禁行区已被其他编辑器更新，正在重新加载', 'error');
+          await loadZones(mapVersionId);
+        } else {
+          setStatus(errorMessage(error, '禁行区保存失败'), 'error');
+        }
+      }
+      return false;
+    } finally {
+      if (serial === state.requestSerial) setBusy(false);
+    }
+  }
+
+  function syncMapVersion(force) {
+    const conflict = currentMapVersionConflict();
+    if (conflict) {
+      const conflictKey = 'conflict:' + conflict.rendered + ':' + conflict.active;
+      if (!force && state.mapVersionInitialized && state.observedMapVersionId === conflictKey) return;
+      state.mapVersionInitialized = true;
+      state.observedMapVersionId = conflictKey;
+      state.requestSerial += 1;
+      state.mapVersionId = null;
+      state.generation = 0;
+      state.signature = null;
+      state.updatedAt = null;
+      state.zones = [];
+      clearDraft();
+      renderList();
+      redrawOverlay();
+      emitZonesUpdated();
+      setBusy(false);
+      setStatus(
+        '显示地图 ' + conflict.rendered + ' 与活动地图 ' + conflict.active + ' 不一致，已禁用禁行区编辑',
+        'error',
+      );
+      return;
+    }
+    const resolved = currentMapVersionId();
+    if (!force && state.mapVersionInitialized && resolved === state.observedMapVersionId) return;
+    state.mapVersionInitialized = true;
+    state.observedMapVersionId = resolved;
+    if (!force && resolved && resolved === state.mapVersionId) return;
+    void loadZones(resolved);
+  }
+
+  function worldFromEvent(event) {
     if (typeof window.__nuwaxMapUnproject !== 'function') return null;
-    return window.__nuwaxMapUnproject(ev.clientX, ev.clientY);
+    return normalizedPoint(window.__nuwaxMapUnproject(event.clientX, event.clientY));
   }
 
-  function getViewport() {
-    if (typeof window.__nuwaxMapWorldViewport !== 'function') return null;
-    return window.__nuwaxMapWorldViewport();
+  function projectPoint(point) {
+    if (!point || typeof window.__nuwaxMapProject !== 'function') return null;
+    const projected = window.__nuwaxMapProject(point.x, point.y);
+    if (!projected || !Number.isFinite(Number(projected.x)) || !Number.isFinite(Number(projected.y))) return null;
+    if (Number.isFinite(Number(projected.scale)) && Number(projected.scale) > 0) state.overlayScale = Number(projected.scale);
+    if (Number.isFinite(Number(projected.pixelWidth))) state.overlayWidth = Number(projected.pixelWidth);
+    if (Number.isFinite(Number(projected.pixelHeight))) state.overlayHeight = Number(projected.pixelHeight);
+    return { x: Number(projected.x), y: Number(projected.y) };
   }
 
-  // 世界坐标 (Y-up) → SVG 用户坐标 (Y-down)：y' = cy - y
-  function mirrorY(point) {
-    if (!state.viewport || !point) return point;
-    return { x: point.x, y: state.viewport.cy - point.y };
+  function rectangleCorners(vertices) {
+    if (!vertices || vertices.length < 2) return [];
+    const first = vertices[0];
+    const second = vertices[1];
+    return [
+      { x: first.x, y: first.y },
+      { x: second.x, y: first.y },
+      { x: second.x, y: second.y },
+      { x: first.x, y: second.y },
+    ];
   }
 
-  function makePoint(x, y) {
-    const el = document.createElementNS(SVG_NS, 'circle');
-    el.setAttribute('cx', String(x));
-    el.setAttribute('cy', String(y));
-    el.setAttribute('r', '3');
-    el.setAttribute('fill', '#f59e0b');
-    return el;
+  function circleVertices(center, radius) {
+    const points = [];
+    for (let index = 0; index < CIRCLE_SEGMENTS; index += 1) {
+      const angle = Math.PI * 2 * index / CIRCLE_SEGMENTS;
+      points.push({ x: center.x + Math.cos(angle) * radius, y: center.y + Math.sin(angle) * radius });
+    }
+    return points;
   }
 
-  function makeLine(a, b) {
-    const el = document.createElementNS(SVG_NS, 'line');
-    el.setAttribute('x1', String(a.x));
-    el.setAttribute('y1', String(a.y));
-    el.setAttribute('x2', String(b.x));
-    el.setAttribute('y2', String(b.y));
-    el.setAttribute('stroke', '#f59e0b');
-    el.setAttribute('stroke-width', '0.15'); // 世界米单位，0.15m 视觉粗细
-    el.setAttribute('stroke-linecap', 'round');
-    return el;
+  function displayVertices(zone) {
+    if (!zone) return [];
+    if (zone.shape === 'rectangle') return rectangleCorners(zone.vertices);
+    if (zone.shape === 'circle') return circleVertices(zone.center, zone.radius_m);
+    return (zone.vertices || []).slice();
+  }
+
+  function createSvgElement(tag, attributes) {
+    const element = document.createElementNS(SVG_NS, tag);
+    for (const [name, value] of Object.entries(attributes || {})) {
+      if (value !== null && value !== undefined) element.setAttribute(name, String(value));
+    }
+    return element;
+  }
+
+  function projectedPath(points, closed) {
+    const projected = points.map(projectPoint).filter(Boolean);
+    if (projected.length < (closed ? 3 : 2)) return null;
+    const path = projected.map((point, index) => (index ? 'L' : 'M') + point.x + ' ' + point.y).join(' ');
+    return { path: path + (closed ? ' Z' : ''), points: projected };
+  }
+
+  function zoneStrokeWidth(zone) {
+    return clamp(Math.max(2, Number(zone.stroke_width_m || 0.25) * state.overlayScale), 2, 34);
+  }
+
+  function appendZoneToOverlay(zone, options) {
+    if (!state.overlaySvg || !zone) return;
+    const opts = options || {};
+    const closed = zone.shape !== 'line';
+    const pathInfo = projectedPath(displayVertices(zone), closed);
+    if (!pathInfo) return;
+    const enabled = zone.enabled !== false;
+    const outside = zone.mode === 'outside' && closed;
+    const stroke = outside ? '#a855f7' : '#ef4444';
+    const fill = outside ? '#7e22ce' : '#dc2626';
+    const opacity = opts.draft ? 0.36 : enabled ? 0.22 : 0.06;
+
+    if (enabled && closed) {
+      if (outside && state.overlayWidth > 0 && state.overlayHeight > 0) {
+        const outer = 'M0 0 H' + state.overlayWidth + ' V' + state.overlayHeight + ' H0 Z ';
+        state.overlaySvg.appendChild(createSvgElement('path', {
+          d: outer + pathInfo.path,
+          fill,
+          'fill-opacity': opts.draft ? 0.18 : 0.14,
+          'fill-rule': 'evenodd',
+          'clip-rule': 'evenodd',
+          'pointer-events': 'none',
+        }));
+      } else {
+        state.overlaySvg.appendChild(createSvgElement('path', {
+          d: pathInfo.path,
+          fill,
+          'fill-opacity': opacity,
+          'pointer-events': 'none',
+        }));
+      }
+    }
+
+    state.overlaySvg.appendChild(createSvgElement('path', {
+      d: pathInfo.path,
+      fill: 'none',
+      stroke: enabled ? stroke : '#94a3b8',
+      'stroke-width': zoneStrokeWidth(zone),
+      'stroke-linecap': 'round',
+      'stroke-linejoin': 'round',
+      'stroke-dasharray': enabled ? (opts.draft ? '10 7' : null) : '7 7',
+      'stroke-opacity': opts.draft ? 0.95 : enabled ? 0.92 : 0.65,
+      'pointer-events': 'none',
+    }));
+
+    if (opts.vertices) {
+      for (const point of pathInfo.points) {
+        state.overlaySvg.appendChild(createSvgElement('circle', {
+          cx: point.x,
+          cy: point.y,
+          r: 4.5,
+          fill: '#fef2f2',
+          stroke,
+          'stroke-width': 2,
+          'pointer-events': 'none',
+        }));
+      }
+    }
+  }
+
+  function draftPreview() {
+    if (state.draft) return state.draft;
+    const shape = selectedShape();
+    if (shape === 'polygon') {
+      const vertices = state.customVertices.slice();
+      if (state.customHover && vertices.length) vertices.push(state.customHover);
+      if (vertices.length < 2) return null;
+      return {
+        shape: vertices.length >= 3 ? 'polygon' : 'line',
+        mode: selectedMode(),
+        frame_id: FRAME_ID,
+        vertices,
+        center: null,
+        radius_m: null,
+        stroke_width_m: selectedStrokeWidth(),
+        enabled: true,
+      };
+    }
+    if (!state.dragStart || !state.dragCurrent) return null;
+    return geometryFromDrag(shape, state.dragStart, state.dragCurrent);
   }
 
   function clearOverlay() {
     if (!state.overlaySvg) return;
-    while (state.overlaySvg.firstChild) state.overlaySvg.removeChild(state.overlaySvg.firstChild);
+    state.overlaySvg.replaceChildren();
   }
 
-  function redrawSegments() {
-    if (!state.overlaySvg || !state.viewport) return;
+  function syncOverlayMetrics() {
+    const projected = typeof window.__nuwaxMapProject === 'function'
+      ? window.__nuwaxMapProject(0, 0)
+      : null;
+    const canvas = document.getElementById('mapCanvas');
+    state.overlayWidth = Number(projected && projected.pixelWidth) || Number(canvas && canvas.width) || 1;
+    state.overlayHeight = Number(projected && projected.pixelHeight) || Number(canvas && canvas.height) || 1;
+    state.overlayScale = Number(projected && projected.scale) || state.overlayScale || 1;
+    if (state.overlaySvg) state.overlaySvg.setAttribute('viewBox', '0 0 ' + state.overlayWidth + ' ' + state.overlayHeight);
+  }
+
+  function redrawOverlay() {
+    if (!state.overlaySvg) return;
+    syncOverlayMetrics();
     clearOverlay();
-    for (const seg of state.segments) {
-      const a = mirrorY(seg.a);
-      const b = mirrorY(seg.b);
-      state.overlaySvg.appendChild(makeLine(a, b));
-      state.overlaySvg.appendChild(makePoint(a.x, a.y));
-      state.overlaySvg.appendChild(makePoint(b.x, b.y));
-    }
-    // 实时预览（按下鼠标到松开前的临时线段）
-    if (state.drawing && state.currentStart && state.currentEnd) {
-      const a = mirrorY(state.currentStart);
-      const b = mirrorY(state.currentEnd);
-      state.overlaySvg.appendChild(makeLine(a, b));
-      state.overlaySvg.appendChild(makePoint(a.x, a.y));
-      state.overlaySvg.appendChild(makePoint(b.x, b.y));
-    }
-  }
-
-  function renderList() {
-    if (!state.listEl) return;
-    state.listEl.innerHTML = '';
-    if (!state.segments.length) {
-      const li = document.createElement('li');
-      li.textContent = '（暂无线段）';
-      li.style.opacity = '0.6';
-      state.listEl.appendChild(li);
-      return;
-    }
-    state.segments.forEach(function (seg, idx) {
-      const li = document.createElement('li');
-      li.textContent = '#' + (idx + 1) + ' (' +
-        seg.a.x.toFixed(2) + ',' + seg.a.y.toFixed(2) + ') -> (' +
-        seg.b.x.toFixed(2) + ',' + seg.b.y.toFixed(2) + ')';
-      state.listEl.appendChild(li);
-    });
+    for (const zone of state.zones.filter((item) => item.mode === 'outside')) appendZoneToOverlay(zone);
+    for (const zone of state.zones.filter((item) => item.mode !== 'outside')) appendZoneToOverlay(zone);
+    const preview = draftPreview();
+    if (preview) appendZoneToOverlay(preview, { draft: true, vertices: true });
   }
 
   function findOverlayHost() {
@@ -141,182 +585,296 @@
     if (state.overlaySvg && state.overlaySvg.isConnected) return state.overlaySvg;
     const host = findOverlayHost();
     if (!host) return null;
-    state.overlaySvg = document.createElementNS(SVG_NS, 'svg');
-    state.overlaySvg.id = 'boundary-draw-overlay';
-    state.overlaySvg.setAttribute('width', '100%');
-    state.overlaySvg.setAttribute('height', '100%');
-    // z-index:2 让 toolbar/legend（HUD z-index:5）仍在 SVG 上方可点
-    state.overlaySvg.style.cssText = [
+    const overlay = createSvgElement('svg', {
+      id: 'forbidden-zone-overlay',
+      width: '100%',
+      height: '100%',
+      'aria-label': '导航禁行区覆盖层',
+    });
+    overlay.style.cssText = [
       'position:absolute',
-      'left:0',
-      'top:0',
+      'inset:0',
       'width:100%',
       'height:100%',
-      'pointer-events:auto',
       'z-index:2',
-      'cursor:crosshair',
+      'pointer-events:none',
       'touch-action:none',
-      'overflow:visible',
+      'overflow:hidden',
     ].join(';');
-    state.overlaySvg.style.display = state.drawing ? 'block' : 'none';
-    host.appendChild(state.overlaySvg);
-    return state.overlaySvg;
+    host.appendChild(overlay);
+    state.overlaySvg = overlay;
+    bindOverlay(overlay);
+    state.resizeObserver = new ResizeObserver(redrawOverlay);
+    state.resizeObserver.observe(host);
+    return overlay;
   }
 
-  // drawTick 回调：每帧拉最新 viewport，更新 viewBox，重绘所有线段
-  function syncViewBox() {
-    const vp = getViewport();
-    if (!vp) {
-      state.viewport = null;
+  function selectedShape() {
+    const value = String(state.shapeSelect && state.shapeSelect.value || 'line');
+    return value === 'custom' ? 'polygon' : value;
+  }
+
+  function selectedMode() {
+    return selectedShape() === 'line' ? 'inside' : state.modeSelect && state.modeSelect.value === 'outside' ? 'outside' : 'inside';
+  }
+
+  function selectedStrokeWidth() {
+    const value = numberOrNull(state.widthInput && state.widthInput.value);
+    return value === null ? 0.25 : clamp(value, 0.02, 5);
+  }
+
+  function geometryFromDrag(shape, start, end) {
+    const distance = Math.hypot(end.x - start.x, end.y - start.y);
+    if (distance < MIN_GEOMETRY_METERS) return null;
+    const common = {
+      shape,
+      mode: shape === 'line' ? 'inside' : selectedMode(),
+      frame_id: FRAME_ID,
+      vertices: [],
+      center: null,
+      radius_m: null,
+      stroke_width_m: selectedStrokeWidth(),
+      enabled: true,
+    };
+    if (shape === 'line' || shape === 'rectangle') {
+      common.vertices = [{ ...start }, { ...end }];
+      if (shape === 'rectangle' && (Math.abs(end.x - start.x) < MIN_GEOMETRY_METERS || Math.abs(end.y - start.y) < MIN_GEOMETRY_METERS)) return null;
+      return common;
+    }
+    if (shape === 'circle') {
+      common.center = { ...start };
+      common.radius_m = distance;
+      return common;
+    }
+    return null;
+  }
+
+  function polygonAreaTwice(vertices) {
+    let sum = 0;
+    for (let index = 0; index < vertices.length; index += 1) {
+      const current = vertices[index];
+      const next = vertices[(index + 1) % vertices.length];
+      sum += current.x * next.y - next.x * current.y;
+    }
+    return Math.abs(sum);
+  }
+
+  function cross(a, b, c) {
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+  }
+
+  function pointOnSegment(point, start, end) {
+    const epsilon = 1e-10;
+    return Math.abs(cross(start, end, point)) <= epsilon
+      && point.x >= Math.min(start.x, end.x) - epsilon
+      && point.x <= Math.max(start.x, end.x) + epsilon
+      && point.y >= Math.min(start.y, end.y) - epsilon
+      && point.y <= Math.max(start.y, end.y) + epsilon;
+  }
+
+  function segmentsIntersect(a, b, c, d) {
+    const abC = cross(a, b, c);
+    const abD = cross(a, b, d);
+    const cdA = cross(c, d, a);
+    const cdB = cross(c, d, b);
+    if (abC * abD < 0 && cdA * cdB < 0) return true;
+    return pointOnSegment(c, a, b) || pointOnSegment(d, a, b)
+      || pointOnSegment(a, c, d) || pointOnSegment(b, c, d);
+  }
+
+  function polygonSelfIntersects(vertices) {
+    for (let left = 0; left < vertices.length; left += 1) {
+      const leftNext = (left + 1) % vertices.length;
+      for (let right = left + 1; right < vertices.length; right += 1) {
+        const rightNext = (right + 1) % vertices.length;
+        if (left === right || leftNext === right || rightNext === left) continue;
+        if (segmentsIntersect(vertices[left], vertices[leftNext], vertices[right], vertices[rightNext])) return true;
+      }
+    }
+    return false;
+  }
+
+  function finishPolygon() {
+    const vertices = state.customVertices.slice();
+    if (vertices.length < 3) {
+      setStatus('自定义多边形至少需要 3 个顶点', 'error');
+      return false;
+    }
+    if (polygonAreaTwice(vertices) <= 1e-8) {
+      setStatus('自定义多边形面积不能为零', 'error');
+      return false;
+    }
+    if (polygonSelfIntersects(vertices)) {
+      setStatus('自定义多边形不能自相交', 'error');
+      return false;
+    }
+    state.draft = {
+      shape: 'polygon',
+      mode: selectedMode(),
+      frame_id: FRAME_ID,
+      vertices,
+      center: null,
+      radius_m: null,
+      stroke_width_m: selectedStrokeWidth(),
+      enabled: true,
+    };
+    state.customHover = null;
+    redrawOverlay();
+    syncDraftButtons();
+    setStatus('多边形草稿已闭合，可保存', 'ready');
+    return true;
+  }
+
+  function clearDraft() {
+    state.activePointerId = null;
+    state.dragStart = null;
+    state.dragCurrent = null;
+    state.customVertices = [];
+    state.customHover = null;
+    state.draft = null;
+    syncDraftButtons();
+    redrawOverlay();
+  }
+
+  function syncDraftButtons() {
+    const custom = selectedShape() === 'polygon';
+    if (state.btnFinish) state.btnFinish.hidden = !custom;
+    if (state.btnUndo) state.btnUndo.hidden = !custom;
+    if (state.btnFinish) state.btnFinish.disabled = state.busy || state.customVertices.length < 3;
+    if (state.btnUndo) state.btnUndo.disabled = state.busy || state.customVertices.length < 1;
+  }
+
+  function syncShapeUi() {
+    const shape = selectedShape();
+    if (state.modeSelect) {
+      state.modeSelect.disabled = shape === 'line';
+      if (shape === 'line') state.modeSelect.value = 'inside';
+    }
+    if (state.hintEl) {
+      state.hintEl.textContent = shape === 'polygon'
+        ? '在地图上逐点单击，完成后保存；Esc 取消，Enter 闭合。'
+        : '在地图上按住左键拖拽生成' + SHAPE_LABELS[shape] + '。';
+    }
+    clearDraft();
+    syncDraftButtons();
+  }
+
+  function syncDraftOptions() {
+    if (state.draft) {
+      state.draft.mode = state.draft.shape === 'line' ? 'inside' : selectedMode();
+      state.draft.stroke_width_m = selectedStrokeWidth();
+    }
+    redrawOverlay();
+  }
+
+  function setV2ActiveFlag(active) {
+    try { window.__nuwaxBoundaryActive = Boolean(active); } catch (_) {}
+  }
+
+  function requestMapDraw() {
+    if (typeof window.__nuwaxMapRequestDraw === 'function') window.__nuwaxMapRequestDraw();
+  }
+
+  function is2dMapVisible() {
+    return typeof window.__nuwaxMapViewMode !== 'function' || window.__nuwaxMapViewMode() !== '3d';
+  }
+
+  function setEditing(active) {
+    const next = Boolean(active) && is2dMapVisible();
+    const overlay = ensureOverlay();
+    if (next && !overlay) {
+      setStatus('找不到地图容器 .canvas-wrap', 'error');
       return;
     }
-    state.viewport = vp;
-    if (!state.overlaySvg) return;
-    // viewBox 用世界米：cx-halfX, cy-halfY, 2*halfX, 2*halfY
-    const vb = [
-      vp.cx - vp.halfX,
-      vp.cy - vp.halfY,
-      vp.halfX * 2,
-      vp.halfY * 2,
-    ].join(' ');
-    state.overlaySvg.setAttribute('viewBox', vb);
-    // preserveAspectRatio 默认 xMidYMid meet，跟 canvas 的居中/等比一致
-    redrawSegments();
-  }
-
-  function setDrawing(on) {
-    state.drawing = !!on;
-    if (state.drawing) {
-      const overlay = ensureOverlay();
-      if (!overlay) {
-        state.drawing = false;
-        if (state.btnToggle) state.btnToggle.dataset.active = 'false';
-        if (state.listEl) state.listEl.dataset.lastError = '找不到地图容器 .canvas-wrap';
-        return;
-      }
-      overlay.style.display = 'block';
-      setV2ActiveFlag(true);
-      // V2 冻结相机：写入冻结中心 + 开关。cameraAnchor() 入口会优先判断此开关，
-      // 强制走 mapFixed 路径——canvas 不再 robotLocked 跟随 pose 旋转/平移。
-      // 冻结中心取当前 anchor.point：此刻世界米坐标系中心。
-      const anchor = (typeof window.__nuwaxCameraAnchor === 'function') ? window.__nuwaxCameraAnchor() : null;
-      if (anchor && anchor.point) {
-        window.__nuwaxMapFreezeCenter = { x: Number(anchor.point.x) || 0, y: Number(anchor.point.y) || 0 };
-      } else {
-        // 兜底：第一次划线 / 还没收到 pose 时，中心设 (0,0)
-        window.__nuwaxMapFreezeCenter = { x: 0, y: 0 };
-      }
+    state.editing = next;
+    if (state.overlaySvg) {
+      state.overlaySvg.style.pointerEvents = next ? 'auto' : 'none';
+      state.overlaySvg.style.cursor = next ? 'crosshair' : 'default';
+    }
+    setV2ActiveFlag(next);
+    if (next) {
+      const anchor = typeof window.__nuwaxCameraAnchor === 'function' ? window.__nuwaxCameraAnchor() : null;
+      const point = anchor && anchor.point ? anchor.point : { x: 0, y: 0 };
+      window.__nuwaxMapFreezeCenter = { x: Number(point.x) || 0, y: Number(point.y) || 0 };
       window.__nuwaxMapFreeze = true;
-      // 立即拉一次 viewport，不然首次画线前 SVG 还没 viewBox
-      syncViewBox();
     } else {
-      if (state.overlaySvg) state.overlaySvg.style.display = 'none';
-      state.currentStart = null;
-      state.currentEnd = null;
       state.activePointerId = null;
-      setV2ActiveFlag(false);
-      // V2 解冻：清掉开关与冻结中心，cameraAnchor() 下帧恢复 pose-locked 跟随
+      state.dragStart = null;
+      state.dragCurrent = null;
       try { window.__nuwaxMapFreeze = false; } catch (_) {}
       try { delete window.__nuwaxMapFreezeCenter; } catch (_) {}
     }
-    if (state.btnToggle) state.btnToggle.dataset.active = state.drawing ? 'true' : 'false';
-    if (state.btnToggle) state.btnToggle.textContent = state.drawing ? '停止划线' : '开始划线';
-  }
-
-  function onPointerDown(ev) {
-    if (!state.drawing) return;
-    if (ev.pointerType === 'mouse' && ev.button !== 0) return;
-    ev.preventDefault();
-    ev.stopPropagation();
-    const w = worldFromEvent(ev);
-    if (!w) return;
-    state.currentStart = { x: w.x, y: w.y };
-    state.currentEnd = { x: w.x, y: w.y };
-    state.activePointerId = ev.pointerId;
-    if (state.overlaySvg && state.overlaySvg.setPointerCapture) {
-      try { state.overlaySvg.setPointerCapture(ev.pointerId); } catch (_) {}
+    if (state.btnToggle) {
+      state.btnToggle.textContent = next ? '停止绘制' : '开始绘制';
+      state.btnToggle.dataset.active = next ? 'true' : 'false';
     }
-    redrawSegments();
+    requestMapDraw();
+    redrawOverlay();
   }
 
-  function onPointerMove(ev) {
-    if (!state.drawing || !state.currentStart) return;
-    if (state.activePointerId !== null && ev.pointerId !== state.activePointerId) return;
-    const w = worldFromEvent(ev);
-    if (!w) return;
-    state.currentEnd = { x: w.x, y: w.y };
-    redrawSegments();
-  }
-
-  function onPointerUp(ev) {
-    if (!state.drawing || !state.currentStart) return;
-    if (state.activePointerId !== null && ev.pointerId !== state.activePointerId) return;
-    const w = worldFromEvent(ev);
-    if (!w) return;
-    // 拖拽距离 < 5cm 视为误点，不入段
-    const dx = w.x - state.currentStart.x;
-    const dy = w.y - state.currentStart.y;
-    if (Math.hypot(dx, dy) >= 0.05) {
-      state.segments.push({
-        a: { x: state.currentStart.x, y: state.currentStart.y },
-        b: { x: w.x, y: w.y },
-      });
-      renderList();
-    }
-    state.currentStart = null;
-    state.currentEnd = null;
-    state.activePointerId = null;
-    if (state.overlaySvg && state.overlaySvg.releasePointerCapture) {
-      try { state.overlaySvg.releasePointerCapture(ev.pointerId); } catch (_) {}
-    }
-    redrawSegments();
-  }
-
-  function onPointerCancel(ev) {
-    if (!state.drawing) return;
-    state.currentStart = null;
-    state.currentEnd = null;
-    state.activePointerId = null;
-    redrawSegments();
-  }
-
-  function clearAll() {
-    state.segments = [];
-    state.currentStart = null;
-    state.currentEnd = null;
-    state.activePointerId = null;
-    redrawSegments();
-    renderList();
-  }
-
-  function submitBoundary() {
-    if (state.segments.length < 1) {
-      if (state.listEl) state.listEl.dataset.lastError = '至少需要 1 段线段';
+  function onPointerDown(event) {
+    if (!state.editing || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = worldFromEvent(event);
+    if (!point) return;
+    if (selectedShape() === 'polygon') {
+      const previous = state.customVertices[state.customVertices.length - 1];
+      if (!previous || Math.hypot(point.x - previous.x, point.y - previous.y) >= MIN_GEOMETRY_METERS) {
+        state.customVertices.push(point);
+        state.draft = null;
+      }
+      state.customHover = point;
+      syncDraftButtons();
+      redrawOverlay();
       return;
     }
-    const payload = {
-      boundary_line_segments: state.segments.map(function (seg) {
-        return [
-          { x: seg.a.x, y: seg.a.y, yaw: 0.0, frame_id: FRAME_ID },
-          { x: seg.b.x, y: seg.b.y, yaw: 0.0, frame_id: FRAME_ID },
-        ];
-      }),
-    };
-    fetch(EXPLORATION_API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ arguments: payload }),
-    }).then(function (r) { return r.json(); }).then(function (resp) {
-      if (state.listEl) {
-        state.listEl.dataset.lastSubmit = JSON.stringify({
-          at: new Date().toISOString(),
-          ok: !(resp && resp.ok === false),
-          task_id: (resp && (resp.task_id || resp.id)) || null,
-        });
+    state.activePointerId = event.pointerId;
+    state.dragStart = point;
+    state.dragCurrent = point;
+    state.draft = null;
+    try { state.overlaySvg.setPointerCapture(event.pointerId); } catch (_) {}
+    redrawOverlay();
+  }
+
+  function onPointerMove(event) {
+    if (!state.editing) return;
+    const point = worldFromEvent(event);
+    if (!point) return;
+    if (selectedShape() === 'polygon') {
+      if (state.customVertices.length) {
+        state.customHover = point;
+        redrawOverlay();
       }
-    }).catch(function (err) {
-      if (state.listEl) state.listEl.dataset.lastError = String(err);
-    });
+      return;
+    }
+    if (!state.dragStart || (state.activePointerId !== null && event.pointerId !== state.activePointerId)) return;
+    state.dragCurrent = point;
+    redrawOverlay();
+  }
+
+  function onPointerUp(event) {
+    if (!state.editing || selectedShape() === 'polygon' || !state.dragStart) return;
+    if (state.activePointerId !== null && event.pointerId !== state.activePointerId) return;
+    event.preventDefault();
+    const point = worldFromEvent(event) || state.dragCurrent;
+    state.draft = point ? geometryFromDrag(selectedShape(), state.dragStart, point) : null;
+    state.dragStart = null;
+    state.dragCurrent = null;
+    state.activePointerId = null;
+    try { state.overlaySvg.releasePointerCapture(event.pointerId); } catch (_) {}
+    if (!state.draft) setStatus('几何尺寸过小，请重新绘制', 'error');
+    else setStatus('草稿已生成，可保存', 'ready');
+    redrawOverlay();
+  }
+
+  function onPointerCancel(event) {
+    if (!state.editing) return;
+    state.activePointerId = null;
+    state.dragStart = null;
+    state.dragCurrent = null;
+    try { state.overlaySvg.releasePointerCapture(event.pointerId); } catch (_) {}
+    redrawOverlay();
   }
 
   function bindOverlay(overlay) {
@@ -326,36 +884,202 @@
     overlay.addEventListener('pointercancel', onPointerCancel);
   }
 
+  function zoneName(zone) {
+    return String(zone && zone.metadata && zone.metadata.name || zone && zone.id || '未命名禁行区');
+  }
+
+  function renderList() {
+    if (!state.listEl) return;
+    state.listEl.replaceChildren();
+    if (!state.zones.length) {
+      const empty = document.createElement('li');
+      empty.className = 'forbidden-zone-empty';
+      empty.textContent = '当前地图版本暂无禁行区。';
+      state.listEl.appendChild(empty);
+      return;
+    }
+    for (const zone of state.zones) {
+      const item = document.createElement('li');
+      item.className = 'forbidden-zone-item';
+      const main = document.createElement('span');
+      main.className = 'forbidden-zone-item-main';
+      const name = document.createElement('span');
+      name.className = 'forbidden-zone-item-name';
+      name.textContent = zoneName(zone);
+      const meta = document.createElement('span');
+      meta.className = 'forbidden-zone-item-meta';
+      meta.textContent = (zone.enabled ? '' : '停用 · ') + SHAPE_LABELS[zone.shape] + ' · ' + MODE_LABELS[zone.mode];
+      main.append(name, meta);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = '删除';
+      remove.disabled = state.busy;
+      remove.addEventListener('click', function () { void deleteZone(zone.id); });
+      item.append(main, remove);
+      state.listEl.appendChild(item);
+    }
+  }
+
+  function draftAsZone() {
+    if (selectedShape() === 'polygon' && !state.draft && !finishPolygon()) return null;
+    if (!state.draft) return null;
+    const name = String(state.nameInput && state.nameInput.value || '').trim();
+    if (!name) {
+      setStatus('禁行区名称不能为空', 'error');
+      return null;
+    }
+    return normalizeZone({
+      ...state.draft,
+      id: newZoneId(),
+      mode: state.draft.shape === 'line' ? 'inside' : selectedMode(),
+      stroke_width_m: selectedStrokeWidth(),
+      enabled: !state.enabledSelect || state.enabledSelect.value !== 'false',
+      metadata: {
+        name,
+        created_by: 'debug_panel',
+      },
+    });
+  }
+
+  async function saveDraft() {
+    const zone = draftAsZone();
+    if (!zone) {
+      if (!state.draft) setStatus('请先在地图上绘制禁行区', 'error');
+      return;
+    }
+    const saved = await replaceZones(state.zones.concat(zone), '禁行区已保存');
+    if (!saved) return;
+    clearDraft();
+    if (state.nameInput) state.nameInput.value = '禁行区 ' + (state.zones.length + 1);
+  }
+
+  async function deleteZone(zoneId) {
+    const next = state.zones.filter((zone) => zone.id !== zoneId);
+    if (next.length === state.zones.length) return;
+    await replaceZones(next, '禁行区已删除');
+  }
+
+  async function clearAllZones() {
+    if (!state.zones.length) {
+      clearDraft();
+      return;
+    }
+    const cleared = await replaceZones([], '已清空当前地图的禁行区');
+    if (cleared) clearDraft();
+  }
+
+  function undoPolygonVertex() {
+    if (state.draft) state.draft = null;
+    state.customVertices.pop();
+    state.customHover = null;
+    syncDraftButtons();
+    redrawOverlay();
+  }
+
+  function syncMapView() {
+    const is2d = is2dMapVisible();
+    if (state.overlaySvg) state.overlaySvg.style.display = is2d ? 'block' : 'none';
+    if (!is2d) {
+      setEditing(false);
+      if (state.container) state.container.hidden = true;
+      document.getElementById('mapBoundaryToggle')?.classList.remove('active');
+    } else {
+      redrawOverlay();
+    }
+  }
+
+  function onDrawTick() {
+    syncMapVersion(false);
+    syncMapView();
+    redrawOverlay();
+  }
+
+  function onForbiddenZonesStream(event) {
+    const preferred = currentMapVersionId() || state.mapVersionId;
+    const entry = entryFromEnvelope(event.detail, preferred);
+    if (!entry) return;
+    if (preferred && entry.mapVersionId && entry.mapVersionId !== preferred) return;
+    if (entry.mapVersionId === state.mapVersionId && entry.generation <= state.generation) return;
+    applyEntry(entry);
+  }
+
+  function onKeyDown(event) {
+    if (!state.editing) return;
+    if (event.key === 'Escape') {
+      clearDraft();
+      event.preventDefault();
+    } else if (event.key === 'Enter' && selectedShape() === 'polygon') {
+      finishPolygon();
+      event.preventDefault();
+    }
+  }
+
   function mount() {
     state.container = document.getElementById('boundary-draw-container');
     if (!state.container) return;
-    state.btnToggle = state.container.querySelector('[data-role="boundary-toggle"]');
-    state.btnSubmit = state.container.querySelector('[data-role="boundary-submit"]');
-    state.btnClear = state.container.querySelector('[data-role="boundary-clear"]');
+    state.statusEl = state.container.querySelector('[data-role="boundary-status"]');
+    state.hintEl = state.container.querySelector('[data-role="boundary-hint"]');
     state.listEl = state.container.querySelector('[data-role="boundary-list"]');
-    if (state.btnToggle) {
-      state.btnToggle.addEventListener('click', function () { setDrawing(!state.drawing); });
-      state.btnToggle.textContent = '开始划线';
-      state.btnToggle.dataset.active = 'false';
-    }
-    if (state.btnSubmit) state.btnSubmit.addEventListener('click', submitBoundary);
-    if (state.btnClear) state.btnClear.addEventListener('click', clearAll);
-    const overlay = ensureOverlay();
-    if (overlay) bindOverlay(overlay);
-    // 注册为 draw tick 回调：每帧同步 viewBox + 重绘
-    window.__nuwaxMapDrawTick = syncViewBox;
+    state.nameInput = state.container.querySelector('[data-role="boundary-name"]');
+    state.shapeSelect = state.container.querySelector('[data-role="boundary-shape"]');
+    state.modeSelect = state.container.querySelector('[data-role="boundary-mode"]');
+    state.widthInput = state.container.querySelector('[data-role="boundary-width"]');
+    state.enabledSelect = state.container.querySelector('[data-role="boundary-enabled"]');
+    state.btnToggle = state.container.querySelector('[data-role="boundary-toggle"]');
+    state.btnFinish = state.container.querySelector('[data-role="boundary-finish"]');
+    state.btnUndo = state.container.querySelector('[data-role="boundary-undo"]');
+    state.btnSubmit = state.container.querySelector('[data-role="boundary-submit"]');
+    state.btnDraftClear = state.container.querySelector('[data-role="boundary-draft-clear"]');
+    state.btnClear = state.container.querySelector('[data-role="boundary-clear"]');
+
+    ensureOverlay();
+    state.shapeSelect?.addEventListener('change', syncShapeUi);
+    state.modeSelect?.addEventListener('change', syncDraftOptions);
+    state.widthInput?.addEventListener('input', syncDraftOptions);
+    state.btnToggle?.addEventListener('click', function () { setEditing(!state.editing); });
+    state.btnFinish?.addEventListener('click', finishPolygon);
+    state.btnUndo?.addEventListener('click', undoPolygonVertex);
+    state.btnSubmit?.addEventListener('click', function () { void saveDraft(); });
+    state.btnDraftClear?.addEventListener('click', clearDraft);
+    state.btnClear?.addEventListener('click', function () { void clearAllZones(); });
+    document.addEventListener('keydown', onKeyDown);
+
+    const boundaryButton = document.getElementById('mapBoundaryToggle');
+    const navigationButton = document.getElementById('mapNavToggle');
+    const mapModeButton = document.getElementById('mapModeToggle');
+    boundaryButton?.addEventListener('click', function () {
+      queueMicrotask(function () { if (state.container.hidden) setEditing(false); });
+    });
+    navigationButton?.addEventListener('click', function () {
+      queueMicrotask(function () { if (state.container.hidden) setEditing(false); });
+    });
+    mapModeButton?.addEventListener('click', function () { queueMicrotask(syncMapView); });
+
+    state.previousDrawTick = window.__nuwaxMapDrawTick;
+    window.__nuwaxMapDrawTick = function () {
+      if (typeof state.previousDrawTick === 'function') state.previousDrawTick();
+      onDrawTick();
+    };
+    window.addEventListener('stream:navigation.forbidden_zones', onForbiddenZonesStream);
+    window.addEventListener('stream:map.frame', function () { syncMapVersion(false); });
+    window.addEventListener('stream:map.heartbeat', function () { syncMapVersion(false); });
+    window.addEventListener('stream:runtime.governance', function () { syncMapVersion(false); });
+    window.addEventListener('stream:pointcloud_map.meta', function () { syncMapVersion(false); });
+
+    syncShapeUi();
     renderList();
+    syncMapView();
+    syncMapVersion(true);
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', mount);
-  } else {
-    mount();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);
+  else mount();
 
   window.__nuwaxBoundaryDrawModule = {
-    getSegments: function () { return state.segments.slice(); },
-    setDrawing: setDrawing,
-    clear: clearAll,
+    clearDraft,
+    getEnvelope: currentEnvelope,
+    getZones: function () { return state.zones.map(canonicalZone); },
+    reload: function () { syncMapVersion(true); },
+    setDrawing: setEditing,
   };
 })();

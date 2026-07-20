@@ -658,6 +658,10 @@ def _nav_readiness_disconnected_dict(message: str = "未连接") -> Dict[str, An
         "motion_sink_generation": None,
         "map_frame": None,
         "pose_frame": None,
+        "forbidden_zone_map_version_id": None,
+        "forbidden_zone_generation": None,
+        "forbidden_zone_signature": None,
+        "forbidden_zone_applied_revision": None,
     }
 
 
@@ -2269,6 +2273,33 @@ class GeometryRuntimeProvider:
             _log_rpc_error("GetOccupancyGridData", e)
             return None
 
+    def get_raw_occupancy_grid_data(self) -> Optional[Dict[str, Any]]:
+        """获取未叠加虚拟禁行区的物理 OccupancyGrid 数据。"""
+
+        self._raise_if_stopping("get_raw_occupancy_grid_data")
+        if not self._stub:
+            return None
+        rpc = getattr(self._stub, "GetRawOccupancyGridData", None)
+        if not callable(rpc):
+            return None
+        try:
+            resp = rpc(pb2.Empty(), timeout=_heavy_deadline_sec())
+            meta = resp.meta
+            return {
+                "width": meta.width,
+                "height": meta.height,
+                "resolution": meta.resolution,
+                "origin_x": meta.origin_x,
+                "origin_y": meta.origin_y,
+                "frame_id": meta.frame_id,
+                "revision": meta.revision,
+                "timestamp_ns": meta.timestamp_ns,
+                "data": bytes(resp.data),
+            }
+        except grpc.RpcError as e:
+            _log_rpc_error("GetRawOccupancyGridData", e)
+            return None
+
     @staticmethod
     def _occupancy_grid_from_components(
         *,
@@ -2373,6 +2404,28 @@ class GeometryRuntimeProvider:
                 self._last_occupancy_grid = grid.model_copy(deep=True)
                 self._last_occupancy_grid_identity = request_identity
         return grid
+
+    def get_raw_occupancy_grid(self) -> Optional[OccupancyGrid]:
+        """返回物理栅格，供地图版本持久化避免烘焙虚拟禁行区。"""
+
+        payload = self.get_raw_occupancy_grid_data()
+        if payload is None:
+            return None
+        try:
+            return self._occupancy_grid_from_components(
+                width=int(payload["width"]),
+                height=int(payload["height"]),
+                resolution=float(payload["resolution"]),
+                origin_x=float(payload["origin_x"]),
+                origin_y=float(payload["origin_y"]),
+                frame_id=str(payload["frame_id"]),
+                revision=int(payload["revision"]),
+                timestamp_ns=int(payload.get("timestamp_ns") or 0),
+                data=bytes(payload["data"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            LOGGER.exception("GetRawOccupancyGridData 返回了无效物理栅格。")
+            return None
 
     def get_cost_map(self):
         """Rust facade 当前没有独立 cost-map RPC。"""
@@ -2592,8 +2645,25 @@ class GeometryRuntimeProvider:
                     ),
                     "map_frame": str(getattr(resp, "map_frame", "") or ""),
                     "pose_frame": str(getattr(resp, "pose_frame", "") or ""),
+                    "forbidden_zone_map_version_id": str(
+                        getattr(resp, "forbidden_zone_map_version_id", "") or ""
+                    ),
+                    "forbidden_zone_generation": int(
+                        getattr(resp, "forbidden_zone_generation", 0) or 0
+                    ),
+                    "forbidden_zone_signature": str(
+                        getattr(resp, "forbidden_zone_signature", "") or ""
+                    ),
+                    "forbidden_zone_applied_revision": int(
+                        getattr(resp, "forbidden_zone_applied_revision", 0) or 0
+                    ),
                 }
             )
+            planner_costmap_revision = int(
+                getattr(resp, "planner_costmap_revision", 0) or 0
+            )
+            if planner_costmap_revision > 0:
+                readiness["costmap_revision"] = planner_costmap_revision
             return readiness
         except grpc.RpcError as e:
             _log_rpc_error("GetNavigationReadiness", e)

@@ -62,6 +62,7 @@
   "NUWAX_MAPPING_VOXEL_SIZE": "nuwax-mapping 适配器·点云体素大小(米,默认 0.05)",
   "NUWAX_CLOUDMAP_SHM_PATH": "cloud_map 共享内存映射文件路径（services/geometry/runtime.py:2785 默认 /tmp/nuwax_cloudmap.mmap）",
   "NUWAX_OCCUPANCY_SHM_PATH": "occupancy 共享内存映射文件路径（services/geometry/runtime.py:2782 默认 /tmp/nuwax_occupancy.mmap）",
+  "NUWAX_FORBIDDEN_ZONES_PATH": "地图版本级禁行区 JSON 文件路径（Gateway 原子写，Geometry Runtime 监听）",
   "NUWAX_VIDEO_SHM_PATH": "视频共享内存路径（gateways/ws/data_streams.py:129、services/geometry/geometry_runtime_client.py:116 默认 /tmp/nuwax_video.shm）",
   "NUWAX_VIDEO_UDS_PATH": "视频 Unix domain socket 路径（drivers/go2/video_streamer.py:89 默认 /tmp/nuwax_video.sock）",
   "NUWAX_GOOGLE_MAPS_API_KEY": "地图云·Google Maps API Key（Rust crate 自管,Python 端不消费；空值禁用云端瓦片）",

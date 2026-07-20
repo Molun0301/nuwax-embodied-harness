@@ -15,9 +15,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.forbidden_zones import ReplaceForbiddenZonesRequest
 from contracts.navigation import NavigationGoal
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
+from gateways.feedback import build_task_summary
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable
 from gateways.tcp_legacy.policy import build_tcp_legacy_policy
@@ -598,9 +600,37 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         history_limit: int = 20,
     ) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
+        bounded_history_limit = min(max(int(history_limit), 0), 100)
+
+        def _summary_for_status(status: Any) -> Dict[str, Any]:
+            task_id = str(_payload_value(status, "task_id", "") or "").strip()
+            spec = None
+            error_payload = None
+            if task_id:
+                try:
+                    spec = runtime.task_manager.get_task_spec(task_id)
+                except (KeyError, AttributeError):
+                    spec = None
+                try:
+                    error_payload = runtime.task_manager.get_task_error_payload(task_id)
+                except (KeyError, AttributeError):
+                    error_payload = None
+            return build_task_summary(
+                status,
+                spec=spec,
+                error_payload=error_payload,
+            )
+
         return {
-            "active_tasks": to_jsonable(runtime.task_manager.list_active_tasks()),
-            "history_tasks": to_jsonable(runtime.task_manager.list_history(limit=history_limit)),
+            "active_tasks": [
+                _summary_for_status(status)
+                for status in runtime.task_manager.list_active_tasks()
+            ],
+            "history_tasks": [
+                _summary_for_status(status)
+                for status in runtime.task_manager.list_history(limit=bounded_history_limit)
+            ],
+            "history_limit": bounded_history_limit,
         }
 
     @router.get("/api/tasks/{task_id}")
@@ -877,6 +907,38 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_navigation_latest(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
+
+    @router.get("/api/navigation/forbidden-zones")
+    async def api_navigation_forbidden_zones_get(
+        request: Request,
+        map_version_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        try:
+            envelope = await run_in_threadpool(
+                runtime.navigation_service.list_forbidden_zones,
+                map_version_id=map_version_id,
+            )
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+        return to_jsonable(envelope)
+
+    @router.put("/api/navigation/forbidden-zones")
+    async def api_navigation_forbidden_zones_put(
+        request: Request,
+        body: ReplaceForbiddenZonesRequest,
+    ) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        try:
+            envelope = await run_in_threadpool(
+                runtime.navigation_service.replace_forbidden_zones,
+                map_version_id=body.map_version_id,
+                zones=body.zones,
+                expected_generation=body.expected_generation,
+            )
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+        return to_jsonable(envelope)
 
     @router.post("/api/navigation/goal")
     async def api_navigation_goal(request: Request, goal: NavigationGoalRequest) -> Dict[str, Any]:

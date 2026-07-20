@@ -858,6 +858,7 @@ def write_systemd_example(planner: BootstrapPlanner) -> Path:
         Environment=NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready
         Environment=NUWAX_GEOMETRY_RUNTIME_PORT=50051
         Environment=NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30
+        Environment=NUWAX_FORBIDDEN_ZONES_PATH=/var/lib/nuwax_robot_bridge/forbidden_zones.json
         Environment=NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true
         Environment=NUWAX_PERSON_FOLLOW_TARGET_CHANNEL=/person_follow_target
         Environment=NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL=/global_map

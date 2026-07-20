@@ -20,6 +20,7 @@
 // Phase 4: `pub` 而非私有 —— 兄弟模块(lcm_runtime/server)需要 `crate::channel_registry::*`。
 pub mod channel_registry;
 mod explore_runtime;
+mod forbidden_zones;
 mod lcm_runtime;
 // W41 (Bug #2 fix): `map_checksum` 模块是 W37 (RALPLAN §Phase M #3) 新增
 // 的 SHA-256 helper,供 `mapping_adapter::build_and_publish` 算 checksum

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 import logging
 import threading
 import time
 
 from contracts.events import RuntimeEventCategory
+from contracts.forbidden_zones import ForbiddenZone, ForbiddenZonesEnvelope
 from contracts.map_workspace import MapAssetStatus
 from contracts.runtime_views import LocalizationSessionStatus
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
@@ -15,8 +17,9 @@ from core.errors import GatewayError
 from providers import ExplorationProvider, NavigationProvider
 from services.localization import LocalizationService
 from services.mapping.service import MappingService
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, Optional, Sequence, Tuple
 
+from .forbidden_zones import ForbiddenZoneStore
 from .state_machine import (
     NavigationStateMachine,
     NavigationDiagnostics,
@@ -24,6 +27,31 @@ from .state_machine import (
 )
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.navigation.service")
+
+
+@dataclass(frozen=True)
+class _ForbiddenZoneRuntimeAck:
+    map_version_id: str
+    generation: int
+    signature: str
+    applied_revision: int
+    planner_revision: int
+
+    def confirms(
+        self,
+        *,
+        map_version_id: str,
+        generation: int,
+        signature: str,
+    ) -> bool:
+        return bool(
+            self.map_version_id == map_version_id
+            and self.generation == generation
+            and self.signature == signature
+            and signature
+            and self.applied_revision > 0
+            and self.planner_revision >= self.applied_revision
+        )
 
 
 def _is_complete_exploration_terminal(
@@ -71,6 +99,7 @@ class NavigationService:
         stream_bus: Optional[StreamBus] = None,
         history_limit: int = 100,
         navigation_state_machine: Optional[NavigationStateMachine] = None,
+        forbidden_zone_store: Optional[ForbiddenZoneStore] = None,
     ) -> None:
         self._provider_owner = provider_owner
         self._localization_service = localization_service
@@ -78,6 +107,7 @@ class NavigationService:
         self._state_store = state_store
         self._event_bus = event_bus
         self._stream_bus = stream_bus
+        self._forbidden_zone_store = forbidden_zone_store or ForbiddenZoneStore()
         self._navigation_history: Deque[NavigationContext] = deque(maxlen=max(1, history_limit))
         self._exploration_history: Deque[ExplorationContext] = deque(maxlen=max(1, history_limit))
         self._latest_navigation_context: Optional[NavigationContext] = None
@@ -85,6 +115,15 @@ class NavigationService:
         self._current_goal: Optional[NavigationGoal] = None
         self._current_explore_request: Optional[ExploreAreaRequest] = None
         self._pending_explore_request_id: Optional[str] = None
+        self._forbidden_zone_update_lock = threading.Lock()
+        self._forbidden_zone_update_active = False
+        self._forbidden_zone_required_generation: Optional[int] = None
+        self._forbidden_zone_required_signature: Optional[str] = None
+        self._forbidden_zone_required_map_version_id: Optional[str] = None
+        self._forbidden_zone_cancel_wait_timeout_sec = 5.0
+        self._forbidden_zone_cancel_poll_interval_sec = 0.05
+        self._forbidden_zone_revision_wait_timeout_sec = 2.0
+        self._forbidden_zone_revision_poll_interval_sec = 0.05
         # 平台导航状态机
         self._state_machine: NavigationStateMachine = navigation_state_machine or create_navigation_state_machine()
         self._last_navigation_diagnostics: Optional[NavigationDiagnostics] = None
@@ -96,6 +135,940 @@ class NavigationService:
         self._last_localization_refresh_monotonic: Optional[float] = None
         self._subscribe_provider_navigation_updates()
         self._subscribe_provider_exploration_updates()
+
+    def list_forbidden_zones(
+        self,
+        map_version_id: Optional[str] = None,
+    ) -> ForbiddenZonesEnvelope:
+        """返回指定地图版本的禁行区；省略版本时解析当前活动地图。"""
+
+        resolved_map_version_id = self._resolve_forbidden_zone_map_version_id(map_version_id)
+        return self._forbidden_zone_store.list_for_map(resolved_map_version_id)
+
+    def replace_forbidden_zones(
+        self,
+        *,
+        map_version_id: str,
+        zones: Sequence[ForbiddenZone],
+        expected_generation: Optional[int] = None,
+    ) -> ForbiddenZonesEnvelope:
+        """原子替换禁行区；活动地图更新前先停止旧 revision 上的运动任务。"""
+
+        resolved_map_version_id = str(map_version_id or "").strip()
+        if not resolved_map_version_id:
+            raise GatewayError(
+                "map_version_id 不能为空。",
+                error_code="map_version_id_required",
+                http_status=400,
+            )
+        zone_snapshot = tuple(zones)
+        update_lock = getattr(self, "_forbidden_zone_update_lock", None)
+        if update_lock is None:
+            update_lock = threading.Lock()
+            self._forbidden_zone_update_lock = update_lock
+        with update_lock:
+            self._preflight_forbidden_zone_generation(
+                map_version_id=resolved_map_version_id,
+                expected_generation=expected_generation,
+            )
+            if self._forbidden_zone_update_affects_active_map(
+                resolved_map_version_id
+            ):
+                envelope = self._replace_active_map_forbidden_zones(
+                    map_version_id=resolved_map_version_id,
+                    zones=zone_snapshot,
+                    expected_generation=expected_generation,
+                )
+            else:
+                envelope = self._replace_inactive_map_forbidden_zones(
+                    map_version_id=resolved_map_version_id,
+                    zones=zone_snapshot,
+                    expected_generation=expected_generation,
+                )
+            entry = envelope.maps[resolved_map_version_id]
+            if self._stream_bus is not None:
+                self._stream_bus.publish(
+                    "navigation.forbidden_zones",
+                    source="navigation_service",
+                    payload=envelope,
+                    frame_id="map",
+                    sequence=entry.generation,
+                    revision=str(entry.generation),
+                    status="available",
+                    metadata={
+                        "map_version_id": resolved_map_version_id,
+                        "generation": entry.generation,
+                        "zone_count": len(entry.zones),
+                    },
+                )
+            return envelope
+
+    def _preflight_forbidden_zone_generation(
+        self,
+        *,
+        map_version_id: str,
+        expected_generation: Optional[int],
+    ) -> int:
+        """在任何取消动作前验证 store 可读且 CAS generation 匹配。"""
+
+        envelope = self._forbidden_zone_store.list_for_map(map_version_id)
+        current_generation = envelope.maps[map_version_id].generation
+        if (
+            expected_generation is not None
+            and expected_generation != current_generation
+        ):
+            raise GatewayError(
+                "禁行区已被其他编辑器更新，请重新加载后再保存。",
+                error_code="forbidden_zones_generation_conflict",
+                http_status=409,
+                details={
+                    "map_version_id": map_version_id,
+                    "expected_generation": expected_generation,
+                    "current_generation": current_generation,
+                },
+            )
+        return current_generation
+
+    def _replace_inactive_map_forbidden_zones(
+        self,
+        *,
+        map_version_id: str,
+        zones: Sequence[ForbiddenZone],
+        expected_generation: Optional[int],
+    ) -> ForbiddenZonesEnvelope:
+        state_lock = self._forbidden_zone_state_lock()
+        with state_lock:
+            self._forbidden_zone_update_active = True
+        try:
+            return self._forbidden_zone_store.replace(
+                map_version_id=map_version_id,
+                zones=zones,
+                expected_generation=expected_generation,
+            )
+        finally:
+            with state_lock:
+                self._forbidden_zone_update_active = False
+
+    def _forbidden_zone_update_affects_active_map(
+        self,
+        map_version_id: str,
+    ) -> bool:
+        """仅为会被当前 Geometry Runtime 消费的地图建立运动栅栏。"""
+
+        active_map_version_ids = set()
+        active_map_lookup_failed = False
+        localization_service = getattr(self, "_localization_service", None)
+        if localization_service is not None:
+            try:
+                active_session = localization_service.get_active_session()
+            except Exception:
+                active_session = None
+                active_map_lookup_failed = True
+            active_map_version_id = str(
+                getattr(active_session, "map_version_id", "") or ""
+            ).strip()
+            if active_map_version_id:
+                active_map_version_ids.add(active_map_version_id)
+
+        mapping_service = getattr(self, "_mapping_service", None)
+        if mapping_service is not None:
+            try:
+                map_snapshot = mapping_service.get_latest_snapshot()
+            except Exception:
+                map_snapshot = None
+                active_map_lookup_failed = True
+            active_map_version_id = str(
+                getattr(map_snapshot, "version_id", "") or ""
+            ).strip()
+            if active_map_version_id:
+                active_map_version_ids.add(active_map_version_id)
+            snapshot_metadata = getattr(map_snapshot, "metadata", None)
+            if isinstance(snapshot_metadata, dict):
+                for key in (
+                    "map_version_id",
+                    "seed_map_version_id",
+                    "platform_map_version_id",
+                ):
+                    active_map_version_id = str(
+                        snapshot_metadata.get(key) or ""
+                    ).strip()
+                    if active_map_version_id:
+                        active_map_version_ids.add(active_map_version_id)
+
+        with self._forbidden_zone_state_lock():
+            metadata_sources = [
+                getattr(getattr(self, "_current_goal", None), "metadata", None),
+                getattr(
+                    getattr(self, "_current_explore_request", None),
+                    "metadata",
+                    None,
+                ),
+                getattr(
+                    getattr(
+                        getattr(self, "_latest_navigation_context", None),
+                        "navigation_state",
+                        None,
+                    ),
+                    "metadata",
+                    None,
+                ),
+                getattr(
+                    getattr(
+                        getattr(self, "_latest_exploration_context", None),
+                        "exploration_state",
+                        None,
+                    ),
+                    "metadata",
+                    None,
+                ),
+            ]
+        for metadata_source in metadata_sources:
+            if not isinstance(metadata_source, dict):
+                continue
+            for key in (
+                "map_version_id",
+                "localization_session_map_version_id",
+                "latest_map_version_id",
+            ):
+                active_map_version_id = str(
+                    metadata_source.get(key) or ""
+                ).strip()
+                if active_map_version_id:
+                    active_map_version_ids.add(active_map_version_id)
+
+        # 无法证明更新与活动地图无关时 fail closed。
+        return bool(
+            map_version_id in active_map_version_ids
+            or active_map_lookup_failed
+            or not active_map_version_ids
+        )
+
+    def _replace_active_map_forbidden_zones(
+        self,
+        *,
+        map_version_id: str,
+        zones: Sequence[ForbiddenZone],
+        expected_generation: Optional[int],
+    ) -> ForbiddenZonesEnvelope:
+        state_lock = self._forbidden_zone_state_lock()
+        with state_lock:
+            pending_request_id = str(
+                getattr(self, "_pending_explore_request_id", "") or ""
+            ).strip()
+            current_request_id = str(
+                getattr(
+                    getattr(self, "_current_explore_request", None),
+                    "request_id",
+                    "",
+                )
+                or ""
+            ).strip()
+            if pending_request_id and pending_request_id != current_request_id:
+                raise GatewayError(
+                    "探索任务正在启动，无法安全替换活动地图禁行区。",
+                    error_code="forbidden_zone_update_conflict",
+                    http_status=409,
+                    details={"pending_exploration_request_id": pending_request_id},
+                )
+            goal_id = self._active_navigation_goal_id_locked()
+            exploration_request_id = (
+                current_request_id or self._active_exploration_request_id_locked()
+            )
+            self._forbidden_zone_update_active = True
+
+        try:
+            exploration_request_id = (
+                self._authoritative_active_exploration_request_id(
+                    exploration_request_id
+                )
+            )
+            goal_id = self._authoritative_active_navigation_goal_id(
+                goal_id,
+                exploration_request_id=exploration_request_id,
+            )
+            if exploration_request_id:
+                exploration_context = self.stop_exploration(
+                    request_id=exploration_request_id
+                )
+                self._wait_for_forbidden_zone_exploration_stop(
+                    exploration_request_id,
+                    initial_state=getattr(
+                        exploration_context,
+                        "exploration_state",
+                        None,
+                    ),
+                )
+            if goal_id:
+                navigation_context = self.cancel_goal(request_id=goal_id)
+                self._wait_for_forbidden_zone_navigation_stop(
+                    goal_id,
+                    initial_state=getattr(
+                        navigation_context,
+                        "navigation_state",
+                        None,
+                    ),
+                )
+
+            envelope = self._forbidden_zone_store.replace(
+                map_version_id=map_version_id,
+                zones=zones,
+                expected_generation=expected_generation,
+            )
+            entry = envelope.maps[map_version_id]
+            required_generation = entry.generation
+            required_signature = entry.signature
+            with state_lock:
+                self._forbidden_zone_required_generation = required_generation
+                self._forbidden_zone_required_signature = required_signature
+                self._forbidden_zone_required_map_version_id = map_version_id
+
+            observed_ack = self._wait_for_forbidden_zone_runtime_ack(
+                map_version_id=map_version_id,
+                generation=required_generation,
+                signature=required_signature,
+            )
+            with state_lock:
+                if (
+                    observed_ack is not None
+                    and observed_ack.confirms(
+                        map_version_id=map_version_id,
+                        generation=required_generation,
+                        signature=required_signature,
+                    )
+                    and self._forbidden_zone_required_generation
+                    == required_generation
+                    and self._forbidden_zone_required_signature
+                    == required_signature
+                    and self._forbidden_zone_required_map_version_id
+                    == map_version_id
+                ):
+                    self._forbidden_zone_required_generation = None
+                    self._forbidden_zone_required_signature = None
+                    self._forbidden_zone_required_map_version_id = None
+            if observed_ack is None or not observed_ack.confirms(
+                map_version_id=map_version_id,
+                generation=required_generation,
+                signature=required_signature,
+            ):
+                LOGGER.warning(
+                    "禁行区已保存，但 Geometry Runtime/planner 尚未确认消费该 generation；"
+                    "map_version_id=%s generation=%s observed_ack=%s",
+                    map_version_id,
+                    required_generation,
+                    observed_ack,
+                )
+            return envelope
+        finally:
+            with state_lock:
+                self._forbidden_zone_update_active = False
+
+    def _forbidden_zone_state_lock(self):
+        state_lock = getattr(self, "_lock", None)
+        if state_lock is None:
+            state_lock = threading.RLock()
+            self._lock = state_lock
+        return state_lock
+
+    def _active_navigation_goal_id_locked(self) -> Optional[str]:
+        goal_id = str(
+            getattr(getattr(self, "_current_goal", None), "goal_id", "") or ""
+        ).strip()
+        if goal_id:
+            return goal_id
+        context = getattr(self, "_latest_navigation_context", None)
+        state = getattr(context, "navigation_state", None)
+        if getattr(state, "status", None) not in {
+            NavigationStatus.ACCEPTED,
+            NavigationStatus.PLANNING,
+            NavigationStatus.RUNNING,
+        }:
+            return None
+        return str(getattr(state, "current_goal_id", "") or "").strip() or None
+
+    def _active_exploration_request_id_locked(self) -> Optional[str]:
+        context = getattr(self, "_latest_exploration_context", None)
+        state = getattr(context, "exploration_state", None)
+        if getattr(state, "status", None) not in {
+            ExplorationStatus.ACCEPTED,
+            ExplorationStatus.RUNNING,
+        }:
+            return None
+        return str(getattr(state, "current_request_id", "") or "").strip() or None
+
+    @staticmethod
+    def _status_value(state) -> str:
+        raw_status = getattr(state, "status", None)
+        return str(getattr(raw_status, "value", raw_status) or "").strip().lower()
+
+    def _authoritative_active_exploration_request_id(
+        self,
+        fallback_request_id: Optional[str],
+    ) -> Optional[str]:
+        owner = getattr(self, "_provider_owner", None)
+        provider = getattr(owner, "providers", None)
+        state_reader = getattr(provider, "get_exploration_state", None)
+        if not callable(state_reader):
+            return fallback_request_id
+        try:
+            state = state_reader()
+        except Exception as exc:
+            raise GatewayError(
+                "禁行区更新前无法确认当前探索 exact request_id。",
+                error_code="exploration_request_identity_unavailable",
+                http_status=503,
+            ) from exc
+        status = self._status_value(state)
+        if not status:
+            return fallback_request_id
+        backend_request_id = str(
+            getattr(state, "current_request_id", "") or ""
+        ).strip()
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        is_running = status in {
+            ExplorationStatus.ACCEPTED.value,
+            ExplorationStatus.RUNNING.value,
+        }
+        complete_terminal = _is_complete_exploration_terminal(
+            state,
+            request_id=backend_request_id,
+        )
+        retains_child = bool(str(metadata.get("child_task_id") or "").strip())
+        requires_stop = bool(
+            is_running
+            or retains_child
+            or (
+                backend_request_id
+                and status != ExplorationStatus.IDLE.value
+                and not complete_terminal
+            )
+        )
+        if requires_stop and not backend_request_id:
+            raise GatewayError(
+                "探索后端处于活动状态，但未提供 exact request_id。",
+                error_code="exploration_request_identity_unavailable",
+                http_status=409,
+                details={"active_status": status},
+            )
+        if (
+            fallback_request_id
+            and complete_terminal
+            and backend_request_id == fallback_request_id
+        ):
+            return None
+        if fallback_request_id and (
+            not requires_stop or backend_request_id != fallback_request_id
+        ):
+            raise GatewayError(
+                "本地探索 request_id 与后端活动会话不一致。",
+                error_code="exploration_request_mismatch",
+                http_status=409,
+                details={
+                    "local_request_id": fallback_request_id,
+                    "active_request_id": backend_request_id or None,
+                    "active_status": status,
+                },
+            )
+        return backend_request_id if requires_stop else None
+
+    def _authoritative_active_navigation_goal_id(
+        self,
+        fallback_goal_id: Optional[str],
+        *,
+        exploration_request_id: Optional[str],
+    ) -> Optional[str]:
+        provider = self._forbidden_zone_navigation_provider()
+        if provider is None:
+            return fallback_goal_id
+        try:
+            state = provider.get_navigation_state()
+        except Exception as exc:
+            raise GatewayError(
+                "禁行区更新前无法确认当前导航 exact goal_id。",
+                error_code="navigation_goal_identity_unavailable",
+                http_status=503,
+            ) from exc
+        status = self._status_value(state)
+        if not status:
+            return fallback_goal_id
+        backend_goal_id = str(
+            getattr(state, "current_goal_id", "") or ""
+        ).strip()
+        is_active = status in {
+            NavigationStatus.ACCEPTED.value,
+            NavigationStatus.PLANNING.value,
+            NavigationStatus.RUNNING.value,
+        }
+        if is_active and not backend_goal_id:
+            raise GatewayError(
+                "导航后端处于活动状态，但未提供 exact goal_id。",
+                error_code="navigation_goal_identity_unavailable",
+                http_status=409,
+                details={"active_status": status},
+            )
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        cancel_phase = str(metadata.get("cancel_phase") or "").strip().upper()
+        if backend_goal_id and (
+            cancel_phase in {"FAILED", "TIMED_OUT"}
+            or (
+                status == NavigationStatus.CANCELLED.value
+                and not self._navigation_has_complete_zero_proof(
+                    state,
+                    goal_id=backend_goal_id,
+                )
+            )
+        ):
+            raise GatewayError(
+                "当前导航会话缺少 actuator ZEROED 证明，禁止更新禁行区。",
+                error_code="navigation_cancel_not_zeroed",
+                http_status=409,
+                details={
+                    "goal_id": backend_goal_id,
+                    "active_status": status,
+                    "cancel_phase": cancel_phase or None,
+                },
+            )
+        parent_request_id = str(
+            metadata.get("parent_request_id") or ""
+        ).strip()
+        owner_kind = metadata.get("owner_kind")
+        exploration_child = bool(
+            exploration_request_id
+            and is_active
+            and (
+                parent_request_id == exploration_request_id
+                or owner_kind in {2, "2", "exploration_child"}
+            )
+        )
+        if exploration_child and not fallback_goal_id:
+            return None
+        if (
+            fallback_goal_id
+            and backend_goal_id == fallback_goal_id
+            and self._navigation_has_complete_zero_proof(
+                state,
+                goal_id=backend_goal_id,
+            )
+        ):
+            return None
+        if fallback_goal_id and (
+            not is_active or backend_goal_id != fallback_goal_id
+        ):
+            raise GatewayError(
+                "本地导航 goal_id 与后端活动会话不一致。",
+                error_code="navigation_goal_mismatch",
+                http_status=409,
+                details={
+                    "local_goal_id": fallback_goal_id,
+                    "active_goal_id": backend_goal_id or None,
+                    "active_status": status,
+                },
+            )
+        return backend_goal_id if is_active else None
+
+    @staticmethod
+    def _navigation_has_complete_zero_proof(state, *, goal_id: str) -> bool:
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        try:
+            zero_applied_monotonic_ns = int(
+                metadata.get("zero_applied_monotonic_ns") or 0
+            )
+        except (TypeError, ValueError):
+            zero_applied_monotonic_ns = 0
+        return bool(
+            NavigationService._status_value(state)
+            == NavigationStatus.CANCELLED.value
+            and str(getattr(state, "current_goal_id", "") or "").strip()
+            == goal_id
+            and metadata.get("actuator_zeroed") is True
+            and str(metadata.get("zero_ack_id") or "").strip()
+            and zero_applied_monotonic_ns > 0
+        )
+
+    def _forbidden_zone_cancel_wait_settings(self) -> Tuple[float, float]:
+        timeout_sec = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "_forbidden_zone_cancel_wait_timeout_sec",
+                    5.0,
+                )
+            ),
+        )
+        poll_interval_sec = max(
+            0.01,
+            float(
+                getattr(
+                    self,
+                    "_forbidden_zone_cancel_poll_interval_sec",
+                    0.05,
+                )
+            ),
+        )
+        return timeout_sec, poll_interval_sec
+
+    def _wait_for_forbidden_zone_navigation_stop(
+        self,
+        goal_id: str,
+        *,
+        initial_state=None,
+    ) -> None:
+        provider = self._forbidden_zone_navigation_provider()
+        if initial_state is not None and self._navigation_has_complete_zero_proof(
+            initial_state,
+            goal_id=goal_id,
+        ):
+            return
+        if provider is None:
+            raise GatewayError(
+                "导航取消已下发，但无法验证 actuator ZEROED 证明。",
+                error_code="navigation_cancel_confirmation_unavailable",
+                http_status=503,
+                details={"goal_id": goal_id},
+            )
+        timeout_sec, poll_interval_sec = (
+            self._forbidden_zone_cancel_wait_settings()
+        )
+        deadline = time.monotonic() + timeout_sec
+        last_state = initial_state
+        while True:
+            try:
+                last_state = provider.get_navigation_state()
+            except Exception as exc:
+                raise GatewayError(
+                    "导航取消后无法读取 actuator ZEROED 证明。",
+                    error_code="navigation_cancel_confirmation_unavailable",
+                    http_status=503,
+                    details={"goal_id": goal_id},
+                ) from exc
+            if self._navigation_has_complete_zero_proof(
+                last_state,
+                goal_id=goal_id,
+            ):
+                return
+            metadata = dict(getattr(last_state, "metadata", {}) or {})
+            cancel_phase = str(metadata.get("cancel_phase") or "").strip().upper()
+            if (
+                self._status_value(last_state) == NavigationStatus.FAILED.value
+                or cancel_phase in {"FAILED", "TIMED_OUT"}
+            ):
+                raise GatewayError(
+                    "导航取消未获得 actuator ZEROED 证明。",
+                    error_code="navigation_cancel_not_zeroed",
+                    http_status=409,
+                    details={
+                        "goal_id": goal_id,
+                        "cancel_phase": cancel_phase or None,
+                    },
+                )
+            if time.monotonic() >= deadline:
+                raise GatewayError(
+                    "等待导航 actuator ZEROED 证明超时，禁行区未写入。",
+                    error_code="navigation_cancel_confirmation_timeout",
+                    http_status=503,
+                    details={
+                        "goal_id": goal_id,
+                        "active_status": self._status_value(last_state) or None,
+                    },
+                )
+            time.sleep(poll_interval_sec)
+
+    def _wait_for_forbidden_zone_exploration_stop(
+        self,
+        request_id: str,
+        *,
+        initial_state=None,
+    ) -> None:
+        if initial_state is not None and _is_complete_exploration_terminal(
+            initial_state,
+            request_id=request_id,
+        ):
+            return
+        owner = getattr(self, "_provider_owner", None)
+        provider = getattr(owner, "providers", None)
+        state_reader = getattr(provider, "get_exploration_state", None)
+        if not callable(state_reader):
+            raise GatewayError(
+                "探索停止已下发，但无法验证 child navigation 已清空。",
+                error_code="exploration_stop_confirmation_unavailable",
+                http_status=503,
+                details={"request_id": request_id},
+            )
+        timeout_sec, poll_interval_sec = (
+            self._forbidden_zone_cancel_wait_settings()
+        )
+        deadline = time.monotonic() + timeout_sec
+        last_state = initial_state
+        while True:
+            try:
+                last_state = state_reader()
+            except Exception as exc:
+                raise GatewayError(
+                    "探索停止后无法读取 child navigation 清理状态。",
+                    error_code="exploration_stop_confirmation_unavailable",
+                    http_status=503,
+                    details={"request_id": request_id},
+                ) from exc
+            if _is_complete_exploration_terminal(
+                last_state,
+                request_id=request_id,
+            ):
+                return
+            observed_request_id = str(
+                getattr(last_state, "current_request_id", "") or ""
+            ).strip()
+            if (
+                observed_request_id
+                and observed_request_id != request_id
+                and self._status_value(last_state)
+                in {
+                    ExplorationStatus.ACCEPTED.value,
+                    ExplorationStatus.RUNNING.value,
+                }
+            ):
+                raise GatewayError(
+                    "探索停止确认时检测到其它活动 request_id。",
+                    error_code="exploration_request_mismatch",
+                    http_status=409,
+                    details={
+                        "request_id": request_id,
+                        "active_request_id": observed_request_id,
+                    },
+                )
+            if time.monotonic() >= deadline:
+                metadata = dict(getattr(last_state, "metadata", {}) or {})
+                raise GatewayError(
+                    "等待探索 child navigation 清空超时，禁行区未写入。",
+                    error_code="exploration_stop_confirmation_timeout",
+                    http_status=503,
+                    details={
+                        "request_id": request_id,
+                        "active_status": self._status_value(last_state) or None,
+                        "child_task_id": metadata.get("child_task_id"),
+                    },
+                )
+            time.sleep(poll_interval_sec)
+
+    def _forbidden_zone_navigation_provider(self):
+        owner = getattr(self, "_provider_owner", None)
+        provider = getattr(owner, "providers", None)
+        if not callable(getattr(provider, "get_navigation_state", None)):
+            return None
+        return provider
+
+    def _read_forbidden_zone_runtime_ack(
+        self,
+    ) -> Optional[_ForbiddenZoneRuntimeAck]:
+        owner = getattr(self, "_provider_owner", None)
+        provider = getattr(owner, "providers", None)
+        readiness_reader = getattr(provider, "get_navigation_readiness", None)
+        if not callable(readiness_reader):
+            return None
+        try:
+            readiness = readiness_reader()
+        except Exception:
+            LOGGER.exception("读取禁行区 runtime acknowledgement 失败。")
+            return None
+        if not isinstance(readiness, dict):
+            return None
+
+        def _nonnegative_int(value) -> int:
+            if value is None or isinstance(value, bool):
+                return 0
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return 0
+            return parsed if parsed >= 0 else 0
+
+        return _ForbiddenZoneRuntimeAck(
+            map_version_id=str(
+                readiness.get("forbidden_zone_map_version_id") or ""
+            ).strip(),
+            generation=_nonnegative_int(
+                readiness.get("forbidden_zone_generation")
+            ),
+            signature=str(
+                readiness.get("forbidden_zone_signature") or ""
+            ).strip(),
+            applied_revision=_nonnegative_int(
+                readiness.get("forbidden_zone_applied_revision")
+            ),
+            planner_revision=_nonnegative_int(
+                readiness.get("costmap_revision")
+            ),
+        )
+
+    def _wait_for_forbidden_zone_runtime_ack(
+        self,
+        *,
+        map_version_id: str,
+        generation: int,
+        signature: str,
+    ) -> Optional[_ForbiddenZoneRuntimeAck]:
+        timeout_sec = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "_forbidden_zone_revision_wait_timeout_sec",
+                    2.0,
+                )
+            ),
+        )
+        poll_interval_sec = max(
+            0.01,
+            float(
+                getattr(
+                    self,
+                    "_forbidden_zone_revision_poll_interval_sec",
+                    0.05,
+                )
+            ),
+        )
+        deadline = time.monotonic() + timeout_sec
+        observed_ack: Optional[_ForbiddenZoneRuntimeAck] = None
+        while True:
+            observed_ack = self._read_forbidden_zone_runtime_ack()
+            if observed_ack is not None and observed_ack.confirms(
+                map_version_id=map_version_id,
+                generation=generation,
+                signature=signature,
+            ):
+                return observed_ack
+            if time.monotonic() >= deadline:
+                return observed_ack
+            time.sleep(poll_interval_sec)
+
+    def _ensure_forbidden_zone_motion_start_allowed(self) -> None:
+        state_lock = self._forbidden_zone_state_lock()
+        with state_lock:
+            if getattr(self, "_forbidden_zone_update_active", False):
+                self._raise_forbidden_zone_motion_start_blocked_locked()
+            required_generation = getattr(
+                self,
+                "_forbidden_zone_required_generation",
+                None,
+            )
+            required_map_version_id = getattr(
+                self,
+                "_forbidden_zone_required_map_version_id",
+                None,
+            )
+        if required_generation is None or not required_map_version_id:
+            return
+
+        observed_ack = self._read_forbidden_zone_runtime_ack()
+        with state_lock:
+            if getattr(self, "_forbidden_zone_update_active", False):
+                self._raise_forbidden_zone_motion_start_blocked_locked()
+            current_required_generation = getattr(
+                self,
+                "_forbidden_zone_required_generation",
+                None,
+            )
+            current_required_map_version_id = getattr(
+                self,
+                "_forbidden_zone_required_map_version_id",
+                None,
+            )
+            current_required_signature = getattr(
+                self,
+                "_forbidden_zone_required_signature",
+                None,
+            )
+            if current_required_generation is None:
+                return
+            if (
+                observed_ack is not None
+                and observed_ack.confirms(
+                    map_version_id=current_required_map_version_id,
+                    generation=current_required_generation,
+                    signature=current_required_signature or "",
+                )
+            ):
+                self._forbidden_zone_required_generation = None
+                self._forbidden_zone_required_signature = None
+                self._forbidden_zone_required_map_version_id = None
+                return
+            self._raise_forbidden_zone_motion_start_blocked_locked(
+                observed_ack=observed_ack
+            )
+
+    def _raise_forbidden_zone_motion_start_blocked_locked(
+        self,
+        *,
+        observed_ack: Optional[_ForbiddenZoneRuntimeAck] = None,
+    ) -> None:
+        if getattr(self, "_forbidden_zone_update_active", False):
+            raise GatewayError(
+                "活动地图禁行区正在更新，请稍后重试。",
+                error_code="forbidden_zone_update_in_progress",
+                http_status=409,
+            )
+        required_generation = getattr(
+            self,
+            "_forbidden_zone_required_generation",
+            None,
+        )
+        if required_generation is not None:
+            raise GatewayError(
+                "planner 尚未消费最新禁行区 costmap，暂不允许启动运动任务。",
+                error_code="forbidden_zone_revision_pending",
+                http_status=503,
+                details={
+                    "map_version_id": getattr(
+                        self,
+                        "_forbidden_zone_required_map_version_id",
+                        None,
+                    ),
+                    "required_generation": required_generation,
+                    "required_signature": getattr(
+                        self,
+                        "_forbidden_zone_required_signature",
+                        None,
+                    ),
+                    "observed_map_version_id": (
+                        observed_ack.map_version_id if observed_ack else None
+                    ),
+                    "observed_generation": (
+                        observed_ack.generation if observed_ack else None
+                    ),
+                    "observed_signature": (
+                        observed_ack.signature if observed_ack else None
+                    ),
+                    "forbidden_zone_applied_revision": (
+                        observed_ack.applied_revision if observed_ack else None
+                    ),
+                    "planner_costmap_revision": (
+                        observed_ack.planner_revision if observed_ack else None
+                    ),
+                },
+            )
+
+    def _resolve_forbidden_zone_map_version_id(
+        self,
+        map_version_id: Optional[str],
+    ) -> str:
+        resolved = str(map_version_id or "").strip()
+        if resolved:
+            return resolved
+
+        active_session = self._localization_service.get_active_session()
+        resolved = str(getattr(active_session, "map_version_id", "") or "").strip()
+        if resolved:
+            return resolved
+
+        map_snapshot = self._mapping_service.get_latest_snapshot()
+        resolved = str(getattr(map_snapshot, "version_id", "") or "").strip()
+        if resolved:
+            return resolved
+
+        raise GatewayError(
+            "未提供 map_version_id，且当前没有可解析的活动地图版本。",
+            error_code="map_version_id_required",
+            http_status=400,
+        )
 
     def is_navigation_available(self) -> bool:
         """判断导航后端是否可用。"""
@@ -256,6 +1229,7 @@ class NavigationService:
         主链：NavigationGoal -> 平台状态机 ACCEPTED -> 当前导航后端执行 -> 平台 NavigationContext
         """
 
+        self._ensure_forbidden_zone_motion_start_allowed()
         provider = self._get_navigation_provider()
         if goal.target_pose is not None:
             LOGGER.info(
@@ -280,6 +1254,7 @@ class NavigationService:
                 dict(goal.metadata),
             )
         with self._lock:
+            self._raise_forbidden_zone_motion_start_blocked_locked()
             self._current_goal = goal
             self._state_machine.set_goal(goal.goal_id, message="平台导航目标已接受。")
         LOGGER.debug("导航服务转发目标 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
@@ -667,9 +1642,11 @@ class NavigationService:
     def start_exploration(self, request: ExploreAreaRequest) -> ExplorationContext:
         """启动探索任务。"""
 
+        self._ensure_forbidden_zone_motion_start_allowed()
         provider = self._get_exploration_provider()
         request_id = str(request.request_id or "").strip()
         with self._lock:
+            self._raise_forbidden_zone_motion_start_blocked_locked()
             current_id = str(
                 getattr(self._current_explore_request, "request_id", "") or ""
             ).strip()

@@ -332,6 +332,61 @@ class MapWorkspaceService:
                 http_status=409,
                 jsonrpc_code=-32000,
             )
+        persistence_map_version_id = str(
+            pinned_version_id or snapshot_map_version_id or snapshot.version_id
+        ).strip()
+        forbidden_zone_entry = None
+        if persistence_map_version_id:
+            forbidden_zone_envelope = self._navigation_service.list_forbidden_zones(
+                persistence_map_version_id
+            )
+            forbidden_zone_entry = forbidden_zone_envelope.maps.get(
+                persistence_map_version_id
+            )
+        enabled_forbidden_zones = tuple(
+            zone
+            for zone in getattr(forbidden_zone_entry, "zones", ())
+            if bool(getattr(zone, "enabled", False))
+        )
+        raw_reader = getattr(self._geometry_runtime, "get_raw_occupancy_grid", None)
+        raw_occupancy = raw_reader() if callable(raw_reader) else None
+        if snapshot.occupancy_grid is not None and raw_occupancy is None and enabled_forbidden_zones:
+            raise GatewayError(
+                "禁行区已启用，但当前无法读取物理占据栅格；已拒绝保存，避免将虚拟障碍永久写入地图版本。",
+                error_code="raw_occupancy_unavailable",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
+        if snapshot.occupancy_grid is not None and raw_occupancy is not None:
+            effective = snapshot.occupancy_grid
+            same_layout = (
+                raw_occupancy.width == effective.width
+                and raw_occupancy.height == effective.height
+                and abs(raw_occupancy.resolution_m - effective.resolution_m) <= 1e-9
+                and abs(raw_occupancy.origin.position.x - effective.origin.position.x) <= 1e-9
+                and abs(raw_occupancy.origin.position.y - effective.origin.position.y) <= 1e-9
+                and frame_ids_semantically_equal(raw_occupancy.frame_id, effective.frame_id)
+            )
+            if not same_layout:
+                raise GatewayError(
+                    "物理栅格与当前有效栅格布局不一致，无法安全保存地图版本。",
+                    error_code="raw_occupancy_layout_mismatch",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                )
+            snapshot = snapshot.model_copy(
+                update={
+                    "occupancy_grid": raw_occupancy,
+                    "metadata": {
+                        **dict(snapshot.metadata),
+                        "saved_occupancy_layer": "physical_raw",
+                        "forbidden_zone_generation": getattr(
+                            forbidden_zone_entry, "generation", 0
+                        ),
+                    },
+                },
+                deep=True,
+            )
         version = self._version_repository.save_map_version(
             map_name=resolved_name,
             snapshot=snapshot,

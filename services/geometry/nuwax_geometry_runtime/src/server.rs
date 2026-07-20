@@ -1378,6 +1378,34 @@ impl GeometryRuntime for GeometryRuntimeService {
         }))
     }
 
+    async fn get_raw_occupancy_grid_data(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<OccupancyGridData>, Status> {
+        let adapter = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?;
+        let raw_map = adapter
+            .lock()
+            .raw_map_snapshot()
+            .ok_or_else(|| Status::failed_precondition("physical occupancy grid is unavailable"))?;
+        Ok(Response::new(OccupancyGridData {
+            meta: Some(OccupancyGridMeta {
+                width: raw_map.width,
+                height: raw_map.height,
+                resolution: raw_map.resolution,
+                origin_x: raw_map.origin_x,
+                origin_y: raw_map.origin_y,
+                frame_id: raw_map.frame_id,
+                revision: raw_map.revision,
+                timestamp_ns: raw_map.timestamp_ns,
+            }),
+            data: raw_map.data.iter().map(|&value| value as u8).collect(),
+        }))
+    }
+
     async fn get_occupancy_grid_shm(
         &self,
         _req: Request<Empty>,
@@ -1637,6 +1665,12 @@ impl GeometryRuntime for GeometryRuntimeService {
         // CI/CLI 现有 grep "nav ready" 的守门不会失效。
         let r = runtime_diagnostics::navigation_readiness(&self.bridge);
         let detail = compute_readiness(&self.bridge, &self.bridge.nav).await;
+        let forbidden_zone_ack = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .map(|adapter| adapter.lock().forbidden_zone_ack())
+            .unwrap_or_default();
         let json = readiness_to_reason(&detail);
         Ok(Response::new(NavigationReadiness {
             ready: r.ready && detail.ready,
@@ -1652,6 +1686,11 @@ impl GeometryRuntime for GeometryRuntimeService {
             motion_sink_generation: detail.motion_sink_generation,
             map_frame: detail.map_frame,
             pose_frame: detail.pose_frame,
+            forbidden_zone_map_version_id: forbidden_zone_ack.map_version_id,
+            forbidden_zone_generation: forbidden_zone_ack.generation,
+            forbidden_zone_signature: forbidden_zone_ack.signature,
+            forbidden_zone_applied_revision: forbidden_zone_ack.applied_revision,
+            planner_costmap_revision: detail.costmap_revision,
         }))
     }
 

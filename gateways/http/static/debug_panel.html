@@ -386,6 +386,32 @@ button{font-family:inherit;cursor:pointer}
 .map-pose-title{margin-bottom:4px;color:var(--muted);font-size:9.5px;font-weight:700;text-transform:uppercase}
 .map-pose-meta{grid-template-columns:auto minmax(72px,auto);gap:2px 10px;font-size:10.5px;line-height:1.35}
 #mapStatus{position:absolute;right:14px;bottom:115px;z-index:5}
+.forbidden-zone-panel{position:absolute;left:14px;top:104px;z-index:7;width:min(390px,calc(100% - 28px));
+  max-height:min(430px,calc(100% - 180px));overflow:auto;padding:10px;pointer-events:auto;border:1px solid var(--line)}
+.forbidden-zone-panel[hidden]{display:none!important}
+.forbidden-zone-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.forbidden-zone-title{font-size:12px;font-weight:700;color:var(--strong)}
+.forbidden-zone-status{font-size:9.5px;color:var(--muted);font-family:var(--mono);text-align:right}
+.forbidden-zone-status[data-state="error"]{color:var(--bad)}
+.forbidden-zone-status[data-state="busy"]{color:var(--warn)}
+.forbidden-zone-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+.forbidden-zone-field{display:grid;gap:3px;min-width:0;color:var(--muted);font-size:9.5px}
+.forbidden-zone-field.wide{grid-column:1/-1}
+.forbidden-zone-field input,.forbidden-zone-field select{min-width:0;width:100%;height:29px;padding:4px 7px;
+  border:1px solid var(--line);border-radius:var(--r-sm);background:var(--inset);color:var(--strong);font:inherit;font-size:11px}
+.forbidden-zone-actions{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}
+.forbidden-zone-actions button,.forbidden-zone-list button{min-height:27px;padding:4px 8px;border:1px solid var(--line);
+  border-radius:var(--r-sm);background:var(--inset);color:var(--strong);font-size:10.5px;font-weight:620}
+.forbidden-zone-actions button.primary{background:var(--bad);border-color:transparent;color:#fff}
+.forbidden-zone-actions button:disabled,.forbidden-zone-list button:disabled{opacity:.45;cursor:not-allowed}
+.forbidden-zone-hint{margin-top:7px;color:var(--muted);font-size:10px;line-height:1.4}
+.forbidden-zone-list{display:grid;gap:5px;margin:8px 0 0;padding:8px 0 0;border-top:1px solid var(--line);list-style:none}
+.forbidden-zone-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;align-items:center;padding:6px 7px;
+  border-radius:var(--r-sm);background:var(--inset)}
+.forbidden-zone-item-main{min-width:0}
+.forbidden-zone-item-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--strong);font-size:10.5px;font-weight:650}
+.forbidden-zone-item-meta{display:block;color:var(--muted);font-size:9.5px;font-family:var(--mono)}
+.forbidden-zone-empty{padding:5px 2px;color:var(--muted);font-size:10px}
 .map-info-grid{display:none}
 .workspace.swapped .map-toolbar{left:10px;right:10px;top:10px;max-width:none}
 .workspace.swapped .map-tool-row{gap:5px}
@@ -413,6 +439,7 @@ button{font-family:inherit;cursor:pointer}
   .legend{left:10px;bottom:10px;max-width:48%}
   .map-pose-hud{right:10px;bottom:10px;min-width:154px;padding:7px 9px}
   #mapStatus{right:10px;bottom:109px}
+  .forbidden-zone-panel{left:10px;top:135px;width:calc(100% - 20px);max-height:calc(100% - 210px)}
 }
 
 /* media-swap buttons */
@@ -524,9 +551,53 @@ button{font-family:inherit;cursor:pointer}
                   </div>
                   <div class="map-tool-group glass">
                     <button id="mapNavToggle" class="tool" type="button" title="进入导航模式：在地图上左键选点后提交 navigate_to_pose">导航</button>
-                    <button id="mapBoundaryToggle" class="tool" type="button" title="进入手划探索范围模式：在地图上拖拽画线段后提交 explore_area_v2">划线</button>
+                    <button id="mapBoundaryToggle" class="tool" type="button" title="创建并管理会参与导航规划的禁行区">禁行区</button>
                   </div>
                 </div>
+              </div>
+              <div id="boundary-draw-container" class="forbidden-zone-panel glass" data-role="v2-boundary" hidden>
+                <div class="forbidden-zone-head">
+                  <span class="forbidden-zone-title">导航禁行区</span>
+                  <span class="forbidden-zone-status" data-role="boundary-status">等待地图版本</span>
+                </div>
+                <div class="forbidden-zone-grid">
+                  <label class="forbidden-zone-field wide">名称
+                    <input data-role="boundary-name" type="text" maxlength="80" value="禁行区 1" autocomplete="off">
+                  </label>
+                  <label class="forbidden-zone-field">形状
+                    <select data-role="boundary-shape">
+                      <option value="line">直线</option>
+                      <option value="rectangle">矩形</option>
+                      <option value="circle">圆形</option>
+                      <option value="custom">自定义多边形</option>
+                    </select>
+                  </label>
+                  <label class="forbidden-zone-field">禁行方向
+                    <select data-role="boundary-mode">
+                      <option value="inside">内部禁行</option>
+                      <option value="outside">外部禁行</option>
+                    </select>
+                  </label>
+                  <label class="forbidden-zone-field">边界宽度（米）
+                    <input data-role="boundary-width" type="number" min="0.02" max="5" step="0.01" value="0.25">
+                  </label>
+                  <label class="forbidden-zone-field">状态
+                    <select data-role="boundary-enabled">
+                      <option value="true">启用</option>
+                      <option value="false">停用</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="forbidden-zone-actions">
+                  <button data-role="boundary-toggle" type="button">开始绘制</button>
+                  <button data-role="boundary-finish" type="button" hidden>完成多边形</button>
+                  <button data-role="boundary-undo" type="button" hidden>撤销顶点</button>
+                  <button data-role="boundary-submit" class="primary" type="button">保存禁行区</button>
+                  <button data-role="boundary-draft-clear" type="button">取消草稿</button>
+                  <button data-role="boundary-clear" type="button">清空全部</button>
+                </div>
+                <div class="forbidden-zone-hint" data-role="boundary-hint">直线、矩形和圆形用鼠标拖拽；自定义多边形逐点单击后完成。</div>
+                <ul class="forbidden-zone-list" data-role="boundary-list"></ul>
               </div>
               <span id="mapGoalStatus" class="mchip glass map-goal-chip" hidden></span>
               <span id="mapStreamStatus" class="mchip glass map-overlay-panel map-stream-chip">等待地图首帧</span>
@@ -661,7 +732,7 @@ button{font-family:inherit;cursor:pointer}
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "perception_nms", "logs"];
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 500;
-      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state", "system.metrics"];
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state", "system.metrics"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
       const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
       const VIDEO_JPEG_DECODE_TIMEOUT_MS = 3000;
@@ -721,6 +792,8 @@ button{font-family:inherit;cursor:pointer}
         logCursor: 0,
         streamSocket: null,
         streamReconnectTimer: null,
+        streamReconnectDelayMs: 1000,
+        streamReconnectAttempt: 0,
         latestStreamCursor: 0,
         latestStreamFrames: {},
         pendingStreamFrames: {},
@@ -1134,6 +1207,7 @@ button{font-family:inherit;cursor:pointer}
         url.searchParams.set("access_token", apiAccessToken);
         return `${url.pathname}${url.search}`;
       }
+      window.__nuwaxWithAccessToken = withAccessToken;
       function buildOverview() {
         els.overviewGrid.replaceChildren();
         for (const name of overviewNames) {
@@ -1656,7 +1730,10 @@ button{font-family:inherit;cursor:pointer}
         state.latestTasks = payload || {};
         els.taskSummary.replaceChildren();
         setPill(els.taskStatus, active.length ? "available" : "idle", active.length ? `${active.length} 个任务` : "空闲");
-        const items = active.length ? active.slice(0, 4) : history.slice(0, 3);
+        const recentFailures = history.filter((task) => ["failed", "timeout"].includes(normalizeTaskState(task.state || task.status))).slice(0, 2);
+        const items = active.length
+          ? [...active.slice(0, 4), ...recentFailures.filter((task) => !active.some((item) => String(item.task_id) === String(task.task_id)))]
+          : history.slice(0, 4);
         if (!items.length) {
           const row = document.createElement("article");
           row.className = "task-row";
@@ -1678,11 +1755,19 @@ button{font-family:inherit;cursor:pointer}
           meta.className = "meta";
           const taskState = normalizeTaskState(task.state || task.status);
           const reason = task.failure_reason || task.waiting_for || task.message || task.error || (["failed", "timeout", "cancelled"].includes(taskState) ? "未上报原因" : "");
-          const progressText = task.progress === null || task.progress === undefined ? "进度未上报" : `进度 ${fmt(task.progress, "")}`;
+          const progressNumber = Number(task.progress);
+          const progressPercent = Number.isFinite(Number(task.progress_percent))
+            ? Math.round(Number(task.progress_percent))
+            : Number.isFinite(progressNumber)
+              ? Math.round((progressNumber >= 0 && progressNumber <= 1 ? progressNumber * 100 : progressNumber))
+              : null;
+          const progressText = progressPercent === null ? "进度未上报" : `进度 ${progressPercent}%`;
           const timeText = task.updated_at || task.completed_at || task.started_at
             ? `更新 ${shortTime(task.updated_at || task.completed_at || task.started_at)}`
             : "时间未上报";
-          meta.textContent = `阶段 ${safeText(task.stage || taskState)} · ${progressText} · ${timeText}${reason ? " · " + reason : ""}`;
+          const nextAction = task.next_action ? ` · 下一步 ${safeText(task.next_action)}` : "";
+          const retryText = task.retryable === true ? " · 可重试" : task.retryable === false && ["failed", "timeout"].includes(taskState) ? " · 不建议原样重试" : "";
+          meta.textContent = `阶段 ${safeText(task.stage || taskState)} · ${progressText} · ${timeText}${reason ? " · " + reason : ""}${retryText}${nextAction}`;
           left.append(title, meta);
           const pill = document.createElement("span");
           pill.className = `pill ${taskState === "failed" || taskState === "timeout" ? "error" : taskState === "running" || taskState === "accepted" ? "available" : taskState === "succeeded" ? "available" : "stale"}`;
@@ -1699,7 +1784,7 @@ button{font-family:inherit;cursor:pointer}
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           replaceTaskStore(await response.json());
         } catch (err) {
-          showPanelError("logs", `任务列表初始化失败：${err.message || err}`);
+          showPanelError("tasks", `任务列表初始化失败：${err.message || err}`);
         } finally {
           // bootstrap 闸门：完成后才允许 updateTaskFrame 直接写 Map；flush 期间累积的流式事件
           flushTaskQueue();
@@ -1760,9 +1845,27 @@ button{font-family:inherit;cursor:pointer}
           setPill(els.videoStatus, "error");
           els.videoEmpty.hidden = false;
           els.videoEmpty.textContent = message;
+        } else if (kind === "tasks") {
+          setPill(els.taskStatus, "error", "任务链路异常");
+          els.taskSummary.replaceChildren();
+          const row = document.createElement("article");
+          row.className = "task-row";
+          const detail = document.createElement("div");
+          const title = document.createElement("div");
+          title.className = "mono";
+          title.textContent = "任务状态读取失败";
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.textContent = `${message} · 下一步：检查 /api/tasks 与实时流连接，系统会自动重试对账。`;
+          detail.append(title, meta);
+          row.appendChild(detail);
+          els.taskSummary.appendChild(row);
         } else if (kind === "logs") {
           setPill(els.logsStatus, "error");
-          setKv(els.logsMeta, [["错误", message], ["前端接收", nowText()]]);
+          const errorLine = document.createElement("article");
+          errorLine.className = "log-line error";
+          errorLine.textContent = `${message} · 前端接收 ${nowText()} · 系统会自动重连；若持续失败请检查网关日志。`;
+          els.logs.prepend(errorLine);
         }
       }
       function normalizeFrameId(value, fallback) {
@@ -4536,6 +4639,8 @@ button{font-family:inherit;cursor:pointer}
             entry.task_id,
             entry.capability_name,
             entry.duration_ms,
+            entry.error_category,
+            entry.suppressed_count,
             compactLogValue(entry.payload_preview),
             compactLogValue(entry.metadata_preview),
             compactLogValue(entry.details_compact),
@@ -4565,16 +4670,32 @@ button{font-family:inherit;cursor:pointer}
             if (eventName && !parts.includes(eventName)) parts.push(`事件 ${eventName}`);
           }
           if (entry.capability_name) parts.push(`能力 ${entry.capability_name}`);
+          if (entry.task_id) parts.push(`任务 ${entry.task_id}`);
+          if (entry.error_category) parts.push(`错误分类 ${entry.error_category}`);
           const durationNumber = Number(entry.duration_ms);
           if (Number.isFinite(durationNumber)) parts.push(`耗时 ${fmt(durationNumber, " ms")}`);
           if (entry.request_id) parts.push(`请求 ${entry.request_id}`);
+          const suppressedNumber = Number(entry.suppressed_count);
+          if (Number.isFinite(suppressedNumber) && suppressedNumber > 0) parts.push(`合并重复 ${suppressedNumber} 条`);
           const payloadPreview = compactLogValue(entry.payload_preview);
           const metadataPreview = compactLogValue(entry.metadata_preview);
-          if (payloadPreview) parts.push(`载荷 ${payloadPreview}`);
-          if (metadataPreview) parts.push(`元数据 ${metadataPreview}`);
           message.textContent = parts.filter(Boolean).join(" · ");
-          if (entry.details_compact) message.title = compactLogValue(entry.details_compact);
           line.append(meta, message);
+          const detailParts = [];
+          if (payloadPreview) detailParts.push(`载荷：${payloadPreview}`);
+          if (metadataPreview) detailParts.push(`元数据：${metadataPreview}`);
+          const compactDetails = compactLogValue(entry.details_compact);
+          if (compactDetails) detailParts.push(`详细字段：${compactDetails}`);
+          if (detailParts.length) {
+            const details = document.createElement("details");
+            const summary = document.createElement("summary");
+            summary.textContent = "技术详情";
+            const body = document.createElement("pre");
+            body.className = "mono";
+            body.textContent = detailParts.join("\n");
+            details.append(summary, body);
+            line.appendChild(details);
+          }
           els.logs.appendChild(line);
         }
       }
@@ -4587,6 +4708,7 @@ button{font-family:inherit;cursor:pointer}
         "localization.frame_tree",
         "localization.trajectory",
         "navigation.state",
+        "navigation.forbidden_zones",
         "exploration.state",
         "exploration.frontier",
         "runtime.governance",
@@ -4600,11 +4722,15 @@ button{font-family:inherit;cursor:pointer}
         "system.metrics"
       ];
       const POINTCLOUD3D_STREAM_TOPICS = new Set([
+        "map.frame",
+        "map.heartbeat",
         "localization.pose",
         "localization.trajectory",
         "navigation.state",
+        "navigation.forbidden_zones",
         "exploration.state",
         "exploration.frontier",
+        "runtime.governance",
         "pointcloud_map.meta",
       ]);
       function pointcloud3dStreamDetail(frame) {
@@ -4656,10 +4782,14 @@ button{font-family:inherit;cursor:pointer}
         state.streamSocket = socket;
         socket.addEventListener("open", () => {
           setText(els.connectionText, "实时流");
+          const wasReconnect = state.streamReconnectAttempt > 0;
+          state.streamReconnectAttempt = 0;
+          state.streamReconnectDelayMs = 1000;
           if (state.streamReconnectTimer) {
             window.clearTimeout(state.streamReconnectTimer);
             state.streamReconnectTimer = null;
           }
+          if (wasReconnect) loadInitialTasks();
         });
         socket.addEventListener("message", (event) => {
           if (event.data instanceof ArrayBuffer) {
@@ -4672,22 +4802,41 @@ button{font-family:inherit;cursor:pointer}
             if (typeof message.cursor === "number") state.latestStreamCursor = message.cursor;
             return;
           }
+          if (message.type === "stream.replay") {
+            if (typeof message.latest_cursor === "number") state.latestStreamCursor = message.latest_cursor;
+            if (message.resync_required || message.replay_gap) {
+              setText(els.connectionText, "流已降级，正在对账");
+              loadInitialTasks();
+            }
+            return;
+          }
+          if (message.type === "stream.gap") {
+            if (typeof message.latest_cursor === "number") state.latestStreamCursor = message.latest_cursor;
+            setText(els.connectionText, `流丢帧 ${Number(message.dropped_count || 0)} 条，正在对账`);
+            loadInitialTasks();
+            return;
+          }
           if (message.type !== "stream.frame" || !message.frame) return;
           handleStreamFrame(message.frame);
         });
-        socket.addEventListener("close", () => scheduleStreamReconnect());
+        socket.addEventListener("close", () => {
+          state.streamReconnectAttempt += 1;
+          scheduleStreamReconnect();
+        });
         socket.addEventListener("error", () => {
           setText(els.connectionText, "流异常");
           showPanelError("logs", "实时数据流连接异常，正在重连。");
         });
       }
       function scheduleStreamReconnect() {
-        setText(els.connectionText, "重连中");
+        const delayMs = Math.min(30000, Math.max(1000, state.streamReconnectDelayMs));
+        setText(els.connectionText, `重连中（${Math.ceil(delayMs / 1000)} 秒）`);
         if (state.streamReconnectTimer) return;
         state.streamReconnectTimer = window.setTimeout(() => {
           state.streamReconnectTimer = null;
           connectStreams();
-        }, 1000);
+        }, delayMs);
+        state.streamReconnectDelayMs = Math.min(30000, delayMs * 2);
       }
       function handleStreamFrame(frame) {
         state.latestStreamCursor = Math.max(state.latestStreamCursor || 0, Number(frame.cursor || 0));
@@ -4902,6 +5051,7 @@ button{font-family:inherit;cursor:pointer}
           capability_name: payload.capability_name || details.capability_name,
           duration_ms: durationMs,
           error_category: payload.error_category || details.error_category,
+          suppressed_count: payload.suppressed_count ?? details.suppressed_count,
           payload_preview: payload.payload_preview ?? details.payload_preview,
           metadata_preview: payload.metadata_preview ?? details.metadata_preview,
           details_compact: details,
@@ -4945,10 +5095,15 @@ button{font-family:inherit;cursor:pointer}
           task_id: taskId,
           capability_name: payload.capability_name || requestContext.capability_name || existing.capability_name,
           state: payload.state || event.state || existing.state || null,
-          stage: payload.stage || event.message || existing.stage || derivedStage,
+          stage: payload.stage || existing.stage || derivedStage,
           message: payload.message || event.message || existing.message,
           progress: payload.progress !== undefined ? payload.progress : existing.progress,
-          updated_at: event.timestamp || payload.updated_at || frame.timestamp || existing.updated_at,
+          progress_percent: payload.progress_percent !== undefined ? payload.progress_percent : existing.progress_percent,
+          error_code: payload.error_code || (payload.error_payload && payload.error_payload.code) || existing.error_code,
+          error_category: payload.error_category || (payload.error_payload && payload.error_payload.error_category) || existing.error_category,
+          retryable: payload.retryable !== undefined ? payload.retryable : payload.error_payload && payload.error_payload.retryable !== undefined ? payload.error_payload.retryable : existing.retryable,
+          next_action: payload.next_action || (payload.error_payload && payload.error_payload.next_action) || existing.next_action,
+          updated_at: payload.updated_at || event.timestamp || frame.timestamp || existing.updated_at,
           completed_at: payload.completed_at || existing.completed_at,
         };
         // 任务 3.2.3：终态时强制 progress=1.0（如果 state 是 SUCCEEDED 且 payload.progress 为 null/undefined）
@@ -5624,6 +5779,59 @@ button{font-family:inherit;cursor:pointer}
           pixelHeight: canvas.height,
         };
       };
+      // 禁行区使用与 canvas 完全相同的 world -> pixel 投影，包含非零地图中心、
+      // robot-locked 旋转视角、RViz 固定视角和 CSS 缩放。
+      window.__nuwaxMapProject = function (worldX, worldY) {
+        if (!els.mapCanvas) return null;
+        const anchor = cameraAnchor();
+        const scale = cameraScale(anchor);
+        const projected = mapToCanvas({ x: Number(worldX), y: Number(worldY) }, anchor, scale);
+        if (!projected || !Number.isFinite(projected.x) || !Number.isFinite(projected.y)) return null;
+        return {
+          x: projected.x,
+          y: projected.y,
+          scale,
+          pixelWidth: els.mapCanvas.width,
+          pixelHeight: els.mapCanvas.height,
+          mapFixed: Boolean(anchor.mapFixed),
+          yaw: Number(anchor.yaw) || 0,
+        };
+      };
+      window.__nuwaxMapVersionId = function () {
+        const diagnostics = state.mapStream && state.mapStream.diagnostics ? state.mapStream.diagnostics : {};
+        const governance = state.latestGovernance || {};
+        const localizationSession = governance.localization_session || {};
+        const pointcloud = pointcloudMapSummary().payload;
+        const snapshot = state.lastMapEnvelope?.data?.map_snapshot || {};
+        const snapshotMetadata = snapshot.metadata || {};
+        const renderedMapVersionId = firstNonBlank(
+          diagnostics.platform_map_version_id,
+          diagnostics.seed_map_version_id,
+          diagnostics.map_version_id,
+          snapshotMetadata.platform_map_version_id,
+          snapshotMetadata.seed_map_version_id,
+          snapshotMetadata.map_version_id,
+          snapshot.map_version_id,
+          pointcloud.platform_map_version_id,
+          pointcloud.seed_map_version_id,
+          pointcloud.map_version_id,
+        );
+        const activeMapVersionId = firstNonBlank(
+          localizationSession.map_version_id,
+          governance.active_map_version_id,
+          governance.map_version_id,
+        );
+        const conflict = renderedMapVersionId && activeMapVersionId && renderedMapVersionId !== activeMapVersionId
+          ? { rendered: renderedMapVersionId, active: activeMapVersionId }
+          : null;
+        window.__nuwaxMapVersionConflict = conflict;
+        if (conflict) {
+          return null;
+        }
+        return renderedMapVersionId || activeMapVersionId || null;
+      };
+      window.__nuwaxMapViewMode = function () { return state.mapViewMode; };
+      window.__nuwaxMapRequestDraw = function () { requestMapDraw(false); };
       // V2 boundary tick：drawMap() 每帧末尾调用，boundary_draw.js 注册回调同步 viewBox。
       // 解耦：boundary 模块自己挂回调，不在主循环 import boundary 模块。
       window.__nuwaxMapDrawTick = window.__nuwaxMapDrawTick || null;
@@ -5779,27 +5987,20 @@ button{font-family:inherit;cursor:pointer}
       updateMapPoseHud();
     })();
   </script>
-  <script type="module" src="/static/js/pointcloud3d.js?v=20260718-point-styles"></script>
-  <!-- V2 navigation-and-exploration-boundary §9.3：容器 + 拆模块 script 引用（不堆业务） -->
-  <!-- 默认隐藏，由 map-toolbar 的"导航"按钮 / "划线"按钮点击后展开 -->
+  <script type="module" src="/static/js/pointcloud3d.js?v=20260719-forbidden-zones"></script>
+  <!-- 地图导航工具模块：导航面板在页面尾部，禁行区面板常驻地图 HUD。 -->
   <div id="navigation-container" data-role="v2-navigation" hidden>
     <span data-role="nav-status">未选点</span>
     <button data-role="nav-submit">导航到选点</button>
     <button data-role="nav-cancel">取消导航</button>
     <pre data-role="nav-detail"></pre>
   </div>
-  <div id="boundary-draw-container" data-role="v2-boundary" hidden>
-    <button data-role="boundary-toggle">开始划线</button>
-    <button data-role="boundary-submit">提交探索范围</button>
-    <button data-role="boundary-clear">清空</button>
-    <ul data-role="boundary-list"></ul>
-  </div>
   <script src="/static/js/navigation.js"></script>
-  <script src="/static/js/boundary_draw.js"></script>
+  <script src="/static/js/boundary_draw.js?v=20260719-forbidden-zones"></script>
   <script>
-    // V2 navigation-and-exploration-boundary §9.3 入口开关：
+    // 地图导航工具入口开关：
     // map-toolbar 上的"导航"按钮 → 显示 navigation-container
-    // map-toolbar 上的"划线"按钮 → 显示 boundary-draw-container
+    // map-toolbar 上的"禁行区"按钮 → 显示地图 HUD 内的 boundary-draw-container
     // 同时只允许一个容器可见（互斥模式）。
     (function () {
       'use strict';

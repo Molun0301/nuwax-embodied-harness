@@ -4192,6 +4192,18 @@ class PlatformGeometryRuntime:
             },
         )
 
+    def get_raw_occupancy_grid(self):
+        """返回未叠加虚拟禁行区的物理栅格（若远端支持）。"""
+
+        remote = self._remote_provider
+        if remote is None or not remote.is_connected:
+            return None
+        reader = getattr(remote, "get_raw_occupancy_grid", None)
+        if not callable(reader):
+            return None
+        grid = reader()
+        return self._clone_contract(grid) if grid is not None else None
+
     def _build_live_map_snapshot(self, *, live_occupancy, live_cost_map, seed_version: Optional[MapVersion]) -> MapSnapshot:
         live_status = self._clone_metadata(self._geometry_runtime_status_stub("live_map_provider"))
         update_sequence = live_status.get("update_sequence")

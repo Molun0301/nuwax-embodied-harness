@@ -212,6 +212,11 @@ message NavigationReadiness {
   uint64 motion_sink_generation = 7;
   string map_frame = 8;
   string pose_frame = 9;
+  string forbidden_zone_map_version_id = 10;
+  uint64 forbidden_zone_generation = 11;
+  string forbidden_zone_signature = 12;
+  uint64 forbidden_zone_applied_revision = 13;
+  uint64 planner_costmap_revision = 14;
 }
 
 // Phase 7: 三套 readiness 字段打包 message(JSON 字符串给 Python 解析)。
@@ -358,6 +363,10 @@ service GeometryRuntime {
   // 地图
   rpc GetOccupancyGrid(Empty) returns (OccupancyGridMeta);
   rpc GetOccupancyGridData(Empty) returns (OccupancyGridData);
+  // Physical occupancy before virtual forbidden zones are composed.  Map
+  // version persistence must use this getter to avoid baking keepouts into a
+  // checkpoint permanently.
+  rpc GetRawOccupancyGridData(Empty) returns (OccupancyGridData);
   rpc GetOccupancyGridShm(Empty) returns (ShmRef);
   rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
   rpc SubscribeCloudMapUpdates(Empty) returns (stream CloudMapShmRef);

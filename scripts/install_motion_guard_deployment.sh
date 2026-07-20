@@ -607,7 +607,7 @@ secure_runtime_data_permissions() {
     find "${directory}" -xdev -type f -exec chmod 0640 {} +
   done
   chown nuwax-geometry:nuwax-motion-clients /var/lib/nuwax_robot_bridge
-  chmod 0770 /var/lib/nuwax_robot_bridge
+  chmod 2770 /var/lib/nuwax_robot_bridge
   [[ -f /tmp/cdds.LOG && ! -L /tmp/cdds.LOG ]] \
     || fail "/tmp/cdds.LOG must be a regular non-symlink created by systemd-tmpfiles"
   [[ "$(stat -c '%U:%G:%a' /tmp/cdds.LOG)" == "root:nuwax-motion-clients:660" ]] \

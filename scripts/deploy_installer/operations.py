@@ -3502,6 +3502,7 @@ def write_configuration(context: "ExecutionContext") -> None:
         "XDG_CACHE_HOME": "/var/lib/nuwax/gateway/cache",
         "NUWAX_CLOUDMAP_SHM_PATH": "/var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap",
         "NUWAX_OCCUPANCY_SHM_PATH": "/var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap",
+        "NUWAX_FORBIDDEN_ZONES_PATH": "/var/lib/nuwax_robot_bridge/forbidden_zones.json",
         "GO2_SDK_PATH": str(
             context.notes.get("runtime_go2_sdk") or (options.current_link / "vendor" / "unitree_sdk2_python")
         ),
